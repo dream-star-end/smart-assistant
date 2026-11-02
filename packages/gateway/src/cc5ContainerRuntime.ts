@@ -5,6 +5,8 @@ import {
   chmodSync,
   chownSync,
   closeSync,
+  fchmodSync,
+  fchownSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -45,12 +47,13 @@ function writePrivate(path: string, value: unknown, groupReadable = false): void
     groupReadable ? 0o640 : 0o600,
   )
   try {
+    if (groupReadable) fchownSync(fd, 0, 1000)
+    fchmodSync(fd, groupReadable ? 0o640 : 0o600)
     writeFileSync(fd, JSON.stringify(value))
     fsyncSync(fd)
   } finally {
     closeSync(fd)
   }
-  if (groupReadable) chownSync(path, 0, 1000)
   syncDirectory(dirname(path))
 }
 export interface Cc5PreparedContainer {
@@ -147,6 +150,8 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     const mountSource = join(root, 'view')
     mkdirSync(mountSource, { mode: 0o750 })
     chownSync(mountSource, 0, 1000)
+    chmodSync(mountSource, 0o750)
+    syncDirectory(mountSource)
     const handle = Object.freeze({ mountSource, containerDbId: input.containerDbId })
     const record: RecordState = {
       handle,

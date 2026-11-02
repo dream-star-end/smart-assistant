@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
@@ -254,6 +255,38 @@ test('prepared/bound directory has no relay; activation exposes exact root-owned
     assert.equal(existsSync(socket), false)
   } finally {
     req?.destroy()
+    await f.cleanup()
+  }
+})
+
+test('strict umask still permits a real UID1000 process to read the protected binding and public ring', async () => {
+  const f = fixture()
+  try {
+    const old = process.umask(0o077)
+    let preparing: ReturnType<typeof f.prepare>
+    try {
+      preparing = f.prepare()
+    } finally {
+      process.umask(old)
+    }
+    const handle = (await preparing)!
+    const previous = process.umask(0o077)
+    let binding: Promise<void>
+    try {
+      binding = f.runtime.bindCreated(handle, 'a'.repeat(64))
+    } finally {
+      process.umask(previous)
+    }
+    await binding
+    assert.equal(lstatSync(handle.mountSource).mode & 0o777, 0o750)
+    const check =
+      "const fs=require('node:fs');process.chdir(process.argv[1]);process.setgid(1000);process.setuid(1000);" +
+      "if(JSON.parse(fs.readFileSync('binding.json')).uid!=='912'||!JSON.parse(fs.readFileSync('authority-public.json')).keyring)process.exit(2);process.stdout.write('READ_OK')"
+    assert.equal(
+      execFileSync(process.execPath, ['-e', check, handle.mountSource], { encoding: 'utf8' }),
+      'READ_OK',
+    )
+  } finally {
     await f.cleanup()
   }
 })
