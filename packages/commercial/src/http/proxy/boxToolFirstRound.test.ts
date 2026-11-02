@@ -1222,3 +1222,42 @@ test("first upstream refusal is durably projected before the explicit Stop can c
   assert.deepEqual(events, ["first-failure", "stop"]);
   assert.equal(f.sequence.includes("terminal-journal"), false);
 });
+
+
+test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and does not complete it", async (t) => {
+  const f = fixture({ directFinal: true });
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const run = f.target.exec.run.bind(f.target.exec);
+  f.target.exec.run = async (request) => {
+    if (request.args[2]?.includes("terminal.json")) {
+      f.sequence.push("proof-missing");
+      // Exhaust the real proof-wait budget without spending 20 wall seconds.
+      // Missing strict proof stays unknown; it is not keeper_stopped evidence.
+      now += 20_001;
+      throw new BoxExecTransportError("BOX_EXEC_REMOTE_EXIT", true, 1);
+    }
+    return run(request);
+  };
+  let stops = 0, stopStartedAt = 0;
+  let release!: () => void;
+  const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
+  try {
+    await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+      terminalUnprovenStopWaitMs: 40,
+      stopRejectedRun: async () => {
+        stops++; stopStartedAt = performance.now(); return hung;
+      } }),
+    (error: unknown) => error instanceof BoxToolFirstRoundError
+      && error.code === "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.ok(f.sequence.includes("proof-missing"));
+    assert.equal(stops, 1);
+    assert.ok(performance.now() - stopStartedAt < 2_000,
+      "the hanging Stop cannot hold this unproven request indefinitely");
+    assert.equal(f.sequence.includes("terminal-journal"), false);
+    assert.equal(f.sequence.includes("durable-handoff"), false);
+    assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+    assert.equal(f.retained, true);
+    assert.equal(f.disposed, false, "unknown remote stop cannot release the owned target");
+  } finally { release(); await hung; }
+});
