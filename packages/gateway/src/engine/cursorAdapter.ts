@@ -12,6 +12,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
 import {
   CURSOR_ENGINE_MODELS,
+  isCc5TestModel,
   DEFAULT_CURSOR_ENGINE_MODEL,
   type GoalStateSnapshot,
   type OutboundContentBlock,
@@ -2840,4 +2841,9 @@ export const _internals = {
   isBlockingOcMemoryDelegateCommand,
 }
 
-registerEngine('cursor', (opts) => new CursorRoutingAdapter(opts))
+registerEngine('cursor', (opts) => {
+  // Task route must never enter credential selection, including while disabled.
+  // The dedicated bridge is added in the next slice; until then reject here.
+  if (isCc5TestModel(opts.model)) throw new Error('CC5_TEST_BRIDGE_NOT_READY')
+  return new CursorRoutingAdapter(opts)
+})

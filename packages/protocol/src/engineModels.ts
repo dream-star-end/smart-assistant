@@ -421,6 +421,7 @@ export type CursorEngineFamilyId =
   | 'box-claude-haiku'
   | 'box-claude-haiku-5-5'
   | 'box-gpt-6-astra-pro'
+  | 'cc5-remote-t1555u'
 
 export const CURSOR_ENGINE_MODELS = [
   {
@@ -1218,6 +1219,15 @@ export const CURSOR_ENGINE_MODELS = [
     effort: null,
     fast: false,
     runner: 'interactive',
+  },
+  {
+    id: 'cc5-remote-t1555u',
+    displayName: 'cc5 remote (task test)',
+    upstreamModel: 'sonnet',
+    family: 'cc5-remote-t1555u',
+    familyLabel: 'cc5 task test',
+    effort: null,
+    fast: false,
   },
 ] as const
 

@@ -68,7 +68,7 @@ import { setPoolOverride, resetPool } from "../db/index.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import { ModelAuthorityConsumer, buildContainerAttestFrame } from "@openclaude/gateway";
-import { DEFAULT_CODEX_ENGINE_MODEL, MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, DURABLE_TURN_DISPATCH_CAPABILITY, MODEL_AUTHORITY_FIELD } from "@openclaude/protocol";
 import {
   ModelCatalogSnapshot,
   type ModelCatalogCache,
@@ -151,7 +151,7 @@ interface FakePoolControl {
   attributionCredits: Map<string, string>;
 }
 
-function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | null } = {}): FakePoolControl {
+function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | null; cursorEligible?: boolean } = {}): FakePoolControl {
   const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
   const balance = opts.userBalance ?? 1_000_000n;
   const periodCredits = opts.periodCredits ?? null; // null = 无 active 订阅(默认)
@@ -350,6 +350,9 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
           rowCount: 1,
         };
       }
+      if (opts.cursorEligible && trimmed.startsWith("SELECT 1 AS ok FROM agent_containers")) {
+        return { rows: [{ ok: 1 }], rowCount: 1 };
+      }
       // 企业版预检:getOrgSpendableForUser(org 钱包+期内池)。本套件不测 org 计费
       // → 无成员归属,返回空 → org 可用额 0n(纯个人预检,行为不变)。
       if (trimmed.startsWith("SELECT (o.credits")) {
@@ -369,7 +372,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
 const AUTH_EPOCH = 42n;
 
 /** 只含本套件用的 codex 模型(gpt-5.6-sol),engine=codex → 走 codex 计费编排。 */
-function fakeAuthorityCatalog(): ModelCatalogCache {
+function fakeAuthorityCatalog(cc5Alias = false): ModelCatalogCache {
   const entries: ModelCatalogEntry[] = [
     {
       entryId: 1,
@@ -405,9 +408,14 @@ function fakeAuthorityCatalog(): ModelCatalogCache {
       },
     ],
   ]);
+  if (cc5Alias) {
+    entries.push({ ...entries[0]!, entryId: 99, modelId: 'cc5-remote-t1555u',
+      engine: 'cursor', providerId: 'cursor', upstreamModelId: 'sonnet' });
+    pricing.set('cc5-remote-t1555u', { ...pricing.get('gpt-5.6-sol')!, modelId: 'cc5-remote-t1555u' });
+  }
   const snapshot = new ModelCatalogSnapshot({
     entries,
-    aliases: new Map(),
+    aliases: new Map(cc5Alias ? [['cursor-auto', 99]] : []),
     pricing,
     securityEpoch: AUTH_EPOCH,
   });
@@ -489,6 +497,9 @@ async function startRig(opts: {
    * 每条 inbound 注入签名 envelope,且**签发边界重读 epoch**(MAJOR-2)。
    */
   modelAuthority?: boolean;
+  cc5Alias?: boolean;
+  cursorEligible?: boolean;
+  admitUserTurn?: UserChatBridgeDeps['admitUserTurn'];
   promptQueueEnabled?: boolean;
 } = {}): Promise<BillingRig> {
   // 模型执行权威装配(flag 关 → 全部 undefined,rig 行为与本批次之前完全一致)
@@ -511,13 +522,17 @@ async function startRig(opts: {
         required: true,
       });
       ws.send(
-        JSON.stringify(buildContainerAttestFrame(consumer, consumer.newConnection(), 999)),
+        JSON.stringify((() => {
+          const frame = buildContainerAttestFrame(consumer, consumer.newConnection(), 999);
+          return opts.admitUserTurn ? { ...frame,
+            capabilities: [...frame.capabilities, DURABLE_TURN_DISPATCH_CAPABILITY] } : frame;
+        })()),
       );
     }
   });
 
   // billing deps
-  const poolCtrl = makeFakePool({ userBalance: opts.userBalance, periodCredits: opts.periodCredits });
+  const poolCtrl = makeFakePool({ userBalance: opts.userBalance, periodCredits: opts.periodCredits, cursorEligible: opts.cursorEligible });
   // getSpendableBalance() 走 commercial/db getPool() — 注入同一只 fakePool。
   setPoolOverride(poolCtrl.pool);
   const preCheckRedis = new InMemoryPreCheckRedis();
@@ -573,11 +588,13 @@ async function startRig(opts: {
     appendCostCredits: opts.appendCostCredits,
     maxPerUser: opts.maxPerUser,
     promptQueueEnabled: opts.promptQueueEnabled,
+    admitUserTurn: opts.admitUserTurn,
+    selfHostId: opts.cursorEligible ? '00000000-0000-4000-8000-000000000001' : undefined,
     ...(authoritySigner !== null
       ? {
           modelAuthority: {
             signer: authoritySigner,
-            catalog: fakeAuthorityCatalog(),
+            catalog: fakeAuthorityCatalog(opts.cc5Alias),
             census: new AuthorityKeyCensus(),
             // **签发边界**的 epoch 直读(MAJOR-2)。默认 = 快照 epoch(无安全写);
             // 用例把它改掉 = turn 途中 admin 禁用/撤销/改价 → 签发前必须拒 + 补偿。
@@ -3684,4 +3701,57 @@ test("RF-step3: two online tabs share transport and bill one frame once after th
     assert.equal(rig.binding.acquireCalls, 1);
     b.close();
   } finally { await stopRig(rig); }
+});
+
+
+describe('cc5 task route financial and stale-alias admission', () => {
+  test('OFF, spoofed UID and stale allowed alias reject before admission, reserve or accounting', async () => {
+    const keys = ['OC_SELFHOST_CC5_T1555U_ENABLED', 'OC_SELFHOST_CC5_T1555U_TEST_UID', 'OC_V5_CURSOR_CREDENTIAL_UIDS'] as const;
+    const saved = keys.map(key => process.env[key]);
+    try {
+      for (const scenario of ['off', 'spoof', 'alias']) {
+        process.env.OC_SELFHOST_CC5_T1555U_ENABLED = scenario === 'off' ? '0' : '1';
+        process.env.OC_SELFHOST_CC5_T1555U_TEST_UID = scenario === 'off' ? '11' : '314159';
+        process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = '11';
+        let admissions = 0;
+        const rig = await startRig({ modelAuthority: true, cc5Alias: true, cursorEligible: true,
+          loadAllowedModelChecker: async () => () => true,
+          admitUserTurn: async () => { admissions++; throw new Error('synthetic-admission-positive-control'); } });
+        try {
+          let reserves = 0;
+          const reserve = rig.preCheckRedis.atomicReserve.bind(rig.preCheckRedis);
+          rig.preCheckRedis.atomicReserve = input => { reserves++; return reserve(input); };
+          const connected = waitNextContainerSocket(rig);
+          const ws = openClient(rig.gatewayPort, await makeJwt('11'));
+          await waitOpen(ws);
+          const container = await connected;
+          await new Promise(resolve => setTimeout(resolve, 20));
+          const before = rig.poolCtrl.queries.length;
+          let forwarded = 0;
+          container.on('message', data => { if (data.toString().includes('cc5-accounting-denied')) forwarded++; });
+          const error = waitJsonFrameOfType(ws, 'error', 3000);
+          ws.send(JSON.stringify({ type: 'inbound.message', model: scenario === 'alias' ? 'cursor-auto' : 'cc5-remote-t1555u',
+            peer: { id: 'cc5-accounting', kind: 'dm' }, clientMessageId: 'cc5-accounting-denied',
+            uid: 314159, userId: '314159', user_id: '314159', content: { text: 'synthetic forbidden request' } }));
+          assert.equal((await error).code, 'UNAUTHORIZED_MODEL');
+          assert.equal(ws.readyState, WebSocket.OPEN);
+          assert.equal(admissions, 0);
+          assert.equal(reserves, 0);
+          assert.equal(forwarded, 0);
+          assert.equal(rig.binding.acquireCalls, 0);
+          const queries = rig.poolCtrl.queries.slice(before);
+          assert.equal(queries.some(row => /SELECT u\.credits|(?:INSERT|UPDATE|DELETE)[\s\S]*(?:turn_dispatches|request_finalize_journal|usage_records|credit_ledger|cursor_external_usage_audit)/i.test(row.sql)), false);
+          // Positive control: same attested connection really enables admission.
+          const admittedError = waitJsonFrameOfType(ws, 'error', 3000);
+          ws.send(JSON.stringify({ type: 'inbound.message', model: 'gpt-5.6-sol',
+            peer: { id: 'cc5-accounting', kind: 'dm' }, clientMessageId: 'normal-admission-control', content: { text: 'normal' } }));
+          await admittedError;
+          assert.equal(admissions, 1);
+          ws.close();
+        } finally { await stopRig(rig); }
+      }
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+    }
+  });
 });
