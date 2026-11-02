@@ -596,6 +596,14 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
 // imported-history exemption. The full SHA binds the original tree and message;
 // the mapped ID must still satisfy ALL ordinary manifest/proof/lineage checks.
 function normalizeImmutableIncidentTrailer(sha: string, trailer: string): string {
+  // User-approved 2026-11-02 exact historical closure: the copy guard joins
+  // the existing capacity incident and must pass its ordinary proof/lineage checks.
+  if (
+    sha === "793c4f0b15928a59eaaedab3f8ba6194d1fb496a"
+    && trailer === "none (user-facing copy only; no behavior change)"
+  ) {
+    return "INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE";
+  }
   if (
     sha === "f496228de43718852cebda8fb9f35eb0e9c3a9c0"
     && trailer === "OCV5-171 follow-up"
@@ -705,17 +713,17 @@ function checkTrailerClosure(): number {
       if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 emergency trailer waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
+    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
+    if (normalizedTrailer !== trailer) {
+      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
+    }
+    trailer = normalizedTrailer;
     if (/^none\b/.test(trailer)) {
       const waiver = waivers.get(sha.slice(0, 8));
       if (!waiver) fail(`${sha.slice(0, 8)} 声明 Incident: none,但 incident-waivers.json 里没有对应 waiver`);
       if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
-    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
-    if (normalizedTrailer !== trailer) {
-      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
-    }
-    trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
       // fbb9020fd was pushed as Incident: OCV5-276. The shared branch forbids
       // rewriting it. The waiver records the user-approved smoke-only fix.

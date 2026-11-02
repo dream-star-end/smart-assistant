@@ -326,6 +326,15 @@ describe("errorLabel / stripMarkdown", () => {
     expect(errorLabel("model_authority_unavailable")).toBe("模型服务暂时不可用");
     expect(errorLabel("model_catalog_unavailable")).toBe("模型服务暂时不可用");
   });
+  test("INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE: historical unavailable copy stays neutral about capacity", () => {
+    const presented = errorPresentation("model_not_available", undefined,
+      "Selected model is at capacity. Please try a different model.");
+    expect(presented.title).toBe("模型暂不可用");
+    expect(presented.message).toBe(friendlyBridgeErrorMessage("model_not_available"));
+    expect(presented.message).toContain("（可能是上游满载，也可能已下架或未对你的账号开通）");
+    expect(presented.message).not.toMatch(/(?:模型|该模型)已(?:经)?(?:退役|下架|停用)/);
+    expect(presented.message).toContain("请在上方切换一个模型后重发");
+  });
   test("存量 MODEL_AUTHORITY_INVALID 会脱敏，但无账务证据时不谎报免单/站内信", () => {
     const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"},"request_id":"9cad8ad4bf74b7050694873e6ab16b01"}';
     const presented = errorPresentation("ENGINE_ERROR", raw, raw);
