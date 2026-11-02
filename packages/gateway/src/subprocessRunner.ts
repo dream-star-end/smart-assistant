@@ -2126,13 +2126,15 @@ export class SubprocessRunner extends EventEmitter {
   }
 
   async shutdown(): Promise<void> {
-    // Revoke admission and require independent remote stop proof before local cleanup.
-    if (this.opts.cc5BridgePort) await this.opts.cc5BridgePort.close()
     this.currentTurnHeaders = undefined
     // Drop shared in-flight start so a hung preheat cannot be reused by submit().
     this._startEpoch += 1
     this._startPromise = null
     this.starting = false
+    // Revoke first; remote proof and local shutdown proceed independently.
+    let remoteStopFailure: unknown
+    const remoteStop = this.opts.cc5BridgePort?.close().catch((error: unknown) => { remoteStopFailure = error })
+    try {
     // Always clean up the session directory, even if there is no live process
     // (failed starts, already-exited runners, crash paths).
     if (!this.proc) {
@@ -2212,6 +2214,10 @@ export class SubprocessRunner extends EventEmitter {
     // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。
     this._boundRepoBinding = null
     this.cleanupSessionDir()
+    } finally {
+      await remoteStop
+      if (remoteStopFailure) throw new Error('CC5_REMOTE_STOP_UNPROVEN')
+    }
   }
 
   /** Capture-by-value barrier for the current process generation. */

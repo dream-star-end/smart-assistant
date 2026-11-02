@@ -8,7 +8,9 @@ import { type Cc5BridgeBinding, type Cc5BridgePort, UnixCc5BridgePort } from '..
 import { runCc5StdioBridge } from '../cc5StdioBridge.js'
 import { Cc5InteractiveAdapter } from '../engine/cc5InteractiveAdapter.js'
 import { cc5ResumeId } from '../engine/cc5ResumeId.js'
+import { CursorRoutingAdapter } from '../engine/cursorRoutingAdapter.js'
 import { probeResumeArtifact } from '../engine/resumeArtifacts.js'
+import { _resumeIdFor } from '../sessionSubmit.js'
 import { SubprocessRunner, __setCcbSpawnForTests } from '../subprocessRunner.js'
 
 const binding: Cc5BridgeBinding = {
@@ -282,4 +284,37 @@ test('actual Unix HTTP stream preserves original bytes, hashes one user frame, a
     server.closeAllConnections()
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
+})
+
+test('unproven remote stop still revokes the local generation and closes its stdin', async () => {
+  const f = fixture()
+  f.port.close = async () => {
+    throw new Error('REMOTE_STILL_UNKNOWN')
+  }
+  const runner = new SubprocessRunner(f.opts)
+  await runner.submit('one', undefined, authority, 't')
+  await assert.rejects(runner.shutdown(), /CC5_REMOTE_STOP_UNPROVEN/)
+  assert.equal(runner.isRunning, false)
+  assert.equal(f.proc.stdin.writableEnded, true)
+})
+
+test('a persisted cc5 id cannot block leaving cc5 or enter a local resume probe', () => {
+  const remote = cc5ResumeId(binding.operationId, randomUUID())
+  const host = {
+    _resumeMap: new Map([['s', remote]]),
+    get _resumeMapProvider() {
+      throw new Error('MUST_NOT_PROBE_OLD_CURSOR_STATE')
+    },
+  }
+  for (const provider of ['ccb', 'codex', 'cursor']) {
+    assert.equal(_resumeIdFor.call(host as never, 's', provider, '/no-local-probe'), undefined)
+  }
+  // Check the actual existing-router boundary without constructing any credential selector.
+  assert.equal(
+    CursorRoutingAdapter.prototype.requiresReopenForModel.call(
+      {} as never,
+      descriptor.canonicalModel,
+    ),
+    true,
+  )
 })
