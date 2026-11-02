@@ -6503,7 +6503,29 @@ build_runtime_release() {
 # 激活提交的核心健康门(单一权威,R4-M2):正常激活与 emergency 激活**同强度**,
 # 恒含 sessionsDb=ok(数据库失联时不许提交任何 tuple history)。
 hotcfg_core_smoke_cmd() {
-  printf '%s' 'hz=""; for i in $(seq 1 15); do hz=$(curl -fsS http://127.0.0.1:'"$ACTIVE_PORT"'/healthz 2>/dev/null||true); [ -n "$hz" ] && break; sleep 2; done; printf "%s" "$hz" | grep -q "\"ok\":true" && printf "%s" "$hz" | grep -q "\"channel\":\"v5\"" && printf "%s" "$hz" | grep -q "\"sessionsDb\":\"ok\""'
+  printf '_oc_core_port=%q\n' "$ACTIVE_PORT"
+  cat <<'CORE_SMOKE'
+_oc_core_deadline=$(( $(date +%s) + 90 ))
+_oc_core_ready=0; _oc_core_curl_rc=0; _oc_core_http=000; _oc_core_body=''
+while [ "$(date +%s)" -lt "$_oc_core_deadline" ]; do
+  _oc_core_curl_rc=0
+  _oc_core_reply="$(curl -fsS --connect-timeout 1 --max-time 2 --write-out $'\n%{http_code}' "http://127.0.0.1:$_oc_core_port/healthz" 2>/dev/null)" || _oc_core_curl_rc=$?
+  _oc_core_http="${_oc_core_reply##*$'\n'}"
+  _oc_core_body="${_oc_core_reply%$'\n'*}"
+  if [ "$_oc_core_curl_rc" -eq 0 ] && printf '%s' "$_oc_core_body" | jq -e '.ok==true and .channel=="v5" and .deps.sessionsDb=="ok"' >/dev/null 2>&1; then
+    _oc_core_ready=1; break
+  fi
+  sleep 2
+done
+if [ "$_oc_core_ready" -eq 1 ]; then
+  printf 'core health readiness passed: port=%s\n' "$_oc_core_port" >&2
+else
+  [[ "$_oc_core_http" =~ ^[0-9]{3}$ ]] || _oc_core_http=unknown
+  _oc_core_safe="$(printf '%s' "$_oc_core_body" | jq -c '{ok:(.ok==true),channel:(if .channel=="v5" then "v5" else "unexpected" end),deps:{pg:(if .deps.pg=="ok" then "ok" else "not-ok" end),redis:(if .deps.redis=="ok" then "ok" else "not-ok" end),sessionsDb:(if .deps.sessionsDb=="ok" then "ok" else "not-ok" end)}}' 2>/dev/null)" || _oc_core_safe='{"json":"invalid-or-empty"}'
+  printf 'core health readiness failed: port=%s curl_rc=%s http=%s last=%s\n' "$_oc_core_port" "$_oc_core_curl_rc" "$_oc_core_http" "$_oc_core_safe" >&2
+  false
+fi
+CORE_SMOKE
 }
 
 # 把 deploy_state release CAS 作为 hotcfg saga 的 commit/revert 钩子。命令在 kl-mirror 的

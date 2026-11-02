@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
+import { BoxSpoolTerminalError } from "./boxSpoolPoller.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter,
@@ -692,4 +693,86 @@ test("OCV5-368 a final cut at max_tokens and resumed by the CLI is delivered and
     assert.match(f.emitted.at(-1)!, /"stop_reason":"end_turn"/);
     assert.equal(f.sequence.includes("unknown"), false);
   }
+});
+
+
+function terminalPollingFixture(kind: "tool" | "final", reason: "worker_complete" | "worker_failed",
+  emptySpool = false) {
+  const f = fixture(kind);
+  if (reason === "worker_failed") Object.assign(f.proof,
+    { reason, revision: 2, workerExitCode: 1 });
+  type Result = { stdout: string; stderrBytes: number; exitCode: 0 };
+  const published = f.input.published as unknown as {
+    target: { exec: { run: (request: { args: string[] }) => Promise<Result> } } };
+  const run = published.target.exec.run.bind(published.target.exec);
+  let reads = 0;
+  published.target.exec.run = async (request) => {
+    if (request.args[5] === "--read" && (emptySpool || reads++ === 0)) {
+      f.sequence.push("empty-spool-read");
+      return { stdout: JSON.stringify({ offset: Number(request.args[7]), data: "" }),
+        stderrBytes: 0, exitCode: 0 as const };
+    }
+    return run(request);
+  };
+  return f;
+}
+
+test("continuation notices proven worker failure at its old cursor without another handoff or unknown", async () => {
+  const f = terminalPollingFixture("final", "worker_failed", true);
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string; ownerRequestId?: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_SPOOL_WORKER_FAILED");
+    assert.equal(input.phase, "continuation");
+    assert.equal(input.ownerRequestId, "box-owner");
+    f.sequence.push("first-failure"); return null;
+  };
+  await assert.rejects(runBoxToolContinuation(f.input, f.deps),
+    (error: unknown) => error instanceof BoxSpoolTerminalError
+      && error.proof.reason === "worker_failed" && error.accountId === 20n);
+  assert.ok(f.sequence.includes("first-failure"));
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.equal(f.sequence.includes("notify"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+});
+
+test("continuation drains a late complete final and preserves its single original success path", async () => {
+  const f = terminalPollingFixture("final", "worker_complete");
+  const result = await runBoxToolContinuation(f.input, f.deps);
+  assert.equal(result.kind, "final");
+  assert.equal(f.sequence.filter((x) => x === "terminal-journal").length, 1);
+  assert.equal(f.sequence.includes("unknown"), false);
+});
+
+test("continuation cannot publish buffered tool handoff after strict terminal proof", async () => {
+  const f = terminalPollingFixture("tool", "worker_complete");
+  await assert.rejects(runBoxToolContinuation(f.input, f.deps),
+    (error: unknown) => error instanceof BoxSpoolTerminalError
+      && error.code === "BOX_SPOOL_TERMINAL_INCOMPLETE");
+  assert.equal(f.sequence.includes("pending-read"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.equal(f.sequence.includes("unknown"), false);
+});
+
+
+test("continuation projects its original echo failure before unknown recovery can start cleanup", async () => {
+  const f = fixture("final");
+  const claim = (f.input.published as unknown as { claim: {
+    results: Array<Record<string, unknown>> } }).claim;
+  claim.results = [{ ...claim.results[0]!, content: [{ type: "text", text: "other bytes" }],
+    contentHash: "0".repeat(64) }];
+  const events: string[] = [];
+  const journal = { ...(f.deps.journal as object),
+    recordFirstFailure: async (input: { code: string; phase: string }) => {
+      assert.equal(input.code, "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+      assert.equal(input.phase, "continuation");
+      events.push("first-failure"); return null;
+    },
+    markUnknown: async () => { events.push("unknown"); },
+  };
+  await assert.rejects(runBoxToolContinuation(f.input, { ...f.deps, journal: journal as never }),
+    /BOX_TOOL_ECHO_CONTENT_MISMATCH/);
+  assert.deepEqual(events, ["first-failure", "unknown"]);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
 });
