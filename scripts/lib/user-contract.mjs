@@ -1,4 +1,5 @@
 // Pure contract policy: importing this module never starts a browser or reads secrets.
+import { readSelfhostModelPolicy } from "./selfhost-model-policy.mjs";
 export const TOTAL_TIMEOUT = 240_000;
 export const CASES = ["C1 cold UI login without auth hint", "C2 collapsed model reaches outbound request", "C3 one model per engine, two turns in one session"];
 export function parseModels(value = "grok-build,deepseek-v4-flash") {
@@ -7,6 +8,7 @@ export function parseModels(value = "grok-build,deepseek-v4-flash") {
   return models;
 }
 export function parseOptions(env) {
+  const { grokEnabled } = readSelfhostModelPolicy(env.V5_SELFHOST_MODEL_POLICY_FILE);
   const base = new URL(env.V5_E2E_BASE || "http://127.0.0.1:18790");
   if (!["http:", "https:"].includes(base.protocol) || base.username || base.password || base.pathname !== "/" || base.search || base.hash) throw new Error("V5_E2E_BASE must be an HTTP origin");
   const email = env.V5_CANARY_EMAIL || "v5-selfhost-canary@claudeai.chat";
@@ -15,14 +17,19 @@ export function parseOptions(env) {
   if (!["dry", "live"].includes(cost)) throw new Error("V5_CONTRACT_COST must be dry or live");
   const model = parseModels(env.V5_CONTRACT_MODEL_ID ?? "gpt-6-luna");
   if (model.length !== 1) throw new Error("Expected one contract model");
-  return { base: base.origin, email, passwordFile: env.V5_CANARY_PASSWORD_FILE || "/etc/openclaude/selfhost-canary.password", cost, model: model[0], models: parseModels(env.V5_CONTRACT_MODELS) };
+  const models = parseModels(env.V5_CONTRACT_MODELS ?? (grokEnabled ? "grok-build,deepseek-v4-flash" : "gpt-6-luna,deepseek-v4-flash"));
+  if (!grokEnabled && [...model, ...models].some((id) => id === "grok-build" || id.startsWith("grok-build-"))) {
+    throw new Error("Grok is withdrawn by the selfhost model policy");
+  }
+  return { base: base.origin, email, passwordFile: env.V5_CANARY_PASSWORD_FILE || "/etc/openclaude/selfhost-canary.password", cost, model: model[0], models, grokEnabled };
 }
 export function turnPolicy(cost) {
   if (cost === "dry") return { forward: false, waitForCompletion: false };
   if (cost === "live") return { forward: true, waitForCompletion: true };
   throw new Error("Invalid cost mode");
 }
-export function engineMatrix(ids, catalog) {
+export function engineMatrix(ids, catalog, { grokEnabled = true } = {}) {
+  if (!grokEnabled && catalog.some((m) => m.id === "grok-build" || m.id.startsWith("grok-build-"))) throw new Error("Withdrawn Grok appeared in the catalog");
   const matrix = ids.map((id) => {
     const rows = catalog.filter((m) => m.id === id);
     if (rows.length !== 1 || !["codex", "ccb", "grok", "cursor", "zcode"].includes(rows[0].engine)) throw new Error(`Missing/ambiguous catalog engine: ${id}`);

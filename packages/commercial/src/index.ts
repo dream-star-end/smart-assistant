@@ -3,6 +3,7 @@ import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContain
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
 import { recoveryDecisionFrame } from './ws/recoveryPresentation.js';
 import { configurePluginCatalog } from './plugins/catalogPolicy.js';
+import { configureModelAvailability } from './billing/modelAvailability.js';
 import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
 import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
@@ -1289,6 +1290,7 @@ export async function registerCommercial(
   assertModelAuthorityCutoverFloor();
   const flavorIdentity = assertFlavorIdentity();
   configurePluginCatalog(flavorIdentity);
+  configureModelAvailability(flavorIdentity);
   const cursorExternalOutboxDir =
     flavorIdentity.status === "ok"
       ? cursorExternalApiOutboxDirForFlavor(flavorIdentity.flavor)

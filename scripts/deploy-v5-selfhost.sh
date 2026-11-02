@@ -1918,6 +1918,7 @@ assert_ssh_rule_before_drop() {
 # Fail closed; the caller owns the existing compensation/exit path.
 user_contract_gate() { # <candidate release>
   local rel="${1:-}"
+  local model_policy_file="${rel:-${REPO_ROOT:-$SCRIPT_DIR/..}}/deploy/v5-selfhost/model-availability.json"
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
@@ -1928,12 +1929,13 @@ user_contract_gate() { # <candidate release>
   # must fail the gate before any paid contract turn is sent.
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
-    V5_CANARY_PASSWORD_FILE="$password_file" \
+    V5_CANARY_PASSWORD_FILE="$password_file" V5_SELFHOST_MODEL_POLICY_FILE="$model_policy_file" \
     user_contract_prewarm || return $?
   tsum_mark F.C1-C3 2>/dev/null || :
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
+    V5_SELFHOST_MODEL_POLICY_FILE="$model_policy_file" \
     node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
   tsum_mark F.G1 2>/dev/null || :
   # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache

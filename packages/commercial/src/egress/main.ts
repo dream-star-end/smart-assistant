@@ -33,6 +33,8 @@ import { join } from "node:path";
 import IORedis from "ioredis";
 
 import { loadConfig } from "../config.js";
+import { assertFlavorIdentity } from "../flavor/assertFlavor.js";
+import { configureModelAvailability } from "../billing/modelAvailability.js";
 import { getPool } from "../db/index.js";
 import { PricingCache } from "../billing/pricing.js";
 import {
@@ -142,6 +144,7 @@ const log = rootLogger.child({ subsys: "egressMain" });
 const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000);
 
 export async function startEgress(): Promise<void> {
+  configureModelAvailability(assertFlavorIdentity());
   process.env.OC_EGRESS_PROCESS = "1";
   // D3④:进程实例标识 —— 优先 systemd invocation id(每次 (re)start 变化),否则随机
   // UUID。finalize 门槛用它区分"队列自然排空"与"egress 中途重启计数归零假绿"。
