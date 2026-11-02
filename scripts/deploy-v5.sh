@@ -195,6 +195,8 @@ HOT_CONFIG_LIB="$SCRIPT_DIR/v5-hot-config-lib.sh"
 [ -f "$HOT_CONFIG_LIB" ] || { echo "FATAL: 缺 hot-config lib: $HOT_CONFIG_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-hot-config-lib.sh
 source "$HOT_CONFIG_LIB"
+# shellcheck source=scripts/lib/v5-prebuilt-resume.sh
+source "$SCRIPT_DIR/lib/v5-prebuilt-resume.sh"
 HOST_MAINT_LIB="$SCRIPT_DIR/v5-host-maint-lib.sh"
 [ -f "$HOST_MAINT_LIB" ] || { echo "FATAL: 缺 host maint lib: $HOST_MAINT_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-host-maint-lib.sh
@@ -277,6 +279,7 @@ DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
 # P3 cohort lane 参数
+RESUME_BUILT_RELEASE="" # ordinary-only sealed artifacts from an idle-gate failure
 CANARY_RELEASE=""     # --canary [<rel-*目录名>];空=从当前 HEAD build_release
 PROMOTE_PCT=""        # --promote <0..100>
 DRAIN_WS=0            # --finalize 时可选 WS drain(step3)
@@ -299,6 +302,7 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
+    --resume-built-release=*) RESUME_BUILT_RELEASE="${arg#*=}" ;;
     --hot-config) HOT_CONFIG=1 ;;
     --hot-config-force) HOT_CONFIG=1; HOT_CONFIG_FORCE=1 ;;
     # 一次性 setup-first lane：仅把扫码实时感知/加密持久化先上线，DB 继续钉旧
@@ -409,6 +413,16 @@ if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 \
   echo "✗ --defer-knowledge-planet-upgrade 仅允许与普通 deploy + --with-dist 同用" >&2
   exit 2
 fi
+if [[ -n "$RESUME_BUILT_RELEASE" ]]; then
+  [[ "$MODE" == deploy && "$WITH_DIST" == 1 && "$DRY" == 0 && "$RESTART_EGRESS" == 0 && "$ALLOW_UNVERIFIED_CI" == 0 && "$ALLOW_LEGACY_MANIFEST_MISSING" == 0 && "$HOT_CONFIG" == 0 && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 0 && "${V5_SMOKE_E2E:-1}" == 1 && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_CANARY_REQUIRE_COST:-1}" == 1 \
+    && "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 0 && -z "${OC_CAPMATRIX_COMPAT:-}" \
+    && "$ENABLE_BUNDLE_FLAG$ENABLE_RELEASE_FLAG$DISABLE_BUNDLE_FLAG$DISABLE_RELEASE_FLAG" == 0000 \
+    && -z "$TARGET_RUNTIME_IMAGE$TARGET_RUNTIME_IMAGE_ID$EMERGENCY_INCIDENT$EMERGENCY_APPROVAL$EMERGENCY_COMMIT" ]] || {
+    echo '✗ --resume-built-release requires ordinary --with-dist, all gates, existing axes; no force/waiver/image/egress/dry-run flags' >&2
+    exit 2
+  }
+fi
+
 if [[ "$HOT_CONFIG" == 1 ]]; then
   [[ "$MODE" == "deploy" ]] || {
     echo "✗ --hot-config 只允许普通 deploy lane(不要和 --canary/--dist/--smoke 叠用)" >&2
@@ -8355,7 +8369,11 @@ deploy() {
   # reldir,代码+前端同一 release 共享一次翻转+重启;无 --with-dist 则硬链继承当前 dist)。
   # 背景(2026-07-10 事故):deploy 后紧跟 --dist 的成对重启会把刚续写的 turn 二次掐死 →
   # 蓝绿下天然一次翻转一次重启,不会再成对重启。
-  build_release || { echo "✗ build_release 失败,未激活任何 release(live 未改)" >&2; exit 1; }
+  if [[ -n "$RESUME_BUILT_RELEASE" ]]; then
+    prebuilt_resume_load || { local resume_rc=$?; echo '✗ prebuilt resume rejected; no build fallback, live untouched' >&2; exit "$resume_rc"; }
+  else
+    build_release || { echo "✗ build_release 失败,未激活任何 release(live 未改)" >&2; exit 1; }
+  fi
   # 历史部署曾把 release 解成 775/664，并在共享 env 留 dev-only OPTIONAL=1。
   # 目标 release 已由 build_release 收紧后，先无重启地修 current+unit+env；即使后续
   # tuple/激活失败，未来意外重启也不会再无 baseline 裸奔。
@@ -8393,13 +8411,21 @@ deploy() {
     echo "  · 首次 direct timeline capability 升级改走普通单-master restart；runtime tuple 保持不变。"
     hc_bundle=0; hc_release=0; hc_any=0
   fi
+  if [[ -n "$RESUME_BUILT_RELEASE" && ( "$hc_bundle" != 1 || "$hc_release" != 1 ) ]]; then
+    echo '✗ prebuilt resume requires both existing runtime/platform axes; tuple not changed' >&2; exit 1
+  fi
   if [[ "$hc_any" == 1 ]]; then
     echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release disable_bundle=$DISABLE_BUNDLE_FLAG disable_release=$DISABLE_RELEASE_FLAG)──"
+    if [[ -n "$RESUME_BUILT_RELEASE" ]]; then
+      prebuilt_resume_select_runtime || { local resume_rc=$?; echo '✗ prebuilt runtime selection rejected' >&2; exit "$resume_rc"; }
+    else
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
+    fi
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
   fi
   commercial_wait_for_cutover_idle "$kp_previous_release" || { local idle_rc=$?; echo "✗ 未证明商业空窗,live 未切换" >&2; exit "$idle_rc"; }
+  if [[ -n "$RESUME_BUILT_RELEASE" ]]; then prebuilt_resume_recheck || exit $?; fi
   begin_planned_maintenance deploy "$RESTART_EGRESS"
   # RFC §1.2:进入不可逆翻转段(KP 门关闭 / release 激活 / egress)前活体断言远端 lease 仍持有。
   # 此刻 live master 仍未改,失活即 end maintenance 后干净退出(无 KP 门需回滚)。
@@ -11960,6 +11986,7 @@ fi
 maybe_run_ci_green_gate_for_mode || exit 1
 # egress surface gate 同样在 lease 外、只读:egress 面有变更却没带 --egress 直接拒,别等构建完才发现。
 assert_egress_surface_covered || exit 1
+if [[ -n "$RESUME_BUILT_RELEASE" ]]; then prebuilt_resume_prepare || exit 1; fi
 v5_host_admission_for_mode || exit 1
 
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。

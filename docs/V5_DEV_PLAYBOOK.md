@@ -609,6 +609,23 @@ OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS=3600 \
 
 红线:只从部署树发;绝不手工 rsync+restart 绕过脚本;v3 的 service/env/Caddy 一律不碰。
 
+### 普通发布在空窗前退出后的原制品续发
+
+仅支持原正式 ordinary `--with-dist` invocation：master/runtime均完整就绪，唯一终态原因为空窗超时，未激活。`--resume-built-release=<root-owned JSON>`沿同一ordinary后半段继续，不能与egress、镜像/轴开关、waiver、emergency或dry-run组合；缺证据直接拒绝，不回落重建或更换source。
+
+record schema1只保存sourceCommit、originUnit、masterRelease、runtimeRelease、imageId、platformBundle与masterArtifactSha256/runtimeManifestSha256/bundleManifestSha256。不得填写PASS或豁免字段。恢复会从systemd精确invocation与journal重新核对原命令/就绪顺序/仅空窗失败，完整重验strong master、runtime/bundle所有文件摘要和source/image/input/capabilities，现场SQL参数门在新lease内仍完整执行。
+
+保持原发布源S：队首到本批且canonical仍S时，先正常submit/acquire/pin(S)，随后才保护合并恢复controller C。现有queue assert允许S是C祖先；制品版本与typed source仍S，C另过独立required CI/provenance。S..C仅允许本功能明确列出的controller/helpers/tests/本手册，任何业务/runtime/metadata差异均拒绝。不得用旧worktree伪装canonical pin，不得任意重pin。原active slot/lock/predecessor、当前lease与源在激活前再次核对。
+
+```bash
+# 所有正常queue/授权/CI/互斥前置仍有效；只从clean canonical发车
+OC_V5_RELEASE_QUEUE_ID=<active-pinned-S-id> \
+  bash scripts/v5-deploy-detached.sh start -- --with-dist \
+  --resume-built-release=/root/task-evidence/prebuilt-resume.json
+```
+
+仍须连续两次真实空窗、原tuple saga/精确补偿、完整smoke、双引擎真实turn、浏览器旅程、前端handshake及公网资产验证；root-owned marker不替代任何当前live门。manifest、原制品、版本和摘要不作改写。空窗失败仍安全退出；后续只复用同批active pin和证据，先查旧operation结果，禁止盲目重复发车。
+
 ### 4.2b 极少数跨 master/runtime/dist 的离线切换
 默认走在线构建 + 普通 deploy + 存量容器自然/逐个回收。只有无法兼容运行的
 master/runtime/dist 组合才走本 lane。**数据库迁移必须可向后兼容，并在服务在线时
