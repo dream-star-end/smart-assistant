@@ -37,6 +37,8 @@ import { proveGptWebCitationMarkers } from "./lib/boxGptWebCitationProof.js"; //
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
 import { boxBridgeFailed, boxBridgeOutcome } from "./lib/boxBridgeFailureProof.js";
 import { scaledMs } from "./lib/gateLoadScale.js";
+import { proveUpstreamRefusal, proveUid4FirstFailurePreserved,
+  proveUid4StoppedWorkerConverges } from "./lib/boxUid4FailureProof.js";
 
 const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
@@ -60,6 +62,7 @@ type Api = {
     pollIntervalMs: number; retryDelaysMs?: readonly number[] }) => AsyncGenerator<{ text: string; endOffset: number }>;
   spoolAccess: () => unknown;
   transportError: (code: string) => Error;
+  isSpoolTerminalError: (error: unknown) => boolean;
   /** OCV5-509: whether a failed replay re-read is the run's own deterministic refusal. */
   replayRejection: (error: unknown) => boolean;
   firstRound: (input: unknown, deps: unknown) => Promise<{ kind: string }>;
@@ -155,6 +158,7 @@ type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
   idleHistoryStillBlocked: (input: { candidate: unknown; pending: unknown; recovered: unknown }) => boolean;
   setRuntimeIncarnationStartForTest: (ms: number | undefined) => void };
 type ReplayLookup = { kind: string; response?: Response;
+  failure?: { code: string; diagnostic?: Record<string, unknown> };
   identity?: { state?: string; rootLaunchPermit?: boolean; invocationMode?: string } };
 type Db = { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }> };
 type Journal = { readIdleProof: (input: { uid: bigint; containerId: bigint; sessionId: string; turnKey: string }) =>
@@ -169,6 +173,10 @@ type Decoder = {
 type Matched = { modelToolUseId: string; isError: boolean; contentHash: string;
   content: ReadonlyArray<{ type: string; text?: string; data?: string; mimeType?: string }> };
 type EchoExpected = { modelToolUseId: string; isError: boolean; contentHash: string; content?: unknown };
+export type Uid4BoxProofContext = { api: Api; db: Db; boxHost: typeof boxHost;
+  prechecked: typeof prechecked; journalRow: typeof journalRow; money: typeof money;
+  must: typeof must; codeOf: typeof codeOf; spoolOf: typeof spoolOf; cliInit: typeof cliInit;
+  finalAnswer: typeof FINAL_ANSWER; model: string; upstreamModel: string; candidate: string };
 
 function fail(message: string): never {
   throw new Error(`[box-incident-proofs] ${message}`);
@@ -306,6 +314,7 @@ async function load(): Promise<Api> {
     pollSpool: poller.pollBoxSpoolLines,
     spoolAccess: () => access.makeBoxDetachedRunAccess({ runNonce: "a".repeat(24), detachedRunnerHash: "b".repeat(64) }),
     transportError: (code) => new transport.BoxExecTransportError(code, false),
+    isSpoolTerminalError: (error) => error instanceof poller.BoxSpoolTerminalError,
     replayRejection: observer.isBoxReplayRejection,
     firstRound: firstRound.runBoxToolFirstRound,
     textFetch: (deps) => new textFetch.BoxTextFetch(deps),
@@ -785,7 +794,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   /** The durable journal on real Postgres instead of the in-memory one. */
   real?: { journal: unknown; uid: bigint; requestId: string; sessionId: string; turnKey: string;
     messages?: unknown[]; resumeToolResults?: boolean; proofReason?: string;
-    nextSpool?: Buffer; stopIgnored?: boolean; dispatchId?: string;
+    nextSpool?: Buffer; stopIgnored?: boolean; dispatchId?: string; workerExitCode?: number; cleanupSpool?: boolean;
     /** The Box account this session is pinned to (its capacity is per account). */
     accountId?: bigint;
     stopRejectedRun?: (identity: unknown) => Promise<string> } } = {}) {
@@ -793,7 +802,8 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   const emitted: string[] = [];
   /** What each handoff recorded in the journal (the claim the next round is built from). */
   const handoffs: unknown[] = [];
-  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0, look: 0 };
+  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0, look: 0, cleanup: 0 };
+  const spoolOffsets: number[] = [];
   // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let nonce = "", epoch = "", controlHash = "", disposed = false;
   const epochs = new Map<string, string>();
@@ -828,6 +838,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     if (isRunner(args)) {
       faults.spoolRead?.(++count.spoolRead);
       const offset = Number(args[7]);
+      spoolOffsets.push(offset);
       const bytes = spool.subarray(offset);
       return reply(JSON.stringify({ data: bytes.toString("base64"), offset: offset + bytes.length }));
     }
@@ -848,12 +859,20 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
       count.look++;
       return reply(`${faults.liveness?.state ?? "alive"} ${faults.liveness?.boot ?? PROOF_BOOT}\n`);
     }
+    if (faults.real?.cleanupSpool && args[2]?.includes("nonce,keep=sys.argv[1:]")
+      && args[2].includes("def clear_session(parent,name):")) {
+      if (args[3] !== nonce || !["0", "1"].includes(args[4] ?? "")) fail("BOX_HOST_CLEANUP_IDENTITY");
+      count.cleanup++;
+      spool = Buffer.alloc(0);
+      return reply("clean\n");
+    }
     if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
       faults.proofRead?.(++count.proofRead);
       const asked = args[3]?.slice(-24) ?? nonce;
+      const reason = stopped.has(asked) ? "keeper_stopped" : faults.real?.proofReason ?? "worker_complete";
       return reply(`${JSON.stringify({ runNonce: asked, leaseEpoch: epochs.get(asked) ?? epoch, keeperPid: 101,
-        cliPid: 102, reason: stopped.has(asked) ? "keeper_stopped" : faults.real?.proofReason ?? "worker_complete",
-        revision: 1 })}\n`);
+        cliPid: 102, reason, revision: reason === "worker_failed" ? 2 : 1,
+        ...(reason === "worker_failed" ? { workerExitCode: faults.real?.workerExitCode ?? 1 } : {}) })}\n`);
     }
     if (args[2]?.includes("print('staged:'+str(len(steps)))")) {
       const steps = JSON.parse(Buffer.from(args[3]!, "base64").toString("utf8")) as unknown[];
@@ -933,9 +952,10 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     retainCleanupTarget: () => {} };
   const round = () => api.firstRound({ ...call, emit: (sse: string) => { emitted.push(sse); },
     ...(real?.resumeToolResults ? { resumeToolResults: true } : {}) }, deps);
-  return { round, call, deps, target, sequence, count, staged, files, handoffs, sse: () => emitted.join(""),
+  return { round, call, deps, target, sequence, count, staged, files, handoffs, spoolOffsets, sse: () => emitted.join(""),
     /** The CLI goes on and appends to its stdout spool. */
     write: (records: unknown[]) => { spool = Buffer.concat([spool, spoolOf(records)]); },
+    clearSpool: () => { spool = Buffer.alloc(0); },
     get spoolLength() { return spool.length; },
     get disposed() { return disposed; }, get launchEnvironment() { return launchEnvironment; },
     get launchArgs() { return launchArgs; }, get runNonce() { return nonce; }, get leaseEpoch() { return epoch; } };
@@ -1560,72 +1580,6 @@ async function proveSyntheticTurnHeld(api: Api, db: Db): Promise<string> {
   if (answered.kind !== "final" || !next.sse().includes("done")) fail("SYNTHETIC_TURN_NEXT_MESSAGE_NO_ANSWER");
   if ((await journalRow(db, "box-synthetic-turn-next"))?.ctx.boxState !== "terminal") fail("SYNTHETIC_TURN_NEXT_MESSAGE_NOT_SETTLED");
   return "[inc-20261006-synthetic-turn-held] PASS — a stream with the CLI's own synthetic turn settles unbilled and the next message runs";
-}
-
-// INC-20261006-BOX-SYNTHETIC-TURN-HELD (cause of the canary's "snapshot without
-// stream" rounds, found 2026-10-06 10:52Z): the Box account's five hour usage
-// window was exhausted. The CLI runs without retries, so it streamed no model
-// message and wrote its own synthetic assistant record ("You've hit your
-// session limit") plus an error result. The decoder called that a snapshot
-// violation; the row waited for the cleanup worker and the next message met
-// BOX_CAPACITY_HELD. The refusal is one named code, settles unbilled at once
-// and the next message is admitted. The spool is the capture from the Box.
-async function proveUpstreamRefusal(api: Api, db: Db): Promise<string> {
-  const who = { uid: 900_000_321n, containerId: 321n, sessionId: "session-upstream-refusal" };
-  const journal = api.journal(db);
-  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'upstream-refusal@test.invalid','unused',10000)",
-    [who.uid.toString()]);
-  const before = await money(db, who.uid);
-  const turnKey = "7".repeat(64);
-  await prechecked(api, db, { ...who, requestId: "box-upstream-refusal", turnKey });
-  const captured = readFileSync(fileURLToPath(new URL(
-    "../packages/commercial/src/http/proxy/__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl",
-    import.meta.url)), "utf8").trim().split("\n").map((line) => JSON.parse(line) as unknown);
-  let stops = 0;
-  const host = boxHost(api, spoolOf([cliInit, ...captured]), { real: { journal, ...who,
-    requestId: "box-upstream-refusal", turnKey,
-    // the CLI finished by itself: its keeper proof says worker_complete
-    proofReason: "worker_complete",
-    stopRejectedRun: async (identity) => { stops++; return api.stopCoordinator(journal, host.target).requestStop(identity); } } });
-  const rejected = await codeOf(host.round);
-  if (rejected !== "BOX_CLI_UPSTREAM_RATE_LIMITED") fail(`UPSTREAM_REFUSAL_NOT_NAMED_${rejected}`);
-  if (stops !== 1 || host.count.launch !== 1) fail("UPSTREAM_REFUSAL_STOP_OR_LAUNCH_COUNT");
-  const row = await journalRow(db, "box-upstream-refusal");
-  if (row?.state !== "aborted" || row.failure_code !== "STREAM_FAILED" || row.credits !== "0"
-    || row.ctx.boxState !== "failed_stopped" || row.ctx.boxStopOutcome !== "rejected_stream") {
-    fail(`UPSTREAM_REFUSAL_ROW_${row?.state}_${String(row?.ctx.boxState)}_${String(row?.ctx.boxStopOutcome)}`);
-  }
-  if (await money(db, who.uid) !== before) fail("UPSTREAM_REFUSAL_BILLED");
-  const idle = await journal.readIdleProof({ ...who, turnKey });
-  if (idle.status !== "failed" || !isDeepStrictEqual(idle.requestIds, ["box-upstream-refusal"])) fail(`UPSTREAM_REFUSAL_IDLE_${idle.status}`);
-  // CCB's same-request retries (streaming again, then the non-streaming fallback) must not
-  // find the settled attempt "still resolving": it has nothing to replay, and a second failed
-  // attempt of the same call must not make the call ambiguous either.
-  const replayDeps = { journal, readMessage: async () => { throw new Error("NO_MESSAGE"); } };
-  const lookupOf = (stream: boolean) => api.findReplay({ uid: who.uid, canonicalModel: MODEL,
-    upstreamModel: CLI_MODEL, canonicalBody: { ...host.call.canonicalBody, stream } as never }, replayDeps as never);
-  for (const stream of [false, true]) {
-    const found = await must(`UPSTREAM_REFUSAL_REPLAY_${stream}`, lookupOf(stream));
-    if (found.kind !== "missing") fail(`UPSTREAM_REFUSAL_REPLAY_${stream}_${found.kind}`);
-  }
-  await prechecked(api, db, { ...who, requestId: "box-upstream-refusal-2", turnKey });
-  const again = boxHost(api, spoolOf([cliInit, ...captured]), { real: { journal, ...who,
-    requestId: "box-upstream-refusal-2", turnKey, proofReason: "worker_complete",
-    stopRejectedRun: async (identity) => api.stopCoordinator(journal, again.target).requestStop(identity) } });
-  const secondCode = await codeOf(again.round);
-  if (secondCode !== "BOX_CLI_UPSTREAM_RATE_LIMITED") fail(`UPSTREAM_REFUSAL_SECOND_ATTEMPT_${secondCode}`);
-  for (const stream of [false, true]) {
-    const found = await must(`UPSTREAM_REFUSAL_REPLAY2_${stream}`, lookupOf(stream));
-    if (found.kind !== "missing") fail(`UPSTREAM_REFUSAL_REPLAY2_${stream}_${found.kind}`);
-  }
-  const nextKey = "8".repeat(64);
-  await prechecked(api, db, { ...who, requestId: "box-upstream-refusal-next", turnKey: nextKey });
-  const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
-    real: { journal, ...who, requestId: "box-upstream-refusal-next", turnKey: nextKey } });
-  const answered = await must("UPSTREAM_REFUSAL_NEXT_MESSAGE", next.round());
-  if (answered.kind !== "final" || !next.sse().includes("done")) fail("UPSTREAM_REFUSAL_NEXT_MESSAGE_NO_ANSWER");
-  if ((await journalRow(db, "box-upstream-refusal-next"))?.ctx.boxState !== "terminal") fail("UPSTREAM_REFUSAL_NEXT_MESSAGE_NOT_SETTLED");
-  return "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once, its retries are not seen as still resolving, and the next message runs";
 }
 
 // INC-20261010-BOX-OUTPUT-LIMIT-RESUME, live 2026-10-10 01:35Z (commercial
@@ -3704,6 +3658,9 @@ async function main(): Promise<void> {
   cleanups.add(() => rmSync(home, { recursive: true, force: true }));
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
+  const uid4Context = (db: Db): Uid4BoxProofContext => ({ api, db, boxHost, prechecked, journalRow,
+    money, must, codeOf, spoolOf, cliInit, finalAnswer: FINAL_ANSWER,
+    model: MODEL, upstreamModel: CLI_MODEL, candidate: CANDIDATE });
   const proofs = [(await import("./lib/boxKeeperOwnedChildrenProof.js")).proveKeeperOwnedChildren(CANDIDATE), proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
     proveForeignToolHistory(api), await proveGptWebCitationMarkers(CANDIDATE), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
@@ -3717,7 +3674,9 @@ async function main(): Promise<void> {
       await proveIdleNoSummary(api, db), await (await import("./lib/tapeJobTerminalProof.js")).proveTapeJobTerminals(CANDIDATE, db), // [ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key
       await proveAnsweredExchangePrompt(api, db), await proveReadPdfDocument({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
-      await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),
+      await proveUpstreamRefusal(uid4Context(db)), await proveNativeResumedStop(api, db),
+      await proveUid4FirstFailurePreserved(uid4Context(db)),
+      await proveUid4StoppedWorkerConverges(uid4Context(db)),
       await proveOutputLimitResume(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),

@@ -9764,6 +9764,61 @@
           "assertion": "a running chat leaves its login once that login's weekly quota is exhausted"
         }
       ]
+    },
+    {
+      "id": "INC-20261102-BOX-FIRST-FAILURE-LOST",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "商业 uid4 的流中首错被非流式回退 BOX_REPLAY_NOT_FOUND 覆盖，清理后无法定位原始拒绝。首错按精确运行身份有界持久化，只读回退保留原错误；成功或在途结果优先，歧义明确拒绝，不新增模型请求或重复结算。",
+      "rootFixCommit": "4f1f8d23",
+      "coverageCommits": ["40cae4f8"],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCoreFailure.test.ts",
+          "assertion": "mid-stream Box refusal survives the resolved pipe error after headers were sent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxReplayCompleted.test.ts",
+          "assertion": "a unique durable failure survives restart without reading a message or launching Box"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.integ.test.ts",
+          "assertion": "first Box failure survives cleanup/restart with exact, read-only fallback binding"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "await proveUid4FirstFailurePreserved(uid4Context(db))"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261102-BOX-STOPPED-WORKER-POLL-HANG",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "商业 uid4 四次 worker_failed 后 stdout 清理截断，旧游标继续空轮询 158 至 246 秒。轮询在精确 account/run/epoch 终态证明下排空竞争输出并及时返回失败；不把静默当停止，不重复 Stop、工具执行或结算。",
+      "rootFixCommit": "4f1f8d23",
+      "coverageCommits": ["40cae4f8"],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.terminal.test.ts",
+          "assertion": "a cleaned empty stdout beyond the old cursor stops on its strict failure proof"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.terminal.test.ts",
+          "assertion": "a terminal error for a different account cannot settle or clean the owned run"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "await proveUid4StoppedWorkerConverges(uid4Context(db))"
+        }
+      ]
     }
   ]
 }
