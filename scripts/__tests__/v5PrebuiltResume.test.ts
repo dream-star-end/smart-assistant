@@ -76,7 +76,9 @@ RELEASES_ROOT=${quote(path.dirname(master))}; OC_HOTCFG_RELEASES_ROOT=${quote(ru
 OC_HOTCFG_PLATFORM_ROOT=${quote(platformRoot)}; export KL_HOST=fixture V5_ENV="$FIX/env"
 RELEASE_QUEUE_SCRIPT="$FIX/queue"; OC_V5_RELEASE_QUEUE_ID=rq-fixture
 RESUME_BUILT_RELEASE="$FIX/record"; DRY=0; WITH_DIST=1; RESTART_EGRESS=0
-ssh() { shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }
+# OpenSSH joins command arguments before the remote shell parses them again.
+# Preserve that boundary: executing argv directly hides JSON quote loss.
+ssh() { shift; bash -c "$*"; }
 docker() { [[ "$1 $2" == 'image inspect' ]] || return 99; printf '%s\\n' "\${OBSERVED_IMAGE:-$FIX_IMAGE}"; }
 npx() { [[ "$1 $2" == '--no-install tsx' ]] || return 99; shift 2; node ${quote(path.join(repo, 'node_modules/tsx/dist/cli.mjs'))} "$@"; }
 getent() {
@@ -189,7 +191,7 @@ rollback() { echo UNEXPECTED_ROLLBACK >>"$FIX/calls"; return 99; }
 }
 
 describe('formal prebuilt resume real shell behavior', () => {
-  test('valid exact artifacts pass full verification, fresh SQL and runtime selection without builds', () => {
+  test('valid exact artifacts survive SSH shell parsing, full verification and fresh SQL without builds', () => {
     const fx = artifactFixture()
     try {
       const result = fx.run(`${fx.ready}

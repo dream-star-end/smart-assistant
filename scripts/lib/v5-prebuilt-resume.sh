@@ -98,17 +98,19 @@ prebuilt_resume_prepare() { # readonly, before production lease; CI outcomes are
 }
 
 prebuilt_resume_verify_artifacts() { # full hashes; uses immutable source's existing runtime verifier
-  local probe kind source short built artifact input caps
+  local probe kind source short built artifact input caps_b64
   probe="$(release_marker_probe "$PREBUILT_MASTER")" || return 1
   IFS=$'\t' read -r kind source short built artifact <<<"$probe"
   [[ "$kind" == strong && "$source" == "$PREBUILT_SOURCE" && "$artifact" == "$PREBUILT_MASTER_SHA" ]] || return 1
   assert_release_metadata_matches_commit "$PREBUILT_MASTER" "$PREBUILT_SOURCE" || return 1
   input="$(compute_runtime_input_digest "$PREBUILT_SOURCE" "$PREBUILT_IMAGE_ID")" || return 1
-  caps="$(git -C "$REPO_ROOT" show "$PREBUILT_SOURCE:deploy/v5/release-metadata.json" | jq -ce '.runtimeCapabilities|sort')" || return 1
-  ssh "$KL_HOST" bash -s -- "$PREBUILT_MASTER" "$PREBUILT_RUNTIME" "$OC_HOTCFG_RELEASES_ROOT" "$OC_HOTCFG_PLATFORM_ROOT" "$PREBUILT_BUNDLE" "$PREBUILT_SOURCE" "$PREBUILT_IMAGE_ID" "$input" "$caps" "$PREBUILT_RUNTIME_MANIFEST_SHA" "$PREBUILT_BUNDLE_MANIFEST_SHA" <<'REMOTE'
+  # OpenSSH reparses command arguments in a remote shell; JSON quotes must survive it.
+  caps_b64="$(git -C "$REPO_ROOT" show "$PREBUILT_SOURCE:deploy/v5/release-metadata.json" | jq -ce '.runtimeCapabilities|sort' | base64 -w0)" || return 1
+  ssh "$KL_HOST" bash -s -- "$PREBUILT_MASTER" "$PREBUILT_RUNTIME" "$OC_HOTCFG_RELEASES_ROOT" "$OC_HOTCFG_PLATFORM_ROOT" "$PREBUILT_BUNDLE" "$PREBUILT_SOURCE" "$PREBUILT_IMAGE_ID" "$input" "$caps_b64" "$PREBUILT_RUNTIME_MANIFEST_SHA" "$PREBUILT_BUNDLE_MANIFEST_SHA" <<'REMOTE'
 set -Eeuo pipefail
 master="$1"; runtime="$2"; runtime_root="$3"; platform_root="$4"; bundle="$platform_root/bundles/$5"
-source_commit="$6"; image="$7"; input="$8"; caps="$9"; runtime_mf="${10}"; bundle_mf="${11}"
+source_commit="$6"; image="$7"; input="$8"; runtime_mf="${10}"; bundle_mf="${11}"
+caps="$(printf '%s' "$9" | base64 -d)" || exit 1
 for root in "$master" "$runtime" "$bundle"; do
   [[ "$(readlink -f "$root")" == "$root" && -d "$root" && ! -L "$root" ]] || exit 1
   if [[ "$root" == "$master" ]]; then
