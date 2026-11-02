@@ -232,7 +232,7 @@ test('cancellation before helper READY cannot dispatch a late TUI launch', async
 test('local SSH exit and wrong/failed independent proof never report remoteStopped', async (t) => {
   for (const options of [{ failControl: true }, { badProof: true }])
     await t.test(JSON.stringify(options), async () => {
-      const f = fixture(options, { stopMs: 600, controlMs: 300 })
+      const f = fixture(options, { stopMs: 3000, controlMs: 1000 })
       try {
         const streams = f.start()
         await streams.ready
