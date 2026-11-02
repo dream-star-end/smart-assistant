@@ -43,6 +43,7 @@ import {
 } from './preCheck.js'
 import { abortInflightJournal, startInflightJournal } from './proxyBilling.js'
 import type { AdvisorCodexAdmitRoute } from './advisorCodexAdmitRoute.js'
+import { isPlatformPresetPaused } from '../marketplace/seedPlatformAgents.js'
 
 const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
@@ -214,6 +215,9 @@ export function createDelegateEngineBillingRuntime(
         const engine = engineRaw as 'codex' | 'grok'
         const agentId = requireString(body, 'agentId', AGENT_ID_RE)
         const delegateAgentId = requireString(body, 'delegateAgentId', AGENT_ID_RE)
+        if (isPlatformPresetPaused(agentId) || isPlatformPresetPaused(delegateAgentId)) {
+          throw new Error('DELEGATE_ENGINE_BILLING_AGENT_UNAVAILABLE')
+        }
         const sessionKey = requireString(body, 'sessionKey', SESSION_ID_RE)
         const parentSessionId = optionalString(body, 'parentSessionId', SESSION_ID_RE)
         const parentTurnKey = optionalString(body, 'parentTurnKey', PARENT_TURN_KEY_RE)

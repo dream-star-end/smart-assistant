@@ -1,4 +1,5 @@
-import { availablePluginSlugs, isMarketplaceArtifactAvailable, isPluginAvailable } from '../plugins/catalogPolicy.js'
+import { availablePluginSlugs, isMarketplaceArtifactAvailable as isPluginArtifactAvailable, isPluginAvailable } from '../plugins/catalogPolicy.js'
+import { isPlatformPresetPaused, pausedPlatformPresetAgentSlugs } from './seedPlatformAgents.js'
 import {
   type MarketplaceCapabilityInstallOutcome,
   type MarketplaceCapabilityRef,
@@ -82,6 +83,11 @@ import type { RiskFlag } from './skillScanner.js'
  *  lifecycle (publish→scan→review→approve→install→sync→revoke) is shared, only
  *  the scanner / install-applier / detail-renderer vary by kind. */
 export type ArtifactKind = 'skill' | 'agent' | 'connector'
+
+/** Compose existing plugin availability with the same preset execution policy. */
+function isMarketplaceArtifactAvailable(kind: string, slug: string): boolean {
+  return isPluginArtifactAvailable(kind, slug) && (kind !== 'agent' || !isPlatformPresetPaused(slug))
+}
 
 async function loadVerifiedMarketplacePlugin(
   versionId: number,
@@ -1872,7 +1878,8 @@ async function verifyLockedInstallTarget(
     !orgCanSee(listing.orgId, callerOrgId) ||
     version.status !== 'approved' ||
     listing.state !== 'active' ||
-    listing.currentApprovedVersionId !== version.id
+    listing.currentApprovedVersionId !== version.id ||
+    !isMarketplaceArtifactAvailable(listing.kind, listing.slug)
   )
     throw new MarketplaceError('NOT_INSTALLABLE', `工件不可安装：${version.slug}`)
   if (listing.kind === 'agent' && !marketplaceAgentsEnabled())
@@ -2097,6 +2104,10 @@ export async function installMarketplaceBundle(args: {
   )
   const root = located.rows[0]
   if (!root) throw new MarketplaceError('NOT_INSTALLABLE', '工件不可安装(未上架/已下架/非当前版本)')
+  if (!isMarketplaceArtifactAvailable(root.kind, root.slug))
+    throw new MarketplaceError('NOT_INSTALLABLE', '工件当前不可用')
+  if (normalizeCapabilityScopeCache(args.agentIds).some(isPlatformPresetPaused))
+    throw new MarketplaceError('NOT_INSTALLABLE', '不可分配给当前停用的预设')
   const discovered = await query<{ slug: string; kind: 'skill' | 'connector'; required: boolean }>(
     `SELECT capability_slug AS slug, capability_kind AS kind, required
        FROM marketplace_capability_requirements WHERE agent_version_id = $1
@@ -2795,6 +2806,8 @@ export async function updateInstalledAgentScope(
   agentIds: string[],
 ): Promise<boolean> {
   const finalScope = normalizeInstallAgentIds(agentIds, DEFAULT_INSTALL_AGENT_IDS)
+  if (finalScope.some(isPlatformPresetPaused))
+    throw new MarketplaceError('NOT_INSTALLABLE', '不可分配给当前停用的预设')
   const before = await query<{ agent_slug: string }>(
     `SELECT agent_slug FROM marketplace_agent_capability_bindings
       WHERE user_id = $1 AND capability_slug = $2 AND source = 'manual'
@@ -3316,14 +3329,21 @@ export async function listActiveInstalledArtifacts(
     [userId, orgId],
     runner,
   )
-  return r.rows.map((x) => ({
-    slug: x.slug,
-    version: x.version,
-    rawSkillMd: x.raw_skill_md,
-    artifactHash: x.artifact_hash,
-    agentIds: normalizeCapabilityScopeCache(x.agent_ids),
-    bundle: (x.raw_bundle as Record<string, string> | null) ?? null,
-  }))
+  return r.rows.flatMap((x) => {
+    const originalScope = normalizeCapabilityScopeCache(x.agent_ids)
+    const agentIds = originalScope.filter((id) => !isPlatformPresetPaused(id))
+    // Never reinterpret an office-only Skill as a main-Agent grant. The stored
+    // bindings remain untouched and become visible again after policy restore.
+    if (originalScope.length > 0 && agentIds.length === 0) return []
+    return [{
+      slug: x.slug,
+      version: x.version,
+      rawSkillMd: x.raw_skill_md,
+      artifactHash: x.artifact_hash,
+      agentIds,
+      bundle: (x.raw_bundle as Record<string, string> | null) ?? null,
+    }]
+  })
 }
 
 export interface InstalledAgent {
@@ -3377,7 +3397,7 @@ export async function listActiveInstalledAgents(
     [userId],
     runner,
   )
-  return r.rows.map((x) => ({
+  return r.rows.filter((x) => !isPlatformPresetPaused(x.slug)).map((x) => ({
     slug: x.slug,
     version: x.version,
     versionId: x.version_id,
@@ -3411,7 +3431,7 @@ export async function listPlatformPresetAgents(
     [slugs],
     runner,
   )
-  return r.rows.map((x) => ({
+  return r.rows.filter((x) => !isPlatformPresetPaused(x.slug)).map((x) => ({
     slug: x.slug,
     version: x.version,
     versionId: x.version_id,
@@ -3487,7 +3507,8 @@ export async function listRuntimeReadyAgentSets(
   // Configuration reserves the slug, not the success of the catalog lookup.
   // Otherwise a temporarily missing/invalid preset row could fail open to an
   // older personal install with the same slug.
-  const presetSet = new Set(presetSlugs)
+  const reservedSlugs = [...new Set([...presetSlugs, ...pausedPlatformPresetAgentSlugs()])]
+  const presetSet = new Set(reservedSlugs)
   const personalCandidates = installed.filter((agent) => !presetSet.has(agent.slug))
   const readiness = await getAgentCapabilityReadinessBatch(
     userId,
@@ -3511,7 +3532,7 @@ export async function listRuntimeReadyAgentSets(
   const readyInstalled = personalCandidates.filter(
     (agent) => readiness.get(agentCapabilityReadinessKey(agent.slug, false))?.ready === true,
   )
-  const denied = new Set<string>(presetSlugs)
+  const denied = new Set<string>(reservedSlugs)
   for (const agent of readyPresets) {
     denied.delete(agent.slug)
   }
