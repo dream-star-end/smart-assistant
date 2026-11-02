@@ -5,7 +5,7 @@
 // on infrastructure, not on the contract (#745 / #746 on 2026-10-15). This runs the same cold UI login
 // in its own browser context, sends no message and waits for the bridge's sys.relay_ready. The gate
 // that follows uses a fresh context and keeps every assertion and timeout; a prewarm that never gets
-// ready only warns, so the gate still decides.
+// ready fails the gate before any paid contract turn is sent.
 import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { launchJourneyBrowser } from "./lib/journey-browser.mjs";

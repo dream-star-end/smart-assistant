@@ -152,6 +152,7 @@ for mode in deploy prewarm-artifacts; do
       set -Eeuo pipefail
       source "$1"
       note() { printf "%s\n" "$*" >>"$TRACE"; }
+      user_contract_prewarm_cleanup() { note prewarm-drain; }
       reap_master_build_jobs() { note drain; }
       tsum_finish() { note "finish:$1"; }
       prewarm_cleanup_invocation() { note "prewarm:$1"; }
@@ -168,9 +169,9 @@ for mode in deploy prewarm-artifacts; do
     ' _ "$T/cleanup.sh" "$code"
     rc=$?
     check "$mode EXIT cleanup preserves status $code" test "$rc" = "$code"
-    expected="prewarm:$code"
+    expected=$'prewarm-drain\nprewarm:'"$code"
     if [[ "$mode" == deploy ]]; then
-      expected=$'drain\nfinish:'"$code"
+      expected=$'prewarm-drain\ndrain\nfinish:'"$code"
       if [[ "$code" != 86 ]]; then
         expected+=$'\npolicy'
         [[ "$code" == 0 ]] || expected+=$'\nabort'
