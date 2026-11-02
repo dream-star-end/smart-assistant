@@ -124,7 +124,7 @@ import { BoxContextTransportError, restoreBoxContextRequest } from "./boxContext
 import { boxContextSummary } from "./boxContextMetrics.js";
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
-import { runUpstreamRoundTrip, sendBoxUpstreamRefusal } from "./core.js";
+import { runUpstreamRoundTrip, sendBoxUpstreamRefusal, sendBoxFallbackFailure } from "./core.js";
 import { forgetBoxRefusal, recentBoxRefusal, rememberBoxRefusal } from "./boxRefusalMemory.js";
 import { BOX_NATIVE_CONTEXT_ROUTE_READY, selectBoxNativeByteBudget } from "./boxNativeContextOwner.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
@@ -1106,6 +1106,11 @@ export function makeAnthropicProxyHandler(
               if (gone.signal.aborted) return;
             }
           } catch (error) {
+            if (error instanceof BoxDurableJournalError && error.code === "BOX_CALL_AMBIGUOUS") {
+              sendJsonError(res, 409, error.code,
+                "The prior Box request cannot be identified safely", requestId);
+              return;
+            }
             if (error instanceof BoxDurableJournalError
               && (error.code === "BOX_AUTHORITY_REJECTED"
                 || error.code === "BOX_AUTHORITY_MALFORMED")) {
@@ -1129,6 +1134,10 @@ export function makeAnthropicProxyHandler(
             replay.response.headers.forEach((value, key) => { headers[key] = value; });
             res.writeHead(replay.response.status, headers);
             res.end(bytes);
+            return;
+          }
+          if (replay.kind === "failed") {
+            sendBoxFallbackFailure(res, replay.failure, requestId);
             return;
           }
           if (replay.kind === "pending") {
