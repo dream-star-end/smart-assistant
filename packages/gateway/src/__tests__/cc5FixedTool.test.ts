@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
+import fs from 'node:fs'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -95,8 +97,8 @@ function fixture() {
     connectionChallenge: a.connectionChallenge,
     securityEpoch: a.securityEpoch,
   }
-  const executor = () =>
-    new Cc5FixedToolExecutor(binding, request.sessionKey, keyring, admission, root)
+  const executor = (executionRoot = root) =>
+    new Cc5FixedToolExecutor(binding, request.sessionKey, keyring, admission, executionRoot)
   return {
     root,
     binding,
@@ -213,6 +215,33 @@ test('failed fixed command leaves attempted/unknown and cannot be restarted by a
     await assert.rejects(f.executor().execute(f.request, f.observed), /DELIVERY_UNKNOWN/)
     assert.equal(readFileSync(join(work, 'cc5-proof.txt'), 'utf8'), 'preexisting-guard')
   } finally {
+    f.cleanup()
+  }
+})
+
+test('new execution root parent fsync failure stops before journal creation or command effect', async () => {
+  const f = fixture()
+  const executionRoot = join(f.root, 'new-root')
+  const original = fs.fsyncSync
+  const parent = fs.statSync(f.root)
+  let called = 0
+  fs.fsyncSync = (fd: number): void => {
+    const target = fs.fstatSync(fd)
+    if (target.dev === parent.dev && target.ino === parent.ino) {
+      called++
+      throw Object.assign(new Error('injected parent fsync EIO'), { code: 'EIO' })
+    }
+    original(fd)
+  }
+  syncBuiltinESMExports()
+  try {
+    const executor = f.executor(executionRoot)
+    await assert.rejects(executor.execute(f.request, f.observed), /parent fsync EIO/)
+    assert.equal(called, 1)
+    assert.equal(existsSync(join(executionRoot, f.binding.operationId)), false)
+  } finally {
+    fs.fsyncSync = original
+    syncBuiltinESMExports()
     f.cleanup()
   }
 })

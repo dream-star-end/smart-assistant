@@ -15,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   type AuthorityKeyring,
   assertLeaseMatchesAuthority,
@@ -266,6 +266,8 @@ export class Cc5FixedToolExecutor {
       }),
     )
     privateDir(this.executionRoot)
+    // Persist the newly-created root entry before any journal or command effect.
+    syncDir(dirname(this.executionRoot))
     const work = join(this.executionRoot, request.operationId)
     privateDir(work)
     const receiptPath = join(work, 'receipt.json')
