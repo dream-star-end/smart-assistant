@@ -84,3 +84,28 @@ proxy receipt/proof file exists. Before stopping `hold`, explicitly perform the
 same full-container-ID independent verification; `hold` itself only keeps the
 fixture alive and does not execute `check`'s trailing verification. The current
 scripts provide the container half, not a completed cc5 controller/acceptance.
+
+## Steward 09:12: installation and READY-only approved
+
+The original host plus four original plugin sources exactly match personal live
+9826fe951. Install these five sources in the task's private `install` directory;
+the unmodified host generates the four runtime plugin copies and tap.py in `run`.
+This replaces the earlier in-memory host bootstrap plan and keeps protocol fd0
+untouched. No additional plugin/client/system package is installed. The helper
+`cc5-smoke-prepare.py` packages, validates, launches and stops through SSH22;
+its source stays in the v5-dev task tree, executed over SSH without installing
+another helper on cc5. All task paths are under box's home, no sudo.
+
+READY-only uses a separate task tmux socket via TMUX_TMPDIR, an empty open input
+pipe and no prompt/resume/continue or permission-response frames. The controller
+must count the bytes it actually writes; the remote inspector does not invent
+that count. Unknown stderr/pane tails are discarded. Record task PTY/argv and
+stop only a revalidated host identity through pidfd, then check original login
+pane metadata and task runtime removal. Keep the fixed installation for the
+approved real round; after that, helper cleanup removes only this task root,
+refusing a live runtime/session. READY-only is not real-chat acceptance and does
+not prove the CLI made zero startup/background model requests.
+
+The prompt.submit evidence question is still pending. Do not send the real user
+frame until the steward conveys that answer. The expired incident waiver stays
+unchanged; the steward will decide before P3 merge.
