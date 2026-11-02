@@ -100,3 +100,4 @@ export type {
 } from './g8ReplayJudge.js'
 
 export * from './cc5TestModel.js'
+export * from './cc5Backend.js'

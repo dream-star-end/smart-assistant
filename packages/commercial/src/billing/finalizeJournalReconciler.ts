@@ -42,6 +42,7 @@ import {
 import { transitionProductFrictionEventIfPresent } from '../productFriction/events.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { EVENTS } from '../admin/alertEvents.js'
+import { REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 60_000
 export const MIN_INTERVAL_MS = 5_000
@@ -342,6 +343,7 @@ export async function reconcileStuckFinalizeJournal(
       WHERE rfj.request_id = ur.request_id
         AND rfj.user_id = ur.user_id
         AND rfj.state IN ('inflight', 'finalizing')
+        AND COALESCE(rfj.ctx->>'remoteNativeBillingRecovery', '') <> '${REMOTE_NATIVE_BILLING_RECOVERY_VERSION}'
         AND (
           rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
           OR COALESCE(rfj.ctx->>'gatewayExitedAt', '') <> ''
@@ -366,6 +368,7 @@ export async function reconcileStuckFinalizeJournal(
       WHERE rfj.state IN ('inflight', 'finalizing')
         AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') <> $2
         AND COALESCE(rfj.ctx->>'boxInvocationRecovery', '') <> 'v1'
+        AND COALESCE(rfj.ctx->>'remoteNativeBillingRecovery', '') <> '${REMOTE_NATIVE_BILLING_RECOVERY_VERSION}'
         AND NOT EXISTS (
           SELECT 1 FROM usage_records ur
            WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
@@ -415,6 +418,7 @@ export async function reconcileStuckFinalizeJournal(
       WHERE rfj.state = 'inflight'
         AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
         AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') = $2
+        AND COALESCE(rfj.ctx->>'remoteNativeBillingRecovery', '') <> '${REMOTE_NATIVE_BILLING_RECOVERY_VERSION}'
         AND NOT EXISTS (
           SELECT 1 FROM usage_records ur
            WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
@@ -451,6 +455,7 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
            AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
            AND COALESCE(ctx->>'durableBillingRecovery', '') <> $3
            AND COALESCE(ctx->>'boxInvocationRecovery', '') <> 'v1'
+           AND COALESCE(ctx->>'remoteNativeBillingRecovery', '') <> '${REMOTE_NATIVE_BILLING_RECOVERY_VERSION}'
          ORDER BY updated_at ASC
          LIMIT $2
       )
@@ -467,6 +472,7 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
          WHERE rfj.state = 'committed'
            AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
            AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') = $3
+           AND COALESCE(rfj.ctx->>'remoteNativeBillingRecovery', '') <> '${REMOTE_NATIVE_BILLING_RECOVERY_VERSION}'
            AND EXISTS (
              SELECT 1 FROM usage_records ur
               WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
@@ -485,6 +491,7 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
          WHERE state = 'aborted'
            AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
            AND COALESCE(ctx->>'durableBillingRecovery', '') = $3
+           AND COALESCE(ctx->>'remoteNativeBillingRecovery', '') <> '${REMOTE_NATIVE_BILLING_RECOVERY_VERSION}'
          ORDER BY updated_at ASC
          LIMIT $2
       )

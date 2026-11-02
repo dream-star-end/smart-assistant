@@ -20,6 +20,7 @@ import { type Cc5BridgeBinding, cc5ControlRequest } from '../cc5BridgePort.js'
 import { CC5_FIXED_TOOL_NAME, type Cc5ToolRequest } from '../cc5FixedTool.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from '../cc5Relay.js'
 import { runCc5StdioBridge } from '../cc5StdioBridge.js'
+import type { Cc5FinancePort } from '../cc5Finance.js'
 
 function fixture() {
   const key = generateKeyPairSync('ed25519')
@@ -28,7 +29,11 @@ function fixture() {
   const now = Date.now()
   const root = mkdtempSync(join(tmpdir(), 'cc5-fixed-tool-'))
   const binding: Cc5BridgeBinding = {
-    version: 1,
+    version: 2,
+    backendKind: 'cc5-interactive-v1',
+    canonicalModel: 'box-claude-sonnet-5',
+    sessionKey: 'agent:main:webchat:dm:fixture_chat1',
+    runId: randomUUID(),
     uid: '912',
     containerDbId: '91',
     dockerId: 'a'.repeat(64),
@@ -43,8 +48,9 @@ function fixture() {
     containerId: 91,
     authorityTurnId: randomBytes(16).toString('hex'),
     connectionChallenge: 'synthetic-connection',
-    canonicalModel: 'cc5-remote-t1555u',
-    engine: 'cursor',
+    canonicalModel: 'box-claude-sonnet-5',
+    engine: 'ccb',
+    executionBackend: { kind: 'cc5-interactive-v1', sessionKey: binding.sessionKey, operationId: binding.operationId },
     securityEpoch: 12,
     executionRevision: 'test-r1',
     issuedAt: now,
@@ -78,7 +84,7 @@ function fixture() {
     containerDbId: binding.containerDbId,
     dockerId: binding.dockerId,
     operationId: binding.operationId,
-    sessionKey: 'personal-task-session',
+    sessionKey: 'agent:main:webchat:dm:fixture_chat1',
     turnKey: 'logical-billing-key-is-not-authority-id',
     nativeSessionId: randomUUID(),
     toolUseId: 'toolu_actual-frame',
@@ -118,6 +124,7 @@ function fixture() {
 async function harness(
   f: ReturnType<typeof fixture>,
   failure: 'none' | 'start' | 'stop' | 'stdin-error' = 'none',
+  financeOverride?: Cc5FinancePort,
 ) {
   const written: Buffer[] = []
   const input =
@@ -148,6 +155,7 @@ async function harness(
   const port: Cc5InteractiveHostPort = {
     start() {
       starts++
+      financeEvents.push('host-start')
       started()
       if (failure === 'start') throw new Error('synthetic spawn status unknown')
       return { stdin: input, stdout: output, ready: readyPromise }
@@ -159,8 +167,20 @@ async function harness(
       return { remoteStopped: true }
     },
   }
-  const runId = randomUUID()
-  const relay = new Cc5Relay(f.binding, f.keyring, runId, port, join(f.root, 'relay-journal'))
+  const runId = f.binding.runId
+  const financeEvents: string[] = []
+  const finance = {
+    async admit() {
+      financeEvents.push('admit')
+      return {
+        async beforeHostStart() { financeEvents.push('host-effect') },
+        async beforeDispatch() { financeEvents.push('dispatch-effect') },
+        async terminal() { financeEvents.push('settled'); return { state: 'proven' as const, requestId: 'fixture-request' } },
+        async stop() { financeEvents.push('stop') },
+      }
+    },
+  }
+  const relay = new Cc5Relay(f.binding, f.keyring, runId, port, join(f.root, 'relay-journal'), financeOverride ?? finance)
   const socketPath = relative(process.cwd(), join(f.root, 'control.sock'))
   const toolSocket = relative(process.cwd(), join(f.root, 'tool.sock'))
   relay.controlServer.listen(socketPath)
@@ -202,6 +222,7 @@ async function harness(
     output,
     written,
     runId,
+    financeEvents,
     counts: () => ({ starts, stops }),
   }
 }
@@ -227,10 +248,10 @@ function rpc(socketPath: string, path: string, body: unknown): Promise<Record<st
 }
 
 test(
-  'open and admit in either order join one host and positive stop proof',
+  'budgeted admission precedes opening the stream and starts exactly one host',
   { timeout: 15000 },
   async (t) => {
-    for (const order of ['open-first', 'admit-first'])
+    for (const order of ['admit-first'])
       await t.test(order, async () => {
         const f = fixture()
         const h = await harness(f)
@@ -308,6 +329,150 @@ test('wrong signed identity fails before host startup or dispatch', async () => 
   }
 })
 
+test('an open request without admitted finance cannot start a host', async () => {
+  const f = fixture()
+  const h = await harness(f)
+  try {
+    await assert.rejects(rpc(h.socketPath, '/session/open', { type: 'open', ...h.scope }))
+    assert.equal(h.counts().starts, 0)
+    assert.deepEqual(h.financeEvents, [])
+  } finally { await h.close(); f.cleanup() }
+})
+
+test('finance and its durable startup marker run before any potentially billable host startup', async () => {
+  const f = fixture()
+  const events: string[] = []
+  const finance: Cc5FinancePort = {
+    async admit() {
+      events.push('admit')
+      return {
+        async beforeHostStart() { events.push('host-effect'); throw new Error('fixture durable boundary failed') },
+        async beforeDispatch() { throw new Error('must not dispatch') },
+        async terminal() { throw new Error('must not settle') },
+        async stop(info) { assert.equal(info.hostStartAttempted, false); events.push('stopped-before-host') },
+      }
+    },
+  }
+  const h = await harness(f, 'none', finance)
+  try {
+    await assert.rejects(h.admit())
+    await h.relay.stop()
+    await assert.rejects(h.admit())
+    assert.deepEqual(events, ['admit', 'host-effect', 'stopped-before-host'])
+    assert.equal(h.counts().starts, 0)
+    assert.equal(h.written.length, 0)
+  } finally { await h.close(); f.cleanup() }
+})
+
+test('same user and Sonnet authority cannot claim another session or operation', async () => {
+  const f = fixture()
+  const h = await harness(f)
+  try {
+    for (const executionBackend of [
+      { ...f.a.executionBackend!, sessionKey: 'agent:main:webchat:dm:other_chat1' },
+      { ...f.a.executionBackend!, operationId: randomUUID() },
+    ]) await assert.rejects(cc5ControlRequest('/admit', { ...h.scope,
+      authority: f.envelope({ ...f.a, executionBackend }), lease: f.request.lease,
+      turnKey: f.request.turnKey }, h.socketPath))
+    assert.equal(h.counts().starts, 0)
+    assert.deepEqual(h.financeEvents, [])
+  } finally { await h.close(); f.cleanup() }
+})
+
+test('original result bytes wait for proven settlement; native usage receipt never uses assistant text or CLI cost',
+  { timeout: 15000 }, async () => {
+    const f = fixture()
+    let release!: () => void
+    let entered!: () => void
+    const settling = new Promise<void>((resolve) => { entered = resolve })
+    const settled = new Promise<void>((resolve) => { release = resolve })
+    const finance: Cc5FinancePort = { async admit() { return {
+      async beforeHostStart() {}, async beforeDispatch() {}, async stop() {},
+      async terminal(receipt) {
+        assert.equal(receipt.nativeSessionId, f.request.nativeSessionId)
+        assert.equal(receipt.upstreamModel, 'claude-sonnet-5')
+        assert.deepEqual(receipt.usage, { inputTokens: 7, outputTokens: 3, cacheReadTokens: 11, cacheWriteTokens: 13 })
+        entered(); await settled
+        return { state: 'proven', requestId: 'existing-request-id' }
+      },
+    } } }
+    const h = await harness(f, 'none', finance)
+    const controller = new AbortController()
+    const stdin = new PassThrough(); const stdout = new PassThrough(); const output: Buffer[] = []
+    stdout.on('data', (bytes) => output.push(bytes))
+    let running: Promise<void> | undefined
+    try {
+      const admitted = h.admit(); h.ready(); await admitted
+      running = runCc5StdioBridge({ binding: f.binding, sessionKey: f.binding.sessionKey, stdin, stdout,
+        socketPath: h.socketPath, signal: controller.signal })
+      void running.catch(() => {})
+      stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'fixture only' } })}\n`)
+      if (!h.written.length) await once(h.input, 'data')
+      const raw = Buffer.from(`${[
+        { type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: f.request.nativeSessionId },
+        { type: 'result', subtype: 'success', is_error: false, session_id: f.request.nativeSessionId,
+          total_cost_usd: 999999, result: '{"input_tokens":999999}', usage: { input_tokens: 7,
+            output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 } },
+      ].map((row) => JSON.stringify(row)).join('\n')}\n`)
+      h.output.write(raw)
+      await settling
+      assert.equal(Buffer.concat(output).includes(Buffer.from('"type":"result"')), false)
+      release()
+      const deadline = Date.now() + 2000
+      while (Buffer.concat(output).length < raw.length && Date.now() < deadline)
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      assert.deepEqual(Buffer.concat(output), raw)
+      controller.abort(); await running
+      assert.equal(h.written.length, 1)
+    } finally {
+      release(); controller.abort(); await running?.catch(() => {}); await h.close(); f.cleanup()
+    }
+  })
+
+test('pending or throwing native settlement withholds terminal and records a started operation at stop',
+  { timeout: 15000 }, async (t) => {
+    for (const failure of ['pending', 'throw']) await t.test(failure, async () => {
+      const f = fixture()
+      const stops: unknown[] = []
+      let settlements = 0
+      const finance: Cc5FinancePort = { async admit() { return {
+        async beforeHostStart() {}, async beforeDispatch() {},
+        async terminal() {
+          settlements++
+          if (failure === 'throw') throw new Error('fixture commit acknowledgement unknown')
+          return { state: 'pending' }
+        },
+        async stop(info) { stops.push(info) },
+      } } }
+      const h = await harness(f, 'none', finance)
+      const controller = new AbortController(); const stdin = new PassThrough(); const stdout = new PassThrough()
+      const output: Buffer[] = []; stdout.on('data', (bytes) => output.push(bytes))
+      let running: Promise<void> | undefined
+      try {
+        const admitted = h.admit(); h.ready(); await admitted
+        running = runCc5StdioBridge({ binding: f.binding, sessionKey: f.binding.sessionKey, stdin, stdout,
+          socketPath: h.socketPath, signal: controller.signal })
+        void running.catch(() => {})
+        stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'fixture only' } })}\n`)
+        if (!h.written.length) await once(h.input, 'data')
+        h.output.write(`${[
+          { type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: f.request.nativeSessionId },
+          { type: 'result', subtype: 'success', is_error: false, session_id: f.request.nativeSessionId,
+            usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 } },
+        ].map((row) => JSON.stringify(row)).join('\n')}\n`)
+        await h.stopObserved
+        await h.relay.stop()
+        assert.equal(Buffer.concat(output).includes(Buffer.from('"type":"result"')), false)
+        assert.equal(settlements, 1)
+        assert.deepEqual(stops, [{ hostStartAttempted: true, userSubmitted: true, remoteStopped: true }])
+        await assert.rejects(h.admit())
+        assert.equal(h.counts().starts, 1)
+      } finally {
+        controller.abort(); await running?.catch(() => {}); await h.close(); f.cleanup()
+      }
+    })
+  })
+
 test('missing remote absence proof never returns a positive stop result', async () => {
   const f = fixture()
   const h = await harness(f, 'stop')
@@ -351,20 +516,21 @@ test(
         },
       })}\n`,
     )
-    const running = runCc5StdioBridge({
-      binding: f.binding,
-      sessionKey: f.request.sessionKey,
-      stdin,
-      stdout,
-      socketPath: h.socketPath,
-      signal: controller.signal,
-      tools: { keyring: f.keyring, executionRoot: f.root },
-    })
-    void running.catch(() => {})
+    let running: Promise<void> | undefined
     try {
       const accepted = h.admit()
       h.ready()
       await accepted
+      running = runCc5StdioBridge({
+        binding: f.binding,
+        sessionKey: f.request.sessionKey,
+        stdin,
+        stdout,
+        socketPath: h.socketPath,
+        signal: controller.signal,
+        tools: { keyring: f.keyring, executionRoot: f.root },
+      })
+      void running.catch(() => {})
       stdin.write(
         `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'fixture, no model' } })}\n`,
       )
@@ -396,7 +562,7 @@ test(
       assert.deepEqual(h.counts(), { starts: 1, stops: 1 })
     } finally {
       controller.abort()
-      await running.catch(() => {})
+      await running?.catch(() => {})
       await h.close()
       f.cleanup()
     }
@@ -486,21 +652,22 @@ test(
     const h = await harness(f)
     const controller = new AbortController()
     const stdin = new PassThrough()
-    const running = runCc5StdioBridge({
-      binding: f.binding,
-      sessionKey: f.request.sessionKey,
-      stdin,
-      stdout: new PassThrough(),
-      socketPath: h.socketPath,
-      signal: controller.signal,
-      tools: { keyring: f.keyring, executionRoot: f.root },
-    })
-    void running.catch(() => {})
+    let running: Promise<void> | undefined
     let req: ReturnType<typeof request> | undefined
     try {
       const admission = h.admit()
       h.ready()
       await admission
+      running = runCc5StdioBridge({
+        binding: f.binding,
+        sessionKey: f.request.sessionKey,
+        stdin,
+        stdout: new PassThrough(),
+        socketPath: h.socketPath,
+        signal: controller.signal,
+        tools: { keyring: f.keyring, executionRoot: f.root },
+      })
+      void running.catch(() => {})
       stdin.write(
         `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'disconnect fixture' } })}\n`,
       )
@@ -547,7 +714,7 @@ test(
     } finally {
       req?.destroy()
       controller.abort()
-      await running.catch(() => {})
+      await running?.catch(() => {})
       await h.close()
       f.cleanup()
     }
@@ -562,19 +729,20 @@ test(
     const h = await harness(f, 'stdin-error')
     const controller = new AbortController()
     const stdin = new PassThrough()
-    const running = runCc5StdioBridge({
-      binding: f.binding,
-      sessionKey: f.request.sessionKey,
-      stdin,
-      stdout: new PassThrough(),
-      socketPath: h.socketPath,
-      signal: controller.signal,
-    })
-    void running.catch(() => {})
+    let running: Promise<void> | undefined
     try {
       const admission = h.admit()
       h.ready()
       await admission
+      running = runCc5StdioBridge({
+        binding: f.binding,
+        sessionKey: f.request.sessionKey,
+        stdin,
+        stdout: new PassThrough(),
+        socketPath: h.socketPath,
+        signal: controller.signal,
+      })
+      void running.catch(() => {})
       stdin.write(
         `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'EPIPE fixture' } })}\n`,
       )
@@ -584,7 +752,7 @@ test(
       assert.equal(h.counts().stops, 1)
     } finally {
       controller.abort()
-      await running.catch(() => {})
+      await running?.catch(() => {})
       await h.close()
       f.cleanup()
     }

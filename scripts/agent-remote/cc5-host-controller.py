@@ -326,7 +326,7 @@ def profile_args(root, info):
             'unsafe-task-workdir')
     cli = claude_executable(root, info)
     require(cli == str(root / 'bin/claude-2.1.316'), 'requires-private-cli')
-    return [cli, '--permission-mode', 'default', '--model', 'sonnet', '--tools', '',
+    return [cli, '--permission-mode', 'default', '--model', 'claude-sonnet-5', '--tools', '',
             '--strict-mcp-config', '--mcp-config', str(root / 'cprofile/mcp.json'),
             '--setting-sources', '', '--disable-slash-commands', '--allowedTools', 'mcp__ocbridge__roundtrip']
 
@@ -504,7 +504,12 @@ def launch_locked(root):
            'TMPDIR': str(root / 'tmp'), 'TMUX_TMPDIR': str(root / 'tmux'),
            'OC_BOX_MOD_FILES': json.dumps({name: base64.b64encode(files['mod/oc-bridge/' + name]).decode()
                                            for name in PLUGIN}),
-           'OC_BOX_MOD_SHA256': info['pluginDigest'], 'OC_BOX_READY_MS': '20000'}
+           'OC_BOX_MOD_SHA256': info['pluginDigest'], 'OC_BOX_READY_MS': '20000',
+           # Same native guards as boxTextPlan.ts; these bound retries/output,
+           # not the number of upstream requests or the platform monetary cost.
+           'CLAUDE_CODE_MAX_RETRIES': '0', 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1',
+           'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS': '1024',
+           'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'}
     claude_executable(root, info, full_hash=True)
     cli_args = profile_args(root, info)
     write_lifecycle(root, info, {'host': process_record(os.getpid()), 'claude': None, 'descendants': [],

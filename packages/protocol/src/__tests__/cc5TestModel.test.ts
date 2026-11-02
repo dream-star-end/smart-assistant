@@ -7,7 +7,8 @@ const enabled = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TE
 
 test('cc5 has exact model identity and default-off execution', () => {
   assert.equal(isCc5TestModel('cc5-remote-t1555u'), true)
-  assert.equal(isCursorEngineModel('cc5-remote-t1555u'), true)
+  // The old task policy remains a compatibility leaf, but is no longer a catalog/engine model.
+  assert.equal(isCursorEngineModel('cc5-remote-t1555u'), false)
   for (const value of [null, '', 'CC5-remote-t1555u', 'cc5-remote-t1555u ', 'cursor-auto']) {
     assert.equal(isCc5TestModel(value), false)
   }

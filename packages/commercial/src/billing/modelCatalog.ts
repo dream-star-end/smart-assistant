@@ -31,7 +31,6 @@ import { createHash } from "node:crypto";
 import { Client } from "pg";
 import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
-  canUseCc5TestModel,
   isCc5TestModel,
   isBoxGptWebModel,
   isBoxGptWebOwnerUid,
@@ -603,9 +602,9 @@ export class ModelCatalogSnapshot {
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
     const routable = entry !== undefined && schemaOk && pricing !== undefined;
     const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebOwnerUid(scope.uid);
-    const cc5Ok = !isCc5TestModel(canonical) || canUseCc5TestModel(scope.uid, process.env);
+    const cc5Ok = !isCc5TestModel(canonical); // retired task model; backend routing uses existing Sonnet
     const cursorOk = cc5Ok &&
-      (entry?.engine !== "cursor" || isCc5TestModel(canonical) || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;
+      (entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;
     // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid
     // credential uid). Anonymous is a placeholder identity: after subscribe
     // they get a real uid, and policy `all` accepts every real uid. Advertise

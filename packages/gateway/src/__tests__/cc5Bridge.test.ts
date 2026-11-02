@@ -8,13 +8,18 @@ import { type Cc5BridgeBinding, type Cc5BridgePort, UnixCc5BridgePort } from '..
 import { runCc5StdioBridge } from '../cc5StdioBridge.js'
 import { Cc5InteractiveAdapter } from '../engine/cc5InteractiveAdapter.js'
 import { cc5ResumeId } from '../engine/cc5ResumeId.js'
-import { CursorRoutingAdapter } from '../engine/cursorRoutingAdapter.js'
+import { createCcbBackend } from '../engine/ccbFactory.js'
+import { CcbAdapter } from '../engine/ccbAdapter.js'
 import { probeResumeArtifact } from '../engine/resumeArtifacts.js'
 import { _resumeIdFor } from '../sessionSubmit.js'
 import { SubprocessRunner, __setCcbSpawnForTests } from '../subprocessRunner.js'
 
 const binding: Cc5BridgeBinding = {
-  version: 1,
+  version: 2,
+  backendKind: 'cc5-interactive-v1',
+  canonicalModel: 'box-claude-sonnet-5',
+  sessionKey: 'agent:main:webchat:dm:cc5native1',
+  runId: randomUUID(),
   uid: '912',
   containerDbId: '91',
   dockerId: 'a'.repeat(64),
@@ -22,8 +27,11 @@ const binding: Cc5BridgeBinding = {
   capability: 'b'.repeat(64),
   expiresAt: Date.now() + 120000,
 }
+const executionBackend = { kind: 'cc5-interactive-v1' as const, sessionKey: binding.sessionKey, operationId: binding.operationId }
 const descriptor = {
-  canonicalModel: 'cc5-remote-t1555u',
+  canonicalModel: binding.canonicalModel,
+  executionBackend,
+  contextOwner: 'box-native-v1' as const,
   contextWindow: 200000,
   capabilityZero: true,
   supportsThinking: true,
@@ -68,7 +76,10 @@ function fixture(admitError?: string) {
   let stopped = 0
   const port: Cc5BridgePort = {
     bindingId: binding.operationId,
+    executionBackend,
+    canonicalModel: binding.canonicalModel,
     async prepare() {
+      assert.equal(admitted, 1, 'budget/admission must happen before bridge preparation/spawn')
       prepared++
       return spawnOpts
     },
@@ -93,7 +104,8 @@ function fixture(admitError?: string) {
     },
   }
   const opts = {
-    sessionKey: 'task-session',
+    sessionKey: binding.sessionKey,
+    executionBackend,
     agentId: 'main',
     agentBaseDir: process.cwd(),
     model: descriptor.canonicalModel,
@@ -101,7 +113,7 @@ function fixture(admitError?: string) {
     cc5BridgePort: port,
     harness: 'official-cc' as const,
     boxResidentCc: true,
-    authorityEngine: 'cursor' as const,
+    authorityEngine: 'ccb' as const,
     prepareBoxCc: async () => {
       throw new Error('OLD_BOX_POOL_TOUCHED')
     },
@@ -164,7 +176,7 @@ test('cc5 rejects missing authority/readOnly before spawning and never pins the 
 
 test('cc5 port snapshots mutable lease, burns admission on unknown, and requires positive remote stop', async () => {
   let calls = 0
-  const port = new UnixCc5BridgePort(binding, 'session', async (path, body) => {
+  const port = new UnixCc5BridgePort(binding, binding.sessionKey, async (path, body) => {
     calls++
     if (path === '/stop') return { ok: true, remoteStopped: false }
     assert.equal(body.lease, 'synthetic-lease')
@@ -201,7 +213,7 @@ test('cc5 adapter keeps remote native IDs out of local artifact probes and forbi
   adapter.emit('session_id', native)
   assert.equal(observed, cc5ResumeId(binding.operationId, native))
   assert.deepEqual(
-    probeResumeArtifact('cursor', String(observed), { workspacePath: '/does-not-exist' }),
+    probeResumeArtifact('ccb', String(observed), { workspacePath: '/does-not-exist' }),
     { exists: false },
   )
   assert.equal(adapter.requiresReopenForModel('cursor-auto'), true)
@@ -253,7 +265,7 @@ test('actual Unix HTTP stream preserves original bytes, hashes one user frame, a
   const controller = new AbortController()
   const running = runCc5StdioBridge({
     binding,
-    sessionKey: 's',
+    sessionKey: binding.sessionKey,
     stdin,
     stdout,
     socketPath,
@@ -298,7 +310,7 @@ test('unproven remote stop still revokes the local generation and closes its std
   assert.equal(f.proc.stdin.writableEnded, true)
 })
 
-test('a persisted cc5 id cannot block leaving cc5 or enter a local resume probe', () => {
+test('a persisted cc5 id never enters a local resume probe and the native route keeps the CCB model', () => {
   const remote = cc5ResumeId(binding.operationId, randomUUID())
   const host = {
     _resumeMap: new Map([['s', remote]]),
@@ -309,12 +321,28 @@ test('a persisted cc5 id cannot block leaving cc5 or enter a local resume probe'
   for (const provider of ['ccb', 'codex', 'cursor']) {
     assert.equal(_resumeIdFor.call(host as never, 's', provider, '/no-local-probe'), undefined)
   }
-  // Check the actual existing-router boundary without constructing any credential selector.
-  assert.equal(
-    CursorRoutingAdapter.prototype.requiresReopenForModel.call(
-      {} as never,
-      descriptor.canonicalModel,
-    ),
-    true,
-  )
+  // The same canonical Sonnet keeps its catalog engine while the verified
+  // backend selects a distinct implementation, with no Cursor pool selector.
+  const f = fixture()
+  assert.ok(createCcbBackend(f.opts) instanceof Cc5InteractiveAdapter)
+  const { executionBackend: _scope, cc5BridgePort: _port, ...local } = f.opts
+  assert.ok(createCcbBackend(local) instanceof CcbAdapter)
+  assert.throws(() => createCcbBackend({ ...local, cc5BridgePort: f.port }), /SCOPE_REQUIRED/)
+
+})
+
+test('native backend requires the same signed scope, never just the Sonnet model', async () => {
+  const f = fixture()
+  const runner = new SubprocessRunner(f.opts)
+  const foreign = { ...authority, executionDescriptor: { ...descriptor,
+    executionBackend: { ...executionBackend, operationId: randomUUID() } } }
+  await assert.rejects(runner.submit('x', undefined, foreign, 't'), /AUTHORITY_REQUIRED/)
+  assert.equal(f.counts().admitted, 0)
+  assert.equal(f.counts().prepared, 0)
+  const { executionBackend: _scope, ...noScope } = f.opts
+  assert.throws(() => new Cc5InteractiveAdapter(noScope), /PROFILE_UNSUPPORTED/)
+  const adapter = new Cc5InteractiveAdapter(f.opts)
+  await adapter.preheat()
+  assert.equal(f.counts().admitted, 0)
+  assert.equal(f.counts().prepared, 0)
 })

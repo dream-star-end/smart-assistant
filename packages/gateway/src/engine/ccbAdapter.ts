@@ -1,4 +1,4 @@
-import type { PromptPrivacyPolicy } from '@openclaude/protocol'
+import type { Cc5ExecutionBackend, PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * CcbAdapter — CCB(claude-code-best)底座的 EngineAdapter 实现。
  *
@@ -382,6 +382,7 @@ const FORWARDED_RUNNER_EVENTS = [
 
 export class CcbAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId: string = 'ccb'
+  readonly executionBackend?: Cc5ExecutionBackend
   readonly capabilities: EngineCapabilities = {
     billingMode: 'proxy',
     supportsEffort: true,
@@ -433,6 +434,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
+    if (Boolean(opts.executionBackend) !== Boolean(opts.cc5BridgePort)) throw new Error('CC5_BACKEND_TRANSPORT_REQUIRED')
+    this.executionBackend = opts.executionBackend ? Object.freeze({ ...opts.executionBackend }) : undefined
     // Hermetic one-shots (Auto-Dream, advisor) only run on CCB: the stock CLI
     // refuses them (OFFICIAL_CC_REQUIRES_LOCAL_NON_HERMETIC), so OC_CCB_OFFICIAL_CC
     // must not move them off CCB.
@@ -805,7 +808,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    * calls this notifier. The gateway owns it beyond the CLI interrupt. */
   private _notifyBoxStop(turn: CcbTurnContext, cause: 'user' | 'continuation_rejected'): void {
     const nativeSessionId = this.runner.sessionId
-    if (turn.boxStopNotified || !isBoxApiModel(this.model)
+    if (this.executionBackend || turn.boxStopNotified || !isBoxApiModel(this.model)
       || !turn.turnKey || !nativeSessionId) return
     turn.boxStopNotified = true
     this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,
@@ -1024,4 +1027,6 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 }
 
 // ── registry 注册(import 本模块即生效;sessionManager 顶部显式 import)──────
+// Local-only registration keeps direct adapter imports compatible. The production
+// ccbFactory module installs the explicit backend selector after both classes initialize.
 registerEngine('ccb', (opts) => new CcbAdapter(opts))

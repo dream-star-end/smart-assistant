@@ -24,7 +24,6 @@ import { resolveRequestTrace } from './requestTrace.js'
 import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
-import { handleAdminCreateCc5TestUser } from './admin/cc5TestUser.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
 import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
@@ -1093,7 +1092,6 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/admin/agent-audit/stats', handler: handleAdminAgentAuditStats },
     { method: 'GET', path: '/api/admin/agent-audit', handler: handleAdminAgentAudit },
     // T-60 超管 API —— 用户管理
-    { method: 'POST', path: '/api/admin/users/cc5-test-t1555u', handler: handleAdminCreateCc5TestUser },
     { method: 'GET', path: '/api/admin/users', handler: handleAdminListUsers },
     // R2:exact path 在 pathPrefix 之前优先匹配,避免被 /users/:id 吞掉。
     { method: 'GET', path: '/api/admin/users/stats', handler: handleAdminUsersStats },

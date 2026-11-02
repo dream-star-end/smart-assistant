@@ -20,7 +20,10 @@ import {
   verifyAuthority,
   verifyTurnLease,
 } from '@openclaude/protocol'
-import { CC5_BRIDGE_MAX_FRAME_BYTES, type Cc5BridgeBinding } from './cc5BridgePort.js'
+import { CC5_BRIDGE_MAX_FRAME_BYTES, type Cc5BridgeBinding, assertCc5BindingScope,
+  cc5AuthorityMatchesBinding } from './cc5BridgePort.js'
+import type { Cc5FinancePort, Cc5FinanceTurn } from './cc5Finance.js'
+import { Cc5NativeUsageObserver } from './cc5NativeUsage.js'
 import { CC5_FIXED_TOOL_NAME, type Cc5FixedToolReceipt } from './cc5FixedTool.js'
 import { Cc5ToolObservation } from './cc5ToolObservation.js'
 import type { Cc5ToolDelivery } from './cc5ToolPump.js'
@@ -78,7 +81,13 @@ export class Cc5Relay {
   })
   private readonly abort = new AbortController()
   private readonly observation: Cc5ToolObservation
-  private sessionKey?: string
+  private readonly nativeUsage: Cc5NativeUsageObserver
+  private financeTurn?: Cc5FinanceTurn
+  private effectBarrier?: Promise<void>
+  private outputTail: Promise<void> = Promise.resolve()
+  private queuedOutputBytes = 0
+  private outputBackpressured = false
+  private userSubmitted = false
   private host?: ReturnType<Cc5InteractiveHostPort['start']>
   private hostReady?: Promise<void>
   private launchAttempted = false
@@ -109,8 +118,12 @@ export class Cc5Relay {
     private readonly runId: string,
     private readonly hostPort: Cc5InteractiveHostPort,
     private readonly journalRoot: string,
+    private readonly finance: Cc5FinancePort,
   ) {
-    requireRelay(keyring.size > 0 && /^[a-f0-9-]{36}$/.test(runId))
+    assertCc5BindingScope(binding)
+    requireRelay(keyring.size > 0 && /^[a-f0-9-]{36}$/.test(runId) &&
+      binding.runId === runId && typeof finance?.admit === 'function')
+    this.nativeUsage = new Cc5NativeUsageObserver(binding)
     mkdirSync(journalRoot, { mode: 0o700, recursive: false })
     const st = lstatSync(journalRoot)
     requireRelay(st.isDirectory() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0)
@@ -156,23 +169,16 @@ export class Cc5Relay {
         body.containerDbId === this.binding.containerDbId &&
         body.dockerId === this.binding.dockerId &&
         body.operationId === this.binding.operationId &&
-        typeof body.sessionKey === 'string' &&
-        body.sessionKey.length > 0 &&
-        body.sessionKey.length <= 512 &&
+        body.sessionKey === this.binding.sessionKey &&
         (allowExpired || (!this.revoked && this.binding.expiresAt > Date.now())),
     )
-    if (this.sessionKey) requireRelay(body.sessionKey === this.sessionKey)
-    else this.sessionKey = body.sessionKey as string
   }
   private verify(authority: string, lease: string, allowExpired = false): ModelAuthorityPayload {
     const now = Date.now()
     const a = verifyAuthority(authority, this.keyring, now, { allowExpired })
     assertLeaseMatchesAuthority(verifyTurnLease(lease, this.keyring, now), a)
     requireRelay(
-      String(a.uid) === this.binding.uid &&
-        String(a.containerId) === this.binding.containerDbId &&
-        a.canonicalModel === 'cc5-remote-t1555u' &&
-        a.engine === 'cursor',
+      cc5AuthorityMatchesBinding(this.binding, a),
     )
     return a
   }
@@ -191,6 +197,9 @@ export class Cc5Relay {
     requireRelay(!this.revoked)
     // Publish the joining promise BEFORE invoking start, even if start throws after spawning.
     this.hostReady = Promise.resolve().then(async () => {
+      requireRelay(!this.revoked && this.admitted && this.financeTurn)
+      this.effectBarrier = this.financeTurn.beforeHostStart()
+      await this.effectBarrier
       requireRelay(!this.revoked)
       this.launchAttempted = true
       this.host = this.hostPort.start()
@@ -205,22 +214,37 @@ export class Cc5Relay {
       })
       this.host.stdout.on('data', (chunk: Buffer) => {
         if (this.revoked) return
-        try {
-          this.observation.ingest(chunk)
+        this.host!.stdout.pause()
+        const bytes = Buffer.from(chunk)
+        this.queuedOutputBytes += bytes.length
+        this.outputTail = this.outputTail.then(async () => {
+          requireRelay(!this.revoked && this.queuedOutputBytes <= CC5_BRIDGE_MAX_FRAME_BYTES)
+          const frames = this.nativeUsage.ingest(bytes)
+          // Validate the entire complete chunk before a waiter can authorize a tool.
+          this.observation.ingest(bytes)
           this.outputEvents.emit('data')
-          if (this.stream?.headersSent) {
-            if (!this.stream.write(chunk)) this.host!.stdout.pause()
-          } else {
-            this.outputBytes += chunk.length
-            requireRelay(this.outputBytes <= CC5_BRIDGE_MAX_FRAME_BYTES)
-            this.output.push(chunk)
+          for (const frame of frames) {
+            requireRelay(!this.revoked)
+            if (frame.receipt) {
+              requireRelay(this.financeTurn)
+              this.record('native-terminal.json', frame.receipt)
+              const outcome = await this.financeTurn.terminal(frame.receipt)
+              requireRelay(outcome.state === 'proven' && typeof outcome.requestId === 'string' && outcome.requestId.length > 0)
+              this.record('terminal-proven.json', { requestId: outcome.requestId,
+                resultSha256: frame.receipt.resultSha256 })
+            }
+            requireRelay(!this.revoked)
+            this.publishOutput(frame.bytes)
           }
-        } catch {
-          void this.stop().catch(() => {})
-        }
+          this.queuedOutputBytes -= bytes.length
+          if (!this.revoked && !this.outputBackpressured) this.host?.stdout.resume()
+        }).catch(() => { void this.stop().catch(() => {}) })
       })
       this.host.stdout.once('end', () => {
-        void this.stop().catch(() => {})
+        void this.outputTail.then(() => {
+          this.nativeUsage.finish()
+          this.observation.finish()
+        }).finally(() => this.stop()).catch(() => {})
       })
       this.host.stdout.once('error', () => {
         void this.stop().catch(() => {})
@@ -232,6 +256,16 @@ export class Cc5Relay {
       void this.stop().catch(() => {})
     })
     return this.hostReady
+  }
+
+  private publishOutput(bytes: Buffer): void {
+    if (this.stream?.headersSent) {
+      if (!this.stream.write(bytes)) this.outputBackpressured = true
+    } else {
+      this.outputBytes += bytes.length
+      requireRelay(this.outputBytes <= CC5_BRIDGE_MAX_FRAME_BYTES)
+      this.output.push(bytes)
+    }
   }
 
   stop(): Promise<{ remoteStopped: true }> {
@@ -247,7 +281,15 @@ export class Cc5Relay {
     this.pending?.response.destroy()
     this.stopPromise = Promise.resolve()
       .then(async () => {
-        if (this.launchAttempted) requireRelay((await this.hostPort.stop()).remoteStopped === true)
+        await this.effectBarrier?.catch(() => {})
+        let remoteStopped = !this.launchAttempted
+        try {
+          if (this.launchAttempted) remoteStopped = (await this.hostPort.stop()).remoteStopped === true
+          requireRelay(remoteStopped)
+        } finally {
+          await this.financeTurn?.stop({ hostStartAttempted: this.launchAttempted,
+            userSubmitted: this.userSubmitted, remoteStopped })
+        }
         this.stream?.end()
         return { remoteStopped: true as const }
       })
@@ -285,6 +327,13 @@ export class Cc5Relay {
         lease: body.lease,
         payload,
         turnKey: body.turnKey,
+      }
+      this.financeTurn = await this.finance.admit({ binding: this.binding,
+        authorityEnvelope: body.authority, leaseEnvelope: body.lease,
+        turnKey: body.turnKey, sessionKey: this.binding.sessionKey })
+      if (this.revoked) {
+        await this.financeTurn.stop({ hostStartAttempted: false, userSubmitted: false, remoteStopped: true })
+        throw new Error('CC5_RELAY_REJECTED')
       }
       this.armExpiry(verifyTurnLease(body.lease, this.keyring, Date.now()).expiresAt)
       await this.ensureHost()
@@ -356,7 +405,7 @@ export class Cc5Relay {
           const body = JSON.parse(buffer.slice(0, at)) as Body
           buffer = buffer.slice(at + 1)
           if (!opened) {
-            requireRelay(body.type === 'open' && !this.streamClaimed)
+            requireRelay(body.type === 'open' && !this.streamClaimed && this.admitted && this.financeTurn)
             this.scope(body)
             this.streamClaimed = true
             this.stream = res
@@ -367,7 +416,10 @@ export class Cc5Relay {
             for (const raw of this.output) res.write(raw)
             this.output = []
             this.outputBytes = 0
-            res.on('drain', () => this.host?.stdout.resume())
+            res.on('drain', () => {
+              this.outputBackpressured = false
+              if (!this.revoked && this.queuedOutputBytes === 0) this.host?.stdout.resume()
+            })
           } else await this.input(body)
         }
       }
@@ -407,9 +459,15 @@ export class Cc5Relay {
       )
       this.record('dispatch.json', { sequence: body.seq, hash: body.hash })
       this.userSeen = true
+      requireRelay(this.financeTurn)
+      this.effectBarrier = this.financeTurn.beforeDispatch({ sequence: body.seq as number,
+        inputSha256: body.hash as string })
+      await this.effectBarrier
+      requireRelay(!this.revoked)
     } else requireRelay(frame.type === 'control_request' && frame.request?.subtype === 'interrupt')
     this.lastSequence = body.seq as number
     this.lastHash = body.hash
+    if (frame.type === 'user') this.userSubmitted = true
     if (!this.host.stdin.write(bytes))
       await once(this.host.stdin, 'drain', { signal: this.abort.signal })
   }
@@ -470,7 +528,7 @@ export class Cc5Relay {
       containerDbId: this.binding.containerDbId,
       dockerId: this.binding.dockerId,
       operationId: this.binding.operationId,
-      sessionKey: this.sessionKey!,
+      sessionKey: this.binding.sessionKey,
       turnKey: this.admitted.turnKey,
       nativeSessionId,
       toolUseId: body.toolUseId as string,

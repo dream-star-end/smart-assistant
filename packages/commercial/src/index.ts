@@ -66,7 +66,8 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
-import { createMasterCc5Runtime } from "./agent-sandbox/cc5Runtime.js";
+import { createMasterCc5Runtime, selectMasterCc5Backend } from "./agent-sandbox/cc5Runtime.js";
+import { createRemoteNativeTurnFinance, recoverRemoteNativeTurnBilling } from "./billing/remoteNativeTurnBilling.js";
 import {
   cursorExternalApiOutboxDirForFlavor,
   openCursorExternalApiOutbox,
@@ -3662,6 +3663,7 @@ export async function registerCommercial(
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
   let v3Deps: V3SupervisorDeps | undefined;
+  let cc5Runtime: ReturnType<typeof createMasterCc5Runtime>;
   if (cfg.OC_RUNTIME_IMAGE) {
     // 复用 agentRuntime 路径的 docker socket / 默认逻辑,避免 v2/v3 端再各开一个 docker client
     // (一个进程开多个 dockerode 也无副作用,但同一 socket 没必要)
@@ -3730,10 +3732,17 @@ export async function registerCommercial(
       runtimeTuple = t;
     }
 
-    const cc5 = createMasterCc5Runtime({
+    const cc5 = cc5Runtime = createMasterCc5Runtime({
       selfhost: getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
       authorityReady: modelAuthoritySigner !== null && modelAuthoritySigner !== undefined && modelAuthorityProvisionRequired,
       env: process.env,
+      ...(modelAuthoritySigner && modelCatalogCache ? {
+        financeFactory: () => createRemoteNativeTurnFinance({
+          pool: getPool(), preCheckRedis, catalog: modelCatalogCache!,
+          keyring: () => modelAuthoritySigner!.publicKeyring(), loadUserModelAuthz,
+          log: rootLogger.child({ subsys: "remoteNativeBilling" }),
+        }),
+      } : {}),
     });
     v3Deps = {
       ...(cc5 ? { cc5 } : {}),
@@ -5877,6 +5886,9 @@ export async function registerCommercial(
 
   const containerLinkOn = containerLinkEnabled(flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined);
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
+    cc5BackendSelector: input => selectMasterCc5Backend(cc5Runtime, input,
+      getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
+      process.env),
     containerLinkEnabled: containerLinkOn,
     resolveContainerLinkEndpoint: (uid, cid) => resolveContainerLinkEndpoint(getPool(), runtimeChannel, uid, cid),
     containerLinkRecovery: { channel: runtimeChannel },
@@ -6413,6 +6425,8 @@ export async function registerCommercial(
             const results = await Promise.allSettled([
               reconcileBoxBillingBatch(getPool(), 20, preCheckRedis),
               boxRemoteCleanup.reconcileBatch(10),
+              recoverRemoteNativeTurnBilling({ pool: getPool(), preCheckRedis,
+                log: rootLogger.child({ subsys: "remoteNativeBillingRecovery" }) }, { limit: 20 }),
             ]);
             if (results.some((result) => result.status === "rejected")) {
               throw new Error("BOX_RECOVERY_PARTIAL_FAILURE");

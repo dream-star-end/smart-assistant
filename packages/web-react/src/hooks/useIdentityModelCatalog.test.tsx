@@ -78,17 +78,17 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-it('test-only model disappears for the new UID while its catalog is pending or 503', async () => {
+it('previous identity model disappears for the new UID while its catalog is pending or 503', async () => {
   const f = fixture()
   const pending = deferred<never>()
   vi.spyOn(api, 'getPublicModels')
-    .mockResolvedValueOnce(catalog('cc5-remote-t1555u'))
+    .mockResolvedValueOnce(catalog('box-claude-sonnet-5'))
     .mockReturnValueOnce(pending.promise)
   const view = renderHook(f.harness, {
     initialProps: { identity: f.identity as ResolvedIdentity | null },
   })
   await waitFor(() =>
-    expect(view.result.current.visible.map((m) => m.id)).toEqual(['cc5-remote-t1555u']),
+    expect(view.result.current.visible.map((m) => m.id)).toEqual(['box-claude-sonnet-5']),
   )
   let normal!: ResolvedIdentity
   act(() => {
@@ -119,7 +119,7 @@ it('late old-account catalog/preferences cannot commit even before React cleanup
   })
   const normal = f.nextIdentity('normal-uid')
   await act(async () => {
-    old.resolve(catalog('cc5-remote-t1555u'))
+    old.resolve(catalog('box-claude-sonnet-5'))
     await old.promise
   })
   expect(view.result.current.models).toEqual([])
@@ -134,7 +134,7 @@ it('late old-account catalog/preferences cannot commit even before React cleanup
 it('pending account acceptance with the same AuthSession keeps old cc5 hidden and accepts only the new catalog', async () => {
   const f = fixture()
   vi.spyOn(api, 'getPublicModels')
-    .mockResolvedValueOnce(catalog('cc5-remote-t1555u'))
+    .mockResolvedValueOnce(catalog('box-claude-sonnet-5'))
     .mockResolvedValueOnce(catalog('gpt-5.5'))
   const view = renderHook(f.harness, {
     initialProps: { identity: f.identity as ResolvedIdentity | null },

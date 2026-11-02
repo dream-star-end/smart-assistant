@@ -29,7 +29,11 @@ function fixture() {
   const now = Date.now()
   const root = mkdtempSync(join(tmpdir(), 'cc5-fixed-tool-'))
   const binding: Cc5BridgeBinding = {
-    version: 1,
+    version: 2,
+    backendKind: 'cc5-interactive-v1',
+    canonicalModel: 'box-claude-sonnet-5',
+    sessionKey: 'agent:main:webchat:dm:fixture_chat1',
+    runId: randomUUID(),
     uid: '912',
     containerDbId: '91',
     dockerId: 'a'.repeat(64),
@@ -44,8 +48,9 @@ function fixture() {
     containerId: 91,
     authorityTurnId: randomBytes(16).toString('hex'),
     connectionChallenge: 'synthetic-connection',
-    canonicalModel: 'cc5-remote-t1555u',
-    engine: 'cursor',
+    canonicalModel: 'box-claude-sonnet-5',
+    engine: 'ccb',
+    executionBackend: { kind: 'cc5-interactive-v1', sessionKey: binding.sessionKey, operationId: binding.operationId },
     securityEpoch: 12,
     executionRevision: 'test-r1',
     issuedAt: now,
@@ -79,7 +84,7 @@ function fixture() {
     containerDbId: binding.containerDbId,
     dockerId: binding.dockerId,
     operationId: binding.operationId,
-    sessionKey: 'personal-task-session',
+    sessionKey: 'agent:main:webchat:dm:fixture_chat1',
     turnKey: 'logical-billing-key-is-not-authority-id',
     nativeSessionId: randomUUID(),
     toolUseId: 'toolu_actual-frame',

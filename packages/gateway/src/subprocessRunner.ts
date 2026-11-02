@@ -1,3 +1,4 @@
+import { CC5_NATIVE_MODEL, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
 import { systemHelpEnvironment } from './systemHelpEnvironment.js'
@@ -335,11 +336,16 @@ export class SubprocessRunner extends EventEmitter {
   /** Explicit ccb harness for a not-yet-spawned runner that carries the signed token. */
   pinBoxNativeHarness(descriptor: CcbExecutionDescriptor | undefined): 'ccb' | 'official-cc' {
     if (this.opts.cc5BridgePort) {
-      if (descriptor?.canonicalModel !== 'cc5-remote-t1555u' || descriptor.contextOwner) {
+      if (descriptor?.canonicalModel !== CC5_NATIVE_MODEL || descriptor.contextOwner !== BOX_NATIVE_CONTEXT_OWNER ||
+          !descriptor.executionBackend ||
+          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.executionBackend) ||
+          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.cc5BridgePort.executionBackend) ||
+          this.opts.cc5BridgePort.canonicalModel !== CC5_NATIVE_MODEL) {
         throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
       }
       return 'official-cc'
     }
+    if (descriptor?.executionBackend || this.opts.executionBackend) throw new Error('CC5_BACKEND_TRANSPORT_REQUIRED')
     const next = applyBoxNativeHarness({
       model: this.opts.model,
       descriptor,
@@ -1322,10 +1328,13 @@ export class SubprocessRunner extends EventEmitter {
     )
     turnTiming.once('runtime_resolved')
     if (this.opts.cc5BridgePort) {
-      if (!authority || !turnKey || runtime.descriptor?.canonicalModel !== 'cc5-remote-t1555u'
+      if (!authority || !turnKey || runtime.descriptor?.canonicalModel !== CC5_NATIVE_MODEL
+        || !runtime.descriptor.executionBackend
+        || !sameCc5ExecutionBackend(runtime.descriptor.executionBackend, this.opts.executionBackend)
         || typeof userTextOrBlocks !== 'string' || this.readOnlyTurn || this.consultTurnBinding) {
         throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
       }
+      this.pinBoxNativeHarness(runtime.descriptor)
     } else this.pinBoxNativeHarness(runtime.descriptor)
     if (isCcbAdvisorHermeticProfile(this.opts)) {
       await assertCcbAdvisorCatalogLock({
@@ -1390,10 +1399,8 @@ export class SubprocessRunner extends EventEmitter {
       : null
 
     turnTiming.once('recycle_complete')
-    if (!this.proc) await this.start()
-    turnTiming.once('process_available')
-    if (!this.proc) throw new Error('failed to start agent subprocess')
-    this.delegateContextTraceId = turnTraceId
+    // Admission durably reserves and marks possible remote effects BEFORE any
+    // local bridge /session/open can launch the native TUI.
     if (this.opts.cc5BridgePort) {
       try {
         await this.opts.cc5BridgePort.admit({ authority: authority!, turnKey: turnKey!, model: this.opts.model! })
@@ -1401,7 +1408,12 @@ export class SubprocessRunner extends EventEmitter {
         await this.shutdown()
         throw err
       }
-    } else this.refreshDelegateContext(turnTraceId)
+    }
+    if (!this.proc) await this.start()
+    turnTiming.once('process_available')
+    if (!this.proc) throw new Error('failed to start agent subprocess')
+    this.delegateContextTraceId = turnTraceId
+    if (!this.opts.cc5BridgePort) this.refreshDelegateContext(turnTraceId)
     const envUpdateLine = envUpdateVars
       ? _buildUpdateEnvStdinLine({
           ...envUpdateVars,
@@ -1979,6 +1991,10 @@ export class SubprocessRunner extends EventEmitter {
 
   // 发送 interrupt control request — CCB 会中止当前 turn
   interrupt(): boolean {
+    if (this.opts.cc5BridgePort) {
+      void this.shutdown().catch(() => {}) // remote absence/finance owns unknown; never write a second input frame
+      return true
+    }
     if (!this.proc) return false
     try {
       const req = {

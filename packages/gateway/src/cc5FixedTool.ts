@@ -22,7 +22,7 @@ import {
   verifyAuthority,
   verifyTurnLease,
 } from '@openclaude/protocol'
-import type { Cc5BridgeBinding } from './cc5BridgePort.js'
+import { type Cc5BridgeBinding, assertCc5BindingScope, cc5AuthorityMatchesBinding } from './cc5BridgePort.js'
 
 export const CC5_FIXED_TOOL_NAME = 'mcp__ocbridge__roundtrip'
 export const CC5_FIXED_EXECUTION_ROOT = '/home/agent/.openclaude/.cc5-t1555u'
@@ -206,6 +206,8 @@ export class Cc5FixedToolExecutor {
     }>,
     private readonly executionRoot = CC5_FIXED_EXECUTION_ROOT,
   ) {
+    assertCc5BindingScope(binding)
+    requireTool(sessionKey === binding.sessionKey)
     this.admission = Object.freeze({ ...admission })
   }
   async execute(raw: Cc5ToolRequest, observed: Cc5ObservedTool): Promise<Cc5FixedToolReceipt> {
@@ -223,10 +225,7 @@ export class Cc5FixedToolExecutor {
         request.dockerId === this.binding.dockerId &&
         request.operationId === this.binding.operationId &&
         request.sessionKey === this.sessionKey &&
-        String(a.uid) === this.binding.uid &&
-        String(a.containerId) === this.binding.containerDbId &&
-        a.canonicalModel === 'cc5-remote-t1555u' &&
-        a.engine === 'cursor' &&
+        cc5AuthorityMatchesBinding(this.binding, a) &&
         request.turnKey === this.admission.turnKey &&
         a.authorityTurnId === this.admission.authorityTurnId &&
         a.connectionChallenge === this.admission.connectionChallenge &&

@@ -7,7 +7,7 @@ import { dirname, isAbsolute } from 'node:path'
 import { PassThrough } from 'node:stream'
 import type { Cc5InteractiveHostPort } from './cc5Relay.js'
 
-const CONTROLLER_SHA = '3f0ca5bfd44af013a7c056eb4305dbddd6713da586db097172b564ee39c0baa1'
+const CONTROLLER_SHA = '19602e831b1efbff6c6dcdd3184d516422c07e279bc3bc32267fe704dc6d337b'
 const MAX_BODY = 131072
 const MAX_FRAME = 262144
 const FAILED = 'CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN'

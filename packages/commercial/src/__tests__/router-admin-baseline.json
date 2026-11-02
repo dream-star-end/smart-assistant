@@ -114,12 +114,6 @@
     "handler": "handleAdminAgentAudit"
   },
   {
-    "method": "POST",
-    "pathKind": "path",
-    "pathValue": "/api/admin/users/cc5-test-t1555u",
-    "handler": "handleAdminCreateCc5TestUser"
-  },
-  {
     "method": "GET",
     "pathKind": "path",
     "pathValue": "/api/admin/users",

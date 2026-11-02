@@ -18,11 +18,16 @@ import type { Server } from 'node:http'
 import { dirname, isAbsolute, join } from 'node:path'
 import {
   type AuthorityKeyring,
+  type Cc5ExecutionBackend,
+  CC5_INTERACTIVE_BACKEND,
+  CC5_NATIVE_MODEL,
   CC5_TEST_UID_ENV,
   type Cc5PolicyEnvironment,
   canUseCc5TestModel,
   parseAuthorityKeyring,
+  parseCc5ExecutionBackend,
 } from '@openclaude/protocol'
+import type { Cc5FinanceFactory, Cc5FinancePort } from './cc5Finance.js'
 import type { Cc5BridgeBinding } from './cc5BridgePort.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from './cc5Relay.js'
 import { Cc5SshHost, type Cc5SshHostConfig } from './cc5SshHost.js'
@@ -63,6 +68,8 @@ export interface Cc5PreparedContainer {
   readonly containerDbId: string
 }
 export interface Cc5FreshContainerRuntimePort {
+  selectBackend(input: { uid: number; containerId: number; sessionKey: string;
+    canonicalModel: string; engine: string }): Cc5ExecutionBackend | undefined
   prepare(input: {
     uid: number
     containerDbId: string
@@ -80,6 +87,7 @@ interface RuntimeOptions {
   ssh: Readonly<SshDeployment>
   /** IDs of this exact preinstalled strict MCP profile; one binding consumes it once. */
   profile: Readonly<{ operationId: string; runId: string }>
+  scope: Readonly<{ sessionKey: string; canonicalModel: typeof CC5_NATIVE_MODEL }>
   /** Trusted fixture seam only; default constructs the pinned production SSH port. */
   hostFactory?: (config: Cc5SshHostConfig) => Cc5InteractiveHostPort
 }
@@ -92,6 +100,7 @@ interface RecordState {
   keyring: AuthorityKeyring
   binding?: Readonly<Cc5BridgeBinding>
   relay?: Cc5Relay
+  finance?: Cc5FinancePort
   state: 'prepared' | 'bound' | 'activating' | 'active' | 'released' | 'unknown'
   release?: Promise<void>
   activation?: Promise<void>
@@ -102,10 +111,11 @@ export function createCc5FreshContainerRuntime(input: {
   selfhost: boolean
   env: Cc5PolicyEnvironment
   configuration: () => RuntimeOptions
+  financeFactory: Cc5FinanceFactory
 }): Cc5FreshContainerRuntimePort | undefined {
   const testUid = input.env[CC5_TEST_UID_ENV]
   if (!input.selfhost || !canUseCc5TestModel(testUid, input.env)) return undefined
-  return new Cc5FreshContainerRuntime(testUid!, input.configuration())
+  return new Cc5FreshContainerRuntime(testUid!, input.configuration(), input.financeFactory)
 }
 
 class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
@@ -115,7 +125,12 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
   constructor(
     private readonly testUid: string,
     private readonly options: RuntimeOptions,
+    private readonly financeFactory: Cc5FinanceFactory,
   ) {
+    requireRuntime(typeof financeFactory === 'function')
+    requireRuntime(options.scope?.canonicalModel === CC5_NATIVE_MODEL)
+    parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: options.scope.sessionKey,
+      operationId: options.profile.operationId })
     requireRuntime(
       process.getuid?.() === 0 &&
         isAbsolute(options.baseRoot) &&
@@ -130,6 +145,17 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     const st = lstatSync(options.baseRoot)
     requireRuntime(st.isDirectory() && st.uid === 0 && (st.mode & 0o777) === 0o700)
     syncDirectory(dirname(options.baseRoot))
+  }
+  selectBackend(input: { uid: number; containerId: number; sessionKey: string;
+    canonicalModel: string; engine: string }): Cc5ExecutionBackend | undefined {
+    if (String(input.uid) !== this.testUid || input.sessionKey !== this.options.scope.sessionKey)
+      return undefined
+    requireRuntime(input.canonicalModel === this.options.scope.canonicalModel && input.engine === 'ccb')
+    const record = this.records.get(String(input.containerId))
+    requireRuntime(!this.blocked && record?.state === 'active' && record.binding &&
+      record.binding.expiresAt > Date.now() && record.finance)
+    return Object.freeze({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: record.binding.sessionKey,
+      operationId: record.binding.operationId })
   }
   async prepare(input: {
     uid: number
@@ -168,7 +194,10 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     this.records.set(input.containerDbId, record)
     this.handles.set(handle, record)
     writePrivate(join(root, 'prepared.json'), {
-      version: 1,
+      version: 2,
+      backendKind: CC5_INTERACTIVE_BACKEND,
+      canonicalModel: this.options.scope.canonicalModel,
+      sessionKey: this.options.scope.sessionKey,
       uid: this.testUid,
       containerDbId: input.containerDbId,
       runId: record.runId,
@@ -190,7 +219,11 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     const record = this.record(handle)
     requireRuntime(record.state === 'prepared' && /^[a-f0-9]{64}$/.test(dockerId))
     record.binding = Object.freeze({
-      version: 1,
+      version: 2,
+      backendKind: CC5_INTERACTIVE_BACKEND,
+      canonicalModel: this.options.scope.canonicalModel,
+      sessionKey: this.options.scope.sessionKey,
+      runId: record.runId,
       uid: this.testUid,
       containerDbId: handle.containerDbId,
       dockerId,
@@ -198,6 +231,8 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
       capability: record.capability,
       expiresAt: Date.now() + 2 * 60 * 60 * 1000,
     })
+    record.finance = this.financeFactory(record.binding)
+    requireRuntime(record.finance)
     writePrivate(join(handle.mountSource, 'binding.json'), record.binding, true)
     record.state = 'bound'
   }
@@ -208,6 +243,8 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     )
     record.state = 'activating'
     record.activation = (async () => {
+      const finance = record.finance
+      requireRuntime(finance)
       const toolSocketPath = join(record.root, 'tool.sock')
       const host = (this.options.hostFactory ?? ((config) => new Cc5SshHost(config)))({
         ...this.options.ssh,
@@ -221,6 +258,7 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
         record.runId,
         host,
         join(record.root, 'journal'),
+        finance,
       )
       await this.listen(record.relay.toolServer, toolSocketPath, 0, 0)
       requireRuntime(record.state === 'activating' && !this.blocked)

@@ -152,7 +152,12 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
     capabilityProfile: { supportsVision: true,
       reasoning: { supported: ["low", "high", "max"], codexModelDefault: null },
       ccb: { capabilityZero: true, supportsThinking: true } } }));
+  entries.push(entry({ entryId: 61, modelId: 'box-claude-sonnet-5', providerId: 'box',
+    capabilityProfile: { supportsVision: true,
+      reasoning: { supported: [], codexModelDefault: null },
+      ccb: { capabilityZero: false, supportsThinking: true, contextOwner: 'box-native-v1' } } }));
   const pricing = new Map([
+    ['box-claude-sonnet-5', price('box-claude-sonnet-5')],
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
@@ -230,6 +235,7 @@ async function startRig(opts: {
   /** 容器是否 attest(false = 旧 release / 旧 env,不广播 capability)。 */
   attest: "yes" | "no-capability" | "silent";
   authorityOn?: boolean;
+  cc5BackendSelector?: UserChatBridgeDeps["cc5BackendSelector"];
   loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
   attestTimeoutMs?: number;
   fenceFails?: boolean;
@@ -532,6 +538,7 @@ async function startRig(opts: {
         };
 
   const bridge = createUserChatBridge({
+    cc5BackendSelector: opts.cc5BackendSelector,
     containerLinkEnabled: opts.containerLinkEnabled,
     jwtSecret: JWT_SECRET,
     issueSystemHelpBootstrap: opts.issueSystemHelpBootstrap,
@@ -837,7 +844,7 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
     const fn = source.slice(source.indexOf("async function resolveTurnExecution("));
     const body = fn.slice(0, fn.indexOf("\n}\n"));
-    assert.match(body, /auxModels: !isCc5TestModel\(canonicalModel\) && engineUsesAnthropicAuxModels\(descriptor\.engine\) \? platformAuxModels\(snapshot\) : \[\]/);
+    assert.match(body, /auxModels: engineUsesAnthropicAuxModels\(descriptor\.engine\) \? platformAuxModels\(snapshot\) : \[\]/);
     assert.doesNotMatch(body, /descriptor\.engine === "ccb" \?/);
   });
 
@@ -2881,4 +2888,56 @@ test("RF-step3: attested tabs share the same executor through owner detach", asy
     assert.equal(rig.bridge._testGetCronOriginExecutor(String(UID)), executor);
     b.close();
   } finally { await stopRig(rig); }
+});
+
+
+describe('existing-account native backend authority', () => {
+  const operationId = '00000000-0000-4000-8000-000000000123';
+  const sessionKey = 'agent:main:webchat:dm:cc5-native-chat';
+  test('only trusted selector signs the normal Sonnet backend and suppresses auxiliary models', async () => {
+    const calls: unknown[] = [];
+    const rig = await startRig({ attest: 'yes', cc5BackendSelector(input) {
+      calls.push(input);
+      return input.sessionKey === sessionKey ? {kind:'cc5-interactive-v1', sessionKey, operationId} : undefined;
+    } });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({ model: 'box-claude-sonnet-5', peer: {id:'cc5-native-chat',kind:'dm'},
+        executionBackend: {kind:'cc5-interactive-v1',sessionKey:'forged',operationId:'forged'},
+        sessionKey: 'forged' }));
+      await waitFor(() => rig.containerSeen.some(s => s.includes(MODEL_AUTHORITY_FIELD)));
+      const frame = firstInbound(rig.containerSeen);
+      const bundle = frame[MODEL_AUTHORITY_FIELD] as {authority:string;lease:string};
+      const payload = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
+      const lease = verifyTurnLease(bundle.lease, rig.signer.publicKeyring(), Date.now());
+      assert.deepEqual(payload.executionBackend, {kind:'cc5-interactive-v1',sessionKey,operationId});
+      assert.deepEqual(payload.auxModels, []); assert.deepEqual(lease.auxModels, []);
+      assert.doesNotThrow(() => assertLeaseMatchesAuthority(lease,payload));
+      assert.deepEqual(calls, [{uid:UID,containerId:CONTAINER_ID,sessionKey,
+        canonicalModel:'box-claude-sonnet-5',engine:'ccb'}]);
+      ws.close();
+    } finally { await stopRig(rig); }
+  });
+  test('same normal model outside the configured session preserves ordinary authority and aux policy', async () => {
+    const rig = await startRig({attest:'yes', cc5BackendSelector: () => undefined});
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({model:'box-claude-sonnet-5', executionBackend:{kind:'cc5-interactive-v1',sessionKey,operationId}}));
+      await waitFor(() => rig.containerSeen.some(s => s.includes(MODEL_AUTHORITY_FIELD)));
+      const bundle = firstInbound(rig.containerSeen)[MODEL_AUTHORITY_FIELD] as {authority:string};
+      const payload = verifyAuthority(bundle.authority,rig.signer.publicKeyring(),Date.now());
+      assert.equal(payload.executionBackend,undefined); assert.ok((payload.auxModels ?? []).length>0);
+      ws.close();
+    } finally {await stopRig(rig);}
+  });
+  test('unready target selector rejects before any execution frame can fall back to ordinary Box', async () => {
+    const rig = await startRig({attest:'yes', cc5BackendSelector: () => {throw new Error('not active');}});
+    try {
+      const ws = await openClient(rig.port); const frames = frameCollector(ws);
+      ws.send(inboundFrame({model:'box-claude-sonnet-5',peer:{id:'cc5-native-chat',kind:'dm'}}));
+      const error = await frames.next(); assert.equal(error.code,'REMOTE_NATIVE_UNAVAILABLE');
+      assert.equal(rig.containerSeen.some(s => s.includes('inbound.message')),false);
+      ws.close();
+    } finally {await stopRig(rig);}
+  });
 });

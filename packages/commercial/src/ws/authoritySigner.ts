@@ -93,6 +93,7 @@ import type { AuthorityKeyCoverage } from './authorityKeyCensus.js'
 import {
   AUTHORITY_TTL_MS,
   type AuthorityKeyring,
+  type Cc5ExecutionBackend,
   type DispatchAuthorityPayload,
   MODEL_AUTHORITY_KEYRING_ENV,
   MODEL_AUTHORITY_VERSION,
@@ -534,6 +535,8 @@ export interface AuthorityMintInput {
   auxModels: readonly string[]
   /** codex 的 server-owned 计费 requestId(绑定字段,可缺席)。 */
   billingRequestId?: string
+  /** Trusted supervisor selection, never copied from a browser frame. */
+  executionBackend?: Cc5ExecutionBackend
 }
 
 export interface MintOptions {
@@ -709,6 +712,7 @@ export class AuthoritySigner {
       expiresAt: now + (opts.authorityTtlMs ?? AUTHORITY_TTL_MS),
       auxModels,
       ...(input.billingRequestId === undefined ? {} : { billingRequestId: input.billingRequestId }),
+      ...(input.executionBackend === undefined ? {} : { executionBackend: input.executionBackend }),
     }
 
     const lease: TurnLease = {

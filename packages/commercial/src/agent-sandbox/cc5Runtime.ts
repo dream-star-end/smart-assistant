@@ -1,9 +1,13 @@
 /** Personal task metadata only. No credentials are read, and OFF performs no configuration I/O. */
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import type { Cc5FinanceFactory } from '@openclaude/gateway/cc5-finance'
 import { createCc5FreshContainerRuntime } from '@openclaude/gateway/cc5-container-runtime'
 import {
   CC5_TEST_UID_ENV,
+  CC5_INTERACTIVE_BACKEND,
+  CC5_NATIVE_MODEL,
+  parseCc5ExecutionBackend,
   type Cc5PolicyEnvironment,
   canUseCc5TestModel,
 } from '@openclaude/protocol'
@@ -22,8 +26,8 @@ export function parseCc5DeploymentMetadata(bytes: Buffer, expectedUid: string) {
     data &&
       typeof data === 'object' &&
       !Array.isArray(data) &&
-      Object.keys(data).sort().join(',') === 'profile,task,taskRoot,testUid,user,version' &&
-      data.version === 1 &&
+      Object.keys(data).sort().join(',') === 'profile,scope,task,taskRoot,testUid,user,version' &&
+      data.version === 2 &&
       data.task === 'AGENT-REMOTE-T1555U' &&
       data.testUid === expectedUid &&
       typeof data.user === 'string' &&
@@ -41,7 +45,13 @@ export function parseCc5DeploymentMetadata(bytes: Buffer, expectedUid: string) {
       typeof data.profile.runId === 'string' &&
       UUID.test(data.profile.runId),
   )
+  requireConfig(data.scope && typeof data.scope === 'object' && !Array.isArray(data.scope) &&
+    Object.keys(data.scope).sort().join(',') === 'canonicalModel,sessionKey' &&
+    data.scope.canonicalModel === CC5_NATIVE_MODEL)
+  const backend = parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND,
+    sessionKey: data.scope.sessionKey, operationId: data.profile.operationId })
   return {
+    scope: Object.freeze({ canonicalModel: CC5_NATIVE_MODEL, sessionKey: backend.sessionKey }),
     baseRoot: '/run/oc-cc5-t1555u',
     profile: Object.freeze({
       operationId: data.profile.operationId as string,
@@ -84,16 +94,18 @@ export function createMasterCc5Runtime(
     selfhost: boolean
     authorityReady: boolean
     env: Cc5PolicyEnvironment
+    financeFactory?: Cc5FinanceFactory
   },
   fixture: { read?: typeof readDeployment; rejected?: () => void } = {},
 ) {
   const uid = input.env[CC5_TEST_UID_ENV]
-  if (!input.selfhost || !input.authorityReady || !canUseCc5TestModel(uid, input.env))
+  if (!input.selfhost || !input.authorityReady || !input.financeFactory || !canUseCc5TestModel(uid, input.env))
     return undefined
   try {
     return createCc5FreshContainerRuntime({
       selfhost: true,
       env: input.env,
+      financeFactory: input.financeFactory,
       configuration: () => (fixture.read ?? readDeployment)(uid!),
     })
   } catch {
@@ -102,4 +114,16 @@ export function createMasterCc5Runtime(
       console.error('[selfhost] cc5 task metadata rejected; test provisioning remains unavailable')
     return undefined
   }
+}
+
+/** Enabled but incomplete setup must never silently fall back to the ordinary Box worker. */
+export function selectMasterCc5Backend(
+  runtime: ReturnType<typeof createMasterCc5Runtime>,
+  input: Parameters<NonNullable<ReturnType<typeof createMasterCc5Runtime>>['selectBackend']>[0],
+  selfhost: boolean,
+  env: Cc5PolicyEnvironment,
+) {
+  if (!selfhost || !canUseCc5TestModel(String(input.uid), env)) return undefined
+  if (!runtime) throw new Error('CC5_FRESH_CONTAINER_BINDING_REJECTED')
+  return runtime.selectBackend(input)
 }

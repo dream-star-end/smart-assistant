@@ -190,7 +190,7 @@ import {
   type DispatchRequestContent,
   type SessionWorkspaceMode,
   BOX_GPT_WEB_BUSY_MESSAGE,
-  canUseCc5TestModel,
+  type Cc5ExecutionBackend,
   isCc5TestModel,
   isBoxGptWebModel,
   isBoxGptWebOwnerUid,
@@ -840,7 +840,7 @@ async function resolveTurnExecution(
     //   egress modelAuthorityGate 以 "authority model mismatch" 403 拒掉(Agent 工具全灭)。
     // codex/grok/zcode 走各自 relay,不产生 `/v1/messages`,签 aux 只会白白撑大放行集合。
     // platformAuxModels 对"aux 不在 catalog active"fail-closed 抛 → 调用方拒帧。
-    auxModels: !isCc5TestModel(canonicalModel) && engineUsesAnthropicAuxModels(descriptor.engine) ? platformAuxModels(snapshot) : [],
+    auxModels: engineUsesAnthropicAuxModels(descriptor.engine) ? platformAuxModels(snapshot) : [],
     executionRevision: snapshot.executionRevision,
     securityEpoch: Number(snapshot.securityEpoch),
   };
@@ -849,6 +849,9 @@ async function resolveTurnExecution(
 // ---------- Deps + Handler --------------------------------------------------
 
 export interface UserChatBridgeDeps {
+  /** Supervisor-owned normal-chat scope; browser fields never select a backend. */
+  cc5BackendSelector?: (input: { uid: number; containerId: number; sessionKey: string;
+    canonicalModel: string; engine: string }) => Cc5ExecutionBackend | undefined;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
@@ -1811,7 +1814,7 @@ export function _sanitizeMasterHistoricalMessagesForFrame(
   return rows;
 }
 
-type InboundTurnIdentity = { peerId: string | null; clientMessageId: string | null };
+type InboundTurnIdentity = { peerId: string | null; clientMessageId: string | null; sessionKey?: string };
 
 function inboundTurnIdentityFromParsed(parsed: unknown): InboundTurnIdentity {
   if (parsed === null || typeof parsed !== "object") {
@@ -2998,6 +3001,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       exec: ResolvedTurnExecution,
       billingRequestId?: string,
       authorityTurnId?: string,
+      executionBackend?: Cc5ExecutionBackend,
     ): ModelAuthorityBundle => {
       if (authorityDeps === undefined || containerChallenge === null || containerId === undefined) {
         throw new Error(
@@ -3011,7 +3015,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         canonicalModel: exec.canonicalModel,
         engine: exec.engine,
         executionDescriptor: exec.descriptor,
-        auxModels: exec.auxModels,
+        auxModels: executionBackend ? [] : exec.auxModels,
+        ...(executionBackend ? { executionBackend } : {}),
         executionRevision: exec.executionRevision,
         securityEpoch: exec.securityEpoch,
         ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
@@ -3095,6 +3100,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           "sign_boundary_epoch_changed",
         );
       }
+      let executionBackend: Cc5ExecutionBackend | undefined;
+      try {
+        if (args.turn?.sessionKey && deps.cc5BackendSelector && containerId !== undefined) {
+          executionBackend = deps.cc5BackendSelector({ uid: Number(uid), containerId,
+            sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel,
+            engine: args.exec.engine });
+        }
+      } catch {
+        return await reject("REMOTE_NATIVE_UNAVAILABLE", "remote execution unavailable, retry after setup", "remote_native_binding_rejected");
+      }
       // 注意:**不**在这里查 `cleaned`。调用方在 seal 之后紧接着就有自己的 cleaned 分支
       // (带各自完整的补偿),在这里提前 return null 会让"已拒(补偿过)"与"桥关了
       // (还没补偿)"两种 null 语义混在一起 —— 正是漏账最爱的那种歧义。
@@ -3104,6 +3119,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           args.exec,
           args.billingRequestId,
           args.authorityTurnId,
+          executionBackend,
         ),
       };
     };
@@ -3157,7 +3173,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return reject("MODEL_AUTHORITY_UNAVAILABLE", "model catalog unavailable, retry shortly");
       }
       if (cleaned) return null;
-      if (isCc5TestModel(exec.canonicalModel) && !canUseCc5TestModel(uid, process.env)) {
+      if (isCc5TestModel(exec.canonicalModel)) {
         return reject("UNAUTHORIZED_MODEL", "model not authorized for current user");
       }
       const execIsCodex = exec.engine !== "ccb";
@@ -3988,8 +4004,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           cc5AdmissionError = "MODEL_AUTHORITY_UNAVAILABLE";
         }
       }
-      if (cc5AdmissionError === null && isCc5TestModel(admissionCanonical) &&
-          !canUseCc5TestModel(uid, process.env)) cc5AdmissionError = "UNAUTHORIZED_MODEL";
+      if (cc5AdmissionError === null && isCc5TestModel(admissionCanonical)) cc5AdmissionError = "UNAUTHORIZED_MODEL";
       if (cc5AdmissionError !== null) {
         if (pretrackedEnrichment) terminalizeEnrichmentDispatch(pretrackedEnrichment, cc5AdmissionError);
         onReject?.(cc5AdmissionError);
@@ -5541,6 +5556,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               teamModeRequested &&
               (frameAgentId === "main" || frameAgentId === null || teamModeNonMainAgentDemotesToMain);
             const effectiveFrameAgentId = teamModeMain ? "main" : frameAgentId;
+            // Freeze the same server-normalized web-chat route used by the gateway.
+            // This identity is captured with the turn across asynchronous preparation.
+            inboundTurnIdentityForFrame = { ...inboundTurnIdentityForFrame,
+              sessionKey: inboundSessionKey({ ...parsed,
+                agentId: effectiveFrameAgentId ?? "main" }) };
             try {
               const reviewFrame = parsed as {
                 channel?: unknown
@@ -5637,7 +5657,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             if (
               effectiveModel !== null &&
-              ((isCc5TestModel(effectiveModel) && !canUseCc5TestModel(uid, process.env)) ||
+              (isCc5TestModel(effectiveModel) ||
                (modelCheckerHandle !== null && !modelCheckerHandle.isAllowed(effectiveModel)))
             ) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
@@ -5885,6 +5905,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const peerCapture = inboundPeerIdForFrame;
         const cid = containerId;
         const cursorTurnIdentity = {
+          ...inboundTurnIdentityForFrame,
           peerId: peerCapture,
           clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
             ? parsedCapture.clientMessageId
@@ -5898,9 +5919,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account', cursorTurnIdentity);
               return;
             }
-            if (isCc5TestModel(modelCapture)
-              ? !canUseCc5TestModel(uid, process.env)
-              : !isCursorCredentialMember(uid)) {
+            if (isCc5TestModel(modelCapture) || !isCursorCredentialMember(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;
@@ -6089,6 +6108,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const peerCapture = inboundPeerIdForFrame;
         const cid = containerId;
         const antigravityTurnIdentity = {
+          ...inboundTurnIdentityForFrame,
           peerId: peerCapture,
           clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
             ? parsedCapture.clientMessageId
@@ -6275,6 +6295,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const peerCapture = inboundPeerIdForFrame;
         const cid = containerId;
         const zcodeTurnIdentity = {
+          ...inboundTurnIdentityForFrame,
           peerId: peerCapture,
           clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
             ? parsedCapture.clientMessageId
@@ -6612,6 +6633,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         };
         activeCodexTurnsByPeer.set(peerKeyForAcquire, codexTurnState);
         const turnIdentity = {
+          ...inboundTurnIdentityForFrame,
           peerId: peerIdForAcquire,
           clientMessageId: clientMessageIdForAcquire,
         };

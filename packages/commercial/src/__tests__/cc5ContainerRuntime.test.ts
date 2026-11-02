@@ -13,6 +13,7 @@ import {
   cc5ControlRequest,
   createCc5FreshContainerRuntime,
 } from '@openclaude/gateway/cc5-container-runtime'
+import type { Cc5FinanceFactory } from '@openclaude/gateway/cc5-finance'
 import {
   MODEL_AUTHORITY_VERSION,
   type ModelAuthorityPayload,
@@ -23,6 +24,10 @@ import {
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
 
+const financeFactory: Cc5FinanceFactory = () => ({ async admit() { return {
+  async beforeHostStart() {}, async beforeDispatch() {}, async stop() {},
+  async terminal() { return { state: 'proven', requestId: 'fixture-only-request' } },
+} } })
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
 function fixture(failStop = false) {
   const root = mkdtempSync(join(tmpdir(), 'cc5-cr-'))
@@ -40,6 +45,7 @@ function fixture(failStop = false) {
   const options = {
     baseRoot,
     profile: { operationId: randomUUID(), runId: randomUUID() },
+    scope: { sessionKey: 'agent:main:webchat:dm:fixture_chat1', canonicalModel: 'box-claude-sonnet-5' as const },
     ssh: {
       user: 'dedicated_cc5',
       taskRoot: '/home/box/oc-agentremote-t1555u-20261102t1400z-fixture',
@@ -66,6 +72,7 @@ function fixture(failStop = false) {
     selfhost: true,
     env,
     configuration: () => options,
+    financeFactory,
   })!
   const prepare = () =>
     runtime.prepare({ uid: 912, containerDbId: '91', local: true, publicKeyring })
@@ -102,8 +109,9 @@ function envelopes(key: ReturnType<typeof generateKeyPairSync>, b: Cc5BridgeBind
     containerId: 91,
     authorityTurnId: 'a'.repeat(32),
     connectionChallenge: 'fixture-connection',
-    canonicalModel: 'cc5-remote-t1555u',
-    engine: 'cursor',
+    canonicalModel: 'box-claude-sonnet-5',
+    engine: 'ccb',
+    executionBackend: { kind: 'cc5-interactive-v1', sessionKey: b.sessionKey, operationId: b.operationId },
     securityEpoch: 1,
     executionRevision: 'fixture-r1',
     issuedAt: now,
@@ -130,7 +138,7 @@ function envelopes(key: ReturnType<typeof generateKeyPairSync>, b: Cc5BridgeBind
   }
   return {
     ...b,
-    sessionKey: 'fixture-session',
+    sessionKey: b.sessionKey,
     turnKey: 'fixture-billing-turn',
     authority: encodeAuthorityEnvelope(a, sign(null, authoritySigningInput(a), key.privateKey)),
     lease: encodeTurnLeaseEnvelope(lease, sign(null, turnLeaseSigningInput(lease), key.privateKey)),
@@ -149,6 +157,7 @@ test('OFF, invalid UID and nonselfhost never read configuration or create a runt
       createCc5FreshContainerRuntime({
         selfhost,
         env: policy,
+        financeFactory,
         configuration: () => {
           configurations++
           throw new Error('must never read deployment configuration')
@@ -200,6 +209,44 @@ test('wrong UID/remote placement do no prepare IO; opaque handle and full CID ar
   } finally {
     await f.cleanup()
   }
+})
+
+test('backend selection is read-only, pins one existing account/new chat and requires the committed active binding', async () => {
+  const f = fixture()
+  const query = { uid: 912, containerId: 91, sessionKey: f.options.scope.sessionKey,
+    canonicalModel: f.options.scope.canonicalModel, engine: 'ccb' }
+  try {
+    assert.equal(f.runtime.selectBackend({ ...query, uid: 913 }), undefined)
+    assert.equal(f.runtime.selectBackend({ ...query, sessionKey: 'agent:main:webchat:dm:ordinary_chat1' }), undefined)
+    assert.throws(() => f.runtime.selectBackend(query))
+    const handle = (await f.prepare())!
+    assert.throws(() => f.runtime.selectBackend(query))
+    await f.runtime.bindCreated(handle, 'a'.repeat(64))
+    assert.throws(() => f.runtime.selectBackend(query))
+    await f.runtime.activate(handle, 'a'.repeat(64))
+    assert.deepEqual(f.runtime.selectBackend(query), { kind: 'cc5-interactive-v1',
+      sessionKey: query.sessionKey, operationId: f.options.profile.operationId })
+    assert.throws(() => f.runtime.selectBackend({ ...query, containerId: 92 }))
+    assert.throws(() => f.runtime.selectBackend({ ...query, canonicalModel: 'other-model' }))
+    assert.throws(() => f.runtime.selectBackend({ ...query, engine: 'cursor' }))
+    assert.equal(f.starts, 0)
+    await f.runtime.release('91', 'a'.repeat(64))
+    assert.throws(() => f.runtime.selectBackend(query))
+  } finally { await f.cleanup() }
+})
+
+test('production runtime cannot activate without an injected financial port', async () => {
+  const f = fixture()
+  try {
+    const handle = (await f.prepare())!
+    // Factory absence is rejected before even creating a new runtime directory.
+    assert.throws(() => createCc5FreshContainerRuntime({ selfhost: true, env,
+      configuration: () => ({ ...f.options, baseRoot: join(f.root, 'unused-runtime') }),
+      financeFactory: undefined as unknown as Cc5FinanceFactory }))
+    assert.equal(existsSync(join(f.root, 'unused-runtime')), false)
+    assert.equal(f.starts, 0)
+    assert.equal(existsSync(join(handle.mountSource, 'relay.sock')), false)
+  } finally { await f.cleanup() }
 })
 
 test('prepared/bound directory has no relay; activation exposes exact root-owned files then a real signed admission reaches the fake host', async () => {
@@ -332,7 +379,7 @@ test('unproved remote exit retains private unknown fence and cannot be replaced/
       }),
     )
     assert.throws(() =>
-      createCc5FreshContainerRuntime({ selfhost: true, env, configuration: () => f.options }),
+      createCc5FreshContainerRuntime({ selfhost: true, env, configuration: () => f.options, financeFactory }),
     )
   } finally {
     await f.cleanup()

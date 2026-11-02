@@ -6,6 +6,9 @@
  */
 import {
   BOX_API_MODELS,
+  type Cc5ExecutionBackend,
+  CC5_NATIVE_MODEL,
+  isCc5ExecutionBackend,
   OPENAI_FAST_SERVICE_TIER,
   TRACE_ID_HEADER,
   isBoxApiModel,
@@ -433,6 +436,7 @@ export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_API_MODELS[0].id
 
 export interface CcbExecutionDescriptor {
+  readonly executionBackend?: Cc5ExecutionBackend
   readonly canonicalModel: string
   readonly contextWindow: number | null
   readonly capabilityZero: boolean
@@ -797,6 +801,8 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 // ───────────────────────────────────────────────
 
 export interface SubprocessRunnerOpts {
+  /** Only supplied from the verified bridge authority; never from local catalog or client fields. */
+  executionBackend?: Cc5ExecutionBackend
   /** Trusted cc5-only transport. No user-selected URL, command or credentials. */
   cc5BridgePort?: import('./cc5BridgePort.js').Cc5BridgePort
   /** Actual chat peer; sessionId below may be a delegated repository parent. */
@@ -1050,7 +1056,11 @@ export function projectCcbExecutionDescriptor(input: {
   supportsVision: boolean
   supportedEfforts: readonly string[]
   capabilityProfile: Readonly<Record<string, unknown>>
+  executionBackend?: Cc5ExecutionBackend
 }): CcbExecutionDescriptor {
+  if (input.executionBackend && (!isCc5ExecutionBackend(input.executionBackend) || input.canonicalModel !== CC5_NATIVE_MODEL)) {
+    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  }
   const raw = input.capabilityProfile.ccb
   const ccb = raw !== null && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
   if (ccb.contextOwner !== undefined && ccb.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) {
@@ -1061,6 +1071,7 @@ export function projectCcbExecutionDescriptor(input: {
   }
   return {
     canonicalModel: input.canonicalModel,
+    ...(input.executionBackend ? { executionBackend: input.executionBackend } : {}),
     contextWindow: input.contextWindow,
     capabilityZero: ccb.capabilityZero === true,
     supportsThinking: ccb.supportsThinking === true,

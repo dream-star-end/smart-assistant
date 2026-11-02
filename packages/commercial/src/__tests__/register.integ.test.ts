@@ -1,7 +1,5 @@
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
-import { CC5_TEST_ACCOUNT_EMAIL, Cc5TestUserError, createCc5UnverifiedTestUser } from "../admin/cc5TestUser.js";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
@@ -600,46 +598,5 @@ describe("isEmailDomainBlocked", () => {
 
   test("plus-tag in local part does not affect domain match", () => {
     assert.equal(isEmailDomainBlocked("a+spam@tempmail.com", ["tempmail.com"]), true);
-  });
-});
-
-describe("cc5 audited unverified test account (real PG)", () => {
-  test("one concurrent create wins with a verification and audit, no sessions, billing or container side effects", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const actor = await query<{ id: string }>(
-      `INSERT INTO users(email,password_hash,email_verified,role,status)
-       VALUES ($1,$2,true,'admin','active') RETURNING id::text AS id`,
-      ["cc5-synthetic-audit-actor@example.invalid", "synthetic-fixture-not-a-login-hash"],
-    );
-    const audit = { adminId: actor.rows[0]!.id, ip: "127.0.0.1", userAgent: "cc5-real-pg-test" };
-    const passwords = [randomBytes(24).toString("base64url"), randomBytes(24).toString("base64url")];
-    const results = await Promise.allSettled(passwords.map((password) => createCc5UnverifiedTestUser({ password }, audit)));
-    const accepted = results.filter((r) => r.status === "fulfilled");
-    const rejected = results.filter((r) => r.status === "rejected");
-    assert.equal(accepted.length, 1); assert.equal(rejected.length, 1);
-    assert.ok(rejected[0]!.status === "rejected" && rejected[0]!.reason instanceof Cc5TestUserError && rejected[0]!.reason.code === "CONFLICT");
-    assert.ok(accepted[0]!.status === "fulfilled");
-    const uid = accepted[0]!.value.user_id;
-    const user = await query<{ id: string; email: string; email_verified: boolean; role: string; credits: string; v5_migration_status: string }>(
-      "SELECT id::text AS id,email,email_verified,role,credits::text AS credits,v5_migration_status FROM users WHERE id=$1", [uid]);
-    assert.equal(user.rows.length, 1); assert.equal(user.rows[0]!.email, CC5_TEST_ACCOUNT_EMAIL);
-    assert.equal(user.rows[0]!.email_verified, false); assert.equal(user.rows[0]!.role, "user");
-    assert.equal(user.rows[0]!.credits, "0"); assert.equal(user.rows[0]!.v5_migration_status, "migrated");
-    const verification = await query("SELECT purpose,used_at FROM email_verifications WHERE user_id=$1", [uid]);
-    assert.equal(verification.rows.length, 1); assert.equal(verification.rows[0]!.purpose, "verify_email");
-    assert.equal(verification.rows[0]!.used_at, null);
-    const rows = await query("SELECT admin_id::text AS admin_id,action,after FROM admin_audit WHERE target=$1", [`user:${uid}`]);
-    assert.equal(rows.rows.length, 1); assert.equal(rows.rows[0]!.admin_id, audit.adminId);
-    assert.equal(rows.rows[0]!.action, "user.create"); assert.equal(rows.rows[0]!.after.task, "AGENT-REMOTE-T1555U");
-    const counts = await Promise.all([
-      query("SELECT count(*)::text AS n FROM refresh_tokens WHERE user_id=$1", [uid]),
-      query("SELECT count(*)::text AS n FROM user_subscriptions WHERE user_id=$1", [uid]),
-      query("SELECT count(*)::text AS n FROM agent_subscriptions WHERE user_id=$1", [uid]),
-      query("SELECT count(*)::text AS n FROM agent_containers WHERE user_id=$1", [uid]),
-      query("SELECT count(*)::text AS n FROM credit_ledger WHERE user_id=$1", [uid]),
-    ]);
-    assert.ok(counts.every((result) => result.rows[0]!.n === "0"));
-    const output = JSON.stringify({ result: accepted[0]!.value, audit: rows.rows });
-    assert.equal(passwords.some((password) => output.includes(password)), false);
   });
 });

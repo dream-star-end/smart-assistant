@@ -43,7 +43,7 @@
 import type { PoolClient } from 'pg'
 import { query, tx } from '../db/queries.js'
 import { writeAdminAudit } from './audit.js'
-import { isCc5ConfiguredTestUid, isCc5TestModel, isBoxGptWebModel, isBoxGptWebOwnerUid } from '@openclaude/protocol'
+import { isCc5TestModel, isBoxGptWebModel, isBoxGptWebOwnerUid } from '@openclaude/protocol'
 import { isCursorCredentialMember } from '../cursor/access.js'
 
 /**
@@ -166,8 +166,8 @@ export async function addGrant(
 ): Promise<{ inserted: boolean; row: ModelGrantRowView }> {
   const uid = normalizeUserId(userId)
   const mid = normalizeModelId(modelId)
-  if (isCc5TestModel(mid) && !isCc5ConfiguredTestUid(uid, process.env)) {
-    throw new GrantInvalidInputError('cc5_task_test_uid_only')
+  if (isCc5TestModel(mid)) {
+    throw new GrantInvalidInputError('cc5_task_model_retired')
   }
   const out = await tx(async (client: PoolClient) => {
     // 用户存在性 —— FK 会兜底,但提前抛清晰错误码,前端 UX 友好
@@ -188,7 +188,7 @@ export async function addGrant(
     if (isBoxGptWebModel(mid) && !isBoxGptWebOwnerUid(uid)) {
       throw new GrantInvalidInputError('box_gpt_web_owner_only')
     }
-    if (modelR.rows[0]?.engine === 'cursor' && !isCc5TestModel(mid) && !isCursorCredentialMember(uid)) {
+    if (modelR.rows[0]?.engine === 'cursor' && !isCursorCredentialMember(uid)) {
       throw new GrantInvalidInputError('cursor_credential_not_enabled')
     }
 

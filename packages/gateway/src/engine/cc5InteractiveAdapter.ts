@@ -1,5 +1,5 @@
 /** Temporary one-round live personal web route; never constructs a pool selector. */
-import { isCc5TestModel } from '@openclaude/protocol'
+import { type Cc5ExecutionBackend, CC5_NATIVE_MODEL, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { createCc5BridgePort } from '../cc5BridgePort.js'
 import { cc5ResumeId } from './cc5ResumeId.js'
 import { CcbAdapter } from './ccbAdapter.js'
@@ -7,7 +7,8 @@ import type { EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdap
 import type { EngineCreateOpts } from './registry.js'
 
 export class Cc5InteractiveAdapter extends CcbAdapter {
-  override readonly engineId = 'cursor'
+  override readonly engineId = 'ccb'
+  declare readonly executionBackend: Cc5ExecutionBackend
   override readonly capabilities: EngineCapabilities = {
     billingMode: 'proxy',
     supportsEffort: false,
@@ -23,7 +24,9 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
   private readonly cc5BindingId: string
   constructor(opts: EngineCreateOpts) {
     if (
-      !isCc5TestModel(opts.model) ||
+      opts.model !== CC5_NATIVE_MODEL ||
+      !isCc5ExecutionBackend(opts.executionBackend) ||
+      opts.executionBackend.sessionKey !== opts.sessionKey ||
       opts.hermeticNoTools ||
       opts.advisorExecutionLock ||
       opts.delegationDepth ||
@@ -32,17 +35,20 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
       opts.resumeSessionId
     )
       throw new Error('CC5_TEST_PROFILE_UNSUPPORTED')
-    const port = opts.cc5BridgePort ?? createCc5BridgePort(opts.sessionKey)
+    const port = opts.cc5BridgePort ?? createCc5BridgePort(opts.sessionKey, opts.executionBackend!, opts.model!)
     super({
       ...opts,
       harness: 'official-cc',
-      authorityEngine: 'cursor',
+      authorityEngine: 'ccb',
       boxResidentCc: true,
       cc5BridgePort: port,
       prepareBoxCc: undefined,
       providerEnvOverride: undefined,
       cursorCredentialSelection: undefined,
     })
+    if (!sameCc5ExecutionBackend(port.executionBackend, opts.executionBackend) || port.canonicalModel !== opts.model) {
+      throw new Error('CC5_BACKEND_BINDING_MISMATCH')
+    }
     this.cc5BindingId = port.bindingId
   }
   override emit(event: string | symbol, ...args: unknown[]): boolean {
@@ -64,18 +70,20 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
     throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
   }
   requiresReopenForModel(model: string | undefined): boolean {
-    return !isCc5TestModel(model)
+    return model !== CC5_NATIVE_MODEL
   }
   override setModel(model: string | undefined): void {
-    if (!isCc5TestModel(model)) throw new Error('CC5_ROUTE_CHANGED_REOPEN_SESSION')
+    if (model !== CC5_NATIVE_MODEL) throw new Error('CC5_ROUTE_CHANGED_REOPEN_SESSION')
     super.setModel(model)
   }
+  override preheat(): Promise<void> { return Promise.resolve() }
   override submitTurn(params: TurnParams): EngineTurnRun {
     if (
       params.readOnly ||
       params.consultTurn ||
       !params.modelAuthority ||
       !params.turnKey ||
+      !sameCc5ExecutionBackend(params.modelAuthority.executionDescriptor.executionBackend, this.executionBackend) ||
       typeof params.input !== 'string'
     )
       throw new Error('CC5_TEST_TURN_UNSUPPORTED')

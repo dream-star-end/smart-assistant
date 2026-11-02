@@ -6,9 +6,10 @@ import { existsSync } from 'node:fs'
 import { CC5_BINDING_FILE, UnixCc5BridgePort } from '../../packages/gateway/dist/cc5BridgePort.js'
 
 assert.equal(existsSync(CC5_BINDING_FILE), false, 'run only in a disposable host/container without the task binding')
-const port = new UnixCc5BridgePort({ version: 1, uid: '912', containerDbId: '91',
+const port = new UnixCc5BridgePort({ version: 2, backendKind: 'cc5-interactive-v1', canonicalModel: 'box-claude-sonnet-5',
+  sessionKey: 'agent:main:webchat:dm:artifact_smoke', runId: randomUUID(), uid: '912', containerDbId: '91',
   dockerId: 'a'.repeat(64), operationId: randomUUID(), capability: 'b'.repeat(64), expiresAt: Date.now() + 600000 },
-  'synthetic-artifact-smoke')
+  'agent:main:webchat:dm:artifact_smoke')
 const options = await port.prepare()
 assert.equal(options.args[0], '--conditions=openclaude-precompiled')
 const child = spawnSync(options.command, options.args, { cwd: options.subprocessCwd,

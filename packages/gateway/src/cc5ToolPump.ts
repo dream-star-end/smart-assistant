@@ -88,6 +88,7 @@ export async function runCc5ToolPump(input: {
   executionRoot?: string
 }): Promise<Cc5FixedToolReceipt> {
   if (input.keyring.size === 0) throw new Error('CC5_TOOL_KEYRING_MISSING')
+  if (input.sessionKey !== input.binding.sessionKey) throw new Error('CC5_TOOL_SCOPE_MISMATCH')
   const scope = {
     capability: input.binding.capability,
     uid: input.binding.uid,

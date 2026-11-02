@@ -41,7 +41,7 @@ const emailSchema = z
   .regex(/^[a-z0-9._+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i, "invalid email format");
 
 /** 密码 8-72 字节,argon2 上限 72(05-SEC §1) */
-export const passwordSchema = z.string().min(8).max(72);
+const passwordSchema = z.string().min(8).max(72);
 
 export const registerInputSchema = z.object({
   email: emailSchema,
@@ -198,8 +198,8 @@ export function isEmailDomainBlocked(
   return false;
 }
 
-/** Shared creation core; caller owns transaction, validation, hashing, audit and mail policy. */
-export async function insertUnverifiedAccount(client: PoolClient, input: {
+/** Internal normal-registration core; register() owns validation, transaction and mail policy. */
+async function insertUnverifiedAccount(client: PoolClient, input: {
   email: string;
   passwordHash: string;
   verificationHash: string;

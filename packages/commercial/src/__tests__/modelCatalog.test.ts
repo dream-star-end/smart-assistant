@@ -916,8 +916,8 @@ describe("OCV5-551 box-gpt-6-astra-pro owner uid=3 restriction", () => {
   });
 });
 
-describe('cc5 task test model server projection and execution policy', () => {
-  test('default-off and exact test UID override public/admin/grants, including aliases and locked rows', () => {
+describe('retired cc5 task model server projection and execution policy', () => {
+  test('legacy flags and grants never restore a retired task model, including aliases and locked rows', () => {
     const keys = ['OC_SELFHOST_CC5_T1555U_ENABLED', 'OC_SELFHOST_CC5_T1555U_TEST_UID'] as const;
     const saved = keys.map((key) => process.env[key]);
     try {
@@ -933,7 +933,7 @@ describe('cc5 task test model server projection and execution policy', () => {
           for (const role of ['user', 'admin'] as const) {
             for (const uid of [0, 3, 314158, 314159]) {
               const scope = { uid, role, grantedModelIds: new Set([id]), userPlanTier: 100 };
-              const expected = flag === '1' && uid === 314159;
+              const expected = false;
               assert.equal(catalog.canUseModel(scope, id), expected);
               assert.equal(catalog.canUseModel(scope, 'cc5-task-alias'), expected);
               assert.deepEqual(catalog.listForUser(scope).map((row) => row.modelId), expected ? [id] : []);
@@ -953,7 +953,7 @@ describe('cc5 task test model server projection and execution policy', () => {
       for (const uid of [0, 3, 314159]) {
         const scope = { uid, role: 'user' as const, grantedModelIds: new Set([id]), userPlanTier: 0 };
         assert.equal(locked.canUseModel(scope, id), false);
-        assert.deepEqual(locked.listLockedForUser(scope).map((row) => row.modelId), uid === 314159 ? [id] : []);
+        assert.deepEqual(locked.listLockedForUser(scope).map((row) => row.modelId), []);
       }
     } finally {
       keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });

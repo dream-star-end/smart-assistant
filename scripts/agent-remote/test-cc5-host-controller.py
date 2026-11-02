@@ -52,11 +52,44 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(config, {'mcpServers': {'ocbridge': {'command': '/usr/bin/python3',
                 'args': ['-I', str(root / 'cprofile/cc5-fixed-mcp.py'), str(root)]}}})
             args = mod.profile_args(root, info)
+            # Canonical existing Sonnet model, never a mutable upstream alias.
+            self.assertEqual(args[args.index('--model') + 1], 'claude-sonnet-5')
             self.assertEqual(args[args.index('--tools') + 1], '')
             self.assertEqual(args[args.index('--setting-sources') + 1], '')
             self.assertIn('--strict-mcp-config', args)
             self.assertEqual(args[-2:], ['--allowedTools', 'mcp__ocbridge__roundtrip'])
             self.assertTrue(all((p.stat().st_mode & 0o777) == 0o400 for p in (root / 'cprofile').iterdir()))
+
+    def test_launch_passes_native_guards_and_fixed_interactive_model_to_the_real_exec_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = {**self.installed(root), 'pluginDigest': 'synthetic-plugin-digest'}
+            files = {'mod/oc-bridge/' + name: b'synthetic-plugin' for name in mod.PLUGIN}
+            with patch.object(mod, 'owner', lambda _: info), \
+                    patch.object(mod, 'check_sources', lambda *_: files), \
+                    patch.object(mod, 'process_record', lambda _: {'pid': 444, 'startTicks': '1'}), \
+                    patch.object(mod, 'proc', lambda _: (['synthetic-controller'], '1')), \
+                    patch.object(mod, 'write_lifecycle') as lifecycle, \
+                    patch.object(mod.os, 'chdir') as chdir, \
+                    patch.object(mod.os, 'execve') as execute, \
+                    patch.dict(mod.os.environ, {'CLAUDE_CODE_MAX_RETRIES': '99', 'PYTHONPATH': '/untrusted'}):
+                mod.launch_locked(root)
+            lifecycle.assert_called_once()
+            chdir.assert_called_once_with(info['cwd'])
+            execute.assert_called_once()
+            executable, args, environment = execute.call_args.args
+            self.assertEqual(executable, sys.executable)
+            self.assertEqual(args[:4], [sys.executable, str(root / 'install/host.py'), str(root / 'run'), info['session']])
+            self.assertEqual(args[args.index('--model') + 1], 'claude-sonnet-5')
+            self.assertTrue(all(flag not in args for flag in ('-p', '--print', '--output-format', '--input-format')))
+            self.assertEqual({name: environment[name] for name in (
+                'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY',
+                'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+                'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')}, {
+                'CLAUDE_CODE_MAX_RETRIES': '0', 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1',
+                'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS': '1024',
+                'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'})
+            self.assertNotIn('PYTHONPATH', environment)
 
     def test_installer_rejects_running_task_hash_changes_or_extra_packet_fields_before_publish(self):
         for case in ('run', 'session', 'setup', 'hash', 'extra'):

@@ -14,8 +14,11 @@ import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   type AuthorityKeyring,
-  CC5_TEST_MODEL_ID,
-  canUseCc5TestModel,
+  type Cc5ExecutionBackend,
+  CC5_INTERACTIVE_BACKEND,
+  CC5_NATIVE_MODEL,
+  isCc5BackendAuthority,
+  parseCc5ExecutionBackend,
   parseAuthorityKeyring,
 } from '@openclaude/protocol'
 import type { TurnModelAuthority } from './subprocessSpawnConfig.js'
@@ -26,13 +29,43 @@ export const CC5_AUTHORITY_KEYRING_FILE = '/run/oc/cc5-remote-t1555u/authority-p
 export const CC5_RELAY_SOCKET = '/run/oc/cc5-remote-t1555u/relay.sock'
 export const CC5_BRIDGE_MAX_FRAME_BYTES = 8 * 1024 * 1024
 export interface Cc5BridgeBinding {
-  version: 1
+  version: 2
+  backendKind: typeof CC5_INTERACTIVE_BACKEND
+  canonicalModel: typeof CC5_NATIVE_MODEL
+  sessionKey: string
+  runId: string
   uid: string
   containerDbId: string
   dockerId: string
   operationId: string
   capability: string
   expiresAt: number
+}
+
+/** The same closed v2 binding is consumed by the child, relay and fixed tool. */
+export function assertCc5BindingScope(binding: Readonly<Cc5BridgeBinding>): void {
+  requireCc5(binding && typeof binding === 'object' &&
+    Object.keys(binding).sort().join(',') === 'backendKind,canonicalModel,capability,containerDbId,dockerId,expiresAt,operationId,runId,sessionKey,uid,version' &&
+    binding.version === 2 && binding.backendKind === CC5_INTERACTIVE_BACKEND &&
+    binding.canonicalModel === CC5_NATIVE_MODEL &&
+    /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![\s\S])/.test(binding.runId) &&
+    /^[1-9][0-9]{0,18}$/.test(binding.uid) && /^[1-9][0-9]{0,18}$/.test(binding.containerDbId) &&
+    /^[a-f0-9]{64}$/.test(binding.dockerId) && /^[a-f0-9]{64}$/.test(binding.capability) &&
+    Number.isSafeInteger(binding.expiresAt))
+  parseCc5ExecutionBackend({ kind: binding.backendKind, sessionKey: binding.sessionKey,
+    operationId: binding.operationId })
+}
+
+export function cc5AuthorityMatchesBinding(binding: Readonly<Cc5BridgeBinding>, authority: {
+  uid: number; containerId: number; canonicalModel: string; engine: string
+  executionBackend?: Cc5ExecutionBackend
+}): boolean {
+  assertCc5BindingScope(binding)
+  return isCc5BackendAuthority(authority) && String(authority.uid) === binding.uid &&
+    String(authority.containerId) === binding.containerDbId &&
+    authority.canonicalModel === binding.canonicalModel &&
+    authority.executionBackend!.sessionKey === binding.sessionKey &&
+    authority.executionBackend!.operationId === binding.operationId
 }
 
 function requireCc5(value: unknown): asserts value {
@@ -74,7 +107,7 @@ export function readCc5Binding(
     requireCc5(path === CC5_BINDING_FILE)
     const b = readSupervisorJson(path) as Cc5BridgeBinding
     requireCc5(
-      b.version === 1 &&
+      b.version === 2 &&
         /^[1-9][0-9]*$/.test(b.uid) &&
         /^[1-9][0-9]*$/.test(b.containerDbId) &&
         /^[a-f0-9]{64}$/.test(b.dockerId) &&
@@ -83,6 +116,7 @@ export function readCc5Binding(
         Number.isSafeInteger(b.expiresAt) &&
         b.expiresAt > now,
     )
+    assertCc5BindingScope(b)
     return Object.freeze(b)
   } catch {
     throw new Error('CC5_BRIDGE_BINDING_INVALID')
@@ -106,6 +140,8 @@ export function readCc5AuthorityKeyring(): AuthorityKeyring {
 
 export interface Cc5BridgePort {
   readonly bindingId: string
+  readonly executionBackend: Cc5ExecutionBackend
+  readonly canonicalModel: string
   prepare(): Promise<SpawnOpts>
   admit(input: { authority: TurnModelAuthority; turnKey: string; model: string }): Promise<void>
   renew(leaseEnvelope: string): Promise<void>
@@ -164,6 +200,8 @@ export function cc5ControlRequest(
 
 export class UnixCc5BridgePort implements Cc5BridgePort {
   readonly bindingId: string
+  readonly executionBackend: Cc5ExecutionBackend
+  readonly canonicalModel: string
   private stopPromise?: Promise<void>
   private closed = false
   private active = false
@@ -173,7 +211,11 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     private readonly call = cc5ControlRequest,
   ) {
     this.bindingId = binding.operationId
-    requireCc5(sessionKey.length > 0 && sessionKey.length <= 512)
+    assertCc5BindingScope(binding)
+    requireCc5(sessionKey === binding.sessionKey)
+    this.executionBackend = Object.freeze({ kind: binding.backendKind, sessionKey,
+      operationId: binding.operationId })
+    this.canonicalModel = binding.canonicalModel
   }
   async prepare(): Promise<SpawnOpts> {
     requireCc5(!this.closed && this.binding.expiresAt > Date.now())
@@ -216,8 +258,11 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     requireCc5(
       !this.closed &&
         !this.active &&
-        input.model === CC5_TEST_MODEL_ID &&
-        input.authority.executionDescriptor.canonicalModel === CC5_TEST_MODEL_ID &&
+        input.model === this.binding.canonicalModel &&
+        input.authority.executionDescriptor.canonicalModel === this.binding.canonicalModel &&
+        input.authority.executionDescriptor.executionBackend?.kind === this.binding.backendKind &&
+        input.authority.executionDescriptor.executionBackend.sessionKey === this.binding.sessionKey &&
+        input.authority.executionDescriptor.executionBackend.operationId === this.binding.operationId &&
         this.binding.expiresAt > Date.now() &&
         authority &&
         lease &&
@@ -245,10 +290,14 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
 
 export function createCc5BridgePort(
   sessionKey: string,
+  executionBackend: Cc5ExecutionBackend,
+  canonicalModel: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Cc5BridgePort {
-  requireCc5(canUseCc5TestModel(env.OC_USER_ID, env))
+  const expected = parseCc5ExecutionBackend(executionBackend)
   const binding = readCc5Binding()
-  requireCc5(binding.uid === env.OC_USER_ID && binding.containerDbId === env.OC_CONTAINER_ID)
+  requireCc5(binding.uid === env.OC_USER_ID && binding.containerDbId === env.OC_CONTAINER_ID &&
+    expected.sessionKey === sessionKey && expected.sessionKey === binding.sessionKey &&
+    expected.operationId === binding.operationId && canonicalModel === binding.canonicalModel)
   return new UnixCc5BridgePort(binding, sessionKey)
 }
