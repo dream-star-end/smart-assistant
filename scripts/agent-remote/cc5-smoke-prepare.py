@@ -141,7 +141,7 @@ def install_cli(root):
         info.update({'claudeExecutable': str(path), 'cliFileIdentity': identity,
                      'cliSha256': PINNED_CLI_SHA})
         temp = root / 'OWNER.cli-install.json'
-        with temp.open('x', opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+        with open(temp, 'x', opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
             json.dump(info, stream, indent=2)
             stream.write('\n')
             stream.flush()
