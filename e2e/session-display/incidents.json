@@ -9764,6 +9764,31 @@
           "assertion": "a running chat leaves its login once that login's weekly quota is exhausted"
         }
       ]
+    },
+    {
+      "id": "INC-20261102-BOX-PROFILE-OBSERVER-ATTRIBUTION",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "2026-11-02 商业版代码审计后的隔离故障注入：egress重启丢失runOwners，或读命令缺少nonce时，BoxProfileExec把旧run的配额/认证信号回退记到当前观察target，错误冷却另一登录；非launch裸stdout也会写当前scope健康。已用假transport在正式runner复现，未证明这是uid4当天故障根因。修复只接受launch直出信号，或有已知原owner的合法spool信号；未知身份保持原读取/偏移/控制但不更新任何profile健康，不新增登录切换。",
+      "rootFixCommit": "e13f9886",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxProfileExec.test.ts",
+          "assertion": "a process restart never attributes a prior run's rejection to the observing login"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxProfileExec.test.ts",
+          "assertion": "non-launch raw stdout never teaches a profile, including a failed exec"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "[inc-20261102-box-profile-observer-attribution] PASS — unknown observers never poison login health; known owners remain exact; zero launches"
+        }
+      ]
     }
   ]
 }
