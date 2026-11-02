@@ -69,3 +69,37 @@ test("missing and pending rows never start Box or invent a successful response",
     readMessage: async () => { throw new Error("must not read"); } } as never);
   assert.equal(pending.kind, "pending");
 });
+
+test("a unique durable failure survives restart without reading a message or launching Box", async () => {
+  const failure = { version: 1 as const, code: "BOX_TOOL_SNAPSHOT_MISMATCH" as const,
+    phase: "continuation" as const, observedAtMs: 1_000, requestId: "original-failed" };
+  let failureReads = 0, messageReads = 0;
+  const deps = { journal: {
+    findReplayIdentity: async () => null,
+    findFallbackFailure: async () => { failureReads++; return failure; },
+  }, readMessage: async () => { messageReads++; throw new Error("must not read"); } };
+  const input = { uid: 3n, canonicalModel: body.model,
+    canonicalBody: { ...body, stream: false } as ProxyBody, upstreamModel: message.model };
+  assert.deepEqual(await findCompletedBoxReplay(input, deps), { kind: "failed", failure });
+  assert.equal(failureReads, 1);
+  assert.equal(messageReads, 0);
+  assert.deepEqual(await findCompletedBoxReplay({ ...input, canonicalBody: body }, deps),
+    { kind: "missing" }, "historical failure must not prevent a new streaming attempt");
+  assert.equal(failureReads, 1);
+});
+
+test("a live pending attempt takes precedence over a historical failure", async () => {
+  const identity: BoxReplayIdentity = { requestId: "current-pending",
+    rootRequestId: "current-pending", uid: 3n, accountId: 20n,
+    runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), invocationMode: "text",
+    state: "unknown", roundNo: 1, spoolOffset: 0, rootLaunchPermit: false };
+  let failedReads = 0;
+  const replay = await findCompletedBoxReplay({ uid: 3n, canonicalModel: body.model,
+    canonicalBody: { ...body, stream: false } as ProxyBody, upstreamModel: message.model }, {
+    journal: { findReplayIdentity: async () => identity,
+      findFallbackFailure: async () => { failedReads++; return null; } },
+    readMessage: async () => { throw new Error("must not read"); },
+  });
+  assert.deepEqual(replay, { kind: "pending", identity });
+  assert.equal(failedReads, 0);
+});

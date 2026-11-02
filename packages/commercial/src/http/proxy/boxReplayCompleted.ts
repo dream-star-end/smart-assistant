@@ -6,12 +6,14 @@ import type { BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { boxReplayMessageToSse } from "./boxReplayMessageSse.js";
 import type { ProxyBody } from "./shared.js";
 import type { AuthorityProjection, PreparedContinuation } from "./boxPreparedContinuation.js";
+import type { BoxFallbackFailure } from "./boxFailureEvidence.js";
 
 export class BoxReplayCompletedError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxReplayCompletedError"; }
 }
 export type BoxReplayLookup =
   | { kind: "missing" }
+  | { kind: "failed"; failure: BoxFallbackFailure }
   | { kind: "pending"; identity: BoxReplayIdentity }
   | { kind: "ready"; identity: BoxReplayIdentity; response: Response };
 
@@ -21,11 +23,18 @@ export async function findCompletedBoxReplay(input: {
   trustedAuthority?: AuthorityProjection;
   prepared?: PreparedContinuation;
 }, deps: {
-  journal: Pick<BoxDurableJournal, "findReplayIdentity">;
+  journal: Pick<BoxDurableJournal, "findReplayIdentity"> &
+    Partial<Pick<BoxDurableJournal, "findFallbackFailure">>;
   readMessage: (pointer: BoxReplayMessagePointer) => Promise<unknown>;
 }): Promise<BoxReplayLookup> {
   const identity = await deps.journal.findReplayIdentity(input);
-  if (!identity) return { kind: "missing" };
+  if (!identity) {
+    if (input.canonicalBody.stream === false && deps.journal.findFallbackFailure) {
+      const failure = await deps.journal.findFallbackFailure(input);
+      if (failure) return { kind: "failed", failure };
+    }
+    return { kind: "missing" };
+  }
   if (!identity.messagePointer) return { kind: "pending", identity };
   const message = await deps.readMessage(identity.messagePointer);
   if (!message || typeof message !== "object" || Array.isArray(message)

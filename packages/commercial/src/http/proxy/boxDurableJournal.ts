@@ -38,6 +38,8 @@ import { parseBoxReplayMessagePointer,
   type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
 import { normalizeBoxResultImagesForCli } from "./boxToolResultImages.js";
+import { parseBoxFirstFailure, type BoxFailureInput, type BoxFirstFailure,
+  type BoxFallbackFailure } from "./boxFailureEvidence.js";
 import { BOX_EXPIRED_UNPROVEN_STATE, BOX_OPERATOR_UNREACHABLE_CLOSED_STATE,
   isBoxExpiredCloseCause, isBoxUnknownPhase, parseBoxExpiredClose,
   parseBoxOperatorUnreachableClose, BOX_ABSENCE_CONFIRM_MS, BOX_PROCESS_ABSENT_CAUSE,
@@ -377,6 +379,9 @@ export interface BoxJournalPort {
     { receipt: BoxPrelaunchReceipt; cleanedReceipt: string }): Promise<void>;
   markUnknown(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { phase: string }): Promise<void>;
+  recordFirstFailure?(input: BoxFailureInput & Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { ownerRequestId?: string }): Promise<BoxFirstFailure | null>;
   recordUserCancelIntent?(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">): Promise<void>;
   complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
@@ -399,7 +404,7 @@ export interface BoxJournalPort {
     { proof: BoxTerminalProof; usage: BoxUsageEvidence;
       messagePointer?: BoxReplayMessagePointer }): Promise<void>;
   markToolChainStoppedFailure?(input: Pick<BoxJournalAdmission,
-    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof }): Promise<void>;
+    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof; rejectedStream?: true }): Promise<void>;
 }
 
 function goodId(input: BoxJournalAdmission): void {
@@ -876,6 +881,89 @@ export class BoxDurableJournal implements BoxJournalPort {
     return changed.rowCount === 1;
   }
 
+  /** Record a bounded first observation without changing billing, launch or
+   * stop state. A successful delivery always wins over a late stream error. */
+  async recordFirstFailure(input: BoxFailureInput & Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { ownerRequestId?: string }): Promise<BoxFirstFailure | null> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
+      || (input.ownerRequestId !== undefined
+        && !/^[A-Za-z0-9_-]{1,64}$/.test(input.ownerRequestId))) {
+      throw new BoxDurableJournalError("BOX_FAILURE_IDENTITY_INVALID");
+    }
+    const projected = parseBoxFirstFailure({ version: 1, observedAtMs: 1,
+      code: input.code, phase: input.phase,
+      ...(input.diagnostic !== undefined ? { diagnostic: input.diagnostic } : {}) });
+    if (!projected) throw new BoxDurableJournalError("BOX_FAILURE_EVIDENCE_INVALID");
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      const found = await client.query<{ state: string; failure_code: string | null; ctx: Record<string, unknown>;
+        observed_ms: string }>(
+        `SELECT state,failure_code,ctx,FLOOR(EXTRACT(EPOCH FROM clock_timestamp())*1000)::bigint AS observed_ms
+           FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+        [input.requestId, input.uid.toString()]);
+      const row = found.rows[0], ctx = row?.ctx;
+      if (found.rowCount !== 1 || !row || !ctx || ctx.boxInvocationRecovery !== "v1"
+        || typeof ctx.model !== "string" || !isBoxApiModel(ctx.model)
+        || ctx.boxAccountId !== input.accountId.toString()
+        || ctx.boxRunNonce !== input.runNonce || ctx.boxLeaseEpoch !== input.leaseEpoch
+        || ctx.boxOwnerRequestId !== input.ownerRequestId
+        || typeof ctx.boxSessionId !== "string" || ctx.boxSessionId.length < 1
+        || ctx.boxSessionId.length > 256 || typeof ctx.boxTurnKey !== "string"
+        || ctx.boxTurnKey.length < 1 || ctx.boxTurnKey.length > 256
+        || typeof ctx.boxReplayFingerprint !== "string"
+        || !/^[a-f0-9]{64}$/.test(ctx.boxReplayFingerprint)
+        || typeof ctx.boxRequestHash !== "string" || !/^[a-f0-9]{64}$/.test(ctx.boxRequestHash)) {
+        throw new BoxDurableJournalError("BOX_FAILURE_IDENTITY_INVALID");
+      }
+      const successful = ctx.boxReplayMessage !== undefined || ctx.boxToolHandoff !== undefined
+        || ctx.boxUsage !== undefined || row.state === "committed";
+      const usage = successful ? null : await client.query(
+        "SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1",
+        [input.requestId, input.uid.toString()]);
+      if (successful || usage?.rowCount) {
+        await client.query("COMMIT"); committed = true; return null;
+      }
+      if (Object.hasOwn(ctx, "boxFirstFailure")) {
+        const first = parseBoxFirstFailure(ctx.boxFirstFailure);
+        if (!first) throw new BoxDurableJournalError("BOX_FAILURE_EVIDENCE_INVALID");
+        await client.query("COMMIT"); committed = true; return first;
+      }
+      // A real Stop already recorded before any failure is not an upstream
+      // error. Decoder cleanup may add the same intent after the first error;
+      // that path returned its original evidence above and keeps it intact.
+      if (Object.hasOwn(ctx, "boxCancelIntent") || row.failure_code === "USER_CANCELLED") {
+        await client.query("COMMIT"); committed = true; return null;
+      }
+      if (!["inflight", "finalizing", "aborted"].includes(row.state)
+        || !["reserved", "starting", "running", "resuming", "linked", "unknown",
+          "failed_stopped", "prestart_stopped"].includes(String(ctx.boxState))) {
+        throw new BoxDurableJournalError("BOX_FAILURE_FENCE_LOST");
+      }
+      const evidence = parseBoxFirstFailure({ ...projected, observedAtMs: Number(row.observed_ms) });
+      if (!evidence) throw new BoxDurableJournalError("BOX_FAILURE_EVIDENCE_INVALID");
+      const changed = await client.query(
+        `UPDATE request_finalize_journal
+            SET ctx=ctx || jsonb_build_object('boxFirstFailure',$6::jsonb),updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
+            AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
+            AND ctx->>'boxOwnerRequestId' IS NOT DISTINCT FROM $7::text
+            AND NOT (ctx ? 'boxFirstFailure') AND NOT (ctx ? 'boxReplayMessage')
+            AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxUsage')`,
+        [input.requestId, input.uid.toString(), input.accountId.toString(), input.runNonce,
+          input.leaseEpoch, JSON.stringify(evidence), input.ownerRequestId ?? null]);
+      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILURE_FENCE_LOST");
+      await client.query("COMMIT"); committed = true; return evidence;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
   /** Find the original round before precharge or account selection. This only
    * reads committed evidence; the caller must separately observe the pinned
    * spool/proof or load a completed Message before returning any answer.
@@ -886,6 +974,28 @@ export class BoxDurableJournal implements BoxJournalPort {
   async findReplayIdentity(input: { uid: bigint; canonicalModel: string;
     canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection;
     prepared?: PreparedContinuation }): Promise<BoxReplayIdentity | null> {
+    return this.findReadOnlyIdentity(input, false);
+  }
+
+  /** Failure observation is only for a same-request non-streaming fallback.
+   * It never changes which stopped attempts count as successful replays. */
+  async findFallbackFailure(input: { uid: bigint; canonicalModel: string;
+    canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection;
+    prepared?: PreparedContinuation }): Promise<BoxFallbackFailure | null> {
+    if ((input.canonicalBody as { stream?: boolean }).stream !== false) {
+      throw new BoxDurableJournalError("BOX_FAILURE_REPLAY_REQUIRES_NONSTREAMING");
+    }
+    const identity = await this.findReadOnlyIdentity(input, true);
+    return identity?.firstFailure ? { ...identity.firstFailure,
+      requestId: identity.requestId } : null;
+  }
+
+  /** Both lookups consume the same prepared identity and verify the same full
+   * owner chain. Only the candidate predicate and returned safe evidence vary. */
+  private async findReadOnlyIdentity(input: { uid: bigint; canonicalModel: string;
+    canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection;
+    prepared?: PreparedContinuation }, failureOnly: boolean):
+    Promise<(BoxReplayIdentity & { firstFailure?: BoxFirstFailure }) | null> {
     const stream = (input.canonicalBody as { stream?: boolean }).stream;
     if (input.uid <= 0n || input.canonicalBody.model !== input.canonicalModel
       || (stream !== true && stream !== false)) {
@@ -918,22 +1028,43 @@ export class BoxDurableJournal implements BoxJournalPort {
       await lock(client, [`box:session:${input.uid}:${fingerprint.sessionId}`]);
       type Row = { request_id: string; ctx: Record<string, unknown> };
       const column = stream === false ? "boxFallbackAlias" : "boxReplayFingerprint";
+      const failurePredicate = failureOnly
+        ? `state='aborted' AND failure_code IS DISTINCT FROM 'USER_CANCELLED'
+            AND ctx->>'boxState'='failed_stopped'
+            AND ctx ? 'boxFirstFailure'
+            AND NOT (ctx ? 'boxReplayMessage') AND NOT (ctx ? 'boxToolHandoff')
+            AND NOT (ctx ? 'boxUsage')
+            AND NOT EXISTS (SELECT 1 FROM usage_records u
+              WHERE u.request_id=request_finalize_journal.request_id AND u.user_id=$1)
+            AND ($7::boolean IS FALSE OR CASE
+              WHEN jsonb_typeof(ctx->'boxFirstFailure'->'observedAtMs')='number'
+                AND (ctx->'boxFirstFailure'->>'observedAtMs') ~ '^[1-9][0-9]{0,15}$'
+              THEN (ctx->'boxFirstFailure'->>'observedAtMs')::bigint
+                BETWEEN FLOOR(EXTRACT(EPOCH FROM NOW()-INTERVAL '10 minutes')*1000)::bigint
+                AND FLOOR(EXTRACT(EPOCH FROM NOW()+INTERVAL '5 seconds')*1000)::bigint
+              ELSE FALSE END)`
+        : `NOT (state='aborted' AND NOT (ctx ? 'boxReplayMessage')
+              AND COALESCE(ctx->>'boxState','') IN ('failed_stopped','prestart_stopped'))`;
       const found = await client.query<Row>(
         `SELECT request_id,ctx FROM request_finalize_journal
           WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
             AND ctx->>'boxTurnKey'=$3 AND ctx->>'model'=$4
             AND ctx->>$5=$6
-            AND NOT (state='aborted' AND NOT (ctx ? 'boxReplayMessage')
-              AND COALESCE(ctx->>'boxState','') IN ('failed_stopped','prestart_stopped'))
+            AND (${failurePredicate})
           LIMIT 2`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
-          input.canonicalModel, column, key]);
+          input.canonicalModel, column, key,
+          ...(failureOnly ? [view.prepared.authority.kind === "legacy_unsigned"] : [])]);
       if (found.rows.length > 1) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
       const matched = found.rows[0];
       if (!matched) {
         await client.query("COMMIT"); committed = true; return null;
       }
       const original = matched.ctx;
+      const firstFailure = failureOnly ? parseBoxFirstFailure(original.boxFirstFailure) : null;
+      if (failureOnly && !firstFailure) {
+        throw new BoxDurableJournalError("BOX_FAILURE_EVIDENCE_INVALID");
+      }
       const accountId = original.boxAccountId;
       const runNonce = original.boxRunNonce;
       const leaseEpoch = original.boxLeaseEpoch;
@@ -970,6 +1101,16 @@ export class BoxDurableJournal implements BoxJournalPort {
         || ![...ACTIVE, "terminal", "failed_stopped", "prestart_stopped"]
           .includes(String(original.boxState))) {
         throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+      }
+      if (failureOnly) {
+        try {
+          const proof = parseBoxTerminalProof(JSON.stringify(original.boxTerminalProof) + "\n",
+            { runNonce, leaseEpoch });
+          if ((proof.reason === "worker_complete")
+            !== (original.boxStopOutcome === "rejected_stream")) {
+            throw new Error("unbound failure proof");
+          }
+        } catch { throw new BoxDurableJournalError("BOX_FAILURE_EVIDENCE_INVALID"); }
       }
       let row = matched;
       const seen = new Set<string>();
@@ -1015,7 +1156,8 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(resultHashes ? { resultHashes } : {}),
              ...(priorToolUses ? { priorToolUses } : {}),
              ...(priorRejectedToolUses ? { priorRejectedToolUses } : {}),
-             ...(nativeSessionId ? { nativeSessionId } : {}) };
+             ...(nativeSessionId ? { nativeSessionId } : {}),
+             ...(firstFailure ? { firstFailure } : {}) };
         }
         if (Object.hasOwn(row.ctx, "boxNativeSessionId")) {
           descendantSessions.push(row.ctx.boxNativeSessionId);
@@ -2502,7 +2644,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
       }
       if (rejectedStream && (handoff || current.state !== "inflight" && current.state !== "aborted"
-        || (current.state === "inflight" && basis.boxState !== "unknown"))) {
+        || (current.state === "inflight" && !["linked", "unknown"].includes(String(basis.boxState))))) {
         throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
       }
       if ((handoff ? ["inflight", "finalizing", "committed"].includes(current.state)
@@ -2578,8 +2720,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             WHERE request_id=$1 AND user_id=$2 AND state='inflight'
               AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
               AND ctx->>'boxState' IN ('linked','unknown')
-              AND ($6::boolean IS FALSE OR ctx->>'boxState'='unknown')
-              AND NOT (ctx ? 'boxToolHandoff')`, [...stopParams, rejectedStream]);
+              AND NOT (ctx ? 'boxResumeRequestId')
+              AND NOT (ctx ? 'boxToolHandoff')`, stopParams);
       if (stopped.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
       for (const ancestor of rows.slice(1)) {
         const changed = await client.query(
