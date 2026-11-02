@@ -55,11 +55,11 @@ export function createNativeToolSession(config: NativeToolSessionOptions) {
   let disposal: Promise<void> | undefined
   let batch: ReturnType<typeof createDrainedToolStream<Message>> | undefined
   const assertLive = (signal: AbortSignal) => {
-    if (closing || signal.aborted) throw new Error('native-session-aborted')
+    if (closing || context.abortController.signal.aborted || signal.aborted)
+      throw new Error('native-session-aborted')
   }
   const lifecycle: NativeToolLifecycle = {
-    track(request, execute) {
-      const signal = context.abortController.signal
+    track(request, signal, execute) {
       const execution = Promise.resolve().then(async () => {
         assertLive(signal)
         await config.beforeExecution(request, signal)
@@ -73,8 +73,7 @@ export function createNativeToolSession(config: NativeToolSessionOptions) {
       )
       return execution
     },
-    async invoke(request, call) {
-      const signal = context.abortController.signal
+    async invoke(request, signal, call) {
       assertLive(signal)
       await config.beforeToolCall(request, signal)
       assertLive(signal)

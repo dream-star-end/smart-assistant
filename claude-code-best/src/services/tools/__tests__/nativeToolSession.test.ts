@@ -259,6 +259,110 @@ describe('native real runTools lifetime', () => {
     expect(order).toEqual(['effect-live', 'abort'])
     await f.session.dispose()
   })
+  test('per-tool cancellation during dispatch blocks validation while the session remains live', async () => {
+    const entered = gate()
+    const release = gate()
+    let validations = 0
+    let effects = 0
+    const child = new AbortController()
+    let dispatchedSignal: AbortSignal | undefined
+    const f = setup(
+      fixtureTool(
+        async () => {
+          effects++
+          return { data: {} }
+        },
+        {
+          validateInput: async () => {
+            validations++
+            return { result: true }
+          },
+        },
+      ),
+      {
+        beforeExecution: async (_request, signal) => {
+          dispatchedSignal = signal
+          entered.release()
+          await release.promise
+        },
+      },
+    )
+    const context = f.session.getContext()
+    const { blocks, assistant } = requestBlocks(['Fixture'])
+    const { runToolUse } = await import('../toolExecution.js')
+    const reading = collect(
+      runToolUse(
+        blocks[0]!,
+        assistant,
+        async (_tool, input) => ({ behavior: 'allow', updatedInput: input }),
+        { ...context, abortController: child },
+      ),
+    )
+    await entered.promise
+    child.abort('sibling_error')
+    expect(context.abortController.signal.aborted).toBe(false)
+    release.release()
+    const updates = await reading
+    expect(
+      updates.some(
+        (update) =>
+          update.message?.type === 'user' &&
+          JSON.stringify(update.message.message?.content).includes('native-session-aborted'),
+      ),
+    ).toBe(true)
+    expect(dispatchedSignal).toBe(child.signal)
+    expect(validations).toBe(0)
+    expect(effects).toBe(0)
+    await f.session.dispose()
+  })
+  test('streaming child cancellation during the final gate prevents an effect with a live session', async () => {
+    const entered = gate()
+    const release = gate()
+    let effects = 0
+    let child: AbortController | undefined
+    let checkedSignal: AbortSignal | undefined
+    const f = setup(
+      fixtureTool(async () => {
+        effects++
+        return { data: {} }
+      }),
+      {
+        canUseTool: async (_tool, input, context) => {
+          child = context.abortController
+          return { behavior: 'allow', updatedInput: input }
+        },
+        beforeToolCall: async (_request, signal) => {
+          checkedSignal = signal
+          entered.release()
+          await release.promise
+        },
+      },
+    )
+    const context = f.session.getContext()
+    const executor = new StreamingToolExecutor(
+      context.options.tools,
+      async (_tool, input, toolContext) => {
+        child = toolContext.abortController
+        return { behavior: 'allow', updatedInput: input }
+      },
+      context,
+    )
+    const { blocks, assistant } = requestBlocks(['Fixture'])
+    executor.addTool(blocks[0]!, assistant)
+    const reading = collect(executor.getRemainingResults())
+    await entered.promise
+    expect(child).toBeDefined()
+    expect(child).not.toBe(context.abortController)
+    child!.abort('sibling_error')
+    expect(context.abortController.signal.aborted).toBe(false)
+    release.release()
+    const updates = await reading
+    await executor.drain()
+    expect(effects).toBe(0)
+    expect(checkedSignal).toBe(child!.signal)
+    expect(updates.some((update) => update.message?.type === 'user')).toBe(true)
+    await f.session.dispose()
+  })
   test('a late dispatch grant after disposal cannot reach validation, permission or effect', async () => {
     const entered = gate()
     const release = gate()

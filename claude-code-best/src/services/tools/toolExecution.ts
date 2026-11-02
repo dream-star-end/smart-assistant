@@ -613,7 +613,8 @@ function streamedCheckPermissionsAndCallTool(
   )
   const execution = toolUseContext.nativeToolLifecycle
     ? toolUseContext.nativeToolLifecycle.track(
-        { toolUseId: toolUseID, name: tool.name, input }, execute,
+        { toolUseId: toolUseID, name: tool.name, input },
+        toolUseContext.abortController.signal, execute,
       )
     : execute()
   execution
@@ -1308,7 +1309,7 @@ async function checkPermissionsAndCallTool(
       return lifecycle
         ? lifecycle.invoke({
             toolUseId: toolUseID, name: tool.name, input: callInput,
-          }, callTool)
+          }, toolUseContext.abortController.signal, callTool)
         : callTool()
     }
     // Fast-path: skip wrapper entirely when skill-learning is disabled to
