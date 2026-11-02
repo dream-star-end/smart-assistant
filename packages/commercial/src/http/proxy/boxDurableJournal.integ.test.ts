@@ -1884,6 +1884,44 @@ test("first Box failure survives cleanup/restart with exact, read-only fallback 
     assert.equal(await restarted.recordFirstFailure({ ...identity, requestId: "user-stopped",
       code: "BOX_SPOOL_POLL_ABORTED", phase: "proxy_stream" }), null);
     assert.equal((await query("SELECT ctx ? 'boxFirstFailure' AS present FROM request_finalize_journal WHERE request_id='user-stopped'")).rows[0].present, false);
+    // The real producer records this closed typed error before its system
+    // Stop. Missing proof remains pending; only a strict later proof closes it.
+    const unprovenBody: ProxyBody = { ...body, metadata: { user_id: JSON.stringify({
+      session_id: "unproven-terminal-session", oc_turn_key: "f".repeat(64) }) } };
+    const unprovenFp = deriveBoxCallFingerprint(3n, unprovenBody);
+    const unprovenIdentity = { ...identity, requestId: "unproven-terminal",
+      runNonce: "d".repeat(24), leaseEpoch: "e".repeat(32) };
+    await put(unprovenIdentity.requestId, { ...base, boxState: "unknown",
+      boxRunNonce: unprovenIdentity.runNonce, boxLeaseEpoch: unprovenIdentity.leaseEpoch,
+      boxSessionId: unprovenFp.sessionId, boxTurnKey: unprovenFp.turnKey,
+      boxReplayFingerprint: unprovenFp.replayFingerprint, boxRequestHash: unprovenFp.requestHash,
+      boxFallbackAlias: deriveBoxFallbackAlias(3n, unprovenBody) });
+    const unprovenInput = { ...lookup, canonicalBody: { ...unprovenBody, stream: false } };
+    const unprovenFirst = await restarted.recordFirstFailure({ ...unprovenIdentity,
+      code: "BOX_TOOL_TERMINAL_UNPROVEN", phase: "first_round" });
+    assert.equal(unprovenFirst?.code, "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.equal((await restarted.findReadOnlyFallback(unprovenInput))?.kind, "identity",
+      "an unproven running invocation remains pending even with recorded failure evidence");
+    await restarted.recordUserCancelIntent(unprovenIdentity);
+    assert.deepEqual(await restarted.recordFirstFailure({ ...unprovenIdentity,
+      code: "BOX_SPOOL_POLL_ABORTED", phase: "proxy_stream" }), unprovenFirst,
+    "later system Stop intent cannot erase the earlier producer error");
+    await restarted.markFirstRoundStoppedFailure({ ...unprovenIdentity, proof: { revision: 1,
+      runNonce: unprovenIdentity.runNonce, leaseEpoch: unprovenIdentity.leaseEpoch,
+      keeperPid: 101, cliPid: 102, reason: "keeper_stopped" } });
+    await query(`UPDATE request_finalize_journal SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb
+      WHERE request_id=$1`, [unprovenIdentity.requestId]);
+    const unprovenClosed = await restarted.findReadOnlyFallback(unprovenInput);
+    assert.equal(unprovenClosed?.kind, "failure");
+    if (unprovenClosed?.kind !== "failure") assert.fail("stopped unproven failure missing");
+    assert.equal(unprovenClosed.failure.code, "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.equal(await restarted.findReadOnlyFallback({ ...unprovenInput, uid: 4n }), null);
+    await query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxOwnerRequestId":"wrong-owner"}'::jsonb WHERE request_id=$1`, [unprovenIdentity.requestId]);
+    await assert.rejects(() => restarted.findReadOnlyFallback(unprovenInput), /BOX_REPLAY_EVIDENCE_INVALID/);
+    await query("UPDATE request_finalize_journal SET ctx=ctx-'boxOwnerRequestId' WHERE request_id=$1", [unprovenIdentity.requestId]);
+    assert.equal((await query("SELECT final_credits::text AS credits FROM request_finalize_journal WHERE request_id=$1",
+      [unprovenIdentity.requestId])).rows[0].credits, "0");
     await put("invalid-diagnostic");
     await assert.rejects(() => restarted.recordFirstFailure({ ...identity, requestId: "invalid-diagnostic",
       code: "BOX_CLI_UPSTREAM_REFUSED", phase: "first_round", diagnostic: { raw: "private text" } as never }),

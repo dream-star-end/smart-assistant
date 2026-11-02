@@ -7,6 +7,7 @@ export const BOX_FAILURE_CODES = [
   "BOX_TOOL_ECHO_ID_MISMATCH", "BOX_TOOL_ECHO_ERROR_MISMATCH",
   "BOX_SPOOL_POLL_ABORTED", "BOX_SPOOL_POLL_TIMEOUT", "BOX_EXEC_TIMEOUT",
   "BOX_SPOOL_WORKER_FAILED", "BOX_SPOOL_KEEPER_STOPPED", "BOX_SPOOL_TERMINAL_INCOMPLETE",
+  "BOX_TOOL_TERMINAL_UNPROVEN",
 ] as const;
 export type BoxFailureCode = typeof BOX_FAILURE_CODES[number];
 export type BoxFailurePhase = "first_round" | "continuation" | "proxy_stream" | "remote_terminal";

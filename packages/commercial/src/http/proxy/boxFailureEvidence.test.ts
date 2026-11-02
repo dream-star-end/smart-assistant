@@ -47,3 +47,11 @@ test("Box diagnostic summary emits type, length and hash without retaining conte
   assert.deepEqual(summarizeBoxFailureValue(cycle), { type: "tool_use" });
   assert.deepEqual(summarizeBoxFailureValue(undefined), { type: "missing" });
 });
+
+test("the existing unproven-terminal code is preserved without broadening the error allowlist", () => {
+  const code = "BOX_TOOL_TERMINAL_UNPROVEN";
+  assert.deepEqual(boxFailureFromError(Object.assign(new Error(code), { code }), "first_round"),
+    { code, phase: "first_round" });
+  assert.equal(boxFailureFromError(new Error(`${code}: private detail`), "first_round"), null);
+  assert.equal(boxFailureFromError({ code: "BOX_TOOL_OTHER_UNPROVEN" }, "first_round"), null);
+});

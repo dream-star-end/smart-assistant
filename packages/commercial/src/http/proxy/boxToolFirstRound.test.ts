@@ -1239,6 +1239,14 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and 
     }
     return run(request);
   };
+  const events: string[] = [];
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.equal(input.phase, "first_round");
+    events.push("first-failure"); return null;
+  };
   let stops = 0, stopStartedAt = 0;
   let release!: () => void;
   const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
@@ -1246,12 +1254,14 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and 
     await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
       terminalUnprovenStopWaitMs: 40,
       stopRejectedRun: async () => {
-        stops++; stopStartedAt = performance.now(); return hung;
+        events.push("stop"); stops++; stopStartedAt = performance.now(); return hung;
       } }),
     (error: unknown) => error instanceof BoxToolFirstRoundError
       && error.code === "BOX_TOOL_TERMINAL_UNPROVEN");
     assert.ok(f.sequence.includes("proof-missing"));
     assert.equal(stops, 1);
+    assert.deepEqual(events, ["first-failure", "stop"],
+      "save the original UNPROVEN failure before Stop can clean its spool");
     assert.ok(performance.now() - stopStartedAt < 2_000,
       "the hanging Stop cannot hold this unproven request indefinitely");
     assert.equal(f.sequence.includes("terminal-journal"), false);
