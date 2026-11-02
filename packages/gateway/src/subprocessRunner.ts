@@ -2135,6 +2135,7 @@ export class SubprocessRunner extends EventEmitter {
     let remoteStopFailure: unknown
     const remoteStop = this.opts.cc5BridgePort?.close().catch((error: unknown) => { remoteStopFailure = error })
     try {
+    await (async () => {
     // Always clean up the session directory, even if there is no live process
     // (failed starts, already-exited runners, crash paths).
     if (!this.proc) {
@@ -2214,10 +2215,11 @@ export class SubprocessRunner extends EventEmitter {
     // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。
     this._boundRepoBinding = null
     this.cleanupSessionDir()
+    })()
     } finally {
       await remoteStop
-      if (remoteStopFailure) throw new Error('CC5_REMOTE_STOP_UNPROVEN')
     }
+    if (remoteStopFailure) throw new Error('CC5_REMOTE_STOP_UNPROVEN')
   }
 
   /** Capture-by-value barrier for the current process generation. */

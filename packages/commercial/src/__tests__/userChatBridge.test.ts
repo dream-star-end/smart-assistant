@@ -4786,10 +4786,10 @@ describe('cc5 task route hard admission', () => {
           const container = await containerOpen;
           ws.send(JSON.stringify({ type: 'inbound.message', model: 'cc5-remote-t1555u',
             uid: 314159, userId: '314159', user_id: '314159',
-            peer: { id: 'cc5-hard-gate', kind: 'dm' }, clientMessageId: 'cc5-denied-' + flag }));
+            peer: { id: 'cc5-hard-gate', kind: 'dm' }, clientMessageId: `cc5-denied-${flag}` }));
           const error = await nextBusinessFrame(fc);
           assert.equal(error.code, 'UNAUTHORIZED_MODEL');
-          assert.equal(error.clientMessageId, 'cc5-denied-' + flag);
+          assert.equal(error.clientMessageId, `cc5-denied-${flag}`);
           assert.equal(ws.readyState, WebSocket.OPEN);
           assert.equal(rig.containerSeen.some(row => row.data.toString().includes('cc5-denied-')), false);
           const next = new Promise<string>(resolve => container.once('message', data => resolve(data.toString())));
