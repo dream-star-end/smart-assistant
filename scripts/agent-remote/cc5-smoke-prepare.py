@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 TASK = 'AGENT-REMOTE-T1555U'
 PLUGIN = ('.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.ts', 'hooks/frames.ts')
@@ -53,6 +54,7 @@ def owner(root):
     info = json.loads((root / 'OWNER.json').read_text())
     require(info['task'] == TASK and info['root'] == str(root) and info['uid'] == os.getuid(),
             'wrong-task-owner')
+    require(info['cwd'] in ('/home/box', str(root / 'work')), 'unsafe-task-cwd')
     return info
 
 
@@ -159,11 +161,85 @@ def launch(root):
                               info['session'], '/usr/bin/claude', '--permission-mode', 'default'], env)
 
 
+def workspace(root):
+    info = owner(root)
+    check_sources(root, info)
+    require(not (root / 'run').exists(), 'runtime-still-present')
+    work = root / 'work'
+    work.mkdir(mode=0o700)
+    info['cwd'] = str(work)
+    (root / 'OWNER.json').write_text(json.dumps(info, indent=2) + '\n')
+    print(json.dumps({'kind': 'empty-task-workspace-selected', 'cwd': str(work)}))
+
+
+def trust_prepare(root):
+    info = owner(root)
+    check_sources(root, info)
+    work = root / 'work'
+    require(info['cwd'] == str(work) and work.is_dir() and not work.is_symlink()
+            and work.stat().st_uid == os.getuid() and work.stat().st_mode & 0o777 == 0o700
+            and not any(work.iterdir()), 'requires-empty-task-workspace')
+    require(not (root / 'run').exists(), 'host-guard-must-not-be-running')
+    session = info['session'] + '-setup'
+    require(tmux(root, 'has-session', '-t', '=' + session).returncode != 0, 'setup-already-exists')
+    args = ['new-session', '-d', '-s', session, '-x', '200', '-y', '50', '-c', str(work), '--',
+            'env', '-i', 'HOME=/home/box',
+            'PATH=/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
+            'TERM=xterm-256color', 'DISABLE_AUTOUPDATER=1', '/usr/bin/claude',
+            '--permission-mode', 'default', '--plugin-dir', str(root / 'install/mod/oc-bridge')]
+    require(tmux(root, *args).returncode == 0, 'setup-launch-failed')
+    identity = None
+    matched = False
+    result = {'kind': 'native-trust-configuration-only', 'cwd': str(work), 'session': session,
+              'chatFrames': 0, 'trustEnterKeys': 0, 'globalConfigReadOrEditedByHelper': False}
+    try:
+        for _ in range(60):
+            meta = tmux(root, 'list-panes', '-t', '=' + session, '-F', '#{pane_id} #{pane_pid} #{pane_tty}')
+            require(meta.returncode == 0, 'setup-exited-before-trust')
+            pane_id, pid_text, tty = meta.stdout.strip().split()
+            pid = int(pid_text)
+            require(tty.startswith('/dev/pts/'), 'setup-must-have-pts')
+            current = (pane_id, pid, proc(pid)[1], tty)
+            if identity is None:
+                identity = current
+            require(current == identity, 'setup-identity-changed')
+            require(os.readlink('/proc/' + str(pid) + '/cwd') == str(work), 'setup-cwd-changed')
+            pane = tmux(root, 'capture-pane', '-p', '-t', pane_id).stdout
+            pane = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', pane)
+            selected = re.search(r'[❯>]\s*1[.)]\s*Yes, I trust this folder', pane)
+            forbidden = any(x in pane.lower() for x in ('usage credits', 'sign in', 'log in'))
+            require(not forbidden, 'account-menu-no-keys')
+            own_paths = (str(work), '~/' + str(work.relative_to('/home/box')))
+            if any(path in pane for path in own_paths) and selected:
+                # This is only the trust dialog for this empty task directory; never a prompt.
+                require((pane_id, pid, proc(pid)[1], tty) == identity, 'setup-identity-changed')
+                require(tmux(root, 'send-keys', '-t', pane_id, 'Enter').returncode == 0,
+                        'trust-key-failed')
+                result.update({'trustEnterKeys': 1, 'taskPid': pid, 'taskTty': tty,
+                               'matchedOwnPathAndSelectedTrustChoice': True})
+                matched = True
+                time.sleep(2)
+                break
+            time.sleep(0.2)
+        require(matched, 'trust-dialog-not-matched-no-keys')
+    finally:
+        if tmux(root, 'has-session', '-t', '=' + session).returncode == 0:
+            require(identity is not None, 'setup-identity-unavailable-no-kill')
+            meta = tmux(root, 'list-panes', '-t', '=' + session, '-F', '#{pane_id} #{pane_pid} #{pane_tty}')
+            pane_id, pid_text, tty = meta.stdout.strip().split()
+            require((pane_id, int(pid_text), proc(int(pid_text))[1], tty) == identity,
+                    'setup-identity-changed-no-kill')
+            require(tmux(root, 'kill-session', '-t', '=' + session).returncode == 0,
+                    'setup-stop-failed')
+        result['setupSessionAbsent'] = tmux(root, 'has-session', '-t', '=' + session).returncode != 0
+    print(json.dumps(result))
+
+
 def inspect(root):
     info = owner(root)
     check_sources(root, info)
     result = {'kind': 'ready-only-preparation-not-real-chat', 'root': str(root), 'session': info['session'],
-              'runtimeExists': (root / 'run').exists(),
+              'runtimeExists': (root / 'run').exists(), 'cwd': info['cwd'],
               'note': 'stdin byte count must be recorded by the controller; not inferred here'}
     if (root / 'run/host.pid').exists():
         pid, start = host_identity(root, info)
@@ -220,9 +296,10 @@ if __name__ == '__main__':
         elif role == 'install':
             install()
         else:
-            require(role in ('launch', 'inspect', 'stop', 'cleanup'), 'unknown-role')
+            require(role in ('launch', 'workspace', 'trust-prepare', 'inspect', 'stop', 'cleanup'), 'unknown-role')
             root = task_root(sys.argv[2])
-            {'launch': launch, 'inspect': inspect, 'stop': stop, 'cleanup': cleanup}[role](root)
+            {'launch': launch, 'workspace': workspace, 'trust-prepare': trust_prepare,
+             'inspect': inspect, 'stop': stop, 'cleanup': cleanup}[role](root)
     except Exception as error:
         # No raw exception/argv/response could leak pane or credentials.
         label = str(error) if isinstance(error, RuntimeError) else type(error).__name__

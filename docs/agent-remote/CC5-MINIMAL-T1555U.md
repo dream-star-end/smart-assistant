@@ -109,3 +109,16 @@ not prove the CLI made zero startup/background model requests.
 The prompt.submit evidence question is still pending. Do not send the real user
 frame until the steward conveys that answer. The expired incident waiver stays
 unchanged; the steward will decide before P3 merge.
+
+READY-only on the existing home cwd returned the original host's fixed
+NOT_READY dialog=trust. No user frame was written and the host cleaned its
+runtime; cc5-login retained its original PID/tty. Prepare trust only for an
+empty task-owned work directory in a separate native TUI with the unchanged
+plugin inactive (no OC_BRIDGE_DIR). Require private socket/session, stable
+pane/PID/startticks/pts and actual process cwd, exact displayed task path, and
+selected Yes-trust choice; only then send one Enter. Account/credits or unknown
+menus get no keys. Stop that setup TUI, then retry the unchanged original host
+in the task work directory. The CLI itself persists this scoped trust setting;
+the helper never reads/edits global auth/config to remove that metadata. This is
+configuration preparation under 09:12, not a real chat or a change to the host's
+runtime dialog guard. The real round remains pending the second decision.
