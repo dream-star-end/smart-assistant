@@ -66,6 +66,7 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
+import { createMasterCc5Runtime } from "./agent-sandbox/cc5Runtime.js";
 import {
   cursorExternalApiOutboxDirForFlavor,
   openCursorExternalApiOutbox,
@@ -3729,7 +3730,13 @@ export async function registerCommercial(
       runtimeTuple = t;
     }
 
+    const cc5 = createMasterCc5Runtime({
+      selfhost: getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
+      authorityReady: modelAuthoritySigner !== null && modelAuthoritySigner !== undefined && modelAuthorityProvisionRequired,
+      env: process.env,
+    });
     v3Deps = {
+      ...(cc5 ? { cc5 } : {}),
       docker: v3Docker,
       pool: getPool(),
       image: cfg.OC_RUNTIME_IMAGE,
