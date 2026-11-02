@@ -17,6 +17,19 @@ let dynamicWatchPaths: string[] = []
 let dynamicWatchPathsSorted: string[] = []
 let initialized = false
 let hasEnvHooks = false
+let unregisterCleanup: (() => void) | undefined
+let cleanupGeneration = 0
+const pendingCloses = new Set<Promise<void>>()
+const closeFailures: unknown[] = []
+function closeWatcher(value: FSWatcher): void {
+  const closing = Promise.resolve().then(() => value.close())
+  pendingCloses.add(closing)
+  void closing.then(() => pendingCloses.delete(closing), error => {
+    pendingCloses.delete(closing)
+    closeFailures.push(error)
+    logForDebugging('FileChanged watcher close failed: ' + errorMessage(error), { level: 'error' })
+  })
+}
 let notifyCallback: ((text: string, isError: boolean) => void) | null = null
 
 export function setEnvHookNotifier(
@@ -29,6 +42,7 @@ export function initializeFileChangedWatcher(cwd: string): void {
   if (initialized) return
   initialized = true
   currentCwd = cwd
+  const generation = ++cleanupGeneration
 
   const config = getHooksConfigFromSnapshot()
   hasEnvHooks =
@@ -36,7 +50,9 @@ export function initializeFileChangedWatcher(cwd: string): void {
     (config?.FileChanged?.length ?? 0) > 0
 
   if (hasEnvHooks) {
-    registerCleanup(async () => dispose())
+    unregisterCleanup = registerCleanup(async () => {
+      if (generation === cleanupGeneration) await disposeFileChangedWatcher()
+    })
   }
 
   const paths = resolveWatchPaths(config)
@@ -81,6 +97,7 @@ function handleFileEvent(
   path: string,
   event: 'change' | 'add' | 'unlink',
 ): void {
+  if (!initialized) return
   logForDebugging(`FileChanged: ${event} ${path}`)
   void executeFileChangedHooks(path, event)
     .then(({ results, watchPaths, systemMessages }) => {
@@ -121,7 +138,7 @@ export function updateWatchPaths(paths: string[]): void {
 
 function restartWatching(): void {
   if (watcher) {
-    void watcher.close()
+    closeWatcher(watcher)
     watcher = null
   }
   const paths = resolveWatchPaths()
@@ -174,9 +191,12 @@ export async function onCwdChangedForHooks(
   }
 }
 
-function dispose(): void {
+function detachWatcher(): void {
+  ++cleanupGeneration
+  unregisterCleanup?.()
+  unregisterCleanup = undefined
   if (watcher) {
-    void watcher.close()
+    closeWatcher(watcher)
     watcher = null
   }
   dynamicWatchPaths = []
@@ -186,6 +206,15 @@ function dispose(): void {
   notifyCallback = null
 }
 
+/** Waits watcher handles, including older restart closes. This is not a
+ * completion proof for hook subprocesses; the runtime must drain those too. */
+export async function disposeFileChangedWatcher(): Promise<void> {
+  detachWatcher()
+  while (pendingCloses.size) await Promise.allSettled([...pendingCloses])
+  if (closeFailures.length) throw new AggregateError(closeFailures, 'file-watcher-close-failed')
+}
 export function resetFileChangedWatcherForTesting(): void {
-  dispose()
+  void disposeFileChangedWatcher().catch(error => {
+    logForDebugging('FileChanged reset close failed: ' + errorMessage(error), { level: 'error' })
+  })
 }
