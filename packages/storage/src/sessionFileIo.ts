@@ -40,6 +40,44 @@ interface Lease {
   pending: Promise<void> | null
   failure?: unknown
 }
+/** An opaque, process-local capability. It is valid only inside its actual
+ * withSessionFile mutation; a JSON claim or user-provided assert is insufficient. */
+export interface SessionFileLeaseCapability { readonly sessionFileLease: unique symbol }
+export interface SessionFileLeaseIdentity {
+  readonly projectsDir: string
+  readonly sessionId: string
+  readonly filePath: string
+  readonly stagingDirectory: string
+}
+const leaseCapabilities = new WeakMap<object, { lease: Lease; key: string; identity: SessionFileLeaseIdentity }>()
+export function assertSessionFileLease(capability: SessionFileLeaseCapability): SessionFileLeaseIdentity {
+  const value = capability && typeof capability === 'object' ? leaseCapabilities.get(capability) : undefined
+  check(value?.lease.active && owned.getStore()?.get(value.key) === value.lease, 'CCB_TRANSCRIPT_LEASE_INVALID')
+  if (value!.lease.failure) throw value!.lease.failure
+  return value!.identity
+}
+/** Checks a trusted cwd alias against the inode already locked by this lease. */
+export async function assertSessionFileAlias(capability: SessionFileLeaseCapability, path: string): Promise<void> {
+  const identity = assertSessionFileLease(capability)
+  const rel = relative(identity.projectsDir, path)
+  check(path === resolve(path) && rel && !rel.startsWith('..') && !isAbsolute(rel), 'CCB_TRANSCRIPT_PATH_INVALID')
+  let parent = identity.projectsDir
+  for (const part of rel.split('/').slice(0, -1)) {
+    parent = join(parent, part)
+    const stat = await lstat(parent)
+    check(stat.isDirectory() && !stat.isSymbolicLink(), 'CCB_TRANSCRIPT_PATH_INVALID')
+  }
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const stat = await file.stat()
+    const named = await lstat(path)
+    assertSessionFileLease(capability)
+    const lease = leaseCapabilities.get(capability)!.lease
+    check(stat.isFile() && stat.dev === lease.dev && stat.ino === lease.ino && stat.nlink > 0 && !named.isSymbolicLink() && named.dev === stat.dev && named.ino === stat.ino, 'CCB_TRANSCRIPT_ALIAS_DIVERGED')
+  } finally { await file.close() }
+}
+export type SessionFileDependency = (capability: SessionFileLeaseCapability) => Promise<void>
+export type SessionFilePatch = (offset: number, target: Buffer, beforePatch?: SessionFileDependency) => Promise<void>
 interface Intent {
   schema: 1
   dev: number
@@ -217,7 +255,8 @@ function useLeaseMutation(lease: Lease, apply: () => Promise<void>): Promise<voi
     void rejected.catch(() => {})
     return rejected
   }
-  const pending = apply()
+  // Register ownership before invoking a dependency that can synchronously reenter.
+  const pending = Promise.resolve().then(apply)
   lease.pending = pending
   const clear = () => { if (lease.pending === pending) lease.pending = null }
   void pending.then(clear, error => { lease.failure ??= error; clear() })
@@ -244,6 +283,7 @@ async function checkedPath(filePath: string, scope: SessionFileScope): Promise<{
   await mkdir(requestedRoot, { recursive: true, mode: 0o700 })
   const root = await realpath(requestedRoot)
   const parts = rel.split(/[\\/]/)
+  check(!parts.includes('.oc-transcript-integrity'), 'CCB_TRANSCRIPT_PATH_INVALID')
   let parent = root
   for (const part of parts.slice(0, -1)) {
     check(part && part !== '.' && part !== '..', 'CCB_TRANSCRIPT_PATH_INVALID')
@@ -256,71 +296,162 @@ async function checkedPath(filePath: string, scope: SessionFileScope): Promise<{
   check(/^[A-Za-z0-9_.-]{1,160}$/.test(artifact), 'CCB_TRANSCRIPT_SCOPE_INVALID')
   return { path: join(parent, parts[parts.length - 1]!), root, key: sha(`${root}\n${scope.sessionId}\n${artifact}`) }
 }
-export async function withSessionFile<T>(filePath: string, scope: SessionFileScope, create: boolean, use: (file: SessionReadHandle, patch: (offset: number, target: Buffer) => Promise<void>, receipt: (value: SessionFileRestoreReceipt) => Promise<void>) => Promise<T>): Promise<T> {
-  // Register admission synchronously: awaiting path IO before queuing can
-  // let a later metadata/boundary operation overtake an earlier append.
+export interface SessionFileReadRequest {
+  readonly filePath: string
+  readonly scope: SessionFileScope
+}
+export interface SessionFileGroupReadEntry {
+  readonly filePath: string
+  readonly file: SessionReadHandle
+}
+interface SessionFileRequest extends SessionFileReadRequest { readonly create: boolean; readonly queueKey: string; readonly durableRead: boolean }
+interface OpenedSessionFile {
+  request: SessionFileRequest
+  path: Awaited<ReturnType<typeof checkedPath>>
+  lock: FileHandle
+  metadataInode: string
+  file?: FileHandle
+  dataInode?: string
+  lease?: Lease
+}
+const physicalOrder = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0
+function sessionQueueKey(filePath: string, scope: SessionFileScope): string {
   const rootHint = resolve(scope.projectsDir)
   const relativeHint = relative(rootHint, resolve(filePath))
   const artifactHint = scope.artifactId ?? (relativeHint.split(/[\\/]/).includes('subagents') ? basename(filePath) : 'main')
-  const queueKey = sha(`${rootHint}\n${scope.sessionId}\n${artifactHint}`)
-  check(![...(owned.getStore()?.values() ?? [])].some(lease => lease.active), 'CCB_TRANSCRIPT_NESTED_IO')
-  const previous = queues.get(queueKey) ?? Promise.resolve()
-  const next = previous.catch(() => {}).then(async () => {
-    const p = await checkedPath(filePath, scope)
-    const root = join(p.root, '.oc-transcript-integrity')
-    await privateDirectory(root)
-    const dir = join(root, p.key)
-    await privateDirectory(dir)
-    const lock = await open(join(dir, 'lock'), constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
-    let file: FileHandle | undefined
-    let lease: Lease | undefined
-    try {
-      const ls = await lock.stat()
-      check(ls.isFile() && ls.nlink === 1 && ls.uid === process.getuid?.() && (ls.mode & 0o777) === 0o600, 'CCB_TRANSCRIPT_PRIVATE_FILE')
-      await lockFd(lock, scope.requireKernelLock ?? false)
-      if (create) {
+  return sha(`${rootHint}\n${scope.sessionId}\n${artifactHint}`)
+}
+async function closeSessionFiles(entries: readonly OpenedSessionFile[]): Promise<void> {
+  const failures: unknown[] = []
+  for (const entry of entries) if (entry.lease) entry.lease.active = false
+  for (const entry of entries) if (entry.lease?.pending) await entry.lease.pending.catch(() => {})
+  // Release all data locks before metadata locks. A failed close must not leak
+  // the rest of the group; no further acquisition occurs during cleanup.
+  for (const entry of [...entries].reverse()) {
+    try { if (entry.file) await entry.file.close() } catch (error) { failures.push(error) }
+  }
+  for (const entry of [...entries].reverse()) {
+    try { await entry.lock.close() } catch (error) { failures.push(error) }
+  }
+  if (failures.length) throw failures[0]
+}
+async function acquireSessionFiles(requests: readonly SessionFileRequest[]): Promise<OpenedSessionFile[]> {
+  const entries: OpenedSessionFile[] = []
+  try {
+    // Every caller, including a single-file mutation, uses the same global
+    // metadata -> data lock hierarchy. Physical identities include bind aliases.
+    for (const request of requests) {
+      const path = await checkedPath(request.filePath, request.scope)
+      const root = join(path.root, '.oc-transcript-integrity')
+      await privateDirectory(root)
+      const dir = join(root, path.key)
+      await privateDirectory(dir)
+      const lock = await open(join(dir, 'lock'), constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
+      // Track the FD before any validation/stat can throw.
+      const entry: OpenedSessionFile = { request, path, lock, metadataInode: '' }
+      entries.push(entry)
+      const stat = await lock.stat({ bigint: true })
+      check(stat.isFile() && stat.nlink === 1n && stat.uid === BigInt(process.getuid?.() ?? -1) && (stat.mode & 0o777n) === 0o600n, 'CCB_TRANSCRIPT_PRIVATE_FILE')
+      entry.metadataInode = `${stat.dev}:${stat.ino}`
+    }
+    const metadata = [...entries].sort((a, b) => physicalOrder(a.metadataInode, b.metadataInode))
+    const metadataIds = new Set(metadata.map(entry => entry.metadataInode))
+    check(metadataIds.size === entries.length, 'CCB_TRANSCRIPT_DUPLICATE_INODE')
+    for (const entry of metadata) await lockFd(entry.lock, entry.request.scope.requireKernelLock ?? false)
+    // Open and identify the entire data set before locking any data inode.
+    // A duplicate detected after flock would deadlock on its own independent FD.
+    const dataIds = new Set<string>()
+    for (const entry of entries) {
+      const { path, request } = entry
+      const dir = join(path.root, '.oc-transcript-integrity', path.key)
+      if (request.create) {
         let exists = true
-        try { await lstat(p.path) } catch (error) { if (!isMissing(error)) throw error; exists = false }
+        try { await lstat(path.path) } catch (error) { if (!isMissing(error)) throw error; exists = false }
         if (!exists) {
           try { await privateRead(join(dir, 'artifact.json')); fail('CCB_TRANSCRIPT_ALIAS_DIVERGED') }
           catch (error) { if (!isMissing(error)) throw error }
         }
         try {
-          file = await open(p.path, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL, 0o600)
-          await file.sync(); await syncDirectory(dirname(p.path))
-        } catch (e) {
-          if (!(e && typeof e === 'object' && 'code' in e && e.code === 'EEXIST')) throw e
-          file = await open(p.path, constants.O_RDWR | constants.O_NOFOLLOW)
+          entry.file = await open(path.path, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL, 0o600)
+          await entry.file.sync(); await syncDirectory(dirname(path.path))
+        } catch (error) {
+          if (!(error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST')) throw error
+          entry.file = await open(path.path, constants.O_RDWR | constants.O_NOFOLLOW)
         }
-      } else file = await open(p.path, constants.O_RDWR | constants.O_NOFOLLOW)
-      const s = await file.stat()
-      check(s.isFile() && s.nlink > 0 && s.uid === process.getuid?.(), 'CCB_TRANSCRIPT_PATH_INVALID')
-      // Also fence the actual inode: hard-link aliases remain serialized.
-      await lockFd(file, scope.requireKernelLock ?? false)
-      const alias = await lstat(p.path)
-      check(!alias.isSymbolicLink() && alias.dev === s.dev && alias.ino === s.ino, 'CCB_TRANSCRIPT_ALIAS_DIVERGED')
-      lease = { file, dir, dev: s.dev, ino: s.ino, active: false, pending: null }
-      await bindArtifactIdentity(lease)
-      await completeIntent(lease)
-      lease.active = true
-      const activeLease = lease
-      const context = new Map<string, Lease>([[queueKey, activeLease]])
-      const result = await owned.run(context, () => use(file!,
-        (offset, target) => useLeaseMutation(activeLease, () => patchTail(activeLease, offset, target)),
-        value => useLeaseMutation(activeLease, () => saveRestoreReceipt(activeLease, value))))
-      if (activeLease.pending) await activeLease.pending
-      if (activeLease.failure) throw activeLease.failure
-      return result
-    } finally {
-      if (lease) {
-        lease.active = false
-        if (lease.pending) await lease.pending.catch(() => {})
-      }
-      try { if (file) await file.close() } finally { await lock.close() }
+      } else entry.file = await open(path.path, constants.O_RDWR | constants.O_NOFOLLOW)
+      const stat = await entry.file.stat({ bigint: true })
+      check(stat.isFile() && stat.nlink > 0n && stat.uid === BigInt(process.getuid?.() ?? -1), 'CCB_TRANSCRIPT_PATH_INVALID')
+      entry.dataInode = `${stat.dev}:${stat.ino}`
+      check(!dataIds.has(entry.dataInode) && !metadataIds.has(entry.dataInode), 'CCB_TRANSCRIPT_DUPLICATE_INODE')
+      dataIds.add(entry.dataInode)
     }
+    const data = [...entries].sort((a, b) => physicalOrder(a.dataInode!, b.dataInode!))
+    for (const entry of data) await lockFd(entry.file!, entry.request.scope.requireKernelLock ?? false)
+    for (const entry of entries) {
+      const stat = await entry.file!.stat()
+      const alias = await lstat(entry.path.path)
+      check(!alias.isSymbolicLink() && alias.dev === stat.dev && alias.ino === stat.ino && stat.nlink > 0, 'CCB_TRANSCRIPT_ALIAS_DIVERGED')
+      entry.lease = { file: entry.file!, dir: join(entry.path.root, '.oc-transcript-integrity', entry.path.key), dev: stat.dev, ino: stat.ino, active: false, pending: null }
+      await bindArtifactIdentity(entry.lease)
+      await completeIntent(entry.lease)
+      // The group readback may be used as a durable Writer commit boundary.
+      if (entry.request.durableRead) await entry.file!.sync()
+    }
+    for (const entry of entries) entry.lease!.active = true
+    return entries
+  } catch (error) {
+    await closeSessionFiles(entries).catch(() => {})
+    throw error
+  }
+}
+async function runSessionFiles<T>(input: readonly (SessionFileReadRequest & { create: boolean; durableRead?: boolean })[], use: (entries: readonly OpenedSessionFile[]) => Promise<T>): Promise<T> {
+  check(input.length > 0 && input.length <= 10001, 'CCB_TRANSCRIPT_GROUP_INVALID')
+  check(![...(owned.getStore()?.values() ?? [])].some(lease => lease.active), 'CCB_TRANSCRIPT_NESTED_IO')
+  const requests = input.map(request => {
+    const scope = Object.freeze({ ...request.scope })
+    return Object.freeze({ filePath: request.filePath, scope, create: request.create, queueKey: sessionQueueKey(request.filePath, scope), durableRead: request.durableRead ?? false })
   })
-  queues.set(queueKey, next)
-  try { return await next } finally { if (queues.get(queueKey) === next) queues.delete(queueKey) }
+  check(requests.every(request => request.scope.sessionId === requests[0]!.scope.sessionId && resolve(request.scope.projectsDir) === resolve(requests[0]!.scope.projectsDir)), 'CCB_TRANSCRIPT_GROUP_SCOPE_INVALID')
+  const keys = requests.map(request => request.queueKey)
+  check(new Set(keys).size === keys.length, 'CCB_TRANSCRIPT_GROUP_DUPLICATE_TARGET')
+  // Atomic queue reservation: gather ALL predecessors before replacing ANY
+  // queue entry, without awaiting path IO or acquiring a partial lock set.
+  const previous = keys.map(key => queues.get(key) ?? Promise.resolve())
+  const next = Promise.allSettled(previous).then(async () => {
+    const entries = await acquireSessionFiles(requests)
+    const context = new Map(entries.map(entry => [entry.request.queueKey, entry.lease!]))
+    let outcome: { result: T } | { error: unknown }
+    try {
+      const result = await owned.run(context, () => use(entries))
+      for (const entry of entries) {
+        if (entry.lease!.pending) await entry.lease!.pending
+        if (entry.lease!.failure) throw entry.lease!.failure
+      }
+      outcome = { result }
+    } catch (error) { outcome = { error } }
+    try { await closeSessionFiles(entries) } catch (error) { if (!('error' in outcome)) outcome = { error } }
+    if ('error' in outcome) throw outcome.error
+    return outcome.result
+  })
+  for (const key of keys) queues.set(key, next)
+  try { return await next } finally { for (const key of keys) if (queues.get(key) === next) queues.delete(key) }
+}
+export async function withSessionFile<T>(filePath: string, scope: SessionFileScope, create: boolean, use: (file: SessionReadHandle, patch: SessionFilePatch, receipt: (value: SessionFileRestoreReceipt) => Promise<void>) => Promise<T>): Promise<T> {
+  return runSessionFiles([{ filePath, scope, create }], async entries => {
+    const entry = entries[0]!
+    const lease = entry.lease!
+    const capability = Object.freeze({}) as SessionFileLeaseCapability
+    leaseCapabilities.set(capability, { lease, key: entry.request.queueKey, identity: Object.freeze({ projectsDir: entry.path.root, sessionId: entry.request.scope.sessionId, filePath: entry.path.path, stagingDirectory: join(lease.dir, 'artifact-staging') }) })
+    return use(entry.file!, (offset, target, beforePatch) => useLeaseMutation(lease, async () => {
+      if (beforePatch) { await beforePatch(capability); assertSessionFileLease(capability) }
+      await patchTail(lease, offset, target)
+    }), value => useLeaseMutation(lease, () => saveRestoreReceipt(lease, value)))
+  })
+}
+/** Holds every existing target through the awaited commit callback. This is a
+ * read-only capability: it exposes neither FD, patch nor a public lease handle. */
+export async function withSessionFileGroupRead<T>(requests: readonly SessionFileReadRequest[], use: (files: readonly SessionFileGroupReadEntry[]) => Promise<T>): Promise<T> {
+  return runSessionFiles(requests.map(request => ({ ...request, create: false, durableRead: true })), async entries => use(Object.freeze(entries.map(entry => Object.freeze({ filePath: entry.request.filePath, file: Object.freeze({ stat: entry.file!.stat.bind(entry.file!), read: entry.file!.read.bind(entry.file!) }) })))))
 }
 async function patchTail(lease: Lease, offset: number, target: Buffer): Promise<void> {
   check(lease.active, 'CCB_TRANSCRIPT_LEASE_ENDED')
@@ -344,6 +475,7 @@ export async function readSessionFile(filePath: string, scope: SessionFileScope)
   return withSessionFile(filePath, scope, false, async file => readRange(file, 0, (await file.stat()).size))
 }
 export async function flushSessionFileIo(): Promise<void> {
+  check(![...(owned.getStore()?.values() ?? [])].some(lease => lease.active), 'CCB_TRANSCRIPT_NESTED_FLUSH')
   let failure: unknown
   while (queues.size) {
     const settled = await Promise.allSettled([...queues.values()])

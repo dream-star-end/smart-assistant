@@ -1,3 +1,4 @@
+export * from './gatewayRuntimeServices.js'
 export * from './server.js'
 export * from './webRootOverlay.js'
 export * from './sessionManager.js'
@@ -88,6 +89,7 @@ export {
   MODEL_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH,
   ModelCatalogClient,
+  type ModelCatalogTransport,
   ModelCatalogUnavailableError,
   TURN_LEASE_HEADER,
   _setModelCatalogClientForTests,

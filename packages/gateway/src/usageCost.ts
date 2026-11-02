@@ -8,16 +8,18 @@
  * computeCostFen,再按 0223 汇率换成 USD 填回去。CCB 已有 vendor USD 时不覆盖。
  */
 
-import { composeMultiplier, computeCostFen, fenToUsd, type TurnWaiveReason } from '@openclaude/protocol'
 import {
-  resolveBackfillPolicy,
-  type TerminalBillingStatus,
-} from './costBackfillPolicy.js'
+  type TurnWaiveReason,
+  composeMultiplier,
+  computeCostFen,
+  fenToUsd,
+} from '@openclaude/protocol'
+import { type TerminalBillingStatus, resolveBackfillPolicy } from './costBackfillPolicy.js'
 import {
-  getModelCatalogClient,
-  lookupCatalogAgentMultiplier,
   type LocalCatalogPricing,
   type LocalCatalogView,
+  getModelCatalogClient,
+  lookupCatalogAgentMultiplier,
 } from './modelCatalogClient.js'
 
 export interface UsageCostTokens {
@@ -57,10 +59,7 @@ export function _setCatalogViewForTests(view: LocalCatalogView | null): void {
   testCatalogView = view
 }
 
-export function estimatePlatformCostUsd(
-  usage: UsageCostTokens,
-  pricing: PlatformPricing,
-): number {
+export function estimatePlatformCostUsd(usage: UsageCostTokens, pricing: PlatformPricing): number {
   const fen = computeCostFen(
     {
       input_tokens: usage.inputTokens,
@@ -89,10 +88,13 @@ function catalogPricingToPlatform(p: LocalCatalogPricing): PlatformPricing {
   }
 }
 
-export async function lookupPlatformPricing(modelId: string): Promise<PlatformPricing | null> {
+export async function lookupPlatformPricing(
+  modelId: string,
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort,
+): Promise<PlatformPricing | null> {
   if (testLookup) return testLookup(modelId)
   if (!modelId) return null
-  const client = getModelCatalogClient()
+  const client = catalog ?? getModelCatalogClient()
   if (!client.configured) return null
   try {
     const view = await client.getView()
@@ -122,6 +124,7 @@ function markImprecise(usage: UsageCostTokens, reason: string): void {
  * 不复合的引擎(cursor / zcode)不查倍率,只用 model 基础价。
  */
 export async function applyPlatformCostIfMissing(args: {
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort
   model?: string
   usage: UsageCostTokens
   sessionCostUsd: number
@@ -149,14 +152,14 @@ export async function applyPlatformCostIfMissing(args: {
     markImprecise(args.usage, 'model_unavailable')
     return null
   }
-  const pricing = await lookupPlatformPricing(model)
+  const pricing = await lookupPlatformPricing(model, args.catalog)
   if (!pricing) {
     markImprecise(args.usage, 'pricing_unavailable')
     return null
   }
   let multiplier = pricing.multiplier
   if (policy.composeAgentMultiplier) {
-    const agentMul = await resolveAgentMultiplier(args.agentMultiplier, args.agentId)
+    const agentMul = await resolveAgentMultiplier(args.agentMultiplier, args.agentId, args.catalog)
     if (!agentMul) {
       markImprecise(args.usage, 'agent_multiplier_unavailable')
       return null
@@ -184,13 +187,14 @@ export async function applyPlatformCostIfMissing(args: {
 async function resolveAgentMultiplier(
   explicit: string | null | undefined,
   agentId: string | undefined,
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort,
 ): Promise<string | null> {
   const trimmed = explicit?.trim()
   if (trimmed) return trimmed
   const id = agentId?.trim()
   if (!id) return null
   if (testCatalogView) return lookupCatalogAgentMultiplier(testCatalogView, id)
-  const client = getModelCatalogClient()
+  const client = catalog ?? getModelCatalogClient()
   if (!client.configured) return null
   try {
     return await client.lookupAgentCostMultiplier(id)
@@ -222,7 +226,10 @@ export interface ResolvedDelegateCost {
 }
 
 /** delegate 返回给 taskboard 的 costUsd:优先用 session 已累计,否则按平台价补。 */
-export async function resolveDelegateCostUsd(session: DelegateCostSource): Promise<ResolvedDelegateCost> {
+export async function resolveDelegateCostUsd(
+  session: DelegateCostSource,
+  options?: { catalog: import('./gatewayRuntimeServices.js').CatalogRuntimePort },
+): Promise<ResolvedDelegateCost> {
   if (session.totalCostUSD > 0) {
     return { costUsd: session.totalCostUSD, costImprecise: session.costImprecise === true }
   }
@@ -234,6 +241,7 @@ export async function resolveDelegateCostUsd(session: DelegateCostSource): Promi
     cacheCreationTokens: session.totalCacheCreationTokens,
   }
   const filled = await applyPlatformCostIfMissing({
+    catalog: options?.catalog,
     model: session.model,
     usage,
     sessionCostUsd: session.totalCostUSD,

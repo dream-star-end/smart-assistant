@@ -336,7 +336,7 @@ export async function _freezeAdvisorTurn(
   try {
     const collabDoc = this.advisorConfigStore().read()
     const proven = [...openAdvisorEngines(), ...(collabDoc.provenEngines ?? [])]
-    const view = await getLocalCatalogView()
+    const view = await (this.sessions.runtime?.catalog.getRoutingView() ?? getLocalCatalogView())
     const listed = listProvenAdvisorModels({
       catalog: view.models,
       provenEngines: proven,
@@ -836,7 +836,7 @@ export async function _resolveAdvisorConsultExecution(
     }
   }
   try {
-    const view = await getLocalCatalogView()
+    const view = await (this.sessions.runtime?.catalog.getRoutingView() ?? getLocalCatalogView())
     const row = view.resolve(view.canonicalize(advisorModel))
     if (!row || row.available === false) {
       return { ok: false, status: 400, error: '顾问型号不在当前 catalog' }
@@ -971,6 +971,7 @@ export async function _spawnCcbAdvisorConsult(
       toolsets: [],
     }
     const execution = await resolveLocalExecutionIfEnforced({
+      catalog: this.sessions.runtime?.catalog,
       agent,
       kind: 'turn',
       model: input.execution.modelId,
@@ -1284,6 +1285,7 @@ export async function _spawnAdvisorConsult(
       toolsets: [],
     }
     const execution = await resolveLocalExecutionIfEnforced({
+      catalog: this.sessions.runtime?.catalog,
       agent,
       kind: 'turn',
       model: input.snapshot.advisorModel,

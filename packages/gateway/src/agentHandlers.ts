@@ -709,6 +709,7 @@ export async function _runAutoDreamOptimizerModel(
     toolsets: [],
   }
   const execution = await resolveLocalExecutionIfEnforced({
+    catalog: this.sessions.runtime?.catalog,
     agent,
     kind: 'auto_dream',
     model: input.model,
@@ -1081,6 +1082,7 @@ export async function _runAutoDreamModel(
     toolsets: [],
   }
   const execution = await resolveLocalExecutionIfEnforced({
+    catalog: this.sessions.runtime?.catalog,
     agent,
     kind: 'turn',
     model: input.model,

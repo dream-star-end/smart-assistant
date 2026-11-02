@@ -2,11 +2,11 @@ import type { Command } from '../../commands.js'
 import { hasAnthropicApiKeyAuth } from '../../utils/auth.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 
-export default () =>
+export default (hasApiKeyAuth?: boolean) =>
   ({
     type: 'local-jsx',
     name: 'login',
-    description: hasAnthropicApiKeyAuth()
+    description: (hasApiKeyAuth ?? hasAnthropicApiKeyAuth())
       ? 'Switch Anthropic accounts'
       : 'Sign in with your Anthropic account',
     isEnabled: () => !isEnvTruthy(process.env.DISABLE_LOGIN_COMMAND),

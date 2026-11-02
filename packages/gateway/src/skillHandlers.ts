@@ -690,6 +690,7 @@ export async function _skillEvalTurn(
   // 模型权威 §3:skill-eval 是**真实计费的本地 turn**(无 envelope)→ kind='turn'
   // (codex 意图不降级、直接结构化拒:换个模型跑分等于换了被测对象)。
   const evalExec = await resolveLocalExecutionIfEnforced({
+    catalog: this.sessions.runtime?.catalog,
     agent,
     kind: 'turn',
     model,
@@ -1064,6 +1065,7 @@ export async function _handleSkillTrainStart(
   let trainExec: LocalExecutionDecision | undefined
   try {
     trainExec = await resolveLocalExecutionIfEnforced({
+      catalog: this.sessions.runtime?.catalog,
       agent,
       kind: 'turn',
       model: SKILL_TRAIN_DEFAULT_MODEL,
@@ -1231,6 +1233,7 @@ export async function _handleSkillTrainComment(
   let reviseExec: LocalExecutionDecision | undefined
   try {
     reviseExec = await resolveLocalExecutionIfEnforced({
+      catalog: this.sessions.runtime?.catalog,
       agent,
       kind: 'turn',
       model: SKILL_TRAIN_DEFAULT_MODEL,

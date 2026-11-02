@@ -529,6 +529,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       pendingHookRecords: new Map(),
     }
     ctx.creditGuard = new CreditBudgetGuard({
+      catalog: this.opts.runtime?.catalog,
       budgetFen: params.creditBudgetFen,
       modelId: () => this.currentModel,
       // zcodeCatalogSettle prices at catalog multiplier only.
@@ -576,6 +577,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     const input = promptText(params.input)
     try {
       const platform = await buildPromptContext({
+        catalog: this.opts.runtime?.catalog,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,

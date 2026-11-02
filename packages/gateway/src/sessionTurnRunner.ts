@@ -98,6 +98,7 @@ import { log } from './sessionManagerLog.js'
 import type { SessionManager, AgentSession } from './sessionManager.js'
 
 export interface TurnRunnerHost {
+  runtime?: SessionManager['runtime']
   getByKey: SessionManager['getByKey']
   _awaitBoundedOutputDrain: SessionManager['_awaitBoundedOutputDrain']
   _dispatchPostTerminalRuntimeEvent: SessionManager['_dispatchPostTerminalRuntimeEvent']
@@ -1694,6 +1695,7 @@ export async function _runOneTurn(
           ...freezeStructuredBlocks(structuredBlocks),
         ]
         const pricedUsd = await applyPlatformCostIfMissing({
+          catalog: this.runtime?.catalog,
           model: session.model,
           usage: result.usage,
           sessionCostUsd: session.totalCostUSD,
@@ -2254,7 +2256,7 @@ export async function _runOneTurn(
     }
     if (attemptOrdinal > 0 && modelAuthority && turnKey) {
       const renewalSignal = session._externalTurnAbort?.signal
-      void refreshTurnModelAuthorityLease(turnKey, modelAuthority, { signal: renewalSignal }).then(() => {
+      void refreshTurnModelAuthorityLease(turnKey, modelAuthority, { signal: renewalSignal, renew: this.runtime?.turnLease.renew }).then(() => {
         if (settled || detached || renewalSignal?.aborted) return
         submitEngineTurn()
       }).catch(async (error: unknown) => {

@@ -63,6 +63,7 @@ export class CreditBudgetGuard {
 
   constructor(
     private readonly opts: {
+      catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort
       budgetFen: bigint | undefined
       modelId: () => string | undefined
       agentId?: string
@@ -98,6 +99,7 @@ export class CreditBudgetGuard {
     this.inflight++
     try {
       const fen = await runningCostFenForUsage({
+        catalog: this.opts.catalog,
         modelId: this.opts.modelId(),
         usage,
         agentId: this.opts.agentId,
@@ -119,6 +121,7 @@ export class CreditBudgetGuard {
 }
 
 export async function runningCostFenForUsage(args: {
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort
   modelId: string | undefined
   usage: {
     inputTokens: number
@@ -132,11 +135,11 @@ export async function runningCostFenForUsage(args: {
 }): Promise<bigint | null> {
   const modelId = args.modelId?.trim()
   if (!modelId) return null
-  const pricing = await lookupPlatformPricing(modelId)
+  const pricing = await lookupPlatformPricing(modelId, args.catalog)
   if (!pricing) return null
   let multiplier = pricing.multiplier
   if (args.composeAgentMultiplier) {
-    const agentMul = await lookupAgentMultiplier(args.agentId)
+    const agentMul = await lookupAgentMultiplier(args.agentId, args.catalog)
     if (!agentMul) return null
     try {
       multiplier = composeMultiplier(pricing.multiplier, agentMul)
@@ -165,10 +168,13 @@ export async function runningCostFenForUsage(args: {
   }
 }
 
-async function lookupAgentMultiplier(agentId: string | undefined): Promise<string | null> {
+async function lookupAgentMultiplier(
+  agentId: string | undefined,
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort,
+): Promise<string | null> {
   const id = agentId?.trim()
   if (!id) return null
-  const client = getModelCatalogClient()
+  const client = catalog ?? getModelCatalogClient()
   if (!client.configured) return null
   try {
     // Override edits do not bump catalog epoch; getView() can reuse a stale

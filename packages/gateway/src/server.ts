@@ -1,3 +1,4 @@
+import { createGatewayRuntimeServices } from './gatewayRuntimeServices.js'
 import { withUserError } from '@openclaude/protocol'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
@@ -338,6 +339,7 @@ export function __setUploadFsOpsForTests(overrides: Partial<UploadFsOps> | null)
 }
 
 export interface GatewayDeps {
+  runtime?: import('./gatewayRuntimeServices.js').GatewayRuntimeServices
   config: OpenClaudeConfig
   agentsConfig: AgentsConfig
   webRoot?: string // 静态 web UI 目录
@@ -738,7 +740,7 @@ export class Gateway {
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
-    this.sessions = new SessionManager(deps.config)
+    this.sessions = new SessionManager(deps.config, deps.runtime)
     installSystemHelpRelay(this.sessions)
     this.sessions.onCcbTaskNotification = (session, payload) => {
       void this.handleCcbLocalAgentNotification(session, payload)
@@ -1039,7 +1041,11 @@ export class Gateway {
 
   /** Narrow view of the Gateway for routes/workspaceApi.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly workspaceApiRoutesIo: WorkspaceApiRoutesIo = ((gw: Gateway): WorkspaceApiRoutesIo => ({
-    preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => gw._getAgentsConfig(), defaultModel: gw.deps.config.defaults.model })(stages),
+    isAvailableStageModel: async (modelId) => {
+      const view = await gw.sessions.runtime.catalog.getRoutingView()
+      return view.isRoutable(view.canonicalize(modelId))
+    },
+    preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => gw._getAgentsConfig(), defaultModel: gw.deps.config.defaults.model, catalog: gw.sessions.runtime.catalog })(stages),
     getRunSnapshots: (runs) => projectTaskboardRunSnapshots(runs, (key) => gw.sessions.getByKey(key)),
     _getAgentsConfigUserView: (...args) => gw._getAgentsConfigUserView(...args),
     _handleTaskItem: (...args) => gw._handleTaskItem(...args),
@@ -2976,5 +2982,5 @@ export async function createGateway(opts?: { webRoot?: string }): Promise<Gatewa
   const config = await readConfig()
   if (!config) throw new Error('Run `openclaude onboard` first to create config.')
   const agentsConfig = await readAgentsConfig()
-  return new Gateway({ config, agentsConfig, webRoot: opts?.webRoot })
+  return new Gateway({ config, agentsConfig, webRoot: opts?.webRoot, runtime: createGatewayRuntimeServices() })
 }

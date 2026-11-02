@@ -294,7 +294,31 @@ export const INTERNAL_ONLY_COMMANDS = [
 
 // Declared as a function so that we don't run this until getCommands is called,
 // since underlying functions read from config, which can't be read at module initialization time
-const COMMANDS = memoize((): Command[] => [
+export type CommandAuthPresentation = Readonly<{
+  role: string
+  revision: string
+  includeAnthropicAccountCommands: boolean
+  hasAnthropicApiKeyAuth: boolean
+}>
+type NativeHostCommandProfile = Readonly<{
+  enabled: (command: Command) => boolean
+  auth: CommandAuthPresentation
+}>
+let nativeHostCommandProfile: NativeHostCommandProfile | undefined
+/** Trusted one-session process only; presentation is not execution authority. */
+export function installNativeHostCommandProfile(profile: NativeHostCommandProfile): void {
+  if (nativeHostCommandProfile || typeof profile.enabled !== 'function' ||
+    !profile.auth?.role || !profile.auth.revision ||
+    typeof profile.auth.includeAnthropicAccountCommands !== 'boolean' ||
+    typeof profile.auth.hasAnthropicApiKeyAuth !== 'boolean')
+    throw new Error('native-host-command-profile-invalid-or-claimed')
+  nativeHostCommandProfile = Object.freeze({ enabled: profile.enabled,
+    auth: Object.freeze({ role: profile.auth.role, revision: profile.auth.revision,
+      includeAnthropicAccountCommands: profile.auth.includeAnthropicAccountCommands,
+      hasAnthropicApiKeyAuth: profile.auth.hasAnthropicApiKeyAuth }) })
+}
+
+const COMMANDS = memoize((profile: NativeHostCommandProfile | undefined): Command[] => [
   addDir,
   advisor,
   agentsPlatform,
@@ -388,7 +412,8 @@ const COMMANDS = memoize((): Command[] => [
   hooks,
   exportCommand,
   sandboxToggle,
-  ...(!isUsing3PServices() ? [logout, login()] : []),
+  ...((profile ? profile.auth.includeAnthropicAccountCommands : !isUsing3PServices())
+    ? [logout, login(profile?.auth.hasAnthropicApiKeyAuth)] : []),
   passes,
   ...(peersCmd ? [peersCmd] : []),
   ...(attachCmd ? [attachCmd] : []),
@@ -434,7 +459,8 @@ const COMMANDS = memoize((): Command[] => [
 
 export const builtInCommandNames = memoize(
   (): Set<string> =>
-    new Set(COMMANDS().flatMap(_ => [_.name, ...(_.aliases ?? [])])),
+    new Set(COMMANDS(nativeHostCommandProfile).flatMap(_ => [_.name, ...(_.aliases ?? [])])),
+  () => nativeHostCommandProfile,
 )
 
 async function getSkills(cwd: string): Promise<{
@@ -533,7 +559,7 @@ export function meetsAvailabilityRequirement(cmd: Command): boolean {
  * Loads all command sources (skills, plugins, workflows). Memoized by cwd
  * because loading is expensive (disk I/O, dynamic imports).
  */
-const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
+const loadAllCommands = memoize(async (cwd: string, profile: NativeHostCommandProfile | undefined): Promise<Command[]> => {
   const [
     { skillDirCommands, pluginSkills, bundledSkills, builtinPluginSkills },
     pluginCommands,
@@ -551,9 +577,9 @@ const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
     ...(workflowCommands as Command[]),
     ...(pluginCommands as Command[]),
     ...pluginSkills,
-    ...COMMANDS(),
+    ...COMMANDS(profile),
   ]
-})
+}, (cwd, profile) => JSON.stringify([cwd, profile?.auth ?? null]))
 
 /**
  * Returns commands available to the current user. The expensive loading is
@@ -561,14 +587,18 @@ const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
  * auth changes (e.g. /login) take effect immediately.
  */
 export async function getCommands(cwd: string): Promise<Command[]> {
-  const allCommands = await loadAllCommands(cwd)
+  const profile = nativeHostCommandProfile
+  const enabled = profile
+    ? (command: Command) => profile.enabled(command) === true
+    : (command: Command) => meetsAvailabilityRequirement(command) && isCommandEnabled(command)
+  const allCommands = await loadAllCommands(cwd, profile)
 
   // Get dynamic skills discovered during file operations
   const dynamicSkills = getDynamicSkills()
 
   // Build base commands without dynamic skills
   const baseCommands = allCommands.filter(
-    _ => meetsAvailabilityRequirement(_) && isCommandEnabled(_),
+    command => enabled(command),
   )
 
   if (dynamicSkills.length === 0) {
@@ -580,8 +610,7 @@ export async function getCommands(cwd: string): Promise<Command[]> {
   const uniqueDynamicSkills = dynamicSkills.filter(
     s =>
       !baseCommandNames.has(s.name) &&
-      meetsAvailabilityRequirement(s) &&
-      isCommandEnabled(s),
+      enabled(s),
   )
 
   if (uniqueDynamicSkills.length === 0) {
@@ -589,7 +618,7 @@ export async function getCommands(cwd: string): Promise<Command[]> {
   }
 
   // Insert dynamic skills after plugin skills but before built-in commands
-  const builtInNames = new Set(COMMANDS().map(c => c.name))
+  const builtInNames = new Set(COMMANDS(profile).map(c => c.name))
   const insertIndex = baseCommands.findIndex(c => builtInNames.has(c.name))
 
   if (insertIndex === -1) {

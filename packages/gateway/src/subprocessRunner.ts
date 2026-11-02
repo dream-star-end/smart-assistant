@@ -776,6 +776,7 @@ export class SubprocessRunner extends EventEmitter {
       try {
         await assertCcbAdvisorCatalogLock({
           lock: this.opts.advisorExecutionLock,
+          catalog: this.opts.runtime?.catalog,
           model: this.opts.model,
         })
       } catch (err) {
@@ -1300,12 +1301,14 @@ export class SubprocessRunner extends EventEmitter {
       this.opts.model,
       process.env,
       this.opts.authorityEngine ?? 'ccb',
+      this.opts.runtime?.catalog,
     )
     turnTiming.once('runtime_resolved')
     this.pinBoxNativeHarness(runtime.descriptor)
     if (isCcbAdvisorHermeticProfile(this.opts)) {
       await assertCcbAdvisorCatalogLock({
         lock: this.opts.advisorExecutionLock,
+        catalog: this.opts.runtime?.catalog,
         model: this.opts.model,
       })
     }
@@ -1684,6 +1687,7 @@ export class SubprocessRunner extends EventEmitter {
     this._promptPolicyFingerprint = undefined
     try {
       const promptResult = await buildPromptContext({
+        catalog: this.opts.runtime?.catalog,
         promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,

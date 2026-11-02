@@ -146,6 +146,7 @@ async function handleChatCompletions(
   let _oaiExec: LocalExecutionDecision | undefined
   try {
     _oaiExec = await resolveLocalExecutionIfEnforced({
+      catalog: deps.sessions.runtime?.catalog,
       agent,
       kind: 'synthetic',
       model: _oaiRoute?.model,

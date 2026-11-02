@@ -2407,6 +2407,7 @@ export class CronScheduler {
     let cronExec: LocalExecutionDecision | undefined
     try {
       cronExec = await resolveLocalExecutionIfEnforced({
+        catalog: this.sessions.runtime?.catalog,
         agent: executionAgent,
         kind: 'synthetic',
         model: cronRoute?.model,

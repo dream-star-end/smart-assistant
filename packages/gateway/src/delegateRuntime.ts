@@ -1179,7 +1179,7 @@ export async function _runDelegateTaskCore(
     // agents.yaml 里 hidden-reviewer 的默认绑定(降级,仍审查)。
     if (isModelAuthorityRequired()) {
       try {
-        const view = await getLocalCatalogView()
+        const view = await (this.sessions.runtime?.catalog.getRoutingView() ?? getLocalCatalogView())
         reviewerModelOverride = pickReviewerModel(view, {
           leaderModel: parent.model ?? this.deps.config.defaults.model,
           avoidModels: evidence
@@ -1284,6 +1284,7 @@ export async function _runDelegateTaskCore(
   const preferGrokDefault = !requestedModel && !isReview && isEngineLocalTurnExempt(process.env)
   try {
     delegateExec = await resolveLocalExecutionIfEnforced({
+      catalog: this.sessions.runtime?.catalog,
       agent: execAgent,
       kind: 'turn',
       model: requestedModel,
@@ -1802,6 +1803,7 @@ export async function _runDelegateTaskCore(
       })
       try {
         delegateExec = await resolveLocalExecutionIfEnforced({
+          catalog: this.sessions.runtime?.catalog,
           agent: { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL },
           kind: 'turn',
           model: DELEGATE_GROK_FALLBACK_MODEL,
@@ -2570,7 +2572,7 @@ export async function _runDelegateTaskCore(
     ...session,
     engine: session.providerTag,
     isError: Boolean(error),
-  }).catch((err) => {
+  }, this.sessions.runtime ? { catalog: this.sessions.runtime.catalog } : undefined).catch((err) => {
     if (!input.taskboardControl) throw err
     this.log.warn('taskboard reference price unavailable; preserving paid output', { sessionKey, err: String(err) })
     return { costUsd: null, costImprecise: true }

@@ -649,6 +649,7 @@ export async function dispatchInbound(
     if (turnAuthority === undefined) {
       try {
         localExec = await resolveLocalExecutionIfEnforced({
+          catalog: this.sessions.runtime?.catalog,
           agent: effectiveAgent,
           kind: 'turn',
           model: safeModel,
@@ -1653,7 +1654,7 @@ export async function dispatchInbound(
         let panel: DeliberationPanelMember[] = []
         if (isModelAuthorityRequired()) {
           try {
-            const view = await getLocalCatalogView()
+            const view = await (this.sessions.runtime?.catalog.getRoutingView() ?? getLocalCatalogView())
             panel = pickDeliberationPanel(view, {
               excludeModel: leaderModelForTeam,
               requireLocalEngines: !isEngineLocalTurnExempt(process.env),

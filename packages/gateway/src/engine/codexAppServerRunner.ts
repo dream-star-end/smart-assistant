@@ -224,6 +224,7 @@ const RETRY_JITTER_MS = 500
 // ───────────────────────────────────────────────
 
 export interface CodexAppServerRunnerOpts {
+  catalog?: import('../gatewayRuntimeServices.js').CatalogRuntimePort
   systemHelpContextFile?: string
   sessionKey: string
   agentId: string
@@ -1030,6 +1031,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
     try {
       const overrides = await buildCodexLaunchOverrides({
+        catalog: this.opts.catalog,
         systemHelpContextFile: this.opts.systemHelpContextFile,
         promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,

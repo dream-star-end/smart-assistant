@@ -392,8 +392,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   private _executionTarget: ExecutionTarget = { kind: 'local' }
 
   /** @param kernelOverride 测试注入结构等价 fake(生产恒为内部构造的内核)。 */
+  private readonly runtimeCatalog?: import('../gatewayRuntimeServices.js').CatalogRuntimePort
   constructor(opts: EngineCreateOpts, kernelOverride?: CodexAppServerRunner) {
     super()
+    this.runtimeCatalog = opts.runtime?.catalog
     this._engineSessionId = engineSessionId(opts.sessionKey)
     this._sessionKey = opts.sessionKey
     this.agentId = opts.agentId
@@ -402,6 +404,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     this.kernel =
       kernelOverride ??
       new CodexAppServerRunner({
+        catalog: this.runtimeCatalog,
         sessionKey: opts.sessionKey,
         systemHelpContextFile: opts.systemHelpContextFile,
         agentId: opts.agentId,
@@ -549,6 +552,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       creditGuard: null as unknown as CreditBudgetGuard,
     }
     ctx.creditGuard = new CreditBudgetGuard({
+      catalog: this.runtimeCatalog,
       budgetFen: params.creditBudgetFen,
       modelId: () => this.kernel.model,
       agentId: this.agentId,
