@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 
 import { DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
@@ -288,6 +289,94 @@ function makeRuntime(opts?: {
     },
   }
 }
+
+it('paused preset delegate identity rejects nongrok overrides before side effects and preserves old journal cleanup', () => {
+  // The policy is boot-scoped. Isolate it so normal Grok/control admissions in
+  // this file keep their original deployment identity and assertions.
+  const child = spawnSync(process.execPath, [
+    '--import', import.meta.resolve('tsx'), '--input-type=module', '-e', `
+      import assert from 'node:assert/strict';
+      import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+      import { tmpdir } from 'node:os';
+      import { join } from 'node:path';
+      import { configureModelAvailability } from ${JSON.stringify(new URL('../billing/modelAvailability.ts', import.meta.url).href)};
+      import { createDelegateEngineBillingRuntime } from ${JSON.stringify(new URL('../billing/delegateEngineBillingRuntime.ts', import.meta.url).href)};
+      import { DELEGATE_ENGINE_BILLING_ADMIT_PATH, DELEGATE_ENGINE_BILLING_SETTLE_PATH, DELEGATE_ENGINE_BILLING_ABANDON_PATH } from ${JSON.stringify(new URL('../http/internalDelegateEngineBilling.ts', import.meta.url).href)};
+
+      const root = mkdtempSync(join(tmpdir(), 'delegate-preset-policy-'));
+      const policyFile = join(root, 'deploy/v5-selfhost/model-availability.json');
+      mkdirSync(join(root, 'deploy/v5-selfhost'), { recursive: true });
+      const configure = (grokEnabled) => {
+        writeFileSync(policyFile, JSON.stringify({ grokEnabled }));
+        configureModelAvailability({ status: 'ok', flavor: 'selfhost', manifestPath: join(root, 'flavor.manifest.json') });
+      };
+      const identity = { userId: 42, containerId: 7 };
+      const body = { model: 'gpt-5.6-sol', engine: 'codex', agentId: 'auditor', delegateAgentId: 'auditor', sessionKey: 'agent:auditor:delegate:main:1' };
+      const requestId = 'ab'.repeat(16);
+      const rig = () => {
+        const calls = [];
+        const forbidden = (name) => () => { calls.push(name); throw new Error('UNEXPECTED_SIDE_EFFECT_' + name); };
+        const runtime = createDelegateEngineBillingRuntime({
+          getPool: forbidden('pool'), preCheckRedis: {}, pricing: { get: forbidden('pricing') },
+          catalog: { assertFresh: forbidden('catalog') }, loadUserModelAuthz: forbidden('authz'),
+          newRequestId: forbidden('request-id'), getAgentCostMultiplierFn: forbidden('multiplier'),
+          preCheckWithCostFn: forbidden('precheck'), startInflightJournalFn: forbidden('journal'),
+          attributeOpenTurnFn: forbidden('open-turn'), createAdvisorCodexRoute: forbidden('advisor-route'),
+        });
+        return { calls, runtime };
+      };
+      try {
+        configure(false);
+        for (const fields of [
+          { delegateAgentId: 'office-assistant' },
+          { agentId: 'office-assistant' },
+          { agentId: 'office-assistant', delegateAgentId: 'office-assistant' },
+        ]) {
+          const { calls, runtime } = rig();
+          await assert.rejects(() => runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity, body: { ...body, ...fields } }),
+            /^Error: DELEGATE_ENGINE_BILLING_AGENT_UNAVAILABLE$/, JSON.stringify(fields));
+          assert.deepEqual(calls, [], 'paused preset must reject before catalog, authz, pool, reservation, routing or journal');
+        }
+        {
+          const { calls, runtime } = rig();
+          await assert.rejects(() => runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity, body }), /CATALOG_UNAVAILABLE/);
+          assert.deepEqual(calls, ['catalog'], 'unpaused delegates retain fenced catalog admission');
+        }
+
+        const cleanupCalls = [];
+        const pool = { query: async () => ({ rows: [{ user_id: '42', container_id: '7', ctx: { source: 'delegate_grok', agentId: 'office-assistant', delegateAgentId: 'office-assistant', engineSessionId: 'existing-office-engine' } }] }) };
+        const cleanup = createDelegateEngineBillingRuntime({
+          getPool: () => pool, preCheckRedis: {}, pricing: {},
+          catalog: { assertFresh: () => { throw new Error('cleanup must not read catalog'); } },
+          loadUserModelAuthz: () => { throw new Error('cleanup must not load fresh authz'); },
+          settleDurableCodexBillingFn: async (...args) => { cleanupCalls.push(['settle', args[2].delegateAgentId]); return 'committed'; },
+          abortInflightJournalFn: async (_pool, id) => { cleanupCalls.push(['abort', id]); return true; },
+          releasePreCheckFn: async (_redis, reservation) => { cleanupCalls.push(['release', reservation.requestId]); return true; },
+        });
+        assert.deepEqual(await cleanup.handle({ path: DELEGATE_ENGINE_BILLING_SETTLE_PATH, identity, body: { requestId, status: 'success' } }), { settled: true });
+        assert.deepEqual(cleanupCalls, [['settle', 'office-assistant']]);
+        cleanupCalls.length = 0;
+        assert.deepEqual(await cleanup.handle({ path: DELEGATE_ENGINE_BILLING_ABANDON_PATH, identity, body: { requestId } }), { abandoned: true });
+        assert.deepEqual(cleanupCalls, [['abort', requestId], ['release', requestId]]);
+        cleanupCalls.length = 0;
+        for (const path of [DELEGATE_ENGINE_BILLING_SETTLE_PATH, DELEGATE_ENGINE_BILLING_ABANDON_PATH]) {
+          await assert.rejects(() => cleanup.handle({ path, identity: { ...identity, userId: 43 }, body: { requestId } }), /INVALID_JOURNAL_IDENTITY/);
+          await assert.rejects(() => cleanup.handle({ path, identity: { ...identity, containerId: 8 }, body: { requestId } }), /INVALID_JOURNAL_IDENTITY/);
+        }
+        assert.deepEqual(cleanupCalls, [], 'a pause must not weaken existing journal ownership checks');
+
+        configure(true);
+        const restored = rig();
+        await assert.rejects(() => restored.runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity, body: { ...body, agentId: 'office-assistant', delegateAgentId: 'office-assistant' } }), /CATALOG_UNAVAILABLE/);
+        assert.deepEqual(restored.calls, ['catalog'], 'restored presets retain fenced catalog admission');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    `,
+  ], { encoding: 'utf8', timeout: 30_000 })
+  assert.equal(child.error, undefined, child.error?.message)
+  assert.equal(child.status, 0, child.stdout + child.stderr)
+})
 
 describe('delegate engine-billing runtime', () => {
   it('admits a codex delegate with source + attribution in journal ctx', async () => {

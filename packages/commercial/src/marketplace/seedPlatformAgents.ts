@@ -29,6 +29,7 @@ import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 
 import { query } from '../db/queries.js'
 import { assertFlavorIdentity } from '../flavor/assertFlavor.js'
+import { isModelAvailable } from '../billing/modelAvailability.js'
 import {
   type AgentManifest,
   VETTED_AGENT_TOOLSETS,
@@ -328,6 +329,12 @@ async function seedAgentDefs(
   const allowedModels = new Set(deps.listPublicModels().map((m) => m.id))
 
   for (const def of defs) {
+    // A release policy pauses the preset identity as well as its fixed model.
+    // Keep the approved artifact untouched so a later release can restore it.
+    if (isPlatformPresetPaused(def.slug)) {
+      out.skipped.push(def.slug)
+      continue
+    }
     try {
       const result = validateAgentManifest(def.body, {
         vettedToolsets: VETTED_AGENT_TOOLSETS,
@@ -457,6 +464,30 @@ export const PLATFORM_SEED_AGENT_DEFS: readonly Readonly<PlatformAgentDef>[] = [
   ...PLATFORM_GENERAL_AGENTS,
   ...PLATFORM_RESEARCH_AGENTS,
 ]
+
+/** One boot-verified policy for every projection and execution of a preset. */
+export function isPlatformPresetPaused(slug: string): boolean {
+  const def = PLATFORM_SEED_AGENT_DEFS.find((candidate) => candidate.slug === slug)
+  const model = def?.body.model
+  return typeof model === 'string' && model !== AGENT_MODEL_AUTO && !isModelAvailable(model)
+}
+
+/** Reserved even while paused, so neither an old install nor main can replace it. */
+export function pausedPlatformPresetAgentSlugs(): string[] {
+  return PLATFORM_SEED_AGENT_DEFS.map((def) => def.slug).filter(isPlatformPresetPaused)
+}
+
+/** Only optional preset dependencies narrow; core seed requirements never do. */
+export function requiredPlatformSeedAgentModelIds(): string[] {
+  return [...new Set(PLATFORM_SEED_AGENT_DEFS
+    .filter((def) => !isPlatformPresetPaused(def.slug))
+    .flatMap((def) => {
+      const model = def.body.model
+      if (typeof model !== 'string' || !model.trim())
+        throw new Error(`[seedPlatformAgents] preset '${def.slug}' has no model in its manifest body`)
+      return model === AGENT_MODEL_AUTO ? [] : [model]
+    }))]
+}
 
 export const PLATFORM_GENERAL_AGENT_SLUGS: readonly string[] = PLATFORM_GENERAL_AGENTS.map(
   (a) => a.slug,

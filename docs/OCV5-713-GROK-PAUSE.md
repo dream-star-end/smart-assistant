@@ -23,6 +23,32 @@ fail C3. Two different engines remain mandatory. C1/C2, prewarm, G1/S1, budgets,
 inline-request checks and every other gate remain unchanged. True restores the
 original Grok+DeepSeek C3 matrix. This is not a skipped or automatically passing C3.
 
+## Platform presets during the pause
+
+The office preset's approved `office-assistant@1.0.3` artifact pins `grok-build`.
+While the verified personal policy is false, that preset identity is paused too:
+it is absent from the picker, marketplace execution projection and container sync,
+and cannot run with an explicit alternative model. Browser chat and internal
+delegate admission reject it before any account, precheck or journal side effect.
+Existing delegate settlement and release still finish through their original
+journal-bound paths.
+
+Reserved preset slugs stay reserved while paused. Old personal installs, known
+version IDs and a missing preset row cannot reintroduce the office preset or make
+it fall back to main. New Skill assignments to it are rejected. Runtime Skill
+scopes omit the paused identity; an office-only Skill is withheld rather than
+granted to main. Stored installs, scopes, model rows, preset version and artifact
+hash remain unchanged, so a normal new policy=true release restores the original
+preset and Skill projections without a data rewrite.
+
+The startup seed assertion uses the same effective preset dependencies. Default,
+hidden-reviewer and Codex captain models remain mandatory in every policy state;
+other active presets must also have usable models. A paused optional preset does
+not make the application refuse startup. Commercial and unverified legacy
+deployments retain their original complete seed requirement and preset behavior.
+The regression imports the real policy, catalog constructor and startup assertion
+in their actual order, testing both pause and restore with unchanged artifacts.
+
 ## Restore on/after November 6
 
 Restoration is not automatic and does not enable any account. First obtain the
