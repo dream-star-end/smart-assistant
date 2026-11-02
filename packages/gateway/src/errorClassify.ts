@@ -23,6 +23,7 @@ import { observeUnknownRunError } from './errorClassifyJevShadow.js'
 export type ClassifiedErrorCode =
   | 'insufficient_credits'
   | 'rate_limited'
+  | 'quota_exhausted'
   | 'model_capacity'
   | 'model_config_changed_retry_turn'
   | 'model_not_available'
@@ -52,11 +53,45 @@ export interface DelegateOutputError {
 /** 模型容量满载词族 —— model_capacity 规则与 OCV5-407 的排除条件共用同一份源。 */
 const CAPACITY_LEXICON = String.raw`at capacity|capacity.{0,40}(?:limit|exceed|full)|overloaded|model.{0,20}busy|\b529\b`
 
+/** Only the proxy's typed API response establishes exhausted quota. Generic
+ * 429s, provider prose and a bare marker retain their existing semantics.
+ * CCB can wrap the canonical API diagnostic in its JSON result terminal. */
+function isTypedBoxQuotaFailure(raw: string): boolean {
+  let text = raw.trim()
+  for (let depth = 0; depth < 4; depth += 1) {
+    const api = /^API Error:\s*[45]\d{2}\s*(\{[\s\S]*\})$/i.exec(text)
+    if (api) {
+      try {
+        const payload = JSON.parse(api[1]!) as { error?: { code?: unknown } }
+        return payload?.error?.code === 'BOX_UPSTREAM_QUOTA_EXHAUSTED'
+      } catch { return false }
+    }
+    try {
+      const wrapped = JSON.parse(text) as unknown
+      if (typeof wrapped === 'string') { text = wrapped.trim(); continue }
+      if (wrapped && typeof wrapped === 'object' && !Array.isArray(wrapped)) {
+        const result = wrapped as { subtype?: unknown; result?: unknown }
+        if ((result.subtype === 'success' || result.subtype === 'error_during_execution')
+          && typeof result.result === 'string') { text = result.result.trim(); continue }
+      }
+    } catch { /* No canonical API diagnostic was found. */ }
+    return false
+  }
+  return false
+}
+
 const PATTERNS: Array<{
   re: RegExp
+  matches?: (raw: string) => boolean
   code: Exclude<ClassifiedErrorCode, 'unknown'>
   message: string
 }> = [
+  {
+    re: /BOX_UPSTREAM_QUOTA_EXHAUSTED/,
+    matches: isTypedBoxQuotaFailure,
+    code: 'quota_exhausted',
+    message: '当前模型的使用额度已用尽，本轮已暂停，不会自动重试。已有进度已保留。',
+  },
   {
     re: /BODY_FIELD_TOO_LARGE|PAYLOAD_TOO_LARGE|BOX_CONTEXT_TOO_LARGE|\bRequest too large\b|本轮资料未能完整处理|这轮资料暂时无法完整处理/i,
     code: 'request_too_large',
@@ -251,7 +286,7 @@ export function classifyRunError(raw: string | undefined | null): ClassifiedErro
   const s = String(raw ?? '')
   if (!s) return { code: 'unknown', message: '' }
   for (const p of PATTERNS) {
-    if (p.re.test(s)) return { code: p.code, message: p.message }
+    if (p.re.test(s) && (!p.matches || p.matches(s))) return { code: p.code, message: p.message }
   }
   try {
     observeUnknownRunError(s)

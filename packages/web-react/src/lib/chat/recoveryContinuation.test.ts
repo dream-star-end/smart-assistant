@@ -8,6 +8,31 @@ import {
 } from "./socket";
 
 describe("checkpoint recovery continuation", () => {
+  it("keeps a quota checkpoint available manually while refusing automatic recovery and an empty checkpoint", () => {
+    const source: ChatMessage = {
+      id: "cm-quota-checkpoint", role: "user", text: "continue the work", ts: 1,
+      _source: "server",
+      _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+    };
+    const progress: ChatMessage = {
+      id: "quota-progress", role: "thinking", text: "saved progress", ts: 2,
+      _source: "server",
+    };
+    const error: ChatMessage = {
+      id: "quota-error", role: "assistant", text: "quota exhausted", ts: 3,
+      _source: "server", _clientMessageId: source.id, _errorCode: "quota_exhausted",
+    };
+    const messages = [source, progress, error];
+    expect(interruptedContinuationTarget(messages, error, "s-quota"))
+      .toMatchObject({ user: source, mode: "checkpoint" });
+    expect(automaticTurnRecoveryTarget(messages, error, "s-quota")).toBeUndefined();
+    expect(interruptedContinuationTarget([source, error], error, "s-quota")).toBeUndefined();
+    expect(interruptedContinuationTarget([source, { ...progress, _source: undefined }, error], error, "s-quota"))
+      .toBeUndefined();
+    const transient = { ...error, _errorCode: "rate_limited" };
+    expect(automaticTurnRecoveryTarget([source, progress, transient], transient, "s-quota"))
+      .toMatchObject({ mode: "checkpoint" });
+  });
   it("automatically resumes an uncertain tool checkpoint instead of replaying the source", () => {
     const sourceId = "cm-uncertain-checkpoint";
     const messages: ChatMessage[] = [

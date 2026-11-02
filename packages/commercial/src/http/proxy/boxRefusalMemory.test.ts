@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { _resetBoxRefusalMemoryForTest, forgetBoxRefusal, recentBoxRefusal, rememberBoxRefusal } from "./boxRefusalMemory.js";
-import { sendBoxUpstreamRefusal } from "./core.js";
+import { sendBoxUpstreamRefusal, sendBoxFallbackFailure } from "./core.js";
 
 const key = { uid: 247n, sessionId: "s1", turnKey: "t1", model: "box-api-claude-sonnet-5-5" };
 
@@ -58,6 +58,29 @@ test("the client sees a 503 with Retry-After for a usage-limit refusal and for a
       assert.equal(response.headers.get("retry-after"), after);
       assert.equal(body.error.code, name);
       assert.match(body.error.message, /nothing was charged/);
+      if (value === "BOX_CLI_UPSTREAM_RATE_LIMITED") assert.doesNotMatch(body.error.message, /quota|usage window/i);
     }
   } finally { server.close(); }
+});
+
+
+test("proven quota is explicit and nonretryable on both initial and durable failure replies", async () => {
+  let fallback = false;
+  const server = createServer((_req, res) => fallback
+    ? sendBoxFallbackFailure(res, { code: "BOX_CLI_QUOTA_EXHAUSTED" }, "req-quota")
+    : sendBoxUpstreamRefusal(res, "BOX_CLI_QUOTA_EXHAUSTED", "req-quota"));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as { port: number };
+    for (fallback of [false, true]) {
+      const response = await fetch(`http://127.0.0.1:${port}/`);
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get("x-should-retry"), "false");
+      assert.equal(response.headers.get("retry-after"), null, "no invented quota reset");
+      assert.equal((await response.json() as { error: { code: string } }).error.code, "BOX_UPSTREAM_QUOTA_EXHAUSTED");
+    }
+  } finally { server.close(); }
+  _resetBoxRefusalMemoryForTest();
+  rememberBoxRefusal(key, "BOX_CLI_QUOTA_EXHAUSTED", 1);
+  assert.equal(recentBoxRefusal(key, 2), "BOX_CLI_QUOTA_EXHAUSTED");
 });

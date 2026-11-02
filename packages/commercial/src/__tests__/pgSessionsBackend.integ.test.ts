@@ -5919,6 +5919,71 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     }
   }
 
+  maybe("Box exhausted quota permits manual checkpoint or explicit empty reissue and refuses automatic admission", async () => {
+    for (const withCheckpoint of [true, false]) {
+      const sessionId = `s-dd-quota-${withCheckpoint ? "checkpoint" : "empty"}`;
+      const sourceClientMessageId = `cm-dd-quota-${withCheckpoint ? "checkpoint" : "empty"}`;
+      const terminal: MessageLike = {
+        id: `quota-terminal-${withCheckpoint}`, role: "assistant", text: "quota exhausted", ts: 3,
+        _clientMessageId: sourceClientMessageId, _errorCode: "quota_exhausted",
+      };
+      await seedRecoverableSource({
+        sessionId, sourceClientMessageId, inlineError: false,
+        records: withCheckpoint ? [{
+          id: "quota-durable-progress", role: "thinking", text: "saved progress", ts: 2,
+          _clientMessageId: sourceClientMessageId,
+        }, {
+          id: "quota-completed-tool", role: "tool", text: "saved tool result", ts: 2,
+          toolName: "Bash", _completed: true, _clientMessageId: sourceClientMessageId,
+        }, terminal] : [terminal],
+      });
+      const originalRecords = await pool.query(
+        "SELECT msg_id,content_sha256 FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2 ORDER BY ordinal",
+        [sessionId, CUSER],
+      );
+      const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+      const request = (automatic: boolean, mode: "checkpoint" | "replay" = "checkpoint") => backend.admitUserTurn(admitInput({
+        sessionId, clientMessageId: identity.clientMessageId,
+        billingRequestId: `brq-${identity.clientMessageId}`,
+        message: { id: identity.clientMessageId, role: "user", text: "verify the saved checkpoint", ts: 4 } as MessageLike & { id: string },
+        recovery: automatic ? {
+          sourceClientMessageId, mode, automatic: true, rootClientMessageId: sourceClientMessageId,
+          attempt: 1, max: 10,
+        } : { sourceClientMessageId, mode, automatic: false },
+      }));
+      assert.deepEqual(await request(true), { kind: "recovery_conflict", reason: "source_not_recoverable" });
+      const beforeManual = await pool.query(
+        "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
+        [UID, sessionId, identity.clientMessageId],
+      );
+      assert.equal(beforeManual.rowCount, 0, "a forged automatic quota recovery creates no dispatch");
+      if (withCheckpoint) {
+        assert.deepEqual(await request(false, "replay"), { kind: "recovery_conflict", reason: "recovery_mode_mismatch" },
+          "an executed-tool checkpoint cannot become original replay through the recovery admission path");
+        assert.equal((await request(false)).kind, "admitted");
+        assert.equal((await request(false)).kind, "already_owned", "manual ACK retry keeps the active dispatch");
+        const owned = await pool.query("SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
+          [UID, sessionId, identity.clientMessageId]);
+        assert.equal(owned.rowCount, 1, "manual ACK retry creates no second dispatch");
+      } else {
+        assert.deepEqual(await request(false), { kind: "recovery_conflict", reason: "recovery_mode_mismatch" });
+        assert.deepEqual(await request(false, "replay"), { kind: "recovery_conflict", reason: "automatic_replay_not_proven" });
+        const explicitId = `${sourceClientMessageId}-manual-reissue`;
+        const explicitReissue = await backend.admitUserTurn(admitInput({
+          sessionId, clientMessageId: explicitId, billingRequestId: `brq-${explicitId}`,
+          message: { id: explicitId, role: "user", text: "source", ts: 4 } as MessageLike & { id: string },
+        }));
+        assert.equal(explicitReissue.kind, "admitted",
+          "a zero-output turn can still be explicitly reissued as an ordinary user turn without recovery control");
+      }
+      const afterRecords = await pool.query(
+        "SELECT msg_id,content_sha256 FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2 ORDER BY ordinal",
+        [sessionId, CUSER],
+      );
+      assert.deepEqual(afterRecords.rows, originalRecords.rows, "manual continuation preserves the original tape");
+    }
+  });
+
   maybe("lossless anchor recovery trusts interrupted tape waiver without hot error metadata", async () => {
     const sessionId = "s-dd-recovery-lossless-waiver";
     const sourceClientMessageId = "cm-dd-recovery-lossless-waiver";

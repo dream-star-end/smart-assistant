@@ -588,6 +588,7 @@ const ERROR_LABELS: Record<string, string> = {
   // ── 计费/配额 ──
   insufficient_credits: insufficientCreditsCopy(false).title,
   rate_limited: "请求过于频繁，请稍后再试",
+  quota_exhausted: "使用额度已耗尽",
   // ── 上游模型服务 ──
   model_capacity: "模型繁忙",
   upstream_failed: "模型服务暂时中断",

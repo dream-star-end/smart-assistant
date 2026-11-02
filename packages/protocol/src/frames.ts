@@ -1063,6 +1063,7 @@ export const OutboundError = Type.Object({
   code: Type.Union([
     Type.Literal('insufficient_credits'),
     Type.Literal('rate_limited'),
+    Type.Literal('quota_exhausted'),
     Type.Literal('model_capacity'),
     Type.Literal('model_config_changed_retry_turn'),
     Type.Literal('model_not_available'),

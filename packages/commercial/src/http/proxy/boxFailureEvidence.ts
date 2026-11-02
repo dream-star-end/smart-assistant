@@ -1,8 +1,9 @@
 /** Content-free, bounded evidence for one admitted Box attempt. Persisted in
  * the existing journal; it never grants launch, billing or cleanup authority. */
+import { BOX_QUOTA_WINDOWS, type BoxQuotaWindow } from "./boxCliQuotaEvidence.js";
 import { createHash } from "node:crypto";
 export const BOX_FAILURE_CODES = [
-  "BOX_CLI_UPSTREAM_REFUSED", "BOX_CLI_UPSTREAM_RATE_LIMITED", "BOX_CLI_MODEL_REFUSED",
+  "BOX_CLI_QUOTA_EXHAUSTED", "BOX_CLI_UPSTREAM_REFUSED", "BOX_CLI_UPSTREAM_RATE_LIMITED", "BOX_CLI_MODEL_REFUSED",
   "BOX_TOOL_SNAPSHOT_MISMATCH", "BOX_TOOL_ECHO_CONTENT_MISMATCH",
   "BOX_TOOL_ECHO_ID_MISMATCH", "BOX_TOOL_ECHO_ERROR_MISMATCH",
   "BOX_SPOOL_POLL_ABORTED", "BOX_SPOOL_POLL_TIMEOUT", "BOX_EXEC_TIMEOUT",
@@ -19,6 +20,8 @@ export interface BoxFailureDiagnostic {
   upstreamTag?: "authentication_failed" | "rate_limit" | "invalid_request"
     | "overloaded_error" | "api_error" | "other";
   upstreamStatus?: number;
+  quotaWindow?: BoxQuotaWindow;
+  quotaResetAtMs?: number;
   blockIndex?: number;
   expectedBlocks?: number;
   observedBlocks?: number;
@@ -49,7 +52,7 @@ const branches = new Set(["synthetic_api_error", "missing_snapshot", "snapshot_c
 const tags = new Set(["authentication_failed", "rate_limit", "invalid_request",
   "overloaded_error", "api_error", "other"]);
 const blockTypes = new Set(["text", "image", "tool_use", "tool_result", "thinking", "missing", "unknown"]);
-const diagnosticKeys = new Set(["branch", "upstreamTag", "upstreamStatus", "blockIndex", "expectedBlocks", "observedBlocks",
+const diagnosticKeys = new Set(["quotaWindow", "quotaResetAtMs", "branch", "upstreamTag", "upstreamStatus", "blockIndex", "expectedBlocks", "observedBlocks",
   "expectedType", "observedType", "expectedBytes", "observedBytes", "expectedSha256",
   "observedSha256", "hashOnly"]);
 function record(value: unknown): value is Record<string, unknown> {
@@ -76,6 +79,8 @@ export function summarizeBoxFailureValue(value: unknown): {
 function validDiagnostic(value: unknown): value is BoxFailureDiagnostic {
   if (!record(value) || Object.keys(value).some((key) => !diagnosticKeys.has(key))) return false;
   for (const [key, item] of Object.entries(value)) {
+    if (key === "quotaWindow" && (typeof item !== "string" || !BOX_QUOTA_WINDOWS.includes(item as BoxQuotaWindow))) return false;
+    if (key === "quotaResetAtMs" && (!Number.isSafeInteger(item) || Number(item) <= 0 || Number(item) > 8_640_000_000_000_000)) return false;
     if (key === "branch" && (typeof item !== "string" || !branches.has(item))) return false;
     if (key === "upstreamTag" && (typeof item !== "string" || !tags.has(item))) return false;
     if ((key === "expectedType" || key === "observedType")

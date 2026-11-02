@@ -797,6 +797,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   // ── 计费/配额 ──
   insufficient_credits: insufficientCreditsCopy(false).message,
   rate_limited: "请求暂时较多，请稍后直接重试本条消息。",
+  quota_exhausted: "当前模型的使用额度已用尽，本轮已暂停，不会自动重试。已有进度已保留，额度恢复后可手动继续，或切换模型后继续。",
   // ── 上游模型服务 ──
   model_capacity: "当前模型访问量较大，请稍后重试，或在上方切换到其他模型立即继续。",
   upstream_failed: "任务执行暂时中断，你的消息已保留，可直接重试。",

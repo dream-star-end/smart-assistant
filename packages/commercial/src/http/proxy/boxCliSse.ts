@@ -1,6 +1,9 @@
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
   isBoxCliSyntheticUser } from "./boxCliCompaction.js";
-import { boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
+import { boxCliUpstreamRefusal, BOX_CLI_UPSTREAM_RATE_LIMITED } from "./boxCliUpstreamRefusal.js";
+
+import { BOX_CLI_QUOTA_EXHAUSTED, BoxCliQuotaObserver } from "./boxCliQuotaEvidence.js";
+import type { BoxFailureDiagnostic } from "./boxFailureEvidence.js";
 
 /** Convert a completed, supervised Claude CLI stream-json call back to
  * Anthropic Messages SSE. Visible block indexes are renumbered only after
@@ -9,7 +12,7 @@ import { boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
  * tool_use so it can never swallow a pending OpenClaude-local tool execution.
  */
 export class BoxCliSseError extends Error {
-  constructor(readonly code: string) {
+  constructor(readonly code: string, readonly boxFailureDiagnostic?: BoxFailureDiagnostic) {
     super(code);
     this.name = "BoxCliSseError";
   }
@@ -59,6 +62,7 @@ export function createBoxCliSseDecoder(expectedModel: string,
   if (!expectedModel) {
     throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
   }
+  const quotaObserver = new BoxCliQuotaObserver(trustedNativeSessionId);
   const compaction = trustedNativeSessionId
     ? new BoxCliCompaction(trustedNativeSessionId) : null;
   let started = false, stopped = false, resultSeen = false, initSeen = false;
@@ -90,7 +94,9 @@ export function createBoxCliSseDecoder(expectedModel: string,
     catch { throw new BoxCliSseError("BOX_CLI_STREAM_INVALID"); }
     if (resultSeen) throw new BoxCliSseError("BOX_CLI_RECORD_AFTER_RESULT");
     const refusal = boxCliUpstreamRefusal(record);
-    if (refusal) throw new BoxCliSseError(refusal);
+    const quota = quotaObserver.take(record, refusal === BOX_CLI_UPSTREAM_RATE_LIMITED);
+    if (refusal) throw new BoxCliSseError(quota ? BOX_CLI_QUOTA_EXHAUSTED : refusal,
+      quota ? { branch: "synthetic_api_error", upstreamTag: "rate_limit", ...quota } : undefined);
     if (compaction) {
       try {
         if (compaction.take(record, started ? "in-model" : "pre-model")) return "";
@@ -251,6 +257,7 @@ export function createBoxCliSseDecoder(expectedModel: string,
           throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
         }
         initSeen = true;
+        quotaObserver.bindNativeSession(record.session_id);
       }
     } else if (kind === "assistant") {
       const snapshot = object(record.message);

@@ -15,6 +15,29 @@ import { _tapeErrorCodeForGenericFailure } from '../sessionManager.js'
 import { _buildEngineErrorFrame } from '../turnFrames.js'
 
 describe('classifyRunError', () => {
+  it('preserves only the typed Box API quota failure on the wire and tape without automatic recovery', () => {
+    for (const status of [400, 429, 503, 599]) {
+      const api = `API Error: ${status} {"error":{"code":"BOX_UPSTREAM_QUOTA_EXHAUSTED","message":"quota exhausted"}}`
+      for (const raw of [api, JSON.stringify({ subtype: 'success', result: api }),
+        JSON.stringify({ subtype: 'error_during_execution', result: api })]) {
+        assert.equal(classifyRunError(raw).code, 'quota_exhausted')
+        const frame = _buildEngineErrorFrame({ sessionKey: 'sk', channel: 'webchat',
+          peer: { id: 'u4', kind: 'dm' } }, { kind: 'error', error: raw })
+        assert.equal(frame.code, 'quota_exhausted')
+        assert.equal(_tapeErrorCodeForGenericFailure(raw), 'quota_exhausted')
+        assert.equal(supportsAutomaticTurnRecovery(frame.code), false)
+      }
+    }
+    assert.equal(classifyRunError('429 Too Many Requests').code, 'rate_limited')
+    assert.equal(supportsAutomaticTurnRecovery('rate_limited'), true)
+    for (const raw of [
+      'BOX_UPSTREAM_QUOTA_EXHAUSTED',
+      'quota exhausted; rate_limit',
+      'API Error: 503 {"error":{"code":"BOX_UPSTREAM_QUOTA_EXHAUSTED_LATER"}}',
+      'API Error: 503 {"error":{"code":"BOX_UPSTREAM_REFUSED","message":"BOX_UPSTREAM_QUOTA_EXHAUSTED"}}',
+      'example: API Error: 503 {"error":{"code":"BOX_UPSTREAM_QUOTA_EXHAUSTED"}}',
+    ]) assert.notEqual(classifyRunError(raw).code, 'quota_exhausted', raw)
+  })
   it('OCV5-649 Box slot 409 stays box_capacity_held on the wire and tape and is never auto-recovered', () => {
     // The exact production terminal (commercial uid 4, 10-28 trace 5adf074e).
     const raw = JSON.stringify({ subtype: 'success',

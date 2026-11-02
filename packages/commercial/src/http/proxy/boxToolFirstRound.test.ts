@@ -81,6 +81,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   claimLostOnce?: boolean;
   spoolPrefix?: Buffer;
   spoolBody?: Buffer;
+  spoolUsingLaunchSession?: boolean;
   compactUsingLaunchSession?: boolean;
   /** Claude Code build the resolver read on this Box; null = not read. */
   cliVersion?: string | null;
@@ -140,9 +141,15 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
           return { stdout: JSON.stringify({ data: "", offset }), stderrBytes: 0,
             exitCode: 0 as const };
         }
-        const body = options.spoolBody ?? (options.directFinal
+        let body = options.spoolBody ?? (options.directFinal
           ? options.finalTrailing ? Buffer.concat([finalRaw, Buffer.from("bad-after-success\n")])
             : finalRaw : raw);
+        if (options.spoolUsingLaunchSession && launchedSession) {
+          body = Buffer.from(body.toString().split("\n").filter(Boolean).map((line) => {
+            const record = JSON.parse(line); record.session_id = launchedSession;
+            return JSON.stringify(record) + "\n";
+          }).join(""));
+        }
         const prefix = options.compactUsingLaunchSession
           ? compactPrefix(launchedSession) : options.spoolPrefix;
         const spool = prefix ? Buffer.concat([prefix, body]) : body;
@@ -1270,4 +1277,26 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and 
     assert.equal(f.retained, true);
     assert.equal(f.disposed, false, "unknown remote stop cannot release the owned target");
   } finally { release(); await hung; }
+});
+
+
+test("proven quota is recorded before Stop and is never handed off or committed", async () => {
+  const capture = upstreamRefusalRaw.toString().trim().split("\n").map(line => JSON.parse(line));
+  capture[0].session_id = capture[1].session_id;
+  const f = fixture({ spoolBody: Buffer.from(capture.map(record => JSON.stringify(record) + "\n").join("")),
+    spoolUsingLaunchSession: true });
+  const events: string[] = [];
+  const journal = f.deps.journal as unknown as { recordFirstFailure?: (input: { code: string; diagnostic?: { quotaWindow?: string } }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_CLI_QUOTA_EXHAUSTED");
+    assert.equal(input.diagnostic?.quotaWindow, "five_hour");
+    events.push("first-failure"); return null;
+  };
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    stopRejectedRun: async () => { events.push("stop"); return "stopped_proven"; } }), /BOX_CLI_QUOTA_EXHAUSTED/);
+  assert.deepEqual(events, ["first-failure", "stop"]);
+  assert.equal(f.launches, 1);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.deepEqual(f.unknownPhases, []);
 });

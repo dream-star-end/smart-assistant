@@ -73,7 +73,7 @@ import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BoxContinuationDecisionError, isContinuationConflict } from "./boxPreparedContinuation.js";
 import { BoxTextFetchError } from "./boxTextFetch.js";
 import { BoxInvocationConflict } from "./boxInvocationRegistry.js";
-import { BOX_CLI_UPSTREAM_RATE_LIMITED, isBoxCliUpstreamRefusalCode } from "./boxCliUpstreamRefusal.js";
+import { BOX_CLI_QUOTA_EXHAUSTED, BOX_CLI_UPSTREAM_RATE_LIMITED, isBoxCliUpstreamRefusalCode } from "./boxCliUpstreamRefusal.js";
 import type { BoxFirstFailure } from "./boxFailureEvidence.js";
 import {
   clearProviderQuotaBlock,
@@ -111,9 +111,15 @@ import {
  */
 /** The client-facing answer to a Box CLI upstream refusal: nothing was charged. */
 export function sendBoxUpstreamRefusal(res: ServerResponse, code: string, requestId: string): void {
+  if (code === BOX_CLI_QUOTA_EXHAUSTED) {
+    sendJsonError(res, 503, "BOX_UPSTREAM_QUOTA_EXHAUSTED",
+      "Box Claude subscription quota is exhausted; nothing was charged for this request",
+      requestId, { "x-should-retry": "false" });
+    return;
+  }
   const limited = code === BOX_CLI_UPSTREAM_RATE_LIMITED;
   sendJsonError(res, 503, limited ? "BOX_UPSTREAM_RATE_LIMITED" : "BOX_UPSTREAM_REFUSED",
-    limited ? "Box Claude usage window is exhausted; nothing was charged, retry later"
+    limited ? "Box Claude rate limited this request; nothing was charged, retry later"
       : "Box Claude upstream refused the request; nothing was charged", requestId,
     { "retry-after": limited ? "300" : "30" });
 }

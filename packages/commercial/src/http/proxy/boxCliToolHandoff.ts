@@ -7,8 +7,9 @@
  */
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
   isBoxCliOutputLimitResume, isBoxCliSyntheticUser } from "./boxCliCompaction.js";
-import { BOX_CLI_MODEL_REFUSED, boxCliUpstreamRefusal,
+import { BOX_CLI_MODEL_REFUSED, BOX_CLI_UPSTREAM_RATE_LIMITED, boxCliUpstreamRefusal,
   boxCliUpstreamRefusalDiagnostic } from "./boxCliUpstreamRefusal.js";
+import { BOX_CLI_QUOTA_EXHAUSTED, BoxCliQuotaObserver } from "./boxCliQuotaEvidence.js";
 import { summarizeBoxFailureValue, type BoxFailureDiagnostic } from "./boxFailureEvidence.js";
 import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES } from "./boxToolCapacity.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
@@ -208,6 +209,7 @@ interface CompletedBlock {
 }
 
 export class BoxCliToolHandoffDecoder {
+  private readonly quota: BoxCliQuotaObserver;
   private pending = "";
   private bytes = 0;
   private splitHighSurrogate = "";
@@ -297,6 +299,7 @@ export class BoxCliToolHandoffDecoder {
       }
       this.priorCliErrors = new Map(prior.map((use) => [use.id, use.name]));
     }
+    this.quota = new BoxCliQuotaObserver(options.trustedNativeSessionId ?? options.progress?.nativeSessionId);
     this.initSeen = options.alreadyInitialized === true;
     this.compaction = options.trustedNativeSessionId
       ? new BoxCliCompaction(options.trustedNativeSessionId) : null;
@@ -506,8 +509,9 @@ export class BoxCliToolHandoffDecoder {
       throw new BoxCliToolHandoffError("BOX_TOOL_AFTER_HANDOFF");
     }
     const refusal = boxCliUpstreamRefusal(record);
-    if (refusal) throw new BoxCliToolHandoffError(refusal,
-      boxCliUpstreamRefusalDiagnostic(record));
+    const quota = this.quota.take(record, refusal === BOX_CLI_UPSTREAM_RATE_LIMITED);
+    if (refusal) throw new BoxCliToolHandoffError(quota ? BOX_CLI_QUOTA_EXHAUSTED : refusal,
+      { ...boxCliUpstreamRefusalDiagnostic(record), ...quota });
     if (this.outputLimitResumeDue(record)) {
       // OCV5-368: the held max_tokens terminal is never sent; the next model
       // message continues this one and its usage is added to the bill.
@@ -551,6 +555,7 @@ export class BoxCliToolHandoffDecoder {
         throw new BoxCliToolHandoffError("BOX_TOOL_INIT_INVALID");
       }
       this.initSeen = true;
+      this.quota.bindNativeSession(record.session_id);
       return "";
     }
     if (record.type === "system" || record.type === "rate_limit_event") return "";
