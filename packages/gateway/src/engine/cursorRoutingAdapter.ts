@@ -6,6 +6,7 @@ import { withFreshPromptPrivacy, refreshRunnerPromptPrivacy, clearRunnerPromptPr
 import { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import {
+  isCc5TestModel,
   cursorCredentialModelFamily,
   cursorModelById,
   type GoalStateSnapshot,
@@ -514,7 +515,8 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   }
 
   requiresReopenForModel(model: string | undefined): boolean {
-    return cursorVariantFor(model, this.credentialSelection, this.opts.executionTarget) !== this.variant
+    return isCc5TestModel(model)
+      || cursorVariantFor(model, this.credentialSelection, this.opts.executionTarget) !== this.variant
   }
   isUserCancellationResult(summary: TurnSummary): boolean {
     return this.inner.isUserCancellationResult?.(summary) ?? false

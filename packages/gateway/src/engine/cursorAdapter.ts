@@ -42,6 +42,7 @@ import { buildPromptContext } from '../promptSlots.js'
 import { issueParentCallerToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
 import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
+import { Cc5InteractiveAdapter } from './cc5InteractiveAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import {
   CREDIT_EXHAUSTED_DETAIL,
@@ -2842,8 +2843,7 @@ export const _internals = {
 }
 
 registerEngine('cursor', (opts) => {
-  // Task route must never enter credential selection, including while disabled.
-  // The dedicated bridge is added in the next slice; until then reject here.
-  if (isCc5TestModel(opts.model)) throw new Error('CC5_TEST_BRIDGE_NOT_READY')
+  // Resolve this route before constructing any real credential-pool selector.
+  if (isCc5TestModel(opts.model)) return new Cc5InteractiveAdapter(opts)
   return new CursorRoutingAdapter(opts)
 })

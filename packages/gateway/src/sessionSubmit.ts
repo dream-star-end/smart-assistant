@@ -1,3 +1,4 @@
+import { isCc5ResumeId } from './engine/cc5ResumeId.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
@@ -1038,6 +1039,9 @@ export async function submit(
     }
     const spawnCwd = this._cursorWorkspacePathForSession(session)
     const liveNativeId = session.runner.nativeSessionId
+    if (isCc5ResumeId(liveNativeId) || isCc5ResumeId(this._resumeMap.get(session.sessionKey))) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
     const liveBoxId =
       session.providerTag === 'cursor' ? cursorSandBoxCcResumeInnerId(liveNativeId) : undefined
     const liveSandJsonlId =
@@ -2802,6 +2806,7 @@ export function _resumeIdFor(
 ): string | undefined {
   const id = this._resumeMap.get(sessionKey)
   if (!id) return undefined
+  if (isCc5ResumeId(id)) throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
   let tag = normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
   // A false "no transcript" drop used to delete the provider and let the
   // live-session overlay save the same id back as implicit ccb. The Fast

@@ -76,8 +76,12 @@ Approved C profile disables all builtins, ambient settings/MCP and slash
 commands, exposing only one stdio MCP tool. The tool accepts only fixed
 operationId; it preserves JSON-RPC id and _meta.claudecode/toolUseId separately.
 The operation is bound to trusted testUID/session/turn/nativeSession/toolUseId/
-operationId/full-container-ID/parameter hash. The real command runs in the new
-personal execution fixture via execd, with actual terminal commandId/exit0.
+operationId/full-container-ID/parameter hash. For this temporary test slice, the real fixed command runs as a child of the
+bridge in the NEW personal execution container, with an actual process receipt
+and terminal exit0; it does not claim to use execd. P0 execd proof remains
+separate, and full P3 must still supply its formal execution-runtime ports.
+This narrow substitution was independently plan-reviewed APPROVED by
+research_review (round 1/3); no arbitrary command/path is accepted.
 Dispatch is recorded once before effect; duplicates read a terminal receipt,
 post-dispatch disconnect is unknown and never retries. No native cc5 Bash/Read.
 
