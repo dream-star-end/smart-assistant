@@ -51,7 +51,7 @@ const BEHAVIOR = [
   "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes",
   "[ocv5-530-agy-host-path] PASS — Antigravity launch login shell resolves only the selfhost host wrapper; neighbouring user shims stay off PATH",
   "[go-websearch-server-tool] PASS — official WebSearch side requests on Go chat/responses bridges are answered from platform search with zero usage and no upstream call; mixed requests keep only function tools",
-  "[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error with no automatic recovery",
+  "[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error recovered only through fresh master admission and a safe checkpoint",
   "[box-stopped-precheck] PASS — late proven Box stops release retained credit reservations without charging",
   "[box-login-expired-stop-reason] PASS — an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p",
 ];

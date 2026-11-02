@@ -7,14 +7,14 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { supportsAutomaticTurnRecovery } from '@openclaude/protocol'
+import { supportsAutomaticTurnRecovery, supportsAutomaticRecoveryWithoutCheckpoint } from '@openclaude/protocol'
 import { normalizeAntigravityErrorDetail } from '../engine/antigravityAdapter.js'
 import { cleanupAntigravityLaunch, projectAntigravityPlatform } from '../engine/antigravityPlatform.js'
 import { classifyRunError } from '../errorClassify.js'
 import { historicalContextInjectionKey, providerGapMessagesAfterOwnTurn } from '../sessionManager.js'
 
 export const RESUME_AGY_CRED_PROOF =
-  '[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error with no automatic recovery'
+  '[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error recovered only through fresh master admission and a safe checkpoint'
 
 /** Run inside a private OPENCLAUDE_HOME; returns the receipt line. */
 export function proveResumeAgyCred(): string {
@@ -78,6 +78,7 @@ export function proveResumeAgyCred(): string {
   )
   const code = classifyRunError(detail).code
   assert.equal(code, 'platform_credential_expired', 'AGY_CRED_NOT_PLATFORM_ERROR')
-  assert.equal(supportsAutomaticTurnRecovery(code), false, 'AGY_CRED_AUTO_RECOVERS')
+  assert.equal(supportsAutomaticTurnRecovery(code), true, 'AGY_CRED_MASTER_RECOVERY_MISSING')
+  assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false, 'AGY_CRED_UNPROVEN_REPLAY')
   return RESUME_AGY_CRED_PROOF
 }

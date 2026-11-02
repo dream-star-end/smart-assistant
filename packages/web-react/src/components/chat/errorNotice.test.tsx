@@ -140,8 +140,8 @@ describe("自动重试耗尽 / 暂停的终态卡", () => {
       onContinueInterrupted, resolveInterruptedContinuation: () => ({ id: "root", role: "user", text: "目标", ts: 0 } as ChatMessage) });
     expect(card).toHaveTextContent("自动重试已停止");
     expect(card).toHaveTextContent(USER_ERROR_CATALOG[code]!.message);
-    expect(within(card).getAllByRole("button").slice(0, 2).map((b) => b.textContent)).toEqual(["继续", "切换模型"]);
-    fireEvent.click(within(card).getByRole("button", { name: "继续" }));
+    expect(within(card).getAllByRole("button").slice(0, 2).map((b) => b.textContent)).toEqual(["重试", "联系管理员"]);
+    fireEvent.click(within(card).getByRole("button", { name: "重试" }));
     expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
     expect(onRegenerate).not.toHaveBeenCalled();
     // 服务端兼容正文不再另画一遍,也不挂复制 / 评价这类回答动作。

@@ -11,6 +11,6 @@ export const UserErrorSchema = Type.Object({
   message: Type.String(),
   actions: Type.Array(Type.Union(([
     'retry', 'switch_model', 'contact_admin', 'edit_message', 'relogin',
-    'refresh', 'topup', 'new_session', 'wait', 'check_settings',
+    'refresh', 'topup', 'new_session', 'wait', 'check_settings', 'split_upload',
   ] as const).map((value) => Type.Literal(value)))),
 })

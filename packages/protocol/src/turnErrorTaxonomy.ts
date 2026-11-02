@@ -98,15 +98,14 @@ export const TURN_ERROR_TAXONOMY = {
   engine_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   internal_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   auth_error: { retryable: false, cta: 'relogin' },
-  /** gateway errorClassify: a platform-issued engine credential expired mid-turn
-   * (OCV5-556). The next message gets a fresh one, so a manual retry works;
-   * automatic recovery would replay the same failure. */
-  platform_credential_expired: { retryable: true, cta: 'retry' },
+  /** Master durable recovery re-enters admission and mints a fresh credential.
+   * Never retry inside the gateway with the expired launch credential. */
+  platform_credential_expired: { retryable: true, automaticRecovery: true, cta: 'retry' },
   /** gateway errorClassify: the Box proxy refused the turn with 409
    * BOX_CAPACITY_HELD before any model call (OCV5-649). The session's slot is
-   * still held by an earlier run, so automatic recovery only waits on the same
-   * hold again; a manual retry after it is released works. */
-  box_capacity_held: { retryable: true, cta: 'retry' },
+   * still held by an earlier run. Master recovery backs off within the shared
+   * budget; the ordinary checkpoint/replay safety gates still apply. */
+  box_capacity_held: { retryable: true, automaticRecovery: true, cta: 'retry' },
   service_restart: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
   session_persist_unavailable: { retryable: true, cta: 'retry' },
   /** Soft-deleted conversation. Same-peer retry cannot revive it; restore from

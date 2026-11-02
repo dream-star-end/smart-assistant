@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg'
 
-import { AUTOMATIC_TURN_RETRY_MAX } from '@openclaude/protocol'
+import { AUTOMATIC_TURN_RETRY_MAX, normalizeTurnErrorCode } from '@openclaude/protocol'
 
 import { durableRetryDelayMs } from './turnControlStore.js'
 import type { Queryable } from './turnDispatchStore.js'
@@ -68,9 +68,10 @@ export async function enqueueAutomaticRecoveryJob(
     `INSERT INTO turn_recovery_jobs (
        user_id,session_id,root_client_message_id,source_client_message_id,
        source_turn_key,error_code,recovery_mode,semantic_recovery_attempt,
-       request_json,tape_sha256
+       request_json,tape_sha256,next_attempt_at
      )
-     SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10
+     SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,
+       clock_timestamp()+($11::bigint * INTERVAL '1 millisecond')
      WHERE NOT EXISTS (
         SELECT 1 FROM turn_control_requests c
          WHERE c.user_id=$1 AND c.session_id=$2 AND c.kind='stop'
@@ -88,6 +89,8 @@ export async function enqueueAutomaticRecoveryJob(
       input.sourceClientMessageId, input.sourceTurnKey, input.errorCode,
       input.recoveryMode, input.semanticRecoveryAttempt,
       JSON.stringify(input.request), input.tapeSha256,
+      ['box_capacity_held', 'platform_credential_expired'].includes(normalizeTurnErrorCode(input.errorCode))
+        ? durableRetryDelayMs(input.semanticRecoveryAttempt) : 0,
     ],
   )
   return result.rowCount === 1

@@ -891,25 +891,21 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  // W3(#1206 错误目录):上下文超限的建议是精简这条消息或换更长上下文的模型,不再引导新建会话。
-  test("context_too_long →「修改消息」+「切换模型」,无重试类按钮", () => {
+  // W3: history fitting is a system responsibility; a terminal failure continues safely.
+  test("context_too_long offers continuation without asking users to trim or switch models", () => {
+    const onContinueInterrupted = vi.fn();
     const onEditResend = vi.fn();
     const onOpenModelPicker = vi.fn();
     renderErr(errMsg({ _errorCode: "context_too_long", _clientMessageId: "u1" }), {
-      onStartNewSession: vi.fn(),
-      onEditResend,
-      onOpenModelPicker,
-      onRetrySend: vi.fn(),
-      onRegenerate: vi.fn(),
-      resolveRetryTarget: () => retryableUser,
+      onContinueInterrupted, resolveInterruptedContinuation: () => retryableUser,
+      onEditResend, onOpenModelPicker, resolveRetryTarget: () => retryableUser,
     });
-    fireEvent.click(screen.getByRole("button", { name: "修改消息" }));
-    expect(onEditResend).toHaveBeenCalledWith(retryableUser);
-    fireEvent.click(screen.getByRole("button", { name: "切换模型" }));
-    expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("button", { name: "新建会话继续" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "修改消息" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "切换模型" })).toBeNull();
+    expect(onEditResend).not.toHaveBeenCalled();
+    expect(onOpenModelPicker).not.toHaveBeenCalled();
   });
 
   test("context_too_long 未接 onStartNewSession 时不渲染孤立按钮", () => {
