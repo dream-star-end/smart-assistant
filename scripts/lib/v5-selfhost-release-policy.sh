@@ -659,7 +659,7 @@ release_policy_finish_compensation() { # saga already restored exact predecessor
   served="$(release_policy_py field mayHaveServed)" || return 79
   digest="$(release_policy_probe_stack before)" || return $?
   # Confirm original full user gates, not only healthz, before releasing hold.
-  if cutover_smoke_against_release "$before"; then :; else return 79; fi
+  if cutover_smoke_against_release "$before" compensation; then :; else return 79; fi
   release_policy_require_owner || return 86
   cutover_persist_phase kept-failed || return 79
   cutover_disarm_survivor || return 79
@@ -746,6 +746,7 @@ release_policy_recover_forward() {
     return 0
   fi
   ( assert_master_release_static_gate "$rel" "$LEASE_TARGET_SHA" ) || return 79
+  model_policy_require_forward_release "$rel" || return 79
   state="$(release_policy_history_status)" || return 79
   if [[ "$state" == missing ]]; then
     release_policy_require_owner || return 86

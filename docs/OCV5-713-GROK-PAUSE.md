@@ -50,8 +50,8 @@ that would overwrite the real `.prev-release` pointer.
 
 ## This batch and failure rollback
 
-This batch is only #1344 + #1346 + #1348 + OCV5-713. It excludes #1345/#1343 and
-all commercial changes. Before registering a ride, record exact merged SHA,
+This batch is #1344 + #1346 + #1348 + OCV5-713 and its reviewed rollback-compatibility
+prerequisite. It excludes #1345/#1343 and all commercial changes. Before registering a ride, record exact merged SHA,
 previous complete master/runtime/platform tuple, health and available disk.
 Steward go is mandatory; this PR does not register or launch a train.
 
@@ -64,5 +64,10 @@ if required and authorized. Verify status/smoke/version/health and journal agree
 Do not repeat rollback if the baseline is already live: current pre-train .prev
 points to the failed 77a7 release, so blindly repeating it would roll forward.
 Old9826 predates this switch; rolling back code can re-expose Grok. Report that
-explicitly and do not call old C3 green. Prefer a controlled false-policy release
-for a later Grok-only withdrawal rather than editing production SQL or accounts.
+explicitly. The compatibility path verifies the complete predecessor and runs its
+original child probes with Codex+DeepSeek continuation, retaining the current
+prewarm supervisor and G1/S1. It does not assert that Grok works. All required
+checks must actually pass before a rollback can be called complete; health alone
+is not sufficient. See [the compatibility contract](OCV5-713-ROLLBACK-COMPAT.md).
+Use a controlled false-policy release for a later Grok-only withdrawal rather
+than editing production SQL or accounts.

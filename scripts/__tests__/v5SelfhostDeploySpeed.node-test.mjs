@@ -13,8 +13,9 @@ function fn(s,n){const match=s.match(new RegExp('^'+n+'\\(\\) \\{[^\\n]*\\n[\\s\
 function block(s,startRe,endRe){const a=s.search(startRe);assert.ok(a>=0,String(startRe));const rest=s.slice(a);const b=rest.search(endRe);assert.ok(b>0,String(endRe));return rest.slice(0,b);}
 const hostPolicy=readFileSync(join(root,'scripts/lib/v5-selfhost-host-log-policy.sh'),'utf8');
 const hostPolicyFiles=['scripts/v5-selfhost-host-log-policy.py','deploy/v5-selfhost/host-log-policy.json','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost-egress-watch'];
+const modelPolicyFiles=['deploy/v5-selfhost/model-availability.json','scripts/lib/selfhost-model-policy.mjs','packages/commercial/src/billing/modelAvailability.ts'];
 const q=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
-const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'master_seed_frontend_buildinfo'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
+const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',`source ${q(join(root,'scripts/lib/v5-selfhost-model-policy.sh'))}`,block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'master_seed_frontend_buildinfo'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
 const asRoot=typeof process.getuid==='function'&&process.getuid()===0;
 function fixture(t){
  const dir=mkdtempSync(join(tmpdir(),'oc-deploy-speed-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const repo=join(dir,'repo');
@@ -59,7 +60,7 @@ function release(f,name,{key:k,html='<html><head><meta name="oc-build" content="
  mkdirSync(join(rel,'node_modules/tsx'),{recursive:true});mkdirSync(join(rel,'deploy/v5'),{recursive:true});
  writeFileSync(join(rel,'package.json'),'{}');writeFileSync(join(rel,'deploy/v5/release-metadata.json'),'{}');
  writeFileSync(join(rel,'VERSION.json'),JSON.stringify({commit:f.base.slice(0,9)}));
- for(const policyPath of hostPolicyFiles){const target=join(rel,policyPath);mkdirSync(join(target,'..'),{recursive:true});writeFileSync(target,readFileSync(join(root,policyPath)));}
+ for(const policyPath of [...hostPolicyFiles,...modelPolicyFiles]){const target=join(rel,policyPath);mkdirSync(join(target,'..'),{recursive:true});writeFileSync(target,readFileSync(join(root,policyPath)));}
  if(poison)writeFileSync(join(rel,'.poisoned'),'');
  if(record)ok(bash(f,webLib,'write_web_dist_reuse_record '+q(rel)+' '+q(k)+' built '+q(f.base)));
  if(seal)ok(bash(f,webLib,'write_strong_release_marker_local '+q(rel)+' '+q(f.base)+' '+q(f.base.slice(0,9))+' 20261008-000000 2'));
@@ -214,7 +215,7 @@ test('P2: bg build starts after admission; non-Box gates overlap it; Box gates a
  // P3 aggregates overlapping jobs under C.parallel; each still has its own receipt.
  assert.deepEqual(marks.map(x=>x[0]),['C.parallel',...after]);
  const queued=[...b.matchAll(/^ {4}(C\.[a-z-]+):master_job_/gm)].map(x=>x[1]);
- assert.equal(queued.length,12);assert.equal(new Set(queued).size,12);
+ assert.deepEqual(queued,['C.session-rootfix','C.watch-gate','C.cursor-sand','C.delegate-billing','C.callback-ws','C.cron-submit','C.prompt-privacy','C.session-boundary','C.system-approval','C.system-executor','C.host-log-policy','C.model-policy','C.architecture']);
  assert.ok(at('  if ! master_build_jobs_wait;')<wait,'C/D drained before runtime/Box barrier');
  for(const g of after)assert.ok(marks.some(([n])=>n===g),g);
  // the first Box gate's mark opens its phase, then the await (OCV5-557 wait is counted inside that phase)
