@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import type { BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { compareBoxResult, projectBoxResult } from "./boxResultSemantics.js";
 import { recordBoxContinuationCompatibility, recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
+import { summarizeBoxFailureValue, type BoxFailureDiagnostic } from "./boxFailureEvidence.js";
 
 type ExpectedEcho = Pick<BoxMatchedToolResult,
   "modelToolUseId" | "contentHash" | "isError">
@@ -117,10 +118,25 @@ function cliTransformed(echoed: EchoBlock[], expected: ExpectedEcho): boolean {
 }
 
 export class BoxToolResultEchoError extends Error {
-  constructor(readonly code: string) {
+  constructor(readonly code: string, readonly boxFailureDiagnostic?: BoxFailureDiagnostic) {
     super(code); this.name = "BoxToolResultEchoError";
     recordBoxContinuationRejection("echo", code);
   }
+}
+
+function echoDiagnostic(expected: ExpectedEcho, observed: EchoBlock[], observedHash: string,
+  branch: BoxFailureDiagnostic["branch"] = "echo_content"): BoxFailureDiagnostic {
+  const published = expected.content;
+  const expectedSummary = summarizeBoxFailureValue(published);
+  const observedSummary = summarizeBoxFailureValue(observed);
+  return { branch, hashOnly: published === undefined,
+    ...(published === undefined ? {} : { expectedBlocks: published.length }),
+    observedBlocks: observed.length,
+    expectedType: summarizeBoxFailureValue(published?.[0]).type,
+    observedType: summarizeBoxFailureValue(observed[0]).type,
+    expectedSha256: expected.contentHash, observedSha256: observedHash,
+    ...(expectedSummary.bytes === undefined ? {} : { expectedBytes: expectedSummary.bytes }),
+    ...(observedSummary.bytes === undefined ? {} : { observedBytes: observedSummary.bytes }) };
 }
 function obj(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -174,14 +190,16 @@ export class BoxToolResultEcho {
         content: normalized, isError })).digest("hex");
       const expected = this.expected.get(id)!;
       if (isError !== expected.isError) {
-        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH",
+          echoDiagnostic(expected, normalized, hash, "echo_error_bit"));
       }
       const compared = expected.content
         ? compareBoxResult(projection, expected.content) : "incompatible";
       const warning = projection.unknownShape || envelopeChanged
         ? (projection.opaque ? "opaque_content" : "envelope") : undefined;
       if (warning && !expected.content) {
-        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH",
+          echoDiagnostic(expected, normalized, hash, "unsupported_shape"));
       }
       if (hash !== expected.contentHash && compared === "incompatible") {
         const first = normalized[0];
@@ -189,7 +207,8 @@ export class BoxToolResultEcho {
           throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CLI_BACKGROUNDED");
         }
         if (!expected.content || !possibleCliRewrite(normalized, expected.content as EchoBlock[])) {
-          throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+          throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH",
+            echoDiagnostic(expected, normalized, hash));
         }
         // Known lossy representations (empty markers / persisted previews /
         // source notes) still require their complete existing proof.
@@ -204,7 +223,10 @@ export class BoxToolResultEcho {
     this.deferred = [];
     for (const item of pending) {
       if (!cliTransformed(item.echoed, item.expected)) {
-        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+        const hash = createHash("sha256").update(JSON.stringify({
+          content: item.echoed, isError: item.expected.isError })).digest("hex");
+        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH",
+          echoDiagnostic(item.expected, item.echoed, hash));
       }
       if (item.warning) recordBoxContinuationCompatibility("echo", item.warning);
     }

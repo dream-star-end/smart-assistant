@@ -11,7 +11,9 @@ import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { BoxToolResultEcho, BoxToolResultEchoError } from "./boxToolResultEcho.js";
 import { boxCliNativeResumeVerified } from "./boxCliVersion.js";
 import type { BoxToolPublishedResume } from "./boxToolResumePublish.js";
-import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { BoxSpoolTerminalError, isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { boxFailureFromError } from "./boxFailureEvidence.js";
+import { rootLogger } from "../../logging/logger.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxContextHash } from "./boxCallFingerprint.js";
@@ -23,6 +25,8 @@ import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 
+const continuationLog = rootLogger.child({ subsys: "box-tool-continuation" });
+
 export class BoxToolContinuationError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolContinuationError"; }
 }
@@ -31,7 +35,7 @@ export type BoxToolContinuationResult =
   | { kind: "final"; proof: BoxTerminalProof; nativePointer?: BoxNativePointer };
 type Journal = Pick<BoxDurableJournal, "recordToolHandoff" |
   "completeToolChain" | "markUnknown">
-  & Partial<Pick<BoxDurableJournal, "attachNativePointer">>;
+  & Partial<Pick<BoxDurableJournal, "attachNativePointer" | "recordFirstFailure">>;
 
 export async function runBoxToolContinuation(input: {
   published: BoxToolPublishedResume;
@@ -70,6 +74,7 @@ export async function runBoxToolContinuation(input: {
   void aborted.catch(() => {});
   const race = <T>(value: Promise<T>): Promise<T> => Promise.race([value, aborted]);
   let unknownNotified = false;
+  let observedTerminalProof: BoxTerminalProof | undefined;
   const unknown = async (phase: string): Promise<void> => {
     if (unknownNotified) return;
     unknownNotified = true;
@@ -107,7 +112,10 @@ export async function runBoxToolContinuation(input: {
     const echo = new BoxToolResultEcho(claim.results);
     let modelStarted = false;
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access,
-      startOffset: claim.spoolOffset, deadlineMs: budget, signal })) {
+      startOffset: claim.spoolOffset, deadlineMs: budget, signal,
+      terminal: { accountId: target.accountId, expectedAccountId: claim.accountId,
+        runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch } })) {
+      observedTerminalProof = line.terminalProof ?? observedTerminalProof;
       let record: unknown;
       try { record = JSON.parse(line.text); }
       catch { throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_RECORD_INVALID"); }
@@ -143,6 +151,8 @@ export async function runBoxToolContinuation(input: {
       const decoded = decoder.push(line.text);
       if (decoded.sse) input.emit(decoded.sse);
       if (decoded.candidate) {
+        if (observedTerminalProof) throw new BoxSpoolTerminalError({
+          proof: observedTerminalProof, accountId: target.accountId });
         const candidate = decoded.candidate;
         const pending = new Set<string>();
         const until = Date.now() + 5000;
@@ -177,8 +187,12 @@ export async function runBoxToolContinuation(input: {
         return { kind: "tool_handoff", spoolOffset: line.endOffset };
       }
       if (decoded.finalCandidate) {
+        if (observedTerminalProof && observedTerminalProof.reason !== "worker_complete") {
+          throw new BoxSpoolTerminalError({ proof: observedTerminalProof,
+            accountId: target.accountId });
+        }
         const final = decoded.finalCandidate;
-        let proof: BoxTerminalProof | null = null;
+        let proof: BoxTerminalProof | null = observedTerminalProof ?? null;
         const until = Date.now() + 20_000;
         while (!proof && Date.now() < until && !signal.aborted) {
           try { proof = await race(readBoxTerminalProof({ target,
@@ -190,8 +204,11 @@ export async function runBoxToolContinuation(input: {
             await new Promise<void>((resolve) => setTimeout(resolve, 50));
           }
         }
-        if (!proof || proof.reason !== "worker_complete") {
+        if (!proof) {
           throw new BoxToolContinuationError("BOX_TOOL_TERMINAL_UNPROVEN");
+        }
+        if (proof.reason !== "worker_complete") {
+          throw new BoxSpoolTerminalError({ proof, accountId: target.accountId });
         }
         // The terminal marker proves no writer remains. Read from the result
         // line's exact byte end, not the enclosing chunk end: any trailing
@@ -255,7 +272,32 @@ export async function runBoxToolContinuation(input: {
       }
     }
     throw new BoxToolContinuationError("BOX_TOOL_STREAM_INCOMPLETE");
-  } catch (error) {
+  } catch (caught) {
+    const decoderFailure = caught instanceof BoxCliToolHandoffError
+      || caught instanceof BoxToolResultEchoError
+      || caught instanceof BoxToolContinuationError
+        && /^(BOX_CLI_COMPACT_|BOX_TOOL_(CONTINUATION_RECORD_INVALID|ECHO_AFTER_MODEL)$)/.test(caught.code);
+    const error = observedTerminalProof && decoderFailure
+      ? new BoxSpoolTerminalError({ proof: observedTerminalProof,
+        accountId: target.accountId, cause: caught }) : caught;
+    const failure = boxFailureFromError(caught instanceof BoxSpoolTerminalError
+      ? caught.cause ?? caught : caught, "continuation")
+      ?? boxFailureFromError(error, "continuation");
+    if (failure && deps.journal.recordFirstFailure) {
+      let failureTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([deps.journal.recordFirstFailure({ requestId: input.requestId,
+          uid: input.uid, accountId: claim.accountId, runNonce: claim.runNonce,
+          leaseEpoch: claim.leaseEpoch, ownerRequestId: claim.ownerRequestId, ...failure }),
+        new Promise<never>((_, reject) => {
+          failureTimer = setTimeout(() => reject(new Error("BOX_FAILURE_RECORD_TIMEOUT")), 5_000);
+        })]);
+      } catch {
+        continuationLog.warn("box_first_failure_record_failed", {
+          requestId: input.requestId, phase: "continuation" });
+      } finally { if (failureTimer) clearTimeout(failureTimer); }
+    }
+    if (error instanceof BoxSpoolTerminalError || observedTerminalProof) throw error;
     // OCV5-313: a rejected result echo is named so the stop paths can end
     // this run at once; nothing it writes afterwards can be delivered.
     // OCV5-328 / OCV5-377: the same holds when the decoder rejects the stream
