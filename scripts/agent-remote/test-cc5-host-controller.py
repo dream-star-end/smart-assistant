@@ -130,6 +130,32 @@ class ProfileTests(unittest.TestCase):
                 close.assert_called_with(987)
             with self.assertRaisesRegex(RuntimeError, 'runtime-or-session-present'): mod.prove_stopped(root)
 
+    def test_repeated_inspection_retains_a_real_live_old_descendant_and_blocks_relaunch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            child = Popen([sys.executable, '-c', 'import time; time.sleep(15)'])
+            try:
+                old_child = mod.process_record(child.pid)
+                host = {'pid': 2000000000, 'startTicks': '1'}
+                mod.write_lifecycle(root, info, {'host': host, 'claude': None, 'descendants': [old_child]})
+                # It no longer appears in a later ancestor scan, but remains alive.
+                mod.write_lifecycle(root, info, {'host': host, 'claude': None, 'descendants': []})
+                saved = (root / 'LIFECYCLE.json').read_bytes()
+                self.assertIn(old_child, json.loads(saved)['descendants'])
+                with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.prove_stopped(root)
+                with patch.object(mod.os, 'execve') as execute:
+                    with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.launch(root)
+                    execute.assert_not_called()
+                self.assertEqual((root / 'LIFECYCLE.json').read_bytes(), saved)
+                child.terminate()
+                child.wait(timeout=3)
+                with redirect_stdout(io.StringIO()): mod.prove_stopped(root)
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                    child.wait(timeout=3)
+
     def test_cleanup_refuses_own_live_process_or_main_setup_session(self):
         for case in ('live', 'main', 'setup', 'stopped'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:

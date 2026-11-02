@@ -350,8 +350,22 @@ def descendants_of(pid):
 
 
 def write_lifecycle(root, info, processes):
-    data = canonical({'version': 1, 'root': str(root), 'session': info['session'], **processes})
     path = root / 'LIFECYCLE.json'
+    history = []
+    if path.exists():
+        previous = json.loads(read_private(path))
+        require(previous['version'] == 1 and previous['root'] == str(root) and
+                previous['session'] == info['session'], 'wrong-previous-lifecycle-record')
+        history = [previous['host'], previous['claude'], *previous['descendants']]
+    observed = {}
+    for item in [*history, *processes['descendants']]:
+        if item is None:
+            continue
+        require(type(item['pid']) is int and item['pid'] > 1 and str(item['startTicks']).isdecimal(),
+                'bad-previous-lifecycle-process')
+        observed[(item['pid'], item['startTicks'])] = {'pid': item['pid'], 'startTicks': item['startTicks']}
+    processes = {**processes, 'descendants': list(observed.values())}
+    data = canonical({'version': 1, 'root': str(root), 'session': info['session'], **processes})
     stage = root / 'LIFECYCLE.partial'
     fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'wb') as stream:
@@ -412,6 +426,8 @@ def launch(root):
            'OC_BOX_MOD_SHA256': info['pluginDigest'], 'OC_BOX_READY_MS': '20000'}
     claude_executable(root, info, full_hash=True)
     cli_args = profile_args(root, info)
+    if (root / 'LIFECYCLE.json').exists():
+        prove_stopped(root, emit=False)  # A new launch cannot erase an unproved old writer.
     write_lifecycle(root, info, {'host': process_record(os.getpid()), 'claude': None, 'descendants': []})
     os.chdir(info['cwd'])
     # fd0 is never read here: it belongs exclusively to the original host.
