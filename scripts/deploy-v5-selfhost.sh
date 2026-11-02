@@ -2012,17 +2012,6 @@ cmd_bootstrap() {
 2) 联系维护者跑带 joint 的首次 bootstrap,或先手工写 env/网再 --deploy。"
 }
 
-explain_dirty_semantics() {
-  log "── 脏工作树三面语义 ──"
-  log "  master live     : git archive HEAD → 脏文件不会进线上进程 cwd"
-  log "  runtime-release : git archive HEAD → 脏文件不会进容器 bind"
-  if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
-    log "  platform bundle : --platform-from-head → 也从已提交树 archive,不带脏"
-  else
-    log "  platform bundle : 默认拷工作树 → 未提交的 platform-runtime 会进全员容器"
-    log "                    要干净请加 --platform-from-head"
-  fi
-}
 
 # 发布前 Incident trailer 快检。放在 lease_train_begin 之后、构建之前:
 #   · 之后 —— 失败要经 EXIT trap 把本班 train 记 failed(worker 对同 target 不自动重发,

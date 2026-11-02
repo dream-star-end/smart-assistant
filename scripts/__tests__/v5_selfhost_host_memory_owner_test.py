@@ -403,25 +403,75 @@ exit "$rc"
 
 
 class OriginalFinalizerTests(OwnerFixture):
-    def run_finalizer(self, *, collector=True, hook_rc=0, watch_rc=0, watch_same=True, owner=True):
+    def run_finalizer(self, *, collector=True, hook_rc=0, watch_rc=0, watch_same=True,
+                      owner=True, cc5_rc=0, lose_owner_after_cc5=False,
+                      forward=False, reenter=False):
         candidate = self.candidate(collector)
+        (self.root / "cc5.state").write_text("applied\n")
+        (self.root / "policy.hold").write_text("held\n")
         env = self.environment()
         env.update(CANDIDATE=str(candidate), HOOK_RC=str(hook_rc), WATCH_RC=str(watch_rc),
-                   WATCH_SAME="1" if watch_same else "0", OWNER="1" if owner else "0")
+                   WATCH_SAME="1" if watch_same else "0", OWNER="1" if owner else "0",
+                   CC5_RC=str(cc5_rc), LOSE_OWNER_AFTER_CC5="1" if lose_owner_after_cc5 else "0")
         stubs = r'''
 set -u
+LEASE_TRAIN_ID=tr-owner-fixture-001
+RELEASE_POLICY_GATES_PASSED=1
+V5_ENV=/fixture/env
 event() { printf '%s\n' "$*" >>"$FIXTURE_ROOT/finalizer.events"; }
 release_policy_require_owner() { event owner; [[ "$OWNER" == 1 ]]; }
 cutover_persist_phase() { event "persist:$1"; }
 cutover_disarm_survivor() { event disarm; }
 persist_selfhost_model_authority_cutover() { event "authority:$1"; }
 sync_boot_scripts_from() { event "boot:$1"; }
+cc5_activation_finalize() {
+  event cc5:finalize
+  [[ "$CC5_RC" == 0 ]] || return "$CC5_RC"
+  local state
+  IFS= read -r state <"$FIXTURE_ROOT/cc5.state"
+  if [[ "$state" == committed ]]; then
+    event cc5:already-committed
+  else
+    printf 'committed\n' >"$FIXTURE_ROOT/cc5.state"
+    event cc5:committed
+  fi
+  [[ "$LOSE_OWNER_AFTER_CC5" == 0 ]] || OWNER=0
+  return 0
+}
 sync_watch_from() { event "watch:$1"; return "$WATCH_RC"; }
 watch_install_state() { event state; [[ "$WATCH_SAME" == 1 ]] && printf 'same\n' || printf 'different\n'; }
 host_memory_sampler_finalize() { event "hook:$1"; return "$HOOK_RC"; }
+release_policy_probe_stack() { event "probe:$1"; printf 'fixture-digest\n'; }
+release_policy_history_status() { printf 'applied\n'; }
+oc_hotcfg_fsync_path() { :; }
+dirname() { printf '/fixture\n'; }
+release_policy_py() {
+  case "$1:$2" in
+    field:history.path) printf '/fixture/history\n' ;;
+    verify-resolution:target) event verify-resolution ;;
+    resolve:forward) event resolve:forward; printf 'resolved\n' >"$FIXTURE_ROOT/policy.hold" ;;
+    *) event FORBIDDEN-POLICY-ACTION; return 99 ;;
+  esac
+}
+lease_train_finish() { event "finish:$1:$LEASE_TRAIN_ID"; }
+clear_stay_maintenance() { :; }
+oc_hotcfg_rotate_env_baks() { :; }
+cutover_clog() { event "log:$*"; }
 '''
         script = stubs + "\n" + function_body(LIB / "v5-selfhost-release-policy.sh", "release_policy_original_finalizer")
-        script += '\nif release_policy_original_finalizer "$CANDIDATE"; then rc=0; else rc=$?; fi\nexit "$rc"\n'
+        action = "release_policy_original_finalizer"
+        if forward:
+            script += "\n" + function_body(LIB / "v5-selfhost-release-policy.sh", "release_policy_finalize_forward")
+            action = "release_policy_finalize_forward"
+        script += '\nif ' + action + ' "$CANDIDATE"; then rc=0; else rc=$?; fi\n'
+        if reenter:
+            script += r'''
+[[ "$rc" == 79 ]] || exit 95
+event "retry:$LEASE_TRAIN_ID"
+HOOK_RC=0
+if release_policy_finalize_forward "$CANDIDATE"; then rc=0; else rc=$?; fi
+'''
+        script += 'exit "$rc"\n'
         result = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", script],
                                 cwd=self.root, env=env, capture_output=True, text=True, timeout=10)
         events = (self.root / "finalizer.events").read_text().splitlines()
@@ -434,6 +484,50 @@ host_memory_sampler_finalize() { event "hook:$1"; return "$HOOK_RC"; }
         self.assertEqual(sum(item.startswith("hook:") for item in events), 1)
         self.assertIn("persist:committed", events)
         self.assertIn("disarm", events)
+        self.assertLess(events.index("cc5:committed"), events.index("watch:" + str(candidate)))
+
+    def test_cc5_failure_holds_before_watch_sampler_or_resolution(self):
+        result, events, _ = self.run_finalizer(cc5_rc=79, forward=True)
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertEqual(events[-1], "cc5:finalize")
+        self.assertFalse(any(item.startswith(("watch:", "hook:", "finish:", "resolve:")) for item in events))
+        self.assertEqual((self.root / "cc5.state").read_text().strip(), "applied")
+        self.assertEqual((self.root / "policy.hold").read_text().strip(), "held")
+
+    def test_sampler_failure_preserves_committed_cc5_and_application_hold(self):
+        result, events, candidate = self.run_finalizer(hook_rc=79, forward=True)
+        self.assertEqual(result.returncode, 79, result.stderr)
+        self.assertEqual(events[-1], "hook:" + str(candidate))
+        self.assertEqual((self.root / "cc5.state").read_text().strip(), "committed")
+        self.assertEqual((self.root / "policy.hold").read_text().strip(), "held")
+        self.assertFalse(any(item.startswith(("finish:", "resolve:")) for item in events))
+
+    def test_sampler_owner_loss_86_never_reaches_terminal_or_resolution_writes(self):
+        result, events, candidate = self.run_finalizer(hook_rc=86, forward=True)
+        self.assertEqual(result.returncode, 86, result.stderr)
+        self.assertEqual(events[-1], "hook:" + str(candidate))
+        self.assertEqual((self.root / "policy.hold").read_text().strip(), "held")
+        self.assertFalse(any(item.startswith(("finish:", "resolve:")) for item in events))
+
+    def test_owner_loss_after_cc5_stops_before_watch_and_sampler(self):
+        result, events, _ = self.run_finalizer(lose_owner_after_cc5=True, forward=True)
+        self.assertEqual(result.returncode, 86, result.stderr)
+        self.assertEqual(events[-2:], ["cc5:committed", "owner"])
+        self.assertEqual((self.root / "policy.hold").read_text().strip(), "held")
+        self.assertFalse(any(item.startswith(("watch:", "hook:", "finish:", "resolve:")) for item in events))
+
+    def test_same_operation_reentry_closes_cc5_once_then_resolves_after_sampler(self):
+        result, events, candidate = self.run_finalizer(hook_rc=79, forward=True, reenter=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(events.count("cc5:committed"), 1)
+        self.assertEqual(events.count("cc5:already-committed"), 1)
+        self.assertEqual(events.count("hook:" + str(candidate)), 2)
+        retry = events.index("retry:" + TRAIN)
+        self.assertFalse(any(item.startswith(("finish:", "resolve:")) for item in events[:retry]))
+        self.assertEqual(events.count("finish:committed:" + TRAIN), 1)
+        self.assertEqual(events.count("resolve:forward"), 1)
+        self.assertLess(events.index("cc5:already-committed"), len(events) - 1 - events[::-1].index("hook:" + str(candidate)))
+        self.assertEqual((self.root / "policy.hold").read_text().strip(), "resolved")
 
     def test_hook_79_and_owner_86_propagate_unchanged(self):
         for code in (79, 86):
@@ -504,6 +598,7 @@ release_policy_py() { event FORBIDDEN-RESOLVE; return 99; }
 release_policy_recover_forward() { event FORBIDDEN-FORWARD; return 99; }
 cutover_persist_phase() { event FORBIDDEN-APP-WRITE; return 99; }
 release_policy_original_finalizer() { event FORBIDDEN-FINALIZER; return 99; }
+cc5_activation_finalize() { event FORBIDDEN-CC5-FINALIZE; return 99; }
 '''
         script = stubs + "\n" + function_body(LIB / "v5-selfhost-release-policy.sh", "release_policy_recover_host_memory")
         script += '\nif release_policy_recover_host_memory; then rc=0; else rc=$?; fi\nexit "$rc"\n'
@@ -604,6 +699,7 @@ RELEASE_POLICY_RESUME=1
 RELEASE_POLICY_SAMPLER_RESTORE=1
 release_policy_recover_host_memory() { printf 'RESTORE\n'; return 79; }
 release_policy_recover_forward() { printf 'FORBIDDEN-FORWARD\n'; return 0; }
+cc5_activation_finalize() { printf 'FORBIDDEN-CC5-FINALIZE\n'; return 99; }
 log() { printf 'FORBIDDEN-SUCCESS:%s\n' "$*"; }
 '''
         script = stubs + function_body(source, "cmd_deploy") + "\ncmd_deploy\n"
