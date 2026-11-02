@@ -9825,7 +9825,7 @@
       "occurredAt": "2026-11-02",
       "severity": "P1",
       "symptom": "Box CLI明确的订阅窗口额度耗尽被归为普通瞬时限流，平台继续自动恢复；只对同运行会话结构化拒绝配对发出独立quota语义，停止SDK、gateway及客户端/服务端自动恢复，保留既有用户显式重试和持久化断点继续。普通短时限流保持原语义。",
-      "rootFixCommit": "3c0e97c21646c83b7750da3dd66d93bda75d38b6",
+      "rootFixCommit": "3c0e97c2",
       "regressions": [
         {
           "layer": "unit",
