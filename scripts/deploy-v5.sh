@@ -413,9 +413,9 @@ if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 \
   echo "✗ --defer-knowledge-planet-upgrade 仅允许与普通 deploy + --with-dist 同用" >&2
   exit 2
 fi
-if [[ -n "$RESUME_BUILT_RELEASE" ]]; then
+if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then
   [[ "$MODE" == deploy && "$WITH_DIST" == 1 && "$DRY" == 0 && "$RESTART_EGRESS" == 0 && "$ALLOW_UNVERIFIED_CI" == 0 && "$ALLOW_LEGACY_MANIFEST_MISSING" == 0 && "$HOT_CONFIG" == 0 && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 0 && "${V5_SMOKE_E2E:-1}" == 1 && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_CANARY_REQUIRE_COST:-1}" == 1 \
-    && "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 0 && -z "${OC_CAPMATRIX_COMPAT:-}" \
+    && "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 0 && "${OC_V5_SKIP_MUTATION_LEASE:-0}" == 0 && -z "${OC_CAPMATRIX_COMPAT:-}" \
     && "$ENABLE_BUNDLE_FLAG$ENABLE_RELEASE_FLAG$DISABLE_BUNDLE_FLAG$DISABLE_RELEASE_FLAG" == 0000 \
     && -z "$TARGET_RUNTIME_IMAGE$TARGET_RUNTIME_IMAGE_ID$EMERGENCY_INCIDENT$EMERGENCY_APPROVAL$EMERGENCY_COMMIT" ]] || {
     echo '✗ --resume-built-release requires ordinary --with-dist, all gates, existing axes; no force/waiver/image/egress/dry-run flags' >&2
@@ -8369,7 +8369,7 @@ deploy() {
   # reldir,代码+前端同一 release 共享一次翻转+重启;无 --with-dist 则硬链继承当前 dist)。
   # 背景(2026-07-10 事故):deploy 后紧跟 --dist 的成对重启会把刚续写的 turn 二次掐死 →
   # 蓝绿下天然一次翻转一次重启,不会再成对重启。
-  if [[ -n "$RESUME_BUILT_RELEASE" ]]; then
+  if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then
     prebuilt_resume_load || { local resume_rc=$?; echo '✗ prebuilt resume rejected; no build fallback, live untouched' >&2; exit "$resume_rc"; }
   else
     build_release || { echo "✗ build_release 失败,未激活任何 release(live 未改)" >&2; exit 1; }
@@ -8411,12 +8411,12 @@ deploy() {
     echo "  · 首次 direct timeline capability 升级改走普通单-master restart；runtime tuple 保持不变。"
     hc_bundle=0; hc_release=0; hc_any=0
   fi
-  if [[ -n "$RESUME_BUILT_RELEASE" && ( "$hc_bundle" != 1 || "$hc_release" != 1 ) ]]; then
+  if [[ -n "${RESUME_BUILT_RELEASE:-}" && ( "$hc_bundle" != 1 || "$hc_release" != 1 ) ]]; then
     echo '✗ prebuilt resume requires both existing runtime/platform axes; tuple not changed' >&2; exit 1
   fi
   if [[ "$hc_any" == 1 ]]; then
     echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release disable_bundle=$DISABLE_BUNDLE_FLAG disable_release=$DISABLE_RELEASE_FLAG)──"
-    if [[ -n "$RESUME_BUILT_RELEASE" ]]; then
+    if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then
       prebuilt_resume_select_runtime || { local resume_rc=$?; echo '✗ prebuilt runtime selection rejected' >&2; exit "$resume_rc"; }
     else
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
@@ -8425,7 +8425,7 @@ deploy() {
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
   fi
   commercial_wait_for_cutover_idle "$kp_previous_release" || { local idle_rc=$?; echo "✗ 未证明商业空窗,live 未切换" >&2; exit "$idle_rc"; }
-  if [[ -n "$RESUME_BUILT_RELEASE" ]]; then prebuilt_resume_recheck || exit $?; fi
+  if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then prebuilt_resume_recheck || exit $?; fi
   begin_planned_maintenance deploy "$RESTART_EGRESS"
   # RFC §1.2:进入不可逆翻转段(KP 门关闭 / release 激活 / egress)前活体断言远端 lease 仍持有。
   # 此刻 live master 仍未改,失活即 end maintenance 后干净退出(无 KP 门需回滚)。
@@ -11986,7 +11986,7 @@ fi
 maybe_run_ci_green_gate_for_mode || exit 1
 # egress surface gate 同样在 lease 外、只读:egress 面有变更却没带 --egress 直接拒,别等构建完才发现。
 assert_egress_surface_covered || exit 1
-if [[ -n "$RESUME_BUILT_RELEASE" ]]; then prebuilt_resume_prepare || exit 1; fi
+if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then prebuilt_resume_prepare || exit 1; fi
 v5_host_admission_for_mode || exit 1
 
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。

@@ -79,7 +79,10 @@ RESUME_BUILT_RELEASE="$FIX/record"; DRY=0; WITH_DIST=1; RESTART_EGRESS=0
 ssh() { shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }
 docker() { [[ "$1 $2" == 'image inspect' ]] || return 99; printf '%s\\n' "\${OBSERVED_IMAGE:-$FIX_IMAGE}"; }
 npx() { [[ "$1 $2" == '--no-install tsx' ]] || return 99; shift 2; node ${quote(path.join(repo, 'node_modules/tsx/dist/cli.mjs'))} "$@"; }
-export -f ssh docker npx
+getent() {
+  case "$1" in passwd) printf 'root:x:0:0:fixture:/root:/bin/bash\\n' ;; group) printf 'root:x:0:\\n' ;; *) return 99 ;; esac
+}
+export -f ssh docker npx getent
 systemctl() { cat "$FIX/unit"; }
 journalctl() { cat "$FIX/journal"; }
 # The fixture supplies checkout and remote-ref facts, never modifies a real branch.
@@ -238,9 +241,14 @@ echo SELECTED_EXACT`)
       assert.doesNotMatch(changed.stdout, /UNEXPECTED_ACTIVATION/)
       writeFileSync(path.join(fx.dir, 'record'), JSON.stringify(fx.record))
       for (const drift of ['OBSERVED_RUNTIME=/alien-runtime', 'OBSERVED_BUNDLE=/alien-bundle',
-        'OBSERVED_GENERATION=175', 'PREBUILT_RESUME_CONTROLLER_CI_AT=9999999999']) {
+        'OBSERVED_GENERATION=175', 'export FOREIGN_QUEUE=1', 'PREBUILT_RESUME_CONTROLLER_CI_AT=9999999999']) {
         const result = fx.run(`${fx.ready}; ${drift}; prebuilt_resume_recheck || exit 45; echo UNEXPECTED_ACTIVATION`)
         assert.notEqual(result.status, 0, drift + result.stdout + result.stderr)
+        assert.doesNotMatch(result.stdout, /UNEXPECTED_ACTIVATION/)
+      }
+      for (const bypass of ['OC_V5_SKIP_MUTATION_LEASE=1', 'MUTATION_LEASE_ACTIVE=0; MUTATION_LEASE_BYPASSED=1']) {
+        const result = fx.run(`${fx.ready}; ${bypass}; prebuilt_resume_recheck; echo UNEXPECTED_ACTIVATION`)
+        assert.equal(result.status, 86, bypass + result.stdout + result.stderr)
         assert.doesNotMatch(result.stdout, /UNEXPECTED_ACTIVATION/)
       }
     } finally { fx.close() }
@@ -473,13 +481,19 @@ describe('formal prebuilt resume original-build evidence', () => {
 })
 
 test('ordinary resume CLI keeps all live gates and rejects waiver or alternate lanes before side effects', () => {
-  const command = 'V5_DEPLOY_SOURCE_ONLY=1 source scripts/deploy-v5.sh --with-dist --resume-built-release=/tmp/fixture-resume.json "$@"; printf PARSED'
+  const command = 'if test "$FIXTURE_DETACHED_BRANCH" = 1; then git() { if test "$*" = "rev-parse --abbrev-ref HEAD"; then printf HEAD; else command git "$@"; fi; }; fi; V5_DEPLOY_SOURCE_ONLY=1 source scripts/deploy-v5.sh --with-dist --resume-built-release=/tmp/fixture-resume.json "$@"; printf PARSED'
   const invoke = (env: Record<string, string> = {}, args: string[] = []) => spawnSync('bash', ['-c', command, 'fixture', ...args], {
-    cwd: repo, env: { ...process.env, V5_SMOKE_E2E: '1', V5_SMOKE_TURN: '1', V5_CANARY_REQUIRE_COST: '1', OC_FINALIZE_SKIP_EGRESS_GATE: '0', OC_CAPMATRIX_COMPAT: '', ...env }, encoding: 'utf8', timeout: 10_000,
+    cwd: repo, env: { ...process.env, ALLOW_ANY_BRANCH: '1', FIXTURE_DETACHED_BRANCH: '0', V5_SMOKE_E2E: '1', V5_SMOKE_TURN: '1', V5_CANARY_REQUIRE_COST: '1', OC_FINALIZE_SKIP_EGRESS_GATE: '0', OC_V5_SKIP_MUTATION_LEASE: '0', OC_CAPMATRIX_COMPAT: '', ...env }, encoding: 'utf8', timeout: 10_000,
   })
-  assert.equal(invoke().status, 0)
+  const valid = invoke()
+  assert.equal(valid.status, 0, valid.stdout + valid.stderr)
+  const detached = invoke({ FIXTURE_DETACHED_BRANCH: '1' })
+  assert.equal(detached.status, 0, detached.stdout + detached.stderr)
+  const guarded = invoke({ FIXTURE_DETACHED_BRANCH: '1', ALLOW_ANY_BRANCH: '0' })
+  assert.equal(guarded.status, 1, guarded.stdout + guarded.stderr)
+  assert.doesNotMatch(guarded.stdout, /PARSED/)
   for (const env of [{ V5_SMOKE_E2E: '0' }, { V5_SMOKE_E2E: '2' }, { V5_SMOKE_TURN: '0' },
-    { V5_CANARY_REQUIRE_COST: '0' }, { OC_FINALIZE_SKIP_EGRESS_GATE: '1' }, { OC_CAPMATRIX_COMPAT: 'fixture' }]) {
+    { V5_CANARY_REQUIRE_COST: '0' }, { OC_FINALIZE_SKIP_EGRESS_GATE: '1' }, { OC_V5_SKIP_MUTATION_LEASE: '1' }, { OC_CAPMATRIX_COMPAT: 'fixture' }]) {
     const run = invoke(env)
     assert.equal(run.status, 2, run.stderr)
     assert.doesNotMatch(run.stdout, /PARSED/)

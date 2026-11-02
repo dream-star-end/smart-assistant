@@ -146,6 +146,10 @@ REMOTE
 
 prebuilt_resume_recheck() { # cheap authority/fencing check, also immediately after the live idle gate
   local controller now
+  [[ "${OC_V5_SKIP_MUTATION_LEASE:-0}" == 0 && "${MUTATION_LEASE_ACTIVE:-0}" == 1 && "${MUTATION_LEASE_BYPASSED:-0}" == 0 ]] || {
+    echo '✗ prebuilt resume requires an active, non-bypassed production mutation lease' >&2; return 86;
+  }
+  assert_development_release_queue || return 3
   [[ -n "$PREBUILT_RESUME_CONTROLLER_SHA" && "$PREBUILT_RESUME_CONTROLLER_CI_AT" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "$(sha256sum "$RESUME_BUILT_RELEASE" | cut -d' ' -f1)" == "$PREBUILT_RESUME_RECORD_SHA" ]] || return 1
   now="$(date +%s)"
