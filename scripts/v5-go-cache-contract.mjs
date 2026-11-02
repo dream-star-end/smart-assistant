@@ -11,6 +11,7 @@ import { performance } from 'node:perf_hooks'
 import WebSocket from 'ws'
 import { GO_CACHE_MODEL, assessGoCache, goCachePrompts } from './lib/user-contract-go-cache.mjs'
 import { tapResult } from './lib/user-contract.mjs'
+import { authorizeContractModelSwitch } from './lib/user-contract-switch-cost.mjs'
 
 const GO_CACHE_CASE = 'G1 OpenCode Go prompt cache hits across turns'
 
@@ -48,7 +49,10 @@ async function api(token, path, init = {}) {
   return r.json()
 }
 
-function turn(token, peer, model, cmid, text) {
+async function turn(token, peer, model, cmid, text) {
+  const approval = await authorizeContractModelSwitch((path, init) => api(token, path, init), {
+    sessionId: peer, requestId: cmid, targetModel: model, agentId: 'main', text, mediaCount: 0,
+  })
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${base.replace(/^http/, 'ws')}/ws/user-chat-bridge`, [
       'bearer',
@@ -73,6 +77,7 @@ function turn(token, peer, model, cmid, text) {
           clientMessageId: cmid,
           content: { text },
           model,
+          ...(approval.consent ? { modelSwitchConsent: approval.consent } : {}),
           ts: Date.now(),
         }),
       ),
