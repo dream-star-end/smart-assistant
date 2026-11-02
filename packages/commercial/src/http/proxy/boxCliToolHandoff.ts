@@ -7,7 +7,9 @@
  */
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
   isBoxCliOutputLimitResume, isBoxCliSyntheticUser } from "./boxCliCompaction.js";
-import { BOX_CLI_MODEL_REFUSED, boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
+import { BOX_CLI_MODEL_REFUSED, boxCliUpstreamRefusal,
+  boxCliUpstreamRefusalDiagnostic } from "./boxCliUpstreamRefusal.js";
+import { summarizeBoxFailureValue, type BoxFailureDiagnostic } from "./boxFailureEvidence.js";
 import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES } from "./boxToolCapacity.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
@@ -17,7 +19,9 @@ import { acceptBoxToolProgress, classifyBoxToolProgress,
 import { isDeepStrictEqual } from "node:util";
 
 export class BoxCliToolHandoffError extends Error {
-  constructor(readonly code: string) { super(code); this.name = "BoxCliToolHandoffError"; }
+  constructor(readonly code: string, readonly boxFailureDiagnostic?: BoxFailureDiagnostic) {
+    super(code); this.name = "BoxCliToolHandoffError";
+  }
 }
 
 interface Obj { [key: string]: unknown }
@@ -502,7 +506,8 @@ export class BoxCliToolHandoffDecoder {
       throw new BoxCliToolHandoffError("BOX_TOOL_AFTER_HANDOFF");
     }
     const refusal = boxCliUpstreamRefusal(record);
-    if (refusal) throw new BoxCliToolHandoffError(refusal);
+    if (refusal) throw new BoxCliToolHandoffError(refusal,
+      boxCliUpstreamRefusalDiagnostic(record));
     if (this.outputLimitResumeDue(record)) {
       // OCV5-368: the held max_tokens terminal is never sent; the next model
       // message continues this one and its usage is added to the bill.
@@ -910,11 +915,12 @@ export class BoxCliToolHandoffDecoder {
   }
 
   private verifySnapshot(): void {
+    const blocks = this.blocks.slice(this.segmentStart);
     if (this.snapshots.length === 0) {
-      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
+      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH", {
+        branch: "missing_snapshot", expectedBlocks: blocks.length, observedBlocks: 0 });
     }
     // Each merged segment is its own upstream message (OCV5-301).
-    const blocks = this.blocks.slice(this.segmentStart);
     // An identical next block can look like either a repeated cumulative
     // prefix or a new segment. Keep every bounded valid coverage position;
     // choosing one greedily would reject [A,A,T] with snapshots [A],[A],[T].
@@ -933,12 +939,33 @@ export class BoxCliToolHandoffDecoder {
         }
       }
       if (next.size === 0) {
-        throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
+        // Select the longest matching attempted prefix only for diagnostics.
+        // This does not participate in the acceptance/coverage predicate.
+        let position = 0, matched = -1;
+        for (const start of new Set([0, ...covered])) {
+          let prefix = 0;
+          while (prefix < content.length
+            && snapshotBlockMatches(content[prefix]!, blocks[start + prefix]?.upstream)) prefix++;
+          if (prefix > matched) { position = start; matched = prefix; }
+        }
+        const index = Math.max(0, matched);
+        const expected = summarizeBoxFailureValue(blocks[position + index]?.upstream);
+        const observed = summarizeBoxFailureValue(content[index]);
+        throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH", {
+          branch: "snapshot_content", blockIndex: position + index,
+          expectedBlocks: blocks.length, observedBlocks: content.length,
+          expectedType: expected.type, observedType: observed.type,
+          ...(expected.bytes === undefined ? {} : { expectedBytes: expected.bytes }),
+          ...(observed.bytes === undefined ? {} : { observedBytes: observed.bytes }),
+          ...(expected.sha256 === undefined ? {} : { expectedSha256: expected.sha256 }),
+          ...(observed.sha256 === undefined ? {} : { observedSha256: observed.sha256 }) });
       }
       covered = next;
     }
     if (!covered.has(blocks.length)) {
-      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
+      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH", {
+        branch: "snapshot_coverage", expectedBlocks: blocks.length,
+        observedBlocks: Math.max(...covered) });
     }
   }
 
@@ -960,7 +987,8 @@ export class BoxCliToolHandoffDecoder {
     try {
       return hashBoxAssistantContent(this.visibleBlocks());
     } catch {
-      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
+      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH", {
+        branch: "unsupported_shape", expectedBlocks: this.blocks.length });
     }
   }
 }

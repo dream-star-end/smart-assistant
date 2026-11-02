@@ -74,6 +74,7 @@ import { BoxContinuationDecisionError, isContinuationConflict } from "./boxPrepa
 import { BoxTextFetchError } from "./boxTextFetch.js";
 import { BoxInvocationConflict } from "./boxInvocationRegistry.js";
 import { BOX_CLI_UPSTREAM_RATE_LIMITED, isBoxCliUpstreamRefusalCode } from "./boxCliUpstreamRefusal.js";
+import type { BoxFirstFailure } from "./boxFailureEvidence.js";
 import {
   clearProviderQuotaBlock,
   isMoonshotBillingQuotaExhausted,
@@ -115,6 +116,20 @@ export function sendBoxUpstreamRefusal(res: ServerResponse, code: string, reques
     limited ? "Box Claude usage window is exhausted; nothing was charged, retry later"
       : "Box Claude upstream refused the request; nothing was charged", requestId,
     { "retry-after": limited ? "300" : "30" });
+}
+
+/** A proved failed attempt is an error replay, never another paid invocation. */
+export function sendBoxFallbackFailure(res: ServerResponse,
+  failure: Pick<BoxFirstFailure, "code">, requestId: string): void {
+  if (isBoxCliUpstreamRefusalCode(failure.code)) {
+    sendBoxUpstreamRefusal(res, failure.code, requestId);
+    return;
+  }
+  const stopped = failure.code === "BOX_SPOOL_KEEPER_STOPPED";
+  sendJsonError(res, stopped ? 409 : 503, failure.code,
+    stopped ? "The previous Box request has stopped"
+      : "Box Claude could not complete this request",
+    requestId);
 }
 
 export interface RoundTripCtx {
@@ -218,11 +233,26 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     userLog,
   } = ctx;
 
-  // 双向 abort 绑定
+  // Normal request/response completion also emits close. Only an incomplete
+  // transport cancels upstream; a transport close is not proof of user Stop.
   const ac = new AbortController();
-  const onClose = () => ac.abort();
-  req.on("close", onClose);
-  res.on("close", onClose);
+  const cancel = (source: "request_aborted" | "request_incomplete" | "response_incomplete"): void => {
+    if (ac.signal.aborted) return;
+    userLog.info("proxy_transport_cancelled", { source,
+      requestComplete: req.complete === true, requestAborted: req.aborted === true,
+      responseEnded: res.writableEnded === true });
+    ac.abort();
+  };
+  const onRequestAbort = (): void => cancel("request_aborted");
+  const onRequestClose = (): void => {
+    if (req.aborted || !req.complete) cancel("request_incomplete");
+  };
+  const onResponseClose = (): void => {
+    if (!res.writableEnded) cancel("response_incomplete");
+  };
+  req.on("aborted", onRequestAbort);
+  req.on("close", onRequestClose);
+  res.on("close", onResponseClose);
 
   let session = ctx.session;
   let observed: UsageObservation = { kind: "none" };
@@ -586,6 +616,13 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       res,
       ac.signal,
     );
+    // The pipe deliberately resolves with result.error rather than throwing.
+    // This is the usual mid-stream refusal path, so the outer catch alone
+    // cannot preserve the cause for CCB's subsequent non-streaming fallback.
+    if (isBoxApiModel(body.model)
+      && isBoxCliUpstreamRefusalCode((result.error as { code?: unknown } | null)?.code)) {
+      ctx.onBoxRefusal?.((result.error as { code: string }).code);
+    }
     userLog.info("proxy_stream_timing", { requestId, model: body.model, provider: session.providerId,
       firstByteMs: result.firstByteAtMs === null ? null : result.firstByteAtMs - fetchStartMs,
       firstTextMs: result.firstTextAtMs === null ? null : result.firstTextAtMs - fetchStartMs });
@@ -744,12 +781,12 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         || err instanceof BoxInvocationConflict
           && ["BOX_USER_CAPACITY_FULL", "BOX_ACCOUNT_CAPACITY_FULL",
             "BOX_SESSION_BUSY"].includes(err.code));
-    // The Box CLI answered with its own upstream refusal (usage window
-    // exhausted, API error): nothing was generated or billed. Say so instead
-    // of an anonymous 500 the client retries blindly.
+    // A generic refusal is not necessarily quota exhaustion. Remember its
+    // typed cause before finalization, even after SSE headers were sent.
     const boxUpstreamRefusal = isBoxApiModel(body.model)
       ? (isBoxCliUpstreamRefusalCode((err as { code?: unknown } | null)?.code)
         ? (err as { code: string }).code : null) : null;
+    if (boxUpstreamRefusal) ctx.onBoxRefusal?.(boxUpstreamRefusal);
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。
     if (boxEgressNotConfigured || continuationConflict) {
@@ -788,7 +825,6 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       } else if (boxCapacityHeld) {
         sendJsonError(res, 409, "BOX_CAPACITY_HELD", "Box slot busy", requestId);
       } else if (boxUpstreamRefusal) {
-        ctx.onBoxRefusal?.(boxUpstreamRefusal);
         sendBoxUpstreamRefusal(res, boxUpstreamRefusal, requestId);
       } else sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
     } else {
@@ -799,8 +835,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       }
     }
   } finally {
-    req.off("close", onClose);
-    res.off("close", onClose);
+    req.off("aborted", onRequestAbort);
+    req.off("close", onRequestClose);
+    res.off("close", onResponseClose);
+    ac.abort();
     // session.zeroizeSecrets 内部 idempotent:即便 release 路径已经 zero 过也安全。
     // DeepSeek session 为 noop。
     session.zeroizeSecrets();

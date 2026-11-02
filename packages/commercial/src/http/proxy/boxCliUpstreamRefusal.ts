@@ -1,3 +1,5 @@
+import { summarizeBoxFailureValue, type BoxFailureDiagnostic } from "./boxFailureEvidence.js";
+
 /** The Box CLI runs with CLAUDE_CODE_MAX_RETRIES=0. When the upstream refuses a
  * call (the account's usage window is exhausted, a 4xx/5xx, a rejected input)
  * it does not stream a model message: it writes one synthetic assistant record
@@ -34,4 +36,19 @@ export function boxCliUpstreamRefusal(record: unknown): BoxCliUpstreamRefusalCod
   // message carries the error tag and flag (see the capture fixture).
   if (item.is_api_error_message !== true && typeof item.error !== "string") return null;
   return item.error === "rate_limit" ? BOX_CLI_UPSTREAM_RATE_LIMITED : BOX_CLI_UPSTREAM_REFUSED;
+}
+
+/** Only the CLI's explicit error tag enters diagnostics. The synthetic API
+ * message text may contain request content and is deliberately never read. */
+export function boxCliUpstreamRefusalDiagnostic(record: unknown): BoxFailureDiagnostic | undefined {
+  if (!boxCliUpstreamRefusal(record)) return undefined;
+  const tag = (record as { error?: unknown }).error;
+  if (tag === "authentication_failed" || tag === "rate_limit" || tag === "invalid_request"
+    || tag === "overloaded_error" || tag === "api_error") {
+    return { branch: "synthetic_api_error", upstreamTag: tag };
+  }
+  const summary = summarizeBoxFailureValue(tag);
+  return { branch: "synthetic_api_error", upstreamTag: "other",
+    ...(summary.bytes === undefined ? {} : { observedBytes: summary.bytes }),
+    ...(summary.sha256 === undefined ? {} : { observedSha256: summary.sha256 }) };
 }

@@ -41,6 +41,53 @@ function records() {
 }
 const lines = (values: unknown[]) => values.map((item) => JSON.stringify(item) + "\n");
 
+test("snapshot failures keep their code and expose only bounded structure diagnostics", () => {
+  const secret = "private tool input that must not be retained";
+  const variants = [
+    { branch: "missing_snapshot", source: records().filter(item => item.type !== "assistant") },
+    { branch: "snapshot_coverage", source: records().filter(item => item.type !== "assistant"
+      || (item as { message: { content: unknown[] } }).message.content.length !== 2) },
+    { branch: "snapshot_content", source: records().map(item => item.type !== "assistant" ? item
+      : { ...item, message: { ...(item as { message: object }).message,
+        content: [{ ...use("toolu_parallel_a"), input: { value: secret } }] } }) },
+  ];
+  for (const variant of variants) {
+    const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+    assert.throws(() => { for (const line of lines(variant.source)) decoder.push(line); },
+      (error: unknown) => {
+        assert.ok(error instanceof BoxCliToolHandoffError);
+        assert.equal(error.message, "BOX_TOOL_SNAPSHOT_MISMATCH");
+        assert.equal(error.boxFailureDiagnostic?.branch, variant.branch);
+        const encoded = JSON.stringify(error.boxFailureDiagnostic);
+        assert.ok(Buffer.byteLength(encoded) <= 2048);
+        assert.ok(!encoded.includes(secret));
+        if (variant.branch === "snapshot_content") {
+          assert.equal(error.boxFailureDiagnostic?.expectedType, "tool_use");
+          assert.equal(error.boxFailureDiagnostic?.observedType, "tool_use");
+          assert.match(error.boxFailureDiagnostic?.observedSha256 ?? "", /^[a-f0-9]{64}$/);
+          assert.notEqual(error.boxFailureDiagnostic?.observedSha256,
+            error.boxFailureDiagnostic?.expectedSha256);
+        }
+        return true;
+      });
+  }
+});
+
+test("synthetic refusals preserve the fixed error message and bounded tag diagnostic", () => {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  assert.throws(() => decoder.push(JSON.stringify({ type: "assistant",
+    error: "authentication_failed", is_api_error_message: true,
+    message: { model: "<synthetic>", content: [{ type: "text", text: "private API error body" }] } }) + "\n"),
+  (error: unknown) => {
+    assert.ok(error instanceof BoxCliToolHandoffError);
+    assert.equal(error.message, "BOX_CLI_UPSTREAM_REFUSED");
+    assert.deepEqual(error.boxFailureDiagnostic,
+      { branch: "synthetic_api_error", upstreamTag: "authentication_failed" });
+    assert.ok(!JSON.stringify(error.boxFailureDiagnostic).includes("private API"));
+    return true;
+  });
+});
+
 test("interleaved real-CC-style snapshots and two identical tools form one guarded handoff", () => {
   const decoder = new BoxCliToolHandoffDecoder(model, catalog);
   const observer = new _UsageObserver();

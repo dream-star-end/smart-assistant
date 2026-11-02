@@ -32,6 +32,15 @@ test("a new launch of the turn supersedes its earlier refusal", () => {
   assert.equal(recentBoxRefusal(key, 2), null);
 });
 
+test("the earliest refusal survives a later fallback error and expiry refreshes its position", () => {
+  _resetBoxRefusalMemoryForTest();
+  rememberBoxRefusal(key, "BOX_CLI_UPSTREAM_RATE_LIMITED", 1_000);
+  rememberBoxRefusal(key, "BOX_CLI_UPSTREAM_REFUSED", 2_000);
+  assert.equal(recentBoxRefusal(key, 3_000), "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  rememberBoxRefusal(key, "BOX_CLI_UPSTREAM_REFUSED", 601_001);
+  assert.equal(recentBoxRefusal(key, 601_002), "BOX_CLI_UPSTREAM_REFUSED");
+});
+
 test("the client sees a 503 with Retry-After for a usage-limit refusal and for any other refusal", async () => {
   let code = "BOX_CLI_UPSTREAM_RATE_LIMITED";
   const server = createServer((_req, res) => sendBoxUpstreamRefusal(res, code, "req-1"));
