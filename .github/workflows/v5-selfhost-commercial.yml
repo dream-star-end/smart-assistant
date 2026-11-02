@@ -154,6 +154,26 @@ jobs:
             "COMMERCIAL_UNIT_IDLE_TIMEOUT=$COMMERCIAL_UNIT_IDLE_TIMEOUT" \
             npm run test:commercial:unit:gate
 
+      - name: Verify normal registration in private PG
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-mutex.sh commercial 'REQUIRE_TEST_DB=1 node --import tsx --test packages/commercial/src/__tests__/register.integ.test.ts' | tee registration-pg.tap
+          grep -Eq '^# pass [1-9][0-9]*$' registration-pg.tap
+          grep -qx '# fail 0' registration-pg.tap
+          grep -qx '# skipped 0' registration-pg.tap
+          grep -qx '# cancelled 0' registration-pg.tap
+
+      - name: Verify native backend settlement and recovery isolation in private PG
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-mutex.sh commercial 'REQUIRE_TEST_DB=1 node --import tsx --test --test-concurrency=1 packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts packages/commercial/src/__tests__/finalizeJournalReconciler.integ.test.ts' | tee cc5-native-finance-pg.tap
+          grep -Eq '^# pass [1-9][0-9]*$' cc5-native-finance-pg.tap
+          grep -qx '# fail 0' cc5-native-finance-pg.tap
+          grep -qx '# skipped 0' cc5-native-finance-pg.tap
+          grep -qx '# cancelled 0' cc5-native-finance-pg.tap
+
       - name: Automatic recovery presentation (targeted PG)
         shell: bash
         run: |

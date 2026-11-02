@@ -4768,3 +4768,40 @@ describe("RF-link singleton transport for open dispatch streams", () => {
     }
   });
 });
+
+describe('cc5 task route hard admission', () => {
+  test('default-off and spoofed client UID cannot bypass a permissive general checker', async () => {
+    const keys = ['OC_SELFHOST_CC5_T1555U_ENABLED', 'OC_SELFHOST_CC5_T1555U_TEST_UID'] as const;
+    const saved = keys.map(key => process.env[key]);
+    try {
+      for (const flag of ['0', '1']) {
+        process.env.OC_SELFHOST_CC5_T1555U_ENABLED = flag;
+        process.env.OC_SELFHOST_CC5_T1555U_TEST_UID = flag === '0' ? '200' : '314159';
+        const rig = await startRig({ loadAllowedModelChecker: async () => () => true });
+        try {
+          const containerOpen = waitNextContainerSocket(rig);
+          const ws = openClient(rig.gatewayPort, await makeJwt('200'));
+          const fc = frameCollector(ws);
+          await new Promise<void>(r => ws.once('open', r));
+          const container = await containerOpen;
+          ws.send(JSON.stringify({ type: 'inbound.message', model: 'cc5-remote-t1555u',
+            uid: 314159, userId: '314159', user_id: '314159',
+            peer: { id: 'cc5-hard-gate', kind: 'dm' }, clientMessageId: `cc5-denied-${flag}` }));
+          const error = await nextBusinessFrame(fc);
+          assert.equal(error.code, 'UNAUTHORIZED_MODEL');
+          assert.equal(error.clientMessageId, `cc5-denied-${flag}`);
+          assert.equal(ws.readyState, WebSocket.OPEN);
+          assert.equal(rig.containerSeen.some(row => row.data.toString().includes('cc5-denied-')), false);
+          const next = new Promise<string>(resolve => container.once('message', data => resolve(data.toString())));
+          ws.send(JSON.stringify({ type: 'inbound.message', model: 'glm-5.2',
+            peer: { id: 'cc5-hard-gate', kind: 'dm' }, clientMessageId: 'normal-positive-control' }));
+          assert.equal(JSON.parse(await next).model, 'glm-5.2');
+          ws.close();
+          await waitClose(ws);
+        } finally { await stopRig(rig); }
+      }
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+    }
+  });
+});

@@ -13,6 +13,32 @@
 # 达不到则非 0 退出,打印「unit 已恢复但健康未确认」,禁止打印总成功。
 set -euo pipefail
 
+# Installed recovery paths only observe this carrier. They cannot borrow a dead
+# publisher's lock or turn an uncertain env replacement into recovery success.
+cc5_activation_recovery_safe() {
+  local index=/opt/openclaude/cc5-t1555u/activation-index.json
+  local helper=/opt/openclaude/v5-selfhost-breakglass/cc5-activation.py
+  if [[ -f "$helper" && ! -L "$helper" ]]; then
+    python3 "$helper" guard
+    return "$?"
+  fi
+  # An old/unconfigured installation may have no helper. Only proven absence
+  # is safe; inaccessible or symlinked parents cannot masquerade as absence.
+  python3 - "$index" <<'CC5_ABSENCE'
+import os,pathlib,stat,sys
+p=pathlib.Path(sys.argv[1])
+try:
+    for parent in reversed(p.parents):
+        try: info=parent.lstat()
+        except FileNotFoundError: sys.exit(0)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022: sys.exit(75)
+    try: p.lstat()
+    except FileNotFoundError: sys.exit(0)
+except OSError: sys.exit(75)
+sys.exit(75)
+CC5_ABSENCE
+}
+
 BACKUP_DIR="${BACKUP_DIR:-/opt/openclaude/v5-selfhost-breakglass/unit-backups/worktree-current}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 MASTER_UNIT="openclaude-v5-selfhost.service"
@@ -73,6 +99,8 @@ while [[ $# -gt 0 ]]; do
     *) die "未知参数: $1" ;;
   esac
 done
+
+cc5_activation_recovery_safe || { log "CC5 receipt unresolved; no unit/env restore or restart"; exit 75; }
 
 [[ "$BACKUP_DIR" == /* ]] || die "备份目录必须是绝对路径: $BACKUP_DIR"
 [[ "$SYSTEMD_DIR" == /* ]] || die "systemd 目录必须是绝对路径: $SYSTEMD_DIR"

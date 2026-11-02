@@ -1,3 +1,6 @@
+import { type Cc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
+import { isCc5ResumeId } from './engine/cc5ResumeId.js'
+import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
@@ -627,6 +630,9 @@ export async function submit(
   try {
     await prev
     session._turnReadOnly = opts?.readOnly === true
+    if (!sameCc5ExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
+      throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+    }
     log.info('turn_pipeline_timing', { traceId, stage: 'submit_lock_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
     const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
@@ -1038,6 +1044,10 @@ export async function submit(
     }
     const spawnCwd = this._cursorWorkspacePathForSession(session)
     const liveNativeId = session.runner.nativeSessionId
+    if (session.runner.executionBackend
+      && (isCc5ResumeId(liveNativeId) || isCc5ResumeId(this._resumeMap.get(session.sessionKey)))) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
     const liveBoxId =
       session.providerTag === 'cursor' ? cursorSandBoxCcResumeInnerId(liveNativeId) : undefined
     const liveSandJsonlId =
@@ -1053,7 +1063,8 @@ export async function submit(
             : usableCursorResumeId({
                 workspacePath: spawnCwd,
                 liveId: liveNativeId,
-                mappedId: this._resumeMap.get(session.sessionKey),
+                mappedId: isCc5ResumeId(this._resumeMap.get(session.sessionKey))
+                  ? undefined : this._resumeMap.get(session.sessionKey),
               })
         : undefined
     let providerResumeId =
@@ -1445,7 +1456,7 @@ export async function submit(
           opts?.modelSwitchInternal === undefined
         ) {
           try {
-            if (boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) {
+            if (!session.runner.executionBackend && boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) {
               writeIdleCandidate(paths.home, {
                 v: 1,
                 sessionKey: session.sessionKey,
@@ -1511,15 +1522,8 @@ export async function _getOrCreateExclusive(
   // 新建时 null 等同 undefined(都让 CCB 用模型默认)
   const initialEffort: string | undefined = opts.effortLevel === null ? undefined : opts.effortLevel
 
-  // ── M1a engine 判定(取代 providerTag 二值假设)────────────────────────
-  // 统一执行模型准入 + engine 解析都在这里一次收口:
-  //   - resolveExecutionModel:agent.model / 入站 model 可能是已下线模型,
-  //     收敛到白名单内(白名单只拦入站帧、agent.model 绕过的教训)。
-  //   - resolveEngine:model→engine 映射 + agentDef.provider 显式 pin 的单一
-  //     权威(gpt-5.5 → 'codex';codex-native pin 仅接受 app-server 形态)。
-  //   - executionAuthority(有则唯一权威):master 签名 descriptor 的 canonicalModel /
-  //     engine 直接落地,两个 baked 表(ALLOWED_INBOUND_MODELS / MODEL_ENGINE_MAP)
-  //     在该 turn **完全不参与** —— 判定单点化(方案 §2)。
+  // Verified authority owns model/engine selection. Local paths retain the
+  // existing registry/catalog admission and fail-closed gates.
   const executionModel = resolveExecutionModel(
     opts.model ?? opts.agent.model,
     this.config.defaults.model,
@@ -1550,6 +1554,15 @@ export async function _getOrCreateExclusive(
   // This runs under the creation gate. A late speculative lookup must not
   // overwrite a real first turn that created its runner while projection awaited.
   if (opts.preheatOnly && existing) return existing
+  const executionBackend = cc5SessionBackend({ ...opts, engineId, executionModel,
+    storedResumeId: this._resumeMap.get(opts.sessionKey) })
+  const backendChanged = !sameCc5ExecutionBackend(existing?.runner.executionBackend, executionBackend)
+  if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+  const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
+    current, storedResumeId: this._resumeMap.get(opts.sessionKey),
+    sessionIds: [opts.sessionKey, ...(opts.peerId ? [opts.peerId] : [])], hasPersistedTurnActivity,
+  })
+  if (executionBackend && (!existing || backendChanged)) await assertFreshBackendTarget(existing)
   if (existing?._modelSwitchTransition) {
     const transition = existing._modelSwitchTransition
     if (
@@ -1615,6 +1628,7 @@ export async function _getOrCreateExclusive(
         existing._identityAgentFingerprint !== identityAgentFingerprint ||
         existing.providerTag !== desiredEngine ||
         cursorTransportChanged ||
+        backendChanged ||
         workspaceModeChanged ||
         workspaceCwdChanged ||
         projectIdChanged
@@ -1633,15 +1647,15 @@ export async function _getOrCreateExclusive(
         // 旧 session 在 shutdown() 完成前仍留在 map;无票 inbound 不得沿用其 model。
         // 放在不变量检查之后:检查失败不会留下粘滞 _replacing。
         existing._replacing = true
-        // Same logical client session, but the desired engine changed (model
-        // switch across engines, or agent switched between CCB and Codex).
-        // Native resume ids are engine-specific, so tear down the old runner
-        // and let the fresh one receive a compact transcript preamble on its
-        // first submit().
+        // Wait for the prior owner before replacing its engine or backend.
         try {
           await existing.lock
           const canonical = this.sessions.get(opts.sessionKey)
           if (canonical && canonical !== existing) {
+            await canonical.lock
+            if (canonical.runner.executionBackend && !sameCc5ExecutionBackend(canonical.runner.executionBackend, executionBackend)) {
+              throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+            }
             const desiredEngineNow =
               opts.model !== undefined ||
               opts.executionAuthority !== undefined ||
@@ -1652,6 +1666,7 @@ export async function _getOrCreateExclusive(
               canonical.agentId !== opts.agent.id ||
               canonical._identityAgentFingerprint !== identityAgentFingerprint ||
               canonical.providerTag !== desiredEngineNow ||
+              !sameCc5ExecutionBackend(canonical.runner.executionBackend, executionBackend) ||
               Boolean(
                 (opts.model !== undefined || opts.executionAuthority !== undefined) &&
                   canonical.runner.requiresReopenForModel?.(executionModel),
@@ -1678,6 +1693,12 @@ export async function _getOrCreateExclusive(
             existing = canonical
             existing._replacing = true
           }
+          // A local turn may have completed while the creation path waited.
+          // Reprove freshness under the final canonical session lock, before
+          // shutting anything down; a failed proof preserves the original runner.
+          if (executionBackend && !sameCc5ExecutionBackend(existing.runner.executionBackend, executionBackend)) {
+            await assertFreshBackendTarget(existing)
+          }
           // Identity-only runner refresh keeps the logical owner held by
           // begin/endClientTurn and B1; general engine/workspace switches don't.
           if (
@@ -1690,6 +1711,7 @@ export async function _getOrCreateExclusive(
             existing.providerTag === engineId &&
             existing.model === executionModel &&
             !cursorTransportChanged &&
+            !backendChanged &&
             !workspaceModeChanged &&
             !workspaceCwdChanged &&
             !projectIdChanged &&
@@ -1733,6 +1755,10 @@ export async function _getOrCreateExclusive(
           }
           await existing.runner.shutdown()
         } catch (err) {
+          if (executionBackend || existing.runner.executionBackend) {
+            existing._replacing = false
+            throw err
+          }
           if (identityRefreshSession) throw err
           log.warn(
             'session-replacement shutdown failed',
@@ -1783,10 +1809,13 @@ export async function _getOrCreateExclusive(
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
+    if (executionBackend && this._resumeMap.get(opts.sessionKey)) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
     const hadSameProviderResume =
       Boolean(this._resumeMap.get(opts.sessionKey)) &&
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
-    const mappedResumeId = opts.hermeticNoTools
+    const mappedResumeId = opts.hermeticNoTools || executionBackend
       ? undefined
       : this._resumeIdFor(
           opts.sessionKey,
@@ -1797,6 +1826,7 @@ export async function _getOrCreateExclusive(
     const runner = createEngine(engineId, {
       peerId: opts.peerId,
       sessionKey: opts.sessionKey,
+      executionBackend,
       systemHelpContextFile: systemHelpContextFile(this, opts.sessionKey),
       agentId: opts.agent.id,
       agentBaseDir: cwd,
@@ -2142,6 +2172,7 @@ export async function getOrCreate(
      *     catalog 判定,不许回落 baked)。
      */
     executionAuthority?: {
+      executionBackend?: Cc5ExecutionBackend
       canonicalModel: string
       engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
       source?: 'bridge_signed' | 'local_catalog'
@@ -2802,6 +2833,7 @@ export function _resumeIdFor(
 ): string | undefined {
   const id = this._resumeMap.get(sessionKey)
   if (!id) return undefined
+  if (isCc5ResumeId(id)) return undefined
   let tag = normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
   // A false "no transcript" drop used to delete the provider and let the
   // live-session overlay save the same id back as implicit ccb. The Fast

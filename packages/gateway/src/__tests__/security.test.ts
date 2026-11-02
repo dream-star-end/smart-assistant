@@ -522,6 +522,29 @@ describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
     else process.env[ENV_KEY] = prevEnv
   })
 
+  it('denies cc5 task journal/proof and private relay files without blocking workspace products', () => {
+    for (const path of [
+      '/home/agent/.openclaude/.cc5-t1555u',
+      '/home/agent/.openclaude/.cc5-t1555u/op/attempt.json',
+      '/home/agent/.openclaude/.cc5-t1555u/op/receipt.json',
+      '/home/agent/.openclaude/.cc5-t1555u/op/cc5-proof.txt',
+      '/home/agent/workspace/.cc5-t1555u/other-state',
+      '/run/oc/cc5-remote-t1555u/binding.json',
+      '/run/oc/cc5-remote-t1555u/relay.sock',
+    ]) {
+      assert.ok(isFileBlocked(path), path)
+      assert.ok(!isFileAllowed(path), path)
+    }
+    for (const path of [
+      '/home/agent/.openclaude/workspace/result.txt',
+      '/home/agent/.openclaude/.cc5-t1555u-output/result.txt',
+      '/home/agent/.openclaude/my.cc5-t1555u/result.txt',
+    ]) {
+      assert.ok(!isFileBlocked(path), path)
+      assert.ok(isFileAllowed(path), path)
+    }
+  })
+
   // ── ALLOW: typical agent work products under /home/agent (boss's actual UX) ──
   describe('ALLOW — agent work products under /home/agent', () => {
     it('allows /home/agent/hello.txt (boss-reported failing download path)', () => {

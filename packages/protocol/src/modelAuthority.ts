@@ -16,6 +16,7 @@
 // 编码规则 = 签名互不认账。私钥逻辑**不在本文件**(master 独占)。
 
 import { BOX_API_MODELS } from './boxApiModels.js'
+import { type Cc5ExecutionBackend, isCc5BackendAuthority, parseCc5ExecutionBackend } from './cc5Backend.js'
 import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto'
 
 import type { PlatformReasoningEffort } from './engineModels.js'
@@ -141,6 +142,8 @@ export interface ModelAuthorityPayload {
   readonly canonicalModel: string
   readonly engine: ModelAuthorityEngine
   readonly executionDescriptor: ModelExecutionDescriptor
+  /** Optional per-chat backend selected by the trusted signer, never by model/catalog aliases. */
+  readonly executionBackend?: Cc5ExecutionBackend
   readonly executionRevision: string
   readonly securityEpoch: number
   readonly issuedAt: number
@@ -735,6 +738,7 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     expiresAt: int(o, 'expiresAt'),
     ...(o.auxModels === undefined ? {} : { auxModels: modelList(o, 'auxModels') }),
     ...(o.billingRequestId === undefined ? {} : { billingRequestId: str(o, 'billingRequestId') }),
+    ...(o.executionBackend === undefined ? {} : { executionBackend: parseExecutionBackend(o.executionBackend) }),
   }
   // 重建对象后必须与 wire 载荷**字段集完全一致**:多出的未知字段一律拒 —— 否则
   // 「签名覆盖 wire 全字段、验签只取已知字段」会让未知字段成为不被校验的携带面。
@@ -754,8 +758,20 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     'expiresAt',
     'auxModels',
     'billingRequestId',
+    'executionBackend',
   ])
+  if (payload.executionBackend !== undefined && !isCc5BackendAuthority(payload)) {
+    throw new ModelAuthorityError('BadShape', 'payload: execution backend/model/engine mismatch')
+  }
   return payload
+}
+
+function parseExecutionBackend(value: unknown): Cc5ExecutionBackend {
+  try {
+    return parseCc5ExecutionBackend(value)
+  } catch {
+    throw new ModelAuthorityError('BadShape', 'payload: invalid execution backend scope')
+  }
 }
 
 function parseTurnLease(raw: unknown): TurnLease {

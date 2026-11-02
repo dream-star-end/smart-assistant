@@ -1,3 +1,5 @@
+import { catalogOwnerIsCurrent } from './hooks/useIdentityModelCatalog'
+import type { ResolvedIdentity } from './lib/resolvedIdentity'
 import {useModelSwitchCost} from './hooks/useModelSwitchCost';
 import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 import { DialogFallback } from "./components/DialogFallback";
@@ -311,6 +313,9 @@ const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 
 
 
+const EMPTY_CATALOG_MODELS: PublicModel[] = [];
+const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
+
 export function App() {
   // P7 最小路由（无路由库）：特判页（demo / reset-password / desktop/enroll）与启动深链
   // （会话 /s/<id> + 面板 ?panel=）的解析见 readLocationRoute；此后 URL 是状态的 replaceState 单向镜像。
@@ -383,8 +388,8 @@ export function App() {
   const [pickerOpen, setPickerOpen] = useState(false);
   // 对话模型/默认思考深度:模型能力来自 GET /api/public/models；用户默认来自
   // /api/me/preferences。两者同批 hydrate 后才决定初始值,避免迟到偏好覆盖人工选择。
-  const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
-  const [lockedModels, setLockedModels] = useState<LockedPublicModel[]>([]);
+  const [catalogModels, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
+  const [catalogLockedModels, setLockedModels] = useState<LockedPublicModel[]>([]);
   const [subscribeOpenSignal, setSubscribeOpenSignal] = useState(0);
   const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
   // 最近一次 preferences 快照(default_model 解析用):per-session 模型恢复的回落基准。
@@ -392,6 +397,16 @@ export function App() {
   const [modelPrefs, setModelPrefs] = useState<PrefsView>({});
   const [preferenceEffort, setPreferenceEffort] = useState<PreferenceEffort | undefined>();
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [catalogOwner, setCatalogOwner] = useState<ResolvedIdentity | null>(null);
+  const clearModelCatalog = () => {
+    setCatalogOwner(null);
+    setModels([]);
+    setLockedModels([]);
+    setModelId(undefined);
+    setModelPrefs({});
+    setPreferenceEffort(undefined);
+    setModelsLoading(false);
+  };
   const [modelSwitchPreparing, setModelSwitchPreparing] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   // 输入框上方横幅栈的「展开全部」(shell 审计 S-06)。默认折叠到 MAX_VISIBLE_BANNERS 条。
@@ -578,6 +593,7 @@ export function App() {
     // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/私有面板态,回首页。
     // help 是公开内容：若 URL 明确携带案例/功能深链，静默续期发现未登录时仍应保留。
     onClearAuth: () => {
+      clearModelCatalog();
       teardownComposerDrafts(user?.id);
       resetComposerAttachmentCache();
       // signPath 只在单一租户内唯一；鉴权身份退出/过期时必须丢弃内存图片字节，避免
@@ -613,6 +629,7 @@ export function App() {
       setView("app");
     },
     onAccountSwitchPending: () => {
+      clearModelCatalog();
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
       setMediaTasksOpen(false);
@@ -629,6 +646,7 @@ export function App() {
     // 登录成功不预载会话：由 useChatSocket IndexedDB 注水（onHydrated）+ listSessions
     // 合并 server canonical 列表填侧栏；selectSession 再按需拉取单会话历史。
     onLoginSuccess: () => {
+      clearModelCatalog();
       imageByteCache.clear();
       sessionsResetRef.current();
       setMessages([]);
@@ -639,6 +657,10 @@ export function App() {
   // 经本地 useRef 再持有一次以保留 biome 的稳定 ref 推断 —— 直接使用 hook 返回的 ref 会在
   // 多处 useCallback/useEffect 误报 useExhaustiveDependencies（lint 只认本地 useRef 为稳定）。
   const authRef = useRef(authSessionRef.current);
+  const catalogVisible = demo || catalogOwnerIsCurrent(catalogOwner, resolvedIdentity, auth, user?.id);
+  const models = catalogVisible ? catalogModels : EMPTY_CATALOG_MODELS;
+  const lockedModels = catalogVisible ? catalogLockedModels : EMPTY_LOCKED_CATALOG_MODELS;
+
 
   // Assistant/tool markdown often exposes a dev-server URL such as
   // http://localhost:3000. That address belongs to the user's container, not
@@ -1128,6 +1150,8 @@ export function App() {
 
   const { inbox, refreshMyAgents, teamLeaderModelId } = useAppDeepLinks({
     auth,
+    resolvedIdentity,
+    setCatalogOwner,
     authRef,
     authed,
     confirmDialog,

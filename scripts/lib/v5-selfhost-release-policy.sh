@@ -418,8 +418,18 @@ release_policy_assert_no_service_jobs() {
 
 release_policy_install_guards() { # <verified candidate> <captured predecessor>
   release_policy_enabled || return 0
-  local rel="$1" previous="$2" unit probe old_watch_fd old_watch_identity readers
+  local rel="$1" previous="$2" guard_rel="$1" unit probe old_watch_fd old_watch_identity readers
   release_policy_require_owner || return 86
+  # Retain a current activation guard during rollback; when rolling forward
+  # from an older unguarded release, install the candidate guard instead.
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
+    [[ -f "$previous/scripts/v5-selfhost-watch.sh" && ! -L "$previous/scripts/v5-selfhost-watch.sh" ]] || return 2
+    if LC_ALL=C grep -Fqx -- '# CC5 activation mutation guard v1' "$previous/scripts/v5-selfhost-watch.sh"; then
+      guard_rel="$previous"
+    else
+      [[ "$?" == 1 ]] || return 2
+    fi
+  fi
   [[ -f "$V5_WATCH_DIR/watch.sh" && ! -L "$V5_WATCH_DIR/watch.sh" ]] || return 2
   [[ -f "$rel/scripts/lib/v5-release-policy.py" && -f "$rel/scripts/v5-lease-worker.sh" && -f "$rel/scripts/v5-lease-lib.sh" ]] || return 2
   cmp -s "$RELEASE_POLICY_HELPER" "$rel/scripts/lib/v5-release-policy.py" || return 2
@@ -427,12 +437,12 @@ release_policy_install_guards() { # <verified candidate> <captured predecessor>
   # identifiable after the atomic install; no process is signalled.
   exec {old_watch_fd}<"$V5_WATCH_DIR/watch.sh" || return 2
   old_watch_identity="$(stat -Lc '%d:%i' "/proc/$$/fd/$old_watch_fd")" || return 2
-  sync_watch_from "$rel" || { exec {old_watch_fd}<&-; return 2; }
+  sync_watch_from "$guard_rel" || { exec {old_watch_fd}<&-; return 2; }
   readers="$(release_policy_watch_readers "$old_watch_identity")" || { exec {old_watch_fd}<&-; return 2; }
   release_policy_drain_watch_readers "$readers" || { local rc=$?; exec {old_watch_fd}<&-; return "$rc"; }
   exec {old_watch_fd}<&-
-  cmp -s "$V5_WATCH_DIR/watch.sh" "$rel/scripts/v5-selfhost-watch.sh" || return 2
-  cmp -s "$V5_WATCH_DIR/alert.sh" "$rel/scripts/v5-selfhost-watch-alert.sh" || return 2
+  cmp -s "$V5_WATCH_DIR/watch.sh" "$guard_rel/scripts/v5-selfhost-watch.sh" || return 2
+  cmp -s "$V5_WATCH_DIR/alert.sh" "$guard_rel/scripts/v5-selfhost-watch-alert.sh" || return 2
   # New stable-path invocations load the new self-contained guard. Existing
   # loaded old actions must finish before the context or any unit can change.
   for unit in openclaude-v5-selfhost-watch.service openclaude-v5-selfhost-autorecover-action.service \
@@ -623,6 +633,10 @@ release_policy_original_finalizer() { # exact target; caller keeps intent active
   ( set -e; persist_selfhost_model_authority_cutover "$rel" ) || return 79
   release_policy_require_owner || return 86
   ( set -e; sync_boot_scripts_from "$rel" ) || return 79
+  release_policy_require_owner || return 86
+  # The history was already proved by finalize_forward. Complete carrier state
+  # before any watch downgrade; unresolved activation must keep the policy hold.
+  cc5_activation_finalize || return 79
   release_policy_require_owner || return 86
   sync_watch_from "$rel" || return 79
   [[ "$(watch_install_state "$rel")" == same ]] || return 79

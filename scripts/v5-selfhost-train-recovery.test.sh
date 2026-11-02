@@ -22,7 +22,19 @@ trap 'rm -rf "$BASE"' EXIT
 mkdir -p "$BASE/bin"
 printf '#!/bin/sh\nexit 0\n' >"$BASE/bin/systemctl"
 chmod 0755 "$BASE/bin/systemctl"
-install -m 0755 "$SURVIVOR_SRC" "$BASE/survivor.sh"
+# No CC5 deployment exists in these recovery-policy fixtures. Replace only
+# that fixed read-only dependency in the private survivor; keep every other
+# production function/CLI byte and the recursive selftest entry unchanged.
+python3 - "$SURVIVOR_SRC" "$BASE/survivor.sh" <<'CC5_FIXTURE'
+import pathlib,re,sys
+source=pathlib.Path(sys.argv[1]).read_text()
+source,count=re.subn(r'^cc5_activation_recovery_safe\(\) \{.*?^\}',
+                     'cc5_activation_recovery_safe() { return 0; }',source,
+                     flags=re.M|re.S)
+assert count==1, 'expected exactly one CC5 dependency leaf in survivor fixture'
+pathlib.Path(sys.argv[2]).write_text(source)
+CC5_FIXTURE
+chmod 0755 "$BASE/survivor.sh"
 
 {
   # Load the production libraries before the existing observation-only stubs.
