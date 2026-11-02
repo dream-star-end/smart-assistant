@@ -1809,6 +1809,34 @@ test("first Box failure survives cleanup/restart with exact, read-only fallback 
     assert.deepEqual(await restarted.findFallbackFailure(lookup), { ...first, requestId: identity.requestId });
     assert.equal(await restarted.findReplayIdentity(lookup), null,
       "failed fallback support must not change successful replay candidates");
+    // Reproduce the old split-transaction gap: normal lookup was missing,
+    // then a same-alias stream is admitted before fallback observes failure.
+    const interleavedId = "interleaved-attempt";
+    const interleavedCtx = { ...base, boxRunNonce: "d".repeat(24), boxLeaseEpoch: "e".repeat(32) };
+    await put(interleavedId, interleavedCtx);
+    const pendingOutcome = await restarted.findReadOnlyFallback(lookup);
+    assert.equal(pendingOutcome?.kind, "identity",
+      "atomic fallback must return the new pending identity instead of old failure/missing");
+    if (pendingOutcome?.kind !== "identity") assert.fail("pending identity missing");
+    assert.equal(pendingOutcome.identity.requestId, interleavedId);
+    assert.equal(pendingOutcome.identity.messagePointer, undefined);
+    const interleavedPointer = { version: 1, uid: "3", requestId: interleavedId,
+      runNonce: interleavedCtx.boxRunNonce, leaseEpoch: interleavedCtx.boxLeaseEpoch,
+      roundNo: 1, bytes: 123, sha256: "f".repeat(64) };
+    await query(`UPDATE request_finalize_journal SET state='committed',
+      ctx=ctx || $2::jsonb WHERE request_id=$1`, [interleavedId,
+      JSON.stringify({ boxState: "terminal", boxReplayMessage: interleavedPointer })]);
+    const readyOutcome = await restarted.findReadOnlyFallback(lookup);
+    assert.equal(readyOutcome?.kind, "identity",
+      "atomic fallback must return the new completed capsule rather than old failure");
+    if (readyOutcome?.kind !== "identity") assert.fail("ready identity missing");
+    assert.deepEqual(readyOutcome.identity.messagePointer, interleavedPointer);
+    await query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{authorityTurnId}',to_jsonb($2::text)) WHERE request_id=$1`,
+      [interleavedId, "2".repeat(32)]);
+    await assert.rejects(() => restarted.findReadOnlyFallback(lookup), /BOX_AUTHORITY_REJECTED/,
+      "binding rejection must not degrade to another attempt's failure");
+    await query("DELETE FROM request_finalize_journal WHERE request_id=$1", [interleavedId]);
     assert.deepEqual((await query("SELECT state,ctx,final_credits FROM request_finalize_journal WHERE request_id=$1", [identity.requestId])).rows,
       before.rows, "failure lookup changes neither billing nor cleanup state");
     assert.equal(await restarted.findFallbackFailure({ ...lookup, uid: 4n }), null);
@@ -1832,7 +1860,8 @@ test("first Box failure survives cleanup/restart with exact, read-only fallback 
       code: "BOX_EXEC_TIMEOUT", phase: "proxy_stream" }), null, "existing usage beats late failure");
     await query("DELETE FROM usage_records WHERE request_id=$1", [identity.requestId]);
     await query(`UPDATE request_finalize_journal SET ctx=ctx || '{"boxReplayMessage":{}}'::jsonb WHERE request_id=$1`, [identity.requestId]);
-    assert.equal(await restarted.findFallbackFailure(lookup), null);
+    await assert.rejects(() => restarted.findFallbackFailure(lookup), /BOX_REPLAY_EVIDENCE_INVALID/,
+      "an invalid normal capsule must fail binding, never degrade into a stopped failure");
     assert.equal(await restarted.recordFirstFailure({ ...identity,
       code: "BOX_EXEC_TIMEOUT", phase: "proxy_stream" }), null, "capsule evidence beats late failure");
     await query("UPDATE request_finalize_journal SET ctx=ctx-'boxReplayMessage' WHERE request_id=$1", [identity.requestId]);

@@ -24,16 +24,17 @@ export async function findCompletedBoxReplay(input: {
   prepared?: PreparedContinuation;
 }, deps: {
   journal: Pick<BoxDurableJournal, "findReplayIdentity"> &
-    Partial<Pick<BoxDurableJournal, "findFallbackFailure">>;
+    Partial<Pick<BoxDurableJournal, "findReadOnlyFallback">>;
   readMessage: (pointer: BoxReplayMessagePointer) => Promise<unknown>;
 }): Promise<BoxReplayLookup> {
-  const identity = await deps.journal.findReplayIdentity(input);
+  let identity = await deps.journal.findReplayIdentity(input);
   if (!identity) {
-    if (input.canonicalBody.stream === false && deps.journal.findFallbackFailure) {
-      const failure = await deps.journal.findFallbackFailure(input);
-      if (failure) return { kind: "failed", failure };
+    if (input.canonicalBody.stream === false && deps.journal.findReadOnlyFallback) {
+      const fallback = await deps.journal.findReadOnlyFallback(input);
+      if (fallback?.kind === "failure") return { kind: "failed", failure: fallback.failure };
+      if (fallback?.kind === "identity") identity = fallback.identity;
     }
-    return { kind: "missing" };
+    if (!identity) return { kind: "missing" };
   }
   if (!identity.messagePointer) return { kind: "pending", identity };
   const message = await deps.readMessage(identity.messagePointer);
