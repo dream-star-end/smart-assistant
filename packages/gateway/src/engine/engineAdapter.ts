@@ -224,6 +224,10 @@ export interface EngineAdapter extends EventEmitter {
   /** Only the explicit browser Stop may use reason='user'; automatic timeout,
    * quota and recovery interrupts default to system. */
   interrupt(reason?: 'user' | 'system'): boolean
+  /** Process is exiting (SIGTERM/SIGINT): no live turn of this generation can
+   * continue. Synchronous and fire-and-forget; called before any other
+   * shutdown stage so remote side effects start inside the stop grace. */
+  beginPlannedShutdown?(): void
   shutdown(): Promise<void>
   /** Resolves only after the current process generation's stdout has closed.
    * `shutdown()` itself is deliberately bounded for process supervision, so

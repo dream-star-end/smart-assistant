@@ -2495,6 +2495,17 @@ export class SessionManager {
     this._saveResumeMap()
   }
 
+  /** First shutdown stage; never throws so the rest of shutdown always runs. */
+  beginPlannedShutdown(): void {
+    for (const s of this.sessions.values()) {
+      try {
+        s.runner.beginPlannedShutdown?.()
+      } catch (err) {
+        log.warn('beginPlannedShutdown failed', { sessionKey: s.sessionKey }, err)
+      }
+    }
+  }
+
   shutdownAll(): Promise<void> {
     return shutdownAllImpl.call(this as unknown as SessionLifecycleHost)
   }

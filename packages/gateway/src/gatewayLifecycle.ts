@@ -953,6 +953,10 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
   logTimingStops.delete(this)
   this.log.info('shutting down')
 
+  // ── Stage 0: start settling remote engine runs while the container's stop
+  // grace still has room (sessions are only drained at Stage 4). ──
+  this.sessions.beginPlannedShutdown()
+
   // ── Stage 1: stop accepting new traffic ──
   // `httpServer.close()` stops accepting new HTTP connections but lets
   // in-flight requests finish. WS upgrade happens via the HTTP server so
