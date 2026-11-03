@@ -14,13 +14,29 @@ import {
   supportsAutomaticRecoveryWithoutCheckpoint,
   shouldReplayOriginalAfterEmptyExecution,
   supportsAutomaticTurnRecovery,
+  supportsManualTurnRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from '../turnErrorTaxonomy.js'
 
 describe('automatic turn recovery policy', () => {
+  it('keeps exhausted Box quota manually retryable without enabling automatic recovery', () => {
+    assert.equal(TURN_ERROR_TAXONOMY.quota_exhausted.retryable, true)
+    assert.equal(TURN_ERROR_TAXONOMY.quota_exhausted.cta, 'retry')
+    for (const code of ['quota_exhausted', 'BOX_UPSTREAM_QUOTA_EXHAUSTED']) {
+      assert.equal(supportsAutomaticTurnRecovery(code), false, code)
+      assert.equal(supportsManualTurnRecovery(code), true, code)
+      assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false, code)
+    }
+    assert.equal(supportsAutomaticTurnRecovery('rate_limited'), true)
+    assert.equal(supportsManualTurnRecovery('rate_limited'), true)
+    for (const code of ['unknown', 'auth_error', 'user_cancelled', 'box_capacity_held']) {
+      assert.equal(supportsManualTurnRecovery(code), false, code)
+    }
+  })
   it('classifies every frontend-visible retryable code into automatic recovery or an explicit unsafe transport/admission exclusion', () => {
     const explicitUnsafe = new Set([
+      'quota_exhausted', // exhausted quota permits user choice, never an automatic retry loop
       'session_persist_unavailable', // no durable user-row/tape authority
       'durable_dispatch_unavailable', // bind fence failed; retry mints a new dispatch
       'conn_kicked', // connection lifecycle owns reconnect, not turn replay

@@ -33,6 +33,10 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
   },
   { input: '402 INSUFFICIENT_CREDITS: balance=1 required=9', code: 'insufficient_credits' },
   { input: '429 Too Many Requests', code: 'rate_limited' },
+  {
+    input: 'API Error: 503 {"error":{"code":"BOX_UPSTREAM_QUOTA_EXHAUSTED","message":"quota exhausted"}}',
+    code: 'quota_exhausted',
+  },
   { input: 'model is overloaded', code: 'model_capacity' },
   { input: 'Selected model is at capacity. Please try a different model.', code: 'model_capacity' },
   { input: 'This model has been retired. Please try a different model.', code: 'model_not_available' },

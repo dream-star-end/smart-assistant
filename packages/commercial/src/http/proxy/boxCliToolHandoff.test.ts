@@ -666,3 +666,20 @@ test("OCV5-509 a recorded tool input that differs in any other way is still a sn
   assert.throws(() => decodeRound(repairedRound(windows, { value: "type C:\\usersAdmin.txt" })),
     (error: unknown) => error instanceof BoxCliToolHandoffError && error.code === "BOX_TOOL_SNAPSHOT_MISMATCH");
 });
+
+
+test("a bound captured subscription rejection has a precise quota code; an unbound one stays generic", () => {
+  const session = refusalRecords[0]!.session_id as string;
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog, { alreadyInitialized: true, trustedNativeSessionId: session });
+  assert.throws(() => decoder.push(refusalRecords.map(item => JSON.stringify(item)).join("\n") + "\n"),
+    (error: unknown) => {
+      assert.ok(error instanceof BoxCliToolHandoffError);
+      assert.equal(error.code, "BOX_CLI_QUOTA_EXHAUSTED");
+      assert.equal(error.boxFailureDiagnostic?.quotaWindow, "five_hour");
+      assert.equal(error.boxFailureDiagnostic?.upstreamTag, "rate_limit");
+      return true;
+    });
+  const initBound = new BoxCliToolHandoffDecoder(model, catalog);
+  initBound.push(JSON.stringify({ type: "system", subtype: "init", session_id: session, tools: [boxName], mcp_servers: [{}] }) + "\n");
+  assert.throws(() => initBound.push(refusalRecords.map(item => JSON.stringify(item)).join("\n") + "\n"), /BOX_CLI_QUOTA_EXHAUSTED/);
+});

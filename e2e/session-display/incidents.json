@@ -9875,6 +9875,35 @@
           "assertion": "[ocv5-607-lossless-context-transport] PASS"
         }
       ]
+    },
+    {
+      "id": "INC-20261102-BOX-QUOTA-AUTORECOVERY",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "Box CLI明确的订阅窗口额度耗尽被归为普通瞬时限流，平台继续自动恢复；只对同运行会话结构化拒绝配对发出独立quota语义，停止SDK、gateway及客户端/服务端自动恢复，保留既有用户显式重试和持久化断点继续。普通短时限流保持原语义。",
+      "rootFixCommit": "3c0e97c2",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliQuotaEvidence.test.ts",
+          "assertion": "captured quota pairs only with an independently bound native session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "preserves only the typed Box API quota failure on the wire and tape without automatic recovery"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "Box exhausted quota permits manual checkpoint or explicit empty reissue and refuses automatic admission"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "await proveUpstreamRefusal(uid4Context(db))"
+        }
+      ]
     }
   ]
 }

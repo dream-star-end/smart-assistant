@@ -94,3 +94,24 @@ test("actual request abort is recorded once and retains client-abort settlement"
   assert.equal((cancelled[0].fields as { source: string }).source, "request_aborted");
   assert.equal(f.commits(), 0);
 });
+
+test("mid-stream proven quota keeps its typed identity for the read-only fallback", async () => {
+  _resetBoxRefusalMemoryForTest();
+  const f = fixture();
+  const key = { uid: 4n, sessionId: "synthetic-session", turnKey: "b".repeat(64), model: f.ctx.body.model };
+  let reads = 0, launches = 0;
+  await runUpstreamRoundTrip({ ...f.ctx,
+    onBoxRefusal: (code: string) => rememberBoxRefusal(key, code),
+    fetchFn: (async () => {
+      launches++;
+      return new Response(new ReadableStream<Uint8Array>({ pull(controller) {
+        if (reads++ === 0) controller.enqueue(Buffer.from("event: ping\ndata: {}\n\n"));
+        else controller.error(new BoxCliToolHandoffError("BOX_CLI_QUOTA_EXHAUSTED"));
+      } }));
+    }) as typeof fetch,
+  } as never);
+  assert.equal(launches, 1);
+  assert.equal(recentBoxRefusal(key), "BOX_CLI_QUOTA_EXHAUSTED");
+  assert.deepEqual(f.failures, ["STREAM_FAILED"]);
+  assert.equal(f.commits(), 0);
+});

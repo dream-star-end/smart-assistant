@@ -423,3 +423,19 @@ test("a CLI usage-limit refusal is one named code, not an order violation", () =
   // a real model message in the same stream is untouched
   assert.equal(completedBoxCliToSse(jsonl(records()), model).outputTokens, 7);
 });
+
+
+test("complete-call decoding preserves a bound subscription rejection without classifying ordinary rate limits", () => {
+  const capture = refusalRecords;
+  const session = capture[0]!.session_id as string;
+  const bound = createBoxCliSseDecoder(model, session);
+  assert.throws(() => bound.push(jsonl(capture)), (error: unknown) => {
+    assert.ok(error instanceof BoxCliSseError);
+    assert.equal(error.code, "BOX_CLI_QUOTA_EXHAUSTED");
+    assert.equal(error.boxFailureDiagnostic?.quotaWindow, "five_hour");
+    return true;
+  });
+  const initBound = createBoxCliSseDecoder(model);
+  initBound.push(jsonl([{ type: "system", subtype: "init", session_id: session, tools: [], mcp_servers: [] }]));
+  assert.throws(() => initBound.push(jsonl(capture)), /BOX_CLI_QUOTA_EXHAUSTED/);
+});

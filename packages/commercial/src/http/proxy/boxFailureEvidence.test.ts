@@ -55,3 +55,15 @@ test("the existing unproven-terminal code is preserved without broadening the er
   assert.equal(boxFailureFromError(new Error(`${code}: private detail`), "first_round"), null);
   assert.equal(boxFailureFromError({ code: "BOX_TOOL_OTHER_UNPROVEN" }, "first_round"), null);
 });
+
+
+test("proven subscription window metadata survives the existing first-failure envelope", () => {
+  const evidence = { version: 1, code: "BOX_CLI_QUOTA_EXHAUSTED", phase: "continuation", observedAtMs: 1_790_000_000_000,
+    diagnostic: { branch: "synthetic_api_error", upstreamTag: "rate_limit", quotaWindow: "five_hour", quotaResetAtMs: 1_791_300_000_000 } };
+  assert.deepEqual(parseBoxFirstFailure(evidence), evidence);
+  for (const changed of [{ quotaWindow: "minute" }, { quotaResetAtMs: NaN }, { quotaResetAtMs: -1 }, { quotaResetAtMs: 9e20 }]) {
+    assert.equal(parseBoxFirstFailure({ ...evidence, diagnostic: { ...evidence.diagnostic, ...changed } }), null);
+  }
+  assert.deepEqual(boxFailureFromError({ code: evidence.code, boxFailureDiagnostic: evidence.diagnostic }, "continuation"),
+    { code: evidence.code, phase: "continuation", diagnostic: evidence.diagnostic });
+});

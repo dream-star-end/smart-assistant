@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { proveQuotaExhaustion } from "./boxQuotaExhaustionProof.js";
 import type { Uid4BoxProofContext } from "../check-v5-box-incident-proofs.js";
 
 function fail(message: string): never { throw new Error(`[uid4-box-proof] ${message}`); }
@@ -17,6 +18,7 @@ function fail(message: string): never { throw new Error(`[uid4-box-proof] ${mess
 // BOX_CAPACITY_HELD. The refusal is one named code, settles unbilled at once
 // and the next message is admitted. The spool is the capture from the Box.
 export async function proveUpstreamRefusal(ctx: Uid4BoxProofContext): Promise<string> {
+  await proveQuotaExhaustion(ctx.candidate, ctx.upstreamModel);
   const { api, db, money, prechecked, boxHost, spoolOf, cliInit, codeOf, journalRow, must } = ctx;
   const MODEL = ctx.model, CLI_MODEL = ctx.upstreamModel, FINAL_ANSWER = ctx.finalAnswer;
   const who = { uid: 900_000_321n, containerId: 321n, sessionId: "session-upstream-refusal" };

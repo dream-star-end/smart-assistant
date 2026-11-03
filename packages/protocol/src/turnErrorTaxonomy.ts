@@ -82,6 +82,9 @@ export const TURN_ERROR_TAXONOMY = {
   // ── 计费/配额 ────────────────────────────────────────────
   insufficient_credits: { retryable: false, cta: 'topup', expected: true, reportable: false },
   rate_limited: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
+  /** A provider-confirmed subscription quota boundary. Keep the existing
+   * manual retry/checkpoint actions; never automatically replay it. */
+  quota_exhausted: { retryable: true, cta: 'retry', expected: true },
 
   // ── 上游模型服务(errorClassify / codex runner 分类产物)────
   /** 新增:模型容量满载("at capacity"/overloaded/model busy 词族)。 */
@@ -205,6 +208,7 @@ const LEGACY_CODE_ALIASES: Record<string, TurnErrorCode> = {
   CONN_KICKED: 'conn_kicked',
   ERR_BACKPRESSURE: 'conn_kicked',
   RATE_LIMITED: 'rate_limited',
+  BOX_UPSTREAM_QUOTA_EXHAUSTED: 'quota_exhausted',
   UPSTREAM_FAILED: 'upstream_failed',
 }
 
@@ -235,6 +239,12 @@ export function turnErrorSemantics(code: string): TurnErrorSemantics {
  * codes stay false. */
 export function supportsAutomaticTurnRecovery(code: string): boolean {
   return turnErrorSemantics(normalizeTurnErrorCode(code)).automaticRecovery === true
+}
+
+/** Manual checkpoint eligibility is distinct from automatic execution. This
+ * grants no original-request replay or permission to select another account. */
+export function supportsManualTurnRecovery(code: string): boolean {
+  return supportsAutomaticTurnRecovery(code) || normalizeTurnErrorCode(code) === 'quota_exhausted'
 }
 
 const SILENT_AUTOMATIC_RECOVERY_CODES = new Set([

@@ -67,6 +67,7 @@ import {
   normalizeTurnErrorCode,
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
+  supportsManualTurnRecovery,
   allowUnsafeAutomaticCheckpoint,
   modelPlaneFailureAfterSettledTools,
   emptyRecoveryRepeatsModelPlaneFailure,
@@ -9075,10 +9076,13 @@ export function createPgSessionsBackend(
               }
             }
             const sourceIndex = current.lastIndexOf(latestUser);
+            const supportsRequestedRecovery = input.recovery.automatic
+              ? supportsAutomaticTurnRecovery
+              : supportsManualTurnRecovery;
             const recoverableHotTapeError = current.slice(sourceIndex + 1).some((item) =>
               item?.role === "assistant" &&
               item._clientMessageId === input.recovery?.sourceClientMessageId &&
-              supportsAutomaticTurnRecovery(String(item._errorCode ?? "")));
+              supportsRequestedRecovery(String(item._errorCode ?? "")));
             const dispatchFailure = (
               await client.query<{ outcome: string; failure_code: string | null }>(
                 `SELECT outcome, failure_code
@@ -9148,7 +9152,7 @@ export function createPgSessionsBackend(
                 (finalized.status === "crashed" || finalized.status === "interrupted"
                   ? finalized.waive_reason ?? ""
                   : "");
-              if (!supportsAutomaticTurnRecovery(finalizedErrorCode)) {
+              if (!supportsRequestedRecovery(finalizedErrorCode)) {
                 return { kind: "recovery_conflict", reason: "source_not_recoverable" };
               }
               const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
@@ -9222,7 +9226,7 @@ export function createPgSessionsBackend(
               const dispatchErrorCode = dispatchFailure?.failure_code ?? "";
               if (
                 !recoverableHotTapeError &&
-                !supportsAutomaticTurnRecovery(dispatchErrorCode)
+                !supportsRequestedRecovery(dispatchErrorCode)
               ) {
                 return { kind: "recovery_conflict", reason: "source_not_recoverable" };
               }

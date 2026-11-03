@@ -167,6 +167,7 @@ import {
   maxAutomaticTurnRetryAttempt,
   shouldPauseSilentAutomaticRecovery,
   supportsAutomaticTurnRecovery,
+  supportsManualTurnRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from "@openclaude/protocol/browser";
@@ -481,7 +482,7 @@ function baseTurnRecoveryTarget(
   sessionId: string,
 ): { user: ChatMessage; error: ChatMessage; rows: ChatMessage[] } | undefined {
   const normalizedCode = normalizeTurnErrorCode(error._errorCode);
-  if (!supportsAutomaticTurnRecovery(normalizedCode)) return undefined;
+  if (!supportsManualTurnRecovery(normalizedCode)) return undefined;
   if (error._source !== "server" && !error._turnTapeId) return undefined;
   const interruptedClientMessageId = error._clientMessageId;
   if (!interruptedClientMessageId) return undefined;
@@ -540,6 +541,7 @@ export function automaticTurnRecoveryTarget(
   error: ChatMessage,
   sessionId: string,
 ): InterruptedContinuationTarget | undefined {
+  if (!supportsAutomaticTurnRecovery(normalizeTurnErrorCode(error._errorCode))) return undefined;
   const base = baseTurnRecoveryTarget(messages, error, sessionId);
   if (
     !base ||

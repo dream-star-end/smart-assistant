@@ -1,3 +1,5 @@
+import { BOX_CLI_QUOTA_EXHAUSTED } from "./boxCliQuotaEvidence.js";
+export { BOX_CLI_QUOTA_EXHAUSTED } from "./boxCliQuotaEvidence.js";
 import { summarizeBoxFailureValue, type BoxFailureDiagnostic } from "./boxFailureEvidence.js";
 
 /** The Box CLI runs with CLAUDE_CODE_MAX_RETRIES=0. When the upstream refuses a
@@ -13,10 +15,10 @@ export const BOX_CLI_UPSTREAM_REFUSED = "BOX_CLI_UPSTREAM_REFUSED";
  * this call: the CLI runs with CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1, so it does
  * not start a hidden second answer nobody receives. Settled like a refusal. */
 export const BOX_CLI_MODEL_REFUSED = "BOX_CLI_MODEL_REFUSED";
-export type BoxCliUpstreamRefusalCode = typeof BOX_CLI_UPSTREAM_RATE_LIMITED
+export type BoxCliUpstreamRefusalCode = typeof BOX_CLI_QUOTA_EXHAUSTED | typeof BOX_CLI_UPSTREAM_RATE_LIMITED
   | typeof BOX_CLI_UPSTREAM_REFUSED | typeof BOX_CLI_MODEL_REFUSED;
 
-const REFUSAL_CODES: ReadonlySet<string> = new Set([BOX_CLI_UPSTREAM_RATE_LIMITED,
+const REFUSAL_CODES: ReadonlySet<string> = new Set([BOX_CLI_QUOTA_EXHAUSTED, BOX_CLI_UPSTREAM_RATE_LIMITED,
   BOX_CLI_UPSTREAM_REFUSED, BOX_CLI_MODEL_REFUSED]);
 
 export function isBoxCliUpstreamRefusalCode(code: unknown): code is BoxCliUpstreamRefusalCode {

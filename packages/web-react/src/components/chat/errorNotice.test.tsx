@@ -3,6 +3,7 @@ import { USER_ERROR_CATALOG } from "@openclaude/protocol/browser";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
+import { interruptedContinuationTarget, preciseRetryEligible } from "../../lib/chat/socket";
 import { AssistantCard, type CardCallbacks, type RenderCtx, TurnStatusCard } from "./cards";
 
 vi.mock("../../lib/clientFriction", () => ({
@@ -97,6 +98,49 @@ describe("终态错误卡说人话", () => {
     expect(onRetrySend).toHaveBeenCalledWith(source);
     fireEvent.click(within(card).getByRole("button", { name: "切换模型" }));
     expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
+  });
+
+  test("quota zero-output failure retains explicit original-message retry", () => {
+    const source: ChatMessage = {
+      id: "m-client-1", role: "user", text: "original request", ts: 0, status: "error", _source: "server",
+      _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+    };
+    const error = errorRow({ _errorCode: "quota_exhausted", _source: "server" });
+    const rows = [source, error];
+    const onRetrySend = vi.fn();
+    const onRegenerate = vi.fn();
+    const card = renderCard(error, {
+      onRetrySend, onRegenerate,
+      resolveRetryTarget: () => preciseRetryEligible(source) ? source : undefined,
+      resolveInterruptedContinuation: () => interruptedContinuationTarget(rows, error, "s-quota-empty")?.user,
+    });
+    expect(within(card).queryByRole("button", { name: "从断点继续" })).toBeNull();
+    fireEvent.click(within(card).getByRole("button", { name: /^重试$/ }));
+    expect(onRetrySend).toHaveBeenCalledWith(source);
+    expect(onRegenerate).not.toHaveBeenCalled();
+  });
+
+  test("quota with a durable tool checkpoint keeps the existing checkpoint action ahead of original retry", () => {
+    const source: ChatMessage = {
+      id: "m-client-1", role: "user", text: "original request", ts: 0, status: "error", _source: "server",
+      _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+    };
+    const tool: ChatMessage = { id: "quota-tool", role: "tool", text: "saved result", ts: 1,
+      toolName: "Bash", _completed: true, _source: "server" };
+    const error = errorRow({ _errorCode: "quota_exhausted", _source: "server", ts: 2 });
+    const rows = [source, tool, error];
+    const onRetrySend = vi.fn();
+    const onContinueInterrupted = vi.fn();
+    const card = renderCard(error, {
+      onRetrySend, onContinueInterrupted, onRegenerate: vi.fn(),
+      resolveRetryTarget: () => source,
+      resolveInterruptedContinuation: () => interruptedContinuationTarget(rows, error, "s-quota-tool")?.user,
+    });
+    expect(within(card).queryByRole("button", { name: /^重试$/ })).toBeNull();
+    expect(within(card).queryByRole("button", { name: "重新尝试" })).toBeNull();
+    fireEvent.click(within(card).getByRole("button", { name: "从断点继续" }));
+    expect(onContinueInterrupted).toHaveBeenCalledWith(error);
+    expect(onRetrySend).not.toHaveBeenCalled();
   });
 
   test("「联系管理员」走反馈入口并带上这条消息的追踪信息", () => {

@@ -32,6 +32,7 @@ const GROUP_COPY: Record<UserErrorCategory, Copy> = {
 const TURN_COPY: Record<TurnErrorCode, readonly [UserErrorCategory, string]> = {
   insufficient_credits: ['billing', '可用积分不足，请补充积分或联系管理员后继续。'],
   rate_limited: ['capacity', '请求暂时较多，请稍后重试本条消息。'],
+  quota_exhausted: ['capacity', '当前模型的使用额度已用尽，本轮已暂停，不会自动重试。已有进度已保留，额度恢复后可手动继续，或切换模型后继续。'],
   model_capacity: ['capacity', '当前模型访问量较大，请稍后重试，或切换其他模型继续。'],
   upstream_failed: ['model', '模型服务暂时中断，请稍后重试本条消息。'],
   upstream_timeout: ['connection', '模型响应超时，请稍后重试本条消息。'],
