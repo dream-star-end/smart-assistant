@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fixed Unix MCP endpoint over ordinary SSH exec stdio; no SSH forwarding or TCP.
 
-No model tool executes here. The only operation is relaying one fixed task RPC
+No model tool executes here. The only operation is relaying closed task RPCs
 and its real execution-container receipt. Unknown delivery is never retried.
 """
 import base64
@@ -17,7 +17,7 @@ import struct
 import sys
 import types
 
-PINNED_MCP_SHA = '9738e246fc23dbf356335f4effacbbd12204180b981dd9996d62305f2fba2809'
+PINNED_MCP_SHA = '828d524a08c10f45a9c13c89c178ec740581f98ebc1870d089dab594a18d4cfd'
 MAX_BODY = 131072
 MAX_FRAME = 262144
 
@@ -32,6 +32,23 @@ def emit(stream, value):
     require(len(data) <= MAX_FRAME)
     stream.write(data)
     stream.flush()
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durable_record(path, data):
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, 'wb') as target:
+        target.write(data)
+        target.flush()
+        os.fsync(target.fileno())
+    sync_dir(path.parent)
 
 
 def load_client(root):
@@ -57,7 +74,9 @@ def run(root, client, source, sink):
     require(len(os.fsencode(path)) <= 100 and not path.exists() and not path.is_symlink())
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     socket_identity = None
-    attempted = False
+    sequence = 0
+    seen_rpc = set()
+    attempts = root / 'tool-attempts'
     failed = False
 
     class Handler(BaseHTTPRequestHandler):
@@ -71,59 +90,61 @@ def run(root, client, source, sink):
             self.wfile.write(b'{"ok":false}')
 
         def do_POST(self):
-            nonlocal attempted, failed
+            nonlocal sequence, failed
+            dispatched = False
             try:
-                require(self.path == '/roundtrip' and not attempted and self.headers.get('Transfer-Encoding') is None)
+                require(self.path == '/roundtrip' and self.headers.get('Transfer-Encoding') is None)
                 lengths = self.headers.get_all('Content-Length') or []
                 require(len(lengths) == 1 and lengths[0].isdecimal() and 0 < int(lengths[0]) <= MAX_BODY)
                 data = self.rfile.read(int(lengths[0]))
                 require(len(data) == int(lengths[0]))
                 body = client.strict_json(data)
-                require(isinstance(body, dict) and set(body) == {'runId', 'operationId', 'rpcId', 'toolUseId', 'name', 'arguments'})
+                client.valid_strings(body)
+                require(isinstance(body, dict) and set(body) == {'runId', 'operationId', 'rpcId', 'toolUseId', 'name', 'arguments', 'inputSha256'})
                 ident = body['rpcId']
                 require(body['runId'] == config['runId'] and body['operationId'] == config['operationId']
-                        and body['name'] == 'mcp__ocbridge__roundtrip' and body['arguments'] == {'operationId': config['operationId']}
+                        and body['name'] in tuple('mcp__ocbridge__' + name for name in client.TOOLS)
                         and type(ident) in (str, int) and (not isinstance(ident, str) or 0 < len(ident) <= 256)
                         and (not isinstance(ident, int) or abs(ident) <= 2**53 - 1)
                         and isinstance(body['toolUseId'], str) and 0 < len(body['toolUseId'].encode()) <= 65536
                         and ident != body['toolUseId'])
-                attempted = True  # Burn and durably record before sending anything over SSH.
-                fd = os.open(root / 'tool-socket-attempt.json', os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
-                with os.fdopen(fd, 'wb') as record:
-                    record.write(json.dumps({'version': 1, 'runId': config['runId'], 'operationId': config['operationId'],
-                        'rpcId': ident, 'toolUseId': body['toolUseId']}).encode())
-                    record.flush()
-                    os.fsync(record.fileno())
-                directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-                emit(sink, {'version': 1, 'kind': 'tool-request', 'seq': 1, 'body': base64.b64encode(data).decode()})
+                input_hash = client.tool_arguments(body['name'].removeprefix('mcp__ocbridge__'), body['arguments'])
+                require(body['inputSha256'] == input_hash and (type(ident), ident) not in seen_rpc)
+                key = hashlib.sha256(body['toolUseId'].encode('utf-8', errors='strict')).hexdigest()
+                require(not (attempts / (key + '.attempt.json')).exists() and sequence < 10000)
+                sequence += 1
+                seen_rpc.add((type(ident), ident))
+                # O_EXCL and file + directory fsync precede the first SSH byte.
+                dispatched = True
+                durable_record(attempts / (key + '.attempt.json'), client.canonical({
+                    'version': 2, 'seq': sequence, 'runId': config['runId'], 'operationId': config['operationId'],
+                    'rpcId': ident, 'toolUseId': body['toolUseId'], 'name': body['name'], 'inputSha256': input_hash}))
+                emit(sink, {'version': 2, 'kind': 'tool-request', 'seq': sequence, 'body': base64.b64encode(data).decode()})
                 line = source.readline(MAX_FRAME + 1)
                 require(line.endswith(b'\n') and len(line) <= MAX_FRAME)
                 response = client.strict_json(line)
                 require(isinstance(response, dict) and set(response) == {'version', 'kind', 'seq', 'status', 'body'}
-                        and type(response['version']) is int and response['version'] == 1
-                        and response['kind'] == 'tool-response' and type(response['seq']) is int and response['seq'] == 1
+                        and type(response['version']) is int and response['version'] == 2
+                        and response['kind'] == 'tool-response' and type(response['seq']) is int and response['seq'] == sequence
                         and type(response['status']) is int and response['status'] == 200 and isinstance(response['body'], str))
                 receipt_bytes = base64.b64decode(response['body'], validate=True)
-                require(len(receipt_bytes) <= MAX_BODY)
+                require(len(receipt_bytes) <= client.MAX_REPLY)
                 value = client.strict_json(receipt_bytes)
-                require(isinstance(value, dict) and value.get('ok') is True
-                        and type(value.get('rpcId')) is type(ident) and value['rpcId'] == ident
-                        and value.get('toolUseId') == body['toolUseId'] and value.get('operationId') == config['operationId'])
+                client.validate_response(value, config, ident, body['toolUseId'], body['name'], input_hash)
+                durable_record(attempts / (key + '.result.json'), receipt_bytes)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(receipt_bytes)))
                 self.end_headers()
                 self.wfile.write(receipt_bytes)
             except (OSError, ValueError, TypeError, KeyError, RecursionError):
-                failed = attempted
+                failed = failed or dispatched
                 self.send_error()
 
     try:
-        require(not (root / 'tool-socket-attempt.json').exists())
+        require(not attempts.exists() and not attempts.is_symlink())
+        attempts.mkdir(mode=0o700)
+        sync_dir(root)
         listener.bind(str(path))
         os.chmod(path, 0o600)
         listener.listen(1)
@@ -141,7 +162,7 @@ def run(root, client, source, sink):
             os.fsync(directory)
         finally:
             os.close(directory)
-        emit(sink, {'version': 1, 'kind': 'socket-ready', 'runId': config['runId'],
+        emit(sink, {'version': 2, 'kind': 'socket-ready', 'runId': config['runId'],
             'operationId': config['operationId'], 'pid': os.getpid(), 'startTicks': fields[19]})
         while not failed:
             readable, _, _ = select.select([listener, source], [], [])

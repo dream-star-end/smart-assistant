@@ -2,6 +2,7 @@
 import { EventEmitter } from 'node:events'
 import { CC5_BRIDGE_MAX_FRAME_BYTES } from './cc5BridgePort.js'
 import { CC5_FIXED_TOOL_NAME, type Cc5ObservedTool, type Cc5ToolRequest } from './cc5FixedTool.js'
+import { CC5_NATIVE_TOOLS, cc5ToolInputSha256, validateCc5NativeToolInput } from './cc5NativeTool.js'
 
 function rejectObservation(): never {
   throw new Error('CC5_ORIGINAL_TOOL_OBSERVATION_INVALID')
@@ -12,11 +13,30 @@ export class Cc5ToolObservation {
   private buffer = ''
   private ended = false
   private nativeId: string | undefined
-  private actual: Readonly<Cc5ObservedTool> | undefined
-  constructor(private readonly operationId: string) {}
+  private readonly actual = new Map<string, Readonly<Cc5ObservedTool>>()
+  private readonly seen = new Set<string>()
+  private active = true
+  constructor(private readonly operationId: string, private readonly options: { legacyFixedTool?: boolean } = {}) {}
+  beginTurn(): void {
+    if (this.ended || this.buffer) rejectObservation()
+    this.actual.clear()
+    this.active = true
+  }
+  endTurn(): void { this.active = false }
+  get toolUseIds(): readonly string[] { return [...this.actual.keys()] }
+  private inputHash(name: string, input: unknown): string {
+    if (this.options.legacyFixedTool && name === CC5_FIXED_TOOL_NAME) {
+      if (!input || typeof input !== 'object' || Array.isArray(input) ||
+        Object.keys(input).length !== 1 || (input as { operationId?: unknown }).operationId !== this.operationId) rejectObservation()
+      return this.operationId
+    }
+    if (!(CC5_NATIVE_TOOLS as readonly string[]).includes(name)) rejectObservation()
+    validateCc5NativeToolInput(name, input)
+    return cc5ToolInputSha256(input)
+  }
   ingest(bytes: Uint8Array): void {
     if (this.ended) rejectObservation()
-    const previous = this.actual
+    const previous = this.actual.size
     try {
       this.buffer += this.decoder.decode(bytes, { stream: true })
       if (Buffer.byteLength(this.buffer) > CC5_BRIDGE_MAX_FRAME_BYTES) rejectObservation()
@@ -28,12 +48,12 @@ export class Cc5ToolObservation {
       }
     } catch (error) {
       this.ended = true
-      this.actual = undefined
+      this.actual.clear()
       this.events.emit('ended')
       throw error
     }
     // No waiter is released until all complete rows in this ingest have passed.
-    if (this.actual !== previous) this.events.emit('complete')
+    if (this.actual.size !== previous) this.events.emit('complete')
   }
   finish(): void {
     this.ended = true
@@ -64,39 +84,35 @@ export class Cc5ToolObservation {
       if (value.session_id) this.nativeId = value.session_id
       return
     }
-    let candidate: Cc5ObservedTool | undefined
     for (const block of value.message.content) {
       if (block.type !== 'tool_use') continue
       if (
         value.parent_tool_use_id != null ||
         !value.session_id ||
         !block.id ||
-        block.name !== CC5_FIXED_TOOL_NAME ||
-        typeof block.id !== 'string'
+        !this.active ||
+        typeof block.name !== 'string' ||
+        typeof block.id !== 'string' || block.id.length > 65536
       )
         rejectObservation()
-      const input = block.input as { operationId?: unknown } | null
-      if (
-        !input ||
-        typeof input !== 'object' ||
-        Array.isArray(input) ||
-        Object.keys(input).length !== 1 ||
-        input.operationId !== this.operationId
-      )
-        rejectObservation()
+      const inputHash = this.inputHash(block.name, block.input)
       const observed = {
         nativeSessionId: value.session_id,
         toolUseId: block.id,
         name: block.name,
-        input: { operationId: this.operationId },
+        input: structuredClone(block.input),
       }
-      if (this.actual && JSON.stringify(this.actual) !== JSON.stringify(observed))
-        rejectObservation()
-      if (candidate) rejectObservation()
-      candidate = observed
+      const previous = this.actual.get(block.id)
+      if (previous) {
+        if (previous.nativeSessionId !== observed.nativeSessionId || previous.name !== observed.name ||
+          this.inputHash(previous.name, previous.input) !== inputHash) rejectObservation()
+      } else {
+        if (this.seen.has(block.id) || this.seen.size >= 10000 || this.options.legacyFixedTool && this.actual.size) rejectObservation()
+        this.seen.add(block.id)
+        this.actual.set(block.id, Object.freeze(observed))
+      }
     }
     if (value.session_id) this.nativeId = value.session_id
-    if (candidate && !this.actual) this.actual = Object.freeze(candidate)
   }
   waitFor(
     request: Pick<Cc5ToolRequest, 'nativeSessionId' | 'toolUseId' | 'name' | 'arguments'>,
@@ -120,21 +136,16 @@ export class Cc5ToolObservation {
           closed()
           return
         }
-        if (!this.actual) return
+        const actual = this.actual.get(expected.toolUseId)
+        if (!actual && !(this.options.legacyFixedTool && this.actual.size)) return
         cleanup()
-        const args = expected.arguments as { operationId?: unknown } | null
-        if (
-          expected.nativeSessionId !== this.actual.nativeSessionId ||
-          expected.toolUseId !== this.actual.toolUseId ||
-          expected.name !== this.actual.name ||
-          !args ||
-          typeof args !== 'object' ||
-          Array.isArray(args) ||
-          Object.keys(args).length !== 1 ||
-          args.operationId !== this.operationId
-        ) {
+        let matches = false
+        try { matches = !!actual && expected.nativeSessionId === actual.nativeSessionId &&
+          expected.name === actual.name && this.inputHash(expected.name, expected.arguments) === this.inputHash(actual.name, actual.input) }
+        catch { /* Invalid arguments are never an observation. */ }
+        if (!matches) {
           reject(new Error('CC5_ORIGINAL_TOOL_SCOPE_MISMATCH'))
-        } else resolve(structuredClone(this.actual))
+        } else resolve(structuredClone(actual!))
       }
       this.events.on('complete', check)
       this.events.once('ended', closed)

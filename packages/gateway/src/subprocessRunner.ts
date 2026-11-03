@@ -569,7 +569,7 @@ export class SubprocessRunner extends EventEmitter {
     let spawnOpts: SpawnOpts
     try {
     if (this.opts.cc5BridgePort) {
-      spawnOpts = await this.opts.cc5BridgePort.prepare()
+      spawnOpts = await this.opts.cc5BridgePort.prepare({ cwd: this.opts.agentBaseDir })
       this._boundRepoBinding = null
       this.spawnedUpstreamIsEgress = false
       this.pendingOfficialSpawnEnv = null

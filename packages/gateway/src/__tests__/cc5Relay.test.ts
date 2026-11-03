@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
-import { PassThrough, Writable } from 'node:stream'
+import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
 import {
   MODEL_AUTHORITY_VERSION,
@@ -15,14 +15,16 @@ import {
   encodeAuthorityEnvelope,
   encodeTurnLeaseEnvelope,
   turnLeaseSigningInput,
+  verifyAuthority,
 } from '@openclaude/protocol'
 import { type Cc5BridgeBinding, cc5ControlRequest } from '../cc5BridgePort.js'
-import { CC5_FIXED_TOOL_NAME, type Cc5ToolRequest } from '../cc5FixedTool.js'
+import type { Cc5ToolRequest } from '../cc5FixedTool.js'
+import { type Cc5ToolReceipt, cc5ToolInputSha256, cc5ToolScopeHash } from '../cc5NativeTool.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from '../cc5Relay.js'
-import { runCc5StdioBridge } from '../cc5StdioBridge.js'
 import type { Cc5FinancePort } from '../cc5Finance.js'
+import { StreamJson } from '../../box-bridge-mod/oc-bridge/hooks/frames.js'
 
-function fixture() {
+function fixture(authorityTtlMs = 120000) {
   const key = generateKeyPairSync('ed25519')
   const jwk = key.publicKey.export({ format: 'jwk' }) as { x: string }
   const keyring = new Map([['test-key', new Uint8Array(Buffer.from(jwk.x, 'base64url'))]])
@@ -47,6 +49,7 @@ function fixture() {
     uid: 912,
     containerId: 91,
     authorityTurnId: randomBytes(16).toString('hex'),
+    billingRequestId: randomUUID(),
     connectionChallenge: 'synthetic-connection',
     canonicalModel: 'box-claude-sonnet-5',
     engine: 'ccb',
@@ -54,7 +57,7 @@ function fixture() {
     securityEpoch: 12,
     executionRevision: 'test-r1',
     issuedAt: now,
-    expiresAt: now + 120000,
+    expiresAt: now + authorityTtlMs,
     executionDescriptor: {
       capabilityProfile: {},
       capabilitySchemaVersion: 1,
@@ -89,8 +92,8 @@ function fixture() {
     nativeSessionId: randomUUID(),
     toolUseId: 'toolu_actual-frame',
     rpcId: 17,
-    name: CC5_FIXED_TOOL_NAME,
-    arguments: { operationId: binding.operationId },
+    name: 'mcp__ocbridge__Read',
+    arguments: { file_path: '/task/proof.txt' },
     authority: envelope(a),
     lease: leaseEnvelope(lease),
   }
@@ -100,6 +103,8 @@ function fixture() {
     name: request.name,
     input: request.arguments,
   }
+  const producer = new StreamJson()
+  producer.sessionId = request.nativeSessionId
   const admission = {
     turnKey: request.turnKey,
     authorityTurnId: a.authorityTurnId,
@@ -117,27 +122,25 @@ function fixture() {
     admission,
     envelope,
     leaseEnvelope,
+    nextResultId: (): string => JSON.parse(producer.result({ reason: 'answer', answer: 'fixture', durationMs: 0 }, null)).uuid,
+    nextTurn: () => {
+      const payload = { ...a, authorityTurnId: randomBytes(16).toString('hex'), billingRequestId: randomUUID() }
+      return { authority: envelope(payload), lease: leaseEnvelope({ ...lease, authorityTurnId: payload.authorityTurnId }),
+        turnKey: randomBytes(32).toString('hex'), payload }
+    },
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   }
 }
 
 async function harness(
   f: ReturnType<typeof fixture>,
-  failure: 'none' | 'start' | 'stop' | 'stdin-error' = 'none',
+  failure: 'none' | 'start' | 'stop' = 'none',
   financeOverride?: Cc5FinancePort,
 ) {
   const written: Buffer[] = []
-  const input =
-    failure === 'stdin-error'
-      ? new Writable({
-          write(chunk, _encoding, callback) {
-            written.push(Buffer.from(chunk))
-            queueMicrotask(() => callback(new Error('synthetic asynchronous EPIPE')))
-          },
-        })
-      : new PassThrough()
+  const input = new PassThrough()
   const output = new PassThrough()
-  if (failure !== 'stdin-error') input.on('data', (b) => written.push(b))
+  input.on('data', (b) => written.push(b))
   let ready!: () => void
   const readyPromise = new Promise<void>((resolve) => {
     ready = resolve
@@ -146,9 +149,9 @@ async function harness(
   const startObserved = new Promise<void>((resolve) => {
     started = resolve
   })
-  let stopped!: () => void
+  let markStopped!: () => void
   const stopObserved = new Promise<void>((resolve) => {
-    stopped = resolve
+    markStopped = resolve
   })
   let starts = 0
   let stops = 0
@@ -162,7 +165,7 @@ async function harness(
     },
     async stop() {
       stops++
-      stopped()
+      markStopped()
       if (failure === 'stop') throw new Error('synthetic remote absence unproved')
       return { remoteStopped: true }
     },
@@ -170,36 +173,41 @@ async function harness(
   const runId = f.binding.runId
   const financeEvents: string[] = []
   const finance = {
-    async admit() {
+    async admit(info: Parameters<Cc5FinancePort['admit']>[0]) {
+      const authority = verifyAuthority(info.authorityEnvelope, f.keyring, Date.now())
       financeEvents.push('admit')
       return {
         async beforeHostStart() { financeEvents.push('host-effect') },
         async beforeDispatch() { financeEvents.push('dispatch-effect') },
-        async terminal() { financeEvents.push('settled'); return { state: 'proven' as const, requestId: 'fixture-request' } },
+        async terminal() { financeEvents.push('settled'); return { state: 'proven' as const, requestId: authority.billingRequestId! } },
         async stop() { financeEvents.push('stop') },
       }
     },
   }
-  const relay = new Cc5Relay(f.binding, f.keyring, runId, port, join(f.root, 'relay-journal'), financeOverride ?? finance)
+  const relay = new Cc5Relay(f.binding, f.keyring, runId, port, join(f.root, 'relay-journal'), financeOverride ?? finance,
+    { localStopTimeoutMs: 250 })
   const socketPath = relative(process.cwd(), join(f.root, 'control.sock'))
   const toolSocket = relative(process.cwd(), join(f.root, 'tool.sock'))
   relay.controlServer.listen(socketPath)
   relay.toolServer.listen(toolSocket)
   await Promise.all([once(relay.controlServer, 'listening'), once(relay.toolServer, 'listening')])
   const scope = { ...f.binding, sessionKey: f.request.sessionKey }
-  const admit = () =>
+  const admit = (turn = { authority: f.request.authority, lease: f.request.lease, turnKey: f.request.turnKey }) =>
     cc5ControlRequest(
       '/admit',
       {
         ...scope,
-        authority: f.request.authority,
-        lease: f.request.lease,
-        turnKey: f.request.turnKey,
+        ...turn,
       },
       socketPath,
     )
+  const lifecycleId = randomUUID()
+  let registered = false
+  const register = async () => { await rpc(socketPath, '/tool/register', { ...scope, lifecycleId }); registered = true }
+  const stopped = () => rpc(socketPath, '/tool/stopped', { ...scope, lifecycleId, localStopped: true })
   const close = async () => {
     ready()
+    if (registered) await stopped().catch(() => {})
     await relay.stop().catch(() => {})
     for (const server of [relay.controlServer, relay.toolServer]) {
       server.closeAllConnections()
@@ -223,6 +231,9 @@ async function harness(
     written,
     runId,
     financeEvents,
+    register,
+    stopped,
+    lifecycleId,
     counts: () => ({ starts, stops }),
   }
 }
@@ -247,514 +258,304 @@ function rpc(socketPath: string, path: string, body: unknown): Promise<Record<st
   })
 }
 
-test(
-  'budgeted admission precedes opening the stream and starts exactly one host',
-  { timeout: 15000 },
-  async (t) => {
-    for (const order of ['admit-first'])
-      await t.test(order, async () => {
-        const f = fixture()
-        const h = await harness(f)
-        const controller = new AbortController()
-        let running: Promise<void> | undefined
-        let admission: Promise<unknown> | undefined
-        try {
-          const open = () =>
-            runCc5StdioBridge({
-              binding: f.binding,
-              sessionKey: f.request.sessionKey,
-              stdin: new PassThrough(),
-              stdout: new PassThrough(),
-              socketPath: h.socketPath,
-              signal: controller.signal,
-            })
-          if (order === 'open-first') running = open()
-          else admission = h.admit()
-          await h.startObserved
-          if (order === 'open-first') admission = h.admit()
-          else running = open()
-          void running!.catch(() => {})
-          h.ready()
-          await admission
-          assert.equal(h.counts().starts, 1)
-          controller.abort()
-          await running
-          assert.deepEqual(h.counts(), { starts: 1, stops: 1 })
-          assert.equal(h.written.length, 0)
-        } finally {
-          controller.abort()
-          await running?.catch(() => {})
-          await h.close()
-          f.cleanup()
-        }
-      })
-  },
-)
 
-test('a synchronous unknown host startup is burned once and still needs independent remote stop', async () => {
-  const f = fixture()
-  const h = await harness(f, 'start')
-  try {
-    await assert.rejects(h.admit())
-    await assert.rejects(h.admit())
-    assert.deepEqual(h.counts(), { starts: 1, stops: 1 })
-    assert.equal(h.written.length, 0)
-  } finally {
-    await h.close()
-    f.cleanup()
+async function until(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2000
+  while (!check()) {
+    assert.ok(Date.now() < deadline, 'fixture observation deadline')
+    await new Promise((resolve) => setTimeout(resolve, 2))
   }
-})
-
-test('wrong signed identity fails before host startup or dispatch', async () => {
-  const f = fixture()
-  const h = await harness(f)
-  try {
-    await assert.rejects(
-      cc5ControlRequest(
-        '/admit',
-        {
-          ...h.scope,
-          authority: f.envelope({ ...f.a, uid: 999 }),
-          lease: f.request.lease,
-          turnKey: f.request.turnKey,
-        },
-        h.socketPath,
-      ),
-    )
-    assert.equal(h.counts().starts, 0)
-    assert.equal(h.written.length, 0)
-  } finally {
-    await h.close()
-    f.cleanup()
-  }
-})
-
-test('an open request without admitted finance cannot start a host', async () => {
-  const f = fixture()
-  const h = await harness(f)
-  try {
-    await assert.rejects(rpc(h.socketPath, '/session/open', { type: 'open', ...h.scope }))
-    assert.equal(h.counts().starts, 0)
-    assert.deepEqual(h.financeEvents, [])
-  } finally { await h.close(); f.cleanup() }
-})
-
-test('finance and its durable startup marker run before any potentially billable host startup', async () => {
-  const f = fixture()
-  const events: string[] = []
-  const finance: Cc5FinancePort = {
-    async admit() {
-      events.push('admit')
-      return {
-        async beforeHostStart() { events.push('host-effect'); throw new Error('fixture durable boundary failed') },
-        async beforeDispatch() { throw new Error('must not dispatch') },
-        async terminal() { throw new Error('must not settle') },
-        async stop(info) { assert.equal(info.hostStartAttempted, false); events.push('stopped-before-host') },
-      }
+}
+async function stream(h: Awaited<ReturnType<typeof harness>>) {
+  let response!: import('node:http').IncomingMessage
+  const output: Buffer[] = []
+  let ended = false
+  const req = request({ socketPath: h.socketPath, path: '/session/open', method: 'POST' })
+  req.on('error', () => {})
+  const ready = new Promise<void>((resolve, reject) => {
+    req.once('response', (res) => {
+      response = res
+      res.on('data', (bytes) => output.push(Buffer.from(bytes)))
+      res.on('end', () => { ended = true })
+      res.on('error', () => {})
+      if (res.statusCode === 200) resolve()
+      else { res.resume(); reject(new Error('stream not admitted')) }
+    })
+    req.once('error', reject)
+  })
+  req.write(`${JSON.stringify({ type: 'open', ...h.scope })}\n`)
+  await ready
+  let sequence = 0
+  return {
+    req, response, output, ended: () => ended,
+    send(content = 'offline fixture') {
+      const bytes = Buffer.from(`${JSON.stringify({ type: 'user', message: { role: 'user', content } })}\n`)
+      const frame = { seq: ++sequence, hash: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.toString('base64') }
+      req.write(`${JSON.stringify(frame)}\n`)
+      return frame
     },
   }
+}
+function original(f: ReturnType<typeof fixture>, calls: Array<{ id: string; name?: string; input?: unknown }>) {
+  return Buffer.from(`${JSON.stringify({ type: 'assistant', session_id: f.request.nativeSessionId,
+    message: { model: 'claude-sonnet-5', content: calls.map((call) => ({ type: 'tool_use', id: call.id,
+      name: call.name ?? f.request.name, input: call.input ?? f.request.arguments })) } })}\n`)
+}
+function terminal(f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}) {
+  return Buffer.from(`${JSON.stringify({ type: 'result', subtype: 'success', is_error: false,
+    session_id: f.request.nativeSessionId, uuid: f.nextResultId(),
+    usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 }, ...extra })}\n`)
+}
+async function start(f: ReturnType<typeof fixture>, finance?: Cc5FinancePort) {
   const h = await harness(f, 'none', finance)
+  await h.register()
+  h.ready()
+  await h.admit()
+  const s = await stream(h)
+  s.send()
+  await until(() => h.written.length === 1)
+  h.output.write(`${JSON.stringify({ type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: f.request.nativeSessionId })}\n`)
+  return { h, s }
+}
+async function callTool(f: ReturnType<typeof fixture>, h: Awaited<ReturnType<typeof harness>>, id: string, rpcId: number,
+  name = f.request.name, args: unknown = f.request.arguments) {
+  const remote = rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
+    rpcId, toolUseId: id, name, arguments: args, inputSha256: cc5ToolInputSha256(args) })
+  void remote.catch(() => {})
+  h.output.write(original(f, [{ id, name, input: args }]))
+  const next = await rpc(h.socketPath, '/tool/next', h.scope)
+  const delivery = next.delivery
+  assert.equal(delivery.request.toolUseId, id)
+  const receipt: Cc5ToolReceipt = { version: 2, scopeHash: cc5ToolScopeHash(delivery.request, delivery.admission), commandId: randomUUID(),
+    dockerId: f.binding.dockerId, containerDbId: f.binding.containerDbId, operationId: f.binding.operationId,
+    nativeSessionId: f.request.nativeSessionId, toolUseId: id, rpcId, name, inputSha256: cc5ToolInputSha256(args),
+    result: { content: [{ type: 'text', text: 'real host fixture result' }], isError: false }, completedAt: Date.now() }
+  return { remote, delivery, receipt,
+    complete: async (value = receipt) => {
+      const ack = await rpc(h.socketPath, '/tool/result', { ...h.scope, receipt: value })
+      assert.equal(ack.commandId, value.commandId)
+      const result = await remote
+      assert.equal(result.version, 2)
+      assert.deepEqual(result.result, value.result)
+      return result
+    } }
+}
+
+test('fresh financial admission precedes host startup; overlapping or reused identities cannot start effects', async () => {
+  const f = fixture(); const h = await harness(f)
   try {
+    const admission = h.admit()
+    await h.startObserved
+    assert.deepEqual(h.financeEvents, ['admit', 'host-effect', 'host-start'])
+    await assert.rejects(h.admit(f.nextTurn()))
+    h.ready(); await admission
     await assert.rejects(h.admit())
-    await h.relay.stop()
-    await assert.rejects(h.admit())
-    assert.deepEqual(events, ['admit', 'host-effect', 'stopped-before-host'])
-    assert.equal(h.counts().starts, 0)
+    assert.equal(h.counts().starts, 1)
     assert.equal(h.written.length, 0)
   } finally { await h.close(); f.cleanup() }
 })
 
-test('same user and Sonnet authority cannot claim another session or operation', async () => {
-  const f = fixture()
-  const h = await harness(f)
-  try {
-    for (const executionBackend of [
-      { ...f.a.executionBackend!, sessionKey: 'agent:main:webchat:dm:other_chat1' },
-      { ...f.a.executionBackend!, operationId: randomUUID() },
-    ]) await assert.rejects(cc5ControlRequest('/admit', { ...h.scope,
-      authority: f.envelope({ ...f.a, executionBackend }), lease: f.request.lease,
-      turnKey: f.request.turnKey }, h.socketPath))
-    assert.equal(h.counts().starts, 0)
-    assert.deepEqual(h.financeEvents, [])
-  } finally { await h.close(); f.cleanup() }
-})
-
-test('original result bytes wait for proven settlement; native usage receipt never uses assistant text or CLI cost',
-  { timeout: 15000 }, async () => {
-    const f = fixture()
-    let release!: () => void
-    let entered!: () => void
-    const settling = new Promise<void>((resolve) => { entered = resolve })
-    const settled = new Promise<void>((resolve) => { release = resolve })
-    const finance: Cc5FinancePort = { async admit() { return {
-      async beforeHostStart() {}, async beforeDispatch() {}, async stop() {},
-      async terminal(receipt) {
-        assert.equal(receipt.nativeSessionId, f.request.nativeSessionId)
-        assert.equal(receipt.upstreamModel, 'claude-sonnet-5')
-        assert.deepEqual(receipt.usage, { inputTokens: 7, outputTokens: 3, cacheReadTokens: 11, cacheWriteTokens: 13 })
-        entered(); await settled
-        return { state: 'proven', requestId: 'existing-request-id' }
-      },
-    } } }
-    const h = await harness(f, 'none', finance)
-    const controller = new AbortController()
-    const stdin = new PassThrough(); const stdout = new PassThrough(); const output: Buffer[] = []
-    stdout.on('data', (bytes) => output.push(bytes))
-    let running: Promise<void> | undefined
+test('wrong UID/session/container and stream-before-admission fail before finance or host effects', async () => {
+  for (const change of [{ uid: '999' }, { dockerId: 'c'.repeat(64) }, { sessionKey: 'agent:main:webchat:dm:different_chat' }]) {
+    const f = fixture(); const h = await harness(f)
     try {
-      const admitted = h.admit(); h.ready(); await admitted
-      running = runCc5StdioBridge({ binding: f.binding, sessionKey: f.binding.sessionKey, stdin, stdout,
-        socketPath: h.socketPath, signal: controller.signal })
-      void running.catch(() => {})
-      stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'fixture only' } })}\n`)
-      if (!h.written.length) await once(h.input, 'data')
-      const raw = Buffer.from(`${[
-        { type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: f.request.nativeSessionId },
-        { type: 'result', subtype: 'success', is_error: false, session_id: f.request.nativeSessionId,
-          total_cost_usd: 999999, result: '{"input_tokens":999999}', usage: { input_tokens: 7,
-            output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 } },
-      ].map((row) => JSON.stringify(row)).join('\n')}\n`)
-      h.output.write(raw)
-      await settling
-      assert.equal(Buffer.concat(output).includes(Buffer.from('"type":"result"')), false)
-      release()
-      const deadline = Date.now() + 2000
-      while (Buffer.concat(output).length < raw.length && Date.now() < deadline)
-        await new Promise<void>((resolve) => setImmediate(resolve))
-      assert.deepEqual(Buffer.concat(output), raw)
-      controller.abort(); await running
-      assert.equal(h.written.length, 1)
-    } finally {
-      release(); controller.abort(); await running?.catch(() => {}); await h.close(); f.cleanup()
-    }
-  })
-
-test('pending or throwing native settlement withholds terminal and records a started operation at stop',
-  { timeout: 15000 }, async (t) => {
-    for (const failure of ['pending', 'throw']) await t.test(failure, async () => {
-      const f = fixture()
-      const stops: unknown[] = []
-      let settlements = 0
-      const finance: Cc5FinancePort = { async admit() { return {
-        async beforeHostStart() {}, async beforeDispatch() {},
-        async terminal() {
-          settlements++
-          if (failure === 'throw') throw new Error('fixture commit acknowledgement unknown')
-          return { state: 'pending' }
-        },
-        async stop(info) { stops.push(info) },
-      } } }
-      const h = await harness(f, 'none', finance)
-      const controller = new AbortController(); const stdin = new PassThrough(); const stdout = new PassThrough()
-      const output: Buffer[] = []; stdout.on('data', (bytes) => output.push(bytes))
-      let running: Promise<void> | undefined
-      try {
-        const admitted = h.admit(); h.ready(); await admitted
-        running = runCc5StdioBridge({ binding: f.binding, sessionKey: f.binding.sessionKey, stdin, stdout,
-          socketPath: h.socketPath, signal: controller.signal })
-        void running.catch(() => {})
-        stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'fixture only' } })}\n`)
-        if (!h.written.length) await once(h.input, 'data')
-        h.output.write(`${[
-          { type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: f.request.nativeSessionId },
-          { type: 'result', subtype: 'success', is_error: false, session_id: f.request.nativeSessionId,
-            usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 } },
-        ].map((row) => JSON.stringify(row)).join('\n')}\n`)
-        await h.stopObserved
-        await h.relay.stop()
-        assert.equal(Buffer.concat(output).includes(Buffer.from('"type":"result"')), false)
-        assert.equal(settlements, 1)
-        assert.deepEqual(stops, [{ hostStartAttempted: true, userSubmitted: true, remoteStopped: true }])
-        await assert.rejects(h.admit())
-        assert.equal(h.counts().starts, 1)
-      } finally {
-        controller.abort(); await running?.catch(() => {}); await h.close(); f.cleanup()
-      }
-    })
-  })
-
-test('missing remote absence proof never returns a positive stop result', async () => {
-  const f = fixture()
-  const h = await harness(f, 'stop')
-  try {
-    const admitted = h.admit()
-    h.ready()
-    await admitted
-    await assert.rejects(cc5ControlRequest('/stop', h.scope, h.socketPath))
-    await assert.rejects(h.relay.stop())
-    assert.equal(h.counts().stops, 1)
-  } finally {
-    await h.close()
-    f.cleanup()
+      await assert.rejects(rpc(h.socketPath, '/admit', { ...h.scope, ...change, authority: f.request.authority,
+        lease: f.request.lease, turnKey: f.request.turnKey }))
+      await assert.rejects(rpc(h.socketPath, '/session/open', { type: 'open', ...h.scope }))
+      assert.deepEqual(h.financeEvents, [])
+      assert.equal(h.counts().starts, 0)
+    } finally { await h.close(); f.cleanup() }
   }
 })
 
-test(
-  'real Unix relay and stdio child correlate RPC before original frames and return one real local command receipt',
-  { timeout: 20000 },
-  async () => {
-    const f = fixture()
-    const h = await harness(f)
-    const controller = new AbortController()
-    const stdin = new PassThrough()
-    const stdout = new PassThrough()
-    const output: Buffer[] = []
-    stdout.on('data', (b) => output.push(b))
-    const raw = Buffer.from(
-      `${JSON.stringify({
-        type: 'assistant',
-        session_id: f.request.nativeSessionId,
-        message: {
-          content: [
-            {
-              type: 'tool_use',
-              id: f.request.toolUseId,
-              name: f.request.name,
-              input: f.request.arguments,
-            },
-          ],
-        },
-      })}\n`,
-    )
-    let running: Promise<void> | undefined
-    try {
-      const accepted = h.admit()
-      h.ready()
-      await accepted
-      running = runCc5StdioBridge({
-        binding: f.binding,
-        sessionKey: f.request.sessionKey,
-        stdin,
-        stdout,
-        socketPath: h.socketPath,
-        signal: controller.signal,
-        tools: { keyring: f.keyring, executionRoot: f.root },
-      })
-      void running.catch(() => {})
-      stdin.write(
-        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'fixture, no model' } })}\n`,
-      )
-      if (h.written.length === 0) await once(h.input, 'data')
-      const result = rpc(h.toolSocket, '/roundtrip', {
-        runId: h.runId,
-        operationId: f.binding.operationId,
-        rpcId: f.request.rpcId,
-        toolUseId: f.request.toolUseId,
-        name: f.request.name,
-        arguments: f.request.arguments,
-      })
-      // The independent MCP request may precede all original authenticated output.
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      h.output.write(raw.subarray(0, raw.length - 1))
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      h.output.write(raw.subarray(raw.length - 1))
-      const response = await result
-      assert.equal(response.receipt.exitCode, 0)
-      assert.equal(response.receipt.dockerId, f.binding.dockerId)
-      assert.equal(
-        readFileSync(join(f.root, f.binding.operationId, 'cc5-proof.txt'), 'utf8'),
-        `${response.receipt.marker}\n`,
-      )
-      assert.deepEqual(Buffer.concat(output), raw)
-      assert.equal(h.written.length, 1)
-      controller.abort()
-      await running
-      assert.deepEqual(h.counts(), { starts: 1, stops: 1 })
-    } finally {
-      controller.abort()
-      await running?.catch(() => {})
-      await h.close()
-      f.cleanup()
-    }
-  },
-)
+test('two serial user turns retain one native host/stream and settle distinct v2 receipts', async () => {
+  const f = fixture(); const { h, s } = await start(f)
+  try {
+    const first = await callTool(f, h, 'read-1', 1); await first.complete()
+    const edit = await callTool(f, h, 'edit-1', 2, 'mcp__ocbridge__Edit', { file_path: '/task/proof.txt', old_string: 'before', new_string: 'after' })
+    await edit.complete({ ...edit.receipt, result: { content: [{ type: 'text', text: 'permission denied' }], isError: true } })
+    h.output.write(terminal(f))
+    await until(() => Buffer.concat(s.output).includes(Buffer.from('"type":"result"')))
+    await assert.rejects(h.admit())
+    for (const change of [
+      { ...f.nextTurn(), turnKey: f.request.turnKey },
+      { ...f.nextTurn(), authority: f.envelope({ ...f.a, authorityTurnId: randomBytes(16).toString('hex') }) },
+    ]) await assert.rejects(h.admit(change))
+    const next = f.nextTurn(); await h.admit(next)
+    s.send('recall prior turn and read'); await until(() => h.written.length === 2)
+    const read = await callTool(f, h, 'read-2', 3); await read.complete()
+    h.output.write(terminal(f, { usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }))
+    await until(() => h.financeEvents.filter((event) => event === 'settled').length === 2)
+    assert.deepEqual(h.counts(), { starts: 1, stops: 0 })
+    assert.equal(h.financeEvents.filter((event) => event === 'host-effect').length, 2)
+    const dirs = readdirSync(join(f.root, 'relay-journal')).filter((name) => /^[a-f0-9]{32}$/.test(name))
+    assert.equal(dirs.length, 2)
+    const receipts = dirs.map((dir) => JSON.parse(readFileSync(join(f.root, 'relay-journal', dir, 'native-terminal.json'), 'utf8')))
+    assert.deepEqual(receipts.map((receipt) => receipt.usage.inputTokens).sort((a, b) => a - b), [2, 7])
+    assert.ok(receipts.every((receipt) => receipt.version === 2 && receipt.nativeSessionId === f.request.nativeSessionId))
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
 
-test(
-  'same sequence/hash is ignored and a conflicting replay stops without a second user dispatch',
-  { timeout: 15000 },
-  async () => {
-    const f = fixture()
-    const h = await harness(f)
-    let req: ReturnType<typeof request> | undefined
-    try {
-      const admission = h.admit()
-      h.ready()
-      await admission
-      const opened = new Promise<void>((resolve, reject) => {
-        req = request(
-          { socketPath: h.socketPath, path: '/session/open', method: 'POST' },
-          (res) => {
-            res.resume()
-            resolve()
-          },
-        )
-        req.once('error', reject)
-        req.on('error', () => {})
-        req.write(`${JSON.stringify({ type: 'open', ...h.scope })}\n`)
-      })
-      await opened
-      const bytes = Buffer.from(
-        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'synthetic once' } })}\n`,
-      )
-      const frame = {
-        seq: 1,
-        hash: createHash('sha256').update(bytes).digest('hex'),
-        bytes: bytes.toString('base64'),
-      }
-      req!.write(`${JSON.stringify(frame)}\n`)
-      if (h.written.length === 0) await once(h.input, 'data')
-      req!.write(`${JSON.stringify(frame)}\n`)
-      const other = Buffer.from(
-        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'conflicting' } })}\n`,
-      )
-      req!.write(
-        `${JSON.stringify({ seq: 1, hash: createHash('sha256').update(other).digest('hex'), bytes: other.toString('base64') })}\n`,
-      )
-      await h.stopObserved
-      assert.equal(h.written.length, 1)
-      assert.deepEqual(h.written[0], bytes)
-    } finally {
-      req?.destroy()
-      await h.close()
-      f.cleanup()
-    }
-  },
-)
+test('multiple original tool blocks queue serially and exact canonical input is required', async () => {
+  const f = fixture(); const { h, s } = await start(f)
+  try {
+    const first = await callTool(f, h, 'read-1', 1, f.request.name, { limit: 2, file_path: '/task/proof.txt' })
+    const second = rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
+      rpcId: 2, toolUseId: 'bash-1', name: 'mcp__ocbridge__Bash', arguments: { command: 'true' }, inputSha256: cc5ToolInputSha256({ command: 'true' }) })
+    void second.catch(() => {})
+    h.output.write(original(f, [{ id: 'bash-1', name: 'mcp__ocbridge__Bash', input: { command: 'true' } }]))
+    await first.complete()
+    const next = await rpc(h.socketPath, '/tool/next', h.scope)
+    const tool = next.delivery.request
+    const receipt = { ...first.receipt, commandId: randomUUID(), toolUseId: tool.toolUseId, rpcId: tool.rpcId, name: tool.name,
+      inputSha256: cc5ToolInputSha256(tool.arguments), scopeHash: cc5ToolScopeHash(tool, next.delivery.admission) }
+    await rpc(h.socketPath, '/tool/result', { ...h.scope, receipt })
+    assert.equal((await second).toolUseId, 'bash-1')
+    assert.equal(h.counts().stops, 0)
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
 
-test(
-  'binding expiry revokes execution yet leaves independent identity stop usable',
-  { timeout: 15000 },
-  async () => {
-    const f = fixture()
-    f.binding.expiresAt = Date.now() + 1500
-    const h = await harness(f)
-    try {
-      const admission = h.admit()
-      h.ready()
-      await admission
-      await h.stopObserved
-      const stopped = await cc5ControlRequest('/stop', h.scope, h.socketPath)
-      assert.equal(stopped.remoteStopped, true)
-      assert.equal(h.counts().stops, 1)
-      assert.equal(h.written.length, 0)
-    } finally {
-      await h.close()
-      f.cleanup()
-    }
-  },
-)
+for (const fault of ['pending', 'throw', 'wrong-request']) test(`native terminal ${fault} retains unknown and withholds terminal bytes and next admission`, async () => {
+  const f = fixture()
+  const finance: Cc5FinancePort = { async admit() { return {
+    async beforeHostStart() {}, async beforeDispatch() {}, async stop() {},
+    async terminal() { if (fault === 'throw') throw new Error('commit ACK unknown')
+      return fault === 'wrong-request' ? { state: 'proven', requestId: 'foreign-request' } : { state: 'pending' } },
+  } } }
+  const { h, s } = await start(f, finance)
+  try {
+    h.output.write(terminal(f)); await h.stopObserved
+    await h.stopped(); await h.relay.stop()
+    assert.equal(Buffer.concat(s.output).includes(Buffer.from('"type":"result"')), false)
+    await assert.rejects(h.admit(f.nextTurn()))
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
 
-test(
-  'MCP disconnect while waiting for the original row revokes the attached real tool pump before effect',
-  { timeout: 15000 },
-  async () => {
-    const f = fixture()
-    const h = await harness(f)
-    const controller = new AbortController()
-    const stdin = new PassThrough()
-    let running: Promise<void> | undefined
-    let req: ReturnType<typeof request> | undefined
-    try {
-      const admission = h.admit()
-      h.ready()
-      await admission
-      running = runCc5StdioBridge({
-        binding: f.binding,
-        sessionKey: f.request.sessionKey,
-        stdin,
-        stdout: new PassThrough(),
-        socketPath: h.socketPath,
-        signal: controller.signal,
-        tools: { keyring: f.keyring, executionRoot: f.root },
-      })
-      void running.catch(() => {})
-      stdin.write(
-        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'disconnect fixture' } })}\n`,
-      )
-      if (h.written.length === 0) await once(h.input, 'data')
-      req = request({ socketPath: h.toolSocket, path: '/roundtrip', method: 'POST' }, (res) =>
-        res.resume(),
-      )
-      req.on('error', () => {})
-      req.end(
-        JSON.stringify({
-          runId: h.runId,
-          operationId: f.binding.operationId,
-          rpcId: f.request.rpcId,
-          toolUseId: f.request.toolUseId,
-          name: f.request.name,
-          arguments: f.request.arguments,
-        }),
-      )
-      const deadline = Date.now() + 2000
-      while (!existsSync(join(f.root, 'relay-journal/tool-attempt.json')) && Date.now() < deadline)
-        await new Promise((resolve) => setTimeout(resolve, 5))
-      assert.ok(existsSync(join(f.root, 'relay-journal/tool-attempt.json')))
-      req.destroy()
-      await h.stopObserved
-      h.output.write(
-        `${JSON.stringify({
-          type: 'assistant',
-          session_id: f.request.nativeSessionId,
-          message: {
-            content: [
-              {
-                type: 'tool_use',
-                id: f.request.toolUseId,
-                name: f.request.name,
-                input: f.request.arguments,
-              },
-            ],
-          },
-        })}\n`,
-      )
-      await assert.rejects(running)
-      assert.equal(existsSync(join(f.root, f.binding.operationId)), false)
-      assert.equal(h.counts().stops, 1)
-    } finally {
-      req?.destroy()
-      controller.abort()
-      await running?.catch(() => {})
-      await h.close()
-      f.cleanup()
-    }
-  },
-)
+test('a terminal cannot settle while any original tool lacks a completed result', async () => {
+  const f = fixture(); const { h, s } = await start(f)
+  try {
+    const tool = await callTool(f, h, 'read-1', 1)
+    h.output.write(terminal(f)); await h.stopObserved
+    await assert.rejects(tool.remote)
+    assert.equal(h.financeEvents.includes('settled'), false)
+    await h.stopped(); await h.relay.stop()
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
 
-test(
-  'an asynchronous host stdin EPIPE invokes independent stop instead of escaping as an unhandled error',
-  { timeout: 15000 },
-  async () => {
-    const f = fixture()
-    const h = await harness(f, 'stdin-error')
-    const controller = new AbortController()
-    const stdin = new PassThrough()
-    let running: Promise<void> | undefined
-    try {
-      const admission = h.admit()
-      h.ready()
-      await admission
-      running = runCc5StdioBridge({
-        binding: f.binding,
-        sessionKey: f.request.sessionKey,
-        stdin,
-        stdout: new PassThrough(),
-        socketPath: h.socketPath,
-        signal: controller.signal,
-      })
-      void running.catch(() => {})
-      stdin.write(
-        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'EPIPE fixture' } })}\n`,
-      )
-      await h.stopObserved
-      await assert.rejects(running)
-      assert.equal(h.written.length, 1)
-      assert.equal(h.counts().stops, 1)
-    } finally {
-      controller.abort()
-      await running?.catch(() => {})
-      await h.close()
-      f.cleanup()
-    }
-  },
-)
+test('changed observed arguments or a duplicate RPC cannot dispatch another tool effect', async () => {
+  const f = fixture(); const { h, s } = await start(f)
+  try {
+    const tool = await callTool(f, h, 'read-1', 1); await tool.complete()
+    await assert.rejects(rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
+      rpcId: 1, toolUseId: 'read-2', name: f.request.name, arguments: f.request.arguments, inputSha256: cc5ToolInputSha256(f.request.arguments) }))
+    await h.stopObserved
+    assert.equal(h.financeEvents.includes('settled'), false)
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('combined stop wakes output cleanup and requires the exact lifecycle clean-stop proof', async () => {
+  const f = fixture(); const { h, s } = await start(f)
+  try {
+    let proven = false
+    const stopping = h.relay.stop().then(() => { proven = true })
+    await until(s.ended)
+    assert.equal(proven, false)
+    await assert.rejects(rpc(h.socketPath, '/tool/stopped', { ...h.scope, lifecycleId: randomUUID(), localStopped: true }))
+    assert.equal(proven, false)
+    await h.stopped(); await stopping
+    assert.equal(proven, true)
+    await assert.rejects(h.admit(f.nextTurn()))
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('missing local clean exit times out as unknown and cannot be repaired into a successful stop', async () => {
+  const f = fixture(); const { h, s } = await start(f)
+  try {
+    await assert.rejects(h.relay.stop())
+    await h.stopped()
+    await assert.rejects(h.relay.stop())
+    await assert.rejects(h.admit(f.nextTurn()))
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('independent remote absence proof is still required when local ToolHost stopped cleanly', async () => {
+  const f = fixture(); const h = await harness(f, 'stop')
+  try {
+    await h.register(); h.ready(); await h.admit(); await h.stopped()
+    await assert.rejects(h.relay.stop())
+    assert.equal(h.counts().stops, 1)
+  } finally { await h.close(); f.cleanup() }
+})
+
+test('unknown startup is burned once and wrong signed authority never starts a host', async () => {
+  const f = fixture(); const h = await harness(f, 'start')
+  try {
+    h.ready(); await assert.rejects(h.admit()); await assert.rejects(h.admit())
+    assert.equal(h.counts().starts, 1)
+  } finally { await h.close(); f.cleanup() }
+  const other = fixture(); const healthy = await harness(other)
+  try {
+    await assert.rejects(rpc(healthy.socketPath, '/admit', { ...healthy.scope, authority: other.envelope({ ...other.a, uid: 999 }),
+      lease: other.request.lease, turnKey: other.request.turnKey }))
+    assert.equal(healthy.counts().starts, 0)
+    assert.deepEqual(healthy.financeEvents, [])
+  } finally { await healthy.close(); other.cleanup() }
+})
+
+test('same stream sequence/hash is ignored but a conflicting input replay stops before a second dispatch', async () => {
+  const f = fixture(); const { h, s } = await start(f)
+  try {
+    const first = JSON.parse(JSON.stringify({ seq: 1, bytes: h.written[0]!.toString('base64'),
+      hash: createHash('sha256').update(h.written[0]!).digest('hex') }))
+    s.req.write(`${JSON.stringify(first)}\n`)
+    const bytes = Buffer.from(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'conflicting' } })}\n`)
+    s.req.write(`${JSON.stringify({ seq: 1, bytes: bytes.toString('base64'), hash: createHash('sha256').update(bytes).digest('hex') })}\n`)
+    await h.stopObserved
+    assert.equal(h.written.length, 1)
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('tool execution requires lifecycle registration and the claimed canonical input hash', async () => {
+  const f = fixture(); const h = await harness(f)
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    h.ready(); await h.admit(); s = await stream(h); s.send()
+    await until(() => h.written.length === 1)
+    const body = { runId: h.runId, operationId: f.binding.operationId, rpcId: 1, toolUseId: 'read-1',
+      name: f.request.name, arguments: f.request.arguments, inputSha256: cc5ToolInputSha256(f.request.arguments) }
+    await assert.rejects(rpc(h.toolSocket, '/roundtrip', body))
+    await h.register()
+    await assert.rejects(rpc(h.toolSocket, '/roundtrip', { ...body, inputSha256: '0'.repeat(64) }))
+    assert.equal(h.counts().stops, 0)
+    assert.equal(readdirSync(join(f.root, 'relay-journal', f.a.authorityTurnId)).some((name) => name.includes('attempt')), false)
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('admitted authority may expire while the current lease still permits tool delivery and receipt', async () => {
+  const f = fixture(10000)
+  const { h, s } = await start(f)
+  const realNow = Date.now
+  try {
+    const remote = rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
+      rpcId: 1, toolUseId: 'read-1', name: f.request.name, arguments: f.request.arguments, inputSha256: cc5ToolInputSha256(f.request.arguments) })
+    void remote.catch(() => {})
+    await until(() => readdirSync(join(f.root, 'relay-journal', f.a.authorityTurnId)).some((name) => name.endsWith('-attempt.json')))
+    Date.now = () => f.a.expiresAt + 1000
+    h.output.write(original(f, [{ id: 'read-1' }]))
+    const { delivery } = await rpc(h.socketPath, '/tool/next', h.scope)
+    const receipt: Cc5ToolReceipt = { version: 2, scopeHash: cc5ToolScopeHash(delivery.request, delivery.admission), commandId: randomUUID(),
+      dockerId: f.binding.dockerId, containerDbId: f.binding.containerDbId, operationId: f.binding.operationId,
+      nativeSessionId: f.request.nativeSessionId, toolUseId: 'read-1', rpcId: 1, name: f.request.name,
+      inputSha256: cc5ToolInputSha256(f.request.arguments), result: { content: [{ type: 'text', text: 'complete' }], isError: false }, completedAt: Date.now() }
+    await rpc(h.socketPath, '/tool/result', { ...h.scope, receipt })
+    assert.deepEqual((await remote).result, receipt.result)
+    const next = await callTool(f, h, 'read-2', 2)
+    await next.complete()
+    h.output.write(terminal(f))
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(h.financeEvents.includes('settled'), true)
+    Date.now = realNow
+    assert.equal(h.counts().stops, 0)
+    assert.equal(readdirSync(join(f.root, 'relay-journal', f.a.authorityTurnId)).filter((name) => name.endsWith('-completed.json')).length, 2)
+  } finally { Date.now = realNow; s.req.destroy(); await h.close(); f.cleanup() }
+})

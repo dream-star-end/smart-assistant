@@ -108,6 +108,7 @@ function envelopes(key: ReturnType<typeof generateKeyPairSync>, b: Cc5BridgeBind
     uid: 912,
     containerId: 91,
     authorityTurnId: 'a'.repeat(32),
+    billingRequestId: 'fixture-only-request',
     connectionChallenge: 'fixture-connection',
     canonicalModel: 'box-claude-sonnet-5',
     engine: 'ccb',

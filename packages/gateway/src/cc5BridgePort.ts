@@ -10,7 +10,7 @@ import {
   statSync,
 } from 'node:fs'
 import { request } from 'node:http'
-import { dirname } from 'node:path'
+import { dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   type AuthorityKeyring,
@@ -142,7 +142,7 @@ export interface Cc5BridgePort {
   readonly bindingId: string
   readonly executionBackend: Cc5ExecutionBackend
   readonly canonicalModel: string
-  prepare(): Promise<SpawnOpts>
+  prepare(input?: { cwd: string }): Promise<SpawnOpts>
   admit(input: { authority: TurnModelAuthority; turnKey: string; model: string }): Promise<void>
   renew(leaseEnvelope: string): Promise<void>
   close(): Promise<void>
@@ -150,7 +150,7 @@ export interface Cc5BridgePort {
 
 /** One request, no transport retries. A lost ACK is not permission to resubmit. */
 export function cc5ControlRequest(
-  path: '/admit' | '/renew' | '/stop',
+  path: '/admit' | '/renew' | '/stop' | '/tool/register' | '/tool/stopped',
   body: Readonly<Record<string, unknown>>,
   socketPath = CC5_RELAY_SOCKET,
 ): Promise<Record<string, unknown>> {
@@ -159,6 +159,7 @@ export function cc5ControlRequest(
     const req = request(
       {
         socketPath,
+        agent: false,
         path,
         method: 'POST',
         headers: {
@@ -205,6 +206,7 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
   private stopPromise?: Promise<void>
   private closed = false
   private active = false
+  private admitting = false
   constructor(
     private readonly binding: Readonly<Cc5BridgeBinding>,
     private readonly sessionKey: string,
@@ -217,9 +219,11 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
       operationId: binding.operationId })
     this.canonicalModel = binding.canonicalModel
   }
-  async prepare(): Promise<SpawnOpts> {
+  async prepare(input?: { cwd: string }): Promise<SpawnOpts> {
     requireCc5(!this.closed && this.binding.expiresAt > Date.now())
     const entry = fileURLToPath(new URL('../dist/cc5StdioBridge.js', import.meta.url))
+    const cwd = input?.cwd ?? dirname(entry)
+    requireCc5(isAbsolute(cwd) && statSync(cwd).isDirectory())
     try {
       const meta = statSync(entry)
       if (!meta.isFile() || meta.size === 0) throw new Error('empty')
@@ -230,7 +234,7 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
       command: process.execPath,
       args: ['--conditions=openclaude-precompiled', entry, this.sessionKey],
       ccbBinaryDir: dirname(entry),
-      subprocessCwd: dirname(entry),
+      subprocessCwd: cwd,
       env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' },
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
@@ -257,7 +261,7 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     const turnKey = input.turnKey
     requireCc5(
       !this.closed &&
-        !this.active &&
+        !this.admitting &&
         input.model === this.binding.canonicalModel &&
         input.authority.executionDescriptor.canonicalModel === this.binding.canonicalModel &&
         input.authority.executionDescriptor.executionBackend?.kind === this.binding.backendKind &&
@@ -268,11 +272,13 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
         lease &&
         turnKey,
     )
-    // This one-round test profile never opens a second admission, even on a lost ACK.
+    // The relay owns the per-turn fence. A lost ACK closes this port; it is never replayed.
+    this.admitting = true
     this.active = true
     const expected = createHash('sha256').update(authority).update('\0').update(lease).digest('hex')
     const response = await this.call('/admit', { ...this.scope(), authority, lease, turnKey })
     requireCc5(!this.closed && response.admissionHash === expected && response.ready === true)
+    this.admitting = false
   }
   async renew(leaseEnvelope: string): Promise<void> {
     requireCc5(!this.closed && this.active && this.binding.expiresAt > Date.now())

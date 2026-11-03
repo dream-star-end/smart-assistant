@@ -1,4 +1,4 @@
-/** One fixed tool effect in the execution container, correlated with original host stdout. */
+/** Serialized real tools in the execution container, correlated with original host stdout. */
 import { request } from 'node:http'
 import {
   type AuthorityKeyring,
@@ -7,11 +7,9 @@ import {
   verifyTurnLease,
 } from '@openclaude/protocol'
 import { CC5_RELAY_SOCKET, type Cc5BridgeBinding } from './cc5BridgePort.js'
-import {
-  Cc5FixedToolExecutor,
-  type Cc5FixedToolReceipt,
-  type Cc5ToolRequest,
-} from './cc5FixedTool.js'
+import type { Cc5ToolRequest } from './cc5FixedTool.js'
+import { Cc5NativeToolExecutor } from './cc5NativeToolExecutor.js'
+import type { Cc5ToolResult } from './cc5NativeTool.js'
 import type { Cc5ToolObservation } from './cc5ToolObservation.js'
 
 export interface Cc5ToolDelivery {
@@ -37,6 +35,7 @@ export function cc5ToolRequest(
     const req = request(
       {
         socketPath,
+        agent: false,
         path,
         method: 'POST',
         signal,
@@ -84,9 +83,10 @@ export async function runCc5ToolPump(input: {
   observation: Cc5ToolObservation
   signal: AbortSignal
   socketPath?: string
+  executeTool: (request: Cc5ToolRequest) => Promise<Cc5ToolResult>
   /** Only fixtures override the persistent production root. */
   executionRoot?: string
-}): Promise<Cc5FixedToolReceipt> {
+}): Promise<void> {
   if (input.keyring.size === 0) throw new Error('CC5_TOOL_KEYRING_MISSING')
   if (input.sessionKey !== input.binding.sessionKey) throw new Error('CC5_TOOL_SCOPE_MISMATCH')
   const scope = {
@@ -97,14 +97,11 @@ export async function runCc5ToolPump(input: {
     operationId: input.binding.operationId,
     sessionKey: input.sessionKey,
   }
-  let delivery: Cc5ToolDelivery | undefined
   while (!input.signal.aborted) {
     const value = await cc5ToolRequest('/tool/next', scope, input.signal, input.socketPath)
     if (value.delivery === null) continue // bounded long-poll; no effect has been attempted.
-    delivery = structuredClone(value.delivery) as Cc5ToolDelivery
-    break
-  }
-  if (!delivery || input.signal.aborted) throw new Error('CC5_TOOL_CHANNEL_CLOSED')
+    const delivery = structuredClone(value.delivery) as Cc5ToolDelivery
+    if (!delivery || input.signal.aborted) throw new Error('CC5_TOOL_CHANNEL_CLOSED')
   const { request: tool, admission } = delivery
   const now = Date.now()
   const authority = verifyAuthority(tool.authority, input.keyring, now, { allowExpired: true })
@@ -122,15 +119,14 @@ export async function runCc5ToolPump(input: {
     throw new Error('CC5_TOOL_ADMISSION_MISMATCH')
   const actual = await input.observation.waitFor(tool, input.signal)
   if (input.signal.aborted) throw new Error('CC5_TOOL_CHANNEL_CLOSED')
-  const executor = new Cc5FixedToolExecutor(
+  const executor = new Cc5NativeToolExecutor(
     input.binding,
-    input.sessionKey,
     input.keyring,
-    admission,
-    input.executionRoot,
+    input.executeTool,
+    input.executionRoot ?? '/home/agent/.openclaude/.cc5-native-tools',
   )
   // execute verifies all signatures, expiry and binding again after observation's await.
-  const receipt = await executor.execute(tool, actual)
+  const receipt = await executor.execute(tool, actual, admission)
   const ack = await cc5ToolRequest(
     '/tool/result',
     { ...scope, receipt },
@@ -138,5 +134,5 @@ export async function runCc5ToolPump(input: {
     input.socketPath,
   )
   if (ack.commandId !== receipt.commandId) throw new Error('CC5_TOOL_RESULT_ACK_UNKNOWN')
-  return receipt
+  }
 }

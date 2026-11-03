@@ -4,6 +4,7 @@
 Run only as /usr/bin/python3 -I <pinned-script> <approved-task-root>.
 The independent tool socket cannot admit a turn or control the original host.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -14,7 +15,10 @@ import stat
 import sys
 
 MAX_FRAME = 8 * 1024 * 1024
-MAX_REPLY = 131072
+MAX_REPLY = 163840
+MAX_RESULT = 131072
+SAFE_INTEGER = 2**53 - 1
+TOOLS = ('Read', 'Edit', 'Bash')
 ROOT = re.compile(r"/home/box/oc-agentremote-t1555u-[a-z0-9-]{16,80}\Z")
 UUID = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z")
 
@@ -61,19 +65,78 @@ def read_config(root):
     finally:
         os.close(fd)
     if (not isinstance(config, dict) or set(config) != {"version", "operationId", "runId"}
-            or config["version"] != 1 or not isinstance(config["operationId"], str)
+            or type(config["version"]) is not int or config["version"] != 2 or not isinstance(config["operationId"], str)
             or not UUID.fullmatch(config["operationId"]) or not isinstance(config["runId"], str)
             or not UUID.fullmatch(config["runId"])):
         raise ValueError("config-shape")
     return config
 
 
-def roundtrip(root, config, ident, params):
+def valid_strings(value):
+    if isinstance(value, str):
+        value.encode('utf-8', errors='strict')
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            valid_strings(key)
+            valid_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            valid_strings(item)
+
+
+def canonical(value):
+    valid_strings(value)
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+
+
+def tool_arguments(name, args):
+    if name not in TOOLS or not isinstance(args, dict):
+        raise ValueError('invalid-tool')
+    required, optional = {
+        'Read': ({'file_path'}, {'offset', 'limit'}),
+        'Edit': ({'file_path', 'old_string', 'new_string'}, {'replace_all'}),
+        'Bash': ({'command'}, {'description', 'timeout'}),
+    }[name]
+    if not required <= set(args) or not set(args) <= required | optional:
+        raise ValueError('invalid-tool')
+    for key, value in args.items():
+        if key in ('offset', 'limit', 'timeout'):
+            maximum = 30000 if key == 'timeout' else SAFE_INTEGER
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError('invalid-tool')
+        elif key == 'replace_all':
+            if type(value) is not bool:
+                raise ValueError('invalid-tool')
+        elif not isinstance(value, str) or ('\x00' in value) or (key in ('file_path', 'command') and not value):
+            raise ValueError('invalid-tool')
+    return hashlib.sha256(canonical(args)).hexdigest()
+
+
+def validate_response(value, config, ident, tool_id, name, input_hash):
+    required = {'version', 'ok', 'runId', 'operationId', 'rpcId', 'toolUseId', 'name', 'inputSha256', 'result'}
+    if (not isinstance(value, dict) or not required <= set(value) or not set(value) <= required | {'receipt'}
+            or type(value['version']) is not int or value['version'] != 2 or value['ok'] is not True
+            or value['runId'] != config['runId'] or value['operationId'] != config['operationId']
+            or type(value['rpcId']) is not type(ident) or value['rpcId'] != ident
+            or value['toolUseId'] != tool_id or value['name'] != name or value['inputSha256'] != input_hash):
+        raise ValueError('receipt-mismatch')
+    result = value['result']
+    if (not isinstance(result, dict) or set(result) != {'content', 'isError'}
+            or type(result['isError']) is not bool or not isinstance(result['content'], list)
+            or any(not isinstance(item, dict) or not isinstance(item.get('type'), str) or not item['type']
+                   for item in result['content']) or len(canonical(result)) > MAX_RESULT):
+        raise ValueError('result-mismatch')
+    valid_strings(value)
+    return result
+
+
+def call_tool(root, config, ident, params):
     args = params.get("arguments")
     meta = params.get("_meta")
     tool_id = meta.get("claudecode/toolUseId") if isinstance(meta, dict) else None
-    if (params.get("name") != "roundtrip" or args != {"operationId": config["operationId"]}
-            or not isinstance(tool_id, str) or not 0 < len(tool_id.encode("utf-8")) <= 65536
+    name = params.get('name')
+    input_hash = tool_arguments(name, args)
+    if (not isinstance(tool_id, str) or not 0 < len(tool_id.encode("utf-8", errors='strict')) <= 65536
             or ident == tool_id):
         raise ValueError("invalid-tool")
     path = root / "tool.sock"
@@ -82,8 +145,10 @@ def roundtrip(root, config, ident, params):
         raise ValueError("socket-mode")
     body = json.dumps({"runId": config["runId"], "operationId": config["operationId"],
                        "rpcId": ident, "toolUseId": tool_id,
-                       "name": "mcp__ocbridge__roundtrip", "arguments": args},
-                      separators=(",", ":")).encode("utf-8")
+                       "name": 'mcp__ocbridge__' + name, "arguments": args, 'inputSha256': input_hash},
+                      ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(body) > 131072:
+        raise ValueError('invalid-tool')
     connection = http.client.HTTPConnection("localhost", timeout=45)
     connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.sock.settimeout(45)
@@ -97,20 +162,7 @@ def roundtrip(root, config, ident, params):
         if response.status != 200 or len(data) > MAX_REPLY:
             raise ValueError("delivery-unknown")
         value = strict_json(data)
-        if (not isinstance(value, dict) or value.get("ok") is not True
-                or type(value.get("rpcId")) is not type(ident) or value.get("rpcId") != ident
-                or value.get("toolUseId") != tool_id or value.get("operationId") != config["operationId"]
-                or not isinstance(value.get("receipt"), dict) or value["receipt"].get("exitCode") != 0
-                or isinstance(value["receipt"].get("exitCode"), bool)
-                or value["receipt"].get("operationId") != config["operationId"]
-                or value["receipt"].get("toolUseId") != tool_id
-                or type(value["receipt"].get("rpcId")) is not type(ident)
-                or value["receipt"].get("rpcId") != ident
-                or not isinstance(value["receipt"].get("dockerId"), str)
-                or not re.fullmatch(r"[a-f0-9]{64}", value["receipt"]["dockerId"])):
-            raise ValueError("receipt-mismatch")
-        return {"content": [{"type": "text", "text": json.dumps(value["receipt"], ensure_ascii=True)}],
-                "isError": False}
+        return validate_response(value, config, ident, tool_id, 'mcp__ocbridge__' + name, input_hash)
     finally:
         connection.close()
 
@@ -121,7 +173,7 @@ def main():
     root = Path(sys.argv[1])
     config = read_config(root)
     seen = set()
-    attempted = False
+    seen_tools = set()
     while True:
         line = sys.stdin.buffer.readline(MAX_FRAME + 2)
         if not line:
@@ -130,6 +182,7 @@ def main():
             return 126
         try:
             request = strict_json(line)
+            valid_strings(request)
         except (ValueError, RecursionError, UnicodeError):
             failure(None, -32700, "Parse error")
             continue
@@ -158,26 +211,38 @@ def main():
         elif method == "ping":
             emit({"jsonrpc": "2.0", "id": ident, "result": {}})
         elif method == "tools/list":
-            emit({"jsonrpc": "2.0", "id": ident, "result": {"tools": [{"name": "roundtrip",
-                  "description": "Run the one approved proof in the personal execution container; returns real file/hash/exit receipt.",
-                  "inputSchema": {"type": "object", "properties": {"operationId": {
-                      "type": "string", "const": config["operationId"]}},
-                      "required": ["operationId"], "additionalProperties": False}}]}})
+            properties = {
+                'Read': {'file_path': {'type': 'string', 'minLength': 1}, 'offset': {'type': 'integer', 'minimum': 1, 'maximum': SAFE_INTEGER}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': SAFE_INTEGER}},
+                'Edit': {'file_path': {'type': 'string', 'minLength': 1}, 'old_string': {'type': 'string'}, 'new_string': {'type': 'string'}, 'replace_all': {'type': 'boolean'}},
+                'Bash': {'command': {'type': 'string', 'minLength': 1}, 'description': {'type': 'string'}, 'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 30000}},
+            }
+            required = {'Read': ['file_path'], 'Edit': ['file_path', 'old_string', 'new_string'], 'Bash': ['command']}
+            emit({'jsonrpc': '2.0', 'id': ident, 'result': {'tools': [
+                {'name': name, 'description': name + ' in the authorized personal execution container.',
+                 'inputSchema': {'type': 'object', 'properties': properties[name], 'required': required[name], 'additionalProperties': False}}
+                for name in TOOLS]}})
         elif method == "tools/call":
-            if attempted:
-                failure(ident, -32000, "Operation already attempted; never retry unknown delivery")
-                continue
             params = request.get("params")
             if not isinstance(params, dict):
                 failure(ident, -32602, "Invalid tool call")
                 continue
-            # Burn before network effect, including rejected or lost ACK.
-            attempted = True
             try:
-                result = roundtrip(root, config, ident, params)
+                tool_arguments(params.get('name'), params.get('arguments'))
+                meta = params.get('_meta')
+                tool_id = meta.get('claudecode/toolUseId') if isinstance(meta, dict) else None
+                if (not isinstance(tool_id, str) or not 0 < len(tool_id.encode('utf-8', errors='strict')) <= 65536
+                        or ident == tool_id or tool_id in seen_tools):
+                    raise ValueError('invalid-tool')
+            except (ValueError, UnicodeError):
+                failure(ident, -32602, 'Invalid or repeated tool call')
+                continue
+            seen_tools.add(tool_id)
+            try:
+                result = call_tool(root, config, ident, params)
                 emit({"jsonrpc": "2.0", "id": ident, "result": result})
-            except (ValueError, OSError, http.client.HTTPException, RecursionError):
-                failure(ident, -32000, "Fixed operation failed or delivery unknown; do not retry")
+            except (ValueError, OSError, http.client.HTTPException, RecursionError, UnicodeError):
+                failure(ident, -32000, "Tool delivery unknown; worker stopped; never retry")
+                return 1
         else:
             failure(ident, -32601, "Method not found")
 

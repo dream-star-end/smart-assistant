@@ -1,4 +1,4 @@
-/** Temporary one-round live personal web route; never constructs a pool selector. */
+/** Bound personal web route over one original interactive TUI; no pool selector. */
 import { type Cc5ExecutionBackend, CC5_NATIVE_MODEL, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { createCc5BridgePort } from '../cc5BridgePort.js'
 import { cc5ResumeId } from './cc5ResumeId.js'
@@ -63,10 +63,11 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
     const id = super.nativeSessionId
     return id ? cc5ResumeId(this.cc5BindingId, id) : null
   }
-  isResumeIdCompatible(_id: string): boolean {
-    return false
+  isResumeIdCompatible(id: string): boolean {
+    return this.isRunning && id === this.nativeSessionId
   }
-  override setResumeSessionId(_id: string): void {
+  override setResumeSessionId(id: string): void {
+    if (this.isResumeIdCompatible(id)) return // Same live Writer; this does not restart or reattach.
     throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
   }
   requiresReopenForModel(model: string | undefined): boolean {

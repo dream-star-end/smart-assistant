@@ -35,6 +35,7 @@ const NATIVE_SESSION = '33333333-3333-4333-8333-333333333333'
 const DISPATCH = '44444444-4444-4444-8444-444444444444'
 const REQUEST = 'native_request_42'
 const TURN = 'b'.repeat(64)
+const AUTHORITY_TURN = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6'
 const KEY_ID = 'mak1_testkey00000001'
 const { privateKey, publicKey } = generateKeyPairSync('ed25519')
 const jwk = publicKey.export({ format: 'jwk' }) as { x: string }
@@ -67,7 +68,7 @@ function tickets(s: ModelCatalogSnapshot, over: Partial<ModelAuthorityPayload> =
   const descriptor = s.resolve(MODEL)!
   const a: ModelAuthorityPayload = {
     v: MODEL_AUTHORITY_VERSION, keyId: KEY_ID, uid: 42, containerId: 7,
-    authorityTurnId: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6', connectionChallenge: 'fixture-challenge',
+    authorityTurnId: AUTHORITY_TURN, connectionChallenge: 'fixture-challenge',
     canonicalModel: MODEL, engine: 'ccb', executionDescriptor: {
       capabilityProfile: { supportsVision: true,
         reasoning: { supported: [], codexModelDefault: null },
@@ -91,9 +92,11 @@ function tickets(s: ModelCatalogSnapshot, over: Partial<ModelAuthorityPayload> =
     leaseEnvelope: encodeTurnLeaseEnvelope(lease, sign(null, turnLeaseSigningInput(lease), privateKey)),
   }
 }
-function receipt(over: Partial<Cc5NativeTerminalReceipt> = {}): Cc5NativeTerminalReceipt {
+type LiveReceipt = Extract<Cc5NativeTerminalReceipt, { version: 2 }>
+function receipt(over: Partial<LiveReceipt> = {}): LiveReceipt {
   const b = binding()
-  return { version: 1, backendKind: b.backendKind, uid: b.uid, containerDbId: b.containerDbId,
+  return { version: 2, authorityTurnId: AUTHORITY_TURN, turnKey: TURN,
+    backendKind: b.backendKind, uid: b.uid, containerDbId: b.containerDbId,
     dockerId: b.dockerId, operationId: b.operationId, runId: b.runId, sessionKey: b.sessionKey,
     nativeSessionId: NATIVE_SESSION, canonicalModel: MODEL, upstreamModel: 'claude-sonnet-5',
     resultSha256: 'c'.repeat(64), status: 'success',
@@ -102,13 +105,17 @@ function receipt(over: Partial<Cc5NativeTerminalReceipt> = {}): Cc5NativeTermina
 
 type Settlement = Parameters<typeof settleUsageAndLedger>[1]
 type Json = Record<string, any>
+interface TestTurnIdentity { requestId: string; authorityTurnId: string; turnKey: string; dispatchId: string }
+const FIRST_TURN: TestTurnIdentity = { requestId: REQUEST, authorityTurnId: AUTHORITY_TURN, turnKey: TURN, dispatchId: DISPATCH }
+const SECOND_TURN: TestTurnIdentity = { requestId: 'native_request_43', authorityTurnId: 'e'.repeat(32),
+  turnKey: 'f'.repeat(64), dispatchId: '55555555-5555-4555-8555-555555555555' }
 /** This models only persisted rows and CAS outcomes; it does not recalculate money. */
 class FinancialStore {
   events: string[] = []
   journal: { state: string; ctx: Json; claim?: string } | undefined
   settled: Settlement | undefined
-  dispatchTurn: string | null = TURN
-  authorityTurn: string | null = TURN
+  dispatchTurn: string | null
+  authorityTurn: string | null
   dispatchExists = true
   bindTurnConflict = false
   duplicateJournal = false
@@ -118,6 +125,10 @@ class FinancialStore {
   attribution: string | null | undefined
   attributionCost: string | undefined
   attributionLedger: string | null | undefined
+  constructor(readonly identity = FIRST_TURN) {
+    this.dispatchTurn = identity.turnKey
+    this.authorityTurn = identity.turnKey
+  }
   result(rows: unknown[] = [], rowCount = rows.length) { return { rows, rowCount } }
   persist(args: Settlement) { this.settled = structuredClone(args) }
   async connect() { return { query: this.query.bind(this), release() {} } }
@@ -126,12 +137,12 @@ class FinancialStore {
     const tag = /remote-native:([a-z-]+)/.exec(sql)?.[1]
     if (tag) this.events.push(tag)
     if (tag === 'dispatch') {
-      assert.deepEqual(values, ['a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6', '42', REQUEST, '7', MODEL])
-      return this.result(this.dispatchExists ? [{ dispatch_id: DISPATCH, attempt_no: 1,
+      assert.deepEqual(values, [this.identity.authorityTurnId, '42', this.identity.requestId, '7', MODEL])
+      return this.result(this.dispatchExists ? [{ dispatch_id: this.identity.dispatchId, attempt_no: 1,
         session_id: SESSION, turn_key: this.dispatchTurn, authority_turn_key: this.authorityTurn }] : [])
     }
     if (tag === 'bind-turn') {
-      assert.deepEqual(values.slice(0, 5), ['a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6', '42', DISPATCH, 1, SESSION])
+      assert.deepEqual(values.slice(0, 5), [this.identity.authorityTurnId, '42', this.identity.dispatchId, 1, SESSION])
       if (this.bindTurnConflict || (this.dispatchTurn !== null && this.dispatchTurn !== values[5])
         || (this.authorityTurn !== null && this.authorityTurn !== values[5])) return this.result()
       this.dispatchTurn = values[5]; this.authorityTurn = values[5]
@@ -145,7 +156,7 @@ class FinancialStore {
     }
     const j = this.journal
     if (tag === 'recovery-scan') return this.result(j && j.state !== 'committed' && j.ctx.remoteNative.receipt
-      ? [{ request_id: REQUEST, user_id: '42', state: j.state, ctx: structuredClone(j.ctx), updated_at: new Date(NOW) }] : [])
+      ? [{ request_id: this.identity.requestId, user_id: '42', state: j.state, ctx: structuredClone(j.ctx), updated_at: new Date(NOW) }] : [])
     if (tag === 'readback') {
       if (!j || !this.settled) return this.result()
       const s = this.settled
@@ -217,8 +228,9 @@ class FinancialStore {
 function fixture(options: {
   settle?: 'unknown-committed' | 'unknown-unproven'; deny?: boolean; releaseFails?: boolean
   dispatchPool?: Pick<Pool, 'connect'>
+  identity?: TestTurnIdentity
 } = {}) {
-  const store = new FinancialStore()
+  const store = new FinancialStore(options.identity)
   let catalogSnapshot = snapshot()
   let keyring = KEYS
   let reserveCount = 0
@@ -238,7 +250,7 @@ function fixture(options: {
         reservation: { userId: String(input.userId), requestId: input.requestId } }
     },
     async release(_redis, handle) {
-      assert.deepEqual(handle, { userId: '42', requestId: REQUEST })
+      assert.deepEqual(handle, { userId: '42', requestId: store.identity.requestId })
       releaseCount++; store.events.push('release')
       if (options.releaseFails) throw new Error('fixture Redis release unavailable')
       return true
@@ -263,7 +275,9 @@ function fixture(options: {
         deniedModelIds: new Set<string>(options.deny ? [MODEL] : []), userPlanTier: null, orgPlanCode: null }
     }, log: logger, now: () => NOW }, fixtures)
   const admit = (over: Partial<Parameters<typeof finance.admit>[0]> = {}, authority: Partial<ModelAuthorityPayload> = {}) =>
-    finance.admit({ binding: binding(), ...tickets(catalogSnapshot, authority), turnKey: TURN, sessionKey: SESSION, ...over })
+    finance.admit({ binding: binding(), ...tickets(catalogSnapshot, {
+      authorityTurnId: store.identity.authorityTurnId, billingRequestId: store.identity.requestId, ...authority }),
+      turnKey: store.identity.turnKey, sessionKey: SESSION, ...over })
   return { store, finance, admit, pool, redis, fixtures, settlements,
     counts: () => ({ reserve: reserveCount, release: releaseCount, settle: settleCount }),
     setCatalog: (s: ModelCatalogSnapshot) => { catalogSnapshot = s },
@@ -275,6 +289,150 @@ async function started(f = fixture()) {
   await turn.beforeDispatch({ sequence: 1, inputSha256: 'd'.repeat(64) })
   return { f, turn }
 }
+
+function continuedFixture(first: Parameters<typeof fixture>[0] = {}) {
+  const turns = [fixture(first), fixture({ identity: SECOND_TURN })]
+  const queries: string[] = []
+  const byRequest = (requestId: string) => {
+    const f = turns.find((item) => item.store.identity.requestId === requestId)
+    assert.ok(f, `unknown fixture request ${requestId}`)
+    return f
+  }
+  const query = async (sql: string, values: unknown[] = []) => {
+    queries.push(sql)
+    if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return turns[0].store.result()
+    const f = turns.find((item) => values.includes(item.store.identity.requestId)
+      || values.includes(item.store.identity.authorityTurnId))
+    assert.ok(f, 'query must address one exact fixture turn')
+    return f.store.query(sql, values)
+  }
+  const pool = { query, async connect() { return { query, release() {} } } } as unknown as Pool
+  const finance = createRemoteNativeTurnFinance({ pool, preCheckRedis: turns[0].redis,
+    catalog: { assertFresh: async () => snapshot() } as unknown as ModelCatalogCache,
+    keyring: KEYS, loadUserModelAuthz: async (uid) => ({ uid, role: 'user',
+      grantedModelIds: new Set<string>(), deniedModelIds: new Set<string>(), userPlanTier: null, orgPlanCode: null }),
+    log: logger, now: () => NOW }, {
+    reserve: (redis, input) => byRequest(input.requestId).fixtures.reserve!(redis, input),
+    release: (redis, handle) => byRequest(handle.requestId).fixtures.release!(redis, handle),
+    settle: (db, args) => byRequest(args.requestId).fixtures.settle!(db, args),
+  })
+  const admit = (index: number, over: Partial<Parameters<typeof finance.admit>[0]> = {},
+    authority: Partial<ModelAuthorityPayload> = {}) => {
+    const identity = turns[index].store.identity
+    return finance.admit({ binding: binding(), sessionKey: SESSION, turnKey: identity.turnKey,
+      ...tickets(snapshot(), { authorityTurnId: identity.authorityTurnId,
+        billingRequestId: identity.requestId, ...authority }), ...over })
+  }
+  const result = (index: number) => {
+    const identity = turns[index].store.identity
+    return receipt({ authorityTurnId: identity.authorityTurnId, turnKey: identity.turnKey,
+      resultSha256: (index ? 'e' : 'c').repeat(64),
+      usage: { ...receipt().usage, outputTokens: 2_000 + index } })
+  }
+  const start = async (index: number, sequence: number) => {
+    const turn = await admit(index)
+    await turn.beforeHostStart()
+    await turn.beforeDispatch({ sequence, inputSha256: 'd'.repeat(64) })
+    return turn
+  }
+  return { turns, admit, result, start, queries }
+}
+
+test('one stable Worker binding settles two sequential signed turns independently', async () => {
+  const f = continuedFixture()
+  const first = await f.start(0, 1)
+  assert.equal((await first.terminal(f.result(0))).state, 'proven')
+  const second = await f.start(1, 4)
+  assert.equal((await second.terminal(f.result(1))).state, 'proven')
+  assert.deepEqual(f.turns.map((turn) => turn.counts()), [
+    { reserve: 1, release: 1, settle: 1 }, { reserve: 1, release: 1, settle: 1 },
+  ])
+  const settlements = f.turns.map((turn) => turn.settlements[0])
+  assert.deepEqual(settlements.map((s) => s.requestId), [REQUEST, SECOND_TURN.requestId])
+  assert.deepEqual(settlements.map((s) => s.turnKey), [TURN, SECOND_TURN.turnKey])
+  assert.deepEqual(settlements.map((s) => s.dispatchId), [DISPATCH, SECOND_TURN.dispatchId])
+  assert.deepEqual(settlements.map((s) => s.usage.output_tokens), [2_000, 2_001])
+  assert.deepEqual(f.turns.map((turn) => turn.store.journal?.ctx.remoteNative.scope.operationId), [OPERATION, OPERATION])
+  assert.deepEqual(f.turns.map((turn) => turn.store.journal?.ctx.remoteNative.input.sequence), [1, 4])
+  assert.equal(JSON.parse(settlements[1].snapshotJson).remote_native.authorityTurnId, SECOND_TURN.authorityTurnId)
+})
+
+test('an active or financially unknown turn never admits the next signed turn', async () => {
+  for (const pending of [false, true]) {
+    const f = continuedFixture(pending ? { settle: 'unknown-unproven' } : {})
+    const first = await f.start(0, 1)
+    await assert.rejects(f.admit(1))
+    assert.deepEqual(f.turns[1].counts(), { reserve: 0, release: 0, settle: 0 })
+    if (pending) {
+      assert.equal((await first.terminal(f.result(0))).state, 'pending')
+      await assert.rejects(f.admit(1))
+      assert.equal((await first.terminal(f.result(0))).state, 'pending')
+      assert.equal(f.turns[0].counts().settle, 1)
+    } else {
+      await first.terminal(f.result(0))
+      const second = await f.start(1, 2)
+      assert.equal((await second.terminal(f.result(1))).state, 'proven')
+    }
+  }
+})
+
+test('completed authority, billing request and logical turn identities cannot be reused', async () => {
+  for (const kind of ['authority', 'request', 'turn'] as const) {
+    const f = continuedFixture()
+    const first = await f.start(0, 1)
+    await first.terminal(f.result(0))
+    const before = f.queries.length
+    await assert.rejects(f.admit(1, kind === 'turn' ? { turnKey: TURN } : {},
+      kind === 'authority' ? { authorityTurnId: AUTHORITY_TURN }
+        : kind === 'request' ? { billingRequestId: REQUEST } : {}), kind)
+    assert.equal(f.turns[1].store.journal, undefined, kind)
+    assert.equal(f.turns[1].counts().reserve, 0, kind)
+    assert.equal(f.queries.length, before, kind)
+  }
+})
+
+test('cross-turn or legacy receipts cannot settle a live continued turn', async () => {
+  const f = continuedFixture()
+  const first = await f.start(0, 1)
+  for (const bad of [f.result(1), receipt({ authorityTurnId: SECOND_TURN.authorityTurnId }),
+    receipt({ turnKey: SECOND_TURN.turnKey })]) assert.throws(() => first.terminal(bad))
+  const { authorityTurnId: _authority, turnKey: _turn, ...legacy } = receipt()
+  assert.throws(() => first.terminal({ ...legacy, version: 1 }))
+  assert.equal(f.turns[0].counts().settle, 0)
+  await first.terminal(f.result(0))
+  const second = await f.start(1, 2)
+  assert.throws(() => second.terminal(f.result(0)))
+  assert.equal(f.turns[1].counts().settle, 0)
+  await second.terminal(f.result(1))
+})
+
+test('every turn needs a fresh effect marker and one safe positive input sequence', async () => {
+  const f = fixture()
+  const turn = await f.admit()
+  await assert.rejects(turn.beforeDispatch({ sequence: 3, inputSha256: 'd'.repeat(64) }))
+  await turn.beforeHostStart()
+  for (const sequence of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN]) {
+    await assert.rejects(turn.beforeDispatch({ sequence, inputSha256: 'd'.repeat(64) }))
+  }
+  await turn.beforeDispatch({ sequence: 3, inputSha256: 'd'.repeat(64) })
+  await assert.rejects(turn.beforeDispatch({ sequence: 4, inputSha256: 'e'.repeat(64) }))
+  assert.equal((await turn.terminal(receipt())).state, 'proven')
+  assert.equal(f.store.journal?.ctx.remoteNative.input.sequence, 3)
+})
+
+test('a proven pre-effect cancellation releases only its own active turn', async () => {
+  const f = continuedFixture()
+  const first = await f.admit(0)
+  await first.stop({ hostStartAttempted: false, userSubmitted: false, remoteStopped: true })
+  const second = await f.start(1, 2)
+  // Repeating an old Stop cannot release the next turn's operation fence.
+  await first.stop({ hostStartAttempted: false, userSubmitted: false, remoteStopped: true })
+  const before = f.queries.length
+  await assert.rejects(f.admit(1, { turnKey: 'a'.repeat(64) },
+    { authorityTurnId: '1'.repeat(32), billingRequestId: 'third_native_request' }))
+  assert.equal(f.queries.length, before)
+  assert.equal((await second.terminal(f.result(1))).state, 'proven')
+})
 
 test('signed existing Sonnet admission persists reservation and effects before terminal settlement', async () => {
   const f = fixture()
@@ -484,6 +642,22 @@ test('durable receipt with lost acknowledgement recovers financially without any
   assert.equal(f.counts().settle, 1)
   assert.equal(f.store.events.filter((event) => event === 'host-start').length, 1)
   assert.equal(f.store.events.filter((event) => event === 'dispatch-input').length, 1)
+})
+
+test('persisted legacy v1 receipts remain recoverable without enabling live v1 delivery', async () => {
+  const { f, turn } = await started()
+  f.store.ackLostTag = 'receipt'
+  assert.equal((await turn.terminal(receipt())).state, 'pending')
+  // Represent the exact historical v1 context saved before this upgrade.
+  const { authorityTurnId: _authority, turnKey: _turn, ...legacy } = receipt()
+  f.store.journal!.ctx.remoteNative.receipt = { ...legacy, version: 1 }
+  assert.deepEqual(await recoverRemoteNativeTurnBilling({ pool: f.pool, preCheckRedis: f.redis, log: logger },
+    { settle: f.fixtures.settle }), { proven: 1, pending: 0 })
+  assert.equal(f.counts().settle, 1)
+  const stamp = JSON.parse(f.settlements[0].snapshotJson).remote_native
+  assert.equal(stamp.version, 1)
+  assert.equal('authorityTurnId' in stamp, false)
+  assert.equal('turnKey' in stamp, false)
 })
 
 const PG_REQUIRED = process.env.REQUIRE_TEST_DB === '1' || process.env.CI === 'true'

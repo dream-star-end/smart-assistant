@@ -21,8 +21,18 @@ export class Cc5NativeUsageObserver {
   private terminalSeen = false
   private failed = false
   private finished = false
-  constructor(private readonly binding: Readonly<Cc5BridgeBinding>) {
+  private turn?: { authorityTurnId: string; turnKey: string }
+  private readonly resultUuids = new Set<string>()
+  private readonly resultDigests = new Set<string>()
+  constructor(private readonly binding: Readonly<Cc5BridgeBinding>, private readonly options: { legacySingleTurn?: boolean } = {}) {
     assertCc5BindingScope(binding)
+  }
+  beginTurn(turn: { authorityTurnId: string; turnKey: string }): void {
+    requireUsage(!this.failed && !this.finished && this.buffer.length === 0 &&
+      (!this.turn || this.terminalSeen) && /^[a-f0-9]{32}$/.test(turn.authorityTurnId) &&
+      typeof turn.turnKey === 'string' && turn.turnKey.length > 0 && turn.turnKey.length <= 512)
+    this.turn = Object.freeze({ ...turn })
+    this.terminalSeen = false
   }
   ingest(chunk: Buffer): Cc5NativeOutputFrame[] {
     requireUsage(!this.failed && !this.finished)
@@ -71,20 +81,31 @@ export class Cc5NativeUsageObserver {
       }
     }
     if (row.type !== 'result') return { bytes }
-    requireUsage(!this.terminalSeen && this.nativeSessionId && row.session_id === this.nativeSessionId &&
+    requireUsage((this.turn || this.options.legacySingleTurn) && !this.terminalSeen && this.nativeSessionId && row.session_id === this.nativeSessionId &&
       this.upstreamModel === CC5_NATIVE_UPSTREAM_MODEL && typeof row.is_error === 'boolean' &&
       (row.is_error ? row.subtype === 'error_during_execution' : row.subtype === 'success') &&
       row.usage && typeof row.usage === 'object' && !Array.isArray(row.usage))
     const keys = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'] as const
     for (const key of keys) requireUsage(Number.isSafeInteger(row.usage[key]) && row.usage[key] >= 0)
+    const resultSha256 = createHash('sha256').update(bytes).digest('hex')
+    requireUsage(!this.resultDigests.has(resultSha256))
+    if (this.turn) {
+      // Exact producer: box-bridge-mod/oc-bridge/hooks/frames.ts StreamJson.uuid().
+      const id = typeof row.uuid === 'string' && /^ocb-([a-fA-F0-9]{8})-([0-9a-z]{1,11})-([1-9][0-9]{0,15})$/.exec(row.uuid)
+      requireUsage(id && id[1] === this.nativeSessionId.slice(0, 8) &&
+        Number.isSafeInteger(Number.parseInt(id[2]!, 36)) && Number.isSafeInteger(Number(id[3])) &&
+        !this.resultUuids.has(row.uuid))
+      this.resultUuids.add(row.uuid)
+    }
+    this.resultDigests.add(resultSha256)
     this.terminalSeen = true
     const receipt: Cc5NativeTerminalReceipt = Object.freeze({
-      version: 1, backendKind: this.binding.backendKind,
+      ...(this.turn ? { version: 2 as const, ...this.turn } : { version: 1 as const }), backendKind: this.binding.backendKind,
       uid: this.binding.uid, containerDbId: this.binding.containerDbId, dockerId: this.binding.dockerId,
       operationId: this.binding.operationId, runId: this.binding.runId, sessionKey: this.binding.sessionKey,
       nativeSessionId: this.nativeSessionId, canonicalModel: this.binding.canonicalModel,
       upstreamModel: this.upstreamModel, status: row.is_error ? 'error' : 'success',
-      resultSha256: createHash('sha256').update(bytes).digest('hex'),
+      resultSha256,
       usage: Object.freeze({ inputTokens: row.usage.input_tokens, outputTokens: row.usage.output_tokens,
         cacheReadTokens: row.usage.cache_read_input_tokens, cacheWriteTokens: row.usage.cache_creation_input_tokens }),
     })

@@ -23,8 +23,8 @@ import sys
 import time
 
 TASK = 'AGENT-REMOTE-T1555U'
-PINNED_MCP_SHA = '9738e246fc23dbf356335f4effacbbd12204180b981dd9996d62305f2fba2809'
-PINNED_SOCKET_SHA = '6507522620d6aaea8657a5bb061b6d110206c1f27a453d048e6e7d7b9a616fde'
+PINNED_MCP_SHA = '828d524a08c10f45a9c13c89c178ec740581f98ebc1870d089dab594a18d4cfd'
+PINNED_SOCKET_SHA = '548c8d791f3b76f866ff67b2c12c88b085252a835c0c7c13a5ef0fbc03790563'
 UUID = re.compile(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z')
 PINNED_CLI_SIZE = 328262000
 PINNED_CLI_SHA = 'fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824'
@@ -243,7 +243,7 @@ def profile_files(root, operation_id, run_id, script, socket_script):
     require(UUID.fullmatch(operation_id) and UUID.fullmatch(run_id), 'bad-profile-identity')
     require(sha(script) == PINNED_MCP_SHA and sha(socket_script) == PINNED_SOCKET_SHA, 'wrong-pinned-mcp-source')
     return {'cc5-fixed-mcp.py': script, 'cc5-mcp-socket.py': socket_script,
-            'client.json': canonical({'version': 1, 'operationId': operation_id, 'runId': run_id}),
+            'client.json': canonical({'version': 2, 'operationId': operation_id, 'runId': run_id}),
             'mcp.json': canonical({'mcpServers': {'ocbridge': {'command': '/usr/bin/python3',
                          'args': ['-I', str(root / 'cprofile/cc5-fixed-mcp.py'), str(root)]}}})}
 
@@ -255,7 +255,7 @@ def package_profile(root_text, operation_id, run_id):
     script = (repo / 'scripts/agent-remote/cc5-fixed-mcp.py').read_bytes()
     socket_script = (repo / 'scripts/agent-remote/cc5-mcp-socket.py').read_bytes()
     profile_files(Path(root_text), operation_id, run_id, script, socket_script)
-    print(json.dumps({'version': 1, 'operationId': operation_id, 'runId': run_id,
+    print(json.dumps({'version': 2, 'operationId': operation_id, 'runId': run_id,
                       'script': base64.b64encode(script).decode(),
                       'socketScript': base64.b64encode(socket_script).decode()}))
 
@@ -267,7 +267,7 @@ def check_profile(root):
             'unsafe-profile-directory')
     info = json.loads(read_private(directory / 'PROFILE.json'))
     require(set(info) == {'version', 'task', 'root', 'operationId', 'runId', 'hashes'} and
-            info['version'] == 1 and info['task'] == TASK and info['root'] == str(root),
+            info['version'] == 2 and info['task'] == TASK and info['root'] == str(root),
             'wrong-profile-manifest')
     script = read_private(directory / 'cc5-fixed-mcp.py')
     files = profile_files(root, info['operationId'], info['runId'], script,
@@ -291,7 +291,7 @@ def install_profile(root):
     raw = sys.stdin.buffer.read(65537)
     require(len(raw) <= 65536, 'profile-packet-too-large')
     packet = json.loads(raw)
-    require(set(packet) == {'version', 'operationId', 'runId', 'script', 'socketScript'} and packet['version'] == 1,
+    require(set(packet) == {'version', 'operationId', 'runId', 'script', 'socketScript'} and type(packet['version']) is int and packet['version'] == 2,
             'wrong-profile-packet')
     files = profile_files(root, packet['operationId'], packet['runId'],
                           base64.b64decode(packet['script'], validate=True),
@@ -300,7 +300,7 @@ def install_profile(root):
     require(not directory.exists() and not directory.is_symlink(), 'profile-already-exists')
     stage = root / 'cprofile.partial'
     stage.mkdir(mode=0o700)
-    info = {'version': 1, 'task': TASK, 'root': str(root), 'operationId': packet['operationId'],
+    info = {'version': 2, 'task': TASK, 'root': str(root), 'operationId': packet['operationId'],
             'runId': packet['runId'], 'hashes': {name: sha(data) for name, data in files.items()}}
     try:
         for name, data in {**files, 'PROFILE.json': canonical(info)}.items():
@@ -310,6 +310,11 @@ def install_profile(root):
                 stream.flush()
                 os.fsync(stream.fileno())
         stage.rename(directory)
+        parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
         check_profile(root)
     finally:
         if stage.exists():
@@ -328,7 +333,8 @@ def profile_args(root, info):
     require(cli == str(root / 'bin/claude-2.1.316'), 'requires-private-cli')
     return [cli, '--permission-mode', 'default', '--model', 'claude-sonnet-5', '--tools', '',
             '--strict-mcp-config', '--mcp-config', str(root / 'cprofile/mcp.json'),
-            '--setting-sources', '', '--disable-slash-commands', '--allowedTools', 'mcp__ocbridge__roundtrip']
+            '--setting-sources', '', '--disable-slash-commands', '--allowedTools',
+            'mcp__ocbridge__Read,mcp__ocbridge__Edit,mcp__ocbridge__Bash']
 
 
 def process_record(pid):
@@ -360,12 +366,14 @@ def write_lifecycle(root, info, processes):
     path = root / 'LIFECYCLE.json'
     history = []
     launch_hash = processes.get('launchArgvHash')
+    writer_lock = processes.get('writerLock')
     if path.exists():
         previous = json.loads(read_private(path))
         require(previous['version'] == 1 and previous['root'] == str(root) and
                 previous['session'] == info['session'], 'wrong-previous-lifecycle-record')
         history = [previous['host'], previous['claude'], *previous['descendants']]
         launch_hash = launch_hash or previous.get('launchArgvHash')
+        writer_lock = writer_lock or previous.get('writerLock')
     observed = {}
     for item in [*history, *processes['descendants']]:
         if item is None:
@@ -373,7 +381,8 @@ def write_lifecycle(root, info, processes):
         require(type(item['pid']) is int and item['pid'] > 1 and str(item['startTicks']).isdecimal(),
                 'bad-previous-lifecycle-process')
         observed[(item['pid'], item['startTicks'])] = {'pid': item['pid'], 'startTicks': item['startTicks']}
-    processes = {**processes, 'descendants': list(observed.values()), 'launchArgvHash': launch_hash}
+    processes = {**processes, 'descendants': list(observed.values()), 'launchArgvHash': launch_hash,
+                 'writerLock': writer_lock}
     data = canonical({'version': 1, 'root': str(root), 'session': info['session'], **processes})
     stage = root / 'LIFECYCLE.partial'
     fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -415,10 +424,26 @@ def prove_stopped(root, emit=True):
         except FileNotFoundError:
             continue
         require(ticks != item['startTicks'], 'recorded-task-process-still-alive')
+    proof = {'kind': 'verified-task-runtime-absent', 'remoteStopped': True,
+             'root': str(root), 'session': info['session'], 'processes': record,
+             'mcpSocketIdentity': socket_record}
+    proof_path = root / 'STOPPED.json'
+    data = canonical(proof)
+    if proof_path.exists():
+        require(read_private(proof_path) == data, 'stopped-proof-changed')
+    else:
+        fd = os.open(proof_path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'wb') as target:
+            target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     if emit:
-        print(json.dumps({'kind': 'verified-task-runtime-absent', 'remoteStopped': True,
-                          'root': str(root), 'session': info['session'], 'processes': record,
-                          'mcpSocketIdentity': socket_record}))
+        print(json.dumps(proof))
 
 
 def proc(pid):
@@ -469,6 +494,25 @@ def control_lock(root):
         os.close(fd)  # Also closed atomically on successful exec; never inherited by host/tmux.
 
 
+@contextmanager
+def writer_lock(root):
+    """Only launch takes this lock; the original host retains its FD after exec."""
+    owner(root)
+    fd = os.open(root / 'WRITER.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        st = os.fstat(fd)
+        require(stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and st.st_nlink == 1
+                and stat.S_IMODE(st.st_mode) == 0o600, 'unsafe-task-writer-lock')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('task-writer-already-active') from None
+        os.set_inheritable(fd, True)
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def mark_stopping(root):
     profile = check_profile(root)
     value = {'version': 1, 'root': str(root), 'operationId': profile['operationId'], 'runId': profile['runId']}
@@ -491,13 +535,15 @@ def mark_stopping(root):
 def launch(root):
     with control_lock(root):
         require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
-        launch_locked(root)
+        with writer_lock(root) as fd:
+            launch_locked(root, fd)
 
 
-def launch_locked(root):
+def launch_locked(root, writer_fd):
     info = owner(root)
     if (root / 'LIFECYCLE.json').exists():
         prove_stopped(root, emit=False)  # A new launch cannot erase an unproved old writer.
+        raise RuntimeError('task-lifecycle-already-used')
     files = check_sources(root, info)
     require(not (root / 'run').exists(), 'runtime-already-exists')
     env = {'HOME': '/home/box', 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
@@ -512,8 +558,13 @@ def launch_locked(root):
            'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'}
     claude_executable(root, info, full_hash=True)
     cli_args = profile_args(root, info)
+    lock_stat = os.fstat(writer_fd)
+    path_stat = (root / 'WRITER.lock').lstat()
+    require(os.get_inheritable(writer_fd) and
+            (lock_stat.st_dev, lock_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino), 'writer-lock-not-inheritable')
     write_lifecycle(root, info, {'host': process_record(os.getpid()), 'claude': None, 'descendants': [],
-                                'launchArgvHash': sha(canonical(proc(os.getpid())[0]))})
+                                'launchArgvHash': sha(canonical(proc(os.getpid())[0])),
+                                'writerLock': {'fd': writer_fd, 'dev': lock_stat.st_dev, 'inode': lock_stat.st_ino}})
     os.chdir(info['cwd'])
     # fd0 is never read here: it belongs exclusively to the original host.
     os.execve(sys.executable, [sys.executable, str(root / 'install/host.py'), str(root / 'run'),

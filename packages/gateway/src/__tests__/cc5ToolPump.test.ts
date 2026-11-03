@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { type Server, type ServerResponse, createServer } from 'node:http'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { type ServerResponse, createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -17,7 +17,8 @@ import {
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
 import type { Cc5BridgeBinding } from '../cc5BridgePort.js'
-import { CC5_FIXED_TOOL_NAME, type Cc5ToolRequest } from '../cc5FixedTool.js'
+import type { Cc5ToolRequest } from '../cc5FixedTool.js'
+import { cc5ToolInputSha256, type Cc5ToolReceipt, type Cc5ToolResult } from '../cc5NativeTool.js'
 import { runCc5StdioBridge } from '../cc5StdioBridge.js'
 import { Cc5ToolObservation } from '../cc5ToolObservation.js'
 import { type Cc5ToolDelivery, runCc5ToolPump } from '../cc5ToolPump.js'
@@ -89,8 +90,8 @@ function fixture() {
     nativeSessionId: randomUUID(),
     toolUseId: 'toolu_actual-frame',
     rpcId: 17,
-    name: CC5_FIXED_TOOL_NAME,
-    arguments: { operationId: binding.operationId },
+    name: 'mcp__ocbridge__Bash',
+    arguments: { command: 'printf fixture' },
     authority: envelope(a),
     lease: leaseEnvelope(lease),
   }
@@ -139,7 +140,13 @@ function original(f: ReturnType<typeof fixture>): Buffer {
     })}\n`,
   )
 }
-async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery, loseAck = false) {
+function receiptPath(f: ReturnType<typeof fixture>): string {
+  return join(f.root, f.binding.operationId,
+    createHash('sha256').update(f.request.toolUseId).digest('hex'), 'receipt.json')
+}
+function effectPath(f: ReturnType<typeof fixture>): string { return join(f.root, 'local-effect') }
+async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
+  options: { loseAck?: boolean; duplicate?: boolean; executionUnknown?: boolean } = {}) {
   const socketPath = relative(process.cwd(), join(f.root, 's'))
   const controller = new AbortController()
   const observation = new Cc5ToolObservation(f.binding.operationId)
@@ -149,7 +156,10 @@ async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
   })
   let pollCount = 0
   let resultCount = 0
-  let result: Record<string, unknown> | undefined
+  let effects = 0
+  const results: Cc5ToolReceipt[] = []
+  let idle!: () => void
+  const idlePolled = new Promise<void>((resolve) => { idle = resolve })
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (b) => chunks.push(b))
@@ -159,13 +169,14 @@ async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
       assert.equal(body.operationId, f.binding.operationId)
       if (req.url === '/tool/next') {
         pollCount++
-        res.end(JSON.stringify({ ok: true, delivery }))
+        if (pollCount <= (options.duplicate ? 2 : 1)) res.end(JSON.stringify({ ok: true, delivery }))
+        else idle() // An outstanding poll proves every preceding result ACK was consumed.
         polled()
       } else if (req.url === '/tool/result') {
         resultCount++
-        result = body.receipt
-        if (loseAck) res.destroy()
-        else res.end(JSON.stringify({ ok: true, commandId: result!.commandId }))
+        results.push(body.receipt)
+        if (options.loseAck) res.destroy()
+        else res.end(JSON.stringify({ ok: true, commandId: body.receipt.commandId }))
       } else {
         res.writeHead(404).end()
       }
@@ -181,6 +192,14 @@ async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
     signal: controller.signal,
     socketPath,
     executionRoot: f.root,
+    executeTool: async (request): Promise<Cc5ToolResult> => {
+      assert.equal(request.name, f.request.name)
+      assert.deepEqual(request.arguments, f.request.arguments)
+      effects++
+      writeFileSync(effectPath(f), 'one local effect', { flag: 'wx', mode: 0o600 })
+      if (options.executionUnknown) throw new Error('fixture effect occurred but completion is unknown')
+      return { content: [{ type: 'text', text: 'one local effect' }], isError: false }
+    },
   })
   // Attach a handler now so rejected negative fixtures never emit unhandled rejection.
   void running.catch(() => {})
@@ -195,13 +214,15 @@ async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
     observation,
     controller,
     pollReady,
+    idlePolled,
     close,
-    counts: () => ({ pollCount, resultCount }),
-    receipt: () => result,
+    counts: () => ({ pollCount, resultCount, effects }),
+    receipt: () => results.at(-1),
+    receipts: results,
   }
 }
 
-test('real Unix tool pump waits for the full original tool row then executes only in its fixed local root', async () => {
+test('real Unix tool pump waits for the full original row, executes once and keeps polling until aborted', { timeout: 5000 }, async () => {
   const f = fixture()
   const h = await harness(f, { request: f.request, admission: f.admission })
   try {
@@ -211,14 +232,18 @@ test('real Unix tool pump waits for the full original tool row then executes onl
     await new Promise<void>((resolve) => setImmediate(resolve))
     assert.equal(existsSync(join(f.root, f.binding.operationId)), false)
     h.observation.ingest(bytes.subarray(bytes.length - 1))
-    const receipt = await h.running
-    assert.deepEqual(h.counts(), { pollCount: 1, resultCount: 1 })
-    assert.deepEqual(h.receipt(), receipt)
+    await h.idlePolled
+    const receipt = h.receipt()!
+    assert.deepEqual(h.counts(), { pollCount: 2, resultCount: 1, effects: 1 })
     assert.equal(receipt.dockerId, f.binding.dockerId)
-    assert.equal(
-      readFileSync(join(f.root, f.binding.operationId, 'cc5-proof.txt'), 'utf8'),
-      `${receipt.marker}\n`,
-    )
+    assert.equal(receipt.version, 2)
+    assert.equal(receipt.name, f.request.name)
+    assert.equal(receipt.inputSha256, cc5ToolInputSha256(f.request.arguments))
+    assert.deepEqual(receipt.result, { content: [{ type: 'text', text: 'one local effect' }], isError: false })
+    assert.equal(readFileSync(effectPath(f), 'utf8'), 'one local effect')
+    assert.deepEqual(JSON.parse(readFileSync(receiptPath(f), 'utf8')), receipt)
+    h.controller.abort()
+    await h.running.catch(() => {})
   } finally {
     await h.close()
     f.cleanup()
@@ -238,6 +263,7 @@ test('wrong signature, binding or trusted admission cannot create a journal or c
         h.observation.ingest(original(f))
         await assert.rejects(h.running)
         assert.equal(existsSync(join(f.root, f.binding.operationId)), false)
+        assert.equal(h.counts().effects, 0)
         assert.equal(h.counts().resultCount, 0)
       } finally {
         await h.close()
@@ -255,6 +281,7 @@ test('an RPC without an original tool row aborts without effect', async () => {
     h.controller.abort()
     await assert.rejects(h.running)
     assert.equal(existsSync(join(f.root, f.binding.operationId)), false)
+    assert.equal(h.counts().effects, 0)
     assert.equal(h.counts().resultCount, 0)
   } finally {
     await h.close()
@@ -264,19 +291,55 @@ test('an RPC without an original tool row aborts without effect', async () => {
 
 test('lost result ACK leaves one real terminal receipt and never repeats the tool poll or effect', async () => {
   const f = fixture()
-  const h = await harness(f, { request: f.request, admission: f.admission }, true)
+  const h = await harness(f, { request: f.request, admission: f.admission }, { loseAck: true })
   try {
     h.observation.ingest(original(f))
     await assert.rejects(h.running)
-    const receipt = JSON.parse(
-      readFileSync(join(f.root, f.binding.operationId, 'receipt.json'), 'utf8'),
-    )
-    assert.equal(receipt.exitCode, 0)
+    const receipt = JSON.parse(readFileSync(receiptPath(f), 'utf8'))
+    assert.equal(receipt.result.isError, false)
     assert.equal(h.receipt()!.commandId, receipt.commandId)
     await new Promise<void>((resolve) => setImmediate(resolve))
-    assert.deepEqual(h.counts(), { pollCount: 1, resultCount: 1 })
+    assert.deepEqual(h.counts(), { pollCount: 1, resultCount: 1, effects: 1 })
   } finally {
     await h.close()
+    f.cleanup()
+  }
+})
+
+test('a duplicate completed tool delivery reuses its receipt without repeating the effect', { timeout: 5000 }, async () => {
+  const f = fixture()
+  const h = await harness(f, { request: f.request, admission: f.admission }, { duplicate: true })
+  try {
+    h.observation.ingest(original(f))
+    await h.idlePolled
+    assert.deepEqual(h.counts(), { pollCount: 3, resultCount: 2, effects: 1 })
+    assert.deepEqual(h.receipts[0], h.receipts[1])
+    assert.equal(readFileSync(effectPath(f), 'utf8'), 'one local effect')
+  } finally {
+    await h.close()
+    f.cleanup()
+  }
+})
+
+test('a durable unknown attempt blocks replay even after a new pump starts', { timeout: 5000 }, async () => {
+  const f = fixture()
+  const delivery = { request: f.request, admission: f.admission }
+  const first = await harness(f, delivery, { executionUnknown: true })
+  try {
+    first.observation.ingest(original(f))
+    await assert.rejects(first.running, /fixture effect occurred/)
+    assert.deepEqual(first.counts(), { pollCount: 1, resultCount: 0, effects: 1 })
+    assert.equal(existsSync(receiptPath(f)), false)
+    await first.close()
+    const second = await harness(f, delivery)
+    try {
+      second.observation.ingest(original(f))
+      await assert.rejects(second.running, /CC5_NATIVE_TOOL_EXECUTION_UNKNOWN/)
+      assert.deepEqual(second.counts(), { pollCount: 1, resultCount: 0, effects: 0 })
+      assert.equal(readFileSync(effectPath(f), 'utf8'), 'one local effect')
+    } finally { await second.close() }
+  } finally {
+    await first.close()
     f.cleanup()
   }
 })
@@ -299,6 +362,11 @@ test(
       complete = resolve
     })
     let commands = 0
+    let polls = 0
+    let lifecycleId: string | undefined
+    let hostCloses = 0
+    let idle!: () => void
+    const idlePolled = new Promise<void>((resolve) => { idle = resolve })
     const server = createServer((req, res) => {
       let body = ''
       if (req.url === '/session/open') {
@@ -325,16 +393,30 @@ test(
       })
       req.on('end', () => {
         if (req.url === '/tool/next') {
-          res.end(
+          polls++
+          if (polls === 1) res.end(
             JSON.stringify({ ok: true, delivery: { request: f.request, admission: f.admission } }),
           )
+          else idle()
         } else if (req.url === '/tool/result') {
           const value = JSON.parse(body)
-          assert.equal(value.receipt.exitCode, 0)
+          assert.equal(value.receipt.version, 2)
+          assert.equal(value.receipt.result.isError, false)
           commands++
           res.end(JSON.stringify({ ok: true, commandId: value.receipt.commandId }))
           complete()
+        } else if (req.url === '/tool/register') {
+          lifecycleId = JSON.parse(body).lifecycleId
+          assert.equal(typeof lifecycleId, 'string')
+          res.end(JSON.stringify({ ok: true, lifecycleId }))
+        } else if (req.url === '/tool/stopped') {
+          const value = JSON.parse(body)
+          assert.equal(value.lifecycleId, lifecycleId)
+          assert.equal(value.localStopped, true)
+          assert.equal(hostCloses, 1)
+          res.end(JSON.stringify({ ok: true, lifecycleId }))
         } else if (req.url === '/stop') {
+          assert.equal(hostCloses, 1)
           res.end(JSON.stringify({ ok: true, remoteStopped: true }))
           stream?.end()
         } else {
@@ -351,7 +433,20 @@ test(
       stdout,
       socketPath,
       signal: controller.signal,
-      tools: { keyring: f.keyring, executionRoot: f.root },
+      tools: { keyring: f.keyring, executionRoot: f.root, hostFactory(root, identity) {
+        assert.equal(identity, lifecycleId)
+        assert.equal(root, join(f.root, `host-${identity}`))
+        return {
+          async execute(name, args, request) {
+            assert.equal(name, f.request.name)
+            assert.deepEqual(args, f.request.arguments)
+            assert.equal(request.toolUseId, f.request.toolUseId)
+            writeFileSync(effectPath(f), 'one local effect', { flag: 'wx', mode: 0o600 })
+            return { content: [{ type: 'text', text: 'one local effect' }], isError: false }
+          },
+          async close() { hostCloses++ },
+        }
+      } },
     })
     void running.catch(() => {})
     try {
@@ -359,11 +454,14 @@ test(
         `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'synthetic transport fixture' } })}\n`,
       )
       await toolComplete
+      await idlePolled
       assert.equal(commands, 1)
       assert.deepEqual(Buffer.concat(output), raw)
-      assert.equal(existsSync(join(f.root, f.binding.operationId, 'receipt.json')), true)
+      assert.equal(existsSync(receiptPath(f)), true)
+      assert.equal(readFileSync(effectPath(f), 'utf8'), 'one local effect')
       controller.abort()
       await running
+      assert.equal(hostCloses, 1)
     } finally {
       controller.abort()
       await running.catch(() => {})
