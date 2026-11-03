@@ -1461,14 +1461,24 @@ export function deliver(
         ? (wire as { sessionKey: string }).sessionKey
         : undefined
     const current = (wire as { clientMessageId?: unknown }).clientMessageId
-    const rebound = rebindOutboundClientMessageId({
-      clientMessageId: typeof current === 'string' ? current : undefined,
-      sessionKey,
-      isFenced: (sk, cmid) => this._outboundRing?.isTurnFenced(sk, cmid) === true,
-      openTurnClientMessageId: sessionKey
-        ? this._outboundRing?.activeTurnClientMessageId(sessionKey)
-        : undefined,
-    })
+    const blocks = (wire as { blocks?: Array<{ kind?: unknown }> }).blocks
+    const isUnboundDelegateProgressOnly =
+      wire.type === 'outbound.message' &&
+      !(wire as { isFinal?: boolean }).isFinal &&
+      typeof current !== 'string' &&
+      Array.isArray(blocks) &&
+      blocks.length > 0 &&
+      blocks.every((b) => b?.kind === 'delegate_progress')
+    const rebound = isUnboundDelegateProgressOnly
+      ? undefined
+      : rebindOutboundClientMessageId({
+          clientMessageId: typeof current === 'string' ? current : undefined,
+          sessionKey,
+          isFenced: (sk, cmid) => this._outboundRing?.isTurnFenced(sk, cmid) === true,
+          openTurnClientMessageId: sessionKey
+            ? this._outboundRing?.activeTurnClientMessageId(sessionKey)
+            : undefined,
+        })
     if (rebound) (wire as { clientMessageId?: string }).clientMessageId = rebound
     // biome-ignore lint/performance/noDelete: moved verbatim from server.ts (OCV5-483); pre-existing there
     else delete (wire as { clientMessageId?: string }).clientMessageId

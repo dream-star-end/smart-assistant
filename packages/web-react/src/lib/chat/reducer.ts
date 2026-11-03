@@ -1334,15 +1334,14 @@ function placeProcessCardAtCallSite(sess: ChatSession, card: ChatMessage): void 
   sess.messages.splice(insertAt, 0, card);
 }
 
-function isFrozenDelegateCard(message: ChatMessage, runId: string): boolean {
-  if (message._adoptedInto) return false;
-  if (!isServerAuthoredRow(message) && !isImmutableTapeViewportRow(message)) return false;
-  return (message.role === "delegate-progress" && message.runId === runId) ||
-    (message.role === "agent-group" && message._delegateRunId === runId);
-}
-
 function hasFrozenDelegateCard(sess: ChatSession, runId: string): boolean {
-  return sess.messages.some((m) => isFrozenDelegateCard(m, runId));
+  return sess.messages.some(
+    (m) =>
+      !m._adoptedInto &&
+      (isServerAuthoredRow(m) || isImmutableTapeViewportRow(m)) &&
+      ((m.role === "delegate-progress" && m.runId === runId) ||
+        (m.role === "agent-group" && m._delegateRunId === runId)),
+  );
 }
 
 function handleDelegateProgressBlock(
@@ -1350,19 +1349,20 @@ function handleDelegateProgressBlock(
   block: DelegateProgressBlock,
   turnOwnerId?: string,
 ): void {
-  if (!block.runId) return;
-  let groupMsgId = sess._delegateRunGroups?.get(block.runId);
+  const runId = block.runId;
+  if (!runId) return;
+  const isTerminalPhase = block.phase === "done" || block.phase === "error";
+  if (isTerminalPhase && sess._turnProgressHint?.startsWith("子任务")) {
+    sess._turnProgressHint = undefined;
+  }
+  let groupMsgId = sess._delegateRunGroups?.get(runId);
   if (groupMsgId === undefined) {
-    // 只绑本地富卡:server-authored 骨架行同 runId 也不接收 live 帧(债A)。
     const bound = sess.messages.find(
-      (m) => m.role === "agent-group" && !isServerAuthoredRow(m) && m._delegateRunId === block.runId,
+      (m) => m.role === "agent-group" && !isServerAuthoredRow(m) && m._delegateRunId === runId,
     );
     if (bound) {
-      if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
-      sess._delegateRunGroups.set(block.runId, bound.id);
-      groupMsgId = bound.id;
+      (sess._delegateRunGroups ??= new Map()).set(runId, (groupMsgId = bound.id));
     } else {
-      // start 以外的 progress 也可能带 goal/jobId；Bash 组卡尚未绑 runId 时仍应收进组。
       groupMsgId = bindDelegateRunToGroup(sess, block) ?? undefined;
     }
   }
@@ -1377,48 +1377,44 @@ function handleDelegateProgressBlock(
     }
   }
 
-  // ── 兜底 ── 已持久化的 standalone delegate-progress 行(旧会话 / 尚未被 adopt)按 runId 继续原地更新。
-  const legacy =
-    sess.messages.find((m) =>
-      m.role === "delegate-progress" && m.runId === block.runId && !m._adoptedInto &&
-      !isImmutableTapeViewportRow(m)) || null;
+  let msg =
+    sess.messages.find(
+      (m) =>
+        m.role === "delegate-progress" &&
+        m.runId === runId &&
+        !m._adoptedInto &&
+        !isImmutableTapeViewportRow(m),
+    ) || null;
+  const goalRaw = typeof block.goal === "string" ? block.goal : "";
+  const goalKey = goalRaw ? normalizeDelegateGoalKey(goalRaw) : "";
+  const jobId = typeof block.jobId === "string" ? block.jobId : undefined;
 
-  // fan-out 成员:队长本轮调用的是复数 `delegate_tasks`(tool 卡不转组、无 per-subtask delegate_task
-  // tool_use 可 adopt),直接把该 run 物化成 live agent-group —— 同轮 ≥2 个自动聚成 TeamPanel,turn 末
-  // server-authored 骨架行按 runId 折叠去重(债A),消除「兜底卡 + 团队面板」三卡并存。单数委派(无 fan-out
-  // tool 卡)则保留下方 delegate-progress standalone 兜底,由后到的 delegate_task tool_use adopt(零回归)。
-  if (!legacy && hasActiveFanoutDelegate(sess)) {
-    if (hasFrozenDelegateCard(sess, block.runId)) return;
-    const goalRaw = typeof block.goal === "string" ? block.goal : "";
-    const groupMsg = addMessage(sess, "agent-group", goalRaw.trim() || "子任务", {
-      startTime: Date.now(),
-      childBlocks: [],
-      _delegate: true,
-      _delegateRunId: block.runId,
-      _delegateAgentId: block.agentId || "",
-      _delegateGoal: goalRaw ? normalizeDelegateGoalKey(goalRaw) : "",
-      _delegateJobId: typeof block.jobId === "string" ? block.jobId : undefined,
-      _completed: false,
-      ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
-    });
-    placeProcessCardAtCallSite(sess, groupMsg);
-    if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
-    sess._delegateRunGroups.set(block.runId, groupMsg.id);
-    applyDelegatePhaseToGroup(sess, groupMsg, block);
-    if (!sess._sendingInFlight) sess.messages = repairPostFinalProcessOrder(sess.messages);
-    return;
-  }
-
-  // Fallback: standalone delegate-progress card keyed by runId.
-  let msg = legacy;
   if (!msg) {
-    if (hasFrozenDelegateCard(sess, block.runId)) return;
+    if (hasFrozenDelegateCard(sess, runId)) return;
+    if (hasActiveFanoutDelegate(sess)) {
+      const groupMsg = addMessage(sess, "agent-group", goalRaw.trim() || "子任务", {
+        startTime: Date.now(),
+        childBlocks: [],
+        _delegate: true,
+        _delegateRunId: runId,
+        _delegateAgentId: block.agentId || "",
+        _delegateGoal: goalKey,
+        _delegateJobId: jobId,
+        _completed: false,
+        ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
+      });
+      placeProcessCardAtCallSite(sess, groupMsg);
+      (sess._delegateRunGroups ??= new Map()).set(runId, groupMsg.id);
+      applyDelegatePhaseToGroup(sess, groupMsg, block);
+      if (!sess._sendingInFlight) sess.messages = repairPostFinalProcessOrder(sess.messages);
+      return;
+    }
     msg = addMessage(sess, "delegate-progress", "", {
-      runId: block.runId,
+      runId,
       agentId: block.agentId || "",
-      goal: typeof block.goal === "string" ? block.goal : "",
-      _delegateGoal: typeof block.goal === "string" ? normalizeDelegateGoalKey(block.goal) : "",
-      _delegateJobId: typeof block.jobId === "string" ? block.jobId : undefined,
+      goal: goalRaw,
+      _delegateGoal: goalKey,
+      _delegateJobId: jobId,
       entries: [],
       childBlocks: [],
       _completed: false,
@@ -1427,9 +1423,9 @@ function handleDelegateProgressBlock(
     placeProcessCardAtCallSite(sess, msg);
   }
   if (block.agentId) msg.agentId = block.agentId;
-  if (typeof block.goal === "string" && block.goal && !msg._delegateGoal) {
-    msg.goal = block.goal;
-    msg._delegateGoal = normalizeDelegateGoalKey(block.goal);
+  if (goalRaw && !msg._delegateGoal) {
+    msg.goal = goalRaw;
+    msg._delegateGoal = goalKey;
   }
   if (applyDelegateUsageSnapshot(msg, block)) {
     // Usage is a replaceable absolute snapshot, not a visible transcript row.
@@ -1598,7 +1594,7 @@ export function applyOutboundMessage(
   // Exact turn ownership for browser-only process cards.  Rolling legacy
   // frames without an id may use the active turn, but an explicit frame id
   // always wins and is never replaced with a nearby active turn.
-  const frameTurnOwnerId = frame.clientMessageId ?? sess._activeClientMessageId;
+  let frameTurnOwnerId = frame.clientMessageId ?? sess._activeClientMessageId;
 
   // ── reconcile 'turn_state_unknown'(非 final,RFC §4)──
   // hello 对账时 server 对客户端上报的在飞 turn **无法给出终态**(durable inbox 无行且不是
@@ -1610,8 +1606,7 @@ export function applyOutboundMessage(
   if (!frame.isFinal && frame.meta?.reconcile === "turn_state_unknown") {
     markFrameReceived(sess);
     const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
-    if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });
-    else effects.forceSync?.(sess.id);
+    if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId }); else effects.forceSync?.(sess.id);
     return;
   }
 
@@ -1668,8 +1663,7 @@ export function applyOutboundMessage(
       !!sess._streamingThinking;
     if (!(hasLiveStream && !hasQueuedUser)) {
       const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
-      sess._streamingAssistant = null;
-      sess._streamingThinking = null;
+      sess._streamingAssistant = sess._streamingThinking = null;
       sess._sendingInFlight = false;
       sess._activeClientMessageId = undefined;
       clearTurnTiming(sess);
@@ -1717,8 +1711,7 @@ export function applyOutboundMessage(
       return;
     }
     const clientMessageId = frameCmid ?? active;
-    sess._streamingAssistant = null;
-    sess._streamingThinking = null;
+    sess._streamingAssistant = sess._streamingThinking = null;
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
@@ -1727,8 +1720,7 @@ export function applyOutboundMessage(
     resolveGenPlaceholders(sess, extractImageEditJobId(frame));
     sess.messages = repairPostFinalProcessOrder(sess.messages);
     effects.onFinal?.(sess, frame, false, clientMessageId);
-    if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });
-    else effects.forceSync?.(sess.id);
+    if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId }); else effects.forceSync?.(sess.id);
     return;
   }
 
@@ -1810,49 +1802,28 @@ export function applyOutboundMessage(
   // 的用户行错标成 read、发出错误的 live 生命周期信号。final 帧**永不**算 tail-only(其收尾逻辑必须
   // 照常跑)。混合帧(tail + text/tool)代表模型确有新生成 → 行为完全不变。thinking-safety 不受影响:
   // 计时器触发时按 _lastFrameAt(markFrameReceived 推进)做 liveness 复检,长 bash 只发 tail 也不误超时。
-  const tailOnlyFrame =
-    !frame.isFinal &&
-    hasBlocks &&
-    (frame.blocks as Array<{ kind?: string }>).every((b) => b?.kind === "tool_output_tail");
-  // 父轮 isFinal 之后仍可能涌来无 cmid 的 delegate_progress（子 agent 镜像到 leftover
-  // legacy:* live journal）。这和晚到 bash tail 是同一类事故：不是父模型新内容，
-  // 绝不能把已结束轮重新点亮成「正在生成」。混合帧(progress + text/tool)仍照旧。
-  const progressOnlyFrame =
-    !frame.isFinal &&
-    hasBlocks &&
-    (frame.blocks as Array<{ kind?: string }>).every((b) => b?.kind === "delegate_progress");
-  // leftover 才把 progress-only 当 sideband（不复活已收尾轮）。活跃轮仍要绑
-  // reply tracker、把 user 行 sent→read、并触发 onLiveFrame；否则首帧就是委派
-  // 进度时会吞掉这些生命周期信号。复活 _sendingInFlight 的那行已有
-  // !sess._sendingInFlight 守卫，sideband 限 leftover 保住「不点亮已收尾轮」。
-  const leftoverProgressSideband = progressOnlyFrame && !sess._sendingInFlight;
+  const nonFinalBlocks = !frame.isFinal && hasBlocks ? (frame.blocks as Array<{ kind?: string }>) : null;
+  const tailOnlyFrame = !!nonFinalBlocks?.every((b) => b?.kind === "tool_output_tail");
+  const progressOnlyFrame = !!nonFinalBlocks?.every((b) => b?.kind === "delegate_progress");
+  const leftoverProgressSideband =
+    progressOnlyFrame && (!sess._sendingInFlight || (!!sess._activeClientMessageId && !frame.clientMessageId));
+  if (leftoverProgressSideband) frameTurnOwnerId = undefined;
   const lifecycleSidebandFrame = tailOnlyFrame || leftoverProgressSideband;
-  // reload 后若本轮仍有新内容抵达，先通过 frameSeq/stale/agent-switch 守卫，再恢复 in-flight；cron 推送不是用户 turn。
-  if (!frame.isFinal && !frame.cronJob && hasBlocks && !lifecycleSidebandFrame && !sess._sendingInFlight)
-    sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
-  // 自动重试/引擎冷启动软提示的**内容帧兜底消解**:引擎产出真实内容(非 tail-only)即代表流
-  // 已恢复 → 清 retrying/engine_*,防 gateway 的 turn_status:null 复位帧在断线重连窗口丢失时软提示粘住。
-  // final/error/interrupted 由 clearTurnTiming 统一清 _turnStatus,此处只兜「流恢复但 null 帧丢」。
-  if (
-    hasBlocks &&
-    !lifecycleSidebandFrame &&
-    (isRetryingTurnStatus(sess._turnStatus) || isEngineStartupTurnStatus(sess._turnStatus))
-  )
-    sess._turnStatus = null;
-  // 「深度思考中」同理兜底:非思考内容到达 = 思考已结束,防 gateway 的 null 复位帧丢失时粘住。
-  if (
-    hasBlocks &&
-    !lifecycleSidebandFrame &&
-    sess._turnProgressHint === MODEL_THINKING_WORKING_DETAIL &&
-    frame.blocks!.some((b) => (b as { kind?: unknown }).kind !== "thinking")
-  )
-    sess._turnProgressHint = undefined;
-  // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
-  if (sess._sendingInFlight && !frame.isFinal && !lifecycleSidebandFrame) effects.onLiveFrame?.(sess);
-
-  // reply tracker 绑定 / user 行状态 / answer 计数 / isFinal 收尾 —— tail-only 帧全部短路(见上注释)。
   if (!lifecycleSidebandFrame) {
+    if (hasBlocks) {
+      if (!frame.isFinal && !frame.cronJob && !sess._sendingInFlight) sess._sendingInFlight = true;
+      if (isRetryingTurnStatus(sess._turnStatus) || isEngineStartupTurnStatus(sess._turnStatus))
+        sess._turnStatus = null;
+      const hint = sess._turnProgressHint;
+      if (
+        (hint === MODEL_THINKING_WORKING_DETAIL &&
+          frame.blocks!.some((b) => (b as { kind?: unknown }).kind !== "thinking")) ||
+        (hint?.startsWith("子任务") && frame.blocks!.some((b) => (b as { kind?: unknown }).kind !== "delegate_progress" && (b as { kind?: unknown }).kind !== "tool_output_tail"))
+      )
+        sess._turnProgressHint = undefined;
+    }
+    if (sess._sendingInFlight && !frame.isFinal) effects.onLiveFrame?.(sess);
     // reply tracker 绑定（跳过 queued）。
     if (!sess._replyingToMsgId) {
       const pending = [...sess.messages]
@@ -2480,8 +2451,7 @@ export function applyOutboundMessage(
     sess._pendingCostCredits = "0";
     // 清流式指针 + in-flight。
     const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
-    sess._streamingAssistant = null;
-    sess._streamingThinking = null;
+    sess._streamingAssistant = sess._streamingThinking = null;
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
@@ -2500,19 +2470,25 @@ export function applyOutboundMessage(
 // ═══════════════ outbound.turn_status（§6/§7）═══════════════
 export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire): void {
   if (!acceptFrameSeq(sess, frame)) return;
+  if (
+    frame.clientMessageId &&
+    sess._activeClientMessageId &&
+    frame.clientMessageId !== sess._activeClientMessageId
+  ) {
+    return;
+  }
   markFrameReceived(sess); // liveness signal
   // 判别联合(turn-retry 批):compacting 沿用字符串态;retrying 存下 attempt/max/retryAt 软提示
   // 载荷(不进 tape);其余(status:null / compact_end / abort)回到普通流式空态。retry 元数据只在
   // retrying 分支携带,故此处显式 narrow,不接受其它态漂出 retry 字段。
   if (frame.status === "compacting") {
-    // CCB repeats `compacting` while the summary streams; keep the first start.
     if (sess._turnStatus !== "compacting") sess._turnStatusSince = Date.now();
     sess._turnStatus = "compacting";
-  } else if (frame.status === "waiting_for_user") {
-    sess._turnStatus = "waiting_for_user";
-  } else if (frame.status === "engine_starting" || frame.status === "engine_resuming") {
-    // 引擎冷启动阶段:gateway 在首个可观察事件时权威清除(status:null);
-    // 内容帧兜底消解见 applyOutboundMessage。
+  } else if (
+    frame.status === "waiting_for_user" ||
+    frame.status === "engine_starting" ||
+    frame.status === "engine_resuming"
+  ) {
     sess._turnStatus = frame.status;
   } else if (frame.status === "retrying") {
     sess._turnStatus = {
@@ -2561,19 +2537,12 @@ export function applyTurnUsage(sess: ChatSession, frame: OutboundTurnUsageWire):
   if (!acceptFrameSeq(sess, frame)) return;
   if (!frame.clientMessageId || sess._activeClientMessageId !== frame.clientMessageId) return;
   markFrameReceived(sess);
-  const observedBytes =
-    sess._liveTurnUsage?.clientMessageId === frame.clientMessageId
-      ? sess._liveTurnUsage._observedBytes
-      : undefined;
-  const partialJsonByBlock =
-    sess._liveTurnUsage?.clientMessageId === frame.clientMessageId
-      ? sess._liveTurnUsage._partialJsonByBlock
-      : undefined;
+  const prev = sess._liveTurnUsage?.clientMessageId === frame.clientMessageId ? sess._liveTurnUsage : undefined;
   sess._liveTurnUsage = {
     clientMessageId: frame.clientMessageId,
     usage: { ...frame.usage },
-    ...(observedBytes ? { _observedBytes: observedBytes } : {}),
-    ...(partialJsonByBlock ? { _partialJsonByBlock: partialJsonByBlock } : {}),
+    ...(prev?._observedBytes ? { _observedBytes: prev._observedBytes } : {}),
+    ...(prev?._partialJsonByBlock ? { _partialJsonByBlock: prev._partialJsonByBlock } : {}),
     _estimatedUtf8Bytes: 0,
   };
 }
@@ -2601,16 +2570,22 @@ export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: { cli
   const cmid = typeof frame.clientMessageId === "string" && frame.clientMessageId
     ? frame.clientMessageId
     : undefined;
-  if (cmid && sess._activeClientMessageId === cmid) return false;
   const isCompletedTapeAssistant = (m: ChatSession["messages"][number]) =>
     m.role === "assistant" && m._turnTapeComplete === true && !m._errorCode;
-  if (cmid && sess.messages.some((m) => m._clientMessageId === cmid && isCompletedTapeAssistant(m))) {
-    return true;
+  if (cmid) {
+    if (sess._activeClientMessageId === cmid) return false;
+    if (
+      sess.messages.some(
+        (m) =>
+          (m._clientMessageId === cmid && isCompletedTapeAssistant(m)) ||
+          (m.role === "user" &&
+            m._automaticRecovery === true &&
+            m._recoveryOfClientMessageId === cmid &&
+            (m._source === "server" || !!m._turnTapeId)),
+      )
+    )
+      return true;
   }
-  if (cmid && sess.messages.some((message) =>
-    message.role === "user" && message._automaticRecovery === true &&
-    message._recoveryOfClientMessageId === cmid &&
-    (message._source === "server" || !!message._turnTapeId))) return true;
   if (sess._sendingInFlight) return false;
   if (!cmid) {
     return sess.messages.some(isCompletedTapeAssistant);
@@ -2841,50 +2816,43 @@ function settleCancelFencedTerminalError(
   effects.persistSession?.(sess.id);
 }
 
-export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
-  if (shouldSuppressStaleOutboundError(sess, frame)) return;
-  if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
-    if (!acceptFrameSeq(sess, frame)) return;
-    sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
-  }
-  // The rolling gateway wire enum cannot carry user_cancelled yet, so the
-  // container's proven Stop terminal arrives as this exact legacy pair.
-  const normalized = normalizeBridgeErrorCode(frame.code) === "upstream_failed" &&
-      frame.detail === "本轮已由用户停止。"
-    ? "user_cancelled"
-    : normalizeBridgeErrorCode(frame.code);
+function dispatchTerminalErrorPaint(
+  sess: ChatSession,
+  paint: DeferredTerminalErrorPaint,
+  effects: FrameEffects,
+  terminalDecision: boolean,
+  reportMessage?: string,
+): void {
+  const { normalized, clientMessageId, traceId } = paint;
   const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
-  const userError = readUserError(frame.userError);
-  const paint: DeferredTerminalErrorPaint = {
-    normalized,
-    text: friendlyBridgeErrorMessage(normalized, frame.message || "出错了"),
-    detail: safeBridgeErrorDetail(normalized, frame.traceId),
-    ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
-    ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
-    ...(userError ? { userError } : {}),
-  };
-  const terminalDecision = frame.recoveryDisposition === "terminal";
+  const activeOrFrameCmid = clientMessageId ?? sess._activeClientMessageId;
   if (terminalDecision || isSilentTurnErrorCode(normalized)) {
-    effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
+    effects.discardDeferredTerminalError?.(sess.id, clientMessageId);
   }
   if (
     !userCancelled &&
-    automaticRecoveryCancelFenced(sess, paint.clientMessageId ?? sess._activeClientMessageId) &&
-    !committedErrorCard(sess, paint.clientMessageId)
+    automaticRecoveryCancelFenced(sess, activeOrFrameCmid) &&
+    !committedErrorCard(sess, clientMessageId)
   ) {
     settleCancelFencedTerminalError(sess, paint, effects);
     return;
   }
-  // Master 拥有恢复且错误可自动恢复:红卡延后,本轮保持软状态直到 master 裁决。遥测仍照常上报。
-  if (
-    !userCancelled &&
-    !terminalDecision && supportsAutomaticTurnRecovery(normalized) &&
-    effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
-  ) {
-    sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
-    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
+  const canRecover = !terminalDecision && supportsAutomaticTurnRecovery(normalized);
+  const reportTelemetry = () => {
+    if (reportMessage !== undefined && !REPORT_EXEMPT_TURN_ERR_CODES.has(normalized)) {
+      effects.reportTurnError?.({
+        code: normalized,
+        message: `${normalized}: ${reportMessage}`,
+        traceId,
+        sessionId: sess.id,
+      });
+    }
+  };
+  if (!userCancelled && canRecover && effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true) {
+    sess._deferredTerminalErrorClientMessageId = activeOrFrameCmid;
+    enterDeferredRecoverySoftState(sess, activeOrFrameCmid);
     effects.persistSession?.(sess.id);
-    const deferredRoot = problemCardRootCmid(sess, sess._deferredTerminalErrorClientMessageId);
+    const deferredRoot = problemCardRootCmid(sess, activeOrFrameCmid);
     if (deferredRoot) {
       effects.reportProblemCard?.(sess.id, {
         rootCmid: deferredRoot,
@@ -2893,23 +2861,15 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
         path: "deferred",
         presentation: "soft",
         attempts: 1,
-        traceId: paint.traceId,
+        traceId,
       });
     }
-    if (!REPORT_EXEMPT_TURN_ERR_CODES.has(normalized)) {
-      effects.reportTurnError?.({
-        code: normalized,
-        message: `${normalized}: ${frame.message || frame.detail || ""}`,
-        traceId: typeof frame.traceId === "string" ? frame.traceId : undefined,
-        sessionId: sess.id,
-      });
-    }
+    reportTelemetry();
     return;
   }
-  const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
+  const immediateRoot = problemCardRootCmid(sess, activeOrFrameCmid);
   const painted = paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
-  // 重连重放同一条错误时卡片已经在了:不重画,也不再报一次(管理员数据里同一张卡报过 35 次)。
   if (painted && !isSilentTurnErrorCode(normalized) && immediateRoot) {
     effects.reportProblemCard?.(sess.id, {
       rootCmid: immediateRoot,
@@ -2917,24 +2877,39 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
       outcome: "failed",
       path: "immediate",
       presentation: problemCardPresentation(normalized, false),
-      traceId: paint.traceId,
+      traceId,
     });
   }
-  // 遥测上报口径用**遥测豁免集**(reportable===false),与"预期业务态"(expected)解耦
-  // (Codex 审计 R5c):rate_limited/model_capacity/service_restart/image_server_busy 虽对用户预期,
-  // 但是平台运营故障信号,必须上报;仅用户主动(stopped/user_cancelled)与业务拒绝类才豁免。
-  if (!REPORT_EXEMPT_TURN_ERR_CODES.has(normalized)) {
-    effects.reportTurnError?.({
-      code: normalized,
-      message: `${normalized}: ${frame.message || frame.detail || ""}`,
-      traceId: typeof frame.traceId === "string" ? frame.traceId : undefined,
-      sessionId: sess.id,
-    });
-  }
+  reportTelemetry();
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
-  if (!terminalDecision && supportsAutomaticTurnRecovery(normalized)) {
-    effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
+  if (canRecover) effects.scheduleAutomaticRecovery?.(sess.id, clientMessageId);
+}
+
+export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
+  if (shouldSuppressStaleOutboundError(sess, frame)) return;
+  if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
+    if (!acceptFrameSeq(sess, frame)) return;
+    sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
   }
+  const normalized =
+    normalizeBridgeErrorCode(frame.code) === "upstream_failed" && frame.detail === "本轮已由用户停止。"
+      ? "user_cancelled"
+      : normalizeBridgeErrorCode(frame.code);
+  const userError = readUserError(frame.userError);
+  dispatchTerminalErrorPaint(
+    sess,
+    {
+      normalized,
+      text: friendlyBridgeErrorMessage(normalized, frame.message || "出错了"),
+      detail: safeBridgeErrorDetail(normalized, frame.traceId),
+      ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
+      ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+      ...(userError ? { userError } : {}),
+    },
+    effects,
+    frame.recoveryDisposition === "terminal",
+    frame.message || frame.detail || "",
+  );
 }
 
 // ═══════════════ legacy bridge error（type:'error'）═══════════════
@@ -2944,68 +2919,20 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     return;
   }
   const normalized = normalizeBridgeErrorCode(frame.code);
-  const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
   const userError = readUserError(frame.userError);
-  const paint: DeferredTerminalErrorPaint = {
-    normalized,
-    text: friendlyBridgeErrorMessage(frame.code, frame.message),
-    detail: safeBridgeErrorDetail(frame.code, frame.traceId),
-    ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
-    ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
-    ...(userError ? { userError } : {}),
-  };
-  if (isSilentTurnErrorCode(normalized)) {
-    effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
-  }
-  if (
-    !userCancelled &&
-    automaticRecoveryCancelFenced(sess, paint.clientMessageId ?? sess._activeClientMessageId) &&
-    !committedErrorCard(sess, paint.clientMessageId)
-  ) {
-    settleCancelFencedTerminalError(sess, paint, effects);
-    return;
-  }
-  // legacy error 无后续 final,前端自己收尾本轮 UI;master 拥有恢复时同样延后红卡。
-  if (
-    !userCancelled &&
-    supportsAutomaticTurnRecovery(normalized) &&
-    effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
-  ) {
-    sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
-    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
-    effects.persistSession?.(sess.id);
-    const deferredRoot = problemCardRootCmid(sess, sess._deferredTerminalErrorClientMessageId);
-    if (deferredRoot) {
-      effects.reportProblemCard?.(sess.id, {
-        rootCmid: deferredRoot,
-        code: normalized,
-        outcome: "pending",
-        path: "deferred",
-        presentation: "soft",
-        attempts: 1,
-        traceId: paint.traceId,
-      });
-    }
-    return;
-  }
-  const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
-  const painted = paintTerminalError(sess, paint, userCancelled);
-  effects.persistSession?.(sess.id);
-  // 重连重放同一条错误时卡片已经在了:不重画,也不再报一次(管理员数据里同一张卡报过 35 次)。
-  if (painted && !isSilentTurnErrorCode(normalized) && immediateRoot) {
-    effects.reportProblemCard?.(sess.id, {
-      rootCmid: immediateRoot,
-      code: normalized,
-      outcome: "failed",
-      path: "immediate",
-      presentation: problemCardPresentation(normalized, false),
-      traceId: paint.traceId,
-    });
-  }
-  if (normalized === "insufficient_credits") effects.refreshBalance?.();
-  if (supportsAutomaticTurnRecovery(normalized)) {
-    effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
-  }
+  dispatchTerminalErrorPaint(
+    sess,
+    {
+      normalized,
+      text: friendlyBridgeErrorMessage(frame.code, frame.message),
+      detail: safeBridgeErrorDetail(frame.code, frame.traceId),
+      ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
+      ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+      ...(userError ? { userError } : {}),
+    },
+    effects,
+    false,
+  );
 }
 
 // ═══════════════ resume_failed（§4 第三层）═══════════════

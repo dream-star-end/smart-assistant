@@ -1547,10 +1547,12 @@ export class ChatSocket {
 
   /** Claim one exact server turn as this browser's in-flight turn. */
   private beginTurn(sess: ChatSession, clientMessageId: string, agentId?: string, startedAt = Date.now()): void {
-    sess._streamingAssistant = null;
-    sess._streamingThinking = null;
+    if (sess._activeClientMessageId !== clientMessageId) {
+      sess._turnStatus = null;
+      sess._turnStatusSince = sess._turnProgressHint = undefined;
+    }
+    sess._streamingAssistant = sess._streamingThinking = sess._agentSwitchedAt = null;
     sess._blockIdToMsgId = new Map();
-    sess._agentSwitchedAt = null;
     sess._localTeardownAt = undefined;
     sess._sendingInFlight = true;
     sess._activeClientMessageId = clientMessageId;

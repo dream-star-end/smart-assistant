@@ -6,20 +6,19 @@
  * 作为一整轮新回合执行并单独计费。提示条只讲这个后果。
  *
  * 合并规则(§3.4):本轮处于什么阶段(「后台运行中」「深度思考中」「启动引擎」「连接已断开」)
- * 只由 TurnActivity 那一行说;提示条不复述阶段,detached 的出现与消失直接跟 isTurnDetached 走,
- * 所以 #1198 的「后台运行中」与本提示条是同一件事的一处说明,不会出现第二条同义提示。
+ * 只由 TurnActivity 那一行说;提示条仅在已有排队消息时显示,平时无排队消息时不弹出打扰。
  * 积分(「本轮已扣 N 积分」)来自统一快照的实扣结算(B4b),只说已扣,不估算。
  */
 import type { BackgroundSendKind } from "./continuationNudge";
 import type { ChatSession } from "./model";
-import { type ChatStatusClass, STALE_WARN_MS } from "./pure";
+import type { ChatStatusClass } from "./pure";
 import { TURN_COST_REMINDER_CREDITS } from "./reducer";
 import { formatCredits } from "../utils";
 import type { DispatchStatus } from "./socket";
 
-/** 触发条件全部消失后,提示条再保留这么久,避免帧间隔在 30s 上下时来回闪。 */
+/** 触发条件全部消失后,提示条再保留这么久,避免排队刚泵出时来回闪。 */
 export const BACKGROUND_TURN_HOLD_MS = 10_000;
-/** 提示条自带的复检节拍:静默跨过 30s、保持期到点都靠它推进。 */
+/** 提示条自带的复检节拍:保持期到点靠它推进。 */
 export const BACKGROUND_TURN_TICK_MS = 5_000;
 
 export const BACKGROUND_TURN_TEXT = "本轮仍在运行。现在发送的消息会等本轮结束后再发出，另行计费。";
@@ -81,9 +80,9 @@ export function turnCreditsLine(
   return `本轮已扣 ${formatCredits(c.settled)} 积分${asOf}`;
 }
 
-/** §3.2 触发 (a) detached、(b) 静默 ≥30s、(c) 已有排队消息。(d) 积分线随 B4b 加入。 */
+/** 仅在已有排队消息时触发横幅;未排队时不弹出(继续/重复发送仍走 guardSend 软确认)。 */
 export function backgroundTurnTriggered(f: BackgroundTurnFacts): boolean {
-  return f.detached || f.silenceMs >= STALE_WARN_MS || f.queuedCount > 0 || creditsAtReminderLine(f.creditsSettled);
+  return f.queuedCount > 0;
 }
 
 /**
