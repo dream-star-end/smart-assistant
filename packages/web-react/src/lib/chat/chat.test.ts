@@ -1843,6 +1843,120 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s.messages.map((m) => m.role)).toEqual(["user", "delegate-progress", "assistant"]);
   });
 
+  test("跨轮后台子任务隔离: 新轮在飞时收到旧轮无 cmid 的 delegate_progress 帧，仅原地更新旧轮卡片，不冲掉新轮状态或污染新轮生命周期", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    addMessage(s, "user", "第一轮任务", { id: "m-turn-1", status: "replied" });
+    const bgGroup = addMessage(s, "agent-group", "", {
+      id: "ag-bg-1",
+      agentId: "general-assistant",
+      _delegateRunId: "dlg-bg-1",
+      _delegateJobId: "dlgjob-bg-1",
+      _turnOwnerId: "m-turn-1",
+      childBlocks: [],
+      _completed: false,
+    });
+    addMessage(s, "assistant", "已派发后台任务", { id: "a-turn-1", _clientMessageId: "m-turn-1" });
+
+    // 用户发起第二轮，此时正在启动引擎 / 深度思考中
+    const u2 = addMessage(s, "user", "第二轮新问题", { id: "m-turn-2", status: "sent" });
+    s._activeClientMessageId = "m-turn-2";
+    s._sendingInFlight = true;
+    s._replyingToMsgId = null;
+    s._turnStatus = "engine_starting";
+    s._turnProgressHint = MODEL_THINKING_WORKING_DETAIL;
+
+    // 第一轮后台子任务发来无 clientMessageId 的进度帧
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 10,
+        clientMessageId: undefined,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-bg-1",
+            agentId: "general-assistant",
+            phase: "tool_start",
+            toolName: "Bash",
+            text: "Bash",
+            block: {
+              kind: "tool_use",
+              name: "Bash",
+              input: JSON.stringify({ command: "echo bg" }),
+              blockId: "b-bg-tool-1",
+            },
+          },
+        ],
+      }),
+      { onLiveFrame },
+    );
+
+    // 1. 旧轮卡片原地收到子任务块，且归属仍为 m-turn-1
+    expect(bgGroup.childBlocks).toHaveLength(1);
+    expect(bgGroup._turnOwnerId).toBe("m-turn-1");
+    // 2. 新轮的 engine_starting 与深度思考提示未被冲掉
+    expect(s._turnStatus).toBe("engine_starting");
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+    // 3. 新轮 user 行未被提前标为 read，reply tracker 未被误绑，onLiveFrame 未被误触发
+    expect(u2.status).toBe("sent");
+    expect(s._replyingToMsgId).toBeNull();
+    expect(onLiveFrame).not.toHaveBeenCalled();
+    // 4. 新轮实时 token 估算未被旧轮后台子任务字节污染
+    expect(s._liveTurnUsage).toBeUndefined();
+  });
+
+  test("applyTurnStatus 跨轮隔离与子任务提示消解: 忽略旧轮 cmid 的 working 帧，同步子任务 done 或父轮后续正文到达时自动清掉子任务提示", () => {
+    const s = sess();
+    s._activeClientMessageId = "m-turn-2";
+    s._sendingInFlight = true;
+    s._turnProgressHint = MODEL_THINKING_WORKING_DETAIL;
+
+    // 1. 带旧轮 clientMessageId 的 working 帧被严格忽略
+    applyTurnStatus(
+      s,
+      turnStatusFrame({
+        frameSeq: 1,
+        clientMessageId: "m-turn-1",
+        status: "working",
+        detail: "子任务 通用助手: Bash sleep 10",
+      }),
+    );
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+
+    // 2. 本轮同步子任务 working 帧正常写入提示
+    applyTurnStatus(
+      s,
+      turnStatusFrame({
+        frameSeq: 2,
+        clientMessageId: "m-turn-2",
+        status: "working",
+        detail: "子任务 编程助手: Bash pytest",
+      }),
+    );
+    expect(s._turnProgressHint).toBe("子任务 编程助手: Bash pytest");
+
+    // 3. 同步子任务 done 帧到达时自动清掉残留的「子任务 …」提示
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        clientMessageId: "m-turn-2",
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sync-2",
+            agentId: "coding-assistant",
+            phase: "done",
+            text: "测试通过",
+          },
+        ],
+      }),
+      {},
+    );
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+
   test("混合帧(progress + text)行为不变:仍复活发送态", () => {
     const s = sess();
     const onLiveFrame = vi.fn();

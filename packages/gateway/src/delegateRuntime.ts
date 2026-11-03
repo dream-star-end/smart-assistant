@@ -1133,6 +1133,17 @@ export async function _runDelegateTaskCore(
   let context = input.context
   let isReview = input.isReview === true
   const parentSessionKey = input.parentSessionKey
+  const launchOwnerSession =
+    typeof parentSessionKey === 'string' && parentSessionKey
+      ? this.sessions.getByKey(parentSessionKey)
+      : undefined
+  const launchOwnerTurnKey =
+    launchOwnerSession?._billingParentTurnKey ?? launchOwnerSession?._currentTurnKey
+  const launchOwnerTurnIndex =
+    launchOwnerSession?._currentTurnIndex ??
+    (launchOwnerSession && Number.isSafeInteger(launchOwnerSession.turns)
+      ? Math.max(1, launchOwnerSession.turns + 1)
+      : undefined)
   /** 审查员本次执行型号(2026-09-04:必须 ≠ 队长/panel 家族;选不出则沿用成员默认绑定)。 */
   let reviewerModelOverride: string | undefined
   let reviewMode: TeamReviewMode = 'execution'
@@ -1364,11 +1375,15 @@ export async function _runDelegateTaskCore(
   // 嵌套(二级+):直接父是 delegate 会话 → 进度要挂到用户可见的一级委派卡,而非
   // 另开一张卡或(旧行为)整段丢弃。
   const nestedProgress = progressRouting?.nested === true
-  const delegateParent = this._resolveDelegateParent({
+  const rawDelegateParent = this._resolveDelegateParent({
     taskboardControl: input.taskboardControl,
     parentSessionKey,
     sourceAgent,
   })
+  const delegateParent =
+    rawDelegateParent && !rawDelegateParent.billingParentTurnKey && launchOwnerTurnKey
+      ? { ...rawDelegateParent, billingParentTurnKey: launchOwnerTurnKey }
+      : rawDelegateParent
   // delegate 计费归因:父**客户端**会话 id(web-*)优先,拿不到才落容器内部
   // parentSessionKey(解析链见 resolveDelegateParentClientSessionId JSDoc)。
   // 随 usageAttribution → runner CLAUDE_CODE_EXTRA_METADATA env → master 计费点
@@ -1388,15 +1403,25 @@ export async function _runDelegateTaskCore(
   // (= progressTarget.peerId),保证账务 locator 与 tape sessionId 一致。
   const delegateOwnerLocator: DelegateOwnerTurnLocator | undefined = progressTarget
     ? (() => {
+        if (nestedProgress && progressRouting?.firstLevelRunId) {
+          const inherited = this._delegateOwnerByRunId?.get(progressRouting.firstLevelRunId)
+          if (inherited) return inherited
+        }
         const ownerSession = this.sessions.getByKey(progressTarget.sessionKey)
-        const ownerTurnKey = ownerSession?._currentTurnKey
-        if (!ownerSession || !ownerTurnKey) return undefined
+        const currentTurnKey = ownerSession?._currentTurnKey
+        const ownerTurnKey = nestedProgress
+          ? delegateParent?.billingParentTurnKey ?? currentTurnKey
+          : launchOwnerTurnKey ?? currentTurnKey
+        if (!ownerTurnKey) return undefined
+        const currentMatchesOwner = Boolean(currentTurnKey && currentTurnKey === ownerTurnKey)
         return {
           parentSessionId: progressTarget.peerId,
           parentTurnKey: ownerTurnKey,
           turnIndex:
-            ownerSession._currentTurnIndex ??
-            (Number.isSafeInteger(ownerSession.turns) ? Math.max(1, ownerSession.turns + 1) : 1),
+            (currentMatchesOwner ? ownerSession?._currentTurnIndex : launchOwnerTurnIndex) ??
+            (ownerSession && Number.isSafeInteger(ownerSession.turns)
+              ? Math.max(1, ownerSession.turns + 1)
+              : 1),
         }
       })()
     : undefined
@@ -1431,6 +1456,35 @@ export async function _runDelegateTaskCore(
   const nestLabel = nestedProgress
     ? [...(progressRouting?.ancestorAgentPath ?? []), targetAgentId].join('↳')
     : ''
+  const expectedOwnerTurnKey =
+    delegateOwnerLocator?.parentTurnKey ??
+    (nestedProgress ? delegateParent?.billingParentTurnKey : undefined) ??
+    launchOwnerTurnKey
+  const isBackgroundOriginInject = (() => {
+    if (input.callbackOnComplete === 'origin-inject') return true
+    if (
+      input.backgroundJobId &&
+      this._delegateJobs?.snapshotOf(input.backgroundJobId)?.callback === 'origin-inject'
+    ) {
+      return true
+    }
+    if (nestedProgress && this._delegateJobs && typeof parentSessionKey === 'string') {
+      const activeOriginInjectKeys = new Set(
+        this._delegateJobs
+          .listNonTerminal()
+          .filter((j) => j.callback === 'origin-inject' && typeof j.sessionKey === 'string')
+          .map((j) => j.sessionKey as string),
+      )
+      if (activeOriginInjectKeys.size > 0) {
+        let curKey: string | undefined = parentSessionKey
+        for (let hop = 0; hop < 5 && curKey; hop++) {
+          if (activeOriginInjectKeys.has(curKey)) return true
+          curKey = this.sessions.getByKey(curKey)?.parentSessionKey
+        }
+      }
+    }
+    return false
+  })()
   // Live lookup each emit: a retry may have moved the parent cmid, and a
   // terminated parent must not keep receiving dispatch:<old>:N frames.
   const emitProgress = (block: DelegateProgressBlock | null) => {
@@ -1446,8 +1500,13 @@ export async function _runDelegateTaskCore(
       : block
     if (!outBlock) return
     const parentSession = this.sessions.getByKey(progressTarget.sessionKey)
-    const liveCmid =
-      parentSession?._runningClientMessageId ?? parentSession?._currentDispatch?.clientMessageId
+    const sameOwnerTurn = expectedOwnerTurnKey
+      ? parentSession?._currentTurnKey === expectedOwnerTurnKey &&
+        !parentSession?._sealedOwnerTurnKeys?.has(expectedOwnerTurnKey)
+      : parentSession?._currentTurnKey === undefined
+    const liveCmid = sameOwnerTurn
+      ? (parentSession?._runningClientMessageId ?? parentSession?._currentDispatch?.clientMessageId)
+      : undefined
     const binding = resolveDelegateProgressBinding({
       candidate: typeof liveCmid === 'string' ? liveCmid : undefined,
       isFenced: (cmid) =>
@@ -1473,17 +1532,20 @@ export async function _runDelegateTaskCore(
       parallelCount: this._activeDelegationsByParent.get(progressTarget.sessionKey)?.size,
     })
     if (liveDetail) {
-      this.deliver(
-        _buildTurnStatusFrame(
-          {
-            sessionKey: progressTarget.sessionKey,
-            channel: progressTarget.channel,
-            peer: { id: progressTarget.peerId, kind: 'dm' },
-            ...(progressTarget.userId ? { _userId: progressTarget.userId } : {}),
-          },
-          { status: 'working', detail: liveDetail },
-        ),
-      )
+      if (sameOwnerTurn && !isBackgroundOriginInject) {
+        this.deliver(
+          _buildTurnStatusFrame(
+            {
+              sessionKey: progressTarget.sessionKey,
+              channel: progressTarget.channel,
+              peer: { id: progressTarget.peerId, kind: 'dm' },
+              ...(binding.clientMessageId ? { clientMessageId: binding.clientMessageId } : {}),
+              ...(progressTarget.userId ? { _userId: progressTarget.userId } : {}),
+            },
+            { status: 'working', detail: liveDetail },
+          ),
+        )
+      }
     }
     this._touchDelegateInflightSurface({
       // Nested progress hangs on the first-level card: never let the child's

@@ -1351,6 +1351,12 @@ function handleDelegateProgressBlock(
   turnOwnerId?: string,
 ): void {
   if (!block.runId) return;
+  if (
+    (block.phase === "done" || block.phase === "error") &&
+    sess._turnProgressHint?.startsWith("子任务")
+  ) {
+    sess._turnProgressHint = undefined;
+  }
   let groupMsgId = sess._delegateRunGroups?.get(block.runId);
   if (groupMsgId === undefined) {
     // 只绑本地富卡:server-authored 骨架行同 runId 也不接收 live 帧(债A)。
@@ -1598,7 +1604,7 @@ export function applyOutboundMessage(
   // Exact turn ownership for browser-only process cards.  Rolling legacy
   // frames without an id may use the active turn, but an explicit frame id
   // always wins and is never replaced with a nearby active turn.
-  const frameTurnOwnerId = frame.clientMessageId ?? sess._activeClientMessageId;
+  let frameTurnOwnerId = frame.clientMessageId ?? sess._activeClientMessageId;
 
   // ── reconcile 'turn_state_unknown'(非 final,RFC §4)──
   // hello 对账时 server 对客户端上报的在飞 turn **无法给出终态**(durable inbox 无行且不是
@@ -1825,7 +1831,10 @@ export function applyOutboundMessage(
   // reply tracker、把 user 行 sent→read、并触发 onLiveFrame；否则首帧就是委派
   // 进度时会吞掉这些生命周期信号。复活 _sendingInFlight 的那行已有
   // !sess._sendingInFlight 守卫，sideband 限 leftover 保住「不点亮已收尾轮」。
-  const leftoverProgressSideband = progressOnlyFrame && !sess._sendingInFlight;
+  const leftoverProgressSideband =
+    progressOnlyFrame &&
+    (!sess._sendingInFlight || (Boolean(sess._activeClientMessageId) && !frame.clientMessageId));
+  if (leftoverProgressSideband) frameTurnOwnerId = undefined;
   const lifecycleSidebandFrame = tailOnlyFrame || leftoverProgressSideband;
   // reload 后若本轮仍有新内容抵达，先通过 frameSeq/stale/agent-switch 守卫，再恢复 in-flight；cron 推送不是用户 turn。
   if (!frame.isFinal && !frame.cronJob && hasBlocks && !lifecycleSidebandFrame && !sess._sendingInFlight)
@@ -1846,6 +1855,17 @@ export function applyOutboundMessage(
     !lifecycleSidebandFrame &&
     sess._turnProgressHint === MODEL_THINKING_WORKING_DETAIL &&
     frame.blocks!.some((b) => (b as { kind?: unknown }).kind !== "thinking")
+  )
+    sess._turnProgressHint = undefined;
+  if (
+    hasBlocks &&
+    !lifecycleSidebandFrame &&
+    sess._turnProgressHint?.startsWith("子任务") &&
+    frame.blocks!.some(
+      (b) =>
+        (b as { kind?: unknown }).kind !== "delegate_progress" &&
+        (b as { kind?: unknown }).kind !== "tool_output_tail",
+    )
   )
     sess._turnProgressHint = undefined;
   // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
@@ -2500,6 +2520,13 @@ export function applyOutboundMessage(
 // ═══════════════ outbound.turn_status（§6/§7）═══════════════
 export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire): void {
   if (!acceptFrameSeq(sess, frame)) return;
+  if (
+    frame.clientMessageId &&
+    sess._activeClientMessageId &&
+    frame.clientMessageId !== sess._activeClientMessageId
+  ) {
+    return;
+  }
   markFrameReceived(sess); // liveness signal
   // 判别联合(turn-retry 批):compacting 沿用字符串态;retrying 存下 attempt/max/retryAt 软提示
   // 载荷(不进 tape);其余(status:null / compact_end / abort)回到普通流式空态。retry 元数据只在
