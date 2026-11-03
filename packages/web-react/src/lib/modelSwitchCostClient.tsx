@@ -59,10 +59,47 @@ function checkedQuote(value: unknown, requestId: string): ModelSwitchCostQuote {
   return q
 }
 const number = (value: string | number) => String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-export function ModelSwitchCostSummary({ quote: q }: { quote: ModelSwitchCostQuote }) {
+type PriceDirection = 'higher' | 'lower' | 'same'
+/** 价目（目录倍率）优先于首轮预估：重建上下文会让更便宜的模型首轮看起来更贵。 */
+function listedDirection(listed?: { from?: number; to?: number }): PriceDirection | null {
+  const from = listed?.from
+  const to = listed?.to
+  if (typeof from !== 'number' || typeof to !== 'number') return null
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return null
+  if (to > from) return 'higher'
+  if (to < from) return 'lower'
+  return 'same'
+}
+function creditDirection(q: ModelSwitchCostQuote): PriceDirection | null {
+  if (!q.targetCost || !q.currentCost) return null
+  const target = BigInt(q.targetCost.expectedCredits)
+  const current = BigInt(q.currentCost.expectedCredits)
+  if (target > current) return 'higher'
+  if (target < current) return 'lower'
+  return 'same'
+}
+export function switchPriceDirection(
+  q: ModelSwitchCostQuote,
+  listed?: { from?: number; to?: number },
+): PriceDirection | null {
+  return listedDirection(listed) ?? creditDirection(q)
+}
+export function switchPriceWarning(direction: PriceDirection | null): string {
+  if (direction === 'lower') return '切换后首次会话将重建全部上下文，价格更低'
+  if (direction === 'same') return '切换后首次会话将重建全部上下文，价格相同'
+  if (direction === 'higher') return SWITCH_COST_WARNING
+  return '切换后首次会话将重建全部上下文'
+}
+export function ModelSwitchCostSummary({
+  quote: q,
+  listedX,
+}: {
+  quote: ModelSwitchCostQuote
+  listedX?: { from?: number; to?: number }
+}) {
   return (
     <div className="space-y-2 text-sm text-muted" data-testid="model-switch-cost-summary">
-      <p>{SWITCH_COST_WARNING}</p>
+      <p>{switchPriceWarning(switchPriceDirection(q, listedX))}</p>
       {q.mode === 'risk' ? (
         <>
           <p className="font-medium text-foreground">无法预估本轮费用</p>
@@ -113,7 +150,12 @@ export function createModelSwitchCostAuthorizer({
 }: ModelSwitchCostClientDeps): AuthorizeSwitch {
   const cache = new Map<
     string,
-    { epoch: number; authorization: SwitchAuthorization; expiresAt: number }
+    {
+      epoch: number
+      authorization: SwitchAuthorization
+      expiresAt: number
+      userConfirmed: boolean
+    }
   >()
   const flight = new Map<string, Promise<SwitchAuthorization | null>>()
   return (original, opts = {}) => {
@@ -176,17 +218,32 @@ export function createModelSwitchCostAuthorizer({
           return null
         }
         let choice: ConfirmChoice = true
-        if (q.requiresConfirmation || opts.notice) {
-          if (opts.interactive === false || opts.canPrompt?.() === false) return null
+        let userConfirmed = false
+        const priorConfirmed = valid?.userConfirmed === true
+        const canAsk = opts.interactive !== false && opts.canPrompt?.() !== false
+        // The picker confirm already covered this switch. Refresh consent for the
+        // real message without asking the same question again.
+        if (priorConfirmed && !opts.notice && q.requiresConfirmation && q.canConfirm && canAsk) {
+          if (!q.quoteToken) return null
+          choice = valid?.authorization.choice ?? true
+          userConfirmed = true
+          q = checkedQuote(
+            await api.modelSwitchCost(auth, input, { quoteToken: q.quoteToken }),
+            input.requestId,
+          )
+          if (!current() || q.requiresConfirmation) return null
+        } else if (q.requiresConfirmation || opts.notice) {
+          if (!canAsk) return null
           const notice = opts.notice
+          const warning = switchPriceWarning(switchPriceDirection(q, opts.listedX))
           choice = await confirmDialog({
             title: notice?.title ?? '切换模型？',
             body: (
               <div className="space-y-3">
                 {q.requiresConfirmation || q.targetCost !== null ? (
-                  <ModelSwitchCostSummary quote={q} />
+                  <ModelSwitchCostSummary quote={q} listedX={opts.listedX} />
                 ) : (
-                  <p className="text-sm text-muted">{SWITCH_COST_WARNING}</p>
+                  <p className="text-sm text-muted">{warning}</p>
                 )}
                 {notice?.body}
               </div>
@@ -197,6 +254,7 @@ export function createModelSwitchCostAuthorizer({
             confirmDisabled: !q.canConfirm,
           })
           if (choice === false || !current() || opts.canPrompt?.() === false) return null
+          userConfirmed = true
           if (q.requiresConfirmation) {
             if (!q.quoteToken) return null
             q = checkedQuote(
@@ -211,7 +269,8 @@ export function createModelSwitchCostAuthorizer({
           ...(q.consent ? { consent: q.consent } : {}),
           choice,
         }
-        if (opts.primeNextTurn) cache.set(key, { epoch, authorization, expiresAt: q.expiresAt })
+        if (opts.primeNextTurn)
+          cache.set(key, { epoch, authorization, expiresAt: q.expiresAt, userConfirmed })
         return authorization
       } catch (error) {
         const unavailable =

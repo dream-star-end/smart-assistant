@@ -28,7 +28,7 @@ describe("sys.context_rebuilt 按 noticeId 去重", () => {
   test("文案说清原因;旧帧不带原因时沿用原文案", () => {
     const s = createSession({ id: "s1", agentId: "main" });
     expect(contextRebuiltRow(s, { ...base, noticeId: "a", reason: "engine-switch" })?.text)
-      .toBe("换了模型引擎，已用最近 12 条对话重建上下文。更早的细节助手可能记不全，如需引用旧内容可直接粘贴。");
+      .toBe("换了模型，已用最近 12 条对话接上上下文。更早的细节助手可能记不全，如需引用旧内容可直接粘贴。");
     expect(contextRebuiltRow(s, { ...base, noticeId: "b", reason: "native-resume-loss" })?.text)
       .toContain("原会话没能直接续上");
     expect(contextRebuiltRow(s, { ...base, noticeId: "c" })?.text).toBe(contextRebuiltNotice(12));

@@ -1,9 +1,14 @@
+import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
+import '@testing-library/jest-dom/vitest'
 import { api, ApiError } from './api'
 import { createMemoryAuthSession } from './authSession'
 import { createModelSwitchCostAuthorizer } from './modelSwitchCostClient'
 import { fixtureSwitchQuote } from '../../browser-tests/model-switch-cost-fixture.mjs'
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 test('malformed successful API data cannot authorize a switch or masquerade as offline work', async () => {
   vi.spyOn(api, 'modelSwitchCost').mockResolvedValue({} as never)
   const confirmDialog = vi.fn()
@@ -195,4 +200,200 @@ test('direct-switch alt confirms the paid quote and returns its consent', async 
     .toEqual({ requestId: input.requestId, choice: 'alt', consent: 'paid-alt-consent' })
   expect(request).toHaveBeenCalledTimes(2)
   expect(request.mock.calls[1][2]).toEqual({ quoteToken: 'quote-alt' })
+})
+
+const switchInput = (requestId: string) => ({
+  sessionId: 'own',
+  requestId,
+  targetModel: 'gpt-6-astra',
+  agentId: 'main',
+})
+
+test('a confirmed switch is not asked again when the send quote still needs a token', async () => {
+  const select = switchInput('m-select')
+  vi.spyOn(api, 'modelSwitchCost').mockImplementation(async (_auth, input, proof) => {
+    if (proof?.quoteToken) {
+      return {
+        ...fixtureSwitchQuote(input),
+        requiresConfirmation: false,
+        consent: `c-${proof.quoteToken}`,
+      }
+    }
+    if (proof?.consent) {
+      return { ...fixtureSwitchQuote(input), requiresConfirmation: true, quoteToken: 'q-send' }
+    }
+    return { ...fixtureSwitchQuote(input), requiresConfirmation: true, quoteToken: 'q-select' }
+  })
+  const confirmDialog = vi.fn().mockResolvedValue(true)
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+    confirmDialog,
+    toast: vi.fn(),
+  })
+  expect(
+    await authorize(select, {
+      notice: { title: '切换模型？', confirmText: '压缩并切换', altText: '直接切换' },
+      primeNextTurn: true,
+    }),
+  ).toEqual({ requestId: 'm-select', choice: true, consent: 'c-q-select' })
+  expect(confirmDialog).toHaveBeenCalledTimes(1)
+  expect(confirmDialog.mock.calls[0]?.[0]).toMatchObject({
+    title: '切换模型？',
+    confirmText: '压缩并切换',
+    altText: '直接切换',
+  })
+  expect(
+    await authorize(
+      { ...select, requestId: 'm-send' },
+      { useCachedRequestId: true },
+    ),
+  ).toEqual({ requestId: 'm-select', choice: true, consent: 'c-q-send' })
+  expect(confirmDialog).toHaveBeenCalledTimes(1)
+})
+
+test('a notice-only confirm is reused when the later send needs a quote token', async () => {
+  const select = switchInput('m-notice')
+  let calls = 0
+  vi.spyOn(api, 'modelSwitchCost').mockImplementation(async (_auth, input, proof) => {
+    calls += 1
+    if (proof?.quoteToken) {
+      return { ...fixtureSwitchQuote(input), requiresConfirmation: false, consent: 'c-send' }
+    }
+    if (calls === 1) return fixtureSwitchQuote(input)
+    return { ...fixtureSwitchQuote(input), requiresConfirmation: true, quoteToken: 'q-send' }
+  })
+  const confirmDialog = vi.fn().mockResolvedValue(true)
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+    confirmDialog,
+    toast: vi.fn(),
+  })
+  expect(
+    await authorize(select, { notice: { title: '切换模型？' }, primeNextTurn: true }),
+  ).toEqual({ requestId: 'm-notice', choice: true })
+  expect(confirmDialog).toHaveBeenCalledTimes(1)
+  expect(
+    await authorize({ ...select, requestId: 'm-send' }, { useCachedRequestId: true }),
+  ).toEqual({ requestId: 'm-notice', choice: true, consent: 'c-send' })
+  expect(confirmDialog).toHaveBeenCalledTimes(1)
+})
+
+test('an exempt prime that never showed a dialog still asks on the send', async () => {
+  const select = switchInput('m-unconfirmed')
+  let calls = 0
+  vi.spyOn(api, 'modelSwitchCost').mockImplementation(async (_auth, input, proof) => {
+    calls += 1
+    if (proof?.quoteToken) {
+      return { ...fixtureSwitchQuote(input), requiresConfirmation: false, consent: 'c-later' }
+    }
+    if (calls === 1) return fixtureSwitchQuote(input)
+    return { ...fixtureSwitchQuote(input), requiresConfirmation: true, quoteToken: 'q-later' }
+  })
+  const confirmDialog = vi.fn().mockResolvedValue(true)
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+    confirmDialog,
+    toast: vi.fn(),
+  })
+  expect(await authorize(select, { primeNextTurn: true })).toEqual({
+    requestId: 'm-unconfirmed',
+    choice: true,
+  })
+  expect(confirmDialog).not.toHaveBeenCalled()
+  expect(
+    await authorize({ ...select, requestId: 'm-send' }, { useCachedRequestId: true }),
+  ).toEqual({ requestId: 'm-unconfirmed', choice: true, consent: 'c-later' })
+  expect(confirmDialog).toHaveBeenCalledTimes(1)
+})
+
+test('cancelling the switch does not suppress the next prompt', async () => {
+  const input = switchInput('m-cancel')
+  vi.spyOn(api, 'modelSwitchCost').mockImplementation(async (_auth, quoted, proof) => {
+    if (proof?.quoteToken) {
+      return { ...fixtureSwitchQuote(quoted), requiresConfirmation: false, consent: 'c-after-cancel' }
+    }
+    return { ...fixtureSwitchQuote(quoted), requiresConfirmation: true, quoteToken: 'q-cancel' }
+  })
+  const confirmDialog = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+    confirmDialog,
+    toast: vi.fn(),
+  })
+  expect(await authorize(input, { notice: { title: '切换模型？' }, primeNextTurn: true })).toBeNull()
+  expect(
+    await authorize(input, { primeNextTurn: true }),
+  ).toEqual({ requestId: 'm-cancel', choice: true, consent: 'c-after-cancel' })
+  expect(confirmDialog).toHaveBeenCalledTimes(2)
+})
+
+test('a non-interactive send does not treat the earlier confirm as silent consent', async () => {
+  const select = switchInput('m-silent')
+  vi.spyOn(api, 'modelSwitchCost').mockImplementation(async (_auth, input, proof) => {
+    if (proof?.quoteToken) {
+      return { ...fixtureSwitchQuote(input), requiresConfirmation: false, consent: 'c-silent' }
+    }
+    return { ...fixtureSwitchQuote(input), requiresConfirmation: true, quoteToken: 'q-silent' }
+  })
+  const confirmDialog = vi.fn().mockResolvedValue(true)
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+    confirmDialog,
+    toast: vi.fn(),
+  })
+  expect(
+    await authorize(select, { notice: { title: '切换模型？' }, primeNextTurn: true }),
+  ).toMatchObject({ consent: 'c-silent' })
+  expect(
+    await authorize({ ...select, requestId: 'm-send' }, { useCachedRequestId: true, interactive: false }),
+  ).toBeNull()
+  expect(confirmDialog).toHaveBeenCalledTimes(1)
+})
+
+async function openPriceDialog(listedX?: { from?: number; to?: number }, quotePatch?: object) {
+  const input = switchInput(`m-price-${listedX?.to ?? 'x'}-${quotePatch ? 'patch' : 'plain'}`)
+  vi.spyOn(api, 'modelSwitchCost').mockResolvedValue({
+    ...fixtureSwitchQuote(input),
+    ...quotePatch,
+  } as never)
+  const confirmDialog = vi.fn().mockResolvedValue(false)
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+    confirmDialog,
+    toast: vi.fn(),
+  })
+  expect(await authorize(input, { notice: { title: '切换模型？' }, listedX })).toBeNull()
+  expect(confirmDialog).toHaveBeenCalledTimes(1)
+  render(confirmDialog.mock.calls[0]?.[0].body)
+}
+
+test('listed price direction overrides a higher first-turn estimate', async () => {
+  await openPriceDialog({ from: 5, to: 1 })
+  expect(screen.getByText('切换后首次会话将重建全部上下文，价格更低')).toBeInTheDocument()
+  expect(screen.queryByText('切换后首次会话将重建全部上下文，价格较高')).toBeNull()
+})
+
+test('without a list price, a higher first-turn estimate still says 价格较高', async () => {
+  await openPriceDialog()
+  expect(screen.getByText('切换后首次会话将重建全部上下文，价格较高')).toBeInTheDocument()
+})
+
+test('an equal list price says 价格相同', async () => {
+  await openPriceDialog({ from: 2, to: 2 })
+  expect(screen.getByText('切换后首次会话将重建全部上下文，价格相同')).toBeInTheDocument()
+})
+
+test('an exempt quote with no prices drops the price adjective', async () => {
+  await openPriceDialog(undefined, {
+    mode: 'exempt',
+    contextTokens: null,
+    outputTokens: null,
+    targetCost: null,
+    currentCost: null,
+    targetUnitPrice: null,
+    balanceCredits: null,
+    requiresConfirmation: false,
+  })
+  expect(screen.getByText('切换后首次会话将重建全部上下文')).toBeInTheDocument()
+  expect(screen.queryByText(/价格/)).toBeNull()
 })

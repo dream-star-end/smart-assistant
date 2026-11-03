@@ -14,7 +14,7 @@ import {
   cursorFamilySupportsFast,
 } from '@openclaude/protocol/browser'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import { useNarrowViewport } from '../hooks/useMdViewport'
 import {
   availableCursorEfforts,
@@ -357,14 +357,17 @@ export function ModelSelector({
     collapsed: collapsedRows,
     selectedInCollapsed,
   } = partitionCollapsedRows(rows, selectedId)
-  // 折叠组默认收起;当前选中项落在组内时自动展开,保证选中项永远可见。
+  // 每次打开都按同一规则：选中项在组内才展开。不记住上次展开，避免再次打开时相反。
   const [collapsedOpen, setCollapsedOpen] = useState(selectedInCollapsed)
-  useEffect(() => {
-    if (selectedInCollapsed) setCollapsedOpen(true)
-  }, [selectedInCollapsed])
+  const pickerWasOpen = useRef(false)
   const narrow = useNarrowViewport()
   const [uncontrolledSheetOpen, setUncontrolledSheetOpen] = useState(false)
   const sheetOpen = teamEngineActive ? false : (open ?? uncontrolledSheetOpen)
+  useEffect(() => {
+    const opened = sheetOpen && !pickerWasOpen.current
+    pickerWasOpen.current = sheetOpen
+    if (opened) setCollapsedOpen(selectedInCollapsed)
+  }, [sheetOpen, selectedInCollapsed])
   const setSheetOpen = (next: boolean) => {
     if (teamEngineActive && next) return
     onOpenChange?.(next)
@@ -456,6 +459,11 @@ export function ModelSelector({
   const gptFastOn = serviceTier === 'fast'
   const showPlatformEffort =
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
+  const showEffortUnsupported =
+    !teamEngineActive &&
+    Boolean(selected) &&
+    !showCursorEffort &&
+    !(effortSupported && effortSupported.length > 0)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
 
   const rememberAndSelect = (id: string) => {
@@ -574,7 +582,7 @@ export function ModelSelector({
           <span className="flex min-w-0 items-center gap-1.5">
             <Lock size={14} className="shrink-0" aria-hidden />
             <span className="truncate">{labelText}</span>
-            <span className="sr-only">（需升级解锁）</span>
+            <span className="sr-only">需升级</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={locked} />
@@ -639,7 +647,7 @@ export function ModelSelector({
           <span className="flex min-w-0 items-center gap-1.5">
             <Lock size={14} className="shrink-0" aria-hidden />
             <span className="truncate">{row.row.label}</span>
-            <span className="sr-only">（需升级解锁）</span>
+            <span className="sr-only">需升级</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={row.row.representative} />
@@ -688,8 +696,8 @@ export function ModelSelector({
             </span>
             <span className="mt-0.5 block text-muted">
               {hasAlternatives
-                ? '该服务商暂时降级,建议改用下方可用模型。'
-                : '该服务商暂时降级,暂无同类可用模型,请稍后重试。'}
+                ? '建议改用下方可用模型。'
+                : '请稍后重试。'}
             </span>
           </div>
         )}
@@ -737,6 +745,9 @@ export function ModelSelector({
     )
     const extras = (
       <>
+        {showEffortUnsupported && (
+          <p className="px-2.5 py-1 text-caption text-faint">不支持思考档位</p>
+        )}
         {showCursorEffort && selectedCursor && (
           <div className={mode === 'menu' ? 'shrink-0' : undefined}>
             <PickerSeparator mode={mode} />
@@ -853,7 +864,7 @@ export function ModelSelector({
               className="justify-between"
             >
               <span>
-                Fast（更快，按 2× 计费）
+                Fast（按 2× 计费）
               </span>
               {gptFastOn && <Check size={14} className="shrink-0 text-accent" />}
             </PickerItem>
@@ -891,7 +902,7 @@ export function ModelSelector({
               }}
               className="justify-between"
             >
-              <span>1M（更少压缩，单轮消耗更高）</span>
+              <span>1M</span>
               {activeCursorContextTier === '1m' && (
                 <Check size={14} className="shrink-0 text-accent" />
               )}
@@ -1008,7 +1019,7 @@ export function ModelSelector({
         loading && selected
           ? '正在切换模型，请稍候'
           : teamEngineActive
-            ? `团队模式固定由队长模型 ${engineLabel} 执行与计费，关闭团队模式后可切换模型`
+            ? engineLabel
             : selectedDegraded
               ? '当前模型暂不可用，点击更换'
               : undefined
@@ -1049,7 +1060,7 @@ export function ModelSelector({
       <span className="min-w-0 truncate sm:max-w-[180px]">{label}</span>
       {loading && selected && !teamEngineActive ? (
         <span className="shrink-0 text-faint" data-testid="model-trigger-loading">
-          · 切换中…
+          切换中…
         </span>
       ) : (
         tierLabel && (

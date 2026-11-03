@@ -16,6 +16,8 @@ export type AuthorizeSwitch = (
     allowOfflineQueue?: boolean
     useCachedRequestId?: boolean
     consent?: string
+    /** Catalog multipliers (cost_x). Price-list direction, not the first-turn estimate. */
+    listedX?: { from?: number; to?: number }
     isCurrent?: () => boolean
     canPrompt?: () => boolean
   },

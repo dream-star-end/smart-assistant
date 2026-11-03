@@ -1002,3 +1002,129 @@ describe('OCV5-504 自选档说明保持默认与目录价格权威', () => {
     expect(onSelectEffort).toHaveBeenCalledExactlyOnceWith(null)
   })
 })
+
+
+describe('ModelSelector 更多模型再次打开', () => {
+  const GROUP: PublicModel[] = [
+    { id: 'deepseek-v4-flash', display_name: 'DeepSeek V4 Flash' },
+    { id: 'kimi-k3', display_name: 'Kimi K3' },
+    { id: 'kimi-k3-go', display_name: 'Kimi K3 (Go)' },
+    { id: 'qwen3.8-max-go', display_name: 'Qwen3.8 Max (Go)' },
+  ]
+  const collapsed = () => document.querySelector('[data-collapsed-group]')?.getAttribute('data-collapsed-group')
+
+  it('展开后关掉再打开，仍按选中项收起，不和上次相反', async () => {
+    const view = render(
+      <ModelSelector models={GROUP} selectedId="deepseek-v4-flash" onSelect={() => {}} open />,
+    )
+    await screen.findAllByRole('menuitem')
+    expect(collapsed()).toBe('closed')
+    const header = document.querySelector('[data-collapsed-group]')
+    if (header) fireEvent.click(header)
+    expect(collapsed()).toBe('open')
+    view.rerender(
+      <ModelSelector models={GROUP} selectedId="deepseek-v4-flash" onSelect={() => {}} open={false} />,
+    )
+    view.rerender(
+      <ModelSelector models={GROUP} selectedId="deepseek-v4-flash" onSelect={() => {}} open />,
+    )
+    await screen.findAllByRole('menuitem')
+    await waitFor(() => expect(collapsed()).toBe('closed'))
+  })
+
+  it('选中项在组内时，收起再打开仍展开', async () => {
+    const view = render(
+      <ModelSelector models={GROUP} selectedId="qwen3.8-max-go" onSelect={() => {}} open />,
+    )
+    await screen.findAllByRole('menuitem')
+    expect(collapsed()).toBe('open')
+    const header = document.querySelector('[data-collapsed-group]')
+    if (header) fireEvent.click(header)
+    expect(collapsed()).toBe('closed')
+    view.rerender(
+      <ModelSelector models={GROUP} selectedId="qwen3.8-max-go" onSelect={() => {}} open={false} />,
+    )
+    view.rerender(<ModelSelector models={GROUP} selectedId="qwen3.8-max-go" onSelect={() => {}} open />)
+    await screen.findAllByRole('menuitem')
+    await waitFor(() => expect(collapsed()).toBe('open'))
+  })
+})
+
+describe('ModelSelector 不支持思考档位', () => {
+  it('只显示一行淡灰说明，不弹窗，也不占用 note', async () => {
+    const view = render(
+      <ModelSelector
+        models={[{ id: 'glm-5.2', display_name: 'GLM-5.2' }]}
+        selectedId="glm-5.2"
+        onSelect={() => {}}
+        open
+      />,
+    )
+    await screen.findAllByRole('menuitem')
+    const hint = screen.getByText('不支持思考档位')
+    expect(hint.tagName).toBe('P')
+    expect(hint.className).toContain('text-faint')
+    expect(hint.getAttribute('role')).toBeNull()
+    expect(screen.queryByRole('note')).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText('思考档位')).toBeNull()
+    view.rerender(
+      <ModelSelector
+        models={[{ id: 'glm-5.2', display_name: 'GLM-5.2' }]}
+        selectedId="glm-5.2"
+        onSelect={() => {}}
+        effortSupported={[]}
+        onSelectEffort={() => {}}
+        open
+      />,
+    )
+    expect(screen.getByText('不支持思考档位')).toBeInTheDocument()
+  })
+
+  it('目录有思考档时不显示不支持说明', async () => {
+    render(
+      <ModelSelector
+        models={[{ id: 'glm-5.2', display_name: 'GLM-5.2' }]}
+        selectedId="glm-5.2"
+        onSelect={() => {}}
+        effortSupported={['low', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+        open
+      />,
+    )
+    await screen.findAllByRole('menuitem')
+    expect(screen.getByText('较低档偏重响应速度，较高档偏重复杂任务。')).toBeInTheDocument()
+    expect(screen.queryByText('不支持思考档位')).toBeNull()
+  })
+
+  it('Cursor 家族有思考档时不显示不支持说明', async () => {
+    render(
+      <ModelSelector
+        models={[
+          { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+          { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
+        ]}
+        selectedId="cursor-grok-4.6-high"
+        onSelect={() => {}}
+        open
+      />,
+    )
+    await screen.findAllByRole('menuitem')
+    expect(screen.getByText('思考档位')).toBeInTheDocument()
+    expect(screen.queryByText('不支持思考档位')).toBeNull()
+  })
+
+  it('团队引擎开启时不显示不支持说明', () => {
+    render(
+      <ModelSelector
+        models={[{ id: 'glm-5.2', display_name: 'GLM-5.2' }]}
+        selectedId="glm-5.2"
+        onSelect={() => {}}
+        teamEngineActive
+        open
+      />,
+    )
+    expect(screen.queryByText('不支持思考档位')).toBeNull()
+  })
+})
