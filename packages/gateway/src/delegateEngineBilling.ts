@@ -53,7 +53,7 @@ export interface DelegateEngineBillingAdmitInput {
 export interface DelegateEngineBillingAdmission {
   requestId: string
   engineSessionId: string
-  /** Advisor-consult only. Regular delegate admits omit this. */
+  /** Master-issued provider route for any codex admit (advisor or delegate). */
   route?: unknown
 }
 

@@ -33,7 +33,12 @@ after(() => {
 })
 process.env.OC_MODEL_AUTHORITY = '0'
 
-function makeBillingClient(): DelegateEngineBillingClient & {
+const OFFICIAL_ROUTE = { kind: 'official_oauth', groupId: '3' }
+
+function makeBillingClient(
+  admitRoute: unknown = OFFICIAL_ROUTE,
+  includeRoute = true,
+): DelegateEngineBillingClient & {
   admits: unknown[]
   settles: unknown[]
   abandons: string[]
@@ -47,7 +52,11 @@ function makeBillingClient(): DelegateEngineBillingClient & {
     abandons,
     async admit(input) {
       admits.push(input)
-      return { requestId: REQUEST_ID, engineSessionId: `oceng-${'b'.repeat(48)}` }
+      return {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        ...(includeRoute ? { route: admitRoute } : {}),
+      }
     },
     async settle(billing) {
       settles.push(billing)
@@ -137,8 +146,12 @@ function makeGateway(opts?: {
       _effort?: string | null,
       _model?: string,
       requestId?: string,
+      _traceId?: string,
+      _conversationMode?: unknown,
+      submitOpts?: { codexRoute?: unknown; grokRoute?: unknown },
     ) => {
       gw._lastSubmitRequestId = requestId
+      gw._lastSubmitOpts = submitOpts
       gw._submitOnEvent = onEvent
       if (opts?.submitError) throw opts.submitError
       if (opts?.hangSubmit) {
@@ -310,5 +323,55 @@ describe('handleDelegateTask engine-reported billing', () => {
         else process.env[key] = value
       }
     }
+  })
+
+  it('(e) codex 委派 submit 带 master 签发的 official_oauth provider route (OCV5-729)', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    const r = await delegate(gw, 'auditor', memberBody({ model: 'gpt-5.6-sol' }))
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    const route = gw._lastSubmitOpts?.codexRoute as Record<string, unknown> | undefined
+    assert.ok(route, 'codexRoute must reach the runner')
+    assert.equal(route.modelProvider, 'oc_chatgpt_official')
+    assert.equal(route.baseUrl, 'http://127.0.0.1:18789/internal/v3/codex-relay/backend-api/codex')
+    assert.equal(route.providerName, 'OpenAI (OpenClaude relay)')
+    assert.equal(route.wireApi, 'responses')
+    assert.equal(route.preferredAuthMethod, 'chatgpt')
+    assert.equal(route.disableResponseStorage, true)
+    assert.equal(route.requiresOpenaiAuth, true)
+  })
+
+  it('(f) api_relay admit 路由投影为带 token 的 loopback baseUrl (OCV5-729)', async () => {
+    const token = 'cd'.repeat(32)
+    const billing = makeBillingClient({
+      kind: 'api_relay',
+      token,
+      modelProvider: 'openai-codex',
+      providerName: 'relay',
+      wireApi: 'responses',
+      preferredAuthMethod: 'apikey',
+      disableResponseStorage: true,
+    })
+    const gw = makeGateway({ billing })
+    const r = await delegate(gw, 'auditor', memberBody({ model: 'gpt-5.6-sol' }))
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    const route = gw._lastSubmitOpts?.codexRoute as Record<string, unknown> | undefined
+    assert.ok(route, 'codexRoute must reach the runner')
+    assert.equal(route.modelProvider, 'openai-codex')
+    assert.equal(
+      route.baseUrl,
+      `http://127.0.0.1:18789/internal/v3/codex-relay/route/${token}`,
+    )
+  })
+
+  it('(g) codex 委派 admit 未签发 route 时 fail-closed，不创建 submit (OCV5-729)', async () => {
+    const billing = makeBillingClient(undefined, false)
+    const gw = makeGateway({ billing })
+    const r = await delegate(gw, 'auditor', memberBody({ model: 'gpt-5.6-sol' }))
+    assert.equal(r.status, 503, JSON.stringify(r.body))
+    assert.match(String(r.body.error), /Codex 委派路由不可用/)
+    assert.equal(gw._lastSubmitRequestId, 'UNSET', 'runner must not be submitted')
+    assert.equal(gw._lastSubmitOpts, undefined)
+    assert.deepEqual(billing.abandons, [REQUEST_ID])
   })
 })

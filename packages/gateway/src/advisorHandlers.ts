@@ -45,7 +45,7 @@ import {
   type DelegateEngineBillingAdmission,
 } from './delegateEngineBilling.js'
 import { parseAdvisorAdmitRoute, type AdvisorAdmitRouteOk } from './advisorCodexRoute.js'
-import { V3_CODEX_RELAY_PREFIX } from './v3CodexRelay.js'
+import { _buildCodexAdmitRouteOverride } from './routeOverrides.js'
 import { resolveEngine } from './engine/registry.js'
 import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
 import { getLocalCatalogView } from './modelCatalogClient.js'
@@ -53,7 +53,6 @@ import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   resolveLocalExecutionIfEnforced,
   localExecutionOverride,
-  _buildSafeCodexRouteOverride,
 } from './server.js'
 import type { Gateway } from './server.js'
 
@@ -1166,28 +1165,11 @@ export function _advisorConsultRouteOverride(
   route: AdvisorAdmitRouteOk,
   model: string,
 ): import('./engine/codexShared.js').CodexProviderConfigOverride | null {
-  const port = this.deps.config.gateway.port
-  if (route.kind === 'official_oauth') {
-    return _buildSafeCodexRouteOverride({
-      agent: { id: ADVISOR_AGENT_ID },
-      model,
-      rawRoute: { kind: 'official_oauth' },
-      officialRelayPort: port,
-    })
-  }
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
-  return _buildSafeCodexRouteOverride({
-    agent: { id: ADVISOR_AGENT_ID },
+  return _buildCodexAdmitRouteOverride({
+    route,
+    agentId: ADVISOR_AGENT_ID,
     model,
-    rawRoute: {
-      baseUrl: `http://127.0.0.1:${port}${V3_CODEX_RELAY_PREFIX}/route/${route.token}`,
-      modelProvider: route.modelProvider,
-      providerName: route.providerName ?? null,
-      wireApi: route.wireApi ?? 'responses',
-      preferredAuthMethod: route.preferredAuthMethod ?? 'apikey',
-      disableResponseStorage: route.disableResponseStorage ?? true,
-    },
-    officialRelayPort: port,
+    officialRelayPort: this.deps.config.gateway.port,
   })
 }
 
