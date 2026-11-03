@@ -9199,7 +9199,13 @@ wait $!
     assert.match(j5Lib, /const deadline = Date\.now\(\) \+ turnWaitMs;/, 'J5 deadline 必须实际使用传入的等待上限')
     assert.match(journeySource, /turnWaitMs: TURN_WAIT_TIMEOUT,/, 'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT')
     assert.match(journeySource, /graceMs: J5_BACKEND_GRACE,/, 'J5 宽限必须是计入总预算的常量')
-    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "grok-build";')
+    // The literal moved into the pure selector; the default intent is unchanged.
+    const validationSelector = await readFile(path.join(root, 'scripts/lib/v5-validation-journey.mjs'), 'utf8')
+    assert.match(validationSelector, /export const DEFAULT_JOURNEY_MODEL_ID = "grok-build";/)
+    assert.match(validationSelector, /scope\.journeyModel !== "deepseek-v4-flash"/)
+    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = journeyValidation.model;')
+    assert.ok(journeySource.indexOf('selectJourneyValidation(process.argv.slice(2))') < modelPin,
+      'batch scope must be validated before selecting the entire journey model')
     // 选模逻辑已抽到共享 helper(selfhost 契约门共用);不变量不变:真实选择器 → 菜单项 → 触发器回显,
     // 且必须在附件上传/首次 UI 发送之前生效。canary 侧断言"调用 helper 并传固定模型",helper 侧断言顺序。
     const helperSource = await readFile(path.join(root, 'scripts/lib/journey-browser.mjs'), 'utf8')
@@ -9226,7 +9232,7 @@ wait $!
       "J3 must click the plus-menu menuitem, not EmptyState text that also contains 设定目标",
     )
     assert.doesNotMatch(journeySource, /getByText\("设定目标"\)/)
-    assert.ok(modelPin >= 0, 'journey 必须固定使用平台自有的 GPT-5.6 Luna')
+    assert.ok(modelPin >= 0, 'journey 必须在默认Grok/显式绑定DeepSeek profile之间固定选择')
     assert.match(
       journeySource,
       /请读取刚上传的附件「\$\{probeName\}」第一行/,

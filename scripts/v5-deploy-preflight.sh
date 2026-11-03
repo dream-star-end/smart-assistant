@@ -91,6 +91,12 @@ if ! (
     esac
   fi
 
+  # Per-batch model exclusion must have a real pinned queue/source before a unit exists.
+  if ! validation_scope_preflight "$pinned"; then
+    echo '✗ preflight: validation profile authorization/batch/source invalid' >&2
+    fail=1
+  fi
+
   # 2) Box 证明门测试库:build_release 要求显式测试库。transient unit 只继承 OC_V5_PROOF_TEST_DATABASE_URL
   #    (见 v5-deploy-detached.sh add_optional_env),调用方 shell 里的 TEST_DATABASE_URL 带不进 unit,故只认前者。
   builds_release=0

@@ -17,6 +17,9 @@ import urllib.request
 spec = importlib.util.spec_from_file_location('release_policy', Path(__file__).with_name('v5-release-policy.py'))
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
+validation_spec = importlib.util.spec_from_file_location('validation_profile', Path(__file__).with_name('v5-validation-profile.py'))
+validation = importlib.util.module_from_spec(validation_spec)
+validation_spec.loader.exec_module(validation)
 ROOT = Path(os.environ.get('CP_ROOT', '/var/lib/openclaude-v5/release-policy'))
 ACTIVE = ROOT / 'active.json'
 MARKER = Path(os.environ.get('CP_RECOVERY_MARKER', '/opt/openclaude/openclaude-v5-releases/.manual-recovery-required'))
@@ -44,6 +47,26 @@ def context():
         p.require(c[key] == d[key], 'descriptor differs from context: ' + key)
     return c, d
 
+def validation_profile(d):
+    try:
+        scope = validation.validate_profile(d['options'].get('validationProfile'),
+            queue_id=d['options']['queueId'], source_sha=d['candidateSha'],
+            operation_id=d['owner']['deploymentId'])
+    except (ValueError, TypeError) as error:
+        raise p.PolicyError('invalid validation profile: ' + str(error)) from error
+    if 'validationProfile' in d['options']:
+        p.require(scope is not None and d['options']['withDist'] is True, 'invalid scoped validation options')
+    return scope
+
+def validate_options(d):
+    keys = {'withDist', 'restartEgress', 'egressBefore', 'egressTargetSlot', 'queueId', 'bundleDigest', 'authority'}
+    p.require(isinstance(d['options'], dict) and set(d['options']) in [keys, keys | {'validationProfile'}], 'invalid options')
+    p.require(all(type(d['options'][key]) is bool for key in ['withDist', 'restartEgress']), 'invalid boolean options')
+    p.require(re.fullmatch(r'[0-9a-f]{64}', d['options']['bundleDigest'] or ''), 'invalid code bundle digest')
+    p.require(d['options']['egressTargetSlot'] in ['', 'A', 'B'], 'invalid egress target slot')
+    p.ident(d['options']['queueId'], 'queue id')
+    validation_profile(d)
+
 def descriptor(operation):
     p.ident(operation, 'operation')
     filename = ROOT / (operation + '.json')
@@ -54,11 +77,7 @@ def descriptor(operation):
     p.require(set(d) == {'schema', 'operationId', 'candidateSha', 'owner', 'before', 'target', 'history', 'options'}, 'descriptor keys differ')
     body = {key: value for key, value in d.items() if key != 'operationId'}
     p.require(operation == 'c-' + hashlib.sha256(canonical(body)).hexdigest(), 'descriptor digest differs')
-    p.require(set(d['options']) == {'withDist', 'restartEgress', 'egressBefore', 'egressTargetSlot', 'queueId', 'bundleDigest', 'authority'}, 'invalid options')
-    p.require(all(type(d['options'][key]) is bool for key in ['withDist', 'restartEgress']), 'invalid boolean options')
-    p.require(re.fullmatch(r'[0-9a-f]{64}', d['options']['bundleDigest'] or ''), 'invalid code bundle digest')
-    p.require(d['options']['egressTargetSlot'] in ['', 'A', 'B'], 'invalid egress target slot')
-    p.ident(d['options']['queueId'], 'queue id')
+    validate_options(d)
     return d
 
 def values(filename):
@@ -176,6 +195,7 @@ def main(action, a):
         options.pop('slot'); options.pop('port')
         d = dict(schema=1, candidateSha=target['sourceCommit'], owner=dict(deploymentId=os.environ['CP_DEPLOY_ID'], nonce=os.environ['CP_LANE_NONCE']),
                  before=before, target=target, history=dict(path=hist, predecessorSha256=hashlib.sha256(Path(hist).read_bytes()).hexdigest(), transitionKind=kind), options=options)
+        validate_options(d)
         operation = 'c-' + hashlib.sha256(canonical(d)).hexdigest()
         d['operationId'] = operation
         p.atomic_write(ROOT / (operation + '.json'), d, create=True)
@@ -187,6 +207,9 @@ def main(action, a):
         return
     c, d = context()
     operation = c['operationId']
+    if action == 'validation-profile':
+        print(json.dumps(validation_profile(d), separators=(',', ':')))
+        return
     if action == 'archive-direction':
         print('target' if c.get('resolution') == 'forward' else 'before' if c.get('resolution') == 'compensated' else '')
         return

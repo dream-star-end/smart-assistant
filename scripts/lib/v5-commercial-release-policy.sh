@@ -32,13 +32,13 @@ commercial_policy_ship() {
   [[ "$MUTATION_LEASE_BYPASSED" != 1 ]] || return 86
   local dir digest remote
   dir="$SCRIPT_DIR"
-  digest="$(cat "$RUNTIME_LIB" "$dir/lib/v5-commercial-release-policy.sh" "$dir/lib/v5-commercial-release-policy.py" "$dir/lib/v5-release-policy.py" "$dir/v5-egress-slots.sh" | sha256sum | awk '{print $1}')" || return 79
+  digest="$(cat "$RUNTIME_LIB" "$dir/lib/v5-commercial-release-policy.sh" "$dir/lib/v5-commercial-release-policy.py" "$dir/lib/v5-release-policy.py" "$dir/lib/v5-validation-profile.py" "$dir/v5-egress-slots.sh" | sha256sum | awk '{print $1}')" || return 79
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 79
   CP_CODE_DIGEST="$digest"
   CP_BUNDLE="$CP_ROOT/code-$digest"
   [[ "${CP_SHIPPED:-}" == "$digest" ]] && return 0
-  remote="set -euo pipefail; umask 077; mkdir -p '$CP_ROOT'; t=\$(mktemp -d '$CP_ROOT/.code.XXXXXX'); trap 'rm -rf -- \"\$t\"' EXIT; tar -xf - -C \"\$t\"; test \"\$(cat \"\$t/v5-runtime-release-lib.sh\" \"\$t/lib/v5-commercial-release-policy.sh\" \"\$t/lib/v5-commercial-release-policy.py\" \"\$t/lib/v5-release-policy.py\" \"\$t/v5-egress-slots.sh\" | sha256sum | cut -d' ' -f1)\" = '$digest'; if test -e '$CP_BUNDLE'; then diff -qr \"\$t\" '$CP_BUNDLE' >/dev/null; else mv -T \"\$t\" '$CP_BUNDLE'; fi"
-  tar -cf - -C "$dir" v5-runtime-release-lib.sh lib/v5-commercial-release-policy.sh lib/v5-commercial-release-policy.py lib/v5-release-policy.py v5-egress-slots.sh \
+  remote="set -euo pipefail; umask 077; mkdir -p '$CP_ROOT'; t=\$(mktemp -d '$CP_ROOT/.code.XXXXXX'); trap 'rm -rf -- \"\$t\"' EXIT; tar -xf - -C \"\$t\"; test \"\$(cat \"\$t/v5-runtime-release-lib.sh\" \"\$t/lib/v5-commercial-release-policy.sh\" \"\$t/lib/v5-commercial-release-policy.py\" \"\$t/lib/v5-release-policy.py\" \"\$t/lib/v5-validation-profile.py\" \"\$t/v5-egress-slots.sh\" | sha256sum | cut -d' ' -f1)\" = '$digest'; if test -e '$CP_BUNDLE'; then diff -qr \"\$t\" '$CP_BUNDLE' >/dev/null; else mv -T \"\$t\" '$CP_BUNDLE'; fi"
+  tar -cf - -C "$dir" v5-runtime-release-lib.sh lib/v5-commercial-release-policy.sh lib/v5-commercial-release-policy.py lib/v5-release-policy.py lib/v5-validation-profile.py v5-egress-slots.sh \
     | ssh "$KL_HOST" "$remote" || return 79
   CP_SHIPPED="$digest"
 }
@@ -77,6 +77,7 @@ commercial_policy_configure() {
   commercial_policy_enabled || return 0
   [[ "$DRY" == 1 ]] && return 0
   commercial_policy_ship || return $?
+  validation_scope_bind || return $?
   local serving_unit="" egress_target_slot=""
   if [[ "$RESTART_EGRESS" == 1 ]]; then
     serving_unit="$(egress_slots_remote active)" || return 79
@@ -86,9 +87,11 @@ commercial_policy_configure() {
   CP_CONFIG="$(jq -cn --arg sha "$BUILT_RELEASE_SOURCE_COMMIT" --arg slot "$ACTIVE_SLOT" --argjson port "$ACTIVE_PORT" \
     --argjson withDist "$([[ "$WITH_DIST" == 1 ]] && echo true || echo false)" --argjson restartEgress "$([[ "$RESTART_EGRESS" == 1 ]] && echo true || echo false)" \
     --arg egressBefore "${CAPTURED_EGRESS_PREDECESSOR:-}" --arg egressTargetSlot "$egress_target_slot" --arg queueId "${OC_V5_RELEASE_QUEUE_ID:-}" --arg bundleDigest "$CP_CODE_DIGEST" \
+    --argjson validationProfile "${VALIDATION_SCOPE_JSON:-null}" \
     --argjson lockVersion "$ACTIVE_STATE_LOCK_VERSION" --arg activeRelease "$ACTIVE_STATE_RELEASE" --arg previousRelease "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" \
     '{sha:$sha,slot:$slot,port:$port,withDist:$withDist,restartEgress:$restartEgress,egressBefore:$egressBefore,egressTargetSlot:$egressTargetSlot,queueId:$queueId,bundleDigest:$bundleDigest,
-      authority:{lockVersion:$lockVersion,activeSlot:$slot,activeRelease:$activeRelease,previousRelease:$previousRelease}}')" || return 79
+      authority:{lockVersion:$lockVersion,activeSlot:$slot,activeRelease:$activeRelease,previousRelease:$previousRelease}}
+      + (if $validationProfile == null then {} else {validationProfile:$validationProfile} end)')" || return 79
 }
 
 commercial_policy_failure() { # allow existing compensation only on explicit direct user impairment
@@ -192,7 +195,9 @@ commercial_policy_promote_plugin() {
   fi
 }
 commercial_policy_required_gates() {
-  local rel="$1" with_dist
+  local rel="$1" with_dist validation_scope
+  validation_scope="$(commercial_policy_rmt commercial_policy_py validation-profile)" || return $?
+  validation_scope_restore "$validation_scope" || return $?
   BUILT_RELEASE_SOURCE_COMMIT="$(commercial_policy_rmt commercial_policy_py source-for-release "$rel")" || return $?
   BUILT_RELEASE="$rel"
   with_dist="$(commercial_policy_rmt commercial_policy_py field options.withDist)" || return $?
@@ -215,10 +220,12 @@ commercial_policy_required_gates() {
 commercial_policy_recover() {
   [[ "$DRY" == 1 ]] && { echo '  [dry-run] exact policy: recover service, reconcile real metadata, rerun all original gates'; return 0; }
   commercial_policy_ship || return $?
-  local rel status queue direction restart_egress rc=0
+  local rel status queue direction restart_egress validation_scope rc=0
   rel="$(commercial_policy_rmt commercial_policy_py field target.masterRelease)" || return $?
   queue="$(commercial_policy_rmt commercial_policy_py field options.queueId)" || return $?
   [[ "$queue" == "${OC_V5_RELEASE_QUEUE_ID:-}" ]] || return 79
+  validation_scope="$(commercial_policy_rmt commercial_policy_py validation-profile)" || return $?
+  validation_scope_restore "$validation_scope" || return $?
   direction="$(commercial_policy_rmt commercial_policy_py archive-direction)" || return $?
   if [[ "$direction" == before ]]; then
     commercial_policy_complete_compensation || return $?
