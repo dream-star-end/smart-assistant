@@ -1,3 +1,4 @@
+import { createBoxFailureDiagnostics } from "./http/proxy/boxFailureDiagnostic.js";
 import { resolveContainerLinkEndpoint } from "./ws/containerLinkEndpoint.js";
 import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
@@ -6388,7 +6389,10 @@ export async function registerCommercial(
   if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
     // Local ProxyAgent cleanup state must outlive a temporary loss of shared
     // leadership. Only the scheduler starts/stops on each leader term.
+    const boxFailureDiagnostics = createBoxFailureDiagnostics(process.env.OC_PLATFORM_ROOT);
     const boxRemoteCleanup = new BoxRemoteCleanupWorker({
+      beforeCleanup: boxFailureDiagnostics?.beforeCleanup,
+      sweepDiagnostics: boxFailureDiagnostics ? () => boxFailureDiagnostics.sweep() : undefined,
       journal: new BoxDurableJournal(getPool()),
       resolver: createProductionBoxAccountResolver(),
       writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),

@@ -1074,6 +1074,115 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
   }
 
+  /** A non-streaming fallback may explain an already settled failure, never
+   * resurrect it. Deliberately separate from admission / replay exclusions. */
+  async findSettledFailure(input: { uid: bigint; canonicalModel: string;
+    canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection;
+    prepared?: PreparedContinuation }): Promise<BoxRemoteCleanupCandidate | null> {
+    if ((input.canonicalBody as { stream?: boolean }).stream !== false) return null;
+    if (input.uid <= 0n || input.canonicalBody.model !== input.canonicalModel) {
+      throw new BoxDurableJournalError("BOX_REPLAY_IDENTITY_INVALID");
+    }
+    let view: PreparedConsumption;
+    try { view = consumePrepared({ ...input, allowPrepareOnce: input.prepared === undefined,
+      replayAlias: true }); }
+    catch (error) {
+      if (error instanceof PreparedConsumptionError
+        && ["BOX_AUTHORITY_MALFORMED", "BOX_AUTHORITY_REJECTED", "BOX_PREPARED_STALE"].includes(error.code)) {
+        throw new BoxDurableJournalError(error.code);
+      }
+      throw new BoxDurableJournalError("BOX_REPLAY_IDENTITY_INVALID");
+    }
+    const fp = view.fingerprint;
+    const invalid = (): never => { throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID"); };
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      await lock(client, [`box:session:${input.uid}:${fp.sessionId}`]);
+      type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
+      const found = await client.query<Row>(`SELECT request_id,state,ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
+          AND ctx->>'model'=$4 AND ctx->>'boxFallbackAlias'=$5 LIMIT 2`,
+      [input.uid.toString(), fp.sessionId, fp.turnKey, input.canonicalModel, view.fallbackAlias]);
+      if (found.rows.length > 1) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
+      const leaf = found.rows[0];
+      if (!leaf || leaf.state !== "aborted" || leaf.ctx.boxState !== "failed_stopped"
+        || Object.hasOwn(leaf.ctx, "boxReplayMessage")) {
+        await client.query("COMMIT"); committed = true; return null;
+      }
+      const basis = leaf.ctx;
+      const accountId = basis.boxAccountId, runNonce = basis.boxRunNonce, leaseEpoch = basis.boxLeaseEpoch;
+      const mode = basis.boxInvocationMode, round = basis.boxRoundNo ?? 1;
+      if (typeof accountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(accountId)
+        || typeof runNonce !== "string" || !/^[a-f0-9]{24}$/.test(runNonce)
+        || typeof leaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(leaseEpoch)
+        || (mode !== "text" && mode !== "detached_tool")
+        || !Number.isSafeInteger(round) || Number(round) < 1 || Number(round) > BOX_TOOL_MAX_ROUNDS
+        || (mode === "text" && round !== 1)
+        || (Number(round) > 1 && (typeof basis.boxCatalogHash !== "string"
+          || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
+          || typeof basis.boxDetachedRunnerHash !== "string" || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)))
+        || Object.hasOwn(basis, "boxToolHandoff") || Object.hasOwn(basis, "boxResumeRequestId")) invalid();
+      let proof: BoxTerminalProof;
+      try { proof = parseBoxTerminalProof(JSON.stringify(basis.boxTerminalProof) + "\n",
+        { runNonce: runNonce as string, leaseEpoch: leaseEpoch as string }); }
+      catch { return invalid(); }
+      if ((proof.reason === "worker_complete") !== (basis.boxStopOutcome === "rejected_stream")) invalid();
+      const rows: Row[] = [], seen = new Set<string>();
+      let row: Row | undefined = leaf;
+      while (row) {
+        const ctx = row.ctx;
+        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(row.request_id)
+          || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
+          || ctx.boxInvocationRecovery !== "v1" || ctx.boxInvocationMode !== mode
+          || ctx.boxAccountId !== accountId || ctx.boxRunNonce !== runNonce || ctx.boxLeaseEpoch !== leaseEpoch
+          || ctx.boxSessionId !== fp.sessionId || ctx.boxTurnKey !== fp.turnKey || ctx.model !== input.canonicalModel
+          || (ctx.boxUpstreamModel !== undefined && !isBoxApiModelPair(ctx.model, ctx.boxUpstreamModel))) invalid();
+        const bound = trustedIdentitiesBind({ uid: view.prepared.uid, sessionId: fp.sessionId,
+          canonicalModel: view.prepared.canonicalModel, turnKey: fp.turnKey, authority: view.prepared.authority },
+        { uid: input.uid, sessionId: String(ctx.boxSessionId), canonicalModel: String(ctx.model),
+          turnKey: String(ctx.boxTurnKey), authority: authorityFromJournalCtx(ctx) });
+        if (!bound.ok) throw new BoxDurableJournalError(bound.code);
+        seen.add(row.request_id); rows.push(row);
+        const child = rows[rows.length - 2];
+        if (child) {
+          const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+          const hashes = ctx.boxResumeResultHashes;
+          if (!Array.isArray(hashes) || hashes.length < 1 || hashes.length > 32
+            || hashes.some((item) => !item || typeof item !== "object" || Array.isArray(item)
+              || Object.keys(item).sort().join(",") !== "contentHash,isError,modelToolUseId"
+              || typeof item.modelToolUseId !== "string" || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.modelToolUseId)
+              || typeof item.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(item.contentHash)
+              || typeof item.isError !== "boolean")
+            || new Set(hashes.map((item) => item.modelToolUseId)).size !== hashes.length) invalid();
+          if (!handoff || handoff.roundNo !== Number(round) - rows.length + 1
+            || handoff.catalogHash !== basis.boxCatalogHash
+            || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash
+            || !["inflight", "finalizing", "committed"].includes(row.state)
+            || ctx.boxState !== "failed_stopped" || ctx.boxResumeRequestId !== child.request_id
+            || typeof ctx.boxResumeRevision !== "string" || !UUID_V4.test(ctx.boxResumeRevision)
+            || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) invalid();
+        }
+        const owner: unknown = ctx.boxOwnerRequestId;
+        if (owner === undefined) break;
+        if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) invalid();
+        const parent = await client.query<Row>(
+          "SELECT request_id,state,ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2",
+          [owner, input.uid.toString()]);
+        if (parent.rowCount !== 1) invalid();
+        row = parent.rows[0];
+      }
+      if (rows.length !== round) invalid();
+      await client.query("COMMIT"); committed = true;
+      return { uid: input.uid, requestId: leaf.request_id, accountId: BigInt(accountId as string),
+        runNonce: runNonce as string, leaseEpoch: leaseEpoch as string, proof };
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
   /** Background takeover of only armed, unknown detached text. This produces
    * read identity, never another admission or paid launch permission. */
   async listTextUnknownCandidates(limit = 10): Promise<BoxReplayIdentity[]> {

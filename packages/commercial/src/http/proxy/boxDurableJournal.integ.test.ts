@@ -32,6 +32,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         'INTERNAL_ERROR','USER_CANCELLED')), final_credits bigint)`);
     await client.query(`CREATE TEMP TABLE usage_records (
       request_id text NOT NULL, user_id bigint NOT NULL)`);
+    await client.query(`CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY, state text NOT NULL)`);
     // Pin all journal operations to this one connection, whose temp table
     // shadows the real table. No shared schema or persistent row is touched.
     const privateMarker = "synthetic-private-marker";
@@ -1128,6 +1129,22 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     enforceChainLockOrder = false;
     await journal.markToolChainStoppedFailure({ requestId: `box-h-${suffix}`,
       uid: 3n, leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof });
+    const failedFallbackInput = { uid: 3n, canonicalModel: basis.model,
+      canonicalBody: { ...failedResumeBody, stream: false } as unknown as ProxyBody };
+    assert.equal(await journal.findReplayIdentity(failedFallbackInput), null);
+    assert.equal((await journal.findSettledFailure(failedFallbackInput))?.requestId, `box-h-${suffix}`);
+    const ownerSnapshot = (await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [failedChainRoot.requestId])).rows[0]!.ctx;
+    for (const poison of [{ boxAccountId: "21" }, { boxResumeRequestId: "unrelated" },
+      { boxResumeRevision: "invalid" }, { boxResumeResultHashes: [] },
+      { authorityKind: "bridge_signed", authorityTurnId: "a".repeat(32) }]) {
+      await client.query("UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1",
+        [failedChainRoot.requestId, JSON.stringify(poison)]);
+      await assert.rejects(() => journal.findSettledFailure(failedFallbackInput),
+        /BOX_REPLAY_EVIDENCE_INVALID|BOX_AUTHORITY_REJECTED/);
+      await client.query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",
+        [failedChainRoot.requestId, JSON.stringify(ownerSnapshot)]);
+    }
     const failedChainRows = await client.query<{ request_id: string; state: string;
       ctx: Record<string, unknown>; final_credits: string | null }>(
       `SELECT request_id,state,ctx,final_credits::text

@@ -1,3 +1,4 @@
+import { beforeBoxPrivacyCleanup, type BoxBeforeCleanup } from "./boxFailureDiagnostic.js";
 import { BoxToolRolloverRequired } from "./boxToolRollover.js";
 /** Internal Box tool transport on the existing OpenClaude Messages route.
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
@@ -75,6 +76,7 @@ export class BoxToolFetch {
     toolAliasMode?: BoxMcpAliasMode;
     journal: BoxDurableJournal;
     writeMessage?: BoxReplayMessageWriter;
+    beforeCleanup?: BoxBeforeCleanup;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null;
       requestId: string; upstreamModel: string; signal: AbortSignal;
@@ -470,6 +472,7 @@ export class BoxToolFetch {
     target: BoxResolvedTarget, candidate: BoxRemoteCleanupCandidate): Promise<void> {
     const keepNativeProject = candidate.nativePointer?.cliCwd
       === `/tmp/ocv5-289-run-${runNonce}`;
+    await beforeBoxPrivacyCleanup(this.deps.beforeCleanup, candidate, target);
     const remote = target.exec.run(makeBoxRunCleanup(runNonce,
       keepNativeProject), {
       timeoutMs: 20_000, maxResponseBytes: 4096 });

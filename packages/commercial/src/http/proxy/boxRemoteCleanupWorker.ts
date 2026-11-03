@@ -1,3 +1,4 @@
+import { beforeBoxPrivacyCleanup, type BoxBeforeCleanup } from "./boxFailureDiagnostic.js";
 /** Shared-leader, flag-independent Box privacy cleanup recovery. Only a
  * terminal-proof journal candidate may reach remote Exec; no CLI launch,
  * tool publication or paid retry exists in this worker. */
@@ -71,6 +72,8 @@ export class BoxRemoteCleanupWorker {
     { pending: Promise<void> | null; failed: boolean }>();
   constructor(private readonly deps: { journal: Journal; resolver: Resolver;
     writeRecoveryMessage?: BoxReplayMessageWriter;
+    beforeCleanup?: BoxBeforeCleanup;
+    sweepDiagnostics?: () => Promise<unknown>;
     /** How long to re-read the proof after a stale-resume stop. */
     staleResumeProofWaitMs?: number;
     /** Test seam for the worker_complete recovery below. */
@@ -401,6 +404,8 @@ export class BoxRemoteCleanupWorker {
         await this.closeLocal(target);
       }
     }
+    // Retention runs even if no failed runs are eligible for cleanup.
+    await this.deps.sweepDiagnostics?.().catch(() => {});
     const probe = await this.reconcileStoppedFailures(limit);
     const candidates = await this.deps.journal.listRemoteCleanupCandidates(limit);
     let cleaned = 0, pending = probe.pending;
@@ -412,6 +417,7 @@ export class BoxRemoteCleanupWorker {
         if (target.accountId !== candidate.accountId) throw new Error("BOX_CLEANUP_ACCOUNT_MISMATCH");
         const keepNativeProject = candidate.nativePointer?.cliCwd
           === `/tmp/ocv5-289-run-${candidate.runNonce}`;
+        await beforeBoxPrivacyCleanup(this.deps.beforeCleanup, candidate, target);
         const remote = target.exec.run(makeBoxRunCleanup(candidate.runNonce,
           keepNativeProject), {
           timeoutMs: 20_000, maxResponseBytes: 4096 });

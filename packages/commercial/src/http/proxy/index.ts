@@ -1126,6 +1126,16 @@ export function makeAnthropicProxyHandler(
               "previous Box response unavailable", requestId);
             return;
           }
+          if (replay.kind === "failed") {
+            userLog.warn("proxy_box_replay_failed", { code: replay.code,
+              ...(replay.diagnosticId ? { diagnosticId: replay.diagnosticId } : {}) });
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ type: "error", error: { type: "api_error",
+              code: replay.code, message: replay.code === "BOX_REPLAY_STOPPED" ? "previous Box call stopped"
+                : replay.code === "BOX_REPLAY_RESULT_REJECTED" ? "previous Box result was rejected" : "previous Box call failed",
+              ...(replay.diagnosticId ? { diagnosticId: replay.diagnosticId } : {}) }, request_id: requestId }));
+            return;
+          }
           if (replay.kind === "ready") {
             const bytes = Buffer.from(await replay.response.arrayBuffer());
             const headers: Record<string, string> = {};

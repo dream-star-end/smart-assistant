@@ -1,3 +1,4 @@
+import { createBoxFailureDiagnostics } from "../http/proxy/boxFailureDiagnostic.js";
 import { FileBoxContextTransport } from "../http/proxy/boxContextTransport.js";
 import { startLogTimingReporter } from '../logging/logTimingReporter.js';
 /**
@@ -301,11 +302,15 @@ export async function startEgress(): Promise<void> {
   const boxRecoveryWriter = boxReplayWriter
     ?? createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT);
   const boxReplayReader = createBoxReplayReader(process.env.OC_PLATFORM_ROOT);
+  const boxFailureDiagnostics = createBoxFailureDiagnostics(process.env.OC_PLATFORM_ROOT);
   const boxReplayJournal = boxJournal ?? new BoxDurableJournal(getPool());
   const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
   const boxReplay = boxReplayReader ? {
     lookup: async (input: Parameters<typeof findCompletedBoxReplay>[0]) => {
-      const deps = { journal: boxReplayJournal, readMessage: boxReplayReader };
+      const deps = { journal: boxReplayJournal, readMessage: boxReplayReader,
+        readFailureDiagnosticId: boxFailureDiagnostics
+          ? (identity: Parameters<typeof boxFailureDiagnostics.findId>[0]) => boxFailureDiagnostics.findId(identity)
+          : undefined };
       const onlyAfterSettlement = async (
         replay: Awaited<ReturnType<typeof findCompletedBoxReplay>>,
       ): Promise<Awaited<ReturnType<typeof findCompletedBoxReplay>>> => {
@@ -376,6 +381,7 @@ export async function startEgress(): Promise<void> {
       maxPerAccount: boxCapacity.maxRunsPerAccount, leaseMs: 900_000 }),
     journal: boxJournal,
     writeMessage: boxReplayWriter,
+    beforeCleanup: boxFailureDiagnostics?.beforeCleanup,
     maxOutputTokensForModel: (model) =>
       boxApiModelById(model)?.maxOutputTokens ?? null,
     resolveTarget: (args) => resolveBoxLaunch!({ ...args,
@@ -398,6 +404,7 @@ export async function startEgress(): Promise<void> {
       toolAliasMode: "natural",
       journal: boxJournal,
       writeMessage: boxReplayWriter,
+      beforeCleanup: boxFailureDiagnostics?.beforeCleanup,
       maxOutputTokensForModel: (model) =>
         boxApiModelById(model)?.maxOutputTokens ?? null,
       resolveTarget: (args) => resolveBoxLaunch!(args),
@@ -455,6 +462,7 @@ export async function startEgress(): Promise<void> {
     supervisorAsset: Buffer.alloc(0), keeperAsset: Buffer.alloc(0),
     virtualMcpAsset: Buffer.alloc(0), detachedRunnerAsset: Buffer.alloc(0),
     journal: boxStopJournal, maxOutputTokensForModel: () => null,
+    beforeCleanup: boxFailureDiagnostics?.beforeCleanup,
     resolveTarget: (args) => boxStopResolver.resolve(args),
     onUnknown: reportBoxUnknown,
   });
@@ -477,6 +485,7 @@ export async function startEgress(): Promise<void> {
   };
   let boxNativeGcTicks = 0;
   const boxRecoveryTimer = setInterval(() => {
+    void boxFailureDiagnostics?.sweep().catch(() => log.warn("box_failure_diagnostic_sweep_failed"));
     void reconcileTextUnknown().catch(() =>
       log.error("box_text_unknown_selection_failed"));
     void boxStopResolver.retryFailedAgentCleanup().catch(() =>

@@ -5,6 +5,8 @@ import {
   type BoxCcExecRequest,
 } from "@openclaude/gateway";
 
+import { classifyBoxFailureCause, type BoxFailureCauseTag, type BoxFailureStage } from "./boxFailureCause.js";
+
 export interface BoxExecTarget {
   execUrl: string;
   execToken: string;
@@ -13,10 +15,17 @@ export interface BoxExecTarget {
 
 export class BoxExecTransportError extends Error {
   constructor(readonly code: string, readonly terminalKnown: boolean,
-    readonly remoteExitCode: number | null = null) {
+    readonly remoteExitCode: number | null = null,
+    readonly causeTag: BoxFailureCauseTag = classifyBoxFailureCause({ code }),
+    readonly stage: BoxFailureStage = "validate") {
     super(code);
     this.name = "BoxExecTransportError";
   }
+}
+
+// A rejected fetch/read may carry a revoked Proxy; even instanceof can throw.
+function isTransportError(error: unknown): error is BoxExecTransportError {
+  try { return error instanceof BoxExecTransportError; } catch { return false; }
 }
 
 export interface BoxExecResult {
@@ -88,8 +97,10 @@ export class BoxExecTransport {
       if (abortOrigin === null) abortOrigin = origin;
       abort.abort();
     };
+    let stage: BoxFailureStage = "guard";
     const abortedError = (): BoxExecTransportError => new BoxExecTransportError(
-      abortOrigin === "deadline" ? "BOX_EXEC_TIMEOUT" : "BOX_EXEC_ABORTED", false);
+      abortOrigin === "deadline" ? "BOX_EXEC_TIMEOUT" : "BOX_EXEC_ABORTED", false, null,
+      abortOrigin === "deadline" ? "deadline" : "aborted", stage);
     const onCallerAbort = (): void => abortWith("caller");
     const deadlineAt = Date.now() + opts.timeoutMs;
     const aborted = new Promise<never>((_, reject) => {
@@ -110,9 +121,10 @@ export class BoxExecTransport {
     try {
       ensureLive();
       await raceAbort(Promise.resolve().then(() => this.assertCurrent()).catch(() => {
-        throw new BoxExecTransportError("BOX_EXEC_ACCOUNT_GUARD_FAILED", false);
+        throw new BoxExecTransportError("BOX_EXEC_ACCOUNT_GUARD_FAILED", false, null, "account_guard", "guard");
       }));
       ensureLive();
+      stage = "fetch";
       let response: Response;
       try {
         response = await raceAbort(this.fetchImpl(this.target.execUrl, {
@@ -126,15 +138,16 @@ export class BoxExecTransport {
           body: new Uint8Array(body),
         }));
       } catch (error) {
-        if (error instanceof BoxExecTransportError) throw error;
+        if (isTransportError(error)) throw error;
         if (abort.signal.aborted) throw abortedError();
-        throw new BoxExecTransportError("BOX_EXEC_TRANSPORT_UNKNOWN", false);
+        throw new BoxExecTransportError("BOX_EXEC_TRANSPORT_UNKNOWN", false, null, classifyBoxFailureCause(error), "fetch");
       }
       ensureLive();
       if (!response.ok || !response.body) {
         if (response.body) await boundedCancel(() => response.body!.cancel(), deadlineAt);
-        throw new BoxExecTransportError(`BOX_EXEC_HTTP_${response.status}`, false);
+        throw new BoxExecTransportError(`BOX_EXEC_HTTP_${response.status}`, false, null, "http", "http");
       }
+      stage = "stream";
       reader = response.body.getReader();
       let pending = Buffer.alloc(0), stdout = "", stderrBytes = 0;
       let total = 0, exitCode: number | null = null, sawEnd = false;
@@ -142,34 +155,34 @@ export class BoxExecTransport {
         let chunk: ReadableStreamReadResult<Uint8Array>;
         try { chunk = await raceAbort(reader.read()); }
         catch (error) {
-          if (error instanceof BoxExecTransportError) throw error;
+          if (isTransportError(error)) throw error;
           if (abort.signal.aborted) throw abortedError();
-          throw new BoxExecTransportError("BOX_EXEC_STREAM_UNKNOWN", false);
+          throw new BoxExecTransportError("BOX_EXEC_STREAM_UNKNOWN", false, null, classifyBoxFailureCause(error), "stream");
         }
         ensureLive();
         if (chunk.done) break;
         total += chunk.value.byteLength;
         if (total > (opts.maxResponseBytes ?? 262_144)) {
-          throw new BoxExecTransportError("BOX_EXEC_RESPONSE_TOO_LARGE", false);
+          throw new BoxExecTransportError("BOX_EXEC_RESPONSE_TOO_LARGE", false, null, "output_limit", "stream");
         }
         pending = Buffer.concat([pending, Buffer.from(chunk.value)]);
         let parsed: ReturnType<typeof parseExecFramesStrict>;
         try { parsed = parseExecFramesStrict(pending); }
-        catch { throw new BoxExecTransportError("BOX_EXEC_FRAME_INVALID", false); }
+        catch { throw new BoxExecTransportError("BOX_EXEC_FRAME_INVALID", false, null, "protocol", "decode"); }
         pending = Buffer.from(parsed.rest);
         for (const event of parsed.events) {
           ensureLive();
-          if (sawEnd) throw new BoxExecTransportError("BOX_EXEC_AFTER_END", false);
+          if (sawEnd) throw new BoxExecTransportError("BOX_EXEC_AFTER_END", false, null, "protocol", "decode");
           if (event.kind === "end") {
-            if (exitCode === null) throw new BoxExecTransportError("BOX_EXEC_END_BEFORE_EXIT", false);
+            if (exitCode === null) throw new BoxExecTransportError("BOX_EXEC_END_BEFORE_EXIT", false, null, "protocol", "decode");
             sawEnd = true;
             continue;
           }
-          if (exitCode !== null) throw new BoxExecTransportError("BOX_EXEC_AFTER_EXIT", false);
+          if (exitCode !== null) throw new BoxExecTransportError("BOX_EXEC_AFTER_EXIT", false, null, "protocol", "decode");
           if (event.kind === "stdout") {
             stdout += event.data ?? "";
             try { opts.onStdout?.(event.data ?? ""); }
-            catch { throw new BoxExecTransportError("BOX_EXEC_CONSUMER_FAILED", false); }
+            catch { throw new BoxExecTransportError("BOX_EXEC_CONSUMER_FAILED", false, null, "consumer", "consumer"); }
             ensureLive();
           } else if (event.kind === "stderr") {
             stderrBytes += Buffer.byteLength(event.data ?? "");
@@ -180,10 +193,10 @@ export class BoxExecTransport {
       }
       ensureLive();
       if (pending.length !== 0 || exitCode === null || !sawEnd) {
-        throw new BoxExecTransportError("BOX_EXEC_INCOMPLETE", false);
+        throw new BoxExecTransportError("BOX_EXEC_INCOMPLETE", false, null, "protocol", "decode");
       }
       if (exitCode !== 0) {
-        throw new BoxExecTransportError("BOX_EXEC_REMOTE_EXIT", true, exitCode);
+        throw new BoxExecTransportError("BOX_EXEC_REMOTE_EXIT", true, exitCode, "remote_exit", "remote_exit");
       }
       return { stdout, stderrBytes, exitCode: 0 };
     } finally {

@@ -1887,6 +1887,72 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       assert.equal(h.preCheckSpy.reserveCalls.length, 0);
       assert.equal(await usageCount(), before);
 
+      // A settled worker failure survives cleanup as a failure, not NOT_FOUND.
+      // The real PG identity/proof reader and HTTP handler are both exercised.
+      const failed = await seed("id-failed", "sess-failed", "77".repeat(32), null);
+      const failedProof = { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
+        reason: "worker_failed", revision: 2, workerExitCode: 1 };
+      await client.query(`UPDATE request_finalize_journal SET state='aborted',final_credits=0,
+        ctx=ctx || $2::jsonb WHERE request_id=$1`, ["id-failed", JSON.stringify({
+        boxState: "failed_stopped", boxStopOutcome: "failed", boxTerminalProof: failedProof,
+        boxRemoteCleanup: "done" })]);
+      const failureInput = { uid, canonicalModel: BOX_API_MODEL, canonicalBody: failed.body as never,
+        prepared: failed.prepared, trustedAuthority: failed.prepared.authority };
+      assert.equal(await journal.findReplayIdentity(failureInput), null,
+        "existing replay exclusion is unchanged");
+      assert.equal((await journal.findSettledFailure(failureInput))?.requestId, "id-failed");
+      assert.equal(await journal.findSettledFailure({ ...failureInput,
+        canonicalBody: { ...failed.body, stream: true } as never, prepared: undefined }), null);
+      assert.equal(await journal.findSettledFailure({ ...failureInput, uid: uid + 1n,
+        prepared: undefined, trustedAuthority: undefined }), null);
+      assert.equal(await journal.findSettledFailure({ ...failureInput,
+        canonicalBody: { ...failed.body, messages: [{ role: "user", content: "different" }] } as never,
+        prepared: undefined, trustedAuthority: undefined }), null);
+      const signedFailure = prepareBoxContinuation({ uid, canonicalModel: BOX_API_MODEL,
+        rawBody: failed.body as never, authorityKind: "bridge_signed", authorityTurnId: turnA });
+      await assert.rejects(() => journal.findSettledFailure({ ...failureInput,
+        prepared: signedFailure, trustedAuthority: signedFailure.authority }), /BOX_AUTHORITY_REJECTED/);
+      for (const poison of [{ boxTerminalProof: { ...failedProof, runNonce: "0".repeat(24) } },
+        { boxTerminalProof: null }, { boxOwnerRequestId: "id-failed" },
+        { boxOwnerRequestId: "missing-parent" }, { boxRoundNo: 2 }]) {
+        await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1`,
+          ["id-failed", JSON.stringify(poison)]);
+        await assert.rejects(() => journal.findSettledFailure(failureInput), /BOX_REPLAY_EVIDENCE_INVALID/);
+        await client.query(`UPDATE request_finalize_journal SET ctx=(ctx-'boxOwnerRequestId') || $2::jsonb
+          WHERE request_id=$1`, ["id-failed", JSON.stringify({ boxTerminalProof: failedProof, boxRoundNo: 1 })]);
+      }
+      await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx,precheck_credits)
+        SELECT 'id-failed-duplicate',user_id,state,ctx,0 FROM request_finalize_journal WHERE request_id='id-failed'`);
+      await assert.rejects(() => journal.findSettledFailure(failureInput), /BOX_CALL_AMBIGUOUS/);
+      await client.query("DELETE FROM request_finalize_journal WHERE request_id='id-failed-duplicate'");
+      await resetPool();
+      const { h: failedH, headers: failedHeaders } = boxRouteHarness();
+      let failureLaunches = 0;
+      failedH.deps.boxModel = { async fetch() { failureLaunches++;
+        throw new Error("failure fallback must not launch"); } };
+      failedH.deps.boxReplay = { lookup: (input: Parameters<typeof findCompletedBoxReplay>[0]) =>
+        findCompletedBoxReplay(input, { journal, readMessage: async () => {
+          throw new Error("failure must not read capsule"); },
+        readFailureDiagnosticId: async (id) => { assert.equal(id.requestId, "id-failed");
+          return "bdiag_" + "a".repeat(24); } }) };
+      const usageBeforeFailure = await usageCount(), ledgerBeforeFailure = await ledgerCount();
+      for (const fallbackBody of [failed.body, Object.fromEntries(Object.entries(failed.body)
+        .filter(([key]) => key !== "stream"))]) {
+        const response = await failedH.run(fallbackBody, failedHeaders);
+        assert.equal(response.statusCode, 409, response.bodyText());
+        const payload = JSON.parse(response.bodyText());
+        assert.equal(payload.error.code, "BOX_REPLAY_FAILED");
+        assert.equal(payload.error.diagnosticId, "bdiag_" + "a".repeat(24));
+        assert.ok(!response.bodyText().includes("id-failed"));
+        assert.ok(!response.bodyText().includes(nonce));
+      }
+      assert.equal(failureLaunches, 0);
+      assert.equal(failedH.preCheckSpy.reserveCalls.length, 0);
+      assert.equal(failedH.pool.queries.filter((query) => /INSERT INTO (REQUEST_FINALIZE_JOURNAL|USAGE_RECORDS)/
+        .test(query.sql.trim().toUpperCase())).length, 0);
+      assert.equal(await usageCount(), usageBeforeFailure);
+      assert.equal(await ledgerCount(), ledgerBeforeFailure);
+
       const legalSession = "sess-legal";
       const legalTurn = "66".repeat(32);
       const legalBody = replayBody(legalSession, legalTurn);
