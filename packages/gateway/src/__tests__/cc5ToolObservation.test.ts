@@ -29,7 +29,7 @@ function fixture() {
     nativeSessionId,
     request,
     frame,
-    observation: new Cc5ToolObservation(operationId),
+    observation: new Cc5ToolObservation(operationId, { legacyFixedTool: true }),
   }
 }
 
@@ -116,7 +116,7 @@ test('truncated or malformed original frames never yield an observation', async 
   f.observation.ingest(Buffer.from('{"type":"assistant"'))
   assert.throws(() => f.observation.finish(), /OBSERVATION_INVALID/)
   await assert.rejects(f.observation.waitFor(f.request), /NOT_OBSERVED/)
-  const bad = new Cc5ToolObservation(f.operationId)
+  const bad = new Cc5ToolObservation(f.operationId, { legacyFixedTool: true })
   assert.throws(() => bad.ingest(Buffer.from([0xff, 0x0a])))
 })
 
@@ -141,4 +141,54 @@ test('a valid-looking first block cannot release a waiter before the entire orig
   await assert.rejects(pending, /NOT_OBSERVED/)
   assert.equal(authorized, false)
   await assert.rejects(f.observation.waitFor(f.request), /NOT_OBSERVED/)
+})
+
+test('native profile matches multiple complete tools by canonical input and preserves the session across turns', async () => {
+  const native = randomUUID()
+  const observation = new Cc5ToolObservation(randomUUID())
+  observation.beginTurn()
+  const first = { nativeSessionId: native, toolUseId: 'read-1', name: 'mcp__ocbridge__Read', arguments: { file_path: '/task/a', limit: 2 } }
+  const second = { nativeSessionId: native, toolUseId: 'edit-1', name: 'mcp__ocbridge__Edit', arguments: { file_path: '/task/a', old_string: 'before', new_string: 'after' } }
+  const row = (requests: Array<{ toolUseId: string; name: string; arguments: unknown }>) => Buffer.from(`${JSON.stringify({ type: 'assistant', session_id: native,
+    message: { content: requests.map((request) => ({ type: 'tool_use', id: request.toolUseId, name: request.name, input: request.arguments })) } })}\n`)
+  observation.ingest(row([first, second]))
+  assert.deepEqual((await observation.waitFor({ ...first, arguments: { limit: 2, file_path: '/task/a' } })).input, first.arguments)
+  assert.equal((await observation.waitFor(second)).toolUseId, 'edit-1')
+  assert.deepEqual(observation.toolUseIds, ['read-1', 'edit-1'])
+  await assert.rejects(observation.waitFor({ ...first, arguments: { file_path: '/task/elsewhere', limit: 2 } }), /SCOPE_MISMATCH/)
+  observation.endTurn()
+  observation.beginTurn()
+  const third = { ...first, toolUseId: 'read-2' }
+  observation.ingest(row([third]))
+  assert.equal((await observation.waitFor(third)).nativeSessionId, native)
+  assert.throws(() => observation.ingest(row([first])), /OBSERVATION_INVALID/)
+})
+
+test('native profile rejects fixed proof, hidden tools, unsafe inputs and effects outside an admitted turn', () => {
+  for (const tool of [
+    { name: CC5_FIXED_TOOL_NAME, input: { operationId: randomUUID() } },
+    { name: 'mcp__ocbridge__Write', input: { file_path: '/task/a', content: 'x' } },
+    { name: 'mcp__ocbridge__Bash', input: { command: 'true', run_in_background: true } },
+    { name: 'mcp__ocbridge__Read', input: { file_path: '/task/a', limit: 1.5 } },
+  ]) {
+    const observation = new Cc5ToolObservation(randomUUID())
+    assert.throws(() => observation.ingest(Buffer.from(`${JSON.stringify({ type: 'assistant', session_id: randomUUID(),
+      message: { content: [{ type: 'tool_use', id: 'tool-1', ...tool }] } })}\n`)))
+  }
+  const observation = new Cc5ToolObservation(randomUUID())
+  observation.endTurn()
+  assert.throws(() => observation.ingest(Buffer.from(`${JSON.stringify({ type: 'assistant', session_id: randomUUID(),
+    message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'mcp__ocbridge__Read', input: { file_path: '/task/a' } }] } })}\n`)))
+})
+
+test('a later invalid block in a native batch never releases the valid earlier tool', async () => {
+  const native = randomUUID()
+  const observation = new Cc5ToolObservation(randomUUID())
+  const request = { nativeSessionId: native, toolUseId: 'read-1', name: 'mcp__ocbridge__Read', arguments: { file_path: '/task/a' } }
+  const waiting = observation.waitFor(request)
+  assert.throws(() => observation.ingest(Buffer.from(`${JSON.stringify({ type: 'assistant', session_id: native, message: { content: [
+    { type: 'tool_use', id: request.toolUseId, name: request.name, input: request.arguments },
+    { type: 'tool_use', id: 'bad-1', name: 'mcp__ocbridge__Write', input: { file_path: '/task/a', content: 'bad' } },
+  ] } })}\n`)))
+  await assert.rejects(waiting, /NOT_OBSERVED/)
 })

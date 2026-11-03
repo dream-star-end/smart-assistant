@@ -3,6 +3,7 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import http.client
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,13 +32,15 @@ sys.exit(m.run(root,c,sys.stdin.buffer,sys.stdout.buffer))
 '''
 
 
+@unittest.skipUnless(sys.platform.startswith('linux'), 'real SO_PEERCRED and /proc fixture requires Linux')
 class SocketBridge(unittest.TestCase):
     def fixture(self):
+        Path('.task-tmp').mkdir(exist_ok=True, mode=0o700)
         root = Path(os.path.relpath(tempfile.mkdtemp(prefix='cc5-socket-', dir='.task-tmp'), os.getcwd()))
         (root / 'cprofile').mkdir(mode=0o700)
         shutil.copyfile(CLIENT, root / 'cprofile/cc5-fixed-mcp.py')
         (root / 'cprofile/cc5-fixed-mcp.py').chmod(0o400)
-        config = {'version': 1, 'operationId': str(uuid4()), 'runId': str(uuid4())}
+        config = {'version': 2, 'operationId': str(uuid4()), 'runId': str(uuid4())}
         (root / 'cprofile/client.json').write_text(json.dumps(config))
         (root / 'cprofile/client.json').chmod(0o400)
         child = subprocess.Popen([sys.executable, '-I', '-B', '-c', WRAPPER, str(HELPER), str(root)],
@@ -56,6 +59,7 @@ class SocketBridge(unittest.TestCase):
         self.assertEqual(ready['kind'], 'socket-ready')
         self.assertEqual(ready['operationId'], config['operationId'])
         self.assertEqual(ready['pid'], child.pid)
+        self.assertEqual(ready['version'], 2)
         return root, config, child
 
     def frame(self, child):
@@ -76,28 +80,41 @@ class SocketBridge(unittest.TestCase):
         finally:
             conn.close()
 
-    def body(self, config):
-        return {'runId': config['runId'], 'operationId': config['operationId'], 'rpcId': 17,
-            'toolUseId': 'toolu_original', 'name': 'mcp__ocbridge__roundtrip',
-            'arguments': {'operationId': config['operationId']}}
+    def body(self, config, tool='Read', ident=17, tool_id='toolu_original'):
+        args = {'Read': {'file_path': '资料.txt'}, 'Edit': {'file_path': 'f', 'old_string': 'a', 'new_string': 'b'},
+                'Bash': {'command': 'pwd', 'timeout': 30000}}[tool]
+        return {'runId': config['runId'], 'operationId': config['operationId'], 'rpcId': ident,
+            'toolUseId': tool_id, 'name': 'mcp__ocbridge__' + tool, 'arguments': args,
+            'inputSha256': hashlib.sha256(json.dumps(args, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()}
 
-    def test_one_real_unix_request_preserves_bytes_and_ids_then_eof_cleans_only_own_socket(self):
+    def respond(self, child, body, seq):
+        receipt = {key: body[key] for key in ('runId', 'operationId', 'rpcId', 'toolUseId', 'name', 'inputSha256')}
+        receipt.update({'version': 2, 'ok': True, 'result': {'content': [{'type': 'text', 'text': 'fixture result'}], 'isError': False}})
+        exact = json.dumps(receipt, separators=(',', ':')).encode()
+        child.stdin.write(json.dumps({'version': 2, 'kind': 'tool-response', 'seq': seq,
+            'status': 200, 'body': base64.b64encode(exact).decode()}).encode() + b'\n')
+        child.stdin.flush()
+        return exact
+
+    def test_three_real_unix_requests_preserve_bytes_ids_and_sequence_then_cleanup_only_socket(self):
         root, config, child = self.fixture()
-        body = self.body(config)
         self.assertEqual((root / 'tool.sock').stat().st_mode & 0o777, 0o600)
         with ThreadPoolExecutor(max_workers=1) as executor:
-            result = executor.submit(self.rpc, root, body)
-            request = self.frame(child)
-            self.assertEqual(request['seq'], 1)
-            self.assertEqual(json.loads(base64.b64decode(request['body'])), body)
-            receipt = {'ok': True, 'operationId': config['operationId'], 'rpcId': 17,
-                'toolUseId': 'toolu_original', 'receipt': {'fixture': 'transport only, not a command receipt'}}
-            exact = json.dumps(receipt, separators=(',', ':')).encode()
-            child.stdin.write(json.dumps({'version': 1, 'kind': 'tool-response', 'seq': 1,
-                'status': 200, 'body': base64.b64encode(exact).decode()}).encode() + b'\n')
-            child.stdin.flush()
-            self.assertEqual(result.result(timeout=5), (200, exact))
-        self.assertTrue((root / 'tool-socket-attempt.json').exists())
+            for seq, tool in enumerate(('Read', 'Edit', 'Bash'), 1):
+                body = self.body(config, tool, seq + 16, 'toolu_' + str(seq))
+                result = executor.submit(self.rpc, root, body)
+                request = self.frame(child)
+                self.assertEqual((request['version'], request['seq']), (2, seq))
+                self.assertEqual(json.loads(base64.b64decode(request['body'])), body)
+                exact = self.respond(child, body, seq)
+                self.assertEqual(result.result(timeout=5), (200, exact))
+                # Both RPC-ID and tool-ID duplication reject without another SSH frame.
+                self.assertNotEqual(self.rpc(root, body)[0], 200)
+                changed = {**body, 'rpcId': 100 + seq}
+                self.assertNotEqual(self.rpc(root, changed)[0], 200)
+                self.assertFalse(select.select([child.stdout], [], [], 0)[0])
+        self.assertEqual(len(list((root / 'tool-attempts').glob('*.attempt.json'))), 3)
+        self.assertEqual(len(list((root / 'tool-attempts').glob('*.result.json'))), 3)
         child.stdin.close(); child.wait(timeout=3)
         self.assertEqual(child.returncode, 0)
         self.assertFalse((root / 'tool.sock').exists())
@@ -112,13 +129,16 @@ class SocketBridge(unittest.TestCase):
                     self.assertEqual(self.frame(child)['kind'], 'tool-request')
                     if case == 'eof': child.stdin.close()
                     else:
-                        child.stdin.write(json.dumps({'version': 1, 'kind': 'tool-response', 'seq': 2,
+                        child.stdin.write(json.dumps({'version': 2, 'kind': 'tool-response', 'seq': 2,
                             'status': 200, 'body': ''}).encode() + b'\n')
                         child.stdin.flush()
                     self.assertNotEqual(result.result(timeout=5)[0], 200)
                 child.wait(timeout=3)
                 self.assertEqual(child.returncode, 1)
-                self.assertTrue((root / 'tool-socket-attempt.json').exists())
+                attempts = list((root / 'tool-attempts').glob('*.attempt.json'))
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(json.loads(attempts[0].read_text())['seq'], 1)
+                self.assertEqual(list((root / 'tool-attempts').glob('*.result.json')), [])
                 self.assertFalse((root / 'tool.sock').exists())
                 self.assertEqual(child.stdout.read(), b'', 'no second tool dispatch')
 
@@ -126,7 +146,7 @@ class SocketBridge(unittest.TestCase):
         root, config, child = self.fixture()
         body = self.body(config); body['rpcId'] = True
         self.assertNotEqual(self.rpc(root, body)[0], 200)
-        self.assertFalse((root / 'tool-socket-attempt.json').exists())
+        self.assertEqual(list((root / 'tool-attempts').iterdir()), [])
         child.stdin.close(); child.wait(timeout=3)
         self.assertEqual(child.returncode, 0)
         self.assertEqual(child.stdout.read(), b'')

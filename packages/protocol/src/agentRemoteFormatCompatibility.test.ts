@@ -53,7 +53,7 @@ test('missing, extra and non-object descriptors are rejected on either side', ()
 })
 
 test('zero, fractional, unsafe, nonfinite and coerced versions are rejected', () => {
-  for (const version of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, '1', undefined]) {
+  for (const version of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN, Number.POSITIVE_INFINITY, '1', undefined]) {
     for (const key of ['checkpointSchemaVersion', 'controlStoreUserVersion']) {
       const bad = { ...live, [key]: version }
       assert.throws(() => compareAgentRemoteFormatVersions(bad, live), /FORMAT_HEADER_INVALID/)

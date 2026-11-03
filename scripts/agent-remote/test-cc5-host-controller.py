@@ -6,10 +6,12 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 from subprocess import CompletedProcess, PIPE, Popen
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -22,7 +24,7 @@ SCRIPT = Path(__file__).with_name('cc5-fixed-mcp.py').read_bytes()
 
 
 def packet():
-    return {'version': 1, 'operationId': str(uuid4()), 'runId': str(uuid4()),
+    return {'version': 2, 'operationId': str(uuid4()), 'runId': str(uuid4()),
             'script': base64.b64encode(SCRIPT).decode(),
             'socketScript': base64.b64encode(Path(__file__).with_name('cc5-mcp-socket.py').read_bytes()).decode()}
 
@@ -57,7 +59,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(args[args.index('--tools') + 1], '')
             self.assertEqual(args[args.index('--setting-sources') + 1], '')
             self.assertIn('--strict-mcp-config', args)
-            self.assertEqual(args[-2:], ['--allowedTools', 'mcp__ocbridge__roundtrip'])
+            self.assertEqual(args[-2:], ['--allowedTools', 'mcp__ocbridge__Read,mcp__ocbridge__Edit,mcp__ocbridge__Bash'])
             self.assertTrue(all((p.stat().st_mode & 0o777) == 0o400 for p in (root / 'cprofile').iterdir()))
 
     def test_launch_passes_native_guards_and_fixed_interactive_model_to_the_real_exec_boundary(self):
@@ -73,7 +75,8 @@ class ProfileTests(unittest.TestCase):
                     patch.object(mod.os, 'chdir') as chdir, \
                     patch.object(mod.os, 'execve') as execute, \
                     patch.dict(mod.os.environ, {'CLAUDE_CODE_MAX_RETRIES': '99', 'PYTHONPATH': '/untrusted'}):
-                mod.launch_locked(root)
+                with mod.writer_lock(root) as writer_fd:
+                    mod.launch_locked(root, writer_fd)
             lifecycle.assert_called_once()
             chdir.assert_called_once_with(info['cwd'])
             execute.assert_called_once()
@@ -123,6 +126,75 @@ class ProfileTests(unittest.TestCase):
                     path.write_bytes(path.read_bytes() + b' ')
                     path.chmod(0o400)
                 with self.assertRaises(RuntimeError): mod.profile_args(root, info)
+
+    def test_new_exact_root_keeps_old_profile_unchanged_and_reinstall_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            old = Path(temp) / 'old'; old.mkdir(mode=0o700)
+            self.installed(old)
+            saved = {p.name: p.read_bytes() for p in (old / 'cprofile').iterdir()}
+            new = Path(temp) / 'new'; new.mkdir(mode=0o700)
+            self.installed(new)
+            self.assertNotEqual(mod.check_profile(old)['runId'], mod.check_profile(new)['runId'])
+            with patch.object(mod.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(json.dumps(packet()).encode()))):
+                with self.assertRaisesRegex(RuntimeError, 'profile-already-exists'): mod.install_profile(new)
+            self.assertEqual({p.name: p.read_bytes() for p in (old / 'cprofile').iterdir()}, saved)
+
+    def test_real_exec_retains_writer_flock_but_stop_control_does_not_deadlock_and_proof_survives(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            (root / 'install').mkdir(mode=0o700)
+            # This executable is ordinary local Python, never the real host/Claude.
+            (root / 'install/host.py').write_text('''import json,os,sys
+from pathlib import Path
+root=Path(sys.argv[1]).parent
+lock=json.loads((root/'LIFECYCLE.json').read_text())['writerLock']
+fd=lock['fd']; st=os.fstat(fd)
+info=Path('/proc/self/fdinfo')/str(fd)
+print(json.dumps({'pid':os.getpid(),'fd':fd,'dev':st.st_dev,'inode':st.st_ino,'inheritable':os.get_inheritable(fd),'fdinfo':info.read_text() if info.exists() else ''}),flush=True)
+sys.stdin.readline()
+''')
+            wrapper = '''import importlib.util,sys
+from pathlib import Path
+s=importlib.util.spec_from_file_location('controller',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+r=Path(sys.argv[2]);m.owner=lambda _: {'session':'synthetic-task','cwd':str(r/'work'),'pluginDigest':'fixture'}
+m.check_sources=lambda *_: {'mod/oc-bridge/'+name:b'fixture' for name in m.PLUGIN}
+m.claude_executable=lambda *_args,**_kw:'fixture';m.profile_args=lambda *_:[]
+m.proc=lambda pid:(['synthetic-controller'],'1');m.process_record=lambda pid:{'pid':pid,'startTicks':'1'}
+m.launch(r)
+'''
+            child = Popen([sys.executable, '-I', '-B', '-c', wrapper, str(Path(mod.__file__).resolve()), str(root)], stdin=PIPE, stdout=PIPE)
+            try:
+                report = json.loads(child.stdout.readline())
+                record = json.loads((root / 'LIFECYCLE.json').read_text())
+                self.assertEqual(report['pid'], child.pid, 'exec retained original host process')
+                self.assertTrue(report['inheritable'])
+                self.assertEqual({key: report[key] for key in ('fd', 'dev', 'inode')}, record['writerLock'])
+                if sys.platform.startswith('linux'):
+                    self.assertRegex(report['fdinfo'], r'FLOCK\s+ADVISORY\s+WRITE\s+' + str(child.pid))
+                with self.assertRaisesRegex(RuntimeError, 'writer-already-active'):
+                    with mod.writer_lock(root): self.fail('second writer acquired live lock')
+                # Actual control flock remains independently acquirable after exec.
+                began = time.monotonic()
+                with patch.object(mod, 'host_identity', lambda *_: (child.pid, '1')), \
+                        patch.object(mod, 'proc', lambda _: (['synthetic-host'], '1')), \
+                        patch.object(mod.os, 'pidfd_open', lambda _: os.open(os.devnull, os.O_RDONLY), create=True), \
+                        patch.object(mod.signal, 'pidfd_send_signal', lambda *_: child.terminate(), create=True), \
+                        redirect_stdout(io.StringIO()):
+                    mod.stop(root)
+                self.assertLess(time.monotonic() - began, 2)
+                child.wait(timeout=3)
+                with mod.writer_lock(root): pass
+                with patch.object(mod, 'proc', side_effect=FileNotFoundError), redirect_stdout(io.StringIO()):
+                    mod.prove_stopped(root)
+                    proof = (root / 'STOPPED.json').read_bytes()
+                    mod.prove_stopped(root)
+                self.assertEqual((root / 'STOPPED.json').read_bytes(), proof)
+                self.assertEqual(json.loads(proof)['processes']['writerLock'], record['writerLock'])
+                self.assertTrue((root / 'LIFECYCLE.json').exists())
+            finally:
+                if child.poll() is None: child.terminate(); child.wait(timeout=3)
+                child.stdin.close(); child.stdout.close()
 
     def test_proc_preserves_security_significant_empty_arguments_in_a_real_python_child(self):
         child = Popen([sys.executable, '-c', 'import time; print("READY", flush=True); time.sleep(15)', '--tools', '', '--setting-sources', ''], stdout=PIPE)

@@ -85,8 +85,13 @@ function scopeOf(binding: Readonly<Cc5BridgeBinding>): Scope {
 }
 export function validateRemoteNativeReceipt(raw: unknown, scope: Scope): Cc5NativeTerminalReceipt {
   const r = object(raw)
-  need(Object.keys(r).sort().join(',') === 'backendKind,canonicalModel,containerDbId,dockerId,nativeSessionId,operationId,resultSha256,runId,sessionKey,status,uid,upstreamModel,usage,version')
-  need(r.version === 1 && r.backendKind === BACKEND && r.uid === scope.uid
+  const keys = 'backendKind,canonicalModel,containerDbId,dockerId,nativeSessionId,operationId,resultSha256,runId,sessionKey,status,uid,upstreamModel,usage,version'
+  need(r.version === 1 || r.version === 2)
+  need(Object.keys(r).sort().join(',') === (r.version === 1 ? keys
+    : `authorityTurnId,${keys.replace(',uid,', ',turnKey,uid,')}`))
+  if (r.version === 2) need(typeof r.authorityTurnId === 'string' && /^[a-f0-9]{32}$/.test(r.authorityTurnId)
+    && typeof r.turnKey === 'string' && HASH.test(r.turnKey))
+  need(r.backendKind === BACKEND && r.uid === scope.uid
     && r.containerDbId === scope.containerDbId && r.dockerId === scope.dockerId
     && r.operationId === scope.operationId && r.runId === scope.runId
     && r.sessionKey === scope.sessionKey && r.canonicalModel === scope.canonicalModel
@@ -119,9 +124,13 @@ function parseContext(raw: unknown): Context {
     && typeof a.securityEpoch === 'string' && /^\d+$/.test(a.securityEpoch))
   if (c.input !== null) {
     const i = object(c.input)
-    need(i.sequence === 1 && typeof i.inputSha256 === 'string' && HASH.test(i.inputSha256))
+    need(typeof i.sequence === 'number' && Number.isSafeInteger(i.sequence) && i.sequence > 0
+      && typeof i.inputSha256 === 'string' && HASH.test(i.inputSha256))
   }
-  if (c.receipt !== null) validateRemoteNativeReceipt(c.receipt, s as unknown as Scope)
+  if (c.receipt !== null) {
+    const receipt = validateRemoteNativeReceipt(c.receipt, s as unknown as Scope)
+    if (receipt.version === 2) need(receipt.authorityTurnId === c.authorityTurnId && receipt.turnKey === c.turnKey)
+  }
   return structuredClone(raw) as Context
 }
 function reservation(c: Context): ReservationHandle {
@@ -140,8 +149,9 @@ async function releaseSoftReservation(
 }
 function nativeStamp(c: Context) {
   const r = c.receipt!
-  return { version: 1, backendKind: BACKEND, operationId: c.scope.operationId, runId: c.scope.runId,
-    nativeSessionId: r.nativeSessionId, resultSha256: r.resultSha256 }
+  return { version: r.version, backendKind: BACKEND, operationId: c.scope.operationId, runId: c.scope.runId,
+    nativeSessionId: r.nativeSessionId, resultSha256: r.resultSha256,
+    ...(r.version === 2 ? { authorityTurnId: r.authorityTurnId, turnKey: r.turnKey } : {}) }
 }
 function usageOf(c: Context): TokenUsage {
   const u = c.receipt!.usage
@@ -246,13 +256,14 @@ export function createRemoteNativeTurnFinance(
   const reserve = fixtures.reserve ?? preCheckWithCost
   const release = fixtures.release ?? releasePreCheck
   const settle = fixtures.settle ?? settleUsageAndLedger
-  const claimedOperations = new Set<string>()
+  const claimedAuthorities = new Set<string>()
+  const claimedRequests = new Set<string>()
+  const claimedTurns = new Set<string>()
+  const activeOperations = new Map<string, string>()
   const now = deps.now ?? Date.now
   return { async admit(input) {
     const scope = scopeOf(input.binding)
-    need(scope.expiresAt > now() && input.sessionKey === scope.sessionKey && HASH.test(input.turnKey)
-      && !claimedOperations.has(scope.operationId))
-    claimedOperations.add(scope.operationId) // one admission, including an unknown ACK
+    need(scope.expiresAt > now() && input.sessionKey === scope.sessionKey && HASH.test(input.turnKey))
     const keys = typeof deps.keyring === 'function' ? deps.keyring() : deps.keyring
     const a = verifyAuthority(input.authorityEnvelope, keys, now())
     const lease = verifyTurnLease(input.leaseEnvelope, keys, now())
@@ -263,6 +274,17 @@ export function createRemoteNativeTurnFinance(
       && backend?.kind === BACKEND && backend.operationId === scope.operationId
       && backend.sessionKey === scope.sessionKey && typeof a.billingRequestId === 'string'
       && /^[A-Za-z0-9_-]{1,64}$/.test(a.billingRequestId))
+    // The Worker binding outlives a turn. Burn each signed turn/request before
+    // awaiting I/O, while retaining one active financial owner per operation.
+    need(!activeOperations.has(scope.operationId) && !claimedAuthorities.has(a.authorityTurnId)
+      && !claimedRequests.has(a.billingRequestId) && !claimedTurns.has(input.turnKey))
+    claimedAuthorities.add(a.authorityTurnId)
+    claimedRequests.add(a.billingRequestId)
+    claimedTurns.add(input.turnKey)
+    activeOperations.set(scope.operationId, a.billingRequestId)
+    const releaseActive = () => {
+      if (activeOperations.get(scope.operationId) === a.billingRequestId) activeOperations.delete(scope.operationId)
+    }
     const fence = () => enforceModelAuthority({ catalog: deps.catalog,
       keyring: typeof deps.keyring === 'function' ? deps.keyring() : deps.keyring,
       headers: { [AUTHORITY_HEADER]: input.authorityEnvelope, [TURN_LEASE_HEADER]: input.leaseEnvelope },
@@ -334,7 +356,10 @@ export function createRemoteNativeTurnFinance(
           AND ctx#>>'{remoteNative,hostStartAttempted}'='false'
           AND ctx#>'{remoteNative,input}'='null'::jsonb`,
       [c.requestId, scope.uid, REMOTE_NATIVE_BILLING_RECOVERY_VERSION, scope.operationId, reason])
-      if (row.rowCount === 1) await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
+      if (row.rowCount === 1) {
+        await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
+        releaseActive()
+      }
     }
     try {
       const pre = await reserve(deps.preCheckRedis, { userId: scope.uid, requestId: c.requestId,
@@ -376,7 +401,7 @@ export function createRemoteNativeTurnFinance(
       },
       async beforeDispatch(value) {
         need(scope.expiresAt > now() && hostAttempted && c.hostStartAttempted
-          && !inputAttempted && value.sequence === 1 && HASH.test(value.inputSha256))
+          && !inputAttempted && Number.isSafeInteger(value.sequence) && value.sequence > 0 && HASH.test(value.inputSha256))
         inputAttempted = true
         await fence()
         const row = await scopedUpdate('dispatch-input', 'input', value,
@@ -386,6 +411,9 @@ export function createRemoteNativeTurnFinance(
       },
       terminal(raw) {
         const receipt = validateRemoteNativeReceipt(raw, scope)
+        // v1 receipts remain readable by recovery only. A live continued turn
+        // must carry the exact current signed admission, not just session IDs.
+        need(receipt.version === 2 && receipt.authorityTurnId === c.authorityTurnId && receipt.turnKey === c.turnKey)
         need(hostAttempted && inputAttempted && c.input)
         if (c.receipt) need(isDeepStrictEqual(c.receipt, receipt))
         if (finish) return finish
@@ -397,6 +425,7 @@ export function createRemoteNativeTurnFinance(
             need(row.rowCount === 1)
             if (await settleReceipt(deps.pool, c, settle)) {
               await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
+              releaseActive()
               return { state: 'proven' as const, requestId: c.requestId }
             }
           } catch {
@@ -405,6 +434,7 @@ export function createRemoteNativeTurnFinance(
             try {
               if (await proveAndRepair(deps.pool, c)) {
                 await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
+                releaseActive()
                 return { state: 'proven' as const, requestId: c.requestId }
               }
             } catch { /* unknown remains durable and unreplayed */ }

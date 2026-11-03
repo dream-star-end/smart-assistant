@@ -10,25 +10,48 @@ import { join, relative } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Cc5SshHost, type Cc5SshSpawn } from '../cc5SshHost.js'
+import { CC5_NATIVE_TOOLS, cc5ToolInputSha256 } from '../cc5NativeTool.js'
 
 // Ordinary Node children emulate SSH stdio only. No SSH/Claude/network model invocation occurs.
 const FAKE = String.raw`
 const fs = require('node:fs');
+const {createHash} = require('node:crypto');
 const [role, raw] = process.argv.slice(1); const c = JSON.parse(raw);
 if (role === 'tool-socket') {
   setTimeout(() => {
-    const row = JSON.stringify({version:1,kind:'socket-ready',runId:c.runId,
+    const row = JSON.stringify({version:2,kind:'socket-ready',runId:c.runId,
       operationId:c.operationId,pid:process.pid,startTicks:'12'})+'\n';
     process.stdout.write(row.slice(0,13)); process.stdout.write(row.slice(13));
   }, c.helperDelay || 0);
-  let buffer=''; process.stdin.on('data', b => { buffer+=b; if(buffer.includes('\n')) {
-    fs.writeFileSync(c.root+'/response', buffer); }});
+  let sent=0;
+  function sendTool() {
+    sent++;
+    const names=['Read','Edit','Bash'];
+    const inputs=[{file_path:'/fixture/file'},
+      {file_path:'/fixture/file',old_string:'before',new_string:'after'},
+      {command:'printf fixture'}];
+    const args=inputs[(sent-1)%3];
+    const inputSha256=createHash('sha256').update(JSON.stringify(Object.fromEntries(
+      Object.entries(args).sort(([left],[right])=>left<right?-1:left>right?1:0)))).digest('hex');
+    const body=Buffer.from(JSON.stringify({runId:c.runId,operationId:c.operationId,
+      rpcId:18+sent,toolUseId:'toolu-real-stdio-fixture-'+sent,
+      name:'mcp__ocbridge__'+names[(sent-1)%3],arguments:args,inputSha256}));
+    process.stdout.write(JSON.stringify({version:2,kind:'tool-request',
+      seq:c.repeatSequence&&sent>1?1:sent,body:body.toString('base64')})+'\n');
+  }
+  let buffer=''; process.stdin.on('data', b => {
+    buffer+=b;
+    for(let index=buffer.indexOf('\n');index>=0;index=buffer.indexOf('\n')) {
+      const line=buffer.slice(0,index); buffer=buffer.slice(index+1);
+      const response=JSON.parse(line);
+      if(response.version!==2||response.kind!=='tool-response'||response.seq!==sent) process.exit(29);
+      fs.appendFileSync(c.root+'/response',line+'\n');
+      if(sent<(c.toolCount||1)) setTimeout(sendTool,5);
+    }
+  });
   process.stdin.on('end',()=>process.exit(0));
   if(c.tool) { const poll=setInterval(()=>{if(fs.existsSync(c.root+'/prompt')) {
-    clearInterval(poll); const body=Buffer.from(JSON.stringify({runId:c.runId,
-      operationId:c.operationId,rpcId:19,toolUseId:'toolu-real-stdio-fixture',
-      name:'mcp__ocbridge__roundtrip',arguments:{operationId:c.operationId}}));
-    process.stdout.write(JSON.stringify({version:1,kind:'tool-request',seq:1,body:body.toString('base64')})+'\n');
+    clearInterval(poll); sendTool();
   }},5); }
 } else if(role === 'launch') {
   fs.writeFileSync(c.root+'/launched','once');
@@ -181,10 +204,10 @@ test('fixed SSH argv waits for helper READY and transports original bytes withou
   }
 })
 
-test('one actual Unix request/receipt crosses the MCP stdio channel once', async () => {
-  const f = fixture({ tool: true })
+test('three sequential tool RPCs cross the v2 MCP channel with exact input hashes and increasing sequences', async () => {
+  const f = fixture({ tool: true, toolCount: 3 })
   let requests = 0
-  let received: Buffer | undefined
+  const received: Array<Record<string, unknown>> = []
   const receipt = Buffer.from('{"ok":true,"receipt":"actual-unix-fixture"}')
   const server = createServer((req, res) => {
     requests++
@@ -192,7 +215,12 @@ test('one actual Unix request/receipt crosses the MCP stdio channel once', async
     const chunks: Buffer[] = []
     req.on('data', (b: Buffer) => chunks.push(b))
     req.on('end', () => {
-      received = Buffer.concat(chunks)
+      const body = JSON.parse(Buffer.concat(chunks).toString())
+      assert.equal(Object.keys(body).sort().join(','), 'arguments,inputSha256,name,operationId,rpcId,runId,toolUseId')
+      assert.equal(body.operationId, f.config.operationId)
+      assert.equal(body.runId, f.config.runId)
+      assert.equal(body.inputSha256, cc5ToolInputSha256(body.arguments))
+      received.push(body)
       res.end(receipt)
     })
   })
@@ -202,16 +230,47 @@ test('one actual Unix request/receipt crosses the MCP stdio channel once', async
     const streams = f.start()
     await streams.ready
     streams.stdin.write('one user frame\n')
-    await until(() => existsSync(join(f.root, 'response')))
-    const frame = JSON.parse(readFileSync(join(f.root, 'response'), 'utf8'))
-    assert.equal(frame.seq, 1)
-    assert.equal(frame.kind, 'tool-response')
-    assert.equal(frame.status, 200)
-    assert.deepEqual(Buffer.from(frame.body, 'base64'), receipt)
-    assert.equal(requests, 1)
-    assert.equal(JSON.parse(received!.toString()).toolUseId, 'toolu-real-stdio-fixture')
-    assert.equal(JSON.parse(received!.toString()).rpcId, 19)
+    await until(() => existsSync(join(f.root, 'response')) &&
+      readFileSync(join(f.root, 'response'), 'utf8').trim().split('\n').length === 3)
+    const frames = readFileSync(join(f.root, 'response'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    assert.deepEqual(frames.map((frame) => frame.seq), [1, 2, 3])
+    for (const frame of frames) {
+      assert.equal(frame.version, 2)
+      assert.equal(frame.kind, 'tool-response')
+      assert.equal(frame.status, 200)
+      assert.deepEqual(Buffer.from(frame.body, 'base64'), receipt)
+    }
+    assert.equal(requests, 3)
+    assert.deepEqual(received.map((body) => body.name), [...CC5_NATIVE_TOOLS])
+    assert.deepEqual(received.map((body) => body.toolUseId), [1, 2, 3].map((index) => `toolu-real-stdio-fixture-${index}`))
+    assert.deepEqual(received.map((body) => body.rpcId), [19, 20, 21])
     await f.host.stop()
+  } finally {
+    server.closeAllConnections()
+    server.close()
+    await f.cleanup()
+  }
+})
+
+test('a repeated MCP transport sequence fails before a second Unix delivery', async () => {
+  const f = fixture({ tool: true, toolCount: 2, repeatSequence: true })
+  let requests = 0
+  const server = createServer((_req, res) => {
+    requests++
+    res.end('{"ok":true,"receipt":"first-only"}')
+  })
+  try {
+    server.listen(f.config.toolSocketPath)
+    await once(server, 'listening')
+    const streams = f.start()
+    await streams.ready
+    streams.stdin.write('one user frame\n')
+    await until(() => f.errors.length > 0)
+    assert.equal(requests, 1)
+    assert.equal(readFileSync(join(f.root, 'response'), 'utf8').trim().split('\n').length, 1)
+    assert.ok(f.errors.every((error) => error.message === 'CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN'))
+    await f.host.stop()
+    assert.equal(f.roles.filter((role) => role === 'launch').length, 1)
   } finally {
     server.closeAllConnections()
     server.close()

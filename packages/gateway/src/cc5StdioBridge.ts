@@ -1,7 +1,7 @@
 /** Byte transport for the original interactive host. Never synthesizes model frames. */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { request } from 'node:http'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
@@ -16,6 +16,8 @@ import {
 } from './cc5BridgePort.js'
 import { Cc5ToolObservation } from './cc5ToolObservation.js'
 import { runCc5ToolPump } from './cc5ToolPump.js'
+import { privateDir, syncDir } from './cc5FixedTool.js'
+import { Cc5ToolHost } from './cc5ToolHost.js'
 
 export async function runCc5StdioBridge(input: {
   binding: Readonly<Cc5BridgeBinding>
@@ -25,7 +27,9 @@ export async function runCc5StdioBridge(input: {
   socketPath?: string
   signal?: AbortSignal
   /** Production entry always supplies the supervisor-owned keyring. */
-  tools?: { keyring: AuthorityKeyring; executionRoot?: string }
+  tools?: { keyring: AuthorityKeyring; executionRoot?: string;
+    /** In-process fixtures only; production always constructs the fixed supervisor. */
+    hostFactory?: (root: string, lifecycleId: string) => Pick<Cc5ToolHost, 'execute' | 'close'> }
 }): Promise<void> {
   const scope = {
     capability: input.binding.capability,
@@ -40,7 +44,17 @@ export async function runCc5StdioBridge(input: {
   const toolAbort = new AbortController()
   let toolRun: Promise<unknown> | undefined
   let seq = 0
-  let userSeen = false
+  let toolHost: Pick<Cc5ToolHost, 'execute' | 'close'> | undefined
+  const lifecycleId = randomUUID()
+  const executionRoot = input.tools?.executionRoot ?? '/home/agent/.openclaude/.cc5-native-tools'
+  const lifecycleRoot = join(executionRoot, `host-${lifecycleId}`)
+  if (input.tools) {
+    privateDir(executionRoot)
+    privateDir(lifecycleRoot)
+    syncDir(executionRoot)
+    const registered = await cc5ControlRequest('/tool/register', { ...scope, lifecycleId }, socketPath)
+    if (registered.lifecycleId !== lifecycleId) throw new Error('CC5_TOOLHOST_REGISTRATION_UNKNOWN')
+  }
   let ready = false
   let stopping = false
   let ended = false
@@ -55,7 +69,23 @@ export async function runCc5StdioBridge(input: {
     stopping = true
     toolAbort.abort()
     pending = []
-    stopPromise = cc5ControlRequest('/stop', scope, socketPath)
+    stopPromise = Promise.resolve().then(async () => {
+      let localFailure: unknown
+      try {
+        await toolHost?.close()
+        if (input.tools) {
+          const stopped = await cc5ControlRequest('/tool/stopped', { ...scope, lifecycleId, localStopped: true }, socketPath)
+          if (stopped.lifecycleId !== lifecycleId) throw new Error('CC5_TOOLHOST_STOP_ACK_UNKNOWN')
+        }
+      } catch (error) {
+        localFailure = error
+      }
+      // A failed local proof still revokes/stops the remote Worker; it never
+      // becomes a successful combined stop or permission for another turn.
+      const result = await cc5ControlRequest('/stop', scope, socketPath)
+      if (localFailure) throw new Error('CC5_TOOLHOST_STOP_UNPROVEN')
+      return result
+    })
       .then((result) => {
         if (result.remoteStopped !== true) throw new Error('CC5_REMOTE_STOP_UNPROVEN')
       })
@@ -84,10 +114,9 @@ export async function runCc5StdioBridge(input: {
           typeof content === 'string' ||
           (Array.isArray(content) &&
             content.every((b) => b && b.type === 'text' && typeof b.text === 'string'))
-        if (userSeen || frame.message?.role !== 'user' || !textOnly) {
+        if (frame.message?.role !== 'user' || !textOnly) {
           throw new Error('CC5_INPUT_REJECTED')
         }
-        userSeen = true
       } else if (frame.type !== 'control_request' || frame.request?.subtype !== 'interrupt') {
         throw new Error('CC5_INPUT_REJECTED')
       }
@@ -163,6 +192,11 @@ export async function runCc5StdioBridge(input: {
               signal: toolAbort.signal,
               socketPath,
               executionRoot: input.tools.executionRoot,
+              executeTool: async (request) => {
+                if (stopping) throw new Error('CC5_TOOLHOST_CLOSED')
+                toolHost ??= input.tools?.hostFactory?.(lifecycleRoot, lifecycleId) ?? new Cc5ToolHost(lifecycleRoot, lifecycleId)
+                return toolHost.execute(request.name, request.arguments, request)
+              },
             }).catch(() => {
               if (!stopping) fail('CC5_FIXED_TOOL_FAILED_OR_UNKNOWN')
             })

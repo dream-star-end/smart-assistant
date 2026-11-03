@@ -80,7 +80,7 @@ function fixedInput(value: unknown, operationId: string): string {
   )
   return hash(JSON.stringify({ operationId }))
 }
-function syncDir(path: string): void {
+export function syncDir(path: string): void {
   const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
   try {
     fsyncSync(fd)
@@ -88,7 +88,7 @@ function syncDir(path: string): void {
     closeSync(fd)
   }
 }
-function privateDir(path: string): void {
+export function privateDir(path: string): void {
   try {
     mkdirSync(path, { mode: 0o700 })
   } catch (e) {
@@ -97,7 +97,7 @@ function privateDir(path: string): void {
   const st = lstatSync(path)
   requireTool(st.isDirectory() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0)
 }
-function readRecord(path: string): unknown {
+export function readRecord(path: string): unknown {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
     const st = fstatSync(fd)
@@ -114,7 +114,7 @@ function readRecord(path: string): unknown {
     closeSync(fd)
   }
 }
-function exclusiveRecord(path: string, value: unknown): void {
+export function exclusiveRecord(path: string, value: unknown): void {
   const fd = openSync(
     path,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,

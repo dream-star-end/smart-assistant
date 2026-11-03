@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 import type { Cc5BridgeBinding } from '../cc5BridgePort.js'
 import { Cc5NativeUsageObserver } from '../cc5NativeUsage.js'
+import { StreamJson } from '../../box-bridge-mod/oc-bridge/hooks/frames.js'
 
 function fixture() {
   const binding: Cc5BridgeBinding = { version: 2, backendKind: 'cc5-interactive-v1',
@@ -10,13 +11,16 @@ function fixture() {
     runId: randomUUID(), uid: '3', containerDbId: '91', dockerId: 'a'.repeat(64),
     operationId: randomUUID(), capability: 'b'.repeat(64), expiresAt: Date.now() + 60000 }
   const native = randomUUID()
-  const observer = new Cc5NativeUsageObserver(binding)
+  const producer = new StreamJson()
+  producer.sessionId = native
+  const nextResultId = (): string => JSON.parse(producer.result({ reason: 'answer', answer: 'fixture', durationMs: 0 }, null)).uuid
+  const observer = new Cc5NativeUsageObserver(binding, { legacySingleTurn: true })
   const init = Buffer.from(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: native,
     model: 'claude-sonnet-5' })}\n`)
   const terminal = { type: 'result', subtype: 'success', is_error: false, session_id: native,
     total_cost_usd: 999999, result: '{"usage":{"input_tokens":999999}}',
     usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 } }
-  return { binding, native, observer, init, terminal }
+  return { binding, native, observer, init, terminal, nextResultId }
 }
 
 test('only native result aggregate replaces step usage; original bytes and exact digest are retained', () => {
@@ -77,4 +81,46 @@ test('a result without prior native model identity or with a truncated tail is n
   const other = fixture()
   other.observer.ingest(other.init.subarray(0, other.init.length - 1))
   assert.throws(() => other.observer.finish())
+})
+
+test('live usage requires explicit admission and produces isolated v2 receipts across serial turns', () => {
+  const f = fixture()
+  const observer = new Cc5NativeUsageObserver(f.binding)
+  const first = { authorityTurnId: '1'.repeat(32), turnKey: 'a'.repeat(64) }
+  observer.beginTurn(first)
+  observer.ingest(f.init)
+  const raw = (row: unknown) => Buffer.from(`${JSON.stringify(row)}\n`)
+  const one = { ...f.terminal, uuid: f.nextResultId() }
+  const receipt = observer.ingest(raw(one))[0]!.receipt!
+  assert.equal(receipt.version, 2)
+  if (receipt.version === 2) assert.deepEqual({ authorityTurnId: receipt.authorityTurnId, turnKey: receipt.turnKey }, first)
+  const second = { authorityTurnId: '2'.repeat(32), turnKey: 'b'.repeat(64) }
+  observer.beginTurn(second)
+  const two = { ...f.terminal, uuid: f.nextResultId(), usage: { ...f.terminal.usage, input_tokens: 2 } }
+  const next = observer.ingest(raw(two))[0]!.receipt!
+  assert.equal(next.usage.inputTokens, 2)
+  assert.equal(next.nativeSessionId, f.native)
+  assert.equal(next.version, 2)
+  if (next.version === 2) assert.equal(next.authorityTurnId, second.authorityTurnId)
+  observer.finish()
+  const unadmitted = new Cc5NativeUsageObserver(f.binding)
+  unadmitted.ingest(f.init)
+  assert.throws(() => unadmitted.ingest(raw(one)))
+})
+
+test('live turns reject overlapping admission, reused terminal UUID/digest and switched native identity', () => {
+  for (const reuse of ['uuid', 'digest', 'session', 'rfc-uuid']) {
+    const f = fixture()
+    const observer = new Cc5NativeUsageObserver(f.binding)
+    observer.beginTurn({ authorityTurnId: '1'.repeat(32), turnKey: 'a'.repeat(64) })
+    assert.throws(() => observer.beginTurn({ authorityTurnId: '2'.repeat(32), turnKey: 'b'.repeat(64) }))
+    observer.ingest(f.init)
+    const one = { ...f.terminal, uuid: f.nextResultId() }
+    observer.ingest(Buffer.from(`${JSON.stringify(one)}\n`))
+    observer.beginTurn({ authorityTurnId: '2'.repeat(32), turnKey: 'b'.repeat(64) })
+    const two = reuse === 'digest' ? one : reuse === 'uuid' ? { ...one, result: 'changed bytes' }
+      : reuse === 'rfc-uuid' ? { ...one, uuid: randomUUID() }
+      : { ...one, uuid: f.nextResultId(), session_id: randomUUID() }
+    assert.throws(() => observer.ingest(Buffer.from(`${JSON.stringify(two)}\n`)))
+  }
 })

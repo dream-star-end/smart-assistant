@@ -7,7 +7,7 @@ import { dirname, isAbsolute } from 'node:path'
 import { PassThrough } from 'node:stream'
 import type { Cc5InteractiveHostPort } from './cc5Relay.js'
 
-const CONTROLLER_SHA = '19602e831b1efbff6c6dcdd3184d516422c07e279bc3bc32267fe704dc6d337b'
+const CONTROLLER_SHA = '83062dd94139c78c81d982dbcdc2757b105c50def5f7e782ebb0260e2accae2c'
 const MAX_BODY = 131072
 const MAX_FRAME = 262144
 const FAILED = 'CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN'
@@ -73,7 +73,8 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
   private stopPromise?: Promise<{ remoteStopped: true }>
   private toolChannel?: Channel
   private hostChannel?: Channel
-  private toolSeen = false
+  private lastToolSequence = 0
+  private toolBusy = false
   private startupTimer?: ReturnType<typeof setTimeout>
 
   constructor(
@@ -251,7 +252,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
             const index = pending.indexOf(10)
             const row = object(pending.subarray(0, index))
             pending = pending.subarray(index + 1)
-            requireHost(!this.closing && row.version === 1)
+            requireHost(!this.closing && row.version === 2)
             if (!ready) {
               requireHost(
                 Object.keys(row).sort().join(',') ===
@@ -270,12 +271,13 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
               requireHost(
                 Object.keys(row).sort().join(',') === 'body,kind,seq,version' &&
                   row.kind === 'tool-request' &&
-                  row.seq === 1 &&
-                  !this.toolSeen,
+                  row.seq === this.lastToolSequence + 1 &&
+                  !this.toolBusy,
               )
-              this.toolSeen = true // Burn before any HTTP delivery; no retry on unknown.
+              this.toolBusy = true // Burn before any HTTP delivery; no retry on unknown.
+              const sequence = ++this.lastToolSequence
               const body = decode(row.body)
-              void this.forwardTool(body).catch(() => this.fail())
+              void this.forwardTool(body, sequence).then(() => { this.toolBusy = false }).catch(() => this.fail())
             }
           }
         } catch {
@@ -314,12 +316,13 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       }
     })
   }
-  private async forwardTool(body: Buffer): Promise<void> {
+  private async forwardTool(body: Buffer, sequence: number): Promise<void> {
     requireHost(!this.closing && this.originalReady)
     const receipt = await new Promise<Buffer>((resolve, reject) => {
       const req = request(
         {
           socketPath: this.config.toolSocketPath,
+          agent: false,
           method: 'POST',
           path: '/roundtrip',
           headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
@@ -349,9 +352,9 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     requireHost(!this.closing)
     const response = Buffer.from(
       `${JSON.stringify({
-        version: 1,
+        version: 2,
         kind: 'tool-response',
-        seq: 1,
+        seq: sequence,
         status: 200,
         body: receipt.toString('base64'),
       })}\n`,

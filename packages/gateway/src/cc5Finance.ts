@@ -9,7 +9,7 @@ export interface Cc5NativeUsage {
 }
 
 /** Produced only at the pinned host stdout boundary from one complete native result. */
-export interface Cc5NativeTerminalReceipt {
+export interface Cc5NativeTerminalReceiptV1 {
   readonly version: 1
   readonly backendKind: 'cc5-interactive-v1'
   readonly uid: string
@@ -25,6 +25,14 @@ export interface Cc5NativeTerminalReceipt {
   readonly status: 'success' | 'error'
   readonly usage: Cc5NativeUsage
 }
+
+/** Live continued turns carry their own signed admission identity. V1 is recovery-only. */
+export type Cc5NativeTerminalReceiptV2 = Omit<Cc5NativeTerminalReceiptV1, 'version'> & {
+  readonly version: 2
+  readonly authorityTurnId: string
+  readonly turnKey: string
+}
+export type Cc5NativeTerminalReceipt = Cc5NativeTerminalReceiptV1 | Cc5NativeTerminalReceiptV2
 
 export type Cc5FinanceTerminalOutcome =
   | { readonly state: 'proven'; readonly requestId: string }
