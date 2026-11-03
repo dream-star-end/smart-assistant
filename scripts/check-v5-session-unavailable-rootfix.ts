@@ -572,6 +572,7 @@ const C_FULL_LEAVES = [
   'client close during pending keeps reservation; 65th 429; release frees; no double count',
   'upstream failure during pending releases the reservation without 200',
   'client close + 10s upstream timeout releases reservation and real socket',
+  'keeps exhausted Box quota manually retryable without enabling automatic recovery',
   'classifies every frontend-visible retryable code into automatic recovery or an explicit unsafe transport/admission exclusion',
   'includes transient execution failures but excludes user/action and admission failures',
   'normalizes every deployed unexpected runner label to one recovery policy',
