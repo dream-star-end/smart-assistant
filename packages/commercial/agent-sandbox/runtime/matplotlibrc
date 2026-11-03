@@ -1,0 +1,11 @@
+# Site matplotlibrc for the OpenClaude runtime.
+# fonts-noto-cjk and fonts-wqy-zenhei are already installed. Matplotlib does
+# not use fontconfig, and a generic family uses only the first installed face,
+# so a CJK face has to be first or Chinese titles render as boxes.
+# An explicit family list is also a per-glyph fallback chain.
+
+font.family: Noto Sans CJK SC, DejaVu Sans
+font.sans-serif: Noto Sans CJK SC, WenQuanYi Zen Hei, DejaVu Sans, Bitstream Vera Sans, Computer Modern Sans Serif, Lucida Grande, Verdana, Geneva, Lucid, Arial, Helvetica, Avant Garde, sans-serif
+font.serif: Noto Serif CJK SC, WenQuanYi Zen Hei, DejaVu Serif, Bitstream Vera Serif, Computer Modern Roman, New Century Schoolbook, Century Schoolbook L, Utopia, ITC Bookman, Bookman, Nimbus Roman No9 L, Times New Roman, Times, Palatino, Charter, serif
+font.monospace: Noto Sans Mono CJK SC, WenQuanYi Zen Hei Mono, DejaVu Sans Mono, Bitstream Vera Sans Mono, Computer Modern Typewriter, Andale Mono, Nimbus Mono L, Courier New, Courier, Fixed, Terminal, monospace
+axes.unicode_minus: False
