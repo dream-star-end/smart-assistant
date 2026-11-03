@@ -57,28 +57,18 @@ describe("turnSilenceMs", () => {
 });
 
 describe("decideBackgroundTurnNotice(B4-SPEC §3.2)", () => {
-  test("不在飞 → 隐藏;在飞但帧新鲜、无排队 → 隐藏(正常流式交给活动行)", () => {
-    expect(decide({ turnOpen: false, detached: true }).visible).toBe(false);
+  test("不在飞 → 隐藏;在飞但无排队 → 隐藏(detached / 静默 ≥30s / 实扣积分均不单独弹出横幅)", () => {
+    expect(decide({ turnOpen: false, detached: true, queuedCount: 1 }).visible).toBe(false);
     expect(decide().visible).toBe(false);
+    expect(decide({ detached: true }).visible).toBe(false);
     expect(decide({ silenceMs: STALE_WARN_MS - 1 }).visible).toBe(false);
+    expect(decide({ silenceMs: STALE_WARN_MS }).visible).toBe(false);
+    expect(decide({ silenceMs: 31_000 }).visible).toBe(false);
+    expect(decide({ creditsSettled: "500" }).visible).toBe(false);
   });
 
-  test("(a) detached → 显示", () => {
-    expect(decide({ detached: true })).toEqual({ visible: true, lastTriggerAt: NOW });
-  });
-
-  test("(b) 静默 ≥30s → 显示", () => {
-    expect(decide({ silenceMs: STALE_WARN_MS }).visible).toBe(true);
-    expect(decide({ silenceMs: 31_000 }).visible).toBe(true);
-  });
-
-  test("(c) 已有排队消息 → 显示", () => {
-    expect(decide({ queuedCount: 1 }).visible).toBe(true);
-  });
-
-  test("(d) 快照实扣积分到 500 → 显示;未到不单独触发", () => {
-    expect(decide({ creditsSettled: "500" }).visible).toBe(true);
-    expect(decide({ creditsSettled: "499" }).visible).toBe(false);
+  test("已有排队消息 → 显示", () => {
+    expect(decide({ queuedCount: 1 })).toEqual({ visible: true, lastTriggerAt: NOW });
   });
 
   test("断线 / 连接中 → 立即隐藏并清保持期(断线期间说「仍在运行」会撒谎)", () => {

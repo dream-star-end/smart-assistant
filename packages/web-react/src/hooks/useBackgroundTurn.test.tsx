@@ -67,7 +67,7 @@ function renderTurn(initial: Props) {
 }
 
 describe("useBackgroundTurn 提示条显隐(B4-SPEC §3.2)", () => {
-  test("不在飞 → 不显示;在飞但帧新鲜、无排队 → 不显示", () => {
+  test("不在飞 → 不显示;在飞但无排队(含 detached / 静默 ≥30s / 实扣积分) → 不显示", () => {
     vi.useFakeTimers({ now: T0 });
     const idle = makeSess({ _sendingInFlight: false });
     const { result, rerender } = renderTurn({ sess: idle });
@@ -75,32 +75,35 @@ describe("useBackgroundTurn 提示条显隐(B4-SPEC §3.2)", () => {
     rerender({ sess: makeSess() });
     expect(result.current.notice).toBeNull();
     act(() => {
-      vi.advanceTimersByTime(20_000);
+      vi.advanceTimersByTime(30_000 + BACKGROUND_TURN_TICK_MS);
+    });
+    expect(result.current.notice).toBeNull();
+    rerender({
+      sess: makeSess({
+        _lastFrameAt: T0 - 1000,
+        _turnDetachedAt: T0,
+        _turnCredits: { clientMessageId: "c1", settled: "1520", requests: 3, asOf: T0, receivedAt: T0 },
+      }),
     });
     expect(result.current.notice).toBeNull();
   });
 
-  test("hello 快照标了 detached、之后没有新帧 → 显示;桌面和窄屏文案不同", () => {
+  test("有排队消息 → 显示;桌面和窄屏文案不同,高额积分升 warning", () => {
     vi.useFakeTimers({ now: T0 });
-    const sess = makeSess({ _lastFrameAt: T0 - 1000, _turnDetachedAt: T0 });
-    const { result, rerender } = renderTurn({ sess });
+    const sess = makeSess();
+    const { result, rerender } = renderTurn({ sess, queuedCount: 1 });
     expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT, compact: false, tone: "info" });
-    rerender({ sess, compact: true });
+    rerender({ sess, queuedCount: 1, compact: true });
     expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT_COMPACT, compact: true, tone: "info" });
-  });
-
-  test("静默跨过 30s 由自带节拍推进,不依赖 App 重渲", () => {
-    vi.useFakeTimers({ now: T0 });
-    const { result } = renderTurn({ sess: makeSess() });
-    expect(result.current.notice).toBeNull();
-    act(() => {
-      vi.advanceTimersByTime(25_000);
+    const withCredits = makeSess({
+      _turnCredits: { clientMessageId: "c1", settled: "1520", requests: 3, asOf: T0, receivedAt: T0 },
     });
-    expect(result.current.notice).toBeNull();
-    act(() => {
-      vi.advanceTimersByTime(30_000 - 25_000 + BACKGROUND_TURN_TICK_MS);
+    rerender({ sess: withCredits, queuedCount: 1, compact: false });
+    expect(result.current.notice).toEqual({
+      text: "本轮已扣 1,520 积分，仍在运行。现在发送的消息会等本轮结束后再发出，另行计费。",
+      compact: false,
+      tone: "warning",
     });
-    expect(result.current.notice?.text).toBe(BACKGROUND_TURN_TEXT);
   });
 
   test("有排队消息 → 显示;排队清空后保持 10 秒再消失", () => {
