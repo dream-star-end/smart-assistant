@@ -46,3 +46,39 @@ test('the gateway result bound matches the Python canonical wire limit byte for 
   assert.ok(text.startsWith('新行\n😀"\\'))
   assert.ok(text.endsWith(`[cc5 tool result truncated: original ${cc5ToolResultBytes(oversized)} bytes]`))
 })
+
+
+test('an oversized image block becomes a placeholder instead of base64 text', () => {
+  const data = Buffer.alloc(200 * 1024, 7).toString('base64')
+  const oversized = { content: [{ type: 'image', mimeType: 'image/png', data }], isError: false }
+  const bounded = boundCc5ToolResult(oversized) as unknown as { content: Array<{ type: string; text?: string }>; isError: boolean }
+  assert.ok(cc5ToolResultBytes(bounded) <= CC5_TOOL_RESULT_MAX_BYTES)
+  assert.deepEqual(bounded.content.map((block) => block.type), ['text'])
+  assert.ok(bounded.content[0].text!.includes('[image omitted: original 204800 bytes, too large to transfer'))
+  assert.ok(!JSON.stringify(bounded).includes(data.slice(0, 64)), 'image bytes leaked as text')
+})
+
+test('mixed text and an oversized image keep the text head and replace only the image', () => {
+  const head = 'gateway head\n'.repeat(4000)
+  const data = Buffer.alloc(200 * 1024, 9).toString('base64')
+  const oversized = { content: [
+    { type: 'text', text: head },
+    { type: 'image', mimeType: 'image/png', data },
+  ], isError: false }
+  const bounded = boundCc5ToolResult(oversized) as unknown as { content: Array<{ type: string; text?: string }>; isError: boolean }
+  assert.ok(cc5ToolResultBytes(bounded) <= CC5_TOOL_RESULT_MAX_BYTES)
+  assert.equal(bounded.content[0].type, 'text')
+  assert.ok(bounded.content[0].text!.startsWith('gateway head\ngateway head\n'))
+  const wire = JSON.stringify(bounded)
+  assert.ok(wire.includes('[image omitted: original 204800 bytes'))
+  assert.ok(!wire.includes(data.slice(0, 64)), 'image bytes leaked as text')
+})
+
+test('oversized UTF-8 text is cut on a complete character boundary', () => {
+  const oversized = { content: [{ type: 'text', text: '😀'.repeat(50000) }], isError: false }
+  const bounded = boundCc5ToolResult(oversized) as unknown as { content: Array<{ type: string; text: string }> }
+  const text = bounded.content[0].text
+  assert.ok(cc5ToolResultBytes(bounded) <= CC5_TOOL_RESULT_MAX_BYTES)
+  assert.ok(!text.includes('�'), 'truncation split a UTF-8 character')
+  assert.ok(text.endsWith(']'))
+})

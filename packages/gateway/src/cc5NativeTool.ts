@@ -91,10 +91,33 @@ function cc5CanonicalJson(value: unknown): string {
 export function cc5ToolResultBytes(value: unknown): number {
   return Buffer.byteLength(cc5CanonicalJson(value), 'utf8')
 }
+function cc5Base64Bytes(data: string): number {
+  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0
+  return Math.max(0, Math.floor(data.length * 3 / 4) - padding)
+}
+/** The wire image carries its base64 payload in `data`; tolerate a nested
+ * Anthropic-style `source.data` so a shape change cannot turn an image into a
+ * text passthrough. */
+function cc5ImageData(block: Record<string, unknown>): string | undefined {
+  if (block.type !== 'image') return undefined
+  if (typeof block.data === 'string') return block.data
+  const source = block.source as { data?: unknown } | undefined
+  return typeof source?.data === 'string' ? source.data : undefined
+}
+function cc5OmittedImage(bytes: number): string {
+  return `[image omitted: original ${bytes} bytes, too large to transfer; read a smaller region or downscale]`
+}
+/** Back a byte cut off to a complete UTF-8 character boundary. */
+function cc5Utf8Boundary(bytes: Buffer, length: number): number {
+  let end = Math.min(length, bytes.length)
+  while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--
+  return end
+}
 /** Keep the head of an oversized tool result and tell the model how many bytes
- * the tool produced. A large Read/Bash must degrade the answer, not tear down
- * the whole CC5 turn. Malformed shapes are returned untouched so the strict
- * assertion below still rejects them. */
+ * the tool produced. Text and images degrade independently: text is cut at a
+ * character boundary, and an oversized image block becomes a placeholder
+ * instead of being serialized into the text stream as base64. Malformed shapes
+ * are returned untouched so the strict assertion below still rejects them. */
 export function boundCc5ToolResult(result: Cc5ToolResult): Cc5ToolResult
 export function boundCc5ToolResult(result: unknown): unknown
 export function boundCc5ToolResult(result: unknown): unknown {
@@ -103,16 +126,30 @@ export function boundCc5ToolResult(result: unknown): unknown {
   if (!Array.isArray(value.content)) return result
   const originalBytes = cc5ToolResultBytes(result)
   if (originalBytes <= CC5_TOOL_RESULT_MAX_BYTES) return result
+  const isError = value.isError as boolean
   const note = `\n\n[cc5 tool result truncated: original ${originalBytes} bytes]`
-  const first = value.content[0]
-  const head = value.content.length === 1 && first && typeof first === 'object' &&
-    first.type === 'text' && typeof first.text === 'string'
-    ? first.text
-    : JSON.stringify(value.content)
+  const content = value.content as Array<Record<string, unknown>>
+  // Text and image blocks degrade independently: a large image must never be
+  // serialized into the text stream as base64 garbage.
+  const bounded = content.map((block) => {
+    const data = cc5ImageData(block)
+    return data === undefined ? block : { type: 'text', text: cc5OmittedImage(cc5Base64Bytes(data)) }
+  })
+  const withNote = bounded.map((block) => ({ ...block }))
+  let lastText = -1
+  for (let index = withNote.length - 1; index >= 0; index--) {
+    if (withNote[index].type === 'text' && typeof withNote[index].text === 'string') { lastText = index; break }
+  }
+  if (lastText >= 0) withNote[lastText] = { ...withNote[lastText], text: `${withNote[lastText].text as string}${note}` }
+  else withNote.push({ type: 'text', text: note.trimStart() })
+  if (cc5ToolResultBytes({ content: withNote, isError }) <= CC5_TOOL_RESULT_MAX_BYTES)
+    return { content: withNote, isError }
+  // The text itself is over budget: keep its head plus the note, as before.
+  const head = bounded.map((block) => typeof block.text === 'string' ? block.text : JSON.stringify(block)).join('\n\n')
   const bytes = Buffer.from(head, 'utf8')
   const truncate = (length: number): Cc5ToolResult => ({
-    content: [{ type: 'text', text: `${bytes.subarray(0, length).toString('utf8')}${note}` }],
-    isError: value.isError as boolean,
+    content: [{ type: 'text', text: `${bytes.subarray(0, cc5Utf8Boundary(bytes, length)).toString('utf8')}${note}` }],
+    isError,
   })
   let low = 0
   let high = bytes.length
