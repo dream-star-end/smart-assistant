@@ -59,6 +59,114 @@ class CommercialPolicyTest(unittest.TestCase):
         self.live.unlink(); self.live.symlink_to(self.new)
         self.env.write_text('OC_RUNTIME_IMAGE=new\nOC_RUNTIME_IMAGE_ID=new-id\nOC_RUNTIME_RELEASE=/new\nOC_PLATFORM_BUNDLE='+bundle+'\n')
 
+    def scoped_profile(self):
+        self.options['queueId'] = 'rq-20261103T000000Z-0123456789ab'
+        return m.validation.make_profile('skip-grok', 'user-approved:uid4-batch',
+            self.options['queueId'], self.options['sha'], 'deploy-test')
+
+    def test_legacy_descriptor_omits_profile_and_retains_its_original_digest(self):
+        self.prepare(); c, d = m.context()
+        self.assertEqual(set(d['options']), {'withDist', 'restartEgress', 'egressBefore',
+            'egressTargetSlot', 'queueId', 'bundleDigest', 'authority'})
+        frozen = (self.policy/(c['operationId']+'.json')).read_bytes()
+        legacy_body = {k:v for k,v in d.items() if k != 'operationId'}
+        self.assertEqual(c['operationId'], 'c-'+hashlib.sha256(
+            json.dumps(legacy_body, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
+        with patch.dict(os.environ, VALIDATION_PROFILE='skip-grok', VALIDATION_SCOPE_JSON='{"alien":true}'):
+            self.assertEqual(self.action('validation-profile'), 'null')
+        self.assertEqual((self.policy/(c['operationId']+'.json')).read_bytes(), frozen)
+
+    def test_scoped_descriptor_restores_exact_profile_under_a_new_recovery_owner(self):
+        scope = self.scoped_profile(); self.options['validationProfile'] = scope
+        self.prepare(); c, d = m.context()
+        self.assertEqual(d['options']['validationProfile'], scope)
+        without = {k:v for k,v in d.items() if k != 'operationId'}
+        without['options'] = {k:v for k,v in d['options'].items() if k != 'validationProfile'}
+        self.assertNotEqual(c['operationId'], 'c-'+hashlib.sha256(m.canonical(without)).hexdigest())
+        with patch.dict(os.environ, CP_DEPLOY_ID='new-recovery-holder', VALIDATION_PROFILE='normal',
+                        VALIDATION_SCOPE_JSON='null', VALIDATION_AUTHORIZATION_REF='caller-override'):
+            self.assertEqual(json.loads(self.action('validation-profile')), scope)
+
+    def test_invalid_scope_binding_is_rejected_before_any_intent_or_marker(self):
+        scope = self.scoped_profile()
+        for field, value in [('sourceSha', '3'*40), ('queueId', 'rq-20261103T000000Z-fedcba987654'),
+                             ('operationId', 'another-deployment')]:
+            with self.subTest(field=field):
+                self.options['validationProfile'] = {**scope, field:value}
+                with self.assertRaises(m.p.PolicyError): self.prepare()
+                self.assertFalse(m.ACTIVE.exists()); self.assertFalse(self.marker.exists())
+                self.assertEqual(list(self.policy.glob('*.json')), [])
+
+    def test_profile_is_digest_sealed_and_semantic_binding_cannot_be_rehashed_away(self):
+        scope = self.scoped_profile(); self.options['validationProfile'] = scope
+        self.prepare(); c, d = m.context(); filename = self.policy/(c['operationId']+'.json')
+        original = filename.read_bytes()
+        bad = json.loads(json.dumps(d)); bad['options']['validationProfile']['authorizationRef'] = 'changed'
+        filename.write_text(json.dumps(bad))
+        with self.assertRaises(m.p.PolicyError): m.descriptor(c['operationId'])
+        filename.write_bytes(original)
+        bad = json.loads(json.dumps(d)); bad['options']['validationProfile']['sourceSha'] = '3'*40
+        bad.pop('operationId'); operation = 'c-'+hashlib.sha256(m.canonical(bad)).hexdigest()
+        bad['operationId'] = operation
+        m.p.atomic_write(self.policy/(operation+'.json'), bad, create=True)
+        with self.assertRaises(m.p.PolicyError): m.descriptor(operation)
+
+    def test_configure_adds_only_non_normal_profile_after_binding(self):
+        script = r'''set -eu
+source "$1/scripts/lib/v5-commercial-release-policy.sh"
+COMMERCIAL_FAILURE_POLICY=user-impact-only; DRY=0; RESTART_EGRESS=0; WITH_DIST=1
+BUILT_RELEASE_SOURCE_COMMIT=$(printf '%040d' 2); ACTIVE_SLOT=B; ACTIVE_PORT=18795
+OC_V5_RELEASE_QUEUE_ID=rq-20261103T000000Z-0123456789ab; CP_CODE_DIGEST=$(printf '%064d' 1)
+ACTIVE_STATE_LOCK_VERSION=1; ACTIVE_STATE_RELEASE=old; ACTIVE_STATE_PREVIOUS_RELEASE=''
+commercial_policy_ship(){ :; }
+validation_scope_bind(){ VALIDATION_SCOPE_JSON=$(cat "$SCOPE_FILE"); }
+commercial_policy_configure
+printf '%s\n' "$CP_CONFIG"
+'''
+        scope = self.scoped_profile(); file = self.root/'saved-scope'
+        for value in [None, scope]:
+            with self.subTest(profile=value):
+                file.write_text(json.dumps(value)); env=os.environ.copy(); env['SCOPE_FILE']=str(file)
+                r=subprocess.run(['bash','-s','--',str(REPO)],input=script,text=True,capture_output=True,env=env)
+                self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+                config=json.loads(r.stdout)
+                if value is None: self.assertNotIn('validationProfile',config)
+                else: self.assertEqual(config['validationProfile'],value)
+
+    def test_required_gates_inherit_original_scope_even_for_predecessor_validation(self):
+        script = r'''set -eu
+source "$1/scripts/lib/v5-commercial-release-policy.sh"
+ACTIVE_PORT=18795; VALIDATION_PROFILE=normal; VALIDATION_SCOPE_JSON=null
+commercial_policy_rmt(){
+  case "$*" in
+    'commercial_policy_py validation-profile') cat "$SCOPE_FILE" ;;
+    'commercial_policy_py source-for-release old') echo 1111111111111111111111111111111111111111 ;;
+    'commercial_policy_py field options.withDist') echo false ;;
+    *) return 79 ;;
+  esac
+}
+validation_scope_restore(){ VALIDATION_SCOPE_JSON="$1"; printf 'RESTORE %s\n' "$1"; }
+smoke(){ echo SMOKE; }
+minimum_functional_core(){ printf 'CORE %s %s\n' "$BUILT_RELEASE_SOURCE_COMMIT" "$VALIDATION_SCOPE_JSON"; return "$CORE_RC"; }
+verify_public_surface(){ echo PUBLIC; }
+knowledge_planet_plugin_advisory_gate(){ KP_PLUGIN_PROMOTE=0; }
+weibo_plugin_advisory_gate(){ WB_PLUGIN_PROMOTE=0; }
+end_planned_maintenance(){ echo END; }
+smoke_sourcemap_sealed(){ echo SOURCEMAP; }
+commercial_policy_required_gates old
+'''
+        scope = self.scoped_profile(); file=self.root/'saved-scope'; file.write_text(json.dumps(scope))
+        for core_rc in [0,1]:
+            env=os.environ.copy(); env.update(SCOPE_FILE=str(file),CORE_RC=str(core_rc))
+            r=subprocess.run(['bash','-s','--',str(REPO)],input=script,text=True,capture_output=True,env=env)
+            self.assertEqual(r.returncode,0 if core_rc == 0 else 79,r.stdout+r.stderr)
+            lines=r.stdout.splitlines()
+            self.assertEqual(json.loads(lines[0].removeprefix('RESTORE ')),scope)
+            self.assertEqual(lines[1],'SMOKE')
+            prefix='CORE '+'1'*40+' '
+            self.assertTrue(lines[2].startswith(prefix)); self.assertEqual(json.loads(lines[2][len(prefix):]),scope)
+            self.assertEqual(lines[3:],['PUBLIC','END','SOURCEMAP'] if core_rc == 0 else [])
+
     def failure(self, authority='applied'):
         return self.action('failure','state',authority,str(self.env),str(self.platform),str(self.live),'test.service')
 
@@ -74,11 +182,13 @@ printf 'held original operation' > "$FIXTURE/marker"
 event(){ printf '%s\n' "$*" >> "$FIXTURE/calls"; }
 commercial_policy_rmt(){
   case "$*" in
+    'commercial_policy_py validation-profile') echo null ;;
     'commercial_policy_py source-for-release new') printf '%040d\n' 2 ;;
     'commercial_policy_py field options.withDist') echo true ;;
     *) return 79 ;;
   esac
 }
+validation_scope_restore(){ [[ "$1" == null ]]; }
 ssh(){ echo abcdef123456; }
 smoke(){ event SMOKE; }
 minimum_functional_core(){ event REAL_TURN_E2E; }
@@ -564,7 +674,7 @@ CP_ROOT="$2"; KL_HOST=fixture
 assert_mutation_lease_alive(){ return 0; }
 ssh(){ shift; bash -c "$*"; }
 commercial_policy_ship
-for f in v5-runtime-release-lib.sh v5-egress-slots.sh lib/v5-commercial-release-policy.sh lib/v5-commercial-release-policy.py lib/v5-release-policy.py; do
+for f in v5-runtime-release-lib.sh v5-egress-slots.sh lib/v5-commercial-release-policy.sh lib/v5-commercial-release-policy.py lib/v5-release-policy.py lib/v5-validation-profile.py; do
   cmp "$SCRIPT_DIR/$f" "$CP_BUNDLE/$f"
 done
 commercial_policy_ship
