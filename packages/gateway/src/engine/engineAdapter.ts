@@ -36,11 +36,11 @@ import type {
 export interface NativeModelHandoffArtifact {
   /** Native, model-authored continuation text already cleaned by the source engine. */
   summaryText: string
-  /** 类型层面允许全部生产引擎;cursor/zcode 当前无原生 compact 导出实现,运行时
-   *  抛 MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE(见各 adapter),字段先行。 */
-  source: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
+  /** 类型层面允许全部生产引擎;cursor/zcode 当前无原生导出实现,运行时抛 UNAVAILABLE。 */
+  source: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
   /** Epoch captured immediately before the native compact trigger. */
   compactStartedAt: number
+  allowHistoryFallback?: boolean
 }
 
 export interface EngineCapabilities {

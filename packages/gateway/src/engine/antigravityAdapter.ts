@@ -40,7 +40,8 @@ import {
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
-import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
+import type { EngineAdapter, EngineCapabilities, EngineTurnRun, NativeModelHandoffArtifact, TurnParams } from './engineAdapter.js'
+import { readLatestAntigravityNativeHandoff, resolveAntigravityOpenClaudeHome, shouldEmitAntigravityCheckpointCompacted } from './antigravityCompaction.js'
 import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
@@ -75,9 +76,7 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 /** Native file operations have no model-generation phase after ACTIVE.
  * Reuse the gateway's existing idle budget from that observed start; do not
  * apply it to commands, MCP, subagents, or the preceding high-effort thought. */
-const BOUNDED_FILE_TOOLS = new Set([
-  'view_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file',
-])
+const BOUNDED_FILE_TOOLS = new Set(['view_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file'])
 /** After `result`, wait this long for the process to exit so trailing
  * stderr (soft-deny / empty-run notices) is read before the turn settles. */
 const RESULT_SETTLE_MS = 5_000
@@ -177,6 +176,7 @@ interface TurnContext {
   errorDetail: string | null
   /** step_index of this launch's own user_input; earlier indices are history. */
   firstOwnStepIndex: number | null
+  compactedStepIndices: Set<number>
   /** error_message seen before this launch's user_input; used only if the run fails. */
   preludeErrorDetail: string | null
   /** This launch's last step was an error_message (1.4.0 streams it without text). */
@@ -285,7 +285,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     permissionModel: 'forced-unattended',
     emitsCallUsage: false,
     emitsToolInputDeltas: false,
-    supportsNativeCompact: false,
+    supportsNativeCompact: true,
     multimodalInput: 'text-only',
   }
 
@@ -359,6 +359,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       interruptReason: null,
       errorDetail: null,
       firstOwnStepIndex: null,
+      compactedStepIndices: new Set(),
       preludeErrorDetail: null,
       trailingErrorStep: false,
       ownErrorStep: false,
@@ -733,7 +734,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       if (message) ctx.errorDetail = message
       else ctx.trailingErrorStep = true
     }
-    // user_input / system_message / checkpoint / unknown (native ask_question,
+    if (type === 'checkpoint') {
+      if (shouldEmitAntigravityCheckpointCompacted({ state, stepIndex, firstOwnStepIndex: ctx.firstOwnStepIndex, emittedStepIndices: ctx.compactedStepIndices })) {
+        ctx.trailingErrorStep = false
+        ctx.params.onEvent({ kind: 'context_compacted', compaction: { engine: 'antigravity', scope: 'native_context', strategy: 'native_summary' } })
+      }
+      return
+    }
+    // user_input / system_message / unknown (native ask_question,
     // invisible in headless mode) carry nothing the product renders.
   }
 
@@ -744,12 +752,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     ctx.sawOutput = true
     if (!ctx.lastWasText) {
-      ctx.assistantSegments.push({
-        index: ctx.assistantSegments.length,
-        text: '',
-        ts: Date.now(),
-        eventOrdinal: ctx.params.nextDurableEventOrdinal?.(),
-      })
+      ctx.assistantSegments.push({ index: ctx.assistantSegments.length, text: '', ts: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() })
     }
     ctx.lastWasText = true
     ctx.assistantText += text
@@ -805,23 +808,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       ctx.toolStartedAt.set(id, Date.now())
       ctx.pendingToolIds.add(id)
       ctx.params.toolUseIdToName.set(id, toolName)
-      const block: OutboundContentBlock = {
-        kind: 'tool_use',
-        blockId: id,
-        toolName,
-        inputJson: structuredClone(inputJson),
-        inputPreview: tool.inputPreview,
-        partial: false,
-      }
+      const block: OutboundContentBlock = { kind: 'tool_use', blockId: id, toolName, inputJson: structuredClone(inputJson), inputPreview: tool.inputPreview, partial: false }
       ctx.params.onEvent({ kind: 'block', block })
-      ctx.params.onEvent({
-        kind: 'tool_use_detected',
-        tool: {
-          name: toolName,
-          id,
-          input: recordOf(inputJson) ? structuredClone(inputJson) as Record<string, any> : {},
-        },
-      })
+      const detectedInput = recordOf(inputJson) ? structuredClone(inputJson) as Record<string, any> : {}
+      ctx.params.onEvent({ kind: 'tool_use_detected', tool: { name: toolName, id, input: detectedInput } })
     }
     if (state !== 'DONE' && state !== 'ERROR') return
     const tool = ctx.tools.get(id)!
@@ -1133,6 +1123,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   waitForOutputDrain(): Promise<void> { return this.drain }
+  async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    const compactStartedAt = Date.now()
+    const empty: NativeModelHandoffArtifact = { summaryText: '', source: 'antigravity', compactStartedAt, allowHistoryFallback: true }
+    return this.nativeId ? (await readLatestAntigravityNativeHandoff(resolveAntigravityOpenClaudeHome(), this.nativeId, compactStartedAt)) ?? empty : empty
+  }
   get nativeSessionId(): string | null { return this.nativeId }
   isResumeIdCompatible(sessionId: string): boolean { return CONVERSATION_ID_RE.test(sessionId) }
   clearSessionId(): void { this.nativeId = null }

@@ -865,13 +865,13 @@ export async function prepareModelSwitch(
               }
             : undefined
     }
-    if (!artifact?.summaryText?.trim())
+    const summaryText = artifact?.summaryText?.trim()
+    if (!summaryText && !artifact?.allowHistoryFallback)
       throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE')
-    if (artifact.summaryText.length > NATIVE_MODEL_HANDOFF_MAX_CHARS) {
+    if (summaryText && artifact!.summaryText.length > NATIVE_MODEL_HANDOFF_MAX_CHARS)
       throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_TOO_LARGE')
-    }
     if (session._modelSwitchTransition !== transition) throw new Error('MODEL_SWITCH_SUPERSEDED')
-    transition.summaryText = artifact.summaryText.trim()
+    if (summaryText) transition.summaryText = summaryText
     transition.expiresAt = Date.now() + NATIVE_MODEL_SWITCH_TTL_MS
     transition.state = 'prepared'
     return { sourceModel, targetModel }
