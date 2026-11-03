@@ -8891,7 +8891,7 @@ wait $!
     // ① 五个豁免 env 全部登记进注册表,且各有还债 lane。
     assert.match(
       source,
-      /GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification"/,
+      /GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification grok-live-validation"/,
       '所有豁免 key 必须全在单一注册表里(新增豁免 env/旗标必须同步登记)',
     )
     for (const [key, env] of [
