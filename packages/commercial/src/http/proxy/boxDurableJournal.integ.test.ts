@@ -1785,6 +1785,54 @@ test("first Box failure survives cleanup/restart with exact, read-only fallback 
     const lookup = { uid: 3n, canonicalModel: model, canonicalBody: fallback, trustedAuthority: authority };
     const stoppedProof = { revision: 2, runNonce: identity.runNonce, leaseEpoch: identity.leaseEpoch,
       keeperPid: 101, cliPid: 102, reason: "worker_failed", workerExitCode: 1 };
+    // Exercise the new evidence through real SQL and the restarted reader.
+    // Remove each isolated row before the existing same-alias guard cases.
+    for (const evidence of [
+      { code: "BOX_TOOL_INPUT_INVALID", phase: "first_round",
+        diagnostic: { branch: "tool_input_json", observedBytes: 17 } },
+      { code: "BOX_TOOL_ORDER_INVALID", phase: "continuation",
+        diagnostic: { branch: "tool_event_order", eventType: "content_block_stop",
+          stateFlags: 17, blockIndex: 0 } },
+      { code: "BOX_EXEC_HTTP_417", phase: "proxy_stream",
+        diagnostic: { branch: "exec_http", upstreamStatus: 417 } },
+      { code: "BOX_CLI_COMPACT_BOUNDARY_INVALID", phase: "first_round",
+        diagnostic: { branch: "compact_boundary" } },
+    ] as const) {
+      const diagnosticIdentity = { ...identity, requestId: `diagnostic-${evidence.code}` };
+      const diagnosticCtx = { ...base,
+        boxState: evidence.code === "BOX_EXEC_HTTP_417" ? "unknown" : "running" };
+      await put(diagnosticIdentity.requestId, diagnosticCtx);
+      const observed = await journal.recordFirstFailure({ ...diagnosticIdentity, ...evidence });
+      assert.ok(observed);
+      assert.deepEqual(observed, { version: 1, ...evidence, observedAtMs: observed.observedAtMs });
+      assert.ok(observed.observedAtMs > 0);
+      const saved = await query("SELECT state,ctx,final_credits FROM request_finalize_journal WHERE request_id=$1",
+        [diagnosticIdentity.requestId]);
+      assert.deepEqual(saved.rows, [{ state: "inflight", final_credits: null,
+        ctx: { ...diagnosticCtx, boxFirstFailure: observed } }],
+      "diagnostic persistence grants no state, proof, capsule or launch authority");
+      const diagnosticRestarted = new BoxDurableJournal(sameConnection);
+      if (evidence.code === "BOX_EXEC_HTTP_417") {
+        const pending = await diagnosticRestarted.findReadOnlyFallback(lookup);
+        assert.equal(pending?.kind, "identity");
+        if (pending?.kind !== "identity") assert.fail("unknown attempt must remain observable");
+        assert.equal(pending.identity.requestId, diagnosticIdentity.requestId);
+        assert.equal(pending.identity.state, "unknown");
+        assert.equal(pending.identity.messagePointer, undefined,
+          "HTTP 417 evidence cannot create a ready replay capsule");
+        assert.equal(await diagnosticRestarted.findFallbackFailure(lookup), null);
+        assert.deepEqual((await query("SELECT state,ctx,final_credits FROM request_finalize_journal WHERE request_id=$1",
+          [diagnosticIdentity.requestId])).rows, saved.rows);
+      }
+      await query(`UPDATE request_finalize_journal SET state='aborted',failure_code='STREAM_FAILED',final_credits=0,
+        ctx=ctx || $2::jsonb WHERE request_id=$1`, [diagnosticIdentity.requestId, JSON.stringify({
+        boxState: "failed_stopped", boxStopOutcome: "failed", boxTerminalProof: stoppedProof,
+        boxRemoteCleanup: "done" })]);
+      assert.deepEqual(await diagnosticRestarted.findFallbackFailure(lookup),
+        { ...observed, requestId: diagnosticIdentity.requestId },
+        "all diagnostic fields survive restart and require separate terminal proof");
+      await query("DELETE FROM request_finalize_journal WHERE request_id=$1", [diagnosticIdentity.requestId]);
+    }
     await put(identity.requestId);
     const first = await journal.recordFirstFailure({ ...identity,
       code: "BOX_CLI_UPSTREAM_REFUSED", phase: "first_round",

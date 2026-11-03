@@ -8,6 +8,8 @@ export const BOX_FAILURE_CODES = [
   "BOX_SPOOL_POLL_ABORTED", "BOX_SPOOL_POLL_TIMEOUT", "BOX_EXEC_TIMEOUT",
   "BOX_SPOOL_WORKER_FAILED", "BOX_SPOOL_KEEPER_STOPPED", "BOX_SPOOL_TERMINAL_INCOMPLETE",
   "BOX_TOOL_TERMINAL_UNPROVEN",
+  "BOX_TOOL_INPUT_INVALID", "BOX_TOOL_ORDER_INVALID", "BOX_EXEC_HTTP_417",
+  "BOX_CLI_COMPACT_BOUNDARY_INVALID",
 ] as const;
 export type BoxFailureCode = typeof BOX_FAILURE_CODES[number];
 export type BoxFailurePhase = "first_round" | "continuation" | "proxy_stream" | "remote_terminal";
@@ -15,7 +17,13 @@ export type BoxFailurePhase = "first_round" | "continuation" | "proxy_stream" | 
 export interface BoxFailureDiagnostic {
   branch?: "synthetic_api_error" | "missing_snapshot" | "snapshot_coverage"
     | "snapshot_content" | "echo_content" | "echo_error_bit" | "unsupported_shape"
-    | "worker_terminal" | "terminal_without_message";
+    | "worker_terminal" | "terminal_without_message"
+    | "tool_input_json" | "tool_input_conflict" | "tool_event_order"
+    | "compact_boundary" | "resume_publish" | "exec_http";
+  eventType?: "message_start" | "content_block_start" | "content_block_delta"
+    | "content_block_stop" | "message_delta" | "message_stop";
+  /** Decoder state only: started=1, next-message=2, stopped=4, stop-reason=8, active-block=16. */
+  stateFlags?: number;
   upstreamTag?: "authentication_failed" | "rate_limit" | "invalid_request"
     | "overloaded_error" | "api_error" | "other";
   upstreamStatus?: number;
@@ -45,13 +53,16 @@ const phases = new Set<BoxFailurePhase>(["first_round", "continuation", "proxy_s
 const codes: ReadonlySet<string> = new Set(BOX_FAILURE_CODES);
 const branches = new Set(["synthetic_api_error", "missing_snapshot", "snapshot_coverage",
   "snapshot_content", "echo_content", "echo_error_bit", "unsupported_shape",
-  "worker_terminal", "terminal_without_message"]);
+  "worker_terminal", "terminal_without_message", "tool_input_json", "tool_input_conflict",
+  "tool_event_order", "compact_boundary", "resume_publish", "exec_http"]);
+const eventTypes = new Set(["message_start", "content_block_start", "content_block_delta",
+  "content_block_stop", "message_delta", "message_stop"]);
 const tags = new Set(["authentication_failed", "rate_limit", "invalid_request",
   "overloaded_error", "api_error", "other"]);
 const blockTypes = new Set(["text", "image", "tool_use", "tool_result", "thinking", "missing", "unknown"]);
 const diagnosticKeys = new Set(["branch", "upstreamTag", "upstreamStatus", "blockIndex", "expectedBlocks", "observedBlocks",
   "expectedType", "observedType", "expectedBytes", "observedBytes", "expectedSha256",
-  "observedSha256", "hashOnly"]);
+  "observedSha256", "hashOnly", "eventType", "stateFlags"]);
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -77,6 +88,8 @@ function validDiagnostic(value: unknown): value is BoxFailureDiagnostic {
   if (!record(value) || Object.keys(value).some((key) => !diagnosticKeys.has(key))) return false;
   for (const [key, item] of Object.entries(value)) {
     if (key === "branch" && (typeof item !== "string" || !branches.has(item))) return false;
+    if (key === "eventType" && (typeof item !== "string" || !eventTypes.has(item))) return false;
+    if (key === "stateFlags" && (!Number.isSafeInteger(item) || Number(item) < 0 || Number(item) > 31)) return false;
     if (key === "upstreamTag" && (typeof item !== "string" || !tags.has(item))) return false;
     if ((key === "expectedType" || key === "observedType")
       && (typeof item !== "string" || !blockTypes.has(item))) return false;
@@ -110,6 +123,8 @@ export function boxFailureFromError(error: unknown, phase: BoxFailurePhase): Box
   const code = isBoxFailureCode(error.code) ? error.code
     : isBoxFailureCode(error.message) ? error.message : null;
   if (!code) return null;
-  const diagnostic = validDiagnostic(error.boxFailureDiagnostic) ? error.boxFailureDiagnostic : undefined;
+  const diagnostic = validDiagnostic(error.boxFailureDiagnostic) ? error.boxFailureDiagnostic
+    : code === "BOX_EXEC_HTTP_417" ? { branch: "exec_http" as const, upstreamStatus: 417 }
+      : code === "BOX_CLI_COMPACT_BOUNDARY_INVALID" ? { branch: "compact_boundary" as const } : undefined;
   return { code, phase, ...(diagnostic ? { diagnostic: { ...diagnostic } } : {}) };
 }
