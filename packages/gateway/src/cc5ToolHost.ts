@@ -4,7 +4,7 @@ import { constants, closeSync, fstatSync, openSync, readFileSync } from 'node:fs
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
-import { assertCc5ToolResult, type Cc5ToolResult } from './cc5NativeTool.js'
+import { assertCc5ToolResult, boundCc5ToolResult, type Cc5ToolResult } from './cc5NativeTool.js'
 
 export class Cc5ToolHost {
   private readonly child
@@ -81,7 +81,7 @@ export class Cc5ToolHost {
     const value = await this.request('tools/call', { name: name.slice('mcp__ocbridge__'.length), arguments: args,
       _meta: { 'claudecode/toolUseId': identity.toolUseId, 'openclaude/nativeSessionId': identity.nativeSessionId,
         'openclaude/turnKey': identity.turnKey } })
-    const result = { content: value.content, isError: value.isError === true }
+    const result = boundCc5ToolResult({ content: value.content, isError: value.isError === true })
     assertCc5ToolResult(result)
     return structuredClone(result)
   }

@@ -5,7 +5,8 @@ import { dirname, join } from 'node:path'
 import { type AuthorityKeyring, assertLeaseMatchesAuthority, verifyAuthority, verifyTurnLease } from '@openclaude/protocol'
 import { assertCc5BindingScope, cc5AuthorityMatchesBinding, type Cc5BridgeBinding } from './cc5BridgePort.js'
 import { exclusiveRecord, privateDir, readRecord, syncDir, type Cc5ObservedTool, type Cc5ToolRequest } from './cc5FixedTool.js'
-import { assertCc5ToolResult, cc5ToolInputSha256, cc5ToolScopeHash, validateCc5NativeToolInput,
+import { CC5_TOOL_RECEIPT_MAX_BYTES, assertCc5ToolResult, boundCc5ToolResult, cc5ToolInputSha256,
+  cc5ToolScopeHash, validateCc5NativeToolInput,
   type Cc5ToolAdmission, type Cc5ToolReceipt, type Cc5ToolResult } from './cc5NativeTool.js'
 
 export class Cc5NativeToolExecutor {
@@ -43,7 +44,7 @@ export class Cc5NativeToolExecutor {
     privateDir(path)
     const completed = join(path, 'receipt.json')
     if (existsSync(completed)) {
-      const receipt = readRecord(completed) as Cc5ToolReceipt
+      const receipt = readRecord(completed, CC5_TOOL_RECEIPT_MAX_BYTES) as Cc5ToolReceipt
       if (receipt.version !== 2 || receipt.scopeHash !== scopeHash) reject()
       assertCc5ToolResult(receipt.result)
       return receipt
@@ -57,7 +58,7 @@ export class Cc5NativeToolExecutor {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('CC5_NATIVE_TOOL_EXECUTION_UNKNOWN')
       throw error
     }
-    const result = await this.executeTool(request)
+    const result = boundCc5ToolResult(await this.executeTool(request))
     assertCc5ToolResult(result)
     const receipt: Cc5ToolReceipt = {
       version: 2, scopeHash, commandId, dockerId: request.dockerId, containerDbId: request.containerDbId,

@@ -10,6 +10,7 @@ import type { Message } from '../types/message.js'
 export const CC5_TOOL_NAMES = ['Read', 'Edit', 'Bash'] as const
 type ToolName = (typeof CC5_TOOL_NAMES)[number]
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
+/** Must stay equal to packages/gateway/src/cc5NativeTool.ts CC5_TOOL_RESULT_MAX_BYTES. */
 const MAX_RESULT_BYTES = 131072
 
 function requireHost(value: unknown): asserts value {

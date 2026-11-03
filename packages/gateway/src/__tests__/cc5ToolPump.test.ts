@@ -146,7 +146,8 @@ function receiptPath(f: ReturnType<typeof fixture>): string {
 }
 function effectPath(f: ReturnType<typeof fixture>): string { return join(f.root, 'local-effect') }
 async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
-  options: { loseAck?: boolean; duplicate?: boolean; executionUnknown?: boolean } = {}) {
+  options: { loseAck?: boolean; duplicate?: boolean; executionUnknown?: boolean;
+    result?: Cc5ToolResult } = {}) {
   const socketPath = relative(process.cwd(), join(f.root, 's'))
   const controller = new AbortController()
   const observation = new Cc5ToolObservation(f.binding.operationId)
@@ -198,7 +199,7 @@ async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
       effects++
       writeFileSync(effectPath(f), 'one local effect', { flag: 'wx', mode: 0o600 })
       if (options.executionUnknown) throw new Error('fixture effect occurred but completion is unknown')
-      return { content: [{ type: 'text', text: 'one local effect' }], isError: false }
+      return options.result ?? { content: [{ type: 'text', text: 'one local effect' }], isError: false }
     },
   })
   // Attach a handler now so rejected negative fixtures never emit unhandled rejection.
@@ -471,3 +472,60 @@ test(
     }
   },
 )
+
+
+const RESULT_LIMIT = 128 * 1024
+/** Wire bytes for these single-text-block fixtures: key order is already sorted. */
+const resultBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value))
+
+test('a 100KiB tool result is journaled and delivered instead of breaking the pump', { timeout: 5000 }, async () => {
+  const f = fixture()
+  const text = 'x'.repeat(100 * 1024)
+  const produced: Cc5ToolResult = { content: [{ type: 'text', text }], isError: false }
+  const h = await harness(f, { request: f.request, admission: f.admission }, { result: produced })
+  try {
+    h.observation.ingest(original(f))
+    // A rejected pump shows up here instead of waiting for a poll that never comes.
+    const outcome = await Promise.race([
+      h.idlePolled.then(() => 'idle'),
+      h.running.then(() => 'settled', () => 'failed'),
+    ])
+    assert.equal(outcome, 'idle')
+    assert.deepEqual(h.counts(), { pollCount: 2, resultCount: 1, effects: 1 })
+    assert.deepEqual(h.receipt()!.result, produced)
+    assert.deepEqual(JSON.parse(readFileSync(receiptPath(f), 'utf8')), h.receipt())
+  } finally {
+    await h.close()
+    f.cleanup()
+  }
+})
+
+test('an oversized tool result is truncated with its original byte count, never fatal', { timeout: 5000 }, async () => {
+  const f = fixture()
+  const produced: Cc5ToolResult = { content: [{ type: 'text', text: 'y'.repeat(140 * 1024) }], isError: true }
+  const producedBytes = resultBytes(produced)
+  assert.ok(producedBytes > RESULT_LIMIT)
+  const h = await harness(f, { request: f.request, admission: f.admission }, { result: produced, duplicate: true })
+  try {
+    h.observation.ingest(original(f))
+    const outcome = await Promise.race([
+      h.idlePolled.then(() => 'idle'),
+      h.running.then(() => 'settled', () => 'failed'),
+    ])
+    assert.equal(outcome, 'idle')
+    // The duplicate delivery replays the journaled receipt through readRecord.
+    assert.deepEqual(h.counts(), { pollCount: 3, resultCount: 2, effects: 1 })
+    const receipt = h.receipt()!
+    assert.equal(receipt.result.isError, true)
+    assert.equal(receipt.result.content.length, 1)
+    assert.equal(receipt.result.content[0].type, 'text')
+    const text = (receipt.result.content[0] as { type: string; text: string }).text
+    assert.ok(text.startsWith('y'.repeat(4096)))
+    assert.ok(text.endsWith(`[cc5 tool result truncated: original ${producedBytes} bytes]`))
+    assert.ok(resultBytes(receipt.result) <= RESULT_LIMIT)
+    assert.deepEqual(JSON.parse(readFileSync(receiptPath(f), 'utf8')), receipt)
+  } finally {
+    await h.close()
+    f.cleanup()
+  }
+})

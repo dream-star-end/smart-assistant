@@ -97,7 +97,7 @@ export function privateDir(path: string): void {
   const st = lstatSync(path)
   requireTool(st.isDirectory() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0)
 }
-export function readRecord(path: string): unknown {
+export function readRecord(path: string, maxBytes = 131072): unknown {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
     const st = fstatSync(fd)
@@ -107,7 +107,7 @@ export function readRecord(path: string): unknown {
         st.uid === process.getuid?.() &&
         (st.mode & 0o077) === 0 &&
         st.size > 0 &&
-        st.size <= 131072,
+        st.size <= maxBytes,
     )
     return JSON.parse(readFileSync(fd, 'utf8'))
   } finally {
