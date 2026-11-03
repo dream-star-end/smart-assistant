@@ -274,6 +274,8 @@ assert_overrides_no_remove_keys() {
 }
 
 CP_USER_IMPACT_EVIDENCE=""
+VALIDATION_PROFILE="normal"; VALIDATION_AUTHORIZATION_REF=""
+VALIDATION_SCOPE_JSON="null"; VALIDATION_SCOPE_RESTORED=0
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0; HOT_CONFIG=0; HOT_CONFIG_FORCE=0
 DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
@@ -302,6 +304,8 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
+    --validation-profile=*) VALIDATION_PROFILE="${arg#*=}" ;;
+    --validation-authorization-ref=*) VALIDATION_AUTHORIZATION_REF="${arg#*=}" ;;
     --resume-built-release=*) RESUME_BUILT_RELEASE="${arg#*=}" ;;
     --hot-config) HOT_CONFIG=1 ;;
     --hot-config-force) HOT_CONFIG=1; HOT_CONFIG_FORCE=1 ;;
@@ -379,6 +383,21 @@ for arg in "$@"; do
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done
+# A model exclusion is an explicit per-batch CLI scope, never an inherited global switch.
+case "$VALIDATION_PROFILE" in
+  normal)
+    [[ -z "$VALIDATION_AUTHORIZATION_REF" ]] || { echo '✗ validation authorization requires an explicit profile' >&2; exit 2; }
+    ;;
+  skip-grok)
+    [[ "$MODE" == deploy && "$WITH_DIST" == 1 && -z "$RESUME_BUILT_RELEASE" ]] || { echo '✗ skip-grok requires ordinary --with-dist; recovery inherits its saved scope' >&2; exit 2; }
+    [[ ${#VALIDATION_AUTHORIZATION_REF} -ge 8 && ${#VALIDATION_AUTHORIZATION_REF} -le 512 && ! "$VALIDATION_AUTHORIZATION_REF" =~ [[:cntrl:]] ]] || { echo '✗ skip-grok requires a traceable authorization reference' >&2; exit 2; }
+    [[ -z "${V5_TURN_MODELS+x}" && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_SMOKE_E2E:-1}" == 1 && "${V5_CANARY_REQUIRE_COST:-1}" == 1       && "$ALLOW_UNVERIFIED_CI" == 0 && "$ALLOW_LEGACY_MANIFEST_MISSING" == 0 && "$HOT_CONFIG" == 0       && "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 0 && "${OC_V5_SKIP_MUTATION_LEASE:-0}" == 0 && -z "${OC_CAPMATRIX_COMPAT:-}" ]] || {
+      echo '✗ skip-grok cannot combine model overrides or any other gate/lease waiver' >&2; exit 2;
+    }
+    ;;
+  *) echo "✗ unknown validation profile: $VALIDATION_PROFILE" >&2; exit 2 ;;
+esac
+
 if [[ -n "$EMERGENCY_INCIDENT$EMERGENCY_APPROVAL$EMERGENCY_COMMIT" ]]; then
   [[ -n "$EMERGENCY_INCIDENT" && -n "$EMERGENCY_APPROVAL" && -n "$EMERGENCY_COMMIT" ]] \
     || { echo "✗ emergency containment 必须同时提供 incident/approval/exact commit" >&2; exit 2; }
@@ -2663,12 +2682,13 @@ clear_deploy_recovery_marker_after_stable_recover() {
 # 【红线】恢复 lane(abort/rollback/recover/reclaim/smoke/hide-luna/emergency containment)
 # 永不被本机制阻断 —— 回退路径永远优先于任何新门。
 GATE_WAIVER_DIR="$RELEASES_ROOT/.gate-waivers"
-GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification"
+GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification grok-live-validation"
 
 # 每个 key 的「还债 lane」= 会真跑该门的 mode。不在此列的普通写 lane 一律被阻断。
 gate_waiver_repay_modes() { # <key>
   case "$1" in
     smoke-turn)           echo "deploy dist canary promote finalize" ;;
+    grok-live-validation) echo "deploy dist canary finalize" ;;
     e2e-journey)          echo "deploy dist canary finalize" ;;
     canary-turn-cost)     echo "deploy dist canary promote finalize" ;;
     finalize-egress-gate) echo "canary promote finalize" ;;
@@ -2682,6 +2702,7 @@ gate_waiver_repay_modes() { # <key>
 gate_waiver_env_active() { # <key>
   case "$1" in
     smoke-turn)           [[ "${V5_SMOKE_TURN:-1}" != 1 ]] ;;
+    grok-live-validation) [[ "$VALIDATION_PROFILE" == skip-grok ]] ;;
     e2e-journey)          [[ "${V5_SMOKE_E2E:-1}" != 1 ]] ;;
     canary-turn-cost)     [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] ;;
     finalize-egress-gate) [[ "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 1 ]] ;;
@@ -2768,6 +2789,10 @@ assert_no_open_gate_waivers() {
       echo "  先走能还债的 lane($modes)让门真跑一次;回退 lane(abort/rollback/recover)不受本闸影响。" >&2
       blocked=1; continue
     fi
+    if { [[ "$VALIDATION_PROFILE" == skip-grok && "$key" =~ ^(smoke-turn|e2e-journey|canary-turn-cost)$ ]]; }       || { [[ "$key" == grok-live-validation ]] && ! validation_scope_grok_matrix_planned; }; then
+      echo "✗ current validation scope cannot repay existing complete-gate debt key=$key" >&2
+      blocked=1; continue
+    fi
     if gate_waiver_env_active "$key"; then
       echo "✗ 未偿还的门禁豁免债务 key=$key,而本次调用仍带着同一豁免 env —— 禁止连环跳过。" >&2
       echo "  去掉豁免 env 让门真跑一次即自动销账。" >&2
@@ -2794,12 +2819,76 @@ record_declared_gate_waivers() {
       echo "  · 忽略与本 lane 无关的豁免声明 key=$key(本 lane=$MODE 不跑该门;它只在 $modes 生效)"
       continue
     fi
-    record_gate_waiver "$key" "lane 入口声明豁免(mode=$MODE)" || rc=1
+    if [[ "$key" == grok-live-validation ]]; then
+      validation_scope_bind || return 1
+      validation_scope_receipt declared "" not-run not-run || return 1
+      record_gate_waiver "$key" "SKIPPED by explicit batch scope $VALIDATION_SCOPE_JSON" || rc=1
+    else
+      record_gate_waiver "$key" "lane 入口声明豁免(mode=$MODE)" || rc=1
+    fi
   done
   [[ "$rc" == 0 ]] || {
     echo "✗ 门禁豁免债务登记失败 —— 拒绝以「无痕豁免」的方式发布。去掉豁免 env 让门真跑,或修复 $KL_HOST 记账通路。" >&2
     return 1
   }
+}
+
+# Normal runs retain their exact historical policy shape. A scope is bound to the
+# official pinned source and real mutation owner; recovery restores the saved scope.
+validation_scope_preflight() { # pinned source (read only)
+  [[ "$VALIDATION_PROFILE" == skip-grok ]] || return 0
+  python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" normalize \
+    --profile "$VALIDATION_PROFILE" --authorization-ref "$VALIDATION_AUTHORIZATION_REF" \
+    --queue-id "${OC_V5_RELEASE_QUEUE_ID:-}" --source-sha "$1" >/dev/null
+}
+validation_scope_restore() { # JSON read from the verified operation descriptor
+  VALIDATION_SCOPE_JSON="$(printf '%s' "$1" | python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" validate)" || return 1
+  VALIDATION_PROFILE="$(jq -r '.profile // "normal"' <<<"$VALIDATION_SCOPE_JSON")"
+  VALIDATION_AUTHORIZATION_REF="$(jq -r '.authorizationRef // ""' <<<"$VALIDATION_SCOPE_JSON")"
+  VALIDATION_SCOPE_RESTORED=1
+}
+validation_scope_bind() {
+  if [[ "$VALIDATION_SCOPE_RESTORED" == 1 ]]; then
+    printf '%s' "$VALIDATION_SCOPE_JSON" | python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" validate >/dev/null
+    return $?
+  fi
+  [[ "$VALIDATION_PROFILE" == skip-grok ]] || { VALIDATION_SCOPE_JSON=null; return 0; }
+  local sha operation
+  "$RELEASE_QUEUE_SCRIPT" check --id "${OC_V5_RELEASE_QUEUE_ID:-}" >/dev/null || return 1
+  sha="$("$RELEASE_QUEUE_SCRIPT" pinned-sha --id "${OC_V5_RELEASE_QUEUE_ID:-}")" || return 1
+  [[ "${BUILT_RELEASE_SOURCE_COMMIT:-$sha}" == "$sha" ]] || { echo '✗ validation scope source differs from built candidate' >&2; return 1; }
+  operation="${MUTATION_DEPLOY_ID:-}"
+  [[ "$DRY" == 1 ]] && operation=dry-run-only
+  [[ -n "$operation" ]] || { echo '✗ validation scope lacks actual operation owner' >&2; return 1; }
+  VALIDATION_SCOPE_JSON="$(python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" normalize \
+    --profile "$VALIDATION_PROFILE" --authorization-ref "$VALIDATION_AUTHORIZATION_REF" \
+    --queue-id "${OC_V5_RELEASE_QUEUE_ID:-}" --source-sha "$sha" --operation-id "$operation")" || return 1
+}
+validation_scope_grok_matrix_planned() {
+  [[ "$VALIDATION_PROFILE" == normal && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_SMOKE_E2E:-1}" == 1 ]] || return 1
+  local model
+  for model in ${V5_TURN_MODELS:-grok-build deepseek-v4-flash}; do [[ "$model" != grok-build ]] || return 0; done
+  return 1
+}
+validation_scope_clear_repaid() {
+  # Called only after BOTH complete matrix and journey actually succeeded.
+  validation_scope_grok_matrix_planned && clear_gate_waiver grok-live-validation
+  return 0
+}
+validation_scope_receipt() { # phase, release under test, actual matrix/journey status
+  [[ "$VALIDATION_PROFILE" == skip-grok ]] || return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] validation scope $1 (Grok SKIPPED)"; return 0; }
+  local payload encoded
+  assert_mutation_lease_alive validation-scope-receipt || return 86
+  payload="$(jq -cn --argjson scope "$VALIDATION_SCOPE_JSON" --arg operation "${MUTATION_DEPLOY_ID:-}" \
+    --arg phase "$1" --arg release "$2" --arg turn "$3" --arg journey "$4" \
+    '{schemaVersion:1,executingDeploymentId:$operation,scope:$scope,phase:$phase,releaseUnderTest:$release,
+      grokMatrix:"SKIPPED",grokJourney:"SKIPPED",deepseekMatrix:$turn,deepseekJourney:$journey}')" || return 1
+  encoded="$(printf '%s' "$payload" | base64 -w0)" || return 1
+  ssh "$KL_HOST" python3 - "$RELEASES_ROOT/.validation-scopes" "$MUTATION_DEPLOY_ID" \
+    "$PRODUCTION_MUTATION_LOCK" "${MUTATION_ADMISSION_NONCE:-}" "$encoded" \
+    <"$SCRIPT_DIR/lib/v5-validation-receipt.py" || return 1
+  assert_mutation_lease_alive validation-scope-receipt || return 86
 }
 
 # ── 传统 deploy/dist/rollback 的严格状态快照 ──
@@ -6503,7 +6592,29 @@ build_runtime_release() {
 # 激活提交的核心健康门(单一权威,R4-M2):正常激活与 emergency 激活**同强度**,
 # 恒含 sessionsDb=ok(数据库失联时不许提交任何 tuple history)。
 hotcfg_core_smoke_cmd() {
-  printf '%s' 'hz=""; for i in $(seq 1 15); do hz=$(curl -fsS http://127.0.0.1:'"$ACTIVE_PORT"'/healthz 2>/dev/null||true); [ -n "$hz" ] && break; sleep 2; done; printf "%s" "$hz" | grep -q "\"ok\":true" && printf "%s" "$hz" | grep -q "\"channel\":\"v5\"" && printf "%s" "$hz" | grep -q "\"sessionsDb\":\"ok\""'
+  printf '_oc_core_port=%q\n' "$ACTIVE_PORT"
+  cat <<'CORE_SMOKE'
+_oc_core_deadline=$(( $(date +%s) + 90 ))
+_oc_core_ready=0; _oc_core_curl_rc=0; _oc_core_http=000; _oc_core_body=''
+while [ "$(date +%s)" -lt "$_oc_core_deadline" ]; do
+  _oc_core_curl_rc=0
+  _oc_core_reply="$(curl -fsS --connect-timeout 1 --max-time 2 --write-out $'\n%{http_code}' "http://127.0.0.1:$_oc_core_port/healthz" 2>/dev/null)" || _oc_core_curl_rc=$?
+  _oc_core_http="${_oc_core_reply##*$'\n'}"
+  _oc_core_body="${_oc_core_reply%$'\n'*}"
+  if [ "$_oc_core_curl_rc" -eq 0 ] && printf '%s' "$_oc_core_body" | jq -e '.ok==true and .channel=="v5" and .deps.sessionsDb=="ok"' >/dev/null 2>&1; then
+    _oc_core_ready=1; break
+  fi
+  sleep 2
+done
+if [ "$_oc_core_ready" -eq 1 ]; then
+  printf 'core health readiness passed: port=%s\n' "$_oc_core_port" >&2
+else
+  [[ "$_oc_core_http" =~ ^[0-9]{3}$ ]] || _oc_core_http=unknown
+  _oc_core_safe="$(printf '%s' "$_oc_core_body" | jq -c '{ok:(.ok==true),channel:(if .channel=="v5" then "v5" else "unexpected" end),deps:{pg:(if .deps.pg=="ok" then "ok" else "not-ok" end),redis:(if .deps.redis=="ok" then "ok" else "not-ok" end),sessionsDb:(if .deps.sessionsDb=="ok" then "ok" else "not-ok" end)}}' 2>/dev/null)" || _oc_core_safe='{"json":"invalid-or-empty"}'
+  printf 'core health readiness failed: port=%s curl_rc=%s http=%s last=%s\n' "$_oc_core_port" "$_oc_core_curl_rc" "$_oc_core_http" "$_oc_core_safe" >&2
+  false
+fi
+CORE_SMOKE
 }
 
 # 把 deploy_state release CAS 作为 hotcfg saga 的 commit/revert 钩子。命令在 kl-mirror 的
@@ -7378,7 +7489,13 @@ smoke_turn_matrix() { # <pinned master release> [port] [lane]
     record_gate_waiver canary-turn-cost "V5_CANARY_REQUIRE_COST=0 关闭了真 turn 的计费到账断言(mode=$MODE)" || return 1
   fi
   models="${V5_TURN_MODELS:-$V5_TURN_ENGINE_MATRIX_DEFAULT}"
-  echo "── 双引擎真 turn 矩阵(models=$models,port=$port,lane=$lane)──"
+  if [[ "$VALIDATION_PROFILE" == skip-grok ]]; then
+    [[ -z "${V5_TURN_MODELS+x}" ]] || { echo '✗ scoped matrix rejects ambient model override' >&2; return 1; }
+    models=deepseek-v4-flash
+    echo "── batch validation profile=skip-grok: Grok matrix SKIPPED; DeepSeek true turn required(port=$port,lane=$lane)──"
+  else
+    echo "── 双引擎真 turn 矩阵(models=$models,port=$port,lane=$lane)──"
+  fi
   for model in $models; do
     cost_evidence_mode=live
     if [[ ( "$lane" == canary-ready || "$lane" == promote-candidate ) && "$model" == deepseek-v4-flash ]]; then
@@ -7389,9 +7506,13 @@ smoke_turn_matrix() { # <pinned master release> [port] [lane]
       return 1
     }
   done
-  clear_gate_waiver smoke-turn
-  [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] || clear_gate_waiver canary-turn-cost
-  echo "  ✓ 双引擎真 turn 矩阵全部通过($models)"
+  if [[ "$VALIDATION_PROFILE" == normal ]]; then
+    clear_gate_waiver smoke-turn
+    [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] || clear_gate_waiver canary-turn-cost
+    echo "  ✓ 双引擎真 turn 矩阵全部通过($models)"
+  else
+    echo '  ✓ DeepSeek true turn passed; Grok matrix SKIPPED by recorded batch scope'
+  fi
 }
 
 # 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。背景:「点击添加附件无反应」
@@ -7428,13 +7549,18 @@ smoke_e2e_journey() { # [port]
   fi
   echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送,remote port=$port)──"
   # 外层只作最终失控保护；脚本内 J1-J4 总预算 240s、J5 独立 180s，另留 30s 清理余量。
-  if ! V5_E2E_REMOTE_PORT="$port" timeout 510 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
+  local -a journey_args=()
+  if [[ "$VALIDATION_PROFILE" == skip-grok ]]; then
+    journey_args+=("--validation-scope=$(printf '%s' "$VALIDATION_SCOPE_JSON" | base64 -w0)")
+    echo '  · Grok journey SKIPPED; full DeepSeek J1–J5 required by recorded batch scope'
+  fi
+  if ! V5_E2E_REMOTE_PORT="$port" timeout 510 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs" "${journey_args[@]}"; then
     echo "✗✗ E2E 旅程门失败:用户可感知路径疑似回归(登录/附件/目标/发送其一)。" >&2
     echo "   核查失败截图(/tmp/e2e-journey-fail-*.png);本门已进补偿链,调用方会走对称回滚/abort。" >&2
     echo "   确认假阳性则修 journey 脚本断言并登记;紧急放行用 V5_SMOKE_E2E=0(会登记 durable debt)。" >&2
     return 1
   fi
-  clear_gate_waiver e2e-journey   # 门真跑通过 → 自动销账
+  [[ "$VALIDATION_PROFILE" != normal ]] || clear_gate_waiver e2e-journey   # Full original gate only
 }
 
 # ══════════ 最小功能核(2026-07-26 出口矩阵整改;审计 1)══════════
@@ -7448,16 +7574,28 @@ smoke_e2e_journey() { # [port]
 # 适用 lane:deploy / --dist / canary READY / promote / finalize / activate-emergency-tuple(非阻断)。
 minimum_functional_core() { # <lane-label> <pinned release> <port>
   local lane="$1" release="$2" port="$3"
-  echo "══ 最小功能核(lane=$lane,release=$release,port=$port)══"
+  validation_scope_bind || return 1
+  if [[ "$VALIDATION_PROFILE" == skip-grok ]]; then
+    [[ -z "${V5_TURN_MODELS+x}" && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_SMOKE_E2E:-1}" == 1 && "${V5_CANARY_REQUIRE_COST:-1}" == 1 ]] || return 1
+    echo "══ minimum functional core(profile=skip-grok,lane=$lane,release=$release,port=$port): Grok SKIPPED; full DeepSeek checks required ══"
+  else
+    echo "══ 最小功能核(lane=$lane,release=$release,port=$port)══"
+  fi
+  validation_scope_receipt running "$release" pending pending || return 1
   # B3:默认 turn 组 ∥ E2E。两条真 turn 共用 v5-canary@claudeai.chat,并发会撞配额/会话,
   # 故矩阵内部保持串行;E2E 与 turn 无数据依赖才并行。OC_V5_SMOKE_PARALLEL=0 回退全串行。
   if [[ "${OC_V5_SMOKE_PARALLEL:-1}" != 1 ]]; then
     echo "  · OC_V5_SMOKE_PARALLEL=0 → 全串行(kill-switch)"
     smoke_turn_matrix "$release" "$port" "$lane" || {
+      validation_scope_receipt failed "$release" failed not-run || return 1
       echo "✗ 最小功能核失败(lane=$lane):真 turn 矩阵未通过。" >&2; return 1; }
     smoke_e2e_journey "$port" || {
+      validation_scope_receipt failed "$release" passed failed || return 1
       echo "✗ 最小功能核失败(lane=$lane):E2E 用户旅程未通过。" >&2; return 1; }
-    echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn + J1-J5 旅程"
+    validation_scope_receipt passed "$release" passed passed || return 1
+    validation_scope_clear_repaid
+    if [[ "$VALIDATION_PROFILE" == normal ]]; then echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn + J1-J5 旅程"
+    else echo "  ✓ scoped functional core passed(lane=$lane): DeepSeek true turn + full J1-J5; Grok SKIPPED"; fi
     return 0
   fi
   echo "  · smoke 并行:真 turn 矩阵 ∥ E2E J1-J5(双引擎 turn 仍串行;同 canary 账号)"
@@ -7478,11 +7616,14 @@ minimum_functional_core() { # <lane-label> <pinned release> <port>
   echo "── E2E 旅程日志 ──"
   sed 's/^/  [e2e] /' "$e2e_log" || true
   rm -f "$turn_log" "$e2e_log"
+  validation_scope_receipt "$([[ "$turn_rc" == 0 && "$e2e_rc" == 0 ]] && echo passed || echo failed)" "$release"     "$([[ "$turn_rc" == 0 ]] && echo passed || echo failed)" "$([[ "$e2e_rc" == 0 ]] && echo passed || echo failed)" || return 1
   if [[ "$turn_rc" != 0 || "$e2e_rc" != 0 ]]; then
     echo "✗ 最小功能核失败(lane=$lane):turn_rc=$turn_rc e2e_rc=$e2e_rc" >&2
     return 1
   fi
-  echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn ∥ J1-J5 旅程"
+  validation_scope_clear_repaid
+  if [[ "$VALIDATION_PROFILE" == normal ]]; then echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn ∥ J1-J5 旅程"
+  else echo "  ✓ scoped functional core passed(lane=$lane): DeepSeek true turn ∥ full J1-J5; Grok SKIPPED"; fi
 }
 
 # ══════════ 公网面 + 资产面验证(2026-07-26;审计 8)══════════

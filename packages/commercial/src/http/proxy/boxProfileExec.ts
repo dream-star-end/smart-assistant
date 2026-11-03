@@ -63,9 +63,9 @@ export function scopeBoxExecToProfile(inner: ExecRunner, scope: {
         const nonce = RUN_NONCE.exec(request.cwd)?.[1];
         if (nonce) scope.health.noteRun(nonce, scope.key);
       }
-      // One tap per call: a chunk boundary can fall inside a JSON line.
-      const tap = new BoxProfileSignalTap(observeFor(scope.key));
-      const wrapped = { ...opts, onStdout: (chunk: string) => { tap.push(chunk); opts?.onStdout?.(chunk); } };
+      // Only a launch proves which login owns raw stdout. Observers may read an older run.
+      const tap = launch ? new BoxProfileSignalTap(observeFor(scope.key)) : null;
+      const wrapped = { ...opts, onStdout: (chunk: string) => { tap?.push(chunk); opts?.onStdout?.(chunk); } };
       try {
         // The transport calls onStdout for every stdout event, success or not (a rejected run
         // exits 1 and throws, yet its stream is what carries the rate-limit line).
@@ -74,19 +74,21 @@ export function scopeBoxExecToProfile(inner: ExecRunner, scope: {
           const frame = spoolFrame(result.stdout);
           if (frame) {
             const nonce = request.args.map((arg) => RUN_NONCE.exec(arg)?.[1]).find((n) => n !== undefined);
-            const key = (nonce ? scope.health.runKey(nonce) : undefined) ?? scope.key;
-            const id = nonce ?? "-";
-            let reader = readers.get(id);
-            if (!reader) {
-              if (readers.size >= 64) readers.delete(readers.keys().next().value!);
-              reader = new SpoolReader(observeFor(key));
-              readers.set(id, reader);
+            const key = nonce ? scope.health.runKey(nonce) : undefined;
+            // A restarted process has no owner evidence. Never bench the observing login instead.
+            if (nonce && key) {
+              let reader = readers.get(nonce);
+              if (!reader) {
+                if (readers.size >= 64) readers.delete(readers.keys().next().value!);
+                reader = new SpoolReader(observeFor(key));
+                readers.set(nonce, reader);
+              }
+              reader.feed(frame);
             }
-            reader.feed(frame);
           }
         }
         return result;
-      } finally { tap.end(); }
+      } finally { tap?.end(); }
     },
   };
 }

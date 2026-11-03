@@ -13,6 +13,9 @@ export async function proveContextTransport(candidate: string, db: Db): Promise<
     import(pathToFileURL(join(candidate,
       "packages/commercial/src/http/proxy/testing/boxContextTransportClaim.ts")).href),
   ]);
+  const media = await import(pathToFileURL(join(candidate,
+    "packages/commercial/src/http/proxy/testing/boxMediaHistoryProbe.ts")).href);
+  const mediaPrefix = await media.proveMediaHistoryPrefix(db);
   const integrity = await proveSessionFileIntegrity();
   const directory = await mkdtemp(join(tmpdir(), "g607-context-proof-"));
   try {
@@ -21,7 +24,7 @@ export async function proveContextTransport(candidate: string, db: Db): Promise<
     if (result.images !== 91 || result.bodyBytes <= 16 * 1024 * 1024) {
       throw new Error("[box-incident-proofs] CONTEXT_TRANSPORT_FIXTURE_NOT_OVERSIZED");
     }
-    return `[ocv5-607-lossless-context-transport] PASS — a 17MiB Box request restores all 91 images with unchanged canonical bytes and v1 context hash; legacy handoff stays single-use and stage has zero precheck or model dispatch; ${integrity}`;
+    return `[ocv5-607-lossless-context-transport] PASS — a 17MiB Box request restores all 91 images with unchanged canonical bytes and v1 context hash; legacy handoff stays single-use and stage has zero precheck or model dispatch; ${integrity}; ${mediaPrefix}`;
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
