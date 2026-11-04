@@ -462,7 +462,7 @@ describe('emitProgress respects terminal fence', () => {
     ])
     gw.deliver = (out: any) => {
       gw.delivered.push(out)
-      Gateway.prototype.deliver.call(gw, out)
+      ;(Gateway.prototype as any).deliver.call(gw, out)
     }
 
     gw.sessions.submit = async (_session: unknown, _payload: string, onEvent: (e: any) => void) => {

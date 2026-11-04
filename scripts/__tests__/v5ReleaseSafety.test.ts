@@ -10729,8 +10729,8 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       scripts?: { gateway?: string }
     }
     const gateway = pkg.scripts?.gateway ?? ''
-    assert.match(gateway, /^bash\s+\S+/)
-    const wrapperRel = gateway.replace(/^bash\s+/, '').trim()
+    assert.match(gateway, /^(?:exec\s+)?bash\s+\S+/)
+    const wrapperRel = gateway.replace(/^(?:exec\s+)?bash\s+/, '').trim()
     assert.ok(
       !wrapperRel.startsWith('scripts/'),
       `gateway wrapper ${wrapperRel} is under excluded /scripts/`,

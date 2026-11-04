@@ -223,7 +223,7 @@ export default defineConfig(() => {
                 // 「异步块 import 入口」的被禁边(见 forbidTaskboardEntryImport)。与
                 // lucide-vendor 同理:共享模块单独成块,两边都从它引,不经过入口。
                 name: "viewport-shared",
-                test: /src[\\/]hooks[\\/]useMdViewport\.ts$/,
+                test: /src[\\/](hooks[\\/]useMdViewport|lib[\\/]taskboardFeature)\.ts$/,
                 priority: 25,
               },
               {

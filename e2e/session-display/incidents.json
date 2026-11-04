@@ -9438,6 +9438,39 @@
         "assertion": "retention is opt-in and its disabled scheduler and entry point do no filesystem scans"
       }
     ]
-  }
+  },
+    {
+      "id": "INC-20261104-ANTIGRAVITY-DELIVERY",
+      "occurredAt": "2026-11-04",
+      "severity": "P1",
+      "symptom": "Antigravity relay disconnects could hang or reset instead of returning errors; completed native answers could be lost when stdout/result was empty, causing red cards and needless context reconstruction. Recovery is read-only and launch-bound, never reruns models or tools.",
+      "rootFixCommit": "29a94025",
+      "coverageCommits": [
+        "75eb8d00",
+        "e155a377"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "spawn-time DB watermark rejects a replayed first USER_INPUT and its old answer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityNativeTrajectory.test.ts",
+          "assertion": "overlong status cannot redirect standard decoder into thinking_signature bytes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityDeliveryPersistence.test.ts",
+          "assertion": "survives SQLite reopen"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[antigravity-durable-delivery] PASS"
+        }
+      ]
+    }
   ]
 }

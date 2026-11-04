@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createCc5ToolDispatcher, isCc5ToolHostCommand, parseCc5ToolAllowlist } from './cc5ToolHost.js'
+import { boundCc5ToolResultSize, createCc5ToolDispatcher, isCc5ToolHostCommand,
+  parseCc5ToolAllowlist } from './cc5ToolHost.js'
 
 const session = 'd71e4679-e7df-482a-a129-a998a8f51f7e'
 function call(toolUseId: string, name = 'Read', args: Record<string, unknown> = { file_path: '/workspace/probe.txt' }) {
@@ -134,4 +135,80 @@ test('oversized output is never returned as a successful tool receipt', async ()
   await assert.rejects(host.call(call('oversized')), /RESULT_LIMIT/)
   assert.throws(() => host.call(call('oversized')), /REJECTED/)
   await host.close()
+})
+
+
+const MAX = 131072
+const resultBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value))
+
+/** A smooth 900x900 gradient stored at PNG compression level 0: larger than the
+ * transfer bound as produced, but cheap for the resizer to re-encode. */
+async function oversizedPng(): Promise<Buffer> {
+  const { default: sharp } = await import('sharp')
+  const width = 400
+  const height = 400
+  const raw = Buffer.alloc(width * height * 3)
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * 3
+      raw[offset] = Math.floor((x * 255) / width)
+      raw[offset + 1] = Math.floor((y * 255) / height)
+      raw[offset + 2] = Math.floor(((x + y) * 255) / (width + height))
+    }
+  }
+  return sharp(raw, { raw: { width, height, channels: 3 } }).png({ compressionLevel: 0 }).toBuffer()
+}
+
+test('a result inside the transfer bound is returned untouched', async () => {
+  const result = { content: [{ type: 'text' as const, text: 'small' }], isError: false }
+  assert.deepEqual(await boundCc5ToolResultSize(result), result)
+})
+
+test('an oversized real PNG is recompressed and still arrives as a decodable image block', { timeout: 30000 }, async () => {
+  const png = await oversizedPng()
+  assert.ok(png.length > MAX, `fixture must exceed the bound, got ${png.length}`)
+  const original = { content: [{ type: 'image' as const, mimeType: 'image/png', data: png.toString('base64') }], isError: false }
+  const bounded = await boundCc5ToolResultSize(original, '/workspace/screenshot.png')
+  assert.ok(resultBytes(bounded) <= MAX, `still oversized: ${resultBytes(bounded)}`)
+  assert.equal(bounded.content.length, 2)
+  const image = bounded.content[0] as unknown as { type: string; mimeType: string; data: string }
+  assert.equal(image.type, 'image')
+  const note = bounded.content[1] as unknown as { type: string; text: string }
+  assert.equal(note.type, 'text')
+  assert.ok(note.text.startsWith('[cc5 tool result truncated: original '))
+  assert.ok(image.data.length > 0)
+  const { default: sharp } = await import('sharp')
+  const metadata = await sharp(Buffer.from(image.data, 'base64')).metadata()
+  assert.ok((metadata.width ?? 0) > 0 && (metadata.height ?? 0) > 0)
+})
+
+test('an undecodable oversized image degrades to a placeholder instead of breaking the pipeline', async () => {
+  const { randomFillSync } = await import('node:crypto')
+  const corrupt = Buffer.alloc(200 * 1024)
+  randomFillSync(corrupt)
+  const original = { content: [{ type: 'image' as const, mimeType: 'image/png', data: corrupt.toString('base64') }], isError: false }
+  const bounded = await boundCc5ToolResultSize(original, '/workspace/broken.png')
+  assert.ok(resultBytes(bounded) <= MAX)
+  const text = JSON.stringify(bounded.content)
+  assert.ok(text.includes('[image omitted: original 204800 bytes, too large to transfer'))
+  assert.ok(text.includes('; source: /workspace/broken.png;'), text)
+  assert.ok(!text.includes('"data"'), 'image bytes must never be serialized as text')
+})
+
+test('text and image over the shared bound keep the text head and a bounded image', { timeout: 30000 }, async () => {
+  const png = await oversizedPng()
+  const head = 'read head line\n'.repeat(2000)
+  const original = { content: [
+    { type: 'text' as const, text: head },
+    { type: 'image' as const, mimeType: 'image/png', data: png.toString('base64') },
+  ], isError: false }
+  const bounded = await boundCc5ToolResultSize(original)
+  assert.ok(resultBytes(bounded) <= MAX)
+  const first = bounded.content[0] as unknown as { type: string; text: string }
+  assert.equal(first.type, 'text')
+  assert.ok(first.text.startsWith('read head line\nread head line\n'))
+  assert.ok(first.text.endsWith(`[cc5 tool result truncated: original ${resultBytes(original)} bytes]`))
+  const second = bounded.content[1] as unknown as { type: string; text?: string }
+  assert.ok(second && (second.type === 'image' ||
+    (second.type === 'text' && second.text!.startsWith('[image omitted:'))))
 })

@@ -8,7 +8,11 @@ import {
   Trash2,
 } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, memo, useRef, useState } from "react";
-import { SIDEBAR_DOT_LABELS, resolveSidebarDot } from "../../lib/sessionStatus";
+import {
+  type SessionNeedsYouKind,
+  resolveSidebarDot,
+  resolveSidebarDotLabel,
+} from "../../lib/sessionStatus";
 import type { ChatProject, Session } from "../../lib/types";
 import { SIDEBAR_DOT_STATUS } from "../../lib/ui/statusTone";
 import { cn } from "../../lib/utils";
@@ -48,6 +52,7 @@ export const SessionRow = memo(function SessionRow({
   running,
   lastOutcome,
   lastErrorCode,
+  needsYou,
   now,
   onSelect,
   onRename,
@@ -75,6 +80,8 @@ export const SessionRow = memo(function SessionRow({
   /** 本 tab 终态优先，否则列表元数据。 */
   lastOutcome?: string | null;
   lastErrorCode?: string | null;
+  /** 会话处于待用户回答 / 审批状态（显示 Q 版问号）。 */
+  needsYou?: SessionNeedsYouKind | null;
   /** 只有运行中的行用到(用时算到现在);其余行由 Sidebar 传 0,30s 时钟不打穿它们的 memo。 */
   now: number;
   onSelect: (id: string) => void;
@@ -131,7 +138,7 @@ export const SessionRow = memo(function SessionRow({
     if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) > LONG_PRESS_SLOP_PX) cancelPress();
   };
 
-  const dot = resolveSidebarDot({ running, lastOutcome, lastErrorCode }, unread);
+  const dot = resolveSidebarDot({ running, lastOutcome, lastErrorCode, needsYou }, unread);
   const duration = sessionDurationWindow(s, running, now);
   const durationText = duration ? formatCompactDuration(duration.endAt - duration.startAt) : "";
   const durationTitle = duration
@@ -197,12 +204,13 @@ export const SessionRow = memo(function SessionRow({
         )}
         <span
           data-session-lead
-          className="relative z-[1] flex size-3 shrink-0 items-center justify-center"
+          className="relative z-[1] flex size-3.5 shrink-0 items-center justify-center"
         >
           <SessionStatusDot
             running={running}
             lastOutcome={lastOutcome}
             lastErrorCode={lastErrorCode}
+            needsYou={needsYou}
             unread={unread}
           />
         </span>
@@ -296,7 +304,7 @@ export const SessionRow = memo(function SessionRow({
                   <DropdownMenuLabel>
                     <StatusPill
                       status={SIDEBAR_DOT_STATUS[dot]}
-                      label={SIDEBAR_DOT_LABELS[dot]}
+                      label={resolveSidebarDotLabel(dot, needsYou)}
                       variant="pill"
                     />
                   </DropdownMenuLabel>

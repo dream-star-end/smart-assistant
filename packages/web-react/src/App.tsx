@@ -168,7 +168,14 @@ import {
   type ImplicitTarget,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
-import { deriveLiveTerminalEndedAt, deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
+import {
+  deriveLiveTerminalEndedAt,
+  deriveLiveTerminalFromMessages,
+  deriveSessionNeedsYou,
+  getTicketApprovalPendingVersion,
+  hasUnansweredOptionsFence,
+  subscribeTicketApprovalPending,
+} from "./lib/sessionStatus";
 import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
@@ -1309,6 +1316,29 @@ export function App() {
     (id: string) => liveTerminals.get(id),
     [liveTerminals],
   );
+  const ticketApprovalVersion = useSyncExternalStore(
+    subscribeTicketApprovalPending,
+    getTicketApprovalPendingVersion,
+    getTicketApprovalPendingVersion,
+  );
+  const sessionNeedsYou = useCallback(
+    (id: string) => {
+      void chat.version;
+      void ticketApprovalVersion;
+      if (demo) return null;
+      const liveSess = chat.getSession(id);
+      const fromLive = deriveSessionNeedsYou(liveSess);
+      if (fromLive) return fromLive;
+      if (!liveSess || liveSess.messages.length === 0) {
+        const meta = sessions.find((s) => s.id === id);
+        if (meta?.lastMessagePreview && hasUnansweredOptionsFence(meta.lastMessagePreview)) {
+          return "answer";
+        }
+      }
+      return null;
+    },
+    [demo, chat, sessions, ticketApprovalVersion],
+  );
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -2034,6 +2064,7 @@ export function App() {
     onOpenProjectArchive: demo ? undefined : () => setProjectArchiveOpen(true),
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
+    sessionNeedsYou,
     socketVersion: chat.version,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),

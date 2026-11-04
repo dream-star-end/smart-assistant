@@ -40,7 +40,7 @@ import { SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN } from "../hooks/useSidebarWidth";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
-import { isSidebarSessionRunning } from "../lib/sessionStatus";
+import { type SessionNeedsYouKind, isSidebarSessionRunning } from "../lib/sessionStatus";
 import type {
   ChatProject,
   Session,
@@ -160,6 +160,7 @@ export type SidebarProps = {
   liveTerminal?: (
     id: string,
   ) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  sessionNeedsYou?: (id: string) => SessionNeedsYouKind | null | undefined;
   socketVersion?: number;
   onCollapse?: () => void;
   /**
@@ -249,6 +250,7 @@ export function Sidebar({
   onNewWithAgent,
   isSending,
   liveTerminal,
+  sessionNeedsYou,
   socketVersion,
   onCollapse,
   collapseLabel = "折叠侧栏",
@@ -803,6 +805,7 @@ export function Sidebar({
           running={running}
           lastOutcome={live?.lastOutcome ?? s.lastOutcome}
           lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
+          needsYou={sessionNeedsYou?.(s.id) ?? null}
           now={running ? now : 0}
           onSelect={rowActions.select}
           onRename={rowActions.rename}

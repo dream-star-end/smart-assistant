@@ -162,21 +162,59 @@ function error(res: ServerResponse, status: number, code: string, requestId: str
 
 class AntigravityBodyTooLargeError extends Error {}
 
+// A terminal read can precede Node's queued ECONNRESET (aborted -> error -> close).
+// Keep only this stateless guard, never a closure retaining the body buffers.
+function ignoreLateBodyError(): void {}
+
 function readLimited(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    // Identity/route lookup is asynchronous: the stream may have closed before
+    // any reader was attached, so waiting for another terminal event would hang.
+    if (req.destroyed || req.aborted) {
+      req.on('error', ignoreLateBodyError)
+      reject(new Error('request body already closed'))
+      return
+    }
     const chunks: Buffer[] = []
     let total = 0
-    req.on('data', (chunk: Buffer) => {
+    let settled = false
+    const settle = (err?: Error): void => {
+      if (settled) return
+      settled = true
+      req.off('data', onData)
+      req.off('end', onEnd)
+      req.off('aborted', onAborted)
+      req.off('close', onClose)
+      req.off('error', onError)
+      req.on('error', ignoreLateBodyError)
+      const body = err ? undefined : Buffer.concat(chunks, total)
+      chunks.length = 0
+      if (err) {
+        // Stop buffering immediately. Do not destroy the socket or await drain:
+        // the handler must get its 413 onto the wire before Connection: close.
+        req.pause()
+        reject(err)
+      } else resolve(body!)
+    }
+    const onData = (chunk: Buffer): void => {
       total += chunk.length
       if (total > maxBytes) {
-        req.destroy()
-        reject(new AntigravityBodyTooLargeError('body too large'))
+        settle(new AntigravityBodyTooLargeError('body too large'))
         return
       }
       chunks.push(chunk)
-    })
-    req.on('end', () => resolve(Buffer.concat(chunks)))
-    req.on('error', reject)
+    }
+    const onEnd = (): void => settle()
+    const onError = (err: Error): void => settle(err)
+    const onAborted = (): void => settle(new Error('request body aborted'))
+    const onClose = (): void => {
+      if (!req.complete) settle(new Error('request body incomplete'))
+    }
+    req.once('end', onEnd)
+    req.once('aborted', onAborted)
+    req.once('close', onClose)
+    req.once('error', onError)
+    req.on('data', onData)
   })
 }
 
@@ -494,7 +532,10 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       } catch (err) {
         const oversized = err instanceof AntigravityBodyTooLargeError
         stage('body_read_failed', { statusCode: oversized ? 413 : 400 })
-        error(res, oversized ? 413 : 400, oversized ? 'BODY_TOO_LARGE' : 'REQUEST_BODY_READ_FAILED', requestId)
+        if (!res.destroyed) {
+          if (oversized) res.setHeader('connection', 'close')
+          error(res, oversized ? 413 : 400, oversized ? 'BODY_TOO_LARGE' : 'REQUEST_BODY_READ_FAILED', requestId)
+        }
         return
       }
     }
@@ -517,12 +558,14 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           throw new Error('not an object')
         payload = value as Record<string, unknown>
       } catch {
+        stage('json_rejected', { statusCode: 400 })
         error(res, 400, 'INVALID_JSON', requestId)
         return
       }
       upstreamModel = typeof payload.model === 'string' ? payload.model : ''
       requestType = typeof payload.requestType === 'string' ? payload.requestType : null
       if (!antigravityAllowedUpstreamModels(route.modelId).includes(upstreamModel)) {
+        stage('model_rejected', { statusCode: 403 })
         error(res, 403, 'ANTIGRAVITY_MODEL_NOT_ALLOWED', requestId)
         return
       }
