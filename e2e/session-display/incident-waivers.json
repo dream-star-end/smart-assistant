@@ -343,6 +343,12 @@
       "reason": "OCV5-729: codex 委派注入 master 签发 provider route，并在 route 缺失时 fail-closed。这是委派路由功能修复（Codex CLI 0.159.2 后裸起必然失败），不是 turn 展示/红卡/重试事故修复；只增加 provider override 与 503 门，不改 runner、tape、session 展示。Antigravity 同源问题已拆出未实施。",
       "approvedBy": "user 2026-11-04 OCV5-729 委派任务：实施 codex 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "7eecab3d67066ae00905a9f806f33d0c4c71b76b",
+      "reason": "OCV5-741: 修复 Box 空闲压缩 selectIdlePreserve 保留非落盘 attachment 导致 applyIdleTranscript 抛 IDLE_ARTIFACT_MISSING 死锁，以及 writeSettledIdleOp 覆写刷新 mtime 导致 10 分钟 IDLE_APPLY_STUCK_MS 兜底失效。属于后台空闲压缩修复，不改会话展示或错误卡。",
+      "approvedBy": "user 2026-11-04 webmw1rclzbt1ckvm 拍板建单修复两个代码 Bug",
+      "expiresAt": "2026-12-04"
     }
   ]
 }
