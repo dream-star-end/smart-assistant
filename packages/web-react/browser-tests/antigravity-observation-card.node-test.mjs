@@ -18,7 +18,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 test('Antigravity observation failure preserves partial output and offers no retry CTA, including reload',
   { timeout: 180000 }, async () => {
     const assets = mkdtempSync(join(tmpdir(), 'agy-observation-browser-'));
-    let preview, browser;
+    let preview;
+    let browser;
     let sends = 0;
     try {
       await build({
@@ -79,7 +80,7 @@ test('Antigravity observation failure preserves partial output and offers no ret
           }
           if (process.env.OC_AGY_BROWSER_EVIDENCE_DIR) {
             mkdirSync(process.env.OC_AGY_BROWSER_EVIDENCE_DIR, { recursive: true });
-            await page.screenshot({ path: join(process.env.OC_AGY_BROWSER_EVIDENCE_DIR, width + '.png'), fullPage: true });
+            await page.screenshot({ path: join(process.env.OC_AGY_BROWSER_EVIDENCE_DIR, `${width}.png`), fullPage: true });
           }
         } finally { await context.close(); }
       }

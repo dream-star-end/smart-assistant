@@ -669,11 +669,11 @@ describe('AntigravityAdapter', () => {
       h.adapter.on('spawn', () => { spawns++ })
       process.env.FAKE_AGY_EXIT_CODE = '1'
       const file = path.join(h.dir, 'startup-observer.ndjson')
-      await writeFile(file, [
+      await writeFile(file, `${[
         { event: 'init', conversation_id: prior },
         { event: 'result', result: { conversation_id: prior, status: 'ERROR',
           error: 'timeout waiting for cascade to start running' } },
-      ].map((line) => JSON.stringify(line)).join('\n') + '\n')
+      ].map((line) => JSON.stringify(line)).join('\n')}\n`)
       const { summary, sessionIds } = await runTurn(h, file)
       assert.equal(summary?.isError, true)
       assert.match(summary?.errorDetail ?? '', /^ANTIGRAVITY_START_OBSERVATION_FAILED:/)
