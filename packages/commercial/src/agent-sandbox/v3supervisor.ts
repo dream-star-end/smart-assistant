@@ -2743,18 +2743,40 @@ export async function provisionV3Container(
   > = null;
   try {
     if (canUseCc5TestModel(uid, process.env)) {
-      if (getRuntimeChannel() !== "v5" || useRemote || !deps.cc5 || !deps.modelAuthority?.required) {
-        throw new SupervisorError("InvalidArgument", "cc5 fresh local binding is unavailable");
+      if (getRuntimeChannel() === "v5" && !useRemote && deps.cc5 && deps.modelAuthority?.required) {
+        const assignment = deps.modelAuthority.keyringEnvAssignment;
+        const candidateKeyring = typeof assignment === "function" ? assignment() : assignment;
+        const prefix = "OC_MODEL_AUTHORITY_KEYRING=";
+        if (candidateKeyring.startsWith(prefix)) {
+          cc5KeyringAssignment = candidateKeyring;
+          try {
+            cc5Prepared = await deps.cc5.prepare({
+              uid,
+              containerDbId: String(row.id),
+              local: true,
+              publicKeyring: candidateKeyring.slice(prefix.length),
+            });
+          } catch (cc5Err) {
+            await beginCc5Release(deps, row.id).catch(() => {});
+            console.error("[v3supervisor] cc5 fresh binding prepare failed; degrading cc5 lane for container", {
+              uid,
+              containerId: row.id,
+              errMsg: cc5Err instanceof Error ? cc5Err.message : String(cc5Err),
+            });
+            cc5Prepared = null;
+          }
+        } else {
+          console.error("[v3supervisor] cc5 public authority keyring is unavailable; degrading cc5 lane", {
+            uid,
+            containerId: row.id,
+          });
+        }
+      } else {
+        console.error("[v3supervisor] cc5 fresh local binding is unavailable; degrading cc5 lane", {
+          uid,
+          containerId: row.id,
+        });
       }
-      const assignment = deps.modelAuthority.keyringEnvAssignment;
-      cc5KeyringAssignment = typeof assignment === "function" ? assignment() : assignment;
-      const prefix = "OC_MODEL_AUTHORITY_KEYRING=";
-      if (!cc5KeyringAssignment.startsWith(prefix)) {
-        throw new SupervisorError("InvalidArgument", "cc5 public authority keyring is unavailable");
-      }
-      cc5Prepared = await deps.cc5.prepare({ uid, containerDbId: String(row.id), local: true,
-        publicKeyring: cc5KeyringAssignment.slice(prefix.length) });
-      if (!cc5Prepared) throw new SupervisorError("InvalidArgument", "cc5 fresh binding refused");
     }
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
 

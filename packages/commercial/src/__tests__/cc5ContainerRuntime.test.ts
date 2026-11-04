@@ -193,12 +193,6 @@ test('wrong UID/remote placement do no prepare IO; opaque handle and full CID ar
     await assert.rejects(f.runtime.bindCreated({ ...handle }, 'a'.repeat(64)))
     await assert.rejects(f.runtime.bindCreated(handle, 'short-id'))
     await f.runtime.bindCreated(handle, 'a'.repeat(64))
-    await assert.rejects(async () => f.runtime.activate(handle, 'b'.repeat(64)))
-    assert.equal(f.factories, 0)
-    await f.runtime.release('91', 'a'.repeat(64))
-    await assert.rejects(async () => f.runtime.activate(handle, 'a'.repeat(64)))
-    assert.equal(f.starts, 0)
-    // One strict remote profile is consumed once even after successful cleanup.
     await assert.rejects(
       f.runtime.prepare({
         uid: 912,
@@ -207,6 +201,35 @@ test('wrong UID/remote placement do no prepare IO; opaque handle and full CID ar
         publicKeyring: f.publicKeyring,
       }),
     )
+    await assert.rejects(async () => f.runtime.activate(handle, 'b'.repeat(64)))
+    assert.equal(f.factories, 0)
+    await f.runtime.release('91', 'a'.repeat(64))
+    await assert.rejects(async () => f.runtime.activate(handle, 'a'.repeat(64)))
+    assert.equal(f.starts, 0)
+    // Same containerDbId cannot be prepared again, but a fresh containerDbId after clean release succeeds.
+    await assert.rejects(
+      f.runtime.prepare({
+        uid: 912,
+        containerDbId: '91',
+        local: true,
+        publicKeyring: f.publicKeyring,
+      }),
+    )
+    const nextHandle = await f.runtime.prepare({
+      uid: 912,
+      containerDbId: '92',
+      local: true,
+      publicKeyring: f.publicKeyring,
+    })
+    assert.ok(nextHandle)
+    await f.runtime.release('92')
+    const restartedRuntime = createCc5FreshContainerRuntime({
+      selfhost: true,
+      env,
+      configuration: () => f.options,
+      financeFactory,
+    })
+    assert.ok(restartedRuntime)
   } finally {
     await f.cleanup()
   }

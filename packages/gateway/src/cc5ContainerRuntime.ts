@@ -7,10 +7,12 @@ import {
   closeSync,
   fchmodSync,
   fchownSync,
+  existsSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -141,9 +143,25 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
       /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(options.profile.operationId) &&
         /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(options.profile.runId),
     )
-    mkdirSync(options.baseRoot, { mode: 0o700, recursive: false })
+    if (!existsSync(options.baseRoot)) {
+      mkdirSync(options.baseRoot, { mode: 0o700, recursive: false })
+    }
     const st = lstatSync(options.baseRoot)
-    requireRuntime(st.isDirectory() && st.uid === 0 && (st.mode & 0o777) === 0o700)
+    requireRuntime(
+      st.isDirectory() && !st.isSymbolicLink() && st.uid === 0 && (st.mode & 0o777) === 0o700,
+    )
+    for (const entry of readdirSync(options.baseRoot)) {
+      const childPath = join(options.baseRoot, entry)
+      const childSt = lstatSync(childPath)
+      requireRuntime(
+        /^[a-f0-9]{24}$/.test(entry) &&
+          childSt.isDirectory() &&
+          !childSt.isSymbolicLink() &&
+          childSt.uid === 0 &&
+          (childSt.mode & 0o777) === 0o700 &&
+          !existsSync(join(childPath, 'UNKNOWN.json')),
+      )
+    }
     syncDirectory(dirname(options.baseRoot))
   }
   selectBackend(input: { uid: number; containerId: number; sessionKey: string;
@@ -164,11 +182,15 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     publicKeyring: string
   }): Promise<Cc5PreparedContainer | null> {
     if (!Number.isSafeInteger(input.uid) || String(input.uid) !== this.testUid) return null
+    for (const prior of this.records.values()) {
+      if (prior.release) await prior.release.catch(() => {})
+    }
     requireRuntime(
       input.local &&
         !this.blocked &&
         /^[1-9][0-9]{0,18}$/.test(input.containerDbId) &&
-        this.records.size === 0,
+        !this.records.has(input.containerDbId) &&
+        [...this.records.values()].every((r) => r.state === 'released'),
     )
     const keyring = parseAuthorityKeyring(input.publicKeyring)
     requireRuntime(keyring.size > 0)
