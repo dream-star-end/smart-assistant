@@ -1,7 +1,7 @@
 import { ChevronDown, PanelRight, Pencil } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { type ChatMessage, isRetryingTurnStatus, isServerAuthoredRow } from "../../lib/chat/model";
-import { agentTerminalStatus } from "../../lib/chat/render";
+import { agentTerminalStatus, isErrorCardHeldWithAnswer } from "../../lib/chat/render";
 import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
 import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
@@ -674,7 +674,7 @@ export function turnOutcome(following: readonly ChatMessage[] | undefined): "don
     if (message.role === "user") break;
     if (message.role === "assistant") terminal = message;
   }
-  if (!terminal || !hasErrorMark(terminal)) return "done";
+  if (!terminal || !hasErrorMark(terminal) || isErrorCardHeldWithAnswer(terminal)) return "done";
   const code = String(terminal._errorCode ?? "").toLowerCase();
   return code === "stopped" || code === "user_cancelled" ? "stopped" : "failed";
 }

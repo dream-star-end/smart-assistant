@@ -3104,6 +3104,11 @@ test.each(["committed", "uncommitted", "held"] as const)(
     expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
     assertSavedBody();
     assertSavedUsage();
+    expect(
+      screen.getByText("SAVED_PAID_FIRST_PARAGRAPH").compareDocumentPosition(screen.getByText("CONTINUED_PAID_ANSWER")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText("没完成")).toBeNull();
 
     // A fresh component receives only the persisted rows, without a local held-card repair.
     view.unmount();
@@ -3112,6 +3117,11 @@ test.each(["committed", "uncommitted", "held"] as const)(
     expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
     assertSavedBody();
     assertSavedUsage();
+    expect(
+      screen.getByText("SAVED_PAID_FIRST_PARAGRAPH").compareDocumentPosition(screen.getByText("CONTINUED_PAID_ANSWER")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText("没完成")).toBeNull();
   },
 );
 
