@@ -343,6 +343,12 @@
       "reason": "OCV5-729: codex 委派注入 master 签发 provider route，并在 route 缺失时 fail-closed。这是委派路由功能修复（Codex CLI 0.159.2 后裸起必然失败），不是 turn 展示/红卡/重试事故修复；只增加 provider override 与 503 门，不改 runner、tape、session 展示。Antigravity 同源问题已拆出未实施。",
       "approvedBy": "user 2026-11-04 OCV5-729 委派任务：实施 codex 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "2bfc755bc13dbf8d405a0609994a810cba7dd3b9",
+      "reason": "OCV5-738: 委派到 antigravity 引擎时由 master 签发 relay route（mint/renew/release），并把 settle/abandon 对账并入同一 requestId。属于委派路由功能修复，不是 turn 展示/红卡/重试事故修复；只新增 selfhost-only 内部端点、route 透传与 503 fail-closed，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务：实施 antigravity 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署、不重启服务",
+      "expiresAt": "2026-12-04"
     }
   ]
 }
