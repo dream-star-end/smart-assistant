@@ -94,9 +94,6 @@ const EMPTY_ALL_HEIGHT = 200;
  * 把横向空间让给昵称与余额 —— 268px 下文字版会把「余额 258.5万 积分」截成「余额 258.5万…」（S-09 / SIDEBAR-R1）。
  */
 const FOOTER_LABEL_MIN_WIDTH = 300;
-/** 底栏图标行（任务 / 经验分享）：28px 方钮，触屏 44px。 */
-const NAV_ICON =
-  "flex shrink-0 items-center justify-center rounded-xs outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring size-7 [@media(hover:none)]:size-11";
 
 function readArchivedExpanded(userId: string | undefined): boolean {
   if (!userId) return false;
@@ -635,7 +632,6 @@ export function Sidebar({
   // 最小改动、可回退、不引入新的能力开关判断，计费形态下仍显示余额。
   const email = user?.email?.trim() || null;
   const accountSubtitle = credits != null ? null : email;
-  const hasNav = Boolean(onOpenBoard || onOpenBlog || onOpenTutorial || (theme && onCycleTheme));
   const userChip = (
     <button
       type="button"
@@ -1147,6 +1143,40 @@ export function Sidebar({
           </div>
         )}
 
+        {onOpenBoard && (
+          <button
+            type="button"
+            data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
+            data-testid="taskboard-nav"
+            onClick={onOpenBoard}
+            aria-current={boardActive ? "true" : undefined}
+            className={cn(
+              "mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              boardActive
+                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active"
+                : "text-muted hover:bg-hover hover:text-fg",
+            )}
+          >
+            <SquareKanban
+              size={15}
+              aria-hidden
+              className={boardActive ? "text-fg" : "text-faint"}
+            />
+            任务
+          </button>
+        )}
+        {onOpenBlog && (
+          <button
+            type="button"
+            data-product-control
+            data-testid="blog-nav"
+            onClick={onOpenBlog}
+            className="mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-[background-color,color,box-shadow] duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          >
+            <PenLine size={15} aria-hidden className="text-faint" />
+            经验分享
+          </button>
+        )}
       </div>
 
       {multiSelect && onBatch && (
@@ -1190,65 +1220,9 @@ export function Sidebar({
         </div>
       ) : null}
 
-      {/* 底栏两行：次要入口收成一行图标（任务、经验分享、案例、主题，title / aria-label 说明），
-          下面是账号区（UI-1）。主区只留新建与搜索。管理 / 市场仍在账号菜单里（T41 契约）。 */}
+      {/* 底栏：账号区，右侧是案例展厅与主题切换。任务 / 经验分享在搜索下方以文字行呈现；
+          管理 / 市场仍在账号菜单里（T41 契约）。 */}
       <div className="border-t border-border/70 px-2 pt-1 sidebar-foot-safe-b">
-        {hasNav && (
-          <div className="flex items-center gap-0.5 pb-0.5" data-product-entry-scope="sidebar-nav">
-            {onOpenBoard && (
-              <button
-                type="button"
-                data-product-feature={PRODUCT_CAPABILITIES.taskboard.id}
-                data-testid="taskboard-nav"
-                onClick={onOpenBoard}
-                aria-label="任务"
-                title="任务"
-                aria-current={boardActive ? "true" : undefined}
-                className={cn(
-                  NAV_ICON,
-                  boardActive
-                    ? "bg-sidebar-active text-fg shadow-sidebar-active"
-                    : "text-faint hover:bg-hover hover:text-fg",
-                )}
-              >
-                <SquareKanban size={16} aria-hidden />
-              </button>
-            )}
-            {onOpenBlog && (
-              <button
-                type="button"
-                data-product-control
-                data-testid="blog-nav"
-                onClick={onOpenBlog}
-                aria-label="经验分享"
-                title="经验分享"
-                className={cn(NAV_ICON, "text-faint hover:bg-hover hover:text-fg")}
-              >
-                <PenLine size={16} aria-hidden />
-              </button>
-            )}
-            {onOpenTutorial && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                data-product-control
-                onClick={onOpenTutorial}
-                aria-label="打开案例展厅"
-                title="案例展厅"
-                className={cn(
-                  "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:size-11",
-                  footerCompact ? "w-7 px-0" : "px-2",
-                )}
-              >
-                <BookOpen size={16} />
-                {!footerCompact && <span className="text-caption font-medium">案例</span>}
-              </Button>
-            )}
-            <span className="min-w-0 flex-1" />
-            {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} compact />}
-          </div>
-        )}
         <div className="flex items-center" data-product-entry-scope="sidebar-account">
           {hasAccountMenu ? (
             <DropdownMenu>
@@ -1371,6 +1345,25 @@ export function Sidebar({
           ) : (
             userChip
           )}
+          {onOpenTutorial && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              data-product-control
+              onClick={onOpenTutorial}
+              aria-label="打开案例展厅"
+              title="案例展厅"
+              className={cn(
+                "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:size-11",
+                footerCompact ? "w-7 px-0" : "px-2",
+              )}
+            >
+              <BookOpen size={16} />
+              {!footerCompact && <span className="text-caption font-medium">案例</span>}
+            </Button>
+          )}
+          {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} compact />}
         </div>
       </div>
     </aside>

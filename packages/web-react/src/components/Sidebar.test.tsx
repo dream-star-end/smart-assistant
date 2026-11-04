@@ -2075,7 +2075,7 @@ describe("Sidebar 项目归档/置顶（P2）", () => {
 
 
 describe("Sidebar UI-1 层级", () => {
-  it("主区只留新建与搜索；任务、经验分享收进底栏图标行，和案例、主题同一行", () => {
+  it("任务、经验分享是搜索下方带文字的行；案例与主题在账号行右侧；不再有底栏图标行", () => {
     renderSidebar({
       onOpenBoard: () => {},
       onOpenBlog: () => {},
@@ -2084,14 +2084,18 @@ describe("Sidebar UI-1 层级", () => {
       onCycleTheme: () => {},
     });
     const primary = document.querySelector("[data-product-entry-scope='sidebar-primary']")!;
-    const nav = document.querySelector("[data-product-entry-scope='sidebar-nav']")!;
-    for (const name of ["任务", "经验分享", "打开案例展厅", /切换主题/]) {
+    const account = document.querySelector("[data-product-entry-scope='sidebar-account']")!;
+    expect(document.querySelector("[data-product-entry-scope='sidebar-nav']")).toBeNull();
+    for (const name of ["任务", "经验分享"]) {
       const btn = screen.getByRole("button", { name });
-      expect(nav.contains(btn)).toBe(true);
+      expect(primary.contains(btn)).toBe(true);
+      expect(btn).toHaveTextContent(name);
+    }
+    for (const name of ["打开案例展厅", /切换主题/]) {
+      const btn = screen.getByRole("button", { name });
+      expect(account.contains(btn)).toBe(true);
       expect(primary.contains(btn)).toBe(false);
     }
-    expect(screen.getByRole("button", { name: "任务" })).toHaveAttribute("title", "任务");
-    expect(screen.getByRole("button", { name: "经验分享" })).toHaveAttribute("title", "经验分享");
   });
 
   it("项目超过 5 条时末尾「查看全部 N 条」打开项目主页", () => {
