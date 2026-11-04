@@ -50,8 +50,11 @@ export interface DurableCodexBilling {
   engineSessionId: string
   status: 'success' | 'error'
   /** Stable, content-free terminal classification. Optional only for rolling
-   * compatibility with runtime images predating product-friction telemetry. */
-  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR'
+   * compatibility with runtime images predating product-friction telemetry.
+   * The AUTH_UNAVAILABLE/QUOTA_UNAVAILABLE/ENGINE_ERROR variants are emitted
+   * by the antigravity delegate settle path (OCV5-738), mirroring
+   * EngineExternalBillingEvent.terminalCode. */
+  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE' | 'ENGINE_ERROR'
   durationMs: number
   usage?: {
     input_tokens?: number

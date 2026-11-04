@@ -118,6 +118,7 @@ export function makeDelegateAntigravityRouteHandler(
   const runResolve = deps.resolveRoute ?? resolveAntigravityRelayRoute
   const runExpire = deps.expireRoute ?? expireAntigravityRelayRoute
   const runReleaseInflight = deps.releaseInflightFn ?? releaseInflight
+  const mintInFlight = new Set<string>()
 
   return async (req, res, ctx) => {
     setSecurityHeaders(res)
@@ -167,169 +168,204 @@ export function makeDelegateAntigravityRouteHandler(
         return
       }
       const journalRequestId = raw.requestId
-      let row: JournalAdmissionRow | undefined
-      try {
-        const result = await deps.pool.query(
-          `SELECT user_id::text AS user_id, container_id::text AS container_id, state,
-                  ctx, precheck_credits::text AS precheck_credits
-             FROM request_finalize_journal WHERE request_id=$1`,
-          [journalRequestId],
-        )
-        row = result.rows[0] as JournalAdmissionRow | undefined
-      } catch (err) {
-        log.error('delegate_antigravity_route_journal_lookup_failed', {
-          requestId,
-          err: (err as Error).message,
-        })
-        sendJson(res, 503, {
-          error: { code: 'ANTIGRAVITY_ROUTE_JOURNAL_UNAVAILABLE', message: 'journal unavailable' },
-        })
-        return
-      }
-      const invalid = validateAdmissionRow(row, identity)
-      if (invalid) {
-        log.warn('delegate_antigravity_route_journal_rejected', {
-          requestId,
-          reason: invalid,
-          userId: String(identity.userId),
-          containerId: identity.containerId,
-        })
-        sendJson(res, 409, {
-          error: { code: 'DELEGATE_ANTIGRAVITY_ROUTE_JOURNAL_INVALID', message: invalid },
-        })
-        return
-      }
-      const claim = row as JournalAdmissionRow
-      const ctxJson = claim.ctx ?? {}
-      if (typeof ctxJson.antigravityRouteToken === 'string') {
-        // A retry whose response was lost. The route itself cannot be replayed
-        // (access tokens are not stored), so fail closed; the container
-        // abandons the admission and the journal token is released there.
+      // OCV5-738 blocker 4: serialize concurrent mint attempts for the same
+      // admission before allocating shared requestId resources (turn row and
+      // account in-flight slot), so a racing loser cannot roll back the winner.
+      if (mintInFlight.has(journalRequestId)) {
         sendJson(res, 409, {
           error: {
             code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED',
-            message: 'route already minted for this admission',
+            message: 'route mint already in progress for this admission',
           },
         })
         return
       }
-      const modelId = ctxJson.model
-      if (typeof modelId !== 'string' || !isAntigravityEngineModel(modelId)) {
-        sendJson(res, 409, {
-          error: {
-            code: 'DELEGATE_ANTIGRAVITY_ROUTE_JOURNAL_INVALID',
-            message: 'admission model is not an Antigravity model',
-          },
-        })
-        return
-      }
-      const budgetCredits =
-        typeof claim.precheck_credits === 'string' && /^\d+$/.test(claim.precheck_credits)
-          ? BigInt(claim.precheck_credits)
-          : 0n
-      if (budgetCredits <= 0n) {
-        sendJson(res, 503, {
-          error: { code: 'ANTIGRAVITY_BUDGET_UNAVAILABLE', message: 'admission budget missing' },
-        })
-        return
-      }
-      const userId = BigInt(identity.userId)
-      let minted: Awaited<ReturnType<typeof admitAntigravityTurn>>
+      mintInFlight.add(journalRequestId)
       try {
-        minted = await runAdmit(
-          {
+        let row: JournalAdmissionRow | undefined
+        try {
+          const result = await deps.pool.query(
+            `SELECT user_id::text AS user_id, container_id::text AS container_id, state,
+                    ctx, precheck_credits::text AS precheck_credits
+               FROM request_finalize_journal WHERE request_id=$1`,
+            [journalRequestId],
+          )
+          row = result.rows[0] as JournalAdmissionRow | undefined
+        } catch (err) {
+          log.error('delegate_antigravity_route_journal_lookup_failed', {
+            requestId,
+            err: (err as Error).message,
+          })
+          sendJson(res, 503, {
+            error: { code: 'ANTIGRAVITY_ROUTE_JOURNAL_UNAVAILABLE', message: 'journal unavailable' },
+          })
+          return
+        }
+        const invalid = validateAdmissionRow(row, identity)
+        if (invalid) {
+          log.warn('delegate_antigravity_route_journal_rejected', {
+            requestId,
+            reason: invalid,
+            userId: String(identity.userId),
             containerId: identity.containerId,
-            userId,
-            requestId: journalRequestId,
+          })
+          sendJson(res, 409, {
+            error: { code: 'DELEGATE_ANTIGRAVITY_ROUTE_JOURNAL_INVALID', message: invalid },
+          })
+          return
+        }
+        const claim = row as JournalAdmissionRow
+        const ctxJson = claim.ctx ?? {}
+        if (typeof ctxJson.antigravityRouteToken === 'string') {
+          // A retry whose response was lost. The route itself cannot be replayed
+          // (access tokens are not stored), so fail closed; the container
+          // abandons the admission and the journal token is released there.
+          sendJson(res, 409, {
+            error: {
+              code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED',
+              message: 'route already minted for this admission',
+            },
+          })
+          return
+        }
+        const modelId = ctxJson.model
+        if (typeof modelId !== 'string' || !isAntigravityEngineModel(modelId)) {
+          sendJson(res, 409, {
+            error: {
+              code: 'DELEGATE_ANTIGRAVITY_ROUTE_JOURNAL_INVALID',
+              message: 'admission model is not an Antigravity model',
+            },
+          })
+          return
+        }
+        const budgetCredits =
+          typeof claim.precheck_credits === 'string' && /^\d+$/.test(claim.precheck_credits)
+            ? BigInt(claim.precheck_credits)
+            : 0n
+        if (budgetCredits <= 0n) {
+          sendJson(res, 503, {
+            error: { code: 'ANTIGRAVITY_BUDGET_UNAVAILABLE', message: 'admission budget missing' },
+          })
+          return
+        }
+        const userId = BigInt(identity.userId)
+        let minted: Awaited<ReturnType<typeof admitAntigravityTurn>>
+        try {
+          minted = await runAdmit(
+            {
+              containerId: identity.containerId,
+              userId,
+              requestId: journalRequestId,
+              modelId,
+              budgetCredits,
+              relayPort: deps.relayPort,
+            },
+            { clientSecret: deps.clientSecret },
+          )
+        } catch (err) {
+          const code = err instanceof AntigravityAdmissionError ? err.code : 'ANTIGRAVITY_UNAVAILABLE'
+          log.warn('delegate_antigravity_route_mint_failed', {
+            requestId,
+            userId: String(identity.userId),
+            containerId: identity.containerId,
             modelId,
-            budgetCredits,
-            relayPort: deps.relayPort,
-          },
-          { clientSecret: deps.clientSecret },
-        )
-      } catch (err) {
-        const code = err instanceof AntigravityAdmissionError ? err.code : 'ANTIGRAVITY_UNAVAILABLE'
-        log.warn('delegate_antigravity_route_mint_failed', {
+            code,
+          })
+          sendJson(res, 503, { error: { code, message: code } })
+          return
+        }
+
+        // Durable before the container can spend: settlement is claimed from
+        // this row by the delegate settle path (same authority as chat turns).
+        try {
+          await runRecord(deps.pool, {
+            requestId: journalRequestId,
+            userId,
+            modelId,
+            sessionId: typeof ctxJson.parentSessionId === 'string' ? ctxJson.parentSessionId : null,
+            traceId: null,
+          })
+        } catch (err) {
+          await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
+          sendJson(res, 503, {
+            error: { code: 'ANTIGRAVITY_ROUTE_RECORD_FAILED', message: 'turn record failed' },
+          })
+          return
+        }
+
+        // Persist the opaque token into the admission journal before returning:
+        // settle/abandon read it even after a gateway restart.
+        let persisted: { rows: Record<string, unknown>[] }
+        try {
+          persisted = await deps.pool.query(
+            `UPDATE request_finalize_journal
+                SET ctx = ctx || jsonb_build_object('antigravityRouteToken', $2::text),
+                    updated_at = NOW()
+              WHERE request_id=$1 AND user_id=$3 AND container_id=$4
+                AND state='inflight' AND NOT (ctx ? 'antigravityRouteToken')
+              RETURNING request_id`,
+            [journalRequestId, minted.token, identity.userId, identity.containerId],
+          )
+        } catch (err) {
+          await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
+          sendJson(res, 503, {
+            error: { code: 'ANTIGRAVITY_ROUTE_PERSIST_FAILED', message: 'journal persist failed' },
+          })
+          return
+        }
+        if (persisted.rows.length !== 1) {
+          // If another process won the persist race and already bound a
+          // routeToken onto this journal, only expire our own orphan token so we
+          // never abandon the winner's turn or release the winner's in-flight slot.
+          let winnerMinted = false
+          try {
+            const latest = await deps.pool.query(
+              'SELECT ctx FROM request_finalize_journal WHERE request_id=$1',
+              [journalRequestId],
+            )
+            const latestCtx = (latest.rows[0] as { ctx?: Record<string, unknown> } | undefined)?.ctx
+            winnerMinted =
+              typeof latestCtx?.antigravityRouteToken === 'string' &&
+              latestCtx.antigravityRouteToken !== minted.token
+          } catch {
+            winnerMinted = false
+          }
+          if (winnerMinted) {
+            await runExpire(minted.token).catch(() => {})
+          } else {
+            await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
+          }
+          sendJson(res, 409, {
+            error: {
+              code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED',
+              message: 'admission already holds a route',
+            },
+          })
+          return
+        }
+
+        log.info('delegate_antigravity_route_minted', {
           requestId,
           userId: String(identity.userId),
           containerId: identity.containerId,
           modelId,
-          code,
         })
-        sendJson(res, 503, { error: { code, message: code } })
-        return
-      }
-
-      // Durable before the container can spend: settlement is claimed from
-      // this row by the delegate settle path (same authority as chat turns).
-      try {
-        await runRecord(deps.pool, {
-          requestId: journalRequestId,
-          userId,
-          modelId,
-          sessionId: typeof ctxJson.parentSessionId === 'string' ? ctxJson.parentSessionId : null,
-          traceId: null,
-        })
-      } catch (err) {
-        await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
-        sendJson(res, 503, {
-          error: { code: 'ANTIGRAVITY_ROUTE_RECORD_FAILED', message: 'turn record failed' },
-        })
-        return
-      }
-
-      // Persist the opaque token into the admission journal before returning:
-      // settle/abandon read it even after a gateway restart.
-      let persisted: { rows: Record<string, unknown>[] }
-      try {
-        persisted = await deps.pool.query(
-          `UPDATE request_finalize_journal
-              SET ctx = ctx || jsonb_build_object('antigravityRouteToken', $2::text),
-                  updated_at = NOW()
-            WHERE request_id=$1 AND user_id=$3 AND container_id=$4
-              AND state='inflight' AND NOT (ctx ? 'antigravityRouteToken')
-            RETURNING request_id`,
-          [journalRequestId, minted.token, identity.userId, identity.containerId],
-        )
-      } catch (err) {
-        await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
-        sendJson(res, 503, {
-          error: { code: 'ANTIGRAVITY_ROUTE_PERSIST_FAILED', message: 'journal persist failed' },
-        })
-        return
-      }
-      if (persisted.rows.length !== 1) {
-        // Lost the race (concurrent mint) or the journal moved on: never hand
-        // out a second live route for one admission.
-        await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
-        sendJson(res, 409, {
-          error: {
-            code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED',
-            message: 'admission already holds a route',
+        // Deliberately omit account ids and the OAuth client secret: the
+        // container only consumes the route + limited token.
+        sendJson(res, 200, {
+          ok: true,
+          route: {
+            baseUrl: minted.baseUrl,
+            routeToken: minted.token,
+            accessToken: minted.accessToken,
+            accessTokenExpiresAt: minted.accessTokenExpiresAt,
+            ...(minted.idToken ? { idToken: minted.idToken } : {}),
           },
         })
         return
+      } finally {
+        mintInFlight.delete(journalRequestId)
       }
-
-      log.info('delegate_antigravity_route_minted', {
-        requestId,
-        userId: String(identity.userId),
-        containerId: identity.containerId,
-        modelId,
-      })
-      // Deliberately omit account ids and the OAuth client secret: the
-      // container only consumes the route + limited token.
-      sendJson(res, 200, {
-        ok: true,
-        route: {
-          baseUrl: minted.baseUrl,
-          routeToken: minted.token,
-          accessToken: minted.accessToken,
-          accessTokenExpiresAt: minted.accessTokenExpiresAt,
-          ...(minted.idToken ? { idToken: minted.idToken } : {}),
-        },
-      })
-      return
     }
 
     if (typeof raw.routeToken !== 'string' || !ROUTE_TOKEN_RE.test(raw.routeToken)) {

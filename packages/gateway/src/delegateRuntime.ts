@@ -1936,6 +1936,13 @@ export async function _runDelegateTaskCore(
   let billingEngine: DelegateEngineBillingEngine | undefined
   let liveEngineBilling: DurableCodexBilling | null = null
   let liveSettleTask: Promise<void> | null = null
+  // OCV5-738 blocker 1: the antigravity adapter's own external_billing
+  // terminal event is authoritative over a generic error-string guess
+  // (e.g. budgetStop reports status:'success' even though the turn's
+  // error string is non-empty, because the usage already consumed up to
+  // the budget cutoff must still be billed, clamped to balance by master).
+  let liveExternalBilling: { status: 'success' | 'error' | 'unavailable'; terminalCode?: string } | null =
+    null
   if (engineReported) {
     billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
     if (!billingModel) {
@@ -2129,7 +2136,7 @@ export async function _runDelegateTaskCore(
     })
     if (input.taskboardControl?.signal.aborted) {
       await this.sessions.destroySession(sessionKey)
-      return cancelPreparation(grokRouteLease, engineBillingAdmission)
+      return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease)
     }
     hooks?.onSessionSpawned?.()
     if (session.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
@@ -2180,6 +2187,7 @@ export async function _runDelegateTaskCore(
       await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
     }
     if (grokRouteLease) grokRouteLease.release().catch(() => {})
+    if (antigravityRouteLease) antigravityRouteLease.release().catch(() => {})
     this._releaseDelegateSlot(slotOpts)
     unregisterDelegation?.()
     // flag 未开时 resolveLocalExecutionIfEnforced 是 no-op,显式未知型号在
@@ -2322,6 +2330,10 @@ export async function _runDelegateTaskCore(
             })
           })
         }
+      } else if (e.kind === 'external_billing') {
+        // OCV5-738 blocker 1 — capture the adapter's authoritative terminal
+        // status/terminalCode for the antigravity settle branch below.
+        liveExternalBilling = { status: e.status, ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}) }
       }
       const progressBlock =
         e.kind === 'usage'
@@ -2516,12 +2528,26 @@ export async function _runDelegateTaskCore(
         // The antigravity adapter emits no codex_billing frame: the gateway
         // closes the turn from the terminal state it observed. Usage is
         // server-metered by the relay, so the frame carries no token counts.
+        //
+        // OCV5-738 blocker 1 — the adapter's own external_billing terminal
+        // event is authoritative when present: a budgetStop reports
+        // status:'success' even though `error` is non-empty, because the
+        // usage already consumed up to the budget cutoff must still be
+        // billed (master clamps to balance). Falling back to the plain
+        // error-string guess would waive that already-spent usage.
+        const externalBillingStatus: 'success' | 'error' =
+          liveExternalBilling === null
+            ? error ? 'error' : 'success'
+            : liveExternalBilling.status === 'success' ? 'success' : 'error'
         try {
           await billingApi.settle({
             requestId: engineBillingAdmission.requestId,
             engineSessionId: engineBillingAdmission.engineSessionId,
-            status: error ? 'error' : 'success',
+            status: externalBillingStatus,
             durationMs: Math.max(0, Date.now() - turnStartedAt),
+            ...(liveExternalBilling?.terminalCode
+              ? { terminalCode: liveExternalBilling.terminalCode as DurableCodexBilling['terminalCode'] }
+              : {}),
           })
         } catch (err) {
           this.log.warn('delegate_engine_billing_settle_failed', {

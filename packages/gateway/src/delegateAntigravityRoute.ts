@@ -227,7 +227,7 @@ export async function acquireDelegateAntigravityRoute(args: {
   if (mint.statusCode === 200) {
     const route = parseRoute(mint.text)
     if (!route) {
-      return { ok: false, httpStatus: 502, reason: 'master antigravity route mint 响应字段缺失' }
+      return { ok: false, httpStatus: 503, reason: 'master antigravity route mint 响应字段缺失' }
     }
     const routeToken = route.routeToken
     const heartbeatMs = args.heartbeatMs ?? HEARTBEAT_INTERVAL_MS

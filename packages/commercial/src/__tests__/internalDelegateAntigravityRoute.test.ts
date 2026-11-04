@@ -464,4 +464,36 @@ describe('internalDelegateAntigravityRoute', () => {
       })
     }
   })
+
+  test('concurrent mints for the same requestId serialize and loser never abandons winner turn or in-flight slot (Blocker 4)', async () => {
+    const { pool } = makePool({ row: [journalRow(), journalRow()] })
+    let admitted = 0
+    const abandoned: string[] = []
+    const released: string[] = []
+    const handler = makeHandler({
+      pool,
+      admit: async () => {
+        admitted += 1
+        await new Promise((r) => setTimeout(r, 20))
+        return mintedRoute()
+      },
+      abandonTurn: async (_pool: unknown, requestId: string) => {
+        abandoned.push(requestId)
+      },
+      releaseInflightFn: (requestId: string) => {
+        released.push(requestId)
+      },
+    })
+    await withServer(handler, async (port) => {
+      const [r1, r2] = await Promise.all([
+        call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, { requestId: REQUEST_ID }),
+        call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, { requestId: REQUEST_ID }),
+      ])
+      const statuses = [r1.status, r2.status].sort((a, b) => a - b)
+      assert.deepEqual(statuses, [200, 409])
+    })
+    assert.equal(admitted, 1, 'only one mint may allocate upstream resources')
+    assert.deepEqual(abandoned, [], 'loser must not abandon winner turn')
+    assert.deepEqual(released, [], 'loser must not release winner in-flight slot')
+  })
 })

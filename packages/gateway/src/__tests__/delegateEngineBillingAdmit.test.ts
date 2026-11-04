@@ -532,4 +532,38 @@ describe('handleDelegateTask antigravity delegate route (OCV5-738)', () => {
       }
     }
   })
+
+  it('(l) 预算耗尽停止时消费 external_billing 权威 status=success 与 terminalCode，不免单 (Blocker 1)', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    gw._acquireDelegateAntigravityRoute = async () => ({
+      ok: true as const,
+      lease: {
+        route: antigravityRoute(),
+        routeToken: ANTIGRAVITY_ROUTE_TOKEN,
+        release: async () => {},
+      },
+    })
+    const origSubmit = gw.sessions.submit
+    gw.sessions.submit = async (_s: unknown, _p: string, onEvent: (e: any) => void) => {
+      onEvent({
+        kind: 'external_billing',
+        requestId: REQUEST_ID,
+        status: 'success',
+        terminalCode: 'ENGINE_ERROR',
+      })
+      onEvent({ kind: 'error', error: 'BUDGET_EXHAUSTED: turn exceeded precheck' })
+      onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 100, outputTokens: 50, turn: 1 } })
+    }
+    try {
+      const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(r.body.ok, false)
+      assert.equal(billing.settles.length, 1)
+      assert.equal((billing.settles[0] as { status: string }).status, 'success')
+      assert.equal((billing.settles[0] as { terminalCode?: string }).terminalCode, 'ENGINE_ERROR')
+    } finally {
+      gw.sessions.submit = origSubmit
+    }
+  })
 })

@@ -180,6 +180,7 @@ function makeRuntime(opts?: {
   antigravity?: {
     journalState?: string
     usageRows?: Array<{ id: string; ledger_id: string | null; cost_credits: string }>
+    turnRows?: Array<{ status: string; has_usage: boolean }>
     claim?: (pool: unknown, requestId: string) => Promise<string | null>
     finalize?: (pool: unknown, args: Record<string, unknown>) => Promise<void>
     settle?: (args: Record<string, unknown>) => Promise<unknown>
@@ -227,6 +228,9 @@ function makeRuntime(opts?: {
           }
           if (String(sql).includes('FROM usage_records')) {
             return { rows: opts?.antigravity?.usageRows ?? [], rowCount: 0 }
+          }
+          if (String(sql).includes('FROM antigravity_turns')) {
+            return { rows: opts?.antigravity?.turnRows ?? [], rowCount: 0 }
           }
           if (String(sql).includes('UPDATE request_finalize_journal')) {
             journalUpdates.push({ sql: String(sql), params: params ?? [] })
@@ -1560,5 +1564,59 @@ describe('delegate engine-billing antigravity reconciliation (OCV5-738)', () => 
       expireForRequest: [],
       releaseInflight: [],
     })
+  })
+
+  it('settles using the journal frozen billingPricing snapshot instead of live cache (Blocker 2)', async () => {
+    const { runtime, journals, antigravityCalls } = makeRuntime()
+    journals.set(
+      REQUEST_ID,
+      antigravityJournal({
+        billingPricing: {
+          v: 1,
+          modelId: AG_MODEL,
+          displayName: 'Claude Sonnet 5.5',
+          inputPerMtok: '3000',
+          outputPerMtok: '15000',
+          cacheReadPerMtok: '300',
+          cacheWritePerMtok: '3750',
+          multiplier: '2.000',
+        },
+      }),
+    )
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    const passedPricing = (antigravityCalls.settle[0] as { pricing: { get(m: string): any } }).pricing
+    const resolved = passedPricing.get(AG_MODEL)
+    assert.equal(resolved?.multiplier, '2.000')
+    assert.equal(resolved?.input_per_mtok, 3000n)
+  })
+
+  it('keeps journal inflight for retry when settle returns null but turn row is still pending/has usage (Blocker 3)', async () => {
+    const { runtime, journals, journalUpdates, abortCalls, releaseCalls } = makeRuntime({
+      antigravity: {
+        settle: async () => null,
+        turnRows: [{ status: 'pending', has_usage: true }],
+      },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+          identity: IDENTITY,
+          body: antigravitySettleBody(),
+        }),
+      /DELEGATE_ANTIGRAVITY_SETTLE_RETRYABLE/,
+    )
+    assert.equal(abortCalls.length, 0, 'must not abort journal when turn is pending with usage')
+    assert.equal(releaseCalls.length, 0, 'must keep precheck reserved for retry')
+    assert.equal(
+      journalUpdates.some((u) => u.sql.includes("state='inflight'") && u.params[0] === REQUEST_ID),
+      true,
+    )
   })
 })

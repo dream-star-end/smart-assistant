@@ -207,6 +207,6 @@ describe('acquireDelegateAntigravityRoute', () => {
       heartbeatMs: 60_000,
     })
     assert.equal(result.ok, false)
-    assert.equal((result as { httpStatus: number }).httpStatus, 502)
+    assert.equal((result as { httpStatus: number }).httpStatus, 503)
   })
 })

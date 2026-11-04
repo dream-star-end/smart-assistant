@@ -15,7 +15,7 @@
   },
   {
     "path": "packages/gateway/src/delegateRuntime.ts",
-    "maxLines": 3105,
+    "maxLines": 3135,
     "ticket": "OCV5-738",
     "reason": "OCV5-738 adds the Antigravity delegate branch (route acquisition, safe projection, 503 fail-closed with journal abandon/slot release, and exactly-once settle/abandon) next to the Codex/Grok branches; the base branch is already 5 lines over the 3000 absolute limit, and the branch is deliberately kept beside its Codex twin for auditability. Extract to a helper module when the delegate runtime split lands.",
     "expires": "2026-12-04"

@@ -125,7 +125,11 @@ export interface AntigravitySettleAttribution {
 
 export async function settleAntigravityTurn(args: {
   pool: Pool
-  pricing: PricingCache
+  // OCV5-738 blocker 2: the delegate settle path must pass the journal's
+  // frozen price snapshot, not the live cache, so `Pick<..,'get'>` is all
+  // that is actually required (and all `refreshWaivedAntigravityUsage`
+  // below already assumes).
+  pricing: Pick<PricingCache, 'get'>
   userId: bigint
   requestId: string
   modelId: string
@@ -303,7 +307,7 @@ type SettledTurn = { settled: SettleResult; turn: AntigravityTurnRecord }
  */
 export async function settleAntigravityTurnRecord(args: {
   pool: Pool
-  pricing: PricingCache
+  pricing: Pick<PricingCache, 'get'>
   requestId: string
   userId: bigint
   engineStatus: AntigravityEngineStatus | 'unknown'

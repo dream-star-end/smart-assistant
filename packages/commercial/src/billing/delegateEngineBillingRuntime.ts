@@ -32,7 +32,7 @@ import {
   UnknownCapabilitySchemaError,
   type ModelCatalogSnapshot,
 } from './modelCatalog.js'
-import { serializeBillingPricing } from './persistedBillingPricing.js'
+import { parseBillingPricing, serializeBillingPricing } from './persistedBillingPricing.js'
 import type { PricingCache } from './pricing.js'
 import {
   InsufficientCreditsError,
@@ -428,9 +428,36 @@ export function createDelegateEngineBillingRuntime(
           throw new Error('DELEGATE_ENGINE_BILLING_JOURNAL_CONFLICT')
         }
         try {
+          // OCV5-738 blocker 2: settle with the immutable price snapshot frozen
+          // at admission (includes composed agent multiplier). Fall back to
+          // live pricing cache only for legacy journals without billingPricing.
+          const frozenModel = typeof journalRow.ctx?.model === 'string' ? journalRow.ctx.model : undefined
+          const hasFrozenPricing = journalRow.ctx?.billingPricing !== undefined
+          const frozenPricing =
+            frozenModel && hasFrozenPricing
+              ? parseBillingPricing(journalRow.ctx?.billingPricing, frozenModel)
+              : null
+          if (hasFrozenPricing && frozenPricing === null) {
+            await runAbort(
+              pool,
+              requestId,
+              'durable_billing_pricing_invalid',
+              'INTERNAL_ERROR',
+              claimId,
+            )
+            runReleaseAntigravityInflight(requestId)
+            await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+            return { settled: false }
+          }
+          const settlePricing: Pick<PricingCache, 'get'> = frozenPricing
+            ? {
+                get: (modelId: string) =>
+                  modelId === frozenPricing.model_id ? frozenPricing : deps.pricing.get(modelId),
+              }
+            : deps.pricing
           const done = await runSettleAntigravity({
             pool,
-            pricing: deps.pricing,
+            pricing: settlePricing,
             requestId,
             userId,
             engineStatus,
@@ -438,8 +465,8 @@ export function createDelegateEngineBillingRuntime(
             attribution: resolveDelegateBillingAttribution(journalRow.ctx, body),
           })
           if (done === null) {
-            // No turn row (route never minted → nothing ran) or another
-            // settle already owns it. Prefer durable usage truth when present.
+            // No turn row (route never minted → nothing ran), pricing missing,
+            // or another settle already owns it. Prefer durable usage truth when present.
             const usage = await pool.query<{
               id: string
               ledger_id: string | null
@@ -451,6 +478,26 @@ export function createDelegateEngineBillingRuntime(
             )
             const row = usage.rows[0]
             if (!row) {
+              // OCV5-738 blocker 3: distinguish "route never minted / abandoned
+              // with zero relay usage" from "turn exists (pending due to missing
+              // price, or settling by another worker) / relay usage recorded".
+              const turnState = await pool.query<{
+                status: string
+                has_usage: boolean
+              }>(
+                `SELECT t.status,
+                        EXISTS (
+                          SELECT 1 FROM antigravity_relay_usage u
+                           WHERE u.request_id = t.request_id AND u.user_id = t.user_id
+                        ) AS has_usage
+                   FROM antigravity_turns t
+                  WHERE t.request_id = $1 AND t.user_id = $2`,
+                [requestId, String(identity.userId)],
+              )
+              const turnRow = turnState.rows[0]
+              if (turnRow && (turnRow.status !== 'abandoned' || turnRow.has_usage)) {
+                throw new Error('DELEGATE_ANTIGRAVITY_SETTLE_RETRYABLE')
+              }
               await runAbort(
                 pool,
                 requestId,
