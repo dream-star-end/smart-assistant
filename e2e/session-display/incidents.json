@@ -9800,7 +9800,8 @@
       "rootFixCommit": "4f1f8d23",
       "coverageCommits": [
         "40cae4f8",
-        "8d10816b"
+        "8d10816b",
+        "e4c3cb32"
       ],
       "regressions": [
         {
@@ -9822,6 +9823,26 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "await proveUid4FirstFailurePreserved(uid4Context(db))"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxFailureEvidence.test.ts",
+          "assertion": "today's exact Box tool, Exec417 and compact failures survive bounded first-error projection"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "event order failures retain fixed event type, state bits and only a bounded numeric index"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "tool validation first errors survive first-round cleanup and strict terminal wrapping"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResumePublish.test.ts",
+          "assertion": "post-claim pending-read and result-stage 417 failures are observed before unknown with exact claim identity"
         }
       ]
     },

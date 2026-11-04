@@ -4,6 +4,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { BoxDurableJournal, BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
+import { boxFailureFromError } from "./boxFailureEvidence.js";
 import { makeBoxDetachedRunAccess, type BoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { makeBoxPendingRead, makeBoxToolResultPlan,
   parseBoxPendingCall } from "./boxToolResultPlan.js";
@@ -23,7 +24,8 @@ export interface BoxToolPublishedResume {
   readonly access: BoxDetachedRunAccess;
   readonly target: BoxResolvedTarget;
 }
-type Journal = Pick<BoxDurableJournal, "claimToolResume" | "markUnknown">;
+type Journal = Pick<BoxDurableJournal, "claimToolResume" | "markUnknown">
+  & Partial<Pick<BoxDurableJournal, "recordFirstFailure">>;
 
 export async function publishBoxToolResume(input: {
   uid: bigint;
@@ -199,6 +201,20 @@ export async function publishBoxToolResume(input: {
     }
     return { claim, access, target };
   } catch (error) {
+    if (claim && deps.journal.recordFirstFailure) {
+      let failureTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const failure = boxFailureFromError(error, "continuation");
+        if (failure) await Promise.race([
+          deps.journal.recordFirstFailure({ requestId: input.requestId, uid: input.uid,
+            accountId: claim.accountId, runNonce: claim.runNonce,
+            leaseEpoch: claim.leaseEpoch, ownerRequestId: claim.ownerRequestId,
+            ...failure, diagnostic: { ...failure.diagnostic, branch: "resume_publish" } }),
+          new Promise<void>((resolve) => { failureTimer = setTimeout(resolve, 200); }),
+        ]);
+      } catch { /* Observation is best effort; preserve the publication error and unknown path. */ }
+      finally { if (failureTimer) clearTimeout(failureTimer); }
+    }
     // OCV5-323: without a resolved target no pending read or result write ran,
     // so the CLI is still parked on results this plane never re-publishes.
     if (claim) await unknown(target ? "resume_publish_unknown" : "resume_publish_unsent");

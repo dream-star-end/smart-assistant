@@ -1271,3 +1271,50 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and 
     assert.equal(f.disposed, false, "unknown remote stop cannot release the owned target");
   } finally { release(); await hung; }
 });
+
+test("tool validation first errors survive first-round cleanup and strict terminal wrapping", async () => {
+  const malformedInput = Buffer.from([records[0], records[1], records[2],
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"private-input":' } }),
+    records[5]].map((item) => JSON.stringify(item) + "\n").join(""));
+  const outOfOrder = Buffer.from([records[0], event({ type: "content_block_delta", index: 0,
+    delta: { type: "text_delta", text: "private-output" } })]
+    .map((item) => JSON.stringify(item) + "\n").join(""));
+  for (const item of [
+    { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput },
+    { code: "BOX_TOOL_ORDER_INVALID", spoolBody: outOfOrder },
+    { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput,
+      terminalProof: "worker_failed" as const, emptyFirstRead: true },
+  ]) {
+    const f = fixture(item);
+    const journal = f.deps.journal as unknown as {
+      recordFirstFailure?: (input: { code: string; phase: string; diagnostic?: unknown }) => Promise<null> };
+    const saved: Array<{ code: string; phase: string; diagnostic?: unknown }> = [];
+    journal.recordFirstFailure = async (input) => {
+      saved.push(input); f.sequence.push("first-failure"); return null;
+    };
+    await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+      stopRejectedRun: async () => { f.sequence.push("stop"); return "stopped_proven"; } }),
+    (error: unknown) => {
+      if (item.terminalProof) {
+        assert.ok(error instanceof BoxSpoolTerminalError);
+        assert.equal(error.proof.reason, "worker_failed");
+        assert.equal((error.cause as { code: string }).code, item.code);
+      } else assert.equal((error as { code: string }).code, item.code);
+      return true;
+    });
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0]!.code, item.code);
+    assert.equal(saved[0]!.phase, "first_round");
+    assert.ok(saved[0]!.diagnostic);
+    assert.ok(!JSON.stringify(saved, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value).includes("private"));
+    for (const later of ["stop", "unknown", "retain-unknown"]) {
+      if (f.sequence.includes(later))
+        assert.ok(f.sequence.indexOf("first-failure") < f.sequence.indexOf(later));
+    }
+    assert.equal(f.launches, 1);
+    assert.equal(f.sequence.includes("durable-handoff"), false);
+    assert.equal(f.sequence.includes("terminal-journal"), false);
+  }
+});
