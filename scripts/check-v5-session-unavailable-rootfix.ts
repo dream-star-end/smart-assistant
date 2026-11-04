@@ -1212,3 +1212,19 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[relay-request-body-errors] PASS — relay read errors never reserve credits or become 413; metadata and generate byte caps remain enforced')
+
+// INC-20261104-ANTIGRAVITY-DELIVERY: real subprocess -> runner -> SQLite reopen.
+// This is an executed local durability proof, not production PG or wallet proof.
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/antigravityDeliveryPersistence.test.ts'],
+  expected: [
+    'terminal-only survives SQLite reopen (1 terminal frames, one delivery/settlement)',
+    'terminal-only survives SQLite reopen (3 terminal frames, one delivery/settlement)',
+    'native-only survives SQLite reopen (1 terminal frames, one delivery/settlement)',
+    'native-only survives SQLite reopen (3 terminal frames, one delivery/settlement)',
+  ],
+  label: 'antigravity-durable-delivery',
+  timeoutMs: 120_000,
+})
+console.log('[antigravity-durable-delivery] PASS — executed terminal/native fallback, one subprocess/side effect/settlement and durable SQLite reopen')

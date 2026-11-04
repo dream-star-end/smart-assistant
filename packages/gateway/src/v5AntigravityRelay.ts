@@ -7,8 +7,10 @@
  * account's full-scope token.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { Readable } from 'node:stream'
 import { ANTIGRAVITY_RELAY_PREFIX, TRACE_ID_HEADER } from '@openclaude/protocol'
+import { createLogger, type Logger } from './logger.js'
 import { routeRelayTrace } from './relayTrace.js'
 import { isLoopbackRemoteAddress } from './v3CodexRelay.js'
 
@@ -18,6 +20,10 @@ export interface V5AntigravityRelayConfig {
   masterBaseUrl: string
   containerToken: string
 }
+
+const relayLogger = createLogger({ module: 'v5AntigravityRelay' })
+// A queued stream error after terminal cleanup must not become uncaught.
+function ignoreLateStreamError(): void {}
 
 type FetchLike = (input: string, init: RequestInit & { duplex?: 'half' }) => Promise<Response>
 const HOP = new Set([
@@ -76,7 +82,7 @@ export async function handleV5AntigravityRelayLocal(
   req: IncomingMessage,
   res: ServerResponse,
   cfg: V5AntigravityRelayConfig,
-  opts: { fetchImpl?: FetchLike } = {},
+  opts: { fetchImpl?: FetchLike; logger?: Pick<Logger, 'info'> } = {},
 ): Promise<void> {
   if (!isLoopbackRemoteAddress(req.socket.remoteAddress)) {
     sendJson(res, 403, {
@@ -89,22 +95,57 @@ export async function handleV5AntigravityRelayLocal(
     sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'unknown antigravity relay path' } })
     return
   }
+  const requestId = randomUUID()
+  const traceId = routeRelayTrace(parsed.pathname)
+  const rpc = /\/v1internal:([A-Za-z]{1,64})$/.exec(parsed.pathname)?.[1] ?? 'unknown'
+  const startedAt = performance.now()
+  const stage = (name: string, statusCode?: number): void => {
+    try {
+      (opts.logger ?? relayLogger).info('antigravity_local_relay', {
+        requestId, traceId, rpc, stage: name, elapsedMs: performance.now() - startedAt,
+        ...(traceId === undefined ? { traceIdMissing: 'relay-without-trace' } : {}),
+        ...(statusCode === undefined ? {} : { statusCode }),
+      })
+    } catch { /* Diagnostics cannot change delivery. No URL, body or error text. */ }
+  }
+  res.setHeader('x-request-id', requestId)
   const controller = new AbortController()
-  const abort = () => controller.abort()
-  req.once('aborted', abort)
-  res.once('close', abort)
+  const onAborted = (): void => { stage('request_aborted'); controller.abort() }
+  const onClose = (): void => {
+    if (!res.writableFinished) stage('downstream_closed')
+    controller.abort()
+  }
+  req.once('aborted', onAborted)
+  res.once('close', onClose)
+  stage('request_received')
   try {
+    if (req.destroyed || req.aborted || res.destroyed) {
+      stage('downstream_closed')
+      return
+    }
+    const headers = headersFor(req, cfg.containerToken, parsed.pathname)
+    headers.set('x-request-id', requestId)
+    stage('fetch_started')
     const upstream = await (opts.fetchImpl ?? (fetch as FetchLike))(
       `${cfg.masterBaseUrl}${parsed.pathname}${parsed.search}`,
       {
         method: req.method ?? 'GET',
-        headers: headersFor(req, cfg.containerToken, parsed.pathname),
+        headers,
         body:
-          req.method === 'GET' || req.method === 'HEAD' ? undefined : (req as unknown as BodyInit),
+          req.method === 'GET' || req.method === 'HEAD'
+            ? undefined
+            // Fetch cancels its upload iterator on an early upstream rejection.
+            // Do not let iterator.return() destroy the CLI socket before its 413.
+            : (req.iterator({ destroyOnReturn: false }) as unknown as BodyInit),
         duplex: 'half',
         signal: controller.signal,
       },
     )
+    stage('headers_received', upstream.status)
+    if (res.destroyed) {
+      await upstream.body?.cancel()
+      return
+    }
     res.statusCode = upstream.status
     // Loopback hop only: closing after each response prevents Go's net/http pool
     // from holding an idle socket across a 5s+ tool execution window and racing
@@ -118,17 +159,39 @@ export async function handleV5AntigravityRelayLocal(
     })
     if (!upstream.body) {
       res.end()
+      stage('response_complete', upstream.status)
       return
     }
     await new Promise<void>((resolve, reject) => {
       const body = Readable.fromWeb(upstream.body as any)
-      body.on('error', reject)
-      res.on('error', reject)
-      res.on('finish', resolve)
-      body.pipe(res)
+      let settled = false
+      const settle = (err?: Error): void => {
+        if (settled) return
+        settled = true
+        body.unpipe(res)
+        body.off('error', onError)
+        res.off('error', onError)
+        res.off('finish', onFinish)
+        res.off('close', onClosed)
+        body.on('error', ignoreLateStreamError)
+        res.on('error', ignoreLateStreamError)
+        if (!body.readableEnded) body.destroy()
+        if (err) reject(err)
+        else resolve()
+      }
+      const onError = (err: Error): void => settle(err)
+      const onFinish = (): void => { stage('response_complete', upstream.status); settle() }
+      const onClosed = (): void => settle()
+      body.once('error', onError)
+      res.once('error', onError)
+      res.once('finish', onFinish)
+      res.once('close', onClosed)
+      if (res.destroyed) settle()
+      else body.pipe(res)
     })
   } catch (err) {
     if (controller.signal.aborted) return
+    stage('relay_failed')
     if (res.headersSent) {
       res.destroy(err instanceof Error ? err : undefined)
       return
@@ -136,11 +199,14 @@ export async function handleV5AntigravityRelayLocal(
     sendJson(res, 502, {
       error: {
         code: 'ANTIGRAVITY_RELAY_FAILED',
-        message: err instanceof Error ? err.message : String(err),
+        message: 'antigravity relay transport failed',
       },
     })
   } finally {
-    req.off('aborted', abort)
-    res.off('close', abort)
+    req.off('aborted', onAborted)
+    res.off('close', onClose)
+    // Also release an unfinished upload after an early response. The preserved
+    // request iterator leaves the client connection to ServerResponse to close.
+    controller.abort()
   }
 }

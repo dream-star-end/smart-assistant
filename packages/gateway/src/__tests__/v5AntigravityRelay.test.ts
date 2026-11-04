@@ -227,7 +227,7 @@ describe('P1 local relay lifecycle and safe diagnostics', () => {
           forwardedId = new Headers(init.headers).get('x-request-id')
           return new Response('ok')
         },
-      } as any)
+      })
     })
     const port = await listen(server)
     try {
@@ -256,9 +256,14 @@ describe('P1 local relay lifecycle and safe diagnostics', () => {
     const finished = new Promise<void>((resolve) => { done = resolve })
     let cancelled = false
     let response: import('node:http').ServerResponse | undefined
+    let originalFinishListeners: Function[] = []
+    let originalCloseListeners: Function[] = []
     const logs: Array<Record<string, unknown>> = []
     const server = createServer((req, res) => {
       response = res
+      // Node owns resOnFinish even on a premature close; only relay listeners must leave.
+      originalFinishListeners = res.listeners('finish')
+      originalCloseListeners = res.listeners('close')
       void handleV5AntigravityRelayLocal(req, res, {
         masterBaseUrl: 'http://private-master.invalid', containerToken: 'private-container-token',
       }, {
@@ -267,7 +272,7 @@ describe('P1 local relay lifecycle and safe diagnostics', () => {
           start(controller) { controller.enqueue(new TextEncoder().encode('first')) },
           cancel() { cancelled = true },
         })),
-      } as any).finally(done)
+      }).finally(done)
     })
     const port = await listen(server)
     const req = httpRequest({
@@ -286,8 +291,8 @@ describe('P1 local relay lifecycle and safe diagnostics', () => {
         timer = setTimeout(() => reject(new Error('local pipe remained pending after close')), 3000)
       })])
       assert.equal(cancelled, true)
-      assert.equal(response?.listenerCount('finish'), 0)
-      assert.equal(response?.listenerCount('close'), 0)
+      assert.deepEqual(response?.listeners('finish'), originalFinishListeners)
+      assert.deepEqual(response?.listeners('close'), originalCloseListeners)
       assert.ok(logs.some((row) => row.stage === 'downstream_closed'))
     } finally { clearTimeout(timer); req.destroy(); server.closeAllConnections(); await close(server) }
   })
@@ -300,7 +305,7 @@ describe('P1 local relay lifecycle and safe diagnostics', () => {
       }, {
         logger: { info: (_message: string, fields?: Record<string, unknown>) => { logs.push(fields ?? {}) } },
         fetchImpl: async () => { throw new Error('private-token http://private-url private-body') },
-      } as any)
+      })
     })
     const port = await listen(server)
     try {

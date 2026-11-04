@@ -1325,7 +1325,7 @@ describe('P1 real HTTP transport (no Google traffic)', () => {
         recordUsage: async () => {}, reportOutcome: async () => {}, reportModelOutcome: async () => {},
         requestFn: (async () => {
           upstreamCalls++
-          return { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, body: Readable.from(SSE) }
+          return { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, body: Readable.from(SSE.map((chunk) => Buffer.from(chunk))) }
         }) as never,
       })
       const errors: unknown[] = []
