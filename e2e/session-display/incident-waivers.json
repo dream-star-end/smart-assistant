@@ -367,6 +367,12 @@
       "reason": "OCV5-738: 保持 DurableCodexBilling.terminalCode 与 OutboundCodexBilling 窄类型一致，将 Antigravity 专属 terminalCode 扩宽收敛到 DelegateEngineBillingSettlePayload，消除 inboundDispatch.ts(2123) 类型冲突。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
       "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "7eecab3d67066ae00905a9f806f33d0c4c71b76b",
+      "reason": "OCV5-741: 修复 Box 空闲压缩 selectIdlePreserve 保留非落盘 attachment 导致 applyIdleTranscript 抛 IDLE_ARTIFACT_MISSING 死锁，以及 writeSettledIdleOp 覆写刷新 mtime 导致 10 分钟 IDLE_APPLY_STUCK_MS 兜底失效。属于后台空闲压缩修复，不改会话展示或错误卡。",
+      "approvedBy": "user 2026-11-04 webmw1rclzbt1ckvm 拍板建单修复两个代码 Bug",
+      "expiresAt": "2026-12-04"
     }
   ]
 }

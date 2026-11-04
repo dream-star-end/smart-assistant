@@ -19,7 +19,7 @@ import { IDLE_COMPACT_INSTRUCTIONS, runIdleCompact } from '../../services/compac
 import { buildIdleNativeFit } from '../../services/compact/idleNativeFit.js'
 import { getSessionId } from '../../bootstrap/state.js'
 import { loadConversationForResume } from '../../utils/conversationRecovery.js'
-import { flushSessionStorage, recordTranscript } from '../../utils/sessionStorage.js'
+import { flushSessionStorage, isLoggableMessage, recordTranscript } from '../../utils/sessionStorage.js'
 import { suppressCompactWarning } from '../../services/compact/compactWarningState.js'
 import { microcompactMessages } from '../../services/compact/microCompact.js'
 import { runPostCompactCleanup } from '../../services/compact/postCompactCleanup.js'
@@ -74,6 +74,7 @@ export const call: LocalCommandCall = async (args, context) => {
           await getCacheSharingParams(context, msgs),
           customInstructions,
         ),
+        isLoggable: isLoggableMessage,
         record: recordTranscript,
         flush: flushSessionStorage,
         load: async (id) => loadConversationForResume(id, undefined),

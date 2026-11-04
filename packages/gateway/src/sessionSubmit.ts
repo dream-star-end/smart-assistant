@@ -260,7 +260,7 @@ async function stopParkedIdleTurn(op: IdleOp): Promise<void> {
 
 /** Persist an op; once settled, rotate old settled files for the session. */
 function writeSettledIdleOp(recoveryDir: string, op: IdleOp): void {
-  writeIdleOp(recoveryDir, op)
+  writeIdleOp(recoveryDir, op, { preservePreparedMtime: true })
   if (idleOpSettled(op)) pruneIdleOps(recoveryDir, op.sessionKey)
 }
 
