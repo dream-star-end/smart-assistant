@@ -2126,6 +2126,29 @@ describe("Sidebar UI-1 层级", () => {
     openSessionMenu("好好的");
     expect(within(screen.getByRole("menu")).queryByText("出错")).toBeNull();
   });
+
+  it("待用户审批或回答的会话在左侧栏显示 Q 版问号徽标并在行菜单注明原因", () => {
+    renderSidebar({
+      sessions: [
+        session({ id: "s-approval", title: "待批单据" }),
+        session({ id: "s-answer", title: "待答选项" }),
+        session({ id: "s-idle", title: "普通会话" }),
+      ],
+      sessionNeedsYou: (id: string) =>
+        id === "s-approval" ? "approval" : id === "s-answer" ? "answer" : null,
+    });
+    const approvalDot = screen.getByLabelText("等你批准");
+    expect(approvalDot).toHaveAttribute("data-dot-kind", "needs_you");
+    expect(approvalDot).toHaveAttribute("data-mark", "question");
+    expect(approvalDot.querySelector("svg")).not.toBeNull();
+
+    const answerDot = screen.getByLabelText("等你回答");
+    expect(answerDot).toHaveAttribute("data-dot-kind", "needs_you");
+    expect(answerDot).toHaveAttribute("data-mark", "question");
+
+    openSessionMenu("待批单据");
+    expect(within(screen.getByRole("menu")).getByText("等你批准")).toBeInTheDocument();
+  });
 });
 
 it("OD-P1 sidebar filters foreign titles, previews and archived sessions across account changes", () => {

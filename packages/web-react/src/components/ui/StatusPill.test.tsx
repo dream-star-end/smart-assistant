@@ -46,6 +46,16 @@ describe("StatusPill 点形态", () => {
     expect(ring).not.toHaveClass("bg-status-running");
   });
 
+  it("mark=question: 侧栏待用户回答/审批渲染为 Q 版问号徽标 (OCV5-739)", () => {
+    render(<StatusPill status="needs_you" label="等你批准" size="md" mark="question" />);
+    const qmark = screen.getByRole("img", { name: "等你批准" });
+    expect(qmark).toHaveAttribute("data-mark", "question");
+    expect(qmark).toHaveAttribute("data-status", "needs_you");
+    expect(qmark).toHaveAttribute("title", "等你批准");
+    expect(qmark).toHaveClass("bg-status-attention", "ring-status-attention/20");
+    expect(qmark.querySelector("svg")).not.toBeNull();
+  });
+
   it("decorative:旁边已有文字,点只做装饰", () => {
     const { container } = render(<StatusPill tone="done" decorative />);
     const dot = container.firstElementChild as HTMLElement;
