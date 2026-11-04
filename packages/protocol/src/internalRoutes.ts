@@ -37,6 +37,26 @@ export function isDelegateGrokRoutePath(path: string): boolean {
   )
 }
 
+// ── delegate antigravity-route(v5 面 forwarder 放行例外)───────────────────
+// 容器本地 delegate turn 没有浏览器 frame 注入 __oc_antigravity_route,
+// gateway 向 master 申请同款 token-bound loopback route(OCV5-738)。
+export const DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH = '/internal/v5/delegate/antigravity-route/mint'
+export const DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH = '/internal/v5/delegate/antigravity-route/release'
+export const DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH = '/internal/v5/delegate/antigravity-route/renew'
+
+export function isDelegateAntigravityRoutePath(path: string): boolean {
+  return (
+    path === DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH ||
+    path === DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH ||
+    path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH
+  )
+}
+
+/** delegate engine relay route 的 forwarder 放行例外集合(grok + antigravity)。 */
+export function isDelegateRouteForwardException(path: string): boolean {
+  return isDelegateGrokRoutePath(path) || isDelegateAntigravityRoutePath(path)
+}
+
 // ── v5 控制面其余路径 ───────────────────────────────────────────────────────
 export const COST_EVENT_PATH = '/internal/v5/cost-event'
 export const EGRESS_HEALTH_PATH = '/internal/v5/egress-health'
@@ -173,6 +193,30 @@ export const INTERNAL_ROUTES = [
     egressForwardException: true,
     selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
+  },
+  {
+    path: DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH,
+    match: 'exact',
+    plane: 'v5',
+    egressForwardException: true,
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
+  },
+  {
+    path: DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH,
+    match: 'exact',
+    plane: 'v5',
+    egressForwardException: true,
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
+  },
+  {
+    path: DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH,
+    match: 'exact',
+    plane: 'v5',
+    egressForwardException: true,
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
   },
   {
     path: SYSTEM_ACTIONS_INTERNAL_PATH,

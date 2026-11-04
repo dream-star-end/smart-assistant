@@ -117,6 +117,12 @@ export function planAntigravitySettle(args: {
   return { settleStatus: engineOk ? 'success' : 'error', costCredits, snapshotJson, usage }
 }
 
+export interface AntigravitySettleAttribution {
+  delegateAgentId?: string
+  parentSessionId?: string
+  parentTurnKey?: string
+}
+
 export async function settleAntigravityTurn(args: {
   pool: Pool
   pricing: PricingCache
@@ -126,6 +132,12 @@ export async function settleAntigravityTurn(args: {
   sessionId: string | null
   engineStatus: AntigravityEngineStatus
   terminalCode?: string | null
+  /**
+   * Delegate turn attribution (OCV5-738). Chat turns omit it and keep the
+   * historical mode='chat' shape; a delegate turn must land mode='delegate'
+   * like every other engine so spend reports are not silently mixed.
+   */
+  attribution?: AntigravitySettleAttribution | null
 }): Promise<SettleResult | null> {
   const pricing = args.pricing.get(args.modelId)
   if (pricing === null) return null
@@ -146,6 +158,14 @@ export async function settleAntigravityTurn(args: {
     costCredits: plan.costCredits,
     status: plan.settleStatus,
     sessionId: args.sessionId,
+    ...(args.attribution
+      ? {
+          mode: 'delegate' as const,
+          parentSessionId: args.attribution.parentSessionId ?? null,
+          delegateAgentId: args.attribution.delegateAgentId ?? null,
+          parentTurnKey: args.attribution.parentTurnKey ?? null,
+        }
+      : {}),
   })
   // A call that recorded its row between the sum above and this write would
   // otherwise be missed: its relay refresh found no usage row to update yet.
@@ -288,6 +308,8 @@ export async function settleAntigravityTurnRecord(args: {
   userId: bigint
   engineStatus: AntigravityEngineStatus | 'unknown'
   terminalCode?: string | null
+  /** Delegate attribution; omitted for chat turns (OCV5-738). */
+  attribution?: AntigravitySettleAttribution | null
   /** Reconcile pass: also take over a 'settling' row abandoned by a crash. */
   staleBefore?: Date
 }): Promise<SettledTurn | null> {
@@ -334,6 +356,7 @@ export async function settleAntigravityTurnRecord(args: {
       engineStatus: engineStatus === 'unknown' ? 'success' : engineStatus,
       terminalCode:
         engineStatus === 'unknown' ? 'RECONCILED' : reconciled ? null : (args.terminalCode ?? null),
+      attribution: args.attribution ?? null,
     })
   } finally {
     await args.pool

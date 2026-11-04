@@ -141,9 +141,8 @@ import type { DefaultEngineNotifier } from './engineNotifier.js'
 import type {
   parseParentEngine,
 } from './jobTerminal.js'
-import type {
-  acquireDelegateGrokRoute,
-} from './delegateGrokRoute.js'
+import type { acquireDelegateGrokRoute } from './delegateGrokRoute.js'
+import type { acquireDelegateAntigravityRoute } from './delegateAntigravityRoute.js'
 import type {
   defaultDelegateEngineBilling,
   DelegateEngineBillingClient,
@@ -1885,6 +1884,8 @@ export class Gateway {
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
   /** Test seam: grok relay route mint(默认 grok-build 优先 → mint 失败回落 glm 的用例注入)。 */
   private _acquireDelegateGrokRoute: typeof acquireDelegateGrokRoute | undefined
+  /** Test seam: antigravity relay route mint (OCV5-738, delegate engine route). */
+  private _acquireDelegateAntigravityRoute: typeof acquireDelegateAntigravityRoute | undefined
   /** Test seam: skip the 60s idle-timeout floor so timeout/billing races are unit-testable. */
   private _delegateTimeoutConfig: DelegateTimeoutConfig | undefined
   /** Stage 1: durable boot reconciler has finished (or durable is off). */

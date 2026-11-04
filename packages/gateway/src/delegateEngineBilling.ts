@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path'
 import {
   CODEX_ENGINE_MODEL_IDS,
   DELEGATE_ENGINE_BILLING_SESSION_KEY_RE,
+  isAntigravityEngineModel,
   isGrokEngineModel,
   type DurableCodexBilling,
 } from '@openclaude/protocol'
@@ -38,7 +39,7 @@ const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const SESSION_ID_RE = DELEGATE_ENGINE_BILLING_SESSION_KEY_RE
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 
-export type DelegateEngineBillingEngine = 'codex' | 'grok'
+export type DelegateEngineBillingEngine = 'codex' | 'grok' | 'antigravity'
 
 export interface DelegateEngineBillingAdmitInput {
   model: string
@@ -71,17 +72,30 @@ export function shouldAdmitDelegateEngineBilling(args: {
   agentModel?: string | null
 }): boolean {
   if (args.delegateEngine) {
-    return args.delegateEngine === 'codex' || args.delegateEngine === 'grok'
+    return (
+      args.delegateEngine === 'codex' ||
+      args.delegateEngine === 'grok' ||
+      args.delegateEngine === 'antigravity'
+    )
   }
   const model = args.requestedModel || args.agentModel
   if (!model) return false
-  return isGrokEngineModel(model) || (CODEX_ENGINE_MODEL_IDS as readonly string[]).includes(model)
+  return (
+    isGrokEngineModel(model) ||
+    isAntigravityEngineModel(model) ||
+    (CODEX_ENGINE_MODEL_IDS as readonly string[]).includes(model)
+  )
 }
 
 export function resolveDelegateEngineBillingEngine(args: {
   delegateEngine?: string | null
   model?: string | null
 }): DelegateEngineBillingEngine {
+  // Antigravity must be classified before the codex fallback: it is a
+  // distinct engine with its own master route and settle authority.
+  if (args.delegateEngine === 'antigravity' || isAntigravityEngineModel(args.model)) {
+    return 'antigravity'
+  }
   if (args.delegateEngine === 'grok' || isGrokEngineModel(args.model)) return 'grok'
   return 'codex'
 }
@@ -90,7 +104,7 @@ function validateAdmitInput(input: DelegateEngineBillingAdmitInput): void {
   if (!input.model || typeof input.model !== 'string') {
     throw new Error('DELEGATE_ENGINE_BILLING_INVALID_MODEL')
   }
-  if (input.engine !== 'codex' && input.engine !== 'grok') {
+  if (input.engine !== 'codex' && input.engine !== 'grok' && input.engine !== 'antigravity') {
     throw new Error('DELEGATE_ENGINE_BILLING_INVALID_ENGINE')
   }
   if (!AGENT_ID_RE.test(input.agentId) || !AGENT_ID_RE.test(input.delegateAgentId)) {
@@ -110,7 +124,9 @@ export function mapDelegateEngineBillingError(err: unknown): {
     return { httpStatus: 402, message: '余额不足，engine-reported 委派未启动' }
   }
   if (code.includes('ROUTE_UNAVAILABLE')) {
-    return { httpStatus: 503, message: '顾问模型路由不可用，未启动' }
+    // Regular delegation and advisor consults share this mapper; the message
+    // must read correctly for both (audit follow-up on PR #1371).
+    return { httpStatus: 503, message: '委派模型路由不可用，未启动' }
   }
   if (code.includes('INVALID_')) {
     return { httpStatus: 400, message: `engine-reported 委派计费初始化失败: ${code}` }

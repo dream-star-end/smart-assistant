@@ -118,6 +118,8 @@ function defaultSnapshot(over?: {
         capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION + 1,
       }),
       catalogEntry({ entryId: 8, modelId: 'retired-codex', engine: 'codex', state: 'disabled' }),
+      catalogEntry({ entryId: 9, modelId: 'antigravity-claude-sonnet-5.5', engine: 'antigravity' }),
+      catalogEntry({ entryId: 10, modelId: 'antigravity-gemini-4-argon', engine: 'antigravity' }),
     ],
     aliases: new Map([
       ['sol-alias', 1],
@@ -132,6 +134,14 @@ function defaultSnapshot(over?: {
       ['max-codex', price('max-codex', { minPlanCode: 'max', minPlanTier: 3, displayName: 'Max Codex' })],
       ['future-codex', price('future-codex', { displayName: 'Future Codex' })],
       ['retired-codex', price('retired-codex', { displayName: 'Retired Codex' })],
+      [
+        'antigravity-claude-sonnet-5.5',
+        price('antigravity-claude-sonnet-5.5', { displayName: 'Antigravity Sonnet 5.5' }),
+      ],
+      [
+        'antigravity-gemini-4-argon',
+        price('antigravity-gemini-4-argon', { displayName: 'Antigravity Gemini 4 Argon' }),
+      ],
     ]),
     securityEpoch: over?.epoch ?? SECURITY_EPOCH,
   })
@@ -167,6 +177,14 @@ function makeRuntime(opts?: {
   pricingGet?: (model: string) => ModelPricing | undefined
   advisorRoute?: import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute | (() => Promise<import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute>)
   advisorRouteThrow?: Error
+  antigravity?: {
+    journalState?: string
+    usageRows?: Array<{ id: string; ledger_id: string | null; cost_credits: string }>
+    claim?: (pool: unknown, requestId: string) => Promise<string | null>
+    finalize?: (pool: unknown, args: Record<string, unknown>) => Promise<void>
+    settle?: (args: Record<string, unknown>) => Promise<unknown>
+    abandon?: (pool: unknown, requestId: string, userId: bigint) => Promise<void>
+  }
 }) {
   const journals =
     opts?.journals ??
@@ -180,6 +198,16 @@ function makeRuntime(opts?: {
   const authzCalls: Array<{ uid: bigint; requiredEpoch?: bigint }> = []
   const advisorRouteCalls: unknown[] = []
   const expireCalls: string[] = []
+  const antigravityCalls = {
+    claim: [] as string[],
+    finalize: [] as Record<string, unknown>[],
+    settle: [] as Record<string, unknown>[],
+    abandon: [] as string[],
+    expire: [] as string[],
+    expireForRequest: [] as string[],
+    releaseInflight: [] as string[],
+  }
+  const journalUpdates: Array<{ sql: string; params: unknown[] }> = []
   let assertFreshCalls = 0
   let snapshot = opts?.snapshot ?? defaultSnapshot()
   const runtime = createDelegateEngineBillingRuntime({
@@ -187,12 +215,22 @@ function makeRuntime(opts?: {
       ({
         async query(sql: string, params?: unknown[]) {
           if (String(sql).includes('FROM request_finalize_journal')) {
+            if (String(sql).includes('state FROM request_finalize_journal')) {
+              return { rows: opts?.antigravity?.journalState ? [{ state: opts.antigravity.journalState }] : [] }
+            }
             const row = journals.get(String(params?.[0]))
             return {
               rows: row
                 ? [{ user_id: row.user_id, container_id: row.container_id, ctx: row.ctx }]
                 : [],
             }
+          }
+          if (String(sql).includes('FROM usage_records')) {
+            return { rows: opts?.antigravity?.usageRows ?? [], rowCount: 0 }
+          }
+          if (String(sql).includes('UPDATE request_finalize_journal')) {
+            journalUpdates.push({ sql: String(sql), params: params ?? [] })
+            return { rows: [], rowCount: 0 }
           }
           return { rows: [], rowCount: 0 }
         },
@@ -268,6 +306,38 @@ function makeRuntime(opts?: {
       releaseCalls.push({ redis, reservation })
       return true
     },
+    claimInflightJournalForSettlementFn: async (_pool, requestId) => {
+      antigravityCalls.claim.push(requestId)
+      return opts?.antigravity?.claim
+        ? opts.antigravity.claim(_pool, requestId)
+        : 'claim-0001'
+    },
+    finalizeInflightJournalFn: async (_pool, args) => {
+      antigravityCalls.finalize.push(args as Record<string, unknown>)
+      if (opts?.antigravity?.finalize) await opts.antigravity.finalize(_pool, args as Record<string, unknown>)
+    },
+    settleAntigravityTurnFn: async (args) => {
+      antigravityCalls.settle.push(args as Record<string, unknown>)
+      return opts?.antigravity?.settle
+        ? ((await opts.antigravity.settle(args as Record<string, unknown>)) as never)
+        : ({
+            settled: { settledCostCredits: 123n, ledgerId: 9n, usageId: 8n },
+            released: { tokens: 0 },
+          } as never)
+    },
+    abandonAntigravityTurnFn: async (_pool, requestId, userId) => {
+      antigravityCalls.abandon.push(requestId)
+      if (opts?.antigravity?.abandon) await opts.antigravity.abandon(_pool, requestId, userId)
+    },
+    expireAntigravityRoute: async (token) => {
+      antigravityCalls.expire.push(token)
+    },
+    expireAntigravityRouteForRequest: async (requestId) => {
+      antigravityCalls.expireForRequest.push(requestId)
+    },
+    releaseAntigravityInflightFn: (requestId) => {
+      antigravityCalls.releaseInflight.push(requestId)
+    },
   })
   return {
     runtime,
@@ -281,6 +351,8 @@ function makeRuntime(opts?: {
     authzCalls,
     advisorRouteCalls,
     expireCalls,
+    antigravityCalls,
+    journalUpdates,
     get assertFreshCalls() {
       return assertFreshCalls
     },
@@ -1262,5 +1334,231 @@ describe('delegate engine-billing admit uses one fenced snapshot', () => {
     assert.equal(journalCalls.length, 0)
     assert.equal(releaseCalls.length, 1)
     assert.equal(abortCalls.length, 0)
+  })
+})
+
+// ── OCV5-738: 委派 antigravity 的 admit/settle/abandon 对账 ─────────────────
+
+const AG_MODEL = 'antigravity-claude-sonnet-5.5'
+const AG_ROUTE_TOKEN = 'ef'.repeat(32)
+
+function antigravityJournal(ctx: Record<string, unknown> = {}) {
+  return {
+    user_id: '42',
+    container_id: '7',
+    ctx: {
+      source: 'delegate_antigravity',
+      model: AG_MODEL,
+      delegateAgentId: 'auditor',
+      parentSessionId: 'web-parent',
+      parentTurnKey: 'c'.repeat(64),
+      antigravityRouteToken: AG_ROUTE_TOKEN,
+      ...ctx,
+    },
+  }
+}
+
+function antigravitySettleBody(over: Record<string, unknown> = {}) {
+  return {
+    requestId: REQUEST_ID,
+    engineSessionId: `oceng-${'b'.repeat(48)}`,
+    status: 'success',
+    durationMs: 15,
+    ...over,
+  }
+}
+
+describe('delegate engine-billing antigravity reconciliation (OCV5-738)', () => {
+  it('admits antigravity without minting a route at admit (two-phase)', async () => {
+    const { runtime, journalCalls, advisorRouteCalls } = makeRuntime()
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: {
+        model: AG_MODEL,
+        engine: 'antigravity',
+        agentId: 'auditor',
+        delegateAgentId: 'auditor',
+        sessionKey: 'agent:auditor:delegate:main:1',
+        parentSessionId: 'web-parent',
+      },
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(result.route, undefined, 'route is minted by the antigravity endpoint')
+    assert.equal(advisorRouteCalls.length, 0, 'antigravity must not borrow the codex route')
+    const ctx = journalCalls[0] as { model: string; ctxJson: Record<string, unknown> }
+    assert.equal(ctx.model, AG_MODEL)
+    assert.equal(ctx.ctxJson.source, 'delegate_antigravity')
+    assert.equal(ctx.ctxJson.delegateAgentId, 'auditor')
+    assert.equal(ctx.ctxJson.antigravityRouteToken, undefined, 'token is persisted at mint')
+  })
+
+  it('settles exactly once: expires the route, claims the journal, finalizes and releases the precheck', async () => {
+    const { runtime, journals, antigravityCalls, releaseCalls } = makeRuntime()
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    assert.deepEqual(antigravityCalls.expire, [AG_ROUTE_TOKEN])
+    assert.deepEqual(antigravityCalls.expireForRequest, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls.claim, [REQUEST_ID])
+    assert.equal(antigravityCalls.settle.length, 1)
+    const settled = antigravityCalls.settle[0] as {
+      requestId: string
+      userId: bigint
+      engineStatus: string
+      attribution: unknown
+    }
+    assert.equal(settled.requestId, REQUEST_ID)
+    assert.equal(settled.userId, 42n)
+    assert.equal(settled.engineStatus, 'success')
+    assert.deepEqual(settled.attribution, {
+      delegateAgentId: 'auditor',
+      parentSessionId: 'web-parent',
+      parentTurnKey: 'c'.repeat(64),
+    })
+    assert.equal(antigravityCalls.finalize.length, 1)
+    assert.deepEqual(antigravityCalls.finalize[0], {
+      requestId: REQUEST_ID,
+      finalCredits: 123n,
+      ledgerId: 9n,
+      usageId: 8n,
+      settlementClaimId: 'claim-0001',
+    })
+    assert.equal(releaseCalls.length, 1, 'precheck reservation released once')
+    assert.equal(antigravityCalls.abandon.length, 0)
+  })
+
+  it('settles a turn that never recorded usage by aborting the journal, not debiting', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls, releaseCalls } = makeRuntime({
+      antigravity: { settle: async () => null },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: false })
+    assert.deepEqual(abortCalls, [REQUEST_ID])
+    assert.equal(antigravityCalls.finalize.length, 0, 'no usage row means no debit')
+    assert.deepEqual(antigravityCalls.releaseInflight, [REQUEST_ID])
+    assert.equal(releaseCalls.length, 1)
+  })
+
+  it('repairs a missing turn row from durable usage_records instead of double-settling', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls } = makeRuntime({
+      antigravity: {
+        settle: async () => null,
+        usageRows: [{ id: '77', ledger_id: '88', cost_credits: '456' }],
+      },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    assert.equal(abortCalls.length, 0)
+    assert.deepEqual(antigravityCalls.finalize[0], {
+      requestId: REQUEST_ID,
+      finalCredits: 456n,
+      ledgerId: 88n,
+      usageId: 77n,
+      settlementClaimId: 'claim-0001',
+    })
+  })
+
+  it('treats an already-committed journal as settled and never debits twice', async () => {
+    const { runtime, journals, antigravityCalls, releaseCalls } = makeRuntime({
+      antigravity: { claim: async () => null, journalState: 'committed' },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    assert.equal(antigravityCalls.settle.length, 0)
+    assert.equal(antigravityCalls.finalize.length, 0)
+    assert.equal(releaseCalls.length, 0)
+  })
+
+  it('hands a failed settle back to inflight so the durable retry can finish', async () => {
+    const { runtime, journals, journalUpdates, antigravityCalls, releaseCalls } = makeRuntime({
+      antigravity: {
+        settle: async () => {
+          throw new Error('db down')
+        },
+      },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+          identity: IDENTITY,
+          body: antigravitySettleBody(),
+        }),
+      /db down/,
+    )
+    assert.equal(releaseCalls.length, 0, 'precheck stays reserved for the retry')
+    assert.equal(
+      journalUpdates.some(
+        (u) =>
+          u.sql.includes("state='inflight'") &&
+          u.params[0] === REQUEST_ID &&
+          u.params[1] === 'claim-0001',
+      ),
+      true,
+    )
+    assert.equal(antigravityCalls.abandon.length, 0)
+  })
+
+  it('abandons an antigravity admission exactly once across every resource', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls, releaseCalls } = makeRuntime()
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+      identity: IDENTITY,
+      body: { requestId: REQUEST_ID },
+    })
+    assert.deepEqual(result, { abandoned: true })
+    assert.deepEqual(antigravityCalls.expire, [AG_ROUTE_TOKEN])
+    assert.deepEqual(antigravityCalls.expireForRequest, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls.abandon, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls.releaseInflight, [REQUEST_ID])
+    assert.deepEqual(abortCalls, [REQUEST_ID])
+    assert.equal(releaseCalls.length, 1)
+  })
+
+  it('leaves grok abandon on the generic path (no antigravity cleanup)', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls } = makeRuntime()
+    journals.set(REQUEST_ID, {
+      user_id: '42',
+      container_id: '7',
+      ctx: { source: 'delegate_grok', model: 'grok-build' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+      identity: IDENTITY,
+      body: { requestId: REQUEST_ID },
+    })
+    assert.deepEqual(result, { abandoned: true })
+    assert.deepEqual(abortCalls, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls, {
+      claim: [],
+      finalize: [],
+      settle: [],
+      abandon: [],
+      expire: [],
+      expireForRequest: [],
+      releaseInflight: [],
+    })
   })
 })

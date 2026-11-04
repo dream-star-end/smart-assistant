@@ -41,7 +41,21 @@ import {
   releasePreCheck,
   type PreCheckRedis,
 } from './preCheck.js'
-import { abortInflightJournal, startInflightJournal } from './proxyBilling.js'
+import {
+  abortInflightJournal,
+  claimInflightJournalForSettlement,
+  finalizeInflightJournal,
+  startInflightJournal,
+} from './proxyBilling.js'
+import {
+  abandonAntigravityTurn,
+  settleAntigravityTurnRecord,
+} from './antigravitySettle.js'
+import {
+  expireAntigravityRelayRoute,
+  expireAntigravityRelayRouteForRequest,
+} from './antigravityRouteContext.js'
+import { releaseInflight } from '../account-pool/policy/affinity.js'
 import type { AdvisorCodexAdmitRoute } from './advisorCodexAdmitRoute.js'
 import { isPlatformPresetPaused } from '../marketplace/seedPlatformAgents.js'
 
@@ -86,6 +100,13 @@ export interface DelegateEngineBillingRuntimeDeps {
     requestId: string
   }) => Promise<AdvisorCodexAdmitRoute>
   expireCodexDelegateRoute?: (token: string) => Promise<void> | void
+  claimInflightJournalForSettlementFn?: typeof claimInflightJournalForSettlement
+  finalizeInflightJournalFn?: typeof finalizeInflightJournal
+  settleAntigravityTurnFn?: typeof settleAntigravityTurnRecord
+  abandonAntigravityTurnFn?: typeof abandonAntigravityTurn
+  expireAntigravityRoute?: (token: string) => Promise<void> | void
+  expireAntigravityRouteForRequest?: (requestId: string) => Promise<void> | void
+  releaseAntigravityInflightFn?: typeof releaseInflight
   attributeOpenTurnFn?: typeof attributeOpenTurn
   broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void
   logger?: { warn(msg: string, fields?: Record<string, unknown>): void }
@@ -116,8 +137,17 @@ function optionalString(
   return value
 }
 
-function sourceForEngine(engine: 'codex' | 'grok'): 'delegate_codex' | 'delegate_grok' {
-  return engine === 'grok' ? 'delegate_grok' : 'delegate_codex'
+type DelegateBillingSource = 'delegate_codex' | 'delegate_grok' | 'delegate_antigravity'
+
+function sourceForEngine(engine: 'codex' | 'grok' | 'antigravity'): DelegateBillingSource {
+  if (engine === 'grok') return 'delegate_grok'
+  if (engine === 'antigravity') return 'delegate_antigravity'
+  return 'delegate_codex'
+}
+
+/** Bounded terminal classification from the container frame (same contract as codex). */
+function normalizeTerminalCode(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[A-Z0-9_]{1,40}$/.test(value) ? value : undefined
 }
 
 function journalString(
@@ -204,14 +234,23 @@ export function createDelegateEngineBillingRuntime(
   const runAbort = deps.abortInflightJournalFn ?? abortInflightJournal
   const runReleasePreCheck = deps.releasePreCheckFn ?? releasePreCheck
   const runAgentMul = deps.getAgentCostMultiplierFn ?? getAgentCostMultiplier
+  const runClaimJournal =
+    deps.claimInflightJournalForSettlementFn ?? claimInflightJournalForSettlement
+  const runFinalizeJournal = deps.finalizeInflightJournalFn ?? finalizeInflightJournal
+  const runSettleAntigravity = deps.settleAntigravityTurnFn ?? settleAntigravityTurnRecord
+  const runAbandonAntigravity = deps.abandonAntigravityTurnFn ?? abandonAntigravityTurn
+  const runExpireAntigravityRoute = deps.expireAntigravityRoute ?? expireAntigravityRelayRoute
+  const runExpireAntigravityRouteForRequest =
+    deps.expireAntigravityRouteForRequest ?? expireAntigravityRelayRouteForRequest
+  const runReleaseAntigravityInflight = deps.releaseAntigravityInflightFn ?? releaseInflight
 
   return {
     async handle({ path, identity, body }) {
       const userId = BigInt(identity.userId)
       if (path === DELEGATE_ENGINE_BILLING_ADMIT_PATH) {
         const model = requireString(body, 'model', MODEL_ID_RE)
-        const engineRaw = requireString(body, 'engine', /^(codex|grok)$/)
-        const engine = engineRaw as 'codex' | 'grok'
+        const engineRaw = requireString(body, 'engine', /^(codex|grok|antigravity)$/)
+        const engine = engineRaw as 'codex' | 'grok' | 'antigravity'
         const agentId = requireString(body, 'agentId', AGENT_ID_RE)
         const delegateAgentId = requireString(body, 'delegateAgentId', AGENT_ID_RE)
         if (isPlatformPresetPaused(agentId) || isPlatformPresetPaused(delegateAgentId)) {
@@ -358,9 +397,107 @@ export function createDelegateEngineBillingRuntime(
         !journalRow ||
         journalRow.user_id !== String(identity.userId) ||
         journalRow.container_id !== String(identity.containerId) ||
-        (source !== 'delegate_codex' && source !== 'delegate_grok')
+        source !== 'delegate_codex' &&
+        source !== 'delegate_grok' &&
+        source !== 'delegate_antigravity'
       ) {
         throw new Error('DELEGATE_ENGINE_BILLING_INVALID_JOURNAL_IDENTITY')
+      }
+
+      if (path === DELEGATE_ENGINE_BILLING_SETTLE_PATH && source === 'delegate_antigravity') {
+        const engineStatus = body.status === 'success' ? 'success' : 'error'
+        // The route is done the moment the turn is: stop relay traffic before
+        // the (idempotent) usage settle so no late call can add unattributed
+        // spend to this turn.
+        const routeToken = journalString(journalRow.ctx, 'antigravityRouteToken', ROUTE_TOKEN_RE)
+        if (routeToken) {
+          await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
+        }
+        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId)).catch(() => {})
+        const pool = deps.getPool()
+        const reservation = { userId: String(identity.userId), requestId }
+        const claimId = await runClaimJournal(pool, requestId)
+        if (claimId === null) {
+          // Another owner already finalized/claimed this admission. Never
+          // double-debit; the retry converges once that owner reports state.
+          const state = await pool.query<{ state: string }>(
+            `SELECT state FROM request_finalize_journal WHERE request_id=$1`,
+            [requestId],
+          )
+          if (state.rows[0]?.state === 'committed') return { settled: true }
+          throw new Error('DELEGATE_ENGINE_BILLING_JOURNAL_CONFLICT')
+        }
+        try {
+          const done = await runSettleAntigravity({
+            pool,
+            pricing: deps.pricing,
+            requestId,
+            userId,
+            engineStatus,
+            terminalCode: normalizeTerminalCode(body.terminalCode),
+            attribution: resolveDelegateBillingAttribution(journalRow.ctx, body),
+          })
+          if (done === null) {
+            // No turn row (route never minted → nothing ran) or another
+            // settle already owns it. Prefer durable usage truth when present.
+            const usage = await pool.query<{
+              id: string
+              ledger_id: string | null
+              cost_credits: string
+            }>(
+              `SELECT id::text AS id, ledger_id::text AS ledger_id, cost_credits::text AS cost_credits
+                 FROM usage_records WHERE user_id=$1 AND request_id=$2`,
+              [String(identity.userId), requestId],
+            )
+            const row = usage.rows[0]
+            if (!row) {
+              await runAbort(
+                pool,
+                requestId,
+                'delegate_antigravity_never_started',
+                'INTERNAL_ERROR',
+                claimId,
+              )
+              // No turn row means the account in-flight unit admitted at mint
+              // was never released by settleAntigravityTurn: give it back here
+              // or ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE fills with ghosts.
+              runReleaseAntigravityInflight(requestId)
+              await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+              return { settled: false }
+            }
+            await runFinalizeJournal(pool, {
+              requestId,
+              finalCredits: BigInt(row.cost_credits),
+              ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
+              usageId: BigInt(row.id),
+              settlementClaimId: claimId,
+            })
+            await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+            return { settled: true }
+          }
+          await runFinalizeJournal(pool, {
+            requestId,
+            finalCredits: done.settled.settledCostCredits ?? 0n,
+            ledgerId: done.settled.ledgerId,
+            usageId: done.settled.usageId,
+            settlementClaimId: claimId,
+          })
+        } catch (err) {
+          // A DB/settle failure is not a waiver: hand finalizing back to
+          // inflight so the container's durable settle retry can finish. The
+          // precheck reservation must survive for that retry.
+          await pool
+            .query(
+              `UPDATE request_finalize_journal
+                  SET state='inflight', ctx=ctx - 'settlementClaimId', updated_at=NOW()
+                WHERE request_id=$1 AND state='finalizing' AND ctx->>'settlementClaimId'=$2`,
+              [requestId, claimId],
+            )
+            .catch(() => {})
+          throw err
+        }
+        await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+        return { settled: true }
       }
 
       if (path === DELEGATE_ENGINE_BILLING_SETTLE_PATH) {
@@ -402,6 +539,31 @@ export function createDelegateEngineBillingRuntime(
           await Promise.resolve(deps.expireCodexDelegateRoute?.(settledRouteToken)).catch(() => {})
         }
         return { settled: true }
+      }
+
+      if (path === DELEGATE_ENGINE_BILLING_ABANDON_PATH && source === 'delegate_antigravity') {
+        // Exactly-once terminal cleanup for an admission whose turn never
+        // started: drop the route, mark the durable turn abandoned (refuses
+        // when relay usage proves a turn ran), give back the account in-flight
+        // slot and the precheck reservation, then abort the journal.
+        const routeToken = journalString(journalRow.ctx, 'antigravityRouteToken', ROUTE_TOKEN_RE)
+        if (routeToken) {
+          await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
+        }
+        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId)).catch(() => {})
+        await runAbandonAntigravity(deps.getPool(), requestId, userId).catch(() => {})
+        runReleaseAntigravityInflight(requestId)
+        await runAbort(
+          deps.getPool(),
+          requestId,
+          'delegate_engine_billing_abandoned',
+          'INTERNAL_ERROR',
+        )
+        await runReleasePreCheck(deps.preCheckRedis, {
+          userId: String(identity.userId),
+          requestId,
+        }).catch(() => {})
+        return { abandoned: true }
       }
 
       if (path === DELEGATE_ENGINE_BILLING_ABANDON_PATH) {

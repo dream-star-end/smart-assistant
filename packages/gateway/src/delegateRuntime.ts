@@ -93,15 +93,24 @@ import {
   shouldMintDelegateGrokRoute,
   type DelegateGrokRouteLease,
 } from './delegateGrokRoute.js'
-import { _buildCodexAdmitRouteOverride } from './routeOverrides.js'
+import {
+  acquireDelegateAntigravityRoute,
+  type DelegateAntigravityRouteLease,
+} from './delegateAntigravityRoute.js'
+import {
+  _buildCodexAdmitRouteOverride,
+  _buildSafeAntigravityRouteOverride,
+} from './routeOverrides.js'
 import { parseAdvisorAdmitRoute } from './advisorCodexRoute.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
+import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
 import {
   defaultDelegateEngineBilling,
   mapDelegateEngineBillingError,
   resolveDelegateEngineBillingEngine,
   shouldAdmitDelegateEngineBilling,
   type DelegateEngineBillingAdmission,
+  type DelegateEngineBillingEngine,
 } from './delegateEngineBilling.js'
 import type { DelegateOwnerTurnLocator } from './delegateLateCompletion.js'
 import { eventBus, createEvent } from './eventBus.js'
@@ -124,6 +133,7 @@ import type { DelegateGateBlock, RunDelegateInput } from './delegatePolicy.js'
 
 export interface DelegateRuntimeHost {
   _acquireDelegateGrokRoute: Gateway['_acquireDelegateGrokRoute']
+  _acquireDelegateAntigravityRoute: Gateway['_acquireDelegateAntigravityRoute']
   _activeDelegations: Gateway['_activeDelegations']
   _activeDelegationsByParent: Gateway['_activeDelegationsByParent']
   _interruptDelegationsForParent: Gateway['_interruptDelegationsForParent']
@@ -1695,11 +1705,13 @@ export async function _runDelegateTaskCore(
   const cancelPreparation = async (
     route?: DelegateGrokRouteLease | null,
     admission?: DelegateEngineBillingAdmission | null,
+    antigravity?: DelegateAntigravityRouteLease | null,
   ): Promise<DelegateTaskResult> => {
     try {
       await input.taskboardControl?.waitForDescendants(sessionKey)
       if (admission) await (this._delegateEngineBilling ?? defaultDelegateEngineBilling).abandon(admission.requestId).catch(() => {})
       if (route) await route.release()
+      if (antigravity) await antigravity.release()
       return cancelledBeforeSpawn
     } finally {
       this._delegateOwnerByRunId?.delete(progressRunId)
@@ -1921,7 +1933,7 @@ export async function _runDelegateTaskCore(
   })
   let engineBillingAdmission: DelegateEngineBillingAdmission | null = null
   let billingModel: string | undefined
-  let billingEngine: 'codex' | 'grok' | undefined
+  let billingEngine: DelegateEngineBillingEngine | undefined
   let liveEngineBilling: DurableCodexBilling | null = null
   let liveSettleTask: Promise<void> | null = null
   if (engineReported) {
@@ -2002,6 +2014,9 @@ export async function _runDelegateTaskCore(
       await (this._delegateEngineBilling ?? defaultDelegateEngineBilling)
         .abandon(engineBillingAdmission.requestId)
         .catch(() => {})
+      // Audit follow-up on PR #1371: a fail-closed return must not leave the
+      // admission lease heartbeat running (compare the normal end path).
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -2011,6 +2026,65 @@ export async function _runDelegateTaskCore(
         message: 'Codex 委派路由不可用（master 未签发 provider route），未启动',
       }
     }
+  }
+  // antigravity 委派同样必须有 master 签发的 relay route(OCV5-738):容器本地
+  // turn 没有 bridge 注入 __oc_antigravity_route,adapter 在 spawn 前就
+  // ANTIGRAVITY_ROUTE_REQUIRED。route 由 master 绑定本次 admit 的 requestId
+  // 签发;不可用即 abandon + 释放名额 + fail-closed,禁止裸起。
+  let antigravityRoute: AntigravityRouteOverride | null = null
+  let antigravityRouteLease: DelegateAntigravityRouteLease | null = null
+  if (billingEngine === 'antigravity' && engineBillingAdmission) {
+    const acquired = await (
+      this._acquireDelegateAntigravityRoute ?? acquireDelegateAntigravityRoute
+    )({
+      requestId: engineBillingAdmission.requestId,
+      log: this.log,
+    })
+    if (input.taskboardControl?.signal.aborted) {
+      if (acquired.ok) await acquired.lease.release().catch(() => {})
+      return cancelPreparation(grokRouteLease, engineBillingAdmission)
+    }
+    if (acquired.ok) {
+      // Mirror chat's inbound projection: the agent/model pair already resolves
+      // to the antigravity engine; authority is only added when the catalog
+      // pinned a canonical model, so a catalog-less selfhost deployment (no
+      // OC_MODEL_AUTHORITY) still passes the master-issued route through.
+      antigravityRoute = _buildSafeAntigravityRouteOverride({
+        agent: delegatedAgent,
+        model: billingModel ?? delegateExec?.canonicalModel,
+        rawRoute: acquired.lease.route,
+        officialRelayPort: this.deps.config.gateway.port,
+        ...(delegateExec?.canonicalModel
+          ? {
+              authority: {
+                canonicalModel: delegateExec.canonicalModel,
+                engine: 'antigravity' as const,
+              },
+            }
+          : {}),
+      })
+    }
+    if (!acquired.ok || !antigravityRoute) {
+      const reason = acquired.ok ? 'projection_failed' : acquired.reason
+      const httpStatus = acquired.ok ? 503 : acquired.httpStatus
+      this.log.warn('delegate_antigravity_route_unavailable', {
+        targetAgentId,
+        model: billingModel,
+        reason,
+      })
+      if (acquired.ok) await acquired.lease.release().catch(() => {})
+      await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return {
+        kind: 'rejected',
+        httpStatus,
+        message: `Antigravity 委派暂不可用（master 未签发 relay route）: ${reason}`,
+      }
+    }
+    antigravityRouteLease = acquired.lease
   }
   // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
   // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
@@ -2188,8 +2262,9 @@ export async function _runDelegateTaskCore(
     clearTimeoutTimer()
     detachAncestorActivity?.()
     await this.sessions.destroySession(sessionKey)
-    return cancelPreparation(grokRouteLease, engineBillingAdmission)
+    return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease)
   }
+  const turnStartedAt = Date.now()
   const submitPromise = this.sessions.submit(
     session,
     prompt,
@@ -2275,7 +2350,12 @@ export async function _runDelegateTaskCore(
     engineBillingAdmission?.requestId,
     input.traceId,
     undefined,
-    { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}), ...(codexRoute ? { codexRoute } : {}) },
+    {
+      platformGoal: session._platformGoal ?? null,
+      ...(grokRoute ? { grokRoute } : {}),
+      ...(codexRoute ? { codexRoute } : {}),
+      ...(antigravityRoute ? { antigravityRoute } : {}),
+    },
   )
   try {
     await Promise.race([submitPromise, timeoutPromise])
@@ -2432,6 +2512,25 @@ export async function _runDelegateTaskCore(
             err: String(err),
           })
         }
+      } else if (billingEngine === 'antigravity' && submitSettled) {
+        // The antigravity adapter emits no codex_billing frame: the gateway
+        // closes the turn from the terminal state it observed. Usage is
+        // server-metered by the relay, so the frame carries no token counts.
+        try {
+          await billingApi.settle({
+            requestId: engineBillingAdmission.requestId,
+            engineSessionId: engineBillingAdmission.engineSessionId,
+            status: error ? 'error' : 'success',
+            durationMs: Math.max(0, Date.now() - turnStartedAt),
+          })
+        } catch (err) {
+          this.log.warn('delegate_engine_billing_settle_failed', {
+            targetAgentId,
+            sessionKey,
+            requestId: engineBillingAdmission.requestId,
+            err: String(err),
+          })
+        }
       } else if (submitSettled) {
         // Engine reached a terminal state with no usage: close the journal.
         // The billing client durably retries this terminal decision if the
@@ -2479,6 +2578,7 @@ export async function _runDelegateTaskCore(
     // grok delegate 的 master 侧账号槽/路由上下文收尾(release 幂等且内部吞错,
     // 不会因清理失败让已完成的委派翻成失败)。
     if (grokRouteLease) await grokRouteLease.release()
+    if (antigravityRouteLease) await antigravityRouteLease.release()
     // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
     // 作为"父"再委派(hidden 审查员 / 嵌套成员);它收尾后计数键永远不会复用,
     // 两个 per-turn 计数器都清理防泄漏。注意清的是子会话自己的键,不动 delegateGuardKey
