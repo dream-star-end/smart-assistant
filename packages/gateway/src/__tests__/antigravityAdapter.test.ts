@@ -1032,9 +1032,35 @@ describe('Antigravity route expiry mid-turn (OCV5-556)', () => {
       const fixture = await fixtureWithStatus(h.dir, 'SUCCESS', [
         { conversation_id, step_index: 4, state: 'DONE', step_type: 'agent_response', text_delta: 'done after retry' },
       ])
-      const { summary } = await runTurn(h, fixture)
+      const { summary, sessionIds } = await runTurn(h, fixture)
       assert.equal(summary?.isError, false, summary?.errorDetail)
       assert.match(summary?.assistantText ?? '', /done after retry/)
+      assert.deepEqual(sessionIds, [conversation_id])
+
+      // 1.4.0 also repeats a recovered mid-turn attempt-1 error in result.error
+      // with status ERROR even when the fresh launch recovered, answered and exited 0.
+      const repeatedOnFresh = await fixtureWithStatus(h.dir, 'ERROR', [
+        { conversation_id, step_index: 4, state: 'DONE', step_type: 'agent_response', text_delta: 'done after attempt 2' },
+      ])
+      const freshRecovered = await runTurn(h, repeatedOnFresh)
+      assert.equal(freshRecovered.summary?.isError, false, freshRecovered.summary?.errorDetail)
+      assert.match(freshRecovered.summary?.assistantText ?? '', /done after attempt 2/)
+      assert.deepEqual(freshRecovered.sessionIds, [conversation_id])
+
+      const withStepErrorDetail = await fixtureWithStatus(h.dir, 'ERROR', [
+        {
+          conversation_id,
+          step_index: 4,
+          state: 'DONE',
+          step_type: 'error_message',
+          error: { message: 'API error (attempt 1): request failed: read: connection reset by peer' },
+        },
+        { conversation_id, step_index: 5, state: 'DONE', step_type: 'agent_response', text_delta: 'recovered after step error detail' },
+      ])
+      const detailRecovered = await runTurn(h, withStepErrorDetail)
+      assert.equal(detailRecovered.summary?.isError, false, detailRecovered.summary?.errorDetail)
+      assert.match(detailRecovered.summary?.assistantText ?? '', /recovered after step error detail/)
+      assert.deepEqual(detailRecovered.sessionIds, [conversation_id])
     } finally {
       await h.restore()
     }

@@ -6,7 +6,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/v5AntigravityRelay.test.ts
  */
 import assert from 'node:assert/strict'
-import { createServer } from 'node:http'
+import { Agent as HttpAgent, createServer, request as httpRequest } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { describe, test } from 'node:test'
 
@@ -129,6 +129,80 @@ describe('v5AntigravityRelay local gateway', () => {
       assert.equal(res.status, 404)
       assert.equal(called, false)
     } finally {
+      await close(server)
+    }
+  })
+
+  test('closes each loopback relay response so pooled CLI connections never reset across tool pauses', async () => {
+    const token = 'b'.repeat(64)
+    let upstreamCalls = 0
+    const server = createServer((req, res) => {
+      void handleV5AntigravityRelayLocal(
+        req,
+        res,
+        {
+          masterBaseUrl: 'http://master.internal:18791',
+          containerToken: 'oc-v5.container',
+        },
+        {
+          fetchImpl: async (_input, init) => {
+            await drainBody(init.body)
+            upstreamCalls++
+            return new Response(`data: {"call":${upstreamCalls}}\n\n`, {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            })
+          },
+        },
+      )
+    })
+    server.keepAliveTimeout = 80
+    const port = await listen(server)
+    const agent = new HttpAgent({ keepAlive: true, maxSockets: 1 })
+    const path = `${V5_ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+    const payload = JSON.stringify({ model: 'gemini-4-argon', pad: 'x'.repeat(256 * 1024) })
+
+    function postOnce(): Promise<{ status: number; body: string; connection: string | undefined }> {
+      return new Promise((resolve, reject) => {
+        const req = httpRequest(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path,
+            method: 'POST',
+            agent,
+            headers: {
+              'content-type': 'application/json',
+              'content-length': Buffer.byteLength(payload),
+            },
+          },
+          (res) => {
+            let text = ''
+            res.setEncoding('utf8')
+            res.on('data', (chunk) => { text += chunk })
+            res.on('end', () => resolve({
+              status: res.statusCode ?? 0,
+              body: text,
+              connection: res.headers.connection,
+            }))
+          },
+        )
+        req.on('error', reject)
+        req.end(payload)
+      })
+    }
+
+    try {
+      const first = await postOnce()
+      assert.equal(first.status, 200)
+      assert.equal(first.connection, 'close')
+      await new Promise((r) => setTimeout(r, 80))
+      const second = await postOnce()
+      assert.equal(second.status, 200)
+      assert.equal(second.body, 'data: {"call":2}\n\n')
+      assert.equal(upstreamCalls, 2)
+    } finally {
+      agent.destroy()
       await close(server)
     }
   })

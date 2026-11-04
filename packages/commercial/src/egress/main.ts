@@ -865,7 +865,8 @@ export async function startEgress(): Promise<void> {
   });
   // LLM 流可长达数十分钟,禁 socket 空闲超时误杀(与 master internal listener 同语义)。
   server.requestTimeout = 0;
-  server.headersTimeout = 60_000;
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
 
   // 共享口:sd_activation 时接管 systemd 传入的 SO_REUSEPORT fd(与另一个槽同组),
   // 否则自 bind(legacy 单 unit / 开发)。注意 systemd 的 socket 已 listen(),node 只是
