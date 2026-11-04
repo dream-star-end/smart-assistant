@@ -806,18 +806,36 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** Settle this turn's Box chain through the internal Stop route, once.
    * Browser Stop is explicit; an ordinary provider HTTP disconnect never
    * calls this notifier. The gateway owns it beyond the CLI interrupt. */
-  private _notifyBoxStop(turn: CcbTurnContext, cause: 'user' | 'continuation_rejected'): void {
+  private _notifyBoxStop(turn: CcbTurnContext,
+    cause: 'user' | 'continuation_rejected' | 'planned_shutdown'): void {
     const nativeSessionId = this.runner.sessionId
     if (this.executionBackend || turn.boxStopNotified || !isBoxApiModel(this.model)
       || !turn.turnKey || !nativeSessionId) return
     turn.boxStopNotified = true
-    this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,
+    const sent = notifyBoxUserStop({ sessionId: nativeSessionId,
       turnKey: turn.turnKey }).then((outcome) => {
       if (outcome === 'skipped') log.warn('box_user_stop_notification_skipped', { cause })
-      else if (cause !== 'user') log.info('box_stop_after_continuation_reject', { outcome })
+      else if (cause === 'continuation_rejected') log.info('box_stop_after_continuation_reject', { outcome })
+      else if (cause === 'planned_shutdown') log.info('box_stop_on_planned_shutdown', { outcome })
     }).catch(() => {
       log.warn('box_user_stop_notification_pending', { cause })
     })
+    const prior = this._boxStopPending
+    this._boxStopPending = prior ? Promise.all([prior, sent]).then(() => {}) : sent
+  }
+
+  /** OCV5-733: a container restart killed the CLI mid Box run; egress keeps
+   * an ordinary disconnect's run alive on purpose (first_round_unknown), so
+   * the account seat stayed held until the stop probe settled it ~20 min
+   * later. A process exit is final for this generation's turns (the restart
+   * synthesizes SERVICE_RESTART; recovery uses a new turn key), so settle each
+   * unfinished Box turn through the same Stop route a browser Stop uses.
+   * Best effort: shutdown() waits at most 2s; egress finishes the stop on its
+   * own and its fences decide what is cancelable. Finished turns are skipped. */
+  beginPlannedShutdown(): void {
+    for (const turn of new Set([this._activeTurn, this._routeTurn])) {
+      if (turn && !turn.parser.finalized) this._notifyBoxStop(turn, 'planned_shutdown')
+    }
   }
 
   interrupt(reason: 'user' | 'system' = 'system'): boolean {
