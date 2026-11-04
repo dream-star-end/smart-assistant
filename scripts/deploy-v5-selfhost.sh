@@ -97,7 +97,7 @@ REDIS_URL="redis://127.0.0.1:6379/3"
 # the previous tag stays for rollback.
 # cc2302/codex01630/grok1062/zcode3153/agy140 (OCV5-470) = Claude Code 2.1.302, Codex 0.163.0,
 # Grok 1.0.62, ZCode 3.15.3 (CLI 0.16.9), Antigravity 1.4.0 and Cursor Agent 2026.10.16-e3cb207; the agy134 tag stays for rollback.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2302-codex01630-grok1062-zcode3153-agy140-slim"
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2302-codex01630-grok1062-zcode3153-agy150-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"

@@ -660,6 +660,33 @@ describe('AntigravityAdapter', () => {
     }
   })
 
+  test('large-history startup observation failure preserves native identity and never re-spawns', async () => {
+    const prior = '4187c78c-e96d-4840-8c1c-3de86f92ddd9'
+    const h = await harness({ resumeSessionId: prior })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      let spawns = 0
+      h.adapter.on('spawn', () => { spawns++ })
+      process.env.FAKE_AGY_EXIT_CODE = '1'
+      const file = path.join(h.dir, 'startup-observer.ndjson')
+      await writeFile(file, `${[
+        { event: 'init', conversation_id: prior },
+        { event: 'result', result: { conversation_id: prior, status: 'ERROR',
+          error: 'timeout waiting for cascade to start running' } },
+      ].map((line) => JSON.stringify(line)).join('\n')}\n`)
+      const { summary, sessionIds } = await runTurn(h, file)
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /^ANTIGRAVITY_START_OBSERVATION_FAILED:/)
+      assert.equal(classifyRunError(summary?.errorDetail).code, 'antigravity_start_observation_failed')
+      assert.equal(h.adapter.nativeSessionId, prior)
+      assert.deepEqual(sessionIds, [])
+      assert.equal(spawns, 1)
+      assert.equal(summary?.tools.length, 0, 'absence of observed tools is not proof of no effects')
+    } finally {
+      await h.restore()
+    }
+  })
+
   test('treats a headless soft-deny (exit 0, empty tool output) as a failed turn', async () => {
     const h = await harness()
     try {

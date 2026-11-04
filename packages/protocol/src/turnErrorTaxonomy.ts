@@ -95,6 +95,8 @@ export const TURN_ERROR_TAXONOMY = {
   bad_request: { retryable: false, cta: 'none' },
 
   // ── 引擎/平台执行 ────────────────────────────────────────
+  // CLI observer failure does not prove that model/tools did not execute.
+  antigravity_start_observation_failed: { retryable: false, cta: 'none' },
   engine_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   internal_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   auth_error: { retryable: false, cta: 'relogin' },

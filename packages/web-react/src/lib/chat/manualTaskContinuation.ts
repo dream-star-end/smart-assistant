@@ -71,6 +71,8 @@ export function manualTaskContinuationSource(
 ): ChatMessage | undefined {
   const canonical = canonicalTaskContinuationError(messages, error);
   if (!canonical) return undefined;
+  // Missing progress can hide completed writes: inspect results before a new instruction.
+  if (normalizeTurnErrorCode(canonical._errorCode) === "antigravity_start_observation_failed") return undefined;
   if (canonical._turnStatusRecord === true && !canonical._errorCode && !canonical._userError && canonical._dispatchTerminal !== true) return undefined;
   const end = messages.indexOf(canonical);
   // Match the actual renderer: an authoritative visible dispatch status owns

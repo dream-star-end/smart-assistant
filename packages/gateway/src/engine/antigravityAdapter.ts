@@ -131,6 +131,13 @@ const CLI_CREDENTIAL_EXPIRED_RE = /oauth2: token expired|refresh token is not se
  * to `platform_credential_expired` (no automatic recovery, precise copy).
  */
 export function normalizeAntigravityErrorDetail(detail: string): string {
+  if (detail.startsWith('ANTIGRAVITY_START_OBSERVATION_FAILED:')) return detail
+  // CLI 1.4.0 can execute a resumed large conversation while its print-mode
+  // observer sees no steps, then falsely reports startup timeout. Never replay
+  // this ambiguous execution as a generic transient upstream error.
+  if (/\btimeout waiting for cascade to start running\b/i.test(detail)) {
+    return `ANTIGRAVITY_START_OBSERVATION_FAILED: ${detail}`
+  }
   if (detail.startsWith('ANTIGRAVITY_CREDENTIAL_EXPIRED:')) return detail
   return CLI_CREDENTIAL_EXPIRED_RE.test(detail) ? `ANTIGRAVITY_CREDENTIAL_EXPIRED: ${detail}` : detail
 }
@@ -1012,16 +1019,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         (ctx.requestedConversationId && ctx.resultConversationId !== ctx.requestedConversationId)) {
       ctx.errorDetail ??= 'ANTIGRAVITY_CONVERSATION_MISMATCH: result does not match this launch'
     }
-    if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
-      ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
-    }
     if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
     if (ctx.trailingErrorStep && ctx.trailingErrorDetail && ctx.errorDetail === null) {
       ctx.errorDetail = ctx.trailingErrorDetail
     }
     if (status !== 'SUCCESS' && ctx.errorDetail === null) {
-      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail ||
-        `Antigravity turn ended with status ${status || 'unknown'}`
+      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail || ctx.stderr.trim() ||
+        (ctx.procClosed && ctx.exitCode !== 0
+          ? `antigravity exited with code ${String(ctx.exitCode)}`
+          : `Antigravity turn ended with status ${status || 'unknown'}`)
+    }
+    if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
+      ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
     }
     if (status === 'SUCCESS' && ctx.errorDetail === null) {
       // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
