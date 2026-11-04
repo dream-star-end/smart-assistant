@@ -1529,3 +1529,33 @@ describe('Antigravity verified recovery lifecycle', () => {
     } finally { await h.restore() }
   })
 })
+
+describe('Antigravity unindexed resumed errors', () => {
+  for (const index of [null, -1, 11]) {
+    test((index === null ? 'unindexed' : index < 0 ? 'invalid-index' : 'indexed') + ' error after the current input cannot become a billable terminal-only success', async () => {
+      const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
+      const h = await harness({ resumeSessionId: id })
+      try {
+        h.adapter.setAntigravityRoute(ROUTE)
+        const file = path.join(h.dir, 'current-error.ndjson')
+        await writeFile(file, [
+          { event: 'init', conversation_id: id },
+          { event: 'step_update', step_update: { conversation_id: id, step_type: 'user_input', step_index: 10, state: 'DONE' } },
+          { event: 'step_update', step_update: { conversation_id: id, step_type: 'error_message', state: 'ERROR',
+            ...(index === null ? {} : { step_index: index }), error: { message: 'CURRENT_UNINDEXED_FAILURE' } } },
+          { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: 'DO_NOT_DELIVER' } },
+        ].map(e => JSON.stringify(e)).join('\n') + '\n')
+        const billing: any[] = []
+        h.adapter.on('external_billing', e => billing.push(e))
+        const { summary, events, sessionIds } = await runTurn(h, file)
+        assert.equal(summary?.isError, true)
+        assert.match(summary?.errorDetail ?? '', /CURRENT_UNINDEXED_FAILURE/)
+        assert.equal(summary?.assistantText, '')
+        assert.deepEqual(sessionIds, [])
+        assert.equal(events.filter(e => e.kind === 'block').length, 0)
+        assert.equal(billing.length, 1)
+        assert.equal(billing[0].status, 'error')
+      } finally { await h.restore() }
+    })
+  }
+})

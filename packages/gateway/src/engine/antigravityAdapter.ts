@@ -763,14 +763,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (stepConversation && boundConversation && stepConversation !== boundConversation) return
     const type = asText(step.step_type)
     const state = asText(step.state)
-    const stepIndex = typeof step.step_index === 'number' && Number.isSafeInteger(step.step_index)
+    const stepIndex = typeof step.step_index === 'number' && Number.isSafeInteger(step.step_index) && step.step_index >= 0
       ? step.step_index
       : null
     const baseline = ctx.nativeBinding?.baseline ?? null
     if (stepIndex !== null && baseline !== null && stepIndex <= baseline) return
-    // Unindexed resume events cannot prove ownership. Fresh legacy events
-    // without an index remain valid and retain their existing behaviour.
-    if (ctx.resumedLaunch && stepIndex === null) return
+    // Unindexed resume output cannot prove ownership. Errors still enter the
+    // conservative current/prelude adjudicator: dropping a current error here
+    // would let terminal response text incorrectly turn failure into success.
+    if (ctx.resumedLaunch && stepIndex === null && type !== 'error_message') return
     if (type === 'user_input' && ctx.firstOwnStepIndex === null && stepIndex !== null) {
       ctx.firstOwnStepIndex = stepIndex
     }
