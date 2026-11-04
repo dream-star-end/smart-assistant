@@ -361,6 +361,12 @@
       "reason": "OCV5-738: 修复 PR #1373 第 2 轮独立审计指出的 liveExternalBilling TS 控制流收窄与跨实例并发 mint 持久化回查兜底及单测。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
       "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "e6f57268fc06b7e8705c8f4651b8b6a31fc4f944",
+      "reason": "OCV5-738: 保持 DurableCodexBilling.terminalCode 与 OutboundCodexBilling 窄类型一致，将 Antigravity 专属 terminalCode 扩宽收敛到 DelegateEngineBillingSettlePayload，消除 inboundDispatch.ts(2123) 类型冲突。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
     }
   ]
 }
