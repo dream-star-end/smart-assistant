@@ -455,3 +455,132 @@ test('explicit default preference change resets draft pick even when resolved de
   })
   await waitFor(() => expect(setModelId).toHaveBeenLastCalledWith(B))
 })
+
+test("new solo draft send dispatches immediately before ensureServerSession and putCollaborationConfig finish (OCV5-737)", async () => {
+  const DRAFT = "webdraft737"
+  const MODEL = "glm-5.2"
+  const models = [{ id: MODEL, display_name: MODEL, engine: "ccb" }]
+  const agent = { id: "main", name: "Main", description: "" }
+  const noop = () => {}
+  const auth = createMemoryAuthSession(() => {}, "test-token")
+  let finishEnsure!: (ok: boolean) => void
+  const ensureServerSession = vi.fn(
+    () => new Promise<boolean>((resolve) => { finishEnsure = resolve }),
+  )
+  const send = vi.fn(async () => true)
+  const putCollab = vi.spyOn(api, "putCollaborationConfig").mockResolvedValue({
+    rev: 7,
+    defaultMode: "solo",
+    defaultAdvisorModel: "gpt-6-astra",
+    session: { mode: "solo", advisorModel: null, configVersion: "v1:solo:", source: "session" },
+    advisorModels: [],
+    advisorConsultParents: ["ccb"],
+    advisorConsultAllowed: true,
+    parentEngine: "ccb",
+  })
+  const selectedSessionIdRef: { current: string | undefined } = { current: undefined }
+  const setActiveId = vi.fn((next: React.SetStateAction<string | undefined>) => {
+    selectedSessionIdRef.current = typeof next === "function" ? next(selectedSessionIdRef.current) : next
+  })
+  const sockRef = {
+    current: {
+      ensureSession: noop,
+      ensureServerSession,
+      getMessages: () => [],
+      getSession: () => ({ id: DRAFT }),
+      renameSession: noop,
+      send,
+      setSessionModel: noop,
+    },
+  } as unknown as React.RefObject<UseChatSocket | null>
+
+  const f = renderHook(() => {
+    const [activeId, setActiveState] = useState<string | undefined>(undefined)
+    const [modelId, setModelId] = useState<string | undefined>(MODEL)
+    const [sessions, setSessions] = useState<Session[]>([])
+    const collab = useSessionModelAndCollab({
+      activeId,
+      agent,
+      auth,
+      confirmDialog: async () => true,
+      demo: false,
+      handleNew: noop,
+      modelId,
+      modelPrefs: {},
+      modelSwitchPreparing: false,
+      models,
+      queueModelPatch: noop,
+      resetSessionList: noop,
+      sessions,
+      sessionsResetRef: { current: noop },
+      setModelId,
+      setModelSwitchPreparing: noop,
+      setSessions,
+      sockRef,
+      toast: noop,
+    })
+    const composer = useComposerSend({
+      activeId,
+      agent,
+      applyCollabDoc: collab.applyCollabDoc,
+      auth,
+      authRef: { current: auth },
+      boardOpen: false,
+      collabAsDefault: collab.collabAsDefault,
+      collabEpochRef: collab.collabEpochRef,
+      collabUi: collab.collabUi,
+      contextTier: "300k",
+      demo: false,
+      draftProjectId: null,
+      draftProjectRef: { current: null },
+      draftSessionId: DRAFT,
+      modelId,
+      models,
+      newSessionInProject: noop,
+      preferenceEffort: undefined,
+      projectHome: null,
+      promoteDraftCollab: collab.promoteDraftCollab,
+      publicCfg: null,
+      queueModelPatch: noop,
+      selectedSessionIdRef,
+      sendImplicitRatingRef: { current: null },
+      serviceTier: null,
+      sessionEffort: undefined,
+      sessions,
+      setActiveId: (next) => {
+        setActiveId(next)
+        setActiveState(next)
+      },
+      setBoardOpen: noop,
+      setBusy: noop,
+      setChatError: noop,
+      setCollabSaveError: collab.setCollabSaveError,
+      setCollabUi: collab.setCollabUi,
+      setDraftProject: noop,
+      setImageAnnotationSource: noop,
+      setMessages: noop,
+      setSessions,
+      setStreamText: noop,
+      sockRef,
+      stopPreparing: noop,
+      stopRef: { current: false },
+      toast: noop,
+      user: { id: "u", displayName: "U", roles: ["user"] },
+    })
+    return { collab, composer }
+  })
+
+  await act(async () => {
+    expect(await f.result.current.composer.send("instant first turn")).toBe(true)
+  })
+  expect(send).toHaveBeenCalledTimes(1)
+  expect(setActiveId).toHaveBeenCalledWith(DRAFT)
+  expect(ensureServerSession).toHaveBeenCalledTimes(1)
+  expect(putCollab).not.toHaveBeenCalled()
+
+  await act(async () => {
+    finishEnsure(true)
+  })
+  await waitFor(() => expect(putCollab).toHaveBeenCalledTimes(1))
+  await waitFor(() => expect(f.result.current.collab.collabUi.rev).toBe(7))
+})

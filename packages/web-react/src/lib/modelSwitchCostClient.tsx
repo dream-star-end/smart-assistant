@@ -115,6 +115,10 @@ export function createModelSwitchCostAuthorizer({
     string,
     { epoch: number; authorization: SwitchAuthorization; expiresAt: number }
   >()
+  const verified = new Map<
+    string,
+    { epoch: number; key: string; authorization: SwitchAuthorization; expiresAt: number }
+  >()
   const flight = new Map<string, Promise<SwitchAuthorization | null>>()
   return (original, opts = {}) => {
     const effective =
@@ -148,6 +152,19 @@ export function createModelSwitchCostAuthorizer({
     if (opts.useCachedRequestId && valid) cache.delete(key)
     const current = () =>
       authRef.current === auth && auth.snapshot().epoch === epoch && (opts.isCurrent?.() ?? true)
+    if (opts.interactive === false) {
+      const hit = verified.get(input.requestId)
+      if (
+        hit &&
+        hit.epoch === epoch &&
+        hit.key === key &&
+        hit.expiresAt > Date.now() &&
+        (hit.authorization.consent ?? undefined) === (opts.consent ?? undefined)
+      ) {
+        verified.delete(input.requestId)
+        return Promise.resolve(current() ? hit.authorization : null)
+      }
+    }
     const flightKey = JSON.stringify([epoch, key, input.requestId, opts.interactive !== false])
     const existing = flight.get(flightKey)
     if (existing) return existing
@@ -212,6 +229,9 @@ export function createModelSwitchCostAuthorizer({
           choice,
         }
         if (opts.primeNextTurn) cache.set(key, { epoch, authorization, expiresAt: q.expiresAt })
+        if (opts.interactive !== false) {
+          verified.set(input.requestId, { epoch, key, authorization, expiresAt: q.expiresAt })
+        }
         return authorization
       } catch (error) {
         const unavailable =

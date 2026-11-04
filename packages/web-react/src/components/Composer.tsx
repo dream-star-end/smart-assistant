@@ -509,7 +509,7 @@ export function Composer({
     [revoke],
   );
 
-  const submittingRef=useRef(false);
+  const submittingRef=useRef(false),[submitting,setSubmitting]=useState(false);
   const latestSubmitRef=useRef({value,attachments,draftKey,replyTo,revision:0});
   const previousSubmit=latestSubmitRef.current;
   latestSubmitRef.current={value,attachments,draftKey,replyTo,revision:previousSubmit.revision+
@@ -523,17 +523,19 @@ export function Composer({
     const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
     const snapshot=latestSubmitRef.current;
     submittingRef.current=true;
+    const resetSubmit=()=>{submittingRef.current=false;setSubmitting(false);};
     const finish=(sent:unknown)=>{
-      submittingRef.current=false;
+      resetSubmit();
       if(sent===false)return;
       onAccepted?.();
       if(latestSubmitRef.current.draftKey!==snapshot.draftKey){
         // A successful first send may promote the empty composer to its new
         // session. Clear only the submitted owner's unchanged stored draft.
-        if(snapshot.draftKey&&readDraft(snapshot.draftKey)===snapshot.value)clearDraft(snapshot.draftKey);
-        if(snapshot.draftKey&&attachmentCache.get(snapshot.draftKey)===snapshot.attachments){
-          attachmentCache.set(snapshot.draftKey,[]);
-          for(const attachment of snapshot.attachments)revoke(attachment.previewUrl);
+        const k=snapshot.draftKey;
+        if(k&&readDraft(k)===snapshot.value)clearDraft(k);
+        if(k&&attachmentCache.get(k)===snapshot.attachments){
+          attachmentCache.set(k,[]);
+          for(const a of snapshot.attachments)revoke(a.previewUrl);
         }
         return;
       }
@@ -548,9 +550,10 @@ export function Composer({
     try{
       const sent=onSend(text,doneMedia.length?doneMedia:undefined,replyTo??undefined);
       if(sent&&typeof (sent as Promise<unknown>).then==='function'){
-        void (sent as Promise<unknown>).then(finish,()=>{submittingRef.current=false;});
+        setSubmitting(true);
+        void (sent as Promise<unknown>).then(finish,resetSubmit);
       }else finish(sent);
-    }catch{ submittingRef.current=false; }
+    }catch{ resetSubmit(); }
   };
 
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
@@ -1123,7 +1126,7 @@ export function Composer({
                       : "bg-hover text-faint",
                 )}
               >
-                {stopping ? (
+                {stopping || submitting ? (
                   <Loader2 size={17} className="animate-spin" />
                 ) : busy ? (
                   <Square size={15} className="fill-current" />

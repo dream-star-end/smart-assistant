@@ -196,3 +196,39 @@ test('direct-switch alt confirms the paid quote and returns its consent', async 
   expect(request).toHaveBeenCalledTimes(2)
   expect(request.mock.calls[1][2]).toEqual({ quoteToken: 'quote-alt' })
 })
+
+test("non-interactive dispatch reuses and consumes the online-verified requestId once without a duplicate estimate call", async () => {
+  const input = { sessionId: "own", requestId: "m-dedup", targetModel: "glm-5.2", agentId: "main" }
+  const request = vi.spyOn(api, "modelSwitchCost")
+  request.mockClear()
+  request.mockResolvedValue({
+    ...fixtureSwitchQuote(input),
+    requiresConfirmation: false,
+    consent: "verified-consent",
+  })
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, "fixture") },
+    confirmDialog: vi.fn(),
+    toast: vi.fn(),
+  })
+  expect(await authorize(input, { allowOfflineQueue: true })).toEqual({
+    requestId: input.requestId,
+    choice: true,
+    consent: "verified-consent",
+  })
+  expect(request).toHaveBeenCalledTimes(1)
+
+  expect(await authorize(input, { interactive: false, consent: "verified-consent" })).toEqual({
+    requestId: input.requestId,
+    choice: true,
+    consent: "verified-consent",
+  })
+  expect(request).toHaveBeenCalledTimes(1)
+
+  expect(await authorize(input, { interactive: false, consent: "verified-consent" })).toEqual({
+    requestId: input.requestId,
+    choice: true,
+    consent: "verified-consent",
+  })
+  expect(request).toHaveBeenCalledTimes(2)
+})
