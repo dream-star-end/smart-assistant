@@ -33,6 +33,7 @@ export function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): u
   // checkpoint was declined as checkpoint_unsafe. Pair by id; blocks without
   // an id keep the old fail-closed shape.
   const toolsById = new Map<string, Record<string, unknown>>();
+  const delegatesByExecution = new Map<string, Record<string, unknown>>();
   for (const payload of payloads) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
     const frame = payload as Record<string, unknown>;
@@ -71,10 +72,28 @@ export function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): u
         continue;
       }
       if (kind === "delegate_progress") {
-        records.push({
-          role: "delegate-progress",
-          _completed: item._completed === true,
-        });
+        // Legacy completion is an independent observation, never authority
+        // for a different progress frame or a guessed display identity.
+        if (!Object.hasOwn(item, "phase")) {
+          records.push({ role: "delegate-progress", _completed: item._completed === true });
+          continue;
+        }
+        // Usage is telemetry, not evidence that an execution started or
+        // stopped. An unexpected execution block must still fail closed.
+        if (item.phase === "usage" && !Object.hasOwn(item, "block")) continue;
+        const rawKey = item.usageRunId;
+        const key = typeof rawKey === "string" && rawKey.length > 0 && rawKey.length <= 256
+          && !/[\s\u0000-\u001f\u007f]/u.test(rawKey) ? rawKey : null;
+        // Routing runId/agentId may be rebound to an ancestor's card. Only
+        // the producer's immutable execution key can supersede old progress.
+        const completed = key !== null && item.phase === "done";
+        const known = key ? delegatesByExecution.get(key) : undefined;
+        if (known) known._completed = completed;
+        else {
+          const record = { role: "delegate-progress", _completed: completed };
+          if (key) delegatesByExecution.set(key, record);
+          records.push(record);
+        }
       }
     }
   }

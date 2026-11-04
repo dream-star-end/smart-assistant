@@ -15,7 +15,58 @@ import {
   sanitizeDelegateProgressText,
   summarizeDelegateProgressEvent,
   summarizeDelegateToolForLiveHint,
+  toNestedDelegateProgressLine,
 } from '../delegateProgress.js'
+
+describe('immutable delegate execution identity', () => {
+  const routing = { runId: 'dlg-visible-parent', agentId: 'rebound-agent', label: 'parent↳child' }
+
+  it('keeps an explicitly supplied child key on lifecycle frames across nested rebinding', () => {
+    for (const phase of ['start', 'text', 'thinking', 'plan', 'tool', 'done', 'error'] as const) {
+      const source = makeDelegateProgressBlock({ runId: 'dlg-original-child', usageRunId: 'dlg-child-execution',
+        agentId: 'child', phase, text: 'child progress' })
+      const nested = toNestedDelegateProgressLine(source, routing)
+      assert.ok(nested)
+      assert.equal(nested.runId, routing.runId)
+      assert.equal(nested.agentId, routing.agentId)
+      assert.equal(nested.usageRunId, 'dlg-child-execution')
+      assert.equal(nested.phase, 'text', 'lifecycle rebinding must remain non-terminal for the parent')
+      const normalized = makeDelegateProgressBlock({ runId: nested.runId, agentId: nested.agentId,
+        phase: nested.phase, text: nested.text, usageRunId: nested.usageRunId })
+      assert.equal(normalized.usageRunId, source.usageRunId)
+    }
+  })
+
+  it('uses only the explicit primitive key and preserves it on rich nested progress', () => {
+    const event = { kind: 'block', block: { kind: 'text', text: 'child output', usageRunId: 'untrusted-payload-key' } }
+    const primitive = makeDelegateBlockPassthrough(event, 'dlg-child-card', 'child', 'dlg-exact-child')
+    assert.ok(primitive)
+    assert.equal(primitive.usageRunId, 'dlg-exact-child')
+    assert.deepEqual(primitive.block, event.block)
+    const nested = toNestedDelegateProgressLine(primitive, routing)
+    assert.ok(nested)
+    assert.equal(nested.runId, routing.runId)
+    assert.equal(nested.usageRunId, 'dlg-exact-child')
+    assert.deepEqual(nested.block, event.block)
+    assert.equal(Object.hasOwn(makeDelegateBlockPassthrough(event, 'dlg-parent', 'parent')!, 'usageRunId'), false,
+      'an engine payload or a display run id cannot establish child execution identity')
+  })
+
+  it('leaves legacy lifecycle and rich frames without execution identity unknown', () => {
+    const legacy = makeDelegateProgressBlock({ runId: 'dlg-legacy', agentId: 'same-agent', phase: 'done', text: 'done' })
+    const rich = makeDelegateBlockPassthrough({ kind: 'block', block: { kind: 'text', text: 'legacy' } },
+      'dlg-legacy', 'same-agent')!
+    for (const source of [legacy, rich]) {
+      const nested = toNestedDelegateProgressLine(source, routing)
+      assert.ok(nested)
+      assert.equal(Object.hasOwn(source, 'usageRunId'), false)
+      assert.equal(Object.hasOwn(nested, 'usageRunId'), false)
+      const normalized = makeDelegateProgressBlock({ runId: nested.runId, agentId: nested.agentId,
+        phase: nested.phase, text: nested.text, usageRunId: nested.usageRunId })
+      assert.equal(Object.hasOwn(normalized, 'usageRunId'), false)
+    }
+  })
+})
 
 describe('coalesceDelegateTranscript', () => {
   it('merges per-token text deltas into one block (Cursor grok regression)', () => {
