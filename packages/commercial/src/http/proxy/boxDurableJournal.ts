@@ -567,7 +567,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT request_id, ctx FROM request_finalize_journal
         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
           AND ctx->>'boxState' IN ('handoff','failed_stopped')
-          AND ctx->>'boxTurnKey' IS DISTINCT FROM $3
+          AND (ctx->>'boxTurnKey' IS DISTINCT FROM $3 OR ctx->>'boxState'='failed_stopped')
           AND state IN ('inflight','finalizing','committed','aborted')`,
       [input.uid.toString(), input.sessionId, input.turnKey]);
     const matches = rows.rows.filter((row) => {
@@ -577,6 +577,22 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (matches.length === 0) return { kind: "none" };
     if (matches.length !== 1) return { kind: "live" };
     const row = matches[0]!, ctx = row.ctx;
+    const sameTurn = ctx.boxTurnKey === input.turnKey;
+    const stopped = ctx.boxState === "failed_stopped";
+    // Same-turn live handoff belongs to claimToolResume; a user Stop (or
+    // supersedeWaiting stop) on this turn must not be resurrected by late tool
+    // results. Only a remote worker failure/keeper stop already proven while
+    // the container waited on the tool (e.g. AskUserQuestion) continues fresh.
+    if (sameTurn) {
+      if (!stopped || ctx.boxStopOutcome !== "failed" || ctx.boxResumeRequestId !== undefined
+        || ctx.boxCancelIntent !== undefined || typeof ctx.boxRunNonce !== "string"
+        || typeof ctx.boxLeaseEpoch !== "string") return { kind: "none" };
+      try {
+        const proof = parseBoxTerminalProof(`${JSON.stringify(ctx.boxTerminalProof)}\n`, {
+          runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
+        if (proof.reason !== "keeper_stopped" && proof.reason !== "worker_failed") return { kind: "none" };
+      } catch { return { kind: "none" }; }
+    }
     // A failed recovery gives the exchange back only before admission or
     // after its admitted invocation is proven stopped without a successor.
     let staleClaim: string | undefined;
@@ -591,7 +607,6 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       staleClaim = ctx.boxRecoveredBy;
     }
-    const stopped = ctx.boxState === "failed_stopped";
     // A Stop already in flight (cancel intent, not yet proven) is not ours.
     if (!stopped && ctx.boxCancelIntent !== undefined) return { kind: "live" };
     const billing = parseBoxBillingContext(ctx.boxBillingContext);
@@ -604,7 +619,10 @@ export class BoxDurableJournal implements BoxJournalPort {
     const dispatch = await this.pool.query<{ status: string }>(
       `SELECT status FROM turn_dispatches WHERE user_id=$1 AND dispatch_id::text=$2`,
       [input.uid.toString(), billing.dispatchId]);
-    if (dispatch.rows[0]?.status !== "terminal") return { kind: "live" };
+    const dispatchStatus = dispatch.rows[0]?.status;
+    if (sameTurn
+      ? !dispatchStatus || !["admitted", "accepted", "running", "terminal"].includes(dispatchStatus)
+      : dispatchStatus !== "terminal") return { kind: "live" };
     return { kind: "orphan", stopped, ...(staleClaim ? { staleClaim } : {}),
       identity: { requestId: row.request_id, uid: input.uid,
       accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch } };
