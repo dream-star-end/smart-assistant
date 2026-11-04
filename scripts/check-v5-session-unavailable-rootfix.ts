@@ -1219,8 +1219,8 @@ await runTapProof({
   fromRoot: candidateRoot,
   files: ['packages/gateway/src/__tests__/antigravityDeliveryPersistence.test.ts'],
   expected: [
-    'terminal-only survives SQLite reopen (1 terminal frames, one delivery/settlement)',
-    'terminal-only survives SQLite reopen (3 terminal frames, one delivery/settlement)',
+    'terminal-response-only survives SQLite reopen (1 terminal frames, one delivery/settlement)',
+    'terminal-response-only survives SQLite reopen (3 terminal frames, one delivery/settlement)',
     'native-only survives SQLite reopen (1 terminal frames, one delivery/settlement)',
     'native-only survives SQLite reopen (3 terminal frames, one delivery/settlement)',
   ],

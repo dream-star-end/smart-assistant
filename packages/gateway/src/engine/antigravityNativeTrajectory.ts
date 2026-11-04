@@ -203,7 +203,9 @@ function validateWire(bytes: Uint8Array, type: protobuf.Type, depth = 0): void {
   const reader = protobuf.Reader.create(bytes)
   const seen = new Set<number>()
   while (reader.pos < reader.len) {
-    const tag = wireUint32(reader), id = tag >>> 3, wire = tag & 7
+    const tag = wireUint32(reader)
+    const id = tag >>> 3
+    const wire = tag & 7
     const field = type.fieldsById[id]
     if (!field || (!field.repeated && seen.has(id))) throw new Error('unknown-or-duplicate-field')
     seen.add(id)
@@ -320,7 +322,8 @@ export async function recoverAntigravityNativeTrajectory(
       if (final.type !== 15 || final.status !== 3) return fail('missing-final')
       const response = final.planner_response!
       if (response.stop_reason !== 2 || response.tool_calls?.length) return fail('nonterminal-final')
-      const original = response.response ?? '', modified = response.modified_response ?? ''
+      const original = response.response ?? ''
+      const modified = response.modified_response ?? ''
       if (original && modified && original !== modified) return fail('conflicting-answer')
       const text = modified || original
       if (!text.trim()) return fail('empty-answer')

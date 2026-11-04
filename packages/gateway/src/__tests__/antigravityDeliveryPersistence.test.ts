@@ -14,7 +14,7 @@ import { createRequire } from 'node:module'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { after, test } from 'node:test'
+import { after, describe, test } from 'node:test'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { AgentSession } from '../sessionManager.js'
 import type { SessionStreamEvent } from '../ccbMessageParser.js'
@@ -169,6 +169,7 @@ async function runPrivateOneTurn(sm: InstanceType<typeof SessionManager>, sessio
   })._runOneTurn(session, '完成一次文件操作并回复', event => events.push(event), REQUEST_ID)
 }
 
+describe('Antigravity durable SQLite delivery', () => {
 for (const deliveryMode of ['terminal-response-only', 'native-only'] as const) for (const terminalCopies of [1, 3]) {
   test(`${deliveryMode} survives SQLite reopen (${terminalCopies} terminal frames, one delivery/settlement)`, { timeout: 30_000 }, async () => {
     const native = deliveryMode === 'native-only'
@@ -307,3 +308,5 @@ for (const deliveryMode of ['terminal-response-only', 'native-only'] as const) f
     }
   })
 }
+
+})
