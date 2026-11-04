@@ -1019,16 +1019,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         (ctx.requestedConversationId && ctx.resultConversationId !== ctx.requestedConversationId)) {
       ctx.errorDetail ??= 'ANTIGRAVITY_CONVERSATION_MISMATCH: result does not match this launch'
     }
-    if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
-      ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
-    }
     if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
     if (ctx.trailingErrorStep && ctx.trailingErrorDetail && ctx.errorDetail === null) {
       ctx.errorDetail = ctx.trailingErrorDetail
     }
     if (status !== 'SUCCESS' && ctx.errorDetail === null) {
-      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail ||
-        `Antigravity turn ended with status ${status || 'unknown'}`
+      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail || ctx.stderr.trim() ||
+        (ctx.procClosed && ctx.exitCode !== 0
+          ? `antigravity exited with code ${String(ctx.exitCode)}`
+          : `Antigravity turn ended with status ${status || 'unknown'}`)
+    }
+    if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
+      ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
     }
     if (status === 'SUCCESS' && ctx.errorDetail === null) {
       // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
