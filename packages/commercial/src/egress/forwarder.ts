@@ -9,7 +9,8 @@
  * 安全:
  *   - **deny /internal/v5/***:控制专用路径(cost-event 等)只允许 egress 进程
  *     自己调用,容器伪造经转发面到达 → 403(master 端秘钥头是第二道)。
- *     唯一例外:/internal/v5/delegate/grok-route/{mint,release,renew} 三条
+ *     唯一例外:delegate engine relay route 的 mint/release/renew(grok 与
+ *     antigravity,见 protocol internalRoutes.isDelegateRouteForwardException)
  *     精确路径转发给 master(容器身份鉴权在 master 侧,见
  *     internalDelegateGrokRoute.ts);其余 /internal/v5/* 仍全部拒转。
  *   - 剥掉入站的 egress 秘钥头(容器不可能合法携带,防透传)。
@@ -25,7 +26,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { request as httpRequest } from "node:http";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
-import { isDelegateGrokRoutePath } from "../http/internalDelegateGrokRoute.js";
+import { isDelegateRouteForwardException } from "@openclaude/protocol";
 import { EGRESS_SECRET_HEADER } from "../http/internalCostEvent.js";
 
 /** 转发到 master 时传递容器真实 peer ip 的头(master 控制口据此重建 boundIp ctx)。 */
@@ -65,7 +66,7 @@ export function makeForwarder(opts: ForwarderOpts): Forwarder {
     // 404,fail-closed 不变。
     if (
       path.split("?")[0]!.startsWith(CONTROL_ONLY_PREFIX) &&
-      !isDelegateGrokRoutePath(path.split("?")[0]!)
+      !isDelegateRouteForwardException(path.split("?")[0]!)
     ) {
       res.statusCode = 403;
       res.setHeader("Content-Type", "application/json; charset=utf-8");

@@ -4,7 +4,7 @@
  * Moved verbatim out of server.ts (FINDINGS §7.6, OCV5-533); server.ts re-exports
  * these names, so importers are unchanged.
  */
-import { STATIC_KEY_INBOUND_MODEL_IDS, CODEX_ENGINE_MODEL_IDS, GROK_ENGINE_MODEL_IDS, CURSOR_ENGINE_MODEL_IDS, ZCODE_ENGINE_MODEL_IDS } from '@openclaude/protocol'
+import { STATIC_KEY_INBOUND_MODEL_IDS, CODEX_ENGINE_MODEL_IDS, GROK_ENGINE_MODEL_IDS, CURSOR_ENGINE_MODEL_IDS, ZCODE_ENGINE_MODEL_IDS, ANTIGRAVITY_ENGINE_MODEL_IDS } from '@openclaude/protocol'
 import { resolveExecutionModel } from './localExecution.js'
 
 /**
@@ -38,6 +38,10 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
   ...GROK_ENGINE_MODEL_IDS,
   ...CURSOR_ENGINE_MODEL_IDS,
   ...ZCODE_ENGINE_MODEL_IDS,
+  // antigravity 只经 master 签发的 relay route 执行(adapter 无 route 即
+  // ANTIGRAVITY_ROUTE_REQUIRED);列入白名单只是让它与其它托管引擎一样能通过
+  // 委派/入站的型号校验,不构成执行授权。
+  ...ANTIGRAVITY_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 

@@ -353,6 +353,11 @@ import {
   type DelegateGrokRouteHandler,
 } from "./http/internalDelegateGrokRoute.js";
 import {
+  isDelegateAntigravityRoutePath,
+  makeDelegateAntigravityRouteHandler,
+  type DelegateAntigravityRouteHandler,
+} from "./http/internalDelegateAntigravityRoute.js";
+import {
   GROK_RELAY_PREFIX,
   makeGrokRelayHandler,
   makeGrokRelayHealthRecorder,
@@ -2519,6 +2524,20 @@ export async function registerCommercial(
               logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
             })
           : undefined;
+      // /internal/v5/delegate/antigravity-route/* — 委派到 antigravity 引擎时
+      // master 签发/续/释 relay route(OCV5-738)。与 chat turn 共用账号池、
+      // durable turn row 与 relay meter;同样只在 selfhost 引擎本地 turn 豁免下
+      // 挂载,商业版不暴露这条路由面。
+      const delegateAntigravityRouteHandler: DelegateAntigravityRouteHandler | undefined =
+        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
+          ? makeDelegateAntigravityRouteHandler({
+              identityRepo,
+              pool: getPool(),
+              relayPort: V3_CONTAINER_PORT,
+              clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+              logger: rootLogger.child({ subsys: "delegateAntigravityRoute" }),
+            })
+          : undefined;
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
@@ -3022,6 +3041,9 @@ export async function registerCommercial(
         }
         if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
           return delegateGrokRouteHandler(req, res, ctx);
+        }
+        if (delegateAntigravityRouteHandler && isDelegateAntigravityRoutePath(path)) {
+          return delegateAntigravityRouteHandler(req, res, ctx);
         }
         if (
           promptQueueHandler &&

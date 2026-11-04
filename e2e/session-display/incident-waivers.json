@@ -343,6 +343,30 @@
       "reason": "OCV5-729: codex 委派注入 master 签发 provider route，并在 route 缺失时 fail-closed。这是委派路由功能修复（Codex CLI 0.159.2 后裸起必然失败），不是 turn 展示/红卡/重试事故修复；只增加 provider override 与 503 门，不改 runner、tape、session 展示。Antigravity 同源问题已拆出未实施。",
       "approvedBy": "user 2026-11-04 OCV5-729 委派任务：实施 codex 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "2bfc755bc13dbf8d405a0609994a810cba7dd3b9",
+      "reason": "OCV5-738: 委派到 antigravity 引擎时由 master 签发 relay route（mint/renew/release），并把 settle/abandon 对账并入同一 requestId。属于委派路由功能修复，不是 turn 展示/红卡/重试事故修复；只新增 selfhost-only 内部端点、route 透传与 503 fail-closed，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务：实施 antigravity 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署、不重启服务",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "16f62434694c4cf0d01e07afd966025edcb242a6",
+      "reason": "OCV5-738: 修复 PR #1373 独立审计发现的 4 项委派 Antigravity 计费守恒问题（external_billing 权威终态、冻结价格快照结算、暂不可结算回退重试、并发 mint 互斥）与 2 项清理 warning。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "94a039f8ea3476a5493e9571a1f9817c5f417679",
+      "reason": "OCV5-738: 修复 PR #1373 第 2 轮独立审计指出的 liveExternalBilling TS 控制流收窄与跨实例并发 mint 持久化回查兜底及单测。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "e6f57268fc06b7e8705c8f4651b8b6a31fc4f944",
+      "reason": "OCV5-738: 保持 DurableCodexBilling.terminalCode 与 OutboundCodexBilling 窄类型一致，将 Antigravity 专属 terminalCode 扩宽收敛到 DelegateEngineBillingSettlePayload，消除 inboundDispatch.ts(2123) 类型冲突。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
     }
   ]
 }
