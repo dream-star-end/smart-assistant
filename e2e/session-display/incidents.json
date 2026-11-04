@@ -9446,7 +9446,8 @@
       "symptom": "Antigravity relay disconnects could hang or reset instead of returning errors; completed native answers could be lost when stdout/result was empty, causing red cards and needless context reconstruction. Recovery is read-only and launch-bound, never reruns models or tools.",
       "rootFixCommit": "29a94025",
       "coverageCommits": [
-        "75eb8d00"
+        "75eb8d00",
+        "e155a377"
       ],
       "regressions": [
         {
