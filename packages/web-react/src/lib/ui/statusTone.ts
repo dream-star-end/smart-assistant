@@ -93,6 +93,7 @@ export function failedLabel(reason?: string): string {
 
 /** 侧栏行首点(sessionStatus.resolveSidebarDot 的判定结果)→ 语义状态。 */
 export const SIDEBAR_DOT_STATUS: Record<Exclude<SidebarDotKind, "none">, StatusKind> = {
+  needs_you: "needs_you",
   running: "running",
   unread: "unread",
   stopped: "stopped",

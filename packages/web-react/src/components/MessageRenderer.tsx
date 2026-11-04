@@ -11,7 +11,7 @@ import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBounda
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
-import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isInteractiveToolMessage, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
@@ -946,6 +946,12 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   // the end of its turn (after the answer), and does not split the shell: the
   // rows stored after it (which ran before it, see continuedErrorIds) keep
   // folding into the same 工作过程.
+  let interactive: { boundary: string; items: LeafRenderItem[] } | undefined;
+  const flushInteractive = () => {
+    if (!interactive) return;
+    out.push(...interactive.items);
+    interactive = undefined;
+  };
   let terminal: { boundary: string; items: LeafRenderItem[] } | undefined;
   const flushTerminal = () => {
     if (!terminal) return;
@@ -969,10 +975,15 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     const advanced = advanceDisclosureBoundary(rows, owner);
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;
-    if (terminal && terminal.boundary !== nextBoundary) {
+    if ((interactive && interactive.boundary !== nextBoundary) || (terminal && terminal.boundary !== nextBoundary)) {
       seal(group, boundary);
       if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
-      flushTerminal();
+      if (interactive && interactive.boundary !== nextBoundary) flushInteractive();
+      if (terminal && terminal.boundary !== nextBoundary) flushTerminal();
+    }
+    if (rows.length > 0 && rows.every(isInteractiveToolMessage)) {
+      (interactive ??= { boundary: nextBoundary, items: [] }).items.push(item);
+      continue;
     }
     if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !isErrorCardHeldWithAnswer(message) && !continuedErrors.has(message.id))) {
       (terminal ??= { boundary: nextBoundary, items: [] }).items.push(item);
@@ -1028,6 +1039,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   }
   seal(group, boundary);
   if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+  flushInteractive();
   flushTerminal();
   return out;
 }

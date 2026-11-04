@@ -44,6 +44,7 @@ describe("状态语义表(UI-SPEC §4.3)", () => {
 
   it("侧栏点映射到语义状态", () => {
     expect(SIDEBAR_DOT_STATUS).toEqual({
+      needs_you: "needs_you",
       running: "running",
       unread: "unread",
       stopped: "stopped",

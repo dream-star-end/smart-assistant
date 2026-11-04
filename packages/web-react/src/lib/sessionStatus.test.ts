@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  clearTicketApprovalPendingCacheForTest,
   deriveLiveTerminalEndedAt,
   deriveLiveTerminalFromMessages,
+  deriveSessionNeedsYou,
   isSidebarSessionRunning,
+  recordTicketApprovalPending,
+  syncTicketApprovalFromTicket,
   resolveSessionStatus,
   resolveSidebarDot,
+  resolveSidebarDotLabel,
 } from "./sessionStatus";
 
 describe("resolveSessionStatus", () => {
@@ -165,5 +170,149 @@ describe("deriveLiveTerminalEndedAt", () => {
     expect(
       deriveLiveTerminalEndedAt([{ _dispatchOutcome: "completed" }], observed),
     ).toBe(observed);
+  });
+});
+
+
+describe("needs_you 与 Q 版问号待接入判定 (OCV5-739)", () => {
+  it("resolveSidebarDot: needsYou 优先于 running / unread / completed", () => {
+    expect(resolveSidebarDot({ running: true, needsYou: "approval" }, true)).toBe("needs_you");
+    expect(resolveSidebarDot({ running: false, lastOutcome: "completed", needsYou: "answer" }, true)).toBe(
+      "needs_you",
+    );
+    expect(resolveSidebarDotLabel("needs_you", "approval")).toBe("等你批准");
+    expect(resolveSidebarDotLabel("needs_you", "answer")).toBe("等你回答");
+  });
+
+  it("deriveSessionNeedsYou: ExecuteExtraTool / call_mcp_tool 包装的 present_task_approval 识别为 approval，用户回复或单据解决后消解", () => {
+    clearTicketApprovalPendingCacheForTest();
+    const sess = {
+      messages: [
+        { role: "user", text: "开始处理" },
+        {
+          role: "tool",
+          toolName: "ExecuteExtraTool",
+          inputJson: {
+            tool_name: "mcp__openclaude-memory__present_task_approval",
+            params: { id: "OCV5-738" },
+          },
+          _completed: true,
+          output: JSON.stringify({ ok: true, kind: "task_approval", status: "presented" }),
+        },
+        { role: "assistant", text: "下面有 OCV5-738 的审批卡，请点一下批准开工。" },
+      ],
+    };
+    expect(deriveSessionNeedsYou(sess)).toBe("approval");
+
+    // 单据在看板被批准/处理后，无需发新消息也自动消解
+    recordTicketApprovalPending("OCV5-738", false);
+    expect(deriveSessionNeedsYou(sess)).toBeNull();
+
+    // Antigravity call_mcp_tool PascalCase 包装
+    clearTicketApprovalPendingCacheForTest();
+    const agySess = {
+      messages: [
+        { role: "user", text: "继续" },
+        {
+          role: "tool",
+          toolName: "call_mcp_tool",
+          inputJson: {
+            ServerName: "openclaude-memory",
+            ToolName: "present_task_approval",
+            Arguments: { id: "OCV5-739" },
+          },
+          _completed: true,
+          output: "ok",
+        },
+      ],
+    };
+    expect(deriveSessionNeedsYou(agySess)).toBe("approval");
+
+    // 用户回复新消息后立即消解
+    expect(
+      deriveSessionNeedsYou({
+        messages: [...agySess.messages, { role: "user", text: "已批准开工 OCV5-739" }],
+      }),
+    ).toBeNull();
+
+    // use_tool 的 tool_input / name 变体与看板单据状态同步（syncTicketApprovalFromTicket）
+    clearTicketApprovalPendingCacheForTest();
+    const useToolSess = {
+      messages: [
+        { role: "user", text: "继续" },
+        {
+          role: "tool",
+          toolName: "mcp__gateway__use_tool",
+          inputJson: {
+            name: "mcp__openclaude-memory__present_task_approval",
+            tool_input: { id: "OCV5-740" },
+          },
+          _completed: true,
+          output: "ok",
+        },
+      ],
+    };
+    expect(deriveSessionNeedsYou(useToolSess)).toBe("approval");
+    syncTicketApprovalFromTicket({ id: "uuid-740", identifier: "ocv5-740", status: "ready", version: 2 });
+    expect(deriveSessionNeedsYou(useToolSess)).toBeNull();
+    // 乱序晚到的旧版本 v1/backlog 响应不得把已批准状态覆盖回 pending
+    syncTicketApprovalFromTicket({ id: "uuid-740", identifier: "OCV5-740", status: "backlog", version: 1 });
+    expect(deriveSessionNeedsYou(useToolSess)).toBeNull();
+    // 更高版本 v3/waiting_human 进入待验收时允许重新置为待批
+    syncTicketApprovalFromTicket({ id: "uuid-740", identifier: "OCV5-740", status: "waiting_human", version: 3 });
+    expect(deriveSessionNeedsYou(useToolSess)).toBe("approval");
+  });
+
+  it("deriveSessionNeedsYou: 末尾 options 选择卡、未决 permission 问答/权限卡、waiting_for_user 均正确区分 answer / approval，异常或停止轮不误报", () => {
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "帮我选方案" },
+          {
+            role: "assistant",
+            text: "请选择：\n```options\n{\"question\":\"选哪个？\",\"options\":[{\"label\":\"A\"}]}\n```",
+          },
+        ],
+      }),
+    ).toBe("answer");
+
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "执行" },
+          { role: "permission", toolName: "AskUserQuestion", _resolved: false },
+        ],
+      }),
+    ).toBe("answer");
+
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "执行" },
+          { role: "permission", toolName: "ExitPlanMode", _resolved: false },
+        ],
+      }),
+    ).toBe("approval");
+
+    expect(
+      deriveSessionNeedsYou({
+        _turnStatus: "waiting_for_user",
+        messages: [{ role: "user", text: "等待中" }],
+      }),
+    ).toBe("answer");
+
+    // 已停止或报错结束的轮次不再提示待回答
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "帮我选方案" },
+          {
+            role: "assistant",
+            text: "```options\n{\"options\":[{\"label\":\"A\"}]}\n```",
+            _errorCode: "USER_CANCELLED",
+          },
+        ],
+      }),
+    ).toBeNull();
   });
 });
