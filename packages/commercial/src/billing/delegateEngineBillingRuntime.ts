@@ -421,7 +421,7 @@ export function createDelegateEngineBillingRuntime(
           // Another owner already finalized/claimed this admission. Never
           // double-debit; the retry converges once that owner reports state.
           const state = await pool.query<{ state: string }>(
-            `SELECT state FROM request_finalize_journal WHERE request_id=$1`,
+            'SELECT state FROM request_finalize_journal WHERE request_id=$1',
             [requestId],
           )
           if (state.rows[0]?.state === 'committed') return { settled: true }
