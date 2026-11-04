@@ -137,7 +137,7 @@ show_status() {
 }
 
 wait_run() {
-  local unit="$1" state substate status
+  local unit="$1" state substate status result
   validate_unit "$unit"
   require_tool systemctl
   require_loaded_unit "$unit"
@@ -160,10 +160,14 @@ wait_run() {
   done
   status="$(systemctl show "$unit" --property=ExecMainStatus --value)"
   [[ "$status" =~ ^[0-9]+$ ]] || die "无法读取 ExecMainStatus:$unit"
+  result="$(systemctl show "$unit" --property=Result --value)"
   show_status "$unit"
   systemctl stop "$unit" >/dev/null 2>&1 \
     || echo "! 已完成的 detached deploy unit 清理失败:$unit" >&2
   (( status <= 255 )) || status=1
+  if (( status == 0 )) && [[ "$result" != success || "$state" == failed ]]; then
+    status=1
+  fi
   exit "$status"
 }
 

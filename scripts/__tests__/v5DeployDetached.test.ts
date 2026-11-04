@@ -50,8 +50,9 @@ if [[ "$*" == *"--property=SubState --value"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"--property=ExecMainStatus --value"* ]]; then printf '%s\\n' "\${FAKE_STATUS:-0}"; exit 0; fi
+if [[ "$*" == *"--property=Result --value"* ]]; then printf '%s\\n' "\${FAKE_RESULT:-success}"; exit 0; fi
 if [[ "$1" == stop ]]; then printf '%s\\n' "$*" >>"\${FAKE_SYSTEMCTL_LOG:-/dev/null}"; exit 0; fi
-printf '%s\\n' 'LoadState=loaded' "ActiveState=\${FAKE_STATE:-inactive}" "ExecMainStatus=\${FAKE_STATUS:-0}"
+printf '%s\\n' 'LoadState=loaded' "ActiveState=\${FAKE_STATE:-inactive}" "ExecMainStatus=\${FAKE_STATUS:-0}" "Result=\${FAKE_RESULT:-success}"
 `,
     'systemd-run': `#!/usr/bin/env bash
 printf '%s\\n' "$@" >"$FAKE_LOG"
@@ -183,6 +184,44 @@ test('wait returns the official deploy process exit status', () => {
     fake.cleanup()
   }
 })
+
+for (const scenario of [
+  { state: 'failed', result: 'oom-kill', status: 0, expected: 1 },
+  { state: 'failed', result: 'exit-code', status: 0, expected: 1 },
+  { state: 'inactive', result: 'oom-kill', status: 0, expected: 1 },
+  { state: 'failed', result: 'success', status: 0, expected: 1 },
+  { state: 'inactive', result: 'success', status: 0, expected: 0 },
+  { state: 'failed', result: 'oom-kill', status: 9, expected: 9 },
+  { state: 'failed', result: 'exit-code', status: 257, expected: 1 },
+]) {
+  test(`wait handles terminal ${scenario.state}/${scenario.result}/status=${scenario.status}`, () => {
+    const fake = fakeTools()
+    const unit = 'openclaude-v5-deploy-20260807-000000-deadbeef-canary.service'
+    const systemctlLog = path.join(path.dirname(fake.bin), 'systemctl.log')
+    try {
+      const result = spawnSync(runner, ['wait', unit], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${fake.bin}:${process.env.PATH}`,
+          FAKE_STATE: scenario.state,
+          FAKE_RESULT: scenario.result,
+          FAKE_STATUS: String(scenario.status),
+          FAKE_SYSTEMCTL_LOG: systemctlLog,
+        },
+      })
+      assert.equal(result.status, scenario.expected, result.stdout + result.stderr)
+      assert.ok(result.stdout.includes(`Result=${scenario.result}`))
+      assert.ok(result.stdout.includes(`ActiveState=${scenario.state}`))
+      assert.ok(result.stdout.includes(`ExecMainStatus=${scenario.status}`))
+      assert.match(result.stdout, /journal-ok/)
+      assert.equal(readFileSync(systemctlLog, 'utf8').trim(), `stop ${unit}`)
+    } finally {
+      fake.cleanup()
+    }
+  })
+}
 
 test('wait preserves and returns a successful result after running becomes exited', () => {
   const fake = fakeTools()
