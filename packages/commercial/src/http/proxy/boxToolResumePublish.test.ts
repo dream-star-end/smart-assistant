@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { publishBoxToolResume } from "./boxToolResumePublish.js";
 import { BoxContinuationDecisionError } from "./boxPreparedContinuation.js";
+import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { hashBoxToolInput } from "./boxToolInputHash.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
@@ -25,8 +26,10 @@ const canonicalBody: ProxyBody = { model: "box-api-claude-opus-5-5", max_tokens:
     oc_turn_key: "a".repeat(64) }) } };
 const upstreamBody = { ...canonicalBody, model: "claude-opus-5-5" };
 
-function fixture(options: { ambiguousWrite?: boolean; wrongAccount?: boolean } = {}) {
+function fixture(options: { ambiguousWrite?: boolean; wrongAccount?: boolean;
+  failAt?: "pending-read" | "result-write" } = {}) {
   const sequence: string[] = [];
+  const executionError = new BoxExecTransportError("BOX_EXEC_HTTP_417", false);
   let writes = 0, retained = false;
   const claim = { ownerRequestId: "box-owner", accountId: 20n,
     runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
@@ -40,11 +43,13 @@ function fixture(options: { ambiguousWrite?: boolean; wrongAccount?: boolean } =
       if (request.args[0] === "-I" && request.args[1] === "-c"
         && request.args[2]?.includes("pending.")) {
         sequence.push("pending-read");
+        if (options.failAt === "pending-read") throw executionError;
         return { stdout: JSON.stringify({ version: 1, modelToolUseId: id,
           mcpRequestId: 7, name: "t0", arguments: toolInput }),
         stderrBytes: 0, exitCode: 0 as const };
       }
       sequence.push("result-write"); writes++;
+      if (options.failAt === "result-write") throw executionError;
       if (options.ambiguousWrite && writes === 1) {
         throw new BoxExecTransportError("synthetic write ambiguity", false);
       }
@@ -66,7 +71,7 @@ function fixture(options: { ambiguousWrite?: boolean; wrongAccount?: boolean } =
     canonicalModel: canonicalBody.model, canonicalBody,
     upstreamModel: "claude-opus-5-5", url: BOX_INTERNAL_ENDPOINT,
     init: { method: "POST", body: JSON.stringify(upstreamBody) } };
-  return { input, deps, sequence, target, claim,
+  return { input, deps, sequence, target, claim, executionError,
     get writes() { return writes; }, get retained() { return retained; } };
 }
 
@@ -160,4 +165,82 @@ test("out-of-order pending B is published before dependent A without replay", as
   await publishBoxToolResume(f.input, f.deps);
   assert.deepEqual(published, [b, id]);
   assert.equal(f.retained, false);
+});
+
+
+type FailureRecord = Parameters<BoxDurableJournal["recordFirstFailure"]>[0];
+function withFailureRecorder(f: ReturnType<typeof fixture>, recorder: BoxDurableJournal["recordFirstFailure"]) {
+  Object.assign(f.deps.journal, { recordFirstFailure: recorder });
+}
+
+test("post-claim pending-read and result-stage 417 failures are observed before unknown with exact claim identity", async () => {
+  for (const failAt of ["pending-read", "result-write"] as const) {
+    const f = fixture({ failAt });
+    const records: FailureRecord[] = [];
+    withFailureRecorder(f, async (record) => {
+      f.sequence.push("first-failure"); records.push(record); return null;
+    });
+    await assert.rejects(publishBoxToolResume(f.input, f.deps), (error: unknown) => error === f.executionError);
+    assert.deepEqual(records, [{ requestId: f.input.requestId, uid: f.input.uid,
+      accountId: f.claim.accountId, runNonce: f.claim.runNonce, leaseEpoch: f.claim.leaseEpoch,
+      ownerRequestId: f.claim.ownerRequestId, code: "BOX_EXEC_HTTP_417", phase: "continuation",
+      diagnostic: { branch: "resume_publish", upstreamStatus: 417 } }]);
+    assert.ok(f.sequence.indexOf("first-failure") < f.sequence.indexOf("unknown"));
+    assert.equal(f.sequence.filter(item => item === "claim").length, 1);
+    assert.equal(f.writes, failAt === "result-write" ? 1 : 0, "publication is never retried");
+    assert.equal(f.retained, true);
+    assert.ok(f.sequence.includes("notify"));
+  }
+});
+
+test("a rejected authoritative claim records no failure and does not mark an owner unknown", async () => {
+  const f = fixture();
+  let records = 0;
+  withFailureRecorder(f, async () => { records++; return null; });
+  Object.assign(f.deps.journal, { claimToolResume: async () => { throw f.executionError; } });
+  await assert.rejects(publishBoxToolResume(f.input, f.deps), (error: unknown) => error === f.executionError);
+  assert.equal(records, 0);
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.equal(f.sequence.includes("resolve"), false);
+  assert.equal(f.writes, 0);
+});
+
+test("synchronous and rejected diagnostic writes cannot mask the publication failure or unknown path", async () => {
+  for (const kind of ["throw", "reject"] as const) {
+    const f = fixture({ failAt: "result-write" });
+    withFailureRecorder(f, () => {
+      f.sequence.push("first-failure");
+      if (kind === "throw") throw new Error("synthetic diagnostic failure");
+      return Promise.reject(new Error("synthetic diagnostic rejection"));
+    });
+    await assert.rejects(publishBoxToolResume(f.input, f.deps), (error: unknown) => error === f.executionError);
+    assert.equal(f.writes, 1);
+    assert.equal(f.retained, true);
+    assert.ok(f.sequence.indexOf("first-failure") < f.sequence.indexOf("unknown"));
+    assert.ok(f.sequence.includes("notify"));
+  }
+});
+
+test("a hanging diagnostic write is bounded to 200ms and a late rejection stays observed", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture({ failAt: "pending-read" });
+  let started!: () => void, rejectLate!: (error: Error) => void;
+  const recorded = new Promise<void>((resolve) => { started = resolve; });
+  withFailureRecorder(f, () => {
+    f.sequence.push("first-failure"); started();
+    return new Promise<never>((_resolve, reject) => { rejectLate = reject; });
+  });
+  const task = assert.rejects(publishBoxToolResume(f.input, f.deps), (error: unknown) => error === f.executionError);
+  await recorded;
+  t.mock.timers.tick(199);
+  await Promise.resolve();
+  assert.equal(f.sequence.includes("unknown"), false);
+  t.mock.timers.tick(1);
+  await task;
+  assert.equal(f.retained, true);
+  assert.ok(f.sequence.includes("unknown"));
+  assert.ok(f.sequence.includes("notify"));
+  assert.equal(f.writes, 0);
+  rejectLate(new Error("synthetic late diagnostic rejection"));
+  await Promise.resolve();
 });

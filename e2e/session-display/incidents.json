@@ -6071,7 +6071,9 @@
       "severity": "P1",
       "symptom": "线上 #611729fb（v5-a1d06cff1 发布前，09:00Z）：Box Claude Opus 5.5 回合执行 79 步后，一次工具结果续接时 Box exec 目标解析失败（BOX_TARGET_UNAVAILABLE → resume_publish_unknown → 500），CCB 重试被 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝，红卡『任务执行失败 / 内部错误』且只能手点『从断点继续』。所有工具均已完成，按 OCV5-317 应自动断点续接，但 master 判 checkpoint_unsafe：残留 live 帧里每个 tool_use 块被转成无 id、未完成的 tool 记录，凡决策时 live 帧尚在的带工具回合都被当成有未完成工具。修复：残留 tool_use / tool_result 按 id 配对（tool_result.toolUseBlockId → tool_use.blockId），无 id 的块仍按原规则 fail-closed；BOX_TARGET_UNAVAILABLE 附带安全的原因标签（仅错误名/供给码）。",
       "rootFixCommit": "bcaa4772",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "c1e3b8a4"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -6082,6 +6084,16 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "OCV5-321 settled-tools checkpoint survives leftover live tool frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/sessionRecoveryEvidence.test.ts",
+          "assertion": "real producer start then done supersedes its older pending frame for the existing settled-tools checkpoint"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/sessionRecoveryEvidence.test.ts",
+          "assertion": "only done completes; errors, activity and unknown metadata remain pending"
         }
       ]
     },
@@ -7391,6 +7403,9 @@
       "severity": "P1",
       "symptom": "商业 uid 4 会话 webmv6evixkgn33mp（gpt-6.1-sol，2026-10-13 16:28 CST，派单 2e11133a）回合末出现「模型暂不可用」卡，要求用户切换模型。上游原文是 Codex 的容量满载 \"Selected model is at capacity. Please try a different model.\"，属瞬时容量错误；OCV5-252 的 /try a different model/i 把它判成 model_not_available（不可重试），跳过了 model_capacity 的有界无感重试和自动恢复。两边生产自 10-02/10-05 起所有同文案行都被如此误判（商业仅 10-13 就 5 条）。",
       "rootFixCommit": "f1adc83d",
+      "coverageCommits": [
+        "793c4f0b"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -7406,6 +7421,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "[codex-capacity-retry] PASS — INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE executed at-capacity classify and 3-attempt silent retry on throw and resolved shapes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE: historical unavailable copy stays neutral about capacity"
         }
       ]
     },
@@ -9620,110 +9640,112 @@
         }
       ]
     },
-  {
-    "id": "INC-20261101-UPLOAD-TOTAL-UX",
-    "occurredAt": "2026-11-01",
-    "severity": "P1",
-    "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
-    "rootFixCommit": "ae556ee5",
-    "coverageCommits": [
-      "b4fbbfc8",
-      "f8ca2a8c"
-    ],
-    "regressions": [
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "345649213 bytes formats as 330MB over 300MB in two messages"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "attachment total failure code round-trips and rejects other codes"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-        "assertion": "noteAttachmentTotalRejection stamps 2200MB copy and a parseable code"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-        "assertion": "stamped attachment total code round-trips on the state response and is omitted when absent"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/commercial/src/__tests__/attachmentTotalFailure.test.ts",
-        "assertion": "rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
-        "assertion": "errorPresentation attachment total says 2200MB and does not ask to retry"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
-        "assertion": "附件合计超限状态卡说明 2200MB 且没有继续按钮"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "同一帧内第二批附件超过 2048MB 时不再上传"
-      },
-      {
-        "layer": "browser",
-        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
-        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
-      }
-    ]
-  },
-  {
-    "id": "INC-20261101-UPLOAD-TOTAL-2G",
-    "occurredAt": "2026-11-01",
-    "severity": "P1",
-    "symptom": "引用式附件合计仍被 300MiB 卡住。uid4 四个 rar 加一个 docx 共 345649213 字节，单文件都在 100MiB 内，发送被拒。合计上限改为 2GiB，按已落盘文件的字节计。单文件仍是 100MiB。内联文本仍是 300MiB，因为它进帧而不是引用。提示队列的正文预算仍是 300MiB。预检和拒绝文案沿用合计、上限和分条，不计费。",
-    "rootFixCommit": "9caa6fe1",
-    "regressions": [
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "2GiB is within the total limit and one extra byte is over"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/security.test.ts",
-        "assertion": "MAX_UPLOAD_TOTAL is 2GiB"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-        "assertion": "message attachment total includes bytes after the 2GiB cap is crossed"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
-      },
-      {
-        "layer": "browser",
-        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
-        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
-      }
-    ]
-  },
+    {
+      "id": "INC-20261101-UPLOAD-TOTAL-UX",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
+      "rootFixCommit": "ae556ee5",
+      "coverageCommits": [
+        "b4fbbfc8",
+        "f8ca2a8c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "345649213 bytes formats as 330MB over 300MB in two messages"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "attachment total failure code round-trips and rejects other codes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+          "assertion": "noteAttachmentTotalRejection stamps 2200MB copy and a parseable code"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+          "assertion": "stamped attachment total code round-trips on the state response and is omitted when absent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/attachmentTotalFailure.test.ts",
+          "assertion": "rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "errorPresentation attachment total says 2200MB and does not ask to retry"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
+          "assertion": "附件合计超限状态卡说明 2200MB 且没有继续按钮"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "同一帧内第二批附件超过 2048MB 时不再上传"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+          "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261101-UPLOAD-TOTAL-2G",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "引用式附件合计仍被 300MiB 卡住。uid4 四个 rar 加一个 docx 共 345649213 字节，单文件都在 100MiB 内，发送被拒。合计上限改为 2GiB，按已落盘文件的字节计。单文件仍是 100MiB。内联文本仍是 300MiB，因为它进帧而不是引用。提示队列的正文预算仍是 300MiB。预检和拒绝文案沿用合计、上限和分条，不计费。",
+      "rootFixCommit": "9caa6fe1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "2GiB is within the total limit and one extra byte is over"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/security.test.ts",
+          "assertion": "MAX_UPLOAD_TOTAL is 2GiB"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+          "assertion": "message attachment total includes bytes after the 2GiB cap is crossed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+          "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
+        }
+      ]
+    },
     {
       "id": "INC-20261101-RECOVER-UX-EMPTY",
       "occurredAt": "2026-11-01",
       "severity": "P1",
       "symptom": "商业版 uid1 发「hi」时，周额度已用尽的登录仍被选中。上游拒绝后自动恢复改发了「从断点继续」，原消息仍显示发送失败和继续。什么都没执行过时应原样重发用户原文；自动恢复成功接手后，原消息不再显示发送失败。",
       "rootFixCommit": "228248b9",
-      "coverageCommits": ["7714ec8b"],
+      "coverageCommits": [
+        "7714ec8b"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -9754,6 +9776,136 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
           "assertion": "a running chat leaves its login once that login's weekly quota is exhausted"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261102-BOX-PROFILE-OBSERVER-ATTRIBUTION",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "2026-11-02 商业版代码审计后的隔离故障注入：egress重启丢失runOwners，或读命令缺少nonce时，BoxProfileExec把旧run的配额/认证信号回退记到当前观察target，错误冷却另一登录；非launch裸stdout也会写当前scope健康。已用假transport在正式runner复现，未证明这是uid4当天故障根因。修复只接受launch直出信号，或有已知原owner的合法spool信号；未知身份保持原读取/偏移/控制但不更新任何profile健康，不新增登录切换。",
+      "rootFixCommit": "e13f9886",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxProfileExec.test.ts",
+          "assertion": "a process restart never attributes a prior run's rejection to the observing login"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxProfileExec.test.ts",
+          "assertion": "non-launch raw stdout never teaches a profile, including a failed exec"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "[inc-20261102-box-profile-observer-attribution] PASS — unknown observers never poison login health; known owners remain exact; zero launches"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261102-BOX-FIRST-FAILURE-LOST",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "商业 uid4 的流中首错被非流式回退 BOX_REPLAY_NOT_FOUND 覆盖，清理后无法定位原始拒绝。首错按精确运行身份有界持久化，只读回退保留原错误；成功或在途结果优先，歧义明确拒绝，不新增模型请求或重复结算。",
+      "rootFixCommit": "4f1f8d23",
+      "coverageCommits": [
+        "40cae4f8",
+        "8d10816b",
+        "e4c3cb32"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCoreFailure.test.ts",
+          "assertion": "mid-stream Box refusal survives the resolved pipe error after headers were sent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxReplayCompleted.test.ts",
+          "assertion": "a unique durable failure survives restart without reading a message or launching Box"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.integ.test.ts",
+          "assertion": "first Box failure survives cleanup/restart with exact, read-only fallback binding"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "await proveUid4FirstFailurePreserved(uid4Context(db))"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxFailureEvidence.test.ts",
+          "assertion": "today's exact Box tool, Exec417 and compact failures survive bounded first-error projection"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "event order failures retain fixed event type, state bits and only a bounded numeric index"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "tool validation first errors survive first-round cleanup and strict terminal wrapping"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResumePublish.test.ts",
+          "assertion": "post-claim pending-read and result-stage 417 failures are observed before unknown with exact claim identity"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261102-BOX-STOPPED-WORKER-POLL-HANG",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "商业 uid4 四次 worker_failed 后 stdout 清理截断，旧游标继续空轮询 158 至 246 秒。轮询在精确 account/run/epoch 终态证明下排空竞争输出并及时返回失败；不把静默当停止，不重复 Stop、工具执行或结算。",
+      "rootFixCommit": "4f1f8d23",
+      "coverageCommits": [
+        "40cae4f8"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.terminal.test.ts",
+          "assertion": "a cleaned empty stdout beyond the old cursor stops on its strict failure proof"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.terminal.test.ts",
+          "assertion": "a terminal error for a different account cannot settle or clean the owned run"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "await proveUid4StoppedWorkerConverges(uid4Context(db))"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261102-BOX-MEDIA-PREFIX",
+      "occurredAt": "2026-11-02",
+      "severity": "P1",
+      "symptom": "Box工具循环的外层历史从100张图增至102张时，通用媒体计数裁剪改写旧prefix，严格上下文hash拒绝合法续接。PR1350的非空占位未覆盖这个边界。Box从fresh起保持同一逻辑历史投影；服务端字节预算、owner/hash与一次工具结果领取不变。这里只证明外层协议与TEMP账务不变，不宣称原生上游任意图片数量都能完成。",
+      "rootFixCommit": "987e31cb",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMediaHistory.test.ts",
+          "assertion": "Box media history preserves the bound prefix across 100 images"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMediaHistory.test.ts",
+          "assertion": "fresh Box history over 100 images is staged intact and a real old media edit still changes the hash"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-607-lossless-context-transport] PASS"
         }
       ]
     }

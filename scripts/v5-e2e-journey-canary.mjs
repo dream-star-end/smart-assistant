@@ -41,8 +41,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { launchJourneyBrowser, selectJourneyModel } from "./lib/journey-browser.mjs";
 import { waitJ5Delivered } from "./lib/journey-j5.mjs";
+import { selectJourneyValidation } from "./lib/v5-validation-journey.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+let journeyValidation;
+try {
+  journeyValidation = selectJourneyValidation(process.argv.slice(2));
+} catch (err) {
+  fatal(2, `validation scope: ${err.message}`);
+}
 
 const SSH_HOST = process.env.V5_E2E_SSH_HOST ?? "kl-mirror";
 const REMOTE_PORT = Number(process.env.V5_E2E_REMOTE_PORT ?? 18790);
@@ -75,7 +82,13 @@ const PRE_J5_TIMEOUT = 240_000;
  * 回归。固定 Luna 仍通过真实模型选择器和真实 J5 回复验证完整用户路径，同时避免
  * 旅程继承 canary 账号历史会话的粘滞模型。
  */
-const JOURNEY_MODEL_ID = "grok-build";
+// The explicit, bound batch scope selects one model for the entire J1-J5 journey,
+// including the J3 goal auto-start in this same session. Default remains Grok.
+const JOURNEY_MODEL_ID = journeyValidation.model;
+const journeyModelLog = journeyValidation.scope ? ` model=${JOURNEY_MODEL_ID}` : "";
+if (journeyValidation.scope) {
+  console.log(`e2e-journey: Grok journey SKIPPED profile=skip-grok; J1-J5 model=${JOURNEY_MODEL_ID} remains required`);
+}
 /**
  * J5 等一轮真回复的上限。2026-07-28 两次生产慢轮分别在 122.53s / 126.70s
  * 正常 completed，120s 会把真实成功误判成挂起；180s 只扩等待窗，失败签名与附件
@@ -217,7 +230,7 @@ let stepName = "init";
 async function step(name, fn) {
   stepName = name;
   await fn();
-  console.log(`e2e-journey: ✓ ${name}`);
+  console.log(`e2e-journey: ✓ ${name}${journeyModelLog}`);
 }
 
 try {
@@ -417,7 +430,7 @@ try {
     });
   });
 
-  console.log("e2e-journey: 旅程全过(登录/附件读取/目标创建清除/发送/送达)");
+  console.log(`e2e-journey: 旅程全过(登录/附件读取/目标创建清除/发送/送达)${journeyModelLog}`);
   await browser.close();
   cleanupTunnel();
   process.exit(0);
@@ -431,7 +444,7 @@ try {
       console.error(`e2e-journey: J5 证据 ${shot}.json`);
     }
   } catch {}
-  console.error(`e2e-journey: ✗ 步骤「${stepName}」失败: ${String(err?.message ?? err).slice(0, 500)}`);
+  console.error(`e2e-journey: ✗ 步骤「${stepName}」失败${journeyModelLog}: ${String(err?.message ?? err).slice(0, 500)}`);
   await browser.close().catch(() => {});
   cleanupTunnel();
   process.exit(1);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
@@ -20,6 +21,9 @@ const executable = ts.transpileModule(functions.map((node) => node.getText(ast))
 const TARGET = "f496228de43718852cebda8fb9f35eb0e9c3a9c0";
 const ID = "INC-20260908-CC-SWITCH-ASCII-NAME";
 const OLD = "OCV5-171 follow-up";
+const CAPACITY_TARGET = "793c4f0b15928a59eaaedab3f8ba6194d1fb496a";
+const CAPACITY_ID = "INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE";
+const CAPACITY_OLD = "none (user-facing copy only; no behavior change)";
 const START = "1".repeat(40);
 const TIP = "2".repeat(40);
 type Row = { id: string; rootFixCommit: string; coverageCommits?: string[] };
@@ -82,6 +86,33 @@ function execute(options: {
   }
 }
 
+function executeCapacity(options: Parameters<typeof execute>[0] = {}) {
+  return execute({
+    sha: CAPACITY_TARGET,
+    trailer: CAPACITY_OLD,
+    incidents: [{ id: CAPACITY_ID, rootFixCommit: "f1adc83d", coverageCommits: ["793c4f0b"] }],
+    // Preserve the historical expired record: successful closure must not use it.
+    waivers: new Map([["793c4f0b", { expiresAt: "2026-11-01" }]]),
+    ...options,
+  });
+}
+
+// Execute the real Bash conditions between their stable structural boundaries.
+// Source overrides let the same behavior cases prove the old gate is red.
+const bashSource = readFileSync(process.env.OC_INCIDENT_COMPAT_BASH_SOURCE
+  ?? fileURLToPath(new URL("../check-v5-fix-trailers.sh", import.meta.url)), "utf8");
+const bashMarker = "  # exact immutable trailer mapping";
+const bashStart = bashSource.indexOf(bashMarker);
+assert.ok(bashStart >= 0 && bashStart === bashSource.lastIndexOf(bashMarker), "one actual Bash mapping block");
+const bashEnd = bashSource.indexOf('  if [[ "$trailer" =~ ^none', bashStart);
+assert.ok(bashEnd > bashStart, "mapping block precedes the ordinary none path");
+const bashMapping = bashSource.slice(bashStart, bashEnd);
+function executeBashMapping(sha: string, trailer: string): string {
+  return execFileSync("bash", ["-c",
+    `set -euo pipefail\nsha="$1"\ntrailer="$2"\n${bashMapping}\nprintf '%s' "$trailer"`,
+    "exact-trailer-fixture", sha, trailer], { encoding: "utf8", timeout: 2_000 });
+}
+
 test("exact immutable SHA and original trailer normalize then complete incident closure", () => {
   const result = execute();
   assert.equal(result.checked, 1);
@@ -135,3 +166,62 @@ test("a commit inside a frozen tip's history is skipped, not judged", () => {
   const r = execute({ trailer: "OCV5-999", frozen: [TIP, TARGET] });
   assert.equal(r.checked, 0);
 });
+
+test("793c exact immutable copy trailer closes the existing incident despite its expired historical waiver", () => {
+  const result = executeCapacity();
+  assert.equal(result.checked, 1);
+  for (const value of [CAPACITY_TARGET, CAPACITY_OLD, CAPACITY_ID]) assert.ok(result.audit.includes(value));
+});
+
+const capacityWrongShas = [CAPACITY_TARGET.slice(0, 8), CAPACITY_TARGET.slice(0, 39),
+  CAPACITY_TARGET.slice(0, 39) + "0", "a".repeat(40)];
+for (const sha of capacityWrongShas) {
+  test(`793c old none trailer on a non-exact SHA still requires a live waiver: ${sha}`, () => {
+    assert.throws(() => executeCapacity({ sha }), /没有对应 waiver|已于 2026-11-01 过期/);
+  });
+}
+const capacityWrongTrailers = ["None (user-facing copy only; no behavior change)",
+  "none (User-facing copy only; no behavior change)",
+  "none (user-facing copy only; no behavior change.)", `${CAPACITY_OLD} extra`];
+for (const trailer of capacityWrongTrailers) {
+  test(`793c other trailer is not mapped: ${trailer}`, () => {
+    assert.throws(() => executeCapacity({ trailer }), /Incident trailer 格式非法|已于 2026-11-01 过期/);
+  });
+}
+test("793c mapping still requires the existing semantic incident", () => {
+  assert.throws(() => executeCapacity({ incidents: [] }),
+    /指向的 INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE 不在 incidents.json/);
+});
+test("793c mapping still requires its own coverage beside the real root fix", () => {
+  assert.throws(() => executeCapacity({ incidents: [{ id: CAPACITY_ID, rootFixCommit: "f1adc83d" }] }),
+    /rootFixCommit\/coverageCommits 未包含本 commit/);
+});
+test("793c missing trailer is not repaired by its mapping or old waiver", () => {
+  assert.throws(() => executeCapacity({ trailer: null }), /触碰用户可见面但缺 trailer/);
+});
+test("a future commit cannot reuse the 793c closure with its own expired waiver", () => {
+  const sha = "b".repeat(40);
+  assert.throws(() => executeCapacity({ sha, waivers: new Map([[sha.slice(0, 8), { expiresAt: "2020-01-01" }]]) }),
+    /已于 2020-01-01 过期/);
+});
+test("793c other none reason keeps the ordinary valid and expired waiver paths", () => {
+  const trailer = "none (a different approved reason)";
+  const result = executeCapacity({ trailer, waivers: new Map([["793c4f0b", { expiresAt: "2099-01-01" }]]) });
+  assert.equal(result.checked, 1); assert.equal(result.audit, "");
+  assert.throws(() => executeCapacity({ trailer }), /已于 2026-11-01 过期/);
+});
+
+test("actual Bash mapping resolves the exact 793c SHA and original trailer", () => {
+  assert.equal(executeBashMapping(CAPACITY_TARGET, CAPACITY_OLD), CAPACITY_ID);
+  assert.equal(executeBashMapping(TARGET, OLD), ID, "existing exact compatibility is preserved");
+});
+for (const sha of capacityWrongShas) {
+  test(`actual Bash mapping leaves a non-exact 793c SHA unchanged: ${sha}`, () => {
+    assert.equal(executeBashMapping(sha, CAPACITY_OLD), CAPACITY_OLD);
+  });
+}
+for (const trailer of [...capacityWrongTrailers, "none (a different approved reason)"]) {
+  test(`actual Bash mapping leaves another 793c trailer unchanged: ${trailer}`, () => {
+    assert.equal(executeBashMapping(CAPACITY_TARGET, trailer), trailer);
+  });
+}

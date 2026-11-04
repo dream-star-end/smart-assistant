@@ -167,16 +167,48 @@ test("OCV5-306 an unknown linked leaf whose CLI exited by itself settles unbille
     const orphan = await journal.findOrphanToolHandoff({ uid: 3n, sessionId, turnKey: "f".repeat(64),
       toolIds: ["toolu_A"] });
     assert.equal(orphan.kind === "orphan" && orphan.stopped, true);
-    // a live (non-unknown) leaf is never closed this way
-    const liveParent = `box-live-parent-${suffix}`, liveLeaf = `box-live-leaf-${suffix}`;
-    await put(liveParent, "committed", { boxState: "resuming", boxToolHandoff: handoff,
+    // A linked mirror is also known stopped once its exact keeper has proved
+    // completion. A proof bound to another run must still leave it untouched.
+    const linkedParent = `box-linked-parent-${suffix}`, linkedLeaf = `box-linked-leaf-${suffix}`;
+    await put(linkedParent, "committed", { boxState: "resuming", boxToolHandoff: handoff,
       boxHandoffRevision: "66666666-6666-4666-8666-666666666666", boxRoundNo: 1,
-      boxResumeRequestId: liveLeaf, boxResumeRevision: rev, boxRunNonce: "d".repeat(24) });
-    await put(liveLeaf, "inflight", { boxState: "linked", boxRoundNo: 2, boxRunNonce: "d".repeat(24),
-      boxOwnerRequestId: liveParent, boxParentResumeRevision: rev });
-    await assert.rejects(() => journal.markToolChainStoppedFailure({ requestId: liveLeaf, uid: 3n,
-      leaseEpoch, rejectedStream: true, proof: { ...proof, runNonce: "d".repeat(24) } }),
+      boxResumeRequestId: linkedLeaf, boxResumeRevision: rev, boxRunNonce: "d".repeat(24) });
+    await put(linkedLeaf, "inflight", { boxState: "linked", boxRoundNo: 2, boxRunNonce: "d".repeat(24),
+      boxOwnerRequestId: linkedParent, boxParentResumeRevision: rev });
+    const linkedRows = () => q(`SELECT request_id,state,failure_code,final_credits::int fc,ctx
+      FROM request_finalize_journal WHERE request_id IN ($1,$2) ORDER BY request_id`, [linkedParent, linkedLeaf]);
+    const beforeWrongProof = (await linkedRows()).rows;
+    await assert.rejects(() => journal.markToolChainStoppedFailure({ requestId: linkedLeaf, uid: 3n,
+      leaseEpoch, rejectedStream: true, proof }),
     (e: unknown) => e instanceof BoxDurableJournalError && e.code === "BOX_FAILED_STOP_CHAIN_INVALID");
+    assert.deepEqual((await linkedRows()).rows, beforeWrongProof,
+      "a proof from another run cannot change state, handoff or settlement");
+    const linkedProof = { ...proof, runNonce: "d".repeat(24) };
+    await journal.markToolChainStoppedFailure({ requestId: linkedLeaf, uid: 3n,
+      leaseEpoch, rejectedStream: true, proof: linkedProof });
+    await journal.markToolChainStoppedFailure({ requestId: linkedLeaf, uid: 3n,
+      leaseEpoch, rejectedStream: true, proof: linkedProof });
+    const linkedClosed = (await linkedRows()).rows;
+    const closedLeaf = linkedClosed.find((r) => r.request_id === linkedLeaf)!;
+    const closedParent = linkedClosed.find((r) => r.request_id === linkedParent)!;
+    const oldParent = beforeWrongProof.find((r) => r.request_id === linkedParent)!;
+    assert.equal(closedLeaf.state, "aborted");
+    assert.equal(closedLeaf.failure_code, "STREAM_FAILED");
+    assert.equal(closedLeaf.fc, 0);
+    assert.equal(closedLeaf.ctx.boxState, "failed_stopped");
+    assert.equal(closedLeaf.ctx.boxStopOutcome, "rejected_stream");
+    assert.deepEqual(closedLeaf.ctx.boxTerminalProof, linkedProof);
+    assert.equal(closedParent.state, "committed");
+    assert.equal(closedParent.fc, oldParent.fc);
+    assert.equal(closedParent.failure_code, oldParent.failure_code);
+    assert.equal(closedParent.ctx.boxState, "failed_stopped");
+    assert.equal(closedParent.ctx.boxStopOutcome, "failed");
+    assert.deepEqual(closedParent.ctx.boxToolHandoff, oldParent.ctx.boxToolHandoff,
+      "the earlier committed handoff and its exact usage remain billable");
+    assert.equal(projectBoxIdleChain({ sessionId, turnKey, rows: linkedClosed.map((r) => ({
+      requestId: r.request_id, state: r.state, ctx: r.ctx })) }).status, "failed");
+    assert.equal((await q("SELECT count(*)::int n FROM usage_records WHERE request_id IN ($1,$2)",
+      [linkedParent, linkedLeaf])).rows[0].n, 0);
   } finally {
     client.release();
     await pool.end();

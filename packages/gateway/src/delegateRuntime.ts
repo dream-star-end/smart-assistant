@@ -1457,6 +1457,7 @@ export async function _runDelegateTaskCore(
             emitProgress(
               makeDelegateProgressBlock({
                 runId: progressRunId,
+                usageRunId: progressRunId,
                 agentId: targetAgentId,
                 phase: 'start',
                 text: `排队中:容器资源紧张(${blocked.kind === 'memory' ? '内存水位' : '并发已满'}),等待放行…`,
@@ -1510,6 +1511,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: 'error',
           isError: true,
@@ -1818,6 +1820,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: 'start',
           text: `开始委派给 ${targetAgentId}: ${goal}`,
@@ -1970,7 +1973,7 @@ export async function _runDelegateTaskCore(
               agentId: targetAgentId,
               usage: e.usage,
             })
-          : makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
+          : makeDelegateBlockPassthrough(e, progressRunId, targetAgentId, progressRunId)
       if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
       if (!timedOut) {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
@@ -2012,6 +2015,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: error ? 'error' : 'done',
           isError: Boolean(error),
@@ -2117,6 +2121,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: 'error',
           isError: true,

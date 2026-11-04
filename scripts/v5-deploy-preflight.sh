@@ -91,6 +91,12 @@ if ! (
     esac
   fi
 
+  # Per-batch model exclusion must have a real pinned queue/source before a unit exists.
+  if ! validation_scope_preflight "$pinned"; then
+    echo '✗ preflight: validation profile authorization/batch/source invalid' >&2
+    fail=1
+  fi
+
   # 2) Box 证明门测试库:build_release 要求显式测试库。transient unit 只继承 OC_V5_PROOF_TEST_DATABASE_URL
   #    (见 v5-deploy-detached.sh add_optional_env),调用方 shell 里的 TEST_DATABASE_URL 带不进 unit,故只认前者。
   builds_release=0
@@ -100,6 +106,15 @@ if ! (
     deploy|dist|knowledge-planet-verify) builds_release=1 ;;
     canary) [[ -z "${CANARY_RELEASE:-}" ]] && builds_release=1 ;;
   esac
+  # Reuse retains original build proofs; only live gates execute again.
+  if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then
+    builds_release=0
+    if ! prebuilt_resume_read_record "$RESUME_BUILT_RELEASE" || [[ -z "$pinned" || "$PREBUILT_SOURCE" != "$pinned" ]] \
+      || ! prebuilt_resume_controller_identity "$pinned" >/dev/null; then
+      echo '✗ preflight: prebuilt record/source/controller mismatch' >&2
+      fail=1
+    fi
+  fi
   if [[ "$builds_release" == 1 && -z "${OC_V5_PROOF_TEST_DATABASE_URL:-}" ]]; then
     echo "✗ 预检:MODE=$MODE 会 build_release,但未设置 OC_V5_PROOF_TEST_DATABASE_URL(Box 证明门的本机回环 *_test 库)。" >&2
     echo "   在同一条 start 命令前带上它;detached unit 不继承调用方的其它环境变量。" >&2

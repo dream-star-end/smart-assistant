@@ -35,7 +35,9 @@ function expectedImageIdentityUncached(body: ProxyBody) {
     imageCount: rows.length, uniqueImageCount: new Set(rows).size, mediaBytes };
 }
 
-export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise<void> {
+export async function assertLegacyContextClaim(db: Db, body: ProxyBody, options: {
+  imageCount: number; priorContextHash?: string; rejectedBody?: ProxyBody;
+} = { imageCount: 91 }): Promise<void> {
   const located = await db.query("SELECT c.relname AS name,n.nspname AS schema FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid = ANY(ARRAY[to_regclass('request_finalize_journal'),to_regclass('usage_records'),to_regclass('credit_ledger'),to_regclass('users')])");
   assert.equal(located.rows.length, 4);
   assert.ok(located.rows.every((r: any) => /^pg_temp(?:_\d+)?$/.test(r.schema)),
@@ -73,7 +75,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
   assert.equal(freshCtx.boxRequestHash, deriveBoxCallFingerprint(uid, body).requestHash);
   assert.equal(freshCtx.boxContextHash, deriveBoxContextHash(body));
   assert.deepEqual(freshCtx.boxImageIdentity, expectedImageIdentity(body));
-  assert.equal(freshCtx.boxImageIdentity.imageCount, 91);
+  assert.equal(freshCtx.boxImageIdentity.imageCount, options.imageCount);
   // Only this proof's row in its verified TEMP mirror is removed before the handoff fixture.
   await db.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [fresh]);
   const handoff = { version: 1, roundNo: 1, messageId: `msg_g607_${tag}`,
@@ -89,7 +91,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
     [owner, uid.toString(), JSON.stringify({
       model: body.model, boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool",
       boxAccountId: "765", boxRunNonce: nonce, boxLeaseEpoch: epoch,
-      boxContextHash: deriveBoxContextHash(body, true), boxHandoffRevision: "g607-legacy",
+      boxContextHash: options.priorContextHash ?? deriveBoxContextHash(body, true), boxHandoffRevision: "g607-legacy",
       boxToolHandoff: handoff, boxState: "handoff", boxSessionId: session, boxTurnKey: turn,
       billingPricing: pricing, boxBillingContext: billing,
       boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
@@ -108,6 +110,13 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
     canonicalModel: body.model, canonicalBody: broken }),
   (e: unknown) => e instanceof BoxDurableJournalError && e.code === "BOX_TOOL_CONTEXT_CHANGED");
   assert.deepEqual(await rows(), prior, "bad old prefix cannot consume or advance a handoff");
+  if (options.rejectedBody) {
+    await assert.rejects(journal.claimToolResume({ requestId: child, uid,
+      canonicalModel: body.model, canonicalBody: options.rejectedBody }),
+    (e: unknown) => e instanceof BoxDurableJournalError && e.code === "BOX_TOOL_CONTEXT_CHANGED");
+    assert.deepEqual(await rows(), prior, "count trimming cannot consume or advance the old owner");
+    assert.equal(await beforeMoney(), money, "rejected trimming cannot change prior successful usage");
+  }
   const prepared = prepareBoxContinuation({ uid, canonicalModel: body.model, rawBody: body,
     authorityKind: "local_catalog", authorityTurnId: null });
   const claimed = await journal.claimToolResume({ requestId: child, uid,
@@ -118,10 +127,15 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
   assert.equal(stored.rows[0]?.ctx.boxContextHash, deriveBoxContextHash(body));
   assert.equal(stored.rows[0]?.ctx.boxRequestHash, deriveBoxCallFingerprint(uid, body).requestHash);
   assert.deepEqual(stored.rows[0]?.ctx.boxImageIdentity, expectedImageIdentity(body));
-  assert.equal(stored.rows[0]?.ctx.boxImageIdentity.imageCount, 91);
+  assert.equal(stored.rows[0]?.ctx.boxImageIdentity.imageCount, options.imageCount);
   await assert.rejects(journal.claimToolResume({ requestId: child, uid,
     canonicalModel: body.model, canonicalBody: body, prepared }),
   (e: unknown) => e instanceof BoxDurableJournalError && e.code === "BOX_CALL_AMBIGUOUS");
   assert.equal(await beforeMoney(), money, "stage and claim do not debit or settle prior successful usage");
+  // This fixture already proved every table resolves to its own TEMP schema.
+  // Release only its seeded rows so a later proof can use the same account.
+  const removed = await db.query("DELETE FROM request_finalize_journal WHERE user_id=$1 AND request_id=ANY($2::text[])",
+    [uid.toString(), [owner, child]]);
+  assert.equal(removed.rowCount, 2, "only this proof's seeded owner and child are removed");
 }
 

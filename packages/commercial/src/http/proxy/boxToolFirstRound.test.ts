@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { runBoxToolFirstRound, BoxToolFirstRoundError } from "./boxToolFirstRound.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
+import { BoxSpoolTerminalError } from "./boxSpoolPoller.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxNativeHistoryBasis } from "./boxNativeHistory.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
@@ -70,7 +71,8 @@ const finalRaw = Buffer.from(finalRecords.map((record) => JSON.stringify(record)
 
 function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean;
   directFinal?: boolean; finalTrailing?: boolean;
-  terminalProof?: "worker_complete" | "keeper_stopped";
+  terminalProof?: "worker_complete" | "keeper_stopped" | "worker_failed";
+  emptyFirstRead?: boolean;
   failAssetStage?: number; failInputStage?: number;
   stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
   badAssetManifest?: boolean;
@@ -90,6 +92,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   const unknownPhases: string[] = [];
   const emitted: string[] = [];
   let disposed = false, launches = 0, recordedOffset = -1;
+  let spoolReads = 0;
   let currentNonce = "", currentEpoch = "";
   let controlHash = "";
   let retained = false, cleanupRetained = false;
@@ -133,6 +136,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         && args[5] === "--read") {
         sequence.push("spool-read");
         const offset = Number(args[7]);
+        if (options.emptyFirstRead && spoolReads++ === 0) {
+          return { stdout: JSON.stringify({ data: "", offset }), stderrBytes: 0,
+            exitCode: 0 as const };
+        }
         const body = options.spoolBody ?? (options.directFinal
           ? options.finalTrailing ? Buffer.concat([finalRaw, Buffer.from("bad-after-success\n")])
             : finalRaw : raw);
@@ -154,7 +161,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         const reason = options.terminalProof ?? "worker_complete";
         return { stdout: JSON.stringify({ runNonce: currentNonce,
           leaseEpoch: currentEpoch, keeperPid: 101, cliPid: 102,
-          reason, revision: 1 }) + "\n",
+          reason, ...(reason === "worker_failed" ? { revision: 2, workerExitCode: 1 }
+            : { revision: 1 }) }) + "\n",
         stderrBytes: 0, exitCode: 0 as const };
       }
 
@@ -1130,7 +1138,7 @@ test("tool task keeps its exact context across confirmed missing egress and auth
   assert.equal(JSON.stringify(f.input.canonicalBody), before);
 });
 
-test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and does not complete it", async () => {
+test("a strictly proven stopped worker is retained without another Stop or unknown transition", async () => {
   const f = fixture({ directFinal: true, terminalProof: "keeper_stopped" });
   let stops = 0;
   let release!: () => void;
@@ -1139,14 +1147,174 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and 
     stopRejectedRun: async () => { stops++; return hung; } };
   const started = Date.now();
   await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
-    (error: unknown) => error instanceof BoxToolFirstRoundError
-      && error.code === "BOX_TOOL_TERMINAL_UNPROVEN");
-  assert.equal(stops, 1);
+    (error: unknown) => error instanceof BoxSpoolTerminalError
+      && error.code === "BOX_SPOOL_KEEPER_STOPPED");
+  assert.equal(stops, 0);
   assert.ok(Date.now() - started < 2_000, "a hanging stop does not hold the request");
   assert.equal(f.sequence.includes("terminal-journal"), false);
   assert.equal(f.sequence.includes("durable-handoff"), false);
-  assert.ok(f.sequence.includes("unknown"));
-  assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.deepEqual(f.unknownPhases, []);
+  assert.equal(f.retained, true);
   release();
   await hung;
+});
+
+
+test("first round notices failed terminal after cleanup empties its spool and records the cause first", async () => {
+  const f = fixture({ spoolBody: Buffer.alloc(0), terminalProof: "worker_failed" });
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_SPOOL_WORKER_FAILED");
+    assert.equal(input.phase, "first_round");
+    f.sequence.push("first-failure"); return null;
+  };
+  let stops = 0;
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    stopRejectedRun: async () => { stops++; return "pending"; } }),
+  (error: unknown) => error instanceof BoxSpoolTerminalError
+    && error.proof.reason === "worker_failed" && error.accountId === 20n);
+  assert.equal(stops, 0);
+  assert.equal(f.launches, 1);
+  assert.equal(f.disposed, false);
+  assert.equal(f.retained, true);
+  assert.ok(f.sequence.indexOf("first-failure") < f.sequence.indexOf("retain-unknown"));
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+});
+
+test("first round drains a late final after strict worker_complete and commits once", async () => {
+  const f = fixture({ directFinal: true, emptyFirstRead: true });
+  const result = await runBoxToolFirstRound(f.input, f.deps);
+  assert.equal(result.kind, "final");
+  assert.equal(f.sequence.filter((x) => x === "terminal-journal").length, 1);
+  assert.ok(f.sequence.indexOf("proof-read") < f.sequence.lastIndexOf("spool-read"));
+  assert.equal(f.sequence.includes("unknown"), false);
+});
+
+test("first round never records a handoff drained after the writer is proven terminal", async () => {
+  const f = fixture({ emptyFirstRead: true });
+  await assert.rejects(runBoxToolFirstRound(f.input, f.deps),
+    (error: unknown) => error instanceof BoxSpoolTerminalError
+      && error.code === "BOX_SPOOL_TERMINAL_INCOMPLETE");
+  assert.equal(f.sequence.includes("pending-read"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.equal(f.retained, true);
+});
+
+
+test("first upstream refusal is durably projected before the explicit Stop can clean its spool", async () => {
+  const f = fixture({ spoolBody: upstreamRefusalRaw });
+  const events: string[] = [];
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_CLI_UPSTREAM_RATE_LIMITED");
+    assert.equal(input.phase, "first_round");
+    events.push("first-failure"); return null;
+  };
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    stopRejectedRun: async () => { events.push("stop"); return "stopped_proven"; } }),
+  /BOX_CLI_UPSTREAM_RATE_LIMITED/);
+  assert.deepEqual(events, ["first-failure", "stop"]);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+});
+
+
+test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and does not complete it", async (t) => {
+  const f = fixture({ directFinal: true });
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const run = f.target.exec.run.bind(f.target.exec);
+  f.target.exec.run = async (request) => {
+    if (request.args[2]?.includes("terminal.json")) {
+      f.sequence.push("proof-missing");
+      // Exhaust the real proof-wait budget without spending 20 wall seconds.
+      // Missing strict proof stays unknown; it is not keeper_stopped evidence.
+      now += 20_001;
+      throw new BoxExecTransportError("BOX_EXEC_REMOTE_EXIT", true, 1);
+    }
+    return run(request);
+  };
+  const events: string[] = [];
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.equal(input.phase, "first_round");
+    events.push("first-failure"); return null;
+  };
+  let stops = 0, stopStartedAt = 0;
+  let release!: () => void;
+  const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
+  try {
+    await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+      terminalUnprovenStopWaitMs: 40,
+      stopRejectedRun: async () => {
+        events.push("stop"); stops++; stopStartedAt = performance.now(); return hung;
+      } }),
+    (error: unknown) => error instanceof BoxToolFirstRoundError
+      && error.code === "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.ok(f.sequence.includes("proof-missing"));
+    assert.equal(stops, 1);
+    assert.deepEqual(events, ["first-failure", "stop"],
+      "save the original UNPROVEN failure before Stop can clean its spool");
+    assert.ok(performance.now() - stopStartedAt < 2_000,
+      "the hanging Stop cannot hold this unproven request indefinitely");
+    assert.equal(f.sequence.includes("terminal-journal"), false);
+    assert.equal(f.sequence.includes("durable-handoff"), false);
+    assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+    assert.equal(f.retained, true);
+    assert.equal(f.disposed, false, "unknown remote stop cannot release the owned target");
+  } finally { release(); await hung; }
+});
+
+test("tool validation first errors survive first-round cleanup and strict terminal wrapping", async () => {
+  const malformedInput = Buffer.from([records[0], records[1], records[2],
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"private-input":' } }),
+    records[5]].map((item) => JSON.stringify(item) + "\n").join(""));
+  const outOfOrder = Buffer.from([records[0], event({ type: "content_block_delta", index: 0,
+    delta: { type: "text_delta", text: "private-output" } })]
+    .map((item) => JSON.stringify(item) + "\n").join(""));
+  for (const item of [
+    { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput },
+    { code: "BOX_TOOL_ORDER_INVALID", spoolBody: outOfOrder },
+    { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput,
+      terminalProof: "worker_failed" as const, emptyFirstRead: true },
+  ]) {
+    const f = fixture(item);
+    const journal = f.deps.journal as unknown as {
+      recordFirstFailure?: (input: { code: string; phase: string; diagnostic?: unknown }) => Promise<null> };
+    const saved: Array<{ code: string; phase: string; diagnostic?: unknown }> = [];
+    journal.recordFirstFailure = async (input) => {
+      saved.push(input); f.sequence.push("first-failure"); return null;
+    };
+    await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+      stopRejectedRun: async () => { f.sequence.push("stop"); return "stopped_proven"; } }),
+    (error: unknown) => {
+      if (item.terminalProof) {
+        assert.ok(error instanceof BoxSpoolTerminalError);
+        assert.equal(error.proof.reason, "worker_failed");
+        assert.equal((error.cause as { code: string }).code, item.code);
+      } else assert.equal((error as { code: string }).code, item.code);
+      return true;
+    });
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0]!.code, item.code);
+    assert.equal(saved[0]!.phase, "first_round");
+    assert.ok(saved[0]!.diagnostic);
+    assert.ok(!JSON.stringify(saved, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value).includes("private"));
+    for (const later of ["stop", "unknown", "retain-unknown"]) {
+      if (f.sequence.includes(later))
+        assert.ok(f.sequence.indexOf("first-failure") < f.sequence.indexOf(later));
+    }
+    assert.equal(f.launches, 1);
+    assert.equal(f.sequence.includes("durable-handoff"), false);
+    assert.equal(f.sequence.includes("terminal-journal"), false);
+  }
 });

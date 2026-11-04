@@ -1,3 +1,4 @@
+import './v5PrebuiltResume.test.js'
 import './v5CommercialCutoverIdle.test.js'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
@@ -82,6 +83,64 @@ const v5BaselinePortGuardService = path.join(
 const dirs: string[] = []
 const require_ = createRequire(path.join(root, 'package.json'))
 const { WebSocketServer } = require_('ws')
+
+
+describe('core health polling', () => {
+  const healthy = JSON.stringify({ ok: true, channel: 'v5', deps: { sessionsDb: 'ok' } })
+  const probe = async (bodies: string[]) => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-core-health-poll-'))
+    try {
+      await writeFile(path.join(dir, 'clock'), '0')
+      await writeFile(path.join(dir, 'calls'), '0')
+      for (const [i, body] of bodies.entries()) await writeFile(path.join(dir, 'body-' + (i + 1)), body)
+      return spawnSync('bash', ['-c', `
+set -eu
+source "$CORE_DEPLOY_SCRIPT"
+ACTIVE_PORT=18795
+cmd="$(hotcfg_core_smoke_cmd)"
+date() { cat "$CORE_FIX_DIR/clock"; }
+sleep() { printf '%s' "$(( $(cat "$CORE_FIX_DIR/clock") + 2 ))" >"$CORE_FIX_DIR/clock"; }
+curl() {
+  n=$(( $(cat "$CORE_FIX_DIR/calls") + 1 )); printf '%s' "$n" >"$CORE_FIX_DIR/calls"
+  (( n <= CORE_STEP_COUNT )) || n=$CORE_STEP_COUNT
+  cat "$CORE_FIX_DIR/body-$n"
+  if [[ " $* " == *' --write-out '* ]]; then printf '\\n200'; fi
+}
+set +e
+eval "$cmd"
+rc=$?
+printf 'CALLER_COMPLETED rc=%s calls=%s clock=%s\\n' "$rc" "$(cat "$CORE_FIX_DIR/calls")" "$(cat "$CORE_FIX_DIR/clock")"
+exit "$rc"
+`], {
+        cwd: root, encoding: 'utf8', timeout: 10_000,
+        env: { ...process.env, CORE_DEPLOY_SCRIPT: deploy, CORE_FIX_DIR: dir,
+          CORE_STEP_COUNT: String(bodies.length), V5_DEPLOY_SOURCE_ONLY: '1', ALLOW_ANY_BRANCH: '1' },
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('core health polling waits beyond the first nonempty unready response and continues its caller', async () => {
+    const result = await probe(['{"ok":false,"channel":"v5","deps":{"sessionsDb":"warming"}}', healthy])
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(result.stdout, /CALLER_COMPLETED rc=0 calls=2 clock=2/)
+  })
+
+  test('core health polling preserves all required fields, bounds retries and redacts diagnostics', async () => {
+    for (const body of [
+      '{"ok":false,"channel":"v5","deps":{"sessionsDb":"ok"},"secret":"SECRET_DO_NOT_LOG"}',
+      '{"ok":true,"channel":"other","deps":{"sessionsDb":"ok"},"noise":{"channel":"v5"}}',
+      '{"ok":true,"channel":"v5","deps":{"sessionsDb":"warming"}}',
+    ]) {
+      const result = await probe([body])
+      assert.equal(result.status, 1, result.stdout + result.stderr)
+      assert.match(result.stdout, /CALLER_COMPLETED rc=1 calls=45 clock=90/)
+      assert.match(result.stderr, /core health readiness failed/)
+      assert.doesNotMatch(result.stdout + result.stderr, /SECRET_DO_NOT_LOG/)
+    }
+  })
+})
 
 describe('V5 branch deployment policy', () => {
   const assertBranch = (branch: string, allowAny = '0') =>
@@ -8832,7 +8891,7 @@ wait $!
     // ① 五个豁免 env 全部登记进注册表,且各有还债 lane。
     assert.match(
       source,
-      /GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification"/,
+      /GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification grok-live-validation"/,
       '所有豁免 key 必须全在单一注册表里(新增豁免 env/旗标必须同步登记)',
     )
     for (const [key, env] of [
@@ -9140,7 +9199,13 @@ wait $!
     assert.match(j5Lib, /const deadline = Date\.now\(\) \+ turnWaitMs;/, 'J5 deadline 必须实际使用传入的等待上限')
     assert.match(journeySource, /turnWaitMs: TURN_WAIT_TIMEOUT,/, 'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT')
     assert.match(journeySource, /graceMs: J5_BACKEND_GRACE,/, 'J5 宽限必须是计入总预算的常量')
-    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "grok-build";')
+    // The literal moved into the pure selector; the default intent is unchanged.
+    const validationSelector = await readFile(path.join(root, 'scripts/lib/v5-validation-journey.mjs'), 'utf8')
+    assert.match(validationSelector, /export const DEFAULT_JOURNEY_MODEL_ID = "grok-build";/)
+    assert.match(validationSelector, /scope\.journeyModel !== "deepseek-v4-flash"/)
+    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = journeyValidation.model;')
+    assert.ok(journeySource.indexOf('selectJourneyValidation(process.argv.slice(2))') < modelPin,
+      'batch scope must be validated before selecting the entire journey model')
     // 选模逻辑已抽到共享 helper(selfhost 契约门共用);不变量不变:真实选择器 → 菜单项 → 触发器回显,
     // 且必须在附件上传/首次 UI 发送之前生效。canary 侧断言"调用 helper 并传固定模型",helper 侧断言顺序。
     const helperSource = await readFile(path.join(root, 'scripts/lib/journey-browser.mjs'), 'utf8')
@@ -9167,7 +9232,7 @@ wait $!
       "J3 must click the plus-menu menuitem, not EmptyState text that also contains 设定目标",
     )
     assert.doesNotMatch(journeySource, /getByText\("设定目标"\)/)
-    assert.ok(modelPin >= 0, 'journey 必须固定使用平台自有的 GPT-5.6 Luna')
+    assert.ok(modelPin >= 0, 'journey 必须在默认Grok/显式绑定DeepSeek profile之间固定选择')
     assert.match(
       journeySource,
       /请读取刚上传的附件「\$\{probeName\}」第一行/,
