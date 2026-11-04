@@ -5,6 +5,8 @@ import { api, ApiError } from '../lib/api'
 import { createMemoryAuthSession } from '../lib/authSession'
 import { EMPTY_COLLAB_UI, type CollaborationConfigDoc, type CollabMode } from '../lib/collaborationConfig'
 import type { AuthorizeSwitch } from '../lib/modelSwitchCostTypes'
+import type { PublicModel, Session } from '../lib/types'
+import type { UseChatSocket } from './useChatSocket'
 import { useComposerSend, type ComposerSendInput } from './useComposerSend'
 import { useSessionList, type UseSessionListOptions } from './useSessionList'
 import {
@@ -459,7 +461,7 @@ test('explicit default preference change resets draft pick even when resolved de
 test("new solo draft send dispatches immediately before ensureServerSession and putCollaborationConfig finish (OCV5-737)", async () => {
   const DRAFT = "webdraft737"
   const MODEL = "glm-5.2"
-  const models = [{ id: MODEL, display_name: MODEL, engine: "ccb" }]
+  const models: PublicModel[] = [{ id: MODEL, display_name: MODEL, engine: "ccb" }]
   const agent = { id: "main", name: "Main", description: "" }
   const noop = () => {}
   const auth = createMemoryAuthSession(() => {}, "test-token")
