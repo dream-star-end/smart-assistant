@@ -57,7 +57,7 @@ export type StatusPillProps = StatusSource &
      * 点的形状。ring = 细线旋转环(侧栏「运行中」沿用的语汇;减少动态效果时静止为缺口环,
      * 形状仍能和实心点区分)。
      */
-    mark?: "dot" | "ring";
+    mark?: "dot" | "ring" | "question";
     /** 旁边已有同义文字:点只做装饰(aria-hidden),不挂 title / aria-label。 */
     decorative?: boolean;
   };
@@ -90,6 +90,43 @@ export function StatusPill({
         );
 
   if (variant === "dot") {
+    if (mark === "question") {
+      return (
+        <span
+          role={decorative ? undefined : "img"}
+          aria-hidden={decorative ? true : undefined}
+          aria-label={decorative ? undefined : text}
+          title={decorative ? undefined : text}
+          data-status={status}
+          data-tone={tone}
+          data-mark="question"
+          className={cn(
+            "inline-flex shrink-0 items-center justify-center rounded-full shadow-2xs oc-status-breathe",
+            size === "md" ? "size-3.5" : "size-3",
+            BG[tone],
+            size === "md" && HALO[tone],
+            className,
+          )}
+          {...rest}
+        >
+          <svg
+            viewBox="0 0 16 16"
+            aria-hidden="true"
+            className="size-full shrink-0 text-white"
+          >
+            <path
+              d="M6.15 5.65C6.35 4.45 7.25 3.75 8.35 3.75C9.55 3.75 10.35 4.5 10.35 5.55C10.35 6.45 9.85 6.95 9.05 7.42C8.35 7.83 8.05 8.22 8.05 9.05"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.1"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            <circle cx="8.05" cy="11.95" r="1.25" fill="currentColor" />
+          </svg>
+        </span>
+      );
+    }
     return (
       <span
         role={decorative ? undefined : "img"}

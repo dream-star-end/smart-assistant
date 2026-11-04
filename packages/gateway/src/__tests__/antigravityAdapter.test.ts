@@ -8,8 +8,9 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/antigravityAdapter.test.ts
  */
 import assert from 'node:assert/strict'
+import Database from 'better-sqlite3'
 import { existsSync } from 'node:fs'
-import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -19,9 +20,11 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import {
   ANTIGRAVITY_MAX_PROMPT_BYTES,
   AntigravityAdapter,
+  type AntigravityDeliveryDependencies,
   _internals,
   validateAntigravityRoute,
 } from '../engine/antigravityAdapter.js'
+import { prepareAntigravityNativeTrajectory } from '../engine/antigravityNativeTrajectory.js'
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
 import { resetEnvFactsCache } from '../envProbe.js'
 import { routeRelayTrace } from '../relayTrace.js'
@@ -115,7 +118,19 @@ interface Harness {
   restore: () => Promise<void>
 }
 
-async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
+/** Fake stdout fixtures do not run the CLI store. Seed its otherwise real
+ * empty baseline so resume attribution does not depend on missing artifacts. */
+async function seedNativeBaseline(dir: string, id: string): Promise<string> {
+  const conversations = path.join(dir, 'openclaude-home', 'antigravity-cli', 'home', '.gemini', 'antigravity-cli', 'conversations')
+  await mkdir(conversations, { recursive: true })
+  const file = path.join(conversations, `${id}.db`)
+  const db = new Database(file)
+  db.exec('CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, step_payload BLOB, step_format INTEGER NOT NULL DEFAULT 0)')
+  db.close()
+  return file
+}
+
+async function harness(opts: Partial<EngineCreateOpts> = {}, deps: AntigravityDeliveryDependencies = {}): Promise<Harness> {
   const dir = await mkdtemp(path.join(tmpdir(), 'oc-agy-adapter-'))
   const fake = path.join(dir, 'fake-agy.cjs')
   await writeFile(fake, FAKE_CLI)
@@ -136,6 +151,7 @@ async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
   set('FAKE_AGY_EXIT_DELAY_MS', undefined)
   set('FAKE_AGY_EXIT_CODE', undefined)
   set('FAKE_AGY_STREAM_FILE', undefined)
+  if (opts.resumeSessionId) await seedNativeBaseline(dir, opts.resumeSessionId)
   const adapter = new AntigravityAdapter({
     sessionKey: 'agent:main:webchat:dm:agy-test',
     agentId: 'main',
@@ -144,7 +160,7 @@ async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
     model: 'antigravity-gemini-3.8-flash',
     effortLevel: 'high',
     ...opts,
-  } as EngineCreateOpts)
+  } as EngineCreateOpts, deps)
   adapter.on('error', () => {})
   return {
     dir,
@@ -165,6 +181,7 @@ async function runTurn(
   fixture: string,  // name under FIXTURES, or an absolute path
   extra: { stderr?: string; input?: Parameters<AntigravityAdapter['submitTurn']>[0]['input'] } = {},
 ): Promise<{ summary: TurnSummary | null; events: EngineEvent[]; sessionIds: string[] }> {
+  if (h.adapter.nativeSessionId) await seedNativeBaseline(h.dir, h.adapter.nativeSessionId)
   process.env.FAKE_AGY_FIXTURE = path.isAbsolute(fixture) ? fixture : path.join(FIXTURES, fixture)
   if (extra.stderr) {
     const file = path.join(h.dir, 'stderr.txt')
@@ -721,10 +738,17 @@ describe('AntigravityAdapter', () => {
     const h = await harness()
     try {
       h.adapter.setAntigravityRoute(ROUTE)
-      process.env.FAKE_AGY_EXIT_DELAY_MS = '400'
-      const first = await runTurn(h, 'tool-success.ndjson')
-      assert.equal(first.summary?.isError, false)
-      // Turn 1 settled on the timer; its process is still alive for ~400 ms.
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '1200'
+      process.env.FAKE_AGY_FIXTURE = path.join(FIXTURES, 'tool-success.ndjson')
+      const first = h.adapter.submitTurn({
+        input: 'first', onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+      })
+      await first.submitted
+      assert.equal((await first.summary)?.isError, false)
+      // Do NOT await output drain here: this must exercise a real late close.
+      // The fake CLI emits stdout but does not maintain its native store.
+      await seedNativeBaseline(h.dir, h.adapter.nativeSessionId!)
       Reflect.deleteProperty(process.env, 'FAKE_AGY_EXIT_DELAY_MS')
       process.env.FAKE_AGY_HANG = '1'
       process.env.FAKE_AGY_FIXTURE = path.join(FIXTURES, 'tool-success.ndjson')
@@ -736,7 +760,7 @@ describe('AntigravityAdapter', () => {
         toolUseIdToName: new Map(),
       })
       await run.submitted
-      await new Promise((resolve) => setTimeout(resolve, 600))
+      await new Promise((resolve) => setTimeout(resolve, 1500))
       let ticks = 0
       const onActivity = (): void => { ticks += 1 }
       h.adapter.on('activity', onActivity)
@@ -1205,4 +1229,360 @@ describe('Antigravity stale result error after a failed launch (OCV5-556)', () =
       await h.restore()
     }
   })
+})
+
+describe('Antigravity terminal answer delivery', () => {
+  async function terminalFixture(h: Harness, response: string, deltas: string[] = [], errorStep = false) {
+    const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
+    const events = [
+      { event: 'init', conversation_id: id },
+      { event: 'step_update', step_update: { conversation_id: id, step_index: 0, state: 'DONE', step_type: 'user_input' } },
+      ...deltas.map(text_delta => ({ event: 'step_update', step_update: {
+        conversation_id: id, step_index: 1, state: 'ACTIVE', step_type: 'agent_response', text_delta,
+      } })),
+      ...(errorStep ? [{ event: 'step_update', step_update: {
+        conversation_id: id, step_index: 2, state: 'DONE', step_type: 'error_message', error: { message: 'current request failed' },
+      } }] : []),
+      { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response } },
+    ]
+    const file = path.join(h.dir, 'terminal-answer.ndjson')
+    await writeFile(file, `${events.map(e => JSON.stringify(e)).join('\n')}\n`)
+    return file
+  }
+
+  for (const [name, deltas, response, expected] of [
+    ['terminal-only', [], 'CURRENT_ANSWER', 'CURRENT_ANSWER'],
+    ['partial prefix', ['CURRENT_'], 'CURRENT_ANSWER', 'CURRENT_ANSWER'],
+    ['already streamed', ['CURRENT_', 'ANSWER'], 'CURRENT_ANSWER', 'CURRENT_ANSWER'],
+    ['unrelated terminal snapshot', ['CURRENT_ANSWER'], 'OLD_ANSWER', 'CURRENT_ANSWER'],
+  ] as Array<[string, string[], string, string]>) {
+    test(`${name} delivers one answer in blocks and durable summary`, async () => {
+      const h = await harness()
+      try {
+        h.adapter.setAntigravityRoute(ROUTE)
+        const billing: any[] = []
+        h.adapter.on('external_billing', event => billing.push(event))
+        const { summary, events, sessionIds } = await runTurn(h, await terminalFixture(h, response, deltas))
+        assert.equal(summary?.isError, false)
+        assert.equal(summary?.assistantText, expected)
+        assert.equal(summary?.assistantSegments.map(s => s.text).join(''), expected)
+        assert.equal(events.filter(e => e.kind === 'block' && e.block.kind === 'text')
+          .map(e => e.kind === 'block' && e.block.kind === 'text' ? e.block.text : '').join(''), expected)
+        assert.equal(events.filter(e => e.kind === 'final').length, 1)
+        assert.equal(billing.length, 1)
+        assert.equal(billing[0].status, 'success')
+        assert.equal(sessionIds.length, 1)
+      } finally { await h.restore() }
+    })
+  }
+
+  test('terminal-only answer is appended after the binary-input omission notice', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const { summary } = await runTurn(h, await terminalFixture(h, 'CURRENT_ANSWER'), {
+        input: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } }] as any,
+      })
+      assert.equal(summary?.isError, false)
+      assert.ok(summary?.assistantText.endsWith('CURRENT_ANSWER'))
+      assert.equal(summary?.assistantText.match(/CURRENT_ANSWER/g)?.length, 1)
+    } finally { await h.restore() }
+  })
+
+  test('terminal response cannot erase a current error or change failed billing', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const billing: any[] = []
+      h.adapter.on('external_billing', event => billing.push(event))
+      const { summary, events, sessionIds } = await runTurn(h, await terminalFixture(h, 'STALE_FINAL', [], true))
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /current request failed/)
+      assert.equal(summary?.assistantText, '')
+      assert.equal(events.filter(e => e.kind === 'block' && e.block.kind === 'text').length, 0)
+      assert.deepEqual(sessionIds, [])
+      assert.equal(billing.length, 1)
+      assert.equal(billing[0].status, 'error')
+    } finally { await h.restore() }
+  })
+})
+
+describe('Antigravity current launch event isolation', () => {
+  test('old text and tools cannot wash a current error or add usage', async () => {
+    const h = await harness({ resumeSessionId: '4187c78c-e96d-4840-8c1c-3de86f92ddd9' })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const conversation_id = '4187c78c-e96d-4840-8c1c-3de86f92ddd9'
+      const file = path.join(h.dir, 'old-step-pollution.ndjson')
+      const steps = [
+        { step_index: 10, step_type: 'user_input' },
+        { step_index: 11, step_type: 'error_message', error: { message: 'CURRENT_FAILURE' } },
+        { step_index: 2, step_type: 'agent_response', text_delta: 'OLD_REPLY', usage: { input_tokens: 100, output_tokens: 50 } },
+        { step_index: 3, step_type: 'tool', tool_info: { name: 'run_command', parameters: { CommandLine: 'old command' } }, output: 'OLD_TOOL' },
+      ]
+      await writeFile(file, `${[
+        { event: 'init', conversation_id },
+        ...steps.map(s => ({ event: 'step_update', step_update: { conversation_id, state: 'DONE', ...s } })),
+        { event: 'result', result: { conversation_id, status: 'SUCCESS', response: '' } },
+      ].map(s => JSON.stringify(s)).join('\n')}\n`)
+      const billing: any[] = []
+      h.adapter.on('external_billing', e => billing.push(e))
+      const { summary, events, sessionIds } = await runTurn(h, file)
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /CURRENT_FAILURE/)
+      assert.equal(summary?.assistantText, '')
+      assert.equal(summary?.tools.length, 0)
+      assert.equal(summary?.usage.outputTokens, 0)
+      assert.equal(events.filter(e => e.kind === 'block').length, 0)
+      assert.deepEqual(sessionIds, [])
+      assert.equal(billing.length, 1)
+      assert.equal(billing[0].status, 'error')
+    } finally { await h.restore() }
+  })
+
+  test('replayed DONE does not count the same step usage twice', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const original = (await readFile(path.join(FIXTURES, 'stream-text.ndjson'), 'utf8')).trim().split('\n')
+      const result = original.pop()!
+      const done = JSON.parse(original.at(-1)!)
+      done.step_update.text_delta = ''
+      const file = path.join(h.dir, 'done-replayed.ndjson')
+      await writeFile(file, `${[...original, JSON.stringify(done), result].join('\n')}\n`)
+      const { summary, events } = await runTurn(h, file)
+      assert.equal(summary?.assistantText, 'Alpha Beta Gamma.\n')
+      assert.equal(summary?.usage.inputTokens, 100)
+      assert.equal(summary?.usage.outputTokens, 14)
+      assert.equal(events.filter(e => e.kind === 'usage').length, 1)
+    } finally { await h.restore() }
+  })
+})
+
+describe('Antigravity empty-result close barrier', () => {
+  async function emptyFixture(h: Harness) {
+    const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
+    const file = path.join(h.dir, 'empty-delayed.ndjson')
+    await writeFile(file, `${[
+      { event: 'init', conversation_id: id },
+      { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '' } },
+    ].map(e => JSON.stringify(e)).join('\n')}\n`)
+    return file
+  }
+
+  test('an empty SUCCESS waits for real close instead of failing at the result timer', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      _internals.setTimingTestHooks({ resultSettleMs: 30, staleErrorExitWaitMs: 2000 })
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '350'
+      let deliveredAt = 0
+      h.adapter.on('external_billing', () => { deliveredAt = Date.now() })
+      const { summary } = await runTurn(h, await emptyFixture(h))
+      assert.equal(summary?.isError, true, 'without verified native evidence still fails closed')
+      assert.ok(deliveredAt - (await stat(h.capture)).mtimeMs >= 300, 'must not declare EMPTY_RUN before actual process close')
+    } finally { _internals.setTimingTestHooks(null); await h.restore() }
+  })
+
+  test('user cancellation remains effective after an empty result while waiting for close', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      _internals.setTimingTestHooks({ resultSettleMs: 30, staleErrorExitWaitMs: 2000 })
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '600'
+      process.env.FAKE_AGY_FIXTURE = await emptyFixture(h)
+      const events: EngineEvent[] = []
+      const run = h.adapter.submitTurn({
+        input: 'cancel pending delivery', requestId: 'd'.repeat(32),
+        onEvent: e => events.push(e), sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      while (!existsSync(h.capture)) await new Promise(r => setTimeout(r, 10))
+      await new Promise(r => setTimeout(r, 100))
+      assert.equal(h.adapter.interrupt('user'), true)
+      const summary = await run.summary
+      await h.adapter.waitForOutputDrain()
+      assert.equal(summary?.stopReason, 'interrupted')
+      assert.equal(summary?.assistantText, '')
+      assert.equal(events.filter(e => e.kind === 'final').length, 1)
+    } finally { _internals.setTimingTestHooks(null); await h.adapter.shutdown(); await h.restore() }
+  })
+})
+
+describe('Antigravity verified recovery lifecycle', () => {
+  const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
+  async function writeResult(h: Harness, result: Record<string, unknown> = {}) {
+    const file = path.join(h.dir, 'native-result.ndjson')
+    await writeFile(file, `${[
+      { event: 'init', conversation_id: id },
+      { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '', ...result } },
+      { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '' } },
+    ].map(e => JSON.stringify(e)).join('\n')}\n`)
+    return file
+  }
+  const recovered = { ok: true as const, text: 'VERIFIED_NATIVE_ANSWER', stepIndex: 3, hash: 'a'.repeat(64) }
+
+  test('recovery waits for close and settles duplicate terminal events once', async () => {
+    let calls = 0
+    let recoveryAt = 0
+    const h = await harness({}, { nativeTrajectory: {
+      prepare: prepareAntigravityNativeTrajectory,
+      recover: async () => { calls++; recoveryAt = Date.now(); return recovered },
+    } })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      _internals.setTimingTestHooks({ resultSettleMs: 30, staleErrorExitWaitMs: 2000 })
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '350'
+      let spawns = 0
+      const billing: any[] = []
+      h.adapter.on('spawn', () => { spawns++ })
+      h.adapter.on('external_billing', e => billing.push(e))
+      const { summary, events } = await runTurn(h, await writeResult(h))
+      assert.equal(summary?.assistantText, recovered.text)
+      assert.equal(summary?.isError, false)
+      assert.ok(recoveryAt - (await stat(h.capture)).mtimeMs >= 300)
+      assert.equal(calls, 1)
+      assert.equal(spawns, 1)
+      assert.equal(events.filter(e => e.kind === 'final').length, 1)
+      assert.equal(billing.length, 1)
+      assert.equal(billing[0].status, 'success')
+    } finally { _internals.setTimingTestHooks(null); await h.restore() }
+  })
+
+  for (const retiredBy of ['cancel', 'end'] as const) {
+    test(`${retiredBy} during asynchronous native recovery cannot deliver late text`, async () => {
+      let entered!: () => void
+      let release!: () => void
+      const started = new Promise<void>(r => { entered = r })
+      const gate = new Promise<void>(r => { release = r })
+      const h = await harness({}, { nativeTrajectory: {
+        prepare: prepareAntigravityNativeTrajectory,
+        recover: async () => { entered(); await gate; return recovered },
+      } })
+      try {
+        h.adapter.setAntigravityRoute(ROUTE)
+        process.env.FAKE_AGY_FIXTURE = await writeResult(h)
+        const events: EngineEvent[] = []
+        const billing: any[] = []
+        h.adapter.on('external_billing', e => billing.push(e))
+        const run = h.adapter.submitTurn({
+          input: 'retire during recovery', requestId: 'e'.repeat(32),
+          onEvent: e => events.push(e), sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+        })
+        await run.submitted
+        await started
+        if (retiredBy === 'cancel') assert.equal(h.adapter.interrupt('user'), true)
+        else run.end()
+        release()
+        const summary = await run.summary
+        await h.adapter.waitForOutputDrain()
+        assert.equal(summary?.assistantText ?? '', '')
+        assert.equal(events.filter(e => e.kind === 'block').length, 0)
+        if (retiredBy === 'cancel') {
+          assert.equal(summary?.stopReason, 'interrupted')
+          assert.equal(billing.length, 1)
+          assert.equal(billing[0].terminalCode, 'USER_CANCELLED')
+        } else {
+          assert.equal(summary, null)
+          assert.equal(billing.length, 0)
+        }
+      } finally { release(); await h.adapter.shutdown(); await h.restore() }
+    })
+  }
+
+  for (const failure of ['nonzero-exit', 'canceled-result', 'soft-denied', 'mismatched-result'] as const) {
+    test(`${failure} never consults native recovery`, async () => {
+      let calls = 0
+      const h = await harness({}, { nativeTrajectory: {
+        prepare: prepareAntigravityNativeTrajectory,
+        recover: async () => { calls++; return recovered },
+      } })
+      try {
+        h.adapter.setAntigravityRoute(ROUTE)
+        if (failure === 'nonzero-exit') process.env.FAKE_AGY_EXIT_CODE = '3'
+        const result = failure === 'canceled-result' ? { status: 'CANCELED' }
+          : failure === 'soft-denied' ? { denied_actions: ['write'] }
+          : failure === 'mismatched-result' ? { conversation_id: '4187c78c-e96d-4840-8c1c-3de86f92ddd9' } : {}
+        const { summary, sessionIds } = await runTurn(h, await writeResult(h, result))
+        assert.equal(summary?.isError, true)
+        assert.equal(calls, 0)
+        assert.equal(summary?.assistantText, '')
+        assert.deepEqual(sessionIds, [])
+      } finally { await h.restore() }
+    })
+  }
+
+  test('spawn-time DB watermark rejects a replayed first USER_INPUT and its old answer', async () => {
+    const h = await harness({ resumeSessionId: id })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const db = new Database(await seedNativeBaseline(h.dir, id))
+      db.prepare('INSERT INTO steps (idx) VALUES (?)').run(9)
+      db.close()
+      const file = path.join(h.dir, 'replayed-first-user.ndjson')
+      await writeFile(file, `${[
+        { event: 'init', conversation_id: id },
+        ...[
+          { step_index: 0, step_type: 'user_input' },
+          { step_index: 1, step_type: 'agent_response', text_delta: 'OLD_ANSWER' },
+          { step_index: 10, step_type: 'user_input' },
+          { step_index: 11, step_type: 'error_message', error: { message: 'CURRENT_FAILURE' } },
+          { step_index: 2, step_type: 'agent_response', text_delta: 'OLD_ANSWER' },
+        ].map(step => ({ event: 'step_update', step_update: { conversation_id: id, state: 'DONE', ...step } })),
+        { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '' } },
+      ].map(e => JSON.stringify(e)).join('\n')}\n`)
+      const { summary } = await runTurn(h, file)
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /CURRENT_FAILURE/)
+      assert.equal(summary?.assistantText, '')
+    } finally { await h.restore() }
+  })
+
+  test('missing resume DB fails before spawning instead of trusting a replay boundary', async () => {
+    const h = await harness({ resumeSessionId: id })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      await rm(await seedNativeBaseline(h.dir, id))
+      let spawns = 0
+      h.adapter.on('spawn', () => { spawns++ })
+      const run = h.adapter.submitTurn({
+        input: 'resume unavailable', onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+      })
+      await assert.rejects(run.submitted, /RESUME_BASELINE_UNKNOWN/)
+      const summary = await run.summary
+      assert.equal(summary?.isError, true)
+      assert.equal(spawns, 0)
+    } finally { await h.restore() }
+  })
+})
+
+describe('Antigravity unindexed resumed errors', () => {
+  for (const index of [null, -1, 11]) {
+    test(`${index === null ? 'unindexed' : index < 0 ? 'invalid-index' : 'indexed'} error after the current input cannot become a billable terminal-only success`, async () => {
+      const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
+      const h = await harness({ resumeSessionId: id })
+      try {
+        h.adapter.setAntigravityRoute(ROUTE)
+        const file = path.join(h.dir, 'current-error.ndjson')
+        await writeFile(file, `${[
+          { event: 'init', conversation_id: id },
+          { event: 'step_update', step_update: { conversation_id: id, step_type: 'user_input', step_index: 10, state: 'DONE' } },
+          { event: 'step_update', step_update: { conversation_id: id, step_type: 'error_message', state: 'ERROR',
+            ...(index === null ? {} : { step_index: index }), error: { message: 'CURRENT_UNINDEXED_FAILURE' } } },
+          { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: 'DO_NOT_DELIVER' } },
+        ].map(e => JSON.stringify(e)).join('\n')}\n`)
+        const billing: any[] = []
+        h.adapter.on('external_billing', e => billing.push(e))
+        const { summary, events, sessionIds } = await runTurn(h, file)
+        assert.equal(summary?.isError, true)
+        assert.match(summary?.errorDetail ?? '', /CURRENT_UNINDEXED_FAILURE/)
+        assert.equal(summary?.assistantText, '')
+        assert.deepEqual(sessionIds, [])
+        assert.equal(events.filter(e => e.kind === 'block').length, 0)
+        assert.equal(billing.length, 1)
+        assert.equal(billing[0].status, 'error')
+      } finally { await h.restore() }
+    })
+  }
 })

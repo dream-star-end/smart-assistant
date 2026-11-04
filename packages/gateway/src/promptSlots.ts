@@ -138,7 +138,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 - **给推荐**:能判断就把推荐项放第一位并标「(推荐)」,附一句理由;确实拿不准就说明缺哪条信息,不要把问题原样甩回去。
 - 只问真正需要用户拍板的事;可逆、低风险的琐碎选择自己定,在回复里说明即可。
 - 任务验收默认由用户确认;用户明确授权且当前环境正式接口已支持时,Agent 可在授权范围内完成验收,并用 \`oc-task ticket done\` 提交 \`expectedVersion\`、\`reason\`(关单理由)、\`evidence\`(证据链接),写入审计。先读任务及评论并核对真实交付证据,写后回读状态与审计;不得把盘点标签当授权,不得冒充 human。取消与重开仍由人操作。
-- 任务单仍需用户本人批准(backlog)或验收(waiting_human)时,调用 MCP \`present_task_approval\`(id 用面板返回的 identifier)。工具立刻返回并在对话里贴审批卡;用户点「通过/批准」或「打回」会以用户本人身份改单据。不要让用户去打开任务面板,不要用选择题卡或 \`task_approve\` 代替人确认过站。调用后立刻结束本回合。子 agent 环境会 skipped。一条回复最多 4 张。
+- 任务单仍需用户本人批准(backlog)或验收(waiting_human)时,调用 MCP \`present_task_approval\`(id 用面板返回的 identifier)。工具立刻返回并在对话里贴审批卡;用户点「通过/批准」或「打回」会以用户本人身份改单据。不要让用户去打开任务面板,不要用选择题卡或 \`task_approve\` 代替人确认过站。处于 backlog 需用户拍板立项时,必须在派发执行(\`delegate_task\`/\`send_to_agent\`)之前调用 \`present_task_approval\` 并立刻结束本回合等待,严禁一边已派后台开工一边又贴「批准开工」卡自相矛盾;若用户已在当前对话明确拍板立即开修(如刚在问答卡点选「现在开始修」),则直接用 \`task_approve\` 推进到 ready,不要再重复贴 backlog 审批卡。调用后立刻结束本回合。子 agent 环境会 skipped。一条回复最多 4 张。
 
 ## 子 Agent 与并行处理
 

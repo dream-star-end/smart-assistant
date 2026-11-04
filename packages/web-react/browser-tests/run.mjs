@@ -566,6 +566,21 @@ await page.route(harnessUrl, (route) => route.fulfill({
 }));
 await page.goto(harnessUrl);
 
+// Fail at the original startup error, before per-case accounting can consume it.
+// These synchronous exports are registered only after the real harness initializes.
+const bootEntries = await page.evaluate(() => ({
+  paint: typeof window.__mountPaintProbes,
+  ask: typeof window.__mountAskQuestion,
+  replay: typeof window.__replayFixture,
+}));
+if (runtimeErrors.length > 0 ||
+    bootEntries.paint !== "function" || bootEntries.ask !== "function" ||
+    bootEntries.replay !== "object") {
+  console.error(`not ok - harness initialization failed: ${JSON.stringify(bootEntries)}\n  ${formatRuntimeErrors(runtimeErrors)}`);
+  await browser.close();
+  process.exit(1);
+}
+
 // 像素锚定用例(T8/T10)用 boundingBox() 取视口坐标做 before/after 比较。点击"加载更早
 // 历史"时 playwright 可能顺带滚动**整页**(harness 把 12 个挂载根平铺在 body 上),
 // 那 500px 的页面位移会被算进"锚点跳动",与被测的容器内锚定不变量无关 → 假红。

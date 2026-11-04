@@ -704,6 +704,58 @@ describe("MessageList Manus 过程披露", () => {
     expect(details.closest("[data-testid=process-disclosure]")).not.toBeNull();
   });
 
+
+  test("OCV5-739: ExecuteExtraTool / call_mcp_tool 包装且已完成的 present_task_approval 不被折进工作过程，默认展开且排在本轮最终回复正文下方", async () => {
+    renderList([
+      row("u-738", "user", "现在开始修", { status: "replied" }),
+      row("s-738", "assistant", "两个模型的修复都已经派到后台了，现在先请你确认工单：", {
+        _clientMessageId: "u-738",
+      }),
+      row("search-1", "tool", "查找工具", {
+        _clientMessageId: "u-738",
+        toolName: "SearchExtraTools",
+        inputJson: { query: "select:mcp__openclaude-memory__present_task_approval" },
+        _completed: true,
+        output: "found",
+      }),
+      row("approval-738", "tool", "ExecuteExtraTool", {
+        _clientMessageId: "u-738",
+        toolName: "ExecuteExtraTool",
+        inputJson: {
+          tool_name: "mcp__openclaude-memory__present_task_approval",
+          params: { id: "OCV5-738" },
+        },
+        _completed: true,
+        output: JSON.stringify({
+          ok: true,
+          kind: "task_approval",
+          status: "presented",
+          id: "OCV5-738",
+        }),
+      }),
+      row("search-2", "tool", "查找工具", {
+        _clientMessageId: "u-738",
+        toolName: "SearchExtraTools",
+        inputJson: { query: "select:mcp__openclaude-memory__task_get" },
+        _completed: true,
+        output: "found",
+      }),
+      row("ans-738", "assistant", "下面有 OCV5-738 的审批卡，请点一下“批准开工”，正式确认这张工单。", {
+        _clientMessageId: "u-738",
+      }),
+    ]);
+
+    const answerEl = screen.getByText(/下面有 OCV5-738 的审批卡/);
+    const approvalEl = await screen.findByText("任务待你确认");
+    // 1. 审批卡绝不折进工作过程，且 search-1/search-2 合并在同一个工作过程壳内（不分裂出第二个工作过程）
+    expect(approvalEl.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    // 2. 审批卡即使 _completed: true 也默认展开可见，且在 DOM 顺序中位于最终回复正文下方
+    expect(
+      Boolean(answerEl.compareDocumentPosition(approvalEl) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+  });
+
   test("两轮、分页、刷新和切会话不会串组或带走展开", () => {
     const messages: ChatMessage[] = [
       row("u1", "user", "第一问", { status: "replied" }),

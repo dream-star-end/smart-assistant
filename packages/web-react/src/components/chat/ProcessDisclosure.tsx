@@ -396,9 +396,21 @@ const PROMPT_CARD_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
  * (no toolUseId) leaves the row unpaired, and it used to stay outside 处理过程.
  * Whether a question still needs the user is the card's call (isAnsweredPrompt).
  */
+export function isInteractiveToolMessage(message: ChatMessage): boolean {
+  if (message.role !== "tool") return false;
+  const rawName = message.toolName ?? "";
+  let name = rawName;
+  try {
+    name = normalizeToolForDisplay(message).name || rawName;
+  } catch {
+    name = rawName;
+  }
+  if (PROMPT_CARD_TOOLS.has(rawName) || PROMPT_CARD_TOOLS.has(name)) return false;
+  return INTERACTIVE_TOOL_RE.test(rawName) || INTERACTIVE_TOOL_RE.test(name);
+}
+
 function interactiveTool(message: ChatMessage): boolean {
-  const name = message.toolName ?? "";
-  return !PROMPT_CARD_TOOLS.has(name) && INTERACTIVE_TOOL_RE.test(name);
+  return isInteractiveToolMessage(message);
 }
 
 /**
@@ -596,6 +608,7 @@ export function workKind(message: ChatMessage): string {
   if (message.role !== "tool" || PROMPT_CARD_TOOLS.has(message.toolName ?? "")) return "";
   try {
     const display = normalizeToolForDisplay(message);
+    if (PROMPT_CARD_TOOLS.has(display.name)) return "";
     const label = resolveToolMeta(display.name, display.input).label;
     const head = reliableHeadCall(stripShellWrapperForDisplay(commandOf(display.input)));
     // 读工具给 file_path,shell 的 `cat …` 只有命令文本:两处都看。

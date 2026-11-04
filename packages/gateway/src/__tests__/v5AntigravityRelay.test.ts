@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import { Agent as HttpAgent, createServer, request as httpRequest } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { describe, test } from 'node:test'
+import { bindRouteTrace } from '../relayTrace.js'
 
 import {
   V5_ANTIGRAVITY_RELAY_PREFIX,
@@ -205,5 +206,114 @@ describe('v5AntigravityRelay local gateway', () => {
       agent.destroy()
       await close(server)
     }
+  })
+})
+
+
+describe('P1 local relay lifecycle and safe diagnostics', () => {
+  test('logs request/trace/rpc/status but never credentials, body or URL', async () => {
+    const token = 'c'.repeat(64)
+    const traceId = '0123456789abcdef0123456789abcdef'
+    const release = bindRouteTrace(token, traceId)
+    const logs: Array<Record<string, unknown>> = []
+    let forwardedId: string | null = null
+    const server = createServer((req, res) => {
+      void handleV5AntigravityRelayLocal(req, res, {
+        masterBaseUrl: 'http://private-master.invalid', containerToken: 'private-container-token',
+      }, {
+        logger: { info: (_message: string, fields?: Record<string, unknown>) => { logs.push(fields ?? {}) } },
+        fetchImpl: async (_url, init) => {
+          await drainBody(init.body)
+          forwardedId = new Headers(init.headers).get('x-request-id')
+          return new Response('ok')
+        },
+      })
+    })
+    const port = await listen(server)
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${V5_ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:generateContent`, {
+        method: 'POST', headers: { authorization: 'Bearer private-cli-token', 'x-openclaude-trace-id': 'bad-caller-trace' },
+        body: 'private-prompt-body',
+      })
+      assert.equal(await res.text(), 'ok')
+      assert.ok(forwardedId)
+      assert.equal(res.headers.get('x-request-id'), forwardedId)
+      assert.ok(logs.some((row) => row.stage === 'headers_received' && row.statusCode === 200))
+      assert.ok(logs.some((row) => row.stage === 'response_complete'))
+      for (const row of logs) {
+        assert.equal(row.requestId, forwardedId)
+        assert.equal(row.traceId, traceId)
+        assert.equal(row.rpc, 'generateContent')
+      }
+      const serialized = JSON.stringify(logs)
+      assert.doesNotMatch(serialized, /private-|bad-caller-trace|Bearer|https?:\/\//)
+      assert.ok(!serialized.includes(token))
+    } finally { release(); await close(server) }
+  })
+
+  test('response close settles a pending pipe and cancels its reader without leaking listeners', async () => {
+    let done!: () => void
+    const finished = new Promise<void>((resolve) => { done = resolve })
+    let cancelled = false
+    let response: import('node:http').ServerResponse | undefined
+    let originalFinishListeners: unknown[] = []
+    let originalCloseListeners: unknown[] = []
+    const logs: Array<Record<string, unknown>> = []
+    const server = createServer((req, res) => {
+      response = res
+      // Node owns resOnFinish even on a premature close; only relay listeners must leave.
+      originalFinishListeners = res.listeners('finish')
+      originalCloseListeners = res.listeners('close')
+      void handleV5AntigravityRelayLocal(req, res, {
+        masterBaseUrl: 'http://private-master.invalid', containerToken: 'private-container-token',
+      }, {
+        logger: { info: (_message: string, fields?: Record<string, unknown>) => { logs.push(fields ?? {}) } },
+        fetchImpl: async () => new Response(new ReadableStream({
+          start(controller) { controller.enqueue(new TextEncoder().encode('first')) },
+          cancel() { cancelled = true },
+        })),
+      }).finally(done)
+    })
+    const port = await listen(server)
+    const req = httpRequest({
+      hostname: '127.0.0.1', port,
+      path: `${V5_ANTIGRAVITY_RELAY_PREFIX}/route/${'d'.repeat(64)}/v1internal:fetchUserInfo`,
+    })
+    req.on('error', () => {})
+    let timer: NodeJS.Timeout | undefined
+    try {
+      const firstByte = new Promise<void>((resolve) => req.on('response', (res) => {
+        res.once('data', () => { req.destroy(); resolve() })
+      }))
+      req.end()
+      await firstByte
+      await Promise.race([finished, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('local pipe remained pending after close')), 3000)
+      })])
+      assert.equal(cancelled, true)
+      assert.deepEqual(response?.listeners('finish'), originalFinishListeners)
+      assert.deepEqual(response?.listeners('close'), originalCloseListeners)
+      assert.ok(logs.some((row) => row.stage === 'downstream_closed'))
+    } finally { clearTimeout(timer); req.destroy(); server.closeAllConnections(); await close(server) }
+  })
+
+  test('transport errors log only a fixed stage and do not expose exception text', async () => {
+    const logs: Array<Record<string, unknown>> = []
+    const server = createServer((req, res) => {
+      void handleV5AntigravityRelayLocal(req, res, {
+        masterBaseUrl: 'http://private-master.invalid', containerToken: 'private-container-token',
+      }, {
+        logger: { info: (_message: string, fields?: Record<string, unknown>) => { logs.push(fields ?? {}) } },
+        fetchImpl: async () => { throw new Error('private-token http://private-url private-body') },
+      })
+    })
+    const port = await listen(server)
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${V5_ANTIGRAVITY_RELAY_PREFIX}/route/${'e'.repeat(64)}/v1internal:fetchUserInfo`)
+      assert.equal(res.status, 502)
+      assert.doesNotMatch(await res.text(), /private-/)
+      assert.ok(logs.some((row) => row.stage === 'relay_failed'))
+      assert.doesNotMatch(JSON.stringify(logs), /private-|https?:\/\//)
+    } finally { await close(server) }
   })
 })

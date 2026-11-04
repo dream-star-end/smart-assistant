@@ -5,6 +5,7 @@
 import { ClipboardCheck, AlertTriangle } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
+import { recordTicketApprovalPending, syncTicketApprovalFromTicket } from "../../lib/sessionStatus";
 import {
   TICKET_STATUS_LABEL,
   TICKET_TYPE_LABEL,
@@ -51,6 +52,8 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
     taskApproval
       .getTicket(id)
       .then((t) => {
+        syncTicketApprovalFromTicket(t);
+        if (id !== t.identifier && id !== t.id) recordTicketApprovalPending(id, isApprovable(t.status), t.version);
         if (alive) setTicket(t);
       })
       .catch((e) => {
@@ -104,6 +107,10 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
     void runWithRetry((t) => taskApproval.approve(t.identifier, t.version))
       .then((next) => {
         if (!next) return;
+        syncTicketApprovalFromTicket(next);
+        recordTicketApprovalPending(next.identifier, false, next.version);
+        recordTicketApprovalPending(next.id, false, next.version);
+        if (id !== next.identifier) recordTicketApprovalPending(id, false, next.version);
         setTicket(next);
         setSettled("approve");
         const ident = next.identifier;
@@ -129,6 +136,10 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
     void runWithRetry((t) => taskApproval.reject(t.identifier, t.version, reason))
       .then((next) => {
         if (!next) return;
+        syncTicketApprovalFromTicket(next);
+        recordTicketApprovalPending(next.identifier, false, next.version);
+        recordTicketApprovalPending(next.id, false, next.version);
+        if (id !== next.identifier) recordTicketApprovalPending(id, false, next.version);
         setTicket(next);
         setSettled("reject");
         setRejectOpen(false);
@@ -142,6 +153,8 @@ export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }
 
   const onDefer = useCallback(() => {
     if (deciding || settled) return;
+    recordTicketApprovalPending(ticket?.identifier ?? id, false);
+    if (ticket?.identifier && id !== ticket.identifier) recordTicketApprovalPending(id, false);
     setSettled("defer");
     announce(`暂不批准 ${ticket?.identifier ?? id}`);
   }, [announce, deciding, settled, ticket, id]);
