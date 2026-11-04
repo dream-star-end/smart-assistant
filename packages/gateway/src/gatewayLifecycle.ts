@@ -444,6 +444,14 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
   }
 
   this.httpServer = createServer((req, res) => this.handleHttp(req, res))
+  // Loopback CLI relays (Antigravity Go net/http, Codex, CCB, MCP) stream SSE for
+  // minutes and pool idle connections across tool executions (Go DefaultTransport
+  // IdleConnTimeout = 90s). Node's default requestTimeout (300s) and keepAliveTimeout
+  // (5s) otherwise close pooled sockets mid-tool-call (~5.0s-5.7s), causing
+  // `read tcp 127.0.0.1:xxxxx->127.0.0.1:18789: read: connection reset by peer`.
+  this.httpServer.requestTimeout = 0
+  this.httpServer.keepAliveTimeout = 120_000
+  this.httpServer.headersTimeout = 125_000
   // V3 2H: 改用 noServer + 手动 upgrade dispatch,以便商业化模块的 /ws/user-chat-bridge
   // 与 /ws/agent 路径在 gateway 自身的 /ws 之前优先匹配。原 `path: '/ws'` 模式下
   // ws lib 会对所有非 /ws 请求 socket.destroy(),把商业化路径吃掉。

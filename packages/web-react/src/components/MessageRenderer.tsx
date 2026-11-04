@@ -974,7 +974,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
       flushTerminal();
     }
-    if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !continuedErrors.has(message.id))) {
+    if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !isErrorCardHeldWithAnswer(message) && !continuedErrors.has(message.id))) {
       (terminal ??= { boundary: nextBoundary, items: [] }).items.push(item);
       continue;
     }

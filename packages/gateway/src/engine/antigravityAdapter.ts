@@ -181,6 +181,8 @@ interface TurnContext {
   preludeErrorDetail: string | null
   /** This launch's last step was an error_message (1.4.0 streams it without text). */
   trailingErrorStep: boolean
+  /** Error message from the most recent unrecovered `error_message` step. */
+  trailingErrorDetail: string | null
   /** This launch streamed an error_message step of its own. */
   ownErrorStep: boolean
   /** Launched with `--conversation` (resuming an existing CLI conversation). */
@@ -361,6 +363,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       firstOwnStepIndex: null,
       preludeErrorDetail: null,
       trailingErrorStep: false,
+      trailingErrorDetail: null,
       ownErrorStep: false,
       resumedLaunch: false,
       exitCode: null,
@@ -730,8 +733,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       // turn ended as a "success" with no reply). Remember it; settleResult
       // fails the turn unless a later tool or reply step shows the run went on.
       ctx.ownErrorStep = true
-      if (message) ctx.errorDetail = message
-      else ctx.trailingErrorStep = true
+      ctx.trailingErrorStep = true
+      if (message) ctx.trailingErrorDetail = message
     }
     // user_input / system_message / checkpoint / unknown (native ask_question,
     // invisible in headless mode) carry nothing the product renders.
@@ -741,6 +744,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (text.trim()) {
       ctx.timing.once('first_text')
       ctx.trailingErrorStep = false
+      ctx.trailingErrorDetail = null
     }
     ctx.sawOutput = true
     if (!ctx.lastWasText) {
@@ -770,6 +774,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private handleToolStep(ctx: TurnContext, step: Record<string, unknown>, state: string): void {
     ctx.sawOutput = true
     ctx.trailingErrorStep = false
+    ctx.trailingErrorDetail = null
     const id = this.toolId(ctx, step)
     const info = recordOf(step.tool_info) ?? {}
     const nativeName = asText(info.name) || asText(step.tool_name)
@@ -907,6 +912,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const id = asText(result.conversation_id)
     if (CONVERSATION_ID_RE.test(id)) ctx.conversationId = id
     if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
+    if (ctx.trailingErrorStep && ctx.trailingErrorDetail && ctx.errorDetail === null) {
+      ctx.errorDetail = ctx.trailingErrorDetail
+    }
     if (status !== 'SUCCESS' && ctx.errorDetail === null) {
       ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail ||
         `Antigravity turn ended with status ${status || 'unknown'}`
@@ -940,9 +948,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   /** Everything but the exit code that marks an ERROR as the repeated old one. */
   private mayBeRepeatedOldError(ctx: TurnContext, result: Record<string, unknown>): boolean {
     return asText(result.status) === 'ERROR' &&
-      ctx.resumedLaunch &&
+      (ctx.resumedLaunch || ctx.ownErrorStep) &&
       !CLI_STDERR_ERROR_RE.test(ctx.stderr) &&
-      !ctx.ownErrorStep &&
+      !ctx.trailingErrorStep &&
+      ctx.errorDetail === null &&
       ctx.firstOwnStepIndex !== null &&
       (ctx.assistantText.trim() !== '' || asText(result.response).trim() !== '')
   }

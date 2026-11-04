@@ -194,8 +194,14 @@ export function useComposerSend({
       const recoverySelection = selectedSessionIdRef.current;
       const recoveryIdentity = auth?.snapshot().epoch;
       const recoveryIdentityIsCurrent = () => auth?.snapshot().epoch === recoveryIdentity;
-      const recoveryIsCurrent = () => collabEpochRef.current === recoveryEpoch
-        && selectedSessionIdRef.current === recoverySelection && (!target || target.sessionId === recoverySelection) && recoveryIdentityIsCurrent();
+      const recoveryIsCurrent = () =>
+        (selectedSessionIdRef.current === recoverySelection
+          ? collabEpochRef.current === recoveryEpoch
+          : !originalSessionId &&
+            selectedSessionIdRef.current === sessionId &&
+            collabEpochRef.current <= recoveryEpoch + 1) &&
+        (!target || target.sessionId === recoverySelection) &&
+        recoveryIdentityIsCurrent();
       if (!originalSessionId) stopPreparing();
       const recovery = await prepareAdvisorSend({
         agentId: agent.id, original: collabUi, auth, sessionId: originalSessionId,
@@ -211,6 +217,7 @@ export function useComposerSend({
       if (!recovery || !recoveryIdentityIsCurrent()) return false;
       let latestCollab = recovery.state;
       const recoveredAdvisor = recovery.recoveredAdvisor;
+      let persistInitialCollab: (() => Promise<boolean>) | undefined;
       if (!originalSessionId) {
         createdSession = {
           id: sessionId,
@@ -231,24 +238,26 @@ export function useComposerSend({
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
         if (auth && agent.id === "main" && !recoveredAdvisor) {
-          const collabAuth = auth;
-          const identityEpoch = collabAuth.snapshot().epoch;
-          try {
-            const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
-            if (collabAuth.snapshot().epoch !== identityEpoch) return false;
-            if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
-            const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
-            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return false;
-            if (recoveryIsCurrent()) applyCollabDoc(doc);
-            latestCollab = docToUiState(doc);
-          } catch (err) {
-            if (collabAuth.snapshot().epoch !== identityEpoch) return false;
-            // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
-            const msg = apiErrorMessage(err, "协作配置保存失败，请重新选择后重试");
-            setCollabSaveError(msg);
-            toast(msg, "error");
-            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) return false;
-          }
+          const keepCollab = keepCollabChoiceOnSaveFailure(latestCollab.mode);
+          persistInitialCollab = async () => {
+            try {
+              const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+              if (!recoveryIdentityIsCurrent()) return false;
+              if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
+              const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, recoveryIdentity!);
+              if (!doc || !recoveryIdentityIsCurrent()) return false;
+              if (recoveryIsCurrent()) applyCollabDoc(doc);
+              latestCollab = docToUiState(doc);
+              return true;
+            } catch (err) {
+              if (!recoveryIdentityIsCurrent()) return false;
+              const msg = apiErrorMessage(err, "协作配置保存失败，请重新选择后重试");
+              if (recoveryIsCurrent()) setCollabSaveError(msg);
+              toast(msg, "error");
+              return keepCollab;
+            }
+          };
+          if (!keepCollab && !(await persistInitialCollab())) return false;
         }
       }
       const sendCollab = sendCollabFields({
@@ -268,6 +277,7 @@ export function useComposerSend({
         canPrompt:recoveryIsCurrent,
         isCurrent:()=>recoveryIdentityIsCurrent()&&(!originalSessionId||!!sockRef.current?.getSession(sessionId))}):undefined;
       if(!imageEdit&&modelId&&authorizeSwitch&&!authorization)return false;
+      if (persistInitialCollab && keepCollabChoiceOnSaveFailure(latestCollab.mode)) void persistInitialCollab();
       const materializedDraft =
         !createdSession && (
           sessions.some((session) => session.id === sessionId && session.messageCount === 0) ||
@@ -350,8 +360,7 @@ export function useComposerSend({
       setSessions((c) => {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
-        const base: Session =
-          found ?? createdSession ?? { id: sid, title: sessionTitle, ownerUserId: user.id, updatedAt: "", messageCount: 0 };
+        const base = found ?? createdSession ?? ({ ownerUserId: user.id } as Session);
         const updated: Session = {
           ...base,
           id: sid,
@@ -502,44 +511,20 @@ export function useComposerSend({
   // 天然落 annotated 分支，向后兼容。
   const submitImageEdit = useCallback(
     async (value: ImageEditSubmit) => {
+      const base = { clientJobId: value.clientJobId, sourceIndex: 0, width: value.width, height: value.height };
       if (value.mode === "resize") {
-        // 调整大小（outpaint）：源图（hidden）+ guide（可见），无 mask；带目标比例 targetAspect。
-        const [sourceMedia, guideMedia] = await Promise.all([
-          uploadMedia(value.source),
-          uploadMedia(value.guide),
-        ]);
-        const media: MediaRef[] = [{ ...sourceMedia, hidden: true }, guideMedia];
-        await send(value.prompt, media, {
-          mode: "outpaint",
-          targetAspect: value.targetAspect,
-          clientJobId: value.clientJobId,
-          sourceIndex: 0,
-          guideIndex: 1,
-          width: value.width,
-          height: value.height,
+        const [sourceMedia, guideMedia] = await Promise.all([uploadMedia(value.source), uploadMedia(value.guide)]);
+        await send(value.prompt, [{ ...sourceMedia, hidden: true }, guideMedia], {
+          ...base, mode: "outpaint", targetAspect: value.targetAspect, guideIndex: 1,
         });
         toast("已提交调整大小，成功生成后扣 50 积分", "success");
         return;
       }
-      // 编辑/评论（annotated）：源图 + mask（均 hidden）+ guide 三件套（既有链路，逐字保留）。
       const [sourceMedia, maskMedia, guideMedia] = await Promise.all([
-        uploadMedia(value.source),
-        uploadMedia(value.mask),
-        uploadMedia(value.guide),
+        uploadMedia(value.source), uploadMedia(value.mask), uploadMedia(value.guide),
       ]);
-      const media: MediaRef[] = [
-        { ...sourceMedia, hidden: true },
-        { ...maskMedia, hidden: true },
-        guideMedia,
-      ];
-      await send(value.prompt, media, {
-        mode: "annotated",
-        clientJobId: value.clientJobId,
-        sourceIndex: 0,
-        maskIndex: 1,
-        guideIndex: 2,
-        width: value.width,
-        height: value.height,
+      await send(value.prompt, [{ ...sourceMedia, hidden: true }, { ...maskMedia, hidden: true }, guideMedia], {
+        ...base, mode: "annotated", maskIndex: 1, guideIndex: 2,
       });
       toast("已提交精确修改，成功生成后扣 50 积分", "success");
     },

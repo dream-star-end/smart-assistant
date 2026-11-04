@@ -124,6 +124,13 @@ export function selectMasterCc5Backend(
   env: Cc5PolicyEnvironment,
 ) {
   if (!selfhost || !canUseCc5TestModel(String(input.uid), env)) return undefined
-  if (!runtime) throw new Error('CC5_FRESH_CONTAINER_BINDING_REJECTED')
-  return runtime.selectBackend(input)
+  if (runtime) return runtime.selectBackend(input)
+  if (input.canonicalModel !== CC5_NATIVE_MODEL || input.engine !== 'ccb') return undefined
+  try {
+    const config = readDeployment(String(input.uid))
+    if (input.sessionKey !== config.scope.sessionKey) return undefined
+  } catch {
+    // Fall through to fail-closed rejection when deployment metadata cannot narrow the session.
+  }
+  throw new Error('CC5_FRESH_CONTAINER_BINDING_REJECTED')
 }

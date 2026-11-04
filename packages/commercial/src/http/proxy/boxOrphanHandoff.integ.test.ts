@@ -197,6 +197,19 @@ test("orphan handoff lookup requires same tool ids, another turn and a terminal 
     await row("box-stopped", done, ["toolu_F"], "aa".repeat(32), { boxState: "failed_stopped", boxCancelIntent: true });
     const stopped = await find(["toolu_F"]);
     assert.equal(stopped.kind === "orphan" && stopped.stopped, true, "already stopped exchange is recoverable");
+    assert.equal((await find(["toolu_F"], "aa".repeat(32))).kind, "none",
+      "same-turn user-stopped exchange must not be resurrected");
+    await row("box-same-turn-worker-failed", live, ["toolu_W"], "cc".repeat(32), {
+      boxState: "failed_stopped", boxStopOutcome: "failed",
+      boxTerminalProof: { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+        keeperPid: 100, cliPid: 101, reason: "worker_failed", revision: 2, workerExitCode: 1 } });
+    const sameTurnStopped = await find(["toolu_W"], "cc".repeat(32));
+    assert.equal(sameTurnStopped.kind === "orphan" && sameTurnStopped.stopped, true,
+      "same-turn worker_failed handoff with live dispatch continues fresh");
+    await row("box-same-turn-unproven", live, ["toolu_U"], "cc".repeat(32), {
+      boxState: "failed_stopped", boxStopOutcome: "failed" });
+    assert.equal((await find(["toolu_U"], "cc".repeat(32))).kind, "none",
+      "same-turn stopped handoff without bound terminal proof is ignored");
     // exactly one recovery claims an exchange; release gives it back
     const claims = await Promise.all([1, 2].map((n) =>
       journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: `box-recover-${n}` })));

@@ -300,6 +300,151 @@ class ToolEventPublisher:
         self.published = True
 
 
+class FailureDiagnostic:
+    """Bounded observations, never raw model output or an authoritative proof."""
+
+    def __init__(self):
+        self.path = os.environ.pop("OCV5_DIAGNOSTIC_PROOF_DIR", "")
+        self.epoch = os.environ.pop("OCV5_DIAGNOSTIC_LEASE_EPOCH", "")
+        match = re.fullmatch(r"/tmp/ocv5-289-proof-([0-9a-f]{24})", self.path)
+        self.enabled = bool(match and re.fullmatch(r"[0-9a-f]{32}", self.epoch))
+        self.record = {"version": 1, "runNonce": match[1] if match else "",
+            "leaseEpoch": self.epoch, "producer": "supervisor", "stage": "setup",
+            "reason": "unknown", "cliExitCode": None, "cliSignal": None,
+            "httpStatus": None, "upstreamCode": "unknown", "lastEvent": "none",
+            "stdoutBytes": 0, "stderrBytes": 0,
+            "flags": {"stderrTruncated": False, "stdoutTruncated": False, "parseFailed": False}}
+        self.buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        self.dropping = {"stdout": False, "stderr": False}
+
+    def feed(self, stream, chunk):
+        if not self.enabled:
+            return
+        try:
+            self.record[stream + "Bytes"] += len(chunk)
+            # Per-line cap bounds JSON depth/work and long tool echo buffering.
+            # Retain only enums after classification.
+            for part in chunk.splitlines(keepends=True):
+                buffer = self.buffers[stream]
+                ended = part.endswith(b"\n")
+                if not self.dropping[stream]:
+                    if len(buffer) + len(part) > 4096:
+                        buffer.clear()
+                        self.dropping[stream] = True
+                        self.record["flags"][stream + "Truncated"] = True
+                    else:
+                        buffer.extend(part)
+                if ended:
+                    if not self.dropping[stream]:
+                        self.observe(stream, bytes(buffer))
+                    buffer.clear()
+                    self.dropping[stream] = False
+        except Exception:
+            self.record["flags"]["parseFailed"] = True
+
+    def observe(self, stream, line):
+        statuses = {400, 401, 403, 408, 413, 429, 500, 502, 503, 504}
+        kinds = {"authentication_error": "authentication", "permission_error": "permission",
+            "rate_limit_error": "rate_limit", "overloaded_error": "overloaded",
+            "context_length_exceeded": "context_limit", "invalid_request_error": "invalid_request",
+            "ECONNRESET": "network", "ECONNREFUSED": "network", "ETIMEDOUT": "network",
+            "ENOTFOUND": "network", "EAI_AGAIN": "network"}
+        def status(value):
+            if type(value) is int and value in statuses:
+                self.record["httpStatus"] = value
+                inferred = {401: "authentication", 403: "permission", 429: "rate_limit",
+                    413: "context_limit", 400: "invalid_request", 503: "overloaded"}
+                self.record["upstreamCode"] = inferred.get(value, "unknown")
+        text = line.decode("utf-8", errors="replace").strip()
+        if not text:
+            return
+        if stream == "stdout" and text.startswith("{"):
+            try:
+                value = json.loads(text)
+                kind = value.get("type")
+                self.record["lastEvent"] = kind if kind in (
+                    "system", "assistant", "user", "result", "stream_event") else "other"
+                error = value.get("error")
+                if isinstance(error, dict):
+                    status(error.get("status"))
+                    if isinstance(error.get("type"), str) and error["type"] in kinds:
+                        self.record["upstreamCode"] = kinds[error["type"]]
+                status(value.get("status"))
+                # No arbitrary message/URL fields; CLI result prefix only.
+                if kind == "result" and value.get("is_error") is True:
+                    if isinstance(value.get("result"), str):
+                        text = value["result"][:4096].strip()
+                    errors = value.get("errors")
+                    if isinstance(errors, list):
+                        for error_text in errors[:8]:
+                            if isinstance(error_text, str):
+                                self.observe("stderr", error_text[:4096].encode("utf-8"))
+            except (ValueError, AttributeError, TypeError, RecursionError):
+                self.record["flags"]["parseFailed"] = True
+                return
+        # Explicit prefixes only, not a keyword search in arbitrary prose.
+        match = re.match(r"^(?:API Error: |HTTP Error: )(400|401|403|408|413|429|500|502|503|504)(?:\b|:)", text)
+        if match:
+            status(int(match[1]))
+        for token, mapped in kinds.items():
+            if text == token or text.startswith(token + ":") or text.startswith("Error: " + token + ":"):
+                self.record["upstreamCode"] = mapped
+                break
+
+    def finish(self, code, stage="setup", reason="internal_error", child_code=None):
+        if not code or not self.enabled:
+            return code
+        directory = fd = None
+        tmp = f"failure.diag.{os.getpid()}.tmp"
+        created = False
+        try:
+            for stream, buffer in self.buffers.items():
+                if buffer and not self.dropping[stream]:
+                    self.observe(stream, bytes(buffer))
+                buffer.clear()
+            self.record.update(stage=stage, reason=reason)
+            if type(child_code) is int and -255 <= child_code <= 255:
+                self.record["cliExitCode"] = child_code
+                if -64 <= child_code < 0:
+                    self.record["cliSignal"] = -child_code
+            if os.path.realpath(self.path) != self.path:
+                return code
+            directory = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            info = os.fstat(directory)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                return code
+            raw = (json.dumps(self.record, separators=(",", ":")) + "\n").encode("ascii")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+            created = True
+            offset = 0
+            while offset < len(raw):
+                written = os.write(fd, raw[offset:])
+                if written <= 0:
+                    raise OSError("DIAGNOSTIC_WRITE_FAILED")
+                offset += written
+            os.close(fd)
+            fd = None
+            # Atomic no-replace publication. No fsync: diagnostics are best
+            # effort and must not park process cleanup on a storage flush.
+            os.link(tmp, "failure.diag.json", src_dir_fd=directory,
+                    dst_dir_fd=directory, follow_symlinks=False)
+        except Exception:
+            pass  # Optional diagnostics must never affect supervision/proofs.
+        finally:
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+            if directory is not None:
+                if created:
+                    try: os.unlink(tmp, dir_fd=directory)
+                    except OSError: pass
+                try: os.close(directory)
+                except OSError: pass
+        return code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--deadline", type=float, required=True)
@@ -317,6 +462,7 @@ def main() -> int:
             or (args.stdin_file is None) != (args.stdin_sha256 is None)
             or (args.stdin_file is not None and (not args.stdin_file or not args.stdin_sha256))):
         return 126
+    diagnostic = FailureDiagnostic()
     deadline = time.monotonic() + args.deadline
 
     publisher = None
@@ -324,7 +470,7 @@ def main() -> int:
         try:
             publisher = ToolEventPublisher(event_path)
         except (OSError, ValueError):
-            return 126
+            return diagnostic.finish(126)
 
     stdin_fd = None
     if args.stdin_file is not None:
@@ -333,7 +479,7 @@ def main() -> int:
         except (OSError, ValueError):
             if publisher is not None:
                 publisher.close()
-            return 126
+            return diagnostic.finish(126)
 
     parent_pid = os.getpid()
     gate_read, gate_write = os.pipe()
@@ -353,7 +499,7 @@ def main() -> int:
             os.close(fd)
         if publisher is not None:
             publisher.close()
-        return 126
+        return diagnostic.finish(126)
     if stdin_fd is not None:
         os.close(stdin_fd)
     os.close(gate_read)
@@ -423,7 +569,7 @@ def main() -> int:
             except subprocess.TimeoutExpired: watcher.kill(); watcher.wait()
         if publisher is not None:
             publisher.close()
-        return 126
+        return diagnostic.finish(126)
     except RuntimeError:
         kill_group(child.pid, signal.SIGKILL)
         child.wait()
@@ -435,7 +581,8 @@ def main() -> int:
             except subprocess.TimeoutExpired: watcher.kill(); watcher.wait()
         if publisher is not None:
             publisher.close()
-        return 124 if startup_expired else 126
+        return diagnostic.finish(124 if startup_expired else 126,
+                                 reason="deadline" if startup_expired else "internal_error")
     if ready_path := os.environ.get("OCV5_SUPERVISOR_READY_FILE"):
         with open(ready_path, "w", encoding="ascii") as ready:
             ready.write(f"{child.pid} {watcher.pid}\n")
@@ -455,23 +602,28 @@ def main() -> int:
     stdout_bytes = 0
     stderr_bytes = 0
     reason = None
+    diag_reason, diag_stage = "child_exit", "child_exit"
     try:
         while selector.get_map():
             if stopped:
                 reason = 143
+                diag_reason, diag_stage = "interrupted", "shutdown"
                 break
             if time.monotonic() >= deadline:
                 reason = 124
+                diag_reason, diag_stage = "deadline", "stream"
                 break
             for key, _ in selector.select(timeout=min(0.1, max(0, deadline - time.monotonic()))):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
+                diagnostic.feed(key.data, chunk)
                 if key.data == "stdout":
                     if (stdout_bytes + len(chunk)
                             + (0 if args.stderr_limit else stderr_bytes) > args.max_output):
                         reason = 125
+                        diag_reason, diag_stage = "output_limit", "stream"
                         break
                     stdout_bytes += len(chunk)
                     if publisher is not None:
@@ -479,12 +631,16 @@ def main() -> int:
                     delivery = write_before_deadline(chunk, deadline, lambda: stopped)
                     if delivery != "written":
                         reason = 143 if delivery == "cancelled" else 124
+                        diag_reason = "interrupted" if delivery == "cancelled" else "delivery_timeout"
+                        diag_stage = "publish"
                         break
                 else:
                     stderr_bytes += len(chunk)
                     if (stderr_bytes > args.stderr_limit if args.stderr_limit
                             else stdout_bytes + stderr_bytes > args.max_output):
                         reason = 125
+                        diag_reason = "stderr_limit" if args.stderr_limit else "output_limit"
+                        diag_stage = "stream"
                         break
             if reason is not None:
                 break
@@ -492,6 +648,7 @@ def main() -> int:
             publisher.finish()
     except (OSError, ValueError, json.JSONDecodeError):
         reason = 125
+        diag_reason, diag_stage = "internal_error", "stream"
     finally:
         selector.close()
         # Keep the group leader unreaped while signalling. Its PID/PGID cannot
@@ -515,9 +672,8 @@ def main() -> int:
         child.wait()
         if publisher is not None:
             publisher.close()
-    if reason is not None:
-        return reason
-    return child.returncode or 0
+    return diagnostic.finish(reason if reason is not None else (child.returncode or 0),
+                             diag_stage, diag_reason, child.returncode)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 /** Resume the same detached CLI after OpenClaude-local tool results publish.
  * Delivers either the next durable tool handoff or a remotely-proven final
  * message. The caller retains the Box target until terminal cleanup. */
+import { rootLogger } from "../../logging/logger.js";
+import { boxFailureObservation } from "./boxFailureCause.js";
 import { boxCatalogMatching, compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
@@ -256,6 +258,8 @@ export async function runBoxToolContinuation(input: {
     }
     throw new BoxToolContinuationError("BOX_TOOL_STREAM_INCOMPLETE");
   } catch (error) {
+    rootLogger.warn("box_continuation_transport_observation", { requestId: input.requestId,
+      ...boxFailureObservation(error, "stream") });
     // OCV5-313: a rejected result echo is named so the stop paths can end
     // this run at once; nothing it writes afterwards can be delivered.
     // OCV5-328: the same holds when the decoder rejects the stream itself:

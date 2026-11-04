@@ -268,10 +268,21 @@ export async function admitDispatch(
       const taken = await client.query<RawDispatchRow>(
         `UPDATE turn_dispatches
             SET owner_id = $2, lease_epoch = lease_epoch + 1, lease_until = $3,
-                last_attempt_at = $4, trace_id = COALESCE($6, trace_id)
+                last_attempt_at = $4, trace_id = COALESCE($6, trace_id),
+                agent_container_id = COALESCE($7, agent_container_id),
+                runtime_kind = COALESCE($8, runtime_kind)
           WHERE dispatch_id = $1 AND lease_epoch = $5 AND status = 'admitted'
           RETURNING ${DISPATCH_COLUMNS}`,
-        [row.dispatchId, input.ownerId, leaseUntil, nowDate, String(row.leaseEpoch), input.traceId ?? null],
+        [
+          row.dispatchId,
+          input.ownerId,
+          leaseUntil,
+          nowDate,
+          String(row.leaseEpoch),
+          input.traceId ?? null,
+          input.agentContainerId ?? null,
+          input.runtimeKind ?? null,
+        ],
       )
       if (taken.rows.length === 0) {
         // 并发接管输了(别的 bridge 先 epoch++)→ 当作已被占用,回 busy。
@@ -386,15 +397,31 @@ export async function casAdmittedToRejecting(
  */
 export async function casAdmittedToAccepted(
   q: Queryable,
-  input: { dispatchId: string; expectedEpoch: number; now?: number },
+  input: {
+    dispatchId: string
+    expectedEpoch: number
+    now?: number
+    agentContainerId?: number | null
+    runtimeKind?: string | null
+  },
 ): Promise<TurnDispatchRow | null> {
   const now = input.now ?? Date.now()
   const res = await q.query<RawDispatchRow>(
     `UPDATE turn_dispatches
-        SET status = 'accepted', accepted_at = COALESCE(accepted_at, $3), last_attempt_at = $3
+        SET status = 'accepted',
+            accepted_at = COALESCE(accepted_at, $3),
+            last_attempt_at = $3,
+            agent_container_id = COALESCE(agent_container_id, $4),
+            runtime_kind = COALESCE(runtime_kind, $5)
       WHERE dispatch_id = $1 AND status = 'admitted' AND lease_epoch = $2
       RETURNING ${DISPATCH_COLUMNS}`,
-    [input.dispatchId, input.expectedEpoch, new Date(now)],
+    [
+      input.dispatchId,
+      input.expectedEpoch,
+      new Date(now),
+      input.agentContainerId ?? null,
+      input.runtimeKind ?? null,
+    ],
   )
   return res.rows.length === 0 ? null : mapRow(res.rows[0]!)
 }

@@ -1164,10 +1164,15 @@ function makeDelegateGateway(): any {
   gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
   // Engine-reported delegate lanes must admit billing before runner creation.
   // Keep this local-path test hermetic instead of calling default master.invalid.
+  // Master now issues a provider route for every codex admit (OCV5-729); the
+  // gateway fail-closes without it, so the stub must carry one too.
   gw._delegateEngineBilling = {
-    admit: async () => ({
+    admit: async (input: { engine?: string }) => ({
       requestId: "ab".repeat(16),
       engineSessionId: "oceng-" + "b".repeat(48),
+      ...(input?.engine === "codex"
+        ? { route: { kind: "official_oauth", groupId: "3" } }
+        : {}),
     }),
     settle: async () => {},
     abandon: async () => {},

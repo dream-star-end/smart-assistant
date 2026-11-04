@@ -119,6 +119,7 @@ export async function installTurnProbe(context, base, cost) {
 export async function clickSend(page, log = console.log, timeout = 20_000) {
   const button = page.getByRole("button", { name: "发送", exact: true });
   await button.waitFor({ state: "visible", timeout });
+  await button.scrollIntoViewIfNeeded({ timeout });
   const deadline = Date.now() + timeout;
   let box = null;
   for (;;) {

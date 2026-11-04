@@ -10,6 +10,7 @@ import {
   type Queryable,
   admitDispatch,
   backfillDispatchTraceId,
+  casAdmittedToAccepted,
   casToTerminal,
   heartbeatLease,
   touchDispatchLeaseOnLiveFrame,
@@ -282,5 +283,42 @@ describe('turn_dispatches.trace_id (OCV5-599)', () => {
     assert.deepEqual(calls[0]!.params, ['d-1', TRACE])
     rowCount = 0
     assert.equal(await backfillDispatchTraceId(asQ(q), { dispatchId: 'd-1', traceId: TRACE }), false)
+  })
+
+  test('takeover and casAdmittedToAccepted coalesce agent_container_id and runtime_kind', async () => {
+    const q = makeFakeQ({
+      existing: rawRow({ status: 'admitted', lease_until: new Date(Date.now() - 1000) }),
+      onTakeover: () => rawRow({ lease_epoch: '2', owner_id: 'owner-me' }),
+    })
+    const r = await admitDispatch(asQ(q), {
+      ...baseInput,
+      agentContainerId: 7143,
+      runtimeKind: 'docker',
+    })
+    assert.equal(r.kind, 'admitted')
+    const upd = q.calls.find((c) => c.sql.includes('lease_epoch + 1'))!
+    assert.match(upd.sql, /agent_container_id = COALESCE\(\$7, agent_container_id\)/)
+    assert.match(upd.sql, /runtime_kind = COALESCE\(\$8, runtime_kind\)/)
+    assert.equal(upd.params[6], 7143)
+    assert.equal(upd.params[7], 'docker')
+
+    const acceptCalls: Array<{ sql: string; params: unknown[] }> = []
+    const acceptQ = {
+      async query(sql: string, params: unknown[] = []) {
+        acceptCalls.push({ sql, params })
+        return { rows: [rawRow({ status: 'accepted' })], rowCount: 1 }
+      },
+    }
+    const accepted = await casAdmittedToAccepted(asQ(acceptQ), {
+      dispatchId: 'd-1',
+      expectedEpoch: 2,
+      agentContainerId: 7143,
+      runtimeKind: 'docker',
+    })
+    assert.ok(accepted)
+    assert.match(acceptCalls[0]!.sql, /agent_container_id = COALESCE\(agent_container_id, \$4\)/)
+    assert.match(acceptCalls[0]!.sql, /runtime_kind = COALESCE\(runtime_kind, \$5\)/)
+    assert.equal(acceptCalls[0]!.params[3], 7143)
+    assert.equal(acceptCalls[0]!.params[4], 'docker')
   })
 })

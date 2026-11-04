@@ -4790,18 +4790,29 @@ describe("cc5 fresh container supervisor boundary", () => {
       } finally { process.env.OC_SELFHOST_CC5_T1555U_ENABLED = "1"; }
     }
   });
-  test("target UID without a valid runtime fails before Docker creation", async () => {
-    const f = setup(); const { cc5: _unused, ...deps } = f.deps;
-    await assert.rejects(provisionV3Container(deps, 912), /cc5 fresh local binding/);
-    assert.equal(f.captured.containersCreated.length, 0); assert.equal(f.pool.rows[0]!.state, "vanished");
+  test("target UID without a valid runtime or with prepare failure degrades cc5 lane without blocking container creation", async () => {
+    const fMissing = setup(); const { cc5: _unused, ...depsMissing } = fMissing.deps;
+    const resMissing = await provisionV3Container(depsMissing, 912);
+    assert.equal(resMissing.dockerContainerId, fMissing.full);
+    assert.deepEqual(fMissing.order, ["create", "start"]);
+    assert.equal(fMissing.captured.containersCreated[0]!.HostConfig!.Binds!.some((v) => v.includes("cc5")), false);
+    assert.equal(fMissing.captured.containersCreated[0]!.Env!.some((v) => v.startsWith("OC_SELFHOST_CC5_")), false);
+
+    const fPrep = setup("prepare");
+    const resPrep = await provisionV3Container(fPrep.deps, 912);
+    assert.equal(resPrep.dockerContainerId, fPrep.full);
+    assert.deepEqual(fPrep.order, ["prepare", "release", "create", "start"]);
+    assert.deepEqual(fPrep.releaseRows, [String(fPrep.pool.rows[0]!.id)]);
+    assert.equal(fPrep.captured.containersCreated[0]!.HostConfig!.Binds!.some((v) => v.includes("cc5")), false);
+    assert.equal(fPrep.captured.containersCreated[0]!.Env!.some((v) => v.startsWith("OC_SELFHOST_CC5_")), false);
   });
-  for (const failure of ["prepare", "bind", "start", "tx2", "activate"] as const) {
+  for (const failure of ["bind", "start", "tx2", "activate"] as const) {
     test(`${failure} failure releases only the fresh row and still compensates Docker`, async () => {
       const f = setup(failure);
       await assert.rejects(provisionV3Container(f.deps, 912));
       assert.deepEqual(f.releaseRows, [String(f.pool.rows[0]!.id)]);
       assert.equal(f.pool.rows[0]!.state, "vanished");
-      if (failure !== "prepare") assert.ok(f.captured.removed > 0);
+      assert.ok(f.captured.removed > 0);
       if (failure === "tx2") assert.equal(f.order.includes("activate"), false);
     });
   }

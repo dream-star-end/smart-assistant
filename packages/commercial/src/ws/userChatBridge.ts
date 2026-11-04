@@ -1472,7 +1472,7 @@ export type CronOriginExecutorClaimResult =
   | { kind: "delivery_unknown" }
 
 
-export type CronOriginExecutor = (payload: {
+export type CronOriginExecutor = ((payload: {
   encoded: Buffer
   admitted: {
     clientMessageId: string
@@ -1487,7 +1487,10 @@ export type CronOriginExecutor = (payload: {
     anchorSeq: bigint | null
     requestHash: string
   }
-}) => CronOriginExecutorClaimResult | Promise<CronOriginExecutorClaimResult>
+}) => CronOriginExecutorClaimResult | Promise<CronOriginExecutorClaimResult>) & {
+  agentContainerId?: number | null
+  runtimeKind?: "docker" | "desktop" | null
+}
 
 export interface UserChatBridgeHandler {
   /** Gateway HTTP server 的 'upgrade' 事件入口。返 false → 路径不匹配,gateway 路由别处。 */
@@ -1635,6 +1638,7 @@ export async function executeCronOriginInject(opts: {
       ...(originModel ? { model: originModel } : {}),
     },
   };
+  const initialCarrier = executor ?? (getExecutors ? [...getExecutors()][0] : undefined);
   let admit;
   try {
     admit = await admitUserTurn({
@@ -1648,6 +1652,12 @@ export async function executeCronOriginInject(opts: {
       billingRequestId: ensureRequestIdServerSide(),
       dispatchId: randomUUID(),
       ownerId: `cron-origin:${input.clientMessageId}`,
+      ...(initialCarrier?.agentContainerId !== undefined && initialCarrier.agentContainerId !== null
+        ? { agentContainerId: initialCarrier.agentContainerId }
+        : {}),
+      ...(initialCarrier?.runtimeKind !== undefined && initialCarrier.runtimeKind !== null
+        ? { runtimeKind: initialCarrier.runtimeKind }
+        : {}),
       exclusiveSession: true,
       message,
     });
@@ -2957,6 +2967,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           );
           return receipt;
         };
+        if (containerId !== undefined) {
+          cronOriginExecutor.agentContainerId = containerId;
+          cronOriginExecutor.runtimeKind = endpoint.desktop ? "desktop" : "docker";
+        }
       }
       if (unregisterExecutors === null && (recoveryExecutor || cronOriginExecutor)) {
         unregisterExecutors = registerBridgeExecutors(uid, containerWs,
@@ -6022,6 +6036,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   attemptNo: dispatchRecord.attemptNo,
                   ownerId: dispatchRecord.leaseOwnerId,
                   leaseEpoch: dispatchRecord.leaseEpoch,
+                  ...(containerId !== undefined ? {
+                    agentContainerId: containerId,
+                    runtimeKind: endpoint.desktop ? 'desktop' : 'docker',
+                  } : {}),
                 });
               } catch (err) {
                 logCapture?.error('user-chat-bridge: cursor authority turn dispatch binding failed', { err, dispatchId: dispatchRecord.dispatchId });
@@ -7495,6 +7513,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   attemptNo: dispatchRecordC.attemptNo,
                   ownerId: dispatchRecordC.leaseOwnerId,
                   leaseEpoch: dispatchRecordC.leaseEpoch,
+                  ...(containerId !== undefined ? {
+                    agentContainerId: containerId,
+                    runtimeKind: endpoint.desktop ? "desktop" : "docker",
+                  } : {}),
                 });
               } catch (err) {
                 turnLogCapture?.error("user-chat-bridge: authority turn dispatch binding failed", {
@@ -8038,6 +8060,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         if (handleTurnDispatchReceipt(attestPeek, {
           pool: deps.pgPool, uid, admittedDispatches, enrichmentDispatches,
+          ...(containerId !== undefined ? {
+            agentContainerId: containerId,
+            runtimeKind: endpoint.desktop ? "desktop" : "docker",
+          } : {}),
           claimEnrichmentTerminalization, acceptEnrichmentReceipt, dropAdmittedDispatch,
           settleCronOriginClaim, noteDispatchStreamFrame,
           hasCronOriginClaim: (dispatchId) => cronOriginClaimWaiters.has(dispatchId),

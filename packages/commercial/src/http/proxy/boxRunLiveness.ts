@@ -74,7 +74,7 @@ for name in os.listdir('/proc'):
    c=os.stat(p+'/cwd')
    if (c.st_dev,c.st_ino) in dirs:
     print('alive '+boot);raise SystemExit(0)
- except (FileNotFoundError,ProcessLookupError):continue
+ except (FileNotFoundError,ProcessLookupError,PermissionError):continue
 print('absent '+boot)`;
 
 export type BoxRunLiveness = { state: "alive" | "absent" | "terminal"; boot: string };

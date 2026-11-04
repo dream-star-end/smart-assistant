@@ -1,5 +1,7 @@
 /** Resume observation of one *already launched* detached no-tool text run.
  * HTTP retries and background reconciliation share this read-only path. */
+import { rootLogger } from "../../logging/logger.js";
+import { boxFailureObservation } from "./boxFailureCause.js";
 import { isBoxApiUpstreamModel } from "@openclaude/protocol";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { observeBoxDetachedText } from "./boxDetachedTextObserve.js";
@@ -76,7 +78,9 @@ export async function observeBoxTextUnknown(input: {
       ...(id.nativeSessionId ? { trustedNativeSessionId: id.nativeSessionId } : {}),
       runNonce: id.runNonce,
       leaseEpoch: id.leaseEpoch, deadlineMs: budget, signal: pollAbort.signal }); }
-    catch {
+    catch (error) {
+      rootLogger.warn("box_text_transport_observation", { requestId: id.requestId,
+        ...boxFailureObservation(error, "stream") });
       // A keeper may have proved failure without ever producing a valid
       // Claude result line. Probe the immutable marker even after the spool
       // poll timed out; the spent HTTP signal must not hide that proof.

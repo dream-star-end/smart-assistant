@@ -24,8 +24,8 @@ import { CC5_BRIDGE_MAX_FRAME_BYTES, type Cc5BridgeBinding, assertCc5BindingScop
   cc5AuthorityMatchesBinding } from './cc5BridgePort.js'
 import type { Cc5FinancePort, Cc5FinanceTurn } from './cc5Finance.js'
 import { Cc5NativeUsageObserver } from './cc5NativeUsage.js'
-import { type Cc5ToolReceipt, assertCc5ToolResult, cc5ToolInputSha256,
-  cc5ToolScopeHash, validateCc5NativeToolInput } from './cc5NativeTool.js'
+import { CC5_TOOL_RECEIPT_MAX_BYTES, type Cc5ToolReceipt, assertCc5ToolResult, boundCc5ToolResult,
+  cc5ToolInputSha256, cc5ToolScopeHash, validateCc5NativeToolInput } from './cc5NativeTool.js'
 import { Cc5ToolObservation } from './cc5ToolObservation.js'
 import type { Cc5ToolDelivery } from './cc5ToolPump.js'
 
@@ -44,12 +44,12 @@ function requireRelay(ok: unknown): asserts ok {
 function sha(bytes: string | Buffer): string {
   return createHash('sha256').update(bytes).digest('hex')
 }
-async function jsonBody(req: IncomingMessage): Promise<Body> {
+async function jsonBody(req: IncomingMessage, maxBytes = 131072): Promise<Body> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
     size += chunk.length
-    requireRelay(size <= 131072)
+    requireRelay(size <= maxBytes)
     chunks.push(chunk)
   }
   const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
@@ -351,7 +351,8 @@ export class Cc5Relay {
   private async control(req: IncomingMessage, res: ServerResponse): Promise<void> {
     requireRelay(req.method === 'POST')
     if (req.url === '/session/open') return this.open(req, res)
-    const body = await jsonBody(req)
+    // A receipt carries one bounded tool result plus its identifiers and scope.
+    const body = await jsonBody(req, req.url === '/tool/result' ? CC5_TOOL_RECEIPT_MAX_BYTES : 131072)
     this.scope(body, req.url === '/stop' || req.url === '/tool/stopped')
     if (req.url === '/stop') {
       reply(res, { ok: true, ...(await this.stop()) })
@@ -450,6 +451,10 @@ export class Cc5Relay {
       this.verify(this.admitted.authority, this.admitted.lease, true)
       const pending = this.pending
       const receipt = body.receipt as Cc5ToolReceipt
+      // The wire receiver truncates instead of breaking the turn; the strict
+      // shape/scope checks below still decide whether the receipt is admitted.
+      if (receipt && typeof receipt === 'object' && !Array.isArray(receipt))
+        receipt.result = boundCc5ToolResult(receipt.result)
       const tool = pending.delivery.request
       assertCc5ToolResult(receipt?.result)
       requireRelay(

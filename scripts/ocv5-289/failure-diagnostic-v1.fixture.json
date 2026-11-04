@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "runNonce": "000000000000000000000000",
+  "leaseEpoch": "11111111111111111111111111111111",
+  "producer": "supervisor",
+  "stage": "child_exit",
+  "reason": "child_exit",
+  "cliExitCode": 1,
+  "cliSignal": null,
+  "httpStatus": 401,
+  "upstreamCode": "authentication",
+  "lastEvent": "result",
+  "stdoutBytes": 0,
+  "stderrBytes": 0,
+  "flags": {
+    "stderrTruncated": false,
+    "stdoutTruncated": false,
+    "parseFailed": false
+  }
+}

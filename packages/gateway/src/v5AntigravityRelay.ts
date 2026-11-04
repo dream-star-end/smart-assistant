@@ -53,6 +53,7 @@ export function readV5AntigravityRelayConfig(
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status
   res.setHeader('content-type', 'application/json; charset=utf-8')
+  res.setHeader('connection', 'close')
   res.end(JSON.stringify(body))
 }
 
@@ -105,6 +106,10 @@ export async function handleV5AntigravityRelayLocal(
       },
     )
     res.statusCode = upstream.status
+    // Loopback hop only: closing after each response prevents Go's net/http pool
+    // from holding an idle socket across a 5s+ tool execution window and racing
+    // Node's keepAliveTimeout (`read: connection reset by peer`).
+    res.setHeader('connection', 'close')
     upstream.headers.forEach((value, rawKey) => {
       const key = rawKey.toLowerCase()
       // fetch already decoded the body; a stale content-encoding would corrupt it.

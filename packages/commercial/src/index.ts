@@ -1,3 +1,4 @@
+import { createBoxFailureDiagnostics } from "./http/proxy/boxFailureDiagnostic.js";
 import { resolveContainerLinkEndpoint } from "./ws/containerLinkEndpoint.js";
 import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
@@ -2661,7 +2662,7 @@ export async function registerCommercial(
           },
         },
         loadUserModelAuthz,
-        createAdvisorCodexRoute: async ({ containerId, userId, modelId }) => {
+        createCodexDelegateRoute: async ({ containerId, userId, modelId }) => {
           const createRoute = commercialCodexRouteRef.current
           if (!createRoute) return { kind: 'unavailable' as const, reason: 'selector_unwired' }
           return selectAdvisorCodexAdmitRoute({
@@ -2672,7 +2673,7 @@ export async function registerCommercial(
             readBinding: (id) => advisorCodexRelayDb.readContainerBinding(id),
           })
         },
-        expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
+        expireCodexDelegateRoute: (token) => expireCodexRouteContext(token).then(() => {}),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
         logger: rootLogger.child({ subsys: "openTurnAttribution" }),
       });
@@ -6388,7 +6389,10 @@ export async function registerCommercial(
   if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
     // Local ProxyAgent cleanup state must outlive a temporary loss of shared
     // leadership. Only the scheduler starts/stops on each leader term.
+    const boxFailureDiagnostics = createBoxFailureDiagnostics(process.env.OC_PLATFORM_ROOT);
     const boxRemoteCleanup = new BoxRemoteCleanupWorker({
+      beforeCleanup: boxFailureDiagnostics?.beforeCleanup,
+      sweepDiagnostics: boxFailureDiagnostics ? () => boxFailureDiagnostics.sweep() : undefined,
       journal: new BoxDurableJournal(getPool()),
       resolver: createProductionBoxAccountResolver(),
       writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),

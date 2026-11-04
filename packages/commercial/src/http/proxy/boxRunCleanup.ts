@@ -87,6 +87,20 @@ try:
   os.unlink(name,dir_fd=run)
  os.fsync(run)
 finally:os.close(run)
+# Diagnostic metadata is independent of terminal/stop/replay proof. Delete only
+# this component's exact filenames after the caller's bounded collection.
+try:
+ diag=private_dir('/tmp/ocv5-289-proof-'+nonce)
+ try:
+  for name in os.listdir(diag):
+   if name!='failure.diag.json' and not re.fullmatch(r'failure\.diag\.[1-9][0-9]{0,9}\.tmp',name):continue
+   try:
+    st=private_file(diag,name)
+    if st.st_size<=8192:os.unlink(name,dir_fd=diag)
+   except (OSError,SystemExit):pass
+  os.fsync(diag)
+ finally:os.close(diag)
+except (OSError,SystemExit):pass
 if keep=='0':
  try:history=private_dir(project)
  except FileNotFoundError:history=None

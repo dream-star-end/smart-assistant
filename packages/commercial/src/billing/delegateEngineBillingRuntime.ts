@@ -52,7 +52,6 @@ const SESSION_ID_RE = DELEGATE_ENGINE_BILLING_SESSION_KEY_RE
 const PARENT_TURN_KEY_RE = /^[0-9a-f]{64}$/
 const MODEL_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
-const ADVISOR_AGENT_ID = 'advisor'
 
 export interface DelegateEngineCatalog {
   assertFresh(): Promise<ModelCatalogSnapshot>
@@ -76,17 +75,17 @@ export interface DelegateEngineBillingRuntimeDeps {
   releasePreCheckFn?: typeof releasePreCheck
   getAgentCostMultiplierFn?: typeof getAgentCostMultiplier
   /**
-   * Advisor-consult only. Regular delegate admits must not call this.
-   * Selection is metadata + short-lived api_relay context; 179 catalog/authz/
-   * price/precheck/journal stay unchanged.
+   * Master-issued Codex route for every codex delegate (OCV5-729) and for
+   * advisor consults. Selection is metadata + short-lived api_relay context;
+   * catalog/authz/price/precheck/journal stay unchanged.
    */
-  createAdvisorCodexRoute?: (args: {
+  createCodexDelegateRoute?: (args: {
     containerId: number
     userId: bigint
     modelId: string
     requestId: string
   }) => Promise<AdvisorCodexAdmitRoute>
-  expireAdvisorCodexRoute?: (token: string) => Promise<void> | void
+  expireCodexDelegateRoute?: (token: string) => Promise<void> | void
   attributeOpenTurnFn?: typeof attributeOpenTurn
   broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void
   logger?: { warn(msg: string, fields?: Record<string, unknown>): void }
@@ -276,12 +275,18 @@ export function createDelegateEngineBillingRuntime(
               deps.logger,
             )
         const openTurnColumns = parentTurnKey ? undefined : openTurnDispatchColumns(openTurn)
-        const advisorConsult = delegateAgentId === ADVISOR_AGENT_ID && engine === 'codex'
-        let advisorRoute: AdvisorCodexAdmitRoute | undefined
-        if (advisorConsult) {
+        // Every codex delegate needs a master-issued route (OCV5-729): the
+        // container's codex CLI is spawned with no provider override and would
+        // otherwise fall back to the built-in `openai` provider plus workspace
+        // routing discovery, which the relay allowlist rejects. Advisor
+        // consults use the same authority; the route stays master-signed and
+        // bound to this container/user/model.
+        const codexRouteRequired = engine === 'codex'
+        let codexRoute: AdvisorCodexAdmitRoute | undefined
+        if (codexRouteRequired) {
           try {
-            advisorRoute = deps.createAdvisorCodexRoute
-              ? await deps.createAdvisorCodexRoute({
+            codexRoute = deps.createCodexDelegateRoute
+              ? await deps.createCodexDelegateRoute({
                   containerId: identity.containerId,
                   userId,
                   modelId: canonical,
@@ -293,8 +298,8 @@ export function createDelegateEngineBillingRuntime(
             throw new Error('DELEGATE_ENGINE_BILLING_ROUTE_UNAVAILABLE')
           }
         }
-        const advisorRouteToken =
-          advisorRoute?.kind === 'api_relay' ? advisorRoute.token : undefined
+        const codexRouteToken =
+          codexRoute?.kind === 'api_relay' ? codexRoute.token : undefined
         try {
           const admitted = await runStartJournal(deps.getPool(), {
             requestId,
@@ -317,20 +322,22 @@ export function createDelegateEngineBillingRuntime(
                 securityEpoch: snapshot.securityEpoch.toString(),
               },
               engineSessionId,
-              ...(advisorRouteToken ? { advisorRouteToken } : {}),
-              ...(advisorRoute ? { advisorRouteKind: advisorRoute.kind } : {}),
+              // Historical key names, shared with advisor consults: settle and
+              // abandon recovery read them to expire api_relay routes.
+              ...(codexRouteToken ? { advisorRouteToken: codexRouteToken } : {}),
+              ...(codexRoute ? { advisorRouteKind: codexRoute.kind } : {}),
             },
           })
           if (!admitted) throw new Error('DELEGATE_ENGINE_BILLING_JOURNAL_CONFLICT')
         } catch (err) {
           await runReleasePreCheck(deps.preCheckRedis, precheck.reservation).catch(() => {})
-          if (advisorRouteToken) {
-            await Promise.resolve(deps.expireAdvisorCodexRoute?.(advisorRouteToken)).catch(() => {})
+          if (codexRouteToken) {
+            await Promise.resolve(deps.expireCodexDelegateRoute?.(codexRouteToken)).catch(() => {})
           }
           throw err
         }
-        if (advisorConsult) {
-          return { requestId, engineSessionId, route: advisorRoute }
+        if (codexRouteRequired) {
+          return { requestId, engineSessionId, route: codexRoute }
         }
         return { requestId, engineSessionId }
       }
@@ -392,7 +399,7 @@ export function createDelegateEngineBillingRuntime(
         )
         const settledRouteToken = journalString(journalRow.ctx, 'advisorRouteToken', ROUTE_TOKEN_RE)
         if (settledRouteToken) {
-          await Promise.resolve(deps.expireAdvisorCodexRoute?.(settledRouteToken)).catch(() => {})
+          await Promise.resolve(deps.expireCodexDelegateRoute?.(settledRouteToken)).catch(() => {})
         }
         return { settled: true }
       }
@@ -410,7 +417,7 @@ export function createDelegateEngineBillingRuntime(
         }).catch(() => {})
         const abandonedRouteToken = journalString(journalRow.ctx, 'advisorRouteToken', ROUTE_TOKEN_RE)
         if (abandonedRouteToken) {
-          await Promise.resolve(deps.expireAdvisorCodexRoute?.(abandonedRouteToken)).catch(() => {})
+          await Promise.resolve(deps.expireCodexDelegateRoute?.(abandonedRouteToken)).catch(() => {})
         }
         return { abandoned: true }
       }

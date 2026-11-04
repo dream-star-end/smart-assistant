@@ -124,4 +124,8 @@ test('enabled incomplete setup rejects rather than silently selecting the ordina
   assert.equal(selectMasterCc5Backend(undefined, input, false, env), undefined)
   assert.equal(selectMasterCc5Backend(undefined, { ...input, uid: 913 }, true, env), undefined)
   assert.equal(selectMasterCc5Backend(undefined, input, true, {}), undefined)
+  assert.equal(
+    selectMasterCc5Backend(undefined, { ...input, canonicalModel: 'gpt-5.4', engine: 'codex' }, true, env),
+    undefined,
+  )
 })

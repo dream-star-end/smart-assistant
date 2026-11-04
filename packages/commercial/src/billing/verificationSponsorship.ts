@@ -108,6 +108,8 @@ interface TurnDispatchAdmissionRow {
   owner_id: string | null;
   lease_epoch: string;
   lease_until: Date | null;
+  agent_container_id?: string | null;
+  runtime_kind?: string | null;
 }
 
 interface AuthorityTurnDispatchRow {
@@ -271,6 +273,8 @@ export async function bindAuthorityTurnDispatch(
     attemptNo: number;
     ownerId: string;
     leaseEpoch: number;
+    agentContainerId?: number | null;
+    runtimeKind?: string | null;
   },
 ): Promise<AuthorityTurnDispatchBinding> {
   if (
@@ -281,7 +285,8 @@ export async function bindAuthorityTurnDispatch(
     input.sessionId.length === 0 || input.sessionId.length > 256 ||
     !Number.isInteger(input.attemptNo) || input.attemptNo < 1 ||
     input.ownerId.length === 0 ||
-    !Number.isSafeInteger(input.leaseEpoch) || input.leaseEpoch < 0
+    !Number.isSafeInteger(input.leaseEpoch) || input.leaseEpoch < 0 ||
+    (input.agentContainerId !== undefined && input.agentContainerId !== null && (!Number.isSafeInteger(input.agentContainerId) || input.agentContainerId < 1))
   ) {
     throw new VerificationSponsorshipInvariantError("invalid authority turn dispatch identity");
   }
@@ -291,7 +296,7 @@ export async function bindAuthorityTurnDispatch(
     await client.query("BEGIN");
     const dispatch = await client.query<TurnDispatchAdmissionRow>(
       `SELECT user_id::text,session_id,model,attempt_no,status,owner_id,
-              lease_epoch::text,lease_until
+              lease_epoch::text,lease_until,agent_container_id::text,runtime_kind
          FROM turn_dispatches
         WHERE dispatch_id=$1
         FOR UPDATE`,
@@ -301,7 +306,14 @@ export async function bindAuthorityTurnDispatch(
     if (d === undefined) {
       throw new VerificationSponsorshipInvariantError("authority turn dispatch identity mismatch");
     }
+    const containerMatches =
+      input.agentContainerId === undefined ||
+      input.agentContainerId === null ||
+      d.agent_container_id === undefined ||
+      d.agent_container_id === null ||
+      String(d.agent_container_id) === String(input.agentContainerId);
     const coreMatches =
+      containerMatches &&
       d.user_id === input.userId.toString() &&
       d.session_id === input.sessionId &&
       d.attempt_no === input.attemptNo &&
@@ -324,7 +336,9 @@ export async function bindAuthorityTurnDispatch(
         `UPDATE turn_dispatches
             SET owner_id = $2,
                 lease_until = NOW() + ($3::bigint * INTERVAL '1 millisecond'),
-                model = $4
+                model = $4,
+                agent_container_id = COALESCE(agent_container_id, $9),
+                runtime_kind = COALESCE(runtime_kind, $10)
           WHERE dispatch_id = $1
             AND owner_id LIKE 'cron-origin:%'
             AND status = 'admitted'
@@ -333,7 +347,7 @@ export async function bindAuthorityTurnDispatch(
             AND attempt_no = $7
             AND lease_epoch = $8
           RETURNING user_id::text,session_id,model,attempt_no,status,owner_id,
-                    lease_epoch::text,lease_until`,
+                    lease_epoch::text,lease_until,agent_container_id::text,runtime_kind`,
         [
           input.dispatchId,
           input.ownerId,
@@ -343,6 +357,8 @@ export async function bindAuthorityTurnDispatch(
           input.sessionId,
           input.attemptNo,
           String(input.leaseEpoch),
+          input.agentContainerId ?? null,
+          input.runtimeKind ?? null,
         ],
       );
       if (adopted.rowCount !== 1 || adopted.rows[0] === undefined) {
@@ -358,6 +374,27 @@ export async function bindAuthorityTurnDispatch(
       ) {
         throw new VerificationSponsorshipInvariantError("authority turn dispatch identity mismatch");
       }
+    } else if (
+      input.agentContainerId !== undefined &&
+      input.agentContainerId !== null &&
+      "agent_container_id" in d &&
+      (d.agent_container_id === null || (input.runtimeKind !== undefined && input.runtimeKind !== null && d.runtime_kind === null))
+    ) {
+      // cron-origin turns retain their `cron-origin:<clientMessageId>` owner_id for
+      // receipt/heartbeat CAS, so dispatchMatches is true when model/lease match.
+      // Stamp the claiming container carrier atomically under the same FOR UPDATE lock.
+      await client.query(
+        `UPDATE turn_dispatches
+            SET agent_container_id = COALESCE(agent_container_id, $2),
+                runtime_kind = COALESCE(runtime_kind, $3)
+          WHERE dispatch_id = $1`,
+        [input.dispatchId, input.agentContainerId, input.runtimeKind ?? null],
+      );
+      d = {
+        ...d,
+        agent_container_id: d.agent_container_id ?? String(input.agentContainerId),
+        runtime_kind: d.runtime_kind ?? (input.runtimeKind ?? null),
+      };
     }
 
     await client.query(

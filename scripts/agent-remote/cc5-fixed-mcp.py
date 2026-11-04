@@ -16,6 +16,7 @@ import sys
 
 MAX_FRAME = 8 * 1024 * 1024
 MAX_REPLY = 163840
+# Must stay equal to the gateway's CC5_TOOL_RESULT_MAX_BYTES (128 KiB).
 MAX_RESULT = 131072
 SAFE_INTEGER = 2**53 - 1
 TOOLS = ('Read', 'Edit', 'Bash')
