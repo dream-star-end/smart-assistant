@@ -2620,7 +2620,7 @@ export async function runOneTurnWithRetry(
       // Only retry on transient errors (rate limit, server error, network)
       const isTransient =
         TRANSIENT_RETRY_ERROR_CODES.has(errorClass) ||
-        /AbortError|operation was aborted|timed?\s*out/i.test(msg)
+        (errorClass === 'unknown' && /AbortError|operation was aborted|timed?\s*out/i.test(msg))
       if (!isTransient || !canRetry()) throw err
       if (TRANSIENT_RETRY_ERROR_CODES.has(errorClass)) {
         const breaker = advanceTransientBreaker(

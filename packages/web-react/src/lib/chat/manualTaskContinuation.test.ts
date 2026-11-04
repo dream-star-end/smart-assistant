@@ -205,3 +205,14 @@ describe("recovery dispatch statuses remain raw while their intermediate view co
     }
   });
 });
+
+test("observation failure never offers blind continuation from assistant or terminal status", () => {
+  const user = { id: "u", role: "user", text: "写入一次", ts: 1 } as ChatMessage;
+  for (const role of ["assistant", "system"] as const) {
+    const error = { id: "e", role, text: "", ts: 2, _clientMessageId: "u",
+      _source: "server", _turnStatusRecord: role === "system", _dispatchTerminal: true,
+      _errorCode: "antigravity_start_observation_failed" } as ChatMessage;
+    expect(manualTaskContinuationSource([user, error], error)).toBeUndefined();
+    expect(manualTaskContinuationSource([user, error], { ...error, _errorCode: "engine_error" })).toBeUndefined();
+  }
+});

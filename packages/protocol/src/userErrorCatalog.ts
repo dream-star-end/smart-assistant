@@ -42,6 +42,7 @@ const TURN_COPY: Record<TurnErrorCode, readonly [UserErrorCategory, string]> = {
   engine_error: ['execution', '本轮执行遇到问题，请重试；如果再次失败，可以换模型或联系管理员。'],
   internal_error: ['execution', '服务暂时遇到问题，请重试；如果持续失败，请联系管理员。'],
   auth_error: ['auth', '模型服务认证暂时失败，请继续；如果持续失败，请联系管理员。'],
+  antigravity_start_observation_failed: ['execution', '执行进度同步失败，本轮可能已有操作完成，已停止自动重试。请先核对执行结果，再决定是否继续。'],
   platform_credential_expired: ['auth', '本轮模型访问凭证已过期，执行已停止。请在当前会话继续。'],
   box_capacity_held: ['capacity', '上一轮任务仍在收尾，本条消息尚未开始。请稍后继续。'],
   service_restart: ['execution', '服务重启打断了本轮任务，请继续。'],

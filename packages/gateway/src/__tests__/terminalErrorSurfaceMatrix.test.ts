@@ -143,6 +143,12 @@ const SCENARIOS: readonly Scenario[] = [
     why: 'E7 — 凭据坏了重试只会再 401,不进 TRANSIENT_RETRY_ERROR_CODES,立即给 relogin 引导',
   },
   {
+    code: 'antigravity_start_observation_failed',
+    sample: 'ANTIGRAVITY_START_OBSERVATION_FAILED: timeout waiting for cascade to start running',
+    attempts: 1,
+    why: 'CLI lost observation while tools may have executed: neither resolved nor thrown error may resubmit',
+  },
+  {
     code: 'platform_credential_expired',
     sample:
       'ANTIGRAVITY_CREDENTIAL_EXPIRED: agent executor error: generating and executing: request failed: Post \"http://127.0.0.1:18789/internal/v5/antigravity-relay/route/<route>/v1internal:streamGenerateContent?alt=sse\": oauth2: token expired and refresh token is not set',

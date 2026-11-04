@@ -117,6 +117,13 @@ const CLI_CREDENTIAL_EXPIRED_RE = /oauth2: token expired|refresh token is not se
  * to `platform_credential_expired` (no automatic recovery, precise copy).
  */
 export function normalizeAntigravityErrorDetail(detail: string): string {
+  if (detail.startsWith('ANTIGRAVITY_START_OBSERVATION_FAILED:')) return detail
+  // CLI 1.4.0 can execute a resumed large conversation while its print-mode
+  // observer sees no steps, then falsely reports startup timeout. Never replay
+  // this ambiguous execution as a generic transient upstream error.
+  if (/\btimeout waiting for cascade to start running\b/i.test(detail)) {
+    return `ANTIGRAVITY_START_OBSERVATION_FAILED: ${detail}`
+  }
   if (detail.startsWith('ANTIGRAVITY_CREDENTIAL_EXPIRED:')) return detail
   return CLI_CREDENTIAL_EXPIRED_RE.test(detail) ? `ANTIGRAVITY_CREDENTIAL_EXPIRED: ${detail}` : detail
 }

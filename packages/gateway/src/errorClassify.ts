@@ -32,6 +32,7 @@ export type ClassifiedErrorCode =
   | 'bad_request'
   | 'auth_error'
   | 'platform_credential_expired'
+  | 'antigravity_start_observation_failed'
   | 'box_capacity_held'
   | 'unknown'
 
@@ -57,6 +58,11 @@ const PATTERNS: Array<{
   code: Exclude<ClassifiedErrorCode, 'unknown'>
   message: string
 }> = [
+  {
+    re: /\bANTIGRAVITY_START_OBSERVATION_FAILED\b|\btimeout waiting for cascade to start running\b/i,
+    code: 'antigravity_start_observation_failed',
+    message: '执行进度同步失败，本轮可能已有操作完成，已停止自动重试。请先核对执行结果，再决定是否继续。',
+  },
   {
     re: /BODY_FIELD_TOO_LARGE|PAYLOAD_TOO_LARGE|BOX_CONTEXT_TOO_LARGE|\bRequest too large\b|本轮资料未能完整处理|这轮资料暂时无法完整处理/i,
     code: 'request_too_large',

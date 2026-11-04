@@ -799,6 +799,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   internal_error: "服务遇到内部错误，你的消息已保留，可以在当前会话继续。",
   auth_error: "认证状态异常，本轮未正常完成，可以继续。",
   box_capacity_held: "上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。",
+  antigravity_start_observation_failed: "执行进度同步失败，本轮可能已有操作完成，已停止自动重试。请先核对执行结果，再决定是否继续。",
   platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
   service_restart: "服务正在更新，本轮已中断，可以继续。",
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。可以在当前会话继续。",

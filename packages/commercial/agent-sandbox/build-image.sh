@@ -91,8 +91,8 @@ GROK_VERSION="1.0.62"
 ZCODE_APPIMAGE_VERSION="3.15.3"
 ZCODE_APPIMAGE_SHA256="2edc79650fcff72358670af4ffbfbf7d979ba95476611a80ad1151d577e90fe3"
 ZCODE_CLI_VERSION="${OC_ZCODE_CLI_VERSION:-0.16.9}"
-# OCV5-415: build id + sha512 are pinned in the Dockerfile; only 1.4.0 exists there.
-ANTIGRAVITY_CLI_VERSION="1.4.0"
+# OCV5-415: build id + sha512 are pinned in the Dockerfile; 1.5.0 fixes large-history resume observation.
+ANTIGRAVITY_CLI_VERSION="1.5.0"
 
 # The image tag is a deployment handle and may be chosen before the final source commit.
 # Bind the image to the exact staged source independently so activation can reject a stale
