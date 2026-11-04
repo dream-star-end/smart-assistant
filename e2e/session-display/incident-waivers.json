@@ -355,6 +355,12 @@
       "reason": "OCV5-738: 修复 PR #1373 独立审计发现的 4 项委派 Antigravity 计费守恒问题（external_billing 权威终态、冻结价格快照结算、暂不可结算回退重试、并发 mint 互斥）与 2 项清理 warning。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
       "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "94a039f8ea3476a5493e9571a1f9817c5f417679",
+      "reason": "OCV5-738: 修复 PR #1373 第 2 轮独立审计指出的 liveExternalBilling TS 控制流收窄与跨实例并发 mint 持久化回查兜底及单测。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
     }
   ]
 }
