@@ -349,6 +349,12 @@
       "reason": "OCV5-738: 委派到 antigravity 引擎时由 master 签发 relay route（mint/renew/release），并把 settle/abandon 对账并入同一 requestId。属于委派路由功能修复，不是 turn 展示/红卡/重试事故修复；只新增 selfhost-only 内部端点、route 透传与 503 fail-closed，不改 runner、tape、会话展示。",
       "approvedBy": "user 2026-11-04 OCV5-738 委派任务：实施 antigravity 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署、不重启服务",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "16f62434694c4cf0d01e07afd966025edcb242a6",
+      "reason": "OCV5-738: 修复 PR #1373 独立审计发现的 4 项委派 Antigravity 计费守恒问题（external_billing 权威终态、冻结价格快照结算、暂不可结算回退重试、并发 mint 互斥）与 2 项清理 warning。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
     }
   ]
 }
