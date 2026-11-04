@@ -2545,7 +2545,7 @@ export async function _runDelegateTaskCore(
             status: externalBillingStatus,
             durationMs: Math.max(0, Date.now() - turnStartedAt),
             ...(liveExternalBilling?.terminalCode
-              ? { terminalCode: liveExternalBilling.terminalCode as DurableCodexBilling['terminalCode'] }
+              ? { terminalCode: liveExternalBilling.terminalCode as 'USER_CANCELLED' | 'CODEX_ERROR' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE' | 'ENGINE_ERROR' }
               : {}),
           })
         } catch (err) {
