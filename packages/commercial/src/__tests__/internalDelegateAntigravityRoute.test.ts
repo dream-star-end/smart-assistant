@@ -496,4 +496,85 @@ describe('internalDelegateAntigravityRoute', () => {
     assert.deepEqual(abandoned, [], 'loser must not abandon winner turn')
     assert.deepEqual(released, [], 'loser must not release winner in-flight slot')
   })
+
+  test('cross-instance persist race loser only expires its own token when winner bound a token or verification query fails (Blocker 4)', async () => {
+    // Case 1: second SELECT shows another winner already persisted antigravityRouteToken
+    {
+      const winnerRow = journalRow({
+        ctx: {
+          source: 'delegate_antigravity',
+          model: 'antigravity-claude-sonnet-5.5',
+          antigravityRouteToken: 'ff'.repeat(32),
+        },
+      })
+      const { pool } = makePool({ row: [journalRow(), winnerRow], persistRows: 0 })
+      const expired: string[] = []
+      const abandoned: string[] = []
+      const released: string[] = []
+      const handler = makeHandler({
+        pool,
+        expireRoute: async (token: string) => {
+          expired.push(token)
+        },
+        abandonTurn: async (_pool: unknown, requestId: string) => {
+          abandoned.push(requestId)
+        },
+        releaseInflightFn: (requestId: string) => {
+          released.push(requestId)
+        },
+      })
+      await withServer(handler, async (port) => {
+        const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+          requestId: REQUEST_ID,
+        })
+        assert.equal(res.status, 409)
+        assert.equal(res.json.error.code, 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED')
+      })
+      assert.deepEqual(expired, [ROUTE_TOKEN])
+      assert.deepEqual(abandoned, [])
+      assert.deepEqual(released, [])
+    }
+    // Case 2: second SELECT throws transient DB error -> ownership unknown, do not touch shared requestId
+    {
+      let selectCalls = 0
+      const pool = {
+        async query(sql: string) {
+          if (sql.includes('SELECT')) {
+            selectCalls += 1
+            if (selectCalls === 1) return { rows: [journalRow()], rowCount: 1 }
+            throw new Error('verification query failed')
+          }
+          if (sql.includes('UPDATE request_finalize_journal')) {
+            return { rows: [], rowCount: 0 }
+          }
+          return { rows: [], rowCount: 0 }
+        },
+      }
+      const expired: string[] = []
+      const abandoned: string[] = []
+      const released: string[] = []
+      const handler = makeHandler({
+        pool,
+        expireRoute: async (token: string) => {
+          expired.push(token)
+        },
+        abandonTurn: async (_pool: unknown, requestId: string) => {
+          abandoned.push(requestId)
+        },
+        releaseInflightFn: (requestId: string) => {
+          released.push(requestId)
+        },
+      })
+      await withServer(handler, async (port) => {
+        const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+          requestId: REQUEST_ID,
+        })
+        assert.equal(res.status, 503)
+        assert.equal(res.json.error.code, 'ANTIGRAVITY_ROUTE_PERSIST_FAILED')
+      })
+      assert.deepEqual(expired, [ROUTE_TOKEN])
+      assert.deepEqual(abandoned, [])
+      assert.deepEqual(released, [])
+    }
+  })
 })

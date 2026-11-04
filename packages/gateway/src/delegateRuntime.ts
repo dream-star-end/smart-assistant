@@ -1941,8 +1941,7 @@ export async function _runDelegateTaskCore(
   // (e.g. budgetStop reports status:'success' even though the turn's
   // error string is non-empty, because the usage already consumed up to
   // the budget cutoff must still be billed, clamped to balance by master).
-  let liveExternalBilling: { status: 'success' | 'error' | 'unavailable'; terminalCode?: string } | null =
-    null
+  let liveExternalBilling = null as { status: 'success' | 'error' | 'unavailable'; terminalCode?: string } | null
   if (engineReported) {
     billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
     if (!billingModel) {

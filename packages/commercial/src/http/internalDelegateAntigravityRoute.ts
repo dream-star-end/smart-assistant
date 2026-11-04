@@ -315,25 +315,38 @@ export function makeDelegateAntigravityRouteHandler(
         }
         if (persisted.rows.length !== 1) {
           // If another process won the persist race and already bound a
-          // routeToken onto this journal, only expire our own orphan token so we
+          // routeToken onto this journal — or if the verification query fails
+          // so ownership is unknown — only expire our own orphan token so we
           // never abandon the winner's turn or release the winner's in-flight slot.
-          let winnerMinted = false
+          let shouldCleanupShared = false
+          let lookupFailed = false
           try {
             const latest = await deps.pool.query(
               'SELECT ctx FROM request_finalize_journal WHERE request_id=$1',
               [journalRequestId],
             )
             const latestCtx = (latest.rows[0] as { ctx?: Record<string, unknown> } | undefined)?.ctx
-            winnerMinted =
+            const winnerMinted =
               typeof latestCtx?.antigravityRouteToken === 'string' &&
               latestCtx.antigravityRouteToken !== minted.token
+            shouldCleanupShared = !winnerMinted
           } catch {
-            winnerMinted = false
+            lookupFailed = true
+            shouldCleanupShared = false
           }
-          if (winnerMinted) {
-            await runExpire(minted.token).catch(() => {})
-          } else {
+          if (shouldCleanupShared) {
             await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
+          } else {
+            await runExpire(minted.token).catch(() => {})
+          }
+          if (lookupFailed) {
+            sendJson(res, 503, {
+              error: {
+                code: 'ANTIGRAVITY_ROUTE_PERSIST_FAILED',
+                message: 'journal persist verification failed',
+              },
+            })
+            return
           }
           sendJson(res, 409, {
             error: {

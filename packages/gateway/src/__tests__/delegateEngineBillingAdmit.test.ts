@@ -566,4 +566,32 @@ describe('handleDelegateTask antigravity delegate route (OCV5-738)', () => {
       gw.sessions.submit = origSubmit
     }
   })
+
+  it('(m) session 初始化抛错时释放 antigravityRouteLease 并 abandon 账本 (Blocker 3)', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    let released = 0
+    gw._acquireDelegateAntigravityRoute = async () => ({
+      ok: true as const,
+      lease: {
+        route: antigravityRoute(),
+        routeToken: ANTIGRAVITY_ROUTE_TOKEN,
+        release: async () => {
+          released += 1
+        },
+      },
+    })
+    const origGetOrCreate = gw.sessions.getOrCreate
+    gw.sessions.getOrCreate = async () => {
+      throw new Error('session init failed')
+    }
+    try {
+      const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+      assert.equal(r.status, 500)
+      assert.equal(released, 1, 'antigravityRouteLease must be released on session init error')
+      assert.deepEqual(billing.abandons, [REQUEST_ID])
+    } finally {
+      gw.sessions.getOrCreate = origGetOrCreate
+    }
+  })
 })
