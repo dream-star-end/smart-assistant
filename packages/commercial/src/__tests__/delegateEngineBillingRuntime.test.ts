@@ -250,7 +250,7 @@ function makeRuntime(opts?: {
       abortCalls.push(requestId)
       return true
     },
-    createAdvisorCodexRoute: opts?.advisorRouteThrow
+    createCodexDelegateRoute: opts?.advisorRouteThrow
       ? async (args) => {
           advisorRouteCalls.push(args)
           throw opts.advisorRouteThrow
@@ -261,7 +261,7 @@ function makeRuntime(opts?: {
             return typeof opts.advisorRoute === 'function' ? opts.advisorRoute() : opts.advisorRoute!
           }
         : undefined,
-    expireAdvisorCodexRoute: async (token) => {
+    expireCodexDelegateRoute: async (token) => {
       expireCalls.push(token)
     },
     releasePreCheckFn: async (redis, reservation) => {
@@ -321,7 +321,7 @@ it('paused preset delegate identity rejects nongrok overrides before side effect
           catalog: { assertFresh: forbidden('catalog') }, loadUserModelAuthz: forbidden('authz'),
           newRequestId: forbidden('request-id'), getAgentCostMultiplierFn: forbidden('multiplier'),
           preCheckWithCostFn: forbidden('precheck'), startInflightJournalFn: forbidden('journal'),
-          attributeOpenTurnFn: forbidden('open-turn'), createAdvisorCodexRoute: forbidden('advisor-route'),
+          attributeOpenTurnFn: forbidden('open-turn'), createCodexDelegateRoute: forbidden('codex-route'),
         });
         return { calls, runtime };
       };
@@ -380,7 +380,9 @@ it('paused preset delegate identity rejects nongrok overrides before side effect
 
 describe('delegate engine-billing runtime', () => {
   it('admits a codex delegate with source + attribution in journal ctx', async () => {
-    const { runtime, journalCalls } = makeRuntime()
+    const { runtime, journalCalls } = makeRuntime({
+      advisorRoute: { kind: 'official_oauth', groupId: '9' },
+    })
     const result = await runtime.handle({
       path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
       identity: IDENTITY,
@@ -396,7 +398,8 @@ describe('delegate engine-billing runtime', () => {
     })
     assert.equal(result.requestId, REQUEST_ID)
     assert.match(String(result.engineSessionId), /^oceng-[0-9a-f]{48}$/)
-    assert.equal('route' in result, false)
+    // OCV5-729: codex delegates must carry the master-issued route.
+    assert.deepEqual(result.route, { kind: 'official_oauth', groupId: '9' })
     const ctx = journalCalls[0] as {
       model: string
       ctxJson: Record<string, unknown>
@@ -1088,6 +1091,39 @@ describe('delegate engine-billing admit uses one fenced snapshot', () => {
     assert.equal(stillFrozen.input_per_mtok, 111n)
     assert.equal(stillFrozen.multiplier, '3.000')
     assert.notEqual(stillFrozen.input_per_mtok, later.billingPricingFor('gpt-5.6-sol')?.input_per_mtok)
+  })
+
+  it('regular codex delegate gets the same master-issued route (OCV5-729)', async () => {
+    const { runtime, advisorRouteCalls, journalCalls } = makeRuntime({
+      advisorRoute: { kind: 'official_oauth', groupId: '9' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody(),
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.deepEqual(result.route, { kind: 'official_oauth', groupId: '9' })
+    assert.equal(advisorRouteCalls.length, 1)
+    assert.equal((advisorRouteCalls[0] as { modelId: string }).modelId, 'gpt-5.6-sol')
+    assert.equal(
+      (journalCalls[0] as { ctxJson: { advisorRouteKind: string } }).ctxJson.advisorRouteKind,
+      'official_oauth',
+    )
+  })
+
+  it('grok delegate never requests a codex delegate route (OCV5-729)', async () => {
+    const { runtime, advisorRouteCalls } = makeRuntime({
+      advisorRoute: { kind: 'official_oauth', groupId: '9' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ model: 'grok-build', engine: 'grok' }),
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(advisorRouteCalls.length, 0)
+    assert.equal('route' in result, false)
   })
 
   it('advisor official_oauth returns kind metadata without a hardcoded loopback URL', async () => {

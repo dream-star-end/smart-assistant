@@ -93,6 +93,9 @@ import {
   shouldMintDelegateGrokRoute,
   type DelegateGrokRouteLease,
 } from './delegateGrokRoute.js'
+import { _buildCodexAdmitRouteOverride } from './routeOverrides.js'
+import { parseAdvisorAdmitRoute } from './advisorCodexRoute.js'
+import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   defaultDelegateEngineBilling,
   mapDelegateEngineBillingError,
@@ -1917,10 +1920,12 @@ export async function _runDelegateTaskCore(
     agentModel: execAgent.model,
   })
   let engineBillingAdmission: DelegateEngineBillingAdmission | null = null
+  let billingModel: string | undefined
+  let billingEngine: 'codex' | 'grok' | undefined
   let liveEngineBilling: DurableCodexBilling | null = null
   let liveSettleTask: Promise<void> | null = null
   if (engineReported) {
-    const billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
+    billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
     if (!billingModel) {
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
@@ -1931,13 +1936,14 @@ export async function _runDelegateTaskCore(
         message: 'engine-reported 委派暂不可用: missing model id',
       }
     }
+    billingEngine = resolveDelegateEngineBillingEngine({
+      delegateEngine: delegateExec?.engine,
+      model: billingModel,
+    })
     try {
       engineBillingAdmission = await billingApi.admit({
         model: billingModel,
-        engine: resolveDelegateEngineBillingEngine({
-          delegateEngine: delegateExec?.engine,
-          model: billingModel,
-        }),
+        engine: billingEngine,
         agentId: targetAgentId,
         delegateAgentId: targetAgentId,
         sessionKey,
@@ -1964,6 +1970,48 @@ export async function _runDelegateTaskCore(
     }
   }
   if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
+  // codex 委派必须有 master 签发的 provider route(OCV5-729):容器里的 codex
+  // CLI 没有任何 baked `model_providers.*`,裸起会退回内建 `openai` provider
+  // 的 workspace routing discovery,被 relay allowlist 404 → 整轮失败。route
+  // 由 master admit 签发并绑定本容器/用户/模型;不可用即 fail-closed,禁止裸起。
+  let codexRoute: CodexProviderConfigOverride | null = null
+  if (billingEngine === 'codex' && engineBillingAdmission && billingModel) {
+    const parsedRoute = parseAdvisorAdmitRoute(engineBillingAdmission.route)
+    codexRoute = parsedRoute.ok
+      ? _buildCodexAdmitRouteOverride({
+          route: parsedRoute.route,
+          agentId: targetAgentId,
+          model: billingModel,
+          officialRelayPort: this.deps.config.gateway.port,
+          ...(delegateExec?.engine === 'codex' && delegateExec.canonicalModel
+            ? {
+                authority: {
+                  canonicalModel: delegateExec.canonicalModel,
+                  engine: 'codex' as const,
+                },
+              }
+            : {}),
+        })
+      : null
+    if (!codexRoute) {
+      this.log.warn('delegate_codex_route_unavailable', {
+        targetAgentId,
+        model: billingModel,
+        reason: parsedRoute.ok ? 'projection_failed' : parsedRoute.reason,
+      })
+      await (this._delegateEngineBilling ?? defaultDelegateEngineBilling)
+        .abandon(engineBillingAdmission.requestId)
+        .catch(() => {})
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return {
+        kind: 'rejected',
+        httpStatus: 503,
+        message: 'Codex 委派路由不可用（master 未签发 provider route），未启动',
+      }
+    }
+  }
   // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
   // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
   const durableTranscript: unknown[] = []
@@ -2227,7 +2275,7 @@ export async function _runDelegateTaskCore(
     engineBillingAdmission?.requestId,
     input.traceId,
     undefined,
-    { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
+    { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}), ...(codexRoute ? { codexRoute } : {}) },
   )
   try {
     await Promise.race([submitPromise, timeoutPromise])

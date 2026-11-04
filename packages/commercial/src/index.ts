@@ -2662,7 +2662,7 @@ export async function registerCommercial(
           },
         },
         loadUserModelAuthz,
-        createAdvisorCodexRoute: async ({ containerId, userId, modelId }) => {
+        createCodexDelegateRoute: async ({ containerId, userId, modelId }) => {
           const createRoute = commercialCodexRouteRef.current
           if (!createRoute) return { kind: 'unavailable' as const, reason: 'selector_unwired' }
           return selectAdvisorCodexAdmitRoute({
@@ -2673,7 +2673,7 @@ export async function registerCommercial(
             readBinding: (id) => advisorCodexRelayDb.readContainerBinding(id),
           })
         },
-        expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
+        expireCodexDelegateRoute: (token) => expireCodexRouteContext(token).then(() => {}),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
         logger: rootLogger.child({ subsys: "openTurnAttribution" }),
       });
