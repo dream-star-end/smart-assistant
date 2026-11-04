@@ -5,5 +5,19 @@
     "ticket": "OCV5-491",
     "reason": "verbatim port of the commercial Box incident proofs gate (OCV5-488); both trees keep the file identical for two-tree sync, so it is split in both trees together with the OCV5-491 selfhost Box catch-up; OCV5-488 PR-2 adds the process-absent and idle-stop proofs and PR-3 the container-rebuilt and any-refusal proofs; OCV5-557 (+26) replaces fixed sleeps with bounded waits (stop arrival, process exit, stdin close) and adds the [gate-failure] line the release retry reads; OCV5-583 (+5) pins the idle proof's incarnation start past the grace (CI runner uptime made it red) — split stays with OCV5-491",
     "expires": "2026-11-16"
+  },
+  {
+    "path": "packages/commercial/src/index.ts",
+    "maxLines": 7825,
+    "ticket": "OCV5-738",
+    "reason": "OCV5-738 mounts the selfhost-only delegate Antigravity route handler (mint/renew/release) alongside the existing delegate Grok mount; the base branch is already 3 lines over the 7800 cap (7700 baseline + 100 slack), so splitting the mount alone cannot pass. Handler construction and routing stay in index.ts until the commercial bootstrap split lands; remove once index.ts is decomposed.",
+    "expires": "2026-12-04"
+  },
+  {
+    "path": "packages/gateway/src/delegateRuntime.ts",
+    "maxLines": 3105,
+    "ticket": "OCV5-738",
+    "reason": "OCV5-738 adds the Antigravity delegate branch (route acquisition, safe projection, 503 fail-closed with journal abandon/slot release, and exactly-once settle/abandon) next to the Codex/Grok branches; the base branch is already 5 lines over the 3000 absolute limit, and the branch is deliberately kept beside its Codex twin for auditability. Extract to a helper module when the delegate runtime split lands.",
+    "expires": "2026-12-04"
   }
 ]
