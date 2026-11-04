@@ -26,6 +26,8 @@ interface DispatchRow {
   owner_id: string | null;
   lease_epoch: string;
   lease_until: Date | null;
+  agent_container_id?: string | null;
+  runtime_kind?: string | null;
 }
 
 function baseRow(over: Partial<DispatchRow> = {}): DispatchRow {
@@ -38,6 +40,8 @@ function baseRow(over: Partial<DispatchRow> = {}): DispatchRow {
     owner_id: `${CRON_ORIGIN_OWNER_PREFIX}cmid-31`,
     lease_epoch: "0",
     lease_until: null,
+    agent_container_id: null,
+    runtime_kind: null,
     ...over,
   };
 }
@@ -104,10 +108,24 @@ function fakePool(opts: {
               owner_id: String(params[1]),
               lease_until: new Date(Date.now() + DISPATCH_LEASE_TTL_MS),
               model: (params[3] as string | null) ?? null,
+              agent_container_id:
+                store.row.agent_container_id ?? (params[8] != null ? String(params[8]) : null),
+              runtime_kind:
+                store.row.runtime_kind ?? ((params[9] as string | null) ?? null),
             };
             return { rowCount: 1, rows: [{ ...store.row }] };
           }
           return { rowCount: 0, rows: [] };
+        }
+        if (text.includes("UPDATE turn_dispatches") && text.includes("agent_container_id = COALESCE")) {
+          store.row = {
+            ...store.row,
+            agent_container_id:
+              store.row.agent_container_id ?? (params[1] != null ? String(params[1]) : null),
+            runtime_kind:
+              store.row.runtime_kind ?? ((params[2] as string | null) ?? null),
+          };
+          return { rowCount: 1, rows: [] };
         }
         if (text.includes("INSERT INTO authority_turn_dispatches")) {
           mappings.push({
@@ -243,5 +261,70 @@ describe("bindAuthorityTurnDispatch cron-origin adoption", () => {
       (x) => x.status === "rejected" && x.reason instanceof VerificationSponsorshipInvariantError,
     ));
     assert.ok(store.row.owner_id === "conn-a" || store.row.owner_id === "conn-b");
+  });
+
+  test("stamps agentContainerId and runtimeKind when cron-origin owner is preserved", async () => {
+    const cronOwner = `${CRON_ORIGIN_OWNER_PREFIX}dlgcb-dlgjob-1`;
+    const { pool, store, sql } = fakePool({
+      row: baseRow({
+        owner_id: cronOwner,
+        model: CANONICAL,
+        lease_until: new Date(Date.now() + 60_000),
+        agent_container_id: null,
+        runtime_kind: null,
+      }),
+    });
+    await bindAuthorityTurnDispatch(
+      pool,
+      bindInput({
+        ownerId: cronOwner,
+        dispatchModel: CANONICAL,
+        agentContainerId: 7143,
+        runtimeKind: "docker",
+      }),
+    );
+    assert.equal(store.row.owner_id, cronOwner);
+    assert.equal(store.row.agent_container_id, "7143");
+    assert.equal(store.row.runtime_kind, "docker");
+    assert.ok(sql.some((s) => s.includes("agent_container_id = COALESCE")));
+  });
+
+  test("stamps agentContainerId and runtimeKind during cron-origin adoption", async () => {
+    const { pool, store } = fakePool({ row: baseRow() });
+    await bindAuthorityTurnDispatch(
+      pool,
+      bindInput({
+        dispatchModel: CANONICAL,
+        agentContainerId: 7143,
+        runtimeKind: "docker",
+      }),
+    );
+    assert.equal(store.row.owner_id, "conn-live");
+    assert.equal(store.row.agent_container_id, "7143");
+    assert.equal(store.row.runtime_kind, "docker");
+  });
+
+  test("rejects when turn_dispatches is bound to a different agent_container_id", async () => {
+    const { pool, store } = fakePool({
+      row: baseRow({
+        owner_id: "conn-live",
+        model: CANONICAL,
+        lease_until: new Date(Date.now() + 60_000),
+        agent_container_id: "9999",
+        runtime_kind: "docker",
+      }),
+    });
+    await assert.rejects(
+      bindAuthorityTurnDispatch(
+        pool,
+        bindInput({
+          dispatchModel: CANONICAL,
+          agentContainerId: 7143,
+          runtimeKind: "docker",
+        }),
+      ),
+      VerificationSponsorshipInvariantError,
+    );
+    assert.equal(store.row.agent_container_id, "9999");
   });
 });

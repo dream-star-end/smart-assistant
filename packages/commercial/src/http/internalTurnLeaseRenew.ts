@@ -166,11 +166,27 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
         active.terminal_at !== null || active.producer_fenced_at !== null ||
         active.attempt_no !== active.dispatch_attempt_no ||
         active.canonical_model !== lease.canonicalModel ||
-        active.agent_container_id !== String(identity.containerId)
+        (active.agent_container_id !== null && active.agent_container_id !== String(identity.containerId))
       )) {
         await client.query('ROLLBACK')
         sendJson(res, 409, { error: { code: 'TURN_NOT_ACTIVE', message: 'active turn identity rejected' } })
         return
+      }
+      if (active && active.agent_container_id === null) {
+        // Pre-carrier cron-origin rows were admitted before a container id was
+        // stamped on turn_dispatches, while the Master-signed lease already
+        // binds (uid, containerId, authorityTurnId). Heal the row under lock.
+        await client.query(
+          `UPDATE turn_dispatches td
+              SET agent_container_id = $3,
+                  runtime_kind = COALESCE(runtime_kind, 'docker')
+             FROM authority_turn_dispatches atd
+            WHERE atd.authority_turn_id = $1
+              AND atd.user_id = $2
+              AND td.dispatch_id = atd.dispatch_id
+              AND td.agent_container_id IS NULL`,
+          [lease.authorityTurnId, identity.userId, identity.containerId],
+        )
       }
       // Expired signatures authenticate identity only. A historical journal
       // can never reactivate a completed/revoked dispatch.

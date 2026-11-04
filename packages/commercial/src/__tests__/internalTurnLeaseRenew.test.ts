@@ -45,12 +45,14 @@ function mint(signer: AuthoritySigner) {
 }
 interface DbOpts {
   terminal?: boolean; waived?: boolean; dispatch?: boolean; turnKey?: string | null
-  status?: string; containerId?: number; canonicalModel?: string; dispatchAttemptNo?: number
+  status?: string; containerId?: number | null; canonicalModel?: string; dispatchAttemptNo?: number
   fenced?: boolean; epoch?: bigint; conflicting?: boolean; matching?: boolean; bindable?: string[]
 }
 function fakePool(opts: DbOpts = {}) {
   const sql: Array<{ text: string; params: readonly unknown[] }> = []
   let boundKey = opts.turnKey === undefined ? TURN_KEY : opts.turnKey
+  let boundContainerId: string | null =
+    opts.containerId === null ? null : String(opts.containerId ?? 7)
   const client = {
     async query(raw: any, params: readonly unknown[] = []) {
       const text = (typeof raw === 'string' ? raw : raw.text).replace(/\s+/g, ' ').trim()
@@ -68,8 +70,13 @@ function fakePool(opts: DbOpts = {}) {
           attempt_no: 1, dispatch_attempt_no: opts.dispatchAttemptNo ?? 1,
           status: opts.status ?? 'accepted', terminal_at: null,
           producer_fenced_at: opts.fenced ? new Date(ORIGINAL) : null,
-          agent_container_id: String(opts.containerId ?? 7),
+          agent_container_id: boundContainerId,
         }] : [] }
+      }
+      if (/UPDATE turn_dispatches td/.test(text)) {
+        if (boundContainerId !== null) return { rowCount: 0, rows: [] }
+        boundContainerId = String(params[2])
+        return { rowCount: 1, rows: [] }
       }
       if (/FROM request_finalize_journal/.test(text))
         return { rowCount: 1, rows: [{ conflicting: opts.conflicting ?? false,
@@ -194,4 +201,17 @@ test('legacy experimental originalIssuedAt is stripped while current short windo
   assert.equal(res.statusCode, 200)
   assert.equal(verifyTurnLease(res.json().lease, signer.publicKeyring(),
     ORIGINAL + 24 * 60 * 60_000).originalIssuedAt, undefined)
+})
+test('cron-origin dispatch with null agent_container_id heals container binding and renews lease', async () => {
+  const signer = AuthoritySigner.createEphemeral(); const initial = mint(signer)
+  const now = ORIGINAL + 30 * 60_000
+  const { res, sql } = await run(signer, initial.bundle.lease, now, { containerId: null })
+  assert.equal(res.statusCode, 200)
+  const renewed = verifyTurnLease(res.json().lease, signer.publicKeyring(), now)
+  assert.equal(renewed.authorityTurnId, initial.lease.authorityTurnId)
+  assert.equal(renewed.expiresAt, now + TURN_LEASE_TTL_MS)
+  const heal = sql.find((q) => /UPDATE turn_dispatches td/.test(q.text))
+  assert.ok(heal, 'heals null agent_container_id on turn_dispatches')
+  assert.deepEqual(heal.params, [initial.lease.authorityTurnId, 42, 7])
+  assert.equal(sql.at(-1)?.text, 'COMMIT')
 })

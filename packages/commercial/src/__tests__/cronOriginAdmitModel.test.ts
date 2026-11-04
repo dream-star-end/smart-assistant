@@ -294,4 +294,24 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
     assert.deepEqual(result, { kind: "failed", reason: "dispatch_rejected" });
     assert.equal(secondCalls, 0);
   });
+
+  test("executor carrier metadata stamps agentContainerId and runtimeKind at admission", async () => {
+    const admits: AdmitUserTurnInput[] = [];
+    const executor: CronOriginExecutor = Object.assign(
+      () => ({ kind: "claimed" as const }),
+      { agentContainerId: 7143, runtimeKind: "docker" as const },
+    );
+    const result = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (admitInput) => {
+        admits.push(admitInput);
+        return fakeAdmitted(admitInput);
+      },
+      getExecutors: () => [executor],
+    });
+    assert.equal(result.kind, "injected");
+    assert.equal(admits.length, 1);
+    assert.equal(admits[0]!.agentContainerId, 7143);
+    assert.equal(admits[0]!.runtimeKind, "docker");
+  });
 });
