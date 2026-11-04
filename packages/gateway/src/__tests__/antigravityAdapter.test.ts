@@ -1179,3 +1179,118 @@ describe('Antigravity stale result error after a failed launch (OCV5-556)', () =
     }
   })
 })
+
+describe('Antigravity terminal answer delivery', () => {
+  async function terminalFixture(h: Harness, response: string, deltas: string[] = [], errorStep = false) {
+    const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
+    const events = [
+      { event: 'init', conversation_id: id },
+      { event: 'step_update', step_update: { conversation_id: id, step_index: 0, state: 'DONE', step_type: 'user_input' } },
+      ...deltas.map(text_delta => ({ event: 'step_update', step_update: {
+        conversation_id: id, step_index: 1, state: 'ACTIVE', step_type: 'agent_response', text_delta,
+      } })),
+      ...(errorStep ? [{ event: 'step_update', step_update: {
+        conversation_id: id, step_index: 2, state: 'DONE', step_type: 'error_message', error: { message: 'current request failed' },
+      } }] : []),
+      { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response } },
+    ]
+    const file = path.join(h.dir, 'terminal-answer.ndjson')
+    await writeFile(file, events.map(e => JSON.stringify(e)).join('\n') + '\n')
+    return file
+  }
+
+  for (const [name, deltas, response, expected] of [
+    ['terminal-only', [], 'CURRENT_ANSWER', 'CURRENT_ANSWER'],
+    ['partial prefix', ['CURRENT_'], 'CURRENT_ANSWER', 'CURRENT_ANSWER'],
+    ['already streamed', ['CURRENT_', 'ANSWER'], 'CURRENT_ANSWER', 'CURRENT_ANSWER'],
+    ['unrelated terminal snapshot', ['CURRENT_ANSWER'], 'OLD_ANSWER', 'CURRENT_ANSWER'],
+  ] as Array<[string, string[], string, string]>) {
+    test(name + ' delivers one answer in blocks and durable summary', async () => {
+      const h = await harness()
+      try {
+        h.adapter.setAntigravityRoute(ROUTE)
+        const billing: any[] = []
+        h.adapter.on('external_billing', event => billing.push(event))
+        const { summary, events, sessionIds } = await runTurn(h, await terminalFixture(h, response, deltas))
+        assert.equal(summary?.isError, false)
+        assert.equal(summary?.assistantText, expected)
+        assert.equal(summary?.assistantSegments.map(s => s.text).join(''), expected)
+        assert.equal(events.filter(e => e.kind === 'block' && e.block.kind === 'text')
+          .map(e => e.kind === 'block' && e.block.kind === 'text' ? e.block.text : '').join(''), expected)
+        assert.equal(events.filter(e => e.kind === 'final').length, 1)
+        assert.equal(billing.length, 1)
+        assert.equal(billing[0].status, 'success')
+        assert.equal(sessionIds.length, 1)
+      } finally { await h.restore() }
+    })
+  }
+
+  test('terminal response cannot erase a current error or change failed billing', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const billing: any[] = []
+      h.adapter.on('external_billing', event => billing.push(event))
+      const { summary, events, sessionIds } = await runTurn(h, await terminalFixture(h, 'STALE_FINAL', [], true))
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /current request failed/)
+      assert.equal(summary?.assistantText, '')
+      assert.equal(events.filter(e => e.kind === 'block' && e.block.kind === 'text').length, 0)
+      assert.deepEqual(sessionIds, [])
+      assert.equal(billing.length, 1)
+      assert.equal(billing[0].status, 'error')
+    } finally { await h.restore() }
+  })
+})
+
+describe('Antigravity current launch event isolation', () => {
+  test('old text and tools cannot wash a current error or add usage', async () => {
+    const h = await harness({ resumeSessionId: '4187c78c-e96d-4840-8c1c-3de86f92ddd9' })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const conversation_id = '4187c78c-e96d-4840-8c1c-3de86f92ddd9'
+      const file = path.join(h.dir, 'old-step-pollution.ndjson')
+      const steps = [
+        { step_index: 10, step_type: 'user_input' },
+        { step_index: 11, step_type: 'error_message', error: { message: 'CURRENT_FAILURE' } },
+        { step_index: 2, step_type: 'agent_response', text_delta: 'OLD_REPLY', usage: { input_tokens: 100, output_tokens: 50 } },
+        { step_index: 3, step_type: 'tool', tool_info: { name: 'run_command', parameters: { CommandLine: 'old command' } }, output: 'OLD_TOOL' },
+      ]
+      await writeFile(file, [
+        { event: 'init', conversation_id },
+        ...steps.map(s => ({ event: 'step_update', step_update: { conversation_id, state: 'DONE', ...s } })),
+        { event: 'result', result: { conversation_id, status: 'SUCCESS', response: '' } },
+      ].map(s => JSON.stringify(s)).join('\n') + '\n')
+      const billing: any[] = []
+      h.adapter.on('external_billing', e => billing.push(e))
+      const { summary, events, sessionIds } = await runTurn(h, file)
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /CURRENT_FAILURE/)
+      assert.equal(summary?.assistantText, '')
+      assert.equal(summary?.tools.length, 0)
+      assert.equal(summary?.usage.outputTokens, 0)
+      assert.equal(events.filter(e => e.kind === 'block').length, 0)
+      assert.deepEqual(sessionIds, [])
+      assert.equal(billing.length, 1)
+      assert.equal(billing[0].status, 'error')
+    } finally { await h.restore() }
+  })
+
+  test('replayed DONE does not count the same step usage twice', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const original = (await readFile(path.join(FIXTURES, 'stream-text.ndjson'), 'utf8')).trim().split('\n')
+      const result = original.pop()!
+      const done = JSON.parse(original.at(-1)!)
+      done.step_update.text_delta = ''
+      const file = path.join(h.dir, 'done-replayed.ndjson')
+      await writeFile(file, [...original, JSON.stringify(done), result].join('\n') + '\n')
+      const { summary, events } = await runTurn(h, file)
+      assert.equal(summary?.assistantText, 'Alpha Beta Gamma.\n')
+      assert.equal(summary?.usage.inputTokens, 100)
+      assert.equal(summary?.usage.outputTokens, 14)
+      assert.equal(events.filter(e => e.kind === 'usage').length, 1)
+    } finally { await h.restore() }
+  })
+})

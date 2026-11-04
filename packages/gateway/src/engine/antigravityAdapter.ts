@@ -177,6 +177,11 @@ interface TurnContext {
   errorDetail: string | null
   /** step_index of this launch's own user_input; earlier indices are history. */
   firstOwnStepIndex: number | null
+  usageSteps: Set<number>
+  inputBytes: number
+  stdoutEvents: number
+  stepEvents: number
+  resultResponseBytes: number
   /** error_message seen before this launch's user_input; used only if the run fails. */
   preludeErrorDetail: string | null
   /** This launch's last step was an error_message (1.4.0 streams it without text). */
@@ -361,6 +366,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       interruptReason: null,
       errorDetail: null,
       firstOwnStepIndex: null,
+      usageSteps: new Set(),
+      inputBytes: 0,
+      stdoutEvents: 0,
+      stepEvents: 0,
+      resultResponseBytes: 0,
       preludeErrorDetail: null,
       trailingErrorStep: false,
       trailingErrorDetail: null,
@@ -521,6 +531,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx: TurnContext,
     spec: { bin: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string; line: string },
   ): void {
+    ctx.inputBytes = Buffer.byteLength(spec.line, 'utf8')
     ctx.timing.once('spawn_requested')
     ctx.resumedLaunch = spec.args.includes('--conversation')
     const proc = spawn(spec.bin, spec.args, {
@@ -664,6 +675,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       return
     }
     if (ctx.terminal) return
+    ctx.stdoutEvents += 1
     if (event.event === 'init') {
       ctx.timing.once('cli_init_received')
       const id = asText(event.conversation_id)
@@ -671,6 +683,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       return
     }
     if (event.event === 'step_update') {
+      ctx.stepEvents += 1
       const step = recordOf(event.step_update)
       if (step) this.handleStep(ctx, step)
       return
@@ -681,6 +694,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private handleStep(ctx: TurnContext, step: Record<string, unknown>): void {
+    const stepConversation = asText(step.conversation_id)
+    if (stepConversation && ctx.conversationId && stepConversation !== ctx.conversationId) return
     const type = asText(step.step_type)
     const state = asText(step.state)
     const stepIndex = typeof step.step_index === 'number' && Number.isSafeInteger(step.step_index)
@@ -689,11 +704,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'user_input' && ctx.firstOwnStepIndex === null && stepIndex !== null) {
       ctx.firstOwnStepIndex = stepIndex
     }
+    // All product effects use the same launch boundary, not just error steps.
+    // Old output must never clear a current failure or duplicate a tool/usage.
+    if (stepIndex !== null && ctx.firstOwnStepIndex !== null && stepIndex < ctx.firstOwnStepIndex) return
     if (type === 'agent_response') {
       const delta = typeof step.text_delta === 'string' ? step.text_delta : ''
       if (delta) this.appendText(ctx, delta)
       const usage = recordOf(step.usage)
-      if (state === 'DONE' && usage) {
+      if (state === 'DONE' && usage && (stepIndex === null || !ctx.usageSteps.has(stepIndex))) {
+        if (stepIndex !== null) ctx.usageSteps.add(stepIndex)
         // Per-call usage. result.usage is cumulative across --conversation.
         ctx.usage.inputTokens += count(usage.input_tokens)
         ctx.usage.outputTokens += count(usage.output_tokens)
@@ -893,6 +912,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     ctx.pendingResult = null
+    ctx.resultResponseBytes = Buffer.byteLength(asText(result.response), 'utf8')
     let status = asText(result.status)
     // OCV5-556: once a launch of a conversation failed (e.g. relay
     // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
@@ -933,6 +953,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         ctx.errorDetail = EMPTY_RUN_RE.test(ctx.stderr)
           ? `ANTIGRAVITY_EMPTY_RUN: ${ctx.stderr.trim().slice(0, 500)}`
           : 'ANTIGRAVITY_EMPTY_RUN: CLI reported success with no output'
+      }
+    }
+    // A terminal response is an alternate delivery channel, not evidence that
+    // erases a current error. Reconcile only after error/cancellation/denial
+    // adjudication, through the same durable text path used by streaming.
+    if (!ctx.interrupted && ctx.errorDetail === null) {
+      const response = asText(result.response)
+      if (response.trim() && response.startsWith(ctx.assistantText)) {
+        const missing = response.slice(ctx.assistantText.length)
+        if (missing) this.appendText(ctx, missing)
       }
     }
     // Commit only a conversation whose turn landed. On failure or cancel the
@@ -980,6 +1010,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         ? 'Antigravity turn cancelled' : 'Antigravity turn interrupted by system'
     }
     if (ctx.errorDetail !== null) ctx.errorDetail = normalizeAntigravityErrorDetail(ctx.errorDetail)
+    log.info('antigravity turn delivery', {
+      sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId,
+      conversationId: ctx.conversationId, resumed: ctx.resumedLaunch,
+      firstOwnStepIndex: ctx.firstOwnStepIndex, inputBytes: ctx.inputBytes,
+      stdoutEvents: ctx.stdoutEvents, stepEvents: ctx.stepEvents,
+      textBytes: Buffer.byteLength(ctx.assistantText, 'utf8'),
+      resultResponseBytes: ctx.resultResponseBytes, tools: ctx.tools.size,
+      exitCode: ctx.exitCode, interrupted: ctx.interrupted,
+      failed: ctx.errorDetail !== null,
+    })
     const isError = ctx.errorDetail !== null
     const stopReason = ctx.interrupted ? 'interrupted' : isError ? 'error' : 'end_turn'
     ctx.params.sessionTotals.turns += 1
