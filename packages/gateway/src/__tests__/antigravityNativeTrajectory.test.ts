@@ -66,7 +66,8 @@ test('fresh launch recovers exact UTF-8 answer, leaves SQLite bytes unchanged, a
 })
 
 test('resume baseline excludes old round and binds exact new stdin, not prompt snippets', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   insert(db, 0, user('old')); insert(db, 1, final({ response: 'old', modified_response: 'old' }))
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   assert.equal(binding.baseline, 1)
@@ -75,7 +76,8 @@ test('resume baseline excludes old round and binds exact new stdin, not prompt s
 })
 
 test('tool call must have one subsequent terminal result, terminal ERROR is not unfinished', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   insert(db, 0, user())
   insert(db, 1, final({ response: '', modified_response: '', tool_calls: [{ id: 'call-1', name: 'write_file' }] }))
@@ -98,7 +100,7 @@ const invalidCases: [string, (db: Database.Database) => void][] = [
   ['unknown enum', db => { insert(db, 0, user()); insert(db, 1, final({ stop_reason: 999 })) }],
   ['canceled stop', db => { insert(db, 0, user()); insert(db, 1, final({ stop_reason: 16 })) }],
   ['max tokens stop', db => { insert(db, 0, user()); insert(db, 1, final({ stop_reason: 3 })) }],
-  ['missing stop', db => { insert(db, 0, user()); const s = final(); delete (s.planner_response as Record<string, unknown>).stop_reason; insert(db, 1, s) }],
+  ['missing stop', db => { insert(db, 0, user()); const s = final(); Reflect.deleteProperty(s.planner_response as Record<string, unknown>, 'stop_reason'); insert(db, 1, s) }],
   ['unknown field', db => { insert(db, 0, user()); insert(db, 1, final(), { payload: Buffer.concat([Buffer.from(stepType.encode(final()).finish()), Buffer.from([0xf8, 0x7f, 1])]) }) }],
   ['truncated message', db => { insert(db, 0, user()); insert(db, 1, final(), { payload: Buffer.from(stepType.encode(final()).finish()).subarray(0, -1) }) }],
   ['duplicate singular field', db => { insert(db, 0, user()); insert(db, 1, final(), { payload: Buffer.concat([Buffer.from(stepType.encode(final()).finish()), Buffer.from([8, 15])]) }) }],
@@ -112,7 +114,8 @@ const invalidCases: [string, (db: Database.Database) => void][] = [
 ]
 for (const [name, populate] of invalidCases) test(`fail closed: ${name}`, async t => {
   // Exercise the invalid payload itself, not an unrelated fresh-file clock fence.
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   assert.equal(binding.baseline, -1)
   populate(db); db.close()
@@ -122,7 +125,8 @@ for (const [name, populate] of invalidCases) test(`fail closed: ${name}`, async 
 for (const which of ['response', 'modified_response']) test(`accept sole ${which}`, async t => {
   // Isolate answer selection from the fresh-file timestamp fence using an empty
   // resume database (baseline -1). Fresh-launch behavior has separate coverage.
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   assert.equal(binding.baseline, -1)
   insert(db, 0, user()); insert(db, 1, final({ response: '', modified_response: '', [which]: ANSWER })); db.close()
@@ -130,7 +134,8 @@ for (const which of ['response', 'modified_response']) test(`accept sole ${which
 })
 
 test('hash unknown still exposes resume MAX(idx), but cannot recover', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   insert(db, 0, user()); insert(db, 1, final())
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, { verifyBinary: async () => false })
   assert.equal(binding.baseline, 1); assert.equal(binding.binaryVerified, false)
@@ -139,14 +144,16 @@ test('hash unknown still exposes resume MAX(idx), but cannot recover', async t =
 })
 
 test('unknown baseline disables recovery without creating a missing DB', async t => {
-  const f = await fixture(t), binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
+  const f = await fixture(t)
+  const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   assert.equal(binding.baseline, null)
   assert.equal((await recover(binding, ID, ID)).ok, false)
   await assert.rejects(readFile(f.filename), { code: 'ENOENT' })
 })
 
 test('fresh launch cannot recover a DB present at prepare even with identical prompt', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   insert(db, 0, user()); insert(db, 1, final()); db.close()
   const binding = await prepare(f.input, deps)
   assert.deepEqual(await recover(binding, ID, ID), { ok: false, reason: 'preexisting-conversation' })
@@ -154,7 +161,8 @@ test('fresh launch cannot recover a DB present at prepare even with identical pr
 
 test('fresh launch rejects an older DB moved into directory after prepare', async t => {
   const f = await fixture(t)
-  const staging = path.join(f.dir, 'old.db'), db = createDb(staging)
+  const staging = path.join(f.dir, 'old.db')
+  const db = createDb(staging)
   insert(db, 0, user()); insert(db, 1, final()); db.close()
   await new Promise(resolve => setTimeout(resolve, 15))
   const binding = await prepare(f.input, deps)
@@ -163,7 +171,8 @@ test('fresh launch rejects an older DB moved into directory after prepare', asyn
 })
 
 test('resume rejects unchanged old round, baseline rewrite, replaced DB, and mismatched IDs', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   insert(db, 0, user()); insert(db, 1, final())
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   assert.equal((await recover(binding, ID, ID)).ok, false)
@@ -192,7 +201,8 @@ test('read failures, bad schema, symlinks and verifier exceptions never escape',
 })
 
 test('binary verifier streams content, detects replacement and missing path, no process needed', async t => {
-  const f = await fixture(t), binary = f.input.cliPath
+  const f = await fixture(t)
+  const binary = f.input.cliPath
   await writeFile(binary, 'first content')
   assert.equal(await verifyAntigravityNativeBinary(binary, hash('first content')), true)
   assert.equal(await verifyAntigravityNativeBinary(binary), false) // cached pinned-hash rejection
@@ -215,7 +225,8 @@ test('binary identity is reverified at recovery, dependency failure fails closed
 
 
 test('strict protobuf validation rejects unterminated 10-byte DONE varint rather than truncating to 3', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   insert(db, 0, user())
   const good = Buffer.from(stepType.encode(final()).finish())
@@ -228,7 +239,8 @@ test('strict protobuf validation rejects unterminated 10-byte DONE varint rather
 })
 
 test('fresh missing conversations directory stays read-only and still exposes -1', async t => {
-  const f = await fixture(t), missing = path.join(f.dir, 'nested', 'conversations')
+  const f = await fixture(t)
+  const missing = path.join(f.dir, 'nested', 'conversations')
   const binding = await prepare({ ...f.input, conversationsDir: missing }, deps)
   assert.equal(binding.baseline, -1)
   await assert.rejects(readFile(missing), { code: 'ENOENT' })
@@ -238,7 +250,8 @@ test('fresh missing conversations directory stays read-only and still exposes -1
 
 
 test('overlong status cannot redirect standard decoder into thinking_signature bytes', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   insert(db, 0, user())
   const corrupt = Buffer.concat([
@@ -251,7 +264,8 @@ test('overlong status cannot redirect standard decoder into thinking_signature b
 })
 
 test('valid signed int32 remains accepted while an overflowing int32 is rejected', async t => {
-  const f = await fixture(t), db = createDb(f.filename)
+  const f = await fixture(t)
+  const db = createDb(f.filename)
   const binding = await prepare({ ...f.input, requestedResumeId: ID }, deps)
   insert(db, 0, user())
   insert(db, 1, { ...final(), metadata: { flow_credits_used: -1 } })

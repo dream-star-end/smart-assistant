@@ -256,8 +256,8 @@ describe('P1 local relay lifecycle and safe diagnostics', () => {
     const finished = new Promise<void>((resolve) => { done = resolve })
     let cancelled = false
     let response: import('node:http').ServerResponse | undefined
-    let originalFinishListeners: Function[] = []
-    let originalCloseListeners: Function[] = []
+    let originalFinishListeners: unknown[] = []
+    let originalCloseListeners: unknown[] = []
     const logs: Array<Record<string, unknown>> = []
     const server = createServer((req, res) => {
       response = res

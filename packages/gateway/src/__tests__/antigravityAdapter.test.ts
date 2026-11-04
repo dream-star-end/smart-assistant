@@ -123,7 +123,7 @@ interface Harness {
 async function seedNativeBaseline(dir: string, id: string): Promise<string> {
   const conversations = path.join(dir, 'openclaude-home', 'antigravity-cli', 'home', '.gemini', 'antigravity-cli', 'conversations')
   await mkdir(conversations, { recursive: true })
-  const file = path.join(conversations, id + '.db')
+  const file = path.join(conversations, `${id}.db`)
   const db = new Database(file)
   db.exec('CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, step_payload BLOB, step_format INTEGER NOT NULL DEFAULT 0)')
   db.close()
@@ -1219,7 +1219,7 @@ describe('Antigravity terminal answer delivery', () => {
       { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response } },
     ]
     const file = path.join(h.dir, 'terminal-answer.ndjson')
-    await writeFile(file, events.map(e => JSON.stringify(e)).join('\n') + '\n')
+    await writeFile(file, `${events.map(e => JSON.stringify(e)).join('\n')}\n`)
     return file
   }
 
@@ -1229,7 +1229,7 @@ describe('Antigravity terminal answer delivery', () => {
     ['already streamed', ['CURRENT_', 'ANSWER'], 'CURRENT_ANSWER', 'CURRENT_ANSWER'],
     ['unrelated terminal snapshot', ['CURRENT_ANSWER'], 'OLD_ANSWER', 'CURRENT_ANSWER'],
   ] as Array<[string, string[], string, string]>) {
-    test(name + ' delivers one answer in blocks and durable summary', async () => {
+    test(`${name} delivers one answer in blocks and durable summary`, async () => {
       const h = await harness()
       try {
         h.adapter.setAntigravityRoute(ROUTE)
@@ -1293,11 +1293,11 @@ describe('Antigravity current launch event isolation', () => {
         { step_index: 2, step_type: 'agent_response', text_delta: 'OLD_REPLY', usage: { input_tokens: 100, output_tokens: 50 } },
         { step_index: 3, step_type: 'tool', tool_info: { name: 'run_command', parameters: { CommandLine: 'old command' } }, output: 'OLD_TOOL' },
       ]
-      await writeFile(file, [
+      await writeFile(file, `${[
         { event: 'init', conversation_id },
         ...steps.map(s => ({ event: 'step_update', step_update: { conversation_id, state: 'DONE', ...s } })),
         { event: 'result', result: { conversation_id, status: 'SUCCESS', response: '' } },
-      ].map(s => JSON.stringify(s)).join('\n') + '\n')
+      ].map(s => JSON.stringify(s)).join('\n')}\n`)
       const billing: any[] = []
       h.adapter.on('external_billing', e => billing.push(e))
       const { summary, events, sessionIds } = await runTurn(h, file)
@@ -1322,7 +1322,7 @@ describe('Antigravity current launch event isolation', () => {
       const done = JSON.parse(original.at(-1)!)
       done.step_update.text_delta = ''
       const file = path.join(h.dir, 'done-replayed.ndjson')
-      await writeFile(file, [...original, JSON.stringify(done), result].join('\n') + '\n')
+      await writeFile(file, `${[...original, JSON.stringify(done), result].join('\n')}\n`)
       const { summary, events } = await runTurn(h, file)
       assert.equal(summary?.assistantText, 'Alpha Beta Gamma.\n')
       assert.equal(summary?.usage.inputTokens, 100)
@@ -1336,10 +1336,10 @@ describe('Antigravity empty-result close barrier', () => {
   async function emptyFixture(h: Harness) {
     const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
     const file = path.join(h.dir, 'empty-delayed.ndjson')
-    await writeFile(file, [
+    await writeFile(file, `${[
       { event: 'init', conversation_id: id },
       { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '' } },
-    ].map(e => JSON.stringify(e)).join('\n') + '\n')
+    ].map(e => JSON.stringify(e)).join('\n')}\n`)
     return file
   }
 
@@ -1386,11 +1386,11 @@ describe('Antigravity verified recovery lifecycle', () => {
   const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
   async function writeResult(h: Harness, result: Record<string, unknown> = {}) {
     const file = path.join(h.dir, 'native-result.ndjson')
-    await writeFile(file, [
+    await writeFile(file, `${[
       { event: 'init', conversation_id: id },
       { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '', ...result } },
       { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '' } },
-    ].map(e => JSON.stringify(e)).join('\n') + '\n')
+    ].map(e => JSON.stringify(e)).join('\n')}\n`)
     return file
   }
   const recovered = { ok: true as const, text: 'VERIFIED_NATIVE_ANSWER', stepIndex: 3, hash: 'a'.repeat(64) }
@@ -1423,7 +1423,7 @@ describe('Antigravity verified recovery lifecycle', () => {
   })
 
   for (const retiredBy of ['cancel', 'end'] as const) {
-    test(retiredBy + ' during asynchronous native recovery cannot deliver late text', async () => {
+    test(`${retiredBy} during asynchronous native recovery cannot deliver late text`, async () => {
       let entered!: () => void
       let release!: () => void
       const started = new Promise<void>(r => { entered = r })
@@ -1464,7 +1464,7 @@ describe('Antigravity verified recovery lifecycle', () => {
   }
 
   for (const failure of ['nonzero-exit', 'canceled-result', 'soft-denied', 'mismatched-result'] as const) {
-    test(failure + ' never consults native recovery', async () => {
+    test(`${failure} never consults native recovery`, async () => {
       let calls = 0
       const h = await harness({}, { nativeTrajectory: {
         prepare: prepareAntigravityNativeTrajectory,
@@ -1493,7 +1493,7 @@ describe('Antigravity verified recovery lifecycle', () => {
       db.prepare('INSERT INTO steps (idx) VALUES (?)').run(9)
       db.close()
       const file = path.join(h.dir, 'replayed-first-user.ndjson')
-      await writeFile(file, [
+      await writeFile(file, `${[
         { event: 'init', conversation_id: id },
         ...[
           { step_index: 0, step_type: 'user_input' },
@@ -1503,7 +1503,7 @@ describe('Antigravity verified recovery lifecycle', () => {
           { step_index: 2, step_type: 'agent_response', text_delta: 'OLD_ANSWER' },
         ].map(step => ({ event: 'step_update', step_update: { conversation_id: id, state: 'DONE', ...step } })),
         { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '' } },
-      ].map(e => JSON.stringify(e)).join('\n') + '\n')
+      ].map(e => JSON.stringify(e)).join('\n')}\n`)
       const { summary } = await runTurn(h, file)
       assert.equal(summary?.isError, true)
       assert.match(summary?.errorDetail ?? '', /CURRENT_FAILURE/)
@@ -1532,19 +1532,19 @@ describe('Antigravity verified recovery lifecycle', () => {
 
 describe('Antigravity unindexed resumed errors', () => {
   for (const index of [null, -1, 11]) {
-    test((index === null ? 'unindexed' : index < 0 ? 'invalid-index' : 'indexed') + ' error after the current input cannot become a billable terminal-only success', async () => {
+    test(`${index === null ? 'unindexed' : index < 0 ? 'invalid-index' : 'indexed'} error after the current input cannot become a billable terminal-only success`, async () => {
       const id = '63f1f880-9ff7-459a-9585-a40781030fa3'
       const h = await harness({ resumeSessionId: id })
       try {
         h.adapter.setAntigravityRoute(ROUTE)
         const file = path.join(h.dir, 'current-error.ndjson')
-        await writeFile(file, [
+        await writeFile(file, `${[
           { event: 'init', conversation_id: id },
           { event: 'step_update', step_update: { conversation_id: id, step_type: 'user_input', step_index: 10, state: 'DONE' } },
           { event: 'step_update', step_update: { conversation_id: id, step_type: 'error_message', state: 'ERROR',
             ...(index === null ? {} : { step_index: index }), error: { message: 'CURRENT_UNINDEXED_FAILURE' } } },
           { event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: 'DO_NOT_DELIVER' } },
-        ].map(e => JSON.stringify(e)).join('\n') + '\n')
+        ].map(e => JSON.stringify(e)).join('\n')}\n`)
         const billing: any[] = []
         h.adapter.on('external_billing', e => billing.push(e))
         const { summary, events, sessionIds } = await runTurn(h, file)

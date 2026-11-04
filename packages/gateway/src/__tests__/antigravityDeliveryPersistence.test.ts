@@ -68,9 +68,9 @@ const MODEL = 'antigravity-gemini-3.8-flash'
 // Kept inline so this test owns its whole fixture. This executable really
 // starts a process and performs one file append, rather than mocking spawn.
 // Repeated terminal frames do NOT repeat the side effect or add text deltas.
-const FAKE_CLI = `#!/usr/bin/env node
+const FAKE_CLI = `#!${process.execPath}
 const fs = require('node:fs')
-fs.appendFileSync(__dirname + '/spawns.ndjson', JSON.stringify({ pid: process.pid, home: process.env.HOME }) + '\\n')
+fs.appendFileSync(__dirname + '/spawns.ndjson', JSON.stringify({ pid: process.pid, home: process.env.HOME, execPath: process.execPath, nodeVersion: process.version, modules: process.versions.modules }) + '\\n')
 let input = ''
 let ran = false
 process.stdin.setEncoding('utf8')
@@ -245,6 +245,9 @@ for (const deliveryMode of ['terminal-response-only', 'native-only'] as const) f
       const spawns = (await readFile(path.join(dir, 'spawns.ndjson'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
       assert.equal(spawns.length, 1, 'must not retry the CLI')
       assert.notEqual(spawns[0].pid, process.pid, 'real child process, not an in-process fake runner')
+      assert.equal(spawns[0].execPath, process.execPath, 'safe PATH must not select a different Node ABI')
+      assert.equal(spawns[0].nodeVersion, process.version)
+      assert.equal(spawns[0].modules, process.versions.modules)
       assert.ok(path.resolve(spawns[0].home).startsWith(root + path.sep), 'CLI HOME must also be isolated')
       assert.equal(await readFile(path.join(dir, 'effects.txt'), 'utf8'), 'effect\n', 'one actual tool side effect')
       assert.match(await readFile(path.join(dir, 'input.json'), 'utf8'), /完成一次文件操作并回复/)
