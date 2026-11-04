@@ -559,3 +559,60 @@ test('admitted authority may expire while the current lease still permits tool d
     assert.equal(readdirSync(join(f.root, 'relay-journal', f.a.authorityTurnId)).filter((name) => name.endsWith('-completed.json')).length, 2)
   } finally { Date.now = realNow; s.req.destroy(); await h.close(); f.cleanup() }
 })
+
+
+const RESULT_LIMIT = 128 * 1024
+/** Wire bytes for these single-text-block fixtures: key order is already sorted. */
+const resultBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value))
+
+async function receiveToolResult(
+  f: ReturnType<typeof fixture>,
+  h: Awaited<ReturnType<typeof harness>>,
+  id: string,
+  rpcId: number,
+  result: Cc5ToolReceipt['result'],
+) {
+  const remote = rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
+    rpcId, toolUseId: id, name: f.request.name, arguments: f.request.arguments,
+    inputSha256: cc5ToolInputSha256(f.request.arguments) })
+  void remote.catch(() => {})
+  await until(() => readdirSync(join(f.root, 'relay-journal', f.a.authorityTurnId)).some((name) => name.endsWith('-attempt.json')))
+  h.output.write(original(f, [{ id }]))
+  const { delivery } = await rpc(h.socketPath, '/tool/next', h.scope)
+  const receipt: Cc5ToolReceipt = { version: 2, scopeHash: cc5ToolScopeHash(delivery.request, delivery.admission),
+    commandId: randomUUID(), dockerId: f.binding.dockerId, containerDbId: f.binding.containerDbId,
+    operationId: f.binding.operationId, nativeSessionId: f.request.nativeSessionId, toolUseId: id, rpcId,
+    name: f.request.name, inputSha256: cc5ToolInputSha256(f.request.arguments), result, completedAt: Date.now() }
+  await rpc(h.socketPath, '/tool/result', { ...h.scope, receipt })
+  return { receipt, delivered: (await remote).result as Cc5ToolReceipt['result'] }
+}
+
+test('a 100KiB tool result crosses the relay envelope unchanged', async () => {
+  const f = fixture()
+  const { h, s } = await start(f)
+  try {
+    const produced: Cc5ToolReceipt['result'] = { content: [{ type: 'text', text: 'x'.repeat(100 * 1024) }], isError: false }
+    const { receipt, delivered } = await receiveToolResult(f, h, 'read-large', 1, produced)
+    assert.deepEqual(delivered, receipt.result)
+    const completed = readdirSync(join(f.root, 'relay-journal', f.a.authorityTurnId))
+      .filter((name) => name.endsWith('-completed.json'))
+    assert.deepEqual(JSON.parse(readFileSync(join(f.root, 'relay-journal', f.a.authorityTurnId, completed[0]), 'utf8')).result, produced)
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('an oversized tool result is truncated for the model with its original byte count', async () => {
+  const f = fixture()
+  const { h, s } = await start(f)
+  try {
+    const produced: Cc5ToolReceipt['result'] = { content: [{ type: 'text', text: 'z'.repeat(140 * 1024) }], isError: true }
+    const producedBytes = resultBytes(produced)
+    const { delivered } = await receiveToolResult(f, h, 'read-oversized', 1, produced)
+    assert.equal(delivered.isError, true)
+    assert.equal(delivered.content.length, 1)
+    assert.equal(delivered.content[0].type, 'text')
+    const text = (delivered.content[0] as { type: string; text: string }).text
+    assert.ok(text.startsWith('z'.repeat(4096)))
+    assert.ok(text.endsWith(`[cc5 tool result truncated: original ${producedBytes} bytes]`))
+    assert.ok(resultBytes(delivered) <= RESULT_LIMIT)
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
