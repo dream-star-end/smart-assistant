@@ -246,6 +246,28 @@ describe('OCV5-725 — >50 MiB outputs preserve historical versions in CAS acros
       assert.equal(posted.length, 3)
       assert.equal(posted[2]!.items[0]!.digest, undefined)
       assert.equal(posted[2]!.items[0]!.size, size52M)
+
+      // Concurrent copies into a fresh CAS with a 90 MiB quota: two 52 MiB files
+      // raced in parallel must serialize so only one publishes to CAS.
+      const raceCas = join(dir, 'cas-race')
+      await mkdir(raceCas, { recursive: true })
+      const f1 = join(roots.generated, 'race-a.bin')
+      const f2 = join(roots.generated, 'race-b.bin')
+      await writeFile(f1, 'race-a-')
+      await truncate(f1, size52M)
+      await writeFile(f2, 'race-b-')
+      await truncate(f2, size52M)
+      const raceRoots = {
+        generated: roots.generated,
+        cas: raceCas,
+        largeVersionQuotaBytes: 90 * 1024 * 1024,
+      }
+      const [r1, r2] = await Promise.all([
+        captureOutputVersion('/home/agent/.openclaude/generated/race-a.bin', raceRoots),
+        captureOutputVersion('/home/agent/.openclaude/generated/race-b.bin', raceRoots),
+      ])
+      const publishedCount = [r1, r2].filter((r) => Boolean(r?.digest)).length
+      assert.equal(publishedCount, 1)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

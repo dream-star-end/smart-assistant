@@ -2304,38 +2304,58 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       await deps.reconcileAutomaticRecoveryJobs(uid, 100);
     }
     let executor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
-    if (!executor && recovery && links) {
-      try {
-        const channel = deps.containerLinkRecovery?.channel ?? "v5";
-        const carriers = await deps.pgPool.query<{ container_id: number }>(
-          `SELECT DISTINCT ac.id::int AS container_id
-             FROM turn_recovery_jobs r
-             JOIN client_sessions s ON s.id=r.session_id AND s.user_id='c:' || r.user_id::text AND s.deleted_at IS NULL
-             LEFT JOIN LATERAL (
-               SELECT d.agent_container_id FROM turn_dispatches d
-                WHERE d.user_id=r.user_id AND d.session_id=r.session_id
-                ORDER BY (d.client_message_id=r.source_client_message_id) DESC NULLS LAST,
-                         d.admitted_at DESC, d.dispatch_id DESC LIMIT 1
-             ) d ON true
-             JOIN agent_containers ac ON ac.user_id=r.user_id AND ac.state='active' AND ac.runtime_channel=$2
-              AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
-                SELECT 1 FROM agent_containers other WHERE other.user_id=r.user_id AND other.state='active'
-                  AND other.runtime_channel=$2 AND other.id<>ac.id)))
-            WHERE r.user_id=$1 AND r.status IN ('queued','leased') AND r.next_attempt_at<=NOW()
-              AND (r.status='queued' OR r.lease_until<NOW())
-              AND r.dispatch_id IS NULL
-            LIMIT 5`,
-          [key, channel],
-        );
-        for (const row of carriers.rows ?? []) {
-          await recovery.wake({ uid: key, containerId: row.container_id });
+    if (!executor) {
+      if (recovery && links) {
+        try {
+          const channel = deps.containerLinkRecovery?.channel ?? "v5";
+          const carriers = await deps.pgPool.query<{ container_id: number }>(
+            `SELECT DISTINCT ac.id::int AS container_id
+               FROM turn_recovery_jobs r
+               JOIN client_sessions s ON s.id=r.session_id AND s.user_id='c:' || r.user_id::text AND s.deleted_at IS NULL
+               LEFT JOIN LATERAL (
+                 SELECT d.agent_container_id FROM turn_dispatches d
+                  WHERE d.user_id=r.user_id AND d.session_id=r.session_id
+                  ORDER BY (d.client_message_id=r.source_client_message_id) DESC NULLS LAST,
+                           d.admitted_at DESC, d.dispatch_id DESC LIMIT 1
+               ) d ON true
+               JOIN agent_containers ac ON ac.user_id=r.user_id AND ac.state='active' AND ac.runtime_channel=$2
+                AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
+                  SELECT 1 FROM agent_containers other WHERE other.user_id=r.user_id AND other.state='active'
+                    AND other.runtime_channel=$2 AND other.id<>ac.id)))
+              WHERE r.user_id=$1 AND r.status IN ('queued','leased') AND r.next_attempt_at<=NOW()
+                AND (r.status='queued' OR r.lease_until<NOW())
+                AND r.dispatch_id IS NULL
+              LIMIT 5`,
+            [key, channel],
+          );
+          for (const row of carriers.rows ?? []) {
+            if (links.retainKeepAliveConsumer(uid, row.container_id)) {
+              continue;
+            }
+            // Do NOT await recovery.wake inside drainDurableRecoveryForUser:
+            // recovery.wake drains outboundPersistQueues before attaching, while
+            // final frame persistence awaits drainDurableRecoveryForUser. Firing
+            // wake asynchronously keeps the wait graph strictly acyclic, and
+            // onContainerAttest (or the post-wake callback for already-attached
+            // links) re-triggers drainDurableRecoveryForUser once ready.
+            void recovery
+              .wake({ uid: key, containerId: row.container_id })
+              .then(() => {
+                if (!shuttingDown && availableExecutors(uidToRecoveryExecutors.get(key)).length > 0) {
+                  void drainDurableRecoveryForUser(uid);
+                }
+              })
+              .catch((wakeErr) => {
+                log?.warn("user-chat-bridge: durable recovery carrier wake failed", { uid: key, error: wakeErr });
+              });
+          }
+        } catch (wakeErr) {
+          log?.warn("user-chat-bridge: durable recovery carrier lookup failed", { uid: key, error: wakeErr });
         }
-      } catch (wakeErr) {
-        log?.warn("user-chat-bridge: durable recovery carrier wake failed", { uid: key, error: wakeErr });
       }
       executor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
+      if (!executor) return;
     }
-    if (!executor) return;
     const jobs = await claimDueRecoveryJobs(deps.pgPool, {
       userId: uid,
       ownerId: recoveryLeaseOwner,
@@ -2385,6 +2405,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const recoveryDrainTimer = setInterval(() => {
     for (const uid of uidToRecoveryExecutors.keys()) {
       void drainDurableRecoveryForUser(BigInt(uid));
+    }
+    if (deps.pgPool && recovery && links && !shuttingDown) {
+      void deps.pgPool
+        .query<{ user_id: string }>(
+          `SELECT DISTINCT user_id::text AS user_id
+             FROM turn_recovery_jobs
+            WHERE status IN ('queued','leased') AND next_attempt_at<=NOW()
+              AND (status='queued' OR lease_until<NOW())
+              AND dispatch_id IS NULL
+            LIMIT 20`,
+        )
+        .then((res) => {
+          for (const row of res.rows ?? []) {
+            if (!uidToRecoveryExecutors.has(row.user_id)) {
+              void drainDurableRecoveryForUser(BigInt(row.user_id));
+            }
+          }
+        })
+        .catch(() => {});
     }
   }, 1_000);
   recoveryDrainTimer.unref?.();
@@ -3667,6 +3706,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const enrichmentDeadlineChecks = new WeakMap<EnrichmentDispatchState, () => boolean>();
     const preparedEnrichmentFrames = new WeakMap<Record<string, unknown>, EnrichmentDispatchState>();
     let preparationInFlight = 0;
+    let inFlightOutboundPersists = 0;
     let dispatchHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
     const cronOriginClaimWaiters = new Map<string, {
       promise: Promise<CronOriginExecutorClaimResult>;
@@ -3699,7 +3739,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     };
 
     const hasPendingDispatchWork = (): boolean =>
-      preparationInFlight > 0 || admittedDispatches.size > 0 || enrichmentDispatches.size > 0;
+      preparationInFlight > 0 ||
+      admittedDispatches.size > 0 ||
+      enrichmentDispatches.size > 0 ||
+      inFlightOutboundPersists > 0;
     const hasPreTransferDispatchWork = (): boolean =>
       preparationInFlight > 0 || enrichmentDispatches.size > 0;
 
@@ -9152,27 +9195,44 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // Fallback for old/non-browser peers that produce stamped output before
         // sending an inbound.hello subscription.
         retainOutboundPersistQueueKey(stamped.storeKey);
+        inFlightOutboundPersists += 1;
+        if (linkHandle) linkHandle.pendingPersistCount += 1;
+        let persistSettled = false;
+        const releasePersistHold = (): void => {
+          if (persistSettled) return;
+          persistSettled = true;
+          inFlightOutboundPersists = Math.max(0, inFlightOutboundPersists - 1);
+          if (linkHandle) {
+            linkHandle.pendingPersistCount = Math.max(0, linkHandle.pendingPersistCount - 1);
+          }
+          checkDrainComplete();
+        };
         outboundPersistQueues.enqueue(
           stamped.storeKey,
           stamped.frameSeq,
           async () => {
-            if (permissionAuthorityCommit !== null) await permissionAuthorityCommit();
-            await deps.persistOutboundFrame!({
-              uid,
-              sessionId: durableSessionId,
-              clientMessageId: stamped.clientMessageId,
-              agentContainerId: containerId!,
-              sessionKey: stamped.sessionKey,
-              frameSeq: stamped.frameSeq,
-              payload: stamped.payload,
-            });
-            if (stamped.isFinal && userDetached && !cleaned && !shuttingDown) {
-              await drainDurableRecoveryForUser(uid);
+            try {
+              if (permissionAuthorityCommit !== null) await permissionAuthorityCommit();
+              await deps.persistOutboundFrame!({
+                uid,
+                sessionId: durableSessionId,
+                clientMessageId: stamped.clientMessageId,
+                agentContainerId: containerId!,
+                sessionKey: stamped.sessionKey,
+                frameSeq: stamped.frameSeq,
+                payload: stamped.payload,
+              });
+              if (stamped.isFinal && userDetached && !cleaned && !shuttingDown) {
+                await drainDurableRecoveryForUser(uid);
+              }
+              linkHandle?.persisted(durableSessionId, stamped.clientMessageId, stamped.isFinal);
+              forwardCommittedFrame();
+            } finally {
+              releasePersistHold();
             }
-            linkHandle?.persisted(durableSessionId, stamped.clientMessageId, stamped.isFinal);
-            forwardCommittedFrame();
           },
           (error) => {
+            releasePersistHold();
             bridgeLog?.error("user-chat-bridge: outbound durability commit failed", {
               sessionId: stamped.sessionId,
               clientMessageId: stamped.clientMessageId,
@@ -9184,6 +9244,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             try { userWs.close(CLOSE_BRIDGE.INTERNAL, "output persistence unavailable"); } catch { /* */ }
           },
           (error) => {
+            releasePersistHold();
             bridgeLog?.error("user-chat-bridge: skipping outbound frame after permanent live-stream conflict", {
               sessionId: stamped.sessionId,
               clientMessageId: stamped.clientMessageId,

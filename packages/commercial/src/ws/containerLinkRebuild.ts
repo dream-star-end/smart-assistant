@@ -26,7 +26,7 @@ export async function rebuildContainerLink(input: {
   const { carrier, signal, links, deps } = input
   const uid = BigInt(carrier.uid)
   if (signal.aborted || links.stopping) throw new Error('container link recovery stopped')
-  if (input.keepAlive && links.controlTransport(uid, carrier.containerId)) return 'attached'
+  if (input.keepAlive && input.rows.length === 0 && links.retainKeepAliveConsumer(uid, carrier.containerId)) return 'attached'
   const endpoint = await deps.resolveContainerLinkEndpoint!(uid, carrier.containerId)
   if (signal.aborted || links.stopping) throw new Error('container link recovery stopped')
   if (endpoint === 'pending') return 'pending'

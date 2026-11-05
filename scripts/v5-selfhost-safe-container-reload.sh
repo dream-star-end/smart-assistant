@@ -118,19 +118,13 @@ query_active_dispatches() {
   su - postgres -c "psql -d openclaude_v5_selfhost -Atc \"SELECT COUNT(*)::int FROM turn_dispatches WHERE ${DISPATCH_WHERE};\""
 }
 
+if [ -n "${OC_SAFE_RELOAD_ACTIVE_COUNT_CMD:-}" ] && [ "$DRY_RUN" -ne 1 ]; then
+  log_event "action=abort reason=test_override_without_dry_run"
+  echo "ERROR: OC_SAFE_RELOAD_ACTIVE_COUNT_CMD is only permitted with --dry-run." >&2
+  exit 64
+fi
+
 run_locked_restart() {
-  if [ -n "${OC_SAFE_RELOAD_ACTIVE_COUNT_CMD:-}" ]; then
-    local recheck
-    recheck=$(query_active_dispatches | tr -d "[:space:]")
-    if [ "$recheck" != "0" ]; then
-      return 10
-    fi
-    docker restart "oc-v5-u${UID_NUM}"
-    if [ -n "$RESTART_EGRESS" ]; then
-      systemctl restart "$RESTART_EGRESS"
-    fi
-    return 0
-  fi
 
   python3 - "$UID_NUM" "$RESTART_EGRESS" "$DISPATCH_WHERE" << 'PY'
 import subprocess
