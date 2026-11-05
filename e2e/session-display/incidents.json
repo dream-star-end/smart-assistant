@@ -9477,7 +9477,7 @@
       "occurredAt": "2026-11-05",
       "severity": "P1",
       "symptom": "Box synthetic upstream API errors were lost behind shutdown metadata; a finalized zero-token failed first turn retained no source model, so same-model Continue incorrectly opened a switch-cost confirmation. Preserve safe first-cause classification and prove failed-route identity without weakening genuine-switch or ambiguous-history risk checks.",
-      "rootFixCommit": "70836694dff5f8a1de9158004af0acf6535d78f5",
+      "rootFixCommit": "70836694",
       "regressions": [
         {
           "layer": "unit",
