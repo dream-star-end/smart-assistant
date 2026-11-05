@@ -411,13 +411,13 @@ test('without an accepted terminal crashed dispatch the failure is not authorita
 test('old unknown zero-like tapes veto both inside and outside the six-row window', async (t) => {
   if (!ready) return t.skip('Postgres test fixture unavailable')
   for (const count of [0, 6]) {
-    const sid = 's-unknown-' + count
+    const sid = `s-unknown-${count}`
     await seedFailedFirstTurn('910', sid)
     await query("UPDATE client_session_turn_tapes SET created_at=100,finalized_at=101 WHERE session_id=$1", [sid])
     await addTape({ uid: '910', sid, tapeId: 'unknown-old', createdAt: 0, finalizedAt: 1, turnIndex: 20,
       usage: JSON.stringify({ model: 'cheap', inputTokens: 0, outputTokens: 0 }) })
     for (let i = 1; i <= count; i++)
-      await addTape({ uid: '910', sid, tapeId: 'zero-old-' + i, createdAt: i, finalizedAt: i + 1,
+      await addTape({ uid: '910', sid, tapeId: `zero-old-${i}`, createdAt: i, finalizedAt: i + 1,
         usage: ZERO_USAGE('cheap'), turnIndex: i })
     assert.equal((await context('910', sid, 'cheap')).source, 'unknown')
   }
@@ -429,10 +429,10 @@ test('failed tape identity must bind the exact dispatch and attempt', async (t) 
     'dispatch_id=NULL', 'attempt_no=NULL', 'attempt_no=attempt_no+1',
     "dispatch_id='00000000-0000-4000-8000-000000000742'::uuid",
   ].entries()) {
-    const sid = 's-exact-' + index
+    const sid = `s-exact-${index}`
     await seedFailedFirstTurn('911', sid)
     assert.equal((await context('911', sid, 'cheap')).source, 'unchanged')
-    await query('UPDATE client_session_turn_tapes SET ' + mutation + ' WHERE session_id=$1', [sid])
+    await query(`UPDATE client_session_turn_tapes SET ${mutation} WHERE session_id=$1`, [sid])
     assert.equal((await context('911', sid, 'cheap')).source, 'unknown', mutation)
   }
 })
@@ -446,7 +446,7 @@ test('model-visible hot history and forged anchors veto first-failure exemption'
     { ...ANCHOR, _turnTapeComplete: false },
   ]
   for (const [index, row] of extra.entries()) {
-    const sid = 's-hot-' + index
+    const sid = `s-hot-${index}`
     await seedFailedFirstTurn('912', sid)
     await query("UPDATE client_sessions SET messages=$2 WHERE id=$1",
       [sid, JSON.stringify([{ role: 'user', id: 'msg-1' }, ANCHOR, row])])
@@ -478,7 +478,9 @@ test('a cheaper different model or different agent still requires an actual risk
 
 test('the real batched tape writer produces an eligible failed-start anchor', async (t) => {
   if (!ready) return t.skip('Postgres test fixture unavailable')
-  const uid = '914', sid = 's-real-runtime-batch', owner = 'c:' + uid
+  const uid = '914'
+  const sid = 's-real-runtime-batch'
+  const owner = `c:${uid}`
   await makeSession(uid, sid, [{ id: 'msg-batch', role: 'user', text: 'original goal' }])
   const dispatchId = await addDispatch({ uid, sid, clientMessageId: 'msg-batch', model: 'cheap' })
   const payload = {
@@ -516,7 +518,9 @@ test('the real batched tape writer produces an eligible failed-start anchor', as
     await query('UPDATE client_sessions SET messages=$2 WHERE id=$1', [sid, JSON.stringify(messages)])
     assert.equal((await context(uid, sid, 'cheap')).source, 'unknown')
   } finally {
-    if (old === undefined) delete process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING
-    else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = old
+    if (old === undefined) {
+      // biome-ignore lint/performance/noDelete: assigning undefined to process.env stores a string, not absence.
+      delete process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING
+    } else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = old
   }
 })
