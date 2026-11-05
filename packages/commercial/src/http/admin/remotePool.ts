@@ -4,15 +4,18 @@
  */
 
 import { execFile } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { resolve } from 'node:path'
 import { promisify } from 'node:util'
+import { loadBoxBridgeMod } from '@openclaude/gateway'
 import { writeAdminAuditBestEffort } from '../../admin/audit.js'
 import { requireAdmin, requireAdminVerifyDb } from '../../admin/requireAdmin.js'
 import {
-  applyRemoteNodeProbeResult,
   createRemoteAgentNode,
   getRemoteHostdSha256,
   listRemotePoolOverview,
+  probeRemoteAgentNodeLive,
   publishRemoteModelOffers,
   revokeRemoteAgentBinding,
   updateRemoteProfileAdminState,
@@ -163,66 +166,16 @@ export async function handleAdminRemotePoolNodeAction(
   if (req.method === 'POST' && probeMatch) {
     const nodeId = probeMatch[1]!
     const body = ((await readJsonBody(req).catch(() => ({}))) ?? {}) as Record<string, unknown>
-    const nodeRes = await query(`SELECT * FROM remote_agent_nodes WHERE id = $1`, [nodeId])
-    if (nodeRes.rows.length === 0) throw new HttpError(404, 'remote node not found')
-    const nodeRow = nodeRes.rows[0]!
-
-    let probePayload: RemoteNodeProbePayload | null = null
-    if (Array.isArray(body.profiles)) {
-      probePayload = {
-        rttMsP50: typeof body.rtt_ms_p50 === 'number' ? body.rtt_ms_p50 : 38,
-        rttMsP95: typeof body.rtt_ms_p95 === 'number' ? body.rtt_ms_p95 : 82,
-        profiles: body.profiles as RemoteNodeProbePayload['profiles'],
-      }
-    } else {
-      const started = Date.now()
-      try {
-        const { stdout } = await execFileAsync(
-          'ssh',
-          [
-            '-o',
-            'BatchMode=yes',
-            '-o',
-            'ConnectTimeout=4',
-            '-o',
-            'StrictHostKeyChecking=accept-new',
-            '-p',
-            String(nodeRow.ssh_port ?? 22),
-            `${String(nodeRow.ssh_user)}@${String(nodeRow.ssh_host)}`,
-            'python3 ~/.openclaude/bin/oc-remote-hostd.py --probe',
-          ],
-          { timeout: 6000 },
-        )
-        const rtt = Math.max(5, Date.now() - started)
-        const parsed = JSON.parse(stdout.trim()) as {
-          ok?: boolean
-          profiles?: RemoteNodeProbePayload['profiles']
+    const overridePayload: RemoteNodeProbePayload | undefined = Array.isArray(body.profiles)
+      ? {
+          rttMsP50: typeof body.rtt_ms_p50 === 'number' ? body.rtt_ms_p50 : 38,
+          rttMsP95: typeof body.rtt_ms_p95 === 'number' ? body.rtt_ms_p95 : 82,
+          profiles: body.profiles as RemoteNodeProbePayload['profiles'],
         }
-        if (parsed?.ok && Array.isArray(parsed.profiles) && parsed.profiles.length > 0) {
-          probePayload = {
-            rttMsP50: rtt,
-            rttMsP95: Math.round(rtt * 1.4),
-            profiles: parsed.profiles,
-          }
-        }
-      } catch {
-        // Fallback to node-scoped discovery template when SSH key is pending operator installation.
-      }
-      if (!probePayload) {
-        const suffix = String(nodeRow.id).slice(0, 8)
-        probePayload = {
-          rttMsP50: 42,
-          rttMsP95: 88,
-          profiles: DEFAULT_FALLBACK_PROBE_PROFILES.map((p) => ({
-            ...p,
-            account_fingerprint: `${p.engine}-${suffix}-${p.profile_name}`,
-          })),
-        }
-      }
-    }
+      : undefined
 
     try {
-      const updated = await applyRemoteNodeProbeResult(nodeId, probePayload)
+      const updated = await probeRemoteAgentNodeLive(nodeId, overridePayload)
       await writeAdminAuditBestEffort({
         adminUid: admin.uid,
         action: 'remote_pool.node.probe',
@@ -234,7 +187,8 @@ export async function handleAdminRemotePoolNodeAction(
       sendJson(res, 200, updated)
       return
     } catch (err) {
-      throw new HttpError(400, (err as Error)?.message ?? 'probe failed')
+      const msg = (err as Error)?.message ?? 'probe failed'
+      throw new HttpError(msg === 'REMOTE_NODE_NOT_FOUND' ? 404 : 400, msg)
     }
   }
 

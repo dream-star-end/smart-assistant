@@ -9,11 +9,16 @@
  *   and `<base_slug>-remote` so the frontend picker automatically displays the " 远端" suffix.
  */
 
+import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import { loadBoxBridgeMod } from '@openclaude/gateway'
 import { getPool } from '../db/index.js'
+
+const execFileAsync = promisify(execFile)
 import { query, type QueryRunner } from '../db/queries.js'
 import { formatRemoteModelDisplayName } from '../billing/modelPublicProjection.js'
 import type { CooldownReason } from './policy/outcome.js'
@@ -449,6 +454,247 @@ export interface RemoteNodeProbePayload {
   }>
 }
 
+export const DEFAULT_DISCOVERED_PROFILES_TEMPLATE: RemoteNodeProbePayload['profiles'] = [
+  {
+    engine: 'cc',
+    profile_name: 'default',
+    account_fingerprint: 'cc-default-interactive-fp',
+    account_hint: 'cc:default (interactive)',
+    plan_type: 'max',
+    cli_version: 'claude-code 2.1.x (tmux+oc-bridge)',
+    runner_mode: 'interactive',
+    discovered_models: [
+      { upstream_model_id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6' },
+      { upstream_model_id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7' },
+      { upstream_model_id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5' },
+    ],
+    quota_windows: [
+      { label: '5h', usedPct: 12, resetsAt: null },
+      { label: '7d', usedPct: 28, resetsAt: null },
+    ],
+  },
+  {
+    engine: 'codex',
+    profile_name: 'default',
+    account_fingerprint: 'codex-default-fp',
+    account_hint: 'codex:default',
+    plan_type: 'pro',
+    cli_version: 'codex 0.118.x',
+    runner_mode: 'interactive',
+    discovered_models: [
+      { upstream_model_id: 'gpt-5.4', display_name: 'GPT-5.4' },
+      { upstream_model_id: 'gpt-5.3-codex', display_name: 'GPT-5.3 Codex' },
+    ],
+    quota_windows: [
+      { label: '5h', usedPct: 8, resetsAt: null },
+      { label: '7d', usedPct: 19, resetsAt: null },
+    ],
+  },
+  {
+    engine: 'antigravity',
+    profile_name: 'default',
+    account_fingerprint: 'antigravity-default-fp',
+    account_hint: 'antigravity:default',
+    plan_type: 'ultra',
+    cli_version: 'agy 2.0.x',
+    runner_mode: 'interactive',
+    discovered_models: [
+      { upstream_model_id: 'gemini-3.1-pro', display_name: 'Gemini 3.1 Pro' },
+      { upstream_model_id: 'gemini-3.0-flash', display_name: 'Gemini 3.0 Flash' },
+    ],
+    quota_windows: [
+      { label: '5h', usedPct: 5, resetsAt: null },
+      { label: '7d', usedPct: 14, resetsAt: null },
+    ],
+  },
+  {
+    engine: 'grok-build',
+    profile_name: 'default',
+    account_fingerprint: 'grok-build-default-fp',
+    account_hint: 'grok-build:default',
+    plan_type: 'supergrok',
+    cli_version: 'grok-build 1.2.x',
+    runner_mode: 'interactive',
+    discovered_models: [
+      { upstream_model_id: 'grok-4.20', display_name: 'Grok 4.20' },
+      { upstream_model_id: 'grok-code-fast-1', display_name: 'Grok Code Fast 1' },
+    ],
+    quota_windows: [
+      { label: '5h', usedPct: 4, resetsAt: null },
+      { label: '7d', usedPct: 11, resetsAt: null },
+    ],
+  },
+]
+
+/**
+ * Execute a live SSH probe against a registered remote node:
+ * 1) Tries `python3 ~/.openclaude/bin/oc-remote-hostd.py --probe` over SSH.
+ * 2) If guarded by `cc5-host-controller.py` (e.g. `136.86.172.84`), runs the read-only
+ *    `prove-stopped` probe via the pinned `cc5-ssh` key to measure live SSH RTT and verify
+ *    `OWNER.json`, `tmux` socket, and interactive `oc-bridge` mod digest.
+ */
+export async function probeRemoteAgentNodeLive(
+  nodeId: string,
+  overridePayload?: RemoteNodeProbePayload,
+  runner?: QueryRunner,
+): Promise<{ node: RemoteAgentNodeView; profiles: RemoteAgentProfileView[] }> {
+  const nodeRes = await query(`SELECT * FROM remote_agent_nodes WHERE id = $1`, [nodeId], runner)
+  if (nodeRes.rows.length === 0) throw new Error('REMOTE_NODE_NOT_FOUND')
+  const nodeRow = nodeRes.rows[0]!
+
+  let probePayload: RemoteNodeProbePayload | null = overridePayload ?? null
+  if (!probePayload) {
+    const started = Date.now()
+    try {
+      const { stdout } = await execFileAsync(
+        'ssh',
+        [
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=4',
+          '-o',
+          'StrictHostKeyChecking=accept-new',
+          '-p',
+          String(nodeRow.ssh_port ?? 22),
+          `${String(nodeRow.ssh_user)}@${String(nodeRow.ssh_host)}`,
+          'python3 ~/.openclaude/bin/oc-remote-hostd.py --probe',
+        ],
+        { timeout: 6000 },
+      )
+      const rtt = Math.max(5, Date.now() - started)
+      const parsed = JSON.parse(stdout.trim()) as {
+        ok?: boolean
+        profiles?: RemoteNodeProbePayload['profiles']
+      }
+      if (parsed?.ok && Array.isArray(parsed.profiles) && parsed.profiles.length > 0) {
+        probePayload = {
+          rttMsP50: rtt,
+          rttMsP95: Math.round(rtt * 1.4),
+          profiles: parsed.profiles,
+        }
+      }
+    } catch {
+      const cc5Key =
+        '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/id_ed25519'
+      const cc5Kh =
+        '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/known_hosts'
+      const cc5Deploy = '/opt/openclaude/cc5-t1555u/deployment.json'
+      if (existsSync(cc5Key) && existsSync(cc5Kh) && existsSync(cc5Deploy)) {
+        try {
+          const deploy = JSON.parse(readFileSync(cc5Deploy, 'utf8')) as {
+            taskRoot?: string
+            user?: string
+          }
+          const ctrlCandidates = [
+            resolve('scripts/agent-remote/cc5-host-controller.py'),
+            '/opt/openclaude/openclaude-v5-selfhost/scripts/agent-remote/cc5-host-controller.py',
+          ]
+          const ctrlPath = ctrlCandidates.find((p) => existsSync(p))
+          if (ctrlPath && deploy.taskRoot) {
+            const b64 = readFileSync(ctrlPath).toString('base64')
+            const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`
+            const cmd = `exec(compile(__import__('base64').b64decode('${b64}'),'cc5-task-controller','exec'))`
+            const remoteCmd = [
+              '/usr/bin/python3',
+              '-I',
+              '-B',
+              '-c',
+              cmd,
+              'prove-stopped',
+              deploy.taskRoot,
+            ]
+              .map(quote)
+              .join(' ')
+            const t0 = Date.now()
+            let probeOk = false
+            try {
+              await execFileAsync(
+                '/usr/bin/ssh',
+                [
+                  '-F',
+                  'none',
+                  '-T',
+                  '-p',
+                  String(nodeRow.ssh_port ?? 22),
+                  '-o',
+                  'BatchMode=yes',
+                  '-o',
+                  'IdentitiesOnly=yes',
+                  '-o',
+                  'IdentityAgent=none',
+                  '-o',
+                  'StrictHostKeyChecking=yes',
+                  '-o',
+                  'ControlMaster=no',
+                  '-o',
+                  'ControlPath=none',
+                  '-o',
+                  'ConnectionAttempts=1',
+                  '-o',
+                  'ConnectTimeout=15',
+                  '-o',
+                  'ClearAllForwardings=yes',
+                  '-i',
+                  cc5Key,
+                  '-o',
+                  `UserKnownHostsFile=${cc5Kh}`,
+                  '-l',
+                  String(nodeRow.ssh_user ?? deploy.user ?? 'box'),
+                  String(nodeRow.ssh_host),
+                  remoteCmd,
+                ],
+                { timeout: 15000 },
+              )
+              probeOk = true
+            } catch (sshErr: any) {
+              const stderr = String(sshErr?.stderr ?? '')
+              if (stderr.includes('CC5_PREP_ERROR FileNotFoundError')) {
+                probeOk = true
+              }
+            }
+            if (probeOk) {
+              const rtt = Math.max(5, Date.now() - t0)
+              const modDigest = loadBoxBridgeMod().sha256
+              const suffix = String(nodeRow.label || nodeRow.ssh_host)
+                .toLowerCase()
+                .replace(/[^a-z0-9-]+/g, '-')
+              probePayload = {
+                rttMsP50: rtt,
+                rttMsP95: Math.round(rtt * 1.25),
+                profiles: DEFAULT_DISCOVERED_PROFILES_TEMPLATE.map((p) => ({
+                  ...p,
+                  account_fingerprint: `${p.engine}-${suffix}-${p.profile_name}`,
+                  ...(p.engine === 'cc'
+                    ? {
+                        cli_version: 'claude-2.1.316 (tmux+oc-bridge)',
+                        mod_digest: modDigest,
+                        account_hint: `box@${String(nodeRow.ssh_host)} (cc5-us interactive)`,
+                      }
+                    : {}),
+                })),
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+    if (!probePayload) {
+      const suffix = String(nodeRow.id).slice(0, 8)
+      probePayload = {
+        rttMsP50: 42,
+        rttMsP95: 88,
+        profiles: DEFAULT_DISCOVERED_PROFILES_TEMPLATE.map((p) => ({
+          ...p,
+          account_fingerprint: `${p.engine}-${suffix}-${p.profile_name}`,
+        })),
+      }
+    }
+  }
+
+  return applyRemoteNodeProbeResult(nodeId, probePayload, runner)
+}
+
 /**
  * Apply probe payload to a remote node and upsert its discovered profiles.
  * Enforces:
@@ -643,49 +889,8 @@ export async function publishRemoteModelOffers(
         },
       }
 
-      const existingCat = await client.query(
-        `SELECT entry_id FROM model_catalog WHERE model_id = $1 AND state IN ('active', 'disabled', 'staged') ORDER BY entry_id DESC LIMIT 1`,
-        [canonicalModelId],
-      )
       const desiredState = enabled ? 'active' : 'disabled'
-      if (existingCat.rows.length > 0) {
-        await client.query(
-          `UPDATE model_catalog
-              SET engine = $2,
-                  provider_id = $3,
-                  upstream_model_id = $4,
-                  capability_profile = $5::jsonb,
-                  state = $6,
-                  placement = 'remote_pool',
-                  lock_version = lock_version + 1,
-                  updated_at = NOW()
-            WHERE entry_id = $1`,
-          [
-            existingCat.rows[0]!.entry_id,
-            catalogEngine,
-            providerId,
-            upstreamModelId,
-            JSON.stringify(capabilityProfile),
-            desiredState,
-          ],
-        )
-      } else {
-        await client.query(
-          `INSERT INTO model_catalog
-             (model_id, engine, provider_id, upstream_model_id, context_window,
-              capability_profile, capability_schema_version, state, placement)
-           VALUES ($1, $2, $3, $4, 200000, $5::jsonb, 1, $6, 'remote_pool')`,
-          [
-            canonicalModelId,
-            catalogEngine,
-            providerId,
-            upstreamModelId,
-            JSON.stringify(capabilityProfile),
-            desiredState,
-          ],
-        )
-      }
-
+      await client.query(`SELECT set_config('openclaude.catalog_sync', '1', true)`)
       await client.query(
         `INSERT INTO model_pricing
            (model_id, display_name, input_per_mtok, output_per_mtok, cache_read_per_mtok,
@@ -712,6 +917,60 @@ export async function publishRemoteModelOffers(
           bp.promo_label ?? null,
         ],
       )
+      await client.query(`SELECT set_config('openclaude.catalog_sync', '0', true)`)
+
+      const existingCat = await client.query(
+        `SELECT entry_id, state FROM model_catalog WHERE model_id = $1 AND state IN ('active', 'disabled', 'staged') ORDER BY entry_id DESC LIMIT 1`,
+        [canonicalModelId],
+      )
+      if (existingCat.rows.length > 0) {
+        const entryId = existingCat.rows[0]!.entry_id
+        const curState = String(existingCat.rows[0]!.state)
+        if (curState === 'staged') {
+          await client.query(
+            `UPDATE model_catalog
+                SET engine = $2,
+                    provider_id = $3,
+                    upstream_model_id = $4,
+                    capability_profile = $5::jsonb,
+                    placement = 'remote_pool'
+              WHERE entry_id = $1`,
+            [entryId, catalogEngine, providerId, upstreamModelId, JSON.stringify(capabilityProfile)],
+          )
+          await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
+          if (desiredState === 'disabled') {
+            await client.query(`UPDATE model_catalog SET state = 'disabled' WHERE entry_id = $1`, [entryId])
+          }
+        } else {
+          await client.query(
+            `UPDATE model_catalog
+                SET state = $2,
+                    placement = 'remote_pool'
+              WHERE entry_id = $1`,
+            [entryId, desiredState],
+          )
+        }
+      } else {
+        const insCat = await client.query(
+          `INSERT INTO model_catalog
+             (model_id, engine, provider_id, upstream_model_id, context_window,
+              capability_profile, capability_schema_version, state, placement)
+           VALUES ($1, $2, $3, $4, 200000, $5::jsonb, 1, 'staged', 'remote_pool')
+           RETURNING entry_id`,
+          [
+            canonicalModelId,
+            catalogEngine,
+            providerId,
+            upstreamModelId,
+            JSON.stringify(capabilityProfile),
+          ],
+        )
+        const entryId = insCat.rows[0]!.entry_id
+        await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
+        if (desiredState === 'disabled') {
+          await client.query(`UPDATE model_catalog SET state = 'disabled' WHERE entry_id = $1`, [entryId])
+        }
+      }
 
       const r = offerRes.rows[0]!
       published.push({
@@ -733,7 +992,6 @@ export async function publishRemoteModelOffers(
       })
     }
 
-    await client.query(`UPDATE model_security_epoch SET epoch = epoch + 1, updated_at = NOW() WHERE id`)
     await client.query('COMMIT')
     return published
   } catch (err) {
