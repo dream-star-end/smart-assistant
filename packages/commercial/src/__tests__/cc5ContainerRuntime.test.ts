@@ -410,22 +410,57 @@ test('unproved remote exit retains private unknown fence and cannot be replaced/
   }
 })
 
-test('24h sliding lease and active binding recovery across runtime restart', async () => {
+test('24h sliding lease propagates to finance/disk and recovered runtime rebuilds live relay listeners and proves remote stop', async () => {
+  const realNow = Date.now
   const f = fixture()
   try {
-    const before = Date.now()
+    const before = realNow()
     const handle = (await f.prepare())!
     await f.runtime.bindCreated(handle, 'a'.repeat(64))
-    const b = JSON.parse(
+    const initialBinding = JSON.parse(
       readFileSync(join(handle.mountSource, 'binding.json'), 'utf8'),
     ) as Cc5BridgeBinding
-    assert.ok(b.expiresAt >= before + 24 * 60 * 60 * 1000 - 5000)
-    await f.runtime.activate(handle, b.dockerId)
+    assert.ok(initialBinding.expiresAt >= before + 24 * 60 * 60 * 1000 - 5000)
+    await f.runtime.activate(handle, initialBinding.dockerId)
+
+    // Advance clock by 12 hours and admit a turn so sliding lease extends binding.json past initial 24h
+    Date.now = () => before + 12 * 60 * 60 * 1000
+    const socket = join(handle.mountSource, 'relay.sock')
+    const admitted1 = await cc5ControlRequest('/admit', envelopes(f.key, initialBinding), socket)
+    assert.equal(admitted1.ready, true)
+    const extendedBinding = JSON.parse(
+      readFileSync(join(handle.mountSource, 'binding.json'), 'utf8'),
+    ) as Cc5BridgeBinding
+    assert.ok(extendedBinding.expiresAt > initialBinding.expiresAt)
+
+    // Remove the incomplete turn journal dir before simulating clean idle restart at +25h (past initial 24h, within extended 36h)
+    rmSync(join(dirname(handle.mountSource), 'journal', 'a'.repeat(32)), {
+      recursive: true,
+      force: true,
+    })
+    Date.now = () => before + 25 * 60 * 60 * 1000
+
+    let financeAdmittedExpiresAt = 0
+    const checkingFinanceFactory: Cc5FinanceFactory = () => ({
+      async admit(info) {
+        assert.ok(info.binding.expiresAt > Date.now(), 'finance must receive extended binding expiry')
+        financeAdmittedExpiresAt = info.binding.expiresAt
+        return {
+          async beforeHostStart() {},
+          async beforeDispatch() {},
+          async stop() {},
+          async terminal() {
+            return { state: 'proven', requestId: 'fixture-only-request' }
+          },
+        }
+      },
+    })
+
     const restarted = createCc5FreshContainerRuntime({
       selfhost: true,
       env,
       configuration: () => f.options,
-      financeFactory,
+      financeFactory: checkingFinanceFactory,
     })!
     assert.deepEqual(
       restarted.selectBackend({
@@ -441,7 +476,23 @@ test('24h sliding lease and active binding recovery across runtime restart', asy
         operationId: f.options.profile.operationId,
       },
     )
+
+    // Recovered runtime has a real listening relay on relay.sock and passes extended binding to finance
+    const admittedAfterRestart = await cc5ControlRequest(
+      '/admit',
+      envelopes(f.key, extendedBinding),
+      socket,
+    )
+    assert.equal(admittedAfterRestart.ready, true)
+    assert.ok(financeAdmittedExpiresAt >= extendedBinding.expiresAt)
+
+    // Release on recovered runtime proves remote stop via host.stop()
+    const stopsBefore = f.stops
+    await restarted.release('91', extendedBinding.dockerId)
+    assert.equal(f.stops, stopsBefore + 1)
+    assert.equal(existsSync(join(dirname(handle.mountSource), 'released.json')), true)
   } finally {
+    Date.now = realNow
     await f.cleanup()
   }
 })

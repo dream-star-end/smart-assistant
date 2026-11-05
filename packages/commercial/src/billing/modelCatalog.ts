@@ -133,6 +133,8 @@ export interface ModelExecutionDescriptor {
   capabilitySchemaVersion: number;
   /** model_pricing.default_effort(null = 不注入)。 */
   defaultEffort: string | null;
+  /** 执行放置位置:local 或 remote_pool。 */
+  placement?: ModelPlacement;
 }
 
 /** per-uid 投影的一行(/internal/v3/model-catalog + /api/public/models 的服务端投影底稿)。 */
@@ -516,6 +518,9 @@ export class ModelCatalogSnapshot {
     const e = this.activeByModel.get(canonical);
     if (!e) return false;
     if (e.capabilitySchemaVersion > CAPABILITY_SCHEMA_VERSION) return false;
+    if (e.placement === "remote_pool" && process.env.OC_REMOTE_POOL_EXECUTION_ENABLED !== "1") {
+      return false;
+    }
     return this.pricing.has(canonical);
   }
 
@@ -563,7 +568,7 @@ export class ModelCatalogSnapshot {
     if (e.capabilitySchemaVersion > CAPABILITY_SCHEMA_VERSION) {
       throw new UnknownCapabilitySchemaError(e.modelId, e.capabilitySchemaVersion);
     }
-    if (!this.pricing.has(canonical)) return null;
+    if (!this.isRoutable(canonical)) return null;
     return {
       canonicalModel: e.modelId,
       engine: e.engine,
@@ -573,6 +578,7 @@ export class ModelCatalogSnapshot {
       capabilityProfile: e.capabilityProfile,
       capabilitySchemaVersion: e.capabilitySchemaVersion,
       defaultEffort: this.pricing.get(canonical)?.defaultEffort ?? null,
+      placement: e.placement ?? "local",
     };
   }
 
@@ -607,7 +613,9 @@ export class ModelCatalogSnapshot {
     const pricing = this.pricing.get(canonical);
     const schemaOk =
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
-    const routable = entry !== undefined && schemaOk && pricing !== undefined;
+    const remotePoolOk =
+      entry?.placement !== "remote_pool" || process.env.OC_REMOTE_POOL_EXECUTION_ENABLED === "1";
+    const routable = entry !== undefined && schemaOk && remotePoolOk && pricing !== undefined;
     const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebOwnerUid(scope.uid);
     const cc5Ok = !isCc5TestModel(canonical); // retired task model; backend routing uses existing Sonnet
     const cursorOk = cc5Ok &&

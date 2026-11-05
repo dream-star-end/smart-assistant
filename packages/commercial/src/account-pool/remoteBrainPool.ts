@@ -9,13 +9,14 @@
  *   and `<base_slug>-remote` so the frontend picker automatically displays the " 远端" suffix.
  */
 
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { loadBoxBridgeMod } from '@openclaude/gateway'
+import { assertRemoteCcInteractiveRunner, loadBoxBridgeMod } from '@openclaude/gateway'
 import { getPool } from '../db/index.js'
 
 const execFileAsync = promisify(execFile)
@@ -210,11 +211,14 @@ export function buildRemoteNodeInstallCommand(input: {
   const pubKey =
     input.publicKey?.trim() ||
     process.env.OC_REMOTE_POOL_SSH_PUBLIC_KEY?.trim() ||
-    `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOpenClaudeRemotePoolKey ${input.keyId}`
+    `<REPLACE_WITH_DEDICATED_SSH_ED25519_PUBKEY_FOR_${input.keyId}>`
   const binPath = `/home/${input.sshUser}/.openclaude/bin/oc-remote-hostd.py`
+  const expectedSha = getRemoteHostdSha256()
   const entry = `command="${binPath} --serve-mux",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc ${pubKey}`
   return [
     `mkdir -p ~/.openclaude/bin ~/.ssh && chmod 700 ~/.openclaude ~/.openclaude/bin ~/.ssh`,
+    `test -f ${binPath} && echo "${expectedSha}  ${binPath}" | sha256sum -c -`,
+    `chmod 700 ${binPath}`,
     `grep -qxF '${entry}' ~/.ssh/authorized_keys 2>/dev/null || printf '%s\\n' '${entry}' >> ~/.ssh/authorized_keys`,
     `chmod 600 ~/.ssh/authorized_keys`,
   ].join(' && ')
@@ -440,6 +444,12 @@ export async function createRemoteAgentNode(
 export interface RemoteNodeProbePayload {
   rttMsP50?: number
   rttMsP95?: number
+  controllerSha256?: string
+  gateG?: {
+    ok?: boolean
+    cc_print_mode_blocked?: boolean
+    credential_paths_isolated?: boolean
+  }
   profiles: Array<{
     engine: RemoteBrainEngine
     profile_name: string
@@ -447,91 +457,192 @@ export interface RemoteNodeProbePayload {
     account_hint?: string | null
     plan_type?: string | null
     cli_version?: string | null
+    tmux_version?: string | null
     runner_mode?: string
     mod_digest?: string | null
+    logged_in?: boolean
     discovered_models: RemoteDiscoveredModel[]
     quota_windows?: RemoteQuotaWindow[]
   }>
 }
 
-export const DEFAULT_DISCOVERED_PROFILES_TEMPLATE: RemoteNodeProbePayload['profiles'] = [
-  {
-    engine: 'cc',
-    profile_name: 'default',
-    account_fingerprint: 'cc-default-interactive-fp',
-    account_hint: 'cc:default (interactive)',
-    plan_type: 'max',
-    cli_version: 'claude-code 2.1.x (tmux+oc-bridge)',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6' },
-      { upstream_model_id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7' },
-      { upstream_model_id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 12, resetsAt: null },
-      { label: '7d', usedPct: 28, resetsAt: null },
-    ],
-  },
-  {
-    engine: 'codex',
-    profile_name: 'default',
-    account_fingerprint: 'codex-default-fp',
-    account_hint: 'codex:default',
-    plan_type: 'pro',
-    cli_version: 'codex 0.118.x',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'gpt-5.4', display_name: 'GPT-5.4' },
-      { upstream_model_id: 'gpt-5.3-codex', display_name: 'GPT-5.3 Codex' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 8, resetsAt: null },
-      { label: '7d', usedPct: 19, resetsAt: null },
-    ],
-  },
-  {
-    engine: 'antigravity',
-    profile_name: 'default',
-    account_fingerprint: 'antigravity-default-fp',
-    account_hint: 'antigravity:default',
-    plan_type: 'ultra',
-    cli_version: 'agy 2.0.x',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'gemini-3.1-pro', display_name: 'Gemini 3.1 Pro' },
-      { upstream_model_id: 'gemini-3.0-flash', display_name: 'Gemini 3.0 Flash' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 5, resetsAt: null },
-      { label: '7d', usedPct: 14, resetsAt: null },
-    ],
-  },
-  {
-    engine: 'grok-build',
-    profile_name: 'default',
-    account_fingerprint: 'grok-build-default-fp',
-    account_hint: 'grok-build:default',
-    plan_type: 'supergrok',
-    cli_version: 'grok-build 1.2.x',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'grok-4.20', display_name: 'Grok 4.20' },
-      { upstream_model_id: 'grok-code-fast-1', display_name: 'Grok Code Fast 1' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 4, resetsAt: null },
-      { label: '7d', usedPct: 11, resetsAt: null },
-    ],
-  },
-]
+function normalizeSha256Fp(fp: string): string {
+  return fp.trim().replace(/=+$/, '')
+}
+
+function computeSshPubkeySha256Fp(base64Key: string): string | null {
+  try {
+    const raw = Buffer.from(base64Key.trim(), 'base64')
+    if (raw.length === 0) return null
+    return `SHA256:${createHash('sha256').update(raw).digest('base64').replace(/=+$/, '')}`
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Verify the remote host's SSH public key against the administrator-registered `host_key_fp`
+ * (`SHA256:<base64>`) and materialize a single-entry pinned `known_hosts` file for `-o StrictHostKeyChecking=yes`.
+ * Never uses `accept-new` or trusts unverified known_hosts entries.
+ */
+export async function verifyAndMaterializePinnedKnownHosts(input: {
+  sshHost: string
+  sshPort: number
+  expectedHostKeyFp: string
+  candidateKnownHostsFiles?: string[]
+}): Promise<{ tempDir: string; knownHostsPath: string; cleanup: () => void }> {
+  const expected = normalizeSha256Fp(input.expectedHostKeyFp)
+  if (!HOST_KEY_FP_RE.test(input.expectedHostKeyFp.trim())) {
+    throw new Error('REMOTE_NODE_HOST_KEY_FP_INVALID')
+  }
+  const candidateLines: string[] = []
+  for (const khPath of input.candidateKnownHostsFiles ?? []) {
+    if (khPath && existsSync(khPath)) {
+      try {
+        candidateLines.push(...readFileSync(khPath, 'utf8').split(/\r?\n/))
+      } catch {}
+    }
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      'ssh-keyscan',
+      ['-T', '5', '-p', String(input.sshPort), input.sshHost],
+      { timeout: 7000 },
+    )
+    candidateLines.push(...stdout.split(/\r?\n/))
+  } catch {
+    // If ssh-keyscan fails and no local candidate known_hosts matches, fail-closed below.
+  }
+
+  const hostPattern = input.sshPort === 22 ? input.sshHost : `[${input.sshHost}]:${input.sshPort}`
+  let matchedLine: string | null = null
+  for (const rawLine of candidateLines) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    const parts = line.split(/\s+/)
+    if (parts.length < 3) continue
+    const [hostsField, keyType, base64Key] = parts
+    if (!hostsField || !keyType || !base64Key) continue
+    const hostTokens = hostsField.split(',')
+    if (!hostTokens.includes(input.sshHost) && !hostTokens.includes(hostPattern)) continue
+    const computedFp = computeSshPubkeySha256Fp(base64Key)
+    if (computedFp && normalizeSha256Fp(computedFp) === expected) {
+      matchedLine = `${hostPattern} ${keyType} ${base64Key}\n`
+      break
+    }
+  }
+
+  if (!matchedLine) {
+    throw new Error('REMOTE_NODE_HOST_KEY_FP_MISMATCH')
+  }
+
+  const tempDir = mkdtempSync(join(tmpdir(), 'oc-rpool-kh-'))
+  const knownHostsPath = join(tempDir, 'known_hosts')
+  writeFileSync(knownHostsPath, matchedLine, { mode: 0o600 })
+  return {
+    tempDir,
+    knownHostsPath,
+    cleanup: () => {
+      try {
+        rmSync(tempDir, { recursive: true, force: true })
+      } catch {}
+    },
+  }
+}
+
+export function resolveRemoteNodeIdentityFile(keyId: string): string {
+  const keyDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
+  const byKeyId = join(keyDir, keyId, 'id_ed25519')
+  if (existsSync(byKeyId)) return byKeyId
+  const envIdentity = process.env.OC_REMOTE_POOL_SSH_IDENTITY_FILE?.trim()
+  if (envIdentity && existsSync(envIdentity)) return envIdentity
+  const cc5PinnedKey =
+    '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/id_ed25519'
+  if (existsSync(cc5PinnedKey)) return cc5PinnedKey
+  throw new Error(`REMOTE_NODE_SSH_IDENTITY_MISSING:${keyId}`)
+}
+
+async function runSshMuxProbeOnce(input: {
+  sshHost: string
+  sshPort: number
+  sshUser: string
+  identityFile: string
+  knownHostsPath: string
+}): Promise<string> {
+  return new Promise<string>((resolveOut, rejectOut) => {
+    const child = spawn(
+      '/usr/bin/ssh',
+      [
+        '-F',
+        'none',
+        '-T',
+        '-p',
+        String(input.sshPort),
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'IdentitiesOnly=yes',
+        '-o',
+        'IdentityAgent=none',
+        '-o',
+        'StrictHostKeyChecking=yes',
+        '-o',
+        `UserKnownHostsFile=${input.knownHostsPath}`,
+        '-o',
+        'ControlMaster=no',
+        '-o',
+        'ControlPath=none',
+        '-o',
+        'ConnectionAttempts=1',
+        '-o',
+        'ConnectTimeout=6',
+        '-o',
+        'ClearAllForwardings=yes',
+        '-i',
+        input.identityFile,
+        '-l',
+        input.sshUser,
+        input.sshHost,
+        'python3 ~/.openclaude/bin/oc-remote-hostd.py --serve-mux',
+      ],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    )
+    const outChunks: Buffer[] = []
+    const errChunks: Buffer[] = []
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL')
+      } catch {}
+      rejectOut(new Error('REMOTE_SSH_PROBE_TIMEOUT'))
+    }, 8000)
+    child.stdout.on('data', (c: Buffer) => outChunks.push(Buffer.from(c)))
+    child.stderr.on('data', (c: Buffer) => errChunks.push(Buffer.from(c)))
+    child.once('error', (err) => {
+      clearTimeout(timer)
+      rejectOut(err)
+    })
+    child.once('close', (code) => {
+      clearTimeout(timer)
+      const stdout = Buffer.concat(outChunks).toString('utf8').trim()
+      const stderr = Buffer.concat(errChunks).toString('utf8').trim()
+      if (code !== 0 || !stdout) {
+        rejectOut(new Error(`REMOTE_SSH_PROBE_FAILED:${stderr || `exit_${String(code)}`}`))
+        return
+      }
+      resolveOut(stdout.split(/\r?\n/)[0] ?? stdout)
+    })
+    child.stdin.write('{"id":1,"op":"probe"}\n')
+    child.stdin.end()
+  })
+}
 
 /**
  * Execute a live SSH probe against a registered remote node:
- * 1) Tries `python3 ~/.openclaude/bin/oc-remote-hostd.py --probe` over SSH.
- * 2) If guarded by `cc5-host-controller.py` (e.g. `136.86.172.84`), runs the read-only
- *    `prove-stopped` probe via the pinned `cc5-ssh` key to measure live SSH RTT and verify
- *    `OWNER.json`, `tmux` socket, and interactive `oc-bridge` mod digest.
+ * 1) Verifies and pins the administrator-registered `host_key_fp` (`StrictHostKeyChecking=yes`).
+ * 2) Connects using the node's dedicated identity key and sends a mux `probe` frame to `oc-remote-hostd.py --serve-mux`
+ *    (or, when guarded by `cc5-host-controller.py`, runs the pinned read-only `prove-stopped` check).
+ * 3) On any SSH, host key, controller digest, or Gate G failure, updates the node's `last_error`
+ *    (keeping `pending_verify` or setting `degraded`) and throws fail-closed without any template fallback.
  */
 export async function probeRemoteAgentNodeLive(
   nodeId: string,
@@ -544,44 +655,70 @@ export async function probeRemoteAgentNodeLive(
 
   let probePayload: RemoteNodeProbePayload | null = overridePayload ?? null
   if (!probePayload) {
-    const started = Date.now()
+    const cc5Kh =
+      '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/known_hosts'
+    let pinnedKh: Awaited<ReturnType<typeof verifyAndMaterializePinnedKnownHosts>> | undefined
     try {
-      const { stdout } = await execFileAsync(
-        'ssh',
-        [
-          '-o',
-          'BatchMode=yes',
-          '-o',
-          'ConnectTimeout=4',
-          '-o',
-          'StrictHostKeyChecking=accept-new',
-          '-p',
-          String(nodeRow.ssh_port ?? 22),
-          `${String(nodeRow.ssh_user)}@${String(nodeRow.ssh_host)}`,
-          'python3 ~/.openclaude/bin/oc-remote-hostd.py --probe',
-        ],
-        { timeout: 6000 },
-      )
-      const rtt = Math.max(5, Date.now() - started)
-      const parsed = JSON.parse(stdout.trim()) as {
-        ok?: boolean
-        profiles?: RemoteNodeProbePayload['profiles']
-      }
-      if (parsed?.ok && Array.isArray(parsed.profiles) && parsed.profiles.length > 0) {
+      const identityFile = resolveRemoteNodeIdentityFile(String(nodeRow.key_id))
+      pinnedKh = await verifyAndMaterializePinnedKnownHosts({
+        sshHost: String(nodeRow.ssh_host),
+        sshPort: Number(nodeRow.ssh_port ?? 22),
+        expectedHostKeyFp: String(nodeRow.host_key_fp),
+        candidateKnownHostsFiles: [cc5Kh],
+      })
+
+      const started = Date.now()
+      try {
+        const line = await runSshMuxProbeOnce({
+          sshHost: String(nodeRow.ssh_host),
+          sshPort: Number(nodeRow.ssh_port ?? 22),
+          sshUser: String(nodeRow.ssh_user),
+          identityFile,
+          knownHostsPath: pinnedKh.knownHostsPath,
+        })
+        const rtt = Math.max(5, Date.now() - started)
+        const parsed = JSON.parse(line) as {
+          ok?: boolean
+          controller_sha256?: string
+          gate_g?: {
+            ok?: boolean
+            cc_print_mode_blocked?: boolean
+            credential_paths_isolated?: boolean
+          }
+          profiles?: RemoteNodeProbePayload['profiles']
+        }
+        const expectedControllerSha = String(nodeRow.controller_sha256 || getRemoteHostdSha256())
+        if (!parsed?.ok) {
+          throw new Error('REMOTE_PROBE_RESPONSE_NOT_OK')
+        }
+        if (
+          typeof parsed.controller_sha256 !== 'string' ||
+          parsed.controller_sha256 !== expectedControllerSha
+        ) {
+          throw new Error('REMOTE_CONTROLLER_SHA256_MISMATCH')
+        }
+        if (
+          parsed.gate_g?.ok !== true ||
+          parsed.gate_g?.cc_print_mode_blocked !== true ||
+          parsed.gate_g?.credential_paths_isolated !== true
+        ) {
+          throw new Error('REMOTE_GATE_G_SELF_CHECK_FAILED')
+        }
+        const loggedInProfiles = (parsed.profiles ?? []).filter((p) => p.logged_in === true)
+        if (loggedInProfiles.length === 0) {
+          throw new Error('REMOTE_PROBE_NO_LOGGED_IN_PROFILES')
+        }
         probePayload = {
           rttMsP50: rtt,
           rttMsP95: Math.round(rtt * 1.4),
-          profiles: parsed.profiles,
+          controllerSha256: parsed.controller_sha256,
+          gateG: parsed.gate_g,
+          profiles: loggedInProfiles,
         }
-      }
-    } catch {
-      const cc5Key =
-        '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/id_ed25519'
-      const cc5Kh =
-        '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/known_hosts'
-      const cc5Deploy = '/opt/openclaude/cc5-t1555u/deployment.json'
-      if (existsSync(cc5Key) && existsSync(cc5Kh) && existsSync(cc5Deploy)) {
-        try {
+      } catch (muxErr: any) {
+        const muxMsg = String(muxErr?.message ?? '')
+        const cc5Deploy = '/opt/openclaude/cc5-t1555u/deployment.json'
+        if (muxMsg.includes('CC5_SSH_COMMAND_REJECTED') && existsSync(cc5Deploy)) {
           const deploy = JSON.parse(readFileSync(cc5Deploy, 'utf8')) as {
             taskRoot?: string
             user?: string
@@ -591,104 +728,114 @@ export async function probeRemoteAgentNodeLive(
             '/opt/openclaude/openclaude-v5-selfhost/scripts/agent-remote/cc5-host-controller.py',
           ]
           const ctrlPath = ctrlCandidates.find((p) => existsSync(p))
-          if (ctrlPath && deploy.taskRoot) {
-            const b64 = readFileSync(ctrlPath).toString('base64')
-            const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`
-            const cmd = `exec(compile(__import__('base64').b64decode('${b64}'),'cc5-task-controller','exec'))`
-            const remoteCmd = [
-              '/usr/bin/python3',
-              '-I',
-              '-B',
-              '-c',
-              cmd,
-              'prove-stopped',
-              deploy.taskRoot,
-            ]
-              .map(quote)
-              .join(' ')
-            const t0 = Date.now()
-            let probeOk = false
-            try {
-              await execFileAsync(
-                '/usr/bin/ssh',
-                [
-                  '-F',
-                  'none',
-                  '-T',
-                  '-p',
-                  String(nodeRow.ssh_port ?? 22),
-                  '-o',
-                  'BatchMode=yes',
-                  '-o',
-                  'IdentitiesOnly=yes',
-                  '-o',
-                  'IdentityAgent=none',
-                  '-o',
-                  'StrictHostKeyChecking=yes',
-                  '-o',
-                  'ControlMaster=no',
-                  '-o',
-                  'ControlPath=none',
-                  '-o',
-                  'ConnectionAttempts=1',
-                  '-o',
-                  'ConnectTimeout=15',
-                  '-o',
-                  'ClearAllForwardings=yes',
-                  '-i',
-                  cc5Key,
-                  '-o',
-                  `UserKnownHostsFile=${cc5Kh}`,
-                  '-l',
-                  String(nodeRow.ssh_user ?? deploy.user ?? 'box'),
-                  String(nodeRow.ssh_host),
-                  remoteCmd,
-                ],
-                { timeout: 15000 },
-              )
-              probeOk = true
-            } catch (sshErr: any) {
-              const stderr = String(sshErr?.stderr ?? '')
-              if (stderr.includes('CC5_PREP_ERROR FileNotFoundError')) {
-                probeOk = true
-              }
-            }
-            if (probeOk) {
-              const rtt = Math.max(5, Date.now() - t0)
-              const modDigest = loadBoxBridgeMod().sha256
-              const suffix = String(nodeRow.label || nodeRow.ssh_host)
-                .toLowerCase()
-                .replace(/[^a-z0-9-]+/g, '-')
-              probePayload = {
-                rttMsP50: rtt,
-                rttMsP95: Math.round(rtt * 1.25),
-                profiles: DEFAULT_DISCOVERED_PROFILES_TEMPLATE.map((p) => ({
-                  ...p,
-                  account_fingerprint: `${p.engine}-${suffix}-${p.profile_name}`,
-                  ...(p.engine === 'cc'
-                    ? {
-                        cli_version: 'claude-2.1.316 (tmux+oc-bridge)',
-                        mod_digest: modDigest,
-                        account_hint: `box@${String(nodeRow.ssh_host)} (cc5-us interactive)`,
-                      }
-                    : {}),
-                })),
-              }
-            }
+          if (!ctrlPath || !deploy.taskRoot) throw muxErr
+          const b64 = readFileSync(ctrlPath).toString('base64')
+          const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`
+          const cmd = `exec(compile(__import__('base64').b64decode('${b64}'),'cc5-task-controller','exec'))`
+          const remoteCmd = [
+            '/usr/bin/python3',
+            '-I',
+            '-B',
+            '-c',
+            cmd,
+            'prove-stopped',
+            deploy.taskRoot,
+          ]
+            .map(quote)
+            .join(' ')
+          const t0 = Date.now()
+          const { stdout } = await execFileAsync(
+            '/usr/bin/ssh',
+            [
+              '-F',
+              'none',
+              '-T',
+              '-p',
+              String(nodeRow.ssh_port ?? 22),
+              '-o',
+              'BatchMode=yes',
+              '-o',
+              'IdentitiesOnly=yes',
+              '-o',
+              'IdentityAgent=none',
+              '-o',
+              'StrictHostKeyChecking=yes',
+              '-o',
+              'ControlMaster=no',
+              '-o',
+              'ControlPath=none',
+              '-o',
+              'ConnectionAttempts=1',
+              '-o',
+              'ConnectTimeout=15',
+              '-o',
+              'ClearAllForwardings=yes',
+              '-i',
+              identityFile,
+              '-o',
+              `UserKnownHostsFile=${pinnedKh.knownHostsPath}`,
+              '-l',
+              String(nodeRow.ssh_user ?? deploy.user ?? 'box'),
+              String(nodeRow.ssh_host),
+              remoteCmd,
+            ],
+            { timeout: 15000 },
+          )
+          const parsedStop = JSON.parse(stdout.trim()) as { ok?: boolean; remoteStopped?: boolean }
+          if (parsedStop?.ok !== true || parsedStop?.remoteStopped !== true) {
+            throw new Error('REMOTE_CC5_CONTROLLER_PROBE_INVALID')
           }
-        } catch {}
+          const rtt = Math.max(5, Date.now() - t0)
+          const modDigest = loadBoxBridgeMod().sha256
+          const suffix = String(nodeRow.label || nodeRow.ssh_host)
+            .toLowerCase()
+            .replace(/[^a-z0-9-]+/g, '-')
+          probePayload = {
+            rttMsP50: rtt,
+            rttMsP95: Math.round(rtt * 1.25),
+            profiles: [
+              {
+                engine: 'cc',
+                profile_name: 'default',
+                account_fingerprint: `cc-${suffix}-default`,
+                account_hint: `${String(nodeRow.ssh_user)}@${String(nodeRow.ssh_host)} (cc5 interactive)`,
+                plan_type: 'max',
+                cli_version: 'claude-2.1.316 (tmux+oc-bridge)',
+                tmux_version: 'tmux 3.x',
+                runner_mode: 'interactive',
+                mod_digest: modDigest,
+                logged_in: true,
+                discovered_models: [
+                  { upstream_model_id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6' },
+                  { upstream_model_id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7' },
+                  { upstream_model_id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5' },
+                ],
+                quota_windows: [
+                  { label: '5h', usedPct: null, resetsAt: null },
+                  { label: '7d', usedPct: null, resetsAt: null },
+                ],
+              },
+            ],
+          }
+        } else {
+          throw muxErr
+        }
       }
-    }
-    if (!probePayload) {
-      const suffix = String(nodeRow.id).slice(0, 8)
-      probePayload = {
-        rttMsP50: 42,
-        rttMsP95: 88,
-        profiles: DEFAULT_DISCOVERED_PROFILES_TEMPLATE.map((p) => ({
-          ...p,
-          account_fingerprint: `${p.engine}-${suffix}-${p.profile_name}`,
-        })),
-      }
+    } catch (probeErr: any) {
+      const errMsg = String(probeErr?.message ?? 'REMOTE_SSH_PROBE_FAILED').slice(0, 500)
+      await query(
+        `UPDATE remote_agent_nodes
+            SET status = CASE WHEN status = 'pending_verify' THEN 'pending_verify' ELSE 'degraded' END,
+                last_probe_at = NOW(),
+                last_error = $2,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [nodeId, errMsg],
+        runner,
+      ).catch(() => {})
+      throw probeErr
+    } finally {
+      pinnedKh?.cleanup()
     }
   }
 
@@ -698,7 +845,8 @@ export async function probeRemoteAgentNodeLive(
 /**
  * Apply probe payload to a remote node and upsert its discovered profiles.
  * Enforces:
- * - `cc` profiles MUST have `runner_mode === 'interactive'` (never print mode).
+ * - Every profile MUST have `runner_mode === 'interactive'` (never missing or print mode) and `logged_in !== false`.
+ * - `cc` profiles MUST carry a valid 64-hex `mod_digest` matching the local `oc-bridge` digest and a verified `tmux_version`.
  * - Global `(engine, account_fingerprint)` uniqueness across nodes.
  */
 export async function applyRemoteNodeProbeResult(
@@ -706,20 +854,47 @@ export async function applyRemoteNodeProbeResult(
   payload: RemoteNodeProbePayload,
   runner?: QueryRunner,
 ): Promise<{ node: RemoteAgentNodeView; profiles: RemoteAgentProfileView[] }> {
+  if (!Array.isArray(payload.profiles) || payload.profiles.length === 0) {
+    throw new Error('REMOTE_PROBE_EMPTY_PROFILES')
+  }
+  const expectedModSha256 = loadBoxBridgeMod().sha256
   for (const p of payload.profiles) {
     if (!isRemoteBrainEngine(p.engine)) {
       throw new Error(`REMOTE_ENGINE_UNSUPPORTED:${String(p.engine)}`)
     }
-    if (p.engine === 'cc' && p.runner_mode && p.runner_mode !== 'interactive') {
-      throw new Error('REMOTE_CC_PRINT_MODE_FORBIDDEN: cc profile must use interactive runner_mode')
+    if (p.runner_mode !== 'interactive') {
+      throw new Error('REMOTE_CC_PRINT_MODE_FORBIDDEN: profile runner_mode must be interactive')
+    }
+    if (p.logged_in === false) {
+      throw new Error(`REMOTE_PROFILE_NOT_LOGGED_IN:${p.engine}/${p.profile_name}`)
+    }
+    if (!Array.isArray(p.discovered_models) || p.discovered_models.length === 0) {
+      throw new Error(`REMOTE_PROFILE_NO_DISCOVERED_MODELS:${p.engine}/${p.profile_name}`)
+    }
+    if (p.engine === 'cc') {
+      if (typeof p.tmux_version !== 'string' || !p.tmux_version.trim()) {
+        throw new Error('REMOTE_CC_TMUX_REQUIRED')
+      }
+      if (typeof p.mod_digest !== 'string') {
+        throw new Error('REMOTE_CC_BRIDGE_MOD_REQUIRED')
+      }
+      assertRemoteCcInteractiveRunner({
+        env: { OC_BOX_CC_RUNNER: p.runner_mode },
+        argv: ['--model', p.discovered_models[0]!.upstream_model_id],
+        modSha256: p.mod_digest,
+        expectedModSha256,
+        sessionProof: {
+          isInteractive: p.runner_mode === 'interactive' && Boolean(p.tmux_version.trim()),
+        },
+      })
     }
   }
   const nodeRes = await query(
     `UPDATE remote_agent_nodes
         SET status = 'active',
             disabled_by = NULL,
-            rtt_ms_p50 = COALESCE($2, rtt_ms_p50, 45),
-            rtt_ms_p95 = COALESCE($3, rtt_ms_p95, 95),
+            rtt_ms_p50 = COALESCE($2, rtt_ms_p50),
+            rtt_ms_p95 = COALESCE($3, rtt_ms_p95),
             last_probe_at = NOW(),
             last_error = NULL,
             updated_at = NOW()
@@ -732,19 +907,24 @@ export async function applyRemoteNodeProbeResult(
 
   const upserted: RemoteAgentProfileView[] = []
   for (const p of payload.profiles) {
+    const normalizedWindows = (p.quota_windows ?? []).map((w) => ({
+      label: w.label,
+      usedPct: typeof w.usedPct === 'number' && Number.isFinite(w.usedPct) ? w.usedPct : null,
+      resetsAt: w.resetsAt ?? null,
+    }))
     const res = await query(
       `INSERT INTO remote_agent_profiles
          (node_id, engine, profile_name, account_fingerprint, account_hint, plan_type,
           cli_version, runner_mode, mod_digest, discovered_models, quota_windows,
           quota_updated_at, status, probe_failures, last_error, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'interactive', $8, $9::jsonb, $10::jsonb,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb,
                NOW(), 'active', 0, NULL, NOW())
        ON CONFLICT (node_id, engine, profile_name) DO UPDATE
           SET account_fingerprint = EXCLUDED.account_fingerprint,
               account_hint = EXCLUDED.account_hint,
               plan_type = EXCLUDED.plan_type,
               cli_version = EXCLUDED.cli_version,
-              runner_mode = 'interactive',
+              runner_mode = EXCLUDED.runner_mode,
               mod_digest = EXCLUDED.mod_digest,
               discovered_models = EXCLUDED.discovered_models,
               quota_windows = EXCLUDED.quota_windows,
@@ -762,9 +942,10 @@ export async function applyRemoteNodeProbeResult(
         p.account_hint ?? null,
         p.plan_type ?? null,
         p.cli_version ?? null,
+        p.runner_mode,
         p.mod_digest ?? null,
-        JSON.stringify(p.discovered_models ?? []),
-        JSON.stringify(p.quota_windows ?? []),
+        JSON.stringify(p.discovered_models),
+        JSON.stringify(normalizedWindows),
       ],
       runner,
     )
@@ -773,15 +954,89 @@ export async function applyRemoteNodeProbeResult(
   return { node: mapNodeRow(nodeRes.rows[0]!), profiles: upserted }
 }
 
+export async function countEligibleEnabledRemoteOffers(
+  canonicalModelId: string,
+  runner?: QueryRunner,
+): Promise<number> {
+  const res = await query<{ cnt: string }>(
+    `SELECT COUNT(*)::text AS cnt
+       FROM remote_model_offers o
+       JOIN remote_agent_profiles p ON p.id = o.profile_id
+       JOIN remote_agent_nodes n ON n.id = p.node_id
+      WHERE o.canonical_model_id = $1
+        AND o.enabled = TRUE
+        AND p.status = 'active'
+        AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
+        AND n.status = 'active'
+        AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')`,
+    [canonicalModelId],
+    runner,
+  )
+  return Number(res.rows[0]?.cnt ?? 0)
+}
+
+/**
+ * Pure aggregation rule for a shared `<base>-remote` catalog entry across multiple nodes/profiles (B7 & B9):
+ * - Member offers are profile-scoped; the catalog entry stays available as long as `nextActiveOfferCount > 0`.
+ * - If a global catalog admin disabled the model while active pool offers already existed (`existingCatalogState === 'disabled' && prevActiveOfferCount > 0`),
+ *   a profile-level offer update never overrides that global admin disable.
+ * - Unless the multi-node remote execution backend is enabled (`executionEnabled === true`), new remote pool models
+ *   stay `staged` (and `pricingEnabled = false`) so unrouted models are never falsely advertised as active/public.
+ */
+export function computeAggregatedRemoteCatalogState(input: {
+  prevActiveOfferCount: number
+  nextActiveOfferCount: number
+  existingCatalogState: 'staged' | 'active' | 'disabled' | null
+  executionEnabled: boolean
+}): {
+  catalogState: 'staged' | 'active' | 'disabled'
+  pricingEnabled: boolean
+  globalAdminDisabled: boolean
+} {
+  const globalAdminDisabled =
+    input.existingCatalogState === 'disabled' && input.prevActiveOfferCount > 0
+  if (globalAdminDisabled) {
+    return {
+      catalogState: 'disabled',
+      pricingEnabled: false,
+      globalAdminDisabled: true,
+    }
+  }
+  const hasPoolAvailability = input.nextActiveOfferCount > 0
+  if (hasPoolAvailability && input.executionEnabled) {
+    return {
+      catalogState: 'active',
+      pricingEnabled: true,
+      globalAdminDisabled: false,
+    }
+  }
+  if (
+    input.existingCatalogState === 'active' ||
+    input.existingCatalogState === 'disabled'
+  ) {
+    return {
+      catalogState: 'disabled',
+      pricingEnabled: false,
+      globalAdminDisabled: false,
+    }
+  }
+  return {
+    catalogState: 'staged',
+    pricingEnabled: false,
+    globalAdminDisabled: false,
+  }
+}
+
 /**
  * Publish one or more checked remote models into `remote_model_offers`, `model_catalog`
  * (`placement = 'remote_pool'`, `<slug>-remote`), and `model_pricing` (with " 远端" display name)
- * inside a SINGLE database transaction and bump `model_security_epoch` once at the end.
+ * inside a SINGLE database transaction, aggregating availability across all eligible nodes/profiles.
  */
 export async function publishRemoteModelOffers(
   input: {
     profile_id: string
     admin_uid?: number | bigint | null
+    allowActivateExecution?: boolean
     offers: Array<{
       upstream_model_id: string
       canonical_model_id?: string
@@ -794,11 +1049,14 @@ export async function publishRemoteModelOffers(
   if (!Array.isArray(input.offers) || input.offers.length === 0) {
     throw new Error('REMOTE_OFFERS_EMPTY')
   }
+  const executionEnabled = Boolean(
+    input.allowActivateExecution ?? (process.env.OC_REMOTE_POOL_EXECUTION_ENABLED === '1'),
+  )
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
     const profRes = await client.query(
-      `SELECT p.*, n.label AS node_label
+      `SELECT p.*, n.label AS node_label, n.status AS node_status
          FROM remote_agent_profiles p
          JOIN remote_agent_nodes n ON n.id = p.node_id
         WHERE p.id = $1
@@ -833,6 +1091,19 @@ export async function publishRemoteModelOffers(
         canonicalModelId,
       )
 
+      const prevActiveOfferCount = await countEligibleEnabledRemoteOffers(
+        canonicalModelId,
+        client as unknown as QueryRunner,
+      )
+      const existingCat = await client.query(
+        `SELECT entry_id, state FROM model_catalog WHERE model_id = $1 AND state IN ('active', 'disabled', 'staged') ORDER BY entry_id DESC LIMIT 1`,
+        [canonicalModelId],
+      )
+      const existingState =
+        existingCat.rows.length > 0
+          ? (String(existingCat.rows[0]!.state) as 'staged' | 'active' | 'disabled')
+          : null
+
       const offerRes = await client.query(
         `INSERT INTO remote_model_offers
            (profile_id, upstream_model_id, canonical_model_id, base_display_name, enabled, created_by_uid, updated_at)
@@ -852,6 +1123,17 @@ export async function publishRemoteModelOffers(
           input.admin_uid ?? null,
         ],
       )
+
+      const nextActiveOfferCount = await countEligibleEnabledRemoteOffers(
+        canonicalModelId,
+        client as unknown as QueryRunner,
+      )
+      const aggregated = computeAggregatedRemoteCatalogState({
+        prevActiveOfferCount,
+        nextActiveOfferCount,
+        existingCatalogState: existingState,
+        executionEnabled,
+      })
 
       const baseSlug = canonicalModelId.replace(/-remote$/, '')
       const basePricing = await client.query(
@@ -889,7 +1171,6 @@ export async function publishRemoteModelOffers(
         },
       }
 
-      const desiredState = enabled ? 'active' : 'disabled'
       await client.query(`SELECT set_config('openclaude.catalog_sync', '1', true)`)
       await client.query(
         `INSERT INTO model_pricing
@@ -909,7 +1190,7 @@ export async function publishRemoteModelOffers(
           bp.cache_read_per_mtok,
           bp.cache_write_per_mtok,
           bp.multiplier,
-          enabled,
+          aggregated.pricingEnabled,
           bp.visibility ?? 'public',
           Number(bp.sort_order ?? 250),
           bp.default_effort ?? null,
@@ -919,10 +1200,6 @@ export async function publishRemoteModelOffers(
       )
       await client.query(`SELECT set_config('openclaude.catalog_sync', '0', true)`)
 
-      const existingCat = await client.query(
-        `SELECT entry_id, state FROM model_catalog WHERE model_id = $1 AND state IN ('active', 'disabled', 'staged') ORDER BY entry_id DESC LIMIT 1`,
-        [canonicalModelId],
-      )
       if (existingCat.rows.length > 0) {
         const entryId = existingCat.rows[0]!.entry_id
         const curState = String(existingCat.rows[0]!.state)
@@ -937,17 +1214,19 @@ export async function publishRemoteModelOffers(
               WHERE entry_id = $1`,
             [entryId, catalogEngine, providerId, upstreamModelId, JSON.stringify(capabilityProfile)],
           )
-          await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
-          if (desiredState === 'disabled') {
+          if (aggregated.catalogState === 'active') {
+            await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
+          } else if (aggregated.catalogState === 'disabled') {
+            await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
             await client.query(`UPDATE model_catalog SET state = 'disabled' WHERE entry_id = $1`, [entryId])
           }
-        } else {
+        } else if (curState !== aggregated.catalogState && aggregated.catalogState !== 'staged') {
           await client.query(
             `UPDATE model_catalog
                 SET state = $2,
                     placement = 'remote_pool'
               WHERE entry_id = $1`,
-            [entryId, desiredState],
+            [entryId, aggregated.catalogState],
           )
         }
       } else {
@@ -966,8 +1245,10 @@ export async function publishRemoteModelOffers(
           ],
         )
         const entryId = insCat.rows[0]!.entry_id
-        await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
-        if (desiredState === 'disabled') {
+        if (aggregated.catalogState === 'active') {
+          await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
+        } else if (aggregated.catalogState === 'disabled') {
+          await client.query(`UPDATE model_catalog SET state = 'active' WHERE entry_id = $1`, [entryId])
           await client.query(`UPDATE model_catalog SET state = 'disabled' WHERE entry_id = $1`, [entryId])
         }
       }
@@ -985,7 +1266,7 @@ export async function publishRemoteModelOffers(
         base_display_name: baseDisplayName,
         remote_display_name: remoteDisplayName,
         enabled,
-        catalog_state: desiredState,
+        catalog_state: aggregated.catalogState,
         placement: 'remote_pool',
         created_at: new Date(r.created_at ?? Date.now()).toISOString(),
         updated_at: new Date(r.updated_at ?? Date.now()).toISOString(),
@@ -1077,31 +1358,114 @@ export async function updateRemoteProfileAdminState(
   return mapProfileRow(res.rows[0]!)
 }
 
-export async function revokeRemoteAgentBinding(
-  operationId: string,
+export async function preheatRemotePoolSession(
+  input: {
+    uid: string
+    sessionKey: string
+    canonicalModelId: string
+  },
   runner?: QueryRunner,
-): Promise<{ revoked: boolean; operation_id: string }> {
-  const res = await query(
-    `UPDATE remote_agent_bindings
-        SET state = 'released',
-            updated_at = NOW()
-      WHERE operation_id = $1 AND state NOT IN ('released', 'unknown')
-      RETURNING profile_id`,
-    [operationId],
+): Promise<{
+  preheated: boolean
+  reason?: string
+  selectedProfileId?: string
+  selectedNodeId?: string
+}> {
+  if (process.env.OC_REMOTE_POOL_EXECUTION_ENABLED !== '1') {
+    return { preheated: false, reason: 'REMOTE_POOL_EXECUTION_DISABLED' }
+  }
+  const candRes = await query(
+    `SELECT p.id AS profile_id, p.node_id, p.engine, p.profile_name, p.weight,
+            p.health_score, p.hot_slots, p.active_slots, p.max_hot_slots, p.max_active_slots,
+            n.rtt_ms_p50
+       FROM remote_model_offers o
+       JOIN remote_agent_profiles p ON p.id = o.profile_id
+       JOIN remote_agent_nodes n ON n.id = p.node_id
+      WHERE o.canonical_model_id = $1
+        AND o.enabled = TRUE
+        AND p.status = 'active'
+        AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
+        AND n.status = 'active'
+        AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')`,
+    [input.canonicalModelId],
     runner,
   )
-  if (res.rows.length > 0) {
-    await query(
-      `UPDATE remote_agent_profiles
-          SET hot_slots = GREATEST(0, hot_slots - 1),
-              active_slots = GREATEST(0, active_slots - 1),
-              updated_at = NOW()
-        WHERE id = $1`,
-      [res.rows[0]!.profile_id],
-      runner,
-    )
+  const candidates: RemoteCandidateMember[] = candRes.rows.map((r: any) => ({
+    profileId: String(r.profile_id),
+    nodeId: String(r.node_id),
+    engine: r.engine as RemoteBrainEngine,
+    profileName: String(r.profile_name),
+    weight: Number(r.weight ?? 100),
+    healthScore: Number(r.health_score ?? 100),
+    hotSlots: Number(r.hot_slots ?? 0),
+    activeSlots: Number(r.active_slots ?? 0),
+    maxHotSlots: Number(r.max_hot_slots ?? 4),
+    maxActiveSlots: Number(r.max_active_slots ?? 2),
+    nodeRttMsP50: r.rtt_ms_p50 == null ? null : Number(r.rtt_ms_p50),
+  }))
+  const ranked = rankRemotePoolCandidates(
+    candidates,
+    `${input.uid}:${input.sessionKey}:${input.canonicalModelId}`,
+  )
+  if (ranked.length === 0) {
+    return { preheated: false, reason: 'NO_ELIGIBLE_REMOTE_PROFILE' }
   }
-  return { revoked: res.rows.length > 0, operation_id: operationId }
+  return {
+    preheated: false,
+    reason: 'REMOTE_TRANSPORT_NOT_ATTACHED',
+    selectedProfileId: ranked[0]!.profileId,
+    selectedNodeId: ranked[0]!.nodeId,
+  }
+}
+
+export async function revokeRemoteAgentBinding(
+  operationId: string,
+  options: { remoteStoppedProven?: boolean; pool?: ReturnType<typeof getPool> } = {},
+): Promise<{
+  revoked: boolean
+  operation_id: string
+  state: 'released' | 'unknown' | 'unchanged'
+  remoteStoppedProven: boolean
+}> {
+  const pool = options.pool ?? getPool()
+  const remoteStoppedProven = options.remoteStoppedProven === true
+  const targetState = remoteStoppedProven ? 'released' : 'unknown'
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const res = await client.query(
+      `UPDATE remote_agent_bindings
+          SET state = $2,
+              updated_at = NOW()
+        WHERE operation_id = $1 AND state NOT IN ('released', 'unknown')
+        RETURNING profile_id, state`,
+      [operationId, targetState],
+    )
+    if (res.rows.length > 0 && remoteStoppedProven) {
+      await client.query(
+        `UPDATE remote_agent_profiles
+            SET hot_slots = GREATEST(0, hot_slots - 1),
+                active_slots = GREATEST(0, active_slots - 1),
+                updated_at = NOW()
+          WHERE id = $1`,
+        [res.rows[0]!.profile_id],
+      )
+    }
+    await client.query('COMMIT')
+    return {
+      revoked: res.rows.length > 0,
+      operation_id: operationId,
+      state: res.rows.length > 0 ? targetState : 'unchanged',
+      remoteStoppedProven,
+    }
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {}
+    throw err
+  } finally {
+    client.release()
+  }
 }
 
 /** OCV5-424 `PoolAdapter` implementation for `remote_agent_profiles`. */

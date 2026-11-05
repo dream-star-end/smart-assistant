@@ -1,4 +1,4 @@
--- order-dependency: 0143_model_catalog.sql
+-- order-dependency: 0143_model_catalog
 -- OCV5-721: Remote Agent Brain Pool (nodes, profiles, model offers, active bindings)
 -- and model_catalog.placement column for transition-period remote model suffixing.
 -- compat: Additive tables + additive column with DEFAULT 'local' on model_catalog. Old binaries ignore the new tables and default placement to 'local'. No backfill and no balance change.

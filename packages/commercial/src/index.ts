@@ -195,6 +195,7 @@ import {
   startApiKeyPoolCache,
 } from "./account-pool/apiKeyPool.js";
 import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
+import { registerRemoteBrainPoolAdapter } from "./account-pool/remoteBrainPool.js";
 import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
 import { configureAffinitySettings } from "./account-pool/policy/affinity.js";
 import { getSystemSetting } from "./admin/systemSettings.js";
@@ -6292,6 +6293,7 @@ export async function registerCommercial(
   registerPoolAdapter(createGeminiPoolAdapter({
     clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? "",
   }));
+  registerRemoteBrainPoolAdapter();
   if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
     leaderBundle.add({
       name: "cooldownRecovery",

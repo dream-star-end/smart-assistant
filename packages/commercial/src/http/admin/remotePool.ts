@@ -3,102 +3,23 @@
  * and session preheat endpoint (`POST /api/sessions/preheat`).
  */
 
-import { execFile } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { resolve } from 'node:path'
-import { promisify } from 'node:util'
-import { loadBoxBridgeMod } from '@openclaude/gateway'
 import { writeAdminAuditBestEffort } from '../../admin/audit.js'
 import { requireAdmin, requireAdminVerifyDb } from '../../admin/requireAdmin.js'
 import {
   createRemoteAgentNode,
   getRemoteHostdSha256,
   listRemotePoolOverview,
+  preheatRemotePoolSession,
   probeRemoteAgentNodeLive,
   publishRemoteModelOffers,
   revokeRemoteAgentBinding,
   updateRemoteProfileAdminState,
   type RemoteBrainEngine,
-  type RemoteNodeProbePayload,
 } from '../../account-pool/remoteBrainPool.js'
 import { query } from '../../db/queries.js'
 import type { CommercialHttpDeps, RequestContext } from '../handlers.js'
 import { HttpError, readJsonBody, sendJson } from '../util.js'
-
-const execFileAsync = promisify(execFile)
-
-const DEFAULT_FALLBACK_PROBE_PROFILES: RemoteNodeProbePayload['profiles'] = [
-  {
-    engine: 'cc',
-    profile_name: 'default',
-    account_fingerprint: 'cc-default-interactive-fp',
-    account_hint: 'cc:default (interactive)',
-    plan_type: 'max',
-    cli_version: 'claude-code 2.1.x (tmux+oc-bridge)',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6' },
-      { upstream_model_id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7' },
-      { upstream_model_id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 12, resetsAt: null },
-      { label: '7d', usedPct: 28, resetsAt: null },
-    ],
-  },
-  {
-    engine: 'codex',
-    profile_name: 'default',
-    account_fingerprint: 'codex-default-fp',
-    account_hint: 'codex:default',
-    plan_type: 'pro',
-    cli_version: 'codex 0.118.x',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'gpt-5.4', display_name: 'GPT-5.4' },
-      { upstream_model_id: 'gpt-5.3-codex', display_name: 'GPT-5.3 Codex' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 8, resetsAt: null },
-      { label: '7d', usedPct: 19, resetsAt: null },
-    ],
-  },
-  {
-    engine: 'antigravity',
-    profile_name: 'default',
-    account_fingerprint: 'antigravity-default-fp',
-    account_hint: 'antigravity:default',
-    plan_type: 'ultra',
-    cli_version: 'agy 2.0.x',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'gemini-3.1-pro', display_name: 'Gemini 3.1 Pro' },
-      { upstream_model_id: 'gemini-3.0-flash', display_name: 'Gemini 3.0 Flash' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 5, resetsAt: null },
-      { label: '7d', usedPct: 14, resetsAt: null },
-    ],
-  },
-  {
-    engine: 'grok-build',
-    profile_name: 'default',
-    account_fingerprint: 'grok-build-default-fp',
-    account_hint: 'grok-build:default',
-    plan_type: 'supergrok',
-    cli_version: 'grok-build 1.2.x',
-    runner_mode: 'interactive',
-    discovered_models: [
-      { upstream_model_id: 'grok-4.20', display_name: 'Grok 4.20' },
-      { upstream_model_id: 'grok-code-fast-1', display_name: 'Grok Code Fast 1' },
-    ],
-    quota_windows: [
-      { label: '5h', usedPct: 4, resetsAt: null },
-      { label: '7d', usedPct: 11, resetsAt: null },
-    ],
-  },
-]
 
 export async function handleAdminRemotePoolGet(
   _req: IncomingMessage,
@@ -165,17 +86,8 @@ export async function handleAdminRemotePoolNodeAction(
   const probeMatch = /^\/api\/admin\/remote-pool\/nodes\/([0-9a-f-]{36})\/probe$/.exec(url.pathname)
   if (req.method === 'POST' && probeMatch) {
     const nodeId = probeMatch[1]!
-    const body = ((await readJsonBody(req).catch(() => ({}))) ?? {}) as Record<string, unknown>
-    const overridePayload: RemoteNodeProbePayload | undefined = Array.isArray(body.profiles)
-      ? {
-          rttMsP50: typeof body.rtt_ms_p50 === 'number' ? body.rtt_ms_p50 : 38,
-          rttMsP95: typeof body.rtt_ms_p95 === 'number' ? body.rtt_ms_p95 : 82,
-          profiles: body.profiles as RemoteNodeProbePayload['profiles'],
-        }
-      : undefined
-
     try {
-      const updated = await probeRemoteAgentNodeLive(nodeId, overridePayload)
+      const updated = await probeRemoteAgentNodeLive(nodeId)
       await writeAdminAuditBestEffort({
         adminUid: admin.uid,
         action: 'remote_pool.node.probe',
@@ -326,12 +238,31 @@ export async function handleSessionPreheat(
   const model = typeof body.model === 'string' ? body.model.trim() : ''
   const sessionKey = typeof body.sessionKey === 'string' ? body.sessionKey.trim() : ''
   const isRemote = model.endsWith('-remote') || model === 'box-claude-sonnet-5'
+  if (!isRemote) {
+    sendJson(res, 200, {
+      ok: true,
+      sessionKey,
+      model,
+      placement: 'local' as const,
+      preheated: false,
+      reason: 'LOCAL_PLACEMENT',
+    })
+    return
+  }
+  const outcome = await preheatRemotePoolSession({
+    uid: String(ctx.auth.uid),
+    sessionKey,
+    canonicalModelId: model,
+  })
   sendJson(res, 200, {
     ok: true,
     sessionKey,
     model,
-    placement: isRemote ? ('remote_pool' as const) : ('local' as const),
-    preheated: true,
+    placement: 'remote_pool' as const,
+    preheated: outcome.preheated,
+    reason: outcome.reason ?? null,
+    selectedProfileId: outcome.selectedProfileId ?? null,
+    selectedNodeId: outcome.selectedNodeId ?? null,
     ttftTargetMs: { p50OverNative: 150, p95OverNative: 400 },
   })
 }

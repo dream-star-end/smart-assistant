@@ -236,18 +236,18 @@ export default function RemotePoolsPage() {
 
   async function handleRevokeBinding(binding: RemoteAgentBinding) {
     const ok = await confirm({
-      title: "强制撤销远端会话绑定",
-      description: `确认销毁会话 ${binding.session_key} (${binding.operation_id.slice(0, 8)}) 的远端热驻留进程并释放槽位？`,
-      confirmText: "撤销并释放",
+      title: "强制隔离远端会话绑定",
+      description: `确认将绑定记录 ${binding.session_key} (${binding.operation_id.slice(0, 8)}) 标记为隔离状态（未经远端停止证明不宣称进程已销毁）？`,
+      confirmText: "确认隔离绑定",
       danger: true,
     });
     if (!ok) return;
     try {
       await adminSend(`/api/admin/remote-pool/bindings/${binding.operation_id}/revoke`, "POST", {});
-      toast.success("远端绑定已撤销");
+      toast.success("远端绑定已隔离");
       reload();
     } catch (e) {
-      toast.error(apiErrorMessage(e, "撤销失败"));
+      toast.error(apiErrorMessage(e, "操作失败"));
     }
   }
 

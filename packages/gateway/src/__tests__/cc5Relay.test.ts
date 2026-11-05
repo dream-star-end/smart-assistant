@@ -172,15 +172,37 @@ async function harness(
   }
   const runId = f.binding.runId
   const financeEvents: string[] = []
+  const activeOperations = new Map<string, string>()
   const finance = {
     async admit(info: Parameters<Cc5FinancePort['admit']>[0]) {
+      if (info.binding.expiresAt <= Date.now()) throw new Error('CC5_FINANCE_BINDING_EXPIRED')
+      if (activeOperations.has(info.binding.operationId)) throw new Error('CC5_FINANCE_OPERATION_BUSY')
       const authority = verifyAuthority(info.authorityEnvelope, f.keyring, Date.now())
+      activeOperations.set(info.binding.operationId, authority.billingRequestId!)
       financeEvents.push('admit')
+      let hostAttempted = false
       return {
-        async beforeHostStart() { financeEvents.push('host-effect') },
+        async beforeHostStart() {
+          hostAttempted = true
+          financeEvents.push('host-effect')
+        },
         async beforeDispatch() { financeEvents.push('dispatch-effect') },
-        async terminal() { financeEvents.push('settled'); return { state: 'proven' as const, requestId: authority.billingRequestId! } },
-        async stop() { financeEvents.push('stop') },
+        async terminal(receipt: unknown) {
+          assert.ok(receipt && typeof receipt === 'object')
+          if (activeOperations.get(info.binding.operationId) === authority.billingRequestId) {
+            activeOperations.delete(info.binding.operationId)
+          }
+          financeEvents.push('settled')
+          return { state: 'proven' as const, requestId: authority.billingRequestId! }
+        },
+        async stop(val: { hostStartAttempted: boolean; userSubmitted: boolean; remoteStopped: boolean }) {
+          if (!hostAttempted && !val.hostStartAttempted && !val.userSubmitted && val.remoteStopped) {
+            if (activeOperations.get(info.binding.operationId) === authority.billingRequestId) {
+              activeOperations.delete(info.binding.operationId)
+            }
+          }
+          financeEvents.push('stop')
+        },
       }
     },
   }
@@ -290,6 +312,12 @@ async function stream(h: Awaited<ReturnType<typeof harness>>) {
     req, response, output, ended: () => ended,
     send(content = 'offline fixture') {
       const bytes = Buffer.from(`${JSON.stringify({ type: 'user', message: { role: 'user', content } })}\n`)
+      const frame = { seq: ++sequence, hash: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.toString('base64') }
+      req.write(`${JSON.stringify(frame)}\n`)
+      return frame
+    },
+    sendInterrupt() {
+      const bytes = Buffer.from(`${JSON.stringify({ type: 'control_request', request_id: 'int-stdin-1', request: { subtype: 'interrupt' } })}\n`)
       const frame = { seq: ++sequence, hash: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.toString('base64') }
       req.write(`${JSON.stringify(frame)}\n`)
       return frame
@@ -617,35 +645,67 @@ test('an oversized tool result is truncated for the model with its original byte
   } finally { s.req.destroy(); await h.close(); f.cleanup() }
 })
 
-test('interrupt aborts active turn without revoking the remote host and permits a subsequent turn admission', async () => {
+test('dual-channel interrupt (HTTP + stdin) settles interrupted turn usage before admitting turn 2 without stopping host', async () => {
   const f = fixture()
   const { h, s } = await start(f)
   try {
+    // 1) HTTP /interrupt arrives first, followed by stdin control_request interrupt (B1 race)
     const intRes = await rpc(h.socketPath, '/interrupt', h.scope)
     assert.equal(intRes.ok, true)
     assert.equal(intRes.interrupted, true)
-    assert.equal(intRes.phase, 'idle')
+    s.sendInterrupt()
+    await new Promise((r) => setTimeout(r, 20))
     assert.equal(h.counts().stops, 0)
+
+    // 2) Host emits interrupted terminal result with real token usage; relay settles finance and releases activeOperations (B2)
+    h.output.write(
+      terminal(f, {
+        subtype: 'interrupted',
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+    )
+    await until(() => h.financeEvents.filter((e) => e === 'settled').length === 1)
+    assert.equal(h.counts().stops, 0)
+
+    // 3) Even a late trailing stdin interrupt after idle is idempotent and does not stop the host
+    s.sendInterrupt()
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(h.counts().stops, 0)
+
+    // 4) Turn 2 admission succeeds because turn 1 finance activeOperations was properly released by receipt settlement
     const next = f.nextTurn()
     const admitted = await h.admit(next)
     assert.equal(admitted.ready, true)
     s.send('second turn after interrupt')
     await until(() => h.written.length >= 3)
     h.output.write(terminal(f))
-    await until(() => h.financeEvents.includes('settled'))
+    await until(() => h.financeEvents.filter((e) => e === 'settled').length === 2)
     assert.deepEqual(h.counts(), { starts: 1, stops: 0 })
   } finally { s.req.destroy(); await h.close(); f.cleanup() }
 })
 
-test('stream reconnect with higher generation fences stale stream and replays buffered output after lastAckedSeq', async () => {
+test('stream transport disconnect detaches without stop, higher generation fences stale writer, and sequence gap returns 409', async () => {
   const f = fixture()
   const { h, s } = await start(f)
   let req2: ReturnType<typeof request> | undefined
+  let reqGap: ReturnType<typeof request> | undefined
   try {
     h.output.write(terminal(f))
     await until(() => Buffer.concat(s.output).includes(Buffer.from('"type":"result"')))
     const next = f.nextTurn()
     await h.admit(next)
+
+    // Abrupt client disconnect (ECONNRESET / destroy) detaches stream without stopping remote host (B4)
+    s.req.destroy(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(h.counts().stops, 0)
+
+    // Reconnect with generation=1 and lastAckedSeq=0 replays buffered frames
     const replayed: Buffer[] = []
     req2 = request({ socketPath: h.socketPath, path: '/session/open', method: 'POST' })
     req2.on('error', () => {})
@@ -654,7 +714,7 @@ test('stream reconnect with higher generation fences stale stream and replays bu
         res.on('data', (bytes) => replayed.push(Buffer.from(bytes)))
         res.on('error', () => {})
         if (res.statusCode === 200) resolve()
-        else reject(new Error('reconnect stream not admitted'))
+        else reject(new Error(`reconnect stream not admitted: ${String(res.statusCode)}`))
       })
       req2!.once('error', reject)
     })
@@ -662,5 +722,5 @@ test('stream reconnect with higher generation fences stale stream and replays bu
     await ready2
     await until(() => Buffer.concat(replayed).includes(Buffer.from('"type":"result"')))
     assert.equal(h.counts().stops, 0)
-  } finally { req2?.destroy(); s.req.destroy(); await h.close(); f.cleanup() }
+  } finally { reqGap?.destroy(); req2?.destroy(); s.req.destroy(); await h.close(); f.cleanup() }
 })

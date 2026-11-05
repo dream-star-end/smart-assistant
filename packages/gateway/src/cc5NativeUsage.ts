@@ -86,11 +86,6 @@ export class Cc5NativeUsageObserver {
       }
     }
     if (row.type !== 'result') return { bytes }
-    if (this.interrupted) {
-      this.terminalSeen = true
-      this.interrupted = false
-      return { bytes }
-    }
     requireUsage((this.turn || this.options.legacySingleTurn) && !this.terminalSeen && this.nativeSessionId && row.session_id === this.nativeSessionId &&
       this.upstreamModel === CC5_NATIVE_UPSTREAM_MODEL && typeof row.is_error === 'boolean' &&
       (row.is_error
@@ -111,6 +106,7 @@ export class Cc5NativeUsageObserver {
     }
     this.resultDigests.add(resultSha256)
     this.terminalSeen = true
+    this.interrupted = false
     const receipt: Cc5NativeTerminalReceipt = Object.freeze({
       ...(this.turn ? { version: 2 as const, ...this.turn } : { version: 1 as const }), backendKind: this.binding.backendKind,
       uid: this.binding.uid, containerDbId: this.binding.containerDbId, dockerId: this.binding.dockerId,

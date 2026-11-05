@@ -347,7 +347,7 @@ test('native backend requires the same signed scope, never just the Sonnet model
   assert.equal(f.counts().prepared, 0)
 })
 
-test('cc5 Runner interrupt sends control_request and calls port.interrupt without shutting down the bridge', async () => {
+test('cc5 Runner interrupt uses port.interrupt as single canonical sender and allows turn 2 on same live bridge', async () => {
   const f = fixture()
   let interrupted = 0
   f.port.interrupt = async () => {
@@ -360,8 +360,36 @@ test('cc5 Runner interrupt sends control_request and calls port.interrupt withou
   assert.equal(interrupted, 1)
   assert.equal(f.counts().stopped, 0)
   assert.equal(runner.isRunning, true)
+  // Canonical control plane port.interrupt avoids duplicate stdin control_request race (B1)
+  assert.equal(f.writes.length, 1)
+
+  // Emit interrupted turn result so runner returns to idle, then submit turn 2 on the same live bridge
+  f.proc.stdout.write(
+    `${JSON.stringify({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      session_id: '00000000-0000-4000-8000-000000000099',
+      uuid: '00000000-0000-4000-8000-000000000098',
+      duration_ms: 12,
+      num_turns: 1,
+      result: 'interrupted',
+      stop_reason: 'end_turn',
+      total_cost_usd: 0.001,
+      usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    })}\n`,
+  )
+  await new Promise((resolve) => setTimeout(resolve, 25))
+  const auth2 = {
+    ...authority,
+    authorityId: randomUUID(),
+    billingRequestId: randomUUID(),
+  }
+  await runner.submit('second turn after interrupt', undefined, auth2, 'turn2')
+  assert.equal(f.counts().prepared, 1)
+  assert.equal(f.counts().admitted, 2)
+  assert.equal(f.counts().stopped, 0)
   assert.equal(f.writes.length, 2)
-  assert.equal(JSON.parse(f.writes[1]!).type, 'control_request')
   await runner.shutdown()
   assert.equal(f.counts().stopped, 1)
 })

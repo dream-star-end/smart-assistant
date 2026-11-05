@@ -1,7 +1,10 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { resolve } from 'node:path'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import {
   formatRemoteModelDisplayName,
   projectPublicModels,
@@ -14,9 +17,13 @@ import {
   loadBoxBridgeMod,
 } from '@openclaude/gateway'
 import {
+  applyRemoteNodeProbeResult,
   buildRemoteNodeInstallCommand,
+  computeAggregatedRemoteCatalogState,
+  preheatRemotePoolSession,
   rankRemotePoolCandidates,
   toRemotePoolModelId,
+  verifyAndMaterializePinnedKnownHosts,
   type RemoteCandidateMember,
 } from '../remoteBrainPool.js'
 
@@ -260,5 +267,216 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
     assert.equal(selfCheck.ok, true)
     assert.equal(selfCheck.cc_print_mode_blocked, true)
     assert.equal(selfCheck.credential_paths_isolated, true)
+  })
+
+  it('verifyAndMaterializePinnedKnownHosts pins verified SHA256 host_key_fp and rejects mismatches (B8)', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'oc-rpool-test-kh-'))
+    try {
+      const dummyKeyBytes = Buffer.from('ssh-ed25519-test-public-key-payload-for-ocv5-721')
+      const b64Key = dummyKeyBytes.toString('base64')
+      const expectedFp = `SHA256:${createHash('sha256').update(dummyKeyBytes).digest('base64').replace(/=+$/, '')}`
+      const wrongFp = `SHA256:${'A'.repeat(43)}`
+      const candidateKh = join(tmpDir, 'candidate_known_hosts')
+      writeFileSync(candidateKh, `198.51.100.42 ssh-ed25519 ${b64Key}\n`, { mode: 0o600 })
+
+      const pinned = await verifyAndMaterializePinnedKnownHosts({
+        sshHost: '198.51.100.42',
+        sshPort: 22,
+        expectedHostKeyFp: expectedFp,
+        candidateKnownHostsFiles: [candidateKh],
+      })
+      try {
+        const content = readFileSync(pinned.knownHostsPath, 'utf8')
+        assert.equal(content, `198.51.100.42 ssh-ed25519 ${b64Key}\n`)
+      } finally {
+        pinned.cleanup()
+      }
+
+      await assert.rejects(
+        () =>
+          verifyAndMaterializePinnedKnownHosts({
+            sshHost: '198.51.100.42',
+            sshPort: 22,
+            expectedHostKeyFp: wrongFp,
+            candidateKnownHostsFiles: [candidateKh],
+          }),
+        /REMOTE_NODE_HOST_KEY_FP_MISMATCH/,
+      )
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('applyRemoteNodeProbeResult enforces runner_mode=interactive, logged_in, tmux_version and mod_digest (B6 & B8)', async () => {
+    const mod = loadBoxBridgeMod()
+    // Missing runner_mode is rejected (no default fallback to interactive)
+    await assert.rejects(
+      () =>
+        applyRemoteNodeProbeResult('00000000-0000-0000-0000-000000000001', {
+          profiles: [
+            {
+              engine: 'cc',
+              profile_name: 'default',
+              account_fingerprint: 'fp-1',
+              tmux_version: 'tmux 3.4',
+              mod_digest: mod.sha256,
+              discovered_models: [{ upstream_model_id: 'claude-opus-4-7', display_name: 'Opus 4.7' }],
+            },
+          ],
+        }),
+      /REMOTE_CC_PRINT_MODE_FORBIDDEN/,
+    )
+
+    // Unauthenticated profile (logged_in: false) is rejected
+    await assert.rejects(
+      () =>
+        applyRemoteNodeProbeResult('00000000-0000-0000-0000-000000000001', {
+          profiles: [
+            {
+              engine: 'cc',
+              profile_name: 'default',
+              account_fingerprint: 'fp-1',
+              runner_mode: 'interactive',
+              logged_in: false,
+              tmux_version: 'tmux 3.4',
+              mod_digest: mod.sha256,
+              discovered_models: [{ upstream_model_id: 'claude-opus-4-7', display_name: 'Opus 4.7' }],
+            },
+          ],
+        }),
+      /REMOTE_PROFILE_NOT_LOGGED_IN/,
+    )
+
+    // CC profile without tmux_version is rejected
+    await assert.rejects(
+      () =>
+        applyRemoteNodeProbeResult('00000000-0000-0000-0000-000000000001', {
+          profiles: [
+            {
+              engine: 'cc',
+              profile_name: 'default',
+              account_fingerprint: 'fp-1',
+              runner_mode: 'interactive',
+              logged_in: true,
+              mod_digest: mod.sha256,
+              discovered_models: [{ upstream_model_id: 'claude-opus-4-7', display_name: 'Opus 4.7' }],
+            },
+          ],
+        }),
+      /REMOTE_CC_TMUX_REQUIRED/,
+    )
+
+    // CC profile with wrong mod_digest is rejected
+    await assert.rejects(
+      () =>
+        applyRemoteNodeProbeResult('00000000-0000-0000-0000-000000000001', {
+          profiles: [
+            {
+              engine: 'cc',
+              profile_name: 'default',
+              account_fingerprint: 'fp-1',
+              runner_mode: 'interactive',
+              logged_in: true,
+              tmux_version: 'tmux 3.4',
+              mod_digest: 'f'.repeat(64),
+              discovered_models: [{ upstream_model_id: 'claude-opus-4-7', display_name: 'Opus 4.7' }],
+            },
+          ],
+        }),
+      /REMOTE_CC_BRIDGE_MOD_DIGEST_MISMATCH/,
+    )
+  })
+
+  it('computeAggregatedRemoteCatalogState aggregates multi-node offers and preserves global admin disable (B7 & B9)', () => {
+    // 1. When execution backend is not enabled, new offers stay staged (not active)
+    assert.deepEqual(
+      computeAggregatedRemoteCatalogState({
+        prevActiveOfferCount: 0,
+        nextActiveOfferCount: 1,
+        existingCatalogState: null,
+        executionEnabled: false,
+      }),
+      {
+        catalogState: 'staged',
+        pricingEnabled: false,
+        globalAdminDisabled: false,
+      },
+    )
+
+    // 2. When execution backend is enabled and >=1 offer is active, model becomes active
+    assert.deepEqual(
+      computeAggregatedRemoteCatalogState({
+        prevActiveOfferCount: 0,
+        nextActiveOfferCount: 2,
+        existingCatalogState: 'staged',
+        executionEnabled: true,
+      }),
+      {
+        catalogState: 'active',
+        pricingEnabled: true,
+        globalAdminDisabled: false,
+      },
+    )
+
+    // 3. Disabling one node's offer when another node still serves the same model keeps catalog active
+    assert.deepEqual(
+      computeAggregatedRemoteCatalogState({
+        prevActiveOfferCount: 2,
+        nextActiveOfferCount: 1,
+        existingCatalogState: 'active',
+        executionEnabled: true,
+      }),
+      {
+        catalogState: 'active',
+        pricingEnabled: true,
+        globalAdminDisabled: false,
+      },
+    )
+
+    // 4. Disabling the last remaining offer transitions catalog to disabled
+    assert.deepEqual(
+      computeAggregatedRemoteCatalogState({
+        prevActiveOfferCount: 1,
+        nextActiveOfferCount: 0,
+        existingCatalogState: 'active',
+        executionEnabled: true,
+      }),
+      {
+        catalogState: 'disabled',
+        pricingEnabled: false,
+        globalAdminDisabled: false,
+      },
+    )
+
+    // 5. Global catalog admin disable is never overridden by a single profile offer update
+    assert.deepEqual(
+      computeAggregatedRemoteCatalogState({
+        prevActiveOfferCount: 1,
+        nextActiveOfferCount: 2,
+        existingCatalogState: 'disabled',
+        executionEnabled: true,
+      }),
+      {
+        catalogState: 'disabled',
+        pricingEnabled: false,
+        globalAdminDisabled: true,
+      },
+    )
+  })
+
+  it('preheatRemotePoolSession honestly reports REMOTE_POOL_EXECUTION_DISABLED when execution is gated off (B7)', async () => {
+    const prev = process.env.OC_REMOTE_POOL_EXECUTION_ENABLED
+    delete process.env.OC_REMOTE_POOL_EXECUTION_ENABLED
+    try {
+      const res = await preheatRemotePoolSession({
+        uid: '1001',
+        session_key: 'sess-1',
+        model_id: 'claude-opus-4-7-remote',
+      })
+      assert.equal(res.preheated, false)
+      assert.equal(res.reason, 'REMOTE_POOL_EXECUTION_DISABLED')
+    } finally {
+      if (prev !== undefined) process.env.OC_REMOTE_POOL_EXECUTION_ENABLED = prev
+    }
   })
 })

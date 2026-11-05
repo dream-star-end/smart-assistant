@@ -124,6 +124,64 @@ export function readCc5Binding(
   }
 }
 
+/**
+ * Re-read a supervisor-updated `binding.json` (at `CC5_BINDING_FILE` or adjacent to `socketPath`),
+ * verifying that every immutable identity field matches `initial` before accepting an extended `expiresAt`.
+ */
+export function refreshCc5Binding(
+  initial: Readonly<Cc5BridgeBinding>,
+  socketPath = CC5_RELAY_SOCKET,
+  now = Date.now(),
+): Readonly<Cc5BridgeBinding> {
+  assertCc5BindingScope(initial)
+  const candidatePath =
+    socketPath === CC5_RELAY_SOCKET ? CC5_BINDING_FILE : `${dirname(socketPath)}/binding.json`
+  try {
+    const dir = lstatSync(dirname(candidatePath))
+    requireCc5(
+      dir.isDirectory() &&
+        (dir.uid === 0 || dir.uid === process.getuid?.()) &&
+        (dir.mode & 0o027) === 0,
+    )
+    const fd = openSync(candidatePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    try {
+      const meta = fstatSync(fd)
+      const link = lstatSync(candidatePath)
+      requireCc5(
+        meta.isFile() &&
+          !link.isSymbolicLink() &&
+          meta.ino === link.ino &&
+          meta.dev === link.dev &&
+          (meta.uid === 0 || meta.uid === process.getuid?.()) &&
+          meta.nlink === 1 &&
+          (meta.mode & 0o027) === 0 &&
+          meta.size > 0 &&
+          meta.size <= 4096,
+      )
+      const disk = JSON.parse(readFileSync(fd, 'utf8')) as Cc5BridgeBinding
+      assertCc5BindingScope(disk)
+      requireCc5(
+        disk.capability === initial.capability &&
+          disk.uid === initial.uid &&
+          disk.containerDbId === initial.containerDbId &&
+          disk.dockerId === initial.dockerId &&
+          disk.operationId === initial.operationId &&
+          disk.runId === initial.runId &&
+          disk.sessionKey === initial.sessionKey &&
+          disk.canonicalModel === initial.canonicalModel &&
+          disk.backendKind === initial.backendKind &&
+          disk.expiresAt >= initial.expiresAt &&
+          disk.expiresAt > now,
+      )
+      return Object.freeze(disk)
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return initial
+  }
+}
+
 export function readCc5AuthorityKeyring(): AuthorityKeyring {
   try {
     const value = readSupervisorJson(CC5_AUTHORITY_KEYRING_FILE) as {

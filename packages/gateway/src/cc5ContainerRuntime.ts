@@ -192,10 +192,40 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
       const mountSource = join(childPath, 'view')
       const bindingPath = join(mountSource, 'binding.json')
       const authorityPath = join(mountSource, 'authority-public.json')
-      if (
+      if (existsSync(join(childPath, 'released.json'))) {
+        try {
+          const prep = JSON.parse(readFileSync(join(childPath, 'prepared.json'), 'utf8')) as {
+            containerDbId?: string
+            runId?: string
+            operationId?: string
+          }
+          const rel = JSON.parse(readFileSync(join(childPath, 'released.json'), 'utf8')) as {
+            remoteStopped?: boolean
+          }
+          requireRuntime(
+            rel?.remoteStopped === true &&
+              typeof prep?.containerDbId === 'string' &&
+              /^[1-9][0-9]{0,18}$/.test(prep.containerDbId),
+          )
+          const handle = Object.freeze({ mountSource, containerDbId: prep.containerDbId })
+          const releasedRecord: RecordState = {
+            handle,
+            root: childPath,
+            keyring: new Map(),
+            runId: String(prep.runId ?? options.profile.runId),
+            operationId: String(prep.operationId ?? options.profile.operationId),
+            capability: '',
+            state: 'released',
+          }
+          this.records.set(prep.containerDbId, releasedRecord)
+          this.handles.set(handle, releasedRecord)
+        } catch {
+          this.blocked = true
+          requireRuntime(false)
+        }
+      } else if (
         existsSync(join(childPath, 'prepared.json')) &&
         existsSync(join(childPath, 'activated.json')) &&
-        !existsSync(join(childPath, 'released.json')) &&
         existsSync(bindingPath) &&
         existsSync(authorityPath)
       ) {
@@ -208,38 +238,96 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
             version?: number
             keyring?: string
           }
-          if (
-            pub?.version === 1 &&
-            typeof pub.keyring === 'string' &&
-            binding.uid === this.testUid &&
-            binding.sessionKey === options.scope.sessionKey &&
-            binding.canonicalModel === options.scope.canonicalModel &&
-            binding.operationId === options.profile.operationId &&
-            binding.runId === options.profile.runId &&
-            binding.expiresAt > Date.now()
-          ) {
-            const keyring = parseAuthorityKeyring(pub.keyring)
-            const finance = this.financeFactory(binding)
-            if (keyring.size > 0 && finance) {
-              const handle = Object.freeze({ mountSource, containerDbId: binding.containerDbId })
-              const recovered: RecordState = {
-                handle,
-                root: childPath,
-                keyring,
-                runId: binding.runId,
-                operationId: binding.operationId,
-                capability: binding.capability,
-                binding,
-                finance,
-                state: 'active',
-              }
-              this.records.set(binding.containerDbId, recovered)
-              this.handles.set(handle, recovered)
-            }
+          const act = JSON.parse(readFileSync(join(childPath, 'activated.json'), 'utf8')) as {
+            version?: number
+            dockerId?: string
           }
+          requireRuntime(
+            pub?.version === 1 &&
+              typeof pub.keyring === 'string' &&
+              act?.version === 1 &&
+              act.dockerId === binding.dockerId &&
+              binding.uid === this.testUid &&
+              binding.sessionKey === options.scope.sessionKey &&
+              binding.canonicalModel === options.scope.canonicalModel &&
+              binding.operationId === options.profile.operationId &&
+              binding.runId === options.profile.runId &&
+              binding.expiresAt > Date.now(),
+          )
+          const keyring = parseAuthorityKeyring(pub.keyring)
+          const finance = this.financeFactory(binding)
+          requireRuntime(keyring.size > 0 && finance)
+          const handle = Object.freeze({ mountSource, containerDbId: binding.containerDbId })
+          const toolSocketPath = join(childPath, 'tool.sock')
+          const controlSocketPath = join(mountSource, 'relay.sock')
+          const host = (this.options.hostFactory ?? ((config) => new Cc5SshHost(config)))({
+            ...this.options.ssh,
+            operationId: binding.operationId,
+            runId: binding.runId,
+            toolSocketPath,
+          })
+          const recovered: RecordState = {
+            handle,
+            root: childPath,
+            keyring,
+            runId: binding.runId,
+            operationId: binding.operationId,
+            capability: binding.capability,
+            binding,
+            finance,
+            state: 'activating',
+          }
+          const relay = new Cc5Relay(
+            binding,
+            keyring,
+            binding.runId,
+            host,
+            join(childPath, 'journal'),
+            finance,
+            {
+              slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
+              recoverExistingJournal: true,
+              onBindingExtended: (expiresAt: number) => {
+                requireRuntime(
+                  recovered.binding &&
+                    recovered.state !== 'released' &&
+                    recovered.state !== 'unknown',
+                )
+                const nextBinding = Object.freeze({ ...recovered.binding, expiresAt })
+                overwriteProtectedBinding(handle.mountSource, nextBinding)
+                recovered.binding = nextBinding
+              },
+            },
+          )
+          recovered.relay = relay
+          this.listenSync(relay.toolServer, toolSocketPath, 0, 0)
+          this.listenSync(relay.controlServer, controlSocketPath, 1000, 1000)
+          recovered.state = 'active'
+          this.records.set(binding.containerDbId, recovered)
+          this.handles.set(handle, recovered)
         } catch {
-          // Unrecoverable stale directory remains ignored unless UNKNOWN.json is present.
+          this.blocked = true
+          try {
+            if (!existsSync(join(childPath, 'UNKNOWN.json'))) {
+              writePrivate(join(childPath, 'UNKNOWN.json'), {
+                version: 1,
+                reason: 'recovery-unproved',
+              })
+            }
+          } catch {}
+          requireRuntime(false)
         }
+      } else {
+        this.blocked = true
+        try {
+          if (!existsSync(join(childPath, 'UNKNOWN.json'))) {
+            writePrivate(join(childPath, 'UNKNOWN.json'), {
+              version: 1,
+              reason: 'incomplete-state-unproved',
+            })
+          }
+        } catch {}
+        requireRuntime(false)
       }
     }
     syncDirectory(dirname(options.baseRoot))
@@ -251,7 +339,7 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     requireRuntime(input.canonicalModel === this.options.scope.canonicalModel && input.engine === 'ccb')
     const record = this.records.get(String(input.containerId))
     requireRuntime(!this.blocked && record?.state === 'active' && record.binding &&
-      record.binding.expiresAt > Date.now() && record.finance)
+      record.binding.expiresAt > Date.now() && record.finance && record.relay)
     return Object.freeze({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: record.binding.sessionKey,
       operationId: record.binding.operationId })
   }
@@ -364,11 +452,12 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
         {
           slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
           onBindingExtended: (expiresAt: number) => {
-            if (!record.binding || record.state === 'released' || record.state === 'unknown') return
-            record.binding = Object.freeze({ ...record.binding, expiresAt })
-            try {
-              overwriteProtectedBinding(handle.mountSource, record.binding)
-            } catch {}
+            requireRuntime(
+              record.binding && record.state !== 'released' && record.state !== 'unknown',
+            )
+            const nextBinding = Object.freeze({ ...record.binding, expiresAt })
+            overwriteProtectedBinding(handle.mountSource, nextBinding)
+            record.binding = nextBinding
           },
         },
       )
@@ -388,6 +477,18 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     })
     // The provisioning caller must release this handle on any activation failure.
     return record.activation
+  }
+  private listenSync(server: Server, path: string, uid: number, gid: number): void {
+    if (existsSync(path)) {
+      const existing = lstatSync(path)
+      requireRuntime(existing.isSocket() && !existing.isSymbolicLink())
+      rmSync(path, { force: false })
+    }
+    server.listen(path)
+    const socket = lstatSync(path)
+    requireRuntime(socket.isSocket() && socket.uid === 0 && socket.nlink === 1)
+    chmodSync(path, 0o600)
+    chownSync(path, uid, gid)
   }
   private async listen(server: Server, path: string, uid: number, gid: number): Promise<void> {
     await new Promise<void>((resolve, reject) => {
@@ -412,13 +513,19 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     if (!record) return Promise.resolve()
     requireRuntime(!dockerId || !record.binding || record.binding.dockerId === dockerId)
     if (record.release) return record.release
+    const priorState = record.state
     // Revoke synchronously before waiting for remote proof. Never auto reset an unknown operation.
     record.state = 'released'
-    const stopped = record.relay?.stop()
+    const stopped = record.relay
+      ? record.relay.stop()
+      : priorState === 'prepared' || priorState === 'bound'
+        ? Promise.resolve({ remoteStopped: true as const })
+        : Promise.reject(new Error(REJECTED))
     record.release = (async () => {
       let proven = true
       try {
-        await stopped
+        const res = await stopped
+        requireRuntime(res?.remoteStopped === true)
       } catch {
         proven = false
         record.state = 'unknown'

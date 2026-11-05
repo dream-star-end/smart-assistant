@@ -1998,19 +1998,8 @@ export class SubprocessRunner extends EventEmitter {
 
   // 发送 interrupt control request — CCB 会中止当前 turn
   interrupt(): boolean {
-    if (this.opts.cc5BridgePort) {
-      void this.opts.cc5BridgePort.interrupt?.().catch(() => {})
-      if (!this.proc) return true
-      try {
-        const req = {
-          type: 'control_request',
-          request_id: `int-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          request: { subtype: 'interrupt' },
-        }
-        this.proc.stdin.write(`${JSON.stringify(req)}\n`)
-      } catch {
-        // best-effort control frame alongside bridge /interrupt
-      }
+    if (this.opts.cc5BridgePort?.interrupt) {
+      void this.opts.cc5BridgePort.interrupt().catch(() => {})
       return true
     }
     if (!this.proc) return false

@@ -159,6 +159,9 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
         email = None
         plan_type = "max"
         logged_in = False
+        used_5h: Optional[float] = None
+        used_7d: Optional[float] = None
+        discovered_models = list(DEFAULT_MODELS_BY_ENGINE["cc"])
         for candidate in (cfg_dir / ".credentials.json", cfg_dir / "config.json", home / ".claude.json"):
             if candidate.is_file():
                 try:
@@ -170,6 +173,19 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                             plan_type = acct.get("SubscriptionType") or acct.get("planType") or plan_type
                         if data.get("claudeAiOauth") or email:
                             logged_in = True
+                        if isinstance(data.get("five_hour_used_pct"), (int, float)):
+                            used_5h = float(data["five_hour_used_pct"])
+                        if isinstance(data.get("seven_day_used_pct"), (int, float)):
+                            used_7d = float(data["seven_day_used_pct"])
+                        if isinstance(data.get("available_models"), list) and data["available_models"]:
+                            discovered_models = [
+                                {
+                                    "upstream_model_id": str(m.get("upstream_model_id") or m.get("id")),
+                                    "display_name": str(m.get("display_name") or m.get("name") or m.get("id")),
+                                }
+                                for m in data["available_models"]
+                                if isinstance(m, dict) and (m.get("upstream_model_id") or m.get("id"))
+                            ] or discovered_models
                 except Exception:
                     pass
         raw_id = email or f"{os.uname().nodename}:cc:{profile_name}"
@@ -185,10 +201,10 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                 "account_hint": mask_email(email) or f"cc:{profile_name}",
                 "account_fingerprint": account_fingerprint("cc", raw_id),
                 "plan_type": str(plan_type),
-                "discovered_models": DEFAULT_MODELS_BY_ENGINE["cc"],
+                "discovered_models": discovered_models if logged_in else [],
                 "quota_windows": [
-                    {"label": "5h", "usedPct": 0, "resetsAt": None},
-                    {"label": "7d", "usedPct": 0, "resetsAt": None},
+                    {"label": "5h", "usedPct": used_5h, "resetsAt": None},
+                    {"label": "7d", "usedPct": used_7d, "resetsAt": None},
                 ],
             }
         )
@@ -202,6 +218,8 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
     email = None
     plan_type = "pro"
     logged_in = False
+    used_5h: Optional[float] = None
+    used_7d: Optional[float] = None
     for f in auth_files:
         if f.is_file():
             logged_in = True
@@ -210,6 +228,10 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                 if isinstance(data, dict):
                     email = data.get("email") or data.get("account_email") or email
                     plan_type = data.get("plan") or data.get("plan_type") or plan_type
+                    if isinstance(data.get("five_hour_used_pct"), (int, float)):
+                        used_5h = float(data["five_hour_used_pct"])
+                    if isinstance(data.get("seven_day_used_pct"), (int, float)):
+                        used_7d = float(data["seven_day_used_pct"])
             except Exception:
                 pass
     raw_id = email or f"{os.uname().nodename}:{engine}:default"
@@ -224,13 +246,31 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
             "account_hint": mask_email(email) or f"{engine}:default",
             "account_fingerprint": account_fingerprint(engine, raw_id),
             "plan_type": str(plan_type),
-            "discovered_models": DEFAULT_MODELS_BY_ENGINE.get(engine, []),
+            "discovered_models": DEFAULT_MODELS_BY_ENGINE.get(engine, []) if logged_in else [],
             "quota_windows": [
-                {"label": "5h", "usedPct": 0, "resetsAt": None},
-                {"label": "7d", "usedPct": 0, "resetsAt": None},
+                {"label": "5h", "usedPct": used_5h, "resetsAt": None},
+                {"label": "7d", "usedPct": used_7d, "resetsAt": None},
             ],
         }
     ]
+
+
+def check_credential_paths_isolated(home: pathlib.Path) -> bool:
+    uid = os.getuid()
+    try:
+        if not home.is_dir() or home.is_symlink():
+            return False
+        for rel in (".ssh", ".claude", ".codex"):
+            target = home / rel
+            if target.exists():
+                if target.is_symlink():
+                    return False
+                st = target.lstat()
+                if st.st_uid != uid or (st.st_mode & 0o022) != 0:
+                    return False
+        return True
+    except Exception:
+        return False
 
 
 def run_gate_g_self_check(home: pathlib.Path) -> Dict[str, Any]:
@@ -241,10 +281,11 @@ def run_gate_g_self_check(home: pathlib.Path) -> Dict[str, Any]:
             return {"ok": False, "reason": "print_flag_not_blocked"}
         except RuntimeError:
             pass
+        isolated = check_credential_paths_isolated(home)
         return {
-            "ok": True,
+            "ok": isolated,
             "cc_print_mode_blocked": True,
-            "credential_paths_isolated": True,
+            "credential_paths_isolated": isolated,
             "checked_at": int(time.time() * 1000),
         }
     except Exception as exc:

@@ -13,6 +13,7 @@ import {
   cc5ControlRequest,
   readCc5AuthorityKeyring,
   readCc5Binding,
+  refreshCc5Binding,
 } from './cc5BridgePort.js'
 import { Cc5ToolObservation } from './cc5ToolObservation.js'
 import { runCc5ToolPump } from './cc5ToolPump.js'
@@ -64,6 +65,10 @@ export async function runCc5StdioBridge(input: {
   let req!: ReturnType<typeof request>
   let readyTimer: ReturnType<typeof setTimeout> | undefined
   let stopPromise: Promise<void> | undefined
+  let generation = 1
+  let lastAckedSeq = 0
+  let reconnectCount = 0
+  let outRemainder = Buffer.alloc(0)
   const stop = (): Promise<void> => {
     if (stopPromise) return stopPromise
     stopping = true
@@ -167,100 +172,159 @@ export async function runCc5StdioBridge(input: {
   const onInputError = (): void => fail('CC5_INPUT_FAILED')
   try {
     await new Promise<void>((resolveDone, reject) => {
-      req = request(
-        {
-          socketPath,
-          method: 'POST',
-          path: '/session/open',
-          headers: {
-            'content-type': 'application/x-ndjson',
-          },
-        },
-        (res) => {
-          if (res.statusCode !== 200 || res.headers['x-cc5-interactive-ready'] !== '1') {
-            fail('CC5_INTERACTIVE_NOT_READY')
-            res.resume()
+      const finishStream = async (): Promise<void> => {
+        try {
+          await stop()
+        } catch {
+          failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+        }
+        if (failure) reject(failure)
+        else if (!ended && !input.signal?.aborted) reject(new Error('CC5_TRANSPORT_CLOSED'))
+        else resolveDone()
+      }
+
+      const openStream = (gen: number, ackSeq: number): void => {
+        ready = false
+        let reconnectingThisStream = false
+        const tryReconnect = (fallbackErrorCode: string): void => {
+          if (stopping || ended || input.signal?.aborted || failure) {
+            void finishStream()
             return
           }
-          ready = true
-          if (input.tools && observation) {
-            toolRun = runCc5ToolPump({
-              binding: input.binding,
-              sessionKey: input.sessionKey,
-              keyring: input.tools.keyring,
-              observation,
-              signal: toolAbort.signal,
-              socketPath,
-              executionRoot: input.tools.executionRoot,
-              executeTool: async (request) => {
-                if (stopping) throw new Error('CC5_TOOLHOST_CLOSED')
-                toolHost ??= input.tools?.hostFactory?.(lifecycleRoot, lifecycleId) ?? new Cc5ToolHost(lifecycleRoot, lifecycleId)
-                return toolHost.execute(request.name, request.arguments, request)
-              },
-            }).catch(() => {
-              if (!stopping) fail('CC5_FIXED_TOOL_FAILED_OR_UNKNOWN')
-            })
-          }
-          clearTimeout(readyTimer)
-          for (const line of pending) req.write(line)
-          pending = []
-          pendingBytes = 0
-          input.stdin.resume()
-          res.on('data', (chunk: Buffer) => {
+          if (reconnectCount < 2) {
+            reconnectCount++
+            reconnectingThisStream = true
+            clearTimeout(readyTimer)
             try {
-              observation?.ingest(chunk)
-            } catch {
-              fail('CC5_ORIGINAL_TOOL_OBSERVATION_INVALID')
+              req?.destroy()
+            } catch {}
+            generation = gen + 1
+            openStream(generation, lastAckedSeq)
+            return
+          }
+          failure ??= new Error(fallbackErrorCode)
+          void finishStream()
+        }
+
+        const currentReq = request(
+          {
+            socketPath,
+            method: 'POST',
+            path: '/session/open',
+            headers: {
+              'content-type': 'application/x-ndjson',
+            },
+          },
+          (res) => {
+            if (res.statusCode === 409) {
+              fail('CC5_STREAM_SEQ_GAP')
+              res.resume()
               return
             }
-            // Exact original authenticated host bytes. No screen scraping or replacement result.
-            if (!input.stdout.write(chunk)) res.pause()
-          })
-          const onDrain = (): void => {
-            res.resume()
-          }
-          input.stdout.on('drain', onDrain)
-          res.once('close', () => {
-            input.stdout.removeListener('drain', onDrain)
-          })
-          res.once('aborted', () => {
-            if (!stopping) fail('CC5_OUTPUT_DELIVERY_UNKNOWN')
-          })
-          res.once('error', () => {
-            if (!stopping) fail('CC5_OUTPUT_FAILED')
-          })
-          res.once('end', () => {
-            if (!stopping) failure ??= new Error('CC5_REMOTE_OUTPUT_ENDED')
-            void stop().catch(() => {
-              failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+            if (res.statusCode !== 200 || res.headers['x-cc5-interactive-ready'] !== '1') {
+              fail('CC5_INTERACTIVE_NOT_READY')
+              res.resume()
+              return
+            }
+            ready = true
+            if (input.tools && observation && !toolRun) {
+              toolRun = runCc5ToolPump({
+                binding: input.binding,
+                bindingProvider: () => refreshCc5Binding(input.binding, socketPath, Date.now()),
+                sessionKey: input.sessionKey,
+                keyring: input.tools.keyring,
+                observation,
+                signal: toolAbort.signal,
+                socketPath,
+                executionRoot: input.tools.executionRoot,
+                executeTool: async (request) => {
+                  if (stopping) throw new Error('CC5_TOOLHOST_CLOSED')
+                  toolHost ??=
+                    input.tools?.hostFactory?.(lifecycleRoot, lifecycleId) ??
+                    new Cc5ToolHost(lifecycleRoot, lifecycleId)
+                  return toolHost.execute(request.name, request.arguments, request)
+                },
+              }).catch(() => {
+                if (!stopping) fail('CC5_FIXED_TOOL_FAILED_OR_UNKNOWN')
+              })
+            }
+            clearTimeout(readyTimer)
+            for (const line of pending) currentReq.write(line)
+            pending = []
+            pendingBytes = 0
+            input.stdin.resume()
+            res.on('data', (chunk: Buffer) => {
+              outRemainder = Buffer.concat([outRemainder, chunk])
+              let nl: number
+              const completePieces: Buffer[] = []
+              while ((nl = outRemainder.indexOf(10)) >= 0) {
+                const frameBytes = outRemainder.subarray(0, nl + 1)
+                outRemainder = outRemainder.subarray(nl + 1)
+                lastAckedSeq++
+                completePieces.push(frameBytes)
+              }
+              if (completePieces.length === 0) return
+              const forward = Buffer.concat(completePieces)
+              try {
+                observation?.ingest(forward)
+              } catch {
+                fail('CC5_ORIGINAL_TOOL_OBSERVATION_INVALID')
+                return
+              }
+              // Exact original authenticated host bytes. No screen scraping or replacement result.
+              if (!input.stdout.write(forward)) res.pause()
             })
-          })
-        },
-      )
-      req.on('drain', () => {
-        if (ready) input.stdin.resume()
-      })
-      req.once('error', () => {
-        if (!stopping) failure ??= new Error('CC5_TRANSPORT_DELIVERY_UNKNOWN')
-        void stop().catch(() => {
-          failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+            const onDrain = (): void => {
+              res.resume()
+            }
+            input.stdout.on('drain', onDrain)
+            res.once('close', () => {
+              input.stdout.removeListener('drain', onDrain)
+            })
+            res.once('aborted', () => {
+              if (!stopping && !reconnectingThisStream) tryReconnect('CC5_OUTPUT_DELIVERY_UNKNOWN')
+            })
+            res.once('error', () => {
+              if (!stopping && !reconnectingThisStream) tryReconnect('CC5_OUTPUT_FAILED')
+            })
+            res.once('end', () => {
+              if (reconnectingThisStream) return
+              if (!stopping && !ended && !input.signal?.aborted) {
+                tryReconnect('CC5_REMOTE_OUTPUT_ENDED')
+                return
+              }
+              void finishStream()
+            })
+          },
+        )
+        req = currentReq
+        currentReq.on('drain', () => {
+          if (ready && req === currentReq) input.stdin.resume()
         })
-      })
-      req.once('close', () => {
-        const finish = async (): Promise<void> => {
-          try {
-            await stop()
-          } catch {
-            failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+        currentReq.once('error', () => {
+          if (!stopping && !reconnectingThisStream) {
+            tryReconnect('CC5_TRANSPORT_DELIVERY_UNKNOWN')
           }
-          if (failure) reject(failure)
-          else if (!ended && !input.signal?.aborted) reject(new Error('CC5_TRANSPORT_CLOSED'))
-          else resolveDone()
-        }
-        void finish()
-      })
-      readyTimer = setTimeout(() => fail('CC5_INTERACTIVE_READY_TIMEOUT'), 90000)
-      req.write(`${JSON.stringify({ type: 'open', ...scope })}\n`)
+        })
+        currentReq.once('close', () => {
+          if (reconnectingThisStream || req !== currentReq) return
+          void finishStream()
+        })
+        clearTimeout(readyTimer)
+        readyTimer = setTimeout(() => fail('CC5_INTERACTIVE_READY_TIMEOUT'), 90000)
+        const latestBinding = refreshCc5Binding(input.binding, socketPath, Date.now())
+        currentReq.write(
+          `${JSON.stringify({
+            type: 'open',
+            ...scope,
+            capability: latestBinding.capability,
+            generation: gen,
+            ...(gen > 1 || ackSeq > 0 ? { lastAckedSeq: ackSeq } : {}),
+          })}\n`,
+        )
+      }
+
+      openStream(generation, lastAckedSeq)
       input.stdin.on('data', onData)
       input.stdin.once('end', onEnd)
       input.stdin.once('error', onInputError)

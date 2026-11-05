@@ -124,3 +124,50 @@ test('live turns reject overlapping admission, reused terminal UUID/digest and s
     assert.throws(() => observer.ingest(Buffer.from(`${JSON.stringify(two)}\n`)))
   }
 })
+
+test('interruptTurn retains and validates real terminal usage receipt for interrupted turns', () => {
+  const f = fixture()
+  const observer = new Cc5NativeUsageObserver(f.binding)
+  const first = { authorityTurnId: '1'.repeat(32), turnKey: 'a'.repeat(64) }
+  observer.beginTurn(first)
+  observer.ingest(f.init)
+  observer.interruptTurn()
+  const interruptedResult = {
+    ...f.terminal,
+    subtype: 'interrupted',
+    is_error: false,
+    uuid: f.nextResultId(),
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+  }
+  const frames = observer.ingest(Buffer.from(`${JSON.stringify(interruptedResult)}\n`))
+  assert.equal(frames.length, 1)
+  assert.ok(frames[0]!.receipt)
+  assert.deepEqual(frames[0]!.receipt!.usage, {
+    inputTokens: 10,
+    outputTokens: 5,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+  })
+  // Next turn can begin cleanly after interrupted turn receipt is settled
+  const second = { authorityTurnId: '2'.repeat(32), turnKey: 'b'.repeat(64) }
+  observer.beginTurn(second)
+  const secondResult = {
+    ...f.terminal,
+    uuid: f.nextResultId(),
+    usage: {
+      input_tokens: 14,
+      output_tokens: 8,
+      cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 0,
+    },
+  }
+  const nextFrames = observer.ingest(Buffer.from(`${JSON.stringify(secondResult)}\n`))
+  assert.ok(nextFrames[0]!.receipt)
+  assert.equal(nextFrames[0]!.receipt!.usage.inputTokens, 14)
+  observer.finish()
+})

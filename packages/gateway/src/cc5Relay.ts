@@ -4,10 +4,13 @@ import { EventEmitter, once } from 'node:events'
 import {
   constants,
   closeSync,
+  existsSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readFileSync,
+  readdirSync,
   writeFileSync,
 } from 'node:fs'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
@@ -135,7 +138,7 @@ export class Cc5Relay {
   private outputHistoryBytes = 0
 
   constructor(
-    private readonly binding: Readonly<Cc5BridgeBinding>,
+    private binding: Readonly<Cc5BridgeBinding>,
     private readonly keyring: AuthorityKeyring,
     private readonly runId: string,
     private readonly hostPort: Cc5InteractiveHostPort,
@@ -145,6 +148,7 @@ export class Cc5Relay {
       localStopTimeoutMs?: number
       slidingTtlMs?: number
       onBindingExtended?: (expiresAt: number) => void
+      recoverExistingJournal?: boolean
     } = {},
   ) {
     assertCc5BindingScope(binding)
@@ -152,9 +156,73 @@ export class Cc5Relay {
       binding.runId === runId && typeof finance?.admit === 'function')
     this.bindingExpiresAt = binding.expiresAt
     this.nativeUsage = new Cc5NativeUsageObserver(binding)
-    mkdirSync(journalRoot, { mode: 0o700, recursive: false })
-    const st = lstatSync(journalRoot)
-    requireRelay(st.isDirectory() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0)
+    if (options.recoverExistingJournal && existsSync(journalRoot)) {
+      const st = lstatSync(journalRoot)
+      requireRelay(
+        st.isDirectory() &&
+          !st.isSymbolicLink() &&
+          st.uid === process.getuid?.() &&
+          (st.mode & 0o077) === 0,
+      )
+      for (const entry of readdirSync(journalRoot)) {
+        if (entry === 'local-stopped.json') {
+          this.localStopped = true
+        } else if (entry === 'local-registered.json' || /^local-registered-[a-f0-9-]{36}\.json$/.test(entry)) {
+          const reg = JSON.parse(readFileSync(join(journalRoot, entry), 'utf8')) as {
+            lifecycleId?: string
+          }
+          requireRelay(
+            typeof reg?.lifecycleId === 'string' &&
+              /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(reg.lifecycleId),
+          )
+          this.lifecycleId = reg.lifecycleId
+        } else if (/^[a-f0-9]{32}$/.test(entry)) {
+          const turnDir = join(journalRoot, entry)
+          const turnSt = lstatSync(turnDir)
+          requireRelay(
+            turnSt.isDirectory() &&
+              !turnSt.isSymbolicLink() &&
+              turnSt.uid === process.getuid?.() &&
+              (turnSt.mode & 0o077) === 0 &&
+              existsSync(join(turnDir, 'admission.json')) &&
+              existsSync(join(turnDir, 'terminal-proven.json')),
+          )
+          const adm = JSON.parse(readFileSync(join(turnDir, 'admission.json'), 'utf8')) as {
+            authorityTurnId?: string
+            turnKey?: string
+            billingRequestId?: string
+          }
+          requireRelay(
+            adm?.authorityTurnId === entry &&
+              typeof adm.turnKey === 'string' &&
+              adm.turnKey.length > 0 &&
+              typeof adm.billingRequestId === 'string' &&
+              adm.billingRequestId.length > 0,
+          )
+          this.usedAuthorities.add(adm.authorityTurnId)
+          this.usedTurns.add(adm.turnKey)
+          this.usedRequests.add(adm.billingRequestId)
+          this.launchAttempted = true
+          for (const f of readdirSync(turnDir)) {
+            if (f.startsWith('tool-') && f.endsWith('-completed.json')) {
+              const tr = JSON.parse(readFileSync(join(turnDir, f), 'utf8')) as {
+                rpcId?: string | number
+                toolUseId?: string
+              }
+              if (tr?.rpcId !== undefined) this.usedRpcIds.add(`${typeof tr.rpcId}:${tr.rpcId}`)
+              if (typeof tr?.toolUseId === 'string') this.usedToolIds.add(tr.toolUseId)
+            }
+          }
+        } else {
+          requireRelay(false)
+        }
+      }
+      requireRelay(!this.localStopped)
+    } else {
+      mkdirSync(journalRoot, { mode: 0o700, recursive: false })
+      const st = lstatSync(journalRoot)
+      requireRelay(st.isDirectory() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0)
+    }
     const parent = openSync(
       dirname(journalRoot),
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
@@ -171,8 +239,10 @@ export class Cc5Relay {
     if (this.options.slidingTtlMs && this.options.slidingTtlMs > 0) {
       const next = Math.max(this.bindingExpiresAt, Date.now() + this.options.slidingTtlMs)
       if (next > this.bindingExpiresAt) {
-        this.bindingExpiresAt = next
+        const nextBinding = Object.freeze({ ...this.binding, expiresAt: next })
         this.options.onBindingExtended?.(next)
+        this.binding = nextBinding
+        this.bindingExpiresAt = next
       }
     }
     return this.bindingExpiresAt
@@ -261,30 +331,39 @@ export class Cc5Relay {
           for (const frame of frames) {
             requireRelay(!this.revoked)
             if (frame.receipt) {
-              if (this.interruptedTurn && this.phase === 'idle') {
-                this.interruptedTurn = false
-              } else {
-                requireRelay(this.phase === 'running' && this.userSeen && this.financeTurn && this.admitted &&
-                  frame.receipt.version === 2 && frame.receipt.authorityTurnId === this.admitted.payload.authorityTurnId &&
-                  frame.receipt.turnKey === this.admitted.turnKey && this.waitingTools === 0 && this.toolQueue.length === 0 &&
-                  this.observation.toolUseIds.every((id) => this.turnTools.get(id)?.receipt))
-                this.verify(this.admitted.authority, this.admitted.lease, true)
-                this.phase = 'settling'
-                await Promise.all([...this.turnTools.values()].map((tool) => {
+              requireRelay(
+                this.phase === 'running' &&
+                  this.userSeen &&
+                  this.financeTurn &&
+                  this.admitted &&
+                  frame.receipt.version === 2 &&
+                  frame.receipt.authorityTurnId === this.admitted.payload.authorityTurnId &&
+                  frame.receipt.turnKey === this.admitted.turnKey &&
+                  this.waitingTools === 0 &&
+                  this.toolQueue.length === 0 &&
+                  this.observation.toolUseIds.every((id) => this.turnTools.get(id)?.receipt),
+              )
+              this.verify(this.admitted.authority, this.admitted.lease, true)
+              this.phase = 'settling'
+              await Promise.all(
+                [...this.turnTools.values()].map((tool) => {
                   requireRelay(tool.receipt && tool.ack)
                   return tool.ack
-                }))
-                requireRelay([...this.turnTools.values()].every((tool) => tool.acknowledged) && !this.pending)
-                this.record('native-terminal.json', frame.receipt)
-                const outcome = await this.financeTurn.terminal(frame.receipt)
-                requireRelay(outcome.state === 'proven' && outcome.requestId === this.admitted.payload.billingRequestId)
-                this.record('terminal-proven.json', { requestId: outcome.requestId,
-                  resultSha256: frame.receipt.resultSha256 })
-                requireRelay(!this.revoked)
-                this.observation.endTurn()
-                this.phase = 'idle'
-                this.armExpiry(this.bindingExpiresAt)
-              }
+                }),
+              )
+              requireRelay([...this.turnTools.values()].every((tool) => tool.acknowledged) && !this.pending)
+              this.record('native-terminal.json', frame.receipt)
+              const outcome = await this.financeTurn.terminal(frame.receipt)
+              requireRelay(outcome.state === 'proven' && outcome.requestId === this.admitted.payload.billingRequestId)
+              this.record('terminal-proven.json', {
+                requestId: outcome.requestId,
+                resultSha256: frame.receipt.resultSha256,
+              })
+              requireRelay(!this.revoked)
+              this.observation.endTurn()
+              this.interruptedTurn = false
+              this.phase = 'idle'
+              this.armExpiry(this.bindingExpiresAt)
             }
             requireRelay(!this.revoked)
             this.publishOutput(frame.bytes)
@@ -332,17 +411,10 @@ export class Cc5Relay {
   }
   private interruptActiveTurn(writeControlFrame = true): void {
     if (this.phase !== 'running' && this.phase !== 'settling') return
+    const firstInterrupt = !this.interruptedTurn
     this.interruptedTurn = true
-    this.pending?.response.destroy()
-    this.pending = undefined
-    for (const tool of this.toolQueue) tool.response.destroy()
-    this.toolQueue.length = 0
-    this.turnTools.clear()
-    this.observation.endTurn()
     this.nativeUsage.interruptTurn()
-    this.phase = 'idle'
-    this.armExpiry(this.bindingExpiresAt)
-    if (writeControlFrame && this.host) {
+    if (firstInterrupt && writeControlFrame && this.host) {
       const req = {
         type: 'control_request',
         request_id: `int-${Date.now()}`,
@@ -471,6 +543,7 @@ export class Cc5Relay {
           turnKey: body.turnKey,
           billingRequestId: payload.billingRequestId,
         })
+        const expiresAt = this.slideBindingExpiry()
         this.financeTurn = await this.finance.admit({ binding: this.binding,
           authorityEnvelope: body.authority, leaseEnvelope: body.lease,
           turnKey: body.turnKey, sessionKey: this.binding.sessionKey })
@@ -484,7 +557,6 @@ export class Cc5Relay {
         this.turnTools.clear()
         this.observation.beginTurn()
         this.nativeUsage.beginTurn({ authorityTurnId: payload.authorityTurnId, turnKey: body.turnKey })
-        const expiresAt = this.slideBindingExpiry()
         this.armExpiry(verifyTurnLease(body.lease, this.keyring, Date.now()).expiresAt)
         // The per-turn marker also fences reuse of an already-running native worker.
         this.effectBarrier = this.financeTurn.beforeHostStart()
@@ -574,66 +646,131 @@ export class Cc5Relay {
       this.deliver()
     } else throw new Error('CC5_RELAY_REJECTED')
   }
+  private static isRecoverableTransportError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false
+    const code = (error as { code?: string }).code
+    const msg = (error as { message?: string }).message ?? ''
+    return (
+      code === 'ECONNRESET' ||
+      code === 'EPIPE' ||
+      code === 'ECONNABORTED' ||
+      code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+      code === 'ERR_STREAM_DESTROYED' ||
+      msg === 'aborted' ||
+      msg === 'Premature close'
+    )
+  }
   private async open(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let buffer = ''
     let opened = false
     let protocolFailed = false
+    let myGeneration = -1
     try {
       for await (const chunk of req) {
-        buffer += chunk.toString('utf8')
-        requireRelay(Buffer.byteLength(buffer) <= CC5_BRIDGE_MAX_FRAME_BYTES * 2)
-        let at: number
-        while ((at = buffer.indexOf('\n')) >= 0) {
-          const body = JSON.parse(buffer.slice(0, at)) as Body
-          buffer = buffer.slice(at + 1)
-          if (!opened) {
-            if (body.generation !== undefined) {
-              requireRelay(
-                typeof body.generation === 'number' &&
-                  Number.isSafeInteger(body.generation) &&
-                  body.generation >= this.streamGeneration,
-              )
-              if (body.generation > this.streamGeneration && this.stream) {
-                this.stream.end()
-                this.stream = undefined
-                this.streamClaimed = false
+        try {
+          buffer += chunk.toString('utf8')
+          requireRelay(Buffer.byteLength(buffer) <= CC5_BRIDGE_MAX_FRAME_BYTES * 2)
+          let at: number
+          while ((at = buffer.indexOf('\n')) >= 0) {
+            const body = JSON.parse(buffer.slice(0, at)) as Body
+            buffer = buffer.slice(at + 1)
+            if (!opened) {
+              requireRelay(body.type === 'open' && this.admitted && this.financeTurn)
+              this.scope(body)
+              let nextGen = this.streamGeneration
+              if (body.generation !== undefined) {
+                requireRelay(
+                  typeof body.generation === 'number' &&
+                    Number.isSafeInteger(body.generation) &&
+                    (this.streamClaimed
+                      ? body.generation > this.streamGeneration
+                      : body.generation >= this.streamGeneration),
+                )
+                nextGen = body.generation
+              } else {
+                requireRelay(!this.streamClaimed)
               }
-              this.streamGeneration = body.generation
-            }
-            requireRelay(body.type === 'open' && !this.streamClaimed && this.admitted && this.financeTurn)
-            this.scope(body)
-            this.streamClaimed = true
-            this.stream = res
-            opened = true
-            await this.ensureHost()
-            res.writeHead(200, {
-              'x-cc5-interactive-ready': '1',
-              'x-cc5-stream-generation': String(this.streamGeneration),
-              'x-cc5-out-seq': String(this.outSeq),
-            })
-            res.flushHeaders()
-            if (typeof body.lastAckedSeq === 'number' && Number.isSafeInteger(body.lastAckedSeq)) {
-              for (const item of this.outputHistory) {
-                if (item.seq > body.lastAckedSeq) res.write(item.bytes)
+              let hasLastAcked = false
+              let lastAckedSeq = 0
+              if (body.lastAckedSeq !== undefined) {
+                requireRelay(
+                  typeof body.lastAckedSeq === 'number' &&
+                    Number.isSafeInteger(body.lastAckedSeq) &&
+                    body.lastAckedSeq >= 0 &&
+                    body.lastAckedSeq <= this.outSeq,
+                )
+                const minRetainedSeq =
+                  this.outputHistory.length > 0 ? this.outputHistory[0]!.seq : this.outSeq + 1
+                if (body.lastAckedSeq + 1 < minRetainedSeq) {
+                  if (!res.headersSent) {
+                    res.writeHead(409, { 'content-type': 'application/json' })
+                    res.end('{"ok":false,"error":"CC5_STREAM_SEQ_GAP"}')
+                  }
+                  return
+                }
+                hasLastAcked = true
+                lastAckedSeq = body.lastAckedSeq
               }
+              const prevStream = this.stream
+              this.streamGeneration = nextGen
+              myGeneration = nextGen
+              this.streamClaimed = true
+              this.stream = res
+              opened = true
+              if (prevStream && prevStream !== res) {
+                try {
+                  prevStream.end()
+                } catch {}
+              }
+              await this.ensureHost()
+              if (myGeneration !== this.streamGeneration || this.stream !== res) return
+              res.writeHead(200, {
+                'x-cc5-interactive-ready': '1',
+                'x-cc5-stream-generation': String(this.streamGeneration),
+                'x-cc5-out-seq': String(this.outSeq),
+              })
+              res.flushHeaders()
+              if (hasLastAcked) {
+                for (const item of this.outputHistory) {
+                  if (item.seq > lastAckedSeq) res.write(item.bytes)
+                }
+              } else {
+                for (const raw of this.output) res.write(raw)
+              }
+              this.output = []
+              this.outputBytes = 0
+              res.on('drain', () => {
+                if (myGeneration !== this.streamGeneration || this.stream !== res) return
+                this.outputBackpressured = false
+                if (!this.revoked && this.queuedOutputBytes === 0) this.host?.stdout.resume()
+              })
             } else {
-              for (const raw of this.output) res.write(raw)
+              if (myGeneration !== this.streamGeneration || this.stream !== res) return
+              await this.input(body)
             }
-            this.output = []
-            this.outputBytes = 0
-            res.on('drain', () => {
-              this.outputBackpressured = false
-              if (!this.revoked && this.queuedOutputBytes === 0) this.host?.stdout.resume()
-            })
-          } else await this.input(body)
+          }
+        } catch (innerErr) {
+          if (!opened || myGeneration === this.streamGeneration) {
+            protocolFailed = true
+          }
+          throw innerErr
         }
       }
-      requireRelay(!buffer)
+      if (buffer.length > 0 && (!opened || myGeneration === this.streamGeneration)) {
+        protocolFailed = true
+        throw new Error('CC5_RELAY_REJECTED')
+      }
     } catch (error) {
-      protocolFailed = true
-      throw error
+      if (opened && !protocolFailed && Cc5Relay.isRecoverableTransportError(error)) {
+        // Recoverable client stream disconnect (e.g. ECONNRESET / aborted): detach without stopping host.
+        return
+      }
+      if (!opened || myGeneration === this.streamGeneration) {
+        protocolFailed = true
+        throw error
+      }
     } finally {
-      if (opened) {
+      if (opened && myGeneration === this.streamGeneration) {
         if (protocolFailed || this.revoked) {
           await this.stop()
         } else if (this.stream === res) {
@@ -680,15 +817,21 @@ export class Cc5Relay {
       await this.effectBarrier
       requireRelay(!this.revoked)
       this.verify(this.admitted.authority, this.admitted.lease, true)
+      this.lastSequence = body.seq as number
+      this.lastHash = body.hash
+      this.userSubmitted = true
+      if (!this.host.stdin.write(bytes))
+        await once(this.host.stdin, 'drain', { signal: this.abort.signal })
     } else {
-      requireRelay((this.phase === 'running' || this.phase === 'settling') && frame.type === 'control_request' && frame.request?.subtype === 'interrupt')
-      this.interruptActiveTurn(false)
+      requireRelay(frame.type === 'control_request' && frame.request?.subtype === 'interrupt')
+      this.lastSequence = body.seq as number
+      this.lastHash = body.hash
+      if ((this.phase === 'running' || this.phase === 'settling') && !this.interruptedTurn) {
+        this.interruptActiveTurn(false)
+        if (!this.host.stdin.write(bytes))
+          await once(this.host.stdin, 'drain', { signal: this.abort.signal })
+      }
     }
-    this.lastSequence = body.seq as number
-    this.lastHash = body.hash
-    if (frame.type === 'user') this.userSubmitted = true
-    if (!this.host.stdin.write(bytes))
-      await once(this.host.stdin, 'drain', { signal: this.abort.signal })
   }
   private deliver(): void {
     if (!this.pending) this.pending = this.toolQueue.shift()
