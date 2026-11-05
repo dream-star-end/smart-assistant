@@ -712,7 +712,7 @@ export async function probeRemoteAgentNodeLive(
           rttMsP50: rtt,
           rttMsP95: Math.round(rtt * 1.4),
           controllerSha256: parsed.controller_sha256,
-          gateG: parsed.gateG ?? parsed.gate_g,
+          gateG: parsed.gate_g,
           profiles: loggedInProfiles,
         }
       } catch (muxErr: any) {
@@ -1440,20 +1440,20 @@ export function createRemoteBrainPoolAdapter(): PoolAdapter {
         )
         const row = res.rows[0]
         if (!row?.node_id) {
-          return { ok: false, cooldownReason: 'auth', detail: 'REMOTE_PROFILE_NOT_FOUND' }
+          return { ok: false, detail: 'REMOTE_PROFILE_NOT_FOUND' }
         }
         const live = await probeRemoteAgentNodeLive(String(row.node_id))
         const matched = live.profiles.find(
           (p) => p.id === member.id || (p.engine === row.engine && p.profile_name === row.profile_name),
         )
         if (!matched || matched.status !== 'active') {
-          return { ok: false, cooldownReason: 'auth', detail: 'REMOTE_PROFILE_NOT_ACTIVE_AFTER_PROBE' }
+          return { ok: false, detail: 'REMOTE_PROFILE_NOT_ACTIVE_AFTER_PROBE' }
         }
         return { ok: true }
       } catch (err: any) {
         return {
           ok: false,
-          cooldownReason: 'upstream',
+          transient: true,
           detail: String(err?.message ?? 'REMOTE_SSH_PROBE_FAILED'),
         }
       }

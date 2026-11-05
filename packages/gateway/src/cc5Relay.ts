@@ -216,8 +216,9 @@ export class Cc5Relay {
               adm.billingRequestId.length > 0 &&
               proven?.requestId === adm.billingRequestId &&
               proven?.resultSha256 === term?.resultSha256 &&
-              term?.authorityTurnId === adm.authorityTurnId &&
-              term?.turnKey === adm.turnKey,
+              term?.version === 2 &&
+              term.authorityTurnId === adm.authorityTurnId &&
+              term.turnKey === adm.turnKey,
           )
           this.usedAuthorities.add(adm.authorityTurnId)
           this.usedTurns.add(adm.turnKey)

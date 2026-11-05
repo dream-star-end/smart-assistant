@@ -70,8 +70,8 @@ def is_valid_token_str(val: Any) -> bool:
 def is_not_expired(exp_val: Any) -> bool:
     if exp_val is None:
         return True
-    if isinstance(exp_val, (int, float)):
-        now_sec = time.time()
+    if isinstance(exp_val, (int, float)) and not isinstance(exp_val, bool):
+        now_sec = globals()["time"].time() if "time" in globals() else __import__("time").time()
         # Handle both epoch milliseconds and epoch seconds
         if exp_val > 1e11:
             return exp_val > (now_sec * 1000.0)
@@ -192,8 +192,21 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                         oauth = data.get("claudeAiOauth")
                         if isinstance(oauth, dict):
                             tok = oauth.get("accessToken") or oauth.get("access_token")
-                            exp = oauth.get("expiresAt")
-                            exp_ok = exp is None or (isinstance(exp, (int, float)) and exp > 0)
+                            exp = oauth["expiresAt"] if "expiresAt" in oauth and oauth["expiresAt"] is not None else oauth.get("expires_at")
+                            now_sec = globals()["time"].time() if "time" in globals() else __import__("time").time()
+                            exp_ok = (
+                                globals()["is_not_expired"](exp)
+                                if "is_not_expired" in globals()
+                                else (
+                                    True
+                                    if exp is None
+                                    else (
+                                        ((exp > now_sec * 1000.0) if exp > 1e11 else (exp > now_sec))
+                                        if (isinstance(exp, (int, float)) and not isinstance(exp, bool))
+                                        else False
+                                    )
+                                )
+                            )
                             if isinstance(tok, str) and len(tok.strip()) >= 16 and exp_ok:
                                 has_valid_token = True
                         if isinstance(data.get("five_hour_used_pct"), (int, float)):
@@ -264,8 +277,33 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                         or tokens_obj.get("access_token")
                         or tokens_obj.get("id_token")
                     )
-                    exp = data.get("expires_at") or tokens_obj.get("expires_at")
-                    exp_ok = exp is None or (isinstance(exp, (int, float)) and exp > 0)
+                    exp = (
+                        data["expires_at"]
+                        if "expires_at" in data and data["expires_at"] is not None
+                        else (
+                            data["expiresAt"]
+                            if "expiresAt" in data and data["expiresAt"] is not None
+                            else (
+                                tokens_obj["expires_at"]
+                                if "expires_at" in tokens_obj and tokens_obj["expires_at"] is not None
+                                else tokens_obj.get("expiresAt")
+                            )
+                        )
+                    )
+                    now_sec = globals()["time"].time() if "time" in globals() else __import__("time").time()
+                    exp_ok = (
+                        globals()["is_not_expired"](exp)
+                        if "is_not_expired" in globals()
+                        else (
+                            True
+                            if exp is None
+                            else (
+                                ((exp > now_sec * 1000.0) if exp > 1e11 else (exp > now_sec))
+                                if (isinstance(exp, (int, float)) and not isinstance(exp, bool))
+                                else False
+                            )
+                        )
+                    )
                     if isinstance(token_candidate, str) and len(token_candidate.strip()) >= 16 and exp_ok:
                         has_valid_token = True
                     if isinstance(data.get("five_hour_used_pct"), (int, float)):

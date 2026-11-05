@@ -24,9 +24,9 @@ import {
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
 
-const financeFactory: Cc5FinanceFactory = () => ({ async admit(info) { return {
+const financeFactory: Cc5FinanceFactory = () => ({ async admit() { return {
   async beforeHostStart() {}, async beforeDispatch() {}, async stop() {},
-  async terminal() { return { state: 'proven', requestId: info?.authority?.billingRequestId ?? 'fixture-only-request' } },
+  async terminal() { return { state: 'proven', requestId: 'fixture-only-request' } },
 } } })
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
 function fixture(failStop = false, attachable = false) {

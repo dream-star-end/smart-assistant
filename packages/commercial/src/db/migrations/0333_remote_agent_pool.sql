@@ -1,4 +1,4 @@
--- order-dependency: 0143_model_catalog
+-- order-dependency: 0144_model_authority_guards
 -- OCV5-721: Remote Agent Brain Pool (nodes, profiles, model offers, active bindings)
 -- and model_catalog.placement column for transition-period remote model suffixing.
 -- compat: Additive tables + additive column with DEFAULT 'local' on model_catalog. Old binaries ignore the new tables and default placement to 'local'. No backfill and no balance change.
@@ -15,6 +15,70 @@ COMMENT ON COLUMN model_catalog.placement IS
 
 COMMENT ON COLUMN model_catalog.pool_auto_disabled IS
   'TRUE when a remote_pool catalog entry was automatically disabled only because eligible enabled pool offers dropped to 0 (FALSE when disabled by a global catalog administrator).';
+
+CREATE OR REPLACE FUNCTION fn_model_activate_entry(
+  p_entry_id              BIGINT,
+  p_expected_lock_version INTEGER,
+  p_updated_by            BIGINT DEFAULT NULL
+) RETURNS VOID
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE v_state TEXT; v_lock INTEGER;
+BEGIN
+  SELECT state, lock_version INTO v_state, v_lock
+    FROM model_catalog WHERE entry_id = p_entry_id FOR UPDATE;
+  IF v_state IS NULL THEN
+    RAISE EXCEPTION 'fn_model_activate_entry: entry % does not exist', p_entry_id
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  IF p_expected_lock_version IS NOT NULL AND v_lock <> p_expected_lock_version THEN
+    RAISE EXCEPTION 'fn_model_activate_entry: lock_version mismatch (expected %, got %)',
+      p_expected_lock_version, v_lock USING ERRCODE = 'serialization_failure';
+  END IF;
+  IF v_state NOT IN ('staged', 'disabled') THEN
+    RAISE EXCEPTION 'fn_model_activate_entry: entry % is % (only staged/disabled can be activated)',
+      p_entry_id, v_state USING ERRCODE = 'check_violation';
+  END IF;
+  UPDATE model_catalog
+     SET state = 'active',
+         pool_auto_disabled = FALSE,
+         updated_by = COALESCE(p_updated_by, updated_by)
+   WHERE entry_id = p_entry_id;
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_model_disable_entry(
+  p_entry_id              BIGINT,
+  p_expected_lock_version INTEGER,
+  p_updated_by            BIGINT DEFAULT NULL
+) RETURNS VOID
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE v_state TEXT; v_lock INTEGER;
+BEGIN
+  SELECT state, lock_version INTO v_state, v_lock
+    FROM model_catalog WHERE entry_id = p_entry_id FOR UPDATE;
+  IF v_state IS NULL THEN
+    RAISE EXCEPTION 'fn_model_disable_entry: entry % does not exist', p_entry_id
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  IF p_expected_lock_version IS NOT NULL AND v_lock <> p_expected_lock_version THEN
+    RAISE EXCEPTION 'fn_model_disable_entry: lock_version mismatch (expected %, got %)',
+      p_expected_lock_version, v_lock USING ERRCODE = 'serialization_failure';
+  END IF;
+  IF v_state <> 'active' THEN
+    RAISE EXCEPTION 'fn_model_disable_entry: entry % is % (only active can be disabled)',
+      p_entry_id, v_state USING ERRCODE = 'check_violation';
+  END IF;
+  UPDATE model_catalog
+     SET state = 'disabled',
+         pool_auto_disabled = FALSE,
+         updated_by = COALESCE(p_updated_by, updated_by)
+   WHERE entry_id = p_entry_id;
+END $$;
 
 CREATE TABLE IF NOT EXISTS remote_agent_nodes (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),

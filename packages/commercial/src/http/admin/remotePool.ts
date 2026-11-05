@@ -17,17 +17,19 @@ import {
   updateRemoteProfileAdminState,
   type RemoteBrainEngine,
 } from '../../account-pool/remoteBrainPool.js'
+import { peekModelCatalogCache } from '../../billing/modelCatalogRuntime.js'
 import { query } from '../../db/queries.js'
+import { requireAuth } from '../auth.js'
 import type { CommercialHttpDeps, RequestContext } from '../handlers.js'
 import { HttpError, readJsonBody, sendJson } from '../util.js'
 
 export async function handleAdminRemotePoolGet(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
-  ctx: RequestContext,
-  _deps: CommercialHttpDeps,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  requireAdmin(ctx)
+  await requireAdmin(req, deps.jwtSecret)
   const overview = await listRemotePoolOverview()
   sendJson(res, 200, {
     ...overview,
@@ -45,11 +47,13 @@ export async function handleAdminRemotePoolNodeCreate(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: RequestContext,
-  _deps: CommercialHttpDeps,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdminVerifyDb(ctx)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const body = (await readJsonBody(req)) as Record<string, unknown> | null
-  if (!body || typeof body !== 'object') throw new HttpError(400, 'invalid json body')
+  if (!body || typeof body !== 'object') {
+    throw new HttpError(400, 'VALIDATION', 'invalid json body')
+  }
   try {
     const node = await createRemoteAgentNode({
       label: typeof body.label === 'string' ? body.label : '',
@@ -61,17 +65,16 @@ export async function handleAdminRemotePoolNodeCreate(
       max_hot_slots: typeof body.max_hot_slots === 'number' ? body.max_hot_slots : 16,
       max_active_slots: typeof body.max_active_slots === 'number' ? body.max_active_slots : 8,
     })
-    await writeAdminAuditBestEffort({
-      adminUid: admin.uid,
-      action: 'remote_pool.node.create',
-      targetType: 'remote_agent_node',
-      targetId: node.id,
-      reason: `label=${node.label} host=${node.ssh_user}@${node.ssh_host}:${node.ssh_port}`,
-      ip: ctx.clientIp,
-    })
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+      'remote_pool.node.create',
+      `remote_agent_node:${node.id}`,
+      null,
+      { label: node.label, ssh_host: node.ssh_host, ssh_port: node.ssh_port, ssh_user: node.ssh_user },
+    )
     sendJson(res, 201, { node })
   } catch (err) {
-    throw new HttpError(400, (err as Error)?.message ?? 'failed to create remote node')
+    throw new HttpError(400, 'BAD_REQUEST', (err as Error)?.message ?? 'failed to create remote node')
   }
 }
 
@@ -79,28 +82,31 @@ export async function handleAdminRemotePoolNodeAction(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: RequestContext,
-  _deps: CommercialHttpDeps,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdminVerifyDb(ctx)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const url = new URL(req.url ?? '/', 'http://localhost')
   const probeMatch = /^\/api\/admin\/remote-pool\/nodes\/([0-9a-f-]{36})\/probe$/.exec(url.pathname)
   if (req.method === 'POST' && probeMatch) {
     const nodeId = probeMatch[1]!
     try {
       const updated = await probeRemoteAgentNodeLive(nodeId)
-      await writeAdminAuditBestEffort({
-        adminUid: admin.uid,
-        action: 'remote_pool.node.probe',
-        targetType: 'remote_agent_node',
-        targetId: nodeId,
-        reason: `probed ${updated.profiles.length} profiles`,
-        ip: ctx.clientIp,
-      })
+      await writeAdminAuditBestEffort(
+        { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+        'remote_pool.node.probe',
+        `remote_agent_node:${nodeId}`,
+        null,
+        { profile_count: updated.profiles.length },
+      )
       sendJson(res, 200, updated)
       return
     } catch (err) {
       const msg = (err as Error)?.message ?? 'probe failed'
-      throw new HttpError(msg === 'REMOTE_NODE_NOT_FOUND' ? 404 : 400, msg)
+      throw new HttpError(
+        msg === 'REMOTE_NODE_NOT_FOUND' ? 404 : 400,
+        msg === 'REMOTE_NODE_NOT_FOUND' ? 'NOT_FOUND' : 'BAD_REQUEST',
+        msg,
+      )
     }
   }
 
@@ -108,19 +114,18 @@ export async function handleAdminRemotePoolNodeAction(
   if (req.method === 'DELETE' && idMatch) {
     const nodeId = idMatch[1]!
     await query(`DELETE FROM remote_agent_nodes WHERE id = $1`, [nodeId])
-    await writeAdminAuditBestEffort({
-      adminUid: admin.uid,
-      action: 'remote_pool.node.delete',
-      targetType: 'remote_agent_node',
-      targetId: nodeId,
-      reason: 'deleted remote node',
-      ip: ctx.clientIp,
-    })
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+      'remote_pool.node.delete',
+      `remote_agent_node:${nodeId}`,
+      null,
+      null,
+    )
     sendJson(res, 200, { ok: true, id: nodeId })
     return
   }
 
-  throw new HttpError(404, 'not found')
+  throw new HttpError(404, 'NOT_FOUND', 'not found')
 }
 
 export async function handleAdminRemotePoolOffersPublish(
@@ -129,15 +134,15 @@ export async function handleAdminRemotePoolOffersPublish(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdminVerifyDb(ctx)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const body = (await readJsonBody(req)) as Record<string, unknown> | null
   if (!body || typeof body.profile_id !== 'string' || !Array.isArray(body.offers)) {
-    throw new HttpError(400, 'profile_id and offers[] are required')
+    throw new HttpError(400, 'VALIDATION', 'profile_id and offers[] are required')
   }
   try {
     const published = await publishRemoteModelOffers({
       profile_id: body.profile_id,
-      admin_uid: admin.uid,
+      admin_uid: BigInt(admin.id),
       offers: body.offers.map((o: any) => ({
         upstream_model_id: String(o?.upstream_model_id ?? ''),
         canonical_model_id:
@@ -146,18 +151,17 @@ export async function handleAdminRemotePoolOffersPublish(
         enabled: o?.enabled !== false,
       })),
     })
-    await deps.modelCatalog?.rebuild().catch(() => {})
-    await writeAdminAuditBestEffort({
-      adminUid: admin.uid,
-      action: 'remote_pool.offers.publish',
-      targetType: 'remote_agent_profile',
-      targetId: body.profile_id,
-      reason: `published ${published.map((p) => p.canonical_model_id).join(',')}`,
-      ip: ctx.clientIp,
-    })
+    await peekModelCatalogCache()?.rebuild().catch(() => {})
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+      'remote_pool.offers.publish',
+      `remote_agent_profile:${body.profile_id}`,
+      null,
+      { models: published.map((p) => p.canonical_model_id) },
+    )
     sendJson(res, 200, { offers: published })
   } catch (err) {
-    throw new HttpError(400, (err as Error)?.message ?? 'failed to publish remote model offers')
+    throw new HttpError(400, 'BAD_REQUEST', (err as Error)?.message ?? 'failed to publish remote model offers')
   }
 }
 
@@ -165,15 +169,17 @@ export async function handleAdminRemotePoolProfilePatch(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: RequestContext,
-  _deps: CommercialHttpDeps,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdminVerifyDb(ctx)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const url = new URL(req.url ?? '/', 'http://localhost')
   const m = /^\/api\/admin\/remote-pool\/profiles\/([0-9a-f-]{36})$/.exec(url.pathname)
-  if (!m) throw new HttpError(404, 'not found')
+  if (!m) throw new HttpError(404, 'NOT_FOUND', 'not found')
   const profileId = m[1]!
   const body = (await readJsonBody(req)) as Record<string, unknown> | null
-  if (!body || typeof body !== 'object') throw new HttpError(400, 'invalid json body')
+  if (!body || typeof body !== 'object') {
+    throw new HttpError(400, 'VALIDATION', 'invalid json body')
+  }
   try {
     const profile = await updateRemoteProfileAdminState(profileId, {
       status:
@@ -183,17 +189,16 @@ export async function handleAdminRemotePoolProfilePatch(
       max_active_slots:
         typeof body.max_active_slots === 'number' ? body.max_active_slots : undefined,
     })
-    await writeAdminAuditBestEffort({
-      adminUid: admin.uid,
-      action: 'remote_pool.profile.patch',
-      targetType: 'remote_agent_profile',
-      targetId: profileId,
-      reason: JSON.stringify(body),
-      ip: ctx.clientIp,
-    })
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+      'remote_pool.profile.patch',
+      `remote_agent_profile:${profileId}`,
+      null,
+      body,
+    )
     sendJson(res, 200, { profile })
   } catch (err) {
-    throw new HttpError(400, (err as Error)?.message ?? 'failed to update profile')
+    throw new HttpError(400, 'BAD_REQUEST', (err as Error)?.message ?? 'failed to update profile')
   }
 }
 
@@ -201,22 +206,21 @@ export async function handleAdminRemotePoolBindingRevoke(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: RequestContext,
-  _deps: CommercialHttpDeps,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  const admin = await requireAdminVerifyDb(ctx)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const url = new URL(req.url ?? '/', 'http://localhost')
   const m = /^\/api\/admin\/remote-pool\/bindings\/([0-9a-f-]{36})\/revoke$/.exec(url.pathname)
-  if (!m) throw new HttpError(404, 'not found')
+  if (!m) throw new HttpError(404, 'NOT_FOUND', 'not found')
   const operationId = m[1]!
   const result = await revokeRemoteAgentBinding(operationId)
-  await writeAdminAuditBestEffort({
-    adminUid: admin.uid,
-    action: 'remote_pool.binding.revoke',
-    targetType: 'remote_agent_binding',
-    targetId: operationId,
-    reason: 'operator revoked remote binding',
-    ip: ctx.clientIp,
-  })
+  await writeAdminAuditBestEffort(
+    { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+    'remote_pool.binding.revoke',
+    `remote_agent_binding:${operationId}`,
+    null,
+    result,
+  )
   sendJson(res, 200, result)
 }
 
@@ -227,10 +231,10 @@ export async function handleAdminRemotePoolBindingRevoke(
 export async function handleSessionPreheat(
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: RequestContext,
-  _deps: CommercialHttpDeps,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
 ): Promise<void> {
-  if (!ctx.auth?.uid) throw new HttpError(401, 'authentication required')
+  const user = await requireAuth(req, deps.jwtSecret)
   const body = ((await readJsonBody(req).catch(() => ({}))) ?? {}) as {
     sessionKey?: string
     model?: string
@@ -250,7 +254,7 @@ export async function handleSessionPreheat(
     return
   }
   const outcome = await preheatRemotePoolSession({
-    uid: String(ctx.auth.uid),
+    uid: String(user.id),
     sessionKey,
     canonicalModelId: model,
   })

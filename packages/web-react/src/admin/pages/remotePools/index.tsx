@@ -122,7 +122,7 @@ export default function RemotePoolsPage() {
   const [publishingOffers, setPublishingOffers] = useState(false);
 
   const fetcher = useCallback(() => adminGet<RemotePoolResponse>("/api/admin/remote-pool"), []);
-  const { data, loading, reload } = useAdminPoll(fetcher, [], { intervalMs: 30_000 });
+  const { data, loading, refresh: reload } = useAdminPoll(fetcher, { intervalMs: 30_000 });
 
   const nodes = data?.nodes ?? [];
   const profiles = data?.profiles ?? [];
@@ -131,26 +131,26 @@ export default function RemotePoolsPage() {
 
   async function handleCreateNode() {
     if (!label.trim() || !sshHost.trim() || !hostKeyFp.trim()) {
-      toast.error("请填写节点名称、SSH 地址与 HostKey SHA256 指纹");
+      toast("请填写节点名称、SSH 地址与 HostKey SHA256 指纹", "error");
       return;
     }
     setCreatingNode(true);
     try {
-      await adminSend("/api/admin/remote-pool/nodes", "POST", {
+      await adminSend("POST", "/api/admin/remote-pool/nodes", {
         label: label.trim(),
         ssh_host: sshHost.trim(),
         ssh_port: Number(sshPort) || 22,
         ssh_user: sshUser.trim() || "box",
         host_key_fp: hostKeyFp.trim(),
       });
-      toast.success("远端节点已添加，可执行一键探测发现已登录底座与模型");
+      toast("远端节点已添加，可执行一键探测发现已登录底座与模型", "success");
       setShowAddModal(false);
       setLabel("");
       setSshHost("");
       setHostKeyFp("");
       reload();
     } catch (e) {
-      toast.error(apiErrorMessage(e, "添加远端节点失败"));
+      toast(apiErrorMessage(e, "添加远端节点失败"), "error");
     } finally {
       setCreatingNode(false);
     }
@@ -159,11 +159,11 @@ export default function RemotePoolsPage() {
   async function handleProbeNode(node: RemoteAgentNode) {
     setProbingNodeId(node.id);
     try {
-      await adminSend(`/api/admin/remote-pool/nodes/${node.id}/probe`, "POST", {});
-      toast.success(`已完成节点 ${node.label} 探测（CC 交互模式校验通过）`);
+      await adminSend("POST", `/api/admin/remote-pool/nodes/${node.id}/probe`, {});
+      toast(`已完成节点 ${node.label} 探测（CC 交互模式校验通过）`, "success");
       reload();
     } catch (e) {
-      toast.error(apiErrorMessage(e, "探测远端节点失败"));
+      toast(apiErrorMessage(e, "探测远端节点失败"), "error");
     } finally {
       setProbingNodeId(null);
     }
@@ -172,17 +172,17 @@ export default function RemotePoolsPage() {
   async function handleDeleteNode(node: RemoteAgentNode) {
     const ok = await confirm({
       title: `删除远端节点 ${node.label}`,
-      description: "将同步移除该节点下的底座 Profile 与模型上架映射，确认继续？",
+      body: "将同步移除该节点下的底座 Profile 与模型上架映射，确认继续？",
       confirmText: "删除节点",
       danger: true,
     });
     if (!ok) return;
     try {
-      await adminSend(`/api/admin/remote-pool/nodes/${node.id}`, "DELETE");
-      toast.success("节点已删除");
+      await adminSend("DELETE", `/api/admin/remote-pool/nodes/${node.id}`);
+      toast("节点已删除", "success");
       reload();
     } catch (e) {
-      toast.error(apiErrorMessage(e, "删除失败"));
+      toast(apiErrorMessage(e, "删除失败"), "error");
     }
   }
 
@@ -207,15 +207,15 @@ export default function RemotePoolsPage() {
         base_display_name: m.display_name,
         enabled: Boolean(checkedModels[m.upstream_model_id]),
       }));
-      await adminSend("/api/admin/remote-pool/offers", "POST", {
+      await adminSend("POST", "/api/admin/remote-pool/offers", {
         profile_id: selectedProfile.id,
         offers: payloadOffers,
       });
-      toast.success("远端模型上架配置已同步至模型目录（前端自动带「远端」后缀）");
+      toast("远端模型上架配置已同步至模型目录（前端自动带「远端」后缀）", "success");
       setSelectedProfile(null);
       reload();
     } catch (e) {
-      toast.error(apiErrorMessage(e, "模型上架失败"));
+      toast(apiErrorMessage(e, "模型上架失败"), "error");
     } finally {
       setPublishingOffers(false);
     }
@@ -224,30 +224,30 @@ export default function RemotePoolsPage() {
   async function handleToggleProfileStatus(profile: RemoteAgentProfile) {
     const nextStatus = profile.status === "disabled" ? "active" : "disabled";
     try {
-      await adminSend(`/api/admin/remote-pool/profiles/${profile.id}`, "PATCH", {
+      await adminSend("PATCH", `/api/admin/remote-pool/profiles/${profile.id}`, {
         status: nextStatus,
       });
-      toast.success(nextStatus === "active" ? "已恢复参与调度" : "已暂停调度");
+      toast(nextStatus === "active" ? "已恢复参与调度" : "已暂停调度", "success");
       reload();
     } catch (e) {
-      toast.error(apiErrorMessage(e, "状态更新失败"));
+      toast(apiErrorMessage(e, "状态更新失败"), "error");
     }
   }
 
   async function handleRevokeBinding(binding: RemoteAgentBinding) {
     const ok = await confirm({
       title: "强制隔离远端会话绑定",
-      description: `确认将绑定记录 ${binding.session_key} (${binding.operation_id.slice(0, 8)}) 标记为隔离状态（未经远端停止证明不宣称进程已销毁）？`,
+      body: `确认将绑定记录 ${binding.session_key} (${binding.operation_id.slice(0, 8)}) 标记为隔离状态（未经远端停止证明不宣称进程已销毁）？`,
       confirmText: "确认隔离绑定",
       danger: true,
     });
     if (!ok) return;
     try {
-      await adminSend(`/api/admin/remote-pool/bindings/${binding.operation_id}/revoke`, "POST", {});
-      toast.success("远端绑定已隔离");
+      await adminSend("POST", `/api/admin/remote-pool/bindings/${binding.operation_id}/revoke`, {});
+      toast("远端绑定已隔离", "success");
       reload();
     } catch (e) {
-      toast.error(apiErrorMessage(e, "操作失败"));
+      toast(apiErrorMessage(e, "操作失败"), "error");
     }
   }
 
@@ -387,7 +387,7 @@ export default function RemotePoolsPage() {
                     size="sm"
                     onClick={() => {
                       void navigator.clipboard?.writeText(n.install_command);
-                      toast.success("已复制受限 authorized_keys 安装命令");
+                      toast("已复制受限 authorized_keys 安装命令", "success");
                     }}
                   >
                     <Copy size={12} /> 复制命令

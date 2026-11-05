@@ -10,7 +10,6 @@ import {
   projectPublicModels,
   projectLockedModels,
 } from '../../billing/modelPublicProjection.js'
-import type { ModelRow } from '../../billing/modelCatalog.js'
 import {
   assertRemoteCcInteractiveRunner,
   boxCcInteractiveLaunchExec,
@@ -88,12 +87,21 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       listLockedForUser: () => [row],
     } as any
 
-    const publicModels = projectPublicModels(snapshot, { isAdmin: false, planCode: 'pro' }, new Set())
+    const publicModels = projectPublicModels(
+      snapshot,
+      { uid: '1', role: 'user', grantedModelIds: new Set(), orgPlanCode: 'pro' },
+      new Set(),
+    )
     assert.equal(publicModels.length, 1)
     assert.equal(publicModels[0]?.display_name, 'Opus 4.7 (1M) 远端')
     assert.equal(publicModels[0]?.placement, 'remote_pool')
 
-    const lockedModels = projectLockedModels(snapshot, { isAdmin: false, planCode: 'free' })
+    const lockedModels = projectLockedModels(snapshot, {
+      uid: '1',
+      role: 'user',
+      grantedModelIds: new Set(),
+      orgPlanCode: 'free',
+    })
     assert.equal(lockedModels.length, 1)
     assert.equal(lockedModels[0]?.display_name, 'Opus 4.7 (1M) 远端')
     assert.equal(lockedModels[0]?.placement, 'remote_pool')
@@ -118,6 +126,9 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
         fifo: '/tmp/oc-box-cc-sess001.1.fifo',
         cwd: '/workspace',
         remoteClaude: '/home/box/.local/bin/claude',
+        execUrl: 'http://127.0.0.1:18799',
+        execToken: 'fixture-exec-token',
+        networkToken: 'fixture-net-token',
       },
       ['--model', 'claude-opus-4-7'],
       mod,
@@ -268,13 +279,57 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
     assert.equal(selfCheck.cc_print_mode_blocked, true)
     assert.equal(selfCheck.credential_paths_isolated, true)
 
-    // Verify B6: empty {} or unverified credential file must never report logged_in=true or synthesize template models
+    // Verify B6: empty {}, expired seconds/ms, or 0 expiry credential files must never report logged_in=true or models
     const fakeHome = mkdtempSync(join(tmpdir(), 'oc-rpool-hostd-home-'))
     try {
+      const claudeDir = join(fakeHome, '.claude')
       const codexDir = join(fakeHome, '.codex')
-      execFileSync('mkdir', ['-p', codexDir])
-      writeFileSync(join(codexDir, 'auth.json'), '{}', 'utf8')
-      const emptyProbe = JSON.parse(
+      execFileSync('mkdir', ['-p', claudeDir, codexDir])
+      const nowSec = Math.floor(Date.now() / 1000)
+
+      for (const exp of [(nowSec - 3600) * 1000, nowSec - 3600, 0]) {
+        writeFileSync(
+          join(claudeDir, '.credentials.json'),
+          JSON.stringify({
+            claudeAiOauth: { accessToken: 'fixture-only-nonsecret-token', expiresAt: exp },
+            available_models: [{ id: 'claude-opus-4-7' }],
+          }),
+          'utf8',
+        )
+        writeFileSync(
+          join(codexDir, 'auth.json'),
+          JSON.stringify({
+            access_token: 'fixture-only-nonsecret-token',
+            expires_at: exp,
+            available_models: [{ id: 'gpt-5.4' }],
+          }),
+          'utf8',
+        )
+        const expiredProbe = JSON.parse(
+          execFileSync('python3', [scriptPath, '--probe'], {
+            encoding: 'utf8',
+            env: { ...process.env, HOME: fakeHome },
+          }),
+        ) as {
+          profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
+        }
+        for (const p of expiredProbe.profiles) {
+          assert.equal(p.logged_in, false, `engine=${p.engine} exp=${exp} must be logged_in=false`)
+          assert.deepEqual(p.discovered_models, [])
+        }
+      }
+
+      // Future timestamp with valid token + available_models succeeds
+      const futureMs = (nowSec + 3600) * 1000
+      writeFileSync(
+        join(claudeDir, '.credentials.json'),
+        JSON.stringify({
+          claudeAiOauth: { accessToken: 'fixture-only-nonsecret-token', expiresAt: futureMs },
+          available_models: [{ id: 'claude-opus-4-7' }],
+        }),
+        'utf8',
+      )
+      const validProbe = JSON.parse(
         execFileSync('python3', [scriptPath, '--probe'], {
           encoding: 'utf8',
           env: { ...process.env, HOME: fakeHome },
@@ -282,10 +337,9 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       ) as {
         profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
       }
-      for (const p of emptyProbe.profiles) {
-        assert.equal(p.logged_in, false)
-        assert.deepEqual(p.discovered_models, [])
-      }
+      const ccProf = validProbe.profiles.find((p) => p.engine === 'cc')
+      assert.equal(ccProf?.logged_in, true)
+      assert.equal(ccProf?.discovered_models.length, 1)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
@@ -522,6 +576,20 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
         globalAdminDisabled: false,
       },
     )
+
+    // 7. Admin activate/disable stored procedures in 0333_remote_agent_pool.sql explicitly reset pool_auto_disabled = FALSE (W1)
+    const migSql = readFileSync(
+      resolve(import.meta.dirname, '../../db/migrations/0333_remote_agent_pool.sql'),
+      'utf8',
+    )
+    assert.match(
+      migSql,
+      /CREATE OR REPLACE FUNCTION fn_model_activate_entry[\s\S]*?SET state = 'active',\s*pool_auto_disabled = FALSE/,
+    )
+    assert.match(
+      migSql,
+      /CREATE OR REPLACE FUNCTION fn_model_disable_entry[\s\S]*?SET state = 'disabled',\s*pool_auto_disabled = FALSE/,
+    )
   })
 
   it('preheatRemotePoolSession honestly reports REMOTE_POOL_EXECUTION_DISABLED when execution is gated off (B7)', async () => {
@@ -530,8 +598,8 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
     try {
       const res = await preheatRemotePoolSession({
         uid: '1001',
-        session_key: 'sess-1',
-        model_id: 'claude-opus-4-7-remote',
+        sessionKey: 'sess-1',
+        canonicalModelId: 'claude-opus-4-7-remote',
       })
       assert.equal(res.preheated, false)
       assert.equal(res.reason, 'REMOTE_POOL_EXECUTION_DISABLED')
