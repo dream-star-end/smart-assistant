@@ -167,20 +167,20 @@
     {
       "commit": "ac5f476106a00b0d4d33fcf3f0773b1592fe1571",
       "reason": "An answered CCB question showed its AskUserQuestion tool row (raw 'User has answered your questions' echo) outside 处理过程, duplicating the 用户问答 card. The tool row is now hidden only when a question card with the same tool_use id exists. Display-only; covered by a MessageList component regression test, no engine or protocol change.",
-      "approvedBy": "user 2026-10-05 改下（问答卡漏到处理过程外）",
-      "expiresAt": "2026-11-04"
+      "approvedBy": "user 2026-10-05 改下（问答卡漏到处理过程外）; user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」（续期已上线不可变 display-only 豁免以放行 selfhost 发布列车）",
+      "expiresAt": "2026-12-04"
     },
     {
       "commit": "3595422d41439b7800ebad13ca7a4e902fec5639",
       "reason": "A resolved CCB plan review showed its ExitPlanMode tool row (raw 'User has approved your plan' / rejected / timed-out echo) outside 处理过程, duplicating the 退出计划模式 card that already shows the plan and outcome. The tool row is now hidden only when a card with the same tool name and tool_use id exists. Display-only; covered by a MessageList component regression test, no engine or protocol change.",
-      "approvedBy": "user 2026-10-05 一起改下（退出计划模式卡同样重复）",
-      "expiresAt": "2026-11-04"
+      "approvedBy": "user 2026-10-05 一起改下（退出计划模式卡同样重复）; user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」（续期已上线不可变 display-only 豁免以放行 selfhost 发布列车）",
+      "expiresAt": "2026-12-04"
     },
     {
       "commit": "98e7e988728643c380d7e1ba40c1fb39716fa014",
       "reason": "During a turn the 已送达 label under the user's message kept appearing and disappearing: every live frame carrying the turn's clientMessageId re-ran admission confirmation, which rewrote the row from read back to sent until the next answer block. Admission now never downgrades read/replied. Display-only client status change; covered by a socket regression test, no gateway or protocol change.",
-      "approvedBy": "user 2026-10-05 v5个人版用户消息底下的已送达会反复出现和消失",
-      "expiresAt": "2026-11-04"
+      "approvedBy": "user 2026-10-05 v5个人版用户消息底下的已送达会反复出现和消失; user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」（续期已上线不可变 display-only 豁免以放行 selfhost 发布列车）",
+      "expiresAt": "2026-12-04"
     },
     {
       "commit": "785b3e0425e9ccc1720043c501946c31abfea22b",
@@ -373,6 +373,12 @@
       "reason": "OCV5-741: 修复 Box 空闲压缩 selectIdlePreserve 保留非落盘 attachment 导致 applyIdleTranscript 抛 IDLE_ARTIFACT_MISSING 死锁，以及 writeSettledIdleOp 覆写刷新 mtime 导致 10 分钟 IDLE_APPLY_STUCK_MS 兜底失效。属于后台空闲压缩修复，不改会话展示或错误卡。",
       "approvedBy": "user 2026-11-04 webmw1rclzbt1ckvm 拍板建单修复两个代码 Bug",
       "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "adad1823aff5f0fe0851e51a4afed1a5ff2cc5cb",
+      "reason": "服务端注入会话回调（cronOrigin / lease_callback）在 executeCronOriginInject 认领分发后广播带 cronOrigin 元数据的 outbound.ack，并在 getClientSessionPartial 增量拉取时附带 openDispatch，使在线浏览器无需刷新即可实时建立活跃回合与订阅流；同时前端将回调消息渲染为居中单行灰字系统通知（点击展开原始回执）。属于回调实时同步与展示形态优化，不改计费或历史落盘数据。",
+      "approvedBy": "user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」",
+      "expiresAt": "2026-12-05"
     }
   ]
 }
