@@ -214,9 +214,6 @@ export function boxCcInteractiveLaunchExec(
     argv: remoteArgs,
     modSha256: mod.sha256,
     expectedModSha256: loadBoxBridgeMod().sha256,
-    sessionProof: {
-      isInteractive: BOX_CC_INTERACTIVE_LAUNCH_SCRIPT.includes('python3 -c "$OC_BOX_HOST_PY"'),
-    },
   })
   const environment: Record<string, string> = {
     HOME: BOX_CC_HOME,

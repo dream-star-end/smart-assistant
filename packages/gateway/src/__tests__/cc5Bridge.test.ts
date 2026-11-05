@@ -385,11 +385,82 @@ test('cc5 Runner interrupt uses port.interrupt as single canonical sender and al
     authorityId: randomUUID(),
     billingRequestId: randomUUID(),
   }
-  await runner.submit('second turn after interrupt', undefined, auth2, 'turn2')
+  await runner. submit('second turn after interrupt', undefined, auth2, 'turn2')
   assert.equal(f.counts().prepared, 1)
   assert.equal(f.counts().admitted, 2)
   assert.equal(f.counts().stopped, 0)
   assert.equal(f.writes.length, 2)
   await runner.shutdown()
   assert.equal(f.counts().stopped, 1)
+})
+
+test('runCc5StdioBridge discards uncommitted half-line on stream disconnect and replays byte-exact valid JSON on generation-2 reconnect (B4)', async () => {
+  const socketPath = `\0cc5-test-b4-${randomUUID()}`
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const fullLine = Buffer.from('{"type":"assistant","message":{"content":"hello"}}\n')
+  const opens: Array<{ generation?: number; lastAckedSeq?: number }> = []
+  const outputChunks: Buffer[] = []
+  const controller = new AbortController()
+  let stopCalls = 0
+
+  stdout.on('data', (chunk: Buffer) => {
+    outputChunks.push(Buffer.from(chunk))
+    setImmediate(() => controller.abort())
+  })
+
+  const server = createServer((req, res) => {
+    if (req.url === '/stop') {
+      stopCalls++
+      req.resume()
+      res.end(JSON.stringify({ ok: true, remoteStopped: true }))
+      return
+    }
+    let buf = ''
+    req.on('error', () => {})
+    req.on('data', (chunk) => {
+      buf += chunk.toString()
+      if (!buf.includes('\n')) return
+      const opening = JSON.parse(buf.split('\n')[0]!) as { generation?: number; lastAckedSeq?: number }
+      buf = ''
+      opens.push({ generation: opening.generation, lastAckedSeq: opening.lastAckedSeq })
+      res.writeHead(200, { 'x-cc5-interactive-ready': '1' })
+      res.flushHeaders()
+      if (opens.length === 1) {
+        // Send uncommitted partial frame (19 bytes, no newline) and then drop connection
+        res.write(fullLine.subarray(0, 19))
+        setTimeout(() => res.destroy(), 25)
+      } else {
+        // Replay full frame on generation 2
+        res.write(fullLine)
+      }
+    })
+  })
+  server.listen(socketPath)
+  await once(server, 'listening')
+
+  const running = runCc5StdioBridge({
+    binding,
+    sessionKey: binding.sessionKey,
+    stdin,
+    stdout,
+    socketPath,
+    signal: controller.signal,
+  })
+  try {
+    await running
+    assert.deepEqual(opens, [
+      { generation: 1, lastAckedSeq: undefined },
+      { generation: 2, lastAckedSeq: 0 },
+    ])
+    const output = Buffer.concat(outputChunks)
+    assert.deepEqual(output, fullLine)
+    assert.doesNotThrow(() => JSON.parse(output.toString('utf8')))
+    assert.equal(stopCalls, 1)
+  } finally {
+    controller.abort()
+    await running.catch(() => {})
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 })

@@ -24,18 +24,19 @@ import {
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
 
-const financeFactory: Cc5FinanceFactory = () => ({ async admit() { return {
+const financeFactory: Cc5FinanceFactory = () => ({ async admit(info) { return {
   async beforeHostStart() {}, async beforeDispatch() {}, async stop() {},
-  async terminal() { return { state: 'proven', requestId: 'fixture-only-request' } },
+  async terminal() { return { state: 'proven', requestId: info?.authority?.billingRequestId ?? 'fixture-only-request' } },
 } } })
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
-function fixture(failStop = false) {
+function fixture(failStop = false, attachable = false) {
   const root = mkdtempSync(join(tmpdir(), 'cc5-cr-'))
   const baseRoot = `/proc/${process.pid}/cwd/${relative(process.cwd(), join(root, 'r'))}`
   const key = generateKeyPairSync('ed25519')
   const x = (key.publicKey.export({ format: 'jwk' }) as { x: string }).x
   const publicKeyring = `fixture-key:${x}`
   let starts = 0
+  let attaches = 0
   let stops = 0
   let factories = 0
   const input = new PassThrough()
@@ -57,9 +58,20 @@ function fixture(failStop = false) {
       factories++
       return {
         start() {
+          if (starts > 0) {
+            throw new Error('task-lifecycle-already-used')
+          }
           starts++
           return { stdin: input, stdout: output, ready: Promise.resolve() }
         },
+        ...(attachable
+          ? {
+              attach() {
+                attaches++
+                return { stdin: input, stdout: output, ready: Promise.resolve() }
+              },
+            }
+          : {}),
         async stop(): Promise<{ remoteStopped: true }> {
           stops++
           if (failStop) throw new Error('fixture remote exit remains unknown')
@@ -84,9 +96,14 @@ function fixture(failStop = false) {
     options,
     publicKeyring,
     key,
+    input,
+    output,
     written,
     get starts() {
       return starts
+    },
+    get attaches() {
+      return attaches
     },
     get stops() {
       return stops
@@ -100,15 +117,22 @@ function fixture(failStop = false) {
     },
   }
 }
-function envelopes(key: ReturnType<typeof generateKeyPairSync>, b: Cc5BridgeBinding) {
+function envelopes(
+  key: ReturnType<typeof generateKeyPairSync>,
+  b: Cc5BridgeBinding,
+  overrides?: { authorityTurnId?: string; billingRequestId?: string; turnKey?: string },
+) {
   const now = Date.now()
+  const authorityTurnId = overrides?.authorityTurnId ?? 'a'.repeat(32)
+  const billingRequestId = overrides?.billingRequestId ?? 'fixture-only-request'
+  const turnKey = overrides?.turnKey ?? 'fixture-billing-turn'
   const a: ModelAuthorityPayload = {
     v: MODEL_AUTHORITY_VERSION,
     keyId: 'fixture-key',
     uid: 912,
     containerId: 91,
-    authorityTurnId: 'a'.repeat(32),
-    billingRequestId: 'fixture-only-request',
+    authorityTurnId,
+    billingRequestId,
     connectionChallenge: 'fixture-connection',
     canonicalModel: 'box-claude-sonnet-5',
     engine: 'ccb',
@@ -140,7 +164,7 @@ function envelopes(key: ReturnType<typeof generateKeyPairSync>, b: Cc5BridgeBind
   return {
     ...b,
     sessionKey: b.sessionKey,
-    turnKey: 'fixture-billing-turn',
+    turnKey,
     authority: encodeAuthorityEnvelope(a, sign(null, authoritySigningInput(a), key.privateKey)),
     lease: encodeTurnLeaseEnvelope(lease, sign(null, turnLeaseSigningInput(lease), key.privateKey)),
   }
@@ -410,9 +434,11 @@ test('unproved remote exit retains private unknown fence and cannot be replaced/
   }
 })
 
-test('24h sliding lease propagates to finance/disk and recovered runtime rebuilds live relay listeners and proves remote stop', async () => {
+test('24h sliding lease propagates to finance/disk and recovered attachable runtime completes multi-turn continuation (seq=2) without re-launching lifecycle (B3)', async () => {
   const realNow = Date.now
-  const f = fixture()
+  const f = fixture(false, true)
+  let req1: ReturnType<typeof request> | undefined
+  let req2: ReturnType<typeof request> | undefined
   try {
     const before = realNow()
     const handle = (await f.prepare())!
@@ -423,21 +449,77 @@ test('24h sliding lease propagates to finance/disk and recovered runtime rebuild
     assert.ok(initialBinding.expiresAt >= before + 24 * 60 * 60 * 1000 - 5000)
     await f.runtime.activate(handle, initialBinding.dockerId)
 
-    // Advance clock by 12 hours and admit a turn so sliding lease extends binding.json past initial 24h
+    // Advance clock by 12 hours and complete a full Turn 1 (admission -> open -> seq=1 -> init + result -> terminal-proven.json)
     Date.now = () => before + 12 * 60 * 60 * 1000
     const socket = join(handle.mountSource, 'relay.sock')
-    const admitted1 = await cc5ControlRequest('/admit', envelopes(f.key, initialBinding), socket)
+    const turn1Scope = envelopes(f.key, initialBinding, {
+      authorityTurnId: 'a'.repeat(32),
+      billingRequestId: 'fixture-only-request',
+      turnKey: 'fixture-turn-key-1',
+    })
+    const admitted1 = await cc5ControlRequest('/admit', turn1Scope, socket)
     assert.equal(admitted1.ready, true)
+    assert.equal(f.starts, 1)
+    assert.equal(f.attaches, 0)
     const extendedBinding = JSON.parse(
       readFileSync(join(handle.mountSource, 'binding.json'), 'utf8'),
     ) as Cc5BridgeBinding
     assert.ok(extendedBinding.expiresAt > initialBinding.expiresAt)
 
-    // Remove the incomplete turn journal dir before simulating clean idle restart at +25h (past initial 24h, within extended 36h)
-    rmSync(join(dirname(handle.mountSource), 'journal', 'a'.repeat(32)), {
-      recursive: true,
-      force: true,
-    })
+    req1 = request({ socketPath: socket, method: 'POST', path: '/session/open' })
+    req1.on('error', () => {})
+    req1.write(`${JSON.stringify({ ...extendedBinding, type: 'open', sessionKey: turn1Scope.sessionKey, generation: 1 })}\n`)
+    const [res1] = await once(req1, 'response')
+    res1.on('error', () => {})
+    res1.resume()
+
+    const turn1Bytes = Buffer.from(
+      `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'turn 1 user frame' } })}\n`,
+    )
+    const turn1Hash = createHash('sha256').update(turn1Bytes).digest('hex')
+    req1.write(`${JSON.stringify({ seq: 1, bytes: turn1Bytes.toString('base64'), hash: turn1Hash })}\n`)
+
+    const wait1 = realNow() + 2000
+    while (f.written.length === 0) {
+      assert.ok(realNow() < wait1)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+
+    const nativeSid = '11111111-1111-4111-8111-111111111111'
+    f.output.write(
+      `${JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeSid, model: 'claude-sonnet-5' })}\n` +
+        `${JSON.stringify({
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          session_id: nativeSid,
+          uuid: 'ocb-11111111-m00001-1',
+          usage: {
+            input_tokens: 12,
+            output_tokens: 34,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        })}\n`,
+    )
+
+    const turn1ProvenPath = join(dirname(handle.mountSource), 'journal', 'a'.repeat(32), 'terminal-proven.json')
+    const waitProven1 = realNow() + 2000
+    while (!existsSync(turn1ProvenPath)) {
+      assert.ok(realNow() < waitProven1)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+
+    // Close the old process's relay socket listeners before simulating process restart at +25h
+    req1.destroy()
+    const origRecord = (f.runtime as any).records.get('91')
+    for (const srv of [origRecord?.relay?.controlServer, origRecord?.relay?.toolServer]) {
+      if (srv) {
+        srv.closeAllConnections()
+        await new Promise<void>((r) => srv.close(() => r()))
+      }
+    }
+
     Date.now = () => before + 25 * 60 * 60 * 1000
 
     let financeAdmittedExpiresAt = 0
@@ -450,7 +532,7 @@ test('24h sliding lease propagates to finance/disk and recovered runtime rebuild
           async beforeDispatch() {},
           async stop() {},
           async terminal() {
-            return { state: 'proven', requestId: 'fixture-only-request' }
+            return { state: 'proven', requestId: 'fixture-request-turn-2' }
           },
         }
       },
@@ -462,6 +544,9 @@ test('24h sliding lease propagates to finance/disk and recovered runtime rebuild
       configuration: () => f.options,
       financeFactory: checkingFinanceFactory,
     })!
+    // Recovery attached to existing lifecycle without calling start() a second time
+    assert.equal(f.starts, 1)
+    assert.equal(f.attaches, 1)
     assert.deepEqual(
       restarted.selectBackend({
         uid: 912,
@@ -477,14 +562,66 @@ test('24h sliding lease propagates to finance/disk and recovered runtime rebuild
       },
     )
 
-    // Recovered runtime has a real listening relay on relay.sock and passes extended binding to finance
-    const admittedAfterRestart = await cc5ControlRequest(
-      '/admit',
-      envelopes(f.key, extendedBinding),
-      socket,
-    )
+    // Complete a real Turn 2 (seq=2) on the recovered runtime using the same operationId and nativeSessionId
+    const turn2Scope = envelopes(f.key, extendedBinding, {
+      authorityTurnId: 'b'.repeat(32),
+      billingRequestId: 'fixture-request-turn-2',
+      turnKey: 'fixture-turn-key-2',
+    })
+    const admittedAfterRestart = await cc5ControlRequest('/admit', turn2Scope, socket)
     assert.equal(admittedAfterRestart.ready, true)
+    assert.equal(f.starts, 1)
     assert.ok(financeAdmittedExpiresAt >= extendedBinding.expiresAt)
+
+    req2 = request({ socketPath: socket, method: 'POST', path: '/session/open' })
+    req2.on('error', () => {})
+    req2.write(
+      `${JSON.stringify({
+        ...extendedBinding,
+        type: 'open',
+        sessionKey: turn2Scope.sessionKey,
+        generation: 1,
+      })}\n`,
+    )
+    const [res2] = await once(req2, 'response')
+    res2.on('error', () => {})
+    res2.resume()
+
+    const turn2Bytes = Buffer.from(
+      `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'turn 2 user frame after recovery' } })}\n`,
+    )
+    const turn2Hash = createHash('sha256').update(turn2Bytes).digest('hex')
+    const writtenBeforeTurn2 = f.written.length
+    req2.write(`${JSON.stringify({ seq: 2, bytes: turn2Bytes.toString('base64'), hash: turn2Hash })}\n`)
+
+    const wait2 = realNow() + 2000
+    while (f.written.length <= writtenBeforeTurn2) {
+      assert.ok(realNow() < wait2)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+
+    f.output.write(
+      `${JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: nativeSid,
+        uuid: 'ocb-11111111-m00002-2',
+        usage: {
+          input_tokens: 18,
+          output_tokens: 42,
+          cache_read_input_tokens: 10,
+          cache_creation_input_tokens: 0,
+        },
+      })}\n`,
+    )
+
+    const turn2ProvenPath = join(dirname(handle.mountSource), 'journal', 'b'.repeat(32), 'terminal-proven.json')
+    const waitProven2 = realNow() + 2000
+    while (!existsSync(turn2ProvenPath)) {
+      assert.ok(realNow() < waitProven2)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
 
     // Release on recovered runtime proves remote stop via host.stop()
     const stopsBefore = f.stops
@@ -492,7 +629,61 @@ test('24h sliding lease propagates to finance/disk and recovered runtime rebuild
     assert.equal(f.stops, stopsBefore + 1)
     assert.equal(existsSync(join(dirname(handle.mountSource), 'released.json')), true)
   } finally {
+    req1?.destroy()
+    req2?.destroy()
     Date.now = realNow
-    await f.cleanup()
+    rmSync(f.root, { recursive: true, force: true })
+  }
+})
+
+test('recovering a launched lifecycle with a one-shot host lacking attach() fails closed and fences UNKNOWN.json (B3)', async () => {
+  const f = fixture(false, false)
+  try {
+    const handle = (await f.prepare())!
+    await f.runtime.bindCreated(handle, 'a'.repeat(64))
+    const b = JSON.parse(readFileSync(join(handle.mountSource, 'binding.json'), 'utf8')) as Cc5BridgeBinding
+    await f.runtime.activate(handle, b.dockerId)
+    const socket = join(handle.mountSource, 'relay.sock')
+    await cc5ControlRequest(
+      '/tool/register',
+      {
+        ...b,
+        sessionKey: f.options.scope.sessionKey,
+        lifecycleId: randomUUID(),
+      },
+      socket,
+    )
+    await cc5ControlRequest('/admit', envelopes(f.key, b), socket)
+    assert.equal(f.starts, 1)
+
+    const origRecord = (f.runtime as any).records.get('91')
+    for (const srv of [origRecord?.relay?.controlServer, origRecord?.relay?.toolServer]) {
+      if (srv) {
+        srv.closeAllConnections()
+        await new Promise<void>((r) => srv.close(() => r()))
+      }
+    }
+
+    // Remove the incomplete turn dir so only local-registered.json remains, proving even with clean turn dirs,
+    // a used lifecycle cannot be marked active if the host port cannot attach() to the existing remote process.
+    rmSync(join(dirname(handle.mountSource), 'journal', 'a'.repeat(32)), {
+      recursive: true,
+      force: true,
+    })
+
+    assert.throws(() =>
+      createCc5FreshContainerRuntime({
+        selfhost: true,
+        env,
+        configuration: () => f.options,
+        financeFactory,
+      }),
+    )
+    const unknownPath = join(dirname(handle.mountSource), 'UNKNOWN.json')
+    assert.equal(existsSync(unknownPath), true)
+    const unknown = JSON.parse(readFileSync(unknownPath, 'utf8')) as { reason: string }
+    assert.equal(unknown.reason, 'recovery-unproved')
+  } finally {
+    rmSync(f.root, { recursive: true, force: true })
   }
 })

@@ -7,8 +7,14 @@ ALTER TABLE model_catalog
   ADD COLUMN IF NOT EXISTS placement TEXT NOT NULL DEFAULT 'local'
   CHECK (placement IN ('local', 'remote_pool'));
 
+ALTER TABLE model_catalog
+  ADD COLUMN IF NOT EXISTS pool_auto_disabled BOOLEAN NOT NULL DEFAULT FALSE;
+
 COMMENT ON COLUMN model_catalog.placement IS
   'Execution placement: local (default) or remote_pool (transition-period remote brain pool; projected with " 远端" display suffix).';
+
+COMMENT ON COLUMN model_catalog.pool_auto_disabled IS
+  'TRUE when a remote_pool catalog entry was automatically disabled only because eligible enabled pool offers dropped to 0 (FALSE when disabled by a global catalog administrator).';
 
 CREATE TABLE IF NOT EXISTS remote_agent_nodes (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),

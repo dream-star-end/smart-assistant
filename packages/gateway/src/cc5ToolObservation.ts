@@ -23,6 +23,21 @@ export class Cc5ToolObservation {
     this.active = true
   }
   endTurn(): void { this.active = false }
+  restoreSession(nativeSessionId: string, seenToolUseIds: Iterable<string> = []): void {
+    if (
+      this.ended ||
+      !/^[a-f0-9-]{36}$/i.test(nativeSessionId) ||
+      (this.nativeId && this.nativeId !== nativeSessionId)
+    ) {
+      rejectObservation()
+    }
+    this.nativeId = nativeSessionId
+    this.active = false
+    for (const id of seenToolUseIds) {
+      if (typeof id !== 'string' || !id || this.seen.size >= 10000) rejectObservation()
+      this.seen.add(id)
+    }
+  }
   get toolUseIds(): readonly string[] { return [...this.actual.keys()] }
   private inputHash(name: string, input: unknown): string {
     if (this.options.legacyFixedTool && name === CC5_FIXED_TOOL_NAME) {

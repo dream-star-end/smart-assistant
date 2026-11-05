@@ -229,6 +229,7 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
         existsSync(bindingPath) &&
         existsSync(authorityPath)
       ) {
+        let createdRelay: Cc5Relay | undefined
         try {
           const binding = Object.freeze(
             JSON.parse(readFileSync(bindingPath, 'utf8')) as Cc5BridgeBinding,
@@ -299,13 +300,23 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
               },
             },
           )
+          createdRelay = relay
           recovered.relay = relay
           this.listenSync(relay.toolServer, toolSocketPath, 0, 0)
           this.listenSync(relay.controlServer, controlSocketPath, 1000, 1000)
+          relay.attachRecoveredHost()
           recovered.state = 'active'
           this.records.set(binding.containerDbId, recovered)
           this.handles.set(handle, recovered)
         } catch {
+          if (createdRelay) {
+            for (const server of [createdRelay.controlServer, createdRelay.toolServer]) {
+              try {
+                server.closeAllConnections()
+                server.close()
+              } catch {}
+            }
+          }
           this.blocked = true
           try {
             if (!existsSync(join(childPath, 'UNKNOWN.json'))) {
@@ -538,10 +549,12 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
         await new Promise<void>((resolve) => server.close(() => resolve()))
       }
       if (!proven) {
-        writePrivate(join(record.root, 'UNKNOWN.json'), {
-          version: 1,
-          reason: 'remote-exit-unproved',
-        })
+        if (!existsSync(join(record.root, 'UNKNOWN.json'))) {
+          writePrivate(join(record.root, 'UNKNOWN.json'), {
+            version: 1,
+            reason: 'remote-exit-unproved',
+          })
+        }
         throw new Error(REJECTED)
       }
       // Retain private identity/fence journal; only the now-inaccessible container view is removed.

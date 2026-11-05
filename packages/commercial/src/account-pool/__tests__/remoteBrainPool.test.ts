@@ -267,6 +267,28 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
     assert.equal(selfCheck.ok, true)
     assert.equal(selfCheck.cc_print_mode_blocked, true)
     assert.equal(selfCheck.credential_paths_isolated, true)
+
+    // Verify B6: empty {} or unverified credential file must never report logged_in=true or synthesize template models
+    const fakeHome = mkdtempSync(join(tmpdir(), 'oc-rpool-hostd-home-'))
+    try {
+      const codexDir = join(fakeHome, '.codex')
+      execFileSync('mkdir', ['-p', codexDir])
+      writeFileSync(join(codexDir, 'auth.json'), '{}', 'utf8')
+      const emptyProbe = JSON.parse(
+        execFileSync('python3', [scriptPath, '--probe'], {
+          encoding: 'utf8',
+          env: { ...process.env, HOME: fakeHome },
+        }),
+      ) as {
+        profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
+      }
+      for (const p of emptyProbe.profiles) {
+        assert.equal(p.logged_in, false)
+        assert.deepEqual(p.discovered_models, [])
+      }
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+    }
   })
 
   it('verifyAndMaterializePinnedKnownHosts pins verified SHA256 host_key_fp and rejects mismatches (B8)', async () => {
@@ -448,7 +470,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       },
     )
 
-    // 5. Global catalog admin disable is never overridden by a single profile offer update
+    // 5. Global catalog admin disable is never overridden by a single profile offer update, even across 1 -> 0 -> 1 transitions (W1)
     assert.deepEqual(
       computeAggregatedRemoteCatalogState({
         prevActiveOfferCount: 1,
@@ -460,6 +482,44 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
         catalogState: 'disabled',
         pricingEnabled: false,
         globalAdminDisabled: true,
+      },
+    )
+    const afterLastOfferRemovedWhileAdminDisabled = computeAggregatedRemoteCatalogState({
+      prevActiveOfferCount: 1,
+      nextActiveOfferCount: 0,
+      existingCatalogState: 'disabled',
+      executionEnabled: true,
+    })
+    assert.deepEqual(afterLastOfferRemovedWhileAdminDisabled, {
+      catalogState: 'disabled',
+      pricingEnabled: false,
+      globalAdminDisabled: true,
+    })
+    const afterOfferReenabledWhileAdminDisabled = computeAggregatedRemoteCatalogState({
+      prevActiveOfferCount: 0,
+      nextActiveOfferCount: 1,
+      existingCatalogState: afterLastOfferRemovedWhileAdminDisabled.catalogState,
+      executionEnabled: true,
+    })
+    assert.deepEqual(afterOfferReenabledWhileAdminDisabled, {
+      catalogState: 'disabled',
+      pricingEnabled: false,
+      globalAdminDisabled: true,
+    })
+
+    // 6. Pool auto-disabled catalog entry (poolAutoDisabled: true) recovers when an active offer returns
+    assert.deepEqual(
+      computeAggregatedRemoteCatalogState({
+        prevActiveOfferCount: 0,
+        nextActiveOfferCount: 1,
+        existingCatalogState: 'disabled',
+        executionEnabled: true,
+        poolAutoDisabled: true,
+      }),
+      {
+        catalogState: 'active',
+        pricingEnabled: true,
+        globalAdminDisabled: false,
       },
     )
   })

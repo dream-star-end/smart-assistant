@@ -39,6 +39,32 @@ export class Cc5NativeUsageObserver {
   interruptTurn(): void {
     this.interrupted = true
   }
+  restoreFromReceipts(receipts: readonly Cc5NativeTerminalReceipt[]): void {
+    requireUsage(!this.failed && !this.finished && !this.turn && this.buffer.length === 0)
+    for (const receipt of receipts) {
+      requireUsage(
+        receipt &&
+          receipt.version === 2 &&
+          receipt.operationId === this.binding.operationId &&
+          receipt.runId === this.binding.runId &&
+          receipt.sessionKey === this.binding.sessionKey &&
+          receipt.canonicalModel === this.binding.canonicalModel &&
+          receipt.upstreamModel === CC5_NATIVE_UPSTREAM_MODEL &&
+          typeof receipt.nativeSessionId === 'string' &&
+          UUID.test(receipt.nativeSessionId) &&
+          (!this.nativeSessionId || this.nativeSessionId === receipt.nativeSessionId) &&
+          typeof receipt.resultSha256 === 'string' &&
+          /^[a-f0-9]{64}$/.test(receipt.resultSha256) &&
+          !this.resultDigests.has(receipt.resultSha256),
+      )
+      this.nativeSessionId = receipt.nativeSessionId
+      this.upstreamModel = receipt.upstreamModel
+      this.resultDigests.add(receipt.resultSha256)
+    }
+    if (receipts.length > 0) {
+      this.terminalSeen = true
+    }
+  }
   ingest(chunk: Buffer): Cc5NativeOutputFrame[] {
     requireUsage(!this.failed && !this.finished)
     try {

@@ -40,25 +40,43 @@ FORBIDDEN_CC_PRINT_FLAGS = {
     "--replay-user-messages",
 }
 
-DEFAULT_MODELS_BY_ENGINE: Dict[str, List[Dict[str, str]]] = {
-    "cc": [
-        {"upstream_model_id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6"},
-        {"upstream_model_id": "claude-opus-4-7", "display_name": "Claude Opus 4.7"},
-        {"upstream_model_id": "claude-sonnet-5", "display_name": "Claude Sonnet 5"},
-    ],
-    "codex": [
-        {"upstream_model_id": "gpt-5.4", "display_name": "GPT-5.4"},
-        {"upstream_model_id": "gpt-5.3-codex", "display_name": "GPT-5.3 Codex"},
-    ],
-    "antigravity": [
-        {"upstream_model_id": "gemini-3.1-pro", "display_name": "Gemini 3.1 Pro"},
-        {"upstream_model_id": "gemini-3.0-flash", "display_name": "Gemini 3.0 Flash"},
-    ],
-    "grok-build": [
-        {"upstream_model_id": "grok-4.20", "display_name": "Grok 4.20"},
-        {"upstream_model_id": "grok-code-fast-1", "display_name": "Grok Code Fast 1"},
-    ],
-}
+DEFAULT_MODELS_BY_ENGINE: Dict[str, List[Dict[str, str]]] = {}
+
+
+def parse_verified_models(raw: Any) -> List[Dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    models: List[Dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("upstream_model_id") or item.get("id")
+        if not isinstance(mid, str) or not mid.strip():
+            continue
+        disp = item.get("display_name") or item.get("name") or mid
+        models.append(
+            {
+                "upstream_model_id": mid.strip(),
+                "display_name": str(disp).strip() or mid.strip(),
+            }
+        )
+    return models
+
+
+def is_valid_token_str(val: Any) -> bool:
+    return isinstance(val, str) and len(val.strip()) >= 16
+
+
+def is_not_expired(exp_val: Any) -> bool:
+    if exp_val is None:
+        return True
+    if isinstance(exp_val, (int, float)):
+        now_sec = time.time()
+        # Handle both epoch milliseconds and epoch seconds
+        if exp_val > 1e11:
+            return exp_val > (now_sec * 1000.0)
+        return exp_val > now_sec
+    return False
 
 
 def self_sha256() -> str:
@@ -106,10 +124,10 @@ def run_cmd_version(binary: str, args: List[str] = ["--version"]) -> Optional[st
         return None
     try:
         out = subprocess.check_output([exe, *args], stderr=subprocess.STDOUT, timeout=4.0, text=True)
-        first = out.strip().splitlines()[0] if out.strip() else "installed"
-        return first[:120]
+        first = out.strip().splitlines()[0] if out.strip() else None
+        return first[:120] if first else None
     except Exception:
-        return "installed"
+        return None
 
 
 def compute_oc_bridge_digest(home: pathlib.Path) -> Optional[str]:
@@ -157,37 +175,47 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
 
     for profile_name, cfg_dir in dirs:
         email = None
-        plan_type = "max"
-        logged_in = False
+        plan_type: Optional[str] = None
+        has_valid_token = False
         used_5h: Optional[float] = None
         used_7d: Optional[float] = None
-        discovered_models = list(DEFAULT_MODELS_BY_ENGINE["cc"])
+        discovered_models: List[Dict[str, str]] = []
         for candidate in (cfg_dir / ".credentials.json", cfg_dir / "config.json", home / ".claude.json"):
             if candidate.is_file():
                 try:
-                    data = json.loads(candidate.read_text("utf-8", errors="ignore"))
+                    data = json.loads(candidate.read_text("utf-8", errors="strict"))
                     if isinstance(data, dict):
                         acct = data.get("oauthAccount") or data.get("account") or {}
                         if isinstance(acct, dict):
                             email = acct.get("emailAddress") or acct.get("email") or email
                             plan_type = acct.get("SubscriptionType") or acct.get("planType") or plan_type
-                        if data.get("claudeAiOauth") or email:
-                            logged_in = True
+                        oauth = data.get("claudeAiOauth")
+                        if isinstance(oauth, dict):
+                            tok = oauth.get("accessToken") or oauth.get("access_token")
+                            exp = oauth.get("expiresAt")
+                            exp_ok = exp is None or (isinstance(exp, (int, float)) and exp > 0)
+                            if isinstance(tok, str) and len(tok.strip()) >= 16 and exp_ok:
+                                has_valid_token = True
                         if isinstance(data.get("five_hour_used_pct"), (int, float)):
                             used_5h = float(data["five_hour_used_pct"])
                         if isinstance(data.get("seven_day_used_pct"), (int, float)):
                             used_7d = float(data["seven_day_used_pct"])
                         if isinstance(data.get("available_models"), list) and data["available_models"]:
-                            discovered_models = [
+                            verified = [
                                 {
-                                    "upstream_model_id": str(m.get("upstream_model_id") or m.get("id")),
-                                    "display_name": str(m.get("display_name") or m.get("name") or m.get("id")),
+                                    "upstream_model_id": str(m.get("upstream_model_id") or m.get("id")).strip(),
+                                    "display_name": str(m.get("display_name") or m.get("name") or m.get("id")).strip(),
                                 }
                                 for m in data["available_models"]
-                                if isinstance(m, dict) and (m.get("upstream_model_id") or m.get("id"))
-                            ] or discovered_models
+                                if isinstance(m, dict)
+                                and isinstance(m.get("upstream_model_id") or m.get("id"), str)
+                                and str(m.get("upstream_model_id") or m.get("id")).strip()
+                            ]
+                            if verified:
+                                discovered_models = verified
                 except Exception:
                     pass
+        logged_in = bool(has_valid_token and len(discovered_models) > 0)
         raw_id = email or f"{os.uname().nodename}:cc:{profile_name}"
         profiles.append(
             {
@@ -200,7 +228,7 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                 "logged_in": logged_in,
                 "account_hint": mask_email(email) or f"cc:{profile_name}",
                 "account_fingerprint": account_fingerprint("cc", raw_id),
-                "plan_type": str(plan_type),
+                "plan_type": str(plan_type) if (logged_in and plan_type) else None,
                 "discovered_models": discovered_models if logged_in else [],
                 "quota_windows": [
                     {"label": "5h", "usedPct": used_5h, "resetsAt": None},
@@ -216,24 +244,50 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
     if not cli_ver:
         return []
     email = None
-    plan_type = "pro"
-    logged_in = False
+    plan_type: Optional[str] = None
+    has_valid_token = False
     used_5h: Optional[float] = None
     used_7d: Optional[float] = None
+    discovered_models: List[Dict[str, str]] = []
     for f in auth_files:
         if f.is_file():
-            logged_in = True
             try:
-                data = json.loads(f.read_text("utf-8", errors="ignore"))
+                data = json.loads(f.read_text("utf-8", errors="strict"))
                 if isinstance(data, dict):
                     email = data.get("email") or data.get("account_email") or email
                     plan_type = data.get("plan") or data.get("plan_type") or plan_type
+                    tokens_obj = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+                    token_candidate = (
+                        data.get("access_token")
+                        or data.get("id_token")
+                        or data.get("api_key")
+                        or tokens_obj.get("access_token")
+                        or tokens_obj.get("id_token")
+                    )
+                    exp = data.get("expires_at") or tokens_obj.get("expires_at")
+                    exp_ok = exp is None or (isinstance(exp, (int, float)) and exp > 0)
+                    if isinstance(token_candidate, str) and len(token_candidate.strip()) >= 16 and exp_ok:
+                        has_valid_token = True
                     if isinstance(data.get("five_hour_used_pct"), (int, float)):
                         used_5h = float(data["five_hour_used_pct"])
                     if isinstance(data.get("seven_day_used_pct"), (int, float)):
                         used_7d = float(data["seven_day_used_pct"])
+                    if isinstance(data.get("available_models"), list) and data["available_models"]:
+                        verified = [
+                            {
+                                "upstream_model_id": str(m.get("upstream_model_id") or m.get("id")).strip(),
+                                "display_name": str(m.get("display_name") or m.get("name") or m.get("id")).strip(),
+                            }
+                            for m in data["available_models"]
+                            if isinstance(m, dict)
+                            and isinstance(m.get("upstream_model_id") or m.get("id"), str)
+                            and str(m.get("upstream_model_id") or m.get("id")).strip()
+                        ]
+                        if verified:
+                            discovered_models = verified
             except Exception:
                 pass
+    logged_in = bool(has_valid_token and len(discovered_models) > 0)
     raw_id = email or f"{os.uname().nodename}:{engine}:default"
     return [
         {
@@ -245,8 +299,8 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
             "logged_in": logged_in,
             "account_hint": mask_email(email) or f"{engine}:default",
             "account_fingerprint": account_fingerprint(engine, raw_id),
-            "plan_type": str(plan_type),
-            "discovered_models": DEFAULT_MODELS_BY_ENGINE.get(engine, []) if logged_in else [],
+            "plan_type": str(plan_type) if (logged_in and plan_type) else None,
+            "discovered_models": discovered_models if logged_in else [],
             "quota_windows": [
                 {"label": "5h", "usedPct": used_5h, "resetsAt": None},
                 {"label": "7d", "usedPct": used_7d, "resetsAt": None},

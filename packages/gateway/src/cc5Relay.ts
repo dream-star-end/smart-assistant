@@ -25,7 +25,7 @@ import {
 } from '@openclaude/protocol'
 import { CC5_BRIDGE_MAX_FRAME_BYTES, type Cc5BridgeBinding, assertCc5BindingScope,
   cc5AuthorityMatchesBinding } from './cc5BridgePort.js'
-import type { Cc5FinancePort, Cc5FinanceTurn } from './cc5Finance.js'
+import type { Cc5FinancePort, Cc5FinanceTurn, Cc5NativeTerminalReceipt } from './cc5Finance.js'
 import { Cc5NativeUsageObserver } from './cc5NativeUsage.js'
 import { CC5_TOOL_RECEIPT_MAX_BYTES, type Cc5ToolReceipt, assertCc5ToolResult, boundCc5ToolResult,
   cc5ToolInputSha256, cc5ToolScopeHash, validateCc5NativeToolInput } from './cc5NativeTool.js'
@@ -35,6 +35,8 @@ import type { Cc5ToolDelivery } from './cc5ToolPump.js'
 export interface Cc5InteractiveHostPort {
   /** Must launch the pinned original host once; only its original READY resolves ready. */
   start(): { stdin: Writable; stdout: Readable; ready: Promise<void> }
+  /** Reattach to an already-launched live remote session without re-running one-shot launch. */
+  attach?(): { stdin: Writable; stdout: Readable; ready: Promise<void> }
   /** Independent identity-checked remote stop and absence proof, including failed startup. */
   stop(): Promise<{ remoteStopped: true }>
 }
@@ -136,6 +138,7 @@ export class Cc5Relay {
   private outSeq = 0
   private readonly outputHistory: Array<{ seq: number; bytes: Buffer }> = []
   private outputHistoryBytes = 0
+  private needsReattach = false
 
   constructor(
     private binding: Readonly<Cc5BridgeBinding>,
@@ -156,6 +159,7 @@ export class Cc5Relay {
       binding.runId === runId && typeof finance?.admit === 'function')
     this.bindingExpiresAt = binding.expiresAt
     this.nativeUsage = new Cc5NativeUsageObserver(binding)
+    this.observation = new Cc5ToolObservation(binding.operationId)
     if (options.recoverExistingJournal && existsSync(journalRoot)) {
       const st = lstatSync(journalRoot)
       requireRelay(
@@ -164,6 +168,9 @@ export class Cc5Relay {
           st.uid === process.getuid?.() &&
           (st.mode & 0o077) === 0,
       )
+      const recoveredReceipts: Cc5NativeTerminalReceipt[] = []
+      let maxInputSeq = 0
+      let maxInputHash: string | undefined
       for (const entry of readdirSync(journalRoot)) {
         if (entry === 'local-stopped.json') {
           this.localStopped = true
@@ -176,6 +183,7 @@ export class Cc5Relay {
               /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(reg.lifecycleId),
           )
           this.lifecycleId = reg.lifecycleId
+          this.launchAttempted = true
         } else if (/^[a-f0-9]{32}$/.test(entry)) {
           const turnDir = join(journalRoot, entry)
           const turnSt = lstatSync(turnDir)
@@ -185,6 +193,7 @@ export class Cc5Relay {
               turnSt.uid === process.getuid?.() &&
               (turnSt.mode & 0o077) === 0 &&
               existsSync(join(turnDir, 'admission.json')) &&
+              existsSync(join(turnDir, 'native-terminal.json')) &&
               existsSync(join(turnDir, 'terminal-proven.json')),
           )
           const adm = JSON.parse(readFileSync(join(turnDir, 'admission.json'), 'utf8')) as {
@@ -192,18 +201,52 @@ export class Cc5Relay {
             turnKey?: string
             billingRequestId?: string
           }
+          const term = JSON.parse(
+            readFileSync(join(turnDir, 'native-terminal.json'), 'utf8'),
+          ) as Cc5NativeTerminalReceipt
+          const proven = JSON.parse(readFileSync(join(turnDir, 'terminal-proven.json'), 'utf8')) as {
+            requestId?: string
+            resultSha256?: string
+          }
           requireRelay(
             adm?.authorityTurnId === entry &&
               typeof adm.turnKey === 'string' &&
               adm.turnKey.length > 0 &&
               typeof adm.billingRequestId === 'string' &&
-              adm.billingRequestId.length > 0,
+              adm.billingRequestId.length > 0 &&
+              proven?.requestId === adm.billingRequestId &&
+              proven?.resultSha256 === term?.resultSha256 &&
+              term?.authorityTurnId === adm.authorityTurnId &&
+              term?.turnKey === adm.turnKey,
           )
           this.usedAuthorities.add(adm.authorityTurnId)
           this.usedTurns.add(adm.turnKey)
           this.usedRequests.add(adm.billingRequestId)
           this.launchAttempted = true
-          for (const f of readdirSync(turnDir)) {
+          recoveredReceipts.push(term)
+          if (existsSync(join(turnDir, 'dispatch.json'))) {
+            const disp = JSON.parse(readFileSync(join(turnDir, 'dispatch.json'), 'utf8')) as {
+              sequence?: number
+              hash?: string
+            }
+            requireRelay(
+              typeof disp?.sequence === 'number' &&
+                Number.isSafeInteger(disp.sequence) &&
+                disp.sequence >= 1 &&
+                typeof disp?.hash === 'string' &&
+                /^[a-f0-9]{64}$/.test(disp.hash),
+            )
+            if (disp.sequence > maxInputSeq) {
+              maxInputSeq = disp.sequence
+              maxInputHash = disp.hash
+            }
+          }
+          const turnFiles = readdirSync(turnDir)
+          for (const f of turnFiles) {
+            if (f.startsWith('tool-') && f.endsWith('-attempt.json')) {
+              const completedName = f.replace(/-attempt\.json$/, '-completed.json')
+              requireRelay(turnFiles.includes(completedName))
+            }
             if (f.startsWith('tool-') && f.endsWith('-completed.json')) {
               const tr = JSON.parse(readFileSync(join(turnDir, f), 'utf8')) as {
                 rpcId?: string | number
@@ -218,6 +261,17 @@ export class Cc5Relay {
         }
       }
       requireRelay(!this.localStopped)
+      if (this.launchAttempted || recoveredReceipts.length > 0) {
+        // An already-launched session cannot be re-launched via one-shot start(); hostPort MUST support attach().
+        requireRelay(typeof this.hostPort.attach === 'function')
+        if (recoveredReceipts.length > 0) {
+          this.nativeUsage.restoreFromReceipts(recoveredReceipts)
+          this.observation.restoreSession(recoveredReceipts[0]!.nativeSessionId, this.usedToolIds)
+        }
+        this.lastSequence = maxInputSeq
+        this.lastHash = maxInputHash
+        this.needsReattach = true
+      }
     } else {
       mkdirSync(journalRoot, { mode: 0o700, recursive: false })
       const st = lstatSync(journalRoot)
@@ -232,7 +286,6 @@ export class Cc5Relay {
     } finally {
       closeSync(parent)
     }
-    this.observation = new Cc5ToolObservation(binding.operationId)
     this.armExpiry(this.bindingExpiresAt)
   }
   private slideBindingExpiry(): number {
@@ -300,87 +353,109 @@ export class Cc5Relay {
     )
     this.expiry.unref()
   }
+  private bindHostStreams(host: ReturnType<Cc5InteractiveHostPort['start']>): void {
+    const stdin = host.stdin
+    const inputFailed = (): void => {
+      void this.stop().catch(() => {})
+    }
+    stdin.on('error', inputFailed)
+    stdin.once('close', () => {
+      inputFailed()
+      stdin.removeListener('error', inputFailed)
+    })
+    host.stdout.on('data', (chunk: Buffer) => {
+      if (this.revoked) return
+      this.host!.stdout.pause()
+      const bytes = Buffer.from(chunk)
+      this.queuedOutputBytes += bytes.length
+      this.outputTail = this.outputTail.then(async () => {
+        requireRelay(!this.revoked && this.queuedOutputBytes <= CC5_BRIDGE_MAX_FRAME_BYTES)
+        const frames = this.nativeUsage.ingest(bytes)
+        // Validate the entire complete chunk before a waiter can authorize a tool.
+        this.observation.ingest(bytes)
+        this.outputEvents.emit('data')
+        for (const frame of frames) {
+          requireRelay(!this.revoked)
+          if (frame.receipt) {
+            requireRelay(
+              this.phase === 'running' &&
+                this.userSeen &&
+                this.financeTurn &&
+                this.admitted &&
+                frame.receipt.version === 2 &&
+                frame.receipt.authorityTurnId === this.admitted.payload.authorityTurnId &&
+                frame.receipt.turnKey === this.admitted.turnKey &&
+                this.waitingTools === 0 &&
+                this.toolQueue.length === 0 &&
+                this.observation.toolUseIds.every((id) => this.turnTools.get(id)?.receipt),
+            )
+            this.verify(this.admitted.authority, this.admitted.lease, true)
+            this.phase = 'settling'
+            await Promise.all(
+              [...this.turnTools.values()].map((tool) => {
+                requireRelay(tool.receipt && tool.ack)
+                return tool.ack
+              }),
+            )
+            requireRelay([...this.turnTools.values()].every((tool) => tool.acknowledged) && !this.pending)
+            this.record('native-terminal.json', frame.receipt)
+            const outcome = await this.financeTurn.terminal(frame.receipt)
+            requireRelay(outcome.state === 'proven' && outcome.requestId === this.admitted.payload.billingRequestId)
+            this.record('terminal-proven.json', {
+              requestId: outcome.requestId,
+              resultSha256: frame.receipt.resultSha256,
+            })
+            requireRelay(!this.revoked)
+            this.observation.endTurn()
+            this.interruptedTurn = false
+            this.phase = 'idle'
+            this.armExpiry(this.bindingExpiresAt)
+          }
+          requireRelay(!this.revoked)
+          this.publishOutput(frame.bytes)
+        }
+        this.queuedOutputBytes -= bytes.length
+        if (!this.revoked && !this.outputBackpressured) this.host?.stdout.resume()
+      }).catch(() => { void this.stop().catch(() => {}) })
+    })
+    host.stdout.once('end', () => {
+      void this.outputTail.then(() => {
+        this.nativeUsage.finish()
+        this.observation.finish()
+      }).finally(() => this.stop()).catch(() => {})
+    })
+    host.stdout.once('error', () => {
+      void this.stop().catch(() => {})
+    })
+  }
+  attachRecoveredHost(): void {
+    if (!this.needsReattach) return
+    requireRelay(!this.revoked && !this.hostReady && typeof this.hostPort.attach === 'function')
+    this.launchAttempted = true
+    this.needsReattach = false
+    this.host = this.hostPort.attach()
+    this.bindHostStreams(this.host)
+    this.hostReady = Promise.resolve().then(async () => {
+      await this.host!.ready
+      requireRelay(!this.revoked)
+    })
+    void this.hostReady.catch(() => {
+      void this.stop().catch(() => {})
+    })
+  }
   private ensureHost(): Promise<void> {
     if (this.hostReady) return this.hostReady
     requireRelay(!this.revoked)
+    if (this.needsReattach) {
+      this.attachRecoveredHost()
+      return this.hostReady!
+    }
     // Publish the joining promise BEFORE invoking start, even if start throws after spawning.
     this.hostReady = Promise.resolve().then(async () => {
       requireRelay(!this.revoked && this.admitted && this.financeTurn)
       this.launchAttempted = true
       this.host = this.hostPort.start()
-      const stdin = this.host.stdin
-      const inputFailed = (): void => {
-        void this.stop().catch(() => {})
-      }
-      stdin.on('error', inputFailed)
-      stdin.once('close', () => {
-        inputFailed()
-        stdin.removeListener('error', inputFailed)
-      })
-      this.host.stdout.on('data', (chunk: Buffer) => {
-        if (this.revoked) return
-        this.host!.stdout.pause()
-        const bytes = Buffer.from(chunk)
-        this.queuedOutputBytes += bytes.length
-        this.outputTail = this.outputTail.then(async () => {
-          requireRelay(!this.revoked && this.queuedOutputBytes <= CC5_BRIDGE_MAX_FRAME_BYTES)
-          const frames = this.nativeUsage.ingest(bytes)
-          // Validate the entire complete chunk before a waiter can authorize a tool.
-          this.observation.ingest(bytes)
-          this.outputEvents.emit('data')
-          for (const frame of frames) {
-            requireRelay(!this.revoked)
-            if (frame.receipt) {
-              requireRelay(
-                this.phase === 'running' &&
-                  this.userSeen &&
-                  this.financeTurn &&
-                  this.admitted &&
-                  frame.receipt.version === 2 &&
-                  frame.receipt.authorityTurnId === this.admitted.payload.authorityTurnId &&
-                  frame.receipt.turnKey === this.admitted.turnKey &&
-                  this.waitingTools === 0 &&
-                  this.toolQueue.length === 0 &&
-                  this.observation.toolUseIds.every((id) => this.turnTools.get(id)?.receipt),
-              )
-              this.verify(this.admitted.authority, this.admitted.lease, true)
-              this.phase = 'settling'
-              await Promise.all(
-                [...this.turnTools.values()].map((tool) => {
-                  requireRelay(tool.receipt && tool.ack)
-                  return tool.ack
-                }),
-              )
-              requireRelay([...this.turnTools.values()].every((tool) => tool.acknowledged) && !this.pending)
-              this.record('native-terminal.json', frame.receipt)
-              const outcome = await this.financeTurn.terminal(frame.receipt)
-              requireRelay(outcome.state === 'proven' && outcome.requestId === this.admitted.payload.billingRequestId)
-              this.record('terminal-proven.json', {
-                requestId: outcome.requestId,
-                resultSha256: frame.receipt.resultSha256,
-              })
-              requireRelay(!this.revoked)
-              this.observation.endTurn()
-              this.interruptedTurn = false
-              this.phase = 'idle'
-              this.armExpiry(this.bindingExpiresAt)
-            }
-            requireRelay(!this.revoked)
-            this.publishOutput(frame.bytes)
-          }
-          this.queuedOutputBytes -= bytes.length
-          if (!this.revoked && !this.outputBackpressured) this.host?.stdout.resume()
-        }).catch(() => { void this.stop().catch(() => {}) })
-      })
-      this.host.stdout.once('end', () => {
-        void this.outputTail.then(() => {
-          this.nativeUsage.finish()
-          this.observation.finish()
-        }).finally(() => this.stop()).catch(() => {})
-      })
-      this.host.stdout.once('error', () => {
-        void this.stop().catch(() => {})
-      })
+      this.bindHostStreams(this.host)
       await this.host.ready
       requireRelay(!this.revoked)
     })

@@ -68,7 +68,6 @@ export async function runCc5StdioBridge(input: {
   let generation = 1
   let lastAckedSeq = 0
   let reconnectCount = 0
-  let outRemainder = Buffer.alloc(0)
   const stop = (): Promise<void> => {
     if (stopPromise) return stopPromise
     stopping = true
@@ -186,7 +185,9 @@ export async function runCc5StdioBridge(input: {
       const openStream = (gen: number, ackSeq: number): void => {
         ready = false
         let reconnectingThisStream = false
+        let connRemainder = Buffer.alloc(0)
         const tryReconnect = (fallbackErrorCode: string): void => {
+          if (gen !== generation || reconnectingThisStream) return
           if (stopping || ended || input.signal?.aborted || failure) {
             void finishStream()
             return
@@ -194,6 +195,7 @@ export async function runCc5StdioBridge(input: {
           if (reconnectCount < 2) {
             reconnectCount++
             reconnectingThisStream = true
+            connRemainder = Buffer.alloc(0)
             clearTimeout(readyTimer)
             try {
               req?.destroy()
@@ -216,6 +218,10 @@ export async function runCc5StdioBridge(input: {
             },
           },
           (res) => {
+            if (gen !== generation || reconnectingThisStream) {
+              res.resume()
+              return
+            }
             if (res.statusCode === 409) {
               fail('CC5_STREAM_SEQ_GAP')
               res.resume()
@@ -254,12 +260,17 @@ export async function runCc5StdioBridge(input: {
             pendingBytes = 0
             input.stdin.resume()
             res.on('data', (chunk: Buffer) => {
-              outRemainder = Buffer.concat([outRemainder, chunk])
+              if (gen !== generation || reconnectingThisStream || stopping) return
+              connRemainder = Buffer.concat([connRemainder, chunk])
+              if (connRemainder.length > CC5_BRIDGE_MAX_FRAME_BYTES) {
+                fail('CC5_OUTPUT_FRAME_TOO_LARGE')
+                return
+              }
               let nl: number
               const completePieces: Buffer[] = []
-              while ((nl = outRemainder.indexOf(10)) >= 0) {
-                const frameBytes = outRemainder.subarray(0, nl + 1)
-                outRemainder = outRemainder.subarray(nl + 1)
+              while ((nl = connRemainder.indexOf(10)) >= 0) {
+                const frameBytes = connRemainder.subarray(0, nl + 1)
+                connRemainder = connRemainder.subarray(nl + 1)
                 lastAckedSeq++
                 completePieces.push(frameBytes)
               }
@@ -275,21 +286,23 @@ export async function runCc5StdioBridge(input: {
               if (!input.stdout.write(forward)) res.pause()
             })
             const onDrain = (): void => {
-              res.resume()
+              if (gen === generation && !reconnectingThisStream) res.resume()
             }
             input.stdout.on('drain', onDrain)
             res.once('close', () => {
               input.stdout.removeListener('drain', onDrain)
             })
             res.once('aborted', () => {
-              if (!stopping && !reconnectingThisStream) tryReconnect('CC5_OUTPUT_DELIVERY_UNKNOWN')
+              if (gen !== generation || reconnectingThisStream || stopping) return
+              tryReconnect('CC5_OUTPUT_DELIVERY_UNKNOWN')
             })
             res.once('error', () => {
-              if (!stopping && !reconnectingThisStream) tryReconnect('CC5_OUTPUT_FAILED')
+              if (gen !== generation || reconnectingThisStream || stopping) return
+              tryReconnect('CC5_OUTPUT_FAILED')
             })
             res.once('end', () => {
-              if (reconnectingThisStream) return
-              if (!stopping && !ended && !input.signal?.aborted) {
+              if (gen !== generation || reconnectingThisStream) return
+              if (!stopping && (!ended && !input.signal?.aborted || connRemainder.length > 0)) {
                 tryReconnect('CC5_REMOTE_OUTPUT_ENDED')
                 return
               }
@@ -299,15 +312,14 @@ export async function runCc5StdioBridge(input: {
         )
         req = currentReq
         currentReq.on('drain', () => {
-          if (ready && req === currentReq) input.stdin.resume()
+          if (ready && gen === generation && req === currentReq) input.stdin.resume()
         })
         currentReq.once('error', () => {
-          if (!stopping && !reconnectingThisStream) {
-            tryReconnect('CC5_TRANSPORT_DELIVERY_UNKNOWN')
-          }
+          if (gen !== generation || reconnectingThisStream || stopping) return
+          tryReconnect('CC5_TRANSPORT_DELIVERY_UNKNOWN')
         })
         currentReq.once('close', () => {
-          if (reconnectingThisStream || req !== currentReq) return
+          if (gen !== generation || reconnectingThisStream || req !== currentReq) return
           void finishStream()
         })
         clearTimeout(readyTimer)
