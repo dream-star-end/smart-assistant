@@ -278,9 +278,10 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
   it('opencodego → provider-neutral Flash canonical / 历史 alias 同归一 / qwen3.7 legacy', () => {
     const og = getStaticProvider('opencodego')
     assert.equal(og.canonicalizeForPricing('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash')
-    assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash')
+    assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4.1-flash')
     assert.equal(og.canonicalizeForPricing('deepseek-v4-flash'), 'deepseek-v4-flash')
-    assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash'), 'deepseek-v4-flash')
+    assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash'), 'deepseek-v4.1-flash')
+    assert.equal(og.upstreamModelForRequest?.('deepseek-v4.1-flash'), 'deepseek-v4.1-flash')
     assert.equal(og.canonicalizeForPricing('qwen3.7-max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('Qwen3.7-Max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('qwen3.7-plus'), 'qwen3.7-plus')

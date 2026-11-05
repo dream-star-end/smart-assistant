@@ -50,7 +50,7 @@ describe("staticRouteFallback", () => {
 });
 
 describe("fetchPlatformFlash", () => {
-  test("Go 200 → Go only, body unchanged", async () => {
+  test("Go 200 → Go only, catalog id rewritten to Go upstream name", async () => {
     setPlatformFlashFallbackKey("DS-KEY");
     const r = recorder([ok()]);
     const res = await fetchPlatformFlash(r.fetchImpl, { goKey: "GO-KEY", body, init: {} });
@@ -60,7 +60,9 @@ describe("fetchPlatformFlash", () => {
     assert.equal(r.calls[0]!.headers["x-api-key"], "GO-KEY");
     // OpenCode Go 缺 x-opencode-session 即 400 MissingSessionID(且不回落)。
     assert.match(r.calls[0]!.headers["x-opencode-session"] ?? "", /^[0-9a-f-]{36}$/);
-    assert.equal(r.calls[0]!.body.model, "deepseek-v4-flash");
+    // Go 已下线 deepseek-v4-flash(400 Model is unavailable,且 400 不回落)。
+    assert.deepEqual(r.calls[0]!.body, { ...body, model: "deepseek-v4.1-flash" });
+    assert.equal(body.model, "deepseek-v4-flash");
   });
 
   test("Go weekly limit 429 → same call on official DeepSeek with Bearer key and deepseek-flash", async () => {

@@ -81,7 +81,7 @@ describe('OpenCode Go /messages models', () => {
   })
 
   it('existing OpenCode Go routes are unchanged', () => {
-    assert.equal(GO.upstreamModelForRequest?.('deepseek-v4-flash'), 'deepseek-v4-flash')
+    assert.equal(GO.upstreamModelForRequest?.('deepseek-v4-flash'), 'deepseek-v4.1-flash')
     assert.equal(
       GO.upstreamModelForRequest?.('gemini-4-argon-contributor'),
       'gemini-4-argon-contributor',
