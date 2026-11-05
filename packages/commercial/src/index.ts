@@ -6136,6 +6136,9 @@ export async function registerCommercial(
       return;
     }
     userChatBridge.broadcastToUser(BigInt(uid), payload);
+    if (verdict.scheduled) {
+      void userChatBridge.drainRecoveryForUser?.(BigInt(uid));
+    }
   };
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);

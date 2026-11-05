@@ -31,9 +31,10 @@ export const MAX_DELEGATE_WAIT_MS = 55_000
 
 export const DEFAULT_MAX_DELEGATE_JOBS = 256
 
-/** B1 lease heartbeat. 480 * 15s = 2h hard cap. */
+/** B1 lease heartbeat. 480 * 15s = 2h idle beat cap; 2880 * 15s = 12h absolute cap (TURN_MAX_MS). */
 export const DELEGATE_LEASE_HEARTBEAT_MS = 15_000
 export const DELEGATE_LEASE_HEARTBEAT_MAX_BEATS = 480
+export const DELEGATE_LEASE_HEARTBEAT_ABSOLUTE_MAX_BEATS = 2880
 
 /**
  * OCV5-164 heartbeat-timeout reaper.

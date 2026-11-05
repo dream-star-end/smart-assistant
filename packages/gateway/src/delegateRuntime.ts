@@ -58,6 +58,7 @@ import {
 import { getDelegateTimeoutReason, resolveDelegateTimeoutConfig } from './delegateTimeout.js'
 import {
   DelegateJobStore,
+  DELEGATE_LEASE_HEARTBEAT_ABSOLUTE_MAX_BEATS,
   DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
   DELEGATE_LEASE_HEARTBEAT_MS,
   resolveDelegateJobTtlMs,
@@ -1629,6 +1630,7 @@ export async function _runDelegateTaskCore(
             emitProgress(
               makeDelegateProgressBlock({
                 runId: progressRunId,
+                usageRunId: progressRunId,
                 agentId: targetAgentId,
                 phase: 'start',
                 text: `排队中:容器资源紧张(${blocked.kind === 'memory' ? '内存水位' : '并发已满'}),等待放行…`,
@@ -1682,6 +1684,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: 'error',
           isError: true,
@@ -1755,10 +1758,12 @@ export async function _runDelegateTaskCore(
     const tok = claimed.claimToken
     const epoch = claimed.fencingEpoch
     const jobId = input.backgroundJobId
-    let beats = 0
     const timer = setInterval(() => {
-      beats += 1
-      const capHit = beats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS
+      idleLeaseBeats += 1
+      totalLeaseBeats += 1
+      const capHit =
+        idleLeaseBeats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS ||
+        totalLeaseBeats > DELEGATE_LEASE_HEARTBEAT_ABSOLUTE_MAX_BEATS
       const ok = !capHit && this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
       if (!ok) {
         clearInterval(timer)
@@ -2101,6 +2106,7 @@ export async function _runDelegateTaskCore(
   let lastChildActivityAt = Date.now()
   const markChildActivity = () => {
     lastChildActivityAt = Date.now()
+    idleLeaseBeats = 0
     if (session?.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
   }
   let session: AgentSession
@@ -2170,6 +2176,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: 'start',
           text: `开始委派给 ${targetAgentId}: ${goal}`,
@@ -2342,7 +2349,7 @@ export async function _runDelegateTaskCore(
               agentId: targetAgentId,
               usage: e.usage,
             })
-          : makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
+          : makeDelegateBlockPassthrough(e, progressRunId, targetAgentId, progressRunId)
       if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
       if (!timedOut) {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
@@ -2391,6 +2398,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: error ? 'error' : 'done',
           isError: Boolean(error),
@@ -2496,6 +2504,7 @@ export async function _runDelegateTaskCore(
       emitProgress(
         makeDelegateProgressBlock({
           runId: progressRunId,
+          usageRunId: progressRunId,
           agentId: targetAgentId,
           phase: 'error',
           isError: true,

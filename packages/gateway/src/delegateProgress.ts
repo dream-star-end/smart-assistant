@@ -29,9 +29,11 @@ export type DelegateProgressBlock = {
   goal?: string
   /** Exact async handle returned by send_to_agent; avoids goal-key ambiguity. */
   jobId?: string
-  /** Absolute usage snapshot for one exact child execution. `runId` may be
-   * rebound to a first-level visible card; this id never changes. */
+  /** Identity of the original child execution, also used for absolute usage.
+   * `runId` may be rebound to a visible card; wrappers never infer this id. */
   usageRunId?: string
+  /** Preserves child terminal phase across nested text rebinding. */
+  nestedPhase?: DelegateProgressPhase
   usage?: TurnTokenUsageSnapshot
   /**
    * 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),供新前端
@@ -91,6 +93,8 @@ export function normalizeDelegateGoalKey(raw: unknown): string {
 
 export function makeDelegateProgressBlock(args: {
   runId: string
+  usageRunId?: string
+  nestedPhase?: DelegateProgressPhase
   agentId: string
   phase: DelegateProgressPhase
   text?: unknown
@@ -107,6 +111,8 @@ export function makeDelegateProgressBlock(args: {
     agentId: args.agentId,
     phase: args.phase,
   }
+  if (args.usageRunId !== undefined) block.usageRunId = args.usageRunId
+  if (args.nestedPhase !== undefined) block.nestedPhase = args.nestedPhase
   const text = sanitizeDelegateProgressText(args.text, args.maxLen ?? DEFAULT_TEXT_LIMIT, {
     trim: !args.preserveWhitespace,
   })
@@ -412,6 +418,7 @@ export function makeDelegateBlockPassthrough(
   event: any,
   runId: string,
   agentId: string,
+  usageRunId?: string,
 ): DelegateProgressBlock | null {
   if (!event || event.kind !== 'block' || !event.block) return null
   const b = event.block as any
@@ -433,6 +440,7 @@ export function makeDelegateBlockPassthrough(
     runId,
     agentId,
     phase,
+    ...(usageRunId === undefined ? {} : { usageRunId }),
     block: { ...b },
   }
 }
@@ -591,6 +599,12 @@ export function toNestedDelegateProgressLine(
   return {
     kind: 'delegate_progress',
     runId: args.runId,
+    ...(source.usageRunId === undefined
+      ? {}
+      : {
+          usageRunId: source.usageRunId,
+          ...(source.phase === "done" ? { nestedPhase: "done" as const } : {}),
+        }),
     agentId: args.agentId,
     phase: 'text',
     text,

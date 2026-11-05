@@ -5,7 +5,7 @@
  * 正文:服务端给的 userError 优先,否则按码查目录;这一轮特有的说法(计费事实、白名单原因、
  * 冻结的旧快照正文)由调用方作为 fixedBody 传入。动作按目录建议,执行入口由调用方给。
  */
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { parseAttachmentTotalExceeded } from "@openclaude/protocol/browser";
 import type { ChatMessage } from "../../lib/chat/model";
 import { errorPresentation } from "../../lib/chat/render";
@@ -19,6 +19,13 @@ import { Notice } from "../ui/Notice";
 import { errorNoticeActions, type ErrorNoticeActionsInput, noticeActions } from "./errorNoticeActions";
 
 export { ErrorTechDetails };
+
+export const BOX_CAPACITY_HELD_WAIT_SECONDS = 15;
+const autoContinuedBoxHoldKeys = new Set<string>();
+
+export function _resetBoxCapacityHoldAutoContinueForTest(): void {
+  autoContinuedBoxHoldKeys.clear();
+}
 
 export type TurnErrorNoticeProps = {
   role: "alert" | "status";
@@ -36,22 +43,79 @@ export type TurnErrorNoticeProps = {
   actions: ((userError: UserError) => readonly ErrorNoticeAction[]) | Omit<ErrorNoticeActionsInput, "userError">;
   /** 技术详情(码、请求 ID、消息 ID),默认收起。 */
   details?: string | Parameters<typeof errorTechnicalDetails>[0];
+  /** OCV5-734: 唯一消息键,保证 box_capacity_held 释放后自动继续至多触发一次。 */
+  holdKey?: string;
 };
 
 export function TurnErrorNotice(p: TurnErrorNoticeProps) {
   const userError = resolveUserError(p.userError, p.code);
   const details = typeof p.details === "string" ? p.details : p.details ? errorTechnicalDetails(p.details) : undefined;
+  const baseActions = typeof p.actions === "function" ? p.actions(userError) : errorNoticeActions({ ...p.actions, userError });
+  const isBoxCapacityHeld = userError.code === "box_capacity_held" || p.code === "box_capacity_held";
+  const retryAction = isBoxCapacityHeld ? baseActions.find((a) => a.label === "继续") : undefined;
+  const holdKey = p.holdKey
+    ?? (typeof p.actions !== "function" ? p.actions.msg.id : undefined)
+    ?? (typeof p.details === "object" && p.details ? (p.details.clientMessageId ?? p.details.requestId) : undefined)
+    ?? "box_capacity_held";
+  const retryOnClickRef = useRef(retryAction?.onClick);
+  retryOnClickRef.current = retryAction?.onClick;
+  const canAutoWait = isBoxCapacityHeld && !!retryAction;
+  const [secondsLeft, setSecondsLeft] = useState(() =>
+    canAutoWait && !autoContinuedBoxHoldKeys.has(holdKey) ? BOX_CAPACITY_HELD_WAIT_SECONDS : 0,
+  );
+  const [autoResumed, setAutoResumed] = useState(() =>
+    canAutoWait && autoContinuedBoxHoldKeys.has(holdKey),
+  );
+
+  useEffect(() => {
+    if (!canAutoWait) return;
+    if (autoContinuedBoxHoldKeys.has(holdKey)) {
+      setSecondsLeft(0);
+      setAutoResumed(true);
+      return;
+    }
+    if (secondsLeft <= 0) {
+      autoContinuedBoxHoldKeys.add(holdKey);
+      setAutoResumed(true);
+      retryOnClickRef.current?.();
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setSecondsLeft((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [canAutoWait, holdKey, secondsLeft]);
+
+  const effectiveActions = canAutoWait && secondsLeft > 0
+    ? baseActions.map((a) =>
+        a.label === "继续"
+          ? {
+              label: `正在等待上一轮释放（${secondsLeft}s）`,
+              onClick: () => {},
+              disabled: true,
+              loading: true,
+            }
+          : a,
+      )
+    : baseActions;
+  const holdReleasedNote = canAutoWait && autoResumed ? (
+    <p data-testid="box-capacity-released-notice" className="mt-1.5 text-meta text-fg/80">
+      上一轮已释放，已自动继续本条消息。
+    </p>
+  ) : null;
+
   return (
     <Notice
       role={p.role}
       tone={p.tone}
       className={p.className}
       title={p.title ?? standaloneErrorTitle(userError)}
-      actions={noticeActions(typeof p.actions === "function" ? p.actions(userError) : errorNoticeActions({ ...p.actions, userError }))}
+      actions={noticeActions(effectiveActions)}
       details={details ? <ErrorTechDetails text={details} /> : undefined}
     >
       {p.fixedBody ?? userError.message}
       {p.note}
+      {holdReleasedNote}
     </Notice>
   );
 }
@@ -90,6 +154,7 @@ export function TurnStatusCard({
       fixedBody={presented.fixedMessage ? presented.message : undefined}
       actions={() => (currentTurn && retry ? [retry] : [])}
       details={details}
+      holdKey={msg.id}
     />
   );
 }

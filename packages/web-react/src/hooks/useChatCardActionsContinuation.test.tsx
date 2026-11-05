@@ -116,3 +116,20 @@ test("checkpoint continuation receives the canonical raw error instead of a pres
   expect(sock.send).not.toHaveBeenCalled();
   expect(input.send).not.toHaveBeenCalled();
 });
+
+
+test("OCV5-718: switching model in session picker before clicking Continue uses the newly selected model", async () => {
+  const original = { ...user, _routing: { model: "claude-original", teamMode: false, effortLevel: "high" as const } } as ChatMessage;
+  const { input, sock } = setup([original, error]);
+  (sock as unknown as { getSession: (id: string) => { _selectedModelId?: string } }).getSession =
+    vi.fn(() => ({ _selectedModelId: "deepseek-v4-flash" }));
+  const { result } = renderHook(() => useChatCardActions(input));
+  await result.current.cardCallbacks.onContinueInterrupted!(error);
+  expect(sock.send).toHaveBeenCalledWith(expect.objectContaining({
+    sessId: "s1",
+    agentId: "main",
+    displayText: "继续",
+    model: "deepseek-v4-flash",
+    text: expect.stringContaining(original.text),
+  }));
+});

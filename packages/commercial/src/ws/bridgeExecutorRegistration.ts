@@ -20,6 +20,9 @@ export class ContainerLinkExecutors {
     for (const [handle, value] of this.candidates) {
       if (handle.active && !handle.detached && !handle.disposed) return value;
     }
+    for (const [handle, value] of this.candidates) {
+      if (handle.active && !handle.disposed && (handle.hasOpenDispatches || handle.keepAlive)) return value;
+    }
     return undefined;
   }
   readonly recovery: RecoveryExecutor = (job) => {

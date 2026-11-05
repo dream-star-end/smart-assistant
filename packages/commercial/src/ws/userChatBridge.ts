@@ -3594,6 +3594,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       requestHash: string;
       /** Present only for a Master-scheduled automatic recovery. */
       recoveryJob?: ClaimedRecoveryJob;
+      /** OCV5-730: deferred recovery ACK emitted only after pre-forward admission gates pass. */
+      pendingRecoveryAck?: Record<string, unknown>;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
     type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
@@ -3865,6 +3867,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * is usually decided before the pre-forward failure exit runs; that exit then pauses the job
      * (and ends its dispatch) instead of re-queuing it. */
     const refusedRecoveryJobs = new Map<string, string>();
+    const broadcastRecoveryJobRefused = (job: ClaimedRecoveryJob, reason: string): void => {
+      const rawReq = job.request as { clientMessageId?: unknown; idempotencyKey?: unknown };
+      const cmid = isClientMessageId(rawReq.clientMessageId) ? rawReq.clientMessageId : undefined;
+      if (!cmid) return;
+      try {
+        broadcastToUser(uid, {
+          type: "outbound.ack",
+          admitted: false,
+          recoverySkipped: true,
+          recoverySkippedReason: reason,
+          sourceClientMessageId: job.sourceClientMessageId,
+          ...(typeof rawReq.idempotencyKey === "string" ? { idempotencyKey: rawReq.idempotencyKey } : {}),
+          peer: { id: job.sessionId, kind: "dm" },
+          clientMessageId: cmid,
+        });
+      } catch { /* sideband only */ }
+    };
     const failDispatchPreForward = (
       record: AdmittedDispatch | undefined,
       failureCode: string,
@@ -3890,6 +3909,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           dispatchOwner: record.leaseOwnerId,
           dispatchLeaseEpoch: record.leaseEpoch,
         };
+        if (refusal !== undefined) broadcastRecoveryJobRefused(record.recoveryJob, refusal);
         void (refusal !== undefined
           ? pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal })
           : releaseRecoveryPreReceipt(pool, fenced)).catch(() => {});
@@ -4103,7 +4123,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             });
           }
           skippedRecoveryIds.add(clientMessageId);
-          userWs.send(JSON.stringify({
+          const skippedAckPayload = {
             type: "outbound.ack",
             recoverySkipped: true,
             recoverySkippedReason: reason,
@@ -4113,7 +4133,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...(idempotencyKey ? { idempotencyKey } : {}),
             peer: { id: peerId, kind: "dm" },
             clientMessageId,
-          }));
+          };
+          if (recoveryJob) {
+            broadcastToUser(uid, skippedAckPayload);
+          } else {
+            userWs.send(JSON.stringify(skippedAckPayload));
+          }
           // Re-announce after the ACK has released the old client's local
           // dispatch slot. A stale bundle trapped in this rejected-recovery
           // loop can then hit the existing update governor's safe point and
@@ -4524,27 +4549,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   : undefined;
                 const rawDisplayText = (frameContent as { displayText?: unknown } | null)?.displayText;
                 const displayText = typeof rawDisplayText === "string" ? rawDisplayText : undefined;
-                try {
-                  broadcastToUser(uid, {
-                    type: "outbound.ack",
-                    admitted: true,
-                    retryStatus: recoveryJobStatus(recoveryJob, "scheduled"),
-                    ...(idempotencyKey ? { idempotencyKey } : {}),
-                    peer: { id: peerId, kind: "dm" },
-                    clientMessageId,
-                    recovery: {
-                      automatic: true,
-                      mode: validatedRecovery.mode,
-                      sourceClientMessageId: validatedRecovery.sourceClientMessageId,
-                      rootClientMessageId: validatedRecovery.rootClientMessageId,
-                      attempt: validatedRecovery.attempt,
-                      max: validatedRecovery.max,
-                      agentId: admitAgentId,
-                      ...(admitModel ? { model: admitModel } : {}),
-                      ...(displayText ? { displayText } : {}),
-                    },
-                  });
-                } catch { /* sideband only; durable admission is unaffected */ }
+                admittedRecord.pendingRecoveryAck = {
+                  type: "outbound.ack",
+                  admitted: true,
+                  retryStatus: recoveryJobStatus(recoveryJob, "scheduled"),
+                  ...(idempotencyKey ? { idempotencyKey } : {}),
+                  peer: { id: peerId, kind: "dm" },
+                  clientMessageId,
+                  recovery: {
+                    automatic: true,
+                    mode: validatedRecovery.mode,
+                    sourceClientMessageId: validatedRecovery.sourceClientMessageId,
+                    rootClientMessageId: validatedRecovery.rootClientMessageId,
+                    attempt: validatedRecovery.attempt,
+                    max: validatedRecovery.max,
+                    agentId: admitAgentId,
+                    ...(admitModel ? { model: admitModel } : {}),
+                    ...(displayText ? { displayText } : {}),
+                  },
+                };
               }
               // R5 note:heartbeat 只在确认连接存活后才起 —— finalCleanup 已跑过的话,此刻新建的
               // interval 无人清理,会把整个 bridge 闭包钉在内存里。顺序=登记→cleaned→heartbeat。
@@ -4853,7 +4876,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const pause = _recoveryRefusalAction(reasonCode) === "pause";
           // A job already bound to a dispatch is not touched here (dispatch_id fence); the
           // pre-forward failure exit reads this mark and pauses it with its dispatch.
-          if (pause) refusedRecoveryJobs.set(`${recoveryJob.jobId}:${recoveryJob.leaseEpoch}`, reasonCode);
+          if (pause) {
+            refusedRecoveryJobs.set(`${recoveryJob.jobId}:${recoveryJob.leaseEpoch}`, reasonCode);
+            const hasBoundDispatch = [...admittedDispatches.values()].some(
+              (candidate) => candidate.recoveryJob?.jobId === recoveryJob.jobId,
+            );
+            if (!hasBoundDispatch) broadcastRecoveryJobRefused(recoveryJob, reasonCode);
+          }
           void (pause
             ? pauseRecoveryForRefusal(deps.pgPool, recoveryJob, reasonCode)
             : releaseRecoveryForTransportWait(deps.pgPool, recoveryJob)).catch(() => {});
@@ -4876,7 +4905,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const encoded = Buffer.from(JSON.stringify(result), "utf8");
         forwardInboundFrame(encoded, false, encoded.length);
       };
-      if (linkHandle?.recoveryOnly) { rejectPromptQueueDispatch("NO_BRIDGE"); return; }
+      if (linkHandle?.recoveryOnly && ingress !== "recovery") { rejectPromptQueueDispatch("NO_BRIDGE"); return; }
       const forwardPreparedFrame = (
         frameData: RawData,
         frameIsBinary: boolean,
@@ -4897,6 +4926,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return accepted;
         };
         if (!recoveryJob || !deps.pgPool) {
+          if (dispatchRecord?.pendingRecoveryAck) {
+            const ack = dispatchRecord.pendingRecoveryAck;
+            dispatchRecord.pendingRecoveryAck = undefined;
+            try { broadcastToUser(uid, ack); } catch { /* sideband only */ }
+          }
           return completeForward(
             forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord),
           );
@@ -4914,7 +4948,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             dispatchOwner: record.leaseOwnerId,
             dispatchLeaseEpoch: record.leaseEpoch,
           },
-          () => forwardInboundFrame(frameData, frameIsBinary, frameLength, record),
+          () => {
+            if (record.pendingRecoveryAck) {
+              const ack = record.pendingRecoveryAck;
+              record.pendingRecoveryAck = undefined;
+              try { broadcastToUser(uid, ack); } catch { /* sideband only */ }
+            }
+            return forwardInboundFrame(frameData, frameIsBinary, frameLength, record);
+          },
         ).then(
           (accepted) => {
             if (!accepted) failDispatchPreForward(record, "recovery_forward_fenced");
@@ -9047,6 +9088,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               frameSeq: stamped.frameSeq,
               payload: stamped.payload,
             });
+            if (stamped.isFinal && userDetached && !cleaned && !shuttingDown) {
+              await drainDurableRecoveryForUser(uid);
+            }
             linkHandle?.persisted(durableSessionId, stamped.clientMessageId, stamped.isFinal);
             forwardCommittedFrame();
           },
@@ -9960,9 +10004,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (set.size === 0) uidToContainerWs.delete(key);
         }
       }
-      unregisterExecutors?.();
-      unregisterExecutors = null;
-      recoveryExecutor = null;
       cronOriginExecutor = null;
     }
 
@@ -9998,6 +10039,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
       // user 侧 detach(idempotent)
       detachUserSide(finalCause);
+      unregisterExecutors?.();
+      unregisterExecutors = null;
+      recoveryExecutor = null;
+      cronOriginExecutor = null;
 
       // An exact queue registration exists only between container forward and
       // the PG activation acknowledgement. A container/bridge restart in this
@@ -10315,6 +10360,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     rebuildContainerLinks: async () => { await Promise.all([recovery?.start(), controls?.scan()]); },
     broadcastToUser,
     syncGoalToContainers,
+    drainRecoveryForUser: drainDurableRecoveryForUser,
     broadcastAll,
     broadcastToUsers,
     onlineUserSubset,

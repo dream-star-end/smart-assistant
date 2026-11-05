@@ -42,10 +42,11 @@ export async function continueManualTask({ activeId, demo, identity, authRef, so
     // It neither deletes old content nor resends an executed task.
     const text = taskContinuationPrompt(replay.text);
     const routing = exact._routing;
+    const selectedModel = sock.getSession?.(activeId)?._selectedModelId;
     if (routing) {
       await sock.send({
         sessId: activeId, agentId, text, media: replay.media, displayText: "继续",
-        model: routing.model, teamMode: routing.teamMode,
+        model: selectedModel || routing.model, teamMode: routing.teamMode,
         effortLevel: routing.effortLevel === null ? null : parsePlatformReasoningEffort(routing.effortLevel),
         collabMode: routing.collabMode, advisorModel: routing.advisorModel,
         collabConfigVersion: routing.collabConfigVersion,

@@ -474,6 +474,15 @@ export function recoverySkippedNotice(reason?: string): string {
     case "automatic_lineage_mismatch":
     case "automatic_attempt_mismatch":
       return "未从断点继续：这次恢复请求已经过期或与当前会话不一致。原任务仍已保留，请刷新后再试。";
+    case "INSUFFICIENT_CREDITS":
+    case "ERR_INSUFFICIENT_CREDITS":
+    case "insufficient_credits":
+      return "自动恢复已暂停：账户可用积分不足，原任务仍已保留。请充值后在错误卡上继续。";
+    case "UNAUTHORIZED_MODEL":
+    case "MODEL_NOT_AVAILABLE":
+    case "ERR_MODEL_UNAUTHORIZED":
+    case "antigravity_authority_rejected":
+      return "自动恢复已暂停：当前模型不可用或无权限，原任务仍已保留。请切换模型后继续。";
     default:
       return "未从断点继续：服务端安全校验未通过。原任务仍已保留，请刷新后再试。";
   }
@@ -5507,8 +5516,20 @@ export class ChatSocket {
     ) {
       return false;
     }
-    const routing = normalizeRetiredRouting(target.user._routing);
-    if (!routing) return false;
+    const baseRouting = normalizeRetiredRouting(target.user._routing);
+    if (!baseRouting) return false;
+    const selectedModel = !automatic ? sess._selectedModelId : undefined;
+    const preparedSwitch = selectedModel && sess._preparedModelSwitch?.targetModel === selectedModel
+      ? sess._preparedModelSwitch
+      : undefined;
+    const routing = selectedModel && selectedModel !== baseRouting.model
+      ? {
+          ...baseRouting,
+          model: selectedModel,
+          modelSwitchId: preparedSwitch?.id,
+          modelSwitchConsent: undefined,
+        }
+      : baseRouting;
     const resolvedAgentId = sess.agentId || agentId;
     void this.ensureServerSessionOnce(sess, resolvedAgentId);
     const replay = target.mode === "replay"

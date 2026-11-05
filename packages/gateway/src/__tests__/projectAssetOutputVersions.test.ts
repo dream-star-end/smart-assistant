@@ -7,7 +7,7 @@
 import * as assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, truncate, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, readdir, readFile, rm, symlink, truncate, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, it } from 'node:test'
@@ -164,5 +164,89 @@ describe('output version capture', () => {
     await utimes(file, when, when)
     const captured = await captureOutputVersion(`${GEN}/dated.md`, roots)
     assert.equal(captured?.capturedAt, when.getTime())
+  })
+})
+
+describe('OCV5-725 — >50 MiB outputs preserve historical versions in CAS across overwrites', () => {
+  it('captures two >50 MiB versions at the same path and enforces the large-file CAS quota', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-asset-large-'))
+    const ENV = { OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:18799', OPENCLAUDE_V3_CONTAINER_TOKEN: 'tok' }
+    const roots = {
+      generated: join(dir, 'generated'),
+      cas: join(dir, 'uploads'),
+      largeVersionQuotaBytes: 120 * 1024 * 1024,
+    }
+    await mkdir(roots.generated, { recursive: true })
+    await mkdir(roots.cas, { recursive: true })
+    const posted: OutputAssetRegistration[] = []
+    const fetcher = (async (_url: string, init?: { body?: string }) => {
+      if (init?.body) posted.push(JSON.parse(init.body) as OutputAssetRegistration)
+      return { statusCode: 200, body: { text: async () => '{}' } }
+    }) as any
+
+    try {
+      const target = join(roots.generated, 'archive.bin')
+      const size52M = 52 * 1024 * 1024
+      await writeFile(target, 'v1-header-')
+      await truncate(target, size52M)
+      await collectSessionOutputAssets({
+        userId: '3',
+        sessionId: 'sess-725',
+        assistantText: 'round 1 /home/agent/.openclaude/generated/archive.bin',
+        env: ENV,
+        outputRoots: roots,
+        spoolFile: join(dir, 'spool.jsonl'),
+        fetcher,
+      })
+
+      await writeFile(target, 'v2-header-different-')
+      await truncate(target, size52M)
+      await collectSessionOutputAssets({
+        userId: '3',
+        sessionId: 'sess-725',
+        assistantText: 'round 2 /home/agent/.openclaude/generated/archive.bin',
+        env: ENV,
+        outputRoots: roots,
+        spoolFile: join(dir, 'spool.jsonl'),
+        fetcher,
+      })
+
+      assert.equal(posted.length, 2)
+      const v1 = posted[0]!.items[0]!
+      const v2 = posted[1]!.items[0]!
+      assert.ok(v1.digest && v1.url)
+      assert.ok(v2.digest && v2.url)
+      assert.notEqual(v1.digest, v2.digest)
+      const casV1 = await open(join(roots.cas, `${v1.digest}.bin`), 'r')
+      const casV2 = await open(join(roots.cas, `${v2.digest}.bin`), 'r')
+      try {
+        const b1 = Buffer.alloc(10)
+        const b2 = Buffer.alloc(10)
+        await casV1.read(b1, 0, 10, 0)
+        await casV2.read(b2, 0, 10, 0)
+        assert.equal(b1.toString('utf8'), 'v1-header-')
+        assert.equal(b2.toString('utf8'), 'v2-header-')
+      } finally {
+        await casV1.close()
+        await casV2.close()
+      }
+
+      await writeFile(target, 'v3-header-over-quota-')
+      await truncate(target, size52M)
+      await collectSessionOutputAssets({
+        userId: '3',
+        sessionId: 'sess-725',
+        assistantText: 'round 3 /home/agent/.openclaude/generated/archive.bin',
+        env: ENV,
+        outputRoots: roots,
+        spoolFile: join(dir, 'spool.jsonl'),
+        fetcher,
+      })
+      assert.equal(posted.length, 3)
+      assert.equal(posted[2]!.items[0]!.digest, undefined)
+      assert.equal(posted[2]!.items[0]!.size, size52M)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

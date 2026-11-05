@@ -1870,6 +1870,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `UPDATE request_finalize_journal
             SET state='aborted', failure_code='STREAM_FAILED',
                 final_credits=0,
+                error_msg=COALESCE(NULLIF(error_msg, ''), 'box_stopped:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'failed')),
                 ctx=ctx || $4::jsonb, updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND state='inflight'
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
@@ -1945,6 +1946,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `UPDATE request_finalize_journal
             SET state='aborted', failure_code='STREAM_FAILED',
                 final_credits=0,
+                error_msg=COALESCE(NULLIF(error_msg, ''), 'box_rejected_stream:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'rejected')),
                 ctx=ctx || $4::jsonb, updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND state='inflight'
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
@@ -2470,6 +2472,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         : await client.query(
           `UPDATE request_finalize_journal
               SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
+                  error_msg=COALESCE(NULLIF(error_msg, ''), 'box_toolchain_stopped:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'failed')),
                   ctx=ctx || $4::jsonb, updated_at=NOW()
             WHERE request_id=$1 AND user_id=$2 AND state='inflight'
               AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
@@ -2670,6 +2673,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         : await client.query(
           `UPDATE request_finalize_journal
               SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
+                  error_msg=COALESCE(NULLIF(error_msg, ''), 'box_expired_unproven:' || COALESCE($8::text, 'expired')),
                   ctx=${marker}, updated_at=NOW()
             WHERE ${fence} AND NOT (ctx ? 'boxToolHandoff')
               AND state='inflight' AND final_credits IS NULL`, params);
