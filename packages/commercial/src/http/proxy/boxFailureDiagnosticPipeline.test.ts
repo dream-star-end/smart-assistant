@@ -30,11 +30,11 @@ test("commercial unit gate executes the real Python supervisor diagnostic suite"
     });
     const count = /Ran ([0-9]+) tests/.exec(stderr);
     assert.ok(count, "Python suite must report an executed test count");
-    assert.ok(Number(count[1]) >= 17, "all failure/lifetime/privacy cases must execute");
+    assert.ok(Number(count[1]) >= 21, "all failure/lifetime/privacy cases must execute");
     assert.match(stderr, /\nOK\s*$/);
     assert.doesNotMatch(stderr, /skipped|FAILED|ERROR:/);
     assert.equal(stdout, "");
-    t.diagnostic("Python supervisor diagnostic cases executed: " + count[1] + "; no skips");
+    t.diagnostic(`Python supervisor diagnostic cases executed: ${count[1]}; no skips`);
   });
 
 test("Python v1 fixture agrees with the strict TypeScript boundary", () => {
@@ -49,23 +49,31 @@ test("actual failed keeper/supervisor survives cleanup as a safe durable diagnos
   { timeout: 30_000 }, async () => {
     const runNonce = randomBytes(12).toString("hex");
     const leaseEpoch = randomBytes(16).toString("hex");
-    const run = "/tmp/ocv5-289-run-" + runNonce;
-    const proof = "/tmp/ocv5-289-proof-" + runNonce;
+    const run = `/tmp/ocv5-289-run-${runNonce}`;
+    const proof = `/tmp/ocv5-289-proof-${runNonce}`;
     const local = mkdtempSync("/tmp/box-diagnostic-pipeline-");
     const store = join(local, "safe-store");
     const raw = Buffer.concat([readFileSync(join(SCRIPTS, "box_supervisor.py")),
-      Buffer.from("\n# isolated-pipeline-" + randomBytes(16).toString("hex") + "\n")]);
-    const staged = "/tmp/ocv5-289-supervisor-" + createHash("sha256").update(raw).digest("hex").slice(0, 16) + ".py";
-    const secret = "Bearer synthetic-private-" + randomBytes(16).toString("hex");
-    const privateUrl = "https://not-a-real-account.invalid/path?token=" + randomBytes(16).toString("hex");
-    let ownsStaged = false, ownsRun = false, ownsProof = false;
+      Buffer.from(`\n# isolated-pipeline-${randomBytes(16).toString("hex")}\n`)]);
+    const staged = `/tmp/ocv5-289-supervisor-${createHash("sha256").update(raw).digest("hex").slice(0, 16)}.py`;
+    const secret = `Bearer synthetic-private-${randomBytes(16).toString("hex")}`;
+    const privateUrl = `https://not-a-real-account.invalid/path?token=${randomBytes(16).toString("hex")}`;
+    let ownsStaged = false;
+    let ownsRun = false;
+    let ownsProof = false;
     try {
       writeFileSync(staged, raw, { mode: 0o600, flag: "wx" }); ownsStaged = true;
       mkdirSync(run, { mode: 0o700 }); ownsRun = true;
-      const fakeCli = "import sys;print(" + JSON.stringify(JSON.stringify({
-        type: "system", message: secret,
-      })) + ");sys.stderr.write(" + JSON.stringify("API Error: 401 " + secret + " " + privateUrl + "\n")
-        + ");sys.exit(1)";
+      const cliEvents = [
+        { type: "system", message: secret },
+        { type: "assistant", error: "authentication_failed", is_api_error_message: true,
+          message: { model: "<synthetic>", content: [
+            { type: "text", text: `API Error: 401 ${secret} ${privateUrl}` },
+          ] } },
+        { type: "result", is_error: true, result: `API Error: 429 ${secret}`,
+          errors: ["turn ended on an API error"] },
+      ];
+      const fakeCli = `import sys;sys.stdout.write(${JSON.stringify(cliEvents.map(event => `${JSON.stringify(event)}\n`).join(""))});sys.exit(1)`;
       assert.equal(existsSync(proof), false, "never reuse an existing proof directory");
       ownsProof = true; // Only the keeper invocation below may create this random path.
       const failed = spawnSync(PYTHON, ["-I", join(SCRIPTS, "box_keeper.py"), staged,
@@ -82,7 +90,7 @@ test("actual failed keeper/supervisor survives cleanup as a safe durable diagnos
       assert.equal(terminal.reason, "worker_failed");
       assert.equal(terminal.revision, 2);
       assert.equal(terminal.reason === "worker_failed" && terminal.workerExitCode, 1);
-      assert.equal(existsSync("/proc/" + terminal.cliPid), false, "keeper reaped the actual child");
+      assert.equal(existsSync(`/proc/${terminal.cliPid}`), false, "keeper reaped the actual child");
       const remoteRaw = readFileSync(join(proof, "failure.diag.json"), "utf8");
       const remote = parseRemoteDiagnostic(JSON.parse(remoteRaw), { runNonce, leaseEpoch });
       assert.ok(remote, "real producer must satisfy the exact central schema");
@@ -95,12 +103,12 @@ test("actual failed keeper/supervisor survives cleanup as a safe durable diagnos
       const put = (name: string, content: string) =>
         writeFileSync(join(run, name), content, { mode: 0o600, flag: "wx" });
       put("stdout.jsonl", failed.stdout);
-      put("stderr.log", secret + "\n");
-      put("stdin.jsonl", secret + " private-prompt\n");
-      put("system.txt", secret + " private-system\n");
+      put("stderr.log", `${secret}\n`);
+      put("stdin.jsonl", `${secret} private-prompt\n`);
+      put("system.txt", `${secret} private-system\n`);
       const spoolInode = statSync(join(run, "stdout.jsonl")).ino;
       const candidate: BoxRemoteCleanupCandidate = {
-        uid: 999991n, accountId: 999992n, requestId: "offline_" + randomBytes(16).toString("hex"),
+        uid: 999991n, accountId: 999992n, requestId: `offline_${randomBytes(16).toString("hex")}`,
         runNonce, leaseEpoch, proof: terminal,
       };
       const target: Pick<BoxResolvedTarget, "exec"> = { exec: {

@@ -145,3 +145,20 @@ test("success skips diagnostics and idle leader ticks still sweep", async () => 
     resolver: {} as never, sweepDiagnostics: async () => { sweeps++; } });
   await worker.reconcileBatch(); assert.equal(sweeps, 1);
 });
+
+test("OCV5-742 upstream first cause and cleanup signal survive collection independently", async () => home(async dir => {
+  const diagnostics = new BoxFailureDiagnostics(join(dir, "store"));
+  const failure = { ...candidate, proof: { ...candidate.proof, workerExitCode: 143 } };
+  const remote = { ...fixture, stage: "shutdown", reason: "interrupted",
+    cliExitCode: -9, cliSignal: 9, httpStatus: 401, upstreamCode: "authentication", lastEvent: "result" };
+  await beforeBoxPrivacyCleanup(diagnostics.beforeCleanup, failure,
+    target({ status: "ok", diagnostic: remote }) as never);
+  const saved = await diagnostics.store.read(diagnosticId(failure));
+  assert.equal(saved?.status, "ok");
+  assert.equal(saved?.remote?.upstreamCode, "authentication");
+  assert.equal(saved?.remote?.httpStatus, 401);
+  assert.equal(saved?.remote?.reason, "interrupted");
+  assert.equal(saved?.remote?.cliSignal, 9);
+  assert.deepEqual(saved?.terminal, failure.proof);
+  assert.deepEqual(failure.proof, { ...candidate.proof, workerExitCode: 143 });
+}));
