@@ -66,7 +66,10 @@ const userActionRequiredCodes = new Set([
 ])
 
 export function promptQueueDispositionForCode(code: string): 'retryable' | 'user_action_required' {
-  return userActionRequiredCodes.has(code) ? 'user_action_required' : 'retryable'
+  const normalized = typeof code === 'string' ? code.trim().toUpperCase() : ''
+  return userActionRequiredCodes.has(code) || userActionRequiredCodes.has(normalized)
+    ? 'user_action_required'
+    : 'retryable'
 }
 
 /** OCV5-391: what a refused scheduler replay does with its recovery job. A refusal the user has

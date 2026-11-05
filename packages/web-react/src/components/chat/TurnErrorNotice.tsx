@@ -100,7 +100,7 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
     : baseActions;
   const holdReleasedNote = canAutoWait && autoResumed ? (
     <p data-testid="box-capacity-released-notice" className="mt-1.5 text-meta text-fg/80">
-      上一轮已释放，已自动继续本条消息。
+      等待时间已结束，已为你自动尝试继续一次。
     </p>
   ) : null;
 

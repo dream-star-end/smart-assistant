@@ -153,4 +153,56 @@ test("OCV5-717: loadLeftoverRecoveryRecords queries limit+1 and fails closed whe
   const merged = mergeTapeAndLeftoverRecoveryAssessment(completedTape, truncatedRecords);
   assert.equal(merged.mode, "checkpoint");
   assert.equal(merged.checkpointSafe, false);
+
+  // Even if all 5 returned frames are telemetry usage frames (so records only has
+  // the _leftoverTruncated sentinel) and status="completed" / errorCode="service_restart",
+  // allowUnsafeAutomaticCheckpoint and shouldDeclineLiveServiceRestartRecovery must fail closed.
+  const {
+    allowUnsafeAutomaticCheckpoint,
+    shouldDeclineLiveServiceRestartRecovery,
+  } = await import("@openclaude/protocol");
+  const usageOnlyClient = {
+    query: async (_sql: string, params: unknown[]) => {
+      const limitPlusOne = Number(params[3]);
+      const rows = Array.from({ length: limitPlusOne }, (_, idx) => ({
+        payload: Buffer.from(
+          JSON.stringify(
+            frame(
+              idx < limitPlusOne - 1
+                ? { kind: "delegate_progress", phase: "usage", usageRunId: "exec-u" }
+                : { kind: "tool_use", blockId: "open-tool-after-cap" },
+              idx + 1,
+            ),
+          ),
+          "utf8",
+        ),
+      }));
+      return { rows };
+    },
+  };
+  const usageTruncated = await loadLeftoverRecoveryRecords(
+    usageOnlyClient as never,
+    "sess-usage-trunc",
+    "c:3",
+    "cm-usage-trunc",
+    5,
+  );
+  assert.equal(isLeftoverRecoveryRecordsTruncated(usageTruncated), true);
+  assert.equal(
+    allowUnsafeAutomaticCheckpoint({
+      status: "completed",
+      errorCode: "service_restart",
+      leftoverBacked: true,
+      records: usageTruncated,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldDeclineLiveServiceRestartRecovery({
+      errorCode: "service_restart",
+      records: [],
+      leftoverRecords: usageTruncated,
+    }),
+    true,
+  );
 });

@@ -61,7 +61,7 @@ test("OCV5-734: box_capacity_held disables Continue while waiting for slot relea
   expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
   expect(onContinueInterrupted).toHaveBeenCalledWith(msg);
   expect(screen.getByTestId("box-capacity-released-notice")).toHaveTextContent(
-    "上一轮已释放，已自动继续本条消息。",
+    "等待时间已结束，已为你自动尝试继续一次。",
   );
 
   // Re-rendering or advancing timers further must never auto-continue a second time.

@@ -11,6 +11,7 @@ import { mkdir, mkdtemp, open, readdir, readFile, rm, symlink, truncate, utimes,
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, it } from 'node:test'
+import type { OutputAssetRegistration } from '../projectAssetCollector.js'
 
 process.env.OPENCLAUDE_HOME = await mkdtemp(join(tmpdir(), 'oc-output-versions-'))
 const HOME = process.env.OPENCLAUDE_HOME

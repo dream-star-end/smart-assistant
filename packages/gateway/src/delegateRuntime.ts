@@ -1723,6 +1723,8 @@ export async function _runDelegateTaskCore(
     }
   }
   if (input.taskboardControl?.signal.aborted) return cancelPreparation()
+  let idleLeaseBeats = 0
+  let totalLeaseBeats = 0
   if (isDelegateSmEnabled() && input.backgroundJobId) {
     const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
     if (!claimed?.ok) {

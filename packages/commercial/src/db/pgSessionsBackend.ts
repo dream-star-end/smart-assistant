@@ -272,6 +272,7 @@ import {
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
 import {
+  isLeftoverRecoveryRecordsTruncated,
   sessionTurnHasSuccessfulUsage,
   loadLeftoverRecoveryRecords,
   mergeTapeAndLeftoverRecoveryAssessment,
@@ -2212,12 +2213,13 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
     !replayOverSyntheticCheckpoint &&
-    !allowUnsafeAutomaticCheckpoint({
-      status,
-      errorCode,
-      leftoverBacked: assessment.leftoverBacked,
-      records: [...recoveryRecords, ...leftoverRecords],
-    })
+    (isLeftoverRecoveryRecordsTruncated(leftoverRecords) ||
+      !allowUnsafeAutomaticCheckpoint({
+        status,
+        errorCode,
+        leftoverBacked: assessment.leftoverBacked,
+        records: [...recoveryRecords, ...leftoverRecords],
+      }))
   ) {
     return done(declined("checkpoint_unsafe", errorCode));
   }
@@ -9063,12 +9065,13 @@ export function createPgSessionsBackend(
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
                 !replayOverSyntheticCheckpoint &&
-                !allowUnsafeAutomaticCheckpoint({
-                  status: finalized.status,
-                  errorCode: finalizedErrorCode,
-                  leftoverBacked: assessment.leftoverBacked,
-                  records: [...records, ...leftoverRecords],
-                })
+                (isLeftoverRecoveryRecordsTruncated(leftoverRecords) ||
+                  !allowUnsafeAutomaticCheckpoint({
+                    status: finalized.status,
+                    errorCode: finalizedErrorCode,
+                    leftoverBacked: assessment.leftoverBacked,
+                    records: [...records, ...leftoverRecords],
+                  }))
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
               }

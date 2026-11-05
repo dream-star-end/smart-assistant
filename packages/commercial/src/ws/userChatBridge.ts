@@ -1514,6 +1514,8 @@ export interface UserChatBridgeHandler {
   broadcastToUser(uid: bigint, payload: unknown): number;
   /** Master-only control path into this user's live runtime container(s). */
   syncGoalToContainers(uid: bigint, goal: unknown): number;
+  /** Trigger an immediate durable recovery drain pass for the given user. */
+  drainRecoveryForUser(uid: bigint): Promise<void>;
   /** 给所有在线用户的每个 OPEN user WS 广播 JSON payload。不得用于用户事故通知。 */
   broadcastAll(payload: unknown): number;
   /**
@@ -2282,7 +2284,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     Set<(job: ClaimedRecoveryJob) => void>
   >();
   const uidToCronOriginExecutors = new Map<string, Set<CronOriginExecutor>>();
-  const recoveryDrainRunning = new Set<string>();
+  const recoveryDrainInFlight = new Map<string, Promise<void>>();
+  const recoveryDrainNeedsRerun = new Set<string>();
   const recoveryLastScanAt = new Map<string, number>();
   const recoveryLeaseOwner = `master-recovery:${randomUUID()}`;
   const recoveryLeaseMs = 120_000;
@@ -2293,44 +2296,91 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   }) : null;
   const drainDurableControlsForUser = (uid: bigint): Promise<void> => controls?.drain(uid) ?? Promise.resolve();
 
+  const runSingleRecoveryDrainPass = async (uid: bigint, key: string): Promise<void> => {
+    if (!deps.pgPool || shuttingDown) return;
+    const lastScanAt = recoveryLastScanAt.get(key) ?? 0;
+    if (deps.reconcileAutomaticRecoveryJobs && Date.now() - lastScanAt >= 30_000) {
+      recoveryLastScanAt.set(key, Date.now());
+      await deps.reconcileAutomaticRecoveryJobs(uid, 100);
+    }
+    let executor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
+    if (!executor && recovery && links) {
+      try {
+        const channel = deps.containerLinkRecovery?.channel ?? "v5";
+        const carriers = await deps.pgPool.query<{ container_id: number }>(
+          `SELECT DISTINCT ac.id::int AS container_id
+             FROM turn_recovery_jobs r
+             JOIN client_sessions s ON s.id=r.session_id AND s.user_id='c:' || r.user_id::text AND s.deleted_at IS NULL
+             LEFT JOIN LATERAL (
+               SELECT d.agent_container_id FROM turn_dispatches d
+                WHERE d.user_id=r.user_id AND d.session_id=r.session_id
+                ORDER BY (d.client_message_id=r.source_client_message_id) DESC NULLS LAST,
+                         d.admitted_at DESC, d.dispatch_id DESC LIMIT 1
+             ) d ON true
+             JOIN agent_containers ac ON ac.user_id=r.user_id AND ac.state='active' AND ac.runtime_channel=$2
+              AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
+                SELECT 1 FROM agent_containers other WHERE other.user_id=r.user_id AND other.state='active'
+                  AND other.runtime_channel=$2 AND other.id<>ac.id)))
+            WHERE r.user_id=$1 AND r.status IN ('queued','leased') AND r.next_attempt_at<=NOW()
+              AND (r.status='queued' OR r.lease_until<NOW())
+              AND r.dispatch_id IS NULL
+            LIMIT 5`,
+          [key, channel],
+        );
+        for (const row of carriers.rows ?? []) {
+          await recovery.wake({ uid: key, containerId: row.container_id });
+        }
+      } catch (wakeErr) {
+        log?.warn("user-chat-bridge: durable recovery carrier wake failed", { uid: key, error: wakeErr });
+      }
+      executor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
+    }
+    if (!executor) return;
+    const jobs = await claimDueRecoveryJobs(deps.pgPool, {
+      userId: uid,
+      ownerId: recoveryLeaseOwner,
+      leaseMs: recoveryLeaseMs,
+    });
+    for (const job of jobs) {
+      const liveExecutor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
+      if (!liveExecutor) {
+        await releaseRecoveryForTransportWait(deps.pgPool, job);
+        continue;
+      }
+      try {
+        liveExecutor(job);
+      } catch {
+        await releaseRecoveryForTransportWait(deps.pgPool, job);
+      }
+    }
+  };
+
   /** Master-owned semantic recovery scheduler. Executors are registered only
    * by attested durable-dispatch bridges; every claimed request then enters
    * the same executeAdmittedTurn pipeline as an ordinary browser message. */
-  const drainDurableRecoveryForUser = async (uid: bigint): Promise<void> => {
-    if (!deps.pgPool) return;
+  const drainDurableRecoveryForUser = (uid: bigint): Promise<void> => {
+    if (!deps.pgPool || shuttingDown) return Promise.resolve();
     const key = uid.toString();
-    if (recoveryDrainRunning.has(key)) return;
-    const executors = uidToRecoveryExecutors.get(key);
-    const executor = availableExecutors(executors)[0];
-    if (!executor) return;
-    recoveryDrainRunning.add(key);
-    try {
-      const lastScanAt = recoveryLastScanAt.get(key) ?? 0;
-      if (deps.reconcileAutomaticRecoveryJobs && Date.now() - lastScanAt >= 30_000) {
-        recoveryLastScanAt.set(key, Date.now());
-        await deps.reconcileAutomaticRecoveryJobs(uid, 100);
-      }
-      const jobs = await claimDueRecoveryJobs(deps.pgPool, {
-        userId: uid,
-        ownerId: recoveryLeaseOwner,
-        leaseMs: recoveryLeaseMs,
-      });
-      for (const job of jobs) {
-        const liveExecutor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
-        if (!liveExecutor) {
-          await releaseRecoveryForTransportWait(deps.pgPool, job);
-          continue;
-        }
-        try {
-          liveExecutor(job);
-        } catch {
-          await releaseRecoveryForTransportWait(deps.pgPool, job);
-        }
-      }
-    } catch (error) {
-      log?.warn("user-chat-bridge: durable recovery drain failed", { uid: key, error });
+    const existing = recoveryDrainInFlight.get(key);
+    if (existing) {
+      recoveryDrainNeedsRerun.add(key);
+      return existing;
     }
-    recoveryDrainRunning.delete(key);
+    const work = (async () => {
+      do {
+        recoveryDrainNeedsRerun.delete(key);
+        try {
+          await runSingleRecoveryDrainPass(uid, key);
+        } catch (error) {
+          log?.warn("user-chat-bridge: durable recovery drain failed", { uid: key, error });
+        }
+      } while (recoveryDrainNeedsRerun.has(key) && !shuttingDown);
+    })().finally(() => {
+      recoveryDrainInFlight.delete(key);
+      recoveryDrainNeedsRerun.delete(key);
+    });
+    recoveryDrainInFlight.set(key, work);
+    return work;
   };
   const recoveryDrainTimer = setInterval(() => {
     for (const uid of uidToRecoveryExecutors.keys()) {
@@ -3696,12 +3746,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try {
           if (!pool) return;
           if (record.recoveryJob) {
-            await releaseRecoveryPreReceipt(pool, {
+            const refusalKey = `${record.recoveryJob.jobId}:${record.recoveryJob.leaseEpoch}`;
+            const refusal = refusedRecoveryJobs.get(refusalKey)
+              ?? (_recoveryRefusalAction(failureCode) === "pause" ? failureCode : undefined);
+            refusedRecoveryJobs.delete(refusalKey);
+            const fenced = {
               job: record.recoveryJob,
               dispatchId: record.dispatchId,
               dispatchOwner: record.leaseOwnerId,
               dispatchLeaseEpoch: record.leaseEpoch,
-            });
+            };
+            if (refusal !== undefined) {
+              const paused = await pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal });
+              if (paused) broadcastRecoveryJobRefused(record.recoveryJob, refusal);
+            } else {
+              await releaseRecoveryPreReceipt(pool, fenced);
+            }
           } else {
             await casToTerminal(pool, {
               dispatchId: record.dispatchId,
@@ -3909,10 +3969,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           dispatchOwner: record.leaseOwnerId,
           dispatchLeaseEpoch: record.leaseEpoch,
         };
-        if (refusal !== undefined) broadcastRecoveryJobRefused(record.recoveryJob, refusal);
-        void (refusal !== undefined
-          ? pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal })
-          : releaseRecoveryPreReceipt(pool, fenced)).catch(() => {});
+        if (refusal !== undefined) {
+          const pausedJob = record.recoveryJob;
+          void pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal })
+            .then((paused) => {
+              if (paused) broadcastRecoveryJobRefused(pausedJob, refusal);
+            })
+            .catch(() => {});
+        } else {
+          void releaseRecoveryPreReceipt(pool, fenced).catch(() => {});
+        }
         return;
       }
       void casToTerminal(pool, {
@@ -4874,18 +4940,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // OCV5-391: a policy refusal (UNAUTHORIZED_MODEL for a retired model, credits, …)
           // stops the recovery job; only transient refusals wait for the next attempt.
           const pause = _recoveryRefusalAction(reasonCode) === "pause";
+          const hasBoundDispatch =
+            [...admittedDispatches.values()].some(
+              (candidate) => candidate.recoveryJob?.jobId === recoveryJob.jobId,
+            ) ||
+            [...enrichmentDispatches.values()].some(
+              (candidate) => candidate.record.recoveryJob?.jobId === recoveryJob.jobId,
+            );
           // A job already bound to a dispatch is not touched here (dispatch_id fence); the
           // pre-forward failure exit reads this mark and pauses it with its dispatch.
           if (pause) {
             refusedRecoveryJobs.set(`${recoveryJob.jobId}:${recoveryJob.leaseEpoch}`, reasonCode);
-            const hasBoundDispatch = [...admittedDispatches.values()].some(
-              (candidate) => candidate.recoveryJob?.jobId === recoveryJob.jobId,
-            );
-            if (!hasBoundDispatch) broadcastRecoveryJobRefused(recoveryJob, reasonCode);
           }
-          void (pause
-            ? pauseRecoveryForRefusal(deps.pgPool, recoveryJob, reasonCode)
-            : releaseRecoveryForTransportWait(deps.pgPool, recoveryJob)).catch(() => {});
+          if (!hasBoundDispatch) {
+            if (pause) {
+              const targetJob = recoveryJob;
+              void pauseRecoveryForRefusal(deps.pgPool, targetJob, reasonCode)
+                .then((paused) => {
+                  if (paused) broadcastRecoveryJobRefused(targetJob, reasonCode);
+                })
+                .catch(() => {});
+            } else {
+              void releaseRecoveryForTransportWait(deps.pgPool, recoveryJob).catch(() => {});
+            }
+          }
         }
         if (!dispatchRequest || promptQueueResolved) return;
         promptQueueResolved = true;
