@@ -9471,6 +9471,40 @@
           "assertion": "[antigravity-durable-delivery] PASS"
         }
       ]
+    },
+    {
+      "id": "INC-20261105-FAILED-FIRST-CONTINUE",
+      "occurredAt": "2026-11-05",
+      "severity": "P1",
+      "symptom": "Box synthetic upstream API errors were lost behind shutdown metadata; a finalized zero-token failed first turn retained no source model, so same-model Continue incorrectly opened a switch-cost confirmation. Preserve safe first-cause classification and prove failed-route identity without weakening genuine-switch or ambiguous-history risk checks.",
+      "rootFixCommit": "70836694dff5f8a1de9158004af0acf6535d78f5",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxFailureDiagnosticPipeline.test.ts",
+          "assertion": "actual failed keeper/supervisor survives cleanup as a safe durable diagnostic"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostContext.integ.test.ts",
+          "assertion": "same model continues the failed first turn without a switch quote"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostContext.integ.test.ts",
+          "assertion": "a cheaper different model or different agent still requires an actual risk quote"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostContext.integ.test.ts",
+          "assertion": "the real batched tape writer produces an eligible failed-start anchor"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-switch-cost-continue.node-test.mjs",
+          "assertion": "a zero-token crashed first turn continues on the same model without a cost dialog"
+        }
+      ]
     }
   ]
 }
