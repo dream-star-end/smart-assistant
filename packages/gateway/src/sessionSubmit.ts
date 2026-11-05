@@ -1,5 +1,5 @@
 import { type Cc5ExecutionBackend, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
-import { isCc5ResumeId } from './engine/cc5ResumeId.js'
+import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
@@ -1045,10 +1045,26 @@ export async function submit(
     }
     const spawnCwd = this._cursorWorkspacePathForSession(session)
     const liveNativeId = session.runner.nativeSessionId
-    if (session.runner.executionBackend
-      && (isCc5ResumeId(liveNativeId) || isCc5ResumeId(this._resumeMap.get(session.sessionKey)))) {
+    const storedCc5Resume = this._resumeMap.get(session.sessionKey)
+    if (
+      session.runner.executionBackend &&
+      ((isCc5ResumeId(liveNativeId) &&
+        parseCc5ResumeId(liveNativeId)?.bindingId !== session.runner.executionBackend.operationId) ||
+        (isCc5ResumeId(storedCc5Resume) &&
+          parseCc5ResumeId(storedCc5Resume)?.bindingId !== session.runner.executionBackend.operationId))
+    ) {
       throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
     }
+    const liveCc5ResumeId = session.runner.executionBackend
+      ? ((liveNativeId &&
+        parseCc5ResumeId(liveNativeId)?.bindingId === session.runner.executionBackend.operationId
+          ? liveNativeId
+          : undefined) ??
+        (storedCc5Resume &&
+        parseCc5ResumeId(storedCc5Resume)?.bindingId === session.runner.executionBackend.operationId
+          ? storedCc5Resume
+          : undefined))
+      : undefined
     const liveBoxId =
       session.providerTag === 'cursor' ? cursorSandBoxCcResumeInnerId(liveNativeId) : undefined
     const liveSandJsonlId =
@@ -1069,7 +1085,9 @@ export async function submit(
               })
         : undefined
     let providerResumeId =
-      usableCursorId ?? this._resumeIdFor(session.sessionKey, session.providerTag, spawnCwd)
+      liveCc5ResumeId ??
+      usableCursorId ??
+      this._resumeIdFor(session.sessionKey, session.providerTag, spawnCwd)
     if (
       providerResumeId &&
       session.runner.isResumeIdCompatible &&
@@ -1116,7 +1134,7 @@ export async function submit(
         injectionKey,
         missingCount: providerGapDelta.length,
       })
-    } else if (providerResumeId && injectionKey !== null) {
+    } else if (providerResumeId && injectionKey !== null && !session.runner.executionBackend) {
       log.warn('master history gap invalidated native resume before context rebuild', {
         sessionKey: session.sessionKey,
         provider: session.providerTag,
@@ -1561,6 +1579,7 @@ export async function _getOrCreateExclusive(
   if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
   const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
     current, storedResumeId: this._resumeMap.get(opts.sessionKey),
+    executionBackend,
     sessionIds: [opts.sessionKey, ...(opts.peerId ? [opts.peerId] : [])], hasPersistedTurnActivity,
   })
   if (executionBackend && (!existing || backendChanged)) await assertFreshBackendTarget(existing)
@@ -1810,19 +1829,29 @@ export async function _getOrCreateExclusive(
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
-    if (executionBackend && this._resumeMap.get(opts.sessionKey)) {
+    const storedResumeForCreate = this._resumeMap.get(opts.sessionKey)
+    if (
+      executionBackend &&
+      storedResumeForCreate &&
+      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== executionBackend.operationId
+    ) {
       throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
     }
     const hadSameProviderResume =
-      Boolean(this._resumeMap.get(opts.sessionKey)) &&
+      Boolean(storedResumeForCreate) &&
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
-    const mappedResumeId = opts.hermeticNoTools || executionBackend
+    const mappedResumeId = opts.hermeticNoTools
       ? undefined
-      : this._resumeIdFor(
-          opts.sessionKey,
-          engineId,
-          this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
-        )
+      : executionBackend
+        ? (storedResumeForCreate &&
+          parseCc5ResumeId(storedResumeForCreate)?.bindingId === executionBackend.operationId
+            ? storedResumeForCreate
+            : undefined)
+        : this._resumeIdFor(
+            opts.sessionKey,
+            engineId,
+            this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+          )
     if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
       peerId: opts.peerId,

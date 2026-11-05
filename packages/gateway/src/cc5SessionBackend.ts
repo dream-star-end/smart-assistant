@@ -4,7 +4,7 @@ import {
   CC5_NATIVE_MODEL,
   isCc5ExecutionBackend,
 } from '@openclaude/protocol'
-import { isCc5ResumeId } from './engine/cc5ResumeId.js'
+import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 
 export function cc5SessionBackend(input: {
   executionAuthority?: { source?: string; executionBackend?: Cc5ExecutionBackend }
@@ -37,9 +37,17 @@ export function cc5SessionBackend(input: {
 export async function assertFreshCc5Session(input: {
   current?: { turns: number; runner: { nativeSessionId: string | null } }
   storedResumeId?: string
+  executionBackend?: Cc5ExecutionBackend
   sessionIds: string[]
   hasPersistedTurnActivity: (ids: string[]) => Promise<boolean>
 }): Promise<void> {
+  if (
+    !input.current &&
+    input.executionBackend &&
+    parseCc5ResumeId(input.storedResumeId)?.bindingId === input.executionBackend.operationId
+  ) {
+    return
+  }
   if (input.current?.turns || input.current?.runner.nativeSessionId || input.storedResumeId ||
     await input.hasPersistedTurnActivity(input.sessionIds)) {
     throw new Error('CC5_BACKEND_REQUIRES_NEW_SESSION')

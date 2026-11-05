@@ -1,12 +1,32 @@
 /** Shared public projection; retain the HTTP picker pricing and authorization semantics. */
 import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline } from '@openclaude/protocol'
 import { perKtokCredits, type PublicModel } from './pricing.js'
-import type { ModelCatalogSnapshot, UserModelScope } from './modelCatalog.js'
+import type { ModelCatalogSnapshot, ModelPlacement, UserModelScope } from './modelCatalog.js'
+
+/**
+ * OCV5-721: Transition-period remote brain pool models automatically display with a " 远端" suffix
+ * so users and operators can clearly distinguish remote-pool models from local models in the picker.
+ */
+export function formatRemoteModelDisplayName(
+  displayName: string,
+  placement?: ModelPlacement,
+  modelId?: string,
+): string {
+  const isRemote =
+    placement === 'remote_pool' || (typeof modelId === 'string' && modelId.endsWith('-remote'))
+  if (!isRemote) return displayName
+  const trimmed = displayName.trim()
+  if (trimmed.endsWith(' 远端') || trimmed.endsWith('（远端）') || trimmed.endsWith('(远端)')) {
+    return displayName
+  }
+  return `${trimmed} 远端`
+}
 
 /** `/api/public/models` 的 catalog 投影行:PublicModel + catalog 的 provider 归属(方案 §6)。 */
 export interface PublicModelProjection extends PublicModel {
   /** catalog.provider_id(engine='codex' 的虚拟条目也有值;null = 未归属静态 provider)。 */
   provider_id: string | null;
+  placement?: ModelPlacement;
 }
 
 /**
@@ -44,7 +64,7 @@ export function projectPublicModels(
     );
     out.push({
       id: row.modelId,
-      display_name: row.displayName,
+      display_name: formatRemoteModelDisplayName(row.displayName, row.placement, row.modelId),
       input_per_ktok_credits: perKtokCredits(p.inputPerMtok, p.multiplier),
       output_per_ktok_credits: perKtokCredits(p.outputPerMtok, p.multiplier),
       cache_read_per_ktok_credits: perKtokCredits(p.cacheReadPerMtok, p.multiplier),
@@ -55,6 +75,7 @@ export function projectPublicModels(
       context_window: row.contextWindow,
       supports_vision: row.supportsVision,
       provider_id: row.providerId,
+      ...(row.placement === 'remote_pool' ? { placement: 'remote_pool' as const } : {}),
       ...(costX !== undefined ? { cost_x: costX } : {}),
       ...(row.providerId && degraded.has(row.providerId) ? { degraded: true } : {}),
       ...(row.promoLabel ? { promo_label: row.promoLabel } : {}),
@@ -72,6 +93,7 @@ export interface LockedPublicModelProjection {
   min_plan_name?: string;
   cost_x?: number;
   promo_label?: string;
+  placement?: ModelPlacement;
 }
 
 export function projectLockedModels(
@@ -101,9 +123,10 @@ export function projectLockedModels(
     );
     out.push({
       id: row.modelId,
-      display_name: row.displayName,
+      display_name: formatRemoteModelDisplayName(row.displayName, row.placement, row.modelId),
       engine: row.engine,
       min_plan_code: row.minPlanCode,
+      ...(row.placement === 'remote_pool' ? { placement: 'remote_pool' as const } : {}),
       ...(row.minPlanName ? { min_plan_name: row.minPlanName } : {}),
       ...(costX !== undefined ? { cost_x: costX } : {}),
       ...(row.promoLabel ? { promo_label: row.promoLabel } : {}),

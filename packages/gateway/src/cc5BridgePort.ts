@@ -28,6 +28,7 @@ export const CC5_BINDING_FILE = '/run/oc/cc5-remote-t1555u/binding.json'
 export const CC5_AUTHORITY_KEYRING_FILE = '/run/oc/cc5-remote-t1555u/authority-public.json'
 export const CC5_RELAY_SOCKET = '/run/oc/cc5-remote-t1555u/relay.sock'
 export const CC5_BRIDGE_MAX_FRAME_BYTES = 8 * 1024 * 1024
+export const CC5_BINDING_SLIDING_TTL_MS = 24 * 60 * 60 * 1000
 export interface Cc5BridgeBinding {
   version: 2
   backendKind: typeof CC5_INTERACTIVE_BACKEND
@@ -145,12 +146,13 @@ export interface Cc5BridgePort {
   prepare(input?: { cwd: string }): Promise<SpawnOpts>
   admit(input: { authority: TurnModelAuthority; turnKey: string; model: string }): Promise<void>
   renew(leaseEnvelope: string): Promise<void>
+  interrupt?(): Promise<void>
   close(): Promise<void>
 }
 
 /** One request, no transport retries. A lost ACK is not permission to resubmit. */
 export function cc5ControlRequest(
-  path: '/admit' | '/renew' | '/stop' | '/tool/register' | '/tool/stopped',
+  path: '/admit' | '/renew' | '/interrupt' | '/stop' | '/tool/register' | '/tool/stopped',
   body: Readonly<Record<string, unknown>>,
   socketPath = CC5_RELAY_SOCKET,
 ): Promise<Record<string, unknown>> {
@@ -207,6 +209,7 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
   private closed = false
   private active = false
   private admitting = false
+  private mutableExpiresAt: number
   constructor(
     private readonly binding: Readonly<Cc5BridgeBinding>,
     private readonly sessionKey: string,
@@ -218,9 +221,13 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     this.executionBackend = Object.freeze({ kind: binding.backendKind, sessionKey,
       operationId: binding.operationId })
     this.canonicalModel = binding.canonicalModel
+    this.mutableExpiresAt = binding.expiresAt
+  }
+  private effectiveExpiresAt(): number {
+    return Math.max(this.binding.expiresAt, this.mutableExpiresAt)
   }
   async prepare(input?: { cwd: string }): Promise<SpawnOpts> {
-    requireCc5(!this.closed && this.binding.expiresAt > Date.now())
+    requireCc5(!this.closed && this.effectiveExpiresAt() > Date.now())
     const entry = fileURLToPath(new URL('../dist/cc5StdioBridge.js', import.meta.url))
     const cwd = input?.cwd ?? dirname(entry)
     requireCc5(isAbsolute(cwd) && statSync(cwd).isDirectory())
@@ -267,7 +274,7 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
         input.authority.executionDescriptor.executionBackend?.kind === this.binding.backendKind &&
         input.authority.executionDescriptor.executionBackend.sessionKey === this.binding.sessionKey &&
         input.authority.executionDescriptor.executionBackend.operationId === this.binding.operationId &&
-        this.binding.expiresAt > Date.now() &&
+        this.effectiveExpiresAt() > Date.now() &&
         authority &&
         lease &&
         turnKey,
@@ -278,11 +285,21 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     const expected = createHash('sha256').update(authority).update('\0').update(lease).digest('hex')
     const response = await this.call('/admit', { ...this.scope(), authority, lease, turnKey })
     requireCc5(!this.closed && response.admissionHash === expected && response.ready === true)
+    if (typeof response.expiresAt === 'number' && Number.isSafeInteger(response.expiresAt)) {
+      this.mutableExpiresAt = Math.max(this.mutableExpiresAt, response.expiresAt)
+    }
     this.admitting = false
   }
   async renew(leaseEnvelope: string): Promise<void> {
-    requireCc5(!this.closed && this.active && this.binding.expiresAt > Date.now())
-    await this.call('/renew', { ...this.scope(), lease: leaseEnvelope })
+    requireCc5(!this.closed && this.active && this.effectiveExpiresAt() > Date.now())
+    const response = await this.call('/renew', { ...this.scope(), lease: leaseEnvelope })
+    if (typeof response.expiresAt === 'number' && Number.isSafeInteger(response.expiresAt)) {
+      this.mutableExpiresAt = Math.max(this.mutableExpiresAt, response.expiresAt)
+    }
+  }
+  async interrupt(): Promise<void> {
+    if (this.closed || !this.active) return
+    await this.call('/interrupt', this.scope())
   }
   close(): Promise<void> {
     if (this.stopPromise) return this.stopPromise

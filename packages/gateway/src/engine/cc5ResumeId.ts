@@ -9,3 +9,15 @@ export function cc5ResumeId(bindingId: string, nativeId: string): string {
   }
   return `${CC5_RESUME_PREFIX + bindingId}:${nativeId}`
 }
+export function parseCc5ResumeId(
+  value: string | null | undefined,
+): { bindingId: string; nativeId: string } | null {
+  if (!isCc5ResumeId(value)) return null
+  const rest = value!.slice(CC5_RESUME_PREFIX.length)
+  const sep = rest.indexOf(':')
+  if (sep <= 0) return null
+  const bindingId = rest.slice(0, sep)
+  const nativeId = rest.slice(sep + 1)
+  if (!/^[a-f0-9-]{36}$/.test(bindingId) || !/^[a-f0-9-]{36}$/i.test(nativeId)) return null
+  return { bindingId, nativeId }
+}

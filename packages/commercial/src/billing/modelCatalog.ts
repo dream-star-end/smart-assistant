@@ -52,6 +52,7 @@ import { meetsMinPlan } from "./planEntitlement.js";
 
 export type ModelEngine = "ccb" | "codex" | "grok" | "cursor" | "zcode" | "antigravity";
 export type ModelCatalogState = "staged" | "active" | "disabled" | "retired";
+export type ModelPlacement = "local" | "remote_pool";
 
 /**
  * 本进程能理解的 capability_profile schema 版本上限。
@@ -94,6 +95,7 @@ export interface ModelCatalogEntry {
   capabilitySchemaVersion: number;
   state: ModelCatalogState;
   lockVersion: number;
+  placement?: ModelPlacement;
 }
 
 /** catalog 侧不管价格;计费/授权面从 model_pricing 随快照一起读入。 */
@@ -147,6 +149,7 @@ export interface ModelProjectionRow {
   defaultEffort: string | null;
   sortOrder: number;
   promoLabel?: string | null;
+  placement?: ModelPlacement;
 }
 
 /** Rows the caller could use if they met the subscription floor (picker lock list). */
@@ -158,6 +161,7 @@ export interface LockedModelProjectionRow {
   minPlanName: string | null;
   promoLabel: string | null;
   sortOrder: number;
+  placement?: ModelPlacement;
 }
 
 export interface UserModelScope {
@@ -256,6 +260,7 @@ type CatalogRow = {
   capability_schema_version: number;
   state: string;
   lock_version: number;
+  placement?: string | null;
 };
 
 type AliasRow = { alias: string; entry_id: string };
@@ -354,6 +359,7 @@ function rowToEntry(r: CatalogRow): ModelCatalogEntry {
     capabilitySchemaVersion: r.capability_schema_version,
     state: r.state as ModelCatalogState,
     lockVersion: r.lock_version,
+    placement: r.placement === "remote_pool" ? "remote_pool" : "local",
   };
 }
 
@@ -675,6 +681,7 @@ export class ModelCatalogSnapshot {
         defaultEffort: p.defaultEffort,
         sortOrder: p.sortOrder,
         promoLabel: p.promoLabel ?? null,
+        placement: e.placement ?? (e.modelId.endsWith("-remote") ? "remote_pool" : "local"),
       });
     }
     return rows.sort((a, b) => a.sortOrder - b.sortOrder || (a.modelId < b.modelId ? -1 : 1));
@@ -708,6 +715,7 @@ export class ModelCatalogSnapshot {
         minPlanName: p.minPlanName ?? null,
         promoLabel: p.promoLabel ?? null,
         sortOrder: p.sortOrder,
+        placement: e.placement ?? (e.modelId.endsWith("-remote") ? "remote_pool" : "local"),
       });
     }
     return rows.sort((a, b) => a.sortOrder - b.sortOrder || (a.modelId < b.modelId ? -1 : 1));
@@ -850,7 +858,8 @@ export async function loadCatalogSnapshot(pool = getPool()): Promise<ModelCatalo
     }
     const catalog = await client.query<CatalogRow>(
       `SELECT entry_id::text AS entry_id, model_id, engine, provider_id, upstream_model_id,
-              context_window, capability_profile, capability_schema_version, state, lock_version
+              context_window, capability_profile, capability_schema_version, state, lock_version,
+              placement
          FROM model_catalog`,
     );
     const aliases = await client.query<AliasRow>(

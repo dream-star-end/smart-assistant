@@ -223,4 +223,31 @@ test('a restarted manager refuses automatic local Sonnet replay of a persisted r
   } })
   assert.equal(other.runner.executionBackend, undefined)
   assert.equal(other.runner.nativeSessionId, null)
+
+  const restartedForRemote = new SessionManager(config)
+  const mr = restartedForRemote as any
+  mr.resumeMapPath = file
+  mr._loadResumeMap()
+  mr._saveResumeMap = () => {}
+  const recovered = await restartedForRemote.getOrCreate(f.remote)
+  assert.deepEqual(recovered.runner.executionBackend, f.backend)
+})
+
+test('multi-turn submit on the same signed remote backend succeeds across consecutive turns', async () => {
+  const f = fixture()
+  const session = await f.sm.getOrCreate(f.remote)
+  const remoteId = cc5ResumeId(f.backend.operationId, randomUUID())
+  let turnsRun = 0
+  f.m.runOneTurnWithRetry = async () => {
+    turnsRun++
+    runners.get(session.runner)!.sessionId = remoteId
+    f.m._resumeMap.set(f.remote.sessionKey, remoteId)
+    session.runner.emit('session_id', remoteId)
+  }
+  await f.sm.submit(session, 'turn 1', () => {}, undefined, undefined,
+    undefined, undefined, undefined, { modelAuthority: f.authority })
+  await f.sm.submit(session, 'turn 2', () => {}, undefined, undefined,
+    undefined, undefined, undefined, { modelAuthority: f.authority })
+  assert.equal(turnsRun, 2)
+  assert.equal(f.m._resumeMap.get(f.remote.sessionKey), remoteId)
 })

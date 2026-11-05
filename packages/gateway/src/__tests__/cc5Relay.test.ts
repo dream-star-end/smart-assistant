@@ -616,3 +616,51 @@ test('an oversized tool result is truncated for the model with its original byte
     assert.ok(resultBytes(delivered) <= RESULT_LIMIT)
   } finally { s.req.destroy(); await h.close(); f.cleanup() }
 })
+
+test('interrupt aborts active turn without revoking the remote host and permits a subsequent turn admission', async () => {
+  const f = fixture()
+  const { h, s } = await start(f)
+  try {
+    const intRes = await rpc(h.socketPath, '/interrupt', h.scope)
+    assert.equal(intRes.ok, true)
+    assert.equal(intRes.interrupted, true)
+    assert.equal(intRes.phase, 'idle')
+    assert.equal(h.counts().stops, 0)
+    const next = f.nextTurn()
+    const admitted = await h.admit(next)
+    assert.equal(admitted.ready, true)
+    s.send('second turn after interrupt')
+    await until(() => h.written.length >= 3)
+    h.output.write(terminal(f))
+    await until(() => h.financeEvents.includes('settled'))
+    assert.deepEqual(h.counts(), { starts: 1, stops: 0 })
+  } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('stream reconnect with higher generation fences stale stream and replays buffered output after lastAckedSeq', async () => {
+  const f = fixture()
+  const { h, s } = await start(f)
+  let req2: ReturnType<typeof request> | undefined
+  try {
+    h.output.write(terminal(f))
+    await until(() => Buffer.concat(s.output).includes(Buffer.from('"type":"result"')))
+    const next = f.nextTurn()
+    await h.admit(next)
+    const replayed: Buffer[] = []
+    req2 = request({ socketPath: h.socketPath, path: '/session/open', method: 'POST' })
+    req2.on('error', () => {})
+    const ready2 = new Promise<void>((resolve, reject) => {
+      req2!.once('response', (res) => {
+        res.on('data', (bytes) => replayed.push(Buffer.from(bytes)))
+        res.on('error', () => {})
+        if (res.statusCode === 200) resolve()
+        else reject(new Error('reconnect stream not admitted'))
+      })
+      req2!.once('error', reject)
+    })
+    req2.write(`${JSON.stringify({ type: 'open', generation: 1, lastAckedSeq: 0, ...h.scope })}\n`)
+    await ready2
+    await until(() => Buffer.concat(replayed).includes(Buffer.from('"type":"result"')))
+    assert.equal(h.counts().stops, 0)
+  } finally { req2?.destroy(); s.req.destroy(); await h.close(); f.cleanup() }
+})

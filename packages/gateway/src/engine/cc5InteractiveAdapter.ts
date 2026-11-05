@@ -1,7 +1,7 @@
 /** Bound personal web route over one original interactive TUI; no pool selector. */
 import { type Cc5ExecutionBackend, CC5_NATIVE_MODEL, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { createCc5BridgePort } from '../cc5BridgePort.js'
-import { cc5ResumeId } from './cc5ResumeId.js'
+import { cc5ResumeId, parseCc5ResumeId } from './cc5ResumeId.js'
 import { CcbAdapter } from './ccbAdapter.js'
 import type { EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type { EngineCreateOpts } from './registry.js'
@@ -23,6 +23,7 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
   }
   private readonly cc5BindingId: string
   constructor(opts: EngineCreateOpts) {
+    const parsedResume = opts.resumeSessionId ? parseCc5ResumeId(opts.resumeSessionId) : null
     if (
       opts.model !== CC5_NATIVE_MODEL ||
       !isCc5ExecutionBackend(opts.executionBackend) ||
@@ -32,12 +33,13 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
       opts.delegationDepth ||
       opts.usageAttribution ||
       opts.executionTarget?.kind === 'remote' ||
-      opts.resumeSessionId
+      (opts.resumeSessionId && parsedResume?.bindingId !== opts.executionBackend.operationId)
     )
       throw new Error('CC5_TEST_PROFILE_UNSUPPORTED')
     const port = opts.cc5BridgePort ?? createCc5BridgePort(opts.sessionKey, opts.executionBackend!, opts.model!)
     super({
       ...opts,
+      resumeSessionId: parsedResume?.nativeId,
       harness: 'official-cc',
       authorityEngine: 'ccb',
       boxResidentCc: true,
@@ -64,10 +66,16 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
     return id ? cc5ResumeId(this.cc5BindingId, id) : null
   }
   isResumeIdCompatible(id: string): boolean {
-    return this.isRunning && id === this.nativeSessionId
+    const parsed = parseCc5ResumeId(id)
+    if (!parsed || parsed.bindingId !== this.cc5BindingId) return false
+    return !this.nativeSessionId || id === this.nativeSessionId
   }
   override setResumeSessionId(id: string): void {
-    if (this.isResumeIdCompatible(id)) return // Same live Writer; this does not restart or reattach.
+    if (this.isResumeIdCompatible(id)) {
+      const parsed = parseCc5ResumeId(id)
+      if (parsed && !super.nativeSessionId) super.setResumeSessionId(parsed.nativeId)
+      return // Same live or recovered binding; never switches to another remote or local store.
+    }
     throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
   }
   requiresReopenForModel(model: string | undefined): boolean {

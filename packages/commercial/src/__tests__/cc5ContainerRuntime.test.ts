@@ -409,3 +409,39 @@ test('unproved remote exit retains private unknown fence and cannot be replaced/
     await f.cleanup()
   }
 })
+
+test('24h sliding lease and active binding recovery across runtime restart', async () => {
+  const f = fixture()
+  try {
+    const before = Date.now()
+    const handle = (await f.prepare())!
+    await f.runtime.bindCreated(handle, 'a'.repeat(64))
+    const b = JSON.parse(
+      readFileSync(join(handle.mountSource, 'binding.json'), 'utf8'),
+    ) as Cc5BridgeBinding
+    assert.ok(b.expiresAt >= before + 24 * 60 * 60 * 1000 - 5000)
+    await f.runtime.activate(handle, b.dockerId)
+    const restarted = createCc5FreshContainerRuntime({
+      selfhost: true,
+      env,
+      configuration: () => f.options,
+      financeFactory,
+    })!
+    assert.deepEqual(
+      restarted.selectBackend({
+        uid: 912,
+        containerId: 91,
+        sessionKey: f.options.scope.sessionKey,
+        canonicalModel: f.options.scope.canonicalModel,
+        engine: 'ccb',
+      }),
+      {
+        kind: 'cc5-interactive-v1',
+        sessionKey: f.options.scope.sessionKey,
+        operationId: f.options.profile.operationId,
+      },
+    )
+  } finally {
+    await f.cleanup()
+  }
+})

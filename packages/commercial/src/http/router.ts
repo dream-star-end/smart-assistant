@@ -121,6 +121,15 @@ import {
 } from './admin/boxClaudeProfiles.js'
 import { handleAdminPoolKeyCreate, handleAdminPoolKeyPatch, handleAdminPoolsList } from './admin/pools.js'
 import {
+  handleAdminRemotePoolBindingRevoke,
+  handleAdminRemotePoolGet,
+  handleAdminRemotePoolNodeAction,
+  handleAdminRemotePoolNodeCreate,
+  handleAdminRemotePoolOffersPublish,
+  handleAdminRemotePoolProfilePatch,
+  handleSessionPreheat,
+} from './admin/remotePool.js'
+import {
   handleAdminListAudit,
   handleAdminListHostAudit,
   handleAdminListSecurityEvents,
@@ -1264,6 +1273,15 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/admin/pools', handler: handleAdminPoolsList },
     { method: 'POST', path: '/api/admin/pools/keys', handler: handleAdminPoolKeyCreate },
     { method: 'PATCH', pathPrefix: '/api/admin/pools/keys/', handler: handleAdminPoolKeyPatch },
+    // OCV5-721 远端底座服务池(节点、Profile 自动探测、勾选模型上架、Binding 撤销 + 预热)。
+    { method: 'GET', path: '/api/admin/remote-pool', handler: handleAdminRemotePoolGet },
+    { method: 'POST', path: '/api/admin/remote-pool/nodes', handler: handleAdminRemotePoolNodeCreate },
+    { method: 'POST', pathPrefix: '/api/admin/remote-pool/nodes/', handler: handleAdminRemotePoolNodeAction },
+    { method: 'DELETE', pathPrefix: '/api/admin/remote-pool/nodes/', handler: handleAdminRemotePoolNodeAction },
+    { method: 'POST', path: '/api/admin/remote-pool/offers', handler: handleAdminRemotePoolOffersPublish },
+    { method: 'PATCH', pathPrefix: '/api/admin/remote-pool/profiles/', handler: handleAdminRemotePoolProfilePatch },
+    { method: 'POST', pathPrefix: '/api/admin/remote-pool/bindings/', handler: handleAdminRemotePoolBindingRevoke },
+    { method: 'POST', path: '/api/sessions/preheat', handler: handleSessionPreheat },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。

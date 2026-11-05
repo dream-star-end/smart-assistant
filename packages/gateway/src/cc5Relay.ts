@@ -127,6 +127,12 @@ export class Cc5Relay {
   private toolBurned = false
   private pending?: PendingTool
   private poll?: { response: ServerResponse; timer: ReturnType<typeof setTimeout> }
+  private bindingExpiresAt: number
+  private interruptedTurn = false
+  private streamGeneration = 0
+  private outSeq = 0
+  private readonly outputHistory: Array<{ seq: number; bytes: Buffer }> = []
+  private outputHistoryBytes = 0
 
   constructor(
     private readonly binding: Readonly<Cc5BridgeBinding>,
@@ -135,11 +141,16 @@ export class Cc5Relay {
     private readonly hostPort: Cc5InteractiveHostPort,
     private readonly journalRoot: string,
     private readonly finance: Cc5FinancePort,
-    private readonly options: { localStopTimeoutMs?: number } = {},
+    private readonly options: {
+      localStopTimeoutMs?: number
+      slidingTtlMs?: number
+      onBindingExtended?: (expiresAt: number) => void
+    } = {},
   ) {
     assertCc5BindingScope(binding)
     requireRelay(keyring.size > 0 && /^[a-f0-9-]{36}$/.test(runId) &&
       binding.runId === runId && typeof finance?.admit === 'function')
+    this.bindingExpiresAt = binding.expiresAt
     this.nativeUsage = new Cc5NativeUsageObserver(binding)
     mkdirSync(journalRoot, { mode: 0o700, recursive: false })
     const st = lstatSync(journalRoot)
@@ -154,7 +165,17 @@ export class Cc5Relay {
       closeSync(parent)
     }
     this.observation = new Cc5ToolObservation(binding.operationId)
-    this.armExpiry(binding.expiresAt)
+    this.armExpiry(this.bindingExpiresAt)
+  }
+  private slideBindingExpiry(): number {
+    if (this.options.slidingTtlMs && this.options.slidingTtlMs > 0) {
+      const next = Math.max(this.bindingExpiresAt, Date.now() + this.options.slidingTtlMs)
+      if (next > this.bindingExpiresAt) {
+        this.bindingExpiresAt = next
+        this.options.onBindingExtended?.(next)
+      }
+    }
+    return this.bindingExpiresAt
   }
   private record(name: string, value: unknown, root = this.admitted?.journal ?? this.journalRoot): void {
     const fd = openSync(
@@ -187,7 +208,7 @@ export class Cc5Relay {
         body.dockerId === this.binding.dockerId &&
         body.operationId === this.binding.operationId &&
         body.sessionKey === this.binding.sessionKey &&
-        (allowExpired || (!this.revoked && this.binding.expiresAt > Date.now())),
+        (allowExpired || (!this.revoked && this.bindingExpiresAt > Date.now())),
     )
   }
   private verify(authority: string, lease: string, allowExpired = false): ModelAuthorityPayload {
@@ -205,7 +226,7 @@ export class Cc5Relay {
       () => {
         void this.stop().catch(() => {})
       },
-      Math.max(0, Math.min(this.binding.expiresAt, expiresAt) - Date.now()),
+      Math.max(0, Math.min(this.bindingExpiresAt, expiresAt) - Date.now()),
     )
     this.expiry.unref()
   }
@@ -240,26 +261,30 @@ export class Cc5Relay {
           for (const frame of frames) {
             requireRelay(!this.revoked)
             if (frame.receipt) {
-              requireRelay(this.phase === 'running' && this.userSeen && this.financeTurn && this.admitted &&
-                frame.receipt.version === 2 && frame.receipt.authorityTurnId === this.admitted.payload.authorityTurnId &&
-                frame.receipt.turnKey === this.admitted.turnKey && this.waitingTools === 0 && this.toolQueue.length === 0 &&
-                this.observation.toolUseIds.every((id) => this.turnTools.get(id)?.receipt))
-              this.verify(this.admitted.authority, this.admitted.lease, true)
-              this.phase = 'settling'
-              await Promise.all([...this.turnTools.values()].map((tool) => {
-                requireRelay(tool.receipt && tool.ack)
-                return tool.ack
-              }))
-              requireRelay([...this.turnTools.values()].every((tool) => tool.acknowledged) && !this.pending)
-              this.record('native-terminal.json', frame.receipt)
-              const outcome = await this.financeTurn.terminal(frame.receipt)
-              requireRelay(outcome.state === 'proven' && outcome.requestId === this.admitted.payload.billingRequestId)
-              this.record('terminal-proven.json', { requestId: outcome.requestId,
-                resultSha256: frame.receipt.resultSha256 })
-              requireRelay(!this.revoked)
-              this.observation.endTurn()
-              this.phase = 'idle'
-              this.armExpiry(this.binding.expiresAt)
+              if (this.interruptedTurn && this.phase === 'idle') {
+                this.interruptedTurn = false
+              } else {
+                requireRelay(this.phase === 'running' && this.userSeen && this.financeTurn && this.admitted &&
+                  frame.receipt.version === 2 && frame.receipt.authorityTurnId === this.admitted.payload.authorityTurnId &&
+                  frame.receipt.turnKey === this.admitted.turnKey && this.waitingTools === 0 && this.toolQueue.length === 0 &&
+                  this.observation.toolUseIds.every((id) => this.turnTools.get(id)?.receipt))
+                this.verify(this.admitted.authority, this.admitted.lease, true)
+                this.phase = 'settling'
+                await Promise.all([...this.turnTools.values()].map((tool) => {
+                  requireRelay(tool.receipt && tool.ack)
+                  return tool.ack
+                }))
+                requireRelay([...this.turnTools.values()].every((tool) => tool.acknowledged) && !this.pending)
+                this.record('native-terminal.json', frame.receipt)
+                const outcome = await this.financeTurn.terminal(frame.receipt)
+                requireRelay(outcome.state === 'proven' && outcome.requestId === this.admitted.payload.billingRequestId)
+                this.record('terminal-proven.json', { requestId: outcome.requestId,
+                  resultSha256: frame.receipt.resultSha256 })
+                requireRelay(!this.revoked)
+                this.observation.endTurn()
+                this.phase = 'idle'
+                this.armExpiry(this.bindingExpiresAt)
+              }
             }
             requireRelay(!this.revoked)
             this.publishOutput(frame.bytes)
@@ -287,12 +312,45 @@ export class Cc5Relay {
   }
 
   private publishOutput(bytes: Buffer): void {
+    const seq = ++this.outSeq
+    this.outputHistory.push({ seq, bytes })
+    this.outputHistoryBytes += bytes.length
+    while (
+      this.outputHistory.length > 1 &&
+      (this.outputHistoryBytes > 2 * 1024 * 1024 || this.outputHistory.length > 512)
+    ) {
+      const evicted = this.outputHistory.shift()!
+      this.outputHistoryBytes -= evicted.bytes.length
+    }
     if (this.stream?.headersSent) {
       if (!this.stream.write(bytes)) this.outputBackpressured = true
     } else {
       this.outputBytes += bytes.length
       requireRelay(this.outputBytes <= CC5_BRIDGE_MAX_FRAME_BYTES)
       this.output.push(bytes)
+    }
+  }
+  private interruptActiveTurn(writeControlFrame = true): void {
+    if (this.phase !== 'running' && this.phase !== 'settling') return
+    this.interruptedTurn = true
+    this.pending?.response.destroy()
+    this.pending = undefined
+    for (const tool of this.toolQueue) tool.response.destroy()
+    this.toolQueue.length = 0
+    this.turnTools.clear()
+    this.observation.endTurn()
+    this.nativeUsage.interruptTurn()
+    this.phase = 'idle'
+    this.armExpiry(this.bindingExpiresAt)
+    if (writeControlFrame && this.host) {
+      const req = {
+        type: 'control_request',
+        request_id: `int-${Date.now()}`,
+        request: { subtype: 'interrupt' },
+      }
+      try {
+        this.host.stdin.write(`${JSON.stringify(req)}\n`)
+      } catch {}
     }
   }
 
@@ -358,11 +416,22 @@ export class Cc5Relay {
       reply(res, { ok: true, ...(await this.stop()) })
       return
     }
+    if (req.url === '/interrupt') {
+      this.interruptActiveTurn(true)
+      reply(res, { ok: true, interrupted: true, phase: this.phase })
+      return
+    }
     if (req.url === '/tool/register') {
-      requireRelay(!this.lifecycleId && typeof body.lifecycleId === 'string' &&
+      requireRelay((!this.lifecycleId || body.replace === true) && typeof body.lifecycleId === 'string' &&
         /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(body.lifecycleId))
+      const isInitial = !this.lifecycleId
       this.lifecycleId = body.lifecycleId
-      this.record('local-registered.json', { lifecycleId: this.lifecycleId }, this.journalRoot)
+      this.localStopped = false
+      this.record(
+        isInitial ? 'local-registered.json' : `local-registered-${this.lifecycleId}.json`,
+        { lifecycleId: this.lifecycleId },
+        this.journalRoot,
+      )
       reply(res, { ok: true, lifecycleId: this.lifecycleId })
     } else if (req.url === '/tool/stopped') {
       requireRelay(this.lifecycleId && body.lifecycleId === this.lifecycleId && body.localStopped === true)
@@ -411,9 +480,11 @@ export class Cc5Relay {
         }
         this.userSeen = false
         this.userSubmitted = false
+        this.interruptedTurn = false
         this.turnTools.clear()
         this.observation.beginTurn()
         this.nativeUsage.beginTurn({ authorityTurnId: payload.authorityTurnId, turnKey: body.turnKey })
+        const expiresAt = this.slideBindingExpiry()
         this.armExpiry(verifyTurnLease(body.lease, this.keyring, Date.now()).expiresAt)
         // The per-turn marker also fences reuse of an already-running native worker.
         this.effectBarrier = this.financeTurn.beforeHostStart()
@@ -422,14 +493,15 @@ export class Cc5Relay {
         this.verify(body.authority, body.lease)
         requireRelay(!this.revoked)
         this.phase = 'running'
-        reply(res, { ok: true, ready: true, admissionHash: sha(`${body.authority}\0${body.lease}`) })
+        reply(res, { ok: true, ready: true, admissionHash: sha(`${body.authority}\0${body.lease}`), expiresAt })
       } catch (error) { void this.stop().catch(() => {}); throw error }
     } else if (req.url === '/renew') {
       requireRelay(this.admitted && (this.phase === 'running' || this.phase === 'settling') && typeof body.lease === 'string')
       this.verify(this.admitted.authority, body.lease, true)
       this.admitted.lease = body.lease
+      const expiresAt = this.slideBindingExpiry()
       this.armExpiry(verifyTurnLease(body.lease, this.keyring, Date.now()).expiresAt)
-      reply(res, { ok: true })
+      reply(res, { ok: true, expiresAt })
     } else if (req.url === '/tool/next') {
       requireRelay(this.lifecycleId && !this.localStopped && !this.poll && !this.pending?.delivered)
       this.poll = {
@@ -505,6 +577,7 @@ export class Cc5Relay {
   private async open(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let buffer = ''
     let opened = false
+    let protocolFailed = false
     try {
       for await (const chunk of req) {
         buffer += chunk.toString('utf8')
@@ -514,15 +587,38 @@ export class Cc5Relay {
           const body = JSON.parse(buffer.slice(0, at)) as Body
           buffer = buffer.slice(at + 1)
           if (!opened) {
+            if (body.generation !== undefined) {
+              requireRelay(
+                typeof body.generation === 'number' &&
+                  Number.isSafeInteger(body.generation) &&
+                  body.generation >= this.streamGeneration,
+              )
+              if (body.generation > this.streamGeneration && this.stream) {
+                this.stream.end()
+                this.stream = undefined
+                this.streamClaimed = false
+              }
+              this.streamGeneration = body.generation
+            }
             requireRelay(body.type === 'open' && !this.streamClaimed && this.admitted && this.financeTurn)
             this.scope(body)
             this.streamClaimed = true
             this.stream = res
             opened = true
             await this.ensureHost()
-            res.writeHead(200, { 'x-cc5-interactive-ready': '1' })
+            res.writeHead(200, {
+              'x-cc5-interactive-ready': '1',
+              'x-cc5-stream-generation': String(this.streamGeneration),
+              'x-cc5-out-seq': String(this.outSeq),
+            })
             res.flushHeaders()
-            for (const raw of this.output) res.write(raw)
+            if (typeof body.lastAckedSeq === 'number' && Number.isSafeInteger(body.lastAckedSeq)) {
+              for (const item of this.outputHistory) {
+                if (item.seq > body.lastAckedSeq) res.write(item.bytes)
+              }
+            } else {
+              for (const raw of this.output) res.write(raw)
+            }
             this.output = []
             this.outputBytes = 0
             res.on('drain', () => {
@@ -533,12 +629,22 @@ export class Cc5Relay {
         }
       }
       requireRelay(!buffer)
+    } catch (error) {
+      protocolFailed = true
+      throw error
     } finally {
-      if (opened) await this.stop()
+      if (opened) {
+        if (protocolFailed || this.revoked) {
+          await this.stop()
+        } else if (this.stream === res) {
+          this.stream = undefined
+          this.streamClaimed = false
+        }
+      }
     }
   }
   private async input(body: Body): Promise<void> {
-    requireRelay(this.admitted && this.host && !this.revoked && this.binding.expiresAt > Date.now())
+    requireRelay(this.admitted && this.host && !this.revoked && this.bindingExpiresAt > Date.now())
     this.verify(this.admitted.authority, this.admitted.lease, true)
     requireRelay(
       Number.isSafeInteger(body.seq) &&
@@ -574,7 +680,10 @@ export class Cc5Relay {
       await this.effectBarrier
       requireRelay(!this.revoked)
       this.verify(this.admitted.authority, this.admitted.lease, true)
-    } else requireRelay((this.phase === 'running' || this.phase === 'settling') && frame.type === 'control_request' && frame.request?.subtype === 'interrupt')
+    } else {
+      requireRelay((this.phase === 'running' || this.phase === 'settling') && frame.type === 'control_request' && frame.request?.subtype === 'interrupt')
+      this.interruptActiveTurn(false)
+    }
     this.lastSequence = body.seq as number
     this.lastHash = body.hash
     if (frame.type === 'user') this.userSubmitted = true
@@ -602,7 +711,7 @@ export class Cc5Relay {
     const body = await jsonBody(req)
     requireRelay(
       !this.revoked &&
-        this.binding.expiresAt > Date.now() &&
+        this.bindingExpiresAt > Date.now() &&
         this.admitted &&
         this.userSeen &&
         this.phase === 'running' && this.lifecycleId && !this.localStopped &&

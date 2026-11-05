@@ -346,3 +346,22 @@ test('native backend requires the same signed scope, never just the Sonnet model
   assert.equal(f.counts().admitted, 0)
   assert.equal(f.counts().prepared, 0)
 })
+
+test('cc5 Runner interrupt sends control_request and calls port.interrupt without shutting down the bridge', async () => {
+  const f = fixture()
+  let interrupted = 0
+  f.port.interrupt = async () => {
+    interrupted++
+  }
+  const runner = new SubprocessRunner(f.opts)
+  await runner.submit('first turn', undefined, authority, 'turn1')
+  assert.equal(runner.interrupt(), true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(interrupted, 1)
+  assert.equal(f.counts().stopped, 0)
+  assert.equal(runner.isRunning, true)
+  assert.equal(f.writes.length, 2)
+  assert.equal(JSON.parse(f.writes[1]!).type, 'control_request')
+  await runner.shutdown()
+  assert.equal(f.counts().stopped, 1)
+})

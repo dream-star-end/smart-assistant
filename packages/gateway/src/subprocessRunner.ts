@@ -1,4 +1,5 @@
 import { CC5_NATIVE_MODEL, sameCc5ExecutionBackend } from '@openclaude/protocol'
+import { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
 import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
 import { systemHelpEnvironment } from './systemHelpEnvironment.js'
@@ -574,6 +575,12 @@ export class SubprocessRunner extends EventEmitter {
       this.spawnedUpstreamIsEgress = false
       this.pendingOfficialSpawnEnv = null
       this.spawnedOfficialHeaderFingerprint = undefined
+      if (this.promptPolicy) {
+        this._promptPolicyFingerprint = promptPrivacyFingerprint(
+          this.promptPolicy,
+          this.opts.sessionId ?? this.promptPolicy.profile?.sessionId,
+        )
+      }
     } else {
     if (this.opts.boxResidentCc && !this.boxCcControlPath) {
       if (!this.opts.prepareBoxCc) {
@@ -1238,7 +1245,7 @@ export class SubprocessRunner extends EventEmitter {
               this.emit('telemetry', telemetryMsg)
             }
           } else {
-            if (this.opts.harness === 'official-cc' && _isOfficialClaudeAbortResult(msg)) {
+            if (this.opts.harness === 'official-cc' && !this.opts.cc5BridgePort && _isOfficialClaudeAbortResult(msg)) {
               this.officialAbortResultObserved = true
               // Official Claude Code exits 1 a few seconds after this frame; a
               // user turn submitted in that window would be written into a
@@ -1992,7 +1999,18 @@ export class SubprocessRunner extends EventEmitter {
   // 发送 interrupt control request — CCB 会中止当前 turn
   interrupt(): boolean {
     if (this.opts.cc5BridgePort) {
-      void this.shutdown().catch(() => {}) // remote absence/finance owns unknown; never write a second input frame
+      void this.opts.cc5BridgePort.interrupt?.().catch(() => {})
+      if (!this.proc) return true
+      try {
+        const req = {
+          type: 'control_request',
+          request_id: `int-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          request: { subtype: 'interrupt' },
+        }
+        this.proc.stdin.write(`${JSON.stringify(req)}\n`)
+      } catch {
+        // best-effort control frame alongside bridge /interrupt
+      }
       return true
     }
     if (!this.proc) return false

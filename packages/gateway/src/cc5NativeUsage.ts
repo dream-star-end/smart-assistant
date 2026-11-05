@@ -19,6 +19,7 @@ export class Cc5NativeUsageObserver {
   private nativeSessionId?: string
   private upstreamModel?: string
   private terminalSeen = false
+  private interrupted = false
   private failed = false
   private finished = false
   private turn?: { authorityTurnId: string; turnKey: string }
@@ -29,10 +30,14 @@ export class Cc5NativeUsageObserver {
   }
   beginTurn(turn: { authorityTurnId: string; turnKey: string }): void {
     requireUsage(!this.failed && !this.finished && this.buffer.length === 0 &&
-      (!this.turn || this.terminalSeen) && /^[a-f0-9]{32}$/.test(turn.authorityTurnId) &&
+      (!this.turn || this.terminalSeen || this.interrupted) && /^[a-f0-9]{32}$/.test(turn.authorityTurnId) &&
       typeof turn.turnKey === 'string' && turn.turnKey.length > 0 && turn.turnKey.length <= 512)
     this.turn = Object.freeze({ ...turn })
     this.terminalSeen = false
+    this.interrupted = false
+  }
+  interruptTurn(): void {
+    this.interrupted = true
   }
   ingest(chunk: Buffer): Cc5NativeOutputFrame[] {
     requireUsage(!this.failed && !this.finished)
@@ -62,7 +67,7 @@ export class Cc5NativeUsageObserver {
     if (!text.trim()) return { bytes }
     const row = JSON.parse(text)
     requireUsage(row && typeof row === 'object' && !Array.isArray(row))
-    requireUsage(!this.terminalSeen || row.type === 'rate_limit_event')
+    requireUsage(!this.terminalSeen || this.interrupted || row.type === 'rate_limit_event')
     if (row.session_id !== undefined) {
       requireUsage(typeof row.session_id === 'string' && UUID.test(row.session_id) &&
         (!this.nativeSessionId || this.nativeSessionId === row.session_id))
@@ -81,9 +86,16 @@ export class Cc5NativeUsageObserver {
       }
     }
     if (row.type !== 'result') return { bytes }
+    if (this.interrupted) {
+      this.terminalSeen = true
+      this.interrupted = false
+      return { bytes }
+    }
     requireUsage((this.turn || this.options.legacySingleTurn) && !this.terminalSeen && this.nativeSessionId && row.session_id === this.nativeSessionId &&
       this.upstreamModel === CC5_NATIVE_UPSTREAM_MODEL && typeof row.is_error === 'boolean' &&
-      (row.is_error ? row.subtype === 'error_during_execution' : row.subtype === 'success') &&
+      (row.is_error
+        ? (row.subtype === 'error_during_execution' || row.subtype === 'interrupted' || row.subtype === 'aborted_streaming')
+        : (row.subtype === 'success' || row.subtype === 'interrupted' || row.subtype === 'aborted_streaming')) &&
       row.usage && typeof row.usage === 'object' && !Array.isArray(row.usage))
     const keys = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'] as const
     for (const key of keys) requireUsage(Number.isSafeInteger(row.usage[key]) && row.usage[key] >= 0)

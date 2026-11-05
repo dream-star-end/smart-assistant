@@ -12,7 +12,9 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -30,7 +32,11 @@ import {
   parseCc5ExecutionBackend,
 } from '@openclaude/protocol'
 import type { Cc5FinanceFactory, Cc5FinancePort } from './cc5Finance.js'
-import type { Cc5BridgeBinding } from './cc5BridgePort.js'
+import {
+  CC5_BINDING_SLIDING_TTL_MS,
+  type Cc5BridgeBinding,
+  assertCc5BindingScope,
+} from './cc5BridgePort.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from './cc5Relay.js'
 import { Cc5SshHost, type Cc5SshHostConfig } from './cc5SshHost.js'
 
@@ -64,6 +70,28 @@ function writePrivate(path: string, value: unknown, groupReadable = false): void
     closeSync(fd)
   }
   syncDirectory(dirname(path))
+}
+function overwriteProtectedBinding(mountSource: string, binding: Readonly<Cc5BridgeBinding>): void {
+  const tmpPath = join(mountSource, 'binding.json.tmp')
+  const finalPath = join(mountSource, 'binding.json')
+  try {
+    rmSync(tmpPath, { force: true })
+  } catch {}
+  const fd = openSync(
+    tmpPath,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o640,
+  )
+  try {
+    fchownSync(fd, 0, 1000)
+    fchmodSync(fd, 0o640)
+    writeFileSync(fd, JSON.stringify(binding))
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  renameSync(tmpPath, finalPath)
+  syncDirectory(mountSource)
 }
 export interface Cc5PreparedContainer {
   readonly mountSource: string
@@ -161,6 +189,58 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
           (childSt.mode & 0o777) === 0o700 &&
           !existsSync(join(childPath, 'UNKNOWN.json')),
       )
+      const mountSource = join(childPath, 'view')
+      const bindingPath = join(mountSource, 'binding.json')
+      const authorityPath = join(mountSource, 'authority-public.json')
+      if (
+        existsSync(join(childPath, 'prepared.json')) &&
+        existsSync(join(childPath, 'activated.json')) &&
+        !existsSync(join(childPath, 'released.json')) &&
+        existsSync(bindingPath) &&
+        existsSync(authorityPath)
+      ) {
+        try {
+          const binding = Object.freeze(
+            JSON.parse(readFileSync(bindingPath, 'utf8')) as Cc5BridgeBinding,
+          )
+          assertCc5BindingScope(binding)
+          const pub = JSON.parse(readFileSync(authorityPath, 'utf8')) as {
+            version?: number
+            keyring?: string
+          }
+          if (
+            pub?.version === 1 &&
+            typeof pub.keyring === 'string' &&
+            binding.uid === this.testUid &&
+            binding.sessionKey === options.scope.sessionKey &&
+            binding.canonicalModel === options.scope.canonicalModel &&
+            binding.operationId === options.profile.operationId &&
+            binding.runId === options.profile.runId &&
+            binding.expiresAt > Date.now()
+          ) {
+            const keyring = parseAuthorityKeyring(pub.keyring)
+            const finance = this.financeFactory(binding)
+            if (keyring.size > 0 && finance) {
+              const handle = Object.freeze({ mountSource, containerDbId: binding.containerDbId })
+              const recovered: RecordState = {
+                handle,
+                root: childPath,
+                keyring,
+                runId: binding.runId,
+                operationId: binding.operationId,
+                capability: binding.capability,
+                binding,
+                finance,
+                state: 'active',
+              }
+              this.records.set(binding.containerDbId, recovered)
+              this.handles.set(handle, recovered)
+            }
+          }
+        } catch {
+          // Unrecoverable stale directory remains ignored unless UNKNOWN.json is present.
+        }
+      }
     }
     syncDirectory(dirname(options.baseRoot))
   }
@@ -251,7 +331,7 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
       dockerId,
       operationId: record.operationId,
       capability: record.capability,
-      expiresAt: Date.now() + 2 * 60 * 60 * 1000,
+      expiresAt: Date.now() + CC5_BINDING_SLIDING_TTL_MS,
     })
     record.finance = this.financeFactory(record.binding)
     requireRuntime(record.finance)
@@ -281,6 +361,16 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
         host,
         join(record.root, 'journal'),
         finance,
+        {
+          slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
+          onBindingExtended: (expiresAt: number) => {
+            if (!record.binding || record.state === 'released' || record.state === 'unknown') return
+            record.binding = Object.freeze({ ...record.binding, expiresAt })
+            try {
+              overwriteProtectedBinding(handle.mountSource, record.binding)
+            } catch {}
+          },
+        },
       )
       await this.listen(record.relay.toolServer, toolSocketPath, 0, 0)
       requireRuntime(record.state === 'activating' && !this.blocked)
