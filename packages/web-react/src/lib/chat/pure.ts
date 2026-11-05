@@ -397,6 +397,58 @@ export function isRecoveryTurnClientMessageId(value: unknown): value is string {
   return typeof value === "string" && value.startsWith("m-recover-");
 }
 
+/** Server-authored callback turns (`lsc-*` lease callbacks, `dlgcb-*` async
+ * delegate callbacks, `cron-origin-*` origin-session cron injections). */
+export function isSystemCallbackClientMessageId(value: unknown): value is string {
+  return typeof value === "string" && /^(?:lsc-|dlgcb-|cron-origin-)/.test(value);
+}
+
+export type SystemCallbackUserTurnLike = {
+  id?: string;
+  role?: string;
+  text?: string;
+  _systemCallback?: boolean;
+};
+
+/** Identify server-injected callback user turns (both live `_systemCallback`
+ * rows and historical persisted rows with deterministic callback IDs or
+ * `[系统通知 ·` headers). */
+export function isSystemCallbackUserTurn(
+  message: SystemCallbackUserTurnLike | null | undefined,
+): boolean {
+  if (!message || message.role !== "user") return false;
+  if (message._systemCallback === true) return true;
+  if (isSystemCallbackClientMessageId(message.id)) return true;
+  if (typeof message.text === "string" && /^\[系统通知\s*·/.test(message.text.trim())) {
+    return true;
+  }
+  return false;
+}
+
+/** Concise single-line explanation for a server-injected callback turn. */
+export function summarizeSystemCallbackUserTurn(
+  message: SystemCallbackUserTurnLike | null | undefined,
+): string {
+  const id = typeof message?.id === "string" ? message.id : "";
+  const text = typeof message?.text === "string" ? message.text.trim() : "";
+  if (id.startsWith("lsc-") || text.includes("自进化租约列车结果")) {
+    if (/终态:\s*committed\b/.test(text) || text.includes("已上线")) {
+      return "系统回调 · 发布列车已上线";
+    }
+    if (/终态:\s*failed\b/.test(text) || text.includes("未通过") || text.includes("失败")) {
+      return "系统回调 · 发布列车未通过，Agent 正在处理";
+    }
+    return "系统回调 · 发布列车状态已更新";
+  }
+  if (id.startsWith("dlgcb-") || text.includes("子任务已完成") || text.includes("后台子任务")) {
+    return "系统回调 · 后台子任务已返回结果";
+  }
+  if (id.startsWith("cron-origin-") || text.startsWith("⏰")) {
+    return "系统回调 · 定时任务已触发";
+  }
+  return "系统回调 · 系统通知已送达";
+}
+
 /** Walk newest-first to the last user utterance that is not a recovery control row. */
 export function lastRealUserTurn<T extends RecoveryControlUserTurn>(
   messages: readonly T[],

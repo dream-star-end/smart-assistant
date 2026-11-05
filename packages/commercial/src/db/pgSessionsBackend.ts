@@ -11961,6 +11961,7 @@ export function createPgSessionsBackend(
             isPartial: false,
             archivedCount,
             archivedThroughSeq,
+            ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
             ...(await readPermissionPromptsForSession(
               queryable,
               row.id,
@@ -12016,6 +12017,7 @@ export function createPgSessionsBackend(
         isPartial,
         archivedCount,
         archivedThroughSeq,
+        ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
         ...(await readPermissionPromptsForSession(
           queryable,
           row.id,

@@ -4477,3 +4477,34 @@ test("real MessageList keeps one Continue on a terminal error before trailing tr
   expect(onRegenerate).not.toHaveBeenCalled();
   expect(screen.getByText("已完成前半段")).toBeInTheDocument();
 });
+
+test("system callback user turn renders as centered gray single-line notice with click-to-expand details", () => {
+  const rawCallbackText = [
+    "[系统通知 · 自进化租约列车结果]",
+    "租约: ls-20261104T194918Z-7edb9cb07a72",
+    "终态: failed",
+    "期望 SHA: 702f5ca064b76bd37a01dae8ff9cbfac3437c3b8",
+  ].join("\n");
+  const callbackMsg = mk("user", {
+    id: "lsc-eaf9a356aaec2f3a56552236",
+    text: rawCallbackText,
+    status: "sent",
+  });
+  render(
+    <MessageList
+      messages={[callbackMsg]}
+      sending={true}
+      cb={{ onQuote: vi.fn(), onEditResend: vi.fn() }}
+      onRespondPermission={() => {}}
+    />,
+  );
+  expect(screen.getByTestId("system-callback-row")).toBeInTheDocument();
+  expect(screen.queryByTestId("user-row")).not.toBeInTheDocument();
+  expect(screen.getByText("系统回调 · 发布列车未通过，Agent 正在处理")).toBeInTheDocument();
+  expect(screen.queryByText(/ls-20261104T194918Z-7edb9cb07a72/)).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "引用" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "编辑" })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByTestId("system-callback-summary"));
+  expect(screen.getByText(/ls-20261104T194918Z-7edb9cb07a72/)).toBeInTheDocument();
+});

@@ -35,8 +35,10 @@ import {
   formatDurationSeconds,
   insufficientCreditsCopy,
   isSilentTurnErrorCode,
+  isSystemCallbackUserTurn,
   problemCardPresentation,
   speechLangFor,
+  summarizeSystemCallbackUserTurn,
 } from "../../lib/chat/pure";
 import { BRAND } from "../../lib/brand";
 import { STATUS } from "../../lib/ui/statusTone";
@@ -688,6 +690,39 @@ function ReplyQuoteBlock({
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
 // 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
+function SystemCallbackNoticeCard({ msg }: { msg: ChatMessage }) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = summarizeSystemCallbackUserTurn(msg);
+  return (
+    <div
+      className="flex min-w-0 flex-col items-center py-2 animate-in"
+      data-testid="system-callback-row"
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((prev) => !prev)}
+        aria-expanded={expanded}
+        className="inline-flex max-w-full items-center gap-1 rounded-full px-3 py-1 text-[12px] leading-snug text-faint transition-colors hover:bg-hover hover:text-muted"
+        data-testid="system-callback-summary"
+      >
+        <span className="truncate">{summary}</span>
+        <ChevronRight
+          size={12}
+          className={cn("shrink-0 transition-transform", expanded && "rotate-90")}
+        />
+      </button>
+      {expanded && msg.text && (
+        <div
+          className="mt-1.5 min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-2 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] [overflow-wrap:anywhere]"
+          data-testid="message-text"
+        >
+          {msg.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function UserCard({
   msg,
   cb,
@@ -704,6 +739,9 @@ export function UserCard({
   /** 这一轮还在进行,且这条消息下面还没有任何内容。只有这时 sent 才显示「已送达」。 */
   awaitingReply?: boolean;
 }) {
+  if (isSystemCallbackUserTurn(msg)) {
+    return <SystemCallbackNoticeCard msg={msg} />;
+  }
   const status = msg.status;
   // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
   // 用户自己停止的待发消息保留中性说明，通过当前来源门继续。

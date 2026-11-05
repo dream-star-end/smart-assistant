@@ -132,6 +132,7 @@ import {
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
   isRecoveryControlUserTurn,
+  isSystemCallbackClientMessageId,
   problemCardPresentation,
   friendlyBridgeErrorMessage,
   safeBridgeErrorDetail,
@@ -1570,7 +1571,8 @@ export class ChatSocket {
     const pending = this.offlineQueue.find(
       (item) => item.sessId === sessId && item.msgId === clientMessageId,
     );
-    const ownsTurn = sess._activeClientMessageId === clientMessageId || pending !== undefined;
+    const systemCallback = !sess._sendingInFlight && isSystemCallbackClientMessageId(clientMessageId);
+    const ownsTurn = sess._activeClientMessageId === clientMessageId || pending !== undefined || systemCallback;
     if (!ownsTurn) return false;
     // Stop keeps the exact correlation id in memory while waiting for terminal
     // authority. A late admission ACK must not revive sending or remove the
@@ -2269,6 +2271,8 @@ export class ChatSocket {
             this.adoptMasterAutomaticRecovery(frame.peer.id, frame.clientMessageId, frame.recovery);
             const sess = this.sessions.get(frame.peer.id);
             if (sess) rememberRetryStatus(sess, { ...frame.recovery, clientMessageId: frame.clientMessageId }, frame.retryStatus);
+          } else if (frame.cronOrigin) {
+            this.adoptCronOriginTurn(frame.peer.id, frame.clientMessageId, frame.cronOrigin);
           }
           this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId, frame.accepted === true);
         }
@@ -2475,6 +2479,47 @@ export class ChatSocket {
       retryAt: Date.now(),
     };
     sess._lastRouting = { ...routing };
+    this.clearTransientNotice(sessId);
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
+  private adoptCronOriginTurn(
+    sessId: string,
+    clientMessageId: string,
+    cronOrigin: NonNullable<AckWire["cronOrigin"]>,
+  ): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    const ts = typeof cronOrigin.ts === "number" && Number.isFinite(cronOrigin.ts)
+      ? cronOrigin.ts
+      : Date.now();
+    const routing: ChatRoutingSnapshot = {
+      ...(sess._lastRouting ?? {}),
+      ...(cronOrigin.model ? { model: cronOrigin.model } : {}),
+    };
+    delete routing.modelSwitchId;
+    const existing = sess.messages.find(
+      (message) => message.role === "user" && message.id === clientMessageId,
+    );
+    if (!existing) {
+      addMessage(sess, "user", cronOrigin.text, {
+        id: clientMessageId,
+        status: "sent",
+        ts,
+        _source: "server",
+        _systemCallback: true,
+        _routing: routing,
+      });
+    } else {
+      existing._systemCallback = true;
+      if (existing.status !== "sent") existing.status = "sent";
+    }
+    if (!sess._sendingInFlight || sess._activeClientMessageId !== clientMessageId) {
+      this.beginTurn(sess, clientMessageId, cronOrigin.agentId, ts);
+    }
+    this.dispatchSlots.set(sessId, clientMessageId);
+    this.subscribeSession(sessId);
     this.clearTransientNotice(sessId);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
@@ -4131,6 +4176,11 @@ export class ChatSocket {
     if (openDispatch?.clientMessageId && !s._sendingInFlight) {
       s._sendingInFlight = true;
       s._activeClientMessageId = openDispatch.clientMessageId;
+      s._activeAgentId = s._activeAgentId || s.agentId;
+      if (!s._turnStartedAt) {
+        const userRow = msgs.find((m) => m.role === "user" && m.id === openDispatch.clientMessageId);
+        s._turnStartedAt = typeof userRow?.ts === "number" && Number.isFinite(userRow.ts) ? userRow.ts : Date.now();
+      }
     }
     // 终态收敛:先从载荷推导「已收尾 turn → 终态类别」。verified failure status、
     // 持久化 error 卡、真 tape 生成行都在此被识别,合并后 convergeTerminalTurns 显式清发送态 +
@@ -4300,7 +4350,7 @@ export class ChatSocket {
     if (this.masterOwnsAutomaticRecovery) this.adoptPendingAutomaticRecoveryFromHistory(s);
     // A session loaded after this socket's hello subscribes now; its snapshot
     // (and the server's cursor arbitration for a stale idle cursor) follows.
-    if (full) this.subscribeSession(sessId);
+    this.subscribeSession(sessId);
   }
 
   applyPermissionPromptSnapshot(

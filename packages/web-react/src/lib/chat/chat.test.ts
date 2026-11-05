@@ -11498,4 +11498,52 @@ describe("OCV5-427 resume replay catch-up", () => {
     vi.unstubAllGlobals();
   });
 
+  test("server-injected callback turn (lsc-*) adopts in-flight state on outbound.ack and renders live stream", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const s = sock.sessions.get("s1")!;
+    expect(s._sendingInFlight).toBeFalsy();
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        admitted: true,
+        accepted: true,
+        peer: { id: "s1", kind: "dm" },
+        clientMessageId: "lsc-eaf9a356aaec2f3a56552236",
+        cronOrigin: {
+          text: "[系统通知 · 自进化租约列车结果]\n终态: failed",
+          ts: 1793821656967,
+          agentId: "main",
+          model: "gemini-3.1-pro-agy",
+        },
+      }),
+    });
+
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._activeClientMessageId).toBe("lsc-eaf9a356aaec2f3a56552236");
+    expect(s._turnStartedAt).toBe(1793821656967);
+    const callbackRow = s.messages.find((m) => m.id === "lsc-eaf9a356aaec2f3a56552236");
+    expect(callbackRow?.role).toBe("user");
+    expect(callbackRow?._systemCallback).toBe(true);
+    expect(callbackRow?.status).toBe("sent");
+
+    ws.onmessage?.({
+      data: JSON.stringify(msgFrame({
+        frameSeq: 1,
+        clientMessageId: "lsc-eaf9a356aaec2f3a56552236",
+        blocks: [{ kind: "text", text: "正在排查列车失败原因…", messageId: "srv-s1-main-t3-s0" }],
+      })),
+    });
+    const reply = s.messages.find((m) => m.role === "assistant" && m._clientMessageId === "lsc-eaf9a356aaec2f3a56552236");
+    expect(reply?.text).toBe("正在排查列车失败原因…");
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
 });

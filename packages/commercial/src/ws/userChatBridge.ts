@@ -1596,9 +1596,10 @@ export async function executeCronOriginInject(opts: {
    * closure. `executor` remains as a focused-test convenience. */
   getExecutors?: () => Iterable<CronOriginExecutor>
   executor?: CronOriginExecutor
+  broadcast?: (frame: unknown) => void
   log?: Logger
 }): Promise<CronOriginInjectResult> {
-  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, log, modelSwitchCost } = opts;
+  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, broadcast, log, modelSwitchCost } = opts;
   if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
     return { kind: "failed", reason: "invalid_payload" };
   }
@@ -1630,8 +1631,10 @@ export async function executeCronOriginInject(opts: {
   const message = {
     id: input.clientMessageId,
     role: "user" as const,
+    status: "sent" as const,
     text: input.text,
     ts: Date.now(),
+    _systemCallback: true as const,
     _routing: {
       teamMode: false,
       effortLevel: null as string | null,
@@ -1751,7 +1754,22 @@ export async function executeCronOriginInject(opts: {
       });
       return { kind: "failed", reason: "delivery_unknown" };
     }
-    if (claim.kind === "claimed") return { kind: "injected" };
+    if (claim.kind === "claimed") {
+      broadcast?.({
+        type: "outbound.ack",
+        admitted: true,
+        accepted: true,
+        peer: { id: input.sessionId, kind: "dm" },
+        clientMessageId: input.clientMessageId,
+        cronOrigin: {
+          text: input.text,
+          ts: message.ts,
+          agentId: d.agentId,
+          ...(originModel ? { model: originModel } : {}),
+        },
+      });
+      return { kind: "injected" };
+    }
     if (claim.kind === "rejected") {
       return { kind: "failed", reason: "dispatch_rejected" };
     }
@@ -5506,6 +5524,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ) {
             inboundTurnIdentityForFrame = inboundTurnIdentityFromParsed(parsed);
             inboundPeerIdForFrame = inboundTurnIdentityForFrame.peerId;
+            if (inboundPeerIdForFrame) {
+              registerUserWsSession(userWs, uid.toString(), inboundPeerIdForFrame);
+            }
             const frameModelRaw = (parsed as { model?: unknown }).model;
             const frameModelId = typeof frameModelRaw === "string" ? frameModelRaw : null;
             const frameAgentIdRaw = (parsed as { agentId?: unknown }).agentId;
@@ -10267,6 +10288,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // Resolve after admission so a bridge removed while PG was awaited is
       // never retained as a stale executor closure.
       getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString())),
+      broadcast: (frame) => { broadcastToUser(input.uid, frame); },
       log,
     });
   }

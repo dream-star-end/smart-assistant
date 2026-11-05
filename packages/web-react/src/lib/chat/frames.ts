@@ -309,6 +309,15 @@ export type AckWire = {
     model?: string;
     displayText?: string;
   };
+  /** Server-injected callback turn (lease callback / async delegate callback /
+   * origin-session cron). Broadcast to every tab of the uid on acceptance so
+   * the active session adopts the turn and mounts TurnActivity immediately. */
+  cronOrigin?: {
+    text: string;
+    ts?: number;
+    agentId?: string;
+    model?: string;
+  };
 };
 
 /** master 把恢复子轮交给容器后广播「正在重试」(#1206)。按 rootClientMessageId 归并。 */

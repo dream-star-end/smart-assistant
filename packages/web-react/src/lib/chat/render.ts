@@ -398,6 +398,7 @@ export function messageSignature(
         m._userPayloadDeferred ? 1 : 0,
         m._userPayloadId ?? "",
         m._payloadSha256 ?? "",
+        m._systemCallback ? 1 : 0,
       ].join("|");
     case "thinking":
       return [head, textSig(m.text)].join("|");
