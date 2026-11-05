@@ -16,6 +16,7 @@ import { parseBoxBillingContext } from "./boxBillingContext.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import type { ProxyBody } from "./shared.js";
 import { claimToolRollover, BoxToolRolloverRequired } from "./boxToolRollover.js";
+import { resumingParentWithUnsentChildSql, unsentResumeChildClaimSql } from "./boxOrphanRecovery.js";
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export interface BoxToolResumeInput { requestId: string; uid: bigint; canonicalModel: string;
   canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection; prepared?: PreparedContinuation }
@@ -64,18 +65,39 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
       await lock(client, [`box:fingerprint:${fingerprint.replayFingerprint}`,
         `box:session:${input.uid}:${fingerprint.sessionId}`]);
       const duplicate = await client.query(
-        `SELECT 1 FROM request_finalize_journal
-          WHERE ctx->>'boxReplayFingerprint'=$1
-             OR ctx->>'boxFallbackAlias'=$2 LIMIT 1`,
-        [fingerprint.replayFingerprint, fallbackAlias]);
+        `SELECT 1 FROM request_finalize_journal dup
+          WHERE (dup.ctx->>'boxReplayFingerprint'=$1
+             OR dup.ctx->>'boxFallbackAlias'=$2)
+            AND NOT (dup.state='aborted' AND NOT (dup.ctx ? 'boxReplayMessage')
+              AND COALESCE(dup.ctx->>'boxState','') IN ('failed_stopped','prestart_stopped'))
+            AND NOT (${unsentResumeChildClaimSql("dup")}
+              AND EXISTS (SELECT 1 FROM request_finalize_journal handoff_row
+                WHERE handoff_row.request_id=dup.ctx->>'boxOwnerRequestId'
+                  AND handoff_row.user_id=dup.user_id
+                  AND handoff_row.user_id=$3
+                  AND handoff_row.ctx->>'boxSessionId'=$4
+                  AND handoff_row.ctx->>'boxTurnKey'=$5
+                  AND handoff_row.ctx->>'boxState'='resuming'
+                  AND handoff_row.ctx->>'boxResumeRequestId'=dup.request_id
+                  AND handoff_row.ctx->>'boxResumeRevision'=dup.ctx->>'boxParentResumeRevision'
+                  AND NOT (handoff_row.ctx ? 'boxCancelIntent')
+                  AND NOT (handoff_row.ctx ? 'boxRecoveredBy')
+                  AND handoff_row.state IN ('inflight','finalizing','committed')))
+          LIMIT 1`,
+        [fingerprint.replayFingerprint, fallbackAlias, input.uid.toString(),
+          fingerprint.sessionId, fingerprint.turnKey]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
       if (resumeLookupBarrier) await resumeLookupBarrier();
       const owners = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
-        `SELECT request_id,ctx FROM request_finalize_journal
-          WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
-            AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
-            AND NOT (ctx ? 'boxRecoveredBy')
-            AND state IN ('inflight','finalizing','committed') FOR UPDATE`,
+        `SELECT handoff_row.request_id,handoff_row.ctx
+          FROM request_finalize_journal handoff_row
+          WHERE handoff_row.user_id=$1 AND handoff_row.ctx->>'boxSessionId'=$2
+            AND handoff_row.ctx->>'boxTurnKey'=$3
+            AND (handoff_row.ctx->>'boxState'='handoff'
+              OR ${resumingParentWithUnsentChildSql("handoff_row", unsentResumeChildClaimSql("resume_child"))})
+            AND NOT (handoff_row.ctx ? 'boxCancelIntent')
+            AND NOT (handoff_row.ctx ? 'boxRecoveredBy')
+            AND handoff_row.state IN ('inflight','finalizing','committed') FOR UPDATE`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey]);
       if (owners.rows.length !== 1) {
         const consumed = await client.query(
@@ -200,6 +222,52 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
         || childCtx.boxInvocationRecovery !== "v1"
         || !parseBillingPricing(childCtx.billingPricing,input.canonicalModel)) {
         throw new BoxDurableJournalError("BOX_TOOL_RESUME_JOURNAL_INVALID");
+      }
+      if (ctx.boxState === "resuming") {
+        const unsentChildId = ctx.boxResumeRequestId;
+        const unsentRevision = ctx.boxResumeRevision;
+        if (typeof unsentChildId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(unsentChildId)
+          || unsentChildId === input.requestId
+          || typeof unsentRevision !== "string" || !UUID_V4.test(unsentRevision)) {
+          throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
+        }
+        const retiredChild = await client.query(
+          `UPDATE request_finalize_journal resume_child
+              SET state='aborted',
+                  failure_code=COALESCE(failure_code,'UPSTREAM_UNAVAILABLE'),
+                  final_credits=0,
+                  error_msg=COALESCE(NULLIF(error_msg,''),'box_resume_unsent_superseded'),
+                  ctx=(resume_child.ctx
+                    - ARRAY['boxOwnerRequestId','boxInvocationMode','boxAccountId','boxRunNonce',
+                      'boxLeaseEpoch','boxResumeSpoolOffset','boxRoundNo','boxPriorMessageIds',
+                      'boxDetachedRunnerHash','boxCatalogHash','boxReplayFingerprint',
+                      'boxFallbackAlias','boxReplayRequired','boxRequestHash','boxContextHash',
+                      'boxImageIdentity','boxParentResumeRevision','boxUnknownPhase',
+                      'boxNativeSessionId','boxNativeCliCwd','boxNativeCliVersion',
+                      'boxNativePromptLayout']::text[])
+                    || jsonb_build_object('boxState','prestart_stopped','boxUnsentSupersededBy',$5::text),
+                  updated_at=NOW()
+            WHERE resume_child.request_id=$1 AND resume_child.user_id=$2
+              AND resume_child.ctx->>'boxOwnerRequestId'=$3
+              AND resume_child.ctx->>'boxParentResumeRevision'=$4
+              AND ${unsentResumeChildClaimSql("resume_child")}`,
+          [unsentChildId, input.uid.toString(), owner.request_id, unsentRevision, input.requestId]);
+        if (retiredChild.rowCount !== 1) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
+        const reclaimedOwner = await client.query(
+          `UPDATE request_finalize_journal
+              SET ctx=(ctx - ARRAY['boxResumeRequestId','boxResumeRevision','boxResumeResultHashes']::text[])
+                || '{"boxState":"handoff"}'::jsonb,
+                  updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2
+              AND ctx->>'boxState'='resuming' AND NOT (ctx ? 'boxCancelIntent')
+              AND NOT (ctx ? 'boxRecoveredBy')
+              AND state IN ('inflight','finalizing','committed')
+              AND ctx->>'boxHandoffRevision'=$3
+              AND ctx->>'boxResumeRequestId'=$4
+              AND ctx->>'boxResumeRevision'=$5`,
+          [owner.request_id, input.uid.toString(), ctx.boxHandoffRevision,
+            unsentChildId, unsentRevision]);
+        if (reclaimedOwner.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_RESUME_FENCE_LOST");
       }
       const resultHashes = results.map((result) => ({
         modelToolUseId: result.modelToolUseId, contentHash: result.contentHash,

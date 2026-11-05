@@ -603,7 +603,7 @@ const ERROR_LABELS: Record<string, string> = {
   auth_error: "认证状态异常",
   antigravity_start_observation_failed: "执行进度同步失败",
   platform_credential_expired: "平台临时凭证已过期",
-  box_capacity_held: "上一轮仍在收尾",
+  box_capacity_held: "前一步仍在收尾",
   service_restart: "服务重启，本轮已中断",
   session_persist_unavailable: "消息暂未安全送达",
   session_deleted: "会话已删除",

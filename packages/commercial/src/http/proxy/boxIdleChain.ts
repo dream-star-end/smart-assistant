@@ -361,6 +361,22 @@ function cancelledRolloverExtra(row: IdleChainRow, byId: Map<string,IdleChainRow
  * One complete chain keeps the original terminal result. Several independent
  * complete chains are a ready set, not a summary.
  */
+function isSupersededUnsentResume(
+  row: IdleChainRow,
+  byId: ReadonlyMap<string, IdleChainRow>,
+): boolean {
+  const by = row.ctx.boxUnsentSupersededBy;
+  return row.state === "aborted"
+    && (row.finalCredits == null || row.finalCredits === "0")
+    && row.ctx.boxState === "prestart_stopped"
+    && !Object.hasOwn(row.ctx, "boxLaunchPermit")
+    && row.ctx.boxOwnerRequestId === undefined
+    && row.ctx.boxResumeRequestId === undefined
+    && row.ctx.boxRunNonce === undefined
+    && typeof by === "string" && by.length > 0 && by !== row.requestId
+    && byId.get(by)?.ctx.model === row.ctx.model;
+}
+
 export function projectBoxIdleChain(input: {
   sessionId: string;
   turnKey: string;
@@ -369,13 +385,16 @@ export function projectBoxIdleChain(input: {
   /** Text already checked against the capsule file hash by the replay reader. */
   verifiedSummaryText?: string;
 }): BoxIdleProof {
-  const scoped = input.rows.filter((row) => row.ctx.boxSessionId === input.sessionId
+  const rawScoped = input.rows.filter((row) => row.ctx.boxSessionId === input.sessionId
     && row.ctx.boxTurnKey === input.turnKey
     && isBoxApiModel(row.ctx.model)
     && row.ctx.boxInvocationRecovery === "v1");
-  if (scoped.length === 0) return { status: "not_found" };
+  if (rawScoped.length === 0) return { status: "not_found" };
+  const rawById = new Map(rawScoped.map((row) => [row.requestId, row]));
+  if (rawById.size !== rawScoped.length) return { status: "pending", reason: "fork" };
+  const scoped = rawScoped.filter((row) => !isSupersededUnsentResume(row, rawById));
+  if (scoped.length === 0) return { status: "pending", reason: "cycle" };
   const byId = new Map(scoped.map((row) => [row.requestId, row]));
-  if (byId.size !== scoped.length) return { status: "pending", reason: "fork" };
   if (scoped.length > BOX_TOOL_MAX_ROUNDS && (scoped.length !== BOX_TOOL_MAX_ROUNDS + 1
     || scoped.filter((row) => cancelledRolloverExtra(row,byId)).length !== 1)) {
     return { status: "pending", reason: "cycle" };

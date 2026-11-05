@@ -651,6 +651,15 @@ describe("引擎/路由内部码不外露(t1049u)", () => {
     }
   });
 
+  test("box_capacity_held 面向用户的标题与说明兼容中途工具调用后中断，不宣称尚未开始", () => {
+    const p = errorPresentation("box_capacity_held", "先读取了仓库配置。", "BOX_CAPACITY_HELD");
+    expect(p.title).toBe("前一步仍在收尾");
+    expect(p.bodyText).toBe("先读取了仓库配置。");
+    expect(p.message).toContain("已有进度已保留");
+    expect(p.message).not.toMatch(/尚未开始|未开始处理/);
+    expect(friendlyBridgeErrorMessage("box_capacity_held")).not.toMatch(/尚未开始|未开始处理/);
+  });
+
   test("多行合法部分回答提到环境变量名 → 仍作 bodyText 保留", () => {
     const answer = "先设置 OPENAI_API_KEY:\n然后重启服务。";
     const p = errorPresentation("engine_error", answer, "CURSOR_SAND_DOWNSTREAM_CLOSED");

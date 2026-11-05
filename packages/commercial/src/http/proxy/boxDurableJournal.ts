@@ -20,7 +20,9 @@ import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, validExpiredCh
   type BoxIdleProof, type IdleChainRow } from "./boxIdleChain.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
-import { orphanRecoveryHolderIsStale } from "./boxOrphanRecovery.js";
+import { orphanRecoveryHolderIsStale, resumingParentWithUnsentChildSql,
+  sameTurnOrphanStoppedProofValid, stoppedUnsentChildCtxSql, supersededUnsentResumeSql,
+  unsentChildStopInflightSql, unsentResumeChildClaimSql } from "./boxOrphanRecovery.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
   deriveBoxFallbackAlias } from "./boxCallFingerprint.js";
@@ -522,11 +524,16 @@ export class BoxDurableJournal implements BoxJournalPort {
     | { kind: "waiting"; identity: { requestId: string; uid: bigint; accountId: bigint;
       runNonce: string; leaseEpoch: string } }> {
     const want = [...input.toolIds].sort().join(",");
-    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
-      `SELECT request_id, ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
-          AND ctx->>'boxState'='handoff'
-          AND state IN ('inflight','finalizing','committed')`,
+    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown>;
+      unsent_stop_inflight: boolean }>(
+      `SELECT handoff_row.request_id, handoff_row.ctx,
+          ${unsentChildStopInflightSql("handoff_row")} AS unsent_stop_inflight
+        FROM request_finalize_journal handoff_row
+        WHERE handoff_row.user_id=$1 AND handoff_row.ctx->>'boxSessionId'=$2
+          AND handoff_row.ctx->>'boxTurnKey'=$3
+          AND (handoff_row.ctx->>'boxState'='handoff'
+            OR ${resumingParentWithUnsentChildSql("handoff_row")})
+          AND handoff_row.state IN ('inflight','finalizing','committed')`,
       [input.uid.toString(), input.sessionId, input.turnKey]);
     const matches = rows.rows.filter((row) => {
       const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
@@ -536,6 +543,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (matches.length !== 1) return { kind: "live" };
     const row = matches[0]!, ctx = row.ctx;
     if (parseBoxStoredToolHandoff(ctx.boxToolHandoff) === null
+      || row.unsent_stop_inflight === true
       || ctx.boxCancelIntent !== undefined || ctx.boxRecoveredBy !== undefined
       || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
       || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
@@ -563,12 +571,18 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.toolIds.length < 1 || input.toolIds.length > 32
       || input.toolIds.some((id) => !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))) return { kind: "none" };
     const want = [...input.toolIds].sort().join(",");
-    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
-      `SELECT request_id, ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
-          AND ctx->>'boxState' IN ('handoff','failed_stopped')
-          AND (ctx->>'boxTurnKey' IS DISTINCT FROM $3 OR ctx->>'boxState'='failed_stopped')
-          AND state IN ('inflight','finalizing','committed','aborted')`,
+    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown>;
+      unsent_stop_inflight: boolean; stopped_unsent_child_ctx: Record<string, unknown> | null }>(
+      `SELECT handoff_row.request_id, handoff_row.ctx,
+          ${unsentChildStopInflightSql("handoff_row")} AS unsent_stop_inflight,
+          ${stoppedUnsentChildCtxSql("handoff_row")} AS stopped_unsent_child_ctx
+        FROM request_finalize_journal handoff_row
+        WHERE handoff_row.user_id=$1 AND handoff_row.ctx->>'boxSessionId'=$2
+          AND (handoff_row.ctx->>'boxState' IN ('handoff','failed_stopped')
+            OR ${resumingParentWithUnsentChildSql("handoff_row")})
+          AND (handoff_row.ctx->>'boxTurnKey' IS DISTINCT FROM $3
+            OR handoff_row.ctx->>'boxState'='failed_stopped')
+          AND handoff_row.state IN ('inflight','finalizing','committed','aborted')`,
       [input.uid.toString(), input.sessionId, input.turnKey]);
     const matches = rows.rows.filter((row) => {
       const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
@@ -583,15 +597,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     // supersedeWaiting stop) on this turn must not be resurrected by late tool
     // results. Only a remote worker failure/keeper stop already proven while
     // the container waited on the tool (e.g. AskUserQuestion) continues fresh.
-    if (sameTurn) {
-      if (!stopped || ctx.boxStopOutcome !== "failed" || ctx.boxResumeRequestId !== undefined
-        || ctx.boxCancelIntent !== undefined || typeof ctx.boxRunNonce !== "string"
-        || typeof ctx.boxLeaseEpoch !== "string") return { kind: "none" };
-      try {
-        const proof = parseBoxTerminalProof(`${JSON.stringify(ctx.boxTerminalProof)}\n`, {
-          runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
-        if (proof.reason !== "keeper_stopped" && proof.reason !== "worker_failed") return { kind: "none" };
-      } catch { return { kind: "none" }; }
+    if (sameTurn && !sameTurnOrphanStoppedProofValid(ctx, row.stopped_unsent_child_ctx)) {
+      return { kind: "none" };
     }
     // A failed recovery gives the exchange back only before admission or
     // after its admitted invocation is proven stopped without a successor.
@@ -608,7 +615,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       staleClaim = ctx.boxRecoveredBy;
     }
     // A Stop already in flight (cancel intent, not yet proven) is not ours.
-    if (!stopped && ctx.boxCancelIntent !== undefined) return { kind: "live" };
+    if (!stopped && (ctx.boxCancelIntent !== undefined || row.unsent_stop_inflight === true)) {
+      return { kind: "live" };
+    }
     const billing = parseBoxBillingContext(ctx.boxBillingContext);
     if (!billing?.dispatchId || typeof ctx.boxAccountId !== "string"
       || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -663,12 +672,16 @@ export class BoxDurableJournal implements BoxJournalPort {
         }
       }
       const changed = await client.query(
-        `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxRecoveredBy', $3::text),
-            updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxSessionId'=$4
-            AND (NOT (ctx ? 'boxRecoveredBy') OR ctx->>'boxRecoveredBy' = $5)
-            AND (ctx->>'boxState'='failed_stopped'
-              OR (ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')))`,
+        `UPDATE request_finalize_journal handoff_row
+            SET ctx = handoff_row.ctx || jsonb_build_object('boxRecoveredBy', $3::text),
+                updated_at=NOW()
+          WHERE handoff_row.request_id=$1 AND handoff_row.user_id=$2
+            AND handoff_row.ctx->>'boxSessionId'=$4
+            AND (NOT (handoff_row.ctx ? 'boxRecoveredBy') OR handoff_row.ctx->>'boxRecoveredBy' = $5)
+            AND (handoff_row.ctx->>'boxState'='failed_stopped'
+              OR ((handoff_row.ctx->>'boxState'='handoff'
+                OR ${resumingParentWithUnsentChildSql("handoff_row", unsentResumeChildClaimSql("resume_child"))})
+                AND NOT (handoff_row.ctx ? 'boxCancelIntent')))`,
         [input.requestId, input.uid.toString(), input.by, sessionId, input.replacing ?? null]);
       await client.query("COMMIT"); committed = true;
       return changed.rowCount === 1;
@@ -940,12 +953,13 @@ export class BoxDurableJournal implements BoxJournalPort {
       type Row = { request_id: string; ctx: Record<string, unknown> };
       const column = stream === false ? "boxFallbackAlias" : "boxReplayFingerprint";
       const found = await client.query<Row>(
-        `SELECT request_id,ctx FROM request_finalize_journal
+        `SELECT request_id,ctx FROM request_finalize_journal replay_row
           WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
             AND ctx->>'boxTurnKey'=$3 AND ctx->>'model'=$4
             AND ctx->>$5=$6
             AND NOT (state='aborted' AND NOT (ctx ? 'boxReplayMessage')
               AND COALESCE(ctx->>'boxState','') IN ('failed_stopped','prestart_stopped'))
+            AND NOT (${unsentResumeChildClaimSql("replay_row")})
           LIMIT 2`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
           input.canonicalModel, column, key]);
@@ -3106,7 +3120,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
             AND ctx->>'model' IN (${BOX_MODEL_IDS_SQL})
             AND ctx->>'boxInvocationRecovery'='v1'
-            AND NOT ${retiredToolRolloverSql("current_row")} LIMIT 129`,
+            AND NOT ${retiredToolRolloverSql("current_row")}
+            AND NOT ${supersededUnsentResumeSql("current_row")} LIMIT 129`,
         [input.uid.toString(), input.containerId.toString(), input.sessionId, input.turnKey]);
       const open = await client.query<{ request_id: string }>(
         `SELECT request_id FROM request_finalize_journal

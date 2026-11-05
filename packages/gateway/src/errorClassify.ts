@@ -97,7 +97,7 @@ const PATTERNS: Array<{
   {
     re: /\bBOX_CAPACITY_HELD\b/,
     code: 'box_capacity_held',
-    message: '上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。',
+    message: '当前会话在 Box 上的前一步执行仍在收尾，本轮暂时中断；已有进度已保留，请稍后继续。',
   },
   // OCV5-556: the Antigravity relay route of a turn lapsed (404
   // ANTIGRAVITY_ROUTE_EXPIRED), or the CLI ended "successfully" right after an

@@ -565,8 +565,23 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
     assert.equal(stillHandoff.rows[0]?.ctx.boxState, "handoff",
       "context mismatch must reject before claim and file publication");
+    await put(`box-d-unsent-${suffix}`);
+    await journal.claimToolResume({ requestId: `box-d-unsent-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody });
+    await journal.markUnknown({ requestId: `box-d-unsent-${suffix}`,
+      uid: 3n, leaseEpoch: toolCall.leaseEpoch, phase: "resume_publish_unsent" });
+    assert.equal(await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: resumeBody as ProxyBody }), null,
+      "an unsent resume child has nothing on the Box to observe and must not trap a retry in replay wait");
     const resumed = await journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody });
+    const retiredUnsent = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+      "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [`box-d-unsent-${suffix}`]);
+    assert.equal(retiredUnsent.rows[0]?.state, "aborted");
+    assert.equal(retiredUnsent.rows[0]?.ctx.boxState, "prestart_stopped");
+      assert.equal(retiredUnsent.rows[0]?.ctx.boxUnsentSupersededBy, `box-d-${suffix}`);
+    assert.equal(retiredUnsent.rows[0]?.ctx.boxOwnerRequestId, undefined);
+    assert.equal(retiredUnsent.rows[0]?.ctx.boxRunNonce, undefined);
     assert.equal(resumed.ownerRequestId, toolCall.requestId);
     assert.equal(resumed.accountId, 20n);
     assert.equal(resumed.spoolOffset, 1234);
