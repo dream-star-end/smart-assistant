@@ -513,7 +513,7 @@ export async function handleProjectSearch(args: {
   const offset = args.offset ?? 0
   try {
     const Database = (await import('better-sqlite3')).default
-    const db = new Database(paths.taskboardDb, { readonly: true, fileMustExist: true })
+    const db = new Database(paths.taskboardDb, { readonly: true, fileMustExist: true, timeout: 5000 })
     try {
       const ledger = new ProjectMemoryLedger(db)
       const dir = new ProjectMemoryDir(projectId)

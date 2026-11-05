@@ -212,6 +212,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // this aligned with sessionsMigrate.ts.
   db.pragma('busy_timeout = 10000')
   db.pragma('journal_mode = WAL')
+  db.pragma('synchronous = NORMAL')
   registerFtsCjkFunctions(db)
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions_meta (
@@ -5931,7 +5932,7 @@ async function _sqlitePatchServerAuthoredMessage(
 }
 
 async function _sqliteScanRecentClientSessionMessages(opts: UploadReferenceOptions, visit: (body: string) => void): Promise<boolean> {
-  const db = new Database(opts.sessionsDb ?? paths.sessionsDb, { readonly: true, fileMustExist: true })
+  const db = new Database(opts.sessionsDb ?? paths.sessionsDb, { readonly: true, fileMustExist: true, timeout: 5000 })
   try {
     const rows = db.prepare(`
       SELECT id AS sessionId, user_id AS userId,

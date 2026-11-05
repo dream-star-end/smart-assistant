@@ -205,8 +205,14 @@ export class DelegateDurableDb {
     this.db = new Database(dbPath)
     this.db.pragma('busy_timeout = 10000')
     this.db.pragma('journal_mode = WAL')
+    this.db.pragma('synchronous = NORMAL')
     this.db.pragma('foreign_keys = ON')
     this.migrate()
+    try {
+      this.db.pragma('wal_checkpoint(TRUNCATE)')
+    } catch {
+      /* non-fatal if another reader/writer holds WAL frames at startup */
+    }
     this.upsertStmt = this.db.prepare(`
       INSERT INTO delegate_jobs (
         job_id, agent_id, state, kind, session_key, parent_session_key, trace_id, parent_trace_id, generation,
