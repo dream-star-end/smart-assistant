@@ -349,15 +349,27 @@ class FailureDiagnostic:
             "context_length_exceeded": "context_limit", "invalid_request_error": "invalid_request",
             "ECONNRESET": "network", "ECONNREFUSED": "network", "ETIMEDOUT": "network",
             "ENOTFOUND": "network", "EAI_AGAIN": "network"}
-        def status(value):
-            if type(value) is int and value in statuses:
-                self.record["httpStatus"] = value
-                inferred = {401: "authentication", 403: "permission", 429: "rate_limit",
-                    413: "context_limit", 400: "invalid_request", 503: "overloaded"}
-                self.record["upstreamCode"] = inferred.get(value, "unknown")
+        inferred = {401: "authentication", 403: "permission", 429: "rate_limit",
+            413: "context_limit", 400: "invalid_request", 503: "overloaded"}
+        def http(value):
+            return (value, inferred.get(value, "unknown")) if type(value) is int and value in statuses else (None, "unknown")
+        def known(pair):
+            return pair[0] is not None or pair[1] != "unknown"
+        def prefix(text):
+            if not isinstance(text, str):
+                return (None, "unknown")
+            text = text[:4096].strip()
+            match = re.match(r"^(?:API Error: |HTTP Error: )(400|401|403|408|413|429|500|502|503|504)(?:\b|:)", text)
+            if match:
+                return http(int(match[1]))
+            for token, mapped in kinds.items():
+                if text == token or text.startswith(token + ":") or text.startswith("Error: " + token + ":"):
+                    return (None, mapped)
+            return (None, "unknown")
         text = line.decode("utf-8", errors="replace").strip()
         if not text:
             return
+        pair = (None, "unknown")
         if stream == "stdout" and text.startswith("{"):
             try:
                 value = json.loads(text)
@@ -365,31 +377,55 @@ class FailureDiagnostic:
                 self.record["lastEvent"] = kind if kind in (
                     "system", "assistant", "user", "result", "stream_event") else "other"
                 error = value.get("error")
-                if isinstance(error, dict):
-                    status(error.get("status"))
-                    if isinstance(error.get("type"), str) and error["type"] in kinds:
-                        self.record["upstreamCode"] = kinds[error["type"]]
-                status(value.get("status"))
-                # No arbitrary message/URL fields; CLI result prefix only.
-                if kind == "result" and value.get("is_error") is True:
-                    if isinstance(value.get("result"), str):
-                        text = value["result"][:4096].strip()
+                if kind == "error":
+                    pair = http(value.get("status"))
+                    if isinstance(error, dict):
+                        candidate = http(error.get("status"))
+                        if known(candidate):
+                            pair = candidate
+                        if isinstance(error.get("type"), str) and error["type"] in kinds:
+                            pair = (pair[0], kinds[error["type"]])
+                elif kind == "assistant":
+                    message = value.get("message")
+                    # Only the CLI's synthetic API error, never normal model/tool prose.
+                    tags = {"authentication_failed", "billing_error", "rate_limit",
+                            "invalid_request", "server_error", "unknown", "max_output_tokens"}
+                    if (not isinstance(message, dict) or message.get("model") != "<synthetic>"
+                            or not isinstance(error, str) or error not in tags):
+                        return
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        for block in content[:8]:
+                            candidate = prefix(block.get("text")) if isinstance(block, dict) and block.get("type") == "text" else (None, "unknown")
+                            if known(candidate):
+                                pair = candidate
+                                break
+                    tag = {"authentication_failed": "authentication", "rate_limit": "rate_limit",
+                           "invalid_request": "invalid_request"}.get(error)
+                    if tag:
+                        pair = (pair[0], tag)
+                elif kind == "result" and value.get("is_error") is True:
+                    pair = http(value.get("api_error_status"))
+                    if not known(pair):
+                        pair = prefix(value.get("result"))
                     errors = value.get("errors")
-                    if isinstance(errors, list):
-                        for error_text in errors[:8]:
-                            if isinstance(error_text, str):
-                                self.observe("stderr", error_text[:4096].encode("utf-8"))
+                    if not known(pair) and isinstance(errors, list):
+                        for item in errors[:8]:
+                            candidate = prefix(item)
+                            if known(candidate):
+                                pair = candidate
+                                break
+                else:
+                    return
             except (ValueError, AttributeError, TypeError, RecursionError):
                 self.record["flags"]["parseFailed"] = True
                 return
-        # Explicit prefixes only, not a keyword search in arbitrary prose.
-        match = re.match(r"^(?:API Error: |HTTP Error: )(400|401|403|408|413|429|500|502|503|504)(?:\b|:)", text)
-        if match:
-            status(int(match[1]))
-        for token, mapped in kinds.items():
-            if text == token or text.startswith(token + ":") or text.startswith("Error: " + token + ":"):
-                self.record["upstreamCode"] = mapped
-                break
+        else:
+            pair = prefix(text)
+        # Commit one whole observation. Never combine the first error's category
+        # with a later HTTP status; shutdown/proof fields remain independent.
+        if known(pair) and not known((self.record["httpStatus"], self.record["upstreamCode"])):
+            self.record["httpStatus"], self.record["upstreamCode"] = pair
 
     def finish(self, code, stage="setup", reason="internal_error", child_code=None):
         if not code or not self.enabled:

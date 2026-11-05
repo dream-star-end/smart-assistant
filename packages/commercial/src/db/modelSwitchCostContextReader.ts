@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Pool } from 'pg'
+import { readFailedStartSource } from './modelSwitchCostFailedStart.js'
 
 export interface SwitchContext {
   revision: number
@@ -124,7 +125,7 @@ export async function readSwitchContext(
     typeof sourceTape?.usage?.model === 'string'
       ? sourceTape.usage.model
       : (accepted?.model ?? null)
-  const sourceAgent = sourceTape?.agent_id ?? accepted?.agent_id ?? 'main'
+  let sourceAgent = sourceTape?.agent_id ?? accepted?.agent_id ?? 'main'
   // A newer primary root racing the roots query invalidates even a same-model
   // assertion; child/continuation models never replace the parent's model.
   if (
@@ -134,6 +135,22 @@ export async function readSwitchContext(
       !latest.continuation_of_turn_key)
   )
     sourceModel = null
+  // Nothing was executed: only then may a failed first attempt name its own
+  // route. The proof covers the whole session and never becomes a numeric
+  // context, so a real switch still quotes risk and an empty session is never
+  // claimed. An executed source keeps its priority over this fallback.
+  const failedStart =
+    !sourceTape && !accepted && root
+      ? await readFailedStartSource(pool, uid, sessionId, requestId, {
+          tapeId: root.tape_id,
+          clientMessageId: root.client_message_id,
+        })
+      : null
+  if (failedStart && failedStart.model === options.targetModel &&
+      (options.targetAgent === undefined || failedStart.agent === options.targetAgent)) {
+    sourceModel = failedStart.model
+    sourceAgent = failedStart.agent
+  }
 
   if (!root && !sourceModel) {
     if (!latest && !row.has_content && !row.archived) return { ...empty, revision }
@@ -184,6 +201,7 @@ export async function readSwitchContext(
       latest?.parent_turn_key,
       latest?.continuation_of_turn_key,
       accepted?.dispatch_id,
+      failedStart?.dispatchId,
       sourceModel,
     ]),
     outputs: ordinary

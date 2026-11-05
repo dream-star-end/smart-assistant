@@ -38,6 +38,7 @@ function db(
             },
           ],
         }
+      if (sql.includes('model-switch-failed-start')) return { rows: [] }
       if (sql.includes('model-switch-history-shape'))
         return { rows: [{ peak_tokens: '200460', has_unknown: false, has_shrunk: false }] }
       if (sql.includes('FROM client_session_turn_tapes')) return { rows: tapes }
@@ -192,4 +193,102 @@ test('same model only takes the fast path for the same agent routing', async () 
   )
   assert.equal(context.source, 'last-call')
   assert.equal(context.sourceAgent, 'main')
+})
+
+// A first turn that crashed at zero tokens is the one case where the session has
+// no executed source but the reader still sees a tape. The failed attempt may
+// name its own route; it must never become a numeric context or an empty session.
+const crashedFirstTurn = {
+  tape_id: '9',
+  tape_sha256: '9',
+  agent_id: 'main',
+  status: 'crashed',
+  usage: {
+    model: 'cheap',
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+  },
+  finalized_at: 'now',
+  created_at: '9',
+  client_message_id: 'msg-1',
+}
+const failedDb = (failedRows: unknown[]) =>
+  ({
+    query: async (sql: string) => {
+      if (sql.includes('model-switch-failed-start')) return { rows: failedRows }
+      if (sql.includes('FROM client_sessions cs'))
+        return {
+          rows: [
+            {
+              history_revision: '3',
+              timeline_generation: '1',
+              has_content: true,
+              deleted_at: null,
+              archived: false,
+            },
+          ],
+        }
+      if (sql.includes('FROM client_session_turn_tapes')) return { rows: [crashedFirstTurn] }
+      return { rows: [] }
+    },
+  }) as unknown as Pool
+const failedRow = {
+  dispatch_id: 'd-1',
+  tape_sha256: '9',
+  model: 'cheap',
+  agent_id: 'main',
+  messages: JSON.stringify([
+    { role: 'user', id: 'msg-1' },
+    { id: 'anchor', role: 'assistant', _source: 'server', _turnTapeId: '9', _turnTapeSha256: '9', _turnTapeComplete: true },
+    { role: 'user', id: 'req-next' },
+  ]),
+}
+
+test('a zero-token first-turn crash continues on the same model without a switch', async () => {
+  const ctx = await readSwitchContext(failedDb([failedRow]), '765', 'own', 'req-next', {
+    targetModel: 'cheap',
+    targetAgent: 'main',
+  })
+  assert.equal(ctx.source, 'unchanged')
+  assert.equal(ctx.sourceModel, 'cheap')
+  assert.equal(ctx.sourceAgent, 'main')
+  assert.equal(ctx.tokens, null)
+})
+
+test('the same failed first turn is still risk when the model really changes', async () => {
+  const ctx = await readSwitchContext(failedDb([failedRow]), '765', 'own', 'req-next', {
+    targetModel: 'expensive',
+    targetAgent: 'main',
+  })
+  assert.equal(ctx.source, 'unknown')
+  assert.equal(ctx.sourceModel, null)
+  assert.equal(ctx.tokens, null)
+})
+
+test('without the authoritative crashed dispatch the failed first turn stays undecided', async () => {
+  for (const rows of [[], [{ ...failedRow, dispatch_id: 'd-1', model: null }]]) {
+    const ctx = await readSwitchContext(failedDb(rows), '765', 'own', 'req-next', {
+      targetModel: 'cheap',
+      targetAgent: 'main',
+    })
+    assert.equal(ctx.source, 'unknown')
+    assert.equal(ctx.sourceModel, null)
+  }
+})
+
+test('a changed failed-attempt identity changes the fingerprint a quote was signed over', async () => {
+  const first = await readSwitchContext(failedDb([failedRow]), '765', 'own', 'req-next', {
+    targetModel: 'cheap',
+    targetAgent: 'main',
+  })
+  const second = await readSwitchContext(
+    failedDb([{ ...failedRow, dispatch_id: 'd-2' }]),
+    '765',
+    'own',
+    'req-next',
+    { targetModel: 'cheap', targetAgent: 'main' },
+  )
+  assert.notEqual(first.fingerprint, second.fingerprint)
 })

@@ -30,7 +30,7 @@ test("commercial unit gate executes the real Python supervisor diagnostic suite"
     });
     const count = /Ran ([0-9]+) tests/.exec(stderr);
     assert.ok(count, "Python suite must report an executed test count");
-    assert.ok(Number(count[1]) >= 17, "all failure/lifetime/privacy cases must execute");
+    assert.ok(Number(count[1]) >= 21, "all failure/lifetime/privacy cases must execute");
     assert.match(stderr, /\nOK\s*$/);
     assert.doesNotMatch(stderr, /skipped|FAILED|ERROR:/);
     assert.equal(stdout, "");
@@ -62,10 +62,18 @@ test("actual failed keeper/supervisor survives cleanup as a safe durable diagnos
     try {
       writeFileSync(staged, raw, { mode: 0o600, flag: "wx" }); ownsStaged = true;
       mkdirSync(run, { mode: 0o700 }); ownsRun = true;
-      const fakeCli = "import sys;print(" + JSON.stringify(JSON.stringify({
-        type: "system", message: secret,
-      })) + ");sys.stderr.write(" + JSON.stringify("API Error: 401 " + secret + " " + privateUrl + "\n")
-        + ");sys.exit(1)";
+      const cliEvents = [
+        { type: "system", message: secret },
+        { type: "assistant", error: "authentication_failed", is_api_error_message: true,
+          message: { model: "<synthetic>", content: [
+            { type: "text", text: "API Error: 401 " + secret + " " + privateUrl },
+          ] } },
+        { type: "result", is_error: true, result: "API Error: 429 " + secret,
+          errors: ["turn ended on an API error"] },
+      ];
+      const fakeCli = "import sys;sys.stdout.write(" +
+        JSON.stringify(cliEvents.map(event => JSON.stringify(event) + "\n").join("")) +
+        ");sys.exit(1)";
       assert.equal(existsSync(proof), false, "never reuse an existing proof directory");
       ownsProof = true; // Only the keeper invocation below may create this random path.
       const failed = spawnSync(PYTHON, ["-I", join(SCRIPTS, "box_keeper.py"), staged,

@@ -163,6 +163,90 @@ class FailureDiagnosticTest(unittest.TestCase):
                 value = self.load(proof, epoch)
                 self.assertEqual((value["httpStatus"], value["upstreamCode"]), (status, kind))
 
+
+    def test_synthetic_cli_errors_preserve_first_complete_observation(self):
+        cases = [
+            ({"error": "authentication_failed"}, None, "authentication"),
+            ({"error": "rate_limit"}, None, "rate_limit"),
+            ({"error": "invalid_request", "text": "API Error: 400 secret"}, 400, "invalid_request"),
+            ({"error": "server_error", "text": "API Error: 500 secret"}, 500, "unknown"),
+            ({"error": "unknown", "text": "API Error: 403 secret"}, 403, "permission"),
+        ]
+        for spec, status, category in cases:
+            with self.subTest(spec=spec):
+                proof, epoch = self.identity()
+                first = {"type": "assistant", "error": spec["error"], "is_api_error_message": True,
+                         "message": {"model": "<synthetic>", "content": [
+                             {"type": "text", "text": spec.get("text", "Bearer sk-private-token")}]}}
+                # A later error must not fill the first event's missing HTTP or
+                # overwrite its category. Result events still update lastEvent.
+                events = [first, {"type": "result", "is_error": True,
+                                  "result": "API Error: 429 https://secret.invalid/token",
+                                  "errors": ["turn ended on an API error"]}]
+                raw = "".join(json.dumps(item) + "\n" for item in events)
+                proc = self.run_child(f"import sys;sys.stdout.write({raw!r});sys.exit(1)",
+                                      proof=proof, epoch=epoch)
+                self.assertEqual((proc.returncode, proc.stdout), (1, raw.encode()))
+                value = self.load(proof, epoch)
+                self.assertEqual((value["httpStatus"], value["upstreamCode"]), (status, category))
+                self.assertEqual(value["lastEvent"], "result")
+                self.assertNotIn("secret", json.dumps(value))
+                self.assertNotIn("Bearer", json.dumps(value))
+
+    def test_captured_session_limit_retains_classification(self):
+        proof, epoch = self.identity()
+        fixture = HERE.parents[1] / "packages/commercial/src/http/proxy/__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl"
+        raw = fixture.read_text()
+        proc = self.run_child(f"import sys;sys.stdout.write({raw!r});sys.exit(1)",
+                              proof=proof, epoch=epoch)
+        self.assertEqual(proc.returncode, 1)
+        value = self.load(proof, epoch)
+        self.assertEqual((value["upstreamCode"], value["httpStatus"]), ("rate_limit", None))
+
+    def test_normal_model_and_tool_error_prose_is_not_upstream_evidence(self):
+        cases = [
+            {"type": "assistant", "error": "rate_limit",
+             "message": {"model": "claude-haiku", "content": [{"type": "text", "text": "API Error: 401 secret"}]}},
+            {"type": "assistant", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "API Error: 401 secret"}]}},
+            {"type": "assistant", "message": {"model": "claude-haiku"}, "error": {"status": 401, "type": "authentication_error"}},
+            {"type": "user", "tool_use_result": {"error": "authentication_failed"}, "status": 401},
+        ]
+        for event in cases:
+            proof, epoch = self.identity()
+            proc = self.run_child(f"import sys;print({json.dumps(event)!r});sys.exit(1)",
+                                  proof=proof, epoch=epoch)
+            self.assertEqual(proc.returncode, 1)
+            value = self.load(proof, epoch)
+            self.assertEqual((value["httpStatus"], value["upstreamCode"]), (None, "unknown"))
+
+    def test_synthetic_first_cause_survives_shutdown(self):
+        proof, epoch = self.identity()
+        event = {"type": "assistant", "error": "authentication_failed", "is_api_error_message": True,
+                 "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "API Error: 401 Bearer sk-secret"}]}}
+        lines = json.dumps(event) + "\n" + json.dumps({"type": "result", "is_error": True, "errors": ["turn ended on an API error"]}) + "\n"
+        code = f"import sys,time,signal;signal.signal(signal.SIGTERM,signal.SIG_IGN);sys.stdout.write({lines!r});sys.stdout.flush();time.sleep(30)"
+        env = {**os.environ, "OCV5_DIAGNOSTIC_PROOF_DIR": str(proof), "OCV5_DIAGNOSTIC_LEASE_EPOCH": epoch}
+        proc = subprocess.Popen([sys.executable, "-I", str(SUPERVISOR), "--deadline", "5",
+                                 "--kill-after", ".05", "--max-output", "262144", "--",
+                                 sys.executable, "-I", "-c", code], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # Forwarding proves the supervisor has classified both records.
+            received = b""
+            while received.count(b"\n") < 2:
+                self.assertTrue(select.select([proc.stdout], [], [], 4)[0], "no forwarded CLI events")
+                received += os.read(proc.stdout.fileno(), 65536)
+            proc.send_signal(signal.SIGTERM)
+            out, err = proc.communicate(timeout=8)
+            self.assertEqual((proc.returncode, received + out, err), (143, lines.encode(), b""))
+            value = self.load(proof, epoch)
+            self.assertEqual((value["upstreamCode"], value["httpStatus"]), ("authentication", 401))
+            self.assertEqual((value["stage"], value["reason"], value["cliSignal"]), ("shutdown", "interrupted", 9))
+            self.assertNotIn("sk-secret", json.dumps(value))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=8)
+
     def test_child_signal_is_preserved_separately(self):
         proof, epoch = self.identity()
         proc = self.run_child("import os,signal;os.kill(os.getpid(), signal.SIGTERM)", proof=proof, epoch=epoch)
