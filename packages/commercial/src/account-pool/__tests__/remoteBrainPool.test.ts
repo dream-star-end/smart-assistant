@@ -340,6 +340,26 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const ccProf = validProbe.profiles.find((p) => p.engine === 'cc')
       assert.equal(ccProf?.logged_in, true)
       assert.equal(ccProf?.discovered_models.length, 1)
+
+      // Standard claude login .credentials.json without available_models falls back to DEFAULT_MODELS_BY_ENGINE['cc']
+      writeFileSync(
+        join(claudeDir, '.credentials.json'),
+        JSON.stringify({
+          claudeAiOauth: { accessToken: 'fixture-only-nonsecret-token', expiresAt: futureMs },
+        }),
+        'utf8',
+      )
+      const defaultModelsProbe = JSON.parse(
+        execFileSync('python3', [scriptPath, '--probe'], {
+          encoding: 'utf8',
+          env: { ...process.env, HOME: fakeHome },
+        }),
+      ) as {
+        profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
+      }
+      const ccDefaultProf = defaultModelsProbe.profiles.find((p) => p.engine === 'cc')
+      assert.equal(ccDefaultProf?.logged_in, true)
+      assert.equal(ccDefaultProf?.discovered_models.length, 3)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
@@ -594,7 +614,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
 
   it('preheatRemotePoolSession honestly reports REMOTE_POOL_EXECUTION_DISABLED when execution is gated off (B7)', async () => {
     const prev = process.env.OC_REMOTE_POOL_EXECUTION_ENABLED
-    delete process.env.OC_REMOTE_POOL_EXECUTION_ENABLED
+    process.env.OC_REMOTE_POOL_EXECUTION_ENABLED = '0'
     try {
       const res = await preheatRemotePoolSession({
         uid: '1001',
@@ -604,7 +624,11 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       assert.equal(res.preheated, false)
       assert.equal(res.reason, 'REMOTE_POOL_EXECUTION_DISABLED')
     } finally {
-      if (prev !== undefined) process.env.OC_REMOTE_POOL_EXECUTION_ENABLED = prev
+      if (prev !== undefined) {
+        process.env.OC_REMOTE_POOL_EXECUTION_ENABLED = prev
+      } else {
+        delete process.env.OC_REMOTE_POOL_EXECUTION_ENABLED
+      }
     }
   })
 })

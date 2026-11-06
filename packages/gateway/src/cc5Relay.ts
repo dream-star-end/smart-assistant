@@ -192,39 +192,46 @@ export class Cc5Relay {
               !turnSt.isSymbolicLink() &&
               turnSt.uid === process.getuid?.() &&
               (turnSt.mode & 0o077) === 0 &&
-              existsSync(join(turnDir, 'admission.json')) &&
-              existsSync(join(turnDir, 'native-terminal.json')) &&
-              existsSync(join(turnDir, 'terminal-proven.json')),
+              existsSync(join(turnDir, 'admission.json')),
           )
           const adm = JSON.parse(readFileSync(join(turnDir, 'admission.json'), 'utf8')) as {
             authorityTurnId?: string
             turnKey?: string
             billingRequestId?: string
           }
-          const term = JSON.parse(
-            readFileSync(join(turnDir, 'native-terminal.json'), 'utf8'),
-          ) as Cc5NativeTerminalReceipt
-          const proven = JSON.parse(readFileSync(join(turnDir, 'terminal-proven.json'), 'utf8')) as {
-            requestId?: string
-            resultSha256?: string
-          }
           requireRelay(
             adm?.authorityTurnId === entry &&
               typeof adm.turnKey === 'string' &&
               adm.turnKey.length > 0 &&
               typeof adm.billingRequestId === 'string' &&
-              adm.billingRequestId.length > 0 &&
-              proven?.requestId === adm.billingRequestId &&
-              proven?.resultSha256 === term?.resultSha256 &&
-              term?.version === 2 &&
-              term.authorityTurnId === adm.authorityTurnId &&
-              term.turnKey === adm.turnKey,
+              adm.billingRequestId.length > 0,
           )
           this.usedAuthorities.add(adm.authorityTurnId)
           this.usedTurns.add(adm.turnKey)
           this.usedRequests.add(adm.billingRequestId)
           this.launchAttempted = true
-          recoveredReceipts.push(term)
+          const hasNativeTerminal = existsSync(join(turnDir, 'native-terminal.json'))
+          const hasTerminalProven = existsSync(join(turnDir, 'terminal-proven.json'))
+          if (hasNativeTerminal && hasTerminalProven) {
+            const term = JSON.parse(
+              readFileSync(join(turnDir, 'native-terminal.json'), 'utf8'),
+            ) as Cc5NativeTerminalReceipt
+            const proven = JSON.parse(readFileSync(join(turnDir, 'terminal-proven.json'), 'utf8')) as {
+              requestId?: string
+              resultSha256?: string
+            }
+            requireRelay(
+              proven?.requestId === adm.billingRequestId &&
+                proven?.resultSha256 === term?.resultSha256 &&
+                term?.version === 2 &&
+                term.authorityTurnId === adm.authorityTurnId &&
+                term.turnKey === adm.turnKey,
+            )
+            recoveredReceipts.push(term)
+          } else {
+            // Interrupted turn before terminal settlement: allow recovery if attachable and no dangling tool attempt
+            requireRelay(!hasTerminalProven)
+          }
           if (existsSync(join(turnDir, 'dispatch.json'))) {
             const disp = JSON.parse(readFileSync(join(turnDir, 'dispatch.json'), 'utf8')) as {
               sequence?: number

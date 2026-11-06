@@ -40,7 +40,25 @@ FORBIDDEN_CC_PRINT_FLAGS = {
     "--replay-user-messages",
 }
 
-DEFAULT_MODELS_BY_ENGINE: Dict[str, List[Dict[str, str]]] = {}
+DEFAULT_MODELS_BY_ENGINE: Dict[str, List[Dict[str, str]]] = {
+    "cc": [
+        {"upstream_model_id": "claude-sonnet-4-6", "display_name": "Sonnet 4.6"},
+        {"upstream_model_id": "claude-opus-4-7", "display_name": "Opus 4.7 (1M)"},
+        {"upstream_model_id": "claude-sonnet-5", "display_name": "Sonnet 5"},
+    ],
+    "codex": [
+        {"upstream_model_id": "gpt-5.4", "display_name": "GPT 5.4"},
+        {"upstream_model_id": "gpt-5.3-codex", "display_name": "GPT 5.3 Codex"},
+    ],
+    "antigravity": [
+        {"upstream_model_id": "gemini-3.1-pro", "display_name": "Gemini 3.1 Pro"},
+        {"upstream_model_id": "gemini-3.0-flash", "display_name": "Gemini 3.0 Flash"},
+    ],
+    "grok-build": [
+        {"upstream_model_id": "grok-4.20", "display_name": "Grok 4.20"},
+        {"upstream_model_id": "grok-code-fast-1", "display_name": "Grok Code Fast"},
+    ],
+}
 
 
 def parse_verified_models(raw: Any) -> List[Dict[str, str]]:
@@ -192,6 +210,8 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                         oauth = data.get("claudeAiOauth")
                         if isinstance(oauth, dict):
                             tok = oauth.get("accessToken") or oauth.get("access_token")
+                            refresh_tok = oauth.get("refreshToken") or oauth.get("refresh_token")
+                            plan_type = oauth.get("subscriptionType") or oauth.get("SubscriptionType") or plan_type
                             exp = oauth["expiresAt"] if "expiresAt" in oauth and oauth["expiresAt"] is not None else oauth.get("expires_at")
                             now_sec = globals()["time"].time() if "time" in globals() else __import__("time").time()
                             exp_ok = (
@@ -207,7 +227,15 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                                     )
                                 )
                             )
-                            if isinstance(tok, str) and len(tok.strip()) >= 16 and exp_ok:
+                            has_refresh = (
+                                isinstance(refresh_tok, str)
+                                and len(refresh_tok.strip()) >= 16
+                                and (
+                                    exp is None
+                                    or (isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0)
+                                )
+                            )
+                            if isinstance(tok, str) and len(tok.strip()) >= 16 and (exp_ok or has_refresh):
                                 has_valid_token = True
                         if isinstance(data.get("five_hour_used_pct"), (int, float)):
                             used_5h = float(data["five_hour_used_pct"])
@@ -228,6 +256,8 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                                 discovered_models = verified
                 except Exception:
                     pass
+        if has_valid_token and not discovered_models:
+            discovered_models = list(DEFAULT_MODELS_BY_ENGINE.get("cc", []))
         logged_in = bool(has_valid_token and len(discovered_models) > 0)
         raw_id = email or f"{os.uname().nodename}:cc:{profile_name}"
         profiles.append(
@@ -274,8 +304,15 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                         data.get("access_token")
                         or data.get("id_token")
                         or data.get("api_key")
+                        or data.get("OPENAI_API_KEY")
                         or tokens_obj.get("access_token")
                         or tokens_obj.get("id_token")
+                    )
+                    refresh_tok = (
+                        data.get("refresh_token")
+                        or data.get("refreshToken")
+                        or tokens_obj.get("refresh_token")
+                        or tokens_obj.get("refreshToken")
                     )
                     exp = (
                         data["expires_at"]
@@ -304,7 +341,15 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                             )
                         )
                     )
-                    if isinstance(token_candidate, str) and len(token_candidate.strip()) >= 16 and exp_ok:
+                    has_refresh = (
+                        isinstance(refresh_tok, str)
+                        and len(refresh_tok.strip()) >= 16
+                        and (
+                            exp is None
+                            or (isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0)
+                        )
+                    )
+                    if isinstance(token_candidate, str) and len(token_candidate.strip()) >= 16 and (exp_ok or has_refresh):
                         has_valid_token = True
                     if isinstance(data.get("five_hour_used_pct"), (int, float)):
                         used_5h = float(data["five_hour_used_pct"])
@@ -325,6 +370,8 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                             discovered_models = verified
             except Exception:
                 pass
+    if has_valid_token and not discovered_models:
+        discovered_models = list(DEFAULT_MODELS_BY_ENGINE.get(engine, []))
     logged_in = bool(has_valid_token and len(discovered_models) > 0)
     raw_id = email or f"{os.uname().nodename}:{engine}:default"
     return [
