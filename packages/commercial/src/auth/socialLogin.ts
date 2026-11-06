@@ -37,6 +37,7 @@ import { ensureFreeSubscription } from '../billing/subscription.js'
 import { query, tx } from '../db/queries.js'
 import { REFRESH_TOKEN_TTL_SECONDS, issueRefresh, refreshTokenHash, signAccess } from './jwt.js'
 import { hashPassword } from './passwords.js'
+import { claimRegistrationIpSlot } from './registrationIpCap.js'
 import {
   lockRefreshFamily,
   lockRefreshUsers,
@@ -70,6 +71,7 @@ export type SocialLoginErrorCode =
   | 'USER_DISABLED' // 已存在但被封号 / 软删
   | 'INVALID_INPUT' // provider_user_id / username 校验失败(防御 LDC 异常)
   | 'REGISTRATION_DISABLED' // 全局关停注册 + identity 未命中(老 LDC 用户登录不受影响)
+  | 'IP_REGISTRATION_LIMIT' // 同 IP 账号数已满 + identity 未命中(老 LDC 用户登录不受影响)
 
 export class SocialLoginError extends Error {
   constructor(
@@ -120,6 +122,8 @@ export interface SocialLoginDeps {
   userAgent?: string
   /** 出口 IP(refresh_tokens.ip;同 login.ts bindIp 语义) */
   bindIp?: string
+  /** 真实客户端 IP(ctx.clientIp),只在新建账号时写 users.registration_ip 并计入同 IP 上限 */
+  registrationIp: string | undefined
   /** 测试可注入 now(秒) */
   now?: () => number
   accessTtlSeconds?: number
@@ -254,6 +258,11 @@ export async function socialLoginOrCreate(
       )
     }
 
+    // 同 IP 账号上限与邮箱注册共用名额,老用户登录(上面 3a)不受影响。
+    if (!(await claimRegistrationIpSlot(client, deps.registrationIp))) {
+      throw new SocialLoginError('IP_REGISTRATION_LIMIT', 'registration ip account limit reached')
+    }
+
     const placeholderHash = await hashPassword(randomBytes(32).toString('base64url'))
     const synEmail = syntheticEmail(input.provider, input.providerUserId)
 
@@ -270,10 +279,10 @@ export async function socialLoginOrCreate(
       const insUser = await client.query<{ id: string }>(
         `INSERT INTO users(email, password_hash, email_verified,
                            display_name, avatar_url,
-                           v5_migrated_at, v5_migration_status)
-         VALUES ($1, $2, TRUE, $3, $4, NOW(), 'migrated')
+                           v5_migrated_at, v5_migration_status, registration_ip)
+         VALUES ($1, $2, TRUE, $3, $4, NOW(), 'migrated', $5::inet)
          RETURNING id::text AS id`,
-        [synEmail, placeholderHash, input.username, input.avatarUrl],
+        [synEmail, placeholderHash, input.username, input.avatarUrl, deps.registrationIp],
       )
       newUserId = insUser.rows[0].id
       await client.query('RELEASE SAVEPOINT social_user_insert')

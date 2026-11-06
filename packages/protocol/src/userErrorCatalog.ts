@@ -99,6 +99,7 @@ const HTTP_COPY: Record<string, Copy> = {
   email_not_verified: ['auth', '邮箱还未验证，请完成邮箱验证后再登录。', ['relogin']],
   turnstile_failed: ['input', '安全验证未通过，请刷新页面后再试。', ['refresh']],
   email_domain_blocked: ['permission', '暂不支持这个邮箱域名，请换一个邮箱或联系管理员。', ['edit_message', 'contact_admin']],
+  ip_registration_limit: ['permission', '当前网络注册的账号数已达上限，无法继续注册，如有疑问请联系管理员。', ['contact_admin']],
   weak_password: ['input', '密码强度不够，请按页面要求设置更安全的密码。', ['edit_message']],
   model_switch_insufficient_balance: ['billing', '可用积分不足，暂时无法完成模型切换。请补充积分或联系管理员。', ['topup', 'contact_admin']],
   model_switch_in_progress: ['state', '模型正在切换，请等待切换完成后再发送消息。', ['wait']],

@@ -102,6 +102,13 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   return false;
 }
 
+let testIpSeq = 0;
+/** 每次一个新 IP:这里的用例不验同 IP 上限,不让它们互相占名额。 */
+function nextTestIp(): string {
+  testIpSeq += 1;
+  return `198.51.${Math.floor(testIpSeq / 250)}.${(testIpSeq % 250) + 1}`;
+}
+
 /**
  * 注册 + 从邮件正文抓 6 位验证码。
  *
@@ -120,6 +127,7 @@ async function registerAndCaptureVerifyToken(email: string, password: string): P
     {
       mailer,
       turnstileBypass: true,
+      remoteIp: nextTestIp(),
       verifyEmailUrlBase: "https://claudeai.chat",
     },
   );

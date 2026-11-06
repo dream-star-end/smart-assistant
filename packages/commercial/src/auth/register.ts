@@ -18,10 +18,11 @@
  *   - CONFLICT:邮箱已存在
  *   - EMAIL_DOMAIN_BLOCKED:邮箱域名命中 system_settings.register_email_domain_blocklist
  *     (一次性邮箱黑名单 — 反薅羊毛;verify 路径也会再查一次,详见 verify.ts)
+ *   - IP_REGISTRATION_LIMIT:同 IP 账号数已满,或拿不到合法客户端 IP(registrationIpCap.ts)
  *
  * 不在本文件:
  *   - HTTP/Express 路由(T-14+)
- *   - 同 IP 限流(T-14+ 速率限制中间件)
+ *   - 同 IP 短时尝试限流(T-14+ 速率限制中间件)
  */
 
 import { z } from "zod";
@@ -31,6 +32,7 @@ import { hashPassword } from "./passwords.js";
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
 import type { Mailer } from "./mail.js";
 import { renderVerifyEmail } from "./verifyEmailTemplate.js";
+import { claimRegistrationIpSlot } from "./registrationIpCap.js";
 
 /** RFC 5322 简化邮箱正则,长度 ≤ 254(05-SEC §7) */
 const emailSchema = z
@@ -67,7 +69,8 @@ export type RegisterErrorCode =
   | "VALIDATION"
   | "TURNSTILE_FAILED"
   | "CONFLICT"
-  | "EMAIL_DOMAIN_BLOCKED";
+  | "EMAIL_DOMAIN_BLOCKED"
+  | "IP_REGISTRATION_LIMIT";
 
 export class RegisterError extends Error {
   readonly code: RegisterErrorCode;
@@ -112,7 +115,7 @@ export interface RegisterDeps {
   turnstileBypass?: boolean;
   /** 账号级旁路白名单(env TURNSTILE_BYPASS_ACCOUNTS),生产给自动化账号留的合法通道 */
   turnstileBypassAccounts?: readonly string[];
-  /** 用户 IP — 转给 turnstile + 反滥用日志 */
+  /** 用户 IP — 转给 turnstile,并作为 users.registration_ip 计入同 IP 账号上限 */
   remoteIp?: string;
   /** 测试可注入 fetch(传给 turnstile) */
   fetchImpl?: typeof fetch;
@@ -271,6 +274,9 @@ export async function register(
   let userId: string;
   try {
     userId = await tx<string>(async (client) => {
+      if (!(await claimRegistrationIpSlot(client, deps.remoteIp))) {
+        throw new RegisterError("IP_REGISTRATION_LIMIT", "该网络注册的账号数已达上限");
+      }
       // INSERT user;email UNIQUE 约束撞了会抛 23505。
       // credits 不带,默认 0。注册赠金已于 2026-07-07 下线;免费额度由 login/SSO/
       // GET /api/me 调用 ensureFreeSubscription 发放期内桶 300,verifyEmail 不再发积分。
@@ -281,11 +287,11 @@ export async function register(
       // NOW();无值两列 NULL(旧 bundle / 直连 API),语义见迁移头注释。
       const ins = await client.query<{ id: string }>(
         `INSERT INTO users(email, password_hash, display_name, v5_migrated_at, v5_migration_status,
-                           terms_version, terms_accepted_at)
+                           terms_version, terms_accepted_at, registration_ip)
          VALUES ($1, $2, $3, NOW(), 'migrated',
-                 $4, CASE WHEN $4::text IS NULL THEN NULL ELSE NOW() END)
+                 $4, CASE WHEN $4::text IS NULL THEN NULL ELSE NOW() END, $5::inet)
          RETURNING id::text AS id`,
-        [input.email, passwordHash, input.display_name ?? null, input.terms_version ?? null],
+        [input.email, passwordHash, input.display_name ?? null, input.terms_version ?? null, deps.remoteIp],
       );
       const uid = ins.rows[0].id;
       await client.query(
