@@ -83,8 +83,27 @@ export function useIdentityModelCatalog(input: IdentityModelCatalogInput): void 
       .finally(() => {
         if (current()) setModelsLoading(false)
       })
+    const refreshModelsOnly = () => {
+      if (!current()) return
+      api
+        .getPublicModels(auth)
+        .then((catalog) => {
+          if (!current()) return
+          setModels(catalog.models)
+          setLockedModels(catalog.lockedModels)
+          setTeamLeaderModelId(catalog.teamLeaderModelId)
+          setCatalogOwner(identity)
+        })
+        .catch(() => {})
+    }
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('openclaude:models-updated', refreshModelsOnly)
+    }
     return () => {
       cancelled = true
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('openclaude:models-updated', refreshModelsOnly)
+      }
     }
   }, [
     auth,

@@ -518,7 +518,7 @@ export class ModelCatalogSnapshot {
     const e = this.activeByModel.get(canonical);
     if (!e) return false;
     if (e.capabilitySchemaVersion > CAPABILITY_SCHEMA_VERSION) return false;
-    if (e.placement === "remote_pool" && process.env.OC_REMOTE_POOL_EXECUTION_ENABLED !== "1") {
+    if (e.placement === "remote_pool" && process.env.OC_REMOTE_POOL_EXECUTION_ENABLED === "0") {
       return false;
     }
     return this.pricing.has(canonical);
@@ -614,7 +614,7 @@ export class ModelCatalogSnapshot {
     const schemaOk =
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
     const remotePoolOk =
-      entry?.placement !== "remote_pool" || process.env.OC_REMOTE_POOL_EXECUTION_ENABLED === "1";
+      entry?.placement !== "remote_pool" || process.env.OC_REMOTE_POOL_EXECUTION_ENABLED !== "0";
     const routable = entry !== undefined && schemaOk && remotePoolOk && pricing !== undefined;
     const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebOwnerUid(scope.uid);
     const cc5Ok = !isCc5TestModel(canonical); // retired task model; backend routing uses existing Sonnet

@@ -370,6 +370,77 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       assert.ok(
         ccDefaultProf?.discovered_models.some((m) => m.upstream_model_id === 'claude-sonnet-5'),
       )
+
+      // Multi-directory multi-account: distinct accounts in .claude-account2 and .codex-account2 are discovered independently
+      const claudeAcc2Dir = join(fakeHome, '.claude-account2')
+      const codexAcc2Dir = join(fakeHome, '.codex-account2')
+      execFileSync('mkdir', ['-p', claudeAcc2Dir, codexAcc2Dir])
+      writeFileSync(
+        join(claudeDir, '.credentials.json'),
+        JSON.stringify({
+          oauthAccount: { emailAddress: 'alice@example.com' },
+          claudeAiOauth: { accessToken: 'fixture-only-nonsecret-token-1', expiresAt: futureMs },
+          available_models: [{ id: 'claude-sonnet-5-5', name: 'Sonnet 5.5' }],
+        }),
+        'utf8',
+      )
+      writeFileSync(
+        join(claudeAcc2Dir, '.credentials.json'),
+        JSON.stringify({
+          oauthAccount: { emailAddress: 'bob@example.com' },
+          claudeAiOauth: { accessToken: 'fixture-only-nonsecret-token-2', expiresAt: futureMs },
+          available_models: [{ id: 'claude-opus-5-5', name: 'Opus 5.5' }],
+        }),
+        'utf8',
+      )
+      writeFileSync(
+        join(codexDir, 'auth.json'),
+        JSON.stringify({
+          email: 'codex1@example.com',
+          access_token: 'fixture-only-nonsecret-token-c1',
+          expires_at: futureMs,
+          available_models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+        }),
+        'utf8',
+      )
+      writeFileSync(
+        join(codexAcc2Dir, 'auth.json'),
+        JSON.stringify({
+          email: 'codex2@example.com',
+          access_token: 'fixture-only-nonsecret-token-c2',
+          expires_at: futureMs,
+          available_models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+        }),
+        'utf8',
+      )
+      const multiProbe = JSON.parse(
+        execFileSync('python3', [scriptPath, '--probe'], {
+          encoding: 'utf8',
+          env: { ...process.env, HOME: fakeHome },
+        }),
+      ) as {
+        profiles: Array<{
+          engine: string
+          profile_name: string
+          logged_in: boolean
+          account_fingerprint: string
+        }>
+      }
+      const ccProfs = multiProbe.profiles.filter((p) => p.engine === 'cc' && p.logged_in)
+      assert.equal(ccProfs.length, 2)
+      assert.deepEqual(
+        ccProfs.map((p) => p.profile_name).sort(),
+        ['account2', 'default'],
+      )
+      assert.notEqual(ccProfs[0]?.account_fingerprint, ccProfs[1]?.account_fingerprint)
+
+      const codexProfs = multiProbe.profiles.filter((p) => p.engine === 'codex' && p.logged_in)
+      assert.equal(codexProfs.length, 2)
+      assert.deepEqual(
+        codexProfs.map((p) => p.profile_name).sort(),
+        ['account2', 'default'],
+      )
+      assert.notEqual(codexProfs[0]?.account_fingerprint, codexProfs[1]?.account_fingerprint)
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }

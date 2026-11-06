@@ -9,9 +9,9 @@
  *   and `<base_slug>-remote` so the frontend picker automatically displays the " 远端" suffix.
  */
 
-import { execFile, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -180,26 +180,63 @@ export function toRemotePoolModelId(upstreamOrBaseId: string): string {
   return clean.endsWith('-remote') ? clean : `${clean}-remote`
 }
 
+function getRemoteHostdScriptPath(): string {
+  return resolve(
+    fileURLToPath(import.meta.url),
+    '..',
+    '..',
+    '..',
+    '..',
+    '..',
+    'scripts',
+    'agent-remote',
+    'oc-remote-hostd.py',
+  )
+}
+
 let cachedControllerSha256: string | null = null
 export function getRemoteHostdSha256(): string {
   if (cachedControllerSha256) return cachedControllerSha256
   try {
-    const scriptPath = resolve(
-      fileURLToPath(import.meta.url),
-      '..',
-      '..',
-      '..',
-      '..',
-      '..',
-      'scripts',
-      'agent-remote',
-      'oc-remote-hostd.py',
-    )
+    const scriptPath = getRemoteHostdScriptPath()
     cachedControllerSha256 = createHash('sha256').update(readFileSync(scriptPath)).digest('hex')
     return cachedControllerSha256
   } catch {
     return '0'.repeat(64)
   }
+}
+
+export function ensureRemoteNodeKeypair(keyId: string): { privateKeyPath: string; publicKey: string } | null {
+  try {
+    const baseDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
+    const dir = join(baseDir, keyId)
+    const privPath = join(dir, 'id_ed25519')
+    const pubPath = `${privPath}.pub`
+    if (!existsSync(privPath) || !existsSync(pubPath)) {
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      execFileSync(
+        'ssh-keygen',
+        ['-q', '-t', 'ed25519', '-N', '', '-C', keyId, '-f', privPath],
+        { timeout: 5000 },
+      )
+    }
+    const pub = readFileSync(pubPath, 'utf8').trim()
+    return pub ? { privateKeyPath: privPath, publicKey: pub } : null
+  } catch {
+    return null
+  }
+}
+
+function readExistingNodePublicKey(keyId: string): string | null {
+  try {
+    const baseDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
+    const pubPath = join(baseDir, keyId, 'id_ed25519.pub')
+    if (existsSync(pubPath)) {
+      const pub = readFileSync(pubPath, 'utf8').trim()
+      if (pub) return pub
+    }
+  } catch {}
+  return null
 }
 
 /** Build the one-line restricted SSH authorized_keys install snippet for operators. */
@@ -210,9 +247,11 @@ export function buildRemoteNodeInstallCommand(input: {
 }): string {
   const pubKey =
     input.publicKey?.trim() ||
+    readExistingNodePublicKey(input.keyId) ||
     process.env.OC_REMOTE_POOL_SSH_PUBLIC_KEY?.trim() ||
     `<REPLACE_WITH_DEDICATED_SSH_ED25519_PUBKEY_FOR_${input.keyId}>`
-  const binPath = `/home/${input.sshUser}/.openclaude/bin/oc-remote-hostd.py`
+  const homeDir = input.sshUser === 'root' ? '/root' : `/home/${input.sshUser}`
+  const binPath = `${homeDir}/.openclaude/bin/oc-remote-hostd.py`
   const expectedSha = getRemoteHostdSha256()
   const entry = `command="${binPath} --serve-mux",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc ${pubKey}`
   return [
@@ -389,13 +428,137 @@ export async function listRemotePoolOverview(runner?: QueryRunner): Promise<{
   }
 }
 
+export async function autoScanHostKeyFingerprint(
+  sshHost: string,
+  sshPort: number,
+): Promise<string> {
+  const { stdout } = await execFileAsync(
+    'ssh-keyscan',
+    ['-T', '5', '-p', String(sshPort), sshHost],
+    { timeout: 7000 },
+  )
+  const candidates: Array<{ keyType: string; fp: string }> = []
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    const parts = line.split(/\s+/)
+    if (parts.length < 3) continue
+    const [, keyType, base64Key] = parts
+    if (!keyType || !base64Key) continue
+    const fp = computeSshPubkeySha256Fp(base64Key)
+    if (fp && HOST_KEY_FP_RE.test(fp)) {
+      candidates.push({ keyType, fp })
+    }
+  }
+  const preferred =
+    candidates.find((c) => c.keyType === 'ssh-ed25519') ??
+    candidates.find((c) => c.keyType.startsWith('ecdsa-')) ??
+    candidates[0]
+  if (!preferred) {
+    throw new Error('REMOTE_NODE_HOST_KEYSCAN_FAILED: 无法通过 ssh-keyscan 获取远端主机指纹，请检查主机/端口连通性或手动填写 SHA256 指纹')
+  }
+  return preferred.fp
+}
+
+async function bootstrapRemoteNodeWithPassword(input: {
+  sshHost: string
+  sshPort: number
+  sshUser: string
+  sshPassword: string
+  hostKeyFp: string
+  publicKey: string
+}): Promise<void> {
+  const pinned = await verifyAndMaterializePinnedKnownHosts({
+    sshHost: input.sshHost,
+    sshPort: input.sshPort,
+    expectedHostKeyFp: input.hostKeyFp,
+  })
+  try {
+    const scriptB64 = readFileSync(getRemoteHostdScriptPath()).toString('base64')
+    const homeDir = input.sshUser === 'root' ? '/root' : `/home/${input.sshUser}`
+    const binPath = `${homeDir}/.openclaude/bin/oc-remote-hostd.py`
+    const entry = `command="${binPath} --serve-mux",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc ${input.publicKey.trim()}`
+    const remoteScript = [
+      'set -eu',
+      'mkdir -p ~/.openclaude/bin ~/.ssh',
+      'chmod 700 ~/.openclaude ~/.openclaude/bin ~/.ssh',
+      `printf '%s' '${scriptB64}' | base64 -d > ~/.openclaude/bin/oc-remote-hostd.py`,
+      'chmod 700 ~/.openclaude/bin/oc-remote-hostd.py',
+      'touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys',
+      `grep -qxF '${entry}' ~/.ssh/authorized_keys 2>/dev/null || printf '%s\\n' '${entry}' >> ~/.ssh/authorized_keys`,
+    ].join('\n')
+
+    await new Promise<void>((resolveOk, rejectErr) => {
+      const child = spawn(
+        'sshpass',
+        [
+          '-e',
+          '/usr/bin/ssh',
+          '-F',
+          'none',
+          '-T',
+          '-p',
+          String(input.sshPort),
+          '-o',
+          'StrictHostKeyChecking=yes',
+          '-o',
+          `UserKnownHostsFile=${pinned.knownHostsPath}`,
+          '-o',
+          'PreferredAuthentications=password,keyboard-interactive',
+          '-o',
+          'PubkeyAuthentication=no',
+          '-o',
+          'ConnectTimeout=8',
+          `${input.sshUser}@${input.sshHost}`,
+          'sh -eu',
+        ],
+        {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { ...process.env, SSHPASS: input.sshPassword },
+        },
+      )
+      let stderr = ''
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {}
+        rejectErr(new Error('REMOTE_SSH_PASSWORD_BOOTSTRAP_TIMEOUT'))
+      }, 15_000)
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString('utf8')
+      })
+      child.on('error', (err) => {
+        clearTimeout(timer)
+        rejectErr(err)
+      })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        if (code === 0) {
+          resolveOk()
+        } else {
+          rejectErr(
+            new Error(
+              `REMOTE_SSH_PASSWORD_BOOTSTRAP_FAILED(exit=${code}): ${stderr.trim().slice(0, 200)}`,
+            ),
+          )
+        }
+      })
+      child.stdin.write(`${remoteScript}\n`)
+      child.stdin.end()
+    })
+  } finally {
+    pinned.cleanup()
+  }
+}
+
 export async function createRemoteAgentNode(
   input: {
     label: string
     ssh_host: string
     ssh_port?: number
     ssh_user: string
-    host_key_fp: string
+    host_key_fp?: string
+    ssh_password?: string
     mux_cap_slots?: number
     max_hot_slots?: number
     max_active_slots?: number
@@ -406,18 +569,36 @@ export async function createRemoteAgentNode(
   const sshHost = input.ssh_host.trim()
   const sshPort = input.ssh_port ?? 22
   const sshUser = input.ssh_user.trim()
-  const hostKeyFp = input.host_key_fp.trim()
+  let hostKeyFp = (input.host_key_fp ?? '').trim()
   if (!label || label.length > 64) throw new Error('REMOTE_NODE_LABEL_INVALID')
   if (!SSH_HOST_RE.test(sshHost)) throw new Error('REMOTE_NODE_SSH_HOST_INVALID')
   if (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) {
     throw new Error('REMOTE_NODE_SSH_PORT_INVALID')
   }
   if (!SSH_USER_RE.test(sshUser)) throw new Error('REMOTE_NODE_SSH_USER_INVALID')
+  if (!hostKeyFp) {
+    hostKeyFp = await autoScanHostKeyFingerprint(sshHost, sshPort)
+  }
   if (!HOST_KEY_FP_RE.test(hostKeyFp)) {
     throw new Error('REMOTE_NODE_HOST_KEY_FP_INVALID: must be SHA256:<base64>')
   }
   const keyId = `oc-rpool-${randomUUID().slice(0, 8)}`
+  const keypair = ensureRemoteNodeKeypair(keyId)
   const controllerSha = getRemoteHostdSha256()
+  const sshPassword = typeof input.ssh_password === 'string' ? input.ssh_password : ''
+  if (sshPassword) {
+    if (!keypair?.publicKey) {
+      throw new Error('REMOTE_NODE_KEYGEN_FAILED: 无法生成节点受限 SSH 密钥对')
+    }
+    await bootstrapRemoteNodeWithPassword({
+      sshHost,
+      sshPort,
+      sshUser,
+      sshPassword,
+      hostKeyFp,
+      publicKey: keypair.publicKey,
+    })
+  }
   const res = await query(
     `INSERT INTO remote_agent_nodes
        (label, ssh_host, ssh_port, ssh_user, host_key_fp, key_id, controller_sha256,
@@ -438,7 +619,16 @@ export async function createRemoteAgentNode(
     ],
     runner,
   )
-  return mapNodeRow(res.rows[0]!)
+  const created = mapNodeRow(res.rows[0]!)
+  if (sshPassword) {
+    try {
+      const probed = await probeRemoteAgentNodeLive(created.id, runner)
+      return probed.node
+    } catch {
+      return created
+    }
+  }
+  return created
 }
 
 export interface RemoteNodeProbePayload {

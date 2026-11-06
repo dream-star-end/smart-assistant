@@ -114,6 +114,7 @@ export default function RemotePoolsPage() {
   const [sshHost, setSshHost] = useState("");
   const [sshPort, setSshPort] = useState("22");
   const [sshUser, setSshUser] = useState("box");
+  const [sshPassword, setSshPassword] = useState("");
   const [hostKeyFp, setHostKeyFp] = useState("");
   const [creatingNode, setCreatingNode] = useState(false);
   const [probingNodeId, setProbingNodeId] = useState<string | null>(null);
@@ -132,23 +133,31 @@ export default function RemotePoolsPage() {
   const bindings = data?.bindings ?? [];
 
   async function handleCreateNode() {
-    if (!label.trim() || !sshHost.trim() || !hostKeyFp.trim()) {
-      toast("请填写节点名称、SSH 地址与 HostKey SHA256 指纹", "error");
+    if (!label.trim() || !sshHost.trim()) {
+      toast("请填写节点名称与 SSH 主机地址", "error");
       return;
     }
     setCreatingNode(true);
     try {
+      const hadPwd = Boolean(sshPassword.trim());
       await adminSend("POST", "/api/admin/remote-pool/nodes", {
         label: label.trim(),
         ssh_host: sshHost.trim(),
         ssh_port: Number(sshPort) || 22,
         ssh_user: sshUser.trim() || "box",
         host_key_fp: hostKeyFp.trim(),
+        ...(hadPwd ? { ssh_password: sshPassword } : {}),
       });
-      toast("远端节点已添加，可执行一键探测发现已登录底座与模型", "success");
+      toast(
+        hadPwd
+          ? "远端节点已通过 SSH 密码自动下发受限密钥与守护脚本，并完成首次探测（密码已销毁不落库）"
+          : "远端节点已添加，已自动扫描锁定 HostKey 指纹，请复制受限公钥指令或执行一键探测",
+        "success",
+      );
       setShowAddModal(false);
       setLabel("");
       setSshHost("");
+      setSshPassword("");
       setHostKeyFp("");
       reload();
     } catch (e) {
@@ -219,6 +228,9 @@ export default function RemotePoolsPage() {
         profile_id: selectedProfile.id,
         offers: payloadOffers,
       });
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("openclaude:models-updated"));
+      }
       toast("远端模型上架配置已同步至模型目录（前端自动带「远端」后缀）", "success");
       setSelectedProfile(null);
       reload();
@@ -235,6 +247,9 @@ export default function RemotePoolsPage() {
       await adminSend("PATCH", `/api/admin/remote-pool/profiles/${profile.id}`, {
         status: nextStatus,
       });
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("openclaude:models-updated"));
+      }
       toast(nextStatus === "active" ? "已恢复参与调度" : "已暂停调度", "success");
       reload();
     } catch (e) {
@@ -606,11 +621,20 @@ export default function RemotePoolsPage() {
               <Input value={sshUser} onChange={(e) => setSshUser(e.target.value)} placeholder="box" />
             </Field>
           </div>
-          <Field label="SSH HostKey SHA256 指纹（防 MITM 强制校验）">
+          <Field label="SSH 登录密码（选填，推荐：一键自动部署受限密钥与守护脚本，密码用后即焚不落库）">
+            <Input
+              type="password"
+              value={sshPassword}
+              onChange={(e) => setSshPassword(e.target.value)}
+              placeholder="填写 SSH 密码可免手动贴公钥，首次连接自动完成部署并立即探测"
+              autoComplete="new-password"
+            />
+          </Field>
+          <Field label="SSH HostKey SHA256 指纹（选填，留空将自动通过 ssh-keyscan 扫描并锁定）">
             <Input
               value={hostKeyFp}
               onChange={(e) => setHostKeyFp(e.target.value)}
-              placeholder="SHA256:44charactersBase64HostKeyFingerprintHere="
+              placeholder="选填：留空自动获取，或手动指定 SHA256:44charactersBase64HostKeyFingerprint="
             />
           </Field>
         </div>

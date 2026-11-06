@@ -344,14 +344,30 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
     cli_models: Optional[List[Dict[str, str]]] = None
     profiles: List[Dict[str, Any]] = []
     dirs: List[tuple[str, pathlib.Path]] = []
+    seen_names: set[str] = set()
     default_dir = home / ".claude"
     if default_dir.is_dir():
         dirs.append(("default", default_dir))
+        seen_names.add("default")
     for entry in sorted(home.glob(".claude-*")):
         if entry.is_dir():
             name = entry.name[len(".claude-") :]
-            if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name != "default":
+            if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names:
                 dirs.append((name, entry))
+                seen_names.add(name)
+    for parent in (home / "accounts", home / ".openclaude" / "profiles"):
+        if parent.is_dir():
+            for sub in sorted(parent.iterdir()):
+                if sub.is_dir():
+                    name = sub.name.lower()
+                    cc_sub = sub / ".claude" if (sub / ".claude").is_dir() else sub
+                    if (
+                        re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name)
+                        and name not in seen_names
+                        and any((cc_sub / f).is_file() for f in (".credentials.json", "config.json", ".claude.json"))
+                    ):
+                        dirs.append((name, cc_sub))
+                        seen_names.add(name)
     if not dirs:
         dirs.append(("default", default_dir))
 
@@ -489,134 +505,214 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
         cli_ver = run_cmd_version(alt_bin)
     if not cli_ver:
         return []
-    email = None
-    plan_type: Optional[str] = None
-    has_valid_token = False
-    used_5h: Optional[float] = None
-    used_7d: Optional[float] = None
-    discovered_models: List[Dict[str, str]] = []
-    for f in auth_files:
-        if f.is_file():
-            try:
-                data = json.loads(f.read_text("utf-8", errors="strict"))
-                if isinstance(data, dict):
-                    email = data.get("email") or data.get("account_email") or data.get("id_token_email") or email
-                    plan_type = data.get("plan") or data.get("plan_type") or plan_type
-                    tokens_obj = (
-                        data.get("tokens")
-                        if isinstance(data.get("tokens"), dict)
-                        else (data.get("token") if isinstance(data.get("token"), dict) else {})
-                    )
-                    # Support xAI grok auth.json issuer-keyed dict format (e.g. "https://auth.x.ai::...")
-                    if not tokens_obj and engine == "grok-build":
-                        for k, v in data.items():
-                            if isinstance(k, str) and "auth.x.ai" in k and isinstance(v, dict):
-                                tokens_obj = v
-                                email = v.get("email") or email
-                                plan_type = v.get("principal_type") or plan_type
-                                break
-                    token_candidate = (
-                        data.get("access_token")
-                        or data.get("id_token")
-                        or data.get("api_key")
-                        or data.get("OPENAI_API_KEY")
-                        or tokens_obj.get("access_token")
-                        or tokens_obj.get("id_token")
-                        or tokens_obj.get("key")
-                    )
-                    refresh_tok = (
-                        data.get("refresh_token")
-                        or data.get("refreshToken")
-                        or tokens_obj.get("refresh_token")
-                        or tokens_obj.get("refreshToken")
-                    )
-                    exp = (
-                        data["expires_at"]
-                        if "expires_at" in data and data["expires_at"] is not None
-                        else (
-                            data["expiresAt"]
-                            if "expiresAt" in data and data["expiresAt"] is not None
-                            else (
-                                tokens_obj["expires_at"]
-                                if "expires_at" in tokens_obj and tokens_obj["expires_at"] is not None
-                                else tokens_obj.get("expiresAt")
+
+    profile_Auths: List[tuple[str, pathlib.Path, List[pathlib.Path]]] = [("default", home, auth_files)]
+    seen_names: set[str] = {"default"}
+    if engine == "codex":
+        for entry in sorted(home.glob(".codex-*")):
+            if entry.is_dir():
+                name = entry.name[len(".codex-") :]
+                if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names:
+                    profile_Auths.append((name, entry, [entry / "auth.json"]))
+                    seen_names.add(name)
+        for parent in (home / "accounts", home / ".openclaude" / "profiles"):
+            if parent.is_dir():
+                for sub in sorted(parent.iterdir()):
+                    if sub.is_dir():
+                        name = sub.name.lower()
+                        cand = sub / ".codex" / "auth.json" if (sub / ".codex" / "auth.json").is_file() else (sub / "auth.json")
+                        if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names and cand.is_file():
+                            profile_Auths.append((name, cand.parent, [cand]))
+                            seen_names.add(name)
+    elif engine == "antigravity":
+        for prefix in (".gemini-", ".antigravity-"):
+            for entry in sorted(home.glob(f"{prefix}*")):
+                if entry.is_dir():
+                    name = entry.name[len(prefix) :]
+                    if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names:
+                        profile_Auths.append(
+                            (
+                                name,
+                                entry,
+                                [
+                                    entry / "antigravity-cli" / "antigravity-oauth-token",
+                                    entry / "antigravity-cli" / "auth.json",
+                                    entry / "antigravity-oauth-token",
+                                    entry / "auth.json",
+                                ],
                             )
                         )
-                    )
-                    now_sec = globals()["time"].time() if "time" in globals() else __import__("time").time()
-                    if isinstance(exp, str) and exp.strip():
-                        exp_ok = True
-                    else:
-                        exp_ok = (
-                            globals()["is_not_expired"](exp)
-                            if "is_not_expired" in globals()
+                        seen_names.add(name)
+        for parent in (home / "accounts", home / ".openclaude" / "profiles"):
+            if parent.is_dir():
+                for sub in sorted(parent.iterdir()):
+                    if sub.is_dir():
+                        name = sub.name.lower()
+                        cands = [
+                            sub / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
+                            sub / ".gemini" / "antigravity-cli" / "auth.json",
+                            sub / "antigravity-oauth-token",
+                            sub / "auth.json",
+                        ]
+                        if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names and any(c.is_file() for c in cands):
+                            profile_Auths.append((name, sub, cands))
+                            seen_names.add(name)
+    elif engine == "grok-build":
+        for entry in sorted(home.glob(".grok-*")):
+            if entry.is_dir():
+                name = entry.name[len(".grok-") :]
+                if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names:
+                    profile_Auths.append((name, entry, [entry / "auth.json", entry / "config.json"]))
+                    seen_names.add(name)
+        for parent in (home / "accounts", home / ".openclaude" / "profiles"):
+            if parent.is_dir():
+                for sub in sorted(parent.iterdir()):
+                    if sub.is_dir():
+                        name = sub.name.lower()
+                        cands = [sub / ".grok" / "auth.json", sub / "auth.json", sub / "config.json"]
+                        if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names and any(c.is_file() for c in cands):
+                            profile_Auths.append((name, sub, cands))
+                            seen_names.add(name)
+
+    results: List[Dict[str, Any]] = []
+    seen_fps: set[str] = set()
+    for profile_name, prof_root, files in profile_Auths:
+        email = None
+        plan_type: Optional[str] = None
+        has_valid_token = False
+        used_5h: Optional[float] = None
+        used_7d: Optional[float] = None
+        discovered_models: List[Dict[str, str]] = []
+        for f in files:
+            if f.is_file():
+                try:
+                    data = json.loads(f.read_text("utf-8", errors="strict"))
+                    if isinstance(data, dict):
+                        email = data.get("email") or data.get("account_email") or data.get("id_token_email") or email
+                        plan_type = data.get("plan") or data.get("plan_type") or plan_type
+                        tokens_obj = (
+                            data.get("tokens")
+                            if isinstance(data.get("tokens"), dict)
+                            else (data.get("token") if isinstance(data.get("token"), dict) else {})
+                        )
+                        # Support xAI grok auth.json issuer-keyed dict format (e.g. "https://auth.x.ai::...")
+                        if not tokens_obj and engine == "grok-build":
+                            for k, v in data.items():
+                                if isinstance(k, str) and "auth.x.ai" in k and isinstance(v, dict):
+                                    tokens_obj = v
+                                    email = v.get("email") or email
+                                    plan_type = v.get("principal_type") or plan_type
+                                    break
+                        token_candidate = (
+                            data.get("access_token")
+                            or data.get("id_token")
+                            or data.get("api_key")
+                            or data.get("OPENAI_API_KEY")
+                            or tokens_obj.get("access_token")
+                            or tokens_obj.get("id_token")
+                            or tokens_obj.get("key")
+                        )
+                        refresh_tok = (
+                            data.get("refresh_token")
+                            or data.get("refreshToken")
+                            or tokens_obj.get("refresh_token")
+                            or tokens_obj.get("refreshToken")
+                        )
+                        exp = (
+                            data["expires_at"]
+                            if "expires_at" in data and data["expires_at"] is not None
                             else (
-                                True
-                                if exp is None
+                                data["expiresAt"]
+                                if "expiresAt" in data and data["expiresAt"] is not None
                                 else (
-                                    ((exp > now_sec * 1000.0) if exp > 1e11 else (exp > now_sec))
-                                    if (isinstance(exp, (int, float)) and not isinstance(exp, bool))
-                                    else False
+                                    tokens_obj["expires_at"]
+                                    if "expires_at" in tokens_obj and tokens_obj["expires_at"] is not None
+                                    else tokens_obj.get("expiresAt")
                                 )
                             )
                         )
-                    has_refresh = (
-                        isinstance(refresh_tok, str)
-                        and len(refresh_tok.strip()) >= 16
-                        and (
-                            exp is None
-                            or isinstance(exp, str)
-                            or (isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0)
+                        now_sec = globals()["time"].time() if "time" in globals() else __import__("time").time()
+                        if isinstance(exp, str) and exp.strip():
+                            exp_ok = True
+                        else:
+                            exp_ok = (
+                                globals()["is_not_expired"](exp)
+                                if "is_not_expired" in globals()
+                                else (
+                                    True
+                                    if exp is None
+                                    else (
+                                        ((exp > now_sec * 1000.0) if exp > 1e11 else (exp > now_sec))
+                                        if (isinstance(exp, (int, float)) and not isinstance(exp, bool))
+                                        else False
+                                    )
+                                )
+                            )
+                        has_refresh = (
+                            isinstance(refresh_tok, str)
+                            and len(refresh_tok.strip()) >= 16
+                            and (
+                                exp is None
+                                or isinstance(exp, str)
+                                or (isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0)
+                            )
                         )
-                    )
-                    if isinstance(token_candidate, str) and len(token_candidate.strip()) >= 16 and (exp_ok or has_refresh):
-                        has_valid_token = True
-                    if isinstance(data.get("five_hour_used_pct"), (int, float)):
-                        used_5h = float(data["five_hour_used_pct"])
-                    if isinstance(data.get("seven_day_used_pct"), (int, float)):
-                        used_7d = float(data["seven_day_used_pct"])
-                    if isinstance(data.get("available_models"), list) and data["available_models"]:
-                        verified = [
-                            {
-                                "upstream_model_id": str(m.get("upstream_model_id") or m.get("id")).strip(),
-                                "display_name": str(m.get("display_name") or m.get("name") or m.get("id")).strip(),
-                            }
-                            for m in data["available_models"]
-                            if isinstance(m, dict)
-                            and isinstance(m.get("upstream_model_id") or m.get("id"), str)
-                            and str(m.get("upstream_model_id") or m.get("id")).strip()
-                        ]
-                        if verified:
-                            discovered_models = verified
-            except Exception:
-                pass
-    if has_valid_token and not discovered_models:
-        if engine == "codex":
-            discovered_models = discover_codex_models_from_cli(home, exe_path)
-        elif engine == "grok-build":
-            discovered_models = discover_grok_models_from_cli(home, exe_path)
-        elif engine == "antigravity":
-            discovered_models = discover_antigravity_models_from_cli(exe_path)
-    logged_in = bool(has_valid_token and len(discovered_models) > 0)
-    raw_id = email or f"{os.uname().nodename}:{engine}:default"
-    return [
-        {
-            "engine": engine,
-            "profile_name": "default",
-            "cli_version": cli_ver,
-            "runner_mode": "interactive",
-            "mod_digest": None,
-            "logged_in": logged_in,
-            "account_hint": mask_email(email) or f"{engine}:default",
-            "account_fingerprint": account_fingerprint(engine, raw_id),
-            "plan_type": str(plan_type) if (logged_in and plan_type) else None,
-            "discovered_models": discovered_models if logged_in else [],
-            "quota_windows": [
-                {"label": "5h", "usedPct": used_5h, "resetsAt": None},
-                {"label": "7d", "usedPct": used_7d, "resetsAt": None},
-            ],
-        }
-    ]
+                        if isinstance(token_candidate, str) and len(token_candidate.strip()) >= 16 and (exp_ok or has_refresh):
+                            has_valid_token = True
+                        if isinstance(data.get("five_hour_used_pct"), (int, float)):
+                            used_5h = float(data["five_hour_used_pct"])
+                        if isinstance(data.get("seven_day_used_pct"), (int, float)):
+                            used_7d = float(data["seven_day_used_pct"])
+                        if isinstance(data.get("available_models"), list) and data["available_models"]:
+                            verified = [
+                                {
+                                    "upstream_model_id": str(m.get("upstream_model_id") or m.get("id")).strip(),
+                                    "display_name": str(m.get("display_name") or m.get("name") or m.get("id")).strip(),
+                                }
+                                for m in data["available_models"]
+                                if isinstance(m, dict)
+                                and isinstance(m.get("upstream_model_id") or m.get("id"), str)
+                                and str(m.get("upstream_model_id") or m.get("id")).strip()
+                            ]
+                            if verified:
+                                discovered_models = verified
+                except Exception:
+                    pass
+        if has_valid_token and not discovered_models:
+            if engine == "codex":
+                discovered_models = discover_codex_models_from_cli(prof_root if (prof_root / "models_cache.json").is_file() else home, exe_path)
+            elif engine == "grok-build":
+                discovered_models = discover_grok_models_from_cli(prof_root if (prof_root / "models_cache.json").is_file() else home, exe_path)
+            elif engine == "antigravity":
+                discovered_models = discover_antigravity_models_from_cli(exe_path)
+        logged_in = bool(has_valid_token and len(discovered_models) > 0)
+        if profile_name != "default" and not logged_in:
+            continue
+        raw_id = email or f"{os.uname().nodename}:{engine}:{profile_name}"
+        fp = account_fingerprint(engine, raw_id)
+        if logged_in and fp in seen_fps:
+            continue
+        if logged_in:
+            seen_fps.add(fp)
+        results.append(
+            {
+                "engine": engine,
+                "profile_name": profile_name,
+                "cli_version": cli_ver,
+                "runner_mode": "interactive",
+                "mod_digest": None,
+                "logged_in": logged_in,
+                "account_hint": mask_email(email) or f"{engine}:{profile_name}",
+                "account_fingerprint": fp,
+                "plan_type": str(plan_type) if (logged_in and plan_type) else None,
+                "discovered_models": discovered_models if logged_in else [],
+                "quota_windows": [
+                    {"label": "5h", "usedPct": used_5h, "resetsAt": None},
+                    {"label": "7d", "usedPct": used_7d, "resetsAt": None},
+                ],
+            }
+        )
+    return results
 
 
 def check_credential_paths_isolated(home: pathlib.Path) -> bool:

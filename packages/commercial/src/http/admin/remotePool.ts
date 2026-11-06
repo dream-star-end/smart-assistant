@@ -61,6 +61,7 @@ export async function handleAdminRemotePoolNodeCreate(
       ssh_port: typeof body.ssh_port === 'number' ? body.ssh_port : 22,
       ssh_user: typeof body.ssh_user === 'string' ? body.ssh_user : 'box',
       host_key_fp: typeof body.host_key_fp === 'string' ? body.host_key_fp : '',
+      ssh_password: typeof body.ssh_password === 'string' ? body.ssh_password : '',
       mux_cap_slots: typeof body.mux_cap_slots === 'number' ? body.mux_cap_slots : 8,
       max_hot_slots: typeof body.max_hot_slots === 'number' ? body.max_hot_slots : 16,
       max_active_slots: typeof body.max_active_slots === 'number' ? body.max_active_slots : 8,
