@@ -379,6 +379,12 @@
       "reason": "服务端注入会话回调（cronOrigin / lease_callback）在 executeCronOriginInject 认领分发后广播带 cronOrigin 元数据的 outbound.ack，并在 getClientSessionPartial 增量拉取时附带 openDispatch，使在线浏览器无需刷新即可实时建立活跃回合与订阅流；同时前端将回调消息渲染为居中单行灰字系统通知（点击展开原始回执）。属于回调实时同步与展示形态优化，不改计费或历史落盘数据。",
       "approvedBy": "user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」",
       "expiresAt": "2026-12-05"
+    },
+    {
+      "commit": "ae3b77946db724b6b53b717aceeb5506213158c0",
+      "reason": "OCV5-721 远程模型池提交 ae3b77946（remote_pool 目录投影、多目录 profile、SSH 密码引导）以 fix(v5) 前缀推送但漏写 Incident trailer；已推送到共享 feat/v5-selfhost，不可改写。属于远程模型池功能开发，不对应会话展示/错误卡事故。仅豁免该完整 SHA。",
+      "approvedBy": "user 2026-11-06 webmw49pf18atbm96 选择「给这一个提交加例外后发布」",
+      "expiresAt": "2026-12-06"
     }
   ]
 }

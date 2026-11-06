@@ -51,6 +51,9 @@ EMERGENCY_SHA="aa583b702d5e454801e90ff3c6b25df38e808a98"
 # 2026-11-01 管家批准。已上线、不可改写、原 waiver 于 2026-10-31 过期。
 # 不延长 waiver，不冻结祖先。只豁免这一个完整 SHA。
 IMMUTABLE_EXPIRED_WAIVER_SHA="da9cd5484db3b0e5c882f4032ee09685c4e5b5a7"
+# 2026-11-06 用户批准。已推送到共享分支、不可改写、缺 Incident trailer。
+# 只豁免这一个完整 SHA，且必须有 commit 完全相等、未过期的 waiver；不冻结祖先。
+PUSHED_MISSING_TRAILER_SHA="ae3b77946db724b6b53b717aceeb5506213158c0"
 
 g() { git -C "$REPO" "$@"; }
 say() { [[ "$QUIET" == 1 ]] || echo "$*"; }
@@ -147,6 +150,11 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
           && "$inc_id" == "INC-20260804-RETRY-ERROR-REDCARD" && "$inc_root" == "aa583b70" ]]; then
       exp="$(jq -r '.expiresAt' <<<"$w")"
       if [[ "$exp" < "$today" ]]; then bad "$sha8 的 emergency trailer waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
+      continue
+    fi
+    if [[ "$sha" == "$PUSHED_MISSING_TRAILER_SHA" && -n "$w" && "$(jq -r '.commit' <<<"$w")" == "$sha" ]]; then
+      exp="$(jq -r '.expiresAt' <<<"$w")"
+      if [[ "$exp" < "$today" ]]; then bad "$sha8 的缺 trailer 例外 waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
       continue
     fi
     bad "$sha8 \"$subject\" 触碰用户可见面但缺 trailer:Incident: INC-YYYYMMDD-SLUG,或 Incident: none (<理由>) + waiver"

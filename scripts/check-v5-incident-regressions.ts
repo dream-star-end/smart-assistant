@@ -698,11 +698,17 @@ function checkTrailerClosure(): number {
         && waiver?.emergencyMissingTrailer === true
         && incident?.id === "INC-20260804-RETRY-ERROR-REDCARD"
         && incident.rootFixCommit === "aa583b70";
-      if (!exactImmutableEmergency) {
+      // 2026-11-06 用户批准：已推送、不可改写的缺 trailer 提交。只放行这一个完整 SHA，
+      // 需 commit 完全相等的未过期 waiver；不写入 IMPORTED_TRAILER_HISTORY_TIPS。
+      // 与 check-v5-fix-trailers.sh 的 PUSHED_MISSING_TRAILER_SHA 保持一致。
+      const pushedMissingTrailerException =
+        sha === "ae3b77946db724b6b53b717aceeb5506213158c0"
+        && waiver?.commit === sha;
+      if (!exactImmutableEmergency && !pushedMissingTrailerException) {
         fail(`${sha.slice(0, 8)} "${subject}" 触碰用户可见面但缺 trailer:`
           + "Incident: INC-YYYYMMDD-SLUG,或仅对已登记 exact P0 containment 使用带审批的 emergencyMissingTrailer waiver");
       }
-      if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 emergency trailer waiver 已于 ${waiver.expiresAt} 过期`);
+      if (waiver && waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 trailer 例外 waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
     if (/^none\b/.test(trailer)) {
