@@ -371,6 +371,8 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     const authority = input.authority.authorityEnvelope
     const lease = input.authority.leaseEnvelope
     const turnKey = input.turnKey
+    // The runner admits before it (re)spawns: a replaced lane is adopted here, ahead of the relay call.
+    await this.refresh()
     requireCc5(
       !this.closed &&
         !this.admitting &&

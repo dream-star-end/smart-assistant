@@ -385,3 +385,26 @@ test('two different models queued for one chat each get their own lane in order'
     await f.cleanup()
   }
 })
+
+test('a request queued for a container that was released meanwhile leaves the other container lane alone', { skip: !root }, async () => {
+  let open!: () => void
+  const f = fixture({ holdPrepare: new Promise<void>((resolve) => { open = resolve }) })
+  try {
+    await f.container('91')
+    const b = await f.container('92')
+    const fresh = f.lane(SESSION, MODEL, '92')
+    while (f.events.length === 0) await new Promise((resolve) => setTimeout(resolve, 5))
+    const stale = f.lane(SESSION, MODEL, '91')
+    const released = f.runtime.release('91')
+    open()
+    const backend = await fresh
+    await assert.rejects(stale, /REMOTE_LANE_UNAVAILABLE/)
+    await released
+    assert.deepEqual(f.places.map((p) => p.containerDbId), ['92'])
+    assert.deepEqual(readdirSync(b.mountSource).sort(), ['authority-public.json', backend.operationId].sort())
+    assert.ok(existsSync(join(b.mountSource, backend.operationId, 'relay.sock')), 'the new container keeps serving')
+    await f.runtime.release('92')
+  } finally {
+    await f.cleanup()
+  }
+})

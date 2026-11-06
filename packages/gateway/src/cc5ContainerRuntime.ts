@@ -307,6 +307,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       lane = await this.serial(owner, async () => {
         if (live(owner.lane)) return owner.lane
         try {
+          // A request whose container was released while it queued must not touch the chat's lane.
+          requireLane(container.state === 'active' && container.dockerId)
           if (owner.lane) {
             const old = owner.lane
             owner.lane = undefined
