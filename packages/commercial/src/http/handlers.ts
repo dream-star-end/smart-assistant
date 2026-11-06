@@ -632,9 +632,9 @@ async function emitAuthFunnel(input: {
 /** Map register business errors onto the frozen funnel code set. */
 export function mapRegisterFunnelCode(
   code: string,
-): "CONFLICT" | "TURNSTILE" | "EMAIL_DOMAIN_BLOCKED" | null {
+): "CONFLICT" | "TURNSTILE" | "EMAIL_DOMAIN_BLOCKED" | "IP_REGISTRATION_LIMIT" | null {
   if (code === "TURNSTILE_FAILED") return "TURNSTILE";
-  if (code === "CONFLICT" || code === "EMAIL_DOMAIN_BLOCKED") return code;
+  if (code === "CONFLICT" || code === "EMAIL_DOMAIN_BLOCKED" || code === "IP_REGISTRATION_LIMIT") return code;
   return null;
 }
 
@@ -670,8 +670,8 @@ export async function handleRegister(
 
   const body = await readJsonBody(req);
   try {
-    // register 里 remoteIp 只给 Turnstile(CF bot scoring 需要真实访客 IP),不写
-    // refresh_tokens。用 ctx.clientIp(CF-Connecting-IP)。
+    // register 里 remoteIp 给 Turnstile(CF bot scoring 需要真实访客 IP)和同 IP 账号
+    // 上限,不写 refresh_tokens。用 ctx.clientIp(CF-Connecting-IP)。
     const result = await register(body, {
       mailer: deps.mailer,
       turnstileSecret: deps.turnstileSecret,
@@ -710,6 +710,7 @@ export async function handleRegister(
         TURNSTILE_FAILED: { status: 400 },
         CONFLICT: { status: 409 },
         EMAIL_DOMAIN_BLOCKED: { status: 400 },
+        IP_REGISTRATION_LIMIT: { status: 403 },
       };
       const m = map[err.code];
       throw new HttpError(m.status, err.code, err.message, { issues: err.issues });

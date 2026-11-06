@@ -341,6 +341,24 @@ describe("commercial HTTP router (integ)", () => {
     assert.equal(r.status, 401);
   });
 
+  test("POST /api/auth/register: 4th account from one client IP → 403 IP_REGISTRATION_LIMIT", async (t) => {
+    if (skipIfMissing(t)) return;
+    const from = { "X-Forwarded-For": "203.0.113.50" };
+    const body = (n: number) => ({
+      email: `ipcap${n}@example.com`,
+      password: "ipcap good password",
+      turnstile_token: "tok",
+    });
+    for (const n of [1, 2, 3]) {
+      assert.equal((await postJson("/api/auth/register", body(n), from)).status, 201);
+    }
+    const refused = await postJson("/api/auth/register", body(4), from);
+    assert.equal(refused.status, 403);
+    assert.equal((refused.json.error as { code?: string }).code, "IP_REGISTRATION_LIMIT");
+    const otherIp = await postJson("/api/auth/register", body(5), { "X-Forwarded-For": "203.0.113.51" });
+    assert.equal(otherIp.status, 201);
+  });
+
   test("/api/me with garbage token → 401", async (t) => {
     if (skipIfMissing(t)) return;
     const r = await getJson("/api/me", { Authorization: "Bearer not-a-jwt" });

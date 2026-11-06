@@ -3663,7 +3663,9 @@ async function init() {
                       ? 'LINUX DO 登录暂时不可用'
                       : _oauthErr === 'registration_disabled'
                         ? '网站当前暂停新用户注册'
-                        : 'LINUX DO 登录失败，请稍后再试'
+                        : _oauthErr === 'ip_registration_limit'
+                          ? '当前网络注册的账号数已达上限，无法继续注册'
+                          : 'LINUX DO 登录失败，请稍后再试'
         toast(_msg, _oauthErr === 'denied' ? 'info' : 'error')
         try {
           const cleanUrl = new URL(window.location.href)
