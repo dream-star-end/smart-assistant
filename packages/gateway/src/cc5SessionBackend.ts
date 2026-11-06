@@ -1,5 +1,10 @@
-/** Session admission for the single signed remote chat; no model or filesystem effects. */
+/** Session admission for a signed remote-lane chat; no model or filesystem effects. */
 import { type Cc5ExecutionBackend, boxClaudeRunner, isCc5ExecutionBackend } from '@openclaude/protocol'
+
+/** Remote-pool catalog ids always end in `-remote` (remoteBrainPool toRemotePoolModelId). */
+function isRemoteChatModel(model: string): boolean {
+  return model.endsWith('-remote') || boxClaudeRunner(model) === 'interactive'
+}
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 
 export function cc5SessionBackend(input: {
@@ -15,11 +20,10 @@ export function cc5SessionBackend(input: {
   channel?: string
 }): Cc5ExecutionBackend | undefined {
   const scope = input.executionAuthority?.executionBackend
-  // A restart must never silently replay a remote Box Claude chat locally, whichever
-  // of the interactive rows it bound. Explicit switches to other models keep their
-  // preexisting behavior (the new local runner starts without the remote resume id).
-  if (boxClaudeRunner(input.executionModel) === 'interactive' && !scope &&
-      isCc5ResumeId(input.storedResumeId)) {
+  // A restart must never silently replay a remote chat locally while it still names a
+  // remote model. Explicit switches to other models keep their preexisting behavior
+  // (the new local runner starts without the remote resume id).
+  if (isRemoteChatModel(input.executionModel) && !scope && isCc5ResumeId(input.storedResumeId)) {
     throw new Error('CC5_BACKEND_SCOPE_CHANGED_NEW_CHAT_REQUIRED')
   }
   if (scope !== undefined && (

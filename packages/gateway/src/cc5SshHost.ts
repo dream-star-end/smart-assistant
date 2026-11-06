@@ -21,6 +21,13 @@ const DEFAULT_CC5_UPSTREAM_MODEL = 'claude-sonnet-5'
 function requireHost(ok: unknown): asserts ok {
   if (!ok) throw new Error(FAILED)
 }
+type Cc5SshRole = 'launch' | 'tool-socket' | 'stop' | 'stop-socket' | 'prove-stopped' | 'reset' | 'provision'
+/** A remote role exited non-zero; only the controller's fixed one-line label is kept. */
+export class Cc5SshControlError extends Error {
+  constructor(readonly remoteMessage: string) {
+    super(FAILED)
+  }
+}
 
 /**
  * Deployment-selected remote target for the interactive CC backend: one pool node,
@@ -213,9 +220,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     requireHost(Number.isInteger(value) && value > 0 && value <= normal)
     return value
   }
-  private argv(
-    role: 'launch' | 'tool-socket' | 'stop' | 'stop-socket' | 'prove-stopped',
-  ): string[] {
+  private argv(role: Cc5SshRole): string[] {
     const target = this.config.target
     const command = `exec(compile(__import__('base64').b64decode('${this.source}'),'cc5-task-controller','exec'))`
     const remote = ['/usr/bin/python3', '-I', '-B', '-c', command, role, this.config.taskRoot]
@@ -431,23 +436,46 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       ),
     )
   }
+  /**
+   * Before this host's first start: end whatever an earlier owner left on the task root
+   * (a master restart loses its SSH channels but not the remote tmux), then provision the
+   * chat's root from `packet` (package-provision output). Idempotent for a known root.
+   */
+  async prepareTask(packet: Buffer): Promise<void> {
+    requireHost(!this.started && !this.closing && packet.length > 0 && packet.length <= 2 * 1024 * 1024)
+    const reset = await this.control('reset', 30000).catch(async (error: unknown) => {
+      // A root that was never provisioned has nothing to reset.
+      if (error instanceof Cc5SshControlError && error.remoteMessage === 'CC5_PREP_ERROR FileNotFoundError') return null
+      throw error
+    })
+    requireHost(reset === null || reset.kind === 'task-reset')
+    const provisioned = await this.control('provision', 30000, packet)
+    requireHost(provisioned.kind === 'task-root-provisioned' && provisioned.root === this.config.taskRoot)
+  }
   private async control(
-    role: 'stop' | 'stop-socket' | 'prove-stopped',
+    role: 'stop' | 'stop-socket' | 'prove-stopped' | 'reset' | 'provision',
     remaining: number,
+    input?: Buffer,
   ): Promise<Record<string, unknown>> {
     const child = this.spawnSsh(this.argv(role))
-    child.stderr.resume() // Never return remote errors, pane contents or argv.
+    const errors: Buffer[] = []
+    child.stderr.on('data', (chunk: Buffer) => {
+      // Only the controller's own one-line error label is kept, never pane/argv text.
+      if (errors.reduce((n, b) => n + b.length, 0) < 4096) errors.push(chunk)
+    })
     child.stdin.on('error', () => {})
-    child.stdin.end()
+    child.stdin.end(input)
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = []
       let size = 0
+      // reset waits on the node for the old round's processes to exit; it has its own bound.
+      const bound = role === 'reset' || role === 'provision' ? remaining : Math.min(remaining, this.deadline('controlMs', 15000))
       const timer = setTimeout(
         () => {
           child.kill('SIGKILL')
           reject(new Error(FAILED))
         },
-        Math.min(remaining, this.deadline('controlMs', 15000)),
+        bound,
       )
       child.stdout.on('data', (chunk: Buffer) => {
         size += chunk.length
@@ -464,7 +492,12 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       child.once('close', (code) => {
         clearTimeout(timer)
         try {
-          requireHost(code === 0 && size > 0 && size <= MAX_BODY)
+          if (code !== 0) {
+            const line = Buffer.concat(errors).toString('utf8').split('\n')[0] ?? ''
+            reject(new Cc5SshControlError(/^(CC5_PREP_ERROR [a-zA-Z0-9-]{1,80}|CC5_SSH_COMMAND_REJECTED)$/.test(line) ? line : ''))
+            return
+          }
+          requireHost(size > 0 && size <= MAX_BODY)
           resolve(object(Buffer.concat(chunks)))
         } catch {
           reject(new Error(FAILED))

@@ -24,9 +24,18 @@ import {
 import type { TurnModelAuthority } from './subprocessSpawnConfig.js'
 import type { SpawnOpts } from './terminalBackend.js'
 
-export const CC5_BINDING_FILE = '/run/oc/cc5-remote-t1555u/binding.json'
-export const CC5_AUTHORITY_KEYRING_FILE = '/run/oc/cc5-remote-t1555u/authority-public.json'
-export const CC5_RELAY_SOCKET = '/run/oc/cc5-remote-t1555u/relay.sock'
+export const CC5_MOUNT = '/run/oc/cc5-remote-t1555u'
+export const CC5_AUTHORITY_KEYRING_FILE = `${CC5_MOUNT}/authority-public.json`
+const LANE_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
+/** One remote chat lane per operation: its binding and relay live in the supervisor's lane dir. */
+export function cc5LanePaths(operationId: string, mount = CC5_MOUNT): { binding: string; socket: string } {
+  requireCc5(LANE_ID.test(operationId))
+  return { binding: `${mount}/${operationId}/binding.json`, socket: `${mount}/${operationId}/relay.sock` }
+}
+function isLaneBinding(path: string): boolean {
+  const match = /^\/run\/oc\/cc5-remote-t1555u\/([a-f0-9-]{36})\/binding\.json$/.exec(path)
+  return match !== null && LANE_ID.test(match[1]!)
+}
 export const CC5_BRIDGE_MAX_FRAME_BYTES = 8 * 1024 * 1024
 export const CC5_BINDING_SLIDING_TTL_MS = 24 * 60 * 60 * 1000
 export interface Cc5BridgeBinding {
@@ -75,7 +84,8 @@ function requireCc5(value: unknown): asserts value {
 
 /** No user/env path may select a supervisor-owned file. Errors never echo JSON. */
 function readSupervisorJson(path: string): unknown {
-  requireCc5(path === CC5_BINDING_FILE || path === CC5_AUTHORITY_KEYRING_FILE)
+  const binding = isLaneBinding(path)
+  requireCc5(binding || path === CC5_AUTHORITY_KEYRING_FILE)
   const dir = lstatSync(dirname(path))
   requireCc5(dir.isDirectory() && dir.uid === 0 && (dir.mode & 0o027) === 0)
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
@@ -91,7 +101,7 @@ function readSupervisorJson(path: string): unknown {
         meta.nlink === 1 &&
         (meta.mode & 0o027) === 0 &&
         meta.size > 0 &&
-        meta.size <= (path === CC5_BINDING_FILE ? 4096 : 16384),
+        meta.size <= (binding ? 4096 : 16384),
     )
     return JSON.parse(readFileSync(fd, 'utf8'))
   } finally {
@@ -101,11 +111,11 @@ function readSupervisorJson(path: string): unknown {
 
 /** Only the supervisor's root-owned read-only bind may select a relay. */
 export function readCc5Binding(
-  path = CC5_BINDING_FILE,
+  path: string,
   now = Date.now(),
 ): Readonly<Cc5BridgeBinding> {
   try {
-    requireCc5(path === CC5_BINDING_FILE)
+    requireCc5(isLaneBinding(path))
     const b = readSupervisorJson(path) as Cc5BridgeBinding
     requireCc5(
       b.version === 2 &&
@@ -118,6 +128,7 @@ export function readCc5Binding(
         b.expiresAt > now,
     )
     assertCc5BindingScope(b)
+    requireCc5(path === cc5LanePaths(b.operationId).binding)
     return Object.freeze(b)
   } catch {
     throw new Error('CC5_BRIDGE_BINDING_INVALID')
@@ -125,17 +136,16 @@ export function readCc5Binding(
 }
 
 /**
- * Re-read a supervisor-updated `binding.json` (at `CC5_BINDING_FILE` or adjacent to `socketPath`),
+ * Re-read a supervisor-updated `binding.json` adjacent to the lane's `socketPath`,
  * verifying that every immutable identity field matches `initial` before accepting an extended `expiresAt`.
  */
 export function refreshCc5Binding(
   initial: Readonly<Cc5BridgeBinding>,
-  socketPath = CC5_RELAY_SOCKET,
+  socketPath: string,
   now = Date.now(),
 ): Readonly<Cc5BridgeBinding> {
   assertCc5BindingScope(initial)
-  const candidatePath =
-    socketPath === CC5_RELAY_SOCKET ? CC5_BINDING_FILE : `${dirname(socketPath)}/binding.json`
+  const candidatePath = `${dirname(socketPath)}/binding.json`
   try {
     const dir = lstatSync(dirname(candidatePath))
     requireCc5(
@@ -212,7 +222,7 @@ export interface Cc5BridgePort {
 export function cc5ControlRequest(
   path: '/admit' | '/renew' | '/interrupt' | '/stop' | '/tool/register' | '/tool/stopped',
   body: Readonly<Record<string, unknown>>,
-  socketPath = CC5_RELAY_SOCKET,
+  socketPath: string,
 ): Promise<Record<string, unknown>> {
   const payload = JSON.stringify(body)
   return new Promise((resolve, reject) => {
@@ -271,7 +281,11 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
   constructor(
     private readonly binding: Readonly<Cc5BridgeBinding>,
     private readonly sessionKey: string,
-    private readonly call = cc5ControlRequest,
+    private readonly call: (
+      path: Parameters<typeof cc5ControlRequest>[0],
+      body: Readonly<Record<string, unknown>>,
+    ) => Promise<Record<string, unknown>> = (path, body) =>
+      cc5ControlRequest(path, body, cc5LanePaths(binding.operationId).socket),
   ) {
     this.bindingId = binding.operationId
     assertCc5BindingScope(binding)
@@ -297,7 +311,7 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     }
     return {
       command: process.execPath,
-      args: ['--conditions=openclaude-precompiled', entry, this.sessionKey],
+      args: ['--conditions=openclaude-precompiled', entry, this.sessionKey, this.binding.operationId],
       ccbBinaryDir: dirname(entry),
       subprocessCwd: cwd,
       env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' },
@@ -376,7 +390,7 @@ export function createCc5BridgePort(
   env: NodeJS.ProcessEnv = process.env,
 ): Cc5BridgePort {
   const expected = parseCc5ExecutionBackend(executionBackend)
-  const binding = readCc5Binding()
+  const binding = readCc5Binding(cc5LanePaths(expected.operationId).binding)
   requireCc5(binding.uid === env.OC_USER_ID && binding.containerDbId === env.OC_CONTAINER_ID &&
     expected.sessionKey === sessionKey && expected.sessionKey === binding.sessionKey &&
     expected.operationId === binding.operationId && canonicalModel === binding.canonicalModel)

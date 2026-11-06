@@ -31,9 +31,6 @@ describe('boxApiModels', () => {
       ['box-claude-opus-5-5', 'claude-opus-5-5', 128_000, true, 'interactive'],
       ['box-claude-sonnet-5', 'claude-sonnet-5', 128_000, true, 'interactive'],
       ['box-claude-haiku-5-5', 'claude-haiku-5-5', 128_000, true, 'interactive'],
-      ['claude-opus-5-5-remote', 'claude-opus-5-5', 128_000, true, 'interactive'],
-      ['claude-sonnet-5-5-remote', 'claude-sonnet-5-5', 128_000, true, 'interactive'],
-      ['claude-haiku-5-5-remote', 'claude-haiku-5-5', 128_000, true, 'interactive'],
     ])
     assert.equal(new Set(BOX_API_MODEL_IDS).size, BOX_API_MODELS.length)
     assert.deepEqual(BOX_API_UPSTREAM_MODEL_IDS, ['claude-opus-5-5', 'claude-sonnet-5-5',

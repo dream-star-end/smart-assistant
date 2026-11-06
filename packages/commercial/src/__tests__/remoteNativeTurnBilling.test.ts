@@ -21,13 +21,14 @@ import type { PreCheckRedis } from '../billing/preCheck.js'
 import { SettlementCommitOutcomeUnknownError, type settleUsageAndLedger } from '../billing/proxyBilling.js'
 import {
   createRemoteNativeTurnFinance, recoverRemoteNativeTurnBilling,
-  REMOTE_NATIVE_BILLING_RECOVERY_VERSION, REMOTE_NATIVE_CANONICAL_MODEL,
+  REMOTE_NATIVE_BILLING_RECOVERY_VERSION,
   type RemoteNativeFinanceFixtures,
 } from '../billing/remoteNativeTurnBilling.js'
 import { createLogger } from '../logging/logger.js'
 
 const NOW = 1_760_000_000_000
-const MODEL = REMOTE_NATIVE_CANONICAL_MODEL
+const MODEL = 'claude-opus-5-5-remote'
+const UPSTREAM = 'claude-opus-5-5'
 const SESSION = 'agent:main:webchat:dm:new_chat_123'
 const OPERATION = '11111111-1111-4111-8111-111111111111'
 const RUN = '22222222-2222-4222-8222-222222222222'
@@ -43,8 +44,8 @@ const KEYS: AuthorityKeyring = new Map([[KEY_ID, new Uint8Array(Buffer.from(jwk.
 const logger = createLogger({ out: () => undefined })
 
 const ENTRY: ModelCatalogEntry = {
-  entryId: 1, modelId: MODEL, engine: 'ccb', providerId: 'box_cli',
-  upstreamModelId: 'claude-sonnet-5', contextWindow: 200_000,
+  entryId: 1, modelId: MODEL, engine: 'ccb', providerId: 'remote_pool', placement: 'remote_pool',
+  upstreamModelId: UPSTREAM, contextWindow: 200_000,
   capabilityProfile: { supportsVision: true, reasoning: { supported: [], codexModelDefault: null },
     ccb: { capabilityZero: false, supportsThinking: true, contextOwner: 'box-native-v1' } },
   capabilitySchemaVersion: 1, state: 'active', lockVersion: 0,
@@ -98,7 +99,7 @@ function receipt(over: Partial<LiveReceipt> = {}): LiveReceipt {
   return { version: 2, authorityTurnId: AUTHORITY_TURN, turnKey: TURN,
     backendKind: b.backendKind, uid: b.uid, containerDbId: b.containerDbId,
     dockerId: b.dockerId, operationId: b.operationId, runId: b.runId, sessionKey: b.sessionKey,
-    nativeSessionId: NATIVE_SESSION, canonicalModel: MODEL, upstreamModel: 'claude-sonnet-5',
+    nativeSessionId: NATIVE_SESSION, canonicalModel: MODEL, upstreamModel: UPSTREAM,
     resultSha256: 'c'.repeat(64), status: 'success',
     usage: { inputTokens: 10_000, outputTokens: 2_000, cacheReadTokens: 3_000, cacheWriteTokens: 400 }, ...over }
 }
@@ -267,7 +268,7 @@ function fixture(options: {
   const pool = (options.dispatchPool
     ? { query: store.query.bind(store), connect: options.dispatchPool.connect.bind(options.dispatchPool) }
     : store) as unknown as Pool
-  const finance = createRemoteNativeTurnFinance({ pool, preCheckRedis: redis,
+  const finance = createRemoteNativeTurnFinance({ upstreamModel: UPSTREAM, pool, preCheckRedis: redis,
     catalog: { assertFresh: async () => catalogSnapshot } as unknown as ModelCatalogCache,
     keyring: () => keyring, loadUserModelAuthz: async (uid, epoch) => {
       assert.equal(uid, 42n); assert.equal(epoch, 5n)
@@ -307,7 +308,7 @@ function continuedFixture(first: Parameters<typeof fixture>[0] = {}) {
     return f.store.query(sql, values)
   }
   const pool = { query, async connect() { return { query, release() {} } } } as unknown as Pool
-  const finance = createRemoteNativeTurnFinance({ pool, preCheckRedis: turns[0].redis,
+  const finance = createRemoteNativeTurnFinance({ upstreamModel: UPSTREAM, pool, preCheckRedis: turns[0].redis,
     catalog: { assertFresh: async () => snapshot() } as unknown as ModelCatalogCache,
     keyring: KEYS, loadUserModelAuthz: async (uid) => ({ uid, role: 'user',
       grantedModelIds: new Set<string>(), deniedModelIds: new Set<string>(), userPlanTier: null, orgPlanCode: null }),

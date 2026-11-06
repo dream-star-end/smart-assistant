@@ -511,6 +511,10 @@ export class Cc5Relay {
     }
   }
 
+  /** Revoked relays never serve another turn; the owner must replace the lane. */
+  get stopped(): boolean {
+    return this.revoked
+  }
   stop(): Promise<{ remoteStopped: true }> {
     if (this.stopPromise) return this.stopPromise
     this.revoked = true

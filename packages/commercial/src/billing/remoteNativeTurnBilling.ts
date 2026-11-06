@@ -1,5 +1,6 @@
-/** Existing Sonnet billing for one pinned native worker, never a pool account.
- * Recovery only settles a durable original receipt; it cannot launch a worker.
+/** Billing for a remote-pool chat lane: the canonical model is the lane binding's, the native
+ * upstream model is the one its node runs. Recovery only settles a durable original receipt;
+ * it cannot launch a worker.
  */
 import { isDeepStrictEqual } from 'node:util'
 import type { Pool } from 'pg'
@@ -30,9 +31,8 @@ import {
 } from './proxyBilling.js'
 
 export { REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
-export const REMOTE_NATIVE_CANONICAL_MODEL = 'box-claude-sonnet-5'
-const UPSTREAM_MODEL = 'claude-sonnet-5'
 const BACKEND = 'cc5-interactive-v1'
+const MODEL = /^[a-z0-9][a-z0-9._-]{0,63}$/
 /** Soft reservation only, not a promise that upstream spend is capped. */
 export const REMOTE_NATIVE_RESERVATION_CREDITS = 100n
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
@@ -48,6 +48,8 @@ function object(value: unknown): Record<string, unknown> {
 interface Scope {
   uid: string; containerDbId: string; dockerId: string; operationId: string; runId: string
   sessionKey: string; canonicalModel: string; backendKind: typeof BACKEND; expiresAt: number
+  /** The lane node's CLI model; every native receipt must carry exactly it. */
+  upstreamModel: string
 }
 interface Context {
   v: 1; scope: Scope; requestId: string; turnKey: string; authorityTurnId: string
@@ -64,6 +66,8 @@ export interface RemoteNativeTurnFinanceDeps {
   keyring: AuthorityKeyring | (() => AuthorityKeyring)
   loadUserModelAuthz: UserModelAuthzLoader
   log: Logger
+  /** The lane node's CLI model (target upstream). */
+  upstreamModel: string
   now?: () => number
 }
 /** Primitive substitutes are for isolated tests only. Production passes no second argument. */
@@ -72,16 +76,16 @@ export interface RemoteNativeFinanceFixtures {
   release?: typeof releasePreCheck
   settle?: typeof settleUsageAndLedger
 }
-function scopeOf(binding: Readonly<Cc5BridgeBinding>): Scope {
+function scopeOf(binding: Readonly<Cc5BridgeBinding>, upstreamModel: string): Scope {
   need(binding.version === 2 && binding.backendKind === BACKEND
-    && binding.canonicalModel === REMOTE_NATIVE_CANONICAL_MODEL
+    && MODEL.test(binding.canonicalModel) && MODEL.test(upstreamModel)
     && POSITIVE_ID.test(binding.uid) && POSITIVE_ID.test(binding.containerDbId)
     && HASH.test(binding.dockerId) && UUID.test(binding.operationId) && UUID.test(binding.runId)
     && typeof binding.sessionKey === 'string' && binding.sessionKey.length > 0
     && binding.sessionKey.length <= 512 && Number.isSafeInteger(binding.expiresAt))
   return { uid: binding.uid, containerDbId: binding.containerDbId, dockerId: binding.dockerId,
     operationId: binding.operationId, runId: binding.runId, sessionKey: binding.sessionKey,
-    canonicalModel: binding.canonicalModel, backendKind: BACKEND, expiresAt: binding.expiresAt }
+    canonicalModel: binding.canonicalModel, backendKind: BACKEND, expiresAt: binding.expiresAt, upstreamModel }
 }
 export function validateRemoteNativeReceipt(raw: unknown, scope: Scope): Cc5NativeTerminalReceipt {
   const r = object(raw)
@@ -95,7 +99,7 @@ export function validateRemoteNativeReceipt(raw: unknown, scope: Scope): Cc5Nati
     && r.containerDbId === scope.containerDbId && r.dockerId === scope.dockerId
     && r.operationId === scope.operationId && r.runId === scope.runId
     && r.sessionKey === scope.sessionKey && r.canonicalModel === scope.canonicalModel
-    && r.upstreamModel === UPSTREAM_MODEL && typeof r.nativeSessionId === 'string'
+    && r.upstreamModel === scope.upstreamModel && typeof r.nativeSessionId === 'string'
     && UUID.test(r.nativeSessionId) && typeof r.resultSha256 === 'string' && HASH.test(r.resultSha256)
     && (r.status === 'success' || r.status === 'error'))
   const u = object(r.usage)
@@ -116,8 +120,9 @@ function parseContext(raw: unknown): Context {
     && typeof c.reservedCredits === 'string' && /^\d+$/.test(c.reservedCredits)
     && BigInt(c.reservedCredits) <= REMOTE_NATIVE_RESERVATION_CREDITS)
   const s = object(c.scope)
-  scopeOf({ ...s, version: 2 } as unknown as Cc5BridgeBinding)
-  need(parseBillingPricing(c.pricing, REMOTE_NATIVE_CANONICAL_MODEL))
+  need(typeof s.upstreamModel === 'string')
+  scopeOf({ ...s, version: 2 } as unknown as Cc5BridgeBinding, s.upstreamModel as string)
+  need(parseBillingPricing(c.pricing, s.canonicalModel as string))
   const a = object(c.authority)
   need(a.kind === 'bridge_signed' && typeof a.executionRevision === 'string'
     && a.executionRevision.length > 0 && a.projectionRevision === null
@@ -262,7 +267,7 @@ export function createRemoteNativeTurnFinance(
   const activeOperations = new Map<string, string>()
   const now = deps.now ?? Date.now
   return { async admit(input) {
-    const scope = scopeOf(input.binding)
+    const scope = scopeOf(input.binding, deps.upstreamModel)
     need(scope.expiresAt > now() && input.sessionKey === scope.sessionKey && HASH.test(input.turnKey))
     const keys = typeof deps.keyring === 'function' ? deps.keyring() : deps.keyring
     const a = verifyAuthority(input.authorityEnvelope, keys, now())

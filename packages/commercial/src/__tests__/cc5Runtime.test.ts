@@ -1,152 +1,69 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 import type { Cc5FinanceFactory } from '@openclaude/gateway/cc5-finance'
-import { createMasterCc5Runtime, parseCc5DeploymentMetadata, selectMasterCc5Backend } from '../agent-sandbox/cc5Runtime.js'
+import type { RemoteLaneRuntimePort, createRemoteLaneRuntime } from '@openclaude/gateway/cc5-container-runtime'
+import { createMasterCc5Runtime, selectMasterCc5Backend } from '../agent-sandbox/cc5Runtime.js'
 
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
-function data() {
-  return {
-    version: 2,
-    task: 'AGENT-REMOTE-T1555U',
-    testUid: '912',
-    user: 'box',
-    taskRoot: '/home/box/oc-agentremote-t1555u-20261102t1400z-fixture',
-    profile: { operationId: randomUUID(), runId: randomUUID() },
-    scope: { canonicalModel: 'box-claude-sonnet-5', sessionKey: 'agent:main:webchat:dm:new_chat_123' },
-  }
-}
-const financeFactory: Cc5FinanceFactory = () => { throw new Error('must not create finance before binding') }
-test('master OFF/nonselfhost/missing authority/invalid UID/missing finance never reads deployment metadata', () => {
-  let reads = 0
+const financeFactory: Cc5FinanceFactory = () => { throw new Error('must not create finance before a lane') }
+
+test('master OFF/nonselfhost/missing authority/invalid UID/missing finance never creates the lane runtime', () => {
+  let creates = 0
   for (const input of [
     { selfhost: true, authorityReady: true, env: {}, financeFactory },
     { selfhost: false, authorityReady: true, env, financeFactory },
     { selfhost: true, authorityReady: false, env, financeFactory },
     { selfhost: true, authorityReady: true, env },
-    {
-      selfhost: true,
-      authorityReady: true,
-      env: { ...env, OC_SELFHOST_CC5_T1555U_TEST_UID: 'all' },
-      financeFactory,
-    },
+    { selfhost: true, authorityReady: true, env: { ...env, OC_SELFHOST_CC5_T1555U_TEST_UID: 'all' }, financeFactory },
   ]) {
-    assert.equal(
-      createMasterCc5Runtime(input, {
-        read() {
-          reads++
-          throw new Error('must not read')
-        },
-      }),
-      undefined,
-    )
+    assert.equal(createMasterCc5Runtime(input, { create: () => { creates++; throw new Error('never') } }), undefined)
   }
-  assert.equal(reads, 0)
+  assert.equal(creates, 0)
 })
-test('invalid deployment fails only the dedicated lane and reports a fixed diagnostic', () => {
-  let rejected = 0
-  assert.equal(
-    createMasterCc5Runtime(
-      { selfhost: true, authorityReady: true, env, financeFactory },
-      {
-        read() {
-          throw new Error('sensitive underlying path must not escape')
-        },
-        rejected() {
-          rejected++
-        },
-      },
-    ),
-    undefined,
-  )
-  assert.equal(rejected, 1)
-})
-test('deployment can only select public task identities; key/source/network paths are fixed', () => {
-  const valid = data()
-  const config = parseCc5DeploymentMetadata(Buffer.from(JSON.stringify(valid)), '912')
-  assert.equal(config.ssh.target.user, valid.user)
-  assert.deepEqual(config.scope, valid.scope)
-  assert.deepEqual(config.profile, valid.profile)
-  assert.equal(Object.isFrozen(config.scope), true)
-  assert.equal(Object.isFrozen(config.profile), true)
-  assert.ok(config.ssh.target.keyPath.endsWith('/.task-tmp/cc5-ssh/id_ed25519'))
-  assert.equal(config.ssh.target.host, '136.86.172.84')
-  assert.equal(config.ssh.target.port, 22)
-  assert.equal(config.ssh.target.taskRootPrefix, '/home/box/oc-agentremote-')
-  assert.equal(config.ssh.target.upstreamModel, 'claude-sonnet-5')
+
+test('the master runtime places lanes through the pool scheduler under the fixed base root', () => {
+  let seen: Parameters<typeof createRemoteLaneRuntime>[0] | undefined
+  const runtime = {} as RemoteLaneRuntimePort
+  assert.equal(createMasterCc5Runtime({ selfhost: true, authorityReady: true, env, financeFactory },
+    { create: (input) => { seen = input; return runtime } }), runtime)
+  const config = seen!.configuration()
   assert.equal(config.baseRoot, '/run/oc-cc5-t1555u')
-  for (const patch of [
-    { testUid: '913' },
-    { user: 'root' },
-    { taskRoot: '/home/other/oc-agentremote-t1555u-20261102t1400z-fixture' },
-    { host: 'different-ssh-server' },
-    { privateKeyPath: '/old/key' },
-    { version: 1 },
-    { profile: { ...valid.profile, operationId: 'invalid' } },
-  ]) {
-    assert.throws(() =>
-      parseCc5DeploymentMetadata(Buffer.from(JSON.stringify({ ...valid, ...patch })), '912'),
-    )
-  }
+  assert.ok(config.controllerPath.endsWith('/scripts/agent-remote/cc5-host-controller.py'))
+  assert.equal(typeof seen!.hooks.place, 'function')
+  assert.equal(seen!.financeFactory, financeFactory)
 })
 
-test('the declared platform model reaches the remote CLI as its upstream id', () => {
-  const valid = data()
-  for (const [canonicalModel, upstreamModel] of [
-    ['box-claude-sonnet-5', 'claude-sonnet-5'],
-    ['box-claude-opus-5', 'claude-opus-5'],
-    ['box-claude-haiku-5-5', 'claude-haiku-5-5'],
-    ['claude-sonnet-5', 'claude-sonnet-5'],
-  ] as const) {
-    const config = parseCc5DeploymentMetadata(
-      Buffer.from(JSON.stringify({ ...valid, scope: { ...valid.scope, canonicalModel } })),
-      '912',
-    )
-    assert.equal(config.scope.canonicalModel, canonicalModel)
-    assert.equal(config.ssh.target.upstreamModel, upstreamModel)
-  }
-})
-
-test('v2 metadata rejects missing, legacy, auxiliary or expanded backend scopes before runtime IO', () => {
-  const valid = data()
-  for (const scope of [
-    undefined, null, [], 'agent:main:webchat:dm:new_chat_123', {},
-    { ...valid.scope, canonicalModel: 'Claude Opus 5' },
-    { ...valid.scope, canonicalModel: '' },
-    { ...valid.scope, sessionKey: 'fixture-session' },
-    { ...valid.scope, sessionKey: 'agent:main:cron:dm:new_chat_123' },
-    { ...valid.scope, sessionKey: `${valid.scope.sessionKey}\n` },
-    { ...valid.scope, operationId: valid.profile.operationId },
-  ]) {
-    assert.throws(() => parseCc5DeploymentMetadata(Buffer.from(JSON.stringify({ ...valid, scope })), '912'))
-  }
-  for (const bytes of [Buffer.alloc(0), Buffer.alloc(16385), Buffer.from([0xff]), Buffer.from('[]')]) {
-    assert.throws(() => parseCc5DeploymentMetadata(bytes, '912'))
-  }
-  let reads = 0
+test('a failing runtime setup only disables remote lanes and reports once', () => {
   let rejected = 0
-  const runtime = createMasterCc5Runtime({ selfhost: true, authorityReady: true, env, financeFactory }, {
-    read(uid) {
-      reads++
-      return parseCc5DeploymentMetadata(Buffer.from(JSON.stringify({ ...valid, version: 1 })), uid)
-    },
-    rejected() { rejected++ },
-  })
-  assert.equal(runtime, undefined)
-  assert.equal(reads, 1)
+  assert.equal(createMasterCc5Runtime({ selfhost: true, authorityReady: true, env, financeFactory }, {
+    create: () => { throw new Error('sensitive path must not escape') },
+    rejected: () => { rejected++ },
+  }), undefined)
   assert.equal(rejected, 1)
 })
 
-
-test('enabled incomplete setup rejects rather than silently selecting the ordinary same-model worker', () => {
+test('a remote-pool turn always gets its lane or fails; a local model never gets one', async () => {
+  const calls: unknown[] = []
+  const runtime = { async ensureLane(request: unknown) {
+    calls.push(request)
+    return { kind: 'cc5-interactive-v1' as const, sessionKey: 'agent:main:webchat:dm:new_chat_123',
+      operationId: '00000000-0000-4000-8000-000000000001' }
+  } } as unknown as RemoteLaneRuntimePort
   const input = { uid: 912, containerId: 91, sessionKey: 'agent:main:webchat:dm:new_chat_123',
-    canonicalModel: 'box-claude-sonnet-5', engine: 'ccb' }
-  assert.throws(() => selectMasterCc5Backend(undefined, input, true, env), /CC5_FRESH_CONTAINER_BINDING_REJECTED/)
-  assert.equal(selectMasterCc5Backend(undefined, input, false, env), undefined)
-  assert.equal(selectMasterCc5Backend(undefined, { ...input, uid: 913 }, true, env), undefined)
-  assert.equal(selectMasterCc5Backend(undefined, input, true, {}), undefined)
-  assert.equal(
-    selectMasterCc5Backend(undefined, { ...input, canonicalModel: 'gpt-5.4', engine: 'codex' }, true, env),
-    undefined,
-  )
+    canonicalModel: 'claude-opus-5-5-remote', engine: 'ccb', placement: 'remote_pool' as const }
+  assert.deepEqual(await selectMasterCc5Backend(runtime, input, true, env), {
+    kind: 'cc5-interactive-v1', sessionKey: input.sessionKey, operationId: '00000000-0000-4000-8000-000000000001' })
+  assert.deepEqual(calls, [{ uid: 912, containerDbId: '91', sessionKey: input.sessionKey,
+    canonicalModel: 'claude-opus-5-5-remote' }])
+  assert.equal(await selectMasterCc5Backend(runtime, { ...input, placement: 'local', canonicalModel: 'box-claude-opus-5-5' }, true, env), undefined)
+  for (const [rt, patch, selfhost, policy] of [
+    [undefined, {}, true, env],
+    [runtime, {}, false, env],
+    [runtime, { uid: 913 }, true, env],
+    [runtime, {}, true, {}],
+    [runtime, { engine: 'codex' }, true, env],
+  ] as const) {
+    await assert.rejects(selectMasterCc5Backend(rt, { ...input, ...patch }, selfhost, policy), /REMOTE_LANE_UNAVAILABLE/)
+  }
+  assert.equal(calls.length, 1)
 })

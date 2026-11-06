@@ -152,12 +152,10 @@ const STATIC_PROVIDER_IDS: ReadonlySet<string> = new Set<StaticProviderId>([
  * hint 里的 providerId 不认识 → 抛 UnroutableProviderError(handler → 503):静默回落
  * OAuth 会把"配错 provider 的新模型"发到 Anthropic 账号池上烧真钱。
  */
-/** A name the Box model route may serve: `box-api-*` (claude -p), `box-claude-*` (interactive runner,
- * OCV5-378), or `claude-*-remote` (OCV5-721 remote pool interactive Claude Code). Only a prefix/suffix
- * test for the pre-catalog fences; routing itself reads the signed catalog. */
+/** A name the Box model route may serve: `box-api-*` (claude -p) or `box-claude-*` (interactive runner,
+ * OCV5-378). Only a prefix test for the pre-catalog fences; routing itself reads the signed catalog. */
 export function isBoxRouteModelName(model: string): boolean {
-  return model.startsWith("box-api-") || model.startsWith("box-claude-")
-    || (model.startsWith("claude-") && model.endsWith("-remote"));
+  return model.startsWith("box-api-") || model.startsWith("box-claude-");
 }
 
 export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): UpstreamRoute {
@@ -262,6 +260,7 @@ export function checkSnapshotCapabilities(snapshot: {
     providerId: string | null;
     upstreamModelId?: string | null;
     state: string;
+    placement?: string;
     capabilityProfile: {
       supportsVision: boolean;
       reasoning: { supported: readonly string[] };
@@ -271,6 +270,8 @@ export function checkSnapshotCapabilities(snapshot: {
   const violations: string[] = [];
   for (const e of snapshot.entries) {
     if (e.state !== "active" || e.engine !== "ccb") continue;
+    // Remote-pool rows run on their pool node through a lane, never through this proxy.
+    if (e.placement === "remote_pool") continue;
     let route: UpstreamRoute;
     try {
       route = selectUpstreamRoute(e.modelId, {

@@ -4745,7 +4745,7 @@ describe("cc5 fresh container supervisor boundary", () => {
       randomIp: () => "172.31.8.12", randomSecret: fixedSecret("a".repeat(64)),
       modelAuthority: { required: true, keyringEnvAssignment: () => { getterCalls++; return `OC_MODEL_AUTHORITY_KEYRING=${ring}`; } },
       cc5: {
-        selectBackend() { return undefined; },
+        async ensureLane(): Promise<never> { throw new Error("not used by provisioning"); },
         async prepare(input: { uid: number; containerDbId: string; local: boolean; publicKeyring: string }) {
           order.push("prepare"); assert.equal(pool.clientLog.at(-1), "COMMIT");
           assert.equal(input.uid, 912); assert.equal(input.local, true); assert.equal(input.publicKeyring, ring);

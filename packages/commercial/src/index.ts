@@ -3766,10 +3766,11 @@ export async function registerCommercial(
       authorityReady: modelAuthoritySigner !== null && modelAuthoritySigner !== undefined && modelAuthorityProvisionRequired,
       env: process.env,
       ...(modelAuthoritySigner && modelCatalogCache ? {
-        financeFactory: () => createRemoteNativeTurnFinance({
+        financeFactory: (_binding, lane) => createRemoteNativeTurnFinance({
           pool: getPool(), preCheckRedis, catalog: modelCatalogCache!,
           keyring: () => modelAuthoritySigner!.publicKeyring(), loadUserModelAuthz,
           log: rootLogger.child({ subsys: "remoteNativeBilling" }),
+          upstreamModel: lane.upstreamModel,
         }),
       } : {}),
     });
