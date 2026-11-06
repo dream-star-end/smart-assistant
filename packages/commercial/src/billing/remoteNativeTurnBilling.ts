@@ -48,8 +48,15 @@ function object(value: unknown): Record<string, unknown> {
 interface Scope {
   uid: string; containerDbId: string; dockerId: string; operationId: string; runId: string
   sessionKey: string; canonicalModel: string; backendKind: typeof BACKEND; expiresAt: number
-  /** The lane node's CLI model; every native receipt must carry exactly it. */
-  upstreamModel: string
+  /** The lane node's CLI model; every native receipt must carry exactly it. Absent in journals
+   * written before remote-pool lanes, whose only worker ran the pinned Sonnet. */
+  upstreamModel?: string
+}
+/** Pre-lane journals persisted no upstream: their single pinned worker ran exactly this pair. */
+const LEGACY_PINNED_WORKER = { canonicalModel: 'box-claude-sonnet-5', upstreamModel: 'claude-sonnet-5' } as const
+function scopeUpstream(scope: Pick<Scope, 'canonicalModel' | 'upstreamModel'>): string | undefined {
+  if (scope.upstreamModel !== undefined) return scope.upstreamModel
+  return scope.canonicalModel === LEGACY_PINNED_WORKER.canonicalModel ? LEGACY_PINNED_WORKER.upstreamModel : undefined
 }
 interface Context {
   v: 1; scope: Scope; requestId: string; turnKey: string; authorityTurnId: string
@@ -99,7 +106,7 @@ export function validateRemoteNativeReceipt(raw: unknown, scope: Scope): Cc5Nati
     && r.containerDbId === scope.containerDbId && r.dockerId === scope.dockerId
     && r.operationId === scope.operationId && r.runId === scope.runId
     && r.sessionKey === scope.sessionKey && r.canonicalModel === scope.canonicalModel
-    && r.upstreamModel === scope.upstreamModel && typeof r.nativeSessionId === 'string'
+    && r.upstreamModel === scopeUpstream(scope) && typeof r.nativeSessionId === 'string'
     && UUID.test(r.nativeSessionId) && typeof r.resultSha256 === 'string' && HASH.test(r.resultSha256)
     && (r.status === 'success' || r.status === 'error'))
   const u = object(r.usage)
@@ -120,8 +127,10 @@ function parseContext(raw: unknown): Context {
     && typeof c.reservedCredits === 'string' && /^\d+$/.test(c.reservedCredits)
     && BigInt(c.reservedCredits) <= REMOTE_NATIVE_RESERVATION_CREDITS)
   const s = object(c.scope)
-  need(typeof s.upstreamModel === 'string')
-  scopeOf({ ...s, version: 2 } as unknown as Cc5BridgeBinding, s.upstreamModel as string)
+  // The persisted scope is kept byte-for-byte (JSONB CAS/repair compare it); only validation reads the legacy pair.
+  const upstream = scopeUpstream(s as unknown as Scope)
+  need(upstream !== undefined && (s.upstreamModel === undefined || typeof s.upstreamModel === 'string'))
+  scopeOf({ ...s, version: 2 } as unknown as Cc5BridgeBinding, upstream)
   need(parseBillingPricing(c.pricing, s.canonicalModel as string))
   const a = object(c.authority)
   need(a.kind === 'bridge_signed' && typeof a.executionRevision === 'string'

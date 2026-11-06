@@ -1066,7 +1066,9 @@ export function projectCcbExecutionDescriptor(input: {
   if (ccb.contextOwner !== undefined && ccb.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
-  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && !isBoxApiModel(input.canonicalModel)) {
+  // A remote-lane chat's native context lives on its pool node; the signed lane backend is its proof.
+  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && !isBoxApiModel(input.canonicalModel) &&
+      !input.executionBackend) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
   return {

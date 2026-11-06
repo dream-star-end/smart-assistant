@@ -998,12 +998,14 @@ def stop_socket_locked(root):
     pid, start = record['pid'], record['startTicks']
     require(type(pid) is int and pid > 1 and isinstance(start, str) and start.isdecimal(),
             'bad-stop-mcp-process')
+    if not running(record):  # Gone, reused pid, or an exited zombie awaiting its parent.
+        return {'kind': 'recorded-mcp-exited-needs-independent-proof'}
     try:
         args, ticks = proc(pid)
     except FileNotFoundError:
         return {'kind': 'recorded-mcp-exited-needs-independent-proof'}
     if ticks != start:
-        return {'kind': 'recorded-mcp-exited-needs-independent-proof'}  # The pid was reused.
+        return {'kind': 'recorded-mcp-exited-needs-independent-proof'}
     require(args == ['/usr/bin/python3', '-I', '-B',
             str(root / 'cprofile/cc5-mcp-socket.py'), str(root)], 'wrong-stop-mcp-process')
     fd = os.pidfd_open(pid)

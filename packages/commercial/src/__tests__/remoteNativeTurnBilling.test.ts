@@ -661,6 +661,28 @@ test('persisted legacy v1 receipts remain recoverable without enabling live v1 d
   assert.equal('turnKey' in stamp, false)
 })
 
+test('a journal written before remote lanes (pinned Sonnet, no upstream in scope) still settles on recovery', async () => {
+  for (const [canonicalModel, expected] of [
+    ['box-claude-sonnet-5', { proven: 1, pending: 0 }],
+    ['claude-opus-5-5-remote', { proven: 0, pending: 1 }], // A lane journal always names its upstream.
+  ] as const) {
+    const { f, turn } = await started()
+    f.store.ackLostTag = 'receipt'
+    assert.equal((await turn.terminal(receipt())).state, 'pending')
+    const ctx = f.store.journal!.ctx.remoteNative
+    delete ctx.scope.upstreamModel
+    ctx.scope.canonicalModel = canonicalModel
+    ctx.pricing.modelId = canonicalModel
+    ctx.receipt = { ...ctx.receipt, canonicalModel, upstreamModel: 'claude-sonnet-5' }
+    const persisted = JSON.stringify(ctx)
+    assert.deepEqual(await recoverRemoteNativeTurnBilling({ pool: f.pool, preCheckRedis: f.redis, log: logger },
+      { settle: f.fixtures.settle }), expected, canonicalModel)
+    assert.equal(f.counts().settle, expected.proven)
+    if (expected.proven) assert.equal(f.settlements[0].model, 'box-claude-sonnet-5')
+    assert.equal(JSON.stringify(f.store.journal!.ctx.remoteNative), persisted, 'the stored context is not rewritten')
+  }
+})
+
 const PG_REQUIRED = process.env.REQUIRE_TEST_DB === '1' || process.env.CI === 'true'
 const PG_TEST_URL = process.env.NATIVE_FINANCE_TEST_DATABASE_URL
   || (PG_REQUIRED ? process.env.TEST_DATABASE_URL : undefined)

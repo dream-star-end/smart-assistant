@@ -137,8 +137,6 @@ export interface RemoteLaneRuntimePort {
   /** The chat's live lane, created on first use. Rejects with REMOTE_LANE_UNAVAILABLE. */
   ensureLane(request: RemoteLaneRequest): Promise<Cc5ExecutionBackend>
 }
-/** @deprecated name kept for the supervisor's type import. */
-export type Cc5FreshContainerRuntimePort = RemoteLaneRuntimePort
 
 interface RuntimeOptions {
   baseRoot: string
@@ -147,10 +145,10 @@ interface RuntimeOptions {
   hostFactory?: (config: Cc5SshHostConfig) => RemoteLaneHost
 }
 interface Lane {
+  readonly container: ContainerState
   readonly sessionKey: string
   readonly canonicalModel: string
   readonly operationId: string
-  readonly taskRoot: string
   readonly dir: string
   readonly view: string
   readonly relay: Cc5Relay
@@ -163,9 +161,16 @@ interface ContainerState {
   readonly keyring: AuthorityKeyring
   dockerId?: string
   state: 'prepared' | 'bound' | 'active' | 'released'
-  readonly lanes: Map<string, Lane>
-  readonly pending: Map<string, Promise<Lane>>
   release?: Promise<void>
+}
+/**
+ * One owner per chat across all containers: its live lane and a serial tail. Placement, stopping
+ * the previous lane (another container's, a dead one, another model's) and starting the next all
+ * run on this tail, so the chat's node root is handed over strictly one lane at a time.
+ */
+interface ChatOwner {
+  lane?: Lane
+  tail: Promise<unknown>
 }
 
 /** OFF/nonselfhost returns before reading configuration or creating any files. */
@@ -184,8 +189,7 @@ export function createRemoteLaneRuntime(input: {
 class RemoteLaneRuntime implements RemoteLaneRuntimePort {
   private readonly containers = new Map<string, ContainerState>()
   private readonly handles = new WeakMap<Cc5PreparedContainer, ContainerState>()
-  /** The latest stop of a lane per node task root; the next lane on that root waits for it. */
-  private readonly roots = new Map<string, Promise<void>>()
+  private readonly chats = new Map<string, ChatOwner>()
   constructor(
     private readonly uid: string,
     private readonly options: RuntimeOptions,
@@ -232,8 +236,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       rmSync(join(root, 'lanes'), { recursive: true, force: true })
       rmSync(join(root, 'UNKNOWN.json'), { force: true })
       const handle = Object.freeze({ mountSource, containerDbId })
-      const record: ContainerState = { handle, root, keyring, dockerId: activated.dockerId, state: 'active',
-        lanes: new Map(), pending: new Map() }
+      const record: ContainerState = { handle, root, keyring, dockerId: activated.dockerId, state: 'active' }
       this.containers.set(containerDbId, record)
       this.handles.set(handle, record)
     } catch {
@@ -265,7 +268,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     chownSync(mountSource, 0, 1000)
     chmodSync(mountSource, 0o750)
     const handle = Object.freeze({ mountSource, containerDbId: input.containerDbId })
-    const record: ContainerState = { handle, root, keyring, state: 'prepared', lanes: new Map(), pending: new Map() }
+    const record: ContainerState = { handle, root, keyring, state: 'prepared' }
     this.containers.set(input.containerDbId, record)
     this.handles.set(handle, record)
     writePrivate(join(root, 'prepared.json'), { version: 3, uid: this.uid, containerDbId: input.containerDbId })
@@ -294,41 +297,56 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     const container = this.containers.get(request.containerDbId)
     requireLane(container?.state === 'active' && container.dockerId && String(request.uid) === this.uid &&
       isCc5CanonicalModel(request.canonicalModel))
-    let lane = container.lanes.get(request.sessionKey)
-    if (!lane || lane.relay.stopped || lane.canonicalModel !== request.canonicalModel ||
-        lane.binding.expiresAt <= Date.now()) {
-      let pending = container.pending.get(request.sessionKey)
-      if (!pending) {
-        pending = this.replaceLane(container, request, lane).finally(() => container.pending.delete(request.sessionKey))
-        container.pending.set(request.sessionKey, pending)
-      }
-      lane = await pending
+    const owner = this.chat(request.sessionKey)
+    const live = (lane: Lane | undefined): lane is Lane => !!lane && lane.container === container &&
+      !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
+      lane.binding.expiresAt > Date.now()
+    // A resident lane answers without waiting; anything else is decided on the chat's tail.
+    let lane = owner.lane
+    if (!live(lane)) {
+      lane = await this.serial(owner, async () => {
+        if (live(owner.lane)) return owner.lane
+        try {
+          if (owner.lane) {
+            const old = owner.lane
+            owner.lane = undefined
+            await this.stopLane(old) // Another container's, a dead one, or another model's.
+          }
+          requireLane(container.state === 'active' && container.dockerId)
+          const placement = await this.hooks.place({ ...request, dockerId: container.dockerId })
+          requireLane(UUID.test(placement.operationId) && UUID.test(placement.runId) &&
+            placement.target.upstreamModel.length > 0)
+          const next = await this.startLane(container, request, placement)
+          if (container.state !== 'active') {
+            await this.stopLane(next) // Released while the node was being prepared.
+            requireLane(false)
+          }
+          owner.lane = next
+          this.hooks.onState?.(next.operationId, 'running')
+          return next
+        } catch (error) {
+          if (error instanceof Error && error.message === REMOTE_LANE_UNAVAILABLE) throw error
+          throw new Error(REMOTE_LANE_UNAVAILABLE, { cause: error })
+        }
+      })
     }
     return parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: lane.sessionKey,
       operationId: lane.operationId })
   }
 
-  private async replaceLane(container: ContainerState, request: RemoteLaneRequest, old?: Lane): Promise<Lane> {
-    if (old) {
-      container.lanes.delete(old.sessionKey)
-      await this.stopLane(old)
+  private chat(sessionKey: string): ChatOwner {
+    let owner = this.chats.get(sessionKey)
+    if (!owner) {
+      owner = { tail: Promise.resolve() }
+      this.chats.set(sessionKey, owner)
     }
-    try {
-      requireLane(container.dockerId)
-      const placement = await this.hooks.place({ ...request, dockerId: container.dockerId })
-      requireLane(UUID.test(placement.operationId) && UUID.test(placement.runId) &&
-        placement.target.upstreamModel.length > 0)
-      // A previous lane on the same node root (this or an earlier container) must be gone first.
-      await this.roots.get(placement.taskRoot)?.catch(() => {})
-      requireLane(container.state === 'active' && container.dockerId)
-      const lane = await this.startLane(container, request, placement)
-      container.lanes.set(request.sessionKey, lane)
-      this.hooks.onState?.(lane.operationId, 'running')
-      return lane
-    } catch (error) {
-      if (error instanceof Error && error.message === REMOTE_LANE_UNAVAILABLE) throw error
-      throw new Error(REMOTE_LANE_UNAVAILABLE, { cause: error })
-    }
+    return owner
+  }
+
+  private serial<T>(owner: ChatOwner, step: () => Promise<T>): Promise<T> {
+    const run = owner.tail.then(step, step)
+    owner.tail = run.catch(() => {})
+    return run
   }
 
   private async startLane(container: ContainerState, request: RemoteLaneRequest,
@@ -378,8 +396,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         current.binding = next
       },
     })
-    const lane: Lane = current = { sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
-      operationId: placement.operationId, taskRoot: placement.taskRoot, dir, view, binding, relay }
+    const lane: Lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
+      operationId: placement.operationId, dir, view, binding, relay }
     try {
       await this.listen(relay.toolServer, toolSocketPath, 0, 0)
       await this.listen(relay.controlServer, join(view, 'relay.sock'), 1000, 1000)
@@ -408,7 +426,6 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       // An unproved exit stays visible; the node root is reset before its next lane.
       this.hooks.onState?.(lane.operationId, proven ? 'released' : 'unknown')
     })()
-    this.roots.set(lane.taskRoot, lane.stopping)
     return lane.stopping
   }
 
@@ -436,11 +453,15 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     if (!record) return Promise.resolve()
     requireRuntime(!dockerId || !record.dockerId || record.dockerId === dockerId)
     if (record.release) return record.release
-    record.state = 'released' // No new lane from here on.
+    record.state = 'released' // No new lane from here on; a lane still starting stops itself.
     record.release = (async () => {
-      await Promise.allSettled([...record.pending.values()])
-      await Promise.allSettled([...record.lanes.values()].map((lane) => this.stopLane(lane)))
-      record.lanes.clear()
+      // On each chat's own tail, after any placement already queued there for this container.
+      await Promise.allSettled([...this.chats.values()].map((owner) => this.serial(owner, async () => {
+        if (owner.lane?.container !== record) return
+        const lane = owner.lane
+        owner.lane = undefined
+        await this.stopLane(lane)
+      })))
       rmSync(record.handle.mountSource, { recursive: true, force: true })
       rmSync(join(record.root, 'lanes'), { recursive: true, force: true })
       writePrivate(join(record.root, 'released.json'), { version: 1 })

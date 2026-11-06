@@ -18,6 +18,18 @@ const base = {
 }
 
 describe('box native harness', () => {
+  test('a remote-pool model keeps its native context only with its signed lane backend', () => {
+    const backend = { kind: 'cc5-interactive-v1' as const, sessionKey: 'agent:main:webchat:dm:chat_a1b2c3d4',
+      operationId: '11111111-1111-4111-8111-111111111111' }
+    for (const model of ['claude-opus-5-5-remote', 'claude-sonnet-5-5-remote', 'claude-haiku-5-5-remote']) {
+      const descriptor = projectCcbExecutionDescriptor({ ...base, canonicalModel: model, executionBackend: backend })
+      assert.equal(descriptor.contextOwner, 'box-native-v1')
+      assert.deepEqual(descriptor.executionBackend, backend)
+      assert.throws(() => projectCcbExecutionDescriptor({ ...base, canonicalModel: model }),
+        (err: unknown) => err instanceof BoxNativeHarnessError && err.code === 'BOX_NATIVE_CONTEXT_MISMATCH')
+    }
+  })
+
   test('ready projection keeps the model and forces a new runner onto ccb', () => {
     const descriptor = projectCcbExecutionDescriptor(base)
     assert.equal(descriptor.contextOwner, 'box-native-v1')

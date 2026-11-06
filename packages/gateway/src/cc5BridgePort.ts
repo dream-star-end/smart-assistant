@@ -279,13 +279,16 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
   private admitting = false
   private mutableExpiresAt: number
   constructor(
-    private readonly binding: Readonly<Cc5BridgeBinding>,
+    private binding: Readonly<Cc5BridgeBinding>,
     private readonly sessionKey: string,
     private readonly call: (
       path: Parameters<typeof cc5ControlRequest>[0],
       body: Readonly<Record<string, unknown>>,
     ) => Promise<Record<string, unknown>> = (path, body) =>
       cc5ControlRequest(path, body, cc5LanePaths(binding.operationId).socket),
+    /** The lane's current supervisor binding; the master replaces it when it replaces the lane. */
+    private readonly reload: () => Readonly<Cc5BridgeBinding> = () =>
+      readCc5Binding(cc5LanePaths(binding.operationId).binding),
   ) {
     this.bindingId = binding.operationId
     assertCc5BindingScope(binding)
@@ -298,7 +301,37 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
   private effectiveExpiresAt(): number {
     return Math.max(this.binding.expiresAt, this.mutableExpiresAt)
   }
+  /**
+   * Before each (re)start: adopt the lane the master currently serves for this same chat.
+   * A replaced lane (remote CLI died, master restarted) keeps the chat, operation and model
+   * but has a new capability; a port closed by its runner's shutdown reopens on it. A binding
+   * for another model, chat or container is never adopted.
+   */
+  private async refresh(): Promise<void> {
+    // A live port is mid-admission only inside submit; a closed one left any admission behind
+    // (a lost ACK closes the port, and its relay was stopped with it).
+    if (this.admitting && !this.closed) return
+    let next: Readonly<Cc5BridgeBinding>
+    try {
+      next = this.reload()
+    } catch {
+      return // No current lane: the relay call fails and the next turn's lane is awaited.
+    }
+    if (next.capability === this.binding.capability && !this.closed) return
+    requireCc5(next.operationId === this.binding.operationId && next.runId === this.binding.runId &&
+      next.uid === this.binding.uid && next.containerDbId === this.binding.containerDbId &&
+      next.dockerId === this.binding.dockerId && next.sessionKey === this.binding.sessionKey &&
+      next.canonicalModel === this.binding.canonicalModel && next.backendKind === this.binding.backendKind)
+    await this.stopPromise?.catch(() => {})
+    this.binding = next
+    this.mutableExpiresAt = next.expiresAt
+    this.stopPromise = undefined
+    this.closed = false
+    this.active = false
+    this.admitting = false
+  }
   async prepare(input?: { cwd: string }): Promise<SpawnOpts> {
+    await this.refresh()
     requireCc5(!this.closed && this.effectiveExpiresAt() > Date.now())
     const entry = fileURLToPath(new URL('../dist/cc5StdioBridge.js', import.meta.url))
     const cwd = input?.cwd ?? dirname(entry)

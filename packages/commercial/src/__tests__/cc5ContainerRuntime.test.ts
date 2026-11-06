@@ -39,7 +39,7 @@ const financeFactory: Cc5FinanceFactory = () => ({ async admit() { return {
 } } })
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
 
-function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string } = {}) {
+function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string; holdPrepare?: Promise<void> } = {}) {
   const dir = options.baseRoot ? undefined : mkdtempSync('/tmp/cl-')
   const baseRoot = options.baseRoot ?? join(dir!, 'r')
   const key = generateKeyPairSync('ed25519')
@@ -82,6 +82,7 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
           async prepareTask(packet: Buffer) {
             events.push(`prepare:${config.operationId}`)
             assert.equal(packet.toString(), '{"fixture":true}')
+            await options.holdPrepare
             if (options.failPrepare) throw new Error('fixture node unreachable')
           },
           start() {
@@ -113,9 +114,10 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
 }
 
 function admission(key: ReturnType<typeof generateKeyPairSync>, b: Cc5BridgeBinding) {
+  const containerId = Number(b.containerDbId)
   const now = Date.now()
   const a: ModelAuthorityPayload = {
-    v: MODEL_AUTHORITY_VERSION, keyId: 'fixture-key', uid: 912, containerId: 91,
+    v: MODEL_AUTHORITY_VERSION, keyId: 'fixture-key', uid: 912, containerId,
     authorityTurnId: 'a'.repeat(32), billingRequestId: 'fixture-only-request',
     connectionChallenge: 'fixture-connection', canonicalModel: b.canonicalModel, engine: 'ccb',
     executionBackend: { kind: 'cc5-interactive-v1', sessionKey: b.sessionKey, operationId: b.operationId },
@@ -308,5 +310,78 @@ test('a restarted master adopts live container views, drops lane leftovers and i
     await restarted.runtime.release('91')
   } finally {
     await first.cleanup()
+  }
+})
+
+async function startHost(f: ReturnType<typeof fixture>, mountSource: string, operationId: string) {
+  const view = join(mountSource, operationId)
+  const b = JSON.parse(readFileSync(join(view, 'binding.json'), 'utf8')) as Cc5BridgeBinding
+  await cc5ControlRequest('/admit', admission(f.key, b), join(view, 'relay.sock'))
+}
+
+test('a chat moving to another container hands its node root over only after the old lane stopped', { skip: !root }, async () => {
+  const f = fixture()
+  try {
+    const a = await f.container('91')
+    const b = await f.container('92')
+    const first = await f.lane(SESSION, MODEL, '91')
+    await startHost(f, a.mountSource, first.operationId)
+    const moved = await f.lane(SESSION, MODEL, '92')
+    const op = first.operationId
+    assert.equal(moved.operationId, op, 'same chat, same node root')
+    assert.deepEqual(f.events, [`prepare:${op}`, `start:${op}`, `stop:${op}`, `prepare:${op}`])
+    assert.deepEqual(readdirSync(a.mountSource), ['authority-public.json'])
+    assert.deepEqual(readdirSync(b.mountSource).sort(), ['authority-public.json', op].sort())
+    await f.runtime.release('92')
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('concurrent first turns of one chat in two containers are placed one after the other', { skip: !root }, async () => {
+  const f = fixture()
+  try {
+    const a = await f.container('91')
+    const b = await f.container('92')
+    const [x, y] = await Promise.all([f.lane(SESSION, MODEL, '91'), f.lane(SESSION, MODEL, '92')])
+    assert.equal(x.operationId, y.operationId)
+    assert.deepEqual(f.places.map((p) => p.containerDbId), ['91', '92'], 'the second waited for the first')
+    assert.deepEqual(f.events, [`prepare:${x.operationId}`, `prepare:${x.operationId}`])
+    const views = [...readdirSync(a.mountSource), ...readdirSync(b.mountSource)].filter((n) => n !== 'authority-public.json')
+    assert.deepEqual(views, [x.operationId], 'exactly one live lane for the chat')
+    await f.runtime.release('92')
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a container released while its lane is being prepared never ends up serving it', { skip: !root }, async () => {
+  let open!: () => void
+  const f = fixture({ holdPrepare: new Promise<void>((resolve) => { open = resolve }) })
+  try {
+    const handle = await f.container()
+    const pending = f.lane()
+    while (f.events.length === 0) await new Promise((resolve) => setTimeout(resolve, 5))
+    const released = f.runtime.release('91')
+    open()
+    await assert.rejects(pending, /REMOTE_LANE_UNAVAILABLE/)
+    await released
+    assert.equal(existsSync(handle.mountSource), false)
+    assert.deepEqual(f.states.filter(([, s]) => s === 'running'), [])
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('two different models queued for one chat each get their own lane in order', { skip: !root }, async () => {
+  const f = fixture()
+  try {
+    const handle = await f.container()
+    const [opus, haiku] = await Promise.all([f.lane(SESSION, MODEL), f.lane(SESSION, 'claude-haiku-5-5-remote')])
+    assert.equal(opus.operationId, haiku.operationId)
+    const b = JSON.parse(readFileSync(join(handle.mountSource, haiku.operationId, 'binding.json'), 'utf8'))
+    assert.equal(b.canonicalModel, 'claude-haiku-5-5-remote', 'the later request is not handed the earlier model')
+  } finally {
+    await f.cleanup()
   }
 })
