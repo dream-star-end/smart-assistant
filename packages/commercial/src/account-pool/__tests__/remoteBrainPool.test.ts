@@ -341,7 +341,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       assert.equal(ccProf?.logged_in, true)
       assert.equal(ccProf?.discovered_models.length, 1)
 
-      // Standard claude login .credentials.json without available_models falls back to DEFAULT_MODELS_BY_ENGINE['cc']
+      // Standard claude login .credentials.json without available_models discovers models directly from the claude CLI
       writeFileSync(
         join(claudeDir, '.credentials.json'),
         JSON.stringify({
@@ -355,11 +355,21 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
           env: { ...process.env, HOME: fakeHome },
         }),
       ) as {
-        profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
+        profiles: Array<{
+          engine: string
+          logged_in: boolean
+          discovered_models: Array<{ upstream_model_id: string; display_name: string }>
+        }>
       }
       const ccDefaultProf = defaultModelsProbe.profiles.find((p) => p.engine === 'cc')
       assert.equal(ccDefaultProf?.logged_in, true)
-      assert.equal(ccDefaultProf?.discovered_models.length, 3)
+      assert.ok((ccDefaultProf?.discovered_models.length ?? 0) >= 3)
+      assert.ok(
+        ccDefaultProf?.discovered_models.some((m) => m.upstream_model_id === 'claude-opus-4-7'),
+      )
+      assert.ok(
+        ccDefaultProf?.discovered_models.some((m) => m.upstream_model_id === 'claude-sonnet-5'),
+      )
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }

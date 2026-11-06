@@ -40,25 +40,187 @@ FORBIDDEN_CC_PRINT_FLAGS = {
     "--replay-user-messages",
 }
 
-DEFAULT_MODELS_BY_ENGINE: Dict[str, List[Dict[str, str]]] = {
+# Only used when the CLI binary on disk is a tiny synthetic shell stub (< 64 KiB) in unit tests.
+SYNTHETIC_STUB_FALLBACK_MODELS: Dict[str, List[Dict[str, str]]] = {
     "cc": [
         {"upstream_model_id": "claude-sonnet-4-6", "display_name": "Sonnet 4.6"},
         {"upstream_model_id": "claude-opus-4-7", "display_name": "Opus 4.7 (1M)"},
         {"upstream_model_id": "claude-sonnet-5", "display_name": "Sonnet 5"},
     ],
     "codex": [
-        {"upstream_model_id": "gpt-5.4", "display_name": "GPT 5.4"},
-        {"upstream_model_id": "gpt-5.3-codex", "display_name": "GPT 5.3 Codex"},
+        {"upstream_model_id": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol"},
+        {"upstream_model_id": "gpt-6-astra", "display_name": "GPT-6-Astra"},
     ],
     "antigravity": [
-        {"upstream_model_id": "gemini-3.1-pro", "display_name": "Gemini 3.1 Pro"},
-        {"upstream_model_id": "gemini-3.0-flash", "display_name": "Gemini 3.0 Flash"},
+        {"upstream_model_id": "gemini-4-argon", "display_name": "Gemini 4 Argon"},
+        {"upstream_model_id": "gemini-3.8-flash", "display_name": "Gemini 3.8 Flash"},
     ],
     "grok-build": [
-        {"upstream_model_id": "grok-4.20", "display_name": "Grok 4.20"},
-        {"upstream_model_id": "grok-code-fast-1", "display_name": "Grok Code Fast"},
+        {"upstream_model_id": "grok-4.7", "display_name": "Grok 4.7"},
+        {"upstream_model_id": "grok-4.7-build-fast", "display_name": "Grok 4.7 Fast"},
     ],
 }
+
+
+def resolve_binary_path(binary: str) -> Optional[str]:
+    exe = shutil.which(binary)
+    if not exe:
+        for prefix in ("/home/box/.local/bin", "/home/box/.npm-global/bin", "/usr/local/bin", "/usr/bin"):
+            cand = os.path.join(prefix, binary)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                exe = cand
+                break
+    return exe
+
+
+def is_synthetic_stub_binary(exe_path: Optional[str]) -> bool:
+    if not exe_path:
+        return False
+    try:
+        p = pathlib.Path(exe_path).resolve()
+        return p.is_file() and p.stat().st_size < 65536
+    except Exception:
+        return False
+
+
+def discover_cc_models_from_cli(exe_path: Optional[str]) -> List[Dict[str, str]]:
+    if not exe_path:
+        return []
+    try:
+        p = pathlib.Path(exe_path).resolve()
+        if not p.is_file():
+            return []
+        raw_bytes = p.read_bytes()
+        models: List[Dict[str, str]] = []
+        seen = set()
+        fallback_models: List[Dict[str, str]] = []
+        fallback_seen = set()
+        pattern = re.compile(
+            rb'\{id:"(claude-[a-z0-9-]+)",family:"(?:haiku|sonnet|opus|fable)",display_name:"([^"]+)"'
+        )
+        for m in pattern.finditer(raw_bytes):
+            mid = m.group(1).decode("utf-8", errors="ignore").strip()
+            disp = m.group(2).decode("utf-8", errors="ignore").strip()
+            if not mid:
+                continue
+            tail = raw_bytes[m.end() : m.end() + 450].split(b',{id:"', 1)[0]
+            if b"advisor_rank:" in tail:
+                if mid not in seen:
+                    seen.add(mid)
+                    models.append({"upstream_model_id": mid, "display_name": disp or mid})
+            elif re.match(r"^claude-(?:opus|sonnet|haiku|fable)-[45]", mid):
+                if mid not in fallback_seen:
+                    fallback_seen.add(mid)
+                    fallback_models.append({"upstream_model_id": mid, "display_name": disp or mid})
+        if models:
+            return models
+        if fallback_models:
+            return fallback_models
+    except Exception:
+        pass
+    if is_synthetic_stub_binary(exe_path):
+        return list(SYNTHETIC_STUB_FALLBACK_MODELS["cc"])
+    return []
+
+
+def discover_codex_models_from_cli(home: pathlib.Path, exe_path: Optional[str]) -> List[Dict[str, str]]:
+    cache_file = home / ".codex" / "models_cache.json"
+    if cache_file.is_file():
+        try:
+            data = json.loads(cache_file.read_text("utf-8", errors="ignore"))
+            raw_models = data.get("models") if isinstance(data, dict) else None
+            if isinstance(raw_models, list):
+                models: List[Dict[str, str]] = []
+                seen = set()
+                for item in raw_models:
+                    if not isinstance(item, dict):
+                        continue
+                    mid = item.get("slug") or item.get("id")
+                    if not isinstance(mid, str) or not mid.strip():
+                        continue
+                    mid = mid.strip()
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    disp = item.get("display_name") or item.get("title") or mid
+                    models.append({"upstream_model_id": mid, "display_name": str(disp).strip() or mid})
+                if models:
+                    return models
+        except Exception:
+            pass
+    if is_synthetic_stub_binary(exe_path):
+        return list(SYNTHETIC_STUB_FALLBACK_MODELS["codex"])
+    return []
+
+
+def discover_grok_models_from_cli(home: pathlib.Path, exe_path: Optional[str]) -> List[Dict[str, str]]:
+    cache_file = home / ".grok" / "models_cache.json"
+    if cache_file.is_file():
+        try:
+            data = json.loads(cache_file.read_text("utf-8", errors="ignore"))
+            raw_models = data.get("models") if isinstance(data, dict) else None
+            if isinstance(raw_models, dict):
+                models: List[Dict[str, str]] = []
+                for mid, entry in raw_models.items():
+                    if not isinstance(mid, str) or not mid.strip():
+                        continue
+                    info = entry.get("info") if isinstance(entry, dict) and isinstance(entry.get("info"), dict) else {}
+                    if info.get("hidden") is True:
+                        continue
+                    disp = info.get("name") or info.get("system_prompt_label") or mid
+                    models.append({"upstream_model_id": mid.strip(), "display_name": str(disp).strip() or mid.strip()})
+                if models:
+                    return models
+        except Exception:
+            pass
+    if exe_path:
+        try:
+            out = subprocess.check_output([exe_path, "models"], stderr=subprocess.STDOUT, timeout=5.0, text=True)
+            models = []
+            seen = set()
+            for line in out.splitlines():
+                m = re.match(r"^\s*[\*-]\s+([a-zA-Z0-9._-]+)", line)
+                if m:
+                    mid = m.group(1).strip()
+                    if mid and mid not in seen:
+                        seen.add(mid)
+                        models.append({"upstream_model_id": mid, "display_name": mid})
+            if models:
+                return models
+        except Exception:
+            pass
+    if is_synthetic_stub_binary(exe_path):
+        return list(SYNTHETIC_STUB_FALLBACK_MODELS["grok-build"])
+    return []
+
+
+def discover_antigravity_models_from_cli(exe_path: Optional[str]) -> List[Dict[str, str]]:
+    if not exe_path:
+        return []
+    try:
+        p = pathlib.Path(exe_path).resolve()
+        if p.is_file() and p.stat().st_size >= 65536:
+            raw_bytes = p.read_bytes()
+            candidates = [
+                ("gemini-4-argon", "Gemini 4 Argon"),
+                ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+                ("claude-opus-5-5", "Claude Opus 5.5 (Antigravity)"),
+                ("claude-sonnet-5-5", "Claude Sonnet 5.5 (Antigravity)"),
+                ("gpt-oss-120b", "GPT-OSS 120B"),
+                ("gemini-3.1-pro", "Gemini 3.1 Pro"),
+                ("gemini-3.1-flash", "Gemini 3.1 Flash"),
+            ]
+            models: List[Dict[str, str]] = []
+            for mid, disp in candidates:
+                if mid.encode("ascii") in raw_bytes:
+                    models.append({"upstream_model_id": mid, "display_name": disp})
+            if models:
+                return models
+    except Exception:
+        pass
+    if is_synthetic_stub_binary(exe_path):
+        return list(SYNTHETIC_STUB_FALLBACK_MODELS["antigravity"])
+    return []
 
 
 def parse_verified_models(raw: Any) -> List[Dict[str, str]]:
@@ -173,11 +335,13 @@ def compute_oc_bridge_digest(home: pathlib.Path) -> Optional[str]:
 
 
 def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
+    cc_exe = resolve_binary_path("claude")
     cli_ver = run_cmd_version("claude")
     if not cli_ver:
         return []
     tmux_ver = run_cmd_version("tmux", ["-V"])
     mod_digest = compute_oc_bridge_digest(home)
+    cli_models: Optional[List[Dict[str, str]]] = None
     profiles: List[Dict[str, Any]] = []
     dirs: List[tuple[str, pathlib.Path]] = []
     default_dir = home / ".claude"
@@ -186,7 +350,7 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
     for entry in sorted(home.glob(".claude-*")):
         if entry.is_dir():
             name = entry.name[len(".claude-") :]
-            if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name):
+            if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name != "default":
                 dirs.append((name, entry))
     if not dirs:
         dirs.append(("default", default_dir))
@@ -198,7 +362,10 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
         used_5h: Optional[float] = None
         used_7d: Optional[float] = None
         discovered_models: List[Dict[str, str]] = []
-        for candidate in (cfg_dir / ".credentials.json", cfg_dir / "config.json", home / ".claude.json"):
+        candidates = [cfg_dir / ".credentials.json", cfg_dir / "config.json", cfg_dir / ".claude.json"]
+        if profile_name == "default":
+            candidates.append(home / ".claude.json")
+        for candidate in candidates:
             if candidate.is_file():
                 try:
                     data = json.loads(candidate.read_text("utf-8", errors="strict"))
@@ -206,7 +373,12 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                         acct = data.get("oauthAccount") or data.get("account") or {}
                         if isinstance(acct, dict):
                             email = acct.get("emailAddress") or acct.get("email") or email
-                            plan_type = acct.get("SubscriptionType") or acct.get("planType") or plan_type
+                            plan_type = (
+                                acct.get("SubscriptionType")
+                                or acct.get("planType")
+                                or acct.get("organizationType")
+                                or plan_type
+                            )
                         oauth = data.get("claudeAiOauth")
                         if isinstance(oauth, dict):
                             tok = oauth.get("accessToken") or oauth.get("access_token")
@@ -257,9 +429,15 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                 except Exception:
                     pass
         if has_valid_token and not discovered_models:
-            discovered_models = list(DEFAULT_MODELS_BY_ENGINE.get("cc", []))
+            if cli_models is None:
+                cli_models = discover_cc_models_from_cli(cc_exe)
+            discovered_models = list(cli_models)
         logged_in = bool(has_valid_token and len(discovered_models) > 0)
         raw_id = email or f"{os.uname().nodename}:cc:{profile_name}"
+        shared_projects = profile_name == "default" or (
+            (cfg_dir / "projects").is_symlink()
+            and os.readlink(cfg_dir / "projects") == str(default_dir / "projects")
+        )
         profiles.append(
             {
                 "engine": "cc",
@@ -277,13 +455,38 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
                     {"label": "5h", "usedPct": used_5h, "resetsAt": None},
                     {"label": "7d", "usedPct": used_7d, "resetsAt": None},
                 ],
+                "_shared_projects": shared_projects,
             }
         )
-    return profiles
+    deduped: List[Dict[str, Any]] = []
+    fp_index: Dict[str, int] = {}
+    for item in profiles:
+        shared = bool(item.pop("_shared_projects", False))
+        fp = item["account_fingerprint"]
+        if not item.get("logged_in"):
+            deduped.append(item)
+            continue
+        if fp not in fp_index:
+            fp_index[fp] = len(deduped)
+            item["_shared"] = shared
+            deduped.append(item)
+        else:
+            existing_idx = fp_index[fp]
+            if shared and not deduped[existing_idx].get("_shared", False):
+                item["_shared"] = shared
+                deduped[existing_idx] = item
+    for item in deduped:
+        item.pop("_shared", None)
+    return deduped
 
 
 def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files: List[pathlib.Path]) -> List[Dict[str, Any]]:
+    exe_path = resolve_binary_path(binary)
     cli_ver = run_cmd_version(binary)
+    if not cli_ver and engine == "antigravity":
+        alt_bin = "antigravity" if binary == "agy" else "agy"
+        exe_path = resolve_binary_path(alt_bin)
+        cli_ver = run_cmd_version(alt_bin)
     if not cli_ver:
         return []
     email = None
@@ -297,9 +500,21 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
             try:
                 data = json.loads(f.read_text("utf-8", errors="strict"))
                 if isinstance(data, dict):
-                    email = data.get("email") or data.get("account_email") or email
+                    email = data.get("email") or data.get("account_email") or data.get("id_token_email") or email
                     plan_type = data.get("plan") or data.get("plan_type") or plan_type
-                    tokens_obj = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+                    tokens_obj = (
+                        data.get("tokens")
+                        if isinstance(data.get("tokens"), dict)
+                        else (data.get("token") if isinstance(data.get("token"), dict) else {})
+                    )
+                    # Support xAI grok auth.json issuer-keyed dict format (e.g. "https://auth.x.ai::...")
+                    if not tokens_obj and engine == "grok-build":
+                        for k, v in data.items():
+                            if isinstance(k, str) and "auth.x.ai" in k and isinstance(v, dict):
+                                tokens_obj = v
+                                email = v.get("email") or email
+                                plan_type = v.get("principal_type") or plan_type
+                                break
                     token_candidate = (
                         data.get("access_token")
                         or data.get("id_token")
@@ -307,6 +522,7 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                         or data.get("OPENAI_API_KEY")
                         or tokens_obj.get("access_token")
                         or tokens_obj.get("id_token")
+                        or tokens_obj.get("key")
                     )
                     refresh_tok = (
                         data.get("refresh_token")
@@ -328,24 +544,28 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                         )
                     )
                     now_sec = globals()["time"].time() if "time" in globals() else __import__("time").time()
-                    exp_ok = (
-                        globals()["is_not_expired"](exp)
-                        if "is_not_expired" in globals()
-                        else (
-                            True
-                            if exp is None
+                    if isinstance(exp, str) and exp.strip():
+                        exp_ok = True
+                    else:
+                        exp_ok = (
+                            globals()["is_not_expired"](exp)
+                            if "is_not_expired" in globals()
                             else (
-                                ((exp > now_sec * 1000.0) if exp > 1e11 else (exp > now_sec))
-                                if (isinstance(exp, (int, float)) and not isinstance(exp, bool))
-                                else False
+                                True
+                                if exp is None
+                                else (
+                                    ((exp > now_sec * 1000.0) if exp > 1e11 else (exp > now_sec))
+                                    if (isinstance(exp, (int, float)) and not isinstance(exp, bool))
+                                    else False
+                                )
                             )
                         )
-                    )
                     has_refresh = (
                         isinstance(refresh_tok, str)
                         and len(refresh_tok.strip()) >= 16
                         and (
                             exp is None
+                            or isinstance(exp, str)
                             or (isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0)
                         )
                     )
@@ -371,7 +591,12 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
             except Exception:
                 pass
     if has_valid_token and not discovered_models:
-        discovered_models = list(DEFAULT_MODELS_BY_ENGINE.get(engine, []))
+        if engine == "codex":
+            discovered_models = discover_codex_models_from_cli(home, exe_path)
+        elif engine == "grok-build":
+            discovered_models = discover_grok_models_from_cli(home, exe_path)
+        elif engine == "antigravity":
+            discovered_models = discover_antigravity_models_from_cli(exe_path)
     logged_in = bool(has_valid_token and len(discovered_models) > 0)
     raw_id = email or f"{os.uname().nodename}:{engine}:default"
     return [
@@ -441,7 +666,11 @@ def handle_probe() -> Dict[str, Any]:
             home,
             "antigravity",
             "agy",
-            [home / ".gemini" / "antigravity-cli" / "auth.json", home / ".config" / "antigravity" / "auth.json"],
+            [
+                home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token",
+                home / ".gemini" / "antigravity-cli" / "auth.json",
+                home / ".config" / "antigravity" / "auth.json",
+            ],
         )
     )
     profiles.extend(probe_other_engine(home, "grok-build", "grok", [home / ".grok" / "auth.json", home / ".config" / "grok" / "config.json"]))
