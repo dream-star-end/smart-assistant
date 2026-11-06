@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Forced-command preparation; installing it or an authorized key is a separate action.
 
-The administrator-owned authorized_keys command fixes only --task-root. Everything
+The administrator-owned authorized_keys command may pin one --task-root; otherwise each
+command names its chat's task root inside the configured prefix. Everything
 else that bounds the run — source addresses, sshd port, account, root prefix,
 accepted controller digests, models and account directories — is read from the
 read-only JSON next to this file, so no value in SSH_ORIGINAL_COMMAND or the client
 environment can widen it. The key also requires from="<gateway>" and restrict: this
 process can reject agent/X11/PTY signals, but only sshd's key restrictions prevent
 independent forwarding channels.
-Only the five Cc5SshHost runtime operations are accepted, not setup/inspection.
+Only the Cc5SshHost runtime operations plus the master's provision/reset are accepted,
+not node setup or inspection.
 """
 import base64
 import binascii
@@ -25,7 +27,7 @@ import sys
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name('cc5-ssh-guard.json')
 PYTHON = '/usr/bin/python3'
-ROLES = frozenset(('launch', 'tool-socket', 'stop', 'stop-socket', 'prove-stopped'))
+ROLES = frozenset(('launch', 'tool-socket', 'stop', 'stop-socket', 'prove-stopped', 'provision', 'reset'))
 MAX_CONFIG_BYTES = 65536
 MAX_SOURCE_BYTES = 131072  # Same bound as Cc5SshHost's pinned controller file.
 MAX_COMMAND_BYTES = 4 * ((MAX_SOURCE_BYTES + 2) // 3) + 4096
@@ -90,8 +92,10 @@ def load_config(path=DEFAULT_CONFIG):
 
 
 def fixed_config(argv):
-    # This argument originates only in the administrator-owned forced command,
-    # never in SSH_ORIGINAL_COMMAND or a client-provided environment variable.
+    # The administrator-owned forced command may pin one task root; without it the root
+    # comes from the command and is bounded by the configured prefix (one task per chat).
+    if len(argv) == 1:
+        return None
     require(len(argv) == 3 and argv[1] == '--task-root')
     return argv[2]
 
@@ -118,7 +122,7 @@ def launch_args(args, config):
     return args[7:]
 
 
-def verified_argv(original, config, root):
+def verified_argv(original, config, pinned_root):
     require(isinstance(original, str) and 0 < len(original) <= MAX_COMMAND_BYTES)
     require(not any(c in original for c in ('\0', '\r', '\n')))
     try:
@@ -126,7 +130,8 @@ def verified_argv(original, config, root):
     except ValueError:
         raise GuardRejected() from None
     require(len(args) in (7, 9, 11) and args[:4] == [PYTHON, '-I', '-B', '-c'])
-    require(args[5] in ROLES and args[6] == root)
+    root = task_root(config, args[6])
+    require(args[5] in ROLES and (pinned_root is None or root == pinned_root))
     require(original == ' '.join(quote(arg) for arg in args))
     extra = launch_args(args, config) if args[5] == 'launch' else []
     require(len(args) == 7 + len(extra))
@@ -177,9 +182,11 @@ def checked_environment(environ, config, root):
 def main():
     try:
         config = load_config()
-        root = task_root(config, fixed_config(sys.argv))
-        environment = checked_environment(os.environ, config, root)
-        args = verified_argv(os.environ.get('SSH_ORIGINAL_COMMAND'), config, root)
+        pinned = fixed_config(sys.argv)
+        if pinned is not None:
+            task_root(config, pinned)
+        args = verified_argv(os.environ.get('SSH_ORIGINAL_COMMAND'), config, pinned)
+        environment = checked_environment(os.environ, config, args[6])
         os.execve(PYTHON, args, environment)
     except (GuardRejected, OSError, ValueError):
         # Do not reflect supplied command/source/environment or a traceback.

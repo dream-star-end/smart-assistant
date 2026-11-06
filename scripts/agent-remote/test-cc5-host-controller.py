@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import socket
+import threading
 from pathlib import Path
 from subprocess import CompletedProcess, PIPE, Popen
 import sys
@@ -531,8 +533,10 @@ m.launch(r,'claude-sonnet-5')
                 target = root / 'MCP-SOCKET.json'
                 target.write_text(json.dumps({**record, 'startTicks': '1'})); target.chmod(0o600)
                 # This fixture deliberately runs ordinary Python in place of the pinned sidecar.
-                with patch.object(mod, 'check_profile', lambda _: profile), redirect_stdout(io.StringIO()):
-                    with self.assertRaisesRegex(RuntimeError, 'wrong-stop-mcp-process'): mod.stop_socket(root)
+                with patch.object(mod, 'check_profile', lambda _: profile), redirect_stdout(io.StringIO()) as out:
+                    # Another start time on that pid: the recorded sidecar is gone; never signal its successor.
+                    mod.stop_socket(root)
+                    self.assertEqual(json.loads(out.getvalue())['kind'], 'recorded-mcp-exited-needs-independent-proof')
                     self.assertIsNone(child.poll())
                     target.write_text(json.dumps(record))
                     mod.stop_socket(root)
@@ -540,6 +544,134 @@ m.launch(r,'claude-sonnet-5')
             finally:
                 if child.poll() is None: child.terminate(); child.wait(timeout=3)
                 child.stdout.close()
+
+    def provision_fixture(self, base, op=None, run=None):
+        """A real master packet (package-provision) for a root in a temporary node home."""
+        home = base / 'home'
+        home.mkdir(exist_ok=True)
+        op, run = op or str(uuid4()), run or str(uuid4())
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(mod, 'HOME', home))
+        stack.enter_context(patch.object(mod, 'NODE_CLI', home / '.oc-remote-cc/claude-2.1.316'))
+        stack.enter_context(patch.object(mod, 'NODE_ROOT', re.compile(re.escape(str(home)) + r'/oc-agentremote-[a-z0-9-]+\Z')))
+        stack.enter_context(patch.object(mod, 'cli_identity', lambda _path: {}))
+        stack.enter_context(patch.object(mod, 'tmux', lambda *_a, **_k: CompletedProcess([], 1)))
+        packet = mod.package_provision('l0123456789abcdef0123456', str(home), op, run)
+        return home, Path(packet['install']['root']), packet
+
+    def provision(self, root, packet):
+        with patch.object(mod.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(json.dumps(packet).encode()))), \
+                redirect_stdout(io.StringIO()) as out:
+            mod.provision(root)
+        return json.loads(out.getvalue())
+
+    def test_provision_builds_a_chat_root_on_the_shared_cli_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home, root, packet = self.provision_fixture(Path(temp))
+            self.assertTrue(self.provision(root, packet)['created'])
+            info = mod.owner(root)
+            self.assertEqual((info['cwd'], info['claudeExecutable']),
+                             (str(root / 'work'), str(home / '.oc-remote-cc/claude-2.1.316')))
+            self.assertNotIn('cliFileIdentity', info)
+            mod.check_sources(root, info)
+            self.assertEqual(mod.check_profile(root)['operationId'], packet['profile']['operationId'])
+            args = mod.profile_args(root, info)
+            self.assertEqual(args[0], str(home / '.oc-remote-cc/claude-2.1.316'))
+            (root / 'work/kept.txt').write_text('chat files stay')
+            (root / 'tool-attempts').mkdir(mode=0o700)
+            snapshot = lambda: {p.relative_to(root): p.read_bytes() for p in root.rglob('*')
+                                if p.is_file() and p.name not in ('CONTROL.lock', 'OWNER.json')}
+            before = snapshot()
+            self.assertFalse(self.provision(root, packet)['created'])
+            self.assertEqual(snapshot(), before)
+            self.assertEqual(mod.owner(root)['cwd'], str(root / 'work'))
+
+    def test_provision_replaces_profile_ids_but_keeps_the_chat_and_refuses_a_live_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            _home, root, packet = self.provision_fixture(base)
+            self.provision(root, packet)
+            (root / 'work/kept.txt').write_text('chat files stay')
+            again = mod.package_provision('l0123456789abcdef0123456', packet['install']['cwd'],
+                                          str(uuid4()), str(uuid4()))
+            self.provision(root, again)
+            self.assertEqual(mod.check_profile(root)['runId'], again['profile']['runId'])
+            self.assertEqual((root / 'work/kept.txt').read_text(), 'chat files stay')
+            (root / 'LIFECYCLE.json').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, 'provision-runtime-present'):
+                self.provision(root, packet)
+
+    def test_reset_ends_the_left_over_round_and_reopens_even_a_never_launched_stopped_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _home, root, packet = self.provision_fixture(Path(temp))
+            self.provision(root, packet)
+            info = mod.owner(root)
+            profile = mod.check_profile(root)
+            mod.mark_stopping(root)  # The old lane stopped this root before it ever launched.
+            # A sidecar the dead master left behind, running as the pinned socket script.
+            path = root / 'cprofile/cc5-mcp-socket.py'
+            path.chmod(0o600)
+            path.write_text("import time; print('READY',flush=True); time.sleep(30)")
+            path.chmod(0o400)
+            child = Popen(['/usr/bin/python3', '-I', '-B', str(path), str(root)], stdout=PIPE)
+            try:
+                self.assertEqual(child.stdout.readline(), b'READY\n')
+                record = root / 'MCP-SOCKET.json'
+                record.write_text(json.dumps({'version': 1, 'root': str(root), 'runId': profile['runId'],
+                    'operationId': profile['operationId'], **mod.process_record(child.pid)}))
+                record.chmod(0o600)
+                mod.write_lifecycle(root, info, {'host': {'pid': 2000000000, 'startTicks': '1'},
+                                                'claude': None, 'descendants': []})
+                (root / 'run').mkdir()  # The killed host never removed its runtime directory.
+                listener = socket.socket(socket.AF_UNIX)
+                listener.bind(str(root / 'tool.sock'))
+                listener.close()
+                with patch.object(mod, 'check_profile', lambda _: profile), redirect_stdout(io.StringIO()) as out:
+                    mod.reset(root)
+                self.assertEqual(json.loads(out.getvalue())['kind'], 'task-reset')
+                self.assertIsNotNone(child.poll(), 'the recorded sidecar received SIGTERM and exited')
+                for name in ('LIFECYCLE.json', 'STOPPING.json', 'STOPPED.json', 'MCP-SOCKET.json', 'run', 'tool.sock'):
+                    self.assertFalse((root / name).exists(), name)
+                self.assertTrue((root / 'work').is_dir())
+            finally:
+                if child.poll() is None: child.terminate(); child.wait(timeout=3)
+                child.stdout.close()
+
+    def test_reset_fails_loudly_while_a_recorded_process_survives(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _home, root, packet = self.provision_fixture(Path(temp))
+            self.provision(root, packet)
+            info = mod.owner(root)
+            child = Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+            clock = iter(range(0, 1000, 5))
+            try:
+                mod.write_lifecycle(root, info, {'host': {'pid': 2000000000, 'startTicks': '1'},
+                                                'claude': None, 'descendants': [mod.process_record(child.pid)]})
+                with patch.object(mod.time, 'monotonic', lambda: next(clock)), patch.object(mod.time, 'sleep'):
+                    with self.assertRaisesRegex(RuntimeError, 'reset-processes-still-alive'):
+                        mod.reset(root)
+                self.assertTrue((root / 'LIFECYCLE.json').exists(), 'records stay until every process is gone')
+                self.assertIsNone(child.poll())
+            finally:
+                child.terminate(); child.wait(timeout=3)
+
+    def test_prove_stopped_role_waits_for_the_control_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            (root / 'OWNER.json').write_text(json.dumps({**info, 'task': mod.TASK, 'root': str(root),
+                                                         'uid': os.getuid()}))
+            (root / 'OWNER.json').chmod(0o600)
+            order = []
+            with patch.object(mod, 'prove_stopped', lambda *_a, **_k: order.append('proof')):
+                with mod.control_lock(root):
+                    worker = threading.Thread(target=mod.prove_stopped_role, args=(root,))
+                    worker.start()
+                    time.sleep(0.3)
+                    order.append('rotate-finished')
+                worker.join(timeout=3)
+            self.assertEqual(order, ['rotate-finished', 'proof'])
 
     def test_cleanup_refuses_own_live_process_or_main_setup_session(self):
         for case in ('live', 'main', 'setup', 'stopped'):

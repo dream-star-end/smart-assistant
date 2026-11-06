@@ -7,6 +7,7 @@ is installed separately. No dependency install, credentials or non-TUI CLI use.
 """
 import ast
 import base64
+import contextlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -36,6 +37,7 @@ DEFAULT_MODEL = 'claude-sonnet-5'
 HOME = Path.home()
 # Master-side packaging names a root on some node account; the node re-checks it as its own home.
 NODE_ROOT = re.compile(r'/home/[a-z_][a-z0-9_-]{0,31}/oc-agentremote-[a-z0-9][a-z0-9-]{14,59}\Z')
+NODE_CLI = HOME / '.oc-remote-cc' / 'claude-2.1.316'
 PINNED_CLI_SIZE = 328262000
 PINNED_CLI_SHA = 'fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824'
 PLUGIN = ('.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.ts', 'hooks/frames.ts')
@@ -120,11 +122,48 @@ def claude_executable(root, info, full_hash=False):
     selected = info.get('claudeExecutable', '/usr/bin/claude')
     if selected == '/usr/bin/claude':
         return selected
+    if selected == str(NODE_CLI):
+        # Shared by every task root of this account, so its inode metadata is not a per-task
+        # identity; the pinned digest is checked over the exact bytes before each launch.
+        hash_cli(NODE_CLI) if full_hash else cli_identity(NODE_CLI)
+        return selected
     path = root / 'bin/claude-2.1.316'
     require(selected == str(path), 'unexpected-cli-path')
     identity = hash_cli(path) if full_hash else cli_identity(path)
     require(identity == info.get('cliFileIdentity'), 'private-cli-identity-changed')
     return selected
+
+
+def install_node_cli():
+    """Write the account's shared pinned CLI from stdin once per node; a matching copy is kept."""
+    if NODE_CLI.exists():
+        hash_cli(NODE_CLI)
+        print(json.dumps({'kind': 'node-cli-present', 'path': str(NODE_CLI), 'sha256': PINNED_CLI_SHA}))
+        return
+    NODE_CLI.parent.mkdir(mode=0o700, exist_ok=True)
+    stage = NODE_CLI.with_name(NODE_CLI.name + '.partial')
+    if stage.exists():
+        stage.unlink()
+    fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+    try:
+        count = 0
+        with os.fdopen(fd, 'wb') as out:
+            while True:
+                piece = sys.stdin.buffer.read(min(1024 * 1024, PINNED_CLI_SIZE + 1 - count))
+                if not piece:
+                    break
+                count += len(piece)
+                require(count <= PINNED_CLI_SIZE, 'private-cli-input-too-large')
+                out.write(piece)
+            require(count == PINNED_CLI_SIZE, 'private-cli-input-truncated')
+            out.flush()
+            os.fsync(out.fileno())
+        hash_cli(stage)
+        stage.rename(NODE_CLI)
+    finally:
+        if stage.exists():
+            stage.unlink()
+    print(json.dumps({'kind': 'node-cli-installed', 'path': str(NODE_CLI), 'sha256': PINNED_CLI_SHA}))
 
 
 def install_cli(root):
@@ -187,17 +226,13 @@ def package(run_id, home='/home/box'):
                and any(isinstance(t, ast.Name) and t.id == 'TAP_SOURCE' for t in n.targets)).encode()
     packet = {'task': TASK, 'root': home + '/oc-agentremote-' + run_id,
               'session': 'oc-ar-' + run_id, 'cwd': home,
-              'sourceCommit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip(),
               'pluginDigest': digest({name: files['mod/oc-bridge/' + name] for name in PLUGIN}),
               'tapSha256': sha(tap), 'hashes': {name: sha(data) for name, data in files.items()},
               'files': {name: base64.b64encode(data).decode() for name, data in files.items()}}
-    print(json.dumps(packet))
+    return packet
 
 
-def install():
-    raw = sys.stdin.buffer.read(1024 * 1024 + 1)
-    require(len(raw) <= 1024 * 1024, 'package-too-large')
-    packet = json.loads(raw)
+def source_packet(packet):
     require(packet['task'] == TASK and set(packet['files']) == set(SOURCE_FILES) and
             set(packet['hashes']) == set(SOURCE_FILES), 'unexpected-package-files')
     root = task_root(packet['root'])
@@ -209,22 +244,91 @@ def install():
     require(all(sha(value) == packet['hashes'][name] for name, value in data.items()), 'package-hash-mismatch')
     require(digest({name: data['mod/oc-bridge/' + name] for name in PLUGIN}) == packet['pluginDigest'],
             'package-mod-digest-mismatch')
-    os.umask(0o077)
-    root.mkdir(mode=0o700)
-    info = {key: value for key, value in packet.items() if key != 'files'}
-    info['uid'] = os.getuid()
-    (root / 'OWNER.json').write_text(json.dumps(info, indent=2) + '\n')
-    os.chmod(root / 'OWNER.json', 0o600)
+    return root, data
+
+
+def write_sources(root, data):
     for name, value in data.items():
         p = root / 'install' / name
         p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
         with os.fdopen(fd, 'wb') as out:
             out.write(value)
+
+
+def install_packet(packet):
+    root, data = source_packet(packet)
+    os.umask(0o077)
+    root.mkdir(mode=0o700)
+    info = {key: value for key, value in packet.items() if key != 'files'}
+    info['uid'] = os.getuid()
+    (root / 'OWNER.json').write_text(json.dumps(info, indent=2) + '\n')
+    os.chmod(root / 'OWNER.json', 0o600)
+    write_sources(root, data)
     for name in ('tmux', 'tmp'):
         (root / name).mkdir(mode=0o700)
     check_sources(root, info)
+    return root, info
+
+
+def install():
+    raw = sys.stdin.buffer.read(1024 * 1024 + 1)
+    require(len(raw) <= 1024 * 1024, 'package-too-large')
+    _root, info = install_packet(json.loads(raw))
     print(json.dumps({'kind': 'installed-only-no-chat', **info}))
+
+
+def provision(root):
+    """Idempotently prepare one chat's task root from a master packet on stdin.
+
+    The node's shared pinned CLI is used, so a task root costs only its small sources and profile.
+    An existing root is kept (its work dir, transcript link and tool ledger stay); when the master
+    ships different sources or profile ids, they are replaced while no runtime is present.
+    """
+    raw = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
+    require(len(raw) <= 2 * 1024 * 1024, 'package-too-large')
+    packet = json.loads(raw)
+    require(set(packet) == {'version', 'install', 'profile'} and packet['version'] == 1, 'wrong-provision-packet')
+    install, profile = packet['install'], packet['profile']
+    require(install['root'] == str(root), 'provision-root-mismatch')
+    claude_executable(root, {'claudeExecutable': str(NODE_CLI)})
+    with control_lock(root) if root.exists() else contextlib.nullcontext():
+        created = not root.exists()
+        if created:
+            _root, info = install_packet(install)
+        else:
+            _root, data = source_packet(install)
+            info = owner(root)
+            require(info['session'] == install['session'], 'provision-session-mismatch')
+            require(not (root / 'run').exists() and not (root / 'LIFECYCLE.json').exists(),
+                    'provision-runtime-present')
+            if info['hashes'] != install['hashes'] or info['pluginDigest'] != install['pluginDigest']:
+                shutil.rmtree(root / 'install')
+                write_sources(root, data)
+                info.update({key: install[key] for key in ('hashes', 'pluginDigest', 'tapSha256')})
+        directory = root / 'cprofile'
+        if directory.exists():
+            current = check_profile(root)
+            if (current['operationId'], current['runId']) != (profile['operationId'], profile['runId']) or \
+                    current['hashes'] != {name: sha(value) for name, value in profile_files(
+                        root, profile['operationId'], profile['runId'],
+                        base64.b64decode(profile['script'], validate=True),
+                        base64.b64decode(profile['socketScript'], validate=True)).items()}:
+                shutil.rmtree(directory)
+        info['claudeExecutable'] = str(NODE_CLI)
+        info.pop('cliFileIdentity', None)
+        info.pop('cliSha256', None)
+        work = root / 'work'
+        if not work.exists():
+            work.mkdir(mode=0o700)
+        info['cwd'] = str(work)
+        publish_owner(root, info)
+        if not directory.exists():
+            write_profile(root, profile)
+    check_sources(root, owner(root))
+    check_profile(root)
+    print(json.dumps({'kind': 'task-root-provisioned', 'root': str(root), 'created': created,
+                      'session': info['session']}))
 
 
 def tmux(root, *args, timeout=None):
@@ -265,9 +369,15 @@ def package_profile(root_text, operation_id, run_id):
     script = (repo / 'scripts/agent-remote/cc5-fixed-mcp.py').read_bytes()
     socket_script = (repo / 'scripts/agent-remote/cc5-mcp-socket.py').read_bytes()
     profile_files(Path(root_text), operation_id, run_id, script, socket_script)
-    print(json.dumps({'version': 2, 'operationId': operation_id, 'runId': run_id,
-                      'script': base64.b64encode(script).decode(),
-                      'socketScript': base64.b64encode(socket_script).decode()}))
+    return {'version': 2, 'operationId': operation_id, 'runId': run_id,
+            'script': base64.b64encode(script).decode(),
+            'socketScript': base64.b64encode(socket_script).decode()}
+
+
+def package_provision(run_id, home, operation_id, run):
+    """Master-side packet for `provision`: one chat's sources and fixed-tool profile."""
+    install = package(run_id, home)
+    return {'version': 1, 'install': install, 'profile': package_profile(install['root'], operation_id, run)}
 
 
 def check_profile(root):
@@ -295,12 +405,17 @@ def check_profile(root):
 def install_profile(root):
     info = owner(root)
     check_sources(root, info)
-    require(claude_executable(root, info) == str(root / 'bin/claude-2.1.316'), 'requires-private-cli')
+    require(claude_executable(root, info) in (str(root / 'bin/claude-2.1.316'), str(NODE_CLI)),
+            'requires-private-cli')
     require(not (root / 'run').exists() and all(tmux(root, 'has-session', '-t', '=' + name).returncode != 0
             for name in (info['session'], info['session'] + '-setup')), 'task-must-be-stopped-for-profile-install')
     raw = sys.stdin.buffer.read(65537)
     require(len(raw) <= 65536, 'profile-packet-too-large')
-    packet = json.loads(raw)
+    info = write_profile(root, json.loads(raw))
+    print(json.dumps({'kind': 'fixed-mcp-profile-installed-no-cli-launch', **info}))
+
+
+def write_profile(root, packet):
     require(set(packet) == {'version', 'operationId', 'runId', 'script', 'socketScript'} and type(packet['version']) is int and packet['version'] == 2,
             'wrong-profile-packet')
     files = profile_files(root, packet['operationId'], packet['runId'],
@@ -329,7 +444,7 @@ def install_profile(root):
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    print(json.dumps({'kind': 'fixed-mcp-profile-installed-no-cli-launch', **info}))
+    return info
 
 
 def profile_args(root, info):
@@ -340,7 +455,7 @@ def profile_args(root, info):
     require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700,
             'unsafe-task-workdir')
     cli = claude_executable(root, info)
-    require(cli == str(root / 'bin/claude-2.1.316'), 'requires-private-cli')
+    require(cli in (str(root / 'bin/claude-2.1.316'), str(NODE_CLI)), 'requires-private-cli')
     model = info.get('model', DEFAULT_MODEL)
     require(isinstance(model, str) and MODEL.fullmatch(model), 'unapproved-model')
     args = [cli, '--permission-mode', 'default', '--model', model, '--tools', '',
@@ -447,11 +562,7 @@ def prove_stopped(root, emit=True):
             continue
         require(type(item['pid']) is int and item['pid'] > 1 and str(item['startTicks']).isdecimal(),
                 'bad-lifecycle-process')
-        try:
-            ticks = proc(item['pid'])[1]
-        except FileNotFoundError:
-            continue
-        require(ticks != item['startTicks'], 'recorded-task-process-still-alive')
+        require(not running(item), 'recorded-task-process-still-alive')
     proof = {'kind': 'verified-task-runtime-absent', 'remoteStopped': True,
              'root': str(root), 'session': info['session'], 'processes': record,
              'mcpSocketIdentity': socket_record}
@@ -866,51 +977,125 @@ def snapshot(root):
 def stop(root):
     with control_lock(root):
         mark_stopping(root)
-        stop_locked(root)
+        print(json.dumps(stop_locked(root)))
 
 
 def stop_socket(root):
     with control_lock(root):
         mark_stopping(root)
-        path = root / 'MCP-SOCKET.json'
-        if not path.exists():
-            print(json.dumps({'kind': 'mcp-identity-not-published-not-exit-proof'}))
-            return
-        record = json.loads(read_private(path))
-        profile = check_profile(root)
-        require(record['version'] == 1 and record['root'] == str(root) and
-                record['runId'] == profile['runId'] and record['operationId'] == profile['operationId'],
-                'wrong-stop-mcp-identity')
-        pid, start = record['pid'], record['startTicks']
-        require(type(pid) is int and pid > 1 and isinstance(start, str) and start.isdecimal(),
-                'bad-stop-mcp-process')
+        print(json.dumps(stop_socket_locked(root)))
+
+
+def stop_socket_locked(root):
+    path = root / 'MCP-SOCKET.json'
+    if not path.exists():
+        return {'kind': 'mcp-identity-not-published-not-exit-proof'}
+    record = json.loads(read_private(path))
+    profile = check_profile(root)
+    require(record['version'] == 1 and record['root'] == str(root) and
+            record['runId'] == profile['runId'] and record['operationId'] == profile['operationId'],
+            'wrong-stop-mcp-identity')
+    pid, start = record['pid'], record['startTicks']
+    require(type(pid) is int and pid > 1 and isinstance(start, str) and start.isdecimal(),
+            'bad-stop-mcp-process')
+    try:
+        args, ticks = proc(pid)
+    except FileNotFoundError:
+        return {'kind': 'recorded-mcp-exited-needs-independent-proof'}
+    if ticks != start:
+        return {'kind': 'recorded-mcp-exited-needs-independent-proof'}  # The pid was reused.
+    require(args == ['/usr/bin/python3', '-I', '-B',
+            str(root / 'cprofile/cc5-mcp-socket.py'), str(root)], 'wrong-stop-mcp-process')
+    fd = os.pidfd_open(pid)
+    try:
+        require(proc(pid) == (args, start), 'mcp-process-identity-changed')
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+    finally:
+        os.close(fd)
+    return {'kind': 'sent-term-to-verified-mcp-socket', 'pid': pid, 'startTicks': start}
+
+
+def prove_stopped_role(root):
+    # Same lock as stop/launch/rotate: a proof never reads a lifecycle the next round is replacing.
+    with control_lock(root):
+        prove_stopped(root)
+
+
+def recorded_processes(root):
+    """Every process the task recorded for its current round, whether or not it is still alive."""
+    records = []
+    if (root / 'LIFECYCLE.json').exists():
+        record = json.loads(read_private(root / 'LIFECYCLE.json'))
+        records += [record['host'], record['claude'], *record['descendants']]
+    if (root / 'MCP-SOCKET.json').exists():
+        records.append(json.loads(read_private(root / 'MCP-SOCKET.json')))
+    return [item for item in records if item is not None and running(item)]
+
+
+def running(item):
+    """The recorded process (same pid and start time) still executes; an exited zombie does not."""
+    try:
+        if proc(item['pid'])[1] != item['startTicks']:
+            return False
+    except FileNotFoundError:
+        return False
+    try:
+        state = (Path('/proc') / str(item['pid']) / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+    except FileNotFoundError:
+        return True  # It was alive a moment ago; the next check decides.
+    return state != 'Z'
+
+
+def reset(root):
+    """Master-only: end whatever an earlier owner of this task left running, then clear its records.
+
+    Used before a new lane takes the root (e.g. after the master restarted and lost its SSH channels).
+    It signals only the processes this task recorded, kills only this task's own tmux server
+    sessions, waits until all are gone and leaves no terminal marker, so the next lane can start.
+    """
+    with control_lock(root):
+        info = owner(root)
+        if (root / 'run').exists() or (root / 'LIFECYCLE.json').exists():
+            try:
+                stop_locked(root)
+            except (FileNotFoundError, RuntimeError):
+                pass  # Host gone or its pid reused; the wait below still requires every recorded process gone.
+        stop_socket_locked(root)
+        sessions = (info['session'], info['session'] + '-setup')
+        for name in sessions:
+            tmux(root, 'kill-session', '-t', '=' + name)
+        deadline = time.monotonic() + 20
+        while recorded_processes(root) or any(
+                tmux(root, 'has-session', '-t', '=' + name).returncode == 0 for name in sessions):
+            require(time.monotonic() < deadline, 'reset-processes-still-alive')
+            time.sleep(0.2)
+        if (root / 'run').exists():
+            shutil.rmtree(root / 'run')  # Left by a host that was killed before its own cleanup.
+        stale = root / 'tool.sock'
+        if stale.is_socket():
+            stale.unlink()
+        for name in ('LIFECYCLE.json', 'STOPPED.json', 'STOPPING.json', 'MCP-SOCKET.json'):
+            try:
+                (root / name).unlink()
+            except FileNotFoundError:
+                pass
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            args, ticks = proc(pid)
-        except FileNotFoundError:
-            print(json.dumps({'kind': 'recorded-mcp-exited-needs-independent-proof'}))
-            return
-        require(ticks == start and args == ['/usr/bin/python3', '-I', '-B',
-                str(root / 'cprofile/cc5-mcp-socket.py'), str(root)], 'wrong-stop-mcp-process')
-        fd = os.pidfd_open(pid)
-        try:
-            require(proc(pid) == (args, start), 'mcp-process-identity-changed')
-            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            os.fsync(directory)
         finally:
-            os.close(fd)
-        print(json.dumps({'kind': 'sent-term-to-verified-mcp-socket', 'pid': pid, 'startTicks': start}))
+            os.close(directory)
+    print(json.dumps({'kind': 'task-reset', 'root': str(root), 'remoteStopped': True}))
 
 
 def stop_locked(root):
     info = owner(root)
     if not (root / 'run').exists() and not (root / 'LIFECYCLE.json').exists():
-        print(json.dumps({'kind': 'already-stopped', 'runtimeAbsent': True}))
-        return
+        return {'kind': 'already-stopped', 'runtimeAbsent': True}
     try:
         pid, start = host_identity(root, info)
     except FileNotFoundError:
         require(not (root / 'run').exists(), 'dead-host-with-runtime-still-present')
-        print(json.dumps({'kind': 'recorded-host-exited-still-needs-independent-proof'}))
-        return
+        return {'kind': 'recorded-host-exited-still-needs-independent-proof'}
     claude_record = None
     descendants = []
     if (root / 'run/claude.pid').exists():
@@ -928,7 +1113,7 @@ def stop_locked(root):
         signal.pidfd_send_signal(fd, signal.SIGTERM)
     finally:
         os.close(fd)
-    print(json.dumps({'kind': 'sent-term-to-verified-task-host', 'pid': pid, 'startTicks': start}))
+    return {'kind': 'sent-term-to-verified-task-host', 'pid': pid, 'startTicks': start}
 
 
 def cleanup(root):
@@ -946,11 +1131,15 @@ if __name__ == '__main__':
     try:
         role = sys.argv[1]
         if role == 'package':
-            package(*sys.argv[2:4])
+            print(json.dumps(package(*sys.argv[2:4])))
         elif role == 'install':
             install()
+        elif role == 'install-node-cli':
+            install_node_cli()
         elif role == 'package-profile':
-            package_profile(sys.argv[2], sys.argv[3], sys.argv[4])
+            print(json.dumps(package_profile(sys.argv[2], sys.argv[3], sys.argv[4])))
+        elif role == 'package-provision':
+            print(json.dumps(package_provision(*sys.argv[2:6])))
         elif role == 'launch':
             # Only the launch carries the deployment's model and account directory.
             rest = sys.argv[3:]
@@ -958,10 +1147,12 @@ if __name__ == '__main__':
                     (len(rest) == 2 or rest[2] == '--profile'), 'bad-launch-arguments')
             launch(task_root(sys.argv[2]), rest[1], rest[3] if len(rest) == 4 else None)
         else:
-            require(len(sys.argv) == 3 and role in ('workspace', 'inspect', 'snapshot', 'install-cli', 'install-profile', 'tool-socket', 'stop-socket', 'prove-stopped', 'stop', 'cleanup'), 'unknown-role')
-            root = task_root(sys.argv[2])
-            {'workspace': workspace, 'install-profile': install_profile, 'tool-socket': tool_socket, 'stop-socket': stop_socket, 'prove-stopped': prove_stopped,
-             'inspect': inspect, 'snapshot': snapshot, 'install-cli': install_cli, 'stop': stop, 'cleanup': cleanup}[role](root)
+            roles = {'workspace': workspace, 'install-profile': install_profile, 'tool-socket': tool_socket,
+                     'stop-socket': stop_socket, 'prove-stopped': prove_stopped_role, 'inspect': inspect,
+                     'snapshot': snapshot, 'install-cli': install_cli, 'stop': stop, 'cleanup': cleanup,
+                     'provision': provision, 'reset': reset}
+            require(len(sys.argv) == 3 and role in roles, 'unknown-role')
+            roles[role](task_root(sys.argv[2]))
     except Exception as error:
         # No raw exception/argv/response could leak pane or credentials.
         label = str(error) if isinstance(error, RuntimeError) else type(error).__name__

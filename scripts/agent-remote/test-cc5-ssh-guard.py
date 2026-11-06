@@ -61,7 +61,8 @@ class ReplacedProcess(Exception):
 class GuardTests(unittest.TestCase):
     def invoke(self, env, execute, config=CONFIG, root=ROOT):
         with ExitStack() as stack:
-            stack.enter_context(patch.object(mod.sys, 'argv', [str(GUARD_PATH), '--task-root', root]))
+            argv = [str(GUARD_PATH)] if root is None else [str(GUARD_PATH), '--task-root', root]
+            stack.enter_context(patch.object(mod.sys, 'argv', argv))
             stack.enter_context(patch.object(mod, 'load_config', lambda: config))
             stack.enter_context(patch.dict(mod.os.environ, env, clear=True))
             stack.enter_context(patch.object(mod.os, 'isatty', lambda _: False))
@@ -95,6 +96,30 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(env, {'HOME': '/home/box', 'USER': 'box', 'LOGNAME': 'box',
                     'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
                     'TMPDIR': ROOT + '/tmp', 'TMUX_TMPDIR': ROOT + '/tmux'})
+
+    def test_unpinned_key_serves_every_chat_root_in_the_prefix_and_nothing_else(self):
+        chat = '/home/box/oc-agentremote-l0123456789abcdef0123456'
+        for role in ('provision', 'reset', 'tool-socket', 'launch', 'prove-stopped'):
+            with self.subTest(role=role):
+                calls = []
+                def execute(executable, args, env):
+                    calls.append((args, env))
+                    raise ReplacedProcess()
+                with self.assertRaises(ReplacedProcess):
+                    self.invoke(environment(gateway_command(role, root=chat)), execute, root=None)
+                args, env = calls[0]
+                self.assertEqual(args[5:7], [role, chat])
+                self.assertEqual((env['TMPDIR'], env['TMUX_TMPDIR']), (chat + '/tmp', chat + '/tmux'))
+        for root in ('/home/box/oc-agentremote-short', '/home/other/oc-agentremote-l0123456789abcdef0123456',
+                     '/home/box/oc-agentremote-l0123456789abcdef0123456/../x', '/home/box/.ssh'):
+            with self.subTest(root=root):
+                self.assertEqual(self.invoke(environment(gateway_command('reset', root=root)),
+                                             lambda *_: self.fail('executed'), root=None), 126)
+        # A pinned key still serves only its own root.
+        self.assertEqual(self.invoke(environment(gateway_command('reset', root=chat)),
+                                     lambda *_: self.fail('executed')), 126)
+        self.assertEqual(self.invoke(environment(gateway_command('cleanup', root=chat)),
+                                     lambda *_: self.fail('executed'), root=None), 126)
 
     def test_verified_source_runs_as_an_ordinary_python_child_with_exact_argv(self):
         source = b'import json,os,sys; print(json.dumps({"argv":sys.argv,"home":os.environ["HOME"],"leaked":"PYTHONPATH" in os.environ}))'
