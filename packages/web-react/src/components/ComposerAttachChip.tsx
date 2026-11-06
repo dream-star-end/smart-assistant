@@ -2,6 +2,7 @@ import { uploadFailureCanContinue } from "@openclaude/protocol/browser";
 import { FileText, Loader2, Pencil, RotateCcw, X } from "lucide-react";
 import type { Attach } from "./Composer";
 import { cn } from "../lib/utils";
+import { uploadProgressText } from "../lib/uploadProgressText";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -63,7 +64,7 @@ export function AttachChip({
         </span>
         {a.status === "uploading" && typeof a.sentBytes === "number" && a.size > 0 && (
           <span className="text-caption text-faint tabular-nums">
-            {Math.min(100, Math.round((a.sentBytes / a.size) * 100))}%
+            {uploadProgressText(a.sentBytes, a.size)}
           </span>
         )}
         {a.status === "error" && (
