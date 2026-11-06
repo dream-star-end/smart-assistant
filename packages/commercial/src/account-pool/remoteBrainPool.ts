@@ -17,11 +17,14 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { assertRemoteCcInteractiveRunner, loadBoxBridgeMod } from '@openclaude/gateway'
+import {
+  defaultRemoteCcTarget,
+  type RemoteCcTarget,
+} from '@openclaude/gateway/cc5-container-runtime'
 import { getPool } from '../db/index.js'
-
-const execFileAsync = promisify(execFile)
 import { query, type QueryRunner } from '../db/queries.js'
 import { formatRemoteModelDisplayName } from '../billing/modelPublicProjection.js'
+import { REMOTE_POOL_PROVIDER_ID } from '../http/proxy/boxNativeContextOwner.js'
 import type { CooldownReason } from './policy/outcome.js'
 import {
   registerPoolAdapter,
@@ -31,6 +34,12 @@ import {
   type ProbeResult,
 } from './policy/registry.js'
 import { healthWeight, rankWRH } from './policy/select.js'
+
+const execFileAsync = promisify(execFile)
+/** The controller this deployment ships; its digest is what a pool guard was installed for. */
+const CC5_CONTROLLER_PATH = fileURLToPath(
+  new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
+)
 
 export const REMOTE_BRAIN_ENGINES = ['cc', 'codex', 'antigravity', 'grok-build'] as const
 export type RemoteBrainEngine = (typeof REMOTE_BRAIN_ENGINES)[number]
@@ -622,7 +631,7 @@ export async function createRemoteAgentNode(
   const created = mapNodeRow(res.rows[0]!)
   if (sshPassword) {
     try {
-      const probed = await probeRemoteAgentNodeLive(created.id, runner)
+      const probed = await probeRemoteAgentNodeLive(created.id, undefined, runner)
       return probed.node
     } catch {
       return created
@@ -746,9 +755,22 @@ export async function verifyAndMaterializePinnedKnownHosts(input: {
   }
 }
 
-export function resolveRemoteNodeIdentityFile(keyId: string): string {
+function remoteNodeKeyPath(keyId: string): string {
   const keyDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
-  const byKeyId = join(keyDir, keyId, 'id_ed25519')
+  return join(keyDir, keyId, 'id_ed25519')
+}
+
+/**
+ * The node's execution key: its authorized_keys line forces the cc5 guard, unlike the probe key
+ * (forced to oc-remote-hostd). Its directory also holds the pinned known_hosts for the node.
+ */
+export function remoteNodeExecKeyDir(keyId: string): string {
+  const keyDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
+  return join(keyDir, `${keyId}-exec`)
+}
+
+export function resolveRemoteNodeIdentityFile(keyId: string): string {
+  const byKeyId = remoteNodeKeyPath(keyId)
   if (existsSync(byKeyId)) return byKeyId
   const envIdentity = process.env.OC_REMOTE_POOL_SSH_IDENTITY_FILE?.trim()
   if (envIdentity && existsSync(envIdentity)) return envIdentity
@@ -756,6 +778,174 @@ export function resolveRemoteNodeIdentityFile(keyId: string): string {
     '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/id_ed25519'
   if (existsSync(cc5PinnedKey)) return cc5PinnedKey
   throw new Error(`REMOTE_NODE_SSH_IDENTITY_MISSING:${keyId}`)
+}
+
+/**
+ * P1 seam only: one pool node/profile/offer expressed as the gateway's remote target.
+ * Pure mapping — placement, ranking and the binding row stay with the caller (P2). The
+ * account directory is `profile_name`, i.e. the same `~/.claude-<name>` host.py selects
+ * (`default` is the node's plain login). `knownHostsPath` is the caller's pinned file for
+ * this node's `host_key_fp` (see verifyAndMaterializePinnedKnownHosts).
+ */
+export function remoteCcTargetFromPool(
+  node: RemoteAgentNodeView,
+  profile: RemoteAgentProfileView,
+  offer: RemoteModelOfferView,
+  knownHostsPath: string,
+): RemoteCcTarget {
+  if (
+    profile.node_id !== node.id ||
+    offer.profile_id !== profile.id ||
+    (offer.node_id !== undefined && offer.node_id !== node.id)
+  )
+    throw new Error('REMOTE_POOL_TARGET_MISMATCH')
+  if (profile.engine !== 'cc' || profile.runner_mode !== 'interactive')
+    throw new Error('REMOTE_POOL_TARGET_ENGINE_UNSUPPORTED')
+  const target = defaultRemoteCcTarget({
+    user: node.ssh_user,
+    keyPath: join(remoteNodeExecKeyDir(node.key_id), 'id_ed25519'),
+    knownHostsPath,
+    controllerPath: CC5_CONTROLLER_PATH,
+    upstreamModel: offer.upstream_model_id,
+  })
+  return Object.freeze({
+    ...target,
+    host: node.ssh_host,
+    port: node.ssh_port,
+    ...(profile.profile_name === 'default' ? {} : { profileDir: profile.profile_name }),
+  })
+}
+
+export interface RemoteLanePlacementResult {
+  target: RemoteCcTarget
+  taskRoot: string
+  operationId: string
+  runId: string
+  provisionPacket: Buffer
+  nodeId: string
+  profileId: string
+}
+
+/**
+ * Choose where one chat runs and record it in `remote_agent_bindings` (the placement evidence).
+ *
+ * A chat is sticky: once placed it keeps its profile and task root (its native transcript lives
+ * there), so the same operation/run ids come back and its resume ids stay valid. A first turn
+ * ranks the eligible cc interactive profiles offering the model.
+ */
+export async function placeRemoteLane(
+  input: { uid: number; containerDbId: string; dockerId: string; sessionKey: string; canonicalModel: string },
+  options: { controllerPath?: string; pool?: ReturnType<typeof getPool>; packet?: typeof buildProvisionPacket } = {},
+): Promise<RemoteLanePlacementResult> {
+  const pool = options.pool ?? getPool()
+  if (process.env.OC_REMOTE_POOL_EXECUTION_ENABLED === '0') throw new Error('REMOTE_POOL_EXECUTION_DISABLED')
+  const candidates = (await pool.query(
+    `SELECT p.id AS profile_id, p.node_id, p.engine, p.profile_name, p.runner_mode, p.weight,
+            p.health_score, p.hot_slots, p.active_slots, p.max_hot_slots, p.max_active_slots,
+            o.id AS offer_id, o.upstream_model_id, o.canonical_model_id,
+            n.label, n.ssh_host, n.ssh_port, n.ssh_user, n.host_key_fp, n.key_id,
+            n.rtt_ms_p50, n.status AS node_status
+       FROM remote_model_offers o
+       JOIN remote_agent_profiles p ON p.id = o.profile_id
+       JOIN remote_agent_nodes n ON n.id = p.node_id
+      WHERE o.canonical_model_id = $1 AND o.enabled = TRUE
+        AND p.engine = 'cc' AND p.runner_mode = 'interactive'
+        AND p.status IN ('active', 'degraded')
+        AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
+        AND n.status IN ('active', 'degraded')
+        AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')`,
+    [input.canonicalModel],
+  )).rows as Array<Record<string, any>>
+  const sticky = (await pool.query(
+    `SELECT operation_id::text, run_id::text, profile_id::text FROM remote_agent_bindings
+      WHERE uid = $1 AND session_key = $2 ORDER BY updated_at DESC LIMIT 1`,
+    [input.uid, input.sessionKey],
+  )).rows[0] as { operation_id: string; run_id: string; profile_id: string } | undefined
+  let row: Record<string, any> | undefined
+  let operationId: string
+  let runId: string
+  if (sticky) {
+    row = candidates.find((c) => String(c.profile_id) === sticky.profile_id)
+    // The chat's transcript lives on that profile; another node would silently lose its history.
+    if (!row) throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
+    operationId = sticky.operation_id
+    runId = sticky.run_id
+  } else {
+    const ranked = rankRemotePoolCandidates(candidates.map((r) => ({
+      profileId: String(r.profile_id),
+      nodeId: String(r.node_id),
+      engine: r.engine as RemoteBrainEngine,
+      profileName: String(r.profile_name),
+      weight: Number(r.weight ?? 100),
+      healthScore: r.node_status === 'degraded'
+        ? Math.min(Number(r.health_score ?? 100), 60)
+        : Number(r.health_score ?? 100),
+      hotSlots: Number(r.hot_slots ?? 0),
+      activeSlots: Number(r.active_slots ?? 0),
+      maxHotSlots: Number(r.max_hot_slots ?? 4),
+      maxActiveSlots: Number(r.max_active_slots ?? 2),
+      nodeRttMsP50: r.rtt_ms_p50 == null ? null : Number(r.rtt_ms_p50),
+    })), `${input.uid}:${input.sessionKey}:${input.canonicalModel}`)
+    if (ranked.length === 0) throw new Error('NO_ELIGIBLE_REMOTE_PROFILE')
+    row = candidates.find((c) => String(c.profile_id) === ranked[0]!.profileId)!
+    operationId = randomUUID()
+    runId = randomUUID()
+  }
+  const user = String(row.ssh_user)
+  const home = `/home/${user}`
+  const suffix = `c${operationId.replace(/-/g, '').slice(0, 23)}`
+  const execDir = remoteNodeExecKeyDir(String(row.key_id))
+  const target = remoteCcTargetFromPool(
+    { id: String(row.node_id), label: String(row.label), ssh_host: String(row.ssh_host),
+      ssh_port: Number(row.ssh_port ?? 22), ssh_user: user, host_key_fp: String(row.host_key_fp),
+      key_id: String(row.key_id) } as RemoteAgentNodeView,
+    { id: String(row.profile_id), node_id: String(row.node_id), engine: 'cc',
+      profile_name: String(row.profile_name), runner_mode: 'interactive' } as RemoteAgentProfileView,
+    { id: String(row.offer_id), profile_id: String(row.profile_id), node_id: String(row.node_id),
+      upstream_model_id: String(row.upstream_model_id),
+      canonical_model_id: String(row.canonical_model_id) } as RemoteModelOfferView,
+    join(execDir, 'known_hosts'),
+  )
+  const provisionPacket = await (options.packet ?? buildProvisionPacket)({
+    controllerPath: options.controllerPath ?? CC5_CONTROLLER_PATH, suffix, home, operationId, runId,
+  })
+  await pool.query(
+    `INSERT INTO remote_agent_bindings
+       (operation_id, run_id, uid, container_db_id, docker_id, session_key, node_id, profile_id,
+        canonical_model_id, state, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'preparing', NOW() + INTERVAL '24 hours')
+     ON CONFLICT (operation_id) DO UPDATE
+        SET container_db_id = EXCLUDED.container_db_id, docker_id = EXCLUDED.docker_id,
+            canonical_model_id = EXCLUDED.canonical_model_id, state = 'preparing',
+            generation = remote_agent_bindings.generation + 1,
+            expires_at = EXCLUDED.expires_at, updated_at = NOW()`,
+    [operationId, runId, input.uid, input.containerDbId, input.dockerId, input.sessionKey,
+      String(row.node_id), String(row.profile_id), input.canonicalModel],
+  )
+  return { target, taskRoot: `${home}/oc-agentremote-${suffix}`, operationId, runId, provisionPacket,
+    nodeId: String(row.node_id), profileId: String(row.profile_id) }
+}
+
+/** The node `provision` packet: the deployment's host/mod sources and fixed tool profile. */
+export async function buildProvisionPacket(input: {
+  controllerPath: string; suffix: string; home: string; operationId: string; runId: string
+}): Promise<Buffer> {
+  const { stdout } = await execFileAsync('/usr/bin/python3',
+    ['-I', '-B', input.controllerPath, 'package-provision', input.suffix, input.home, input.operationId, input.runId],
+    { timeout: 15_000, maxBuffer: 4 * 1024 * 1024, encoding: 'buffer' })
+  return stdout as Buffer
+}
+
+/** Lane lifecycle evidence on the binding row (running / released / unknown exit). */
+export async function recordRemoteLaneState(
+  operationId: string,
+  state: 'running' | 'released' | 'unknown',
+  pool: ReturnType<typeof getPool> = getPool(),
+): Promise<void> {
+  await pool.query(
+    `UPDATE remote_agent_bindings SET state = $2, updated_at = NOW() WHERE operation_id = $1`,
+    [operationId, state],
+  )
 }
 
 async function runSshMuxProbeOnce(input: {
@@ -1376,7 +1566,7 @@ export async function publishRemoteModelOffers(
     const catalogEngine = catalogEngineForRemoteEngine(engine)
     const providerId =
       catalogEngine === 'ccb'
-        ? 'box_cli'
+        ? REMOTE_POOL_PROVIDER_ID
         : catalogEngine === 'codex'
           ? 'codex'
           : catalogEngine === 'antigravity'
@@ -1470,22 +1660,18 @@ export async function publishRemoteModelOffers(
         promo_label: null,
       }
 
+      // A remote cc chat is a text-only interactive session on the node: no image input and no
+      // effort control reach its CLI; its native context lives there (box-native-v1).
       const capabilityProfile = {
         supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb',
         reasoning: {
-          supported:
-            catalogEngine === 'ccb'
-              ? baseSlug.includes('haiku-4-5')
-                ? []
-                : ['low', 'medium', 'high', 'xhigh', 'max']
-              : catalogEngine === 'codex'
-                ? ['low', 'medium', 'high']
-                : [],
+          supported: catalogEngine === 'codex' ? ['low', 'medium', 'high'] : [],
           codex_model_default: catalogEngine === 'codex' ? 'medium' : null,
         },
         ccb: {
           capability_zero: catalogEngine === 'ccb',
           supports_thinking: catalogEngine !== 'ccb',
+          ...(catalogEngine === 'ccb' ? { context_owner: 'box-native-v1' } : {}),
         },
       }
 

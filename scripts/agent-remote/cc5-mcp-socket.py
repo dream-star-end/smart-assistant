@@ -17,7 +17,7 @@ import struct
 import sys
 import types
 
-PINNED_MCP_SHA = '828d524a08c10f45a9c13c89c178ec740581f98ebc1870d089dab594a18d4cfd'
+PINNED_MCP_SHA = '34f7f5f412639f6d095198b5e2169974f833679cbef19c41e80d40951c567055'
 MAX_BODY = 131072
 MAX_FRAME = 262144
 
@@ -142,9 +142,13 @@ def run(root, client, source, sink):
                 self.send_error()
 
     try:
-        require(not attempts.exists() and not attempts.is_symlink())
-        attempts.mkdir(mode=0o700)
-        sync_dir(root)
+        # Kept across the task's start rounds: an attempt recorded by an earlier round still
+        # forbids dispatching that tool use again after a resume.
+        if not attempts.exists() and not attempts.is_symlink():
+            attempts.mkdir(mode=0o700)
+            sync_dir(root)
+        st = attempts.lstat()
+        require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700)
         listener.bind(str(path))
         os.chmod(path, 0o600)
         listener.listen(1)

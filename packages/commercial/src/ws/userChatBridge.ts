@@ -787,6 +787,8 @@ interface ResolvedTurnExecution {
   auxModels: string[];
   executionRevision: string;
   securityEpoch: number;
+  /** `remote_pool`: the turn must run in the chat's remote lane, never locally or through Box. */
+  placement: "local" | "remote_pool";
 }
 
 /**
@@ -843,15 +845,20 @@ async function resolveTurnExecution(
     auxModels: engineUsesAnthropicAuxModels(descriptor.engine) ? platformAuxModels(snapshot) : [],
     executionRevision: snapshot.executionRevision,
     securityEpoch: Number(snapshot.securityEpoch),
+    placement: descriptor.placement === "remote_pool" ? "remote_pool" : "local",
   };
 }
 
 // ---------- Deps + Handler --------------------------------------------------
 
 export interface UserChatBridgeDeps {
-  /** Supervisor-owned normal-chat scope; browser fields never select a backend. */
+  /**
+   * Supervisor-owned remote lane for a `remote_pool` model turn (created on first use);
+   * undefined for local models. Browser fields never select a backend.
+   */
   cc5BackendSelector?: (input: { uid: number; containerId: number; sessionKey: string;
-    canonicalModel: string; engine: string }) => Cc5ExecutionBackend | undefined;
+    canonicalModel: string; engine: string; placement: "local" | "remote_pool" }) =>
+    Promise<Cc5ExecutionBackend | undefined>;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
@@ -3223,13 +3230,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       let executionBackend: Cc5ExecutionBackend | undefined;
       try {
-        if (args.turn?.sessionKey && deps.cc5BackendSelector && containerId !== undefined) {
-          executionBackend = deps.cc5BackendSelector({ uid: Number(uid), containerId,
+        if (args.exec.placement === "remote_pool") {
+          // A remote model never falls back to a local or Box run: no lane, no turn.
+          if (!args.turn?.sessionKey || !deps.cc5BackendSelector || containerId === undefined) {
+            throw new Error("REMOTE_LANE_UNAVAILABLE");
+          }
+          executionBackend = await deps.cc5BackendSelector({ uid: Number(uid), containerId,
             sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel,
-            engine: args.exec.engine });
+            engine: args.exec.engine, placement: args.exec.placement });
+          if (!executionBackend) throw new Error("REMOTE_LANE_UNAVAILABLE");
         }
-      } catch {
-        return await reject("REMOTE_NATIVE_UNAVAILABLE", "remote execution unavailable, retry after setup", "remote_native_binding_rejected");
+      } catch (err) {
+        args.log?.warn("user-chat-bridge: remote lane unavailable", {
+          model: args.exec.canonicalModel,
+          cause: err instanceof Error ? (err.cause instanceof Error ? err.cause.message : err.message) : String(err),
+        });
+        return await reject("REMOTE_NATIVE_UNAVAILABLE", "remote node unavailable for this chat, retry shortly", "remote_native_binding_rejected");
       }
       // 注意:**不**在这里查 `cleaned`。调用方在 seal 之后紧接着就有自己的 cleaned 分支
       // (带各自完整的补偿),在这里提前 return null 会让"已拒(补偿过)"与"桥关了

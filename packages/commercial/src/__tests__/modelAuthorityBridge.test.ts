@@ -156,8 +156,14 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
     capabilityProfile: { supportsVision: true,
       reasoning: { supported: [], codexModelDefault: null },
       ccb: { capabilityZero: false, supportsThinking: true, contextOwner: 'box-native-v1' } } }));
+  entries.push(entry({ entryId: 62, modelId: 'claude-opus-5-5-remote', providerId: 'remote_pool',
+    upstreamModelId: 'claude-opus-5-5', placement: 'remote_pool',
+    capabilityProfile: { supportsVision: false,
+      reasoning: { supported: [], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: false, contextOwner: 'box-native-v1' } } }));
   const pricing = new Map([
     ['box-claude-sonnet-5', price('box-claude-sonnet-5')],
+    ['claude-opus-5-5-remote', price('claude-opus-5-5-remote')],
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
@@ -2891,18 +2897,18 @@ test("RF-step3: attested tabs share the same executor through owner detach", asy
 });
 
 
-describe('existing-account native backend authority', () => {
+describe('remote-pool lane authority', () => {
   const operationId = '00000000-0000-4000-8000-000000000123';
   const sessionKey = 'agent:main:webchat:dm:cc5-native-chat';
-  test('only trusted selector signs the normal Sonnet backend and suppresses auxiliary models', async () => {
+  test('a remote-pool model signs its chat lane, owns its context and suppresses auxiliary models', async () => {
     const calls: unknown[] = [];
-    const rig = await startRig({ attest: 'yes', cc5BackendSelector(input) {
+    const rig = await startRig({ attest: 'yes', async cc5BackendSelector(input) {
       calls.push(input);
-      return input.sessionKey === sessionKey ? {kind:'cc5-interactive-v1', sessionKey, operationId} : undefined;
+      return {kind:'cc5-interactive-v1', sessionKey: input.sessionKey, operationId};
     } });
     try {
       const ws = await openClient(rig.port);
-      ws.send(inboundFrame({ model: 'box-claude-sonnet-5', peer: {id:'cc5-native-chat',kind:'dm'},
+      ws.send(inboundFrame({ model: 'claude-opus-5-5-remote', peer: {id:'cc5-native-chat',kind:'dm'},
         executionBackend: {kind:'cc5-interactive-v1',sessionKey:'forged',operationId:'forged'},
         sessionKey: 'forged' }));
       await waitFor(() => rig.containerSeen.some(s => s.includes(MODEL_AUTHORITY_FIELD)));
@@ -2911,15 +2917,18 @@ describe('existing-account native backend authority', () => {
       const payload = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
       const lease = verifyTurnLease(bundle.lease, rig.signer.publicKeyring(), Date.now());
       assert.deepEqual(payload.executionBackend, {kind:'cc5-interactive-v1',sessionKey,operationId});
+      assert.equal((payload.executionDescriptor.capabilityProfile as {ccb?:{contextOwner?:string}}).ccb?.contextOwner,
+        'box-native-v1');
       assert.deepEqual(payload.auxModels, []); assert.deepEqual(lease.auxModels, []);
       assert.doesNotThrow(() => assertLeaseMatchesAuthority(lease,payload));
       assert.deepEqual(calls, [{uid:UID,containerId:CONTAINER_ID,sessionKey,
-        canonicalModel:'box-claude-sonnet-5',engine:'ccb'}]);
+        canonicalModel:'claude-opus-5-5-remote',engine:'ccb',placement:'remote_pool'}]);
       ws.close();
     } finally { await stopRig(rig); }
   });
-  test('same normal model outside the configured session preserves ordinary authority and aux policy', async () => {
-    const rig = await startRig({attest:'yes', cc5BackendSelector: () => undefined});
+  test('a local model never consults the lane selector, even with a forged backend in the frame', async () => {
+    let calls = 0;
+    const rig = await startRig({attest:'yes', cc5BackendSelector: async () => { calls++; return undefined; }});
     try {
       const ws = await openClient(rig.port);
       ws.send(inboundFrame({model:'box-claude-sonnet-5', executionBackend:{kind:'cc5-interactive-v1',sessionKey,operationId}}));
@@ -2927,17 +2936,23 @@ describe('existing-account native backend authority', () => {
       const bundle = firstInbound(rig.containerSeen)[MODEL_AUTHORITY_FIELD] as {authority:string};
       const payload = verifyAuthority(bundle.authority,rig.signer.publicKeyring(),Date.now());
       assert.equal(payload.executionBackend,undefined); assert.ok((payload.auxModels ?? []).length>0);
+      assert.equal(calls, 0);
       ws.close();
     } finally {await stopRig(rig);}
   });
-  test('unready target selector rejects before any execution frame can fall back to ordinary Box', async () => {
-    const rig = await startRig({attest:'yes', cc5BackendSelector: () => {throw new Error('not active');}});
-    try {
-      const ws = await openClient(rig.port); const frames = frameCollector(ws);
-      ws.send(inboundFrame({model:'box-claude-sonnet-5',peer:{id:'cc5-native-chat',kind:'dm'}}));
-      const error = await frames.next(); assert.equal(error.code,'REMOTE_NATIVE_UNAVAILABLE');
-      assert.equal(rig.containerSeen.some(s => s.includes('inbound.message')),false);
-      ws.close();
-    } finally {await stopRig(rig);}
-  });
+  for (const [name, selector] of [
+    ['an unready lane', async () => { throw new Error('node unreachable'); }],
+    ['a missing lane', async () => undefined],
+  ] as const) {
+    test(`${name} rejects a remote-pool turn before any execution frame can fall back`, async () => {
+      const rig = await startRig({attest:'yes', cc5BackendSelector: selector});
+      try {
+        const ws = await openClient(rig.port); const frames = frameCollector(ws);
+        ws.send(inboundFrame({model:'claude-opus-5-5-remote',peer:{id:'cc5-native-chat',kind:'dm'}}));
+        const error = await frames.next(); assert.equal(error.code,'REMOTE_NATIVE_UNAVAILABLE');
+        assert.equal(rig.containerSeen.some(s => s.includes('inbound.message')),false);
+        ws.close();
+      } finally {await stopRig(rig);}
+    });
+  }
 });

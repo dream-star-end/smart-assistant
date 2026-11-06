@@ -148,9 +148,15 @@ describe('signed execution backend scope', () => {
       expectCode(() => verifyAuthority(Buffer.from(JSON.stringify(forged)).toString('base64url'), keyring, NOW), 'VerifyFail')
     }
   })
+  it('any approved remote model slug may carry a signed cc5 backend, and its exact value is retained', () => {
+    const payload = { ...nativePayload(), canonicalModel: 'claude-opus-5' }
+    const verified = verifyAuthority(signAuthorityEnvelope(payload), keyring, NOW)
+    assert.equal(verified.canonicalModel, 'claude-opus-5')
+    assert.deepEqual(verified.executionBackend, backend)
+  })
   it('even valid signatures cannot authorize unknown shape, backend, model or engine', () => {
     for (const change of [
-      { engine: 'cursor' }, { canonicalModel: 'cc5-remote-t1555u' },
+      { engine: 'cursor' }, { canonicalModel: 'Claude Opus 5' }, { canonicalModel: '' },
       { executionBackend: { ...backend, other: true } },
       { executionBackend: { ...backend, kind: 'other-backend' } },
       { executionBackend: { ...backend, sessionKey: 'agent:main:main' } },

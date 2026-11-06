@@ -21,6 +21,25 @@ mcp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mcp)
 
 
+controller_spec = importlib.util.spec_from_file_location("cc5_controller", Path(__file__).with_name("cc5-host-controller.py"))
+controller = importlib.util.module_from_spec(controller_spec)
+controller_spec.loader.exec_module(controller)
+
+
+class ProductionRoot(unittest.TestCase):
+    def test_unpatched_root_rule_accepts_exactly_the_controller_task_roots_of_this_account(self):
+        home = str(Path.home())
+        run_id = "t20261106t1200z-abcdef0123456789"
+        packaged = home + "/oc-agentremote-" + run_id  # Same shape package(run_id, home) emits.
+        self.assertTrue(controller.NODE_ROOT.fullmatch(packaged) or not re.fullmatch(r"/home/[^/]+", home))
+        self.assertTrue(mcp.ROOT.fullmatch(packaged))
+        self.assertEqual(str(controller.task_root(packaged)), packaged)
+        for bad in ("/home/someoneelse/oc-agentremote-" + run_id, home + "/oc-agentremote-short",
+                    home + "/other-" + run_id, home + "/oc-agentremote-" + run_id + "/x"):
+            with self.subTest(root=bad):
+                self.assertFalse(mcp.ROOT.fullmatch(bad))
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.cwd = Path.cwd()

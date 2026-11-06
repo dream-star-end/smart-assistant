@@ -13,9 +13,6 @@ export const BOX_NATIVE_CONTEXT_MODELS: readonly string[] = [
   "box-claude-opus-5-5",
   "box-claude-sonnet-5",
   "box-claude-haiku-5-5",
-  "claude-opus-5-5-remote",
-  "claude-sonnet-5-5-remote",
-  "claude-haiku-5-5-remote",
 ];
 /** One listed model, kept for fixtures. Checks read the list. */
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_NATIVE_CONTEXT_MODELS[0]!;
@@ -52,10 +49,14 @@ export interface SignedCcbCapability {
   contextOwner?: BoxNativeContextOwner;
 }
 
+/** Catalog provider of remote-pool rows: the chat runs on a pool node, which owns its context. */
+export const REMOTE_POOL_PROVIDER_ID = "remote_pool" as const;
+
 /**
  * Put the token on the signed descriptor only when the server route is ready,
- * the catalog provider is the Box route, the canonical model is one of the
- * listed Box models, and the catalog itself declared the same token. A client body or env
+ * the catalog itself declared the same token, and either the provider is the
+ * Box route serving one of the listed Box models, or the row is a remote-pool
+ * model (its native session lives on the pool node). A client body or env
  * value is not an input.
  */
 export function issueBoxNativeContextOwner(input: {
@@ -65,9 +66,10 @@ export function issueBoxNativeContextOwner(input: {
   routeReady: boolean;
 }): BoxNativeContextOwner | undefined {
   if (input.routeReady !== true) return undefined;
+  if (input.declared !== BOX_NATIVE_CONTEXT_OWNER) return undefined;
+  if (input.providerId === REMOTE_POOL_PROVIDER_ID) return BOX_NATIVE_CONTEXT_OWNER;
   if (input.providerId !== "box_cli") return undefined;
   if (!BOX_NATIVE_CONTEXT_MODELS.includes(input.canonicalModel)) return undefined;
-  if (input.declared !== BOX_NATIVE_CONTEXT_OWNER) return undefined;
   return BOX_NATIVE_CONTEXT_OWNER;
 }
 

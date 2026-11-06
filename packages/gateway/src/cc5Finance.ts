@@ -62,4 +62,8 @@ export interface Cc5FinancePort {
   }): Promise<Cc5FinanceTurn>
 }
 
-export type Cc5FinanceFactory = (binding: Readonly<Cc5BridgeBinding>) => Cc5FinancePort | undefined
+/** `upstreamModel` is the CLI model the lane's node runs; native receipts must carry exactly it. */
+export type Cc5FinanceFactory = (
+  binding: Readonly<Cc5BridgeBinding>,
+  lane: { readonly upstreamModel: string },
+) => Cc5FinancePort | undefined

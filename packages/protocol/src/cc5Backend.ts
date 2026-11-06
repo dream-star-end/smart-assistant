@@ -1,5 +1,6 @@
 /** Pure scope contract. Structural validation is never a substitute for an envelope signature. */
 export const CC5_INTERACTIVE_BACKEND = 'cc5-interactive-v1' as const
+/** Default catalog id of the built-in remote target; a target/offer may declare another. */
 export const CC5_NATIVE_MODEL = 'box-claude-sonnet-5' as const
 
 export interface Cc5ExecutionBackend {
@@ -11,13 +12,22 @@ export interface Cc5ExecutionBackend {
 /** Scope portion of a separately validated, supervisor-owned v2 binding. */
 export interface Cc5BackendBindingScope {
   readonly backendKind: typeof CC5_INTERACTIVE_BACKEND
-  readonly canonicalModel: typeof CC5_NATIVE_MODEL
+  /** Declared by the bound target/offer, not by a single hardcoded model. */
+  readonly canonicalModel: Cc5CanonicalModel
   readonly sessionKey: string
   readonly operationId: string
 }
 
 const SESSION_KEY = /^agent:[A-Za-z0-9_-]{1,64}:webchat:dm:[A-Za-z0-9_-]{8,50}(?![\s\S])/
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/
+const MODEL = /^[a-z0-9][a-z0-9._-]{0,63}(?![\s\S])/
+
+/** A catalog model slug that a remote target or offer binds to. */
+export type Cc5CanonicalModel = string
+
+export function isCc5CanonicalModel(value: unknown): value is Cc5CanonicalModel {
+  return typeof value === 'string' && MODEL.test(value)
+}
 
 /** Only the one normal web-chat scope is supported; auxiliary/sessionless routes are excluded. */
 export function parseCc5ExecutionBackend(value: unknown): Cc5ExecutionBackend {
@@ -58,12 +68,12 @@ export function sameCc5ExecutionBackend(
 /** This checks the signed payload's semantics, but the caller must first establish its signature. */
 export function isCc5BackendAuthority(value: unknown): value is {
   readonly engine: 'ccb'
-  readonly canonicalModel: typeof CC5_NATIVE_MODEL
+  readonly canonicalModel: Cc5CanonicalModel
   readonly executionBackend: Cc5ExecutionBackend
 } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const authority = value as Record<string, unknown>
-  return authority.engine === 'ccb' && authority.canonicalModel === CC5_NATIVE_MODEL &&
+  return authority.engine === 'ccb' && isCc5CanonicalModel(authority.canonicalModel) &&
     isCc5ExecutionBackend(authority.executionBackend)
 }
 
@@ -74,12 +84,12 @@ export function assertCc5BackendBinding(
   sessionKey: string = binding.sessionKey,
 ): asserts authority is {
   readonly engine: 'ccb'
-  readonly canonicalModel: typeof CC5_NATIVE_MODEL
+  readonly canonicalModel: Cc5CanonicalModel
   readonly executionBackend: Cc5ExecutionBackend
 } {
   if (!isCc5BackendAuthority(authority) ||
     binding.backendKind !== CC5_INTERACTIVE_BACKEND ||
-    binding.canonicalModel !== CC5_NATIVE_MODEL ||
+    !isCc5CanonicalModel(binding.canonicalModel) ||
     authority.canonicalModel !== binding.canonicalModel ||
     authority.executionBackend.sessionKey !== binding.sessionKey ||
     authority.executionBackend.operationId !== binding.operationId ||

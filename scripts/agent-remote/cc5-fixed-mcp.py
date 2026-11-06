@@ -20,7 +20,8 @@ MAX_REPLY = 163840
 MAX_RESULT = 131072
 SAFE_INTEGER = 2**53 - 1
 TOOLS = ('Read', 'Edit', 'Bash')
-ROOT = re.compile(r"/home/box/oc-agentremote-t1555u-[a-z0-9-]{16,80}\Z")
+# Same task-root contract as the controller: a task directory directly in this node account's home.
+ROOT = re.compile(re.escape(str(Path.home())) + r"/oc-agentremote-[a-z0-9][a-z0-9-]{14,59}\Z")
 UUID = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z")
 
 

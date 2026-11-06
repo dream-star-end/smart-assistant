@@ -1,4 +1,4 @@
-import { type Cc5ExecutionBackend, isBoxApiModel } from '@openclaude/protocol'
+import { type Cc5ExecutionBackend, isBoxApiModel, isCc5ExecutionBackend } from '@openclaude/protocol'
 /**
  * modelAuthority(容器侧)—— master 签发的**模型执行权威**的验签消费端。
  *
@@ -521,10 +521,12 @@ export class ModelAuthorityConsumer {
       if (ccb.contextOwner !== undefined && ccb.contextOwner !== 'box-native-v1') {
         throw new AuthorityRejected('bad_shape', 'CCB contextOwner is not box-native-v1')
       }
-      if (ccb.contextOwner === 'box-native-v1' && !isBoxApiModel(payload.canonicalModel)) {
+      // A remote-pool chat carries its signed lane; its native context lives on the pool node.
+      if (ccb.contextOwner === 'box-native-v1' && !isBoxApiModel(payload.canonicalModel) &&
+          !isCc5ExecutionBackend((payload as { executionBackend?: unknown }).executionBackend)) {
         throw new AuthorityRejected(
           'bad_shape',
-          'box-native-v1 contextOwner requires the signed Box model',
+          'box-native-v1 contextOwner requires the signed Box model or a remote lane',
         )
       }
     }

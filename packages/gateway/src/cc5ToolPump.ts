@@ -6,7 +6,7 @@ import {
   verifyAuthority,
   verifyTurnLease,
 } from '@openclaude/protocol'
-import { CC5_RELAY_SOCKET, type Cc5BridgeBinding, refreshCc5Binding } from './cc5BridgePort.js'
+import { type Cc5BridgeBinding, cc5LanePaths, refreshCc5Binding } from './cc5BridgePort.js'
 import type { Cc5ToolRequest } from './cc5FixedTool.js'
 import { Cc5NativeToolExecutor } from './cc5NativeToolExecutor.js'
 import type { Cc5ToolResult } from './cc5NativeTool.js'
@@ -27,7 +27,7 @@ export function cc5ToolRequest(
   path: '/tool/next' | '/tool/result',
   body: Readonly<Record<string, unknown>>,
   signal: AbortSignal,
-  socketPath = CC5_RELAY_SOCKET,
+  socketPath: string,
 ): Promise<Record<string, unknown>> {
   if (signal.aborted) return Promise.reject(new Error('CC5_TOOL_CHANNEL_CLOSED'))
   const payload = JSON.stringify(body)
@@ -90,6 +90,7 @@ export async function runCc5ToolPump(input: {
 }): Promise<void> {
   if (input.keyring.size === 0) throw new Error('CC5_TOOL_KEYRING_MISSING')
   if (input.sessionKey !== input.binding.sessionKey) throw new Error('CC5_TOOL_SCOPE_MISMATCH')
+  const socketPath = input.socketPath ?? cc5LanePaths(input.binding.operationId).socket
   const scope = {
     capability: input.binding.capability,
     uid: input.binding.uid,
@@ -99,7 +100,7 @@ export async function runCc5ToolPump(input: {
     sessionKey: input.sessionKey,
   }
   while (!input.signal.aborted) {
-    const value = await cc5ToolRequest('/tool/next', scope, input.signal, input.socketPath)
+    const value = await cc5ToolRequest('/tool/next', scope, input.signal, socketPath)
     if (value.delivery === null) continue // bounded long-poll; no effect has been attempted.
     const delivery = structuredClone(value.delivery) as Cc5ToolDelivery
     if (!delivery || input.signal.aborted) throw new Error('CC5_TOOL_CHANNEL_CLOSED')
@@ -122,7 +123,7 @@ export async function runCc5ToolPump(input: {
   if (input.signal.aborted) throw new Error('CC5_TOOL_CHANNEL_CLOSED')
   const latestBinding = input.bindingProvider
     ? input.bindingProvider()
-    : refreshCc5Binding(input.binding, input.socketPath, Date.now())
+    : refreshCc5Binding(input.binding, socketPath, Date.now())
   const executor = new Cc5NativeToolExecutor(
     latestBinding,
     input.keyring,
@@ -135,7 +136,7 @@ export async function runCc5ToolPump(input: {
     '/tool/result',
     { ...scope, receipt },
     input.signal,
-    input.socketPath,
+    socketPath,
   )
   if (ack.commandId !== receipt.commandId) throw new Error('CC5_TOOL_RESULT_ACK_UNKNOWN')
   }

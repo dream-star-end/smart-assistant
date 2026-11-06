@@ -7,7 +7,6 @@
 import {
   BOX_API_MODELS,
   type Cc5ExecutionBackend,
-  CC5_NATIVE_MODEL,
   isCc5ExecutionBackend,
   OPENAI_FAST_SERVICE_TIER,
   TRACE_ID_HEADER,
@@ -1058,7 +1057,8 @@ export function projectCcbExecutionDescriptor(input: {
   capabilityProfile: Readonly<Record<string, unknown>>
   executionBackend?: Cc5ExecutionBackend
 }): CcbExecutionDescriptor {
-  if (input.executionBackend && (!isCc5ExecutionBackend(input.executionBackend) || input.canonicalModel !== CC5_NATIVE_MODEL)) {
+  // The bound target/offer declares the model; the runner compares it to the port's.
+  if (input.executionBackend && !isCc5ExecutionBackend(input.executionBackend)) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
   const raw = input.capabilityProfile.ccb
@@ -1066,7 +1066,9 @@ export function projectCcbExecutionDescriptor(input: {
   if (ccb.contextOwner !== undefined && ccb.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
-  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && !isBoxApiModel(input.canonicalModel)) {
+  // A remote-lane chat's native context lives on its pool node; the signed lane backend is its proof.
+  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && !isBoxApiModel(input.canonicalModel) &&
+      !input.executionBackend) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
   return {

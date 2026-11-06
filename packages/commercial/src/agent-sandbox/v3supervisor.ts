@@ -56,7 +56,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
-import type { Cc5FreshContainerRuntimePort, Cc5PreparedContainer } from "@openclaude/gateway/cc5-container-runtime";
+import type { Cc5PreparedContainer, RemoteLaneRuntimePort } from "@openclaude/gateway/cc5-container-runtime";
 import { OPENCLAUDE_CONTAINER_GATEWAY_PORT, canUseCc5TestModel, serverFeatureContainerEnv } from "@openclaude/protocol";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import {
@@ -1186,7 +1186,7 @@ export function readPlatformBundleOptionalFromEnv(): boolean {
  */
 export interface V3SupervisorDeps {
   /** Personal test-only fresh container lane; omitted entirely while OFF. */
-  cc5?: Cc5FreshContainerRuntimePort;
+  cc5?: RemoteLaneRuntimePort;
   docker: Docker;
   pool: Pool;
   image: string;

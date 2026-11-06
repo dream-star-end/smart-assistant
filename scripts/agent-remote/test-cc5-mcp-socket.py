@@ -43,9 +43,12 @@ class SocketBridge(unittest.TestCase):
         config = {'version': 2, 'operationId': str(uuid4()), 'runId': str(uuid4())}
         (root / 'cprofile/client.json').write_text(json.dumps(config))
         (root / 'cprofile/client.json').chmod(0o400)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        return (root, config, self.start(root, config))
+
+    def start(self, root, config):
         child = subprocess.Popen([sys.executable, '-I', '-B', '-c', WRAPPER, str(HELPER), str(root)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         def cleanup():
             if child.poll() is None:
                 child.stdin.close()
@@ -60,7 +63,37 @@ class SocketBridge(unittest.TestCase):
         self.assertEqual(ready['operationId'], config['operationId'])
         self.assertEqual(ready['pid'], child.pid)
         self.assertEqual(ready['version'], 2)
-        return root, config, child
+        return child
+
+    def test_a_later_start_round_on_the_same_root_serves_new_tools_but_never_redispatches_old_ones(self):
+        root, config, child = self.fixture()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            done = self.body(config, 'Read', 1, 'toolu_done')
+            result = executor.submit(self.rpc, root, done)
+            self.assertEqual(self.frame(child)['seq'], 1)
+            exact = self.respond(child, done, 1)
+            self.assertEqual(result.result(timeout=5), (200, exact))
+            unknown = self.body(config, 'Bash', 2, 'toolu_unknown')
+            result = executor.submit(self.rpc, root, unknown)
+            self.assertEqual(self.frame(child)['seq'], 2)
+            child.stdin.close()  # Round ends after dispatch: the Bash result is unknown.
+            self.assertNotEqual(result.result(timeout=5)[0], 200)
+        child.wait(timeout=3)
+        (root / 'MCP-SOCKET.json').unlink()  # The controller's rotate drops the old round's identity.
+
+        second = self.start(root, config)
+        self.assertEqual(json.loads((root / 'MCP-SOCKET.json').read_text())['pid'], second.pid)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            for old in (done, unknown):
+                self.assertNotEqual(self.rpc(root, {**old, 'rpcId': 50})[0], 200)
+            self.assertFalse(select.select([second.stdout], [], [], 0)[0], 'old tool uses are never sent again')
+            fresh = self.body(config, 'Edit', 3, 'toolu_fresh')
+            result = executor.submit(self.rpc, root, fresh)
+            self.assertEqual(self.frame(second)['seq'], 1)
+            exact = self.respond(second, fresh, 1)
+            self.assertEqual(result.result(timeout=5), (200, exact))
+        second.stdin.close(); second.wait(timeout=3)
+        self.assertEqual(second.returncode, 0)
 
     def frame(self, child):
         self.assertTrue(select.select([child.stdout], [], [], 5)[0], 'bounded helper stdout wait')

@@ -11,9 +11,6 @@ export const BOX_NATIVE_CONTEXT_MODELS: readonly string[] = [
   'box-claude-opus-5-5',
   'box-claude-sonnet-5',
   'box-claude-haiku-5-5',
-  'claude-opus-5-5-remote',
-  'claude-sonnet-5-5-remote',
-  'claude-haiku-5-5-remote',
 ]
 /** OCV5-368: official output cap of every Box API model; CCB uses it as both
  * default and upper limit instead of the generic 32k/64k. At 32000 a final
@@ -30,9 +27,6 @@ export const BOX_API_OUTPUT_TOKENS: Readonly<Record<string, number>> = {
   'box-claude-opus-5-5': 128_000,
   'box-claude-sonnet-5': 128_000,
   'box-claude-haiku-5-5': 128_000,
-  'claude-opus-5-5-remote': 128_000,
-  'claude-sonnet-5-5-remote': 128_000,
-  'claude-haiku-5-5-remote': 128_000,
 }
 /** One listed model, kept for tests. */
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_NATIVE_CONTEXT_MODELS[0]!

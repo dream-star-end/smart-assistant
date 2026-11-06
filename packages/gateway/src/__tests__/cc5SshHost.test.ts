@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { copyFileSync } from 'node:fs'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { Cc5SshHost, type Cc5SshSpawn } from '../cc5SshHost.js'
+import { Cc5SshHost, defaultRemoteCcTarget, type Cc5SshSpawn, type RemoteCcTarget } from '../cc5SshHost.js'
 import { CC5_NATIVE_TOOLS, cc5ToolInputSha256 } from '../cc5NativeTool.js'
 
 // Ordinary Node children emulate SSH stdio only. No SSH/Claude/network model invocation occurs.
@@ -73,30 +73,44 @@ if (role === 'tool-socket') {
   });
 }
 `
-function fixture(options: Record<string, unknown> = {}, deadlines: Record<string, number> = {}) {
+function fixture(
+  options: Record<string, unknown> = {},
+  deadlines: Record<string, number> = {},
+  targetOverride: Partial<RemoteCcTarget> = {},
+) {
   const root = mkdtempSync(join(tmpdir(), 'cc5-ssh-'))
   chmodSync(root, 0o700)
   const key = join(root, 'dedicated-key')
   const known = join(root, 'known-hosts')
   writeFileSync(key, 'ordinary test metadata fixture, not an SSH key', { mode: 0o600 })
   writeFileSync(known, 'ordinary host metadata fixture', { mode: 0o600 })
-  const config = {
-    user: 'dedicated_cc5',
-    taskRoot: '/home/box/oc-agentremote-t1555u-20261102t1400z-fixture',
-    runId: randomUUID(),
-    operationId: randomUUID(),
-    privateKeyPath: key,
-    knownHostsPath: known,
-    controllerPath: join(root, 'controller.py'),
-    // Short relative Unix path is only for this test; production config below remains absolute.
-    toolSocketPath: join(root, 't.sock'),
-  }
+  const controllerPath = join(root, 'controller.py')
   copyFileSync(
     fileURLToPath(
       new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
     ),
-    config.controllerPath,
+    controllerPath,
   )
+  const target: RemoteCcTarget = {
+    host: '136.86.172.84',
+    port: 22,
+    user: 'dedicated_cc5',
+    keyPath: key,
+    knownHostsPath: known,
+    controllerSha256: createHash('sha256').update(readFileSync(controllerPath)).digest('hex'),
+    taskRootPrefix: '/home/dedicated_cc5/oc-agentremote-',
+    upstreamModel: 'claude-sonnet-5',
+    ...targetOverride,
+  }
+  const config = {
+    target,
+    taskRoot: target.taskRootPrefix + '20261102t1400z-fixture',
+    runId: randomUUID(),
+    operationId: randomUUID(),
+    controllerPath,
+    // Short relative Unix path is only for this test; production config below remains absolute.
+    toolSocketPath: join(root, 't.sock'),
+  }
   // Linux sockaddr_un limit: use this worktree's private TMPDIR, shortened via /proc/self/cwd.
   // The full host path may exceed 100; preserve an absolute path through this process's cwd.
   config.toolSocketPath = `/proc/${process.pid}/cwd/${relative(process.cwd(), join(root, 't.sock'))}`
@@ -105,7 +119,7 @@ function fixture(options: Record<string, unknown> = {}, deadlines: Record<string
   const roles: string[] = []
   const children: ReturnType<typeof spawn>[] = []
   const spawnFixture: Cc5SshSpawn = (args) => {
-    const match = /'(tool-socket|launch|stop-socket|prove-stopped|stop)' '[^']+'$/.exec(
+    const match = /'(tool-socket|launch|stop-socket|prove-stopped|stop)' '([^']+)'(?: '--[a-z]+' '[^']+')*$/.exec(
       args.at(-1)!,
     )
     assert.ok(match)
@@ -194,7 +208,7 @@ test('fixed SSH argv waits for helper READY and transports original bytes withou
         false,
       )
       assert.ok(args.includes('StrictHostKeyChecking=yes') && args.includes('IdentityAgent=none'))
-      assert.ok(args.includes(f.config.privateKeyPath))
+      assert.ok(args.includes(f.config.target.keyPath))
     }
     assert.deepEqual(await f.host.stop(), { remoteStopped: true })
     assert.deepEqual(f.roles.slice(2), ['stop', 'stop-socket', 'prove-stopped'])
@@ -319,6 +333,119 @@ test('NOT_READY pane is discarded and startup error is a fixed label', async () 
     assert.ok(f.errors.every((error) => error.message === 'CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN'))
   } finally {
     await f.cleanup()
+  }
+})
+
+test('target host/user/port/key/model reach the real ssh argv and remote command', async () => {
+  const f = fixture(
+    { answer: '{"type":"assistant","text":"fixture response"}\n' },
+    {},
+    {
+      host: 'node-7.pool.example',
+      port: 2222,
+      user: 'acct_user',
+      upstreamModel: 'claude-opus-5',
+      profileDir: 'acct-2',
+      taskRootPrefix: '/home/acct_user/oc-agentremote-',
+    },
+  )
+  try {
+    const streams = f.start()
+    await streams.ready
+    const launch = f.argv.find((_args, index) => f.roles[index] === 'launch')!
+    const remote = launch.at(-1)!
+    assert.deepEqual(launch.slice(launch.indexOf('-p'), launch.indexOf('-p') + 2), ['-p', '2222'])
+    assert.deepEqual(launch.slice(launch.indexOf('-l'), launch.indexOf('-l') + 2), ['-l', 'acct_user'])
+    assert.deepEqual(launch.slice(launch.indexOf('-i'), launch.indexOf('-i') + 2), ['-i', f.config.target.keyPath])
+    assert.ok(launch.includes(`UserKnownHostsFile=${f.config.target.knownHostsPath}`))
+    assert.equal(launch.at(-2), 'node-7.pool.example')
+    assert.ok(remote.endsWith("'launch' '" + f.config.taskRoot + "' '--model' 'claude-opus-5' '--profile' 'acct-2'"))
+    // Only the launch role carries the model; the helper/control roles stay model-free.
+    for (const args of f.argv.filter((_args, index) => f.roles[index] !== 'launch'))
+      assert.equal(args.at(-1)!.includes('--model'), false)
+    await f.host.stop()
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a controller whose bytes do not match the target digest is refused before any ssh spawn', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cc5-digest-'))
+  chmodSync(root, 0o700)
+  const controllerPath = join(root, 'controller.py')
+  copyFileSync(
+    fileURLToPath(
+      new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
+    ),
+    controllerPath,
+  )
+  const keyPath = join(root, 'id_ed25519')
+  const knownHostsPath = join(root, 'known_hosts')
+  writeFileSync(keyPath, 'fixture', { mode: 0o600 })
+  writeFileSync(knownHostsPath, 'fixture', { mode: 0o600 })
+  const spawned: string[][] = []
+  try {
+    assert.throws(
+      () =>
+        new Cc5SshHost(
+          {
+            target: {
+              host: '136.86.172.84',
+              port: 22,
+              user: 'box',
+              keyPath,
+              knownHostsPath,
+              controllerSha256: '0'.repeat(64),
+              taskRootPrefix: '/home/box/oc-agentremote-',
+              upstreamModel: 'claude-sonnet-5',
+            },
+            taskRoot: '/home/box/oc-agentremote-20261102t1400z-fixture',
+            operationId: randomUUID(),
+            runId: randomUUID(),
+            controllerPath,
+            toolSocketPath: `/proc/${process.pid}/cwd/${relative(process.cwd(), join(root, 't.sock'))}`,
+          },
+          {
+            spawn: (args) => {
+              spawned.push(args)
+              throw new Error('must not spawn')
+            },
+          },
+        ),
+      /CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN/,
+    )
+    assert.equal(spawned.length, 0)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('the default target equals the single host this lane ran on before pool data existed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cc5-default-'))
+  const controllerPath = join(root, 'controller.py')
+  copyFileSync(
+    fileURLToPath(
+      new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
+    ),
+    controllerPath,
+  )
+  const keyPath = join(root, 'id_ed25519')
+  const knownHostsPath = join(root, 'known_hosts')
+  writeFileSync(keyPath, 'fixture', { mode: 0o600 })
+  writeFileSync(knownHostsPath, 'fixture', { mode: 0o600 })
+  try {
+    const target = defaultRemoteCcTarget({ user: 'box', keyPath, knownHostsPath, controllerPath })
+    assert.equal(target.host, '136.86.172.84')
+    assert.equal(target.port, 22)
+    assert.equal(target.user, 'box')
+    assert.equal(target.upstreamModel, 'claude-sonnet-5')
+    assert.equal(target.taskRootPrefix, '/home/box/oc-agentremote-')
+    assert.equal(
+      target.controllerSha256,
+      createHash('sha256').update(readFileSync(controllerPath)).digest('hex'),
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 

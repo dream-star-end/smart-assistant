@@ -8,9 +8,9 @@ import { fileURLToPath } from 'node:url'
 import type { AuthorityKeyring } from '@openclaude/protocol'
 import {
   CC5_BRIDGE_MAX_FRAME_BYTES,
-  CC5_RELAY_SOCKET,
   type Cc5BridgeBinding,
   cc5ControlRequest,
+  cc5LanePaths,
   readCc5AuthorityKeyring,
   readCc5Binding,
   refreshCc5Binding,
@@ -40,7 +40,7 @@ export async function runCc5StdioBridge(input: {
     operationId: input.binding.operationId,
     sessionKey: input.sessionKey,
   }
-  const socketPath = input.socketPath ?? CC5_RELAY_SOCKET
+  const socketPath = input.socketPath ?? cc5LanePaths(input.binding.operationId).socket
   const observation = input.tools ? new Cc5ToolObservation(input.binding.operationId) : undefined
   const toolAbort = new AbortController()
   let toolRun: Promise<unknown> | undefined
@@ -364,7 +364,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   Promise.resolve()
     .then(() =>
       runCc5StdioBridge({
-        binding: readCc5Binding(),
+        binding: readCc5Binding(cc5LanePaths(process.argv[3] ?? '').binding),
         tools: { keyring: readCc5AuthorityKeyring() },
         sessionKey: process.argv[2] ?? '',
         stdin: process.stdin,

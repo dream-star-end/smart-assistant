@@ -59,9 +59,16 @@ test('scope equality does not authorize another canonical model, engine, operati
   }
   assert.equal(isCc5BackendAuthority(authority), true)
   assert.doesNotThrow(() => assertCc5BackendBinding(authority, binding))
+  // The capability lane now runs whichever approved remote model the node provides;
+  // the binding still has to name exactly that model.
+  const remote = { ...authority, canonicalModel: 'claude-opus-5' }
+  assert.equal(isCc5BackendAuthority(remote), true)
+  assert.throws(() => assertCc5BackendBinding(remote, binding), /CC5_BACKEND_BINDING_MISMATCH/)
+  assert.doesNotThrow(() => assertCc5BackendBinding(remote, { ...binding, canonicalModel: 'claude-opus-5' }))
   for (const value of [
-    { ...authority, canonicalModel: 'cc5-remote-t1555u' },
-    { ...authority, canonicalModel: 'box-claude-opus-5' },
+    { ...authority, canonicalModel: '' },
+    { ...authority, canonicalModel: 'Claude Opus 5' },
+    { ...authority, canonicalModel: 'claude-opus-5\n' },
     { ...authority, engine: 'cursor' },
     { ...authority, executionBackend: undefined },
   ]) {

@@ -1,4 +1,12 @@
-/** Privileged v5-dev factory for one fresh container / operation / admission / tool call. */
+/**
+ * Privileged master runtime for remote-pool chats.
+ *
+ * Per container the supervisor prepares one read-only view (mounted at CC5_MOUNT) holding the
+ * public authority keyring. Per chat a lane is created on demand: the chat's task root on its
+ * pool node is reset and provisioned, then a Cc5Relay + Cc5SshHost serve it through
+ * `<view>/<operationId>/{binding.json,relay.sock}`. A master restart only loses lanes; the next
+ * turn of a chat resets the node root and resumes the same native session.
+ */
 import { randomBytes } from 'node:crypto'
 import {
   constants,
@@ -24,28 +32,30 @@ import {
   type AuthorityKeyring,
   type Cc5ExecutionBackend,
   CC5_INTERACTIVE_BACKEND,
-  CC5_NATIVE_MODEL,
   CC5_TEST_UID_ENV,
   type Cc5PolicyEnvironment,
   canUseCc5TestModel,
+  isCc5CanonicalModel,
   parseAuthorityKeyring,
   parseCc5ExecutionBackend,
 } from '@openclaude/protocol'
-import type { Cc5FinanceFactory, Cc5FinancePort } from './cc5Finance.js'
-import {
-  CC5_BINDING_SLIDING_TTL_MS,
-  type Cc5BridgeBinding,
-  assertCc5BindingScope,
-} from './cc5BridgePort.js'
+import type { Cc5FinanceFactory } from './cc5Finance.js'
+import { CC5_BINDING_SLIDING_TTL_MS, CC5_MOUNT, type Cc5BridgeBinding } from './cc5BridgePort.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from './cc5Relay.js'
-import { Cc5SshHost, type Cc5SshHostConfig } from './cc5SshHost.js'
+import { Cc5SshHost, type Cc5SshHostConfig, type RemoteCcTarget } from './cc5SshHost.js'
 
 export { cc5ControlRequest, type Cc5BridgeBinding } from './cc5BridgePort.js'
+export { defaultRemoteCcTarget, type RemoteCcTarget } from './cc5SshHost.js'
 
 const REJECTED = 'CC5_FRESH_CONTAINER_BINDING_REJECTED'
-export const CC5_CONTAINER_MOUNT = '/run/oc/cc5-remote-t1555u'
+export const REMOTE_LANE_UNAVAILABLE = 'REMOTE_LANE_UNAVAILABLE'
+export const CC5_CONTAINER_MOUNT = CC5_MOUNT
+const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
 function requireRuntime(ok: unknown): asserts ok {
   if (!ok) throw new Error(REJECTED)
+}
+function requireLane(ok: unknown): asserts ok {
+  if (!ok) throw new Error(REMOTE_LANE_UNAVAILABLE)
 }
 function syncDirectory(path: string): void {
   const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
@@ -71,35 +81,48 @@ function writePrivate(path: string, value: unknown, groupReadable = false): void
   }
   syncDirectory(dirname(path))
 }
-function overwriteProtectedBinding(mountSource: string, binding: Readonly<Cc5BridgeBinding>): void {
-  const tmpPath = join(mountSource, 'binding.json.tmp')
-  const finalPath = join(mountSource, 'binding.json')
-  try {
-    rmSync(tmpPath, { force: true })
-  } catch {}
-  const fd = openSync(
-    tmpPath,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-    0o640,
-  )
-  try {
-    fchownSync(fd, 0, 1000)
-    fchmodSync(fd, 0o640)
-    writeFileSync(fd, JSON.stringify(binding))
-    fsyncSync(fd)
-  } finally {
-    closeSync(fd)
-  }
-  renameSync(tmpPath, finalPath)
-  syncDirectory(mountSource)
+function overwriteProtectedBinding(laneView: string, binding: Readonly<Cc5BridgeBinding>): void {
+  const tmpPath = join(laneView, 'binding.json.tmp')
+  rmSync(tmpPath, { force: true })
+  writePrivate(tmpPath, binding, true)
+  renameSync(tmpPath, join(laneView, 'binding.json'))
+  syncDirectory(laneView)
 }
+function readJson(path: string): Record<string, unknown> {
+  const value = JSON.parse(readFileSync(path, 'utf8'))
+  requireRuntime(value && typeof value === 'object' && !Array.isArray(value))
+  return value
+}
+
 export interface Cc5PreparedContainer {
   readonly mountSource: string
   readonly containerDbId: string
 }
-export interface Cc5FreshContainerRuntimePort {
-  selectBackend(input: { uid: number; containerId: number; sessionKey: string;
-    canonicalModel: string; engine: string }): Cc5ExecutionBackend | undefined
+
+/** Where one chat runs, decided by the master's pool scheduler for this lane. */
+export interface RemoteLanePlacement {
+  readonly target: Readonly<RemoteCcTarget>
+  readonly taskRoot: string
+  /** Stable per task root, so a chat's resume ids survive container and master restarts. */
+  readonly operationId: string
+  readonly runId: string
+  /** The node `provision` packet (controller `package-provision` output). */
+  readonly provisionPacket: Buffer
+}
+export interface RemoteLaneRequest {
+  readonly uid: number
+  readonly containerDbId: string
+  readonly sessionKey: string
+  readonly canonicalModel: string
+}
+export type RemoteLaneState = 'running' | 'released' | 'unknown'
+export interface RemoteLaneHooks {
+  place(request: RemoteLaneRequest & { readonly dockerId: string }): Promise<RemoteLanePlacement>
+  onState?(operationId: string, state: RemoteLaneState): void
+}
+export type RemoteLaneHost = Cc5InteractiveHostPort & { prepareTask(packet: Buffer): Promise<void> }
+
+export interface RemoteLaneRuntimePort {
   prepare(input: {
     uid: number
     containerDbId: string
@@ -109,267 +132,131 @@ export interface Cc5FreshContainerRuntimePort {
   bindCreated(handle: Cc5PreparedContainer, dockerId: string): Promise<void>
   /** Caller MUST invoke only after the guarded Tx2 UPDATE has committed successfully. */
   activate(handle: Cc5PreparedContainer, dockerId: string): Promise<void>
+  /** Stops every lane of the container; a lane whose remote exit is unproved is reported, not retried. */
   release(containerDbId: string, dockerId?: string): Promise<void>
-}
-type SshDeployment = Omit<Cc5SshHostConfig, 'operationId' | 'runId' | 'toolSocketPath'>
-interface RuntimeOptions {
-  baseRoot: string
-  ssh: Readonly<SshDeployment>
-  /** IDs of this exact preinstalled strict MCP profile; one binding consumes it once. */
-  profile: Readonly<{ operationId: string; runId: string }>
-  scope: Readonly<{ sessionKey: string; canonicalModel: typeof CC5_NATIVE_MODEL }>
-  /** Trusted fixture seam only; default constructs the pinned production SSH port. */
-  hostFactory?: (config: Cc5SshHostConfig) => Cc5InteractiveHostPort
-}
-interface RecordState {
-  handle: Cc5PreparedContainer
-  root: string
-  runId: string
-  operationId: string
-  capability: string
-  keyring: AuthorityKeyring
-  binding?: Readonly<Cc5BridgeBinding>
-  relay?: Cc5Relay
-  finance?: Cc5FinancePort
-  state: 'prepared' | 'bound' | 'activating' | 'active' | 'released' | 'unknown'
-  release?: Promise<void>
-  activation?: Promise<void>
+  /** The chat's live lane, created on first use. Rejects with REMOTE_LANE_UNAVAILABLE. */
+  ensureLane(request: RemoteLaneRequest): Promise<Cc5ExecutionBackend>
 }
 
-/** OFF/nonselfhost returns before reading configuration, SSH metadata or creating any files. */
-export function createCc5FreshContainerRuntime(input: {
+interface RuntimeOptions {
+  baseRoot: string
+  controllerPath: string
+  /** Trusted fixture seam only; default constructs the production SSH host. */
+  hostFactory?: (config: Cc5SshHostConfig) => RemoteLaneHost
+}
+interface Lane {
+  readonly container: ContainerState
+  readonly sessionKey: string
+  readonly canonicalModel: string
+  readonly operationId: string
+  readonly dir: string
+  readonly view: string
+  readonly relay: Cc5Relay
+  binding: Readonly<Cc5BridgeBinding>
+  stopping?: Promise<void>
+}
+interface ContainerState {
+  readonly handle: Cc5PreparedContainer
+  readonly root: string
+  readonly keyring: AuthorityKeyring
+  dockerId?: string
+  state: 'prepared' | 'bound' | 'active' | 'released'
+  release?: Promise<void>
+}
+/**
+ * One owner per chat across all containers: its live lane and a serial tail. Placement, stopping
+ * the previous lane (another container's, a dead one, another model's) and starting the next all
+ * run on this tail, so the chat's node root is handed over strictly one lane at a time.
+ */
+interface ChatOwner {
+  lane?: Lane
+  tail: Promise<unknown>
+}
+
+/** OFF/nonselfhost returns before reading configuration or creating any files. */
+export function createRemoteLaneRuntime(input: {
   selfhost: boolean
   env: Cc5PolicyEnvironment
   configuration: () => RuntimeOptions
   financeFactory: Cc5FinanceFactory
-}): Cc5FreshContainerRuntimePort | undefined {
-  const testUid = input.env[CC5_TEST_UID_ENV]
-  if (!input.selfhost || !canUseCc5TestModel(testUid, input.env)) return undefined
-  return new Cc5FreshContainerRuntime(testUid!, input.configuration(), input.financeFactory)
+  hooks: RemoteLaneHooks
+}): RemoteLaneRuntimePort | undefined {
+  const uid = input.env[CC5_TEST_UID_ENV]
+  if (!input.selfhost || !canUseCc5TestModel(uid, input.env)) return undefined
+  return new RemoteLaneRuntime(uid!, input.configuration(), input.financeFactory, input.hooks)
 }
 
-class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
-  private readonly records = new Map<string, RecordState>()
-  private readonly handles = new WeakMap<Cc5PreparedContainer, RecordState>()
-  private blocked = false
+class RemoteLaneRuntime implements RemoteLaneRuntimePort {
+  private readonly containers = new Map<string, ContainerState>()
+  private readonly handles = new WeakMap<Cc5PreparedContainer, ContainerState>()
+  private readonly chats = new Map<string, ChatOwner>()
   constructor(
-    private readonly testUid: string,
+    private readonly uid: string,
     private readonly options: RuntimeOptions,
     private readonly financeFactory: Cc5FinanceFactory,
+    private readonly hooks: RemoteLaneHooks,
   ) {
-    requireRuntime(typeof financeFactory === 'function')
-    requireRuntime(options.scope?.canonicalModel === CC5_NATIVE_MODEL)
-    parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: options.scope.sessionKey,
-      operationId: options.profile.operationId })
+    requireRuntime(typeof financeFactory === 'function' && typeof hooks?.place === 'function')
     requireRuntime(
       process.getuid?.() === 0 &&
         isAbsolute(options.baseRoot) &&
-        Buffer.byteLength(join(options.baseRoot, 'a'.repeat(24), 'tool.sock')) <= 100,
+        isAbsolute(options.controllerPath) &&
+        Buffer.byteLength(join(options.baseRoot, 'a'.repeat(24), 'lanes', 'a'.repeat(36), 'tool.sock')) <= 100,
     )
-    // Existing state is never silently adopted/reset after a master restart or unknown result.
-    requireRuntime(
-      /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(options.profile.operationId) &&
-        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(options.profile.runId),
-    )
-    if (!existsSync(options.baseRoot)) {
-      mkdirSync(options.baseRoot, { mode: 0o700, recursive: false })
-    }
+    if (!existsSync(options.baseRoot)) mkdirSync(options.baseRoot, { mode: 0o700 })
     const st = lstatSync(options.baseRoot)
-    requireRuntime(
-      st.isDirectory() && !st.isSymbolicLink() && st.uid === 0 && (st.mode & 0o777) === 0o700,
-    )
-    for (const entry of readdirSync(options.baseRoot)) {
-      const childPath = join(options.baseRoot, entry)
-      const childSt = lstatSync(childPath)
-      requireRuntime(
-        /^[a-f0-9]{24}$/.test(entry) &&
-          childSt.isDirectory() &&
-          !childSt.isSymbolicLink() &&
-          childSt.uid === 0 &&
-          (childSt.mode & 0o777) === 0o700 &&
-          !existsSync(join(childPath, 'UNKNOWN.json')),
-      )
-      const mountSource = join(childPath, 'view')
-      const bindingPath = join(mountSource, 'binding.json')
-      const authorityPath = join(mountSource, 'authority-public.json')
-      if (existsSync(join(childPath, 'released.json'))) {
-        try {
-          const prep = JSON.parse(readFileSync(join(childPath, 'prepared.json'), 'utf8')) as {
-            containerDbId?: string
-            runId?: string
-            operationId?: string
-          }
-          const rel = JSON.parse(readFileSync(join(childPath, 'released.json'), 'utf8')) as {
-            remoteStopped?: boolean
-          }
-          requireRuntime(
-            rel?.remoteStopped === true &&
-              typeof prep?.containerDbId === 'string' &&
-              /^[1-9][0-9]{0,18}$/.test(prep.containerDbId),
-          )
-          const handle = Object.freeze({ mountSource, containerDbId: prep.containerDbId })
-          const releasedRecord: RecordState = {
-            handle,
-            root: childPath,
-            keyring: new Map(),
-            runId: String(prep.runId ?? options.profile.runId),
-            operationId: String(prep.operationId ?? options.profile.operationId),
-            capability: '',
-            state: 'released',
-          }
-          this.records.set(prep.containerDbId, releasedRecord)
-          this.handles.set(handle, releasedRecord)
-        } catch {
-          this.blocked = true
-          requireRuntime(false)
-        }
-      } else if (
-        existsSync(join(childPath, 'prepared.json')) &&
-        existsSync(join(childPath, 'activated.json')) &&
-        existsSync(bindingPath) &&
-        existsSync(authorityPath)
-      ) {
-        let createdRelay: Cc5Relay | undefined
-        try {
-          const binding = Object.freeze(
-            JSON.parse(readFileSync(bindingPath, 'utf8')) as Cc5BridgeBinding,
-          )
-          assertCc5BindingScope(binding)
-          const pub = JSON.parse(readFileSync(authorityPath, 'utf8')) as {
-            version?: number
-            keyring?: string
-          }
-          const act = JSON.parse(readFileSync(join(childPath, 'activated.json'), 'utf8')) as {
-            version?: number
-            dockerId?: string
-          }
-          requireRuntime(
-            pub?.version === 1 &&
-              typeof pub.keyring === 'string' &&
-              act?.version === 1 &&
-              act.dockerId === binding.dockerId &&
-              binding.uid === this.testUid &&
-              binding.sessionKey === options.scope.sessionKey &&
-              binding.canonicalModel === options.scope.canonicalModel &&
-              binding.operationId === options.profile.operationId &&
-              binding.runId === options.profile.runId &&
-              binding.expiresAt > Date.now(),
-          )
-          const keyring = parseAuthorityKeyring(pub.keyring)
-          const finance = this.financeFactory(binding)
-          requireRuntime(keyring.size > 0 && finance)
-          const handle = Object.freeze({ mountSource, containerDbId: binding.containerDbId })
-          const toolSocketPath = join(childPath, 'tool.sock')
-          const controlSocketPath = join(mountSource, 'relay.sock')
-          const host = (this.options.hostFactory ?? ((config) => new Cc5SshHost(config)))({
-            ...this.options.ssh,
-            operationId: binding.operationId,
-            runId: binding.runId,
-            toolSocketPath,
-          })
-          const recovered: RecordState = {
-            handle,
-            root: childPath,
-            keyring,
-            runId: binding.runId,
-            operationId: binding.operationId,
-            capability: binding.capability,
-            binding,
-            finance,
-            state: 'activating',
-          }
-          const relay = new Cc5Relay(
-            binding,
-            keyring,
-            binding.runId,
-            host,
-            join(childPath, 'journal'),
-            finance,
-            {
-              slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
-              recoverExistingJournal: true,
-              onBindingExtended: (expiresAt: number) => {
-                requireRuntime(
-                  recovered.binding &&
-                    recovered.state !== 'released' &&
-                    recovered.state !== 'unknown',
-                )
-                const nextBinding = Object.freeze({ ...recovered.binding, expiresAt })
-                overwriteProtectedBinding(handle.mountSource, nextBinding)
-                recovered.binding = nextBinding
-              },
-            },
-          )
-          createdRelay = relay
-          recovered.relay = relay
-          this.listenSync(relay.toolServer, toolSocketPath, 0, 0)
-          this.listenSync(relay.controlServer, controlSocketPath, 1000, 1000)
-          relay.attachRecoveredHost()
-          recovered.state = 'active'
-          this.records.set(binding.containerDbId, recovered)
-          this.handles.set(handle, recovered)
-        } catch {
-          if (createdRelay) {
-            for (const server of [createdRelay.controlServer, createdRelay.toolServer]) {
-              try {
-                server.closeAllConnections()
-                server.close()
-              } catch {}
-            }
-          }
-          this.blocked = true
-          try {
-            if (!existsSync(join(childPath, 'UNKNOWN.json'))) {
-              writePrivate(join(childPath, 'UNKNOWN.json'), {
-                version: 1,
-                reason: 'recovery-unproved',
-              })
-            }
-          } catch {}
-          requireRuntime(false)
-        }
-      } else {
-        this.blocked = true
-        try {
-          if (!existsSync(join(childPath, 'UNKNOWN.json'))) {
-            writePrivate(join(childPath, 'UNKNOWN.json'), {
-              version: 1,
-              reason: 'incomplete-state-unproved',
-            })
-          }
-        } catch {}
-        requireRuntime(false)
+    requireRuntime(st.isDirectory() && !st.isSymbolicLink() && st.uid === 0 && (st.mode & 0o777) === 0o700)
+    for (const entry of readdirSync(options.baseRoot)) this.adopt(entry)
+  }
+
+  /**
+   * A container prepared by an earlier master keeps its mounted view; it is adopted with no lane.
+   * Lane leftovers are dropped here — their remote side is reset by the chat's next lane.
+   * Anything not recognisable is left alone and simply not served.
+   */
+  private adopt(entry: string): void {
+    const root = join(this.options.baseRoot, entry)
+    try {
+      const st = lstatSync(root)
+      if (!/^[a-f0-9]{24}$/.test(entry) || !st.isDirectory() || st.isSymbolicLink() || st.uid !== 0) return
+      if (existsSync(join(root, 'released.json'))) return
+      const prepared = readJson(join(root, 'prepared.json'))
+      const activated = readJson(join(root, 'activated.json'))
+      const containerDbId = String(prepared.containerDbId)
+      const mountSource = join(root, 'view')
+      if (String(prepared.uid) !== this.uid || !/^[1-9][0-9]{0,18}$/.test(containerDbId) ||
+          typeof activated.dockerId !== 'string' || !/^[a-f0-9]{64}$/.test(activated.dockerId) ||
+          this.containers.has(containerDbId) || !existsSync(mountSource)) return
+      const authority = readJson(join(mountSource, 'authority-public.json'))
+      const keyring = parseAuthorityKeyring(String(authority.keyring))
+      if (keyring.size === 0) return
+      for (const name of readdirSync(mountSource)) {
+        if (name !== 'authority-public.json') rmSync(join(mountSource, name), { recursive: true, force: true })
       }
+      rmSync(join(root, 'lanes'), { recursive: true, force: true })
+      rmSync(join(root, 'UNKNOWN.json'), { force: true })
+      const handle = Object.freeze({ mountSource, containerDbId })
+      const record: ContainerState = { handle, root, keyring, dockerId: activated.dockerId, state: 'active' }
+      this.containers.set(containerDbId, record)
+      this.handles.set(handle, record)
+    } catch {
+      // Unreadable leftovers are not adopted; they never block other containers.
     }
-    syncDirectory(dirname(options.baseRoot))
   }
-  selectBackend(input: { uid: number; containerId: number; sessionKey: string;
-    canonicalModel: string; engine: string }): Cc5ExecutionBackend | undefined {
-    if (String(input.uid) !== this.testUid || input.sessionKey !== this.options.scope.sessionKey)
-      return undefined
-    requireRuntime(input.canonicalModel === this.options.scope.canonicalModel && input.engine === 'ccb')
-    const record = this.records.get(String(input.containerId))
-    requireRuntime(!this.blocked && record?.state === 'active' && record.binding &&
-      record.binding.expiresAt > Date.now() && record.finance && record.relay)
-    return Object.freeze({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: record.binding.sessionKey,
-      operationId: record.binding.operationId })
-  }
+
   async prepare(input: {
     uid: number
     containerDbId: string
     local: boolean
     publicKeyring: string
   }): Promise<Cc5PreparedContainer | null> {
-    if (!Number.isSafeInteger(input.uid) || String(input.uid) !== this.testUid) return null
-    for (const prior of this.records.values()) {
-      if (prior.release) await prior.release.catch(() => {})
-    }
+    if (!Number.isSafeInteger(input.uid) || String(input.uid) !== this.uid) return null
+    const prior = this.containers.get(input.containerDbId)
+    if (prior?.release) await prior.release.catch(() => {})
     requireRuntime(
       input.local &&
-        !this.blocked &&
         /^[1-9][0-9]{0,18}$/.test(input.containerDbId) &&
-        !this.records.has(input.containerDbId) &&
-        [...this.records.values()].every((r) => r.state === 'released'),
+        (!prior || prior.state === 'released'),
     )
     const keyring = parseAuthorityKeyring(input.publicKeyring)
     requireRuntime(keyring.size > 0)
@@ -380,127 +267,170 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     mkdirSync(mountSource, { mode: 0o750 })
     chownSync(mountSource, 0, 1000)
     chmodSync(mountSource, 0o750)
-    syncDirectory(mountSource)
     const handle = Object.freeze({ mountSource, containerDbId: input.containerDbId })
-    const record: RecordState = {
-      handle,
-      root,
-      keyring,
-      runId: this.options.profile.runId,
-      operationId: this.options.profile.operationId,
-      capability: randomBytes(32).toString('hex'),
-      state: 'prepared',
-    }
-    // Retain a fence even if publication fails; a retry cannot reset this operation.
-    this.records.set(input.containerDbId, record)
+    const record: ContainerState = { handle, root, keyring, state: 'prepared' }
+    this.containers.set(input.containerDbId, record)
     this.handles.set(handle, record)
-    writePrivate(join(root, 'prepared.json'), {
-      version: 2,
-      backendKind: CC5_INTERACTIVE_BACKEND,
-      canonicalModel: this.options.scope.canonicalModel,
-      sessionKey: this.options.scope.sessionKey,
-      uid: this.testUid,
-      containerDbId: input.containerDbId,
-      runId: record.runId,
-      operationId: record.operationId,
-    })
-    writePrivate(
-      join(mountSource, 'authority-public.json'),
-      { version: 1, keyring: input.publicKeyring },
-      true,
-    )
+    writePrivate(join(root, 'prepared.json'), { version: 3, uid: this.uid, containerDbId: input.containerDbId })
+    writePrivate(join(mountSource, 'authority-public.json'), { version: 1, keyring: input.publicKeyring }, true)
     return handle
   }
-  private record(handle: Cc5PreparedContainer): RecordState {
+  private record(handle: Cc5PreparedContainer): ContainerState {
     const record = this.handles.get(handle)
-    requireRuntime(record && this.records.get(handle.containerDbId) === record)
+    requireRuntime(record && this.containers.get(handle.containerDbId) === record)
     return record
   }
   async bindCreated(handle: Cc5PreparedContainer, dockerId: string): Promise<void> {
     const record = this.record(handle)
     requireRuntime(record.state === 'prepared' && /^[a-f0-9]{64}$/.test(dockerId))
-    record.binding = Object.freeze({
-      version: 2,
-      backendKind: CC5_INTERACTIVE_BACKEND,
-      canonicalModel: this.options.scope.canonicalModel,
-      sessionKey: this.options.scope.sessionKey,
-      runId: record.runId,
-      uid: this.testUid,
-      containerDbId: handle.containerDbId,
-      dockerId,
-      operationId: record.operationId,
-      capability: record.capability,
-      expiresAt: Date.now() + CC5_BINDING_SLIDING_TTL_MS,
-    })
-    record.finance = this.financeFactory(record.binding)
-    requireRuntime(record.finance)
-    writePrivate(join(handle.mountSource, 'binding.json'), record.binding, true)
+    record.dockerId = dockerId
     record.state = 'bound'
   }
-  activate(handle: Cc5PreparedContainer, dockerId: string): Promise<void> {
+  async activate(handle: Cc5PreparedContainer, dockerId: string): Promise<void> {
     const record = this.record(handle)
-    requireRuntime(
-      record.state === 'bound' && record.binding?.dockerId === dockerId && !this.blocked,
-    )
-    record.state = 'activating'
-    record.activation = (async () => {
-      const finance = record.finance
-      requireRuntime(finance)
-      const toolSocketPath = join(record.root, 'tool.sock')
-      const host = (this.options.hostFactory ?? ((config) => new Cc5SshHost(config)))({
-        ...this.options.ssh,
-        operationId: record.operationId,
-        runId: record.runId,
-        toolSocketPath,
+    requireRuntime(record.state === 'bound' && record.dockerId === dockerId)
+    writePrivate(join(record.root, 'activated.json'), { version: 1, dockerId })
+    record.state = 'active'
+  }
+
+  async ensureLane(request: RemoteLaneRequest): Promise<Cc5ExecutionBackend> {
+    const container = this.containers.get(request.containerDbId)
+    requireLane(container?.state === 'active' && container.dockerId && String(request.uid) === this.uid &&
+      isCc5CanonicalModel(request.canonicalModel))
+    const owner = this.chat(request.sessionKey)
+    const live = (lane: Lane | undefined): lane is Lane => !!lane && lane.container === container &&
+      !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
+      lane.binding.expiresAt > Date.now()
+    // A resident lane answers without waiting; anything else is decided on the chat's tail.
+    let lane = owner.lane
+    if (!live(lane)) {
+      lane = await this.serial(owner, async () => {
+        if (live(owner.lane)) return owner.lane
+        try {
+          // A request whose container was released while it queued must not touch the chat's lane.
+          requireLane(container.state === 'active' && container.dockerId)
+          if (owner.lane) {
+            const old = owner.lane
+            owner.lane = undefined
+            await this.stopLane(old) // Another container's, a dead one, or another model's.
+          }
+          requireLane(container.state === 'active' && container.dockerId)
+          const placement = await this.hooks.place({ ...request, dockerId: container.dockerId })
+          requireLane(UUID.test(placement.operationId) && UUID.test(placement.runId) &&
+            placement.target.upstreamModel.length > 0)
+          const next = await this.startLane(container, request, placement)
+          if (container.state !== 'active') {
+            await this.stopLane(next) // Released while the node was being prepared.
+            requireLane(false)
+          }
+          owner.lane = next
+          this.hooks.onState?.(next.operationId, 'running')
+          return next
+        } catch (error) {
+          if (error instanceof Error && error.message === REMOTE_LANE_UNAVAILABLE) throw error
+          throw new Error(REMOTE_LANE_UNAVAILABLE, { cause: error })
+        }
       })
-      record.relay = new Cc5Relay(
-        record.binding!,
-        record.keyring,
-        record.runId,
-        host,
-        join(record.root, 'journal'),
-        finance,
-        {
-          slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
-          onBindingExtended: (expiresAt: number) => {
-            requireRuntime(
-              record.binding && record.state !== 'released' && record.state !== 'unknown',
-            )
-            const nextBinding = Object.freeze({ ...record.binding, expiresAt })
-            overwriteProtectedBinding(handle.mountSource, nextBinding)
-            record.binding = nextBinding
-          },
-        },
-      )
-      await this.listen(record.relay.toolServer, toolSocketPath, 0, 0)
-      requireRuntime(record.state === 'activating' && !this.blocked)
-      await this.listen(
-        record.relay.controlServer,
-        join(handle.mountSource, 'relay.sock'),
-        1000,
-        1000,
-      )
-      requireRuntime(record.state === 'activating' && !this.blocked)
-      record.state = 'active'
-      writePrivate(join(record.root, 'activated.json'), { version: 1, dockerId })
-    })().catch(() => {
-      throw new Error(REJECTED)
-    })
-    // The provisioning caller must release this handle on any activation failure.
-    return record.activation
-  }
-  private listenSync(server: Server, path: string, uid: number, gid: number): void {
-    if (existsSync(path)) {
-      const existing = lstatSync(path)
-      requireRuntime(existing.isSocket() && !existing.isSymbolicLink())
-      rmSync(path, { force: false })
     }
-    server.listen(path)
-    const socket = lstatSync(path)
-    requireRuntime(socket.isSocket() && socket.uid === 0 && socket.nlink === 1)
-    chmodSync(path, 0o600)
-    chownSync(path, uid, gid)
+    return parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: lane.sessionKey,
+      operationId: lane.operationId })
   }
+
+  private chat(sessionKey: string): ChatOwner {
+    let owner = this.chats.get(sessionKey)
+    if (!owner) {
+      owner = { tail: Promise.resolve() }
+      this.chats.set(sessionKey, owner)
+    }
+    return owner
+  }
+
+  private serial<T>(owner: ChatOwner, step: () => Promise<T>): Promise<T> {
+    const run = owner.tail.then(step, step)
+    owner.tail = run.catch(() => {})
+    return run
+  }
+
+  private async startLane(container: ContainerState, request: RemoteLaneRequest,
+    placement: RemoteLanePlacement): Promise<Lane> {
+    const dir = join(container.root, 'lanes', placement.operationId)
+    const view = join(container.handle.mountSource, placement.operationId)
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(view, { recursive: true, force: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const toolSocketPath = join(dir, 'tool.sock')
+    const host = (this.options.hostFactory ?? ((config) => new Cc5SshHost(config)))({
+      target: placement.target,
+      taskRoot: placement.taskRoot,
+      operationId: placement.operationId,
+      runId: placement.runId,
+      controllerPath: this.options.controllerPath,
+      toolSocketPath,
+    })
+    await host.prepareTask(placement.provisionPacket)
+    const binding: Readonly<Cc5BridgeBinding> = Object.freeze({
+      version: 2,
+      backendKind: CC5_INTERACTIVE_BACKEND,
+      canonicalModel: request.canonicalModel,
+      sessionKey: request.sessionKey,
+      runId: placement.runId,
+      uid: this.uid,
+      containerDbId: request.containerDbId,
+      dockerId: container.dockerId!,
+      operationId: placement.operationId,
+      capability: randomBytes(32).toString('hex'),
+      expiresAt: Date.now() + CC5_BINDING_SLIDING_TTL_MS,
+    })
+    const finance = this.financeFactory(binding, { upstreamModel: placement.target.upstreamModel })
+    requireLane(finance)
+    mkdirSync(view, { mode: 0o750 })
+    chownSync(view, 0, 1000)
+    chmodSync(view, 0o750)
+    writePrivate(join(view, 'binding.json'), binding, true)
+    let current: Lane | undefined
+    const relay = new Cc5Relay(binding, container.keyring, placement.runId, host, join(dir, 'journal'), finance, {
+      slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
+      upstreamModel: placement.target.upstreamModel,
+      onBindingExtended: (expiresAt: number) => {
+        requireLane(current && !current.stopping && existsSync(view))
+        const next = Object.freeze({ ...current.binding, expiresAt })
+        overwriteProtectedBinding(view, next)
+        current.binding = next
+      },
+    })
+    const lane: Lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
+      operationId: placement.operationId, dir, view, binding, relay }
+    try {
+      await this.listen(relay.toolServer, toolSocketPath, 0, 0)
+      await this.listen(relay.controlServer, join(view, 'relay.sock'), 1000, 1000)
+    } catch (error) {
+      await this.stopLane(lane).catch(() => {})
+      throw error
+    }
+    return lane
+  }
+
+  private stopLane(lane: Lane): Promise<void> {
+    if (lane.stopping) return lane.stopping
+    lane.stopping = (async () => {
+      let proven = false
+      try {
+        proven = (await lane.relay.stop()).remoteStopped === true
+      } catch {
+        proven = false
+      }
+      for (const server of [lane.relay.controlServer, lane.relay.toolServer]) {
+        if (!server.listening) continue
+        server.closeAllConnections()
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+      }
+      rmSync(lane.view, { recursive: true, force: true })
+      // An unproved exit stays visible; the node root is reset before its next lane.
+      this.hooks.onState?.(lane.operationId, proven ? 'released' : 'unknown')
+    })()
+    return lane.stopping
+  }
+
   private async listen(server: Server, path: string, uid: number, gid: number): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const error = (): void => reject(new Error(REJECTED))
@@ -519,48 +449,24 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
       })
     })
   }
+
   release(containerDbId: string, dockerId?: string): Promise<void> {
-    const record = this.records.get(containerDbId)
+    const record = this.containers.get(containerDbId)
     if (!record) return Promise.resolve()
-    requireRuntime(!dockerId || !record.binding || record.binding.dockerId === dockerId)
+    requireRuntime(!dockerId || !record.dockerId || record.dockerId === dockerId)
     if (record.release) return record.release
-    const priorState = record.state
-    // Revoke synchronously before waiting for remote proof. Never auto reset an unknown operation.
-    record.state = 'released'
-    const stopped = record.relay
-      ? record.relay.stop()
-      : priorState === 'prepared' || priorState === 'bound'
-        ? Promise.resolve({ remoteStopped: true as const })
-        : Promise.reject(new Error(REJECTED))
+    record.state = 'released' // No new lane from here on; a lane still starting stops itself.
     record.release = (async () => {
-      let proven = true
-      try {
-        const res = await stopped
-        requireRuntime(res?.remoteStopped === true)
-      } catch {
-        proven = false
-        record.state = 'unknown'
-        this.blocked = true
-      }
-      await record.activation?.catch(() => {})
-      for (const server of [record.relay?.controlServer, record.relay?.toolServer]) {
-        if (!server) continue
-        server.closeAllConnections()
-        await new Promise<void>((resolve) => server.close(() => resolve()))
-      }
-      if (!proven) {
-        if (!existsSync(join(record.root, 'UNKNOWN.json'))) {
-          writePrivate(join(record.root, 'UNKNOWN.json'), {
-            version: 1,
-            reason: 'remote-exit-unproved',
-          })
-        }
-        throw new Error(REJECTED)
-      }
-      // Retain private identity/fence journal; only the now-inaccessible container view is removed.
-      rmSync(record.handle.mountSource, { recursive: true, force: false })
-      syncDirectory(record.root)
-      writePrivate(join(record.root, 'released.json'), { version: 1, remoteStopped: true })
+      // On each chat's own tail, after any placement already queued there for this container.
+      await Promise.allSettled([...this.chats.values()].map((owner) => this.serial(owner, async () => {
+        if (owner.lane?.container !== record) return
+        const lane = owner.lane
+        owner.lane = undefined
+        await this.stopLane(lane)
+      })))
+      rmSync(record.handle.mountSource, { recursive: true, force: true })
+      rmSync(join(record.root, 'lanes'), { recursive: true, force: true })
+      writePrivate(join(record.root, 'released.json'), { version: 1 })
     })()
     return record.release
   }
