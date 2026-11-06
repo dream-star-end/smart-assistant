@@ -21,11 +21,20 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 
 TASK = 'AGENT-REMOTE-T1555U'
-PINNED_MCP_SHA = '828d524a08c10f45a9c13c89c178ec740581f98ebc1870d089dab594a18d4cfd'
-PINNED_SOCKET_SHA = '548c8d791f3b76f866ff67b2c12c88b085252a835c0c7c13a5ef0fbc03790563'
+PINNED_MCP_SHA = 'e37bb27db422d0eba594be84f3817cf2ff7adfc73c675ff223df4a24d4207e64'
+PINNED_SOCKET_SHA = '09e72708f99f3e04f20c442c9f7b0234bdf35f07d72e122499772be5a022cc4f'
 UUID = re.compile(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z')
+# Same accepted shapes as the gateway target and host.py's account directory.
+MODEL = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}\Z')
+PROFILE = re.compile(r'[a-z0-9][a-z0-9-]{0,31}\Z')
+DEFAULT_MODEL = 'claude-sonnet-5'
+# The controller runs as the target SSH account, so its home is that node's account home.
+HOME = Path.home()
+# Master-side packaging names a root on some node account; the node re-checks it as its own home.
+NODE_ROOT = re.compile(r'/home/[a-z_][a-z0-9_-]{0,31}/oc-agentremote-[a-z0-9][a-z0-9-]{14,59}\Z')
 PINNED_CLI_SIZE = 328262000
 PINNED_CLI_SHA = 'fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824'
 PLUGIN = ('.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.ts', 'hooks/frames.ts')
@@ -49,10 +58,11 @@ def digest(files):
 
 
 def task_root(value):
+    # The strict per-node prefix is pinned by the SSH guard; here only the task shape matters.
     root = Path(value)
-    require(root.parent == Path('/home/box') and
-            re.fullmatch(r'oc-agentremote-t1555u-[a-z0-9-]{16,40}', root.name), 'bad-task-root')
-    require(os.getuid() != 0 and Path.home() == Path('/home/box'), 'requires-box-user-no-sudo')
+    require(root.parent == HOME and
+            re.fullmatch(r'oc-agentremote-[a-z0-9][a-z0-9-]{14,59}', root.name), 'bad-task-root')
+    require(os.getuid() != 0, 'requires-nonroot-account')
     return root
 
 
@@ -63,7 +73,7 @@ def owner(root):
     info = json.loads((root / 'OWNER.json').read_text())
     require(info['task'] == TASK and info['root'] == str(root) and info['uid'] == os.getuid(),
             'wrong-task-owner')
-    require(info['cwd'] in ('/home/box', str(root / 'work')), 'unsafe-task-cwd')
+    require(info['cwd'] in (str(HOME), str(root / 'work')), 'unsafe-task-cwd')
     return info
 
 
@@ -165,17 +175,17 @@ def install_cli(root):
             directory.rmdir()
 
 
-def package(run_id):
+def package(run_id, home='/home/box'):
     repo = Path(__file__).resolve().parents[2]
-    require(repo.name == 'ocv5-agentremote-cc5-web-t1555u', 'requires-task-worktree')
     require(re.fullmatch(r'[a-z0-9-]{16,40}', run_id), 'bad-run-id')
+    require(NODE_ROOT.fullmatch(home + '/oc-agentremote-' + run_id), 'bad-node-home')
     src = repo / 'packages/gateway/box-bridge-mod'
     files = {'host.py': (src / 'host.py').read_bytes()}
     files.update({'mod/oc-bridge/' + name: (src / 'oc-bridge' / name).read_bytes() for name in PLUGIN})
     tap = next(n.value.value for n in ast.parse(files['host.py']).body if isinstance(n, ast.Assign)
                and any(isinstance(t, ast.Name) and t.id == 'TAP_SOURCE' for t in n.targets)).encode()
-    packet = {'task': TASK, 'root': '/home/box/oc-agentremote-t1555u-' + run_id,
-              'session': 'oc-ar-' + run_id, 'cwd': '/home/box',
+    packet = {'task': TASK, 'root': home + '/oc-agentremote-' + run_id,
+              'session': 'oc-ar-' + run_id, 'cwd': home,
               'sourceCommit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip(),
               'pluginDigest': digest({name: files['mod/oc-bridge/' + name] for name in PLUGIN}),
               'tapSha256': sha(tap), 'hashes': {name: sha(data) for name, data in files.items()},
@@ -190,7 +200,7 @@ def install():
     require(packet['task'] == TASK and set(packet['files']) == set(SOURCE_FILES) and
             set(packet['hashes']) == set(SOURCE_FILES), 'unexpected-package-files')
     root = task_root(packet['root'])
-    require(packet['cwd'] == '/home/box' and
+    require(packet['cwd'] == str(HOME) and
             re.fullmatch(r'oc-ar-[a-z0-9-]{16,40}', packet['session']), 'unsafe-launch-config')
     require(max(len(str(root / x).encode()) for x in ('run/bridge.sock', 'exec.sock', 'tmux/tmux-1001/oc-box')) <= 100,
             'unix-socket-path-too-long')
@@ -217,7 +227,7 @@ def install():
 
 
 def tmux(root, *args, timeout=None):
-    env = {'HOME': '/home/box', 'PATH': '/usr/bin:/bin', 'TMUX_TMPDIR': str(root / 'tmux')}
+    env = {'HOME': str(HOME), 'PATH': '/usr/bin:/bin', 'TMUX_TMPDIR': str(root / 'tmux')}
     return subprocess.run(['tmux', '-L', 'oc-box', *args], env=env, capture_output=True, text=True, timeout=timeout)
 
 
@@ -250,8 +260,7 @@ def profile_files(root, operation_id, run_id, script, socket_script):
 
 def package_profile(root_text, operation_id, run_id):
     repo = Path(__file__).resolve().parents[2]
-    require(repo.name == 'ocv5-agentremote-cc5-web-t1555u', 'requires-task-worktree')
-    require(re.fullmatch(r'/home/box/oc-agentremote-t1555u-[a-z0-9-]{16,40}', root_text), 'bad-profile-root')
+    require(NODE_ROOT.fullmatch(root_text), 'bad-profile-root')
     script = (repo / 'scripts/agent-remote/cc5-fixed-mcp.py').read_bytes()
     socket_script = (repo / 'scripts/agent-remote/cc5-mcp-socket.py').read_bytes()
     profile_files(Path(root_text), operation_id, run_id, script, socket_script)
@@ -331,10 +340,28 @@ def profile_args(root, info):
             'unsafe-task-workdir')
     cli = claude_executable(root, info)
     require(cli == str(root / 'bin/claude-2.1.316'), 'requires-private-cli')
-    return [cli, '--permission-mode', 'default', '--model', 'claude-sonnet-5', '--tools', '',
+    model = info.get('model', DEFAULT_MODEL)
+    require(isinstance(model, str) and MODEL.fullmatch(model), 'unapproved-model')
+    args = [cli, '--permission-mode', 'default', '--model', model, '--tools', '',
             '--strict-mcp-config', '--mcp-config', str(root / 'cprofile/mcp.json'),
             '--setting-sources', '', '--disable-slash-commands', '--allowedTools',
             'mcp__ocbridge__Read,mcp__ocbridge__Edit,mcp__ocbridge__Bash']
+    session = info.get('sessionArgs')
+    if session is not None:
+        # Fixed at launch and persisted, so later roles compare the live argv byte-for-byte.
+        require(isinstance(session, list) and len(session) == 2 and
+                session[0] in ('--session-id', '--resume') and
+                isinstance(session[1], str) and UUID.fullmatch(session[1]), 'bad-claude-session')
+        args += session
+    return args
+
+
+def account_name(info):
+    name = info.get('profileDir')
+    if name is None:
+        return None
+    require(isinstance(name, str) and PROFILE.fullmatch(name), 'bad-account-directory')
+    return name
 
 
 def process_record(pid):
@@ -532,30 +559,88 @@ def mark_stopping(root):
         os.close(directory)
 
 
-def launch(root):
+def publish_owner(root, info):
+    stage = root / 'OWNER.partial'
+    fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(info, stream, indent=2)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    stage.replace(root / 'OWNER.json')
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def transcript(info, session):
+    # host.py only launches an account directory whose projects is the shared ~/.claude/projects
+    # link, so every account of this node writes the task's transcript to the same place.
+    return HOME / '.claude/projects' / re.sub(r'[^A-Za-z0-9]', '-', info['cwd']) / (session + '.jsonl')
+
+
+def rotate(root):
+    """Open the next start round of a task that ran before; tool-socket is each round's first role.
+
+    The old round must be proven gone, then its records are dropped so the new socket and host
+    can publish theirs. A root stopped before it ever launched stays terminal: that stop was the
+    operator's answer, not an interruption to recover from.
+    """
+    if not (root / 'LIFECYCLE.json').exists():
+        require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
+        return
+    prove_stopped(root, emit=False)
+    for name in ('LIFECYCLE.json', 'STOPPED.json', 'STOPPING.json', 'MCP-SOCKET.json'):
+        try:
+            (root / name).unlink()
+        except FileNotFoundError:
+            pass
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def launch(root, model, profile_dir=None):
     with control_lock(root):
         require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
         with writer_lock(root) as fd:
-            launch_locked(root, fd)
+            launch_locked(root, fd, model, profile_dir)
 
 
-def launch_locked(root, writer_fd):
+def launch_locked(root, writer_fd, model, profile_dir=None):
     info = owner(root)
     if (root / 'LIFECYCLE.json').exists():
         prove_stopped(root, emit=False)  # A new launch cannot erase an unproved old writer.
-        raise RuntimeError('task-lifecycle-already-used')
+        raise RuntimeError('task-lifecycle-already-used')  # One launch per round; tool-socket opens the next.
+    require(isinstance(model, str) and MODEL.fullmatch(model), 'unapproved-model')
+    require(profile_dir is None or (isinstance(profile_dir, str) and PROFILE.fullmatch(profile_dir)),
+            'bad-account-directory')
+    # One Claude session per task for its whole life: the first round names it, later rounds
+    # resume that exact transcript, so the history is never retransmitted nor guessed.
+    session = (info.get('sessionArgs') or [None, str(uuid.uuid4())])[1]
+    flag = '--resume' if transcript(info, session).exists() else '--session-id'
+    info.update({'model': model, 'profileDir': profile_dir, 'sessionArgs': [flag, session]})
+    publish_owner(root, info)  # Later roles compare live argv against these persisted choices.
     files = check_sources(root, info)
     require(not (root / 'run').exists(), 'runtime-already-exists')
-    env = {'HOME': '/home/box', 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
+    env = {'HOME': str(HOME), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
            'TMPDIR': str(root / 'tmp'), 'TMUX_TMPDIR': str(root / 'tmux'),
            'OC_BOX_MOD_FILES': json.dumps({name: base64.b64encode(files['mod/oc-bridge/' + name]).decode()
                                            for name in PLUGIN}),
            'OC_BOX_MOD_SHA256': info['pluginDigest'], 'OC_BOX_READY_MS': '20000',
-           # Same native guards as boxTextPlan.ts; these bound retries/output,
-           # not the number of upstream requests or the platform monetary cost.
-           'CLAUDE_CODE_MAX_RETRIES': '0', 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1',
-           'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS': '1024',
+           # A real chat on the node's own login: the CLI keeps its native retries and output
+           # limit, so a transient upstream error or a long answer behaves as in a local session.
+           'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1',
+           'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0',
            'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'}
+    account = account_name(info)
+    if account is not None:
+        # host.py owns the account directory convention: OC_BOX_CLAUDE_PROFILE -> ~/.claude-<name>.
+        env['OC_BOX_CLAUDE_PROFILE'] = account
     claude_executable(root, info, full_hash=True)
     cli_args = profile_args(root, info)
     lock_stat = os.fstat(writer_fd)
@@ -573,7 +658,7 @@ def launch_locked(root, writer_fd):
 
 def tool_socket(root):
     with control_lock(root):
-        require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
+        rotate(root)
         tool_socket_locked(root)
 
 
@@ -581,7 +666,7 @@ def tool_socket_locked(root):
     info = owner(root)
     check_sources(root, info)
     profile_args(root, info)  # Includes all pinned profile contents/identity checks.
-    env = {'HOME': '/home/box', 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': str(root / 'tmp')}
+    env = {'HOME': str(HOME), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': str(root / 'tmp')}
     script = str(root / 'cprofile/cc5-mcp-socket.py')
     os.execve('/usr/bin/python3', ['/usr/bin/python3', '-I', '-B', script, str(root)], env)
 
@@ -811,15 +896,21 @@ if __name__ == '__main__':
     try:
         role = sys.argv[1]
         if role == 'package':
-            package(sys.argv[2])
+            package(*sys.argv[2:4])
         elif role == 'install':
             install()
         elif role == 'package-profile':
             package_profile(sys.argv[2], sys.argv[3], sys.argv[4])
+        elif role == 'launch':
+            # Only the launch carries the deployment's model and account directory.
+            rest = sys.argv[3:]
+            require(len(rest) in (2, 4) and rest[0] == '--model' and
+                    (len(rest) == 2 or rest[2] == '--profile'), 'bad-launch-arguments')
+            launch(task_root(sys.argv[2]), rest[1], rest[3] if len(rest) == 4 else None)
         else:
-            require(role in ('launch', 'workspace', 'inspect', 'snapshot', 'install-cli', 'install-profile', 'tool-socket', 'stop-socket', 'prove-stopped', 'stop', 'cleanup'), 'unknown-role')
+            require(len(sys.argv) == 3 and role in ('workspace', 'inspect', 'snapshot', 'install-cli', 'install-profile', 'tool-socket', 'stop-socket', 'prove-stopped', 'stop', 'cleanup'), 'unknown-role')
             root = task_root(sys.argv[2])
-            {'launch': launch, 'workspace': workspace, 'install-profile': install_profile, 'tool-socket': tool_socket, 'stop-socket': stop_socket, 'prove-stopped': prove_stopped,
+            {'workspace': workspace, 'install-profile': install_profile, 'tool-socket': tool_socket, 'stop-socket': stop_socket, 'prove-stopped': prove_stopped,
              'inspect': inspect, 'snapshot': snapshot, 'install-cli': install_cli, 'stop': stop, 'cleanup': cleanup}[role](root)
     except Exception as error:
         # No raw exception/argv/response could leak pane or credentials.

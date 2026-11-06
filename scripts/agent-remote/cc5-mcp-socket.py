@@ -17,7 +17,7 @@ import struct
 import sys
 import types
 
-PINNED_MCP_SHA = '828d524a08c10f45a9c13c89c178ec740581f98ebc1870d089dab594a18d4cfd'
+PINNED_MCP_SHA = 'e37bb27db422d0eba594be84f3817cf2ff7adfc73c675ff223df4a24d4207e64'
 MAX_BODY = 131072
 MAX_FRAME = 262144
 

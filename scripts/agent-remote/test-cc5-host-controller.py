@@ -54,7 +54,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(config, {'mcpServers': {'ocbridge': {'command': '/usr/bin/python3',
                 'args': ['-I', str(root / 'cprofile/cc5-fixed-mcp.py'), str(root)]}}})
             args = mod.profile_args(root, info)
-            # Canonical existing Sonnet model, never a mutable upstream alias.
+            # Built-in default before any launch record exists; a launch record overrides it.
             self.assertEqual(args[args.index('--model') + 1], 'claude-sonnet-5')
             self.assertEqual(args[args.index('--tools') + 1], '')
             self.assertEqual(args[args.index('--setting-sources') + 1], '')
@@ -62,12 +62,27 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(args[-2:], ['--allowedTools', 'mcp__ocbridge__Read,mcp__ocbridge__Edit,mcp__ocbridge__Bash'])
             self.assertTrue(all((p.stat().st_mode & 0o777) == 0o400 for p in (root / 'cprofile').iterdir()))
 
-    def test_launch_passes_native_guards_and_fixed_interactive_model_to_the_real_exec_boundary(self):
+    def test_task_root_belongs_to_the_target_account_home(self):
+        home = Path.home()
+        root = home / 'oc-agentremote-t20261106t0000z-abcdef0123456789'
+        with patch.object(mod.os, 'getuid', lambda: 1000):
+            self.assertEqual(mod.task_root(str(root)), root)
+        with patch.object(mod.os, 'getuid', lambda: 0), self.assertRaises(RuntimeError):
+            mod.task_root(str(root))
+        for bad in ('/home/someoneelse/oc-agentremote-t20261106t0000z-abcdef0123456789',
+                    str(home / 'oc-agentremote-short'),
+                    str(home / 'other-task-abcdef0123456789xyz'),
+                    str(home / 'oc-agentremote-ABCDEF0123456789xyz'),
+                    str(root) + '/sub'):
+            with self.subTest(root=bad), self.assertRaises(RuntimeError):
+                mod.task_root(bad)
+
+    def test_launch_passes_native_guards_and_the_target_model_to_the_real_exec_boundary(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             info = {**self.installed(root), 'pluginDigest': 'synthetic-plugin-digest'}
             files = {'mod/oc-bridge/' + name: b'synthetic-plugin' for name in mod.PLUGIN}
-            with patch.object(mod, 'owner', lambda _: info), \
+            with patch.object(mod, 'owner', lambda _: dict(info)), \
                     patch.object(mod, 'check_sources', lambda *_: files), \
                     patch.object(mod, 'process_record', lambda _: {'pid': 444, 'startTicks': '1'}), \
                     patch.object(mod, 'proc', lambda _: (['synthetic-controller'], '1')), \
@@ -76,23 +91,142 @@ class ProfileTests(unittest.TestCase):
                     patch.object(mod.os, 'execve') as execute, \
                     patch.dict(mod.os.environ, {'CLAUDE_CODE_MAX_RETRIES': '99', 'PYTHONPATH': '/untrusted'}):
                 with mod.writer_lock(root) as writer_fd:
-                    mod.launch_locked(root, writer_fd)
+                    mod.launch_locked(root, writer_fd, 'claude-opus-5', 'acct-a')
             lifecycle.assert_called_once()
             chdir.assert_called_once_with(info['cwd'])
             execute.assert_called_once()
             executable, args, environment = execute.call_args.args
             self.assertEqual(executable, sys.executable)
             self.assertEqual(args[:4], [sys.executable, str(root / 'install/host.py'), str(root / 'run'), info['session']])
-            self.assertEqual(args[args.index('--model') + 1], 'claude-sonnet-5')
+            # The model and account directory come from the target, not from a constant.
+            self.assertEqual(args[args.index('--model') + 1], 'claude-opus-5')
+            self.assertEqual(environment['OC_BOX_CLAUDE_PROFILE'], 'acct-a')
+            self.assertEqual(environment['HOME'], str(Path.home()))
             self.assertTrue(all(flag not in args for flag in ('-p', '--print', '--output-format', '--input-format')))
             self.assertEqual({name: environment[name] for name in (
-                'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY',
-                'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+                'CLAUDE_CODE_DISABLE_REFUSAL_RETRY', 'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS',
                 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')}, {
-                'CLAUDE_CODE_MAX_RETRIES': '0', 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1',
-                'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS': '1024',
+                'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1', 'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0',
                 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'})
+            # A real chat keeps the CLI's native retries and output limit; the inherited value is dropped too.
+            self.assertNotIn('CLAUDE_CODE_MAX_RETRIES', environment)
+            self.assertNotIn('CLAUDE_CODE_MAX_OUTPUT_TOKENS', environment)
             self.assertNotIn('PYTHONPATH', environment)
+            # First round of a task: it names its one Claude session; nothing to resume yet.
+            self.assertEqual(args[-2], '--session-id')
+            self.assertRegex(args[-1], mod.UUID)
+
+    def test_profile_args_take_model_resume_and_account_from_the_launch_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            session = str(uuid4())
+            args = mod.profile_args(root, {**info, 'model': 'claude-opus-5',
+                                           'sessionArgs': ['--resume', session], 'profileDir': 'acct-a'})
+            self.assertEqual(args[args.index('--model') + 1], 'claude-opus-5')
+            self.assertEqual(args[-2:], ['--resume', session])
+            self.assertEqual(args[args.index('--tools') + 1], '')
+            self.assertEqual(args[args.index('--setting-sources') + 1], '')
+            self.assertNotIn('--continue', args)
+            for record, error in (({'model': '/bin/sh'}, 'unapproved-model'),
+                                  ({'model': 'Claude Sonnet'}, 'unapproved-model'),
+                                  ({'sessionArgs': ['--resume', '../../etc/passwd']}, 'bad-claude-session'),
+                                  ({'sessionArgs': ['--continue', session]}, 'bad-claude-session'),
+                                  ({'profileDir': 'Acct/1'}, 'bad-account-directory')):
+                with self.subTest(record=record), self.assertRaisesRegex(RuntimeError, error):
+                    if 'profileDir' in record:
+                        mod.account_name({**info, **record})
+                    else:
+                        mod.profile_args(root, {**info, **record})
+
+    def test_stopped_task_starts_a_new_round_in_real_role_order_and_resumes_its_own_session(self):
+        """Each start round is tool-socket then launch (Cc5SshHost.initialize), on the same root."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / 'task'
+            root.mkdir(mode=0o700)
+            info = self.installed(root)
+            (root / 'OWNER.json').write_text(json.dumps({
+                'task': mod.TASK, 'root': str(root), 'uid': os.getuid(), 'session': info['session'],
+                'cwd': info['cwd'], 'pluginDigest': 'synthetic-plugin-digest'}))
+            (root / 'OWNER.json').chmod(0o600)
+            profile = mod.check_profile(root)
+            files = {'mod/oc-bridge/' + name: b'synthetic-plugin' for name in mod.PLUGIN}
+            dead = {'pid': 2000000000, 'startTicks': '1'}
+
+            def socket_published(identity):
+                path = root / 'MCP-SOCKET.json'
+                path.write_text(json.dumps({'version': 1, 'root': str(root), 'runId': profile['runId'],
+                                            'operationId': profile['operationId'], **identity}))
+                path.chmod(0o600)
+
+            def start_round():
+                with patch.object(mod.os, 'execve') as socket_exec:
+                    mod.tool_socket(root)
+                socket_exec.assert_called_once()
+                # The new round's socket is alive while the host launches next to it.
+                self.assertFalse((root / 'MCP-SOCKET.json').exists())
+                socket_published({'pid': os.getpid(), 'startTicks': mod.proc(os.getpid())[1]})
+                with patch.object(mod.os, 'chdir'), patch.object(mod.os, 'execve') as host_exec:
+                    mod.launch(root, 'claude-opus-5', 'acct-b')
+                return host_exec.call_args.args
+
+            def end_round():
+                socket_published(dead)  # Both recorded processes of this round have exited.
+                with redirect_stdout(io.StringIO()):
+                    mod.prove_stopped(root)
+                mod.mark_stopping(root)
+
+            with patch.object(mod, 'owner', lambda r: json.loads((r / 'OWNER.json').read_text())), \
+                    patch.object(mod, 'check_sources', lambda *_: files), \
+                    patch.object(mod, 'tmux', lambda *_a, **_k: CompletedProcess([], 1)), \
+                    patch.object(mod, 'process_record', lambda _: dict(dead)), \
+                    patch.object(mod, 'HOME', base / 'home'):
+                _exe, first, environment = start_round()
+                self.assertEqual(first[-2], '--session-id')
+                session = first[-1]
+                self.assertEqual(environment['OC_BOX_CLAUDE_PROFILE'], 'acct-b')
+                # Claude wrote its transcript into the shared projects tree; a newer foreign one sits beside it.
+                projects = base / 'home/.claude/projects' / re.sub(r'[^A-Za-z0-9]', '-', info['cwd'])
+                projects.mkdir(parents=True)
+                (projects / (session + '.jsonl')).write_text('{}\n')
+                os.utime(projects / (session + '.jsonl'), (100, 100))
+                (projects / (str(uuid4()) + '.jsonl')).write_text('{}\n')
+                end_round()
+
+                _exe, second, _env = start_round()
+                self.assertEqual(second[-2:], ['--resume', session])
+                self.assertEqual(second[second.index('--model') + 1], 'claude-opus-5')
+                self.assertFalse((root / 'STOPPED.json').exists())
+                self.assertFalse((root / 'STOPPING.json').exists())
+                end_round()
+                # Third round still resumes the same session; the root never wears out.
+                _exe, third, _env = start_round()
+                self.assertEqual(third[-2:], ['--resume', session])
+            owner = json.loads((root / 'OWNER.json').read_text())
+            self.assertEqual((owner['model'], owner['profileDir'], owner['sessionArgs']),
+                             ('claude-opus-5', 'acct-b', ['--resume', session]))
+
+    def test_a_round_launches_once_and_an_unproved_old_round_blocks_the_next(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            child = Popen([sys.executable, '-c', 'import time; time.sleep(15)'])
+            try:
+                mod.write_lifecycle(root, info, {'host': mod.process_record(child.pid), 'claude': None,
+                                                 'descendants': []})
+                with patch.object(mod.os, 'execve') as execute:
+                    with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.tool_socket(root)
+                    with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.launch(root, 'claude-sonnet-5')
+                    execute.assert_not_called()
+                self.assertTrue((root / 'LIFECYCLE.json').exists())
+                child.terminate(); child.wait(timeout=3)
+                # Exited but this round already launched: only tool-socket may open the next one.
+                with patch.object(mod.os, 'execve') as execute:
+                    with self.assertRaisesRegex(RuntimeError, 'already-used'): mod.launch(root, 'claude-sonnet-5')
+                    execute.assert_not_called()
+            finally:
+                if child.poll() is None: child.terminate(); child.wait(timeout=3)
 
     def test_installer_rejects_running_task_hash_changes_or_extra_packet_fields_before_publish(self):
         for case in ('run', 'session', 'setup', 'hash', 'extra'):
@@ -161,7 +295,7 @@ r=Path(sys.argv[2]);m.owner=lambda _: {'session':'synthetic-task','cwd':str(r/'w
 m.check_sources=lambda *_: {'mod/oc-bridge/'+name:b'fixture' for name in m.PLUGIN}
 m.claude_executable=lambda *_args,**_kw:'fixture';m.profile_args=lambda *_:[]
 m.proc=lambda pid:(['synthetic-controller'],'1');m.process_record=lambda pid:{'pid':pid,'startTicks':'1'}
-m.launch(r)
+m.launch(r,'claude-sonnet-5')
 '''
             child = Popen([sys.executable, '-I', '-B', '-c', wrapper, str(Path(mod.__file__).resolve()), str(root)], stdin=PIPE, stdout=PIPE)
             try:
@@ -253,7 +387,7 @@ m.launch(r)
                 self.assertIn(old_child, json.loads(saved)['descendants'])
                 with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.prove_stopped(root)
                 with patch.object(mod.os, 'execve') as execute:
-                    with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.launch(root)
+                    with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.launch(root, 'claude-sonnet-5')
                     execute.assert_not_called()
                 self.assertEqual((root / 'LIFECYCLE.json').read_bytes(), saved)
                 child.terminate()
@@ -319,8 +453,8 @@ m.launch(r)
             with redirect_stdout(io.StringIO()): mod.stop(root)
             marker = (root / 'STOPPING.json').read_bytes()
             with patch.object(mod.os, 'execve') as execute:
-                for entry in (mod.launch, mod.tool_socket):
-                    with self.assertRaisesRegex(RuntimeError, 'permanently-stopped'): entry(root)
+                for entry in (lambda: mod.launch(root, 'claude-sonnet-5'), lambda: mod.tool_socket(root)):
+                    with self.assertRaisesRegex(RuntimeError, 'permanently-stopped'): entry()
                 execute.assert_not_called()
             with redirect_stdout(io.StringIO()): mod.stop(root)
             self.assertEqual((root / 'STOPPING.json').read_bytes(), marker)
