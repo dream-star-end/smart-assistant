@@ -1245,7 +1245,7 @@ export class SubprocessRunner extends EventEmitter {
               this.emit('telemetry', telemetryMsg)
             }
           } else {
-            if (this.opts.harness === 'official-cc' && !this.opts.cc5BridgePort && _isOfficialClaudeAbortResult(msg)) {
+            if (this.opts.harness === 'official-cc' && _isOfficialClaudeAbortResult(msg) && !this.opts.cc5BridgePort) {
               this.officialAbortResultObserved = true
               // Official Claude Code exits 1 a few seconds after this frame; a
               // user turn submitted in that window would be written into a
