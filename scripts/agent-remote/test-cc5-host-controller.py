@@ -87,9 +87,11 @@ class ProfileTests(unittest.TestCase):
                     patch.object(mod, 'process_record', lambda _: {'pid': 444, 'startTicks': '1'}), \
                     patch.object(mod, 'proc', lambda _: (['synthetic-controller'], '1')), \
                     patch.object(mod, 'write_lifecycle') as lifecycle, \
+                    patch.object(mod, 'HOME', root), \
                     patch.object(mod.os, 'chdir') as chdir, \
                     patch.object(mod.os, 'execve') as execute, \
                     patch.dict(mod.os.environ, {'CLAUDE_CODE_MAX_RETRIES': '99', 'PYTHONPATH': '/untrusted'}):
+                (root / '.claude-acct-a').mkdir()
                 with mod.writer_lock(root) as writer_fd:
                     mod.launch_locked(root, writer_fd, 'claude-opus-5', 'acct-a')
             lifecycle.assert_called_once()
@@ -101,7 +103,9 @@ class ProfileTests(unittest.TestCase):
             # The model and account directory come from the target, not from a constant.
             self.assertEqual(args[args.index('--model') + 1], 'claude-opus-5')
             self.assertEqual(environment['OC_BOX_CLAUDE_PROFILE'], 'acct-a')
-            self.assertEqual(environment['HOME'], str(Path.home()))
+            self.assertEqual(environment['HOME'], str(root))  # The node account's home.
+            self.assertTrue(json.loads((root / '.claude-acct-a/.claude.json').read_text())
+                            ['projects'][info['cwd']]['hasTrustDialogAccepted'])
             self.assertTrue(all(flag not in args for flag in ('-p', '--print', '--output-format', '--input-format')))
             self.assertEqual({name: environment[name] for name in (
                 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY', 'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS',
@@ -182,6 +186,7 @@ class ProfileTests(unittest.TestCase):
                     patch.object(mod, 'tmux', lambda *_a, **_k: CompletedProcess([], 1)), \
                     patch.object(mod, 'process_record', lambda _: dict(dead)), \
                     patch.object(mod, 'HOME', base / 'home'):
+                (base / 'home/.claude-acct-b').mkdir(parents=True)
                 _exe, first, environment = start_round()
                 self.assertEqual(first[-2], '--session-id')
                 session = first[-1]
@@ -206,6 +211,29 @@ class ProfileTests(unittest.TestCase):
             owner = json.loads((root / 'OWNER.json').read_text())
             self.assertEqual((owner['model'], owner['profileDir'], owner['sessionArgs']),
                              ('claude-opus-5', 'acct-b', ['--resume', session]))
+
+    def test_launch_trusts_only_its_own_work_directory_in_the_launching_account_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / '.claude-acct-b').mkdir()
+            other = {'projects': {'/elsewhere': {'hasTrustDialogAccepted': False, 'history': [1]}},
+                     'oauthAccount': {'kept': True}}
+            (home / '.claude.json').write_text(json.dumps(other))
+            with patch.object(mod, 'HOME', home):
+                mod.trust_task_directory({'cwd': '/t/work', 'profileDir': 'acct-b'})
+                mod.trust_task_directory({'cwd': '/t/work', 'profileDir': None})
+                # The CLI holds its lock: the controller waits instead of racing its write.
+                (home / '.claude.json.lock').mkdir()
+                with patch.object(mod.time, 'sleep'), self.assertRaisesRegex(RuntimeError, 'account-config-locked'):
+                    mod.trust_task_directory({'cwd': '/t/other', 'profileDir': None})
+            account = json.loads((home / '.claude-acct-b/.claude.json').read_text())
+            self.assertEqual(account, {'projects': {'/t/work': {'hasTrustDialogAccepted': True}}})
+            default = json.loads((home / '.claude.json').read_text())
+            self.assertEqual(default['projects']['/t/work'], {'hasTrustDialogAccepted': True})
+            self.assertEqual(default['projects']['/elsewhere'], other['projects']['/elsewhere'])
+            self.assertEqual(default['oauthAccount'], {'kept': True})
+            self.assertNotIn('/t/other', default['projects'])
+            self.assertEqual((home / '.claude.json').stat().st_mode & 0o777, 0o600)
 
     def test_a_round_launches_once_and_an_unproved_old_round_blocks_the_next(self):
         with tempfile.TemporaryDirectory() as temp:

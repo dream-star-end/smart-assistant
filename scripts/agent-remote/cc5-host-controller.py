@@ -582,6 +582,41 @@ def transcript(info, session):
     return HOME / '.claude/projects' / re.sub(r'[^A-Za-z0-9]', '-', info['cwd']) / (session + '.jsonl')
 
 
+def trust_task_directory(info):
+    """Accept the folder-trust prompt for this task's own empty work directory, as an operator once did.
+
+    A fresh task cwd otherwise stops the TUI at "trust this folder" and host.py reports NOT_READY.
+    Written to the launching account's config under Claude Code's own lock (proper-lockfile's
+    `<file>.lock` directory), so concurrent sessions of the same account keep their writes.
+    """
+    base = HOME / ('.claude-' + info['profileDir']) if info.get('profileDir') else HOME
+    path = base / '.claude.json'
+    lock = base / '.claude.json.lock'
+    for _ in range(100):
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            time.sleep(0.05)
+    else:
+        raise RuntimeError('account-config-locked')
+    try:
+        config = json.loads(path.read_text()) if path.exists() else {}
+        project = config.setdefault('projects', {}).setdefault(info['cwd'], {})
+        if project.get('hasTrustDialogAccepted') is True:
+            return
+        project['hasTrustDialogAccepted'] = True
+        stage = path.with_name('.claude.json.oc-trust')
+        fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(config, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        stage.replace(path)
+    finally:
+        lock.rmdir()
+
+
 def rotate(root):
     """Open the next start round of a task that ran before; tool-socket is each round's first role.
 
@@ -639,6 +674,7 @@ def launch_locked(root, writer_fd, model, profile_dir=None):
     publish_owner(root, info)  # Later roles compare live argv against these persisted choices.
     files = check_sources(root, info)
     require(not (root / 'run').exists(), 'runtime-already-exists')
+    trust_task_directory(info)
     env = {'HOME': str(HOME), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
            'TMPDIR': str(root / 'tmp'), 'TMUX_TMPDIR': str(root / 'tmux'),
            'OC_BOX_MOD_FILES': json.dumps({name: base64.b64encode(files['mod/oc-bridge/' + name]).decode()
