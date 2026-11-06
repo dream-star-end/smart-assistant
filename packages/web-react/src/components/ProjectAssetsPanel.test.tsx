@@ -22,6 +22,13 @@ describe("uploadingLabel", () => {
     // 最后一个处理完、状态尚未清空的一瞬不越界到 6/5。
     expect(uploadingLabel({ done: 5, total: 5 })).toBe("正在上传 5/5 个文件…");
   });
+
+  test("字节进度不提前到 100%，发完后显示处理中", () => {
+    expect(uploadingLabel({ done: 0, total: 1, sentBytes: 0, totalBytes: 1000 })).toBe("正在上传… 0%");
+    expect(uploadingLabel({ done: 0, total: 1, sentBytes: 999, totalBytes: 1000 })).toBe("正在上传… 99%");
+    expect(uploadingLabel({ done: 0, total: 1, sentBytes: 1000, totalBytes: 1000 })).toBe("正在上传… 处理中…");
+    expect(uploadingLabel({ done: 1, total: 3, sentBytes: 420, totalBytes: 1000 })).toBe("正在上传 2/3 个文件… 42%");
+  });
 });
 
 function asset(partial: Partial<ProjectAsset> & Pick<ProjectAsset, "id" | "name">): ProjectAsset {

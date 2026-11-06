@@ -15,6 +15,7 @@ import { useSignedDownload } from "./chat/media";
 import { formatBytes } from "../lib/chat/download";
 import type { AuthSession, ProjectAsset, Session } from "../lib/types";
 import { cn } from "../lib/utils";
+import { uploadProgressText } from "../lib/uploadProgressText";
 import { PINNED_INJECT_LIMIT, type UploadProgress, useProjectAssets } from "../hooks/useProjectAssets";
 import {
   Alert,
@@ -143,7 +144,7 @@ export function ProjectAssetsPanel(props: {
 export function uploadingLabel(progress: UploadProgress | null): string {
   const pct =
     progress?.totalBytes && progress.totalBytes > 0 && typeof progress.sentBytes === "number"
-      ? ` ${Math.min(100, Math.round((progress.sentBytes / progress.totalBytes) * 100))}%`
+      ? ` ${uploadProgressText(progress.sentBytes, progress.totalBytes)}`
       : "";
   if (!progress || progress.total <= 1) return pct ? `正在上传…${pct}` : "正在上传…";
   const current = Math.min(progress.done + 1, progress.total);

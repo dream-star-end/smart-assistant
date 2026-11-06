@@ -10,6 +10,7 @@ import {
   sleep,
   throwApi,
 } from "./http";
+import { canReportUploadProgress, sendWithUploadProgress } from "./uploadTransport";
 
 type UploadResult = { url: string; digest?: string; size?: number; mimeType?: string };
 type UploadOpts = { maxRetries?: number; signal?: AbortSignal; onProgress?: (sent: number, total: number) => void };
@@ -54,19 +55,28 @@ export async function uploadFile(
   for (let attempt = 0; ; attempt++) {
     if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
     if (a.snapshot().epoch !== startEpoch) throw new AuthEpochStaleError();
-    const res = await callWithRefresh(a, (t) =>
-      fetch("/api/uploads", {
+    const res = await callWithRefresh(a, (t) => {
+      const headers = {
+        Accept: "application/json",
+        Authorization: `Bearer ${t}`,
+        "content-type": file.type || "application/octet-stream",
+        "x-filename": encodeURIComponent(file.name || "file"),
+      };
+      const onProgress = opts?.onProgress;
+      if (onProgress && canReportUploadProgress()) {
+        return sendWithUploadProgress(
+          "/api/uploads",
+          { method: "POST", headers, body: file, signal: opts?.signal },
+          (sent) => onProgress(sent, file.size),
+        );
+      }
+      return fetch("/api/uploads", {
         method: "POST",
         credentials: "include",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${t}`,
-          "content-type": file.type || "application/octet-stream",
-          "x-filename": encodeURIComponent(file.name || "file"),
-        },
+        headers,
         body: file,
-      }),
-    );
+      });
+    });
     // 换号栅栏必须逐次检查:重试循环会跨越切账号边界,旧 epoch 的响应不能继续重放,
     // 否则退避期间换了号,文件会落进上一个账号的容器卷。
     assertAuthResponseCurrent(res);

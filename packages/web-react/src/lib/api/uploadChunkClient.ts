@@ -6,6 +6,7 @@
  */
 import type { AuthSession } from "../types";
 import { ApiError } from "./http";
+import { canReportUploadProgress, sendWithUploadProgress } from "./uploadTransport";
 import {
   MAX_UPLOAD_FILE_BYTES,
   UPLOAD_CHUNK_BYTES,
@@ -111,18 +112,29 @@ export async function uploadChunkedFile(
     }
     const start = index * chunkBytes;
     const body = file.slice(start, start + length);
-    await uploadOnce(a, opts, (t) =>
-      fetch(`/api/uploads/${activeId}/chunks/${index}`, {
+    const before = sent;
+    await uploadOnce(a, opts, (t) => {
+      const url = `/api/uploads/${activeId}/chunks/${index}`;
+      const headers = {
+        Authorization: `Bearer ${t}`,
+        "content-type": "application/octet-stream",
+      };
+      const onProgress = opts?.onProgress;
+      if (onProgress && canReportUploadProgress()) {
+        return sendWithUploadProgress(
+          url,
+          { method: "PUT", headers, body, signal: opts?.signal },
+          (chunkSent) => onProgress(before + chunkSent, file.size),
+        );
+      }
+      return fetch(url, {
         method: "PUT",
         credentials: "include",
-        headers: {
-          Authorization: `Bearer ${t}`,
-          "content-type": "application/octet-stream",
-        },
+        headers,
         body,
         signal: opts?.signal,
-      }),
-    );
+      });
+    });
     sent += length;
     opts?.onProgress?.(sent, file.size);
   }
