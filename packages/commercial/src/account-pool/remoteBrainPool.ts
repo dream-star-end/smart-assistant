@@ -1376,7 +1376,7 @@ export async function publishRemoteModelOffers(
     const catalogEngine = catalogEngineForRemoteEngine(engine)
     const providerId =
       catalogEngine === 'ccb'
-        ? 'anthropic'
+        ? 'box_cli'
         : catalogEngine === 'codex'
           ? 'codex'
           : catalogEngine === 'antigravity'
@@ -1400,7 +1400,7 @@ export async function publishRemoteModelOffers(
         client as unknown as QueryRunner,
       )
       const existingCat = await client.query(
-        `SELECT entry_id, state, pool_auto_disabled, updated_by FROM model_catalog WHERE model_id = $1 AND state IN ('active', 'disabled', 'staged') ORDER BY entry_id DESC LIMIT 1`,
+        `SELECT entry_id, state, engine, provider_id, upstream_model_id, capability_profile, pool_auto_disabled, updated_by FROM model_catalog WHERE model_id = $1 AND state IN ('active', 'disabled', 'staged') ORDER BY entry_id DESC LIMIT 1`,
         [canonicalModelId],
       )
       const existingState =
@@ -1471,15 +1471,21 @@ export async function publishRemoteModelOffers(
       }
 
       const capabilityProfile = {
-        supports_vision: catalogEngine !== 'grok',
+        supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb',
         reasoning: {
-          supported: catalogEngine === 'codex' || catalogEngine === 'ccb' ? ['low', 'medium', 'high'] : [],
+          supported:
+            catalogEngine === 'ccb'
+              ? baseSlug.includes('haiku-4-5')
+                ? []
+                : ['low', 'medium', 'high', 'xhigh', 'max']
+              : catalogEngine === 'codex'
+                ? ['low', 'medium', 'high']
+                : [],
           codex_model_default: catalogEngine === 'codex' ? 'medium' : null,
         },
         ccb: {
-          capability_zero: false,
-          supports_thinking: true,
-          ...(engine === 'cc' ? { context_owner: 'box-native-v1' } : {}),
+          capability_zero: catalogEngine === 'ccb',
+          supports_thinking: catalogEngine !== 'ccb',
         },
       }
 
@@ -1512,10 +1518,24 @@ export async function publishRemoteModelOffers(
       )
       await client.query(`SELECT set_config('openclaude.catalog_sync', '0', true)`)
 
+      let needsFreshCatalogEntry = existingCat.rows.length === 0
       if (existingCat.rows.length > 0) {
-        const entryId = existingCat.rows[0]!.entry_id
-        const curState = String(existingCat.rows[0]!.state)
-        if (curState === 'staged') {
+        const prevRow = existingCat.rows[0]!
+        const entryId = prevRow.entry_id
+        const curState = String(prevRow.state)
+        const executionDrift =
+          curState !== 'staged' &&
+          (String(prevRow.engine ?? '') !== catalogEngine ||
+            String(prevRow.provider_id ?? '') !== providerId ||
+            String(prevRow.upstream_model_id ?? '') !== upstreamModelId ||
+            JSON.stringify(prevRow.capability_profile ?? {}) !== JSON.stringify(capabilityProfile))
+        if (executionDrift) {
+          if (curState === 'active') {
+            await client.query(`UPDATE model_catalog SET state = 'disabled' WHERE entry_id = $1`, [entryId])
+          }
+          await client.query(`UPDATE model_catalog SET state = 'retired' WHERE entry_id = $1`, [entryId])
+          needsFreshCatalogEntry = true
+        } else if (curState === 'staged') {
           await client.query(
             `UPDATE model_catalog
                 SET engine = $2,
@@ -1548,7 +1568,8 @@ export async function publishRemoteModelOffers(
             [entryId, aggregated.catalogState, nextPoolAutoDisabled],
           )
         }
-      } else {
+      }
+      if (needsFreshCatalogEntry && (enabled || aggregated.catalogState !== 'staged')) {
         const insCat = await client.query(
           `INSERT INTO model_catalog
              (model_id, engine, provider_id, upstream_model_id, context_window,

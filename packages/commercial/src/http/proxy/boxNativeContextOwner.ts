@@ -13,6 +13,9 @@ export const BOX_NATIVE_CONTEXT_MODELS: readonly string[] = [
   "box-claude-opus-5-5",
   "box-claude-sonnet-5",
   "box-claude-haiku-5-5",
+  "claude-opus-5-5-remote",
+  "claude-sonnet-5-5-remote",
+  "claude-haiku-5-5-remote",
 ];
 /** One listed model, kept for fixtures. Checks read the list. */
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_NATIVE_CONTEXT_MODELS[0]!;

@@ -46,6 +46,10 @@ export const BOX_API_MODELS = [
   { id: 'box-claude-opus-5-5', upstreamModel: 'claude-opus-5-5', maxOutputTokens: 128_000, supportsEffort: true, runner: 'interactive' },
   { id: 'box-claude-sonnet-5', upstreamModel: 'claude-sonnet-5', maxOutputTokens: 128_000, supportsEffort: true, runner: 'interactive' },
   { id: 'box-claude-haiku-5-5', upstreamModel: 'claude-haiku-5-5', maxOutputTokens: 128_000, supportsEffort: true, runner: 'interactive' },
+  // OCV5-721: Remote Agent Brain Pool published Claude Code models (interactive runner).
+  { id: 'claude-opus-5-5-remote', upstreamModel: 'claude-opus-5-5', maxOutputTokens: 128_000, supportsEffort: true, runner: 'interactive' },
+  { id: 'claude-sonnet-5-5-remote', upstreamModel: 'claude-sonnet-5-5', maxOutputTokens: 128_000, supportsEffort: true, runner: 'interactive' },
+  { id: 'claude-haiku-5-5-remote', upstreamModel: 'claude-haiku-5-5', maxOutputTokens: 128_000, supportsEffort: true, runner: 'interactive' },
 ] as const satisfies readonly BoxApiModel[]
 
 export type BoxApiModelId = (typeof BOX_API_MODELS)[number]['id']
@@ -57,7 +61,7 @@ export const BOX_API_UPSTREAM_MODEL_IDS: readonly BoxApiUpstreamModelId[] =
 
 // The ids are also written into SQL lists and into the CLI argv.
 for (const m of BOX_API_MODELS) {
-  if (!/^box-(?:api-)?claude-[a-z0-9-]{3,48}$/.test(m.id) || !/^claude-[a-z0-9-]{3,64}$/.test(m.upstreamModel)
+  if (!/^(?:box-(?:api-)?)?claude-[a-z0-9-]{3,48}$/.test(m.id) || !/^claude-[a-z0-9-]{3,64}$/.test(m.upstreamModel)
     || m.id.startsWith('box-api-') !== (m.runner === 'print')) {
     throw new Error(`BOX_API_MODELS entry has an invalid id: ${m.id}`)
   }
