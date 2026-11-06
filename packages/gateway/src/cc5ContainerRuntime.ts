@@ -289,6 +289,7 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
             {
               slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
               recoverExistingJournal: true,
+              upstreamModel: this.options.ssh.target.upstreamModel,
               onBindingExtended: (expiresAt: number) => {
                 requireRuntime(
                   recovered.binding &&
@@ -463,6 +464,7 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
         finance,
         {
           slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
+          upstreamModel: this.options.ssh.target.upstreamModel,
           onBindingExtended: (expiresAt: number) => {
             requireRuntime(
               record.binding && record.state !== 'released' && record.state !== 'unknown',

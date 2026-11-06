@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -24,8 +25,8 @@ import time
 import uuid
 
 TASK = 'AGENT-REMOTE-T1555U'
-PINNED_MCP_SHA = 'e37bb27db422d0eba594be84f3817cf2ff7adfc73c675ff223df4a24d4207e64'
-PINNED_SOCKET_SHA = '09e72708f99f3e04f20c442c9f7b0234bdf35f07d72e122499772be5a022cc4f'
+PINNED_MCP_SHA = '34f7f5f412639f6d095198b5e2169974f833679cbef19c41e80d40951c567055'
+PINNED_SOCKET_SHA = '8914fd2c1cd6777e11fdb6fd11eaaf9b3dda6ee71b01879a90f8fe2fd47ba603'
 UUID = re.compile(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z')
 # Same accepted shapes as the gateway target and host.py's account directory.
 MODEL = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}\Z')
@@ -592,6 +593,17 @@ def rotate(root):
         require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
         return
     prove_stopped(root, emit=False)
+    stale = root / 'tool.sock'
+    if stale.is_socket():
+        # A killed socket helper cannot unlink its endpoint; only one nobody listens on is removed.
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(str(stale))
+            raise RuntimeError('tool-socket-still-listening')
+        except ConnectionRefusedError:
+            stale.unlink()
+        finally:
+            probe.close()
     for name in ('LIFECYCLE.json', 'STOPPED.json', 'STOPPING.json', 'MCP-SOCKET.json'):
         try:
             (root / name).unlink()

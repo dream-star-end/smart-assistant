@@ -152,13 +152,15 @@ export class Cc5Relay {
       slidingTtlMs?: number
       onBindingExtended?: (expiresAt: number) => void
       recoverExistingJournal?: boolean
+      /** The remote target's CLI model; native usage frames are held to exactly this model. */
+      upstreamModel?: string
     } = {},
   ) {
     assertCc5BindingScope(binding)
     requireRelay(keyring.size > 0 && /^[a-f0-9-]{36}$/.test(runId) &&
       binding.runId === runId && typeof finance?.admit === 'function')
     this.bindingExpiresAt = binding.expiresAt
-    this.nativeUsage = new Cc5NativeUsageObserver(binding)
+    this.nativeUsage = new Cc5NativeUsageObserver(binding, { upstreamModel: options.upstreamModel })
     this.observation = new Cc5ToolObservation(binding.operationId)
     if (options.recoverExistingJournal && existsSync(journalRoot)) {
       const st = lstatSync(journalRoot)

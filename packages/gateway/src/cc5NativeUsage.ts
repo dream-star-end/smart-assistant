@@ -25,8 +25,12 @@ export class Cc5NativeUsageObserver {
   private turn?: { authorityTurnId: string; turnKey: string }
   private readonly resultUuids = new Set<string>()
   private readonly resultDigests = new Set<string>()
-  constructor(private readonly binding: Readonly<Cc5BridgeBinding>, private readonly options: { legacySingleTurn?: boolean } = {}) {
+  /** The CLI model the deployment's target launched; every model-bearing frame must equal it. */
+  private readonly expectedModel: string
+  constructor(private readonly binding: Readonly<Cc5BridgeBinding>,
+    private readonly options: { legacySingleTurn?: boolean; upstreamModel?: string } = {}) {
     assertCc5BindingScope(binding)
+    this.expectedModel = options.upstreamModel ?? CC5_NATIVE_UPSTREAM_MODEL
   }
   beginTurn(turn: { authorityTurnId: string; turnKey: string }): void {
     requireUsage(!this.failed && !this.finished && this.buffer.length === 0 &&
@@ -49,7 +53,7 @@ export class Cc5NativeUsageObserver {
           receipt.runId === this.binding.runId &&
           receipt.sessionKey === this.binding.sessionKey &&
           receipt.canonicalModel === this.binding.canonicalModel &&
-          receipt.upstreamModel === CC5_NATIVE_UPSTREAM_MODEL &&
+          receipt.upstreamModel === this.expectedModel &&
           typeof receipt.nativeSessionId === 'string' &&
           UUID.test(receipt.nativeSessionId) &&
           (!this.nativeSessionId || this.nativeSessionId === receipt.nativeSessionId) &&
@@ -106,14 +110,14 @@ export class Cc5NativeUsageObserver {
     if (model !== undefined) {
       // Synthetic API-error rows carry no model evidence. A prior init/step still must pin it.
       if (model !== '<synthetic>') {
-        requireUsage(model === CC5_NATIVE_UPSTREAM_MODEL &&
+        requireUsage(model === this.expectedModel &&
           (!this.upstreamModel || this.upstreamModel === model))
         this.upstreamModel = model
       }
     }
     if (row.type !== 'result') return { bytes }
     requireUsage((this.turn || this.options.legacySingleTurn) && !this.terminalSeen && this.nativeSessionId && row.session_id === this.nativeSessionId &&
-      this.upstreamModel === CC5_NATIVE_UPSTREAM_MODEL && typeof row.is_error === 'boolean' &&
+      this.upstreamModel === this.expectedModel && typeof row.is_error === 'boolean' &&
       (row.is_error
         ? (row.subtype === 'error_during_execution' || row.subtype === 'interrupted' || row.subtype === 'aborted_streaming')
         : (row.subtype === 'success' || row.subtype === 'interrupted' || row.subtype === 'aborted_streaming')) &&

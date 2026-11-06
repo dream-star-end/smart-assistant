@@ -43,6 +43,30 @@ test('only native result aggregate replaces step usage; original bytes and exact
   f.observer.finish()
 })
 
+test('a target launched on another model settles under exactly that model, live and after recovery', () => {
+  const f = fixture()
+  const binding = { ...f.binding, canonicalModel: 'box-claude-opus-5-5' }
+  const frame = (model: string) => Buffer.from(`${JSON.stringify({ type: 'system', subtype: 'init',
+    session_id: f.native, model })}\n`)
+  const raw = Buffer.from(`${JSON.stringify({ ...f.terminal, uuid: f.nextResultId() })}\n`)
+  const opus = new Cc5NativeUsageObserver(binding, { upstreamModel: 'claude-opus-5-5' })
+  opus.beginTurn({ authorityTurnId: 'c'.repeat(32), turnKey: 'turn-1' })
+  const receipt = opus.ingest(Buffer.concat([frame('claude-opus-5-5'), raw]))[1]!.receipt!
+  assert.equal(receipt.version, 2)
+  assert.equal(receipt.upstreamModel, 'claude-opus-5-5')
+  assert.equal(receipt.canonicalModel, 'box-claude-opus-5-5')
+  opus.finish()
+  // The same receipt restores under the same target and is refused under another one.
+  new Cc5NativeUsageObserver(binding, { upstreamModel: 'claude-opus-5-5' }).restoreFromReceipts([receipt])
+  assert.throws(() => new Cc5NativeUsageObserver(binding, { upstreamModel: 'claude-haiku-5-5' })
+    .restoreFromReceipts([receipt]), /CC5_NATIVE_USAGE_UNPROVEN/)
+  // The remote CLI reporting a model the target did not launch is not usage evidence.
+  for (const reported of ['claude-sonnet-5', 'claude-haiku-5-5']) {
+    const observer = new Cc5NativeUsageObserver(binding, { legacySingleTurn: true, upstreamModel: 'claude-opus-5-5' })
+    assert.throws(() => observer.ingest(frame(reported)), /CC5_NATIVE_USAGE_UNPROVEN/)
+  }
+})
+
 test('fragmented output withholds incomplete terminal bytes until its whole native record is validated', () => {
   const f = fixture()
   f.observer.ingest(f.init)

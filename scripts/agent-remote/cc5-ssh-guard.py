@@ -35,7 +35,6 @@ SHA256 = re.compile(r'[0-9a-f]{64}\Z')
 USER = re.compile(r'[a-z_][a-z0-9_-]{0,31}\Z')
 MODEL = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}\Z')
 PROFILE = re.compile(r'[a-z0-9][a-z0-9-]{0,31}\Z')
-TASK = re.compile(r'[a-z0-9-]{16,40}\Z')
 CONFIG_KEYS = frozenset(('version', 'sourceIps', 'user', 'home', 'sshPort', 'rootPrefix',
                          'controllerSha256', 'models', 'profiles'))
 SSH_ENV = frozenset(('SSH_ORIGINAL_COMMAND', 'SSH_CONNECTION', 'SSH_CLIENT'))
