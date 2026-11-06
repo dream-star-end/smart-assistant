@@ -63,6 +63,11 @@ async function round(index: number, prompts: string[]): Promise<void> {
     toolSocketPath: config.toolSocketPath,
   })
   const started = Date.now()
+  if (config.provisionPacketPath) {
+    // The lane runtime's first step: reset whatever an earlier owner left, then provision the root.
+    await host.prepareTask(readFileSync(config.provisionPacketPath))
+    log({ round: index, phase: 'prepared', ms: Date.now() - started })
+  }
   const { stdin, stdout, ready } = host.start()
   const frames = createInterface({ input: stdout })[Symbol.asyncIterator]()
   await ready
