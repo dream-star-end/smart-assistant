@@ -24,10 +24,10 @@ import {
   type AuthorityKeyring,
   type Cc5ExecutionBackend,
   CC5_INTERACTIVE_BACKEND,
-  CC5_NATIVE_MODEL,
   CC5_TEST_UID_ENV,
   type Cc5PolicyEnvironment,
   canUseCc5TestModel,
+  isCc5CanonicalModel,
   parseAuthorityKeyring,
   parseCc5ExecutionBackend,
 } from '@openclaude/protocol'
@@ -41,6 +41,7 @@ import { type Cc5InteractiveHostPort, Cc5Relay } from './cc5Relay.js'
 import { Cc5SshHost, type Cc5SshHostConfig } from './cc5SshHost.js'
 
 export { cc5ControlRequest, type Cc5BridgeBinding } from './cc5BridgePort.js'
+export { defaultRemoteCcTarget, type RemoteCcTarget } from './cc5SshHost.js'
 
 const REJECTED = 'CC5_FRESH_CONTAINER_BINDING_REJECTED'
 export const CC5_CONTAINER_MOUNT = '/run/oc/cc5-remote-t1555u'
@@ -117,7 +118,7 @@ interface RuntimeOptions {
   ssh: Readonly<SshDeployment>
   /** IDs of this exact preinstalled strict MCP profile; one binding consumes it once. */
   profile: Readonly<{ operationId: string; runId: string }>
-  scope: Readonly<{ sessionKey: string; canonicalModel: typeof CC5_NATIVE_MODEL }>
+  scope: Readonly<{ sessionKey: string; canonicalModel: string }>
   /** Trusted fixture seam only; default constructs the pinned production SSH port. */
   hostFactory?: (config: Cc5SshHostConfig) => Cc5InteractiveHostPort
 }
@@ -158,7 +159,7 @@ class Cc5FreshContainerRuntime implements Cc5FreshContainerRuntimePort {
     private readonly financeFactory: Cc5FinanceFactory,
   ) {
     requireRuntime(typeof financeFactory === 'function')
-    requireRuntime(options.scope?.canonicalModel === CC5_NATIVE_MODEL)
+    requireRuntime(isCc5CanonicalModel(options.scope?.canonicalModel))
     parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: options.scope.sessionKey,
       operationId: options.profile.operationId })
     requireRuntime(

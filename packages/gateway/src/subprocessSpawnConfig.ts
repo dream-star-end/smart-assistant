@@ -7,7 +7,6 @@
 import {
   BOX_API_MODELS,
   type Cc5ExecutionBackend,
-  CC5_NATIVE_MODEL,
   isCc5ExecutionBackend,
   OPENAI_FAST_SERVICE_TIER,
   TRACE_ID_HEADER,
@@ -1058,7 +1057,8 @@ export function projectCcbExecutionDescriptor(input: {
   capabilityProfile: Readonly<Record<string, unknown>>
   executionBackend?: Cc5ExecutionBackend
 }): CcbExecutionDescriptor {
-  if (input.executionBackend && (!isCc5ExecutionBackend(input.executionBackend) || input.canonicalModel !== CC5_NATIVE_MODEL)) {
+  // The bound target/offer declares the model; the runner compares it to the port's.
+  if (input.executionBackend && !isCc5ExecutionBackend(input.executionBackend)) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
   const raw = input.capabilityProfile.ccb

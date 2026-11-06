@@ -17,9 +17,11 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { assertRemoteCcInteractiveRunner, loadBoxBridgeMod } from '@openclaude/gateway'
+import {
+  defaultRemoteCcTarget,
+  type RemoteCcTarget,
+} from '@openclaude/gateway/cc5-container-runtime'
 import { getPool } from '../db/index.js'
-
-const execFileAsync = promisify(execFile)
 import { query, type QueryRunner } from '../db/queries.js'
 import { formatRemoteModelDisplayName } from '../billing/modelPublicProjection.js'
 import type { CooldownReason } from './policy/outcome.js'
@@ -31,6 +33,12 @@ import {
   type ProbeResult,
 } from './policy/registry.js'
 import { healthWeight, rankWRH } from './policy/select.js'
+
+const execFileAsync = promisify(execFile)
+/** The controller this deployment ships; its digest is what a pool guard was installed for. */
+const CC5_CONTROLLER_PATH = fileURLToPath(
+  new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
+)
 
 export const REMOTE_BRAIN_ENGINES = ['cc', 'codex', 'antigravity', 'grok-build'] as const
 export type RemoteBrainEngine = (typeof REMOTE_BRAIN_ENGINES)[number]
@@ -622,7 +630,7 @@ export async function createRemoteAgentNode(
   const created = mapNodeRow(res.rows[0]!)
   if (sshPassword) {
     try {
-      const probed = await probeRemoteAgentNodeLive(created.id, runner)
+      const probed = await probeRemoteAgentNodeLive(created.id, undefined, runner)
       return probed.node
     } catch {
       return created
@@ -746,9 +754,13 @@ export async function verifyAndMaterializePinnedKnownHosts(input: {
   }
 }
 
-export function resolveRemoteNodeIdentityFile(keyId: string): string {
+function remoteNodeKeyPath(keyId: string): string {
   const keyDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
-  const byKeyId = join(keyDir, keyId, 'id_ed25519')
+  return join(keyDir, keyId, 'id_ed25519')
+}
+
+export function resolveRemoteNodeIdentityFile(keyId: string): string {
+  const byKeyId = remoteNodeKeyPath(keyId)
   if (existsSync(byKeyId)) return byKeyId
   const envIdentity = process.env.OC_REMOTE_POOL_SSH_IDENTITY_FILE?.trim()
   if (envIdentity && existsSync(envIdentity)) return envIdentity
@@ -756,6 +768,42 @@ export function resolveRemoteNodeIdentityFile(keyId: string): string {
     '/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-agentremote-cc5-web-t1555u/.task-tmp/cc5-ssh/id_ed25519'
   if (existsSync(cc5PinnedKey)) return cc5PinnedKey
   throw new Error(`REMOTE_NODE_SSH_IDENTITY_MISSING:${keyId}`)
+}
+
+/**
+ * P1 seam only: one pool node/profile/offer expressed as the gateway's remote target.
+ * Pure mapping — placement, ranking and the binding row stay with the caller (P2). The
+ * account directory is `profile_name`, i.e. the same `~/.claude-<name>` host.py selects
+ * (`default` is the node's plain login). `knownHostsPath` is the caller's pinned file for
+ * this node's `host_key_fp` (see verifyAndMaterializePinnedKnownHosts).
+ */
+export function remoteCcTargetFromPool(
+  node: RemoteAgentNodeView,
+  profile: RemoteAgentProfileView,
+  offer: RemoteModelOfferView,
+  knownHostsPath: string,
+): RemoteCcTarget {
+  if (
+    profile.node_id !== node.id ||
+    offer.profile_id !== profile.id ||
+    (offer.node_id !== undefined && offer.node_id !== node.id)
+  )
+    throw new Error('REMOTE_POOL_TARGET_MISMATCH')
+  if (profile.engine !== 'cc' || profile.runner_mode !== 'interactive')
+    throw new Error('REMOTE_POOL_TARGET_ENGINE_UNSUPPORTED')
+  const target = defaultRemoteCcTarget({
+    user: node.ssh_user,
+    keyPath: remoteNodeKeyPath(node.key_id),
+    knownHostsPath,
+    controllerPath: CC5_CONTROLLER_PATH,
+    upstreamModel: offer.upstream_model_id,
+  })
+  return Object.freeze({
+    ...target,
+    host: node.ssh_host,
+    port: node.ssh_port,
+    ...(profile.profile_name === 'default' ? {} : { profileDir: profile.profile_name }),
+  })
 }
 
 async function runSshMuxProbeOnce(input: {

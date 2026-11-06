@@ -16,8 +16,8 @@ import {
   type AuthorityKeyring,
   type Cc5ExecutionBackend,
   CC5_INTERACTIVE_BACKEND,
-  CC5_NATIVE_MODEL,
   isCc5BackendAuthority,
+  isCc5CanonicalModel,
   parseCc5ExecutionBackend,
   parseAuthorityKeyring,
 } from '@openclaude/protocol'
@@ -32,7 +32,7 @@ export const CC5_BINDING_SLIDING_TTL_MS = 24 * 60 * 60 * 1000
 export interface Cc5BridgeBinding {
   version: 2
   backendKind: typeof CC5_INTERACTIVE_BACKEND
-  canonicalModel: typeof CC5_NATIVE_MODEL
+  canonicalModel: string
   sessionKey: string
   runId: string
   uid: string
@@ -48,7 +48,7 @@ export function assertCc5BindingScope(binding: Readonly<Cc5BridgeBinding>): void
   requireCc5(binding && typeof binding === 'object' &&
     Object.keys(binding).sort().join(',') === 'backendKind,canonicalModel,capability,containerDbId,dockerId,expiresAt,operationId,runId,sessionKey,uid,version' &&
     binding.version === 2 && binding.backendKind === CC5_INTERACTIVE_BACKEND &&
-    binding.canonicalModel === CC5_NATIVE_MODEL &&
+    isCc5CanonicalModel(binding.canonicalModel) &&
     /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![\s\S])/.test(binding.runId) &&
     /^[1-9][0-9]{0,18}$/.test(binding.uid) && /^[1-9][0-9]{0,18}$/.test(binding.containerDbId) &&
     /^[a-f0-9]{64}$/.test(binding.dockerId) && /^[a-f0-9]{64}$/.test(binding.capability) &&

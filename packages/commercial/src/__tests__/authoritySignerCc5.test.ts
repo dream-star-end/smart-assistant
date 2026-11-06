@@ -80,7 +80,7 @@ test('changing or removing a valid signed backend scope cannot retain the origin
 test('even correctly signed invalid backend/model/engine combinations fail public verification', () => {
   const signer = AuthoritySigner.createEphemeral()
   for (const over of [
-    { canonicalModel: 'cc5-remote-t1555u' },
+    { canonicalModel: 'Claude Opus 5' },
     { engine: 'cursor' as const },
     { executionBackend: { ...backend, sessionKey: 'fixture-session' } },
     { executionBackend: { ...backend, kind: 'other-backend' } as unknown as Cc5ExecutionBackend },

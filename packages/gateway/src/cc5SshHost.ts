@@ -7,13 +7,66 @@ import { dirname, isAbsolute } from 'node:path'
 import { PassThrough } from 'node:stream'
 import type { Cc5InteractiveHostPort } from './cc5Relay.js'
 
-const CONTROLLER_SHA = '83062dd94139c78c81d982dbcdc2757b105c50def5f7e782ebb0260e2accae2c'
 const MAX_BODY = 131072
 const MAX_FRAME = 262144
 const FAILED = 'CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN'
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
+const HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/
+const USER = /^[a-z_][a-z0-9_-]{0,31}$/
+const MODEL = /^[a-z0-9][a-z0-9._-]{0,63}$/
+/** Same account-directory name `host.py` accepts for `OC_BOX_CLAUDE_PROFILE`. */
+const PROFILE_DIR = /^[a-z0-9][a-z0-9-]{0,31}$/
+const DEFAULT_CC5_HOST = '136.86.172.84'
+const DEFAULT_CC5_UPSTREAM_MODEL = 'claude-sonnet-5'
 function requireHost(ok: unknown): asserts ok {
   if (!ok) throw new Error(FAILED)
+}
+
+/**
+ * Deployment-selected remote target for the interactive CC backend: one pool node,
+ * profile and model offer, or the built-in single-host default.
+ */
+export interface RemoteCcTarget {
+  host: string
+  port: number
+  user: string
+  keyPath: string
+  knownHostsPath: string
+  /** Digest of the exact controller this target's guard was installed to accept. */
+  controllerSha256: string
+  taskRootPrefix: string
+  /** CLI model handed to the remote session (`--model`). */
+  upstreamModel: string
+  /** Remote account directory `~/.claude-<profileDir>`; absent means the default login. */
+  profileDir?: string
+}
+
+/**
+ * Default target equivalent to the one fixed host this lane ran on before pool binding existed.
+ * The digest defaults to the controller bytes this deployment ships; a pool node passes the
+ * digest its guard was installed with, so drift between the two is then detected, not assumed.
+ */
+export function defaultRemoteCcTarget(input: {
+  user: string
+  keyPath: string
+  knownHostsPath: string
+  controllerPath: string
+  controllerSha256?: string
+  /** CLI model for the remote session; the default keeps the pre-pool Sonnet lane. */
+  upstreamModel?: string
+}): RemoteCcTarget {
+  return Object.freeze({
+    host: DEFAULT_CC5_HOST,
+    port: 22,
+    user: input.user,
+    keyPath: input.keyPath,
+    knownHostsPath: input.knownHostsPath,
+    controllerSha256:
+      input.controllerSha256 ??
+      createHash('sha256').update(readFileSync(input.controllerPath)).digest('hex'),
+    taskRootPrefix: '/home/' + input.user + '/oc-agentremote-',
+    upstreamModel: input.upstreamModel ?? DEFAULT_CC5_UPSTREAM_MODEL,
+  })
 }
 function quote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
@@ -32,12 +85,10 @@ function decode(value: unknown): Buffer {
 
 export interface Cc5SshHostConfig {
   /** Trusted deployment metadata, never populated from a container or web request. */
-  user: string
+  target: Readonly<RemoteCcTarget>
   taskRoot: string
   operationId: string
   runId: string
-  privateKeyPath: string
-  knownHostsPath: string
   controllerPath: string
   /** Private v5-dev Unix endpoint of this operation's Cc5Relay.toolServer. */
   toolSocketPath: string
@@ -82,12 +133,20 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     private readonly fixture: FixtureDependencies = {},
   ) {
     this.config = Object.freeze({ ...config })
+    const target = config.target
     requireHost(
-      /^[a-z_][a-z0-9_-]{0,31}$/.test(config.user) &&
-        config.user !== 'root' &&
-        /^\/home\/[a-z_][a-z0-9_-]{0,31}\/oc-agentremote-t1555u-[a-z0-9-]{16,40}$/.test(
-          config.taskRoot,
-        ) &&
+      target &&
+        HOST.test(target.host) &&
+        Number.isInteger(target.port) &&
+        target.port > 0 &&
+        target.port <= 65535 &&
+        USER.test(target.user) &&
+        target.user !== 'root' &&
+        MODEL.test(target.upstreamModel) &&
+        (target.profileDir === undefined || PROFILE_DIR.test(target.profileDir)) &&
+        /^[0-9a-f]{64}$/.test(target.controllerSha256) &&
+        config.taskRoot.startsWith(target.taskRootPrefix) &&
+        /^[a-z0-9-]{16,40}$/.test(config.taskRoot.slice(target.taskRootPrefix.length)) &&
         UUID.test(config.operationId) &&
         UUID.test(config.runId) &&
         isAbsolute(config.toolSocketPath) &&
@@ -95,8 +154,8 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     )
     // No private key contents are opened/read. Only metadata of the new dedicated key is checked.
     for (const [path, privateKey] of [
-      [config.privateKeyPath, true],
-      [config.knownHostsPath, false],
+      [target.keyPath, true],
+      [target.knownHostsPath, false],
     ] as const) {
       requireHost(isAbsolute(path))
       const st = lstatSync(path)
@@ -128,7 +187,9 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
           st.size <= MAX_BODY,
       )
       const bytes = readFileSync(fd)
-      requireHost(createHash('sha256').update(bytes).digest('hex') === CONTROLLER_SHA)
+      // The digest is computed from the bytes about to be sent; the target declares the
+      // exact controller its guard was installed to accept.
+      requireHost(createHash('sha256').update(bytes).digest('hex') === config.target.controllerSha256)
       this.source = bytes.toString('base64')
     } finally {
       closeSync(fd)
@@ -155,13 +216,19 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
   private argv(
     role: 'launch' | 'tool-socket' | 'stop' | 'stop-socket' | 'prove-stopped',
   ): string[] {
+    const target = this.config.target
     const command = `exec(compile(__import__('base64').b64decode('${this.source}'),'cc5-task-controller','exec'))`
+    const remote = ['/usr/bin/python3', '-I', '-B', '-c', command, role, this.config.taskRoot]
+    if (role === 'launch') {
+      remote.push('--model', target.upstreamModel)
+      if (target.profileDir) remote.push('--profile', target.profileDir)
+    }
     return [
       '-F',
       'none',
       '-T',
       '-p',
-      '22',
+      String(target.port),
       '-o',
       'BatchMode=yes',
       '-o',
@@ -185,15 +252,13 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       '-o',
       'ServerAliveCountMax=2',
       '-i',
-      this.config.privateKeyPath,
+      target.keyPath,
       '-o',
-      `UserKnownHostsFile=${this.config.knownHostsPath}`,
+      `UserKnownHostsFile=${target.knownHostsPath}`,
       '-l',
-      this.config.user,
-      '136.86.172.84',
-      ['/usr/bin/python3', '-I', '-B', '-c', command, role, this.config.taskRoot]
-        .map(quote)
-        .join(' '),
+      target.user,
+      target.host,
+      remote.map(quote).join(' '),
     ]
   }
   private channel(role: 'launch' | 'tool-socket'): Channel {

@@ -64,12 +64,16 @@ test('invalid deployment fails only the dedicated lane and reports a fixed diagn
 test('deployment can only select public task identities; key/source/network paths are fixed', () => {
   const valid = data()
   const config = parseCc5DeploymentMetadata(Buffer.from(JSON.stringify(valid)), '912')
-  assert.equal(config.ssh.user, valid.user)
+  assert.equal(config.ssh.target.user, valid.user)
   assert.deepEqual(config.scope, valid.scope)
   assert.deepEqual(config.profile, valid.profile)
   assert.equal(Object.isFrozen(config.scope), true)
   assert.equal(Object.isFrozen(config.profile), true)
-  assert.ok(config.ssh.privateKeyPath.endsWith('/.task-tmp/cc5-ssh/id_ed25519'))
+  assert.ok(config.ssh.target.keyPath.endsWith('/.task-tmp/cc5-ssh/id_ed25519'))
+  assert.equal(config.ssh.target.host, '136.86.172.84')
+  assert.equal(config.ssh.target.port, 22)
+  assert.equal(config.ssh.target.taskRootPrefix, '/home/box/oc-agentremote-')
+  assert.equal(config.ssh.target.upstreamModel, 'claude-sonnet-5')
   assert.equal(config.baseRoot, '/run/oc-cc5-t1555u')
   for (const patch of [
     { testUid: '913' },
@@ -86,12 +90,29 @@ test('deployment can only select public task identities; key/source/network path
   }
 })
 
+test('the declared platform model reaches the remote CLI as its upstream id', () => {
+  const valid = data()
+  for (const [canonicalModel, upstreamModel] of [
+    ['box-claude-sonnet-5', 'claude-sonnet-5'],
+    ['box-claude-opus-5', 'claude-opus-5'],
+    ['box-claude-haiku-5-5', 'claude-haiku-5-5'],
+    ['claude-sonnet-5', 'claude-sonnet-5'],
+  ] as const) {
+    const config = parseCc5DeploymentMetadata(
+      Buffer.from(JSON.stringify({ ...valid, scope: { ...valid.scope, canonicalModel } })),
+      '912',
+    )
+    assert.equal(config.scope.canonicalModel, canonicalModel)
+    assert.equal(config.ssh.target.upstreamModel, upstreamModel)
+  }
+})
+
 test('v2 metadata rejects missing, legacy, auxiliary or expanded backend scopes before runtime IO', () => {
   const valid = data()
   for (const scope of [
     undefined, null, [], 'agent:main:webchat:dm:new_chat_123', {},
-    { ...valid.scope, canonicalModel: 'cc5-remote-t1555u' },
-    { ...valid.scope, canonicalModel: 'gpt-5.6-sol' },
+    { ...valid.scope, canonicalModel: 'Claude Opus 5' },
+    { ...valid.scope, canonicalModel: '' },
     { ...valid.scope, sessionKey: 'fixture-session' },
     { ...valid.scope, sessionKey: 'agent:main:cron:dm:new_chat_123' },
     { ...valid.scope, sessionKey: `${valid.scope.sessionKey}\n` },

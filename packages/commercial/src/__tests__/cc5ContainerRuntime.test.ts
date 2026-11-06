@@ -48,10 +48,17 @@ function fixture(failStop = false, attachable = false) {
     profile: { operationId: randomUUID(), runId: randomUUID() },
     scope: { sessionKey: 'agent:main:webchat:dm:fixture_chat1', canonicalModel: 'box-claude-sonnet-5' as const },
     ssh: {
-      user: 'dedicated_cc5',
-      taskRoot: '/home/box/oc-agentremote-t1555u-20261102t1400z-fixture',
-      privateKeyPath: '/unused/dedicated-key',
-      knownHostsPath: '/unused/known-hosts',
+      target: {
+        host: '136.86.172.84',
+        port: 22,
+        user: 'dedicated_cc5',
+        keyPath: '/unused/dedicated-key',
+        knownHostsPath: '/unused/known-hosts',
+        controllerSha256: '0'.repeat(64),
+        taskRootPrefix: '/home/dedicated_cc5/oc-agentremote-',
+        upstreamModel: 'claude-sonnet-5',
+      },
+      taskRoot: '/home/dedicated_cc5/oc-agentremote-t1555u-20261102t1400z-fixture',
       controllerPath: '/unused/controller',
     },
     hostFactory: () => {

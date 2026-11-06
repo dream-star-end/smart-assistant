@@ -1,5 +1,5 @@
 /** Bound personal web route over one original interactive TUI; no pool selector. */
-import { type Cc5ExecutionBackend, CC5_NATIVE_MODEL, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
+import { type Cc5ExecutionBackend, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { createCc5BridgePort } from '../cc5BridgePort.js'
 import { cc5ResumeId, parseCc5ResumeId } from './cc5ResumeId.js'
 import { CcbAdapter } from './ccbAdapter.js'
@@ -22,10 +22,11 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
     multimodalInput: 'text-only',
   }
   private readonly cc5BindingId: string
+  /** Declared by this router's binding/offer; the constructor refuses any other model. */
+  private readonly cc5CanonicalModel: string
   constructor(opts: EngineCreateOpts) {
     const parsedResume = opts.resumeSessionId ? parseCc5ResumeId(opts.resumeSessionId) : null
     if (
-      opts.model !== CC5_NATIVE_MODEL ||
       !isCc5ExecutionBackend(opts.executionBackend) ||
       opts.executionBackend.sessionKey !== opts.sessionKey ||
       opts.hermeticNoTools ||
@@ -52,6 +53,7 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
       throw new Error('CC5_BACKEND_BINDING_MISMATCH')
     }
     this.cc5BindingId = port.bindingId
+    this.cc5CanonicalModel = port.canonicalModel
   }
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     if (event === 'session_id') {
@@ -79,10 +81,10 @@ export class Cc5InteractiveAdapter extends CcbAdapter {
     throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
   }
   requiresReopenForModel(model: string | undefined): boolean {
-    return model !== CC5_NATIVE_MODEL
+    return model !== this.cc5CanonicalModel
   }
   override setModel(model: string | undefined): void {
-    if (model !== CC5_NATIVE_MODEL) throw new Error('CC5_ROUTE_CHANGED_REOPEN_SESSION')
+    if (model !== this.cc5CanonicalModel) throw new Error('CC5_ROUTE_CHANGED_REOPEN_SESSION')
     super.setModel(model)
   }
   override preheat(): Promise<void> { return Promise.resolve() }

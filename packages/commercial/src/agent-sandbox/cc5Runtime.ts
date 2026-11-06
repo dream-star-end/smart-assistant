@@ -2,11 +2,15 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import type { Cc5FinanceFactory } from '@openclaude/gateway/cc5-finance'
-import { createCc5FreshContainerRuntime } from '@openclaude/gateway/cc5-container-runtime'
+import {
+  createCc5FreshContainerRuntime,
+  defaultRemoteCcTarget,
+} from '@openclaude/gateway/cc5-container-runtime'
 import {
   CC5_TEST_UID_ENV,
   CC5_INTERACTIVE_BACKEND,
   CC5_NATIVE_MODEL,
+  isCc5CanonicalModel,
   parseCc5ExecutionBackend,
   type Cc5PolicyEnvironment,
   canUseCc5TestModel,
@@ -47,22 +51,31 @@ export function parseCc5DeploymentMetadata(bytes: Buffer, expectedUid: string) {
   )
   requireConfig(data.scope && typeof data.scope === 'object' && !Array.isArray(data.scope) &&
     Object.keys(data.scope).sort().join(',') === 'canonicalModel,sessionKey' &&
-    data.scope.canonicalModel === CC5_NATIVE_MODEL)
+    isCc5CanonicalModel(data.scope.canonicalModel))
   const backend = parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND,
     sessionKey: data.scope.sessionKey, operationId: data.profile.operationId })
+  const controllerPath = resolve('scripts/agent-remote/cc5-host-controller.py')
+  // The metadata names the platform model (`box-*`); the remote CLI takes its upstream
+  // id. The deployment stays self-contained: the account, host and key paths are fixed.
+  const canonicalModel = data.scope.canonicalModel as string
+  const upstreamModel = canonicalModel.startsWith('box-') ? canonicalModel.slice(4) : canonicalModel
   return {
-    scope: Object.freeze({ canonicalModel: CC5_NATIVE_MODEL, sessionKey: backend.sessionKey }),
+    scope: Object.freeze({ canonicalModel, sessionKey: backend.sessionKey }),
     baseRoot: '/run/oc-cc5-t1555u',
     profile: Object.freeze({
       operationId: data.profile.operationId as string,
       runId: data.profile.runId as string,
     }),
     ssh: Object.freeze({
-      user: data.user as string,
+      target: defaultRemoteCcTarget({
+        user: data.user as string,
+        keyPath: `${KEY_DIRECTORY}/id_ed25519`,
+        knownHostsPath: `${KEY_DIRECTORY}/known_hosts`,
+        controllerPath,
+        upstreamModel,
+      }),
       taskRoot: data.taskRoot as string,
-      privateKeyPath: `${KEY_DIRECTORY}/id_ed25519`,
-      knownHostsPath: `${KEY_DIRECTORY}/known_hosts`,
-      controllerPath: resolve('scripts/agent-remote/cc5-host-controller.py'),
+      controllerPath,
     }),
   }
 }

@@ -1,4 +1,4 @@
-import { CC5_NATIVE_MODEL, sameCc5ExecutionBackend } from '@openclaude/protocol'
+import { sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
 import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
@@ -337,11 +337,11 @@ export class SubprocessRunner extends EventEmitter {
   /** Explicit ccb harness for a not-yet-spawned runner that carries the signed token. */
   pinBoxNativeHarness(descriptor: CcbExecutionDescriptor | undefined): 'ccb' | 'official-cc' {
     if (this.opts.cc5BridgePort) {
-      if (descriptor?.canonicalModel !== CC5_NATIVE_MODEL || descriptor.contextOwner !== BOX_NATIVE_CONTEXT_OWNER ||
+      if (descriptor?.canonicalModel !== this.opts.cc5BridgePort.canonicalModel ||
+          descriptor.contextOwner !== BOX_NATIVE_CONTEXT_OWNER ||
           !descriptor.executionBackend ||
           !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.executionBackend) ||
-          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.cc5BridgePort.executionBackend) ||
-          this.opts.cc5BridgePort.canonicalModel !== CC5_NATIVE_MODEL) {
+          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.cc5BridgePort.executionBackend)) {
         throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
       }
       return 'official-cc'
@@ -1335,7 +1335,8 @@ export class SubprocessRunner extends EventEmitter {
     )
     turnTiming.once('runtime_resolved')
     if (this.opts.cc5BridgePort) {
-      if (!authority || !turnKey || runtime.descriptor?.canonicalModel !== CC5_NATIVE_MODEL
+      if (!authority || !turnKey
+        || runtime.descriptor?.canonicalModel !== this.opts.cc5BridgePort.canonicalModel
         || !runtime.descriptor.executionBackend
         || !sameCc5ExecutionBackend(runtime.descriptor.executionBackend, this.opts.executionBackend)
         || typeof userTextOrBlocks !== 'string' || this.readOnlyTurn || this.consultTurnBinding) {
