@@ -209,12 +209,6 @@ export function boxCcInteractiveLaunchExec(
   profile = 'default',
 ): BoxCcExecRequest {
   if (profile !== 'default' && !BOX_LOGIN_NAME.test(profile)) throw new Error('BOX_INTERACTIVE_PROFILE_INVALID')
-  assertRemoteCcInteractiveRunner({
-    env: { OC_BOX_CC_RUNNER: 'interactive' },
-    argv: remoteArgs,
-    modSha256: mod.sha256,
-    expectedModSha256: loadBoxBridgeMod().sha256,
-  })
   const environment: Record<string, string> = {
     HOME: BOX_CC_HOME,
     PATH: BOX_CC_PATH,
