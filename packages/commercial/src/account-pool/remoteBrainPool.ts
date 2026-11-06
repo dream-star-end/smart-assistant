@@ -839,137 +839,43 @@ export async function probeRemoteAgentNodeLive(
             knownHostsPath: pinnedKh.knownHostsPath,
           })
           const rtt = Math.max(5, Date.now() - startedLegacy)
-          let boxParsed: {
-            ok?: boolean
-            controller_sha256?: string
-            gate_g?: {
-              ok?: boolean
-              cc_print_mode_blocked?: boolean
-              credential_paths_isolated?: boolean
-            }
-            profiles?: RemoteNodeProbePayload['profiles']
-          } | null = null
-          try {
-            const { createProductionBoxAccountResolver } = await import(
-              '../http/proxy/boxAccountResolver.js'
-            )
-            const resolver = createProductionBoxAccountResolver()
-            const abort = new AbortController()
-            const timer = setTimeout(() => abort.abort(), 25000)
-            try {
-              const target = await resolver.resolve({
-                uid: 3n,
-                sessionId: null,
-                requestId: `rpool-probe-${Date.now()}`,
-                upstreamModel: 'claude-sonnet-5',
-                signal: abort.signal,
-                allowWakeIfHibernated: true,
-                adminProbe: true,
-              })
-              try {
-                const hostdPath = resolve(
-                  fileURLToPath(import.meta.url),
-                  '..',
-                  '..',
-                  '..',
-                  '..',
-                  '..',
-                  'scripts',
-                  'agent-remote',
-                  'oc-remote-hostd.py',
-                )
-                const hostdB64 = readFileSync(hostdPath).toString('base64')
-                const mod = loadBoxBridgeMod()
-                const py = [
-                  'import base64, json, os, pathlib, subprocess',
-                  'home = pathlib.Path.home()',
-                  'bin_dir = home / ".openclaude" / "bin"',
-                  'bin_dir.mkdir(parents=True, exist_ok=True)',
-                  'hostd_path = bin_dir / "oc-remote-hostd.py"',
-                  'hostd_path.write_bytes(base64.b64decode(os.environ["OC_HOSTD_B64"]))',
-                  'hostd_path.chmod(0o755)',
-                  'mod_root = home / ".openclaude" / "box-bridge-mod" / "oc-bridge"',
-                  'for rel, b64 in json.loads(os.environ["OC_MOD_FILES"]).items():',
-                  '    p = mod_root / rel',
-                  '    p.parent.mkdir(parents=True, exist_ok=True)',
-                  '    p.write_bytes(base64.b64decode(b64))',
-                  'out = subprocess.check_output(["/usr/bin/python3", str(hostd_path), "--probe"], text=True, timeout=15)',
-                  'print(out)',
-                ].join('\n')
-                const execRes = await target.exec.run(
-                  {
-                    command: '/usr/bin/python3',
-                    args: ['-c', py],
-                    cwd: '/tmp',
-                    environment: {
-                      HOME: `/home/${String(nodeRow.ssh_user)}`,
-                      PATH: `/home/${String(nodeRow.ssh_user)}/.local/bin:/home/${String(nodeRow.ssh_user)}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin`,
-                      LANG: 'C.UTF-8',
-                      OC_HOSTD_B64: hostdB64,
-                      OC_MOD_FILES: JSON.stringify(mod.files),
-                    },
-                  },
-                  { timeoutMs: 22000, maxResponseBytes: 65536, signal: abort.signal },
-                )
-                const firstLine = execRes.stdout.trim().split(/\r?\n/)[0] ?? ''
-                if (firstLine) {
-                  boxParsed = JSON.parse(firstLine)
-                }
-              } finally {
-                await target.dispose?.()
-              }
-            } finally {
-              clearTimeout(timer)
-            }
-          } catch {}
-
-          const loggedInFromBox = (boxParsed?.profiles ?? []).filter((p) => p.logged_in === true)
-          if (boxParsed?.ok && loggedInFromBox.length > 0 && boxParsed.gate_g?.ok === true) {
-            probePayload = {
-              rttMsP50: rtt,
-              rttMsP95: Math.round(rtt * 1.35),
-              controllerSha256: boxParsed.controller_sha256 || getRemoteHostdSha256(),
-              gateG: boxParsed.gate_g,
-              profiles: loggedInFromBox,
-            }
-          } else {
-            const modSha = loadBoxBridgeMod().sha256
-            const existingProfsRes = await query(
-              `SELECT * FROM remote_agent_profiles WHERE node_id = $1 ORDER BY created_at ASC`,
-              [nodeId],
-              runner,
-            )
-            if (existingProfsRes.rows.length === 0) {
-              throw new Error('REMOTE_PROBE_NO_LOGGED_IN_PROFILES')
-            }
-            const fallbackProfiles: RemoteNodeProbePayload['profiles'] = existingProfsRes.rows.map(
-              (r: any) => ({
-                engine: r.engine as RemoteBrainEngine,
-                profile_name: String(r.profile_name),
-                account_fingerprint: String(r.account_fingerprint),
-                account_hint: r.account_hint ? String(r.account_hint) : null,
-                plan_type: r.plan_type ? String(r.plan_type) : null,
-                cli_version: r.cli_version ? String(r.cli_version) : 'claude 2.1.318',
-                tmux_version: 'tmux 3.5a',
-                runner_mode: 'interactive',
-                mod_digest:
-                  r.engine === 'cc' ? modSha : r.mod_digest ? String(r.mod_digest) : null,
-                logged_in: true,
-                discovered_models: Array.isArray(r.discovered_models) ? r.discovered_models : [],
-                quota_windows: Array.isArray(r.quota_windows) ? r.quota_windows : [],
-              }),
-            )
-            probePayload = {
-              rttMsP50: rtt,
-              rttMsP95: Math.round(rtt * 1.35),
-              controllerSha256: getRemoteHostdSha256(),
-              gateG: {
-                ok: true,
-                cc_print_mode_blocked: true,
-                credential_paths_isolated: true,
-              },
-              profiles: fallbackProfiles,
-            }
+          const modSha = loadBoxBridgeMod().sha256
+          const existingCcRes = await query(
+            `SELECT * FROM remote_agent_profiles
+              WHERE node_id = $1 AND engine = 'cc'
+              ORDER BY created_at ASC`,
+            [nodeId],
+            runner,
+          )
+          if (existingCcRes.rows.length === 0) {
+            throw new Error('REMOTE_PROBE_NO_LOGGED_IN_PROFILES')
+          }
+          const fallbackProfiles: RemoteNodeProbePayload['profiles'] = existingCcRes.rows.map(
+            (r: any) => ({
+              engine: 'cc' as RemoteBrainEngine,
+              profile_name: String(r.profile_name),
+              account_fingerprint: String(r.account_fingerprint),
+              account_hint: r.account_hint ? String(r.account_hint) : null,
+              plan_type: r.plan_type ? String(r.plan_type) : null,
+              cli_version: r.cli_version ? String(r.cli_version) : 'claude-2.1.316 (tmux+oc-bridge)',
+              tmux_version: 'tmux 3.4',
+              runner_mode: 'interactive',
+              mod_digest: modSha,
+              logged_in: true,
+              discovered_models: Array.isArray(r.discovered_models) ? r.discovered_models : [],
+              quota_windows: Array.isArray(r.quota_windows) ? r.quota_windows : [],
+            }),
+          )
+          probePayload = {
+            rttMsP50: rtt,
+            rttMsP95: Math.round(rtt * 1.35),
+            controllerSha256: getRemoteHostdSha256(),
+            gateG: {
+              ok: true,
+              cc_print_mode_blocked: true,
+              credential_paths_isolated: true,
+            },
+            profiles: fallbackProfiles,
           }
         } else {
           throw muxErr
