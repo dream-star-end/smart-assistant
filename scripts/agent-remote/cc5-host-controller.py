@@ -666,6 +666,8 @@ def launch_locked(root, writer_fd, model, profile_dir=None):
     require(isinstance(model, str) and MODEL.fullmatch(model), 'unapproved-model')
     require(profile_dir is None or (isinstance(profile_dir, str) and PROFILE.fullmatch(profile_dir)),
             'bad-account-directory')
+    if profile_dir == 'default':
+        profile_dir = None  # host.py: "default" is the plain login, not ~/.claude-default.
     # One Claude session per task for its whole life: the first round names it, later rounds
     # resume that exact transcript, so the history is never retransmitted nor guessed.
     session = (info.get('sessionArgs') or [None, str(uuid.uuid4())])[1]
@@ -674,7 +676,6 @@ def launch_locked(root, writer_fd, model, profile_dir=None):
     publish_owner(root, info)  # Later roles compare live argv against these persisted choices.
     files = check_sources(root, info)
     require(not (root / 'run').exists(), 'runtime-already-exists')
-    trust_task_directory(info)
     env = {'HOME': str(HOME), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
            'TMPDIR': str(root / 'tmp'), 'TMUX_TMPDIR': str(root / 'tmux'),
            'OC_BOX_MOD_FILES': json.dumps({name: base64.b64encode(files['mod/oc-bridge/' + name]).decode()
@@ -690,7 +691,8 @@ def launch_locked(root, writer_fd, model, profile_dir=None):
         # host.py owns the account directory convention: OC_BOX_CLAUDE_PROFILE -> ~/.claude-<name>.
         env['OC_BOX_CLAUDE_PROFILE'] = account
     claude_executable(root, info, full_hash=True)
-    cli_args = profile_args(root, info)
+    cli_args = profile_args(root, info)  # Validates the task work directory first.
+    trust_task_directory(info)
     lock_stat = os.fstat(writer_fd)
     path_stat = (root / 'WRITER.lock').lstat()
     require(os.get_inheritable(writer_fd) and
