@@ -10532,7 +10532,10 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.doesNotMatch(listed.stdout, /packages\/commercial\//)
     assert.match(listed.stdout, /packages\/web\/public\//)
     assert.match(listed.stdout, /packages\/web-react\/package.json/)
-    assert.doesNotMatch(listed.stdout, /\tscripts\//)
+    // Of /scripts/ only the two files the container's remote-lane tool host runs.
+    const scriptPaths = listed.stdout.split('\n').filter((row) => /\tscripts\//.test(row))
+      .map((row) => row.split('\t')[1]).sort()
+    assert.deepEqual(scriptPaths, ['scripts/agent-remote/cc5-toolhost-supervisor.py', 'scripts/ocv5-289/box_keeper.py'])
     assert.doesNotMatch(listed.stdout, /\tpackages\/web-react\/src\//)
     assert.doesNotMatch(listed.stdout, /\te2e\//)
     assert.doesNotMatch(listed.stdout, /\t\.github\//)
@@ -10550,6 +10553,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.equal(changed.status, 0, changed.stderr)
     assert.match(base.stdout.trim(), /^[0-9a-f]{64}$/)
     assert.notEqual(base.stdout.trim(), changed.stdout.trim())
+    const supervisor = danglingFileChange('scripts/agent-remote/cc5-toolhost-supervisor.py')
+    const withSupervisor = invokeHelpers(`compute_runtime_input_digest '${supervisor.commit}' '${image}'`)
+    assert.equal(withSupervisor.status, 0, withSupervisor.stderr)
+    assert.notEqual(base.stdout.trim(), withSupervisor.stdout.trim(), 'tool-host supervisor must be a runtime input')
+    const hostOnly = danglingFileChange('scripts/agent-remote/cc5-host-controller.py')
+    const withHostOnly = invokeHelpers(`compute_runtime_input_digest '${hostOnly.commit}' '${image}'`)
+    assert.equal(withHostOnly.status, 0, withHostOnly.stderr)
+    assert.equal(base.stdout.trim(), withHostOnly.stdout.trim(), 'other scripts stay outside the runtime')
   })
 
   test('B5: host-only web/e2e/github changes must not invalidate runtime digest', () => {
@@ -10852,6 +10863,11 @@ describe('v5 oc-memory MCP cjs survives runtime prune and gateway precompile', (
       true,
       'production prune dropped packages/mcp-memory/src/index.ts',
     )
+    // The remote-lane tool host (packages/gateway/src/cc5ToolHost.ts) runs these in the container.
+    for (const kept of ['scripts/agent-remote/cc5-toolhost-supervisor.py', 'scripts/ocv5-289/box_keeper.py'])
+      assert.equal(existsSync(path.join(staging, kept)), true, `production prune dropped ${kept}`)
+    for (const dropped of ['scripts/agent-remote/cc5-host-controller.py', 'scripts/deploy-v5-selfhost.sh', 'scripts/lib'])
+      assert.equal(existsSync(path.join(staging, dropped)), false, `production prune kept ${dropped}`)
 
     const dist = path.join(staging, 'packages/mcp-memory/dist')
     await mkdir(dist, { recursive: true })

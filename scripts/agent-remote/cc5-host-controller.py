@@ -796,7 +796,9 @@ def launch_locked(root, writer_fd, model, profile_dir=None):
            # limit, so a transient upstream error or a long answer behaves as in a local session.
            'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1',
            'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0',
-           'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'}
+           'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
+           # Memory belongs to the platform (container), never to the node's ~/.claude/projects.
+           'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
     account = account_name(info)
     if account is not None:
         # host.py owns the account directory convention: OC_BOX_CLAUDE_PROFILE -> ~/.claude-<name>.

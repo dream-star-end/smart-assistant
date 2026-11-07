@@ -101,7 +101,7 @@ export async function runCc5StdioBridge(input: {
   const fail = (code: string): void => {
     failure ??= new Error(code)
     void stop().catch(() => {
-      failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+      failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
     })
   }
   const send = (line: string): void => {
@@ -160,12 +160,12 @@ export async function runCc5StdioBridge(input: {
     ended = true
     if (buf || decoder.end()) failure ??= new Error('CC5_INPUT_TRUNCATED')
     void stop().catch(() => {
-      failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+      failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
     })
   }
   const onAbort = (): void => {
     void stop().catch(() => {
-      failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+      failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
     })
   }
   const onInputError = (): void => fail('CC5_INPUT_FAILED')
@@ -175,7 +175,7 @@ export async function runCc5StdioBridge(input: {
         try {
           await stop()
         } catch {
-          failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+          failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
         }
         if (failure) reject(failure)
         else if (!ended && !input.signal?.aborted) reject(new Error('CC5_TRANSPORT_CLOSED'))
@@ -353,7 +353,23 @@ export async function runCc5StdioBridge(input: {
     input.stdin.removeListener('data', onData)
     input.stdin.removeListener('end', onEnd)
     input.stdin.removeListener('error', onInputError)
+    // A resumed stdin keeps the bridge process alive while the gateway holds the pipe open.
+    input.stdin.pause()
     input.signal?.removeEventListener('abort', onAbort)
+  }
+}
+
+/** Process entry: the runner treats process exit as the turn's terminal, so a finished
+ * bridge must exit even while the gateway still holds its stdin pipe open. */
+export async function runCc5StdioBridgeProcess(run: () => Promise<void>): Promise<void> {
+  try {
+    await run()
+  } catch (error) {
+    const code = error instanceof Error && /^CC5_[A-Z0-9_]{1,64}$/.test(error.message) ? ` ${error.message}` : ''
+    process.stderr.write(`CC5_INTERACTIVE_BRIDGE_FAILED${code}\n`)
+    process.exitCode = 1
+  } finally {
+    process.stdin.destroy()
   }
 }
 
@@ -361,19 +377,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const controller = new AbortController()
   process.once('SIGTERM', () => controller.abort())
   process.once('SIGINT', () => controller.abort())
-  Promise.resolve()
-    .then(() =>
-      runCc5StdioBridge({
-        binding: readCc5Binding(cc5LanePaths(process.argv[3] ?? '').binding),
-        tools: { keyring: readCc5AuthorityKeyring() },
-        sessionKey: process.argv[2] ?? '',
-        stdin: process.stdin,
-        stdout: process.stdout,
-        signal: controller.signal,
-      }),
-    )
-    .catch(() => {
-      process.stderr.write('CC5_INTERACTIVE_BRIDGE_FAILED\n')
-      process.exitCode = 1
-    })
+  void runCc5StdioBridgeProcess(() =>
+    runCc5StdioBridge({
+      binding: readCc5Binding(cc5LanePaths(process.argv[3] ?? '').binding),
+      tools: { keyring: readCc5AuthorityKeyring() },
+      sessionKey: process.argv[2] ?? '',
+      stdin: process.stdin,
+      stdout: process.stdout,
+      signal: controller.signal,
+    }),
+  )
 }

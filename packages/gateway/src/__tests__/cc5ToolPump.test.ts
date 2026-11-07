@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -473,6 +474,101 @@ test(
   },
 )
 
+test(
+  'a tool host that dies at start ends the bridge with that cause and releases its stdin',
+  { timeout: 15000 },
+  async () => {
+    // 2026-11-07 web incident: the container lacked the supervisor script, the relay's /stop
+    // was rejected (no local stop proof), and the bridge stayed alive on a resumed stdin.
+    const f = fixture()
+    const socketPath = relative(process.cwd(), join(f.root, 'bridge.sock'))
+    const stdin = new PassThrough()
+    const stdout = new PassThrough()
+    stdout.resume()
+    const raw = original(f)
+    let results = 0
+    let polls = 0
+    const server = createServer((req, res) => {
+      let body = ''
+      if (req.url === '/session/open') {
+        req.on('data', (b) => {
+          body += b.toString()
+          for (let pos = body.indexOf('\n'); pos >= 0; pos = body.indexOf('\n')) {
+            const frame = JSON.parse(body.slice(0, pos))
+            body = body.slice(pos + 1)
+            if (frame.type === 'open') {
+              res.writeHead(200, { 'x-cc5-interactive-ready': '1' })
+              res.flushHeaders()
+            } else res.write(raw)
+          }
+        })
+        return
+      }
+      req.on('data', (b) => { body += b.toString() })
+      req.on('end', () => {
+        if (req.url === '/tool/next') {
+          if (++polls === 1) res.end(JSON.stringify({ ok: true, delivery: { request: f.request, admission: f.admission } }))
+        } else if (req.url === '/tool/register') {
+          res.end(JSON.stringify({ ok: true, lifecycleId: JSON.parse(body).lifecycleId }))
+        } else if (req.url === '/tool/result') {
+          results++
+          res.writeHead(403).end()
+        } else res.writeHead(403).end(JSON.stringify({ ok: false, code: 'CC5_RELAY_REJECTED' }))
+      })
+    })
+    server.listen(socketPath)
+    await once(server, 'listening')
+    const running = runCc5StdioBridge({
+      binding: f.binding,
+      sessionKey: f.request.sessionKey,
+      stdin,
+      stdout,
+      socketPath,
+      tools: { keyring: f.keyring, executionRoot: f.root, hostFactory: () => ({
+        execute: async () => { throw new Error('CC5_TOOLHOST_EXECUTION_UNKNOWN') },
+        close: async () => { throw new Error('CC5_TOOLHOST_STOP_UNKNOWN') },
+      }) },
+    })
+    try {
+      stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'remember 42' } })}\n`)
+      await assert.rejects(running, /^Error: CC5_FIXED_TOOL_FAILED_OR_UNKNOWN$/)
+      assert.equal(results, 0, 'no receipt for an effect that never ran')
+      assert.equal(stdin.readableFlowing, false, 'a finished bridge must not keep reading stdin')
+    } finally {
+      await running.catch(() => {})
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      f.cleanup()
+    }
+  },
+)
+
+test('the bridge process exits non-zero with its cause while the gateway still holds stdin open', { timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cc5-bridge-exit-'))
+  const child = join(dir, 'child.mts')
+  const entry = new URL('../cc5StdioBridge.ts', import.meta.url).href
+  writeFileSync(child, [
+    `import { runCc5StdioBridgeProcess } from ${JSON.stringify(entry)}`,
+    'await runCc5StdioBridgeProcess(async () => {',
+    "  process.stdin.on('data', () => {})",
+    "  throw new Error('CC5_FIXED_TOOL_FAILED_OR_UNKNOWN')",
+    '})',
+  ].join('\n'))
+  try {
+    const proc = spawn(process.execPath, ['--import', 'tsx', child], { stdio: ['pipe', 'ignore', 'pipe'] })
+    let stderr = ''
+    proc.stderr.on('data', (b) => { stderr += b.toString() })
+    const timer = setTimeout(() => proc.kill('SIGKILL'), 10000)
+    const [code, signal] = await once(proc, 'exit') as [number | null, NodeJS.Signals | null]
+    clearTimeout(timer)
+    proc.stdin.end()
+    assert.equal(signal, null, 'bridge had to be killed: it never exited on its own')
+    assert.equal(code, 1)
+    assert.match(stderr, /CC5_INTERACTIVE_BRIDGE_FAILED CC5_FIXED_TOOL_FAILED_OR_UNKNOWN/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 const RESULT_LIMIT = 128 * 1024
 /** Wire bytes for these single-text-block fixtures: key order is already sorted. */
