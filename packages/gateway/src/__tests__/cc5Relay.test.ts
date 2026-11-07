@@ -148,8 +148,12 @@ async function harness(
   input.on('data', (b) => written.push(b))
   let ready!: () => void
   let rejectReady!: (error: Error) => void
+  let readySettled = false
   const readyPromise = new Promise<void>((resolve, reject) => {
-    ready = resolve
+    ready = () => {
+      readySettled = true
+      resolve()
+    }
     rejectReady = reject
   })
   // A stop before READY is a failed start, exactly as the production transport reports it.
@@ -200,23 +204,31 @@ async function harness(
       stops++
       markStopped()
       rejectReady(new Error('synthetic host stopped'))
+      // The node controller proves absence only from the round's LIFECYCLE record, which the
+      // launch role writes before host.py prints READY (cc5-host-controller launch_locked).
+      // Stopping a round the node never recorded yields no independent proof.
+      if (!(readySettled && starts > 0)) throw new Error('synthetic remote absence unproved')
       if (failure === 'stop') throw new Error('synthetic remote absence unproved')
       return { remoteStopped: true }
     },
   }
   // Replacement launches get their own transport, as production builds a fresh ssh host.
   const replacements: Array<{ events: string[]; packets: Buffer[]; starts: number; written: Buffer[];
-    ready: () => void; input: PassThrough; output: PassThrough }> = []
+    ready: () => void; readySettled: boolean; input: PassThrough; output: PassThrough }> = []
   const replacementPort = (): Cc5InteractiveHostPort => {
     const replacement = { events: [] as string[], packets: [] as Buffer[], starts: 0,
-      written: [] as Buffer[], ready: () => {}, input: new PassThrough(), output: new PassThrough() }
+      written: [] as Buffer[], ready: () => {}, readySettled: false, input: new PassThrough(),
+      output: new PassThrough() }
     replacement.input.on('data', (bytes) => replacement.written.push(Buffer.from(bytes)))
     let resolveReady!: () => void
     const ready = new Promise<void>((resolve) => {
       resolveReady = resolve
     })
     void ready.catch(() => {})
-    replacement.ready = resolveReady
+    replacement.ready = () => {
+      replacement.readySettled = true
+      resolveReady()
+    }
     let started!: () => void
     const startObserved = new Promise<void>((resolve) => {
       started = resolve
@@ -239,6 +251,9 @@ async function harness(
       },
       async stop() {
         replacement.events.push('stop')
+        // Same controller rule as the initial transport: no lifecycle, no independent proof.
+        if (!(replacement.readySettled && replacement.starts > 0))
+          throw new Error('synthetic remote absence unproved')
         return { remoteStopped: true }
       },
     }
@@ -326,6 +341,8 @@ async function harness(
     scope,
     admit,
     ready,
+    /** The launch fails before native READY, as a dead or stuck node would report it. */
+    failReady: () => rejectReady(new Error('synthetic host never ready')),
     startObserved,
     stopObserved,
     close,
@@ -870,6 +887,23 @@ function profilePacket(profile: ReturnType<typeof toolProfile>): Buffer {
   return Buffer.from(JSON.stringify({ version: 1, catalog: profile.catalog,
     catalogSha256: profile.catalogSha256, prompt: profile.prompt }))
 }
+/** Records the finance turn's stop verdict; the relay verifies the signed authority itself. */
+function financeProbe() {
+  const events: string[] = []
+  const stops: Array<{ hostStartAttempted: boolean; userSubmitted: boolean; remoteStopped: boolean }> = []
+  const finance: Cc5FinancePort = {
+    async admit() {
+      events.push('admit')
+      return {
+        async beforeHostStart() { events.push('host-effect') },
+        async beforeDispatch() { events.push('dispatch-effect') },
+        async terminal() { throw new Error('unexpected terminal') },
+        async stop(value) { events.push('stop'); stops.push(value) },
+      }
+    },
+  }
+  return { finance, events, stops }
+}
 
 test('a profile-taking host is not started by admission; the first stream configures it byte-exactly then starts once', async () => {
   const f = fixture()
@@ -996,18 +1030,20 @@ test('re-registration after launch keeps the first catalog even with replace and
   } finally { s?.req.destroy(); await h.close(); f.cleanup() }
 })
 
-test('a stale catalog replaces the wrongly launched remote inside the same turn', async () => {
+test('a stale catalog after the launch READY replaces the wrongly launched remote inside the same turn', async () => {
   const f = fixture()
-  const h = await harness(f, 'none', undefined, { configure: true, replaceHost: true })
+  const fin = financeProbe()
+  const h = await harness(f, 'none', fin.finance, { configure: true, prepare: true, replaceHost: true })
   let s: Awaited<ReturnType<typeof stream>> | undefined
   try {
     const first = toolProfile([{ alias: 'Read', client: 'Read' }])
     await h.register(first)
     const admitted = h.admit()
     void admitted.catch(() => {})
-    await until(() => h.hostEvents.includes('start'))
+    await h.startObserved
+    // The launch role committed its LIFECYCLE record and host.py printed READY.
+    h.ready()
     const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
-    // The bridge found the cached catalog stale while the launch was still in flight.
     const replaced = await rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
       replace: true, relaunch: true, profile: second })
     assert.deepEqual(replaced.toolNames, second.toolNames)
@@ -1016,6 +1052,7 @@ test('a stale catalog replaces the wrongly launched remote inside the same turn'
     // The replacement's tool socket rotates the old round first: the controller refuses
     // `session-profile` while the old LIFECYCLE record still proves the previous round.
     assert.deepEqual(h.replacements[0]!.events, ['prepare', 'configure', 'start'])
+    assert.equal(h.counts().stops, 1)
     h.replacements[0]!.ready()
     // Admission and the stream both wait for the replacement, not for the abandoned launch.
     await admitted
@@ -1029,6 +1066,121 @@ test('a stale catalog replaces the wrongly launched remote inside the same turn'
       inputSha256: cc5ToolInputSha256(f.request.arguments) })
     assert.equal(stale, 403)
   } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('a stale catalog before the launch READY waits for the node lifecycle before replacing', async () => {
+  const f = fixture()
+  const fin = financeProbe()
+  const h = await harness(f, 'none', fin.finance, { configure: true, prepare: true, replaceHost: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const first = toolProfile([{ alias: 'Read', client: 'Read' }])
+    await h.register(first)
+    const admitted = h.admit()
+    void admitted.catch(() => {})
+    await h.startObserved
+    // start() only scheduled the launch role: the node has no LIFECYCLE.json to prove against,
+    // so its stop would answer `already-stopped` and never yield an independent absence proof.
+    const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
+    let settled: Record<string, unknown> | undefined
+    const pending = rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: second })
+    void pending.then((value) => { settled = value }, () => {})
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(settled, undefined, 'the replacement waits for the launched host to be confirmed')
+    assert.equal(h.replacements.length, 0)
+    assert.equal(h.counts().stops, 0, 'no stop is issued before the lifecycle record exists')
+    // Native READY: the controller wrote LIFECYCLE.json before it exec'd host.py.
+    h.ready()
+    const replaced = await pending
+    assert.deepEqual(replaced.toolNames, second.toolNames)
+    assert.equal(h.replacements.length, 1)
+    assert.deepEqual(h.replacements[0]!.events, ['prepare', 'configure', 'start'])
+    assert.deepEqual(h.replacements[0]!.packets, [profilePacket(second)])
+    assert.equal(h.counts().stops, 1)
+    // The replaced launch's own streams are dying on purpose; they must not revoke the turn.
+    h.input.emit('error', new Error('dying stdin of the replaced launch'))
+    h.replacements[0]!.ready()
+    await admitted
+    assert.equal(h.relay.stopped, false)
+    s = await stream(h)
+    s.send()
+    await until(() => h.replacements[0]!.written.length === 1)
+    assert.equal(h.written.length, 0, 'the replaced launch must not receive turn content')
+    await h.stopped()
+    await h.relay.stop()
+    assert.equal(fin.events.filter((event) => event === 'admit').length, 1)
+    assert.equal(fin.events.filter((event) => event === 'host-effect').length, 1)
+    assert.deepEqual(fin.stops, [{ hostStartAttempted: true, userSubmitted: true, remoteStopped: true }])
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('a second mismatch while the replacement waits for READY coalesces into one replacement', async () => {
+  const f = fixture()
+  const fin = financeProbe()
+  const h = await harness(f, 'none', fin.finance, { configure: true, prepare: true, replaceHost: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const first = toolProfile([{ alias: 'Read', client: 'Read' }])
+    await h.register(first)
+    const admitted = h.admit()
+    void admitted.catch(() => {})
+    await h.startObserved
+    const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
+    const third = toolProfile([{ alias: 'Bash', client: 'Bash' }])
+    const firstRegister = rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: second })
+    void firstRegister.catch(() => {})
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(h.replacements.length, 0)
+    // Accepted while the replacement still waits: the newest catalog wins, no second factory.
+    const accepted = await rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: third })
+    assert.deepEqual(accepted.toolNames, third.toolNames)
+    assert.equal(h.replacements.length, 0, 'still waiting for the launched host READY')
+    h.ready()
+    assert.deepEqual((await firstRegister).toolNames, third.toolNames)
+    assert.equal(h.replacements.length, 1)
+    assert.deepEqual(h.replacements[0]!.events, ['prepare', 'configure', 'start'])
+    assert.deepEqual(h.replacements[0]!.packets, [profilePacket(third)])
+    assert.equal(h.counts().stops, 1)
+    h.replacements[0]!.ready()
+    await admitted
+    s = await stream(h)
+    s.send()
+    await until(() => h.replacements[0]!.written.length === 1)
+    assert.equal(h.written.length, 0)
+    await h.stopped()
+    await h.relay.stop()
+    assert.equal(fin.events.filter((event) => event === 'admit').length, 1)
+    assert.deepEqual(fin.stops, [{ hostStartAttempted: true, userSubmitted: true, remoteStopped: true }])
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('a launch that never becomes ready replaces nothing and leaves the stop unproven', async () => {
+  const f = fixture()
+  const fin = financeProbe()
+  const h = await harness(f, 'none', fin.finance, { configure: true, prepare: true, replaceHost: true })
+  try {
+    await h.register(toolProfile())
+    const admitted = h.admit()
+    void admitted.catch(() => {})
+    await h.startObserved
+    const pending = rpcStatus(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: toolProfile([{ alias: 'Edit', client: 'Edit' }]) })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(h.replacements.length, 0)
+    // The launch fails before READY: the node never recorded this round, so nothing can be proven.
+    h.failReady()
+    assert.equal(await pending, 403)
+    await assert.rejects(admitted)
+    await h.relay.stop().catch(() => {})
+    assert.equal(h.replacements.length, 0)
+    assert.equal(h.written.length, 0, 'no user frame reached any host')
+    assert.equal(fin.events.filter((event) => event === 'admit').length, 1)
+    assert.equal(fin.events.filter((event) => event === 'host-effect').length, 1)
+    assert.deepEqual(fin.stops, [{ hostStartAttempted: true, userSubmitted: false, remoteStopped: false }])
+  } finally { await h.close(); f.cleanup() }
 })
 
 test('a replacement is refused once the user frame reached the remote', async () => {

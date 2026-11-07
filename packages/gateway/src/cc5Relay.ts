@@ -174,6 +174,8 @@ export class Cc5Relay {
   private launchStage: 'none' | 'preparing' | 'launched' = 'none'
   /** Bumped for every lane profile; preparation re-runs until the launch uses the newest one. */
   private profileEpoch = 0
+  /** The current launch's native READY. Only then has the node written this round's LIFECYCLE. */
+  private hostConfirmed?: Promise<void>
 
   constructor(
     private binding: Readonly<Cc5BridgeBinding>,
@@ -489,6 +491,7 @@ export class Cc5Relay {
     this.launchAttempted = true
     this.needsReattach = false
     this.host = this.hostPort.attach()
+    this.hostConfirmed = this.host.ready
     this.bindHostStreams(this.host)
     this.hostReady = Promise.resolve().then(async () => {
       await this.host!.ready
@@ -519,6 +522,8 @@ export class Cc5Relay {
         this.launchStage = 'launched'
         const host = this.hostPort.start()
         this.host = host
+        // A replacement may ask whether this launch has reached the node's lifecycle record yet.
+        this.hostConfirmed = host.ready
         this.bindHostStreams(host, epoch)
         break
       }
@@ -575,8 +580,10 @@ export class Cc5Relay {
     }
   }
   /** A live catalog found the registered one stale. Still preparing: the running start sequence
-   *  re-installs this profile before it launches. Already launched: the remote runs the old
-   *  catalog and is replaced. After the user frame neither is possible. */
+   *  re-installs this profile before it launches (a replacement waiting for the launched host's
+   *  READY is still `preparing`, so a second mismatch coalesces into it: newest profile, one
+   *  replacement). Already launched: the remote runs the old catalog and is replaced. After the
+   *  user frame neither is possible. */
   private adoptLaneProfile(profile: { packet: Buffer; catalogSha256: string;
     toolNames: Readonly<Record<string, string>> }): Promise<void> {
     requireRelay(this.launchAttempted && !this.needsReattach && !this.userSeen &&
@@ -597,10 +604,19 @@ export class Cc5Relay {
       !this.userSeen && (this.phase === 'admitting' || this.phase === 'running') && !this.revoked)
     const epoch = ++this.hostEpoch
     const previous = this.hostPort
+    // `start()` only schedules the launch role: the node writes this round's LIFECYCLE.json inside
+    // that role (cc5-host-controller launch_locked), and host.py prints READY after it. A stop
+    // before READY therefore has no lifecycle record to prove absence against, so the replacement
+    // waits for this launch's own confirmation instead of failing the first turn. The user frame
+    // and tool pump stay held until the catalog is verified (cc5StdioBridge toolsVerified).
+    const launched = this.hostConfirmed
     this.profile = profile
     this.profileEpoch++
     this.launchStage = 'preparing'
     const replacement = (async () => {
+      requireRelay(launched !== undefined)
+      await launched
+      requireRelay(!this.revoked && epoch === this.hostEpoch)
       // Independent absence proof for the wrongly launched session before a second one exists.
       await previous.stop()
       requireRelay(!this.revoked && epoch === this.hostEpoch)
@@ -613,6 +629,7 @@ export class Cc5Relay {
         this.launchStage = 'launched'
         const host = next.start()
         this.host = host
+        this.hostConfirmed = host.ready
         this.bindHostStreams(host, epoch)
         break
       }

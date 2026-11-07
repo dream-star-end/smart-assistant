@@ -57,6 +57,9 @@ if (role === 'tool-socket') {
   }},5); }
 } else if(role === 'launch') {
   fs.writeFileSync(c.root+'/launched','once');
+  // The controller's launch role writes the round's LIFECYCLE record before it execs host.py,
+  // and only host.py prints READY. The independent stop proof reads exactly that record.
+  fs.writeFileSync(c.root+'/LIFECYCLE.json','{}');
   process.stderr.write(c.notReady ? 'BOX_INTERACTIVE_NOT_READY\n  | PRIVATE_PANE_MUST_NEVER_ESCAPE\n' :
     'irrelevant private stderr\nBOX_INTERACTIVE_READY plugins=oc-bridge version=None\n');
   process.stdout.write(c.initial || '');
@@ -70,6 +73,10 @@ if (role === 'tool-socket') {
     if(c.failControl) process.exit(23);
     if(c.failProfile && role==='session-profile') process.exit(24);
     if(role==='prove-stopped') {
+      // No round record, no independent proof: this is the controller's FileNotFoundError path.
+      if(!fs.existsSync(c.root+'/LIFECYCLE.json')) {
+        process.stderr.write('CC5_PREP_ERROR FileNotFoundError\\n'); process.exit(31);
+      }
       if(c.badProof) console.log(JSON.stringify({remoteStopped:true,kind:'verified-task-runtime-absent',root:'/wrong'}));
       else console.log(JSON.stringify({remoteStopped:true,kind:'verified-task-runtime-absent',root:c.taskRoot}));
     } else if(role==='session-profile') {
@@ -181,11 +188,17 @@ function fixture(
     },
     async cleanup() {
       await host.stop().catch(() => {})
-      for (const child of children) if (child.exitCode === null) child.kill('SIGKILL')
       await Promise.all(
-        children.map((child) =>
-          child.exitCode !== null ? Promise.resolve() : once(child, 'close').catch(() => {}),
-        ),
+        children.map((child) => {
+          // A child killed by a signal has `exitCode === null`; waiting on its 'close' afterwards can
+          // never settle. Settle on either event and only wait when the process is actually running.
+          if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+          return new Promise<void>((resolve) => {
+            child.once('close', () => resolve())
+            child.once('exit', () => resolve())
+            child.kill('SIGKILL')
+          })
+        }),
       )
       rmSync(root, { recursive: true, force: true })
       errors = []
@@ -277,7 +290,7 @@ test('a replacement lane rotates through the tool socket before installing the n
 })
 
 test('a failed profile install never launches the remote', async () => {
-  const f = fixture({ failProfile: true })
+  const f = fixture({ failProfile: true }, { stopMs: 300 })
   try {
     await assert.rejects(f.host.configure(Buffer.from('{"version":1}')))
     await f.host.stop().catch(() => {})
@@ -290,9 +303,9 @@ test('a failed profile install never launches the remote', async () => {
 
 test('a preparation failure before start() rejects prepare() without an uncaught stream error or a launch', async (t) => {
   const cases: Array<[string, Record<string, unknown>, Record<string, number>]> = [
-    ['tool socket exit', { socketExit: true }, {}],
-    ['bad socket READY', { badSocketFrame: true }, {}],
-    ['startup timeout', { helperDelay: 5000 }, { startupMs: 100 }],
+    ['tool socket exit', { socketExit: true }, { stopMs: 1000 }],
+    ['bad socket READY', { badSocketFrame: true }, { stopMs: 1000 }],
+    ['startup timeout', { helperDelay: 5000 }, { startupMs: 100, stopMs: 1000 }],
   ]
   for (const [label, options, deadlines] of cases) {
     await t.test(label, async () => {
@@ -310,7 +323,8 @@ test('a preparation failure before start() rejects prepare() without an uncaught
         await new Promise((resolve) => setTimeout(resolve, 50))
         assert.deepEqual(uncaught.map((error) => error.message), [])
         assert.equal(f.roles.filter((role) => role === 'launch').length, 0)
-        // The failure path still proves the remote absent and tears both channels down.
+        // The failure path still requires the independent proof and tears both channels down;
+        // without a lifecycle record the node cannot give one, so the stop stays unknown.
         assert.ok(f.roles.includes('stop') && f.roles.includes('prove-stopped'))
       } finally {
         process.removeListener('uncaughtException', observe)
@@ -395,12 +409,14 @@ test('a repeated MCP transport sequence fails before a second Unix delivery', as
 })
 
 test('cancellation before helper READY cannot dispatch a late TUI launch', async () => {
-  const f = fixture({ helperDelay: 300 })
+  const f = fixture({ helperDelay: 300 }, { stopMs: 300 })
   try {
     const streams = f.start()
     void streams.ready.catch(() => {})
     await until(() => f.roles.includes('tool-socket'))
-    await f.host.stop()
+    // The round never launched, so the node has no lifecycle record to prove absence from:
+    // cancellation reports the remote stop unproven instead of claiming it.
+    await assert.rejects(f.host.stop(), /CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN/)
     await assert.rejects(streams.ready, /CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN/)
     assert.equal(f.roles.filter((role) => role === 'launch').length, 0)
     assert.equal(existsSync(join(f.root, 'prompt')), false)
@@ -426,7 +442,7 @@ test('local SSH exit and wrong/failed independent proof never report remoteStopp
 })
 
 test('NOT_READY pane is discarded and startup error is a fixed label', async () => {
-  const f = fixture({ notReady: true })
+  const f = fixture({ notReady: true }, { stopMs: 300 })
   try {
     const streams = f.start()
     await assert.rejects(streams.ready, /^Error: CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN$/)
