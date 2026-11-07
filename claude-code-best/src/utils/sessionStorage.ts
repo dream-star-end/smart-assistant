@@ -2122,6 +2122,7 @@ function applyPreservedSegmentRelinks(
   // Find the absolute-last boundary and the last seg-boundary (can differ:
   // manual /compact after reactive compact → seg is stale).
   let lastSeg: Seg | undefined
+  let idlePreservedUuids: unknown
   let lastSegBoundaryIdx = -1
   let absoluteLastBoundaryIdx = -1
   const entryIndex = new Map<UUID, number>()
@@ -2133,6 +2134,7 @@ function applyPreservedSegmentRelinks(
       const seg = entry.compactMetadata?.preservedSegment
       if (seg) {
         lastSeg = seg
+        idlePreservedUuids = entry.compactMetadata?.idlePreservedUuids
         lastSegBoundaryIdx = i
       }
     }
@@ -2148,7 +2150,24 @@ function applyPreservedSegmentRelinks(
   // Validate tail→head BEFORE mutating so malformed metadata is a true
   // no-op (walk stops at headUuid, doesn't need the relink to run first).
   const preservedUuids = new Set<UUID>()
-  if (segIsLive) {
+  if (segIsLive && idlePreservedUuids !== undefined) {
+    // Idle freezes an ordered projection, including parallel tool-result siblings
+    // which are NOT all ancestors of tailUuid. Never drop them via a single walk.
+    if (!Array.isArray(idlePreservedUuids) || idlePreservedUuids.length === 0
+      || new Set(idlePreservedUuids).size !== idlePreservedUuids.length
+      || idlePreservedUuids[0] !== lastSeg.headUuid
+      || idlePreservedUuids.at(-1) !== lastSeg.tailUuid
+      || idlePreservedUuids.some(id => typeof id !== 'string' || !messages.has(id as UUID))) {
+      throw new Error('IDLE_RECOVERY_CORRUPT')
+    }
+    let parent = lastSeg.anchorUuid
+    for (const id of idlePreservedUuids as UUID[]) {
+      const message = messages.get(id)!
+      messages.set(id, { ...message, parentUuid: parent })
+      preservedUuids.add(id)
+      parent = id
+    }
+  } else if (segIsLive) {
     const walkSeen = new Set<UUID>()
     let cur = messages.get(lastSeg.tailUuid)
     let reachedHead = false

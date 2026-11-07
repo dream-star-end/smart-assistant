@@ -353,6 +353,7 @@ export function buildIdleCompactionResult(file: IdleNativeFile, _messages: reado
       preTokens: 0,
       idleReceiptDigest: artifact.digest,
       idleOpId: file.opId,
+      idlePreservedUuids: file.frozenTail.map(item => item.uuid),
     },
   } as CompactionResult['boundaryMarker'], summaryUuid as UUID, kept)
   const result: CompactionResult = {
