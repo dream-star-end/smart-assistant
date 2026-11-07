@@ -26,8 +26,8 @@ import time
 import uuid
 
 TASK = 'AGENT-REMOTE-T1555U'
-PINNED_MCP_SHA = 'e89e1e9a7e9909460265bd0cd94f85ed8e349f8067a436726caccae1da839631'
-PINNED_SOCKET_SHA = '7a6d3499222977bd9f38a90cc5dd5de117ee38166b8e0d4e1ccd9260fd431381'
+PINNED_MCP_SHA = '62711d60956dd3f60275e57612e62ba1cba6775f75cb40fcb82fb8009d6ebbee'
+PINNED_SOCKET_SHA = '8604c8fb37e9af48edf172b2f5c8aa6685bc7c305411ebc7a94bdf02818d3f8e'
 UUID = re.compile(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z')
 SHA256 = re.compile(r'[0-9a-f]{64}\Z')
 # Per-lane tool catalog and system prompt shipped by the master right before launch.

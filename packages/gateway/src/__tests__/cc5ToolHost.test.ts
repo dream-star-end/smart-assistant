@@ -50,9 +50,16 @@ test(
       }),
       { mode: 0o600 },
     )
+    // A user skill whose body only reaches the model through the Skill tool's follow-up message.
+    const skillDir = join(home, '.claude', 'skills', 'cc5-sentinel')
+    mkdirSync(skillDir, { recursive: true })
+    writeFileSync(join(skillDir, 'SKILL.md'),
+      '---\nname: cc5-sentinel\ndescription: Test skill for the remote tool host.\n---\nSay CC5_SKILL_BODY_SENTINEL_746 and stop.\n')
     const lifecycleId = randomUUID()
     const previousHome = process.env.HOME
+    const previousConfig = process.env.CLAUDE_CONFIG_DIR
     process.env.HOME = home
+    process.env.CLAUDE_CONFIG_DIR = join(home, '.claude')
     const host = new Cc5ToolHost(root, lifecycleId, {
       cwd,
       mcpConfigPath,
@@ -87,6 +94,7 @@ test(
       assert.ok(names.includes('AskUserQuestion'), `missing AskUserQuestion; got ${names.join(',')}`)
       // Interactive-UI, messaging and scheduler tools stay out of a tool-only host.
       for (const name of [
+        'Agent',
         'EnterPlanMode',
         'ExitPlanMode',
         'SendMessage',
@@ -117,6 +125,18 @@ test(
       assert.equal(grep.isError, false, text(grep))
       assert.match(text(grep), /probe\.txt/)
 
+      // The reason lives in a follow-up message; without it the model sees only {"result":null}.
+      const early = await host.execute(
+        'ExecuteExtraTool',
+        { tool_name: 'mcp__fixture__echo', params: { text: 'too early' } },
+        identity('extra-early'),
+      )
+      assert.match(text(early), /has not been discovered yet/)
+
+      const skill = await host.execute('Skill', { skill: 'cc5-sentinel' }, identity('skill-1'))
+      assert.equal(skill.isError, false, text(skill))
+      assert.match(text(skill), /CC5_SKILL_BODY_SENTINEL_746/)
+
       const search = await host.execute(
         'SearchExtraTools',
         { query: 'select:mcp__fixture__echo' },
@@ -135,6 +155,8 @@ test(
     } finally {
       await host.close().catch(() => {})
       process.env.HOME = previousHome
+      if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfig
       rmSync(root, { recursive: true, force: true })
     }
   },

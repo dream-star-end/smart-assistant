@@ -68,13 +68,18 @@ export function cc5ToolScopeHash(request: Cc5ToolRequest, admission: Cc5ToolAdmi
     admission.connectionChallenge, admission.securityEpoch,
   ])).digest('hex')
 }
-/** Python's canonical(json) form: sorted keys, compact separators, raw UTF-8. */
+/** The wire's canonical JSON, shared with cc5-fixed-mcp.py canonical(): object keys in UTF-8 byte
+ * (= code point) order, numbers in ECMAScript Number::toString form, compact, raw UTF-8 strings.
+ * JSON.stringify alone would put integer-like keys first and sort by UTF-16 units. */
 function cc5CanonicalJson(value: unknown): string {
-  return JSON.stringify(value, (_key, item) => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return item
-    const record = item as Record<string, unknown>
-    return Object.fromEntries(Object.keys(record).sort().map((key) => [key, record[key]]))
-  })
+  if (Array.isArray(value)) return `[${value.map((item) => cc5CanonicalJson(item === undefined ? null : item)).join(',')}]`
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    const keys = Object.keys(record).filter((key) => record[key] !== undefined)
+      .sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')))
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${cc5CanonicalJson(record[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
 export function cc5ToolResultBytes(value: unknown): number {
   return Buffer.byteLength(cc5CanonicalJson(value), 'utf8')

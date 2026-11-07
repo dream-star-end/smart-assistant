@@ -1,3 +1,5 @@
+import { fileURLToPath } from 'node:url'
+import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
@@ -367,9 +369,9 @@ async function start(f: ReturnType<typeof fixture>, finance?: Cc5FinancePort) {
   return { h, s }
 }
 async function callTool(f: ReturnType<typeof fixture>, h: Awaited<ReturnType<typeof harness>>, id: string, rpcId: number,
-  name = f.request.name, args: unknown = f.request.arguments) {
+  name = f.request.name, args: unknown = f.request.arguments, inputSha256 = cc5ToolInputSha256(args)) {
   const remote = rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
-    rpcId, toolUseId: id, name, arguments: args, inputSha256: cc5ToolInputSha256(args) })
+    rpcId, toolUseId: id, name, arguments: args, inputSha256 })
   void remote.catch(() => {})
   h.output.write(original(f, [{ id, name, input: args }]))
   const next = await rpc(h.socketPath, '/tool/next', h.scope)
@@ -443,6 +445,32 @@ test('two serial user turns retain one native host/stream and settle distinct v2
     assert.deepEqual(receipts.map((receipt) => receipt.usage.inputTokens).sort((a, b) => a - b), [2, 7])
     assert.ok(receipts.every((receipt) => receipt.version === 2 && receipt.nativeSessionId === f.request.nativeSessionId))
   } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+/** The hash the node's MCP (cc5-fixed-mcp.py canonical) sends for these arguments. */
+function nodeInputSha256(args: unknown): string {
+  const script = fileURLToPath(new URL('../../../../scripts/agent-remote/cc5-fixed-mcp.py', import.meta.url))
+  const child = spawnSync('python3', ['-I', '-B', '-c', 'import sys,json,hashlib,importlib.util\n' +
+    'spec=importlib.util.spec_from_file_location("m",sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n' +
+    'print(hashlib.sha256(m.canonical(json.loads(sys.stdin.read()))).hexdigest())', script],
+  { input: JSON.stringify(args), encoding: 'utf8', timeout: 5000 })
+  assert.equal(child.status, 0, child.stderr)
+  return child.stdout.trim()
+}
+
+test('nested arguments hashed by the node MCP are delivered: integer-like keys, small numbers, astral keys', async () => {
+  // P4 audit r1: JSON.stringify ordered "2" before "10" and wrote 0.000001 where Python wrote 1e-06 -> 403.
+  const f = fixture(); const { h } = await start(f)
+  try {
+    let rpcId = 1
+    for (const args of [{ params: { '2': 'two', '10': 'ten' } }, { params: { value: 0.000001, tiny: 1e-7 } },
+      { params: { '\u{1F600}': 1, '\uFFFF': 2 } }]) {
+      const id = `extra-${rpcId}`
+      const call = await callTool(f, h, id, rpcId++, 'mcp__ocbridge__ExecuteExtraTool', args, nodeInputSha256(args))
+      assert.deepEqual(call.delivery.request.arguments, args)
+      await call.complete()
+    }
+  } finally { await h.close(); f.cleanup() }
 })
 
 test('multiple original tool blocks queue serially and exact canonical input is required', async () => {

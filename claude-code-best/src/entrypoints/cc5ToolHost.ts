@@ -20,8 +20,10 @@ const MAX_TOOLS = 128
 /** Inside the gateway's 11-minute tools/call bound. */
 const PERMISSION_TIMEOUT_MS = 10 * 60 * 1000
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/
-/** Tools that need this process's own interactive UI; permission prompts (AskUserQuestion) go to the client. */
+/** Tools this host cannot serve: they need its own interactive UI, or (Agent) a model loop it never runs.
+ * Permission prompts (AskUserQuestion) go to the client; delegation is mcp__openclaude-memory__delegate_task. */
 const INTERACTIVE_TOOLS: ReadonlySet<string> = new Set([
+  'Agent',
   'EnterPlanMode',
   'ExitPlanMode',
   'SendMessage',
@@ -458,6 +460,9 @@ export async function startCc5ToolHost(profilePath: string): Promise<void> {
         call.signal.addEventListener('abort', onAbort, { once: true })
         if (call.signal.aborted) onAbort()
         let result: CallToolResult | undefined
+        // A tool's follow-up user messages (a skill's body, ExecuteExtraTool's "not discovered yet") are what a
+        // local model reads next; here they travel inside this call's result, after the tool's own content.
+        const followUp: string[] = []
         try {
           for await (const update of runTools(
             [block],
@@ -479,9 +484,13 @@ export async function startCc5ToolHost(profilePath: string): Promise<void> {
                 }>
               }
             }
+            if (message.type === 'user' && typeof message.message?.content === 'string')
+              followUp.push(message.message.content)
             for (const item of Array.isArray(message.message?.content)
               ? message.message.content
               : []) {
+              if (message.type === 'user' && item.type === 'text' && typeof (item as { text?: unknown }).text === 'string')
+                followUp.push((item as { text: string }).text)
               if (
                 item.type !== 'tool_result' ||
                 item.tool_use_id !== call.toolUseId
@@ -498,6 +507,8 @@ export async function startCc5ToolHost(profilePath: string): Promise<void> {
           call.signal.removeEventListener('abort', onAbort)
         }
         requireHost(result)
+        if (followUp.length > 0)
+          result = { ...result, content: [...result.content, ...followUp.map(text => ({ type: 'text' as const, text }))] }
         const failed = result.isError === true
         const sourcePath =
           (call.name === 'Read' || call.name === 'Write') &&

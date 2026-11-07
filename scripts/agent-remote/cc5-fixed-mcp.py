@@ -127,9 +127,64 @@ def valid_strings(value):
             valid_strings(item)
 
 
+SAFE_INTEGER = 2**53 - 1
+
+
+def js_number(value):
+    """ECMAScript Number::toString, the form the master hashes; Python repr has the same shortest digits."""
+    if type(value) is int:
+        if abs(value) > SAFE_INTEGER:
+            raise ValueError('unsafe-integer')
+        return str(value)
+    if value != value or value in (float('inf'), float('-inf')):
+        raise ValueError('non-finite')
+    if value.is_integer() and abs(value) > SAFE_INTEGER:
+        raise ValueError('unsafe-integer')  # The master cannot tell 1e21 from an integer and rejects both.
+    if value == 0:
+        return '0'
+    text = repr(value)
+    sign = '-' if text.startswith('-') else ''
+    mantissa, _, exponent = text.lstrip('-').partition('e')
+    whole, _, fraction = mantissa.partition('.')
+    raw = whole + fraction
+    lead = len(raw) - len(raw.lstrip('0'))
+    digits = raw.lstrip('0').rstrip('0')
+    n = len(whole) - lead + int(exponent or 0)
+    k = len(digits)
+    if k <= n <= 21:
+        body = digits + '0' * (n - k)
+    elif 0 < n <= 21:
+        body = digits[:n] + '.' + digits[n:]
+    elif -6 < n <= 0:
+        body = '0.' + '0' * -n + digits
+    else:
+        e = n - 1
+        body = (digits[0] + ('.' + digits[1:] if k > 1 else '') + 'e' + ('+' if e >= 0 else '-') + str(abs(e)))
+    return sign + body
+
+
+def canonical_text(value):
+    if value is None:
+        return 'null'
+    if value is True or value is False:
+        return 'true' if value else 'false'
+    if isinstance(value, (int, float)):
+        return js_number(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return '[' + ','.join(canonical_text(item) for item in value) + ']'
+    if isinstance(value, dict):
+        # str order is code point order, which equals the master's UTF-8 byte order.
+        return '{' + ','.join(json.dumps(key, ensure_ascii=False) + ':' + canonical_text(value[key])
+                              for key in sorted(value)) + '}'
+    raise ValueError('not-json')
+
+
 def canonical(value):
+    """The wire's canonical JSON, shared with the master (packages/gateway/src/cc5NativeTool.ts)."""
     valid_strings(value)
-    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+    return canonical_text(value).encode('utf-8')
 
 
 def tool_arguments(catalog, name, args):
