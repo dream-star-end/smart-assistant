@@ -40,6 +40,8 @@ export interface Cc5InteractiveHostPort {
   configure?(packet: Buffer): Promise<void>
   /** Reattach to an already-launched live remote session without re-running one-shot launch. */
   attach?(): { stdin: Writable; stdout: Readable; ready: Promise<void> }
+  /** Opens the session-independent tool-socket channel; must not carry session data. */
+  prepare?(): Promise<void>
   /** Independent identity-checked remote stop and absence proof, including failed startup. */
   stop(): Promise<{ remoteStopped: true }>
 }
@@ -50,7 +52,8 @@ function requireRelay(ok: unknown): asserts ok {
   if (!ok) throw new Error('CC5_RELAY_REJECTED')
 }
 /** The bridge's lane profile, re-checked here and shipped byte-exact to the node controller. */
-function sessionProfile(value: unknown): { packet: Buffer; toolNames: Readonly<Record<string, string>> } {
+function sessionProfile(value: unknown): { packet: Buffer; catalogSha256: string;
+  toolNames: Readonly<Record<string, string>> } {
   const profile = value as { catalog?: unknown; catalogSha256?: unknown; prompt?: unknown; toolNames?: unknown }
   requireRelay(profile && typeof profile === 'object' && !Array.isArray(profile) &&
     Object.keys(profile).sort().join(',') === 'catalog,catalogSha256,prompt,toolNames' &&
@@ -67,7 +70,8 @@ function sessionProfile(value: unknown): { packet: Buffer; toolNames: Readonly<R
     Object.values(toolNames).every((name) => typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(name)))
   const packet = Buffer.from(JSON.stringify({ version: 1, catalog: profile.catalog,
     catalogSha256: profile.catalogSha256, prompt: profile.prompt }))
-  return { packet, toolNames: Object.freeze({ ...toolNames }) as Readonly<Record<string, string>> }
+  return { packet, catalogSha256: profile.catalogSha256 as string,
+    toolNames: Object.freeze({ ...toolNames }) as Readonly<Record<string, string>> }
 }
 function sha(bytes: string | Buffer): string {
   return createHash('sha256').update(bytes).digest('hex')
@@ -121,6 +125,8 @@ export class Cc5Relay {
   private userSubmitted = false
   private host?: ReturnType<Cc5InteractiveHostPort['start']>
   private hostReady?: Promise<void>
+  /** Bumped when a stale catalog forces a replacement launch; older hosts must not act. */
+  private hostEpoch = 0
   private launchAttempted = false
   private readonly outputEvents = new EventEmitter()
   private expiry?: ReturnType<typeof setTimeout>
@@ -137,7 +143,7 @@ export class Cc5Relay {
   private waitingTools = 0
   private lifecycleId?: string
   /** The catalog the remote CLI is launched with; fixed for the lane once launch is attempted. */
-  private profile?: { packet: Buffer; toolNames: Readonly<Record<string, string>> }
+  private profile?: { packet: Buffer; catalogSha256: string; toolNames: Readonly<Record<string, string>> }
   private localStopped = false
   private readonly localEvents = new EventEmitter()
   private output: Buffer[] = []
@@ -164,12 +170,18 @@ export class Cc5Relay {
   private readonly outputHistory: Array<{ seq: number; bytes: Buffer }> = []
   private outputHistoryBytes = 0
   private needsReattach = false
+  /** One lane start at a time: `none` → `preparing` → `launched`, all before any user frame. */
+  private launchStage: 'none' | 'preparing' | 'launched' = 'none'
+  /** Bumped for every lane profile; preparation re-runs until the launch uses the newest one. */
+  private profileEpoch = 0
+  /** The current launch's native READY. Only then has the node written this round's LIFECYCLE. */
+  private hostConfirmed?: Promise<void>
 
   constructor(
     private binding: Readonly<Cc5BridgeBinding>,
     private readonly keyring: AuthorityKeyring,
     private readonly runId: string,
-    private readonly hostPort: Cc5InteractiveHostPort,
+    private hostPort: Cc5InteractiveHostPort,
     private readonly journalRoot: string,
     private readonly finance: Cc5FinancePort,
     private readonly options: {
@@ -179,6 +191,8 @@ export class Cc5Relay {
       recoverExistingJournal?: boolean
       /** The remote target's CLI model; native usage frames are held to exactly this model. */
       upstreamModel?: string
+      /** Builds the transport for a replacement launch when a cached catalog turns out stale. */
+      replaceHost?: () => Cc5InteractiveHostPort
     } = {},
   ) {
     assertCc5BindingScope(binding)
@@ -388,10 +402,13 @@ export class Cc5Relay {
     )
     this.expiry.unref()
   }
-  private bindHostStreams(host: ReturnType<Cc5InteractiveHostPort['start']>): void {
+  private bindHostStreams(host: ReturnType<Cc5InteractiveHostPort['start']>,
+    epoch = this.hostEpoch): void {
     const stdin = host.stdin
+    // A replaced host is stopped on purpose; its dying streams must not stop the relay.
+    const current = (): boolean => epoch === this.hostEpoch
     const inputFailed = (): void => {
-      void this.stop().catch(() => {})
+      if (current()) void this.stop().catch(() => {})
     }
     stdin.on('error', inputFailed)
     stdin.once('close', () => {
@@ -399,11 +416,15 @@ export class Cc5Relay {
       stdin.removeListener('error', inputFailed)
     })
     host.stdout.on('data', (chunk: Buffer) => {
-      if (this.revoked) return
+      if (this.revoked || !current()) return
       this.host!.stdout.pause()
       const bytes = Buffer.from(chunk)
       this.queuedOutputBytes += bytes.length
       this.outputTail = this.outputTail.then(async () => {
+        if (!current()) {
+          this.queuedOutputBytes -= bytes.length
+          return
+        }
         requireRelay(!this.revoked && this.queuedOutputBytes <= CC5_BRIDGE_MAX_FRAME_BYTES)
         const frames = this.nativeUsage.ingest(bytes)
         // Validate the entire complete chunk before a waiter can authorize a tool.
@@ -454,13 +475,14 @@ export class Cc5Relay {
       }).catch(() => { void this.stop().catch(() => {}) })
     })
     host.stdout.once('end', () => {
+      if (!current()) return
       void this.outputTail.then(() => {
         this.nativeUsage.finish()
         this.observation.finish()
       }).finally(() => this.stop()).catch(() => {})
     })
     host.stdout.once('error', () => {
-      void this.stop().catch(() => {})
+      if (current()) void this.stop().catch(() => {})
     })
   }
   attachRecoveredHost(): void {
@@ -469,6 +491,7 @@ export class Cc5Relay {
     this.launchAttempted = true
     this.needsReattach = false
     this.host = this.hostPort.attach()
+    this.hostConfirmed = this.host.ready
     this.bindHostStreams(this.host)
     this.hostReady = Promise.resolve().then(async () => {
       await this.host!.ready
@@ -486,20 +509,141 @@ export class Cc5Relay {
       return this.hostReady!
     }
     // Publish the joining promise BEFORE invoking start, even if start throws after spawning.
+    const epoch = this.hostEpoch
     this.hostReady = Promise.resolve().then(async () => {
       requireRelay(!this.revoked && this.admitted && this.financeTurn && (this.profile || !this.hostPort.configure))
       this.launchAttempted = true
-      if (this.hostPort.configure) await this.hostPort.configure(this.profile!.packet)
-      requireRelay(!this.revoked)
-      this.host = this.hostPort.start()
-      this.bindHostStreams(this.host)
+      this.launchStage = 'preparing'
+      for (;;) {
+        const prepared = await this.prepareLane(this.hostPort, false)
+        requireRelay(!this.revoked && epoch === this.hostEpoch)
+        if (prepared !== this.profileEpoch) continue
+        // From here to start() there is no await: no profile can slip in after the last check.
+        this.launchStage = 'launched'
+        const host = this.hostPort.start()
+        this.host = host
+        // A replacement may ask whether this launch has reached the node's lifecycle record yet.
+        this.hostConfirmed = host.ready
+        this.bindHostStreams(host, epoch)
+        break
+      }
       await this.host.ready
-      requireRelay(!this.revoked)
+      requireRelay(!this.revoked && epoch === this.hostEpoch)
     })
     void this.hostReady.catch(() => {
-      void this.stop().catch(() => {})
+      if (epoch === this.hostEpoch) void this.stop().catch(() => {})
     })
     return this.hostReady
+  }
+  /** The host the stream will write to: a replacement launch extends what a stream must wait for. */
+  private async waitForHost(): Promise<void> {
+    for (;;) {
+      const ready = this.hostReady ?? this.ensureHost()
+      try {
+        await ready
+      } catch (error) {
+        // A replaced host is stopped on purpose; only the current host's failure ends the stream.
+        if (ready === this.hostReady) throw error
+        continue
+      }
+      if (ready === this.hostReady) return
+    }
+  }
+  /** The lane's remote preparation, in the one order the node controller accepts.
+   *
+   *  A fresh root has no installed session, and the controller validates that profile before it
+   *  execs the tool-socket helper: `session-profile` must come first there. An already-launched
+   *  round keeps its LIFECYCLE record as stop proof, and `session-profile` refuses while that
+   *  record exists; only tool-socket's rotate proves the old round gone and clears it. The socket
+   *  helper reads the catalog per request, so a later profile install still reaches it.
+   *  A live catalog that arrives mid-way re-runs the pass before the launch. Returns the profile
+   *  generation this pass installed; the caller launches only if no newer one has arrived. */
+  private async prepareLane(host: Cc5InteractiveHostPort, replacement: boolean): Promise<number> {
+    for (;;) {
+      const generation = this.profileEpoch
+      const profile = this.profile
+      requireRelay(profile || !host.configure)
+      if (replacement) {
+        await host.prepare?.()
+        requireRelay(!this.revoked)
+        if (generation !== this.profileEpoch) continue
+        if (profile && host.configure) await host.configure(profile.packet)
+      } else {
+        if (profile && host.configure) await host.configure(profile.packet)
+        requireRelay(!this.revoked)
+        // No socket for a stale catalog: re-install the newest profile first.
+        if (generation !== this.profileEpoch) continue
+        await host.prepare?.()
+      }
+      requireRelay(!this.revoked)
+      if (generation === this.profileEpoch) return generation
+    }
+  }
+  /** A live catalog found the registered one stale. Still preparing: the running start sequence
+   *  re-installs this profile before it launches (a replacement waiting for the launched host's
+   *  READY is still `preparing`, so a second mismatch coalesces into it: newest profile, one
+   *  replacement). Already launched: the remote runs the old catalog and is replaced. After the
+   *  user frame neither is possible. */
+  private adoptLaneProfile(profile: { packet: Buffer; catalogSha256: string;
+    toolNames: Readonly<Record<string, string>> }): Promise<void> {
+    requireRelay(this.launchAttempted && !this.needsReattach && !this.userSeen &&
+      (this.phase === 'admitting' || this.phase === 'running') && !this.revoked)
+    if (this.launchStage === 'launched') return this.replaceLaunchedHost(profile)
+    this.profile = profile
+    this.profileEpoch++
+    // The start sequence in flight sees the epoch and re-installs before it launches; the stream
+    // gates the user frame on that same launch, so nothing is dispatched with the old catalog.
+    return Promise.resolve()
+  }
+  /** The cached catalog was stale, so the remote runs the wrong tool set. Replace it inside this
+   *  admitted turn: nothing was dispatched yet, so no prompt or result can be lost. */
+  private replaceLaunchedHost(profile: { packet: Buffer; catalogSha256: string;
+    toolNames: Readonly<Record<string, string>> }): Promise<void> {
+    const factory = this.options.replaceHost
+    requireRelay(typeof factory === 'function' && this.launchStage === 'launched' && !this.needsReattach &&
+      !this.userSeen && (this.phase === 'admitting' || this.phase === 'running') && !this.revoked)
+    const epoch = ++this.hostEpoch
+    const previous = this.hostPort
+    // `start()` only schedules the launch role: the node writes this round's LIFECYCLE.json inside
+    // that role (cc5-host-controller launch_locked), and host.py prints READY after it. A stop
+    // before READY therefore has no lifecycle record to prove absence against, so the replacement
+    // waits for this launch's own confirmation instead of failing the first turn. The user frame
+    // and tool pump stay held until the catalog is verified (cc5StdioBridge toolsVerified).
+    const launched = this.hostConfirmed
+    this.profile = profile
+    this.profileEpoch++
+    this.launchStage = 'preparing'
+    const replacement = (async () => {
+      requireRelay(launched !== undefined)
+      await launched
+      requireRelay(!this.revoked && epoch === this.hostEpoch)
+      // Independent absence proof for the wrongly launched session before a second one exists.
+      await previous.stop()
+      requireRelay(!this.revoked && epoch === this.hostEpoch)
+      const next = factory!()
+      this.hostPort = next
+      for (;;) {
+        const prepared = await this.prepareLane(next, true)
+        requireRelay(!this.revoked && epoch === this.hostEpoch)
+        if (prepared !== this.profileEpoch) continue
+        this.launchStage = 'launched'
+        const host = next.start()
+        this.host = host
+        this.hostConfirmed = host.ready
+        this.bindHostStreams(host, epoch)
+        break
+      }
+    })()
+    // Published before the old host can reject: a stream waiting on it waits for the replacement.
+    // The registering bridge only waits for the launch; streams and admission wait for READY.
+    this.hostReady = replacement.then(async () => {
+      await this.host!.ready
+      requireRelay(!this.revoked && epoch === this.hostEpoch)
+    })
+    void this.hostReady.catch(() => {
+      if (epoch === this.hostEpoch) void this.stop().catch(() => {})
+    })
+    return replacement
   }
 
   private publishOutput(bytes: Buffer): void {
@@ -615,15 +759,24 @@ export class Cc5Relay {
         /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(body.lifecycleId))
       const profile = body.profile === undefined ? undefined : sessionProfile(body.profile)
       requireRelay(profile || !this.hostPort.configure)
+      requireRelay(body.relaunch === undefined || (body.relaunch === true && profile !== undefined))
       const isInitial = !this.lifecycleId
       this.lifecycleId = body.lifecycleId
+      let replaced = false
       if (profile && !this.launchAttempted) this.profile = profile
+      else if (body.relaunch === true) {
+        // A replacement keeps the same lifecycle id; its registration is already journaled.
+        replaced = true
+        if (profile && profile.catalogSha256 !== this.profile?.catalogSha256) await this.adoptLaneProfile(profile)
+      }
       this.localStopped = false
-      this.record(
-        isInitial ? 'local-registered.json' : `local-registered-${this.lifecycleId}.json`,
-        { lifecycleId: this.lifecycleId },
-        this.journalRoot,
-      )
+      if (!replaced) {
+        this.record(
+          isInitial ? 'local-registered.json' : `local-registered-${this.lifecycleId}.json`,
+          { lifecycleId: this.lifecycleId },
+          this.journalRoot,
+        )
+      }
       reply(res, { ok: true, lifecycleId: this.lifecycleId, toolNames: this.profile?.toolNames ?? null })
     } else if (req.url === '/tool/stopped') {
       requireRelay(this.lifecycleId && body.lifecycleId === this.lifecycleId && body.localStopped === true)
@@ -682,7 +835,7 @@ export class Cc5Relay {
         this.effectBarrier = this.financeTurn.beforeHostStart()
         await this.effectBarrier
         // A first launch waits for the bridge's catalog: its /session/open starts the host.
-        if (!this.hostPort.configure || this.profile || this.launchAttempted || this.needsReattach) await this.ensureHost()
+        if (!this.hostPort.configure || this.profile || this.launchAttempted || this.needsReattach) await this.waitForHost()
         this.verify(body.authority, body.lease)
         requireRelay(!this.revoked)
         this.phase = 'running'
@@ -843,7 +996,7 @@ export class Cc5Relay {
                   prevStream.end()
                 } catch {}
               }
-              await this.ensureHost()
+              await this.waitForHost()
               if (myGeneration !== this.streamGeneration || this.stream !== res) return
               res.writeHead(200, {
                 'x-cc5-interactive-ready': '1',
