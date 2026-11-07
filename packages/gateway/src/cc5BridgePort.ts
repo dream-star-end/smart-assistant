@@ -211,7 +211,7 @@ export interface Cc5BridgePort {
   readonly bindingId: string
   readonly executionBackend: Cc5ExecutionBackend
   readonly canonicalModel: string
-  prepare(input?: { cwd: string }): Promise<SpawnOpts>
+  prepare(input?: { cwd: string; laneProfile?: string; env?: Record<string, string> }): Promise<SpawnOpts>
   admit(input: { authority: TurnModelAuthority; turnKey: string; model: string }): Promise<void>
   renew(leaseEnvelope: string): Promise<void>
   interrupt?(): Promise<void>
@@ -330,7 +330,7 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     this.active = false
     this.admitting = false
   }
-  async prepare(input?: { cwd: string }): Promise<SpawnOpts> {
+  async prepare(input?: { cwd: string; laneProfile?: string; env?: Record<string, string> }): Promise<SpawnOpts> {
     await this.refresh()
     requireCc5(!this.closed && this.effectiveExpiresAt() > Date.now())
     const entry = fileURLToPath(new URL('../dist/cc5StdioBridge.js', import.meta.url))
@@ -344,10 +344,11 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
     }
     return {
       command: process.execPath,
-      args: ['--conditions=openclaude-precompiled', entry, this.sessionKey, this.binding.operationId],
+      args: ['--conditions=openclaude-precompiled', entry, this.sessionKey, this.binding.operationId,
+        ...(input?.laneProfile ? [input.laneProfile] : [])],
       ccbBinaryDir: dirname(entry),
       subprocessCwd: cwd,
-      env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' },
+      env: input?.env ? { LANG: 'C.UTF-8', ...input.env } : { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' },
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     }

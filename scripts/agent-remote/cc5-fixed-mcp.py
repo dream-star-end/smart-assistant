@@ -18,8 +18,12 @@ MAX_FRAME = 8 * 1024 * 1024
 MAX_REPLY = 163840
 # Must stay equal to the gateway's CC5_TOOL_RESULT_MAX_BYTES (128 KiB).
 MAX_RESULT = 131072
-SAFE_INTEGER = 2**53 - 1
-TOOLS = ('Read', 'Edit', 'Bash')
+# A full tool set runs long commands and waits on user prompts; the container bounds a call at 11 minutes.
+TOOL_TIMEOUT = 720
+MAX_ARGUMENTS = 98304
+# Arguments plus both ids plus framing, as the socket admits them.
+MAX_BODY = MAX_ARGUMENTS + 65536 + 4096
+MAX_CATALOG = 1024 * 1024
 # Same task-root contract as the controller: a task directory directly in this node account's home.
 ROOT = re.compile(re.escape(str(Path.home())) + r"/oc-agentremote-[a-z0-9][a-z0-9-]{14,59}\Z")
 UUID = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z")
@@ -46,6 +50,22 @@ def failure(ident, code, message):
     emit({"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": message}})
 
 
+def read_private(parent, name, limit):
+    fd = os.open(parent / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077 or not 0 < info.st_size <= limit):
+            raise ValueError("file-mode")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            data = source.read(limit + 1)
+        if len(data) != info.st_size:
+            raise ValueError("file-changed")
+        return data
+    finally:
+        os.close(fd)
+
+
 def read_config(root):
     if not ROOT.fullmatch(str(root)):
         raise ValueError("root")
@@ -56,22 +76,43 @@ def read_config(root):
     info = parent.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("profile-mode")
-    fd = os.open(parent / "client.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_nlink != 1 or info.st_mode & 0o077 or not 0 < info.st_size <= 4096):
-            raise ValueError("config-mode")
-        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as source:
-            config = strict_json(source.read(4097))
-    finally:
-        os.close(fd)
+    config = strict_json(read_private(parent, "client.json", 4096).decode("utf-8"))
     if (not isinstance(config, dict) or set(config) != {"version", "operationId", "runId"}
             or type(config["version"]) is not int or config["version"] != 2 or not isinstance(config["operationId"], str)
             or not UUID.fullmatch(config["operationId"]) or not isinstance(config["runId"], str)
             or not UUID.fullmatch(config["runId"])):
         raise ValueError("config-shape")
     return config
+
+
+def read_catalog(root):
+    """The lane's catalog, whose exact bytes are pinned by the installed SESSION.json."""
+    directory = root / "session"
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("session-mode")
+    manifest = strict_json(read_private(directory, "SESSION.json", 4096).decode("utf-8"))
+    if (not isinstance(manifest, dict)
+            or set(manifest) != {"version", "task", "root", "catalogSha256", "promptSha256"}
+            or type(manifest["version"]) is not int or manifest["version"] != 1
+            or manifest["root"] != str(root) or not isinstance(manifest["task"], str)
+            or not isinstance(manifest["catalogSha256"], str) or not isinstance(manifest["promptSha256"], str)):
+        raise ValueError("session-shape")
+    data = read_private(directory, "catalog.json", MAX_CATALOG)
+    if hashlib.sha256(data).hexdigest() != manifest["catalogSha256"]:
+        raise ValueError("catalog-hash")
+    catalog = strict_json(data.decode("utf-8"))
+    if (not isinstance(catalog, dict) or set(catalog) != {"tools"}
+            or not isinstance(catalog["tools"], list) or not 1 <= len(catalog["tools"]) <= 128):
+        raise ValueError("catalog-shape")
+    names = set()
+    for tool in catalog["tools"]:
+        if (not isinstance(tool, dict) or set(tool) != {"name", "description", "inputSchema"}
+                or not isinstance(tool["name"], str) or not tool["name"] or tool["name"] in names
+                or not isinstance(tool["description"], str) or not isinstance(tool["inputSchema"], dict)):
+            raise ValueError("catalog-shape")
+        names.add(tool["name"])
+    return catalog
 
 
 def valid_strings(value):
@@ -86,32 +127,74 @@ def valid_strings(value):
             valid_strings(item)
 
 
+SAFE_INTEGER = 2**53 - 1
+
+
+def js_number(value):
+    """ECMAScript Number::toString, the form the master hashes; Python repr has the same shortest digits."""
+    if type(value) is int:
+        if abs(value) > SAFE_INTEGER:
+            raise ValueError('unsafe-integer')
+        return str(value)
+    if value != value or value in (float('inf'), float('-inf')):
+        raise ValueError('non-finite')
+    if value.is_integer() and abs(value) > SAFE_INTEGER:
+        raise ValueError('unsafe-integer')  # The master cannot tell 1e21 from an integer and rejects both.
+    if value == 0:
+        return '0'
+    text = repr(value)
+    sign = '-' if text.startswith('-') else ''
+    mantissa, _, exponent = text.lstrip('-').partition('e')
+    whole, _, fraction = mantissa.partition('.')
+    raw = whole + fraction
+    lead = len(raw) - len(raw.lstrip('0'))
+    digits = raw.lstrip('0').rstrip('0')
+    n = len(whole) - lead + int(exponent or 0)
+    k = len(digits)
+    if k <= n <= 21:
+        body = digits + '0' * (n - k)
+    elif 0 < n <= 21:
+        body = digits[:n] + '.' + digits[n:]
+    elif -6 < n <= 0:
+        body = '0.' + '0' * -n + digits
+    else:
+        e = n - 1
+        body = (digits[0] + ('.' + digits[1:] if k > 1 else '') + 'e' + ('+' if e >= 0 else '-') + str(abs(e)))
+    return sign + body
+
+
+def canonical_text(value):
+    if value is None:
+        return 'null'
+    if value is True or value is False:
+        return 'true' if value else 'false'
+    if isinstance(value, (int, float)):
+        return js_number(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return '[' + ','.join(canonical_text(item) for item in value) + ']'
+    if isinstance(value, dict):
+        # str order is code point order, which equals the master's UTF-8 byte order.
+        return '{' + ','.join(json.dumps(key, ensure_ascii=False) + ':' + canonical_text(value[key])
+                              for key in sorted(value)) + '}'
+    raise ValueError('not-json')
+
+
 def canonical(value):
+    """The wire's canonical JSON, shared with the master (packages/gateway/src/cc5NativeTool.ts)."""
     valid_strings(value)
-    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+    return canonical_text(value).encode('utf-8')
 
 
-def tool_arguments(name, args):
-    if name not in TOOLS or not isinstance(args, dict):
+def tool_arguments(catalog, name, args):
+    if (not isinstance(name, str) or not isinstance(args, dict)
+            or name not in {tool["name"] for tool in catalog["tools"]}):
         raise ValueError('invalid-tool')
-    required, optional = {
-        'Read': ({'file_path'}, {'offset', 'limit'}),
-        'Edit': ({'file_path', 'old_string', 'new_string'}, {'replace_all'}),
-        'Bash': ({'command'}, {'description', 'timeout'}),
-    }[name]
-    if not required <= set(args) or not set(args) <= required | optional:
+    body = canonical(args)  # Recursive sort_keys; the master hashes the same form.
+    if len(body) > MAX_ARGUMENTS:
         raise ValueError('invalid-tool')
-    for key, value in args.items():
-        if key in ('offset', 'limit', 'timeout'):
-            maximum = 30000 if key == 'timeout' else SAFE_INTEGER
-            if type(value) is not int or not 1 <= value <= maximum:
-                raise ValueError('invalid-tool')
-        elif key == 'replace_all':
-            if type(value) is not bool:
-                raise ValueError('invalid-tool')
-        elif not isinstance(value, str) or ('\x00' in value) or (key in ('file_path', 'command') and not value):
-            raise ValueError('invalid-tool')
-    return hashlib.sha256(canonical(args)).hexdigest()
+    return hashlib.sha256(body).hexdigest()
 
 
 def validate_response(value, config, ident, tool_id, name, input_hash):
@@ -132,12 +215,12 @@ def validate_response(value, config, ident, tool_id, name, input_hash):
     return result
 
 
-def call_tool(root, config, ident, params):
+def call_tool(root, config, catalog, ident, params):
     args = params.get("arguments")
     meta = params.get("_meta")
     tool_id = meta.get("claudecode/toolUseId") if isinstance(meta, dict) else None
     name = params.get('name')
-    input_hash = tool_arguments(name, args)
+    input_hash = tool_arguments(catalog, name, args)
     if (not isinstance(tool_id, str) or not 0 < len(tool_id.encode("utf-8", errors='strict')) <= 65536
             or ident == tool_id):
         raise ValueError("invalid-tool")
@@ -149,11 +232,11 @@ def call_tool(root, config, ident, params):
                        "rpcId": ident, "toolUseId": tool_id,
                        "name": 'mcp__ocbridge__' + name, "arguments": args, 'inputSha256': input_hash},
                       ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    if len(body) > 131072:
+    if len(body) > MAX_BODY:
         raise ValueError('invalid-tool')
-    connection = http.client.HTTPConnection("localhost", timeout=45)
+    connection = http.client.HTTPConnection("localhost", timeout=TOOL_TIMEOUT)
     connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.sock.settimeout(45)
+    connection.sock.settimeout(TOOL_TIMEOUT)
     try:
         connection.sock.connect(str(path))
         # This connection only uses AF_UNIX. No proxy, DNS, TCP or retries.
@@ -174,6 +257,7 @@ def main():
         return 126
     root = Path(sys.argv[1])
     config = read_config(root)
+    catalog = read_catalog(root)
     seen = set()
     seen_tools = set()
     while True:
@@ -213,34 +297,27 @@ def main():
         elif method == "ping":
             emit({"jsonrpc": "2.0", "id": ident, "result": {}})
         elif method == "tools/list":
-            properties = {
-                'Read': {'file_path': {'type': 'string', 'minLength': 1}, 'offset': {'type': 'integer', 'minimum': 1, 'maximum': SAFE_INTEGER}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': SAFE_INTEGER}},
-                'Edit': {'file_path': {'type': 'string', 'minLength': 1}, 'old_string': {'type': 'string'}, 'new_string': {'type': 'string'}, 'replace_all': {'type': 'boolean'}},
-                'Bash': {'command': {'type': 'string', 'minLength': 1}, 'description': {'type': 'string'}, 'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 30000}},
-            }
-            required = {'Read': ['file_path'], 'Edit': ['file_path', 'old_string', 'new_string'], 'Bash': ['command']}
             emit({'jsonrpc': '2.0', 'id': ident, 'result': {'tools': [
-                {'name': name, 'description': name + ' in the authorized personal execution container.',
-                 'inputSchema': {'type': 'object', 'properties': properties[name], 'required': required[name], 'additionalProperties': False}}
-                for name in TOOLS]}})
+                {'name': tool['name'], 'description': tool['description'],
+                 'inputSchema': tool['inputSchema']} for tool in catalog['tools']]}})
         elif method == "tools/call":
             params = request.get("params")
             if not isinstance(params, dict):
                 failure(ident, -32602, "Invalid tool call")
                 continue
             try:
-                tool_arguments(params.get('name'), params.get('arguments'))
+                tool_arguments(catalog, params.get('name'), params.get('arguments'))
                 meta = params.get('_meta')
                 tool_id = meta.get('claudecode/toolUseId') if isinstance(meta, dict) else None
                 if (not isinstance(tool_id, str) or not 0 < len(tool_id.encode('utf-8', errors='strict')) <= 65536
                         or ident == tool_id or tool_id in seen_tools):
                     raise ValueError('invalid-tool')
-            except (ValueError, UnicodeError):
+            except (ValueError, UnicodeError, RecursionError):
                 failure(ident, -32602, 'Invalid or repeated tool call')
                 continue
             seen_tools.add(tool_id)
             try:
-                result = call_tool(root, config, ident, params)
+                result = call_tool(root, config, catalog, ident, params)
                 emit({"jsonrpc": "2.0", "id": ident, "result": result})
             except (ValueError, OSError, http.client.HTTPException, RecursionError, UnicodeError):
                 failure(ident, -32000, "Tool delivery unknown; worker stopped; never retry")

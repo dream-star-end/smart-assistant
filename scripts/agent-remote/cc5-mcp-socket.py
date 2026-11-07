@@ -17,8 +17,8 @@ import struct
 import sys
 import types
 
-PINNED_MCP_SHA = '34f7f5f412639f6d095198b5e2169974f833679cbef19c41e80d40951c567055'
-MAX_BODY = 131072
+PINNED_MCP_SHA = '62711d60956dd3f60275e57612e62ba1cba6775f75cb40fcb82fb8009d6ebbee'
+MAX_BODY = 98304 + 65536 + 4096
 MAX_FRAME = 262144
 
 
@@ -102,13 +102,18 @@ def run(root, client, source, sink):
                 client.valid_strings(body)
                 require(isinstance(body, dict) and set(body) == {'runId', 'operationId', 'rpcId', 'toolUseId', 'name', 'arguments', 'inputSha256'})
                 ident = body['rpcId']
+                # This helper starts before the lane's catalog is installed (tool-socket precedes
+                # session-profile), so the catalog is read per request rather than at startup.
+                catalog = client.read_catalog(root)
+                allowed = {'mcp__ocbridge__' + tool['name'] for tool in catalog['tools']}
                 require(body['runId'] == config['runId'] and body['operationId'] == config['operationId']
-                        and body['name'] in tuple('mcp__ocbridge__' + name for name in client.TOOLS)
+                        and body['name'] in allowed
                         and type(ident) in (str, int) and (not isinstance(ident, str) or 0 < len(ident) <= 256)
                         and (not isinstance(ident, int) or abs(ident) <= 2**53 - 1)
                         and isinstance(body['toolUseId'], str) and 0 < len(body['toolUseId'].encode()) <= 65536
                         and ident != body['toolUseId'])
-                input_hash = client.tool_arguments(body['name'].removeprefix('mcp__ocbridge__'), body['arguments'])
+                input_hash = client.tool_arguments(catalog, body['name'].removeprefix('mcp__ocbridge__'),
+                                                  body['arguments'])
                 require(body['inputSha256'] == input_hash and (type(ident), ident) not in seen_rpc)
                 key = hashlib.sha256(body['toolUseId'].encode('utf-8', errors='strict')).hexdigest()
                 require(not (attempts / (key + '.attempt.json')).exists() and sequence < 10000)
@@ -178,7 +183,7 @@ def run(root, client, source, sink):
             try:
                 _pid, uid, _gid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
                 require(uid == os.getuid())
-                connection.settimeout(45)
+                connection.settimeout(720)  # Same bound as cc5-fixed-mcp.py TOOL_TIMEOUT.
                 Handler(connection, ('local-unix', 0), None)
             finally:
                 connection.close()

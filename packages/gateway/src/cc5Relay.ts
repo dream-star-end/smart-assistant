@@ -28,13 +28,16 @@ import { CC5_BRIDGE_MAX_FRAME_BYTES, type Cc5BridgeBinding, assertCc5BindingScop
 import type { Cc5FinancePort, Cc5FinanceTurn, Cc5NativeTerminalReceipt } from './cc5Finance.js'
 import { Cc5NativeUsageObserver } from './cc5NativeUsage.js'
 import { CC5_TOOL_RECEIPT_MAX_BYTES, type Cc5ToolReceipt, assertCc5ToolResult, boundCc5ToolResult,
-  cc5ToolInputSha256, cc5ToolScopeHash, validateCc5NativeToolInput } from './cc5NativeTool.js'
+  cc5ToolInputSha256, cc5ToolScopeHash, validateCc5NativeToolInput, CC5_NATIVE_TOOL_NAME } from './cc5NativeTool.js'
+import { CC5_PROMPT_MAX_BYTES } from './cc5ToolCatalog.js'
 import { Cc5ToolObservation } from './cc5ToolObservation.js'
 import type { Cc5ToolDelivery } from './cc5ToolPump.js'
 
 export interface Cc5InteractiveHostPort {
   /** Must launch the pinned original host once; only its original READY resolves ready. */
   start(): { stdin: Writable; stdout: Readable; ready: Promise<void> }
+  /** Production hosts take the lane's session profile (tool catalog + prompt) before their one launch. */
+  configure?(packet: Buffer): Promise<void>
   /** Reattach to an already-launched live remote session without re-running one-shot launch. */
   attach?(): { stdin: Writable; stdout: Readable; ready: Promise<void> }
   /** Independent identity-checked remote stop and absence proof, including failed startup. */
@@ -45,6 +48,26 @@ type PendingTool = { delivery: Cc5ToolDelivery; response: ServerResponse; delive
   receipt?: Cc5ToolReceipt; acknowledged: boolean; ack?: Promise<void> }
 function requireRelay(ok: unknown): asserts ok {
   if (!ok) throw new Error('CC5_RELAY_REJECTED')
+}
+/** The bridge's lane profile, re-checked here and shipped byte-exact to the node controller. */
+function sessionProfile(value: unknown): { packet: Buffer; toolNames: Readonly<Record<string, string>> } {
+  const profile = value as { catalog?: unknown; catalogSha256?: unknown; prompt?: unknown; toolNames?: unknown }
+  requireRelay(profile && typeof profile === 'object' && !Array.isArray(profile) &&
+    Object.keys(profile).sort().join(',') === 'catalog,catalogSha256,prompt,toolNames' &&
+    typeof profile.catalog === 'string' && Buffer.byteLength(profile.catalog) <= 1048576 &&
+    profile.catalogSha256 === sha(profile.catalog) &&
+    typeof profile.prompt === 'string' && Buffer.byteLength(profile.prompt) <= CC5_PROMPT_MAX_BYTES &&
+    profile.toolNames && typeof profile.toolNames === 'object' && !Array.isArray(profile.toolNames))
+  const tools = (JSON.parse(profile.catalog) as { tools?: Array<{ name?: unknown }> }).tools
+  const toolNames = profile.toolNames as Record<string, unknown>
+  requireRelay(Array.isArray(tools) && tools.length >= 1 && tools.length <= 128 &&
+    Object.keys(toolNames).length === tools.length &&
+    tools.every((tool) => typeof tool?.name === 'string' && Object.hasOwn(toolNames, `mcp__ocbridge__${tool.name}`) &&
+      CC5_NATIVE_TOOL_NAME.test(`mcp__ocbridge__${tool.name}`)) &&
+    Object.values(toolNames).every((name) => typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(name)))
+  const packet = Buffer.from(JSON.stringify({ version: 1, catalog: profile.catalog,
+    catalogSha256: profile.catalogSha256, prompt: profile.prompt }))
+  return { packet, toolNames: Object.freeze({ ...toolNames }) as Readonly<Record<string, string>> }
 }
 function sha(bytes: string | Buffer): string {
   return createHash('sha256').update(bytes).digest('hex')
@@ -113,6 +136,8 @@ export class Cc5Relay {
   private readonly toolQueue: PendingTool[] = []
   private waitingTools = 0
   private lifecycleId?: string
+  /** The catalog the remote CLI is launched with; fixed for the lane once launch is attempted. */
+  private profile?: { packet: Buffer; toolNames: Readonly<Record<string, string>> }
   private localStopped = false
   private readonly localEvents = new EventEmitter()
   private output: Buffer[] = []
@@ -462,8 +487,10 @@ export class Cc5Relay {
     }
     // Publish the joining promise BEFORE invoking start, even if start throws after spawning.
     this.hostReady = Promise.resolve().then(async () => {
-      requireRelay(!this.revoked && this.admitted && this.financeTurn)
+      requireRelay(!this.revoked && this.admitted && this.financeTurn && (this.profile || !this.hostPort.configure))
       this.launchAttempted = true
+      if (this.hostPort.configure) await this.hostPort.configure(this.profile!.packet)
+      requireRelay(!this.revoked)
       this.host = this.hostPort.start()
       this.bindHostStreams(this.host)
       await this.host.ready
@@ -571,7 +598,8 @@ export class Cc5Relay {
     requireRelay(req.method === 'POST')
     if (req.url === '/session/open') return this.open(req, res)
     // A receipt carries one bounded tool result plus its identifiers and scope.
-    const body = await jsonBody(req, req.url === '/tool/result' ? CC5_TOOL_RECEIPT_MAX_BYTES : 131072)
+    const body = await jsonBody(req, req.url === '/tool/result' ? CC5_TOOL_RECEIPT_MAX_BYTES
+      : req.url === '/tool/register' ? 4 * 1024 * 1024 : 131072)
     this.scope(body, req.url === '/stop' || req.url === '/tool/stopped')
     if (req.url === '/stop') {
       reply(res, { ok: true, ...(await this.stop()) })
@@ -585,15 +613,18 @@ export class Cc5Relay {
     if (req.url === '/tool/register') {
       requireRelay((!this.lifecycleId || body.replace === true) && typeof body.lifecycleId === 'string' &&
         /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(body.lifecycleId))
+      const profile = body.profile === undefined ? undefined : sessionProfile(body.profile)
+      requireRelay(profile || !this.hostPort.configure)
       const isInitial = !this.lifecycleId
       this.lifecycleId = body.lifecycleId
+      if (profile && !this.launchAttempted) this.profile = profile
       this.localStopped = false
       this.record(
         isInitial ? 'local-registered.json' : `local-registered-${this.lifecycleId}.json`,
         { lifecycleId: this.lifecycleId },
         this.journalRoot,
       )
-      reply(res, { ok: true, lifecycleId: this.lifecycleId })
+      reply(res, { ok: true, lifecycleId: this.lifecycleId, toolNames: this.profile?.toolNames ?? null })
     } else if (req.url === '/tool/stopped') {
       requireRelay(this.lifecycleId && body.lifecycleId === this.lifecycleId && body.localStopped === true)
       if (!this.localStopped) {
@@ -650,7 +681,8 @@ export class Cc5Relay {
         // The per-turn marker also fences reuse of an already-running native worker.
         this.effectBarrier = this.financeTurn.beforeHostStart()
         await this.effectBarrier
-        await this.ensureHost()
+        // A first launch waits for the bridge's catalog: its /session/open starts the host.
+        if (!this.hostPort.configure || this.profile || this.launchAttempted || this.needsReattach) await this.ensureHost()
         this.verify(body.authority, body.lease)
         requireRelay(!this.revoked)
         this.phase = 'running'
@@ -965,6 +997,7 @@ export class Cc5Relay {
     const admitted = this.admitted
     this.verify(admitted.authority, admitted.lease, true)
     validateCc5NativeToolInput(body.name, body.arguments)
+    requireRelay(!this.profile || Object.hasOwn(this.profile.toolNames, body.name))
     const inputSha256 = cc5ToolInputSha256(body.arguments)
     const rpcKey = `${typeof body.rpcId}:${body.rpcId}`
     requireRelay(body.inputSha256 === inputSha256 && !this.usedRpcIds.has(rpcKey) &&

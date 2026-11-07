@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import threading
 from pathlib import Path
@@ -31,7 +32,33 @@ def packet():
             'socketScript': base64.b64encode(Path(__file__).with_name('cc5-mcp-socket.py').read_bytes()).decode()}
 
 
+def stat_mode(path):
+    return path.stat().st_mode & 0o777
+
+
+def tool(name='t0', description='ok', schema=None):
+    return {'name': name, 'description': description,
+            'inputSchema': {'type': 'object'} if schema is None else schema}
+
+
+def catalog(tools=None):
+    return json.dumps({'tools': [tool('t0', 'Read in the personal container.'),
+                                 tool('tool_two', 'Nested arguments.')] if tools is None else tools})
+
+
+def session_packet(text=None, prompt='Platform lane system prompt.\n'):
+    text = catalog() if text is None else text
+    return {'version': 1, 'catalog': text, 'catalogSha256': mod.sha(text.encode()), 'prompt': prompt}
+
+
 class ProfileTests(unittest.TestCase):
+    def install_session(self, root, data=None):
+        with patch.object(mod.sys, 'stdin', SimpleNamespace(
+                buffer=io.BytesIO(json.dumps(data or session_packet()).encode()))), \
+                redirect_stdout(io.StringIO()) as out:
+            mod.session_profile(root)
+        return json.loads(out.getvalue())
+
     def installed(self, root):
         info = {'session': 'synthetic-task', 'cwd': str(root / 'work')}
         (root / 'work').mkdir(mode=0o700)
@@ -44,6 +71,7 @@ class ProfileTests(unittest.TestCase):
         stack.enter_context(patch.object(mod.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(json.dumps(packet()).encode()))))
         with redirect_stdout(io.StringIO()):
             mod.install_profile(root)
+        self.install_session(root)
         return info
 
     def test_real_profile_files_pin_the_sole_mcp_and_preserve_empty_cli_arguments(self):
@@ -61,8 +89,95 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(args[args.index('--tools') + 1], '')
             self.assertEqual(args[args.index('--setting-sources') + 1], '')
             self.assertIn('--strict-mcp-config', args)
-            self.assertEqual(args[-2:], ['--allowedTools', 'mcp__ocbridge__Read,mcp__ocbridge__Edit,mcp__ocbridge__Bash'])
+            # The catalog, in catalog order, decides which tools the model may call at all.
+            self.assertEqual(args[args.index('--allowedTools') + 1], 'mcp__ocbridge__t0,mcp__ocbridge__tool_two')
+            self.assertEqual(args[args.index('--append-system-prompt-file') + 1], str(root / 'session/prompt.md'))
             self.assertTrue(all((p.stat().st_mode & 0o777) == 0o400 for p in (root / 'cprofile').iterdir()))
+
+    def test_session_profile_writes_exact_bytes_and_modes_and_replaces_a_previous_lane(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.installed(root)
+            directory = root / 'session'
+            text = catalog()
+            self.assertEqual(stat_mode(directory), 0o700)
+            self.assertEqual((directory / 'catalog.json').read_bytes(), text.encode())
+            self.assertEqual((directory / 'prompt.md').read_bytes(), b'Platform lane system prompt.\n')
+            self.assertTrue(all(stat_mode(directory / name) == 0o400
+                                for name in ('catalog.json', 'prompt.md', 'SESSION.json')))
+            self.assertEqual(json.loads((directory / 'SESSION.json').read_bytes()),
+                             {'version': 1, 'task': mod.TASK, 'root': str(root),
+                              'catalogSha256': mod.sha(text.encode()),
+                              'promptSha256': mod.sha(b'Platform lane system prompt.\n')})
+            self.assertEqual([item['name'] for item in mod.check_session(root)['tools']], ['t0', 'tool_two'])
+            # A new lane's complete staging directory replaces the old one in one rename.
+            changed = catalog([tool('t7', 'only tool')])
+            printed = self.install_session(root, session_packet(changed, 'second prompt'))
+            self.assertEqual(printed, {'kind': 'session-profile-installed', 'root': str(root),
+                'catalogSha256': mod.sha(changed.encode()),
+                'promptSha256': mod.sha(b'second prompt'), 'tools': 1})
+            self.assertEqual((directory / 'catalog.json').read_bytes(), changed.encode())
+            self.assertEqual((directory / 'prompt.md').read_bytes(), b'second prompt')
+            self.assertEqual([item['name'] for item in mod.check_session(root)['tools']], ['t7'])
+            self.assertEqual({path.name for path in directory.iterdir()},
+                             {'catalog.json', 'prompt.md', 'SESSION.json'})
+            self.assertFalse((root / 'session.partial').exists())
+
+    def test_session_profile_rejects_bad_catalog_prompt_or_live_runtime_before_any_write(self):
+        base = session_packet()
+        cases = {
+            'bad-sha': {**base, 'catalogSha256': '0' * 64},
+            'duplicate-name': session_packet(catalog([tool('t0'), tool('t0')])),
+            'bad-name': session_packet(catalog([tool('bad name!')])),
+            'long-name': session_packet(catalog([tool('x' * 49)])),
+            'empty-name': session_packet(catalog([tool('')])),
+            'no-tools': session_packet(catalog([])),
+            'too-many-tools': session_packet(catalog([tool('t%d' % index) for index in range(129)])),
+            'duplicate-json-key': session_packet('{"tools":[],"tools":[]}'),
+            'extra-catalog-key': session_packet('{"tools":[%s],"other":1}' % json.dumps(tool())),
+            'extra-tool-key': session_packet(catalog([{**tool(), 'extra': True}])),
+            'schema-not-object': session_packet(catalog([tool(schema={'type': 'array'})])),
+            'schema-not-dict': session_packet(catalog([tool(schema=[])])),
+            'long-description': session_packet(catalog([tool(description='x' * (20 * 1024 + 1))])),
+            'catalog-too-large': session_packet(catalog([tool('t%d' % index, 'x' * (19 * 1024))
+                                                         for index in range(64)])),
+            'prompt-too-large': session_packet(prompt='x' * (256 * 1024 + 1)),
+            'prompt-nul': session_packet(prompt='a\x00b'),
+            'prompt-not-string': session_packet(prompt=5),
+            'catalog-not-string': {**base, 'catalog': 5},
+            'packet-extra-key': {**base, 'extra': 1},
+            'packet-version': {**base, 'version': 2},
+            'runtime': base,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.installed(root)
+            directory = root / 'session'
+            before = {path.name: path.read_bytes() for path in directory.iterdir()}
+            for case, data in cases.items():
+                with self.subTest(case=case):
+                    if case == 'runtime':
+                        (root / 'run').mkdir()
+                    try:
+                        with self.assertRaises(RuntimeError):
+                            self.install_session(root, data)
+                    finally:
+                        if (root / 'run').exists():
+                            (root / 'run').rmdir()
+                    self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+                    self.assertFalse((root / 'session.partial').exists())
+
+    def test_launch_without_an_installed_session_fails_before_exec(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            info['pluginDigest'] = 'fixture'
+            files = {'mod/oc-bridge/' + name: b'fixture' for name in mod.PLUGIN}
+            shutil.rmtree(root / 'session')
+            with patch.object(mod, 'check_sources', lambda *_: files), patch.object(mod.os, 'execve') as execute:
+                with self.assertRaisesRegex(RuntimeError, 'missing-session-profile'):
+                    mod.launch(root, 'claude-sonnet-5')
+                execute.assert_not_called()
 
     def test_task_root_belongs_to_the_target_account_home(self):
         home = Path.home()
@@ -114,6 +229,8 @@ class ProfileTests(unittest.TestCase):
                 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')}, {
                 'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1', 'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0',
                 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'})
+            # Same MCP output ceiling as the Box path.
+            self.assertEqual(environment['MAX_MCP_OUTPUT_TOKENS'], '4000000')
             # A real chat keeps the CLI's native retries and output limit; the inherited value is dropped too.
             self.assertNotIn('CLAUDE_CODE_MAX_RETRIES', environment)
             self.assertNotIn('CLAUDE_CODE_MAX_OUTPUT_TOKENS', environment)
@@ -576,6 +693,7 @@ m.launch(r,'claude-sonnet-5')
             self.assertNotIn('cliFileIdentity', info)
             mod.check_sources(root, info)
             self.assertEqual(mod.check_profile(root)['operationId'], packet['profile']['operationId'])
+            self.install_session(root)  # The master ships this right before its launch.
             args = mod.profile_args(root, info)
             self.assertEqual(args[0], str(home / '.oc-remote-cc/claude-2.1.316'))
             (root / 'work/kept.txt').write_text('chat files stay')
@@ -602,12 +720,41 @@ m.launch(r,'claude-sonnet-5')
             with self.assertRaisesRegex(RuntimeError, 'provision-runtime-present'):
                 self.provision(root, packet)
 
+    def test_provision_replaces_a_profile_pinned_by_an_earlier_release(self):
+        # 2026-11-07 node smoke: a chat root kept the previous release's fixed MCP, so check_profile failed
+        # with wrong-pinned-mcp-source and every existing chat would have stopped provisioning after deploy.
+        with tempfile.TemporaryDirectory() as temp:
+            _home, root, packet = self.provision_fixture(Path(temp))
+            self.provision(root, packet)
+            (root / 'work/kept.txt').write_text('chat files stay')
+            old = root / 'cprofile/cc5-fixed-mcp.py'
+            old.chmod(0o600)
+            old.write_bytes(old.read_bytes() + b'\n# previous release\n')
+            old.chmod(0o400)
+            with self.assertRaisesRegex(RuntimeError, 'wrong-pinned-mcp-source'):
+                mod.check_profile(root)
+            # The previous release's socket helper record: reset must still identify and clear it.
+            manifest = mod.profile_manifest(root)
+            fd = os.open(root / 'MCP-SOCKET.json', os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump({'version': 1, 'root': str(root), 'runId': manifest['runId'],
+                           'operationId': manifest['operationId'], 'pid': 4194303, 'startTicks': '1'}, stream)
+            with redirect_stdout(io.StringIO()) as out:
+                mod.reset(root)
+            self.assertEqual(json.loads(out.getvalue())['kind'], 'task-reset')
+            self.assertFalse((root / 'MCP-SOCKET.json').exists())
+            self.provision(root, packet)
+            self.assertEqual(mod.check_profile(root)['runId'], packet['profile']['runId'])
+            self.assertEqual((root / 'work/kept.txt').read_text(), 'chat files stay')
+
     def test_reset_ends_the_left_over_round_and_reopens_even_a_never_launched_stopped_root(self):
         with tempfile.TemporaryDirectory() as temp:
             _home, root, packet = self.provision_fixture(Path(temp))
             self.provision(root, packet)
             info = mod.owner(root)
             profile = mod.check_profile(root)
+            self.install_session(root)  # A stale catalog/prompt must not survive into the next lane.
+            self.assertTrue((root / 'session').is_dir())
             mod.mark_stopping(root)  # The old lane stopped this root before it ever launched.
             # A sidecar the dead master left behind, running as the pinned socket script.
             path = root / 'cprofile/cc5-mcp-socket.py'
@@ -631,7 +778,8 @@ m.launch(r,'claude-sonnet-5')
                     mod.reset(root)
                 self.assertEqual(json.loads(out.getvalue())['kind'], 'task-reset')
                 self.assertIsNotNone(child.poll(), 'the recorded sidecar received SIGTERM and exited')
-                for name in ('LIFECYCLE.json', 'STOPPING.json', 'STOPPED.json', 'MCP-SOCKET.json', 'run', 'tool.sock'):
+                for name in ('LIFECYCLE.json', 'STOPPING.json', 'STOPPED.json', 'MCP-SOCKET.json', 'run',
+                             'tool.sock', 'session'):
                     self.assertFalse((root / name).exists(), name)
                 self.assertTrue((root / 'work').is_dir())
             finally:

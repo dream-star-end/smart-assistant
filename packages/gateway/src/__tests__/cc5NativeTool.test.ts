@@ -4,30 +4,36 @@ import test from 'node:test'
 import { CC5_TOOL_RESULT_MAX_BYTES, boundCc5ToolResult, cc5ToolResultBytes, cc5ToolInputSha256,
   validateCc5NativeToolInput } from '../cc5NativeTool.js'
 
-test('Python and Node hash the exact Unicode tool input identically regardless of key order', () => {
-  const args = { replace_all: false, new_string: '新行\n😀', file_path: '/tmp/文字.txt', old_string: 'old' }
-  validateCc5NativeToolInput('mcp__ocbridge__Edit', args)
+test('Python and Node hash the exact nested Unicode tool input identically regardless of key order', () => {
+  const args = { tool_name: 'mcp__openclaude-memory__skill_search', params: { query: '记忆 😀', filters: { z: 1, a: [{ y: true, b: null }] },
+    '10': 0.000001, '2': 1e-7, '\u{1F600}': 1, '\uFFFF': 2.5 },
+    replace_all: false, new_string: '新行\n😀' }
+  validateCc5NativeToolInput('mcp__ocbridge__ExecuteExtraTool', args)
   const child = spawnSync('python3', ['-I', '-B', '-c',
-    'import sys,json,hashlib; print(hashlib.sha256(json.dumps(json.load(sys.stdin),sort_keys=True,separators=(",",":"),ensure_ascii=False).encode("utf-8")).hexdigest())'],
+    'import sys,json,hashlib,importlib.util\nspec=importlib.util.spec_from_file_location("m",sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\nprint(hashlib.sha256(m.canonical(json.load(sys.stdin))).hexdigest())',
+    new URL('../../../../scripts/agent-remote/cc5-fixed-mcp.py', import.meta.url).pathname],
   { input: JSON.stringify(args), encoding: 'utf8', timeout: 3000 })
   assert.equal(child.status, 0)
   assert.equal(cc5ToolInputSha256(args), child.stdout.trim())
-  assert.equal(cc5ToolInputSha256(args), cc5ToolInputSha256(Object.fromEntries(Object.entries(args).reverse())))
+  const reordered = { new_string: args.new_string, replace_all: false,
+    params: { '\uFFFF': 2.5, '\u{1F600}': 1, '2': 1e-7, filters: { a: [{ b: null, y: true }], z: 1 }, query: args.params.query,
+      '10': 0.000001 }, tool_name: args.tool_name }
+  assert.equal(cc5ToolInputSha256(args), cc5ToolInputSha256(reordered))
 })
 
-test('only the three bounded foreground schemas are admitted', () => {
-  for (const [name, args] of [
-    ['mcp__ocbridge__Read', { file_path: '/tmp/a', offset: 1, limit: 10 }],
-    ['mcp__ocbridge__Edit', { file_path: '/tmp/a', old_string: '', new_string: 'x' }],
-    ['mcp__ocbridge__Bash', { command: 'pwd', timeout: 30000 }],
-  ] as const) assert.doesNotThrow(() => validateCc5NativeToolInput(name, args))
+test('any catalog alias with a bounded JSON object is admitted; the tool schema is checked where it runs', () => {
   for (const [name, args] of [
     ['mcp__ocbridge__Write', { file_path: '/tmp/a', content: 'x' }],
-    ['mcp__ocbridge__Bash', { command: 'pwd', run_in_background: true }],
-    ['mcp__ocbridge__Bash', { command: 'pwd', dangerouslyDisableSandbox: true }],
-    ['mcp__ocbridge__Bash', { command: 'pwd', timeout: 30001 }],
-    ['mcp__ocbridge__Read', { file_path: '/tmp/a', offset: 1.5 }],
-    ['mcp__ocbridge__Edit', { file_path: '/tmp/a', old_string: '\ud800', new_string: 'x' }],
+    ['mcp__ocbridge__Bash', { command: 'pwd', timeout: 600000, run_in_background: true }],
+    ['mcp__ocbridge__t7', { nested: { list: [1, 2.5, 'x'] } }],
+  ] as const) assert.doesNotThrow(() => validateCc5NativeToolInput(name, args))
+  for (const [name, args] of [
+    ['Write', { file_path: '/tmp/a' }],
+    ['mcp__other__Write', { file_path: '/tmp/a' }],
+    ['mcp__ocbridge__Bash', ['pwd']],
+    ['mcp__ocbridge__Edit', { file_path: '/tmp/a', old_string: { deep: '\ud800' }, new_string: 'x' }],
+    ['mcp__ocbridge__Read', { offset: 2 ** 53 }],
+    ['mcp__ocbridge__Write', { file_path: '/tmp/a', content: 'x'.repeat(98304) }],
   ] as const) assert.throws(() => validateCc5NativeToolInput(name, args), /CC5_NATIVE_TOOL_INPUT_INVALID/)
 })
 

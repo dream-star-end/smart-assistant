@@ -2,7 +2,10 @@
 import { createHash } from 'node:crypto'
 import type { Cc5ToolRequest } from './cc5FixedTool.js'
 
-export const CC5_NATIVE_TOOLS = ['mcp__ocbridge__Read', 'mcp__ocbridge__Edit', 'mcp__ocbridge__Bash'] as const
+/** Every remote tool is an alias in the lane's catalog (cc5ToolCatalog.ts); membership is the relay's check. */
+export const CC5_NATIVE_TOOL_NAME = /^mcp__ocbridge__(?:t[0-9]{1,3}|[A-Za-z0-9_-]{1,48})$/
+/** Same bound as the node MCP (cc5-fixed-mcp.py) applies to canonical argument bytes. */
+export const CC5_TOOL_INPUT_MAX_BYTES = 98304
 /** Single tool-result bound for both wire ends. Must equal the execution-side
  * MCP host (`claude-code-best/src/entrypoints/cc5ToolHost.ts` MAX_RESULT_BYTES)
  * and the container client (`scripts/agent-remote/cc5-fixed-mcp.py` MAX_RESULT).
@@ -38,39 +41,24 @@ export interface Cc5ToolAdmission {
 function requireInput(value: unknown): asserts value {
   if (!value) throw new Error('CC5_NATIVE_TOOL_INPUT_INVALID')
 }
-function safeText(value: unknown, empty = false): value is string {
-  return typeof value === 'string' && (empty || value.length > 0) &&
-    Buffer.byteLength(value) <= 65536 &&
-    ![...value].some((char) => { const point = char.codePointAt(0)!; return point >= 0xd800 && point <= 0xdfff })
+const LONE_SURROGATE = /\p{Surrogate}/u
+/** Values both canonical forms render identically: no lone surrogates, integers within the safe range. */
+function wellFormed(value: unknown): boolean {
+  if (typeof value === 'string') return !LONE_SURROGATE.test(value)
+  if (Array.isArray(value)) return value.every(wellFormed)
+  if (value && typeof value === 'object')
+    return Object.entries(value).every(([key, item]) => !LONE_SURROGATE.test(key) && wellFormed(item))
+  return typeof value !== 'number' || Number.isFinite(value) && (!Number.isInteger(value) || Number.isSafeInteger(value))
 }
+/** Shape only: the tool's own schema is enforced where it executes (CCB runTools). */
 export function validateCc5NativeToolInput(name: string, args: unknown): void {
-  requireInput(CC5_NATIVE_TOOLS.some((tool) => tool === name) && args && typeof args === 'object' && !Array.isArray(args))
-  const input = args as Record<string, unknown>
-  const tool = name.slice('mcp__ocbridge__'.length)
-  const allowed = tool === 'Read' ? ['file_path', 'offset', 'limit']
-    : tool === 'Edit' ? ['file_path', 'old_string', 'new_string', 'replace_all'] : ['command', 'description', 'timeout']
-  requireInput(Object.keys(input).every((key) => allowed.includes(key)))
-  if (tool === 'Bash') {
-    requireInput(safeText(input.command))
-    if (input.description !== undefined) requireInput(safeText(input.description, true))
-    if (input.timeout !== undefined) requireInput(Number.isSafeInteger(input.timeout) && (input.timeout as number) >= 1 && (input.timeout as number) <= 30000)
-  } else {
-    requireInput(safeText(input.file_path))
-    if (tool === 'Read') {
-      for (const key of ['offset', 'limit']) if (input[key] !== undefined) requireInput(Number.isSafeInteger(input[key]) && (input[key] as number) >= 1)
-    } else {
-      requireInput(safeText(input.old_string, true) && safeText(input.new_string, true))
-      if (input.replace_all !== undefined) requireInput(typeof input.replace_all === 'boolean')
-    }
-  }
-  // Shared with Python: shallow closed schemas, safe integers, sorted keys, UTF-8 strings.
-  requireInput(Buffer.byteLength(JSON.stringify(input)) <= 98304)
+  requireInput(CC5_NATIVE_TOOL_NAME.test(name) && args && typeof args === 'object' && !Array.isArray(args) &&
+    wellFormed(args) && Buffer.byteLength(cc5CanonicalJson(args)) <= CC5_TOOL_INPUT_MAX_BYTES)
 }
+/** sha256 of Python's canonical(): recursively sorted keys, compact, raw UTF-8. */
 export function cc5ToolInputSha256(args: unknown): string {
   requireInput(args && typeof args === 'object' && !Array.isArray(args))
-  return createHash('sha256').update(JSON.stringify(Object.fromEntries(
-    Object.entries(args).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
-  ))).digest('hex')
+  return createHash('sha256').update(cc5CanonicalJson(args)).digest('hex')
 }
 export function cc5ToolScopeHash(request: Cc5ToolRequest, admission: Cc5ToolAdmission): string {
   return createHash('sha256').update(JSON.stringify([
@@ -80,13 +68,18 @@ export function cc5ToolScopeHash(request: Cc5ToolRequest, admission: Cc5ToolAdmi
     admission.connectionChallenge, admission.securityEpoch,
   ])).digest('hex')
 }
-/** Python's canonical(json) form: sorted keys, compact separators, raw UTF-8. */
+/** The wire's canonical JSON, shared with cc5-fixed-mcp.py canonical(): object keys in UTF-8 byte
+ * (= code point) order, numbers in ECMAScript Number::toString form, compact, raw UTF-8 strings.
+ * JSON.stringify alone would put integer-like keys first and sort by UTF-16 units. */
 function cc5CanonicalJson(value: unknown): string {
-  return JSON.stringify(value, (_key, item) => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return item
-    const record = item as Record<string, unknown>
-    return Object.fromEntries(Object.keys(record).sort().map((key) => [key, record[key]]))
-  })
+  if (Array.isArray(value)) return `[${value.map((item) => cc5CanonicalJson(item === undefined ? null : item)).join(',')}]`
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    const keys = Object.keys(record).filter((key) => record[key] !== undefined)
+      .sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')))
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${cc5CanonicalJson(record[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
 export function cc5ToolResultBytes(value: unknown): number {
   return Buffer.byteLength(cc5CanonicalJson(value), 'utf8')

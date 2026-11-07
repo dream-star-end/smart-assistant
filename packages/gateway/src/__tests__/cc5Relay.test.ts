@@ -1,3 +1,5 @@
+import { fileURLToPath } from 'node:url'
+import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
@@ -21,6 +23,7 @@ import { type Cc5BridgeBinding, cc5ControlRequest } from '../cc5BridgePort.js'
 import type { Cc5ToolRequest } from '../cc5FixedTool.js'
 import { type Cc5ToolReceipt, cc5ToolInputSha256, cc5ToolScopeHash } from '../cc5NativeTool.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from '../cc5Relay.js'
+import { CC5_PROMPT_MAX_BYTES } from '../cc5ToolCatalog.js'
 import type { Cc5FinancePort } from '../cc5Finance.js'
 import { StreamJson } from '../../box-bridge-mod/oc-bridge/hooks/frames.js'
 
@@ -136,6 +139,7 @@ async function harness(
   f: ReturnType<typeof fixture>,
   failure: 'none' | 'start' | 'stop' = 'none',
   financeOverride?: Cc5FinancePort,
+  options: { configure?: boolean } = {},
 ) {
   const written: Buffer[] = []
   const input = new PassThrough()
@@ -155,9 +159,18 @@ async function harness(
   })
   let starts = 0
   let stops = 0
+  const configurePackets: Buffer[] = []
+  const hostEvents: string[] = []
   const port: Cc5InteractiveHostPort = {
+    ...(options.configure
+      ? { async configure(packet: Buffer) {
+        hostEvents.push('configure')
+        configurePackets.push(Buffer.from(packet))
+      } }
+      : {}),
     start() {
       starts++
+      hostEvents.push('start')
       financeEvents.push('host-start')
       started()
       if (failure === 'start') throw new Error('synthetic spawn status unknown')
@@ -225,7 +238,15 @@ async function harness(
     )
   const lifecycleId = randomUUID()
   let registered = false
-  const register = async () => { await rpc(socketPath, '/tool/register', { ...scope, lifecycleId }); registered = true }
+  const register = async (profile?: Record<string, unknown>) => {
+    const accepted = await rpc(socketPath, '/tool/register', {
+      ...scope,
+      lifecycleId,
+      ...(profile === undefined ? {} : { profile }),
+    })
+    registered = true
+    return accepted
+  }
   const stopped = () => rpc(socketPath, '/tool/stopped', { ...scope, lifecycleId, localStopped: true })
   const close = async () => {
     ready()
@@ -256,6 +277,8 @@ async function harness(
     register,
     stopped,
     lifecycleId,
+    configurePackets,
+    hostEvents,
     counts: () => ({ starts, stops }),
   }
 }
@@ -346,9 +369,9 @@ async function start(f: ReturnType<typeof fixture>, finance?: Cc5FinancePort) {
   return { h, s }
 }
 async function callTool(f: ReturnType<typeof fixture>, h: Awaited<ReturnType<typeof harness>>, id: string, rpcId: number,
-  name = f.request.name, args: unknown = f.request.arguments) {
+  name = f.request.name, args: unknown = f.request.arguments, inputSha256 = cc5ToolInputSha256(args)) {
   const remote = rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
-    rpcId, toolUseId: id, name, arguments: args, inputSha256: cc5ToolInputSha256(args) })
+    rpcId, toolUseId: id, name, arguments: args, inputSha256 })
   void remote.catch(() => {})
   h.output.write(original(f, [{ id, name, input: args }]))
   const next = await rpc(h.socketPath, '/tool/next', h.scope)
@@ -422,6 +445,32 @@ test('two serial user turns retain one native host/stream and settle distinct v2
     assert.deepEqual(receipts.map((receipt) => receipt.usage.inputTokens).sort((a, b) => a - b), [2, 7])
     assert.ok(receipts.every((receipt) => receipt.version === 2 && receipt.nativeSessionId === f.request.nativeSessionId))
   } finally { s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+/** The hash the node's MCP (cc5-fixed-mcp.py canonical) sends for these arguments. */
+function nodeInputSha256(args: unknown): string {
+  const script = fileURLToPath(new URL('../../../../scripts/agent-remote/cc5-fixed-mcp.py', import.meta.url))
+  const child = spawnSync('python3', ['-I', '-B', '-c', 'import sys,json,hashlib,importlib.util\n' +
+    'spec=importlib.util.spec_from_file_location("m",sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n' +
+    'print(hashlib.sha256(m.canonical(json.loads(sys.stdin.read()))).hexdigest())', script],
+  { input: JSON.stringify(args), encoding: 'utf8', timeout: 5000 })
+  assert.equal(child.status, 0, child.stderr)
+  return child.stdout.trim()
+}
+
+test('nested arguments hashed by the node MCP are delivered: integer-like keys, small numbers, astral keys', async () => {
+  // P4 audit r1: JSON.stringify ordered "2" before "10" and wrote 0.000001 where Python wrote 1e-06 -> 403.
+  const f = fixture(); const { h } = await start(f)
+  try {
+    let rpcId = 1
+    for (const args of [{ params: { '2': 'two', '10': 'ten' } }, { params: { value: 0.000001, tiny: 1e-7 } },
+      { params: { '\u{1F600}': 1, '\uFFFF': 2 } }]) {
+      const id = `extra-${rpcId}`
+      const call = await callTool(f, h, id, rpcId++, 'mcp__ocbridge__ExecuteExtraTool', args, nodeInputSha256(args))
+      assert.deepEqual(call.delivery.request.arguments, args)
+      await call.complete()
+    }
+  } finally { await h.close(); f.cleanup() }
 })
 
 test('multiple original tool blocks queue serially and exact canonical input is required', async () => {
@@ -723,4 +772,154 @@ test('stream transport disconnect detaches without stop, higher generation fence
     await until(() => Buffer.concat(replayed).includes(Buffer.from('"type":"result"')))
     assert.equal(h.counts().stops, 0)
   } finally { reqGap?.destroy(); req2?.destroy(); s.req.destroy(); await h.close(); f.cleanup() }
+})
+
+/** One lane catalog shaped the way the bridge compiles it: tools under `mcp__ocbridge__<alias>`. */
+function toolProfile(
+  tools: Array<{ alias: string; client: string }> = [{ alias: 'Read', client: 'Read' }],
+  prompt = 'fixture lane prompt',
+) {
+  const catalog = JSON.stringify({
+    tools: tools.map(({ alias }) => ({
+      name: alias,
+      description: `${alias} tool`,
+      inputSchema: { type: 'object', properties: {} },
+    })),
+  })
+  return {
+    catalog,
+    catalogSha256: createHash('sha256').update(catalog).digest('hex'),
+    prompt,
+    toolNames: Object.fromEntries(tools.map(({ alias, client }) => [`mcp__ocbridge__${alias}`, client])) as Record<string, string>,
+  }
+}
+/** The byte-exact packet the relay must hand to a profile-taking host. */
+function profilePacket(profile: ReturnType<typeof toolProfile>): Buffer {
+  return Buffer.from(JSON.stringify({ version: 1, catalog: profile.catalog,
+    catalogSha256: profile.catalogSha256, prompt: profile.prompt }))
+}
+
+test('a profile-taking host is not started by admission; the first stream configures it byte-exactly then starts once', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    h.ready()
+    const admitted = await h.admit()
+    assert.equal(admitted.ready, true)
+    // Admission alone has no catalog, so it must neither configure nor launch the host.
+    assert.equal(h.counts().starts, 0)
+    assert.deepEqual(h.hostEvents, [])
+    assert.equal(h.configurePackets.length, 0)
+
+    const profile = toolProfile()
+    const registered = await h.register(profile)
+    assert.deepEqual(registered.toolNames, profile.toolNames)
+    // Registration only fixes the catalog; the host still waits for the stream.
+    assert.equal(h.counts().starts, 0)
+    assert.deepEqual(h.hostEvents, [])
+
+    s = await stream(h)
+    assert.deepEqual(h.hostEvents, ['configure', 'start'])
+    assert.equal(h.configurePackets.length, 1)
+    assert.deepEqual(h.configurePackets[0], profilePacket(profile))
+    assert.equal(h.counts().starts, 1)
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('a profile-taking host rejects missing or invalid profiles while a legacy host accepts them', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true })
+  try {
+    const valid = toolProfile()
+    const invalid: Array<[string, unknown]> = [
+      ['missing profile', undefined],
+      ['bad catalog sha', { ...valid, catalogSha256: '0'.repeat(64) }],
+      ['toolNames not matching the catalog', { ...toolProfile([{ alias: 'Read', client: 'Read' }]),
+        toolNames: { mcp__ocbridge__Bash: 'Bash' } }],
+      ['oversize prompt', { ...valid, prompt: 'p'.repeat(CC5_PROMPT_MAX_BYTES + 1) }],
+    ]
+    for (const [label, profile] of invalid) {
+      await assert.rejects(
+        rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+          ...(profile === undefined ? {} : { profile }) }),
+        Error,
+        label,
+      )
+    }
+    // No rejected registration reaches the journal or burns the lifecycle.
+    assert.deepEqual(readdirSync(join(f.root, 'relay-journal')), [])
+    assert.equal(h.counts().starts, 0)
+    const accepted = await h.register(valid)
+    assert.deepEqual(accepted.toolNames, valid.toolNames)
+  } finally { await h.close(); f.cleanup() }
+})
+
+test('a legacy host without configure still accepts a profile-less registration', async () => {
+  const f = fixture()
+  const h = await harness(f)
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const registered = await h.register()
+    assert.equal(registered.toolNames, null)
+    h.ready()
+    const admitted = await h.admit()
+    assert.equal(admitted.ready, true)
+    assert.deepEqual(h.hostEvents, ['start'])
+    s = await stream(h)
+    assert.equal(h.counts().starts, 1)
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('an ocbridge alias outside the registered catalog is rejected before any attempt journal or delivery', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    await h.register(toolProfile([{ alias: 'Read', client: 'Read' }]))
+    h.ready()
+    await h.admit()
+    s = await stream(h)
+    s.send()
+    await until(() => h.written.length === 1)
+    h.output.write(`${JSON.stringify({ type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: f.request.nativeSessionId })}\n`)
+
+    // Well-formed alias, well-formed input, but not in the catalog the host was launched with.
+    const args = { command: 'true' }
+    await assert.rejects(rpc(h.toolSocket, '/roundtrip', { runId: h.runId, operationId: f.binding.operationId,
+      rpcId: 1, toolUseId: 'bash-1', name: 'mcp__ocbridge__Bash', arguments: args,
+      inputSha256: cc5ToolInputSha256(args) }))
+    const journal = readdirSync(join(f.root, 'relay-journal', f.a.authorityTurnId))
+    assert.deepEqual(journal.filter((name) => name.endsWith('-attempt.json')), [])
+    assert.equal(h.counts().stops, 0)
+
+    // The next delivery must be the catalogued call: an uncatalogued tool never reached /tool/next.
+    const read = await callTool(f, h, 'read-1', 2)
+    await read.complete()
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('re-registration after launch keeps the first catalog even with replace and a different profile', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const first = toolProfile([{ alias: 'Read', client: 'Read' }])
+    const initial = await h.register(first)
+    assert.deepEqual(initial.toolNames, first.toolNames)
+    h.ready()
+    await h.admit()
+    // With a catalog already registered, admission is what launches the host exactly once.
+    assert.deepEqual(h.hostEvents, ['configure', 'start'])
+    assert.deepEqual(h.configurePackets, [profilePacket(first)])
+    s = await stream(h)
+
+    const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
+    const replaced = await rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, profile: second })
+    assert.deepEqual(replaced.toolNames, first.toolNames)
+    // The launch profile is untouched: no second configure, no restart.
+    assert.deepEqual(h.configurePackets, [profilePacket(first)])
+    assert.equal(h.counts().starts, 1)
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
 })

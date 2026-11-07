@@ -2,7 +2,7 @@
 import { EventEmitter } from 'node:events'
 import { CC5_BRIDGE_MAX_FRAME_BYTES } from './cc5BridgePort.js'
 import { CC5_FIXED_TOOL_NAME, type Cc5ObservedTool, type Cc5ToolRequest } from './cc5FixedTool.js'
-import { CC5_NATIVE_TOOLS, cc5ToolInputSha256, validateCc5NativeToolInput } from './cc5NativeTool.js'
+import { cc5ToolInputSha256, validateCc5NativeToolInput } from './cc5NativeTool.js'
 
 function rejectObservation(): never {
   throw new Error('CC5_ORIGINAL_TOOL_OBSERVATION_INVALID')
@@ -45,7 +45,6 @@ export class Cc5ToolObservation {
         Object.keys(input).length !== 1 || (input as { operationId?: unknown }).operationId !== this.operationId) rejectObservation()
       return this.operationId
     }
-    if (!(CC5_NATIVE_TOOLS as readonly string[]).includes(name)) rejectObservation()
     validateCc5NativeToolInput(name, input)
     return cc5ToolInputSha256(input)
   }

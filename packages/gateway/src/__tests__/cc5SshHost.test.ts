@@ -10,7 +10,7 @@ import { join, relative } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Cc5SshHost, defaultRemoteCcTarget, type Cc5SshSpawn, type RemoteCcTarget } from '../cc5SshHost.js'
-import { CC5_NATIVE_TOOLS, cc5ToolInputSha256 } from '../cc5NativeTool.js'
+import { cc5ToolInputSha256 } from '../cc5NativeTool.js'
 
 // Ordinary Node children emulate SSH stdio only. No SSH/Claude/network model invocation occurs.
 const FAKE = String.raw`
@@ -255,7 +255,7 @@ test('three sequential tool RPCs cross the v2 MCP channel with exact input hashe
       assert.deepEqual(Buffer.from(frame.body, 'base64'), receipt)
     }
     assert.equal(requests, 3)
-    assert.deepEqual(received.map((body) => body.name), [...CC5_NATIVE_TOOLS])
+    assert.deepEqual(received.map((body) => body.name), ['mcp__ocbridge__Read', 'mcp__ocbridge__Edit', 'mcp__ocbridge__Bash'])
     assert.deepEqual(received.map((body) => body.toolUseId), [1, 2, 3].map((index) => `toolu-real-stdio-fixture-${index}`))
     assert.deepEqual(received.map((body) => body.rpcId), [19, 20, 21])
     await f.host.stop()

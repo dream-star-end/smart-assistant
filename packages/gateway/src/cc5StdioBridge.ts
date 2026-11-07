@@ -1,7 +1,8 @@
 /** Byte transport for the original interactive host. Never synthesizes model frames. */
 import { createHash, randomUUID } from 'node:crypto'
 import { request } from 'node:http'
-import { join, resolve } from 'node:path'
+import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
@@ -19,6 +20,40 @@ import { Cc5ToolObservation } from './cc5ToolObservation.js'
 import { runCc5ToolPump } from './cc5ToolPump.js'
 import { privateDir, syncDir } from './cc5FixedTool.js'
 import { Cc5ToolHost } from './cc5ToolHost.js'
+import { type Cc5HostProfile, compileCc5ToolCatalog, cc5RemotePrompt } from './cc5ToolCatalog.js'
+import type { Cc5ToolResult } from './cc5NativeTool.js'
+
+/** What the runner prepared for this lane: the same prompt and tool sources a local chat gets. */
+export interface Cc5LaneProfile {
+  version: 1
+  platformPrompt: string
+  host: Cc5HostProfile
+}
+type BridgeToolHost = Pick<Cc5ToolHost, 'execute' | 'close' | 'tools'>
+
+/** Written 0600 by the runner next to its other per-process files; never echoed on failure. */
+export function readCc5LaneProfile(path: string): Cc5LaneProfile {
+  try {
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    let value: Cc5LaneProfile
+    try {
+      const meta = fstatSync(fd)
+      if (!meta.isFile() || meta.uid !== process.getuid?.() || (meta.mode & 0o077) || meta.size > 1048576) throw new Error()
+      value = JSON.parse(readFileSync(fd, 'utf8')) as Cc5LaneProfile
+    } finally { closeSync(fd) }
+    const host = value?.host
+    if (value?.version !== 1 || typeof value.platformPrompt !== 'string' || !host || typeof host !== 'object' ||
+        Object.keys(value).sort().join(',') !== 'host,platformPrompt,version' ||
+        Object.keys(host).sort().join(',') !== 'cwd,disallowedTools,mcpConfigPath,settingsPath' ||
+        typeof host.cwd !== 'string' || !isAbsolute(host.cwd) ||
+        [host.mcpConfigPath, host.settingsPath].some((item) => item !== null && (typeof item !== 'string' || !isAbsolute(item))) ||
+        !Array.isArray(host.disallowedTools) || host.disallowedTools.some((item) => typeof item !== 'string'))
+      throw new Error()
+    return value
+  } catch {
+    throw new Error('CC5_LANE_PROFILE_INVALID')
+  }
+}
 
 export async function runCc5StdioBridge(input: {
   binding: Readonly<Cc5BridgeBinding>
@@ -28,9 +63,10 @@ export async function runCc5StdioBridge(input: {
   socketPath?: string
   signal?: AbortSignal
   /** Production entry always supplies the supervisor-owned keyring. */
-  tools?: { keyring: AuthorityKeyring; executionRoot?: string;
+  tools?: { keyring: AuthorityKeyring; executionRoot?: string; lane: Cc5LaneProfile
     /** In-process fixtures only; production always constructs the fixed supervisor. */
-    hostFactory?: (root: string, lifecycleId: string) => Pick<Cc5ToolHost, 'execute' | 'close'> }
+    hostFactory?: (root: string, lifecycleId: string, profile: Cc5HostProfile,
+      onPermission: (request: Record<string, unknown>) => Promise<Record<string, unknown>>) => BridgeToolHost }
 }): Promise<void> {
   const scope = {
     capability: input.binding.capability,
@@ -45,7 +81,21 @@ export async function runCc5StdioBridge(input: {
   const toolAbort = new AbortController()
   let toolRun: Promise<unknown> | undefined
   let seq = 0
-  let toolHost: Pick<Cc5ToolHost, 'execute' | 'close'> | undefined
+  let toolHost: BridgeToolHost | undefined
+  let toolNames: Readonly<Record<string, string>> = {}
+  // The gateway answers these exactly as for a local CCB: control_request out, control_response in.
+  const permissions = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>()
+  const askPermission = (request: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    if (stopping || typeof request.tool_name !== 'string' || typeof request.tool_use_id !== 'string' ||
+        !request.input || typeof request.input !== 'object' || Array.isArray(request.input) || permissions.size >= 16)
+      return Promise.reject(new Error('CC5_PERMISSION_REQUEST_REJECTED'))
+    const requestId = `cc5-perm-${randomUUID()}`
+    return new Promise((resolvePermission, reject) => {
+      permissions.set(requestId, { resolve: resolvePermission, reject })
+      input.stdout.write(`${JSON.stringify({ type: 'control_request', request_id: requestId, request: {
+        subtype: 'can_use_tool', tool_name: request.tool_name, input: request.input, tool_use_id: request.tool_use_id } })}\n`)
+    })
+  }
   const lifecycleId = randomUUID()
   const executionRoot = input.tools?.executionRoot ?? '/home/agent/.openclaude/.cc5-native-tools'
   const lifecycleRoot = join(executionRoot, `host-${lifecycleId}`)
@@ -53,8 +103,23 @@ export async function runCc5StdioBridge(input: {
     privateDir(executionRoot)
     privateDir(lifecycleRoot)
     syncDir(executionRoot)
-    const registered = await cc5ControlRequest('/tool/register', { ...scope, lifecycleId }, socketPath)
-    if (registered.lifecycleId !== lifecycleId) throw new Error('CC5_TOOLHOST_REGISTRATION_UNKNOWN')
+    // The remote CLI launches with this host's catalog, so the host is up before registration.
+    const lane = input.tools.lane
+    const host = toolHost = input.tools.hostFactory?.(lifecycleRoot, lifecycleId, lane.host, askPermission) ??
+      new Cc5ToolHost(lifecycleRoot, lifecycleId, lane.host, askPermission)
+    try {
+      const catalog = compileCc5ToolCatalog(await host.tools())
+      const registered = await cc5ControlRequest('/tool/register', { ...scope, lifecycleId, profile: {
+        catalog: catalog.json, catalogSha256: catalog.sha256, toolNames: catalog.clientNameByRemoteName,
+        prompt: cc5RemotePrompt(lane.platformPrompt, catalog, lane.host.cwd) } }, socketPath)
+      if (registered.lifecycleId !== lifecycleId) throw new Error('CC5_TOOLHOST_REGISTRATION_UNKNOWN')
+      // A lane launched by an earlier bridge keeps the catalog it was launched with.
+      toolNames = registered.toolNames && typeof registered.toolNames === 'object'
+        ? registered.toolNames as Record<string, string> : catalog.clientNameByRemoteName
+    } catch (error) {
+      await host.close().catch(() => {})
+      throw error
+    }
   }
   let ready = false
   let stopping = false
@@ -73,6 +138,8 @@ export async function runCc5StdioBridge(input: {
     stopping = true
     toolAbort.abort()
     pending = []
+    for (const waiter of permissions.values()) waiter.reject(new Error('CC5_PERMISSION_REQUEST_ABANDONED'))
+    permissions.clear()
     stopPromise = Promise.resolve().then(async () => {
       let localFailure: unknown
       try {
@@ -101,7 +168,7 @@ export async function runCc5StdioBridge(input: {
   const fail = (code: string): void => {
     failure ??= new Error(code)
     void stop().catch(() => {
-      failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+      failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
     })
   }
   const send = (line: string): void => {
@@ -111,6 +178,19 @@ export async function runCc5StdioBridge(input: {
         type?: string
         request?: { subtype?: string }
         message?: { role?: string; content?: unknown }
+        response?: { request_id?: unknown; subtype?: unknown; response?: unknown }
+      }
+      if (frame.type === 'control_response') {
+        // Answers stay in this container: only a reply to a prompt this bridge asked is accepted.
+        const id = frame.response?.request_id
+        const waiter = typeof id === 'string' ? permissions.get(id) : undefined
+        if (!waiter) throw new Error('CC5_INPUT_REJECTED')
+        permissions.delete(id as string)
+        const answer = frame.response?.response
+        if (frame.response?.subtype === 'success' && answer && typeof answer === 'object' && !Array.isArray(answer))
+          waiter.resolve(answer as Record<string, unknown>)
+        else waiter.reject(new Error('CC5_PERMISSION_REQUEST_FAILED'))
+        return
       }
       if (frame.type === 'user') {
         const content = frame.message?.content
@@ -160,12 +240,12 @@ export async function runCc5StdioBridge(input: {
     ended = true
     if (buf || decoder.end()) failure ??= new Error('CC5_INPUT_TRUNCATED')
     void stop().catch(() => {
-      failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+      failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
     })
   }
   const onAbort = (): void => {
     void stop().catch(() => {
-      failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+      failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
     })
   }
   const onInputError = (): void => fail('CC5_INPUT_FAILED')
@@ -175,7 +255,7 @@ export async function runCc5StdioBridge(input: {
         try {
           await stop()
         } catch {
-          failure = new Error('CC5_REMOTE_STOP_UNPROVEN')
+          failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
         }
         if (failure) reject(failure)
         else if (!ended && !input.signal?.aborted) reject(new Error('CC5_TRANSPORT_CLOSED'))
@@ -243,12 +323,11 @@ export async function runCc5StdioBridge(input: {
                 signal: toolAbort.signal,
                 socketPath,
                 executionRoot: input.tools.executionRoot,
-                executeTool: async (request) => {
-                  if (stopping) throw new Error('CC5_TOOLHOST_CLOSED')
-                  toolHost ??=
-                    input.tools?.hostFactory?.(lifecycleRoot, lifecycleId) ??
-                    new Cc5ToolHost(lifecycleRoot, lifecycleId)
-                  return toolHost.execute(request.name, request.arguments, request)
+                executeTool: async (request): Promise<Cc5ToolResult> => {
+                  if (stopping || !toolHost) throw new Error('CC5_TOOLHOST_CLOSED')
+                  const name = Object.hasOwn(toolNames, request.name) ? toolNames[request.name] : undefined
+                  if (!name) return { content: [{ type: 'text', text: `No such tool available: ${request.name}` }], isError: true }
+                  return toolHost.execute(name, request.arguments, request)
                 },
               }).catch(() => {
                 if (!stopping) fail('CC5_FIXED_TOOL_FAILED_OR_UNKNOWN')
@@ -353,7 +432,23 @@ export async function runCc5StdioBridge(input: {
     input.stdin.removeListener('data', onData)
     input.stdin.removeListener('end', onEnd)
     input.stdin.removeListener('error', onInputError)
+    // A resumed stdin keeps the bridge process alive while the gateway holds the pipe open.
+    input.stdin.pause()
     input.signal?.removeEventListener('abort', onAbort)
+  }
+}
+
+/** Process entry: the runner treats process exit as the turn's terminal, so a finished
+ * bridge must exit even while the gateway still holds its stdin pipe open. */
+export async function runCc5StdioBridgeProcess(run: () => Promise<void>): Promise<void> {
+  try {
+    await run()
+  } catch (error) {
+    const code = error instanceof Error && /^CC5_[A-Z0-9_]{1,64}$/.test(error.message) ? ` ${error.message}` : ''
+    process.stderr.write(`CC5_INTERACTIVE_BRIDGE_FAILED${code}\n`)
+    process.exitCode = 1
+  } finally {
+    process.stdin.destroy()
   }
 }
 
@@ -361,19 +456,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const controller = new AbortController()
   process.once('SIGTERM', () => controller.abort())
   process.once('SIGINT', () => controller.abort())
-  Promise.resolve()
-    .then(() =>
-      runCc5StdioBridge({
-        binding: readCc5Binding(cc5LanePaths(process.argv[3] ?? '').binding),
-        tools: { keyring: readCc5AuthorityKeyring() },
-        sessionKey: process.argv[2] ?? '',
-        stdin: process.stdin,
-        stdout: process.stdout,
-        signal: controller.signal,
-      }),
-    )
-    .catch(() => {
-      process.stderr.write('CC5_INTERACTIVE_BRIDGE_FAILED\n')
-      process.exitCode = 1
-    })
+  void runCc5StdioBridgeProcess(() =>
+    runCc5StdioBridge({
+      binding: readCc5Binding(cc5LanePaths(process.argv[3] ?? '').binding),
+      tools: { keyring: readCc5AuthorityKeyring(), lane: readCc5LaneProfile(process.argv[4] ?? '') },
+      sessionKey: process.argv[2] ?? '',
+      stdin: process.stdin,
+      stdout: process.stdout,
+      signal: controller.signal,
+    }),
+  )
 }
