@@ -293,7 +293,10 @@ for (const partial of [false, true]) {
     const sid = `74700000-0000-4000-8000-${partial ? '000000000021' : '000000000020'}`
     const tip = '74700000-0000-4000-8000-000000000022'
     const { readIdleNative } = await import('../boxIdleCompact.js')
-    const { resumeIdleSummary } = await import('../../../../claude-code-best/src/services/compact/idleRecover.js')
+    // CCB is a separate Bun project: load its real runtime without enrolling
+    // its entire declaration graph in the gateway composite TS project.
+    const ccbRecoveryUrl = new URL('../../../../claude-code-best/src/services/compact/idleRecover.js', import.meta.url)
+    const { resumeIdleSummary } = await import(ccbRecoveryUrl.href)
     const { readIdleRollbacks } = await import('@openclaude/storage')
     writeIdleCandidate(home, { v: 1, sessionKey: f.sessionKey, sessionId: sid, turnKey: sourceKey, createdAt: Date.now() })
     writeIdleOp(home, { v: 1, sessionKey: f.sessionKey, sourceSessionId: sid, sourceTurnKey: sourceKey,
