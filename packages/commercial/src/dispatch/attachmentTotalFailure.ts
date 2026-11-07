@@ -1,13 +1,7 @@
-import {
-  attachmentTotalExceededFailureCode,
-  parseAttachmentTotalExceeded,
-} from '@openclaude/protocol'
+import { canonicalUserFailureCode } from '@openclaude/protocol'
 
-/** Container-supplied code is accepted only when it is the attachment-total shape. */
+/** Never trust an arbitrary container error as a user-facing failure code. */
 export function rejectedDispatchFailureCode(res: { kind: string; userFailureCode?: unknown }): string {
-  if (res.kind === 'ok') {
-    const parsed = parseAttachmentTotalExceeded(res.userFailureCode)
-    if (parsed) return attachmentTotalExceededFailureCode(parsed.totalBytes)
-  }
-  return 'DISPATCH_NOT_ACCEPTED'
+  return (res.kind === 'ok' ? canonicalUserFailureCode(res.userFailureCode) : undefined)
+    ?? 'DISPATCH_NOT_ACCEPTED'
 }

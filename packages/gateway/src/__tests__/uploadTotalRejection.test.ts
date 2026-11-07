@@ -3,11 +3,12 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
-import { messageAttachmentTotal, noteAttachmentTotalRejection, readUploadUserFailureCode } from '../uploadTotalRejection.js'
-import { MAX_UPLOAD_TOTAL } from '../httpUploadStatic.js'
 
 const testHome = await mkdtemp(join(tmpdir(), 'oc-gw-upload-total-'))
 process.env.OPENCLAUDE_HOME = testHome
+// httpUploadStatic imports storage transitively: isolate paths before loading it.
+const { messageAttachmentTotal, noteAttachmentTotalRejection, readUploadUserFailureCode } = await import('../uploadTotalRejection.js')
+const { MAX_UPLOAD_TOTAL } = await import('../httpUploadStatic.js')
 
 const { closeSessionsDb, insertQueuedTurnDispatch } = await import('@openclaude/storage')
 const { buildTurnDispatchStateResponse, inboxReject } = await import('../turnDispatchInbox.js')
@@ -81,4 +82,15 @@ test('stamped attachment total code round-trips on the state response and is omi
   )
   assert.equal(generic?.userFailureCode, undefined)
   assert.equal('userFailureCode' in buildTurnDispatchStateResponse(generic), false)
+})
+
+test('idle rejection survives the durable inbox, receipt and polling response', async () => {
+  const { buildTurnDispatchReceiptFrame } = await import('../turnDispatchInbox.js')
+  const key = { userId: 'u1', sessionId: 'idle-wait', clientMessageId: 'idle-client' }
+  await insertQueuedTurnDispatch({ ...key, dispatchId: 'idle-dispatch', attemptNo: 1, payloadHash: 'h' })
+  const row = await inboxReject(key, undefined, 'IDLE_RECOVERY_PENDING:7')
+  assert.equal(buildTurnDispatchStateResponse(row).userFailureCode, 'IDLE_RECOVERY_PENDING:7')
+  assert.equal(buildTurnDispatchReceiptFrame({ dispatchId: 'idle-dispatch', attemptNo: 1,
+    sessionId: key.sessionId, clientMessageId: key.clientMessageId }, row, Date.now()).userFailureCode,
+    'IDLE_RECOVERY_PENDING:7')
 })

@@ -592,6 +592,7 @@ export function scheduleIdleDrain(
       }
     } finally {
       session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
+      if (!session._idleWaiters?.size && !session._idleInternalTurns) session._idleDeadline = undefined
       release()
     }
     if (again && attempt < IDLE_DRAIN_RETRIES) {
