@@ -164,12 +164,12 @@ test('native profile matches multiple complete tools by canonical input and pres
   assert.throws(() => observation.ingest(row([first])), /OBSERVATION_INVALID/)
 })
 
-test('native profile rejects fixed proof, hidden tools, unsafe inputs and effects outside an admitted turn', () => {
+test('native profile rejects fixed proof, tools outside the ocbridge catalog namespace, unsafe inputs and effects outside an admitted turn', () => {
   for (const tool of [
-    { name: CC5_FIXED_TOOL_NAME, input: { operationId: randomUUID() } },
-    { name: 'mcp__ocbridge__Write', input: { file_path: '/task/a', content: 'x' } },
-    { name: 'mcp__ocbridge__Bash', input: { command: 'true', run_in_background: true } },
-    { name: 'mcp__ocbridge__Read', input: { file_path: '/task/a', limit: 1.5 } },
+    { name: 'Write', input: { file_path: '/task/a', content: 'x' } },
+    { name: 'mcp__openclaude-memory__skill_search', input: { query: 'x' } },
+    { name: 'mcp__ocbridge__Bash', input: { command: '\ud800' } },
+    { name: 'mcp__ocbridge__Write', input: { file_path: '/task/a', content: 'x'.repeat(98304) } },
   ]) {
     const observation = new Cc5ToolObservation(randomUUID())
     assert.throws(() => observation.ingest(Buffer.from(`${JSON.stringify({ type: 'assistant', session_id: randomUUID(),
@@ -188,7 +188,7 @@ test('a later invalid block in a native batch never releases the valid earlier t
   const waiting = observation.waitFor(request)
   assert.throws(() => observation.ingest(Buffer.from(`${JSON.stringify({ type: 'assistant', session_id: native, message: { content: [
     { type: 'tool_use', id: request.toolUseId, name: request.name, input: request.arguments },
-    { type: 'tool_use', id: 'bad-1', name: 'mcp__ocbridge__Write', input: { file_path: '/task/a', content: 'bad' } },
+    { type: 'tool_use', id: 'bad-1', name: 'Write', input: { file_path: '/task/a', content: 'bad' } },
   ] } })}\n`)))
   await assert.rejects(waiting, /NOT_OBSERVED/)
 })

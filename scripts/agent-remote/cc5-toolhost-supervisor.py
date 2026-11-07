@@ -69,19 +69,25 @@ def supervise(command, proof_path, lifecycle_id):
         os.close(pidfd)
 
 
+def command_for(node, entry, host_profile_path):
+    return [node, str(entry), 'mcp', 'serve', '--tool-profile', 'full',
+            '--host-profile', host_profile_path]
+
+
 def main():
-    if len(sys.argv) != 4 or not Path(sys.argv[1]).is_absolute():
+    if len(sys.argv) != 5 or not Path(sys.argv[1]).is_absolute():
         return 126
-    node, proof_path, lifecycle_id = sys.argv[1:]
+    node, proof_path, lifecycle_id, host_profile_path = sys.argv[1:]
     directory = Path(proof_path).parent
     meta = directory.lstat()
     if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.getuid()
             or meta.st_mode & 0o077 or Path(proof_path).name != 'stopped.json'
-            or len(lifecycle_id) != 36):
+            or len(lifecycle_id) != 36
+            or not Path(host_profile_path).is_absolute()):
         return 126
     entry = Path(__file__).resolve().parents[2] / 'claude-code-best/dist/cli-node.js'
-    command = [node, str(entry), 'mcp', 'serve', '--tool-allowlist', 'Read,Edit,Bash']
-    return supervise(command, proof_path, lifecycle_id)
+    return supervise(command_for(node, entry, host_profile_path),
+                     proof_path, lifecycle_id)
 
 
 if __name__ == '__main__':

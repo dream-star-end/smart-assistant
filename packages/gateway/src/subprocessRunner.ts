@@ -13,7 +13,7 @@ import {
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type OpenClaudeConfig } from '@openclaude/storage'
@@ -82,6 +82,7 @@ import {
   MAX_STDERR_BUF_BYTES,
   appendCrashStderrTail,
   redactCrashStderrTail,
+  CCB_PLATFORM_DISALLOWED_TOOLS as CCB_LANE_DISALLOWED_TOOLS,
 } from './subprocessSpawnConfig.js'
 import { figcheckTurnIdEnv } from './figcheckRounds.js'
 export {
@@ -252,6 +253,9 @@ export function _boxCcOneShotExitSkipsCrashLoop(args: {
 }): boolean {
   return args.boxResidentCc && args.code === 0 && args.signal == null
 }
+
+/** Never handed to a remote lane's container tool host: it makes no model calls. */
+const CC5_LANE_CREDENTIAL_ENV = /^(?:ANTHROPIC_|CLAUDE_CODE_OAUTH|OPENAI_|GEMINI_|GOOGLE_API|NODE_OPTIONS$)|(?:_API_KEY|_AUTH_TOKEN|_SECRET)$/
 
 export class SubprocessRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null
@@ -570,7 +574,34 @@ export class SubprocessRunner extends EventEmitter {
     let spawnOpts: SpawnOpts
     try {
     if (this.opts.cc5BridgePort) {
-      spawnOpts = await this.opts.cc5BridgePort.prepare({ cwd: this.opts.agentBaseDir })
+      // The remote model gets what a local chat gets: this prompt, and tools from these files run here.
+      const learning = await this.buildLearningContext(null)
+      const laneCwd = learning.workingDir ?? this.opts.agentBaseDir
+      const laneProfile = resolve(this.sessionDir!, 'lane-profile.json')
+      writeFileSync(laneProfile, JSON.stringify({
+        version: 1,
+        platformPrompt: learning.extraPromptFile ? readFileSync(learning.extraPromptFile, 'utf8') : '',
+        host: { cwd: laneCwd, mcpConfigPath: learning.mcpConfigFile ?? null,
+          settingsPath: learning.settingsFile ?? null, disallowedTools: [...CCB_LANE_DISALLOWED_TOOLS] },
+      }), { mode: 0o600, flag: 'wx' })
+      // The container tool host runs tools with a local chat's environment, minus model credentials.
+      const laneEnv: Record<string, string> = {}
+      for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined && !CC5_LANE_CREDENTIAL_ENV.test(key)) laneEnv[key] = value
+      }
+      Object.assign(laneEnv, {
+        OC_SESSION_KEY: this.opts.sessionKey,
+        OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
+        OPENCLAUDE_AGENT_ID: this.opts.agentId,
+        OC_AGENT_ID: this.opts.agentId,
+        OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile ?? '',
+        ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway?.port),
+        ...identityCompatEnvironment(this.opts.identityCompat),
+        IS_SANDBOX: '1',
+        CLAUDE_CODE_DISABLE_CRON: '1',
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+      })
+      spawnOpts = await this.opts.cc5BridgePort.prepare({ cwd: laneCwd, laneProfile, env: laneEnv })
       this._boundRepoBinding = null
       this.spawnedUpstreamIsEgress = false
       this.pendingOfficialSpawnEnv = null

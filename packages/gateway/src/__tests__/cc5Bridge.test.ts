@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
@@ -74,13 +75,24 @@ function fixture(admitError?: string) {
   let admitted = 0
   let renewed = 0
   let stopped = 0
+  const laneProfiles: unknown[] = []
   const port: Cc5BridgePort = {
     bindingId: binding.operationId,
     executionBackend,
     canonicalModel: binding.canonicalModel,
-    async prepare() {
+    async prepare(input) {
       assert.equal(admitted, 1, 'budget/admission must happen before bridge preparation/spawn')
       prepared++
+      // The remote model gets a local chat's platform prompt and tool sources, run in this container.
+      const lane = JSON.parse(readFileSync(input!.laneProfile!, 'utf8'))
+      assert.equal(lane.version, 1)
+      assert.match(lane.platformPrompt, /\S/)
+      assert.equal(typeof lane.host.mcpConfigPath, 'string')
+      assert.ok(JSON.parse(readFileSync(lane.host.mcpConfigPath, 'utf8')).mcpServers['openclaude-memory'])
+      assert.deepEqual(lane.host.disallowedTools, ['SendMessage'])
+      assert.equal(input!.cwd, lane.host.cwd)
+      for (const key of Object.keys(input!.env!)) assert.doesNotMatch(key, /^(ANTHROPIC_|CLAUDE_CODE_OAUTH)|_API_KEY$/)
+      laneProfiles.push(lane)
       return spawnOpts
     },
     async admit() {
@@ -99,9 +111,11 @@ function fixture(admitError?: string) {
     get defaults() {
       throw new Error('OLD_CONFIG_TOUCHED')
     },
-    get provider() {
-      throw new Error('OLD_PROVIDER_TOUCHED')
-    },
+    // Only selects which platform MCP servers a local chat would get; never model auth.
+    provider: 'anthropic',
+    mcpServers: [],
+    auth: {},
+    gateway: { port: 18790, accessToken: 'fixture-token' },
   }
   const opts = {
     sessionKey: binding.sessionKey,
@@ -122,10 +136,10 @@ function fixture(admitError?: string) {
     assert.deepEqual(got, spawnOpts)
     return proc as never
   })
-  return { proc, writes, port, opts, counts: () => ({ prepared, admitted, renewed, stopped }) }
+  return { proc, writes, port, opts, laneProfiles, counts: () => ({ prepared, admitted, renewed, stopped }) }
 }
 
-test('cc5 Runner skips old auth/setup; original fragmented output and lease use the dedicated port', async () => {
+test('cc5 Runner skips old auth/setup, ships the platform lane profile; original fragmented output and lease use the dedicated port', async () => {
   const f = fixture()
   const runner = new SubprocessRunner(f.opts)
   const messages: unknown[] = []
@@ -133,6 +147,7 @@ test('cc5 Runner skips old auth/setup; original fragmented output and lease use 
   await runner.submit('literal user sentence', undefined, authority, 'turn1')
   assert.equal(f.counts().prepared, 1)
   assert.equal(f.counts().admitted, 1)
+  assert.equal(f.laneProfiles.length, 1)
   assert.equal(f.writes.length, 1)
   assert.equal(JSON.parse(f.writes[0]!).type, 'user')
   f.proc.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"real')

@@ -26,9 +26,15 @@ import time
 import uuid
 
 TASK = 'AGENT-REMOTE-T1555U'
-PINNED_MCP_SHA = '34f7f5f412639f6d095198b5e2169974f833679cbef19c41e80d40951c567055'
-PINNED_SOCKET_SHA = '8914fd2c1cd6777e11fdb6fd11eaaf9b3dda6ee71b01879a90f8fe2fd47ba603'
+PINNED_MCP_SHA = 'e89e1e9a7e9909460265bd0cd94f85ed8e349f8067a436726caccae1da839631'
+PINNED_SOCKET_SHA = '7a6d3499222977bd9f38a90cc5dd5de117ee38166b8e0d4e1ccd9260fd431381'
 UUID = re.compile(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z')
+SHA256 = re.compile(r'[0-9a-f]{64}\Z')
+# Per-lane tool catalog and system prompt shipped by the master right before launch.
+SESSION_CATALOG = 1024 * 1024
+SESSION_PROMPT = 256 * 1024
+SESSION_DESCRIPTION = 20 * 1024
+TOOL_NAME = re.compile(r'(?:t[0-9]{1,3}|[A-Za-z0-9_-]{1,48})\Z')
 # Same accepted shapes as the gateway target and host.py's account directory.
 MODEL = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}\Z')
 PROFILE = re.compile(r'[a-z0-9][a-z0-9-]{0,31}\Z')
@@ -308,8 +314,13 @@ def provision(root):
                 info.update({key: install[key] for key in ('hashes', 'pluginDigest', 'tapSha256')})
         directory = root / 'cprofile'
         if directory.exists():
-            current = check_profile(root)
-            if (current['operationId'], current['runId']) != (profile['operationId'], profile['runId']) or \
+            try:
+                current = check_profile(root)
+            except RuntimeError:
+                # Pinned by an earlier release (or damaged): replaced, since no runtime is present here.
+                current = None
+            if current is None or \
+                    (current['operationId'], current['runId']) != (profile['operationId'], profile['runId']) or \
                     current['hashes'] != {name: sha(value) for name, value in profile_files(
                         root, profile['operationId'], profile['runId'],
                         base64.b64decode(profile['script'], validate=True),
@@ -336,13 +347,13 @@ def tmux(root, *args, timeout=None):
     return subprocess.run(['tmux', '-L', 'oc-box', *args], env=env, capture_output=True, text=True, timeout=timeout)
 
 
-def read_private(path, limit=65536):
+def read_private(path, limit=65536, allow_empty=False):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         st = os.fstat(fd)
         require(stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and st.st_nlink == 1 and
-                stat.S_IMODE(st.st_mode) in (0o400, 0o600) and 0 < st.st_size <= limit,
-                'unsafe-private-task-file')
+                stat.S_IMODE(st.st_mode) in (0o400, 0o600) and (allow_empty or st.st_size > 0) and
+                st.st_size <= limit, 'unsafe-private-task-file')
         data = os.read(fd, limit + 1)
         require(len(data) == st.st_size, 'private-task-file-changed')
         return data
@@ -352,6 +363,17 @@ def read_private(path, limit=65536):
 
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
+
+
+def strict_json(value):
+    def pairs(items):
+        result = {}
+        for key, item in items:
+            require(key not in result, 'duplicate-json-key')
+            result[key] = item
+        return result
+    return json.loads(value, object_pairs_hook=pairs,
+                      parse_constant=lambda _: (_ for _ in ()).throw(ValueError('json-constant')))
 
 
 def profile_files(root, operation_id, run_id, script, socket_script):
@@ -380,7 +402,8 @@ def package_provision(run_id, home, operation_id, run):
     return {'version': 1, 'install': install, 'profile': package_profile(install['root'], operation_id, run)}
 
 
-def check_profile(root):
+def profile_manifest(root):
+    """The profile's identity only. Enough to stop what it started, even under an earlier release's pins."""
     directory = root / 'cprofile'
     st = directory.lstat()
     require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700,
@@ -389,6 +412,12 @@ def check_profile(root):
     require(set(info) == {'version', 'task', 'root', 'operationId', 'runId', 'hashes'} and
             info['version'] == 2 and info['task'] == TASK and info['root'] == str(root),
             'wrong-profile-manifest')
+    return info
+
+
+def check_profile(root):
+    directory = root / 'cprofile'
+    info = profile_manifest(root)
     script = read_private(directory / 'cc5-fixed-mcp.py')
     files = profile_files(root, info['operationId'], info['runId'], script,
                           read_private(directory / 'cc5-mcp-socket.py'))
@@ -447,8 +476,140 @@ def write_profile(root, packet):
     return info
 
 
+def session_catalog(text, expected):
+    require(isinstance(text, str) and isinstance(expected, str) and SHA256.fullmatch(expected),
+            'wrong-session-catalog')
+    try:
+        data = text.encode()
+    except UnicodeError:
+        raise RuntimeError('wrong-session-catalog') from None
+    require(0 < len(data) <= SESSION_CATALOG and sha(data) == expected, 'wrong-session-catalog')
+    try:
+        catalog = strict_json(text)
+    except (ValueError, RecursionError):
+        raise RuntimeError('wrong-session-catalog') from None
+    require(isinstance(catalog, dict) and set(catalog) == {'tools'}, 'wrong-session-catalog')
+    tools = catalog['tools']
+    require(isinstance(tools, list) and 1 <= len(tools) <= 128, 'wrong-session-catalog')
+    names = set()
+    for tool in tools:
+        require(isinstance(tool, dict) and set(tool) == {'name', 'description', 'inputSchema'},
+                'wrong-session-catalog')
+        name, description, schema = tool['name'], tool['description'], tool['inputSchema']
+        require(isinstance(name, str) and TOOL_NAME.fullmatch(name) and name not in names,
+                'wrong-session-catalog')
+        try:
+            described = description.encode() if isinstance(description, str) else None
+        except UnicodeError:
+            described = None
+        require(described is not None and len(described) <= SESSION_DESCRIPTION, 'wrong-session-catalog')
+        require(isinstance(schema, dict) and schema.get('type') == 'object', 'wrong-session-catalog')
+        names.add(name)
+    return data, catalog
+
+
+def session_files(root, catalog_bytes, prompt_bytes):
+    return {'catalog.json': catalog_bytes, 'prompt.md': prompt_bytes,
+            'SESSION.json': canonical({'version': 1, 'task': TASK, 'root': str(root),
+                'catalogSha256': sha(catalog_bytes), 'promptSha256': sha(prompt_bytes)})}
+
+
+def write_session(root, catalog_bytes, prompt_bytes):
+    files = session_files(root, catalog_bytes, prompt_bytes)
+    directory = root / 'session'
+    stage = root / 'session.partial'
+    if stage.exists() or stage.is_symlink():
+        require(not stage.is_symlink() and stat.S_ISDIR(stage.lstat().st_mode) and
+                stage.lstat().st_uid == os.getuid(), 'unsafe-session-stage')
+        shutil.rmtree(stage)
+    stage.mkdir(mode=0o700)
+    os.chmod(stage, 0o700)
+    try:
+        for name, data in files.items():
+            fd = os.open(stage / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        if directory.exists() or directory.is_symlink():
+            # The completed stage replaces a previous lane's catalog in one rename.
+            require(not directory.is_symlink() and stat.S_ISDIR(directory.lstat().st_mode) and
+                    directory.lstat().st_uid == os.getuid(), 'unsafe-session-directory')
+            shutil.rmtree(directory)
+        stage.rename(directory)
+        parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+        check_session(root)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+    return files
+
+
+def check_session(root):
+    """Re-validate this lane's installed catalog/prompt and return the parsed catalog."""
+    directory = root / 'session'
+    try:
+        st = directory.lstat()
+    except FileNotFoundError:
+        raise RuntimeError('missing-session-profile') from None
+    require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700,
+            'unsafe-session-directory')
+    names = ('catalog.json', 'prompt.md', 'SESSION.json')
+    require({path.name for path in directory.iterdir()} == set(names), 'unexpected-session-files')
+    require(all(stat.S_IMODE((directory / name).lstat().st_mode) == 0o400 for name in names),
+            'unsafe-session-file-mode')
+    info = json.loads(read_private(directory / 'SESSION.json', 4096))
+    require(isinstance(info, dict) and set(info) == {'version', 'task', 'root', 'catalogSha256', 'promptSha256'}
+            and type(info['version']) is int and info['version'] == 1 and info['task'] == TASK
+            and info['root'] == str(root), 'wrong-session-manifest')
+    data = read_private(directory / 'catalog.json', SESSION_CATALOG)
+    prompt = read_private(directory / 'prompt.md', SESSION_PROMPT, allow_empty=True)
+    require(sha(data) == info['catalogSha256'] and sha(prompt) == info['promptSha256'],
+            'session-hash-mismatch')
+    require(b'\0' not in prompt, 'wrong-session-prompt')
+    try:
+        text = data.decode('utf-8')
+        prompt.decode('utf-8')
+    except UnicodeError:
+        raise RuntimeError('wrong-session-catalog') from None
+    _data, catalog = session_catalog(text, info['catalogSha256'])
+    return catalog
+
+
+def session_profile(root):
+    """Install the lane's tool catalog and system prompt; the CLI reads both at launch."""
+    raw = sys.stdin.buffer.read(4 * 1024 * 1024 + 1)
+    require(len(raw) <= 4 * 1024 * 1024, 'session-packet-too-large')
+    packet = json.loads(raw)
+    require(isinstance(packet, dict) and set(packet) == {'version', 'catalog', 'catalogSha256', 'prompt'}
+            and type(packet['version']) is int and packet['version'] == 1, 'wrong-session-packet')
+    catalog_bytes, catalog = session_catalog(packet['catalog'], packet['catalogSha256'])
+    prompt = packet['prompt']
+    try:
+        prompt_bytes = prompt.encode() if isinstance(prompt, str) else None
+    except UnicodeError:
+        prompt_bytes = None
+    require(prompt_bytes is not None and len(prompt_bytes) <= SESSION_PROMPT and '\0' not in prompt,
+            'wrong-session-prompt')
+    with control_lock(root):
+        info = owner(root)
+        check_sources(root, info)
+        check_profile(root)
+        require(not (root / 'run').exists() and not (root / 'LIFECYCLE.json').exists(),
+                'session-runtime-present')
+        write_session(root, catalog_bytes, prompt_bytes)
+    print(json.dumps({'kind': 'session-profile-installed', 'root': str(root),
+                      'catalogSha256': sha(catalog_bytes), 'promptSha256': sha(prompt_bytes),
+                      'tools': len(catalog['tools'])}))
+
+
 def profile_args(root, info):
     check_profile(root)
+    catalog = check_session(root)
     require(info['cwd'] == str(root / 'work'), 'requires-approved-task-workdir')
     work = root / 'work'
     st = work.lstat()
@@ -458,10 +619,11 @@ def profile_args(root, info):
     require(cli in (str(root / 'bin/claude-2.1.316'), str(NODE_CLI)), 'requires-private-cli')
     model = info.get('model', DEFAULT_MODEL)
     require(isinstance(model, str) and MODEL.fullmatch(model), 'unapproved-model')
+    allowed = ','.join('mcp__ocbridge__' + tool['name'] for tool in catalog['tools'])
     args = [cli, '--permission-mode', 'default', '--model', model, '--tools', '',
             '--strict-mcp-config', '--mcp-config', str(root / 'cprofile/mcp.json'),
-            '--setting-sources', '', '--disable-slash-commands', '--allowedTools',
-            'mcp__ocbridge__Read,mcp__ocbridge__Edit,mcp__ocbridge__Bash']
+            '--setting-sources', '', '--disable-slash-commands', '--allowedTools', allowed,
+            '--append-system-prompt-file', str(root / 'session/prompt.md')]
     session = info.get('sessionArgs')
     if session is not None:
         # Fixed at launch and persisted, so later roles compare the live argv byte-for-byte.
@@ -552,7 +714,7 @@ def prove_stopped(root, emit=True):
     socket_record = None
     if (root / 'MCP-SOCKET.json').exists():
         socket_record = json.loads(read_private(root / 'MCP-SOCKET.json'))
-        profile = check_profile(root)
+        profile = profile_manifest(root)
         require(socket_record['version'] == 1 and socket_record['root'] == str(root) and
                 socket_record['runId'] == profile['runId'] and
                 socket_record['operationId'] == profile['operationId'], 'wrong-mcp-socket-record')
@@ -653,7 +815,7 @@ def writer_lock(root):
 
 
 def mark_stopping(root):
-    profile = check_profile(root)
+    profile = profile_manifest(root)
     value = {'version': 1, 'root': str(root), 'operationId': profile['operationId'], 'runId': profile['runId']}
     path = root / 'STOPPING.json'
     if path.exists():
@@ -797,6 +959,8 @@ def launch_locked(root, writer_fd, model, profile_dir=None):
            'CLAUDE_CODE_DISABLE_REFUSAL_RETRY': '1',
            'CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS': '0',
            'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
+           # Same MCP output ceiling as the Box path: catalog schemas and results are far larger.
+           'MAX_MCP_OUTPUT_TOKENS': '4000000',
            # Memory belongs to the platform (container), never to the node's ~/.claude/projects.
            'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
     account = account_name(info)
@@ -993,7 +1157,7 @@ def stop_socket_locked(root):
     if not path.exists():
         return {'kind': 'mcp-identity-not-published-not-exit-proof'}
     record = json.loads(read_private(path))
-    profile = check_profile(root)
+    profile = profile_manifest(root)
     require(record['version'] == 1 and record['root'] == str(root) and
             record['runId'] == profile['runId'] and record['operationId'] == profile['operationId'],
             'wrong-stop-mcp-identity')
@@ -1075,6 +1239,8 @@ def reset(root):
             time.sleep(0.2)
         if (root / 'run').exists():
             shutil.rmtree(root / 'run')  # Left by a host that was killed before its own cleanup.
+        if (root / 'session').exists():
+            shutil.rmtree(root / 'session')  # A stale catalog/prompt is never reused by the next lane.
         stale = root / 'tool.sock'
         if stale.is_socket():
             stale.unlink()
@@ -1154,7 +1320,7 @@ if __name__ == '__main__':
             roles = {'workspace': workspace, 'install-profile': install_profile, 'tool-socket': tool_socket,
                      'stop-socket': stop_socket, 'prove-stopped': prove_stopped_role, 'inspect': inspect,
                      'snapshot': snapshot, 'install-cli': install_cli, 'stop': stop, 'cleanup': cleanup,
-                     'provision': provision, 'reset': reset}
+                     'provision': provision, 'reset': reset, 'session-profile': session_profile}
             require(len(sys.argv) == 3 and role in roles, 'unknown-role')
             roles[role](task_root(sys.argv[2]))
     except Exception as error:

@@ -72,8 +72,8 @@ class GuardTests(unittest.TestCase):
             stack.enter_context(patch.object(mod.os, 'execve', execute))
             return mod.main()
 
-    def test_all_five_exact_gateway_commands_pass_the_exec_boundary(self):
-        for role in ('launch', 'tool-socket', 'stop', 'stop-socket', 'prove-stopped'):
+    def test_all_six_exact_gateway_commands_pass_the_exec_boundary(self):
+        for role in ('launch', 'tool-socket', 'stop', 'stop-socket', 'prove-stopped', 'session-profile'):
             with self.subTest(role=role):
                 calls = []
                 def execute(executable, args, env):
@@ -99,7 +99,7 @@ class GuardTests(unittest.TestCase):
 
     def test_unpinned_key_serves_every_chat_root_in_the_prefix_and_nothing_else(self):
         chat = '/home/box/oc-agentremote-l0123456789abcdef0123456'
-        for role in ('provision', 'reset', 'tool-socket', 'launch', 'prove-stopped'):
+        for role in ('provision', 'reset', 'tool-socket', 'launch', 'prove-stopped', 'session-profile'):
             with self.subTest(role=role):
                 calls = []
                 def execute(executable, args, env):
@@ -148,6 +148,20 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(calls[0][5:], ['launch', ROOT, '--model', 'claude-opus-5', '--profile', 'acct-b'])
         self.assertEqual(calls[0][4], "exec(compile(__import__('base64').b64decode('" + base64.b64encode(OTHER_CONTROLLER).decode() + "'),'cc5-task-controller','exec'))")
 
+    def test_session_profile_role_reaches_its_child_with_the_stdin_packet(self):
+        source = b'import json,sys; print(json.dumps({"argv":sys.argv,"packet":sys.stdin.buffer.read().decode()}))'
+        config = {**CONFIG, 'controllerSha256': [hashlib.sha256(source).hexdigest()]}
+        packet = '{"version":1,"catalog":"{}","catalogSha256":"x","prompt":""}'
+        calls = []
+        def execute(executable, args, env):
+            # Safe synthetic source only; it echoes the stdin the guard left in place.
+            child = subprocess.run(args, env=env, input=packet.encode(), capture_output=True, timeout=5, check=True)
+            calls.append(json.loads(child.stdout))
+            raise ReplacedProcess()
+        with self.assertRaises(ReplacedProcess):
+            self.invoke(environment(gateway_command('session-profile', source=source)), execute, config)
+        self.assertEqual(calls, [{'argv': ['-c', 'session-profile', ROOT], 'packet': packet}])
+
     def test_changed_shell_syntax_argv_source_root_role_or_model_never_execute(self):
         original = gateway_command()
         bad = {
@@ -168,6 +182,7 @@ class GuardTests(unittest.TestCase):
             'root-subdir': gateway_command(root=ROOT + '/subdir'),
             'other-role': gateway_command(role='snapshot'),
             'setup-role': gateway_command(role='install-profile'),
+            'session-profile-extra': gateway_command('session-profile', extra=('--model', 'claude-sonnet-5')),
             'role-case': gateway_command(role='Launch'),
             'bad-base64': gateway_command(encoded='@@@'),
             'whitespace-base64': gateway_command(encoded='\n' + base64.b64encode(CONTROLLER).decode()),

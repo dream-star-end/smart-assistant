@@ -21,7 +21,7 @@ const DEFAULT_CC5_UPSTREAM_MODEL = 'claude-sonnet-5'
 function requireHost(ok: unknown): asserts ok {
   if (!ok) throw new Error(FAILED)
 }
-type Cc5SshRole = 'launch' | 'tool-socket' | 'stop' | 'stop-socket' | 'prove-stopped' | 'reset' | 'provision'
+type Cc5SshRole = 'launch' | 'tool-socket' | 'stop' | 'stop-socket' | 'prove-stopped' | 'reset' | 'provision' | 'session-profile'
 /** A remote role exited non-zero; only the controller's fixed one-line label is kept. */
 export class Cc5SshControlError extends Error {
   constructor(readonly remoteMessage: string) {
@@ -414,7 +414,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
           })
         },
       )
-      const timer = setTimeout(() => req.destroy(new Error(FAILED)), this.deadline('toolMs', 45000))
+      const timer = setTimeout(() => req.destroy(new Error(FAILED)), this.deadline('toolMs', 720000))
       req.once('error', () => reject(new Error(FAILED)))
       req.once('close', () => clearTimeout(timer))
       req.end(body)
@@ -452,8 +452,14 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     const provisioned = await this.control('provision', 30000, packet)
     requireHost(provisioned.kind === 'task-root-provisioned' && provisioned.root === this.config.taskRoot)
   }
+  /** After prepareTask, before start: the lane's tool catalog and platform prompt (controller `session-profile`). */
+  async configure(packet: Buffer): Promise<void> {
+    requireHost(!this.started && !this.closing && packet.length > 0 && packet.length <= 4 * 1024 * 1024)
+    const installed = await this.control('session-profile', 30000, packet)
+    requireHost(installed.kind === 'session-profile-installed' && installed.root === this.config.taskRoot)
+  }
   private async control(
-    role: 'stop' | 'stop-socket' | 'prove-stopped' | 'reset' | 'provision',
+    role: Exclude<Cc5SshRole, 'launch' | 'tool-socket'>,
     remaining: number,
     input?: Buffer,
   ): Promise<Record<string, unknown>> {
@@ -469,7 +475,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       const chunks: Buffer[] = []
       let size = 0
       // reset waits on the node for the old round's processes to exit; it has its own bound.
-      const bound = role === 'reset' || role === 'provision' ? remaining : Math.min(remaining, this.deadline('controlMs', 15000))
+      const bound = role === 'reset' || role === 'provision' || role === 'session-profile' ? remaining : Math.min(remaining, this.deadline('controlMs', 15000))
       const timer = setTimeout(
         () => {
           child.kill('SIGKILL')

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """No Claude, network TCP or credentials. Real AF_UNIX MCP-client fixture only."""
 import contextlib
+import hashlib
 import http.server
 import importlib.util
 import io
@@ -14,6 +15,17 @@ import tempfile
 import threading
 import unittest
 import uuid
+
+# One lane's catalog: the generic client carries these verbatim, whatever they are.
+CATALOG = json.dumps({'tools': [
+    {'name': 'Read', 'description': 'Read a file.',
+     'inputSchema': {'type': 'object', 'properties': {'file_path': {'type': 'string'}}}},
+    {'name': 'Edit', 'description': 'Edit a file.', 'inputSchema': {'type': 'object'}},
+    {'name': 'Bash', 'description': 'Run a command.', 'inputSchema': {'type': 'object'}},
+    {'name': 'nested', 'description': 'Nested arguments.',
+     'inputSchema': {'type': 'object', 'properties': {'options': {'type': 'object'}}}},
+]})
+PROMPT = b'Platform lane system prompt.\n'
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("cc5_fixed_mcp", Path(__file__).with_name("cc5-fixed-mcp.py"))
@@ -52,6 +64,16 @@ class Fixture(unittest.TestCase):
         config_file = self.root / "cprofile/client.json"
         config_file.write_text(json.dumps(self.config))
         config_file.chmod(0o600)
+        (self.root / "session").mkdir(mode=0o700)
+        (self.root / "session").chmod(0o700)
+        manifest = {'version': 1, 'task': 'AGENT-REMOTE-T1555U', 'root': str(self.root),
+                    'catalogSha256': hashlib.sha256(CATALOG.encode()).hexdigest(),
+                    'promptSha256': hashlib.sha256(PROMPT).hexdigest()}
+        for name, data in (('catalog.json', CATALOG.encode()), ('prompt.md', PROMPT),
+                           ('SESSION.json', json.dumps(manifest).encode())):
+            (self.root / 'session' / name).write_bytes(data)
+            (self.root / 'session' / name).chmod(0o400)
+        self.catalog = mcp.read_catalog(self.root)
         self.original_root = mcp.ROOT
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(os.chdir, self.cwd)
@@ -119,7 +141,7 @@ class Fixture(unittest.TestCase):
 
     def test_actual_unix_preserves_model_and_rpc_ids_separately(self):
         self.assertEqual(mcp.read_config(self.root), self.config)
-        result = mcp.call_tool(self.root, self.config, 17, self.params())
+        result = mcp.call_tool(self.root, self.config, self.catalog, 17, self.params())
         self.assertFalse(result["isError"])
         self.assertEqual(len(self.calls), 1)
         request = self.calls[0]
@@ -128,33 +150,80 @@ class Fixture(unittest.TestCase):
         self.assertEqual(request["runId"], self.config["runId"])
         self.assertEqual(request["name"], "mcp__ocbridge__Read")
         self.assertEqual(request['inputSha256'], mcp.hashlib.sha256('{"file_path":"资料.txt","limit":5}'.encode()).hexdigest())
+        self.assertEqual(request['arguments'], {'file_path': '资料.txt', 'limit': 5})
         self.assertEqual(result['content'][0]['text'], 'synthetic known result')
 
-    def test_missing_meta_same_ids_or_extra_command_never_reaches_socket(self):
+    def test_nested_object_arguments_use_the_recursive_canonical_hash(self):
+        args = {'file_path': '资料.txt', 'options': {'z': 1, 'a': [2, {'b': 'é'}], 'nested': {'y': None}}}
+        result = mcp.call_tool(self.root, self.config, self.catalog, 17,
+                              self.params(name='nested', arguments=args))
+        self.assertFalse(result['isError'])
+        self.assertEqual(self.calls[0]['arguments'], args)
+        self.assertEqual(self.calls[0]['name'], 'mcp__ocbridge__nested')
+        self.assertEqual(self.calls[0]['inputSha256'], mcp.hashlib.sha256(json.dumps(
+            args, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest())
+
+    def test_any_object_arguments_forward_now_that_per_tool_schemas_are_gone(self):
+        cases = [self.params(arguments={'file_path': 'f', 'command': 'touch outside'}),
+                 self.params(name='Bash', arguments={'command': 'pwd', 'run_in_background': False}),
+                 self.params(name='Bash', arguments={'command': 'pwd', 'timeout': 30001}),
+                 self.params(arguments={'file_path': 'f', 'limit': 1.0}),
+                 self.params(arguments={'file_path': 'f', 'offset': 'not-an-integer'})]
+        for params in cases:
+            with self.subTest(params=params):
+                self.assertFalse(mcp.call_tool(self.root, self.config, self.catalog, 17, params)['isError'])
+        self.assertEqual(len(self.calls), len(cases))
+
+    def test_missing_meta_same_ids_unknown_name_or_bad_arguments_never_reach_socket(self):
+        oversize = {'text': 'x' * (mcp.MAX_ARGUMENTS + 1)}
         for ident, params in [(17, self.params(_meta={})),
                               ("toolu_observed", self.params()),
-                              (17, self.params(arguments={'file_path': 'f', 'command': 'touch outside'})),
                               (17, self.params(name="roundtrip")),
-                              (17, self.params(name='Bash', arguments={'command': 'pwd', 'run_in_background': False})),
-                              (17, self.params(name='Bash', arguments={'command': 'pwd', 'timeout': 30001})),
+                              (17, self.params(arguments=['not', 'a', 'dict'])),
+                              (17, self.params(arguments=oversize)),
                               (17, self.params(arguments={'file_path': '\ud800'})),
-                              (17, self.params(arguments={'file_path': 'f', 'limit': 1.0}))]:
+                              (17, self.params(arguments={'file_path': 'f', 'bad': float('nan')}))]:
             with self.subTest(ident=ident, params=params), self.assertRaises(ValueError):
-                mcp.call_tool(self.root, self.config, ident, params)
+                mcp.call_tool(self.root, self.config, self.catalog, ident, params)
         self.assertEqual(self.calls, [])
+
+    def test_catalog_bytes_must_match_the_installed_session_manifest(self):
+        path = self.root / 'session/catalog.json'
+        original = path.read_bytes()
+
+        def restore():
+            path.chmod(0o600)
+            path.write_bytes(original)
+            path.chmod(0o400)
+            (self.root / 'session').chmod(0o700)
+
+        for case in ('hash', 'mode', 'directory'):
+            with self.subTest(case=case):
+                path.chmod(0o600)
+                if case == 'hash':
+                    path.write_bytes(original.replace(b'Read a file.', b'Read a file!'))
+                path.chmod(0o400)
+                if case == 'mode':
+                    path.chmod(0o644)
+                if case == 'directory':
+                    (self.root / 'session').chmod(0o755)
+                with self.assertRaises(ValueError):
+                    mcp.read_catalog(self.root)
+                restore()
+                self.assertEqual(mcp.read_catalog(self.root)['tools'][0]['name'], 'Read')
 
     def test_response_type_or_terminal_conflict_is_not_success_and_never_retried(self):
         for mode in ["rpc-type-conflict", "invalid-is-error", 'hash-conflict']:
             self.response_mode = mode
             before = len(self.calls)
             with self.subTest(mode=mode), self.assertRaises(ValueError):
-                mcp.call_tool(self.root, self.config, 17, self.params())
+                mcp.call_tool(self.root, self.config, self.catalog, 17, self.params())
             self.assertEqual(len(self.calls), before + 1)
 
     def test_disconnect_is_unknown_without_a_retry(self):
         self.response_mode = "disconnect"
         with self.assertRaises(http.client.RemoteDisconnected):
-            mcp.call_tool(self.root, self.config, 17, self.params())
+            mcp.call_tool(self.root, self.config, self.catalog, 17, self.params())
         self.assertEqual(len(self.calls), 1)
 
     def run_stdio(self, messages):
@@ -170,28 +239,31 @@ class Fixture(unittest.TestCase):
             sys.stdin, sys.argv = old_stdin, old_argv
         return status, [json.loads(line) for line in output.getvalue().splitlines()]
 
-    def test_actual_stdio_dispatch_lists_three_tools_and_allows_distinct_rpc_not_reused_tools(self):
+    def test_actual_stdio_serves_the_catalog_verbatim_and_allows_distinct_rpc_not_reused_tools(self):
         messages = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": self.params()},
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": self.params()},
-            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": self.params(name='Edit',
-                arguments={'file_path': 'f', 'old_string': 'a', 'new_string': 'b'}, _meta={'claudecode/toolUseId': 'toolu_second'})},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": self.params(name='nested',
+                arguments={'options': {'deep': [1, {'two': 'three'}]}},
+                _meta={'claudecode/toolUseId': 'toolu_second'})},
             {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": self.params(name='Bash',
-                arguments={'command': 'pwd', 'timeout': 30000}, _meta={'claudecode/toolUseId': 'toolu_third'})},
+                arguments={'command': 'pwd', 'run_in_background': True}, _meta={'claudecode/toolUseId': 'toolu_third'})},
         ]
         status, rows = self.run_stdio(messages)
         self.assertEqual(status, 0)
         self.assertEqual(rows[0]["result"]["protocolVersion"], "2025-06-18")
-        self.assertEqual([tool["name"] for tool in rows[1]["result"]["tools"]], ['Read', 'Edit', 'Bash'])
+        # Exactly the installed catalog, in catalog order, schema and all.
+        self.assertEqual(rows[1]["result"]["tools"], json.loads(CATALOG)['tools'])
         self.assertEqual(rows[2]["id"], 3)
         self.assertFalse(rows[2]["result"]["isError"])
         self.assertEqual(rows[3]["id"], 4)
-        self.assertEqual(rows[3]["error"]["code"], -32602)
+        self.assertEqual(rows[3]["error"]["code"], -32602)  # Same tool use id is never dispatched twice.
         self.assertFalse(rows[4]['result']['isError'])
         self.assertFalse(rows[5]['result']['isError'])
-        self.assertEqual([row['name'] for row in self.calls], ['mcp__ocbridge__Read', 'mcp__ocbridge__Edit', 'mcp__ocbridge__Bash'])
+        self.assertEqual([row['name'] for row in self.calls], ['mcp__ocbridge__Read', 'mcp__ocbridge__nested',
+                                                              'mcp__ocbridge__Bash'])
 
     def test_unknown_stops_stdio_before_another_distinct_tool_can_be_sent(self):
         self.response_mode = 'disconnect'
@@ -206,7 +278,7 @@ class Fixture(unittest.TestCase):
     def test_standard_image_content_and_known_tool_error_are_preserved(self):
         for mode in ('image', 'known-tool-error'):
             self.response_mode = mode
-            result = mcp.call_tool(self.root, self.config, 17, self.params())
+            result = mcp.call_tool(self.root, self.config, self.catalog, 17, self.params())
             self.assertEqual(result['isError'], mode == 'known-tool-error')
             self.assertEqual(result['content'][0]['type'], 'image' if mode == 'image' else 'text')
 

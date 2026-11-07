@@ -224,6 +224,11 @@ async function harness(f: ReturnType<typeof fixture>, delivery: Cc5ToolDelivery,
   }
 }
 
+function laneProfile(root: string) {
+  return { version: 1 as const, platformPrompt: 'fixture persona',
+    host: { cwd: root, mcpConfigPath: null, settingsPath: null, disallowedTools: ['SendMessage'] } }
+}
+
 test('real Unix tool pump waits for the full original row, executes once and keeps polling until aborted', { timeout: 5000 }, async () => {
   const f = fixture()
   const h = await harness(f, { request: f.request, admission: f.admission })
@@ -408,9 +413,14 @@ test(
           res.end(JSON.stringify({ ok: true, commandId: value.receipt.commandId }))
           complete()
         } else if (req.url === '/tool/register') {
-          lifecycleId = JSON.parse(body).lifecycleId
+          const registration = JSON.parse(body)
+          lifecycleId = registration.lifecycleId
           assert.equal(typeof lifecycleId, 'string')
-          res.end(JSON.stringify({ ok: true, lifecycleId }))
+          // The bridge ships the host's own catalog and the platform prompt for the node launch.
+          assert.deepEqual(JSON.parse(registration.profile.catalog).tools.map((tool: { name: string }) => tool.name), ['Bash', 't1'])
+          assert.deepEqual(registration.profile.toolNames, { mcp__ocbridge__Bash: 'Bash', mcp__ocbridge__t1: 'local.echo' })
+          assert.match(registration.profile.prompt, /^fixture persona\n\n<tool-naming>[\s\S]*- Bash → mcp__ocbridge__Bash/)
+          res.end(JSON.stringify({ ok: true, lifecycleId, toolNames: null }))
         } else if (req.url === '/tool/stopped') {
           const value = JSON.parse(body)
           assert.equal(value.lifecycleId, lifecycleId)
@@ -435,12 +445,17 @@ test(
       stdout,
       socketPath,
       signal: controller.signal,
-      tools: { keyring: f.keyring, executionRoot: f.root, hostFactory(root, identity) {
-        assert.equal(identity, lifecycleId)
+      tools: { keyring: f.keyring, executionRoot: f.root, lane: laneProfile(f.root), hostFactory(root, identity, profile) {
         assert.equal(root, join(f.root, `host-${identity}`))
+        assert.deepEqual(profile, laneProfile(f.root).host)
         return {
+          async tools() {
+            return [{ name: 'Bash', description: 'Run a command.', inputSchema: { type: 'object' } },
+              { name: 'local.echo', description: 'Echo.', inputSchema: { type: 'object' } }]
+          },
           async execute(name, args, request) {
-            assert.equal(name, f.request.name)
+            assert.equal(identity, lifecycleId)
+            assert.equal(name, 'Bash')
             assert.deepEqual(args, f.request.arguments)
             assert.equal(request.toolUseId, f.request.toolUseId)
             writeFileSync(effectPath(f), 'one local effect', { flag: 'wx', mode: 0o600 })
@@ -475,7 +490,7 @@ test(
 )
 
 test(
-  'a tool host that dies at start ends the bridge with that cause and releases its stdin',
+  'a tool host that dies at start ends the bridge with that cause before the lane is registered',
   { timeout: 15000 },
   async () => {
     // 2026-11-07 web incident: the container lacked the supervisor script, the relay's /stop
@@ -488,6 +503,8 @@ test(
     const raw = original(f)
     let results = 0
     let polls = 0
+    let registered = 0
+    let closed = 0
     const server = createServer((req, res) => {
       let body = ''
       if (req.url === '/session/open') {
@@ -509,6 +526,7 @@ test(
         if (req.url === '/tool/next') {
           if (++polls === 1) res.end(JSON.stringify({ ok: true, delivery: { request: f.request, admission: f.admission } }))
         } else if (req.url === '/tool/register') {
+          registered++
           res.end(JSON.stringify({ ok: true, lifecycleId: JSON.parse(body).lifecycleId }))
         } else if (req.url === '/tool/result') {
           results++
@@ -524,16 +542,19 @@ test(
       stdin,
       stdout,
       socketPath,
-      tools: { keyring: f.keyring, executionRoot: f.root, hostFactory: () => ({
+      tools: { keyring: f.keyring, executionRoot: f.root, lane: laneProfile(f.root), hostFactory: () => ({
+        tools: async () => { throw new Error('CC5_TOOLHOST_EXECUTION_UNKNOWN') },
         execute: async () => { throw new Error('CC5_TOOLHOST_EXECUTION_UNKNOWN') },
-        close: async () => { throw new Error('CC5_TOOLHOST_STOP_UNKNOWN') },
+        close: async () => { closed++; throw new Error('CC5_TOOLHOST_STOP_UNKNOWN') },
       }) },
     })
     try {
       stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: 'remember 42' } })}\n`)
-      await assert.rejects(running, /^Error: CC5_FIXED_TOOL_FAILED_OR_UNKNOWN$/)
+      await assert.rejects(running, /^Error: CC5_TOOLHOST_EXECUTION_UNKNOWN$/)
+      assert.equal(registered, 0, 'a lane without a tool catalog is never launched')
       assert.equal(results, 0, 'no receipt for an effect that never ran')
-      assert.equal(stdin.readableFlowing, false, 'a finished bridge must not keep reading stdin')
+      assert.equal(closed, 1)
+      assert.notEqual(stdin.readableFlowing, true, 'a finished bridge must not keep reading stdin')
     } finally {
       await running.catch(() => {})
       server.closeAllConnections()

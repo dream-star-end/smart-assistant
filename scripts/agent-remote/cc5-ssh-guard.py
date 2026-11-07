@@ -27,7 +27,8 @@ import sys
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name('cc5-ssh-guard.json')
 PYTHON = '/usr/bin/python3'
-ROLES = frozenset(('launch', 'tool-socket', 'stop', 'stop-socket', 'prove-stopped', 'provision', 'reset'))
+ROLES = frozenset(('launch', 'tool-socket', 'stop', 'stop-socket', 'prove-stopped', 'provision', 'reset',
+                   'session-profile'))
 MAX_CONFIG_BYTES = 65536
 MAX_SOURCE_BYTES = 131072  # Same bound as Cc5SshHost's pinned controller file.
 MAX_COMMAND_BYTES = 4 * ((MAX_SOURCE_BYTES + 2) // 3) + 4096

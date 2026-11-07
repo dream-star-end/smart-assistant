@@ -18,6 +18,11 @@ from uuid import uuid4
 
 CLIENT = Path(__file__).with_name('cc5-fixed-mcp.py').resolve()
 HELPER = Path(__file__).with_name('cc5-mcp-socket.py').resolve()
+CATALOG = {'tools': [
+    {'name': 'Read', 'description': 'Read a file.', 'inputSchema': {'type': 'object'}},
+    {'name': 'Edit', 'description': 'Edit a file.', 'inputSchema': {'type': 'object'}},
+    {'name': 'Bash', 'description': 'Run a command.', 'inputSchema': {'type': 'object'}},
+]}
 # Only the fixture imports and substitutes the existing client root policy;
 # production has no option for this. First assert the original policy rejects it.
 WRAPPER = '''import importlib.util,re,sys
@@ -34,7 +39,19 @@ sys.exit(m.run(root,c,sys.stdin.buffer,sys.stdout.buffer))
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'real SO_PEERCRED and /proc fixture requires Linux')
 class SocketBridge(unittest.TestCase):
-    def fixture(self):
+    def install_session(self, root):
+        (root / 'session').mkdir(mode=0o700)
+        catalog = json.dumps(CATALOG, separators=(',', ':'))
+        prompt = b'fixture prompt\n'
+        manifest = {'version': 1, 'task': 'AGENT-REMOTE-T1555U', 'root': str(root),
+                    'catalogSha256': hashlib.sha256(catalog.encode()).hexdigest(),
+                    'promptSha256': hashlib.sha256(prompt).hexdigest()}
+        for name, data in (('catalog.json', catalog.encode()), ('prompt.md', prompt),
+                           ('SESSION.json', json.dumps(manifest).encode())):
+            (root / 'session' / name).write_bytes(data)
+            (root / 'session' / name).chmod(0o400)
+
+    def fixture(self, session=True):
         Path('.task-tmp').mkdir(exist_ok=True, mode=0o700)
         root = Path(os.path.relpath(tempfile.mkdtemp(prefix='cc5-socket-', dir='.task-tmp'), os.getcwd()))
         (root / 'cprofile').mkdir(mode=0o700)
@@ -43,6 +60,8 @@ class SocketBridge(unittest.TestCase):
         config = {'version': 2, 'operationId': str(uuid4()), 'runId': str(uuid4())}
         (root / 'cprofile/client.json').write_text(json.dumps(config))
         (root / 'cprofile/client.json').chmod(0o400)
+        if session:
+            self.install_session(root)
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         return (root, config, self.start(root, config))
 
@@ -174,6 +193,22 @@ class SocketBridge(unittest.TestCase):
                 self.assertEqual(list((root / 'tool-attempts').glob('*.result.json')), [])
                 self.assertFalse((root / 'tool.sock').exists())
                 self.assertEqual(child.stdout.read(), b'', 'no second tool dispatch')
+
+    def test_a_round_starts_the_socket_before_the_lane_catalog_and_serves_it_once_installed(self):
+        # Real round order: tool-socket, then session-profile, then launch.
+        root, config, child = self.fixture(session=False)
+        self.assertFalse((root / 'session').exists())
+        self.assertNotEqual(self.rpc(root, self.body(config))[0], 200)
+        self.assertFalse(select.select([child.stdout], [], [], 0)[0], 'no frame without a catalog')
+        self.install_session(root)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            body = self.body(config, 'Edit', 7, 'toolu_after_install')
+            result = executor.submit(self.rpc, root, body)
+            self.assertEqual(self.frame(child)['seq'], 1)
+            exact = self.respond(child, body, 1)
+            self.assertEqual(result.result(timeout=5), (200, exact))
+        child.stdin.close(); child.wait(timeout=3)
+        self.assertEqual(child.returncode, 0)
 
     def test_wrong_rpc_id_type_is_rejected_before_attempt_or_ssh_frame(self):
         root, config, child = self.fixture()
