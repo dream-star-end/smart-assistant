@@ -11,12 +11,12 @@
 import { createHash } from 'node:crypto'
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync,
   readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Cc5HostProfile, Cc5ToolCatalog } from './cc5ToolCatalog.js'
 
 /** Bumped when the cache layout, the key inputs or catalog compilation change meaning. */
-export const CC5_TOOL_CATALOG_CACHE_VERSION = 1
+export const CC5_TOOL_CATALOG_CACHE_VERSION = 2
 const CACHE_DIR = 'catalog-cache'
 const CATALOG_MAX_BYTES = 1048576
 const ENTRY_MAX_BYTES = CATALOG_MAX_BYTES + 262144
@@ -73,6 +73,45 @@ function mcpShape(bytes: Buffer): string | undefined {
     return undefined
   }
 }
+const CWD_FILES = [join('.claude', 'settings.json'), join('.claude', 'settings.local.json'), '.mcp.json'] as const
+const ANCESTOR_DIRS = [join('.claude', 'skills'), join('.claude', 'commands'), join('.claude', 'agents')] as const
+const MAX_ANCESTORS = 64
+const MAX_DIR_ENTRIES = 1024
+/**
+ * What the working directory contributes to the tool set: the project/local settings and project
+ * MCP file in the cwd itself, and the skill/command/agent folders the cwd and its ancestors carry.
+ * The path itself is not part of it: every unbound chat runs in its own session folder, so keying
+ * the raw cwd made each new chat a cache miss.
+ */
+function cwdToolSources(cwd: string): string | undefined {
+  const sources: unknown[] = []
+  for (const file of CWD_FILES) {
+    const path = join(cwd, file)
+    if (!lstatSync(path, { throwIfNoEntry: false })) continue
+    const bytes = readBounded(path)
+    if (!bytes) return undefined
+    sources.push(['file', file, sha256(bytes)])
+  }
+  let dir = resolve(cwd)
+  for (let level = 0; level < MAX_ANCESTORS; level += 1) {
+    for (const folder of ANCESTOR_DIRS) {
+      const path = join(dir, folder)
+      if (!lstatSync(path, { throwIfNoEntry: false })) continue
+      let entries: string[]
+      try {
+        entries = readdirSync(path, { withFileTypes: true }).map((e) => `${e.isDirectory() ? 'd' : 'f'}:${e.name}`)
+      } catch {
+        return undefined
+      }
+      if (entries.length > MAX_DIR_ENTRIES) return undefined
+      sources.push(['dir', folder, entries.sort()])
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return JSON.stringify(sources)
+    dir = parent
+  }
+  return undefined
+}
 /** The CCB build the host runs: the entry chunk names every content-hashed chunk it can reach. */
 function ccbIdentity(): string | undefined {
   const entry = readBounded(join(repoRoot, 'claude-code-best/dist/cli.js'), CONFIG_MAX_BYTES)
@@ -96,10 +135,12 @@ export function cc5ToolCatalogCacheKey(profile: Cc5HostProfile): string | undefi
   const mcp = profile.mcpConfigPath ? readBounded(profile.mcpConfigPath) : undefined
   const mcpDigest = profile.mcpConfigPath ? (mcp && mcpShape(mcp)) : 'none'
   if (!mcpDigest) return undefined
+  const cwd = cwdToolSources(profile.cwd)
+  if (cwd === undefined) return undefined
   return sha256(JSON.stringify({
     version: CC5_TOOL_CATALOG_CACHE_VERSION,
     ccb,
-    cwd: profile.cwd,
+    cwd: sha256(cwd),
     disallowedTools: [...profile.disallowedTools].sort(),
     settings: settings ? sha256(settings) : 'none',
     mcp: sha256(mcpDigest),
