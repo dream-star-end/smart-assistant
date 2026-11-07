@@ -38,7 +38,7 @@ import {
   reserveTurnIndex,
   paths,
   projectSessionFingerprint,
-  loadProjectContext,
+  loadProjectContextAllowReadOnly,
   skillOverlayManifestSha256,
   type KernelFileLock,
   withIdleNativeLock,
@@ -280,7 +280,7 @@ async function computeSessionContextFingerprint(
   const id = typeof projectId === 'string' ? projectId.trim() : ''
   if (!id) return projectSessionFingerprint({ projectId: null })
   try {
-    const snap = await loadProjectContext(id)
+    const snap = await loadProjectContextAllowReadOnly(id)
     return projectSessionFingerprint({
       projectId: id,
       contextVersion: snap.version,

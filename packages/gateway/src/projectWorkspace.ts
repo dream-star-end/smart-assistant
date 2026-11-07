@@ -7,7 +7,7 @@
  */
 import {
   isProjectContextEnabled,
-  loadProjectContext,
+  loadProjectContextAllowReadOnly,
   parseProjectWorkspace,
   projectSessionFingerprint,
   resolveProjectCwd,
@@ -32,6 +32,7 @@ export interface ChatRunWorkspace {
   chatProjectId?: string | null
   /** The project context could not be read; the caller must not run the turn as unbound. */
   unavailable?: ProjectContextUnavailableReason
+  unavailableCode?: string
 }
 
 export interface BoardProjectWorkspaceView {
@@ -74,7 +75,13 @@ export async function resolveChatRunWorkspace(opts: {
     boardProjectId: opts.boardProjectId,
     env: opts.env,
   })
-  if (resolved?.unavailable) return { ...UNBOUND, unavailable: resolved.unavailable }
+  if (resolved?.unavailable) {
+    return {
+      ...UNBOUND,
+      unavailable: resolved.unavailable,
+      ...(resolved.unavailableCode ? { unavailableCode: resolved.unavailableCode } : {}),
+    }
+  }
   const projectId = resolved?.boardProjectId ?? null
   if (!projectId || !resolved?.bound) return { ...UNBOUND, chatProjectId: resolved?.chatProjectId ?? null }
   const lookup = opts.getBoardProject ?? defaultGetBoardProject
@@ -87,7 +94,7 @@ export async function resolveChatRunWorkspace(opts: {
     assetsRevision: resolved.assetsRevision,
   })
   try {
-    const snap = await loadProjectContext(projectId)
+    const snap = await loadProjectContextAllowReadOnly(projectId)
     contextFingerprint = projectSessionFingerprint({
       projectId,
       contextVersion: snap.version,
