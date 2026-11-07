@@ -298,8 +298,25 @@ test('cache keys survive per-session config values but not a changed catalog inp
       args: ['/fixture/memory.cjs'], env: { OPENCLAUDE_SESSION_KEY: 'another-session',
         OPENCLAUDE_GATEWAY_TOKEN: 'another-token' } } } }), { mode: 0o600 })
     assert.equal(cc5ToolCatalogCacheKey(other), base)
-    // A different tool source, cwd, settings or disallowed list must not reuse the entry.
-    assert.notEqual(cc5ToolCatalogCacheKey({ ...other, cwd: join(f.root, 'elsewhere') }), base)
+    // Every unbound chat runs in its own session folder: a new folder with the same tool sources
+    // is the same entry (production: two fresh chats got two keys and both missed).
+    const sessions = join(f.root, 'workspace', 'sessions')
+    const chatA = join(sessions, 'webchatA')
+    const chatB = join(sessions, 'webchatB')
+    mkdirSync(chatA, { recursive: true })
+    mkdirSync(chatB, { recursive: true })
+    const inA = cc5ToolCatalogCacheKey({ ...other, cwd: chatA })
+    assert.ok(inA)
+    assert.equal(cc5ToolCatalogCacheKey({ ...other, cwd: chatB }), inA)
+    // What the folder brings to the tool set still splits the entry.
+    mkdirSync(join(chatB, '.claude'), { recursive: true })
+    writeFileSync(join(chatB, '.claude', 'settings.json'), JSON.stringify({ permissions: { deny: ['Bash'] } }))
+    assert.notEqual(cc5ToolCatalogCacheKey({ ...other, cwd: chatB }), inA)
+    const chatC = join(sessions, 'webchatC')
+    mkdirSync(join(sessions, '.claude', 'skills', 'demo'), { recursive: true })
+    mkdirSync(chatC, { recursive: true })
+    assert.notEqual(cc5ToolCatalogCacheKey({ ...other, cwd: chatC }), inA)
+    // A different tool source, settings or disallowed list must not reuse the entry.
     assert.notEqual(cc5ToolCatalogCacheKey({ ...other, disallowedTools: [] }), base)
     writeFileSync(other.settingsPath, JSON.stringify({ hooks: { PreToolUse: [] } }), { mode: 0o600 })
     assert.notEqual(cc5ToolCatalogCacheKey(other), base)
