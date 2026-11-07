@@ -11,8 +11,10 @@ import { idleSummaryAccepted, readIdleNative, writeIdleOp, type IdleOp } from '.
 export async function recoverUnconfirmedIdle(runner: EngineAdapter, op: IdleOp, dir: string,
   deadline: number): Promise<IdleOp> {
   const left = (cap: number) => Math.max(1, Math.min(cap, deadline - Date.now()))
+  // Revalidate even historical markers: old shutdown implementations could
+  // resolve before close. Incarnation evidence still fences the old process.
+  if (!await shutdownIdleRunner(runner, left(5_000))) return op
   if (typeof op.runnerKilledAt !== 'number') {
-    if (!await shutdownIdleRunner(runner, left(5_000))) return op
     op = { ...op, runnerKilledAt: Date.now() }
     writeIdleOp(dir, op, { preservePreparedMtime: true })
   }

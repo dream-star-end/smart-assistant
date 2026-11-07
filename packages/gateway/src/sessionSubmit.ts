@@ -2510,6 +2510,8 @@ export async function finishIdleUnderLock(
           sessionTotals: session,
           toolUseIdToName: session.toolUseIdToName ?? new Map(),
         }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 60_000 })
+        if (settled?.isError && /\bIDLE_RECOVERY_CORRUPT\b/.test(settled.errorDetail ?? ''))
+          throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
         const receipt = settled?.nativeIdleReceipt
         if (needsApply && (receipt?.digest !== step.op.artifact?.digest || receipt?.opId !== step.op.idleTurnKey)) {
           log.warn('box idle apply receipt unconfirmed', {
@@ -2560,6 +2562,8 @@ export async function finishIdleUnderLock(
                 sessionTotals: session,
                 toolUseIdToName: session.toolUseIdToName ?? new Map(),
               }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 60_000 })
+              if (applied?.isError && /\bIDLE_RECOVERY_CORRUPT\b/.test(applied.errorDetail ?? ''))
+                throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
               const applyReceipt = applied?.nativeIdleReceipt
               if (applyReceipt?.digest !== step.op.artifact.digest || applyReceipt?.opId !== step.op.idleTurnKey) log.warn('box idle apply receipt unconfirmed', {
                 sessionKey: session.sessionKey, revision: step.op.revision,

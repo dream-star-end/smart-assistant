@@ -218,22 +218,24 @@ async function proofServer(unknownProof = false) {
     await new Promise<void>(r => server.close(() => r()))
   }
 }
-for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-stop'] as const) {
+for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-stop', 'false-stop', 'corrupt'] as const) {
   test(`OCV5-747 real inbound + submit: ${mode}`, { timeout: 30000 }, async () => {
     const f = gatewayFixture()
     f.session.channel = 'webchat'
     const artifact = seed(f.sessionKey)
     const close = await proofServer(mode === 'unknown-proof')
-    const rejected = ['unstoppable', 'unknown-proof', 'hung-stop'].includes(mode)
+    const rejected = ['unstoppable', 'unknown-proof', 'hung-stop', 'false-stop', 'corrupt'].includes(mode)
     let release!: () => void, entered!: () => void
     const held = new Promise<void>(r => { release = r })
     const started = new Promise<void>(r => { entered = r })
     f.runner.idleHook = async () => {
       entered()
+      if (mode === 'corrupt') return { isError: true, errorDetail: 'IDLE_RECOVERY_CORRUPT' } as TurnSummary
       if (mode === 'receipt') await held
       return mode === 'receipt' ? { nativeIdleReceipt: { opId: idleKey, digest: artifact.digest } } as TurnSummary : {} as TurnSummary
     }
     f.runner.stopFails = mode === 'unstoppable'
+    if (mode === 'false-stop') f.runner.shutdown = async () => {}
     if (mode === 'hung-stop') {
       f.runner.shutdown = () => new Promise<void>(() => {})
       f.session._idleDeadline = Date.now() + 100
@@ -252,7 +254,7 @@ for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-
         release()
       }
       if (rejected) {
-        await assert.rejects(work, /IDLE_RECOVERY_PENDING:[1-9]/)
+        await assert.rejects(work, mode === 'corrupt' ? /IDLE_RECOVERY_CORRUPT/ : /IDLE_RECOVERY_PENDING:[1-9]/)
         assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 0)
         assert.equal(readIdleOp(home, f.sessionKey, revision)?.disposition, undefined)
       } else {

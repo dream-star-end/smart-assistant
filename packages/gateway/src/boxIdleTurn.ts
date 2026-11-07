@@ -95,6 +95,13 @@ export async function runBoxIdleTurn(runner: EngineAdapter, params: TurnParams,
 
 export async function shutdownIdleRunner(runner: EngineAdapter, ms = BOX_IDLE_TURN_KILL_GRACE_MS): Promise<boolean> {
   if (typeof runner.shutdown !== 'function') return false
-  return await withinIdleBudget(Promise.resolve().then(() => runner.shutdown()).then(() => true, () => false),
-    Math.max(0, ms)) === true
+  const stopped = Promise.resolve().then(() => runner.shutdown()).then(() => {
+    // SubprocessRunner.shutdown can return after its final drain deadline while
+    // retaining the child. Resolution alone is NOT a quiescence receipt.
+    if (runner.isRunning !== false) return false
+    const assertStopped = (runner as EngineAdapter & { assertPromptPrivacyStopped?: () => void }).assertPromptPrivacyStopped
+    assertStopped?.call(runner) // CCB checks retained proc ownership, not only isRunning.
+    return true
+  }).catch(() => false)
+  return await withinIdleBudget(stopped, Math.max(0, ms)) === true
 }
