@@ -18,6 +18,8 @@ const fs = require('node:fs');
 const {createHash} = require('node:crypto');
 const [role, raw] = process.argv.slice(1); const c = JSON.parse(raw);
 if (role === 'tool-socket') {
+  if (c.socketExit) process.exit(21);
+  if (c.badSocketFrame) process.stdout.write(JSON.stringify({version:2,kind:'not-socket-ready'})+'\n');
   setTimeout(() => {
     const row = JSON.stringify({version:2,kind:'socket-ready',runId:c.runId,
       operationId:c.operationId,pid:process.pid,startTicks:'12'})+'\n';
@@ -158,6 +160,11 @@ function fixture(
     roles,
     argv,
     config,
+    /** A second transport for the same task root, as a stale-catalog replacement builds one. */
+    next() {
+      return new Cc5SshHost(config, { spawn: spawnFixture, startupMs: 4000, controlMs: 1000,
+        toolMs: 1000, stopMs: 3000, ...deadlines })
+    },
     start() {
       streams = host.start()
       streams.stdout.on('error', (e) => errors.push(e))
@@ -226,24 +233,44 @@ test('fixed SSH argv waits for helper READY and transports original bytes withou
   }
 })
 
-test('the tool-socket channel opens while the profile installs and launch waits for both', async () => {
-  // 300 ms helper delay: the profile install finishes long before socket-ready.
+test('a fresh lane installs the profile before the tool socket and launch waits for it', async () => {
+  // 300 ms helper delay: socket-ready is still outstanding when the launch is requested.
   const f = fixture({ helperDelay: 300 })
   try {
-    const prepare = f.host.prepare()
-    const configure = f.host.configure(Buffer.from('{"version":1,"synthetic":"profile"}'))
-    // Both SSH channels are in flight before either one has finished.
-    assert.deepEqual(f.roles, ['tool-socket', 'session-profile'])
-    await configure
+    // The controller's tool-socket role validates the lane profile, so a fresh root has none
+    // to open the socket against: the profile install must complete first.
+    await f.host.configure(Buffer.from('{"version":1,"synthetic":"profile"}'))
     assert.equal(readFileSync(join(f.root, 'profile'), 'utf8'), 'installed')
-    assert.deepEqual(f.roles, ['tool-socket', 'session-profile'])
+    assert.deepEqual(f.roles, ['session-profile'])
+    const prepare = f.host.prepare()
+    assert.deepEqual(f.roles, ['session-profile', 'tool-socket'])
     const streams = f.start()
     // Socket-ready is still outstanding, so no launch may have been requested yet.
-    assert.deepEqual(f.roles, ['tool-socket', 'session-profile'])
+    assert.deepEqual(f.roles, ['session-profile', 'tool-socket'])
     await prepare
     await streams.ready
-    assert.deepEqual(f.roles, ['tool-socket', 'session-profile', 'launch'])
+    assert.deepEqual(f.roles, ['session-profile', 'tool-socket', 'launch'])
     assert.deepEqual(await f.host.stop(), { remoteStopped: true })
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a replacement lane rotates through the tool socket before installing the new profile', async () => {
+  const f = fixture({ helperDelay: 50 })
+  const replacement = f.next()
+  try {
+    // An already-launched round keeps its LIFECYCLE record: only tool-socket's rotate proves
+    // the old round gone and clears it, and only then does session-profile accept a new one.
+    const prepare = replacement.prepare()
+    assert.deepEqual(f.roles, ['tool-socket'])
+    await prepare
+    await replacement.configure(Buffer.from('{"version":1,"synthetic":"replacement"}'))
+    assert.deepEqual(f.roles, ['tool-socket', 'session-profile'])
+    const streams = replacement.start()
+    await streams.ready
+    assert.deepEqual(f.roles, ['tool-socket', 'session-profile', 'launch'])
+    assert.deepEqual(await replacement.stop(), { remoteStopped: true })
   } finally {
     await f.cleanup()
   }
@@ -252,14 +279,44 @@ test('the tool-socket channel opens while the profile installs and launch waits 
 test('a failed profile install never launches the remote', async () => {
   const f = fixture({ failProfile: true })
   try {
-    const prepare = f.host.prepare()
-    void prepare.catch(() => {})
     await assert.rejects(f.host.configure(Buffer.from('{"version":1}')))
     await f.host.stop().catch(() => {})
     assert.equal(f.roles.includes('launch'), false)
     assert.equal(f.roles.filter((role) => role === 'session-profile').length, 1)
   } finally {
     await f.cleanup()
+  }
+})
+
+test('a preparation failure before start() rejects prepare() without an uncaught stream error or a launch', async (t) => {
+  const cases: Array<[string, Record<string, unknown>, Record<string, number>]> = [
+    ['tool socket exit', { socketExit: true }, {}],
+    ['bad socket READY', { badSocketFrame: true }, {}],
+    ['startup timeout', { helperDelay: 5000 }, { startupMs: 100 }],
+  ]
+  for (const [label, options, deadlines] of cases) {
+    await t.test(label, async () => {
+      const uncaught: Error[] = []
+      const observe = (error: Error): void => {
+        uncaught.push(error)
+      }
+      process.on('uncaughtException', observe)
+      const f = fixture(options, deadlines)
+      try {
+        await assert.rejects(f.host.prepare(), /CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN/)
+        // A failed preparation must not be followed by a late launch.
+        assert.throws(() => f.host.start(), /CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN/)
+        await f.host.stop().catch(() => {})
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        assert.deepEqual(uncaught.map((error) => error.message), [])
+        assert.equal(f.roles.filter((role) => role === 'launch').length, 0)
+        // The failure path still proves the remote absent and tears both channels down.
+        assert.ok(f.roles.includes('stop') && f.roles.includes('prove-stopped'))
+      } finally {
+        process.removeListener('uncaughtException', observe)
+        await f.cleanup()
+      }
+    })
   }
 })
 

@@ -126,6 +126,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
   private rejectReady!: (reason: Error) => void
   private cancelSocketReady?: () => void
   private started = false
+  private failed = false
   private closing = false
   private originalReady = false
   private stopPromise?: Promise<{ remoteStopped: true }>
@@ -290,14 +291,14 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     })
     return channel
   }
-  /** The tool-socket channel carries no session data, so it opens while the profile is installed. */
+  /** Opens the tool-socket channel; the lane's profile must already be installed (see Cc5Relay). */
   prepare(): Promise<void> {
-    requireHost(!this.started && !this.closing)
+    requireHost(!this.started && !this.failed && !this.closing)
     this.startupTimer ??= setTimeout(() => this.fail(), this.deadline('startupMs', 65000))
     return this.openToolChannel()
   }
   start(): ReturnType<Cc5InteractiveHostPort['start']> {
-    requireHost(!this.started && !this.closing)
+    requireHost(!this.started && !this.failed && !this.closing)
     this.started = true
     this.startupTimer ??= setTimeout(() => this.fail(), this.deadline('startupMs', 65000))
     void Promise.resolve()
@@ -306,9 +307,14 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     return { stdin: this.input, stdout: this.output, ready: this.ready }
   }
   private fail(): void {
+    this.failed = true
     this.rejectReady(new Error(FAILED))
+    // Nothing has consumed the tool-socket yet when preparation fails; reject that promise too.
+    this.cancelSocketReady?.()
     if (!this.closing) {
-      this.output.destroy(new Error(FAILED))
+      // Before start() no listener is attached to the returned stdout: destroying it with an
+      // error would escape as an uncaught exception. Preparation failures travel on prepare().
+      if (this.started) this.output.destroy(new Error(FAILED))
       void this.stop().catch(() => {})
     }
   }

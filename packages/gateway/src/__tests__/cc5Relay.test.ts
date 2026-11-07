@@ -139,7 +139,8 @@ async function harness(
   f: ReturnType<typeof fixture>,
   failure: 'none' | 'start' | 'stop' = 'none',
   financeOverride?: Cc5FinancePort,
-  options: { configure?: boolean; prepare?: boolean; failConfigure?: boolean; replaceHost?: boolean } = {},
+  options: { configure?: boolean; prepare?: boolean; failConfigure?: boolean; replaceHost?: boolean;
+    configureGate?: Promise<void>; prepareGate?: Promise<void> } = {},
 ) {
   const written: Buffer[] = []
   const input = new PassThrough()
@@ -165,25 +166,26 @@ async function harness(
   let stops = 0
   const configurePackets: Buffer[] = []
   const hostEvents: string[] = []
-  let configureStarted!: () => void
-  const configureStartedPromise = new Promise<void>((resolve) => {
-    configureStarted = resolve
+  let configureEntered!: () => void
+  const configureEnteredPromise = new Promise<void>((resolve) => {
+    configureEntered = resolve
   })
   const port: Cc5InteractiveHostPort = {
     ...(options.prepare
       ? { async prepare() {
         hostEvents.push('prepare')
-        // Neither channel may finish before the other one has started.
-        await Promise.race([configureStartedPromise, new Promise((resolve) => setTimeout(resolve, 2000))])
+        await options.prepareGate
         hostEvents.push('prepare-done')
       } }
       : {}),
     ...(options.configure
       ? { async configure(packet: Buffer) {
-        hostEvents.push('configure')
-        configureStarted()
+        configureEntered()
+        await options.configureGate
         if (options.failConfigure) throw new Error('synthetic profile install failed')
         configurePackets.push(Buffer.from(packet))
+        // Recorded on completion, so the event order is the order the remote saw.
+        hostEvents.push('configure')
       } }
       : {}),
     start() {
@@ -222,9 +224,12 @@ async function harness(
     void startObserved.catch(() => {})
     replacements.push(replacement)
     return {
+      async prepare() {
+        replacement.events.push('prepare')
+      },
       async configure(packet: Buffer) {
-        replacement.events.push('configure')
         replacement.packets.push(Buffer.from(packet))
+        replacement.events.push('configure')
       },
       start() {
         replacement.starts++
@@ -333,6 +338,7 @@ async function harness(
     stopped,
     lifecycleId,
     configurePackets,
+    configureEntered: configureEnteredPromise,
     hostEvents,
     replacements,
     counts: () => ({ starts, stops }),
@@ -1007,7 +1013,9 @@ test('a stale catalog replaces the wrongly launched remote inside the same turn'
     assert.deepEqual(replaced.toolNames, second.toolNames)
     assert.equal(h.replacements.length, 1)
     assert.deepEqual(h.replacements[0]!.packets, [profilePacket(second)])
-    assert.deepEqual(h.replacements[0]!.events, ['configure', 'start'])
+    // The replacement's tool socket rotates the old round first: the controller refuses
+    // `session-profile` while the old LIFECYCLE record still proves the previous round.
+    assert.deepEqual(h.replacements[0]!.events, ['prepare', 'configure', 'start'])
     h.replacements[0]!.ready()
     // Admission and the stream both wait for the replacement, not for the abandoned launch.
     await admitted
@@ -1044,26 +1052,101 @@ test('a replacement is refused once the user frame reached the remote', async ()
   } finally { s?.req.destroy(); await h.close(); f.cleanup() }
 })
 
-test('the tool-socket channel overlaps the profile install and launch waits for both', async () => {
+test('a fresh lane installs the session profile before the tool socket and launches last', async () => {
   const f = fixture()
   const h = await harness(f, 'none', undefined, { configure: true, prepare: true })
   try {
-    await h.register(toolProfile())
+    const profile = toolProfile()
+    await h.register(profile)
     h.ready()
     await h.admit()
-    // Both channels start before either finishes; launch is last.
-    assert.deepEqual(h.hostEvents, ['prepare', 'configure', 'prepare-done', 'start'])
+    // The node controller's tool-socket role validates the installed session, so the fresh
+    // lane's profile install must finish first; the socket then opens and launch is last.
+    assert.deepEqual(h.hostEvents, ['configure', 'prepare', 'prepare-done', 'start'])
+    assert.deepEqual(h.configurePackets, [profilePacket(profile)])
+    assert.equal(h.counts().starts, 1)
   } finally { await h.close(); f.cleanup() }
 })
 
-test('a failed profile install never launches the remote', async () => {
+test('a failed profile install never opens the tool socket nor launches the remote', async () => {
   const f = fixture()
   const h = await harness(f, 'none', undefined, { configure: true, prepare: true, failConfigure: true })
   try {
     await h.register(toolProfile())
     h.ready()
     await assert.rejects(h.admit())
-    assert.equal(h.hostEvents.includes('start'), false)
+    assert.deepEqual(h.hostEvents, [])
     assert.equal(h.counts().starts, 0)
   } finally { await h.close(); f.cleanup() }
+})
+
+test('a live catalog during the fresh profile install re-installs it before the launch', async () => {
+  const f = fixture()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const h = await harness(f, 'none', undefined, { configure: true, prepare: true, configureGate: gate })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const first = toolProfile([{ alias: 'Read', client: 'Read' }])
+    await h.register(first)
+    h.ready()
+    const admitted = h.admit()
+    void admitted.catch(() => {})
+    await h.configureEntered
+    // The bridge's live tools/list found the cached catalog stale while the first install ran.
+    const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
+    const replaced = rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: second })
+    // Adopted (200) while the first install is still held: the start sequence, not this reply,
+    // carries the newest profile to the node.
+    assert.deepEqual((await replaced).toolNames, second.toolNames)
+    release()
+    await admitted
+    assert.deepEqual(h.configurePackets, [profilePacket(first), profilePacket(second)])
+    // No second launch: the same lane started once, with the new catalog, and was never replaced.
+    assert.equal(h.counts().starts, 1)
+    assert.equal(h.replacements.length, 0)
+    s = await stream(h)
+    s.send()
+    await until(() => h.written.length === 1)
+    // The tool socket opened after both installs and the launch carries the newest catalog.
+    assert.deepEqual(h.hostEvents, ['configure', 'configure', 'prepare', 'prepare-done', 'start'])
+    // The abandoned alias is not part of the launched catalog; only the new one is accepted.
+    const stale = await rpcStatus(h.toolSocket, '/roundtrip', { runId: h.runId,
+      operationId: f.binding.operationId, rpcId: 3, toolUseId: 'toolu_old_alias',
+      name: 'mcp__ocbridge__Read', arguments: f.request.arguments,
+      inputSha256: cc5ToolInputSha256(f.request.arguments) })
+    assert.equal(stale, 403)
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('a live catalog after the profile install but before the launch only re-installs the profile', async () => {
+  const f = fixture()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const h = await harness(f, 'none', undefined, { configure: true, prepare: true, prepareGate: gate })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const first = toolProfile([{ alias: 'Read', client: 'Read' }])
+    await h.register(first)
+    h.ready()
+    const admitted = h.admit()
+    void admitted.catch(() => {})
+    await until(() => h.hostEvents.includes('prepare'))
+    const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
+    const replaced = rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: second })
+    assert.deepEqual((await replaced).toolNames, second.toolNames)
+    release()
+    await admitted
+    assert.deepEqual(h.configurePackets, [profilePacket(first), profilePacket(second)])
+    assert.equal(h.counts().starts, 1)
+    assert.equal(h.replacements.length, 0)
+    s = await stream(h)
+    s.send()
+    await until(() => h.written.length === 1)
+    // The installed socket is reused (the helper reads the catalog per request); launch is last.
+    assert.deepEqual(h.hostEvents, ['configure', 'prepare', 'prepare-done', 'configure', 'prepare',
+      'prepare-done', 'start'])
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
 })

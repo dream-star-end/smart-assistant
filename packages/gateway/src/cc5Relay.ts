@@ -170,6 +170,10 @@ export class Cc5Relay {
   private readonly outputHistory: Array<{ seq: number; bytes: Buffer }> = []
   private outputHistoryBytes = 0
   private needsReattach = false
+  /** One lane start at a time: `none` → `preparing` → `launched`, all before any user frame. */
+  private launchStage: 'none' | 'preparing' | 'launched' = 'none'
+  /** Bumped for every lane profile; preparation re-runs until the launch uses the newest one. */
+  private profileEpoch = 0
 
   constructor(
     private binding: Readonly<Cc5BridgeBinding>,
@@ -506,14 +510,18 @@ export class Cc5Relay {
     this.hostReady = Promise.resolve().then(async () => {
       requireRelay(!this.revoked && this.admitted && this.financeTurn && (this.profile || !this.hostPort.configure))
       this.launchAttempted = true
-      // The socket channel carries no session data, so it opens while the profile is installed;
-      // launch still waits for both. Either failure rejects the join and stop() cancels the other.
-      const prepared = this.hostPort.prepare?.()
-      const configured = this.hostPort.configure ? this.hostPort.configure(this.profile!.packet) : undefined
-      await Promise.all([prepared, configured])
-      requireRelay(!this.revoked && epoch === this.hostEpoch)
-      this.host = this.hostPort.start()
-      this.bindHostStreams(this.host, epoch)
+      this.launchStage = 'preparing'
+      for (;;) {
+        const prepared = await this.prepareLane(this.hostPort, false)
+        requireRelay(!this.revoked && epoch === this.hostEpoch)
+        if (prepared !== this.profileEpoch) continue
+        // From here to start() there is no await: no profile can slip in after the last check.
+        this.launchStage = 'launched'
+        const host = this.hostPort.start()
+        this.host = host
+        this.bindHostStreams(host, epoch)
+        break
+      }
       await this.host.ready
       requireRelay(!this.revoked && epoch === this.hostEpoch)
     })
@@ -536,26 +544,78 @@ export class Cc5Relay {
       if (ready === this.hostReady) return
     }
   }
+  /** The lane's remote preparation, in the one order the node controller accepts.
+   *
+   *  A fresh root has no installed session, and the controller validates that profile before it
+   *  execs the tool-socket helper: `session-profile` must come first there. An already-launched
+   *  round keeps its LIFECYCLE record as stop proof, and `session-profile` refuses while that
+   *  record exists; only tool-socket's rotate proves the old round gone and clears it. The socket
+   *  helper reads the catalog per request, so a later profile install still reaches it.
+   *  A live catalog that arrives mid-way re-runs the pass before the launch. Returns the profile
+   *  generation this pass installed; the caller launches only if no newer one has arrived. */
+  private async prepareLane(host: Cc5InteractiveHostPort, replacement: boolean): Promise<number> {
+    for (;;) {
+      const generation = this.profileEpoch
+      const profile = this.profile
+      requireRelay(profile || !host.configure)
+      if (replacement) {
+        await host.prepare?.()
+        requireRelay(!this.revoked)
+        if (generation !== this.profileEpoch) continue
+        if (profile && host.configure) await host.configure(profile.packet)
+      } else {
+        if (profile && host.configure) await host.configure(profile.packet)
+        requireRelay(!this.revoked)
+        // No socket for a stale catalog: re-install the newest profile first.
+        if (generation !== this.profileEpoch) continue
+        await host.prepare?.()
+      }
+      requireRelay(!this.revoked)
+      if (generation === this.profileEpoch) return generation
+    }
+  }
+  /** A live catalog found the registered one stale. Still preparing: the running start sequence
+   *  re-installs this profile before it launches. Already launched: the remote runs the old
+   *  catalog and is replaced. After the user frame neither is possible. */
+  private adoptLaneProfile(profile: { packet: Buffer; catalogSha256: string;
+    toolNames: Readonly<Record<string, string>> }): Promise<void> {
+    requireRelay(this.launchAttempted && !this.needsReattach && !this.userSeen &&
+      (this.phase === 'admitting' || this.phase === 'running') && !this.revoked)
+    if (this.launchStage === 'launched') return this.replaceLaunchedHost(profile)
+    this.profile = profile
+    this.profileEpoch++
+    // The start sequence in flight sees the epoch and re-installs before it launches; the stream
+    // gates the user frame on that same launch, so nothing is dispatched with the old catalog.
+    return Promise.resolve()
+  }
   /** The cached catalog was stale, so the remote runs the wrong tool set. Replace it inside this
    *  admitted turn: nothing was dispatched yet, so no prompt or result can be lost. */
   private replaceLaunchedHost(profile: { packet: Buffer; catalogSha256: string;
     toolNames: Readonly<Record<string, string>> }): Promise<void> {
     const factory = this.options.replaceHost
-    requireRelay(typeof factory === 'function' && this.host && this.launchAttempted && !this.needsReattach &&
+    requireRelay(typeof factory === 'function' && this.launchStage === 'launched' && !this.needsReattach &&
       !this.userSeen && (this.phase === 'admitting' || this.phase === 'running') && !this.revoked)
     const epoch = ++this.hostEpoch
     const previous = this.hostPort
     this.profile = profile
+    this.profileEpoch++
+    this.launchStage = 'preparing'
     const replacement = (async () => {
       // Independent absence proof for the wrongly launched session before a second one exists.
       await previous.stop()
       requireRelay(!this.revoked && epoch === this.hostEpoch)
       const next = factory!()
       this.hostPort = next
-      await Promise.all([next.prepare?.(), next.configure?.(profile.packet)])
-      requireRelay(!this.revoked && epoch === this.hostEpoch)
-      this.host = next.start()
-      this.bindHostStreams(this.host, epoch)
+      for (;;) {
+        const prepared = await this.prepareLane(next, true)
+        requireRelay(!this.revoked && epoch === this.hostEpoch)
+        if (prepared !== this.profileEpoch) continue
+        this.launchStage = 'launched'
+        const host = next.start()
+        this.host = host
+        this.bindHostStreams(host, epoch)
+        break
+      }
     })()
     // Published before the old host can reject: a stream waiting on it waits for the replacement.
     // The registering bridge only waits for the launch; streams and admission wait for READY.
@@ -690,7 +750,7 @@ export class Cc5Relay {
       else if (body.relaunch === true) {
         // A replacement keeps the same lifecycle id; its registration is already journaled.
         replaced = true
-        if (profile && profile.catalogSha256 !== this.profile?.catalogSha256) await this.replaceLaunchedHost(profile)
+        if (profile && profile.catalogSha256 !== this.profile?.catalogSha256) await this.adoptLaneProfile(profile)
       }
       this.localStopped = false
       if (!replaced) {
