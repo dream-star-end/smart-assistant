@@ -6,6 +6,8 @@ import { join } from 'node:path'
 import {
   findIdleNativeFile,
   runIdleCompact,
+  resumeIdleSummary,
+  readIdleNativeFile,
   writeIdleNativeFile,
   type IdleNativeFile,
 } from './idleRecover.ts'
@@ -55,5 +57,47 @@ describe('idle summary is prepared before it is applied', () => {
     expect(modelCalls).toBe(1)
     delete process.env.CLAUDE_CODE_EXTRA_METADATA
     await rm(home, { recursive: true, force: true })
+  })
+})
+
+describe('proof-only one-shot pre-apply anchor', () => {
+  test('anchor is durable before record, and a partial-apply retry never recaptures the tip', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'idle-proof-anchor-'))
+    const path = join(home, 'idle-native', sessionId, 'proof.json')
+    const tip = '74700000-0000-4000-8000-000000000031'
+    writeIdleNativeFile(path, { v: 1, sessionId, opId, revision: 'proof', summaryText: 'accepted proof',
+      modelStarted: true, modelCalls: 1, frozenTail: [], attachments: [], captureRollbackTip: true } as IdleNativeFile)
+    const messages = [{ type: 'user', uuid: tip, message: { role: 'user', content: 'original full context' } }] as never
+    let persisted = messages, reads = 0
+    try {
+      await expect(runIdleCompact({ sessionId, home, messages,
+        flush: async () => {}, load: async () => { reads++; return { messages: persisted } },
+        record: async (rows) => {
+          expect(readIdleNativeFile(path).rollbackTip).toBe(tip)
+          expect((readIdleNativeFile(path) as any).captureRollbackTip).toBeUndefined()
+          persisted = rows as never
+          throw new Error('simulated lost receipt after record')
+        },
+      })).rejects.toThrow('simulated lost receipt after record')
+      expect(reads).toBe(1)
+      const resumed = await resumeIdleSummary({ sessionId, home, messages: persisted,
+        loadOriginalTip: async () => { throw new Error('must not recapture partial tip') } })
+      expect(resumed?.file.rollbackTip).toBe(tip)
+    } finally { await rm(home, { recursive: true, force: true }) }
+  })
+
+  test('missing original tip fails before apply and cannot silently consume authorization', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'idle-no-anchor-'))
+    const path = join(home, 'idle-native', sessionId, 'proof.json')
+    writeIdleNativeFile(path, { v: 1, sessionId, opId, revision: 'proof', summaryText: 'accepted proof',
+      modelStarted: true, modelCalls: 1, frozenTail: [], attachments: [], captureRollbackTip: true } as IdleNativeFile)
+    let records = 0
+    try {
+      await expect(runIdleCompact({ sessionId, home, messages: [], flush: async () => {},
+        load: async () => null, record: async () => { records++ },
+      })).rejects.toThrow('IDLE_HISTORY_PENDING')
+      expect(records).toBe(0)
+      expect((readIdleNativeFile(path) as any).captureRollbackTip).toBe(true)
+    } finally { await rm(home, { recursive: true, force: true }) }
   })
 })

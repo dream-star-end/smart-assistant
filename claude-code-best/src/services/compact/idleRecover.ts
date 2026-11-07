@@ -72,6 +72,8 @@ export interface IdleNativeFile {
   applied?: boolean
   /** Last original chain row, frozen before any apply writes. */
   rollbackTip?: string
+  /** One-shot gateway authorization: reconstructed proof, never dispatched for apply. */
+  captureRollbackTip?: boolean
   /** Digest of the post-compact projection this process wrote. */
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
@@ -436,6 +438,17 @@ export async function resumeIdleSummary(input: {
     file = { ...file, applied: true }
     writeIdleNativeFile(path, file)
     return { path, file, freshSummary: false }
+  }
+  // Only proof-only reconstruction carries this capability. Persist its
+  // consumption with the original tip before ANY transcript mutation. A
+  // crash before this write has not applied; after it, retries reuse the tip.
+  if (file.captureRollbackTip) {
+    if (file.applied || file.artifact || file.rollbackTip || !file.summaryText)
+      throw new Error('IDLE_RECOVERY_CORRUPT')
+    const rollbackTip = await input.loadOriginalTip?.()
+    if (!rollbackTip) throw new Error('IDLE_HISTORY_PENDING')
+    file = { ...file, rollbackTip, captureRollbackTip: undefined }
+    writeIdleNativeFile(path, file)
   }
   let freshSummary = false
   if (!file.summaryText) {

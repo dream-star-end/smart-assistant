@@ -237,6 +237,8 @@ export interface IdleNativeFile {
   modelStarted?: boolean
   applied?: boolean
   rollbackTip?: string
+  /** One-shot gateway authorization: reconstructed proof, never dispatched for apply. */
+  captureRollbackTip?: boolean
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleAttachment[]

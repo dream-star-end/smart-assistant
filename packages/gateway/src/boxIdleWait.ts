@@ -4,8 +4,13 @@ export function beginIdleWait(session: AgentSession, emit: (event: SessionStream
   const listeners = session._idleWaiters ??= new Set()
   const clear = () => {
     if (!listeners.delete(clear)) return
-    if (!listeners.size && session.currentTurnStatus === 'compacting') session.currentTurnStatus = null
-    emit({ kind: 'turn_status', status: null })
+    // emit also writes the inbound/hello cache: it must have the same owner
+    // guard as the local write. Handoff removes every closure before a user
+    // turn can publish its own (possibly also compacting) status.
+    if (!listeners.size && session.currentTurnStatus === 'compacting') {
+      session.currentTurnStatus = null
+      emit({ kind: 'turn_status', status: null })
+    }
   }
   listeners.add(clear)
   session.currentTurnStatus = 'compacting'

@@ -184,7 +184,7 @@ function seed(key: string) {
     rollbackTip: '74700000-0000-4000-8000-000000000002' })
   return artifact
 }
-async function proofServer(unknownProof = false) {
+async function proofServer(unknownProof = false, proofSessionId = nativeId) {
   process.env.OC_USER_ID = '3'
   const server = createServer((req, res) => {
     if (req.url?.startsWith('/internal/v3/marketplace/sync')) {
@@ -201,7 +201,7 @@ async function proofServer(unknownProof = false) {
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify(req.url?.endsWith('/stop') ? { status: 'stopped' } :
         unknownProof && body.oc_turn_key === idleKey ? { status: 'pending', reason: 'unknown' } :
-        { status: 'terminal', sessionId: nativeId, turnKey: body.oc_turn_key, requestId: 'request',
+        { status: 'terminal', sessionId: proofSessionId, turnKey: body.oc_turn_key, requestId: 'request',
           revision, compactRequired: true, capsuleSha256: 'a'.repeat(64),
           ...(body.oc_turn_key === idleKey ? { summaryText: 'summary' } : {}) }))
     })
@@ -285,3 +285,96 @@ for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-
     } finally { release(); await close() }
   })
 }
+
+for (const partial of [false, true]) {
+  test(`OCV5-747 proof-only recovery: ${partial ? 'legacy partial stays blocked' : 'first apply safely abandons'}`, async () => {
+    const f = gatewayFixture()
+    f.session.channel = 'webchat'
+    const sid = `74700000-0000-4000-8000-${partial ? '000000000021' : '000000000020'}`
+    const tip = '74700000-0000-4000-8000-000000000022'
+    const { readIdleNative } = await import('../boxIdleCompact.js')
+    const { resumeIdleSummary } = await import('../../../../claude-code-best/src/services/compact/idleRecover.js')
+    const { readIdleRollbacks } = await import('@openclaude/storage')
+    writeIdleCandidate(home, { v: 1, sessionKey: f.sessionKey, sessionId: sid, turnKey: sourceKey, createdAt: Date.now() })
+    writeIdleOp(home, { v: 1, sessionKey: f.sessionKey, sourceSessionId: sid, sourceTurnKey: sourceKey,
+      revision, idleTurnKey: idleKey, frozenTail: [], attachments: [] })
+    if (partial) writeIdleNative(home, { v: 1, sessionId: sid, revision, opId: idleKey,
+      summaryText: 'summary', modelCalls: 1, modelStarted: true, frozenTail: [], attachments: [],
+      artifact: assembleIdleArtifact({ opId: idleKey, summaryText: 'summary', tail: [], attachments: [] }) })
+    let tipReads = 0
+    f.runner.idleHook = async () => {
+      // Real CCB preparation; the engine boundary drops the apply receipt.
+      await resumeIdleSummary({ sessionId: sid, home, messages: [], loadOriginalTip: async () => {
+        tipReads++
+        return partial ? 'unsafe-current-partial-tip' : tip
+      } })
+      return {} as TurnSummary
+    }
+    const close = await proofServer(false, sid)
+    try {
+      if (partial) {
+        await assert.rejects(f.inbound('continue original context'), /IDLE_RECOVERY_PENDING:/)
+        assert.equal(tipReads, 0, 'never recapture a possibly post-apply tip')
+        assert.equal(readIdleNative(home, sid, revision)?.rollbackTip, undefined)
+        assert.equal(readIdleOp(home, f.sessionKey, revision)?.disposition, undefined)
+        assert.equal(readIdleRollbacks(home, sid).length, 0)
+        assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 0)
+      } else {
+        await f.inbound('continue original context')
+        assert.equal(tipReads, 1)
+        assert.equal(readIdleNative(home, sid, revision)?.rollbackTip, tip)
+        assert.equal(readIdleOp(home, f.sessionKey, revision)?.disposition, 'abandoned')
+        assert.equal(readIdleRollbacks(home, sid)[0]?.restoreTip, tip)
+        assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 1)
+        assert.ok(JSON.stringify(f.events).includes('已完成只读核验'))
+        const finals = f.events.filter(e => e.type === 'outbound.message' && e.isFinal)
+        assert.equal(finals.length, 1)
+        assert.equal(finals[0].meta.cost, 0.125)
+        await f.manager.awaitPendingPersistence()
+        const records = (await readFile(settledPath, 'utf8')).trim().split('\n').map(l => JSON.parse(l))
+        assert.equal(records.filter(r => JSON.stringify(r).includes(f.peerId)).length, 1)
+      }
+    } finally { await close() }
+  })
+}
+
+test('OCV5-747 two real inbound waiters: first unsafe exit preserves second compacting then one reply', { timeout: 30000 }, async () => {
+  const f = gatewayFixture()
+  f.session.channel = 'webchat'
+  seed(f.sessionKey)
+  const close = await proofServer()
+  let releaseFirst!: () => void, releaseSecond!: () => void, firstEntered!: () => void, secondEntered!: () => void
+  const firstGate = new Promise<void>(r => { releaseFirst = r })
+  const secondGate = new Promise<void>(r => { releaseSecond = r })
+  const startedFirst = new Promise<void>(r => { firstEntered = r })
+  const startedSecond = new Promise<void>(r => { secondEntered = r })
+  let applies = 0
+  f.runner.stopFails = true
+  f.runner.idleHook = async () => {
+    if (++applies === 1) { firstEntered(); await firstGate }
+    else { secondEntered(); await secondGate }
+    return {} as TurnSummary
+  }
+  try {
+    const first = assert.rejects(f.inbound('first unsafe waiter'), /IDLE_RECOVERY_PENDING:/)
+    await startedFirst
+    const second = f.inbound('second safe waiter')
+    // dispatchInbound has async preparation before entering submit/session.lock.
+    for (let i = 0; i < 100 && f.session._idleWaiters?.size !== 2; i++) await new Promise(r => setTimeout(r, 10))
+    assert.equal(f.session._idleWaiters?.size, 2)
+    const firstExitIndex = f.events.length
+    releaseFirst()
+    await first
+    await startedSecond
+    assert.equal(f.session._idleWaiters?.size, 1)
+    assert.equal(f.session.currentTurnStatus, 'compacting')
+    assert.ok(!f.events.slice(firstExitIndex).some(e => e.type === 'outbound.turn_status' && e.status === null))
+    f.runner.stopFails = false
+    releaseSecond()
+    await second
+    assert.equal(f.session._idleWaiters?.size, 0)
+    assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 1)
+    assert.equal(f.events.filter(e => e.type === 'outbound.message' && e.isFinal).length, 1)
+    assert.ok(JSON.stringify(f.events).includes('已完成只读核验'))
+  } finally { releaseFirst(); releaseSecond(); await close() }
+})

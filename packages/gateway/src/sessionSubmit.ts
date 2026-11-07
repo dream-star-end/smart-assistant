@@ -2455,6 +2455,10 @@ export async function finishIdleUnderLock(
       nativeSummary: native?.summaryText,
     })
     if (accepted) {
+      // The op artifact is persisted BEFORE apply dispatch. Only a missing
+      // native AND an unprepared op prove that no apply has ever started.
+      // Never mint this authorization for an old/partially applied native.
+      const captureRollbackTip = !native && !op.summaryText && !op.artifact && !op.receiptDigest
       op = {
         ...op,
         summaryText: accepted.summaryText,
@@ -2462,6 +2466,8 @@ export async function finishIdleUnderLock(
       }
       if (!native?.summaryText) {
         writeIdleNative(recoveryDir, {
+          ...native,
+          ...(captureRollbackTip ? { captureRollbackTip: true } : {}),
           v: 1,
           opId: op.idleTurnKey,
           revision: op.revision,
