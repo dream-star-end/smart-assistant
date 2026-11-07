@@ -266,6 +266,14 @@ for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-
       }
       assert.ok(status, 'all idle wait paths report compacting')
       assert.equal(f.session._idleWaiters?.size ?? 0, 0)
+      assert.equal(f.session._idleDeadline, undefined, 'an exhausted wait cannot permanently poison recovery')
+      if (mode === 'hung-stop') {
+        f.runner.shutdown = async () => { f.runner.isRunning = false }
+        await f.inbound('recover after stop becomes available')
+        assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 1)
+        assert.equal(f.events.filter(e => e.type === 'outbound.message' && e.isFinal).length, 1)
+        assert.equal(readIdleOp(home, f.sessionKey, revision)?.abandonReason, 'idle_apply_unconfirmed')
+      }
       await f.manager.awaitPendingPersistence()
       if (!rejected) {
         const records = (await readFile(settledPath, 'utf8')).trim().split('\n').map(l => JSON.parse(l))

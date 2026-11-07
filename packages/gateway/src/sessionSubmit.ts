@@ -1406,6 +1406,9 @@ export async function submit(
     }
   } finally {
     closeIdleWait?.()
+    // A rejected waiter must not poison all future recovery attempts with an
+    // expired deadline. Concurrent waiters still share the current budget.
+    if (!session._idleWaiters?.size && !session._idleInternalTurns) session._idleDeadline = undefined
     closeHelpLogical?.()
     clearRunnerPromptPrivacy(session.runner)
     if (
