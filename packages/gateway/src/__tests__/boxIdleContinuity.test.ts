@@ -349,6 +349,7 @@ test('OCV5-747 two real inbound waiters: first unsafe exit preserves second comp
   const startedFirst = new Promise<void>(r => { firstEntered = r })
   const startedSecond = new Promise<void>(r => { secondEntered = r })
   let applies = 0
+  const pending: Promise<unknown>[] = []
   f.runner.stopFails = true
   f.runner.idleHook = async () => {
     if (++applies === 1) { firstEntered(); await firstGate }
@@ -357,8 +358,11 @@ test('OCV5-747 two real inbound waiters: first unsafe exit preserves second comp
   }
   try {
     const first = assert.rejects(f.inbound('first unsafe waiter'), /IDLE_RECOVERY_PENDING:/)
+    pending.push(first)
     await startedFirst
     const second = f.inbound('second safe waiter')
+    pending.push(second)
+    void second.catch(() => {}) // observed below, including assertion-failure cleanup
     // dispatchInbound has async preparation before entering submit/session.lock.
     for (let i = 0; i < 100 && f.session._idleWaiters?.size !== 2; i++) await new Promise(r => setTimeout(r, 10))
     assert.equal(f.session._idleWaiters?.size, 2)
@@ -376,5 +380,10 @@ test('OCV5-747 two real inbound waiters: first unsafe exit preserves second comp
     assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 1)
     assert.equal(f.events.filter(e => e.type === 'outbound.message' && e.isFinal).length, 1)
     assert.ok(JSON.stringify(f.events).includes('已完成只读核验'))
-  } finally { releaseFirst(); releaseSecond(); await close() }
+  } finally {
+    f.runner.stopFails = false
+    releaseFirst(); releaseSecond()
+    await Promise.allSettled(pending)
+    await close()
+  }
 })
