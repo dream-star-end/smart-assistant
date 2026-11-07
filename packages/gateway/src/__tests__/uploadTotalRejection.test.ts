@@ -3,11 +3,12 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
-import { messageAttachmentTotal, noteAttachmentTotalRejection, readUploadUserFailureCode } from '../uploadTotalRejection.js'
-import { MAX_UPLOAD_TOTAL } from '../httpUploadStatic.js'
 
 const testHome = await mkdtemp(join(tmpdir(), 'oc-gw-upload-total-'))
 process.env.OPENCLAUDE_HOME = testHome
+// httpUploadStatic imports storage transitively: isolate paths before loading it.
+const { messageAttachmentTotal, noteAttachmentTotalRejection, readUploadUserFailureCode } = await import('../uploadTotalRejection.js')
+const { MAX_UPLOAD_TOTAL } = await import('../httpUploadStatic.js')
 
 const { closeSessionsDb, insertQueuedTurnDispatch } = await import('@openclaude/storage')
 const { buildTurnDispatchStateResponse, inboxReject } = await import('../turnDispatchInbox.js')
