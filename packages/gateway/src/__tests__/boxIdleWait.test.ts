@@ -6,10 +6,11 @@ import { autoResumeFromHello } from '../wsConnection.js'
 import type { AgentSession } from '../sessionTypes.js'
 
 function fixture() {
-  const session = { runner: { isRunning: false }, currentTurnStatus: null } as unknown as AgentSession
+  const runner = { isRunning: false }
+  const session = { runner, currentTurnStatus: null } as unknown as AgentSession
   const events: unknown[] = []
   const emit = (e: any) => { session.currentTurnStatus = e.status; events.push(e.status) }
-  return { session, events, emit }
+  return { session, runner, events, emit }
 }
 async function reconnect(session: AgentSession) {
   const frames: any[] = []
@@ -39,7 +40,7 @@ test('OCV5-747 concurrent idle waiters retain live status and reconnect hello un
 })
 
 test('OCV5-747 idle cleanup cannot clear a different owner or a handed-off user compact', async () => {
-  const { session, events, emit } = fixture()
+  const { session, runner, events, emit } = fixture()
   const first = beginIdleWait(session, emit)
   session.currentTurnStatus = 'engine_starting'
   first()
@@ -47,7 +48,7 @@ test('OCV5-747 idle cleanup cannot clear a different owner or a handed-off user 
   assert.deepEqual(events, ['compacting'])
   const second = beginIdleWait(session, emit), third = beginIdleWait(session, emit)
   endIdleWait(session) // actual submit handoff, before the user engine starts
-  session.runner.isRunning = true
+  runner.isRunning = true
   session.currentTurnStatus = 'compacting' // now owned by the user turn
   const before = [...events]
   second(); third(); first()
