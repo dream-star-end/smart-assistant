@@ -66,9 +66,17 @@ if (role === 'tool-socket') {
 } else {
   process.stdin.resume(); process.stdin.on('end',()=>{
     if(c.failControl) process.exit(23);
+    if(c.failProfile && role==='session-profile') process.exit(24);
     if(role==='prove-stopped') {
       if(c.badProof) console.log(JSON.stringify({remoteStopped:true,kind:'verified-task-runtime-absent',root:'/wrong'}));
       else console.log(JSON.stringify({remoteStopped:true,kind:'verified-task-runtime-absent',root:c.taskRoot}));
+    } else if(role==='session-profile') {
+      fs.writeFileSync(c.root+'/profile','installed');
+      console.log(JSON.stringify({kind:'session-profile-installed',root:c.taskRoot}));
+    } else if(role==='reset') {
+      console.log(JSON.stringify({kind:'task-reset'}));
+    } else if(role==='provision') {
+      console.log(JSON.stringify({kind:'task-root-provisioned',root:c.taskRoot}));
     } else console.log(JSON.stringify({kind:'signalled-not-proof'}));
   });
 }
@@ -119,7 +127,7 @@ function fixture(
   const roles: string[] = []
   const children: ReturnType<typeof spawn>[] = []
   const spawnFixture: Cc5SshSpawn = (args) => {
-    const match = /'(tool-socket|launch|stop-socket|prove-stopped|stop)' '([^']+)'(?: '--[a-z]+' '[^']+')*$/.exec(
+    const match = /'(tool-socket|launch|stop-socket|prove-stopped|stop|session-profile|reset|provision)' '([^']+)'(?: '--[a-z]+' '[^']+')*$/.exec(
       args.at(-1)!,
     )
     assert.ok(match)
@@ -213,6 +221,43 @@ test('fixed SSH argv waits for helper READY and transports original bytes withou
     assert.deepEqual(await f.host.stop(), { remoteStopped: true })
     assert.deepEqual(f.roles.slice(2), ['stop', 'stop-socket', 'prove-stopped'])
     assert.equal(f.errors.length, 0)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('the tool-socket channel opens while the profile installs and launch waits for both', async () => {
+  // 300 ms helper delay: the profile install finishes long before socket-ready.
+  const f = fixture({ helperDelay: 300 })
+  try {
+    const prepare = f.host.prepare()
+    const configure = f.host.configure(Buffer.from('{"version":1,"synthetic":"profile"}'))
+    // Both SSH channels are in flight before either one has finished.
+    assert.deepEqual(f.roles, ['tool-socket', 'session-profile'])
+    await configure
+    assert.equal(readFileSync(join(f.root, 'profile'), 'utf8'), 'installed')
+    assert.deepEqual(f.roles, ['tool-socket', 'session-profile'])
+    const streams = f.start()
+    // Socket-ready is still outstanding, so no launch may have been requested yet.
+    assert.deepEqual(f.roles, ['tool-socket', 'session-profile'])
+    await prepare
+    await streams.ready
+    assert.deepEqual(f.roles, ['tool-socket', 'session-profile', 'launch'])
+    assert.deepEqual(await f.host.stop(), { remoteStopped: true })
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a failed profile install never launches the remote', async () => {
+  const f = fixture({ failProfile: true })
+  try {
+    const prepare = f.host.prepare()
+    void prepare.catch(() => {})
+    await assert.rejects(f.host.configure(Buffer.from('{"version":1}')))
+    await f.host.stop().catch(() => {})
+    assert.equal(f.roles.includes('launch'), false)
+    assert.equal(f.roles.filter((role) => role === 'session-profile').length, 1)
   } finally {
     await f.cleanup()
   }

@@ -130,6 +130,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
   private originalReady = false
   private stopPromise?: Promise<{ remoteStopped: true }>
   private toolChannel?: Channel
+  private socketReady?: Promise<void>
   private hostChannel?: Channel
   private lastToolSequence = 0
   private toolBusy = false
@@ -289,10 +290,16 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     })
     return channel
   }
+  /** The tool-socket channel carries no session data, so it opens while the profile is installed. */
+  prepare(): Promise<void> {
+    requireHost(!this.started && !this.closing)
+    this.startupTimer ??= setTimeout(() => this.fail(), this.deadline('startupMs', 65000))
+    return this.openToolChannel()
+  }
   start(): ReturnType<Cc5InteractiveHostPort['start']> {
     requireHost(!this.started && !this.closing)
     this.started = true
-    this.startupTimer = setTimeout(() => this.fail(), this.deadline('startupMs', 65000))
+    this.startupTimer ??= setTimeout(() => this.fail(), this.deadline('startupMs', 65000))
     void Promise.resolve()
       .then(() => this.initialize())
       .catch(() => this.fail())
@@ -305,7 +312,13 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       void this.stop().catch(() => {})
     }
   }
-  private async initialize(): Promise<void> {
+  private openToolChannel(): Promise<void> {
+    this.socketReady ??= this.startToolChannel()
+    // Preparation may outlive a cancelled start; that never becomes an unhandled rejection.
+    void this.socketReady.catch(() => {})
+    return this.socketReady
+  }
+  private async startToolChannel(): Promise<void> {
     requireHost(!this.closing)
     this.toolChannel = this.channel('tool-socket')
     // Never expose the helper's raw stderr: it may contain remote exception text.
@@ -357,6 +370,9 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       })
     })
     this.cancelSocketReady = undefined
+  }
+  private async initialize(): Promise<void> {
+    await this.openToolChannel()
     requireHost(!this.closing) // A late helper READY cannot launch a TUI after cancellation.
     this.hostChannel = this.channel('launch')
     this.input.pipe(this.hostChannel.child.stdin)
@@ -455,15 +471,20 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
   /** After prepareTask, before start: the lane's tool catalog and platform prompt (controller `session-profile`). */
   async configure(packet: Buffer): Promise<void> {
     requireHost(!this.started && !this.closing && packet.length > 0 && packet.length <= 4 * 1024 * 1024)
-    const installed = await this.control('session-profile', 30000, packet)
+    // Tracked so a cancelled start cannot leave a late profile install behind on the remote.
+    const installed = await this.control('session-profile', 30000, packet, true)
     requireHost(installed.kind === 'session-profile-installed' && installed.root === this.config.taskRoot)
   }
   private async control(
     role: Exclude<Cc5SshRole, 'launch' | 'tool-socket'>,
     remaining: number,
     input?: Buffer,
+    track = false,
   ): Promise<Record<string, unknown>> {
     const child = this.spawnSsh(this.argv(role))
+    if (track) {
+      this.channels.push({ child, closed: new Promise<void>((resolve) => child.once('close', () => resolve())) })
+    }
     const errors: Buffer[] = []
     child.stderr.on('data', (chunk: Buffer) => {
       // Only the controller's own one-line error label is kept, never pane/argv text.

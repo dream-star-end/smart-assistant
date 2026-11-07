@@ -20,7 +20,9 @@ import { Cc5ToolObservation } from './cc5ToolObservation.js'
 import { runCc5ToolPump } from './cc5ToolPump.js'
 import { privateDir, syncDir } from './cc5FixedTool.js'
 import { Cc5ToolHost } from './cc5ToolHost.js'
-import { type Cc5HostProfile, compileCc5ToolCatalog, cc5RemotePrompt } from './cc5ToolCatalog.js'
+import { type Cc5HostProfile, type Cc5ToolCatalog, compileCc5ToolCatalog, cc5RemotePrompt } from './cc5ToolCatalog.js'
+import { cc5ToolCatalogCacheKey, readCc5ToolCatalogCache, removeCc5ToolCatalogCache,
+  writeCc5ToolCatalogCache } from './cc5ToolCatalogCache.js'
 import type { Cc5ToolResult } from './cc5NativeTool.js'
 
 /** What the runner prepared for this lane: the same prompt and tool sources a local chat gets. */
@@ -83,6 +85,8 @@ export async function runCc5StdioBridge(input: {
   let seq = 0
   let toolHost: BridgeToolHost | undefined
   let toolNames: Readonly<Record<string, string>> = {}
+  /** Resolves once the live catalog is known to equal the one the remote was launched with. */
+  let toolsVerified: Promise<void> = Promise.resolve()
   // The gateway answers these exactly as for a local CCB: control_request out, control_response in.
   const permissions = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>()
   const askPermission = (request: Record<string, unknown>): Promise<Record<string, unknown>> => {
@@ -103,19 +107,44 @@ export async function runCc5StdioBridge(input: {
     privateDir(executionRoot)
     privateDir(lifecycleRoot)
     syncDir(executionRoot)
-    // The remote CLI launches with this host's catalog, so the host is up before registration.
+    // The remote CLI launches with this host's catalog, so registration is what starts it.
     const lane = input.tools.lane
     const host = toolHost = input.tools.hostFactory?.(lifecycleRoot, lifecycleId, lane.host, askPermission) ??
       new Cc5ToolHost(lifecycleRoot, lifecycleId, lane.host, askPermission)
-    try {
-      const catalog = compileCc5ToolCatalog(await host.tools())
-      const registered = await cc5ControlRequest('/tool/register', { ...scope, lifecycleId, profile: {
-        catalog: catalog.json, catalogSha256: catalog.sha256, toolNames: catalog.clientNameByRemoteName,
-        prompt: cc5RemotePrompt(lane.platformPrompt, catalog, lane.host.cwd) } }, socketPath)
-      if (registered.lifecycleId !== lifecycleId) throw new Error('CC5_TOOLHOST_REGISTRATION_UNKNOWN')
+    const live = host.tools()
+    // Registration must not wait for the boot; this only keeps an early rejection from escaping.
+    live.catch(() => {})
+    const cacheKey = cc5ToolCatalogCacheKey(lane.host)
+    const cached = readCc5ToolCatalogCache(executionRoot, cacheKey)
+    const register = (catalog: Cc5ToolCatalog, relaunch: boolean): Promise<Record<string, unknown>> =>
+      cc5ControlRequest('/tool/register', { ...scope, lifecycleId,
+        ...(relaunch ? { replace: true, relaunch: true } : {}),
+        profile: { catalog: catalog.json, catalogSha256: catalog.sha256,
+          toolNames: catalog.clientNameByRemoteName,
+          prompt: cc5RemotePrompt(lane.platformPrompt, catalog, lane.host.cwd) } }, socketPath)
+    const settled = (reply: Record<string, unknown>, catalog: Cc5ToolCatalog): void => {
+      if (reply.lifecycleId !== lifecycleId) throw new Error('CC5_TOOLHOST_REGISTRATION_UNKNOWN')
       // A lane launched by an earlier bridge keeps the catalog it was launched with.
-      toolNames = registered.toolNames && typeof registered.toolNames === 'object'
-        ? registered.toolNames as Record<string, string> : catalog.clientNameByRemoteName
+      toolNames = reply.toolNames && typeof reply.toolNames === 'object'
+        ? reply.toolNames as Record<string, string> : catalog.clientNameByRemoteName
+    }
+    try {
+      if (cached) {
+        settled(await register(cached, false), cached)
+        toolsVerified = live.then(async (tools) => {
+          const fresh = compileCc5ToolCatalog(tools)
+          if (fresh.sha256 === cached.sha256) return
+          // The key missed an input: the remote is running with the wrong tool set. Drop the entry
+          // and have the relay replace it inside this turn, before any tool call is served.
+          removeCc5ToolCatalogCache(executionRoot, cacheKey)
+          settled(await register(fresh, true), fresh)
+          writeCc5ToolCatalogCache(executionRoot, cacheKey, fresh)
+        })
+      } else {
+        const catalog = compileCc5ToolCatalog(await live)
+        settled(await register(catalog, false), catalog)
+        writeCc5ToolCatalogCache(executionRoot, cacheKey, catalog)
+      }
     } catch (error) {
       await host.close().catch(() => {})
       throw error
@@ -171,6 +200,11 @@ export async function runCc5StdioBridge(input: {
       failure ??= new Error('CC5_REMOTE_STOP_UNPROVEN')
     })
   }
+  // A stale catalog that could not be replaced inside the turn is a hard stop, not a retry.
+  void toolsVerified.catch((error: unknown) => {
+    fail(error instanceof Error && /^CC5_[A-Z_]+$/.test(error.message)
+      ? error.message : 'CC5_TOOLHOST_CATALOG_MISMATCH')
+  })
   const send = (line: string): void => {
     if (stopping) return
     try {
@@ -312,32 +346,40 @@ export async function runCc5StdioBridge(input: {
               res.resume()
               return
             }
-            ready = true
+            clearTimeout(readyTimer)
             if (input.tools && observation && !toolRun) {
-              toolRun = runCc5ToolPump({
+              const tools = input.tools
+              // No roundtrip is served against a catalog the remote was not launched with.
+              toolRun = toolsVerified.then(() => runCc5ToolPump({
                 binding: input.binding,
                 bindingProvider: () => refreshCc5Binding(input.binding, socketPath, Date.now()),
                 sessionKey: input.sessionKey,
-                keyring: input.tools.keyring,
+                keyring: tools.keyring,
                 observation,
                 signal: toolAbort.signal,
                 socketPath,
-                executionRoot: input.tools.executionRoot,
+                executionRoot: tools.executionRoot,
                 executeTool: async (request): Promise<Cc5ToolResult> => {
                   if (stopping || !toolHost) throw new Error('CC5_TOOLHOST_CLOSED')
+                  await toolsVerified
                   const name = Object.hasOwn(toolNames, request.name) ? toolNames[request.name] : undefined
                   if (!name) return { content: [{ type: 'text', text: `No such tool available: ${request.name}` }], isError: true }
                   return toolHost.execute(name, request.arguments, request)
                 },
-              }).catch(() => {
+              })).catch(() => {
                 if (!stopping) fail('CC5_FIXED_TOOL_FAILED_OR_UNKNOWN')
               })
             }
-            clearTimeout(readyTimer)
-            for (const line of pending) currentReq.write(line)
-            pending = []
-            pendingBytes = 0
-            input.stdin.resume()
+            // The user frame reaches the remote only once its catalog is verified: until then a
+            // stale-catalog launch can still be replaced inside this turn.
+            void toolsVerified.then(() => {
+              if (gen !== generation || reconnectingThisStream || stopping || req !== currentReq) return
+              ready = true
+              for (const line of pending) currentReq.write(line)
+              pending = []
+              pendingBytes = 0
+              input.stdin.resume()
+            }, () => {})
             res.on('data', (chunk: Buffer) => {
               if (gen !== generation || reconnectingThisStream || stopping) return
               connRemainder = Buffer.concat([connRemainder, chunk])

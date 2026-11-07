@@ -530,11 +530,14 @@ function isPlatformInEnabledList(): boolean {
  * This checks the user's enabled setting, platform support, and enabledPlatforms restriction
  */
 function isSandboxingEnabled(): boolean {
-  if (!isSupportedPlatform()) {
+  // Same conjunction as before, evaluated from the cheapest and most decisive check: the
+  // dependency probe spawns processes (npm root -g), so an install with sandbox off must not pay
+  // for it. All four checks are pure and memoized, so the result is unchanged.
+  if (!getSandboxEnabledSetting()) {
     return false
   }
 
-  if (checkDependencies().errors.length > 0) {
+  if (!isSupportedPlatform()) {
     return false
   }
 
@@ -543,7 +546,7 @@ function isSandboxingEnabled(): boolean {
     return false
   }
 
-  return getSandboxEnabledSetting()
+  return checkDependencies().errors.length === 0
 }
 
 /**

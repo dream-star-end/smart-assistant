@@ -139,16 +139,20 @@ async function harness(
   f: ReturnType<typeof fixture>,
   failure: 'none' | 'start' | 'stop' = 'none',
   financeOverride?: Cc5FinancePort,
-  options: { configure?: boolean } = {},
+  options: { configure?: boolean; prepare?: boolean; failConfigure?: boolean; replaceHost?: boolean } = {},
 ) {
   const written: Buffer[] = []
   const input = new PassThrough()
   const output = new PassThrough()
   input.on('data', (b) => written.push(b))
   let ready!: () => void
-  const readyPromise = new Promise<void>((resolve) => {
+  let rejectReady!: (error: Error) => void
+  const readyPromise = new Promise<void>((resolve, reject) => {
     ready = resolve
+    rejectReady = reject
   })
+  // A stop before READY is a failed start, exactly as the production transport reports it.
+  void readyPromise.catch(() => {})
   let started!: () => void
   const startObserved = new Promise<void>((resolve) => {
     started = resolve
@@ -161,10 +165,24 @@ async function harness(
   let stops = 0
   const configurePackets: Buffer[] = []
   const hostEvents: string[] = []
+  let configureStarted!: () => void
+  const configureStartedPromise = new Promise<void>((resolve) => {
+    configureStarted = resolve
+  })
   const port: Cc5InteractiveHostPort = {
+    ...(options.prepare
+      ? { async prepare() {
+        hostEvents.push('prepare')
+        // Neither channel may finish before the other one has started.
+        await Promise.race([configureStartedPromise, new Promise((resolve) => setTimeout(resolve, 2000))])
+        hostEvents.push('prepare-done')
+      } }
+      : {}),
     ...(options.configure
       ? { async configure(packet: Buffer) {
         hostEvents.push('configure')
+        configureStarted()
+        if (options.failConfigure) throw new Error('synthetic profile install failed')
         configurePackets.push(Buffer.from(packet))
       } }
       : {}),
@@ -179,9 +197,46 @@ async function harness(
     async stop() {
       stops++
       markStopped()
+      rejectReady(new Error('synthetic host stopped'))
       if (failure === 'stop') throw new Error('synthetic remote absence unproved')
       return { remoteStopped: true }
     },
+  }
+  // Replacement launches get their own transport, as production builds a fresh ssh host.
+  const replacements: Array<{ events: string[]; packets: Buffer[]; starts: number; written: Buffer[];
+    ready: () => void; input: PassThrough; output: PassThrough }> = []
+  const replacementPort = (): Cc5InteractiveHostPort => {
+    const replacement = { events: [] as string[], packets: [] as Buffer[], starts: 0,
+      written: [] as Buffer[], ready: () => {}, input: new PassThrough(), output: new PassThrough() }
+    replacement.input.on('data', (bytes) => replacement.written.push(Buffer.from(bytes)))
+    let resolveReady!: () => void
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve
+    })
+    void ready.catch(() => {})
+    replacement.ready = resolveReady
+    let started!: () => void
+    const startObserved = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    void startObserved.catch(() => {})
+    replacements.push(replacement)
+    return {
+      async configure(packet: Buffer) {
+        replacement.events.push('configure')
+        replacement.packets.push(Buffer.from(packet))
+      },
+      start() {
+        replacement.starts++
+        replacement.events.push('start')
+        started()
+        return { stdin: replacement.input, stdout: replacement.output, ready }
+      },
+      async stop() {
+        replacement.events.push('stop')
+        return { remoteStopped: true }
+      },
+    }
   }
   const runId = f.binding.runId
   const financeEvents: string[] = []
@@ -220,7 +275,7 @@ async function harness(
     },
   }
   const relay = new Cc5Relay(f.binding, f.keyring, runId, port, join(f.root, 'relay-journal'), financeOverride ?? finance,
-    { localStopTimeoutMs: 250 })
+    { localStopTimeoutMs: 250, ...(options.replaceHost ? { replaceHost: replacementPort } : {}) })
   const socketPath = relative(process.cwd(), join(f.root, 'control.sock'))
   const toolSocket = relative(process.cwd(), join(f.root, 'tool.sock'))
   relay.controlServer.listen(socketPath)
@@ -279,8 +334,19 @@ async function harness(
     lifecycleId,
     configurePackets,
     hostEvents,
+    replacements,
     counts: () => ({ starts, stops }),
   }
+}
+function rpcStatus(socketPath: string, path: string, body: unknown): Promise<number | undefined> {
+  return new Promise((resolve, reject) => {
+    const req = request({ socketPath, path, method: 'POST' }, (res) => {
+      res.resume()
+      res.once('end', () => resolve(res.statusCode))
+    })
+    req.once('error', reject)
+    req.end(JSON.stringify(body))
+  })
 }
 function rpc(socketPath: string, path: string, body: unknown): Promise<Record<string, any>> {
   return new Promise((resolve, reject) => {
@@ -922,4 +988,82 @@ test('re-registration after launch keeps the first catalog even with replace and
     assert.deepEqual(h.configurePackets, [profilePacket(first)])
     assert.equal(h.counts().starts, 1)
   } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('a stale catalog replaces the wrongly launched remote inside the same turn', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true, replaceHost: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const first = toolProfile([{ alias: 'Read', client: 'Read' }])
+    await h.register(first)
+    const admitted = h.admit()
+    void admitted.catch(() => {})
+    await until(() => h.hostEvents.includes('start'))
+    const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
+    // The bridge found the cached catalog stale while the launch was still in flight.
+    const replaced = await rpc(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: second })
+    assert.deepEqual(replaced.toolNames, second.toolNames)
+    assert.equal(h.replacements.length, 1)
+    assert.deepEqual(h.replacements[0]!.packets, [profilePacket(second)])
+    assert.deepEqual(h.replacements[0]!.events, ['configure', 'start'])
+    h.replacements[0]!.ready()
+    // Admission and the stream both wait for the replacement, not for the abandoned launch.
+    await admitted
+    s = await stream(h)
+    s.send()
+    await until(() => h.replacements[0]!.written.length === 1)
+    assert.equal(h.written.length, 0, 'the replaced launch must not receive turn content')
+    const stale = await rpcStatus(h.toolSocket, '/roundtrip', { runId: h.runId,
+      operationId: f.binding.operationId, rpcId: 7, toolUseId: 'toolu_stale',
+      name: 'mcp__ocbridge__Read', arguments: f.request.arguments,
+      inputSha256: cc5ToolInputSha256(f.request.arguments) })
+    assert.equal(stale, 403)
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('a replacement is refused once the user frame reached the remote', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true, replaceHost: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    const first = toolProfile([{ alias: 'Read', client: 'Read' }])
+    await h.register(first)
+    h.ready()
+    await h.admit()
+    s = await stream(h)
+    s.send()
+    await until(() => h.written.length === 1)
+    const second = toolProfile([{ alias: 'Edit', client: 'Edit' }])
+    const status = await rpcStatus(h.socketPath, '/tool/register', { ...h.scope, lifecycleId: h.lifecycleId,
+      replace: true, relaunch: true, profile: second })
+    assert.equal(status, 403)
+    assert.equal(h.replacements.length, 0)
+    assert.deepEqual(h.configurePackets, [profilePacket(first)])
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('the tool-socket channel overlaps the profile install and launch waits for both', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true, prepare: true })
+  try {
+    await h.register(toolProfile())
+    h.ready()
+    await h.admit()
+    // Both channels start before either finishes; launch is last.
+    assert.deepEqual(h.hostEvents, ['prepare', 'configure', 'prepare-done', 'start'])
+  } finally { await h.close(); f.cleanup() }
+})
+
+test('a failed profile install never launches the remote', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { configure: true, prepare: true, failConfigure: true })
+  try {
+    await h.register(toolProfile())
+    h.ready()
+    await assert.rejects(h.admit())
+    assert.equal(h.hostEvents.includes('start'), false)
+    assert.equal(h.counts().starts, 0)
+  } finally { await h.close(); f.cleanup() }
 })

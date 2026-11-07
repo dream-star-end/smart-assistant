@@ -359,14 +359,16 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     rmSync(view, { recursive: true, force: true })
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     const toolSocketPath = join(dir, 'tool.sock')
-    const host = (this.options.hostFactory ?? ((config) => new Cc5SshHost(config)))({
+    const hostConfig: Cc5SshHostConfig = {
       target: placement.target,
       taskRoot: placement.taskRoot,
       operationId: placement.operationId,
       runId: placement.runId,
       controllerPath: this.options.controllerPath,
       toolSocketPath,
-    })
+    }
+    const createHost = this.options.hostFactory ?? ((config: Cc5SshHostConfig) => new Cc5SshHost(config))
+    const host = createHost(hostConfig)
     await host.prepareTask(placement.provisionPacket)
     const binding: Readonly<Cc5BridgeBinding> = Object.freeze({
       version: 2,
@@ -397,6 +399,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         overwriteProtectedBinding(view, next)
         current.binding = next
       },
+      // A stale cached catalog replaces the remote without re-running task provisioning.
+      replaceHost: () => createHost(hostConfig),
     })
     const lane: Lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
       operationId: placement.operationId, dir, view, binding, relay }
