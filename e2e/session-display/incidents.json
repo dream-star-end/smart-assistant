@@ -9527,6 +9527,16 @@
         },
         {
           "layer": "unit",
+          "path": "claude-code-best/src/services/compact/idleConcurrentRecovery.test.ts",
+          "assertion": "two proof-only recoverers retain the pre-apply anchor and applied receipt:"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/services/compact/idleConcurrentRecovery.test.ts",
+          "assertion": "concurrent native summary claims call the model only once"
+        },
+        {
+          "layer": "unit",
           "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
           "assertion": "IDLE_RECOVERY_PENDING:7"
         },

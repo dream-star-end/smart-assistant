@@ -41,6 +41,7 @@ import {
   loadProjectContext,
   skillOverlayManifestSha256,
   type KernelFileLock,
+  withIdleNativeLock,
 } from '@openclaude/storage'
 import {
   advanceIdleOp,
@@ -58,6 +59,7 @@ import {
   idleHistoryStillBlocked,
   idleRecoveryRemainingMs,
   idleSummaryAccepted,
+  idleNativePath,
   nativeShortForOp,
   clearIdleCandidate,
   readIdleCandidate,
@@ -2418,7 +2420,7 @@ export async function finishIdleUnderLock(
       clearIdleCandidate(recoveryDir, session.sessionKey)
       return
     }
-    const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+    let native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
     if (
       nativeShortForOp(native, {
         idleTurnKey: op.idleTurnKey,
@@ -2458,27 +2460,32 @@ export async function finishIdleUnderLock(
       // The op artifact is persisted BEFORE apply dispatch. Only a missing
       // native AND an unprepared op prove that no apply has ever started.
       // Never mint this authorization for an old/partially applied native.
-      const captureRollbackTip = !native && !op.summaryText && !op.artifact && !op.receiptDigest
+      const unpreparedOp = !op.summaryText && !op.artifact && !op.receiptDigest
       op = {
         ...op,
         summaryText: accepted.summaryText,
         capsuleSha256: accepted.capsuleSha256,
       }
-      if (!native?.summaryText) {
-        writeIdleNative(recoveryDir, {
-          ...native,
-          ...(captureRollbackTip ? { captureRollbackTip: true } : {}),
-          v: 1,
+      native = await withIdleNativeLock(idleNativePath(recoveryDir, source.sessionId, proof.revision), () => {
+        // Proof fetch and another drain/apply can overlap across processes.
+        const current = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+        if (current?.summaryText || current?.applied || current?.artifact) return current
+        const next = {
+          ...current,
+          ...(!current && unpreparedOp ? { captureRollbackTip: true } : {}),
+          v: 1 as const,
           opId: op.idleTurnKey,
           revision: op.revision,
           sessionId: source.sessionId,
           summaryText: accepted.summaryText,
-          modelCalls: native?.modelCalls ?? 1,
+          modelCalls: current?.modelCalls ?? 1,
           modelStarted: true,
-          frozenTail: op.frozenTail,
-          attachments: op.attachments,
-        })
-      }
+          frozenTail: current?.frozenTail ?? op.frozenTail,
+          attachments: current?.attachments ?? op.attachments,
+        }
+        writeIdleNative(recoveryDir, next)
+        return next
+      })
     }
     let step = advanceIdleOp({
       op,
@@ -2490,18 +2497,20 @@ export async function finishIdleUnderLock(
       step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest,
     )
     if (step.callModel || needsApply) {
-      if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
-        writeIdleNative(recoveryDir, {
-          v: 1,
-          opId: step.op.idleTurnKey,
-          revision: step.op.revision,
-          sessionId: source.sessionId,
-          ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
-          modelCalls: 0,
-          frozenTail: step.op.frozenTail,
-          attachments: step.op.attachments,
-        })
-      }
+      await withIdleNativeLock(idleNativePath(recoveryDir, source.sessionId, proof.revision), () => {
+        if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
+          writeIdleNative(recoveryDir, {
+            v: 1,
+            opId: step.op.idleTurnKey,
+            revision: step.op.revision,
+            sessionId: source.sessionId,
+            ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
+            modelCalls: 0,
+            frozenTail: step.op.frozenTail,
+            attachments: step.op.attachments,
+          })
+        }
+      })
       step = { ...step, op: { ...step.op, runnerKilledAt: undefined } }
       writeSettledIdleOp(recoveryDir, step.op)
       session._idleRunning = true
