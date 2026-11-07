@@ -521,6 +521,23 @@ export async function writeProjectInstructions(
 }
 
 /**
+ * The instructions a turn sees when the seed below could not be written:
+ * the local file if it has any, otherwise exactly what the seed would have
+ * filled in (same B4 rule as the locked writer), otherwise none.
+ */
+export function projectInstructionsWithUnwrittenSeed(
+  current: ProjectContextSnapshot,
+  sourceInstructions: string | null | undefined,
+): string | null {
+  if (current.instructions) return current.instructions
+  const body = sourceInstructions ? clipProjectInstructions(sourceInstructions) : ''
+  if (!body) return null
+  const status = current.instructionsFileStatus
+  if (current.meta.instructionsState !== 'never' || (status !== 'absent' && status !== 'empty')) return null
+  return body
+}
+
+/**
  * One-time seed: copy unbound chat instructions into PROJECT.md iff the
  * project's instructions were never initialised and the file is absent or
  * empty (B4). Not a dual-write loop — later PG edits are ignored, a deliberate

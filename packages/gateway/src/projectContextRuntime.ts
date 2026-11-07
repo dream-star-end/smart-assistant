@@ -22,9 +22,13 @@ import {
   isProjectContextEnabled,
   listPinnedProjectAssetsForChatProject,
   loadProjectContext,
+  loadProjectContextReadonly,
   parseBoardProjectId,
+  paths,
+  projectInstructionsWithUnwrittenSeed,
   seedProjectInstructionsIfEmpty,
   type ProjectAsset,
+  type ProjectContextSnapshot,
 } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 
@@ -54,6 +58,8 @@ export type ProjectContextUnavailableReason =
   | 'bad_response'
   /** The project's work project could not be created/read in this container. */
   | 'board_unavailable'
+  /** The project's files in this container cannot be read (e.g. EACCES). */
+  | 'project_storage_unavailable'
 
 export interface ResolvedTurnProjectContext {
   boardProjectId: string | null
@@ -65,6 +71,8 @@ export interface ResolvedTurnProjectContext {
   bound: boolean
   /** Set when the master could not be read and the session is or may be in a project. */
   unavailable?: ProjectContextUnavailableReason
+  /** errno code behind `project_storage_unavailable`. */
+  unavailableCode?: string
 }
 
 export interface ResolveTurnProjectContextOpts {
@@ -184,21 +192,56 @@ export function _resetProjectContextCacheForTest(): void {
   lastResolved.clear()
 }
 
+function errnoCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | null)?.code
+  return typeof code === 'string' && code ? code : 'unknown'
+}
+
 async function hydrateBound(
   boardProjectId: string,
   remote: MasterBody | null,
 ): Promise<ResolvedTurnProjectContext> {
-  if (remote?.instructions) {
-    await seedProjectInstructionsIfEmpty(boardProjectId, remote.instructions, remote.name ?? undefined)
-  } else {
-    await seedProjectInstructionsIfEmpty(boardProjectId, null, remote?.name ?? undefined)
+  let instructions: string | null
+  try {
+    await seedProjectInstructionsIfEmpty(boardProjectId, remote?.instructions ?? null, remote?.name ?? undefined)
+    instructions = (await loadProjectContext(boardProjectId)).instructions
+  } catch (writeErr) {
+    // The locked path writes (lock file, seed, meta key). Unwritable project
+    // files must not cost the turn its project: read them without the lock
+    // and use what the seed would have written.
+    let local: ProjectContextSnapshot
+    try {
+      local = await loadProjectContextReadonly(boardProjectId, paths)
+    } catch (readErr) {
+      const code = errnoCode(readErr)
+      log.warn('project files unreadable; turn held', {
+        boardProjectId,
+        writeErrorCode: errnoCode(writeErr),
+        readErrorCode: code,
+      })
+      return {
+        boardProjectId: null,
+        chatProjectId: remote?.chatProjectId ?? null,
+        name: remote?.name ?? null,
+        instructions: null,
+        assets: [],
+        assetsRevision: 0,
+        bound: false,
+        unavailable: 'project_storage_unavailable',
+        unavailableCode: code,
+      }
+    }
+    log.warn('project files not writable; continuing read-only', {
+      boardProjectId,
+      errorCode: errnoCode(writeErr),
+    })
+    instructions = projectInstructionsWithUnwrittenSeed(local, remote?.instructions)
   }
-  const local = await loadProjectContext(boardProjectId)
   return {
     boardProjectId,
     chatProjectId: remote?.chatProjectId ?? null,
     name: remote?.name ?? null,
-    instructions: local.instructions,
+    instructions,
     assets: remote?.pinnedAssets ?? [],
     assetsRevision: Number(remote?.assetsRevision) || 0,
     bound: true,
@@ -282,7 +325,8 @@ export async function resolveTurnProjectContext(
             unavailable: 'board_unavailable',
           }
         }
-        return rememberResolved(sessionId, await hydrateBound(id, remote), opts)
+        const hydrated = await hydrateBound(id, remote)
+        return hydrated.unavailable ? hydrated : rememberResolved(sessionId, hydrated, opts)
       }
       return rememberResolved(sessionId, {
         boardProjectId: null,

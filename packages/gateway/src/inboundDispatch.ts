@@ -703,8 +703,10 @@ export async function dispatchInbound(
       this.log.warn('project context unavailable; turn held', {
         sessionKey,
         reason: chatWorkspace.unavailable,
+        ...(chatWorkspace.unavailableCode ? { errorCode: chatWorkspace.unavailableCode } : {}),
         traceId: turnTraceId,
       })
+      const storage = chatWorkspace.unavailable === 'project_storage_unavailable'
       const heldFrames = _earlyRejectErrorFrames({
         sessionKey,
         channel: frame.channel,
@@ -712,9 +714,10 @@ export async function dispatchInbound(
         userId: activeUserId,
         traceId: turnTraceId,
         code: 'project_context_unavailable',
-        message:
-          '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。',
-        legacyErrorText: '[error] PROJECT_CONTEXT_UNAVAILABLE',
+        message: storage
+          ? `这个项目在容器里的文件读不出来（${chatWorkspace.unavailableCode ?? 'unknown'}），这一轮还没有开始，也不会计费。重试不会好转，需要先检查项目目录的权限。`
+          : '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。',
+        legacyErrorText: storage ? '[error] PROJECT_STORAGE_UNAVAILABLE' : '[error] PROJECT_CONTEXT_UNAVAILABLE',
       })
       for (const f of heldFrames) this.deliver(f, adapter)
       return
