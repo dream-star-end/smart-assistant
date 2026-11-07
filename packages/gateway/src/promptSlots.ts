@@ -1753,6 +1753,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       assets: resolved.assets,
       assetsRevision: resolved.assetsRevision,
       db,
+      ...(resolved.unwrittenSeed ? { unwrittenSeed: resolved.unwrittenSeed } : {}),
     })
   }
   if (frozenProjectContext !== undefined) {

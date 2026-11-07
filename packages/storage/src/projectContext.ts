@@ -404,6 +404,27 @@ export async function loadProjectContextReadonly(boardProjectId: string, locatio
   return readProjectContextSnapshot(assertBoardId(boardProjectId), locations, true)
 }
 
+const READ_ONLY_STORAGE_ERRNO = new Set(['EACCES', 'EPERM', 'EROFS'])
+
+/** The project dir cannot be written by this process (not a lock timeout or a bug). */
+export function isProjectStorageReadOnlyError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  return typeof code === 'string' && READ_ONLY_STORAGE_ERRNO.has(code)
+}
+
+/**
+ * The locked read writes a lock file; a project dir this process may only
+ * read gets the same snapshot read without the lock instead of an error.
+ */
+export async function loadProjectContextAllowReadOnly(boardProjectId: string): Promise<ProjectContextSnapshot> {
+  try {
+    return await loadProjectContext(boardProjectId)
+  } catch (error) {
+    if (!isProjectStorageReadOnlyError(error)) throw error
+    return loadProjectContextReadonly(boardProjectId, paths)
+  }
+}
+
 
 export function skillOverlayManifestSha256(skills: readonly ProjectSkillManifestEntry[]): string {
   const active = skills

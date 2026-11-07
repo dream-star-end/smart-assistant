@@ -4,8 +4,8 @@
  * PROJECT_MEMORY slots and the persist writer. Do not re-read meta/ledger.
  */
 import { join } from 'node:path'
-import { loadProjectContext, loadProjectContextReadonly, type ProjectWorkspace } from './projectContext.js'
-import { ProjectMemoryDir } from './projectMemoryDir.js'
+import { loadProjectContextAllowReadOnly, loadProjectContextReadonly, type ProjectWorkspace } from './projectContext.js'
+import { ProjectMemoryDir, sha256Hex } from './projectMemoryDir.js'
 import {
   officialManifestSha256,
   ProjectMemoryLedger,
@@ -89,11 +89,19 @@ export async function loadFrozenProjectContext(opts: {
   db?: SqlDb | null
   /** Explicit authority only; no fallback to legacy paths or opts.db. Owned by the caller. */
   formal?: ProjectFormalReadSource
+  /**
+   * The seed the turn's resolver could not write to a read-only project dir
+   * (projectInstructionsWithUnwrittenSeed); stands in for the empty PROJECT.md.
+   */
+  unwrittenSeed?: string
 }): Promise<FrozenProjectContext> {
   const formal = opts.formal
   if (formal && (!formal.paths || !formal.ledger)) throw new Error('Complete explicit formal source is required')
   const locations = formal ? formal.paths : paths
-  const snap = formal ? await loadProjectContextReadonly(opts.boardProjectId, locations) : await loadProjectContext(opts.boardProjectId)
+  const snap = formal
+    ? await loadProjectContextReadonly(opts.boardProjectId, locations)
+    : await loadProjectContextAllowReadOnly(opts.boardProjectId)
+  const seed = !formal && !snap.instructions && opts.unwrittenSeed ? opts.unwrittenSeed : null
   const formalSnapshot = formal?.ledger.snapshot(opts.boardProjectId)
   const db = formal ? null : opts.db ?? null
   const { readFile } = await import('node:fs/promises')
@@ -171,8 +179,10 @@ export async function loadFrozenProjectContext(opts: {
     workspaceSpec: opts.workspaceSpec ?? null,
     workspaceCwd: opts.workspaceCwd ?? null,
     cwdSource: opts.cwdSource ?? null,
-    instructions: snap.instructions,
-    projectMdSha256: snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
+    instructions: seed ?? snap.instructions,
+    projectMdSha256: seed
+      ? sha256Hex(seed)
+      : snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
     skills,
     skillManifestSha256: skillManifestSha256FromFiles(skills),
     officialMemory,

@@ -7,7 +7,7 @@
  */
 import {
   isProjectContextEnabled,
-  loadProjectContext,
+  loadProjectContextAllowReadOnly,
   parseProjectWorkspace,
   projectSessionFingerprint,
   resolveProjectCwd,
@@ -94,7 +94,7 @@ export async function resolveChatRunWorkspace(opts: {
     assetsRevision: resolved.assetsRevision,
   })
   try {
-    const snap = await loadProjectContext(projectId)
+    const snap = await loadProjectContextAllowReadOnly(projectId)
     contextFingerprint = projectSessionFingerprint({
       projectId,
       contextVersion: snap.version,

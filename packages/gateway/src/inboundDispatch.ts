@@ -714,9 +714,11 @@ export async function dispatchInbound(
         userId: activeUserId,
         traceId: turnTraceId,
         code: 'project_context_unavailable',
-        message: storage
-          ? `这个项目在容器里的文件读不出来（${chatWorkspace.unavailableCode ?? 'unknown'}），这一轮还没有开始，也不会计费。重试不会好转，需要先检查项目目录的权限。`
-          : '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。',
+        message: !storage
+          ? '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。'
+          : chatWorkspace.unavailableCode === 'EACCES' || chatWorkspace.unavailableCode === 'EPERM'
+            ? `这个项目在容器里的文件没有读取权限（${chatWorkspace.unavailableCode}），这一轮还没有开始，也不会计费。重试不会好转，需要先修复项目目录的权限。`
+            : `这个项目在容器里的文件读取出错（${chatWorkspace.unavailableCode ?? 'unknown'}），这一轮还没有开始，也不会计费。可以稍后重新发送；反复出现需要检查容器存储。`,
         legacyErrorText: storage ? '[error] PROJECT_STORAGE_UNAVAILABLE' : '[error] PROJECT_CONTEXT_UNAVAILABLE',
       })
       for (const f of heldFrames) this.deliver(f, adapter)

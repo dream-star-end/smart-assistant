@@ -20,6 +20,7 @@ import {
   getChatProjectBindByBoardProjectId,
   getChatProjectBindBySessionId,
   isProjectContextEnabled,
+  isProjectStorageReadOnlyError,
   listPinnedProjectAssetsForChatProject,
   loadProjectContext,
   loadProjectContextReadonly,
@@ -73,6 +74,8 @@ export interface ResolvedTurnProjectContext {
   unavailable?: ProjectContextUnavailableReason
   /** errno code behind `project_storage_unavailable`. */
   unavailableCode?: string
+  /** Instructions the seed would have written to the read-only project dir. */
+  unwrittenSeed?: string
 }
 
 export interface ResolveTurnProjectContextOpts {
@@ -202,13 +205,16 @@ async function hydrateBound(
   remote: MasterBody | null,
 ): Promise<ResolvedTurnProjectContext> {
   let instructions: string | null
+  let unwrittenSeed: string | undefined
   try {
     await seedProjectInstructionsIfEmpty(boardProjectId, remote?.instructions ?? null, remote?.name ?? undefined)
     instructions = (await loadProjectContext(boardProjectId)).instructions
   } catch (writeErr) {
-    // The locked path writes (lock file, seed, meta key). Unwritable project
-    // files must not cost the turn its project: read them without the lock
-    // and use what the seed would have written.
+    // The locked path writes (lock file, seed, meta key). A project dir this
+    // process may only read must not cost the turn its project: read it
+    // without the lock and use what the seed would have written. Any other
+    // failure (lock timeout, bug) is not a safe read-only snapshot.
+    if (!isProjectStorageReadOnlyError(writeErr)) throw writeErr
     let local: ProjectContextSnapshot
     try {
       local = await loadProjectContextReadonly(boardProjectId, paths)
@@ -236,6 +242,7 @@ async function hydrateBound(
       errorCode: errnoCode(writeErr),
     })
     instructions = projectInstructionsWithUnwrittenSeed(local, remote?.instructions)
+    if (instructions && !local.instructions) unwrittenSeed = instructions
   }
   return {
     boardProjectId,
@@ -245,6 +252,7 @@ async function hydrateBound(
     assets: remote?.pinnedAssets ?? [],
     assetsRevision: Number(remote?.assetsRevision) || 0,
     bound: true,
+    ...(unwrittenSeed ? { unwrittenSeed } : {}),
   }
 }
 
