@@ -9511,12 +9511,12 @@
       "occurredAt": "2026-11-07",
       "severity": "P1",
       "symptom": "Box idle compact 漏并行 tool_result 导致 apply 缺回执；等待无阶段提示且后续用户消息被 IDLE_HISTORY_PENDING 拒收。",
-      "rootFixCommit": "34a81bb62",
+      "rootFixCommit": "34a81bb6",
       "coverageCommits": [
-        "81e0569a8",
-        "871e13651",
-        "3942bd138",
-        "583cdc485"
+        "81e0569a",
+        "871e1365",
+        "3942bd13",
+        "583cdc48"
       ],
       "regressions": [
         {
