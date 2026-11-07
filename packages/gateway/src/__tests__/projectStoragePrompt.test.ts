@@ -22,6 +22,7 @@ const { loadFrozenProjectContext, paths, writeProjectInstructions } = await impo
 const { _resetProjectContextCacheForTest, resolveTurnProjectContext } = await import('../projectContextRuntime.js')
 const { resolveChatRunWorkspace } = await import('../projectWorkspace.js')
 const { buildPromptContext } = await import('../promptSlots.js')
+const { freezeStageProjectContext } = await import('../taskboard/patrol.js')
 
 let master: Record<string, unknown> = {}
 const server = createServer((req, res) => {
@@ -88,6 +89,29 @@ describe('read-only project dir through the prompt', { skip: asRoot ? 'permissio
     const frozen = await loadFrozenProjectContext({ boardProjectId: id, unwrittenSeed: resolved!.unwrittenSeed })
     assert.equal(frozen.instructions, 'SEED-SENTINEL 用学术中文')
     assert.equal(frozen.projectMdSha256, createHash('sha256').update('SEED-SENTINEL 用学术中文').digest('hex'))
+  })
+
+  it('a taskboard stage frozen from a read-only dir keeps the unwritten seed', async () => {
+    const id = randomUUID()
+    await mkdir(paths.projectDir(id), { recursive: true })
+    await lockDir(paths.projectDir(id), 0o555)
+    master = { boardProjectId: id, chatProjectId: 'chat-d', name: '项目D', instructions: 'STAGE-SEED 先写测试', pinnedAssets: [], assetsRevision: 0 }
+
+    const { frozen, projectContextText } = await freezeStageProjectContext({ boardProjectId: id })
+    assert.equal(frozen.instructions, 'STAGE-SEED 先写测试')
+    assert.equal(frozen.projectMdSha256, createHash('sha256').update('STAGE-SEED 先写测试').digest('hex'))
+    assert.ok(projectContextText?.includes('STAGE-SEED 先写测试'))
+    const prompt = await buildPromptContext({ agentId: 'main', projectId: id, frozenProjectContext: frozen })
+    assert.ok(prompt.content.includes('STAGE-SEED 先写测试'))
+  })
+
+  it('freezing does not refill a PROJECT.md cleared after the resolve', async () => {
+    const id = randomUUID()
+    assert.equal((await writeProjectInstructions(id, 'first', 0)).ok, true)
+    assert.equal((await writeProjectInstructions(id, null, 1)).ok, true)
+    await lockDir(paths.projectDir(id), 0o555)
+    const frozen = await loadFrozenProjectContext({ boardProjectId: id, unwrittenSeed: 'STALE-SEED' })
+    assert.equal(frozen.instructions, null)
   })
 
   it('a held lock is not mistaken for a read-only dir', async () => {

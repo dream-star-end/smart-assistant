@@ -190,6 +190,7 @@ export async function freezeStageProjectContext(opts: {
     workspaceCwd: opts.workspaceCwd ?? null,
     cwdSource: opts.cwdSource ?? null,
     db: opts.db ?? null,
+    ...(resolved?.unwrittenSeed ? { unwrittenSeed: resolved.unwrittenSeed } : {}),
   })
   return {
     frozen,

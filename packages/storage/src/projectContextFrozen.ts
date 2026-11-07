@@ -4,7 +4,12 @@
  * PROJECT_MEMORY slots and the persist writer. Do not re-read meta/ledger.
  */
 import { join } from 'node:path'
-import { loadProjectContextAllowReadOnly, loadProjectContextReadonly, type ProjectWorkspace } from './projectContext.js'
+import {
+  loadProjectContextAllowReadOnly,
+  loadProjectContextReadonly,
+  projectInstructionsWithUnwrittenSeed,
+  type ProjectWorkspace,
+} from './projectContext.js'
 import { ProjectMemoryDir, sha256Hex } from './projectMemoryDir.js'
 import {
   officialManifestSha256,
@@ -101,7 +106,11 @@ export async function loadFrozenProjectContext(opts: {
   const snap = formal
     ? await loadProjectContextReadonly(opts.boardProjectId, locations)
     : await loadProjectContextAllowReadOnly(opts.boardProjectId)
-  const seed = !formal && !snap.instructions && opts.unwrittenSeed ? opts.unwrittenSeed : null
+  // Same B4 rule as the resolver, on the snapshot actually frozen.
+  const seed =
+    !formal && !snap.instructions && opts.unwrittenSeed
+      ? projectInstructionsWithUnwrittenSeed(snap, opts.unwrittenSeed)
+      : null
   const formalSnapshot = formal?.ledger.snapshot(opts.boardProjectId)
   const db = formal ? null : opts.db ?? null
   const { readFile } = await import('node:fs/promises')
