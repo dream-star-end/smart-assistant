@@ -56,3 +56,48 @@ test('OCV5-747 idle cleanup cannot clear a different owner or a handed-off user 
   assert.equal(session.currentTurnStatus, 'compacting')
   assert.deepEqual(await reconnect(session), ['compacting'])
 })
+
+test('OCV5-747 crash fixture installs all 3 fault seams and checkpoint restore clears post-fault rollback tombstones', async () => {
+  const { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { dirname, join } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const { readIdleRollbacks, writeIdleRollback } = await import('@openclaude/storage')
+  const { installIdleFaultFixture, saveIdleCheckpoint, restoreIdleCheckpoint } = await import('./fixtures/idleCrashFixture.js')
+
+  const root = mkdtempSync(join(tmpdir(), 'oc-idle-crash-fixture-'))
+  try {
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '../../../..')
+    const candidate = join(root, 'candidate')
+    const targetRel = 'claude-code-best/src/services/compact/idleRecover.ts'
+    mkdirSync(dirname(join(candidate, targetRel)), { recursive: true })
+    cpSync(join(repoRoot, targetRel), join(candidate, targetRel))
+    const installed = installIdleFaultFixture(candidate, join(root, 'control'))
+    assert.notEqual(installed.before, installed.after)
+    const injected = readFileSync(join(candidate, targetRel), 'utf8')
+    for (const seam of ['before-artifact', 'native-half', 'receipt-lost']) {
+      assert.ok(injected.includes(`testIdleFault('${seam}'`), `missing fault seam ${seam}`)
+    }
+
+    const home = join(root, 'home')
+    const sessionKey = 'agent:main:webchat:dm:crash-checkpoint'
+    const nativeId = '74700000-0000-4000-8000-000000000099'
+    const opId = 'f'.repeat(64)
+    mkdirSync(join(home, 'idle-ops', encodeURIComponent(sessionKey)), { recursive: true })
+    mkdirSync(join(home, 'idle-native', encodeURIComponent(nativeId)), { recursive: true })
+    mkdirSync(join(home, 'idle-candidates'), { recursive: true })
+    mkdirSync(join(home, 'claude-config', 'projects', 'p'), { recursive: true })
+    writeFileSync(join(home, 'idle-ops', encodeURIComponent(sessionKey), 'rev.json'), JSON.stringify({ idleTurnKey: opId }))
+    writeFileSync(join(home, 'idle-native', encodeURIComponent(nativeId), 'rev.json'), JSON.stringify({ v: 1, opId, revision: 'rev', sessionId: nativeId }))
+    writeFileSync(join(home, 'idle-candidates', `${encodeURIComponent(sessionKey)}.json`), JSON.stringify({ sessionKey }))
+    writeFileSync(join(home, 'claude-config', 'projects', 'p', `${nativeId}.jsonl`), '{"uuid":"74700000-0000-4000-8000-000000000002"}\n')
+
+    const atFault = saveIdleCheckpoint(home, join(root, 'checkpoint'), sessionKey, nativeId)
+    writeIdleRollback(home, { v: 1, sessionId: nativeId, opId, restoreTip: '74700000-0000-4000-8000-000000000002' })
+    assert.equal(readIdleRollbacks(home, nativeId).length, 1)
+    restoreIdleCheckpoint(atFault)
+    assert.equal(readIdleRollbacks(home, nativeId).length, 0, 'restoreIdleCheckpoint must remove post-checkpoint idle-abandoned tombstones')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
