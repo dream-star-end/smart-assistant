@@ -70,6 +70,7 @@ import { getPlatformPrompt } from './platformPrompts.js'
 import {
   resolveTurnProjectContext,
   type ResolvedTurnProjectContext,
+  SPAWN_REUSE_TURN_READ_MS,
 } from './projectContextRuntime.js'
 import { buildEnvSlot } from './envProbe.js'
 import { getModelCatalogClient } from './modelCatalogClient.js'
@@ -1723,8 +1724,10 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     resolved = await resolveTurnProjectContext({
       sessionId: ctx.sessionId,
       boardProjectId: ctx.projectId,
-      // The turn already passed server.ts's read (or was held there); if this
-      // spawn-time read fails, build from that read rather than without the project.
+      // The turn already passed server.ts's read (or was held there): use it
+      // while recent; if a spawn-time read is needed and fails, build from it
+      // rather than without the project.
+      reuseRecentMs: SPAWN_REUSE_TURN_READ_MS,
       reuseLastOnFailure: true,
     })
   }

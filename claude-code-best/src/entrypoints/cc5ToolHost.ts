@@ -270,6 +270,13 @@ export async function startCc5ToolHost(profilePath: string): Promise<void> {
     '../utils/hooks/hooksConfigSnapshot.js'
   )
   captureHooksConfigSnapshot()
+  // MCP servers only read the explicit config path and the cwd/settings already in place above, so
+  // their boot can overlap the permission context. The pool is assembled from the same two values
+  // as before, in the same order.
+  const mcpPrefetch = profile.mcpConfigPath
+    ? connectCc5McpTools(profile.mcpConfigPath)
+    : undefined
+  mcpPrefetch?.catch(() => {})
   const { initializeToolPermissionContext } = await import(
     '../utils/permissions/permissionSetup.js'
   )
@@ -289,8 +296,8 @@ export async function startCc5ToolHost(profilePath: string): Promise<void> {
     ...getDefaultAppState(),
     toolPermissionContext: permissionContext,
   })
-  const { clients, tools: mcpTools } = profile.mcpConfigPath
-    ? await connectCc5McpTools(profile.mcpConfigPath)
+  const { clients, tools: mcpTools } = mcpPrefetch
+    ? await mcpPrefetch
     : { clients: [], tools: [] }
   const { assembleToolPool } = await import('../tools.js')
   const tools = assembleToolPool(

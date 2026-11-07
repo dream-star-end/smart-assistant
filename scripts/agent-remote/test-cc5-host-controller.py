@@ -51,7 +51,8 @@ def session_packet(text=None, prompt='Platform lane system prompt.\n'):
     return {'version': 1, 'catalog': text, 'catalogSha256': mod.sha(text.encode()), 'prompt': prompt}
 
 
-class ProfileTests(unittest.TestCase):
+class ControllerFixture(unittest.TestCase):
+    """A real task root: real profile/catalog files, only the node's account-owned bits are stand-ins."""
     def install_session(self, root, data=None):
         with patch.object(mod.sys, 'stdin', SimpleNamespace(
                 buffer=io.BytesIO(json.dumps(data or session_packet()).encode()))), \
@@ -74,6 +75,8 @@ class ProfileTests(unittest.TestCase):
         self.install_session(root)
         return info
 
+
+class ProfileTests(ControllerFixture):
     def test_real_profile_files_pin_the_sole_mcp_and_preserve_empty_cli_arguments(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -843,6 +846,103 @@ m.launch(r,'claude-sonnet-5')
                     else:
                         with self.assertRaises(RuntimeError): mod.cleanup(root)
                         self.assertTrue(root.exists())
+
+
+class StartRoundOrderTests(ControllerFixture):
+    """The order the gateway issues for each lane state (OCV5-746 audit B2).
+
+    The node controller, not the caller, owns these preconditions: a fresh root has no session
+    profile for tool-socket's profile_args, and a launched round keeps its LIFECYCLE record as
+    stop proof, which session-profile refuses while present.
+    """
+
+    def launch_args(self, root, installed_owner):
+        """Run the real launch role with only the node's process/account bits stubbed."""
+        home = root / 'home'
+        home.mkdir(exist_ok=True)
+        with patch.object(mod, 'process_record', lambda _: {'pid': 2000000000, 'startTicks': '1'}), \
+                patch.object(mod, 'proc', lambda _: (['synthetic-controller'], '1')), \
+                patch.object(mod, 'HOME', home), \
+                patch.object(mod, 'owner', lambda root: {**installed_owner, 'pluginDigest': '0' * 64}), \
+                patch.object(mod, 'check_sources',
+                             lambda *_: {name: ('synthetic ' + name).encode() for name in mod.SOURCE_FILES}), \
+                patch.object(mod.os, 'chdir') as chdir, patch.object(mod.os, 'execve') as execute:
+            mod.launch(root, 'claude-sonnet-5')
+        chdir.assert_called_once()
+        execute.assert_called_once()
+        _executable, args, environment = execute.call_args.args
+        self.assertEqual(args[:3], [sys.executable, str(root / 'install/host.py'), str(root / 'run')])
+        self.assertEqual(environment['HOME'], str(home))
+        return args, environment
+
+    def test_a_fresh_round_installs_the_profile_before_the_tool_socket(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            # reset/provision leave the root without a session profile.
+            shutil.rmtree(root / 'session')
+            with patch.object(mod.os, 'execve') as execute:
+                with self.assertRaisesRegex(RuntimeError, 'missing-session-profile'):
+                    mod.tool_socket(root)
+                execute.assert_not_called()
+            self.assertFalse((root / 'LIFECYCLE.json').exists())
+
+            text = catalog([tool('t9', 'fresh lane tool')])
+            self.install_session(root, session_packet(text, 'fresh prompt'))
+            with patch.object(mod.os, 'execve') as execute:
+                mod.tool_socket(root)
+            execute.assert_called_once()
+            executable, args, environment = execute.call_args.args
+            self.assertEqual(executable, '/usr/bin/python3')
+            self.assertEqual(args[:4], ['/usr/bin/python3', '-I', '-B', str(root / 'cprofile/cc5-mcp-socket.py')])
+            self.assertEqual(args[4], str(root))
+            self.assertEqual(environment['HOME'], str(mod.HOME))
+
+            launch_args, _environment = self.launch_args(root, info)
+            self.assertEqual(launch_args[launch_args.index('--allowedTools') + 1], 'mcp__ocbridge__t9')
+            self.assertEqual(launch_args[launch_args.index('--append-system-prompt-file') + 1],
+                             str(root / 'session/prompt.md'))
+            self.assertEqual([item['name'] for item in mod.check_session(root)['tools']], ['t9'])
+
+    def test_a_replacement_round_rotates_before_the_new_profile_and_refuses_the_reverse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            old = [item['name'] for item in mod.check_session(root)['tools']]
+            self.assertEqual(old, ['t0', 'tool_two'])
+            # The previous round launched and was stopped; its record remains as stop proof.
+            mod.write_lifecycle(root, info, {'host': {'pid': 2000000000, 'startTicks': '1'},
+                                             'claude': None, 'descendants': []})
+            text = catalog([tool('t7', 'only tool')])
+            packet = session_packet(text, 'second prompt')
+
+            # Reverse order: the new profile is refused while the old round is still recorded.
+            with self.assertRaisesRegex(RuntimeError, 'session-runtime-present'):
+                self.install_session(root, packet)
+            self.assertEqual([item['name'] for item in mod.check_session(root)['tools']], old)
+            self.assertTrue((root / 'LIFECYCLE.json').exists())
+
+            # The order the gateway issues: tool-socket (rotate) proves the old round gone and
+            # clears its records; the socket itself validates the old, still-installed profile.
+            with patch.object(mod.os, 'execve') as execute:
+                mod.tool_socket(root)
+            execute.assert_called_once()
+            self.assertEqual(execute.call_args.args[1][3], str(root / 'cprofile/cc5-mcp-socket.py'))
+            self.assertFalse((root / 'LIFECYCLE.json').exists())
+            self.assertFalse((root / 'STOPPED.json').exists())
+            self.assertEqual([item['name'] for item in mod.check_session(root)['tools']], old)
+
+            printed = self.install_session(root, packet)
+            self.assertEqual(printed['catalogSha256'], mod.sha(text.encode()))
+            self.assertEqual([item['name'] for item in mod.check_session(root)['tools']], ['t7'])
+            hidden = root / 'cprofile'
+            self.assertTrue(all(stat_mode(hidden / name) == 0o400 for name in
+                                ('cc5-fixed-mcp.py', 'cc5-mcp-socket.py', 'client.json', 'mcp.json')))
+
+            launch_args, _environment = self.launch_args(root, info)
+            self.assertEqual(launch_args[launch_args.index('--allowedTools') + 1], 'mcp__ocbridge__t7')
+            self.assertEqual(launch_args[launch_args.index('--append-system-prompt-file') + 1],
+                             str(root / 'session/prompt.md'))
 
 
 if __name__ == '__main__': unittest.main()
