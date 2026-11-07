@@ -184,7 +184,7 @@ function seed(key: string) {
     rollbackTip: '74700000-0000-4000-8000-000000000002' })
   return artifact
 }
-async function proofServer() {
+async function proofServer(unknownProof = false) {
   process.env.OC_USER_ID = '3'
   const server = createServer((req, res) => {
     if (req.url?.startsWith('/internal/v3/marketplace/sync')) {
@@ -200,6 +200,7 @@ async function proofServer() {
       const body = JSON.parse(raw)
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify(req.url?.endsWith('/stop') ? { status: 'stopped' } :
+        unknownProof && body.oc_turn_key === idleKey ? { status: 'pending', reason: 'unknown' } :
         { status: 'terminal', sessionId: nativeId, turnKey: body.oc_turn_key, requestId: 'request',
           revision, compactRequired: true, capsuleSha256: 'a'.repeat(64),
           ...(body.oc_turn_key === idleKey ? { summaryText: 'summary' } : {}) }))
@@ -217,12 +218,13 @@ async function proofServer() {
     await new Promise<void>(r => server.close(() => r()))
   }
 }
-for (const mode of ['receipt', 'missing', 'unstoppable'] as const) {
+for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-stop'] as const) {
   test(`OCV5-747 real inbound + submit: ${mode}`, { timeout: 30000 }, async () => {
     const f = gatewayFixture()
     f.session.channel = 'webchat'
     const artifact = seed(f.sessionKey)
-    const close = await proofServer()
+    const close = await proofServer(mode === 'unknown-proof')
+    const rejected = ['unstoppable', 'unknown-proof', 'hung-stop'].includes(mode)
     let release!: () => void, entered!: () => void
     const held = new Promise<void>(r => { release = r })
     const started = new Promise<void>(r => { entered = r })
@@ -232,6 +234,10 @@ for (const mode of ['receipt', 'missing', 'unstoppable'] as const) {
       return mode === 'receipt' ? { nativeIdleReceipt: { opId: idleKey, digest: artifact.digest } } as TurnSummary : {} as TurnSummary
     }
     f.runner.stopFails = mode === 'unstoppable'
+    if (mode === 'hung-stop') {
+      f.runner.shutdown = () => new Promise<void>(() => {})
+      f.session._idleDeadline = Date.now() + 100
+    }
     try {
       if (mode === 'receipt') (f.manager as any).scheduleIdleDrain(f.session)
       if (mode === 'receipt') await started
@@ -245,7 +251,7 @@ for (const mode of ['receipt', 'missing', 'unstoppable'] as const) {
         assert.equal(f.session.currentTurnStatus, 'compacting', 'hello reconnect has phase cache while waiting')
         release()
       }
-      if (mode === 'unstoppable') {
+      if (rejected) {
         await assert.rejects(work, /IDLE_RECOVERY_PENDING:[1-9]/)
         assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 0)
         assert.equal(readIdleOp(home, f.sessionKey, revision)?.disposition, undefined)
@@ -261,7 +267,7 @@ for (const mode of ['receipt', 'missing', 'unstoppable'] as const) {
       assert.ok(status, 'all idle wait paths report compacting')
       assert.equal(f.session._idleWaiters?.size ?? 0, 0)
       await f.manager.awaitPendingPersistence()
-      if (mode !== 'unstoppable') {
+      if (!rejected) {
         const records = (await readFile(settledPath, 'utf8')).trim().split('\n').map(l => JSON.parse(l))
         const matching = records.filter(r => JSON.stringify(r).includes(f.peerId))
         assert.equal(matching.length, 1, 'one durable user-turn result, not idle output')

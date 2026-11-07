@@ -2,12 +2,14 @@ import { expect, test } from 'bun:test'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildIdleCompactionResult, applyIdleTranscript } from './idleRecover.js'
+import { buildIdleCompactionResult, applyIdleTranscript, writeIdleNativeFile } from './idleRecover.js'
 import { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } from './compact.js'
 import { loadMessagesFromJsonlPath } from '../../utils/conversationRecovery.js'
 
-test('OCV5-747 parallel tool results survive idle apply and the real resume loader', async () => {
+for (const legacy of [false, true]) test('OCV5-747 parallel tool results survive idle apply and the real resume loader: ' + (legacy ? 'legacy boundary' : 'ordered boundary'), async () => {
   const home = await mkdtemp(join(tmpdir(), 'idle-siblings-'))
+  const oldHome = process.env.OPENCLAUDE_HOME
+  process.env.OPENCLAUDE_HOME = home
   const file = join(home, '74700000-0000-4000-8000-000000000000.jsonl')
   const id = (n: number) => `74700000-0000-4000-8000-${String(n).padStart(12, '0')}`
   const row = (n: number, parent: number | null, role: string, content: unknown) => ({
@@ -31,6 +33,10 @@ test('OCV5-747 parallel tool results survive idle apply and the real resume load
   try {
     const built = buildIdleCompactionResult(native, original as never, annotateBoundaryWithPreservedSegment)
     const expected = buildPostCompactMessages(built.result)
+    if (legacy) {
+      delete (built.result.boundaryMarker.compactMetadata as Record<string, unknown>).idlePreservedUuids
+      writeIdleNativeFile(join(home, 'idle-native', native.sessionId, native.revision + '.json'), native)
+    }
     // Native writer deduplicates kept UUIDs: original sibling parents remain on disk.
     const added = expected.filter(m => !original.some(o => o.uuid === m.uuid))
     const persisted = [...original, ...added.map((m, i) => ({ ...m,
@@ -46,5 +52,13 @@ test('OCV5-747 parallel tool results survive idle apply and the real resume load
       record: async () => {}, flush: async () => {}, load: async () => loaded as never })
     expect(JSON.stringify(loaded.messages)).toContain('first result')
     expect(JSON.stringify(loaded.messages)).toContain('second result')
-  } finally { await rm(home, { recursive: true, force: true }) }
+    if (legacy) {
+      writeIdleNativeFile(join(home, 'idle-native', native.sessionId, native.revision + '.json'),
+        { ...native, summaryText: 'wrong projection' })
+      await expect(loadMessagesFromJsonlPath(file)).rejects.toThrow('IDLE_RECOVERY_CORRUPT')
+    }
+  } finally {
+    if (oldHome === undefined) delete process.env.OPENCLAUDE_HOME; else process.env.OPENCLAUDE_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
 })

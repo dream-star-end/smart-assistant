@@ -1,4 +1,4 @@
-import { readIdleRollbacks } from '../../../../packages/storage/src/idleRollback.js'
+import { readIdleRollbacks, IdleRecoveryCorrupt } from '../../../../packages/storage/src/idleRollback.js'
 /** Idle compact: freeze the tail, then either summarize once or rebuild
  * the same post-compact messages from a stored capsule. Hooks are not run. */
 import { createHash } from 'node:crypto'
@@ -429,8 +429,7 @@ export async function resumeIdleSummary(input: {
   if (file.applied && !file.summaryText) return { path, file, freshSummary: false }
   if (file.frozenTail.length === 0 && file.attachments.length === 0) {
     const preserved = selectIdlePreserve(input.messages, input.isLoggable)
-    file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments,
-      rollbackTip: file.modelStarted ? file.rollbackTip : await input.loadOriginalTip?.() }
+    file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
     writeIdleNativeFile(path, file)
   }
   if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages, input.fit)) {
@@ -441,7 +440,7 @@ export async function resumeIdleSummary(input: {
   let freshSummary = false
   if (!file.summaryText) {
     if (file.modelStarted || !input.summarize) throw new Error('IDLE_HISTORY_PENDING')
-    file = { ...file, modelStarted: true }
+    file = { ...file, modelStarted: true, rollbackTip: await input.loadOriginalTip?.() }
     writeIdleNativeFile(path, file)
     const summaryText = (await input.summarize([...input.messages])).trim()
     if (!summaryText) throw new Error('IDLE_HISTORY_PENDING')
@@ -513,9 +512,9 @@ export function recoverIdlePreservedUuids(sessionId: string, metadata: Record<st
   const path = readIdleNativeByOp(sessionId, metadata.idleOpId)
   if (!path) return undefined
   const file = readIdleNativeFile(path)
-  if (!file.summaryText || file.sessionId !== sessionId) throw new Error('IDLE_RECOVERY_CORRUPT')
+  if (!file.summaryText || file.sessionId !== sessionId) throw new IdleRecoveryCorrupt()
   const projection = projectIdleArtifact({ opId: file.opId, summaryText: file.summaryText,
     tail: file.frozenTail, attachments: file.attachments })
-  if (projection.digest !== metadata.idleReceiptDigest) throw new Error('IDLE_RECOVERY_CORRUPT')
+  if (projection.digest !== metadata.idleReceiptDigest) throw new IdleRecoveryCorrupt()
   return file.frozenTail.map(row => row.uuid)
 }

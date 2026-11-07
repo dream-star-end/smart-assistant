@@ -28,8 +28,6 @@ import {
   ModelAuthorityError,
   TURN_DISPATCH_STATE_PATH,
   TURN_TAPE_STATE_PATH,
-  attachmentTotalExceededFailureCode,
-  parseAttachmentTotalExceeded,
   computeDispatchRequestHash,
   parseAuthorityKeyring,
   verifyDispatchAuthority,

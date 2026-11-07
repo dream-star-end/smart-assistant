@@ -2126,7 +2126,7 @@ function applyPreservedSegmentRelinks(
   // Find the absolute-last boundary and the last seg-boundary (can differ:
   // manual /compact after reactive compact → seg is stale).
   let lastSeg: Seg | undefined
-  let idlePreservedUuids: unknown
+  let idleBoundary: TranscriptMessage | undefined
   let lastSegBoundaryIdx = -1
   let absoluteLastBoundaryIdx = -1
   const entryIndex = new Map<UUID, number>()
@@ -2138,7 +2138,7 @@ function applyPreservedSegmentRelinks(
       const seg = entry.compactMetadata?.preservedSegment
       if (seg) {
         lastSeg = seg
-        idlePreservedUuids = recoverIdlePreservedUuids(String(entry.sessionId), entry.compactMetadata)
+        idleBoundary = entry
         lastSegBoundaryIdx = i
       }
     }
@@ -2150,6 +2150,9 @@ function applyPreservedSegmentRelinks(
   // Seg stale (no-seg boundary came after): skip relink, still prune at
   // absolute — otherwise the stale preserved chain becomes a phantom leaf.
   const segIsLive = lastSegBoundaryIdx === absoluteLastBoundaryIdx
+  const idlePreservedUuids = segIsLive && idleBoundary && isCompactBoundaryMessage(idleBoundary)
+    ? recoverIdlePreservedUuids(String(idleBoundary.sessionId), idleBoundary.compactMetadata)
+    : undefined
 
   // Validate tail→head BEFORE mutating so malformed metadata is a true
   // no-op (walk stops at headUuid, doesn't need the relink to run first).
@@ -2164,7 +2167,7 @@ function applyPreservedSegmentRelinks(
       || !messages.has(lastSeg.anchorUuid) || idlePreservedUuids.includes(lastSeg.anchorUuid)
       || idlePreservedUuids.some(id => typeof id !== 'string' || !messages.has(id as UUID)
         || (entryIndex.get(id as UUID) ?? Infinity) >= absoluteLastBoundaryIdx)) {
-      throw new Error('IDLE_RECOVERY_CORRUPT')
+      throw new IdleRecoveryCorrupt()
     }
     let parent = lastSeg.anchorUuid
     for (const id of idlePreservedUuids as UUID[]) {

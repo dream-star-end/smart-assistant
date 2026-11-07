@@ -59,7 +59,7 @@ export interface ContainerDispatchClientDeps {
   timeoutMs?: number
 }
 
-import { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH, attachmentTotalExceededFailureCode, parseAttachmentTotalExceeded } from '@openclaude/protocol'
+import { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH } from '@openclaude/protocol'
 
 export { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH }
 const DEFAULT_TIMEOUT_MS = 5_000

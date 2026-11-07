@@ -2388,7 +2388,15 @@ export async function finishIdleUnderLock(
   const assertIdleCurrent = () => {
     if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_IDLE_PRIVACY_CANCELLED')
   }
-  await refreshRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertIdleCurrent })
+  // The policy fetch already has a 5s abort; also bound a warm-child restart.
+  // Never race-and-forget privacy refresh (its late cleanup could clear the
+  // following user turn's policy).
+  await refreshRunnerPromptPrivacy(privacyRunner, session.peerId, {
+    assertCurrent: assertIdleCurrent,
+    shutdown: async () => {
+      if (!await shutdownIdleRunner(privacyRunner, left(5_000))) throw new IdleTurnTimeoutError(false)
+    },
+  })
   try {
     const started = startIdleOp({
       dir: recoveryDir,
@@ -2436,10 +2444,8 @@ export async function finishIdleUnderLock(
       writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
       return
     }
-    // OCV5-620: apply-stuck is NOT checked here (before apply). Op-file mtime
-    // reflects the last write, not when the summary became prepared, so an early
-    // check could discard a recoverable summary without ever trying to apply it
-    // (Codex r1 P1). It is checked only after an apply attempt, below.
+    // Try a valid receipt before abandoning. Age alone is not quiescence:
+    // safe fallback below requires shutdown, Box proof, and native rollback.
     const accepted = idleSummaryAccepted(summaryProof, {
       sessionId: source.sessionId,
       idleTurnKey: op.idleTurnKey,
@@ -2493,14 +2499,14 @@ export async function finishIdleUnderLock(
       session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
       try {
         assertIdleCurrent()
-        if (deadline - Date.now() <= 45_000) throw new IdleTurnTimeoutError(false)
+        if (deadline - Date.now() <= 60_000) throw new IdleTurnTimeoutError(false)
         const settled = await runBoxIdleTurn(privacyRunner, {
           input: IDLE_COMPACT_PROMPT,
           turnKey: step.op.idleTurnKey,
           onEvent: () => {},
           sessionTotals: session,
           toolUseIdToName: session.toolUseIdToName ?? new Map(),
-        }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 45_000 })
+        }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 60_000 })
         const receipt = settled?.nativeIdleReceipt
         if (needsApply && (receipt?.digest !== step.op.artifact?.digest || receipt?.opId !== step.op.idleTurnKey)) {
           log.warn('box idle apply receipt unconfirmed', {
@@ -2543,14 +2549,14 @@ export async function finishIdleUnderLock(
             })
             if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
               assertIdleCurrent()
-              if (deadline - Date.now() <= 45_000) throw new IdleTurnTimeoutError(false)
+              if (deadline - Date.now() <= 60_000) throw new IdleTurnTimeoutError(false)
               const applied = await runBoxIdleTurn(privacyRunner, {
                 input: IDLE_COMPACT_PROMPT,
                 turnKey: step.op.idleTurnKey,
                 onEvent: () => {},
                 sessionTotals: session,
                 toolUseIdToName: session.toolUseIdToName ?? new Map(),
-              }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 45_000 })
+              }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 60_000 })
               const applyReceipt = applied?.nativeIdleReceipt
               if (applyReceipt?.digest !== step.op.artifact.digest || applyReceipt?.opId !== step.op.idleTurnKey) log.warn('box idle apply receipt unconfirmed', {
                 sessionKey: session.sessionKey, revision: step.op.revision,
@@ -2602,7 +2608,7 @@ export async function finishIdleUnderLock(
           })
         }
       } catch (idleErr) {
-        if (idleErr instanceof IdleCompactRejected && idleErr.code === 'IDLE_RECOVERY_CORRUPT') throw idleErr
+        if (idleErr instanceof Error && idleErr.message === 'IDLE_RECOVERY_CORRUPT') throw idleErr
         // Timeout, crash or error: never a result and never a re-dispatch
         // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
         // runner is recorded as evidence that it can no longer send the
