@@ -12,8 +12,9 @@ export class IdleCompactRejected extends Error {
     | 'IDLE_HISTORY_PENDING'
     | 'IDLE_ARTIFACT_MISSING'
     | 'IDLE_RECOVERY_CORRUPT'
-    | 'IDLE_NOT_BOX') {
-    super(code)
+    | 'IDLE_NOT_BOX'
+    | 'IDLE_RECOVERY_PENDING', readonly retryAfterMs?: number) {
+    super(code === 'IDLE_RECOVERY_PENDING' ? `IDLE_RECOVERY_PENDING:${Math.max(1, Math.ceil((retryAfterMs ?? IDLE_APPLY_STUCK_MS) / 60000))}` : code)
     this.name = 'IdleCompactRejected'
   }
 }
@@ -56,7 +57,7 @@ export interface IdleOp {
    * never saw it after the grace window, or an operator reset replaced the
    * native session). Both settle the op. */
   disposition?: 'short' | 'abandoned'
-  abandonReason?: 'idle_turn_failed' | 'idle_turn_never_sent' | 'idle_apply_stuck' | 'operator_reset'
+  abandonReason?: 'idle_turn_failed' | 'idle_turn_never_sent' | 'idle_apply_stuck' | 'idle_apply_unconfirmed' | 'operator_reset'
   /** Epoch ms when this process shut the CCB runner down after its idle turn
    * ended without a result (shutdown() returned). From then on that child
    * cannot send a compact request. */
@@ -235,6 +236,7 @@ export interface IdleNativeFile {
   /** Set before the summary request. A later entry must not send another one. */
   modelStarted?: boolean
   applied?: boolean
+  rollbackTip?: string
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleAttachment[]
@@ -607,4 +609,10 @@ export function abandonAllIdle(dir: string, sessionKey: string): number {
   }
   clearIdleCandidate(dir, sessionKey)
   return count
+}
+
+/** Remaining legacy recovery interval; elapsed time alone never proves a live runner dead. */
+export function idleRecoveryRemainingMs(dir: string, op?: IdleOp): number {
+  const written = op ? mtimeOf(opPath(dir, op)) : 0
+  return Math.max(60_000, IDLE_APPLY_STUCK_MS - (written ? Date.now() - written : 0))
 }

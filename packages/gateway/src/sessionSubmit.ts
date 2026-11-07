@@ -1,3 +1,5 @@
+import { beginIdleWait, endIdleWait } from './boxIdleWait.js'
+import { recoverUnconfirmedIdle } from './boxIdleRecovery.js'
 import { type Cc5ExecutionBackend, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
@@ -45,7 +47,6 @@ import {
   boxTurnMayIdle,
   currentIdleSource,
   idleAbandonReason,
-  idleApplyStuckReason,
   idleCandidateAgedOut,
   idleOpSettled,
   idleProofWaitMs,
@@ -55,6 +56,7 @@ import {
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
   idleHistoryStillBlocked,
+  idleRecoveryRemainingMs,
   idleSummaryAccepted,
   nativeShortForOp,
   clearIdleCandidate,
@@ -70,7 +72,7 @@ import {
 } from './boxIdleCompact.js'
 import { fetchBoxIdleProof, type IdleProofResponse } from './engine/boxIdleProofClient.js'
 import { notifyBoxUserStop } from './engine/boxUserStopClient.js'
-import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
+import { BOX_IDLE_TURN_TIMEOUT_MS, boxIdleTurnTimeoutMs, IdleTurnTimeoutError, runBoxIdleTurn, shutdownIdleRunner } from './boxIdleTurn.js'
 import {
   cursorSandBoxCcResumeInnerId,
   cursorSandOfficialCcResumeInnerId,
@@ -195,21 +197,11 @@ async function settleStrandedIdleOp(
   op: IdleOp,
   recoveryDir: string,
 ): Promise<void> {
-  // OCV5-620: apply-stuck settles even when a summary is prepared (that case
-  // is intentionally excluded from idleAbandonReason).
   const evidenced = withIncarnationShutdown(recoveryDir, op)
-  const applyStuck = idleApplyStuckReason(recoveryDir, evidenced)
-  if (applyStuck) {
-    log.warn('box idle op abandoned', {
-      sessionKey: session.sessionKey,
-      revision: op.revision,
-      reason: applyStuck,
-    })
-    writeSettledIdleOp(recoveryDir, {
-      ...evidenced,
-      disposition: 'abandoned',
-      abandonReason: applyStuck,
-    })
+  if (op.summaryText) {
+    const recovered = await recoverUnconfirmedIdle(session.runner, evidenced, recoveryDir,
+      session._idleDeadline ?? Date.now() + 45_000)
+    writeSettledIdleOp(recoveryDir, recovered)
     return
   }
   if (op.summaryText || readIdleNative(recoveryDir, op.sourceSessionId, op.revision)?.summaryText)
@@ -217,7 +209,7 @@ async function settleStrandedIdleOp(
   const idleProof = await fetchBoxIdleProof({
     sessionId: op.sourceSessionId,
     turnKey: op.idleTurnKey,
-  })
+  }, { timeoutMs: Math.max(1, Math.min(10_000, (session._idleDeadline ?? Date.now() + 10_000) - Date.now())) })
   // Same authoritative evidence as a live op; a missing native file alone
   // does not prove nothing was sent. Otherwise only the operator reset exits.
   const reason = idleAbandonReason(evidenced, idleProof)
@@ -240,14 +232,14 @@ async function settleStrandedIdleOp(
  * settles as idle_turn_failed. Nothing is sent to a model. */
 const IDLE_TURN_STOP_WAIT_MS = 30_000
 
-async function stopParkedIdleTurn(op: IdleOp): Promise<void> {
+async function stopParkedIdleTurn(op: IdleOp, timeoutMs = IDLE_TURN_STOP_WAIT_MS): Promise<void> {
   if (idleOpSettled(op) || op.summaryText || typeof op.runnerKilledAt !== 'number') return
   // Bounded: this runs under session.lock on the submit path. A stop that is
   // still running on egress past the budget completes there; the op then
   // settles on a later pass (Codex r1).
   const outcome = await notifyBoxUserStop(
     { sessionId: op.sourceSessionId, turnKey: op.idleTurnKey },
-    { timeoutMs: IDLE_TURN_STOP_WAIT_MS },
+    { timeoutMs },
   ).catch(() => 'pending' as const)
   if (outcome !== 'skipped') {
     log.info('box idle turn stop requested', {
@@ -268,11 +260,11 @@ function writeSettledIdleOp(recoveryDir: string, op: IdleOp): void {
 async function waitBoxIdleProof(input: {
   sessionId: string
   turnKey: string
-}): Promise<IdleProofResponse> {
-  const deadline = Date.now() + idleProofWaitMs()
+}, outerDeadline = Number.POSITIVE_INFINITY): Promise<IdleProofResponse> {
+  const deadline = Math.min(outerDeadline, Date.now() + idleProofWaitMs())
   let delay = 1000
   for (;;) {
-    const proof = await fetchBoxIdleProof(input)
+    const proof = await fetchBoxIdleProof(input, { timeoutMs: Math.max(1, Math.min(10_000, outerDeadline - Date.now())) })
     if (proof.status !== 'pending' || Date.now() + delay > deadline) return proof
     await new Promise((resolve) => setTimeout(resolve, delay))
     delay = Math.min(delay * 2, 8000)
@@ -609,6 +601,7 @@ export async function submit(
   let contextTurn: ContextTurnHandle | undefined
   let replayLifecycleStarted = false
   let unhandledTurnError: unknown | undefined
+  let closeIdleWait: (() => void) | undefined
   const logicalTurnAbort = new AbortController()
   let closeHelpLogical: (() => void) | undefined
   let logicalTurnRun: Promise<void> | null = null
@@ -628,6 +621,9 @@ export async function submit(
   // 走 finally)前归零。
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
+    if (opts?.modelSwitchInternal === undefined && (
+      (session._idleInternalTurns ?? 0) > 0 || currentIdleSource(paths.home, session.sessionKey)
+    )) closeIdleWait = beginIdleWait(session, onEvent)
     await prev
     session._turnReadOnly = opts?.readOnly === true
     if (!sameCc5ExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
@@ -638,18 +634,28 @@ export async function submit(
     const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
     const idleCandidate = readIdleCandidate(paths.home, session.sessionKey)
     if ((pendingIdle || idleCandidate) && opts?.modelSwitchInternal === undefined) {
-      await this.finishIdleUnderLock(session, {
-        sessionId: pendingIdle?.sourceSessionId ?? idleCandidate!.sessionId,
-        turnKey: pendingIdle?.sourceTurnKey ?? idleCandidate!.turnKey,
-      })
+      try {
+        await this.finishIdleUnderLock(session, {
+          sessionId: pendingIdle?.sourceSessionId ?? idleCandidate!.sessionId,
+          turnKey: pendingIdle?.sourceTurnKey ?? idleCandidate!.turnKey,
+        })
+      } catch (error) {
+        // Corrupt recovery evidence is never converted to an ordinary wait.
+        if (error instanceof Error && error.message === 'IDLE_RECOVERY_CORRUPT') throw error
+        log.warn('box idle recovery remains unsafe', { sessionKey: session.sessionKey }, error)
+        throw new IdleCompactRejected('IDLE_RECOVERY_PENDING', idleRecoveryRemainingMs(paths.home, pendingIdle))
+      }
       const still = readIdleCandidate(paths.home, session.sessionKey)
       const recovered = pendingIdle
         ? readIdleOp(paths.home, session.sessionKey, pendingIdle.revision)
         : undefined
       if (idleHistoryStillBlocked({ candidate: still, pending: pendingIdle, recovered })) {
-        throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
+        throw new IdleCompactRejected('IDLE_RECOVERY_PENDING', idleRecoveryRemainingMs(paths.home, recovered ?? pendingIdle))
       }
     }
+    endIdleWait(session)
+    closeIdleWait?.()
+    session._idleDeadline = undefined
     session._boxContextOwner =
       opts?.modelAuthority?.executionDescriptor &&
       typeof (opts.modelAuthority.executionDescriptor as { contextOwner?: unknown })
@@ -1399,6 +1405,7 @@ export async function submit(
       throw err
     }
   } finally {
+    closeIdleWait?.()
     closeHelpLogical?.()
     clearRunnerPromptPrivacy(session.runner)
     if (
@@ -2310,10 +2317,21 @@ export async function finishIdleUnderLock(
   if (session._idleRunning) return
   const pending = readPendingIdle(recoveryDir, session.sessionKey)
   if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
+  const deadline = session._idleDeadline ??= Date.now() + Math.min(BOX_IDLE_TURN_TIMEOUT_MS, boxIdleTurnTimeoutMs())
+  const left = (cap: number) => Math.max(1, Math.min(cap, deadline - Date.now()))
   // OCV5-377: stop an idle summary turn parked on a tool call before reading
   // proofs; its open handoff keeps both proofs pending (see stopParkedIdleTurn).
-  if (pending) await stopParkedIdleTurn(withIncarnationShutdown(recoveryDir, pending))
-  const proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
+  if (pending) await stopParkedIdleTurn(withIncarnationShutdown(recoveryDir, pending), left(IDLE_TURN_STOP_WAIT_MS))
+  if (pending?.summaryText && typeof withIncarnationShutdown(recoveryDir, pending).runnerKilledAt === 'number') {
+    const recovered = await recoverUnconfirmedIdle(session.runner, withIncarnationShutdown(recoveryDir, pending), recoveryDir, deadline)
+    writeSettledIdleOp(recoveryDir, recovered)
+    if (idleOpSettled(recovered)) { clearIdleCandidate(recoveryDir, session.sessionKey); return }
+  }
+  if (Date.now() >= deadline && !pending) {
+    clearIdleCandidate(recoveryDir, session.sessionKey)
+    return
+  }
+  const proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey }, deadline)
   if (proof.status === 'skipped') {
     // Not configured / invalid identity. Safe to drop only a bare candidate:
     // no op exists, so no summary was dispatched and nothing can arrive late.
@@ -2406,7 +2424,7 @@ export async function finishIdleUnderLock(
     const summaryProof = await fetchBoxIdleProof({
       sessionId: source.sessionId,
       turnKey: op.idleTurnKey,
-    })
+    }, { timeoutMs: left(10_000) })
     const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
     if (abandon) {
       log.warn('box idle op abandoned', {
@@ -2469,18 +2487,28 @@ export async function finishIdleUnderLock(
           attachments: step.op.attachments,
         })
       }
+      step = { ...step, op: { ...step.op, runnerKilledAt: undefined } }
+      writeSettledIdleOp(recoveryDir, step.op)
       session._idleRunning = true
       session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
       try {
         assertIdleCurrent()
+        if (deadline - Date.now() <= 45_000) throw new IdleTurnTimeoutError(false)
         const settled = await runBoxIdleTurn(privacyRunner, {
           input: IDLE_COMPACT_PROMPT,
           turnKey: step.op.idleTurnKey,
           onEvent: () => {},
           sessionTotals: session,
           toolUseIdToName: session.toolUseIdToName ?? new Map(),
-        })
+        }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 45_000 })
         const receipt = settled?.nativeIdleReceipt
+        if (needsApply && (receipt?.digest !== step.op.artifact?.digest || receipt?.opId !== step.op.idleTurnKey)) {
+          log.warn('box idle apply receipt unconfirmed', {
+            sessionKey: session.sessionKey, revision: step.op.revision,
+            expectedDigest: step.op.artifact?.digest ?? null, actualDigest: receipt?.digest ?? null,
+            actualOpId: receipt?.opId ?? null, error: settled?.errorDetail ?? null,
+          })
+        }
         const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
         if (
           nativeShortForOp(after, {
@@ -2495,7 +2523,7 @@ export async function finishIdleUnderLock(
           const again = await fetchBoxIdleProof({
             sessionId: source.sessionId,
             turnKey: step.op.idleTurnKey,
-          })
+          }, { timeoutMs: left(10_000) })
           const confirmed = idleSummaryAccepted(again, {
             sessionId: source.sessionId,
             idleTurnKey: step.op.idleTurnKey,
@@ -2515,14 +2543,20 @@ export async function finishIdleUnderLock(
             })
             if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
               assertIdleCurrent()
+              if (deadline - Date.now() <= 45_000) throw new IdleTurnTimeoutError(false)
               const applied = await runBoxIdleTurn(privacyRunner, {
                 input: IDLE_COMPACT_PROMPT,
                 turnKey: step.op.idleTurnKey,
                 onEvent: () => {},
                 sessionTotals: session,
                 toolUseIdToName: session.toolUseIdToName ?? new Map(),
-              })
+              }, { timeoutMs: left(BOX_IDLE_TURN_TIMEOUT_MS) - 45_000 })
               const applyReceipt = applied?.nativeIdleReceipt
+              if (applyReceipt?.digest !== step.op.artifact.digest || applyReceipt?.opId !== step.op.idleTurnKey) log.warn('box idle apply receipt unconfirmed', {
+                sessionKey: session.sessionKey, revision: step.op.revision,
+                expectedDigest: step.op.artifact.digest, actualDigest: applyReceipt?.digest ?? null,
+                actualOpId: applyReceipt?.opId ?? null, error: applied?.errorDetail ?? null,
+              })
               if (
                 applyReceipt &&
                 applyReceipt.opId === step.op.idleTurnKey &&
@@ -2556,13 +2590,9 @@ export async function finishIdleUnderLock(
           !readIdleNative(recoveryDir, source.sessionId, proof.revision)?.summaryText
         ) {
           const killed =
-            typeof session.runner.shutdown === 'function' &&
-            (await session.runner.shutdown().then(
-              () => true,
-              () => false,
-            ))
+            await shutdownIdleRunner(privacyRunner, left(5_000))
           if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
-          if (killed) await stopParkedIdleTurn(step.op)
+          if (killed) await stopParkedIdleTurn(step.op, left(IDLE_TURN_STOP_WAIT_MS))
           log.warn('box idle turn ended without result', {
             sessionKey: session.sessionKey,
             revision: step.op.revision,
@@ -2572,6 +2602,7 @@ export async function finishIdleUnderLock(
           })
         }
       } catch (idleErr) {
+        if (idleErr instanceof IdleCompactRejected && idleErr.code === 'IDLE_RECOVERY_CORRUPT') throw idleErr
         // Timeout, crash or error: never a result and never a re-dispatch
         // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
         // runner is recorded as evidence that it can no longer send the
@@ -2580,13 +2611,10 @@ export async function finishIdleUnderLock(
         // or the operator reset.
         let killed = idleErr instanceof IdleTurnTimeoutError && idleErr.killed
         if (!killed && typeof session.runner.shutdown === 'function') {
-          killed = await session.runner.shutdown().then(
-            () => true,
-            () => false,
-          )
+          killed = await shutdownIdleRunner(privacyRunner, left(5_000))
         }
         if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
-        if (killed) await stopParkedIdleTurn(step.op)
+        if (killed) await stopParkedIdleTurn(step.op, left(IDLE_TURN_STOP_WAIT_MS))
         log.warn(
           'box idle turn ended without result',
           {
@@ -2602,21 +2630,21 @@ export async function finishIdleUnderLock(
         session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
       }
     }
-    // OCV5-620: after apply attempts, age out a still-unsettled prepared summary.
-    const applyStuckFinal = idleApplyStuckReason(recoveryDir, step.op)
-    if (applyStuckFinal) {
-      log.warn('box idle op abandoned', {
-        sessionKey: session.sessionKey,
-        revision: step.op.revision,
-        reason: applyStuckFinal,
+    if (step.op.summaryText && !idleOpSettled(step.op)) {
+      log.warn('box idle apply receipt unconfirmed', {
+        sessionKey: session.sessionKey, revision: step.op.revision,
+        expectedDigest: step.op.artifact?.digest ?? null, actualDigest: step.op.receiptDigest ?? null,
       })
-      clearIdleCandidate(recoveryDir, session.sessionKey)
-      step = {
-        ...step,
-        op: { ...step.op, disposition: 'abandoned', abandonReason: applyStuckFinal },
-      }
+      assertIdleCurrent()
+      step = { ...step, op: await recoverUnconfirmedIdle(privacyRunner, step.op, recoveryDir, deadline) }
+      if (idleOpSettled(step.op)) clearIdleCandidate(recoveryDir, session.sessionKey)
     }
     writeSettledIdleOp(recoveryDir, step.op)
+    if (!step.op.summaryText && !idleOpSettled(step.op)) {
+      await settleStrandedIdleOp(session, step.op, recoveryDir)
+      const settled = readIdleOp(recoveryDir, session.sessionKey, step.op.revision)
+      if (settled && idleOpSettled(settled)) clearIdleCandidate(recoveryDir, session.sessionKey)
+    }
   } finally { clearRunnerPromptPrivacy(session.runner) }
 
 }

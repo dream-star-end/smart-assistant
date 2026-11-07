@@ -1,3 +1,5 @@
+import { readIdleRollbacks, filterAbandonedIdleRows, IdleRecoveryCorrupt } from '../../../packages/storage/src/idleRollback.js'
+import { idleNativeHome, recoverIdlePreservedUuids } from '../services/compact/idleRecover.js'
 import { transcriptNeedsRecovery, readNativeTranscriptArchive, recoverNativeTranscript } from './nativeTranscriptRecovery.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { feature } from 'bun:bundle'
@@ -1884,6 +1886,7 @@ export async function hydrateRemoteSession(
     logForDebugging(`Hydrated ${remoteLogs.length} entries from remote`)
     return remoteLogs.length > 0
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw error
     logForDebugging(`Error hydrating session from remote: ${error}`)
     logForDiagnosticsNoPII('error', 'hydrate_remote_session_fail')
@@ -1984,6 +1987,7 @@ export async function hydrateFromCCRv2InternalEvents(
     })
     return events.length > 0
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw error
     // Re-throw epoch mismatch so the worker doesn't race against gracefulShutdown
     if (
@@ -2134,7 +2138,7 @@ function applyPreservedSegmentRelinks(
       const seg = entry.compactMetadata?.preservedSegment
       if (seg) {
         lastSeg = seg
-        idlePreservedUuids = entry.compactMetadata?.idlePreservedUuids
+        idlePreservedUuids = recoverIdlePreservedUuids(String(entry.sessionId), entry.compactMetadata)
         lastSegBoundaryIdx = i
       }
     }
@@ -2157,7 +2161,9 @@ function applyPreservedSegmentRelinks(
       || new Set(idlePreservedUuids).size !== idlePreservedUuids.length
       || idlePreservedUuids[0] !== lastSeg.headUuid
       || idlePreservedUuids.at(-1) !== lastSeg.tailUuid
-      || idlePreservedUuids.some(id => typeof id !== 'string' || !messages.has(id as UUID))) {
+      || !messages.has(lastSeg.anchorUuid) || idlePreservedUuids.includes(lastSeg.anchorUuid)
+      || idlePreservedUuids.some(id => typeof id !== 'string' || !messages.has(id as UUID)
+        || (entryIndex.get(id as UUID) ?? Infinity) >= absoluteLastBoundaryIdx)) {
       throw new Error('IDLE_RECOVERY_CORRUPT')
     }
     let parent = lastSeg.anchorUuid
@@ -2653,6 +2659,7 @@ export async function loadTranscriptFromFile(
   try {
     parsed = jsonParse(content)
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_IMPORT_INVALID')
     throw new Error(`Invalid JSON in transcript file: ${error}`)
   }
@@ -3400,6 +3407,7 @@ export async function loadFullLog(log: LogOption): Promise<LogOption> {
           : undefined,
     }
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw error
     // Legacy callers keep their existing unreadable-log behavior.
     return log
@@ -3909,6 +3917,7 @@ export async function loadTranscriptFile(
   // Last-wins — later entries supersede.
   let contextCollapseSnapshot: ContextCollapseSnapshotEntry | undefined
 
+  const idleRollbacks = readIdleRollbacks(idleNativeHome(), basename(filePath, '.jsonl'))
   const leafPruneEnabled = getFeatureValue_CACHED_MAY_BE_STALE('tengu_pebble_leaf_prune', false)
   let originalLeafUuids: Set<UUID> | undefined
   let originalSnipPlan: TranscriptSnipPlan | undefined
@@ -3930,7 +3939,7 @@ export async function loadTranscriptFile(
       let buf: Buffer | null = null
     let metadataLines: string[] | null = null
     let hasPreservedSegment = false
-    if (!isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP)) {
+    if (!idleRollbacks.length && !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP)) {
       const { size } = verifiedHandle ? await verifiedHandle.stat() : await stat(filePath)
       if (size > SKIP_PRECOMPACT_THRESHOLD) {
         const scan = await readTranscriptForLoad(filePath, size, verifiedHandle)
@@ -3953,7 +3962,7 @@ export async function loadTranscriptFile(
       }
     }
     buf ??= verifiedHandle ? await readTranscriptHandle(verifiedHandle) : await readFile(filePath)
-      return { buf, metadataLines, hasPreservedSegment }
+      return { buf: filterAbandonedIdleRows(buf, idleRollbacks), metadataLines, hasPreservedSegment }
     }
     const snapshot = managedTranscriptIo()
       ? await withSessionFile(filePath, transcriptIoScope(filePath), false, async (file, patch, recordReceipt) => {
@@ -4019,6 +4028,7 @@ export async function loadTranscriptFile(
     // optimization and the scan it depends on for hasPreservedSegment did
     // not run).
     if (
+      !idleRollbacks.length &&
       !opts?.keepAllLeaves &&
       !hasPreservedSegment &&
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP) &&
@@ -4158,6 +4168,7 @@ export async function loadTranscriptFile(
       }
     }
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo() && !(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error
     // A genuinely absent transcript is handled by the existing session lookup.
   }

@@ -1,3 +1,4 @@
+import { canonicalUserFailureCode } from '@openclaude/protocol'
 // containerDispatchClient —— reconciler 向容器求证 dispatch 归宿的**共享调用封装**
 // (RFC-v5-durable-turn-dispatch §2.3 / §3)。
 //
@@ -97,14 +98,14 @@ function parseStateBody(bodyText: string): ContainerDispatchStateResponse | null
     if (typeof parsed.state !== 'string' || !VALID_STATES.has(parsed.state as ContainerInboxState)) {
       return null
     }
-    const userFailureCode = parseAttachmentTotalExceeded(
+    const userFailureCode = canonicalUserFailureCode(
       (parsed as { userFailureCode?: unknown }).userFailureCode,
     )
     return {
       state: parsed.state as ContainerInboxState,
       ...(typeof parsed.outcome === 'string' ? { outcome: parsed.outcome } : {}),
       ...(userFailureCode
-        ? { userFailureCode: attachmentTotalExceededFailureCode(userFailureCode.totalBytes) }
+        ? { userFailureCode }
         : {}),
     }
   } catch {

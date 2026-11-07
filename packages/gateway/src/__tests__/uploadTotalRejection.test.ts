@@ -82,3 +82,14 @@ test('stamped attachment total code round-trips on the state response and is omi
   assert.equal(generic?.userFailureCode, undefined)
   assert.equal('userFailureCode' in buildTurnDispatchStateResponse(generic), false)
 })
+
+test('idle rejection survives the durable inbox, receipt and polling response', async () => {
+  const { buildTurnDispatchReceiptFrame } = await import('../turnDispatchInbox.js')
+  const key = { userId: 'u1', sessionId: 'idle-wait', clientMessageId: 'idle-client' }
+  await insertQueuedTurnDispatch({ ...key, dispatchId: 'idle-dispatch', attemptNo: 1, payloadHash: 'h' })
+  const row = await inboxReject(key, undefined, 'IDLE_RECOVERY_PENDING:7')
+  assert.equal(buildTurnDispatchStateResponse(row).userFailureCode, 'IDLE_RECOVERY_PENDING:7')
+  assert.equal(buildTurnDispatchReceiptFrame({ dispatchId: 'idle-dispatch', attemptNo: 1,
+    sessionId: key.sessionId, clientMessageId: key.clientMessageId }, row, Date.now()).userFailureCode,
+    'IDLE_RECOVERY_PENDING:7')
+})
