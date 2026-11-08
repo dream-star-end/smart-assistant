@@ -21,12 +21,18 @@ import {
   computeAggregatedRemoteCatalogState,
   preheatRemotePoolSession,
   rankRemotePoolCandidates,
+  REMOTE_SSH_PROBE_TIMEOUT_MS,
   toRemotePoolModelId,
   verifyAndMaterializePinnedKnownHosts,
   type RemoteCandidateMember,
 } from '../remoteBrainPool.js'
 
 describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Projection', () => {
+  it('probe timeout covers a cold discovery pass but stays bounded', () => {
+    // Live node: first cold probe >15s (REMOTE_SSH_PROBE_TIMEOUT), warm ~8s.
+    assert.equal(REMOTE_SSH_PROBE_TIMEOUT_MS, 45_000)
+    assert.ok(REMOTE_SSH_PROBE_TIMEOUT_MS > 15_000 && REMOTE_SSH_PROBE_TIMEOUT_MS <= 60_000)
+  })
   it('formatRemoteModelDisplayName appends " 远端" exactly once for remote_pool models', () => {
     assert.equal(formatRemoteModelDisplayName('Opus 4.7 (1M)', 'local', 'claude-opus-4-7'), 'Opus 4.7 (1M)')
     assert.equal(

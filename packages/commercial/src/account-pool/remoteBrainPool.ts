@@ -45,6 +45,17 @@ const CC5_CONTROLLER_PATH = fileURLToPath(
 
 const CODEX_CONTROLLER_PATH = fileURLToPath(new URL('../../../../scripts/agent-remote/codex-host-controller.py', import.meta.url))
 
+/**
+ * Probe budget for one SSH probe round-trip.
+ *
+ * The first cold probe on a fresh node runs the hostd probe (engine discovery, app-server
+ * start, per-profile model/list) and took >15s on the live Codex node while the warm probe
+ * took ~8s; the old hardcoded 15s killed the cold run with REMOTE_SSH_PROBE_TIMEOUT. 45s
+ * covers a cold start with headroom while staying bounded (the SSH connection itself is
+ * still capped at 10s per attempt, and every probe path clears this timer on close/error).
+ */
+export const REMOTE_SSH_PROBE_TIMEOUT_MS = 45_000
+
 export const REMOTE_BRAIN_ENGINES = ['cc', 'codex', 'antigravity', 'grok-build'] as const
 export type RemoteBrainEngine = (typeof REMOTE_BRAIN_ENGINES)[number]
 
@@ -1063,7 +1074,7 @@ async function runSshMuxProbeOnce(input: {
         child.kill('SIGKILL')
       } catch {}
       rejectOut(new Error('REMOTE_SSH_PROBE_TIMEOUT'))
-    }, 15000)
+    }, REMOTE_SSH_PROBE_TIMEOUT_MS)
     child.stdout.on('data', (c: Buffer) => outChunks.push(Buffer.from(c)))
     child.stderr.on('data', (c: Buffer) => errChunks.push(Buffer.from(c)))
     child.once('error', (err) => {
@@ -1164,7 +1175,7 @@ async function runCc5LegacyReadonlyProbeOnce(input: {
         child.kill('SIGKILL')
       } catch {}
       rejectOut(new Error('REMOTE_SSH_PROBE_TIMEOUT'))
-    }, 15000)
+    }, REMOTE_SSH_PROBE_TIMEOUT_MS)
     child.stdout.on('data', (c: Buffer) => outChunks.push(Buffer.from(c)))
     child.stderr.on('data', (c: Buffer) => errChunks.push(Buffer.from(c)))
     child.once('error', (err) => {

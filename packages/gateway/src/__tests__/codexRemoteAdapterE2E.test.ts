@@ -62,6 +62,8 @@ interface Lane {
   receipts: CodexNativeTerminalReceipt[]
   executed: Array<{ name: string; args: unknown }>
   errors: Error[]
+  /** Fixture keyring handed to the relay and forwarded to the worker as base64. */
+  keys: Map<string, Uint8Array>
   launches: number
   call: (path: string, body?: Record<string, unknown>) => Promise<{ status: number } & Record<string, any>>
   received: (role: 'launch' | 'tool-socket') => any[]

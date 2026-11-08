@@ -8,6 +8,7 @@ import type { CodexRemoteBinding } from '@openclaude/gateway/remote-finance'
 import type { CodexLaneSpec, RemoteCcTarget } from '@openclaude/gateway/codex-commissioning'
 import { codexManifestHash, parseCodexExecutionSnapshot, projectCodexRemoteCapabilities } from './codexRemoteProfile.js'
 import { remoteNodeExecKeyDir } from './remoteBrainPool.js'
+import type { CommissionContainerSource } from './codexCommissioningContainer.js'
 import { admitDispatch } from '../dispatch/turnDispatchStore.js'
 export const COMMISSION_MODEL = 'gpt-6-luna-remote'
 export const COMMISSION_UPSTREAM = 'gpt-6-luna'
@@ -20,12 +21,18 @@ export interface CommissionRun {
   dispatchId: string; requestId: string; ownerId: string; leaseEpoch: number; attemptNo: number
   sentinel: string; content: string; state: 'running' | 'failed' | 'unknown' | 'verified'; revoked?: boolean
 }
-async function adminContainer(q: Pick<Pool,'query'> | PoolClient, adminId: string) {
+async function adminContainer(q: Pick<Pool,'query'> | PoolClient, adminId: string, container: CommissionContainerSource) {
   requireCommission(adminId === '3','ADMIN_UID')
-  const r=(await q.query(`SELECT c.id::text,c.docker_id,c.docker_name FROM users u JOIN agent_containers c ON c.user_id=u.id
-    WHERE u.id=3 AND u.role='admin' AND u.status='active' AND c.status='running' AND c.docker_name='oc-v5-u3'`)).rows
-  requireCommission(r.length===1 && /^[a-f0-9]{64}$/.test(r[0].docker_id),'CONTAINER_NOT_RUNNING')
-  return r[0]
+  // Still only the live uid3 admin. A downgraded/disabled admin is rejected here even if the
+  // container identity below is healthy; the error code stays CONTAINER_NOT_RUNNING for the
+  // existing fail-closed contract (assertCommissionRun role-downgrade test).
+  const r=(await q.query(`SELECT 1 FROM users WHERE id=3 AND role='admin' AND status='active'`)).rows
+  requireCommission(r.length===1,'CONTAINER_NOT_RUNNING')
+  // Container identity comes from the same authoritative source as live lane admission
+  // (see codexCommissioningContainer.ts). Never from the request body.
+  const c=await container()
+  requireCommission(c!==null,'CONTAINER_NOT_RUNNING')
+  return c
 }
 async function profile(q: Pick<Pool,'query'> | PoolClient, id: string, lock=false) {
   const r=(await q.query(`SELECT p.*,n.ssh_host,n.ssh_port,n.ssh_user,n.key_id,n.host_key_fp,n.status AS node_status,n.disabled_by AS node_disabled
@@ -42,10 +49,10 @@ function observed(p: any) {
   requireCommission(projectCodexRemoteCapabilities(p,COMMISSION_UPSTREAM).reasoning.supported.includes('low'),'LOW_NOT_OBSERVED')
   return s
 }
-export async function assertCommissionRun(pool: Pool, run: CommissionRun, timeFence=true): Promise<void> {
+export async function assertCommissionRun(pool: Pool, run: CommissionRun, container: CommissionContainerSource, timeFence=true): Promise<void> {
   requireCommission(!run.revoked && (!timeFence || run.expiresAt>Date.now()),'EXPIRED_OR_REVOKED')
-  const c=await adminContainer(pool,run.adminId)
-  requireCommission(c.id===run.binding.containerDbId && c.docker_id===run.binding.dockerId,'CONTAINER_CHANGED')
+  const c=await adminContainer(pool,run.adminId,container)
+  requireCommission(c.containerDbId===run.binding.containerDbId && c.dockerId===run.binding.dockerId,'CONTAINER_CHANGED')
   const p=await profile(pool,run.profileId); observed(p)
   requireCommission(isDeepStrictEqual(p.probe_snapshot,run.probe) && p.account_fingerprint===run.account &&
     p.auth_epoch===run.previousAuthEpoch && isDeepStrictEqual(p.execution_manifest,run.previousManifest) && String(p.node_id)===run.nodeId &&
@@ -54,11 +61,11 @@ export async function assertCommissionRun(pool: Pool, run: CommissionRun, timeFe
   if(timeFence)requireCommission((await pool.query(`SELECT 1 FROM remote_agent_bindings WHERE operation_id=$1 AND generation=1
     AND state IN ('preparing','running') AND expires_at>NOW()`,[run.binding.operationId])).rows.length===1,'LANE_FENCED')
 }
-export async function admitCommission(pool: Pool, adminId: string, profileId: string): Promise<CommissionRun> {
+export async function admitCommission(pool: Pool, adminId: string, profileId: string, container: CommissionContainerSource): Promise<CommissionRun> {
   requireCommission(process.env.OC_REMOTE_POOL_EXECUTION_ENABLED!=='0','DISABLED')
   const q=await pool.connect()
   try {
-    await q.query('BEGIN'); const c=await adminContainer(q,adminId); const p=await profile(q,profileId,true); const s=observed(p)
+    await q.query('BEGIN'); const c=await adminContainer(q,adminId,container); const p=await profile(q,profileId,true); const s=observed(p)
     const occupied=(await q.query(`SELECT COUNT(*)::int AS n FROM remote_agent_bindings WHERE profile_id=$1 AND state<>'released'`,[profileId])).rows[0].n
     requireCommission(occupied<Number(p.max_concurrent_lanes),'CAPACITY_EXHAUSTED')
     const id=randomUUID(), operationId=randomUUID(), runId=randomUUID(), authEpoch=p.auth_epoch ?? randomUUID()
@@ -72,19 +79,19 @@ export async function admitCommission(pool: Pool, adminId: string, profileId: st
     const target: RemoteCcTarget={host:p.ssh_host,port:Number(p.ssh_port),user:p.ssh_user,keyPath:join(execDir,'codex_id_ed25519'),
       knownHostsPath:join(execDir,'known_hosts'),controllerSha256:s.controllerSha256,taskRootPrefix:`/home/${p.ssh_user}/oc-codexremote-`,upstreamModel:COMMISSION_UPSTREAM}
     const expiresAt=Date.now()+10*60_000
-    const binding: CodexRemoteBinding={version:3,backendKind:'codex-app-server-v1',uid:'3',containerDbId:c.id,dockerId:c.docker_id,
+    const binding: CodexRemoteBinding={version:3,backendKind:'codex-app-server-v1',uid:'3',containerDbId:c.containerDbId,dockerId:c.dockerId,
       operationId,runId,sessionKey,canonicalModel:COMMISSION_MODEL,generation:'1',profileId:'default',authEpoch,
       manifestSha256:codexManifestHash(manifest),capability:randomBytes(32).toString('hex'),expiresAt}
     await q.query(`INSERT INTO remote_agent_bindings(operation_id,run_id,uid,container_db_id,docker_id,session_key,node_id,profile_id,
       canonical_model_id,state,expires_at,engine,backend_kind,generation,auth_epoch,manifest_sha256,recovery_spec,remote_start_attempted)
       VALUES($1,$2,3,$3,$4,$5,$6,$7,$8,'preparing',$9,'codex','codex-app-server-v1',1,$10,$11,$12::jsonb,FALSE)`,
-    [operationId,runId,c.id,c.docker_id,sessionKey,p.node_id,profileId,COMMISSION_MODEL,new Date(expiresAt),authEpoch,binding.manifestSha256,
+    [operationId,runId,c.containerDbId,c.dockerId,sessionKey,p.node_id,profileId,COMMISSION_MODEL,new Date(expiresAt),authEpoch,binding.manifestSha256,
       JSON.stringify({version:1,target,taskRoot:root,operationId,runId,generation:'1',codex:spec,commissioningId:id})])
     const dispatchId=randomUUID(), requestId=`commission-${id}`, ownerId=`commission-${id}`
     // Dedicated commissioning admission, not an impersonated user-chat append. Durable dispatch still owns all billing.
     const d=await admitDispatch(q,{dispatchId,userId:3n,sessionId:sessionKey,clientMessageId:id,agentId:'main',model:COMMISSION_MODEL,
       requestHash:codexManifestHash({kind:'codex-commissioning',id,probe:p.probe_snapshot}),billingRequestId:requestId,ownerId,
-      anchorSeq:null,agentContainerId:Number(c.id),runtimeKind:'v5',leaseTtlMs:12*60_000})
+      anchorSeq:null,agentContainerId:Number(c.containerDbId),runtimeKind:'v5',leaseTtlMs:12*60_000})
     requireCommission(d.kind==='admitted','DISPATCH_REJECTED')
     const run: CommissionRun={version:1,id,adminId,profileId,nodeId:String(p.node_id),probe:p.probe_snapshot,account:p.account_fingerprint,
       hostKeyFp:p.host_key_fp,previousAuthEpoch:p.auth_epoch,previousManifest:p.execution_manifest,authEpoch,expiresAt,binding,spec,target,dispatchId,requestId,ownerId,
@@ -108,9 +115,9 @@ export function commissionManifest(run: CommissionRun, sha: string) {
     controllerSha256:run.spec.manifest.controllerSha256,gatewayRevision:'codex-remote-adapter-v1',e2eReceiptSha256:sha,installed:true,text:true}
 }
 /** Only the coordinator's private verified package reaches this CAS; no client-provided proof is accepted. */
-export async function applyCommission(pool: Pool, run: CommissionRun, sha: string, confirm: boolean) {
+export async function applyCommission(pool: Pool, run: CommissionRun, sha: string, confirm: boolean, container: CommissionContainerSource) {
   requireCommission(confirm && run.state==='verified' && !run.revoked,'CONFIRM_VERIFIED_REQUIRED')
-  await assertCommissionRun(pool,run,false); await commissionBillingProof(pool,run)
+  await assertCommissionRun(pool,run,container,false); await commissionBillingProof(pool,run)
   const q=await pool.connect()
   try {
     await q.query('BEGIN'); const p=await profile(q,run.profileId,true); observed(p)
@@ -123,8 +130,8 @@ export async function applyCommission(pool: Pool, run: CommissionRun, sha: strin
     await q.query('COMMIT'); return manifest
   } catch(e) {await q.query('ROLLBACK');throw e} finally{q.release()}
 }
-export async function revokeCommission(pool: Pool, run: CommissionRun, sha: string, confirm: boolean) {
-  requireCommission(confirm,'CONFIRM_REQUIRED'); await adminContainer(pool,run.adminId)
+export async function revokeCommission(pool: Pool, run: CommissionRun, sha: string, confirm: boolean, container: CommissionContainerSource) {
+  requireCommission(confirm,'CONFIRM_REQUIRED'); await adminContainer(pool,run.adminId,container)
   const q=await pool.connect()
   try {
     await q.query('BEGIN'); const p=(await q.query('SELECT * FROM remote_agent_profiles WHERE id=$1 FOR UPDATE',[run.profileId])).rows[0]

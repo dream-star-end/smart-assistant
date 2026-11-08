@@ -99,6 +99,21 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(snapshot['nativeSha256'],hashlib.sha256(native.read_bytes()).hexdigest())
             (p/'models_cache.json').write_text('{"models":[]}')
             self.assertEqual(hostd.codex_execution_snapshot(p,CLI,[model]),(None,'CODEX_SNAPSHOT_UNAVAILABLE'))
+    def test_codex_version_probe_never_touches_default_codex_home(self):
+        # A bare `codex --version` initializes $HOME/.codex; the probe must use a throwaway
+        # HOME/CODEX_HOME so Gate G's ~/.codex check cannot be poisoned by a version query.
+        fake = self.home/'fake-codex'
+        fake.write_text('#!/usr/bin/env python3\n'
+            'import os,pathlib\n'
+            'h=pathlib.Path(os.environ.get("CODEX_HOME") or (pathlib.Path(os.environ["HOME"])/".codex"))\n'
+            '(h/"tmp").mkdir(parents=True,exist_ok=True)\n'
+            'print("codex-cli 0.167.0 "+str(h/"tmp"/"arg0-linux"))\n')
+        fake.chmod(0o755)
+        line = hostd.run_cmd_version(str(fake), isolated_home=True)
+        self.assertTrue(line.startswith('codex-cli 0.167.0 '))
+        marker = pathlib.Path(line.split(' ',2)[2])
+        self.assertFalse(marker.exists())  # scratch home removed immediately
+        self.assertNotIn(str(pathlib.Path.home()), str(marker))
     def test_account_null_and_no_auth_remain_negative(self):
         p = self.profile('.codex','default'); data=json.loads((p/'fixture.json').read_text()); data['account']=None
         (p/'fixture.json').write_text(json.dumps(data))

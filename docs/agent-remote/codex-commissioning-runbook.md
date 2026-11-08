@@ -26,8 +26,8 @@ export NODE_HOST=136.86.253.46 NODE_USER=box NODE_PORT=22
 export KEY_ID=oc-rpool-7ba0f86e
 export EXEC_DIR=/etc/openclaude/remote-pool-keys/oc-rpool-7ba0f86e-exec
 export CC_SHA=fcfb142422cb605363a44c606f1a0b049aca667ad8eeda3a9c547d978369177b
-export CODEX_SHA=ad62fcc970944b51a9b2e204995821ddfaf60b51510e263ec3fa89cd54476ae6
-export HOSTD_SHA=304f22eb46ba990081334fbee12c7de81db686957f196d994c53f43b9c7d4377
+export CODEX_SHA=3412245a1944933e6a7d0a4d64b7bc8c4122024b7ccdf84a1058787e71fc4f66
+export HOSTD_SHA=f1e019dc2c65b1332155df0553ffbed913c010f458fa25215241aaf2edaffc14
 export BUNDLE=/opt/openclaude/codex-remote/$CODEX_SHA
 export OPS=/root/ocv5-746-deploy-$SHA
 install -d -m 700 "$OPS"
@@ -62,8 +62,8 @@ SQL
 ### 1.1 三个不同摘要，不能混写
 
 - CC controller `fcfb1424…` 是运行时通过SSH内联传输的完整源码摘要；CC guard `controllerSha256` **数组**核它（`scripts/agent-remote/cc5-ssh-guard.py:86-87,133-154`）。`1a50680c…`是R1之前段4旧字节，**不能替代本次hash**。
-- Codex controller `ad62fcc9…` 同时决定bundle目录、Codex guard和execution snapshot（`remoteBrainPool.ts:938-950`，下文未带目录名的 remoteBrainPool 均在 `packages/commercial/src/account-pool/`）。
-- `remote_agent_nodes.controller_sha256=47d26c41…` 是**hostd探针摘要**，不是CC controller。`getRemoteHostdSha256()`读hostd文件（`remoteBrainPool.ts:205-225`），probe接受库中旧值或当前代码hostd值（`:1243-1253`），成功后回写实际hostd摘要（`:1266-1271,1400-1408`）。**不要把它改成fcfb/ad62**；真实新probe成功后应自然成为`304f22eb…`，不需提前手工UPDATE。
+- Codex controller `3412245a…` 同时决定bundle目录、Codex guard和execution snapshot（`remoteBrainPool.ts:938-950`，下文未带目录名的 remoteBrainPool 均在 `packages/commercial/src/account-pool/`）。
+- `remote_agent_nodes.controller_sha256=47d26c41…` 是**hostd探针摘要**，不是CC controller。`getRemoteHostdSha256()`读hostd文件（`remoteBrainPool.ts:205-225`），probe接受库中旧值或当前代码hostd值（`:1243-1253`），成功后回写实际hostd摘要（`:1266-1271,1400-1408`）。**不要把它改成fcfb/ad62**；真实新probe成功后应自然成为`f1e019dc…`，不需提前手工UPDATE。
 
 ### 1.2 只追加，不替换旧允许项
 
@@ -148,7 +148,7 @@ chmod 600 "$OPS/pre-0334.dump" "$OPS/pre-0334.dump.list"
 命令、发车前合并授权、迁移回读及代码回退见第5节；不会提供绕过列车锁的裸生产apply命令，因为本次**确实支持自动迁移**。回退只退代码/runtime，不DROP新增列/表、不删schema_migrations记录（`deploy-v5-selfhost.sh:2878-2882`）。
 ## 3. 发布前：幂等安装器（宿主执行，先 dry-run）
 
-实现：`scripts/agent-remote/codex-install.py:10`（参数/钥匙/SSH），`codex-install-node.py:29`（真实目录迁移）、`:82`（root事务/回退）、`:127`（受管文件CAS）。安装器**只接受 default**。`--dry-run`纯本地读源码，不联网、不读钥匙、不写文件；`--apply`/`--rollback`均需root和`--confirm`。
+实现：`scripts/agent-remote/codex-install.py`（参数/钥匙/SSH/oc-bridge打包与dry-run计划），`codex-install-node.py`（`login_layout`/`migrate_login`/`rollback_login` 登录目录迁移、root事务/回退、`managed` 受管文件CAS、oc-bridge树安装）。安装器**只接受 default**。`--dry-run`纯本地读源码，不联网、不读钥匙、不写文件；`--apply`/`--rollback`均需root和`--confirm`。
 
 [H] 管理key应使用宿主实际路径，不把容器路径当宿主路径：
 ```bash
@@ -171,20 +171,24 @@ python3 "$SRC/scripts/agent-remote/codex-install.py" --apply --confirm \
  --key-dir "$EXEC_DIR" --probe-public-key "$PROBE_PUB" --profile default \
  | tee "$OPS/install-result.json"
 ```
-顺序：root私有事务journal → 校嵌入依赖pin → 不可变bundle → Codex guard → 独立执行钥匙行/probe行 → 登录目录rename。每步保留恢复材料；同参数重跑以before/after CAS识别已执行步骤，不覆盖第三方变更。安装输出/guard/bundle都不含auth正文。
+顺序：root私有事务journal → 校嵌入依赖pin → 不可变bundle → Codex guard → **oc-bridge参考树** → 独立执行钥匙行/probe行 → 登录目录rename。每步保留恢复材料；同参数重跑以before/after CAS识别已执行步骤，不覆盖第三方变更。安装输出/guard/bundle都不含auth正文。
+
+oc-bridge 步骤：安装器从源码树 `packages/gateway/box-bridge-mod/oc-bridge` 打包**与 master `loadBoxBridgeMod()` 相同的文件集/摘要**（跳过 `.claude-plugin/types`、`*.test.ts`、`tsconfig.json`），落到 `/opt/openclaude/box-bridge-mod/oc-bridge`，文件 root:root 0644、目录 root:root 0755、全部非组/其他写。缺少它时 hostd `compute_oc_bridge_digest()` 返回空，probe 以 `REMOTE_CC_BRIDGE_MOD_REQUIRED` 拒绝。dry-run 的 `ocBridge` 段列出目标、文件数与 sha256；apply 先校验收到字节的摘要与 packet 一致再落盘，重跑按 CAS 幂等。落盘后还按 hostd 同一规则重算**磁盘实际整棵树**并比对 packet 摘要：其他 master 版本残留的多余文件会改变 `compute_oc_bridge_digest`，此时安装以 `oc-bridge tree drift` 明确失败，须先人工清掉残留文件再装，不静默带病上线。
 
 安装结果：
 - `/opt/openclaude/codex-remote/<Codex controller sha>/`内恰有controller、hostd、fixed MCP、socket MCP、**remote-engine-resources.py**；文件root0644、目录root0755、全部祖先root-owned非组/其他写、无软链。已有bundle同名不同字节拒绝。
 - `/usr/local/libexec/oc-remote-codex/codex-ssh-guard.{py,json}`；JSON字段`version,user,sourceIps,sshPort,rootPrefix,controllers`。最新controller在第一项，旧项仅供stop/proof。**CC guard脚本/JSON与CC authorized_keys执行行完全不动**。
 - 宿主生成或复用`$EXEC_DIR/codex_id_ed25519`（root0600），不覆盖CC `id_ed25519`；节点新增`from="38.55.252.217",restrict,command="/usr/bin/python3 -I -B /usr/local/libexec/oc-remote-codex/codex-ssh-guard.py" ssh-ed25519 … oc-codex-commissioning-exec`。
 - probe专用公钥的forced-command改为新bundle的`oc-remote-hostd.py --serve-mux`，不改CC执行行。旧probe仍CC-only时无法发现Codex，**只装Codex guard不够**。
-- root事务journal：`/var/lib/openclaude-codex-install/<controller sha>.json`。仅保存配置/公钥before摘要与恢复字节，不保存登录token。
+- `/opt/openclaude/box-bridge-mod/oc-bridge`：完整 oc-bridge 参考树，root:root、文件0644/目录0755、非组/其他写；其摘要必须等于 packet 的 `ocBridge.sha256`（同 master `loadBoxBridgeMod` 与 hostd `compute_oc_bridge_digest`）。已存在的第三方不同字节会被 CAS 拒绝。
+- root事务journal：`/var/lib/openclaude-codex-install/<controller sha>.json`。仅保存配置/公钥before摘要与恢复字节，不保存登录token。oc-bridge 每个文件也按 before/after 记入同一 journal，回退时恢复原字节或删除本事务新建的文件；本事务新建的空目录保留（无内容、无权限风险）。
 
 [N] 验证（用管理通道执行，非执行钥匙）：
 ```bash
 sudo stat -c '%U %a %n' /opt/openclaude/codex-remote/*/codex-host-controller.py \
  /opt/openclaude/codex-remote/*/remote-engine-resources.py /usr/local/libexec/oc-remote-codex/*
 sudo sha256sum /opt/openclaude/codex-remote/*/{codex-host-controller.py,oc-remote-hostd.py,remote-engine-resources.py}
+sudo find /opt/openclaude/box-bridge-mod/oc-bridge -type f -printf '%u %m %p\n'
 sudo python3 -m json.tool /usr/local/libexec/oc-remote-codex/codex-ssh-guard.json
 sudo grep 'oc-rpool-7ba0f86e-exec' /home/box/.ssh/authorized_keys
 ```
@@ -204,15 +208,18 @@ sudo test ! -f /etc/openclaude/remote-engine-resources.json || sudo cat /etc/ope
 
 ## 4. 唯一登录目录与安装器回退
 
-§3安装已完成本节，不再手动重复mv。真实路径是`/home/box/.oc-remote-codex/profiles/default/codex-home`（box0700，auth常规文件0600），`/home/box/.codex`只留指向它的兼容软链。**canonical反过来指向旧目录不接受**。同文件系统rename不复制auth；Codex续期`auth.tmp→auth.json`发生在同一真实目录，所有会话观察同一个最新文件。配置源门仍有效，不能把私有config搬过去绕门。
+§3安装已完成本节，不再手动重复mv。真实路径是`/home/box/.oc-remote-codex/profiles/default/codex-home`（box0700，auth常规文件0600）。`/home/box/.codex`是**真实 0700 目录（box 属主、非软链、不含 auth）**——hostd Gate G 拒绝任何软链或组/其他可写的凭据路径，旧安装器留下的 `~/.codex -> canonical` 兼容软链会在安装时被转换为该空目录。**canonical反过来指向旧目录不接受**。同文件系统rename不复制auth；Codex续期`auth.tmp→auth.json`发生在同一真实目录，所有会话观察同一个最新文件。配置源门仍有效，不能把私有config搬过去绕门。
+
+hostd 的版本探测（`codex --version`）使用一次性 `HOME`/`CODEX_HOME`，运行后立即删除，绝不在真实 `~/.codex` 里创建 `tmp/arg0-linux`；这正是现场 Gate G 被版本查询污染的首因。安装器重跑对已修复现场（无软链 + 0700 空目录 + canonical auth）是幂等 no-op。
 
 源码：`codex-host-controller.py:89-93,129-135,462-478`（canonical真实目录/并发只锁lane writer）；`oc-remote-hostd.py:680-755`（managed default与配置门）；安装器`migrate_login`/`rollback_login`。
 
 [N] 验证（不输出token）：
 ```bash
 sudo stat -c '%U %a %n' /home/box/.oc-remote-codex/profiles/default/codex-home \
- /home/box/.oc-remote-codex/profiles/default/codex-home/auth.json
-sudo readlink /home/box/.codex
+ /home/box/.oc-remote-codex/profiles/default/codex-home/auth.json /home/box/.codex
+# 期望：~/.codex 为目录、属主 box、模式 0700；下面命令必须无输出（不是软链）
+sudo find /home/box/.codex -maxdepth 1 -type l -print
 ```
 
 回退先撤ready/禁Codex纳新、取得所有lane及probe停止证明。安装器遇到`oc-codexremote-*`根目录拒回退；已停止历史根也须先由主控核**正式fence-stop/prove-stopped**原始证明并归档移出这个前缀，不能删除未证明停止的root/claim。
@@ -224,7 +231,11 @@ python3 "$SRC/scripts/agent-remote/codex-install.py" --rollback --confirm \
  --key-dir "$EXEC_DIR" --probe-public-key "$PROBE_PUB" --profile default \
  | tee "$OPS/install-rollback.json"
 ```
-回退识别本事务before/after，第三方漂移拒绝；重复/中断后可重入。恢复公钥/guard/probe配置，恢复的是**最新canonical目录**而非旧token备份，原`.codex`成为真实0700目录。保留不可变bundle和宿主Codex私钥用于取证/后续受控清理；不删除CC行。回退不自动撤数据库ready，必须先走§7.3；不自动结束模型/工具进程。
+回退识别本事务before/after，第三方漂移拒绝；重复/中断后可重入：所有前置校验（布局、身份inode、非空目录）都在第一次写journal之前完成，被拒绝的回退不改journal；回退已完成或apply在rename前中断时，重入按磁盘布局收口journal（不重复搬auth）；rename后、journal提交前中断，重入同样能识别已恢复布局并收口。恢复公钥/guard/probe配置与 oc-bridge 文件（本事务新建的删除、原有字节恢复），恢复的是**最新canonical目录**而非旧token备份。登录回退按本事务记录的原始布局处理三种现场：
+- 原布局是真实目录（首次迁移）：`~/.codex` 的 0700 空目录被移走，canonical 目录整体 rename 回 `~/.codex`；若现场已删除该空目录，直接 rename，不误报“已恢复”。
+- 原布局是旧版兼容软链：先移除空目录，再恢复原软链（忠实回退旧状态，Gate G 会再次不过，需重新安装）。
+- 现场已是修复后稳态（无软链 + 0700 空目录 + canonical auth）：本事务没有移动 auth，回退登录步骤为 no-op，不声称移动过 token。
+`~/.codex` 若被第三方写入非空内容，回退拒绝覆盖并报错。保留不可变bundle和宿主Codex私钥用于取证/后续受控清理；不删除CC行。回退不自动撤数据库ready，必须先走§7.3；不自动结束模型/工具进程。
 
 ## 5. 获准后合入主线、正式列车迁移与切流
 
@@ -335,6 +346,8 @@ label及Mount.Source必须匹配第5节新runtime tuple，RW=false，用户home/
 ### 7.1 用管理员live probe落库，不能提交伪造probe JSON
 
 依据：`packages/commercial/src/http/admin/remotePool.ts:26-43,82-104`，`remoteBrainPool.ts:1200-1322,1400-1477,1530-1542`。API不读probe请求body，必须通过现有节点key实际跑hostd。probe会创建短期scope/锁/claim，有资源与进程副作用，执行前确保足够预算，不能在两路Codex正跑时拿probe失败判登录失效。
+
+单次SSH probe超时现在是`REMOTE_SSH_PROBE_TIMEOUT_MS=45_000`（`remoteBrainPool.ts`，两条probe路径共用）：现场冷启动首次probe超过旧硬编码15s、热probe约8s，15s会误报`REMOTE_SSH_PROBE_TIMEOUT`。45s覆盖冷启动且仍有界（SSH连接本身每次尝试仍10s封顶）。再遇到超时应看节点负载/进程，而不是无上限调大。
 
 [H/A] 第6节api函数与DB函数就位后：
 ```bash

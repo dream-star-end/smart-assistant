@@ -2,6 +2,11 @@ import importlib.util,pathlib,tempfile,unittest,os,json,base64,types,stat,subpro
 spec=importlib.util.spec_from_file_location('installer',pathlib.Path(__file__).with_name('codex-install-node.py'))
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
+def bridge_packet():
+    """Synthetic oc-bridge tree with the two files hostd requires to digest a tree."""
+    files={'.claude-plugin/plugin.json':b'{"name":"oc-bridge"}','hooks/hooks.json':b'{"hooks":{}}'}
+    return {'sha256':m.tree_digest(files),'files':{k:base64.b64encode(v).decode() for k,v in files.items()}}
+
 def transaction_worker(root, action, cut):
     """Fresh process, real syscalls/journal; only paths/account and crash boundary are injected."""
     home=root/'home/box';source=home/'.codex';dest=home/'.oc-remote-codex/profiles/default/codex-home'
@@ -38,6 +43,7 @@ def transaction_worker(root, action, cut):
     os.rename=move;os.symlink=link;os.chmod=mode;os.replace=commit;os.unlink=remove
     m.main({'action':action,'profile':'default','controller':ident,
         'files':{n:base64.b64encode(v).decode() for n,v in files.items()},
+        'ocBridge':bridge_packet(),
         'publicKey':'ssh-ed25519 CODEXKEY','probeKey':'ssh-ed25519 PROBEKEY'})
 
 class CrashRecoveryTests(unittest.TestCase):
@@ -66,19 +72,21 @@ class CrashRecoveryTests(unittest.TestCase):
         return result
     def assert_login(self, f, applied):
         source,dest=f['source'],f['dest'];login=dest if applied else source
-        self.assertEqual(source.is_symlink(),applied)
-        if applied:self.assertEqual(source.readlink(),dest)
-        else:self.assertFalse(os.path.lexists(dest));self.assertEqual(f['keys'].read_bytes(),f['keys_before'])
+        # Gate G: ~/.codex is a real directory, never a symlink, and never holds auth.
+        self.assertFalse(source.is_symlink())
+        self.assertTrue(source.is_dir())
+        if applied:
+            self.assertFalse((source/'auth.json').exists(),'the steady ~/.codex holds no auth')
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode),0o700)
+            self.assertEqual(stat.S_IMODE(dest.stat().st_mode),0o700)
+            self.assertEqual(stat.S_IMODE((dest/'auth.json').stat().st_mode),0o600)
+        else:
+            self.assertFalse(os.path.lexists(dest))
+            self.assertEqual(f['keys'].read_bytes(),f['keys_before'])
         self.assertTrue(login.is_dir(),'original login must be restored, not merely journaled')
         self.assertEqual(login.stat().st_ino,f['dir_inode'])
         self.assertEqual((login/'auth.json').stat().st_ino,f['inode'])
         self.assertEqual((login/'auth.json').read_text(),f['token'])
-        if applied or self.journal(f)[1].get('loginIntent'):
-            self.assertEqual(stat.S_IMODE(login.stat().st_mode),0o700)
-            self.assertEqual(stat.S_IMODE((login/'auth.json').stat().st_mode),0o600)
-        else:
-            self.assertEqual(stat.S_IMODE(login.stat().st_mode),0o755)
-            self.assertEqual(stat.S_IMODE((login/'auth.json').stat().st_mode),0o644)
     def renew(self, f):
         login=f['dest'] if f['dest'].exists() else f['source']
         self.assertEqual(login.stat().st_ino,f['dir_inode'])
@@ -95,9 +103,9 @@ class CrashRecoveryTests(unittest.TestCase):
             result=self.run_worker(f,action)
             points=[line.split()[1] for line in result.stdout.splitlines() if line.startswith('BOUNDARY ')]
             kinds={point.split(':')[0] for point in points}
-            self.assertTrue({'rename','journal','chmod-login'}<=kinds)
-            if action=='apply':self.assertTrue({'symlink','chmod-auth'}<=kinds)
-            else:self.assertIn('unlink',kinds)
+            # No symlink is ever created: the steady layout is a plain 0700 ~/.codex.
+            self.assertTrue({'rename','journal','chmod-login','chmod-auth'}<=kinds)
+            self.assertNotIn('symlink',kinds);self.assertNotIn('unlink',kinds)
             return points
     def test_audit_rename_before_checkpoint_direct_rollback(self):
         with tempfile.TemporaryDirectory(prefix='oc746-audit-') as directory:
@@ -136,7 +144,9 @@ class CrashRecoveryTests(unittest.TestCase):
             for action in ['apply','rollback']:
                 with self.subTest(conflict=conflict,action=action),tempfile.TemporaryDirectory(prefix='oc746-conflict-') as directory:
                     f=self.fixture(pathlib.Path(directory));self.run_worker(f,'apply','rename:1:after',86)
-                    if conflict=='both':f['source'].mkdir()
+                    if conflict=='both':
+                        f['source'].mkdir();os.chown(f['source'],1000,1000)
+                        (f['source']/'auth.json').write_text('stray');os.chown(f['source']/'auth.json',1000,1000)
                     elif conflict=='neither':f['dest'].rename(f['dest'].with_name('parked'))
                     elif conflict=='wrong-link':f['source'].symlink_to(f['root'])
                     elif conflict in ['replacement','dest-link']:
@@ -155,8 +165,11 @@ class CrashRecoveryTests(unittest.TestCase):
     def test_repeated_rollback_checks_disk_instead_of_success_flag(self):
         with tempfile.TemporaryDirectory(prefix='oc746-drift-') as directory:
             f=self.fixture(pathlib.Path(directory));self.run_worker(f,'apply');self.run_worker(f,'rollback')
+            # A completed rollback is an idempotent no-op that must not invent state.
+            self.run_worker(f,'rollback');self.assert_login(f,False)
             f['source'].rename(f['source'].with_name('parked'))
             result=self.run_worker(f,'rollback',expected=1);self.assertNotIn('"ok": true',result.stdout)
+            self.assertFalse(os.path.lexists(f['source']))
 
 class TransactionTests(unittest.TestCase):
     def test_atomic_fsync_observes_complete_bytes_and_failure_preserves_original(self):
@@ -201,7 +214,8 @@ class TransactionTests(unittest.TestCase):
             original=keys.read_bytes()
             files={n:pathlib.Path(__file__).with_name(n).read_bytes() for n in (*m.FILES,'codex-ssh-guard.py')}
             packet={'action':'apply','profile':'default','controller':m.digest(files['codex-host-controller.py']),
-                'files':{n:base64.b64encode(v).decode() for n,v in files.items()},'publicKey':'ssh-ed25519 CODEXKEY', 'probeKey':'ssh-ed25519 PROBEKEY'}
+                'files':{n:base64.b64encode(v).decode() for n,v in files.items()},'ocBridge':bridge_packet(),
+                'publicKey':'ssh-ed25519 CODEXKEY', 'probeKey':'ssh-ed25519 PROBEKEY'}
             originalP,originalPwd=m.P,m.pwd.getpwnam
             def mapped(p): return root/str(p).lstrip('/')
             m.P=mapped;m.pwd.getpwnam=lambda _:types.SimpleNamespace(pw_dir='/home/box',pw_uid=1000,pw_gid=1000)

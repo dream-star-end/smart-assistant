@@ -90,6 +90,7 @@ import { loadConfig, type CommercialConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { CodexCommissioning } from "./account-pool/codexCommissioning.js";
+import { makeAdminCommissionContainerSource } from "./account-pool/codexCommissioningContainer.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { deriveMediaSignKey } from "./http/mediaSign.js";
 import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
@@ -4494,10 +4495,14 @@ export async function registerCommercial(
       stateReads: { sessions: systemSessionReadBackend, readProject: (uid, id) => readPgChatProject(getPool(), uid, id), readRuntimeStatus: makeSystemRuntimeStatusRead(v3Deps) },
     });
   }
+  // Commissioning needs a live v3 runtime: the container identity it binds must come from the
+  // same getV3ContainerStatus source as live lane admission. Without v3Deps the service stays
+  // undefined (503) rather than falling back to any other container source.
   const codexCommissioning = runtimeChannel === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost"
-    && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache
+    && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache && v3Deps
     ? new CodexCommissioning({pool:getPool(),preCheckRedis,catalog:modelCatalogCache,keyring:()=>modelAuthoritySigner!.publicKeyring(),
-      signer:modelAuthoritySigner,loadUserModelAuthz,log:rootLogger.child({subsys:"codexCommissioning"})}) : undefined;
+      signer:modelAuthoritySigner,loadUserModelAuthz,log:rootLogger.child({subsys:"codexCommissioning"}),
+      containerSource:makeAdminCommissionContainerSource(v3Deps)}) : undefined;
   const handler = createCommercialHandler({
     codexCommissioning,
     modelSwitchCost,

@@ -20,7 +20,7 @@ import time
 import tempfile
 import types
 
-PINNED = {'oc-remote-hostd.py': '304f22eb46ba990081334fbee12c7de81db686957f196d994c53f43b9c7d4377', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
+PINNED = {'oc-remote-hostd.py': 'f1e019dc2c65b1332155df0553ffbed913c010f458fa25215241aaf2edaffc14', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
 CLI = Path('/usr/bin/codex')
 NATIVE = Path('/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
 MAX_FRAME = 2 * 1024 * 1024
