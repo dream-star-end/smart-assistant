@@ -61,15 +61,11 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home = pathlib.Path(d); source = home/'.codex'; source.mkdir(); (source/'auth.json').write_text('t')
             state = {}; durable = {}
-            calls = {'n': 0}
             def crash():
-                calls['n'] += 1
-                # The first checkpoint now freezes the pre-login ownership state;
-                # crash at the intent write so the scenario stays "intent durable,
-                # namespace untouched".
-                if calls['n'] == 2:
-                    durable.clear(); durable.update(json.loads(json.dumps(state)))
-                    raise RuntimeError('power loss')
+                # Crash at the first checkpoint (the login intent write) so the
+                # scenario stays "intent durable, namespace untouched".
+                durable.clear(); durable.update(json.loads(json.dumps(state)))
+                raise RuntimeError('power loss')
             with self.assertRaises(RuntimeError): mod.migrate_login(home, 'default', state, crash)
             self.assertTrue(durable.get('loginIntent')); self.assertTrue((source/'auth.json').exists())
             mod.rollback_login(home, 'default', durable, lambda: None)
@@ -83,12 +79,10 @@ class InstallTests(unittest.TestCase):
             home = pathlib.Path(d); dest = self.dest(home); dest.mkdir(parents=True)
             (dest/'auth.json').write_text('token'); source = home/'.codex'; source.symlink_to(dest)
             state = {}; durable = {}
-            calls = {'n': 0}
             def crash():
-                calls['n'] += 1
-                if calls['n'] == 2:  # after the frozen pre-state write
-                    durable.clear(); durable.update(json.loads(json.dumps(state)))
-                    raise RuntimeError('power loss')
+                # Crash at the intent write, before the symlink is converted.
+                durable.clear(); durable.update(json.loads(json.dumps(state)))
+                raise RuntimeError('power loss')
             with self.assertRaises(RuntimeError): mod.migrate_login(home, 'default', state, crash)
             self.assertEqual(durable.get('loginLayout'), 'linked')
             mod.rollback_login(home, 'default', durable, lambda: None)

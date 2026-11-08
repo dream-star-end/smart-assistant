@@ -181,7 +181,7 @@ oc-bridge 步骤：安装器从源码树 `packages/gateway/box-bridge-mod/oc-bri
 - 宿主生成或复用`$EXEC_DIR/codex_id_ed25519`（root0600），不覆盖CC `id_ed25519`；节点新增`from="38.55.252.217",restrict,command="/usr/bin/python3 -I -B /usr/local/libexec/oc-remote-codex/codex-ssh-guard.py" ssh-ed25519 … oc-codex-commissioning-exec`。
 - probe专用公钥的forced-command改为新bundle的`oc-remote-hostd.py --serve-mux`，不改CC执行行。旧probe仍CC-only时无法发现Codex，**只装Codex guard不够**。
 - `/opt/openclaude/box-bridge-mod/oc-bridge`：完整 oc-bridge 参考树，root:root、文件0644/目录0755、非组/其他写；其摘要必须等于 packet 的 `ocBridge.sha256`（同 master `loadBoxBridgeMod` 与 hostd `compute_oc_bridge_digest`）。已存在的第三方不同字节会被 CAS 拒绝。
-- root事务journal：`/var/lib/openclaude-codex-install/<controller sha>.json`。仅保存配置/公钥before摘要与恢复字节，不保存登录token。oc-bridge 每个文件也按 before/after 记入同一 journal，回退时恢复原字节或删除本事务新建的文件；本事务新建的空目录保留（无内容、无权限风险）。例外是 `~/.codex` 稳态空目录：它在同父目录以临时名创建、绑定 journal 的 dev/ino 后原子 rename 发布，回退时若由本事务创建则删除；中断遗留的临时目录与 root 属主的 mkdir 中间态按磁盘身份识别后恢复，不接管无关目录。旧版本 journal 的恢复资格在本次写入任何状态之前冻结：没有迁移前登录/建目录证据的旧 journal 不能因为本次补写的 `loginLayout` 就接管预存 root 目录；有真实旧 mkdir 中断证据的 journal 才允许按形状恢复；该资格是一次性的，apply 或 rollback 成功都会取消，回退删除前先绑定该目录 inode，已 complete/rolledBack 的事务不再保留任何形状接管权。
+- root事务journal：`/var/lib/openclaude-codex-install/<controller sha>.json`。仅保存配置/公钥before摘要与恢复字节，不保存登录token。oc-bridge 每个文件也按 before/after 记入同一 journal，回退时恢复原字节或删除本事务新建的文件；本事务新建的空目录保留（无内容、无权限风险）。例外是 `~/.codex` 稳态空目录：它在同父目录以临时名创建，journal 在 mkdir 前记下临时名、mkdir 后立即记下该目录的 dev/ino，然后 chown/chmod、fsync 父目录并原子 rename 发布；apply/rollback 只接管、改属主或删除 journal 记录了创建者本人 dev/ino 的目录（含临时目录）。**归属证据只有 journaled dev/ino**：路径、形状（root 属主/0700/空目录）、`loginLayout`/`loginIntent` 或旧版 journal 文本一律不算归属——旧版安装器正是在检查默认目录之前就写下了 `loginLayout`，所以它的「正常拒绝预存 root 目录」与「mkdir 后中断」在磁盘上不可区分，两者都拒绝自动接管、保留目录并报错要求人工确认（不虚报成功）。其他 `.oc-codex-plain-*` 条目、以及 `mkdir` 与 dev/ino 落盘之间中断留下的临时目录同理：报错并点名具体路径，由运维确认后手工清理空目录再重跑，绝不按名字删除。
 
 [N] 验证（用管理通道执行，非执行钥匙）：
 ```bash
@@ -235,7 +235,7 @@ python3 "$SRC/scripts/agent-remote/codex-install.py" --rollback --confirm \
 - 原布局是真实目录（首次迁移）：`~/.codex` 的 0700 空目录被移走，canonical 目录整体 rename 回 `~/.codex`；若现场已删除该空目录，直接 rename，不误报“已恢复”。
 - 原布局是旧版兼容软链：先移除空目录，再恢复原软链（忠实回退旧状态，Gate G 会再次不过，需重新安装）。
 - 现场已是修复后稳态（无软链 + 0700 空目录 + canonical auth）：本事务没有移动 auth，回退登录步骤不声称移动过 token；安装前既有的 0700 空目录保留，仅删除本事务创建的目录及其临时中间态。
-`~/.codex` 若被第三方写入非空内容，回退拒绝覆盖并报错。保留不可变bundle和宿主Codex私钥用于取证/后续受控清理；不删除CC行。回退不自动撤数据库ready，必须先走§7.3；不自动结束模型/工具进程。
+`~/.codex` 若被第三方写入非空内容，回退拒绝覆盖并报错。**`~/.codex` 是 root 属主且 journal 没有记录该目录 dev/ino 时，apply 与 rollback 都报 `manual inspection required` 并保持原样**（旧版安装器正常拒绝与 mkdir 中断不可区分）；人工确认它是空目录后删除该路径，再重跑同一 apply/rollback 即可收敛，不要绕过报错改写 journal。中断在 `mkdir` 与 dev/ino 落盘之间的临时目录（报错点名 `.oc-codex-plain-*` 具体路径）同样先人工确认空目录再删除。保留不可变bundle和宿主Codex私钥用于取证/后续受控清理；不删除CC行。回退不自动撤数据库ready，必须先走§7.3；不自动结束模型/工具进程。
 
 ## 5. 获准后合入主线、正式列车迁移与切流
 

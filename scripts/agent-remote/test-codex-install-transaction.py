@@ -169,109 +169,158 @@ class CrashRecoveryTests(unittest.TestCase):
         return result.stdout.strip()=='1'
     def test_plain_dir_interruption_matrix(self):
         """The mkdir/chown window between creating ~/.codex and publishing it must be
-        recoverable from disk on both apply rerun and rollback, for both starting layouts."""
+        recoverable from disk on both apply rerun and rollback, for both starting
+        layouts. The one window with no journaled inode (crash immediately after
+        mkdir) must refuse and name the directory instead of deleting a path it
+        cannot prove it owns."""
         for layout in ('original','moved'):
             for cut in self.plain_boundaries(layout):
                 for recovery in ('apply','rollback'):
                     with self.subTest(layout=layout,cut=cut,recovery=recovery),tempfile.TemporaryDirectory(prefix='oc746-plain-') as directory:
                         f=self.fixture(pathlib.Path(directory),layout);self.run_worker(f,'apply',cut,86)
                         self.renew(f)
-                        self.run_worker(f,recovery);self.assert_plain(f,recovery=='apply')
+                        self.recover_after_cut(f,recovery);self.assert_plain(f,recovery=='apply')
                         self.run_worker(f,'rollback');self.assert_plain(f,False)
                         self.run_worker(f,'rollback');self.assert_plain(f,False)
                         self.assertTrue(self.gate_g(f['home']),'Gate G must accept the recovered layout')
                         print('RECOVERED plain '+layout+' '+cut+' via '+recovery,flush=True)
-    def test_legacy_root_owned_plain_dir_is_recovered(self):
-        """The exact audit state: an older installer (journal without the atomic
-        plain-dir marker) died between mkdir and chown, leaving an empty root-owned
-        0700 ~/.codex. Rerun and rollback must converge from disk instead of
-        rejecting, and rollback must not report false success."""
-        for layout in ('original','moved'):
-            with self.subTest(layout=layout),tempfile.TemporaryDirectory(prefix='oc746-legacy-') as directory:
-                f=self.fixture(pathlib.Path(directory),layout);self.run_worker(f,'apply')
-                path,state=self.journal(f)
-                for key in ('plainDirTxn','plainDir','plainDirBefore','complete','rolledBack'):state.pop(key,None)
-                path.write_text(json.dumps(state))  # an older-version journal
-                source=f['source'];self.assertTrue(source.is_dir())
-                source.rmdir();source.mkdir(mode=0o700);os.chown(source,0,0)
-                self.assertEqual(source.lstat().st_uid,0)
-                self.run_worker(f,'apply');self.assert_plain(f,True)
-                self.assertTrue(self.gate_g(f['home']))
-                self.run_worker(f,'rollback');self.assert_plain(f,False)
-                self.run_worker(f,'rollback');self.assert_plain(f,False)
-                self.assertTrue(self.gate_g(f['home']),'Gate G must accept the recovered layout')
-                print('RECOVERED legacy root-owned plain dir '+layout,flush=True)
-    def test_legacy_journal_without_login_evidence_cannot_adopt(self):
-        """R4: an old-installer journal written before the login step has no login
-        evidence. This run's own loginLayout write must not become retroactive
-        ownership proof, otherwise a pre-existing root-owned ~/.codex is adopted
-        and later deleted."""
-        for layout in ('original','moved'):
-            with self.subTest(layout=layout),tempfile.TemporaryDirectory(prefix='oc746-legacy-early-') as directory:
-                f=self.fixture(pathlib.Path(directory),layout);self.run_worker(f,'apply')
-                path,state=self.journal(f)
-                for key in ('plainDirTxn','plainDir','plainDirBefore','plainDirLegacy',
-                            'loginIntent','loginLayout','loginMoved','loginIdentity',
-                            'complete','rolledBack'):state.pop(key,None)
-                path.write_text(json.dumps(state))  # journal from before the login step
-                source=f['source'];self.assertTrue(source.is_dir(),'steady ~/.codex exists')
-                source.rmdir();source.mkdir(mode=0o700);os.chown(source,0,0)
-                inode=source.stat().st_ino
-                result=self.run_worker(f,'apply',expected=1)
+    def old_journal(self, f):
+        """Rewrite the journal into the shape the older installer leaves behind.
+
+        The older installer checkpointed `loginLayout='moved'` (or, after a real
+        move, `loginIntent`/`loginIdentity`/`loginLayout='original'`) *before* it
+        inspected the default directory, so a journal that ended in its normal
+        `unsafe ~/.codex` rejection carries login evidence without any dev/ino
+        for a directory it never created."""
+        path,state=self.journal(f)
+        for key in ('plainDirTxn','plainDir','plainDirBefore','plainDirLegacy',
+                    'complete','rolledBack'):state.pop(key,None)
+        path.write_text(json.dumps(state))
+        return path,state
+    def plain_record(self, f):
+        paths=sorted((f['root']/'var/lib/openclaude-codex-install').glob('*.json'))
+        return (json.loads(paths[0].read_text()).get('plainDir') or {}) if paths else {}
+    def recorded_temp(self, f):
+        record=self.plain_record(f)
+        return pathlib.Path(record['tmp']) if record.get('tmp') else None
+    def recover_after_cut(self, f, action):
+        """Run one recovery step, honouring the only state with no journaled
+        inode: a crash between mkdir and the dev/ino checkpoint. Ownership is
+        unprovable there, so the step must refuse, preserve the directory, and
+        let the operator remove exactly the path the journal names."""
+        temp=self.recorded_temp(f);record=self.plain_record(f)
+        if temp is not None and temp.is_dir() and record.get('ino') is None:
+            result=self.run_worker(f,action,expected=1)
+            self.assertIn('unowned temporary ~/.codex directory',result.stderr)
+            self.assertNotIn('"ok": true',result.stdout)
+            self.assertTrue(temp.is_dir(),'a directory with no journaled inode must be preserved')
+            temp.rmdir()  # documented operator step for exactly this window
+        self.run_worker(f,action)
+    def test_old_installer_rejection_does_not_authorize_takeover(self):
+        """R2 critical: an older installer that *normally refused* a pre-existing
+        root-owned ~/.codex still left `loginLayout='moved'` in the journal. That
+        journal text is not ownership evidence, so apply must not chown the
+        directory and rollback must not delete it."""
+        for action in ('apply','rollback'):
+            with self.subTest(action=action),tempfile.TemporaryDirectory(prefix='oc746-r2-reject-') as directory:
+                f=self.fixture(pathlib.Path(directory),'moved');self.run_worker(f,'apply')
+                path,state=self.old_journal(f)
+                self.assertEqual(state.get('loginLayout'),'moved')
+                self.assertIsNone(state.get('loginIntent'))
+                source=f['source'];source.rmdir();source.mkdir(mode=0o700);os.chown(source,0,0)
+                inode=source.stat().st_ino;before=path.read_bytes()
+                result=self.run_worker(f,action,expected=1)
                 self.assertIn('unsafe ~/.codex',result.stderr)
+                self.assertIn('manual inspection required',result.stderr)
+                self.assertNotIn('"ok": true',result.stdout)
                 self.assertTrue(source.is_dir() and not source.is_symlink())
-                self.assertEqual(source.lstat().st_uid,0)
+                self.assertEqual(source.lstat().st_uid,0,'the pre-existing root dir must keep its owner')
                 self.assertEqual(stat.S_IMODE(source.stat().st_mode),0o700)
                 self.assertEqual(source.stat().st_ino,inode)
                 _,state=self.journal(f)
-                self.assertIs(state.get('plainDirLegacy'),False,'must stay unproven after upgrade')
-                before=path.read_bytes()
-                result=self.run_worker(f,'rollback',expected=1)
+                self.assertNotEqual((state.get('plainDir') or {}).get('ino'),inode,
+                    'a rejected directory must never be journaled as adopted')
+                if action=='rollback':self.assertEqual(path.read_bytes(),before,'a refused rollback must stay read-only')
+                print('REFUSED old-installer journal takeover via '+action,flush=True)
+    def test_old_installer_mkdir_artifact_is_refused_not_adopted(self):
+        """An old installer that really moved the login and then died between
+        mkdir and chown also leaves no recorded inode for the root-owned
+        directory. Its shape cannot distinguish it from the rejected case above,
+        so both apply and rollback refuse and leave it for manual confirmation."""
+        for action in ('apply','rollback'):
+            with self.subTest(action=action),tempfile.TemporaryDirectory(prefix='oc746-r2-artifact-') as directory:
+                f=self.fixture(pathlib.Path(directory),'moved');self.run_worker(f,'apply')
+                path,state=self.old_journal(f)
+                # Old first-move journal: the durable intent and identity were
+                # written before the move; the layout field still says 'original'.
+                state['loginIntent']=True;state['loginLayout']='original';state['loginMoved']=True
+                state['loginIdentity']={'dev':f['dest'].stat().st_dev,'ino':f['dest'].stat().st_ino}
+                path.write_text(json.dumps(state))
+                source=f['source'];source.rmdir();source.mkdir(mode=0o700);os.chown(source,0,0)
+                inode=source.stat().st_ino;before=path.read_bytes()
+                result=self.run_worker(f,action,expected=1)
                 self.assertIn('unsafe ~/.codex',result.stderr)
+                self.assertIn('manual inspection required',result.stderr)
+                self.assertNotIn('"ok": true',result.stdout)
                 self.assertEqual(source.lstat().st_uid,0)
                 self.assertEqual(source.stat().st_ino,inode)
-                self.assertEqual(path.read_bytes(),before,'refused rollback must not write the journal')
-                print('REFUSED legacy pre-login journal '+layout,flush=True)
-    def test_legacy_right_is_retired_after_successful_rollback(self):
-        """R5: the frozen legacy right is a one-shot authorization. After it is
-        frozen and the process exits, a direct rollback must retire it; a root
-        directory that appears afterwards is not ours and must be refused."""
-        with tempfile.TemporaryDirectory(prefix='oc746-legacy-retire-') as directory:
-            f=self.fixture(pathlib.Path(directory),'moved');self.run_worker(f,'apply')
-            path,state=self.journal(f)
-            for key in ('plainDirTxn','plainDir','plainDirBefore','complete','rolledBack'):
-                state.pop(key,None)
-            self.assertEqual(state.get('loginLayout'),'moved')
-            path.write_text(json.dumps(state))  # old installer journal with real mkdir evidence
-            source=f['source'];source.rmdir();source.mkdir(mode=0o700);os.chown(source,0,0)
-            self.run_worker(f,'apply','journal:1:after',86)  # crash right after freezing the right
-            _,state=self.journal(f)
-            self.assertIs(state.get('plainDirLegacy'),True)
-            self.assertIsNone(state.get('loginIntent'))
-            self.assertNotIn('plainDir',state)
-            # A refused rollback (unknown temp dir) must not retire the right or
-            # rewrite the journal before the obstruction is removed.
-            obstruct=f['home']/'.oc-codex-plain-unrelated';obstruct.mkdir()
-            before=path.read_bytes()
-            result=self.run_worker(f,'rollback',expected=1)
+                _,state=self.journal(f)
+                self.assertNotEqual((state.get('plainDir') or {}).get('ino'),inode)
+                if action=='rollback':self.assertEqual(path.read_bytes(),before,'a refused rollback must stay read-only')
+                print('REFUSED old-installer mkdir artifact via '+action,flush=True)
+    def test_unbound_temp_is_never_deleted(self):
+        """R2 warning: the journal records a temporary path before mkdir, so a
+        crash in that window leaves a directory whose inode was never recorded.
+        A same-named replacement must not be removed by name alone."""
+        for action in ('apply','rollback'):
+            with self.subTest(action=action),tempfile.TemporaryDirectory(prefix='oc746-r2-temp-') as directory:
+                f=self.fixture(pathlib.Path(directory),'moved');self.run_worker(f,'apply','mkdir:1:after',86)
+                temp=self.recorded_temp(f);self.assertTrue(temp.is_dir(),'crash left the recorded temp dir')
+                self.assertIsNone((self.journal(f)[1].get('plainDir') or {}).get('ino'),'inode was never recorded')
+                parked=f['home']/'parked-temp-aside';temp.rename(parked)  # non-candidate name: no inode reuse
+                temp.mkdir(mode=0o700);os.chown(temp,0,0)
+                inode=temp.stat().st_ino
+                result=self.run_worker(f,action,expected=1)
+                self.assertIn('unowned temporary ~/.codex directory',result.stderr)
+                self.assertNotIn('"ok": true',result.stdout)
+                self.assertTrue(temp.is_dir() and temp.stat().st_ino==inode,'the replacement must survive')
+                self.assertTrue(parked.is_dir(),'the moved-aside original must survive too')
+                print('REFUSED unbound temp replacement via '+action,flush=True)
+    def test_unbound_temp_requires_manual_clear_then_recovers(self):
+        """The single documented manual step for the mkdir window: the journal
+        names the empty root-owned staging directory, so an operator removes
+        exactly that path and the rerun converges."""
+        with tempfile.TemporaryDirectory(prefix='oc746-r2-manual-') as directory:
+            f=self.fixture(pathlib.Path(directory),'moved');self.run_worker(f,'apply','mkdir:1:after',86)
+            temp=self.recorded_temp(f)
+            result=self.run_worker(f,'apply',expected=1)
             self.assertIn('unowned temporary ~/.codex directory',result.stderr)
-            self.assertTrue(obstruct.is_dir())
-            self.assertEqual(path.read_bytes(),before,'a refused rollback must stay read-only')
-            obstruct.rmdir()
-            self.run_worker(f,'rollback')  # recover the old artifact, then retire the right
-            self.assertFalse(os.path.lexists(source))
-            _,state=self.journal(f)
-            self.assertIs(state.get('rolledBack'),True)
-            self.assertIs(state.get('plainDirLegacy'),False,'a finished transaction keeps no recovery right')
-            source.mkdir(mode=0o700);os.chown(source,0,0)
-            inode=source.stat().st_ino;before=path.read_bytes()
-            result=self.run_worker(f,'rollback',expected=1)
-            self.assertIn('unsafe ~/.codex',result.stderr)
-            self.assertTrue(source.is_dir() and not source.is_symlink())
-            self.assertEqual(source.lstat().st_uid,0)
+            self.assertTrue(temp.is_dir())
+            temp.rmdir()  # operator removes the empty root-owned staging directory the journal names
+            self.run_worker(f,'apply');self.assert_plain(f,True)
+            self.assertTrue(self.gate_g(f['home']))
+            self.run_worker(f,'rollback');self.assert_plain(f,False)
+    def test_old_journal_steady_state_rerun_is_idempotent(self):
+        """The on-site steady node keeps an old journal: apply must converge
+        without touching the existing box-owned 0700 ~/.codex, and rollback must
+        not delete a directory this transaction never created."""
+        with tempfile.TemporaryDirectory(prefix='oc746-r2-steady-') as directory:
+            f=self.fixture(pathlib.Path(directory),'moved');self.run_worker(f,'apply')
+            self.old_journal(f)
+            source=f['source'];self.assertTrue(source.is_dir())
+            (source/'tmp').mkdir();(source/'note').write_text('keep')
+            for p in (source/'tmp',source/'note'):os.chown(p,1000,1000)
+            inode=source.stat().st_ino
+            for _ in range(2):self.run_worker(f,'apply')
             self.assertEqual(source.stat().st_ino,inode)
-            self.assertEqual(path.read_bytes(),before)
-            print('RETIRED legacy right after rollback',flush=True)
+            self.assertEqual(source.lstat().st_uid,1000)
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode),0o700)
+            self.assertEqual((source/'note').read_text(),'keep')
+            self.assertTrue((source/'tmp').is_dir())
+            self.run_worker(f,'rollback')
+            self.assertEqual(source.stat().st_ino,inode,'rollback must not remove a pre-existing steady dir')
+            self.assertEqual((source/'note').read_text(),'keep')
+            print('IDEMPOTENT old-journal steady rerun',flush=True)
     def test_unowned_root_plain_dir_is_refused_not_deleted(self):
         """Without a journal, a pre-existing root-owned 0700 ~/.codex is not ours:
         apply must refuse to adopt it and rollback must refuse to delete it."""
@@ -321,7 +370,7 @@ class CrashRecoveryTests(unittest.TestCase):
             for recovery in ['rollback','apply']:
                 with self.subTest(cut=cut,recovery=recovery),tempfile.TemporaryDirectory(prefix='oc746-crash-') as directory:
                     f=self.fixture(pathlib.Path(directory));self.run_worker(f,'apply',cut,86);self.renew(f)
-                    self.run_worker(f,recovery);self.assert_login(f,recovery=='apply')
+                    self.recover_after_cut(f,recovery);self.assert_login(f,recovery=='apply')
                     if recovery=='apply':self.run_worker(f,'apply');self.assert_login(f,True)
                     self.run_worker(f,'rollback');self.assert_login(f,False)
                     self.run_worker(f,'rollback');self.assert_login(f,False)
@@ -436,6 +485,56 @@ class TransactionTests(unittest.TestCase):
                 m.atomic=real_atomic;m.main(packet);m.main(packet)
                 self.assertEqual(keys.read_bytes(),original);self.assertEqual(auth.read_text(),'latest-token');self.assertFalse((home/'.codex').is_symlink())
             finally:m.P=originalP;m.pwd.getpwnam=originalPwd;m.atomic=real_atomic if 'real_atomic' in locals() else m.atomic
+    def test_full_main_old_journal_steady_state_is_idempotent(self):
+        """On-site steady model: box-owned 0700 ~/.codex holding contents, a
+        hand-installed oc-bridge tree, and the journal an older installer left.
+        apply twice and rollback twice must all succeed without deleting or
+        changing that directory, and the hand-installed bridge must keep its
+        bytes."""
+        self.assertEqual(os.getuid(),0,'run via host root; no production path is used')
+        with tempfile.TemporaryDirectory(prefix='oc746-steady-main-') as directory:
+            root=pathlib.Path(directory)
+            for name in ['home/box/.ssh','home/box/.codex','var/lib','proc']:(root/name).mkdir(parents=True,exist_ok=True)
+            home=root/'home/box';os.chown(home,1000,1000)
+            for p in [home/'.ssh',home/'.codex']:os.chown(p,1000,1000);os.chmod(p,0o700)
+            auth=home/'.codex/auth.json';auth.write_text('first-token');os.chown(auth,1000,1000)
+            cc='from="38.55.252.217",restrict,command="cc-guard" ssh-ed25519 CCCCKEY oc-rpool-123-exec\n'
+            keys=home/'.ssh/authorized_keys';keys.write_text(cc+'command="oc-remote-hostd.py --serve-mux" ssh-ed25519 PROBEKEY oc-rpool-123\n');os.chown(keys,1000,1000);os.chmod(keys,0o600)
+            files={n:pathlib.Path(__file__).with_name(n).read_bytes() for n in (*m.FILES,'codex-ssh-guard.py')}
+            packet={'action':'apply','profile':'default','controller':m.digest(files['codex-host-controller.py']),
+                'files':{n:base64.b64encode(v).decode() for n,v in files.items()},'ocBridge':bridge_packet(),
+                'publicKey':'ssh-ed25519 CODEXKEY', 'probeKey':'ssh-ed25519 PROBEKEY'}
+            bridge=root/'opt/openclaude/box-bridge-mod/oc-bridge'
+            for rel,data in packet['ocBridge']['files'].items():
+                path=bridge/rel;path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_bytes(base64.b64decode(data));os.chmod(path,0o644)
+            bridge_before={p.relative_to(bridge).as_posix():p.read_bytes() for p in bridge.rglob('*') if p.is_file()}
+            originalP,originalPwd=m.P,m.pwd.getpwnam
+            def mapped(p): return root/str(p).lstrip('/')
+            m.P=mapped;m.pwd.getpwnam=lambda _:types.SimpleNamespace(pw_dir='/home/box',pw_uid=1000,pw_gid=1000)
+            try:
+                m.main(packet)  # first-class install from the original layout
+                journal=root/'var/lib/openclaude-codex-install'/(packet['controller']+'.json')
+                state=json.loads(journal.read_text())
+                for key in ('plainDirTxn','plainDir','plainDirBefore','loginIntent',
+                            'loginIdentity','loginLayout','loginMoved','complete'):
+                    state.pop(key,None)
+                state['loginLayout']='moved';state['loginMoved']=False  # older installer's steady rerun journal
+                journal.write_text(json.dumps(state))
+                source=home/'.codex';inode=source.stat().st_ino
+                (source/'tmp').mkdir();(source/'note').write_text('keep')
+                for p in (source/'tmp',source/'note'):os.chown(p,1000,1000)
+                m.main(packet);m.main(packet)
+                self.assertEqual(source.stat().st_ino,inode,'apply must not recreate a pre-existing steady dir')
+                self.assertEqual(source.lstat().st_uid,1000)
+                self.assertEqual(stat.S_IMODE(source.stat().st_mode),0o700)
+                self.assertEqual((source/'note').read_text(),'keep');self.assertTrue((source/'tmp').is_dir())
+                packet['action']='rollback';m.main(packet);m.main(packet)
+                self.assertEqual(source.stat().st_ino,inode,'rollback must not delete a pre-existing steady dir')
+                self.assertEqual((source/'note').read_text(),'keep')
+                self.assertEqual({p.relative_to(bridge).as_posix():p.read_bytes() for p in bridge.rglob('*') if p.is_file()},bridge_before)
+                self.assertEqual((home/'.oc-remote-codex/profiles/default/codex-home/auth.json').read_text(),'first-token')
+            finally:m.P=originalP;m.pwd.getpwnam=originalPwd
 if __name__=='__main__':
     if len(sys.argv)>1 and sys.argv[1]=='--worker':transaction_worker(pathlib.Path(sys.argv[2]),sys.argv[3],sys.argv[4])
     else:unittest.main()
