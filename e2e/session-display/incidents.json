@@ -9914,8 +9914,10 @@
       "occurredAt": "2026-11-08",
       "severity": "P1",
       "symptom": "t1642u: 商业 uid4 webmw5q71izrmgbs8 的 Box 417/continuation_unknown 后，裸 idle candidate 阻断后续同模型和 GPT 提交。年龄只触发本地 shutdown/drain 与官方 stop，重新读取终态证明后恢复；unknown/live/缺失证明及 operator reset 保持安全围栏，历史与计费不变。",
-      "rootFixCommit": "d7f829ff0",
-      "coverageCommits": [],
+      "rootFixCommit": "d7f829ff",
+      "coverageCommits": [
+        "8e5e6d68"
+      ],
       "regressions": [
         {
           "layer": "unit",
