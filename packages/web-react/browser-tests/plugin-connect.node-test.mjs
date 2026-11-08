@@ -112,3 +112,40 @@ test('Knowledge Planet setup distinguishes QR failure from capacity, stops polli
     await new Promise((resolve) => server.close(resolve))
   }
 })
+
+test('Knowledge Planet setup shows login success after WeChat scan while QR is visible', { timeout: 90000 }, async () => {
+  const bundle = await build({
+    entryPoints: [fileURLToPath(new URL('./knowledge-planet-setup-harness.tsx', import.meta.url))],
+    bundle: true, write: false, format: 'iife', jsx: 'automatic', loader: { '.css': 'empty' },
+    alias: { 'node:crypto': fileURLToPath(new URL('./stubs/node-crypto.js', import.meta.url)),
+      '@openclaude/protocol/browser': fileURLToPath(new URL('../../protocol/src/browser.ts', import.meta.url)),
+      '@openclaude/protocol': fileURLToPath(new URL('../../protocol/src/index.ts', import.meta.url)) },
+    define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env.MODE': '"production"' },
+  })
+  const server = createServer((req, res) => {
+    res.setHeader('Content-Type', req.url === '/fixture.js' ? 'text/javascript' : 'text/html; charset=utf-8')
+    res.end(req.url === '/fixture.js' ? bundle.outputFiles[0].text : '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><div id="root"></div><script src="/fixture.js"></script>')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  let browser
+  try {
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ['--no-sandbox'] })
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } })
+    page.setDefaultTimeout(7000)
+    const errors = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto(`http://127.0.0.1:${server.address().port}/?mode=scan-success`)
+    await page.getByRole('button', { name: '同意并生成二维码' }).click()
+    await page.getByAltText('知识星球微信登录二维码').waitFor()
+    await page.getByText('二维码已生成 · 请使用微信扫码，并在手机上确认登录', { exact: true }).waitFor()
+    await page.getByText('授权成功，Agent 现在可以直接读取知识星球内容；写入能力保持关闭，需你另行开启。', { exact: true }).waitFor()
+    assert.equal(await page.evaluate(() => window.kpFixture.bound), 1)
+    assert.equal(await page.getByAltText('知识星球微信登录二维码').count(), 0)
+    assert.ok((await page.evaluate(() => window.kpFixture.polls)) >= 2)
+    assert.deepEqual(errors, [])
+    await page.close()
+  } finally {
+    await browser?.close()
+    await new Promise((resolve) => server.close(resolve))
+  }
+})

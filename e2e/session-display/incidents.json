@@ -10005,6 +10005,26 @@
           "assertion": "Knowledge Planet setup distinguishes QR failure from capacity, stops polling and retries cleanly"
         }
       ]
+    },
+    {
+      "id": "INC-20261109-KP-SCAN-LONGPOLL",
+      "occurredAt": "2026-11-09",
+      "severity": "P1",
+      "symptom": "知识星球微信登录二维码可以显示，扫码后页面一直不显示已登录。worker CONNECT 中继 15s 空闲超时切断了 lp.open.weixin.qq.com 约 20s 的 qrconnect long-poll，扫码确认无法回到登录页。",
+      "rootFixCommit": "031a9585",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/knowledgePlanet.test.ts",
+          "assertion": "WeChat qrconnect long-poll needs >15s or scan confirmation never arrives"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/plugin-connect.node-test.mjs",
+          "assertion": "Knowledge Planet setup shows login success after WeChat scan while QR is visible"
+        }
+      ]
     }
   ]
 }
