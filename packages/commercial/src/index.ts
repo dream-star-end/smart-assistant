@@ -526,6 +526,7 @@ import {
   appendServerAuthoredMessageDrainByUser,
   drainDelegateCostForClientSession,
   getClientSession,
+  classifyClientSessions,
   patchServerAuthoredMessage,
   readArchivedMessages,
   getEngineContextMessages,
@@ -2109,6 +2110,8 @@ export async function registerCommercial(
   const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool(),
     flavorIdentity.status === "ok" && flavorIdentity.flavor === "commercial" ? {
       append: appendServerAuthoredMessage,
+      originActive: async (sessionId, userId) =>
+        (await classifyClientSessions([{ sessionId, userId }]))[0]?.state === "active",
       resolveMedia: async (userId) => {
         if (!museDeliveryRefs.resolveMedia) throw new Error("Muse media resolver not ready");
         return museDeliveryRefs.resolveMedia(userId);

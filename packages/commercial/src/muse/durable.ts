@@ -46,10 +46,14 @@ export class MuseFenceLost extends Error {
   }
 }
 
-export function createMuseDurability(pool: Pool, deliver: () => Promise<void>): MuseDurability {
+export function createMuseDurability(
+  pool: Pool,
+  deliver: () => Promise<void>,
+  originActive: (sessionId: string, userId: string) => Promise<boolean>,
+): MuseDurability {
   return {
     async validateOrigin(userId, sessionKey) {
-      let key: ReturnType<typeof parseSessionKey>
+      let key: ReturnType<typeof parseSessionKey> | null = null
       try {
         key = parseSessionKey(sessionKey)
       } catch {
@@ -62,11 +66,7 @@ export function createMuseDurability(pool: Pool, deliver: () => Promise<void>): 
           'Muse video requires the originating web conversation',
         )
       }
-      const r = await pool.query(
-        'SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL',
-        [key.peerId, `c:${userId}`],
-      )
-      if (!r.rowCount)
+      if (!(await originActive(key.peerId, `c:${userId}`)))
         throw new MuseError(
           403,
           'MUSE_ORIGIN_INVALID',

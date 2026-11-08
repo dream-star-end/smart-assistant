@@ -9,6 +9,7 @@ import type { MuseDurableState } from './durable.js'
 import { MIME_EXT } from './protocol.js'
 
 export interface MuseDeliveryDeps {
+  originActive(sessionId: string, userId: string): Promise<boolean>
   append: typeof import('@openclaude/storage').appendServerAuthoredMessage
   resolveMedia(userId: string): Promise<UserMediaLocation>
   pushRemote?(args: { hostUuid: string; remotePath: string; content: Buffer }): Promise<void>
@@ -41,11 +42,7 @@ export function createMuseDelivery(
     for (const row of r.rows) {
       try {
         const owner = `c:${row.user_id}`
-        const origin = await pool.query(
-          'SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL',
-          [row.durable.sessionId, owner],
-        )
-        if (!origin.rowCount) {
+        if (!(await deps.originActive(row.durable.sessionId, owner))) {
           // Never redirect a deleted origin to another conversation.
           await pool.query('UPDATE muse_media_jobs SET delivered_at=NOW() WHERE id=$1', [row.id])
           continue

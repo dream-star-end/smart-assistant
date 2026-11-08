@@ -315,6 +315,8 @@ describe('Muse durable journal/outbox (0336)', () => {
       uid,
       origin,
       backend,
+      originActive: async (sessionId: string, userId: string) =>
+        (await backend.classifyClientSessions([{ sessionId, userId }]))[0]?.state === 'active',
       id,
       state,
       store,
@@ -324,7 +326,7 @@ describe('Muse durable journal/outbox (0336)', () => {
   test('claims are exclusive, preserve retry payload and fence old updates and billing', async (t) => {
     if (!pgAvailable) return t.skip('no test database')
     const f = await fixture()
-    const durable = createMuseDurability(getPool(), async () => {})
+    const durable = createMuseDurability(getPool(), async () => {}, f.originActive)
     await assert.rejects(
       durable.validateOrigin('999999', `agent:main:webchat:dm:${f.origin}`),
       /belong/,
@@ -377,7 +379,7 @@ describe('Muse durable journal/outbox (0336)', () => {
       'UPDATE muse_media_jobs SET durable=durable || \'{"background":false,"expiresAt":0}\'::jsonb, lease_until=NOW()-INTERVAL \'1 second\' WHERE id=$1',
       [f.id],
     )
-    const rows = await createMuseDurability(getPool(), async () => {}).claim(
+    const rows = await createMuseDurability(getPool(), async () => {}, f.originActive).claim(
       'offline-recovery',
       10,
       false,
@@ -395,7 +397,7 @@ describe('Muse durable journal/outbox (0336)', () => {
       [f.id],
     )
     assert.equal((await f.store.findJob(f.uid, f.id))?.status, 'queued')
-    await createMuseDurability(getPool(), async () => {}).release(f.id, 'owner-a')
+    await createMuseDurability(getPool(), async () => {}, f.originActive).release(f.id, 'owner-a')
     await assert.rejects(
       f.store.insertJob({
         id: `mj_${randomUUID()}`,
@@ -435,6 +437,7 @@ describe('Muse durable journal/outbox (0336)', () => {
       let unavailable = true
       const frames: unknown[] = []
       const drain = createMuseDelivery(getPool(), root, {
+        originActive: f.originActive,
         resolveMedia: async (owner) => {
           assert.equal(owner, `c:${f.uid}`)
           if (unavailable) throw new Error('user container unavailable')
@@ -509,6 +512,7 @@ describe('Muse durable journal/outbox (0336)', () => {
       })
       let attempts = 0
       const drain = createMuseDelivery(getPool(), root, {
+        originActive: f.originActive,
         append: f.backend.appendServerAuthoredMessage,
         resolveMedia: async () => ({
           kind: 'fail',
@@ -550,6 +554,7 @@ describe('Muse durable journal/outbox (0336)', () => {
     )
     await query('UPDATE client_sessions SET deleted_at=1 WHERE id=$1', [f.origin])
     const drain = createMuseDelivery(getPool(), '/unused', {
+      originActive: f.originActive,
       append: async () => {
         throw new Error('must not append deleted origin')
       },
@@ -572,6 +577,7 @@ describe('Muse durable journal/outbox (0336)', () => {
         [live.id, JSON.stringify([{ mime: 'video/mp4', bytes: 1, sha256: 'a'.repeat(64) }])],
       )
       const attempt = createMuseDelivery(getPool(), root, {
+        originActive: live.originActive,
         append: live.backend.appendServerAuthoredMessage,
         resolveMedia: async () => ({
           kind: 'ok',

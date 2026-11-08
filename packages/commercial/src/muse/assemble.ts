@@ -40,6 +40,7 @@ export async function createMuseFromConfig(
       ? createMuseDurability(
           pool,
           createMuseDelivery(pool, cfg.OC_MUSE_STATE_ROOT ?? MUSE_DEFAULT_STATE_ROOT, delivery),
+          delivery.originActive,
         )
       : undefined,
     stateRoot: cfg.OC_MUSE_STATE_ROOT ?? MUSE_DEFAULT_STATE_ROOT,
