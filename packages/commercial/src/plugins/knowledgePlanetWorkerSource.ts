@@ -1,6 +1,11 @@
 import { KNOWLEDGE_PLANET_LOGIN_DIAGNOSTIC_SOURCE } from './knowledgePlanetLoginDiagnostics.js'
 
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS = 3_000
+// WeChat qrconnect long-polls GET lp.open.weixin.qq.com/connect/l/qrconnect and only
+// returns (typically wx_errcode=408) after ~20s when unscanned. Node socket idle
+// timeouts abort the CONNECT tunnel if shorter than that, so the iframe never sees
+// a later scan/confirm and never redirects to wx.zsxq.com/load.
+export const KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS = 60_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS = 5_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS = 48
 export const KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS = 45_000
@@ -205,7 +210,7 @@ function brokerFrame(token, host, port) {
 
 async function startRelay(token, allowedHosts) {
   const server = createServer((client) => {
-    client.setTimeout(15_000, () => client.destroy());
+    client.setTimeout(${KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS}, () => client.destroy());
     let pending = Buffer.alloc(0);
     const readConnect = (chunk) => {
       pending = Buffer.concat([pending, chunk]);
