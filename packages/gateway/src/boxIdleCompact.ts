@@ -135,15 +135,24 @@ export function idleHistoryStillBlocked(input: {
 }
 
 export function readPendingIdle(dir: string, sessionKey: string): IdleOp | undefined {
+  return readPendingIdleOps(dir, sessionKey)[0]
+}
+
+/** Reset must fence every unfinished operation before abandoning any of them. */
+export function readPendingIdleOps(dir: string, sessionKey: string): IdleOp[] {
   const folder = join(dir, 'idle-ops', encodeURIComponent(sessionKey))
   let names: string[] = []
-  try { names = readdirSync(folder) } catch { return undefined }
+  try { names = readdirSync(folder) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+  }
+  const pending: IdleOp[] = []
   for (const name of names) {
     if (!name.endsWith('.json') || name.endsWith('.tmp')) continue
     const op = readIdleOp(dir, sessionKey, name.slice(0, -'.json'.length))
-    if (op && !idleOpSettled(op)) return op
+    if (op && !idleOpSettled(op)) pending.push(op)
   }
-  return undefined
+  return pending
 }
 
 export function readIdleOp(dir: string, sessionKey: string, revision: string): IdleOp | undefined {
@@ -258,6 +267,8 @@ export interface IdleSourceCandidate {
   sessionId: string
   turnKey: string
   createdAt?: number
+  /** Once egress was pending, a later missing row is not a no-send proof. */
+  observedPending?: true
 }
 
 function candidatePath(dir: string, sessionKey: string): string {
@@ -276,8 +287,16 @@ export function writeIdleCandidate(dir: string, candidate: IdleSourceCandidate):
 export function readIdleCandidate(dir: string, sessionKey: string): IdleSourceCandidate | undefined {
   try {
     const parsed = JSON.parse(readFileSync(candidatePath(dir, sessionKey), 'utf8')) as IdleSourceCandidate
-    if (parsed.v !== 1 || parsed.sessionKey !== sessionKey) return undefined
-    return parsed
+    if (parsed.v !== 1 || parsed.sessionKey !== sessionKey
+      || typeof parsed.sessionId !== 'string' || !/^[A-Za-z0-9._:-]{1,256}$/.test(parsed.sessionId)
+      || typeof parsed.turnKey !== 'string' || !/^[a-f0-9]{64}$/.test(parsed.turnKey)
+      || (parsed.createdAt !== undefined && (!Number.isSafeInteger(parsed.createdAt) || parsed.createdAt <= 0))
+      || (parsed.observedPending !== undefined && parsed.observedPending !== true)) {
+      throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+    }
+    // Legacy candidates predate createdAt. Preserve their durable age when
+    // recording pending evidence; age authorizes a stop attempt, never release.
+    return { ...parsed, createdAt: parsed.createdAt ?? Math.floor(statSync(candidatePath(dir, sessionKey)).mtimeMs) }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')

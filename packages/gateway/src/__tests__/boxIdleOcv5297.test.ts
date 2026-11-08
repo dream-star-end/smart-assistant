@@ -170,7 +170,7 @@ describe('finishIdleUnderLock (OCV5-297)', () => {
     } finally { await server.close() }
   })
 
-  test('skipped releases a bare candidate but keeps a started op blocked', async () => {
+  test('skipped proof keeps both a bare source candidate and a started op blocked', async () => {
     const dir = await tempDir()
     const keys = ['ANTHROPIC_BASE_URL', 'OPENCLAUDE_V3_MASTER_BASE_URL'] as const
     const before = keys.map((key) => process.env[key])
@@ -178,7 +178,7 @@ describe('finishIdleUnderLock (OCV5-297)', () => {
     try {
       writeIdleCandidate(dir, { v: 1, sessionKey: 'skip-bare', sessionId, turnKey: sourceTurn })
       await finish.call({}, fakeSession('skip-bare'), { sessionId, turnKey: sourceTurn }, dir)
-      assert.equal(readIdleCandidate(dir, 'skip-bare'), undefined, 'nothing was dispatched: release')
+      assert.ok(readIdleCandidate(dir, 'skip-bare'), 'missing configuration proves nothing about the source run')
 
       startIdleOp({ dir, sessionKey: 'skip-op', sourceSessionId: sessionId, sourceTurnKey: sourceTurn,
         revision, idleTurnKey: 'ff'.repeat(32), frozenTail: [], attachments: [] })

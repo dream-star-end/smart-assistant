@@ -173,7 +173,7 @@ async function pendingProofServer() {
 }
 
 describe('OCV5-620 finishIdleUnderLock with a source proof that stays pending', () => {
-  test('a pending op still settles once apply-stuck after the candidate already aged out (Codex r1 P1)', async () => {
+  test('a pending op still settles independently while its unknown source candidate stays fenced', async () => {
     const dir = await tempDir()
     const close = await pendingProofServer()
     try {
@@ -188,7 +188,7 @@ describe('OCV5-620 finishIdleUnderLock with a source proof that stays pending', 
       const source = { sessionId, turnKey: sourceTurn }
 
       await finish.call({}, session, source, dir)
-      assert.equal(readIdleCandidate(dir, sessionKey), undefined, 'aged-out candidate cleared')
+      assert.ok(readIdleCandidate(dir, sessionKey), 'pending source stays fenced regardless of age')
       assert.equal(idleOpSettled(readIdleOp(dir, sessionKey, revision)!), false, 'op not stuck yet')
 
       age(IDLE_APPLY_STUCK_MS + 60_000)

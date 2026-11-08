@@ -1,3 +1,4 @@
+import { recoverIdleCandidate, markIdleCandidatePending } from './boxIdleCandidateRecovery.js'
 import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 /**
@@ -42,7 +43,6 @@ import {
   currentIdleSource,
   idleAbandonReason,
   idleApplyStuckReason,
-  idleCandidateAgedOut,
   idleOpSettled,
   idleProofWaitMs,
   pruneIdleOps,
@@ -264,11 +264,12 @@ function writeSettledIdleOp(recoveryDir: string, op: IdleOp): void {
 async function waitBoxIdleProof(input: {
   sessionId: string
   turnKey: string
-}): Promise<IdleProofResponse> {
+}, onPending: () => void): Promise<IdleProofResponse> {
   const deadline = Date.now() + idleProofWaitMs()
   let delay = 1000
   for (;;) {
     const proof = await fetchBoxIdleProof(input)
+    if (proof.status === 'pending') onPending()
     if (proof.status !== 'pending' || Date.now() + delay > deadline) return proof
     await new Promise((resolve) => setTimeout(resolve, delay))
     delay = Math.min(delay * 2, 8000)
@@ -2253,20 +2254,27 @@ export async function finishIdleUnderLock(
 ): Promise<void> {
   if (session._idleRunning) return
   const pending = readPendingIdle(recoveryDir, session.sessionKey)
-  if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
+  let candidate = readIdleCandidate(recoveryDir, session.sessionKey)
+  if (!pending && !candidate) return
   // OCV5-377: stop an idle summary turn parked on a tool call before reading
   // proofs; its open handoff keeps both proofs pending (see stopParkedIdleTurn).
   if (pending) await stopParkedIdleTurn(withIncarnationShutdown(recoveryDir, pending))
-  const proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
+  let proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey }, () => {
+    if (candidate) candidate = markIdleCandidatePending(recoveryDir, candidate)
+  })
+  if (!pending && candidate) {
+    proof = await recoverIdleCandidate({ dir: recoveryDir, candidate, runner: session.runner, proof })
+  }
+  if (proof.status === 'not_found' && candidate?.observedPending) {
+    proof = { status: 'pending', reason: 'source_proof_missing' }
+  }
   if (proof.status === 'skipped') {
-    // Not configured / invalid identity. Safe to drop only a bare candidate:
-    // no op exists, so no summary was dispatched and nothing can arrive late.
+    // Configuration failure is not evidence about the source run.
     log.error('box idle proof unavailable', {
       sessionKey: session.sessionKey,
       reason: proof.reason,
       pendingOp: Boolean(pending),
     })
-    if (!pending) clearIdleCandidate(recoveryDir, session.sessionKey)
     return
   }
   if (proof.status === 'not_found' || proof.status === 'failed') {
@@ -2277,22 +2285,9 @@ export async function finishIdleUnderLock(
     return
   }
   if (proof.status !== 'terminal' && proof.status !== 'terminal_set') {
-    // OCV5-620: source proof stayed non-terminal; age out the candidate so
-    // submit is not blocked forever, and settle any apply-stuck pending op.
-    const stuckCand = readIdleCandidate(recoveryDir, session.sessionKey)
-    if (stuckCand && idleCandidateAgedOut(stuckCand)) {
-      log.warn('box idle candidate aged out', {
-        sessionKey: session.sessionKey,
-        createdAt: stuckCand.createdAt,
-        proofStatus: proof.status,
-      })
-      clearIdleCandidate(recoveryDir, session.sessionKey)
-    }
-    // Once no candidate holds it, a pending op settles on its own evidence on
-    // every call, not only the one that aged the candidate out (Codex r1 P1:
-    // an op that became apply-stuck later stayed pending forever).
-    if (pending && !readIdleCandidate(recoveryDir, session.sessionKey))
-      await settleStrandedIdleOp(session, pending, recoveryDir)
+    // Keep the source fence until authoritative proof arrives. A prepared
+    // operation still gets its existing independent recovery attempt.
+    if (pending) await settleStrandedIdleOp(session, pending, recoveryDir)
     return
   }
   // Dispatch gate: a new op is created only when the leaf says the real
