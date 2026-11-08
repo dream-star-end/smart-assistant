@@ -110,7 +110,7 @@ def call(method: str, path: str, payload: dict | None = None, timeout: int = 60,
         raise MuseFailure(
             code or f"HTTP_{exc.code}",
             message or body or f"HTTP {exc.code}",
-            bool(detail.get("retryable")) if isinstance(detail, dict) else False,
+            exc.code in (502, 503, 504) or (bool(detail.get("retryable")) if isinstance(detail, dict) else False),
         ) from None
     except (error.URLError, TimeoutError, ConnectionError) as exc:
         reason = getattr(exc, "reason", exc)
@@ -171,9 +171,20 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         payload["resume_snapshot_id"] = ns.resume
 
     status = call("GET", "/status")
-    if not status.get("bridge_online"):
+    if not status.get("bridge_online") and not status.get("retry"):
         raise MuseFailure("MUSE_BRIDGE_OFFLINE", "the Muse bridge is not connected; ask the user to start it in the Muse VM")
+    server_delivery = kind == "video" and bool(status.get("durable_video"))
+    if server_delivery:
+        payload["session_key"] = os.environ.get("OPENCLAUDE_SESSION_KEY") or os.environ.get("OC_SESSION_KEY") or ""
     job_id = call("POST", "/jobs", payload, timeout=120)["job_id"]
+
+    def acknowledge(background=False, terminal=False):
+        message = "Muse 视频处理结束，结果会回到本会话。" if terminal else (
+            "Muse 视频已进入后台队列，完成后会回到本会话。" if background else
+            "Muse 视频请求已受理，服务恢复后会继续处理，结果会回到本会话。")
+        print(json.dumps({"ok": True, "job_id": job_id, "background": background,
+                          "delivery": "conversation", "message": message}, ensure_ascii=False))
+        return 0
 
     def cancel(signum, _frame):
         try:
@@ -190,6 +201,7 @@ def run(kind: str, ns: argparse.Namespace) -> int:
     give_up = queue_until + ns.timeout
     deadline: float | None = None
     last_position = None
+    retry_count = 0
     view: dict = {}
     while True:
         now = time.monotonic()
@@ -215,8 +227,25 @@ def run(kind: str, ns: argparse.Namespace) -> int:
             raise MuseFailure("MUSE_TIMEOUT", f"no result within {ns.timeout} s", True, job_id=job_id)
         # First look right away (a queued job reports its place at once), then long-poll.
         wait = 25 if view else 0
-        view = call("GET", f"/jobs/{job_id}?wait={wait}", timeout=60)
+        try:
+            view = call("GET", f"/jobs/{job_id}?wait={wait}", timeout=60)
+        except MuseFailure as exc:
+            if server_delivery and exc.payload.get("retryable"):
+                # POST already acknowledged the durable journal. A master restart must not
+                # turn an accepted video into an H3 fallback or a second submission.
+                return acknowledge()
+            raise
+        # The server owns retries of this same job. --timeout remains per execution attempt;
+        # queue_until/give_up still bound the overall wait and explicit cancellation still works.
+        retries = view.get("retry_count", 0)
+        if retries > retry_count:
+            retry_count = retries
+            deadline = None
         status = view.get("status")
+        if view.get("delivery") == "conversation" and (view.get("background") or status in TERMINAL):
+            # The master owns the durable callback, including synchronous video success. Never
+            # download/re-emit it in a second assistant message or invoke an H3 fallback.
+            return acknowledge(bool(view.get("background")), status in TERMINAL)
         if status in TERMINAL:
             break
         if status == "queued":

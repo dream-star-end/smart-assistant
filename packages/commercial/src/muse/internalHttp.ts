@@ -92,7 +92,12 @@ export function makeMuseInternalHandler(deps: MuseInternalDeps): MuseInternalHan
       }
 
       if (method === 'GET' && sub === '/status') {
-        sendJson(res, 200, { enabled: true, bridge_online: hub.bridgeOnline() })
+        sendJson(res, 200, {
+          enabled: true,
+          bridge_online: hub.bridgeOnline(),
+          retry: hub.retryPolicy(),
+          durable_video: hub.durableVideoEnabled(),
+        })
         return
       }
       if (method === 'POST' && sub === '/jobs') {
@@ -104,7 +109,21 @@ export function makeMuseInternalHandler(deps: MuseInternalDeps): MuseInternalHan
           throw new MuseError(400, 'MUSE_INVALID_INPUT', 'body is not valid JSON')
         }
         const spec = parseSubmission(raw)
-        const jobId = await hub.submit(userId, String(identity.containerId), spec)
+        const origin =
+          raw && typeof raw === 'object' ? (raw as Record<string, unknown>).session_key : undefined
+        if (spec.kind === 'video' && hub.durableVideoEnabled() && typeof origin !== 'string') {
+          throw new MuseError(
+            400,
+            'MUSE_ORIGIN_REQUIRED',
+            'Muse video requires the originating web conversation',
+          )
+        }
+        const jobId = await hub.submit(
+          userId,
+          String(identity.containerId),
+          spec,
+          hub.durableVideoEnabled() && spec.kind === 'video' ? { sessionKey: String(origin) } : {},
+        )
         sendJson(res, 202, { job_id: jobId })
         return
       }
@@ -135,7 +154,7 @@ export function makeMuseInternalHandler(deps: MuseInternalDeps): MuseInternalHan
       if (method === 'DELETE' && m[2] === undefined) {
         const view = hub.cancel(userId, jobId)
         if (!view) throw new MuseError(404, 'NOT_FOUND', 'job not found')
-        sendJson(res, 200, view)
+        sendJson(res, 200, await hub.view(userId, jobId, 0))
         return
       }
       throw new MuseError(405, 'METHOD_NOT_ALLOWED', 'method not allowed')

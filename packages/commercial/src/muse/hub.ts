@@ -1,30 +1,37 @@
-// Muse media bridge — in-process job hub (OCV5-561, multi-slot and billing OCV5-574).
+// Muse media bridge — leased durable video and in-process image job hub (OCV5-561, multi-slot and billing OCV5-574).
 //
 // One master process owns the hub. The personal edition runs one bridge slot (one job at a time)
 // with a short FIFO queue; commercial configures up to `concurrency` jobs at once, per-account
 // caps, a longer queue and per-job credits (see MuseBridgeHubOptions).
 //
 // Job states (memory): queued → dispatched → running → done.
-//   - `dispatched` means "handed to a poll response, not yet acked". It is never persisted:
-//     the audit row stays `queued` until the ack, then becomes `running`.
+//   - `dispatched` means "handed to a poll response, not yet acked". Durable videos journal it;
+//     the audit status stays `queued` until the ack, then becomes `running`.
 //   - The ack is an execution barrier: the bridge only starts media-generation after the
 //     master answered 200 to the ack for this exact nonce. A dispatched job without an ack
 //     within ACK_TIMEOUT_MS is requeued with a fresh nonce, so a late ack for the old nonce
 //     gets 410 and the bridge drops it. At most one generation runs for a given nonce.
 //   - A running job goes back on the queue (same id, new nonce, no charge) when the bridge
 //     says hello again, posts MUSE_BRIDGE_LOST, or stays silent for HEARTBEAT_LOST_MS.
-//     The previous generation stops on 410. After MAX_DISPATCH_ATTEMPTS the job fails.
-//     Queued jobs stay queued while the bridge is quiet, until the queue wait.
+//     The previous generation stops on 410. Transient failures share a budget of three retries,
+//     each delayed 40 seconds; offline dispatch consumes the same budget.
 //   - Credits are charged only for a job that succeeded, in the same transaction that records the
 //     success (MuseBilling.settle). Anything else — failure, cancel, timeout, lost bridge, restart —
 //     charges nothing.
 
 import { type Hash, createHash, randomUUID } from 'node:crypto'
-import { rmSync } from 'node:fs'
 import { access, appendFile, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { type Logger, rootLogger } from '../logging/logger.js'
+import {
+  MUSE_BACKGROUND_TTL_MS,
+  MUSE_LEASE_MS,
+  type MuseDurability,
+  type MuseDurableState,
+  type MuseFence,
+  type MuseRecoveredJob,
+} from './durable.js'
 import type { MuseBilling } from './billing.js'
 import {
   ACK_TIMEOUT_MS,
@@ -34,7 +41,9 @@ import {
   INLINE_SOURCE_MAX_BYTES,
   JOB_DEADLINE_MS,
   JOB_ID_RE,
-  MAX_DISPATCH_ATTEMPTS,
+  MUSE_RETRY_MAX,
+  MUSE_RETRY_INTERVAL_MS,
+  MUSE_TRANSIENT_ERRORS,
   MIME_EXT,
   MUSE_LIMITS,
   type MuseAllowlist,
@@ -88,18 +97,31 @@ interface UploadState {
 }
 
 interface HubJob {
+  durable?: MuseDurableState
+  leaseOwner: string
+  leaseUntil: number
+  checkpoint: Promise<void> | null
+  checkpointCount: number
+
   id: string
   userId: string
   containerId: string | null
   spec: MuseJobSpec
   state: 'queued' | 'dispatched' | 'running' | 'done'
   nonce: string
+  /** Current queue entry time, and accumulated queue time across attempts (includes backoff). */
   queuedAt: number
+  queuedMs: number
   dispatchedAt: number
   lastBeatAt: number
   deadlineAt: number
   dispatchCount: number
+  retryCount: number
+  retryAt: number
+  retryTimer: NodeJS.Timeout | null
   credentialId: string | null
+  bridgeSessionId: string | null
+  bridgeVersion: string | null
   /** Credits this job will cost on success (0n when not billed); held against the balance check. */
   price: bigint
   /** The success is being recorded and charged; only result() may finish the job meanwhile. */
@@ -126,6 +148,9 @@ export interface MuseJobView {
   job_id: string
   kind: MuseKind
   status: MuseJobStatus
+  delivery?: 'conversation'
+  background?: boolean
+  retry_count?: number
   queue_position?: number
   queue_length?: number
   error?: { code: string; message: string; retryable: boolean; upstream_error_code: string | null }
@@ -160,12 +185,17 @@ export interface MuseRateLimits {
 }
 
 export interface MuseBridgeHubOptions {
+  durability?: MuseDurability
   store: MuseStore
   stateRoot: string
   allowedUids: MuseAllowlist
   rate: MuseRateLimits
   cliTimeoutSec: Readonly<Record<MuseKind, number>>
-  /** Jobs running at once (bridge slots). Default 1. */
+  /** Commercial credential-scoped workers; default keeps the single-bridge contract. */
+  multiBridge?: boolean
+  /** Per-bridge execution cap, additionally bounded by the site cap. */
+  perBridgeConcurrency?: number
+  /** Jobs running at once across this hub. Default 1. */
   concurrency?: number
   /** Jobs waiting across all accounts. Default QUEUE_MAX. */
   queueMax?: number
@@ -181,6 +211,9 @@ export interface MuseBridgeHubOptions {
   billing?: MuseBilling
   /** Open rows from another process are closed only once older than this. 0 = at start. */
   orphanGraceMs?: number
+  /** Additional attempts after the initial failure. Defaults to MUSE_RETRY_MAX. */
+  retryMax?: number
+  retryIntervalMs?: number
   now?: () => number
   logger?: Logger
 }
@@ -215,6 +248,12 @@ export function deterministicMuseJobId(executionKey: string): string {
 }
 
 export class MuseBridgeHub {
+  private readonly durability: MuseDurability | undefined
+  private readonly owner = randomUUID()
+  private durableTickRunning = false
+  private deliveryTick: Promise<void> | null = null
+  private stopped = false
+  private lastDurableTick = 0
   private readonly store: MuseStore
   private readonly root: string
   private readonly allowed: MuseAllowlist
@@ -228,15 +267,20 @@ export class MuseBridgeHub {
   private readonly globalPerDay: Readonly<Partial<Record<MuseKind, number>>>
   private readonly billing: MuseBilling | undefined
   private readonly orphanGraceMs: number
+  private readonly retryMax: number
+  private readonly retryIntervalMs: number
   private readonly now: () => number
   private readonly log: Logger
-  private session: Session | null = null
+  private readonly multiBridge: boolean
+  private readonly perBridgeConcurrency: number
+  private readonly sessions = new Map<string, Session>()
   private readonly superseded: string[] = []
   private readonly waiters: PollWaiter[] = []
   /** Dispatched and running jobs (at most `concurrency`). */
   private readonly active = new Map<string, HubJob>()
   private readonly queue: HubJob[] = []
   private readonly jobs = new Map<string, HubJob>()
+  private pumping = false
   private timer: NodeJS.Timeout | null = null
   private lastOrphanSweep = 0
   /** The audit-row write of each finished job, so stop() can wait for them. */
@@ -247,19 +291,39 @@ export class MuseBridgeHub {
   private readonly reservedByUser = new Map<string, { count: number; credits: bigint }>()
 
   constructor(opts: MuseBridgeHubOptions) {
+    this.durability = opts.durability
     this.store = opts.store
     this.root = opts.stateRoot
     this.allowed = opts.allowedUids
     this.rate = opts.rate
     this.cliTimeoutSec = opts.cliTimeoutSec
     this.concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1))
+    this.multiBridge = opts.multiBridge ?? false
+    this.perBridgeConcurrency = Math.max(
+      1,
+      Math.min(this.concurrency, Math.floor(opts.perBridgeConcurrency ?? this.concurrency)),
+    )
     this.queueMax = Math.max(1, Math.floor(opts.queueMax ?? QUEUE_MAX))
     this.queueWaitMs = opts.queueWaitMs ?? { image: QUEUE_WAIT_MS, video: QUEUE_WAIT_MS }
     this.userInflightMax = opts.userInflightMax ?? Number.POSITIVE_INFINITY
     this.userRunningMax = opts.userRunningMax ?? Number.POSITIVE_INFINITY
     this.globalPerDay = opts.globalPerDay ?? {}
     this.billing = opts.billing
-    this.orphanGraceMs = Math.max(0, opts.orphanGraceMs ?? 0)
+    this.retryMax = opts.retryMax ?? MUSE_RETRY_MAX
+    this.retryIntervalMs = opts.retryIntervalMs ?? MUSE_RETRY_INTERVAL_MS
+    if (
+      !Number.isSafeInteger(this.retryMax) ||
+      this.retryMax < 0 ||
+      this.retryMax > 100 ||
+      !Number.isSafeInteger(this.retryIntervalMs) ||
+      this.retryIntervalMs < 1 ||
+      this.retryIntervalMs > 3_600_000
+    )
+      throw new Error('invalid Muse retry policy')
+    // Another A/B slot must not sweep this process's legitimate retry window.
+    this.orphanGraceMs = opts.orphanGraceMs
+      ? Math.max(opts.orphanGraceMs, this.maxJobLifetimeMs() + 60_000)
+      : 0
     this.now = opts.now ?? Date.now
     this.log = (opts.logger ?? rootLogger).child({ subsys: 'museBridge' })
   }
@@ -271,9 +335,8 @@ export class MuseBridgeHub {
       ...kinds.map(
         (k) =>
           this.queueWaitMs[k] +
-          JOB_DEADLINE_MS[k] +
-          SOURCE_UPLOAD_EXTRA_MS +
-          MAX_DISPATCH_ATTEMPTS * ACK_TIMEOUT_MS,
+          (this.retryMax + 1) * (JOB_DEADLINE_MS[k] + SOURCE_UPLOAD_EXTRA_MS + ACK_TIMEOUT_MS) +
+          this.retryMax * this.retryIntervalMs,
       ),
     )
   }
@@ -285,6 +348,7 @@ export class MuseBridgeHub {
     const cutoff = Date.now() - this.orphanGraceMs - DONE_RETAIN_MS
     for (const name of await readdir(this.root)) {
       if (!JOB_ID_RE.test(name)) continue
+      if (await this.durability?.protectedFile(name)) continue
       const dir = join(this.root, name)
       if (this.orphanGraceMs > 0) {
         const st = await stat(dir).catch(() => null)
@@ -293,58 +357,93 @@ export class MuseBridgeHub {
       await rm(dir, { recursive: true, force: true })
     }
     await this.sweepOrphans()
+    await this.durableTick()
     this.timer = setInterval(() => this.tick(), 1000)
     this.timer.unref()
   }
 
   /** Graceful stop: jobs still open in this process can never finish, so close them now. */
   async stop(): Promise<void> {
+    this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
     this.clearWaiters()
     const open = [...this.jobs.values()].filter((j) => j.state !== 'done')
     for (const job of open) {
+      if (job.durable) {
+        if (job.retryTimer) clearTimeout(job.retryTimer)
+        await job.checkpoint?.catch(() => {})
+        this.forget(job)
+        continue
+      }
       this.finish(job, fail('MUSE_MASTER_RESTARTED', 'the master restarted during the job', true))
     }
     await Promise.allSettled(open.map((job) => this.persisted.get(job.id)))
+    await this.deliveryTick
   }
 
   isAllowed(userId: string): boolean {
     return this.allowed === 'all' || this.allowed.has(userId)
   }
 
+  durableVideoEnabled(): boolean {
+    return Boolean(this.durability)
+  }
+
+  retryPolicy(): { max: number; interval_ms: number } {
+    return { max: this.retryMax, interval_ms: this.retryIntervalMs }
+  }
+
   bridgeOnline(): boolean {
-    return this.session !== null && this.now() - this.session.lastSeen <= BRIDGE_ONLINE_MS
+    return [...this.sessions.values()].some((s) => this.sessionOnline(s))
   }
 
   /** Sent to the bridge in /hello: how many jobs it may run at once. */
   bridgeConcurrency(): number {
-    return this.concurrency
+    return this.perBridgeConcurrency
+  }
+
+  private sessionOnline(session: Session): boolean {
+    return this.now() - session.lastSeen <= BRIDGE_ONLINE_MS
   }
 
   // ── bridge side ──────────────────────────────────────────────────────────
 
   hello(credentialId: string, version: string | null): string {
-    if (this.session) {
-      this.superseded.push(this.session.id)
+    const replaced = [...this.sessions.values()].filter(
+      (s) => !this.multiBridge || s.credentialId === credentialId,
+    )
+    for (const old of replaced) {
+      this.sessions.delete(old.id)
+      this.superseded.push(old.id)
       if (this.superseded.length > 32) this.superseded.shift()
+      for (const w of [...this.waiters]) if (w.sessionId === old.id) this.dropWaiter(w)
+      for (const job of [...this.active.values()]) {
+        if (job.bridgeSessionId === old.id) this.requeue(job, 'reconnect')
+      }
     }
-    this.clearWaiters()
-    for (const a of [...this.active.values()]) {
-      if (a.state === 'dispatched' || a.state === 'running') this.requeue(a, 'reconnect')
-    }
-    this.session = { id: randomUUID(), credentialId, version, lastSeen: this.now() }
+    const session = { id: randomUUID(), credentialId, version, lastSeen: this.now() }
+    this.sessions.set(session.id, session)
+    void this.durableTick()
+    this.pump()
     this.log.info('muse_bridge_hello', { credentialId, version })
-    return this.session.id
+    return session.id
   }
 
-  checkSession(sessionId: string | undefined): SessionCheck {
-    if (sessionId && this.session?.id === sessionId) {
-      this.session.lastSeen = this.now()
+  checkSession(sessionId: string | undefined, credentialId?: string): SessionCheck {
+    const session = sessionId ? this.sessions.get(sessionId) : undefined
+    if (session && (credentialId === undefined || session.credentialId === credentialId)) {
+      session.lastSeen = this.now()
       return 'ok'
     }
     if (sessionId && this.superseded.includes(sessionId)) return 'superseded'
     return 'unknown'
+  }
+
+  /** HTTP boundary: even another authenticated bridge cannot operate this attempt. */
+  requireAssignment(jobId: string, nonce: string, sessionId: string): void {
+    if (this.requireActive(jobId, nonce).bridgeSessionId !== sessionId)
+      throw new MuseError(410, 'JOB_GONE', 'job belongs to another bridge session')
   }
 
   /**
@@ -352,11 +451,15 @@ export class MuseBridgeHub {
    * client went away before a response was written). The bridge keeps one poll per free slot.
    */
   poll(sessionId: string, holdMs: number, signal?: AbortSignal): Promise<MuseWireJob | null> {
-    const ready = this.takeNext()
-    if (ready) return Promise.resolve(this.wire(ready))
+    const session = this.sessions.get(sessionId)
+    if (!session) return Promise.resolve(null)
+    session.lastSeen = this.now()
+    const ready = this.takeNext(session)
+    if (ready) return this.wireAfterCheckpoint(ready)
     if (signal?.aborted) return Promise.resolve(null)
     // More polls than slots means stale ones from a restarted bridge thread: drop the oldest.
-    while (this.waiters.length >= this.concurrency) this.dropWaiter(this.waiters[0]!)
+    const ownWaiters = this.waiters.filter((w) => w.sessionId === sessionId)
+    while (ownWaiters.length >= this.perBridgeConcurrency) this.dropWaiter(ownWaiters.shift()!)
     return new Promise((resolve) => {
       const waiter: PollWaiter = {
         sessionId,
@@ -364,7 +467,10 @@ export class MuseBridgeHub {
           this.removeWaiter(waiter)
           resolve(null)
         }, holdMs),
-        resolve: (job) => resolve(job ? this.wire(job) : null),
+        resolve: (job) => {
+          if (job) void this.wireAfterCheckpoint(job).then(resolve)
+          else resolve(null)
+        },
       }
       waiter.timer.unref()
       this.waiters.push(waiter)
@@ -373,9 +479,11 @@ export class MuseBridgeHub {
   }
 
   /** A dispatched job could not be written to its poll response: it was never seen. */
-  undeliverable(jobId: string): void {
+  undeliverable(jobId: string, nonce: string): void {
     const job = this.jobs.get(jobId)
-    if (job && this.active.get(jobId) === job && job.state === 'dispatched') this.requeue(job)
+    if (
+      job && job.nonce === nonce && this.active.get(jobId) === job && job.state === 'dispatched'
+    ) this.requeue(job)
   }
 
   /**
@@ -392,12 +500,12 @@ export class MuseBridgeHub {
   }
 
   /** Ack (first heartbeat) and keep-alive. Throws 410 when the job/nonce is stale. */
-  heartbeat(jobId: string, nonce: string): { cancel: boolean } {
+  heartbeat(jobId: string, nonce: string): { cancel: boolean } | Promise<{ cancel: boolean }> {
     const job = this.requireActive(jobId, nonce)
+    if (job.durable) return this.durableHeartbeat(job)
     const now = this.now()
     if (job.state === 'dispatched') {
       job.state = 'running'
-      job.credentialId = this.session?.credentialId ?? null
       if (job.credentialId) {
         this.store.markRunning(job.id, job.credentialId).catch((err) => {
           this.log.warn('muse_mark_running_failed', { jobId: job.id, err: (err as Error).message })
@@ -448,12 +556,13 @@ export class MuseBridgeHub {
     }
     job.uploadBusy = true
     try {
-      const dir = join(this.root, job.id)
+      const dir = join(this.root, job.id, nonce)
       await mkdir(dir, { recursive: true, mode: 0o700 })
       await appendFile(join(dir, `${idx}.part`), data, { mode: 0o600 })
     } finally {
-      job.uploadBusy = false
+      if (job.nonce === nonce) job.uploadBusy = false
     }
+    this.requireRunning(jobId, nonce)
     if (job.state !== 'running') throw new MuseError(410, 'JOB_GONE', 'job is no longer running')
     up.hash.update(data)
     up.chunks += 1
@@ -464,28 +573,32 @@ export class MuseBridgeHub {
 
   async result(jobId: string, nonce: string, body: Record<string, unknown>): Promise<void> {
     const job = this.requireRunning(jobId, nonce)
+    if (job.durable) {
+      await job.checkpoint
+      this.requireRunning(jobId, nonce)
+    }
     if (body.ok !== true) {
       const f = normalizeBridgeFailure(body)
-      // The bridge stopped this generation. Same job id, new nonce, no charge.
-      // requeue() leaves a job alone once billing has started to settle it.
-      if (f.code === 'MUSE_BRIDGE_LOST') {
-        this.requeue(job, 'bridge_lost')
-        return
-      }
-      this.finish(job, {
+      const outcome: Outcome = {
         ok: false,
         status: f.code === 'MUSE_CANCELLED' ? 'cancelled' : 'failed',
         code: f.code,
         message: f.message,
-        retryable: f.retryable,
+        retryable: f.code === 'MUSE_BRIDGE_LOST' || f.retryable,
         upstreamCode: f.upstreamCode,
-      })
+      }
+      if (MUSE_TRANSIENT_ERRORS.has(f.code)) this.requeue(job, 'bridge_failure', outcome)
+      else this.finish(job, outcome)
+      if (job.durable) await (job.checkpoint ?? this.persisted.get(job.id))
       return
     }
     if (job.uploadBusy) throw new MuseError(429, 'UPLOAD_BUSY', 'a chunk is still being written')
     // Hold the upload lock across verification (and the charge) so nothing can change what was
     // checked, and a second result for the same job cannot run concurrently.
     job.uploadBusy = true
+    // Pin the winning result across filesystem verification as well as billing. Reconnects and
+    // timeouts cannot reassign its files while an accepted result is being committed.
+    job.settling = true
     let files: MuseFileView[]
     let chargedCredits: bigint | null = null
     try {
@@ -493,7 +606,7 @@ export class MuseBridgeHub {
         files = await this.verifyUploads(job, body.files)
       } catch (err) {
         const message = err instanceof MuseError ? err.message : 'result verification failed'
-        this.finish(job, fail('MUSE_BAD_OUTPUT', message))
+        this.finish(job, fail('MUSE_BAD_OUTPUT', message), true)
         throw new MuseError(400, 'BAD_RESULT', message)
       }
       if (job.state !== 'running') throw new MuseError(410, 'JOB_GONE', 'job is no longer running')
@@ -515,6 +628,7 @@ export class MuseBridgeHub {
         job.settling = true
         try {
           const settled = await this.billing.settle({
+            fence: this.fence(job),
             jobId: job.id,
             userId: job.userId,
             kind: job.spec.kind,
@@ -540,6 +654,16 @@ export class MuseBridgeHub {
               err: (lookupErr as Error).message,
             })
           }
+          if (job.durable && (!outcome || !outcome.charged)) {
+            // Unknown COMMIT must not become a fabricated success. Leave the journal for recovery.
+            this.forget(job)
+            throw new MuseError(
+              503,
+              'MUSE_SETTLEMENT_PENDING',
+              'result settlement will be reconciled',
+              true,
+            )
+          }
           if (outcome && !outcome.charged) {
             this.finish(
               job,
@@ -558,6 +682,7 @@ export class MuseBridgeHub {
         }
       }
       this.finish(job, { ok: true, files, snapshotId: snapshot, artifactIds, chargedCredits }, true)
+      if (job.durable) await this.persisted.get(job.id)
     } finally {
       job.uploadBusy = false
     }
@@ -580,7 +705,7 @@ export class MuseBridgeHub {
       }
       const digest = up.hash.copy().digest('hex')
       if (f.sha256 !== digest) throw new MuseError(400, 'BAD_RESULT', `file ${i} sha256 mismatch`)
-      const part = join(this.root, job.id, `${i}.part`)
+      const part = join(this.root, job.id, job.nonce, `${i}.part`)
       const fh = await open(part, 'r')
       let head: Buffer
       try {
@@ -605,8 +730,8 @@ export class MuseBridgeHub {
     }
     for (const f of out) {
       await rename(
-        join(this.root, job.id, `${f.idx}.part`),
-        join(this.root, job.id, `${f.idx}.bin`),
+        join(this.root, job.id, job.nonce, `${f.idx}.part`),
+        join(this.root, job.id, ...(job.durable ? [job.nonce] : []), `${f.idx}.bin`),
       )
     }
     return out
@@ -618,7 +743,7 @@ export class MuseBridgeHub {
     userId: string,
     containerId: string | null,
     spec: MuseJobSpec,
-    opts: { jobId?: string } = {},
+    opts: { jobId?: string; sessionKey?: string } = {},
   ): Promise<string> {
     // Idempotent submission (OCV5-591 A0): a caller-chosen deterministic id that already exists for
     // this user returns that job — never a second queue entry, never a second charge.
@@ -641,14 +766,16 @@ export class MuseBridgeHub {
         'Muse media tools are not enabled for this account',
       )
     }
-    // Refuse only before the first hello. A session that has gone quiet (the VM process
-    // restarts on a schedule and dials back) still accepts work: the job waits until the
-    // bridge polls again, or until the queue wait. Failing it here dropped jobs across that gap.
-    if (!this.session) {
-      throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'the Muse bridge is not connected')
-    }
-    const version = this.session?.version ?? null
-    if (spec.source_images?.length && !bridgeFetchesSources(version)) {
+    const origin =
+      this.durability && spec.kind === 'video' && opts.sessionKey !== undefined
+        ? await this.durability.validateOrigin(userId, opts.sessionKey)
+        : undefined
+    // Offline jobs are admitted once, then consume the same bounded retry budget as failures.
+    const version = this.sessions.values().next().value?.version ?? null
+    if (
+      !this.multiBridge && this.bridgeOnline() && spec.source_images?.length &&
+      !bridgeFetchesSources(version)
+    ) {
       // An older bridge only receives sources inline in the poll response, and large ones never
       // get through to it: refuse now instead of failing a minute later as MUSE_BRIDGE_LOST.
       const total = spec.source_images.reduce((n, b) => n + base64DecodedBytes(b), 0)
@@ -683,7 +810,16 @@ export class MuseBridgeHub {
     this.reservedByUser.set(userId, { count: own.count + 1, credits: own.credits + price })
     try {
       // Other admissions of this account in this process, not yet in the database.
-      return await this.admit(userId, containerId, spec, pending, price, own.credits, opts.jobId)
+      return await this.admit(
+        userId,
+        containerId,
+        spec,
+        pending,
+        price,
+        own.credits,
+        opts.jobId,
+        origin,
+      )
     } finally {
       this.reservedTotal -= 1
       const left = (this.reserved.get(key) ?? 1) - 1
@@ -712,6 +848,7 @@ export class MuseBridgeHub {
     price: bigint,
     admittingCredits: bigint,
     fixedId?: string,
+    origin?: { sessionId: string; agentId: string },
   ): Promise<string> {
     const counts = await this.store.countRecent(userId, spec.kind)
     const [perHour, perDay] =
@@ -744,6 +881,21 @@ export class MuseBridgeHub {
       await this.billing.ensureBalance(userId, price + open + admittingCredits)
     }
     const id = fixedId ?? `mj_${randomUUID()}`
+    const nonce = randomUUID()
+    const durable: MuseDurableState | undefined = origin
+      ? {
+          ...origin,
+          spec,
+          nonce,
+          background: false,
+          backgroundFailures: 0,
+          retryCount: 0,
+          retryAt: 0,
+          state: 'queued',
+          expiresAt: 0,
+        }
+      : undefined
+    const leaseStart = this.now()
     try {
       await this.store.insertJob({
         id,
@@ -753,6 +905,9 @@ export class MuseBridgeHub {
         promptSha256: createHash('sha256').update(spec.prompt).digest(),
         promptPreview: spec.prompt.slice(0, 500),
         priceCredits: price,
+        admissionLimits: durable ? { queue: this.queueMax, user: this.userInflightMax } : undefined,
+        durable,
+        leaseOwner: durable ? this.owner : undefined,
         params: {
           orientation: spec.orientation ?? null,
           aspect_ratio: spec.aspect_ratio ?? null,
@@ -777,13 +932,24 @@ export class MuseBridgeHub {
       containerId,
       spec,
       state: 'queued',
-      nonce: randomUUID(),
+      nonce,
+      durable,
+      leaseOwner: this.owner,
+      leaseUntil: leaseStart + MUSE_LEASE_MS,
+      checkpoint: null,
+      checkpointCount: 0,
       queuedAt: now,
+      queuedMs: 0,
       dispatchedAt: 0,
       lastBeatAt: 0,
       deadlineAt: 0,
       dispatchCount: 0,
+      retryCount: 0,
+      retryAt: 0,
+      retryTimer: null,
       credentialId: null,
+      bridgeSessionId: null,
+      bridgeVersion: null,
       price,
       settling: false,
       uploads: new Map(),
@@ -797,6 +963,8 @@ export class MuseBridgeHub {
     this.jobs.set(id, job)
     this.queue.push(job)
     this.log.info('muse_media_job_queued', { jobId: id, userId, kind: spec.kind })
+    if (!this.bridgeOnline()) this.requeue(job, 'offline', this.offlineFailure())
+    if (durable) await job.checkpoint
     this.pump()
     return id
   }
@@ -815,6 +983,13 @@ export class MuseBridgeHub {
         job_id: rec.id,
         kind: rec.kind,
         status: rec.status,
+        ...(rec.durable
+          ? {
+              delivery: 'conversation' as const,
+              background: rec.durable.background,
+              retry_count: rec.durable.retryCount,
+            }
+          : {}),
         ...(files ? { files, snapshot_id: rec.snapshotId } : {}),
         ...(files && rec.debitedCredits !== null ? { charged_credits: rec.debitedCredits } : {}),
         ...(rec.errorCode
@@ -840,6 +1015,10 @@ export class MuseBridgeHub {
         timer.unref()
         job.waiters.add(done)
       })
+    }
+    if (job.durable) {
+      await job.checkpoint
+      await this.persisted.get(job.id)
     }
     return this.viewOf(job)
   }
@@ -868,14 +1047,18 @@ export class MuseBridgeHub {
   ): Promise<{ path: string; file: MuseFileView } | null> {
     const job = this.jobs.get(jobId)
     let files: MuseFileView[] | null = null
+    let durable = job?.durable
     if (job && job.userId === userId) {
       files = job.outcome?.ok ? job.outcome.files : null
     } else {
       const rec = await this.store.findJob(userId, jobId)
+      durable = rec?.durable
       files = rec?.status === 'succeeded' ? await this.storedFiles(rec) : null
     }
     const file = files?.find((f) => f.idx === idx)
-    return file ? { path: join(this.root, jobId, `${idx}.bin`), file } : null
+    return file
+      ? { path: join(this.root, jobId, ...(durable ? [durable.nonce] : []), `${idx}.bin`), file }
+      : null
   }
 
   /** A succeeded row's files, when every one is still in the state directory. */
@@ -885,7 +1068,9 @@ export class MuseBridgeHub {
     for (const [idx, f] of rec.files.entries()) {
       if (!MIME_EXT[f.mime]) return null
       try {
-        await access(join(this.root, rec.id, `${idx}.bin`))
+        await access(
+          join(this.root, rec.id, ...(rec.durable ? [rec.durable.nonce] : []), `${idx}.bin`),
+        )
       } catch {
         return null
       }
@@ -897,43 +1082,60 @@ export class MuseBridgeHub {
   // ── internals ────────────────────────────────────────────────────────────
 
   tick(): void {
+    if (this.stopped) return
     const now = this.now()
-    // A quiet bridge does not fail queued jobs. They wait out queueWaitMs (an hour in
-    // production). bridgeOnline() stays the signal the UI and studio affinity use.
+    if (this.durability && now - this.lastDurableTick >= 10_000) void this.durableTick()
+    for (const job of [...this.jobs.values()]) {
+      if (job.durable && job.state !== 'done' && now >= job.leaseUntil) this.forget(job)
+    }
+    for (const session of this.sessions.values()) {
+      if (
+        !this.sessionOnline(session) &&
+        ![...this.active.values()].some((job) => job.bridgeSessionId === session.id)
+      ) {
+        this.sessions.delete(session.id)
+        for (const w of [...this.waiters]) if (w.sessionId === session.id) this.dropWaiter(w)
+      }
+    }
+    // Retry delays use both timers and this sweep; tick also detects a quiet bridge.
     for (const a of [...this.active.values()]) {
       if (a.state === 'dispatched' && now - a.dispatchedAt > ACK_TIMEOUT_MS) {
-        if (a.dispatchCount >= MAX_DISPATCH_ATTEMPTS) {
-          this.log.warn('muse_job_never_acked', {
-            jobId: a.id,
-            attempts: a.dispatchCount,
-            claimResponseBytes: a.claimResponseBytes,
-          })
-          this.finish(a, fail('MUSE_BRIDGE_LOST', 'the bridge never acknowledged the job'))
-        } else {
-          this.log.warn('muse_job_ack_timeout_requeued', {
-            jobId: a.id,
-            attempt: a.dispatchCount,
-            claimResponseBytes: a.claimResponseBytes,
-          })
-          this.requeue(a)
-        }
+        this.log.warn('muse_job_ack_timeout_requeued', {
+          jobId: a.id,
+          attempt: a.dispatchCount,
+          claimResponseBytes: a.claimResponseBytes,
+        })
+        this.requeue(a, 'ack_timeout')
       } else if (a.state === 'running') {
         if (now - a.lastBeatAt > HEARTBEAT_LOST_MS) {
           this.requeue(a, 'heartbeat_lost')
         } else if (now > a.deadlineAt) {
-          this.finish(a, fail('MUSE_TIMEOUT', 'the job exceeded its deadline', true))
+          this.requeue(a, 'deadline', fail('MUSE_TIMEOUT', 'the job exceeded its deadline', true))
         }
       }
     }
     for (const job of [...this.queue]) {
-      if (now - job.queuedAt > this.queueWaitMs[job.spec.kind]) {
-        this.finish(job, fail('MUSE_BUSY', 'waited too long in the Muse queue', true))
+      if (job.retryAt > 0) {
+        if (now >= job.retryAt) this.retryReady(job)
+      } else if (!this.bridgeOnline() && !job.durable?.background) {
+        this.requeue(job, 'offline', this.offlineFailure())
+      }
+      if (job.durable?.background && now >= job.durable.expiresAt) {
+        this.finish(job, fail('MUSE_QUEUE_EXPIRED', 'Muse background queue expired'))
+      }
+      if (
+        !job.durable?.background &&
+        job.state === 'queued' &&
+        job.queuedMs + now - job.queuedAt > this.queueWaitMs[job.spec.kind]
+      ) {
+        if (job.durable) this.background(job)
+        else this.finish(job, fail('MUSE_BUSY', 'waited too long in the Muse queue', true))
       }
     }
     for (const [id, job] of this.jobs) {
       if (job.state === 'done' && now - job.finishedAt > DONE_RETAIN_MS) {
         this.jobs.delete(id)
-        void rm(join(this.root, id), { recursive: true, force: true })
+        if (!job.durable) void rm(join(this.root, id), { recursive: true, force: true })
       }
     }
     if (this.orphanGraceMs > 0 && now - this.lastOrphanSweep >= ORPHAN_SWEEP_MS) {
@@ -960,18 +1162,53 @@ export class MuseBridgeHub {
     return n
   }
 
-  private takeNext(): HubJob | null {
-    if (this.active.size >= this.concurrency) return null
-    const at = this.queue.findIndex((job) => this.runningFor(job.userId) < this.userRunningMax)
+  private canServe(session: Session, job: HubJob): boolean {
+    return bridgeFetchesSources(session.version) ||
+      (job.spec.source_images ?? []).reduce((n, b) => n + base64DecodedBytes(b), 0) <=
+        INLINE_SOURCE_MAX_BYTES
+  }
+
+  private takeNext(session: Session): HubJob | null {
+    if (
+      this.stopped || !this.sessionOnline(session) || this.active.size >= this.concurrency ||
+      [...this.active.values()].filter((job) => job.credentialId === session.credentialId).length >=
+        this.perBridgeConcurrency
+    ) return null
+    const at = this.queue.findIndex(
+      (job) =>
+        (!this.multiBridge || this.canServe(session, job)) &&
+        job.retryAt === 0 &&
+        job.checkpointCount === 0 &&
+        (!job.durable || this.now() < job.leaseUntil) &&
+        this.runningFor(job.userId) < this.userRunningMax,
+    )
     if (at < 0) return null
     const [job] = this.queue.splice(at, 1)
     const now = this.now()
+    // An offline submission may first encounter a legacy bridge when it reconnects.
+    if (
+      job!.spec.source_images?.length &&
+      !bridgeFetchesSources(session.version) &&
+      job!.spec.source_images.reduce((n, b) => n + base64DecodedBytes(b), 0) >
+        INLINE_SOURCE_MAX_BYTES
+    ) {
+      this.finish(
+        job!,
+        fail('MUSE_SOURCE_TOO_LARGE', 'source images exceed the connected bridge limit'),
+      )
+      return this.takeNext(session)
+    }
+    job!.queuedMs += now - job!.queuedAt
     job!.state = 'dispatched'
+    job!.bridgeSessionId = session.id
+    job!.bridgeVersion = session.version
+    job!.credentialId = session.credentialId
     job!.nonce = randomUUID()
     job!.dispatchedAt = now
     job!.deadlineAt = now + jobDeadlineMs(job!.spec)
     job!.dispatchCount += 1
     this.active.set(job!.id, job!)
+    this.checkpoint(job!)
     this.wakeQueued()
     return job!
   }
@@ -987,40 +1224,81 @@ export class MuseBridgeHub {
   }
 
   private pump(): void {
-    while (this.waiters.length > 0) {
-      const job = this.takeNext()
-      if (!job) return
-      const w = this.waiters.shift()!
-      clearTimeout(w.timer)
-      w.resolve(job)
+    if (this.pumping) return
+    this.pumping = true
+    try {
+      // A full/legacy bridge must not block another bridge's free compatible slot.
+      for (const w of [...this.waiters]) {
+        const session = this.sessions.get(w.sessionId)
+        if (!session || !this.sessionOnline(session)) {
+          this.dropWaiter(w)
+          continue
+        }
+        const job = this.takeNext(session)
+        if (!job) continue
+        this.removeWaiter(w)
+        w.resolve(job)
+      }
+    } finally {
+      this.pumping = false
     }
   }
 
-  private requeue(job: HubJob, reason?: string): void {
-    if (job.state === 'done' || job.settling) return
-    if (job.state !== 'dispatched' && job.state !== 'running') return
-    if (job.dispatchCount >= MAX_DISPATCH_ATTEMPTS) {
-      this.finish(
-        job,
-        fail('MUSE_BRIDGE_LOST', 'lost contact with the bridge too many times', true),
-      )
+  private offlineFailure(): Outcome {
+    return fail('MUSE_BRIDGE_OFFLINE', 'the Muse bridge is not connected', true)
+  }
+
+  private retryReady(job: HubJob): void {
+    if (job.state !== 'queued' || job.retryAt === 0 || this.now() < job.retryAt) return
+    if (job.retryTimer) clearTimeout(job.retryTimer)
+    job.retryTimer = null
+    job.retryAt = 0
+    this.checkpoint(job)
+    if (!this.bridgeOnline() && !job.durable?.background)
+      this.requeue(job, 'offline', this.offlineFailure())
+    else this.pump()
+  }
+
+  private requeue(
+    job: HubJob,
+    reason = 'bridge_lost',
+    outcome: Outcome = fail('MUSE_BRIDGE_LOST', 'lost contact with the bridge', true),
+  ): void {
+    if (job.state === 'done' || job.settling || job.retryAt > 0) return
+    if (job.durable?.background) {
+      if (job.durable.backgroundFailures >= this.retryMax) {
+        this.finish(job, outcome)
+        return
+      }
+      job.durable.backgroundFailures += 1
+    } else if (job.retryCount >= this.retryMax) {
+      if (job.durable) this.background(job)
+      else this.finish(job, outcome)
       return
     }
-    const wasRunning = job.state === 'running'
+    const oldNonce = job.nonce
     this.active.delete(job.id)
+    if (job.state !== 'queued') job.queuedAt = this.now()
     job.state = 'queued'
     job.nonce = randomUUID()
     job.uploads = new Map()
     job.uploadBusy = false
-    // Drop a partial upload so the next generation does not append to it.
-    // Synchronous: a promise rm can delete the next generation's upload, which is
-    // created as soon as the bridge polls again.
-    if (wasRunning) rmSync(join(this.root, job.id), { recursive: true, force: true })
-    this.queue.unshift(job)
+    // Each generation has its own staging directory; an old in-flight write cannot alter a
+    // later generation, even if it completes after this cleanup.
+    void rm(join(this.root, job.id, oldNonce), { recursive: true, force: true })
+    if (!job.durable?.background) job.retryCount += 1
+    job.retryAt = this.now() + this.retryIntervalMs
+    job.retryTimer = setTimeout(() => this.retryReady(job), this.retryIntervalMs)
+    job.retryTimer.unref()
+    if (!this.queue.includes(job)) this.queue.push(job)
+    this.checkpoint(job)
     this.wake(job)
-    if (reason) {
-      this.log.warn('muse_job_requeued', { jobId: job.id, attempt: job.dispatchCount, reason })
-    }
+    this.log.warn('muse_job_retry_scheduled', {
+      jobId: job.id,
+      retry: job.retryCount,
+      delayMs: this.retryIntervalMs,
+      reason,
+    })
     this.pump()
   }
 
@@ -1046,6 +1324,7 @@ export class MuseBridgeHub {
       !job ||
       this.active.get(jobId) !== job ||
       job.state === 'done' ||
+      (job.durable && (this.stopped || this.now() >= job.leaseUntil)) ||
       !nonce ||
       job.nonce !== nonce
     ) {
@@ -1066,6 +1345,9 @@ export class MuseBridgeHub {
     if (job.settling && !force) return
     job.settling = false
     job.state = 'done'
+    if (job.retryTimer) clearTimeout(job.retryTimer)
+    job.retryTimer = null
+    job.retryAt = 0
     job.outcome = outcome
     job.finishedAt = this.now()
     job.spec = { ...job.spec, source_images: undefined }
@@ -1077,23 +1359,36 @@ export class MuseBridgeHub {
       this.wakeQueued()
     }
     this.wake(job)
-    const write = this.store
-      .finishJob(job.id, {
-        status: outcome.ok ? 'succeeded' : outcome.status,
-        errorCode: outcome.ok ? null : outcome.code,
-        upstreamErrorCode: outcome.ok ? null : outcome.upstreamCode,
-        files: outcome.ok
-          ? outcome.files.map((f) => ({ mime: f.mime, bytes: f.bytes, sha256: f.sha256 }))
-          : null,
-        artifactIds: outcome.ok ? outcome.artifactIds : null,
-        snapshotId: outcome.ok ? outcome.snapshotId : null,
-      })
+    const prior = job.checkpoint ?? Promise.resolve()
+    const write = prior
+      .then(() =>
+        this.store.finishJob(
+          job.id,
+          {
+            status: outcome.ok ? 'succeeded' : outcome.status,
+            errorCode: outcome.ok ? null : outcome.code,
+            upstreamErrorCode: outcome.ok ? null : outcome.upstreamCode,
+            files: outcome.ok
+              ? outcome.files.map((f) => ({ mime: f.mime, bytes: f.bytes, sha256: f.sha256 }))
+              : null,
+            artifactIds: outcome.ok ? outcome.artifactIds : null,
+            snapshotId: outcome.ok ? outcome.snapshotId : null,
+          },
+          this.fence(job),
+        ),
+      )
       .catch((err) => {
         this.log.warn('muse_finish_persist_failed', { jobId: job.id, err: (err as Error).message })
+        if (job.durable) {
+          this.forget(job)
+          throw err
+        }
       })
       .finally(() => this.persisted.delete(job.id))
     this.persisted.set(job.id, write)
-    if (!outcome.ok) void rm(join(this.root, job.id), { recursive: true, force: true })
+    void write.catch(() => {})
+    if (!job.durable && !outcome.ok)
+      void rm(join(this.root, job.id), { recursive: true, force: true })
     this.log.info('muse_media_job_finished', {
       jobId: job.id,
       kind: job.spec.kind,
@@ -1106,8 +1401,201 @@ export class MuseBridgeHub {
     this.pump()
   }
 
+  private fence(job: HubJob): MuseFence | undefined {
+    return job.durable ? { owner: job.leaseOwner, nonce: job.nonce } : undefined
+  }
+
+  private checkpoint(job: HubJob): void {
+    if (!job.durable || !this.durability || job.state === 'done') return
+    const state: MuseDurableState = {
+      ...job.durable,
+      nonce: job.nonce,
+      state: job.state,
+      retryCount: job.retryCount,
+      retryAt: job.retryAt,
+    }
+    job.durable = state
+    const started = this.now()
+    job.checkpointCount += 1
+    const write = (job.checkpoint ?? Promise.resolve()).then(async () => {
+      if (this.jobs.get(job.id) !== job) throw new Error('MUSE_LOCAL_OWNER_GONE')
+      await this.durability!.save(job.id, job.leaseOwner, state)
+      job.leaseUntil = started + MUSE_LEASE_MS
+    })
+    job.checkpoint = write
+    void write
+      .catch(() => this.forget(job))
+      .finally(() => {
+        job.checkpointCount -= 1
+        this.wake(job)
+        this.pump()
+      })
+  }
+
+  private async wireAfterCheckpoint(job: HubJob): Promise<MuseWireJob | null> {
+    const nonce = job.nonce
+    try {
+      await job.checkpoint
+      this.requireActive(job.id, nonce)
+      return this.wire(job)
+    } catch {
+      return null
+    }
+  }
+
+  private async durableHeartbeat(job: HubJob): Promise<{ cancel: boolean }> {
+    const nonce = job.nonce
+    await job.checkpoint
+    this.requireActive(job.id, nonce)
+    if (job.state === 'dispatched') {
+      await this.store.markRunning(job.id, job.credentialId!, this.fence(job))
+      this.requireActive(job.id, nonce)
+      job.state = 'running'
+      this.checkpoint(job)
+      await job.checkpoint
+      this.requireActive(job.id, nonce)
+      this.wake(job)
+    }
+    job.lastBeatAt = this.now()
+    return { cancel: false }
+  }
+
+  private background(job: HubJob): void {
+    if (!job.durable || job.state === 'done') return
+    const oldNonce = job.nonce
+    this.active.delete(job.id)
+    job.nonce = randomUUID()
+    job.state = 'queued'
+    job.retryAt = 0
+    if (job.retryTimer) clearTimeout(job.retryTimer)
+    job.retryTimer = null
+    job.uploads = new Map()
+    job.uploadBusy = false
+    job.durable.background = true
+    job.durable.expiresAt = this.now() + MUSE_BACKGROUND_TTL_MS
+    if (!this.queue.includes(job)) this.queue.push(job)
+    void rm(join(this.root, job.id, oldNonce), { recursive: true, force: true })
+    this.checkpoint(job)
+    this.wake(job)
+    this.pump()
+  }
+
+  private forget(job: HubJob): void {
+    if (job.retryTimer) clearTimeout(job.retryTimer)
+    if (this.jobs.get(job.id) !== job) return
+    this.jobs.delete(job.id)
+    this.active.delete(job.id)
+    const i = this.queue.indexOf(job)
+    if (i >= 0) this.queue.splice(i, 1)
+    this.wake(job)
+  }
+
+  /** Renewal and expired-owner recovery share the durable journal, never a live waiter. */
+  async durableTick(): Promise<void> {
+    if (!this.durability || this.durableTickRunning || this.stopped) return
+    this.durableTickRunning = true
+    this.lastDurableTick = this.now()
+    try {
+      for (const job of this.jobs.values()) {
+        if (job.durable && job.state !== 'done') {
+          if (
+            job.durable.background &&
+            job.state === 'queued' &&
+            !this.bridgeOnline() &&
+            this.now() < job.durable.expiresAt
+          ) {
+            await job.checkpoint
+            await this.durability.release(job.id, job.leaseOwner)
+            this.forget(job)
+          } else this.checkpoint(job)
+        }
+      }
+      const room = Math.max(0, this.queueMax - this.queue.length - this.reservedTotal)
+      const started = this.now()
+      const claimOwner = randomUUID() // a new fencing identity even when this process reclaims its own expired lease
+      for (const row of await this.durability.claim(claimOwner, room, this.bridgeOnline())) {
+        if (this.stopped) break
+        this.restore(row, started, claimOwner)
+      }
+      if (!this.deliveryTick) {
+        // Large video copies must never hold up execution lease renewal.
+        this.deliveryTick = this.durability
+          .deliver()
+          .catch((err) => {
+            this.log.warn('muse_delivery_retry_pending', { error: (err as Error).message })
+          })
+          .finally(() => {
+            this.deliveryTick = null
+          })
+      }
+    } catch (err) {
+      this.log.warn('muse_durable_tick_failed', { error: (err as Error).message })
+    } finally {
+      this.durableTickRunning = false
+    }
+  }
+
+  private restore(row: MuseRecoveredJob, started: number, leaseOwner: string): void {
+    const d = row.durable
+    const previous = this.jobs.get(row.id)
+    if (previous) this.forget(previous)
+    const job: HubJob = {
+      id: row.id,
+      userId: row.userId,
+      containerId: row.containerId,
+      spec: d.spec,
+      state: 'queued',
+      nonce: randomUUID(),
+      durable: d,
+      leaseOwner,
+      leaseUntil: started + MUSE_LEASE_MS,
+      checkpoint: null,
+      checkpointCount: 0,
+      queuedAt: this.now(),
+      queuedMs: 0,
+      dispatchedAt: 0,
+      lastBeatAt: 0,
+      deadlineAt: 0,
+      dispatchCount: 0,
+      retryCount: d.retryCount,
+      retryAt: d.retryAt,
+      retryTimer: null,
+      credentialId: null,
+      bridgeSessionId: null,
+      bridgeVersion: null,
+      price: BigInt(row.price),
+      settling: false,
+      uploads: new Map(),
+      uploadBusy: false,
+      outcome: null,
+      finishedAt: 0,
+      waiters: new Set(),
+      sources: null,
+      claimResponseBytes: 0,
+    }
+    this.jobs.set(job.id, job)
+    this.queue.push(job)
+    if (d.background && this.now() >= d.expiresAt) {
+      this.checkpoint(job)
+      this.finish(job, fail('MUSE_QUEUE_EXPIRED', 'Muse background queue expired'))
+    } else if (d.state !== 'queued') {
+      job.retryAt = 0
+      this.requeue(job, 'owner_lost')
+    } else {
+      this.checkpoint(job)
+    }
+    this.pump()
+  }
+
   private viewOf(job: HubJob): MuseJobView {
-    const base = { job_id: job.id, kind: job.spec.kind }
+    const base = {
+      job_id: job.id,
+      kind: job.spec.kind,
+      retry_count: job.retryCount,
+      ...(job.durable
+        ? { delivery: 'conversation' as const, background: job.durable.background }
+        : {}),
+    }
     if (job.state === 'queued' || job.state === 'dispatched') {
       const pos = this.queue.indexOf(job)
       return {
@@ -1143,7 +1631,7 @@ export class MuseBridgeHub {
   private wire(job: HubJob): MuseWireJob {
     const s = job.spec
     const byRef =
-      Boolean(s.source_images?.length) && bridgeFetchesSources(this.session?.version ?? null)
+      Boolean(s.source_images?.length) && bridgeFetchesSources(job.bridgeVersion)
     const w: MuseWireJob = {
       id: job.id,
       nonce: job.nonce,

@@ -8182,7 +8182,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
         masterOnlyFrameType === "sys.recovery_status" || masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" ||
         // OCV5-591 A2-1c-2: studio activity is master-authored only.
-        masterOnlyFrameType === "sys.studio_event"
+        masterOnlyFrameType === "sys.studio_event" || masterOnlyFrameType === "sys.muse_result"
       ) {
         if (!loggedRejectedContainerIncident) {
           loggedRejectedContainerIncident = true;

@@ -164,10 +164,10 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
     })
   }
 
-  function requireSession(req: IncomingMessage): string {
+  function requireSession(req: IncomingMessage, credentialId: string): string {
     const raw = req.headers['x-muse-bridge-session']
     const sessionId = typeof raw === 'string' ? raw : undefined
-    const check = deps.hub.checkSession(sessionId)
+    const check = deps.hub.checkSession(sessionId, credentialId)
     if (check === 'superseded') {
       throw new MuseError(409, 'SUPERSEDED', 'a newer bridge session took over')
     }
@@ -209,7 +209,7 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
         return
       }
 
-      const sessionId = requireSession(req)
+      const sessionId = requireSession(req, credentialId)
       touch(credentialId, null)
 
       if (method === 'POST' && sub === '/poll') {
@@ -236,7 +236,7 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
           return
         }
         if (res.destroyed || res.writableEnded) {
-          deps.hub.undeliverable(job.id)
+          deps.hub.undeliverable(job.id, job.nonce)
           return
         }
         sendJson(res, 200, { job })
@@ -247,6 +247,7 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
       if (src && method === 'GET') {
         if (!JOB_ID_RE.test(src[1]!)) throw new MuseError(404, 'NOT_FOUND', 'not found')
         const nonce = String(req.headers['x-job-nonce'] ?? '')
+        deps.hub.requireAssignment(src[1]!, nonce, sessionId)
         const source = deps.hub.source(src[1]!, nonce, Number(src[2]))
         const size = source.data.length
         const range = parseByteRange(req.headers.range, size)
@@ -270,12 +271,14 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
       if (method === 'POST' && m[2] === 'heartbeat') {
         const body = await readJson(req, JSON_MAX_BYTES)
         const nonce = typeof body.job_nonce === 'string' ? body.job_nonce : ''
-        sendJson(res, 200, deps.hub.heartbeat(jobId, nonce))
+        deps.hub.requireAssignment(jobId, nonce, sessionId)
+        sendJson(res, 200, await deps.hub.heartbeat(jobId, nonce))
         return
       }
       if (method === 'POST' && m[2] === 'result') {
         const body = await readJson(req, JSON_MAX_BYTES)
         const nonce = typeof body.job_nonce === 'string' ? body.job_nonce : ''
+        deps.hub.requireAssignment(jobId, nonce, sessionId)
         await deps.hub.result(jobId, nonce, body)
         sendJson(res, 200, { ok: true })
         return
@@ -284,6 +287,7 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
         const nonce = String(req.headers['x-job-nonce'] ?? '')
         const sha = String(req.headers['x-chunk-sha256'] ?? '').toLowerCase()
         const data = await readBodyBuffer(req, MUSE_LIMITS.chunk_bytes)
+        deps.hub.requireAssignment(jobId, nonce, sessionId)
         await deps.hub.putChunk(jobId, nonce, Number(m[3]), Number(m[4]), data, sha)
         sendJson(res, 200, { ok: true })
         return

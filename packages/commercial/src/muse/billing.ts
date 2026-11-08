@@ -8,6 +8,7 @@
 // or orphaned jobs are never charged, so there is nothing to refund.
 
 import type { Pool } from 'pg'
+import type { MuseFence } from './durable.js'
 
 import { readTotalSpendableBalance } from '../billing/preCheck.js'
 import { spendTwoBucket } from '../billing/spend.js'
@@ -15,6 +16,7 @@ import { resolveOrgBillingContext } from '../org/orgBilling.js'
 import { MuseError, type MuseKind } from './protocol.js'
 
 export interface MuseSettleInput {
+  fence?: MuseFence
   jobId: string
   userId: string
   kind: MuseKind
@@ -88,6 +90,7 @@ export function createMuseBilling(
                   muse_artifact_ids = $4, muse_snapshot_id = $5, finished_at = NOW(),
                   cost_credits = $6, price_snapshot = $7
             WHERE id = $1 AND user_id = $2 AND status = 'running'
+            ${input.fence ? "AND lease_owner=$8 AND durable->>'nonce'=$9 AND lease_until>NOW()" : ''}
             RETURNING id`,
           [
             input.jobId,
@@ -97,6 +100,7 @@ export function createMuseBilling(
             input.snapshotId,
             input.price.toString(),
             JSON.stringify(snapshot),
+            ...(input.fence ? [input.fence.owner, input.fence.nonce] : []),
           ],
         )
         if (done.rowCount !== 1) throw new Error('MUSE_JOB_NOT_RUNNING')
