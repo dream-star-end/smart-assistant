@@ -9985,6 +9985,26 @@
           "assertion": "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE: a failed load is not cached: the next call loads again"
         }
       ]
+    },
+    {
+      "id": "INC-20261108-KP-SETUP-DRAIN",
+      "occurredAt": "2026-11-08",
+      "severity": "P1",
+      "symptom": "知识星球二维码生成失败后扫码 worker 继续占用容量直到总期限；原始二维码失败触发原因未证实。",
+      "rootFixCommit": "e00d1a14",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/knowledgePlanetLoginLifecycle.test.ts",
+          "assertion": "failed frame during Docker startup kills its exact container and releases the single slot"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/plugin-connect.node-test.mjs",
+          "assertion": "Knowledge Planet setup distinguishes QR failure from capacity, stops polling and retries cleanly"
+        }
+      ]
     }
   ]
 }
