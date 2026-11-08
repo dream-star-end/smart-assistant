@@ -26,40 +26,65 @@ def safe_dir(path, uid, mode=None):
 def login_paths(home, profile):
     need(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}',profile), 'invalid profile')
     return home/'.codex', home/'.oc-remote-codex'/'profiles'/profile/'codex-home'
+def login_layout(home, profile, state):
+    """Journal intent proves ownership; only the actual namespace proves progress."""
+    source,dest=login_paths(home,profile);uid=home.stat().st_uid
+    for p in [home/'.oc-remote-codex',home/'.oc-remote-codex/profiles',dest.parent]:
+        if os.path.lexists(p):
+            s=p.lstat();need(stat.S_ISDIR(s.st_mode) and s.st_uid==uid and not s.st_mode&0o022,'unsafe login ancestor')
+    if source.is_symlink():
+        need(source.readlink()==dest and dest.is_dir() and not dest.is_symlink(),'unexpected login symlink')
+        layout,login='linked',dest
+    elif source.is_dir() and not os.path.lexists(dest):layout,login='original',source
+    elif not os.path.lexists(source) and dest.is_dir() and not dest.is_symlink():layout,login='moved',dest
+    else:raise RuntimeError('ambiguous login layout; inspect source and canonical directories')
+    s=login.lstat();need(s.st_uid==uid,'login owner mismatch')
+    identity={'dev':s.st_dev,'ino':s.st_ino}
+    if state.get('loginIntent'):
+        need(state.get('loginIdentity')==identity,'login identity missing/mismatch; manual inspection required')
+    else:
+        need(layout=='original' and not state.get('loginMoved') and not state.get('loginRollbackIntent'),
+            'login migration has no durable identity/intent')
+    auth=login/'auth.json'
+    need(auth.is_file() and not auth.is_symlink() and auth.stat().st_uid==uid and auth.stat().st_nlink==1,'unsafe/missing login auth')
+    return layout,identity
+def sync_login_dirs(source,dest):
+    # Also run on recovery: a crash may have preceded the previous directory fsync.
+    for p in [source.parent,dest.parent]:
+        fd=os.open(p,os.O_DIRECTORY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
 def migrate_login(home, profile, state, checkpoint):
+    need(not state.get('loginRollbackIntent'),'login rollback in progress; finish rollback before installing')
     source,dest = login_paths(home,profile); uid=home.stat().st_uid
     for p in [home/'.oc-remote-codex',home/'.oc-remote-codex/profiles',dest.parent]: safe_dir(p,uid,0o700)
-    if source.is_symlink():
-        need(source.readlink() == dest and dest.is_dir() and not dest.is_symlink(), 'unexpected login symlink')
-        need(state.get('loginMoved') is True, 'login already migrated by another transaction')
-    else:
-        need(source.is_dir() and not dest.exists(), 'ambiguous login layout')
-        need(source.stat().st_uid == uid and source.stat().st_dev == dest.parent.stat().st_dev, 'login owner/device mismatch')
-        auth=source/'auth.json'; need(auth.is_file() and not auth.is_symlink() and auth.stat().st_nlink == 1, 'unsafe/missing auth')
+    layout,identity=login_layout(home,profile,state)
+    if not state.get('loginIntent'):
+        need(source.stat().st_dev == dest.parent.stat().st_dev, 'login device mismatch')
         for name in ['config.toml','AGENTS.md','AGENTS.override.md']:
             need(not (source/name).exists(), 'remove/review Codex configuration before migration: '+name)
-        # Intent is durable before rename; retry also handles crash between rename and symlink.
-        state['loginIntent']=True; checkpoint()
-        source.rename(dest); state['loginMoved']=True; checkpoint()
-        source.symlink_to(dest)
+        # Bind the directory, not auth.json: token refresh may atomically replace that file.
+        state['loginIdentity']=identity;state['loginIntent']=True;checkpoint()
+    if layout=='original':source.rename(dest)
+    sync_login_dirs(source,dest);state['loginMoved']=True;checkpoint()
+    if layout!='linked':source.symlink_to(dest)
+    sync_login_dirs(source,dest)
     os.chmod(dest,0o700)
-    auth=dest/'auth.json'; need(auth.is_file() and not auth.is_symlink() and auth.stat().st_uid == uid, 'unsafe auth')
-    os.chmod(auth,0o600)
+    os.chmod(dest/'auth.json',0o600)
+    need(login_layout(home,profile,state)[0]=='linked','login migration incomplete')
     checkpoint()
 def rollback_login(home,profile,state,checkpoint):
     source,dest=login_paths(home,profile)
-    if not state.get('loginMoved'): return
+    layout,_=login_layout(home,profile,state)
+    if not state.get('loginIntent'):return  # proven original layout; rename was never authorized
     if not state.get('loginRollbackIntent'):
-        need(source.is_symlink() and source.readlink()==dest and dest.is_dir() and not dest.is_symlink(), 'login rollback conflict')
         state['loginRollbackIntent']=True; checkpoint()
-    if source.is_symlink():
-        need(source.readlink()==dest and dest.is_dir() and not dest.is_symlink(), 'login rollback conflict')
-        source.unlink()
-    if dest.exists():
-        need(not source.exists() and not source.is_symlink() and dest.is_dir() and not dest.is_symlink(), 'login rollback conflict')
-        dest.rename(source)  # move CURRENT auth; never restore an expired token backup
-    need(source.is_dir() and not source.is_symlink() and not dest.exists(), 'login rollback conflict')
-    os.chmod(source,0o700); state['loginMoved']=False; checkpoint()
+    if layout=='linked':source.unlink();sync_login_dirs(source,dest)
+    if layout!='original':dest.rename(source)  # move CURRENT auth; never restore a token backup
+    sync_login_dirs(source,dest)
+    os.chmod(source,0o700);os.chmod(source/'auth.json',0o600)
+    need(login_layout(home,profile,state)[0]=='original','login rollback incomplete')
+    state['loginMoved']=False;checkpoint()
 def replace_key(text,blob,line,allow_probe=False):
     rows=text.splitlines(); matches=[i for i,r in enumerate(rows) if re.search(r'\bssh-ed25519 '+re.escape(blob)+r'(?:\s|$)',r)]
     need(len(matches)<=1,'duplicate key')
@@ -92,7 +117,6 @@ def main(packet):
         save=lambda: atomic(journal,json.dumps(state,sort_keys=True).encode())
         if packet['action']=='rollback':
             idle(home)
-            if state.get('rolledBack'): print(json.dumps({'ok':True,'action':'rollback','alreadyRolledBack':True})); return
             # Validate all CAS before first rollback write. Never restore over a concurrent admin edit.
             def file_bytes(path):
                 need(not path.is_symlink(), 'rollback symlink conflict')
@@ -109,6 +133,7 @@ def main(packet):
                 else: atomic(path,before(r),r['mode'],r['uid'],r['gid'])
             state['rolledBack']=True; save(); print(json.dumps({'ok':True,'action':'rollback','bundleRetained':True})); return
         need(not state.get('rolledBack'),'rolled-back transaction: inspect before a new installation')
+        need(not state.get('loginRollbackIntent'),'login rollback in progress; finish rollback before installing')
         idle(home)
         files={k:base64.b64decode(v,validate=True) for k,v in packet['files'].items()}
         need(set(files)==set(FILES)|{'codex-ssh-guard.py'},'bundle list mismatch')
@@ -154,9 +179,6 @@ def main(packet):
         new=replace_key(new,probe[1],probe_line,True)
         # All non-managed lines, including CC's forced command, are exactly preserved.
         managed(authkeys,new.encode(),0o600,uid,gid)
-        source,dest=login_paths(home,packet['profile'])
-        if state.get('loginIntent') and not source.exists() and not source.is_symlink() and dest.is_dir():
-            state['loginMoved']=True; source.symlink_to(dest); save()
         migrate_login(home,packet['profile'],state,save)
         state['complete']=True; save()
         print(json.dumps({'ok':True,'controller':ident,'profile':'default','budget':'MemTotal-768MiB','journal':str(journal)}))
