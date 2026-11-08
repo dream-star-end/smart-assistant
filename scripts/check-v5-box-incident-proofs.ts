@@ -2892,7 +2892,7 @@ async function main(): Promise<void> {
         return proof;
       }), await proveNativeResumedStop(api, db),
       await proveUid4FirstFailurePreserved(uid4Context(db)),
-      await proveUid4StoppedWorkerConverges(uid4Context(db)),
+      await proveUid4StoppedWorkerConverges(uid4Context(db)), await (await import("./lib/boxIdleCandidateProof.js")).proveIdleCandidateRecovery(CANDIDATE), // [t1642u-box-idle-recovery] PASS
       await proveOutputLimitResume(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),

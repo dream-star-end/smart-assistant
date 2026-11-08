@@ -1,3 +1,4 @@
+import { fenceIdleReset } from './boxIdleCandidateRecovery.js'
 import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
 /**
  * Session runner lifecycle: preheat, repo-change recycle, eviction loop, shutdown/destroy, idle drain, execution target and model switch
@@ -611,7 +612,7 @@ export async function applyIdleResetIfRequested(
     log.error('box idle reset marker invalid; ignored', { sessionKey: session.sessionKey })
     return
   }
-  if (session.runner.isRunning) await session.runner.shutdown().catch(() => {})
+  await fenceIdleReset(session.runner, paths.home, session.sessionKey)
   const sessionKey = session.sessionKey
   this._resumeMap.delete(sessionKey)
   this._resumeMapTimestamps.delete(sessionKey)
@@ -625,6 +626,8 @@ export async function applyIdleResetIfRequested(
   const abandoned = abandonAllIdle(paths.home, sessionKey)
   consumeIdleReset(paths.home, sessionKey)
   pruneIdleOps(paths.home, sessionKey)
+  session._historicalContextInjected = false
+  session._historicalContextInjectedKey = undefined
   log.warn('box idle reset applied: native session replaced', { sessionKey, abandoned })
 }
 

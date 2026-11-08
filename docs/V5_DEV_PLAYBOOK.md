@@ -339,6 +339,13 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 
 turn_tape 作业重试以 `db/turnTapeJobs.ts` 为权威：物化第 8 次、结算第 30 次失败进入 `failed`，调度器只认领 queued / 租约过期 leased；不通过重领 failed 自愈。`ops.tape_job_stuck` 按 job + UTC 日期去重，覆盖 failed 与创建超过 1h 的 awaiting_materialization、超过 24h 的 late_tape_after_fence。告警不释放 held、不改账；缺 parentTurnKey 的历史 tape 仍需另行批准读兼容，不手工标 complete。
 
+Box 失败后 `IDLE_HISTORY_PENDING`（t1642u）：先分清裸 source candidate 与已派发 compact op。
+候选闸在模型设置之前，因此切 GPT 也不会绕过；`continuation_unknown` 不等于未执行。
+恢复只在本地 runner shutdown + stdout drain 后请求精确 session/turn 的官方 stop，再读
+终态 proof；年龄只触发恢复，stop ACK、配置缺失、已见 pending 后的 not_found 都不释放。
+operator reset marker 同样保留到所有耐久身份可证明终态；完整历史不删除。
+现场证据与未证实项、#1379 的 prepared-apply 边界见 [t1642u](T1642U_BOX_IDLE_RECOVERY.md)。
+
 ### 3.4 计费问题
 usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;codex 跨桥重连计费走 journal 权威。造数验证用 psql 必须显式 COMMIT。
 
