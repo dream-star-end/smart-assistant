@@ -1,4 +1,4 @@
-import { recoverIdleCandidate } from './boxIdleCandidateRecovery.js'
+import { recoverIdleCandidate, markIdleCandidatePending } from './boxIdleCandidateRecovery.js'
 import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 /**
@@ -264,11 +264,12 @@ function writeSettledIdleOp(recoveryDir: string, op: IdleOp): void {
 async function waitBoxIdleProof(input: {
   sessionId: string
   turnKey: string
-}): Promise<IdleProofResponse> {
+}, onPending: () => void): Promise<IdleProofResponse> {
   const deadline = Date.now() + idleProofWaitMs()
   let delay = 1000
   for (;;) {
     const proof = await fetchBoxIdleProof(input)
+    if (proof.status === 'pending') onPending()
     if (proof.status !== 'pending' || Date.now() + delay > deadline) return proof
     await new Promise((resolve) => setTimeout(resolve, delay))
     delay = Math.min(delay * 2, 8000)
@@ -2253,17 +2254,16 @@ export async function finishIdleUnderLock(
 ): Promise<void> {
   if (session._idleRunning) return
   const pending = readPendingIdle(recoveryDir, session.sessionKey)
-  const candidate = readIdleCandidate(recoveryDir, session.sessionKey)
+  let candidate = readIdleCandidate(recoveryDir, session.sessionKey)
   if (!pending && !candidate) return
   // OCV5-377: stop an idle summary turn parked on a tool call before reading
   // proofs; its open handoff keeps both proofs pending (see stopParkedIdleTurn).
   if (pending) await stopParkedIdleTurn(withIncarnationShutdown(recoveryDir, pending))
-  let proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
+  let proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey }, () => {
+    if (candidate) candidate = markIdleCandidatePending(recoveryDir, candidate)
+  })
   if (!pending && candidate) {
     proof = await recoverIdleCandidate({ dir: recoveryDir, candidate, runner: session.runner, proof })
-  }
-  if (pending && candidate && proof.status === 'pending' && !candidate.observedPending) {
-    writeIdleCandidate(recoveryDir, { ...candidate, observedPending: true })
   }
   if (proof.status === 'not_found' && candidate?.observedPending) {
     proof = { status: 'pending', reason: 'source_proof_missing' }

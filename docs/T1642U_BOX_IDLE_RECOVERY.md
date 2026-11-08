@@ -54,7 +54,8 @@ sessionSubmit and should be reconciled explicitly when coordinating parity.
 `boxIdleCandidateRecovery.test.ts` drives real SessionManager submit and idle
 recovery with a neutral engine and local proof endpoint: failed Box turn,
 protected pending submit, fresh manager recovery, same/different model, legacy
-candidate, missing proof, failed shutdown, and operator reset. It asserts no
+candidate, pending-to-missing within one poll, missing proof after reset and background
+drain, failed shutdown, and reset with multiple unfinished operations. It asserts no
 extra engine call or persisted final during a blocked submission, exactly one
 subsequent turn/final, and preservation of existing history. This is not a live
 Box or PG wallet billing E2E. Existing remote cleanup / stop coordinator tests

@@ -35,6 +35,9 @@ export async function proveBoxIdleCandidateRecovery(): Promise<string> {
   let proofMode: 'unknown' | 'failed' | 'missing' = 'unknown'
   let closeOnStop = false
   let protectedTurn: string | undefined
+  const proofSequence: Array<'unknown' | 'failed' | 'missing'> = []
+  let pollCandidateKey: string | undefined
+  let persistedBeforeSecondPoll = false
   const server = createServer((req, res) => {
     if (req.url?.startsWith('/internal/v3/marketplace/sync')) {
       res.end(JSON.stringify({ agents: [], skills: [], identityCompat: { schema: 1, userId: '3', profiles: [] } })); return
@@ -51,8 +54,10 @@ export async function proveBoxIdleCandidateRecovery(): Promise<string> {
         // Even a positive ACK must not release without a subsequent proof.
         res.end(JSON.stringify({ status: 'stopped' })); return
       }
-      if (proofMode === 'missing') { res.statusCode = 404; res.end('{}'); return }
-      res.end(JSON.stringify(proofMode === 'failed' && body.oc_turn_key !== protectedTurn
+      const currentProof = proofSequence.shift() ?? proofMode
+      if (currentProof === 'missing' && pollCandidateKey) persistedBeforeSecondPoll = idle.readIdleCandidate(home, pollCandidateKey)?.observedPending === true
+      if (currentProof === 'missing') { res.statusCode = 404; res.end('{}'); return }
+      res.end(JSON.stringify(currentProof === 'failed' && body.oc_turn_key !== protectedTurn
         ? { status: 'failed', sessionId: body.session_id, turnKey: body.oc_turn_key, requestIds: ['original-box-run'] }
         : { status: 'pending', reason: 'continuation_unknown' }))
     })
@@ -189,6 +194,16 @@ export async function proveBoxIdleCandidateRecovery(): Promise<string> {
     assert.equal(calls.filter(c => c.path.endsWith('/stop')).length, stops, 'young continuation is allowed to finish')
     assert.equal(young.runner.inputs.length, 0)
 
+    const polling = fixture(); polling.seed(false)
+    pollCandidateKey = polling.key
+    proofSequence.push('unknown', 'missing')
+    process.env.OC_BOX_IDLE_PROOF_WAIT_MS = '2000'
+    await assert.rejects(polling.submit(), /IDLE_HISTORY_PENDING/, 'pending then missing within one poll must remain fenced')
+    assert.equal(persistedBeforeSecondPoll, true, 'pending is durable before the second poll or a restart')
+    assert.equal(polling.runner.inputs.length, 0)
+    pollCandidateKey = undefined
+    process.env.OC_BOX_IDLE_PROOF_WAIT_MS = '0'
+
     const missing = fixture(); missing.seed()
     proofMode = 'unknown'; closeOnStop = false
     await assert.rejects(missing.submit(), /IDLE_HISTORY_PENDING/)
@@ -216,7 +231,14 @@ export async function proveBoxIdleCandidateRecovery(): Promise<string> {
     assert.ok(idle.readIdleReset(home, reset.key), 'reset intent survives ambiguous stop')
     assert.equal(reset.session.ccbSessionId, 'native-t1642u')
     assert.ok(idle.readIdleCandidate(home, reset.key))
-    closeOnStop = true
+    assert.equal(idle.readIdleCandidate(home, reset.key)?.observedPending, true, 'reset persists its pending observation')
+    proofMode = 'missing'
+    await (reset.manager as unknown as { finishIdleUnderLock(s: AgentSession, source: { sessionId: string; turnKey: string }, dir: string): Promise<void> })
+      .finishIdleUnderLock(reset.session, { sessionId: 'native-t1642u', turnKey: 'd'.repeat(64) }, home)
+    assert.ok(idle.readIdleCandidate(home, reset.key), 'background drain cannot erase pending reset identity on missing proof')
+    await assert.rejects(reset.submit(modelGpt), /IDLE_HISTORY_PENDING/)
+    assert.ok(idle.readIdleReset(home, reset.key))
+    proofMode = 'unknown'; closeOnStop = true
     await reset.submit(modelGpt)
     assert.equal(idle.readIdleReset(home, reset.key), undefined)
     assert.equal(reset.session.ccbSessionId, null)
