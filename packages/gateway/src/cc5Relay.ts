@@ -93,7 +93,9 @@ function reply(res: ServerResponse, value: unknown): void {
 }
 
 export class Cc5Relay {
-  readonly controlServer = createServer((req, res) => {
+  // /session/open keeps its request body open across turns and /roundtrip may run up to 720s;
+  // disable Node's default 300s requestTimeout so checkConnections never aborts active streams.
+  readonly controlServer = createServer({ requestTimeout: 0 }, (req, res) => {
     void this.control(req, res).catch(() => {
       if (res.headersSent) {
         res.destroy()
@@ -103,7 +105,7 @@ export class Cc5Relay {
       res.end('{"ok":false,"error":"CC5_RELAY_REJECTED"}')
     })
   })
-  readonly toolServer = createServer((req, res) => {
+  readonly toolServer = createServer({ requestTimeout: 0 }, (req, res) => {
     void this.tool(req, res).catch(() => {
       if (this.toolBurned) void this.stop().catch(() => {})
       if (res.headersSent) {

@@ -403,6 +403,7 @@ export async function runCc5StdioBridge(input: {
                 fail('CC5_ORIGINAL_TOOL_OBSERVATION_INVALID')
                 return
               }
+              reconnectCount = 0
               // Exact original authenticated host bytes. No screen scraping or replacement result.
               if (!input.stdout.write(forward)) res.pause()
             })
