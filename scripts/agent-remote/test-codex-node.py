@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Behavior tests: native observation + actual stdio/AF_UNIX + real container file effects."""
+import base64
+import fcntl
+import importlib.util
+import json
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+import tempfile
+import unittest
+HERE=Path(__file__).resolve().parent
+
+def load(name):
+    spec=importlib.util.spec_from_file_location(name,HERE/name)
+    mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod);return mod
+client=load('codex-fixed-mcp.py'); ctrl=load('codex-host-controller.py')
+
+class NodeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='oc-codex-test-');self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);os.chmod(self.root,0o700)
+        self.m={'operationId':'operation','runId':'run','generation':'1','nativeThreadId':None,'model':'fixture-model'}
+        self.catalog={'tools':[{'name':'write_marker','description':'Append one container marker','inputSchema':{'type':'object'}}]}
+        self.write('tools.json',self.catalog)
+        self.config={'version':3,'engine':'codex',**self.m,'catalogSha256':client.hashlib.sha256((self.root/'tools.json').read_bytes()).hexdigest()}
+        self.write('client.json',self.config)
+        self.write('model-list.json',[{'id':'fixture-model','supportedReasoningEfforts':[{'reasoningEffort':'low'}]}])
+        (self.root/'observations').mkdir(mode=0o700)
+        (self.root/'codex-fixed-mcp.py').write_bytes((HERE/'codex-fixed-mcp.py').read_bytes());os.chmod(self.root/'codex-fixed-mcp.py',0o400)
+        self.policy=ctrl.Policy(self.root,self.m,client);self.policy.thread='thread';self.policy.turn='turn';self.policy.initialized=True
+        self.params={'name':'write_marker','arguments':{'value':'container-unique'},'_meta':{'callId':'call-a','itemId':'ctc-unrelated','threadId':'thread','x-codex-turn-metadata':{'turn_id':'turn'}}}
+    def write(self,name,value):
+        (self.root/name).write_text(json.dumps(value));os.chmod(self.root/name,0o600)
+    def event(self,**overrides):
+        item={'id':'call-a','type':'mcpToolCall','server':'ocbridge','tool':'write_marker','arguments':self.params['arguments'],**overrides}
+        return {'method':'item/started','params':{'threadId':'thread','turnId':'turn','item':item}}
+    def body(self): return client.request_body(self.config,self.catalog,7,self.params)
+    def socket(self):
+        p=subprocess.Popen([sys.executable,'-I','-B',str(HERE/'codex-mcp-socket.py'),str(self.root)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        def cleanup():
+            if p.poll() is None: p.kill()
+            p.communicate(timeout=5)
+        self.addCleanup(cleanup)
+        ready=self.read(p);self.assertEqual(ready['kind'],'socket-ready');return p
+    def read(self,p):
+        self.assertTrue(select.select([p.stdout],[],[],5)[0],'socket did not emit')
+        line=p.stdout.readline();self.assertTrue(line,p.stderr.read().decode() if p.poll() is not None else 'EOF');return json.loads(line)
+    def invoke(self):
+        p=subprocess.Popen([sys.executable,'-I','-B',str(HERE/'codex-fixed-mcp.py'),str(self.root)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        request={'jsonrpc':'2.0','id':7,'method':'tools/call','params':self.params}
+        p.stdin.write((json.dumps(request)+'\n').encode());p.stdin.flush()
+        self.addCleanup(lambda: p.kill() if p.poll() is None else None)
+        return p
+    def test_real_socket_call_observed_once_writes_container_marker(self):
+        self.policy.outgoing(self.event()); sock=self.socket(); mcp=self.invoke()
+        req=self.read(sock);self.assertEqual(req['version'],3)
+        body=json.loads(base64.b64decode(req['body']));self.assertEqual(body['callId'],'call-a');self.assertEqual(body['rpcId'],7)
+        # This is the container execution boundary, not a mock function call count.
+        marker=self.root/'container-marker';marker.write_text(body['arguments']['value']+'\n')
+        result={k:body[k] for k in client.IDENTITY};result.update(version=3,engine='codex',ok=True,result={'content':[{'type':'text','text':marker.read_text()}],'isError':False})
+        response={'version':3,'engine':'codex','kind':'tool-response','seq':req['seq'],'status':200,'body':base64.b64encode(json.dumps(result).encode()).decode()}
+        sock.stdin.write((json.dumps(response)+'\n').encode());sock.stdin.flush()
+        reply=self.read(mcp);self.assertEqual(reply['result']['content'][0]['text'],'container-unique\n')
+        mcp.stdin.close();mcp.wait(timeout=5);mcp.stdout.close();mcp.stderr.close()
+        duplicate=self.invoke();out,_=duplicate.communicate(timeout=5)
+        self.assertIn('error',json.loads(out));self.assertEqual(marker.read_text(),'container-unique\n')
+    def test_unobserved_call_has_no_container_dispatch(self):
+        sock=self.socket();mcp=self.invoke();out,_=mcp.communicate(timeout=5)
+        self.assertIn('error',json.loads(out));self.assertFalse(select.select([sock.stdout],[],[],.1)[0])
+        self.assertEqual(list((self.root/'tool-attempts').glob('*.attempt.json')),[])
+    def test_wrong_args_do_not_dispatch(self):
+        self.policy.outgoing(self.event());self.params['arguments']={'value':'forged'}
+        sock=self.socket();mcp=self.invoke();out,_=mcp.communicate(timeout=5)
+        self.assertIn('error',json.loads(out));self.assertEqual(list((self.root/'tool-attempts').glob('*')),[])
+    def test_item_id_is_not_call_id(self):
+        self.params['_meta'].pop('callId')
+        with self.assertRaises(ValueError):self.body()
+    def test_unknown_item_and_foreign_server_are_fatal(self):
+        for item in [{'type':'commandExecution'},{'server':'foreign'}]:
+            with self.assertRaisesRegex(ValueError,'CODEX_NATIVE_ITEM_REJECTED'):self.policy.outgoing(self.event(**item))
+        self.assertEqual(list((self.root/'observations').iterdir()),[])
+    def test_reverse_rpc_and_arbitrary_input_rejected(self):
+        with self.assertRaisesRegex(ValueError,'CODEX_SERVER_REQUEST_REJECTED'):
+            self.policy.outgoing({'id':4,'method':'item/tool/requestUserInput','params':{}})
+        for method in ['command/exec','config/write','thread/shellCommand']:
+            with self.assertRaisesRegex(ValueError,'CODEX_RPC_REJECTED'):
+                self.policy.incoming({'id':method,'method':method,'params':{}})
+    def test_turn_policy_reasserted_and_wrong_thread_rejected(self):
+        self.policy.turn=None
+        frame=self.policy.incoming({'id':1,'method':'turn/start','params':{'threadId':'thread','input':[{'type':'text','text':'Hi'}],
+            'effort':'low','sandboxPolicy':{'type':'dangerFullAccess'},'cwd':'/home/box','model':'another'}})
+        self.assertEqual(frame['params']['sandboxPolicy']['type'],'readOnly');self.assertEqual(frame['params']['model'],'fixture-model')
+        with self.assertRaisesRegex(ValueError,'CODEX_RPC_REJECTED'):
+            self.policy.incoming({'id':2,'method':'turn/start','params':{'threadId':'foreign','input':[]}})
+    def test_pinned_catalog_excludes_unobserved_models_and_disables_native_tools(self):
+        result=ctrl.pinned_catalog([{'id':'visible'}],{'models':[{'slug':'visible','tool_mode':'code_mode_only'},{'slug':'cache-only'}]})
+        self.assertEqual([m['slug'] for m in result['models']],['visible']);self.assertEqual(result['models'][0]['tool_mode'],'direct')
+        self.assertIsNone(result['models'][0]['apply_patch_tool_type'])
+        with self.assertRaises(ValueError):ctrl.pinned_catalog([{'id':'missing'}],{'models':[]})
+    def test_stop_proof_cannot_race_pre_scope_writer(self):
+        ctrl.fence(self.root,{**self.m,'profileId':'p','authEpoch':'1'})
+        fd=ctrl.lock(self.root/'APP-WRITER.lock')
+        try:
+            with self.assertRaisesRegex(ValueError,'CODEX_PROFILE_BUSY'):
+                ctrl.proof(self.root,{**self.m,'profileId':'p','authEpoch':'1'},None)
+        finally: os.close(fd)
+    def test_ssh_guard_exact_roles_digest_and_immutable_path(self):
+        guard=load('codex-ssh-guard.py')
+        trusted=Path('/usr/bin/true').resolve()
+        config={'rootPrefix':'/home/box/oc-codexremote-', 'controllers':[{'path':str(trusted),'sha256':client.hashlib.sha256(trusted.read_bytes()).hexdigest()}]}
+        args=['/usr/bin/python3','-I','-B',str(trusted),'stop','/home/box/oc-codexremote-'+'a'*16]
+        command=' '.join(guard.quote(x) for x in args)
+        self.assertEqual(guard.verified_argv(command,config),args)
+        for changed in [args[:4]+['_worker',args[5]],args+['--model','extra']]:
+            with self.assertRaises(ValueError):guard.verified_argv(' '.join(guard.quote(x) for x in changed),config)
+        unsafe=self.root/'controller.py';unsafe.write_text('print(1)')
+        config['controllers']=[{'path':str(unsafe),'sha256':client.hashlib.sha256(unsafe.read_bytes()).hexdigest()}]
+        args[3]=str(unsafe)
+        with self.assertRaises(ValueError):guard.verified_argv(' '.join(guard.quote(x) for x in args),config)
+    def test_mismatched_receipt_cannot_become_success(self):
+        body=self.body();value={k:body[k] for k in client.IDENTITY};value.update(version=3,engine='codex',ok=True,result={'content':[],'isError':False})
+        for key in ['generation','callId','nativeThreadId','nativeTurnId','inputSha256']:
+            with self.assertRaises(ValueError):client.validate_response({**value,key:'wrong'},body)
+if __name__=='__main__':unittest.main()

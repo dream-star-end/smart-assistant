@@ -266,7 +266,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
     assert.equal(probe.gate_g.ok, true)
     assert.equal(probe.gate_g.cc_print_mode_blocked, true)
     for (const p of probe.profiles) {
-      assert.equal(p.runner_mode, 'interactive')
+      assert.equal(p.runner_mode, p.engine === 'codex' ? 'app-server' : 'interactive')
     }
 
     const selfCheckRaw = execFileSync('python3', [scriptPath, '--self-check'], { encoding: 'utf8' })
@@ -434,13 +434,13 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       )
       assert.notEqual(ccProfs[0]?.account_fingerprint, ccProfs[1]?.account_fingerprint)
 
-      const codexProfs = multiProbe.profiles.filter((p) => p.engine === 'codex' && p.logged_in)
+      // Auth-file strings/available_models are not native Codex observations. These
+      // fixtures have no app-server exchange, so keep negative profile facts (OCV5-746).
+      // Real multi-profile model/list success is covered by test-codex-probe.py.
+      const codexProfs = multiProbe.profiles.filter((p) => p.engine === 'codex')
       assert.equal(codexProfs.length, 2)
-      assert.deepEqual(
-        codexProfs.map((p) => p.profile_name).sort(),
-        ['account2', 'default'],
-      )
-      assert.notEqual(codexProfs[0]?.account_fingerprint, codexProfs[1]?.account_fingerprint)
+      assert.ok(codexProfs.every((p) => !p.logged_in))
+      assert.deepEqual(codexProfs.map((p) => p.profile_name).sort(), ['account2', 'default'])
     } finally {
       rmSync(fakeHome, { recursive: true, force: true })
     }
