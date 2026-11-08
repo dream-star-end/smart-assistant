@@ -33,6 +33,7 @@ import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { EventEmitter } from 'node:events'
 import type {
   CallTokenUsageSnapshot,
+  CodexExecutionBackend,
   GoalStateSnapshot,
   JobTerminal,
   TurnTokenUsageSnapshot,
@@ -45,6 +46,7 @@ import { createLogger } from '../logger.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { SdkMessage, UsageAttributionTag } from '../subprocessRunner.js'
 import { asCcbSessionTotals } from './ccbAdapter.js'
+import { CodexRemoteLane, type CodexRemoteLaneOptions } from '../codexRemoteLane.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import type { CodexProviderConfigOverride } from './codexShared.js'
 import type {
@@ -819,5 +821,58 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 }
 
+/**
+ * Codex on a remote pool node. The protocol kernel is the local one; only the process boundary
+ * is replaced by the master relay lane, whose tool host runs real tools in this container.
+ * The lane is admitted per turn before the kernel may write its first frame.
+ */
+export class CodexRemoteAdapter extends CodexAdapter {
+  // Identical to the local adapter except native compaction: a remote thread's rollout lives on
+  // the node, so the container never compacts it.
+  override readonly capabilities: EngineCapabilities = {
+    billingMode: 'engine-reported',
+    supportsEffort: true,
+    resumeKind: 'codex-thread',
+    needsServerRequestId: true,
+    historyMode: 'native-resume',
+    permissionModel: 'native',
+    emitsCallUsage: true,
+    emitsToolInputDeltas: true,
+    supportsNativeCompact: false,
+    multimodalInput: 'native',
+  }
+  private readonly lane: CodexRemoteLane
+
+  constructor(opts: EngineCreateOpts, laneOptions: CodexRemoteLaneOptions = {}) {
+    const lane = new CodexRemoteLane(opts, laneOptions)
+    super(opts, lane.kernel)
+    this.lane = lane
+  }
+
+  get executionBackend(): CodexExecutionBackend { return this.lane.backend }
+
+  /** Session-open preheat would need an admitted turn; a remote lane starts on its first turn. */
+  override preheat(): Promise<void> {
+    return Promise.resolve()
+  }
+
+  override submitTurn(params: TurnParams): EngineTurnRun {
+    this.lane.beginTurn(params)
+    return super.submitTurn(params)
+  }
+
+  override async shutdown(): Promise<void> {
+    try {
+      await this.lane.stopLane()
+    } finally {
+      await super.shutdown()
+    }
+  }
+}
+
 // ── registry 注册(import 本模块即生效;sessionManager 顶部显式 import)──────
-registerEngine('codex', (opts) => new CodexAdapter(opts))
+registerEngine('codex', (opts) =>
+  opts.executionBackend?.kind === 'codex-app-server-v1'
+    ? new CodexRemoteAdapter(opts)
+    : new CodexAdapter(opts),
+)

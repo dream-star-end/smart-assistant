@@ -193,8 +193,6 @@ export function createEngine(engineId: string, opts: EngineCreateOpts): EngineAd
   if (!isEngineEnabled(engineId)) {
     throw new EngineNotEnabledError(engineId)
   }
-  // Segment 3 installs the remote Codex adapter. Until then never fall back locally.
-  if (opts.executionBackend?.kind === 'codex-app-server-v1') throw new Error('CODEX_REMOTE_ADAPTER_UNAVAILABLE')
   const factory = engineFactories.get(engineId)
   if (!factory) {
     throw new Error(

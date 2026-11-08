@@ -47,7 +47,15 @@ export class CodexRemoteRelay {
   private output: Array<{ seq: number; frame: unknown }> = []
   private outputBytes = 0
   private outputTail = Promise.resolve()
-  private readonly pending = new Map<string, string>()
+  /**
+   * Kernel request ids restart in every admission (a recycled kernel is a new client), so the
+   * relay hands the app a lane-unique id and maps the answer back. An answer to an abandoned
+   * admission is recognized by its epoch and dropped: it must never collide with the fresh
+   * kernel's own numbering.
+   */
+  private readonly laneIds = new Map<number, { kernelId: unknown; method: string; epoch: number }>()
+  private laneIdSeq = 0
+  private epoch = 0
   private readonly usedIds = new Set<string>()
   private readonly usedAuthorities = new Set<string>()
   private tools = new Map<string, Tool>()
@@ -137,6 +145,10 @@ export class CodexRemoteRelay {
     codexNeed(!this.catalogHash || this.catalogHash === catalogHash)
     this.catalogHash = catalogHash
     // Lane lifetime is not this admission's effect state (a resident app may serve many turns).
+    // JSON-RPC ids restart with the container's kernel, so replay protection is per admission,
+    // not per lane: a restart after a cancel is a new client, not a repeated frame.
+    this.usedIds.clear()
+    this.epoch++
     this.turnHostAttempted = false; this.dispatching = false; this.financeTurn = undefined
     this.financeTurn = await this.finance.admit({ binding: this.binding, authorityEnvelope: v.authority,
       leaseEnvelope: v.lease, sessionKey: this.binding.sessionKey, turnKey: v.turnKey })
@@ -234,16 +246,26 @@ export class CodexRemoteRelay {
       if (previous) { codexNeed(previous === cc5ToolInputSha256(frame), 'CODEX_TERMINAL_CONFLICT'); return }
     }
     this.observation!.observe(frame)
+    let out = frame
     if (frame.id !== undefined) {
-      const method = this.pending.get(JSON.stringify(frame.id)); codexNeed(method)
-      this.pending.delete(JSON.stringify(frame.id))
-      if (['thread/start','thread/resume'].includes(method) && !frame.error) {
+      // Answers only ever come back on ids this relay minted itself (see translate()).
+      const entry = this.laneIds.get(frame.id)
+      codexNeed(typeof frame.id === 'number' && frame.method === undefined && entry !== undefined,
+        'CODEX_UNKNOWN_RESPONSE')
+      this.laneIds.delete(frame.id)
+      if (entry.epoch !== this.epoch) {
+        // The kernel that asked is gone: its answer is not this admission's stream.
+        this.record('stale-response', { id: frame.id, method: entry.method })
+        return
+      }
+      out = { ...frame, id: entry.kernelId }
+      if (['thread/start','thread/resume'].includes(entry.method) && !frame.error) {
         const id = frame.result?.thread?.id
         codexNeed(typeof id === 'string' && frame.result.model === this.spec.manifest.model &&
           (!this.spec.manifest.nativeThreadId || id === this.spec.manifest.nativeThreadId))
         this.observation!.bindThread(id); this.thread = id
         codexNeed(this.financeTurn?.bindNativeThread)
-        this.baseline = await this.financeTurn.bindNativeThread(id, method === 'thread/start')
+        this.baseline = await this.financeTurn.bindNativeThread(id, entry.method === 'thread/start')
         await this.onThread(id)
       }
     }
@@ -275,7 +297,14 @@ export class CodexRemoteRelay {
       this.terminals.set(`${p.threadId}:${p.turn.id}`, cc5ToolInputSha256(frame))
       this.observation!.endTurn(); this.active = false
     }
-    codexNeed(!this.revoked); this.publish(frame)
+    codexNeed(!this.revoked); this.publish(out)
+  }
+  /** Hands the app a lane-unique id so a response can never be mistaken across admissions. */
+  private translate(frame: any, method: string): any {
+    codexNeed(this.laneIds.size < 100000, 'CODEX_ID_TRANSLATION_LIMIT')
+    const laneId = ++this.laneIdSeq
+    this.laneIds.set(laneId, { kernelId: frame.id, method, epoch: this.epoch })
+    return { ...frame, id: laneId }
   }
   private waitAcknowledgements(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -300,11 +329,17 @@ export class CodexRemoteRelay {
     if (method !== 'initialized') {
       codexNeed(typeof frame.id === 'string' || typeof frame.id === 'number' && Number.isSafeInteger(frame.id))
       const key = JSON.stringify(frame.id); codexNeed(!this.usedIds.has(key) && this.usedIds.size < 100000)
-      this.usedIds.add(key); this.pending.set(key, method)
+      this.usedIds.add(key)
     } else codexNeed(frame.id === undefined)
-    if (method === 'thread/start' || method === 'thread/resume') {
+    if (method === 'thread/start') {
       codexNeed(!this.thread && !this.baseline && !this.dispatching)
-      codexNeed(method === 'thread/start' ? !this.spec.manifest.nativeThreadId : p.threadId === this.spec.manifest.nativeThreadId)
+      codexNeed(!this.spec.manifest.nativeThreadId)
+    } else if (method === 'thread/resume') {
+      // A container kernel that restarted (cancel, route change) resumes the thread this lane
+      // already bound; a first attach resumes the manifest's thread.
+      codexNeed(!this.dispatching && this.thread !== undefined
+        ? p.threadId === this.thread
+        : p.threadId === this.spec.manifest.nativeThreadId)
     }
     if (method === 'turn/start') {
       codexNeed(!this.dispatching && this.baseline && p.threadId === this.thread && Array.isArray(p.input) && p.input.length > 0)
@@ -316,18 +351,26 @@ export class CodexRemoteRelay {
     if (method === 'turn/interrupt') codexNeed(p.threadId === this.thread && p.turnId === this.observation!.nativeTurnId)
     if (method === 'thread/read') codexNeed(p.threadId === this.thread)
     this.verify(this.admitted!.authority, this.admitted!.lease, true)
-    codexNeed(!this.revoked); this.record('rpc', frame); this.app.stdin.write(`${JSON.stringify(frame)}\n`)
+    codexNeed(!this.revoked); this.record('rpc', frame)
+    const forwarded = method === 'initialized' ? frame : this.translate(frame, method)
+    this.app.stdin.write(`${JSON.stringify(forwarded)}\n`)
   }
   private async control(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const v = await body(req), path = req.url
     this.scope(v, path === '/stop' || path === '/tool/stopped')
     let result: any = {}
-    if (path === '/admit') { await this.admit(v); result = { ready: true } }
+    // `seq` is this admission's output baseline: a container that respawns its kernel after a
+    // cancel must not read frames published for the turn it just abandoned.
+    if (path === '/admit') { await this.admit(v); result = { ready: true, seq: this.outputSeq } }
     else if (path === '/rpc') await this.rpc(v.frame)
     else if (path === '/poll') {
       codexNeed(Number.isSafeInteger(v.afterSeq) && v.afterSeq >= 0 && v.afterSeq <= this.outputSeq)
       this.output = this.output.filter(f => f.seq > v.afterSeq)
       this.outputBytes = Buffer.byteLength(JSON.stringify(this.output)); result = { frames: this.output }
+    } else if (path === '/baseline') {
+      // A container that restarts its kernel inside an admitted turn needs to know where the
+      // stream stands, so the fresh kernel is not fed the turn it already rendered.
+      codexNeed(!this.revoked); result = { seq: this.outputSeq }
     } else if (path === '/tool/next') {
       const tool = [...this.tools.values()].find(t => !t.delivered)
       if (tool) { tool.delivered = true; this.record('tool-delivered', { callId: tool.request.callId }); result = { request: tool.request,
@@ -352,9 +395,30 @@ export class CodexRemoteRelay {
       this.localStops.emit('stopped')
     }
     else if (path === '/renew') { this.verify(this.admitted!.authority, v.lease, true); this.admitted!.lease = v.lease; this.arm(v.lease) }
+    else if (path === '/abandon') { await this.abandon(v); result = { abandoned: true } }
     else if (path === '/stop') result = await this.stop()
     else throw new Error('CODEX_CONTROL_REJECTED')
     res.end(JSON.stringify({ ok: true, ...result }))
+  }
+  /**
+   * An admitted turn the container abandoned before `turn/start`: the node never saw it, so no
+   * receipt can exist and the resident app still belongs to the lane. The finance owner must be
+   * closed by durable proof (journal + thread claim) — never settled as if the turn had run, and
+   * never left owning the operation, or the lane's next admission would be rejected.
+   */
+  private async abandon(v: any): Promise<void> {
+    codexNeed(this.active && !this.dispatching && !this.starting && !this.revoked && this.admitted && this.financeTurn)
+    codexNeed(v.turnKey === this.admitted!.turnKey, 'CODEX_ABANDON_SCOPE_MISMATCH')
+    const finance = this.financeTurn!
+    codexNeed(typeof finance.abandonUndispatched === 'function', 'CODEX_ABANDON_UNSUPPORTED')
+    // Frames for the abandoned admission stop here. The lane only learns it is free from this
+    // reply, and the reply is gated on proof, so a failed closure keeps the whole lane closed.
+    clearTimeout(this.expiry)
+    this.active = false
+    this.observation!.endTurn()
+    const outcome = await finance.abandonUndispatched!()
+    codexNeed(outcome.state === 'proven', 'CODEX_ABANDON_UNSETTLED')
+    this.record('abandoned', { authorityTurnId: this.admitted!.payload.authorityTurnId, turnKey: v.turnKey })
   }
   private waitLocalStop(): Promise<void> {
     if (this.localStopped) return Promise.resolve()

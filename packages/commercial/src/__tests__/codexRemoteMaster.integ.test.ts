@@ -236,3 +236,64 @@ test('receipt v3 persists total deltas, charges once, advances free error/cancel
   assert.equal(balance,'99990')
   rmSync(evidence,{recursive:true,force:true})
 })
+test('an admission abandoned before dispatch frees its journal, thread claim and operation for the next turn', async () => {
+  const redis = {eval:async()=>0} as any
+  // One port, like one container lane: the in-memory owner is exactly what a cancel has to release.
+  const port = createRemoteNativeTurnFinance({pool,upstreamModel:upstream,preCheckRedis:redis,keyring:keys,
+    catalog:{assertFresh:async()=>catalog} as unknown as ModelCatalogCache,
+    loadUserModelAuthz:async(userId)=>({uid:userId,role:'user',grantedModelIds:new Set<string>(),deniedModelIds:new Set<string>(),userPlanTier:null,orgPlanCode:null}),
+    log:createLogger({out:()=>{}})}, {reserve:async()=>({maxCost:100n}) as any,release:async()=>true})
+  const binding: CodexRemoteBinding = { version:3,backendKind:'codex-app-server-v1',uid,containerDbId:'7',dockerId:'a'.repeat(64),
+    operationId:randomUUID(),runId:randomUUID(),sessionKey:'agent:main:webchat:dm:abandon_codex_test',canonicalModel:model,
+    generation:'1',profileId:'codex',authEpoch:'epoch1',manifestSha256:'f'.repeat(64),capability:'f'.repeat(64),expiresAt:Date.now()+3600000 }
+  const issue = async (label: string) => {
+    const dispatch=randomUUID(), auth=randomUUID().replaceAll('-',''), turnKey=createHash('sha256').update(`${label}-key`).digest('hex')
+    await pool.query(`INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+      billing_request_id,status,agent_container_id) VALUES($1,$2,$3,$4,'main',$5,$6,$4,'admitted',7)`,
+    [dispatch,uid,binding.sessionKey,label,model,turnKey])
+    await pool.query(`INSERT INTO authority_turn_dispatches(authority_turn_id,user_id,canonical_model,session_id,dispatch_id,attempt_no)
+      VALUES($1,$2,$3,$4,$5,1)`,[auth,uid,model,binding.sessionKey,dispatch])
+    const now=Date.now(), a:ModelAuthorityPayload={v:1,keyId,uid:Number(uid),containerId:7,authorityTurnId:auth,connectionChallenge:'fixture',
+      canonicalModel:model,engine:'codex',executionBackend:codexBackend(binding),executionDescriptor:{capabilityProfile:cap,capabilitySchemaVersion:1,
+      contextWindow:200000,supportsVision:false,supportedEfforts:['low'],codexDefaultEffort:'low'},executionRevision:catalog.executionRevision,
+      securityEpoch:5,billingRequestId:label,issuedAt:now,expiresAt:now+60000}
+    const l:TurnLease={v:1,keyId,uid:Number(uid),containerId:7,authorityTurnId:auth,connectionChallenge:'fixture',canonicalModel:model,
+      securityEpoch:5,issuedAt:now,expiresAt:now+600000}
+    return {label,auth,turnKey,admit:{binding,sessionKey:binding.sessionKey,turnKey,
+      authorityEnvelope:encodeAuthorityEnvelope(a,sign(null,authoritySigningInput(a),privateKey)),
+      leaseEnvelope:encodeTurnLeaseEnvelope(l,sign(null,turnLeaseSigningInput(l),privateKey))}}
+  }
+  const first=await issue('abandon746a')
+  const turnA=await port.admit(first.admit)
+  await turnA.beforeHostStart()
+  // The cancel-before-dispatch state: the host started and the thread is claimed, nothing was sent.
+  assert.deepEqual(await turnA.bindNativeThread!('thread-abandon-746',true),zeroNativeTokens())
+  const second=await issue('abandon746b')
+  await assert.rejects(port.admit(second.admit),/.*/) // the live owner must not admit a second turn
+  assert.deepEqual(await turnA.abandonUndispatched!(),{state:'proven',requestId:first.label})
+  const journal=(await pool.query(`SELECT state,final_credits::text,failure_code,error_msg
+    FROM request_finalize_journal WHERE request_id=$1`,[first.label])).rows[0]
+  assert.equal(journal.state,'aborted'); assert.equal(journal.final_credits,'0')
+  assert.equal(journal.failure_code,'USER_CANCELLED'); assert.equal(journal.error_msg,'remote_native_abandoned_before_dispatch')
+  const thread=(await pool.query('SELECT pending_request_id,total FROM remote_native_threads WHERE operation_id=$1',
+    [binding.operationId])).rows[0]
+  assert.equal(thread.pending_request_id,null) // the claim is freed, the thread itself survives
+  assert.deepEqual(thread.total,zeroNativeTokens())
+  assert.equal((await pool.query('SELECT COUNT(*)::int n FROM usage_records WHERE request_id=$1',[first.label])).rows[0].n,0)
+  await assert.rejects(port.admit(first.admit),/.*/) // the abandoned authority is never re-admitted
+
+  // The next turn admits on the same operation and the same native thread, still from a zero base.
+  const turnB=await port.admit(second.admit)
+  await turnB.beforeHostStart()
+  assert.deepEqual(await turnB.bindNativeThread!('thread-abandon-746',false),zeroNativeTokens())
+  await turnB.beforeDispatch({sequence:1,inputSha256:second.turnKey})
+  const total={inputTokens:1000,cachedInputTokens:500,cacheWriteInputTokens:0,outputTokens:100,reasoningOutputTokens:60}
+  const receipt=buildCodexReceipt(binding,{authorityTurnId:second.auth,turnKey:second.turnKey,upstreamModel:upstream,
+    nativeThreadId:'thread-abandon-746',nativeTurnId:'turn-abandon-1'},zeroNativeTokens(),total,'completed')
+  assert.deepEqual(await turnB.terminal(receipt),{state:'proven',requestId:second.label})
+  const usage=(await pool.query('SELECT price_snapshot FROM usage_records WHERE request_id=$1',[second.label])).rows
+  assert.equal(usage.length,1) // only the turn that dispatched is billed
+  assert.deepEqual(usage[0].price_snapshot.remote_native.nativeUsage,total)
+  assert.equal((await pool.query('SELECT pending_request_id FROM remote_native_threads WHERE operation_id=$1',
+    [binding.operationId])).rows[0].pending_request_id,null)
+})

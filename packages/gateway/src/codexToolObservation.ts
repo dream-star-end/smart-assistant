@@ -33,7 +33,8 @@ export class CodexToolObservation {
         this.turn = p.turn.id
       }
       if (f.method === 'item/started' || f.method === 'item/completed') {
-        codexNeed(p?.threadId === this.thread && p.turnId === this.turn && !!this.turn)
+        codexNeed(p?.threadId === this.thread, 'CODEX_NATIVE_THREAD_CHANGED')
+        codexNeed(!!this.turn && p.turnId === this.turn, 'CODEX_NATIVE_TURN_CHANGED')
         const i = p.item
         codexNeed(i && ['agentMessage', 'reasoning', 'userMessage', 'contextCompaction', 'mcpToolCall'].includes(i.type), 'CODEX_NATIVE_ITEM_REJECTED')
         if (i.type === 'mcpToolCall') {
@@ -53,7 +54,10 @@ export class CodexToolObservation {
           }
         }
       }
-      if (f.method === 'turn/completed') codexNeed(p?.threadId === this.thread && p.turn?.id === this.turn && !!this.turn)
+      if (f.method === 'turn/completed') {
+        codexNeed(p?.threadId === this.thread, 'CODEX_NATIVE_THREAD_CHANGED')
+        codexNeed(!!this.turn && p.turn?.id === this.turn, 'CODEX_NATIVE_TURN_CHANGED')
+      }
       this.events.emit('change')
     } catch (error) { this.revoke(error instanceof Error ? error.message : undefined); throw error }
   }

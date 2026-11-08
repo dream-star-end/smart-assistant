@@ -29,17 +29,45 @@ No generic SSH command or native config is accepted.
   Verify fresh signed admission + DB dispatch + pricing + reservation before provision/start.
   Stable tool catalog per lane. Later effect RPCs accept expired admission **with a fresh matching
   lease**, because the 120s authority TTL only gates admission.
+  Reply carries `seq`, this admission's output baseline: a container kernel that restarts after a
+  cancel must not read frames published for the turn it abandoned. One lane may hold several
+  admissions (a chat keeps its resident node across kernel restarts), so JSON-RPC kernel ids are
+  scoped per admission and the relay gives the node a lane-unique id, mapping the answer back.
+  An answer to an abandoned admission is recognized by its epoch and dropped, never delivered to
+  the restarted kernel whose ids restarted at the same numbers.
 - `/rpc`: `frame` from the closed initialize/model/list/account/read/mcpServerStatus/list,
   thread/start/resume/read and turn/start/interrupt grammar. Master fixes the model and the node
   independently pins sandbox/policy/catalog. Text-only, supported efforts only; no Fast/image claims.
   Native thread response is bound to the original persisted baseline before a turn is dispatched.
 - `/poll`: `afterSeq`. Retained frames are acknowledged by the next sequence cursor; bounded output.
+- `/baseline`: returns the current output `seq`. A container that restarts its kernel **inside** an
+  admitted turn (route change) continues after the frames already published; it never re-renders
+  the part of the turn it rendered before the restart.
 - `/tool/next`: at most one delivery per call; returns original request, binding, authority, lease,
   turnKey. The container executes tools; the master and node never run model tools.
 - `/tool/result`: callId + bounded CCB result. `/tool/ack`: callId after receipt delivery.
   A terminal is delivered only after native tool completion, all tool ACKs, durable v3 receipt and
   independently proven finance result. Exact duplicate terminal is idempotent; conflicting duplicate fences.
-- `/renew`: a fresh matching lease, no new authority required for the admitted turn.
+- `/renew`: a fresh matching lease, no new authority required for the admitted turn. The container
+  owns the rolling renewal (renew at 30 min of the 50 min window, `TURN_LEASE_RENEW_AFTER_MS`) for
+  the whole current turn and stops it at the terminal or the lane stop; the lease the turn was
+  admitted with is never the last one it uses. The master re-arms its expiry fence on every accepted
+  renewal, so a long turn must never be fenced at the window it admitted with. The renewed lease is
+  live on the master before the container consumes the ACK, so a `/tool/next` delivery may carry it
+  first; the container accepts any lease signed for the exact admitted turn (signature plus the full
+  authority binding), never an arbitrary old credential, and a renewal ACK that lands after its turn
+  ended never rewrites the next turn's admission.
+- `/abandon`: turnKey. Closes an admission that never reached `turn/start` (the kernel cancelled
+  the turn locally before dispatch). Accepted only while the lane is active, not dispatching, and
+  the turnKey is the admitted one; a dispatched turn can only end through its native terminal.
+  No receipt is written and no usage is fabricated: the closure is a durable, identity-exact proof
+  that nothing reached the model — the journal row is aborted with zero credits only while its
+  stored `input` and `receipt` are still null, and a bound thread's `pending_request_id` is released
+  only when it is still this request and its ledger total is still the baseline recorded at bind.
+  A closure that cannot be proven keeps the lane closed instead of guessing zero effect, and the
+  reply is only sent after the proof. The lane then stays usable: the next admission continues
+  after the frames the master already published, and the freed reservation follows the normal
+  soft-reservation release.
 - `/stop`: first revoke effects, drain any in-flight finance admission, then independent node
   stop/prove plus local tool host proof. A delayed admission cannot start after revocation. A newly
   admitted reservation without any current-turn provision/input is aborted, including a completed start marker
