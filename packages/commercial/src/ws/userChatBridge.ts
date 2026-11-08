@@ -190,7 +190,7 @@ import {
   type DispatchRequestContent,
   type SessionWorkspaceMode,
   BOX_GPT_WEB_BUSY_MESSAGE,
-  type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
   isCc5TestModel,
   isBoxGptWebModel,
   isBoxGptWebOwnerUid,
@@ -858,7 +858,7 @@ export interface UserChatBridgeDeps {
    */
   cc5BackendSelector?: (input: { uid: number; containerId: number; sessionKey: string;
     canonicalModel: string; engine: string; placement: "local" | "remote_pool" }) =>
-    Promise<Cc5ExecutionBackend | undefined>;
+    Promise<RemoteExecutionBackend | undefined>;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
@@ -3129,7 +3129,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       exec: ResolvedTurnExecution,
       billingRequestId?: string,
       authorityTurnId?: string,
-      executionBackend?: Cc5ExecutionBackend,
+      executionBackend?: RemoteExecutionBackend,
     ): ModelAuthorityBundle => {
       if (authorityDeps === undefined || containerChallenge === null || containerId === undefined) {
         throw new Error(
@@ -3228,7 +3228,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           "sign_boundary_epoch_changed",
         );
       }
-      let executionBackend: Cc5ExecutionBackend | undefined;
+      let executionBackend: RemoteExecutionBackend | undefined;
       try {
         if (args.exec.placement === "remote_pool") {
           // A remote model never falls back to a local or Box run: no lane, no turn.
@@ -5181,6 +5181,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 模型执行权威签发用的 model(= effectiveModel,帧完全无线索时回落默认 agent 的模型)。
       let authorityModelForFrame: string | null = null;
       let isCodexInboundFrame = false;
+      let isRemoteNativeInboundFrame = false;
       let isCursorInboundFrame = false;
       let isZcodeInboundFrame = false;
       let isAntigravityInboundFrame = false;
@@ -5915,6 +5916,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? (authorityDeps?.catalog.peek()?.isEngineReportedModel(authorityModelForFrame) ??
                    (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel)))
                 : (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel));
+            // Remote native billing belongs to the master relay, never the local Codex route/tape.
+            if (authorityOn && authorityModelForFrame !== null &&
+                authorityDeps?.catalog.peek()?.resolve(authorityModelForFrame)?.placement === "remote_pool") {
+              isRemoteNativeInboundFrame = true;
+            }
             isCursorInboundFrame =
               authorityOn && authorityModelForFrame !== null
                 ? (authorityDeps?.catalog.peek()?.isCursorModel(authorityModelForFrame) ??
@@ -6678,7 +6684,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
       if (
-        isCodexInboundFrame &&
+        isCodexInboundFrame && !isRemoteNativeInboundFrame &&
         isAnnotatedImageInboundFrame &&
         containerId !== undefined
       ) {
@@ -6793,7 +6799,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
       if (
-        isCodexInboundFrame &&
+        isCodexInboundFrame && !isRemoteNativeInboundFrame &&
         containerId !== undefined &&
         (deps.codexBinding !== undefined || deps.createCodexRoute !== undefined)
       ) {
@@ -9730,6 +9736,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const ctx = (row.ctx !== null && typeof row.ctx === "object"
             ? row.ctx
             : {}) as Record<string, unknown>;
+          if (Object.hasOwn(ctx, "remoteNativeBillingRecovery")) return;
           const grokAccountId = typeof ctx.grokAccountId === "string" && /^[1-9]\d*$/.test(ctx.grokAccountId)
             ? BigInt(ctx.grokAccountId)
             : null;

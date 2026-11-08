@@ -1,6 +1,6 @@
 import type { PreheatPreparation } from './speculativePreheat.js'
 import { renderHistoricalContextJsonPrompt } from './historicalContextPrompt.js'
-import { type Cc5ExecutionBackend, isBoxApiModel } from '@openclaude/protocol'
+import { type RemoteExecutionBackend, isBoxApiModel } from '@openclaude/protocol'
 import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
@@ -1890,7 +1890,7 @@ export class SessionManager {
      *     catalog 判定,不许回落 baked)。
      */
     executionAuthority?: {
-      executionBackend?: Cc5ExecutionBackend
+      executionBackend?: RemoteExecutionBackend
       canonicalModel: string
       engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
       source?: 'bridge_signed' | 'local_catalog'

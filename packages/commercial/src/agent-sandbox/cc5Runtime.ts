@@ -1,17 +1,21 @@
 /** Master wiring of the remote-pool lane runtime. OFF performs no configuration I/O. */
 import { resolve } from 'node:path'
-import type { Cc5FinanceFactory } from '@openclaude/gateway/cc5-finance'
+import type { RemoteFinanceFactory } from '@openclaude/gateway/remote-finance'
 import {
   createRemoteLaneRuntime,
   type RemoteLaneRuntimePort,
 } from '@openclaude/gateway/cc5-container-runtime'
 import {
   CC5_TEST_UID_ENV,
-  type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
+  isRemoteBackendAuthority,
   type Cc5PolicyEnvironment,
   canUseCc5TestModel,
 } from '@openclaude/protocol'
-import { placeRemoteLane, recordRemoteLaneState } from '../account-pool/remoteBrainPool.js'
+import { placeRemoteLane, recordRemoteLaneState, recordRemoteNativeThread, recordRemoteStartAttempt } from '../account-pool/remoteBrainPool.js'
+
+import { getPool } from '../db/index.js'
+import { reconcileRemoteChat } from '../account-pool/remoteLaneRecovery.js'
 
 const BASE_ROOT = '/run/oc-cc5-t1555u'
 
@@ -20,7 +24,7 @@ export function createMasterCc5Runtime(
     selfhost: boolean
     authorityReady: boolean
     env: Cc5PolicyEnvironment
-    financeFactory?: Cc5FinanceFactory
+    financeFactory?: RemoteFinanceFactory
   },
   fixture: { create?: typeof createRemoteLaneRuntime; rejected?: (error: unknown) => void } = {},
 ): RemoteLaneRuntimePort | undefined {
@@ -33,15 +37,19 @@ export function createMasterCc5Runtime(
       selfhost: true,
       env: input.env,
       financeFactory: input.financeFactory,
-      configuration: () => ({ baseRoot: BASE_ROOT, controllerPath }),
+      configuration: () => ({ baseRoot: BASE_ROOT, controllerPath, evidenceRoot: '/var/lib/openclaude/remote-native' }),
       hooks: {
-        place: (request) => placeRemoteLane(request, { controllerPath }),
-        onState: (operationId, state) => {
-          void recordRemoteLaneState(operationId, state).catch((error: unknown) => {
-            console.error('[selfhost] remote lane state not recorded', { operationId, state,
-              error: error instanceof Error ? error.message : String(error) })
-          })
+        place: async (request) => {
+          try { return await placeRemoteLane(request, { controllerPath }) }
+          catch (error) {
+            if (!(error instanceof Error) || error.message !== 'REMOTE_LANE_STOP_UNPROVEN') throw error
+            await reconcileRemoteChat(getPool(),request.uid,request.sessionKey)
+            return placeRemoteLane(request,{controllerPath})
+          }
         },
+        onState: (operationId, state, generation) => recordRemoteLaneState(operationId,state,undefined,generation),
+        onRemoteStart: (operationId,generation) => recordRemoteStartAttempt(operationId,generation),
+        onNativeThread: (operationId,generation,id) => recordRemoteNativeThread(operationId,generation,id),
       },
     })
   } catch (error) {
@@ -59,11 +67,14 @@ export async function selectMasterCc5Backend(
     engine: string; placement: 'local' | 'remote_pool' },
   selfhost: boolean,
   env: Cc5PolicyEnvironment,
-): Promise<Cc5ExecutionBackend | undefined> {
+): Promise<RemoteExecutionBackend | undefined> {
   if (input.placement !== 'remote_pool') return undefined
-  if (!selfhost || !runtime || input.engine !== 'ccb' || !canUseCc5TestModel(String(input.uid), env)) {
+  if (!selfhost || !runtime || !['ccb','codex'].includes(input.engine) || !canUseCc5TestModel(String(input.uid), env)) {
     throw new Error('REMOTE_LANE_UNAVAILABLE')
   }
-  return runtime.ensureLane({ uid: input.uid, containerDbId: String(input.containerId),
-    sessionKey: input.sessionKey, canonicalModel: input.canonicalModel })
+  const backend = await runtime.ensureLane({ uid: input.uid, containerDbId: String(input.containerId),
+    sessionKey: input.sessionKey, canonicalModel: input.canonicalModel,
+    ...(input.engine === 'codex' ? { engine: 'codex' as const } : {}) })
+  if (!isRemoteBackendAuthority({ engine: input.engine, canonicalModel: input.canonicalModel, executionBackend: backend })) throw new Error('REMOTE_LANE_UNAVAILABLE')
+  return backend
 }

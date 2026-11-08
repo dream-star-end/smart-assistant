@@ -6,10 +6,10 @@
 ## 入口与部署
 
 独立 `codex-host-controller.py <role> <generation-root>`；角色 `provision`、`launch`、
-`tool-socket`、`stop`、`prove-stopped`。新 SSH guard 单独授权，不能把新版 source 塞进旧 cc guard。
+`tool-socket`、`stop`、`fence-stop`、`prove-stopped`。新 SSH guard 单独授权，不能把新版 source 塞进旧 cc guard。
 所有 argv 为 `/usr/bin/python3 -I -B <已安装controller绝对路径> <role> <root>`，精确shell单引号序列化；
 guard配置由root拥有，controllers数组记录path/sha256，完整bundle祖先路径必须root-owned且非组/全局可写。
-只接受第一个版本的新执行，旧版本仅stop/prove-stopped；不接受任意命令/env。
+只接受第一个版本的新执行，旧版本仅stop/fence-stop/prove-stopped；不接受任意命令/env。
 主控负责安装 bundle、准备稳定 profile 与登录授权、更新 guard；本段不手动安装正式节点文件。
 实验仅 /tmp/oc-codex-*。不得开启 SSH ControlMaster。launch 必须在 master 准入/扣费放行后调用。
 
@@ -89,3 +89,12 @@ scope 内 exec 前门检查同 unit claim/revocation，已排队的旧 worker �
 
 独立控制角色失败退出126，stderr为`CODEX_NODE_REJECTED_OR_STOP_UNKNOWN`；没有合法true proof即unknown，
 禁止把退出状态/空stdout猜成停止成功。launch已进入流时，具体固定原因在error包络code中。
+
+段2 master契约见 [codex-master-contract.md](codex-master-contract.md)，包括binding v3、relay HTTP、原生观察门、五维收据与停止/财务分离恢复。
+
+段2新增 `fence-stop`：stdin 单行原 manifest，与 provision 从根目录不存在检查到全部发布共享根外
+`.根名.create.lock`。对尚不存在/尚未发布 manifest 的根，原子发布 manifest 与耐久 STOPPING 屏障，
+再执行原 stop/proof；已有 manifest 必须完整匹配。manifest 经临时文件 fsync + 锁内原子 rename 发布，
+崩溃可留未发布临时文件但不能留下半个权威 manifest。迟到 provision/launch 不能越过屏障。
+已有坏身份/不可证明的生命周期仍拒绝；空 scopes 的独立 proof 才能证明没有宿主执行。
+该新增角色属于 stop-only，不扩大旧版本的 launch/provision 权限；正式 guard/bundle 仍由主控部署。

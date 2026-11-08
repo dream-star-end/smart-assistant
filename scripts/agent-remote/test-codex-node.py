@@ -120,6 +120,43 @@ class NodeTests(unittest.TestCase):
         config['controllers']=[{'path':str(unsafe),'sha256':client.hashlib.sha256(unsafe.read_bytes()).hexdigest()}]
         args[3]=str(unsafe)
         with self.assertRaises(ValueError):guard.verified_argv(' '.join(guard.quote(x) for x in args),config)
+    def test_fence_stop_absent_and_unpublished_manifest_blocks_late_provision(self):
+        home=self.root/'profile/codex-home';home.mkdir(parents=True,mode=0o700)
+        (home/'auth.json').write_text('{}');os.chmod(home/'auth.json',0o600)
+        for partial in ('absent','unpublished','published'):
+            root=self.root/('run-'+partial+'00001')
+            if partial!='absent':
+                root.mkdir(mode=0o700);(root/'.manifest-interrupted').write_text('{')
+            m={'version':1,'engine':'codex','root':str(root),'operationId':'operation','runId':'run','generation':'1',
+               'profileId':'default','authEpoch':'epoch1','model':'fixture-model','nativeThreadId':None,'codexHome':str(home),
+               'controllerSha256':ctrl.sha((HERE/'codex-host-controller.py').read_bytes()),'cliSha256':'a'*64,'nativeSha256':'b'*64}
+            if partial=='published':
+                pid=os.fork()
+                if pid==0:
+                    ctrl.sync_dir=lambda path: os._exit(77) # publication done, cleanup not reached
+                    ctrl.publish_manifest(root,m); os._exit(1)
+                _,status=os.waitpid(pid,0);self.assertEqual(os.waitstatus_to_exitcode(status),77)
+                self.assertEqual((root/'MANIFEST.json').stat().st_nlink,1)
+            def call(role,packet=None):
+                return subprocess.run([sys.executable,'-I','-B',str(HERE/'codex-host-controller.py'),role,str(root)],
+                    input=(json.dumps(packet)+'\n').encode() if packet is not None else b'',capture_output=True,timeout=15)
+            fd=ctrl.creation_lock(root)
+            try:
+                busy=call('fence-stop',m);self.assertEqual(busy.returncode,126)
+                self.assertFalse((root/'STOPPING.json').exists())
+            finally:os.close(fd)
+            for role in ('fence-stop','prove-stopped'):
+                result=call(role,m if role=='fence-stop' else None)
+                self.assertEqual(result.returncode,0,result.stderr.decode())
+                proof=json.loads(result.stdout);self.assertTrue(proof['remoteStopped']);self.assertEqual(proof['scopes'],[])
+            late=call('provision',{'manifest':m,'tools':self.catalog,'modelList':[{'id':'fixture-model'}],
+                'modelCatalog':{'models':[{'slug':'fixture-model'}]}})
+            self.assertEqual(late.returncode,126)
+            self.assertEqual(call('launch').returncode,126)
+            self.assertFalse((root/'PROVISIONED.json').exists())
+            self.assertFalse((root/'APP-STARTING.json').exists())
+            self.assertEqual(json.loads((root/'MANIFEST.json').read_text()),m)
+
     def test_mismatched_receipt_cannot_become_success(self):
         body=self.body();value={k:body[k] for k in client.IDENTITY};value.update(version=3,engine='codex',ok=True,result={'content':[],'isError':False})
         for key in ['generation','callId','nativeThreadId','nativeTurnId','inputSha256']:

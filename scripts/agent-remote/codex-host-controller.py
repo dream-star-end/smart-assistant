@@ -17,9 +17,10 @@ import stat
 import subprocess
 import sys
 import time
+import tempfile
 import types
 
-PINNED = {'oc-remote-hostd.py': 'e5e202196d924ebd5373cb4fa9e6063cd397ddef6c6809fc30f9b10895900d18', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
+PINNED = {'oc-remote-hostd.py': 'e697795c52fe015d57f4206e2af264bc3f42faba4f1bc1071cc1a91166c1e246', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
 CLI = Path('/usr/bin/codex')
 NATIVE = Path('/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
 MAX_FRAME = 2 * 1024 * 1024
@@ -156,7 +157,47 @@ def pinned_catalog(model_list, cache):
     return {'models':[{**raw[mid],**POLICY} for mid in listed]}
 
 
+def creation_lock(root):
+    return lock(root.parent/('.'+root.name+'.create.lock'))
+
+
+def publish_manifest(root, m):
+    # A process crash may leave an unpublished temp file, never a torn authoritative manifest.
+    fd, name=tempfile.mkstemp(prefix='.manifest-',dir=root)
+    try:
+        with os.fdopen(fd,'wb') as out:
+            out.write(encoded(m)); out.flush(); os.fsync(out.fileno())
+        require(not (root/'MANIFEST.json').exists() and not (root/'MANIFEST.json').is_symlink())
+        os.rename(name,root/'MANIFEST.json') # all publishers hold creation_lock; no hard-link crash window
+        sync_dir(root)
+    finally:
+        try: os.unlink(name)
+        except FileNotFoundError: pass
+        sync_dir(root)
+
+
+def fence_unprovisioned(root, expected):
+    control=creation_lock(root)
+    try:
+        if not root.exists(): directory(root,create=True); sync_dir(root.parent)
+        directory(root)
+        if not (root/'MANIFEST.json').exists():
+            # Current controllers cannot launch before atomic MANIFEST publication.
+            require(not any((root/(r+'-STARTING.json')).exists() for r in ('APP','SOCKET')))
+            publish_manifest(root,expected)
+        m=manifest(root); require(m==expected)
+        fence(root,m)
+        return m
+    finally: os.close(control)
+
+
 def provision(root):
+    control=creation_lock(root)
+    try: provision_locked(root)
+    finally: os.close(control)
+
+
+def provision_locked(root):
     require(not root.exists() and not root.is_symlink())
     line=sys.stdin.buffer.readline(8*1024*1024+1)
     require(len(line)<=8*1024*1024 and line.endswith(b'\n'))
@@ -164,7 +205,7 @@ def provision(root):
     require(isinstance(packet,dict) and set(packet)=={'manifest','tools','modelList','modelCatalog'})
     m=packet['manifest']; require(isinstance(m,dict) and m.get('root')==str(root))
     directory(root,create=True)
-    record(root/'MANIFEST.json',m); m=manifest(root)
+    publish_manifest(root,m); m=manifest(root)
     for sub in ('home','tmp','observations','tool-attempts'): directory(root/sub,create=True)
     directory(root/'cwd',create=True,mode=0o500)
     catalog=pinned_catalog(packet['modelList'],packet['modelCatalog'])
@@ -468,6 +509,11 @@ def main():
     require(len(sys.argv) in (3,4))
     role=sys.argv[1]; root=task_root(sys.argv[2])
     if role=='provision': provision(root); return 0
+    if role=='fence-stop':
+        line=sys.stdin.buffer.readline(32769)
+        require(len(line)<=32768 and line.endswith(b'\n'))
+        expected=strict_json(line); require(isinstance(expected,dict))
+        fence_unprovisioned(root,expected)
     m=manifest(root); h=module('oc-remote-hostd.py')
     if role=='_worker': require(len(sys.argv)==4); worker(root,sys.argv[3]); return 126
     require(len(sys.argv)==3)
@@ -479,8 +525,8 @@ def main():
             p=start_scope(root,'socket',m,launch_spec(root,m),h,stdin=sys.stdin.buffer,stdout=sys.stdout.buffer,stderr=sys.stderr.buffer)
             rc=p.wait(); require(rc==0,'CODEX_STOP_UNKNOWN')
         finally: os.close(fd)
-    elif role in ('stop','prove-stopped'):
-        if role=='stop': stop_scopes(root,m,h)
+    elif role in ('stop','fence-stop','prove-stopped'):
+        if role in ('stop','fence-stop'): stop_scopes(root,m,h)
         end=time.monotonic()+10
         while True:
             try: result=proof(root,m,h); break

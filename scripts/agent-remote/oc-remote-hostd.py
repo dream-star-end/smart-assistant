@@ -229,6 +229,56 @@ def codex_reconcile_probe_locked(codex_home):
     finally: os.close(gate)
 
 
+CODEX_NATIVE_BINARY = pathlib.Path('/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
+
+def codex_execution_snapshot(codex_home, exe_path, models):
+    """Read-only provisioning material, never auth.json; unavailable is not fabricated readiness."""
+    import stat
+    def read(path, limit):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > limit:
+                raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            data = os.read(fd, limit + 1)
+            if len(data) != st.st_size: raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            return data
+        finally: os.close(fd)
+    try:
+        native = CODEX_NATIVE_BINARY
+        catalog = json.loads(read(codex_home / 'models_cache.json', 4 * 1024 * 1024))
+        raw = catalog.get('models')
+        if not isinstance(raw, list): raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+        ids = {m['upstream_model_id'] for m in models}
+        selected = [m for m in raw if isinstance(m, dict) and m.get('slug') in ids]
+        if len(selected) != len(ids) or {m['slug'] for m in selected} != ids:
+            raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+        # CLI is the installed symlink, but only its resolved regular file is read.
+        cli_sha = hashlib.sha256(read(pathlib.Path(exe_path).resolve(), 4 * 1024 * 1024)).hexdigest()
+        fd = os.open(native, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= 512 * 1024 * 1024:
+                raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            digest = hashlib.sha256(); size = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk: break
+                size += len(chunk)
+                if size > st.st_size: raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+                digest.update(chunk)
+            after = os.fstat(fd)
+            if size != st.st_size or (st.st_size,st.st_mtime_ns,st.st_ctime_ns) != (after.st_size,after.st_mtime_ns,after.st_ctime_ns):
+                raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            native_sha = digest.hexdigest()
+        finally: os.close(fd)
+        controller_sha = hashlib.sha256(read(pathlib.Path(__file__).resolve().with_name('codex-host-controller.py'), 256 * 1024)).hexdigest()
+        return {'version': 1, 'modelList': [m['native'] for m in models], 'modelCatalog': {'models': selected},
+                'cliSha256': cli_sha, 'nativeSha256': native_sha, 'controllerSha256': controller_sha}, None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, 'CODEX_SNAPSHOT_UNAVAILABLE'
+
+
 def codex_profile_probe(codex_home, exe_path, timeout=20):
     """Exact CODEX_HOME; full pages or no catalog. Returns observed, not online-verified auth."""
     import fcntl
@@ -345,6 +395,8 @@ def codex_profile_probe(codex_home, exe_path, timeout=20):
                 result.update(discovered_models=models, models_observed=True,
                               observed_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                               snapshot_sha256=hashlib.sha256(json.dumps(models,sort_keys=True,separators=(',',':')).encode()).hexdigest())
+                snapshot, error = codex_execution_snapshot(codex_home, exe_path, models)
+                result.update(execution_snapshot=snapshot, execution_snapshot_error=error)
             finally:
                 selector.close()
                 # Always stop before temp HOME is removed or the auth writer lock released.

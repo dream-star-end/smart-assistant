@@ -161,7 +161,10 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
     capabilityProfile: { supportsVision: false,
       reasoning: { supported: [], codexModelDefault: null },
       ccb: { capabilityZero: true, supportsThinking: false, contextOwner: 'box-native-v1' } } }));
+  entries.push(entry({entryId:63,modelId:'gpt-6-luna-remote',engine:'codex',providerId:'codex',upstreamModelId:'gpt-6-luna',placement:'remote_pool',
+    capabilityProfile:{supportsVision:false,reasoning:{supported:['low'],codexModelDefault:'low'},ccb:{capabilityZero:false,supportsThinking:false}}}));
   const pricing = new Map([
+    ['gpt-6-luna-remote',price('gpt-6-luna-remote')],
     ['box-claude-sonnet-5', price('box-claude-sonnet-5')],
     ['claude-opus-5-5-remote', price('claude-opus-5-5-remote')],
     ["glm-5.2", price("glm-5.2")],
@@ -242,6 +245,7 @@ async function startRig(opts: {
   attest: "yes" | "no-capability" | "silent";
   authorityOn?: boolean;
   cc5BackendSelector?: UserChatBridgeDeps["cc5BackendSelector"];
+  createCodexRoute?: UserChatBridgeDeps["createCodexRoute"];
   loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
   attestTimeoutMs?: number;
   fenceFails?: boolean;
@@ -545,6 +549,7 @@ async function startRig(opts: {
 
   const bridge = createUserChatBridge({
     cc5BackendSelector: opts.cc5BackendSelector,
+    createCodexRoute: opts.createCodexRoute,
     containerLinkEnabled: opts.containerLinkEnabled,
     jwtSecret: JWT_SECRET,
     issueSystemHelpBootstrap: opts.issueSystemHelpBootstrap,
@@ -2955,4 +2960,21 @@ describe('remote-pool lane authority', () => {
       } finally {await stopRig(rig);}
     });
   }
+});
+
+test('Codex remote signed dispatch bypasses local Codex account acquisition and keeps its engine',async()=>{
+  let localRouteCalls=0;
+  const rig=await startRig({attest:'yes',createCodexRoute:async()=>{localRouteCalls++;throw new Error('LOCAL_ROUTE_FORBIDDEN')},
+    cc5BackendSelector:async input=>({kind:'codex-app-server-v1',version:1,operationId:'00000000-0000-4000-8000-000000000746',
+      sessionKey:input.sessionKey,generation:'1',profileId:'default',authEpoch:'1'})});
+  try {
+    const ws=await openClient(rig.port);
+    ws.send(inboundFrame({model:'gpt-6-luna-remote',peer:{id:'codex-native-chat',kind:'dm'}}));
+    await waitFor(()=>rig.containerSeen.some(s=>s.includes(MODEL_AUTHORITY_FIELD)));
+    const frame=firstInbound(rig.containerSeen),bundle=frame[MODEL_AUTHORITY_FIELD] as {authority:string};
+    const payload=verifyAuthority(bundle.authority,rig.signer.publicKeyring(),Date.now());
+    assert.equal(payload.engine,'codex');assert.equal(payload.executionBackend?.kind,'codex-app-server-v1');
+    assert.equal(localRouteCalls,0);assert.equal(frame.__oc_codex_route,undefined);
+    assert.deepEqual(payload.executionDescriptor.supportedEfforts,['low']);ws.close();
+  } finally {await stopRig(rig);}
 });

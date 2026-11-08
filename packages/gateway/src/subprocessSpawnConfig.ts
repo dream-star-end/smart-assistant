@@ -7,6 +7,7 @@
 import {
   BOX_API_MODELS,
   type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
   isCc5ExecutionBackend,
   OPENAI_FAST_SERVICE_TIER,
   TRACE_ID_HEADER,
@@ -801,7 +802,7 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 
 export interface SubprocessRunnerOpts {
   /** Only supplied from the verified bridge authority; never from local catalog or client fields. */
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
   /** Trusted cc5-only transport. No user-selected URL, command or credentials. */
   cc5BridgePort?: import('./cc5BridgePort.js').Cc5BridgePort
   /** Actual chat peer; sessionId below may be a delegated repository parent. */
@@ -1055,7 +1056,7 @@ export function projectCcbExecutionDescriptor(input: {
   supportsVision: boolean
   supportedEfforts: readonly string[]
   capabilityProfile: Readonly<Record<string, unknown>>
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
 }): CcbExecutionDescriptor {
   // The bound target/offer declares the model; the runner compares it to the port's.
   if (input.executionBackend && !isCc5ExecutionBackend(input.executionBackend)) {

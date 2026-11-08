@@ -30,7 +30,8 @@ import type { Server } from 'node:http'
 import { dirname, isAbsolute, join } from 'node:path'
 import {
   type AuthorityKeyring,
-  type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
+  parseRemoteExecutionBackend,
   CC5_INTERACTIVE_BACKEND,
   CC5_TEST_UID_ENV,
   type Cc5PolicyEnvironment,
@@ -39,7 +40,12 @@ import {
   parseAuthorityKeyring,
   parseCc5ExecutionBackend,
 } from '@openclaude/protocol'
-import type { Cc5FinanceFactory } from './cc5Finance.js'
+import type { RemoteFinanceFactory } from './remoteFinance.js'
+import { codexBackend, type RemoteBridgeBinding, type CodexRemoteBinding, codexJsonHash } from './codexRemoteContract.js'
+import { CodexSshHost, type CodexLaneSpec } from './codexRemoteHost.js'
+import { CodexRemoteRelay } from './codexRemoteRelay.js'
+export { CodexSshHost, type CodexLaneSpec } from './codexRemoteHost.js'
+export { Cc5SshHost } from './cc5SshHost.js'
 import { CC5_BINDING_SLIDING_TTL_MS, CC5_MOUNT, type Cc5BridgeBinding } from './cc5BridgePort.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from './cc5Relay.js'
 import { Cc5SshHost, type Cc5SshHostConfig, type RemoteCcTarget } from './cc5SshHost.js'
@@ -81,7 +87,7 @@ function writePrivate(path: string, value: unknown, groupReadable = false): void
   }
   syncDirectory(dirname(path))
 }
-function overwriteProtectedBinding(laneView: string, binding: Readonly<Cc5BridgeBinding>): void {
+function overwriteProtectedBinding(laneView: string, binding: Readonly<RemoteBridgeBinding>): void {
   const tmpPath = join(laneView, 'binding.json.tmp')
   rmSync(tmpPath, { force: true })
   writePrivate(tmpPath, binding, true)
@@ -108,8 +114,11 @@ export interface RemoteLanePlacement {
   readonly runId: string
   /** The node `provision` packet (controller `package-provision` output). */
   readonly provisionPacket: Buffer
+  readonly generation?: string
+  readonly codex?: CodexLaneSpec
 }
 export interface RemoteLaneRequest {
+  readonly engine?: 'ccb' | 'codex'
   readonly uid: number
   readonly containerDbId: string
   readonly sessionKey: string
@@ -118,7 +127,9 @@ export interface RemoteLaneRequest {
 export type RemoteLaneState = 'running' | 'released' | 'unknown'
 export interface RemoteLaneHooks {
   place(request: RemoteLaneRequest & { readonly dockerId: string }): Promise<RemoteLanePlacement>
-  onState?(operationId: string, state: RemoteLaneState): void
+  onState?(operationId: string, state: RemoteLaneState, generation?: string): void | Promise<void>
+  onNativeThread?(operationId: string, generation: string, nativeThreadId: string): Promise<void>
+  onRemoteStart?(operationId: string, generation: string): Promise<void>
 }
 export type RemoteLaneHost = Cc5InteractiveHostPort & { prepareTask(packet: Buffer): Promise<void> }
 
@@ -135,12 +146,13 @@ export interface RemoteLaneRuntimePort {
   /** Stops every lane of the container; a lane whose remote exit is unproved is reported, not retried. */
   release(containerDbId: string, dockerId?: string): Promise<void>
   /** The chat's live lane, created on first use. Rejects with REMOTE_LANE_UNAVAILABLE. */
-  ensureLane(request: RemoteLaneRequest): Promise<Cc5ExecutionBackend>
+  ensureLane(request: RemoteLaneRequest): Promise<RemoteExecutionBackend>
 }
 
 interface RuntimeOptions {
   baseRoot: string
   controllerPath: string
+  evidenceRoot?: string
   /** Trusted fixture seam only; default constructs the production SSH host. */
   hostFactory?: (config: Cc5SshHostConfig) => RemoteLaneHost
 }
@@ -151,8 +163,9 @@ interface Lane {
   readonly operationId: string
   readonly dir: string
   readonly view: string
-  readonly relay: Cc5Relay
-  binding: Readonly<Cc5BridgeBinding>
+  readonly generation: string
+  readonly relay: Cc5Relay | CodexRemoteRelay
+  binding: Readonly<RemoteBridgeBinding>
   stopping?: Promise<void>
 }
 interface ContainerState {
@@ -178,7 +191,7 @@ export function createRemoteLaneRuntime(input: {
   selfhost: boolean
   env: Cc5PolicyEnvironment
   configuration: () => RuntimeOptions
-  financeFactory: Cc5FinanceFactory
+  financeFactory: RemoteFinanceFactory
   hooks: RemoteLaneHooks
 }): RemoteLaneRuntimePort | undefined {
   const uid = input.env[CC5_TEST_UID_ENV]
@@ -193,7 +206,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
   constructor(
     private readonly uid: string,
     private readonly options: RuntimeOptions,
-    private readonly financeFactory: Cc5FinanceFactory,
+    private readonly financeFactory: RemoteFinanceFactory,
     private readonly hooks: RemoteLaneHooks,
   ) {
     requireRuntime(typeof financeFactory === 'function' && typeof hooks?.place === 'function')
@@ -293,14 +306,15 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     record.state = 'active'
   }
 
-  async ensureLane(request: RemoteLaneRequest): Promise<Cc5ExecutionBackend> {
+  async ensureLane(request: RemoteLaneRequest): Promise<RemoteExecutionBackend> {
     const container = this.containers.get(request.containerDbId)
     requireLane(container?.state === 'active' && container.dockerId && String(request.uid) === this.uid &&
       isCc5CanonicalModel(request.canonicalModel))
     const owner = this.chat(request.sessionKey)
     const live = (lane: Lane | undefined): lane is Lane => !!lane && lane.container === container &&
       !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
-      lane.binding.expiresAt > Date.now()
+      lane.binding.expiresAt > Date.now() &&
+      (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1')
     // A resident lane answers without waiting; anything else is decided on the chat's tail.
     let lane = owner.lane
     if (!live(lane)) {
@@ -311,8 +325,9 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
           requireLane(container.state === 'active' && container.dockerId)
           if (owner.lane) {
             const old = owner.lane
-            owner.lane = undefined
-            await this.stopLane(old) // Another container's, a dead one, or another model's.
+            await this.stopLane(old)
+            owner.lane = undefined // Only a proven stop permits replacement.
+            // // Another container's, a dead one, or another model's.
           }
           requireLane(container.state === 'active' && container.dockerId)
           const placement = await this.hooks.place({ ...request, dockerId: container.dockerId })
@@ -323,8 +338,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
             await this.stopLane(next) // Released while the node was being prepared.
             requireLane(false)
           }
+          try { await this.hooks.onState?.(next.operationId, 'running', next.generation) }
+          catch (error) {
+            try { await this.stopLane(next) } catch { owner.lane = next } // retain only a fenced lane for proof retry
+            throw error
+          }
           owner.lane = next
-          this.hooks.onState?.(next.operationId, 'running')
           return next
         } catch (error) {
           if (error instanceof Error && error.message === REMOTE_LANE_UNAVAILABLE) throw error
@@ -332,6 +351,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         }
       })
     }
+    if (lane.binding.version === 3) return codexBackend(lane.binding)
     return parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: lane.sessionKey,
       operationId: lane.operationId })
   }
@@ -353,6 +373,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
 
   private async startLane(container: ContainerState, request: RemoteLaneRequest,
     placement: RemoteLanePlacement): Promise<Lane> {
+    if (request.engine === 'codex') return this.startCodexLane(container, request, placement)
+    requireLane(!placement.codex)
     const dir = join(container.root, 'lanes', placement.operationId)
     const view = join(container.handle.mountSource, placement.operationId)
     rmSync(dir, { recursive: true, force: true })
@@ -370,7 +392,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     const createHost = this.options.hostFactory ?? ((config: Cc5SshHostConfig) => new Cc5SshHost(config))
     const host = createHost(hostConfig)
     await host.prepareTask(placement.provisionPacket)
-    const binding: Readonly<Cc5BridgeBinding> = Object.freeze({
+    const binding: Readonly<RemoteBridgeBinding> = Object.freeze({
       version: 2,
       backendKind: CC5_INTERACTIVE_BACKEND,
       canonicalModel: request.canonicalModel,
@@ -403,7 +425,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       replaceHost: () => createHost(hostConfig),
     })
     const lane: Lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
-      operationId: placement.operationId, dir, view, binding, relay }
+      operationId: placement.operationId, generation: placement.generation ?? '1', dir, view, binding, relay }
     try {
       await this.listen(relay.toolServer, toolSocketPath, 0, 0)
       await this.listen(relay.controlServer, join(view, 'relay.sock'), 1000, 1000)
@@ -412,6 +434,46 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       throw error
     }
     return lane
+  }
+
+  private async startCodexLane(container: ContainerState, request: RemoteLaneRequest, placement: RemoteLanePlacement): Promise<Lane> {
+    requireLane(placement.codex && placement.generation && this.hooks.onNativeThread && this.hooks.onRemoteStart &&
+      /^[1-9][0-9]{0,15}$/.test(placement.generation))
+    const spec = placement.codex
+    requireLane(spec.manifest.operationId === placement.operationId && spec.manifest.runId === placement.runId &&
+      spec.manifest.generation === placement.generation && request.canonicalModel === `${spec.manifest.model}-remote`)
+    const view = join(container.handle.mountSource, placement.operationId)
+    const dir = join(this.options.evidenceRoot ?? join(this.options.baseRoot, 'evidence'), placement.operationId, placement.generation)
+    // Durable evidence is never erased by adopt/release. A repeated generation is an unknown effect, not a reset.
+    requireLane(!existsSync(dir) && !existsSync(view))
+    let lane: Lane | undefined
+    try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    mkdirSync(view, { mode: 0o750 }); chownSync(view, 0, 1000); chmodSync(view, 0o750)
+    const binding: CodexRemoteBinding = Object.freeze({ version:3,backendKind:'codex-app-server-v1',
+      canonicalModel:request.canonicalModel,sessionKey:request.sessionKey,uid:this.uid,containerDbId:request.containerDbId,
+      dockerId:container.dockerId!,operationId:placement.operationId,runId:placement.runId,generation:placement.generation,
+      profileId:spec.manifest.profileId,authEpoch:spec.manifest.authEpoch,manifestSha256:codexJsonHash(JSON.stringify(spec.manifest)),
+      capability:randomBytes(32).toString('hex'),expiresAt:Date.now()+CC5_BINDING_SLIDING_TTL_MS })
+    const finance = this.financeFactory(binding, { upstreamModel:spec.manifest.model }); requireLane(finance)
+    const host = new CodexSshHost(placement.target,spec)
+    const relay = new CodexRemoteRelay(binding,container.keyring,host,spec,join(dir,'journal'),finance,
+      id => this.hooks.onNativeThread!(placement.operationId,placement.generation!,id),
+      () => this.hooks.onRemoteStart!(placement.operationId,placement.generation!))
+    lane = { container,sessionKey:request.sessionKey,canonicalModel:request.canonicalModel,operationId:placement.operationId,
+      generation:placement.generation,dir,view,binding,relay }
+    writePrivate(join(view,'binding.json'),binding,true)
+    await this.listen(relay.controlServer,join(view,'relay.sock'),1000,1000)
+    return lane
+    } catch (error) {
+      if (lane) await this.stopLane(lane).catch(() => {})
+      else {
+        // No endpoint/host was exposed. The persistent remote-start CAS remains false.
+        rmSync(view, { recursive: true, force: true })
+        try { await this.hooks.onState?.(placement.operationId, 'released', placement.generation) } catch { /* durable no-effect CAS permits recovery */ }
+      }
+      throw error
+    }
   }
 
   private stopLane(lane: Lane): Promise<void> {
@@ -423,15 +485,17 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       } catch {
         proven = false
       }
+      await this.hooks.onState?.(lane.operationId, proven ? 'released' : 'unknown', lane.generation)
+      requireLane(proven)
       for (const server of [lane.relay.controlServer, lane.relay.toolServer]) {
         if (!server.listening) continue
         server.closeAllConnections()
         await new Promise<void>((resolve) => server.close(() => resolve()))
       }
       rmSync(lane.view, { recursive: true, force: true })
-      // An unproved exit stays visible; the node root is reset before its next lane.
-      this.hooks.onState?.(lane.operationId, proven ? 'released' : 'unknown')
+      // An unproved stop retains its control endpoint for late local proof.
     })()
+    lane.stopping = lane.stopping.catch(error => { lane.stopping = undefined; throw error })
     return lane.stopping
   }
 
@@ -466,7 +530,15 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         if (owner.lane?.container !== record) return
         const lane = owner.lane
         owner.lane = undefined
-        await this.stopLane(lane)
+        try { await this.stopLane(lane) }
+        finally {
+          // Container release closes transport even when capacity remains quarantined in PG.
+          for (const server of [lane.relay.controlServer,lane.relay.toolServer]) {
+            if (!server.listening) continue
+            server.closeAllConnections()
+            await new Promise<void>(resolve => server.close(() => resolve()))
+          }
+        }
       })))
       rmSync(record.handle.mountSource, { recursive: true, force: true })
       rmSync(join(record.root, 'lanes'), { recursive: true, force: true })

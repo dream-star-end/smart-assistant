@@ -93,7 +93,7 @@ import type { AuthorityKeyCoverage } from './authorityKeyCensus.js'
 import {
   AUTHORITY_TTL_MS,
   type AuthorityKeyring,
-  type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
   type DispatchAuthorityPayload,
   MODEL_AUTHORITY_KEYRING_ENV,
   MODEL_AUTHORITY_VERSION,
@@ -536,7 +536,7 @@ export interface AuthorityMintInput {
   /** codex 的 server-owned 计费 requestId(绑定字段,可缺席)。 */
   billingRequestId?: string
   /** Trusted supervisor selection, never copied from a browser frame. */
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
 }
 
 export interface MintOptions {

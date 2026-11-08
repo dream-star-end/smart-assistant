@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 import {
   type AuthorityKeyring,
   type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
   CC5_INTERACTIVE_BACKEND,
   isCc5BackendAuthority,
   isCc5CanonicalModel,
@@ -68,7 +69,7 @@ export function assertCc5BindingScope(binding: Readonly<Cc5BridgeBinding>): void
 
 export function cc5AuthorityMatchesBinding(binding: Readonly<Cc5BridgeBinding>, authority: {
   uid: number; containerId: number; canonicalModel: string; engine: string
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
 }): boolean {
   assertCc5BindingScope(binding)
   return isCc5BackendAuthority(authority) && String(authority.uid) === binding.uid &&

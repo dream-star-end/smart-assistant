@@ -18,7 +18,7 @@ import {
   cc5ControlRequest,
   createRemoteLaneRuntime,
 } from '@openclaude/gateway/cc5-container-runtime'
-import type { Cc5FinanceFactory } from '@openclaude/gateway/cc5-finance'
+import type { RemoteFinanceFactory } from '@openclaude/gateway/remote-finance'
 import {
   MODEL_AUTHORITY_VERSION,
   type ModelAuthorityPayload,
@@ -33,7 +33,7 @@ const root = process.getuid?.() === 0
 const MODEL = 'claude-opus-5-5-remote'
 const DOCKER = 'a'.repeat(64)
 const SESSION = 'agent:main:webchat:dm:fixture_chat1'
-const financeFactory: Cc5FinanceFactory = () => ({ async admit() { return {
+const financeFactory: RemoteFinanceFactory = () => ({ async admit() { return {
   async beforeHostStart() {}, async beforeDispatch() {}, async stop() {},
   async terminal() { return { state: 'proven', requestId: 'fixture-only-request' } },
 } } })
@@ -406,5 +406,38 @@ test('a request queued for a container that was released meanwhile leaves the ot
     await f.runtime.release('92')
   } finally {
     await f.cleanup()
+  }
+})
+
+test('Codex creation failures release unexposed placement; failed running write never publishes a live owner', { skip: !root }, async () => {
+  for (const failure of ['finance','key','running'] as const) {
+    const dir=mkdtempSync('/tmp/cr-'), states:string[]=[], operationId=randomUUID(), runId=randomUUID()
+    const key=generateKeyPairSync('ed25519'), keyPath=join(dir,'key'), knownHostsPath=join(dir,'hosts')
+    writeFileSync(keyPath,'fixture',{mode:0o600}); writeFileSync(knownHostsPath,'fixture',{mode:0o600})
+    let attempts=0
+    const runtime=createRemoteLaneRuntime({selfhost:true,env,
+      financeFactory:()=>{if(failure==='finance')throw new Error('finance unavailable');return {admit:async()=>{throw new Error('must not admit')}}},
+      configuration:()=>({baseRoot:join(dir,'runtime'),controllerPath:'/unused'}),hooks:{
+        async place() { attempts++; const generation=String(attempts); return {operationId,runId,generation,taskRoot:'/unused',provisionPacket:Buffer.alloc(0),
+          target:{host:'fixture.invalid',port:22,user:'box',keyPath:failure==='key'?join(dir,'missing'):keyPath,knownHostsPath,
+            controllerSha256:'a'.repeat(64),upstreamModel:'gpt-6-luna',taskRootPrefix:'/home/box/oc-codexremote-'},
+          codex:{controllerPath:`/opt/openclaude/codex-remote/${'a'.repeat(64)}/codex-host-controller.py`,
+            manifest:{version:1,engine:'codex',operationId,runId,generation,profileId:'default',authEpoch:'epoch1',model:'gpt-6-luna',
+              root:`/home/box/oc-codexremote-${operationId.replaceAll('-','')}-g${generation}`,nativeThreadId:null,codexHome:'/unused',
+              controllerSha256:'a'.repeat(64),cliSha256:'b'.repeat(64),nativeSha256:'c'.repeat(64)},modelList:[],modelCatalog:{models:[]}}} },
+        async onNativeThread(){}, async onRemoteStart(){throw new Error('must not start')},
+        async onState(_op,state){states.push(state);if(failure==='running' && state==='running')throw new Error('write unavailable')},
+      }})!
+    try {
+      const handle=(await runtime.prepare({uid:912,containerDbId:'91',local:true,
+        publicKeyring:`fixture-key:${key.publicKey.export({format:'jwk'}).x}`}))!
+      await runtime.bindCreated(handle,DOCKER);await runtime.activate(handle,DOCKER)
+      const ensure=()=>runtime.ensureLane({uid:912,containerDbId:'91',sessionKey:SESSION,canonicalModel:'gpt-6-luna-remote',engine:'codex'})
+      await assert.rejects(ensure(),/REMOTE_LANE_UNAVAILABLE/)
+      assert.equal(states.at(-1),'released',failure)
+      assert.deepEqual(readdirSync(handle.mountSource),['authority-public.json'])
+      await assert.rejects(ensure(),/REMOTE_LANE_UNAVAILABLE/)
+      assert.equal(attempts,2,'failed running callback must not leave a reusable owner')
+    } finally { await runtime.release('91');rmSync(dir,{recursive:true,force:true}) }
   }
 })

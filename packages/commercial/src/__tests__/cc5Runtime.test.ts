@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import type { Cc5FinanceFactory } from '@openclaude/gateway/cc5-finance'
+import type { RemoteFinanceFactory } from '@openclaude/gateway/remote-finance'
 import type { RemoteLaneRuntimePort, createRemoteLaneRuntime } from '@openclaude/gateway/cc5-container-runtime'
 import { createMasterCc5Runtime, selectMasterCc5Backend } from '../agent-sandbox/cc5Runtime.js'
 
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
-const financeFactory: Cc5FinanceFactory = () => { throw new Error('must not create finance before a lane') }
+const financeFactory: RemoteFinanceFactory = () => { throw new Error('must not create finance before a lane') }
 
 test('master OFF/nonselfhost/missing authority/invalid UID/missing finance never creates the lane runtime', () => {
   let creates = 0
@@ -65,5 +65,12 @@ test('a remote-pool turn always gets its lane or fails; a local model never gets
   ] as const) {
     await assert.rejects(selectMasterCc5Backend(rt, { ...input, ...patch }, selfhost, policy), /REMOTE_LANE_UNAVAILABLE/)
   }
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 2) // mismatched Codex backend is refused after the selector returns.
+})
+
+test('Codex selector signs its own versioned backend, never CCB', async () => {
+  const sessionKey='agent:main:webchat:dm:codex_chat_123'
+  const backend={kind:'codex-app-server-v1' as const,version:1 as const,sessionKey,operationId:'00000000-0000-4000-8000-000000000001',generation:'2',profileId:'default',authEpoch:'1'}
+  const runtime={async ensureLane(input:any){assert.equal(input.engine,'codex');return backend}} as RemoteLaneRuntimePort
+  assert.deepEqual(await selectMasterCc5Backend(runtime,{uid:912,containerId:91,sessionKey,canonicalModel:'gpt-6-luna-remote',engine:'codex',placement:'remote_pool'},true,env),backend)
 })

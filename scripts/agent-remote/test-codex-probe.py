@@ -78,6 +78,20 @@ class ProbeTests(unittest.TestCase):
         (p/'fixture.json').write_text(json.dumps({'pages':[{'data':[{'id':'actual'}],'nextCursor':'0'}]}))
         got = self.probe()[0]
         self.assertEqual(got['discovered_models'],[]); self.assertFalse(got['logged_in'])
+    def test_execution_snapshot_is_exact_observed_intersection_and_real_bytes(self):
+        import hashlib
+        p=self.profile('.codex','default')
+        model={'upstream_model_id':'real','native':{'id':'real','model':'real','serviceTiers':['fast']}}
+        (p/'models_cache.json').write_text(json.dumps({'models':[{'slug':'real','tool_mode':'direct'},{'slug':'not-observed'}]}))
+        native=self.home/'native';native.write_bytes(b'fixture-native-not-production')
+        with patch.object(hostd,'CODEX_NATIVE_BINARY',native):
+            snapshot,error=hostd.codex_execution_snapshot(p,CLI,[model])
+            self.assertIsNone(error)
+            self.assertEqual(snapshot['modelCatalog'],{'models':[{'slug':'real','tool_mode':'direct'}]})
+            self.assertEqual(snapshot['modelList'],[model['native']])
+            self.assertEqual(snapshot['nativeSha256'],hashlib.sha256(native.read_bytes()).hexdigest())
+            (p/'models_cache.json').write_text('{"models":[]}')
+            self.assertEqual(hostd.codex_execution_snapshot(p,CLI,[model]),(None,'CODEX_SNAPSHOT_UNAVAILABLE'))
     def test_account_null_and_no_auth_remain_negative(self):
         p = self.profile('.codex','default'); data=json.loads((p/'fixture.json').read_text()); data['account']=None
         (p/'fixture.json').write_text(json.dumps(data))

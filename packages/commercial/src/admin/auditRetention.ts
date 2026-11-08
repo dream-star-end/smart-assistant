@@ -134,6 +134,10 @@ export const PERMANENT_AUDIT_TABLES: readonly string[] = ["admin_audit"] as cons
  * 任一 ops-ledger 表若被误加进删除政策或与合规永久表重名,resolveRetentionPolicies 抛错拒启。
  */
 export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
+  // OCV5-746: native usage boundaries and turn receipt uniqueness must survive master restarts.
+  // Deleting either would permit a resumed thread to lose its baseline or be charged twice.
+  "remote_native_threads",
+  "remote_native_turns",
   "incidents",
   "codex_repairs",
   "codex_repair_events",

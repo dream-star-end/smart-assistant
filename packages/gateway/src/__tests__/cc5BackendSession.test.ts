@@ -46,6 +46,7 @@ let constructions = 0
 registerEngine('ccb', (opts) => {
   constructions++
   const runner = new FixtureRunner(opts)
+  if (opts.executionBackend && opts.executionBackend.kind !== 'cc5-interactive-v1') throw new Error('wrong fixture engine')
   const port = opts.executionBackend ? {
     executionBackend: opts.executionBackend, canonicalModel: CC5_NATIVE_MODEL,
     bindingId: opts.executionBackend.operationId,

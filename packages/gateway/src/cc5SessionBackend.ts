@@ -1,5 +1,5 @@
 /** Session admission for a signed remote-lane chat; no model or filesystem effects. */
-import { type Cc5ExecutionBackend, boxClaudeRunner, isCc5ExecutionBackend } from '@openclaude/protocol'
+import { type Cc5ExecutionBackend, type RemoteExecutionBackend, boxClaudeRunner, isCc5ExecutionBackend } from '@openclaude/protocol'
 
 /** Remote-pool catalog ids always end in `-remote` (remoteBrainPool toRemotePoolModelId). */
 function isRemoteChatModel(model: string): boolean {
@@ -8,7 +8,7 @@ function isRemoteChatModel(model: string): boolean {
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 
 export function cc5SessionBackend(input: {
-  executionAuthority?: { source?: string; executionBackend?: Cc5ExecutionBackend }
+  executionAuthority?: { source?: string; executionBackend?: RemoteExecutionBackend }
   engineId: string
   executionModel: string
   sessionKey: string
@@ -39,7 +39,7 @@ export function cc5SessionBackend(input: {
 export async function assertFreshCc5Session(input: {
   current?: { turns: number; runner: { nativeSessionId: string | null } }
   storedResumeId?: string
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
   sessionIds: string[]
   hasPersistedTurnActivity: (ids: string[]) => Promise<boolean>
 }): Promise<void> {

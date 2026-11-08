@@ -14,7 +14,7 @@ import re
 import shlex
 import stat
 import sys
-ROLES={'provision','launch','tool-socket','stop','prove-stopped'}
+ROLES={'provision','launch','tool-socket','stop','fence-stop','prove-stopped'}
 
 def require(value):
     if not value: raise ValueError('CODEX_SSH_COMMAND_REJECTED')
@@ -27,7 +27,7 @@ def verified_argv(original,config):
     require(len(args)==6 and args[:3]==['/usr/bin/python3','-I','-B'] and args[4] in ROLES)
     require(original==' '.join(quote(x) for x in args))
     require(re.fullmatch(re.escape(config['rootPrefix'])+r'[a-z0-9-]{16,60}',args[5]))
-    allowed=config['controllers'] if args[4] in ('stop','prove-stopped') else config['controllers'][:1]
+    allowed=config['controllers'] if args[4] in ('stop','fence-stop','prove-stopped') else config['controllers'][:1]
     entry=next((x for x in allowed if x['path']==args[3]),None);require(entry is not None)
     path=Path(args[3]);require(path.resolve()==path)
     # Root-owned file alone is insufficient: a writable parent permits rename after

@@ -1,4 +1,4 @@
-import { sameCc5ExecutionBackend } from '@openclaude/protocol'
+import { sameRemoteExecutionBackend } from '@openclaude/protocol'
 import { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
 import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
@@ -344,8 +344,8 @@ export class SubprocessRunner extends EventEmitter {
       if (descriptor?.canonicalModel !== this.opts.cc5BridgePort.canonicalModel ||
           descriptor.contextOwner !== BOX_NATIVE_CONTEXT_OWNER ||
           !descriptor.executionBackend ||
-          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.executionBackend) ||
-          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.cc5BridgePort.executionBackend)) {
+          !sameRemoteExecutionBackend(descriptor.executionBackend, this.opts.executionBackend) ||
+          !sameRemoteExecutionBackend(descriptor.executionBackend, this.opts.cc5BridgePort.executionBackend)) {
         throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
       }
       return 'official-cc'
@@ -1369,7 +1369,7 @@ export class SubprocessRunner extends EventEmitter {
       if (!authority || !turnKey
         || runtime.descriptor?.canonicalModel !== this.opts.cc5BridgePort.canonicalModel
         || !runtime.descriptor.executionBackend
-        || !sameCc5ExecutionBackend(runtime.descriptor.executionBackend, this.opts.executionBackend)
+        || !sameRemoteExecutionBackend(runtime.descriptor.executionBackend, this.opts.executionBackend)
         || typeof userTextOrBlocks !== 'string' || this.readOnlyTurn || this.consultTurnBinding) {
         throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
       }

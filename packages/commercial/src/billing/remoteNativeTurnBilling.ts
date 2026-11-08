@@ -3,25 +3,27 @@
  * it cannot launch a worker.
  */
 import { isDeepStrictEqual } from 'node:util'
+import { constants, closeSync, fstatSync, openSync, readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Pool } from 'pg'
 import {
   type AuthorityKeyring, type ModelAuthorityPayload,
   assertLeaseMatchesAuthority, verifyAuthority, verifyTurnLease,
 } from '@openclaude/protocol'
-import type { Cc5BridgeBinding } from '@openclaude/gateway/cc5-container-runtime'
+import { type RemoteBridgeBinding, type CodexRemoteBinding, type RemoteNativeTerminalReceipt, type CodexNativeTerminalReceipt, type CodexNativeTokens, type RemoteFinancePort, type RemoteFinanceTurn, buildCodexReceipt, nativeTokens, nativeId, zeroNativeTokens } from '@openclaude/gateway/remote-finance'
 import type {
   Cc5FinancePort, Cc5FinanceTurn, Cc5FinanceTerminalOutcome, Cc5NativeTerminalReceipt,
 } from '@openclaude/gateway/cc5-finance'
 import type { UserModelAuthzLoader } from '../auth/userModelAuthz.js'
 import { loadSettledUsageAttribution } from '../db/pgSessionsBackend.js'
 import {
-  AUTHORITY_HEADER, TURN_LEASE_HEADER, enforceModelAuthority,
+  AUTHORITY_HEADER, TURN_LEASE_HEADER, enforceModelAuthority, enforceRemoteNativeModelAuthority,
 } from '../http/proxy/modelAuthorityGate.js'
 import type { Logger } from '../logging/logger.js'
 import { computeCost, type TokenUsage } from './calculator.js'
 import type { ModelCatalogCache } from './modelCatalog.js'
 import { parseBillingPricing, serializeBillingPricing, type PersistedBillingPricingV1 } from './persistedBillingPricing.js'
-import { REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
+import { CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
 import {
   preCheckWithCost, releasePreCheck, type PreCheckRedis, type ReservationHandle,
 } from './preCheck.js'
@@ -45,9 +47,13 @@ function object(value: unknown): Record<string, unknown> {
   need(value && typeof value === 'object' && !Array.isArray(value))
   return value as Record<string, unknown>
 }
+function marker(c: Context): string {
+  return c.v === 2 ? CODEX_REMOTE_BILLING_RECOVERY_VERSION : REMOTE_NATIVE_BILLING_RECOVERY_VERSION
+}
 interface Scope {
   uid: string; containerDbId: string; dockerId: string; operationId: string; runId: string
-  sessionKey: string; canonicalModel: string; backendKind: typeof BACKEND; expiresAt: number
+  sessionKey: string; canonicalModel: string; backendKind: typeof BACKEND | 'codex-app-server-v1'; expiresAt: number
+  generation?: string; profileId?: string; authEpoch?: string; manifestSha256?: string
   /** The lane node's CLI model; every native receipt must carry exactly it. Absent in journals
    * written before remote-pool lanes, whose only worker ran the pinned Sonnet. */
   upstreamModel?: string
@@ -59,12 +65,13 @@ function scopeUpstream(scope: Pick<Scope, 'canonicalModel' | 'upstreamModel'>): 
   return scope.canonicalModel === LEGACY_PINNED_WORKER.canonicalModel ? LEGACY_PINNED_WORKER.upstreamModel : undefined
 }
 interface Context {
-  v: 1; scope: Scope; requestId: string; turnKey: string; authorityTurnId: string
+  v: 1 | 2; scope: Scope; requestId: string; turnKey: string; authorityTurnId: string
   dispatchId: string; attemptNo: number; sessionId: string
   pricing: PersistedBillingPricingV1; billingRevision: string
   authority: { kind: 'bridge_signed'; executionRevision: string; projectionRevision: null; securityEpoch: string }
   hostStartAttempted: boolean; input: { sequence: number; inputSha256: string } | null
-  receipt: Cc5NativeTerminalReceipt | null; reserved: boolean; reservedCredits: string
+  native?: { threadId: string; baseline: CodexNativeTokens };
+  receipt: RemoteNativeTerminalReceipt | null; reserved: boolean; reservedCredits: string
 }
 export interface RemoteNativeTurnFinanceDeps {
   pool: Pool
@@ -83,19 +90,41 @@ export interface RemoteNativeFinanceFixtures {
   release?: typeof releasePreCheck
   settle?: typeof settleUsageAndLedger
 }
-function scopeOf(binding: Readonly<Cc5BridgeBinding>, upstreamModel: string): Scope {
-  need(binding.version === 2 && binding.backendKind === BACKEND
+function scopeOf(binding: Readonly<RemoteBridgeBinding>, upstreamModel: string): Scope {
+  need((binding.version === 2 && binding.backendKind === BACKEND || binding.version === 3 && binding.backendKind === 'codex-app-server-v1')
     && MODEL.test(binding.canonicalModel) && MODEL.test(upstreamModel)
     && POSITIVE_ID.test(binding.uid) && POSITIVE_ID.test(binding.containerDbId)
     && HASH.test(binding.dockerId) && UUID.test(binding.operationId) && UUID.test(binding.runId)
     && typeof binding.sessionKey === 'string' && binding.sessionKey.length > 0
     && binding.sessionKey.length <= 512 && Number.isSafeInteger(binding.expiresAt))
+  if (binding.version === 3) need(/^[1-9][0-9]{0,15}$/.test(binding.generation)
+    && /^[a-z0-9][a-z0-9-]{0,31}$/.test(binding.profileId) && nativeId(binding.authEpoch)
+    && HASH.test(binding.manifestSha256) && binding.canonicalModel === `${upstreamModel}-remote`)
   return { uid: binding.uid, containerDbId: binding.containerDbId, dockerId: binding.dockerId,
     operationId: binding.operationId, runId: binding.runId, sessionKey: binding.sessionKey,
-    canonicalModel: binding.canonicalModel, backendKind: BACKEND, expiresAt: binding.expiresAt, upstreamModel }
+    canonicalModel: binding.canonicalModel, backendKind: binding.backendKind, expiresAt: binding.expiresAt, upstreamModel,
+    ...(binding.version === 3 ? { generation: binding.generation, profileId: binding.profileId, authEpoch: binding.authEpoch, manifestSha256: binding.manifestSha256 } : {}) }
 }
-export function validateRemoteNativeReceipt(raw: unknown, scope: Scope): Cc5NativeTerminalReceipt {
+function validateCodexReceipt(raw: unknown, scope: Scope): CodexNativeTerminalReceipt {
   const r = object(raw)
+  need(r.version === 3 && nativeId(r.nativeThreadId) && nativeId(r.nativeTurnId)
+    && typeof r.authorityTurnId === 'string' && /^[a-f0-9]{32}$/.test(r.authorityTurnId)
+    && typeof r.turnKey === 'string' && HASH.test(r.turnKey)
+    && ['completed', 'failed', 'interrupted'].includes(String(r.nativeStatus)))
+  const b: CodexRemoteBinding = { version: 3, backendKind: 'codex-app-server-v1',
+    uid: scope.uid, containerDbId: scope.containerDbId, dockerId: scope.dockerId, operationId: scope.operationId,
+    runId: scope.runId, sessionKey: scope.sessionKey, canonicalModel: scope.canonicalModel,
+    generation: scope.generation!, profileId: scope.profileId!, authEpoch: scope.authEpoch!,
+    manifestSha256: scope.manifestSha256!, expiresAt: scope.expiresAt, capability: '0'.repeat(64) }
+  const expected = buildCodexReceipt(b, { authorityTurnId: r.authorityTurnId, turnKey: r.turnKey,
+    upstreamModel: scope.upstreamModel!, nativeThreadId: r.nativeThreadId, nativeTurnId: r.nativeTurnId },
+    nativeTokens(r.baseline), nativeTokens(r.total), r.nativeStatus as CodexNativeTerminalReceipt['nativeStatus'])
+  need(isDeepStrictEqual(expected, raw))
+  return expected
+}
+export function validateRemoteNativeReceipt(raw: unknown, scope: Scope): RemoteNativeTerminalReceipt {
+  const r = object(raw)
+  if (scope.backendKind === 'codex-app-server-v1') return validateCodexReceipt(raw, scope)
   const keys = 'backendKind,canonicalModel,containerDbId,dockerId,nativeSessionId,operationId,resultSha256,runId,sessionKey,status,uid,upstreamModel,usage,version'
   need(r.version === 1 || r.version === 2)
   need(Object.keys(r).sort().join(',') === (r.version === 1 ? keys
@@ -116,7 +145,7 @@ export function validateRemoteNativeReceipt(raw: unknown, scope: Scope): Cc5Nati
 }
 function parseContext(raw: unknown): Context {
   const c = object(raw)
-  need(c.v === 1 && typeof c.requestId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(c.requestId)
+  need((c.v === 1 || c.v === 2) && typeof c.requestId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(c.requestId)
     && typeof c.turnKey === 'string' && HASH.test(c.turnKey)
     && typeof c.authorityTurnId === 'string' && /^[a-f0-9]{32}$/.test(c.authorityTurnId)
     && typeof c.dispatchId === 'string' && UUID.test(c.dispatchId)
@@ -130,7 +159,11 @@ function parseContext(raw: unknown): Context {
   // The persisted scope is kept byte-for-byte (JSONB CAS/repair compare it); only validation reads the legacy pair.
   const upstream = scopeUpstream(s as unknown as Scope)
   need(upstream !== undefined && (s.upstreamModel === undefined || typeof s.upstreamModel === 'string'))
-  scopeOf({ ...s, version: 2 } as unknown as Cc5BridgeBinding, upstream)
+  need((c.v === 2) === (s.backendKind === 'codex-app-server-v1'))
+  scopeOf({ ...s, version: c.v === 2 ? 3 : 2 } as unknown as RemoteBridgeBinding, upstream)
+  if (c.v === 2 && c.native !== undefined) {
+    const n = object(c.native); need(nativeId(n.threadId)); nativeTokens(n.baseline)
+  }
   need(parseBillingPricing(c.pricing, s.canonicalModel as string))
   const a = object(c.authority)
   need(a.kind === 'bridge_signed' && typeof a.executionRevision === 'string'
@@ -143,7 +176,9 @@ function parseContext(raw: unknown): Context {
   }
   if (c.receipt !== null) {
     const receipt = validateRemoteNativeReceipt(c.receipt, s as unknown as Scope)
-    if (receipt.version === 2) need(receipt.authorityTurnId === c.authorityTurnId && receipt.turnKey === c.turnKey)
+    if (receipt.version !== 1) need(receipt.authorityTurnId === c.authorityTurnId && receipt.turnKey === c.turnKey)
+    if (receipt.version === 3) need(c.native && (c.native as Context['native'])!.threadId === receipt.nativeThreadId
+      && isDeepStrictEqual((c.native as Context['native'])!.baseline, receipt.baseline))
   }
   return structuredClone(raw) as Context
 }
@@ -163,6 +198,9 @@ async function releaseSoftReservation(
 }
 function nativeStamp(c: Context) {
   const r = c.receipt!
+  if (r.version === 3) return { version: 3, backendKind: r.backendKind, operationId: r.operationId,
+    nativeThreadId: r.nativeThreadId, nativeTurnId: r.nativeTurnId, resultSha256: r.resultSha256,
+    authorityTurnId: r.authorityTurnId, turnKey: r.turnKey, usageSemantics: r.usageSemantics, nativeUsage: r.nativeUsage, baseline: r.baseline, total: r.total }
   return { version: r.version, backendKind: BACKEND, operationId: c.scope.operationId, runId: c.scope.runId,
     nativeSessionId: r.nativeSessionId, resultSha256: r.resultSha256,
     ...(r.version === 2 ? { authorityTurnId: r.authorityTurnId, turnKey: r.turnKey } : {}) }
@@ -189,7 +227,7 @@ async function readProof(pool: Pool, c: Context): Promise<ProofRow | null> {
     FROM request_finalize_journal j JOIN usage_records ur
       ON ur.request_id=j.request_id AND ur.user_id=j.user_id
     WHERE j.request_id=$1 AND j.user_id=$2 AND j.ctx->>'remoteNativeBillingRecovery'=$3`,
-  [c.requestId, c.scope.uid, REMOTE_NATIVE_BILLING_RECOVERY_VERSION])).rows[0]
+  [c.requestId, c.scope.uid, marker(c)])).rows[0]
   if (!row) return null
   need(c.receipt && row.account_id === null && row.model === c.scope.canonicalModel
     && row.container_id === c.scope.containerDbId && row.session_id === c.sessionId && row.turn_key === c.turnKey
@@ -227,16 +265,94 @@ async function readProof(pool: Pool, c: Context): Promise<ProofRow | null> {
 async function proveAndRepair(pool: Pool, c: Context): Promise<boolean> {
   const proof = await readProof(pool, c)
   if (!proof) return false
-  if (proof.state === 'committed') return true
+  if (proof.state === 'committed') { await releaseNativeBoundary(pool, c); return true }
   need(proof.state === 'inflight' || proof.state === 'finalizing')
   const repaired = await pool.query(`/* remote-native:repair */
     UPDATE request_finalize_journal SET state='committed',usage_id=$4,ledger_id=$5,
       final_credits=$6,failure_code=NULL,ctx=ctx-'settlementClaimId',updated_at=NOW()
     WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3
       AND ctx->'remoteNative'=$7::jsonb AND state IN ('inflight','finalizing')`,
-  [c.requestId, c.scope.uid, REMOTE_NATIVE_BILLING_RECOVERY_VERSION, proof.usage_id,
+  [c.requestId, c.scope.uid, marker(c), proof.usage_id,
     proof.ledger_id, proof.cost_credits, JSON.stringify(c)])
-  return repaired.rowCount === 1 || (await readProof(pool, c))?.state === 'committed'
+  const proven = repaired.rowCount === 1 || (await readProof(pool, c))?.state === 'committed'
+  if (proven) await releaseNativeBoundary(pool, c)
+  return proven
+}
+async function releaseNativeBoundary(pool: Pool, c: Context): Promise<void> {
+  if (c.receipt?.version !== 3) return
+  const r = c.receipt
+  // Never release another turn's boundary. A later turn may already own this thread.
+  await pool.query(`/* remote-native:release-boundary */ UPDATE remote_native_threads
+    SET pending_request_id=NULL,updated_at=NOW()
+    WHERE uid=$1 AND operation_id=$2 AND native_thread_id=$3 AND pending_request_id=$4
+      AND last_native_turn_id=$5 AND total=$6::jsonb`,
+  [c.scope.uid, c.scope.operationId, r.nativeThreadId, c.requestId, r.nativeTurnId, JSON.stringify(r.total)])
+}
+async function bindNativeBoundary(pool: Pool, c: Context, threadId: string, newlyCreated: boolean): Promise<CodexNativeTokens> {
+  need(c.v === 2 && nativeId(threadId) && c.hostStartAttempted && c.input === null && c.native === undefined)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    if (newlyCreated) {
+      const added = await client.query(`INSERT INTO remote_native_threads
+        (uid,operation_id,native_thread_id,profile_id,auth_epoch,upstream_model,total)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) ON CONFLICT DO NOTHING`,
+      [c.scope.uid, c.scope.operationId, threadId, c.scope.profileId, c.scope.authEpoch, c.scope.upstreamModel, JSON.stringify(zeroNativeTokens())])
+      need(added.rowCount === 1) // a thread/start response cannot reset a prior thread's usage.
+    }
+    const row = (await client.query(`SELECT * FROM remote_native_threads
+      WHERE uid=$1 AND operation_id=$2 AND native_thread_id=$3 FOR UPDATE`,
+    [c.scope.uid, c.scope.operationId, threadId])).rows[0]
+    need(row && row.profile_id === c.scope.profileId && row.auth_epoch === c.scope.authEpoch
+      && row.pending_request_id === null)
+    const baseline = nativeTokens(row.total)
+    const native = { threadId, baseline }
+    await client.query(`UPDATE remote_native_threads SET pending_request_id=$4,upstream_model=$5,updated_at=NOW()
+      WHERE uid=$1 AND operation_id=$2 AND native_thread_id=$3`, [c.scope.uid, c.scope.operationId, threadId, c.requestId, c.scope.upstreamModel])
+    const bound = await client.query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{remoteNative,native}',$4::jsonb),updated_at=NOW()
+      WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3 AND state='inflight'
+        AND NOT (ctx->'remoteNative' ? 'native') AND ctx#>>'{remoteNative,hostStartAttempted}'='true'`,
+    [c.requestId, c.scope.uid, marker(c), JSON.stringify(native)])
+    need(bound.rowCount === 1)
+    await client.query('COMMIT')
+    c.native = native
+    return baseline
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error }
+  finally { client.release() }
+}
+async function persistCodexReceipt(pool: Pool, c: Context, r: CodexNativeTerminalReceipt): Promise<void> {
+  need(c.native?.threadId === r.nativeThreadId && isDeepStrictEqual(c.native.baseline, r.baseline))
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const boundary = (await client.query(`SELECT * FROM remote_native_threads
+      WHERE uid=$1 AND operation_id=$2 AND native_thread_id=$3 FOR UPDATE`,
+    [c.scope.uid, c.scope.operationId, r.nativeThreadId])).rows[0]
+    need(boundary && boundary.pending_request_id === c.requestId)
+    const previous = (await client.query(`SELECT * FROM remote_native_turns
+      WHERE uid=$1 AND operation_id=$2 AND native_thread_id=$3 AND native_turn_id=$4`,
+    [c.scope.uid, c.scope.operationId, r.nativeThreadId, r.nativeTurnId])).rows[0]
+    if (previous) need(previous.request_id === c.requestId && previous.receipt_sha256 === r.resultSha256
+      && isDeepStrictEqual(previous.receipt, r))
+    else {
+      need(isDeepStrictEqual(boundary.total, r.baseline))
+      await client.query(`INSERT INTO remote_native_turns
+        (uid,operation_id,native_thread_id,native_turn_id,request_id,receipt_sha256,receipt)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+      [c.scope.uid, c.scope.operationId, r.nativeThreadId, r.nativeTurnId, c.requestId, r.resultSha256, JSON.stringify(r)])
+      await client.query(`UPDATE remote_native_threads SET total=$4::jsonb,last_native_turn_id=$5,updated_at=NOW()
+        WHERE uid=$1 AND operation_id=$2 AND native_thread_id=$3`,
+      [c.scope.uid, c.scope.operationId, r.nativeThreadId, JSON.stringify(r.total), r.nativeTurnId])
+    }
+    const saved = await client.query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{remoteNative,receipt}',$4::jsonb),updated_at=NOW()
+      WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3 AND state='inflight'
+      AND ctx#>>'{remoteNative,hostStartAttempted}'='true' AND ctx#>'{remoteNative,input}'<>'null'::jsonb
+      AND (ctx#>'{remoteNative,receipt}'='null'::jsonb OR ctx#>'{remoteNative,receipt}'=$4::jsonb)`,
+    [c.requestId, c.scope.uid, marker(c), JSON.stringify(r)])
+    need(saved.rowCount === 1)
+    await client.query('COMMIT')
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error }
+  finally { client.release() }
 }
 async function settleReceipt(pool: Pool, c: Context, settle: typeof settleUsageAndLedger): Promise<boolean> {
   need(c.hostStartAttempted && c.input && c.receipt)
@@ -266,7 +382,7 @@ async function settleReceipt(pool: Pool, c: Context, settle: typeof settleUsageA
 
 export function createRemoteNativeTurnFinance(
   deps: RemoteNativeTurnFinanceDeps, fixtures: RemoteNativeFinanceFixtures = {},
-): Cc5FinancePort {
+): RemoteFinancePort {
   const reserve = fixtures.reserve ?? preCheckWithCost
   const release = fixtures.release ?? releasePreCheck
   const settle = fixtures.settle ?? settleUsageAndLedger
@@ -283,11 +399,17 @@ export function createRemoteNativeTurnFinance(
     const lease = verifyTurnLease(input.leaseEnvelope, keys, now())
     assertLeaseMatchesAuthority(lease, a)
     const backend = (a as ModelAuthorityPayload & { executionBackend?: { kind: string; sessionKey: string; operationId: string } }).executionBackend
-    need(a.engine === 'ccb' && a.canonicalModel === scope.canonicalModel
+    const engine = scope.backendKind === BACKEND ? 'ccb' : 'codex'
+    need(a.engine === engine && a.canonicalModel === scope.canonicalModel
       && String(a.uid) === scope.uid && String(a.containerId) === scope.containerDbId
-      && backend?.kind === BACKEND && backend.operationId === scope.operationId
+      && backend?.kind === scope.backendKind && backend.operationId === scope.operationId
       && backend.sessionKey === scope.sessionKey && typeof a.billingRequestId === 'string'
       && /^[A-Za-z0-9_-]{1,64}$/.test(a.billingRequestId))
+    if (input.binding.version === 3) {
+      const b = a.executionBackend
+      need(b?.kind === 'codex-app-server-v1' && b.generation === scope.generation
+        && b.profileId === scope.profileId && b.authEpoch === scope.authEpoch)
+    }
     // The Worker binding outlives a turn. Burn each signed turn/request before
     // awaiting I/O, while retaining one active financial owner per operation.
     need(!activeOperations.has(scope.operationId) && !claimedAuthorities.has(a.authorityTurnId)
@@ -299,20 +421,29 @@ export function createRemoteNativeTurnFinance(
     const releaseActive = () => {
       if (activeOperations.get(scope.operationId) === a.billingRequestId) activeOperations.delete(scope.operationId)
     }
-    const fence = () => enforceModelAuthority({ catalog: deps.catalog,
+    const fence = () => (engine === 'codex' ? enforceRemoteNativeModelAuthority : enforceModelAuthority)({ catalog: deps.catalog,
       keyring: typeof deps.keyring === 'function' ? deps.keyring() : deps.keyring,
       headers: { [AUTHORITY_HEADER]: input.authorityEnvelope, [TURN_LEASE_HEADER]: input.leaseEnvelope },
       uid: BigInt(scope.uid), containerId: BigInt(scope.containerDbId), model: scope.canonicalModel,
       loadUserModelAuthz: deps.loadUserModelAuthz, logger: deps.log, now: now() })
     const gate = await fence()
     need(gate.authorityKind === 'bridge_signed' && gate.canonicalModel === scope.canonicalModel
-      && gate.descriptor.engine === 'ccb' && gate.verifiedSignedContextOwner === 'box-native-v1')
+      && gate.descriptor.engine === engine && (engine === 'codex'
+        ? gate.descriptor.placement === 'remote_pool' : gate.verifiedSignedContextOwner === 'box-native-v1'))
     const pricing = gate.snapshot.billingPricingFor(scope.canonicalModel)
     need(pricing)
     const client = await deps.pool.connect()
     let dispatch: { dispatch_id: string; attempt_no: number; session_id: string; turn_key: string | null; authority_turn_key: string | null }
     try {
       await client.query('BEGIN')
+      if (engine === 'codex') {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`remote-finance:${scope.uid}:${scope.operationId}`])
+        const pending = await client.query(`SELECT 1 FROM request_finalize_journal
+          WHERE user_id=$1 AND ctx->>'remoteNativeBillingRecovery'=$2
+            AND ctx#>>'{remoteNative,scope,operationId}'=$3 AND state IN ('inflight','finalizing') LIMIT 1`,
+        [scope.uid,CODEX_REMOTE_BILLING_RECOVERY_VERSION,scope.operationId])
+        need(!pending.rows.length)
+      }
       const selected = (await client.query<typeof dispatch>(
       `/* remote-native:dispatch */ SELECT d.dispatch_id::text,d.attempt_no,d.session_id,
         d.turn_key,atd.turn_key AS authority_turn_key
@@ -349,7 +480,7 @@ export function createRemoteNativeTurnFinance(
       try { await client.query('ROLLBACK') } catch { /* unknown binding cannot launch a worker */ }
       throw err
     } finally { client.release() }
-    const c: Context = { v: 1, scope, requestId: a.billingRequestId, turnKey: input.turnKey,
+    const c: Context = { v: scope.backendKind === BACKEND ? 1 : 2, scope, requestId: a.billingRequestId, turnKey: input.turnKey,
       authorityTurnId: a.authorityTurnId, dispatchId: dispatch.dispatch_id, attemptNo: dispatch.attempt_no,
       sessionId: dispatch.session_id, pricing: serializeBillingPricing(pricing),
       billingRevision: gate.snapshot.billingRevision,
@@ -359,17 +490,18 @@ export function createRemoteNativeTurnFinance(
     const started = await startInflightJournal(deps.pool, { requestId: c.requestId,
       userId: BigInt(scope.uid), containerId: BigInt(scope.containerDbId), model: scope.canonicalModel,
       precheckCredits: REMOTE_NATIVE_RESERVATION_CREDITS, dispatchId: c.dispatchId, attemptNo: c.attemptNo,
-      ctxJson: { remoteNativeBillingRecovery: REMOTE_NATIVE_BILLING_RECOVERY_VERSION, remoteNative: c } })
+      ctxJson: { remoteNativeBillingRecovery: marker(c), remoteNative: c } })
     need(started) // do not overwrite/release another invocation's reservation
-    const prehostAbort = async (reason: 'USER_CANCELLED' | 'INTERNAL_ERROR') => {
+    const prehostAbort = async (reason: 'USER_CANCELLED' | 'INTERNAL_ERROR', provenNoHostEffect = false) => {
       const row = await deps.pool.query(`/* remote-native:prehost-abort */
         UPDATE request_finalize_journal SET state='aborted',final_credits=0,
           failure_code=$5,error_msg='remote_native_prehost_stopped',updated_at=NOW()
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3
           AND ctx#>>'{remoteNative,scope,operationId}'=$4 AND state='inflight'
-          AND ctx#>>'{remoteNative,hostStartAttempted}'='false'
+          AND (ctx#>>'{remoteNative,hostStartAttempted}'='false' OR $6::boolean)
+          AND NOT (ctx->'remoteNative' ? 'native')
           AND ctx#>'{remoteNative,input}'='null'::jsonb`,
-      [c.requestId, scope.uid, REMOTE_NATIVE_BILLING_RECOVERY_VERSION, scope.operationId, reason])
+      [c.requestId, scope.uid, marker(c), scope.operationId, reason, provenNoHostEffect])
       if (row.rowCount === 1) {
         await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
         releaseActive()
@@ -386,7 +518,7 @@ export function createRemoteNativeTurnFinance(
           precheck_credits=$5,updated_at=NOW()
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3
           AND state='inflight' AND ctx#>>'{remoteNative,hostStartAttempted}'='false'`,
-      [c.requestId, scope.uid, REMOTE_NATIVE_BILLING_RECOVERY_VERSION, JSON.stringify(c), c.reservedCredits])
+      [c.requestId, scope.uid, marker(c), JSON.stringify(c), c.reservedCredits])
       need(reserved.rowCount === 1)
     } catch (err) {
       // This invocation won journal ownership and has not exposed a host port.
@@ -402,8 +534,9 @@ export function createRemoteNativeTurnFinance(
          SET ctx=jsonb_set(ctx,'{remoteNative,${path}}',$5::jsonb),updated_at=NOW()
        WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3
          AND ctx#>>'{remoteNative,scope,operationId}'=$4 AND state='inflight' ${extra}`,
-      [c.requestId, scope.uid, REMOTE_NATIVE_BILLING_RECOVERY_VERSION, scope.operationId, JSON.stringify(value)])
-    const turn: Cc5FinanceTurn = {
+      [c.requestId, scope.uid, marker(c), scope.operationId, JSON.stringify(value)])
+    const turn: RemoteFinanceTurn = {
+      ...(c.v === 2 ? { bindNativeThread: (id: string, fresh: boolean) => bindNativeBoundary(deps.pool, c, id, fresh) } : {}),
       async beforeHostStart() {
         need(!hostAttempted && scope.expiresAt > now())
         hostAttempted = true // a failed CAS acknowledgement never permits a second start
@@ -415,6 +548,7 @@ export function createRemoteNativeTurnFinance(
       },
       async beforeDispatch(value) {
         need(scope.expiresAt > now() && hostAttempted && c.hostStartAttempted
+          && (c.v === 1 || c.native !== undefined)
           && !inputAttempted && Number.isSafeInteger(value.sequence) && value.sequence > 0 && HASH.test(value.inputSha256))
         inputAttempted = true
         await fence()
@@ -427,16 +561,19 @@ export function createRemoteNativeTurnFinance(
         const receipt = validateRemoteNativeReceipt(raw, scope)
         // v1 receipts remain readable by recovery only. A live continued turn
         // must carry the exact current signed admission, not just session IDs.
-        need(receipt.version === 2 && receipt.authorityTurnId === c.authorityTurnId && receipt.turnKey === c.turnKey)
+        need(receipt.version !== 1 && receipt.authorityTurnId === c.authorityTurnId && receipt.turnKey === c.turnKey)
         need(hostAttempted && inputAttempted && c.input)
         if (c.receipt) need(isDeepStrictEqual(c.receipt, receipt))
         if (finish) return finish
         c.receipt = receipt
         finish = (async () => {
           try {
-            const row = await scopedUpdate('receipt', 'receipt', receipt,
-              "AND ctx#>>'{remoteNative,hostStartAttempted}'='true' AND ctx#>'{remoteNative,input}'<>'null'::jsonb AND (ctx#>'{remoteNative,receipt}'='null'::jsonb OR ctx#>'{remoteNative,receipt}'=$5::jsonb)")
-            need(row.rowCount === 1)
+            if (receipt.version === 3) await persistCodexReceipt(deps.pool, c, receipt)
+            else {
+              const row = await scopedUpdate('receipt', 'receipt', receipt,
+                "AND ctx#>>'{remoteNative,hostStartAttempted}'='true' AND ctx#>'{remoteNative,input}'<>'null'::jsonb AND (ctx#>'{remoteNative,receipt}'='null'::jsonb OR ctx#>'{remoteNative,receipt}'=$5::jsonb)")
+              need(row.rowCount === 1)
+            }
             if (await settleReceipt(deps.pool, c, settle)) {
               await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
               releaseActive()
@@ -458,31 +595,78 @@ export function createRemoteNativeTurnFinance(
         return finish
       },
       async stop(value) {
-        if (hostAttempted || c.hostStartAttempted || value.hostStartAttempted || value.userSubmitted || !value.remoteStopped) return
-        await prehostAbort('USER_CANCELLED')
+        if (value.hostStartAttempted || value.userSubmitted || !value.remoteStopped) return
+        // Codex stop waits for admission; a durable marker alone is not a launched host.
+        const noCodexEffect = c.v === 2 && !c.native && !inputAttempted
+        if ((hostAttempted || c.hostStartAttempted) && !noCodexEffect) return
+        await prehostAbort('USER_CANCELLED', noCodexEffect)
       },
     }
     return turn
   } }
 }
 
+async function importCodexSpool(pool: Pool, c: Context, root: string): Promise<void> {
+  if (c.v !== 2 || c.receipt || !c.native || !c.input || !c.hostStartAttempted) return
+  need(UUID.test(c.scope.operationId) && /^[1-9][0-9]{0,15}$/.test(c.scope.generation!))
+  const dir = join(root,c.scope.operationId,c.scope.generation!,'journal')
+  let files: string[]
+  try { files = readdirSync(dir).filter(f => /^[0-9]{8}-native-terminal\.json$/.test(f)).sort() }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
+  for (const file of files) {
+    const fd = openSync(join(dir,file),constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    let raw: unknown
+    try {
+      const st = fstatSync(fd)
+      need(st.isFile() && st.nlink === 1 && st.size <= 131072 && !(st.mode & 0o022) && st.uid === process.getuid?.())
+      raw = JSON.parse(readFileSync(fd,'utf8'))
+    } finally { closeSync(fd) }
+    const r = validateRemoteNativeReceipt(raw,c.scope)
+    if (r.version !== 3 || r.authorityTurnId !== c.authorityTurnId || r.turnKey !== c.turnKey) continue
+    await persistCodexReceipt(pool,c,r)
+    c.receipt = r
+    return
+  }
+}
+
 /** Only durable terminal receipts enter this recovery path; no model/SSH port exists here. */
 export async function recoverRemoteNativeTurnBilling(
   deps: Pick<RemoteNativeTurnFinanceDeps, 'pool' | 'preCheckRedis' | 'log'>,
-  options: { limit?: number; settle?: typeof settleUsageAndLedger } = {},
+  options: { limit?: number; settle?: typeof settleUsageAndLedger; evidenceRoot?: string } = {},
 ): Promise<{ proven: number; pending: number }> {
   const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 25)))
   const rows = (await deps.pool.query<JournalRow & { request_id: string; user_id: string }>(
     `/* remote-native:recovery-scan */ SELECT request_id,user_id::text,state,ctx,updated_at
-     FROM request_finalize_journal WHERE ctx->>'remoteNativeBillingRecovery'=$1
-       AND state IN ('inflight','finalizing') AND ctx#>'{remoteNative,receipt}'<>'null'::jsonb
-     ORDER BY updated_at ASC LIMIT $2`, [REMOTE_NATIVE_BILLING_RECOVERY_VERSION, limit])).rows
+     FROM request_finalize_journal WHERE ctx->>'remoteNativeBillingRecovery'=ANY($1::text[])
+       AND (state IN ('inflight','finalizing') OR (state='committed' AND EXISTS (
+         SELECT 1 FROM remote_native_threads t WHERE t.uid=user_id AND t.pending_request_id=request_id)))
+       AND (ctx#>'{remoteNative,receipt}'<>'null'::jsonb OR ctx->>'remoteNativeBillingRecovery'='remote-native-v2')
+     ORDER BY updated_at ASC LIMIT $2`, [[REMOTE_NATIVE_BILLING_RECOVERY_VERSION, CODEX_REMOTE_BILLING_RECOVERY_VERSION], limit])).rows
   let proven = 0
   let pending = 0
   for (const row of rows) {
     try {
       const c = parseContext(row.ctx.remoteNative)
       need(c.requestId === row.request_id && c.scope.uid === row.user_id)
+      await importCodexSpool(deps.pool,c,options.evidenceRoot ?? '/var/lib/openclaude/remote-native')
+      if (!c.receipt && c.v === 2 && !c.input && !c.native) {
+        // No current native/input marker means no turn effect could be dispatched. An older
+        // resident app/scope is irrelevant; require its exact generation independently released.
+        const aborted = await deps.pool.query(`UPDATE request_finalize_journal j SET state='aborted',final_credits=0,
+          failure_code='INTERNAL_ERROR',error_msg='remote_native_prehost_stopped',updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND state='inflight' AND ctx->'remoteNative'=$3::jsonb
+            AND EXISTS(SELECT 1 FROM remote_agent_bindings b WHERE b.operation_id=$4 AND b.generation=$5
+              AND b.engine='codex' AND b.state='released')`,
+        [c.requestId,c.scope.uid,JSON.stringify(c),c.scope.operationId,c.scope.generation])
+        if (aborted.rowCount === 1) { await releaseSoftReservation(deps.preCheckRedis,c,deps.log); proven++; continue }
+      }
+      if (!c.receipt) {
+        // Rotate still-unknown spools; an old batch must not starve a later recoverable terminal.
+        await deps.pool.query(`UPDATE request_finalize_journal SET updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND state='inflight' AND ctx->'remoteNative'=$3::jsonb
+            AND ctx#>'{remoteNative,receipt}'='null'::jsonb`,[c.requestId,c.scope.uid,JSON.stringify(c)])
+        pending++; continue
+      }
       if (await proveAndRepair(deps.pool, c)) {
         await releaseSoftReservation(deps.preCheckRedis, c, deps.log); proven++; continue
       }
@@ -495,7 +679,7 @@ export async function recoverRemoteNativeTurnBilling(
             AND ctx->'remoteNative'=$4::jsonb AND state='finalizing'
             AND updated_at < NOW()-($5::bigint*INTERVAL '1 millisecond')
             AND NOT EXISTS(SELECT 1 FROM usage_records u WHERE u.request_id=$1 AND u.user_id=$2)`,
-        [c.requestId, c.scope.uid, REMOTE_NATIVE_BILLING_RECOVERY_VERSION, JSON.stringify(c), STALE_SETTLEMENT_MS])
+        [c.requestId, c.scope.uid, marker(c), JSON.stringify(c), STALE_SETTLEMENT_MS])
         if (reset.rowCount !== 1) { pending++; continue }
       }
       if (await settleReceipt(deps.pool, c, options.settle ?? settleUsageAndLedger)) {

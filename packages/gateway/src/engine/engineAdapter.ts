@@ -21,7 +21,7 @@
  */
 import type { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import type { Cc5ExecutionBackend, GoalStateSnapshot, JobTerminal, OutboundContentBlock } from '@openclaude/protocol'
+import type { RemoteExecutionBackend, GoalStateSnapshot, JobTerminal, OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
 import type {
@@ -208,7 +208,7 @@ export interface EngineTurnRun {
  * M0 保持与 SubprocessRunner 同名同语义,后续底座各自实现或声明不支持。
  */
 export interface EngineAdapter extends EventEmitter {
-  readonly executionBackend?: Cc5ExecutionBackend
+  readonly executionBackend?: RemoteExecutionBackend
   readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
   readonly capabilities: EngineCapabilities
 
