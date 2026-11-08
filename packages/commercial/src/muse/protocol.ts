@@ -37,11 +37,19 @@ export const JOB_DEADLINE_MS = Object.freeze({ image: 180_000, video: 390_000 })
 export const SOURCE_UPLOAD_EXTRA_MS = 120_000
 /** A dispatched job not acked within this window was never started: requeue it. */
 export const ACK_TIMEOUT_MS = 20_000
-// A bridge behind a relay that drops some responses (commercial Muse VM, 2026-10-26: poll replies,
-// heartbeat and result replies lost) needs more slack before a job is given up as MUSE_BRIDGE_LOST:
-// 5 dispatches (was 3) before "never acknowledged", 120 s without a sign of life (was 60 s) before
-// "lost contact during the job". A bridge that is really gone is noticed up to a minute later.
-export const MAX_DISPATCH_ATTEMPTS = 5
+/** One initial attempt plus three server retries, with a fixed delay after each failure. */
+export const MUSE_RETRY_MAX = 3
+export const MUSE_RETRY_INTERVAL_MS = 40_000
+export const MAX_DISPATCH_ATTEMPTS = 1 + MUSE_RETRY_MAX
+/** Retry only errors that can recover on a replacement bridge or a later upstream request. */
+export const MUSE_TRANSIENT_ERRORS: ReadonlySet<string> = new Set([
+  'MUSE_BRIDGE_OFFLINE',
+  'MUSE_BRIDGE_LOST',
+  'MUSE_UPSTREAM_ERROR',
+  'MUSE_UPLOAD_FAILED',
+  'MUSE_SOURCE_FETCH_FAILED',
+  'MUSE_TIMEOUT',
+])
 /**
  * Bridges from this version get source images by reference and download them after the ack
  * (GET /jobs/:id/sources/:n); older bridges keep receiving them inline in the poll response.

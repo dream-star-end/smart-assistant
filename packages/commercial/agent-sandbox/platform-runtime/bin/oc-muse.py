@@ -171,7 +171,7 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         payload["resume_snapshot_id"] = ns.resume
 
     status = call("GET", "/status")
-    if not status.get("bridge_online"):
+    if not status.get("bridge_online") and not status.get("retry"):
         raise MuseFailure("MUSE_BRIDGE_OFFLINE", "the Muse bridge is not connected; ask the user to start it in the Muse VM")
     job_id = call("POST", "/jobs", payload, timeout=120)["job_id"]
 
@@ -190,6 +190,7 @@ def run(kind: str, ns: argparse.Namespace) -> int:
     give_up = queue_until + ns.timeout
     deadline: float | None = None
     last_position = None
+    retry_count = 0
     view: dict = {}
     while True:
         now = time.monotonic()
@@ -216,6 +217,12 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         # First look right away (a queued job reports its place at once), then long-poll.
         wait = 25 if view else 0
         view = call("GET", f"/jobs/{job_id}?wait={wait}", timeout=60)
+        # The server owns retries of this same job. --timeout remains per execution attempt;
+        # queue_until/give_up still bound the overall wait and explicit cancellation still works.
+        retries = view.get("retry_count", 0)
+        if retries > retry_count:
+            retry_count = retries
+            deadline = None
         status = view.get("status")
         if status in TERMINAL:
             break

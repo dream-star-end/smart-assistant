@@ -92,7 +92,7 @@ export function makeMuseInternalHandler(deps: MuseInternalDeps): MuseInternalHan
       }
 
       if (method === 'GET' && sub === '/status') {
-        sendJson(res, 200, { enabled: true, bridge_online: hub.bridgeOnline() })
+        sendJson(res, 200, { enabled: true, bridge_online: hub.bridgeOnline(), retry: hub.retryPolicy() })
         return
       }
       if (method === 'POST' && sub === '/jobs') {

@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 
 import type { MuseBilling, MuseSettleInput } from '../muse/billing.js'
 import { MuseBridgeHub, type MuseBridgeHubOptions, type MuseWireJob } from '../muse/hub.js'
-import { MuseError, parseAllowedUids } from '../muse/protocol.js'
+import { MUSE_RETRY_MAX, MUSE_RETRY_INTERVAL_MS, HEARTBEAT_LOST_MS, MuseError, parseAllowedUids } from '../muse/protocol.js'
 import type { MuseJobFinish, MuseStore } from '../muse/store.js'
 
 const WEBP = Buffer.concat([Buffer.from('RIFF\0\0\0\0WEBPVP8 ', 'latin1'), Buffer.alloc(200, 7)])
@@ -412,13 +412,13 @@ describe('commercial muse hub (OCV5-574)', () => {
   it('with an orphan grace, start leaves younger rows (the other A/B slot) alone and stop closes its own', async () => {
     const hub = makeHub({ orphanGraceMs: 1_800_000 })
     await hub.start()
-    assert.deepEqual(store.orphanCalls[0], [1_800_000, []])
+    assert.deepEqual(store.orphanCalls[0], [hub.maxJobLifetimeMs() + 60_000, []])
     hub.hello('1', null)
     const id = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
     await hub.stop()
     assert.equal(store.rows.get(id)?.status, 'failed')
     assert.equal(store.rows.get(id)?.error, 'MUSE_MASTER_RESTARTED')
-    assert.ok(hub.maxJobLifetimeMs() < 1_800_000, 'a live job is always younger than the grace')
+    assert.ok(hub.maxJobLifetimeMs() < store.orphanCalls[0]![0], 'retry lifetime fits the grace')
   })
 
   it('a settle that failed after its COMMIT is delivered as charged (the database is asked)', async () => {
@@ -494,4 +494,212 @@ describe('commercial muse hub (OCV5-574)', () => {
     )
     assert.deepEqual(billing.checks.at(-1), ['160', 100n], "this 50 + the other slot's open 50")
   })
+
+  // t1654u: fake timers prove the delay, shared budget and single billing/delivery record.
+  for (const kind of ['image', 'video'] as const) {
+    it(`offline ${kind} dispatch retries after 40s and succeeds on the same billed row`, async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      const hub = makeHub()
+      const id = await hub.submit('120', null, { kind, prompt: 'p' })
+      const sid = hub.hello('1', '0.5.1')
+      let claimed = false
+      const pending = hub.poll(sid, 50_000).then((j) => { claimed = true; return j! })
+      clock.t += 39_999
+      t.mock.timers.tick(39_999)
+      await Promise.resolve()
+      assert.equal(claimed, false)
+      assert.equal(store.finished.length, 0)
+      clock.t += 1
+      t.mock.timers.tick(1)
+      const job = await pending
+      assert.equal(job.id, id)
+      if (kind === 'image') await runToSuccess(hub, job)
+      else {
+        const bytes = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'), Buffer.alloc(100)])
+        hub.heartbeat(id, job.nonce)
+        await hub.putChunk(id, job.nonce, 0, 0, bytes, sha(bytes))
+        await hub.result(id, job.nonce, { ok: true, files: [
+          { idx: 0, mime: 'video/mp4', bytes: bytes.length, sha256: sha(bytes), chunks: 1 },
+        ] })
+      }
+      assert.equal((await hub.view('120', id, 0))?.status, 'succeeded')
+      assert.equal(store.rows.size, 1)
+      assert.equal(billing.checks.length, 1)
+      assert.equal(billing.settled.length, 1)
+      assert.equal(billing.settled[0]!.jobId, id)
+      assert.equal(billing.settled[0]!.price, kind === 'image' ? 10n : 50n)
+    })
+  }
+
+  for (const cause of ['reconnect', 'heartbeat', 'ack', 'reported'] as const) {
+    it(`${cause} retries with a fresh nonce; late results cannot bill or deliver twice`, async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      const hub = makeHub()
+      let sid = hub.hello('1', '0.5.1')
+      const id = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
+      const first = (await hub.poll(sid, 1))!
+      if (cause !== 'ack') {
+        hub.heartbeat(id, first.nonce)
+        await hub.putChunk(id, first.nonce, 0, 0, WEBP, sha(WEBP))
+      }
+      if (cause === 'reconnect') sid = hub.hello('2', '0.5.1')
+      if (cause === 'heartbeat' || cause === 'ack') {
+        clock.t += cause === 'ack' ? 20_001 : HEARTBEAT_LOST_MS + 1
+        hub.checkSession(sid)
+        hub.tick()
+      }
+      if (cause === 'reported') await hub.result(id, first.nonce, {
+        ok: false, error_code: 'MUSE_UPSTREAM_ERROR', retryable: false,
+      })
+      assert.equal((await hub.view('120', id, 0))?.status, 'queued')
+      const late = () => hub.result(id, first.nonce, { ok: true })
+      await assert.rejects(late, (e: MuseError) => e.code === 'JOB_GONE')
+      let claimed = false
+      const pending = hub.poll(sid, 50_000).then((j) => { claimed = true; return j! })
+      clock.t += MUSE_RETRY_INTERVAL_MS - 1
+      t.mock.timers.tick(MUSE_RETRY_INTERVAL_MS - 1)
+      await Promise.resolve()
+      assert.equal(claimed, false)
+      clock.t += 1
+      t.mock.timers.tick(1)
+      const next = await pending
+      assert.notEqual(next.nonce, first.nonce)
+      await assert.rejects(late, (e: MuseError) => e.code === 'JOB_GONE')
+      await runToSuccess(hub, next)
+      await assert.rejects(late, (e: MuseError) => e.code === 'JOB_GONE')
+      await assert.rejects(hub.result(id, next.nonce, { ok: true }), (e: MuseError) => e.code === 'JOB_GONE')
+      assert.equal(billing.settled.length, 1)
+      assert.equal(store.finished.filter(([, f]) => f.status === 'succeeded').length, 1)
+      assert.equal(store.rows.size, 1)
+    })
+  }
+
+  it('initial failure plus three failed retries exposes the original failure path only at exhaustion', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const hub = makeHub()
+    const sid = hub.hello('1', '0.5.1')
+    const id = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
+    for (let attempt = 0; attempt <= MUSE_RETRY_MAX; attempt++) {
+      hub.checkSession(sid)
+      const job = (await hub.poll(sid, 1))!
+      hub.heartbeat(id, job.nonce)
+      await hub.result(id, job.nonce, { ok: false, error_code: 'MUSE_UPSTREAM_ERROR', upstream_error_code: 'TEMPORARY' })
+      if (attempt < MUSE_RETRY_MAX) {
+        assert.equal((await hub.view('120', id, 0))?.status, 'queued')
+        assert.equal(store.finished.length, 0, 'caller must not receive terminal failure early')
+        clock.t += MUSE_RETRY_INTERVAL_MS
+        t.mock.timers.tick(MUSE_RETRY_INTERVAL_MS)
+      }
+    }
+    const view = await hub.view('120', id, 0)
+    assert.equal(view?.status, 'failed')
+    assert.equal(view?.error?.code, 'MUSE_UPSTREAM_ERROR')
+    assert.equal(view?.error?.upstream_error_code, 'TEMPORARY')
+    assert.equal(store.finished.length, 1)
+    assert.equal(billing.settled.length, 0)
+    assert.equal(store.rows.size, 1)
+  })
+
+  it('offline retries exhaust at 120s, retain admission limits, and never bill', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const hub = makeHub({ userInflightMax: 1 })
+    const id = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
+    await assert.rejects(hub.submit('120', null, { kind: 'image', prompt: 'q' }), (e: MuseError) => e.code === 'MUSE_USER_BUSY')
+    for (let i = 0; i < MUSE_RETRY_MAX; i++) {
+      assert.equal((await hub.view('120', id, 0))?.status, 'queued')
+      clock.t += MUSE_RETRY_INTERVAL_MS
+      t.mock.timers.tick(MUSE_RETRY_INTERVAL_MS)
+    }
+    assert.equal((await hub.view('120', id, 0))?.error?.code, 'MUSE_BRIDGE_OFFLINE')
+    assert.equal(billing.settled.length, 0)
+  })
+
+  it('cancellation and shutdown clear pending retries', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const hub = makeHub()
+    const a = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
+    const b = await hub.submit('121', null, { kind: 'image', prompt: 'q' })
+    hub.cancel('120', a)
+    await hub.stop()
+    clock.t += 120_000
+    t.mock.timers.tick(120_000)
+    assert.equal((await hub.view('120', a, 0))?.status, 'cancelled')
+    assert.equal((await hub.view('121', b, 0))?.error?.code, 'MUSE_MASTER_RESTARTED')
+    assert.equal(store.finished.length, 2)
+    assert.equal(billing.settled.length, 0)
+  })
+
+  for (const code of ['MUSE_INVALID_INPUT', 'MUSE_UPSTREAM_REJECTED', 'MUSE_VIDEO_REGION_BLOCKED', 'MUSE_CANCELLED']) {
+    it(`${code} skips retries even when the bridge marks it retryable`, async () => {
+      const hub = makeHub()
+      const sid = hub.hello('1', '0.5.1')
+      const id = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
+      const job = (await hub.poll(sid, 1))!
+      hub.heartbeat(id, job.nonce)
+      await hub.result(id, job.nonce, { ok: false, error_code: code, retryable: true })
+      assert.equal((await hub.view('120', id, 0))?.error?.code, code)
+      assert.equal((await hub.view('120', id, 0))?.retry_count, 0)
+      assert.equal(billing.settled.length, 0)
+    })
+  }
+
+
+  it('a long video attempt does not spend its execution time out of the queue wait limit', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const hub = makeHub({ queueWaitMs: { image: 60_000, video: 60_000 } })
+    const sid = hub.hello('1', '0.5.1')
+    const id = await hub.submit('120', null, { kind: 'video', prompt: 'p' })
+    const first = (await hub.poll(sid, 1))!
+    hub.heartbeat(id, first.nonce)
+    clock.t += 300_000
+    hub.checkSession(sid)
+    await hub.result(id, first.nonce, { ok: false, error_code: 'MUSE_TIMEOUT' })
+    hub.tick()
+    assert.equal((await hub.view('120', id, 0))?.status, 'queued')
+    clock.t += 40_000
+    t.mock.timers.tick(40_000)
+    const next = (await hub.poll(sid, 1))!
+    assert.equal(next.id, id)
+    hub.heartbeat(id, next.nonce)
+    await hub.result(id, next.nonce, { ok: false, error_code: 'MUSE_TIMEOUT' })
+    clock.t += 20_001
+    hub.tick()
+    assert.equal((await hub.view('120', id, 0))?.error?.code, 'MUSE_BUSY', 'cumulative waiting still respects the original limit')
+  })
+
+  it('a chunk already writing during reconnect cannot corrupt the replacement attempt', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const hub = makeHub()
+    const sid = hub.hello('1', '0.5.1')
+    const id = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
+    const first = (await hub.poll(sid, 1))!
+    hub.heartbeat(id, first.nonce)
+    const writing = hub.putChunk(id, first.nonce, 0, 0, WEBP, sha(WEBP))
+    const nextSid = hub.hello('2', '0.5.1')
+    await assert.rejects(writing)
+    clock.t += 40_000
+    t.mock.timers.tick(40_000)
+    const next = (await hub.poll(nextSid, 1))!
+    await runToSuccess(hub, next)
+    assert.equal((await hub.view('120', id, 0))?.status, 'succeeded')
+    assert.equal(billing.settled.length, 1)
+  })
+
+  it('a success being verified wins a concurrent reconnect exactly once', async () => {
+    const hub = makeHub()
+    const sid = hub.hello('1', '0.5.1')
+    const id = await hub.submit('120', null, { kind: 'image', prompt: 'p' })
+    const job = (await hub.poll(sid, 1))!
+    hub.heartbeat(id, job.nonce)
+    await hub.putChunk(id, job.nonce, 0, 0, WEBP, sha(WEBP))
+    const result = hub.result(id, job.nonce, { ok: true, files: [
+      { idx: 0, mime: 'image/webp', bytes: WEBP.length, sha256: sha(WEBP), chunks: 1 },
+    ] })
+    hub.hello('2', '0.5.1')
+    await result
+    assert.equal((await hub.view('120', id, 0))?.status, 'succeeded')
+    assert.equal((await hub.view('120', id, 0))?.retry_count, 0)
+    assert.equal(billing.settled.length, 1)
+  })
+
 })
