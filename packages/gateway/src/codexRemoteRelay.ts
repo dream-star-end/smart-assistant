@@ -1,3 +1,4 @@
+import { memoryRejection, nodeMemoryError } from './remoteNodeMemory.js'
 /** Privileged master relay. It never runs a model tool, and never trusts MCP metadata as observation. */
 import { timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -25,7 +26,7 @@ interface Tool { seq: number; request: any; delivered: boolean; result?: unknown
 export class CodexRemoteRelay {
   readonly controlServer = createServer((req, res) => { void this.control(req, res).catch(e => {
     this.fence(e instanceof Error ? e.message : 'CODEX_CONTROL_REJECTED')
-    if (!res.headersSent) { res.writeHead(403); res.end('{"ok":false,"error":"CODEX_REMOTE_REJECTED"}') }
+    if (!res.headersSent) { res.writeHead(403); res.end(JSON.stringify({ ok:false, ...(memoryRejection(e) ?? {error:'CODEX_REMOTE_REJECTED'}) })) }
     else res.destroy()
   }) })
   // Kept separate for the runtime's permission layout. Codex's tool channel is SSH, not container HTTP.
@@ -35,6 +36,7 @@ export class CodexRemoteRelay {
   private localStopped = true
   private readonly localStops = new EventEmitter()
   private launched = false
+  private memoryRefused = false
   private turnHostAttempted = false
   private starting = false
   private admitting?: Promise<void>
@@ -212,6 +214,9 @@ export class CodexRemoteRelay {
         codexNeed(!this.revoked && row.version === 1 && row.engine === 'codex' && row.seq === ++this.appSeq)
         this.identity(row)
         if (!ready) {
+          if (row.kind === 'error' && row.code === 'REMOTE_NODE_MEMORY_EXHAUSTED') {
+            const e=nodeMemoryError(row.activeSessions); this.memoryRefused=true; throw e
+          }
           codexNeed(row.kind === 'ready'); ready = true; clearTimeout(timer); this.record('ready', row); resolve(); return
         }
         if (row.kind === 'stderr') return
@@ -236,6 +241,9 @@ export class CodexRemoteRelay {
       const timer = setTimeout(() => fail(new Error('CODEX_TOOL_SOCKET_TIMEOUT')), 30000)
       const fail = (e: Error) => { clearTimeout(timer); reject(e); this.fence(e.message) }
       readCodexLines(socket, row => {
+        if (!ready && row.kind === 'error' && row.code === 'REMOTE_NODE_MEMORY_EXHAUSTED') {
+          const e=nodeMemoryError(row.activeSessions); this.memoryRefused=true; throw e
+        }
         codexNeed(!this.revoked && row.version === 3 && row.engine === 'codex')
         if (!ready) {
           codexNeed(row.kind === 'socket-ready' && row.operationId === this.binding.operationId &&
@@ -458,7 +466,8 @@ export class CodexRemoteRelay {
       const proof = await this.host.stop()
       await this.waitLocalStop()
       await this.financeTurn?.stop({ hostStartAttempted: this.turnHostAttempted, userSubmitted: this.dispatching,
-        remoteStopped: proof.remoteStopped && this.localStopped })
+        remoteStopped: proof.remoteStopped && this.localStopped,
+        ...(this.memoryRefused ? { nodeAdmissionRejected: true } : {}) })
       codexNeed(proof.remoteStopped && this.localStopped, 'CODEX_STOP_UNKNOWN')
       this.record('stopped', { remoteStopped: true }); return { remoteStopped: true as const }
     })().catch(error => { this.stopping = undefined; throw error })

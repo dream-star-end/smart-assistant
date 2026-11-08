@@ -198,7 +198,8 @@
     "0331_refresh_reissue_client_ip",
     "0332_turn_dispatch_turn_key",
     "0333_remote_agent_pool",
-    "0335_codex_remote_native"
+    "0335_codex_remote_native",
+    "0337_remote_engine_concurrency"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -32,7 +32,7 @@ async function harness(t: any, ttl=120000) {
  let admitted=false,charged=false,stopCalls=0,financeIndex=0
  const financeStops:any[]=[]
  let gate:{stage:string;entered:()=>void;wait:Promise<void>}|undefined
- const host={provision:async()=>{assert.equal(admitted,true)},open:(role:'launch'|'tool-socket')=>{
+ const host={preflight:async()=>({memoryOk:true,activeSessions:0}),provision:async()=>{assert.equal(admitted,true)},open:(role:'launch'|'tool-socket')=>{
   assert.equal(admitted,true)
   const c=spawn(process.execPath,[new URL('./fixtures/codexRemoteNode.mjs',import.meta.url).pathname],
    {stdio:['pipe','pipe','pipe','ipc'],env:{...process.env,OC_TEST_NODE:JSON.stringify({role,manifest:spec.manifest})}}) as ChildProcessWithoutNullStreams
@@ -134,7 +134,7 @@ for (const stage of ['reserve','host-marker'] as const) test(`stop drains ${stag
  let entered!:()=>void,unblock!:()=>void,marks=0,stops=0,provisions=0
  const arrival=new Promise<void>(r=>entered=r),barrier=new Promise<void>(r=>unblock=r)
  const relay=new CodexRemoteRelay(b,new Map([[a.keyId,new Uint8Array(Buffer.from(key.publicKey.export({format:'jwk'}).x!,'base64url'))]]),
-  {provision:async()=>{provisions++},open:()=>{throw new Error('must not launch')},stop:async()=>({remoteStopped:true})},spec,join(dir,'journal'),
+  {preflight:async()=>({memoryOk:true,activeSessions:0}),provision:async()=>{provisions++},open:()=>{throw new Error('must not launch')},stop:async()=>({remoteStopped:true})},spec,join(dir,'journal'),
   {admit:async()=>{if(stage==='reserve'){entered();await barrier}return {
    beforeHostStart:async()=>{marks++;if(stage==='host-marker'){entered();await barrier}},beforeDispatch:async()=>{},
    terminal:async()=>({state:'pending'}),stop:async proof=>{assert.deepEqual(proof,{hostStartAttempted:false,userSubmitted:false,remoteStopped:true});stops++},

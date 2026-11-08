@@ -147,10 +147,23 @@ def codex_check_config_sources(codex_home, cwd, system_root=pathlib.Path("/etc/c
         raise ValueError('CODEX_POLICY_REJECTED')
 
 
-def codex_scope_command(unit, argv, environment):
-    # Scope admission happens before executing the CLI. No post-spawn PID migration.
+def engine_resources():
+    # Same immutable bundle as this controller; never import user search paths.
+    import types
+    source = pathlib.Path(__file__).resolve().with_name('remote-engine-resources.py')
+    data = source.read_bytes()
+    if hashlib.sha256(data).hexdigest() != '66083b5913581789232d8ec3535427cc1aef34601f0e4b2c6fee6534af9e2feb':
+        raise RuntimeError('REMOTE_RESOURCE_BUNDLE_MISMATCH')
+    module = types.ModuleType('remote_engine_resources'); module.__file__ = str(source)
+    exec(compile(data, str(source), 'exec'), module.__dict__)
+    return module
+
+
+def codex_scope_command(unit, argv, environment, role='app'):
+    c = engine_resources().config('codex')
     return ['/usr/bin/systemd-run', '--user', '--scope', '--quiet', '--unit', unit,
-            '-p', 'MemoryMax=1073741824', '-p', 'TasksMax=128', '-p', 'KillMode=control-group',
+            '-p', 'Slice=' + c['slice'], '-p', 'MemoryMax=' + str(c[role]),
+            '-p', 'TasksMax=128', '-p', 'KillMode=control-group',
             '--', '/usr/bin/env', '-i', *[k + '=' + v for k, v in environment.items()], *argv]
 
 
@@ -177,21 +190,24 @@ def codex_scope_stop(unit):
 
 # Runs inside the scope before any CLI/auth/config processing. A dead probe owner can
 # fence a queued systemd launch; late workers cannot use a new generation's claim.
+# OCV5-746 §4: the probe has its own claim file and exec gate; runtime Codex lanes never take
+# either, so a discovery probe cannot block a running session and a running session never
+# blocks discovery for longer than the probe's own scope.
 CODEX_PROBE_WRAPPER = """import fcntl,json,os,pathlib,sys
 home=pathlib.Path(os.environ['CODEX_HOME']); unit=sys.argv[1]
 fd=os.open(home/'PROBE-LAUNCH.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
 fcntl.flock(fd,fcntl.LOCK_EX); os.set_inheritable(fd,True)
-claim=json.loads((home/'OC_REMOTE_ACTIVE.json').read_text())
-if claim.get('kind')!='probe' or claim.get('unit')!=unit or (home/(unit+'.revoked')).exists(): sys.exit(126)
+claim=json.loads((home/'PROBE_ACTIVE.json').read_text())
+if claim.get('unit')!=unit or (home/(unit+'.revoked')).exists(): sys.exit(126)
 os.execve(sys.argv[2],sys.argv[2:],dict(os.environ))
 """
 
 
 def codex_reconcile_probe_locked(codex_home):
-    """AUTH.lock held exclusively. Never clears runtime claims or unproved stops."""
+    """PROBE-CLAIM.lock held exclusively. Never reads or clears runtime lane claims."""
     import fcntl
     import stat
-    active=codex_home/'OC_REMOTE_ACTIVE.json'
+    active=codex_home/'PROBE_ACTIVE.json'
     fd=os.open(active,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     try:
         st=os.fstat(fd)
@@ -199,16 +215,14 @@ def codex_reconcile_probe_locked(codex_home):
             raise ValueError('CODEX_PROFILE_BUSY')
         claim=json.loads(os.read(fd,16385))
     finally: os.close(fd)
-    if claim.get('kind')!='probe': raise ValueError('CODEX_PROFILE_BUSY')
     unit=claim.get('unit'); pid=claim.get('ownerPid'); ticks=claim.get('ownerStartTicks')
     if (not isinstance(unit,str) or not re.fullmatch(r'oc-codex-probe-[0-9a-f]{32}\.scope',unit)
             or type(pid) is not int or pid<=0 or not isinstance(ticks,str) or not ticks.isdigit()
             or claim.get('bootId')!=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()):
         raise ValueError('CODEX_STOP_UNKNOWN')
-    # AUTH.lock, not the long-lived hostd PID, is the active-request authority.
-    # Obtaining it proves the previous request returned or died; a queued child
-    # still cannot exec after the durable revocation below.
-    # Fence first; even a systemd job queued before owner death cannot launch its CLI later.
+    # The probe claim lock, not the long-lived hostd PID, is the probe's authority: holding it
+    # proves the previous probe returned or died, and the exec gate below still fences a queued
+    # child. Fence first; even a systemd job queued before owner death cannot launch its CLI later.
     revoked=codex_home/(unit+'.revoked')
     fd=os.open(revoked,os.O_CREAT|os.O_WRONLY|os.O_NOFOLLOW,0o600)
     try: os.fsync(fd)
@@ -222,6 +236,7 @@ def codex_reconcile_probe_locked(codex_home):
         try: fcntl.flock(gate,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: raise ValueError('CODEX_STOP_UNKNOWN') from None
         # Stop verified by systemd; gate and retained revocation prevent a delayed exec.
+        engine_resources().release('probe:' + unit)
         active.unlink()
         dfd=os.open(codex_home,os.O_RDONLY|os.O_DIRECTORY)
         try: os.fsync(dfd)
@@ -298,12 +313,15 @@ def codex_profile_probe(codex_home, exe_path, timeout=20):
     unit = 'oc-codex-probe-' + uuid.uuid4().hex + '.scope'
     started = False
     claimed = False
+    reserved = False
     temporary = None
-    active = codex_home / 'OC_REMOTE_ACTIVE.json'
+    active = codex_home / 'PROBE_ACTIVE.json'
     try:
         if codex_home.is_symlink() or codex_home.resolve() != codex_home.absolute():
             raise ValueError('CODEX_POLICY_REJECTED')
-        lock = os.open(codex_home / 'AUTH.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        # The probe is exclusive only with another probe: runtime lanes share CODEX_HOME and are
+        # never blocked by discovery (OCV5-746 §4).
+        lock = os.open(codex_home / 'PROBE-CLAIM.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -324,6 +342,10 @@ def codex_profile_probe(codex_home, exe_path, timeout=20):
             cwd = root / 'empty'; cwd.mkdir(mode=0o500)
             home = root / 'home'; home.mkdir(mode=0o700)
             codex_check_config_sources(codex_home, cwd)
+            resources = engine_resources()
+            resources.admit('probe:' + unit, 'codex', str(codex_home),
+                            {unit: resources.config('codex')['app']}, kind='probe')
+            reserved = True
             env = {'HOME': str(home), 'CODEX_HOME': str(codex_home), 'PATH': '/usr/bin:/bin',
                    'LANG': 'C.UTF-8', 'XDG_CONFIG_HOME': str(home / 'config'),
                    'XDG_DATA_HOME': str(home / 'data'), 'XDG_CACHE_HOME': str(home / 'cache')}
@@ -403,10 +425,10 @@ def codex_profile_probe(codex_home, exe_path, timeout=20):
                 codex_scope_stop(unit)
                 process.wait(timeout=8)
                 started = False
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         code = str(exc)
         result.update(discovered_models=[], models_observed=False,
-                      error_code=code if re.fullmatch(r'CODEX_[A-Z_]+', code) else 'CODEX_MODEL_LIST_FAILED')
+                      error_code=code if re.fullmatch(r'(?:CODEX|REMOTE)_[A-Z_]+', code) else 'CODEX_MODEL_LIST_FAILED')
     finally:
         if started:
             try:
@@ -415,6 +437,7 @@ def codex_profile_probe(codex_home, exe_path, timeout=20):
                 started = False
             except (OSError, ValueError, subprocess.SubprocessError):
                 result.update(discovered_models=[], models_observed=False, error_code='CODEX_STOP_UNKNOWN')
+        if reserved and not started: engine_resources().release('probe:' + unit)
         if claimed and not started:
             active.unlink()
             directory_fd = os.open(codex_home, os.O_RDONLY | os.O_DIRECTORY)

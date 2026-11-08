@@ -68,6 +68,8 @@ class ControllerFixture(unittest.TestCase):
         stack.enter_context(patch.object(mod, 'owner', lambda _: dict(info)))
         stack.enter_context(patch.object(mod, 'check_sources', lambda *_: None))
         stack.enter_context(patch.object(mod, 'claude_executable', lambda *_args, **_kw: str(root / 'bin/claude-2.1.316')))
+        stack.enter_context(patch.object(mod, 'admit_scope', lambda *_: None))
+        stack.enter_context(patch.object(mod, 'engine_resources', lambda: SimpleNamespace(release=lambda *_:None,stop=lambda *_:None)))
         stack.enter_context(patch.object(mod, 'tmux', lambda *_args, **_kw: CompletedProcess([], 1)))
         stack.enter_context(patch.object(mod.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(json.dumps(packet()).encode()))))
         with redirect_stdout(io.StringIO()):
@@ -444,6 +446,7 @@ s=importlib.util.spec_from_file_location('controller',sys.argv[1]);m=importlib.u
 r=Path(sys.argv[2]);m.owner=lambda _: {'session':'synthetic-task','cwd':str(r/'work'),'pluginDigest':'fixture'}
 m.check_sources=lambda *_: {'mod/oc-bridge/'+name:b'fixture' for name in m.PLUGIN}
 m.claude_executable=lambda *_args,**_kw:'fixture';m.profile_args=lambda *_:[]
+m.admit_scope=lambda *_:None
 m.proc=lambda pid:(['synthetic-controller'],'1');m.process_record=lambda pid:{'pid':pid,'startTicks':'1'}
 m.launch(r,'claude-sonnet-5')
 '''
@@ -676,6 +679,8 @@ m.launch(r,'claude-sonnet-5')
         stack.enter_context(patch.object(mod, 'NODE_CLI', home / '.oc-remote-cc/claude-2.1.316'))
         stack.enter_context(patch.object(mod, 'NODE_ROOT', re.compile(re.escape(str(home)) + r'/oc-agentremote-[a-z0-9-]+\Z')))
         stack.enter_context(patch.object(mod, 'cli_identity', lambda _path: {}))
+        stack.enter_context(patch.object(mod, 'admit_scope', lambda *_: None))
+        stack.enter_context(patch.object(mod, 'engine_resources', lambda: SimpleNamespace(release=lambda *_:None,stop=lambda *_:None)))
         stack.enter_context(patch.object(mod, 'tmux', lambda *_a, **_k: CompletedProcess([], 1)))
         packet = mod.package_provision('l0123456789abcdef0123456', str(home), op, run)
         return home, Path(packet['install']['root']), packet

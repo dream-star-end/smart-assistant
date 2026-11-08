@@ -112,7 +112,7 @@ function placementPool(candidates: Array<Record<string, unknown>>, bindings: Arr
 }
 const candidate = (over: Record<string, unknown> = {}) => ({
   profile_id: 'profile-2', node_id: 'node-7', engine: 'cc', profile_name: 'acct-2', runner_mode: 'interactive',
-  node_max_active_slots: 1, shared_active_cap: 1, weight: 100, health_score: 100, hot_slots: 0, active_slots: 0, max_hot_slots: 4, max_active_slots: 2,
+  max_concurrent_lanes: 5, weight: 100, health_score: 100, hot_slots: 0, active_slots: 0, max_hot_slots: 4, max_active_slots: 5,
   offer_id: 'offer-3', upstream_model_id: 'claude-opus-5-5', canonical_model_id: 'claude-opus-5-5-remote',
   label: 'pool node 7', ssh_host: 'node-7.pool.example', ssh_port: 22, ssh_user: 'box',
   host_key_fp: 'SHA256:fixture', key_id: 'key-7', rtt_ms_p50: 40, node_status: 'active', ...over,

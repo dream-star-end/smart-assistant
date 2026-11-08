@@ -36,6 +36,7 @@ before(async () => {
   setPoolOverride(pool)
   await resetAndMigrateBefore('0334')
   await pool.query(readFileSync(new URL('../db/migrations/0335_codex_remote_native.sql',import.meta.url),'utf8'))
+  await pool.query(readFileSync(new URL('../db/migrations/0337_remote_engine_concurrency.sql',import.meta.url),'utf8'))
   uid = (await pool.query(`INSERT INTO users(email,password_hash,credits) VALUES('codex746@example.test','test-only',100000) RETURNING id::text`)).rows[0].id
   await pool.query(`INSERT INTO agent_containers(id,user_id,secret_hash) VALUES(7,$1,$2)`,[uid,Buffer.alloc(32,1)])
   node = (await pool.query(`INSERT INTO remote_agent_nodes(label,ssh_host,ssh_user,host_key_fp,key_id,controller_sha256,status)
@@ -52,20 +53,42 @@ before(async () => {
   }
 })
 after(async () => { await closePool() })
-test('CC and Codex contend atomically for one node slot; unknown and stale generation never free it', async () => {
+test('engines pool independently: five Codex lanes per account, the sixth is rejected, CC never contends', async () => {
   const request = { uid:Number(uid),containerDbId:'7',dockerId:'a'.repeat(64) }
-  const outcomes = await Promise.allSettled([
-    placeRemoteLane({...request,sessionKey:'agent:main:webchat:dm:cc_slot_test',canonicalModel:'claude-sonnet-5-remote'}, {pool,packet:async()=>Buffer.from('fixture')}),
-    placeRemoteLane({...request,sessionKey:'agent:main:webchat:dm:codex_slot_test',canonicalModel:model,engine:'codex'}, {pool}),
-  ])
-  assert.equal(outcomes.filter(x=>x.status==='fulfilled').length,1)
-  const winner = outcomes.find(x=>x.status==='fulfilled') as PromiseFulfilledResult<Awaited<ReturnType<typeof placeRemoteLane>>>
-  await recordRemoteLaneState(winner.value.operationId,'unknown',pool,winner.value.generation)
-  await assert.rejects(placeRemoteLane({...request,sessionKey:'agent:main:webchat:dm:third_slot_test',canonicalModel:model,engine:'codex'}, {pool}),/NO_ELIGIBLE/)
-  await recordRemoteLaneState(winner.value.operationId,'released',pool,'99')
-  assert.equal((await pool.query(`SELECT state FROM remote_agent_bindings WHERE operation_id=$1`,[winner.value.operationId])).rows[0].state,'unknown')
-  await recordRemoteLaneState(winner.value.operationId,'released',pool,winner.value.generation)
-  let next = await placeRemoteLane({...request,sessionKey:'agent:main:webchat:dm:codex_second_test',canonicalModel:model,engine:'codex'}, {pool})
+  const ccPlace = (key:string) => placeRemoteLane({...request,sessionKey:`agent:main:webchat:dm:${key}`,canonicalModel:'claude-sonnet-5-remote'}, {pool,packet:async()=>Buffer.from('fixture')})
+  const codexPlace = (key:string) => placeRemoteLane({...request,sessionKey:`agent:main:webchat:dm:${key}`,canonicalModel:model,engine:'codex'}, {pool})
+  // Same node, both engines at once: neither consumes the other's pool.
+  const [firstCc, firstCodex] = await Promise.all([ccPlace('cc_slot_test'), codexPlace('codex_slot_test')])
+  assert.ok(firstCc.operationId && firstCodex.operationId)
+  // An unknown (unproven) stop keeps occupying its own Codex slot — and only that pool.
+  await recordRemoteLaneState(firstCodex.operationId,'unknown',pool,firstCodex.generation)
+  await recordRemoteLaneState(firstCodex.operationId,'released',pool,'99') // stale generation frees nothing
+  assert.equal((await pool.query(`SELECT state FROM remote_agent_bindings WHERE operation_id=$1`,[firstCodex.operationId])).rows[0].state,'unknown')
+  const codexLanes = [firstCodex]
+  const contenders = await Promise.allSettled(Array.from({length:5},(_,i)=>codexPlace(`codex_race_${i}`)))
+  assert.equal(contenders.filter(r=>r.status==='fulfilled').length,4)
+  assert.equal(contenders.filter(r=>r.status==='rejected').length,1)
+  for (const r of contenders) if(r.status==='fulfilled') codexLanes.push(r.value)
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM remote_agent_bindings WHERE profile_id=$1 AND state<>'released'`,[codex])).rows[0].n,5)
+  await assert.rejects(codexPlace('codex_slot_6'),/REMOTE_LANE_CAPACITY_EXHAUSTED/)
+  // The Codex pool being full leaves CC's pool untouched.
+  const moreCc = await Promise.all(Array.from({length:4},(_,i)=>ccPlace(`cc_more_${i}`)))
+  await recordRemoteLaneState(firstCc.operationId,'unknown',pool,firstCc.generation)
+  await assert.rejects(ccPlace('cc_sixth'),/REMOTE_LANE_CAPACITY_EXHAUSTED/)
+  // A second Codex account on the same engine/node has its own five slots, not a node+engine cap.
+  const other = (await pool.query(`INSERT INTO remote_agent_profiles(node_id,engine,profile_name,account_fingerprint,runner_mode,
+    probe_snapshot,execution_ready,auth_epoch,execution_manifest)
+    SELECT node_id,engine,'codex-other','other',runner_mode,probe_snapshot,execution_ready,auth_epoch,execution_manifest
+    FROM remote_agent_profiles WHERE id=$1 RETURNING id`,[codex])).rows[0].id
+  await pool.query(`INSERT INTO remote_model_offers(profile_id,upstream_model_id,canonical_model_id,base_display_name)
+    SELECT $1,upstream_model_id,canonical_model_id,base_display_name FROM remote_model_offers WHERE profile_id=$2`,[other,codex])
+  const otherLanes = await Promise.all(Array.from({length:5},(_,i)=>codexPlace(`other_${i}`)))
+  assert.ok(otherLanes.every(r=>r.profileId===String(other)))
+  for(const lane of otherLanes) await recordRemoteLaneState(lane.operationId,'released',pool,lane.generation)
+  await pool.query(`UPDATE remote_agent_profiles SET status='disabled',disabled_by='admin' WHERE id=$1`,[other])
+  // A proven release frees exactly one Codex slot.
+  await recordRemoteLaneState(firstCodex.operationId,'released',pool,firstCodex.generation)
+  let next = await codexPlace('codex_slot_6')
   assert.equal(next.codex?.manifest.model,upstream)
   assert.equal(next.codex?.manifest.generation,'1')
   await assert.rejects(reconcileRemoteLane(pool,next.operationId,'99'),/UNPROVEN/)
@@ -85,12 +108,16 @@ test('CC and Codex contend atomically for one node slot; unknown and stale gener
     assert.equal(spec.codex!.manifest.root,next.taskRoot)
   }})
   assert.equal((await pool.query('SELECT state FROM remote_agent_bindings WHERE operation_id=$1',[next.operationId])).rows[0].state,'released')
+  await recordRemoteLaneState(firstCc.operationId,'released',pool,firstCc.generation)
   const legacy=await placeRemoteLane({...request,sessionKey:'agent:main:webchat:dm:legacy_cc_test',canonicalModel:'claude-sonnet-5-remote'},{pool,packet:async()=>Buffer.from('fixture')})
   await pool.query('UPDATE remote_agent_bindings SET recovery_spec=NULL WHERE operation_id=$1',[legacy.operationId])
   await reconcileRemoteLane(pool,legacy.operationId,legacy.generation,{proveLocal:async()=>{},proveRemote:async spec=>{
     assert.equal(spec.taskRoot,legacy.taskRoot);assert.equal(spec.target.host,legacy.target.host);assert.equal(spec.runId,legacy.runId)
   }})
   assert.equal((await pool.query('SELECT state FROM remote_agent_bindings WHERE operation_id=$1',[legacy.operationId])).rows[0].state,'released')
+  // Leave no occupied slot behind for the later tests in this file.
+  for (const lane of codexLanes.slice(1)) await recordRemoteLaneState(lane.operationId,'released',pool,lane.generation)
+  for(const lane of [firstCc,...moreCc]) await recordRemoteLaneState(lane.operationId,'released',pool,lane.generation)
 })
 test('probe facts persist app-server capabilities and errors but never assert readiness; publication fails closed', async () => {
   await publishRemoteModelOffers({profile_id:codex,allowActivateExecution:true,offers:[{upstream_model_id:upstream,base_display_name:'Fixture Luna'}]},pool)
@@ -299,4 +326,12 @@ test('an admission abandoned before dispatch frees its journal, thread claim and
   assert.deepEqual(usage[0].price_snapshot.remote_native.nativeUsage,total)
   assert.equal((await pool.query('SELECT pending_request_id FROM remote_native_threads WHERE operation_id=$1',
     [binding.operationId])).rows[0].pending_request_id,null)
+  const refused = await issue('memory746')
+  const refusedTurn = await port.admit(refused.admit)
+  await refusedTurn.beforeHostStart()
+  await refusedTurn.stop({hostStartAttempted:true,userSubmitted:false,remoteStopped:true,nodeAdmissionRejected:true})
+  const rejected = (await pool.query(`SELECT state,final_credits::text,failure_code,error_msg FROM request_finalize_journal WHERE request_id=$1`,[refused.label])).rows[0]
+  assert.deepEqual(rejected,{state:'aborted',final_credits:'0',failure_code:'INTERNAL_ERROR',error_msg:'REMOTE_NODE_MEMORY_EXHAUSTED'})
+  assert.equal((await pool.query('SELECT COUNT(*)::int n FROM usage_records WHERE request_id=$1',[refused.label])).rows[0].n,0)
+
 })

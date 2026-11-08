@@ -492,16 +492,16 @@ export function createRemoteNativeTurnFinance(
       precheckCredits: REMOTE_NATIVE_RESERVATION_CREDITS, dispatchId: c.dispatchId, attemptNo: c.attemptNo,
       ctxJson: { remoteNativeBillingRecovery: marker(c), remoteNative: c } })
     need(started) // do not overwrite/release another invocation's reservation
-    const prehostAbort = async (reason: 'USER_CANCELLED' | 'INTERNAL_ERROR', provenNoHostEffect = false): Promise<boolean> => {
+    const prehostAbort = async (reason: 'USER_CANCELLED' | 'INTERNAL_ERROR', provenNoHostEffect = false, diagnostic = 'remote_native_prehost_stopped'): Promise<boolean> => {
       const row = await deps.pool.query(`/* remote-native:prehost-abort */
         UPDATE request_finalize_journal SET state='aborted',final_credits=0,
-          failure_code=$5,error_msg='remote_native_prehost_stopped',updated_at=NOW()
+          failure_code=$5,error_msg=$7,updated_at=NOW()
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3
           AND ctx#>>'{remoteNative,scope,operationId}'=$4 AND state='inflight'
           AND (ctx#>>'{remoteNative,hostStartAttempted}'='false' OR $6::boolean)
           AND NOT (ctx->'remoteNative' ? 'native')
           AND ctx#>'{remoteNative,input}'='null'::jsonb`,
-      [c.requestId, scope.uid, marker(c), scope.operationId, reason, provenNoHostEffect])
+      [c.requestId, scope.uid, marker(c), scope.operationId, reason, provenNoHostEffect, diagnostic])
       if (row.rowCount === 1) {
         await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
         releaseActive()
@@ -639,7 +639,14 @@ export function createRemoteNativeTurnFinance(
         return { state: 'proven' as const, requestId: c.requestId }
       },
       async stop(value) {
-        if (value.hostStartAttempted || value.userSubmitted || !value.remoteStopped) return
+        if (value.userSubmitted || !value.remoteStopped) return
+        // A pinned node's pre-exec resource rejection plus independent stop proof is a zero-effect
+        // boundary, even though the durable 'attempted' marker was correctly written beforehand.
+        if (value.nodeAdmissionRejected && !c.native && !inputAttempted) {
+          await prehostAbort('INTERNAL_ERROR', true, 'REMOTE_NODE_MEMORY_EXHAUSTED')
+          return
+        }
+        if (value.hostStartAttempted) return
         // Codex stop waits for admission; a durable marker alone is not a launched host.
         const noCodexEffect = c.v === 2 && !c.native && !inputAttempted
         if ((hostAttempted || c.hostStartAttempted) && !noCodexEffect) return

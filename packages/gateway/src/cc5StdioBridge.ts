@@ -1,3 +1,4 @@
+import { nodeMemoryError } from './remoteNodeMemory.js'
 /** Byte transport for the original interactive host. Never synthesizes model frames. */
 import { createHash, randomUUID } from 'node:crypto'
 import { request } from 'node:http'
@@ -335,6 +336,12 @@ export async function runCc5StdioBridge(input: {
             if (gen !== generation || reconnectingThisStream) {
               res.resume()
               return
+            }
+            if (res.statusCode === 503 && res.headers['x-oc-remote-error'] === 'REMOTE_NODE_MEMORY_EXHAUSTED' &&
+                typeof res.headers['x-oc-remote-active'] === 'string' && /^[0-9]{1,4}$/.test(res.headers['x-oc-remote-active'])) {
+              const memory=nodeMemoryError(Number(res.headers['x-oc-remote-active']))
+              failure ??= memory
+              fail(memory.message);res.resume();return
             }
             if (res.statusCode === 409) {
               fail('CC5_STREAM_SEQ_GAP')

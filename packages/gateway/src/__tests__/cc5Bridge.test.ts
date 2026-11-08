@@ -479,3 +479,29 @@ test('runCc5StdioBridge discards uncommitted half-line on stream disconnect and 
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
 })
+
+test('node memory rejection crosses the real Unix stream boundary, with zero user frames', async () => {
+  const socketPath=`\0cc5-memory-${randomUUID()}`, stdin=new PassThrough(), stdout=new PassThrough()
+  let frames=0,stops=0
+  const server=createServer((req,res)=>{
+    if(req.url==='/stop'){stops++;req.resume();res.end(JSON.stringify({ok:true,remoteStopped:true}));return}
+    let pending=''
+    req.on('data',b=>{
+      pending+=b.toString()
+      while(pending.includes('\n')){
+        const i=pending.indexOf('\n'), row=JSON.parse(pending.slice(0,i));pending=pending.slice(i+1)
+        if(row.type==='open'){
+          res.writeHead(503,{'x-oc-remote-error':'REMOTE_NODE_MEMORY_EXHAUSTED','x-oc-remote-active':'2'})
+          res.end('{}')
+        } else frames++
+      }
+    })
+  })
+  server.listen(socketPath);await once(server,'listening')
+  try {
+    const run=runCc5StdioBridge({binding,sessionKey:binding.sessionKey,stdin,stdout,socketPath})
+    stdin.write(JSON.stringify({type:'user',message:{role:'user',content:[{type:'text',text:'must not dispatch'}]}})+'\n')
+    await assert.rejects(run,(e:any)=>e.code==='REMOTE_NODE_MEMORY_EXHAUSTED' && e.activeSessions===2)
+    assert.equal(frames,0);assert.equal(stops,1)
+  } finally {stdin.destroy();server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()))}
+})

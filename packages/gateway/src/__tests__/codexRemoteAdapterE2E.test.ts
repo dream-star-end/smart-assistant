@@ -189,6 +189,7 @@ async function lane(t: TestContext, options: {
   let launches = 0
   let billing = ''
   const hostPort = {
+    preflight: async () => ({ memoryOk: true, activeSessions: 0 }),
     provision: async () => {},
     open: (role: 'launch' | 'tool-socket') => {
       if (role === 'launch') launches++

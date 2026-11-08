@@ -6,7 +6,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,9 +21,29 @@ def load(name):
 client=load('codex-fixed-mcp.py'); ctrl=load('codex-host-controller.py')
 
 class NodeTests(unittest.TestCase):
+    def test_native_artifact_hash_fits_bounded_socket_memory(self):
+        artifact=Path(tempfile.gettempdir())/('codex-hash-'+secrets.token_hex(6))
+        self.addCleanup(artifact.unlink)
+        digest=ctrl.hashlib.sha256()
+        with artifact.open('wb') as out:
+            for _ in range(128):
+                block=b'a'*(1024*1024);out.write(block);digest.update(block)
+        code="""import importlib.util,resource,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('controller',sys.argv[1])
+c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c)
+resource.setrlimit(resource.RLIMIT_AS,(48*1024*1024,48*1024*1024))
+print(c.file_sha(Path(sys.argv[2])))
+"""
+        result=subprocess.run([sys.executable,'-I','-B','-c',code,str(HERE/'codex-host-controller.py'),str(artifact)],capture_output=True,text=True,timeout=15)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.strip(),digest.hexdigest())
+
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(prefix='oc-codex-test-');self.addCleanup(self.tmp.cleanup)
-        self.root=Path(self.tmp.name);os.chmod(self.root,0o700)
+        # The controller only accepts /tmp/oc-codex-<[a-z0-9-]{8,50}>/run-* experiment roots, and
+        # tempfile's random suffix can contain '_' — name it ourselves so the harness cannot flake.
+        self.root=Path(tempfile.gettempdir())/('oc-codex-test-'+secrets.token_hex(6))
+        self.root.mkdir(mode=0o700);self.addCleanup(shutil.rmtree,self.root,ignore_errors=True)
         self.m={'operationId':'operation','runId':'run','generation':'1','nativeThreadId':None,'model':'fixture-model'}
         self.catalog={'tools':[{'name':'write_marker','description':'Append one container marker','inputSchema':{'type':'object'}}]}
         self.write('tools.json',self.catalog)
@@ -147,7 +169,7 @@ class NodeTests(unittest.TestCase):
             finally:os.close(fd)
             for role in ('fence-stop','prove-stopped'):
                 result=call(role,m if role=='fence-stop' else None)
-                self.assertEqual(result.returncode,0,result.stderr.decode())
+                self.assertEqual(result.returncode,0,role+': '+result.stderr.decode())
                 proof=json.loads(result.stdout);self.assertTrue(proof['remoteStopped']);self.assertEqual(proof['scopes'],[])
             late=call('provision',{'manifest':m,'tools':self.catalog,'modelList':[{'id':'fixture-model'}],
                 'modelCatalog':{'models':[{'slug':'fixture-model'}]}})

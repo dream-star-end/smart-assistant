@@ -2,7 +2,8 @@
 
 Status: code-only. No production migration, node install, enabled profile or container adapter is
 implied. Segment 3 must implement the container runner/tool host and provide deployment acceptance
-before any `execution_ready=true` manifest is issued. CC node scripts/hashes are unchanged.
+before any `execution_ready=true` manifest is issued. Segment 4 changes the CC controller digest
+(guard must be reinstalled); its native CLI digest and protocol remain unchanged.
 
 ## Signed identities
 
@@ -13,8 +14,14 @@ before any `execution_ready=true` manifest is issued. CC node scripts/hashes are
   The read-only container view keeps `binding.json` and `relay.sock`. Node authority is not delegated
   to the user container; SSH target/key/argv come only from the master placement.
 - Placement commits the original recovery spec **before** exposing a lane; generation is CAS-fenced.
-  Chat advisory lock + ordered node/profile locks serialize CC/Codex shared node occupancy.
-  `preparing/running/unknown` all occupy capacity. Initial shared node cap=1; Codex profile cap=1.
+  Chat advisory lock + ordered profile row locks serialize account occupancy; no shared node row
+  or node+engine capacity gate. `remote_agent_profiles.max_concurrent_lanes` defaults to 5 per
+  (node,engine,profile); every non-released binding, including unknown, occupies only that pool.
+  Different engines do not contend on placement profile locks. Candidate profiles of the same
+  engine can briefly wait on each other's row locks; there is no claim of entirely wait-free placement.
+  Legacy node `max_active_slots/shared_active_cap` and profile `max_active_slots` are unchanged
+  for rollout compatibility but are not read by new placement. The new field is SQL-configurable
+  (1..64); the legacy admin UI is not a capacity editor for this new gate.
   Codex begins with durable `remote_start_attempted=false`. Before any provision, a generation CAS
   requires `state=running` and marks it true. Recovery can CAS-release a still-false generation even
   if the master crashed before creating a socket/root; the old relay can no longer pass its start CAS.
@@ -153,7 +160,19 @@ must be merged/applied first**. Tests replay through 0333 then execute 0335 in a
 isolated PG; that is DDL/behavior evidence, NOT evidence the absent dependency was applied in production.
 Native financial tables are permanent anti-replay ledgers in the retention registry.
 
+Segment 4 adds `0337_remote_engine_concurrency.sql`, explicitly after
+`0336_commercial_muse_durable`. This worktree lacks 0336: the integration tests execute the schema
+subset through 0333, 0335 and 0337, NOT the complete release migration chain. Integrate the real
+0334/0336 dependencies before publishing; do not fabricate migrations or remove dependency gates.
+
+Node memory rejection is `REMOTE_NODE_MEMORY_EXHAUSTED` + bounded `activeSessions`, mapped to
+“远端节点内存不足，当前底座已有 N 个会话在跑（本次未计费）”. Only the trusted startup boundary,
+independent remoteStopped proof and absence of input/native effect can close the journal at zero:
+`aborted`, `final_credits=0`, no usage, existing `failure_code=INTERNAL_ERROR`, exact
+`error_msg=REMOTE_NODE_MEMORY_EXHAUSTED`. Arbitrary stderr is never forwarded. Unknown stopping
+keeps the reservation fenced/pending instead of fabricating a zero-use terminal.
+
 Tests: protocol union signing; two real child transports + real Unix HTTP + actual marker write;
-real PG shared-slot competition/readiness/publication/four-turn totals/repeated terminals/commit-gap
+real PG independent five-slot account pools/readiness/publication/four-turn totals/repeated terminals/commit-gap
 and spool-gap recovery; real WebSocket signed Codex dispatch excluding local account acquisition;
 existing CC Python/TS and root runtime suites. This is not segment-3 real CCB full-tool E2E.

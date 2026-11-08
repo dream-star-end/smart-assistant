@@ -12,7 +12,16 @@ export interface CodexLaneSpec {
   modelList: Array<Record<string, any>>
   modelCatalog: { models: Array<Record<string, any>> }
 }
+export interface CodexPreflight {
+  memoryOk: boolean
+  /** Fixed node label when admission refuses; never a synthesized cause. */
+  code?: 'REMOTE_NODE_MEMORY_EXHAUSTED'
+  /** Sessions of this engine already running on the node, as observed by the node itself. */
+  activeSessions: number
+}
 export interface CodexHostPort {
+  /** Read-only node admission before any session is started; no root, claim or scope exists yet. */
+  preflight(): Promise<CodexPreflight>
   provision(tools: unknown): Promise<void>
   open(role: 'launch' | 'tool-socket'): ChildProcessWithoutNullStreams
   stop(): Promise<{ remoteStopped: true; noHostEffect?: boolean }>
@@ -81,6 +90,15 @@ export class CodexSshHost implements CodexHostPort {
       })
       child.stdin.end(packet === undefined ? undefined : `${JSON.stringify(packet)}\n`)
     })
+  }
+  async preflight(): Promise<CodexPreflight> {
+    codexNeed(!this.opened.size && !this.revoked)
+    const row = await this.control('preflight')
+    codexNeed(row?.version === 1 && row.engine === 'codex' && row.kind === 'preflight' &&
+      typeof row.memoryOk === 'boolean' && Number.isSafeInteger(row.activeSessions) && row.activeSessions >= 0 &&
+      (row.memoryOk === true || row.code === 'REMOTE_NODE_MEMORY_EXHAUSTED'))
+    return { memoryOk: row.memoryOk, activeSessions: row.activeSessions,
+      ...(row.memoryOk ? {} : { code: 'REMOTE_NODE_MEMORY_EXHAUSTED' as const }) }
   }
   async provision(tools: unknown): Promise<void> {
     codexNeed(!this.opened.size && !this.revoked)

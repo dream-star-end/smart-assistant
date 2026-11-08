@@ -1,3 +1,4 @@
+import { memoryRejection, nodeMemoryError } from './remoteNodeMemory.js'
 /**
  * Privileged master runtime for remote-pool chats.
  *
@@ -55,6 +56,8 @@ export { defaultRemoteCcTarget, type RemoteCcTarget } from './cc5SshHost.js'
 
 const REJECTED = 'CC5_FRESH_CONTAINER_BINDING_REJECTED'
 export const REMOTE_LANE_UNAVAILABLE = 'REMOTE_LANE_UNAVAILABLE'
+/** Node admission refused the session: not a lane fault, and the operator can free memory. */
+export const REMOTE_NODE_MEMORY_EXHAUSTED = 'REMOTE_NODE_MEMORY_EXHAUSTED'
 export const CC5_CONTAINER_MOUNT = CC5_MOUNT
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
 function requireRuntime(ok: unknown): asserts ok {
@@ -346,7 +349,9 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
           owner.lane = next
           return next
         } catch (error) {
-          if (error instanceof Error && error.message === REMOTE_LANE_UNAVAILABLE) throw error
+          // Node memory admission is a true, actionable cause: keep its label and session count.
+          if (error instanceof Error &&
+            (error.message === REMOTE_LANE_UNAVAILABLE || memoryRejection(error) !== undefined)) throw error
           throw new Error(REMOTE_LANE_UNAVAILABLE, { cause: error })
         }
       })
@@ -446,8 +451,11 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     const dir = join(this.options.evidenceRoot ?? join(this.options.baseRoot, 'evidence'), placement.operationId, placement.generation)
     // Durable evidence is never erased by adopt/release. A repeated generation is an unknown effect, not a reset.
     requireLane(!existsSync(dir) && !existsSync(view))
+    const host = new CodexSshHost(placement.target,spec)
     let lane: Lane | undefined
     try {
+    const preflight = await host.preflight()
+    if (!preflight.memoryOk) throw nodeMemoryError(preflight.activeSessions)
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     mkdirSync(view, { mode: 0o750 }); chownSync(view, 0, 1000); chmodSync(view, 0o750)
     const binding: CodexRemoteBinding = Object.freeze({ version:3,backendKind:'codex-app-server-v1',
@@ -456,7 +464,6 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       profileId:spec.manifest.profileId,authEpoch:spec.manifest.authEpoch,manifestSha256:codexJsonHash(JSON.stringify(spec.manifest)),
       capability:randomBytes(32).toString('hex'),expiresAt:Date.now()+CC5_BINDING_SLIDING_TTL_MS })
     const finance = this.financeFactory(binding, { upstreamModel:spec.manifest.model }); requireLane(finance)
-    const host = new CodexSshHost(placement.target,spec)
     const relay = new CodexRemoteRelay(binding,container.keyring,host,spec,join(dir,'journal'),finance,
       id => this.hooks.onNativeThread!(placement.operationId,placement.generation!,id),
       () => this.hooks.onRemoteStart!(placement.operationId,placement.generation!))

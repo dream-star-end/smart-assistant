@@ -21,7 +21,11 @@ class ProbeTests(unittest.TestCase):
             if path.exists():
                 try: os.kill(int(path.read_text()),signal.SIGTERM)
                 except ProcessLookupError: pass
-        for name, fn in [('codex_scope_command',command),('codex_scope_stop',stop)]:
+        resource = hostd.engine_resources()
+        from types import SimpleNamespace
+        fixture = SimpleNamespace(config=resource.config, admit=lambda *a,**k: None, release=lambda *a: None)
+        for name, fn in [('codex_scope_command',command),('codex_scope_stop',stop),
+                         ('engine_resources',lambda: fixture)]:
             patcher = patch.object(hostd,name,fn); patcher.start(); self.addCleanup(patcher.stop)
     def profile(self, rel, name):
         p = self.home / rel; p.mkdir(parents=True)
@@ -42,17 +46,20 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(p['runner_mode'],'app-server')
             self.assertFalse(p['execution_ready'])
             self.assertEqual(p['discovered_models'][0]['input_modalities'],['text','image'])
-    def test_managed_profile_and_persistent_claim(self):
+    def test_managed_profile_probes_while_a_runtime_lane_owns_the_profile(self):
+        # OCV5-746 §4: a running app-server lane is not a probe blocker; discovery only excludes
+        # another probe. The runtime claim is neither read as a probe claim nor cleared here.
         p=self.profile('.oc-remote-codex/profiles/default/codex-home','managed')
-        self.assertEqual(self.probe()[0]['discovered_models'][0]['upstream_model_id'],'managed')
-        (p/'OC_REMOTE_ACTIVE.json').write_text('{"kind":"runtime"}')
+        (p/'OC_REMOTE_ACTIVE.json').write_text('{"kind":"runtime","root":"/home/box/oc-codexremote-a"}')
         got=self.probe()[0]
-        self.assertEqual(got['error_code'],'CODEX_PROFILE_BUSY'); self.assertEqual(got['discovered_models'],[])
+        self.assertTrue(got['models_observed'])
+        self.assertEqual(got['discovered_models'][0]['upstream_model_id'],'managed')
+        self.assertTrue((p/'OC_REMOTE_ACTIVE.json').exists())
     def test_dead_probe_claim_reconciles_only_after_proof(self):
         p=self.profile('.codex','default')
         claim={'kind':'probe','unit':'oc-codex-probe-'+'a'*32+'.scope','bootId':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                'ownerPid':99999999,'ownerStartTicks':'1'}
-        active=p/'OC_REMOTE_ACTIVE.json';active.write_text(json.dumps(claim));os.chmod(active,0o600)
+        active=p/'PROBE_ACTIVE.json';active.write_text(json.dumps(claim));os.chmod(active,0o600)
         with patch.object(hostd,'codex_scope_stop',side_effect=ValueError('CODEX_STOP_UNKNOWN')):
             failed=self.probe()[0]
         self.assertEqual(failed['error_code'],'CODEX_STOP_UNKNOWN');self.assertTrue(active.exists())
@@ -66,9 +73,9 @@ class ProbeTests(unittest.TestCase):
             raise ValueError('CODEX_STOP_UNKNOWN')
         with patch.object(hostd,'codex_scope_stop',unknown): got=self.probe()[0]
         self.assertEqual(got['error_code'],'CODEX_STOP_UNKNOWN')
-        self.assertTrue((p/'OC_REMOTE_ACTIVE.json').exists())
+        self.assertTrue((p/'PROBE_ACTIVE.json').exists())
         self.assertTrue(self.probe()[0]['models_observed'])
-        self.assertFalse((p/'OC_REMOTE_ACTIVE.json').exists())
+        self.assertFalse((p/'PROBE_ACTIVE.json').exists())
     def test_tiny_launcher_never_fabricates_models(self):
         p = self.profile('.codex','default'); (p/'fixture.json').unlink()
         got = self.probe()[0]
@@ -96,4 +103,5 @@ class ProbeTests(unittest.TestCase):
         p = self.profile('.codex','default'); data=json.loads((p/'fixture.json').read_text()); data['account']=None
         (p/'fixture.json').write_text(json.dumps(data))
         self.assertFalse(self.probe()[0]['logged_in'])
-if __name__ == '__main__': unittest.main()
+
+if __name__=='__main__': unittest.main()

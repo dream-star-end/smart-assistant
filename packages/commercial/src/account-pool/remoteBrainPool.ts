@@ -80,6 +80,7 @@ export interface RemoteAgentNodeView {
   controller_sha256: string
   mux_cap_slots: number
   max_hot_slots: number
+  /** Legacy node-wide ceiling; new lane placement uses profile.max_concurrent_lanes. */
   max_active_slots: number
   status: RemoteNodeStatus
   disabled_by: string | null
@@ -879,26 +880,27 @@ export async function placeRemoteLane(
     if (busy.rows.length) throw new Error('REMOTE_LANE_STOP_UNPROVEN')
     const candidates = (await client.query(`SELECT p.*,p.id AS profile_id,p.node_id,
         o.id AS offer_id,o.upstream_model_id,o.canonical_model_id,
-        n.label,n.ssh_host,n.ssh_port,n.ssh_user,n.host_key_fp,n.key_id,n.rtt_ms_p50,n.status AS node_status,
-        n.max_active_slots AS node_max_active_slots,n.shared_active_cap
+        n.label,n.ssh_host,n.ssh_port,n.ssh_user,n.host_key_fp,n.key_id,n.rtt_ms_p50,n.status AS node_status
       FROM remote_model_offers o JOIN remote_agent_profiles p ON p.id=o.profile_id
       JOIN remote_agent_nodes n ON n.id=p.node_id
       WHERE o.canonical_model_id=$1 AND o.enabled=TRUE AND p.engine=$2
         AND p.runner_mode=$3 AND p.status IN ('active','degraded')
         AND (p.disabled_by IS NULL OR p.disabled_by<>'admin')
         AND n.status IN ('active','degraded') AND (n.disabled_by IS NULL OR n.disabled_by<>'admin')
-      ORDER BY n.id,p.id FOR UPDATE OF n,p`, [input.canonicalModel,engine,engine === 'cc' ? 'interactive' : 'app-server'])).rows
+      ORDER BY n.id,p.id FOR UPDATE OF p`, [input.canonicalModel,engine,engine === 'cc' ? 'interactive' : 'app-server'])).rows
     const sticky = (await client.query(`SELECT operation_id::text,run_id::text,profile_id::text,generation::text,native_session_id
       FROM remote_agent_bindings WHERE uid=$1 AND session_key=$2 AND engine=$3 ORDER BY updated_at DESC LIMIT 1`,
     [input.uid,input.sessionKey,engine])).rows[0]
     const eligible: typeof candidates = []
+    let capacityBlocked = false
     for (const row of candidates) {
       if (engine === 'codex' && !codexExecutionReady(row)) continue
-      const used = (await client.query(`SELECT COUNT(*) FILTER(WHERE node_id=$1)::int AS node_used,
-        COUNT(*) FILTER(WHERE profile_id=$2)::int AS profile_used FROM remote_agent_bindings WHERE state<>'released'`,
-      [row.node_id,row.profile_id])).rows[0]
-      if (Number(used.node_used) < Math.min(Number(row.node_max_active_slots),Number(row.shared_active_cap)) &&
-          Number(used.profile_used) < (engine === 'codex' ? 1 : Number(row.max_active_slots))) eligible.push(row)
+      // `unknown` and every other un-released state still occupies a slot of its own pool:
+      // a stop that cannot be proven must not free capacity for a new lane.
+      const used = (await client.query(`SELECT COUNT(*)::int AS profile_used
+        FROM remote_agent_bindings WHERE profile_id=$1 AND state<>'released'`, [row.profile_id])).rows[0]
+      if (Number(used.profile_used) >= Number(row.max_concurrent_lanes)) capacityBlocked = true
+      else eligible.push(row)
     }
     let row: Record<string, any> | undefined
     if (sticky) {
@@ -908,9 +910,9 @@ export async function placeRemoteLane(
       const ranked = rankRemotePoolCandidates(eligible.map(r => ({ profileId: String(r.profile_id),nodeId: String(r.node_id),
         engine:r.engine,profileName:r.profile_name,weight:Number(r.weight),healthScore:Number(r.health_score),
         hotSlots:Number(r.hot_slots),activeSlots:Number(r.active_slots),maxHotSlots:Number(r.max_hot_slots),
-        maxActiveSlots:Number(r.max_active_slots),nodeRttMsP50:r.rtt_ms_p50 })), `${input.uid}:${input.sessionKey}:${input.canonicalModel}`)
+        maxActiveSlots:Number(r.max_concurrent_lanes),nodeRttMsP50:r.rtt_ms_p50 })), `${input.uid}:${input.sessionKey}:${input.canonicalModel}`)
       row = eligible.find(r => String(r.profile_id) === ranked[0]?.profileId)
-      if (!row) throw new Error('NO_ELIGIBLE_REMOTE_PROFILE')
+      if (!row) throw new Error(capacityBlocked ? 'REMOTE_LANE_CAPACITY_EXHAUSTED' : 'NO_ELIGIBLE_REMOTE_PROFILE')
     }
     const operationId = sticky?.operation_id ?? randomUUID(), runId = sticky?.run_id ?? randomUUID()
     if (engine === 'codex' && sticky) {

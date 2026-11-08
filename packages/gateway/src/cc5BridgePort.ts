@@ -1,3 +1,4 @@
+import { nodeMemoryError } from './remoteNodeMemory.js'
 /** Task-only live-web transport. No CLI, provider credentials or remote shell here. */
 import { createHash } from 'node:crypto'
 import {
@@ -249,7 +250,13 @@ export function cc5ControlRequest(
         res.on('error', reject)
         res.on('aborted', () => reject(new Error('CC5_CONTROL_RESPONSE_UNKNOWN')))
         res.on('end', () => {
-          if (res.statusCode !== 200) return reject(new Error('CC5_CONTROL_REJECTED'))
+          if (res.statusCode !== 200) {
+            try {
+              const error = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+              if (error.error === 'REMOTE_NODE_MEMORY_EXHAUSTED') return reject(nodeMemoryError(error.activeSessions))
+            } catch { /* Untrusted errors retain the fixed generic label. */ }
+            return reject(new Error('CC5_CONTROL_REJECTED'))
+          }
           try {
             const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<
               string,

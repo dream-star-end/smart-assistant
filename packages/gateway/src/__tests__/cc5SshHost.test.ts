@@ -18,6 +18,7 @@ const fs = require('node:fs');
 const {createHash} = require('node:crypto');
 const [role, raw] = process.argv.slice(1); const c = JSON.parse(raw);
 if (role === 'tool-socket') {
+  if (c.memoryRefused) { process.stderr.write('REMOTE_NODE_MEMORY_EXHAUSTED activeSessions=2\n',()=>process.exit(126)); return; }
   if (c.socketExit) process.exit(21);
   if (c.badSocketFrame) process.stdout.write(JSON.stringify({version:2,kind:'not-socket-ready'})+'\n');
   setTimeout(() => {
@@ -593,4 +594,13 @@ test('unanswered tool request has a bounded deadline, aborts local Unix delivery
     server.close()
     await f.cleanup()
   }
+})
+
+test('pinned node memory refusal preserves Chinese cause/count and never launches a native worker', async () => {
+  const f=fixture({memoryRefused:true},{stopMs:1000})
+  try {
+    await assert.rejects(f.host.prepare(),(error:any)=>error.code==='REMOTE_NODE_MEMORY_EXHAUSTED' &&
+      error.activeSessions===2 && error.message.includes('远端节点内存不足'))
+    assert.equal(f.roles.includes('launch'),false)
+  } finally { await f.cleanup() }
 })

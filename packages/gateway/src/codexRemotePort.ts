@@ -1,3 +1,4 @@
+import { nodeMemoryError } from './remoteNodeMemory.js'
 /** Container-side relay client for one Codex remote lane. No credentials, no model transport. */
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
 import { request } from 'node:http'
@@ -119,7 +120,13 @@ export function codexControlRequest(
         res.on('error', reject)
         res.on('aborted', () => reject(new Error('CODEX_CONTROL_RESPONSE_UNKNOWN')))
         res.on('end', () => {
-          if (res.statusCode !== 200) return reject(new Error('CODEX_CONTROL_REJECTED'))
+          if (res.statusCode !== 200) {
+            try {
+              const error = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+              if (error.error === 'REMOTE_NODE_MEMORY_EXHAUSTED') return reject(nodeMemoryError(error.activeSessions))
+            } catch { /* Untrusted errors retain the fixed generic label. */ }
+            return reject(new Error('CODEX_CONTROL_REJECTED'))
+          }
           try {
             const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>
             if (!value || value.ok !== true) throw new Error('CODEX_CONTROL_REJECTED')

@@ -14,7 +14,7 @@ import re
 import shlex
 import stat
 import sys
-ROLES={'provision','launch','tool-socket','stop','fence-stop','prove-stopped'}
+ROLES={'provision','preflight','launch','tool-socket','stop','fence-stop','prove-stopped'}
 
 def require(value):
     if not value: raise ValueError('CODEX_SSH_COMMAND_REJECTED')

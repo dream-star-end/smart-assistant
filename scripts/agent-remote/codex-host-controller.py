@@ -20,7 +20,7 @@ import time
 import tempfile
 import types
 
-PINNED = {'oc-remote-hostd.py': 'e697795c52fe015d57f4206e2af264bc3f42faba4f1bc1071cc1a91166c1e246', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
+PINNED = {'oc-remote-hostd.py': '1333e64508ff2468e654e9bb0e2cec722cdde97c3822b689957c103cb5e6c069', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
 CLI = Path('/usr/bin/codex')
 NATIVE = Path('/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
 MAX_FRAME = 2 * 1024 * 1024
@@ -37,6 +37,15 @@ def require(value, code='CODEX_POLICY_REJECTED'):
 
 
 def sha(data): return hashlib.sha256(data).hexdigest()
+
+
+def file_sha(path):
+    # Both the outer controller and the bounded socket worker verify the full native artifact.
+    # Never allocate the >100 MiB executable inside a 32 MiB socket scope.
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(256 * 1024), b''): digest.update(chunk)
+    return digest.hexdigest()
 
 
 def strict_json(data):
@@ -242,15 +251,31 @@ def launch_spec(root,m):
             and receipt['launchSha256']==sha(read_file(root/'LAUNCH.json')))
     spec=strict_json(read_file(root/'LAUNCH.json'))
     require(spec['sources']==PINNED and spec['catalogSha256']==sha(read_file(root/'models.json')))
-    require(sha(CLI.resolve().read_bytes())==m['cliSha256'] and sha(NATIVE.read_bytes())==m['nativeSha256'], 'CODEX_CLI_MISMATCH')
+    require(file_sha(CLI.resolve())==m['cliSha256'] and file_sha(NATIVE)==m['nativeSha256'], 'CODEX_CLI_MISMATCH')
     h=module('oc-remote-hostd.py'); h.codex_check_config_sources(Path(m['codexHome']),root/'cwd')
-    version=subprocess.run([str(CLI),'--version'],env={'PATH':'/usr/bin:/bin'},capture_output=True,timeout=8,text=True)
+    version=subprocess.run([str(NATIVE),'--version'],env={'PATH':'/usr/bin:/bin'},capture_output=True,timeout=8,text=True)
     require(version.returncode==0 and version.stdout.strip()=='codex-cli 0.167.0','CODEX_CLI_MISMATCH')
     require(not list((root/'cwd').iterdir()))
     return spec
 
 
 def boot_id(): return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def scope_name(root, m, role):
+    return 'oc-codex-'+sha(encoded([str(root),binding(m),role]))[:32]+'.scope'
+
+
+def lane_admission(root, m, h):
+    resources = h.engine_resources(); c = resources.config('codex')
+    return resources.admit(str(root), 'codex', m['codexHome'],
+                           {scope_name(root,m,role): c['app' if role=='app' else 'socket']
+                            for role in ('app','socket')})
+
+
+def preflight(root):
+    status = module('oc-remote-hostd.py').engine_resources().preflight('codex')
+    print(json.dumps({'version':1,'engine':'codex','kind':'preflight',**status}), flush=True)
 
 
 def scope_record(root,role,m):
@@ -266,10 +291,10 @@ def start_scope(root,role,m,spec,h,**streams):
 
 
 def start_scope_locked(root,role,m,spec,h,**streams):
-    name='oc-codex-'+sha(encoded([str(root),binding(m),role]))[:32]+'.scope'
+    name=scope_name(root,m,role)
     record(root/(role.upper()+'-STARTING.json'),{'unit':name,'bootId':boot_id(),**binding(m)})
     cmd=h.codex_scope_command(name,['/usr/bin/python3','-I','-B',str(Path(__file__).resolve()),'_worker',str(root),role],
-                             {'HOME':str(Path.home()),'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'})
+                             {'HOME':str(Path.home()),'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},role='app' if role=='app' else 'socket')
     p=subprocess.Popen(cmd,cwd=root,env={'PATH':'/usr/bin:/bin','XDG_RUNTIME_DIR':'/run/user/'+str(os.getuid())},**streams)
     try:
         deadline=time.monotonic()+10
@@ -435,7 +460,7 @@ def proof(root,m,h):
 
 
 def launch(root,m,h):
-    fd=lock(root/'APP-WRITER.lock'); auth=None; process=None
+    fd=lock(root/'APP-WRITER.lock'); process=None
     seq=0
     def emit(kind,**payload):
         nonlocal seq
@@ -443,12 +468,9 @@ def launch(root,m,h):
         print(json.dumps({'version':1,'engine':'codex',**binding(m),'kind':kind,'seq':seq,**payload},separators=(',',':')),flush=True)
     try:
         require(not (root/'STOPPING.json').exists() and not (root/'APP-STARTING.json').exists())
-        auth=lock(Path(m['codexHome'])/'AUTH.lock')
-        active=Path(m['codexHome'])/'OC_REMOTE_ACTIVE.json'
-        require(not active.exists() and not active.is_symlink(),'CODEX_PROFILE_BUSY')
+        home=Path(m['codexHome'])
         spec=launch_spec(root,m)
-        # Durable quarantine survives SIGKILL of this SSH/controller process.
-        record(active,{'kind':'runtime','root':str(root),'bootId':boot_id(),**binding(m)})
+        lane_admission(root,m,h)
         process=start_scope(root,'app',m,spec,h,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
         emit('ready',cliVersion='0.167.0',cliSha256=m['cliSha256'],nativeSha256=m['nativeSha256'],
              catalogSha256=spec['catalogSha256'],policySha256=spec['policySha256'],argvSha256=spec['argvSha256'])
@@ -491,8 +513,12 @@ def launch(root,m,h):
                                 journal.write(line+b'\n'); os.fsync(journal.fileno())
                             emit('stdout',payload=frame)
         finally: selector.close()
-    except (ValueError,OSError,KeyError,TypeError) as exc:
-        code=str(exc); emit('error',code=code if re.fullmatch(r'CODEX_[A-Z_]+',code) else 'CODEX_POLICY_REJECTED')
+    except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
+        code=str(exc)
+        if code=='REMOTE_NODE_MEMORY_EXHAUSTED':
+            emit('error',code=code,activeSessions=exc.status['activeSessions'],admission=exc.status)
+        else:
+            emit('error',code=code if re.fullmatch(r'CODEX_[A-Z_]+',code) else 'CODEX_POLICY_REJECTED')
         raise
     finally:
         try:
@@ -501,7 +527,6 @@ def launch(root,m,h):
         finally:
             if process is not None:
                 for stream in (process.stdin,process.stdout,process.stderr): stream.close()
-            if auth is not None: os.close(auth)
             os.close(fd)
 
 
@@ -509,6 +534,8 @@ def main():
     require(len(sys.argv) in (3,4))
     role=sys.argv[1]; root=task_root(sys.argv[2])
     if role=='provision': provision(root); return 0
+    if role=='preflight':
+        require(len(sys.argv)==3); preflight(root); return 0
     if role=='fence-stop':
         line=sys.stdin.buffer.readline(32769)
         require(len(line)<=32768 and line.endswith(b'\n'))
@@ -522,6 +549,7 @@ def main():
         fd=lock(root/'SOCKET-WRITER.lock')
         try:
             require(not (root/'STOPPING.json').exists() and not (root/'SOCKET-STARTING.json').exists())
+            lane_admission(root,m,h)
             p=start_scope(root,'socket',m,launch_spec(root,m),h,stdin=sys.stdin.buffer,stdout=sys.stdout.buffer,stderr=sys.stderr.buffer)
             rc=p.wait(); require(rc==0,'CODEX_STOP_UNKNOWN')
         finally: os.close(fd)
@@ -533,15 +561,7 @@ def main():
             except (ValueError,OSError):
                 if time.monotonic()>=end: raise ValueError('CODEX_STOP_UNKNOWN') from None
                 time.sleep(.1)
-        # Only independent verified stop may release the persistent profile writer claim.
-        auth=lock(Path(m['codexHome'])/'AUTH.lock')
-        try:
-            active=Path(m['codexHome'])/'OC_REMOTE_ACTIVE.json'
-            if active.exists():
-                claim=strict_json(read_file(active))
-                if claim.get('root')==str(root) and all(claim.get(k)==v for k,v in binding(m).items()):
-                    active.unlink(); sync_dir(active.parent)
-        finally: os.close(auth)
+        h.engine_resources().release(str(root))
         print(json.dumps(result,separators=(',',':')),flush=True)
     else: raise ValueError('CODEX_RPC_REJECTED')
     return 0
@@ -549,5 +569,8 @@ def main():
 if __name__=='__main__':
     os.umask(0o077)
     try: sys.exit(main())
-    except (ValueError,OSError,KeyError,TypeError,subprocess.SubprocessError):
+    except (ValueError,OSError,KeyError,TypeError,RuntimeError,subprocess.SubprocessError) as exc:
+        if str(exc)=='REMOTE_NODE_MEMORY_EXHAUSTED':
+            print(json.dumps({'version':1,'engine':'codex','kind':'error','code':str(exc),
+                              'activeSessions':exc.status['activeSessions'],'admission':exc.status}),flush=True)
         sys.stderr.write('CODEX_NODE_REJECTED_OR_STOP_UNKNOWN\n'); sys.exit(126)
