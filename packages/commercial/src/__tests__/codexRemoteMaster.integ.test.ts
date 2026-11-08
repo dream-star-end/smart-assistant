@@ -28,9 +28,10 @@ assert.ok(url && new URL(url).pathname.endsWith('_test'), 'explicit isolated TES
 const pool = new Pool({ connectionString: url, max: 8, connectionTimeoutMillis: 2000 })
 const model = 'gpt-6-luna-remote', upstream = 'gpt-6-luna'
 const controllerSha = createHash('sha256').update(readFileSync(new URL('../../../../scripts/agent-remote/codex-host-controller.py',import.meta.url))).digest('hex')
-const executionSnapshot = { version:1,modelList:[{ id:upstream,model:upstream,displayName:'Fixture Luna',
-  supportedReasoningEfforts:[{reasoningEffort:'low'}],defaultReasoningEffort:'low',inputModalities:['text','image'],serviceTiers:['fast'] }],
-  modelCatalog:{models:[{slug:upstream}]},cliSha256:'a'.repeat(64),nativeSha256:'b'.repeat(64),controllerSha256:controllerSha }
+// Native model/list captured from the OCV5-746 node probe; Sol/Astra advertise ultra.
+const observedModels = JSON.parse(readFileSync(new URL('./fixtures/codex-remote-model-list.json',import.meta.url),'utf8'))
+const executionSnapshot = { version:1,modelList:observedModels,
+  modelCatalog:{models:observedModels.map((m:any)=>({slug:m.model}))},cliSha256:'a'.repeat(64),nativeSha256:'b'.repeat(64),controllerSha256:controllerSha }
 const probe = { probe_schema_version:2,source:'codex-app-server:model/list',freshness:'cli-observed',
   auth_present:true,account_observed:true,models_observed:true,snapshot_sha256:'c'.repeat(64),execution_snapshot:executionSnapshot }
 let node: string, cc: string, codex: string, uid: string
@@ -123,16 +124,20 @@ test('engines pool independently: five Codex lanes per account, the sixth is rej
   for(const lane of [firstCc,...moreCc]) await recordRemoteLaneState(lane.operationId,'released',pool,lane.generation)
 })
 test('probe facts persist app-server capabilities and errors but never assert readiness; publication fails closed', async () => {
-  await publishRemoteModelOffers({profile_id:codex,allowActivateExecution:true,offers:[{upstream_model_id:upstream,base_display_name:'Fixture Luna'}]},pool)
+  await publishRemoteModelOffers({profile_id:codex,allowActivateExecution:true,
+    offers:observedModels.map((m:any)=>({upstream_model_id:m.model,base_display_name:m.displayName}))},pool)
+  for (const observed of observedModels) {
+    const rows=(await pool.query(`SELECT * FROM model_catalog WHERE model_id=$1 AND state='active'`,[`${observed.model}-remote`])).rows
+    assert.equal(rows.length,1)
+    assert.deepEqual(rows[0].capability_profile.reasoning,{supported:['low','medium','high','xhigh','max'],codex_model_default:observed.defaultReasoningEffort})
+  }
   const published=(await pool.query(`SELECT * FROM model_catalog WHERE model_id=$1 AND state='active'`,[model])).rows
-  assert.equal(published.length,1)
-  assert.deepEqual(published[0].capability_profile.reasoning.supported,['low'])
   assert.equal(published[0].capability_profile.remote.observed_vision,true)
-  const observed = executionSnapshot.modelList[0]
+  const observed = executionSnapshot.modelList.find((m:any)=>m.model===upstream)
   const projected = parseCapabilityProfile(model,projectCodexRemoteCapabilities({probe_snapshot:probe},upstream))
-  assert.deepEqual(projected.reasoning.supported,['low'])
+  assert.deepEqual(projected.reasoning.supported,['low','medium','high','xhigh','max'])
   assert.equal(projected.remote?.observed_vision,true)
-  assert.deepEqual(projected.remote?.observed_service_tiers,['fast'])
+  assert.deepEqual(projected.remote?.observed_service_tiers,[])
   assert.equal(projected.supportsVision,false); assert.equal(projected.remote?.supports_fast,false)
   const result = await applyRemoteNodeProbeResult(node,{profiles:[{...probe,engine:'codex',profile_name:'codex',
     account_fingerprint:'codex',runner_mode:'app-server',logged_in:true,execution_ready:true,
@@ -141,7 +146,7 @@ test('probe facts persist app-server capabilities and errors but never assert re
   assert.equal(result.profiles[0].runner_mode,'app-server')
   assert.equal(result.profiles[0].execution_ready,false)
   assert.equal((await pool.query(`SELECT COUNT(*)::int n FROM model_catalog WHERE model_id=$1 AND state='active'`,[model])).rows[0].n,0)
-  assert.deepEqual(result.profiles[0].discovered_models[0].service_tiers,['fast'])
+  assert.deepEqual(result.profiles[0].discovered_models[0].service_tiers,observed.serviceTiers)
   await assert.rejects(publishRemoteModelOffers({profile_id:codex,allowActivateExecution:true,
     offers:[{upstream_model_id:upstream,base_display_name:'Fixture Luna'}]},pool),/CODEX_EXECUTION_NOT_READY/)
   const failed = await applyRemoteNodeProbeResult(node,{profiles:[{engine:'codex',profile_name:'codex',account_fingerprint:'codex',
