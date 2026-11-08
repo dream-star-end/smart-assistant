@@ -140,7 +140,7 @@ async function harness(
   failure: 'none' | 'start' | 'stop' = 'none',
   financeOverride?: Cc5FinancePort,
   options: { configure?: boolean; prepare?: boolean; failConfigure?: boolean; replaceHost?: boolean;
-    configureGate?: Promise<void>; prepareGate?: Promise<void> } = {},
+    configureGate?: Promise<void>; prepareGate?: Promise<void>; fastConnectionCheck?: boolean } = {},
 ) {
   const written: Buffer[] = []
   const input = new PassThrough()
@@ -298,6 +298,13 @@ async function harness(
     { localStopTimeoutMs: 250, ...(options.replaceHost ? { replaceHost: replacementPort } : {}) })
   const socketPath = relative(process.cwd(), join(f.root, 'control.sock'))
   const toolSocket = relative(process.cwd(), join(f.root, 'tool.sock'))
+  if (options.fastConnectionCheck) {
+    for (const server of [relay.controlServer, relay.toolServer]) {
+      Object.assign(server, { connectionsCheckingInterval: 15 })
+      server.headersTimeout = 10
+      if (server.requestTimeout > 0) server.requestTimeout = 30
+    }
+  }
   relay.controlServer.listen(socketPath)
   relay.toolServer.listen(toolSocket)
   await Promise.all([once(relay.controlServer, 'listening'), once(relay.toolServer, 'listening')])
@@ -634,12 +641,14 @@ test('combined stop wakes output cleanup and requires the exact lifecycle clean-
   } finally { s.req.destroy(); await h.close(); f.cleanup() }
 })
 
-test('missing local clean exit times out as unknown and cannot be repaired into a successful stop', async () => {
+test('R1 late exact local proof permits independent stop retry but revoked lane cannot resume', async () => {
   const f = fixture(); const { h, s } = await start(f)
   try {
     await assert.rejects(h.relay.stop())
-    await h.stopped()
+    await assert.rejects(rpc(h.socketPath, '/tool/stopped', { ...h.scope, lifecycleId: randomUUID(), localStopped: true }))
     await assert.rejects(h.relay.stop())
+    await h.stopped()
+    assert.deepEqual(await h.relay.stop(), { remoteStopped: true })
     await assert.rejects(h.admit(f.nextTurn()))
   } finally { s.req.destroy(); await h.close(); f.cleanup() }
 })
@@ -649,7 +658,9 @@ test('independent remote absence proof is still required when local ToolHost sto
   try {
     await h.register(); h.ready(); await h.admit(); await h.stopped()
     await assert.rejects(h.relay.stop())
-    assert.equal(h.counts().stops, 1)
+    await assert.rejects(h.relay.stop()) // Local proof alone still cannot release the lane.
+    await assert.rejects(h.admit(f.nextTurn()))
+    assert.equal(h.counts().starts, 1)
   } finally { await h.close(); f.cleanup() }
 })
 
@@ -1300,5 +1311,32 @@ test('a live catalog after the profile install but before the launch only re-ins
     // The installed socket is reused (the helper reads the catalog per request); launch is last.
     assert.deepEqual(h.hostEvents, ['configure', 'prepare', 'prepare-done', 'configure', 'prepare',
       'prepare-done', 'start'])
+  } finally { s?.req.destroy(); await h.close(); f.cleanup() }
+})
+
+test('controlServer and toolServer disable requestTimeout so long-lived /session/open streams are not aborted by connection checks', async () => {
+  const f = fixture()
+  const h = await harness(f, 'none', undefined, { fastConnectionCheck: true })
+  let s: Awaited<ReturnType<typeof stream>> | undefined
+  try {
+    await h.register()
+    h.ready()
+    await h.admit()
+    s = await stream(h)
+    let aborted = false
+    s.response.once('aborted', () => {
+      aborted = true
+    })
+    s.send('long turn before connection check window')
+    await until(() => h.written.length === 1)
+    h.output.write(`${JSON.stringify({ type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: f.request.nativeSessionId })}\n`)
+    // Wait past multiple connection check intervals while /session/open request body remains open
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    assert.equal(aborted, false, '/session/open stream must not be aborted by http.Server requestTimeout')
+    assert.equal(s.response.destroyed, false)
+    assert.equal(h.relay.controlServer.requestTimeout, 0)
+    assert.equal(h.relay.toolServer.requestTimeout, 0)
+    h.output.write(terminal(f))
+    await until(() => h.financeEvents.includes('settled'))
   } finally { s?.req.destroy(); await h.close(); f.cleanup() }
 })

@@ -9,9 +9,9 @@ import type { Cc5HostProfile, Cc5HostTool } from './cc5ToolCatalog.js'
 
 /** The bridge already holds a local chat's tool environment without model credentials (runner
  * laneEnv); tools see it as they would locally. NODE_OPTIONS could rewrite the child runtime. */
-function childEnv(): NodeJS.ProcessEnv {
+function childEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' }
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(source)) {
     if (value !== undefined && key !== 'NODE_OPTIONS') env[key] = value
   }
   return { ...env, CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -43,6 +43,7 @@ export class Cc5ToolHost {
     profile: Cc5HostProfile,
     /** Answers the host's permission prompt (AskUserQuestion) the way a local chat's gateway does. */
     private readonly onPermission?: (request: Record<string, unknown>) => Promise<Record<string, unknown>>,
+    environment?: NodeJS.ProcessEnv,
   ) {
     const supervisor = fileURLToPath(
       new URL('../../../scripts/agent-remote/cc5-toolhost-supervisor.py', import.meta.url),
@@ -77,7 +78,7 @@ export class Cc5ToolHost {
         profilePath,
       ],
       {
-        env: childEnv(),
+        env: childEnv(environment),
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe'],
       },
@@ -273,7 +274,11 @@ export class Cc5ToolHost {
       } finally {
         closeSync(fd)
       }
-    })()
+    })().catch((error) => {
+      // A late supervisor proof can be re-read; closing still permanently rejects tool calls.
+      this.closePromise = undefined
+      throw error
+    })
     return this.closePromise
   }
 }

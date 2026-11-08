@@ -72,6 +72,9 @@ export interface ModelCapabilityProfile {
     /** 仅 codex 型号有值;用户未覆盖时 runner 必须沿用它。 */
     codexModelDefault: PlatformReasoningEffort | null;
   };
+  /** Observed node capabilities and the separately proven transport intersection. */
+  remote?: { source: 'codex-app-server:model/list'; observed_service_tiers: string[]; observed_vision: boolean;
+    service_tiers: string[]; supports_fast: boolean };
   /** CCB 本地曾经 baked 的执行开关；权威化后随 descriptor 每 turn 下发。 */
   ccb: {
     capabilityZero: boolean;
@@ -146,6 +149,8 @@ export interface ModelProjectionRow {
   contextWindow: number | null;
   supportedEfforts: readonly string[];
   supportsVision: boolean;
+  remoteCapabilities?: ModelCapabilityProfile["remote"];
+  supportsFast?: boolean;
   capabilityZero: boolean;
   supportsThinking: boolean;
   defaultEffort: string | null;
@@ -335,7 +340,17 @@ export function parseCapabilityProfile(modelId: string, raw: unknown): ModelCapa
     }
     contextOwner = "box-native-v1";
   }
+  let remote: ModelCapabilityProfile['remote'];
+  if (obj.remote !== undefined) {
+    const r = obj.remote as NonNullable<ModelCapabilityProfile['remote']>;
+    if (!r || r.source !== 'codex-app-server:model/list' || typeof r.observed_vision !== 'boolean'
+        || r.supports_fast !== false || !Array.isArray(r.service_tiers) || r.service_tiers.length !== 0
+        || !Array.isArray(r.observed_service_tiers) || !r.observed_service_tiers.every(t => typeof t === 'string'))
+      throw new TypeError(`model ${modelId}: remote capability proof invalid`);
+    remote = structuredClone(r);
+  }
   return {
+    ...(remote ? { remote } : {}),
     supportsVision: vision,
     reasoning: {
       supported,
@@ -684,6 +699,7 @@ export class ModelCatalogSnapshot {
         contextWindow: projectContextWindowForRole(e.modelId, e.contextWindow, scope.role),
         supportedEfforts: e.capabilityProfile.reasoning.supported,
         supportsVision: e.capabilityProfile.supportsVision,
+        ...(e.capabilityProfile.remote ? { remoteCapabilities:e.capabilityProfile.remote, supportsFast:e.capabilityProfile.remote.supports_fast } : {}),
         capabilityZero: e.capabilityProfile.ccb.capabilityZero,
         supportsThinking: e.capabilityProfile.ccb.supportsThinking,
         defaultEffort: p.defaultEffort,
@@ -743,6 +759,7 @@ export class ModelCatalogSnapshot {
       contextWindow: r.contextWindow,
       supportedEfforts: [...r.supportedEfforts],
       supportsVision: r.supportsVision,
+      ...(r.remoteCapabilities ? { remoteCapabilities:r.remoteCapabilities, supportsFast:r.supportsFast } : {}),
       capabilityZero: r.capabilityZero,
       supportsThinking: r.supportsThinking,
       defaultEffort: r.defaultEffort,

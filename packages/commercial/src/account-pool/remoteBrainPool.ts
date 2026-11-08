@@ -21,6 +21,8 @@ import {
   defaultRemoteCcTarget,
   type RemoteCcTarget,
 } from '@openclaude/gateway/cc5-container-runtime'
+import { codexExecutionReady, projectCodexRemoteCapabilities, parseCodexExecutionSnapshot, codexManifestHash } from './codexRemoteProfile.js'
+import type { CodexLaneSpec } from '@openclaude/gateway/cc5-container-runtime'
 import { getPool } from '../db/index.js'
 import { query, type QueryRunner } from '../db/queries.js'
 import { formatRemoteModelDisplayName } from '../billing/modelPublicProjection.js'
@@ -41,6 +43,8 @@ const CC5_CONTROLLER_PATH = fileURLToPath(
   new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
 )
 
+const CODEX_CONTROLLER_PATH = fileURLToPath(new URL('../../../../scripts/agent-remote/codex-host-controller.py', import.meta.url))
+
 export const REMOTE_BRAIN_ENGINES = ['cc', 'codex', 'antigravity', 'grok-build'] as const
 export type RemoteBrainEngine = (typeof REMOTE_BRAIN_ENGINES)[number]
 
@@ -50,6 +54,12 @@ export type RemoteProfileStatus = 'active' | 'cooldown' | 'degraded' | 'disabled
 export interface RemoteDiscoveredModel {
   upstream_model_id: string
   display_name: string
+  native?: Record<string, unknown>
+  supported_reasoning_efforts?: unknown
+  default_reasoning_effort?: unknown
+  input_modalities?: unknown
+  service_tiers?: unknown
+  hidden?: unknown
   recommended_remote_slug?: string
 }
 
@@ -70,6 +80,7 @@ export interface RemoteAgentNodeView {
   controller_sha256: string
   mux_cap_slots: number
   max_hot_slots: number
+  /** Legacy node-wide ceiling; new lane placement uses profile.max_concurrent_lanes. */
   max_active_slots: number
   status: RemoteNodeStatus
   disabled_by: string | null
@@ -93,7 +104,9 @@ export interface RemoteAgentProfileView {
   account_hint: string | null
   plan_type: string | null
   cli_version: string | null
-  runner_mode: 'interactive'
+  runner_mode: 'interactive' | 'app-server'
+  probe_snapshot?: Record<string, unknown> | null
+  execution_ready?: boolean
   mod_digest: string | null
   discovered_models: RemoteDiscoveredModel[]
   quota_windows: RemoteQuotaWindow[]
@@ -304,6 +317,7 @@ function mapNodeRow(r: Record<string, any>): RemoteAgentNodeView {
 function mapProfileRow(r: Record<string, any>): RemoteAgentProfileView {
   const discoveredRaw = Array.isArray(r.discovered_models) ? r.discovered_models : []
   const discovered: RemoteDiscoveredModel[] = discoveredRaw.map((m: any) => ({
+    ...m,
     upstream_model_id: String(m?.upstream_model_id ?? ''),
     display_name: String(m?.display_name ?? m?.upstream_model_id ?? ''),
     recommended_remote_slug: m?.upstream_model_id
@@ -326,7 +340,9 @@ function mapProfileRow(r: Record<string, any>): RemoteAgentProfileView {
     account_hint: r.account_hint ?? null,
     plan_type: r.plan_type ?? null,
     cli_version: r.cli_version ?? null,
-    runner_mode: 'interactive',
+    runner_mode: r.runner_mode,
+    probe_snapshot: r.probe_snapshot ?? null,
+    execution_ready: r.engine === 'codex' ? codexExecutionReady(r) : undefined,
     mod_digest: r.mod_digest ?? null,
     discovered_models: discovered,
     quota_windows: windows,
@@ -660,6 +676,18 @@ export interface RemoteNodeProbePayload {
     runner_mode?: string
     mod_digest?: string | null
     logged_in?: boolean
+    probe_schema_version?: number
+    source?: string
+    freshness?: string
+    auth_present?: boolean
+    account_observed?: boolean
+    models_observed?: boolean
+    execution_ready?: boolean
+    observed_at?: string
+    snapshot_sha256?: string
+    error_code?: string | null
+    execution_snapshot?: unknown
+    execution_snapshot_error?: string | null
     discovered_models: RemoteDiscoveredModel[]
     quota_windows?: RemoteQuotaWindow[]
   }>
@@ -824,6 +852,8 @@ export interface RemoteLanePlacementResult {
   provisionPacket: Buffer
   nodeId: string
   profileId: string
+  generation: string
+  codex?: CodexLaneSpec
 }
 
 /**
@@ -834,96 +864,109 @@ export interface RemoteLanePlacementResult {
  * ranks the eligible cc interactive profiles offering the model.
  */
 export async function placeRemoteLane(
-  input: { uid: number; containerDbId: string; dockerId: string; sessionKey: string; canonicalModel: string },
+  input: { uid: number; containerDbId: string; dockerId: string; sessionKey: string; canonicalModel: string; engine?: 'ccb' | 'codex' },
   options: { controllerPath?: string; pool?: ReturnType<typeof getPool>; packet?: typeof buildProvisionPacket } = {},
 ): Promise<RemoteLanePlacementResult> {
   const pool = options.pool ?? getPool()
   if (process.env.OC_REMOTE_POOL_EXECUTION_ENABLED === '0') throw new Error('REMOTE_POOL_EXECUTION_DISABLED')
-  const candidates = (await pool.query(
-    `SELECT p.id AS profile_id, p.node_id, p.engine, p.profile_name, p.runner_mode, p.weight,
-            p.health_score, p.hot_slots, p.active_slots, p.max_hot_slots, p.max_active_slots,
-            o.id AS offer_id, o.upstream_model_id, o.canonical_model_id,
-            n.label, n.ssh_host, n.ssh_port, n.ssh_user, n.host_key_fp, n.key_id,
-            n.rtt_ms_p50, n.status AS node_status
-       FROM remote_model_offers o
-       JOIN remote_agent_profiles p ON p.id = o.profile_id
-       JOIN remote_agent_nodes n ON n.id = p.node_id
-      WHERE o.canonical_model_id = $1 AND o.enabled = TRUE
-        AND p.engine = 'cc' AND p.runner_mode = 'interactive'
-        AND p.status IN ('active', 'degraded')
-        AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
-        AND n.status IN ('active', 'degraded')
-        AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')`,
-    [input.canonicalModel],
-  )).rows as Array<Record<string, any>>
-  const sticky = (await pool.query(
-    `SELECT operation_id::text, run_id::text, profile_id::text FROM remote_agent_bindings
-      WHERE uid = $1 AND session_key = $2 ORDER BY updated_at DESC LIMIT 1`,
-    [input.uid, input.sessionKey],
-  )).rows[0] as { operation_id: string; run_id: string; profile_id: string } | undefined
-  let row: Record<string, any> | undefined
-  let operationId: string
-  let runId: string
-  if (sticky) {
-    row = candidates.find((c) => String(c.profile_id) === sticky.profile_id)
-    // The chat's transcript lives on that profile; another node would silently lose its history.
-    if (!row) throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
-    operationId = sticky.operation_id
-    runId = sticky.run_id
-  } else {
-    const ranked = rankRemotePoolCandidates(candidates.map((r) => ({
-      profileId: String(r.profile_id),
-      nodeId: String(r.node_id),
-      engine: r.engine as RemoteBrainEngine,
-      profileName: String(r.profile_name),
-      weight: Number(r.weight ?? 100),
-      healthScore: r.node_status === 'degraded'
-        ? Math.min(Number(r.health_score ?? 100), 60)
-        : Number(r.health_score ?? 100),
-      hotSlots: Number(r.hot_slots ?? 0),
-      activeSlots: Number(r.active_slots ?? 0),
-      maxHotSlots: Number(r.max_hot_slots ?? 4),
-      maxActiveSlots: Number(r.max_active_slots ?? 2),
-      nodeRttMsP50: r.rtt_ms_p50 == null ? null : Number(r.rtt_ms_p50),
-    })), `${input.uid}:${input.sessionKey}:${input.canonicalModel}`)
-    if (ranked.length === 0) throw new Error('NO_ELIGIBLE_REMOTE_PROFILE')
-    row = candidates.find((c) => String(c.profile_id) === ranked[0]!.profileId)!
-    operationId = randomUUID()
-    runId = randomUUID()
-  }
-  const user = String(row.ssh_user)
-  const home = `/home/${user}`
-  const suffix = `c${operationId.replace(/-/g, '').slice(0, 23)}`
-  const execDir = remoteNodeExecKeyDir(String(row.key_id))
-  const target = remoteCcTargetFromPool(
-    { id: String(row.node_id), label: String(row.label), ssh_host: String(row.ssh_host),
-      ssh_port: Number(row.ssh_port ?? 22), ssh_user: user, host_key_fp: String(row.host_key_fp),
-      key_id: String(row.key_id) } as RemoteAgentNodeView,
-    { id: String(row.profile_id), node_id: String(row.node_id), engine: 'cc',
-      profile_name: String(row.profile_name), runner_mode: 'interactive' } as RemoteAgentProfileView,
-    { id: String(row.offer_id), profile_id: String(row.profile_id), node_id: String(row.node_id),
-      upstream_model_id: String(row.upstream_model_id),
-      canonical_model_id: String(row.canonical_model_id) } as RemoteModelOfferView,
-    join(execDir, 'known_hosts'),
-  )
-  const provisionPacket = await (options.packet ?? buildProvisionPacket)({
-    controllerPath: options.controllerPath ?? CC5_CONTROLLER_PATH, suffix, home, operationId, runId,
-  })
-  await pool.query(
-    `INSERT INTO remote_agent_bindings
-       (operation_id, run_id, uid, container_db_id, docker_id, session_key, node_id, profile_id,
-        canonical_model_id, state, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'preparing', NOW() + INTERVAL '24 hours')
-     ON CONFLICT (operation_id) DO UPDATE
-        SET container_db_id = EXCLUDED.container_db_id, docker_id = EXCLUDED.docker_id,
-            canonical_model_id = EXCLUDED.canonical_model_id, state = 'preparing',
-            generation = remote_agent_bindings.generation + 1,
-            expires_at = EXCLUDED.expires_at, updated_at = NOW()`,
-    [operationId, runId, input.uid, input.containerDbId, input.dockerId, input.sessionKey,
-      String(row.node_id), String(row.profile_id), input.canonicalModel],
-  )
-  return { target, taskRoot: `${home}/oc-agentremote-${suffix}`, operationId, runId, provisionPacket,
-    nodeId: String(row.node_id), profileId: String(row.profile_id) }
+  const engine = input.engine === 'codex' ? 'codex' : 'cc'
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`remote-chat:${input.uid}:${input.sessionKey}`])
+    // Unknown is occupied. Neither timeout nor a lost process PID proves release.
+    const busy = await client.query(`SELECT operation_id FROM remote_agent_bindings
+      WHERE uid=$1 AND session_key=$2 AND state<>'released' LIMIT 1`, [input.uid,input.sessionKey])
+    if (busy.rows.length) throw new Error('REMOTE_LANE_STOP_UNPROVEN')
+    const candidates = (await client.query(`SELECT p.*,p.id AS profile_id,p.node_id,
+        o.id AS offer_id,o.upstream_model_id,o.canonical_model_id,
+        n.label,n.ssh_host,n.ssh_port,n.ssh_user,n.host_key_fp,n.key_id,n.rtt_ms_p50,n.status AS node_status
+      FROM remote_model_offers o JOIN remote_agent_profiles p ON p.id=o.profile_id
+      JOIN remote_agent_nodes n ON n.id=p.node_id
+      WHERE o.canonical_model_id=$1 AND o.enabled=TRUE AND p.engine=$2
+        AND p.runner_mode=$3 AND p.status IN ('active','degraded')
+        AND (p.disabled_by IS NULL OR p.disabled_by<>'admin')
+        AND n.status IN ('active','degraded') AND (n.disabled_by IS NULL OR n.disabled_by<>'admin')
+      ORDER BY n.id,p.id FOR UPDATE OF p`, [input.canonicalModel,engine,engine === 'cc' ? 'interactive' : 'app-server'])).rows
+    const sticky = (await client.query(`SELECT operation_id::text,run_id::text,profile_id::text,generation::text,native_session_id
+      FROM remote_agent_bindings WHERE uid=$1 AND session_key=$2 AND engine=$3 ORDER BY updated_at DESC LIMIT 1`,
+    [input.uid,input.sessionKey,engine])).rows[0]
+    const eligible: typeof candidates = []
+    let capacityBlocked = false
+    for (const row of candidates) {
+      if (engine === 'codex' && !codexExecutionReady(row)) continue
+      // `unknown` and every other un-released state still occupies a slot of its own pool:
+      // a stop that cannot be proven must not free capacity for a new lane.
+      const used = (await client.query(`SELECT COUNT(*)::int AS profile_used
+        FROM remote_agent_bindings WHERE profile_id=$1 AND state<>'released'`, [row.profile_id])).rows[0]
+      if (Number(used.profile_used) >= Number(row.max_concurrent_lanes)) capacityBlocked = true
+      else eligible.push(row)
+    }
+    let row: Record<string, any> | undefined
+    if (sticky) {
+      row = eligible.find(r => String(r.profile_id) === sticky.profile_id)
+      if (!row) throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
+    } else {
+      const ranked = rankRemotePoolCandidates(eligible.map(r => ({ profileId: String(r.profile_id),nodeId: String(r.node_id),
+        engine:r.engine,profileName:r.profile_name,weight:Number(r.weight),healthScore:Number(r.health_score),
+        hotSlots:Number(r.hot_slots),activeSlots:Number(r.active_slots),maxHotSlots:Number(r.max_hot_slots),
+        maxActiveSlots:Number(r.max_concurrent_lanes),nodeRttMsP50:r.rtt_ms_p50 })), `${input.uid}:${input.sessionKey}:${input.canonicalModel}`)
+      row = eligible.find(r => String(r.profile_id) === ranked[0]?.profileId)
+      if (!row) throw new Error(capacityBlocked ? 'REMOTE_LANE_CAPACITY_EXHAUSTED' : 'NO_ELIGIBLE_REMOTE_PROFILE')
+    }
+    const operationId = sticky?.operation_id ?? randomUUID(), runId = sticky?.run_id ?? randomUUID()
+    if (engine === 'codex' && sticky) {
+      const pending = await client.query(`SELECT 1 FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'remoteNativeBillingRecovery'='remote-native-v2'
+          AND ctx#>>'{remoteNative,scope,operationId}'=$2 AND state IN ('inflight','finalizing') LIMIT 1`,[input.uid,sticky.operation_id])
+      if (pending.rows.length) throw new Error('CODEX_BILLING_BOUNDARY_PENDING')
+    }
+    const generation = sticky ? String(BigInt(sticky.generation) + 1n) : '1'
+    const home = `/home/${row.ssh_user}`, suffix = `c${operationId.replace(/-/g,'').slice(0,23)}`
+    const execDir = remoteNodeExecKeyDir(String(row.key_id))
+    let target: RemoteCcTarget, taskRoot: string, provisionPacket: Buffer, codex: CodexLaneSpec | undefined
+    if (engine === 'cc') {
+      target = remoteCcTargetFromPool({ id:String(row.node_id),label:String(row.label),ssh_host:row.ssh_host,ssh_port:row.ssh_port,
+        ssh_user:row.ssh_user,host_key_fp:row.host_key_fp,key_id:row.key_id } as RemoteAgentNodeView,
+      { id:String(row.profile_id),node_id:String(row.node_id),engine:'cc',profile_name:row.profile_name,runner_mode:'interactive' } as RemoteAgentProfileView,
+      { id:String(row.offer_id),profile_id:String(row.profile_id),node_id:String(row.node_id),upstream_model_id:row.upstream_model_id,
+        canonical_model_id:row.canonical_model_id } as RemoteModelOfferView,join(execDir,'known_hosts'))
+      taskRoot = `${home}/oc-agentremote-${suffix}`
+      provisionPacket = await (options.packet ?? buildProvisionPacket)({ controllerPath:options.controllerPath ?? CC5_CONTROLLER_PATH,
+        suffix,home,operationId,runId })
+    } else {
+      const snapshot = parseCodexExecutionSnapshot(row.probe_snapshot.execution_snapshot)
+      if (snapshot.controllerSha256 !== createHash('sha256').update(readFileSync(CODEX_CONTROLLER_PATH)).digest('hex'))
+        throw new Error('CODEX_CONTROLLER_NOT_INSTALLED')
+      taskRoot = `${home}/oc-codexremote-${operationId.replace(/-/g,'')}-g${generation}`
+      const manifest = { version:1 as const,engine:'codex' as const,root:taskRoot,operationId,runId,generation,
+        profileId:String(row.profile_name),authEpoch:String(row.auth_epoch),model:String(row.upstream_model_id),
+        nativeThreadId:sticky?.native_session_id ?? null,codexHome:`${home}/.oc-remote-codex/profiles/${row.profile_name}/codex-home`,
+        controllerSha256:snapshot.controllerSha256,cliSha256:snapshot.cliSha256,nativeSha256:snapshot.nativeSha256 }
+      codex = { controllerPath:`/opt/openclaude/codex-remote/${snapshot.controllerSha256}/codex-host-controller.py`,
+        manifest,modelList:snapshot.modelList,modelCatalog:snapshot.modelCatalog }
+      target = { host:row.ssh_host,port:row.ssh_port,user:row.ssh_user,keyPath:join(execDir,'codex_id_ed25519'),
+        knownHostsPath:join(execDir,'known_hosts'),controllerSha256:snapshot.controllerSha256,
+        taskRootPrefix:`${home}/oc-codexremote-`,upstreamModel:row.upstream_model_id }
+      provisionPacket = Buffer.alloc(0) // Codex provisions only after finance admission, with the actual tool catalog.
+    }
+    await client.query(`INSERT INTO remote_agent_bindings
+      (operation_id,run_id,uid,container_db_id,docker_id,session_key,node_id,profile_id,canonical_model_id,state,expires_at,
+       engine,backend_kind,generation,auth_epoch,manifest_sha256,recovery_spec,remote_start_attempted)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'preparing',NOW()+INTERVAL '24 hours',$10,$11,$12,$13,$14,$15::jsonb,$16)
+      ON CONFLICT(operation_id) DO UPDATE SET container_db_id=EXCLUDED.container_db_id,docker_id=EXCLUDED.docker_id,
+        canonical_model_id=EXCLUDED.canonical_model_id,state='preparing',generation=EXCLUDED.generation,
+        remote_start_attempted=EXCLUDED.remote_start_attempted,no_host_effect_proven=FALSE,
+        expires_at=EXCLUDED.expires_at,auth_epoch=EXCLUDED.auth_epoch,manifest_sha256=EXCLUDED.manifest_sha256,recovery_spec=EXCLUDED.recovery_spec,updated_at=NOW()
+      WHERE remote_agent_bindings.state='released'`,
+    [operationId,runId,input.uid,input.containerDbId,input.dockerId,input.sessionKey,String(row.node_id),String(row.profile_id),
+      input.canonicalModel,engine,engine === 'cc' ? 'cc5-interactive-v1' : 'codex-app-server-v1',generation,
+      codex?.manifest.authEpoch ?? null,codex ? codexManifestHash(codex.manifest) : null,JSON.stringify({ version:1,target,taskRoot,operationId,runId,generation,
+        controllerPath:options.controllerPath ?? CC5_CONTROLLER_PATH,...(codex ? {codex} : {}) }),engine !== 'codex'])
+    await client.query('COMMIT')
+    return { target,taskRoot,operationId,runId,provisionPacket,nodeId:String(row.node_id),profileId:String(row.profile_id),generation,codex }
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error }
+  finally { client.release() }
 }
 
 /** The node `provision` packet: the deployment's host/mod sources and fixed tool profile. */
@@ -941,11 +984,31 @@ export async function recordRemoteLaneState(
   operationId: string,
   state: 'running' | 'released' | 'unknown',
   pool: ReturnType<typeof getPool> = getPool(),
+  generation?: string,
 ): Promise<void> {
-  await pool.query(
-    `UPDATE remote_agent_bindings SET state = $2, updated_at = NOW() WHERE operation_id = $1`,
-    [operationId, state],
+  if (!generation) throw new Error('REMOTE_LANE_GENERATION_REQUIRED')
+  const saved = await pool.query(
+    `UPDATE remote_agent_bindings SET state = $2, updated_at = NOW() WHERE operation_id = $1 AND generation=$3
+      AND ($2<>'running' OR state='preparing')`,
+    [operationId, state, generation],
   )
+  if (state === 'running' && saved.rowCount !== 1) throw new Error('REMOTE_LANE_GENERATION_FENCED')
+}
+
+/** Persistent no-effect fence: recovery can release only before this CAS wins. */
+export async function recordRemoteStartAttempt(operationId: string, generation: string,
+  pool: ReturnType<typeof getPool> = getPool()): Promise<void> {
+  const saved = await pool.query(`UPDATE remote_agent_bindings SET remote_start_attempted=TRUE,updated_at=NOW()
+    WHERE operation_id=$1 AND generation=$2 AND engine='codex' AND state='running'`, [operationId,generation])
+  if (saved.rowCount !== 1) throw new Error('CODEX_REMOTE_START_FENCED')
+}
+
+export async function recordRemoteNativeThread(operationId: string, generation: string, nativeThreadId: string,
+  pool: ReturnType<typeof getPool> = getPool()): Promise<void> {
+  const saved = await pool.query(`UPDATE remote_agent_bindings SET native_session_id=$3,updated_at=NOW()
+    WHERE operation_id=$1 AND generation=$2 AND engine='codex' AND state='running'
+      AND (native_session_id IS NULL OR native_session_id=$3)`, [operationId,generation,nativeThreadId])
+  if (saved.rowCount !== 1) throw new Error('CODEX_NATIVE_THREAD_FENCED')
 }
 
 async function runSshMuxProbeOnce(input: {
@@ -1196,7 +1259,7 @@ export async function probeRemoteAgentNodeLive(
         ) {
           throw new Error('REMOTE_GATE_G_SELF_CHECK_FAILED')
         }
-        const loggedInProfiles = (parsed.profiles ?? []).filter((p) => p.logged_in === true)
+        const loggedInProfiles = (parsed.profiles ?? []).filter((p) => p.logged_in === true || p.engine === 'codex' && p.probe_schema_version === 2)
         if (loggedInProfiles.length === 0) {
           throw new Error('REMOTE_PROBE_NO_LOGGED_IN_PROFILES')
         }
@@ -1302,15 +1365,16 @@ export async function applyRemoteNodeProbeResult(
     if (!isRemoteBrainEngine(p.engine)) {
       throw new Error(`REMOTE_ENGINE_UNSUPPORTED:${String(p.engine)}`)
     }
-    if (p.runner_mode !== 'interactive') {
+    if (p.engine !== 'codex' && p.runner_mode !== 'interactive') {
       throw new Error('REMOTE_CC_PRINT_MODE_FORBIDDEN: profile runner_mode must be interactive')
     }
-    if (p.logged_in === false) {
+    if (p.engine !== 'codex' && p.logged_in === false) {
       throw new Error(`REMOTE_PROFILE_NOT_LOGGED_IN:${p.engine}/${p.profile_name}`)
     }
-    if (!Array.isArray(p.discovered_models) || p.discovered_models.length === 0) {
+    if (!Array.isArray(p.discovered_models) || p.engine !== 'codex' && p.discovered_models.length === 0) {
       throw new Error(`REMOTE_PROFILE_NO_DISCOVERED_MODELS:${p.engine}/${p.profile_name}`)
     }
+    if (p.engine === 'codex' && (p.runner_mode !== 'app-server' || p.probe_schema_version !== 2 || p.source !== 'codex-app-server:model/list')) throw new Error('CODEX_PROBE_SCHEMA_INVALID')
     if (p.engine === 'cc') {
       if (typeof p.tmux_version !== 'string' || !p.tmux_version.trim()) {
         throw new Error('REMOTE_CC_TMUX_REQUIRED')
@@ -1368,6 +1432,7 @@ export async function applyRemoteNodeProbeResult(
                NOW(), 'active', 0, NULL, NOW())
        ON CONFLICT (node_id, engine, profile_name) DO UPDATE
           SET account_fingerprint = EXCLUDED.account_fingerprint,
+              execution_ready = CASE WHEN remote_agent_profiles.account_fingerprint=EXCLUDED.account_fingerprint THEN remote_agent_profiles.execution_ready ELSE FALSE END,
               account_hint = EXCLUDED.account_hint,
               plan_type = EXCLUDED.plan_type,
               cli_version = EXCLUDED.cli_version,
@@ -1396,7 +1461,22 @@ export async function applyRemoteNodeProbeResult(
       ],
       runner,
     )
-    upserted.push(mapProfileRow(res.rows[0]!))
+    if (p.engine === 'codex') {
+      const facts = { probe_schema_version: p.probe_schema_version, source: p.source, freshness: p.freshness,
+        auth_present: p.auth_present === true, account_observed: p.account_observed === true,
+        models_observed: p.models_observed === true, observed_at: p.observed_at ?? null,
+        snapshot_sha256: p.snapshot_sha256 ?? null, execution_snapshot: p.execution_snapshot ?? null,
+        error_code: p.error_code ?? null, execution_snapshot_error: p.execution_snapshot_error ?? null };
+      const updated = await query(`UPDATE remote_agent_profiles SET probe_snapshot=$2::jsonb,
+        execution_ready=CASE WHEN probe_snapshot->>'snapshot_sha256'=$3
+          AND probe_snapshot->'execution_snapshot'=$4::jsonb AND $5::boolean THEN execution_ready ELSE FALSE END,
+        last_error=$6,status=CASE WHEN disabled_by='admin' THEN 'disabled' WHEN $5::boolean THEN 'active' ELSE 'degraded' END
+        WHERE id=$1 RETURNING *`,
+      [res.rows[0]!.id, JSON.stringify(facts), p.snapshot_sha256 ?? null, JSON.stringify(p.execution_snapshot ?? null),
+        p.auth_present === true && p.account_observed === true && p.models_observed === true && !p.error_code,
+        p.error_code ?? p.execution_snapshot_error ?? null], runner);
+      upserted.push(mapProfileRow(updated.rows[0]!));
+    } else upserted.push(mapProfileRow(res.rows[0]!))
   }
 
   const upsertedByEngine = new Map<RemoteBrainEngine, RemoteAgentProfileView[]>()
@@ -1406,6 +1486,7 @@ export async function applyRemoteNodeProbeResult(
     upsertedByEngine.set(prof.engine, list)
   }
   for (const [engine, activeProfiles] of upsertedByEngine.entries()) {
+    if (engine === 'codex') continue // handled together below, including an entirely absent engine
     const primaryTarget = activeProfiles[0]
     if (!primaryTarget) continue
     const activeNames = activeProfiles.map((ap) => ap.profile_name)
@@ -1444,6 +1525,20 @@ export async function applyRemoteNodeProbeResult(
     }
   }
 
+  // Native histories/auth identities never migrate. Revoke missing profiles even if this probe
+  // returned no Codex profiles at all, then aggregate after *all* readiness changes are visible.
+  await query(`UPDATE remote_agent_profiles SET execution_ready=FALSE,
+    status=CASE WHEN disabled_by='admin' THEN 'disabled' ELSE 'degraded' END
+    WHERE node_id=$1 AND engine='codex' AND NOT (profile_name=ANY($2::text[]))`,
+  [nodeId, (upsertedByEngine.get('codex') ?? []).map(p => p.profile_name)], runner)
+  const affected = await query(`SELECT DISTINCT o.canonical_model_id FROM remote_model_offers o
+    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex'`, [nodeId], runner)
+  for (const offer of affected.rows) {
+    if (await countEligibleEnabledRemoteOffers(offer.canonical_model_id,runner) !== 0) continue
+    await query(`UPDATE model_catalog SET state='disabled',pool_auto_disabled=TRUE
+      WHERE model_id=$1 AND engine='codex' AND placement='remote_pool' AND state='active'`, [offer.canonical_model_id], runner)
+  }
+
   return { node: mapNodeRow(nodeRes.rows[0]!), profiles: upserted }
 }
 
@@ -1458,6 +1553,16 @@ export async function countEligibleEnabledRemoteOffers(
        JOIN remote_agent_nodes n ON n.id = p.node_id
       WHERE o.canonical_model_id = $1
         AND o.enabled = TRUE
+        AND (p.engine <> 'codex' OR (p.execution_ready=TRUE AND p.runner_mode='app-server'
+          AND p.execution_manifest->>'backendKind'='codex-app-server-v1'
+          AND p.execution_manifest->>'authEpoch'=p.auth_epoch
+          AND p.execution_manifest->>'snapshotSha256'=p.probe_snapshot->>'snapshot_sha256'
+          AND p.execution_manifest->>'controllerSha256'=p.probe_snapshot#>>'{execution_snapshot,controllerSha256}'
+          AND p.execution_manifest->>'gatewayRevision'='codex-remote-adapter-v1'
+          AND p.execution_manifest->>'installed'='true' AND p.execution_manifest->>'text'='true'
+          AND p.execution_manifest->>'e2eReceiptSha256' ~ '^[a-f0-9]{64}$'
+          AND p.probe_snapshot->>'auth_present'='true' AND p.probe_snapshot->>'account_observed'='true'
+          AND p.probe_snapshot->>'models_observed'='true' AND p.probe_snapshot->>'error_code' IS NULL))
         AND p.status IN ('active', 'degraded')
         AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
         AND n.status IN ('active', 'degraded')
@@ -1563,6 +1668,7 @@ export async function publishRemoteModelOffers(
     if (engine === 'cc' && profile.runner_mode !== 'interactive') {
       throw new Error('REMOTE_CC_PRINT_MODE_FORBIDDEN')
     }
+    if (engine === 'codex' && !codexExecutionReady(profile)) throw new Error('CODEX_EXECUTION_NOT_READY')
     const catalogEngine = catalogEngineForRemoteEngine(engine)
     const providerId =
       catalogEngine === 'ccb'
@@ -1578,6 +1684,7 @@ export async function publishRemoteModelOffers(
       const upstreamModelId = item.upstream_model_id.trim()
       const baseDisplayName = item.base_display_name.trim() || upstreamModelId
       const canonicalModelId = toRemotePoolModelId(item.canonical_model_id ?? upstreamModelId)
+      if (engine === 'codex' && canonicalModelId !== `${upstreamModelId}-remote`) throw new Error('CODEX_CANONICAL_MODEL_MISMATCH')
       const enabled = item.enabled !== false
       const remoteDisplayName = formatRemoteModelDisplayName(
         baseDisplayName,
@@ -1647,6 +1754,7 @@ export async function publishRemoteModelOffers(
           LIMIT 1`,
         [baseSlug, upstreamModelId],
       )
+      if (engine === 'codex' && !basePricing.rows[0]) throw new Error('CODEX_REMOTE_PRICE_REQUIRED')
       const bp = basePricing.rows[0] ?? {
         input_per_mtok: '300',
         output_per_mtok: '1500',
@@ -1662,7 +1770,7 @@ export async function publishRemoteModelOffers(
 
       // A remote cc chat is a text-only interactive session on the node: no image input and no
       // effort control reach its CLI; its native context lives there (box-native-v1).
-      const capabilityProfile = {
+      const capabilityProfile = engine === 'codex' ? projectCodexRemoteCapabilities(profile, upstreamModelId) : {
         supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb',
         reasoning: {
           supported: catalogEngine === 'codex' ? ['low', 'medium', 'high'] : [],
@@ -1697,7 +1805,7 @@ export async function publishRemoteModelOffers(
           aggregated.pricingEnabled,
           bp.visibility ?? 'public',
           Number(bp.sort_order ?? 250),
-          bp.default_effort ?? null,
+          engine === 'codex' ? capabilityProfile.reasoning.codex_model_default : bp.default_effort ?? null,
           bp.min_plan_code ?? null,
           bp.promo_label ?? null,
         ],
@@ -1915,6 +2023,16 @@ export async function preheatRemotePoolSession(
        JOIN remote_agent_nodes n ON n.id = p.node_id
       WHERE o.canonical_model_id = $1
         AND o.enabled = TRUE
+        AND (p.engine <> 'codex' OR (p.execution_ready=TRUE AND p.runner_mode='app-server'
+          AND p.execution_manifest->>'backendKind'='codex-app-server-v1'
+          AND p.execution_manifest->>'authEpoch'=p.auth_epoch
+          AND p.execution_manifest->>'snapshotSha256'=p.probe_snapshot->>'snapshot_sha256'
+          AND p.execution_manifest->>'controllerSha256'=p.probe_snapshot#>>'{execution_snapshot,controllerSha256}'
+          AND p.execution_manifest->>'gatewayRevision'='codex-remote-adapter-v1'
+          AND p.execution_manifest->>'installed'='true' AND p.execution_manifest->>'text'='true'
+          AND p.execution_manifest->>'e2eReceiptSha256' ~ '^[a-f0-9]{64}$'
+          AND p.probe_snapshot->>'auth_present'='true' AND p.probe_snapshot->>'account_observed'='true'
+          AND p.probe_snapshot->>'models_observed'='true' AND p.probe_snapshot->>'error_code' IS NULL))
         AND p.status IN ('active', 'degraded')
         AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
         AND n.status IN ('active', 'degraded')

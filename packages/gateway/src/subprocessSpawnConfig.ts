@@ -7,7 +7,9 @@
 import {
   BOX_API_MODELS,
   type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
   isCc5ExecutionBackend,
+  parseRemoteExecutionBackend,
   OPENAI_FAST_SERVICE_TIER,
   TRACE_ID_HEADER,
   isBoxApiModel,
@@ -435,7 +437,8 @@ export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_API_MODELS[0].id
 
 export interface CcbExecutionDescriptor {
-  readonly executionBackend?: Cc5ExecutionBackend
+  /** Signed remote scope: a CC lane or a codex lane, never a caller-chosen alias. */
+  readonly executionBackend?: RemoteExecutionBackend
   readonly canonicalModel: string
   readonly contextWindow: number | null
   readonly capabilityZero: boolean
@@ -801,7 +804,7 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 
 export interface SubprocessRunnerOpts {
   /** Only supplied from the verified bridge authority; never from local catalog or client fields. */
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
   /** Trusted cc5-only transport. No user-selected URL, command or credentials. */
   cc5BridgePort?: import('./cc5BridgePort.js').Cc5BridgePort
   /** Actual chat peer; sessionId below may be a delegated repository parent. */
@@ -1055,11 +1058,16 @@ export function projectCcbExecutionDescriptor(input: {
   supportsVision: boolean
   supportedEfforts: readonly string[]
   capabilityProfile: Readonly<Record<string, unknown>>
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
 }): CcbExecutionDescriptor {
-  // The bound target/offer declares the model; the runner compares it to the port's.
-  if (input.executionBackend && !isCc5ExecutionBackend(input.executionBackend)) {
-    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  // The bound target/offer declares the model; the runner compares it to the port's. A signed
+  // scope of either kind is a valid remote identity; anything else is a mismatch.
+  if (input.executionBackend) {
+    try {
+      parseRemoteExecutionBackend(input.executionBackend)
+    } catch {
+      throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+    }
   }
   const raw = input.capabilityProfile.ccb
   const ccb = raw !== null && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}

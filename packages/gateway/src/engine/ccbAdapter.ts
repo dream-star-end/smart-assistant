@@ -1,4 +1,4 @@
-import type { Cc5ExecutionBackend, PromptPrivacyPolicy } from '@openclaude/protocol'
+import { isCc5ExecutionBackend, type Cc5ExecutionBackend, type PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * CcbAdapter — CCB(claude-code-best)底座的 EngineAdapter 实现。
  *
@@ -435,6 +435,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
     if (Boolean(opts.executionBackend) !== Boolean(opts.cc5BridgePort)) throw new Error('CC5_BACKEND_TRANSPORT_REQUIRED')
+    if (opts.executionBackend && !isCc5ExecutionBackend(opts.executionBackend)) throw new Error('CC5_BACKEND_SCOPE_INVALID')
     this.executionBackend = opts.executionBackend ? Object.freeze({ ...opts.executionBackend }) : undefined
     // Hermetic one-shots (Auto-Dream, advisor) only run on CCB: the stock CLI
     // refuses them (OFFICIAL_CC_REQUIRES_LOCAL_NON_HERMETIC), so OC_CCB_OFFICIAL_CC

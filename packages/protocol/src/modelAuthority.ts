@@ -16,7 +16,7 @@
 // 编码规则 = 签名互不认账。私钥逻辑**不在本文件**(master 独占)。
 
 import { BOX_API_MODELS } from './boxApiModels.js'
-import { type Cc5ExecutionBackend, isCc5BackendAuthority, parseCc5ExecutionBackend } from './cc5Backend.js'
+import { type RemoteExecutionBackend, isRemoteBackendAuthority, parseRemoteExecutionBackend } from './remoteExecutionBackend.js'
 import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto'
 
 import type { PlatformReasoningEffort } from './engineModels.js'
@@ -143,7 +143,7 @@ export interface ModelAuthorityPayload {
   readonly engine: ModelAuthorityEngine
   readonly executionDescriptor: ModelExecutionDescriptor
   /** Optional per-chat backend selected by the trusted signer, never by model/catalog aliases. */
-  readonly executionBackend?: Cc5ExecutionBackend
+  readonly executionBackend?: RemoteExecutionBackend
   readonly executionRevision: string
   readonly securityEpoch: number
   readonly issuedAt: number
@@ -760,15 +760,15 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     'billingRequestId',
     'executionBackend',
   ])
-  if (payload.executionBackend !== undefined && !isCc5BackendAuthority(payload)) {
+  if (payload.executionBackend !== undefined && !isRemoteBackendAuthority(payload)) {
     throw new ModelAuthorityError('BadShape', 'payload: execution backend/model/engine mismatch')
   }
   return payload
 }
 
-function parseExecutionBackend(value: unknown): Cc5ExecutionBackend {
+function parseExecutionBackend(value: unknown): RemoteExecutionBackend {
   try {
-    return parseCc5ExecutionBackend(value)
+    return parseRemoteExecutionBackend(value)
   } catch {
     throw new ModelAuthorityError('BadShape', 'payload: invalid execution backend scope')
   }

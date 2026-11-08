@@ -1,3 +1,4 @@
+import { nodeMemoryError } from './remoteNodeMemory.js'
 /** v5-dev host-only transport. SSH exec stdio; Claude's PTY is created by the original host/tmux. */
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -124,7 +125,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
   private readonly ready: Promise<void>
   private resolveReady!: () => void
   private rejectReady!: (reason: Error) => void
-  private cancelSocketReady?: () => void
+  private cancelSocketReady?: (error?: Error) => void
   private started = false
   private failed = false
   private closing = false
@@ -275,6 +276,16 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       child,
       closed: new Promise<void>((resolve) => child.once('close', () => resolve())),
     }
+    let errorBuffer = ''
+    child.stderr.on('data', (chunk: Buffer) => {
+      // Do not expose raw stderr; only this exact pinned-controller admission record is public.
+      errorBuffer = (errorBuffer + chunk.toString('utf8')).slice(-16384)
+      for (const line of errorBuffer.split('\n').slice(0,-1)) {
+        const match = /^(REMOTE_NODE_MEMORY_EXHAUSTED|REMOTE_NODE_TASKS_EXHAUSTED) activeSessions=([0-9]{1,4})$/.exec(line)
+        if (match) this.fail(nodeMemoryError(Number(match[2]), match[1] as 'REMOTE_NODE_MEMORY_EXHAUSTED' | 'REMOTE_NODE_TASKS_EXHAUSTED'))
+      }
+      errorBuffer = errorBuffer.slice(errorBuffer.lastIndexOf('\n') + 1)
+    })
     this.channels.push(channel)
     child.once('error', () => this.fail())
     child.once('close', () => {
@@ -306,15 +317,16 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       .catch(() => this.fail())
     return { stdin: this.input, stdout: this.output, ready: this.ready }
   }
-  private fail(): void {
+  private fail(error = new Error(FAILED)): void {
+    if (this.failed) return
     this.failed = true
-    this.rejectReady(new Error(FAILED))
+    this.rejectReady(error)
     // Nothing has consumed the tool-socket yet when preparation fails; reject that promise too.
-    this.cancelSocketReady?.()
+    this.cancelSocketReady?.(error)
     if (!this.closing) {
       // Before start() no listener is attached to the returned stdout: destroying it with an
       // error would escape as an uncaught exception. Preparation failures travel on prepare().
-      if (this.started) this.output.destroy(new Error(FAILED))
+      if (this.started) this.output.destroy(error)
       void this.stop().catch(() => {})
     }
   }
@@ -330,7 +342,7 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     // Never expose the helper's raw stderr: it may contain remote exception text.
     this.toolChannel.child.stderr.resume()
     await new Promise<void>((resolve, reject) => {
-      this.cancelSocketReady = () => reject(new Error(FAILED))
+      this.cancelSocketReady = (error) => reject(error ?? new Error(FAILED))
       let ready = false
       let pending = Buffer.alloc(0)
       this.toolChannel!.child.stdout.on('data', (chunk: Buffer) => {
@@ -547,7 +559,11 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     this.rejectReady(new Error(FAILED))
     this.input.unpipe()
     this.input.destroy()
-    this.stopPromise = this.stopOnce()
+    this.stopPromise = this.stopOnce().catch((error) => {
+      // Keep execution fenced, but a recovered transport may obtain a fresh independent proof.
+      this.stopPromise = undefined
+      throw error
+    })
     return this.stopPromise
   }
   private async stopOnce(): Promise<{ remoteStopped: true }> {

@@ -361,8 +361,26 @@ function rewriteUnroutableOfficialCcModel(args: {
   return { canonicalModel: descriptor.canonicalModel, descriptor };
 }
 
-export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAuthorityDecision> {
+export function enforceModelAuthority(args: EnforceArgs): Promise<ModelAuthorityDecision> {
+  return enforceForChannel(args, 'anthropic');
+}
+
+/** Master-only native admission. Never selected by an HTTP header or request body. */
+export function enforceRemoteNativeModelAuthority(args: EnforceArgs): Promise<ModelAuthorityDecision> {
+  return enforceForChannel(args, 'remote-native');
+}
+
+async function enforceForChannel(args: EnforceArgs, channel: 'anthropic' | 'remote-native'): Promise<ModelAuthorityDecision> {
   const now = args.now ?? Date.now();
+  if (channel === 'remote-native') {
+    const raw = readHeader(args.headers, AUTHORITY_HEADER);
+    if (!raw || !args.keyring) throw new ModelGateReject('authority_invalid', 'remote native requires signed authority');
+    const a = verifyAuthority(raw, args.keyring, now, { allowExpired: true });
+    const backend = a.executionBackend;
+    if (a.canonicalModel !== args.model || !(a.engine === 'ccb' && backend?.kind === 'cc5-interactive-v1'
+        || a.engine === 'codex' && backend?.kind === 'codex-app-server-v1'))
+      throw new ModelGateReject('authority_invalid', 'remote native backend mismatch');
+  }
 
   // ① epoch fence(单行 SELECT;漂移 → 同步重建;重建失败/DB 不可达 → 拒)
   let snapshot: ModelCatalogSnapshot;
@@ -407,7 +425,8 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
   if (!descriptor) {
     throw new ModelGateReject("not_available", `model '${canonicalModel}' not routable`);
   }
-  if (descriptor.engine !== "ccb") {
+  if (channel === 'anthropic' ? descriptor.engine !== "ccb"
+      : descriptor.placement !== 'remote_pool' || !['ccb','codex'].includes(descriptor.engine)) {
     // codex 走 /internal/v3/codex-relay,不该出现在 anthropic proxy。
     throw new ModelGateReject(
       "not_available",

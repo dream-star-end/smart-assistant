@@ -1,6 +1,6 @@
 import { beginIdleWait, endIdleWait } from './boxIdleWait.js'
 import { recoverUnconfirmedIdle } from './boxIdleRecovery.js'
-import { type Cc5ExecutionBackend, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
+import { type RemoteExecutionBackend, isCc5ExecutionBackend, sameRemoteExecutionBackend } from '@openclaude/protocol'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
@@ -628,7 +628,7 @@ export async function submit(
     )) closeIdleWait = beginIdleWait(session, onEvent)
     await prev
     session._turnReadOnly = opts?.readOnly === true
-    if (!sameCc5ExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
+    if (!sameRemoteExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
       throw new Error('CC5_BACKEND_SCOPE_CHANGED')
     }
     log.info('turn_pipeline_timing', { traceId, stage: 'submit_lock_acquired', elapsedMs: performance.now() - submitStartedAt })
@@ -1587,7 +1587,7 @@ export async function _getOrCreateExclusive(
   if (opts.preheatOnly && existing) return existing
   const executionBackend = cc5SessionBackend({ ...opts, engineId, executionModel,
     storedResumeId: this._resumeMap.get(opts.sessionKey) })
-  const backendChanged = !sameCc5ExecutionBackend(existing?.runner.executionBackend, executionBackend)
+  const backendChanged = !sameRemoteExecutionBackend(existing?.runner.executionBackend, executionBackend)
   if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
   const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
     current, storedResumeId: this._resumeMap.get(opts.sessionKey),
@@ -1685,7 +1685,7 @@ export async function _getOrCreateExclusive(
           const canonical = this.sessions.get(opts.sessionKey)
           if (canonical && canonical !== existing) {
             await canonical.lock
-            if (canonical.runner.executionBackend && !sameCc5ExecutionBackend(canonical.runner.executionBackend, executionBackend)) {
+            if (canonical.runner.executionBackend && !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend)) {
               throw new Error('CC5_BACKEND_SCOPE_CHANGED')
             }
             const desiredEngineNow =
@@ -1698,7 +1698,7 @@ export async function _getOrCreateExclusive(
               canonical.agentId !== opts.agent.id ||
               canonical._identityAgentFingerprint !== identityAgentFingerprint ||
               canonical.providerTag !== desiredEngineNow ||
-              !sameCc5ExecutionBackend(canonical.runner.executionBackend, executionBackend) ||
+              !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend) ||
               Boolean(
                 (opts.model !== undefined || opts.executionAuthority !== undefined) &&
                   canonical.runner.requiresReopenForModel?.(executionModel),
@@ -1728,7 +1728,7 @@ export async function _getOrCreateExclusive(
           // A local turn may have completed while the creation path waited.
           // Reprove freshness under the final canonical session lock, before
           // shutting anything down; a failed proof preserves the original runner.
-          if (executionBackend && !sameCc5ExecutionBackend(existing.runner.executionBackend, executionBackend)) {
+          if (executionBackend && !sameRemoteExecutionBackend(existing.runner.executionBackend, executionBackend)) {
             await assertFreshBackendTarget(existing)
           }
           // Identity-only runner refresh keeps the logical owner held by
@@ -2214,7 +2214,7 @@ export async function getOrCreate(
      *     catalog 判定,不许回落 baked)。
      */
     executionAuthority?: {
-      executionBackend?: Cc5ExecutionBackend
+      executionBackend?: RemoteExecutionBackend
       canonicalModel: string
       engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
       source?: 'bridge_signed' | 'local_catalog'

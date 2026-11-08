@@ -1,3 +1,4 @@
+import { memoryRejection } from './remoteNodeMemory.js'
 import { createHash, timingSafeEqual } from 'node:crypto'
 /** Box-side task relay. It never executes the model's file/command operation. */
 import { EventEmitter, once } from 'node:events'
@@ -93,17 +94,18 @@ function reply(res: ServerResponse, value: unknown): void {
 }
 
 export class Cc5Relay {
-  readonly controlServer = createServer((req, res) => {
-    void this.control(req, res).catch(() => {
+  // Long-lived session bodies must not inherit Node's 300s request timeout.
+  readonly controlServer = createServer({ requestTimeout: 0 }, (req, res) => {
+    void this.control(req, res).catch((error) => {
       if (res.headersSent) {
         res.destroy()
         return
       }
       res.writeHead(403)
-      res.end('{"ok":false,"error":"CC5_RELAY_REJECTED"}')
+      res.end(JSON.stringify({ok:false,...(memoryRejection(error) ?? {error:'CC5_RELAY_REJECTED'})}))
     })
   })
-  readonly toolServer = createServer((req, res) => {
+  readonly toolServer = createServer({ requestTimeout: 0 }, (req, res) => {
     void this.tool(req, res).catch(() => {
       if (this.toolBurned) void this.stop().catch(() => {})
       if (res.headersSent) {
@@ -117,6 +119,7 @@ export class Cc5Relay {
   private readonly abort = new AbortController()
   private readonly observation: Cc5ToolObservation
   private readonly nativeUsage: Cc5NativeUsageObserver
+  private memoryRefused?: 'REMOTE_NODE_MEMORY_EXHAUSTED' | 'REMOTE_NODE_TASKS_EXHAUSTED'
   private financeTurn?: Cc5FinanceTurn
   private effectBarrier?: Promise<void>
   private outputTail: Promise<void> = Promise.resolve()
@@ -497,7 +500,15 @@ export class Cc5Relay {
       await this.host!.ready
       requireRelay(!this.revoked)
     })
-    void this.hostReady.catch(() => {
+    void this.hostReady.catch((error) => {
+      const memory = memoryRejection(error)
+      if (memory) {
+        this.memoryRefused = memory.error
+        if (this.stream && !this.stream.headersSent && !this.stream.destroyed) {
+          this.stream.writeHead(503, {'x-oc-remote-error':memory.error,'x-oc-remote-active':String(memory.activeSessions)})
+          this.stream.end(JSON.stringify({ok:false,...memory}))
+        }
+      }
       void this.stop().catch(() => {})
     })
   }
@@ -530,7 +541,15 @@ export class Cc5Relay {
       await this.host.ready
       requireRelay(!this.revoked && epoch === this.hostEpoch)
     })
-    void this.hostReady.catch(() => {
+    void this.hostReady.catch((error) => {
+      const memory = memoryRejection(error)
+      if (memory) {
+        this.memoryRefused = memory.error
+        if (this.stream && !this.stream.headersSent && !this.stream.destroyed) {
+          this.stream.writeHead(503, {'x-oc-remote-error':memory.error,'x-oc-remote-active':String(memory.activeSessions)})
+          this.stream.end(JSON.stringify({ok:false,...memory}))
+        }
+      }
       if (epoch === this.hostEpoch) void this.stop().catch(() => {})
     })
     return this.hostReady
@@ -640,7 +659,15 @@ export class Cc5Relay {
       await this.host!.ready
       requireRelay(!this.revoked && epoch === this.hostEpoch)
     })
-    void this.hostReady.catch(() => {
+    void this.hostReady.catch((error) => {
+      const memory = memoryRejection(error)
+      if (memory) {
+        this.memoryRefused = memory.error
+        if (this.stream && !this.stream.headersSent && !this.stream.destroyed) {
+          this.stream.writeHead(503, {'x-oc-remote-error':memory.error,'x-oc-remote-active':String(memory.activeSessions)})
+          this.stream.end(JSON.stringify({ok:false,...memory}))
+        }
+      }
       if (epoch === this.hostEpoch) void this.stop().catch(() => {})
     })
     return replacement
@@ -713,13 +740,16 @@ export class Cc5Relay {
           requireRelay(remoteStopped)
         } finally {
           await this.financeTurn?.stop({ hostStartAttempted: this.launchAttempted,
-            userSubmitted: this.userSubmitted, remoteStopped })
+            userSubmitted: this.userSubmitted, remoteStopped,
+            ...(this.memoryRefused ? { nodeAdmissionRejected: true, nodeAdmissionReason: this.memoryRefused } : {}) })
         }
         this.stream?.end()
         return { remoteStopped: true as const }
       })
       .catch((error) => {
         this.stream?.destroy()
+        // Revocation is permanent; only the independent stop proofs may be retried.
+        this.stopPromise = undefined
         throw error
       })
     return this.stopPromise

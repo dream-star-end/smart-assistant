@@ -292,3 +292,36 @@ test(
     }
   },
 )
+
+
+test('R1 real supervisor late proof permits close retry but never another tool effect', { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cc5-late-stop-'))
+  const cwd = join(root, 'cwd'), home = join(root, 'home')
+  mkdirSync(cwd); mkdirSync(home)
+  const lifecycleId = randomUUID()
+  const host = new Cc5ToolHost(root, lifecycleId, {
+    cwd, mcpConfigPath: null, settingsPath: null, disallowedTools: [],
+  }, undefined, { PATH: process.env.PATH, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude') })
+  // Fault injection targets only this fixture's real supervisor, not a close() wrapper.
+  const child = (host as unknown as { child: import('node:child_process').ChildProcess }).child
+  const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+  try {
+    await host.tools()
+    child.kill('SIGSTOP'); await pause(50)
+    await assert.rejects(host.close(), /CC5_TOOLHOST_STOP_UNKNOWN/)
+    child.kill('SIGCONT')
+    for (let i = 0; i < 300 && child.exitCode === null; i++) await pause(20)
+    assert.equal(child.exitCode, 0)
+    const proof = JSON.parse(readFileSync(join(root, 'stopped.json'), 'utf8'))
+    assert.equal(proof.lifecycleId, lifecycleId)
+    assert.equal(proof.supervisorPid, child.pid)
+    assert.equal(proof.localStopped, true)
+    await host.close()
+    await assert.rejects(host.execute('Write', { file_path: join(cwd, 'forbidden'), content: 'late' }, identity('late')), /CLOSED/)
+    assert.deepEqual(await import('node:fs').then(fs => fs.readdirSync(cwd)), [])
+  } finally {
+    child.kill('SIGCONT')
+    await host.close().catch(() => {})
+    rmSync(root, { recursive: true, force: true })
+  }
+})

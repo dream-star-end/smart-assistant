@@ -1,4 +1,4 @@
-import { type Cc5ExecutionBackend, isBoxApiModel, isCc5ExecutionBackend } from '@openclaude/protocol'
+import { type RemoteExecutionBackend, isBoxApiModel, isCc5ExecutionBackend } from '@openclaude/protocol'
 /**
  * modelAuthority(容器侧)—— master 签发的**模型执行权威**的验签消费端。
  *
@@ -128,7 +128,7 @@ export function isEngineLocalTurnExempt(env: NodeJS.ProcessEnv = process.env): b
  * capability / context 都在这里,不再回头查本地表。
  */
 export interface TurnExecutionDescriptor {
-  readonly executionBackend?: Cc5ExecutionBackend
+  readonly executionBackend?: RemoteExecutionBackend
   readonly canonicalModel: string
   readonly engine: ModelAuthorityEngine
   readonly contextWindow: number | null

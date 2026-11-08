@@ -707,6 +707,16 @@ def prove_stopped(root, emit=True):
     info = owner(root)
     require(not (root / 'run').exists() and all(tmux(root, 'has-session', '-t', '=' + name).returncode != 0
             for name in (info['session'], info['session'] + '-setup')), 'task-runtime-or-session-present')
+    if not (root/'LIFECYCLE.json').exists() and (root/'RESOURCE-REJECTED.json').exists():
+        r = engine_resources(); rejected = json.loads(read_private(root/'RESOURCE-REJECTED.json'))
+        require(rejected == {'root':str(root),'boot':r.boot()}, 'wrong-resource-rejection')
+        for unit in resource_scopes(root):
+            st = r.state(unit)
+            require(st.get('ActiveState') in ('inactive','failed') and not st.get('ControlGroup'), 'resource-scope-still-active')
+        r.release(str(root))
+        proof = {'kind':'verified-task-runtime-absent','root':str(root),'remoteStopped':True,'nodeAdmissionRejected':True}
+        if emit: print(json.dumps(proof))
+        return
     record = json.loads(read_private(root / 'LIFECYCLE.json'))
     require(record['version'] == 1 and record['root'] == str(root) and record['session'] == info['session'],
             'wrong-lifecycle-record')
@@ -743,6 +753,7 @@ def prove_stopped(root, emit=True):
             os.fsync(parent)
         finally:
             os.close(parent)
+    engine_resources().release(str(root))
     if emit:
         print(json.dumps(proof))
 
@@ -898,7 +909,7 @@ def rotate(root):
     operator's answer, not an interruption to recover from.
     """
     if not (root / 'LIFECYCLE.json').exists():
-        require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
+        require(not (root / 'STOPPING.json').exists() and not (root/'RESOURCE-REJECTED.json').exists(), 'task-permanently-stopped')
         return
     prove_stopped(root, emit=False)
     stale = root / 'tool.sock'
@@ -912,7 +923,7 @@ def rotate(root):
             stale.unlink()
         finally:
             probe.close()
-    for name in ('LIFECYCLE.json', 'STOPPED.json', 'STOPPING.json', 'MCP-SOCKET.json'):
+    for name in ('LIFECYCLE.json', 'STOPPED.json', 'STOPPING.json', 'MCP-SOCKET.json', 'RESOURCE-REJECTED.json'):
         try:
             (root / name).unlink()
         except FileNotFoundError:
@@ -924,6 +935,38 @@ def rotate(root):
         os.close(directory)
 
 
+# Generated from remote-engine-resources.py by sync-engine-resource-bundle.py.
+RESOURCE_MODULE_B64 = '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'
+
+
+def engine_resources():
+    import types, zlib
+    data = zlib.decompress(base64.b64decode(RESOURCE_MODULE_B64))
+    module = types.ModuleType('remote_engine_resources')
+    exec(compile(data, 'remote-engine-resources.py', 'exec'), module.__dict__)
+    return module
+
+
+def resource_scopes(root):
+    c = engine_resources().config('cc')
+    suffix = sha(str(root).encode())[:32]
+    return {'oc-cc-app-'+suffix+'.scope':c['app'], 'oc-cc-socket-'+suffix+'.scope':c['socket']}
+
+
+def admit_scope(root, role):
+    r = engine_resources(); scopes = resource_scopes(root)
+    # CC profile placement is authoritative on master; account choice arrives on launch, after
+    # the socket channel. Do not invent a node-wide account lock for this pre-launch channel.
+    try:
+        r.admit(str(root), 'cc', str(root), scopes)
+    except r.MemoryExhausted:
+        # Durable, fenced no-launch boundary; proof below still checks both resource domains.
+        r.atomic(root/'RESOURCE-REJECTED.json', json.dumps({'root':str(root),'boot':r.boot()}))
+        raise
+    unit = next(u for u in scopes if u.startswith('oc-cc-'+role+'-'))
+    r.attach_self('cc', unit, scopes[unit])
+
+
 def launch(root, model, profile_dir=None):
     with control_lock(root):
         require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
@@ -933,6 +976,7 @@ def launch(root, model, profile_dir=None):
 
 def launch_locked(root, writer_fd, model, profile_dir=None):
     info = owner(root)
+    require(not (root/'RESOURCE-REJECTED.json').exists(), 'task-resource-rejected')
     if (root / 'LIFECYCLE.json').exists():
         prove_stopped(root, emit=False)  # A new launch cannot erase an unproved old writer.
         raise RuntimeError('task-lifecycle-already-used')  # One launch per round; tool-socket opens the next.
@@ -969,6 +1013,7 @@ def launch_locked(root, writer_fd, model, profile_dir=None):
         env['OC_BOX_CLAUDE_PROFILE'] = account
     claude_executable(root, info, full_hash=True)
     cli_args = profile_args(root, info)  # Validates the task work directory first.
+    admit_scope(root, 'app')
     trust_task_directory(info)
     lock_stat = os.fstat(writer_fd)
     path_stat = (root / 'WRITER.lock').lstat()
@@ -994,6 +1039,7 @@ def tool_socket_locked(root):
     check_sources(root, info)
     profile_args(root, info)  # Includes all pinned profile contents/identity checks.
     env = {'HOME': str(HOME), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': str(root / 'tmp')}
+    admit_scope(root, 'socket')
     script = str(root / 'cprofile/cc5-mcp-socket.py')
     os.execve('/usr/bin/python3', ['/usr/bin/python3', '-I', '-B', script, str(root)], env)
 
@@ -1143,7 +1189,9 @@ def snapshot(root):
 def stop(root):
     with control_lock(root):
         mark_stopping(root)
-        print(json.dumps(stop_locked(root)))
+        try: result = stop_locked(root)
+        finally: engine_resources().stop(str(root))
+        print(json.dumps(result))
 
 
 def stop_socket(root):
@@ -1229,6 +1277,7 @@ def reset(root):
             except (FileNotFoundError, RuntimeError):
                 pass  # Host gone or its pid reused; the wait below still requires every recorded process gone.
         stop_socket_locked(root)
+        engine_resources().stop(str(root))
         sessions = (info['session'], info['session'] + '-setup')
         for name in sessions:
             tmux(root, 'kill-session', '-t', '=' + name)
@@ -1244,7 +1293,8 @@ def reset(root):
         stale = root / 'tool.sock'
         if stale.is_socket():
             stale.unlink()
-        for name in ('LIFECYCLE.json', 'STOPPED.json', 'STOPPING.json', 'MCP-SOCKET.json'):
+        engine_resources().release(str(root))
+        for name in ('LIFECYCLE.json', 'STOPPED.json', 'STOPPING.json', 'MCP-SOCKET.json', 'RESOURCE-REJECTED.json'):
             try:
                 (root / name).unlink()
             except FileNotFoundError:
@@ -1326,5 +1376,7 @@ if __name__ == '__main__':
     except Exception as error:
         # No raw exception/argv/response could leak pane or credentials.
         label = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        if label in ('REMOTE_NODE_MEMORY_EXHAUSTED','REMOTE_NODE_TASKS_EXHAUSTED'):
+            print(label+' activeSessions='+str(error.status['activeSessions']), file=sys.stderr)
         print('CC5_PREP_ERROR ' + label, file=sys.stderr)
         sys.exit(1)

@@ -27,6 +27,8 @@ export interface PublicModelProjection extends PublicModel {
   /** catalog.provider_id(engine='codex' 的虚拟条目也有值;null = 未归属静态 provider)。 */
   provider_id: string | null;
   placement?: ModelPlacement;
+  supports_fast?: boolean;
+  remote_capabilities?: import("./modelCatalog.js").ModelCapabilityProfile["remote"];
 }
 
 /**
@@ -74,6 +76,7 @@ export function projectPublicModels(
       engine: row.engine,
       context_window: row.contextWindow,
       supports_vision: row.supportsVision,
+      ...(row.remoteCapabilities ? { supports_fast:row.supportsFast, remote_capabilities:row.remoteCapabilities } : {}),
       provider_id: row.providerId,
       ...(row.placement === 'remote_pool' ? { placement: 'remote_pool' as const } : {}),
       ...(costX !== undefined ? { cost_x: costX } : {}),

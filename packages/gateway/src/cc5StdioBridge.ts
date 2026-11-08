@@ -1,3 +1,4 @@
+import { nodeMemoryError, isRemoteResourceCode } from './remoteNodeMemory.js'
 /** Byte transport for the original interactive host. Never synthesizes model frames. */
 import { createHash, randomUUID } from 'node:crypto'
 import { request } from 'node:http'
@@ -336,6 +337,12 @@ export async function runCc5StdioBridge(input: {
               res.resume()
               return
             }
+            if (res.statusCode === 503 && isRemoteResourceCode(res.headers['x-oc-remote-error']) &&
+                typeof res.headers['x-oc-remote-active'] === 'string' && /^[0-9]{1,4}$/.test(res.headers['x-oc-remote-active'])) {
+              const memory=nodeMemoryError(Number(res.headers['x-oc-remote-active']), res.headers['x-oc-remote-error'])
+              failure ??= memory
+              fail(memory.message);res.resume();return
+            }
             if (res.statusCode === 409) {
               fail('CC5_STREAM_SEQ_GAP')
               res.resume()
@@ -403,6 +410,7 @@ export async function runCc5StdioBridge(input: {
                 fail('CC5_ORIGINAL_TOOL_OBSERVATION_INVALID')
                 return
               }
+              reconnectCount = 0
               // Exact original authenticated host bytes. No screen scraping or replacement result.
               if (!input.stdout.write(forward)) res.pause()
             })

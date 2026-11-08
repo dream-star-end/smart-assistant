@@ -47,10 +47,6 @@ SYNTHETIC_STUB_FALLBACK_MODELS: Dict[str, List[Dict[str, str]]] = {
         {"upstream_model_id": "claude-opus-4-7", "display_name": "Opus 4.7 (1M)"},
         {"upstream_model_id": "claude-sonnet-5", "display_name": "Sonnet 5"},
     ],
-    "codex": [
-        {"upstream_model_id": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol"},
-        {"upstream_model_id": "gpt-6-astra", "display_name": "GPT-6-Astra"},
-    ],
     "antigravity": [
         {"upstream_model_id": "gemini-4-argon", "display_name": "Gemini 4 Argon"},
         {"upstream_model_id": "gemini-3.8-flash", "display_name": "Gemini 3.8 Flash"},
@@ -123,34 +119,379 @@ def discover_cc_models_from_cli(exe_path: Optional[str]) -> List[Dict[str, str]]
     return []
 
 
-def discover_codex_models_from_cli(home: pathlib.Path, exe_path: Optional[str]) -> List[Dict[str, str]]:
-    cache_file = home / ".codex" / "models_cache.json"
-    if cache_file.is_file():
+# Codex discovery is a native protocol exchange, never a credential/cache heuristic.
+CODEX_DISABLE = ('shell_tool', 'unified_exec', 'view_image', 'image_generation',
+                 'multi_agent', 'multi_agent_v2', 'apps', 'plugins', 'browser_use',
+                 'computer_use', 'in_app_browser', 'sleep_tool', 'skill_search',
+                 'tool_suggest', 'goals', 'hooks', 'skill_mcp_dependency_install')
+
+
+def codex_policy_args():
+    args = ['app-server', '--strict-config', '--listen', 'stdio://']
+    for feature in CODEX_DISABLE:
+        args += ['--disable', feature]
+    args += ['--enable', 'skip_host_skill_discovery']
+    for value in ('approval_policy="never"', 'sandbox_mode="read-only"', 'web_search="disabled"'):
+        args += ['-c', value]
+    return args
+
+
+def codex_check_config_sources(codex_home, cwd, system_root=pathlib.Path("/etc/codex")):
+    # 0.167.0 has no --ignore-user-config. Reject before any MCP can be spawned.
+    candidates = [codex_home / 'config.toml', codex_home / 'AGENTS.md',
+                  codex_home / 'AGENTS.override.md', system_root / 'config.toml',
+                  system_root / 'managed_config.toml', system_root / 'requirements.toml']
+    for parent in (cwd, *cwd.parents):
+        candidates += [parent / '.codex/config.toml', parent / 'AGENTS.md', parent / 'AGENTS.override.md']
+    if any(p.exists() or p.is_symlink() for p in candidates):
+        raise ValueError('CODEX_POLICY_REJECTED')
+
+
+def engine_resources():
+    # Same immutable bundle as this controller; never import user search paths.
+    import types
+    source = pathlib.Path(__file__).resolve().with_name('remote-engine-resources.py')
+    data = source.read_bytes()
+    if hashlib.sha256(data).hexdigest() != 'b3d05e9215e1e232fd959dd94580e9bc4371b2a5098d6634a460a3af0ae66a14':
+        raise RuntimeError('REMOTE_RESOURCE_BUNDLE_MISMATCH')
+    module = types.ModuleType('remote_engine_resources'); module.__file__ = str(source)
+    exec(compile(data, str(source), 'exec'), module.__dict__)
+    return module
+
+
+def codex_scope_command(unit, argv, environment, role='app'):
+    c = engine_resources().config('codex')
+    return ['/usr/bin/systemd-run', '--user', '--scope', '--quiet', '--unit', unit,
+            '-p', 'Slice=' + c['slice'], '-p', 'MemoryMax=' + str(c[role]),
+            '-p', 'TasksMax=128', '-p', 'KillMode=control-group',
+            '--', '/usr/bin/env', '-i', *[k + '=' + v for k, v in environment.items()], *argv]
+
+
+def codex_systemctl(*args):
+    env = {'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': '/run/user/' + str(os.getuid())}
+    return subprocess.run(['/usr/bin/systemctl', '--user', *args], env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, text=True)
+
+
+def codex_scope_state(unit):
+    result = codex_systemctl('show', unit, '--property=ActiveState,SubState,ControlGroup,LoadState')
+    if result.returncode:
+        raise ValueError('CODEX_STOP_UNKNOWN')
+    return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+
+
+def codex_scope_stop(unit):
+    codex_systemctl('kill', '--signal=KILL', '--kill-whom=all', unit)
+    result = codex_systemctl('stop', unit)
+    state = codex_scope_state(unit)
+    if state.get('ActiveState') not in ('inactive', 'failed') or state.get('ControlGroup'):
+        raise ValueError('CODEX_STOP_UNKNOWN')
+
+
+# Runs inside the scope before any CLI/auth/config processing. A dead probe owner can
+# fence a queued systemd launch; late workers cannot use a new generation's claim.
+# OCV5-746 §4: the probe has its own claim file and exec gate; runtime Codex lanes never take
+# either, so a discovery probe cannot block a running session and a running session never
+# blocks discovery for longer than the probe's own scope.
+CODEX_PROBE_WRAPPER = """import fcntl,json,os,pathlib,sys
+home=pathlib.Path(os.environ['CODEX_HOME']); unit=sys.argv[1]
+fd=os.open(home/'PROBE-LAUNCH.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+fcntl.flock(fd,fcntl.LOCK_EX); os.set_inheritable(fd,True)
+claim=json.loads((home/'PROBE_ACTIVE.json').read_text())
+if claim.get('unit')!=unit or (home/(unit+'.revoked')).exists(): sys.exit(126)
+os.execve(sys.argv[2],sys.argv[2:],dict(os.environ))
+"""
+
+
+def codex_reconcile_probe_locked(codex_home):
+    """PROBE-CLAIM.lock held exclusively. Never reads or clears runtime lane claims."""
+    import fcntl
+    import stat
+    active=codex_home/'PROBE_ACTIVE.json'
+    fd=os.open(active,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        st=os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode&0o077 or st.st_size>16384:
+            raise ValueError('CODEX_PROFILE_BUSY')
+        claim=json.loads(os.read(fd,16385))
+    finally: os.close(fd)
+    unit=claim.get('unit'); pid=claim.get('ownerPid'); ticks=claim.get('ownerStartTicks')
+    if (not isinstance(unit,str) or not re.fullmatch(r'oc-codex-probe-[0-9a-f]{32}\.scope',unit)
+            or type(pid) is not int or pid<=0 or not isinstance(ticks,str) or not ticks.isdigit()
+            or claim.get('bootId')!=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()):
+        raise ValueError('CODEX_STOP_UNKNOWN')
+    # The probe claim lock, not the long-lived hostd PID, is the probe's authority: holding it
+    # proves the previous probe returned or died, and the exec gate below still fences a queued
+    # child. Fence first; even a systemd job queued before owner death cannot launch its CLI later.
+    revoked=codex_home/(unit+'.revoked')
+    fd=os.open(revoked,os.O_CREAT|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+    dfd=os.open(codex_home,os.O_RDONLY|os.O_DIRECTORY)
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
+    codex_scope_stop(unit)
+    gate=os.open(codex_home/'PROBE-LAUNCH.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    try:
+        try: fcntl.flock(gate,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise ValueError('CODEX_STOP_UNKNOWN') from None
+        # Stop verified by systemd; gate and retained revocation prevent a delayed exec.
+        engine_resources().release('probe:' + unit)
+        active.unlink()
+        dfd=os.open(codex_home,os.O_RDONLY|os.O_DIRECTORY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    finally: os.close(gate)
+
+
+CODEX_NATIVE_BINARY = pathlib.Path('/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
+
+def codex_execution_snapshot(codex_home, exe_path, models):
+    """Read-only provisioning material, never auth.json; unavailable is not fabricated readiness."""
+    import stat
+    def read(path, limit):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
-            data = json.loads(cache_file.read_text("utf-8", errors="ignore"))
-            raw_models = data.get("models") if isinstance(data, dict) else None
-            if isinstance(raw_models, list):
-                models: List[Dict[str, str]] = []
-                seen = set()
-                for item in raw_models:
-                    if not isinstance(item, dict):
-                        continue
-                    mid = item.get("slug") or item.get("id")
-                    if not isinstance(mid, str) or not mid.strip():
-                        continue
-                    mid = mid.strip()
-                    if mid in seen:
-                        continue
-                    seen.add(mid)
-                    disp = item.get("display_name") or item.get("title") or mid
-                    models.append({"upstream_model_id": mid, "display_name": str(disp).strip() or mid})
-                if models:
-                    return models
-        except Exception:
-            pass
-    if is_synthetic_stub_binary(exe_path):
-        return list(SYNTHETIC_STUB_FALLBACK_MODELS["codex"])
-    return []
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > limit:
+                raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            data = os.read(fd, limit + 1)
+            if len(data) != st.st_size: raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            return data
+        finally: os.close(fd)
+    try:
+        native = CODEX_NATIVE_BINARY
+        catalog = json.loads(read(codex_home / 'models_cache.json', 4 * 1024 * 1024))
+        raw = catalog.get('models')
+        if not isinstance(raw, list): raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+        ids = {m['upstream_model_id'] for m in models}
+        selected = [m for m in raw if isinstance(m, dict) and m.get('slug') in ids]
+        if len(selected) != len(ids) or {m['slug'] for m in selected} != ids:
+            raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+        # CLI is the installed symlink, but only its resolved regular file is read.
+        cli_sha = hashlib.sha256(read(pathlib.Path(exe_path).resolve(), 4 * 1024 * 1024)).hexdigest()
+        fd = os.open(native, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= 512 * 1024 * 1024:
+                raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            digest = hashlib.sha256(); size = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk: break
+                size += len(chunk)
+                if size > st.st_size: raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+                digest.update(chunk)
+            after = os.fstat(fd)
+            if size != st.st_size or (st.st_size,st.st_mtime_ns,st.st_ctime_ns) != (after.st_size,after.st_mtime_ns,after.st_ctime_ns):
+                raise ValueError('CODEX_SNAPSHOT_UNAVAILABLE')
+            native_sha = digest.hexdigest()
+        finally: os.close(fd)
+        controller_sha = hashlib.sha256(read(pathlib.Path(__file__).resolve().with_name('codex-host-controller.py'), 256 * 1024)).hexdigest()
+        return {'version': 1, 'modelList': [m['native'] for m in models], 'modelCatalog': {'models': selected},
+                'cliSha256': cli_sha, 'nativeSha256': native_sha, 'controllerSha256': controller_sha}, None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, 'CODEX_SNAPSHOT_UNAVAILABLE'
+
+
+def codex_profile_probe(codex_home, exe_path, timeout=20):
+    """Exact CODEX_HOME; full pages or no catalog. Returns observed, not online-verified auth."""
+    import fcntl
+    import selectors
+    import tempfile
+    import uuid
+    result = {'auth_present': (codex_home / 'auth.json').is_file(), 'account_observed': False,
+              'models_observed': False, 'execution_ready': False, 'probe_schema_version': 2,
+              'source': 'codex-app-server:model/list', 'freshness': 'cli-observed',
+              'discovered_models': [], 'error_code': None, 'account': None}
+    if not exe_path:
+        result['error_code'] = 'CODEX_NOT_INSTALLED'; return result
+    if not result['auth_present']:
+        result['error_code'] = 'CODEX_AUTH_MISSING'; return result
+    process = None
+    lock = None
+    unit = 'oc-codex-probe-' + uuid.uuid4().hex + '.scope'
+    started = False
+    claimed = False
+    reserved = False
+    temporary = None
+    active = codex_home / 'PROBE_ACTIVE.json'
+    try:
+        if codex_home.is_symlink() or codex_home.resolve() != codex_home.absolute():
+            raise ValueError('CODEX_POLICY_REJECTED')
+        # The probe is exclusive only with another probe: runtime lanes share CODEX_HOME and are
+        # never blocked by discovery (OCV5-746 §4).
+        lock = os.open(codex_home / 'PROBE-CLAIM.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('CODEX_PROFILE_BUSY') from None
+        if active.exists() or active.is_symlink(): codex_reconcile_probe_locked(codex_home)
+        fd = os.open(active, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(json.dumps({'kind':'probe','unit':unit,'bootId':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                                  'ownerPid':os.getpid(),'ownerStartTicks':pathlib.Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]}).encode())
+            out.flush(); os.fsync(out.fileno())
+        directory_fd = os.open(codex_home, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+        claimed = True
+        temporary = tempfile.mkdtemp(prefix='oc-codex-probe-')
+        if temporary:
+            root = pathlib.Path(temporary)
+            cwd = root / 'empty'; cwd.mkdir(mode=0o500)
+            home = root / 'home'; home.mkdir(mode=0o700)
+            codex_check_config_sources(codex_home, cwd)
+            resources = engine_resources()
+            resources.admit('probe:' + unit, 'codex', str(codex_home),
+                            {unit: resources.config('codex')['app']}, kind='probe')
+            reserved = True
+            env = {'HOME': str(home), 'CODEX_HOME': str(codex_home), 'PATH': '/usr/bin:/bin',
+                   'LANG': 'C.UTF-8', 'XDG_CONFIG_HOME': str(home / 'config'),
+                   'XDG_DATA_HOME': str(home / 'data'), 'XDG_CACHE_HOME': str(home / 'cache')}
+            argv = codex_scope_command(unit, ['/usr/bin/python3','-I','-B','-c',CODEX_PROBE_WRAPPER,unit,exe_path,*codex_policy_args()], env)
+            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, cwd=cwd, bufsize=0,
+                                       env={'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': '/run/user/' + str(os.getuid())})
+            started = True
+            deadline = time.monotonic() + timeout
+            selector = selectors.DefaultSelector(); selector.register(process.stdout, selectors.EVENT_READ)
+            buffer = b''; received = 0; rid = 0
+            def rpc(method, params):
+                nonlocal rid, buffer, received
+                rid += 1
+                process.stdin.write((json.dumps({'id': rid, 'method': method, 'params': params})+'\n').encode())
+                while time.monotonic() < deadline:
+                    while b'\n' in buffer:
+                        line, buffer = buffer.split(b'\n', 1)
+                        frame = json.loads(line)
+                        if 'method' in frame and 'id' in frame:
+                            raise ValueError('CODEX_POLICY_REJECTED')
+                        if frame.get('id') == rid:
+                            if 'error' in frame or not isinstance(frame.get('result'), dict):
+                                raise ValueError('CODEX_MODEL_LIST_FAILED')
+                            return frame['result']
+                    if not selector.select(max(0, deadline - time.monotonic())):
+                        break
+                    data = os.read(process.stdout.fileno(), 65536)
+                    if not data: raise ValueError('CODEX_MODEL_LIST_FAILED')
+                    buffer += data; received += len(data)
+                    if received > 8 * 1024 * 1024 or len(buffer) > 2 * 1024 * 1024:
+                        raise ValueError('CODEX_MODEL_LIST_FAILED')
+                raise ValueError('CODEX_PROBE_TIMEOUT')
+            try:
+                rpc('initialize', {'clientInfo': {'name': 'openclaude_remote_probe', 'version': '2'},
+                                   'capabilities': {'experimentalApi': True}})
+                process.stdin.write(b'{"method":"initialized","params":{}}\n')
+                account = rpc('account/read', {}) .get('account')
+                if not isinstance(account, dict) or account.get('type') != 'chatgpt':
+                    raise ValueError('CODEX_ACCOUNT_UNAVAILABLE')
+                result['account_observed'] = True
+                # Never return a token-bearing account object to hostd callers.
+                result['account'] = {k: account[k] for k in ('type','email','planType') if isinstance(account.get(k), str)}
+                models = []; ids = set(); cursors = set(); cursor = None
+                for _ in range(64):
+                    page = rpc('model/list', {'cursor': cursor, 'limit': 100, 'includeHidden': True})
+                    if not isinstance(page.get('data'), list): raise ValueError('CODEX_MODEL_LIST_FAILED')
+                    for item in page['data']:
+                        if not isinstance(item, dict): raise ValueError('CODEX_MODEL_LIST_FAILED')
+                        mid = item.get('model') or item.get('id')
+                        if not isinstance(mid, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}', mid) or mid in ids:
+                            raise ValueError('CODEX_MODEL_LIST_FAILED')
+                        ids.add(mid)
+                        normalized = {'upstream_model_id': mid, 'display_name': item.get('displayName') or mid,
+                                      'native': item}
+                        for native, key in (('supportedReasoningEfforts','supported_reasoning_efforts'),
+                                            ('defaultReasoningEffort','default_reasoning_effort'),
+                                            ('inputModalities','input_modalities'), ('serviceTiers','service_tiers'),
+                                            ('hidden','hidden')):
+                            if native in item: normalized[key] = item[native]
+                        models.append(normalized)
+                    cursor = page.get('nextCursor')
+                    if cursor is None: break
+                    if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                        raise ValueError('CODEX_MODEL_LIST_FAILED')
+                    cursors.add(cursor)
+                else: raise ValueError('CODEX_MODEL_LIST_FAILED')
+                if not models: raise ValueError('CODEX_MODEL_LIST_EMPTY')
+                result.update(discovered_models=models, models_observed=True,
+                              observed_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                              snapshot_sha256=hashlib.sha256(json.dumps(models,sort_keys=True,separators=(',',':')).encode()).hexdigest())
+                snapshot, error = codex_execution_snapshot(codex_home, exe_path, models)
+                result.update(execution_snapshot=snapshot, execution_snapshot_error=error)
+            finally:
+                selector.close()
+                # Always stop before temp HOME is removed or the auth writer lock released.
+                codex_scope_stop(unit)
+                process.wait(timeout=8)
+                started = False
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        code = str(exc)
+        result.update(discovered_models=[], models_observed=False,
+                      error_code=code if re.fullmatch(r'(?:CODEX|REMOTE)_[A-Z_]+', code) else 'CODEX_MODEL_LIST_FAILED')
+    finally:
+        if started:
+            try:
+                codex_scope_stop(unit)
+                process.wait(timeout=8)
+                started = False
+            except (OSError, ValueError, subprocess.SubprocessError):
+                result.update(discovered_models=[], models_observed=False, error_code='CODEX_STOP_UNKNOWN')
+        if reserved and not started: engine_resources().release('probe:' + unit)
+        if claimed and not started:
+            active.unlink()
+            directory_fd = os.open(codex_home, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(directory_fd)
+            finally: os.close(directory_fd)
+            if temporary: shutil.rmtree(temporary)
+        if process is not None:
+            for stream in (process.stdin, process.stdout):
+                stream.close()
+            if process.poll() is None:
+                # Reap the transport eventually; this is NOT a stop proof or claim release.
+                import threading
+                threading.Thread(target=process.wait, daemon=True).start()
+        if lock is not None: os.close(lock)
+    return result
+
+
+def discover_codex_models_from_cli(codex_home, exe_path):
+    return codex_profile_probe(codex_home, exe_path)['discovered_models']
+
+
+def probe_codex_profiles(home, exe_path, cli_ver):
+    dirs = [('default', home / '.codex')]; names = {'default'}
+    for path in sorted(home.glob('.codex-*')):
+        name = path.name[len('.codex-'):]
+        if path.is_dir() and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}', name):
+            dirs.append((name, path)); names.add(name)
+    for parent in (home / 'accounts', home / '.openclaude/profiles'):
+        if parent.is_dir():
+            for path in sorted(parent.iterdir()):
+                name = path.name.lower()
+                actual = path / '.codex' if (path / '.codex/auth.json').is_file() else path
+                if re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}',name) and name not in names and (actual/'auth.json').is_file():
+                    dirs.append((name, actual)); names.add(name)
+    managed = home / '.oc-remote-codex/profiles'
+    if managed.is_dir():
+        for profile in sorted(managed.iterdir()):
+            name = profile.name; actual = profile / 'codex-home'
+            if re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}',name) and actual.is_dir():
+                # A managed migration replaces discovery of the legacy profile with this id.
+                dirs = [(n,p) for n,p in dirs if n != name]
+                dirs.append((name,actual)); names.add(name)
+    profiles = []
+    for name, path in dirs:
+        probe = codex_profile_probe(path, exe_path)
+        account = probe.pop('account') or {}
+        email = account.get('email')
+        profiles.append({**probe, 'engine':'codex', 'profile_name':name, 'cli_version':cli_ver,
+                         'runner_mode':'app-server', 'mod_digest':None,
+                         'logged_in':probe['account_observed'] and probe['models_observed'],
+                         'account_hint':mask_email(email) or 'codex:'+name,
+                         'account_fingerprint':account_fingerprint('codex', email or str(path)),
+                         'plan_type':account.get('planType'), 'quota_windows':[]})
+    return profiles
 
 
 def discover_grok_models_from_cli(home: pathlib.Path, exe_path: Optional[str]) -> List[Dict[str, str]]:
@@ -503,28 +844,14 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
         alt_bin = "antigravity" if binary == "agy" else "agy"
         exe_path = resolve_binary_path(alt_bin)
         cli_ver = run_cmd_version(alt_bin)
+    if engine == "codex":
+        return probe_codex_profiles(home, exe_path, cli_ver)
     if not cli_ver:
         return []
 
     profile_Auths: List[tuple[str, pathlib.Path, List[pathlib.Path]]] = [("default", home, auth_files)]
     seen_names: set[str] = {"default"}
-    if engine == "codex":
-        for entry in sorted(home.glob(".codex-*")):
-            if entry.is_dir():
-                name = entry.name[len(".codex-") :]
-                if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names:
-                    profile_Auths.append((name, entry, [entry / "auth.json"]))
-                    seen_names.add(name)
-        for parent in (home / "accounts", home / ".openclaude" / "profiles"):
-            if parent.is_dir():
-                for sub in sorted(parent.iterdir()):
-                    if sub.is_dir():
-                        name = sub.name.lower()
-                        cand = sub / ".codex" / "auth.json" if (sub / ".codex" / "auth.json").is_file() else (sub / "auth.json")
-                        if re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", name) and name not in seen_names and cand.is_file():
-                            profile_Auths.append((name, cand.parent, [cand]))
-                            seen_names.add(name)
-    elif engine == "antigravity":
+    if engine == "antigravity":
         for prefix in (".gemini-", ".antigravity-"):
             for entry in sorted(home.glob(f"{prefix}*")):
                 if entry.is_dir():
@@ -679,9 +1006,7 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
                 except Exception:
                     pass
         if has_valid_token and not discovered_models:
-            if engine == "codex":
-                discovered_models = discover_codex_models_from_cli(prof_root if (prof_root / "models_cache.json").is_file() else home, exe_path)
-            elif engine == "grok-build":
+            if engine == "grok-build":
                 discovered_models = discover_grok_models_from_cli(prof_root if (prof_root / "models_cache.json").is_file() else home, exe_path)
             elif engine == "antigravity":
                 discovered_models = discover_antigravity_models_from_cli(exe_path)

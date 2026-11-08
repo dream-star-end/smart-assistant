@@ -1,3 +1,4 @@
+import { nodeMemoryError, isRemoteResourceCode } from './remoteNodeMemory.js'
 /** Task-only live-web transport. No CLI, provider credentials or remote shell here. */
 import { createHash } from 'node:crypto'
 import {
@@ -15,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import {
   type AuthorityKeyring,
   type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
   CC5_INTERACTIVE_BACKEND,
   isCc5BackendAuthority,
   isCc5CanonicalModel,
@@ -68,7 +70,7 @@ export function assertCc5BindingScope(binding: Readonly<Cc5BridgeBinding>): void
 
 export function cc5AuthorityMatchesBinding(binding: Readonly<Cc5BridgeBinding>, authority: {
   uid: number; containerId: number; canonicalModel: string; engine: string
-  executionBackend?: Cc5ExecutionBackend
+  executionBackend?: RemoteExecutionBackend
 }): boolean {
   assertCc5BindingScope(binding)
   return isCc5BackendAuthority(authority) && String(authority.uid) === binding.uid &&
@@ -248,7 +250,13 @@ export function cc5ControlRequest(
         res.on('error', reject)
         res.on('aborted', () => reject(new Error('CC5_CONTROL_RESPONSE_UNKNOWN')))
         res.on('end', () => {
-          if (res.statusCode !== 200) return reject(new Error('CC5_CONTROL_REJECTED'))
+          if (res.statusCode !== 200) {
+            try {
+              const error = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+              if (isRemoteResourceCode(error.error)) return reject(nodeMemoryError(error.activeSessions, error.error))
+            } catch { /* Untrusted errors retain the fixed generic label. */ }
+            return reject(new Error('CC5_CONTROL_REJECTED'))
+          }
           try {
             const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<
               string,

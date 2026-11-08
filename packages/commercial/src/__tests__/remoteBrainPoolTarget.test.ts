@@ -100,9 +100,11 @@ function placementPool(candidates: Array<Record<string, unknown>>, bindings: Arr
   const statements: Array<{ sql: string; params: unknown[] }> = []
   return {
     statements,
-    pool: { async query(sql: string, params: unknown[] = []) {
+    pool: { async connect(this: {query: (sql: string, params?: unknown[]) => Promise<unknown>}) { return { query: this.query.bind(this), release() {} } }, async query(sql: string, params: unknown[] = []) {
       statements.push({ sql, params })
       if (sql.includes('FROM remote_model_offers')) return { rows: candidates }
+      if (sql.includes('COUNT(*)')) return { rows: [{ node_used: 0, profile_used: 0 }] }
+      if (sql.includes("state<>'released' LIMIT 1")) return { rows: [] }
       if (sql.includes('FROM remote_agent_bindings')) return { rows: bindings }
       return { rows: [], rowCount: 1 }
     } } as unknown as NonNullable<Parameters<typeof placeRemoteLane>[1]>['pool'],
@@ -110,7 +112,7 @@ function placementPool(candidates: Array<Record<string, unknown>>, bindings: Arr
 }
 const candidate = (over: Record<string, unknown> = {}) => ({
   profile_id: 'profile-2', node_id: 'node-7', engine: 'cc', profile_name: 'acct-2', runner_mode: 'interactive',
-  weight: 100, health_score: 100, hot_slots: 0, active_slots: 0, max_hot_slots: 4, max_active_slots: 2,
+  max_concurrent_lanes: 5, weight: 100, health_score: 100, hot_slots: 0, active_slots: 0, max_hot_slots: 4, max_active_slots: 5,
   offer_id: 'offer-3', upstream_model_id: 'claude-opus-5-5', canonical_model_id: 'claude-opus-5-5-remote',
   label: 'pool node 7', ssh_host: 'node-7.pool.example', ssh_port: 22, ssh_user: 'box',
   host_key_fp: 'SHA256:fixture', key_id: 'key-7', rtt_ms_p50: 40, node_status: 'active', ...over,
@@ -132,12 +134,13 @@ test('a first turn ranks the offering profile, packages its node root and record
     home: '/home/box', operationId: placed.operationId, runId: placed.runId }])
   const insert = statements.find((s) => s.sql.includes('INSERT INTO remote_agent_bindings'))!
   assert.deepEqual(insert.params, [placed.operationId, placed.runId, 3, '91', 'd'.repeat(64), request.sessionKey,
-    'node-7', 'profile-2', 'claude-opus-5-5-remote'])
+    'node-7', 'profile-2', 'claude-opus-5-5-remote', 'cc', 'cc5-interactive-v1', '1', null, null,JSON.stringify({version:1,target:placed.target,taskRoot:placed.taskRoot,
+      operationId:placed.operationId,runId:placed.runId,generation:'1',controllerPath:CONTROLLER}),true]) // CC must never claim Codex no-effect recovery
 })
 
 test('a placed chat keeps its profile and ids; an unavailable home profile fails instead of moving the chat', async () => {
   const sticky = { operation_id: '11111111-1111-4111-8111-111111111111',
-    run_id: '22222222-2222-4222-8222-222222222222', profile_id: 'profile-2' }
+    run_id: '22222222-2222-4222-8222-222222222222', profile_id: 'profile-2', generation: '1' }
   const both = [candidate({ profile_id: 'profile-9', weight: 1_000_000 }), candidate()]
   const { pool } = placementPool(both, [sticky])
   const placed = await placeRemoteLane(request, { pool, packet: async () => Buffer.from('packet') })
