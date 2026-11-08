@@ -385,6 +385,12 @@
       "reason": "OCV5-721 远程模型池提交 ae3b77946（remote_pool 目录投影、多目录 profile、SSH 密码引导）以 fix(v5) 前缀推送但漏写 Incident trailer；已推送到共享 feat/v5-selfhost，不可改写。属于远程模型池功能开发，不对应会话展示/错误卡事故。仅豁免该完整 SHA。",
       "approvedBy": "user 2026-11-06 webmw49pf18atbm96 选择「给这一个提交加例外后发布」",
       "expiresAt": "2026-12-06"
+    },
+    {
+      "commit": "de3ca8e4c1a801499aa771172924af06f09d0c8d",
+      "reason": "OCV5-746 Codex 远端容器侧提交 de3ca8e4c（同一准入只认领一次原生线程边界）以 fix(v5) 前缀推送但漏写 Incident trailer；已推送到共享 feat/v5-selfhost，不可改写。修的是开发中自测发现、从未上线的问题，不对应任何线上事故。仅豁免该完整 SHA。",
+      "approvedBy": "user 2026-11-08 webmw4oodqfrsmx3n 选择「登记单提交例外」",
+      "expiresAt": "2026-12-08"
     }
   ]
 }
