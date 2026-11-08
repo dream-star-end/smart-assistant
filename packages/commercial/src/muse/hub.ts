@@ -120,6 +120,8 @@ interface HubJob {
   retryAt: number
   retryTimer: NodeJS.Timeout | null
   credentialId: string | null
+  bridgeSessionId: string | null
+  bridgeVersion: string | null
   /** Credits this job will cost on success (0n when not billed); held against the balance check. */
   price: bigint
   /** The success is being recorded and charged; only result() may finish the job meanwhile. */
@@ -189,7 +191,11 @@ export interface MuseBridgeHubOptions {
   allowedUids: MuseAllowlist
   rate: MuseRateLimits
   cliTimeoutSec: Readonly<Record<MuseKind, number>>
-  /** Jobs running at once (bridge slots). Default 1. */
+  /** Commercial credential-scoped workers; default keeps the single-bridge contract. */
+  multiBridge?: boolean
+  /** Per-bridge execution cap, additionally bounded by the site cap. */
+  perBridgeConcurrency?: number
+  /** Jobs running at once across this hub. Default 1. */
   concurrency?: number
   /** Jobs waiting across all accounts. Default QUEUE_MAX. */
   queueMax?: number
@@ -265,7 +271,9 @@ export class MuseBridgeHub {
   private readonly retryIntervalMs: number
   private readonly now: () => number
   private readonly log: Logger
-  private session: Session | null = null
+  private readonly multiBridge: boolean
+  private readonly perBridgeConcurrency: number
+  private readonly sessions = new Map<string, Session>()
   private readonly superseded: string[] = []
   private readonly waiters: PollWaiter[] = []
   /** Dispatched and running jobs (at most `concurrency`). */
@@ -290,6 +298,11 @@ export class MuseBridgeHub {
     this.rate = opts.rate
     this.cliTimeoutSec = opts.cliTimeoutSec
     this.concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1))
+    this.multiBridge = opts.multiBridge ?? false
+    this.perBridgeConcurrency = Math.max(
+      1,
+      Math.min(this.concurrency, Math.floor(opts.perBridgeConcurrency ?? this.concurrency)),
+    )
     this.queueMax = Math.max(1, Math.floor(opts.queueMax ?? QUEUE_MAX))
     this.queueWaitMs = opts.queueWaitMs ?? { image: QUEUE_WAIT_MS, video: QUEUE_WAIT_MS }
     this.userInflightMax = opts.userInflightMax ?? Number.POSITIVE_INFINITY
@@ -382,38 +395,55 @@ export class MuseBridgeHub {
   }
 
   bridgeOnline(): boolean {
-    return this.session !== null && this.now() - this.session.lastSeen <= BRIDGE_ONLINE_MS
+    return [...this.sessions.values()].some((s) => this.sessionOnline(s))
   }
 
   /** Sent to the bridge in /hello: how many jobs it may run at once. */
   bridgeConcurrency(): number {
-    return this.concurrency
+    return this.perBridgeConcurrency
+  }
+
+  private sessionOnline(session: Session): boolean {
+    return this.now() - session.lastSeen <= BRIDGE_ONLINE_MS
   }
 
   // ── bridge side ──────────────────────────────────────────────────────────
 
   hello(credentialId: string, version: string | null): string {
-    if (this.session) {
-      this.superseded.push(this.session.id)
+    const replaced = [...this.sessions.values()].filter(
+      (s) => !this.multiBridge || s.credentialId === credentialId,
+    )
+    for (const old of replaced) {
+      this.sessions.delete(old.id)
+      this.superseded.push(old.id)
       if (this.superseded.length > 32) this.superseded.shift()
+      for (const w of [...this.waiters]) if (w.sessionId === old.id) this.dropWaiter(w)
+      for (const job of [...this.active.values()]) {
+        if (job.bridgeSessionId === old.id) this.requeue(job, 'reconnect')
+      }
     }
-    this.clearWaiters()
-    for (const a of [...this.active.values()]) {
-      if (a.state === 'dispatched' || a.state === 'running') this.requeue(a, 'reconnect')
-    }
-    this.session = { id: randomUUID(), credentialId, version, lastSeen: this.now() }
+    const session = { id: randomUUID(), credentialId, version, lastSeen: this.now() }
+    this.sessions.set(session.id, session)
     void this.durableTick()
+    this.pump()
     this.log.info('muse_bridge_hello', { credentialId, version })
-    return this.session.id
+    return session.id
   }
 
-  checkSession(sessionId: string | undefined): SessionCheck {
-    if (sessionId && this.session?.id === sessionId) {
-      this.session.lastSeen = this.now()
+  checkSession(sessionId: string | undefined, credentialId?: string): SessionCheck {
+    const session = sessionId ? this.sessions.get(sessionId) : undefined
+    if (session && (credentialId === undefined || session.credentialId === credentialId)) {
+      session.lastSeen = this.now()
       return 'ok'
     }
     if (sessionId && this.superseded.includes(sessionId)) return 'superseded'
     return 'unknown'
+  }
+
+  /** HTTP boundary: even another authenticated bridge cannot operate this attempt. */
+  requireAssignment(jobId: string, nonce: string, sessionId: string): void {
+    if (this.requireActive(jobId, nonce).bridgeSessionId !== sessionId)
+      throw new MuseError(410, 'JOB_GONE', 'job belongs to another bridge session')
   }
 
   /**
@@ -421,13 +451,15 @@ export class MuseBridgeHub {
    * client went away before a response was written). The bridge keeps one poll per free slot.
    */
   poll(sessionId: string, holdMs: number, signal?: AbortSignal): Promise<MuseWireJob | null> {
-    if (sessionId !== this.session?.id) return Promise.resolve(null)
-    this.session.lastSeen = this.now()
-    const ready = this.takeNext()
+    const session = this.sessions.get(sessionId)
+    if (!session) return Promise.resolve(null)
+    session.lastSeen = this.now()
+    const ready = this.takeNext(session)
     if (ready) return this.wireAfterCheckpoint(ready)
     if (signal?.aborted) return Promise.resolve(null)
     // More polls than slots means stale ones from a restarted bridge thread: drop the oldest.
-    while (this.waiters.length >= this.concurrency) this.dropWaiter(this.waiters[0]!)
+    const ownWaiters = this.waiters.filter((w) => w.sessionId === sessionId)
+    while (ownWaiters.length >= this.perBridgeConcurrency) this.dropWaiter(ownWaiters.shift()!)
     return new Promise((resolve) => {
       const waiter: PollWaiter = {
         sessionId,
@@ -447,9 +479,11 @@ export class MuseBridgeHub {
   }
 
   /** A dispatched job could not be written to its poll response: it was never seen. */
-  undeliverable(jobId: string): void {
+  undeliverable(jobId: string, nonce: string): void {
     const job = this.jobs.get(jobId)
-    if (job && this.active.get(jobId) === job && job.state === 'dispatched') this.requeue(job)
+    if (
+      job && job.nonce === nonce && this.active.get(jobId) === job && job.state === 'dispatched'
+    ) this.requeue(job)
   }
 
   /**
@@ -472,7 +506,6 @@ export class MuseBridgeHub {
     const now = this.now()
     if (job.state === 'dispatched') {
       job.state = 'running'
-      job.credentialId = this.session?.credentialId ?? null
       if (job.credentialId) {
         this.store.markRunning(job.id, job.credentialId).catch((err) => {
           this.log.warn('muse_mark_running_failed', { jobId: job.id, err: (err as Error).message })
@@ -738,8 +771,11 @@ export class MuseBridgeHub {
         ? await this.durability.validateOrigin(userId, opts.sessionKey)
         : undefined
     // Offline jobs are admitted once, then consume the same bounded retry budget as failures.
-    const version = this.session?.version ?? null
-    if (this.bridgeOnline() && spec.source_images?.length && !bridgeFetchesSources(version)) {
+    const version = this.sessions.values().next().value?.version ?? null
+    if (
+      !this.multiBridge && this.bridgeOnline() && spec.source_images?.length &&
+      !bridgeFetchesSources(version)
+    ) {
       // An older bridge only receives sources inline in the poll response, and large ones never
       // get through to it: refuse now instead of failing a minute later as MUSE_BRIDGE_LOST.
       const total = spec.source_images.reduce((n, b) => n + base64DecodedBytes(b), 0)
@@ -912,6 +948,8 @@ export class MuseBridgeHub {
       retryAt: 0,
       retryTimer: null,
       credentialId: null,
+      bridgeSessionId: null,
+      bridgeVersion: null,
       price,
       settling: false,
       uploads: new Map(),
@@ -1050,6 +1088,15 @@ export class MuseBridgeHub {
     for (const job of [...this.jobs.values()]) {
       if (job.durable && job.state !== 'done' && now >= job.leaseUntil) this.forget(job)
     }
+    for (const session of this.sessions.values()) {
+      if (
+        !this.sessionOnline(session) &&
+        ![...this.active.values()].some((job) => job.bridgeSessionId === session.id)
+      ) {
+        this.sessions.delete(session.id)
+        for (const w of [...this.waiters]) if (w.sessionId === session.id) this.dropWaiter(w)
+      }
+    }
     // Retry delays use both timers and this sweep; tick also detects a quiet bridge.
     for (const a of [...this.active.values()]) {
       if (a.state === 'dispatched' && now - a.dispatchedAt > ACK_TIMEOUT_MS) {
@@ -1115,10 +1162,21 @@ export class MuseBridgeHub {
     return n
   }
 
-  private takeNext(): HubJob | null {
-    if (this.stopped || !this.bridgeOnline() || this.active.size >= this.concurrency) return null
+  private canServe(session: Session, job: HubJob): boolean {
+    return bridgeFetchesSources(session.version) ||
+      (job.spec.source_images ?? []).reduce((n, b) => n + base64DecodedBytes(b), 0) <=
+        INLINE_SOURCE_MAX_BYTES
+  }
+
+  private takeNext(session: Session): HubJob | null {
+    if (
+      this.stopped || !this.sessionOnline(session) || this.active.size >= this.concurrency ||
+      [...this.active.values()].filter((job) => job.credentialId === session.credentialId).length >=
+        this.perBridgeConcurrency
+    ) return null
     const at = this.queue.findIndex(
       (job) =>
+        (!this.multiBridge || this.canServe(session, job)) &&
         job.retryAt === 0 &&
         job.checkpointCount === 0 &&
         (!job.durable || this.now() < job.leaseUntil) &&
@@ -1130,7 +1188,7 @@ export class MuseBridgeHub {
     // An offline submission may first encounter a legacy bridge when it reconnects.
     if (
       job!.spec.source_images?.length &&
-      !bridgeFetchesSources(this.session?.version ?? null) &&
+      !bridgeFetchesSources(session.version) &&
       job!.spec.source_images.reduce((n, b) => n + base64DecodedBytes(b), 0) >
         INLINE_SOURCE_MAX_BYTES
     ) {
@@ -1138,10 +1196,13 @@ export class MuseBridgeHub {
         job!,
         fail('MUSE_SOURCE_TOO_LARGE', 'source images exceed the connected bridge limit'),
       )
-      return this.takeNext()
+      return this.takeNext(session)
     }
     job!.queuedMs += now - job!.queuedAt
     job!.state = 'dispatched'
+    job!.bridgeSessionId = session.id
+    job!.bridgeVersion = session.version
+    job!.credentialId = session.credentialId
     job!.nonce = randomUUID()
     job!.dispatchedAt = now
     job!.deadlineAt = now + jobDeadlineMs(job!.spec)
@@ -1166,11 +1227,16 @@ export class MuseBridgeHub {
     if (this.pumping) return
     this.pumping = true
     try {
-      while (this.waiters.length > 0) {
-        const job = this.takeNext()
-        if (!job) return
-        const w = this.waiters.shift()!
-        clearTimeout(w.timer)
+      // A full/legacy bridge must not block another bridge's free compatible slot.
+      for (const w of [...this.waiters]) {
+        const session = this.sessions.get(w.sessionId)
+        if (!session || !this.sessionOnline(session)) {
+          this.dropWaiter(w)
+          continue
+        }
+        const job = this.takeNext(session)
+        if (!job) continue
+        this.removeWaiter(w)
         w.resolve(job)
       }
     } finally {
@@ -1382,7 +1448,7 @@ export class MuseBridgeHub {
     await job.checkpoint
     this.requireActive(job.id, nonce)
     if (job.state === 'dispatched') {
-      await this.store.markRunning(job.id, this.session!.credentialId, this.fence(job))
+      await this.store.markRunning(job.id, job.credentialId!, this.fence(job))
       this.requireActive(job.id, nonce)
       job.state = 'running'
       this.checkpoint(job)
@@ -1495,6 +1561,8 @@ export class MuseBridgeHub {
       retryAt: d.retryAt,
       retryTimer: null,
       credentialId: null,
+      bridgeSessionId: null,
+      bridgeVersion: null,
       price: BigInt(row.price),
       settling: false,
       uploads: new Map(),
@@ -1563,7 +1631,7 @@ export class MuseBridgeHub {
   private wire(job: HubJob): MuseWireJob {
     const s = job.spec
     const byRef =
-      Boolean(s.source_images?.length) && bridgeFetchesSources(this.session?.version ?? null)
+      Boolean(s.source_images?.length) && bridgeFetchesSources(job.bridgeVersion)
     const w: MuseWireJob = {
       id: job.id,
       nonce: job.nonce,

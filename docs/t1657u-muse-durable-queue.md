@@ -74,3 +74,43 @@ their audit row exists (startup cleanup reclaims them after row retention).
   and retain the durable-capable release while jobs/outbox entries are outstanding.
 - No environment override, release queue, deployment, restart, actual billing, or production
   callback is performed by this PR-only task.
+
+## Addendum 3 — multiple Muse accounts (t1658u)
+
+The credential table and `scripts/muse-bridge-token.sh` already support separate tokens. The old
+hub had one session: every hello displaced every other bridge. Commercial assembly now enables
+one current session **per credential**, using the same verified commercial-flavor gate as durable
+delivery. A replacement using the same token fences only that credential's attempts and polls.
+Different accounts must use different tokens; sharing one token intentionally retains replacement
+semantics. The personal/default hub contract remains single-session.
+
+For a future approved setup, issue one token per worker/account using `muse-bridge-token.sh issue
+--label <unique-name>`, explicitly setting `MUSE_ENV_FILE` to the commercial environment file
+(the script's default is selfhost). It writes a root-only token file; do not put token contents in
+logs or commands. No tokens were issued or revoked during this task.
+
+`OC_MUSE_CONCURRENCY` remains the existing total cap per master hub (default 1; hard maximum 32).
+`OC_MUSE_BRIDGE_CONCURRENCY` optionally caps each bridge, defaults to that site cap, and cannot
+raise it. `/hello.max_concurrency` advertises the per-bridge cap; each bridge's existing
+`--max-concurrency` can lower its own worker count. For example, site cap 4 and bridge cap 2 allow
+two accounts to execute two jobs each. User running/inflight, queue, daily and credit limits are
+unchanged. These are the existing per-process execution limits, not a new cluster-wide capacity
+reservation system. No environment files were changed.
+
+A polling bridge takes compatible work only while it and the site have spare capacity. Full or
+legacy bridge polls do not block a peer's free slot; source transport uses the assigned bridge's
+version. Any live session means online. Silent job heartbeat loss uses the existing detection
+window (120s), then the fixed 40s retry delay; explicit worker-loss reports and same-token hello
+start that delay immediately. The other bridge can take the next attempt. Addendum 2's initial
+attempt + three retries and durable background phase remain unchanged; no H3 request is added.
+
+Each dispatch pins bridge session, credential and protocol version to its attempt nonce. HTTP
+checks token→session and session→attempt for heartbeat, sources, chunks and results. A stale poll
+response cannot requeue a newer attempt. Durable lease/nonce fencing and immutable result paths
+remain authoritative across server restarts; bridge bindings are local dispatch metadata and are
+recreated on recovery, so no additional migration is needed. Existing atomic settlement and
+conversation outbox dedupe provide one charge and one origin message across reassignment.
+
+R3 deployment surface is master commercial source/config only, plus tests/documentation. No
+runtime image rebuild, new schema migration, egress change or frontend rebuild is introduced by
+R3; the broader R2 rollout requirements above still apply to the combined draft PR.

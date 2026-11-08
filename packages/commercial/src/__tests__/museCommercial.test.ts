@@ -204,6 +204,115 @@ describe('commercial muse hub (OCV5-574)', () => {
     rmSync(root, { recursive: true, force: true })
   })
 
+  it('multi-Muse enforces per-bridge, site and user caps without head-of-line poll blocking', async () => {
+    const hub = makeHub({ multiBridge: true, concurrency: 2, perBridgeConcurrency: 1, userRunningMax: 1 })
+    const a = hub.hello('1', '0.5.0')
+    const b = hub.hello('2', '0.5.0')
+    assert.equal(hub.checkSession(a, '1'), 'ok')
+    assert.equal(hub.checkSession(a, '2'), 'unknown')
+    assert.equal(hub.bridgeConcurrency(), 1)
+    const one = await hub.submit('10', null, { kind: 'image', prompt: 'one' })
+    const two = await hub.submit('10', null, { kind: 'image', prompt: 'two' })
+    const first = (await hub.poll(a, 5))!
+    assert.equal(first.id, one)
+    const aBlocked = hub.poll(a, 1000)
+    const bFree = hub.poll(b, 1000)
+    const three = await hub.submit('11', null, { kind: 'image', prompt: 'three' })
+    const next = (await bFree)!
+    assert.equal(next.id, three, 'full A and capped user do not starve B')
+    const c = hub.hello('3', '0.5.0')
+    assert.equal(await hub.poll(c, 5), null, 'global cap still applies')
+    await runToSuccess(hub, first)
+    const pending = (await aBlocked)!
+    assert.equal(pending.id, two)
+    assert.equal(await hub.poll(a, 5), null)
+    assert.equal(await hub.poll(b, 5), null)
+    await runToSuccess(hub, next)
+    await runToSuccess(hub, pending)
+    assert.equal(billing.settled.length, 3)
+  })
+
+  it('same-token replacement only fences its own attempts and pending polls', async () => {
+    const hub = makeHub({ multiBridge: true, perBridgeConcurrency: 1 })
+    const a = hub.hello('1', '0.5.0')
+    const b = hub.hello('2', '0.5.0')
+    await hub.submit('10', null, { kind: 'image', prompt: 'one' })
+    await hub.submit('11', null, { kind: 'image', prompt: 'two' })
+    const first = (await hub.poll(a, 5))!
+    const other = (await hub.poll(b, 5))!
+    hub.heartbeat(first.id, first.nonce)
+    hub.heartbeat(other.id, other.nonce)
+    const waitingA = hub.poll(a, 1000)
+    const waitingB = hub.poll(b, 1000)
+    const replacement = hub.hello('1', '0.5.0')
+    assert.equal(await waitingA, null)
+    assert.equal(hub.checkSession(a), 'superseded')
+    assert.equal(hub.checkSession(b), 'ok')
+    assert.equal((await hub.view('11', other.id, 0))?.retry_count, 0)
+    await assert.rejects(hub.result(first.id, first.nonce, { ok: true }), /reassigned/)
+    await runToSuccess(hub, other)
+    clock.t += MUSE_RETRY_INTERVAL_MS
+    hub.checkSession(b)
+    hub.tick()
+    const reassigned = (await waitingB)!
+    assert.equal(reassigned.id, first.id)
+    assert.notEqual(reassigned.nonce, first.nonce)
+    hub.undeliverable(first.id, first.nonce)
+    hub.requireAssignment(first.id, reassigned.nonce, b)
+    await runToSuccess(hub, reassigned)
+    assert.equal(await hub.poll(replacement, 5), null)
+    assert.equal(billing.settled.filter((x) => x.jobId === first.id).length, 1)
+  })
+
+  it('one bridge heartbeat timeout reassigns to a live peer after exactly 40s and bills once', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const hub = makeHub({ multiBridge: true, perBridgeConcurrency: 1 })
+    const a = hub.hello('1', '0.5.0')
+    const b = hub.hello('2', '0.5.0')
+    const id = await hub.submit('10', null, { kind: 'image', prompt: 'one' })
+    const lost = (await hub.poll(a, 5))!
+    hub.heartbeat(id, lost.nonce)
+    clock.t += HEARTBEAT_LOST_MS + 1
+    hub.checkSession(b)
+    hub.tick()
+    assert.equal(hub.bridgeOnline(), true)
+    assert.equal((await hub.view('10', id, 0))?.retry_count, 1)
+    const next = hub.poll(b, 60_000)
+    let dispatched = false
+    void next.then(() => { dispatched = true })
+    clock.t += 39_999
+    t.mock.timers.tick(39_999)
+    await Promise.resolve()
+    assert.equal(dispatched, false)
+    clock.t += 1
+    hub.checkSession(b)
+    t.mock.timers.tick(1)
+    const winner = (await next)!
+    assert.equal(winner.id, id)
+    assert.notEqual(winner.nonce, lost.nonce)
+    await assert.rejects(hub.result(id, lost.nonce, { ok: true }), /reassigned/)
+    await runToSuccess(hub, winner)
+    await assert.rejects(hub.result(id, winner.nonce, { ok: true }), /reassigned/)
+    assert.equal(store.rows.size, 1)
+    assert.equal(billing.settled.length, 1)
+  })
+
+  it('legacy polls do not consume a large-source job that a modern bridge can execute', async () => {
+    const hub = makeHub({ multiBridge: true, perBridgeConcurrency: 1 })
+    const modern = hub.hello('1', '0.5.0')
+    const legacy = hub.hello('2', '0.3.0')
+    const oldPoll = hub.poll(legacy, 10)
+    const modernPoll = hub.poll(modern, 1000)
+    const id = await hub.submit('10', null, {
+      kind: 'image', prompt: 'large', source_images: [Buffer.alloc(600_000).toString('base64')],
+    })
+    const job = (await modernPoll)!
+    assert.equal(job.id, id)
+    assert.ok(job.source_refs)
+    assert.equal(await oldPoll, null)
+    assert.equal((await hub.view('10', id, 0))?.retry_count, 0)
+  })
+
   it('opens to every account with the single token all (uid 4 included)', () => {
     assert.equal(parseAllowedUids(['all']), 'all')
     const hub = makeHub()

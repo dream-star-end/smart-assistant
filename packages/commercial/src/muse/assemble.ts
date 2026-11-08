@@ -54,6 +54,8 @@ export async function createMuseFromConfig(
       videoPerDay: cfg.OC_MUSE_VIDEO_PER_DAY ?? 40,
     },
     cliTimeoutSec: CLI_TIMEOUT_SEC,
+    multiBridge: Boolean(delivery), // delivery is supplied only for verified commercial flavor
+    perBridgeConcurrency: cfg.OC_MUSE_BRIDGE_CONCURRENCY,
     concurrency: Math.min(cfg.OC_MUSE_CONCURRENCY ?? 1, MAX_CONCURRENCY),
     ...(cfg.OC_MUSE_QUEUE_MAX !== undefined ? { queueMax: cfg.OC_MUSE_QUEUE_MAX } : {}),
     queueWaitMs: {

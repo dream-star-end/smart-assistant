@@ -765,6 +765,8 @@ export const commercialConfigSchema = z
     /** OCV5-574 commercial Muse. All optional; unset keeps the personal edition's single-slot hub. */
     /** Jobs running at once across the site (bridge slots). Unset → 1. */
     OC_MUSE_CONCURRENCY: positiveInt(32),
+    /** Cap per Muse bridge; unset inherits site concurrency. Worker may lower it locally. */
+    OC_MUSE_BRIDGE_CONCURRENCY: positiveInt(32),
     /** Jobs waiting across the site. Unset → 3. */
     OC_MUSE_QUEUE_MAX: positiveInt(1_000),
     /** Longest wait in the queue, per kind. Unset → 240 s. */

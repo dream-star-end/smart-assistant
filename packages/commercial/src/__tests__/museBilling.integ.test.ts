@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createMuseDurability, type MuseDurableState } from '../muse/durable.js'
 import { createMuseDelivery } from '../muse/delivery.js'
+import { MuseBridgeHub } from '../muse/hub.js'
 import { createPgSessionsBackend } from '../db/pgSessionsBackend.js'
 import { after, before, beforeEach, describe, test } from 'node:test'
 
@@ -323,6 +324,78 @@ describe('Muse durable journal/outbox (0336)', () => {
       fence: { owner: 'owner-a', nonce: state.nonce },
     }
   }
+  for (const background of [false, true]) {
+    test(`multi-Muse ${background ? 'background' : 'sync'} reassignment charges once and delivers once to origin`, async (t) => {
+      if (!pgAvailable) return t.skip('no test database')
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      const f = await fixture()
+      await query(
+        'UPDATE muse_media_jobs SET durable=durable || $2::jsonb, lease_until=NOW() WHERE id=$1',
+        [f.id, JSON.stringify({ background, retryAt: 0, retryCount: 0 })],
+      )
+      const credentials = await query<{ id: string }>(
+        `INSERT INTO muse_bridge_credentials(label, token_sha256)
+         VALUES ('test-muse-a', $1), ('test-muse-b', $2) RETURNING id::text`,
+        [createHash('sha256').update(randomUUID()).digest(), createHash('sha256').update(randomUUID()).digest()],
+      )
+      const root = await mkdtemp(join(tmpdir(), 'muse-multi-'))
+      const bytes = Buffer.concat([Buffer.from('0000ftypisom'), Buffer.alloc(30)])
+      const hash = createHash('sha256').update(bytes).digest('hex')
+      const drain = createMuseDelivery(getPool(), root, {
+        originActive: f.originActive,
+        append: f.backend.appendServerAuthoredMessage,
+        resolveMedia: async () => ({
+          kind: 'ok', uid: Number(f.uid), generated: join(root, 'generated'), uploads: join(root, 'uploads'),
+        }),
+      })
+      let offset = 0
+      const hub = new MuseBridgeHub({
+        store: f.store, durability: createMuseDurability(getPool(), drain, f.originActive),
+        billing: createMuseBilling(getPool(), PRICES), stateRoot: root, allowedUids: 'all',
+        multiBridge: true, concurrency: 2, perBridgeConcurrency: 1,
+        rate: { imagePerHour: 100, imagePerDay: 100, videoPerHour: 100, videoPerDay: 100 },
+        cliTimeoutSec: { image: 120, video: 300 }, now: () => Date.now() + offset,
+      })
+      try {
+        await hub.start()
+        const a = hub.hello(credentials.rows[0]!.id, '0.5.0')
+        const b = hub.hello(credentials.rows[1]!.id, '0.5.0')
+        const lost = (await hub.poll(a, 1000))!
+        assert.equal(lost.id, f.id)
+        await hub.heartbeat(f.id, lost.nonce)
+        // A reports a lost worker. Its process is gone; B is already waiting with spare capacity.
+        await hub.result(f.id, lost.nonce, { ok: false, error_code: 'MUSE_BRIDGE_LOST' })
+        const next = hub.poll(b, 60_000)
+        offset = 40_000
+        t.mock.timers.tick(40_000)
+        const winner = (await next)!
+        assert.equal(winner.id, f.id)
+        assert.notEqual(winner.nonce, lost.nonce)
+        await assert.rejects(hub.result(f.id, lost.nonce, { ok: true }), /reassigned/)
+        await hub.heartbeat(f.id, winner.nonce)
+        await hub.putChunk(f.id, winner.nonce, 0, 0, bytes, hash)
+        await hub.result(f.id, winner.nonce, {
+          ok: true, files: [{ idx: 0, chunks: 1, bytes: bytes.length, sha256: hash, mime: 'video/mp4' }],
+        })
+        await assert.rejects(hub.result(f.id, winner.nonce, { ok: true }), /reassigned/)
+        await Promise.all([drain(), drain()])
+        await drain()
+        assert.equal((await query('SELECT 1 FROM credit_ledger WHERE user_id=$1', [f.uid])).rowCount, 1)
+        assert.equal((await query('SELECT credits::text FROM users WHERE id=$1', [f.uid])).rows[0].credits, '950')
+        assert.equal((await query('SELECT 1 FROM muse_media_jobs WHERE user_id=$1', [f.uid])).rowCount, 1)
+        const row = (await query('SELECT bridge_credential_id::text FROM muse_media_jobs WHERE id=$1', [f.id])).rows[0]
+        assert.equal(row.bridge_credential_id, credentials.rows[1]!.id)
+        const origin = await f.backend.getClientSession(f.origin, `c:${f.uid}`)
+        assert.equal(origin?.messages.length, 1)
+        assert.equal((origin?.messages[0] as { id?: string })?.id, `muse-result:${f.id}`)
+        assert.equal(await f.backend.getClientSession(f.origin, 'c:999999'), null)
+      } finally {
+        await hub.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  }
+
   test('claims are exclusive, preserve retry payload and fence old updates and billing', async (t) => {
     if (!pgAvailable) return t.skip('no test database')
     const f = await fixture()

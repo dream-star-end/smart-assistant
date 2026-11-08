@@ -254,7 +254,7 @@ describe('muse hub', () => {
     return job
   }
 
-  function retryReady(target = hub, sid = (target as any).session.id) {
+  function retryReady(target = hub, sid = (target as any).sessions.keys().next().value) {
     clock.t += MUSE_RETRY_INTERVAL_MS
     target.checkSession(sid)
     target.tick()
@@ -472,7 +472,7 @@ describe('muse hub', () => {
     const sid = await online()
     await hub.submit('3', null, { kind: 'image', prompt: 'x' })
     const j = (await hub.poll(sid, 50))!
-    hub.undeliverable(j.id)
+    hub.undeliverable(j.id, j.nonce)
     retryReady()
     const again = (await hub.poll(sid, 50))!
     assert.equal(again.id, j.id)
@@ -493,21 +493,21 @@ describe('muse hub', () => {
     const a = await runningJob()
     // 61 s of silence is tolerated (relay-dropped heartbeats); 121 s is lost contact.
     clock.t += 61_000
-    hub.checkSession((hub as any).session.id)
+    hub.checkSession((hub as any).sessions.keys().next().value)
     hub.tick()
     assert.equal((await hub.view('3', a.id, 0))?.status, 'running', 'still running after 61 s')
     for (let i = 0; i < MAX_DISPATCH_ATTEMPTS - 1; i++) {
       clock.t += 121_000
-      hub.checkSession((hub as any).session.id)
+      hub.checkSession((hub as any).sessions.keys().next().value)
       hub.tick()
       assert.notEqual((await hub.view('3', a.id, 0))?.status, 'failed', `alive after gap ${i + 1}`)
       retryReady()
-      const again = (await hub.poll((hub as any).session.id, 50))!
+      const again = (await hub.poll((hub as any).sessions.keys().next().value, 50))!
       assert.equal(again.id, a.id)
       hub.heartbeat(again.id, again.nonce)
     }
     clock.t += 121_000
-    hub.checkSession((hub as any).session.id)
+    hub.checkSession((hub as any).sessions.keys().next().value)
     hub.tick()
     const lost = await hub.view('3', a.id, 0)
     assert.equal(lost?.status, 'failed')
@@ -520,7 +520,7 @@ describe('muse hub', () => {
     const b = await runningJob()
     for (let i = 0; i < 20; i++) {
       clock.t += 10_000
-      hub.checkSession((hub as any).session.id)
+      hub.checkSession((hub as any).sessions.keys().next().value)
       if (i < 19) hub.heartbeat(b.id, b.nonce)
       hub.tick()
     }
@@ -821,6 +821,12 @@ describe('muse bridge http', () => {
       } as { t: number },
       root,
     )
+    await hub.stop()
+    hub = new MuseBridgeHub({
+      store, stateRoot: root, allowedUids: new Set(['3']), multiBridge: true,
+      rate: { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
+      cliTimeoutSec: { image: 120, video: 300 },
+    })
     const h = makeMuseBridgeHttpHandler({ hub, store, pollHoldMs: 1500 })
     server = createServer(
       (req, res) => void h(req, res, { clientIp: String(req.headers['x-test-ip'] ?? '1.1.1.1') }),
@@ -866,6 +872,38 @@ describe('muse bridge http', () => {
     const b = (await post('/hello', { bridge_version: '0.3.0' })).json.session_id
     assert.equal((await post('/poll', {}, { 'x-muse-bridge-session': a })).status, 409)
     assert.equal((await post('/poll', {}, { 'x-muse-bridge-session': b })).status, 204)
+  })
+
+  it('binds independent tokens to sessions and all attempt endpoints to their assigned bridge', async () => {
+    const secondToken = `mbr_${'z'.repeat(43)}`
+    store.creds.set(sha(Buffer.from(secondToken)), '2')
+    const a = (await post('/hello', { bridge_version: '0.5.0' })).json.session_id
+    const b = (await post('/hello', { bridge_version: '0.3.0' }, {
+      authorization: `Bearer ${secondToken}`,
+    })).json.session_id
+    const ah = { 'x-muse-bridge-session': a }
+    const bh = { authorization: `Bearer ${secondToken}`, 'x-muse-bridge-session': b }
+    const id = await hub.submit('3', null, {
+      kind: 'image', prompt: 'x', source_images: [PNG.toString('base64')],
+    })
+    assert.equal((await post('/poll', {}, { ...ah, authorization: `Bearer ${secondToken}` })).status, 400)
+    const wire = (await post('/poll', {}, ah)).json.job
+    assert.equal(wire.id, id)
+    assert.ok(wire.source_refs, 'assigned 0.5 capability survives the later 0.3 hello')
+    const payload = { job_nonce: wire.nonce }
+    assert.equal((await post(`/jobs/${id}/heartbeat`, payload, bh)).status, 410)
+    assert.equal((await post(`/jobs/${id}/heartbeat`, payload, ah)).status, 200)
+    assert.equal((await post(`/jobs/${id}/result`, { ...payload, ok: false }, bh)).status, 410)
+    const source = await fetch(`${base}/jobs/${id}/sources/0`, {
+      headers: { ...bh, 'x-job-nonce': wire.nonce },
+    })
+    assert.equal(source.status, 410)
+    const chunk = await fetch(`${base}/jobs/${id}/files/0/chunks/0`, {
+      method: 'PUT', headers: { ...bh, 'x-job-nonce': wire.nonce, 'x-chunk-sha256': sha(WEBP) },
+      body: WEBP,
+    })
+    assert.equal(chunk.status, 410)
+    assert.equal((await hub.view('3', id, 0))?.status, 'running')
   })
 
   it('a live poll keeps waiting after its body is read and receives a job submitted later', async () => {

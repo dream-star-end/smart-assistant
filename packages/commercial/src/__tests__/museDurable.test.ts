@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { MuseBridgeHub, type MuseWireJob } from '../muse/hub.js'
+import { MuseBridgeHub, type MuseBridgeHubOptions, type MuseWireJob } from '../muse/hub.js'
 import {
   MUSE_BACKGROUND_TTL_MS,
   MUSE_LEASE_MS,
@@ -148,7 +148,7 @@ describe('durable Muse video lifecycle', () => {
     clearInterval(keep)
     await rm(root, { recursive: true, force: true })
   })
-  const make = () => {
+  const make = (opts: Partial<MuseBridgeHubOptions> = {}) => {
     const hub = new MuseBridgeHub({
       store: journal,
       durability: journal,
@@ -157,6 +157,7 @@ describe('durable Muse video lifecycle', () => {
       rate: { imagePerHour: 50, imagePerDay: 100, videoPerHour: 50, videoPerDay: 100 },
       cliTimeoutSec: { image: 120, video: 300 },
       now: () => journal.now,
+      ...opts,
     })
     hubs.push(hub)
     return hub
@@ -208,6 +209,47 @@ describe('durable Muse video lifecycle', () => {
     await hub.durableTick()
     assert.equal(journal.delivered.size, 1)
   })
+  for (const background of [false, true]) {
+    it(`two bridges: ${background ? 'background' : 'sync'} video survives one heartbeat loss with one origin callback`, async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      const hub = make({ multiBridge: true, concurrency: 2, perBridgeConcurrency: 1 })
+      let a: string
+      let b: string
+      if (!background) {
+        a = hub.hello('1', '0.5.0')
+        b = hub.hello('2', '0.5.0')
+      }
+      const id = await submit(hub)
+      if (background) {
+        for (let i = 0; i < 3; i++) await advance(hub, 40_000)
+        a = hub.hello('1', '0.5.0')
+        b = hub.hello('2', '0.5.0')
+        await hub.durableTick()
+        await flush()
+      }
+      const lost = (await hub.poll(a!, 1))!
+      await hub.heartbeat(id, lost.nonce)
+      for (let i = 0; i < 13; i++) {
+        hub.checkSession(b!)
+        await advance(hub, 10_000)
+      }
+      assert.equal(hub.bridgeOnline(), true)
+      assert.equal(journal.rows.get(id)?.durable?.background, background)
+      await assert.rejects(hub.result(id, lost.nonce, { ok: true }), /reassigned/)
+      const next = hub.poll(b!, 60_000)
+      await advance(hub, 40_000)
+      const winner = (await next)!
+      assert.equal(winner.id, id)
+      assert.notEqual(winner.nonce, lost.nonce)
+      await success(hub, winner)
+      await hub.durableTick()
+      await hub.durableTick()
+      await assert.rejects(hub.result(id, winner.nonce, { ok: true }), /reassigned/)
+      assert.equal(journal.rows.size, 1)
+      assert.deepEqual([...journal.delivered], [id])
+    })
+  }
+
   it('restart preserves backoff due time and payload; old owner cannot claim or finish', async () => {
     const first = make()
     const id = await submit(first)
