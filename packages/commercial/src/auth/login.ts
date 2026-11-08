@@ -440,6 +440,23 @@ export interface RefreshResult {
   remember: boolean;
 }
 
+/**
+ * refresh_theft 日志的全部字段:只有 id、原因和布尔量,不含 token、cookie、UA、IP。
+ * ip_match:比对用的 client_ip(出示行的,为空则取直接后继的)与本次请求一致。
+ * legacy_row:出示行没有 client_ip(0331 前签发)。
+ */
+export type RefreshTheftEvent = {
+  user_id: string;
+  family_id: string;
+  presented_id: string;
+  successor_id: string | null;
+  reason: "reissued_reuse" | "fingerprint_mismatch" | "client_ip_missing" | "client_ip_mismatch" | "successor_used";
+  revoked_count: number;
+  ip_match: boolean;
+  ua_match: boolean;
+  legacy_row: boolean;
+};
+
 export interface RefreshExtraDeps {
   /** 写新 row 的 IP / UA(audit 追溯)。可空 — 测试用。race grace 的 sameIp 也用它。 */
   remoteIp?: string;
@@ -452,17 +469,8 @@ export interface RefreshExtraDeps {
   userAgent?: string;
   /** 测试可注入新 refresh TTL。 */
   refreshTtlSeconds?: number;
-  /**
-   * 盗用检测时的回调。HTTP 层可以挂日志 / metrics / 通知用户的钩子。
-   * 不抛错;同步运行,不要做重 I/O。
-   */
-  onTheftDetected?: (ev: {
-    user_id: string;
-    family_id: string;
-    revoked_count: number;
-    remoteIp?: string;
-    userAgent?: string;
-  }) => void;
+  /** 盗用判定回调;handleRefresh 把 ev 原样打成 refresh_theft 日志。不抛错,不做重 I/O。 */
+  onTheftDetected?: (ev: RefreshTheftEvent) => void;
   /**
    * 补发成功时的审计钩子。不要做重 I/O，也不要记录 token / UA / IP。
    */
@@ -536,8 +544,14 @@ export async function refresh(
       // 客户端 replay 即使在 grace 内也会被 fingerprint 拒掉,继续走 theft。
       bound_user_agent: string | null;
       bound_ip: string | null;
-      /** 两侧都是合法 client_ip 且相等。空指纹不是匹配。 */
-      same_client_ip: boolean;
+      /**
+       * 存下的 client_ip 与本次请求比对;任一侧为空即 missing,空指纹不是匹配。
+       * 出示行 client_ip 为空(0331 前签发)时改比直接后继的 client_ip:后继存的是
+       * 发起那次轮换的真实客户端 IP。后继也为空 → missing,不补发。
+       */
+      client_ip_cmp: "match" | "mismatch" | "missing";
+      legacy_row: boolean;
+      successor_id: string | null;
       /** 0031 新增;老行默认 TRUE(迁移时 DEFAULT)。 */
       remember_me: boolean;
     }>(
@@ -553,12 +567,18 @@ export async function refresh(
               END AS revoked_age_sec,
               rt.user_agent AS bound_user_agent,
               host(rt.ip) AS bound_ip,
-              (rt.client_ip IS NOT NULL
-               AND $4::inet IS NOT NULL
-               AND rt.client_ip = $4::inet) AS same_client_ip,
+              CASE WHEN COALESCE(rt.client_ip, succ.client_ip) IS NULL OR $4::inet IS NULL THEN 'missing'
+                   WHEN COALESCE(rt.client_ip, succ.client_ip) = $4::inet THEN 'match'
+                   ELSE 'mismatch'
+              END AS client_ip_cmp,
+              (rt.client_ip IS NULL) AS legacy_row,
+              rt.rotated_to_id::text AS successor_id,
               rt.remember_me AS remember_me
          FROM refresh_tokens rt
          JOIN users u ON u.id = rt.user_id
+         LEFT JOIN refresh_tokens succ
+           ON succ.id = rt.rotated_to_id
+          AND succ.family_id = rt.family_id
         WHERE rt.token_hash = $1
           AND rt.family_id = $3::uuid
         FOR UPDATE OF rt`,
@@ -617,11 +637,13 @@ export async function refresh(
       }
       // Set-Cookie 没送达:旧票的直接后继从未被用过 → 补发,不吊销。
       // 除了上面的 UA + authBoundIp 指纹,还要求存下的真实客户端 IP(client_ip)
-      // 两侧都非空且相等:个人版 authBoundIp 恒为 127.0.0.1,只靠它等于只比 UA。
+      // 两侧都非空且相等(出示行为空时比直接后继的,见 client_ip_cmp):个人版
+      // authBoundIp 恒为 127.0.0.1,只靠它等于只比 UA。不存在只比 UA 的补发。
       // 被替掉的后继标 'reissued'(不是 'rotated'),之后宽限外再出示它即 theft,
       // 所以正主回来交后继会终结持旧票者的会话,双方不能交替续期。
       // 只补 'rotated' 的票:'reissued' 的票不再补发,宽限外直接落到 theft。不延长 TTL。
-      if (row.revoked_reason === "rotated" && sameUa && sameIp && fingerprintPresent && row.same_client_ip) {
+      const fingerprintOk = sameUa && sameIp && fingerprintPresent;
+      if (row.revoked_reason === "rotated" && fingerprintOk && row.client_ip_cmp === "match") {
         // FOR UPDATE + family 锁:读到的是前一位已提交的状态。
         // 后继年龄用 clock_timestamp():本事务可能早于前一位 BEGIN,NOW() 会给出负值。
         const succ = await client.query<{
@@ -706,14 +728,26 @@ export async function refresh(
         RETURNING id::text AS id`,
         [row.family_id],
       );
-      // 在事务外触发 onTheftDetected,避免回调误抛影响 tx;但回调
-      // 拿 family_id + revoked_count 的快照足以审计。
-      return {
-        kind: "theft" as const,
-        family_id: row.family_id,
+      // 在事务外触发 onTheftDetected,避免回调误抛影响 tx。reason 按上面的判定顺序取第一个不满足的条件。
+      const ev: RefreshTheftEvent = {
         user_id: row.user_id,
+        family_id: row.family_id,
+        presented_id: row.id,
+        successor_id: row.successor_id,
+        reason:
+          row.revoked_reason === "reissued"
+            ? "reissued_reuse"
+            : !fingerprintOk
+              ? "fingerprint_mismatch"
+              : row.client_ip_cmp !== "match"
+                ? `client_ip_${row.client_ip_cmp}`
+                : "successor_used",
         revoked_count: massRevoke.rowCount ?? 0,
+        ip_match: row.client_ip_cmp === "match",
+        ua_match: sameUa && (deps.userAgent ?? "").length > 0,
+        legacy_row: row.legacy_row,
       };
+      return { kind: "theft" as const, ev };
     }
 
     // 已过期 / 已 revoked 且也过期了 → 普通无效(不当作盗用,因为 token
@@ -775,13 +809,7 @@ export async function refresh(
 
   if (result.kind === "theft") {
     try {
-      deps.onTheftDetected?.({
-        user_id: result.user_id,
-        family_id: result.family_id,
-        revoked_count: result.revoked_count,
-        remoteIp: deps.remoteIp,
-        userAgent: deps.userAgent,
-      });
+      deps.onTheftDetected?.(result.ev);
     } catch {
       // 回调失败不影响响应语义
     }

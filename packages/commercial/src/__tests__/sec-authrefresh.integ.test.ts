@@ -4,7 +4,7 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { register } from "../auth/register.js";
-import { login, refresh, RefreshError, warmupLoginDummyHash } from "../auth/login.js";
+import { login, refresh, RefreshError, warmupLoginDummyHash, type RefreshTheftEvent } from "../auth/login.js";
 import { verifyAccess, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "../auth/jwt.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
@@ -360,5 +360,82 @@ describe("sec-authrefresh CE: fixed contract (PASS = the hole is closed)", () =>
     assert.notEqual(fa.reasons, fb.reasons);
     assert.equal(fa.reasons, "live,reissued,rotated");
     assert.equal(fb.reasons, "live,rotated");
+  });
+});
+
+/**
+ * OCV5-693: a presented row issued before migration 0331 has client_ip NULL. Its direct
+ * successor stores the real client IP of the rotation that replaced it, so the reissue
+ * compares against that instead. Everything else (grace, unused successor, one reissue,
+ * UA + bound IP, family revoke) is unchanged; no stored IP on either row is still theft.
+ */
+describe("OCV5-693 pre-0331 presented row falls back to the direct successor's client_ip", () => {
+  const legacy = (raw: string) =>
+    query("UPDATE refresh_tokens SET client_ip = NULL WHERE token_hash = $1", [refreshTokenHash(raw)]);
+  const rowId = async (raw: string) =>
+    (await query<{ id: string }>("SELECT id::text AS id FROM refresh_tokens WHERE token_hash = $1",
+      [refreshTokenHash(raw)])).rows[0].id;
+
+  test("S-01 presented row without client_ip, successor client_ip matches → reissued, not theft", async (t) => {
+    if (skip(t)) return;
+    const { x, y } = await staleChain("s01");
+    await legacy(x);
+    const thefts: RefreshTheftEvent[] = [];
+    let reissued = 0;
+    const z = await refresh(x, { ...fp, onTheftDetected: (ev) => { thefts.push(ev); }, onReissued: () => { reissued++; } });
+    assert.equal(thefts.length, 0);
+    assert.equal(reissued, 1);
+    assert.notEqual(z.refresh_token, y.refresh_token);
+    let f = await family(x);
+    assert.equal(f.live, 1);
+    assert.equal(f.reasons, "live,reissued,rotated");
+    // One reissue only: past the successor's grace the same old ticket is theft.
+    await age(y.refresh_token, "50 seconds");
+    await assert.rejects(refresh(x, { ...fp, onTheftDetected: (ev) => { thefts.push(ev); } }), isInvalid);
+    f = await family(x);
+    assert.equal(f.live, 0);
+    assert.equal(thefts.length, 1);
+    assert.equal(thefts[0].reason, "successor_used");
+    assert.equal(thefts[0].legacy_row, true);
+  });
+
+  test("S-02 presented row without client_ip, successor client_ip differs → theft, family revoked", async (t) => {
+    if (skip(t)) return;
+    const { userId, x, y } = await staleChain("s02");
+    await legacy(x);
+    const thefts: RefreshTheftEvent[] = [];
+    await assert.rejects(
+      refresh(x, { ...fp, clientIp: "198.51.100.66", onTheftDetected: (ev) => { thefts.push(ev); } }),
+      isInvalid,
+    );
+    assert.equal((await family(x)).live, 0);
+    await assert.rejects(refresh(y.refresh_token, fp), isInvalid);
+    const fam = await query<{ f: string }>("SELECT family_id::text AS f FROM refresh_tokens WHERE token_hash = $1",
+      [refreshTokenHash(x)]);
+    assert.deepEqual(thefts, [{
+      user_id: String(userId),
+      family_id: fam.rows[0].f,
+      presented_id: await rowId(x),
+      successor_id: await rowId(y.refresh_token),
+      reason: "client_ip_mismatch",
+      revoked_count: 1,
+      ip_match: false,
+      ua_match: true,
+      legacy_row: true,
+    }]);
+  });
+
+  test("S-03 neither the presented row nor its successor has a client_ip → theft (R-02 unchanged)", async (t) => {
+    if (skip(t)) return;
+    const { x, y } = await staleChain("s03", { clientIp: null });
+    const thefts: RefreshTheftEvent[] = [];
+    await assert.rejects(refresh(x, { ...fp, onTheftDetected: (ev) => { thefts.push(ev); } }), isInvalid);
+    assert.equal((await family(x)).live, 0);
+    await assert.rejects(refresh(y.refresh_token, fp), isInvalid);
+    assert.equal(thefts.length, 1);
+    assert.equal(thefts[0].reason, "client_ip_missing");
+    assert.equal(thefts[0].ip_match, false);
+    assert.equal(thefts[0].legacy_row, true);
+    assert.equal(thefts[0].successor_id, await rowId(y.refresh_token));
   });
 });

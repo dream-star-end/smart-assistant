@@ -301,4 +301,47 @@ describe("sec-authrefresh HTTP Set-Cookie regression", () => {
     assert.equal(r.status, 401, "logged-out family must not be resurrected by the reissue path");
     assertCleared(r.cookie, "post-logout");
   });
+
+  test("H-07 a theft decision writes one refresh_theft line: ids, reason, booleans, no secrets", async (t) => {
+    if (skip(t)) return;
+    const x = await loginCookie("h07@example.com");
+    const y = await post("/api/auth/refresh", undefined, { ...cookieHeader(x), ...victimNet });
+    assert.equal(y.status, 200);
+    await query("UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '6 hours' WHERE token_hash = $1", [refreshTokenHash(x)]);
+    const lines: string[] = [];
+    const write = process.stdout.write;
+    process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
+      lines.push(String(chunk));
+      return (write as (...a: unknown[]) => boolean).call(process.stdout, chunk, ...rest);
+    }) as typeof process.stdout.write;
+    let r: Awaited<ReturnType<typeof post>>;
+    try {
+      r = await post("/api/auth/refresh", undefined, { ...cookieHeader(x), ...attackerNet });
+    } finally {
+      process.stdout.write = write;
+    }
+    assert.equal(r.status, 401);
+    const theft = lines.join("").split("\n").filter((l) => l.includes("refresh_theft"));
+    assert.equal(theft.length, 1, `exactly one refresh_theft line, got ${theft.length}`);
+    const ids = await query<{ id: string; user_id: string; family_id: string; rotated_to_id: string }>(
+      `SELECT id::text AS id, user_id::text AS user_id, family_id::text AS family_id, rotated_to_id::text AS rotated_to_id
+         FROM refresh_tokens WHERE token_hash = $1`,
+      [refreshTokenHash(x)],
+    );
+    const ev = JSON.parse(theft[0]) as Record<string, unknown>;
+    assert.equal(ev.user_id, ids.rows[0].user_id);
+    assert.equal(ev.family_id, ids.rows[0].family_id);
+    assert.equal(ev.presented_id, ids.rows[0].id);
+    assert.equal(ev.successor_id, ids.rows[0].rotated_to_id);
+    assert.equal(ev.reason, "client_ip_mismatch");
+    assert.equal(ev.ip_match, false);
+    assert.equal(ev.ua_match, true);
+    assert.equal(ev.legacy_row, false);
+    assert.equal(ev.revoked_count, 1);
+    for (const secret of [x, encodeURIComponent(x), y.cookie!.value, refreshTokenHash(x), UA,
+      "203.0.113.10", "198.51.100.66", "127.0.0.1"]) {
+      assert.ok(!theft[0].includes(secret), "refresh_theft must not carry a token, hash, UA or IP");
+    }
+    assert.ok(!/clientIp|remoteIp|userAgent|cookie|token/i.test(Object.keys(ev).join(",")));
+  });
 });
