@@ -2669,6 +2669,15 @@ export class ChatSocket {
         incidentStore.ingest(f as IncidentWire);
         return;
       }
+      case "sys.muse_result": {
+        // A background result is a persisted message, not the final of the current user turn.
+        // Reuse server-wins history hydration without touching that turn's streaming state.
+        const sessionId = (f as { sessionId?: unknown }).sessionId;
+        if (typeof sessionId === "string" && this.sessions.has(sessionId)) {
+          void Promise.resolve(this.deps.syncSession?.(sessionId)).catch(() => {});
+        }
+        return;
+      }
       case "sys.media_job": {
         this.deps.onMediaJob?.(f as MediaJobWire);
         return;

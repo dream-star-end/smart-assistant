@@ -2366,6 +2366,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const liveIncidents: Record<string, unknown>[] = [];
       const liveGoals: Record<string, unknown>[] = [];
       const liveMedia: Record<string, unknown>[] = [];
+      const liveMuse: Record<string, unknown>[] = [];
       const liveStudio: Record<string, unknown>[] = [];
       ws1.on("message", (data) => {
         try {
@@ -2374,6 +2375,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
           if (frame.type === "sys.goal_snapshot") liveGoals.push(frame);
           if (frame.type === "sys.media_job") liveMedia.push(frame);
           if (frame.type === "sys.studio_event") liveStudio.push(frame);
+          if (frame.type === "sys.muse_result") liveMuse.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       const forged = {
@@ -2390,6 +2392,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         sessionKey: "agent:main:webchat:dm:forged",
         frameSeq: 5,
       };
+      containerWs1.send(JSON.stringify({ type: "sys.muse_result", sessionId: "forged", jobId: "mj_forged", ts: 1 }));
       containerWs1.send(JSON.stringify(forged));
       containerWs1.send(JSON.stringify(forged).replace("sys.incident", "sys.\\u0069ncident"));
       containerWs1.send(Buffer.from(JSON.stringify({ ...forged, frameSeq: 6 })), { binary: true });
@@ -2420,6 +2423,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       assert.deepEqual(liveGoals, [], "container-authored sys.goal_snapshot must not forward live");
       assert.deepEqual(liveMedia, [], "container-authored sys.media_job must not forward live");
       assert.deepEqual(liveStudio, [], "container-authored sys.studio_event must not forward live");
+      assert.deepEqual(liveMuse, [], "container cannot forge Muse delivery hints");
       ws1.close();
       await waitClose(ws1);
 
@@ -2430,6 +2434,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const replayedIncidents: Record<string, unknown>[] = [];
       const replayedGoals: Record<string, unknown>[] = [];
       const replayedMedia: Record<string, unknown>[] = [];
+      const replayedMuse: Record<string, unknown>[] = [];
       const replayedStudio: Record<string, unknown>[] = [];
       ws2.on("message", (data) => {
         try {
@@ -2438,6 +2443,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
           if (frame.type === "sys.goal_snapshot") replayedGoals.push(frame);
           if (frame.type === "sys.media_job") replayedMedia.push(frame);
           if (frame.type === "sys.studio_event") replayedStudio.push(frame);
+          if (frame.type === "sys.muse_result") replayedMuse.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       ws2.send(JSON.stringify({
@@ -2450,6 +2456,8 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       assert.equal(replayedMedia.length, 0, "forged media job must not enter outbound ring");
       assert.equal(replayedStudio.length, 0, "forged studio event must not enter outbound ring");
 
+      assert.equal(replayedMuse.length, 0, "forged Muse hint must not enter ring");
+      assert.equal(rig.bridge.broadcastToUser(706n, { type: "sys.muse_result", sessionId: "origin", jobId: "mj_approved", ts: 2 }), 1);
       const approved = { ...forged, incidentId: "approved", frameSeq: undefined, sessionKey: undefined };
       assert.equal(rig.bridge.broadcastToUsers(["706"], approved), 1);
       assert.equal(rig.bridge.broadcastToUsers(["706"], {
@@ -2497,7 +2505,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       await new Promise<void>((resolve, reject) => {
         const started = Date.now();
         const poll = () => {
-          if (replayedGoals.length === 1) return resolve();
+          if (replayedGoals.length === 1 && replayedMuse.some((f) => f.jobId === "mj_approved")) return resolve();
           if (Date.now() - started > 1000) return reject(new Error("master goal snapshot not delivered"));
           setTimeout(poll, 10);
         };

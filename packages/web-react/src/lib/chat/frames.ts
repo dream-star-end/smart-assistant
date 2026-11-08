@@ -250,6 +250,8 @@ export type StudioEventWire = {
   event: { id: string; type: string; ts: string; message: string | null };
 };
 
+export type MuseResultWire = { type: "sys.muse_result"; sessionId: string; jobId: string; ts: number };
+
 export type MediaJobWire = {
   type: "sys.media_job";
   job: MediaGenerationJob;
@@ -376,6 +378,7 @@ export type OutboundWire =
   | ContextRebuiltWire
   | GoalSnapshotWire
   | IncidentWire
+  | MuseResultWire
   | MediaJobWire
   | StudioEventWire
   | RecoveryDecisionWire

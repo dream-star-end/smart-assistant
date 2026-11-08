@@ -7,6 +7,8 @@ import type { Pool } from 'pg'
 
 import type { CommercialConfig } from '../config.js'
 import { rootLogger } from '../logging/logger.js'
+import { createMuseDurability } from './durable.js'
+import { createMuseDelivery, type MuseDeliveryDeps } from './delivery.js'
 import { createMuseBilling } from './billing.js'
 import { type MuseBridgeHttpHandler, makeMuseBridgeHttpHandler } from './bridgeHttp.js'
 import { MuseBridgeHub } from './hub.js'
@@ -19,6 +21,7 @@ export const MUSE_DEFAULT_STATE_ROOT = '/var/lib/openclaude-v5-selfhost/muse-med
 export async function createMuseFromConfig(
   cfg: CommercialConfig,
   pool: Pool,
+  delivery?: MuseDeliveryDeps,
 ): Promise<{
   hub?: MuseBridgeHub
   bridgeHttp?: MuseBridgeHttpHandler
@@ -33,6 +36,12 @@ export async function createMuseFromConfig(
   const queueWait = (sec: number | undefined) => (sec === undefined ? QUEUE_WAIT_MS : sec * 1000)
   const hub = new MuseBridgeHub({
     store,
+    durability: delivery
+      ? createMuseDurability(
+          pool,
+          createMuseDelivery(pool, cfg.OC_MUSE_STATE_ROOT ?? MUSE_DEFAULT_STATE_ROOT, delivery),
+        )
+      : undefined,
     stateRoot: cfg.OC_MUSE_STATE_ROOT ?? MUSE_DEFAULT_STATE_ROOT,
     allowedUids: parseAllowedUids(cfg.OC_MUSE_ALLOWED_UIDS, (msg, meta) =>
       rootLogger.warn(msg, meta),

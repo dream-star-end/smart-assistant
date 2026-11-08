@@ -2102,7 +2102,23 @@ export async function registerCommercial(
   }
   if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
-  const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool());
+  const museDeliveryRefs: {
+    pushRemote?: (args: { hostUuid: string; remotePath: string; content: Buffer }) => Promise<void>;
+    resolveMedia?: (userId: string) => Promise<UserMediaLocation>;
+  } = {};
+  const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool(),
+    flavorIdentity.status === "ok" && flavorIdentity.flavor === "commercial" ? {
+      append: appendServerAuthoredMessage,
+      resolveMedia: async (userId) => {
+        if (!museDeliveryRefs.resolveMedia) throw new Error("Muse media resolver not ready");
+        return museDeliveryRefs.resolveMedia(userId);
+      },
+      pushRemote: async (args) => {
+        if (!museDeliveryRefs.pushRemote) throw new Error("Muse remote uploader not ready");
+        await museDeliveryRefs.pushRemote(args);
+      },
+      broadcast: (uid, frame) => bridgeBroadcastRef.current(uid, frame),
+    } : undefined);
   // OCV5-591 media studio. Off unless OC_STUDIO_ENABLED=1 (→ /api/studio/* 404, no GC tick).
   const studioHttp = await createStudioFromConfig(cfg, getPool(), { preCheckRedis, museHub });
   let stopStudioOrchestrator: (() => Promise<void>) | undefined;
@@ -4400,6 +4416,7 @@ export async function registerCommercial(
         docker: mediaResolverDocker,
       })
     : undefined;
+  museDeliveryRefs.resolveMedia = userMediaResolver;
   knowledgePlanetMediaResolverRef.current = userMediaResolver
 
   // Shared remote-host upload closure. It is used by both gateway /api/uploads
@@ -4425,6 +4442,7 @@ export async function registerCommercial(
       target.psk?.fill(0);
     }
   };
+  museDeliveryRefs.pushRemote = pushRemoteHostUpload;
 
   // Endpoint resolver split (P1-IMPL-09 / design v2 §1.2 / §4.5.3):
   //

@@ -59,6 +59,42 @@ class RetryContract(unittest.TestCase):
         self.assertEqual(err.exception.payload["job_id"], "mj_test")
         self.assertEqual(sum(c.args[0] == "POST" for c in call.call_args_list), 1)
 
+    def test_durable_video_exhaustion_returns_ack_and_does_not_download(self):
+        responses = [
+            {"bridge_online": False, "retry": {"max": 3}, "durable_video": True},
+            {"job_id": "mj_test"},
+            {"status": "queued", "retry_count": 3, "background": True, "delivery": "conversation"},
+        ]
+        with patch.object(cli, "call", side_effect=responses) as call, \
+                patch.dict(cli.os.environ, {"OPENCLAUDE_SESSION_KEY": "agent:main:webchat:dm:origin"}), \
+                patch.object(cli.signal, "signal"), patch.object(cli, "deliver") as deliver, \
+                patch("builtins.print") as output:
+            self.assertEqual(cli.run("video", self.args()), 0)
+        self.assertEqual(call.call_args_list[1].args[2]["session_key"], "agent:main:webchat:dm:origin")
+        self.assertIn('"background": true', output.call_args.args[0])
+        deliver.assert_not_called()
+        self.assertFalse(any(c.args[0] == "DELETE" for c in call.call_args_list))
+
+    def test_restart_after_durable_acceptance_acknowledges_without_h3_or_resubmission(self):
+        with patch.object(cli, "call", side_effect=[
+                {"bridge_online": True, "durable_video": True}, {"job_id": "mj_test"},
+                cli.MuseFailure("MUSE_MASTER_UNAVAILABLE", "restarting", True)]) as call, \
+                patch.object(cli.signal, "signal"), patch.object(cli, "deliver") as deliver, \
+                patch("builtins.print") as output:
+            self.assertEqual(cli.run("video", self.args()), 0)
+        self.assertIn('"delivery": "conversation"', output.call_args.args[0])
+        self.assertEqual(sum(c.args[0] == "POST" for c in call.call_args_list), 1)
+        deliver.assert_not_called()
+
+    def test_durable_sync_success_is_delivered_once_by_server(self):
+        with patch.object(cli, "call", side_effect=[
+                {"bridge_online": True, "durable_video": True}, {"job_id": "mj_test"},
+                {"status": "succeeded", "delivery": "conversation", "background": False}]), \
+                patch.object(cli.signal, "signal"), patch.object(cli, "deliver") as deliver, \
+                patch("builtins.print"):
+            self.assertEqual(cli.run("video", self.args()), 0)
+        deliver.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

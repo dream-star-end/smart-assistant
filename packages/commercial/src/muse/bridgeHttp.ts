@@ -270,7 +270,7 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
       if (method === 'POST' && m[2] === 'heartbeat') {
         const body = await readJson(req, JSON_MAX_BYTES)
         const nonce = typeof body.job_nonce === 'string' ? body.job_nonce : ''
-        sendJson(res, 200, deps.hub.heartbeat(jobId, nonce))
+        sendJson(res, 200, await deps.hub.heartbeat(jobId, nonce))
         return
       }
       if (method === 'POST' && m[2] === 'result') {

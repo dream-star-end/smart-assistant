@@ -12,7 +12,13 @@
  */
 
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createMuseDurability, type MuseDurableState } from '../muse/durable.js'
+import { createMuseDelivery } from '../muse/delivery.js'
+import { createPgSessionsBackend } from '../db/pgSessionsBackend.js'
 import { after, before, beforeEach, describe, test } from 'node:test'
 
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
@@ -258,6 +264,330 @@ describe('Muse billing (OCV5-574)', () => {
       assert.deepEqual(await pending, { charged: true, debitedCredits: 10n })
     } finally {
       inFlight.release()
+    }
+  })
+})
+
+// t1657u: real SQL proves fencing, restart recovery, one bill and one origin message.
+describe('Muse durable journal/outbox (0336)', () => {
+  async function fixture() {
+    const uid = await user(1000n)
+    const origin = `muse-origin-${randomUUID()}`
+    const backend = createPgSessionsBackend(getPool(), { expectedGeneration: 1 })
+    await backend.upsertClientSession({
+      id: origin,
+      userId: `c:${uid}`,
+      agentId: 'main',
+      title: 'Muse',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 1,
+      updatedAt: 1,
+      messages: [],
+    })
+    const id = `mj_${randomUUID()}`
+    const state: MuseDurableState = {
+      spec: { kind: 'video', prompt: 'full prompt' },
+      sessionId: origin,
+      agentId: 'main',
+      background: true,
+      backgroundFailures: 0,
+      retryCount: 3,
+      retryAt: 123456,
+      state: 'queued',
+      nonce: randomUUID(),
+      expiresAt: Date.now() + 86400000,
+    }
+    const store = createPgMuseStore(getPool())
+    await store.insertJob({
+      id,
+      userId: uid,
+      containerId: null,
+      kind: 'video',
+      promptSha256: Buffer.from('00', 'hex'),
+      promptPreview: 'full prompt',
+      params: {},
+      priceCredits: 50n,
+      durable: state,
+      leaseOwner: 'owner-a',
+    })
+    return {
+      uid,
+      origin,
+      backend,
+      id,
+      state,
+      store,
+      fence: { owner: 'owner-a', nonce: state.nonce },
+    }
+  }
+  test('claims are exclusive, preserve retry payload and fence old updates and billing', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const f = await fixture()
+    const durable = createMuseDurability(getPool(), async () => {})
+    await assert.rejects(
+      durable.validateOrigin('999999', `agent:main:webchat:dm:${f.origin}`),
+      /belong/,
+    )
+    assert.equal(
+      (await durable.validateOrigin(f.uid, `agent:main:webchat:dm:${f.origin}`)).sessionId,
+      f.origin,
+    )
+    await query("UPDATE muse_media_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=$1", [
+      f.id,
+    ])
+    assert.equal((await durable.claim('offline', 10, false)).length, 0)
+    const claims = await Promise.all([
+      durable.claim('owner-b', 10, true),
+      durable.claim('owner-c', 10, true),
+    ])
+    assert.equal(claims.flat().length, 1)
+    assert.deepEqual(claims.flat()[0]!.durable, f.state)
+    await assert.rejects(durable.save(f.id, 'owner-a', f.state), /LEASE_LOST/)
+    await assert.rejects(f.store.markRunning(f.id, '1', f.fence))
+    await assert.rejects(
+      f.store.finishJob(
+        f.id,
+        {
+          status: 'failed',
+          errorCode: 'MUSE_TIMEOUT',
+          upstreamErrorCode: null,
+          files: null,
+          artifactIds: null,
+          snapshotId: null,
+        },
+        f.fence,
+      ),
+    )
+    // Simulate a running winner; the loser's settle is rejected before spendTwoBucket.
+    await query("UPDATE muse_media_jobs SET status='running' WHERE id=$1", [f.id])
+    await assert.rejects(
+      createMuseBilling(getPool(), PRICES).settle({
+        ...settleInput(f.id, f.uid, 'video', 50n),
+        fence: f.fence,
+      }),
+      /NOT_RUNNING/,
+    )
+    assert.equal((await query('SELECT 1 FROM credit_ledger WHERE user_id=$1', [f.uid])).rowCount, 0)
+  })
+  test('offline restart claims synchronous backoff but leaves background waiting for a worker', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const f = await fixture()
+    await query(
+      'UPDATE muse_media_jobs SET durable=durable || \'{"background":false,"expiresAt":0}\'::jsonb, lease_until=NOW()-INTERVAL \'1 second\' WHERE id=$1',
+      [f.id],
+    )
+    const rows = await createMuseDurability(getPool(), async () => {}).claim(
+      'offline-recovery',
+      10,
+      false,
+    )
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0]?.durable.retryAt, f.state.retryAt)
+    assert.equal(rows[0]?.durable.background, false)
+  })
+  test('new and old orphan sweeps leave durable rows recoverable; pending caps include released jobs', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const f = await fixture()
+    await f.store.failOrphans(0, [])
+    await query(
+      "UPDATE muse_media_jobs SET status='failed',error_code='MUSE_MASTER_RESTARTED' WHERE id=$1",
+      [f.id],
+    )
+    assert.equal((await f.store.findJob(f.uid, f.id))?.status, 'queued')
+    await createMuseDurability(getPool(), async () => {}).release(f.id, 'owner-a')
+    await assert.rejects(
+      f.store.insertJob({
+        id: `mj_${randomUUID()}`,
+        userId: f.uid,
+        containerId: null,
+        kind: 'video',
+        promptSha256: Buffer.from('00', 'hex'),
+        promptPreview: 'p',
+        params: {},
+        durable: f.state,
+        leaseOwner: 'owner-b',
+        admissionLimits: { queue: 100, user: 1 },
+      }),
+      /pending/,
+    )
+  })
+  test('success + charge survives lost delivery ACK; concurrent drains append once only to origin', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const f = await fixture()
+    const root = await mkdtemp(join(tmpdir(), 'muse-outbox-'))
+    const generated = join(root, 'generated')
+    const bytes = Buffer.from('verified video fixture')
+    const hash = createHash('sha256').update(bytes).digest('hex')
+    try {
+      await mkdir(join(root, f.id, f.state.nonce), { recursive: true })
+      await writeFile(join(root, f.id, f.state.nonce, '0.bin'), bytes)
+      await query("UPDATE muse_media_jobs SET status='running' WHERE id=$1", [f.id])
+      const billing = createMuseBilling(getPool(), PRICES)
+      const input = {
+        ...settleInput(f.id, f.uid, 'video', 50n),
+        fence: f.fence,
+        files: [{ mime: 'video/mp4', bytes: bytes.length, sha256: hash }],
+      }
+      await billing.settle(input)
+      await assert.rejects(billing.settle(input), /NOT_RUNNING/)
+      let lostAck = true
+      let unavailable = true
+      const frames: unknown[] = []
+      const drain = createMuseDelivery(getPool(), root, {
+        resolveMedia: async (owner) => {
+          assert.equal(owner, `c:${f.uid}`)
+          if (unavailable) throw new Error('user container unavailable')
+          return { kind: 'ok', uid: Number(f.uid), generated, uploads: join(root, 'uploads') }
+        },
+        append: async (...args) => {
+          const r = await f.backend.appendServerAuthoredMessage(...args)
+          if (lostAck) {
+            lostAck = false
+            throw new Error('lost append ACK')
+          }
+          return r
+        },
+        broadcast: (_uid, frame) => {
+          frames.push(frame)
+        },
+      })
+      await drain()
+      assert.equal((await f.backend.getClientSession(f.origin, `c:${f.uid}`))?.messages.length, 0)
+      unavailable = false
+      await query('UPDATE muse_media_jobs SET delivery_next_at=NOW() WHERE id=$1', [f.id])
+      await drain() // append commits; response lost
+      assert.equal(
+        (await query('SELECT delivered_at FROM muse_media_jobs WHERE id=$1', [f.id])).rows[0]
+          .delivered_at,
+        null,
+      )
+      await query('UPDATE muse_media_jobs SET delivery_next_at=NOW() WHERE id=$1', [f.id])
+      await Promise.all([drain(), drain()])
+      const restored = await f.backend.getClientSession(f.origin, `c:${f.uid}`)
+      assert.equal(restored?.messages.length, 1)
+      assert.equal((restored?.messages[0] as { id?: string })?.id, `muse-result:${f.id}`)
+      assert.match(String((restored?.messages[0] as { text?: string })?.text), /generated\/muse-/)
+      assert.equal(await f.backend.getClientSession(f.origin, 'c:999999'), null)
+      assert.deepEqual(await readFile(join(generated, `muse-${f.id}-0.mp4`)), bytes)
+      assert.equal(
+        (await query('SELECT credits::text FROM users WHERE id=$1', [f.uid])).rows[0].credits,
+        '950',
+      )
+      assert.equal(
+        (await query('SELECT 1 FROM credit_ledger WHERE user_id=$1', [f.uid])).rowCount,
+        1,
+      )
+      assert.ok(
+        (await query('SELECT delivered_at FROM muse_media_jobs WHERE id=$1', [f.id])).rows[0]
+          .delivered_at,
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+  test('remote-host delivery retries the existing uploader and appends only after verified publication', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const f = await fixture()
+    const root = await mkdtemp(join(tmpdir(), 'muse-remote-'))
+    const content = Buffer.from('remote video')
+    const generated = `/var/lib/docker/volumes/oc-v5-data-u${f.uid}/_data/generated`
+    try {
+      await mkdir(join(root, f.id, f.state.nonce), { recursive: true })
+      await writeFile(join(root, f.id, f.state.nonce, '0.bin'), content)
+      await query("UPDATE muse_media_jobs SET status='running' WHERE id=$1", [f.id])
+      await createMuseBilling(getPool(), PRICES).settle({
+        ...settleInput(f.id, f.uid, 'video', 50n),
+        fence: f.fence,
+        files: [
+          {
+            mime: 'video/mp4',
+            bytes: content.length,
+            sha256: createHash('sha256').update(content).digest('hex'),
+          },
+        ],
+      })
+      let attempts = 0
+      const drain = createMuseDelivery(getPool(), root, {
+        append: f.backend.appendServerAuthoredMessage,
+        resolveMedia: async () => ({
+          kind: 'fail',
+          reason: 'remote-host',
+          uid: Number(f.uid),
+          hostUuid: 'remote-worker',
+          generated,
+          uploads: generated,
+          logCtx: {},
+        }),
+        pushRemote: async (args) => {
+          assert.equal(args.hostUuid, 'remote-worker')
+          assert.equal(args.remotePath, join(generated, `muse-${f.id}-0.mp4`))
+          assert.deepEqual(args.content, content)
+          if (++attempts === 1) throw new Error('remote temporarily unavailable')
+        },
+      })
+      await drain()
+      assert.equal((await f.backend.getClientSession(f.origin, `c:${f.uid}`))?.messages.length, 0)
+      await query('UPDATE muse_media_jobs SET delivery_next_at=NOW() WHERE id=$1', [f.id])
+      await drain()
+      await drain()
+      assert.equal(attempts, 2)
+      assert.equal((await f.backend.getClientSession(f.origin, `c:${f.uid}`))?.messages.length, 1)
+      assert.equal(
+        (await query('SELECT 1 FROM credit_ledger WHERE user_id=$1', [f.uid])).rowCount,
+        1,
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+  test('deleted origin is not redirected; a symlinked generated directory cannot receive a result', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const f = await fixture()
+    await query(
+      "UPDATE muse_media_jobs SET status='failed',error_code='MUSE_QUEUE_EXPIRED',finished_at=NOW() WHERE id=$1",
+      [f.id],
+    )
+    await query('UPDATE client_sessions SET deleted_at=1 WHERE id=$1', [f.origin])
+    const drain = createMuseDelivery(getPool(), '/unused', {
+      append: async () => {
+        throw new Error('must not append deleted origin')
+      },
+      resolveMedia: async () => {
+        throw new Error('must not resolve media')
+      },
+    })
+    await drain()
+    assert.ok(
+      (await query('SELECT delivered_at FROM muse_media_jobs WHERE id=$1', [f.id])).rows[0]
+        .delivered_at,
+    )
+    const live = await fixture()
+    const root = await mkdtemp(join(tmpdir(), 'muse-path-'))
+    try {
+      await mkdir(join(root, 'outside'))
+      await symlink(join(root, 'outside'), join(root, 'generated'))
+      await query(
+        "UPDATE muse_media_jobs SET status='succeeded',files=$2,finished_at=NOW() WHERE id=$1",
+        [live.id, JSON.stringify([{ mime: 'video/mp4', bytes: 1, sha256: 'a'.repeat(64) }])],
+      )
+      const attempt = createMuseDelivery(getPool(), root, {
+        append: live.backend.appendServerAuthoredMessage,
+        resolveMedia: async () => ({
+          kind: 'ok',
+          uid: Number(live.uid),
+          generated: join(root, 'generated'),
+          uploads: root,
+        }),
+      })
+      await attempt()
+      assert.equal(
+        (await query('SELECT delivered_at FROM muse_media_jobs WHERE id=$1', [live.id])).rows[0]
+          .delivered_at,
+        null,
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })

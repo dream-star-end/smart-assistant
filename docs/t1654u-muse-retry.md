@@ -1,5 +1,9 @@
 # t1654u — commercial Muse retry policy (DRAFT)
 
+Historical phase-1 design. For commercial conversation VIDEO, the durable queue/callback and
+restart semantics in [t1657u-muse-durable-queue.md](t1657u-muse-durable-queue.md) supersede the
+in-memory restart and H3 fallback limitations below. Image and Studio behavior remains synchronous.
+
 User request (2026-11-08): 服务端失败自动重试 3 次，每次间隔 40 秒.
 This branch targets `feat/v5-aurora-rewrite` only. Release requires user approval.
 
