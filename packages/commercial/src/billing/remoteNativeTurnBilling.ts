@@ -21,7 +21,7 @@ import {
 } from '../http/proxy/modelAuthorityGate.js'
 import type { Logger } from '../logging/logger.js'
 import { computeCost, type TokenUsage } from './calculator.js'
-import type { ModelCatalogCache } from './modelCatalog.js'
+import type { CatalogSource } from '../http/proxy/modelAuthorityGate.js'
 import { parseBillingPricing, serializeBillingPricing, type PersistedBillingPricingV1 } from './persistedBillingPricing.js'
 import { CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
 import {
@@ -76,7 +76,7 @@ interface Context {
 export interface RemoteNativeTurnFinanceDeps {
   pool: Pool
   preCheckRedis: PreCheckRedis
-  catalog: ModelCatalogCache
+  catalog: CatalogSource
   keyring: AuthorityKeyring | (() => AuthorityKeyring)
   loadUserModelAuthz: UserModelAuthzLoader
   log: Logger

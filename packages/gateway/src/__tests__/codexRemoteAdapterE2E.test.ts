@@ -37,6 +37,7 @@ import {
   type CodexRemoteBinding,
 } from '../codexRemoteContract.js'
 import type { CodexLaneSpec } from '../codexRemoteHost.js'
+import { commissioningLines } from '../codexCommissioningWire.js'
 import { CodexRemoteRelay } from '../codexRemoteRelay.js'
 import { CodexRemoteAdapter } from '../engine/codexAdapter.js'
 import type { TurnParams } from '../engine/engineAdapter.js'
@@ -385,7 +386,7 @@ async function lane(t: TestContext, options: {
   let renewAckPatched: { renew: (lease: string) => Promise<void> } | undefined
 
   return {
-    root, binding, sentinel, turnKey, adapter, relay, receipts, executed, errors,
+    root, binding, sentinel, turnKey, adapter, relay, receipts, executed, errors, keys,
     get launches() { return launches },
     call, received,
     toolResponses: responses,
@@ -1154,4 +1155,47 @@ test('R1 unproved retired tool host prevents successful shutdown until its proof
   closeFailure.active=false
   await h.adapter.shutdown()
   assert.deepEqual(await h.relay.stop(),{remoteStopped:true})
+})
+
+
+// Exercise the actual fixed worker and stdio protocol; node/finance remain explicit fixtures.
+// This regression is NOT a production commissioning receipt or node proof.
+test('commissioning worker traverses stdio relay, real CCB Write and actual supervisor stop', {timeout:180000}, async t=>{
+  const h=await lane(t), signed=h.authority('commission-worker')
+  h.turnParams(signed,h.turnKey,'commission-worker') // fixture finance attribution, no turn submitted here
+  const directory=`/home/agent/.openclaude/commissioning/${randomUUID()}`,sentinel=join(directory,'sentinel.txt'),content='commission-worker-marker\n'
+  const worker=spawn(process.execPath,['--import','tsx',fileURLToPath(new URL('../codexCommissioningWorker.ts',import.meta.url))],{stdio:['pipe','pipe','pipe'],env:process.env})
+  let done:any,failed:any,stderr=''
+  worker.stderr.on('data',b=>{stderr+=b.toString()})
+  const exited=once(worker,'close')
+  commissioningLines(worker.stdout,v=>{
+    if(v.kind==='done'){done=v;return}
+    if(v.kind==='failed'){failed=v;return}
+    assert.equal(v.kind,'request')
+    void h.call(v.path,JSON.parse(v.body)).then(reply=>{
+      const {status,...body}=reply
+      worker.stdin.write(JSON.stringify({kind:'response',id:v.id,status,body:JSON.stringify(body)})+'\n')
+    }).catch(e=>{failed=e;worker.kill()})
+  },e=>{if(!done)failed=e})
+  t.after(()=>{worker.kill();rmSync(directory,{recursive:true,force:true})})
+  worker.stdin.write(JSON.stringify({kind:'init',binding:h.binding,authority:signed.authority,lease:signed.lease,
+    sentinel,content,requestId:'commission-worker',turnKey:h.turnKey,contextWindow:1000,
+    keyring:[...h.keys].map(([id,key])=>[id,Buffer.from(key).toString('base64')])})+'\n')
+  await h.until(()=>h.received('launch').some(r=>r?.received?.method==='turn/start'),'commission worker turn/start')
+  const args={file_path:sentinel,content}
+  h.nativeItem('item/started',{type:'mcpToolCall',id:'commission-call',server:'ocbridge',tool:'Write',arguments:args})
+  h.sendTool(h.toolRequest('commission-call',args))
+  await h.until(()=>existsSync(sentinel),'real worker sentinel')
+  assert.equal(readFileSync(sentinel,'utf8'),content)
+  await h.until(()=>h.toolResponses().length===1,'worker tool response')
+  h.nativeItem('item/completed',{type:'mcpToolCall',id:'commission-call',server:'ocbridge',tool:'Write',arguments:args})
+  const total={...zeroNativeTokens(),inputTokens:1000,outputTokens:80}
+  h.emit({method:'thread/tokenUsage/updated',params:h.tokenUsage(TURNS[0]!,total,total)})
+  h.emit({method:'turn/completed',params:{threadId:THREAD,turn:{id:TURNS[0],status:'completed'}}})
+  const [code]=await exited
+  assert.equal(code,0,`worker failed: ${JSON.stringify(failed)} ${stderr.slice(-1000)}`)
+  assert.equal(done.calls,1);assert.equal(done.proofs.length,1)
+  assert.equal(done.proofs[0].proof.localStopped,true)
+  assert.equal(existsSync(`/proc/${done.proofs[0].proof.supervisorPid}`),false)
+  assert.equal(h.receipts[0]!.version,3)
 })

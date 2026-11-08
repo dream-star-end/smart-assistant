@@ -23,6 +23,7 @@ import {handleModelSwitchCost} from './modelSwitchCost.js'
 import { resolveRequestTrace } from './requestTrace.js'
 import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
+import { handleCodexCommissioning } from './admin/codexCommissioning.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
 import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
@@ -1274,6 +1275,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/admin/pools/keys', handler: handleAdminPoolKeyCreate },
     { method: 'PATCH', pathPrefix: '/api/admin/pools/keys/', handler: handleAdminPoolKeyPatch },
     // OCV5-721 远端底座服务池(节点、Profile 自动探测、勾选模型上架、Binding 撤销 + 预热)。
+    { method: 'GET', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
+    { method: 'POST', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
     { method: 'GET', path: '/api/admin/remote-pool', handler: handleAdminRemotePoolGet },
     { method: 'POST', path: '/api/admin/remote-pool/nodes', handler: handleAdminRemotePoolNodeCreate },
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/nodes/', handler: handleAdminRemotePoolNodeAction },

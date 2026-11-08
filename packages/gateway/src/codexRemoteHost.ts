@@ -49,6 +49,8 @@ export function readCodexLines(child: ChildProcessWithoutNullStreams, handle: (f
 export class CodexSshHost implements CodexHostPort {
   private readonly opened = new Set<string>()
   private revoked = false
+  private stopEvidence?: { fence: unknown; proof: unknown }
+  get verifiedStopEvidence(): unknown { return this.stopEvidence ? structuredClone(this.stopEvidence) : undefined }
   private stopping?: Promise<{ remoteStopped: true; noHostEffect?: boolean }>
   constructor(private readonly target: RemoteCcTarget, private readonly spec: CodexLaneSpec,
     private readonly spawnSsh = (args: string[]) => spawn('/usr/bin/ssh', args, { stdio: ['pipe','pipe','pipe'], env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } }),
@@ -139,6 +141,7 @@ export class CodexSshHost implements CodexHostPort {
       const row = await this.control('fence-stop',this.spec.manifest); this.checkProof(row)
       const proof = await this.control('prove-stopped'); this.checkProof(proof)
       codexNeed(proof.bootId === row.bootId)
+      this.stopEvidence = structuredClone({ fence: row, proof })
       return { remoteStopped: true as const, noHostEffect: proof.scopes.length === 0 }
     })().catch(error => { this.stopping = undefined; throw error })
   }

@@ -81,7 +81,8 @@ export class CodexRemoteRelay {
     private readonly host: CodexHostPort, private readonly spec: CodexLaneSpec,
     private readonly journal: string, private readonly finance: RemoteFinancePort,
     private readonly onThread: (id: string) => Promise<void>,
-    private readonly onRemoteStart: () => Promise<void> = async () => {}) {
+    private readonly onRemoteStart: () => Promise<void> = async () => {},
+    private readonly observeFrame?: (channel: 'app' | 'tool', frame: unknown) => void) {
     assertCodexBinding(binding)
     mkdirSync(journal, { recursive: true, mode: 0o700 })
     this.record('binding', { binding, spec })
@@ -212,6 +213,7 @@ export class CodexRemoteRelay {
       const timer = setTimeout(() => fail(new Error('CODEX_READY_TIMEOUT')), 30000)
       const fail = (e: Error) => { clearTimeout(timer); reject(e); this.fence(e.message) }
       readCodexLines(app, row => {
+        this.observeFrame?.('app', row)
         codexNeed(!this.revoked && row.version === 1 && row.engine === 'codex' && row.seq === ++this.appSeq)
         this.identity(row)
         if (!ready) {
@@ -242,6 +244,7 @@ export class CodexRemoteRelay {
       const timer = setTimeout(() => fail(new Error('CODEX_TOOL_SOCKET_TIMEOUT')), 30000)
       const fail = (e: Error) => { clearTimeout(timer); reject(e); this.fence(e.message) }
       readCodexLines(socket, row => {
+        this.observeFrame?.('tool', row)
         if (!ready && row.kind === 'error' && isRemoteResourceCode(row.code)) {
           const e=nodeMemoryError(row.activeSessions, row.code); this.memoryRefused=row.code; throw e
         }

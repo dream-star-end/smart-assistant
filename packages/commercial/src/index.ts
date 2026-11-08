@@ -89,6 +89,7 @@ import {
 import { loadConfig, type CommercialConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
+import { CodexCommissioning } from "./account-pool/codexCommissioning.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { deriveMediaSignKey } from "./http/mediaSign.js";
 import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
@@ -4493,7 +4494,12 @@ export async function registerCommercial(
       stateReads: { sessions: systemSessionReadBackend, readProject: (uid, id) => readPgChatProject(getPool(), uid, id), readRuntimeStatus: makeSystemRuntimeStatusRead(v3Deps) },
     });
   }
+  const codexCommissioning = runtimeChannel === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost"
+    && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache
+    ? new CodexCommissioning({pool:getPool(),preCheckRedis,catalog:modelCatalogCache,keyring:()=>modelAuthoritySigner!.publicKeyring(),
+      signer:modelAuthoritySigner,loadUserModelAuthz,log:rootLogger.child({subsys:"codexCommissioning"})}) : undefined;
   const handler = createCommercialHandler({
+    codexCommissioning,
     modelSwitchCost,
     jwtSecret,
     ...systemActions?.http,
