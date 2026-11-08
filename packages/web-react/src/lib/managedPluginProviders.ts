@@ -123,6 +123,11 @@ const MANAGED_PLUGIN_PROVIDERS: Record<ManagedQrProvider, ManagedPluginProvider>
     qrRelink: false,
     challengeCodes: [],
     challengeText: null,
+    codeTexts: {
+      QR_GENERATION_FAILED: '知识星球二维码生成失败，请重新授权；若仍失败，请稍后再试。',
+      QR_GENERATION_TIMEOUT: '知识星球二维码生成超时，请重新授权；若仍失败，请稍后再试。',
+      CAPACITY_EXCEEDED: '知识星球扫码名额已满，请稍后再试。',
+    },
     // 知识星球没有「原地重新登录」：始终新建授权会话。
     start: (auth) => api.startKnowledgePlanetSetup(auth),
     get: (auth, sessionId) => api.getKnowledgePlanetSetup(auth, sessionId),
