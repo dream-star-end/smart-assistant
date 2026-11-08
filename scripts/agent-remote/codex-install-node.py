@@ -169,6 +169,10 @@ def plain_login_dir(source,uid,state,checkpoint):
             if os.path.lexists(tmp):
                 t=tmp.lstat()
                 need(stat.S_ISDIR(t.st_mode) and not stat.S_ISLNK(t.st_mode),'unsafe temporary ~/.codex entry')
+                # Even our own cleanup is identity-gated: a name match alone was
+                # never ownership, and this path is writable by the target user.
+                need(same_identity(state.get('plainDir') or {},t),
+                    'temporary ~/.codex identity mismatch; refusing to delete, manual inspection required: '+str(tmp))
                 need(not any(tmp.iterdir()),'temporary ~/.codex directory is not empty')
                 tmp.rmdir()
     else:
@@ -254,16 +258,16 @@ def rollback_login(home,profile,state,checkpoint):
             need(not os.path.lexists(dest) or not (dest/'auth.json').exists(),'canonical login still holds auth; rollback incomplete')
     else:
         need(layout=='moved','login rollback requires the steady layout')
-        # ~/.codex may be our plain 0700 dir (proven by its recorded device/inode)
-        # or absent because it was deleted on-site. Anything else is only removed
-        # when the journal recorded that exact inode; a root-owned directory is
-        # never assumed to be ours.
+        # A move recorded a durable intent, so this transaction created the plain
+        # ~/.codex itself (the pre-install directory was renamed away or was a
+        # symlink). It is therefore only removed when the journal recorded that
+        # exact inode: a user-owned directory with another inode is not ours and
+        # must be neither deleted nor silently reported as rolled back.
         if os.path.lexists(source):
             s=source.lstat()
             need(stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode),'unsafe ~/.codex before rollback')
-            record=state.get('plainDir') or {}
-            need(s.st_uid==uid or same_identity(record,s),
-                'unsafe ~/.codex before rollback: not owned by the user and no journal-recorded inode proves this installer created it; manual inspection required')
+            need(same_identity(state.get('plainDir') or {},s),
+                'unsafe ~/.codex before rollback: no journal-recorded inode proves this installer created it; manual inspection required')
             need(not any(source.iterdir()),'~/.codex is not empty; refusing to overwrite')
     # Recover crash-left temporary directories before the first journal write; a
     # refusal here (non-empty/unexpected entry) leaves the journal untouched.

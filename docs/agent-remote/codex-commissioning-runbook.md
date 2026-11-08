@@ -235,7 +235,7 @@ python3 "$SRC/scripts/agent-remote/codex-install.py" --rollback --confirm \
 - 原布局是真实目录（首次迁移）：`~/.codex` 的 0700 空目录被移走，canonical 目录整体 rename 回 `~/.codex`；若现场已删除该空目录，直接 rename，不误报“已恢复”。
 - 原布局是旧版兼容软链：先移除空目录，再恢复原软链（忠实回退旧状态，Gate G 会再次不过，需重新安装）。
 - 现场已是修复后稳态（无软链 + 0700 空目录 + canonical auth）：本事务没有移动 auth，回退登录步骤不声称移动过 token；安装前既有的 0700 空目录保留，仅删除本事务创建的目录及其临时中间态。
-`~/.codex` 若被第三方写入非空内容，回退拒绝覆盖并报错。**`~/.codex` 是 root 属主且 journal 没有记录该目录 dev/ino 时，apply 与 rollback 都报 `manual inspection required` 并保持原样**（旧版安装器正常拒绝与 mkdir 中断不可区分）；人工确认它是空目录后删除该路径，再重跑同一 apply/rollback 即可收敛，不要绕过报错改写 journal。中断在 `mkdir` 与 dev/ino 落盘之间的临时目录（报错点名 `.oc-codex-plain-*` 具体路径）同样先人工确认空目录再删除。保留不可变bundle和宿主Codex私钥用于取证/后续受控清理；不删除CC行。回退不自动撤数据库ready，必须先走§7.3；不自动结束模型/工具进程。
+`~/.codex` 若被第三方写入非空内容，回退拒绝覆盖并报错。**`~/.codex` 是 root 属主且 journal 没有记录该目录 dev/ino 时，apply 与 rollback 都报 `manual inspection required` 并保持原样**（旧版安装器正常拒绝与 mkdir 中断不可区分）；人工确认它是空目录后删除该路径，再重跑同一 apply/rollback 即可收敛，不要绕过报错改写 journal。同理，moved 布局下回退时 `/home/box/.codex` 即使是 box 属主，只要 inode 与 journal 记录不符（例如被同名重建），也报 `manual inspection required` 并保留该目录——「box 属主」不是归属证据。中断在 `mkdir` 与 dev/ino 落盘之间的临时目录（报错点名 `.oc-codex-plain-*` 具体路径）同样先人工确认空目录再删除。保留不可变bundle和宿主Codex私钥用于取证/后续受控清理；不删除CC行。回退不自动撤数据库ready，必须先走§7.3；不自动结束模型/工具进程。
 
 ## 5. 获准后合入主线、正式列车迁移与切流
 

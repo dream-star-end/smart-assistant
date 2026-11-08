@@ -358,6 +358,46 @@ class CrashRecoveryTests(unittest.TestCase):
             self.assertTrue((later/'note').exists())
             self.assertEqual(path.read_bytes(),before)
 
+    def test_rollback_never_deletes_unrelated_user_dir(self):
+        """R3: a recorded move lets rollback remove the plain ~/.codex it created,
+        but only by the recorded inode. A different (user-owned) empty directory
+        at that path belongs to someone else: refuse instead of deleting it and
+        claiming success."""
+        with tempfile.TemporaryDirectory(prefix='oc746-r3-userdir-') as directory:
+            f=self.fixture(pathlib.Path(directory),'original');self.run_worker(f,'apply')
+            source=f['source'];source.rename(f['home']/'parked-ours')
+            source.mkdir(mode=0o700);os.chown(source,1000,1000)
+            inode=source.stat().st_ino
+            path,_=self.journal(f);before=path.read_bytes()
+            result=self.run_worker(f,'rollback',expected=1)
+            self.assertIn('unsafe ~/.codex before rollback',result.stderr)
+            self.assertNotIn('"ok": true',result.stdout)
+            self.assertTrue(source.is_dir(),'an unrelated user directory must survive rollback')
+            self.assertEqual(source.stat().st_ino,inode)
+            self.assertTrue((f['home']/'parked-ours').is_dir())
+            self.assertEqual(path.read_bytes(),before,'a refused rollback must stay read-only')
+            print('REFUSED rollback over unrelated user dir',flush=True)
+    def test_cleanup_never_deletes_an_unbound_replacement(self):
+        """R3: the publish step's own cleanup runs in a directory the target user
+        can write. A same-named replacement must be reported, not deleted."""
+        self.assertEqual(os.getuid(),0)
+        with tempfile.TemporaryDirectory(prefix='oc746-r3-cleanup-') as directory:
+            home=pathlib.Path(directory);source=home/'.codex';state={}
+            real_rename,real_mkdir=os.rename,os.mkdir
+            def hijack(src,dst):
+                src=pathlib.Path(src)
+                real_rename(src,home/'parked-staging')
+                real_mkdir(src,0o700);os.chown(src,0,0)
+                raise RuntimeError('publish failed')
+            os.rename=hijack
+            try:
+                with self.assertRaisesRegex(RuntimeError,'identity mismatch'):m.plain_login_dir(source,0,state,lambda:None)
+            finally:os.rename=real_rename
+            tmp=pathlib.Path(state['plainDir']['tmp'])
+            self.assertTrue((home/'parked-staging').is_dir(),'the real staging dir must be preserved')
+            self.assertTrue(tmp.is_dir(),'the replacement must survive')
+            self.assertEqual(tmp.stat().st_uid,0)
+            print('REFUSED cleanup of unbound replacement',flush=True)
     def test_audit_rename_before_checkpoint_direct_rollback(self):
         with tempfile.TemporaryDirectory(prefix='oc746-audit-') as directory:
             f=self.fixture(pathlib.Path(directory));self.run_worker(f,'apply','rename:1:after',86)
