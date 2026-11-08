@@ -164,7 +164,13 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         payload["count"] = ns.count
 
     status = call("GET", "/status")
-    if not status.get("bridge_online"):
+    backend = status.get("video_backend") or "hatch"
+    box_exec_ok = (
+        kind == "video"
+        and not ns.resume
+        and backend == "box-exec"
+    )
+    if not status.get("bridge_online") and not box_exec_ok:
         raise MuseFailure("MUSE_BRIDGE_OFFLINE", "the Muse bridge is not connected; ask the user to start it in the Muse VM")
     job_id = call("POST", "/jobs", payload, timeout=120)["job_id"]
 

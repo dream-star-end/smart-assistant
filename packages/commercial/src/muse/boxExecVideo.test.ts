@@ -11,8 +11,11 @@ import {
   BOX_EXEC_CHUNK_BYTES,
   applyChunk,
   canRouteToBoxExec,
+  createMuseBoxExecRunner,
+  isStaleBoxExecTransport,
   mapRelayMode,
   museExecRequest,
+  museRelayStagingPath,
   parseMuseVideoBackend,
   runBoxExecVideoJob,
 } from './boxExecVideo.js'
@@ -141,5 +144,48 @@ describe('OCV5-750 runBoxExecVideoJob against a fake Exec', () => {
     assert.equal(calls[0]![0], 'submit')
     assert.ok(calls[0]!.includes('--mode'))
     assert.ok(calls[0]!.includes('native'))
+  })
+
+  it('isolates staging paths by dest dir and entropy', () => {
+    const a = museRelayStagingPath('/var/lib/muse-media/mj_one', 0, 'aaa111')
+    const b = museRelayStagingPath('/var/lib/muse-media/mj_two', 0, 'aaa111')
+    const c = museRelayStagingPath('/var/lib/muse-media/mj_one', 0, 'bbb222')
+    assert.notEqual(a, b)
+    assert.notEqual(a, c)
+    assert.match(a, /^\/tmp\/oc-muse-mj_one-aaa111-0\.img$/)
+  })
+
+  it('refreshes a cached Exec transport after an account-guard failure', async () => {
+    let resolves = 0
+    let calls = 0
+    const factory = createMuseBoxExecRunner('3', {
+      resolve: async () => {
+        resolves += 1
+        return async () => {
+          calls += 1
+          if (calls === 1) {
+            const err = new Error('guard') as Error & { code: string }
+            err.code = 'BOX_EXEC_ACCOUNT_GUARD_FAILED'
+            throw err
+          }
+          return { stdout: JSON.stringify({ ok: true }) }
+        }
+      },
+    })
+    const exec = await factory()
+    const first = await exec(
+      {
+        command: '/usr/bin/python3',
+        args: ['-I', '/workspace/muse-relay/bin/muse-exec-cli', 'health'],
+        cwd: '/tmp',
+        environment: {},
+      },
+      { timeoutMs: 5000 },
+    )
+    assert.equal(JSON.parse(first.stdout).ok, true)
+    assert.equal(resolves, 2)
+    assert.equal(calls, 2)
+    assert.equal(isStaleBoxExecTransport({ code: 'BOX_EGRESS_CHANGED' }), true)
+    assert.equal(isStaleBoxExecTransport({ code: 'BOX_EXEC_TIMEOUT' }), false)
   })
 })

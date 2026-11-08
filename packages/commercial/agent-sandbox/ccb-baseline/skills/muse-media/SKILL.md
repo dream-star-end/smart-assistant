@@ -16,7 +16,7 @@ Call the platform CLI `oc-muse`. It already has container identity, credits, que
 |---|---|
 | Short cinematic / product / nature / story clip (~10 s, native Muse Video) | `oc-muse video "<shot>"` |
 | Animate a still (the image should be the opening frame) | `oc-muse video --mode first_frame --image still.png "<what happens next>"` |
-| Keep a character / style / scene from reference images, but start in a **new** scene | `oc-muse video --mode reference --image hero.png --image-role character --image mood.png --image-role style "<new scene>"` |
+| Keep a character / style / scene from reference images, but start in a **new** scene | `oc-muse video --mode reference --image hero.png --image mood.png "<new scene; say what each image is>"` |
 | Longer explainer with word-for-word narration and burned-in subtitles | `oc-muse video --mode composite "<topic, language, and length in the prompt>"` |
 | Several native variations of the same shot (max 6) | `oc-muse video --mode native --count 2 "<shot>"` |
 | Text-to-image or image edit | `oc-muse image "<prompt>"` (and `--image` for edits) |
@@ -83,9 +83,9 @@ oc-muse video --mode first_frame --image still.png "She starts walking toward th
 
 # Character + style references
 oc-muse video --mode reference \
-  --image hero.png --image-role character \
-  --image kitchen.png --image-role style \
-  "She sits at the wooden table beside the sunflowers. The first frame is already the painted kitchen, not the studio still."
+  --image hero.png \
+  --image kitchen.png \
+  "She sits at the wooden table beside the sunflowers. The first image is the character reference; the second is the kitchen style. The first frame is already the painted kitchen, not the studio still."
 
 # Two native variations
 oc-muse video --mode native --count 2 "A ceramic coffee cup steaming on a wooden table, soft window light, slow push-in"

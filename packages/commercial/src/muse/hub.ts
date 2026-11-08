@@ -98,6 +98,7 @@ interface HubJob {
   finishedAt: number
   waiters: Set<() => void>
   via: 'hatch' | 'box-exec'
+  abort?: AbortController
 }
 
 export interface MuseJobView {
@@ -679,6 +680,7 @@ export class MuseBridgeHub {
     const job = this.jobs.get(jobId)
     if (!job || job.userId !== userId) return null
     if (job.state !== 'done') {
+      job.abort?.abort()
       this.finish(job, {
         ok: false,
         status: 'cancelled',
@@ -764,23 +766,30 @@ export class MuseBridgeHub {
       job.dispatchedAt = now
       job.lastBeatAt = now
       job.deadlineAt = now + boxExecDeadlineMs(job.spec)
+      job.abort = new AbortController()
       this.boxExecInflight.add(job)
       void this.runBoxExec(job)
     }
   }
 
   private async runBoxExec(job: HubJob): Promise<void> {
+    let relaySubmitted = false
     try {
       if (!this.boxExecRunner) {
         throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'box-exec Muse backend is not wired', true)
       }
       const exec = await this.boxExecRunner()
+      if (job.state === 'done') return
       const result = await runBoxExecVideoJob({
         exec,
         spec: job.spec,
         destDir: join(this.root, job.id),
         now: this.now,
         pollMs: this.boxExecPollMs,
+        signal: job.abort?.signal,
+        onSubmitted: () => {
+          relaySubmitted = true
+        },
       })
       if (job.state === 'done') return
       if (result.modeMismatch) {
@@ -797,10 +806,11 @@ export class MuseBridgeHub {
       if (job.state === 'done') return
       const museErr = err instanceof MuseError ? err : null
       const message = err instanceof Error ? err.message : 'box-exec failed'
-      const offline =
-        museErr?.code === 'MUSE_BRIDGE_OFFLINE' ||
-        /relay is down|not wired|BOX_|ECONNREFUSED/i.test(message)
-      if (this.fallbackHatch && this.bridgeOnline() && offline) {
+      const preSubmitOffline =
+        !relaySubmitted &&
+        (museErr?.code === 'MUSE_BRIDGE_OFFLINE' ||
+          /relay is down|not wired|ECONNREFUSED|BOX_/.test(message))
+      if (this.fallbackHatch && this.bridgeOnline() && preSubmitOffline) {
         this.boxExecInflight.delete(job)
         job.via = 'hatch'
         job.state = 'queued'

@@ -2,7 +2,7 @@
 // Default remains the hatch / muse_bridge.py path. This module is only used when
 // OC_MUSE_VIDEO_BACKEND=box-exec (or a runtime override to the same value).
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -246,6 +246,21 @@ export interface BoxExecVideoSuccess {
   modeMismatch: boolean
 }
 
+export function museRelayStagingPath(destDir: string, index: number, entropy: string): string {
+  const job = (destDir.split('/').pop() ?? 'job').replace(/[^A-Za-z0-9._-]/g, '') || 'job'
+  const nonce = entropy.replace(/[^A-Za-z0-9]/g, '').slice(0, 24) || 'x'
+  return `/tmp/oc-muse-${job}-${nonce}-${index}.img`
+}
+
+export function isStaleBoxExecTransport(err: unknown): boolean {
+  const code =
+    typeof err === 'object' && err && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '')
+      : ''
+  const message = err instanceof Error ? err.message : String(err ?? '')
+  return /BOX_EXEC_ACCOUNT_GUARD_FAILED|BOX_EGRESS_CHANGED/.test(`${code} ${message}`)
+}
+
 export async function runBoxExecVideoJob(input: {
   exec: BoxCliExecFn
   spec: MuseJobSpec
@@ -253,6 +268,7 @@ export async function runBoxExecVideoJob(input: {
   now?: () => number
   pollMs?: number
   signal?: AbortSignal
+  onSubmitted?: (relayJobId: string) => void
 }): Promise<BoxExecVideoSuccess> {
   const mode = mapRelayMode(input.spec)
   const count = Math.max(1, Math.min(6, input.spec.count ?? 1))
@@ -260,75 +276,85 @@ export async function runBoxExecVideoJob(input: {
   const args = ['submit', '--prompt', input.spec.prompt, '--mode', mode, '--count', String(count)]
   if (input.spec.orientation) args.push('--orientation', input.spec.orientation)
   if (input.spec.aspect_ratio) {
-    args.push(
-      '--orientation',
-      input.spec.aspect_ratio === '9:16'
-        ? 'vertical'
-        : input.spec.aspect_ratio === '1:1'
-          ? 'square'
-          : 'landscape',
-    )
+    args.push('--orientation', input.spec.aspect_ratio === '9:16' ? 'vertical' : 'landscape')
   }
   const sources = input.spec.source_images ?? []
-  const stamp = createHash('sha256')
-    .update(`${Date.now()}:${input.spec.prompt}`)
-    .digest('hex')
-    .slice(0, 16)
+  const entropy = randomBytes(8).toString('hex')
   for (const [i, raw] of sources.entries()) {
-    const remote = `/tmp/oc-muse-${stamp}-${i}.img`
+    const remote = museRelayStagingPath(input.destDir, i, entropy)
     await writeBoxFile(input.exec, remote, Buffer.from(raw, 'base64'), input.signal)
     args.push('--image', remote)
   }
   const submitted = await runCli(input.exec, args, { timeoutMs: 60_000, signal: input.signal })
   const jobId = String(submitted.id ?? '')
   if (!jobId) throw new MuseError(502, 'MUSE_BAD_OUTPUT', 'relay did not return a job id')
-
-  const deadline = (input.now ?? Date.now)() + boxExecDeadlineMs(input.spec)
-  const pollMs = input.pollMs ?? BOX_EXEC_POLL_MS
-  let status = String(submitted.status ?? 'queued')
-  let last: Record<string, unknown> = submitted
-  while (status === 'queued' || status === 'running' || status === 'needs_input') {
-    if ((input.now ?? Date.now)() > deadline) {
-      throw new MuseError(504, 'MUSE_TIMEOUT', 'the box-exec Muse job exceeded its deadline', true)
+  input.onSubmitted?.(jobId)
+  try {
+    const deadline = (input.now ?? Date.now)() + boxExecDeadlineMs(input.spec)
+    const pollMs = input.pollMs ?? BOX_EXEC_POLL_MS
+    let status = String(submitted.status ?? 'queued')
+    let last: Record<string, unknown> = submitted
+    while (status === 'queued' || status === 'running' || status === 'needs_input') {
+      if ((input.now ?? Date.now)() > deadline) {
+        throw new MuseError(
+          504,
+          'MUSE_TIMEOUT',
+          'the box-exec Muse job exceeded its deadline',
+          true,
+        )
+      }
+      if (input.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
+      await new Promise((resolve) => setTimeout(resolve, pollMs))
+      last = await runCli(input.exec, ['status', jobId], {
+        timeoutMs: 20_000,
+        signal: input.signal,
+      })
+      status = String(last.status ?? '')
     }
-    if (input.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
-    await new Promise((resolve) => setTimeout(resolve, pollMs))
-    last = await runCli(input.exec, ['status', jobId], { timeoutMs: 20_000, signal: input.signal })
-    status = String(last.status ?? '')
-  }
-  if (status !== 'done') {
-    const mapped = mapRelayFailure(String(last.error ?? `relay status ${status}`), undefined)
-    throw new MuseError(502, mapped.code, mapped.message, mapped.retryable)
-  }
-  const listed = Array.isArray(last.files) ? (last.files as Array<Record<string, unknown>>) : []
-  const indexes = listed.length > 0 ? listed.map((_, i) => i) : [0]
-  const files = []
-  for (const idx of indexes) {
-    const downloaded = await downloadRelayFile(input.exec, jobId, idx, input.signal)
-    const filename = `${idx}.mp4`
-    const path = join(input.destDir, `${idx}.bin`)
-    await writeFile(path, downloaded.bytes)
-    files.push({
-      idx,
-      filename,
-      mime: 'video/mp4',
-      bytes: downloaded.bytes.length,
-      sha256: downloaded.sha256,
-      path,
-    })
-  }
-  return {
-    files,
-    snapshotId: null,
-    artifactIds: [],
-    modeMismatch: last.mode_mismatch === true,
+    if (status !== 'done') {
+      const mapped = mapRelayFailure(String(last.error ?? `relay status ${status}`), undefined)
+      throw new MuseError(502, mapped.code, mapped.message, mapped.retryable)
+    }
+    const listed = Array.isArray(last.files) ? (last.files as Array<Record<string, unknown>>) : []
+    const indexes = listed.length > 0 ? listed.map((_, i) => i) : [0]
+    const files = []
+    for (const idx of indexes) {
+      const downloaded = await downloadRelayFile(input.exec, jobId, idx, input.signal)
+      const filename = `${idx}.mp4`
+      const path = join(input.destDir, `${idx}.bin`)
+      await writeFile(path, downloaded.bytes)
+      files.push({
+        idx,
+        filename,
+        mime: 'video/mp4',
+        bytes: downloaded.bytes.length,
+        sha256: downloaded.sha256,
+        path,
+      })
+    }
+    return {
+      files,
+      snapshotId: null,
+      artifactIds: [],
+      modeMismatch: last.mode_mismatch === true,
+    }
+  } catch (err) {
+    try {
+      await runCli(input.exec, ['cancel', jobId], { timeoutMs: 20_000 })
+    } catch {
+      // best-effort remote cancel
+    }
+    throw err
   }
 }
 
-export function createMuseBoxExecRunner(uidRaw: string | undefined): () => Promise<BoxCliExecFn> {
-  let cached: BoxCliExecFn | null = null
-  return async () => {
-    if (cached) return cached
+export function createMuseBoxExecRunner(
+  uidRaw: string | undefined,
+  deps?: { resolve?: () => Promise<BoxCliExecFn> },
+): () => Promise<BoxCliExecFn> {
+  let inner: BoxCliExecFn | null = null
+  const resolve = async (): Promise<BoxCliExecFn> => {
+    if (deps?.resolve) return deps.resolve()
     const uid = (uidRaw ?? '').trim()
     if (!/^[1-9]\d{0,18}$/.test(uid)) {
       throw new MuseError(
@@ -350,7 +376,17 @@ export function createMuseBoxExecRunner(uidRaw: string | undefined): () => Promi
       signal: new AbortController().signal,
       interactiveExecTarget: true,
     })
-    cached = (request, opts) => target.exec.run(request, opts)
-    return cached
+    return (request, opts) => target.exec.run(request, opts)
   }
+  const wrapped: BoxCliExecFn = async (request, opts) => {
+    try {
+      inner ??= await resolve()
+      return await inner(request, opts)
+    } catch (err) {
+      if (!isStaleBoxExecTransport(err)) throw err
+      inner = await resolve()
+      return await inner(request, opts)
+    }
+  }
+  return async () => wrapped
 }

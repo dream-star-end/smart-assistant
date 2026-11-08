@@ -151,6 +151,63 @@ describe('OCV5-750 hub routing', () => {
     writeFileSync(join(root, 'video-backend'), 'hatch\n')
     assert.equal(hub.getVideoBackend(), 'hatch')
   })
+
+  it('does not start a relay submit after the caller cancels while the runner is resolving', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let submits = 0
+    const hub = makeHub(tmpRoot(), {
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => {
+        await gate
+        return async (request: BoxCcExecRequest) => {
+          const verb = request.args[2]
+          if (verb === 'submit') {
+            submits += 1
+            return { stdout: JSON.stringify({ ok: true, id: 'late', status: 'queued' }) }
+          }
+          throw new Error(`unexpected ${verb}`)
+        }
+      },
+    })
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const cancelled = hub.cancel('3', id)
+    assert.equal(cancelled?.status, 'cancelled')
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(submits, 0)
+    const view = await hub.view('3', id, 100)
+    assert.equal(view?.status, 'cancelled')
+  })
+
+  it('does not fall back to hatch after the relay job was already submitted', async () => {
+    const root = tmpRoot()
+    let submits = 0
+    const hub = makeHub(root, {
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner: async () => async (request: BoxCcExecRequest) => {
+        const verb = request.args[2]
+        if (verb === 'submit') {
+          submits += 1
+          return { stdout: JSON.stringify({ ok: true, id: 'relay-started', status: 'queued' }) }
+        }
+        if (verb === 'status') throw new Error('BOX_EXEC_TIMEOUT')
+        if (verb === 'cancel') return { stdout: JSON.stringify({ ok: true, status: 'cancelled' }) }
+        throw new Error(`unexpected ${verb}`)
+      },
+    })
+    hub.hello('1', '0.5.0')
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(submits, 1)
+    assert.equal(view?.status, 'failed')
+    assert.equal(view?.error?.code, 'MUSE_UPSTREAM_ERROR')
+  })
 })
 
 void BOX_EXEC_CHUNK_BYTES
