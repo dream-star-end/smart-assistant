@@ -5,6 +5,7 @@ Never copies auth. Immutable bundles are retained on rollback for stop/proof rec
 import base64, fcntl, hashlib, json, os, pathlib, pwd, re, stat, sys, tempfile
 P = pathlib.Path
 FILES = ('codex-host-controller.py','oc-remote-hostd.py','codex-fixed-mcp.py','codex-mcp-socket.py','remote-engine-resources.py')
+PLAIN_DIR_PREFIX='.oc-codex-plain-'
 def need(ok, message):
     if not ok: raise RuntimeError(message)
 def digest(data): return hashlib.sha256(data).hexdigest()
@@ -81,16 +82,162 @@ def sync_login_dirs(source,dest):
         fd=os.open(p,os.O_DIRECTORY)
         try:os.fsync(fd)
         finally:os.close(fd)
-def plain_login_dir(source,uid):
-    """`~/.codex` must be a real 0700 directory owned by the user, never a symlink."""
-    if not os.path.lexists(source):
-        source.mkdir(mode=0o700);os.chown(source,uid,uid)
+def _fsync_dir(path):
+    fd=os.open(path,os.O_DIRECTORY)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def plain_prestate(source):
+    """Namespace state recorded before this transaction touches `~/.codex`."""
+    if not os.path.lexists(source):return {'present':False}
     s=source.lstat()
-    need(stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode) and s.st_uid==uid,'unsafe ~/.codex directory')
-    need(not (source/'auth.json').exists(),'auth must live in the canonical login directory only')
-    os.chmod(source,0o700)
+    return {'present':True,'dev':s.st_dev,'ino':s.st_ino,'dir':stat.S_ISDIR(s.st_mode),
+        'symlink':stat.S_ISLNK(s.st_mode),'uid':s.st_uid,'mode':stat.S_IMODE(s.st_mode)}
+def plain_legacy(state):
+    """Frozen ownership decision: only a journal written before the atomic
+    plain-dir transaction may recover the older final-path mkdir/chown artifact.
+
+    The decision is persisted once, before this installer writes any of its own
+    fields, so a later `loginLayout` write can never become retrospective proof
+    of ownership for a directory the transaction did not create. A finished
+    transaction (complete/rolledBack) never keeps the recovery right: it is a
+    one-shot authorization for an interrupted old installer, not a standing
+    permit to adopt whatever root-owned directory appears later."""
+    if state.get('complete') or state.get('rolledBack'):return False
+    if 'plainDirLegacy' in state:return bool(state['plainDirLegacy'])
+    return (not state.get('plainDirTxn')
+        and bool(state.get('loginIntent') or state.get('loginLayout') or state.get('plainDir')))
+def root_plain_shape(s,source,uid):
+    return (s.st_uid!=uid and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o700
+        and not any(source.iterdir()) and not (source/'auth.json').exists())
+def recover_plain_temps(home,state):
+    """Remove only the temporary directory this journal wrote down before mkdir.
+
+    A name match alone never proves ownership: any other `.oc-codex-plain-*`
+    entry stops the transaction for manual inspection. All entries are validated
+    before the single recorded temporary path is deleted.
+    """
+    record=state.get('plainDir') or {}
+    expected=record.get('tmp')
+    for path in sorted(home.glob(PLAIN_DIR_PREFIX+'*')):
+        need(expected and os.path.abspath(str(path))==os.path.abspath(expected),
+            'unowned temporary ~/.codex directory; manual inspection required: '+str(path))
+    if not expected:return
+    path=pathlib.Path(expected)
+    need(path.parent==home and path.name.startswith(PLAIN_DIR_PREFIX),'unsafe temporary ~/.codex name')
+    if not os.path.lexists(path):
+        record.pop('tmp',None);return
+    need(not path.is_symlink(),'unsafe temporary ~/.codex symlink: '+str(path))
+    s=path.lstat()
+    need(stat.S_ISDIR(s.st_mode),'unsafe temporary ~/.codex entry: '+str(path))
+    need(stat.S_IMODE(s.st_mode)==0o700,'unsafe temporary ~/.codex mode: '+str(path))
+    need(s.st_uid in (0,home.stat().st_uid),'unsafe temporary ~/.codex owner: '+str(path))
+    if record.get('ino') is not None:
+        need(s.st_dev==record.get('dev') and s.st_ino==record.get('ino'),'temporary ~/.codex identity mismatch')
+    need(not any(path.iterdir()),'temporary ~/.codex directory is not empty: '+str(path))
+    path.rmdir();record.pop('tmp',None)
+def plain_login_dir(source,uid,state,checkpoint,legacy):
+    """`~/.codex` must be a real 0700 directory owned by the user, never a symlink.
+
+    Creation is published atomically: the journal records the private temporary
+    path before mkdir (and its device/inode before chown), then the directory is
+    chowned/chmodded and renamed into place. Recovery therefore only handles a
+    path this transaction wrote down. A pre-existing root-owned directory is
+    never adopted unless the journal as loaded (before this run wrote anything)
+    proves the older crash window.
+    """
+    home=source.parent
+    record=state.get('plainDir') or {}
+    s=source.lstat() if os.path.lexists(source) else None
+    if s is not None:
+        need(stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode),'unsafe ~/.codex directory')
+    ours=bool(s is not None and record.get('ino')==s.st_ino and record.get('dev')==s.st_dev)
+    adopt=bool(s is not None and not ours and legacy and root_plain_shape(s,source,uid))
+    if 'plainDirBefore' not in state and not adopt:
+        # Durable pre-state before any namespace change, so a later run can tell
+        # a pre-existing directory from one this transaction created.
+        state['plainDirBefore']=plain_prestate(source);state['plainDirTxn']=2;checkpoint()
+    recover_plain_temps(home,state)
+    if s is None:
+        tmp=home/(PLAIN_DIR_PREFIX+os.urandom(12).hex())
+        state['plainDir']={'tmp':str(tmp),'uid':uid,'published':False};checkpoint()
+        try:
+            os.mkdir(tmp,0o700)
+            t=tmp.lstat();state['plainDir'].update({'dev':t.st_dev,'ino':t.st_ino});checkpoint()
+            os.chmod(tmp,0o700);os.chown(tmp,uid,uid);_fsync_dir(home)
+            need(not os.path.lexists(source),'~/.codex appeared during installation')
+            os.rename(tmp,source);_fsync_dir(home)
+            state['plainDir']['published']=True;state['plainDir'].pop('tmp',None);checkpoint()
+        finally:
+            if os.path.lexists(tmp):
+                t=tmp.lstat()
+                need(stat.S_ISDIR(t.st_mode) and not stat.S_ISLNK(t.st_mode),'unsafe temporary ~/.codex entry')
+                need(not any(tmp.iterdir()),'temporary ~/.codex directory is not empty')
+                tmp.rmdir()
+    else:
+        if s.st_uid!=uid:
+            need(ours or adopt,'unsafe ~/.codex directory')
+            if adopt:
+                # The old installer's own crash artifact, proven by the pre-atomic
+                # journal; bind the exact inode and upgrade the journal marker.
+                state['plainDir']={'dev':s.st_dev,'ino':s.st_ino,'uid':uid,'published':True,'adopted':True}
+                state['plainDirTxn']=2;checkpoint()
+            os.chown(source,uid,uid)
+        need(not (source/'auth.json').exists(),'auth must live in the canonical login directory only')
+        os.chmod(source,0o700);_fsync_dir(home)
+    s=source.lstat()
+    need(stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode) and s.st_uid==uid and stat.S_IMODE(s.st_mode)==0o700,'unsafe ~/.codex directory')
+    if legacy:
+        # The legacy artifact has now been recovered (or a normal directory was
+        # established); later runs must rely on the recorded inode, not on the
+        # old-journal shape heuristic.
+        state['plainDirLegacy']=False;checkpoint()
+def rollback_plain_dir(home,source,uid,state,legacy,checkpoint):
+    """Remove the plain `~/.codex` only when this journal proves it owns it.
+
+    Runs even when no auth was moved: an apply may have created the steady plain
+    directory, and reporting rollback success over a root-owned leftover keeps
+    Gate G failing. A pre-existing user-owned directory is left untouched, and an
+    unprovable root-owned directory is refused rather than deleted.
+    """
+    record=state.get('plainDir') or {}
+    if not os.path.lexists(source):
+        # Validate (and clean) any recorded temp first: a refusal must stay
+        # read-only, so the right is retired only after this check passes.
+        recover_plain_temps(home,state)
+        # Nothing left to recover: the one-shot legacy right must not survive
+        # this successful step and authorize a later, unrelated directory.
+        if legacy:
+            state['plainDirLegacy']=False;checkpoint()
+        return
+    s=source.lstat()
+    need(stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode),'unsafe ~/.codex before rollback')
+    ours=record.get('ino')==s.st_ino and record.get('dev')==s.st_dev
+    adopt=bool(not ours and legacy and root_plain_shape(s,source,uid))
+    if not (ours or adopt):
+        need(s.st_uid==uid,'unsafe ~/.codex before rollback')
+        recover_plain_temps(home,state)  # validate before any write: refusals stay read-only
+        if legacy:
+            # The legacy artifact is gone (a user-owned steady dir replaced it);
+            # never keep the one-shot right for whatever appears next.
+            state['plainDirLegacy']=False;checkpoint()
+        return  # pre-existing steady directory, not ours
+    need(not any(source.iterdir()),'~/.codex is not empty; refusing to overwrite')
+    need(not (source/'auth.json').exists(),'auth must not live in ~/.codex')
+    recover_plain_temps(home,state)
+    if legacy:
+        # Bind the inode and retire the shape-based right *before* the unlink, so
+        # a crash here is still recoverable by identity and a directory that
+        # appears later can never be adopted by shape.
+        state['plainDir']={'dev':s.st_dev,'ino':s.st_ino,'uid':uid,'published':True,'adopted':True}
+        state['plainDirLegacy']=False;checkpoint()
+    source.rmdir();_fsync_dir(home)
 def migrate_login(home, profile, state, checkpoint):
     need(not state.get('loginRollbackIntent'),'login rollback in progress; finish rollback before installing')
+    # Freeze (and persist) ownership evidence from the journal as loaded: this
+    # run's own loginLayout write must never become proof for a pre-existing dir.
+    if 'plainDirTxn' not in state:
+        state['plainDirLegacy']=plain_legacy(state);state['plainDirTxn']=2;checkpoint()
+    legacy=bool(state.get('plainDirLegacy'))
     source,dest = login_paths(home,profile); uid=home.stat().st_uid
     for p in [home/'.oc-remote-codex',home/'.oc-remote-codex/profiles',dest.parent]: safe_dir(p,uid,0o700)
     layout,identity=login_layout(home,profile,state)
@@ -110,7 +257,7 @@ def migrate_login(home, profile, state, checkpoint):
     # Only a journal-owned move may later be rolled back; a rerun over the steady layout is a no-op.
     state['loginMoved']=bool(state.get('loginIntent'))
     sync_login_dirs(source,dest);checkpoint()
-    plain_login_dir(source,uid)
+    plain_login_dir(source,uid,state,checkpoint,legacy)
     sync_login_dirs(source,dest)
     os.chmod(dest,0o700)
     os.chmod(dest/'auth.json',0o600)
@@ -118,7 +265,14 @@ def migrate_login(home, profile, state, checkpoint):
     checkpoint()
 def rollback_login(home,profile,state,checkpoint):
     source,dest=login_paths(home,profile);uid=home.stat().st_uid
-    if not state.get('loginIntent'):return  # auth was never moved by this transaction
+    # Read-only: a refused rollback must not write the frozen decision or journal.
+    legacy=plain_legacy(state)
+    if not state.get('loginIntent'):
+        # No auth was moved by this transaction, but a crashed apply may have created
+        # the steady plain ~/.codex (and a temp dir before publish). Recover from disk
+        # instead of returning success over an installer-owned leftover.
+        rollback_plain_dir(home,source,uid,state,legacy,checkpoint)
+        return
     # Every precondition is read-only: a refused rollback must not dirty the journal
     # (a stray rollback intent would block the next installation).
     layout,_=login_layout(home,profile,state)
@@ -133,13 +287,27 @@ def rollback_login(home,profile,state,checkpoint):
             need(not os.path.lexists(dest) or not (dest/'auth.json').exists(),'canonical login still holds auth; rollback incomplete')
     else:
         need(layout=='moved','login rollback requires the steady layout')
-        # ~/.codex may be our plain 0700 dir, or absent because it was deleted on-site.
+        # ~/.codex may be our plain 0700 dir, an interrupted mkdir-before-chown
+        # (root-owned, empty, 0700), or absent because it was deleted on-site.
         if os.path.lexists(source):
             s=source.lstat()
-            need(stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode) and s.st_uid==uid,'unsafe ~/.codex before rollback')
+            need(stat.S_ISDIR(s.st_mode) and not stat.S_ISLNK(s.st_mode),'unsafe ~/.codex before rollback')
+            record=state.get('plainDir') or {}
+            ours=record.get('ino')==s.st_ino and record.get('dev')==s.st_dev
+            legacy=bool(legacy and s.st_uid!=uid and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o700)
+            need(s.st_uid==uid or ours or legacy,'unsafe ~/.codex before rollback')
             need(not any(source.iterdir()),'~/.codex is not empty; refusing to overwrite')
+    # Recover crash-left temporary directories before the first journal write; a
+    # refusal here (non-empty/unexpected entry) leaves the journal untouched.
+    recover_plain_temps(home,state)
     if not state.get('loginRollbackIntent'):
         state['loginRollbackIntent']=True; checkpoint()
+    if layout=='moved' and legacy and os.path.lexists(source):
+        # Same rule as the no-auth path: retire the one-shot shape right by
+        # binding the inode before the directory is removed.
+        s=source.lstat()
+        state['plainDir']={'dev':s.st_dev,'ino':s.st_ino,'uid':uid,'published':True,'adopted':True}
+        state['plainDirLegacy']=False;checkpoint()
     if layout in ('original','linked'):
         state['loginRollbackIntent']=False;state['loginMoved']=False;checkpoint()
         return
@@ -180,8 +348,12 @@ def main(packet):
     with open(root/'lock','a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         ident=packet['controller']; need(re.fullmatch('[a-f0-9]{64}',ident),'invalid controller digest')
-        journal=root/(ident+'.json')
-        state=json.loads(journal.read_text()) if journal.exists() else {'version':1,'controller':ident,'files':{}}
+        journal=root/(ident+'.json'); existed=journal.exists()
+        state=json.loads(journal.read_text()) if existed else {'version':1,'controller':ident,'files':{}}
+        # Mark transactions started by this installer; journals from the older
+        # installer lack it and are the only ones allowed to recover the legacy
+        # final-path mkdir/chown artifact.
+        if not existed and packet['action']=='apply':state['plainDirTxn']=2
         save=lambda: atomic(journal,json.dumps(state,sort_keys=True).encode())
         if packet['action']=='rollback':
             idle(home)
