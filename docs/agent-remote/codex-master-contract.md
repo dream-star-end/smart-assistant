@@ -39,6 +39,10 @@ No generic SSH command or native config is accepted.
   thread/start/resume/read and turn/start/interrupt grammar. Master fixes the model and the node
   independently pins sandbox/policy/catalog. Text-only, supported efforts only; no Fast/image claims.
   Native thread response is bound to the original persisted baseline before a turn is dispatched.
+  One admission claims that thread boundary exactly once: a resident node reused by the next turn
+  binds before its kernel answers, and a kernel that restarts inside the admitted turn re-attaches
+  to the same thread, so the later attach proves the same thread and reuses the recorded baseline
+  instead of claiming the boundary again (the finance turn owns a one-shot claim).
 - `/poll`: `afterSeq`. Retained frames are acknowledged by the next sequence cursor; bounded output.
 - `/baseline`: returns the current output `seq`. A container that restarts its kernel **inside** an
   admitted turn (route change) continues after the frames already published; it never re-renders

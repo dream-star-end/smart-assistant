@@ -286,6 +286,9 @@ test('an admission abandoned before dispatch frees its journal, thread claim and
   const turnB=await port.admit(second.admit)
   await turnB.beforeHostStart()
   assert.deepEqual(await turnB.bindNativeThread!('thread-abandon-746',false),zeroNativeTokens())
+  // The boundary is a one-shot claim for this turn: the relay may re-attach the same thread inside
+  // the admission (kernel restart), but it must reuse the recorded baseline, never bind twice.
+  await assert.rejects(turnB.bindNativeThread!('thread-abandon-746',false),/REMOTE_NATIVE_BILLING_REJECTED/)
   await turnB.beforeDispatch({sequence:1,inputSha256:second.turnKey})
   const total={inputTokens:1000,cachedInputTokens:500,cacheWriteInputTokens:0,outputTokens:100,reasoningOutputTokens:60}
   const receipt=buildCodexReceipt(binding,{authorityTurnId:second.auth,turnKey:second.turnKey,upstreamModel:upstream,

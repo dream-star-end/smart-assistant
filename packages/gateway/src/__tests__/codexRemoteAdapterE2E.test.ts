@@ -226,10 +226,17 @@ async function lane(t: TestContext, options: {
     admit: async () => {
       const held = admissionHold
       if (held) await held
+      // The real port claims a thread boundary once per finance turn and rejects a second claim,
+      // so the double enforces the same contract instead of hiding a rebind behind a friendly port.
+      let bound = false
       return {
         beforeHostStart: async () => {},
         beforeDispatch: async () => {},
-        bindNativeThread: async () => threadTotal,
+        bindNativeThread: async () => {
+          if (bound) throw new Error('REMOTE_NATIVE_BILLING_REJECTED')
+          bound = true
+          return threadTotal
+        },
         // The real port closes the journal row and the thread claim by identity; the double only
         // has to answer with proof, and can be parked to model a late ACK.
         abandonUndispatched: async () => {
@@ -1055,4 +1062,3 @@ test('a node that dies mid-turn leaves no container effect and no replay', { tim
   assert.equal(h.receipts.length, 0)
   assert.equal((await h.call('/tool/next')).status, 403)
 })
-

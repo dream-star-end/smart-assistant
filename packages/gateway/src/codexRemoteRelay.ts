@@ -63,6 +63,8 @@ export class CodexRemoteRelay {
   private catalogHash?: string
   private admitted?: { authority: string; lease: string; payload: ModelAuthorityPayload; turnKey: string }
   private financeTurn?: RemoteFinanceTurn
+  /** The one native thread boundary this admission's finance turn has claimed, with its baseline. */
+  private boundThread?: { id: string; baseline: CodexNativeTokens }
   private baseline?: CodexNativeTokens
   private total?: CodexNativeTokens
   private thread?: string
@@ -150,6 +152,7 @@ export class CodexRemoteRelay {
     this.usedIds.clear()
     this.epoch++
     this.turnHostAttempted = false; this.dispatching = false; this.financeTurn = undefined
+    this.boundThread = undefined
     this.financeTurn = await this.finance.admit({ binding: this.binding, authorityEnvelope: v.authority,
       leaseEnvelope: v.lease, sessionKey: this.binding.sessionKey, turnKey: v.turnKey })
     this.admitted = { authority: v.authority, lease: v.lease, payload: a, turnKey: v.turnKey }
@@ -172,11 +175,29 @@ export class CodexRemoteRelay {
       codexNeed(!this.revoked)
       await this.openApp()
     } else if (this.thread) {
-      codexNeed(this.financeTurn.bindNativeThread)
-      this.baseline = await this.financeTurn.bindNativeThread(this.thread, false)
+      this.baseline = await this.bindThread(this.thread, false)
     }
     codexNeed(!this.revoked)
     this.starting = false; this.active = true
+  }
+  /**
+   * One admission claims one native thread boundary, exactly once: the finance port's bind records
+   * the thread baseline and rejects a second claim for the same turn. A kernel that restarts inside
+   * the admitted turn re-attaches to the same thread (`thread/resume`), so a later attach proves it
+   * is that thread and reuses the recorded baseline instead of claiming the boundary again. A
+   * different thread for the same admitted turn is not billable and fences.
+   */
+  private async bindThread(id: string, newlyCreated: boolean): Promise<CodexNativeTokens> {
+    const finance = this.financeTurn
+    codexNeed(finance?.bindNativeThread !== undefined)
+    if (this.boundThread) {
+      codexNeed(this.boundThread.id === id, 'CODEX_THREAD_REBIND_MISMATCH')
+      return this.boundThread.baseline
+    }
+    const baseline = await finance.bindNativeThread!(id, newlyCreated)
+    codexNeed(!this.revoked && this.financeTurn === finance)
+    this.boundThread = { id, baseline }
+    return baseline
   }
   private identity(row: any): void {
     for (const k of ['operationId','runId','generation','profileId','authEpoch'] as const) codexNeed(row[k] === this.spec.manifest[k])
@@ -264,8 +285,7 @@ export class CodexRemoteRelay {
         codexNeed(typeof id === 'string' && frame.result.model === this.spec.manifest.model &&
           (!this.spec.manifest.nativeThreadId || id === this.spec.manifest.nativeThreadId))
         this.observation!.bindThread(id); this.thread = id
-        codexNeed(this.financeTurn?.bindNativeThread)
-        this.baseline = await this.financeTurn.bindNativeThread(id, entry.method === 'thread/start')
+        this.baseline = await this.bindThread(id, entry.method === 'thread/start')
         await this.onThread(id)
       }
     }
