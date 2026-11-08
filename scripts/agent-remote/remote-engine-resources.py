@@ -167,9 +167,10 @@ def snapshot(engine, scopes, rows):
     ok = (node_committed + budget + c['headroom'] <= node_budget
           and engine_committed + budget + c['headroom'] <= c['max']
           and current + budget + c['headroom'] <= c['max']
-          and free >= budget + c['headroom']
-          and engine_tasks + len(scopes)*128 <= c['tasks'])
-    return {'memoryOk':ok,'code':None if ok else MEMORY_ERROR,
+          and free >= budget + c['headroom'])
+    tasks_ok = engine_tasks + len(scopes)*128 <= c['tasks']
+    code = MEMORY_ERROR if not ok else ('REMOTE_NODE_TASKS_EXHAUSTED' if not tasks_ok else None)
+    return {'memoryOk':ok and tasks_ok,'code':code,
             'activeSessions':sum(r['kind']=='lane' for r in engine_rows),
             'nodeBudgetBytes':node_budget,'committedBytes':node_committed,'newBudgetBytes':budget,
             'memAvailableBytes':free,'sliceMemoryCurrent':current}
@@ -177,7 +178,7 @@ def snapshot(engine, scopes, rows):
 
 class MemoryExhausted(RuntimeError):
     def __init__(self, status):
-        super().__init__(MEMORY_ERROR)
+        super().__init__(status['code'])
         self.status = status
 
 

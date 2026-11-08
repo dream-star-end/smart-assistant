@@ -1,4 +1,4 @@
-import { nodeMemoryError } from './remoteNodeMemory.js'
+import { nodeMemoryError, isRemoteResourceCode } from './remoteNodeMemory.js'
 /** Task-only live-web transport. No CLI, provider credentials or remote shell here. */
 import { createHash } from 'node:crypto'
 import {
@@ -253,7 +253,7 @@ export function cc5ControlRequest(
           if (res.statusCode !== 200) {
             try {
               const error = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-              if (error.error === 'REMOTE_NODE_MEMORY_EXHAUSTED') return reject(nodeMemoryError(error.activeSessions))
+              if (isRemoteResourceCode(error.error)) return reject(nodeMemoryError(error.activeSessions, error.error))
             } catch { /* Untrusted errors retain the fixed generic label. */ }
             return reject(new Error('CC5_CONTROL_REJECTED'))
           }

@@ -1,3 +1,4 @@
+import { isRemoteResourceCode, type RemoteResourceCode } from './remoteNodeMemory.js'
 /** Trusted master/node contract. Transport never interprets a container command as SSH argv. */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { lstatSync } from 'node:fs'
@@ -15,7 +16,7 @@ export interface CodexLaneSpec {
 export interface CodexPreflight {
   memoryOk: boolean
   /** Fixed node label when admission refuses; never a synthesized cause. */
-  code?: 'REMOTE_NODE_MEMORY_EXHAUSTED'
+  code?: RemoteResourceCode
   /** Sessions of this engine already running on the node, as observed by the node itself. */
   activeSessions: number
 }
@@ -96,9 +97,9 @@ export class CodexSshHost implements CodexHostPort {
     const row = await this.control('preflight')
     codexNeed(row?.version === 1 && row.engine === 'codex' && row.kind === 'preflight' &&
       typeof row.memoryOk === 'boolean' && Number.isSafeInteger(row.activeSessions) && row.activeSessions >= 0 &&
-      (row.memoryOk === true || row.code === 'REMOTE_NODE_MEMORY_EXHAUSTED'))
+      (row.memoryOk === true || isRemoteResourceCode(row.code)))
     return { memoryOk: row.memoryOk, activeSessions: row.activeSessions,
-      ...(row.memoryOk ? {} : { code: 'REMOTE_NODE_MEMORY_EXHAUSTED' as const }) }
+      ...(row.memoryOk ? {} : { code: row.code as RemoteResourceCode }) }
   }
   async provision(tools: unknown): Promise<void> {
     codexNeed(!this.opened.size && !this.revoked)

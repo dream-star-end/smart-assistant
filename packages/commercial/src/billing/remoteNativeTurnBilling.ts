@@ -643,7 +643,7 @@ export function createRemoteNativeTurnFinance(
         // A pinned node's pre-exec resource rejection plus independent stop proof is a zero-effect
         // boundary, even though the durable 'attempted' marker was correctly written beforehand.
         if (value.nodeAdmissionRejected && !c.native && !inputAttempted) {
-          await prehostAbort('INTERNAL_ERROR', true, 'REMOTE_NODE_MEMORY_EXHAUSTED')
+          await prehostAbort('INTERNAL_ERROR', true, value.nodeAdmissionReason ?? 'REMOTE_NODE_MEMORY_EXHAUSTED')
           return
         }
         if (value.hostStartAttempted) return

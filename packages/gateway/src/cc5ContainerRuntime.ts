@@ -170,6 +170,9 @@ interface Lane {
   readonly relay: Cc5Relay | CodexRemoteRelay
   binding: Readonly<RemoteBridgeBinding>
   stopping?: Promise<void>
+  /** Preparation may reset/provision remotely before the relay attempts a model launch. */
+  preparationStop?: () => Promise<unknown>
+  creationFailed?: boolean
 }
 interface ContainerState {
   readonly handle: Cc5PreparedContainer
@@ -315,7 +318,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       isCc5CanonicalModel(request.canonicalModel))
     const owner = this.chat(request.sessionKey)
     const live = (lane: Lane | undefined): lane is Lane => !!lane && lane.container === container &&
-      !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
+      !lane.creationFailed && !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
       lane.binding.expiresAt > Date.now() &&
       (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1')
     // A resident lane answers without waiting; anything else is decided on the chat's tail.
@@ -379,6 +382,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
   private async startLane(container: ContainerState, request: RemoteLaneRequest,
     placement: RemoteLanePlacement): Promise<Lane> {
     if (request.engine === 'codex') return this.startCodexLane(container, request, placement)
+    let lane: Lane | undefined
+    try {
     requireLane(!placement.codex)
     const dir = join(container.root, 'lanes', placement.operationId)
     const view = join(container.handle.mountSource, placement.operationId)
@@ -396,7 +401,6 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     }
     const createHost = this.options.hostFactory ?? ((config: Cc5SshHostConfig) => new Cc5SshHost(config))
     const host = createHost(hostConfig)
-    await host.prepareTask(placement.provisionPacket)
     const binding: Readonly<RemoteBridgeBinding> = Object.freeze({
       version: 2,
       backendKind: CC5_INTERACTIVE_BACKEND,
@@ -429,33 +433,43 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       // A stale cached catalog replaces the remote without re-running task provisioning.
       replaceHost: () => createHost(hostConfig),
     })
-    const lane: Lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
+    lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
       operationId: placement.operationId, generation: placement.generation ?? '1', dir, view, binding, relay }
-    try {
-      await this.listen(relay.toolServer, toolSocketPath, 0, 0)
+    lane.preparationStop = () => host.stop()
+    await host.prepareTask(placement.provisionPacket)
+    lane.preparationStop = undefined
+    await this.listen(relay.toolServer, toolSocketPath, 0, 0)
       await this.listen(relay.controlServer, join(view, 'relay.sock'), 1000, 1000)
+    return lane
     } catch (error) {
-      await this.stopLane(lane).catch(() => {})
+      if (lane) {
+        lane.creationFailed = true
+        try { await this.stopLane(lane) }
+        catch { this.chat(request.sessionKey).lane = lane } // owner survives for proof retry
+      } else {
+        // No remote action is possible before the lane owns its preparation stop boundary.
+        await this.hooks.onState?.(placement.operationId, 'released', placement.generation)
+        rmSync(join(container.handle.mountSource, placement.operationId), { recursive: true, force: true })
+      }
       throw error
     }
-    return lane
   }
 
   private async startCodexLane(container: ContainerState, request: RemoteLaneRequest, placement: RemoteLanePlacement): Promise<Lane> {
+    let lane: Lane | undefined
+    const view = join(container.handle.mountSource, placement.operationId)
+    try {
     requireLane(placement.codex && placement.generation && this.hooks.onNativeThread && this.hooks.onRemoteStart &&
       /^[1-9][0-9]{0,15}$/.test(placement.generation))
     const spec = placement.codex
     requireLane(spec.manifest.operationId === placement.operationId && spec.manifest.runId === placement.runId &&
       spec.manifest.generation === placement.generation && request.canonicalModel === `${spec.manifest.model}-remote`)
-    const view = join(container.handle.mountSource, placement.operationId)
     const dir = join(this.options.evidenceRoot ?? join(this.options.baseRoot, 'evidence'), placement.operationId, placement.generation)
     // Durable evidence is never erased by adopt/release. A repeated generation is an unknown effect, not a reset.
     requireLane(!existsSync(dir) && !existsSync(view))
     const host = new CodexSshHost(placement.target,spec)
-    let lane: Lane | undefined
-    try {
     const preflight = await host.preflight()
-    if (!preflight.memoryOk) throw nodeMemoryError(preflight.activeSessions)
+    if (!preflight.memoryOk) throw nodeMemoryError(preflight.activeSessions, preflight.code)
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     mkdirSync(view, { mode: 0o750 }); chownSync(view, 0, 1000); chmodSync(view, 0o750)
     const binding: CodexRemoteBinding = Object.freeze({ version:3,backendKind:'codex-app-server-v1',
@@ -473,7 +487,10 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     await this.listen(relay.controlServer,join(view,'relay.sock'),1000,1000)
     return lane
     } catch (error) {
-      if (lane) await this.stopLane(lane).catch(() => {})
+      if (lane) {
+        lane.creationFailed = true
+        try { await this.stopLane(lane) } catch { this.chat(request.sessionKey).lane = lane }
+      }
       else {
         // No endpoint/host was exposed. The persistent remote-start CAS remains false.
         rmSync(view, { recursive: true, force: true })
@@ -488,6 +505,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     lane.stopping = (async () => {
       let proven = false
       try {
+        await lane.preparationStop?.()
+        lane.preparationStop = undefined
         proven = (await lane.relay.stop()).remoteStopped === true
       } catch {
         proven = false

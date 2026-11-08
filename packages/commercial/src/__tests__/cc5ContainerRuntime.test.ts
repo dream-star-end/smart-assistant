@@ -16,6 +16,7 @@ import {
   type RemoteLaneHooks,
   type RemoteLanePlacement,
   cc5ControlRequest,
+  CodexSshHost,
   createRemoteLaneRuntime,
 } from '@openclaude/gateway/cc5-container-runtime'
 import type { RemoteFinanceFactory } from '@openclaude/gateway/remote-finance'
@@ -39,7 +40,7 @@ const financeFactory: RemoteFinanceFactory = () => ({ async admit() { return {
 } } })
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
 
-function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string; holdPrepare?: Promise<void> } = {}) {
+function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string; holdPrepare?: Promise<void>; enforcePlacementState?: boolean } = {}) {
   const dir = options.baseRoot ? undefined : mkdtempSync('/tmp/cl-')
   const baseRoot = options.baseRoot ?? join(dir!, 'r')
   const key = generateKeyPairSync('ed25519')
@@ -49,9 +50,12 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
   const hosts: Array<{ input: PassThrough; written: Buffer[]; operationId: string }> = []
   const places: Array<Record<string, unknown>> = []
   const placements = new Map<string, RemoteLanePlacement>()
+  const persisted = new Map<string, string>()
   const hooks: RemoteLaneHooks = {
     async place(request) {
+      if (options.enforcePlacementState && persisted.get(request.sessionKey) !== undefined && persisted.get(request.sessionKey) !== 'released') throw new Error('REMOTE_LANE_STOP_UNPROVEN')
       places.push({ ...request })
+      persisted.set(request.sessionKey, 'preparing')
       // Sticky like placeRemoteLane: one task root and operation per chat.
       let placement = placements.get(request.sessionKey)
       if (!placement) {
@@ -67,7 +71,7 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
       }
       return { ...placement, target: { ...placement.target, upstreamModel: request.canonicalModel.replace(/-remote$/, '') } }
     },
-    onState(operationId, state) { states.push([operationId, state]) },
+    onState(operationId, state) { states.push([operationId, state]); for (const [key, value] of placements) if (value.operationId === operationId) persisted.set(key, state) },
   }
   const runtime = createRemoteLaneRuntime({
     selfhost: true, env, financeFactory, hooks,
@@ -285,7 +289,7 @@ test('a node that cannot be prepared fails the turn without leaving a lane behin
     await assert.rejects(f.lane(), (error: Error) =>
       error.message === 'REMOTE_LANE_UNAVAILABLE' && (error.cause as Error).message === 'fixture node unreachable')
     assert.deepEqual(readdirSync(handle.mountSource), ['authority-public.json'])
-    assert.deepEqual(f.states, [])
+    assert.equal(f.states.at(-1)?.[1], 'released')
   } finally {
     await f.cleanup()
   }
@@ -415,6 +419,8 @@ test('Codex creation failures release unexposed placement; failed running write 
     const key=generateKeyPairSync('ed25519'), keyPath=join(dir,'key'), knownHostsPath=join(dir,'hosts')
     writeFileSync(keyPath,'fixture',{mode:0o600}); writeFileSync(knownHostsPath,'fixture',{mode:0o600})
     let attempts=0
+    const preflight = CodexSshHost.prototype.preflight
+    CodexSshHost.prototype.preflight = async () => ({memoryOk:true,activeSessions:0})
     const runtime=createRemoteLaneRuntime({selfhost:true,env,
       financeFactory:()=>{if(failure==='finance')throw new Error('finance unavailable');return {admit:async()=>{throw new Error('must not admit')}}},
       configuration:()=>({baseRoot:join(dir,'runtime'),controllerPath:'/unused'}),hooks:{
@@ -435,9 +441,34 @@ test('Codex creation failures release unexposed placement; failed running write 
       const ensure=()=>runtime.ensureLane({uid:912,containerDbId:'91',sessionKey:SESSION,canonicalModel:'gpt-6-luna-remote',engine:'codex'})
       await assert.rejects(ensure(),/REMOTE_LANE_UNAVAILABLE/)
       assert.equal(states.at(-1),'released',failure)
+      if (failure === 'running') assert.ok(states.includes('running'),'must reach the intended state-write fault')
       assert.deepEqual(readdirSync(handle.mountSource),['authority-public.json'])
       await assert.rejects(ensure(),/REMOTE_LANE_UNAVAILABLE/)
       assert.equal(attempts,2,'failed running callback must not leave a reusable owner')
-    } finally { await runtime.release('91');rmSync(dir,{recursive:true,force:true}) }
+    } finally { CodexSshHost.prototype.preflight = preflight; await runtime.release('91');rmSync(dir,{recursive:true,force:true}) }
+  }
+})
+
+
+test('R1 prepare failure closes persistent placement; unproved stop occupies until proof then same chat retries', {skip: !root}, async () => {
+  for (const unknown of [false, true]) {
+    const options = {failPrepare: true, failStop: unknown, enforcePlacementState: true}
+    const f = fixture(options)
+    try {
+      await f.container()
+      await assert.rejects(f.lane(), /REMOTE_LANE_UNAVAILABLE/)
+      assert.equal(f.states.at(-1)?.[1], unknown ? 'unknown' : 'released')
+      if (unknown) {
+        options.failPrepare = false
+        await assert.rejects(f.lane(), /REMOTE_LANE_UNAVAILABLE/)
+        assert.equal(f.places.length, 1, 'no second placement before stop proof')
+      }
+      options.failStop = false
+      options.failPrepare = false
+      const recovered = await f.lane()
+      assert.ok(recovered.operationId)
+      assert.equal(f.states.at(-1)?.[1], 'running')
+      assert.equal(f.places.length, 2)
+    } finally { await f.cleanup() }
   }
 })

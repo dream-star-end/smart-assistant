@@ -2,12 +2,14 @@
 -- OCV5-746. Additive readers first; no Codex offer/readiness is enabled here.
 -- Apply 0334 before this file in a release. Test fixtures may execute this DDL in isolation.
 -- Existing CC rows, receipts and hashes are not rewritten. Unknown bindings retain their slots.
+-- compat: the new node column defaults to 1, satisfying its CHECK; old node inserts omit it.
 ALTER TABLE remote_agent_nodes ADD COLUMN shared_active_cap INTEGER NOT NULL DEFAULT 1 CHECK(shared_active_cap BETWEEN 1 AND 64);
 ALTER TABLE remote_agent_profiles
   ADD COLUMN probe_snapshot JSONB,
   ADD COLUMN execution_manifest JSONB,
   ADD COLUMN execution_ready BOOLEAN NOT NULL DEFAULT FALSE,
   ADD COLUMN auth_epoch TEXT;
+-- compat: old binding writes omit the new fields; engine defaults to cc and satisfies the new CHECK, with all existing encodings unchanged.
 ALTER TABLE remote_agent_bindings
   ADD COLUMN engine TEXT NOT NULL DEFAULT 'cc' CHECK (engine IN ('cc','codex')),
   ADD COLUMN backend_kind TEXT NOT NULL DEFAULT 'cc5-interactive-v1',

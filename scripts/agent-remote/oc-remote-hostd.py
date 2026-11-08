@@ -152,7 +152,7 @@ def engine_resources():
     import types
     source = pathlib.Path(__file__).resolve().with_name('remote-engine-resources.py')
     data = source.read_bytes()
-    if hashlib.sha256(data).hexdigest() != '66083b5913581789232d8ec3535427cc1aef34601f0e4b2c6fee6534af9e2feb':
+    if hashlib.sha256(data).hexdigest() != 'b3d05e9215e1e232fd959dd94580e9bc4371b2a5098d6634a460a3af0ae66a14':
         raise RuntimeError('REMOTE_RESOURCE_BUNDLE_MISMATCH')
     module = types.ModuleType('remote_engine_resources'); module.__file__ = str(source)
     exec(compile(data, str(source), 'exec'), module.__dict__)

@@ -10,7 +10,10 @@ import { parseCapabilityProfile } from '../billing/modelCatalog.js'
 import { projectCodexRemoteCapabilities } from '../account-pool/codexRemoteProfile.js'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { Pool } from 'pg'
+import { PassThrough } from 'node:stream'
+import { createRemoteLaneRuntime } from '@openclaude/gateway/cc5-container-runtime'
 import { setPoolOverride, closePool } from '../db/index.js'
+import { runMigrations } from '../db/migrate.js'
 import { resetAndMigrateBefore } from './helpers/db.js'
 import { placeRemoteLane, recordRemoteLaneState, recordRemoteStartAttempt, applyRemoteNodeProbeResult, publishRemoteModelOffers } from '../account-pool/remoteBrainPool.js'
 import { createRemoteNativeTurnFinance, recoverRemoteNativeTurnBilling } from '../billing/remoteNativeTurnBilling.js'
@@ -35,8 +38,8 @@ before(async () => {
   assert.match((await pool.query('SELECT current_database() AS db')).rows[0].db, /_test$/)
   setPoolOverride(pool)
   await resetAndMigrateBefore('0334')
-  await pool.query(readFileSync(new URL('../db/migrations/0335_codex_remote_native.sql',import.meta.url),'utf8'))
-  await pool.query(readFileSync(new URL('../db/migrations/0337_remote_engine_concurrency.sql',import.meta.url),'utf8'))
+  const applied = await runMigrations()
+  assert.deepEqual(applied.applied, ['0334_users_registration_ip','0335_codex_remote_native','0336_commercial_muse_durable','0337_remote_engine_concurrency'])
   uid = (await pool.query(`INSERT INTO users(email,password_hash,credits) VALUES('codex746@example.test','test-only',100000) RETURNING id::text`)).rows[0].id
   await pool.query(`INSERT INTO agent_containers(id,user_id,secret_hash) VALUES(7,$1,$2)`,[uid,Buffer.alloc(32,1)])
   node = (await pool.query(`INSERT INTO remote_agent_nodes(label,ssh_host,ssh_user,host_key_fp,key_id,controller_sha256,status)
@@ -326,12 +329,99 @@ test('an admission abandoned before dispatch frees its journal, thread claim and
   assert.deepEqual(usage[0].price_snapshot.remote_native.nativeUsage,total)
   assert.equal((await pool.query('SELECT pending_request_id FROM remote_native_threads WHERE operation_id=$1',
     [binding.operationId])).rows[0].pending_request_id,null)
-  const refused = await issue('memory746')
+  for (const reason of ['REMOTE_NODE_MEMORY_EXHAUSTED','REMOTE_NODE_TASKS_EXHAUSTED'] as const) {
+  const refused = await issue(reason)
   const refusedTurn = await port.admit(refused.admit)
   await refusedTurn.beforeHostStart()
-  await refusedTurn.stop({hostStartAttempted:true,userSubmitted:false,remoteStopped:true,nodeAdmissionRejected:true})
+  await refusedTurn.stop({hostStartAttempted:true,userSubmitted:false,remoteStopped:true,nodeAdmissionRejected:true,nodeAdmissionReason:reason})
   const rejected = (await pool.query(`SELECT state,final_credits::text,failure_code,error_msg FROM request_finalize_journal WHERE request_id=$1`,[refused.label])).rows[0]
-  assert.deepEqual(rejected,{state:'aborted',final_credits:'0',failure_code:'INTERNAL_ERROR',error_msg:'REMOTE_NODE_MEMORY_EXHAUSTED'})
+  assert.deepEqual(rejected,{state:'aborted',final_credits:'0',failure_code:'INTERNAL_ERROR',error_msg:reason})
   assert.equal((await pool.query('SELECT COUNT(*)::int n FROM usage_records WHERE request_id=$1',[refused.label])).rows[0].n,0)
+  }
 
+})
+
+
+test('R1 missing Codex profiles withdraw exclusive models; surviving ready supplier remains routable', async () => {
+  const manifest = {version:1,backendKind:'codex-app-server-v1',authEpoch:'epoch1',snapshotSha256:probe.snapshot_sha256,
+    controllerSha256:controllerSha,gatewayRevision:'codex-remote-adapter-v1',e2eReceiptSha256:'d'.repeat(64),installed:true,text:true}
+  const profile = (name:string) => ({...probe,engine:'codex' as const,profile_name:name,account_fingerprint:name,
+    runner_mode:'app-server',logged_in:true,discovered_models:[{upstream_model_id:upstream,display_name:'Fixture Luna'}]})
+  for (const surviving of [false,true]) {
+    await pool.query(`UPDATE remote_agent_profiles SET execution_ready=TRUE,status='active',disabled_by=NULL,
+      probe_snapshot=$2::jsonb,execution_manifest=$3::jsonb WHERE id=$1`,[codex,JSON.stringify(probe),JSON.stringify(manifest)])
+    const other=(await pool.query(`INSERT INTO remote_agent_profiles(node_id,engine,profile_name,account_fingerprint,runner_mode,
+      probe_snapshot,execution_ready,auth_epoch,execution_manifest)
+      VALUES($1,'codex','r1-other','r1-other','app-server',$2::jsonb,$3,'epoch1',$4::jsonb)
+      ON CONFLICT(node_id,engine,profile_name) DO UPDATE SET execution_ready=EXCLUDED.execution_ready,
+        status='active',probe_snapshot=EXCLUDED.probe_snapshot,execution_manifest=EXCLUDED.execution_manifest RETURNING id`,
+      [node,JSON.stringify(probe),surviving,JSON.stringify(manifest)])).rows[0].id
+    await pool.query(`INSERT INTO remote_model_offers(profile_id,upstream_model_id,canonical_model_id,base_display_name)
+      VALUES($1,$2,$3,'Fixture Luna') ON CONFLICT DO NOTHING`,[other,upstream,model])
+    await publishRemoteModelOffers({profile_id:codex,allowActivateExecution:true,offers:[{upstream_model_id:upstream,base_display_name:'Fixture Luna'}]},pool)
+    assert.equal((await pool.query(`SELECT COUNT(*)::int n FROM model_catalog WHERE model_id=$1 AND state='active'`,[model])).rows[0].n,1,'publication positive control')
+    await applyRemoteNodeProbeResult(node,{profiles:[profile('r1-other')]},pool)
+    assert.equal((await pool.query('SELECT execution_ready FROM remote_agent_profiles WHERE id=$1',[codex])).rows[0].execution_ready,false)
+    const row=(await pool.query(`SELECT state FROM model_catalog WHERE model_id=$1 AND state<>'retired'`,[model])).rows[0]
+    assert.equal(row.state,surviving?'active':'disabled')
+    const place=()=>placeRemoteLane({uid:Number(uid),containerDbId:'7',dockerId:'a'.repeat(64),
+      sessionKey:`agent:main:webchat:dm:r1missing${surviving}`,canonicalModel:model,engine:'codex'},{pool})
+    if (surviving) {const lane=await place();assert.equal(lane.profileId,String(other));await recordRemoteLaneState(lane.operationId,'released',pool,lane.generation)}
+    else await assert.rejects(place(),/NO_ELIGIBLE_REMOTE_PROFILE/)
+    // Entire engine absent, not just a missing named profile.
+    await applyRemoteNodeProbeResult(node,{profiles:[{engine:'grok-build',profile_name:'r1-grok',
+      account_fingerprint:'r1-grok',runner_mode:'interactive',logged_in:true,
+      discovered_models:[{upstream_model_id:'grok-fixture',display_name:'Fixture'}]}]},pool)
+    assert.equal((await pool.query(`SELECT state FROM model_catalog WHERE model_id=$1 AND state<>'retired'`,[model])).rows[0].state,'disabled')
+  }
+})
+
+
+test('complete migration chain preserves old users/Muse writes and records exact ordered versions', async () => {
+  const applied=(await pool.query(`SELECT version FROM schema_migrations WHERE version > '0333_remote_agent_pool' ORDER BY version`)).rows.map(r=>r.version)
+  assert.deepEqual(applied,['0334_users_registration_ip','0335_codex_remote_native','0336_commercial_muse_durable','0337_remote_engine_concurrency'])
+  const user=(await pool.query(`INSERT INTO users(email,password_hash) VALUES('r1-old-writer@example.test','fixture') RETURNING id,registration_ip`)).rows[0]
+  assert.equal(user.registration_ip,null)
+  const id=`mj_${randomUUID()}`
+  await pool.query(`INSERT INTO muse_media_jobs(id,user_id,kind,prompt_sha256,prompt_preview,params,status)
+    VALUES($1,$2,'video',$3,'old writer','{}','running')`,[id,user.id,Buffer.alloc(32)])
+  const result=await pool.query(`UPDATE muse_media_jobs SET status='failed',error_code='MUSE_MASTER_RESTARTED'
+    WHERE id=$1 RETURNING status,durable,delivery_attempts`,[id])
+  assert.deepEqual(result.rows,[{status:'failed',durable:null,delivery_attempts:0}])
+})
+
+
+test('R1 PG prepare failure then same-chat retry frees exactly one slot; unknown proof keeps it occupied', {skip: process.getuid?.() !== 0}, async () => {
+  for (const unproven of [false,true]) {
+    const root=mkdtempSync('/tmp/rl-')
+    const sessionKey=`agent:main:webchat:dm:r1prepare${unproven}`
+    let failPrepare=true,failStop=unproven
+    const runtime=createRemoteLaneRuntime({selfhost:true,
+      env:{OC_SELFHOST_CC5_T1555U_ENABLED:'1',OC_SELFHOST_CC5_T1555U_TEST_UID:uid},
+      financeFactory:()=>({admit:async()=>{throw new Error('must not start model')}}),
+      hooks:{place:request=>placeRemoteLane(request,{pool,packet:async()=>Buffer.from('fixture')}),
+        onState:(op,state,generation)=>recordRemoteLaneState(op,state,pool,generation)},
+      configuration:()=>({baseRoot:join(root,'r'),controllerPath:'/unused',hostFactory:()=>({
+        prepareTask:async()=>{if(failPrepare)throw new Error('transient preparation failure')},
+        start:()=>({stdin:new PassThrough(),stdout:new PassThrough(),ready:Promise.resolve()}),
+        stop:async()=>{if(failStop)throw new Error('stop unproven');return {remoteStopped:true as const}},
+      })}),
+    })!
+    const ensure=()=>runtime.ensureLane({uid:Number(uid),containerDbId:'7',sessionKey,canonicalModel:'claude-sonnet-5-remote'})
+    const rows=async()=> (await pool.query(`SELECT state,generation FROM remote_agent_bindings WHERE uid=$1 AND session_key=$2`,[uid,sessionKey])).rows
+    try {
+      const key=generateKeyPairSync('ed25519')
+      const handle=(await runtime.prepare({uid:Number(uid),containerDbId:'7',local:true,publicKeyring:`fixture-key:${key.publicKey.export({format:'jwk'}).x}`}))!
+      await runtime.bindCreated(handle,'a'.repeat(64));await runtime.activate(handle,'a'.repeat(64))
+      await assert.rejects(ensure(),/REMOTE_LANE_UNAVAILABLE/)
+      assert.equal((await rows())[0].state,unproven?'unknown':'released')
+      if(unproven){await assert.rejects(ensure(),/REMOTE_LANE_UNAVAILABLE/);assert.equal((await rows())[0].state,'unknown')}
+      failPrepare=false;failStop=false
+      const recovered=await ensure();assert.ok(recovered.operationId)
+      const occupied=(await rows()).filter(r=>r.state!=='released')
+      assert.equal(occupied.length,1);assert.equal(occupied[0].state,'running')
+      await runtime.release('7')
+      assert.equal((await rows()).filter(r=>r.state!=='released').length,0)
+    } finally {failStop=false;await runtime.release('7');rmSync(root,{recursive:true,force:true})}
+  }
 })

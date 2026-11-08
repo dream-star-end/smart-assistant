@@ -20,7 +20,7 @@ import time
 import tempfile
 import types
 
-PINNED = {'oc-remote-hostd.py': '1333e64508ff2468e654e9bb0e2cec722cdde97c3822b689957c103cb5e6c069', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
+PINNED = {'oc-remote-hostd.py': '304f22eb46ba990081334fbee12c7de81db686957f196d994c53f43b9c7d4377', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
 CLI = Path('/usr/bin/codex')
 NATIVE = Path('/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
 MAX_FRAME = 2 * 1024 * 1024
@@ -515,7 +515,7 @@ def launch(root,m,h):
         finally: selector.close()
     except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
         code=str(exc)
-        if code=='REMOTE_NODE_MEMORY_EXHAUSTED':
+        if code in ('REMOTE_NODE_MEMORY_EXHAUSTED','REMOTE_NODE_TASKS_EXHAUSTED'):
             emit('error',code=code,activeSessions=exc.status['activeSessions'],admission=exc.status)
         else:
             emit('error',code=code if re.fullmatch(r'CODEX_[A-Z_]+',code) else 'CODEX_POLICY_REJECTED')
@@ -570,7 +570,7 @@ if __name__=='__main__':
     os.umask(0o077)
     try: sys.exit(main())
     except (ValueError,OSError,KeyError,TypeError,RuntimeError,subprocess.SubprocessError) as exc:
-        if str(exc)=='REMOTE_NODE_MEMORY_EXHAUSTED':
+        if str(exc) in ('REMOTE_NODE_MEMORY_EXHAUSTED','REMOTE_NODE_TASKS_EXHAUSTED'):
             print(json.dumps({'version':1,'engine':'codex','kind':'error','code':str(exc),
                               'activeSessions':exc.status['activeSessions'],'admission':exc.status}),flush=True)
         sys.stderr.write('CODEX_NODE_REJECTED_OR_STOP_UNKNOWN\n'); sys.exit(126)

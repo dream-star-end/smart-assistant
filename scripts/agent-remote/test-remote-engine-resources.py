@@ -67,6 +67,15 @@ class Resources(unittest.TestCase):
         os.environ['OC_REMOTE_NODE_MEMORY_BUDGET']=str(2000*M)
         r.admit('probe','codex','one',{'oc-codex-probe.scope':512*M},kind='probe')
         self.assertEqual(len(r.records()),2)
+    def test_tasks_exhaustion_keeps_old_claim_and_reports_tasks_not_memory(self):
+        with patch.dict(os.environ,{'OC_REMOTE_CODEX_TASKS_MAX':'128'}):
+            self.admit('a')
+            with self.assertRaises(RuntimeError) as rejected:self.admit('b')
+            self.assertEqual(str(rejected.exception),'REMOTE_NODE_TASKS_EXHAUSTED')
+            self.assertEqual([row['key'] for row in r.records()],['codex-a'])
+        with patch.dict(os.environ,{'OC_REMOTE_CODEX_TASKS_MAX':'256'}):
+            self.admit('b')
+            self.assertEqual(len(r.records()),2)
     def test_unknown_scope_stop_cannot_release_claim(self):
         self.admit('a')
         with patch.object(r,'state',return_value={'ActiveState':'active','ControlGroup':'/still-running'}):

@@ -1,4 +1,4 @@
-import { nodeMemoryError } from './remoteNodeMemory.js'
+import { nodeMemoryError, isRemoteResourceCode } from './remoteNodeMemory.js'
 /** Container-side relay client for one Codex remote lane. No credentials, no model transport. */
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
 import { request } from 'node:http'
@@ -123,7 +123,7 @@ export function codexControlRequest(
           if (res.statusCode !== 200) {
             try {
               const error = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-              if (error.error === 'REMOTE_NODE_MEMORY_EXHAUSTED') return reject(nodeMemoryError(error.activeSessions))
+              if (isRemoteResourceCode(error.error)) return reject(nodeMemoryError(error.activeSessions, error.error))
             } catch { /* Untrusted errors retain the fixed generic label. */ }
             return reject(new Error('CODEX_CONTROL_REJECTED'))
           }
@@ -160,6 +160,7 @@ export class CodexRelayClient {
   readonly bindingId: string
   readonly canonicalModel: string
   private stopped = false
+  private stopping?: Promise<void>
   private startSeq = 0
   private lastTool: { request: Record<string, unknown>; authority: string; lease: string; turnKey: string } | undefined
   constructor(
@@ -255,10 +256,11 @@ export class CodexRelayClient {
   }
   /** Lane stop. The master relay requires a prior local `/tool/stopped` proof. */
   async stop(): Promise<void> {
-    if (this.stopped) return
     this.stopped = true
-    const reply = await this.call('/stop', this.scope())
-    codexNeed(reply.remoteStopped === true, 'CODEX_REMOTE_STOP_UNPROVEN')
+    return this.stopping ??= (async () => {
+      const reply = await this.call('/stop', this.scope())
+      codexNeed(reply.remoteStopped === true, 'CODEX_REMOTE_STOP_UNPROVEN')
+    })().catch(error => { this.stopping = undefined; throw error })
   }
   get closed(): boolean { return this.stopped }
   get lastDelivery(): CodexRelayClient['lastTool'] { return this.lastTool }

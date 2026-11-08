@@ -505,3 +505,113 @@ test('node memory rejection crosses the real Unix stream boundary, with zero use
     assert.equal(frames,0);assert.equal(stops,1)
   } finally {stdin.destroy();server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()))}
 })
+test('runCc5StdioBridge resets reconnect quota after frame progress so >2 transient drops over a session succeed while 3 consecutive drops without progress fail', async () => {
+  const socketPath = `\0cc5-test-reconnect-reset-${randomUUID()}`
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const frames = [
+    Buffer.from('{"type":"assistant","message":{"content":"frame-1"}}\n'),
+    Buffer.from('{"type":"assistant","message":{"content":"frame-2"}}\n'),
+    Buffer.from('{"type":"assistant","message":{"content":"frame-3"}}\n'),
+    Buffer.from('{"type":"assistant","message":{"content":"frame-4"}}\n'),
+  ]
+  const opens: Array<{ generation?: number; lastAckedSeq?: number }> = []
+  const outputChunks: Buffer[] = []
+  const controller = new AbortController()
+  let receivedFrames = 0
+
+  stdout.on('data', (chunk: Buffer) => {
+    outputChunks.push(Buffer.from(chunk))
+    receivedFrames += chunk.toString('utf8').split('\n').filter(Boolean).length
+    if (receivedFrames === frames.length) {
+      setImmediate(() => controller.abort())
+    }
+  })
+
+  const server = createServer((req, res) => {
+    if (req.url === '/stop') {
+      req.resume()
+      res.end(JSON.stringify({ ok: true, remoteStopped: true }))
+      return
+    }
+    let buf = ''
+    req.on('error', () => {})
+    req.on('data', (chunk) => {
+      buf += chunk.toString()
+      if (!buf.includes('\n')) return
+      const opening = JSON.parse(buf.split('\n')[0]!) as { generation?: number; lastAckedSeq?: number }
+      buf = ''
+      opens.push({ generation: opening.generation, lastAckedSeq: opening.lastAckedSeq })
+      res.writeHead(200, { 'x-cc5-interactive-ready': '1' })
+      res.flushHeaders()
+      const idx = opens.length - 1
+      res.write(frames[idx]!)
+      if (idx < frames.length - 1) {
+        setTimeout(() => res.destroy(), 20)
+      }
+    })
+  })
+  server.listen(socketPath)
+  await once(server, 'listening')
+
+  const running = runCc5StdioBridge({
+    binding,
+    sessionKey: binding.sessionKey,
+    stdin,
+    stdout,
+    socketPath,
+    signal: controller.signal,
+  })
+  try {
+    await running
+    assert.deepEqual(opens, [
+      { generation: 1, lastAckedSeq: undefined },
+      { generation: 2, lastAckedSeq: 1 },
+      { generation: 3, lastAckedSeq: 2 },
+      { generation: 4, lastAckedSeq: 3 },
+    ])
+    assert.deepEqual(Buffer.concat(outputChunks), Buffer.concat(frames))
+  } finally {
+    controller.abort()
+    await running.catch(() => {})
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  // Consecutive drops without any complete frame progress still bound retries at 2 and fail with CC5_OUTPUT_DELIVERY_UNKNOWN
+  const failSocketPath = `\0cc5-test-reconnect-bound-${randomUUID()}`
+  const failOpens: number[] = []
+  const failServer = createServer((req, res) => {
+    if (req.url === '/stop') {
+      req.resume()
+      res.end(JSON.stringify({ ok: true, remoteStopped: true }))
+      return
+    }
+    req.on('error', () => {})
+    req.once('data', () => {
+      failOpens.push(failOpens.length + 1)
+      res.writeHead(200, { 'x-cc5-interactive-ready': '1' })
+      res.flushHeaders()
+      res.write('{"partial_without_newline":')
+      setTimeout(() => res.destroy(), 15)
+    })
+  })
+  failServer.listen(failSocketPath)
+  await once(failServer, 'listening')
+  try {
+    await assert.rejects(
+      runCc5StdioBridge({
+        binding,
+        sessionKey: binding.sessionKey,
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        socketPath: failSocketPath,
+      }),
+      /CC5_OUTPUT_DELIVERY_UNKNOWN/,
+    )
+    assert.deepEqual(failOpens, [1, 2, 3])
+  } finally {
+    failServer.closeAllConnections()
+    await new Promise<void>((resolve) => failServer.close(() => resolve()))
+  }
+})

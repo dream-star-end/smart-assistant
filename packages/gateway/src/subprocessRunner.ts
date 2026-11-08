@@ -575,32 +575,14 @@ export class SubprocessRunner extends EventEmitter {
     try {
     if (this.opts.cc5BridgePort) {
       // The remote model gets what a local chat gets: this prompt, and tools from these files run here.
-      const learning = await this.buildLearningContext(null)
+      const { learning, profile, env: laneEnv } = await this.prepareRemoteToolContext()
       const laneCwd = learning.workingDir ?? this.opts.agentBaseDir
       const laneProfile = resolve(this.sessionDir!, 'lane-profile.json')
       writeFileSync(laneProfile, JSON.stringify({
         version: 1,
         platformPrompt: learning.extraPromptFile ? readFileSync(learning.extraPromptFile, 'utf8') : '',
-        host: { cwd: laneCwd, mcpConfigPath: learning.mcpConfigFile ?? null,
-          settingsPath: learning.settingsFile ?? null, disallowedTools: [...CCB_LANE_DISALLOWED_TOOLS] },
+        host: profile,
       }), { mode: 0o600, flag: 'wx' })
-      // The container tool host runs tools with a local chat's environment, minus model credentials.
-      const laneEnv: Record<string, string> = {}
-      for (const [key, value] of Object.entries(process.env)) {
-        if (value !== undefined && !CC5_LANE_CREDENTIAL_ENV.test(key)) laneEnv[key] = value
-      }
-      Object.assign(laneEnv, {
-        OC_SESSION_KEY: this.opts.sessionKey,
-        OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
-        OPENCLAUDE_AGENT_ID: this.opts.agentId,
-        OC_AGENT_ID: this.opts.agentId,
-        OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile ?? '',
-        ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway?.port),
-        ...identityCompatEnvironment(this.opts.identityCompat),
-        IS_SANDBOX: '1',
-        CLAUDE_CODE_DISABLE_CRON: '1',
-        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-      })
       spawnOpts = await this.opts.cc5BridgePort.prepare({ cwd: laneCwd, laneProfile, env: laneEnv })
       this._boundRepoBinding = null
       this.spawnedUpstreamIsEgress = false
@@ -1649,7 +1631,42 @@ export class SubprocessRunner extends EventEmitter {
   // Writes temp files under /tmp/openclaude-<sessionKey>-XXXXXX/:
   //   extra-prompt.md   — USER.md content + skill metadata digest
   //   mcp-config.json   — MCP server pointing at @openclaude/mcp-memory
-  private async buildLearningContext(repoSnapshot: RepoSnapshot | null = null): Promise<{
+  /** Shared container-only tool context. This does not spawn a model or contact the remote node.
+   * Keep it alive until the host's process group has a verified stop proof. */
+  async prepareRemoteToolContext() {
+    const learning = await this.buildLearningContext(null, true)
+    if (!learning.mcpConfigFile || !learning.settingsFile) {
+      this.cleanupSessionDir()
+      throw new Error('CC5_TOOL_CONTEXT_UNAVAILABLE')
+    }
+    // The container tool host runs tools with a local chat's environment, minus model credentials.
+    const laneEnv: Record<string, string> = {}
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined && !CC5_LANE_CREDENTIAL_ENV.test(key)) laneEnv[key] = value
+    }
+    Object.assign(laneEnv, {
+      OC_SESSION_KEY: this.opts.sessionKey,
+      OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
+      OPENCLAUDE_AGENT_ID: this.opts.agentId,
+      OC_AGENT_ID: this.opts.agentId,
+      OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile ?? '',
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway?.port),
+      ...identityCompatEnvironment(this.opts.identityCompat),
+      IS_SANDBOX: '1',
+      CLAUDE_CODE_DISABLE_CRON: '1',
+      CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+    })
+    return {
+      learning,
+      profile: { cwd: learning.workingDir ?? this.opts.agentBaseDir,
+        mcpConfigPath: learning.mcpConfigFile, settingsPath: learning.settingsFile,
+        disallowedTools: [...CCB_LANE_DISALLOWED_TOOLS] },
+      env: laneEnv,
+      cleanup: () => this.cleanupSessionDir(),
+    }
+  }
+
+  private async buildLearningContext(repoSnapshot: RepoSnapshot | null = null, toolOnly = false): Promise<{
     extraPromptFile?: string
     mcpConfigFile?: string
     settingsFile?: string
@@ -1742,7 +1759,7 @@ export class SubprocessRunner extends EventEmitter {
     let mcpLaunch: ReturnType<typeof resolveMcpMemoryLaunch> = null
     try {
       mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
-        fallback: 'npx-tsx',
+        fallback: toolOnly ? 'node-tsx' : 'npx-tsx',
       })
     } catch (err) {
       runnerLog.warn(

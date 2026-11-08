@@ -281,8 +281,8 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
       // Do not expose raw stderr; only this exact pinned-controller admission record is public.
       errorBuffer = (errorBuffer + chunk.toString('utf8')).slice(-16384)
       for (const line of errorBuffer.split('\n').slice(0,-1)) {
-        const match = /^REMOTE_NODE_MEMORY_EXHAUSTED activeSessions=([0-9]{1,4})$/.exec(line)
-        if (match) this.fail(nodeMemoryError(Number(match[1])))
+        const match = /^(REMOTE_NODE_MEMORY_EXHAUSTED|REMOTE_NODE_TASKS_EXHAUSTED) activeSessions=([0-9]{1,4})$/.exec(line)
+        if (match) this.fail(nodeMemoryError(Number(match[2]), match[1] as 'REMOTE_NODE_MEMORY_EXHAUSTED' | 'REMOTE_NODE_TASKS_EXHAUSTED'))
       }
       errorBuffer = errorBuffer.slice(errorBuffer.lastIndexOf('\n') + 1)
     })
@@ -559,7 +559,11 @@ export class Cc5SshHost implements Cc5InteractiveHostPort {
     this.rejectReady(new Error(FAILED))
     this.input.unpipe()
     this.input.destroy()
-    this.stopPromise = this.stopOnce()
+    this.stopPromise = this.stopOnce().catch((error) => {
+      // Keep execution fenced, but a recovered transport may obtain a fresh independent proof.
+      this.stopPromise = undefined
+      throw error
+    })
     return this.stopPromise
   }
   private async stopOnce(): Promise<{ remoteStopped: true }> {

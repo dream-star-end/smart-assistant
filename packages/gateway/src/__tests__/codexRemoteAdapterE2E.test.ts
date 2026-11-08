@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -106,6 +106,8 @@ interface Lane {
 async function lane(t: TestContext, options: {
   /** Fixtures only: shorten the 30-minute rolling window so a renewal is observable. */
   leaseRenewAfterMs?: number
+  platformTools?: boolean
+  closeFailure?: { active: boolean }
 } = {}): Promise<Lane> {
   const root = mkdtempSync(join(tmpdir(), 'codex-container-e2e-'))
   const cwd = join(root, 'cwd')
@@ -113,6 +115,16 @@ async function lane(t: TestContext, options: {
   mkdirSync(cwd)
   mkdirSync(home)
   // The real host runs the real CLI: isolate it from this container's own config, as cc5ToolHost.test does.
+  const previousPlatformHome = process.env.OPENCLAUDE_HOME
+  process.env.OPENCLAUDE_HOME = home
+  const agentId = options.platformTools ? 'coding-assistant' : 'main'
+  if (options.platformTools) {
+    for (const [agent, body] of [['coding-assistant','R1_AGENT_PRIVATE_SKILL_BODY'], ['main','WRONG_MAIN_BODY']]) {
+      const dir = join(home, 'agents', agent!, 'skills', 'r1-private')
+      mkdirSync(dir, {recursive:true})
+      writeFileSync(join(dir, 'SKILL.md'), `---\nname: r1-private\ndescription: private R1 verification\n---\n${body}\n`)
+    }
+  }
   const previousHome = process.env.HOME
   const previousConfig = process.env.CLAUDE_CONFIG_DIR
   process.env.HOME = home
@@ -120,7 +132,7 @@ async function lane(t: TestContext, options: {
   const now = Date.now()
   const binding: CodexRemoteBinding = {
     version: 3, backendKind: 'codex-app-server-v1', uid: '3', containerDbId: '7', dockerId: 'a'.repeat(64),
-    operationId: randomUUID(), runId: randomUUID(), sessionKey: 'agent:main:webchat:dm:codex_container_e2e',
+    operationId: randomUUID(), runId: randomUUID(), sessionKey: `agent:${agentId}:webchat:dm:codex_container_e2e`,
     canonicalModel: 'gpt-6-luna-remote', generation: '1', profileId: 'default', authEpoch: 'epoch1',
     manifestSha256: 'a'.repeat(64), capability: 'b'.repeat(64), expiresAt: now + 600000,
   }
@@ -281,7 +293,9 @@ async function lane(t: TestContext, options: {
   const executionRoot = join(root, 'tools')
   const adapter = new CodexRemoteAdapter({
     sessionKey: binding.sessionKey,
-    agentId: 'main',
+    agentId,
+    config: { version: 1, gateway: { bind: '127.0.0.1', port: 9, accessToken: 'fixture-token' },
+      auth: {mode:'subscription',claudeCodePath:''}, channels:{webchat:{enabled:false}}, sessions:{dbPath:''}, defaults:{model:binding.canonicalModel,permissionMode:'bypassPermissions'} },
     agentBaseDir: cwd,
     model: binding.canonicalModel,
     effortLevel: 'low',
@@ -290,13 +304,16 @@ async function lane(t: TestContext, options: {
     binding, socketPath: sock, keyring: keys, executionRoot, renewLease,
     ...(options.leaseRenewAfterMs === undefined ? {} : { leaseRenewAfterMs: options.leaseRenewAfterMs }),
     // The real host, with a wrapper that counts effects the container actually performed.
-    hostFactory: (toolRoot, lifecycleId, profile) => {
+    hostFactory: (toolRoot, lifecycleId, profile, env) => {
       const inner = new Cc5ToolHost(toolRoot, lifecycleId, profile, async () => {
         throw new Error('CODEX_REMOTE_PERMISSION_UNSUPPORTED')
-      })
+      }, env)
       return {
         tools: () => inner.tools(),
-        close: () => inner.close(),
+        close: async () => {
+          await inner.close()
+          if (options.closeFailure?.active) throw new Error('FIXTURE_STOP_PROOF_LOST')
+        },
         execute: (name, args, identity) => {
           executed.push({ name, args })
           return inner.execute(name, args, identity)
@@ -338,7 +355,7 @@ async function lane(t: TestContext, options: {
     generation: binding.generation, callId, nativeThreadId: THREAD, nativeTurnId: turnId,
     server: 'ocbridge', name: 'Write', arguments: args, inputSha256: cc5ToolInputSha256(args),
   })
-  const until = async (predicate: () => boolean | Promise<boolean>, label: string, attempts = 600) => {
+  const until = async (predicate: () => boolean | Promise<boolean>, label: string, attempts = 2000) => {
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (await predicate()) return
       await pause(20)
@@ -346,6 +363,8 @@ async function lane(t: TestContext, options: {
     assert.fail(`timed out waiting for ${label}`)
   }
   t.after(async () => {
+    if (previousPlatformHome === undefined) delete process.env.OPENCLAUDE_HOME
+    else process.env.OPENCLAUDE_HOME = previousPlatformHome
     if (previousHome === undefined) delete process.env.HOME
     else process.env.HOME = previousHome
     if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
@@ -1062,4 +1081,77 @@ test('a node that dies mid-turn leaves no container effect and no replay', { tim
   assert.equal(existsSync(h.sentinel), false)
   assert.equal(h.receipts.length, 0)
   assert.equal((await h.call('/tool/next')).status, 403)
+})
+
+
+test('R1 read-only and consult turns reject before admission: no container Write or node launch', async (t) => {
+  const h = await lane(t)
+  for (const restriction of [{readOnly: true}, {consultTurn: true}]) {
+    const signed = h.authority('readonly')
+    assert.throws(() => h.adapter.submitTurn({...h.turnParams(signed, h.turnKey, 'readonly'), ...restriction} as TurnParams),
+      /CODEX_REMOTE_READ_ONLY_UNSUPPORTED/)
+    assert.equal(existsSync(h.sentinel), false)
+    assert.equal(h.executed.length, 0)
+    assert.equal(h.launches, 0)
+    assert.equal(h.receipts.length, 0)
+  }
+})
+
+test('R1 cancel then shutdown proves resident node and local host stopped', {timeout: 90000}, async (t) => {
+  const h = await lane(t)
+  const run = h.adapter.submitTurn(h.turnParams(h.authority('shutdown-after-cancel'), h.turnKey, 'shutdown-after-cancel'))
+  await h.until(() => h.received('launch').some(row => row?.received?.method === 'turn/start'), 'turn start')
+  assert.equal(h.adapter.interrupt(), true)
+  await h.until(() => h.received('launch').some(row => row?.received?.method === 'turn/interrupt'), 'interrupt')
+  h.emit({method:'thread/tokenUsage/updated',params:h.tokenUsage(TURNS[0]!,zeroNativeTokens(),zeroNativeTokens())})
+  h.emit({method:'turn/completed',params:{threadId:THREAD,turn:{id:TURNS[0],status:'interrupted'}}})
+  assert.equal((await run.summary)?.isError, true)
+  await h.adapter.shutdown()
+  assert.equal(h.relay.stopped, true)
+  await h.until(() => h.child('launch').exitCode !== null || h.child('launch').signalCode !== null, 'resident process exit')
+  assert.ok(h.child('tool-socket').exitCode !== null || h.child('tool-socket').signalCode !== null)
+})
+
+
+test('R1 platform MCP reads the selected non-main agent private skill through the real container host', {timeout: 120000}, async (t) => {
+  const h = await lane(t, {platformTools:true})
+  const run = h.adapter.submitTurn(h.turnParams(h.authority('mcp-skill'), h.turnKey, 'mcp-skill'))
+  await h.until(() => h.received('launch').some(row => row?.received?.method === 'turn/start'), 'turn start', 2000)
+  const call = async (name: string, args: Record<string, unknown>, id: string) => {
+    const count = h.toolResponses().length
+    h.nativeItem('item/started',{type:'mcpToolCall',id,server:'ocbridge',tool:name,arguments:args})
+    h.sendTool({...h.toolRequest(id,args),name})
+    await h.until(() => h.toolResponses().length > count, 'MCP result', 2000)
+    h.nativeItem('item/completed',{type:'mcpToolCall',id,server:'ocbridge',tool:name,arguments:args})
+    return JSON.stringify(h.toolResponses().at(-1))
+  }
+  const found = await call('SearchExtraTools',{query:'select:mcp__openclaude-memory__skill_view'},'mcp-search')
+  assert.match(found,/skill_view/)
+  const result = await call('ExecuteExtraTool',{tool_name:'mcp__openclaude-memory__skill_view',params:{name:'r1-private'}},'mcp-view')
+  assert.match(result,/R1_AGENT_PRIVATE_SKILL_BODY/)
+  assert.doesNotMatch(result,/WRONG_MAIN_BODY/)
+  const context = await call('Bash', {command: 'printf "%s|%s|%s" "$OPENCLAUDE_AGENT_ID" "$OC_AGENT_ID" "$OPENCLAUDE_SESSION_KEY"'}, 'context-check')
+  assert.ok(context.includes(`coding-assistant|coding-assistant|${h.binding.sessionKey}`))
+  h.emit({method:'thread/tokenUsage/updated',params:h.tokenUsage(TURNS[0]!,zeroNativeTokens(),zeroNativeTokens())})
+  h.emit({method:'turn/completed',params:{threadId:THREAD,turn:{id:TURNS[0],status:'completed'}}})
+  assert.equal((await run.summary)?.isError,false)
+})
+
+
+test('R1 unproved retired tool host prevents successful shutdown until its proof is available', {timeout:120000}, async (t) => {
+  const closeFailure = {active:false}
+  const h = await lane(t,{closeFailure})
+  const run=h.adapter.submitTurn(h.turnParams(h.authority('close-proof'),h.turnKey,'close-proof'))
+  await h.until(()=>h.received('launch').some(row=>row?.received?.method==='turn/start'),'turn start')
+  closeFailure.active=true
+  h.adapter.interrupt()
+  await h.until(()=>h.received('launch').some(row=>row?.received?.method==='turn/interrupt'),'interrupt')
+  h.emit({method:'thread/tokenUsage/updated',params:h.tokenUsage(TURNS[0]!,zeroNativeTokens(),zeroNativeTokens())})
+  h.emit({method:'turn/completed',params:{threadId:THREAD,turn:{id:TURNS[0],status:'interrupted'}}})
+  assert.equal((await run.summary)?.isError,true)
+  await assert.rejects(h.adapter.shutdown(),/CODEX_|FIXTURE_/)
+  assert.throws(()=>h.adapter.submitTurn(h.turnParams(h.authority('no-reuse'), 'e'.repeat(64),'no-reuse')),/CODEX_LOCAL_STOP_UNPROVEN/)
+  closeFailure.active=false
+  await h.adapter.shutdown()
+  assert.deepEqual(await h.relay.stop(),{remoteStopped:true})
 })

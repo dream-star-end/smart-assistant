@@ -45,7 +45,7 @@ export interface Cc5FinanceTurn {
   beforeDispatch(input: { readonly sequence: number; readonly inputSha256: string }): Promise<void>
   /** Prove the existing settlement before any original terminal bytes reach the browser. */
   terminal(receipt: Cc5NativeTerminalReceipt): Promise<Cc5FinanceTerminalOutcome>
-  stop(input: { nodeAdmissionRejected?: boolean;
+  stop(input: { nodeAdmissionRejected?: boolean; nodeAdmissionReason?: 'REMOTE_NODE_MEMORY_EXHAUSTED' | 'REMOTE_NODE_TASKS_EXHAUSTED';
     readonly hostStartAttempted: boolean
     readonly userSubmitted: boolean
     readonly remoteStopped: boolean

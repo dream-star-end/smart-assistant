@@ -18,7 +18,7 @@ const fs = require('node:fs');
 const {createHash} = require('node:crypto');
 const [role, raw] = process.argv.slice(1); const c = JSON.parse(raw);
 if (role === 'tool-socket') {
-  if (c.memoryRefused) { process.stderr.write('REMOTE_NODE_MEMORY_EXHAUSTED activeSessions=2\n',()=>process.exit(126)); return; }
+  if (c.memoryRefused) { process.stderr.write((c.resourceCode || 'REMOTE_NODE_MEMORY_EXHAUSTED')+' activeSessions=2\n',()=>process.exit(126)); return; }
   if (c.socketExit) process.exit(21);
   if (c.badSocketFrame) process.stdout.write(JSON.stringify({version:2,kind:'not-socket-ready'})+'\n');
   setTimeout(() => {
@@ -603,4 +603,33 @@ test('pinned node memory refusal preserves Chinese cause/count and never launche
       error.activeSessions===2 && error.message.includes('远端节点内存不足'))
     assert.equal(f.roles.includes('launch'),false)
   } finally { await f.cleanup() }
+})
+
+
+test('tasks refusal keeps the exact cause across SSH stderr and does not start a worker', async () => {
+  const f=fixture({memoryRefused:true,resourceCode:'REMOTE_NODE_TASKS_EXHAUSTED'},{stopMs:1000})
+  try {
+    await assert.rejects(f.host.prepare(),(error:any)=>error.code==='REMOTE_NODE_TASKS_EXHAUSTED' &&
+      error.activeSessions===2 && error.message.includes('进程/线程额度不足') && !error.message.includes('内存不足'))
+    assert.equal(f.roles.includes('launch'),false)
+  } finally { await f.cleanup() }
+})
+
+
+test('R1 failed stop proof can be independently retried without reopening execution', async () => {
+  const options = { failControl: true }
+  const f = fixture(options, { stopMs: 3000, controlMs: 1000 })
+  try {
+    await f.start().ready
+    await assert.rejects(f.host.stop(), /CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN/)
+    const calls = f.roles.length
+    options.failControl = false
+    assert.deepEqual(await f.host.stop(), { remoteStopped: true })
+    assert.ok(f.roles.slice(calls).includes('prove-stopped'))
+    assert.throws(() => f.host.start(), /CC5_INTERACTIVE_SSH_FAILED_OR_UNKNOWN/)
+    assert.equal(f.roles.filter(role => role === 'launch').length, 1)
+  } finally {
+    options.failControl = false
+    await f.cleanup()
+  }
 })

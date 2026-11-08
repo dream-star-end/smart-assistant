@@ -155,21 +155,34 @@ there is no Codex legacy format or TTL clearing.
 
 ## Migration/verification boundary
 
-`0335_codex_remote_native.sql` is additive and defaults readiness off. **0334_users_registration_ip
-must be merged/applied first**. Tests replay through 0333 then execute 0335 in an explicit `_test`
-isolated PG; that is DDL/behavior evidence, NOT evidence the absent dependency was applied in production.
-Native financial tables are permanent anti-replay ledgers in the retention registry.
+The selfhost migration chain now includes the **original SQL** of commercial migrations
+`0334_users_registration_ip` (ab7e0489e) and `0336_commercial_muse_durable` (f5a768db6), not their
+feature code. Only per-statement compatibility comments were added to satisfy the selfhost CI gate;
+removing those new comments restores the source bytes exactly. Existing claims remain `0335_codex_remote_native → 0334_users_registration_ip` and
+`0337_remote_engine_concurrency → 0336_commercial_muse_durable`; no renumbering or dummy migration.
+The imported `none` comments describe those original commercial release lines, not permission to
+skip dependencies in this integrated tree. Order: selfhost 0333 → 0334 → 0335 → 0336 → 0337.
+All four are registered as required. Tests replay the mainline schema through 0333 and use the
+**production migration runner** for all four, including exact applied-version order and old users/Muse
+writes. Readiness stays off by default; old writers leave new nullable fields null. No production
+migration is authorized by this change. Native financial tables remain permanent anti-replay ledgers.
 
-Segment 4 adds `0337_remote_engine_concurrency.sql`, explicitly after
-`0336_commercial_muse_durable`. This worktree lacks 0336: the integration tests execute the schema
-subset through 0333, 0335 and 0337, NOT the complete release migration chain. Integrate the real
-0334/0336 dependencies before publishing; do not fabricate migrations or remove dependency gates.
+R1 lifecycle contract: preparation failures keep a generation-specific stop owner until proof;
+unknown stops keep their slot. Missing Codex profiles (including an entirely absent engine) revoke
+readiness and withdraw only models with no remaining eligible offer. A resident relay owns the
+single native initialize handshake; reattached container kernels receive only its proven response.
+Container tool hosts share the CC context builder (MCP/settings/session/agent/delegate context,
+model credentials removed). That configuration stays in the container. Read-only/consult turns
+are rejected before tool-host/admission because this remote adapter does not yet support them.
+Retired local hosts and the lane control connection survive kernel recycle until both local and
+remote stop proofs pass; unavailable proof is an error, never successful shutdown.
 
-Node memory rejection is `REMOTE_NODE_MEMORY_EXHAUSTED` + bounded `activeSessions`, mapped to
+Node resource rejection distinguishes `REMOTE_NODE_MEMORY_EXHAUSTED` (memory) from
+`REMOTE_NODE_TASKS_EXHAUSTED` (process/thread budget), each with bounded `activeSessions`. Memory maps to
 “远端节点内存不足，当前底座已有 N 个会话在跑（本次未计费）”. Only the trusted startup boundary,
 independent remoteStopped proof and absence of input/native effect can close the journal at zero:
-`aborted`, `final_credits=0`, no usage, existing `failure_code=INTERNAL_ERROR`, exact
-`error_msg=REMOTE_NODE_MEMORY_EXHAUSTED`. Arbitrary stderr is never forwarded. Unknown stopping
+`aborted`, `final_credits=0`, no usage, existing `failure_code=INTERNAL_ERROR`, exact resource label in
+`error_msg` (memory or tasks). Tasks exhaustion says “进程/线程额度不足”, never “内存不足”. Arbitrary stderr is never forwarded. Unknown stopping
 keeps the reservation fenced/pending instead of fabricating a zero-use terminal.
 
 Tests: protocol union signing; two real child transports + real Unix HTTP + actual marker write;

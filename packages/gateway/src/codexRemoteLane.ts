@@ -25,7 +25,7 @@ import {
   compileCc5ToolCatalog,
 } from './cc5ToolCatalog.js'
 import { readCc5AuthorityKeyring } from './cc5BridgePort.js'
-import { CCB_PLATFORM_DISALLOWED_TOOLS } from './subprocessSpawnConfig.js'
+import { SubprocessRunner } from './subprocessRunner.js'
 import {
   type renewTurnLease,
   RenewTurnLeaseError,
@@ -86,6 +86,8 @@ interface LaneGeneration {
   /** One host per generation, built once even when several turns race to need it. */
   toolsRun?: Promise<Cc5ToolCatalog>
   pumpRun?: Promise<void>
+  closeRun?: Promise<void>
+  cleanupContext?: () => void
 }
 
 /**
@@ -111,7 +113,7 @@ interface LaneTurn {
 export interface CodexRemoteLaneOptions {
   /** Fixtures only: production hosts tools under the persistent uid-local root. */
   executionRoot?: string
-  hostFactory?: (root: string, lifecycleId: string, profile: Cc5HostProfile) => LaneToolHost
+  hostFactory?: (root: string, lifecycleId: string, profile: Cc5HostProfile, env: NodeJS.ProcessEnv) => LaneToolHost
   /** Fixtures only: production reads the supervisor-owned binding, socket and keyring. */
   binding?: Readonly<CodexRemoteBinding>
   socketPath?: string
@@ -136,6 +138,8 @@ export class CodexRemoteLane {
   private readonly binding: Readonly<CodexRemoteBinding>
   private readonly socketPath: string
   private generation?: LaneGeneration
+  private control?: CodexRelayClient
+  private readonly generations = new Set<LaneGeneration>()
   private catalog?: Cc5ToolCatalog
   private toolNames: Readonly<Record<string, string>> = {}
   private admitted?: CodexAdmittedIdentity
@@ -203,6 +207,8 @@ export class CodexRemoteLane {
     )
     const child = new CodexRelayChild(client, { onFrame: (frame) => this.feed(frame) })
     const generation: LaneGeneration = { client, child, abort: new AbortController() }
+    this.control = client
+    this.generations.add(generation)
     // A generation spawned inside an admitted turn (the kernel restarts its app-server on a route
     // change) inherits that turn's gate, skips the frames this turn already produced, and — see
     // activate() — must also serve this turn's tool calls.
@@ -372,7 +378,7 @@ export class CodexRemoteLane {
     owner?.stopLease?.()
   }
 
-  private async startHost(): Promise<LaneToolHost> {
+  private async startHost(generation: LaneGeneration): Promise<LaneToolHost> {
     privateDir(this.executionRoot)
     // One host per kernel generation: the supervisor claims its profile with O_EXCL, so a host
     // recycled behind an interrupt must land in a fresh root, never reuse the old one.
@@ -380,17 +386,17 @@ export class CodexRemoteLane {
     const root = join(this.executionRoot, `codex-${lifecycleId}`)
     privateDir(root)
     syncDir(this.executionRoot)
-    const profile: Cc5HostProfile = {
-      cwd: this.opts.agentBaseDir,
-      mcpConfigPath: null,
-      settingsPath: null,
-      disallowedTools: [...CCB_PLATFORM_DISALLOWED_TOOLS],
+    const context = await new SubprocessRunner(this.opts).prepareRemoteToolContext()
+    generation.cleanupContext = context.cleanup
+    try {
+      return this.laneOptions.hostFactory?.(root, lifecycleId, context.profile, context.env) ??
+        new Cc5ToolHost(root, lifecycleId, context.profile, async () => {
+          throw new Error('CODEX_REMOTE_PERMISSION_UNSUPPORTED')
+        }, context.env)
+    } catch (error) {
+      context.cleanup()
+      throw error
     }
-    return this.laneOptions.hostFactory?.(root, lifecycleId, profile) ??
-      new Cc5ToolHost(root, lifecycleId, profile, async () => {
-        // Permission cards are not wired for a codex lane: the tool call fails closed.
-        throw new Error('CODEX_REMOTE_PERMISSION_UNSUPPORTED')
-      })
   }
 
   /** Real tools in this container, from the same sources a local chat's CLI is started with. */
@@ -399,14 +405,14 @@ export class CodexRemoteLane {
   }
 
   private async buildTools(generation: LaneGeneration): Promise<Cc5ToolCatalog> {
-    const host: LaneToolHost = generation.host ?? await this.startHost()
+    const host: LaneToolHost = generation.host ?? await this.startHost(generation)
     generation.host = host
     if (!this.catalog) {
       try {
         this.bindCatalog(compileCc5ToolCatalog(await host.tools()))
       } catch (error) {
+        await host.close()
         generation.host = undefined
-        await host.close().catch(() => {})
         throw error
       }
     }
@@ -431,6 +437,7 @@ export class CodexRemoteLane {
    * provisions the node and opens both channels once it holds this turn's authority.
    */
   beginTurn(params: TurnParams): void {
+    codexNeed(!params.readOnly && !params.consultTurn && !this.opts.hermeticNoTools, 'CODEX_REMOTE_READ_ONLY_UNSUPPORTED')
     codexNeed(!this.failure, this.failure?.message ?? 'CODEX_TURN_REJECTED')
     codexNeed(this.stopRun === undefined, 'CODEX_LANE_CLOSED')
     const authority = params.modelAuthority?.authorityEnvelope
@@ -649,57 +656,46 @@ export class CodexRemoteLane {
    * A transient kernel recycle (after a user cancel): this container's generation ends, the lane
    * and the node's resident app do not. The next turn admits again on a fresh client.
    */
+  private async closeGeneration(generation: LaneGeneration): Promise<void> {
+    generation.abort.abort()
+    if (!generation.child.killed) generation.child.kill()
+    return generation.closeRun ??= (async () => {
+      // A host starting concurrently with shutdown still belongs to this generation.
+      await generation.toolsRun?.catch(() => {})
+      await generation.host?.close()
+      await generation.pumpRun?.catch(() => {})
+      generation.cleanupContext?.()
+      this.generations.delete(generation)
+    })().catch(error => { generation.closeRun = undefined; throw error })
+  }
+
   private async recycle(): Promise<void> {
     const generation = this.generation
     if (!generation || this.stopRun !== undefined) return
-    // The admission belongs to the turn, not to this generation: a kernel restart inside the
-    // turn respawns against the same gate, so it is kept until the turn itself ends.
     this.generation = undefined
-    generation.abort.abort()
-    if (!generation.child.killed) generation.child.kill()
-    if (generation.host) {
-      try {
-        await generation.host.close()
-      } catch (error) {
-        log.warn('codex remote tool host recycle unproven', {
-          sessionKey: this.opts.sessionKey,
-          err: error instanceof Error ? error.message : 'unknown',
-        })
-      }
+    try { await this.closeGeneration(generation) }
+    catch (error) {
+      // Keep the host and its owner until a later shutdown can actually prove it stopped.
+      this.failure ??= new Error('CODEX_LOCAL_STOP_UNPROVEN')
+      throw error
     }
-    await generation.pumpRun?.catch(() => {})
   }
 
-  /**
-   * Local stop proof, then the lane stop the master requires. `/stop` revokes first, so the
-   * `/tool/stopped` it waits for can only be sent after it. Idempotent.
-   */
+  /** Kernel generations are disposable; the control connection and stop proofs are lane-owned. */
   stopLane(): Promise<void> {
-    // A turn still waiting for its predecessor must fail on a closed lane, never hang.
     this.abortTurns()
     this.stopRun ??= (async () => {
-      const generation = this.generation
       this.generation = undefined
-      if (!generation) return
-      generation.abort.abort()
-      // End the kernel's view of the lane before the client starts refusing polls.
-      if (!generation.child.killed) generation.child.kill()
-      let localStopped = false
-      try {
-        if (generation.host) {
-          await generation.host.close()
-          localStopped = true
-        }
-      } catch (error) {
-        log.warn('codex remote tool host stop unproven', {
-          sessionKey: this.opts.sessionKey,
-          err: error instanceof Error ? error.message : 'unknown',
-        })
-      }
-      if (generation.client.closed) return
-      const stopping = generation.client.stop()
-      if (localStopped && this.admitted) await this.proveLocalStop(generation.client, this.admitted, stopping)
+      const client = this.control
+      if (!client) return // no host, admission or remote effect was ever created
+      const stopping = client.stop() // revoke before attempting local proof
+      stopping.catch(() => {})
+      let localError: unknown
+      try { await Promise.all([...this.generations].map(g => this.closeGeneration(g))) }
+      catch (error) { localError = error }
+      if (!localError && this.admitted) await this.proveLocalStop(client, this.admitted, stopping)
       await stopping
+      if (localError) throw localError
     })().catch((error) => {
       this.stopRun = undefined
       throw error

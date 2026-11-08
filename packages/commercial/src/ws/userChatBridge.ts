@@ -3247,12 +3247,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
         // OCV5-746 §4: the node refused the session for its real reason. Never present a full node
         // as an outage, and never bill a turn whose session was never admitted.
-        if (err instanceof Error && (err as Error & { code?: string }).code === "REMOTE_NODE_MEMORY_EXHAUSTED") {
+        if (err instanceof Error && ["REMOTE_NODE_MEMORY_EXHAUSTED", "REMOTE_NODE_TASKS_EXHAUSTED"].includes((err as Error & { code?: string }).code ?? "")) {
           const active = Number((err as Error & { activeSessions?: unknown }).activeSessions);
           return await reject(
-            "REMOTE_NODE_MEMORY_EXHAUSTED",
-            `远端节点内存不足，当前底座已有 ${Number.isSafeInteger(active) && active >= 0 ? active : 0} 个会话在跑`,
-            "remote_node_memory_exhausted",
+            (err as Error & { code: string }).code,
+            `远端节点${(err as Error & { code?: string }).code === "REMOTE_NODE_TASKS_EXHAUSTED" ? "进程/线程额度不足" : "内存不足"}，当前底座已有 ${Number.isSafeInteger(active) && active >= 0 ? active : 0} 个会话在跑`,
+            (err as Error & { code: string }).code.toLowerCase(),
           );
         }
         return await reject("REMOTE_NATIVE_UNAVAILABLE", "remote node unavailable for this chat, retry shortly", "remote_native_binding_rejected");

@@ -1,4 +1,4 @@
-import { memoryRejection, nodeMemoryError } from './remoteNodeMemory.js'
+import { memoryRejection, nodeMemoryError, isRemoteResourceCode } from './remoteNodeMemory.js'
 /** Privileged master relay. It never runs a model tool, and never trusts MCP metadata as observation. */
 import { timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -36,7 +36,7 @@ export class CodexRemoteRelay {
   private localStopped = true
   private readonly localStops = new EventEmitter()
   private launched = false
-  private memoryRefused = false
+  private memoryRefused?: 'REMOTE_NODE_MEMORY_EXHAUSTED' | 'REMOTE_NODE_TASKS_EXHAUSTED'
   private turnHostAttempted = false
   private starting = false
   private admitting?: Promise<void>
@@ -74,6 +74,7 @@ export class CodexRemoteRelay {
   private active = false
   private expiry?: ReturnType<typeof setTimeout>
   private firstCause?: string
+  private handshake?: { paramsHash: string; response?: Record<string, unknown> }
   private readonly acknowledgements = new EventEmitter()
   private readonly terminals = new Map<string, string>()
   constructor(readonly binding: CodexRemoteBinding, private readonly keys: AuthorityKeyring,
@@ -214,8 +215,8 @@ export class CodexRemoteRelay {
         codexNeed(!this.revoked && row.version === 1 && row.engine === 'codex' && row.seq === ++this.appSeq)
         this.identity(row)
         if (!ready) {
-          if (row.kind === 'error' && row.code === 'REMOTE_NODE_MEMORY_EXHAUSTED') {
-            const e=nodeMemoryError(row.activeSessions); this.memoryRefused=true; throw e
+          if (row.kind === 'error' && isRemoteResourceCode(row.code)) {
+            const e=nodeMemoryError(row.activeSessions, row.code); this.memoryRefused=row.code; throw e
           }
           codexNeed(row.kind === 'ready'); ready = true; clearTimeout(timer); this.record('ready', row); resolve(); return
         }
@@ -241,8 +242,8 @@ export class CodexRemoteRelay {
       const timer = setTimeout(() => fail(new Error('CODEX_TOOL_SOCKET_TIMEOUT')), 30000)
       const fail = (e: Error) => { clearTimeout(timer); reject(e); this.fence(e.message) }
       readCodexLines(socket, row => {
-        if (!ready && row.kind === 'error' && row.code === 'REMOTE_NODE_MEMORY_EXHAUSTED') {
-          const e=nodeMemoryError(row.activeSessions); this.memoryRefused=true; throw e
+        if (!ready && row.kind === 'error' && isRemoteResourceCode(row.code)) {
+          const e=nodeMemoryError(row.activeSessions, row.code); this.memoryRefused=row.code; throw e
         }
         codexNeed(!this.revoked && row.version === 3 && row.engine === 'codex')
         if (!ready) {
@@ -282,6 +283,10 @@ export class CodexRemoteRelay {
       codexNeed(typeof frame.id === 'number' && frame.method === undefined && entry !== undefined,
         'CODEX_UNKNOWN_RESPONSE')
       this.laneIds.delete(frame.id)
+      if (entry.method === 'initialize') {
+        codexNeed(this.handshake && !this.handshake.response && !frame.error, 'CODEX_INITIALIZE_FAILED')
+        this.handshake.response = { ...frame }
+      }
       if (entry.epoch !== this.epoch) {
         // The kernel that asked is gone: its answer is not this admission's stream.
         this.record('stale-response', { id: frame.id, method: entry.method })
@@ -380,6 +385,16 @@ export class CodexRemoteRelay {
     if (method === 'thread/read') codexNeed(p.threadId === this.thread)
     this.verify(this.admitted!.authority, this.admitted!.lease, true)
     codexNeed(!this.revoked); this.record('rpc', frame)
+    if (method === 'initialize') {
+      const paramsHash = cc5ToolInputSha256(p)
+      if (this.handshake) {
+        codexNeed(this.handshake.paramsHash === paramsHash && this.handshake.response, 'CODEX_INITIALIZE_UNPROVEN')
+        // Reattach the container kernel to the same resident app, not another node handshake.
+        this.publish({ ...this.handshake.response, id: frame.id })
+        return
+      }
+      this.handshake = { paramsHash }
+    }
     const forwarded = method === 'initialized' ? frame : this.translate(frame, method)
     this.app.stdin.write(`${JSON.stringify(forwarded)}\n`)
   }
@@ -467,7 +482,7 @@ export class CodexRemoteRelay {
       await this.waitLocalStop()
       await this.financeTurn?.stop({ hostStartAttempted: this.turnHostAttempted, userSubmitted: this.dispatching,
         remoteStopped: proof.remoteStopped && this.localStopped,
-        ...(this.memoryRefused ? { nodeAdmissionRejected: true } : {}) })
+        ...(this.memoryRefused ? { nodeAdmissionRejected: true, nodeAdmissionReason: this.memoryRefused } : {}) })
       codexNeed(proof.remoteStopped && this.localStopped, 'CODEX_STOP_UNKNOWN')
       this.record('stopped', { remoteStopped: true }); return { remoteStopped: true as const }
     })().catch(error => { this.stopping = undefined; throw error })

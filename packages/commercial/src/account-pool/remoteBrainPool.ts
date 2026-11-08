@@ -1476,14 +1476,6 @@ export async function applyRemoteNodeProbeResult(
         p.auth_present === true && p.account_observed === true && p.models_observed === true && !p.error_code,
         p.error_code ?? p.execution_snapshot_error ?? null], runner);
       upserted.push(mapProfileRow(updated.rows[0]!));
-      if (!codexExecutionReady(updated.rows[0]!)) {
-        const offers = await query(`SELECT canonical_model_id FROM remote_model_offers WHERE profile_id=$1`,[updated.rows[0]!.id],runner)
-        for (const offer of offers.rows) {
-          if (await countEligibleEnabledRemoteOffers(offer.canonical_model_id,runner) !== 0) continue
-          await query(`UPDATE model_catalog SET state='disabled',pool_auto_disabled=TRUE
-            WHERE model_id=$1 AND engine='codex' AND placement='remote_pool' AND state='active'`,[offer.canonical_model_id],runner)
-        }
-      }
     } else upserted.push(mapProfileRow(res.rows[0]!))
   }
 
@@ -1494,13 +1486,7 @@ export async function applyRemoteNodeProbeResult(
     upsertedByEngine.set(prof.engine, list)
   }
   for (const [engine, activeProfiles] of upsertedByEngine.entries()) {
-    if (engine === 'codex') {
-      // Native histories and auth identities never migrate to the first remaining account.
-      await query(`UPDATE remote_agent_profiles SET execution_ready=FALSE,status='degraded'
-        WHERE node_id=$1 AND engine='codex' AND NOT (profile_name=ANY($2::text[]))`,
-      [nodeId, activeProfiles.map(p => p.profile_name)], runner);
-      continue;
-    }
+    if (engine === 'codex') continue // handled together below, including an entirely absent engine
     const primaryTarget = activeProfiles[0]
     if (!primaryTarget) continue
     const activeNames = activeProfiles.map((ap) => ap.profile_name)
@@ -1537,6 +1523,20 @@ export async function applyRemoteNodeProbeResult(
         runner,
       )
     }
+  }
+
+  // Native histories/auth identities never migrate. Revoke missing profiles even if this probe
+  // returned no Codex profiles at all, then aggregate after *all* readiness changes are visible.
+  await query(`UPDATE remote_agent_profiles SET execution_ready=FALSE,
+    status=CASE WHEN disabled_by='admin' THEN 'disabled' ELSE 'degraded' END
+    WHERE node_id=$1 AND engine='codex' AND NOT (profile_name=ANY($2::text[]))`,
+  [nodeId, (upsertedByEngine.get('codex') ?? []).map(p => p.profile_name)], runner)
+  const affected = await query(`SELECT DISTINCT o.canonical_model_id FROM remote_model_offers o
+    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex'`, [nodeId], runner)
+  for (const offer of affected.rows) {
+    if (await countEligibleEnabledRemoteOffers(offer.canonical_model_id,runner) !== 0) continue
+    await query(`UPDATE model_catalog SET state='disabled',pool_auto_disabled=TRUE
+      WHERE model_id=$1 AND engine='codex' AND placement='remote_pool' AND state='active'`, [offer.canonical_model_id], runner)
   }
 
   return { node: mapNodeRow(nodeRes.rows[0]!), profiles: upserted }
