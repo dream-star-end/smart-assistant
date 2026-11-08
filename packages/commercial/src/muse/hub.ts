@@ -101,6 +101,30 @@ interface HubJob {
   abort?: AbortController
 }
 
+function isHubJobDone(job: HubJob): boolean {
+  return job.state === 'done'
+}
+
+function canFallbackBoxExecToHatch(input: {
+  relaySubmitted: boolean
+  museErr: MuseError | null
+  message: string
+}): boolean {
+  if (input.relaySubmitted) return false
+  // BOX_EXEC_INCOMPLETE / TIMEOUT / AFTER_EXIT can happen after the remote
+  // already accepted submit (missing terminal frame). Falling back would
+  // double-generate. Only treat clearly pre-submit reachability failures
+  // as hatch-fallback candidates.
+  if (/BOX_EXEC_INCOMPLETE|BOX_EXEC_TIMEOUT|BOX_EXEC_AFTER_EXIT/.test(input.message)) {
+    return false
+  }
+  if (input.museErr?.code === 'MUSE_BRIDGE_OFFLINE') return true
+  return /relay is down|not wired|ECONNREFUSED|BOX_EXEC_ACCOUNT_GUARD_FAILED|BOX_EGRESS_CHANGED/.test(
+    input.message,
+  )
+}
+
+
 export interface MuseJobView {
   job_id: string
   kind: MuseKind
@@ -779,7 +803,7 @@ export class MuseBridgeHub {
         throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'box-exec Muse backend is not wired', true)
       }
       const exec = await this.boxExecRunner()
-      if (job.state === 'done') return
+      if (isHubJobDone(job)) return
       const result = await runBoxExecVideoJob({
         exec,
         spec: job.spec,
@@ -791,7 +815,7 @@ export class MuseBridgeHub {
           relaySubmitted = true
         },
       })
-      if (job.state === 'done') return
+      if (isHubJobDone(job)) return
       if (result.modeMismatch) {
         this.finish(job, fail('MUSE_BAD_OUTPUT', 'relay reported a mode mismatch'))
         return
@@ -803,14 +827,14 @@ export class MuseBridgeHub {
         artifactIds: result.artifactIds,
       })
     } catch (err) {
-      if (job.state === 'done') return
+      if (isHubJobDone(job)) return
       const museErr = err instanceof MuseError ? err : null
       const message = err instanceof Error ? err.message : 'box-exec failed'
-      const preSubmitOffline =
-        !relaySubmitted &&
-        (museErr?.code === 'MUSE_BRIDGE_OFFLINE' ||
-          /relay is down|not wired|ECONNREFUSED|BOX_/.test(message))
-      if (this.fallbackHatch && this.bridgeOnline() && preSubmitOffline) {
+      if (
+        this.fallbackHatch &&
+        this.bridgeOnline() &&
+        canFallbackBoxExecToHatch({ relaySubmitted, museErr, message })
+      ) {
         this.boxExecInflight.delete(job)
         job.via = 'hatch'
         job.state = 'queued'
@@ -883,7 +907,7 @@ export class MuseBridgeHub {
   }
 
   private finish(job: HubJob, outcome: Outcome): void {
-    if (job.state === 'done') return
+    if (isHubJobDone(job)) return
     job.state = 'done'
     job.outcome = outcome
     job.finishedAt = this.now()

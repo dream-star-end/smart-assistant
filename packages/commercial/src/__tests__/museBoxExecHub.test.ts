@@ -208,6 +208,30 @@ describe('OCV5-750 hub routing', () => {
     assert.equal(view?.status, 'failed')
     assert.equal(view?.error?.code, 'MUSE_UPSTREAM_ERROR')
   })
+  it('does not fall back to hatch when submit ends with BOX_EXEC_INCOMPLETE', async () => {
+    const root = tmpRoot()
+    let submits = 0
+    let hatchHello = 0
+    const hub = makeHub(root, {
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner: async () => async (request: BoxCcExecRequest) => {
+        const verb = request.args[2]
+        if (verb === 'submit') {
+          submits += 1
+          throw new Error('BOX_EXEC_INCOMPLETE')
+        }
+        throw new Error(`unexpected ${verb}`)
+      },
+    })
+    hub.hello('1', '0.5.0')
+    hatchHello += 1
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(submits, 1)
+    assert.equal(view?.status, 'failed')
+    assert.equal(view?.error?.code, 'MUSE_UPSTREAM_ERROR')
+    assert.equal(hatchHello, 1)
+  })
 })
-
-void BOX_EXEC_CHUNK_BYTES

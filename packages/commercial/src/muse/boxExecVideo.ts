@@ -352,7 +352,6 @@ export function createMuseBoxExecRunner(
   uidRaw: string | undefined,
   deps?: { resolve?: () => Promise<BoxCliExecFn> },
 ): () => Promise<BoxCliExecFn> {
-  let inner: BoxCliExecFn | null = null
   const resolve = async (): Promise<BoxCliExecFn> => {
     if (deps?.resolve) return deps.resolve()
     const uid = (uidRaw ?? '').trim()
@@ -378,15 +377,20 @@ export function createMuseBoxExecRunner(
     })
     return (request, opts) => target.exec.run(request, opts)
   }
-  const wrapped: BoxCliExecFn = async (request, opts) => {
-    try {
-      inner ??= await resolve()
-      return await inner(request, opts)
-    } catch (err) {
-      if (!isStaleBoxExecTransport(err)) throw err
-      inner = await resolve()
-      return await inner(request, opts)
+  // Pin a transport per job. A shared mutable cache can re-resolve to a
+  // different Box while another job is in flight, so later status/cancel
+  // calls would miss the relay job that was already submitted.
+  return async () => {
+    let pinned: BoxCliExecFn | null = null
+    return async (request, opts) => {
+      try {
+        pinned ??= await resolve()
+        return await pinned(request, opts)
+      } catch (err) {
+        if (!isStaleBoxExecTransport(err)) throw err
+        pinned = await resolve()
+        return await pinned(request, opts)
+      }
     }
   }
-  return async () => wrapped
 }

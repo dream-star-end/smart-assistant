@@ -188,4 +188,52 @@ describe('OCV5-750 runBoxExecVideoJob against a fake Exec', () => {
     assert.equal(isStaleBoxExecTransport({ code: 'BOX_EGRESS_CHANGED' }), true)
     assert.equal(isStaleBoxExecTransport({ code: 'BOX_EXEC_TIMEOUT' }), false)
   })
+
+  it('pins each job to the Box it resolved, even if another job resolves later', async () => {
+    let started = 0
+    let release!: () => void
+    const bothStarted = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const seen: Array<{ box: number; verb: string }> = []
+    const factory = createMuseBoxExecRunner('3', {
+      resolve: async () => {
+        const box = ++started
+        if (started >= 2) release()
+        await bothStarted
+        return async (request) => {
+          const verb = String(request.args[2] ?? '')
+          seen.push({ box, verb })
+          return { stdout: JSON.stringify({ ok: true, box, verb }) }
+        }
+      },
+    })
+    const first = await factory()
+    const second = await factory()
+    const req = {
+      command: '/usr/bin/python3',
+      args: ['-I', '/workspace/muse-relay/bin/muse-exec-cli', 'submit'],
+      cwd: '/tmp',
+      environment: {},
+    }
+    await Promise.all([
+      first(req, { timeoutMs: 5000 }),
+      second(req, { timeoutMs: 5000 }),
+    ])
+    const firstStatus = await first(
+      { ...req, args: ['-I', '/workspace/muse-relay/bin/muse-exec-cli', 'status'] },
+      { timeoutMs: 5000 },
+    )
+    const secondStatus = await second(
+      { ...req, args: ['-I', '/workspace/muse-relay/bin/muse-exec-cli', 'status'] },
+      { timeoutMs: 5000 },
+    )
+    const firstBox = seen.find((row) => row.verb === 'submit' && row.box === 1)?.box
+    const secondBox = seen.find((row) => row.verb === 'submit' && row.box === 2)?.box
+    assert.equal(firstBox, 1)
+    assert.equal(secondBox, 2)
+    assert.equal(JSON.parse(firstStatus.stdout).box, 1)
+    assert.equal(JSON.parse(secondStatus.stdout).box, 2)
+  })
 })
+
