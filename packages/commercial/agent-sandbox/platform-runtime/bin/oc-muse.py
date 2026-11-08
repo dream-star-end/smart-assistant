@@ -158,6 +158,10 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         payload["source_images"] = read_sources(ns.image)
     if ns.resume:
         payload["resume_snapshot_id"] = ns.resume
+    if getattr(ns, "mode", None):
+        payload["mode"] = ns.mode
+    if getattr(ns, "count", None) is not None:
+        payload["count"] = ns.count
 
     status = call("GET", "/status")
     if not status.get("bridge_online"):
@@ -239,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     common(video)
     video.add_argument("--aspect-ratio", dest="aspect_ratio", choices=("4:5", "7:12", "9:16"))
+    video.add_argument("--mode", choices=("native", "first_frame", "reference", "composite"),
+                       help="video generation mode (optional; inferred from --image if omitted)")
+    video.add_argument("--count", type=int, default=None, help="native-family variations, 1-6")
 
     ns = parser.parse_args(argv)
     if ns.timeout is None:

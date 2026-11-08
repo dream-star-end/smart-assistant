@@ -714,6 +714,36 @@ export const commercialConfigSchema = z
       ),
     /** Muse result staging; default /var/lib/openclaude-v5-selfhost/muse-media. */
     OC_MUSE_STATE_ROOT: absolutePath("OC_MUSE_STATE_ROOT"),
+    /**
+     * OCV5-750 second Muse video backend. Unset / empty / "hatch" = today's hatch path.
+     * "box-exec" routes video (no --resume) through Box Exec → muse-exec-cli.
+     */
+    OC_MUSE_VIDEO_BACKEND: z
+      .string()
+      .optional()
+      .transform((value) => {
+        const trimmed = (value ?? "").trim()
+        if (!trimmed || trimmed === "hatch") return "hatch" as const
+        if (trimmed === "box-exec") return "box-exec" as const
+        throw new Error("OC_MUSE_VIDEO_BACKEND must be hatch or box-exec")
+      }),
+    /** When "1", a down box-exec relay may fall back onto hatch if the hatch bridge is online. */
+    OC_MUSE_BOX_EXEC_FALLBACK_HATCH: z
+      .enum(["0", "1", ""])
+      .optional()
+      .transform((value) => value === "1"),
+    /** Decimal uid used to resolve the Box Exec target (no Claude login is scheduled). */
+    OC_MUSE_BOX_EXEC_UID: z
+      .string()
+      .optional()
+      .transform((value) => {
+        const trimmed = (value ?? "").trim()
+        return trimmed === "" ? undefined : trimmed
+      })
+      .refine(
+        (value) => value === undefined || /^[1-9]\d{0,18}$/.test(value),
+        "OC_MUSE_BOX_EXEC_UID must be a positive decimal uid",
+      ),
     OC_MUSE_IMAGE_PER_HOUR: positiveInt(10_000),
     OC_MUSE_IMAGE_PER_DAY: positiveInt(100_000),
     OC_MUSE_VIDEO_PER_HOUR: positiveInt(10_000),

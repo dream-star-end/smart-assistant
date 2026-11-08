@@ -143,6 +143,8 @@ const SubmitSchema = z
       .max(MUSE_LIMITS.max_source_images)
       .optional(),
     resume_snapshot_id: z.string().regex(SNAPSHOT_ID_RE).optional(),
+    mode: z.enum(['native', 'first_frame', 'reference', 'composite']).optional(),
+    count: z.number().int().min(1).max(6).optional(),
   })
   .strict()
 
@@ -170,6 +172,9 @@ export interface MuseJobSpec {
   /** Validated base64 (decoded size and magic checked); hub retains sources until finish. */
   source_images?: string[]
   resume_snapshot_id?: string
+  /** Optional video mode for the box-exec backend; ignored by the hatch wire. */
+  mode?: 'native' | 'first_frame' | 'reference' | 'composite'
+  count?: number
 }
 
 /** Validate a container submission. Throws MuseError(400, MUSE_INVALID_INPUT). */
@@ -214,6 +219,8 @@ export function parseSubmission(raw: unknown): MuseJobSpec {
     ...(v.image_format ? { image_format: v.image_format } : {}),
     ...(sources.length ? { source_images: sources } : {}),
     ...(v.resume_snapshot_id ? { resume_snapshot_id: v.resume_snapshot_id } : {}),
+    ...(v.mode ? { mode: v.mode } : {}),
+    ...(v.count !== undefined ? { count: v.count } : {}),
   }
 }
 

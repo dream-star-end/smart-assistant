@@ -12,8 +12,18 @@
 //     gets 410 and the bridge drops it. At most one generation can therefore run per job.
 
 import { type Hash, createHash, randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { appendFile, mkdir, open, readdir, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+
+import {
+  BOX_EXEC_MAX_CONCURRENCY,
+  type BoxCliExecFn,
+  type MuseVideoBackend,
+  boxExecDeadlineMs,
+  canRouteToBoxExec,
+  runBoxExecVideoJob,
+} from './boxExecVideo.js'
 
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
@@ -87,6 +97,7 @@ interface HubJob {
   outcome: Outcome | null
   finishedAt: number
   waiters: Set<() => void>
+  via: 'hatch' | 'box-exec'
 }
 
 export interface MuseJobView {
@@ -130,6 +141,10 @@ export interface MuseBridgeHubOptions {
   cliTimeoutSec: Readonly<Record<MuseKind, number>>
   now?: () => number
   logger?: Logger
+  videoBackend?: MuseVideoBackend
+  fallbackHatch?: boolean
+  boxExecRunner?: () => Promise<BoxCliExecFn>
+  boxExecPollMs?: number
 }
 
 interface Session {
@@ -177,6 +192,13 @@ export class MuseBridgeHub {
   /** Submissions between their checks and their enqueue (they await the DB). */
   private reservedTotal = 0
   private readonly reserved = new Map<string, number>()
+  private readonly configuredBackend: MuseVideoBackend
+  private readonly fallbackHatch: boolean
+  private readonly boxExecRunner?: () => Promise<BoxCliExecFn>
+  private readonly boxExecPollMs: number
+  private reservedBox = 0
+  private readonly boxExecPending: HubJob[] = []
+  private readonly boxExecInflight = new Set<HubJob>()
 
   constructor(opts: MuseBridgeHubOptions) {
     this.store = opts.store
@@ -186,6 +208,21 @@ export class MuseBridgeHub {
     this.cliTimeoutSec = opts.cliTimeoutSec
     this.now = opts.now ?? Date.now
     this.log = (opts.logger ?? rootLogger).child({ subsys: 'museBridge' })
+    this.configuredBackend = opts.videoBackend ?? 'hatch'
+    this.fallbackHatch = opts.fallbackHatch === true
+    this.boxExecRunner = opts.boxExecRunner
+    this.boxExecPollMs = opts.boxExecPollMs ?? 5_000
+  }
+
+  /** Runtime file `$stateRoot/video-backend` overrides the env default without a restart. */
+  getVideoBackend(): MuseVideoBackend {
+    try {
+      const raw = readFileSync(join(this.root, 'video-backend'), 'utf8').trim()
+      if (raw === 'hatch' || raw === 'box-exec') return raw
+    } catch {
+      // file absent or unreadable → configured default
+    }
+    return this.configuredBackend
   }
 
   async start(): Promise<void> {
@@ -477,22 +514,29 @@ export class MuseBridgeHub {
         'Muse media tools are not enabled for this account',
       )
     }
-    if (!this.bridgeOnline()) {
+    const routeBox = canRouteToBoxExec(this.getVideoBackend(), spec)
+    if (!this.bridgeOnline() && !routeBox) {
       throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'the Muse bridge is not connected')
     }
     // Reserve the queue slot and the rate count synchronously, before any await, so
     // concurrent submissions cannot all pass the checks and overfill the queue / limits.
-    if (this.queue.length + this.reservedTotal >= QUEUE_MAX) {
+    if (routeBox) {
+      if (this.boxExecPending.length + this.boxExecInflight.size + this.reservedBox >= QUEUE_MAX) {
+        throw new MuseError(503, 'MUSE_BUSY', 'the Muse channel is busy; try again shortly', true)
+      }
+    } else if (this.queue.length + this.reservedTotal >= QUEUE_MAX) {
       throw new MuseError(503, 'MUSE_BUSY', 'the Muse channel is busy; try again shortly', true)
     }
     const key = `${userId}:${spec.kind}`
     const pending = this.reserved.get(key) ?? 0
-    this.reservedTotal += 1
     this.reserved.set(key, pending + 1)
+    if (routeBox) this.reservedBox += 1
+    else this.reservedTotal += 1
     try {
       return await this.admit(userId, containerId, spec, pending, opts.jobId)
     } finally {
-      this.reservedTotal -= 1
+      if (routeBox) this.reservedBox -= 1
+      else this.reservedTotal -= 1
       const left = (this.reserved.get(key) ?? 1) - 1
       if (left > 0) this.reserved.set(key, left)
       else this.reserved.delete(key)
@@ -573,8 +617,21 @@ export class MuseBridgeHub {
       outcome: null,
       finishedAt: 0,
       waiters: new Set(),
+      via: 'hatch',
     }
     this.jobs.set(id, job)
+    if (canRouteToBoxExec(this.getVideoBackend(), spec)) {
+      job.via = 'box-exec'
+      this.boxExecPending.push(job)
+      this.log.info('muse_media_job_queued', {
+        jobId: id,
+        userId,
+        kind: spec.kind,
+        backend: 'box-exec',
+      })
+      this.pumpBoxExec()
+      return id
+    }
     this.queue.push(job)
     this.log.info('muse_media_job_queued', { jobId: id, userId, kind: spec.kind })
     this.pump()
@@ -652,6 +709,16 @@ export class MuseBridgeHub {
         this.finish(job, fail('MUSE_BRIDGE_OFFLINE', 'the Muse bridge disconnected'))
       }
     }
+    for (const job of [...this.boxExecPending]) {
+      if (now - job.queuedAt > QUEUE_WAIT_MS) {
+        this.finish(job, fail('MUSE_BUSY', 'waited too long in the Muse queue', true))
+      }
+    }
+    for (const job of [...this.boxExecInflight]) {
+      if (now > job.deadlineAt) {
+        this.finish(job, fail('MUSE_TIMEOUT', 'the job exceeded its deadline', true))
+      }
+    }
     const a = this.active
     if (a?.state === 'dispatched' && now - a.dispatchedAt > ACK_TIMEOUT_MS) {
       if (a.dispatchCount >= MAX_DISPATCH_ATTEMPTS) {
@@ -686,6 +753,68 @@ export class MuseBridgeHub {
         this.jobs.delete(id)
         void rm(join(this.root, id), { recursive: true, force: true })
       }
+    }
+  }
+
+  private pumpBoxExec(): void {
+    while (this.boxExecInflight.size < BOX_EXEC_MAX_CONCURRENCY && this.boxExecPending.length > 0) {
+      const job = this.boxExecPending.shift()!
+      const now = this.now()
+      job.state = 'running'
+      job.dispatchedAt = now
+      job.lastBeatAt = now
+      job.deadlineAt = now + boxExecDeadlineMs(job.spec)
+      this.boxExecInflight.add(job)
+      void this.runBoxExec(job)
+    }
+  }
+
+  private async runBoxExec(job: HubJob): Promise<void> {
+    try {
+      if (!this.boxExecRunner) {
+        throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'box-exec Muse backend is not wired', true)
+      }
+      const exec = await this.boxExecRunner()
+      const result = await runBoxExecVideoJob({
+        exec,
+        spec: job.spec,
+        destDir: join(this.root, job.id),
+        now: this.now,
+        pollMs: this.boxExecPollMs,
+      })
+      if (job.state === 'done') return
+      if (result.modeMismatch) {
+        this.finish(job, fail('MUSE_BAD_OUTPUT', 'relay reported a mode mismatch'))
+        return
+      }
+      this.finish(job, {
+        ok: true,
+        files: result.files.map(({ path: _ignored, ...file }) => file),
+        snapshotId: result.snapshotId,
+        artifactIds: result.artifactIds,
+      })
+    } catch (err) {
+      if (job.state === 'done') return
+      const museErr = err instanceof MuseError ? err : null
+      const message = err instanceof Error ? err.message : 'box-exec failed'
+      const offline =
+        museErr?.code === 'MUSE_BRIDGE_OFFLINE' ||
+        /relay is down|not wired|BOX_|ECONNREFUSED/i.test(message)
+      if (this.fallbackHatch && this.bridgeOnline() && offline) {
+        this.boxExecInflight.delete(job)
+        job.via = 'hatch'
+        job.state = 'queued'
+        job.nonce = randomUUID()
+        this.queue.push(job)
+        this.log.warn('muse_box_exec_fell_back_to_hatch', { jobId: job.id })
+        this.pump()
+        return
+      }
+      if (museErr) {
+        this.finish(job, fail(museErr.code, museErr.message, museErr.retryable))
+        return
+      }
+      this.finish(job, fail('MUSE_UPSTREAM_ERROR', message, true))
     }
   }
 
@@ -753,6 +882,9 @@ export class MuseBridgeHub {
     if (this.active === job) this.active = null
     const qi = this.queue.indexOf(job)
     if (qi >= 0) this.queue.splice(qi, 1)
+    this.boxExecInflight.delete(job)
+    const bi = this.boxExecPending.indexOf(job)
+    if (bi >= 0) this.boxExecPending.splice(bi, 1)
     for (const w of [...job.waiters]) w()
     this.store
       .finishJob(job.id, {
@@ -777,12 +909,14 @@ export class MuseBridgeHub {
       bytes: outcome.ok ? outcome.files.reduce((s, f) => s + f.bytes, 0) : 0,
     })
     this.pump()
+    this.pumpBoxExec()
   }
 
   private viewOf(job: HubJob): MuseJobView {
     const base = { job_id: job.id, kind: job.spec.kind }
     if (job.state === 'queued' || job.state === 'dispatched') {
-      const pos = this.queue.indexOf(job)
+      const pos =
+        job.via === 'box-exec' ? this.boxExecPending.indexOf(job) : this.queue.indexOf(job)
       return { ...base, status: 'queued', queue_position: pos < 0 ? 0 : pos + 1 }
     }
     if (job.state === 'running') return { ...base, status: 'running' }
