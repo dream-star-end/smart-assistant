@@ -9908,6 +9908,83 @@
           "assertion": "[ocv5-607-lossless-context-transport] PASS"
         }
       ]
+    },
+    {
+      "id": "INC-20261109-MUSE-ORIGIN-SCHEMA",
+      "occurredAt": "2026-11-09",
+      "severity": "P1",
+      "symptom": "商业Muse视频请求携带原会话session_key时被master严格schema拒绝，未创建任务、未到远程桥。显式允许有界非空元数据且不进入桥spec，保留validateOrigin归属验证、未知字段拒绝、原任务重试及单次回写/扣费不变量。",
+      "rootFixCommit": "8e3d13bc",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/museDurable.test.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: explicit metadata stays strict and out of the bridge spec"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/museDurable.test.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: HTTP reaches real origin ownership gate before insertion"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/museDurable.test.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: real oc-muse video submits origin and acknowledges one conversation result"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: HTTP reaches real origin ownership gate before insertion"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL",
+      "occurredAt": "2026-10-11",
+      "severity": "P1",
+      "symptom": "通用助手 platform seed 在 general-assistant@1.0.0 钉死 glm-5.3-zai，与代码侧 auto 不一致；approvePlatformVersion 每次启动拒批，listing 停在旧 artifact，用户所选模型不生效。8f8d44fc 升到 1.0.1+auto 并用 hash 钉死测试锁住。",
+      "rootFixCommit": "8f8d44fc",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/seedPlatformAgentHashes.test.ts",
+          "assertion": "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL: every platform seed agent keeps the artifact hash pinned for its slug@version"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/seedPlatformAgentHashes.test.ts",
+          "assertion": "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL: general-assistant does not pin a model (auto follows the user)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ocv5-376-platform-tool-proofs.ts",
+          "assertion": "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL: general-assistant does not pin a model (auto follows the user)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE",
+      "occurredAt": "2026-10-11",
+      "severity": "P1",
+      "symptom": "lazyToolBody 把失败的 import promise 永久缓存；空闲预取一旦失败，之后展开工具体一直复用同一拒绝直到整页重载；预取 rejection 还会变成 unhandledRejection。785b3e04 失败清缓存并吞掉预取失败。",
+      "rootFixCommit": "785b3e04",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/tool/lazyToolBody.test.ts",
+          "assertion": "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE: a failed load is not cached: the next call loads again"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/tool/lazyToolBody.test.ts",
+          "assertion": "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE: the idle prefetch swallows a failed load instead of leaving an unhandled rejection"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ocv5-376-platform-tool-proofs.ts",
+          "assertion": "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE: a failed load is not cached: the next call loads again"
+        }
+      ]
     }
   ]
 }

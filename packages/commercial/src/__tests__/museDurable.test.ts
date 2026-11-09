@@ -1,12 +1,21 @@
 // Lifecycle policy uses fake time; SQL fencing and actual message/billing dedupe are in integ.
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { fileURLToPath } from 'node:url'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it, type TestContext } from 'node:test'
+import type { Pool } from 'pg'
+import { hashSecret } from '../auth/containerIdentity.js'
+import { makeMuseInternalHandler } from '../muse/internalHttp.js'
+import { MUSE_INTERNAL_PREFIX, parseSubmission } from '../muse/protocol.js'
 import { MuseBridgeHub, type MuseBridgeHubOptions, type MuseWireJob } from '../muse/hub.js'
 import {
+  createMuseDurability,
   MUSE_BACKGROUND_TTL_MS,
   MUSE_LEASE_MS,
   type MuseDurability,
@@ -182,6 +191,105 @@ describe('durable Muse video lifecycle', () => {
       files: [{ idx: 0, chunks: 1, bytes: mp4.length, sha256: digest, mime: 'video/mp4' }],
     })
   }
+  async function internalServer(hub: MuseBridgeHub, t: TestContext) {
+    const secret = 'b'.repeat(64)
+    const handler = makeMuseInternalHandler({
+      hub,
+      identityRepo: {
+        async findActiveByHostAndBoundIp() {
+          return { id: 2, user_id: 1, bound_ip: '10.0.0.2', host_uuid: 'test', secret_hash: hashSecret(secret) }
+        },
+      },
+    })
+    const server = createServer((req, res) => void handler(req, res, { hostUuid: 'test', boundIp: '10.0.0.2' }))
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    t.after(async () => {
+      server.closeAllConnections()
+      await new Promise<void>((r) => server.close(() => r()))
+    })
+    return {
+      base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      token: `oc-v3.2.${secret}`,
+    }
+  }
+
+  it('INC-20261109-MUSE-ORIGIN-SCHEMA: explicit metadata stays strict and out of the bridge spec', () => {
+    const body = { kind: 'video', prompt: 'cat', session_key: 'agent:main:webchat:dm:origin' }
+    assert.deepEqual(parseSubmission(body), { kind: 'video', prompt: 'cat' })
+    for (const session_key of ['', '   ', null, 4, {}, 'x'.repeat(513)]) {
+      assert.throws(() => parseSubmission({ ...body, session_key }), /invalid session_key/)
+    }
+    assert.throws(() => parseSubmission({ ...body, arbitrary_unknown: true }), /Unrecognized key/)
+  })
+
+  it('INC-20261109-MUSE-ORIGIN-SCHEMA: HTTP reaches real origin ownership gate before insertion', async (t) => {
+    const originChecks: Array<[string, string]> = []
+    // Real production origin parser/owner gate; only session storage is substituted.
+    const origin = createMuseDurability({} as Pool, async () => {}, async (id, owner) => {
+      originChecks.push([id, owner])
+      return id === 'origin' && owner === 'c:1'
+    })
+    journal.validateOrigin = origin.validateOrigin
+    const hub = make()
+    const { base, token } = await internalServer(hub, t)
+    const post = (body: unknown) => fetch(`${base}${MUSE_INTERNAL_PREFIX}/jobs`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    for (const [extra, expected] of [
+      [{}, 400], [{ session_key: '' }, 400], [{ session_key: 5 }, 400],
+      [{ session_key: 'agent:main:telegram:dm:origin' }, 400],
+      [{ session_key: 'agent:main:webchat:dm:other-user-session' }, 403],
+      [{ session_key: 'agent:main:webchat:dm:origin', unexpected: 1 }, 400],
+    ] as const) {
+      const res = await post({ kind: 'video', prompt: 'cat', ...extra })
+      assert.equal(res.status, expected, await res.text())
+      assert.equal(journal.rows.size, 0, 'rejected input must not create a billable job')
+    }
+    const res = await post({ kind: 'video', prompt: 'cat', session_key: 'agent:main:webchat:dm:origin' })
+    assert.equal(res.status, 202)
+    const { job_id: id } = await res.json() as { job_id: string }
+    assert.equal(journal.rows.size, 1)
+    assert.deepEqual(originChecks.at(-1), ['origin', 'c:1'])
+    assert.equal(journal.rows.get(id)?.durable?.sessionId, 'origin')
+    assert.equal(journal.rows.get(id)?.durable?.agentId, 'main')
+    assert.equal('session_key' in journal.rows.get(id)!.durable!.spec, false)
+  })
+
+  it('INC-20261109-MUSE-ORIGIN-SCHEMA: real oc-muse video submits origin and acknowledges one conversation result', async (t) => {
+    const hub = make()
+    const sid = hub.hello('1', '0.5.3')
+    const { base, token } = await internalServer(hub, t)
+    const cli = fileURLToPath(new URL('../../agent-sandbox/platform-runtime/bin/oc-muse.py', import.meta.url))
+    const child = spawn('python3', ['-I', cli, 'video', 'cat', '--json'], {
+      env: { PATH: process.env.PATH, HOME: root, OPENCLAUDE_V3_MASTER_BASE_URL: base,
+        OPENCLAUDE_V3_CONTAINER_TOKEN: token, OPENCLAUDE_SESSION_KEY: 'agent:main:webchat:dm:origin' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (x) => { stdout += x })
+    child.stderr.on('data', (x) => { stderr += x })
+    const done = new Promise<number | null>((resolve) => child.on('close', resolve))
+    const deadline = setTimeout(() => child.kill('SIGKILL'), 20_000)
+    t.after(() => { clearTimeout(deadline); child.kill('SIGTERM') })
+    const job = await hub.poll(sid, 10_000)
+    assert.ok(job, stderr)
+    assert.equal(job.prompt, 'cat')
+    assert.equal('session_key' in job, false)
+    await success(hub, job)
+    await hub.durableTick()
+    await hub.durableTick()
+    assert.equal(await done, 0, stderr)
+    const ack = JSON.parse(stdout.trim())
+    assert.equal(ack.job_id, job.id)
+    assert.equal(ack.delivery, 'conversation')
+    assert.equal(journal.rows.size, 1)
+    assert.deepEqual([...journal.delivered], [job.id])
+    await assert.rejects(hub.result(job.id, job.nonce, { ok: true }), /reassigned/)
+    assert.equal(journal.rows.size, 1)
+  })
+
   it('initial + three 40s retries then durable acknowledgment, offline waiting consumes no execution retries', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] })
     const hub = make()

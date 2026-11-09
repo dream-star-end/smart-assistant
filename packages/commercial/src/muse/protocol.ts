@@ -167,6 +167,8 @@ const SubmitSchema = z
       .max(MUSE_LIMITS.max_source_images)
       .optional(),
     resume_snapshot_id: z.string().regex(SNAPSHOT_ID_RE).optional(),
+    // Origin metadata is validated for ownership by durability, never forwarded to the bridge.
+    session_key: z.string().min(1).max(512).refine((v) => v.trim().length > 0, 'session key is blank').optional(),
   })
   .strict()
 
