@@ -144,7 +144,7 @@ const SubmitSchema = z
       .optional(),
     resume_snapshot_id: z.string().regex(SNAPSHOT_ID_RE).optional(),
     mode: z.enum(['native', 'first_frame', 'reference', 'composite']).optional(),
-    count: z.number().int().min(1).max(6).optional(),
+    count: z.number().int().min(1).max(MUSE_LIMITS.max_files).optional(),
   })
   .strict()
 

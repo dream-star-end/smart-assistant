@@ -18,7 +18,7 @@ Call the platform CLI `oc-muse`. It already has container identity, credits, que
 | Animate a still (the image should be the opening frame) | `oc-muse video --mode first_frame --image still.png "<what happens next>"` |
 | Keep a character / style / scene from reference images, but start in a **new** scene | `oc-muse video --mode reference --image hero.png --image mood.png "<new scene; say what each image is>"` |
 | Longer explainer with word-for-word narration and burned-in subtitles | `oc-muse video --mode composite "<topic, language, and length in the prompt>"` |
-| Several native variations of the same shot (max 6) | `oc-muse video --mode native --count 2 "<shot>"` |
+| Several native variations of the same shot (max 4) | `oc-muse video --mode native --count 2 "<shot>"` |
 | Text-to-image or image edit | `oc-muse image "<prompt>"` (and `--image` for edits) |
 | Continue from a previous Muse snapshot | `oc-muse video --resume <snapshot_id> "<what happens next>"` |
 
@@ -37,7 +37,7 @@ Native Muse Video (`media.generate_video`) is typically **~10 s, 1280×720 or 72
 | `reference` | 1..N | Images are character / style / scene / object references, **not** the first frame | Native clip of the requested new scene |
 | `composite` | optional | Stills/clips + TTS + burned-in subtitles, assembled | Often longer, often 1080p; use only when narration/subtitles/length are required |
 
-`--count` is 1–6 and only applies to native-family modes (`native`, `first_frame`, `reference`). It asks for separate variations, not one longer film.
+`--count` is 1–4 and only applies to native-family modes (`native`, `first_frame`, `reference`). It asks for separate variations, not one longer film.
 
 `--mode` and `--count` are honoured when the job runs on the Muse web relay (the Box backend, or the backup when the hatch bridge is unavailable). The hatch bridge path makes one video from the prompt and the images, so you may get one result even when you asked for several; check how many files came back before you describe them to the user.
 
@@ -111,7 +111,7 @@ If the CLI prints `delivery=conversation` or a background-queue acknowledgment, 
 ## Limits
 
 - Native clip: about 10 seconds; resolution is not a menu (observed 1280×720, or 720×1280 when asked for 9:16).
-- At most **6** native clips per request (`--count`).
+- At most **4** native clips per request (`--count`).
 - Source images: png/jpg/webp (gif may be rejected by the server), typically ≤ 10 MiB each, up to 4 via `oc-muse`.
 - Site-wide Muse video concurrency is small. Extra jobs queue; they are not parallelized without limit.
 - Video credits are charged only when a job **succeeds** (commercial default decision: 50 credits per video job, 10 per image job). Failures are not charged.

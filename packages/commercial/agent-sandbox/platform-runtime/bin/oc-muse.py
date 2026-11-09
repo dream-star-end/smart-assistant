@@ -251,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     video.add_argument("--aspect-ratio", dest="aspect_ratio", choices=("4:5", "7:12", "9:16"))
     video.add_argument("--mode", choices=("native", "first_frame", "reference", "composite"),
                        help="video generation mode (optional; inferred from --image if omitted)")
-    video.add_argument("--count", type=int, default=None, help="native-family variations, 1-6")
+    video.add_argument("--count", type=int, default=None, help="native-family variations, 1-4")
 
     ns = parser.parse_args(argv)
     if ns.timeout is None:

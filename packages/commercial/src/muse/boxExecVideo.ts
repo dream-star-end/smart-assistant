@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import type { BoxCcExecRequest } from '@openclaude/gateway'
 
 import type { MuseJobSpec } from './protocol.js'
-import { MuseError } from './protocol.js'
+import { MUSE_LIMITS, MuseError } from './protocol.js'
 
 export const MUSE_VIDEO_BACKENDS = ['hatch', 'box-exec', 'hatch-with-box-fallback'] as const
 export type MuseVideoBackend = (typeof MUSE_VIDEO_BACKENDS)[number]
@@ -298,7 +298,7 @@ export async function runBoxExecVideoJob(input: {
   onSubmitAttempt?: () => void
 }): Promise<BoxExecVideoSuccess> {
   const mode = mapRelayMode(input.spec)
-  const count = Math.max(1, Math.min(6, input.spec.count ?? 1))
+  const count = Math.max(1, Math.min(MUSE_LIMITS.max_files, input.spec.count ?? 1))
   await mkdir(input.destDir, { recursive: true, mode: 0o700 })
   // `--prompt=<text>` so a prompt starting with "-" is never parsed as an option.
   const args = ['submit', `--prompt=${input.spec.prompt}`, '--mode', mode, '--count', String(count)]
