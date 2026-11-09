@@ -229,7 +229,10 @@ def provision_locked(root):
     client=module('codex-fixed-mcp.py'); client.read_catalog(root)
     h=module('oc-remote-hostd.py')
     h.codex_check_config_sources(Path(m['codexHome']),root/'cwd')
-    argv=[str(CLI),*h.codex_policy_args(),'-c','model_catalog_json='+json.dumps(str(root/'models.json')),
+    # thread_unload_delay_secs=0: an unsubscribed thread unloads at once, so a refreshed-instructions
+    # resume reloads it instead of reusing the old instructions held in memory.
+    argv=[str(CLI),*h.codex_policy_args(),'-c','thread_unload_delay_secs=0',
+          '-c','model_catalog_json='+json.dumps(str(root/'models.json')),
           '-c','mcp_servers.ocbridge.command="/usr/bin/python3"',
           '-c','mcp_servers.ocbridge.args='+json.dumps(['-I','-B',str(root/'codex-fixed-mcp.py'),str(root)]),
           '-c','mcp_servers.ocbridge.required=true','-c','mcp_servers.ocbridge.default_tools_approval_mode="approve"']
@@ -339,7 +342,7 @@ class Policy:
         method=frame.get('method'); p=frame.get('params',{})
         require(isinstance(p,dict),'CODEX_RPC_REJECTED')
         allowed={'initialize','initialized','model/list','account/read','mcpServerStatus/list','thread/start','thread/resume',
-                 'thread/read','turn/start','turn/interrupt'}
+                 'thread/read','thread/unsubscribe','turn/start','turn/interrupt'}
         require(method in allowed,'CODEX_RPC_REJECTED')
         if method=='initialized':
             require(self.initialized and not p and 'id' not in frame,'CODEX_RPC_REJECTED'); return frame
@@ -370,6 +373,10 @@ class Policy:
                 require(p['serviceTier'] in model.get('serviceTiers',[]),'CODEX_RPC_REJECTED')
             p={**p,'model':self.m['model'],'cwd':str(self.root/'cwd'),'approvalPolicy':'never',
                'sandboxPolicy':{'type':'readOnly','networkAccess':False}}
+        elif method=='thread/unsubscribe':
+            # Unloads the thread so the next resume re-reads its instructions; never mid-turn.
+            require(set(p)=={'threadId'} and self.thread and p['threadId']==self.thread and not self.turn
+                    and not any(x.startswith(('thread/','turn/')) for x in self.pending.values()),'CODEX_RPC_REJECTED')
         elif method in ('turn/interrupt','thread/read'):
             require(set(p)<=({'threadId','turnId'} if method=='turn/interrupt' else {'threadId','includeTurns'})
                     and self.thread and p.get('threadId')==self.thread,'CODEX_RPC_REJECTED')

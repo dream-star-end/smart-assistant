@@ -711,6 +711,8 @@ test('an effort change restarts only the kernel: first and later turns still run
   assert.equal(summary2.isError, false)
   assert.equal(h.receipts.length, 2)
   assert.equal(h.launches, 1, 'an effort change must not relaunch the node app')
+  assert.equal(h.received('launch').filter((row) => row?.received?.method === 'thread/unsubscribe').length, 0,
+    'unchanged instructions keep the thread loaded')
 })
 
 test('a withdrawn nickname is gone from the instructions the node resumes the warm thread with',
@@ -746,6 +748,14 @@ test('a withdrawn nickname is gone from the instructions the node resumes the wa
   assert.equal(typeof delivered, 'string', 'the resume carries the rebuilt instructions')
   assert.ok(delivered.length > 0)
   assert.ok(!delivered.includes(nickname), 'the withdrawn nickname must not reach the node again')
+  // Delivery is not enough: a loaded native thread ignores resume instructions. The node must have
+  // been made to unload it first, so the second turn actually runs on the rebuilt instructions.
+  assert.equal(nodeFrames('thread/unsubscribe').length, 1, 'the master unloads the warm thread before the resume')
+  const effective = h.received('launch').filter((row) => row && 'effectiveInstructions' in row)
+    .map((row) => row.effectiveInstructions)
+  assert.equal(effective.length, 2)
+  assert.ok(String(effective[0]).includes(nickname))
+  assert.equal(effective[1], delivered, 'the second turn runs on the rebuilt instructions')
   const secondTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 500, outputTokens: 60 }
   h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[1]!, secondTotal, {
     ...zeroNativeTokens(), inputTokens: 300, outputTokens: 40,

@@ -6,6 +6,8 @@ const handshakes = []
 const {role,manifest,turns=['turn-fixture'],thread='thread-fixture'} = JSON.parse(process.env.OC_TEST_NODE)
 let seq = 0
 let turn = 0
+let loaded = false
+let effective
 const out = v => process.stdout.write(JSON.stringify(v)+'\n')
 const wrap = payload => out({version:1,engine:'codex',...manifest,seq:++seq,kind:'stdout',payload})
 if (role === 'launch') out({version:1,engine:'codex',...manifest,seq:++seq,kind:'ready'})
@@ -26,8 +28,16 @@ readline.createInterface({input:process.stdin}).on('line',line => {
    return
   }
  }
- if (f.method === 'thread/start' || f.method === 'thread/resume')
+ // Native 0.167.0 semantics (verified on the real binary): instructions are read only when the
+ // thread is loaded; a resume of a loaded thread keeps the old ones until it is unloaded.
+ if (f.method === 'thread/start' || f.method === 'thread/resume') {
+  if (!loaded) { effective = f.params?.baseInstructions ?? effective; loaded = true }
   wrap({id:f.id,result:{model:manifest.model,thread:{id:thread}}})
- else if (f.method === 'turn/start') { const id = turns[Math.min(turn++, turns.length-1)]; wrap({id:f.id,result:{turn:{id}}}); wrap({method:'turn/started',params:{threadId:thread,turn:{id}}}) }
+ }
+ else if (f.method === 'thread/unsubscribe') {
+  wrap({id:f.id,result:{status: loaded ? 'unsubscribed' : 'notLoaded'}})
+  if (loaded) { loaded = false; wrap({method:'thread/status/changed',params:{threadId:thread,status:{type:'notLoaded'}}}); wrap({method:'thread/closed',params:{threadId:thread}}) }
+ }
+ else if (f.method === 'turn/start') { process.send?.({effectiveInstructions: effective ?? null}); const id = turns[Math.min(turn++, turns.length-1)]; wrap({id:f.id,result:{turn:{id}}}); wrap({method:'turn/started',params:{threadId:thread,turn:{id}}}) }
  else if (f.id !== undefined) wrap({id:f.id,result:{}})
 })

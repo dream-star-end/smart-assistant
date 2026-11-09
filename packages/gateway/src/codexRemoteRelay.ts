@@ -55,7 +55,15 @@ export class CodexRemoteRelay {
    * admission is recognized by its epoch and dropped: it must never collide with the fresh
    * kernel's own numbering.
    */
-  private readonly laneIds = new Map<number, { kernelId: unknown; method: string; epoch: number }>()
+  private readonly laneIds = new Map<number, { kernelId: unknown; method: string; epoch: number; instructions?: string }>()
+  /**
+   * The native app only reads a thread's instructions when it loads the thread: a resume of a
+   * thread it still holds keeps the old ones. `loadedInstructions` is what the node loaded the
+   * current thread with (undefined = not loaded, or loaded with unknown instructions).
+   */
+  private threadLoaded = false
+  private loadedInstructions?: string
+  private unloading?: { id: number; resolve: () => void; reject: (e: Error) => void; closed: boolean; acked: boolean }
   private laneIdSeq = 0
   private epoch = 0
   private readonly usedIds = new Set<string>()
@@ -280,6 +288,24 @@ export class CodexRemoteRelay {
     }
     this.observation!.observe(frame)
     let out = frame
+    const unloading = this.unloading
+    if (unloading && frame.id === unloading.id) {
+      codexNeed(frame.method === undefined && !frame.error &&
+        ['unsubscribed', 'notLoaded'].includes(frame.result?.status), 'CODEX_THREAD_UNLOAD_UNPROVEN')
+      this.laneIds.delete(frame.id)
+      unloading.acked = true
+      if (frame.result.status === 'notLoaded') unloading.closed = true
+      if (unloading.closed) unloading.resolve()
+      return
+    }
+    if (unloading && ['thread/closed', 'thread/status/changed'].includes(frame.method)) {
+      codexNeed(frame.params?.threadId === this.thread, 'CODEX_THREAD_UNLOAD_UNPROVEN')
+      if (frame.method === 'thread/closed') {
+        unloading.closed = true
+        if (unloading.acked) unloading.resolve()
+      }
+      return
+    }
     if (frame.id !== undefined) {
       // Answers only ever come back on ids this relay minted itself (see translate()).
       const entry = this.laneIds.get(frame.id)
@@ -301,6 +327,9 @@ export class CodexRemoteRelay {
         codexNeed(typeof id === 'string' && frame.result.model === this.spec.manifest.model &&
           (!this.spec.manifest.nativeThreadId || id === this.spec.manifest.nativeThreadId))
         this.observation!.bindThread(id); this.thread = id
+        // A warm resume keeps whatever the node loaded before; only a load sets new instructions.
+        if (entry.method === 'thread/start' || !this.threadLoaded) this.loadedInstructions = entry.instructions
+        this.threadLoaded = true
         this.baseline = await this.bindThread(id, entry.method === 'thread/start')
         await this.onThread(id)
       }
@@ -336,10 +365,11 @@ export class CodexRemoteRelay {
     codexNeed(!this.revoked); this.publish(out)
   }
   /** Hands the app a lane-unique id so a response can never be mistaken across admissions. */
-  private translate(frame: any, method: string): any {
+  private translate(frame: any, method: string, instructions?: string): any {
     codexNeed(this.laneIds.size < 100000, 'CODEX_ID_TRANSLATION_LIMIT')
     const laneId = ++this.laneIdSeq
-    this.laneIds.set(laneId, { kernelId: frame.id, method, epoch: this.epoch })
+    this.laneIds.set(laneId, { kernelId: frame.id, method, epoch: this.epoch,
+      ...(instructions === undefined ? {} : { instructions }) })
     return { ...frame, id: laneId }
   }
   private waitAcknowledgements(): Promise<void> {
@@ -398,8 +428,44 @@ export class CodexRemoteRelay {
       }
       this.handshake = { paramsHash }
     }
-    const forwarded = method === 'initialized' ? frame : this.translate(frame, method)
+    const instructions = ['thread/start', 'thread/resume'].includes(method) && typeof p.baseInstructions === 'string'
+      ? p.baseInstructions : undefined
+    if (method === 'thread/resume' && instructions !== undefined && this.threadLoaded &&
+        this.loadedInstructions !== instructions) {
+      await this.unloadThread()
+    }
+    const forwarded = method === 'initialized' ? frame : this.translate(frame, method, instructions)
     this.app.stdin.write(`${JSON.stringify(forwarded)}\n`)
+  }
+  /**
+   * Makes the node drop the thread from memory so the next resume loads it — and the instructions
+   * it carries — from the rollout. Fails closed: a resume that cannot prove the reload never goes out.
+   */
+  private async unloadThread(): Promise<void> {
+    const app = this.app
+    codexNeed(app !== undefined && this.thread !== undefined && !this.dispatching && !this.unloading,
+      'CODEX_THREAD_UNLOAD_UNPROVEN')
+    codexNeed(this.laneIds.size < 100000, 'CODEX_ID_TRANSLATION_LIMIT')
+    const id = ++this.laneIdSeq
+    this.laneIds.set(id, { kernelId: undefined, method: 'thread/unsubscribe', epoch: -1 })
+    const done = new Promise<void>((resolve, reject) => {
+      this.unloading = { id, resolve, reject, closed: false, acked: false }
+    })
+    const timer = setTimeout(() => this.unloading?.reject(new Error('CODEX_THREAD_UNLOAD_UNPROVEN')), 15000)
+    try {
+      this.record('thread-unload', { threadId: this.thread })
+      app!.stdin.write(`${JSON.stringify({ id, method: 'thread/unsubscribe', params: { threadId: this.thread } })}\n`)
+      await done
+      this.threadLoaded = false
+      this.loadedInstructions = undefined
+      this.record('thread-unloaded', { threadId: this.thread })
+    } catch (error) {
+      this.fence(error instanceof Error ? error.message : 'CODEX_THREAD_UNLOAD_UNPROVEN')
+      throw error
+    } finally {
+      clearTimeout(timer)
+      this.unloading = undefined
+    }
   }
   private async control(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const v = await body(req), path = req.url
