@@ -9991,7 +9991,7 @@
       "occurredAt": "2026-11-08",
       "severity": "P1",
       "symptom": "知识星球二维码生成失败后扫码 worker 继续占用容量直到总期限；原始二维码失败触发原因未证实。",
-      "rootFixCommit": "e00d1a14",
+      "rootFixCommit": "0403018b",
       "coverageCommits": [],
       "regressions": [
         {
@@ -10011,7 +10011,7 @@
       "occurredAt": "2026-11-09",
       "severity": "P1",
       "symptom": "知识星球微信登录二维码可以显示，扫码后页面一直不显示已登录。worker CONNECT 中继 15s 空闲超时切断了 lp.open.weixin.qq.com 约 20s 的 qrconnect long-poll，扫码确认无法回到登录页。",
-      "rootFixCommit": "031a9585",
+      "rootFixCommit": "ded8da6b",
       "coverageCommits": [],
       "regressions": [
         {
