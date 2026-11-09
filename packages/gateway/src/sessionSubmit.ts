@@ -2879,6 +2879,11 @@ export function _resumeIdFor(
   }
   if (tag !== wantProvider) return undefined
 
+  if (tag === 'codex' && this.sessions.get(sessionKey)?.runner.executionBackend?.kind === 'codex-app-server-v1') {
+    // The rollout lives on the remote node; the relay only resumes the thread its lane bound.
+    return id
+  }
+
   if (tag === 'cursor' && isCursorSandBoxCcResumeId(id)) {
     if (!cursorSandBoxCcResumeInnerId(id)) {
       log.warn('resume-map Cursor box Claude entry is malformed — dropping silently', {
