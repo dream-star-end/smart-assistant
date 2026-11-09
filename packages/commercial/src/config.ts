@@ -717,6 +717,8 @@ export const commercialConfigSchema = z
     /**
      * OCV5-750 second Muse video backend. Unset / empty / "hatch" = today's hatch path.
      * "box-exec" routes video (no --resume) through Box Exec → muse-exec-cli.
+     * "hatch-with-box-fallback" keeps hatch primary and moves a video the hatch bridge has
+     * not started (offline / never acked / queue wait) onto Box Exec.
      */
     OC_MUSE_VIDEO_BACKEND: z
       .string()
@@ -725,7 +727,10 @@ export const commercialConfigSchema = z
         const trimmed = (value ?? "").trim()
         if (!trimmed || trimmed === "hatch") return "hatch" as const
         if (trimmed === "box-exec") return "box-exec" as const
-        throw new Error("OC_MUSE_VIDEO_BACKEND must be hatch or box-exec")
+        if (trimmed === "hatch-with-box-fallback") return "hatch-with-box-fallback" as const
+        throw new Error(
+          "OC_MUSE_VIDEO_BACKEND must be hatch, box-exec or hatch-with-box-fallback",
+        )
       }),
     /** When "1", a down box-exec relay may fall back onto hatch if the hatch bridge is online. */
     OC_MUSE_BOX_EXEC_FALLBACK_HATCH: z

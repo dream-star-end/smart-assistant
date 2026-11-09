@@ -11,7 +11,12 @@ import type { BoxCcExecRequest } from '@openclaude/gateway'
 
 import { BOX_EXEC_CHUNK_BYTES } from '../muse/boxExecVideo.js'
 import { MuseBridgeHub } from '../muse/hub.js'
-import { MuseError } from '../muse/protocol.js'
+import {
+  ACK_TIMEOUT_MS,
+  BRIDGE_ONLINE_MS,
+  MAX_DISPATCH_ATTEMPTS,
+  MuseError,
+} from '../muse/protocol.js'
 import type { MuseJobFinish, MuseStore } from '../muse/store.js'
 
 class MemStore implements MuseStore {
@@ -235,3 +240,175 @@ describe('OCV5-750 hub routing', () => {
     assert.equal(hatchHello, 1)
   })
 })
+
+function okRelay(counter: { submits: number; calls: string[] }) {
+  const payload = Buffer.alloc(64, 5)
+  payload.write('ftyp', 4)
+  const digest = createHash('sha256').update(payload).digest('hex')
+  return async (request: BoxCcExecRequest) => {
+    const verb = String(request.args[2])
+    counter.calls.push(verb)
+    if (verb === 'submit') {
+      counter.submits += 1
+      return { stdout: JSON.stringify({ ok: true, id: 'fb1', status: 'queued' }) }
+    }
+    if (verb === 'status') {
+      return {
+        stdout: JSON.stringify({ ok: true, id: 'fb1', status: 'done', files: [{ index: 0 }] }),
+      }
+    }
+    if (verb === 'fetch-chunk') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          offset: 0,
+          total: payload.length,
+          sha256: digest,
+          data: payload.toString('base64'),
+          eof: true,
+        }),
+      }
+    }
+    if (verb === 'cancel') return { stdout: JSON.stringify({ ok: true }) }
+    throw new Error(`unexpected ${verb}`)
+  }
+}
+
+describe('OCV5-750 hatch-with-box-fallback', () => {
+  it('hatch offline at submit: a fresh video goes to the relay; images and resume still fail', async () => {
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => okRelay(counter),
+    })
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(counter.submits, 1)
+    await assert.rejects(
+      hub.submit('3', null, { kind: 'image', prompt: 'still' }),
+      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_BRIDGE_OFFLINE',
+    )
+    await assert.rejects(
+      hub.submit('3', null, { kind: 'video', prompt: 'more', resume_snapshot_id: 'abc:v1' }),
+      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_BRIDGE_OFFLINE',
+    )
+  })
+
+  it('hatch online: the job goes to hatch and the relay is never called', async () => {
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => okRelay(counter),
+    })
+    const sid = hub.hello('1', '0.5.3')
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const job = (await hub.poll(sid, 50))!
+    assert.equal(job.id, id)
+    hub.heartbeat(job.id, job.nonce)
+    assert.equal(counter.calls.length, 0)
+  })
+
+  it('a queued hatch job moves to the relay when the bridge goes offline', async () => {
+    let clock = 1_000_000
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      now: () => clock,
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => okRelay(counter),
+    })
+    hub.hello('1', '0.5.3')
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    clock += BRIDGE_ONLINE_MS + 1_000
+    hub.tick()
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(counter.submits, 1)
+  })
+
+  it('a never-acked dispatch moves to the relay and a late hatch ack gets 410', async () => {
+    let clock = 1_000_000
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      now: () => clock,
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => okRelay(counter),
+    })
+    const sid = hub.hello('1', '0.5.3')
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    let last: { id: string; nonce: string } | null = null
+    for (let attempt = 1; attempt <= MAX_DISPATCH_ATTEMPTS; attempt++) {
+      const job = (await hub.poll(sid, 50))!
+      last = job
+      clock += ACK_TIMEOUT_MS + 1
+      hub.checkSession(sid)
+      hub.tick()
+    }
+    assert.throws(
+      () => hub.heartbeat(last!.id, last!.nonce),
+      (err: unknown) => err instanceof MuseError && err.status === 410,
+    )
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(counter.submits, 1)
+  })
+
+  it('an acked (running) hatch job that loses its bridge fails and never touches the relay', async () => {
+    let clock = 1_000_000
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      now: () => clock,
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => okRelay(counter),
+    })
+    const sid = hub.hello('1', '0.5.3')
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const job = (await hub.poll(sid, 50))!
+    hub.heartbeat(job.id, job.nonce)
+    clock += 200_000
+    hub.tick()
+    const view = await hub.view('3', id, 100)
+    assert.equal(view?.status, 'failed')
+    assert.equal(view?.error?.code, 'MUSE_BRIDGE_LOST')
+    assert.equal(counter.calls.length, 0)
+  })
+
+  it('a job that fell back to the relay never bounces back to hatch', async () => {
+    const hub = makeHub(tmpRoot(), {
+      videoBackend: 'hatch-with-box-fallback',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner: async () => async () => {
+        throw new Error('relay is down')
+      },
+    })
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    hub.hello('1', '0.5.3')
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(view?.status, 'failed')
+  })
+
+  it('plain hatch mode still fails queued jobs when the bridge goes offline', async () => {
+    let clock = 1_000_000
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      now: () => clock,
+      videoBackend: 'hatch',
+      boxExecRunner: async () => okRelay(counter),
+    })
+    hub.hello('1', '0.5.3')
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    clock += BRIDGE_ONLINE_MS + 1_000
+    hub.tick()
+    const view = await hub.view('3', id, 100)
+    assert.equal(view?.error?.code, 'MUSE_BRIDGE_OFFLINE')
+    assert.equal(counter.calls.length, 0)
+  })
+})
+
+void BOX_EXEC_CHUNK_BYTES

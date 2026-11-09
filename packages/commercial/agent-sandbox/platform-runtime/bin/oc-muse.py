@@ -168,7 +168,7 @@ def run(kind: str, ns: argparse.Namespace) -> int:
     box_exec_ok = (
         kind == "video"
         and not ns.resume
-        and backend == "box-exec"
+        and backend in ("box-exec", "hatch-with-box-fallback")
     )
     if not status.get("bridge_online") and not box_exec_ok:
         raise MuseFailure("MUSE_BRIDGE_OFFLINE", "the Muse bridge is not connected; ask the user to start it in the Muse VM")

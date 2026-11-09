@@ -21,6 +21,7 @@ import {
   type BoxCliExecFn,
   type MuseVideoBackend,
   boxExecDeadlineMs,
+  canFallbackToBoxExec,
   canRouteToBoxExec,
   runBoxExecVideoJob,
 } from './boxExecVideo.js'
@@ -98,6 +99,8 @@ interface HubJob {
   finishedAt: number
   waiters: Set<() => void>
   via: 'hatch' | 'box-exec'
+  /** Set once a job has moved hatch → box-exec; it never moves back. */
+  movedToBox?: boolean
   abort?: AbortController
 }
 
@@ -123,7 +126,6 @@ function canFallbackBoxExecToHatch(input: {
     input.message,
   )
 }
-
 
 export interface MuseJobView {
   job_id: string
@@ -243,7 +245,7 @@ export class MuseBridgeHub {
   getVideoBackend(): MuseVideoBackend {
     try {
       const raw = readFileSync(join(this.root, 'video-backend'), 'utf8').trim()
-      if (raw === 'hatch' || raw === 'box-exec') return raw
+      if (raw === 'hatch' || raw === 'box-exec' || raw === 'hatch-with-box-fallback') return raw
     } catch {
       // file absent or unreadable → configured default
     }
@@ -539,7 +541,10 @@ export class MuseBridgeHub {
         'Muse media tools are not enabled for this account',
       )
     }
-    const routeBox = canRouteToBoxExec(this.getVideoBackend(), spec)
+    const backend = this.getVideoBackend()
+    const routeBox =
+      canRouteToBoxExec(backend, spec) ||
+      (!this.bridgeOnline() && this.boxFallbackAvailable(backend, spec))
     if (!this.bridgeOnline() && !routeBox) {
       throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'the Muse bridge is not connected')
     }
@@ -558,7 +563,7 @@ export class MuseBridgeHub {
     if (routeBox) this.reservedBox += 1
     else this.reservedTotal += 1
     try {
-      return await this.admit(userId, containerId, spec, pending, opts.jobId)
+      return await this.admit(userId, containerId, spec, pending, routeBox, opts.jobId)
     } finally {
       if (routeBox) this.reservedBox -= 1
       else this.reservedTotal -= 1
@@ -573,6 +578,7 @@ export class MuseBridgeHub {
     containerId: string | null,
     spec: MuseJobSpec,
     pending: number,
+    routeBox: boolean,
     fixedId?: string,
   ): Promise<string> {
     const counts = await this.store.countRecent(userId, spec.kind)
@@ -645,8 +651,9 @@ export class MuseBridgeHub {
       via: 'hatch',
     }
     this.jobs.set(id, job)
-    if (canRouteToBoxExec(this.getVideoBackend(), spec)) {
+    if (routeBox) {
       job.via = 'box-exec'
+      job.movedToBox = !canRouteToBoxExec(this.getVideoBackend(), spec)
       this.boxExecPending.push(job)
       this.log.info('muse_media_job_queued', {
         jobId: id,
@@ -732,6 +739,7 @@ export class MuseBridgeHub {
     const now = this.now()
     if (!this.bridgeOnline()) {
       for (const job of [...this.queue]) {
+        if (this.moveToBoxExec(job, 'hatch_offline')) continue
         this.finish(job, fail('MUSE_BRIDGE_OFFLINE', 'the Muse bridge disconnected'))
       }
     }
@@ -753,7 +761,9 @@ export class MuseBridgeHub {
           attempt: a.dispatchCount,
           claimResponseBytes: a.claimResponseBytes,
         })
-        this.finish(a, fail('MUSE_BRIDGE_LOST', 'the bridge never acknowledged the job'))
+        if (!this.moveToBoxExec(a, 'hatch_never_acked')) {
+          this.finish(a, fail('MUSE_BRIDGE_LOST', 'the bridge never acknowledged the job'))
+        }
       } else {
         this.log.warn('muse_job_ack_timeout_requeued', {
           jobId: a.id,
@@ -771,6 +781,7 @@ export class MuseBridgeHub {
     }
     for (const job of [...this.queue]) {
       if (now - job.queuedAt > QUEUE_WAIT_MS) {
+        if (this.moveToBoxExec(job, 'hatch_queue_wait')) continue
         this.finish(job, fail('MUSE_BUSY', 'waited too long in the Muse queue', true))
       }
     }
@@ -780,6 +791,35 @@ export class MuseBridgeHub {
         void rm(join(this.root, id), { recursive: true, force: true })
       }
     }
+  }
+
+  private boxFallbackAvailable(backend: MuseVideoBackend, spec: MuseJobSpec): boolean {
+    return this.boxExecRunner !== undefined && canFallbackToBoxExec(backend, spec)
+  }
+
+  /**
+   * hatch-with-box-fallback: move a job that hatch has not started (queued, or dispatched
+   * with no ack) onto the Box relay. Rotating the nonce makes any late ack/claim from the
+   * hatch bridge get 410, so hatch can no longer start it. Returns false when not allowed.
+   */
+  private moveToBoxExec(job: HubJob, reason: string): boolean {
+    if (job.state !== 'queued' && job.state !== 'dispatched') return false
+    if (job.via !== 'hatch' || job.movedToBox) return false
+    if (!this.boxFallbackAvailable(this.getVideoBackend(), job.spec)) return false
+    if (this.boxExecPending.length + this.boxExecInflight.size >= QUEUE_MAX) return false
+    if (this.active === job) this.active = null
+    const qi = this.queue.indexOf(job)
+    if (qi >= 0) this.queue.splice(qi, 1)
+    job.nonce = randomUUID()
+    job.state = 'queued'
+    job.via = 'box-exec'
+    job.movedToBox = true
+    job.queuedAt = this.now()
+    this.boxExecPending.push(job)
+    this.log.warn('muse_hatch_fell_back_to_box_exec', { jobId: job.id, reason })
+    this.pumpBoxExec()
+    this.pump()
+    return true
   }
 
   private pumpBoxExec(): void {
@@ -832,6 +872,7 @@ export class MuseBridgeHub {
       const message = err instanceof Error ? err.message : 'box-exec failed'
       if (
         this.fallbackHatch &&
+        !job.movedToBox &&
         this.bridgeOnline() &&
         canFallbackBoxExecToHatch({ relaySubmitted, museErr, message })
       ) {

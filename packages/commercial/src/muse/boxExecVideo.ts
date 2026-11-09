@@ -11,7 +11,7 @@ import type { BoxCcExecRequest } from '@openclaude/gateway'
 import type { MuseJobSpec } from './protocol.js'
 import { MuseError } from './protocol.js'
 
-export const MUSE_VIDEO_BACKENDS = ['hatch', 'box-exec'] as const
+export const MUSE_VIDEO_BACKENDS = ['hatch', 'box-exec', 'hatch-with-box-fallback'] as const
 export type MuseVideoBackend = (typeof MUSE_VIDEO_BACKENDS)[number]
 
 export const MUSE_RELAY_MODES = ['native', 'first_frame', 'reference', 'composite'] as const
@@ -30,7 +30,11 @@ export function parseMuseVideoBackend(raw: string | undefined): MuseVideoBackend
   const value = (raw ?? '').trim()
   if (!value) return DEFAULT_MUSE_VIDEO_BACKEND
   if ((MUSE_VIDEO_BACKENDS as readonly string[]).includes(value)) return value as MuseVideoBackend
-  throw new MuseError(500, 'MUSE_INVALID_INPUT', 'OC_MUSE_VIDEO_BACKEND must be hatch or box-exec')
+  throw new MuseError(
+    500,
+    'MUSE_INVALID_INPUT',
+    'OC_MUSE_VIDEO_BACKEND must be hatch, box-exec or hatch-with-box-fallback',
+  )
 }
 
 export function mapRelayMode(spec: MuseJobSpec): MuseRelayMode {
@@ -46,9 +50,24 @@ export function mapRelayMode(spec: MuseJobSpec): MuseRelayMode {
 
 export function canRouteToBoxExec(backend: MuseVideoBackend, spec: MuseJobSpec): boolean {
   if (backend !== 'box-exec') return false
+  return isBoxExecEligible(spec)
+}
+
+/** Fresh videos only: images and `--resume` need hatch's Muse snapshot. */
+export function isBoxExecEligible(spec: MuseJobSpec): boolean {
   if (spec.kind !== 'video') return false
   if (spec.resume_snapshot_id) return false
   return true
+}
+
+/**
+ * `hatch-with-box-fallback`: hatch stays primary. A job may move to the Box relay only
+ * while hatch has provably not started it (queued, or dispatched without an ack — the ack
+ * is hatch's execution barrier), so a job can never generate on both backends.
+ */
+export function canFallbackToBoxExec(backend: MuseVideoBackend, spec: MuseJobSpec): boolean {
+  if (backend !== 'hatch-with-box-fallback') return false
+  return isBoxExecEligible(spec)
 }
 
 export function boxExecDeadlineMs(spec: MuseJobSpec): number {
