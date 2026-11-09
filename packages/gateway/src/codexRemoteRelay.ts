@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events'
 import { constants, closeSync, fsyncSync, mkdirSync, openSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { assertLeaseMatchesAuthority, verifyAuthority, verifyTurnLease, sameRemoteExecutionBackend,
   type AuthorityKeyring, type ModelAuthorityPayload } from '@openclaude/protocol'
@@ -64,7 +65,6 @@ export class CodexRemoteRelay {
   private threadLoaded = false
   private loadedInstructions?: string
   private unloading?: { id: number; resolve: () => void; reject: (e: Error) => void; closed: boolean; acked: boolean }
-  private unloadOwner?: { finance?: RemoteFinanceTurn; epoch: number }
   private laneIdSeq = 0
   private epoch = 0
   private readonly usedIds = new Set<string>()
@@ -338,6 +338,17 @@ export class CodexRemoteRelay {
       }
     }
     const p = frame.params
+    if (frame.method === 'thread/tokenUsage/updated' && !this.dispatching) {
+      // Codex 0.167 re-emits a resumed thread's last cumulative usage before any turn/start. It is
+      // only droppable when it is exactly the boundary finance already settled for this thread.
+      const { totalTokens, ...usage } = p?.tokenUsage?.total ?? {}
+      const total = nativeTokens(usage), bound = this.boundThread
+      codexNeed(this.active && p?.threadId === this.thread && bound !== undefined && bound.id === this.thread &&
+        Number.isSafeInteger(totalTokens) && totalTokens === total.inputTokens + total.outputTokens &&
+        isDeepStrictEqual(total, bound.baseline), 'CODEX_USAGE_REPLAY_UNPROVEN')
+      this.record('usage-replay', { threadId: p.threadId, turnId: p.turnId ?? null })
+      return
+    }
     if (frame.method === 'thread/tokenUsage/updated') {
       codexNeed(this.active && this.dispatching && p?.threadId === this.thread && p.turnId === this.observation!.nativeTurnId)
       const { totalTokens, ...usage } = p.tokenUsage?.total ?? {}
@@ -451,10 +462,8 @@ export class CodexRemoteRelay {
     codexNeed(app !== undefined && this.thread !== undefined && !this.dispatching && !this.unloading,
       'CODEX_THREAD_UNLOAD_UNPROVEN')
     codexNeed(this.laneIds.size < 100000, 'CODEX_ID_TRANSLATION_LIMIT')
-    // The admission this unload serves: a stop before it completes must close exactly this
-    // undispatched finance owner, and a resume after it may only go out for the same admission.
+    // A resume after the unload may only go out for the admission it served.
     const owner = { finance: this.financeTurn, epoch: this.epoch }
-    this.unloadOwner = owner
     const id = ++this.laneIdSeq
     this.laneIds.set(id, { kernelId: undefined, method: 'thread/unsubscribe', epoch: -1 })
     const done = new Promise<void>((resolve, reject) => {
@@ -470,7 +479,6 @@ export class CodexRemoteRelay {
       this.record('thread-unloaded', { threadId: this.thread })
       codexNeed(!this.revoked && this.active && this.epoch === owner.epoch && this.financeTurn === owner.finance,
         'CODEX_THREAD_UNLOAD_STALE')
-      this.unloadOwner = undefined
     } catch (error) {
       this.fence(error instanceof Error ? error.message : 'CODEX_THREAD_UNLOAD_UNPROVEN')
       throw error
@@ -565,16 +573,16 @@ export class CodexRemoteRelay {
         remoteStopped: proof.remoteStopped && this.localStopped,
         ...(this.memoryRefused ? { nodeAdmissionRejected: true, nodeAdmissionReason: this.memoryRefused } : {}) })
       codexNeed(proof.remoteStopped && this.localStopped, 'CODEX_STOP_UNKNOWN')
-      // A stop that interrupted a thread unload: this admission already holds a bound thread but
-      // never wrote turn/start, a shape the ordinary stop leaves inflight. With both stop proofs in
-      // hand, close it by identity — the same proof the container's own abandon uses.
-      const owner = this.unloadOwner
-      if (owner && owner.finance === this.financeTurn && owner.epoch === this.epoch && this.active && !this.dispatching) {
-        codexNeed(typeof owner.finance?.abandonUndispatched === 'function', 'CODEX_ABANDON_UNSUPPORTED')
-        const outcome = await owner.finance!.abandonUndispatched!({ failureCode: 'INTERNAL_ERROR',
-          diagnostic: 'remote_native_thread_unload_unproven' })
+      // An admission stopped before turn/start never reached the model, a shape the ordinary stop
+      // leaves inflight with its thread claimed. With both stop proofs in hand, close it unbilled
+      // by identity (as the container's own abandon does), keeping the fence's first cause.
+      const finance = this.financeTurn
+      if (finance && this.active && !this.dispatching) {
+        codexNeed(typeof finance.abandonUndispatched === 'function', 'CODEX_ABANDON_UNSUPPORTED')
+        const outcome = await finance.abandonUndispatched(this.firstCause
+          ? { failureCode: 'INTERNAL_ERROR', diagnostic: this.firstCause.toLowerCase().slice(0, 64) } : undefined)
         codexNeed(outcome.state === 'proven', 'CODEX_ABANDON_UNSETTLED')
-        this.active = false; this.unloadOwner = undefined
+        this.active = false
         this.record('abandoned', { authorityTurnId: this.admitted?.payload.authorityTurnId, cause: this.firstCause })
       }
       this.record('stopped', { remoteStopped: true }); return { remoteStopped: true as const }

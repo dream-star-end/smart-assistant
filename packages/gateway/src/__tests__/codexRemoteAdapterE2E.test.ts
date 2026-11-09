@@ -117,6 +117,8 @@ async function lane(t: TestContext, options: {
   sessionId?: string
   /** The node refuses thread/unsubscribe, as an older controller does. */
   rejectUnsubscribe?: boolean
+  /** The node's post-resume usage replay claims more tokens than were billed. */
+  inflateUsageReplay?: boolean
 } = {}): Promise<Lane> {
   const root = mkdtempSync(join(tmpdir(), 'codex-container-e2e-'))
   const cwd = join(root, 'cwd')
@@ -217,7 +219,7 @@ async function lane(t: TestContext, options: {
       const child = spawn(process.execPath, [NODE_FIXTURE], {
         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
         env: { ...process.env, OC_TEST_NODE: JSON.stringify({ role, manifest: spec.manifest, turns: TURNS, thread: THREAD,
-          rejectUnsubscribe: options.rejectUnsubscribe === true }) },
+          rejectUnsubscribe: options.rejectUnsubscribe === true, inflateUsageReplay: options.inflateUsageReplay === true }) },
       }) as ChildProcessWithoutNullStreams
       const rows = receivedByRole.get(role) ?? []
       receivedByRole.set(role, rows)
@@ -798,11 +800,39 @@ test('a node that refuses the thread unload fences the lane and closes the undis
   const summary2 = await run2.summary.catch((error: unknown) => ({ isError: true, error }))
   assert.equal(summary2?.isError, true, 'the turn fails instead of running on the old instructions')
   await h.until(() => h.abandonCauses().length === 1, 'the undispatched admission is closed')
-  assert.deepEqual(h.abandonCauses(), [{ failureCode: 'INTERNAL_ERROR', diagnostic: 'remote_native_thread_unload_unproven' }])
+  assert.deepEqual(h.abandonCauses(), [{ failureCode: 'INTERNAL_ERROR', diagnostic: 'codex_thread_unload_unproven' }])
   assert.equal(nodeFrames('thread/unsubscribe').length, 1)
   assert.equal(nodeFrames('thread/resume').length, 0, 'no resume reaches the node after a refused unload')
   assert.equal(nodeFrames('turn/start').length, 1, 'the second turn never reached the node')
   assert.equal(h.receipts.length, 1)
+})
+
+test('a post-resume usage replay that differs from the billed thread total fences before the turn',
+  { timeout: 180000 }, async (t) => {
+  // OCV5-746 live: 0.167 re-emits the last cumulative usage after a warm resume. Only the exact
+  // settled boundary may be dropped; anything else is unbilled usage and must not be ignored.
+  const h = await lane(t, { inflateUsageReplay: true })
+  const turnStarts = () => h.received('launch')
+    .map((row) => row?.received).filter((frame) => frame?.method === 'turn/start')
+  const first = h.authority('req-replay-1')
+  const run = h.adapter.submitTurn(h.turnParams(first, h.turnKey, 'req-replay-1'))
+  await h.until(() => turnStarts().length === 1, 'first turn/start')
+  const firstTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 200, outputTokens: 20 }
+  h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[0]!, firstTotal, firstTotal) })
+  h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[0], status: 'completed' } } })
+  assert.equal((await run.summary)?.isError, false)
+
+  h.adapter.setEffortLevel('high')
+  await restartRunnerForConfigChange(h.adapter)
+  const second = h.authority('req-replay-2')
+  const run2 = h.adapter.submitTurn(h.turnParams(second, 'f'.repeat(64), 'req-replay-2'))
+  const summary2 = await run2.summary.catch((error: unknown) => ({ isError: true, error }))
+  assert.equal(summary2?.isError, true)
+  assert.equal(turnStarts().length, 1, 'the second turn never reached the node')
+  assert.equal(h.receipts.length, 1)
+  // Live it stayed inflight with the thread claimed, so the conversation could never continue.
+  await h.until(() => h.abandonCauses().length === 1, 'the undispatched admission is closed unbilled')
+  assert.deepEqual(h.abandonCauses(), [{ failureCode: 'INTERNAL_ERROR', diagnostic: 'codex_usage_replay_unproven' }])
 })
 
 test('a turn submitted while another runs admits only after that turn ends', { timeout: 180000 }, async (t) => {

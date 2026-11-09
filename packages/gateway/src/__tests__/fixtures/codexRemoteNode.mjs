@@ -3,7 +3,7 @@ import readline from 'node:readline'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 const handshakes = []
-const {role,manifest,turns=['turn-fixture'],thread='thread-fixture',rejectUnsubscribe=false} = JSON.parse(process.env.OC_TEST_NODE)
+const {role,manifest,turns=['turn-fixture'],thread='thread-fixture',rejectUnsubscribe=false,inflateUsageReplay=false} = JSON.parse(process.env.OC_TEST_NODE)
 let seq = 0
 let turn = 0
 let loaded = false
@@ -12,7 +12,11 @@ const out = v => process.stdout.write(JSON.stringify(v)+'\n')
 const wrap = payload => out({version:1,engine:'codex',...manifest,seq:++seq,kind:'stdout',payload})
 if (role === 'launch') out({version:1,engine:'codex',...manifest,seq:++seq,kind:'ready'})
 else out({...manifest,version:3,engine:'codex',kind:'socket-ready'})
-process.on('message',v => { if (role === 'launch') wrap(v); else out(v) })
+let lastUsage
+process.on('message',v => {
+ if (v?.method === 'thread/tokenUsage/updated') lastUsage = v.params
+ if (role === 'launch') wrap(v); else out(v)
+})
 readline.createInterface({input:process.stdin}).on('line',line => {
  const f=JSON.parse(line)
  process.send?.({received:f})
@@ -31,8 +35,15 @@ readline.createInterface({input:process.stdin}).on('line',line => {
  // Native 0.167.0 semantics (verified on the real binary): instructions are read only when the
  // thread is loaded; a resume of a loaded thread keeps the old ones until it is unloaded.
  if (f.method === 'thread/start' || f.method === 'thread/resume') {
+  const warm = loaded
   if (!loaded) { effective = f.params?.baseInstructions ?? effective; loaded = true }
   wrap({id:f.id,result:{model:manifest.model,thread:{id:thread}}})
+  // 0.167.0 (seen live on the node) re-emits the thread's last cumulative usage after a warm resume.
+  if (warm && f.method === 'thread/resume' && lastUsage) {
+   const total = {...lastUsage.tokenUsage.total}
+   if (inflateUsageReplay) { total.inputTokens += 1; total.totalTokens += 1 }
+   wrap({method:'thread/tokenUsage/updated',params:{...lastUsage,tokenUsage:{...lastUsage.tokenUsage,total}}})
+  }
  }
  else if (f.method === 'thread/unsubscribe' && rejectUnsubscribe) {
   // An older node controller: the RPC is not on its allow-list.
