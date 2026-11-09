@@ -10045,6 +10045,21 @@
           "assertion": "Knowledge Planet setup shows login success after WeChat scan while QR is visible"
         }
       ]
+    },
+    {
+      "id": "INC-20261109-KP-QR-BROKER-CONCURRENCY",
+      "occurredAt": "2026-11-09",
+      "severity": "P1",
+      "symptom": "知识星球扫码登录经常不出码：微信登录页需要 9～11 条并发 TLS 隧道，知识星球 broker 限额 maxConcurrent=8，超出的隧道被直接丢弃，真码图 open.weixin.qq.com/connect/qrcode/<uuid> 加载不出来，只剩模糊占位图，capture_qr 报 image_not_ready。",
+      "rootFixCommit": "9b2cc118",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/knowledgePlanet.test.ts",
+          "assertion": "INC-20261109-KP-QR-BROKER-CONCURRENCY: login broker carries more than 9 concurrent WeChat tunnels so the QR image still loads"
+        }
+      ]
     }
   ]
 }
