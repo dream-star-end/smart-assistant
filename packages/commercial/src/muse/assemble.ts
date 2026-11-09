@@ -6,6 +6,7 @@ import type { Pool } from 'pg'
 
 import type { CommercialConfig } from '../config.js'
 import { rootLogger } from '../logging/logger.js'
+import { createMuseBoxExecRunner, parseMuseVideoBackend } from './boxExecVideo.js'
 import { type MuseBridgeHttpHandler, makeMuseBridgeHttpHandler } from './bridgeHttp.js'
 import { MuseBridgeHub } from './hub.js'
 import { CLI_TIMEOUT_SEC, parseAllowedUids } from './protocol.js'
@@ -37,6 +38,15 @@ export async function createMuseFromConfig(
       videoPerDay: cfg.OC_MUSE_VIDEO_PER_DAY ?? 40,
     },
     cliTimeoutSec: CLI_TIMEOUT_SEC,
+    videoBackend: parseMuseVideoBackend(cfg.OC_MUSE_VIDEO_BACKEND),
+    fallbackHatch: cfg.OC_MUSE_BOX_EXEC_FALLBACK_HATCH === true,
+    // Unset uid = box path not wired: fallback never moves a job onto a Box it cannot reach.
+    boxExecRunner:
+      cfg.OC_MUSE_BOX_EXEC_UID && cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID
+        ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID, {
+            accountId: cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID,
+          })
+        : undefined,
   })
   try {
     await hub.start()

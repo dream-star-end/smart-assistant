@@ -25,6 +25,7 @@ EXPECTED_SKILLS=(
   browser
   document-writing
   minimax-media
+  muse-media
   market
   oc-lit
   oc-cite

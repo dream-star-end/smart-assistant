@@ -158,9 +158,19 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         payload["source_images"] = read_sources(ns.image)
     if ns.resume:
         payload["resume_snapshot_id"] = ns.resume
+    if getattr(ns, "mode", None):
+        payload["mode"] = ns.mode
+    if getattr(ns, "count", None) is not None:
+        payload["count"] = ns.count
 
     status = call("GET", "/status")
-    if not status.get("bridge_online"):
+    backend = status.get("video_backend") or "hatch"
+    box_exec_ok = (
+        kind == "video"
+        and not ns.resume
+        and backend in ("box-exec", "hatch-with-box-fallback")
+    )
+    if not status.get("bridge_online") and not box_exec_ok:
         raise MuseFailure("MUSE_BRIDGE_OFFLINE", "the Muse bridge is not connected; ask the user to start it in the Muse VM")
     job_id = call("POST", "/jobs", payload, timeout=120)["job_id"]
 
@@ -239,6 +249,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     common(video)
     video.add_argument("--aspect-ratio", dest="aspect_ratio", choices=("4:5", "7:12", "9:16"))
+    video.add_argument("--mode", choices=("native", "first_frame", "reference", "composite"),
+                       help="video generation mode (optional; inferred from --image if omitted)")
+    video.add_argument("--count", type=int, default=None, help="native-family variations, 1-4")
 
     ns = parser.parse_args(argv)
     if ns.timeout is None:

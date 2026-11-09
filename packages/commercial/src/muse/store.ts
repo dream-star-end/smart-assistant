@@ -38,7 +38,8 @@ export interface MuseJobRecord {
 
 export interface MuseStore {
   insertJob(row: MuseJobInsert): Promise<void>
-  markRunning(id: string, credentialId: string): Promise<void>
+  /** credentialId null = not run by a hatch bridge (OCV5-750 box-exec backup). */
+  markRunning(id: string, credentialId: string | null): Promise<void>
   finishJob(id: string, fin: MuseJobFinish): Promise<void>
   countRecent(userId: string, kind: MuseKind): Promise<{ hour: number; day: number }>
   /** Startup: rows left queued/running by a previous process can never complete. */
