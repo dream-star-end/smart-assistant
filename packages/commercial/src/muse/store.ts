@@ -53,7 +53,7 @@ export interface MuseJobRecord {
 
 export interface MuseStore {
   insertJob(row: MuseJobInsert): Promise<void>
-  markRunning(id: string, credentialId: string, fence?: MuseFence): Promise<void>
+  markRunning(id: string, credentialId: string | null, fence?: MuseFence): Promise<void>
   finishJob(id: string, fin: MuseJobFinish, fence?: MuseFence): Promise<void>
   countRecent(userId: string, kind: MuseKind): Promise<{ hour: number; day: number }>
   /** Jobs of this kind queued across the site since the start of the day (UTC). */

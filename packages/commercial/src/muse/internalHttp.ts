@@ -97,6 +97,7 @@ export function makeMuseInternalHandler(deps: MuseInternalDeps): MuseInternalHan
           bridge_online: hub.bridgeOnline(),
           retry: hub.retryPolicy(),
           durable_video: hub.durableVideoEnabled(),
+          video_backend: hub.getVideoBackend(),
         })
         return
       }

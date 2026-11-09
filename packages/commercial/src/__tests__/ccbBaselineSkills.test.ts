@@ -169,6 +169,13 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(body, /只向用户确认一次/)
   })
 
+  it('ships muse-media as a platform skill that calls oc-muse', () => {
+    assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('muse-media'))
+    const body = readFileSync(join(skillsDir, 'muse-media', 'SKILL.md'), 'utf8')
+    assert.match(body, /oc-muse/)
+    assert.doesNotMatch(body, /--image-role/)
+  })
+
   it('ships ssh with baked-in OpenSSH, host channel, and no private-key leakage', () => {
     assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('ssh'))
     const body = readFileSync(join(skillsDir, 'ssh', 'SKILL.md'), 'utf8')

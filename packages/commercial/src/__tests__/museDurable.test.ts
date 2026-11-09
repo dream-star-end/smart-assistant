@@ -475,4 +475,149 @@ describe('durable Muse video lifecycle', () => {
     await flush()
     assert.equal((await next.view('1', id, 0))?.error?.code, 'MUSE_QUEUE_EXPIRED')
   })
+
+  // OCV5-750: durable jobs on the Box relay backup.
+  function relay(calls: string[], hangSubmit = false) {
+    return async (request: { args: readonly unknown[] }) => {
+      const verb = String(request.args[2])
+      calls.push(verb)
+      if (verb === 'submit') {
+        // Relay accepted the request and is generating; the owner restarts before it answers.
+        if (hangSubmit) await new Promise(() => {})
+        return { stdout: JSON.stringify({ ok: true, id: 'r1', status: 'queued' }) }
+      }
+      if (verb === 'status')
+        return { stdout: JSON.stringify({ ok: true, id: 'r1', status: 'done', files: [{ index: 0 }] }) }
+      if (verb === 'fetch-chunk')
+        return {
+          stdout: JSON.stringify({
+            ok: true, offset: 0, total: mp4.length, sha256: digest,
+            data: mp4.toString('base64'), eof: true,
+          }),
+        }
+      return { stdout: JSON.stringify({ ok: true }) }
+    }
+  }
+
+  it('OCV5-750: hatch offline in fallback mode runs a durable video on the relay once and journals via', async () => {
+    const calls: string[] = []
+    const hub = make({
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => relay(calls) as never,
+    })
+    const id = await submit(hub)
+    for (let i = 0; i < 20 && journal.rows.get(id)?.status !== 'succeeded'; i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    const row = journal.rows.get(id)!
+    assert.equal(row.status, 'succeeded')
+    assert.equal(row.durable?.via, 'box-exec')
+    assert.equal(calls.filter((c) => c === 'submit').length, 1)
+  })
+
+  it('OCV5-750: a restart while a relay job runs fails it with no charge and never resubmits', async () => {
+    const calls: string[] = []
+    const first = make({
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => relay(calls, true) as never,
+    })
+    const id = await submit(first)
+    for (let i = 0; i < 20 && !calls.includes('submit'); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    assert.equal(journal.rows.get(id)?.durable?.state, 'running')
+    assert.equal(journal.rows.get(id)?.durable?.via, 'box-exec')
+    await first.stop()
+    journal.now += MUSE_LEASE_MS + 1
+    const again: string[] = []
+    const second = make({
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      boxExecRunner: async () => relay(again) as never,
+    })
+    await second.start()
+    await second.durableTick()
+    await flush()
+    const row = journal.rows.get(id)!
+    assert.equal(row.status, 'failed')
+    assert.equal(row.fin?.errorCode, 'MUSE_BOX_EXEC_INTERRUPTED')
+    assert.equal(again.length, 0)
+  })
+
+  it('OCV5-750: a durable job waiting for a relay slot goes to the background instead of MUSE_BUSY', async () => {
+    const calls: string[] = []
+    const hub = make({
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      userRunningMax: 1,
+      queueWaitMs: { image: 1_000, video: 1_000 },
+      boxExecRunner: async () => relay(calls, true) as never,
+    })
+    const first = await submit(hub)
+    const second = await submit(hub)
+    for (let i = 0; i < 20 && !calls.includes('submit'); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    assert.equal(journal.rows.get(first)?.durable?.state, 'running')
+    journal.now += 5_000
+    hub.tick()
+    await flush()
+    const row = journal.rows.get(second)!
+    assert.equal(row.status, 'queued')
+    assert.equal(row.durable?.background, true)
+    assert.equal(calls.filter((c) => c === 'submit').length, 1)
+  })
+
+  it('OCV5-750: an offline sweep that moves a queued durable video to the relay never re-queues it on hatch', async () => {
+    const calls: string[] = []
+    const hub = make({
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      userRunningMax: 3,
+      queueWaitMs: { image: 60_000, video: 60_000 },
+      boxExecRunner: async () => relay(calls, true) as never,
+    })
+    const sid = hub.hello('1', '0.5.0')
+    const id = await submit(hub)
+    journal.now += 61_000
+    hub.tick()
+    for (let i = 0; i < 20 && !calls.includes('submit'); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    assert.equal(journal.rows.get(id)?.durable?.via, 'box-exec')
+    const again = hub.hello('2', '0.5.0')
+    assert.equal(await hub.poll(again, 20), null, 'hatch must not get a job the relay holds')
+    assert.equal(await hub.poll(sid, 20), null)
+  })
+
+  it('OCV5-750: a backgrounded relay job is not released while hatch is offline', async () => {
+    const calls: string[] = []
+    const hub = make({
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      userRunningMax: 1,
+      queueWaitMs: { image: 1_000, video: 1_000 },
+      boxExecRunner: async () => relay(calls, true) as never,
+    })
+    await submit(hub)
+    const second = await submit(hub)
+    for (let i = 0; i < 20 && !calls.includes('submit'); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    journal.now += 5_000
+    hub.tick()
+    await flush()
+    assert.equal(journal.rows.get(second)?.durable?.background, true)
+    await hub.durableTick()
+    await flush()
+    assert.equal(journal.rows.get(second)?.leaseOwner !== undefined, true)
+    assert.ok((journal.rows.get(second)?.lease ?? 0) > journal.now, 'still leased by this hub')
+  })
 })
