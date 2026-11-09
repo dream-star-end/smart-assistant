@@ -111,8 +111,11 @@ test('independent native gate, real two-child relay, tool effect once, terminal 
  assert.ok(!(await h.call('/poll',{afterSeq:0})).frames.some((x:any)=>x.frame.method==='turn/completed'))
  await h.call('/tool/ack',{callId:'call1'});await h.until(async()=>h.charged)
  h.emit(final);await pause();assert.equal(h.receipts.length,1)
+ // Settled but the container has not read the terminal yet: a full pool must not reclaim this lane.
+ assert.equal(h.relay.idle,false)
  const frames=(await h.call('/poll',{afterSeq:0})).frames
  assert.equal(frames.filter((x:any)=>x.frame.method==='turn/completed').length,1)
+ assert.equal(h.relay.idle,true)
  assert.equal(readdirSync(join(h.root,'journal')).filter(f=>f.includes('native-terminal')).length,1)
  const stop=h.call('/stop');await pause();assert.equal((await h.call('/tool/stopped',{authorityTurnId:h.a.authorityTurnId,turnKey:h.turnKey})).status,200)
  assert.equal((await stop).remoteStopped,true)

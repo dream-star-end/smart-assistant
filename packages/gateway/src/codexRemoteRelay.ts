@@ -46,6 +46,8 @@ export class CodexRemoteRelay {
   private appSeq = 0
   private socketSeq = 0
   private outputSeq = 0
+  /** The highest output seq a /poll has handed to the container. */
+  private servedSeq = 0
   private recordSeq = 0
   private output: Array<{ seq: number; frame: unknown }> = []
   private outputBytes = 0
@@ -97,8 +99,13 @@ export class CodexRemoteRelay {
     this.record('binding', { binding, spec })
   }
   get stopped(): boolean { return this.revoked }
-  /** No admission is being started or served: stopping the lane cannot cut a turn short. */
-  get idle(): boolean { return !this.revoked && !this.starting && !this.active && !this.unloading }
+  /**
+   * No admission is being started or served and every frame (a settled turn's terminal too) has
+   * reached the container: stopping the lane cannot cut a turn short.
+   */
+  get idle(): boolean {
+    return !this.revoked && !this.starting && !this.active && !this.unloading && this.servedSeq === this.outputSeq
+  }
   private record(kind: string, value: unknown): void {
     const fd = openSync(join(this.journal, `${String(++this.recordSeq).padStart(8,'0')}-${kind}.json`),
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
@@ -501,6 +508,7 @@ export class CodexRemoteRelay {
       codexNeed(Number.isSafeInteger(v.afterSeq) && v.afterSeq >= 0 && v.afterSeq <= this.outputSeq)
       this.output = this.output.filter(f => f.seq > v.afterSeq)
       this.outputBytes = Buffer.byteLength(JSON.stringify(this.output)); result = { frames: this.output }
+      this.servedSeq = this.outputSeq
     } else if (path === '/baseline') {
       // A container that restarts its kernel inside an admitted turn needs to know where the
       // stream stands, so the fresh kernel is not fed the turn it already rendered.

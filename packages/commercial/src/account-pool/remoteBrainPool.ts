@@ -903,20 +903,22 @@ export async function placeRemoteLane(
       FROM remote_agent_bindings WHERE uid=$1 AND session_key=$2 AND engine=$3 ORDER BY updated_at DESC LIMIT 1`,
     [input.uid,input.sessionKey,engine])).rows[0]
     const eligible: typeof candidates = []
-    let capacityBlocked = false
+    const full = new Set<string>()
     for (const row of candidates) {
       if (engine === 'codex' && !codexExecutionReady(row)) continue
       // `unknown` and every other un-released state still occupies a slot of its own pool:
       // a stop that cannot be proven must not free capacity for a new lane.
       const used = (await client.query(`SELECT COUNT(*)::int AS profile_used
         FROM remote_agent_bindings WHERE profile_id=$1 AND state<>'released'`, [row.profile_id])).rows[0]
-      if (Number(used.profile_used) >= Number(row.max_concurrent_lanes)) capacityBlocked = true
+      if (Number(used.profile_used) >= Number(row.max_concurrent_lanes)) full.add(String(row.profile_id))
       else eligible.push(row)
     }
+    const capacityBlocked = full.size > 0
     let row: Record<string, any> | undefined
     if (sticky) {
       row = eligible.find(r => String(r.profile_id) === sticky.profile_id)
-      if (!row) throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
+      // A home profile that is only full is a capacity wait, which a reclaimed lane can end.
+      if (!row) throw new Error(full.has(sticky.profile_id) ? 'REMOTE_LANE_CAPACITY_EXHAUSTED' : 'REMOTE_LANE_PROFILE_UNAVAILABLE')
     } else {
       const ranked = rankRemotePoolCandidates(eligible.map(r => ({ profileId: String(r.profile_id),nodeId: String(r.node_id),
         engine:r.engine,profileName:r.profile_name,weight:Number(r.weight),healthScore:Number(r.health_score),

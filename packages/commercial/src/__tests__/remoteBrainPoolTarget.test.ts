@@ -96,14 +96,14 @@ test('the key directory stays deployment-owned, not caller-supplied', () => {
 })
 
 /** Recording pool: candidate rows, the chat's binding rows, and every statement issued. */
-function placementPool(candidates: Array<Record<string, unknown>>, bindings: Array<Record<string, unknown>> = []) {
+function placementPool(candidates: Array<Record<string, unknown>>, bindings: Array<Record<string, unknown>> = [], used = 0) {
   const statements: Array<{ sql: string; params: unknown[] }> = []
   return {
     statements,
     pool: { async connect(this: {query: (sql: string, params?: unknown[]) => Promise<unknown>}) { return { query: this.query.bind(this), release() {} } }, async query(sql: string, params: unknown[] = []) {
       statements.push({ sql, params })
       if (sql.includes('FROM remote_model_offers')) return { rows: candidates }
-      if (sql.includes('COUNT(*)')) return { rows: [{ node_used: 0, profile_used: 0 }] }
+      if (sql.includes('COUNT(*)')) return { rows: [{ node_used: 0, profile_used: used }] }
       if (sql.includes("state<>'released' LIMIT 1")) return { rows: [] }
       if (sql.includes('FROM remote_agent_bindings')) return { rows: bindings }
       return { rows: [], rowCount: 1 }
@@ -150,6 +150,11 @@ test('a placed chat keeps its profile and ids; an unavailable home profile fails
   await assert.rejects(placeRemoteLane(request, { pool: gone.pool, packet: async () => Buffer.from('x') }),
     /REMOTE_LANE_PROFILE_UNAVAILABLE/)
   assert.equal(gone.statements.some((s) => s.sql.includes('INSERT INTO remote_agent_bindings')), false)
+  // A home profile that is only full is a capacity wait the caller can end by reclaiming a lane.
+  const full = placementPool([candidate()], [sticky], 5)
+  await assert.rejects(placeRemoteLane(request, { pool: full.pool, packet: async () => Buffer.from('x') }),
+    /REMOTE_LANE_CAPACITY_EXHAUSTED/)
+  assert.equal(full.statements.some((s) => s.sql.includes('INSERT INTO remote_agent_bindings')), false)
   await assert.rejects(placeRemoteLane(request, { pool: placementPool([]).pool, packet: async () => Buffer.from('x') }),
     /NO_ELIGIBLE_REMOTE_PROFILE/)
 })

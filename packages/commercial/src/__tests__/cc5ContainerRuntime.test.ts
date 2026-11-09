@@ -253,10 +253,15 @@ test('a full pool hands the longest-idle chat lane to a new chat; a chat mid-tur
     assert.notEqual(third.operationId, first.operationId)
     assert.ok(f.states.some(([op, state]) => op === first.operationId && state === 'released'), 'the idle chat lane was released')
     assert.ok(!f.states.some(([op, state]) => op === second.operationId && state === 'released'), 'the busy chat keeps its lane')
+    // The reclaimed chat comes back while the pool is still full: it reclaims the now-idle chat3
+    // and continues its own operation.
+    const back = await f.lane()
+    assert.equal(back.operationId, first.operationId)
+    assert.ok(f.states.some(([op, state]) => op === third.operationId && state === 'released'), 'the idle chat3 lane was released')
     // With every remaining lane busy or the requester's own, the pool stays full.
-    await cc5ControlRequest('/admit', admission(f.key, JSON.parse(readFileSync(join(handle.mountSource, third.operationId, 'binding.json'), 'utf8'))),
-      join(handle.mountSource, third.operationId, 'relay.sock'))
-    await assert.rejects(f.lane(), /REMOTE_LANE_UNAVAILABLE/)
+    await cc5ControlRequest('/admit', admission(f.key, JSON.parse(readFileSync(join(handle.mountSource, back.operationId, 'binding.json'), 'utf8'))),
+      join(handle.mountSource, back.operationId, 'relay.sock'))
+    await assert.rejects(f.lane(chat3), /REMOTE_LANE_UNAVAILABLE/)
   } finally {
     await f.cleanup()
   }
