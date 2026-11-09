@@ -861,6 +861,14 @@ export class CodexRemoteAdapter extends CodexAdapter {
     return super.submitTurn(params)
   }
 
+  /**
+   * Effort/model/privacy changes only need a fresh kernel: the lane, its node binding and its
+   * admission channel must survive, or the very next beginTurn sees CODEX_LANE_CLOSED.
+   */
+  restartForConfigChange(): Promise<void> {
+    return super.shutdown()
+  }
+
   override async shutdown(): Promise<void> {
     try {
       await this.lane.stopLane()

@@ -40,6 +40,7 @@ import type { CodexLaneSpec } from '../codexRemoteHost.js'
 import { commissioningLines } from '../codexCommissioningWire.js'
 import { CodexRemoteRelay } from '../codexRemoteRelay.js'
 import { CodexRemoteAdapter } from '../engine/codexAdapter.js'
+import { restartRunnerForConfigChange } from '../runnerConfigRestart.js'
 import type { TurnParams } from '../engine/engineAdapter.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { CcbExecutionDescriptor } from '../subprocessSpawnConfig.js'
@@ -666,6 +667,46 @@ test('a cancelled turn leaves the lane usable: the next turn runs on the same re
   assert.deepEqual(h.receipts[1]!.nativeUsage, secondTotal)
   assert.deepEqual(h.receipts[1]!.total, cumulative)
   assert.equal(h.receipts[1]!.nativeTurnId, TURNS[1])
+})
+
+test('an effort change restarts only the kernel: first and later turns still run on the same lane',
+  { timeout: 180000 }, async (t) => {
+  // OCV5-746: a web chat that picks a reasoning effort makes sessionSubmit restart the runner
+  // before the first turn. That restart must not revoke the lane (it used to: CODEX_LANE_CLOSED).
+  // The fixture descriptor only supports `low`; the relay's per-effort gate is covered elsewhere.
+  const h = await lane(t)
+  h.adapter.setEffortLevel('low')
+  await restartRunnerForConfigChange(h.adapter)
+  const first = h.authority('req-effort-1')
+  const run = h.adapter.submitTurn(h.turnParams(first, h.turnKey, 'req-effort-1'))
+  await h.until(() => h.received('launch').some((row) => row?.received?.method === 'turn/start'), 'turn/start after the effort change')
+  const firstTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 200, outputTokens: 20 }
+  h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[0]!, firstTotal, firstTotal) })
+  h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[0], status: 'completed' } } })
+  const summary = await run.summary
+  assert.ok(summary)
+  assert.equal(summary.isError, false)
+  assert.equal(h.receipts.length, 1)
+
+  // A warm lane switching effort again between turns keeps the same resident node app.
+  h.adapter.setEffortLevel('low')
+  await restartRunnerForConfigChange(h.adapter)
+  const second = h.authority('req-effort-2')
+  const run2 = h.adapter.submitTurn(h.turnParams(second, 'f'.repeat(64), 'req-effort-2'))
+  await h.until(
+    () => h.received('launch').filter((row) => row?.received?.method === 'turn/start').length === 2,
+    'second turn/start after the second effort change',
+  )
+  const secondTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 500, outputTokens: 60 }
+  h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[1]!, secondTotal, {
+    ...zeroNativeTokens(), inputTokens: 300, outputTokens: 40,
+  }) })
+  h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[1], status: 'completed' } } })
+  const summary2 = await run2.summary
+  assert.ok(summary2)
+  assert.equal(summary2.isError, false)
+  assert.equal(h.receipts.length, 2)
+  assert.equal(h.launches, 1, 'an effort change must not relaunch the node app')
 })
 
 test('a turn submitted while another runs admits only after that turn ends', { timeout: 180000 }, async (t) => {

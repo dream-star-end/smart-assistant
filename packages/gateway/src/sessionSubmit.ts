@@ -1,5 +1,6 @@
-import { type RemoteExecutionBackend, isCc5ExecutionBackend, sameRemoteExecutionBackend } from '@openclaude/protocol'
+import { type RemoteExecutionBackend, sameRemoteExecutionBackend } from '@openclaude/protocol'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
+import { restartRunnerForConfigChange } from './runnerConfigRestart.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
@@ -715,7 +716,7 @@ export async function submit(
         { assets: undefined, fingerprint: undefined },
         admission.context,
       )
-      if (changed) await session.runner.shutdown() // native id is deliberately retained
+      if (changed) await restartRunnerForConfigChange(session.runner) // native id is deliberately retained
     } else if (admission.context.assets && session.channel !== 'auto-dream') {
       throw new Error('COMPAT_CONFIG_CONFLICT: runner has no validated identity context')
     }
@@ -845,8 +846,7 @@ export async function submit(
       ) === 'restart'
     if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
       try {
-        // A cold CC5 port is single-use: shutdown would revoke it before its first admission.
-        if (!isCc5ExecutionBackend(session.runner.executionBackend) || session.runner.isRunning) await session.runner.shutdown()
+        await restartRunnerForConfigChange(session.runner)
         if (privacyChanged) assertRunnerPromptPrivacyStopped(session.runner)
         // Delta tracker reset happens automatically on the next 'spawn' event
         // when SubprocessRunner auto-respawns on the next submit().
