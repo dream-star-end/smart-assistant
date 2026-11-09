@@ -111,9 +111,14 @@ function isHubJobDone(job: HubJob): boolean {
 function canFallbackBoxExecToHatch(input: {
   /** The submit call was started (it may have reached the relay even without a reply). */
   submitAttempted: boolean
+  /** The relay answered submit with a job id: it is generating, whatever fails afterwards. */
+  relaySubmitted: boolean
   museErr: MuseError | null
   message: string
 }): boolean {
+  // Status/fetch failures after an accepted submit (relay restart, egress/guard change mid-poll)
+  // must never re-run the job on hatch: Muse is already generating it (Gemini r2 NEW-1).
+  if (input.relaySubmitted) return false
   if (input.submitAttempted) {
     // The submit call left. Only failures proven to precede the relay may fall back: the CLI's
     // own "relay unreachable" answer (connect/send failed, nothing was queued) or a transport
@@ -850,6 +855,7 @@ export class MuseBridgeHub {
 
   private async runBoxExec(job: HubJob): Promise<void> {
     let submitAttempted = false
+    let relaySubmitted = false
     this.store.markRunning(job.id, null).catch((err) => {
       this.log.warn('muse_mark_running_failed', { jobId: job.id, err: (err as Error).message })
     })
@@ -868,6 +874,9 @@ export class MuseBridgeHub {
         signal: job.abort?.signal,
         onSubmitAttempt: () => {
           submitAttempted = true
+        },
+        onSubmitted: () => {
+          relaySubmitted = true
         },
       })
       if (isHubJobDone(job)) return
@@ -890,7 +899,7 @@ export class MuseBridgeHub {
         !job.movedToBox &&
         this.bridgeOnline() &&
         this.queue.length + this.reservedTotal < QUEUE_MAX &&
-        canFallbackBoxExecToHatch({ submitAttempted, museErr, message })
+        canFallbackBoxExecToHatch({ submitAttempted, relaySubmitted, museErr, message })
       ) {
         this.boxExecInflight.delete(job)
         job.via = 'hatch'

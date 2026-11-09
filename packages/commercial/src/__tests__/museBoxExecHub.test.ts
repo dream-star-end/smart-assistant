@@ -433,6 +433,46 @@ describe('OCV5-750 Gemini r1: box → hatch fallback only before the relay could
     assert.equal(job?.id, id, 'pre-submit relay-down falls back onto hatch')
   })
 
+  it('a relay-down or egress failure after an accepted submit never falls back to hatch', async (t) => {
+    // Hub timers are unref'd; keep the loop alive while this test long-polls.
+    const keep = setInterval(() => {}, 1000)
+    t.after(() => clearInterval(keep))
+    for (const failure of ['relay-down', 'egress'] as const) {
+      let submits = 0
+      const hub = makeHub(tmpRoot(), {
+        videoBackend: 'box-exec',
+        fallbackHatch: true,
+        boxExecPollMs: 1,
+        boxExecRunner: async () => async (request: BoxCcExecRequest) => {
+          const verb = String(request.args[2])
+          if (verb === 'submit') {
+            submits += 1
+            return { stdout: JSON.stringify({ ok: true, id: 'relay-started', status: 'queued' }) }
+          }
+          if (verb === 'status' && failure === 'egress') {
+            throw Object.assign(new Error('BOX_EGRESS_CHANGED'), { code: 'BOX_EGRESS_CHANGED' })
+          }
+          if (verb === 'status') {
+            return {
+              stdout: JSON.stringify({
+                ok: false,
+                code: 'MUSE_RELAY_DOWN',
+                message: 'relay unreachable',
+              }),
+            }
+          }
+          return { stdout: JSON.stringify({ ok: true }) }
+        },
+      })
+      const sid = hub.hello('1', '0.5.3')
+      const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+      const view = await hub.view('3', id, 2_000)
+      assert.equal(view?.status, 'failed', failure)
+      assert.equal(await hub.poll(sid, 50), null, `${failure}: must not reach hatch`)
+      assert.equal(submits, 1)
+    }
+  })
+
   it('a deadline-expired box job aborts its CLI calls', async () => {
     let clock = 1_000_000
     let aborted = false
