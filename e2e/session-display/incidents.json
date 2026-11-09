@@ -10060,9 +10060,9 @@
           "assertion": "INC-20261109-KP-QR-BROKER-CONCURRENCY: login broker carries more than 9 concurrent WeChat tunnels so the QR image still loads"
         },
         {
-          "layer": "deploy-gate",
-          "path": "scripts/deploy-v5.sh",
-          "assertion": "seed-knowledge-planet-plugin.ts '--verify-user=$KNOWLEDGE_PLANET_VERIFY_USER'"
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/kp-login-broker-concurrency.node-test.mjs",
+          "assertion": "Knowledge Planet login broker loads the WeChat QR image with more than 9 concurrent tunnels"
         }
       ]
     }

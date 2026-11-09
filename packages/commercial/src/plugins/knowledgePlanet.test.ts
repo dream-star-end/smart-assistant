@@ -2,14 +2,17 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { createConnection, createServer, type Socket } from 'node:net'
+import { type Socket, createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 
 import type Docker from 'dockerode'
 
-import { DEFAULT_MANAGED_BROWSER_BROKER_LIMITS, createManagedBrowserTlsBroker } from './browserBroker.js'
+import {
+  DEFAULT_MANAGED_BROWSER_BROKER_LIMITS,
+  createManagedBrowserTlsBroker,
+} from './browserBroker.js'
 import { ManagedBrowserRuntime } from './browserRuntime.js'
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
 
@@ -1414,7 +1417,9 @@ async function openBrokerTunnel(
 describe('Knowledge Planet login broker concurrency (INC-20261109-KP-QR-BROKER-CONCURRENCY)', () => {
   const brokerRoots: string[] = []
   afterEach(async () => {
-    await Promise.all(brokerRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+    await Promise.all(
+      brokerRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+    )
   })
 
   test('login raises only maxConcurrent to 16; every other limit and the action envelope are unchanged', () => {
@@ -1486,9 +1491,19 @@ describe('Knowledge Planet login broker concurrency (INC-20261109-KP-QR-BROKER-C
         // page assets keep their tunnels open while the QR request is issued
         for (let index = 0; index < parallel; index++)
           tunnels.push(
-            await openBrokerTunnel(broker.mount.hostSocketPath, broker.mount.token, pin.hostname, pin.port),
+            await openBrokerTunnel(
+              broker.mount.hostSocketPath,
+              broker.mount.token,
+              pin.hostname,
+              pin.port,
+            ),
           )
-        const qr = await openBrokerTunnel(broker.mount.hostSocketPath, broker.mount.token, pin.hostname, pin.port)
+        const qr = await openBrokerTunnel(
+          broker.mount.hostSocketPath,
+          broker.mount.token,
+          pin.hostname,
+          pin.port,
+        )
         tunnels.push(qr)
         let image = ''
         if (qr.status === 'open') {
@@ -1498,7 +1513,9 @@ describe('Knowledge Planet login broker concurrency (INC-20261109-KP-QR-BROKER-C
             await new Promise((resolveTick) => setTimeout(resolveTick, 5))
           image = qr.received()
         }
-        const openCount = tunnels.slice(0, parallel).filter((tunnel) => tunnel.status === 'open').length
+        const openCount = tunnels
+          .slice(0, parallel)
+          .filter((tunnel) => tunnel.status === 'open').length
         return { openCount, qrStatus: qr.status, image }
       } finally {
         for (const tunnel of tunnels) tunnel.socket.destroy()
