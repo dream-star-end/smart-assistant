@@ -1112,6 +1112,12 @@ build_master_release() {
       mlog "pinned session unavailable / data-safety rootfix contract gate 失败"
       return 1
     fi
+
+    mlog "  OCV5-376 platform seed + lazy tool-body retry proofs @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+      mlog "pinned OCV5-376 platform/tool proofs 失败"
+      die "pinned OCV5-376 platform/tool proofs 失败"
+    fi
   }
   master_job_host_log_policy() {
     mlog "  host log policy filesystem/logrotate gate @ pinned staging"

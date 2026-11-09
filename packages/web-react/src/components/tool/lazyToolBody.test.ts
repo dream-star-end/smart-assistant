@@ -7,7 +7,7 @@ afterEach(() => {
 });
 
 describe("preloadToolBody", () => {
-  test("a failed load is not cached: the next call loads again", async () => {
+  test("INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE: a failed load is not cached: the next call loads again", async () => {
     vi.resetModules();
     let attempts = 0;
     vi.doMock("./bodies", () => {
@@ -23,7 +23,7 @@ describe("preloadToolBody", () => {
     expect(attempts).toBe(2);
   });
 
-  test("the idle prefetch swallows a failed load instead of leaving an unhandled rejection", async () => {
+  test("INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE: the idle prefetch swallows a failed load instead of leaving an unhandled rejection", async () => {
     vi.resetModules();
     vi.useFakeTimers();
     vi.doMock("./bodies", () => {

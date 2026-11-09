@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
@@ -135,6 +136,107 @@ test("a commit inside a frozen tip's history is skipped, not judged", () => {
   const r = execute({ trailer: "OCV5-999", frozen: [TIP, TARGET] });
   assert.equal(r.checked, 0);
 });
+
+
+const GA_TARGET = "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0";
+const GA_ID = "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL";
+const GA_OLD = "none (preset kept a stale model; found in the OCV5-376 startup-log review)";
+const LB_TARGET = "785b3e0425e9ccc1720043c501946c31abfea22b";
+const LB_ID = "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE";
+const LB_OLD = "none (latent; no user report — found during the OCV5-376 test-suite change)";
+
+function executeMapped(sha: string, trailer: string, id: string, rootFix: string, options: Parameters<typeof execute>[0] = {}) {
+  return execute({
+    sha,
+    trailer,
+    incidents: [{ id, rootFixCommit: rootFix }],
+    // Preserve expired historical waiver: successful closure must not depend on extending it.
+    waivers: new Map([[sha.slice(0, 8), { expiresAt: "2026-11-08" }]]),
+    ...options,
+  });
+}
+
+test("OCV5-376 general-assistant exact none trailer maps despite expired waiver", () => {
+  const result = executeMapped(GA_TARGET, GA_OLD, GA_ID, "8f8d44fc");
+  assert.equal(result.checked, 1);
+  for (const value of [GA_TARGET, GA_OLD, GA_ID]) assert.ok(result.audit.includes(value));
+});
+
+test("OCV5-376 lazy-tool-body exact none trailer maps despite expired waiver", () => {
+  const result = executeMapped(LB_TARGET, LB_OLD, LB_ID, "785b3e04");
+  assert.equal(result.checked, 1);
+  for (const value of [LB_TARGET, LB_OLD, LB_ID]) assert.ok(result.audit.includes(value));
+});
+
+for (const [label, target, old, id] of [
+  ["GA", GA_TARGET, GA_OLD, GA_ID],
+  ["LB", LB_TARGET, LB_OLD, LB_ID],
+] as const) {
+  for (const sha of [target.slice(0, 8), target.slice(0, 39), target.slice(0, 39) + "1", "a".repeat(40)]) {
+    test(`OCV5-376 ${label} non-exact SHA still requires a live waiver: ${sha}`, () => {
+      assert.throws(
+        () => execute({
+          sha,
+          trailer: old,
+          incidents: [{ id, rootFixCommit: target.slice(0, 8) }],
+          waivers: new Map([[sha.slice(0, 8), { expiresAt: "2026-11-08" }]]),
+        }),
+        /已于 2026-11-08 过期/,
+      );
+    });
+  }
+  for (const trailer of [`${old}.`, `${old} extra`, old.replace("none ", "None ")]) {
+    test(`OCV5-376 ${label} other trailer is not mapped: ${trailer}`, () => {
+      assert.throws(
+        () => execute({
+          sha: target,
+          trailer,
+          incidents: [{ id, rootFixCommit: target.slice(0, 8) }],
+          waivers: new Map([[target.slice(0, 8), { expiresAt: "2026-11-08" }]]),
+        }),
+        /已于 2026-11-08 过期|Incident trailer 格式非法|没有对应 waiver/,
+      );
+    });
+  }
+  test(`OCV5-376 ${label} mapping still requires the semantic incident`, () => {
+    assert.throws(
+      () => execute({
+        sha: target,
+        trailer: old,
+        incidents: [],
+        waivers: new Map([[target.slice(0, 8), { expiresAt: "2026-11-08" }]]),
+      }),
+      new RegExp(`指向的 ${id} 不在 incidents.json`),
+    );
+  });
+}
+
+const bashMarker = "  # exact immutable trailer mapping";
+const bashSource = readFileSync(process.env.OC_INCIDENT_COMPAT_BASH_SOURCE
+  ?? fileURLToPath(new URL("../check-v5-fix-trailers.sh", import.meta.url)), "utf8");
+const bashStart = bashSource.indexOf(bashMarker);
+assert.ok(bashStart >= 0 && bashStart === bashSource.lastIndexOf(bashMarker), "one actual Bash mapping block");
+const bashEnd = bashSource.indexOf('  if [[ "$trailer" =~ ^none', bashStart);
+assert.ok(bashEnd > bashStart, "mapping block precedes the ordinary none path");
+const bashMapping = bashSource.slice(bashStart, bashEnd);
+function executeBashMapping(sha: string, trailer: string): string {
+  return execFileSync("bash", ["-c",
+    `set -euo pipefail\nsha="$1"\ntrailer="$2"\n${bashMapping}\nprintf '%s' "$trailer"`,
+    "exact-trailer-fixture", sha, trailer], { encoding: "utf8", timeout: 2_000 });
+}
+
+test("actual Bash mapping resolves OCV5-376 general-assistant SHA and trailer", () => {
+  assert.equal(executeBashMapping(GA_TARGET, GA_OLD), GA_ID);
+});
+test("actual Bash mapping resolves OCV5-376 lazy-tool-body SHA and trailer", () => {
+  assert.equal(executeBashMapping(LB_TARGET, LB_OLD), LB_ID);
+});
+for (const sha of [GA_TARGET.slice(0, 8), GA_TARGET.slice(0, 39) + "1"]) {
+  test(`actual Bash mapping leaves non-exact GA SHA unchanged: ${sha}`, () => {
+    assert.equal(executeBashMapping(sha, GA_OLD), GA_OLD);
+  });
+}
+
 
 const SHIPPED_EXPIRED_WAIVER = "da9cd5484db3b0e5c882f4032ee09685c4e5b5a7";
 

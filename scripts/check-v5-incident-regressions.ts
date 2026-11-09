@@ -596,6 +596,21 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
 // imported-history exemption. The full SHA binds the original tree and message;
 // the mapped ID must still satisfy ALL ordinary manifest/proof/lineage checks.
 function normalizeImmutableIncidentTrailer(sha: string, trailer: string): string {
+  // User-approved 2026-11-09 (t1669u) exact historical closure for OCV5-376 expired
+  // Incident:none waivers. Full SHA + exact trailer only; ordinary INC/proof/lineage required.
+  // Does not extend waivers, freeze tips, or weaken rejection of bad trailers.
+  if (
+    sha === "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0"
+    && trailer === "none (preset kept a stale model; found in the OCV5-376 startup-log review)"
+  ) {
+    return "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL";
+  }
+  if (
+    sha === "785b3e0425e9ccc1720043c501946c31abfea22b"
+    && trailer === "none (latent; no user report — found during the OCV5-376 test-suite change)"
+  ) {
+    return "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE";
+  }
   if (
     sha === "f496228de43718852cebda8fb9f35eb0e9c3a9c0"
     && trailer === "OCV5-171 follow-up"
@@ -714,6 +729,11 @@ function checkTrailerClosure(): number {
       if (waiver && waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 trailer 例外 waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
+    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
+    if (normalizedTrailer !== trailer) {
+      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
+    }
+    trailer = normalizedTrailer;
     if (/^none\b/.test(trailer)) {
       const waiver = waivers.get(sha.slice(0, 8));
       if (!waiver) fail(`${sha.slice(0, 8)} 声明 Incident: none,但 incident-waivers.json 里没有对应 waiver`);
@@ -729,11 +749,6 @@ function checkTrailerClosure(): number {
       }
       continue;
     }
-    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
-    if (normalizedTrailer !== trailer) {
-      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
-    }
-    trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
       // fbb9020fd was pushed as Incident: OCV5-276. The shared branch forbids
       // rewriting it. The waiver records the user-approved smoke-only fix.
