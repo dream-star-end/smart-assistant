@@ -225,3 +225,50 @@ for (const trailer of [...capacityWrongTrailers, "none (a different approved rea
     assert.equal(executeBashMapping(CAPACITY_TARGET, trailer), trailer);
   });
 }
+
+
+const GA_TARGET = "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0";
+const GA_ID = "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL";
+const GA_OLD = "none (preset kept a stale model; found in the OCV5-376 startup-log review)";
+const LB_TARGET = "785b3e0425e9ccc1720043c501946c31abfea22b";
+const LB_ID = "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE";
+const LB_OLD = "none (latent; no user report — found during the OCV5-376 test-suite change)";
+
+function executeOcv5376(sha: string, trailer: string, id: string, rootFix: string) {
+  return execute({
+    sha,
+    trailer,
+    incidents: [{ id, rootFixCommit: rootFix }],
+    waivers: new Map([[sha.slice(0, 8), { expiresAt: "2026-11-08" }]]),
+  });
+}
+
+test("OCV5-376 general-assistant exact none trailer maps despite expired waiver", () => {
+  const result = executeOcv5376(GA_TARGET, GA_OLD, GA_ID, "8f8d44fc");
+  assert.equal(result.checked, 1);
+  for (const value of [GA_TARGET, GA_OLD, GA_ID]) assert.ok(result.audit.includes(value));
+});
+
+test("OCV5-376 lazy-tool-body exact none trailer maps despite expired waiver", () => {
+  const result = executeOcv5376(LB_TARGET, LB_OLD, LB_ID, "785b3e04");
+  assert.equal(result.checked, 1);
+  for (const value of [LB_TARGET, LB_OLD, LB_ID]) assert.ok(result.audit.includes(value));
+});
+
+for (const sha of [GA_TARGET.slice(0, 8), GA_TARGET.slice(0, 39) + "1", "a".repeat(40)]) {
+  test(`OCV5-376 GA non-exact SHA still requires a live waiver: ${sha}`, () => {
+    assert.throws(() => execute({
+      sha,
+      trailer: GA_OLD,
+      incidents: [{ id: GA_ID, rootFixCommit: "8f8d44fc" }],
+      waivers: new Map([[sha.slice(0, 8), { expiresAt: "2026-11-08" }]]),
+    }), /已于 2026-11-08 过期/);
+  });
+}
+
+test("actual Bash mapping resolves OCV5-376 general-assistant SHA and trailer", () => {
+  assert.equal(executeBashMapping(GA_TARGET, GA_OLD), GA_ID);
+});
+test("actual Bash mapping resolves OCV5-376 lazy-tool-body SHA and trailer", () => {
+  assert.equal(executeBashMapping(LB_TARGET, LB_OLD), LB_ID);
+});

@@ -150,7 +150,11 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
 
   # exact immutable trailer mapping — keep byte-aligned with
   # normalizeImmutableIncidentTrailer in check-v5-incident-regressions.ts
-  if [[ "$sha" == "793c4f0b15928a59eaaedab3f8ba6194d1fb496a" && "$trailer" == "none (user-facing copy only; no behavior change)" ]]; then
+  if [[ "$sha" == "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0" && "$trailer" == "none (preset kept a stale model; found in the OCV5-376 startup-log review)" ]]; then
+    trailer="INC-20261011-GENERAL-ASSISTANT-STALE-MODEL"
+  elif [[ "$sha" == "785b3e0425e9ccc1720043c501946c31abfea22b" && "$trailer" == "none (latent; no user report — found during the OCV5-376 test-suite change)" ]]; then
+    trailer="INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE"
+  elif [[ "$sha" == "793c4f0b15928a59eaaedab3f8ba6194d1fb496a" && "$trailer" == "none (user-facing copy only; no behavior change)" ]]; then
     trailer="INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE"
   elif [[ "$sha" == "f496228de43718852cebda8fb9f35eb0e9c3a9c0" && "$trailer" == "OCV5-171 follow-up" ]]; then
     trailer="INC-20260908-CC-SWITCH-ASCII-NAME"

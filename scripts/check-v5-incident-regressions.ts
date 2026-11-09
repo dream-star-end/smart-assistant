@@ -598,6 +598,20 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
 function normalizeImmutableIncidentTrailer(sha: string, trailer: string): string {
   // User-approved 2026-11-02 exact historical closure: the copy guard joins
   // the existing capacity incident and must pass its ordinary proof/lineage checks.
+  // User-approved 2026-11-09 (t1669u) exact historical closure for OCV5-376 expired
+  // Incident:none waivers. Full SHA + exact trailer only; ordinary INC/proof/lineage required.
+  if (
+    sha === "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0"
+    && trailer === "none (preset kept a stale model; found in the OCV5-376 startup-log review)"
+  ) {
+    return "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL";
+  }
+  if (
+    sha === "785b3e0425e9ccc1720043c501946c31abfea22b"
+    && trailer === "none (latent; no user report — found during the OCV5-376 test-suite change)"
+  ) {
+    return "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE";
+  }
   if (
     sha === "793c4f0b15928a59eaaedab3f8ba6194d1fb496a"
     && trailer === "none (user-facing copy only; no behavior change)"

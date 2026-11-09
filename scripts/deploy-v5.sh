@@ -4155,6 +4155,13 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # OCV5-376 historical INC closure proofs (seed hash pin + lazy tool-body retry).
+  if ! (cd "$REPO_ROOT" && \
+        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts); then
+    echo "✗ pinned OCV5-376 platform/tool proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # Phase A writer / Phase B reader must choose the same physical billing
   # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
   # pinned staging tree, not the shared checkout.
