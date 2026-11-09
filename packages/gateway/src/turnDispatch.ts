@@ -84,16 +84,27 @@ export async function _acquireSyntheticTurnBarrier(this: TurnDispatchHost, sessi
   return { owner, release }
 }
 
-export function _rejectAuthority(this: TurnDispatchHost, ws: WebSocket, code: string, detail: string): void {
+export function _rejectAuthority(this: TurnDispatchHost, ws: WebSocket, code: string, detail: string, frame?: Record<string, unknown>): void {
   // 拒帧是安全事件:reason 进日志(运维可见),**不**回给客户端内文
   // (避免把 epoch / challenge / keyId 等内部线索泄漏给容器内的用户 AI)。
   this.log.warn('model_authority.rejected', { code, detail })
+  // OCV5-746: 错误帧必须带上本 turn 的公开身份(peer / clientMessageId / model)。否则
+  // master 无法把它收敛到具体 dispatch,浏览器也无法把错误卡绑到这条已 durable 受理的
+  // 消息上(前端对无主 error 帧直接丢弃),用户只会看到这一轮永远在跑。
+  const peer = frame?.peer as { id?: unknown } | undefined
+  const peerId = typeof peer?.id === 'string' && peer.id.length > 0 ? peer.id : undefined
+  const clientMessageId = isClientMessageId(frame?.clientMessageId) ? frame!.clientMessageId as string : undefined
+  const model = typeof frame?.model === 'string' && frame.model.length > 0 ? frame.model : undefined
   try {
     ws.send(
       JSON.stringify(withUserError({
         type: 'error',
         code: 'MODEL_AUTHORITY_REJECTED',
         error: 'model authority rejected',
+        message: 'model authority rejected',
+        ...(peerId === undefined ? {} : { peer: { id: peerId, kind: 'dm' } }),
+        ...(clientMessageId === undefined ? {} : { clientMessageId }),
+        ...(model === undefined ? {} : { model }),
       })),
     )
   } catch { /* ws may already be closed */ }
