@@ -867,6 +867,10 @@ describe('official Knowledge Planet Plugin', () => {
     assert.match(captureSource, /Number\(style\.opacity\) < 0\.99/)
     assert.match(captureSource, /document\.elementFromPoint\([\s\S]*\) !== element/)
     assert.match(captureSource, /image\.screenshot\(\{ type: 'png'/)
+    assert.ok(
+      /image\.screenshot\(\{ type: 'png'/.test(captureSource) && !/drawImage\(element/.test(captureSource),
+      'INC-20261109-KP-QR-TAINTED-CANVAS: captureQr uses element screenshot not cross-origin canvas',
+    )
     assert.match(captureSource, /sampleContext\.fillStyle = '#fff'/)
     assert.match(captureSource, /sampleContext\.imageSmoothingEnabled = false/)
     assert.match(captureSource, /sampleContext\.getImageData/)
