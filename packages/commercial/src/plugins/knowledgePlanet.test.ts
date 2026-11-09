@@ -125,11 +125,11 @@ describe('official Knowledge Planet Plugin', () => {
       }),
       'current',
     )
-    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 7)
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 8)
     assert.deepEqual(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0], {
-      version: '1.5.0',
-      artifactHash: 'f5b41bcbdeeb0709c4e77ee05f05e6b994aeb8e6d72d5661e06496cfc2a8a642',
-      execContractHash: 'e67a26206d419020abf21f4bd4a3dd8ae44eb1a249cd47a9e356a861a8d08364',
+      version: '1.5.2',
+      artifactHash: '77a0e77acd066eeee5d411d4f6cee43abb374037d632ba19b8c667bbc3b38c3e',
+      execContractHash: 'a2d7c186e81d936f3eb7e561f54b9385899c372341b633a799afac7874d845fe',
     })
     for (const predecessor of KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS)
       assert.equal(classifyKnowledgePlanetSetupPin(predecessor), 'compatible-predecessor')
@@ -143,7 +143,7 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(
       classifyKnowledgePlanetSetupPin({
         ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
-        version: '1.5.2',
+        version: '1.5.3',
       }),
       null,
     )
@@ -196,7 +196,7 @@ describe('official Knowledge Planet Plugin', () => {
   })
 
   test('v1.5 exposes bounded reply-aware reads plus default-confirmed or account-preapproved rich writes without credential-bearing results', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.5.2')
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.5.3')
     assert.equal(KNOWLEDGE_PLANET_DRIVER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.equal(KNOWLEDGE_PLANET_LAUNCHER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.deepEqual(
@@ -825,7 +825,7 @@ describe('official Knowledge Planet Plugin', () => {
     assert.doesNotMatch(actionSource, /writeFrame\(\{ event: 'failed'/)
   })
 
-  test('waits for the real QR image and never publishes the iframe loading mask', () => {
+  test('waits for the real QR image via element screenshot and never publishes the iframe loading mask', () => {
     assert.equal(KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS, 45_000)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION, 0.15)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION, 0.2)
@@ -866,11 +866,16 @@ describe('official Knowledge Planet Plugin', () => {
     assert.match(captureSource, /style\.filter !== 'none'/)
     assert.match(captureSource, /Number\(style\.opacity\) < 0\.99/)
     assert.match(captureSource, /document\.elementFromPoint\([\s\S]*\) !== element/)
+    assert.match(captureSource, /image\.screenshot\(\{ type: 'png'/)
+    assert.ok(
+      /image\.screenshot\(\{ type: 'png'/.test(captureSource) && !/drawImage\(element/.test(captureSource),
+      'INC-20261109-KP-QR-TAINTED-CANVAS: captureQr uses element screenshot not cross-origin canvas',
+    )
     assert.match(captureSource, /sampleContext\.fillStyle = '#fff'/)
     assert.match(captureSource, /sampleContext\.imageSmoothingEnabled = false/)
     assert.match(captureSource, /sampleContext\.getImageData/)
-    assert.match(captureSource, /output\.toDataURL\('image\/png'\)/)
-    assert.match(captureSource, /png\.toString\('base64'\) !== encodedQr/)
+    assert.match(captureSource, /data:image\/png;base64,/)
+    assert.match(captureSource, /drawImage\(probe/)
     assert.match(captureSource, /Buffer\.from\(\[137, 80, 78, 71, 13, 10, 26, 10\]\)/)
     assert.match(
       captureSource,
@@ -885,7 +890,8 @@ describe('official Knowledge Planet Plugin', () => {
       /beforeCaptureDeadline\([\s\S]*\(\) => image\.evaluate\([\s\S]*undefined,[\s\S]*timeout: remainingCaptureTimeout\(captureDeadline\)[\s\S]*captureDeadline/,
     )
     assert.match(captureSource, /remainingCaptureTimeout\(captureDeadline\);\s*return png/)
-    assert.doesNotMatch(captureSource, /\.screenshot\(|iframe/)
+    assert.doesNotMatch(captureSource, /drawImage\(element|output\.toDataURL\(|iframe/)
+    assert.doesNotMatch(captureSource, /const encodedQr/)
     assert.match(
       KNOWLEDGE_PLANET_WORKER_SOURCE,
       /const qrCaptureDeadline = Math\.min\(input\.deadlineMs,[\s\S]*const qrButton =[\s\S]*const switchButton =[\s\S]*const qr = await beforeCaptureDeadline\([\s\S]*captureQr\(page, qrButton, switchButton, qrCaptureDeadline\)[\s\S]*remainingCaptureTimeout\(qrCaptureDeadline\);\s*writeFrame/,

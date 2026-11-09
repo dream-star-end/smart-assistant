@@ -10025,6 +10025,26 @@
           "assertion": "Knowledge Planet setup shows login success after WeChat scan while QR is visible"
         }
       ]
+    },
+    {
+      "id": "INC-20261109-KP-QR-TAINTED-CANVAS",
+      "occurredAt": "2026-11-09",
+      "severity": "P1",
+      "symptom": "知识星球登录验证在 capture_qr 阶段因跨域 WeChat <img> 画到 canvas 后 getImageData 抛 SecurityError（image_unreadable）超时；浏览器 UI 仍可能显示二维码，造成线上有码与 verify 无码的表象矛盾。",
+      "rootFixCommit": "277efd8e",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/knowledgePlanet.test.ts",
+          "assertion": "INC-20261109-KP-QR-TAINTED-CANVAS: captureQr uses element screenshot not cross-origin canvas"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/plugin-connect.node-test.mjs",
+          "assertion": "Knowledge Planet setup shows login success after WeChat scan while QR is visible"
+        }
+      ]
     }
   ]
 }

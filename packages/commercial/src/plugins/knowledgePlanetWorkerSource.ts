@@ -1127,7 +1127,7 @@ async function captureQr(page, qrButton, switchButton, captureDeadline) {
       for (let i = 0; i < count; i += 1) {
         const image = images.nth(i);
         if (!await beforeCaptureDeadline(() => image.isVisible(), captureDeadline).catch(() => false)) continue;
-        const encodedQr = await beforeCaptureDeadline(
+        const ready = await beforeCaptureDeadline(
           () => image.evaluate(
             (element) => {
               if (!element.complete || element.naturalWidth < 180 || element.naturalHeight < 180) return null;
@@ -1141,44 +1141,7 @@ async function captureQr(page, qrButton, switchButton, captureDeadline) {
               if (bounds.width < 180 || bounds.height < 180) return null;
               if (Math.abs(bounds.width - bounds.height) > Math.max(bounds.width, bounds.height) * 0.05) return null;
               if (document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2) !== element) return null;
-              const sample = document.createElement('canvas');
-              sample.width = 128;
-              sample.height = 128;
-              const sampleContext = sample.getContext('2d', { willReadFrequently: true });
-              if (!sampleContext) return null;
-              sampleContext.fillStyle = '#fff';
-              sampleContext.fillRect(0, 0, sample.width, sample.height);
-              sampleContext.imageSmoothingEnabled = false;
-              sampleContext.drawImage(element, 0, 0, sample.width, sample.height);
-              const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
-              let dark = 0;
-              let light = 0;
-              let luminanceSum = 0;
-              let luminanceSquareSum = 0;
-              const pixelCount = pixels.length / 4;
-              for (let index = 0; index < pixels.length; index += 4) {
-                const luminance = 0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2];
-                if (luminance < 96) dark += 1;
-                if (luminance > 224) light += 1;
-                luminanceSum += luminance;
-                luminanceSquareSum += luminance * luminance;
-              }
-              const mean = luminanceSum / pixelCount;
-              const deviation = Math.sqrt(Math.max(0, luminanceSquareSum / pixelCount - mean * mean));
-              if (dark / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION} || light / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION} || deviation < ${KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION}) return null;
-              const output = document.createElement('canvas');
-              output.width = element.naturalWidth;
-              output.height = element.naturalHeight;
-              const outputContext = output.getContext('2d');
-              if (!outputContext) return null;
-              outputContext.fillStyle = '#fff';
-              outputContext.fillRect(0, 0, output.width, output.height);
-              outputContext.imageSmoothingEnabled = false;
-              outputContext.drawImage(element, 0, 0, output.width, output.height);
-              const dataUrl = output.toDataURL('image/png');
-              const prefix = 'data:image/png;base64,';
-              const encoded = dataUrl.startsWith(prefix) ? dataUrl.slice(prefix.length) : '';
-              return encoded.length > 0 && encoded.length <= Math.ceil(512 * 1024 / 3) * 4 ? encoded : null;
+              return true;
             },
             undefined,
             { timeout: remainingCaptureTimeout(captureDeadline) },
@@ -1189,11 +1152,68 @@ async function captureQr(page, qrButton, switchButton, captureDeadline) {
           if (reason !== 'unknown') loginDiagnostic.reason = reason;
           return null;
         });
-        if (!encodedQr && loginDiagnostic.reason === 'unknown') loginDiagnostic.reason = 'image_not_ready';
-        if (!encodedQr || !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedQr) || encodedQr.length % 4 !== 0) continue;
-        const png = Buffer.from(encodedQr, 'base64');
-        if (png.toString('base64') !== encodedQr || png.length > 512 * 1024) continue;
+        if (!ready) {
+          if (loginDiagnostic.reason === 'unknown') loginDiagnostic.reason = 'image_not_ready';
+          continue;
+        }
+        // Element screenshot avoids tainted-canvas SecurityError on cross-origin WeChat QR <img>.
+        // Live and verify share this path; do not draw the remote <img> into canvas.
+        const png = await beforeCaptureDeadline(
+          () => image.screenshot({ type: 'png', timeout: remainingCaptureTimeout(captureDeadline) }),
+          captureDeadline,
+        ).catch((error) => {
+          const reason = loginFailureReason(error);
+          if (reason !== 'unknown') loginDiagnostic.reason = reason;
+          return null;
+        });
+        if (!png || !Buffer.isBuffer(png) || png.length < 256 || png.length > 512 * 1024) {
+          if (loginDiagnostic.reason === 'unknown') loginDiagnostic.reason = 'image_not_ready';
+          continue;
+        }
         if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) continue;
+        const sampleOk = await beforeCaptureDeadline(
+          () => page.evaluate(
+            ({ encoded }) => new Promise((resolve) => {
+              const probe = new Image();
+              probe.onload = () => {
+                const sample = document.createElement('canvas');
+                sample.width = 128;
+                sample.height = 128;
+                const sampleContext = sample.getContext('2d', { willReadFrequently: true });
+                if (!sampleContext) return resolve(null);
+                sampleContext.fillStyle = '#fff';
+                sampleContext.fillRect(0, 0, sample.width, sample.height);
+                sampleContext.imageSmoothingEnabled = false;
+                sampleContext.drawImage(probe, 0, 0, sample.width, sample.height);
+                const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
+                let dark = 0;
+                let light = 0;
+                let luminanceSum = 0;
+                let luminanceSquareSum = 0;
+                const pixelCount = pixels.length / 4;
+                for (let index = 0; index < pixels.length; index += 4) {
+                  const luminance = 0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2];
+                  if (luminance < 96) dark += 1;
+                  if (luminance > 224) light += 1;
+                  luminanceSum += luminance;
+                  luminanceSquareSum += luminance * luminance;
+                }
+                const mean = luminanceSum / pixelCount;
+                const deviation = Math.sqrt(Math.max(0, luminanceSquareSum / pixelCount - mean * mean));
+                if (dark / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION} || light / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION} || deviation < ${KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION}) return resolve(null);
+                resolve(true);
+              };
+              probe.onerror = () => resolve(null);
+              probe.src = 'data:image/png;base64,' + encoded;
+            }),
+            { encoded: png.toString('base64') },
+          ),
+          captureDeadline,
+        ).catch(() => null);
+        if (!sampleOk) {
+          if (loginDiagnostic.reason === 'unknown') loginDiagnostic.reason = 'image_not_ready';
+          continue;
+        }
         remainingCaptureTimeout(captureDeadline);
         return png;
       }
