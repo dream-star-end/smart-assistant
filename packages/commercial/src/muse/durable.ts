@@ -21,6 +21,8 @@ export interface MuseDurableState {
   state: 'queued' | 'dispatched' | 'running'
   nonce: string
   expiresAt: number
+  /** Set when the job was routed to the Box relay (OCV5-750). Absent = hatch. */
+  via?: 'box-exec'
 }
 export interface MuseRecoveredJob {
   id: string

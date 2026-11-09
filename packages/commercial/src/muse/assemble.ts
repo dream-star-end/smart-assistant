@@ -10,6 +10,7 @@ import { rootLogger } from '../logging/logger.js'
 import { createMuseDurability } from './durable.js'
 import { createMuseDelivery, type MuseDeliveryDeps } from './delivery.js'
 import { createMuseBilling } from './billing.js'
+import { createMuseBoxExecRunner, parseMuseVideoBackend } from './boxExecVideo.js'
 import { type MuseBridgeHttpHandler, makeMuseBridgeHttpHandler } from './bridgeHttp.js'
 import { MuseBridgeHub } from './hub.js'
 import { CLI_TIMEOUT_SEC, MAX_CONCURRENCY, QUEUE_WAIT_MS, parseAllowedUids } from './protocol.js'
@@ -78,6 +79,10 @@ export async function createMuseFromConfig(
     },
     ...(prices.image > 0 || prices.video > 0 ? { billing: createMuseBilling(pool, prices) } : {}),
     orphanGraceMs: (cfg.OC_MUSE_ORPHAN_GRACE_SEC ?? 0) * 1000,
+    videoBackend: parseMuseVideoBackend(cfg.OC_MUSE_VIDEO_BACKEND),
+    boxExecRunner: cfg.OC_MUSE_BOX_EXEC_UID
+      ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID)
+      : undefined,
   })
   try {
     await hub.start()
