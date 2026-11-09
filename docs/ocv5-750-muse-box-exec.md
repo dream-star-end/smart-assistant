@@ -14,7 +14,7 @@ Images and `--resume` always stay on hatch.
 
 ## How to switch
 
-1. **Boot default** (master restart): `OC_MUSE_VIDEO_BACKEND=hatch|hatch-with-box-fallback|box-exec` plus `OC_MUSE_BOX_EXEC_UID=<uid whose Box account hosts the relay>`.
+1. **Boot default** (master restart): `OC_MUSE_VIDEO_BACKEND=hatch|hatch-with-box-fallback|box-exec` plus `OC_MUSE_BOX_EXEC_UID=<uid>` and `OC_MUSE_BOX_EXEC_ACCOUNT_ID=<Box account id that hosts the relay>` (both required; the runner is not wired without them).
 2. **Live override** (no restart): write one of the three values to `$OC_MUSE_STATE_ROOT/video-backend`. The hub re-reads it on every routing decision. Delete the file (or write `hatch`) to switch back. The directory is master-owned `0700`; containers cannot flip it.
 3. Commercial (Aurora): box→hatch fallback is not implemented; a box-exec failure fails the job with no charge.
 

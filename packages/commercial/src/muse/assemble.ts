@@ -80,9 +80,12 @@ export async function createMuseFromConfig(
     ...(prices.image > 0 || prices.video > 0 ? { billing: createMuseBilling(pool, prices) } : {}),
     orphanGraceMs: (cfg.OC_MUSE_ORPHAN_GRACE_SEC ?? 0) * 1000,
     videoBackend: parseMuseVideoBackend(cfg.OC_MUSE_VIDEO_BACKEND),
-    boxExecRunner: cfg.OC_MUSE_BOX_EXEC_UID
-      ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID)
-      : undefined,
+    boxExecRunner:
+      cfg.OC_MUSE_BOX_EXEC_UID && cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID
+        ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID, {
+            accountId: cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID,
+          })
+        : undefined,
   })
   try {
     await hub.start()
