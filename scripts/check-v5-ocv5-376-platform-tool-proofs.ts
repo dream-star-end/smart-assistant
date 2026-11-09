@@ -4,7 +4,8 @@
  * Requires named cases to actually pass — missing, failed, skipped, or todo is a hard fail.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const ROOT = process.cwd();
@@ -55,22 +56,34 @@ function runVitest(file: string, cases: string[]): string[] {
   const abs = join(ROOT, file);
   if (!existsSync(abs)) fail(`missing ${file}`);
   const rel = file.replace(/^packages\/web-react\//, "");
-  const run = spawnSync(
-    "npm",
-    ["run", "--workspace", "@openclaude/web-react", "test", "--", "--reporter=json", "--outputFile=/tmp/g1669-vitest.json", rel],
-    { cwd: ROOT, encoding: "utf8", timeout: 300_000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, CI: "1" } },
-  );
-  if (run.error) fail(`${file}: ${run.error.message}`);
-  // Prefer json file; fall back to stdout JSON
+  const reportDir = mkdtempSync(join(tmpdir(), "ocv5-376-vitest-"));
+  const reportPath = join(reportDir, "report.json");
+  let run: ReturnType<typeof spawnSync>;
+  try {
+    run = spawnSync(
+      "npm",
+      ["run", "--workspace", "@openclaude/web-react", "test", "--", "--reporter=json", `--outputFile=${reportPath}`, rel],
+      { cwd: ROOT, encoding: "utf8", timeout: 300_000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, CI: "1" } },
+    );
+  } finally {
+    // keep reportDir until after parse; cleaned below
+  }
+  if (run.error) {
+    rmSync(reportDir, { recursive: true, force: true });
+    fail(`${file}: ${run.error.message}`);
+  }
+  // Prefer this invocation's json file; fall back to stdout JSON
   let report: any;
   try {
-    report = JSON.parse(readFileSync("/tmp/g1669-vitest.json", "utf8"));
+    report = JSON.parse(readFileSync(reportPath, "utf8"));
   } catch {
     const stdout = run.stdout ?? "";
     const start = stdout.indexOf("{");
+    rmSync(reportDir, { recursive: true, force: true });
     if (start < 0) fail(`${file}: vitest json missing (exit ${run.status})\n${stdout.slice(-1500)}`);
     report = JSON.parse(stdout.slice(start));
   }
+  rmSync(reportDir, { recursive: true, force: true });
   const tests: Array<{ name?: string; fullName?: string; status?: string; result?: string }> = [];
   const walk = (node: any) => {
     if (!node || typeof node !== "object") return;
