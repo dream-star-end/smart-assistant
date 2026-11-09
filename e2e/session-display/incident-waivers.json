@@ -185,14 +185,14 @@
     {
       "commit": "785b3e0425e9ccc1720043c501946c31abfea22b",
       "reason": "lazyToolBody cached a rejected import forever, so after one failed idle prefetch tool bodies could not open until reload; latent, no user report. Found while moving the test preload out of setup.ts.",
-      "approvedBy": "operator 2026-10-11 「这个按建议让cc3改，改的过程有啥问题都顺手修下」(OCV5-376)",
-      "expiresAt": "2026-11-08"
+      "approvedBy": "operator 2026-10-11 「这个按建议让cc3改，改的过程有啥问题都顺手修下」(OCV5-376); user 2026-11-09 webmw4oodqfrsmx3n 选择「续期一个月」（续期已上线不可改写提交的豁免以放行 selfhost 发布列车）",
+      "expiresAt": "2026-12-08"
     },
     {
       "commit": "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0",
       "reason": "The approved general-assistant@1.0.0 preset pinned glm-5.3-zai while the code said auto under the same version; the seed refused it on every start. Version bump + hash-pinning test.",
-      "approvedBy": "operator 2026-10-11 「这个按建议让cc3改，改的过程有啥问题都顺手修下」(OCV5-376)",
-      "expiresAt": "2026-11-08"
+      "approvedBy": "operator 2026-10-11 「这个按建议让cc3改，改的过程有啥问题都顺手修下」(OCV5-376); user 2026-11-09 webmw4oodqfrsmx3n 选择「续期一个月」（续期已上线不可改写提交的豁免以放行 selfhost 发布列车）",
+      "expiresAt": "2026-12-08"
     },
     {
       "commit": "1f4e95be548610b2e99ff3d82eb36c3cc55ddf9a",
