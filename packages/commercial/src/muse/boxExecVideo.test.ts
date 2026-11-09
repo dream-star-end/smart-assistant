@@ -335,7 +335,9 @@ describe('OCV5-750 relay Box pinning', () => {
   it('refuses to resolve a Box without OC_MUSE_BOX_EXEC_ACCOUNT_ID (no random Box)', async () => {
     const exec = await createMuseBoxExecRunner('25')()
     await assert.rejects(
-      exec({ args: ['muse-exec-cli', '--json', 'health'] } as unknown as BoxCcExecRequest, {}),
+      exec({ args: ['muse-exec-cli', '--json', 'health'] } as unknown as BoxCcExecRequest, {
+        timeoutMs: 1_000,
+      }),
       /OC_MUSE_BOX_EXEC_ACCOUNT_ID is not set/,
     )
   })
