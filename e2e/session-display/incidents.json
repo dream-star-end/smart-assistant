@@ -10058,6 +10058,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/plugins/knowledgePlanet.test.ts",
           "assertion": "INC-20261109-KP-QR-BROKER-CONCURRENCY: login broker carries more than 9 concurrent WeChat tunnels so the QR image still loads"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "seed-knowledge-planet-plugin.ts '--verify-user=$KNOWLEDGE_PLANET_VERIFY_USER'"
         }
       ]
     }

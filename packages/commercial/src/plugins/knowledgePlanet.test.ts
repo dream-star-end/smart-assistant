@@ -1481,25 +1481,29 @@ describe('Knowledge Planet login broker concurrency (INC-20261109-KP-QR-BROKER-C
         socketGid: process.getgid?.() ?? 0,
         limits,
       })
-      const tunnels = []
-      // page assets keep their tunnels open while the QR request is issued
-      for (let index = 0; index < parallel; index++)
-        tunnels.push(
-          await openBrokerTunnel(broker.mount.hostSocketPath, broker.mount.token, pin.hostname, pin.port),
-        )
-      const qr = await openBrokerTunnel(broker.mount.hostSocketPath, broker.mount.token, pin.hostname, pin.port)
-      let image = ''
-      if (qr.status === 'open') {
-        qr.socket.write('GET /connect/qrcode')
-        const deadline = Date.now() + 2_000
-        while (Date.now() < deadline && qr.received() !== 'QR-PNG')
-          await new Promise((resolveTick) => setTimeout(resolveTick, 5))
-        image = qr.received()
+      const tunnels: Awaited<ReturnType<typeof openBrokerTunnel>>[] = []
+      try {
+        // page assets keep their tunnels open while the QR request is issued
+        for (let index = 0; index < parallel; index++)
+          tunnels.push(
+            await openBrokerTunnel(broker.mount.hostSocketPath, broker.mount.token, pin.hostname, pin.port),
+          )
+        const qr = await openBrokerTunnel(broker.mount.hostSocketPath, broker.mount.token, pin.hostname, pin.port)
+        tunnels.push(qr)
+        let image = ''
+        if (qr.status === 'open') {
+          qr.socket.write('GET /connect/qrcode')
+          const deadline = Date.now() + 2_000
+          while (Date.now() < deadline && qr.received() !== 'QR-PNG')
+            await new Promise((resolveTick) => setTimeout(resolveTick, 5))
+          image = qr.received()
+        }
+        const openCount = tunnels.slice(0, parallel).filter((tunnel) => tunnel.status === 'open').length
+        return { openCount, qrStatus: qr.status, image }
+      } finally {
+        for (const tunnel of tunnels) tunnel.socket.destroy()
+        await broker.close()
       }
-      const openCount = tunnels.filter((tunnel) => tunnel.status === 'open').length
-      for (const tunnel of [...tunnels, qr]) tunnel.socket.destroy()
-      await broker.close()
-      return { openCount, qrStatus: qr.status, image }
     }
     try {
       // the WeChat page opens 9–11 tunnels; the QR request is the 11th
