@@ -401,9 +401,15 @@ describe('OCV5-750 hatch-with-box-fallback', () => {
     const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
     const job = (await hub.poll(sid, 50))!
     await hub.heartbeat(job.id, job.nonce)
-    clock += 200_000
-    hub.tick()
-    await hub.view('3', id, 100)
+    // Heartbeat lost: Aurora requeues it for hatch (state back to queued). Later sweeps (offline,
+    // queue wait, retry budget) must still never hand an acked job to the relay (Gemini r3 NEW-1).
+    for (let i = 0; i < 8; i++) {
+      clock += 200_000
+      hub.tick()
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    const view = await hub.view('3', id, 50)
+    assert.notEqual(view?.status, 'succeeded')
     assert.equal(counter.calls.length, 0)
   })
 

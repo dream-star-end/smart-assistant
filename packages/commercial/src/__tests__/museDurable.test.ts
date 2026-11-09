@@ -547,4 +547,29 @@ describe('durable Muse video lifecycle', () => {
     assert.equal(row.fin?.errorCode, 'MUSE_BOX_EXEC_INTERRUPTED')
     assert.equal(again.length, 0)
   })
+
+  it('OCV5-750: a durable job waiting for a relay slot goes to the background instead of MUSE_BUSY', async () => {
+    const calls: string[] = []
+    const hub = make({
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      userRunningMax: 1,
+      queueWaitMs: { image: 1_000, video: 1_000 },
+      boxExecRunner: async () => relay(calls, true) as never,
+    })
+    const first = await submit(hub)
+    const second = await submit(hub)
+    for (let i = 0; i < 20 && !calls.includes('submit'); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    assert.equal(journal.rows.get(first)?.durable?.state, 'running')
+    journal.now += 5_000
+    hub.tick()
+    await flush()
+    const row = journal.rows.get(second)!
+    assert.equal(row.status, 'queued')
+    assert.equal(row.durable?.background, true)
+    assert.equal(calls.filter((c) => c === 'submit').length, 1)
+  })
 })

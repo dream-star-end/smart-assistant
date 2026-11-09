@@ -151,6 +151,9 @@ interface HubJob {
   via: 'hatch' | 'box-exec'
   /** Set once a job moved hatch → box-exec (it never moves back). */
   movedToBox?: boolean
+  /** Sticky: a hatch bridge acked this job once, so it may be generating there. Never moves to
+   * the Box relay afterwards, even after requeue/restore resets its state (Gemini r3 NEW-1). */
+  hatchAcked?: boolean
   /** Aborts the in-flight box-exec CLI calls (cancel, timeout, lost lease, stop). */
   abort?: AbortController
 }
@@ -550,6 +553,7 @@ export class MuseBridgeHub {
     const now = this.now()
     if (job.state === 'dispatched') {
       job.state = 'running'
+      job.hatchAcked = true
       if (job.credentialId) {
         this.store.markRunning(job.id, job.credentialId).catch((err) => {
           this.log.warn('muse_mark_running_failed', { jobId: job.id, err: (err as Error).message })
@@ -1223,11 +1227,20 @@ export class MuseBridgeHub {
       }
     }
     for (const job of [...this.boxExecPending]) {
+      if (job.durable?.background) {
+        // Backgrounded jobs wait up to their TTL, as on hatch (Gemini r3 NEW-2).
+        if (now >= job.durable.expiresAt) {
+          this.finish(job, fail('MUSE_QUEUE_EXPIRED', 'Muse background queue expired'))
+        }
+        continue
+      }
       // Only the wait for a relay slot counts here; a job may arrive after a long hatch wait.
       if (now - job.queuedAt > this.queueWaitMs[job.spec.kind]) {
-        this.finish(job, fail('MUSE_BUSY', 'waited too long in the Muse queue', true))
+        if (job.durable) this.backgroundBoxPending(job)
+        else this.finish(job, fail('MUSE_BUSY', 'waited too long in the Muse queue', true))
       }
     }
+    this.pumpBoxExec()
     for (const job of [...this.boxExecInflight]) {
       if (now > job.deadlineAt && !job.settling) {
         job.abort?.abort()
@@ -1288,10 +1301,11 @@ export class MuseBridgeHub {
    */
   private moveToBoxExec(job: HubJob, reason: string): boolean {
     if (job.state !== 'queued' && job.state !== 'dispatched') return false
-    if (job.via !== 'hatch' || job.movedToBox || job.settling || this.stopped) return false
+    if (job.via !== 'hatch' || job.movedToBox || job.hatchAcked || job.settling || this.stopped)
+      return false
     if (job.durable && this.now() >= job.leaseUntil) return false
     if (!this.boxFallbackAvailable(this.getVideoBackend(), job.spec)) return false
-    if (this.boxLoad() >= this.queueMax) return false
+    if (this.boxLoad() + this.reservedBox >= this.queueMax) return false
     const oldNonce = job.nonce
     const now = this.now()
     this.active.delete(job.id)
@@ -1543,6 +1557,7 @@ export class MuseBridgeHub {
     outcome: Outcome = fail('MUSE_BRIDGE_LOST', 'lost contact with the bridge', true),
   ): void {
     if (job.state === 'done' || job.settling || job.retryAt > 0) return
+    if (job.state === 'running') job.hatchAcked = true
     // OCV5-750 backup: a job hatch has provably not started (no ack yet) moves to the Box relay
     // when no bridge is connected or its hatch retry budget is spent. Acked jobs never move.
     if (
@@ -1586,6 +1601,8 @@ export class MuseBridgeHub {
       reason,
     })
     this.pump()
+    // A hatch slot of this user may have freed up for a waiting relay job (Gemini r3 NEW-3).
+    this.pumpBoxExec()
   }
 
   private removeWaiter(w: PollWaiter): boolean {
@@ -1707,6 +1724,7 @@ export class MuseBridgeHub {
       retryCount: job.retryCount,
       retryAt: job.retryAt,
       ...(job.via === 'box-exec' ? { via: 'box-exec' as const } : {}),
+      ...(job.hatchAcked ? { hatchAcked: true as const } : {}),
     }
     job.durable = state
     const started = this.now()
@@ -1743,6 +1761,7 @@ export class MuseBridgeHub {
     await job.checkpoint
     this.requireActive(job.id, nonce)
     if (job.state === 'dispatched') {
+      job.hatchAcked = true
       await this.store.markRunning(job.id, job.credentialId!, this.fence(job))
       this.requireActive(job.id, nonce)
       job.state = 'running'
@@ -1753,6 +1772,16 @@ export class MuseBridgeHub {
     }
     job.lastBeatAt = this.now()
     return { cancel: false }
+  }
+
+  /** Durable relay job still waiting for a slot: deliver to the conversation later instead of
+   * failing it (it stays in the relay queue). */
+  private backgroundBoxPending(job: HubJob): void {
+    if (!job.durable || job.state !== 'queued' || job.durable.background) return
+    job.durable.background = true
+    job.durable.expiresAt = this.now() + MUSE_BACKGROUND_TTL_MS
+    this.checkpoint(job)
+    this.wake(job)
   }
 
   private background(job: HubJob): void {
@@ -1875,11 +1904,18 @@ export class MuseBridgeHub {
       sources: null,
       claimResponseBytes: 0,
       via: 'hatch',
+      // A job journalled while running on hatch may still be generating there.
+      hatchAcked: d.hatchAcked === true || (d.via !== 'box-exec' && d.state === 'running'),
     }
     this.jobs.set(job.id, job)
     if (d.via === 'box-exec') {
       job.via = 'box-exec'
       job.movedToBox = true
+      if (d.state === 'queued' && d.background && this.now() >= d.expiresAt) {
+        this.checkpoint(job)
+        this.finish(job, fail('MUSE_QUEUE_EXPIRED', 'Muse background queue expired'))
+        return
+      }
       if (d.state === 'queued' && this.boxExecRunner) {
         // Never handed to the relay (the running checkpoint precedes submit): run it there now.
         this.boxExecPending.push(job)

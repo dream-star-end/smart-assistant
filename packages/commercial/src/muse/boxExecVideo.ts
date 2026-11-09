@@ -417,7 +417,9 @@ export function createMuseBoxExecRunner(
       const first = !used
       used = true
       try {
-        pinned ??= await resolve(opts.signal)
+        // The job signal is not handed to the resolver: its guard would capture it, and the
+        // best-effort cancel sent after an abort must still reach the Box (Codex r2 P1).
+        pinned ??= await resolve()
         if (opts.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
         return await pinned(request, opts)
       } catch (err) {
@@ -425,7 +427,7 @@ export function createMuseBoxExecRunner(
         // remotely). Re-resolve only on a job's very first call: later calls depend on state
         // (staged chunks, the relay job) that lives on the Box this job is pinned to.
         if (!first || !isStaleBoxExecTransport(err)) throw err
-        pinned = await resolve(opts.signal)
+        pinned = await resolve()
         if (opts.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
         return await pinned(request, opts)
       }
