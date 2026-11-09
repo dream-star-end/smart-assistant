@@ -41,6 +41,7 @@ import {
   KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION,
+  KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS,
   KNOWLEDGE_PLANET_TOPIC_PAGE_MAX,
   KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES,
   KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES,
@@ -124,11 +125,11 @@ describe('official Knowledge Planet Plugin', () => {
       }),
       'current',
     )
-    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 5)
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 7)
     assert.deepEqual(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0], {
-      version: '1.4.0',
-      artifactHash: 'bc027e75eade8285c776f0ca6aa1f10bc32d8f6e4bc870b1be35a965946a04fb',
-      execContractHash: '02d496327bf1d088b3f6b1821731416980ac6a77e21df16dabeea2da0882d8b8',
+      version: '1.5.0',
+      artifactHash: 'f5b41bcbdeeb0709c4e77ee05f05e6b994aeb8e6d72d5661e06496cfc2a8a642',
+      execContractHash: 'e67a26206d419020abf21f4bd4a3dd8ae44eb1a249cd47a9e356a861a8d08364',
     })
     for (const predecessor of KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS)
       assert.equal(classifyKnowledgePlanetSetupPin(predecessor), 'compatible-predecessor')
@@ -142,7 +143,7 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(
       classifyKnowledgePlanetSetupPin({
         ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
-        version: '1.5.0',
+        version: '1.5.2',
       }),
       null,
     )
@@ -174,6 +175,16 @@ describe('official Knowledge Planet Plugin', () => {
     })
     assert.ok(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.accountState.origins.length > 1)
     assert.ok(KNOWLEDGE_PLANET_LOGIN_ORIGINS.includes('https://open.weixin.qq.com:443'))
+    assert.ok(KNOWLEDGE_PLANET_LOGIN_ORIGINS.includes('https://lp.open.weixin.qq.com:443'))
+    assert.ok(
+      KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS >= 60_000,
+      'WeChat qrconnect long-poll needs >15s or scan confirmation never arrives',
+    )
+    assert.ok(
+      KNOWLEDGE_PLANET_WORKER_SOURCE.includes(
+        `client.setTimeout(${KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS}, () => client.destroy())`,
+      ),
+    )
     assert.equal(
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'read').length,
       16,
@@ -185,7 +196,7 @@ describe('official Knowledge Planet Plugin', () => {
   })
 
   test('v1.5 exposes bounded reply-aware reads plus default-confirmed or account-preapproved rich writes without credential-bearing results', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.5.0')
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.5.2')
     assert.equal(KNOWLEDGE_PLANET_DRIVER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.equal(KNOWLEDGE_PLANET_LAUNCHER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.deepEqual(

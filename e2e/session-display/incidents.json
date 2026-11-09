@@ -9985,6 +9985,46 @@
           "assertion": "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE: a failed load is not cached: the next call loads again"
         }
       ]
+    },
+    {
+      "id": "INC-20261108-KP-SETUP-DRAIN",
+      "occurredAt": "2026-11-08",
+      "severity": "P1",
+      "symptom": "知识星球二维码生成失败后扫码 worker 继续占用容量直到总期限；原始二维码失败触发原因未证实。",
+      "rootFixCommit": "0403018b",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/knowledgePlanetLoginLifecycle.test.ts",
+          "assertion": "failed frame during Docker startup kills its exact container and releases the single slot"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/plugin-connect.node-test.mjs",
+          "assertion": "Knowledge Planet setup distinguishes QR failure from capacity, stops polling and retries cleanly"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261109-KP-SCAN-LONGPOLL",
+      "occurredAt": "2026-11-09",
+      "severity": "P1",
+      "symptom": "知识星球微信登录二维码可以显示，扫码后页面一直不显示已登录。worker CONNECT 中继 15s 空闲超时切断了 lp.open.weixin.qq.com 约 20s 的 qrconnect long-poll，扫码确认无法回到登录页。",
+      "rootFixCommit": "ded8da6b",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/knowledgePlanet.test.ts",
+          "assertion": "WeChat qrconnect long-poll needs >15s or scan confirmation never arrives"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/plugin-connect.node-test.mjs",
+          "assertion": "Knowledge Planet setup shows login success after WeChat scan while QR is visible"
+        }
+      ]
     }
   ]
 }

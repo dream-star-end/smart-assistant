@@ -358,6 +358,8 @@ unknown/live 请求。预留释放只能消除 402，原模型失败仍须独立
 ### 3.5 市场/技能问题
 市场权威=master PG;容器侧靠 `syncMarketplaceHub`(已内建单飞+5s TTL+限频 warn 日志,"装了不显示"先看容器日志里的 sync warn)。管理面读技能在**容器内 gateway** 执行(生效面=runtime source release 轴,§2 矩阵)。用户向 skill API 必须 `includePlatform:false`(防平台技能泄露)。
 
+知识星球授权先区分生成失败与扫码容量耗尽：终态必须停止对应 worker，二维码生成失败不等于 45 秒预算不足。t1660u 的开发复现、脱敏诊断契约及未证实项见 [知识星球授权失败收尾](T1660U_KNOWLEDGE_PLANET_SETUP.md)；该修复尚待草稿 PR 审查及用户发布授权。
+
 ### 3.6 遥测/审计
 工具失败遥测:显式开关 `OC_TOOL_FAILURE_AUDIT=1`(容器 reporter+master 路由双端;v3 无此键=默认关)。dedupe 走 `idx_aa_agent_event_id` 索引。
 

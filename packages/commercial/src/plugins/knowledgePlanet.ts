@@ -17,6 +17,7 @@ import {
   REQUIRED_BROWSER_LAUNCHER_CAPABILITIES,
 } from './browserRuntime.js'
 import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js'
+import { KP_LOGIN_STAGES, KP_LOGIN_REASONS, type KnowledgePlanetLoginDiagnostic } from './knowledgePlanetLoginDiagnostics.js'
 
 const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
 const WORKER_FILE = 'knowledge-planet-worker.mjs'
@@ -94,7 +95,8 @@ interface ReadyEvent {
 
 interface FailedEvent {
   event: 'failed'
-  code: 'WORKER_FAILED' | 'LOGIN_EXPIRED' | 'UPSTREAM_FAILED'
+  code: 'WORKER_FAILED' | 'LOGIN_EXPIRED' | 'UPSTREAM_FAILED' | 'QR_GENERATION_FAILED' | 'QR_GENERATION_TIMEOUT'
+  diagnostic?: KnowledgePlanetLoginDiagnostic
 }
 
 interface PreparedEvent {
@@ -157,9 +159,16 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
     return event as unknown as ReadyEvent
   }
   if (event.event === 'failed') {
-    exactEventKeys(event, ['event', 'code'])
-    if (!['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_FAILED'].includes(String(event.code)))
+    exactEventKeys(event, event.diagnostic === undefined ? ['event', 'code'] : ['event', 'code', 'diagnostic'])
+    if (!['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_FAILED', 'QR_GENERATION_FAILED', 'QR_GENERATION_TIMEOUT'].includes(String(event.code)))
       throw new KnowledgePlanetRuntimeError('PROTOCOL', 'worker failure code is invalid')
+    if (event.diagnostic !== undefined) {
+      const diagnostic = plainEvent(event.diagnostic)
+      exactEventKeys(diagnostic, ['stage', 'reason'])
+      if (!(KP_LOGIN_STAGES as readonly unknown[]).includes(diagnostic.stage) ||
+          !(KP_LOGIN_REASONS as readonly unknown[]).includes(diagnostic.reason))
+        throw new KnowledgePlanetRuntimeError('PROTOCOL', 'worker diagnostic is invalid')
+    }
     return event as unknown as FailedEvent
   }
   if (event.event === 'prepared') {
@@ -640,6 +649,10 @@ export class KnowledgePlanetDockerService {
           )
         events.push(event)
         args.onEvent?.(event)
+        // A failed login cannot do useful work. Use this invocation's container,
+        // including when the frame arrives before the active map is populated.
+        if (args.kind === 'login' && event.event === 'failed')
+          void current.kill().catch(() => {})
         if (event.event === 'prepared') {
           if (prepared || !args.beforeDispatch || !stream)
             throw new KnowledgePlanetRuntimeError('PROTOCOL', 'worker dispatch fence is invalid')
@@ -841,22 +854,29 @@ export class KnowledgePlanetDockerService {
       onEvent: (event) => {
         if (event.event === 'qr') args.onQr(event.png)
         else if (event.event === 'authenticated') args.onAuthenticated(event.storageState)
-        else if (event.event === 'failed') args.onFailed(event.code)
+        else if (event.event === 'failed') {
+          console.warn('knowledge_planet.login_failed', {
+            sessionId: args.sessionId,
+            code: event.code,
+            ...(event.diagnostic ?? {}),
+          })
+          args.onFailed(event.code)
+        }
       },
     })
     return {
       sessionId: args.sessionId,
       done: worker.done.then(() => undefined),
-      stop: () => this.terminate(`login:${args.sessionId}`),
+      stop: () => this.terminate(`login:${args.sessionId}`, worker),
     }
   }
 
-  async terminate(key: string): Promise<void> {
+  async terminate(key: string, expected?: ActiveWorker): Promise<void> {
     const active = this.active.get(key)
-    if (!active) return
+    if (!active || (expected && active !== expected)) return
     await active.container.kill().catch(() => {})
     await active.done.catch(() => {})
-    if (this.active.has(key)) {
+    if (this.active.get(key) === active) {
       let cleanupFailure = false
       await active.container.remove({ force: true }).catch(() => {
         cleanupFailure = true
@@ -865,9 +885,9 @@ export class KnowledgePlanetDockerService {
       await active.broker.close().catch(() => {
         cleanupFailure = true
       })
-      if (!cleanupFailure) this.active.delete(key)
+      if (!cleanupFailure && this.active.get(key) === active) this.active.delete(key)
     }
-    if (this.active.has(key))
+    if (this.active.get(key) === active)
       throw new KnowledgePlanetRuntimeError('CLEANUP_FAILED', 'worker termination did not drain')
   }
 
