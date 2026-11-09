@@ -358,7 +358,7 @@ export class CodexRemoteRelay {
     const p = frame.params ?? {}, method = frame.method
     codexNeed(p && typeof p === 'object' && !Array.isArray(p))
     const allowed: Record<string, string[]> = { initialize: ['clientInfo','capabilities'], initialized: [],
-      'thread/start': ['baseInstructions','developerInstructions'], 'thread/resume': ['threadId'],
+      'thread/start': ['baseInstructions','developerInstructions'], 'thread/resume': ['threadId','baseInstructions'],
       'turn/start': ['threadId','input','effort'], 'turn/interrupt': ['threadId','turnId'], 'thread/read': ['threadId','includeTurns'],
       'model/list': ['cursor','limit','includeHidden'], 'mcpServerStatus/list': ['cursor','limit'], 'account/read': [] }
     codexNeed(Object.hasOwn(allowed, method) && Object.keys(p).every(k => allowed[method]!.includes(k)))

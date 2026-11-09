@@ -112,6 +112,8 @@ async function lane(t: TestContext, options: {
   leaseRenewAfterMs?: number
   platformTools?: boolean
   closeFailure?: { active: boolean }
+  /** The web chat's peer id; the prompt only projects a nickname consented for this session. */
+  sessionId?: string
 } = {}): Promise<Lane> {
   const root = mkdtempSync(join(tmpdir(), 'codex-container-e2e-'))
   const cwd = join(root, 'cwd')
@@ -163,7 +165,7 @@ async function lane(t: TestContext, options: {
       executionRevision: 'e2e-r1', issuedAt, expiresAt: issuedAt + 120000,
       executionDescriptor: {
         capabilityProfile: {}, capabilitySchemaVersion: 1, contextWindow: 1000,
-        supportsVision: false, supportedEfforts: ['low'],
+        supportsVision: false, supportedEfforts: ['low', 'high'],
       },
     }
     const leaseFor = (expiresAt: number): string => {
@@ -304,6 +306,7 @@ async function lane(t: TestContext, options: {
     model: binding.canonicalModel,
     effortLevel: 'low',
     executionBackend: codexBackend(binding),
+    ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
   } as EngineCreateOpts, {
     binding, socketPath: sock, keyring: keys, executionRoot, renewLease,
     ...(options.leaseRenewAfterMs === undefined ? {} : { leaseRenewAfterMs: options.leaseRenewAfterMs }),
@@ -330,7 +333,7 @@ async function lane(t: TestContext, options: {
   const sentinel = join(cwd, 'remote-sentinel.txt')
   const descriptor: CcbExecutionDescriptor = {
     executionBackend: codexBackend(binding), canonicalModel: binding.canonicalModel, contextWindow: 1000,
-    capabilityZero: false, supportsThinking: true, supportsVision: false, supportedEfforts: ['low'],
+    capabilityZero: false, supportsThinking: true, supportsVision: false, supportedEfforts: ['low', 'high'],
   }
   const turnKey = 'c'.repeat(64)
 
@@ -673,13 +676,16 @@ test('an effort change restarts only the kernel: first and later turns still run
   { timeout: 180000 }, async (t) => {
   // OCV5-746: a web chat that picks a reasoning effort makes sessionSubmit restart the runner
   // before the first turn. That restart must not revoke the lane (it used to: CODEX_LANE_CLOSED).
-  // The fixture descriptor only supports `low`; the relay's per-effort gate is covered elsewhere.
+  // The chat opens at the fixture's `low` and the user picks `high` before the first message.
   const h = await lane(t)
-  h.adapter.setEffortLevel('low')
+  const turnStarts = () => h.received('launch')
+    .map((row) => row?.received).filter((frame) => frame?.method === 'turn/start')
+  h.adapter.setEffortLevel('high')
   await restartRunnerForConfigChange(h.adapter)
   const first = h.authority('req-effort-1')
   const run = h.adapter.submitTurn(h.turnParams(first, h.turnKey, 'req-effort-1'))
-  await h.until(() => h.received('launch').some((row) => row?.received?.method === 'turn/start'), 'turn/start after the effort change')
+  await h.until(() => turnStarts().length === 1, 'turn/start after the effort change')
+  assert.equal(turnStarts()[0].params?.effort, 'high', 'the node runs the first turn at the chosen effort')
   const firstTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 200, outputTokens: 20 }
   h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[0]!, firstTotal, firstTotal) })
   h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[0], status: 'completed' } } })
@@ -693,10 +699,8 @@ test('an effort change restarts only the kernel: first and later turns still run
   await restartRunnerForConfigChange(h.adapter)
   const second = h.authority('req-effort-2')
   const run2 = h.adapter.submitTurn(h.turnParams(second, 'f'.repeat(64), 'req-effort-2'))
-  await h.until(
-    () => h.received('launch').filter((row) => row?.received?.method === 'turn/start').length === 2,
-    'second turn/start after the second effort change',
-  )
+  await h.until(() => turnStarts().length === 2, 'second turn/start after the second effort change')
+  assert.equal(turnStarts()[1].params?.effort, 'low', 'the switch back is honoured on the same lane')
   const secondTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 500, outputTokens: 60 }
   h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[1]!, secondTotal, {
     ...zeroNativeTokens(), inputTokens: 300, outputTokens: 40,
@@ -707,6 +711,49 @@ test('an effort change restarts only the kernel: first and later turns still run
   assert.equal(summary2.isError, false)
   assert.equal(h.receipts.length, 2)
   assert.equal(h.launches, 1, 'an effort change must not relaunch the node app')
+})
+
+test('a withdrawn nickname is gone from the instructions the node resumes the warm thread with',
+  { timeout: 180000 }, async (t) => {
+  // OCV5-746 audit B1: a privacy refresh on a warm remote chat recycles only the kernel and keeps
+  // the native thread, so the rebuilt instructions must reach the node on thread/resume.
+  const nickname = 'Zq746Nick'
+  const sessionId = 'codex_container_e2e'
+  const h = await lane(t, { sessionId })
+  const nodeFrames = (method: string) => h.received('launch')
+    .map((row) => row?.received).filter((frame) => frame?.method === method)
+  h.adapter.setPromptPrivacy({ schemaVersion: 1, profile: { nickname, sessionId } })
+  const first = h.authority('req-privacy-1')
+  const run = h.adapter.submitTurn(h.turnParams(first, h.turnKey, 'req-privacy-1'))
+  await h.until(() => nodeFrames('turn/start').length === 1, 'first turn/start')
+  const started = nodeFrames('thread/start')
+  assert.equal(started.length, 1)
+  assert.ok(String(started[0].params?.baseInstructions).includes(nickname), 'the authorized nickname is in the first instructions')
+  const firstTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 200, outputTokens: 20 }
+  h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[0]!, firstTotal, firstTotal) })
+  h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[0], status: 'completed' } } })
+  assert.equal((await run.summary)?.isError, false)
+
+  h.adapter.setPromptPrivacy({ schemaVersion: 1, profile: null })
+  await restartRunnerForConfigChange(h.adapter)
+  const second = h.authority('req-privacy-2')
+  const run2 = h.adapter.submitTurn(h.turnParams(second, 'f'.repeat(64), 'req-privacy-2'))
+  await h.until(() => nodeFrames('turn/start').length === 2, 'second turn/start after the privacy refresh')
+  const resumed = nodeFrames('thread/resume')
+  assert.equal(resumed.length, 1, 'the warm thread is resumed, not restarted')
+  assert.equal(resumed[0].params?.threadId, THREAD)
+  const delivered = resumed[0].params?.baseInstructions
+  assert.equal(typeof delivered, 'string', 'the resume carries the rebuilt instructions')
+  assert.ok(delivered.length > 0)
+  assert.ok(!delivered.includes(nickname), 'the withdrawn nickname must not reach the node again')
+  const secondTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 500, outputTokens: 60 }
+  h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[1]!, secondTotal, {
+    ...zeroNativeTokens(), inputTokens: 300, outputTokens: 40,
+  }) })
+  h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[1], status: 'completed' } } })
+  assert.equal((await run2.summary)?.isError, false)
+  assert.equal(h.receipts.length, 2)
+  assert.equal(h.launches, 1)
 })
 
 test('a turn submitted while another runs admits only after that turn ends', { timeout: 180000 }, async (t) => {

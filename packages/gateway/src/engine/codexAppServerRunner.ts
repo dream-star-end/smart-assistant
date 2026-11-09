@@ -2240,6 +2240,15 @@ export class CodexAppServerRunner extends EventEmitter {
    *  diffed against the old thread's baseline → underbilling or clamp-to-zero.
    *  Resetting all three here is a no-op on the cold-start path (they're
    *  already null on construction) and load-bearing on the self-heal path. */
+  /**
+   * A remote kernel recycled for a privacy/identity/UI refresh keeps its native thread, so the
+   * freshly built instructions must cross on resume too — otherwise the node keeps the old ones.
+   */
+  private remoteResumeParams(threadId: string): Record<string, unknown> {
+    if (this.remoteInstructions === null) throw new Error('CODEX_REMOTE_CONTEXT_UNAVAILABLE')
+    return { threadId, baseInstructions: this.remoteInstructions }
+  }
+
   private async _startNewThread(effectiveCwd: string, preheatGeneration?: number): Promise<void> {
     // Phase 5:effectiveCwd 由 runTurn 顶部一次取的 snapshot 折算而来,
     // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
@@ -2576,7 +2585,7 @@ export class CodexAppServerRunner extends EventEmitter {
         } else {
           try {
             await this.sendRequest('thread/resume', this.opts.remote
-              ? { threadId: this.threadId }
+              ? this.remoteResumeParams(this.threadId)
               : {
                   ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
                   threadId: this.threadId,
@@ -2622,7 +2631,7 @@ export class CodexAppServerRunner extends EventEmitter {
               this.syncedPlatformGoal = null
               try {
                 await this.sendRequest('thread/resume', this.opts.remote
-                  ? { threadId: fallback }
+                  ? this.remoteResumeParams(fallback)
                   : {
                       ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
                       threadId: fallback,
