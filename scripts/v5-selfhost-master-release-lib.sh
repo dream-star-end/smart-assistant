@@ -1229,6 +1229,7 @@ build_master_release() {
   for job in \
     D:master_job_frontend \
     C.session-rootfix:master_job_session_rootfix:session-unavailable-rootfix \
+    C.ocv5-376-platform-tool:master_job_ocv5_376_platform_tool:ocv5-376-platform-tool \
     C.watch-gate:master_job_watch_gate:watch-gate \
     C.cursor-sand:master_job_cursor_sand \
     C.delegate-billing:master_job_delegate_billing:delegate-billing-requestid \
