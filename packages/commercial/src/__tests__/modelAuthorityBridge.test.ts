@@ -3271,8 +3271,15 @@ describe('OCV5-746 chat turn model authority', () => {
     } finally { await stopRig(rig); }
   });
 
-  test('rejection with a mismatched peer neither terminalizes the dispatch nor releases the remote lane', async () => {
-    // R2-C2:同连接 cmid 命中但 peer 不匹配 → 不得终态 dispatch,更不得撤销有效远端绑定。
+  type RejectProbe = {
+    terminalCasHits: number;
+    journalAbortHits: number;
+    bindingReleaseHits: number;
+    bindingState: string;
+    browserErrorFrames: Array<Record<string, unknown>>;
+  };
+  // 同一受理夹具:终态 CAS 恒 0 行(未命中),只观察拒帧会不会触发副作用。
+  const runRejectionProbe = async (rejectFrame: Record<string, unknown>): Promise<RejectProbe> => {
     let admittedRow: Extract<ReturnType<typeof fakeAdmittedDispatch>, { kind: 'admitted' }>['dispatch'] | null = null;
     let authorityBinding: Record<string, unknown> | null = null;
     let terminalCasHits = 0;
@@ -3360,6 +3367,13 @@ describe('OCV5-746 chat turn model authority', () => {
     });
     try {
       const ws = await openClient(rig.port);
+      const browserErrorFrames: Array<Record<string, unknown>> = [];
+      ws.on('message', (data) => {
+        try {
+          const f = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (f.type === 'error' && f.code === 'MODEL_AUTHORITY_REJECTED') browserErrorFrames.push(f);
+        } catch { /* non-JSON */ }
+      });
       ws.send(inboundFrame({
         model: 'gpt-6-luna-remote',
         peer: { id: 'codex-remote-747', kind: 'dm' },
@@ -3369,23 +3383,53 @@ describe('OCV5-746 chat turn model authority', () => {
       await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
       const container = [...rig.containerWss.clients][0];
       assert.ok(container, 'container socket must be connected');
-      // cmid 命中本连接的受理记录,但 peer 是别人的 —— 不得产生任何资源副作用。
       container.send(JSON.stringify({
         type: 'error',
         code: 'MODEL_AUTHORITY_REJECTED',
         error: 'model authority rejected',
         message: 'model authority rejected',
-        peer: { id: 'someone-else', kind: 'dm' },
-        clientMessageId: 'cm-747-codex',
         model: 'gpt-6-luna-remote',
+        ...rejectFrame,
       }));
       // 给错误路径充足时间真的跑到(若错误地释放/终态,这里必然能观察到)。
       await new Promise((r) => setTimeout(r, 400));
-      assert.equal(terminalCasHits, 0, 'peer 不匹配的拒帧不得终态 dispatch');
-      assert.equal(journalAbortHits, 0, 'peer 不匹配的拒帧不得免单 journal');
-      assert.equal(bindingReleaseHits, 0, 'peer 不匹配的拒帧不得释放远端绑定');
-      assert.equal(remoteBinding.state, 'running');
       ws.close();
+      return {
+        terminalCasHits, journalAbortHits, bindingReleaseHits,
+        bindingState: remoteBinding.state, browserErrorFrames,
+      };
     } finally { await stopRig(rig); }
+  };
+
+  const unverifiedRejections: Array<[string, Record<string, unknown>]> = [
+    ['mismatched peer', { peer: { id: 'someone-else', kind: 'dm' }, clientMessageId: 'cm-747-codex' }],
+    ['missing peer', { clientMessageId: 'cm-747-codex' }],
+    ['null peer', { peer: null, clientMessageId: 'cm-747-codex' }],
+    ['empty peer id', { peer: { id: '', kind: 'dm' }, clientMessageId: 'cm-747-codex' }],
+    ['missing clientMessageId', { peer: { id: 'codex-remote-747', kind: 'dm' } }],
+  ];
+  for (const [label, fields] of unverifiedRejections) {
+    test(`rejection with ${label} has zero side effects and shows no error card`, async () => {
+      // audit R1-C1/W1:身份字段缺失或不匹配一律 fail-closed —— 不终态、不免单、不释放绑定、不发卡。
+      const probe = await runRejectionProbe(fields);
+      assert.equal(probe.terminalCasHits, 0, `${label}: 不得终态 dispatch`);
+      assert.equal(probe.journalAbortHits, 0, `${label}: 不得免单 journal`);
+      assert.equal(probe.bindingReleaseHits, 0, `${label}: 不得释放远端绑定`);
+      assert.equal(probe.bindingState, 'running');
+      assert.equal(probe.browserErrorFrames.length, 0, `${label}: 不得给用户发终止错误卡`);
+    });
+  }
+
+  test('verified rejection whose terminal CAS misses does not release the remote lane', async () => {
+    // audit R1-W2:身份对上但 CAS 未命中(别的路径已接管) → 不得撤销 lane。
+    const probe = await runRejectionProbe({
+      peer: { id: 'codex-remote-747', kind: 'dm' },
+      clientMessageId: 'cm-747-codex',
+    });
+    assert.equal(probe.terminalCasHits, 1, '身份合法的拒帧必须尝试终态 CAS');
+    assert.equal(probe.journalAbortHits, 0, 'CAS 未命中不得免单');
+    assert.equal(probe.bindingReleaseHits, 0, 'CAS 未命中不得释放远端绑定');
+    assert.equal(probe.bindingState, 'running');
+    assert.equal(probe.browserErrorFrames.length, 1, '身份合法的拒帧仍要给用户可绑定错误卡');
   });
 });

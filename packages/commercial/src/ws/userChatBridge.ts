@@ -3814,10 +3814,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return true;
     };
 
+    type PreForwardFailOpts = {
+      abortNeverExecutedJournal?: boolean;
+      fromStatuses?: Array<"admitted" | "accepted">;
+      /** Fires only after this call itself moved the dispatch to a terminal/paused
+       *  state and committed; never on CAS miss, rollback, or a non-durable pool. */
+      onTerminal?: () => void;
+    };
     const terminalizeEnrichmentDispatch = (
       state: EnrichmentDispatchState,
       failureCode: string,
-      opts?: { abortNeverExecutedJournal?: boolean },
+      opts?: PreForwardFailOpts,
     ): boolean => {
       if (!claimEnrichmentTerminalization(state)) return false;
       const record = state.record;
@@ -3838,17 +3845,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             };
             if (refusal !== undefined) {
               const paused = await pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal });
-              if (paused) broadcastRecoveryJobRefused(record.recoveryJob, refusal);
+              if (paused) {
+                broadcastRecoveryJobRefused(record.recoveryJob, refusal);
+                opts?.onTerminal?.();
+              }
             } else {
               await releaseRecoveryPreReceipt(pool, fenced);
             }
           } else {
             // 与普通出口共用同一单事务收敛(R2-C1):enrichment 期也可能已经有本地 Codex
             // 的 inflight journal,补偿不能落在事务外。
-            await settlePreForwardDispatch(pool, record, failureCode, {
+            const settled = await settlePreForwardDispatch(pool, record, failureCode, {
               abortNeverExecutedJournal: opts?.abortNeverExecutedJournal === true,
               fromStatuses: ["admitted"],
             });
+            if (settled) opts?.onTerminal?.();
           }
         } catch (err) {
           bridgeLog?.error("user-chat-bridge: pre-transfer dispatch terminalization failed", {
@@ -4030,17 +4041,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       pool: NonNullable<UserChatBridgeDeps["pgPool"]>,
       record: AdmittedDispatch,
       failureCode: string,
-      opts: {
-        abortNeverExecutedJournal?: boolean;
-        fromStatuses?: Array<"admitted" | "accepted">;
-      } = {},
-    ): Promise<void> => {
+      opts: Omit<PreForwardFailOpts, "onTerminal"> = {},
+    ): Promise<boolean> => {
       // pg.Pool 一定暴露 connect();没有 connect 的池只出现在单测桩里。此时退回单语句
       // 路径,并且**拒绝**做免单补偿 —— 拿不到事务/行锁就不敢声称"从未执行"。
       const txCapable = typeof (pool as { connect?: unknown }).connect === "function";
       let client: PoolClient | null = null;
       let aborted: AbortedJournalRef[] = [];
       let committed = false;
+      let terminalHit = false;
       try {
         client = txCapable
           ? await pool.connect()
@@ -4061,6 +4070,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         if (txCapable) await client.query("COMMIT");
         committed = true;
+        terminalHit = terminal !== null;
       } catch (error) {
         // 补偿失败就整体回滚:宁可留在 admitted 等 reconciler/用户重试,也不能留下
         // 「已 executed_error 但 journal 未补偿」的财务歧义窗口。
@@ -4075,7 +4085,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       } finally {
         if (txCapable && client !== null) client.release();
       }
-      if (!committed) return;
+      if (!committed) return false;
       // 被 abort 的 pre-forward journal 对应的 preCheck 预留额度在 commit 之后释放
       // (best-effort:tx 内不能做 Redis I/O,失败只影响额度 TTL 到期,不影响财务事实)。
       const redis = deps.preCheckRedis;
@@ -4084,16 +4094,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           await releasePreCheck(redis, ref).catch(() => {});
         }
       }
+      return terminalHit;
     };
     const failDispatchPreForward = (
       record: AdmittedDispatch | undefined,
       failureCode: string,
-      opts?: {
-        /** OCV5-746: 容器模型权威已在准入前拒帧 = 本轮可证明未执行 → 终态之后把 pre-forward
-         *  inflight journal 按 never-executed waiver abort(内嵌 no-usage 守卫),否则
-         *  reconciler 会把 executed_error 判成 billed_but_failed 转人工。 */
-        abortNeverExecutedJournal?: boolean;
-      },
+      /** OCV5-746: abortNeverExecutedJournal — 容器模型权威已在准入前拒帧 = 本轮可证明未执行
+       *  → 终态之后把 pre-forward inflight journal 按 never-executed waiver abort(内嵌 no-usage
+       *  守卫),否则 reconciler 会把 executed_error 判成 billed_but_failed 转人工。 */
+      opts?: PreForwardFailOpts,
     ): void => {
       if (record === undefined) return;
       const enrichment = enrichmentDispatches.get(record.clientMessageId);
@@ -4120,7 +4129,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const pausedJob = record.recoveryJob;
           void pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal })
             .then((paused) => {
-              if (paused) broadcastRecoveryJobRefused(pausedJob, refusal);
+              if (!paused) return;
+              broadcastRecoveryJobRefused(pausedJob, refusal);
+              opts?.onTerminal?.();
             })
             .catch(() => {});
         } else {
@@ -4128,7 +4139,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         return;
       }
-      void settlePreForwardDispatch(pool, record, failureCode, opts);
+      const { onTerminal, ...settleOpts } = opts ?? {};
+      void settlePreForwardDispatch(pool, record, failureCode, settleOpts).then((settled) => {
+        if (settled) onTerminal?.();
+      }).catch(() => {});
     };
     /** 按帧的 clientMessageId 反查本连接受理记录(IIFE forward/失败出口共用)。 */
     const lookupAdmittedDispatch = (
@@ -8447,10 +8461,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const rejectedRecord = rejectedCmid === null
               ? undefined
               : admittedDispatches.get(rejectedCmid);
+            // Fail closed: every side effect below needs BOTH a non-empty peer and a cmid
+            // that exactly match this connection's server-owned admission. A frame missing
+            // either identity field must not be promoted to "this turn" (audit R1-C1).
             const rejectedSessionId = rejectedRecord !== undefined &&
-              (rejectedPeerId === null || rejectedRecord.sessionId === rejectedPeerId)
+              rejectedPeerId !== null &&
+              rejectedRecord.sessionId === rejectedPeerId
               ? rejectedRecord.sessionId
               : null;
+            // No admission record at all (non-durable path) but full identity → UI-only
+            // bound card so the turn does not hang; no PG/lease/lane effect.
+            const unadmittedButIdentified = rejectedRecord === undefined &&
+              rejectedPeerId !== null &&
+              rejectedCmid !== null;
+            if (rejectedSessionId === null && !unadmittedButIdentified) {
+              bridgeLog?.warn("user-chat-bridge: dropped authority rejection with unverified identity", {
+                hasPeer: rejectedPeerId !== null,
+                hasClientMessageId: rejectedCmid !== null,
+                admitted: rejectedRecord !== undefined,
+              });
+              return;
+            }
             if (rejectedRecord !== undefined && rejectedSessionId !== null) {
               // 本地 Codex 在物理转发前就已登记 bridge turn state(账号槽 / route token);
               // 容器拒帧意味着引擎永远不会发 final/outbound.error,必须在这里按精确身份收口。
@@ -8462,25 +8493,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               ) {
                 releaseCodexTurnState(rejectedCodexState, "turn_error");
               }
-              failDispatchPreForward(rejectedRecord, "model_authority_rejected", {
-                abortNeverExecutedJournal: true,
-              });
               // 远端绑定只按**服务端**受理时记录的引擎 sessionKey + placement 释放;回帧
               // model/channel 都是容器可控字段,不能拿来推导资源身份。必须与终态收敛同门:
-              // peer 不匹配的拒帧连 dispatch 都不许终态,更不能撤销这条有效 lane(R2-C2)。
-              const rejectedEngineSessionKey = rejectedRecord.engineSessionKey ?? null;
-              if (
-                deps.pgPool &&
-                rejectedRecord.remoteLane === true &&
-                rejectedEngineSessionKey !== null
-              ) {
-                void reconcileRemoteChat(deps.pgPool, Number(uid), rejectedEngineSessionKey).catch((error) => {
-                  bridgeLog?.warn("user-chat-bridge: remote lane release after authority rejection failed", {
-                    engineSessionKey: rejectedEngineSessionKey,
-                    error,
-                  });
-                });
-              }
+              // 只有本次调用自己把这条 admitted dispatch CAS 成终态并 COMMIT 后才释放
+              // (R2-C2 / audit R1-W2);CAS 未命中说明别的路径已接管,不碰 lane。
+              const lanePool = deps.pgPool;
+              const laneKey = rejectedRecord.engineSessionKey ?? null;
+              const releaseRemoteLane = lanePool && rejectedRecord.remoteLane === true && laneKey !== null
+                ? (): void => {
+                    void reconcileRemoteChat(lanePool, Number(uid), laneKey).catch((error) => {
+                      bridgeLog?.warn("user-chat-bridge: remote lane release after authority rejection failed", {
+                        engineSessionKey: laneKey,
+                        error,
+                      });
+                    });
+                  }
+                : undefined;
+              failDispatchPreForward(rejectedRecord, "model_authority_rejected", {
+                abortNeverExecutedJournal: true,
+                fromStatuses: ["admitted"],
+                ...(releaseRemoteLane === undefined ? {} : { onTerminal: releaseRemoteLane }),
+              });
             }
             // 发一张绑定到本轮的可展示错误卡(模型配置未通过校验,本轮未开始未计费)。
             sendErrorFrame(
