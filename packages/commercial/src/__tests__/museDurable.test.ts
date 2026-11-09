@@ -572,4 +572,52 @@ describe('durable Muse video lifecycle', () => {
     assert.equal(row.durable?.background, true)
     assert.equal(calls.filter((c) => c === 'submit').length, 1)
   })
+
+  it('OCV5-750: an offline sweep that moves a queued durable video to the relay never re-queues it on hatch', async () => {
+    const calls: string[] = []
+    const hub = make({
+      videoBackend: 'hatch-with-box-fallback',
+      boxExecPollMs: 1,
+      userRunningMax: 3,
+      queueWaitMs: { image: 60_000, video: 60_000 },
+      boxExecRunner: async () => relay(calls, true) as never,
+    })
+    const sid = hub.hello('1', '0.5.0')
+    const id = await submit(hub)
+    journal.now += 61_000
+    hub.tick()
+    for (let i = 0; i < 20 && !calls.includes('submit'); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    assert.equal(journal.rows.get(id)?.durable?.via, 'box-exec')
+    const again = hub.hello('2', '0.5.0')
+    assert.equal(await hub.poll(again, 20), null, 'hatch must not get a job the relay holds')
+    assert.equal(await hub.poll(sid, 20), null)
+  })
+
+  it('OCV5-750: a backgrounded relay job is not released while hatch is offline', async () => {
+    const calls: string[] = []
+    const hub = make({
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      userRunningMax: 1,
+      queueWaitMs: { image: 1_000, video: 1_000 },
+      boxExecRunner: async () => relay(calls, true) as never,
+    })
+    await submit(hub)
+    const second = await submit(hub)
+    for (let i = 0; i < 20 && !calls.includes('submit'); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      await flush()
+    }
+    journal.now += 5_000
+    hub.tick()
+    await flush()
+    assert.equal(journal.rows.get(second)?.durable?.background, true)
+    await hub.durableTick()
+    await flush()
+    assert.equal(journal.rows.get(second)?.leaseOwner !== undefined, true)
+    assert.ok((journal.rows.get(second)?.lease ?? 0) > journal.now, 'still leased by this hub')
+  })
 })

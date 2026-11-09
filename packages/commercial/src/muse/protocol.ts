@@ -170,7 +170,7 @@ const SubmitSchema = z
     // Origin metadata is validated for ownership by durability, never forwarded to the bridge.
     session_key: z.string().min(1).max(512).refine((v) => v.trim().length > 0, 'session key is blank').optional(),
     mode: z.enum(['native', 'first_frame', 'reference', 'composite']).optional(),
-    count: z.number().int().min(1).max(6).optional(),
+    count: z.number().int().min(1).max(MUSE_LIMITS.max_files).optional(),
   })
   .strict()
 

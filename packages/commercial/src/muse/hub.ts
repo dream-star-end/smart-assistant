@@ -1213,6 +1213,8 @@ export class MuseBridgeHub {
       } else if (!this.bridgeOnline() && !job.durable?.background) {
         this.requeue(job, 'offline', this.offlineFailure())
       }
+      // The offline requeue may have moved it to the relay or finished it (Codex P1).
+      if (job.via !== 'hatch' || job.state === 'done') continue
       if (job.durable?.background && now >= job.durable.expiresAt) {
         this.finish(job, fail('MUSE_QUEUE_EXPIRED', 'Muse background queue expired'))
       }
@@ -1832,6 +1834,7 @@ export class MuseBridgeHub {
           if (
             job.durable.background &&
             job.state === 'queued' &&
+            job.via !== 'box-exec' &&
             !this.bridgeOnline() &&
             this.now() < job.durable.expiresAt
           ) {
