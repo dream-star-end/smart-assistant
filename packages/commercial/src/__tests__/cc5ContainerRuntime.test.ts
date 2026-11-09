@@ -40,7 +40,8 @@ const financeFactory: RemoteFinanceFactory = () => ({ async admit() { return {
 } } })
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
 
-function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string; holdPrepare?: Promise<void>; enforcePlacementState?: boolean; capacity?: number } = {}) {
+function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string; holdPrepare?: Promise<void>; enforcePlacementState?: boolean; capacity?: number; profileOf?: (sessionKey: string) => string } = {}) {
+  const profileOf = options.profileOf ?? (() => 'profile-1')
   const dir = options.baseRoot ? undefined : mkdtempSync('/tmp/cl-')
   const baseRoot = options.baseRoot ?? join(dir!, 'r')
   const key = generateKeyPairSync('ed25519')
@@ -54,8 +55,11 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
   const hooks: RemoteLaneHooks = {
     async place(request) {
       if (options.enforcePlacementState && persisted.get(request.sessionKey) !== undefined && persisted.get(request.sessionKey) !== 'released') throw new Error('REMOTE_LANE_STOP_UNPROVEN')
-      if (options.capacity !== undefined && [...persisted].filter(([key, state]) =>
-        key !== request.sessionKey && state !== 'released').length >= options.capacity) throw new Error('REMOTE_LANE_CAPACITY_EXHAUSTED')
+      // Like placeRemoteLane with sticky chats: each chat lives on one profile, capacity per profile.
+      const profile = profileOf(request.sessionKey)
+      if (options.capacity !== undefined && [...persisted].filter(([key, state]) => key !== request.sessionKey &&
+        profileOf(key) === profile && state !== 'released').length >= options.capacity)
+        throw Object.assign(new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'), { profiles: [profile] })
       places.push({ ...request })
       persisted.set(request.sessionKey, 'preparing')
       // Sticky like placeRemoteLane: one task root and operation per chat.
@@ -67,7 +71,7 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
             controllerSha256: '0'.repeat(64), taskRootPrefix: '/home/box/oc-agentremote-',
             upstreamModel: request.canonicalModel.replace(/-remote$/, '') },
           taskRoot: `/home/box/oc-agentremote-c${operationId.replace(/-/g, '').slice(0, 23)}`,
-          operationId, runId: randomUUID(), provisionPacket: Buffer.from('{"fixture":true}'),
+          operationId, runId: randomUUID(), provisionPacket: Buffer.from('{"fixture":true}'), profileId: profile,
         }
         placements.set(request.sessionKey, placement)
       }
@@ -262,6 +266,23 @@ test('a full pool hands the longest-idle chat lane to a new chat; a chat mid-tur
     await cc5ControlRequest('/admit', admission(f.key, JSON.parse(readFileSync(join(handle.mountSource, back.operationId, 'binding.json'), 'utf8'))),
       join(handle.mountSource, back.operationId, 'relay.sock'))
     await assert.rejects(f.lane(chat3), /REMOTE_LANE_UNAVAILABLE/)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a full pool reclaims a lane of the profile the chat needs, not just the longest-idle one', { skip: !root }, async () => {
+  const onQ = 'agent:main:webchat:dm:fixture_chatq', back = 'agent:main:webchat:dm:fixture_chatb'
+  const f = fixture({ capacity: 1, profileOf: (key) => key === onQ ? 'profile-q' : 'profile-p' })
+  try {
+    await f.container()
+    const q = await f.lane(onQ)
+    const p = await f.lane()
+    // Both chats are idle and the one on profile-q is older, but only a profile-p slot places `back`.
+    const placed = await f.lane(back)
+    assert.ok(f.states.some(([op, state]) => op === p.operationId && state === 'released'), 'the profile-p lane was reclaimed')
+    assert.ok(!f.states.some(([op, state]) => op === q.operationId && state === 'released'), 'the profile-q lane keeps its slot')
+    assert.notEqual(placed.operationId, p.operationId)
   } finally {
     await f.cleanup()
   }

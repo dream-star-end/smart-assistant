@@ -151,9 +151,13 @@ test('a placed chat keeps its profile and ids; an unavailable home profile fails
     /REMOTE_LANE_PROFILE_UNAVAILABLE/)
   assert.equal(gone.statements.some((s) => s.sql.includes('INSERT INTO remote_agent_bindings')), false)
   // A home profile that is only full is a capacity wait the caller can end by reclaiming a lane.
-  const full = placementPool([candidate()], [sticky], 5)
+  const full = placementPool([candidate({ profile_id: 'profile-9' }), candidate()], [sticky], 5)
   await assert.rejects(placeRemoteLane(request, { pool: full.pool, packet: async () => Buffer.from('x') }),
-    /REMOTE_LANE_CAPACITY_EXHAUSTED/)
+    (e: Error & { profiles?: string[] }) => e.message === 'REMOTE_LANE_CAPACITY_EXHAUSTED' && e.profiles?.join() === 'profile-2')
+  // A new chat names every full profile it could have taken.
+  await assert.rejects(placeRemoteLane({ ...request, sessionKey: 'agent:main:webchat:dm:chat_new00001' },
+    { pool: placementPool([candidate({ profile_id: 'profile-9' }), candidate()], [], 5).pool, packet: async () => Buffer.from('x') }),
+  (e: Error & { profiles?: string[] }) => e.profiles?.sort().join() === 'profile-2,profile-9')
   assert.equal(full.statements.some((s) => s.sql.includes('INSERT INTO remote_agent_bindings')), false)
   await assert.rejects(placeRemoteLane(request, { pool: placementPool([]).pool, packet: async () => Buffer.from('x') }),
     /NO_ELIGIBLE_REMOTE_PROFILE/)

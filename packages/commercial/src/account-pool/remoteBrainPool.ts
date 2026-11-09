@@ -913,19 +913,21 @@ export async function placeRemoteLane(
       if (Number(used.profile_used) >= Number(row.max_concurrent_lanes)) full.add(String(row.profile_id))
       else eligible.push(row)
     }
-    const capacityBlocked = full.size > 0
+    // A full pool names the profiles whose freed slot would place this chat, so the caller can
+    // reclaim a lane that actually ends the wait.
+    const exhausted = (profiles: string[]) => Object.assign(new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'), { profiles })
     let row: Record<string, any> | undefined
     if (sticky) {
       row = eligible.find(r => String(r.profile_id) === sticky.profile_id)
       // A home profile that is only full is a capacity wait, which a reclaimed lane can end.
-      if (!row) throw new Error(full.has(sticky.profile_id) ? 'REMOTE_LANE_CAPACITY_EXHAUSTED' : 'REMOTE_LANE_PROFILE_UNAVAILABLE')
+      if (!row) throw full.has(sticky.profile_id) ? exhausted([sticky.profile_id]) : new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
     } else {
       const ranked = rankRemotePoolCandidates(eligible.map(r => ({ profileId: String(r.profile_id),nodeId: String(r.node_id),
         engine:r.engine,profileName:r.profile_name,weight:Number(r.weight),healthScore:Number(r.health_score),
         hotSlots:Number(r.hot_slots),activeSlots:Number(r.active_slots),maxHotSlots:Number(r.max_hot_slots),
         maxActiveSlots:Number(r.max_concurrent_lanes),nodeRttMsP50:r.rtt_ms_p50 })), `${input.uid}:${input.sessionKey}:${input.canonicalModel}`)
       row = eligible.find(r => String(r.profile_id) === ranked[0]?.profileId)
-      if (!row) throw new Error(capacityBlocked ? 'REMOTE_LANE_CAPACITY_EXHAUSTED' : 'NO_ELIGIBLE_REMOTE_PROFILE')
+      if (!row) throw full.size ? exhausted([...full]) : new Error('NO_ELIGIBLE_REMOTE_PROFILE')
     }
     const operationId = sticky?.operation_id ?? randomUUID(), runId = sticky?.run_id ?? randomUUID()
     if (engine === 'codex' && sticky) {

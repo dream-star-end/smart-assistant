@@ -119,6 +119,8 @@ export interface RemoteLanePlacement {
   readonly provisionPacket: Buffer
   readonly generation?: string
   readonly codex?: CodexLaneSpec
+  /** The pool profile whose slot this lane holds. */
+  readonly profileId?: string
 }
 export interface RemoteLaneRequest {
   readonly engine?: 'ccb' | 'codex'
@@ -164,6 +166,7 @@ interface Lane {
   readonly sessionKey: string
   readonly canonicalModel: string
   readonly operationId: string
+  readonly profileId?: string
   readonly dir: string
   readonly view: string
   readonly generation: string
@@ -374,10 +377,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     try { return await this.hooks.place({ ...request, dockerId }) }
     catch (error) {
       if (!(error instanceof Error) || error.message !== 'REMOTE_LANE_CAPACITY_EXHAUSTED') throw error
-      const codex = request.engine === 'codex'
+      // Only a slot of a profile this placement could use ends the wait.
+      const profiles = (error as { profiles?: unknown }).profiles
+      if (!Array.isArray(profiles)) throw error
       const victim = [...this.chats.entries()]
         .filter(([key, owner]) => key !== request.sessionKey && owner.lane && !owner.lane.stopping &&
-          owner.lane.relay.idle && (owner.lane.binding.version === 3) === codex)
+          owner.lane.relay.idle && profiles.includes(owner.lane.profileId))
         .sort(([, a], [, b]) => a.lane!.lastUsedAt - b.lane!.lastUsedAt)[0]?.[1]
       if (!victim) throw error
       const lane = victim.lane!
@@ -457,7 +462,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       replaceHost: () => createHost(hostConfig),
     })
     lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
-      operationId: placement.operationId, generation: placement.generation ?? '1', dir, view, binding, relay, lastUsedAt: Date.now() }
+      operationId: placement.operationId, profileId: placement.profileId, generation: placement.generation ?? '1', dir, view, binding, relay,
+      lastUsedAt: Date.now() }
     lane.preparationStop = () => host.stop()
     await host.prepareTask(placement.provisionPacket)
     lane.preparationStop = undefined
@@ -505,7 +511,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       id => this.hooks.onNativeThread!(placement.operationId,placement.generation!,id),
       () => this.hooks.onRemoteStart!(placement.operationId,placement.generation!))
     lane = { container,sessionKey:request.sessionKey,canonicalModel:request.canonicalModel,operationId:placement.operationId,
-      generation:placement.generation,dir,view,binding,relay,lastUsedAt:Date.now() }
+      profileId:placement.profileId,generation:placement.generation,dir,view,binding,relay,lastUsedAt:Date.now() }
     writePrivate(join(view,'binding.json'),binding,true)
     await this.listen(relay.controlServer,join(view,'relay.sock'),1000,1000)
     return lane
