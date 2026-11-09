@@ -8,6 +8,11 @@ import type Docker from 'dockerode'
 import { type BrowserStorageStateV1, validateBrowserStorageState } from './accounts.js'
 import { type ManagedBrowserBrokerHandle, createManagedBrowserTlsBroker } from './browserBroker.js'
 import {
+  KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS,
+  KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS,
+  knowledgePlanetBrokerLimits,
+} from './knowledgePlanetBrokerLimits.js'
+import {
   type ManagedBrowserDriverV1,
   type ManagedBrowserLaunchArgs,
   type ManagedBrowserLauncherV1,
@@ -340,6 +345,12 @@ export interface KnowledgePlanetLoginWorkerHandle {
   stop(): Promise<void>
 }
 
+export {
+  KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS,
+  KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS,
+  knowledgePlanetBrokerLimits,
+}
+
 export class KnowledgePlanetDockerService {
   private readonly bootId = randomUUID()
   private readonly active = new Map<string, ActiveWorker>()
@@ -508,13 +519,7 @@ export class KnowledgePlanetDockerService {
       expectedOwnerUid: this.opts.expectedOwnerUid ?? 0,
       socketUid: this.opts.socketUid ?? 1000,
       socketGid: this.opts.socketGid ?? 1000,
-      limits: {
-        maxConnections: 64,
-        maxConcurrent: 8,
-        maxBytesPerDirection: 64 * 1024 * 1024,
-        idleTimeoutMs: 120_000,
-        connectTimeoutMs: 10_000,
-      },
+      limits: knowledgePlanetBrokerLimits(args.kind),
     })
     if (args.signal?.aborted) {
       await broker.close()
