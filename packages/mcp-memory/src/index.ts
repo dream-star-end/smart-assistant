@@ -764,11 +764,13 @@ async function handleSkillPropose(args: {
 }
 
 // ─────────────────────────────────────────────────────────────
-async function handleSendToAgent(args: { agentId: string; message: string }) {
+async function handleSendToAgent(args: { agentId: string; message: string; model?: string }) {
   const agentNorm = normalizeDelegateAgentId(args.agentId)
   if (!agentNorm.ok) return toolError(agentNorm.error)
   const agentId = agentNorm.agentId
   if (!agentId) return toolError('agentId 必填')
+  const modelNorm = normalizeDelegateModel(args.model)
+  if (!modelNorm.ok) return toolError(modelNorm.error)
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
   const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
   const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
@@ -785,6 +787,7 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
           sourceAgent,
           async: true,
           callbackOnComplete: 'origin-inject',
+          ...(modelNorm.model ? { model: modelNorm.model } : {}),
           ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
         }),
         timeoutMs: 15_000,

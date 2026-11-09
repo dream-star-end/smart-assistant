@@ -1395,6 +1395,7 @@ describe('delegate engine-billing antigravity reconciliation (OCV5-738)', () => 
     assert.equal(ctx.ctxJson.source, 'delegate_antigravity')
     assert.equal(ctx.ctxJson.delegateAgentId, 'auditor')
     assert.equal(ctx.ctxJson.antigravityRouteToken, undefined, 'token is persisted at mint')
+    assert.equal(ctx.ctxJson.antigravityBudgetCredits, '100', 'persists full spendable balance for multi-step antigravity turn')
   })
 
   it('settles exactly once: expires the route, claims the journal, finalizes and releases the precheck', async () => {

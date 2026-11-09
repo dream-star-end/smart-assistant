@@ -87,6 +87,8 @@ export interface DelegateAntigravityRouteDeps {
   expireRoute?: (token: string) => Promise<void>
   resolveRoute?: typeof resolveAntigravityRelayRoute
   releaseInflightFn?: typeof releaseInflight
+  /** Optional live spendable balance lookup; falls back to journal antigravityBudgetCredits / precheck_credits. */
+  readBalance?: (userId: bigint) => Promise<bigint>
 }
 
 export interface DelegateAntigravityRouteHandlerCtx {
@@ -238,17 +240,37 @@ export function makeDelegateAntigravityRouteHandler(
           })
           return
         }
-        const budgetCredits =
+        const userId = BigInt(identity.userId)
+        const ctxBudgetCredits =
+          typeof ctxJson.antigravityBudgetCredits === 'string' &&
+          /^\d+$/.test(ctxJson.antigravityBudgetCredits)
+            ? BigInt(ctxJson.antigravityBudgetCredits)
+            : 0n
+        const precheckCredits =
           typeof claim.precheck_credits === 'string' && /^\d+$/.test(claim.precheck_credits)
             ? BigInt(claim.precheck_credits)
             : 0n
+        // A multi-step turn may spend what the user can spend now; the precheck reservation is
+        // always covered. Without a live read, the balance recorded at admission stands in.
+        let spendable = ctxBudgetCredits
+        if (deps.readBalance) {
+          try {
+            spendable = await deps.readBalance(userId)
+          } catch (err) {
+            log.warn('delegate_antigravity_route_balance_lookup_failed', {
+              requestId,
+              userId: String(identity.userId),
+              err: (err as Error).message,
+            })
+          }
+        }
+        const budgetCredits = spendable > precheckCredits ? spendable : precheckCredits
         if (budgetCredits <= 0n) {
           sendJson(res, 503, {
             error: { code: 'ANTIGRAVITY_BUDGET_UNAVAILABLE', message: 'admission budget missing' },
           })
           return
         }
-        const userId = BigInt(identity.userId)
         let minted: Awaited<ReturnType<typeof admitAntigravityTurn>>
         try {
           minted = await runAdmit(

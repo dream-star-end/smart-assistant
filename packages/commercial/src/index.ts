@@ -114,6 +114,7 @@ import {
   estimateMaxCost,
   InsufficientCreditsError,
   preCheckWithCost,
+  readTotalSpendableBalance,
   releasePreCheck,
   type ReservationHandle,
   wrapIoredisForPreCheck,
@@ -2538,6 +2539,7 @@ export async function registerCommercial(
               pool: getPool(),
               relayPort: V3_CONTAINER_PORT,
               clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+              readBalance: readTotalSpendableBalance,
               logger: rootLogger.child({ subsys: "delegateAntigravityRoute" }),
             })
           : undefined;

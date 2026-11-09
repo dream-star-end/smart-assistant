@@ -208,6 +208,11 @@ export const TOOLS = [
       properties: {
         agentId: { type: 'string', description: '目标 agent ID (必须已存在)' },
         message: { type: 'string', description: '发送给目标 agent 的消息/任务' },
+        model: {
+          type: 'string',
+          description:
+            '可选模型覆盖;必须填上方系统提示「委派可用型号」表里的完整型号名(如 deepseek-v4-flash、gpt-6-astra),留空则用目标成员默认模型。禁止自造简称。',
+        },
       },
       required: ['agentId', 'message'],
     },

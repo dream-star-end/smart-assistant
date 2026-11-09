@@ -127,6 +127,7 @@ function makeHandler(deps: {
   expireRoute?: any
   resolveRoute?: any
   releaseInflightFn?: any
+  readBalance?: any
   clientSecret?: string
 }) {
   return makeDelegateAntigravityRouteHandler({
@@ -140,6 +141,7 @@ function makeHandler(deps: {
     expireRoute: deps.expireRoute ?? (async () => {}),
     resolveRoute: deps.resolveRoute ?? (async () => null),
     releaseInflightFn: deps.releaseInflightFn ?? (() => {}),
+    ...(deps.readBalance ? { readBalance: deps.readBalance } : {}),
   })
 }
 
@@ -253,6 +255,52 @@ describe('internalDelegateAntigravityRoute', () => {
     const persist = queries.find((q) => q.sql.includes('antigravityRouteToken'))
     assert.ok(persist, 'journal must persist the opaque route token')
     assert.deepEqual(persist!.params, [REQUEST_ID, ROUTE_TOKEN, 42, 11])
+  })
+
+  test('mint uses spendable balance (ctx.antigravityBudgetCredits / readBalance) instead of 64-credit precheck cap', async () => {
+    const { pool } = makePool({
+      row: journalRow({
+        precheck_credits: '64',
+        ctx: {
+          source: 'delegate_antigravity',
+          model: 'antigravity-claude-sonnet-5.5',
+          antigravityBudgetCredits: '2278962',
+        },
+      }),
+    })
+    const admitCalls: any[] = []
+    const handler = makeHandler({
+      pool,
+      admit: async (args: any) => {
+        admitCalls.push(args)
+        return mintedRoute()
+      },
+    })
+    await withServer(handler, async (port) => {
+      const result = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+        requestId: REQUEST_ID,
+      })
+      assert.equal(result.status, 200)
+    })
+    assert.equal(admitCalls.length, 1)
+    assert.equal(admitCalls[0].budgetCredits, 2278962n)
+  })
+
+  test('mint caps the turn at the live spendable balance, never below the reserved precheck', async () => {
+    const budgets: bigint[] = []
+    for (const live of [5000n, 0n]) {
+      const { pool } = makePool({
+        row: journalRow({ precheck_credits: '64', ctx: { source: 'delegate_antigravity',
+          model: 'antigravity-claude-sonnet-5.5', antigravityBudgetCredits: '2278962' } }),
+      })
+      const handler = makeHandler({ pool, readBalance: async () => live,
+        admit: async (args: any) => { budgets.push(args.budgetCredits); return mintedRoute() } })
+      await withServer(handler, async (port) => {
+        assert.equal((await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, { requestId: REQUEST_ID })).status, 200)
+      })
+    }
+    // A balance spent down since admission does not fall back to the stale admission balance.
+    assert.deepEqual(budgets, [5000n, 64n])
   })
 
   test('mint rejects an admission owned by another user or container', async () => {

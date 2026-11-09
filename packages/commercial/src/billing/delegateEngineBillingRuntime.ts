@@ -352,6 +352,15 @@ export function createDelegateEngineBillingRuntime(
               delegateAgentId,
               ...delegateOpenTurnCtx({ parentSessionId, parentTurnKey, stamp: openTurn }),
               source: sourceForEngine(engine),
+              ...(engine === 'antigravity'
+                ? {
+                    antigravityBudgetCredits: (
+                      typeof precheck.balance === 'bigint' && precheck.balance > precheck.maxCost
+                        ? precheck.balance
+                        : precheck.maxCost
+                    ).toString(),
+                  }
+                : {}),
               durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
               billingPricing: serializeBillingPricing(derivedPricing),
               // Nested so settle does not treat these as a bridge_signed stamp.
