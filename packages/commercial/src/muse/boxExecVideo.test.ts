@@ -330,3 +330,13 @@ describe('OCV5-750 Gemini r1 fixes', () => {
     assert.deepEqual(order.slice(0, 2), ['attempt', 'submit'])
   })
 })
+
+describe('OCV5-750 relay Box pinning', () => {
+  it('refuses to resolve a Box without OC_MUSE_BOX_EXEC_ACCOUNT_ID (no random Box)', async () => {
+    const exec = await createMuseBoxExecRunner('25')()
+    await assert.rejects(
+      exec({ args: ['muse-exec-cli', '--json', 'health'] } as unknown as BoxCcExecRequest, {}),
+      /OC_MUSE_BOX_EXEC_ACCOUNT_ID is not set/,
+    )
+  })
+})

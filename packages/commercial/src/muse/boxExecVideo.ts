@@ -380,7 +380,7 @@ export async function runBoxExecVideoJob(input: {
 
 export function createMuseBoxExecRunner(
   uidRaw: string | undefined,
-  deps?: { resolve?: () => Promise<BoxCliExecFn> },
+  deps?: { resolve?: () => Promise<BoxCliExecFn>; accountId?: string },
 ): () => Promise<BoxCliExecFn> {
   const resolve = async (signal?: AbortSignal): Promise<BoxCliExecFn> => {
     if (deps?.resolve) return deps.resolve()
@@ -396,6 +396,15 @@ export function createMuseBoxExecRunner(
     const { createProductionBoxAccountResolver } = await import(
       '../http/proxy/boxAccountResolver.js'
     )
+    const accountRaw = (deps?.accountId ?? '').trim()
+    if (!/^[1-9]\d{0,18}$/.test(accountRaw)) {
+      throw new MuseError(
+        503,
+        'MUSE_BRIDGE_OFFLINE',
+        'OC_MUSE_BOX_EXEC_ACCOUNT_ID is not set; box-exec Muse backend cannot pin the relay Box',
+        true,
+      )
+    }
     const resolver = createProductionBoxAccountResolver()
     const target = await resolver.resolve({
       uid: BigInt(uid),
@@ -404,6 +413,8 @@ export function createMuseBoxExecRunner(
       upstreamModel: 'muse-box-exec',
       signal: signal ?? new AbortController().signal,
       interactiveExecTarget: true,
+      // Pin the Box that hosts the relay; any other Box has no muse-exec-cli.
+      requiredAccountId: BigInt(accountRaw),
     })
     return (request, opts) => target.exec.run(request, opts)
   }

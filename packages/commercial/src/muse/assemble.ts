@@ -41,9 +41,12 @@ export async function createMuseFromConfig(
     videoBackend: parseMuseVideoBackend(cfg.OC_MUSE_VIDEO_BACKEND),
     fallbackHatch: cfg.OC_MUSE_BOX_EXEC_FALLBACK_HATCH === true,
     // Unset uid = box path not wired: fallback never moves a job onto a Box it cannot reach.
-    boxExecRunner: cfg.OC_MUSE_BOX_EXEC_UID
-      ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID)
-      : undefined,
+    boxExecRunner:
+      cfg.OC_MUSE_BOX_EXEC_UID && cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID
+        ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID, {
+            accountId: cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID,
+          })
+        : undefined,
   })
   try {
     await hub.start()

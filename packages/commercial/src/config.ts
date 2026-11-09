@@ -749,6 +749,19 @@ export const commercialConfigSchema = z
         (value) => value === undefined || /^[1-9]\d{0,18}$/.test(value),
         "OC_MUSE_BOX_EXEC_UID must be a positive decimal uid",
       ),
+    /** Box account (cursor_accounts.id) that hosts the Muse web relay. Required for box-exec: the
+     * resolver otherwise picks any eligible Box, which may not run the relay. */
+    OC_MUSE_BOX_EXEC_ACCOUNT_ID: z
+      .string()
+      .optional()
+      .transform((value) => {
+        const trimmed = (value ?? "").trim()
+        return trimmed === "" ? undefined : trimmed
+      })
+      .refine(
+        (value) => value === undefined || /^[1-9]\d{0,18}$/.test(value),
+        "OC_MUSE_BOX_EXEC_ACCOUNT_ID must be a positive decimal account id",
+      ),
     OC_MUSE_IMAGE_PER_HOUR: positiveInt(10_000),
     OC_MUSE_IMAGE_PER_DAY: positiveInt(100_000),
     OC_MUSE_VIDEO_PER_HOUR: positiveInt(10_000),
