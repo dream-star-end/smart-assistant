@@ -9908,6 +9908,35 @@
           "assertion": "[ocv5-607-lossless-context-transport] PASS"
         }
       ]
+    },
+    {
+      "id": "INC-20261109-MUSE-ORIGIN-SCHEMA",
+      "occurredAt": "2026-11-09",
+      "severity": "P1",
+      "symptom": "商业Muse视频请求携带原会话session_key时被master严格schema拒绝，未创建任务、未到远程桥。显式允许有界非空元数据且不进入桥spec，保留validateOrigin归属验证、未知字段拒绝、原任务重试及单次回写/扣费不变量。",
+      "rootFixCommit": "8e3d13bc7132d4004a02b0361e256cf6a37e3de8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/museDurable.test.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: explicit metadata stays strict and out of the bridge spec"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/museDurable.test.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: HTTP reaches real origin ownership gate before insertion"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/museDurable.test.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: real oc-muse video submits origin and acknowledges one conversation result"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "INC-20261109-MUSE-ORIGIN-SCHEMA: HTTP reaches real origin ownership gate before insertion"
+        }
+      ]
     }
   ]
 }

@@ -20,6 +20,11 @@ type Proof = { incident: string; slug: string; file: string; db: boolean; cases:
 
 export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
   {
+    incident: 'INC-20261109-MUSE-ORIGIN-SCHEMA', slug: 'inc-20261109-muse-origin-schema', db: false,
+    file: 'packages/commercial/src/__tests__/museDurable.test.ts',
+    cases: ["INC-20261109-MUSE-ORIGIN-SCHEMA: explicit metadata stays strict and out of the bridge spec", "INC-20261109-MUSE-ORIGIN-SCHEMA: HTTP reaches real origin ownership gate before insertion", "INC-20261109-MUSE-ORIGIN-SCHEMA: real oc-muse video submits origin and acknowledges one conversation result"],
+  },
+  {
     incident: 'INC-20261029-BOX-STOPPED-CREDIT-HOLD', slug: 'inc-20261029-box-stopped-credit-hold', db: true,
     file: 'packages/commercial/src/billing/boxBillingRecovery.integ.test.ts',
     cases: ['late proven Box stops release retained credit reservations without charging'],
