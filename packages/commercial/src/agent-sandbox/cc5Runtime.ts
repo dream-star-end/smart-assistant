@@ -15,7 +15,7 @@ import {
 import { placeRemoteLane, recordRemoteLaneState, recordRemoteNativeThread, recordRemoteStartAttempt } from '../account-pool/remoteBrainPool.js'
 
 import { getPool } from '../db/index.js'
-import { reconcileRemoteChat } from '../account-pool/remoteLaneRecovery.js'
+import { reconcileRemoteChat, reconcileStaleContainerLanes } from '../account-pool/remoteLaneRecovery.js'
 
 const BASE_ROOT = '/run/oc-cc5-t1555u'
 
@@ -42,8 +42,10 @@ export function createMasterCc5Runtime(
         place: async (request) => {
           try { return await placeRemoteLane(request, { controllerPath }) }
           catch (error) {
-            if (!(error instanceof Error) || error.message !== 'REMOTE_LANE_STOP_UNPROVEN') throw error
-            await reconcileRemoteChat(getPool(),request.uid,request.sessionKey)
+            const code = error instanceof Error ? error.message : ''
+            if (code === 'REMOTE_LANE_STOP_UNPROVEN') await reconcileRemoteChat(getPool(),request.uid,request.sessionKey)
+            else if (code !== 'REMOTE_LANE_CAPACITY_EXHAUSTED' ||
+              !await reconcileStaleContainerLanes(getPool(),request.uid,request.dockerId)) throw error
             return placeRemoteLane(request,{controllerPath})
           }
         },

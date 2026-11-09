@@ -170,6 +170,7 @@ interface Lane {
   readonly relay: Cc5Relay | CodexRemoteRelay
   binding: Readonly<RemoteBridgeBinding>
   stopping?: Promise<void>
+  lastUsedAt: number
   /** Preparation may reset/provision remotely before the relay attempts a model launch. */
   preparationStop?: () => Promise<unknown>
   creationFailed?: boolean
@@ -336,7 +337,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
             // // Another container's, a dead one, or another model's.
           }
           requireLane(container.state === 'active' && container.dockerId)
-          const placement = await this.hooks.place({ ...request, dockerId: container.dockerId })
+          const placement = await this.place(request, container.dockerId)
           requireLane(UUID.test(placement.operationId) && UUID.test(placement.runId) &&
             placement.target.upstreamModel.length > 0)
           const next = await this.startLane(container, request, placement)
@@ -359,9 +360,31 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         }
       })
     }
+    lane.lastUsedAt = Date.now()
     if (lane.binding.version === 3) return codexBackend(lane.binding)
     return parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: lane.sessionKey,
       operationId: lane.operationId })
+  }
+
+  /**
+   * A chat keeps its lane while idle so the next turn is warm. When the pool is full, a new turn
+   * takes over this user's longest-idle lane of the same engine; that chat resumes on its next turn.
+   */
+  private async place(request: RemoteLaneRequest, dockerId: string): Promise<RemoteLanePlacement> {
+    try { return await this.hooks.place({ ...request, dockerId }) }
+    catch (error) {
+      if (!(error instanceof Error) || error.message !== 'REMOTE_LANE_CAPACITY_EXHAUSTED') throw error
+      const codex = request.engine === 'codex'
+      const victim = [...this.chats.entries()]
+        .filter(([key, owner]) => key !== request.sessionKey && owner.lane && !owner.lane.stopping &&
+          owner.lane.relay.idle && (owner.lane.binding.version === 3) === codex)
+        .sort(([, a], [, b]) => a.lane!.lastUsedAt - b.lane!.lastUsedAt)[0]?.[1]
+      if (!victim) throw error
+      const lane = victim.lane!
+      await this.stopLane(lane)
+      if (victim.lane === lane) victim.lane = undefined
+      return this.hooks.place({ ...request, dockerId })
+    }
   }
 
   private chat(sessionKey: string): ChatOwner {
@@ -434,7 +457,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       replaceHost: () => createHost(hostConfig),
     })
     lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
-      operationId: placement.operationId, generation: placement.generation ?? '1', dir, view, binding, relay }
+      operationId: placement.operationId, generation: placement.generation ?? '1', dir, view, binding, relay, lastUsedAt: Date.now() }
     lane.preparationStop = () => host.stop()
     await host.prepareTask(placement.provisionPacket)
     lane.preparationStop = undefined
@@ -482,7 +505,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       id => this.hooks.onNativeThread!(placement.operationId,placement.generation!,id),
       () => this.hooks.onRemoteStart!(placement.operationId,placement.generation!))
     lane = { container,sessionKey:request.sessionKey,canonicalModel:request.canonicalModel,operationId:placement.operationId,
-      generation:placement.generation,dir,view,binding,relay }
+      generation:placement.generation,dir,view,binding,relay,lastUsedAt:Date.now() }
     writePrivate(join(view,'binding.json'),binding,true)
     await this.listen(relay.controlServer,join(view,'relay.sock'),1000,1000)
     return lane

@@ -97,6 +97,8 @@ export class CodexRemoteRelay {
     this.record('binding', { binding, spec })
   }
   get stopped(): boolean { return this.revoked }
+  /** No admission is being started or served: stopping the lane cannot cut a turn short. */
+  get idle(): boolean { return !this.revoked && !this.starting && !this.active && !this.unloading }
   private record(kind: string, value: unknown): void {
     const fd = openSync(join(this.journal, `${String(++this.recordSeq).padStart(8,'0')}-${kind}.json`),
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)

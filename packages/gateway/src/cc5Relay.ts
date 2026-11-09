@@ -713,6 +713,10 @@ export class Cc5Relay {
   get stopped(): boolean {
     return this.revoked
   }
+  /** No turn is being admitted, run or settled: stopping the lane cannot cut a turn short. */
+  get idle(): boolean {
+    return !this.revoked && this.phase === 'idle'
+  }
   stop(): Promise<{ remoteStopped: true }> {
     if (this.stopPromise) return this.stopPromise
     this.revoked = true

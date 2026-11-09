@@ -40,7 +40,7 @@ const financeFactory: RemoteFinanceFactory = () => ({ async admit() { return {
 } } })
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
 
-function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string; holdPrepare?: Promise<void>; enforcePlacementState?: boolean } = {}) {
+function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?: string; holdPrepare?: Promise<void>; enforcePlacementState?: boolean; capacity?: number } = {}) {
   const dir = options.baseRoot ? undefined : mkdtempSync('/tmp/cl-')
   const baseRoot = options.baseRoot ?? join(dir!, 'r')
   const key = generateKeyPairSync('ed25519')
@@ -54,6 +54,8 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
   const hooks: RemoteLaneHooks = {
     async place(request) {
       if (options.enforcePlacementState && persisted.get(request.sessionKey) !== undefined && persisted.get(request.sessionKey) !== 'released') throw new Error('REMOTE_LANE_STOP_UNPROVEN')
+      if (options.capacity !== undefined && [...persisted].filter(([key, state]) =>
+        key !== request.sessionKey && state !== 'released').length >= options.capacity) throw new Error('REMOTE_LANE_CAPACITY_EXHAUSTED')
       places.push({ ...request })
       persisted.set(request.sessionKey, 'preparing')
       // Sticky like placeRemoteLane: one task root and operation per chat.
@@ -232,6 +234,29 @@ test('chats get their own lanes; concurrent first turns of one chat share a sing
     assert.equal(f.places.length, 2)
     assert.deepEqual(readdirSync(handle.mountSource).sort(),
       ['authority-public.json', a1.operationId, other.operationId].sort())
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a full pool hands the longest-idle chat lane to a new chat; a chat mid-turn keeps its lane', { skip: !root }, async () => {
+  const f = fixture({ capacity: 2 })
+  try {
+    const handle = await f.container()
+    const chat2 = 'agent:main:webchat:dm:fixture_chat2', chat3 = 'agent:main:webchat:dm:fixture_chat3'
+    const first = await f.lane()
+    const second = await f.lane(chat2)
+    // chat2 is mid-turn: its relay holds an admission.
+    const b = JSON.parse(readFileSync(join(handle.mountSource, second.operationId, 'binding.json'), 'utf8')) as Cc5BridgeBinding
+    await cc5ControlRequest('/admit', admission(f.key, b), join(handle.mountSource, second.operationId, 'relay.sock'))
+    const third = await f.lane(chat3)
+    assert.notEqual(third.operationId, first.operationId)
+    assert.ok(f.states.some(([op, state]) => op === first.operationId && state === 'released'), 'the idle chat lane was released')
+    assert.ok(!f.states.some(([op, state]) => op === second.operationId && state === 'released'), 'the busy chat keeps its lane')
+    // With every remaining lane busy or the requester's own, the pool stays full.
+    await cc5ControlRequest('/admit', admission(f.key, JSON.parse(readFileSync(join(handle.mountSource, third.operationId, 'binding.json'), 'utf8'))),
+      join(handle.mountSource, third.operationId, 'relay.sock'))
+    await assert.rejects(f.lane(), /REMOTE_LANE_UNAVAILABLE/)
   } finally {
     await f.cleanup()
   }

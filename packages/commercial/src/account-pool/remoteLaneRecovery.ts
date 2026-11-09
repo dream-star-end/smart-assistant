@@ -77,6 +77,17 @@ export async function reconcileRemoteLane(pool: Pool, operationId: string, gener
   need(updated.rowCount === 1)
   // Capacity only: never clear native pending_request_id or fabricate a terminal/zero receipt.
 }
+/** A full pool first reclaims this user's lanes left by an earlier container, each by its own stop proof. */
+export async function reconcileStaleContainerLanes(pool: Pool, uid: number, liveDockerId: string): Promise<number> {
+  const rows = (await pool.query(`SELECT operation_id::text,generation::text FROM remote_agent_bindings
+    WHERE uid=$1 AND docker_id<>$2 AND state<>'released'`,[uid,liveDockerId])).rows
+  let released = 0
+  for (const row of rows) {
+    try { await reconcileRemoteLane(pool,row.operation_id,row.generation); released++ }
+    catch { /* A container that may still run keeps its slot. */ }
+  }
+  return released
+}
 /** Used on a new-container/master placement miss; a live old container remains fenced. */
 export async function reconcileRemoteChat(pool: Pool, uid: number, sessionKey: string): Promise<void> {
   const rows = (await pool.query(`SELECT operation_id::text,generation::text FROM remote_agent_bindings
