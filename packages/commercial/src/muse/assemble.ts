@@ -40,7 +40,10 @@ export async function createMuseFromConfig(
     cliTimeoutSec: CLI_TIMEOUT_SEC,
     videoBackend: parseMuseVideoBackend(cfg.OC_MUSE_VIDEO_BACKEND),
     fallbackHatch: cfg.OC_MUSE_BOX_EXEC_FALLBACK_HATCH === true,
-    boxExecRunner: createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID),
+    // Unset uid = box path not wired: fallback never moves a job onto a Box it cannot reach.
+    boxExecRunner: cfg.OC_MUSE_BOX_EXEC_UID
+      ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID)
+      : undefined,
   })
   try {
     await hub.start()

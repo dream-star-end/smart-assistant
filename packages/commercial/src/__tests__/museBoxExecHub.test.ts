@@ -412,3 +412,50 @@ describe('OCV5-750 hatch-with-box-fallback', () => {
 })
 
 void BOX_EXEC_CHUNK_BYTES
+
+describe('OCV5-750 Gemini r1: box → hatch fallback only before the relay could hold the job', () => {
+  it('a relay-down answer to submit falls back; a status failure after submit does not', async () => {
+    const down = makeHub(tmpRoot(), {
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner: async () => async () => ({
+        stdout: JSON.stringify({
+          ok: false,
+          code: 'MUSE_RELAY_DOWN',
+          message: 'relay unreachable',
+        }),
+      }),
+    })
+    const sid = down.hello('1', '0.5.3')
+    const id = await down.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const job = await down.poll(sid, 2_000)
+    assert.equal(job?.id, id, 'pre-submit relay-down falls back onto hatch')
+  })
+
+  it('a deadline-expired box job aborts its CLI calls', async () => {
+    let clock = 1_000_000
+    let aborted = false
+    const hub = makeHub(tmpRoot(), {
+      now: () => clock,
+      videoBackend: 'box-exec',
+      boxExecPollMs: 1,
+      boxExecRunner:
+        async () => async (_request: BoxCcExecRequest, opts: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.signal?.addEventListener('abort', () => {
+              aborted = true
+              reject(new Error('aborted'))
+            })
+          }),
+    })
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    clock += 60 * 60_000
+    hub.tick()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const view = await hub.view('3', id, 100)
+    assert.equal(view?.error?.code, 'MUSE_TIMEOUT')
+    assert.equal(aborted, true)
+  })
+})

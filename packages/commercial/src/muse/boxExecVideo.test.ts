@@ -216,10 +216,7 @@ describe('OCV5-750 runBoxExecVideoJob against a fake Exec', () => {
       cwd: '/tmp',
       environment: {},
     }
-    await Promise.all([
-      first(req, { timeoutMs: 5000 }),
-      second(req, { timeoutMs: 5000 }),
-    ])
+    await Promise.all([first(req, { timeoutMs: 5000 }), second(req, { timeoutMs: 5000 })])
     const firstStatus = await first(
       { ...req, args: ['-I', '/workspace/muse-relay/bin/muse-exec-cli', 'status'] },
       { timeoutMs: 5000 },
@@ -237,3 +234,99 @@ describe('OCV5-750 runBoxExecVideoJob against a fake Exec', () => {
   })
 })
 
+describe('OCV5-750 Gemini r1 fixes', () => {
+  const req = (verb: string) => ({
+    command: '/usr/bin/python3',
+    args: ['-I', '/workspace/muse-relay/bin/muse-exec-cli', verb],
+    cwd: '/tmp',
+    environment: {},
+  })
+
+  it('re-resolves a stale transport only on the first call of a job', async () => {
+    let resolves = 0
+    let calls = 0
+    const factory = createMuseBoxExecRunner('3', {
+      resolve: async () => {
+        resolves += 1
+        return async () => {
+          calls += 1
+          if (calls === 2) {
+            const err = new Error('guard') as Error & { code: string }
+            err.code = 'BOX_EXEC_ACCOUNT_GUARD_FAILED'
+            throw err
+          }
+          return { stdout: JSON.stringify({ ok: true }) }
+        }
+      },
+    })
+    const exec = await factory()
+    await exec(req('submit'), { timeoutMs: 5000 })
+    await assert.rejects(exec(req('status'), { timeoutMs: 5000 }), /guard/)
+    assert.equal(resolves, 1, 'a mid-job stale transport must not move the job to another Box')
+  })
+
+  it('does not call the Box after the caller aborted during resolve', async () => {
+    const ac = new AbortController()
+    let calls = 0
+    const factory = createMuseBoxExecRunner('3', {
+      resolve: async () => {
+        ac.abort()
+        return async () => {
+          calls += 1
+          return { stdout: '{"ok":true}' }
+        }
+      },
+    })
+    const exec = await factory()
+    await assert.rejects(exec(req('submit'), { timeoutMs: 5000, signal: ac.signal }), /cancelled/)
+    assert.equal(calls, 0)
+  })
+
+  it('maps a CLI error printed on stdout (or legacy stderr) to its Muse code', async () => {
+    for (const where of ['stdout', 'stderr'] as const) {
+      const body = JSON.stringify({
+        ok: false,
+        code: 'MUSE_RELAY_DOWN',
+        message: 'relay unreachable',
+      })
+      const exec = async () =>
+        where === 'stdout' ? { stdout: body } : { stdout: '', stderr: body }
+      const dest = await mkdtemp(join(tmpdir(), 'muse-box-exec-'))
+      await assert.rejects(
+        runBoxExecVideoJob({ exec, spec: spec(), destDir: dest, pollMs: 1 }),
+        (err: unknown) => (err as { code?: string }).code === 'MUSE_BRIDGE_OFFLINE',
+      )
+    }
+  })
+
+  it('passes a prompt that starts with "-" as --prompt=<text>', async () => {
+    const seen: string[][] = []
+    const exec = async (request: BoxCcExecRequest) => {
+      seen.push(request.args.slice(2))
+      return { stdout: JSON.stringify({ ok: false, code: 'MUSE_CLI_BAD_ARGS', message: 'stop' }) }
+    }
+    const dest = await mkdtemp(join(tmpdir(), 'muse-box-exec-'))
+    await assert.rejects(
+      runBoxExecVideoJob({ exec, spec: spec({ prompt: '- a list item prompt' }), destDir: dest }),
+    )
+    assert.equal(seen[0]![1], '--prompt=- a list item prompt')
+  })
+
+  it('reports the submit attempt before the submit call leaves', async () => {
+    const order: string[] = []
+    const exec = async (request: BoxCcExecRequest) => {
+      order.push(String(request.args[2]))
+      throw new Error('BOX_EXEC_INCOMPLETE')
+    }
+    const dest = await mkdtemp(join(tmpdir(), 'muse-box-exec-'))
+    await assert.rejects(
+      runBoxExecVideoJob({
+        exec,
+        spec: spec(),
+        destDir: dest,
+        onSubmitAttempt: () => order.push('attempt'),
+      }),
+    )
+    assert.deepEqual(order.slice(0, 2), ['attempt', 'submit'])
+  })
+})

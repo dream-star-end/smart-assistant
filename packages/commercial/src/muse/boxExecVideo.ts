@@ -78,6 +78,8 @@ export function boxExecDeadlineMs(spec: MuseJobSpec): number {
 
 export interface BoxCliExecResult {
   stdout: string
+  /** Older muse-exec-cli builds wrote their JSON error here. */
+  stderr?: string
 }
 
 export type BoxCliExecFn = (
@@ -167,7 +169,11 @@ async function runCli(
   opts: { timeoutMs: number; maxResponseBytes?: number; signal?: AbortSignal },
 ): Promise<Record<string, unknown>> {
   const result = await exec(museExecRequest(args), opts)
-  const payload = parseCliJson(result.stdout)
+  // muse-exec-cli prints its JSON (errors too) on stdout; fall back to stderr for older builds.
+  const payload =
+    !result.stdout.trim() && result.stderr?.trim()
+      ? parseCliJson(result.stderr)
+      : parseCliJson(result.stdout)
   if (payload.ok === false) {
     const mapped = mapRelayFailure(
       String(payload.message ?? 'cli failed'),
@@ -288,11 +294,14 @@ export async function runBoxExecVideoJob(input: {
   pollMs?: number
   signal?: AbortSignal
   onSubmitted?: (relayJobId: string) => void
+  /** Called right before the submit call leaves: from here on the relay may hold the job. */
+  onSubmitAttempt?: () => void
 }): Promise<BoxExecVideoSuccess> {
   const mode = mapRelayMode(input.spec)
   const count = Math.max(1, Math.min(6, input.spec.count ?? 1))
   await mkdir(input.destDir, { recursive: true, mode: 0o700 })
-  const args = ['submit', '--prompt', input.spec.prompt, '--mode', mode, '--count', String(count)]
+  // `--prompt=<text>` so a prompt starting with "-" is never parsed as an option.
+  const args = ['submit', `--prompt=${input.spec.prompt}`, '--mode', mode, '--count', String(count)]
   if (input.spec.orientation) args.push('--orientation', input.spec.orientation)
   if (input.spec.aspect_ratio) {
     args.push('--orientation', input.spec.aspect_ratio === '9:16' ? 'vertical' : 'landscape')
@@ -304,6 +313,8 @@ export async function runBoxExecVideoJob(input: {
     await writeBoxFile(input.exec, remote, Buffer.from(raw, 'base64'), input.signal)
     args.push('--image', remote)
   }
+  if (input.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
+  input.onSubmitAttempt?.()
   const submitted = await runCli(input.exec, args, { timeoutMs: 60_000, signal: input.signal })
   const jobId = String(submitted.id ?? '')
   if (!jobId) throw new MuseError(502, 'MUSE_BAD_OUTPUT', 'relay did not return a job id')
@@ -371,7 +382,7 @@ export function createMuseBoxExecRunner(
   uidRaw: string | undefined,
   deps?: { resolve?: () => Promise<BoxCliExecFn> },
 ): () => Promise<BoxCliExecFn> {
-  const resolve = async (): Promise<BoxCliExecFn> => {
+  const resolve = async (signal?: AbortSignal): Promise<BoxCliExecFn> => {
     if (deps?.resolve) return deps.resolve()
     const uid = (uidRaw ?? '').trim()
     if (!/^[1-9]\d{0,18}$/.test(uid)) {
@@ -391,7 +402,7 @@ export function createMuseBoxExecRunner(
       sessionId: null,
       requestId: `muse-box-exec-${Date.now()}`,
       upstreamModel: 'muse-box-exec',
-      signal: new AbortController().signal,
+      signal: signal ?? new AbortController().signal,
       interactiveExecTarget: true,
     })
     return (request, opts) => target.exec.run(request, opts)
@@ -401,13 +412,21 @@ export function createMuseBoxExecRunner(
   // calls would miss the relay job that was already submitted.
   return async () => {
     let pinned: BoxCliExecFn | null = null
+    let used = false
     return async (request, opts) => {
+      const first = !used
+      used = true
       try {
-        pinned ??= await resolve()
+        pinned ??= await resolve(opts.signal)
+        if (opts.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
         return await pinned(request, opts)
       } catch (err) {
-        if (!isStaleBoxExecTransport(err)) throw err
-        pinned = await resolve()
+        // Account-guard / egress failures are raised before the request leaves (nothing ran
+        // remotely). Re-resolve only on a job's very first call: later calls depend on state
+        // (staged chunks, the relay job) that lives on the Box this job is pinned to.
+        if (!first || !isStaleBoxExecTransport(err)) throw err
+        pinned = await resolve(opts.signal)
+        if (opts.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
         return await pinned(request, opts)
       }
     }

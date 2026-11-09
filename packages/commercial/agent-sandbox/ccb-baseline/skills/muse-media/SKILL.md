@@ -39,6 +39,8 @@ Native Muse Video (`media.generate_video`) is typically **~10 s, 1280×720 or 72
 
 `--count` is 1–6 and only applies to native-family modes (`native`, `first_frame`, `reference`). It asks for separate variations, not one longer film.
 
+`--mode` and `--count` are honoured when the job runs on the Muse web relay (the Box backend, or the backup when the hatch bridge is unavailable). The hatch bridge path makes one video from the prompt and the images, so you may get one result even when you asked for several; check how many files came back before you describe them to the user.
+
 If `--mode` is omitted:
 
 - no `--image` → `native`

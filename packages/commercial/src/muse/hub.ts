@@ -109,11 +109,20 @@ function isHubJobDone(job: HubJob): boolean {
 }
 
 function canFallbackBoxExecToHatch(input: {
-  relaySubmitted: boolean
+  /** The submit call was started (it may have reached the relay even without a reply). */
+  submitAttempted: boolean
   museErr: MuseError | null
   message: string
 }): boolean {
-  if (input.relaySubmitted) return false
+  if (input.submitAttempted) {
+    // The submit call left. Only failures proven to precede the relay may fall back: the CLI's
+    // own "relay unreachable" answer (connect/send failed, nothing was queued) or a transport
+    // guard failure (raised before the Exec request is sent).
+    return (
+      input.museErr?.code === 'MUSE_BRIDGE_OFFLINE' ||
+      /BOX_EXEC_ACCOUNT_GUARD_FAILED|BOX_EGRESS_CHANGED/.test(input.message)
+    )
+  }
   // BOX_EXEC_INCOMPLETE / TIMEOUT / AFTER_EXIT can happen after the remote
   // already accepted submit (missing terminal frame). Falling back would
   // double-generate. Only treat clearly pre-submit reachability failures
@@ -750,6 +759,7 @@ export class MuseBridgeHub {
     }
     for (const job of [...this.boxExecInflight]) {
       if (now > job.deadlineAt) {
+        job.abort?.abort()
         this.finish(job, fail('MUSE_TIMEOUT', 'the job exceeded its deadline', true))
       }
     }
@@ -806,7 +816,9 @@ export class MuseBridgeHub {
     if (job.state !== 'queued' && job.state !== 'dispatched') return false
     if (job.via !== 'hatch' || job.movedToBox) return false
     if (!this.boxFallbackAvailable(this.getVideoBackend(), job.spec)) return false
-    if (this.boxExecPending.length + this.boxExecInflight.size >= QUEUE_MAX) return false
+    if (this.boxExecPending.length + this.boxExecInflight.size + this.reservedBox >= QUEUE_MAX) {
+      return false
+    }
     if (this.active === job) this.active = null
     const qi = this.queue.indexOf(job)
     if (qi >= 0) this.queue.splice(qi, 1)
@@ -837,7 +849,10 @@ export class MuseBridgeHub {
   }
 
   private async runBoxExec(job: HubJob): Promise<void> {
-    let relaySubmitted = false
+    let submitAttempted = false
+    this.store.markRunning(job.id, null).catch((err) => {
+      this.log.warn('muse_mark_running_failed', { jobId: job.id, err: (err as Error).message })
+    })
     try {
       if (!this.boxExecRunner) {
         throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'box-exec Muse backend is not wired', true)
@@ -851,8 +866,8 @@ export class MuseBridgeHub {
         now: this.now,
         pollMs: this.boxExecPollMs,
         signal: job.abort?.signal,
-        onSubmitted: () => {
-          relaySubmitted = true
+        onSubmitAttempt: () => {
+          submitAttempted = true
         },
       })
       if (isHubJobDone(job)) return
@@ -874,15 +889,18 @@ export class MuseBridgeHub {
         this.fallbackHatch &&
         !job.movedToBox &&
         this.bridgeOnline() &&
-        canFallbackBoxExecToHatch({ relaySubmitted, museErr, message })
+        this.queue.length + this.reservedTotal < QUEUE_MAX &&
+        canFallbackBoxExecToHatch({ submitAttempted, museErr, message })
       ) {
         this.boxExecInflight.delete(job)
         job.via = 'hatch'
         job.state = 'queued'
         job.nonce = randomUUID()
+        job.queuedAt = this.now()
         this.queue.push(job)
         this.log.warn('muse_box_exec_fell_back_to_hatch', { jobId: job.id })
         this.pump()
+        this.pumpBoxExec()
         return
       }
       if (museErr) {
@@ -950,6 +968,8 @@ export class MuseBridgeHub {
   private finish(job: HubJob, outcome: Outcome): void {
     if (isHubJobDone(job)) return
     job.state = 'done'
+    // A failed/cancelled box-exec job stops its CLI calls and best-effort cancels the relay job.
+    if (!outcome.ok) job.abort?.abort()
     job.outcome = outcome
     job.finishedAt = this.now()
     job.spec = { ...job.spec, source_images: undefined }
