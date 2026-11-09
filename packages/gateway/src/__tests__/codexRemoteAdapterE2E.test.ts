@@ -88,6 +88,7 @@ interface Lane {
   holdAbandon: (hold: boolean) => void
   abandonAcksHeld: () => boolean
   abandons: () => number
+  abandonCauses: () => Array<{ failureCode: string; diagnostic: string } | null>
   /** The master applied `/renew`, then the container's ACK is held: a legal early delivery. */
   holdRenewAck: (hold: boolean) => void
   renewAcksHeld: () => boolean
@@ -114,6 +115,8 @@ async function lane(t: TestContext, options: {
   closeFailure?: { active: boolean }
   /** The web chat's peer id; the prompt only projects a nickname consented for this session. */
   sessionId?: string
+  /** The node refuses thread/unsubscribe, as an older controller does. */
+  rejectUnsubscribe?: boolean
 } = {}): Promise<Lane> {
   const root = mkdtempSync(join(tmpdir(), 'codex-container-e2e-'))
   const cwd = join(root, 'cwd')
@@ -213,7 +216,8 @@ async function lane(t: TestContext, options: {
       if (role === 'launch') launches++
       const child = spawn(process.execPath, [NODE_FIXTURE], {
         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-        env: { ...process.env, OC_TEST_NODE: JSON.stringify({ role, manifest: spec.manifest, turns: TURNS, thread: THREAD }) },
+        env: { ...process.env, OC_TEST_NODE: JSON.stringify({ role, manifest: spec.manifest, turns: TURNS, thread: THREAD,
+          rejectUnsubscribe: options.rejectUnsubscribe === true }) },
       }) as ChildProcessWithoutNullStreams
       const rows = receivedByRole.get(role) ?? []
       receivedByRole.set(role, rows)
@@ -241,6 +245,7 @@ async function lane(t: TestContext, options: {
   let releaseAbandonHook: (() => void) | undefined
   let abandons = 0
   let abandonsHeld = false
+  const abandonCauses: Array<{ failureCode: string; diagnostic: string } | null> = []
   const relay = new CodexRemoteRelay(binding, keys, hostPort, spec, join(root, 'journal'), {
     admit: async () => {
       const held = admissionHold
@@ -258,7 +263,8 @@ async function lane(t: TestContext, options: {
         },
         // The real port closes the journal row and the thread claim by identity; the double only
         // has to answer with proof, and can be parked to model a late ACK.
-        abandonUndispatched: async () => {
+        abandonUndispatched: async (cause?: { failureCode: 'INTERNAL_ERROR'; diagnostic: string }) => {
+          abandonCauses.push(cause ?? null)
           const held = abandonHold
           if (held) {
             abandonsHeld = true
@@ -399,6 +405,7 @@ async function lane(t: TestContext, options: {
     child, emit, sendTool, nativeItem, toolRequest, until,
     renewals: () => renewals,
     abandons: () => abandons,
+    abandonCauses: () => abandonCauses,
     abandonAcksHeld: () => abandonsHeld,
     holdAbandon: (hold: boolean) => {
       if (!hold) { releaseAbandonHook?.(); releaseAbandonHook = undefined; abandonHold = undefined; return }
@@ -764,6 +771,38 @@ test('a withdrawn nickname is gone from the instructions the node resumes the wa
   assert.equal((await run2.summary)?.isError, false)
   assert.equal(h.receipts.length, 2)
   assert.equal(h.launches, 1)
+})
+
+test('a node that refuses the thread unload fences the lane and closes the undispatched admission',
+  { timeout: 180000 }, async (t) => {
+  // OCV5-746 audit R3 B2: the admission already claimed the bound thread but never wrote turn/start;
+  // the plain stop leaves that inflight, so the fence must close it by identity, with its cause.
+  const nickname = 'Zq746Nick'
+  const sessionId = 'codex_container_e2e'
+  const h = await lane(t, { sessionId, rejectUnsubscribe: true })
+  const nodeFrames = (method: string) => h.received('launch')
+    .map((row) => row?.received).filter((frame) => frame?.method === method)
+  h.adapter.setPromptPrivacy({ schemaVersion: 1, profile: { nickname, sessionId } })
+  const first = h.authority('req-unload-1')
+  const run = h.adapter.submitTurn(h.turnParams(first, h.turnKey, 'req-unload-1'))
+  await h.until(() => nodeFrames('turn/start').length === 1, 'first turn/start')
+  const firstTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 200, outputTokens: 20 }
+  h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[0]!, firstTotal, firstTotal) })
+  h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[0], status: 'completed' } } })
+  assert.equal((await run.summary)?.isError, false)
+
+  h.adapter.setPromptPrivacy({ schemaVersion: 1, profile: null })
+  await restartRunnerForConfigChange(h.adapter)
+  const second = h.authority('req-unload-2')
+  const run2 = h.adapter.submitTurn(h.turnParams(second, 'f'.repeat(64), 'req-unload-2'))
+  const summary2 = await run2.summary.catch((error: unknown) => ({ isError: true, error }))
+  assert.equal(summary2?.isError, true, 'the turn fails instead of running on the old instructions')
+  await h.until(() => h.abandonCauses().length === 1, 'the undispatched admission is closed')
+  assert.deepEqual(h.abandonCauses(), [{ failureCode: 'INTERNAL_ERROR', diagnostic: 'remote_native_thread_unload_unproven' }])
+  assert.equal(nodeFrames('thread/unsubscribe').length, 1)
+  assert.equal(nodeFrames('thread/resume').length, 0, 'no resume reaches the node after a refused unload')
+  assert.equal(nodeFrames('turn/start').length, 1, 'the second turn never reached the node')
+  assert.equal(h.receipts.length, 1)
 })
 
 test('a turn submitted while another runs admits only after that turn ends', { timeout: 180000 }, async (t) => {

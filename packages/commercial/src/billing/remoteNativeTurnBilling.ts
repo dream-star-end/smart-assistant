@@ -602,24 +602,27 @@ export function createRemoteNativeTurnFinance(
        * and release the thread claim by identity. Anything this invocation cannot prove durably
        * stays closed (`pending`) instead of guessing zero effect.
        */
-      async abandonUndispatched() {
+      async abandonUndispatched(cause?: { failureCode: 'INTERNAL_ERROR'; diagnostic: string }) {
         need(c.v === 2 && !inputAttempted && c.input === null && !c.receipt)
+        need(cause === undefined || (cause.failureCode === 'INTERNAL_ERROR' && /^[a-z0-9_]{1,64}$/.test(cause.diagnostic)))
+        const failureCode = cause?.failureCode ?? 'USER_CANCELLED'
         // The host never started at all: the ordinary prehost closure is already exact.
         if (!hostAttempted && !c.hostStartAttempted) {
-          return (await prehostAbort('USER_CANCELLED')) ? { state: 'proven' as const, requestId: c.requestId } : { state: 'pending' as const }
+          return (await prehostAbort(failureCode, false, cause?.diagnostic)) ? { state: 'proven' as const, requestId: c.requestId } : { state: 'pending' as const }
         }
         const client = await deps.pool.connect()
         try {
           await client.query('BEGIN')
           const journal = await client.query(`/* remote-native:abandon-undispatched */
             UPDATE request_finalize_journal SET state='aborted',final_credits=0,
-              failure_code='USER_CANCELLED',error_msg='remote_native_abandoned_before_dispatch',updated_at=NOW()
+              failure_code=$5,error_msg=$6,updated_at=NOW()
             WHERE request_id=$1 AND user_id=$2 AND ctx->>'remoteNativeBillingRecovery'=$3
               AND ctx#>>'{remoteNative,scope,operationId}'=$4 AND state='inflight'
               AND ctx#>>'{remoteNative,hostStartAttempted}'='true'
               AND ctx#>'{remoteNative,input}'='null'::jsonb
               AND ctx#>'{remoteNative,receipt}'='null'::jsonb`,
-          [c.requestId, scope.uid, marker(c), scope.operationId])
+          [c.requestId, scope.uid, marker(c), scope.operationId, failureCode,
+            cause?.diagnostic ?? 'remote_native_abandoned_before_dispatch'])
           if (journal.rowCount !== 1) { await client.query('ROLLBACK'); return { state: 'pending' as const } }
           if (c.native) {
             // Only this thread's own claim, and only while its ledger total is still the

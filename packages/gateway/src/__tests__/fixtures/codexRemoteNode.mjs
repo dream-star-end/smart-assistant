@@ -3,7 +3,7 @@ import readline from 'node:readline'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 const handshakes = []
-const {role,manifest,turns=['turn-fixture'],thread='thread-fixture'} = JSON.parse(process.env.OC_TEST_NODE)
+const {role,manifest,turns=['turn-fixture'],thread='thread-fixture',rejectUnsubscribe=false} = JSON.parse(process.env.OC_TEST_NODE)
 let seq = 0
 let turn = 0
 let loaded = false
@@ -33,6 +33,10 @@ readline.createInterface({input:process.stdin}).on('line',line => {
  if (f.method === 'thread/start' || f.method === 'thread/resume') {
   if (!loaded) { effective = f.params?.baseInstructions ?? effective; loaded = true }
   wrap({id:f.id,result:{model:manifest.model,thread:{id:thread}}})
+ }
+ else if (f.method === 'thread/unsubscribe' && rejectUnsubscribe) {
+  // An older node controller: the RPC is not on its allow-list.
+  wrap({id:f.id,error:{code:-32600,message:'CODEX_RPC_REJECTED'}})
  }
  else if (f.method === 'thread/unsubscribe') {
   wrap({id:f.id,result:{status: loaded ? 'unsubscribed' : 'notLoaded'}})

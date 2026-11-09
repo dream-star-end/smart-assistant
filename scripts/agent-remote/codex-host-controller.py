@@ -363,7 +363,8 @@ class Policy:
         elif method=='turn/start':
             require(set(p)<={'threadId','input','effort','serviceTier','summary','model','cwd','approvalPolicy','sandboxPolicy'},'CODEX_RPC_REJECTED')
             require(self.thread and p.get('threadId')==self.thread and not self.turn
-                    and 'turn/start' not in self.pending.values(),'CODEX_RPC_REJECTED')
+                    and not any(x in ('turn/start','thread/start','thread/resume','thread/unsubscribe')
+                                for x in self.pending.values()),'CODEX_RPC_REJECTED')
             require(isinstance(p.get('input'),list) and p['input'] and all(isinstance(x,dict) and set(x)<={'type','text','text_elements'}
                     and x.get('type')=='text' and isinstance(x.get('text'),str) for x in p['input']),'CODEX_RPC_REJECTED')
             model=next(x for x in self.models if (x.get('model') or x.get('id'))==self.m['model'])

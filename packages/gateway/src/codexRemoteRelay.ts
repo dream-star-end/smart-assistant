@@ -64,6 +64,7 @@ export class CodexRemoteRelay {
   private threadLoaded = false
   private loadedInstructions?: string
   private unloading?: { id: number; resolve: () => void; reject: (e: Error) => void; closed: boolean; acked: boolean }
+  private unloadOwner?: { finance?: RemoteFinanceTurn; epoch: number }
   private laneIdSeq = 0
   private epoch = 0
   private readonly usedIds = new Set<string>()
@@ -111,6 +112,8 @@ export class CodexRemoteRelay {
     }
     this.revoked = true
     this.observation?.revoke(this.firstCause)
+    // A fenced lane cannot prove an unload any more; fail the waiting resume now, not on the timer.
+    this.unloading?.reject(new Error(this.firstCause))
     void this.stop().catch(() => {})
   }
   private scope(v: any, expired = false): void {
@@ -385,6 +388,8 @@ export class CodexRemoteRelay {
   }
   private async rpc(frame: any): Promise<void> {
     codexNeed(this.active && !this.revoked && this.app && frame && Object.keys(frame).every(k => ['id','method','params','jsonrpc'].includes(k)))
+    // An unload is one atomic step of this admission: nothing else reaches the node meanwhile.
+    codexNeed(!this.unloading, 'CODEX_THREAD_UNLOAD_PENDING')
     const p = frame.params ?? {}, method = frame.method
     codexNeed(p && typeof p === 'object' && !Array.isArray(p))
     const allowed: Record<string, string[]> = { initialize: ['clientInfo','capabilities'], initialized: [],
@@ -446,6 +451,10 @@ export class CodexRemoteRelay {
     codexNeed(app !== undefined && this.thread !== undefined && !this.dispatching && !this.unloading,
       'CODEX_THREAD_UNLOAD_UNPROVEN')
     codexNeed(this.laneIds.size < 100000, 'CODEX_ID_TRANSLATION_LIMIT')
+    // The admission this unload serves: a stop before it completes must close exactly this
+    // undispatched finance owner, and a resume after it may only go out for the same admission.
+    const owner = { finance: this.financeTurn, epoch: this.epoch }
+    this.unloadOwner = owner
     const id = ++this.laneIdSeq
     this.laneIds.set(id, { kernelId: undefined, method: 'thread/unsubscribe', epoch: -1 })
     const done = new Promise<void>((resolve, reject) => {
@@ -459,6 +468,9 @@ export class CodexRemoteRelay {
       this.threadLoaded = false
       this.loadedInstructions = undefined
       this.record('thread-unloaded', { threadId: this.thread })
+      codexNeed(!this.revoked && this.active && this.epoch === owner.epoch && this.financeTurn === owner.finance,
+        'CODEX_THREAD_UNLOAD_STALE')
+      this.unloadOwner = undefined
     } catch (error) {
       this.fence(error instanceof Error ? error.message : 'CODEX_THREAD_UNLOAD_UNPROVEN')
       throw error
@@ -553,6 +565,18 @@ export class CodexRemoteRelay {
         remoteStopped: proof.remoteStopped && this.localStopped,
         ...(this.memoryRefused ? { nodeAdmissionRejected: true, nodeAdmissionReason: this.memoryRefused } : {}) })
       codexNeed(proof.remoteStopped && this.localStopped, 'CODEX_STOP_UNKNOWN')
+      // A stop that interrupted a thread unload: this admission already holds a bound thread but
+      // never wrote turn/start, a shape the ordinary stop leaves inflight. With both stop proofs in
+      // hand, close it by identity — the same proof the container's own abandon uses.
+      const owner = this.unloadOwner
+      if (owner && owner.finance === this.financeTurn && owner.epoch === this.epoch && this.active && !this.dispatching) {
+        codexNeed(typeof owner.finance?.abandonUndispatched === 'function', 'CODEX_ABANDON_UNSUPPORTED')
+        const outcome = await owner.finance!.abandonUndispatched!({ failureCode: 'INTERNAL_ERROR',
+          diagnostic: 'remote_native_thread_unload_unproven' })
+        codexNeed(outcome.state === 'proven', 'CODEX_ABANDON_UNSETTLED')
+        this.active = false; this.unloadOwner = undefined
+        this.record('abandoned', { authorityTurnId: this.admitted?.payload.authorityTurnId, cause: this.firstCause })
+      }
       this.record('stopped', { remoteStopped: true }); return { remoteStopped: true as const }
     })().catch(error => { this.stopping = undefined; throw error })
   }

@@ -8,8 +8,10 @@ export interface RemoteFinanceTurn extends Omit<Cc5FinanceTurn, 'terminal'> {
    * and no terminal receipt exists, so the only durable claims are the journal row (and possibly
    * a bound thread's `pending_request_id`). They are released by identity, never settled as
    * usage. `pending` means the owner could not prove it and the caller must stay closed.
+   * `cause` records a platform failure (e.g. a thread unload the node never proved) instead of
+   * the default user cancel.
    */
-  abandonUndispatched?(): Promise<Cc5FinanceTerminalOutcome>
+  abandonUndispatched?(cause?: { failureCode: 'INTERNAL_ERROR'; diagnostic: string }): Promise<Cc5FinanceTerminalOutcome>
   terminal(receipt: RemoteNativeTerminalReceipt): Promise<Cc5FinanceTerminalOutcome>
 }
 export interface RemoteFinancePort {
