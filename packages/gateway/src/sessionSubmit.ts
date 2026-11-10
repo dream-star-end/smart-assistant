@@ -1830,10 +1830,11 @@ export async function _getOrCreateExclusive(
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
     const storedResumeForCreate = this._resumeMap.get(opts.sessionKey)
+    const cc5Backend = executionBackend?.kind === 'cc5-interactive-v1' ? executionBackend : undefined
     if (
-      executionBackend &&
+      cc5Backend &&
       storedResumeForCreate &&
-      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== executionBackend.operationId
+      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== cc5Backend.operationId
     ) {
       throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
     }
@@ -1842,12 +1843,15 @@ export async function _getOrCreateExclusive(
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
     const mappedResumeId = opts.hermeticNoTools
       ? undefined
-      : executionBackend
+      : cc5Backend
         ? (storedResumeForCreate &&
-          parseCc5ResumeId(storedResumeForCreate)?.bindingId === executionBackend.operationId
+          parseCc5ResumeId(storedResumeForCreate)?.bindingId === cc5Backend.operationId
             ? storedResumeForCreate
             : undefined)
-        : this._resumeIdFor(
+        : executionBackend
+          // The rollout lives on the remote node; the relay only resumes the thread its lane bound.
+          ? (normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === 'codex' ? storedResumeForCreate : undefined)
+          : this._resumeIdFor(
             opts.sessionKey,
             engineId,
             this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
