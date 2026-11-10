@@ -18,6 +18,8 @@ import {
   pruneIdleOps,
   readIdleReset,
   IdleCompactRejected,
+  clearIdleCandidate,
+  readPendingIdle,
   writeIdleCandidate,
 } from './boxIdleCompact.js'
 import { boxIdlePreExpiryMs, cancelIdlePreExpiry } from './boxContextBudget.js'
@@ -953,6 +955,7 @@ function runIdlePreExpiry(
     session.lock = new Promise<void>((resolve) => (release = resolve))
     const startedAt = Date.now()
     let outcome = 'skipped'
+    let wroteCandidate = false
     try {
       await prev
       if (
@@ -961,11 +964,14 @@ function runIdlePreExpiry(
         session._plannedTeardown ||
         session._replacing ||
         (session._activeTurnCount ?? 0) > 0 ||
+        // An external turn, reset or new native session replaced what this op would summarize.
+        session.runner.nativeSessionId !== source.sessionId ||
         currentIdleSource(paths.home, session.sessionKey)
       )
         return
       session._idlePreExpirySource = undefined
       session._idlePreExpiryActive = true
+      wroteCandidate = true
       writeIdleCandidate(paths.home, {
         v: 1,
         sessionKey: session.sessionKey,
@@ -974,13 +980,23 @@ function runIdlePreExpiry(
         createdAt: Date.now(),
       })
       await host.finishIdleUnderLock(session, source, paths.home, 'pre_expiry')
-      outcome = currentIdleSource(paths.home, session.sessionKey) ? 'pending' : 'settled'
+      outcome = readPendingIdle(paths.home, session.sessionKey) ? 'pending' : 'settled'
     } catch (err) {
       outcome = 'failed'
       if (!(err instanceof IdleCompactRejected)) {
         log.warn('box idle pre-expiry compaction failed', { sessionKey: session.sessionKey }, err)
       }
     } finally {
+      // Proof not ready, or a throw before the op existed: the candidate written
+      // above must not outlive this attempt, or the next user turn would be
+      // refused with IDLE_HISTORY_PENDING. An op that does exist settles normally.
+      if (wroteCandidate) {
+        try {
+          if (!readPendingIdle(paths.home, session.sessionKey)) clearIdleCandidate(paths.home, session.sessionKey)
+        } catch (err) {
+          log.warn('box idle pre-expiry candidate cleanup failed', { sessionKey: session.sessionKey }, err)
+        }
+      }
       session._idlePreExpiryActive = false
       session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
       release()

@@ -164,7 +164,7 @@ async function flush(): Promise<void> {
 test('a deferred op compacts at the pre-expiry delay, under the session lock', async () => {
   mock.timers.enable({ apis: ['setTimeout'] })
   try {
-    const session: Record<string, unknown> = { sessionKey: `life-${++n}`, lock: Promise.resolve() }
+    const session: Record<string, unknown> = { sessionKey: `life-${++n}`, lock: Promise.resolve(), runner: { nativeSessionId: sessionId } }
     const { host, calls } = lifecycleHost(session as { sessionKey: string })
     idle.writeIdleCandidate(HOME, { v: 1, sessionKey: session.sessionKey as string, sessionId, turnKey: sourceTurn })
     scheduleIdleDrain.call(host as never, session as never)
@@ -187,12 +187,57 @@ test('a deferred op compacts at the pre-expiry delay, under the session lock', a
 test('a user turn before the delay cancels the pre-expiry compaction', async () => {
   mock.timers.enable({ apis: ['setTimeout'] })
   try {
-    const session: Record<string, unknown> = { sessionKey: `life-${++n}`, lock: Promise.resolve() }
+    const session: Record<string, unknown> = { sessionKey: `life-${++n}`, lock: Promise.resolve(), runner: { nativeSessionId: sessionId } }
     const { host, calls } = lifecycleHost(session as { sessionKey: string })
     idle.writeIdleCandidate(HOME, { v: 1, sessionKey: session.sessionKey as string, sessionId, turnKey: sourceTurn })
     scheduleIdleDrain.call(host as never, session as never)
     await flush()
     budget.cancelIdlePreExpiry(session)
+    mock.timers.tick(budget.BOX_IDLE_PRE_EXPIRY_MS_DEFAULT)
+    await flush()
+    assert.deepEqual(calls, ['after_turn'])
+  } finally {
+    mock.timers.reset()
+  }
+})
+
+test('audit r1: a pre-expiry attempt whose proof is not ready leaves no candidate behind', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const key = `life-${++n}`
+    const session: Record<string, unknown> = { sessionKey: key, lock: Promise.resolve(), runner: { nativeSessionId: sessionId } }
+    const calls: string[] = []
+    const host = {
+      sessions: new Map([[key, session]]),
+      async finishIdleUnderLock(_s: unknown, _src: unknown, _d?: string, mode = 'after_turn') {
+        calls.push(mode)
+        if (mode === 'after_turn') { idle.clearIdleCandidate(HOME, key); return 'deferred' }
+        return undefined // proof pending: returned without an op, candidate untouched
+      },
+      scheduleIdleDrain(s: unknown) { calls.push('drain'); void s },
+    }
+    idle.writeIdleCandidate(HOME, { v: 1, sessionKey: key, sessionId, turnKey: sourceTurn })
+    scheduleIdleDrain.call(host as never, session as never)
+    await flush()
+    mock.timers.tick(budget.BOX_IDLE_PRE_EXPIRY_MS_DEFAULT)
+    await flush()
+    assert.deepEqual(calls, ['after_turn', 'pre_expiry'])
+    assert.equal(idle.readIdleCandidate(HOME, key), undefined, 'next user turn is not blocked')
+    assert.equal(session._idlePreExpiryTimer, undefined, 'no second timer')
+  } finally {
+    mock.timers.reset()
+  }
+})
+
+test('audit r1: a replaced native session skips the stale pre-expiry compaction', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const session: Record<string, unknown> = { sessionKey: `life-${++n}`, lock: Promise.resolve(), runner: { nativeSessionId: sessionId } }
+    const { host, calls } = lifecycleHost(session as { sessionKey: string })
+    idle.writeIdleCandidate(HOME, { v: 1, sessionKey: session.sessionKey as string, sessionId, turnKey: sourceTurn })
+    scheduleIdleDrain.call(host as never, session as never)
+    await flush()
+    ;(session.runner as { nativeSessionId?: string }).nativeSessionId = undefined
     mock.timers.tick(budget.BOX_IDLE_PRE_EXPIRY_MS_DEFAULT)
     await flush()
     assert.deepEqual(calls, ['after_turn'])
