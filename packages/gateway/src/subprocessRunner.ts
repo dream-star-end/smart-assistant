@@ -9,6 +9,7 @@ import { fastServiceTierRoute } from '@openclaude/protocol'
 import {
   identityCompatEnvironment,
   isProjectSearchEnabled,
+  paths as storagePaths,
 } from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -35,6 +36,15 @@ import { relocateCcbJsonlToCwd, relocateCcbJsonlToCwdManaged } from './engine/cc
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext, type IntelligentUiApplied } from './promptSlots.js'
+import {
+  applyPromptFreeze,
+  type FrozenPromptBuild,
+  PROMPT_FREEZE_TOUCH_MS,
+  type PromptFreezeInputs,
+  promptFreezeInputsKey,
+  resolvePromptFreezeMode,
+  touchFrozenPrompt,
+} from './promptFreeze.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -319,6 +329,10 @@ export class SubprocessRunner extends EventEmitter {
    *  undefined = 还没组装过 / 组装失败;sessionManager 用它判断开关切换后是否需要重启。 */
   private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
   private _promptPolicyFingerprint: string | undefined
+  /** OCV5-755: CCB context snapshot for this spawn ('' = CCB uses live values). */
+  private _ccbContextFreezeFile = ''
+  private _promptFreezeActive = false
+  private _promptFreezeTouchedAt = 0
   private promptPolicy: PromptPrivacyPolicy | undefined
   get promptPolicyFingerprint(): string | undefined { return this._promptPolicyFingerprint }
   assertPromptPrivacyStopped(): void {
@@ -885,6 +899,8 @@ export class SubprocessRunner extends EventEmitter {
           OPENCLAUDE_PROMPT_LAYOUT: usesStaticFirstPromptLayout(harness, this.opts.boxResidentCc)
             ? '2'
             : '',
+          // OCV5-755: per-session gitStatus / CLAUDE.md / date snapshot; empty = live values.
+          OPENCLAUDE_CONTEXT_FREEZE_FILE: this._ccbContextFreezeFile,
           ...(harness === 'official-cc'
             ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }
             : {}),
@@ -1202,6 +1218,10 @@ export class SubprocessRunner extends EventEmitter {
 
   private handleStdout(chunk: string, timing = this.processTiming): void {
     this.lastActivityAt = Date.now()
+    if (this._promptFreezeActive && this.lastActivityAt - this._promptFreezeTouchedAt >= PROMPT_FREEZE_TOUCH_MS) {
+      this._promptFreezeTouchedAt = this.lastActivityAt
+      touchFrozenPrompt(storagePaths.home, this.opts.sessionKey, this.lastActivityAt)
+    }
 
     // Scan `chunk` in place rather than first concatenating the entire chunk
     // onto stdoutBuf. Complete lines are parsed one by one and only the final
@@ -1666,6 +1686,43 @@ export class SubprocessRunner extends EventEmitter {
     }
   }
 
+  /** OCV5-755: the platform prompt this spawn runs with (see promptFreeze.ts).
+   *  Freezing is an optimization: any failure runs the fresh build. */
+  private applySessionPromptFreeze(fresh: FrozenPromptBuild, inputs: PromptFreezeInputs): FrozenPromptBuild {
+    this._ccbContextFreezeFile = ''
+    this._promptFreezeActive = false
+    try {
+      const home = storagePaths.home
+      const mode = resolvePromptFreezeMode(home)
+      if (mode === 'off') return fresh
+      const outcome = applyPromptFreeze({
+        home,
+        sessionKey: this.opts.sessionKey,
+        mode,
+        inputsKey: promptFreezeInputsKey(inputs),
+        fresh,
+      })
+      this._ccbContextFreezeFile = outcome.ccbContextFile
+      this._promptFreezeActive = true
+      this._promptFreezeTouchedAt = Date.now()
+      runnerLog.info('prompt_freeze', {
+        sessionKey: this.opts.sessionKey,
+        mode,
+        decision: outcome.decision,
+        reused: outcome.reused,
+        same_content: outcome.sameContent,
+        changed_slots: outcome.changedSlots,
+        age_min: outcome.ageMs === null ? null : Math.round(outcome.ageMs / 60_000),
+      })
+      return outcome.chosen
+    } catch (err) {
+      this._ccbContextFreezeFile = ''
+      this._promptFreezeActive = false
+      runnerLog.warn('prompt_freeze failed; using fresh prompt', { sessionKey: this.opts.sessionKey }, err)
+      return fresh
+    }
+  }
+
   private async buildLearningContext(repoSnapshot: RepoSnapshot | null = null, toolOnly = false): Promise<{
     extraPromptFile?: string
     mcpConfigFile?: string
@@ -1686,6 +1743,8 @@ export class SubprocessRunner extends EventEmitter {
     const safeDirName = this.opts.sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_')
     const sessionDir = mkdtempSync(resolve(tmpdir(), `openclaude-${safeDirName}-`))
     this.sessionDir = sessionDir
+    this._ccbContextFreezeFile = ''
+    this._promptFreezeActive = false
 
     if (this.opts.hermeticNoTools) {
       const mcpPath = resolve(sessionDir, 'mcp-config.json')
@@ -1818,17 +1877,45 @@ export class SubprocessRunner extends EventEmitter {
         projectBound: Boolean(this.opts.projectId),
         desktopWorkspaceDir: resolveDesktopWorkspaceDir(),
       })
+      const freshPrompt: FrozenPromptBuild = {
+        content: promptResult.content,
+        contentSha256: promptResult.contentSha256,
+        applied: promptResult.applied,
+        ...(promptResult.frozenProjectContext
+          ? { frozenProjectContext: promptResult.frozenProjectContext }
+          : {}),
+      }
+      const chosenPrompt = this.applySessionPromptFreeze(freshPrompt, {
+        agentId: this.opts.agentId,
+        model: this.opts.model,
+        effortLevel: this.opts.effortLevel,
+        provider: effectiveProvider === 'claude-subscription' ? 'claude-subscription' : 'ccb',
+        cacheLayout: usesStaticFirstPromptLayout(resolveCcbHarness(this.opts.harness), this.opts.boxResidentCc)
+          ? 'static-first'
+          : 'legacy',
+        modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
+        availableMcpTools: [...projectedMcpTools],
+        projectId: this.opts.projectId ?? null,
+        sessionId: this.opts.sessionId,
+        cwd: cwdDecision.cwd,
+        persona: this.opts.persona,
+        identityProfile: this.opts.identityCompat?.assets?.profile,
+        repoSnapshot,
+        skillEval: [this.opts.skillEvalExclude ?? null, this.opts.skillEvalDraft ?? null],
+        intelligentUi: promptResult.intelligentUi ?? false,
+        promptPolicyFingerprint: promptResult.promptPolicyFingerprint,
+      })
       await persistRunContextSnapshot({
         descriptor: this.opts.runContext,
-        applied: promptResult.applied,
-        promptContentSha256: promptResult.contentSha256,
-        frozen: promptResult.frozenProjectContext,
+        applied: chosenPrompt.applied,
+        promptContentSha256: chosenPrompt.contentSha256,
+        frozen: chosenPrompt.frozenProjectContext,
         cwd: cwdDecision.cwd,
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
-      const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
+      const mergedPrompt = [chosenPrompt.content, goalPrompt].filter(Boolean).join('\n\n')
       if (mergedPrompt) {
         const path = resolve(sessionDir, 'extra-prompt.md')
         writeFileSync(path, mergedPrompt)
@@ -1852,7 +1939,7 @@ export class SubprocessRunner extends EventEmitter {
       // 不携带 spawn 入参的 raw model — 后者外部可控,用作 label 会撑爆 Prom counter
       // cardinality(观测面 DoS),作为日志字段同样会污染按字段建索引的日志后端。
       // 需要 raw → canonical 的对应关系时,用 sessionKey/agentId 与上下文 launch log 关联。
-      const hint = promptResult.applied.find((s) => s.name === 'MODEL_HINT')
+      const hint = chosenPrompt.applied.find((s) => s.name === 'MODEL_HINT')
       const canonicalModelId = hint?.meta?.model_id
       if (hint && canonicalModelId) {
         runnerLog.info('model_hint_applied', {

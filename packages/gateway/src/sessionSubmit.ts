@@ -716,7 +716,10 @@ export async function submit(
         { assets: undefined, fingerprint: undefined },
         admission.context,
       )
-      if (changed) await restartRunnerForConfigChange(session.runner) // native id is deliberately retained
+      if (changed) {
+        log.info('runner_config_restart', { sessionKey: session.sessionKey, identityCompatChanged: true })
+        await restartRunnerForConfigChange(session.runner) // native id is deliberately retained
+      }
     } else if (admission.context.assets && session.channel !== 'auto-dream') {
       throw new Error('COMPAT_CONFIG_CONFLICT: runner has no validated identity context')
     }
@@ -845,6 +848,17 @@ export async function submit(
         modelChanged ? desiredModel : session.runner.model,
       ) === 'restart'
     if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
+      // OCV5-755: a restart rebuilds the prompt prefix; record which input asked for it.
+      log.info('runner_config_restart', {
+        sessionKey: session.sessionKey,
+        running: session.runner.isRunning,
+        effortChanged,
+        modelChanged,
+        toolsetsChanged,
+        iuiChanged,
+        privacyChanged,
+        serviceTierChanged,
+      })
       try {
         await restartRunnerForConfigChange(session.runner)
         if (privacyChanged) assertRunnerPromptPrivacyStopped(session.runner)
@@ -1654,6 +1668,17 @@ export async function _getOrCreateExclusive(
         workspaceCwdChanged ||
         projectIdChanged
       ) {
+        log.info('session_runner_replace', {
+          sessionKey: opts.sessionKey,
+          agentChanged: existing.agentId !== opts.agent.id,
+          identityChanged: existing._identityAgentFingerprint !== identityAgentFingerprint,
+          engineChanged: existing.providerTag !== desiredEngine,
+          cursorTransportChanged,
+          backendChanged,
+          workspaceModeChanged,
+          workspaceCwdChanged,
+          projectIdChanged,
+        })
         const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
           existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
         contextRebuildNotice = replacementNotice
