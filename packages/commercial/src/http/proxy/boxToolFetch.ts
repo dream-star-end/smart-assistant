@@ -29,6 +29,7 @@ import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 import { rootLogger } from "../../logging/logger.js";
+import type { BoxNativeMissDetail } from "./boxNativeContextDiagnosis.js";
 
 const fetchLog = rootLogger.child({ subsys: "box-tool-fetch" });
 
@@ -87,7 +88,7 @@ export class BoxToolFetch {
       requestId: string; phase: string }) => Promise<void>;
     runFirst?: First;
     onNativeDecision?: (info: { requestId: string; decision: "resume" | "miss";
-      reason: string; cliVersion: string }) => void;
+      reason: string; cliVersion: string; detail?: BoxNativeMissDetail }) => void;
     publishResume?: Publish;
     runContinuation?: Continue;
     /** Test-only shortening of the bounded restart-cleanup resolver wait. */

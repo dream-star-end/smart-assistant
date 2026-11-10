@@ -24,6 +24,7 @@ import { boxFastPathEnabled } from "./boxFastPath.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
+import { rememberBoxNativeContext } from "./boxNativeContextDiagnosis.js";
 
 export class BoxToolContinuationError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolContinuationError"; }
@@ -247,6 +248,7 @@ export async function runBoxToolContinuation(input: {
               requestId: input.requestId, uid: input.uid,
               accountId: claim.accountId, proof, pointer: candidate })) {
               nativePointer = candidate;
+              rememberBoxNativeContext(candidate.contextHashBeforeFinal, input.canonicalBody);
             }
           } catch { /* Cache miss must not erase durable usage or model result. */ }
         }
