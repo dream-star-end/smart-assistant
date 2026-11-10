@@ -2033,7 +2033,7 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
-  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh/multi-model-review/ths/blog-writer gaps', async () => {
+  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh/multi-model-review/ths/blog-writer/muse-media gaps', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-'))
     dirs.push(dir)
     const release = path.join(dir, 'release')
@@ -2048,6 +2048,7 @@ describe('v5 release safety lanes', () => {
     await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
     await rm(path.join(baseline, 'skills/ths'), { recursive: true })
     await rm(path.join(baseline, 'skills/blog-writer'), { recursive: true })
+    await rm(path.join(baseline, 'skills/muse-media'), { recursive: true })
     await rm(path.join(baseline, 'AGENTS.admin.md'))
     await rm(path.join(baseline, 'CLAUDE.admin.md'))
     const strict = spawnSync('bash', [baselineGuard, 'check-release', release], {
@@ -2083,6 +2084,39 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(prepare, /assert_release_baseline_security "\$live_release"/)
   })
 
+
+  test('strict baseline still requires muse-media exactly; only legacy serving mode tolerates its absence', async () => {
+    // OCV5-750: #1388 added muse-media to EXPECTED_SKILLS; the serving predecessor predates it.
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-muse-media-'))
+    dirs.push(dir)
+    const release = path.join(dir, 'release')
+    const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+    await mkdir(path.dirname(baseline), { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, {
+      recursive: true,
+    })
+    await rm(path.join(baseline, 'skills/muse-media'), { recursive: true })
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], {
+      encoding: 'utf8',
+    })
+    assert.notEqual(strict.status, 0)
+    assert.match(strict.stderr, /skill manifest mismatch/)
+    const compat = spawnSync('bash', [baselineGuard, 'harden-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
+    assert.equal(compat.status, 0, compat.stderr)
+    const check = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
+    assert.equal(check.status, 0, check.stderr)
+    // A present muse-media is still held to the skill layout rules in legacy mode.
+    await mkdir(path.join(baseline, 'skills/muse-media'))
+    await writeFile(path.join(baseline, 'skills/muse-media/stray.bin'), 'x')
+    const badInner = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
+    assert.notEqual(badInner.status, 0)
+  })
   test('post-rollback smoke uses legacy baseline for predecessor missing multi-model-review', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-rollback-smoke-legacy-'))
     dirs.push(dir)
