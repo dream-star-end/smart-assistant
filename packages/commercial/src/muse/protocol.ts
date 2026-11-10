@@ -25,7 +25,11 @@ export const MUSE_LIMITS = Object.freeze({
   max_source_images: 4,
 })
 
-export const POLL_HOLD_SEC = 25
+// 15 s, was 25 s (OCV5-758): the commercial Muse VM reaches the master through an egress proxy and
+// Cloudflare, and ~22% of polls held 25 s idle came back "Remote end closed connection without
+// response" (11-08..11-10). A shorter idle hold gives those hops less time to cut the connection.
+// The bridge reads it from hello and waits hold + 15 s, so no bridge update is needed.
+export const POLL_HOLD_SEC = 15
 export const HEARTBEAT_SEC = 15
 /** media-generation --timeout-secs. Video measured ~40 s for a 10 s clip; give it room. */
 export const CLI_TIMEOUT_SEC = Object.freeze({ image: 120, video: 300 })

@@ -15,6 +15,7 @@ import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse
 import {
   MAX_DISPATCH_ATTEMPTS,
   MuseError,
+  POLL_HOLD_SEC,
   parseAllowedUids,
   parseSubmission,
   supportsSourceRefs,
@@ -628,6 +629,12 @@ describe('muse bridge http', () => {
     }
     assert.equal(last, 429)
     assert.equal((await post('/hello', {}, { 'x-test-ip': '8.8.8.8' })).status, 200)
+  })
+
+  it('hello tells the bridge to hold polls 15 s (OCV5-758: a 25 s idle hold was cut in transit)', async () => {
+    assert.equal(POLL_HOLD_SEC, 15)
+    const hello = (await post('/hello', { bridge_version: '0.5.3' })).json
+    assert.equal(hello.poll_hold_sec, 15)
   })
 
   it('unknown session → 400 (hello again), superseded → 409, empty poll → 204', async () => {
