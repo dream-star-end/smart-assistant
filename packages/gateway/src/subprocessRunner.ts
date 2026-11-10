@@ -45,6 +45,7 @@ import {
   resolvePromptFreezeMode,
   touchFrozenPrompt,
 } from './promptFreeze.js'
+import { boxAutoCompactWindowEnv } from './boxContextBudget.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -901,6 +902,8 @@ export class SubprocessRunner extends EventEmitter {
             : '',
           // OCV5-755: per-session gitStatus / CLAUDE.md / date snapshot; empty = live values.
           OPENCLAUDE_CONTEXT_FREEZE_FILE: this._ccbContextFreezeFile,
+          // OCV5-755: Box Claude compacts at a 400k working window; the model keeps 1M.
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: boxAutoCompactWindowEnv(this.opts.model, storagePaths.home),
           ...(harness === 'official-cc'
             ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }
             : {}),

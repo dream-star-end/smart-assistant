@@ -1,6 +1,7 @@
 import { type RemoteExecutionBackend, sameRemoteExecutionBackend } from '@openclaude/protocol'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { restartRunnerForConfigChange } from './runnerConfigRestart.js'
+import { BOX_IDLE_PRE_EXPIRY_MIN_TOKENS, boxIdlePreExpiryMs, cancelIdlePreExpiry } from './boxContextBudget.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
@@ -52,6 +53,7 @@ import {
   idleProofWaitMs,
   pruneIdleOps,
   sourceNeedsIdleOp,
+  idleCompactAlways,
   type IdleOp,
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
@@ -618,6 +620,11 @@ export async function submit(
     this._promptQueueExecutionKeys.add(session.sessionKey)
   }
   session.lock = new Promise<void>((r) => (release = r))
+  // OCV5-755: this turn supersedes an armed pre-expiry compaction; if one is
+  // already running, the user sees "compacting" until it hands the lock over.
+  cancelIdlePreExpiry(session)
+  const waitedOnIdleCompaction = Boolean(session._idlePreExpiryActive || session._idleRunning)
+  if (waitedOnIdleCompaction) onEvent({ kind: 'turn_status', status: 'compacting' })
   // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 ++。详见
   // AgentSession._activeTurnCount 注释。位置:lock 新建后、`await prev`
   // 前,即 **submit() 已接受、即将串行化执行** 的一刻起算。注意 scope:
@@ -630,6 +637,7 @@ export async function submit(
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
     await prev
+    if (waitedOnIdleCompaction) onEvent({ kind: 'turn_status', status: null })
     session._turnReadOnly = opts?.readOnly === true
     if (!sameRemoteExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
       throw new Error('CC5_BACKEND_SCOPE_CHANGED')
@@ -2336,7 +2344,8 @@ export async function finishIdleUnderLock(
     turnKey: string
   },
   recoveryDir: string = paths.home,
-): Promise<void> {
+  mode: 'after_turn' | 'pre_expiry' = 'after_turn',
+): Promise<'deferred' | void> {
   if (session._idleRunning) return
   const pending = readPendingIdle(recoveryDir, session.sessionKey)
   if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
@@ -2387,6 +2396,19 @@ export async function finishIdleUnderLock(
   if (!readIdleOp(recoveryDir, session.sessionKey, proof.revision) && !sourceNeedsIdleOp(proof)) {
     clearIdleCandidate(recoveryDir, session.sessionKey)
     return
+  }
+  // OCV5-755: a new op right after the turn would only skip as short (CCB
+  // compacts near the 1M limit) or summarize while the user is still active.
+  // Defer it to shortly before the prompt cache expires; the caller arms the
+  // timer and the next user turn simply supersedes it.
+  if (
+    mode === 'after_turn' &&
+    !readIdleOp(recoveryDir, session.sessionKey, proof.revision) &&
+    !idleCompactAlways() &&
+    boxIdlePreExpiryMs(recoveryDir) > 0
+  ) {
+    clearIdleCandidate(recoveryDir, session.sessionKey)
+    return 'deferred'
   }
   const existingIdle = readIdleOp(recoveryDir, session.sessionKey, proof.revision)
   if (existingIdle && idleOpSettled(existingIdle)) { clearIdleCandidate(recoveryDir, session.sessionKey); return }
@@ -2497,6 +2519,7 @@ export async function finishIdleUnderLock(
           modelCalls: 0,
           frozenTail: step.op.frozenTail,
           attachments: step.op.attachments,
+          ...(mode === 'pre_expiry' ? { minInputTokens: BOX_IDLE_PRE_EXPIRY_MIN_TOKENS } : {}),
         })
       }
       session._idleRunning = true

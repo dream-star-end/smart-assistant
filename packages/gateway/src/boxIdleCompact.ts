@@ -238,6 +238,9 @@ export interface IdleNativeFile {
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleAttachment[]
+  /** OCV5-755: pre-expiry compaction summarizes from this outer size, below
+   *  the near-limit fit CCB uses otherwise. */
+  minInputTokens?: number
 }
 
 export function idleNativeDir(home: string, sessionId: string): string {

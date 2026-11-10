@@ -235,6 +235,11 @@ export interface AgentSession {
   _boxContextOwner?: string
   /** Set while the lock-held idle path is inside runner.submitTurn. */
   _idleRunning?: boolean
+  /** OCV5-755: armed pre-expiry idle compaction for the last Box turn. */
+  _idlePreExpiryTimer?: ReturnType<typeof setTimeout>
+  _idlePreExpirySource?: { sessionId: string; turnKey: string }
+  /** OCV5-755: a pre-expiry compaction holds session.lock right now. */
+  _idlePreExpiryActive?: boolean
   /** OCV5-297: internal idle compact turns currently using the runner. Not a
    * client turn and not _activeTurnCount (prompt-queue admission asserts that
    * one); lifecycle gates (recycle drain, model switch, preheat) read it. */

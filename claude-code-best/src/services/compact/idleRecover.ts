@@ -27,12 +27,15 @@ export interface IdleNativeFit {
 export function outerHistoryNeedsCompact(
   messages: readonly unknown[],
   fit?: IdleNativeFit,
+  /** OCV5-755: a pre-expiry op compacts from this size, not only near the limit. */
+  minInputTokens?: number,
 ): boolean {
+  const floor = Number.isSafeInteger(minInputTokens) && minInputTokens! > 0 ? minInputTokens! : undefined
   if (fit && Number.isSafeInteger(fit.inputTokens) && fit.inputTokens >= 0
     && Number.isSafeInteger(fit.inputBudget) && fit.inputBudget > 0) {
-    return fit.inputTokens >= fit.inputBudget
+    return fit.inputTokens >= Math.min(fit.inputBudget, floor ?? fit.inputBudget)
   }
-  return JSON.stringify(messages).length / 4 >= IDLE_OUTER_TOKEN_FLOOR
+  return JSON.stringify(messages).length / 4 >= Math.min(IDLE_OUTER_TOKEN_FLOOR, floor ?? IDLE_OUTER_TOKEN_FLOOR)
 }
 
 export function trustedIdleOpId(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -73,6 +76,8 @@ export interface IdleNativeFile {
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleFrozenAttachment[]
+  /** OCV5-755: written by the gateway for a pre-expiry op. */
+  minInputTokens?: number
 }
 
 export interface IdleArtifact {
@@ -425,7 +430,7 @@ export async function resumeIdleSummary(input: {
     file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
     writeIdleNativeFile(path, file)
   }
-  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages, input.fit)) {
+  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages, input.fit, file.minInputTokens)) {
     file = { ...file, applied: true }
     writeIdleNativeFile(path, file)
     return { path, file, freshSummary: false }

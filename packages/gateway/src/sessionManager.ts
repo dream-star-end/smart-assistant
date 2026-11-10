@@ -2020,8 +2020,9 @@ export class SessionManager {
   private async finishIdleUnderLock(session: AgentSession, source: {
     sessionId: string
     turnKey: string
-  }, recoveryDir: string = paths.home): Promise<void> {
-    return finishIdleUnderLockImpl.call(this as unknown as SessionSubmitHost, session, source, recoveryDir)
+  }, recoveryDir: string = paths.home,
+  mode: 'after_turn' | 'pre_expiry' = 'after_turn'): Promise<'deferred' | void> {
+    return finishIdleUnderLockImpl.call(this as unknown as SessionSubmitHost, session, source, recoveryDir, mode)
   }
 
   /**
