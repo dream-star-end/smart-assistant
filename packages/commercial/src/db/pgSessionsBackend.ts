@@ -1505,6 +1505,17 @@ export interface PgSessionsBackendOptions {
       pauseReason: string | null;
     },
   ) => void | Promise<void>;
+  /** Runs after a delete tx commits, without waiting: deletion never depends on what it frees. */
+  onClientSessionsDeleted?: (userId: string, sessionIds: readonly string[]) => void | Promise<void>;
+}
+
+function notifySessionsDeleted(
+  callback: PgSessionsBackendOptions["onClientSessionsDeleted"],
+  userId: string | undefined,
+  sessionIds: readonly string[],
+): void {
+  if (!callback || !userId || sessionIds.length === 0) return;
+  try { void Promise.resolve(callback(userId, sessionIds)).catch(() => {}); } catch { /* best-effort */ }
 }
 
 type GoalUsageChange = { userId: string; sessionId: string };
@@ -12115,7 +12126,7 @@ export function createPgSessionsBackend(
     // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
     async deleteClientSession(id: string, userId?: string): Promise<boolean> {
       const now = Date.now();
-      return withTx(pool, async (client): Promise<boolean> => {
+      const deleted = await withTx(pool, async (client): Promise<boolean> => {
         // updated_at 逻辑版本推进(软删也让并发 stale PUT 因版本落后被拒)。deleted_at 仍是删除权威。
         const sql = userId
           ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
@@ -12140,6 +12151,8 @@ export function createPgSessionsBackend(
         // raced with deletion and financial/audit history remains attributable.
         return true;
       });
+      if (deleted) notifySessionsDeleted(options.onClientSessionsDeleted, userId, [id]);
+      return deleted;
     },
 
     async renameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
@@ -12437,7 +12450,8 @@ export function createPgSessionsBackend(
       if ("ok" in parsed) return parsed;
       const { ids, action } = parsed;
       if (ids.length === 0) return { ok: true, updated: 0, skipped: 0, operationId: parsed.operationId };
-      return withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
+      const deletedIds: string[] = [];
+      const batch = await withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
         if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
           const staleIds: string[] = [];
           const liveRows = (
@@ -12506,6 +12520,7 @@ export function createPgSessionsBackend(
             await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
             await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
             await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+            deletedIds.push(id);
             updated++;
           }
         } else if (action === "archive") {
@@ -12585,6 +12600,8 @@ export function createPgSessionsBackend(
         }
         throw err;
       });
+      if (batch.ok && action === "delete") notifySessionsDeleted(options.onClientSessionsDeleted, userId, deletedIds);
+      return batch;
     },
 
     async markClientSessionRead(userId: string, sessionId: string): Promise<MarkClientSessionReadResult> {

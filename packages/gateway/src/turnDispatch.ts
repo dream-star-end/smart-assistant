@@ -17,6 +17,7 @@ import { messageSendAttempt, preStartStopKey } from './sessionManager.js'
 import { getTurnAuthority } from './modelAuthority.js'
 import { DISPATCH_AUTHORITY_FIELD, DispatchRejected, type DispatchTurnContext, type admitTurnDispatch, attachDispatchContext, buildTurnDispatchReceiptFrame } from './turnDispatchInbox.js'
 import type { Gateway } from './server.js'
+import { userSentTurnFrames } from './turnFrames.js'
 
 /** Bounds of Gateway._recentSettlements (FIFO evict + TTL); formerly Gateway statics. */
 const RECENT_SETTLEMENT_MAX = 1000
@@ -200,6 +201,7 @@ export function _buildStatusCallback(this: TurnDispatchHost, ws: WebSocket, sess
 /** OCV5-435 — a webchat turn counts as admitted from ws dispatch until it
  * settles, so a Stop that beats its engine run still binds to this turn. */
 export async function _dispatchAdmittedClientTurn(this: TurnDispatchHost, frame: InboundFrame): Promise<void> {
+  userSentTurnFrames.add(frame)
   const clientMessageId = (frame as { clientMessageId?: unknown }).clientMessageId
   if (
     frame.type !== 'inbound.message' ||

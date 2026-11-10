@@ -152,6 +152,8 @@ export interface RemoteLaneRuntimePort {
   release(containerDbId: string, dockerId?: string): Promise<void>
   /** The chat's live lane, created on first use. Rejects with REMOTE_LANE_UNAVAILABLE. */
   ensureLane(request: RemoteLaneRequest): Promise<RemoteExecutionBackend>
+  /** A deleted chat frees its idle lanes (any agent); a lane mid-turn stays reclaimable as before. */
+  releaseChat(uid: number, chatId: string): Promise<void>
 }
 
 interface RuntimeOptions {
@@ -390,6 +392,20 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       if (victim.lane === lane) victim.lane = undefined
       return this.hooks.place({ ...request, dockerId })
     }
+  }
+
+  async releaseChat(uid: number, chatId: string): Promise<void> {
+    if (String(uid) !== this.uid || !chatId) return
+    const suffix = `:webchat:dm:${chatId.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+    const owners = [...this.chats.entries()]
+      .filter(([key]) => key.startsWith('agent:') && key.endsWith(suffix) &&
+        key.split(':').length === 5).map(([, owner]) => owner)
+    await Promise.allSettled(owners.map(owner => this.serial(owner, async () => {
+      const lane = owner.lane
+      if (!lane || lane.stopping || !lane.relay.idle) return
+      await this.stopLane(lane)
+      if (owner.lane === lane) owner.lane = undefined
+    })))
   }
 
   private chat(sessionKey: string): ChatOwner {

@@ -288,6 +288,31 @@ test('a full pool reclaims a lane of the profile the chat needs, not just the lo
   }
 })
 
+test('a deleted chat frees its idle lanes at once; a mid-turn lane and other chats keep theirs', { skip: !root }, async () => {
+  const f = fixture()
+  try {
+    const handle = await f.container()
+    const released = (op: string) => f.states.some(([o, state]) => o === op && state === 'released')
+    const main = await f.lane()
+    const helper = await f.lane('agent:coding-assistant:webchat:dm:fixture_chat1')
+    const similar = await f.lane('agent:main:webchat:dm:fixture_chat10')
+    const busy = await f.lane('agent:main:webchat:dm:fixture_chat2')
+    const b = JSON.parse(readFileSync(join(handle.mountSource, busy.operationId, 'binding.json'), 'utf8')) as Cc5BridgeBinding
+    await cc5ControlRequest('/admit', admission(f.key, b), join(handle.mountSource, busy.operationId, 'relay.sock'))
+
+    await f.runtime.releaseChat(913, 'fixture_chat1')
+    assert.ok(!released(main.operationId), 'another user cannot free this user\'s lanes')
+    await f.runtime.releaseChat(912, 'fixture_chat1')
+    assert.ok(released(main.operationId) && released(helper.operationId), 'every agent lane of the deleted chat is freed')
+    assert.ok(!existsSync(join(handle.mountSource, main.operationId)), 'its container view is gone')
+    assert.ok(!released(similar.operationId), 'a chat whose id merely starts the same keeps its lane')
+    await f.runtime.releaseChat(912, 'fixture_chat2')
+    assert.ok(!released(busy.operationId), 'a lane serving a turn is not stopped under it')
+  } finally {
+    await f.cleanup()
+  }
+})
+
 test('a stopped lane or a model switch gets a new lane only after the old remote exit', { skip: !root }, async () => {
   const f = fixture()
   try {

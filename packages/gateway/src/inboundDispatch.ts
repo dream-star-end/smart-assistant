@@ -97,6 +97,7 @@ import {
 import { buildContextObservationFrame } from './contextObservationFrames.js'
 import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessionReuseSkipReason, readLiveRunnerModel, resolveLocalExecutionIfEnforced, localExecutionOverride, collectAvailableMcpToolNames, _buildSafeCodexRouteOverride, _buildSafeGrokRouteOverride, _buildSafeZcodeRouteOverride, _buildSafeAntigravityRouteOverride, makePeerKey, _buildTurnTraceContext, _inheritOutboundRouting, _buildEngineErrorFrame, _buildTurnStatusFrame, _earlyRejectErrorFrames, _buildContextRebuiltFrame, isUploadMimeAllowed, uploadExtForMime } from './server.js'
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
+import { sessionStartFailureCode, sessionStartFailureMessage, userSentTurnFrames } from './turnFrames.js'
 import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_FILE, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
@@ -736,6 +737,25 @@ export async function dispatchInbound(
       persistSnapshot: Boolean(chatWorkspace.projectId && chatWorkspace.bound),
     })
 
+    // A turn whose session cannot be created never started. Without its own error frames the
+    // failure only reached the socket as an unowned error, so the chat spun until its timeout.
+    const rejectSessionStart = (err: unknown): undefined => {
+      if (!userSentTurnFrames.has(frame)) throw err
+      const code = sessionStartFailureCode(err)
+      this.log.warn('session create failed; turn rejected', { sessionKey, code, traceId: turnTraceId }, err as Error)
+      const frames = _earlyRejectErrorFrames({
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        userId: activeUserId,
+        traceId: turnTraceId,
+        code: 'engine_error',
+        message: sessionStartFailureMessage(code),
+        legacyErrorText: `[error] ${code}`,
+      })
+      for (const f of frames) this.deliver(f, adapter)
+      return undefined
+    }
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: effectiveAgent,
@@ -779,7 +799,8 @@ export async function dispatchInbound(
           }
         : {}),
       ...(promptQueueExecutionFence ? { promptQueueExecutionFence } : {}),
-    })
+    }).catch(rejectSessionStart)
+    if (!session) return
     admitCmid =
       typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
         ? safeClientMessageId

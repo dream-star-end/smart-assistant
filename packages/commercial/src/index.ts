@@ -1434,6 +1434,9 @@ export async function registerCommercial(
   const goalUsageRefreshRef: {
     current: (userId: string, sessionId: string) => void | Promise<void>;
   } = { current: () => { /* GoalState service is assembled below. */ } };
+  const sessionsDeletedRef: {
+    current: (userId: string, sessionIds: readonly string[]) => void;
+  } = { current: () => { /* the remote lane runtime is assembled below */ } };
   // Phase B finalize decides (inside its tx) whether the master will retry the
   // terminal turn. The browser learns the verdict through this post-commit
   // sideband so it can keep showing 「正在重试中」 instead of flashing a red card
@@ -1491,6 +1494,7 @@ export async function registerCommercial(
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
         onRecoveryJobTerminal: (userId, sessionId, info) =>
           recordRecoveryJobTerminalFriction(userId, sessionId, info),
+        onClientSessionsDeleted: (userId, sessionIds) => sessionsDeletedRef.current(userId, sessionIds),
       });
       setClientSessionsBackend(pgSessionsBackend);
       systemSessionReadBackend = pgSessionsBackend;
@@ -3778,6 +3782,17 @@ export async function registerCommercial(
         }),
       } : {}),
     });
+    if (cc5) {
+      sessionsDeletedRef.current = (userId, sessionIds) => {
+        const uid = /^c:(\d+)$/.exec(userId)?.[1];
+        if (!uid) return;
+        for (const id of sessionIds) {
+          cc5.releaseChat(Number(uid), id).catch((error: unknown) =>
+            rootLogger.warn("[selfhost] remote lane release on delete failed", {
+              error: error instanceof Error ? error.message : String(error) }));
+        }
+      };
+    }
     v3Deps = {
       ...(cc5 ? { cc5 } : {}),
       docker: v3Docker,
