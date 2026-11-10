@@ -590,6 +590,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // gate ran. Shared branch forbids rewriting it. Deploy failed before it
   // became live. Freeze this tip only; later commits still go through the gate.
   "197735db77dfbf05280c526963ae04846544cabe",
+  // 2026-11-10 user chose to freeze the live selfhost history instead of renewing
+  // expiring waivers: rel-3a4aba64d is live and its commits (793c4f0b among them)
+  // cannot be rewritten. Only its ancestors are exempt; later commits still go
+  // through the trailer gate.
+  "3a4aba64d1e9a54a4915d40606c5977296bd59bb",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
