@@ -19,9 +19,22 @@ interface ContextFreezeSnapshot {
   localDate?: string
 }
 
-function snapshotPath(env: NodeJS.ProcessEnv = process.env): string | null {
-  const path = env.OPENCLAUDE_CONTEXT_FREEZE_FILE?.trim()
-  return path ? path : null
+let capturedPath: string | null | undefined
+
+/** Read once per process, then removed from process.env: tool subprocesses
+ *  (a nested `claude` in Bash) must not share this session's snapshot. */
+function snapshotPath(env?: NodeJS.ProcessEnv): string | null {
+  if (env) return env.OPENCLAUDE_CONTEXT_FREEZE_FILE?.trim() || null
+  if (capturedPath === undefined) {
+    capturedPath = process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE?.trim() || null
+    delete process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE
+  }
+  return capturedPath
+}
+
+/** Test seam: behave like a new process (re-read the env on next use). */
+export function __resetContextFreezeForTests(): void {
+  capturedPath = undefined
 }
 
 function isContextMap(value: unknown): value is ContextMap {
@@ -54,20 +67,20 @@ function writeSnapshot(path: string, patch: Partial<ContextFreezeSnapshot>): voi
   }
 }
 
-export function getFrozenSystemContext(env: NodeJS.ProcessEnv = process.env): ContextMap | null {
+export function getFrozenSystemContext(env?: NodeJS.ProcessEnv): ContextMap | null {
   const path = snapshotPath(env)
   if (!path) return null
   const ctx = readSnapshot(path)?.systemContext
   return isContextMap(ctx) ? ctx : null
 }
 
-export function recordSystemContext(ctx: ContextMap, env: NodeJS.ProcessEnv = process.env): void {
+export function recordSystemContext(ctx: ContextMap, env?: NodeJS.ProcessEnv): void {
   const path = snapshotPath(env)
   if (path) writeSnapshot(path, { systemContext: ctx })
 }
 
 export function getFrozenUserContext(
-  env: NodeJS.ProcessEnv = process.env,
+  env?: NodeJS.ProcessEnv,
 ): { ctx: ContextMap; localDate: string | null } | null {
   const path = snapshotPath(env)
   if (!path) return null
@@ -80,7 +93,7 @@ export function getFrozenUserContext(
 export function recordUserContext(
   ctx: ContextMap,
   localDate: string,
-  env: NodeJS.ProcessEnv = process.env,
+  env?: NodeJS.ProcessEnv,
 ): void {
   const path = snapshotPath(env)
   if (path) writeSnapshot(path, { userContext: ctx, localDate })

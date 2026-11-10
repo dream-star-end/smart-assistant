@@ -1899,7 +1899,8 @@ export class SubprocessRunner extends EventEmitter {
         sessionId: this.opts.sessionId,
         cwd: cwdDecision.cwd,
         persona: this.opts.persona,
-        identityProfile: this.opts.identityCompat?.assets?.profile,
+        // The fingerprint covers profile + persona/manual digests (sessionSubmit restarts on it).
+        identityProfile: this.opts.identityCompat?.fingerprint ?? this.opts.identityCompat?.assets?.profile,
         repoSnapshot,
         skillEval: [this.opts.skillEvalExclude ?? null, this.opts.skillEvalDraft ?? null],
         intelligentUi: promptResult.intelligentUi ?? false,

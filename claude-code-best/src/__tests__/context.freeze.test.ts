@@ -16,13 +16,23 @@ import { getLocalISODate } from '../constants/common'
 import { getSystemContext, getUserContext, setSystemPromptInjection } from '../context'
 import { getDateChangeAttachments } from '../utils/attachments'
 import { clearMemoryFileCaches } from '../utils/claudemd'
+import { __resetContextFreezeForTests } from '../utils/openclaudeContextFreeze'
 import { cleanupTempDir, createTempDir, writeTempFile } from '../../tests/mocks/file-system'
 
 let tempDir = ''
 let snapshot = ''
+let freezeOn = false
+
+/** Gateway hands this session's snapshot to the next process. */
+function useSnapshot(): void {
+  freezeOn = true
+  process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE = snapshot
+}
 
 /** What a fresh process does: nothing memoized, nothing in bootstrap state. */
 function respawn(): void {
+  __resetContextFreezeForTests()
+  if (freezeOn) process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE = snapshot
   resetStateForTests()
   setOriginalCwd(tempDir)
   setProjectRoot(tempDir)
@@ -32,6 +42,7 @@ function respawn(): void {
 }
 
 beforeEach(async () => {
+  freezeOn = false
   tempDir = await createTempDir('context-freeze-')
   snapshot = join(tempDir, 'session.ccb.json')
   setSystemPromptInjection(null)
@@ -39,6 +50,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  freezeOn = false
   delete process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE
   respawn()
   if (tempDir) await cleanupTempDir(tempDir)
@@ -56,7 +68,7 @@ describe('OpenClaude context freeze', () => {
   })
 
   test('a respawned process reuses the snapshot even after CLAUDE.md changed', async () => {
-    process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE = snapshot
+    useSnapshot()
     await writeTempFile(tempDir, 'CLAUDE.md', 'rules v1')
     const first = await getUserContext()
     await writeTempFile(tempDir, 'CLAUDE.md', 'rules v2')
@@ -67,14 +79,14 @@ describe('OpenClaude context freeze', () => {
   })
 
   test('the frozen git status survives a respawn', async () => {
-    process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE = snapshot
+    useSnapshot()
     writeFileSync(snapshot, JSON.stringify({ v: 1, systemContext: { gitStatus: 'Recent commits:\nabc autosave 1' } }))
     respawn()
     expect(await getSystemContext()).toEqual({ gitStatus: 'Recent commits:\nabc autosave 1' })
   })
 
   test('the first process records its context for the next one', async () => {
-    process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE = snapshot
+    useSnapshot()
     await writeTempFile(tempDir, 'CLAUDE.md', 'rules v1')
     const ctx = await getUserContext()
     await getSystemContext()
@@ -86,7 +98,7 @@ describe('OpenClaude context freeze', () => {
   })
 
   test('a frozen older date keeps the prefix and announces today at the tail', async () => {
-    process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE = snapshot
+    useSnapshot()
     writeFileSync(
       snapshot,
       JSON.stringify({
@@ -103,11 +115,22 @@ describe('OpenClaude context freeze', () => {
   })
 
   test('an unreadable snapshot falls back to live values', async () => {
-    process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE = snapshot
+    useSnapshot()
     writeFileSync(snapshot, 'not json')
     await writeTempFile(tempDir, 'CLAUDE.md', 'live rules')
     respawn()
     const ctx = await getUserContext()
     expect(ctx.claudeMd).toContain('live rules')
+  })
+
+  test('the snapshot path is not inherited by tool subprocesses', async () => {
+    useSnapshot()
+    respawn()
+    await getSystemContext()
+    expect(process.env.OPENCLAUDE_CONTEXT_FREEZE_FILE).toBeUndefined()
+    // ...yet this process keeps using it after its caches are cleared.
+    writeFileSync(snapshot, JSON.stringify({ v: 1, systemContext: { gitStatus: 'kept' } }))
+    getSystemContext.cache.clear?.()
+    expect(await getSystemContext()).toEqual({ gitStatus: 'kept' })
   })
 })

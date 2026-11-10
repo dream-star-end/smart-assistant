@@ -112,6 +112,30 @@ test('activity touch keeps the window open', () => {
   assert.equal(b.chosen.content, 'old')
 })
 
+test('shadow → enforce: the first enforce spawn adopts the live prompt, not the shadow-kept one', () => {
+  const sessionKey = key()
+  freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'shadow', inputsKey: 'k', fresh: build('p1', {}) })
+  // shadow kept p1 but the process actually ran p2
+  freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'shadow', inputsKey: 'k', fresh: build('p2', {}) })
+  const a = freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'enforce', inputsKey: 'k', fresh: build('p3', {}) })
+  assert.equal(a.decision, 'fresh_mode')
+  assert.equal(a.chosen.content, 'p3')
+  const b = freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'enforce', inputsKey: 'k', fresh: build('p4', {}) })
+  assert.equal(b.decision, 'reuse')
+  assert.equal(b.chosen.content, 'p3')
+})
+
+test('clearFrozenPrompt: a reset conversation starts fresh', () => {
+  const sessionKey = key()
+  freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'enforce', inputsKey: 'k', fresh: build('old', {}) })
+  writeFileSync(freeze.ccbContextFreezePath(HOME, sessionKey), '{"v":1}')
+  freeze.clearFrozenPrompt(HOME, sessionKey)
+  assert.equal(existsSync(freeze.promptFreezePath(HOME, sessionKey)), false)
+  assert.equal(existsSync(freeze.ccbContextFreezePath(HOME, sessionKey)), false)
+  const b = freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'enforce', inputsKey: 'k', fresh: build('new', {}) })
+  assert.equal(b.decision, 'fresh_first')
+})
+
 test('a tampered record is ignored', () => {
   const sessionKey = key()
   freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'enforce', inputsKey: 'k', fresh: build('old', {}) })

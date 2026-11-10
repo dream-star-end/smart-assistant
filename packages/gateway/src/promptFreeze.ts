@@ -119,6 +119,9 @@ export interface FrozenPromptRecord extends FrozenPromptBuild {
   sessionKey: string
   inputsKey: string
   builtAt: number
+  /** Mode that wrote the record. A shadow record never ran its content when
+   *  it was kept on reuse, so enforce does not adopt it as a baseline. */
+  mode?: PromptFreezeMode
 }
 
 function recordName(sessionKey: string): string {
@@ -212,7 +215,18 @@ export function touchFrozenPrompt(home: string, sessionKey: string, now = Date.n
   }
 }
 
-export type PromptFreezeDecision = 'reuse' | 'fresh_first' | 'fresh_inputs' | 'fresh_ttl'
+/** A reset or replaced conversation starts from live values. */
+export function clearFrozenPrompt(home: string, sessionKey: string): void {
+  for (const path of [promptFreezePath(home, sessionKey), ccbContextFreezePath(home, sessionKey)]) {
+    try {
+      rmSync(path, { force: true })
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+export type PromptFreezeDecision = 'reuse' | 'fresh_first' | 'fresh_inputs' | 'fresh_ttl' | 'fresh_mode'
 
 export function decidePromptFreeze(input: {
   record: FrozenPromptRecord | undefined
@@ -220,9 +234,11 @@ export function decidePromptFreeze(input: {
   inputsKey: string
   now: number
   ttlMs?: number
+  mode?: PromptFreezeMode
 }): PromptFreezeDecision {
   if (!input.record) return 'fresh_first'
   if (input.record.inputsKey !== input.inputsKey) return 'fresh_inputs'
+  if (input.mode === 'enforce' && input.record.mode !== 'enforce') return 'fresh_mode'
   if (input.now - input.lastUsedAt > (input.ttlMs ?? PROMPT_FREEZE_TTL_MS)) return 'fresh_ttl'
   return 'reuse'
 }
@@ -283,6 +299,7 @@ export function applyPromptFreeze(input: {
     lastUsedAt: stored?.lastUsedAt ?? 0,
     inputsKey: input.inputsKey,
     now,
+    mode: input.mode,
   })
   const sameContent = stored?.record.contentSha256 === input.fresh.contentSha256
   const changedSlots = stored ? changedPromptSlots(stored.record.applied, input.fresh.applied) : []
@@ -290,7 +307,14 @@ export function applyPromptFreeze(input: {
   if (decision !== 'reuse') {
     writeFrozenPrompt(
       input.home,
-      { v: 1, sessionKey: input.sessionKey, inputsKey: input.inputsKey, builtAt: now, ...input.fresh },
+      {
+        v: 1,
+        sessionKey: input.sessionKey,
+        inputsKey: input.inputsKey,
+        builtAt: now,
+        mode: input.mode,
+        ...input.fresh,
+      },
       now,
     )
     // A fresh platform prompt starts a fresh CCB snapshot too.

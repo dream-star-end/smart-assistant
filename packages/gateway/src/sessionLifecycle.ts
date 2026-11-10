@@ -20,6 +20,7 @@ import {
   IdleCompactRejected,
 } from './boxIdleCompact.js'
 import { decideEngineCwd } from './engineCwd.js'
+import { clearFrozenPrompt } from './promptFreeze.js'
 import { type ExecutionTarget, RemoteTargetUnavailableError } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { log } from './sessionManagerLog.js'
@@ -495,6 +496,8 @@ export async function destroySession(
     // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目让后续 recycle 找到死 session)。
     this._sessionIdToKey.delete(s.peerId)
   }
+  // OCV5-755: a destroyed conversation must not inherit the old prompt snapshot.
+  clearFrozenPrompt(paths.home, sessionKey)
   // Always clear resume-map (handles both live and evicted sessions)
   if (this._resumeMap.has(sessionKey)) {
     this._resumeMap.delete(sessionKey)
@@ -618,6 +621,7 @@ export async function applyIdleResetIfRequested(
   }
   if (session.runner.isRunning) await session.runner.shutdown().catch(() => {})
   const sessionKey = session.sessionKey
+  clearFrozenPrompt(paths.home, sessionKey)
   this._resumeMap.delete(sessionKey)
   this._resumeMapTimestamps.delete(sessionKey)
   this._resumeMapProvider.delete(sessionKey)
