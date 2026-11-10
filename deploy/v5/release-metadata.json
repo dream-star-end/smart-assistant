@@ -201,7 +201,8 @@
     "0334_users_registration_ip",
     "0335_codex_remote_native",
     "0336_commercial_muse_durable",
-    "0337_remote_engine_concurrency"
+    "0337_remote_engine_concurrency",
+    "0338_antigravity_gemini_4_carbon"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
