@@ -73,3 +73,17 @@ test('a chat pre-warmed after the restart still resumes on its remote Codex lane
   assert.equal(session.runner.executionBackend, executionBackend)
   assert.equal(session.runner.nativeSessionId, thread)
 })
+
+test('a chat whose saved history is local, not a Codex thread, still needs a new chat on the remote lane', async () => {
+  const sm = new SessionManager(config)
+  const m = sm as any
+  m._saveResumeMap = () => {}
+  const peer = 'codex_restore_3', sessionKey = `agent:main:webchat:dm:${peer}`
+  m._resumeMap.set(sessionKey, randomUUID()); m._resumeMapProvider.set(sessionKey, 'ccb')
+  const executionBackend = { kind: 'codex-app-server-v1' as const, version: 1 as const, sessionKey,
+    operationId: randomUUID(), generation: '1', profileId: 'default', authEpoch: 'epoch-1' }
+  await assert.rejects(sm.getOrCreate({ sessionKey, peerId: peer, channel: 'webchat',
+    agent: { id: 'main', cwd: home }, model: MODEL, workspaceCwd: home,
+    executionAuthority: { engine: 'codex', canonicalModel: MODEL, source: 'bridge_signed', executionBackend } } as never),
+  /CC5_BACKEND_REQUIRES_NEW_SESSION/)
+})

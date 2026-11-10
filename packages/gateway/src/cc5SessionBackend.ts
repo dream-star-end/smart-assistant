@@ -52,6 +52,7 @@ export function cc5SessionBackend(input: {
 export async function assertFreshCc5Session(input: {
   current?: { turns: number; runner: { nativeSessionId: string | null } }
   storedResumeId?: string
+  storedResumeProvider?: string
   executionBackend?: RemoteExecutionBackend
   sessionIds: string[]
   hasPersistedTurnActivity: (ids: string[]) => Promise<boolean>
@@ -65,12 +66,16 @@ export async function assertFreshCc5Session(input: {
   }
   // A codex lane resume names a native thread, not a cc5 resume id. The relay only accepts the
   // thread its own manifest binds, so a foreign thread id fails closed there, not here. An empty
-  // runner pre-warmed after a restart has run nothing, so it does not count as history.
+  // runner pre-warmed after a restart has run nothing and holds no native session, so it does
+  // not count as history. Any other stored or persisted history still requires a new chat.
   if (
     !input.current?.turns &&
+    !input.current?.runner.nativeSessionId &&
     input.executionBackend &&
     !isCc5ExecutionBackend(input.executionBackend) &&
-    !isCc5ResumeId(input.storedResumeId)
+    input.storedResumeId &&
+    !isCc5ResumeId(input.storedResumeId) &&
+    input.storedResumeProvider === 'codex'
   ) {
     return
   }

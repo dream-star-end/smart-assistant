@@ -1579,6 +1579,7 @@ export async function _getOrCreateExclusive(
   if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
   const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
     current, storedResumeId: this._resumeMap.get(opts.sessionKey),
+    storedResumeProvider: normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)),
     executionBackend,
     sessionIds: [opts.sessionKey, ...(opts.peerId ? [opts.peerId] : [])], hasPersistedTurnActivity,
   })
