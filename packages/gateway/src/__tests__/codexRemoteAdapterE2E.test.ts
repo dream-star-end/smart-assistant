@@ -740,6 +740,13 @@ test('a withdrawn nickname is gone from the instructions the node resumes the wa
   const started = nodeFrames('thread/start')
   assert.equal(started.length, 1)
   assert.ok(String(started[0].params?.baseInstructions).includes(nickname), 'the authorized nickname is in the first instructions')
+  // Codex injects <environment_context> for the node (its cwd, UTC, a read-only sandbox); the model
+  // must be told to disregard it rather than narrate it to the user as its own limits.
+  const firstInstructions = String(started[0].params?.baseInstructions)
+  assert.ok(firstInstructions.includes('<environment_context>') && firstInstructions.includes('ignore them'),
+    'the node is told to ignore its own injected environment block')
+  assert.ok(firstInstructions.includes("the user's normal read/write"), 'tools are described with their real access')
+  assert.ok(!firstInstructions.includes('model host'), 'no host/container split for the model to repeat')
   const firstTotal: CodexNativeTokens = { ...zeroNativeTokens(), inputTokens: 200, outputTokens: 20 }
   h.emit({ method: 'thread/tokenUsage/updated', params: h.tokenUsage(TURNS[0]!, firstTotal, firstTotal) })
   h.emit({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: TURNS[0], status: 'completed' } } })
