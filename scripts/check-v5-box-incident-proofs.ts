@@ -2131,6 +2131,16 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
       status: string; revision?: string; compactRequired?: boolean };
     if (proof.status !== "terminal" || proof.compactRequired !== true || !proof.revision) fail(`IDLE_SOURCE_PROOF_${proof.status}`);
     const revision = proof.revision;
+    // OCV5-755: by default the next message no longer dispatches the idle turn; it is deferred to the
+    // pre-expiry timer. The message passes at once, nothing is dispatched and no candidate is left.
+    const deferredKey = "idle-deferred";
+    api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: deferredKey, sessionId: who.sessionId, turnKey: sourceTurn });
+    if (await submit(deferredKey) !== "admitted") fail("IDLE_DEFERRED_BLOCKS_NEXT_MESSAGE");
+    if (counters.submits !== 0 || api.idle.readIdleCandidate(dir, deferredKey) !== undefined
+      || api.idle.readIdleOp(dir, deferredKey, revision) !== undefined) fail("IDLE_DEFERRED_DISPATCHED");
+    // The incident below drives the dispatch and settlement path itself. Production reaches it from the
+    // pre-expiry timer; here the immediate timing is pinned so the next message is what dispatches.
+    process.env.OC_BOX_IDLE_PRE_EXPIRY_MS = "off";
     const key = "idle-no-summary";
     api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: key, sessionId: who.sessionId, turnKey: sourceTurn });
     const before = Date.now();
@@ -2186,6 +2196,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
       || api.idle.readPendingIdle(dir, lost) !== undefined || counters.submits !== submits) fail("IDLE_LOST_SOURCE_OP");
     return "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released";
   } finally {
+    delete process.env.OC_BOX_IDLE_PRE_EXPIRY_MS;
     api.idle.setRuntimeIncarnationStartForTest(undefined);
     await routes.close();
     rmSync(root, { recursive: true, force: true });
