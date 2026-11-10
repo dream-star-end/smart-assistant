@@ -860,9 +860,9 @@ export async function autoResumeFromHello(
             defaultModel: this.deps.config.defaults.model,
           })
           // As sessionPreheat: a Codex pre-warm without its route would check the chat's
-          // thread against the local rollout store and drop a remote lane's thread id.
-          if (preExec?.engine === 'codex') continue
-          session = await this.sessions.getOrCreate({
+          // thread against the local rollout store and drop a remote lane's thread id. The
+          // socket is still registered and its replay cursor still served below.
+          if (preExec?.engine !== 'codex') session = await this.sessions.getOrCreate({
             sessionKey,
             agent,
             ...localExecutionOverride(preExec),
