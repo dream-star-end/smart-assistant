@@ -36,6 +36,7 @@ class FixtureRunner extends MinimalPrivacyRunner {
   interrupt() { return false }
 }
 registerEngine('codex', (opts) => { created.push(opts); return new FixtureRunner(opts) as never })
+registerEngine('ccb', (opts) => new FixtureRunner(opts) as never)
 const config = { version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
   auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: '' }, defaults: { model: MODEL },
 } as unknown as OpenClaudeConfig
@@ -52,5 +53,23 @@ test('a remote Codex chat rebuilt after a restart resumes its saved thread inste
     agent: { id: 'main', cwd: home }, model: MODEL, workspaceCwd: home,
     executionAuthority: { engine: 'codex', canonicalModel: MODEL, source: 'bridge_signed', executionBackend } } as never)
   assert.equal(created.at(-1)?.resumeSessionId, thread)
+  assert.equal(session.runner.nativeSessionId, thread)
+})
+
+test('a chat pre-warmed after the restart still resumes on its remote Codex lane', async () => {
+  const sm = new SessionManager(config)
+  const m = sm as any
+  m._saveResumeMap = () => {}
+  const peer = 'codex_restore_2', sessionKey = `agent:main:webchat:dm:${peer}`, thread = randomUUID()
+  m._resumeMap.set(sessionKey, thread); m._resumeMapProvider.set(sessionKey, 'codex')
+  const base = { sessionKey, peerId: peer, channel: 'webchat', agent: { id: 'main', cwd: home }, model: MODEL, workspaceCwd: home }
+  // Auto-resume pre-warms every chat on the agent's default model (CCB) before its first turn arrives.
+  await sm.getOrCreate({ ...base, model: 'box-claude-opus-5-5',
+    executionAuthority: { engine: 'ccb', canonicalModel: 'box-claude-opus-5-5', source: 'local_catalog' } } as never)
+  const executionBackend = { kind: 'codex-app-server-v1' as const, version: 1 as const, sessionKey,
+    operationId: randomUUID(), generation: '3', profileId: 'default', authEpoch: 'epoch-1' }
+  const session = await sm.getOrCreate({ ...base,
+    executionAuthority: { engine: 'codex', canonicalModel: MODEL, source: 'bridge_signed', executionBackend } } as never)
+  assert.equal(session.runner.executionBackend, executionBackend)
   assert.equal(session.runner.nativeSessionId, thread)
 })

@@ -64,9 +64,10 @@ export async function assertFreshCc5Session(input: {
     return
   }
   // A codex lane resume names a native thread, not a cc5 resume id. The relay only accepts the
-  // thread its own manifest binds, so a foreign thread id fails closed there, not here.
+  // thread its own manifest binds, so a foreign thread id fails closed there, not here. An empty
+  // runner pre-warmed after a restart has run nothing, so it does not count as history.
   if (
-    !input.current &&
+    !input.current?.turns &&
     input.executionBackend &&
     !isCc5ExecutionBackend(input.executionBackend) &&
     !isCc5ResumeId(input.storedResumeId)
