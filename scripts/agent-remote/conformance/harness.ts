@@ -52,8 +52,8 @@ import {
   remotePoolBackendOf,
   remotePoolControlRequest,
   type LaneToolHost,
-  type RemoteDriverPlacementResult,
   type RemotePoolFinancePort,
+  type RemotePoolFinanceTurn,
   type RemotePoolLaneSpec,
 } from '../../../packages/gateway/src/remotePool/index.js'
 import '../../../packages/gateway/src/remotePool/registerRemoteDriver.js'
@@ -66,6 +66,7 @@ import {
   recordDriverProbeSnapshot,
   recordRemoteDriverLaneState,
   type PlaceRemoteDriverLaneOptions,
+  type RemoteDriverPlacementResult,
   type RemoteDriverRegistryEntry,
 } from '../../../packages/commercial/src/account-pool/remotePool/index.js'
 import { remoteNodeExecKeyDir } from '../../../packages/commercial/src/account-pool/remoteBrainPool.js'
@@ -145,13 +146,23 @@ export interface OpenLaneOptions {
   readonly disallowedTools?: readonly string[]
   readonly observationOptions?: {
     readonly testFaultBypassObservation?: boolean
+    readonly testFaultAllowDuplicateClaim?: boolean
     readonly allowTestBypassInTmp?: boolean
     readonly authorizeTimeoutMs?: number
   }
   readonly containerObservationOptions?: {
     readonly testFaultBypassObservation?: boolean
+    readonly testFaultAllowDuplicateClaim?: boolean
     readonly allowTestBypassInTmp?: boolean
   }
+  readonly testFaultSandboxMode?: 'account_mutex' | 'shared_node_cap_5'
+  readonly faultTransformTerminalReceipt?: (
+    receipt: RemoteReceiptV4,
+  ) => Promise<RemoteReceiptV4> | RemoteReceiptV4
+  readonly faultOnAfterTerminalSettled?: (
+    innerTurn: RemotePoolFinanceTurn,
+    settledReceipt: RemoteReceiptV4,
+  ) => Promise<void>
   readonly callInterceptor?: (
     path: string,
     body: Readonly<Record<string, unknown>>,
@@ -176,6 +187,7 @@ export interface SubmittedTurnHandle {
   readonly authorityEnvelope: string
   readonly leaseEnvelope: string
   readonly events: EngineEvent[]
+  readonly getFirstContentEventAt: () => number | null
   readonly run: ReturnType<RemoteEngineAdapter['submitTurn']>
 }
 
@@ -225,6 +237,8 @@ export interface ConformanceHarness {
   readonly peerDriverId: string
   readonly peerProfileId: string
   readonly peerCanonicalModel: string
+  readonly faultCanonicalModel: string
+  readonly faultPeerCanonicalModel: string
   readonly canonicalModel: string
   readonly upstreamModel: string
   readonly expectedPolicySha256: string
@@ -469,7 +483,7 @@ export async function createConformanceHarness(
           tmplPool.on('error', () => {})
           setPoolOverride(tmplPool)
           await runMigrations()
-          await tmplPool.end()
+          await closePool()
         }
         await admin.query(
           'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()',
@@ -799,8 +813,10 @@ export async function createConformanceHarness(
   await verifySeededProfile(profileId, probed.snapshot, expectedPolicySha256)
 
   // Secondary isolated fault-injection sandbox profile when running in `live-node` mode.
-  const faultCanonicalModel = `${canonicalModel.replace(/-remote$/, '')}-faultsbx-remote`
+  const faultCanonicalModel =
+    mode === 'live-node' ? `${canonicalModel.replace(/-remote$/, '')}-faultsbx-remote` : canonicalModel
   const faultUpstreamModel = sandboxInitPrep.upstreamModel
+  let faultNodeId: string | undefined
   if (mode === 'live-node') {
     const sbxProbeRoot = join(sandbox, 'run-faultsbx-probe')
     const sbxBootstrap: RemotePoolLaneSpec = {
@@ -820,7 +836,7 @@ export async function createConformanceHarness(
       sandboxInitPrep.probeContext,
       sbxProbeRoot,
     )
-    const faultNodeId = (
+    faultNodeId = (
       await pool.query(
         `INSERT INTO remote_agent_nodes
            (label, ssh_host, ssh_user, host_key_fp, key_id, controller_sha256, status)
@@ -923,6 +939,38 @@ export async function createConformanceHarness(
   )
   await verifySeededProfile(peerProfileId, peerProbed.snapshot, peerPolicySha)
 
+  const faultPeerCanonicalModel =
+    mode === 'live-node'
+      ? `${peerPrep.canonicalModel.replace(/-remote$/, '')}-faultsbx-remote`
+      : peerPrep.canonicalModel
+  if (mode === 'live-node' && faultNodeId) {
+    const faultPeerProfileId = (
+      await pool.query(
+        `INSERT INTO remote_agent_profiles
+           (node_id, engine, driver_id, engine_id, profile_name, account_fingerprint, runner_mode, auth_epoch, max_concurrent_lanes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 5)
+         RETURNING id::text`,
+        [
+          faultNodeId,
+          peerLegacyEngine,
+          peerReg.driverId,
+          peerReg.engineId,
+          `peer-${peerDriverId}-fault-sbx`,
+          `fp-fault-peer-${peerDriverId}`,
+          peerReg.runnerMode,
+          `epoch-fault-peer-${peerDriverId}`,
+        ],
+      )
+    ).rows[0].id
+    await pool.query(
+      `INSERT INTO remote_model_offers
+         (profile_id, upstream_model_id, canonical_model_id, base_display_name)
+       VALUES ($1, $2, $3, $4)`,
+      [faultPeerProfileId, peerPrep.upstreamModel, faultPeerCanonicalModel, peerPrep.upstreamModel],
+    )
+    await verifySeededProfile(faultPeerProfileId, peerProbed.snapshot, peerPolicySha)
+  }
+
   // Keyring & model catalog for real `createRemoteDriverTurnFinance`.
   const { privateKey, publicKey } = generateKeyPairSync('ed25519')
   const keyId = 'mak1_conf_v4_0001'
@@ -1011,6 +1059,28 @@ export async function createConformanceHarness(
       sortOrder: 30,
       defaultEffort: 'medium',
     })
+    catalogEntries.push({
+      entryId: 504,
+      modelId: faultPeerCanonicalModel,
+      engine: peerReg.authorityEngine as any,
+      providerId: peerReg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      placement: 'remote_pool',
+      upstreamModelId: peerPrep.upstreamModel,
+      contextWindow: 200_000,
+      capabilityProfile: baseCap,
+      capabilitySchemaVersion: 1,
+      state: 'active',
+      lockVersion: 0,
+    })
+    pricingMap.set(faultPeerCanonicalModel, {
+      modelId: faultPeerCanonicalModel,
+      displayName: faultPeerCanonicalModel,
+      ...PRICING_RATES,
+      multiplier: '1.000',
+      visibility: 'public',
+      sortOrder: 40,
+      defaultEffort: 'medium',
+    })
   }
   const catalog = new ModelCatalogSnapshot({
     entries: catalogEntries,
@@ -1021,6 +1091,12 @@ export async function createConformanceHarness(
 
   const silentLog = createLogger({ out: () => {} })
 
+  const adminControlSocketPath = join(sandbox, 'admin-ssh-%C')
+  const buildAdminSshCmd = (rawCmd: string): string =>
+    rawCmd.startsWith('ssh ')
+      ? `ssh -o ControlMaster=auto -o ControlPersist=900 -o ControlPath=${JSON.stringify(adminControlSocketPath)} ${rawCmd.slice(4)}`
+      : rawCmd
+
   const runRemoteFsOp = async (payload: Record<string, unknown>): Promise<any> => {
     assert.ok(liveCfg, 'runRemoteFsOp requires liveCfg')
     const runAs = liveCfg.adminRunAsUserPrefix ?? `runuser -u ${sshUser} --`
@@ -1028,14 +1104,18 @@ export async function createConformanceHarness(
     const remoteCmd = `${runAs} /usr/bin/python3 -I -B -c "import base64; exec(base64.b64decode('${pyB64}').decode('utf-8'))"`
     const childPromise = execFileAsync(
       '/bin/bash',
-      ['-c', `${liveCfg.adminSshCmd} ${JSON.stringify(remoteCmd)}`],
-      { maxBuffer: 8 * 1024 * 1024, timeout: 25_000 },
+      ['-c', `${buildAdminSshCmd(liveCfg.adminSshCmd)} ${JSON.stringify(remoteCmd)}`],
+      { maxBuffer: 8 * 1024 * 1024, timeout: 30_000 },
     )
     const child = (childPromise as any).child as import('node:child_process').ChildProcess | undefined
     child?.stdin?.end(`${JSON.stringify(payload)}\n`)
     const { stdout } = await childPromise
     const lastLine = stdout.trim().split('\n').at(-1) ?? '{}'
     return JSON.parse(lastLine)
+  }
+
+  if (liveCfg) {
+    await runRemoteFsOp({ op: 'exists', root: `/home/${sshUser}`, rel: '' })
   }
 
   const taskFileExists = async (taskRoot: string, relPath = ''): Promise<boolean> => {
@@ -1201,6 +1281,7 @@ export async function createConformanceHarness(
     extra: Partial<PlaceRemoteDriverLaneOptions> = {},
   ): PlaceRemoteDriverLaneOptions => ({
     pool,
+    maxProbeAgeMs: 30 * 60_000,
     ...(mode === 'sandbox' ? { registryPath: opts.registryPath, localSandboxDir: sandbox } : {}),
     ...extra,
   })
@@ -1235,6 +1316,13 @@ export async function createConformanceHarness(
       laneOpts.sessionKey ??
       `agent:main:webchat:dm:cf_${driverId}_${useFaultSandbox ? 'sbx' : 'live'}_${idx}_${randomUUID().slice(0, 6)}`
 
+    if (
+      laneOpts.testFaultSandboxMode ||
+      laneOpts.faultTransformTerminalReceipt ||
+      laneOpts.faultOnAfterTerminalSettled
+    ) {
+      assert.equal(useFaultSandbox, true, 'Fault injection lane options require useFaultSandbox')
+    }
     const placed = await placeRemoteDriverLane(
       {
         uid,
@@ -1248,14 +1336,22 @@ export async function createConformanceHarness(
       useFaultSandbox
         ? {
             pool,
+            maxProbeAgeMs: 30 * 60_000,
             registryPath: opts.registryPath,
             localSandboxDir: sandbox,
             ...(laneOpts.maxSliceMemoryBytes !== undefined
               ? { maxSliceMemoryBytes: laneOpts.maxSliceMemoryBytes }
               : {}),
+            ...(laneOpts.testFaultSandboxMode
+              ? {
+                  allowTestFaultsInSandbox: true,
+                  testFaultSandboxMode: laneOpts.testFaultSandboxMode,
+                }
+              : {}),
           }
         : {
             pool,
+            maxProbeAgeMs: 30 * 60_000,
             ...(laneOpts.maxSliceMemoryBytes !== undefined
               ? { maxSliceMemoryBytes: laneOpts.maxSliceMemoryBytes }
               : {}),
@@ -1341,8 +1437,15 @@ export async function createConformanceHarness(
           bindNativeThread: (sid, newly) => innerTurn.bindNativeThread(sid, newly),
           abandonUndispatched: (f) => innerTurn.abandonUndispatched(f),
           terminal: async (receipt) => {
-            settledReceipts.push(receipt)
-            return await innerTurn.terminal(receipt)
+            const effectiveReceipt = laneOpts.faultTransformTerminalReceipt
+              ? await laneOpts.faultTransformTerminalReceipt(receipt)
+              : receipt
+            settledReceipts.push(effectiveReceipt)
+            const out = await innerTurn.terminal(effectiveReceipt)
+            if (laneOpts.faultOnAfterTerminalSettled) {
+              await laneOpts.faultOnAfterTerminalSettled(innerTurn, effectiveReceipt)
+            }
+            return out
           },
           stop: async (stopInfo) => {
             stopNotifications.push({ ...stopInfo })
@@ -1360,7 +1463,7 @@ export async function createConformanceHarness(
       },
     }
 
-    const defaultAuthTimeoutMs = useFaultSandbox ? 350 : 15_000
+    const defaultAuthTimeoutMs = 15_000
     const journalDir = join(
       evidenceSpoolRoot,
       placed.binding.operationId,
@@ -1456,12 +1559,21 @@ export async function createConformanceHarness(
             await awaitBarrierIfAny()
             const argsObj =
               rawArgs && typeof rawArgs === 'object' ? (rawArgs as Record<string, unknown>) : {}
+            const prevSameCallCount = executedCalls.filter(
+              (c) => c.toolUseId === identity.toolUseId,
+            ).length
             executedCalls.push({
               name,
               args: structuredClone(argsObj),
               toolUseId: identity.toolUseId,
             })
-            return await realHost.execute(name, rawArgs, identity)
+            const effectiveIdentity =
+              useFaultSandbox &&
+              laneOpts.observationOptions?.testFaultAllowDuplicateClaim &&
+              prevSameCallCount > 0
+                ? { ...identity, toolUseId: `${identity.toolUseId}_dup${prevSameCallCount}` }
+                : identity
+            return await realHost.execute(name, rawArgs, effectiveIdentity)
           },
         }
       }
@@ -1474,7 +1586,8 @@ export async function createConformanceHarness(
         tools: async () => {
           inFlightOps += 1
           try {
-            return await pooledHost.tools()
+            const all = await pooledHost.tools()
+            return laneOpts.writeOnlyTools ? all.filter((t) => t.name === 'Write') : all
           } catch (err) {
             healthy = false
             throw err
@@ -1642,6 +1755,7 @@ export async function createConformanceHarness(
       )
 
       const events: EngineEvent[] = []
+      let firstContentEventAt: number | null = null
       const params: TurnParams = {
         input: prompt,
         requestId,
@@ -1659,7 +1773,15 @@ export async function createConformanceHarness(
             supportedEfforts: ['low', 'medium', 'high'],
           },
         },
-        onEvent: (ev) => events.push(ev),
+        onEvent: (ev) => {
+          if (
+            firstContentEventAt === null &&
+            (ev.kind === 'block' || ev.kind === 'tool_use_detected')
+          ) {
+            firstContentEventAt = performance.now()
+          }
+          events.push(ev)
+        },
         sessionTotals,
         toolUseIdToName,
       }
@@ -1672,6 +1794,7 @@ export async function createConformanceHarness(
         authorityEnvelope,
         leaseEnvelope,
         events,
+        getFirstContentEventAt: () => firstContentEventAt,
         run,
       }
     }
@@ -1681,7 +1804,7 @@ export async function createConformanceHarness(
         ? readdirSync(journalDir).filter((f) => f.endsWith('-fence.json'))
         : []
       const details = files.map((f) => readFileSync(join(journalDir, f), 'utf8')).join(';')
-      return `relayFence=${relay.fenceReason ?? 'none'} adapterFence=${adapter.fenceError?.message ?? 'none'} adapterErrors=${adapterErrors.join('|') || 'none'} journal=${details}`
+      return `relayFence=${relay.fenceReason ?? 'none'} adapterErrors=${adapterErrors.join('|') || 'none'} journal=${details}`
     }
 
     const handle: SessionLaneHandle = {
@@ -1736,9 +1859,8 @@ export async function createConformanceHarness(
       return `SENTINEL_WRITE:${filePath}:${content}${dupConcurrent ? ':DUP_CONCURRENT' : ''}`
     }
     return [
-      'Execute the Write tool from MCP server ocbridge ONCE right now with these exact JSON arguments:',
-      JSON.stringify({ file_path: filePath, content }),
-      'Do not call Read, Glob, Grep, Bash, or Edit. After Write returns, respond ONLY with the word DONE.',
+      `Use the Write tool right now with exact arguments ${JSON.stringify({ file_path: filePath, content })} to create that file.`,
+      'Call Write strictly once and do NOT call any other tool or function. After Write returns, reply ONLY with DONE.',
     ].join('\n')
   }
 
@@ -1773,6 +1895,8 @@ export async function createConformanceHarness(
     peerDriverId,
     peerProfileId,
     peerCanonicalModel: peerPrep.canonicalModel,
+    faultCanonicalModel,
+    faultPeerCanonicalModel,
     canonicalModel,
     upstreamModel,
     expectedPolicySha256,
@@ -1780,7 +1904,7 @@ export async function createConformanceHarness(
     probeFingerprint: probed.probeFingerprint,
     usagePolicy,
     worker,
-    barrierTimeoutMs: mode === 'live-node' ? 75_000 : 12_000,
+    barrierTimeoutMs: mode === 'live-node' ? 75_000 : 45_000,
     placeLaneOptions,
     buildWritePrompt,
     buildNativeDangerPrompt,
@@ -1823,6 +1947,12 @@ export async function createConformanceHarness(
           allowedPrefix: `/home/${sshUser}/oc-remotedrv-`,
           roots: [...createdRemoteRoots],
         }).catch(() => {})
+      }
+      if (liveCfg?.adminSshCmd.startsWith('ssh ')) {
+        await execFileAsync('/bin/bash', [
+          '-c',
+          `ssh -O exit -o ControlPath=${JSON.stringify(adminControlSocketPath)} ${liveCfg.adminSshCmd.slice(4)} >/dev/null 2>&1 || true`,
+        ]).catch(() => {})
       }
       await worker.close().catch(() => {})
       await redisClient.quit().catch(() => {})

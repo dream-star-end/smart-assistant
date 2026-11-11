@@ -120,6 +120,7 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                     deadline = time.monotonic() + 2.0
                     while not obs_path.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
+                    need(obs_path.exists(), "REMOTE_SOCKET_OBSERVATION_MISSING")
                     obs = strict_json(read_private(obs_path.parent, obs_path.name, 16384))
                     for obs_field in ("operationId", "runId", "generation", "nativeSessionId", "callId", "name", "argsHash"):
                         need(obs.get(obs_field) == body.get(obs_field), "REMOTE_SOCKET_OBSERVATION_MISMATCH")
@@ -128,10 +129,13 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
 
                 attempt_file = attempts / (call_key + ".attempt.json")
                 result_file = attempts / (call_key + ".result.json")
+                disable_wal = cur_cfg.get("testFaultDisableAttemptWal") is True
+                if disable_wal:
+                    need(str(root).startswith("/tmp/oc-drvtest-"), "REMOTE_FAULT_INJECTION_SANDBOX_ONLY")
                 # Disconnect result-only replay: if a previous round already persisted a proven result,
                 # return it without re-dispatching; if `.attempt.json` exists without `.result.json`,
                 # outcome is unknown -> fail closed (NEVER re-send effect!).
-                if result_file.exists():
+                if not disable_wal and result_file.exists():
                     saved = read_private(attempts, result_file.name, MAX_REPLY)
                     validate_wire_response(strict_json(saved), body)
                     self.send_response(200)
@@ -141,11 +145,18 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                     self.wfile.write(saved)
                     return
 
-                need((type(ident), ident) not in seen_rpc and not attempt_file.exists() and sequence < 10000 and not (root / "STOPPING.json").exists(), "REMOTE_SOCKET_ATTEMPT_EXISTS")
+                need(
+                    sequence < 10000
+                    and not (root / "STOPPING.json").exists()
+                    and (disable_wal or ((type(ident), ident) not in seen_rpc and not attempt_file.exists())),
+                    "REMOTE_SOCKET_ATTEMPT_EXISTS",
+                )
                 sequence += 1
-                seen_rpc.add((type(ident), ident))
+                if not disable_wal:
+                    seen_rpc.add((type(ident), ident))
                 dispatched = True
-                durable_record(attempt_file, remote_canonical_bytes(body))
+                if not disable_wal:
+                    durable_record(attempt_file, remote_canonical_bytes(body))
 
                 emit_frame(
                     sink,
@@ -176,16 +187,39 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                 receipt_bytes = base64.b64decode(resp["body"], validate=True)
                 need(len(receipt_bytes) <= MAX_REPLY, "REMOTE_SOCKET_RECEIPT_TOO_LARGE")
                 validate_wire_response(strict_json(receipt_bytes), body)
-                durable_record(result_file, receipt_bytes)
+                if not disable_wal:
+                    durable_record(result_file, receipt_bytes)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(receipt_bytes)))
                 self.end_headers()
                 self.wfile.write(receipt_bytes)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 failed = True
-                self.send_error()
+                err_code = (
+                    str(exc)
+                    if isinstance(exc, (RuntimeError, ValueError)) and str(exc).startswith("REMOTE_SOCKET_")
+                    else "REMOTE_SOCKET_REJECTED"
+                )
+                try:
+                    self.send_error()
+                    self.wfile.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    emit_frame(
+                        sink,
+                        {
+                            "version": 4,
+                            "driverId": config["driverId"],
+                            "engineId": config["engineId"],
+                            "kind": "socket-error",
+                            "code": err_code,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
     try:
         if not attempts.exists() and not attempts.is_symlink():

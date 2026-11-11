@@ -332,12 +332,22 @@ def provision(root: Path) -> None:
 
         record_exclusive(root / "tools.json", packet["tools"], mode=0o400)
         tools_sha = sha(read_private(root / "tools.json"))
+        raw_dctx = packet["driverContext"] if isinstance(packet["driverContext"], dict) else {}
+        disable_wal_fault = raw_dctx.get("testFaultDisableAttemptWal") is True
+        bypass_admit_fault = raw_dctx.get("testFaultBypassAdmit") is True
+        if disable_wal_fault or bypass_admit_fault:
+            need(sandbox, "REMOTE_FAULT_INJECTION_SANDBOX_ONLY")
         client_cfg: Dict[str, Any] = {
             "version": PROTOCOL_VERSION,
             **binding_fields(m),
+            "driverDigest": m["driverDigest"],
             "catalogSha256": tools_sha,
             "requireNodeObservation": bool(meta.get("requireNodeObservation", False)),
         }
+        if disable_wal_fault:
+            client_cfg["testFaultDisableAttemptWal"] = True
+        if bypass_admit_fault:
+            record_exclusive(root / "SANDBOX-FAULT.json", {"testFaultBypassAdmit": True}, mode=0o400)
         if m.get("nativeSessionId"):
             client_cfg["nativeSessionId"] = m["nativeSessionId"]
             if not (root / "NATIVE-SESSION.json").exists():
@@ -399,6 +409,11 @@ def verify_provisioned_spec(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
 
 def lane_admission(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
     sandbox = str(root).startswith("/tmp/oc-drvtest-")
+    bypass_admit = False
+    if (root / "SANDBOX-FAULT.json").exists():
+        need(sandbox, "REMOTE_FAULT_INJECTION_SANDBOX_ONLY")
+        fcfg = strict_json(read_private(root / "SANDBOX-FAULT.json"))
+        bypass_admit = isinstance(fcfg, dict) and fcfg.get("testFaultBypassAdmit") is True
     c = resources.config(m["engineId"], registry_path=m.get("registryPath"), allow_sandbox_override=sandbox)
     scopes = {
         scope_name(root, m, "app"): c["app"],
@@ -414,6 +429,7 @@ def lane_admission(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
         master_max_memory_bytes=m.get("maxSliceMemoryBytes"),
         registry_path=m.get("registryPath"),
         allow_sandbox_override=sandbox,
+        test_fault_bypass_admit=bypass_admit,
     )
 
 
@@ -1005,7 +1021,11 @@ def probe_role(root: Path) -> None:
             need(isinstance(res, dict) and res.get("kind") in ("step", "snapshot"), "REMOTE_PROBE_INVALID")
             if res["kind"] == "snapshot":
                 snap = validate_model_snapshot(res)
-                policy_sha = str(res.get("policySha256") or snap["rawResponseSha256"])
+                policy_sha = res.get("policySha256")
+                need(
+                    isinstance(policy_sha, str) and re.fullmatch(r"[a-f0-9]{64}", policy_sha) is not None,
+                    "REMOTE_PROBE_MISSING_POLICY_SHA256",
+                )
                 fp = compute_probe_fingerprint(
                     snap,
                     driver_digest=driver_digest,
@@ -1131,10 +1151,14 @@ def main() -> int:
         req = strict_json(line) if line else {}
         engine_id = req.get("engineId") or read_manifest(root)["engineId"]
         sandbox = str(root).startswith("/tmp/oc-drvtest-")
+        bypass_admit = req.get("testFaultBypassAdmit") is True
+        if bypass_admit:
+            need(sandbox, "REMOTE_FAULT_INJECTION_SANDBOX_ONLY")
         status = resources.preflight(
             engine_id,
             registry_path=req.get("registryPath"),
             allow_sandbox_override=sandbox,
+            test_fault_bypass_admit=bypass_admit,
         )
         print(
             json.dumps({"version": PROTOCOL_VERSION, "engineId": engine_id, "kind": "preflight", **status}, separators=(",", ":")),

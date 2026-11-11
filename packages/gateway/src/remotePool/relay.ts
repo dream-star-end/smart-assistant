@@ -106,6 +106,7 @@ export interface RemotePoolRelayOptions {
   readonly observeFrame?: (channel: 'app' | 'tool', frame: unknown) => void
   readonly observationOptions?: {
     readonly testFaultBypassObservation?: boolean
+    readonly testFaultAllowDuplicateClaim?: boolean
     readonly allowTestBypassInTmp?: boolean
     readonly authorizeTimeoutMs?: number
   }
@@ -431,6 +432,13 @@ export class RemotePoolRelay {
             resolve()
             return
           }
+          if (
+            row.kind === 'socket-error' &&
+            typeof row.code === 'string' &&
+            /^REMOTE_SOCKET_[A-Z0-9_]+$/.test(row.code)
+          ) {
+            throw new Error(row.code)
+          }
           remotePoolNeed(
             row.kind === 'tool-request' && row.seq === ++this.socketSeq && typeof row.body === 'string',
             'REMOTE_SOCKET_REQUEST_INVALID',
@@ -517,6 +525,10 @@ export class RemotePoolRelay {
     remotePoolNeed(!this.localStopped && this.active && this.dispatching, 'REMOTE_TOOL_OUTSIDE_ACTIVE_TURN')
     this.appendEvidence('fixed_mcp', rawBytes)
     const wireBody = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(rawBytes)) as Record<string, unknown>
+    const allowSandboxDuplicateTool =
+      this.observationOptions?.testFaultAllowDuplicateClaim === true &&
+      this.observationOptions?.allowTestBypassInTmp === true &&
+      this.spec.manifest.root.startsWith('/tmp/oc-drvtest-')
     remotePoolNeed(
       wireBody &&
         typeof wireBody === 'object' &&
@@ -529,7 +541,7 @@ export class RemotePoolRelay {
         wireBody.profileId === this.binding.profileId &&
         wireBody.authEpoch === this.binding.authEpoch &&
         typeof wireBody.callId === 'string' &&
-        !this.tools.has(wireBody.callId),
+        (!this.tools.has(wireBody.callId) || allowSandboxDuplicateTool),
       'REMOTE_TOOL_WIRE_BODY_INVALID',
     )
     const pendingReq = validatePendingToolRequest({
@@ -554,7 +566,10 @@ export class RemotePoolRelay {
 
     remotePoolNeed(!this.revoked && !this.localStopped && this.admitted !== undefined, 'REMOTE_TOOL_REVOKED')
     this.verifyAuthorityAndLease(this.admitted.authority, this.admitted.lease, true)
-    this.tools.set(pendingReq.callId, {
+    const toolMapKey = this.tools.has(pendingReq.callId)
+      ? `${pendingReq.callId}#dup${seq}`
+      : pendingReq.callId
+    this.tools.set(toolMapKey, {
       seq,
       wireBody,
       request: pendingReq,
@@ -980,12 +995,19 @@ export class RemotePoolRelay {
       )
       remotePoolNeed(initReply?.ok === true, 'REMOTE_INITIALIZE_FAILED')
 
+      const preboundSessionId = this.spec.manifest.nativeSessionId
+      if (preboundSessionId) {
+        this.nativeSessionId = preboundSessionId
+        this.observation.bindSession(preboundSessionId)
+        this.countersBaseline = await this.bindSessionFinance(preboundSessionId, false)
+      }
+
       const resumeReply = await this.dispatchCommand(
         {
           kind: 'resume',
           commandId: `resume-${this.epoch}`,
           model: this.spec.manifest.model,
-          nativeSessionId: this.spec.manifest.nativeSessionId ?? 'new',
+          nativeSessionId: preboundSessionId ?? 'new',
           ...(instructions !== undefined ? { instructions } : {}),
         },
         { publishReplies: false, waitReply: true },
@@ -994,18 +1016,18 @@ export class RemotePoolRelay {
         resumeReply?.ok === true &&
           typeof resumeReply.nativeSessionId === 'string' &&
           resumeReply.nativeSessionId.length > 0 &&
-          (!this.spec.manifest.nativeSessionId || resumeReply.nativeSessionId === this.spec.manifest.nativeSessionId),
+          (!preboundSessionId || resumeReply.nativeSessionId === preboundSessionId),
         'REMOTE_RESUME_FAILED',
       )
-      this.nativeSessionId = resumeReply.nativeSessionId
-      this.observation.bindSession(this.nativeSessionId)
-      this.countersBaseline = await this.bindSessionFinance(
-        this.nativeSessionId,
-        !this.spec.manifest.nativeSessionId,
-      )
-      await this.onNativeSession(this.nativeSessionId)
+      if (!preboundSessionId) {
+        this.nativeSessionId = resumeReply.nativeSessionId
+        this.observation.bindSession(this.nativeSessionId)
+        this.countersBaseline = await this.bindSessionFinance(this.nativeSessionId, true)
+      }
+      await this.onNativeSession(this.nativeSessionId!)
     } else {
       remotePoolNeed(typeof this.nativeSessionId === 'string', 'REMOTE_WARM_LANE_WITHOUT_SESSION')
+      this.countersBaseline = await this.bindSessionFinance(this.nativeSessionId, false)
       const resumeReply = await this.dispatchCommand(
         {
           kind: 'resume',
@@ -1020,7 +1042,6 @@ export class RemotePoolRelay {
         resumeReply?.ok === true && resumeReply.nativeSessionId === this.nativeSessionId,
         'REMOTE_WARM_RESUME_FAILED',
       )
-      this.countersBaseline = await this.bindSessionFinance(this.nativeSessionId, false)
     }
 
     remotePoolNeed(!this.revoked && typeof this.nativeSessionId === 'string', 'REMOTE_ADMIT_REVOKED')
@@ -1215,7 +1236,11 @@ export class RemotePoolRelay {
     }
     if (path === '/tool/result') {
       const callId = typeof v.callId === 'string' ? v.callId : ''
-      const tool = this.tools.get(callId)
+      const tool =
+        (this.tools.get(callId)?.delivered && !this.tools.get(callId)?.result
+          ? this.tools.get(callId)
+          : undefined) ??
+        [...this.tools.values()].find((t) => t.request.callId === callId && t.delivered && !t.result)
       remotePoolNeed(tool?.delivered && !tool.result, 'REMOTE_TOOL_RESULT_UNEXPECTED')
       assertCc5ToolResult(v.result)
       const cleanResult: Cc5ToolResult = {
@@ -1240,7 +1265,13 @@ export class RemotePoolRelay {
     }
     if (path === '/tool/ack') {
       const callId = typeof v.callId === 'string' ? v.callId : ''
-      const tool = this.tools.get(callId)
+      const tool =
+        (this.tools.get(callId)?.result !== undefined && !this.tools.get(callId)?.acknowledged
+          ? this.tools.get(callId)
+          : undefined) ??
+        [...this.tools.values()].find(
+          (t) => t.request.callId === callId && t.result !== undefined && !t.acknowledged,
+        )
       remotePoolNeed(tool !== undefined && tool.result !== undefined && !tool.acknowledged, 'REMOTE_TOOL_ACK_INVALID')
       this.record('tool-ack', { callId })
       tool.acknowledged = true

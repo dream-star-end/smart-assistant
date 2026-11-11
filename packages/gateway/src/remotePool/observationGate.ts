@@ -59,11 +59,15 @@ export class RemoteObservationGate {
      */
     private readonly options: {
       testFaultBypassObservation?: boolean
+      testFaultAllowDuplicateClaim?: boolean
       allowTestBypassInTmp?: boolean
       authorizeTimeoutMs?: number
     } = {},
   ) {
-    if (options.testFaultBypassObservation && !options.allowTestBypassInTmp) {
+    if (
+      (options.testFaultBypassObservation || options.testFaultAllowDuplicateClaim) &&
+      !options.allowTestBypassInTmp
+    ) {
       throw new Error('REMOTE_OBSERVATION_BYPASS_FORBIDDEN')
     }
     this.events.setMaxListeners(128)
@@ -221,7 +225,10 @@ export class RemoteObservationGate {
     }
 
     // Atomic claim burn BEFORE awaiting: two concurrent requests for the same `callId` can NEVER both pass!
-    if (this.claimedCallIds.has(req.callId)) {
+    if (
+      this.claimedCallIds.has(req.callId) &&
+      !(this.options.testFaultAllowDuplicateClaim && this.options.allowTestBypassInTmp)
+    ) {
       this.revoke('REMOTE_TOOL_CONCURRENT_OR_REPLAYED_CLAIM')
       throw new Error('REMOTE_TOOL_CONCURRENT_OR_REPLAYED_CLAIM')
     }

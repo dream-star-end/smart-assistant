@@ -145,7 +145,14 @@ def handle_request(req: Dict[str, Any], default_registry: Optional[str] = None) 
                 out_step["nextProbeState"] = res["nextProbeState"]
             return out_step
         snap = validate_model_snapshot(res)
-        policy_sha = str(res.get("policySha256") or snap.get("rawResponseSha256"))
+        raw_policy_sha = res.get("policySha256")
+        need(
+            isinstance(raw_policy_sha, str)
+            and len(raw_policy_sha) == 64
+            and all(c in "0123456789abcdef" for c in raw_policy_sha),
+            "REMOTE_PROBE_MISSING_POLICY_SHA256",
+        )
+        policy_sha = raw_policy_sha
         fp = compute_probe_fingerprint(
             snap,
             driver_digest=driver_digest,

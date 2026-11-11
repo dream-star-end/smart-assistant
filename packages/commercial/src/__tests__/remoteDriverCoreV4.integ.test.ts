@@ -7,11 +7,13 @@
  * - `RemoteReleaseDrainCoordinator` cutover drain & timeout safety (`AC-5`)
  */
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { after, before, test } from 'node:test'
+import { promisify } from 'node:util'
 import { Pool } from 'pg'
 import {
   REMOTE_DRIVER_BACKEND,
@@ -35,6 +37,7 @@ import {
   type CodexRemoteBinding,
 } from '@openclaude/gateway/remote-finance'
 import { remotePoolBackendOf, type RemotePoolBinding } from '@openclaude/gateway/remote-pool'
+import { createMasterCc5Runtime, selectMasterCc5Backend } from '../agent-sandbox/cc5Runtime.js'
 import { EVENTS } from '../admin/alertEvents.js'
 import {
   RemoteReleaseDrainCoordinator,
@@ -45,6 +48,7 @@ import {
   placeRemoteDriverLane,
   recordDriverProbeSnapshot,
   recordRemoteDriverLaneState,
+  startRemoteReleaseDrainSocketServer,
   verificationSessionKeyForRun,
 } from '../account-pool/remotePool/index.js'
 import {
@@ -1698,4 +1702,173 @@ test('AC-5 R1 RemoteReleaseDrainCoordinator blocks new admissions while waiting 
   unregister()
   drainGate.reopen()
   await recordRemoteDriverLaneState(activeLane.binding.operationId, activeLane.generation, 'released', pool)
+})
+
+test('W2/C2 production entry: createMasterCc5Runtime + selectMasterCc5Backend route driver_id profiles to remote-driver-v4, fail closed on unready, and honor drain-remote-v4.sh', async () => {
+  const execFileAsync = promisify(execFile)
+  const tmpRuntimeDir = mkdtempSync('/tmp/oc-drvtest-rtv4-')
+  const sockPath = join(tmpRuntimeDir, 'drain.sock')
+  const baseRoot = join(tmpRuntimeDir, 'lanes')
+  const evidenceRoot = join(tmpRuntimeDir, 'evidence')
+  mkdirSync(baseRoot, { recursive: true, mode: 0o700 })
+  mkdirSync(evidenceRoot, { recursive: true, mode: 0o700 })
+  const drainGate = new RemoteReleaseDrainCoordinator()
+  const policyEnv = {
+    OC_SELFHOST_CC5_T1555U_ENABLED: '1',
+    OC_SELFHOST_CC5_T1555U_TEST_UID: String(uid),
+    OC_REMOTE_V4_DRAIN_SOCKET: sockPath,
+  }
+
+  let capturedPlace: ((req: any) => Promise<any>) | undefined
+  createMasterCc5Runtime(
+    {
+      selfhost: true,
+      authorityReady: true,
+      env: policyEnv,
+      financeFactory: () => ({ admit: async () => ({}) as any }),
+    },
+    {
+      pool: () => pool,
+      drainGate,
+      v4PlacementOptions: { localSandboxDir: tmpRuntimeDir },
+      baseRoot,
+      evidenceRoot,
+      create: (cfg) => {
+        capturedPlace = cfg.hooks.place
+        return {
+          ensureLane: async (req: any) => {
+            const placed = await cfg.hooks.place({
+              ...req,
+              dockerId: 'a'.repeat(64),
+            })
+            if (placed.v4) {
+              return remotePoolBackendOf(placed.v4.binding)
+            }
+            return {
+              kind: 'cc5-interactive-v1' as const,
+              sessionKey: req.sessionKey,
+              operationId: placed.operationId,
+            }
+          },
+          close: async () => {},
+        } as any
+      },
+    },
+  )
+  assert.ok(capturedPlace, 'Master runtime must register hooks.place')
+  const sockHandle = startRemoteReleaseDrainSocketServer(drainGate, {
+    pool: () => pool,
+    socketPath: sockPath,
+  })
+  const listenDeadline = Date.now() + 2_000
+  while (!sockHandle.server.listening && Date.now() < listenDeadline) {
+    await new Promise((r) => setTimeout(r, 10))
+  }
+
+  try {
+    // 1. Ready `driver_id = 'cc'` and `driver_id = 'codex'` profiles route to `remote-driver-v4`!
+    const rt = {
+      ensureLane: async (req: any) => {
+        const placed = await capturedPlace!({ ...req, dockerId: 'a'.repeat(64) })
+        assert.ok(placed.v4, 'Expected v4 placement for driver_id profile')
+        return remotePoolBackendOf(placed.v4.binding)
+      },
+      close: async () => {},
+    } as any
+
+    const ccSession = `agent:main:webchat:dm:w2_prod_cc_${randomUUID().slice(0, 8)}`
+    const ccBackend = await selectMasterCc5Backend(
+      rt,
+      {
+        uid: Number(uid),
+        containerId: 7,
+        sessionKey: ccSession,
+        canonicalModel: CC_CANONICAL,
+        engine: 'ccb',
+        placement: 'remote_pool',
+      },
+      true,
+      policyEnv,
+    )
+    assert.ok(ccBackend && ccBackend.kind === REMOTE_DRIVER_BACKEND)
+    assert.equal(ccBackend.driverId, 'cc')
+    assert.equal(ccBackend.authorityEngine, 'ccb')
+    await recordRemoteDriverLaneState(ccBackend.operationId, ccBackend.generation, 'released', pool)
+
+    const codexSession = `agent:main:webchat:dm:w2_prod_codex_${randomUUID().slice(0, 8)}`
+    const codexBackend = await selectMasterCc5Backend(
+      rt,
+      {
+        uid: Number(uid),
+        containerId: 7,
+        sessionKey: codexSession,
+        canonicalModel: CODEX_CANONICAL,
+        engine: 'codex',
+        placement: 'remote_pool',
+      },
+      true,
+      policyEnv,
+    )
+    assert.ok(codexBackend && codexBackend.kind === REMOTE_DRIVER_BACKEND)
+    assert.equal(codexBackend.driverId, 'codex')
+    assert.equal(codexBackend.authorityEngine, 'codex')
+    await recordRemoteDriverLaneState(codexBackend.operationId, codexBackend.generation, 'released', pool)
+
+    // 2. Unready `driver_id` profile fails closed (`REMOTE_DRIVER_REVERIFY_REQUIRED`), never falls back!
+    await pool.query('UPDATE remote_agent_profiles SET execution_ready = FALSE WHERE id = $1', [
+      ccProfileId,
+    ])
+    await assert.rejects(
+      selectMasterCc5Backend(
+        rt,
+        {
+          uid: Number(uid),
+          containerId: 7,
+          sessionKey: `agent:main:webchat:dm:w2_unready_${randomUUID().slice(0, 8)}`,
+          canonicalModel: CC_CANONICAL,
+          engine: 'ccb',
+          placement: 'remote_pool',
+        },
+        true,
+        policyEnv,
+      ),
+      /REMOTE_DRIVER_REVERIFY_REQUIRED/,
+    )
+    await pool.query('UPDATE remote_agent_profiles SET execution_ready = TRUE WHERE id = $1', [
+      ccProfileId,
+    ])
+
+    // 3. Real `drain-remote-v4.sh --drain` blocks `selectMasterCc5Backend` with `REMOTE_POOL_DRAINING_RETRY_LATER`!
+    const drainScript = resolve('scripts/agent-remote/drain-remote-v4.sh')
+    const { stdout } = await execFileAsync(drainScript, [
+      '--drain',
+      '--socket',
+      sockPath,
+      '--timeout-ms',
+      '3000',
+      '--release-run-id',
+      'integ-cutover-1',
+    ])
+    assert.equal(JSON.parse(stdout.trim()).drained, true)
+    await assert.rejects(
+      selectMasterCc5Backend(
+        rt,
+        {
+          uid: Number(uid),
+          containerId: 7,
+          sessionKey: `agent:main:webchat:dm:w2_draining_${randomUUID().slice(0, 8)}`,
+          canonicalModel: CC_CANONICAL,
+          engine: 'ccb',
+          placement: 'remote_pool',
+        },
+        true,
+        policyEnv,
+      ),
+      /REMOTE_POOL_DRAINING_RETRY_LATER/,
+    )
+    await execFileAsync(drainScript, ['--reopen', '--socket', sockPath])
+  } finally {
+    await sockHandle.close()
+    rmSync(tmpRuntimeDir, { recursive: true, force: true })
+  }
 })

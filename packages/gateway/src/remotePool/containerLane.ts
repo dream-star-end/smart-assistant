@@ -463,6 +463,7 @@ export interface RemoteContainerLaneOptions {
   readonly platformPrompt?: string
   readonly observationOptions?: {
     readonly testFaultBypassObservation?: boolean
+    readonly testFaultAllowDuplicateClaim?: boolean
     readonly allowTestBypassInTmp?: boolean
   }
 }

@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from urllib.parse import urlparse
@@ -35,6 +36,42 @@ def compute_suite_digest() -> str:
         h.update(name.encode("utf-8") + b"\0")
         h.update(hashlib.sha256(p.read_bytes()).digest())
     return h.hexdigest()
+
+
+def compute_ts_core_digest() -> str:
+    h = hashlib.sha256()
+    for pkg_rel in (
+        "packages/protocol/src",
+        "packages/gateway/src",
+        "packages/commercial/src",
+    ):
+        base = REPO_ROOT / pkg_rel
+        for file_path in sorted(p for p in base.rglob("*") if p.is_file()):
+            rel = file_path.relative_to(REPO_ROOT).as_posix()
+            h.update(rel.encode("utf-8") + b"\0")
+            h.update(hashlib.sha256(file_path.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def read_git_provenance() -> tuple[str, bool]:
+    try:
+        head_proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        status_proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return head_proc.stdout.strip(), (status_proc.stdout.strip() == "")
+    except Exception:
+        return "unmounted-worktree", False
 
 
 def main() -> int:
@@ -70,6 +107,15 @@ def main() -> int:
         sys.stderr.write(f"Refusing non-test database URL: {parsed_db.path}\n")
         return 2
 
+    suite_digest = compute_suite_digest()
+    ts_core_digest = compute_ts_core_digest()
+    git_head_sha, git_worktree_clean = read_git_provenance()
+    if args.mode == "live-node" and not re.fullmatch(r"[0-9a-f]{40}", git_head_sha):
+        sys.stderr.write(
+            f"live-node mode requires a valid 40-hex git HEAD SHA (got {git_head_sha!r}); run on repo host.\n"
+        )
+        return 2
+
     cmd_parts = [
         str(TSX_BIN),
         str(RUNNER_TS),
@@ -81,6 +127,14 @@ def main() -> int:
         args.mode,
         "--groups",
         args.groups,
+        "--suite-digest",
+        suite_digest,
+        "--git-head-sha",
+        git_head_sha,
+        "--git-worktree-clean",
+        "true" if git_worktree_clean else "false",
+        "--ts-core-digest",
+        ts_core_digest,
     ]
     if args.node_config:
         cmd_parts.extend(["--node-config", str(Path(args.node_config).resolve())])
@@ -105,8 +159,12 @@ def main() -> int:
         return 3
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    summary["suiteDigest"] = compute_suite_digest()
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    if summary.get("suiteDigest") != compute_suite_digest():
+        sys.stderr.write("Conformance suiteDigest drifted during run\n")
+        return 4
+    if summary.get("tsCoreDigest") != compute_ts_core_digest():
+        sys.stderr.write("Conformance tsCoreDigest drifted during run\n")
+        return 4
 
     if (
         not summary.get("overallPassed")

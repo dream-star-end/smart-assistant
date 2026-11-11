@@ -100,6 +100,7 @@ def check_worker_ipc(driver_id: str, iterations: int = 25) -> Dict[str, Any]:
         p95 = round(sorted_lat[p95_idx], 3)
         return {
             "status": "PASS" if p95 <= 50.0 else "FAIL",
+            "source": "master-local-fixture",
             "coldInfoMs": cold_info_ms,
             "p50Ms": round(statistics.median(sorted_lat), 3),
             "p95Ms": p95,
@@ -166,6 +167,8 @@ def check_mcp_correlation(driver_id: str) -> Dict[str, Any]:
     )
     return {
         "status": "PASS" if ok else "FAIL",
+        "source": "master-local-fixture",
+        "liveNodeEvidenceRef": "conformance/group-3.json#concurrentDuplicateValidMatch",
         "callId": pending.get("callId"),
         "argsHash": pending.get("argsHash"),
     }

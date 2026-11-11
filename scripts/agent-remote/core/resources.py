@@ -384,7 +384,13 @@ def admit(
     master_max_memory_bytes: Optional[int] = None,
     registry_path: Optional[str] = None,
     allow_sandbox_override: Optional[bool] = None,
+    test_fault_bypass_admit: bool = False,
 ) -> Dict[str, Any]:
+    if test_fault_bypass_admit:
+        need(
+            allow_sandbox_override is True and str(key).startswith("/tmp/oc-drvtest-"),
+            "REMOTE_FAULT_INJECTION_SANDBOX_ONLY",
+        )
     need(
         scopes
         and isinstance(profile, str)
@@ -419,7 +425,7 @@ def admit(
                 r["kind"] == "lane" and r["engine"] == engine and r["profile"] == profile
                 for r in rows
             )
-            if active_in_pool >= effective_cap:
+            if active_in_pool >= effective_cap and not test_fault_bypass_admit:
                 raise ProfileCapacityExhausted(engine, profile, effective_cap, cap_drift=cap_drift)
 
         status = snapshot(
@@ -430,7 +436,7 @@ def admit(
             master_max_memory_bytes=master_max_memory_bytes,
             allow_sandbox_override=allow_sandbox_override,
         )
-        if not status["memoryOk"]:
+        if not status["memoryOk"] and not test_fault_bypass_admit:
             raise MemoryExhausted(status)
         row = {
             "version": 4,
@@ -451,16 +457,21 @@ def preflight(
     registry_path: Optional[str] = None,
     *,
     allow_sandbox_override: Optional[bool] = None,
+    test_fault_bypass_admit: bool = False,
 ) -> Dict[str, Any]:
     with locked():
         c = ensure_slice(engine, registry_path=registry_path, allow_sandbox_override=allow_sandbox_override)
-        return snapshot(
+        snap = snapshot(
             engine,
             {"preview-app": c["app"], "preview-socket": c["socket"]},
             records(),
             registry_path=registry_path,
             allow_sandbox_override=allow_sandbox_override,
         )
+        if test_fault_bypass_admit:
+            need(bool(allow_sandbox_override), "REMOTE_FAULT_INJECTION_SANDBOX_ONLY")
+            snap = {**snap, "memoryOk": True, "code": None}
+        return snap
 
 
 def release(key: str) -> None:

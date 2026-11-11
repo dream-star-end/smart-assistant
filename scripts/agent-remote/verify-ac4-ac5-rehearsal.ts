@@ -27,9 +27,17 @@
  *      idempotent second pass).
  */
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
@@ -43,14 +51,16 @@ import {
   RemoteObservationGate,
 } from '../../packages/gateway/src/remotePool/index.js'
 import {
-  RemoteReleaseDrainCoordinator,
   claimDriverVerificationRun,
   completeDriverVerificationRun,
+  getMasterRemoteReleaseDrainCoordinator,
   placeRemoteDriverLane,
   recordDriverProbeSnapshot,
   recordRemoteDriverLaneState,
+  startRemoteReleaseDrainSocketServer,
 } from '../../packages/commercial/src/account-pool/remotePool/index.js'
 import { createConformanceHarness } from './conformance/harness.js'
+import { runSameNodeLegacyVsV4Parity } from './parity-legacy-v4.js'
 
 function createAsyncBarrier(): {
   barrier: {
@@ -193,7 +203,7 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
         driverId,
         driverId === 'codex'
           ? { kind: 'newTurn', commandId: `cmd_${i}`, prompt: 'bench', model: 'gpt-6-luna' }
-          : { kind: 'newTurn', commandId: `cmd_${i}`, prompt: 'bench' },
+          : { kind: 'newTurn', commandId: `cmd_${i}`, prompt: 'bench', model: 'claude-opus-5-5' },
         driverId === 'codex'
           ? { initialized: true, sessionId: sessId, expectedModel: 'gpt-6-luna' }
           : { initialized: true, sessionId: sessId },
@@ -421,20 +431,74 @@ function verifyLiveConformanceEvidence(dirPath: string, expectedDriver: 'cc' | '
   }
 }
 
-async function runAc5Rehearsals() {
-  const h = await createConformanceHarness('codex', { mode: 'sandbox' })
+const DRAIN_CLI_SCRIPT = resolve(THIS_DIR, 'drain-remote-v4.sh')
+
+function invokeDrainCli(args: readonly string[]): Promise<{
+  exitCode: number
+  stdout: string
+  stderr: string
+  json: Record<string, any> | null
+}> {
+  return new Promise((resolveOut, rejectOut) => {
+    const child = spawn('/bin/bash', [DRAIN_CLI_SCRIPT, ...args], {
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (c: string) => {
+      stdout += c
+    })
+    child.stderr.on('data', (c: string) => {
+      stderr += c
+    })
+    child.once('error', rejectOut)
+    child.once('close', (code) => {
+      let json: Record<string, any> | null = null
+      try {
+        const trimmed = stdout.trim()
+        if (trimmed) json = JSON.parse(trimmed.split('\n').at(-1)!)
+      } catch {
+        json = null
+      }
+      resolveOut({ exitCode: code ?? 1, stdout, stderr, json })
+    })
+  })
+}
+
+async function runAc5Rehearsals(codexNodeConfigPath?: string) {
+  const mode = codexNodeConfigPath ? 'live-node' : 'sandbox'
+  const h = await createConformanceHarness(
+    'codex',
+    mode === 'live-node'
+      ? { mode: 'live-node', nodeConfigPath: codexNodeConfigPath }
+      : { mode: 'sandbox' },
+  )
+  const drainDir = mkdtempSync('/tmp/oc-ac5-drain-')
+  const drainSockPath = join(drainDir, 'remote-v4-drain.sock')
+  const drainCoordinator = getMasterRemoteReleaseDrainCoordinator()
+  drainCoordinator.reopen()
+  const drainSockHandle = startRemoteReleaseDrainSocketServer(drainCoordinator, {
+    pool: () => h.pool,
+    socketPath: drainSockPath,
+  })
   try {
-    // Enable persistent per-thread rollout state in sandbox `CODEX_HOME` so g1 -> g2
-    // OS-process generation upgrade resumes exact cumulative counters & turn_seq.
-    const origCliFile = join(h.sandbox, 'codex-conformance-cli')
-    const statefulCliFile = join(h.sandbox, 'codex-stateful-cli')
-    const origCli = readFileSync(origCliFile, 'utf8')
-    const statefulCli = origCli
-      .replace(
-        `    elif method in ("thread/start", "thread/resume"):
+    let statefulCtx: Record<string, unknown> = {}
+    if (mode === 'sandbox') {
+      // Enable persistent per-thread rollout state in sandbox `CODEX_HOME` so g1 -> g2
+      // OS-process generation upgrade resumes exact cumulative counters & turn_seq.
+      const origCliFile = join(h.sandbox, 'codex-conformance-cli')
+      const statefulCliFile = join(h.sandbox, 'codex-stateful-cli')
+      const origCli = readFileSync(origCliFile, 'utf8')
+      const statefulCli = origCli
+        .replace(
+          `    elif method in ("thread/start", "thread/resume"):
         if method == "thread/resume" and msg.get("params", {}).get("threadId"):
             thread_id = msg["params"]["threadId"]`,
-        `    elif method in ("thread/start", "thread/resume"):
+          `    elif method in ("thread/start", "thread/resume"):
         if method == "thread/resume" and msg.get("params", {}).get("threadId"):
             thread_id = msg["params"]["threadId"]
             st_file = pathlib.Path(os.environ.get("CODEX_HOME", "/tmp")) / f"rollout-{thread_id}.json"
@@ -445,62 +509,64 @@ async function runAc5Rehearsals() {
                 cum_cached = st["cum_cached"]
                 cum_out = st["cum_out"]
                 cum_reason = st["cum_reason"]`,
-      )
-      .replace(
-        `        cum_in += 1000000
+        )
+        .replace(
+          `        cum_in += 1000000
         cum_cached += 400000
         cum_out += 250000
         cum_reason += 100000`,
-        `        cum_in += 1000000
+          `        cum_in += 1000000
         cum_cached += 400000
         cum_out += 250000
         cum_reason += 100000
         st_file = pathlib.Path(os.environ.get("CODEX_HOME", "/tmp")) / f"rollout-{thread_id}.json"
         st_file.write_text(json.dumps({"turn_seq": turn_seq, "cum_in": cum_in, "cum_cached": cum_cached, "cum_out": cum_out, "cum_reason": cum_reason}), encoding="utf-8")`,
-      )
-    assert.notEqual(statefulCli, origCli, 'Expected stateful rollout patch in codex sandbox CLI')
-    writeFileSync(statefulCliFile, statefulCli, { mode: 0o500 })
-    chmodSync(statefulCliFile, 0o500)
-    const newCliSha = createHash('sha256').update(readFileSync(statefulCliFile)).digest('hex')
-    const updatedSnap = {
-      ...h.probedSnapshot,
-      cliSha256: newCliSha,
-      ...(h.probedSnapshot.nativeSha256 ? { nativeSha256: newCliSha } : {}),
+        )
+      assert.notEqual(statefulCli, origCli, 'Expected stateful rollout patch in codex sandbox CLI')
+      writeFileSync(statefulCliFile, statefulCli, { mode: 0o500 })
+      chmodSync(statefulCliFile, 0o500)
+      const newCliSha = createHash('sha256').update(readFileSync(statefulCliFile)).digest('hex')
+      const updatedSnap = {
+        ...h.probedSnapshot,
+        cliSha256: newCliSha,
+        ...(h.probedSnapshot.nativeSha256 ? { nativeSha256: newCliSha } : {}),
+      }
+      const obs = await recordDriverProbeSnapshot(h.pool, {
+        profileId: h.profileId,
+        snapshot: updatedSnap,
+        policySha256: h.expectedPolicySha256,
+      })
+      assert.ok(obs.verificationRunId)
+      const claimed = await claimDriverVerificationRun(h.pool, {
+        leaseOwner: 'ac5-rehearsal-init',
+        profileId: h.profileId,
+      })
+      assert.ok(claimed)
+      const completed = await completeDriverVerificationRun(h.pool, {
+        runId: claimed.id,
+        leaseOwner: 'ac5-rehearsal-init',
+        outcome: 'passed',
+        evidenceDigest: obs.fingerprint,
+      })
+      assert.equal(completed.executionReadyRestored, true)
+      statefulCtx = { cliPath: statefulCliFile, nativePath: statefulCliFile }
     }
-    const obs = await recordDriverProbeSnapshot(h.pool, {
-      profileId: h.profileId,
-      snapshot: updatedSnap,
-      policySha256: h.expectedPolicySha256,
-    })
-    assert.ok(obs.verificationRunId)
-    const claimed = await claimDriverVerificationRun(h.pool, {
-      leaseOwner: 'ac5-rehearsal-init',
-      profileId: h.profileId,
-    })
-    assert.ok(claimed)
-    const completed = await completeDriverVerificationRun(h.pool, {
-      runId: claimed.id,
-      leaseOwner: 'ac5-rehearsal-init',
-      outcome: 'passed',
-      evidenceDigest: obs.fingerprint,
-    })
-    assert.equal(completed.executionReadyRestored, true)
-    const statefulCtx = { cliPath: statefulCliFile, nativePath: statefulCliFile }
 
     // -------------------------------------------------------------------------
-    // Rehearsal 1: In-flight turn triggers R1 drain & waits without killing g1
+    // Rehearsal 1: In-flight turn triggers R1 release drain hook (`drain-remote-v4.sh`)
+    //              over AF_UNIX drain socket & waits without killing g1
     // -------------------------------------------------------------------------
     const sessionKey = `agent:main:webchat:dm:ac5_cutover_${randomUUID().slice(0, 8)}`
     const syncBarrier = createAsyncBarrier()
     const g1 = await h.openLane({
       sessionKey,
       dedicatedToolHost: true,
+      writeOnlyTools: true,
       toolExecutionBarrier: syncBarrier.barrier,
       extraDriverContext: statefulCtx,
     })
     assert.equal(g1.placed.generation, '1')
 
-    const drainCoordinator = new RemoteReleaseDrainCoordinator()
     const unregisterG1 = drainCoordinator.registerRelay(
       `${g1.placed.binding.operationId}:g1`,
       g1.relay,
@@ -522,29 +588,53 @@ async function runAc5Rehearsals() {
     )
     assert.equal(Number(inflightJournalCheck.rows[0]?.cnt ?? '0'), 1)
 
-    // Verify non-destructive timeout: if cutover drain times out, it throws & reopens WITHOUT killing g1
-    const shortTimeoutDrain = new RemoteReleaseDrainCoordinator()
-    shortTimeoutDrain.registerRelay('g1-timeout-probe', g1.relay)
-    let timeoutAbortedCleanly = false
-    try {
-      await shortTimeoutDrain.drainForCutover(h.pool, { timeoutMs: 65, pollIntervalMs: 15 })
-    } catch (err) {
-      if (err instanceof Error && err.message === 'REMOTE_RELEASE_DRAIN_TIMEOUT') {
-        timeoutAbortedCleanly = true
-      } else {
-        throw err
-      }
-    }
-    assert.equal(timeoutAbortedCleanly, true)
-    assert.equal(shortTimeoutDrain.isDraining, false)
+    // Verify non-destructive timeout via REAL `drain-remote-v4.sh --drain --timeout-ms 150`:
+    // cutover aborts & reopens WITHOUT killing in-flight g1
+    const timeoutRunId = `r1-cutover-timeout-probe-${randomUUID().slice(0, 8)}`
+    const timeoutCli = await invokeDrainCli([
+      '--drain',
+      '--socket',
+      drainSockPath,
+      '--timeout-ms',
+      '150',
+      '--poll-ms',
+      '25',
+      '--release-run-id',
+      timeoutRunId,
+    ])
+    assert.equal(timeoutCli.exitCode, 1, 'Expected drain-remote-v4.sh exit code 1 on timeout')
+    assert.equal(timeoutCli.json?.ok, false)
+    assert.equal(timeoutCli.json?.error, 'REMOTE_RELEASE_DRAIN_TIMEOUT')
+    assert.equal(drainCoordinator.isDraining, false)
     assert.equal(g1.relay.idle, false, 'Timeout must NOT kill active g1 turn')
 
-    // Now trigger actual R1 cutover drain while g1 is mid-flight
+    // Trigger REAL R1 release drain hook (`drain-remote-v4.sh --drain`) while g1 is mid-flight
+    const releaseRunId = `r1-cutover-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}`
     const maintenanceOpenedAt = performance.now()
-    const drainPromise = drainCoordinator.drainForCutover(h.pool, {
-      timeoutMs: 15_000,
-      pollIntervalMs: 20,
-    })
+    const drainCliPromise = invokeDrainCli([
+      '--drain',
+      '--socket',
+      drainSockPath,
+      '--timeout-ms',
+      '90000',
+      '--poll-ms',
+      '35',
+      '--release-run-id',
+      releaseRunId,
+    ])
+
+    // Poll `drain-remote-v4.sh --status` until admission gate is closed (`draining === true`)
+    const statusDeadline = Date.now() + 10_000
+    let activeStatusJson: Record<string, any> | null = null
+    while (Date.now() < statusDeadline) {
+      const st = await invokeDrainCli(['--status', '--socket', drainSockPath])
+      if (st.exitCode === 0 && st.json?.draining === true) {
+        activeStatusJson = st.json
+        break
+      }
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    assert.ok(activeStatusJson, 'Expected drain-remote-v4.sh --status to observe draining=true')
     assert.equal(drainCoordinator.isDraining, true)
 
     // New session admission during drain MUST be rejected with REMOTE_POOL_DRAINING_RETRY_LATER
@@ -570,17 +660,32 @@ async function runAc5Rehearsals() {
     }
     assert.equal(rejectedNewSessionCode, 'REMOTE_POOL_DRAINING_RETRY_LATER')
 
-    // Keep g1 in-flight briefly (~120ms) while drain waits, then release tool barrier
-    await new Promise((r) => setTimeout(r, 120))
+    // Keep g1 in-flight (~220ms) while release hook waits, then release tool barrier
+    await new Promise((r) => setTimeout(r, 220))
     syncBarrier.release()
 
-    const [drainResult] = await Promise.all([drainPromise, turn1.run.summary])
-    drainCoordinator.reopen()
+    const [drainCliRes] = await Promise.all([drainCliPromise, turn1.run.summary])
+    assert.equal(
+      drainCliRes.exitCode,
+      0,
+      `Expected drain-remote-v4.sh exit 0, got ${drainCliRes.exitCode}: ${drainCliRes.stderr} ${drainCliRes.stdout}`,
+    )
+    assert.equal(drainCliRes.json?.ok, true)
+    assert.equal(drainCliRes.json?.drained, true)
+    assert.equal(drainCliRes.json?.releaseRunId, releaseRunId)
+    assert.equal(typeof drainCliRes.json?.admissionClosedAt, 'string')
+    assert.equal(typeof drainCliRes.json?.drainedAt, 'string')
+    // Default `keepClosedForRestart: true` keeps admission closed until unit restart or `--reopen`
+    assert.equal(drainCoordinator.isDraining, true)
+
+    const reopenCli = await invokeDrainCli(['--reopen', '--socket', drainSockPath])
+    assert.equal(reopenCli.exitCode, 0)
+    assert.equal(drainCoordinator.isDraining, false)
     const maintenanceWindowRejectionWindowMs = Math.round(performance.now() - maintenanceOpenedAt)
     unregisterG1()
 
-    assert.equal(drainResult.drained, true)
-    assert.ok(drainResult.elapsedMs >= 100, `Expected drain wait >= 100ms, got ${drainResult.elapsedMs}`)
+    const drainElapsedMs = Number(drainCliRes.json?.elapsedMs ?? 0)
+    assert.ok(drainElapsedMs >= 180, `Expected drain wait >= 180ms, got ${drainElapsedMs}`)
     assert.equal(readFileSync(sentinel1Path, 'utf8'), sentinel1Body)
     assert.equal(g1.settledReceipts.length, 1)
     const creditsAfterG1 = await h.getUserCredits()
@@ -602,6 +707,12 @@ async function runAc5Rehearsals() {
     // -------------------------------------------------------------------------
     const opId = g1.placed.binding.operationId
     const g1NativeSessionId = g1.settledReceipts[0].nativeSessionId
+    if (mode === 'live-node') {
+      assert.ok(
+        !g1NativeSessionId.startsWith('thr_conf_'),
+        `Expected real upstream thread ID in live-node mode, got ${g1NativeSessionId}`,
+      )
+    }
     await g1.closeLane()
 
     const relRow = await h.pool.query<{ state: string; native_session_id: string | null }>(
@@ -614,6 +725,7 @@ async function runAc5Rehearsals() {
     const g2 = await h.openLane({
       sessionKey,
       dedicatedToolHost: true,
+      writeOnlyTools: true,
       extraDriverContext: statefulCtx,
     })
     assert.equal(g2.placed.binding.operationId, opId)
@@ -636,7 +748,9 @@ async function runAc5Rehearsals() {
     const sentinel2Path = join(g2.containerCwd, 'ac5-g2-sentinel.txt')
     const sentinel2Body = `ac5-gen2-${randomUUID()}`
     const turn2 = await g2.submitTurn(h.buildWritePrompt(sentinel2Path, sentinel2Body))
-    await turn2.run.summary
+    const sum2 = await turn2.run.summary
+    assert.ok(sum2, 'g2 Turn 2 summary missing')
+    assert.equal(sum2.isError, false, `g2 Turn 2 failed: ${sum2.errorDetail ?? ''}`)
     assert.equal(readFileSync(sentinel2Path, 'utf8'), sentinel2Body)
     assert.equal(g2.settledReceipts.length, 1)
     assert.equal(g2.settledReceipts[0].provenance.generation, '2')
@@ -654,6 +768,7 @@ async function runAc5Rehearsals() {
     const crashLane = await h.openLane({
       sessionKey: crashSessionKey,
       dedicatedToolHost: true,
+      writeOnlyTools: true,
       failTurnInsertOnce: failOnce,
       extraDriverContext: statefulCtx,
     })
@@ -699,20 +814,32 @@ async function runAc5Rehearsals() {
     assert.equal(Number(postRecoveryTurnRows.rows[0]?.cnt ?? '0'), 1)
 
     return {
+      mode,
+      targetHost: h.targetHost,
+      sshMode: h.sshMode,
       rehearsal1CutoverDrain: {
         passed: true,
+        mode,
+        targetHost: h.targetHost,
+        releaseHookScript: 'scripts/agent-remote/drain-remote-v4.sh',
+        releaseRunId,
+        admissionClosedAt: String(drainCliRes.json?.admissionClosedAt),
+        drainedAt: String(drainCliRes.json?.drainedAt),
         inflightRequestId: turn1.requestId,
-        nonDestructiveTimeoutVerified: timeoutAbortedCleanly,
+        journalFinalState,
+        nonDestructiveTimeoutVerified: true,
         newAdmissionRejectedCode: rejectedNewSessionCode,
-        drainElapsedMs: drainResult.elapsedMs,
+        drainElapsedMs,
         maintenanceWindowRejectionWindowMs,
         maintenanceWindowDefinition:
-          'New session admissions rejected with REMOTE_POOL_DRAINING_RETRY_LATER while active relay turns, MCP ACKs, and PG finalize journals drain to 0; zero in-flight turns killed.',
+          'scripts/agent-remote/drain-remote-v4.sh closes new session admissions (REMOTE_POOL_DRAINING_RETRY_LATER) over AF_UNIX drain socket while active relay turns, MCP ACKs, and PG request_finalize_journal rows drain to 0; zero in-flight turns killed.',
         inflightTurnsKilled: 0,
         settledCreditsFen: g1ChargedFen.toString(),
       },
       rehearsal2GenerationUpgrade: {
         passed: true,
+        mode,
+        targetHost: h.targetHost,
         operationId: opId,
         upgradedFromGeneration: '1',
         upgradedToGeneration: '2',
@@ -722,6 +849,8 @@ async function runAc5Rehearsals() {
       },
       rehearsal3CrashSpoolRecovery: {
         passed: true,
+        mode,
+        targetHost: h.targetHost,
         requestId: turn3.requestId,
         toolExecutionsTotal: crashLane.executedCalls.length,
         zeroReplayVerified: true,
@@ -732,7 +861,22 @@ async function runAc5Rehearsals() {
       },
     }
   } finally {
+    drainCoordinator.reopen()
+    await drainSockHandle.close().catch(() => {})
+    rmSync(drainDir, { recursive: true, force: true })
     await h.close()
+  }
+}
+
+function captureGitBinding() {
+  const headRes = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' })
+  const statusRes = spawnSync('git', ['status', '--porcelain'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+  })
+  return {
+    gitHeadSha: headRes.status === 0 ? headRes.stdout.trim() : 'UNKNOWN',
+    gitWorktreeClean: statusRes.status === 0 && statusRes.stdout.trim().length === 0,
   }
 }
 
@@ -741,6 +885,8 @@ async function main() {
   let outputPath = ''
   let ccConformanceDir = ''
   let codexConformanceDir = ''
+  let ccNodeConfigPath = ''
+  let codexNodeConfigPath = ''
   let runLegacyBaseline = false
 
   for (let i = 0; i < argv.length; i++) {
@@ -748,13 +894,16 @@ async function main() {
     if (a === '--output') outputPath = resolve(argv[++i])
     else if (a === '--cc-conformance') ccConformanceDir = resolve(argv[++i])
     else if (a === '--codex-conformance') codexConformanceDir = resolve(argv[++i])
+    else if (a === '--cc-node-config') ccNodeConfigPath = resolve(argv[++i])
+    else if (a === '--codex-node-config') codexNodeConfigPath = resolve(argv[++i])
     else if (a === '--run-legacy-baseline') runLegacyBaseline = true
     else throw new Error(`Unknown argument: ${a}`)
   }
 
+  const gitBinding = captureGitBinding()
   const ccOverhead = await measureDriverSchedulingOverhead('cc', 200)
   const codexOverhead = await measureDriverSchedulingOverhead('codex', 200)
-  const ac5 = await runAc5Rehearsals()
+  const ac5 = await runAc5Rehearsals(codexNodeConfigPath || undefined)
   const legacyBaseline = runLegacyBaseline ? runLegacyBaselineSuites() : null
   const liveParity =
     ccConformanceDir && codexConformanceDir
@@ -763,10 +912,16 @@ async function main() {
           codex: verifyLiveConformanceEvidence(codexConformanceDir, 'codex'),
         }
       : null
+  const sameNodeLegacyVsV4Parity =
+    ccNodeConfigPath && codexNodeConfigPath
+      ? await runSameNodeLegacyVsV4Parity({ ccNodeConfigPath, codexNodeConfigPath })
+      : null
 
   const report = {
     ticket: 'OCV5-749',
     generatedAt: new Date().toISOString(),
+    gitHeadSha: gitBinding.gitHeadSha,
+    gitWorktreeClean: gitBinding.gitWorktreeClean,
     ac4: {
       schedulingOverheadGate: {
         budgetP95Ms: 50,
@@ -776,6 +931,7 @@ async function main() {
       },
       legacy746BaselineSuites: legacyBaseline,
       liveNodeParityCrossCheck: liveParity,
+      sameNodeLegacyVsV4Parity,
     },
     ac5,
     overallPassed:
@@ -784,6 +940,7 @@ async function main() {
       ac5.rehearsal1CutoverDrain.passed &&
       ac5.rehearsal2GenerationUpgrade.passed &&
       ac5.rehearsal3CrashSpoolRecovery.passed &&
+      (codexNodeConfigPath ? ac5.mode === 'live-node' : true) &&
       (legacyBaseline ? legacyBaseline.every((s) => s.passed) : true) &&
       (liveParity !== null
         ? liveParity.cc.group1ContainerToolVerified &&
@@ -792,7 +949,8 @@ async function main() {
           liveParity.codex.group4StopProofVerified &&
           liveParity.cc.group5MultiTurnResumeAndFeeVerified &&
           liveParity.codex.group5MultiTurnResumeAndFeeVerified
-        : true),
+        : true) &&
+      (sameNodeLegacyVsV4Parity !== null ? sameNodeLegacyVsV4Parity.passed : true),
   }
 
   if (outputPath) {

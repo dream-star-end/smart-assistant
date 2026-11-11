@@ -14,7 +14,7 @@
  *   cutover (`AC-5`) and seamlessly upgrades sticky v1/v3 bindings to v4 on the next generation.
  */
 import { randomBytes, randomUUID } from 'node:crypto'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { Pool } from 'pg'
 import {
   REMOTE_DRIVER_BACKEND,
@@ -86,6 +86,9 @@ export interface PlaceRemoteDriverLaneOptions {
   readonly localSandboxDir?: string
   /** Optional tighten-only slice memory ceiling (bytes) enforced by `resources.admit`. */
   readonly maxSliceMemoryBytes?: number
+  /** Strictly sandbox-fenced (`/tmp/oc-drvtest-*`) fault-injection mode for `AC-1` Group 6 Red controls. */
+  readonly allowTestFaultsInSandbox?: boolean
+  readonly testFaultSandboxMode?: 'account_mutex' | 'shared_node_cap_5'
 }
 
 export interface RemoteDriverPlacementResult {
@@ -161,6 +164,14 @@ export async function placeRemoteDriverLane(
     throw new Error('REMOTE_POOL_EXECUTION_DISABLED')
   }
   options.drainGate?.assertAdmissionOpen()
+  if (options.testFaultSandboxMode !== undefined) {
+    need(
+      options.allowTestFaultsInSandbox === true &&
+        typeof options.localSandboxDir === 'string' &&
+        options.localSandboxDir.startsWith('/tmp/oc-drvtest-'),
+      'REMOTE_FAULT_INJECTION_SANDBOX_ONLY',
+    )
+  }
 
   const pool = options.pool ?? getPool()
   const now = options.now ?? Date.now
@@ -186,6 +197,10 @@ export async function placeRemoteDriverLane(
   const legacyProfileEngine = legacyProfileEngineForAuthority(reg.authorityEngine)
   const legacyBindEngine = legacyBindingEngineForAuthority(reg.authorityEngine)
 
+  const accountMutexDeadline =
+    options.testFaultSandboxMode === 'account_mutex' ? Date.now() + 15_000 : 0
+  while (true) {
+  let retryAccountMutex = false
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -276,8 +291,8 @@ export async function placeRemoteDriverLane(
       verifiedProbe = snap
       activeFingerprint = fp
     } else {
-      const candidates = (
-        await client.query(
+      const candidates: Array<Record<string, any>> = (
+        await client.query<Record<string, any>>(
           `SELECT p.*, p.id AS profile_id, p.node_id,
                   o.id AS offer_id, o.upstream_model_id, o.canonical_model_id,
                   n.label, n.ssh_host, n.ssh_port, n.ssh_user, n.host_key_fp, n.key_id,
@@ -325,7 +340,7 @@ export async function placeRemoteDriverLane(
       ).rows[0]
 
       const readyMap = new Map<string, { snapshot: RemoteProbeSnapshot; fingerprint: string; effectiveCap: number }>()
-      const eligible: typeof candidates = []
+      const eligible: Array<Record<string, any>> = []
       const fullProfiles = new Set<string>()
       const reverifyProfiles = new Set<string>()
       const staleProfiles = new Set<string>()
@@ -347,14 +362,27 @@ export async function placeRemoteDriverLane(
         const used = Number(
           (
             await client.query<{ profile_used: number }>(
-              `SELECT COUNT(*)::int AS profile_used
-                 FROM remote_agent_bindings
-                WHERE profile_id = $1 AND state <> 'released'`,
-              [row.profile_id],
+              options.testFaultSandboxMode === 'shared_node_cap_5'
+                ? `SELECT COUNT(*)::int AS profile_used
+                     FROM remote_agent_bindings
+                    WHERE node_id = $1 AND state <> 'released'`
+                : `SELECT COUNT(*)::int AS profile_used
+                     FROM remote_agent_bindings
+                    WHERE profile_id = $1 AND state <> 'released'`,
+              [
+                options.testFaultSandboxMode === 'shared_node_cap_5'
+                  ? row.node_id
+                  : row.profile_id,
+              ],
             )
           ).rows[0]?.profile_used ?? 0,
         )
-        const effectiveCap = Math.min(Number(row.max_concurrent_lanes), reg.profileMaxLanes)
+        const effectiveCap =
+          options.testFaultSandboxMode === 'account_mutex'
+            ? 1
+            : options.testFaultSandboxMode === 'shared_node_cap_5'
+              ? 5
+              : Math.min(Number(row.max_concurrent_lanes), reg.profileMaxLanes)
         if (used >= effectiveCap) {
           fullProfiles.add(pid)
           continue
@@ -552,11 +580,33 @@ export async function placeRemoteDriverLane(
       upstreamModel,
     })
 
+    const execManifestObj =
+      selectedRow.execution_manifest &&
+      typeof selectedRow.execution_manifest === 'object' &&
+      !Array.isArray(selectedRow.execution_manifest)
+        ? (selectedRow.execution_manifest as Record<string, unknown>)
+        : {}
+    const manifestDriverCtx =
+      execManifestObj.driverContext &&
+      typeof execManifestObj.driverContext === 'object' &&
+      !Array.isArray(execManifestObj.driverContext)
+        ? (execManifestObj.driverContext as Record<string, unknown>)
+        : {}
+    const defaultMcpClientPath =
+      options.localSandboxDir !== undefined
+        ? join(dirname(controllerPath), 'mcp_client.py')
+        : `/opt/openclaude/remote-driver/${reg.controllerSha256}/core/mcp_client.py`
+    const mergedDriverContext: Record<string, unknown> = {
+      mcpClientPath: defaultMcpClientPath,
+      ...manifestDriverCtx,
+      ...(input.driverContext ?? {}),
+    }
+
     const spec: RemotePoolLaneSpec = Object.freeze({
       controllerPath,
       controllerSha256: reg.controllerSha256,
       manifest,
-      driverContext: input.driverContext ?? {},
+      driverContext: mergedDriverContext,
       verifiedProbe,
       ...(options.registryPath ? { registryPath: options.registryPath } : {}),
     })
@@ -645,9 +695,22 @@ export async function placeRemoteDriverLane(
     }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
-    throw err
+    if (
+      options.testFaultSandboxMode === 'account_mutex' &&
+      err instanceof Error &&
+      err.message === 'REMOTE_LANE_CAPACITY_EXHAUSTED' &&
+      Date.now() < accountMutexDeadline
+    ) {
+      retryAccountMutex = true
+    } else {
+      throw err
+    }
   } finally {
     client.release()
+  }
+  if (retryAccountMutex) {
+    await new Promise((r) => setTimeout(r, 20))
+  }
   }
 }
 

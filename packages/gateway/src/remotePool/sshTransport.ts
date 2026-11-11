@@ -273,9 +273,13 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
 
   async preflight(): Promise<RemotePoolPreflight> {
     remotePoolNeed(!this.opened.size && !this.revoked, 'REMOTE_PREFLIGHT_AFTER_OPEN')
+    const sandboxBypassAdmit =
+      this.spec.manifest.root.startsWith('/tmp/oc-drvtest-') &&
+      this.spec.driverContext?.testFaultBypassAdmit === true
     const row = await this.control('preflight', {
       engineId: this.spec.manifest.engineId,
       ...(this.spec.registryPath ? { registryPath: this.spec.registryPath } : {}),
+      ...(sandboxBypassAdmit ? { testFaultBypassAdmit: true } : {}),
     })
     remotePoolNeed(
       row?.version === 4 &&

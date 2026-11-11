@@ -28,10 +28,12 @@ import {
 } from 'node:fs'
 import { join, resolve } from 'node:path'
 import {
+  buildRemoteReceiptV4,
   computeCostFen,
   normalizeUsageWithPolicy,
   remoteCanonicalSha256,
   zeroCountersForUsagePolicy,
+  type RemoteReceiptV4,
 } from '@openclaude/protocol'
 import {
   RemoteObservationGate,
@@ -179,7 +181,10 @@ async function runGroup1(h: ConformanceHarness): Promise<GroupResult> {
   const t0 = Date.now()
 
   // --- GREEN ---
-  const lane = await h.openLane({ dedicatedToolHost: true })
+  const lane = await h.openLane({
+    dedicatedToolHost: true,
+    disallowedTools: ['SearchExtraTools', 'ExecuteExtraTool'],
+  })
   const taskRoot = lane.placed.spec.manifest.root
   const sentinelName = `remote-sentinel-${randomUUID().slice(0, 8)}.txt`
   const containerSentinel = join(lane.containerCwd, sentinelName)
@@ -314,8 +319,8 @@ async function runGroup1(h: ConformanceHarness): Promise<GroupResult> {
           supervisorStopProof: stoppedProof,
           receiptDigests: {
             rawEvidenceDigest: receipt.rawEvidenceDigest,
-            securityEventDigest: receipt.securityEventDigest,
-            usageDigest: receipt.usageDigest,
+            semanticDigest: receipt.semanticDigest,
+            receiptDigest: receipt.receiptDigest,
           },
           settledCredits: usageRows[0]!.cost_credits,
         },
@@ -504,6 +509,7 @@ async function runGroup3(h: ConformanceHarness): Promise<GroupResult> {
     fileName: string,
     directivePrefix: string,
     token: string,
+    expectedFence: RegExp,
     timeoutMs = 220,
   ) => {
     const lane = await h.openFaultInjectionLane({ toolAuthorizeTimeoutMs: timeoutMs })
@@ -513,25 +519,58 @@ async function runGroup3(h: ConformanceHarness): Promise<GroupResult> {
       await turn.run.summary
       assert.equal(lane.executedCalls.length, 0)
       assert.equal(existsSync(target), false)
-      assert.match(lane.relay.fenceReason ?? '', /^REMOTE_TOOL_/, `${key} fence: ${lane.getFenceDiag()}`)
+      assert.match(lane.relay.fenceReason ?? '', expectedFence, `${key} fence: ${lane.getFenceDiag()}`)
       subcaseResults[key] = {
         environment: 'local-sandbox-wire-fault-injection',
         executed: 0,
         fenceReason: lane.relay.fenceReason,
+        expectedFencePattern: expectedFence.source,
       }
     } finally {
       await lane.closeLane()
     }
   }
 
-  // 3.1, 3.3, 3.4, 3.5: Malformed/forged MCP wire injections verified fail-closed with 0 executions.
+  const missingObsPattern = /^(REMOTE_TOOL_NOT_OBSERVED|REMOTE_SOCKET_OBSERVATION_MISSING)$/
+  const mismatchObsPattern =
+    /^(REMOTE_TOOL_SCOPE_MISMATCH|REMOTE_TOOL_ARGS_HASH_MISMATCH|REMOTE_SOCKET_OBSERVATION_MISMATCH)$/
+
+  // 3.1, 3.3, 3.4, 3.5: Malformed/forged MCP wire injections verified fail-closed with specific gate reason & 0 executions.
   await Promise.all([
-    runNegativeObservationCase('forgedCallId', 'g3-forged.txt', 'UNOBSERVED_FORGED', 'FORGED', 220),
-    runNegativeObservationCase('argsHashMismatch', 'g3-tampered.txt', 'ARGS_HASH_MISMATCH', 'TAMPERED_SECRET', 220),
+    runNegativeObservationCase(
+      'forgedCallId',
+      'g3-forged.txt',
+      'UNOBSERVED_FORGED',
+      'FORGED',
+      missingObsPattern,
+      220,
+    ),
+    runNegativeObservationCase(
+      'argsHashMismatch',
+      'g3-tampered.txt',
+      'ARGS_HASH_MISMATCH',
+      'TAMPERED_SECRET',
+      mismatchObsPattern,
+      1500,
+    ),
   ])
   await Promise.all([
-    runNegativeObservationCase('partialDeltaOnly', 'g3-partial.txt', 'PARTIAL_DELTA_ONLY', 'PARTIAL_ONLY', 220),
-    runNegativeObservationCase('mcpBeforeObservation', 'g3-early-mcp.txt', 'MCP_BEFORE_OBSERVATION', 'EARLY_MCP', 200),
+    runNegativeObservationCase(
+      'partialDeltaOnly',
+      'g3-partial.txt',
+      'PARTIAL_DELTA_ONLY',
+      'PARTIAL_ONLY',
+      missingObsPattern,
+      220,
+    ),
+    runNegativeObservationCase(
+      'mcpBeforeObservation',
+      'g3-early-mcp.txt',
+      'MCP_BEFORE_OBSERVATION',
+      'EARLY_MCP',
+      missingObsPattern,
+      200,
+    ),
   ])
 
   // 3.2 Wrong session / wrong generation rejected fail-closed
@@ -635,6 +674,7 @@ async function runGroup3(h: ConformanceHarness): Promise<GroupResult> {
     let capturedCallId = ''
     const lane = await h.openLane({
       dedicatedToolHost: true,
+      writeOnlyTools: true,
       toolExecutionBarrier: dupSync.barrier,
       callInterceptor: async (path, body, defaultCall) => {
         const res = await defaultCall(path, body)
@@ -674,6 +714,11 @@ async function runGroup3(h: ConformanceHarness): Promise<GroupResult> {
         'Concurrent duplicate over remote tool.sock must return cached result (200) without re-execution',
       )
       assertTurnOk(sum, lane, 'Group 3.6 live valid match turn')
+      assert.equal(
+        lane.executedCalls.filter((c) => c.toolUseId === capturedCallId).length,
+        1,
+        'Observed callId must execute strictly once despite concurrent duplicate over tool.sock',
+      )
       assert.equal(lane.executedCalls.length, 1, 'Valid observed call must execute strictly once')
       assert.equal(readFileSync(target, 'utf8'), 'EXACT_ONCE')
       await lane.closeLane()
@@ -820,17 +865,21 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
 
   // 4a.3 Disconnect AFTER tool execution BEFORE container `/tool/ack` + real remote `tool-attempts` WAL proof
   {
+    let walCheckDone: Promise<void> | undefined
     const ackDropLane = await h.openLane({
       dedicatedToolHost: true,
       writeOnlyTools: true,
       callInterceptor: async (path, body, defaultCall) => {
         if (path === '/tool/ack') {
-          const walRes = await h.verifyTaskWalReplay(
-            ackDropLane.placed.spec.manifest.root,
-            String(body.callId),
-          )
-          cachedReplayStatus = walRes.cachedReplayStatus
-          inflightDuplicateStatus = walRes.inflightDuplicateStatus
+          walCheckDone = (async () => {
+            const walRes = await h.verifyTaskWalReplay(
+              ackDropLane.placed.spec.manifest.root,
+              String(body.callId),
+            )
+            cachedReplayStatus = walRes.cachedReplayStatus
+            inflightDuplicateStatus = walRes.inflightDuplicateStatus
+          })()
+          await walCheckDone
           throw new Error('SIMULATED_CONTAINER_DISCONNECT_BEFORE_ACK')
         }
         return await defaultCall(path, body)
@@ -841,6 +890,7 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
       const ackTurn = await ackDropLane.submitTurn(h.buildWritePrompt(ackTarget, 'ONCE_ONLY'))
       ackRequestId = ackTurn.requestId
       const ackSummary = await ackTurn.run.summary
+      await walCheckDone
       assertTurnFailed(ackSummary, 'Disconnect before ack must fail turn')
       ackDropExecutions = ackDropLane.executedCalls.length
       assert.equal(ackDropExecutions, 1, 'Tool side effect must happen AT MOST ONCE')
@@ -857,7 +907,7 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
 
   // 4a.4 Disconnect AFTER terminal BEFORE PG commit -> recovered via `0000000N-native-terminal.json` spool!
   const failOnce = { active: true }
-  const spoolLane = await h.openLane({ failTurnInsertOnce: failOnce })
+  const spoolLane = await h.openLane({ failTurnInsertOnce: failOnce, writeOnlyTools: true })
   const spoolTarget = join(spoolLane.containerCwd, 'g4-spool.txt')
   const spoolTurn = await spoolLane.submitTurn(h.buildWritePrompt(spoolTarget, 'SPOOL_RECOVER'))
   const spoolSum = await spoolTurn.run.summary
@@ -896,21 +946,69 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
   ).rows
   assert.equal(unchargedAborts.length, 0, 'Mid-cancel and pre-ACK disconnect turns must remain unbilled')
 
-  // 4a RED CONTROL: WAL-disabled retry dispatches side effect twice (`2 > 1`)
+  // 4a RED CONTROL: Disable attempt WAL (`mcp_socket.py`) + duplicate claim guard in isolated sandbox,
+  // replay the exact pre-ACK tool call over real `tool.sock`, and prove `Cc5ToolHost.execute` runs twice (`2 > 1`).
   let r4aRedCaught = false
+  let r4aRedExecutions = 0
+  let r4aRedAttemptWalAbsent = false
   {
-    let walDisabledSideEffects = 0
-    const executeWithoutAttemptWal = (callId: string) => {
-      void callId
-      walDisabledSideEffects += 1
-    }
-    executeWithoutAttemptWal('call_retry_1')
-    executeWithoutAttemptWal('call_retry_1')
-    if (walDisabledSideEffects > 1) {
-      r4aRedCaught = true
+    let ackInterceptedOnce = false
+    let replayRoundtripPromise: Promise<{ status: number; body: string }> | undefined
+    const redAckLane = await h.openFaultInjectionLane({
+      dedicatedToolHost: true,
+      writeOnlyTools: true,
+      extraDriverContext: { testFaultDisableAttemptWal: true },
+      observationOptions: { testFaultAllowDuplicateClaim: true, allowTestBypassInTmp: true },
+      containerObservationOptions: { testFaultAllowDuplicateClaim: true, allowTestBypassInTmp: true },
+      callInterceptor: async (path, body, defaultCall) => {
+        if (path === '/tool/ack' && !ackInterceptedOnce) {
+          ackInterceptedOnce = true
+          const callId = String(body.callId)
+          const callKey = createHash('sha256').update(callId).digest('hex')
+          r4aRedAttemptWalAbsent = !existsSync(
+            join(redAckLane.placed.spec.manifest.root, 'tool-attempts', `${callKey}.attempt.json`),
+          )
+          const attemptJournal = readdirSync(redAckLane.journalDir)
+            .sort()
+            .find((f) => f.endsWith('-tool-attempt.json'))
+          assert.ok(attemptJournal, 'First tool-attempt journal must exist')
+          const rawWireBytes = readFileSync(join(redAckLane.journalDir, attemptJournal))
+          replayRoundtripPromise = h.postTaskToolSockRoundtrip(
+            redAckLane.placed.spec.manifest.root,
+            rawWireBytes,
+          )
+          replayRoundtripPromise.catch(() => {})
+          const deadline = Date.now() + 8_000
+          while (Date.now() < deadline) {
+            const count = readdirSync(redAckLane.journalDir).filter((f) =>
+              f.endsWith('-tool-attempt.json'),
+            ).length
+            if (count >= 2) break
+            await pause(15)
+          }
+        }
+        return await defaultCall(path, body)
+      },
+    })
+    try {
+      const redAckTarget = join(redAckLane.containerCwd, 'g4-red-waldisabled.txt')
+      const redAckTurn = await redAckLane.submitTurn(
+        `SENTINEL_WRITE:${redAckTarget}:WAL_DISABLED_RETRY`,
+      )
+      assertTurnOk(await redAckTurn.run.summary, redAckLane, 'Group 4a red fault-injected turn')
+      if (replayRoundtripPromise) {
+        const replayRes = await replayRoundtripPromise
+        assert.equal(replayRes.status, 200)
+      }
+      r4aRedExecutions = redAckLane.executedCalls.length
+      if (r4aRedAttemptWalAbsent && r4aRedExecutions === 2) {
+        r4aRedCaught = true
+      }
+    } finally {
+      await redAckLane.closeLane()
     }
   }
-  assert.equal(r4aRedCaught, true)
+  assert.equal(r4aRedCaught, true, `Expected WAL-disabled retry to execute twice, got ${r4aRedExecutions}`)
   const r4aDurationMs = Date.now() - r4aStart
 
   // ==================== R4b: Strict Stop Proof & Unknown Slot Retention ====================
@@ -1055,8 +1153,10 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
         },
         redDetails: {
           environment: 'local-sandbox-fault-injection',
-          injectedFault: 'wal_disabled_mcp_retry',
-          doubleExecutionDetected: true,
+          injectedFault: 'testFaultDisableAttemptWal_and_testFaultAllowDuplicateClaim',
+          attemptWalSkippedOnNode: r4aRedAttemptWalAbsent,
+          observedToolHostExecutions: r4aRedExecutions,
+          doubleExecutionDetected: r4aRedExecutions > 1,
         },
       },
       {
@@ -1096,7 +1196,7 @@ async function runGroup5(h: ConformanceHarness): Promise<GroupResult> {
 
   // 5.1 Multi-turn warm session reuse + normalized usage + exact PG ledger delta on REAL target node!
   const creditsBefore = await h.getUserCredits()
-  const lane = await h.openLane()
+  const lane = await h.openLane({ writeOnlyTools: true })
 
   const s1 = join(lane.containerCwd, 'g5-turn1.txt')
   const s2 = join(lane.containerCwd, 'g5-turn2.txt')
@@ -1159,6 +1259,8 @@ async function runGroup5(h: ConformanceHarness): Promise<GroupResult> {
   try {
     const tDupSame = await dupSameLane.submitTurn('DUPLICATE_TERMINAL:SAME')
     assertTurnOk(await tDupSame.run.summary, dupSameLane, 'Group 5 duplicate same terminal')
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(dupSameLane.relay.fenceReason, undefined)
     const dupSameRows = (
       await h.pool.query('SELECT 1 FROM usage_records WHERE request_id = $1', [tDupSame.requestId])
     ).rows
@@ -1178,6 +1280,10 @@ async function runGroup5(h: ConformanceHarness): Promise<GroupResult> {
       try {
         const tConflict = await conflictLane.submitTurn('DUPLICATE_TERMINAL:CONFLICT')
         await tConflict.run.summary
+        const conflictDeadline = Date.now() + 5_000
+        while (!conflictLane.relay.fenceReason && Date.now() < conflictDeadline) {
+          await new Promise((r) => setTimeout(r, 20))
+        }
         conflictFenceReason = conflictLane.relay.fenceReason
         assert.equal(conflictFenceReason, 'REMOTE_TERMINAL_CONFLICT')
         const conflictRows = (
@@ -1229,26 +1335,171 @@ async function runGroup5(h: ConformanceHarness): Promise<GroupResult> {
     }
   }
 
-  // --- RED CONTROL: Baseline-reset / cumulative-as-per-turn / double-terminal billing bug ---
+  // --- RED CONTROL: Drive real settlement pipeline (`RemotePoolRelay` -> `createRemoteDriverTurnFinance` ->
+  // `request_finalize_journal` -> `remote_native_turns` -> `usage_records` -> `users.credits`) with a
+  // baseline-reset / cumulative-as-per-turn receipt defect + conflicting terminal receipt ---
   let redCaught = false
+  let expectedRedTotal = 0n
   let defectiveCredits = 0n
+  let conflictReceiptCode = ''
   {
-    const trueTwoTurnTotal = expectedCost1 + expectedCost2
-    if (h.usagePolicy.mode === 'cumulative') {
-      const buggyNorm2 = normalizeUsageWithPolicy(
-        h.usagePolicy,
-        r2.countersFinal,
-        zeroCountersForUsagePolicy(h.usagePolicy),
+    const redCreditsBefore = await h.getUserCredits()
+    let redTurnSeq = 0
+    let savedRedTurn1: RemoteReceiptV4 | undefined
+    let trueRedTurn2Usage: {
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+    } | undefined
+
+    const redBillingLane = await h.openFaultInjectionLane({
+      faultTransformTerminalReceipt: async (rcpt) => {
+        redTurnSeq += 1
+        if (redTurnSeq === 1) {
+          savedRedTurn1 = rcpt
+          return rcpt
+        }
+        if (h.usagePolicy.mode === 'cumulative') {
+          trueRedTurn2Usage = normalizeUsageWithPolicy(
+            h.usagePolicy,
+            rcpt.countersFinal,
+            savedRedTurn1!.countersFinal,
+          ).usage
+          return rcpt
+        }
+        // `per_turn` defect injection: feed un-subtracted cumulative counters into `per_turn` settlement.
+        trueRedTurn2Usage = rcpt.usage
+        const inflatedCounters: Record<string, number> = {}
+        for (const [k, v] of Object.entries(rcpt.countersFinal)) {
+          inflatedCounters[k] = v + Number(savedRedTurn1!.countersFinal[k] ?? 0)
+        }
+        return buildRemoteReceiptV4({
+          engineId: rcpt.engineId,
+          driverId: rcpt.driverId,
+          driverVersion: rcpt.driverVersion,
+          driverDigest: rcpt.driverDigest,
+          uid: rcpt.uid,
+          containerDbId: rcpt.containerDbId,
+          dockerId: rcpt.dockerId,
+          operationId: rcpt.operationId,
+          runId: rcpt.runId,
+          sessionKey: rcpt.sessionKey,
+          canonicalModel: rcpt.canonicalModel,
+          upstreamModel: rcpt.upstreamModel,
+          profileId: rcpt.profileId,
+          authEpoch: rcpt.authEpoch,
+          authorityTurnId: rcpt.authorityTurnId,
+          turnKey: rcpt.turnKey,
+          requestId: rcpt.requestId,
+          nativeSessionId: rcpt.nativeSessionId,
+          terminalId: rcpt.terminalId,
+          policy: h.usagePolicy,
+          countersBaseline: null,
+          countersFinal: inflatedCounters,
+          nativeStatus: rcpt.nativeStatus,
+          rawEvidenceDigest: rcpt.rawEvidenceDigest,
+          provenance: rcpt.provenance,
+        })
+      },
+      faultOnAfterTerminalSettled: async (innerTurn, settledRcpt) => {
+        if (redTurnSeq !== 2) return
+        const mutatedCounters: Record<string, number> = {
+          ...settledRcpt.countersFinal,
+          [h.usagePolicy.inputField]:
+            Number(settledRcpt.countersFinal[h.usagePolicy.inputField] ?? 0) + 77,
+        }
+        const conflictingRcpt = buildRemoteReceiptV4({
+          engineId: settledRcpt.engineId,
+          driverId: settledRcpt.driverId,
+          driverVersion: settledRcpt.driverVersion,
+          driverDigest: settledRcpt.driverDigest,
+          uid: settledRcpt.uid,
+          containerDbId: settledRcpt.containerDbId,
+          dockerId: settledRcpt.dockerId,
+          operationId: settledRcpt.operationId,
+          runId: settledRcpt.runId,
+          sessionKey: settledRcpt.sessionKey,
+          canonicalModel: settledRcpt.canonicalModel,
+          upstreamModel: settledRcpt.upstreamModel,
+          profileId: settledRcpt.profileId,
+          authEpoch: settledRcpt.authEpoch,
+          authorityTurnId: settledRcpt.authorityTurnId,
+          turnKey: settledRcpt.turnKey,
+          requestId: settledRcpt.requestId,
+          nativeSessionId: settledRcpt.nativeSessionId,
+          terminalId: settledRcpt.terminalId,
+          policy: h.usagePolicy,
+          countersBaseline: settledRcpt.countersBaseline,
+          countersFinal: mutatedCounters,
+          nativeStatus: settledRcpt.nativeStatus,
+          rawEvidenceDigest: settledRcpt.rawEvidenceDigest,
+          provenance: settledRcpt.provenance,
+        })
+        try {
+          await innerTurn.terminal(conflictingRcpt)
+        } catch (err) {
+          conflictReceiptCode = err instanceof Error ? err.message : String(err)
+        }
+      },
+    })
+    try {
+      const redT1 = await redBillingLane.submitTurn(
+        `SENTINEL_WRITE:${join(redBillingLane.containerCwd, 'g5-red-t1.txt')}:R5_1`,
       )
-      defectiveCredits = expectedCost1 + computeExpectedCredits(buggyNorm2.usage)
-    } else {
-      defectiveCredits = expectedCost1 + expectedCost2 * 2n
-    }
-    if (defectiveCredits !== trueTwoTurnTotal) {
-      redCaught = true
+      assertTurnOk(await redT1.run.summary, redBillingLane, 'Group 5 red turn 1')
+      assert.ok(savedRedTurn1, 'Group 5 red turn 1 must settle')
+
+      if (h.usagePolicy.mode === 'cumulative') {
+        // Inject baseline-reset defect into PG thread boundary before Turn 2 binds!
+        await h.pool.query(
+          `UPDATE remote_native_threads
+              SET total = $4::jsonb
+            WHERE uid = $1 AND operation_id = $2 AND native_thread_id = $3`,
+          [
+            h.uid,
+            redBillingLane.placed.binding.operationId,
+            savedRedTurn1.nativeSessionId,
+            JSON.stringify(zeroCountersForUsagePolicy(h.usagePolicy)),
+          ],
+        )
+      }
+
+      const redT2 = await redBillingLane.submitTurn(
+        `SENTINEL_WRITE:${join(redBillingLane.containerCwd, 'g5-red-t2.txt')}:R5_2`,
+      )
+      assertTurnOk(await redT2.run.summary, redBillingLane, 'Group 5 red turn 2')
+      assert.ok(trueRedTurn2Usage, 'Group 5 red turn 2 must capture true delta usage')
+
+      const redUsageRows = (
+        await h.pool.query<{ cost_credits: string }>(
+          'SELECT cost_credits::text FROM usage_records WHERE request_id = ANY($1::text[])',
+          [[redT1.requestId, redT2.requestId]],
+        )
+      ).rows
+      assert.equal(redUsageRows.length, 2, 'Both red fault turns must settle into PG usage_records')
+      const redUsageSum = redUsageRows.reduce((acc, r) => acc + BigInt(r.cost_credits), 0n)
+      const redCreditsAfter = await h.getUserCredits()
+      defectiveCredits = redCreditsBefore - redCreditsAfter
+      assert.equal(defectiveCredits, redUsageSum, 'PG ledger delta must match usage_records sum')
+
+      expectedRedTotal =
+        computeExpectedCredits(savedRedTurn1.usage) + computeExpectedCredits(trueRedTurn2Usage)
+      if (
+        defectiveCredits > expectedRedTotal &&
+        conflictReceiptCode === 'REMOTE_RECEIPT_CONFLICT'
+      ) {
+        redCaught = true
+      }
+    } finally {
+      await redBillingLane.closeLane()
     }
   }
-  assert.equal(redCaught, true, 'Group 5 red control MUST catch baseline-reset / double-settle')
+  assert.equal(
+    redCaught,
+    true,
+    `Group 5 red control MUST catch PG ledger overcharge (${defectiveCredits} vs ${expectedRedTotal}) and REMOTE_RECEIPT_CONFLICT (${conflictReceiptCode})`,
+  )
 
   const durationMs = Date.now() - t0
   return {
@@ -1280,13 +1531,13 @@ async function runGroup5(h: ConformanceHarness): Promise<GroupResult> {
           turn2Credits: expectedCost2.toString(),
           receipt1Digests: {
             rawEvidenceDigest: r1.rawEvidenceDigest,
-            securityEventDigest: r1.securityEventDigest,
-            usageDigest: r1.usageDigest,
+            semanticDigest: r1.semanticDigest,
+            receiptDigest: r1.receiptDigest,
           },
           receipt2Digests: {
             rawEvidenceDigest: r2.rawEvidenceDigest,
-            securityEventDigest: r2.securityEventDigest,
-            usageDigest: r2.usageDigest,
+            semanticDigest: r2.semanticDigest,
+            receiptDigest: r2.receiptDigest,
           },
           remoteNodeStopProof: g5StopProof,
           malformedWireSubcasesEnvironment: 'local-sandbox-fault-injection',
@@ -1299,10 +1550,11 @@ async function runGroup5(h: ConformanceHarness): Promise<GroupResult> {
           environment: 'local-sandbox-fault-injection',
           injectedFault:
             h.usagePolicy.mode === 'cumulative'
-              ? 'reset_cumulative_baseline_on_turn2'
-              : 'un_deduplicated_terminal_double_settle',
-          expectedTotalCredits: (expectedCost1 + expectedCost2).toString(),
-          defectiveTotalCredits: defectiveCredits.toString(),
+              ? 'pg_thread_baseline_reset_on_turn2_plus_conflicting_terminal_receipt'
+              : 'inflated_unsubtracted_counters_on_turn2_plus_conflicting_terminal_receipt',
+          expectedTotalCredits: expectedRedTotal.toString(),
+          defectiveSettledLedgerCredits: defectiveCredits.toString(),
+          conflictingTerminalRejectedWith: conflictReceiptCode,
         },
       },
     ],
@@ -1327,6 +1579,7 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
     h.openLane({
       sessionIndex: 61,
       dedicatedToolHost: true,
+      writeOnlyTools: true,
       toolExecutionBarrier: {
         onArrive: () => syncA.barrier.onArrive(),
         waitRelease: sharedRelease,
@@ -1335,6 +1588,7 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
     h.openLane({
       sessionIndex: 62,
       dedicatedToolHost: true,
+      writeOnlyTools: true,
       toolExecutionBarrier: {
         onArrive: () => syncB.barrier.onArrive(),
         waitRelease: sharedRelease,
@@ -1429,50 +1683,108 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
   await laneA.closeLane()
   await laneB.closeLane()
 
-  // --- RED CONTROL: (1) Account-exclusive lock breaks overlap barrier; (2) Shared node cap=5 blocks peer engine ---
+  // --- RED CONTROL: Inject real sandbox placement faults (`account_mutex` & `shared_node_cap_5`) into `placeRemoteDriverLane` ---
   let redOverlapCaught = false
   let redSharedCapCaught = false
+  let redSharedCapError = ''
   {
-    let s1AtBarrier = false
-    let s2AtBarrier = false
-    let bothSimultaneous = false
-    let acctLock: Promise<void> = Promise.resolve()
-    const runSerialized = async (which: 1 | 2) => {
-      const prev = acctLock
-      let release!: () => void
-      acctLock = new Promise<void>((r) => {
-        release = r
+    // (1) `testFaultSandboxMode: 'account_mutex'` serializes same-account placement (`cap = 1`),
+    //     causing the simultaneous rendezvous barrier (`aArrived && bArrivedDuringHold`) to fail!
+    const mutexSyncA = createAsyncBarrier()
+    const mutexSyncB = createAsyncBarrier()
+    const redMutexA = await h.openFaultInjectionLane({
+      sessionIndex: 601,
+      dedicatedToolHost: true,
+      testFaultSandboxMode: 'account_mutex',
+      toolExecutionBarrier: mutexSyncA.barrier,
+    })
+    const redSentA = join(redMutexA.containerCwd, 'g6-red-mutex-a.txt')
+    const redTurnA = await redMutexA.submitTurn(`SENTINEL_WRITE:${redSentA}:MUTEX_A`)
+    assert.equal(await waitForPromiseWithTimeout(mutexSyncA.waitArrived, 25_000), true)
+
+    const redMutexBTask = (async () => {
+      const lane = await h.openFaultInjectionLane({
+        sessionIndex: 602,
+        dedicatedToolHost: true,
+        testFaultSandboxMode: 'account_mutex',
+        toolExecutionBarrier: mutexSyncB.barrier,
       })
-      await prev
-      try {
-        if (which === 1) s1AtBarrier = true
-        else s2AtBarrier = true
-        const deadline = Date.now() + 120
-        while (Date.now() < deadline) {
-          if (s1AtBarrier && s2AtBarrier) {
-            bothSimultaneous = true
-            break
-          }
-          await pause(15)
-        }
-      } finally {
-        if (which === 1) s1AtBarrier = false
-        else s2AtBarrier = false
-        release()
-      }
-    }
-    await Promise.all([runSerialized(1), runSerialized(2)])
-    if (!bothSimultaneous) {
+      const sentB = join(lane.containerCwd, 'g6-red-mutex-b.txt')
+      const turn = await lane.submitTurn(`SENTINEL_WRITE:${sentB}:MUTEX_B`)
+      return { lane, turn }
+    })()
+
+    const bArrivedWhileAHeld = await waitForPromiseWithTimeout(mutexSyncB.waitArrived, 500)
+    if (!bArrivedWhileAHeld) {
       redOverlapCaught = true
     }
 
-    const defectiveAdmitPeerOnSharedCap5 = (nodeTotalActive: number) => {
-      if (nodeTotalActive >= 5) throw new Error('DEFECTIVE_SHARED_NODE_CAP_5')
-    }
+    mutexSyncA.release()
+    assertTurnOk(await redTurnA.run.summary, redMutexA, 'Group 6 red mutex session A')
+    await redMutexA.closeLane()
+
+    const { lane: redMutexB, turn: redTurnB } = await redMutexBTask
+    assert.equal(await waitForPromiseWithTimeout(mutexSyncB.waitArrived, 25_000), true)
+    mutexSyncB.release()
+    assertTurnOk(await redTurnB.run.summary, redMutexB, 'Group 6 red mutex session B')
+    await redMutexB.closeLane()
+
+    // (2) `testFaultSandboxMode: 'shared_node_cap_5'` counts node-wide active bindings (`cap = 5`),
+    //     causing cross-engine `placeRemoteDriverLane` for `h.peerDriverId` to fail!
+    const sbxCanonical = h.mode === 'live-node' ? h.faultCanonicalModel : h.canonicalModel
+    const sbxPeerCanonical =
+      h.mode === 'live-node' ? h.faultPeerCanonicalModel : h.peerCanonicalModel
+    const sbxNodeSlots = await Promise.all(
+      [1, 2, 3, 4, 5].map((slotIdx) =>
+        placeRemoteDriverLane(
+          {
+            uid: h.uid,
+            containerDbId: '7',
+            dockerId: 'd'.repeat(64),
+            sessionKey: `agent:main:webchat:dm:g6_red_shared_${h.driverId}_${slotIdx}_${randomUUID().slice(0, 6)}`,
+            canonicalModel: sbxCanonical,
+            driverId: h.driverId,
+          },
+          {
+            pool: h.pool,
+            registryPath: h.registryPath,
+            localSandboxDir: h.sandbox,
+          },
+        ),
+      ),
+    )
     try {
-      defectiveAdmitPeerOnSharedCap5(5)
-    } catch {
-      redSharedCapCaught = true
+      await placeRemoteDriverLane(
+        {
+          uid: h.uid,
+          containerDbId: '7',
+          dockerId: 'd'.repeat(64),
+          sessionKey: `agent:main:webchat:dm:g6_red_peer_${h.peerDriverId}_${randomUUID().slice(0, 6)}`,
+          canonicalModel: sbxPeerCanonical,
+          driverId: h.peerDriverId,
+        },
+        {
+          pool: h.pool,
+          registryPath: h.registryPath,
+          localSandboxDir: h.sandbox,
+          allowTestFaultsInSandbox: true,
+          testFaultSandboxMode: 'shared_node_cap_5',
+        },
+      )
+    } catch (err) {
+      redSharedCapError = err instanceof Error ? err.message : String(err)
+      if (/REMOTE_LANE_CAPACITY_EXHAUSTED/.test(redSharedCapError)) {
+        redSharedCapCaught = true
+      }
+    } finally {
+      for (const p of sbxNodeSlots) {
+        await recordRemoteDriverLaneState(
+          p.binding.operationId,
+          p.generation,
+          'released',
+          h.pool,
+        )
+      }
     }
   }
   assert.equal(redOverlapCaught && redSharedCapCaught, true)
@@ -1509,8 +1821,10 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
         },
         redDetails: {
           environment: 'local-sandbox-fault-injection',
+          injectedFaults: ['account_mutex', 'shared_node_cap_5'],
           accountExclusiveLockCaught: redOverlapCaught,
           sharedNodeCap5Caught: redSharedCapCaught,
+          sharedNodeCap5RejectedWith: redSharedCapError,
         },
       },
     ],
@@ -1528,6 +1842,7 @@ async function runGroup7(h: ConformanceHarness): Promise<GroupResult> {
   const oldLane = await h.openLane({
     sessionIndex: 71,
     dedicatedToolHost: true,
+    writeOnlyTools: true,
     memAvailableBytes: 4096 * 1024 * 1024,
     toolExecutionBarrier: oldSync.barrier,
   })
@@ -1576,11 +1891,14 @@ async function runGroup7(h: ConformanceHarness): Promise<GroupResult> {
   await oldLane.closeLane()
   const oldStopProof = oldLane.getStopEvidence()
 
-  // --- RED CONTROL: Bypassing memory admission gate spawns `APP-SCOPE.json` when budget should reject ---
+  // --- RED CONTROL: Inject `testFaultBypassAdmit: true` under identical constrained 64 MiB budget ---
+  //     `resources.admit()` bypasses the memory check in `/tmp/oc-drvtest-*` and spawns `APP-SCOPE.json`!
   let redBypassCaught = false
   const redBypassLane = await h.openFaultInjectionLane({
     sessionIndex: 73,
-    memAvailableBytes: 4096 * 1024 * 1024,
+    memAvailableBytes: 64 * 1024 * 1024,
+    maxSliceMemoryBytes: 64 * 1024 * 1024,
+    extraDriverContext: { testFaultBypassAdmit: true },
   })
   try {
     const redTurn = await redBypassLane.submitTurn(
@@ -1593,7 +1911,7 @@ async function runGroup7(h: ConformanceHarness): Promise<GroupResult> {
   } finally {
     await redBypassLane.closeLane()
   }
-  assert.equal(redBypassCaught, true, 'Group 7 red control MUST detect bypassed memory admission')
+  assert.equal(redBypassCaught, true, 'Group 7 red control MUST detect bypassed 64 MiB memory admission')
 
   const durationMs = Date.now() - t0
   return {
@@ -1628,7 +1946,8 @@ async function runGroup7(h: ConformanceHarness): Promise<GroupResult> {
         },
         redDetails: {
           environment: 'local-sandbox-fault-injection',
-          injectedFault: 'bypassed_mem_available_gate_spawns_app_scope',
+          injectedFault: 'testFaultBypassAdmit_under_64MiB_budget_spawns_app_scope',
+          constrainedBudgetBytes: 64 * 1024 * 1024,
           appScopeDetected: redBypassCaught,
         },
       },
@@ -1654,6 +1973,10 @@ function parseCliArgs(argv: readonly string[]): {
   groups: number[]
   registryPath?: string
   profileOverride?: string
+  suiteDigest?: string
+  gitHeadSha?: string
+  gitWorktreeClean?: boolean
+  tsCoreDigest?: string
 } {
   let driverId = ''
   let evidenceDir = ''
@@ -1662,6 +1985,10 @@ function parseCliArgs(argv: readonly string[]): {
   let groupsRaw = '1,2,3,4,5,6,7'
   let registryPath: string | undefined
   let profileOverride: string | undefined
+  let suiteDigest: string | undefined
+  let gitHeadSha: string | undefined
+  let gitWorktreeClean: boolean | undefined
+  let tsCoreDigest: string | undefined
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -1675,6 +2002,11 @@ function parseCliArgs(argv: readonly string[]): {
     else if (a === '--groups' && argv[i + 1]) groupsRaw = argv[++i]!
     else if (a === '--registry' && argv[i + 1]) registryPath = resolve(argv[++i]!)
     else if (a === '--profile' && argv[i + 1]) profileOverride = argv[++i]!
+    else if (a === '--suite-digest' && argv[i + 1]) suiteDigest = argv[++i]!
+    else if (a === '--git-head-sha' && argv[i + 1]) gitHeadSha = argv[++i]!
+    else if (a === '--git-worktree-clean' && argv[i + 1]) {
+      gitWorktreeClean = argv[++i] === 'true'
+    } else if (a === '--ts-core-digest' && argv[i + 1]) tsCoreDigest = argv[++i]!
   }
 
   assert.ok(driverId, '--driver <id> is required')
@@ -1688,7 +2020,19 @@ function parseCliArgs(argv: readonly string[]): {
     .filter((n) => Number.isInteger(n) && n >= 1 && n <= 7)
   assert.ok(groups.length > 0, 'At least one valid group (1..7) must be selected')
 
-  return { driverId, evidenceDir, mode, nodeConfigPath, groups, registryPath, profileOverride }
+  return {
+    driverId,
+    evidenceDir,
+    mode,
+    nodeConfigPath,
+    groups,
+    registryPath,
+    profileOverride,
+    suiteDigest,
+    gitHeadSha,
+    gitWorktreeClean,
+    tsCoreDigest,
+  }
 }
 
 async function main(): Promise<void> {
@@ -1739,6 +2083,10 @@ async function main(): Promise<void> {
     driverDigest: harness.reg.driverDigest,
     coreDigest: harness.reg.coreDigest,
     controllerSha256: harness.reg.controllerSha256,
+    suiteDigest: args.suiteDigest ?? null,
+    tsCoreDigest: args.tsCoreDigest ?? null,
+    gitHeadSha: args.gitHeadSha ?? null,
+    gitWorktreeClean: args.gitWorktreeClean ?? null,
     cliVersion: harness.probedSnapshot.cliVersion,
     cliSha256: harness.probedSnapshot.cliSha256,
     nativeSha256: harness.probedSnapshot.nativeSha256 ?? null,

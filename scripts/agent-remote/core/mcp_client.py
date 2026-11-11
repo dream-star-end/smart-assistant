@@ -109,6 +109,11 @@ def read_config(root: Path) -> Dict[str, Any]:
         "catalogSha256",
     ):
         need(isinstance(config.get(key), str) and 0 < len(config[key]) <= 128, "REMOTE_MCP_CONFIG_INVALID")
+    need(
+        isinstance(config.get("driverDigest"), str)
+        and re.fullmatch(r"[a-f0-9]{64}", config["driverDigest"]) is not None,
+        "REMOTE_MCP_CONFIG_INVALID",
+    )
     return config
 
 
@@ -254,6 +259,7 @@ def main() -> int:
     driver_mod, _, _ = load_driver(
         config["driverId"],
         registry_path=config.get("registryPath"),
+        expected_digest=config["driverDigest"],
         allow_sandbox_override=str(root).startswith("/tmp/oc-drvtest-"),
     )
 

@@ -1,5 +1,6 @@
 import type { Cc5FinanceTerminalOutcome, Cc5FinanceTurn } from './cc5Finance.js'
 import type { CodexNativeTokens, RemoteBridgeBinding, RemoteNativeTerminalReceipt } from './codexRemoteContract.js'
+import type { RemotePoolBinding, RemotePoolFinancePort } from './remotePool/types.js'
 export interface RemoteFinanceTurn extends Omit<Cc5FinanceTurn, 'terminal'> {
   /** A new thread must have an authenticated thread/start response; resume never guesses zero. */
   bindNativeThread?(nativeThreadId: string, newlyCreated: boolean): Promise<CodexNativeTokens>
@@ -17,7 +18,11 @@ export interface RemoteFinanceTurn extends Omit<Cc5FinanceTurn, 'terminal'> {
 export interface RemoteFinancePort {
   admit(input: { binding: Readonly<RemoteBridgeBinding>; authorityEnvelope: string; leaseEnvelope: string;
     turnKey: string; sessionKey: string }): Promise<RemoteFinanceTurn>
+  admitV4?: RemotePoolFinancePort['admit']
 }
-export type RemoteFinanceFactory = (binding: Readonly<RemoteBridgeBinding>, lane: { upstreamModel: string }) => RemoteFinancePort | undefined
+export type RemoteFinanceFactory = (
+  binding: Readonly<RemoteBridgeBinding | RemotePoolBinding>,
+  lane: { upstreamModel: string },
+) => RemoteFinancePort | undefined
 
 export * from './codexRemoteContract.js'

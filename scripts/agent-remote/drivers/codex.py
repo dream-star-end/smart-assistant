@@ -567,7 +567,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
                 )
 
     elif method == "thread/tokenUsage/updated":
-        need(params.get("threadId") == state.get("sessionId"), "CODEX_USAGE_THREAD_MISMATCH")
+        active_turn = state.get("activeTurnId")
+        expected_sid = state.get("sessionId") if active_turn else (state.get("sessionId") or state.get("expectedSessionId"))
+        need(isinstance(expected_sid, str) and params.get("threadId") == expected_sid, "CODEX_USAGE_THREAD_MISMATCH")
         total = (params.get("tokenUsage") or {}).get("total")
         need(isinstance(total, dict), "CODEX_USAGE_TOTAL_MISSING")
         total_tokens = total.get("totalTokens")
@@ -586,7 +588,6 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         )
         useq = int(state.get("usageSeq", 0)) + 1
         state["usageSeq"] = useq
-        active_turn = state.get("activeTurnId")
         if active_turn:
             need(params.get("turnId") == active_turn, "CODEX_USAGE_TURN_MISMATCH")
             scope_id = active_turn

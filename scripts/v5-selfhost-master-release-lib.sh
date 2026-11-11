@@ -1982,3 +1982,53 @@ COMMIT;")"; then
     sleep 5
   done
 }
+
+REMOTE_V4_CUTOVER_DRAINED=0
+
+remote_v4_cutover_reopen() {
+  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  REMOTE_V4_CUTOVER_DRAINED=0
+  [[ "${DRY:-0}" != 1 ]] || return 0
+  [[ -S "$sock" ]] || return 0
+  bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || true
+}
+
+# OCV5-749 AC-5: R1 generation cutover drain fence. Closes new remote-pool admissions
+# (`REMOTE_POOL_DRAINING_RETRY_LATER`) and waits for active relays + remote journals;
+# aborts cutover without killing active turns if drain times out.
+remote_v4_cutover_drain() {
+  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  local timeout_ms="${OC_REMOTE_V4_DRAIN_TIMEOUT_MS:-600000}"
+  local run_id="${LEASE_TRAIN_ID:-cutover-$$}" out rc=0 v4_active
+  if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
+    return 0
+  fi
+  if [[ "${DRY:-0}" == 1 ]]; then
+    cutover_clog "  [dry-run] R1 远端驱动池排空闸门 ($sock, timeout=${timeout_ms}ms)"
+    return 0
+  fi
+  out="$(bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" \
+    --drain --socket "$sock" --timeout-ms "$timeout_ms" --release-run-id "$run_id" 2>&1)" || rc=$?
+  if [[ "$rc" == 0 ]]; then
+    REMOTE_V4_CUTOVER_DRAINED=1
+    cutover_clog "  remote-v4 drain ok: $out"
+    return 0
+  fi
+  if [[ "$rc" == 75 ]]; then
+    v4_active="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT CASE WHEN EXISTS (
+  SELECT 1 FROM information_schema.columns
+   WHERE table_schema='public' AND table_name='remote_agent_bindings' AND column_name='remote_protocol_version'
+) THEN (
+  SELECT count(*)::text FROM remote_agent_bindings WHERE remote_protocol_version=4 AND state<>'released'
+) ELSE '0' END;" 2>/dev/null || echo "ERR")"
+    if [[ "$v4_active" == "0" ]]; then
+      cutover_clog "  remote-v4 drain socket absent ($sock); active_v4_bindings=0,继续切流"
+      return 0
+    fi
+    cutover_clog "  ✗ remote-v4 drain socket 缺失但存在活跃 v4 绑定 ($v4_active);拒绝切流"
+    return 1
+  fi
+  cutover_clog "  ✗ remote-v4 排空超时或失败 (rc=$rc): $out;中止切流,不强杀在途回合"
+  return 1
+}

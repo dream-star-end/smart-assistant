@@ -24,7 +24,7 @@ import { computeCost, type TokenUsage } from './calculator.js'
 import type { CatalogSource } from '../http/proxy/modelAuthorityGate.js'
 import { parseBillingPricing, serializeBillingPricing, type PersistedBillingPricingV1 } from './persistedBillingPricing.js'
 import { CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION, REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
-import { recoverRemoteDriverTurnBilling } from './remoteDriverTurnBilling.js'
+import { createRemoteDriverTurnFinance, recoverRemoteDriverTurnBilling } from './remoteDriverTurnBilling.js'
 import {
   preCheckWithCost, releasePreCheck, type PreCheckRedis, type ReservationHandle,
 } from './preCheck.js'
@@ -392,7 +392,13 @@ export function createRemoteNativeTurnFinance(
   const claimedTurns = new Set<string>()
   const activeOperations = new Map<string, string>()
   const now = deps.now ?? Date.now
-  return { async admit(input) {
+  let v4Port: ReturnType<typeof createRemoteDriverTurnFinance> | undefined
+  return {
+    admitV4(input) {
+      v4Port ??= createRemoteDriverTurnFinance(deps, fixtures)
+      return v4Port.admit(input)
+    },
+    async admit(input) {
     const scope = scopeOf(input.binding, deps.upstreamModel)
     need(scope.expiresAt > now() && input.sessionKey === scope.sessionKey && HASH.test(input.turnKey))
     const keys = typeof deps.keyring === 'function' ? deps.keyring() : deps.keyring

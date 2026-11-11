@@ -662,22 +662,21 @@ async function bindNativeThreadV4(
         [c.scope.operationId, c.scope.generation],
       )
     ).rows
-    if (bindingRows.length > 0) {
-      const existingNative = bindingRows[0]!.native_session_id
-      need(
-        existingNative === null || existingNative === nativeSessionId,
-        'REMOTE_BINDING_NATIVE_SESSION_MISMATCH',
-      )
-      await client.query(
-        `UPDATE remote_agent_bindings
-            SET native_session_id = $3,
-                updated_at = NOW()
-          WHERE operation_id = $1
-            AND generation = $2
-            AND remote_protocol_version = 4`,
-        [c.scope.operationId, c.scope.generation, nativeSessionId],
-      )
-    }
+    need(bindingRows.length === 1, 'REMOTE_BINDING_NOT_FOUND')
+    const existingNative = bindingRows[0]!.native_session_id
+    need(
+      existingNative === null || existingNative === nativeSessionId,
+      'REMOTE_BINDING_NATIVE_SESSION_MISMATCH',
+    )
+    await client.query(
+      `UPDATE remote_agent_bindings
+          SET native_session_id = $3,
+              updated_at = NOW()
+        WHERE operation_id = $1
+          AND generation = $2
+          AND remote_protocol_version = 4`,
+      [c.scope.operationId, c.scope.generation, nativeSessionId],
+    )
     await client.query('COMMIT')
     c.native = native
     return baseline ? Object.freeze({ ...baseline }) : null

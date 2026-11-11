@@ -612,10 +612,12 @@ class RemoteDriverCoreTests(unittest.TestCase):
             tools_bytes = json.dumps(SAMPLE_TOOLS, separators=(",", ":")).encode("utf-8")
             (root / "tools.json").write_bytes(tools_bytes)
             (root / "tools.json").chmod(0o400)
+            _, _, codex_digest = load_driver("codex")
             cfg = {
                 "version": 4,
                 "driverId": "codex",
                 "engineId": "codex",
+                "driverDigest": codex_digest,
                 "operationId": "op-wal-1",
                 "runId": "run-wal-1",
                 "generation": "1",
@@ -1366,6 +1368,48 @@ class RemoteDriverCoreTests(unittest.TestCase):
                     )
                 self.assertEqual(str(ctx_mem.exception), "REMOTE_NODE_MEMORY_EXHAUSTED")
                 self.assertEqual(len(resources.records()), 1)
+
+                # C1/R7 fault-injection fence: test_fault_bypass_admit rejected outside /tmp/oc-drvtest-!
+                with self.assertRaisesRegex(RuntimeError, "REMOTE_FAULT_INJECTION_SANDBOX_ONLY"):
+                    resources.admit(
+                        "/home/box/oc-remotedrv-prod",
+                        "codex",
+                        "default",
+                        lane2_scopes,
+                        master_max_memory_bytes=tight_cap,
+                        allow_sandbox_override=False,
+                        test_fault_bypass_admit=True,
+                    )
+                # W3 (Round 2): cc.probe rejects missing claude_code_version even if context.cliVersion is supplied
+                cc_mod, _, _ = load_driver("cc")
+                with self.assertRaisesRegex(ValueError, "CC_PROBE_VERSION_MISSING"):
+                    cc_mod.probe(
+                        {
+                            "cliPath": str(stub_cli),
+                            "accountHome": str(sdir),
+                            "cliVersion": "9.9.9-forged",
+                        },
+                        {
+                            "returncode": 0,
+                            "stdoutLines": [
+                                json.dumps(
+                                    {
+                                        "type": "control_response",
+                                        "response": {
+                                            "subtype": "success",
+                                            "request_id": "probe-init-1",
+                                            "response": {
+                                                "account": {"email": "a@b.com", "subscriptionType": "max"},
+                                                "models": [{"value": "haiku", "displayName": "Haiku"}],
+                                            },
+                                        },
+                                    }
+                                )
+                            ],
+                            "stdoutSha256": "d" * 64,
+                            "artifactHashes": {"cli": "e" * 64},
+                        },
+                    )
             finally:
                 os.environ.clear()
                 os.environ.update(old_env)
