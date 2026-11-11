@@ -1438,6 +1438,127 @@ test('AC-3 drift closed-loop: probe drift withdraws ready, blocks user placement
     'released',
     pool,
   )
+
+  // 8. (`B3`) Unhealthy probe (`authPresent = false`) with IDENTICAL fingerprint revokes `execution_ready`,
+  //    rejects user admission, and subsequent healthy probe at the SAME fingerprint auto-enqueues a
+  //    pending verification run so CAS restores `execution_ready = TRUE` without stranding the profile!
+  const snapUnhealthySameFp = {
+    ...snapPass,
+    authPresent: false,
+    accountObserved: false,
+    observedAt: new Date(Date.now() + 5_000).toISOString(),
+  }
+  const unhealthyTransition = await recordDriverProbeSnapshot(pool, {
+    profileId: driftProfileId,
+    snapshot: snapUnhealthySameFp,
+    policySha256: POLICY_SHA,
+  })
+  assert.equal(unhealthyTransition.fingerprint, driftPass.fingerprint)
+  assert.equal(unhealthyTransition.executionReady, false)
+  assert.equal(unhealthyTransition.verificationRunId, null)
+
+  await assert.rejects(
+    placeRemoteDriverLane(
+      {
+        uid,
+        containerDbId: '7',
+        dockerId: 'a'.repeat(64),
+        sessionKey: 'agent:main:webchat:dm:user_blocked_during_unhealthy',
+        canonicalModel: driftModel,
+        driverId: 'cc',
+      },
+      { pool },
+    ),
+    /REMOTE_DRIVER_REVERIFY_REQUIRED/,
+  )
+
+  const snapRecoveredSameFp = {
+    ...snapPass,
+    observedAt: new Date(Date.now() + 10_000).toISOString(),
+  }
+  const recoveredTransition = await recordDriverProbeSnapshot(pool, {
+    profileId: driftProfileId,
+    snapshot: snapRecoveredSameFp,
+    policySha256: POLICY_SHA,
+  })
+  assert.equal(recoveredTransition.fingerprint, driftPass.fingerprint)
+  assert.equal(recoveredTransition.executionReady, false)
+  assert.equal(recoveredTransition.autoEligible, true)
+  assert.ok(recoveredTransition.verificationRunId, 'Healthy probe after unhealthy at same FP must auto-enqueue verification run')
+
+  // Admission MUST remain rejected while verification is pending/running!
+  await assert.rejects(
+    placeRemoteDriverLane(
+      {
+        uid,
+        containerDbId: '7',
+        dockerId: 'a'.repeat(64),
+        sessionKey: 'agent:main:webchat:dm:user_still_blocked_pending_reverify',
+        canonicalModel: driftModel,
+        driverId: 'cc',
+      },
+      { pool },
+    ),
+    /REMOTE_DRIVER_REVERIFY_REQUIRED/,
+  )
+
+  const runRecover = await claimDriverVerificationRun(pool, {
+    leaseOwner: 'worker-drift-1',
+    profileId: driftProfileId,
+  })
+  assert.ok(runRecover)
+  assert.equal(runRecover.id, recoveredTransition.verificationRunId)
+  const restoredAfterUnhealthy = await completeDriverVerificationRun(pool, {
+    runId: runRecover.id,
+    leaseOwner: 'worker-drift-1',
+    outcome: 'passed',
+    evidenceDigest: EVIDENCE_SHA,
+  })
+  assert.equal(restoredAfterUnhealthy.state, 'passed')
+  assert.equal(restoredAfterUnhealthy.executionReadyRestored, true)
+
+  // 9. (`S1`) NULL `last_probe_ok_at` fails closed as stale when `maxProbeAgeMs > 0`.
+  await pool.query(
+    'UPDATE remote_agent_profiles SET last_probe_ok_at = NULL WHERE id = $1',
+    [driftProfileId],
+  )
+  await assert.rejects(
+    placeRemoteDriverLane(
+      {
+        uid,
+        containerDbId: '7',
+        dockerId: 'a'.repeat(64),
+        sessionKey: 'agent:main:webchat:dm:user_null_probe_timestamp',
+        canonicalModel: driftModel,
+        driverId: 'cc',
+      },
+      { pool, maxProbeAgeMs: 60_000 },
+    ),
+    /REMOTE_DRIVER_PROBE_STALE/,
+  )
+  await pool.query(
+    'UPDATE remote_agent_profiles SET last_probe_ok_at = NOW() WHERE id = $1',
+    [driftProfileId],
+  )
+
+  const userAfterUnhealthyRecovery = await placeRemoteDriverLane(
+    {
+      uid,
+      containerDbId: '7',
+      dockerId: 'a'.repeat(64),
+      sessionKey: 'agent:main:webchat:dm:user_after_unhealthy_recovery',
+      canonicalModel: driftModel,
+      driverId: 'cc',
+    },
+    { pool },
+  )
+  assert.equal(userAfterUnhealthyRecovery.binding.probeFingerprint, driftPass.fingerprint)
+  await recordRemoteDriverLaneState(
+    userAfterUnhealthyRecovery.binding.operationId,
+    userAfterUnhealthyRecovery.generation,
+    'released',
+    pool,
+  )
 })
 
 test('AC-5 R1 RemoteReleaseDrainCoordinator blocks new admissions while waiting for active relay and inflight journal, and reopens without killing on timeout', async () => {

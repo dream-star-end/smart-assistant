@@ -834,6 +834,17 @@ async function settleDriverReceiptV4(
   return proveAndRepairV4(pool, c)
 }
 
+const MAX_INPROCESS_DEDUP_ENTRIES = 16_384
+
+function rememberBounded(set: Set<string>, key: string): void {
+  if (set.has(key)) return
+  if (set.size >= MAX_INPROCESS_DEDUP_ENTRIES) {
+    const oldest = set.values().next().value
+    if (oldest !== undefined) set.delete(oldest)
+  }
+  set.add(key)
+}
+
 export function createRemoteDriverTurnFinance(
   deps: RemoteDriverTurnFinanceDeps,
   fixtures: RemoteDriverFinanceFixtures = {},
@@ -879,9 +890,9 @@ export function createRemoteDriverTurnFinance(
           !claimedTurns.has(input.turnKey),
         'REMOTE_DRIVER_REPLAY_OR_OPERATION_BUSY',
       )
-      claimedAuthorities.add(a.authorityTurnId)
-      claimedRequests.add(requestId)
-      claimedTurns.add(input.turnKey)
+      rememberBounded(claimedAuthorities, a.authorityTurnId)
+      rememberBounded(claimedRequests, requestId)
+      rememberBounded(claimedTurns, input.turnKey)
       activeOperations.set(scope.operationId, requestId)
       const releaseActive = () => {
         if (activeOperations.get(scope.operationId) === requestId) {

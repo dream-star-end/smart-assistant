@@ -213,8 +213,14 @@ export class RemotePoolRelay {
     this.onRemoteStart = options.onRemoteStart ?? (async () => {})
     this.observeFrame = options.observeFrame
     this.observationOptions = options.observationOptions
+    const initialUuid =
+      typeof options.spec.driverContext?.initialSessionUuid === 'string'
+        ? options.spec.driverContext.initialSessionUuid
+        : undefined
     this.masterNativeState = {
       expectedModel: options.spec.manifest.model,
+      operationId: options.binding.operationId,
+      ...(initialUuid ? { sessionId: initialUuid } : {}),
       ...(options.spec.manifest.nativeSessionId ? { sessionId: options.spec.manifest.nativeSessionId } : {}),
     }
     this.stateEvents.setMaxListeners(64)

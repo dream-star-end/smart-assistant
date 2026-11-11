@@ -1,25 +1,38 @@
 /**
  * End-to-end Conformance Harness (`OCV5-749` `AC-1`, `AC-2`):
  *
- * Wires the COMPLETE un-mocked stack for any registered 5-duty driver (`cc`, `codex`, or 3rd driver):
- *   PostgreSQL (`0339_remote_driver_core_v4`) -> `recordDriverProbeSnapshot` / verification CAS ->
- *   `placeRemoteDriverLane` -> `RemotePoolSshHost.forLocalSandbox` (`controller.py` / `mcp_socket.py` /
- *   `mcp_client.py` / `resources.py`) -> `DriverWorkerClient` (`driver_worker.py`) ->
- *   `RemotePoolRelay` + `RemoteObservationGate` + `createRemoteDriverTurnFinance` ->
- *   `RemoteEngineAdapter` + `RemoteContainerLane` + REAL `Cc5ToolHost` (`cc5-toolhost-supervisor.py`).
+ * Supports two execution modes with ZERO per-engine branches in `runner.ts`:
+ *   1. `sandbox`: hermetic `/tmp/oc-drvtest-*` local controller + protocol CLI fixtures (used for
+ *      `example_echo` `AC-2` proof, fast CI gates, and isolated Red fault-injection controls).
+ *   2. `live-node`: production `RemotePoolSshHost.forSshTarget` over real OpenSSH + `guard.py` +
+ *      `controller.py` + real `systemd --user` cgroup scopes + real native CLI (`claude` / `codex`) +
+ *      real Redis (`TEST_REDIS_URL`) + real `Cc5ToolHost` + real PostgreSQL (`0339_remote_driver_core_v4`).
  */
 import assert from 'node:assert/strict'
+import { execFile, spawn } from 'node:child_process'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { request as httpRequest } from 'node:http'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import { Redis } from 'ioredis'
 import { Client, Pool } from 'pg'
 import {
   REMOTE_DRIVER_PROTOCOL_VERSION,
   authoritySigningInput,
   encodeAuthorityEnvelope,
   encodeTurnLeaseEnvelope,
+  remoteCanonicalJson,
   turnLeaseSigningInput,
   type AuthorityKeyring,
   type ModelAuthorityPayload,
@@ -52,13 +65,16 @@ import {
   placeRemoteDriverLane,
   recordDriverProbeSnapshot,
   recordRemoteDriverLaneState,
+  type PlaceRemoteDriverLaneOptions,
   type RemoteDriverRegistryEntry,
 } from '../../../packages/commercial/src/account-pool/remotePool/index.js'
+import { remoteNodeExecKeyDir } from '../../../packages/commercial/src/account-pool/remoteBrainPool.js'
 import {
   ModelCatalogSnapshot,
   type ModelCatalogCache,
   type ModelCatalogEntry,
 } from '../../../packages/commercial/src/billing/modelCatalog.js'
+import { wrapIoredisForPreCheck } from '../../../packages/commercial/src/billing/preCheck.js'
 import {
   createRemoteDriverTurnFinance,
   recoverRemoteDriverTurnBilling,
@@ -67,26 +83,66 @@ import { recoverRemoteNativeTurnBilling } from '../../../packages/commercial/src
 import { closePool, setPoolOverride } from '../../../packages/commercial/src/db/index.js'
 import { runMigrations } from '../../../packages/commercial/src/db/migrate.js'
 import { createLogger } from '../../../packages/commercial/src/logging/logger.js'
-import { resetAndMigrateBefore } from '../../../packages/commercial/src/__tests__/helpers/db.js'
 import { prepareDriverSandbox, type DriverSandboxPrepared } from './fixtures.js'
+
+const execFileAsync = promisify(execFile)
 
 const CONTROLLER_PATH = fileURLToPath(new URL('../core/controller.py', import.meta.url))
 const MCP_CLIENT_PATH = fileURLToPath(new URL('../core/mcp_client.py', import.meta.url))
+const BOX_BRIDGE_DIR = fileURLToPath(
+  new URL('../../../packages/gateway/box-bridge-mod', import.meta.url),
+)
+
+const BOX_BRIDGE_PLUGIN_FILES = [
+  '.claude-plugin/plugin.json',
+  'hooks/hooks.json',
+  'hooks/register.ts',
+  'hooks/frames.ts',
+] as const
 
 export const PRICING_RATES = {
-  inputPerMtok: 1_000n,
-  outputPerMtok: 5_000n,
-  cacheReadPerMtok: 100n,
-  cacheWritePerMtok: 1_250n,
+  inputPerMtok: 1_000_000n,
+  outputPerMtok: 5_000_000n,
+  cacheReadPerMtok: 100_000n,
+  cacheWritePerMtok: 1_250_000n,
 } as const
+
+export type ConformanceMode = 'sandbox' | 'live-node'
+
+export interface LiveNodeConfig {
+  readonly sshHost: string
+  readonly sshPort?: number
+  readonly sshUser?: string
+  readonly keyId: string
+  readonly hostKeyFp: string
+  readonly adminSshCmd: string
+  readonly adminRunAsUserPrefix?: string
+  readonly upstreamModel: string
+  readonly canonicalModel: string
+  readonly profileName?: string
+  readonly probeContext: Record<string, unknown>
+  readonly driverContext: Record<string, unknown>
+  readonly loadBoxBridgeForDriver?: boolean
+  readonly sshConnectCooldownMs?: number
+  readonly sshProxyCommands?: readonly string[]
+}
+
+export interface ToolExecutionBarrier {
+  readonly onArrive: () => void
+  readonly waitRelease: Promise<void>
+  readonly abortExecution?: () => boolean
+}
 
 export interface OpenLaneOptions {
   readonly sessionKey?: string
   readonly sessionIndex?: number
   readonly memAvailableBytes?: number
   readonly nodeMemoryBudgetBytes?: number
+  readonly maxSliceMemoryBytes?: number
   readonly extraDriverContext?: Record<string, unknown>
   readonly toolAuthorizeTimeoutMs?: number
+  readonly toolExecutionBarrier?: ToolExecutionBarrier
+  readonly disallowedTools?: readonly string[]
   readonly observationOptions?: {
     readonly testFaultBypassObservation?: boolean
     readonly allowTestBypassInTmp?: boolean
@@ -110,6 +166,7 @@ export interface OpenLaneOptions {
   readonly failTurnInsertOnce?: { active: boolean }
   readonly autoRecordStopState?: boolean
   readonly dedicatedToolHost?: boolean
+  readonly writeOnlyTools?: boolean
 }
 
 export interface SubmittedTurnHandle {
@@ -123,6 +180,7 @@ export interface SubmittedTurnHandle {
 }
 
 export interface SessionLaneHandle {
+  readonly isFaultSandbox: boolean
   readonly placed: RemoteDriverPlacementResult
   readonly sandboxPrep: DriverSandboxPrepared
   readonly containerCwd: string
@@ -141,12 +199,16 @@ export interface SessionLaneHandle {
   readonly settledReceipts: RemoteReceiptV4[]
   readonly billingEvents: EngineBillingEvent[]
   readonly stopNotifications: Array<Record<string, unknown>>
+  readonly getStopEvidence: () => unknown
   readonly getFenceDiag: () => string
   readonly submitTurn: (prompt: string, requestIdOverride?: string) => Promise<SubmittedTurnHandle>
   readonly closeLane: () => Promise<void>
 }
 
 export interface ConformanceHarness {
+  readonly mode: ConformanceMode
+  readonly targetHost: string
+  readonly sshMode: 'local-sandbox' | 'real-ssh-guard'
   readonly driverId: string
   readonly registryPath?: string
   readonly reg: RemoteDriverRegistryEntry
@@ -170,22 +232,224 @@ export interface ConformanceHarness {
   readonly probeFingerprint: string
   readonly usagePolicy: RemoteDriverUsagePolicy
   readonly worker: DriverWorkerClient
+  readonly barrierTimeoutMs: number
+  readonly placeLaneOptions: (extra?: Partial<PlaceRemoteDriverLaneOptions>) => PlaceRemoteDriverLaneOptions
+  readonly buildWritePrompt: (filePath: string, content: string, dupConcurrent?: boolean) => string
+  readonly buildNativeDangerPrompt: (dangerPath: string) => string
+  readonly taskFileExists: (taskRoot: string, relPath?: string) => Promise<boolean>
+  readonly readTaskFileUtf8: (taskRoot: string, relPath: string) => Promise<string>
+  readonly readTaskFileBytes: (taskRoot: string, relPath: string) => Promise<Buffer>
+  readonly writeTaskFileBytes: (
+    taskRoot: string,
+    relPath: string,
+    data: Buffer,
+    mode?: number,
+  ) => Promise<void>
+  readonly postTaskToolSockRoundtrip: (
+    taskRoot: string,
+    payloadBytes: Buffer,
+  ) => Promise<{ status: number; body: string }>
+  readonly verifyTaskWalReplay: (
+    taskRoot: string,
+    callId: string,
+  ) => Promise<{ cachedReplayStatus: number; inflightDuplicateStatus: number }>
   readonly openLane: (opts?: OpenLaneOptions) => Promise<SessionLaneHandle>
+  readonly openFaultInjectionLane: (opts?: OpenLaneOptions) => Promise<SessionLaneHandle>
   readonly getUserCredits: () => Promise<bigint>
   readonly recoverSpool: () => Promise<{ proven: number; pending: number }>
   readonly recoverV4Only: () => Promise<{ proven: number; pending: number }>
   readonly close: () => Promise<void>
 }
 
+function loadBoxBridgeBundle(): { bridgeSha256: string; bridgeFiles: Record<string, string> } {
+  const hostBytes = readFileSync(join(BOX_BRIDGE_DIR, 'host.py'))
+  const bridgeFiles: Record<string, string> = {
+    'host.py': hostBytes.toString('base64'),
+  }
+  const modHash = createHash('sha256')
+  for (const rel of [...BOX_BRIDGE_PLUGIN_FILES].sort()) {
+    const raw = readFileSync(join(BOX_BRIDGE_DIR, 'oc-bridge', rel))
+    bridgeFiles[`mod/oc-bridge/${rel}`] = raw.toString('base64')
+    modHash.update(Buffer.from(`${rel}\0${raw.length}\0`, 'utf8'))
+    modHash.update(raw)
+  }
+  return {
+    bridgeSha256: modHash.digest('hex'),
+    bridgeFiles,
+  }
+}
+
+function postLocalUnixRoundtrip(
+  unixSocketPath: string,
+  payloadBytes: Buffer,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const req = httpRequest(
+      {
+        socketPath: unixSocketPath,
+        path: '/roundtrip',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': String(payloadBytes.length),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (c: Buffer) => chunks.push(c))
+        res.on('end', () =>
+          resolvePromise({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        )
+      },
+    )
+    req.on('error', rejectPromise)
+    req.end(payloadBytes)
+  })
+}
+
+const REMOTE_FS_HELPER_PY = `
+import base64, http.client, json, os, pathlib, socket, sys
+
+req = json.loads(sys.stdin.read())
+op = req["op"]
+root = pathlib.Path(req["root"])
+rel = req.get("rel") or ""
+target = (root / rel) if rel else root
+
+if op == "exists":
+    print(json.dumps({"exists": target.exists()}))
+elif op == "read":
+    data = target.read_bytes()
+    print(json.dumps({"b64": base64.b64encode(data).decode("ascii")}))
+elif op == "write":
+    raw = base64.b64decode(req["b64"])
+    mode = int(req.get("mode", 0o600))
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    os.chmod(target, mode)
+    print(json.dumps({"ok": True}))
+elif op == "roundtrip":
+    raw = base64.b64decode(req["b64"])
+    sock_path = str(root / "tool.sock")
+    class UnixConn(http.client.HTTPConnection):
+        def connect(self):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(20.0)
+            s.connect(sock_path)
+            self.sock = s
+    try:
+        conn = UnixConn("localhost")
+        conn.request("POST", "/roundtrip", body=raw, headers={"Content-Type": "application/json", "Content-Length": str(len(raw))})
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", errors="replace")
+        conn.close()
+        print(json.dumps({"status": resp.status, "body": body}))
+    except Exception as exc:
+        print(json.dumps({"status": -1, "error": str(exc)}))
+elif op == "wal_check":
+    import hashlib, time
+    call_id = req["callId"]
+    call_key = hashlib.sha256(call_id.encode("utf-8")).hexdigest()
+    attempt_p = root / "tool-attempts" / (call_key + ".attempt.json")
+    result_p = root / "tool-attempts" / (call_key + ".result.json")
+    deadline = time.monotonic() + 15.0
+    while not result_p.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    saved_attempt = attempt_p.read_bytes()
+    sock_path = str(root / "tool.sock")
+    def post_raw(raw_b):
+        class UnixConn(http.client.HTTPConnection):
+            def connect(self):
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(10.0)
+                s.connect(sock_path)
+                self.sock = s
+        conn = UnixConn("localhost")
+        try:
+            conn.request("POST", "/roundtrip", body=raw_b, headers={"Content-Type": "application/json", "Content-Length": str(len(raw_b))})
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status
+        finally:
+            conn.close()
+    cached_status = post_raw(saved_attempt)
+    unknown_cid = call_id + "_inflight_unknown"
+    unknown_key = hashlib.sha256(unknown_cid.encode("utf-8")).hexdigest()
+    obs_p = root / "observations" / (call_key + ".json")
+    if obs_p.exists():
+        orig_obs = json.loads(obs_p.read_text(encoding="utf-8"))
+        orig_obs["callId"] = unknown_cid
+        u_obs_p = root / "observations" / (unknown_key + ".json")
+        u_obs_p.write_bytes(json.dumps(orig_obs, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        os.chmod(u_obs_p, 0o400)
+    parsed_att = json.loads(saved_attempt.decode("utf-8"))
+    parsed_att["rpcId"] = 99991
+    parsed_att["callId"] = unknown_cid
+    u_body = json.dumps(parsed_att, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    u_att_p = root / "tool-attempts" / (unknown_key + ".attempt.json")
+    u_att_p.write_bytes(u_body)
+    os.chmod(u_att_p, 0o600)
+    inflight_status = post_raw(u_body)
+    print(json.dumps({"cachedReplayStatus": cached_status, "inflightDuplicateStatus": inflight_status}))
+elif op == "cleanup_roots":
+    import shutil
+    prefix = req["allowedPrefix"]
+    removed = 0
+    for r_str in req.get("roots") or []:
+        if not isinstance(r_str, str) or not r_str.startswith(prefix):
+            continue
+        rp = pathlib.Path(r_str)
+        if rp.exists() and not rp.is_symlink():
+            shutil.rmtree(rp, ignore_errors=True)
+            removed += 1
+        lock_p = rp.parent / ("." + rp.name + ".create.lock")
+        if lock_p.exists() and not lock_p.is_symlink():
+            try:
+                lock_p.unlink()
+            except OSError:
+                pass
+    print(json.dumps({"removed": removed}))
+else:
+    raise ValueError("unknown op " + str(op))
+`
+
 export async function createConformanceHarness(
   driverId: string,
-  opts: { registryPath?: string; profileOverride?: string } = {},
+  opts: {
+    mode?: ConformanceMode
+    nodeConfigPath?: string
+    registryPath?: string
+    profileOverride?: string
+  } = {},
 ): Promise<ConformanceHarness> {
+  const mode: ConformanceMode = opts.mode ?? 'sandbox'
+  const liveCfg: LiveNodeConfig | undefined =
+    mode === 'live-node'
+      ? (JSON.parse(
+          readFileSync(
+            (() => {
+              assert.ok(opts.nodeConfigPath, 'live-node mode requires nodeConfigPath')
+              return opts.nodeConfigPath
+            })(),
+            'utf8',
+          ),
+        ) as LiveNodeConfig)
+      : undefined
+
   const baseDbUrl = process.env.TEST_DATABASE_URL
   assert.ok(
     baseDbUrl && new URL(baseDbUrl).pathname.endsWith('_test'),
     'Conformance runner requires isolated TEST_DATABASE_URL ending with _test',
   )
+  const redisUrl = process.env.TEST_REDIS_URL ?? 'redis://127.0.0.1:56379'
+  const redisClient = new Redis(redisUrl, { maxRetriesPerRequest: 2, lazyConnect: true })
+  await redisClient.connect()
+  assert.equal(await redisClient.ping(), 'PONG', 'Real Redis must be reachable for conformance')
+  const preCheckRedis = wrapIoredisForPreCheck(redisClient)
+
   const templateDbName = 'oc_remote_conf_tmpl_v4_test'
   const dedicatedDbName = `oc_remote_conf_${randomUUID().replaceAll('-', '').slice(0, 12)}_test`
   const ensureMigratedTemplate = async () => {
@@ -234,7 +498,7 @@ export async function createConformanceHarness(
   dedicatedUrlObj.pathname = `/${dedicatedDbName}`
   const dedicatedDbUrl = dedicatedUrlObj.toString()
 
-  const pool = new Pool({ connectionString: dedicatedDbUrl, max: 10, connectionTimeoutMillis: 3000 })
+  const pool = new Pool({ connectionString: dedicatedDbUrl, max: 12, connectionTimeoutMillis: 3000 })
   pool.on('error', () => {})
   assert.equal((await pool.query('SELECT current_database() AS db')).rows[0].db, dedicatedDbName)
   setPoolOverride(pool)
@@ -263,18 +527,62 @@ export async function createConformanceHarness(
   const workerInfo = await worker.info(driverId)
   const usagePolicy = workerInfo.usagePolicy
 
-  const initPrep = prepareDriverSandbox(driverId, sandbox, 1)
-  const canonicalModel = initPrep.canonicalModel
-  const upstreamModel = initPrep.upstreamModel
-  const profileName = (opts.profileOverride ?? `${driverId.replaceAll('_', '-')}-acct-1`).slice(0, 48)
-  const authEpoch = `epoch-${driverId.replaceAll('_', '-')}-1`
+  const sandboxInitPrep = prepareDriverSandbox(driverId, sandbox, 1)
+  const bridgeBundle = liveCfg?.loadBoxBridgeForDriver ? loadBoxBridgeBundle() : undefined
 
-  // Run REAL node-side probe via `controller.py probe`.
-  const probeRoot = join(sandbox, 'run-init-probe')
+  const canonicalModel =
+    mode === 'live-node' ? liveCfg!.canonicalModel : sandboxInitPrep.canonicalModel
+  const upstreamModel =
+    mode === 'live-node' ? liveCfg!.upstreamModel : sandboxInitPrep.upstreamModel
+  const profileName = (
+    opts.profileOverride ??
+    liveCfg?.profileName ??
+    `${driverId.replaceAll('_', '-')}-acct-1`
+  ).slice(0, 48)
+  const authEpoch = `epoch-${driverId.replaceAll('_', '-')}-1`
+  const sshUser = liveCfg?.sshUser ?? 'box'
+  const sshPort = liveCfg?.sshPort ?? 22
+  const targetHost = mode === 'live-node' ? liveCfg!.sshHost : '127.0.0.1'
+  const sshMode = mode === 'live-node' ? 'real-ssh-guard' : 'local-sandbox'
+  const createdRemoteRoots = new Set<string>()
+
+  const baseNodeEnv: Record<string, string> = {
+    OC_REMOTE_RESOURCE_ROOT: resRoot,
+    OC_REMOTE_TEST_FAKE_SYSTEMD_DIR: fakeSys,
+    OC_REMOTE_NODE_MEMORY_BUDGET: String(4096 * 1024 * 1024),
+    OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: String(4096 * 1024 * 1024),
+  }
+
+  const liveProbeContext: Record<string, unknown> =
+    mode === 'live-node'
+      ? {
+          ...liveCfg!.probeContext,
+          ...(bridgeBundle ? { bridgeSha256: bridgeBundle.bridgeSha256 } : {}),
+        }
+      : sandboxInitPrep.probeContext
+
+  const liveDriverContextBase: Record<string, unknown> =
+    mode === 'live-node'
+      ? {
+          ...liveCfg!.driverContext,
+          ...(bridgeBundle ? { bridgeFiles: bridgeBundle.bridgeFiles } : {}),
+        }
+      : sandboxInitPrep.driverContext
+
+  // Run REAL node-side probe (`forSshTarget` over real SSH guard in `live-node` mode; `forLocalSandbox` in `sandbox`).
+  const probeRoot =
+    mode === 'live-node'
+      ? `/home/${sshUser}/oc-remotedrv-probe-${randomUUID().replaceAll('-', '').slice(0, 20)}`
+      : join(sandbox, 'run-init-probe')
+  if (mode === 'live-node') {
+    createdRemoteRoots.add(probeRoot)
+  }
+
+  const liveControllerPath = `/opt/openclaude/remote-driver/${reg.controllerSha256}/core/controller.py`
   const bootstrapSpec: RemotePoolLaneSpec = {
-    controllerPath: CONTROLLER_PATH,
+    controllerPath: mode === 'live-node' ? liveControllerPath : CONTROLLER_PATH,
     controllerSha256: reg.controllerSha256,
-    ...(opts.registryPath ? { registryPath: opts.registryPath } : {}),
+    ...(mode === 'sandbox' && opts.registryPath ? { registryPath: opts.registryPath } : {}),
     manifest: {
       version: REMOTE_DRIVER_PROTOCOL_VERSION,
       root: probeRoot,
@@ -289,7 +597,7 @@ export async function createConformanceHarness(
       driverDigest: reg.driverDigest,
       coreDigest: reg.coreDigest,
     },
-    driverContext: initPrep.driverContext,
+    driverContext: liveDriverContextBase,
     verifiedProbe: {
       schemaVersion: REMOTE_DRIVER_PROTOCOL_VERSION,
       engineId: reg.engineId,
@@ -316,31 +624,82 @@ export async function createConformanceHarness(
     },
   }
 
-  const baseNodeEnv: Record<string, string> = {
-    OC_REMOTE_RESOURCE_ROOT: resRoot,
-    OC_REMOTE_TEST_FAKE_SYSTEMD_DIR: fakeSys,
-    OC_REMOTE_NODE_MEMORY_BUDGET: String(4096 * 1024 * 1024),
-    OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: String(4096 * 1024 * 1024),
-  }
+  let sshEgressSeq = 0
+  const spawnLiveSsh = liveCfg?.sshProxyCommands?.length
+    ? (args: string[]) => {
+        const proxy =
+          liveCfg.sshProxyCommands![sshEgressSeq++ % liveCfg.sshProxyCommands!.length] ?? ''
+        const finalArgs = proxy
+          ? [
+              ...args
+                .slice(0, -2)
+                .map((a) => (a === 'ConnectTimeout=10' ? 'ConnectTimeout=25' : a)),
+              '-o',
+              `ProxyCommand=${proxy}`,
+              ...args.slice(-2),
+            ]
+          : args
+        return spawn('/usr/bin/ssh', finalArgs, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', HOME: process.env.HOME ?? '/root' },
+        })
+      }
+    : undefined
 
-  const probeHost = RemotePoolSshHost.forLocalSandbox(bootstrapSpec, baseNodeEnv)
-  const probed = await probeHost.probe(initPrep.probeContext, probeRoot)
+  const probeHost =
+    mode === 'live-node'
+      ? (() => {
+          const execDir = remoteNodeExecKeyDir(liveCfg!.keyId)
+          return RemotePoolSshHost.forSshTarget(
+            {
+              host: liveCfg!.sshHost,
+              port: sshPort,
+              user: sshUser,
+              keyPath: join(execDir, `v4_${reg.driverId}_id_ed25519`),
+              knownHostsPath: join(execDir, 'known_hosts'),
+              controllerSha256: reg.controllerSha256,
+              taskRootPrefix: `/home/${sshUser}/oc-remotedrv-`,
+              upstreamModel,
+            },
+            bootstrapSpec,
+            spawnLiveSsh,
+          )
+        })()
+      : RemotePoolSshHost.forLocalSandbox(bootstrapSpec, baseNodeEnv)
 
-  // Obtain exact `policySha256` from the driver's own `launch_spec()` and verify fingerprint parity.
-  const specSample = await worker.launchSpec(
-    driverId,
-    {
-      ...initPrep.driverContext,
-      root: join(sandbox, 'run-policy-sample'),
-      model: upstreamModel,
-      operationId: randomUUID(),
-      mcpClientPath: MCP_CLIENT_PATH,
-      tools: {
-        tools: [{ name: 'Write', description: 'Write file', inputSchema: { type: 'object' } }],
-      },
-    },
-    probed.snapshot,
+  const probed = await probeHost.probe(liveProbeContext, probeRoot)
+  assert.ok(
+    probed.snapshot.models.some((m) => m.upstreamModelId === upstreamModel),
+    `Live/probed snapshot models [${probed.snapshot.models.map((m) => m.upstreamModelId).join(',')}] must include '${upstreamModel}'`,
   )
+
+  // Compute deterministic `policySha256` via local policy-sample context (`launch_spec` policy hash
+  // depends solely on `driverId`, `driverVersion`, and policy flags, never on host file paths).
+  const policySampleCtx =
+    mode === 'live-node'
+      ? {
+          ...sandboxInitPrep.driverContext,
+          ...(bridgeBundle ? { bridgeFiles: bridgeBundle.bridgeFiles } : {}),
+          bridgeMode: undefined,
+          root: join(sandbox, 'run-policy-sample'),
+          model: upstreamModel,
+          operationId: randomUUID(),
+          mcpClientPath: MCP_CLIENT_PATH,
+          tools: {
+            tools: [{ name: 'Write', description: 'Write file', inputSchema: { type: 'object' } }],
+          },
+        }
+      : {
+          ...sandboxInitPrep.driverContext,
+          root: join(sandbox, 'run-policy-sample'),
+          model: upstreamModel,
+          operationId: randomUUID(),
+          mcpClientPath: MCP_CLIENT_PATH,
+          tools: {
+            tools: [{ name: 'Write', description: 'Write file', inputSchema: { type: 'object' } }],
+          },
+        }
+  const specSample = await worker.launchSpec(driverId, policySampleCtx, probed.snapshot)
   const expectedPolicySha256 = String(specSample.policySha256 ?? probed.snapshot.rawResponseSha256)
   assert.equal(
     computeProbeFingerprintTs(probed.snapshot, {
@@ -352,11 +711,12 @@ export async function createConformanceHarness(
     'TS and Python probe fingerprints must be byte-identical',
   )
 
-  // Seed user, container, node, target profile, AND a cross-engine peer profile on the same node (Group 6).
+  // Seed user (`100_000_000_000` fen), container, target node, target profile, cross-engine peer profile,
+  // and (when `live-node`) an isolated fault-injection sandbox node/profile so Red controls never touch user nodes.
   const uid = (
     await pool.query(
       `INSERT INTO users (email, password_hash, credits)
-       VALUES ($1, 'conformance-only', 1000000)
+       VALUES ($1, 'conformance-only', 100000000000)
        RETURNING id::text`,
       [`conf-${driverId}-${randomUUID().slice(0, 8)}@example.test`],
     )
@@ -371,10 +731,18 @@ export async function createConformanceHarness(
   const nodeId = (
     await pool.query(
       `INSERT INTO remote_agent_nodes
-         (label, ssh_host, ssh_user, host_key_fp, key_id, controller_sha256, status)
-       VALUES ('conf-node-1', '127.0.0.1', 'box', 'SHA256:conftest', 'confkey', $1, 'active')
+         (label, ssh_host, ssh_port, ssh_user, host_key_fp, key_id, controller_sha256, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
        RETURNING id::text`,
-      [reg.controllerSha256],
+      [
+        mode === 'live-node' ? `live-${driverId}-node` : 'conf-node-1',
+        targetHost,
+        sshPort,
+        sshUser,
+        liveCfg?.hostKeyFp ?? 'SHA256:conftest',
+        liveCfg?.keyId ?? 'confkey',
+        reg.controllerSha256,
+      ],
     )
   ).rows[0].id
 
@@ -405,27 +773,88 @@ export async function createConformanceHarness(
     [profileId, upstreamModel, canonicalModel, upstreamModel],
   )
 
-  // Verify target profile through real driftCoordinator closed loop (`execution_ready = true`).
-  const rec = await recordDriverProbeSnapshot(pool, {
-    profileId,
-    snapshot: probed.snapshot,
-    policySha256: expectedPolicySha256,
-    registryPath: opts.registryPath,
-  })
-  assert.ok(rec.verificationRunId)
-  const claimed = await claimDriverVerificationRun(pool, {
-    leaseOwner: 'conformance-init',
-    profileId,
-  })
-  assert.ok(claimed)
-  const verified = await completeDriverVerificationRun(pool, {
-    runId: claimed.id,
-    leaseOwner: 'conformance-init',
-    outcome: 'passed',
-    evidenceDigest: 'e'.repeat(64),
-    registryPath: opts.registryPath,
-  })
-  assert.equal(verified.executionReadyRestored, true)
+  const verifySeededProfile = async (pid: string, snap: RemoteProbeSnapshot, polSha: string) => {
+    const r = await recordDriverProbeSnapshot(pool, {
+      profileId: pid,
+      snapshot: snap,
+      policySha256: polSha,
+      registryPath: opts.registryPath,
+    })
+    assert.ok(r.verificationRunId)
+    const c = await claimDriverVerificationRun(pool, {
+      leaseOwner: `conformance-init-${pid}`,
+      profileId: pid,
+    })
+    assert.ok(c)
+    const v = await completeDriverVerificationRun(pool, {
+      runId: c.id,
+      leaseOwner: `conformance-init-${pid}`,
+      outcome: 'passed',
+      evidenceDigest: r.fingerprint,
+      registryPath: opts.registryPath,
+    })
+    assert.equal(v.executionReadyRestored, true)
+  }
+
+  await verifySeededProfile(profileId, probed.snapshot, expectedPolicySha256)
+
+  // Secondary isolated fault-injection sandbox profile when running in `live-node` mode.
+  const faultCanonicalModel = `${canonicalModel.replace(/-remote$/, '')}-faultsbx-remote`
+  const faultUpstreamModel = sandboxInitPrep.upstreamModel
+  if (mode === 'live-node') {
+    const sbxProbeRoot = join(sandbox, 'run-faultsbx-probe')
+    const sbxBootstrap: RemotePoolLaneSpec = {
+      ...bootstrapSpec,
+      controllerPath: CONTROLLER_PATH,
+      ...(opts.registryPath ? { registryPath: opts.registryPath } : {}),
+      manifest: {
+        ...bootstrapSpec.manifest,
+        root: sbxProbeRoot,
+        profileId: `${driverId.replaceAll('_', '-')}-fault-sbx`,
+        authEpoch: `epoch-fault-${driverId.replaceAll('_', '-')}`,
+        model: faultUpstreamModel,
+      },
+      driverContext: sandboxInitPrep.driverContext,
+    }
+    const sbxProbed = await RemotePoolSshHost.forLocalSandbox(sbxBootstrap, baseNodeEnv).probe(
+      sandboxInitPrep.probeContext,
+      sbxProbeRoot,
+    )
+    const faultNodeId = (
+      await pool.query(
+        `INSERT INTO remote_agent_nodes
+           (label, ssh_host, ssh_user, host_key_fp, key_id, controller_sha256, status)
+         VALUES ('fault-sbx-node', '127.0.0.1', 'box', 'SHA256:faultsbx', 'faultkey', $1, 'active')
+         RETURNING id::text`,
+        [reg.controllerSha256],
+      )
+    ).rows[0].id
+    const faultProfileId = (
+      await pool.query(
+        `INSERT INTO remote_agent_profiles
+           (node_id, engine, driver_id, engine_id, profile_name, account_fingerprint, runner_mode, auth_epoch, max_concurrent_lanes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 5)
+         RETURNING id::text`,
+        [
+          faultNodeId,
+          legacyProfileEngine,
+          reg.driverId,
+          reg.engineId,
+          `${driverId.replaceAll('_', '-')}-fault-sbx`,
+          `fp-fault-${driverId}`,
+          reg.runnerMode,
+          `epoch-fault-${driverId.replaceAll('_', '-')}`,
+        ],
+      )
+    ).rows[0].id
+    await pool.query(
+      `INSERT INTO remote_model_offers
+         (profile_id, upstream_model_id, canonical_model_id, base_display_name)
+       VALUES ($1, $2, $3, $4)`,
+      [faultProfileId, faultUpstreamModel, faultCanonicalModel, faultUpstreamModel],
+    )
+    await verifySeededProfile(faultProfileId, sbxProbed.snapshot, expectedPolicySha256)
+  }
 
   // Peer engine profile on the SAME `nodeId` for Group 6 cross-engine independence proof.
   const peerDriverId = reg.engineId === 'codex' ? 'cc' : 'codex'
@@ -434,6 +863,7 @@ export async function createConformanceHarness(
   const peerProbeRoot = join(sandbox, 'run-peer-probe')
   const peerBootstrap: RemotePoolLaneSpec = {
     ...bootstrapSpec,
+    controllerPath: CONTROLLER_PATH,
     manifest: {
       ...bootstrapSpec.manifest,
       root: peerProbeRoot,
@@ -491,23 +921,7 @@ export async function createConformanceHarness(
      VALUES ($1, $2, $3, $4)`,
     [peerProfileId, peerPrep.upstreamModel, peerPrep.canonicalModel, peerPrep.upstreamModel],
   )
-  const peerRec = await recordDriverProbeSnapshot(pool, {
-    profileId: peerProfileId,
-    snapshot: peerProbed.snapshot,
-    policySha256: peerPolicySha,
-    registryPath: opts.registryPath,
-  })
-  const peerClaim = await claimDriverVerificationRun(pool, {
-    leaseOwner: 'conformance-peer-init',
-    profileId: peerProfileId,
-  })
-  await completeDriverVerificationRun(pool, {
-    runId: peerClaim!.id,
-    leaseOwner: 'conformance-peer-init',
-    outcome: 'passed',
-    evidenceDigest: peerRec.fingerprint,
-    registryPath: opts.registryPath,
-  })
+  await verifySeededProfile(peerProfileId, peerProbed.snapshot, peerPolicySha)
 
   // Keyring & model catalog for real `createRemoteDriverTurnFinance`.
   const { privateKey, publicKey } = generateKeyPairSync('ed25519')
@@ -520,66 +934,217 @@ export async function createConformanceHarness(
     reasoning: { supported: ['low', 'medium', 'high'] as const, codexModelDefault: 'medium' as const },
     ccb: { capabilityZero: false, supportsThinking: true },
   }
-  const targetCatalogEntry: ModelCatalogEntry = {
-    entryId: 501,
-    modelId: canonicalModel,
-    engine: reg.authorityEngine as any,
-    providerId: reg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
-    placement: 'remote_pool',
-    upstreamModelId: upstreamModel,
-    contextWindow: 200_000,
-    capabilityProfile: baseCap,
-    capabilitySchemaVersion: 1,
-    state: 'active',
-    lockVersion: 0,
-  }
-  const peerCatalogEntry: ModelCatalogEntry = {
-    entryId: 502,
-    modelId: peerPrep.canonicalModel,
-    engine: peerReg.authorityEngine as any,
-    providerId: peerReg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
-    placement: 'remote_pool',
-    upstreamModelId: peerPrep.upstreamModel,
-    contextWindow: 200_000,
-    capabilityProfile: baseCap,
-    capabilitySchemaVersion: 1,
-    state: 'active',
-    lockVersion: 0,
+  const catalogEntries: ModelCatalogEntry[] = [
+    {
+      entryId: 501,
+      modelId: canonicalModel,
+      engine: reg.authorityEngine as any,
+      providerId: reg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      placement: 'remote_pool',
+      upstreamModelId: upstreamModel,
+      contextWindow: 200_000,
+      capabilityProfile: baseCap,
+      capabilitySchemaVersion: 1,
+      state: 'active',
+      lockVersion: 0,
+    },
+    {
+      entryId: 502,
+      modelId: peerPrep.canonicalModel,
+      engine: peerReg.authorityEngine as any,
+      providerId: peerReg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      placement: 'remote_pool',
+      upstreamModelId: peerPrep.upstreamModel,
+      contextWindow: 200_000,
+      capabilityProfile: baseCap,
+      capabilitySchemaVersion: 1,
+      state: 'active',
+      lockVersion: 0,
+    },
+  ]
+  const pricingMap = new Map<string, any>([
+    [
+      canonicalModel,
+      {
+        modelId: canonicalModel,
+        displayName: canonicalModel,
+        ...PRICING_RATES,
+        multiplier: '1.000',
+        visibility: 'public',
+        sortOrder: 10,
+        defaultEffort: 'medium',
+      },
+    ],
+    [
+      peerPrep.canonicalModel,
+      {
+        modelId: peerPrep.canonicalModel,
+        displayName: peerPrep.canonicalModel,
+        ...PRICING_RATES,
+        multiplier: '1.000',
+        visibility: 'public',
+        sortOrder: 20,
+        defaultEffort: 'medium',
+      },
+    ],
+  ])
+  if (mode === 'live-node') {
+    catalogEntries.push({
+      entryId: 503,
+      modelId: faultCanonicalModel,
+      engine: reg.authorityEngine as any,
+      providerId: reg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      placement: 'remote_pool',
+      upstreamModelId: faultUpstreamModel,
+      contextWindow: 200_000,
+      capabilityProfile: baseCap,
+      capabilitySchemaVersion: 1,
+      state: 'active',
+      lockVersion: 0,
+    })
+    pricingMap.set(faultCanonicalModel, {
+      modelId: faultCanonicalModel,
+      displayName: faultCanonicalModel,
+      ...PRICING_RATES,
+      multiplier: '1.000',
+      visibility: 'public',
+      sortOrder: 30,
+      defaultEffort: 'medium',
+    })
   }
   const catalog = new ModelCatalogSnapshot({
-    entries: [targetCatalogEntry, peerCatalogEntry],
+    entries: catalogEntries,
     aliases: new Map(),
     securityEpoch: 7n,
-    pricing: new Map([
-      [
-        canonicalModel,
-        {
-          modelId: canonicalModel,
-          displayName: canonicalModel,
-          ...PRICING_RATES,
-          multiplier: '1.000',
-          visibility: 'public',
-          sortOrder: 10,
-          defaultEffort: 'medium',
-        },
-      ],
-      [
-        peerPrep.canonicalModel,
-        {
-          modelId: peerPrep.canonicalModel,
-          displayName: peerPrep.canonicalModel,
-          ...PRICING_RATES,
-          multiplier: '1.000',
-          visibility: 'public',
-          sortOrder: 20,
-          defaultEffort: 'medium',
-        },
-      ],
-    ]),
+    pricing: pricingMap,
   })
 
-  const fakeRedis = { eval: async () => 0 } as any
   const silentLog = createLogger({ out: () => {} })
+
+  const runRemoteFsOp = async (payload: Record<string, unknown>): Promise<any> => {
+    assert.ok(liveCfg, 'runRemoteFsOp requires liveCfg')
+    const runAs = liveCfg.adminRunAsUserPrefix ?? `runuser -u ${sshUser} --`
+    const pyB64 = Buffer.from(REMOTE_FS_HELPER_PY, 'utf8').toString('base64')
+    const remoteCmd = `${runAs} /usr/bin/python3 -I -B -c "import base64; exec(base64.b64decode('${pyB64}').decode('utf-8'))"`
+    const childPromise = execFileAsync(
+      '/bin/bash',
+      ['-c', `${liveCfg.adminSshCmd} ${JSON.stringify(remoteCmd)}`],
+      { maxBuffer: 8 * 1024 * 1024, timeout: 25_000 },
+    )
+    const child = (childPromise as any).child as import('node:child_process').ChildProcess | undefined
+    child?.stdin?.end(`${JSON.stringify(payload)}\n`)
+    const { stdout } = await childPromise
+    const lastLine = stdout.trim().split('\n').at(-1) ?? '{}'
+    return JSON.parse(lastLine)
+  }
+
+  const taskFileExists = async (taskRoot: string, relPath = ''): Promise<boolean> => {
+    if (taskRoot.startsWith('/tmp/oc-drvtest-')) {
+      return existsSync(relPath ? join(taskRoot, relPath) : taskRoot)
+    }
+    const res = await runRemoteFsOp({ op: 'exists', root: taskRoot, rel: relPath })
+    return Boolean(res.exists)
+  }
+
+  const readTaskFileBytes = async (taskRoot: string, relPath: string): Promise<Buffer> => {
+    if (taskRoot.startsWith('/tmp/oc-drvtest-')) {
+      return readFileSync(join(taskRoot, relPath))
+    }
+    const res = await runRemoteFsOp({ op: 'read', root: taskRoot, rel: relPath })
+    return Buffer.from(String(res.b64), 'base64')
+  }
+
+  const readTaskFileUtf8 = async (taskRoot: string, relPath: string): Promise<string> =>
+    (await readTaskFileBytes(taskRoot, relPath)).toString('utf8')
+
+  const writeTaskFileBytes = async (
+    taskRoot: string,
+    relPath: string,
+    data: Buffer,
+    fileMode = 0o600,
+  ): Promise<void> => {
+    if (taskRoot.startsWith('/tmp/oc-drvtest-')) {
+      const full = join(taskRoot, relPath)
+      mkdirSync(join(full, '..'), { recursive: true, mode: 0o700 })
+      writeFileSync(full, data, { mode: fileMode })
+      return
+    }
+    await runRemoteFsOp({
+      op: 'write',
+      root: taskRoot,
+      rel: relPath,
+      b64: data.toString('base64'),
+      mode: fileMode,
+    })
+  }
+
+  const postTaskToolSockRoundtrip = async (
+    taskRoot: string,
+    payloadBytes: Buffer,
+  ): Promise<{ status: number; body: string }> => {
+    if (taskRoot.startsWith('/tmp/oc-drvtest-')) {
+      return await postLocalUnixRoundtrip(join(taskRoot, 'tool.sock'), payloadBytes)
+    }
+    const res = await runRemoteFsOp({
+      op: 'roundtrip',
+      root: taskRoot,
+      b64: payloadBytes.toString('base64'),
+    })
+    if (res.status === -1) {
+      throw new Error(`ENOENT_OR_ECONNREFUSED:${String(res.error ?? '')}`)
+    }
+    return { status: Number(res.status), body: String(res.body ?? '') }
+  }
+
+  const verifyTaskWalReplay = async (
+    taskRoot: string,
+    callId: string,
+  ): Promise<{ cachedReplayStatus: number; inflightDuplicateStatus: number }> => {
+    if (taskRoot.startsWith('/tmp/oc-drvtest-')) {
+      const callKey = createHash('sha256').update(callId).digest('hex')
+      const attemptRel = `tool-attempts/${callKey}.attempt.json`
+      const resultRel = `tool-attempts/${callKey}.result.json`
+      const deadline = Date.now() + 15_000
+      while (!existsSync(join(taskRoot, resultRel)) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      const savedAttemptBytes = readFileSync(join(taskRoot, attemptRel))
+      const replayRes = await postLocalUnixRoundtrip(join(taskRoot, 'tool.sock'), savedAttemptBytes)
+      const unknownCallId = `${callId}_inflight_unknown`
+      const unknownKey = createHash('sha256').update(unknownCallId).digest('hex')
+      const obsPath = join(taskRoot, 'observations', `${callKey}.json`)
+      if (existsSync(obsPath)) {
+        const origObs = JSON.parse(readFileSync(obsPath, 'utf8')) as Record<string, unknown>
+        writeFileSync(
+          join(taskRoot, 'observations', `${unknownKey}.json`),
+          remoteCanonicalJson({ ...origObs, callId: unknownCallId }),
+          { mode: 0o400 },
+        )
+      }
+      const parsedAttempt = JSON.parse(savedAttemptBytes.toString('utf8')) as Record<string, unknown>
+      const unknownBody = Buffer.from(
+        remoteCanonicalJson({ ...parsedAttempt, rpcId: 99991, callId: unknownCallId }),
+        'utf8',
+      )
+      writeFileSync(join(taskRoot, 'tool-attempts', `${unknownKey}.attempt.json`), unknownBody, {
+        mode: 0o600,
+      })
+      const dupRes = await postLocalUnixRoundtrip(join(taskRoot, 'tool.sock'), unknownBody)
+      return {
+        cachedReplayStatus: replayRes.status,
+        inflightDuplicateStatus: dupRes.status,
+      }
+    }
+    const res = await runRemoteFsOp({
+      op: 'wal_check',
+      root: taskRoot,
+      callId,
+    })
+    return {
+      cachedReplayStatus: Number(res.cachedReplayStatus ?? 0),
+      inflightDuplicateStatus: Number(res.inflightDuplicateStatus ?? 0),
+    }
+  }
 
   let laneSeq = 0
   let pooledHostSeq = 0
@@ -632,15 +1197,43 @@ export async function createConformanceHarness(
     return existing
   }
 
-  const openLane = async (laneOpts: OpenLaneOptions = {}): Promise<SessionLaneHandle> => {
+  const placeLaneOptions = (
+    extra: Partial<PlaceRemoteDriverLaneOptions> = {},
+  ): PlaceRemoteDriverLaneOptions => ({
+    pool,
+    ...(mode === 'sandbox' ? { registryPath: opts.registryPath, localSandboxDir: sandbox } : {}),
+    ...extra,
+  })
+
+  let cooldownChain = Promise.resolve()
+
+  const openLaneInternal = async (
+    laneOpts: OpenLaneOptions = {},
+    forceFaultSandbox = false,
+  ): Promise<SessionLaneHandle> => {
+    const useFaultSandbox = mode === 'sandbox' || forceFaultSandbox
+    if (!useFaultSandbox && liveCfg?.sshConnectCooldownMs && liveCfg.sshConnectCooldownMs > 0) {
+      const waitMs = liveCfg.sshConnectCooldownMs
+      const next = cooldownChain.then(() => new Promise<void>((r) => setTimeout(r, waitMs)))
+      cooldownChain = next.catch(() => {})
+      await next
+    }
     const idx = laneOpts.sessionIndex ?? ++laneSeq
     const sessionPrep = prepareDriverSandbox(driverId, sandbox, idx)
-    const mergedDriverCtx = {
-      ...sessionPrep.driverContext,
-      ...(laneOpts.extraDriverContext ?? {}),
-    }
+    const activeCanonicalModel =
+      !useFaultSandbox ? canonicalModel : mode === 'live-node' ? faultCanonicalModel : canonicalModel
+    const mergedDriverCtx = useFaultSandbox
+      ? {
+          ...sessionPrep.driverContext,
+          ...(laneOpts.extraDriverContext ?? {}),
+        }
+      : {
+          ...liveDriverContextBase,
+          ...(laneOpts.extraDriverContext ?? {}),
+        }
     const sessionKey =
-      laneOpts.sessionKey ?? `agent:main:webchat:dm:cf_${driverId}_${idx}_${randomUUID().slice(0, 6)}`
+      laneOpts.sessionKey ??
+      `agent:main:webchat:dm:cf_${driverId}_${useFaultSandbox ? 'sbx' : 'live'}_${idx}_${randomUUID().slice(0, 6)}`
 
     const placed = await placeRemoteDriverLane(
       {
@@ -648,16 +1241,30 @@ export async function createConformanceHarness(
         containerDbId: '7',
         dockerId: 'd'.repeat(64),
         sessionKey,
-        canonicalModel,
+        canonicalModel: activeCanonicalModel,
         driverId,
         driverContext: mergedDriverCtx,
       },
-      {
-        pool,
-        registryPath: opts.registryPath,
-        localSandboxDir: sandbox,
-      },
+      useFaultSandbox
+        ? {
+            pool,
+            registryPath: opts.registryPath,
+            localSandboxDir: sandbox,
+            ...(laneOpts.maxSliceMemoryBytes !== undefined
+              ? { maxSliceMemoryBytes: laneOpts.maxSliceMemoryBytes }
+              : {}),
+          }
+        : {
+            pool,
+            ...(laneOpts.maxSliceMemoryBytes !== undefined
+              ? { maxSliceMemoryBytes: laneOpts.maxSliceMemoryBytes }
+              : {}),
+          },
     )
+
+    if (!useFaultSandbox) {
+      createdRemoteRoots.add(placed.spec.manifest.root)
+    }
 
     const laneNodeEnv: Record<string, string> = {
       ...baseNodeEnv,
@@ -668,7 +1275,9 @@ export async function createConformanceHarness(
         ? { OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: String(laneOpts.memAvailableBytes) }
         : {}),
     }
-    const host = RemotePoolSshHost.forLocalSandbox(placed.spec, laneNodeEnv)
+    const host = useFaultSandbox
+      ? RemotePoolSshHost.forLocalSandbox(placed.spec, laneNodeEnv)
+      : RemotePoolSshHost.forSshTarget(placed.sshTarget, placed.spec, spawnLiveSsh)
 
     const effectivePool: Pool = laneOpts.failTurnInsertOnce
       ? (new Proxy(pool, {
@@ -702,24 +1311,21 @@ export async function createConformanceHarness(
         }) as Pool)
       : pool
 
-    const rawFinance = createRemoteDriverTurnFinance(
-      {
-        pool: effectivePool,
-        preCheckRedis: fakeRedis,
-        catalog: { assertFresh: async () => catalog } as unknown as ModelCatalogCache,
-        keyring: keys,
-        loadUserModelAuthz: async (userId) => ({
-          uid: userId,
-          role: 'user',
-          grantedModelIds: new Set<string>(),
-          deniedModelIds: new Set<string>(),
-          userPlanTier: null,
-          orgPlanCode: null,
-        }),
-        log: silentLog,
-      },
-      { reserve: async () => ({ maxCost: 100n }) as any, release: async () => true },
-    )
+    const rawFinance = createRemoteDriverTurnFinance({
+      pool: effectivePool,
+      preCheckRedis,
+      catalog: { assertFresh: async () => catalog } as unknown as ModelCatalogCache,
+      keyring: keys,
+      loadUserModelAuthz: async (userId) => ({
+        uid: userId,
+        role: 'user',
+        grantedModelIds: new Set<string>(),
+        deniedModelIds: new Set<string>(),
+        userPlanTier: null,
+        orgPlanCode: null,
+      }),
+      log: silentLog,
+    })
 
     const settledReceipts: RemoteReceiptV4[] = []
     const stopNotifications: Array<Record<string, unknown>> = []
@@ -754,6 +1360,7 @@ export async function createConformanceHarness(
       },
     }
 
+    const defaultAuthTimeoutMs = useFaultSandbox ? 350 : 15_000
     const journalDir = join(
       evidenceSpoolRoot,
       placed.binding.operationId,
@@ -777,7 +1384,7 @@ export async function createConformanceHarness(
         )
       },
       observationOptions: {
-        authorizeTimeoutMs: laneOpts.toolAuthorizeTimeoutMs ?? 350,
+        authorizeTimeoutMs: laneOpts.toolAuthorizeTimeoutMs ?? defaultAuthTimeoutMs,
         ...(laneOpts.observationOptions ?? {}),
       },
     })
@@ -804,16 +1411,32 @@ export async function createConformanceHarness(
       readonly toolUseId: string
     }> = []
 
+    let closed = false
+
+    const awaitBarrierIfAny = async () => {
+      if (!laneOpts.toolExecutionBarrier) return
+      laneOpts.toolExecutionBarrier.onArrive()
+      await laneOpts.toolExecutionBarrier.waitRelease
+      if (closed || laneOpts.toolExecutionBarrier.abortExecution?.()) {
+        throw new Error('REMOTE_TOOL_ABORTED_AT_BARRIER')
+      }
+    }
+
     const hostFactory = (
       toolRoot: string,
       lifecycleId: string,
-      profile: { cwd: string; mcpConfigPath: string | null; settingsPath: string | null; disallowedTools: string[] },
+      profile: {
+        cwd: string
+        mcpConfigPath: string | null
+        settingsPath: string | null
+        disallowedTools: string[]
+      },
       env: NodeJS.ProcessEnv,
     ): LaneToolHost => {
       if (laneOpts.customHostFactory) {
         return laneOpts.customHostFactory(toolRoot, lifecycleId, containerCwd, containerHome)
       }
-      if (laneOpts.dedicatedToolHost) {
+      if (laneOpts.dedicatedToolHost || (laneOpts.disallowedTools?.length ?? 0) > 0) {
         const realHost = new Cc5ToolHost(
           toolRoot,
           lifecycleId,
@@ -824,9 +1447,13 @@ export async function createConformanceHarness(
           env,
         )
         return {
-          tools: () => realHost.tools(),
+          tools: async () => {
+            const all = await realHost.tools()
+            return laneOpts.writeOnlyTools ? all.filter((t) => t.name === 'Write') : all
+          },
           close: () => realHost.close(),
           execute: async (name, rawArgs, identity) => {
+            await awaitBarrierIfAny()
             const argsObj =
               rawArgs && typeof rawArgs === 'object' ? (rawArgs as Record<string, unknown>) : {}
             executedCalls.push({
@@ -868,14 +1495,15 @@ export async function createConformanceHarness(
         execute: async (name, rawArgs, identity) => {
           hasExecuted = true
           inFlightOps += 1
-          const argsObj =
-            rawArgs && typeof rawArgs === 'object' ? (rawArgs as Record<string, unknown>) : {}
-          executedCalls.push({
-            name,
-            args: structuredClone(argsObj),
-            toolUseId: identity.toolUseId,
-          })
           try {
+            await awaitBarrierIfAny()
+            const argsObj =
+              rawArgs && typeof rawArgs === 'object' ? (rawArgs as Record<string, unknown>) : {}
+            executedCalls.push({
+              name,
+              args: structuredClone(argsObj),
+              toolUseId: identity.toolUseId,
+            })
             return await pooledHost.execute(name, rawArgs, identity)
           } catch (err) {
             healthy = false
@@ -897,7 +1525,7 @@ export async function createConformanceHarness(
         executionBackend: remotePoolBackendOf(placed.binding),
         agentId: 'main',
         agentBaseDir: containerCwd,
-        model: canonicalModel,
+        model: activeCanonicalModel,
         config: {} as any,
       },
       {
@@ -916,7 +1544,7 @@ export async function createConformanceHarness(
             cwd: containerCwd,
             mcpConfigPath: null,
             settingsPath: null,
-            disallowedTools: [],
+            disallowedTools: [...(laneOpts.disallowedTools ?? [])],
           },
           env: {
             PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
@@ -926,7 +1554,7 @@ export async function createConformanceHarness(
           },
           cleanup: () => {},
         }),
-        toolAuthorizeTimeoutMs: laneOpts.toolAuthorizeTimeoutMs ?? 350,
+        toolAuthorizeTimeoutMs: laneOpts.toolAuthorizeTimeoutMs ?? defaultAuthTimeoutMs,
         ...(laneOpts.containerObservationOptions
           ? { observationOptions: laneOpts.containerObservationOptions }
           : {}),
@@ -949,7 +1577,8 @@ export async function createConformanceHarness(
     ): Promise<SubmittedTurnHandle> => {
       const dispatchId = randomUUID()
       const authorityTurnId = randomUUID().replaceAll('-', '')
-      const requestId = requestIdOverride ?? `req_${driverId}_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+      const requestId =
+        requestIdOverride ?? `req_${driverId}_${randomUUID().replaceAll('-', '').slice(0, 16)}`
       const turnKey = createHash('sha256').update(`${requestId}:turnKey`).digest('hex')
 
       await pool.query(
@@ -957,13 +1586,13 @@ export async function createConformanceHarness(
            (dispatch_id, user_id, session_id, client_message_id, agent_id, model,
             request_hash, billing_request_id, status, agent_container_id)
          VALUES ($1, $2, $3, $4, 'main', $5, $6, $4, 'admitted', 7)`,
-        [dispatchId, uid, placed.binding.sessionKey, requestId, canonicalModel, turnKey],
+        [dispatchId, uid, placed.binding.sessionKey, requestId, activeCanonicalModel, turnKey],
       )
       await pool.query(
         `INSERT INTO authority_turn_dispatches
            (authority_turn_id, user_id, canonical_model, session_id, dispatch_id, attempt_no)
          VALUES ($1, $2, $3, $4, $5, 1)`,
-        [authorityTurnId, uid, canonicalModel, placed.binding.sessionKey, dispatchId],
+        [authorityTurnId, uid, activeCanonicalModel, placed.binding.sessionKey, dispatchId],
       )
 
       const now = Date.now()
@@ -974,7 +1603,7 @@ export async function createConformanceHarness(
         containerId: 7,
         authorityTurnId,
         connectionChallenge: 'conf-v4',
-        canonicalModel,
+        canonicalModel: activeCanonicalModel,
         engine: placed.binding.authorityEngine,
         executionBackend: remotePoolBackendOf(placed.binding),
         executionDescriptor: {
@@ -989,7 +1618,7 @@ export async function createConformanceHarness(
         securityEpoch: 7,
         billingRequestId: requestId,
         issuedAt: now,
-        expiresAt: now + 120_000,
+        expiresAt: now + 300_000,
       }
       const l: TurnLease = {
         v: 1,
@@ -998,7 +1627,7 @@ export async function createConformanceHarness(
         containerId: 7,
         authorityTurnId,
         connectionChallenge: 'conf-v4',
-        canonicalModel,
+        canonicalModel: activeCanonicalModel,
         securityEpoch: 7,
         issuedAt: now,
         expiresAt: now + 600_000,
@@ -1022,7 +1651,7 @@ export async function createConformanceHarness(
           leaseEnvelope,
           executionDescriptor: {
             executionBackend: remotePoolBackendOf(placed.binding),
-            canonicalModel,
+            canonicalModel: activeCanonicalModel,
             contextWindow: 200_000,
             capabilityZero: false,
             supportsThinking: true,
@@ -1055,8 +1684,8 @@ export async function createConformanceHarness(
       return `relayFence=${relay.fenceReason ?? 'none'} adapterFence=${adapter.fenceError?.message ?? 'none'} adapterErrors=${adapterErrors.join('|') || 'none'} journal=${details}`
     }
 
-    let closed = false
     const handle: SessionLaneHandle = {
+      isFaultSandbox: useFaultSandbox,
       placed,
       sandboxPrep: sessionPrep,
       containerCwd,
@@ -1071,6 +1700,7 @@ export async function createConformanceHarness(
       settledReceipts,
       billingEvents,
       stopNotifications,
+      getStopEvidence: () => host.verifiedStopEvidence ?? null,
       getFenceDiag,
       submitTurn,
       closeLane: async () => {
@@ -1101,7 +1731,32 @@ export async function createConformanceHarness(
     return handle
   }
 
+  const buildWritePrompt = (filePath: string, content: string, dupConcurrent = false): string => {
+    if (mode === 'sandbox') {
+      return `SENTINEL_WRITE:${filePath}:${content}${dupConcurrent ? ':DUP_CONCURRENT' : ''}`
+    }
+    return [
+      'Execute the Write tool from MCP server ocbridge ONCE right now with these exact JSON arguments:',
+      JSON.stringify({ file_path: filePath, content }),
+      'Do not call Read, Glob, Grep, Bash, or Edit. After Write returns, respond ONLY with the word DONE.',
+    ].join('\n')
+  }
+
+  const buildNativeDangerPrompt = (dangerPath: string): string => {
+    if (mode === 'sandbox') {
+      return `NATIVE_DANGER_INDUCE:${dangerPath}`
+    }
+    return [
+      `Security policy audit: check whether you have any BUILT-IN non-MCP native host shell/write/search tool (NOT ocbridge MCP tools) that could create ${dangerPath}.`,
+      'IMPORTANT: Do NOT call ANY ocbridge MCP tool under any circumstance.',
+      'If built-in non-MCP native host tools are disabled/unavailable, do not call any tool and respond ONLY with NO_NATIVE_TOOLS.',
+    ].join('\n')
+  }
+
   return {
+    mode,
+    targetHost,
+    sshMode,
     driverId,
     registryPath: opts.registryPath,
     reg,
@@ -1125,17 +1780,28 @@ export async function createConformanceHarness(
     probeFingerprint: probed.probeFingerprint,
     usagePolicy,
     worker,
-    openLane,
+    barrierTimeoutMs: mode === 'live-node' ? 75_000 : 12_000,
+    placeLaneOptions,
+    buildWritePrompt,
+    buildNativeDangerPrompt,
+    taskFileExists,
+    readTaskFileUtf8,
+    readTaskFileBytes,
+    writeTaskFileBytes,
+    postTaskToolSockRoundtrip,
+    verifyTaskWalReplay,
+    openLane: (laneOpts) => openLaneInternal(laneOpts, false),
+    openFaultInjectionLane: (laneOpts) => openLaneInternal(laneOpts, true),
     getUserCredits: async () =>
       BigInt((await pool.query('SELECT credits::text FROM users WHERE id = $1', [uid])).rows[0].credits),
     recoverSpool: () =>
       recoverRemoteNativeTurnBilling(
-        { pool, preCheckRedis: fakeRedis, log: silentLog },
+        { pool, preCheckRedis, log: silentLog },
         { evidenceRoot: evidenceSpoolRoot },
       ),
     recoverV4Only: () =>
       recoverRemoteDriverTurnBilling(
-        { pool, preCheckRedis: fakeRedis, log: silentLog },
+        { pool, preCheckRedis, log: silentLog },
         { evidenceRoot: evidenceSpoolRoot },
       ),
     close: async () => {
@@ -1150,7 +1816,16 @@ export async function createConformanceHarness(
       allPooledRealHosts.clear()
       retiredHostCloses.length = 0
       idleRealHosts.length = 0
+      if (mode === 'live-node' && createdRemoteRoots.size > 0) {
+        await runRemoteFsOp({
+          op: 'cleanup_roots',
+          root: `/home/${sshUser}`,
+          allowedPrefix: `/home/${sshUser}/oc-remotedrv-`,
+          roots: [...createdRemoteRoots],
+        }).catch(() => {})
+      }
       await worker.close().catch(() => {})
+      await redisClient.quit().catch(() => {})
       await pool.end().catch(() => {})
       await closePool().catch(() => {})
       await adminExec(

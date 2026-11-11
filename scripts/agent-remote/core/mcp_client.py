@@ -251,7 +251,11 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     config = read_config(root)
     catalog = read_catalog(root, config)
-    driver_mod, _, _ = load_driver(config["driverId"], registry_path=config.get("registryPath"))
+    driver_mod, _, _ = load_driver(
+        config["driverId"],
+        registry_path=config.get("registryPath"),
+        allow_sandbox_override=str(root).startswith("/tmp/oc-drvtest-"),
+    )
 
     seen_rpc: Set[Tuple[type, Any]] = set()
     seen_calls: Set[str] = set()

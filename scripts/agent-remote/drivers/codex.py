@@ -59,6 +59,49 @@ ALLOWED_NATIVE_ITEMS = frozenset(
     {"agentMessage", "reasoning", "userMessage", "contextCompaction", "mcpToolCall"}
 )
 
+DISALLOWED_NOTIFICATION_PREFIXES = (
+    "item/commandExecution/",
+    "item/fileChange/",
+    "item/permissions/",
+    "item/tool/requestUserInput",
+    "execCommandApproval",
+    "applyPatchApproval",
+    "mcpServer/elicitation/",
+)
+
+BENIGN_DIAGNOSTIC_NOTIFICATIONS = frozenset(
+    {
+        "thread/started",
+        "thread/status/changed",
+        "thread/readState/changed",
+        "thread/closed",
+        "thread/archived",
+        "thread/unarchived",
+        "thread/name/updated",
+        "thread/goal/updated",
+        "thread/goal/cleared",
+        "thread/compacted",
+        "account/rateLimits/updated",
+        "account/updated",
+        "account/login/completed",
+        "item/reasoning/summaryPartAdded",
+        "item/mcpToolCall/progress",
+        "item/plan/delta",
+        "turn/plan/updated",
+        "turn/diff/updated",
+        "turn/moderationMetadata",
+        "mcpServer/startupStatus/updated",
+        "mcpServer/oauthLogin/completed",
+        "remoteControl/status/changed",
+        "model/rerouted",
+        "warning",
+        "error",
+        "configWarning",
+        "deprecationNotice",
+        "skills/changed",
+    }
+)
+
 
 def _mask_email(email: Optional[str]) -> Optional[str]:
     if not email or not isinstance(email, str):
@@ -140,6 +183,14 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         for entry in base_catalog["models"]:
             if isinstance(entry, dict) and isinstance(entry.get("slug"), str):
                 raw_by_slug[entry["slug"]] = dict(entry)
+    if not raw_by_slug:
+        cache_path = codex_home / "models_cache.json"
+        if cache_path.is_file() and not cache_path.is_symlink():
+            cached_doc = strict_json(cache_path.read_bytes())
+            if isinstance(cached_doc, dict) and isinstance(cached_doc.get("models"), list):
+                for entry in cached_doc["models"]:
+                    if isinstance(entry, dict) and isinstance(entry.get("slug"), str):
+                        raw_by_slug[entry["slug"]] = dict(entry)
 
     # Test-only Group 2 red control strictly confined to `/tmp/oc-drvtest-`.
     skip_disable: List[str] = []
@@ -492,7 +543,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
                 call_id = item.get("id")
                 tool_name = item.get("tool")
                 raw_args = item.get("arguments")
-                if isinstance(raw_args, str):
+                if raw_args is None:
+                    raw_args = {}
+                elif isinstance(raw_args, str):
                     raw_args = strict_json(raw_args)
                 need(
                     isinstance(call_id, str)
@@ -578,7 +631,18 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         security_events.append(term_ev)
         state["activeTurnId"] = None
 
-    elif method in ("thread/status/changed", "thread/closed", "account/rateLimits/updated", "item/reasoning/summaryPartAdded"):
+    elif any(method == pfx or method.startswith(pfx) for pfx in DISALLOWED_NOTIFICATION_PREFIXES):
+        security_events.append(
+            {
+                "kind": "disallowedItem",
+                "reason": "disallowed_notification",
+                "itemType": method[:120],
+            }
+        )
+
+    elif method in BENIGN_DIAGNOSTIC_NOTIFICATIONS or method.startswith(
+        ("remoteControl/", "mcpServer/startupStatus/", "codex/event/")
+    ):
         pass
 
     else:
@@ -633,12 +697,19 @@ def probe(context: Dict[str, Any], previous_step_result: Optional[Dict[str, Any]
         stdin_lines.append(
             json.dumps({"jsonrpc": "2.0", "id": 3, "method": "model/list", "params": list_params}, separators=(",", ":"))
         )
+        probe_tmp_base = str(context.get("probeTmp") or context.get("probeCwd") or "/tmp")
         out: Dict[str, Any] = {
             "kind": "step",
             "step": {
                 "argv": [cli_path, *_policy_args()],
                 "stdinLines": stdin_lines,
-                "environment": {"CODEX_HOME": str(codex_home)},
+                "interactiveJsonRpc": True,
+                "environment": {
+                    "CODEX_HOME": str(codex_home),
+                    "XDG_CONFIG_HOME": f"{probe_tmp_base}/xdg-config",
+                    "XDG_DATA_HOME": f"{probe_tmp_base}/xdg-data",
+                    "XDG_CACHE_HOME": f"{probe_tmp_base}/xdg-cache",
+                },
                 "timeoutSec": 18,
                 "hashFiles": {"cli": cli_path, "native": native_path},
             },
@@ -721,7 +792,13 @@ def probe(context: Dict[str, Any], previous_step_result: Optional[Dict[str, Any]
     need(len(models) > 0, "CODEX_PROBE_NO_VISIBLE_MODELS")
 
     user_agent = str(init_res.get("userAgent") or "")
-    cli_version = user_agent.split("/", 1)[1] if "/" in user_agent else str(context.get("cliVersion") or "0.167.0")
+    probe_root = str(context.get("probeRoot") or "")
+    if "/" in user_agent and user_agent.split("/", 1)[1].strip():
+        cli_version = user_agent.split("/", 1)[1].strip().split()[0]
+    elif probe_root.startswith("/tmp/oc-drvtest-") and isinstance(context.get("testCliVersion"), str) and context["testCliVersion"].strip():
+        cli_version = context["testCliVersion"].strip()
+    else:
+        raise ValueError("CODEX_PROBE_VERSION_MISSING")
     email_hint = _mask_email(acct_res.get("email"))
     plan_type = str(acct_res.get("planType") or "") or None
     auth_present = (codex_home / "auth.json").is_file() and bool(acct_res)

@@ -161,6 +161,8 @@ export async function recordDriverProbeSnapshot(
         : {}
     const prevObservedFp =
       typeof prevManifest.latestFingerprint === 'string' ? prevManifest.latestFingerprint : null
+    const priorUnenqueuedAuthChange = prevManifest.unverifiedAuthChangeWhileUnhealthy === true
+    const effectiveAuthChanged = authChanged || priorUnenqueuedAuthChange
 
     const nextManifest = {
       ...prevManifest,
@@ -173,6 +175,7 @@ export async function recordDriverProbeSnapshot(
       coreDigest,
       policySha256: input.policySha256,
       latestFingerprint: fingerprint,
+      unverifiedAuthChangeWhileUnhealthy: !healthyProbe && effectiveAuthChanged,
     }
 
     const discoveredModels = snapshot.models.map((m) => ({
@@ -187,7 +190,7 @@ export async function recordDriverProbeSnapshot(
     // Case 1: Already verified for this exact fingerprint and probe remains healthy & same auth_epoch.
     if (
       healthyProbe &&
-      !authChanged &&
+      !effectiveAuthChanged &&
       !adminDisabled &&
       row.execution_ready === true &&
       row.verified_fingerprint === fingerprint &&
@@ -231,8 +234,12 @@ export async function recordDriverProbeSnapshot(
     }
 
     // Case 2: Repeat probe of the exact same unverified fingerprint while already `execution_ready = false`
-    // and `!authChanged` — do NOT bump `ready_generation` (so an in-flight verification run for this
-    // exact fingerprint is not spuriously superseded).
+    // and `!authChanged`.
+    // - If `!healthyProbe` while an active verification run is in flight, fall through to Case 3 so
+    //   `ready_generation` increments and supersedes the in-flight run fail-closed.
+    // - If `healthyProbe && !adminDisabled` and NEITHER an active run NOR a prior `failed` run exists
+    //   (e.g. recovering from a transient `unhealthy` probe at the same fingerprint, `B3`), enqueue a
+    //   `pending` verification run in this same transaction so the profile can re-verify via CAS or alert!
     if (
       row.execution_ready === false &&
       prevObservedFp === fingerprint &&
@@ -250,28 +257,90 @@ export async function recordDriverProbeSnapshot(
           [input.profileId, fingerprint],
         )
       ).rows[0]
-      await client.query(
-        `UPDATE remote_agent_profiles
-            SET probe_snapshot = $2::jsonb,
-                execution_manifest = $3::jsonb,
-                last_probe_ok_at = CASE WHEN $4::boolean THEN NOW() ELSE last_probe_ok_at END,
-                updated_at = NOW()
-          WHERE id = $1`,
-        [input.profileId, JSON.stringify(snapshot), JSON.stringify(nextManifest), healthyProbe],
-      )
-      await client.query('COMMIT')
-      return {
-        profileId: input.profileId,
-        drifted: false,
-        executionReady: false,
-        fingerprint,
-        readyGeneration: String(row.ready_generation),
-        verificationRunId: existingActive?.id ?? null,
-        autoEligible: existingActive?.auto_eligible ?? false,
+
+      if (!healthyProbe && existingActive) {
+        // Fall through to Case 3 to bump `ready_generation` and supersede `existingActive`.
+      } else {
+        const priorFailed = healthyProbe
+          ? (
+              await client.query(
+                `SELECT 1 FROM remote_driver_verification_runs
+                  WHERE profile_id = $1
+                    AND target_fingerprint = $2
+                    AND state = 'failed'
+                  LIMIT 1`,
+                [input.profileId, fingerprint],
+              )
+            ).rows[0]
+          : undefined
+
+        let verificationRunId: string | null = existingActive?.id ?? null
+        let autoEligible: boolean = existingActive?.auto_eligible ?? false
+        if (healthyProbe && !adminDisabled && !existingActive && !priorFailed) {
+          autoEligible = !effectiveAuthChanged
+          const ins = await client.query<{ id: string }>(
+            `INSERT INTO remote_driver_verification_runs
+               (node_id, profile_id, engine_id, driver_id, target_fingerprint,
+                driver_digest, core_digest, suite_digest, ready_generation,
+                auth_epoch, auto_eligible, state)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+             ON CONFLICT (profile_id, target_fingerprint)
+               WHERE state IN ('pending', 'running')
+             DO NOTHING
+             RETURNING id::text AS id`,
+            [
+              row.node_id,
+              input.profileId,
+              snapshot.engineId,
+              snapshot.driverId,
+              fingerprint,
+              driverDigest,
+              coreDigest,
+              input.suiteDigest ?? null,
+              String(row.ready_generation),
+              effectiveAuthEpoch,
+              autoEligible,
+            ],
+          )
+          verificationRunId = ins.rows[0]?.id ?? null
+        }
+
+        await client.query(
+          `UPDATE remote_agent_profiles
+              SET probe_snapshot = $2::jsonb,
+                  execution_manifest = $3::jsonb,
+                  discovered_models = CASE WHEN $4::boolean THEN $5::jsonb ELSE discovered_models END,
+                  last_probe_ok_at = CASE WHEN $4::boolean THEN NOW() ELSE last_probe_ok_at END,
+                  last_error = CASE
+                    WHEN NOT $4::boolean THEN 'REMOTE_PROBE_UNHEALTHY'
+                    WHEN $6::boolean THEN last_error
+                    ELSE NULL
+                  END,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [
+            input.profileId,
+            JSON.stringify(snapshot),
+            JSON.stringify(nextManifest),
+            healthyProbe,
+            JSON.stringify(discoveredModels),
+            Boolean(priorFailed),
+          ],
+        )
+        await client.query('COMMIT')
+        return {
+          profileId: input.profileId,
+          drifted: false,
+          executionReady: false,
+          fingerprint,
+          readyGeneration: String(row.ready_generation),
+          verificationRunId,
+          autoEligible,
+        }
       }
     }
 
-    // Case 3: Genuine fingerprint drift, initial unverified observation, auth change, or manual retry.
+    // Case 3: Genuine fingerprint drift, initial unverified observation, unhealthy transition, auth change, or manual retry.
     const nextGeneration = BigInt(row.ready_generation) + 1n
     await client.query(
       `UPDATE remote_agent_profiles
@@ -316,7 +385,7 @@ export async function recordDriverProbeSnapshot(
     )
 
     let verificationRunId: string | null = null
-    const autoEligible = !authChanged
+    const autoEligible = !effectiveAuthChanged
     if (healthyProbe && !adminDisabled) {
       const priorFailed = (
         await client.query(
@@ -689,15 +758,22 @@ export async function completeDriverVerificationRun(
         : {}
     const policySha256 = typeof manifest.policySha256 === 'string' ? manifest.policySha256 : ''
     let recomputedFp: string | null = null
+    let snapshotHealthy = false
     if (profile.probe_snapshot && SHA256_RE.test(policySha256) && currentDriverDigest && currentCoreDigest) {
       try {
-        recomputedFp = computeProbeFingerprintTs(profile.probe_snapshot as RemoteProbeSnapshot, {
+        const parsedSnap = validateRemoteProbeSnapshot(profile.probe_snapshot)
+        snapshotHealthy =
+          parsedSnap.authPresent === true &&
+          parsedSnap.accountObserved === true &&
+          parsedSnap.models.length > 0
+        recomputedFp = computeProbeFingerprintTs(parsedSnap, {
           driverDigest: currentDriverDigest,
           coreDigest: currentCoreDigest,
           policySha256,
         })
       } catch {
         recomputedFp = null
+        snapshotHealthy = false
       }
     }
 
@@ -720,6 +796,9 @@ export async function completeDriverVerificationRun(
       abortReason = 'ADMIN_DISABLED'
     } else if (!['active', 'degraded'].includes(String(profile.status))) {
       abortReason = 'PROFILE_STATUS_NOT_SERVABLE'
+    } else if (!snapshotHealthy) {
+      abortReason = 'PROBE_SNAPSHOT_UNHEALTHY'
+      targetRunState = 'superseded'
     } else if (BigInt(profile.ready_generation) !== BigInt(run.ready_generation)) {
       abortReason = 'SECONDARY_DRIFT_READY_GENERATION_MISMATCH'
       targetRunState = 'superseded'
@@ -770,6 +849,7 @@ export async function completeDriverVerificationRun(
 
     const updatedManifest = {
       ...manifest,
+      unverifiedAuthChangeWhileUnhealthy: false,
       verifiedAt: new Date().toISOString(),
       verifiedFingerprint: String(run.target_fingerprint),
       evidenceDigest: input.evidenceDigest,

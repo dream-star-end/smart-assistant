@@ -8,9 +8,10 @@ authentic raw-frame digests, enforces state/payload size limits, and fails close
 from __future__ import annotations
 
 import hashlib
-import importlib.util
+import os
 from pathlib import Path
 import re
+import stat
 import types
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -82,9 +83,42 @@ def compute_core_digest(core_dir: Optional[Path] = None) -> str:
     return remote_canonical_sha256({"version": PROTOCOL_VERSION, "coreFiles": listing})
 
 
-def load_registry(registry_path: Optional[Union[str, Path]] = None) -> Dict[str, Dict[str, Any]]:
-    path = Path(registry_path).resolve() if registry_path else default_registry_path().resolve()
-    raw = strict_json(path.read_bytes())
+def _read_regular_file(path: Path, max_bytes: int, *, require_owner_uid: Optional[int] = None) -> bytes:
+    need(not path.is_symlink(), "REMOTE_ARTIFACT_UNSAFE")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        need(
+            stat.S_ISREG(st.st_mode)
+            and st.st_nlink == 1
+            and not (st.st_mode & 0o022)
+            and 0 < st.st_size <= max_bytes
+            and (require_owner_uid is None or st.st_uid == require_owner_uid),
+            "REMOTE_ARTIFACT_UNSAFE",
+        )
+        data = os.read(fd, max_bytes + 1)
+        need(len(data) == st.st_size, "REMOTE_ARTIFACT_CHANGED")
+        return data
+    finally:
+        os.close(fd)
+
+
+def load_registry(
+    registry_path: Optional[Union[str, Path]] = None,
+    *,
+    allow_sandbox_override: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    default_path = default_registry_path().resolve()
+    path = Path(registry_path).resolve() if registry_path else default_path
+    if path != default_path:
+        need(
+            allow_sandbox_override and str(path).startswith("/tmp/oc-drvtest-"),
+            "REMOTE_REGISTRY_OVERRIDE_FORBIDDEN",
+        )
+        raw_bytes = _read_regular_file(path, 262144, require_owner_uid=os.getuid())
+    else:
+        raw_bytes = _read_regular_file(path, 262144)
+    raw = strict_json(raw_bytes)
     need(isinstance(raw, dict) and raw.get("version") == PROTOCOL_VERSION, "REMOTE_REGISTRY_INVALID")
     drivers = raw.get("drivers")
     need(isinstance(drivers, dict) and 1 <= len(drivers) <= 32, "REMOTE_REGISTRY_INVALID")
@@ -133,15 +167,35 @@ def load_driver(
     driver_id: str,
     registry_path: Optional[Union[str, Path]] = None,
     base_dir: Optional[Path] = None,
+    *,
+    expected_digest: Optional[str] = None,
+    allow_sandbox_override: bool = False,
 ) -> Tuple[types.ModuleType, Dict[str, Any], str]:
-    registry = load_registry(registry_path)
+    registry = load_registry(registry_path, allow_sandbox_override=allow_sandbox_override)
     need(driver_id in registry, "REMOTE_DRIVER_NOT_REGISTERED")
     meta = registry[driver_id]
-    root = (base_dir or agent_remote_root()).resolve()
+    if base_dir is not None:
+        root = Path(base_dir).resolve()
+    elif (
+        allow_sandbox_override
+        and registry_path is not None
+        and Path(registry_path).resolve() != default_registry_path().resolve()
+        and Path(registry_path).resolve().parent.name == "drivers"
+        and (Path(registry_path).resolve().parent.parent / meta["module"]).is_file()
+    ):
+        root = Path(registry_path).resolve().parent.parent.resolve()
+    else:
+        root = agent_remote_root().resolve()
     mod_path = (root / meta["module"]).resolve()
     need(mod_path.parent == (root / "drivers").resolve(), "REMOTE_DRIVER_PATH_ESCAPED")
-    digest = file_sha256(mod_path, max_bytes=1024 * 1024)
-    source_bytes = mod_path.read_bytes()
+    source_bytes = _read_regular_file(
+        mod_path,
+        1024 * 1024,
+        require_owner_uid=os.getuid() if str(mod_path).startswith("/tmp/oc-drvtest-") else None,
+    )
+    digest = hashlib.sha256(source_bytes).hexdigest()
+    if expected_digest is not None:
+        need(digest == expected_digest, "REMOTE_DRIVER_OR_CORE_DIGEST_MISMATCH")
     mod = types.ModuleType(f"oc_remote_driver_{driver_id}")
     mod.__file__ = str(mod_path)
     exec(compile(source_bytes, str(mod_path), "exec"), mod.__dict__)

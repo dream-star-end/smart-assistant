@@ -34,10 +34,15 @@ _CORE_DIGEST_CACHE: Optional[str] = None
 
 
 def _pinned_driver(driver_id: str, registry_path: Optional[str]):
-    key = (driver_id, str(Path(registry_path).resolve()) if registry_path else "")
+    resolved_reg = str(Path(registry_path).resolve()) if registry_path else ""
+    key = (driver_id, resolved_reg)
     cached = _DRIVER_CACHE.get(key)
     if cached is None:
-        cached = load_driver(driver_id, registry_path=registry_path)
+        cached = load_driver(
+            driver_id,
+            registry_path=registry_path,
+            allow_sandbox_override=resolved_reg.startswith("/tmp/oc-drvtest-"),
+        )
         _DRIVER_CACHE[key] = cached
     return cached
 

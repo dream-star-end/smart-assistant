@@ -68,16 +68,32 @@ def option(name: str, default: Any) -> Any:
     return os.environ.get("OC_REMOTE_" + name, settings().get(name, default))
 
 
-def engine_meta(engine: str, registry_path: Optional[str] = None) -> Dict[str, Any]:
-    reg = load_registry(registry_path)
+def _sandbox_allowed() -> bool:
+    raw_root = str(option("RESOURCE_ROOT", str(Path.home() / ".oc-remote-resources")))
+    return raw_root.startswith("/tmp/oc-drvtest-")
+
+
+def engine_meta(
+    engine: str,
+    registry_path: Optional[str] = None,
+    *,
+    allow_sandbox_override: Optional[bool] = None,
+) -> Dict[str, Any]:
+    allow = _sandbox_allowed() if allow_sandbox_override is None else allow_sandbox_override
+    reg = load_registry(registry_path, allow_sandbox_override=allow)
     for entry in reg.values():
         if entry["engineId"] == engine:
             return entry
     raise RuntimeError("REMOTE_ENGINE_NOT_REGISTERED")
 
 
-def config(engine: str, registry_path: Optional[str] = None) -> Dict[str, Any]:
-    meta = engine_meta(engine, registry_path=registry_path)
+def config(
+    engine: str,
+    registry_path: Optional[str] = None,
+    *,
+    allow_sandbox_override: Optional[bool] = None,
+) -> Dict[str, Any]:
+    meta = engine_meta(engine, registry_path=registry_path, allow_sandbox_override=allow_sandbox_override)
     prefix = engine.upper().replace("-", "_") + "_"
     values = {
         "slice": str(option(prefix + "SLICE", meta["slice"])),
@@ -231,8 +247,13 @@ def records() -> List[Dict[str, Any]]:
     return rows
 
 
-def ensure_slice(engine: str, registry_path: Optional[str] = None) -> Dict[str, Any]:
-    c = config(engine, registry_path=registry_path)
+def ensure_slice(
+    engine: str,
+    registry_path: Optional[str] = None,
+    *,
+    allow_sandbox_override: Optional[bool] = None,
+) -> Dict[str, Any]:
+    c = config(engine, registry_path=registry_path, allow_sandbox_override=allow_sandbox_override)
     fake = _fake_systemd_dir()
     if fake is not None:
         unit_file = fake / (c["slice"] + ".json")
@@ -309,8 +330,15 @@ def snapshot(
     scopes: Dict[str, int],
     rows: List[Dict[str, Any]],
     registry_path: Optional[str] = None,
+    *,
+    master_max_memory_bytes: Optional[int] = None,
+    allow_sandbox_override: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    c = config(engine, registry_path=registry_path)
+    c = config(engine, registry_path=registry_path, allow_sandbox_override=allow_sandbox_override)
+    effective_slice_max = c["max"]
+    if master_max_memory_bytes is not None:
+        need(type(master_max_memory_bytes) is int and master_max_memory_bytes > 0)
+        effective_slice_max = min(c["max"], master_max_memory_bytes)
     budget = sum(scopes.values())
     total = next(
         int(line.split()[1]) * 1024
@@ -326,8 +354,8 @@ def snapshot(
     free = available()
     ok = (
         node_committed + budget + c["headroom"] <= node_budget
-        and engine_committed + budget + c["headroom"] <= c["max"]
-        and current + budget + c["headroom"] <= c["max"]
+        and engine_committed + budget + c["headroom"] <= effective_slice_max
+        and current + budget + c["headroom"] <= effective_slice_max
         and free >= budget + c["headroom"]
     )
     tasks_ok = engine_tasks + len(scopes) * 128 <= c["tasks"]
@@ -337,6 +365,7 @@ def snapshot(
         "code": code,
         "activeSessions": sum(r["kind"] == "lane" for r in engine_rows),
         "nodeBudgetBytes": node_budget,
+        "sliceMaxBytes": effective_slice_max,
         "committedBytes": node_committed,
         "newBudgetBytes": budget,
         "memAvailableBytes": free,
@@ -352,7 +381,9 @@ def admit(
     *,
     kind: str = "lane",
     master_max_lanes: Optional[int] = None,
+    master_max_memory_bytes: Optional[int] = None,
     registry_path: Optional[str] = None,
+    allow_sandbox_override: Optional[bool] = None,
 ) -> Dict[str, Any]:
     need(
         scopes
@@ -364,7 +395,7 @@ def admit(
         )
     )
     with locked():
-        c = ensure_slice(engine, registry_path=registry_path)
+        c = ensure_slice(engine, registry_path=registry_path, allow_sandbox_override=allow_sandbox_override)
         rows = records()
         existing = next((r for r in rows if r["key"] == key), None)
         if existing:
@@ -391,7 +422,14 @@ def admit(
             if active_in_pool >= effective_cap:
                 raise ProfileCapacityExhausted(engine, profile, effective_cap, cap_drift=cap_drift)
 
-        status = snapshot(engine, scopes, rows, registry_path=registry_path)
+        status = snapshot(
+            engine,
+            scopes,
+            rows,
+            registry_path=registry_path,
+            master_max_memory_bytes=master_max_memory_bytes,
+            allow_sandbox_override=allow_sandbox_override,
+        )
         if not status["memoryOk"]:
             raise MemoryExhausted(status)
         row = {
@@ -408,14 +446,20 @@ def admit(
         return row
 
 
-def preflight(engine: str, registry_path: Optional[str] = None) -> Dict[str, Any]:
+def preflight(
+    engine: str,
+    registry_path: Optional[str] = None,
+    *,
+    allow_sandbox_override: Optional[bool] = None,
+) -> Dict[str, Any]:
     with locked():
-        c = ensure_slice(engine, registry_path=registry_path)
+        c = ensure_slice(engine, registry_path=registry_path, allow_sandbox_override=allow_sandbox_override)
         return snapshot(
             engine,
             {"preview-app": c["app"], "preview-socket": c["socket"]},
             records(),
             registry_path=registry_path,
+            allow_sandbox_override=allow_sandbox_override,
         )
 
 

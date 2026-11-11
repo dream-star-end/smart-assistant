@@ -84,6 +84,8 @@ export interface PlaceRemoteDriverLaneOptions {
   readonly now?: () => number
   /** Hermetic `/tmp/oc-drvtest-*` directory for local controller conformance runs. */
   readonly localSandboxDir?: string
+  /** Optional tighten-only slice memory ceiling (bytes) enforced by `resources.admit`. */
+  readonly maxSliceMemoryBytes?: number
 }
 
 export interface RemoteDriverPlacementResult {
@@ -129,12 +131,22 @@ function verifyProfileReadyForV4(
   } catch {
     return { ready: false, reason: 'reverify' }
   }
+  if (
+    snapshot.authPresent !== true ||
+    snapshot.accountObserved !== true ||
+    snapshot.models.length === 0
+  ) {
+    return { ready: false, reason: 'reverify' }
+  }
   if (computedFp !== row.verified_fingerprint) {
     return { ready: false, reason: 'reverify' }
   }
-  if (row.last_probe_ok_at) {
+  if (maxProbeAgeMs > 0) {
+    if (!row.last_probe_ok_at) {
+      return { ready: false, reason: 'stale' }
+    }
     const probeAge = nowMs - new Date(row.last_probe_ok_at).getTime()
-    if (probeAge > maxProbeAgeMs) {
+    if (!Number.isFinite(probeAge) || probeAge > maxProbeAgeMs) {
       return { ready: false, reason: 'stale' }
     }
   }
@@ -465,8 +477,14 @@ export async function placeRemoteDriverLane(
     } else {
       const home = selectedRow.ssh_user === 'root' ? '/root' : `/home/${selectedRow.ssh_user}`
       taskRootPrefix = `${home}/oc-remotedrv-`
-      taskRoot = `${taskRootPrefix}${safeDriverSlug}-${operationId.replace(/-/g, '')}-g${generation}`
+      taskRoot = `${taskRootPrefix}${safeDriverSlug.slice(0, 12)}-${operationId.replace(/-/g, '').slice(0, 24)}-g${generation}`
       controllerPath = `/opt/openclaude/remote-driver/${reg.controllerSha256}/core/controller.py`
+    }
+    if (options.maxSliceMemoryBytes !== undefined) {
+      need(
+        Number.isSafeInteger(options.maxSliceMemoryBytes) && options.maxSliceMemoryBytes > 0,
+        'REMOTE_SLICE_MEMORY_CAP_INVALID',
+      )
     }
     const profileName = String(selectedRow.profile_name)
     const authEpoch = String(selectedRow.auth_epoch ?? selectedRow.account_fingerprint ?? 'epoch-1')
@@ -488,6 +506,9 @@ export async function placeRemoteDriverLane(
       coreDigest: reg.coreDigest,
       nativeSessionId: sticky?.native_session_id ?? null,
       maxConcurrentLanes: effectiveCap,
+      ...(options.maxSliceMemoryBytes !== undefined
+        ? { maxSliceMemoryBytes: options.maxSliceMemoryBytes }
+        : {}),
     })
     const manifestSha256 = remoteCanonicalSha256(manifest)
     const expiresAt = nowMs + ttlMs

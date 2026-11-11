@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import shutil
 import signal
 import socket
 import stat
@@ -204,6 +205,13 @@ def read_manifest(root: Path) -> Dict[str, Any]:
         need(isinstance(m["nativeSessionId"], str) and IDENT_RE.fullmatch(m["nativeSessionId"]), "REMOTE_MANIFEST_INVALID")
     if m.get("maxConcurrentLanes") is not None:
         need(type(m["maxConcurrentLanes"]) is int and m["maxConcurrentLanes"] > 0, "REMOTE_MANIFEST_INVALID")
+    if m.get("maxSliceMemoryBytes") is not None:
+        need(type(m["maxSliceMemoryBytes"]) is int and m["maxSliceMemoryBytes"] > 0, "REMOTE_MANIFEST_INVALID")
+    if m.get("registryPath") is not None:
+        need(
+            str(root).startswith("/tmp/oc-drvtest-") and isinstance(m["registryPath"], str),
+            "REMOTE_REGISTRY_OVERRIDE_FORBIDDEN",
+        )
     return m
 
 
@@ -263,10 +271,17 @@ def provision(root: Path) -> None:
         m = packet["manifest"]
         need(isinstance(m, dict) and m.get("root") == str(root), "REMOTE_MANIFEST_INVALID")
         reg_path = packet.get("registryPath")
+        sandbox = str(root).startswith("/tmp/oc-drvtest-")
         if reg_path is not None:
+            need(sandbox, "REMOTE_REGISTRY_OVERRIDE_FORBIDDEN")
             m = {**m, "registryPath": str(reg_path)}
 
-        driver_mod, meta, actual_driver_digest = load_driver(m["driverId"], registry_path=reg_path)
+        driver_mod, meta, actual_driver_digest = load_driver(
+            m["driverId"],
+            registry_path=reg_path,
+            expected_digest=m.get("driverDigest"),
+            allow_sandbox_override=sandbox,
+        )
         actual_core_digest = compute_core_digest()
         need(
             meta["engineId"] == m.get("engineId")
@@ -325,7 +340,8 @@ def provision(root: Path) -> None:
         }
         if m.get("nativeSessionId"):
             client_cfg["nativeSessionId"] = m["nativeSessionId"]
-            record_exclusive(root / "NATIVE-SESSION.json", {"nativeSessionId": m["nativeSessionId"]}, mode=0o600)
+            if not (root / "NATIVE-SESSION.json").exists():
+                record_exclusive(root / "NATIVE-SESSION.json", {"nativeSessionId": m["nativeSessionId"]}, mode=0o600)
         if reg_path is not None:
             client_cfg["registryPath"] = str(reg_path)
         record_exclusive(root / "client.json", client_cfg, mode=0o400)
@@ -362,7 +378,13 @@ def verify_provisioned_spec(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
         "REMOTE_PROVISION_TAMPERED",
     )
     spec = strict_json(read_private(root / "LAUNCH.json"))
-    _, meta, actual_driver_digest = load_driver(m["driverId"], registry_path=m.get("registryPath"))
+    sandbox = str(root).startswith("/tmp/oc-drvtest-")
+    _, meta, actual_driver_digest = load_driver(
+        m["driverId"],
+        registry_path=m.get("registryPath"),
+        expected_digest=m["driverDigest"],
+        allow_sandbox_override=sandbox,
+    )
     need(
         meta["engineId"] == m["engineId"]
         and actual_driver_digest == m["driverDigest"]
@@ -376,7 +398,8 @@ def verify_provisioned_spec(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def lane_admission(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
-    c = resources.config(m["engineId"], registry_path=m.get("registryPath"))
+    sandbox = str(root).startswith("/tmp/oc-drvtest-")
+    c = resources.config(m["engineId"], registry_path=m.get("registryPath"), allow_sandbox_override=sandbox)
     scopes = {
         scope_name(root, m, "app"): c["app"],
         scope_name(root, m, "socket"): c["socket"],
@@ -388,7 +411,9 @@ def lane_admission(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
         scopes,
         kind="lane",
         master_max_lanes=m.get("maxConcurrentLanes"),
+        master_max_memory_bytes=m.get("maxSliceMemoryBytes"),
         registry_path=m.get("registryPath"),
+        allow_sandbox_override=sandbox,
     )
 
 
@@ -403,7 +428,8 @@ def start_scope_process(
         need(not (root / "STOPPING.json").exists(), "REMOTE_FENCED")
         unit = scope_name(root, m, role)
         record_exclusive(root / f"{role.upper()}-STARTING.json", {"unit": unit, "bootId": boot_id(), **binding_fields(m)})
-        c = resources.config(m["engineId"], registry_path=m.get("registryPath"))
+        sandbox = str(root).startswith("/tmp/oc-drvtest-")
+        c = resources.config(m["engineId"], registry_path=m.get("registryPath"), allow_sandbox_override=sandbox)
         worker_argv = ["/usr/bin/python3", "-I", "-B", str(Path(__file__).resolve()), "_worker", str(root), role]
         fake_dir = resources._fake_systemd_dir()
 
@@ -686,7 +712,13 @@ def launch_role(root: Path, m: Dict[str, Any]) -> None:
             not (root / "STOPPING.json").exists() and not (root / "APP-STARTING.json").exists(),
             "REMOTE_LAUNCH_ALREADY_USED",
         )
-        driver_mod, _, _ = load_driver(m["driverId"], registry_path=m.get("registryPath"))
+        sandbox = str(root).startswith("/tmp/oc-drvtest-")
+        driver_mod, _, _ = load_driver(
+            m["driverId"],
+            registry_path=m.get("registryPath"),
+            expected_digest=m["driverDigest"],
+            allow_sandbox_override=sandbox,
+        )
         spec = verify_provisioned_spec(root, m)
         admitted = lane_admission(root, m)
         proc = start_scope_process(
@@ -705,9 +737,13 @@ def launch_role(root: Path, m: Dict[str, Any]) -> None:
             capDrift=bool(admitted.get("capDrift", False)),
         )
 
-        native_state: Dict[str, Any] = {"expectedModel": m["model"]}
+        native_state: Dict[str, Any] = {"expectedModel": m["model"], "operationId": m["operationId"]}
         if m.get("nativeSessionId"):
             native_state["sessionId"] = m["nativeSessionId"]
+        elif (root / "NATIVE-SESSION.json").exists():
+            hint = strict_json(read_private(root / "NATIVE-SESSION.json", 4096))
+            if isinstance(hint, dict) and isinstance(hint.get("nativeSessionId"), str):
+                native_state["sessionId"] = hint["nativeSessionId"]
         native_seq = 0
 
         sel = selectors.DefaultSelector()
@@ -826,6 +862,96 @@ def launch_role(root: Path, m: Dict[str, Any]) -> None:
             os.close(wfd)
 
 
+def _run_probe_step_cmd(
+    cmd: List[str],
+    *,
+    cwd: Path,
+    env: Dict[str, str],
+    stdin_lines: List[str],
+    timeout_sec: float,
+    interactive_jsonrpc: bool,
+) -> tuple[int, bytes]:
+    if not interactive_jsonrpc:
+        stdin_payload = "".join(line_s + "\n" for line_s in stdin_lines).encode("utf-8")
+        completed = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            input=stdin_payload,
+            capture_output=True,
+            timeout=timeout_sec,
+        )
+        return completed.returncode, completed.stdout
+
+    deadline = time.monotonic() + timeout_sec
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    out_bytes = bytearray()
+    line_buf = b""
+    try:
+        for line_s in stdin_lines:
+            msg = strict_json(line_s)
+            proc.stdin.write((line_s + "\n").encode("utf-8"))
+            if isinstance(msg, dict) and "id" in msg:
+                expected_id = msg["id"]
+                matched = False
+                while time.monotonic() < deadline:
+                    while b"\n" in line_buf:
+                        raw_ln, line_buf = line_buf.split(b"\n", 1)
+                        if not raw_ln.strip():
+                            continue
+                        frame = strict_json(raw_ln)
+                        if isinstance(frame, dict) and frame.get("id") == expected_id:
+                            matched = True
+                            break
+                    if matched:
+                        break
+                    rem = max(0.0, deadline - time.monotonic())
+                    if not sel.select(rem):
+                        break
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    out_bytes.extend(chunk)
+                    line_buf += chunk
+                    need(len(out_bytes) <= 8 * 1024 * 1024, "REMOTE_PROBE_OUTPUT_TOO_LARGE")
+                need(matched, "REMOTE_PROBE_RPC_TIMEOUT_OR_EOF")
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        drain_until = min(deadline, time.monotonic() + 2.0)
+        while proc.poll() is None and time.monotonic() < drain_until:
+            if sel.select(max(0.0, min(0.1, drain_until - time.monotonic()))):
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                out_bytes.extend(chunk)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1.0)
+        return proc.returncode or 0, bytes(out_bytes)
+    finally:
+        sel.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def probe_role(root: Path) -> None:
     line = sys.stdin.buffer.readline(262144 + 1)
     need(0 < len(line) <= 262144 and line.endswith(b"\n"), "REMOTE_PROBE_REQUEST_INVALID")
@@ -838,16 +964,22 @@ def probe_role(root: Path) -> None:
         "REMOTE_PROBE_REQUEST_INVALID",
     )
     reg_path = req.get("registryPath")
-    driver_mod, meta, driver_digest = load_driver(req["driverId"], registry_path=reg_path)
+    sandbox = str(root).startswith("/tmp/oc-drvtest-")
+    driver_mod, meta, driver_digest = load_driver(
+        req["driverId"],
+        registry_path=reg_path,
+        allow_sandbox_override=sandbox,
+    )
     core_digest = compute_core_digest()
 
-    ensure_private_dir(root, create=not root.exists(), mode=0o700)
+    created_root = not root.exists()
+    ensure_private_dir(root, create=created_root, mode=0o700)
     probe_cwd = root / "probe-cwd"
     probe_cwd.mkdir(mode=0o500, exist_ok=True)
     probe_tmp = root / "probe-tmp"
     probe_tmp.mkdir(mode=0o700, exist_ok=True)
 
-    c = resources.config(meta["engineId"], registry_path=reg_path)
+    c = resources.config(meta["engineId"], registry_path=reg_path, allow_sandbox_override=sandbox)
     unit = f"oc-{meta['engineId']}-probe-{sha(str(root).encode())[:24]}.scope"
     claim_key = f"probe:{unit}"
 
@@ -858,6 +990,7 @@ def probe_role(root: Path) -> None:
         {unit: c["probe"]},
         kind="probe",
         registry_path=reg_path,
+        allow_sandbox_override=sandbox,
     )
     try:
         ctx = {
@@ -907,7 +1040,12 @@ def probe_role(root: Path) -> None:
                 "TMPDIR": str(probe_tmp),
                 **(step.get("environment") or {}),
             }
-            stdin_payload = "".join(line_s + "\n" for line_s in (step.get("stdinLines") or [])).encode("utf-8")
+            for env_k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
+                env_val = env.get(env_k)
+                if isinstance(env_val, str) and env_val.startswith(str(probe_tmp)):
+                    Path(env_val).mkdir(mode=0o700, parents=True, exist_ok=True)
+            stdin_lines = [str(line_s) for line_s in (step.get("stdinLines") or [])]
+            interactive_rpc = bool(step.get("interactiveJsonRpc"))
             timeout_sec = float(step.get("timeoutSec", 15))
             if resources._fake_systemd_dir() is None:
                 cmd = [
@@ -931,23 +1069,23 @@ def probe_role(root: Path) -> None:
                     *[f"{k}={v}" for k, v in env.items()],
                     *argv,
                 ]
-                completed = subprocess.run(
+                step_rc, step_stdout = _run_probe_step_cmd(
                     cmd,
                     cwd=probe_cwd,
                     env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": "/run/user/" + str(os.getuid())},
-                    input=stdin_payload,
-                    capture_output=True,
-                    timeout=timeout_sec,
+                    stdin_lines=stdin_lines,
+                    timeout_sec=timeout_sec,
+                    interactive_jsonrpc=interactive_rpc,
                 )
                 resources.stop_unit(unit)
             else:
-                completed = subprocess.run(
+                step_rc, step_stdout = _run_probe_step_cmd(
                     argv,
                     cwd=probe_cwd,
                     env=env,
-                    input=stdin_payload,
-                    capture_output=True,
-                    timeout=timeout_sec,
+                    stdin_lines=stdin_lines,
+                    timeout_sec=timeout_sec,
+                    interactive_jsonrpc=interactive_rpc,
                 )
                 resources.stop_unit(unit)
 
@@ -955,15 +1093,21 @@ def probe_role(root: Path) -> None:
             for key_name, target_p in (step.get("hashFiles") or {}).items():
                 artifact_hashes[key_name] = file_sha256(Path(target_p).resolve())
             prev = {
-                "returncode": completed.returncode,
-                "stdoutLines": completed.stdout.decode("utf-8", errors="replace").splitlines(),
-                "stdoutSha256": sha(completed.stdout),
+                "returncode": step_rc,
+                "stdoutLines": step_stdout.decode("utf-8", errors="replace").splitlines(),
+                "stdoutSha256": sha(step_stdout),
                 "artifactHashes": artifact_hashes,
             }
         raise ValueError("REMOTE_PROBE_STEP_LIMIT_EXCEEDED")
     finally:
         resources.stop_unit(unit)
         resources.release(claim_key)
+        if created_root and root.exists():
+            try:
+                probe_cwd.chmod(0o700)
+            except OSError:
+                pass
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def main() -> int:
@@ -986,7 +1130,12 @@ def main() -> int:
         line = sys.stdin.buffer.readline(4096)
         req = strict_json(line) if line else {}
         engine_id = req.get("engineId") or read_manifest(root)["engineId"]
-        status = resources.preflight(engine_id, registry_path=req.get("registryPath"))
+        sandbox = str(root).startswith("/tmp/oc-drvtest-")
+        status = resources.preflight(
+            engine_id,
+            registry_path=req.get("registryPath"),
+            allow_sandbox_override=sandbox,
+        )
         print(
             json.dumps({"version": PROTOCOL_VERSION, "engineId": engine_id, "kind": "preflight", **status}, separators=(",", ":")),
             flush=True,

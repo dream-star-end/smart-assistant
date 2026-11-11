@@ -77,6 +77,23 @@ def verified_argv(original: Any, config: Dict[str, Any]) -> List[str]:
         require(hashlib.sha256(os.read(fd, 262145)).hexdigest() == entry["sha256"])
     finally:
         os.close(fd)
+
+    if path.parent.name == "core":
+        drivers_dir = path.parent.parent / "drivers"
+        drv_st = drivers_dir.lstat()
+        require(stat.S_ISDIR(drv_st.st_mode) and drv_st.st_uid == 0 and not (drv_st.st_mode & 0o022))
+        for bundle_dir in (path.parent, drivers_dir):
+            for child in bundle_dir.iterdir():
+                cst = child.lstat()
+                if stat.S_ISDIR(cst.st_mode):
+                    require(cst.st_uid == 0 and not (cst.st_mode & 0o022))
+                else:
+                    require(
+                        stat.S_ISREG(cst.st_mode)
+                        and cst.st_uid == 0
+                        and cst.st_nlink == 1
+                        and not (cst.st_mode & 0o022)
+                    )
     return args
 
 

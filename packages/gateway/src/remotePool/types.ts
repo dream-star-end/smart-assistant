@@ -141,6 +141,7 @@ export interface RemotePoolNodeManifest {
   readonly coreDigest: string
   readonly nativeSessionId?: string | null
   readonly maxConcurrentLanes?: number
+  readonly maxSliceMemoryBytes?: number
 }
 
 export interface RemotePoolLaneSpec {

@@ -51,6 +51,33 @@ def _mod_digest(files: Dict[str, bytes]) -> str:
     return h.hexdigest()
 
 
+def _deterministic_session_id(operation_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, f"oc-cc-v4:{operation_id}"))
+
+
+def _check_and_pin_model(state: Dict[str, Any], actual_model: Any) -> None:
+    if not isinstance(actual_model, str) or not actual_model or actual_model == "<synthetic>":
+        return
+    pinned = state.get("resolvedConcreteModel")
+    if isinstance(pinned, str) and pinned:
+        need(actual_model == pinned, "CC_UPSTREAM_MODEL_MISMATCH")
+        return
+    expected = state.get("expectedModel")
+    if isinstance(expected, str) and expected:
+        if expected in ("opus", "sonnet", "haiku"):
+            need(
+                actual_model == expected or actual_model.startswith(f"claude-{expected}-"),
+                "CC_UPSTREAM_MODEL_MISMATCH",
+            )
+        else:
+            need(
+                actual_model == expected or actual_model.startswith(f"{expected}-"),
+                "CC_UPSTREAM_MODEL_MISMATCH",
+            )
+    state["resolvedConcreteModel"] = actual_model
+    state["observedModel"] = actual_model
+
+
 def _mask_email(email: Optional[str]) -> Optional[str]:
     if not email or not isinstance(email, str):
         return None
@@ -110,7 +137,8 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         session_id = existing_session
         session_flag = "--resume" if context.get("transcriptExists", False) else "--session-id"
     else:
-        session_id = str(context.get("initialSessionUuid") or uuid.uuid4())
+        init_uuid = context.get("initialSessionUuid")
+        session_id = str(init_uuid) if init_uuid else _deterministic_session_id(str(context["operationId"]))
         need(UUID_RE.fullmatch(session_id), "CC_SESSION_ID_INVALID")
         session_flag = "--session-id"
 
@@ -129,8 +157,12 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
     files: Dict[str, Dict[str, Any]] = {
         "mcp.json": {"content": json.dumps(mcp_config, separators=(",", ":")), "mode": 0o400},
         "prompt.md": {"content": prompt_text, "mode": 0o400},
+        "NATIVE-SESSION.json": {
+            "content": json.dumps({"nativeSessionId": session_id}, separators=(",", ":")),
+            "mode": 0o600,
+        },
     }
-    dirs = ["run", "tmux"]
+    dirs = ["tmux"]
 
     cli_args = [
         cli_path,
@@ -163,7 +195,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         "LANG": "C.UTF-8",
         "TMPDIR": str(root / "tmp"),
         "TMUX_TMPDIR": str(root / "tmux"),
-        "OC_BOX_READY_MS": "20000",
+        "OC_BOX_READY_MS": "30000",
         "CLAUDE_CODE_DISABLE_REFUSAL_RETRY": "1",
         "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
@@ -244,19 +276,22 @@ def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, A
     immediate: List[Dict[str, Any]] = []
 
     if kind == "initialize":
-        if state.get("initialized") is True and isinstance(state.get("sessionId"), str):
+        state["expectedModel"] = command.get("model") or state.get("expectedModel")
+        if not state.get("sessionId") and isinstance(state.get("operationId"), str):
+            state["sessionId"] = _deterministic_session_id(state["operationId"])
+        if isinstance(state.get("sessionId"), str):
+            state["initialized"] = True
             immediate.append(
                 {
                     "commandId": cmd_id,
                     "commandKind": "initialize",
                     "ok": True,
                     "nativeSessionId": state["sessionId"],
-                    "upstreamModel": state.get("observedModel") or command.get("model"),
+                    "upstreamModel": state.get("observedModel") or state.get("expectedModel"),
                 }
             )
         else:
             state["pendingInitCommandId"] = cmd_id
-            state["expectedModel"] = command.get("model") or state.get("expectedModel")
 
     elif kind == "resume":
         target = command.get("nativeSessionId")
@@ -386,11 +421,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
 
     if ftype == "system" and frame.get("subtype") == "init":
         model = frame.get("model")
-        expected_model = state.get("expectedModel")
-        if expected_model and model and model != "<synthetic>":
-            need(model == expected_model, "CC_UPSTREAM_MODEL_MISMATCH")
-        if isinstance(model, str):
-            state["observedModel"] = model
+        _check_and_pin_model(state, model)
         state["initialized"] = True
         # Source-ban verification (Group 2): if init advertises ANY non-`mcp__ocbridge__*` tool, emit disallowedItem!
         for tname in frame.get("tools") or []:
@@ -432,10 +463,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         ev_type = ev.get("type")
         if ev_type == "message_start":
             msg_model = (ev.get("message") or {}).get("model")
-            if state.get("expectedModel") and msg_model and msg_model != "<synthetic>":
-                need(msg_model == state["expectedModel"], "CC_UPSTREAM_MODEL_MISMATCH")
-            if isinstance(msg_model, str) and msg_model != "<synthetic>":
-                state["observedModel"] = msg_model
+            _check_and_pin_model(state, msg_model)
         elif ev_type == "content_block_delta":
             delta = ev.get("delta") or {}
             dtype = delta.get("type")
@@ -451,8 +479,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         msg = frame.get("message")
         need(isinstance(msg, dict) and isinstance(msg.get("content"), list), "CC_ASSISTANT_MESSAGE_INVALID")
         msg_model = msg.get("model")
-        if state.get("expectedModel") and msg_model and msg_model != "<synthetic>":
-            need(msg_model == state["expectedModel"], "CC_UPSTREAM_MODEL_MISMATCH")
+        _check_and_pin_model(state, msg_model)
         if frame.get("parent_tool_use_id") is not None:
             security_events.append(
                 {

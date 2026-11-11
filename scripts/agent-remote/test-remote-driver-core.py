@@ -1251,6 +1251,125 @@ class RemoteDriverCoreTests(unittest.TestCase):
             self.assertEqual(cx_rep["mcpCorrelation"]["status"], "PASS")
             self.assertEqual(cx_rep["probe"]["status"], "PASS")
 
+    def test_10_audit_hardening_registry_digest_version_and_slice_cap(self) -> None:
+        from core.contract import load_registry
+
+        # 1. W1: registryPath override rejected when allow_sandbox_override=False OR outside /tmp/oc-drvtest-
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="oc-drvtest-reg-") as sbox:
+            sdir = Path(sbox)
+            reg_copy = sdir / "registry.json"
+            reg_copy.write_bytes((SCRIPT_DIR / "drivers" / "registry.json").read_bytes())
+            os.chmod(reg_copy, 0o600)
+
+            with self.assertRaisesRegex(ValueError, "REMOTE_REGISTRY_OVERRIDE_FORBIDDEN"):
+                load_registry(reg_copy, allow_sandbox_override=False)
+            loaded_ok = load_registry(reg_copy, allow_sandbox_override=True)
+            self.assertIn("cc", loaded_ok)
+
+            # S3: expected_digest verified BEFORE exec(compile(...))!
+            bundle_dir = sdir / "bundle"
+            (bundle_dir / "drivers").mkdir(parents=True, mode=0o700)
+            marker_file = sdir / "must-not-exist"
+            poisoned_py = bundle_dir / "drivers" / "poison.py"
+            poisoned_py.write_text(
+                f"from pathlib import Path\nPath({str(marker_file)!r}).write_text('pwn')\n",
+                encoding="utf-8",
+            )
+            os.chmod(poisoned_py, 0o600)
+            bad_reg = bundle_dir / "drivers" / "registry.json"
+            reg_obj = json.loads((SCRIPT_DIR / "drivers" / "registry.json").read_text(encoding="utf-8"))
+            reg_obj["drivers"]["poison"] = {
+                **reg_obj["drivers"]["cc"],
+                "driverId": "poison",
+                "engineId": "poison",
+                "module": "drivers/poison.py",
+            }
+            bad_reg.write_text(json.dumps(reg_obj), encoding="utf-8")
+            os.chmod(bad_reg, 0o600)
+
+            with self.assertRaisesRegex(ValueError, "REMOTE_DRIVER_OR_CORE_DIGEST_MISMATCH"):
+                load_driver(
+                    "poison",
+                    registry_path=bad_reg,
+                    base_dir=bundle_dir,
+                    expected_digest="0" * 64,
+                    allow_sandbox_override=True,
+                )
+            self.assertFalse(marker_file.exists(), "Poisoned driver module executed before digest check!")
+
+            # W3: codex.probe rejects missing CLI version in userAgent without falling back to '0.167.0'
+            codex_mod, _, _ = load_driver("codex")
+            codex_home = sdir / "cx-home"
+            codex_home.mkdir(mode=0o700)
+            (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+            stub_cli = sdir / "stub-codex"
+            stub_cli.write_bytes(b"stub")
+            bad_stdout = [
+                json.dumps({"id": 1, "result": {"userAgent": "codex-no-slash"}}),
+                json.dumps({"id": 2, "result": {"account": {"email": "ab@example.com", "planType": "plus"}}}),
+                json.dumps(
+                    {
+                        "id": 3,
+                        "result": {
+                            "data": [
+                                {
+                                    "id": "gpt-5.4",
+                                    "displayName": "GPT 5.4",
+                                    "supportedReasoningEfforts": [{"reasoningEffort": "medium"}],
+                                    "defaultReasoningEffort": "medium",
+                                    "inputModalities": ["text"],
+                                }
+                            ],
+                            "nextCursor": None,
+                        },
+                    }
+                ),
+            ]
+            with self.assertRaisesRegex(ValueError, "CODEX_PROBE_VERSION_MISSING"):
+                codex_mod.probe(
+                    {
+                        "cliPath": str(stub_cli),
+                        "nativePath": str(stub_cli),
+                        "codexHome": str(codex_home),
+                        "systemCodexRoot": str(sdir / "no-etc"),
+                        "probeCwd": str(sdir),
+                    },
+                    {
+                        "returncode": 0,
+                        "stdoutLines": bad_stdout,
+                        "stdoutSha256": "a" * 64,
+                        "artifactHashes": {"cli": "b" * 64, "native": "c" * 64},
+                    },
+                )
+
+            # Tighten-only master_max_memory_bytes rejects 2nd lane while preserving 1st lane
+            res_root = sdir / "res-tight"
+            fake_sys = sdir / "fake-sys-tight"
+            old_env = dict(os.environ)
+            try:
+                os.environ["OC_REMOTE_RESOURCE_ROOT"] = str(res_root)
+                os.environ["OC_REMOTE_TEST_FAKE_SYSTEMD_DIR"] = str(fake_sys)
+                os.environ["OC_REMOTE_NODE_MEMORY_BUDGET"] = str(8192 * 1024 * 1024)
+                os.environ["OC_REMOTE_TEST_MEM_AVAILABLE_BYTES"] = str(8192 * 1024 * 1024)
+                c = resources.config("codex")
+                lane1_scopes = {"oc-codex-l1-app.scope": c["app"], "oc-codex-l1-sock.scope": c["socket"]}
+                resources.admit("lane-1", "codex", "default", lane1_scopes)
+                tight_cap = c["app"] + c["socket"] + c["headroom"]
+                lane2_scopes = {"oc-codex-l2-app.scope": c["app"], "oc-codex-l2-sock.scope": c["socket"]}
+                with self.assertRaises(resources.MemoryExhausted) as ctx_mem:
+                    resources.admit(
+                        "lane-2",
+                        "codex",
+                        "default",
+                        lane2_scopes,
+                        master_max_memory_bytes=tight_cap,
+                    )
+                self.assertEqual(str(ctx_mem.exception), "REMOTE_NODE_MEMORY_EXHAUSTED")
+                self.assertEqual(len(resources.records()), 1)
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

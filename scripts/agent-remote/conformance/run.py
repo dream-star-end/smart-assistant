@@ -5,6 +5,8 @@ Usage:
   python3 scripts/agent-remote/conformance/run.py \
     --driver cc \
     --evidence /path/to/evidence-dir \
+    [--mode sandbox|live-node] \
+    [--node-config /path/to/node-config.json] \
     [--profile <profile-name>] \
     [--groups 1,2,3,4,5,6,7] \
     [--registry /path/to/registry.json]
@@ -16,7 +18,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 from urllib.parse import urlparse
@@ -24,7 +25,6 @@ from urllib.parse import urlparse
 CONFORMANCE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CONFORMANCE_DIR.parents[2]
 RUNNER_TS = CONFORMANCE_DIR / "runner.ts"
-TEST_MUTEX = REPO_ROOT / "scripts" / "test-mutex.sh"
 TSX_BIN = REPO_ROOT / "node_modules" / ".bin" / "tsx"
 
 
@@ -41,10 +41,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run OCV5-749 unified remote-driver-v4 conformance suite.")
     parser.add_argument("--driver", required=True, help="Registered driverId (e.g. cc, codex, example_echo)")
     parser.add_argument("--evidence", required=True, help="Output directory for JSON conformance evidence")
+    parser.add_argument(
+        "--mode",
+        choices=("sandbox", "live-node"),
+        default="sandbox",
+        help="Execution mode: hermetic sandbox or live remote node over real SSH guard",
+    )
+    parser.add_argument("--node-config", default="", help="JSON config path required when --mode live-node")
     parser.add_argument("--profile", default="", help="Optional profile name label")
     parser.add_argument("--groups", default="1,2,3,4,5,6,7", help="Comma-separated group numbers (default: 1..7)")
     parser.add_argument("--registry", default="", help="Optional path to drivers/registry.json")
     args = parser.parse_args()
+
+    if args.mode == "live-node" and not args.node_config:
+        sys.stderr.write("--node-config <json> is required when --mode live-node\n")
+        return 2
 
     evidence_dir = Path(args.evidence).resolve()
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -66,9 +77,13 @@ def main() -> int:
         args.driver,
         "--evidence",
         str(evidence_dir),
+        "--mode",
+        args.mode,
         "--groups",
         args.groups,
     ]
+    if args.node_config:
+        cmd_parts.extend(["--node-config", str(Path(args.node_config).resolve())])
     if args.profile:
         cmd_parts.extend(["--profile", args.profile])
     if args.registry:
@@ -98,8 +113,9 @@ def main() -> int:
         or not summary.get("allGreenPassed")
         or not summary.get("allRedControlsCaught")
         or summary.get("skippedCount") != 0
+        or summary.get("unverifiedCount", 0) != 0
     ):
-        sys.stderr.write("Conformance summary failed strict green+red / zero-skip invariants\n")
+        sys.stderr.write("Conformance summary failed strict green+red / zero-skip / zero-unverified invariants\n")
         return 4
 
     print(
@@ -107,9 +123,13 @@ def main() -> int:
             {
                 "ok": True,
                 "driverId": summary["driverId"],
+                "mode": summary["mode"],
+                "targetHost": summary["targetHost"],
+                "sshMode": summary["sshMode"],
                 "groupsExecuted": summary["groupsExecuted"],
                 "requirementsExecuted": summary["requirementsExecuted"],
                 "skippedCount": summary["skippedCount"],
+                "unverifiedCount": summary.get("unverifiedCount", 0),
                 "suiteDigest": summary["suiteDigest"],
                 "coreDigest": summary["coreDigest"],
                 "driverDigest": summary["driverDigest"],
