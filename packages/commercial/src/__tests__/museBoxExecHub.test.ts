@@ -61,6 +61,8 @@ function makeHub(
     rate: { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
     cliTimeoutSec: { image: 120, video: 300 },
     now: extra.now ?? Date.now,
+    // Retried read-only relay calls back off for real in production; instant here.
+    boxExecRetrySleep: async () => {},
     ...extra,
   })
 }
@@ -497,5 +499,63 @@ describe('OCV5-750 Gemini r1: box → hatch fallback only before the relay could
     const view = await hub.view('3', id, 100)
     assert.equal(view?.error?.code, 'MUSE_TIMEOUT')
     assert.equal(aborted, true)
+  })
+})
+
+describe('OCV5-750 transient Box Exec read failure (personal e2e 2026-11-11)', () => {
+  it('a transient 417 on status and fetch-chunk still delivers the MP4 without a second submit', async () => {
+    const payload = Buffer.alloc(300_000, 5)
+    payload.write('ftyp', 4)
+    const digest = createHash('sha256').update(payload).digest('hex')
+    let submits = 0
+    const failOnce = new Set(['status', 'fetch-chunk'])
+    const slept: number[] = []
+    const hub = makeHub(tmpRoot(), {
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRetrySleep: async (ms) => {
+        slept.push(ms)
+      },
+      boxExecRunner: async () => async (request: BoxCcExecRequest) => {
+        const verb = request.args[2]!
+        if (failOnce.delete(verb)) throw new Error('BOX_EXEC_HTTP_417')
+        if (verb === 'submit') {
+          submits += 1
+          return { stdout: JSON.stringify({ ok: true, id: 'relay-417', status: 'queued' }) }
+        }
+        if (verb === 'status') {
+          return {
+            stdout: JSON.stringify({
+              ok: true,
+              id: 'relay-417',
+              status: 'done',
+              files: [{ index: 0 }],
+            }),
+          }
+        }
+        if (verb === 'fetch-chunk') {
+          const offset = Number(request.args[5])
+          const slice = payload.subarray(offset, offset + Number(request.args[6]))
+          return {
+            stdout: JSON.stringify({
+              ok: true,
+              offset,
+              total: payload.length,
+              sha256: digest,
+              data: slice.toString('base64'),
+            }),
+          }
+        }
+        throw new Error(`unexpected ${verb}`)
+      },
+    })
+    hub.hello('1', '0.5.0')
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(view?.files?.[0]?.sha256, digest)
+    assert.equal(submits, 1)
+    assert.deepEqual(slept, [1_000, 1_000])
   })
 })

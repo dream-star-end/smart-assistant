@@ -25,6 +25,71 @@ export const BOX_EXEC_PYTHON = '/usr/bin/python3'
 export const BOX_EXEC_NATIVE_DEADLINE_MS = 6 * 60_000
 export const BOX_EXEC_COMPOSITE_DEADLINE_MS = 12 * 60_000
 export const BOX_EXEC_POLL_MS = 5_000
+/** Backoff for idempotent read-only relay calls (status, fetch-chunk) after a transient Box Exec failure. */
+export const BOX_EXEC_READ_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000]
+
+/** Total read retries one job may spend (status + every fetch-chunk), so a flapping Box cannot stall it for long. */
+export const BOX_EXEC_READ_RETRY_BUDGET = 8
+
+type RetrySleep = (ms: number, signal?: AbortSignal) => Promise<void>
+const defaultRetrySleep: RetrySleep = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve()
+    const timer = setTimeout(done, ms)
+    function done() {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    signal?.addEventListener('abort', done, { once: true })
+  })
+
+const NON_TRANSIENT_BOX_EXEC_CODES = new Set([
+  'BOX_EXEC_REQUEST_INVALID',
+  'BOX_EXEC_REQUEST_TOO_LARGE',
+  'BOX_EXEC_TARGET_INVALID',
+  'BOX_EXEC_RESPONSE_TOO_LARGE',
+  // The job is pinned to one Box after its first call; a guard/egress change will not heal by retrying.
+  'BOX_EXEC_ACCOUNT_GUARD_FAILED',
+  'BOX_EGRESS_CHANGED',
+  'BOX_EXEC_ABORTED',
+  'BOX_EXEC_CANCELLED',
+])
+/** HTTP 4xx from the Exec service is permanent except these (timeout, the observed 417, too-early, rate limit). */
+const TRANSIENT_BOX_EXEC_HTTP_4XX = new Set(['408', '417', '425', '429'])
+
+/**
+ * A Box Exec transport failure (HTTP status from the Exec service, broken stream, remote exit)
+ * on a read-only call. CLI-level relay errors arrive as MuseError and are not retried here.
+ * A real 10 s MP4 is ~270 fetch-chunk calls; one transient BOX_EXEC_HTTP_417 must not throw
+ * away a finished video (OCV5-750 personal e2e, 2026-11-11).
+ */
+export function isTransientBoxExecReadError(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false
+  if (err instanceof MuseError) return false
+  const code =
+    typeof err === 'object' && err && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '')
+      : ''
+  const message = err instanceof Error ? err.message : String(err ?? '')
+  const codes = [
+    ...`${code} ${message}`.matchAll(/\b(BOX_EXEC_[A-Z0-9_]+|BOX_EGRESS_[A-Z0-9_]+)\b/g),
+  ].map((m) => m[1]!)
+  if (codes.length === 0) return false
+  return codes.every((c) => {
+    if (NON_TRANSIENT_BOX_EXEC_CODES.has(c)) return false
+    const http = /^BOX_EXEC_HTTP_(4\d\d)$/.exec(c)
+    return !http || TRANSIENT_BOX_EXEC_HTTP_4XX.has(http[1]!)
+  })
+}
+
+export interface ReadRetryBudget {
+  left: number
+}
+
+export function newReadRetryBudget(): ReadRetryBudget {
+  return { left: BOX_EXEC_READ_RETRY_BUDGET }
+}
 
 export function parseMuseVideoBackend(raw: string | undefined): MuseVideoBackend {
   const value = (raw ?? '').trim()
@@ -184,6 +249,30 @@ async function runCli(
   return payload
 }
 
+/** runCli for idempotent read-only verbs, retried with backoff on transient transport errors. */
+async function runCliRead(
+  exec: BoxCliExecFn,
+  args: string[],
+  opts: { timeoutMs: number; maxResponseBytes?: number; signal?: AbortSignal },
+  sleep: RetrySleep = defaultRetrySleep,
+  budget: ReadRetryBudget = newReadRetryBudget(),
+  retryUntil?: { deadline: number; now: () => number },
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await runCli(exec, args, opts)
+    } catch (err) {
+      const delay = BOX_EXEC_READ_RETRY_DELAYS_MS[attempt]
+      if (delay === undefined || budget.left <= 0 || !isTransientBoxExecReadError(err, opts.signal))
+        throw err
+      if (retryUntil && retryUntil.now() + delay > retryUntil.deadline) throw err
+      budget.left -= 1
+      await sleep(delay, opts.signal)
+      if (opts.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
+    }
+  }
+}
+
 export function applyChunk(
   chunks: Buffer[],
   expected: { sha256?: string; total?: number },
@@ -209,15 +298,19 @@ export async function downloadRelayFile(
   jobId: string,
   index: number,
   signal?: AbortSignal,
+  retrySleep?: RetrySleep,
+  budget: ReadRetryBudget = newReadRetryBudget(),
 ): Promise<{ bytes: Buffer; sha256: string }> {
   const parts: Buffer[] = []
   let expected: { sha256?: string; total?: number } = {}
   for (;;) {
     const have = parts.reduce((n, part) => n + part.length, 0)
-    const payload = await runCli(
+    const payload = await runCliRead(
       exec,
       ['fetch-chunk', jobId, String(index), String(have), String(BOX_EXEC_CHUNK_BYTES)],
       { timeoutMs: 30_000, maxResponseBytes: 131_072, signal },
+      retrySleep,
+      budget,
     )
     const data = Buffer.from(String(payload.data ?? ''), 'base64')
     const frame = {
@@ -292,6 +385,8 @@ export async function runBoxExecVideoJob(input: {
   destDir: string
   now?: () => number
   pollMs?: number
+  /** Test hook for the read-retry backoff. */
+  retrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   signal?: AbortSignal
   onSubmitted?: (relayJobId: string) => void
   /** Called right before the submit call leaves: from here on the relay may hold the job. */
@@ -321,6 +416,7 @@ export async function runBoxExecVideoJob(input: {
   input.onSubmitted?.(jobId)
   try {
     const deadline = (input.now ?? Date.now)() + boxExecDeadlineMs(input.spec)
+    const budget = newReadRetryBudget()
     const pollMs = input.pollMs ?? BOX_EXEC_POLL_MS
     let status = String(submitted.status ?? 'queued')
     let last: Record<string, unknown> = submitted
@@ -335,10 +431,14 @@ export async function runBoxExecVideoJob(input: {
       }
       if (input.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
       await new Promise((resolve) => setTimeout(resolve, pollMs))
-      last = await runCli(input.exec, ['status', jobId], {
-        timeoutMs: 20_000,
-        signal: input.signal,
-      })
+      last = await runCliRead(
+        input.exec,
+        ['status', jobId],
+        { timeoutMs: 20_000, signal: input.signal },
+        input.retrySleep,
+        budget,
+        { deadline, now: input.now ?? Date.now },
+      )
       status = String(last.status ?? '')
     }
     if (status !== 'done') {
@@ -349,7 +449,14 @@ export async function runBoxExecVideoJob(input: {
     const indexes = listed.length > 0 ? listed.map((_, i) => i) : [0]
     const files = []
     for (const idx of indexes) {
-      const downloaded = await downloadRelayFile(input.exec, jobId, idx, input.signal)
+      const downloaded = await downloadRelayFile(
+        input.exec,
+        jobId,
+        idx,
+        input.signal,
+        input.retrySleep,
+        budget,
+      )
       const filename = `${idx}.mp4`
       const path = join(input.destDir, `${idx}.bin`)
       await writeFile(path, downloaded.bytes)

@@ -9,10 +9,14 @@ import type { BoxCcExecRequest } from '@openclaude/gateway'
 
 import {
   BOX_EXEC_CHUNK_BYTES,
+  BOX_EXEC_READ_RETRY_BUDGET,
+  BOX_EXEC_READ_RETRY_DELAYS_MS,
   applyChunk,
   canRouteToBoxExec,
   createMuseBoxExecRunner,
+  downloadRelayFile,
   isStaleBoxExecTransport,
+  isTransientBoxExecReadError,
   mapRelayMode,
   museExecRequest,
   museRelayStagingPath,
@@ -20,6 +24,7 @@ import {
   runBoxExecVideoJob,
 } from './boxExecVideo.js'
 import type { MuseJobSpec } from './protocol.js'
+import { MuseError } from './protocol.js'
 
 function spec(partial: Partial<MuseJobSpec> = {}): MuseJobSpec {
   return { kind: 'video', prompt: 'a red bicycle', ...partial }
@@ -340,5 +345,254 @@ describe('OCV5-750 relay Box pinning', () => {
       }),
       /OC_MUSE_BOX_EXEC_ACCOUNT_ID is not set/,
     )
+  })
+})
+
+class FakeTransportError extends Error {
+  constructor(readonly code: string) {
+    super(code)
+  }
+}
+
+function relayFake(payload: Buffer, failures: Map<string, string[]>) {
+  const digest = createHash('sha256').update(payload).digest('hex')
+  const calls: string[][] = []
+  const exec = async (request: BoxCcExecRequest) => {
+    const verb = request.args[2]!
+    const rest = request.args.slice(3)
+    calls.push([verb, ...rest])
+    const key = verb === 'fetch-chunk' ? `fetch-chunk@${rest[2]}` : verb
+    const queue = failures.get(key)
+    if (queue && queue.length > 0) throw new FakeTransportError(queue.shift()!)
+    if (verb === 'submit')
+      return { stdout: JSON.stringify({ ok: true, id: 'rj', status: 'queued' }) }
+    if (verb === 'status') {
+      return {
+        stdout: JSON.stringify({ ok: true, id: 'rj', status: 'done', files: [{ index: 0 }] }),
+      }
+    }
+    if (verb === 'cancel') return { stdout: JSON.stringify({ ok: true }) }
+    const offset = Number(rest[2])
+    const slice = payload.subarray(offset, offset + Number(rest[3]))
+    return {
+      stdout: JSON.stringify({
+        ok: true,
+        offset,
+        total: payload.length,
+        sha256: digest,
+        data: slice.toString('base64'),
+      }),
+    }
+  }
+  return { exec, calls, digest }
+}
+
+describe('OCV5-750 transient Box Exec failures on read-only relay calls', () => {
+  it('classifies transport failures, not relay/CLI errors or aborts', () => {
+    assert.equal(isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_HTTP_417')), true)
+    assert.equal(isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_HTTP_503')), true)
+    assert.equal(
+      isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_STREAM_UNKNOWN')),
+      true,
+    )
+    assert.equal(
+      isTransientBoxExecReadError(new Error('MUSE_UPSTREAM_ERROR BOX_EXEC_INCOMPLETE')),
+      true,
+    )
+    assert.equal(
+      isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_REQUEST_INVALID')),
+      false,
+    )
+    assert.equal(
+      isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_RESPONSE_TOO_LARGE')),
+      false,
+    )
+    assert.equal(isTransientBoxExecReadError(new MuseError(502, 'MUSE_BAD_OUTPUT', 'x')), false)
+    assert.equal(isTransientBoxExecReadError(new Error('ECONNRESET')), false)
+    const ac = new AbortController()
+    ac.abort()
+    assert.equal(
+      isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_HTTP_417'), ac.signal),
+      false,
+    )
+  })
+
+  it('a transient 417 mid-download is retried and the MP4 still reassembles', async () => {
+    const payload = Buffer.alloc(BOX_EXEC_CHUNK_BYTES * 3 + 5, 3)
+    const failures = new Map([
+      [`fetch-chunk@${BOX_EXEC_CHUNK_BYTES * 2}`, ['BOX_EXEC_HTTP_417', 'BOX_EXEC_HTTP_417']],
+    ])
+    const { exec, calls, digest } = relayFake(payload, failures)
+    const slept: number[] = []
+    const out = await downloadRelayFile(exec, 'rj', 0, undefined, async (ms) => {
+      slept.push(ms)
+    })
+    assert.equal(out.sha256, digest)
+    assert.equal(out.bytes.equals(payload), true)
+    assert.deepEqual(slept, [1_000, 2_000])
+    assert.equal(calls.filter((c) => c[0] === 'fetch-chunk').length, 4 + 2)
+  })
+
+  it('gives up after the bounded retries and surfaces the transport error', async () => {
+    const payload = Buffer.alloc(10, 1)
+    const n = BOX_EXEC_READ_RETRY_DELAYS_MS.length + 1
+    const failures = new Map([['fetch-chunk@0', Array(n).fill('BOX_EXEC_HTTP_417')]])
+    const { exec, calls } = relayFake(payload, failures)
+    const slept: number[] = []
+    await assert.rejects(
+      downloadRelayFile(exec, 'rj', 0, undefined, async (ms) => {
+        slept.push(ms)
+      }),
+      /BOX_EXEC_HTTP_417/,
+    )
+    assert.deepEqual(slept, [...BOX_EXEC_READ_RETRY_DELAYS_MS])
+    assert.equal(calls.length, n)
+  })
+
+  it('does not retry a non-transient transport error', async () => {
+    const failures = new Map([['fetch-chunk@0', ['BOX_EXEC_REQUEST_INVALID']]])
+    const { exec, calls } = relayFake(Buffer.alloc(10, 1), failures)
+    await assert.rejects(
+      downloadRelayFile(exec, 'rj', 0, undefined, async () => {}),
+      /REQUEST_INVALID/,
+    )
+    assert.equal(calls.length, 1)
+  })
+
+  it('stops retrying once the job is cancelled during the backoff', async () => {
+    const failures = new Map([['fetch-chunk@0', ['BOX_EXEC_HTTP_417', 'BOX_EXEC_HTTP_417']]])
+    const { exec, calls } = relayFake(Buffer.alloc(10, 1), failures)
+    const ac = new AbortController()
+    await assert.rejects(
+      downloadRelayFile(exec, 'rj', 0, ac.signal, async () => {
+        ac.abort()
+      }),
+      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_CANCELLED',
+    )
+    assert.equal(calls.length, 1)
+  })
+
+  it('retries a transient status poll but never re-sends submit', async () => {
+    const payload = Buffer.alloc(BOX_EXEC_CHUNK_BYTES + 1, 9)
+    const failures = new Map([
+      ['status', ['BOX_EXEC_HTTP_417']],
+      [`fetch-chunk@${BOX_EXEC_CHUNK_BYTES}`, ['BOX_EXEC_HTTP_502']],
+    ])
+    const { exec, calls, digest } = relayFake(payload, failures)
+    const dest = await mkdtemp(join(tmpdir(), 'muse-box-exec-retry-'))
+    const result = await runBoxExecVideoJob({
+      exec,
+      spec: spec(),
+      destDir: dest,
+      pollMs: 1,
+      retrySleep: async () => {},
+    })
+    assert.equal(result.files[0]!.sha256, digest)
+    assert.equal(calls.filter((c) => c[0] === 'submit').length, 1)
+    assert.equal(calls.filter((c) => c[0] === 'status').length, 2)
+    assert.equal(calls.filter((c) => c[0] === 'cancel').length, 0)
+  })
+
+  it('a transient submit failure is not retried (the relay may already hold the job)', async () => {
+    const failures = new Map([['submit', ['BOX_EXEC_HTTP_417']]])
+    const { exec, calls } = relayFake(Buffer.alloc(10, 1), failures)
+    const dest = await mkdtemp(join(tmpdir(), 'muse-box-exec-retry-'))
+    await assert.rejects(
+      runBoxExecVideoJob({
+        exec,
+        spec: spec(),
+        destDir: dest,
+        pollMs: 1,
+        retrySleep: async () => {},
+      }),
+      /BOX_EXEC_HTTP_417/,
+    )
+    assert.equal(calls.filter((c) => c[0] === 'submit').length, 1)
+  })
+})
+
+describe('OCV5-750 Gemini r4: read-retry classification, budget, abort', () => {
+  it('permanent 4xx and pinned-Box guard failures are not transient; 408/417/425/429 are', () => {
+    for (const c of [
+      'BOX_EXEC_HTTP_400',
+      'BOX_EXEC_HTTP_401',
+      'BOX_EXEC_HTTP_403',
+      'BOX_EXEC_HTTP_404',
+    ]) {
+      assert.equal(isTransientBoxExecReadError(new FakeTransportError(c)), false, c)
+    }
+    for (const c of [
+      'BOX_EXEC_HTTP_408',
+      'BOX_EXEC_HTTP_417',
+      'BOX_EXEC_HTTP_425',
+      'BOX_EXEC_HTTP_429',
+    ]) {
+      assert.equal(isTransientBoxExecReadError(new FakeTransportError(c)), true, c)
+    }
+    assert.equal(
+      isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_ACCOUNT_GUARD_FAILED')),
+      false,
+    )
+    assert.equal(isTransientBoxExecReadError(new FakeTransportError('BOX_EGRESS_CHANGED')), false)
+    // any non-transient token anywhere wins
+    assert.equal(
+      isTransientBoxExecReadError(
+        new Error('BOX_EXEC_HTTP_502 then BOX_EXEC_ACCOUNT_GUARD_FAILED'),
+      ),
+      false,
+    )
+  })
+
+  it('a per-job retry budget bounds retries across all chunks', async () => {
+    const payload = Buffer.alloc(BOX_EXEC_CHUNK_BYTES * 6, 2)
+    const failures = new Map<string, string[]>()
+    for (let i = 0; i < 6; i++)
+      failures.set(`fetch-chunk@${BOX_EXEC_CHUNK_BYTES * i}`, [
+        'BOX_EXEC_HTTP_417',
+        'BOX_EXEC_HTTP_417',
+      ])
+    const { exec } = relayFake(payload, failures)
+    const slept: number[] = []
+    await assert.rejects(
+      downloadRelayFile(exec, 'rj', 0, undefined, async (ms) => {
+        slept.push(ms)
+      }),
+      /BOX_EXEC_HTTP_417/,
+    )
+    assert.equal(slept.length, BOX_EXEC_READ_RETRY_BUDGET)
+  })
+
+  it('the default backoff wakes immediately on abort', async () => {
+    const failures = new Map([['fetch-chunk@0', ['BOX_EXEC_HTTP_417', 'BOX_EXEC_HTTP_417']]])
+    const { exec } = relayFake(Buffer.alloc(10, 1), failures)
+    const ac = new AbortController()
+    const t0 = Date.now()
+    setTimeout(() => ac.abort(), 50)
+    await assert.rejects(
+      downloadRelayFile(exec, 'rj', 0, ac.signal),
+      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_CANCELLED',
+    )
+    assert.ok(Date.now() - t0 < 900, `took ${Date.now() - t0}ms`)
+  })
+
+  it('status retries stop at the job deadline', async () => {
+    let t = 0
+    const failures = new Map([['status', Array(4).fill('BOX_EXEC_HTTP_417')]])
+    const { exec, calls } = relayFake(Buffer.alloc(10, 1), failures)
+    const dest = await mkdtemp(join(tmpdir(), 'muse-box-exec-retry-'))
+    await assert.rejects(
+      runBoxExecVideoJob({
+        exec,
+        spec: spec(),
+        destDir: dest,
+        pollMs: 1,
+        now: () => t,
+        retrySleep: async (ms) => {
+          t += ms + 6 * 60_000 // jump past the native deadline
+        },
+      }),
+      /BOX_EXEC_HTTP_417|MUSE_TIMEOUT/,
+    )
+    assert.ok(calls.filter((c) => c[0] === 'status').length <= 2)
   })
 })
