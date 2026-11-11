@@ -243,7 +243,7 @@ export interface MuseBridgeHubOptions {
   boxExecRunner?: () => Promise<BoxCliExecFn>
   boxExecPollMs?: number
   /** Backoff sleep for retried read-only relay calls (tests pass an instant one). */
-  boxExecRetrySleep?: (ms: number) => Promise<void>
+  boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 interface Session {
@@ -320,7 +320,7 @@ export class MuseBridgeHub {
   private readonly configuredBackend: MuseVideoBackend
   private readonly boxExecRunner?: () => Promise<BoxCliExecFn>
   private readonly boxExecPollMs: number
-  private readonly boxExecRetrySleep?: (ms: number) => Promise<void>
+  private readonly boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   private reservedBox = 0
   /** Box-exec jobs waiting for a relay slot, and the ones running on it. */
   private readonly boxExecPending: HubJob[] = []
