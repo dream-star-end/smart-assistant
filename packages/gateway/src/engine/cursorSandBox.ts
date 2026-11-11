@@ -110,7 +110,7 @@ export class CursorSandBoxResolver {
         method: 'POST', body: '{}', redirect: 'error', signal: controller.signal,
         headers: {
           authorization: `Bearer ${token}`, 'content-type': 'application/json', 'connect-protocol-version': '1',
-          'x-cursor-client-type': 'sand', 'x-cursor-client-source': 'sand-desktop', 'x-cursor-client-version': '0.44.0',
+          'x-cursor-client-type': 'sand', 'x-cursor-client-source': 'sand-desktop', 'x-cursor-client-version': '0.75.0',
           'x-sand-box-namespace': 'prod', 'x-ghost-mode': 'true',
           'x-cursor-checksum': cursorSessionChecksum(machine, (this.options.now ?? Date.now)()),
         },
