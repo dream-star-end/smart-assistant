@@ -9,9 +9,12 @@ import type { BoxCcExecRequest } from '@openclaude/gateway'
 
 import {
   BOX_EXEC_CHUNK_BYTES,
+  BOX_EXEC_COMPOSITE_DEADLINE_MS,
+  BOX_EXEC_NATIVE_DEADLINE_MS,
   BOX_EXEC_READ_RETRY_BUDGET,
   BOX_EXEC_READ_RETRY_DELAYS_MS,
   applyChunk,
+  boxExecDeadlineMs,
   canRouteToBoxExec,
   createMuseBoxExecRunner,
   downloadRelayFile,
@@ -57,6 +60,14 @@ describe('OCV5-750 muse video backend flag and routing', () => {
     assert.equal(req.args[1], '/workspace/muse-relay/bin/muse-exec-cli')
     assert.equal(req.args[2], 'health')
     assert.equal(req.cwd, '/tmp')
+  })
+})
+
+describe('OCV5-750 box-exec job deadlines', () => {
+  it('gives native relay jobs 8 minutes (room for one thread reload and one stall nudge)', () => {
+    assert.equal(BOX_EXEC_NATIVE_DEADLINE_MS, 8 * 60_000)
+    assert.equal(boxExecDeadlineMs({ kind: 'video', prompt: 'p' } as MuseJobSpec), 8 * 60_000)
+    assert.equal(BOX_EXEC_COMPOSITE_DEADLINE_MS, 12 * 60_000)
   })
 })
 
@@ -588,7 +599,7 @@ describe('OCV5-750 Gemini r4: read-retry classification, budget, abort', () => {
         pollMs: 1,
         now: () => t,
         retrySleep: async (ms) => {
-          t += ms + 6 * 60_000 // jump past the native deadline
+          t += ms + BOX_EXEC_NATIVE_DEADLINE_MS // jump past the native deadline
         },
       }),
       /BOX_EXEC_HTTP_417|MUSE_TIMEOUT/,
