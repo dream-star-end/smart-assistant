@@ -25,6 +25,37 @@ export const BOX_EXEC_PYTHON = '/usr/bin/python3'
 export const BOX_EXEC_NATIVE_DEADLINE_MS = 6 * 60_000
 export const BOX_EXEC_COMPOSITE_DEADLINE_MS = 12 * 60_000
 export const BOX_EXEC_POLL_MS = 5_000
+/** Backoff for idempotent read-only relay calls (status, fetch-chunk) after a transient Box Exec failure. */
+export const BOX_EXEC_READ_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000]
+
+type RetrySleep = (ms: number) => Promise<void>
+const defaultRetrySleep: RetrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const NON_TRANSIENT_BOX_EXEC_CODES = new Set([
+  'BOX_EXEC_REQUEST_INVALID',
+  'BOX_EXEC_REQUEST_TOO_LARGE',
+  'BOX_EXEC_TARGET_INVALID',
+  'BOX_EXEC_RESPONSE_TOO_LARGE',
+])
+
+/**
+ * A Box Exec transport failure (HTTP status from the Exec service, broken stream, remote exit)
+ * on a read-only call. CLI-level relay errors arrive as MuseError and are not retried here.
+ * A real 10 s MP4 is ~270 fetch-chunk calls; one transient BOX_EXEC_HTTP_417 must not throw
+ * away a finished video (OCV5-750 personal e2e, 2026-11-11).
+ */
+export function isTransientBoxExecReadError(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false
+  if (err instanceof MuseError) return false
+  const code =
+    typeof err === 'object' && err && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '')
+      : ''
+  const message = err instanceof Error ? err.message : String(err ?? '')
+  const match = /\b(BOX_EXEC_[A-Z0-9_]+|BOX_EGRESS_[A-Z0-9_]+)\b/.exec(`${code} ${message}`)
+  if (!match) return false
+  return !NON_TRANSIENT_BOX_EXEC_CODES.has(match[1]!)
+}
 
 export function parseMuseVideoBackend(raw: string | undefined): MuseVideoBackend {
   const value = (raw ?? '').trim()
@@ -184,6 +215,25 @@ async function runCli(
   return payload
 }
 
+/** runCli for idempotent read-only verbs, retried with backoff on transient transport errors. */
+async function runCliRead(
+  exec: BoxCliExecFn,
+  args: string[],
+  opts: { timeoutMs: number; maxResponseBytes?: number; signal?: AbortSignal },
+  sleep: RetrySleep = defaultRetrySleep,
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await runCli(exec, args, opts)
+    } catch (err) {
+      const delay = BOX_EXEC_READ_RETRY_DELAYS_MS[attempt]
+      if (delay === undefined || !isTransientBoxExecReadError(err, opts.signal)) throw err
+      await sleep(delay)
+      if (opts.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
+    }
+  }
+}
+
 export function applyChunk(
   chunks: Buffer[],
   expected: { sha256?: string; total?: number },
@@ -209,15 +259,17 @@ export async function downloadRelayFile(
   jobId: string,
   index: number,
   signal?: AbortSignal,
+  retrySleep?: RetrySleep,
 ): Promise<{ bytes: Buffer; sha256: string }> {
   const parts: Buffer[] = []
   let expected: { sha256?: string; total?: number } = {}
   for (;;) {
     const have = parts.reduce((n, part) => n + part.length, 0)
-    const payload = await runCli(
+    const payload = await runCliRead(
       exec,
       ['fetch-chunk', jobId, String(index), String(have), String(BOX_EXEC_CHUNK_BYTES)],
       { timeoutMs: 30_000, maxResponseBytes: 131_072, signal },
+      retrySleep,
     )
     const data = Buffer.from(String(payload.data ?? ''), 'base64')
     const frame = {
@@ -292,6 +344,8 @@ export async function runBoxExecVideoJob(input: {
   destDir: string
   now?: () => number
   pollMs?: number
+  /** Test hook for the read-retry backoff. */
+  retrySleep?: (ms: number) => Promise<void>
   signal?: AbortSignal
   onSubmitted?: (relayJobId: string) => void
   /** Called right before the submit call leaves: from here on the relay may hold the job. */
@@ -335,10 +389,12 @@ export async function runBoxExecVideoJob(input: {
       }
       if (input.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
       await new Promise((resolve) => setTimeout(resolve, pollMs))
-      last = await runCli(input.exec, ['status', jobId], {
-        timeoutMs: 20_000,
-        signal: input.signal,
-      })
+      last = await runCliRead(
+        input.exec,
+        ['status', jobId],
+        { timeoutMs: 20_000, signal: input.signal },
+        input.retrySleep,
+      )
       status = String(last.status ?? '')
     }
     if (status !== 'done') {
@@ -349,7 +405,13 @@ export async function runBoxExecVideoJob(input: {
     const indexes = listed.length > 0 ? listed.map((_, i) => i) : [0]
     const files = []
     for (const idx of indexes) {
-      const downloaded = await downloadRelayFile(input.exec, jobId, idx, input.signal)
+      const downloaded = await downloadRelayFile(
+        input.exec,
+        jobId,
+        idx,
+        input.signal,
+        input.retrySleep,
+      )
       const filename = `${idx}.mp4`
       const path = join(input.destDir, `${idx}.bin`)
       await writeFile(path, downloaded.bytes)
