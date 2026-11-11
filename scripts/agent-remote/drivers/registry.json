@@ -1,0 +1,59 @@
+{
+  "version": 4,
+  "drivers": {
+    "cc": {
+      "driverId": "cc",
+      "engineId": "cc",
+      "authorityEngine": "ccb",
+      "driverVersion": "1.0.0",
+      "module": "drivers/cc.py",
+      "runnerMode": "interactive",
+      "slice": "oc-cc.slice",
+      "sliceMemoryMiB": 1536,
+      "sliceTasksMax": 768,
+      "appMemoryMiB": 640,
+      "socketMemoryMiB": 32,
+      "probeMemoryMiB": 384,
+      "headroomMiB": 192,
+      "profileMaxLanes": 5,
+      "requireNodeObservation": false,
+      "roles": [
+        "provision",
+        "preflight",
+        "launch",
+        "tool-socket",
+        "stop",
+        "fence-stop",
+        "prove-stopped",
+        "probe"
+      ]
+    },
+    "codex": {
+      "driverId": "codex",
+      "engineId": "codex",
+      "authorityEngine": "codex",
+      "driverVersion": "1.0.0",
+      "module": "drivers/codex.py",
+      "runnerMode": "app-server",
+      "slice": "oc-codex.slice",
+      "sliceMemoryMiB": 1536,
+      "sliceTasksMax": 768,
+      "appMemoryMiB": 448,
+      "socketMemoryMiB": 32,
+      "probeMemoryMiB": 320,
+      "headroomMiB": 192,
+      "profileMaxLanes": 5,
+      "requireNodeObservation": true,
+      "roles": [
+        "provision",
+        "preflight",
+        "launch",
+        "tool-socket",
+        "stop",
+        "fence-stop",
+        "prove-stopped",
+        "probe"
+      ]
+    }
+  }
+}
