@@ -107,6 +107,8 @@ export const EVENTS = {
   OPS_REPAIR_TIMEOUT: "ops.repair_timeout",
   // 回放检查点。默认不注册监听，注册后严重判定才进 outbox，不停止会话。
   OPS_G8_REPLAY_SEVERE: "ops.g8_replay_severe",
+  // OCV5-749: 远端驱动指纹漂移后自动复验失败(同 profile + target_fingerprint 只发一次告警)。
+  OPS_REMOTE_DRIVER_VERIFICATION_FAILED: "ops.remote_driver_verification_failed",
 } as const;
 
 export const EVENT_META: EventMeta[] = [
@@ -217,6 +219,8 @@ export const EVENT_META: EventMeta[] = [
     description: "v5 自愈 codex 修复超时未收敛(verify_failed / 超过修复时限),已升级,需人工介入", trigger: "passive" },
   { event_type: EVENTS.OPS_G8_REPLAY_SEVERE, severity: "warning", group: "ops",
     description: "回放检查点判定为需人工看的问题。默认不注册；注册后才写入 outbox。不停止会话。", trigger: "passive" },
+  { event_type: EVENTS.OPS_REMOTE_DRIVER_VERIFICATION_FAILED, severity: "warning", group: "ops",
+    description: "远端驱动指纹漂移后自动复验失败，该 profile 保持拒接新请求直至人工排查或新探针通过", trigger: "passive" },
 ];
 
 export const ALL_EVENT_TYPES: string[] = EVENT_META.map((e) => e.event_type);
