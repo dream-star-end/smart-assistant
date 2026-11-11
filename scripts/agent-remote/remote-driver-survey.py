@@ -470,7 +470,116 @@ def run_local_or_ssh_node_survey(driver_id: str, args: argparse.Namespace) -> Di
         ssh_cmd += ["-i", args.ssh_key, "-o", "IdentitiesOnly=yes"]
     if args.known_hosts:
         ssh_cmd += ["-o", f"UserKnownHostsFile={args.known_hosts}"]
-    ssh_cmd += [f"{args.ssh_user}@{args.ssh_host}", "/usr/bin/python3", "-I", "-B", "-c", _remote_node_script()]
+
+    if args.ssh_mode == "hostd":
+        ssh_cmd += [f"{args.ssh_user}@{args.ssh_host}"]
+        completed = subprocess.run(
+            ssh_cmd,
+            input=b'{"id":"survey-1","op":"probe"}\n',
+            capture_output=True,
+            timeout=45,
+        )
+        if completed.returncode != 0:
+            return {
+                "scopeContainment": {"status": "UNVERIFIED", "reason": "hostd forced-command SSH failed"},
+                "probe": {"status": "FAIL", "sshExitCode": completed.returncode, "stderrSha256": sha256_bytes(completed.stderr)},
+            }
+        first_line = next((ln for ln in completed.stdout.splitlines() if ln.strip()), b"")
+        hostd_out = strict_json(first_line)
+        profiles = [p for p in (hostd_out.get("profiles") or []) if p.get("engine") == driver_id]
+        prof = profiles[0] if profiles else None
+        if not prof or not prof.get("logged_in") or not prof.get("discovered_models"):
+            return {
+                "scopeContainment": {
+                    "status": "UNVERIFIED",
+                    "reason": "Node locked to oc-remote-hostd forced-command; arbitrary systemd-run blocked by SSH guard",
+                },
+                "probe": {
+                    "status": "UNVERIFIED" if not prof else "FAIL",
+                    "reason": "Profile not logged in or zero discovered_models via hostd probe",
+                },
+            }
+        exec_snap = prof.get("execution_snapshot") or {}
+        cli_sha = str(exec_snap.get("cliSha256") or sha256_bytes(str(prof.get("cli_version", "")).encode("utf-8")))
+        native_sha = str(exec_snap.get("nativeSha256") or cli_sha)
+        raw_sha = str(prof.get("snapshot_sha256") or sha256_bytes(first_line))
+        models = []
+        seen_mids = set()
+        for dm in prof.get("discovered_models") or []:
+            mid = str(dm.get("upstream_model_id") or "").strip().lower()
+            if not mid or mid in seen_mids:
+                continue
+            seen_mids.add(mid)
+            raw_eff_list = dm.get("supported_reasoning_efforts") or []
+            efforts = []
+            for e in raw_eff_list:
+                val = e.get("reasoningEffort") if isinstance(e, dict) else e
+                if val in ("low", "medium", "high", "xhigh", "max") and val not in efforts:
+                    efforts.append(val)
+            default_eff = dm.get("default_reasoning_effort") or (dm.get("native") or {}).get("defaultReasoningEffort")
+            if default_eff not in efforts:
+                default_eff = efforts[0] if efforts else None
+            models.append(
+                {
+                    "upstreamModelId": mid,
+                    "displayName": str(dm.get("display_name") or mid),
+                    "supportedEfforts": efforts,
+                    **({"defaultEffort": default_eff} if default_eff else {}),
+                    "supportsAdaptiveThinking": bool(efforts),
+                    "supportsVision": "image" in (dm.get("input_modalities") or []),
+                }
+            )
+        snap = validate_model_snapshot(
+            {
+                "kind": "snapshot",
+                "snapshot": {
+                    "schemaVersion": 4,
+                    "engineId": driver_id,
+                    "driverId": driver_id,
+                    "driverVersion": str(load_driver(driver_id)[1]["driverVersion"]),
+                    "source": str(prof.get("source") or f"{driver_id}:hostd-probe"),
+                    "freshness": "cli-observed",
+                    "authPresent": bool(prof.get("auth_present", True)),
+                    "accountObserved": bool(prof.get("account_observed", True)),
+                    **({"planType": str(prof["plan_type"])} if prof.get("plan_type") else {}),
+                    "cliVersion": str(prof.get("cli_version") or "observed")[:64],
+                    "cliSha256": cli_sha if len(cli_sha) == 64 else sha256_bytes(cli_sha.encode("utf-8")),
+                    "nativeSha256": native_sha if len(native_sha) == 64 else sha256_bytes(native_sha.encode("utf-8")),
+                    "models": models,
+                    "rawResponseSha256": raw_sha if len(raw_sha) == 64 else sha256_bytes(first_line),
+                    "observedAt": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+        )
+        fp = compute_probe_fingerprint(
+            snap,
+            driver_digest=driver_digest,
+            core_digest=core_digest,
+            policy_sha256=snap["rawResponseSha256"],
+        )
+        return {
+            "scopeContainment": {
+                "status": "UNVERIFIED",
+                "reason": "Node SSH key locked to oc-remote-hostd forced-command (arbitrary systemd-run disallowed by SSH guard); Gate-G self-check ok="
+                + str(bool((hostd_out.get("gate_g") or {}).get("ok"))),
+                "hostname": hostd_out.get("hostname"),
+                "hostdControllerSha256": hostd_out.get("controller_sha256"),
+            },
+            "probe": {
+                "status": "PASS",
+                "probeFingerprint": fp,
+                "snapshot": snap,
+            },
+        }
+
+    import shlex
+    script_b64 = base64.b64encode(_remote_node_script().encode("utf-8")).decode("ascii")
+    py_bootstrap = f"import base64; exec(base64.b64decode('{script_b64}').decode('utf-8'))"
+    remote_exec = ["/usr/bin/python3", "-I", "-B", "-c", py_bootstrap]
+    if args.run_as_user:
+        remote_exec = ["/usr/sbin/runuser", "-u", args.run_as_user, "--", *remote_exec]
+    remote_cmd_str = " ".join(shlex.quote(part) for part in remote_exec)
+    ssh_cmd += [f"{args.ssh_user}@{args.ssh_host}", remote_cmd_str]
 
     payload = json.dumps(
         {
@@ -545,6 +654,8 @@ def main() -> int:
     parser.add_argument("--driver", choices=("cc", "codex", "all"), default="all")
     parser.add_argument("--ssh-host", default=None)
     parser.add_argument("--ssh-user", default="box")
+    parser.add_argument("--run-as-user", default=None)
+    parser.add_argument("--ssh-mode", choices=("direct", "hostd"), default="direct")
     parser.add_argument("--ssh-port", type=int, default=22)
     parser.add_argument("--ssh-key", default=None)
     parser.add_argument("--known-hosts", default=None)

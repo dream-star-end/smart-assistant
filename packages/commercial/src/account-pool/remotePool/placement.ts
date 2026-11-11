@@ -460,7 +460,7 @@ export async function placeRemoteDriverLane(
         'REMOTE_LOCAL_SANDBOX_ROOT_FORBIDDEN',
       )
       taskRootPrefix = `${options.localSandboxDir}/run-`
-      taskRoot = `${taskRootPrefix}${safeDriverSlug}-${operationId.replace(/-/g, '')}-g${generation}`
+      taskRoot = `${taskRootPrefix}${safeDriverSlug.slice(0, 12)}-${operationId.replace(/-/g, '').slice(0, 20)}-g${generation}`
       controllerPath = reg.controllerPath
     } else {
       const home = selectedRow.ssh_user === 'root' ? '/root' : `/home/${selectedRow.ssh_user}`
@@ -524,7 +524,7 @@ export async function placeRemoteDriverLane(
       host: String(selectedRow.ssh_host),
       port: Number(selectedRow.ssh_port ?? 22),
       user: String(selectedRow.ssh_user),
-      keyPath: join(execDir, `${reg.driverId}_id_ed25519`),
+      keyPath: join(execDir, `v4_${reg.driverId}_id_ed25519`),
       knownHostsPath: join(execDir, 'known_hosts'),
       controllerSha256: reg.controllerSha256,
       taskRootPrefix,
@@ -643,7 +643,7 @@ export async function recordRemoteDriverLaneState(
       WHERE operation_id = $1
         AND generation = $2
         AND remote_protocol_version = 4
-        AND ($3 <> 'running' OR state = 'preparing')`,
+        AND ($3 <> 'running' OR state IN ('preparing', 'running'))`,
     [operationId, generation, state],
   )
   if (state === 'running' && saved.rowCount !== 1) {

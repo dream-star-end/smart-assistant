@@ -144,7 +144,7 @@ export async function recordDriverProbeSnapshot(
   try {
     await client.query('BEGIN')
     const profRes = await client.query(
-      `SELECT * FROM remote_agent_profiles WHERE id = $1 FOR UPDATE`,
+      'SELECT * FROM remote_agent_profiles WHERE id = $1 FOR UPDATE',
       [input.profileId],
     )
     need(profRes.rows.length === 1, 'REMOTE_PROFILE_NOT_FOUND')
@@ -577,7 +577,7 @@ export async function completeDriverVerificationRun(
   try {
     await client.query('BEGIN')
     const runRes = await client.query(
-      `SELECT * FROM remote_driver_verification_runs WHERE id = $1 FOR UPDATE`,
+      'SELECT * FROM remote_driver_verification_runs WHERE id = $1 FOR UPDATE',
       [input.runId],
     )
     need(runRes.rows.length === 1, 'REMOTE_VERIFICATION_RUN_NOT_FOUND')

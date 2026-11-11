@@ -129,7 +129,7 @@ export class RemoteObservationGate {
 
       const payload = ev.payload
       if (payload.kind === 'disallowedItem') {
-        throw new Error(`REMOTE_DISALLOWED_ITEM`)
+        throw new Error('REMOTE_DISALLOWED_ITEM')
       }
 
       if (payload.kind === 'toolCallObserved') {

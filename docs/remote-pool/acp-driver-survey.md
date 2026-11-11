@@ -57,7 +57,16 @@ OpenClaude's remote service pool runs untrusted model turns on shared multi-sess
 Survey CLI entrypoint:
 
 ```bash
-python3 scripts/agent-remote/remote-driver-survey.py --driver all --output <path>
+python3 scripts/agent-remote/remote-driver-survey.py --driver cc|codex|all --output <path>
 ```
 
- Live node verification records (executed in read-only / isolated `/tmp` systemd scopes without touching active user lanes or reading credential contents) are appended during Slice 5 live node verification alongside conformance evidence artifacts.
+### 3.1 Live Read-Only Verification Summary (`2026-11-11`, `coreDigest = db877545c166a1235fb77d495ee3319259e12eef902afb92ba4c5b29dbdaa36a`)
+
+Executed in strictly read-only / isolated `/tmp` systemd scopes without reading credential file contents or mutating active user lanes (full artifacts at `/home/agent/.openclaude/generated/ocv5-749-survey-{cc,codex}.json`):
+
+| Check | `cc` on `cc5-att-us` (`99.144.122.98`, `/home/box/.oc-remote-cc/claude-2.1.316`) | `codex` on `cc5-us` (`136.86.253.46`, `/usr/bin/codex` `0.167.0`) |
+| :--- | :--- | :--- |
+| **`workerIpc`** | **`PASS`** (`p50 = 0.65 ms`, `p95 = 0.86 ms` vs `50 ms` SLO; `driverDigest = b6aeb6d188fc9f19364dfcb14c8ed12928e8bb7e2f76ad5af36fee9ea2590e2d`) | **`PASS`** (`p50 = 0.25 ms`, `p95 = 0.64 ms` vs `50 ms` SLO; `driverDigest = 6a5b3462002f94466a084270db9cb12f8e4014b08f7cc29afd6b72fdccbcbc02`) |
+| **`mcpCorrelation`** | **`PASS`** (`_meta["claudecode/toolUseId"] = toolu_01SurveyCheck`, `argsHash = 7d6441497d2a...`) | **`PASS`** (`_meta.callId = call_survey_01` + `threadId` + `x-codex-turn-metadata.turn_id`, `argsHash = 7d6441497d2a...`) |
+| **`scopeContainment`** | **`PASS`** (`systemd-run --user --scope` unit `oc-survey-cc-*.scope`: `tmux` server + pane inside cgroup, `pidsInScopeBeforeStop = 3`, `activeStateAfterStop = inactive`, `tmuxStopped = true`, `populatedZero = true`) | **`UNVERIFIED` on live SSH guard / `PASS` in local systemd scope** (live `box@136.86.253.46` SSH key is locked to `oc-remote-hostd.py --serve-mux` forced-command, disallowing arbitrary `systemd-run`; `Gate-G self-check ok=True`, `hostdControllerSha256 = f1e019dc2c65...`) |
+| **`probe` (Live CLI-Observed)** | **`PASS`** (`source = claude-control:initialize`, `cliVersion = 2.1.316`, `cliSha256 = fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824`, `planType = Claude Pro`, observed models: `claude-opus-5-5`, `opus`, `sonnet`, `haiku`; `probeFingerprint = d07e78ef45a9fdb79d9ad709d525e2b42d1c9acb91b9642793d6e712b9a60eb6`) | **`PASS`** (`source = codex-app-server:model/list`, `cliSha256 = e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af`, `nativeSha256 = cdcb45aaa01d0f14e298985e09465aebccd47f64ecd298aea44814af7b62bbda`, observed models: `gpt-6-chat-thinking`, `gpt-reserve`, `gpt-6-luna`, `gpt-5.6-terra`, `gpt-5.6-luna`, `codex-auto-review`; `probeFingerprint = ccacab960b0abc892e46ac905394a3a4ac2969f15aac0e1380b08367df0c1ab7`) |

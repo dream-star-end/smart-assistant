@@ -80,7 +80,7 @@ export function toHostSessionUuid(operationId: string, nativeSessionId: string):
 
 export function remotePoolMount(): string {
   const value = process.env.OC_REMOTE_POOL_MOUNT
-  return value && value.startsWith('/') && !value.includes('..') ? value.replace(/\/+$/, '') : CC5_MOUNT
+  return value?.startsWith('/') && !value.includes('..') ? value.replace(/\/+$/, '') : CC5_MOUNT
 }
 
 export function remotePoolLanePaths(

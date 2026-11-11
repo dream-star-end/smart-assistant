@@ -138,7 +138,7 @@ def validate_task_root(value: str) -> Path:
         and len(root.parts) >= 4
         and re.fullmatch(r"run-[a-z0-9-]{4,64}", root.name)
     )
-    need(os.getuid() != 0 and (normal or sandbox) and root.absolute() == root, "REMOTE_TASK_ROOT_INVALID")
+    need(((normal and os.getuid() != 0) or sandbox) and root.absolute() == root, "REMOTE_TASK_ROOT_INVALID")
     return root
 
 

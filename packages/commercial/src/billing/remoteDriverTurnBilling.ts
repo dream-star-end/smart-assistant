@@ -694,7 +694,7 @@ async function persistDriverReceiptV4(
       )
     ).rows[0]
     const existingByReq = (
-      await client.query(`SELECT * FROM remote_native_turns WHERE request_id = $1`, [c.requestId])
+      await client.query('SELECT * FROM remote_native_turns WHERE request_id = $1', [c.requestId])
     ).rows[0]
 
     const previous = existingByTurn ?? existingByReq
@@ -889,7 +889,7 @@ export function createRemoteDriverTurnFinance(
         }
       }
 
-      let gate
+      let gate: Awaited<ReturnType<typeof enforceRemoteNativeModelAuthority>>
       try {
         const fence = () =>
           enforceRemoteNativeModelAuthority({

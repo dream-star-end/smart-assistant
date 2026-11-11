@@ -158,6 +158,8 @@ export class RemotePoolRelay {
   private admitting?: Promise<void>
   private active = false
   private dispatching = false
+  private newTurnAcked = false
+  private activeNativeTurnId?: string
   private dispatchSeq = 0
   private epoch = 0
 
@@ -568,6 +570,12 @@ export class RemotePoolRelay {
         this.appendEvidence('native_stdin', `${line}\n`)
       }
       const matchImm = encoded.immediateControlReplies.find((r) => r.commandId === command.commandId)
+      if (command.kind === 'newTurn' && matchImm?.ok) {
+        this.newTurnAcked = true
+        if (typeof matchImm.nativeTurnId === 'string') {
+          this.activeNativeTurnId = matchImm.nativeTurnId
+        }
+      }
       if (opts.waitReply && !matchImm) {
         waiterPromise = new Promise<RemoteControlReply>((resolve, reject) => {
           const timer = setTimeout(() => {
@@ -613,11 +621,21 @@ export class RemotePoolRelay {
     })
     this.masterNativeState = decoded.nextNativeState
     this.securityEventSeq += decoded.securityEvents.length
+    if (typeof this.masterNativeState.activeTurnId === 'string') {
+      this.activeNativeTurnId = this.masterNativeState.activeTurnId
+    }
     if (this.masterNativeState.activeTurnId !== prevActiveTurnId) {
       this.stateEvents.emit('change')
     }
 
     for (const reply of decoded.controlReplies) {
+      if (reply.commandKind === 'newTurn' && reply.ok) {
+        this.newTurnAcked = true
+        if (typeof reply.nativeTurnId === 'string') {
+          this.activeNativeTurnId = reply.nativeTurnId
+        }
+        this.stateEvents.emit('change')
+      }
       const waiter = this.pendingControlReplies.get(reply.commandId)
       if (waiter) {
         clearTimeout(waiter.timer)
@@ -811,6 +829,8 @@ export class RemotePoolRelay {
     this.observation!.endTurn()
     this.active = false
     this.dispatching = false
+    this.newTurnAcked = false
+    this.activeNativeTurnId = undefined
     this.stateEvents.emit('change')
     this.publish({ kind: 'turn_settled', receipt, outcome })
   }
@@ -873,6 +893,8 @@ export class RemotePoolRelay {
     this.observedTurnCallIds.clear()
     this.turnHostAttempted = false
     this.dispatching = false
+    this.newTurnAcked = false
+    this.activeNativeTurnId = undefined
     this.financeTurn = undefined
     this.boundSession = undefined
     this.countersBaseline = null
@@ -1002,8 +1024,8 @@ export class RemotePoolRelay {
     return { ready: true, seq: this.outputSeq, nativeSessionId: this.nativeSessionId }
   }
 
-  private waitForActiveTurnOrSettle(timeoutMs = 2_000): Promise<void> {
-    if (!this.active || typeof this.masterNativeState.activeTurnId === 'string') return Promise.resolve()
+  private waitForNewTurnAckOrSettle(timeoutMs = 2_000): Promise<void> {
+    if (!this.active || this.newTurnAcked) return Promise.resolve()
     return new Promise((resolve) => {
       const done = () => {
         clearTimeout(timer)
@@ -1011,7 +1033,7 @@ export class RemotePoolRelay {
         resolve()
       }
       const check = () => {
-        if (!this.active || this.revoked || typeof this.masterNativeState.activeTurnId === 'string') done()
+        if (!this.active || this.revoked || this.newTurnAcked) done()
       }
       const timer = setTimeout(done, timeoutMs)
       timer.unref()
@@ -1064,6 +1086,8 @@ export class RemotePoolRelay {
       }
       // Burn dispatch flag BEFORE async effect marker so lost ACKs can never re-submit!
       this.dispatching = true
+      this.newTurnAcked = false
+      this.activeNativeTurnId = undefined
       await this.financeTurn!.beforeDispatch({
         sequence: ++this.dispatchSeq,
         inputSha256: remoteCanonicalSha256(typedCmd),
@@ -1077,22 +1101,18 @@ export class RemotePoolRelay {
       if (!this.dispatching || !this.active) {
         return { alreadySettled: true }
       }
-      // For RPC-based drivers (`codex`), wait briefly if `turn/started` is still in flight on stdout.
-      if (this.binding.driverId === 'codex' && typeof this.masterNativeState.activeTurnId !== 'string') {
-        await this.waitForActiveTurnOrSettle(2_000)
+      // For async RPC drivers whose `newTurn` control reply is still in flight on stdout, wait briefly before encoding `interrupt`.
+      if (!this.newTurnAcked) {
+        await this.waitForNewTurnAckOrSettle(2_000)
       }
       if (!this.active || !this.dispatching) {
         return { alreadySettled: true }
       }
-      const activeTurnId =
-        typeof this.masterNativeState.activeTurnId === 'string'
-          ? this.masterNativeState.activeTurnId
-          : typeof cmd.nativeTurnId === 'string'
-            ? cmd.nativeTurnId
-            : undefined
-      if (this.binding.driverId === 'codex' && !activeTurnId) {
+      if (!this.newTurnAcked) {
         return { deferredToStop: true }
       }
+      const activeTurnId =
+        this.activeNativeTurnId ?? (typeof cmd.nativeTurnId === 'string' ? cmd.nativeTurnId : undefined)
       const typedCmd: RemoteDriverCommand = {
         kind: 'interrupt',
         commandId: cmd.commandId,
@@ -1190,7 +1210,7 @@ export class RemotePoolRelay {
     if (path === '/tool/result') {
       const callId = typeof v.callId === 'string' ? v.callId : ''
       const tool = this.tools.get(callId)
-      remotePoolNeed(tool !== undefined && tool.delivered && !tool.result, 'REMOTE_TOOL_RESULT_UNEXPECTED')
+      remotePoolNeed(tool?.delivered && !tool.result, 'REMOTE_TOOL_RESULT_UNEXPECTED')
       assertCc5ToolResult(v.result)
       const cleanResult: Cc5ToolResult = {
         content: (v.result as Cc5ToolResult).content,

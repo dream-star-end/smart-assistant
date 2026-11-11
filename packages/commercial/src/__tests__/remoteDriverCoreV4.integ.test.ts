@@ -1294,7 +1294,7 @@ test('AC-3 drift closed-loop: probe drift withdraws ready, blocks user placement
   })
   assert.equal(blockedAdmin.executionReadyRestored, false)
   assert.equal(blockedAdmin.rejectReason, 'ADMIN_DISABLED')
-  await pool.query(`UPDATE remote_agent_profiles SET disabled_by = NULL WHERE id = $1`, [driftProfileId])
+  await pool.query('UPDATE remote_agent_profiles SET disabled_by = NULL WHERE id = $1', [driftProfileId])
 
   // 5. Credential `auth_epoch` change marks run `auto_eligible = FALSE` so auto-worker refuses to claim it.
   const authDrift = await recordDriverProbeSnapshot(pool, {

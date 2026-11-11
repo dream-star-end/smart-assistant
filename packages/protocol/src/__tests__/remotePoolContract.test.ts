@@ -54,7 +54,7 @@ test('canonical JSON matches cross-language UTF-8 byte-order golden vectors and 
     -(Number.MAX_SAFE_INTEGER + 1),
     1e21,
     'bad\uD800surrogate',
-    { ['\uDC00key']: 1 },
+    { '\uDC00key': 1 },
   ]) {
     assert.throws(() => remoteCanonicalJson(bad), /REMOTE_CANONICAL_JSON_INVALID/)
   }

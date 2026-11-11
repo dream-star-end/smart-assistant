@@ -697,10 +697,10 @@ export async function recoverRemoteNativeTurnBilling(
          SELECT 1 FROM remote_native_threads t WHERE t.uid=user_id AND t.pending_request_id=request_id)))
        AND (ctx#>'{remoteNative,receipt}'<>'null'::jsonb OR ctx->>'remoteNativeBillingRecovery'=ANY('{remote-native-v2,remote-native-v4}'::text[]))
      ORDER BY updated_at ASC LIMIT $2`, [[REMOTE_NATIVE_BILLING_RECOVERY_VERSION, CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION], limit])).rows
-  const rows = allRows.filter((r) => r.ctx?.remoteNativeBillingRecovery !== REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION), v4Rows = allRows.filter((r) => r.ctx?.remoteNativeBillingRecovery === REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION)
+  const v4Rows = allRows.filter((r) => r.ctx?.remoteNativeBillingRecovery === REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION)
   let proven = 0
   let pending = 0
-  for (const row of rows) {
+  for (const row of allRows.filter((r) => r.ctx?.remoteNativeBillingRecovery !== REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION)) {
     try {
       const c = parseContext(row.ctx.remoteNative)
       need(c.requestId === row.request_id && c.scope.uid === row.user_id)

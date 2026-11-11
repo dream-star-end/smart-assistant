@@ -114,8 +114,11 @@ def _fake_systemd_dir() -> Optional[Path]:
     if not raw:
         return None
     res_root = str(directory())
-    # Strict safety boundary: fake systemd is ONLY honored inside non-root `/tmp/` test sandboxes.
-    need(os.getuid() != 0 and res_root.startswith("/tmp/"), "REMOTE_FAKE_SYSTEMD_FORBIDDEN")
+    # Strict safety boundary: fake systemd is ONLY honored inside isolated `/tmp/oc-drvtest-*` (or non-root `/tmp/`) test sandboxes.
+    need(
+        res_root.startswith("/tmp/oc-drvtest-") or (os.getuid() != 0 and res_root.startswith("/tmp/")),
+        "REMOTE_FAKE_SYSTEMD_FORBIDDEN",
+    )
     d = Path(raw).resolve()
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     return d
