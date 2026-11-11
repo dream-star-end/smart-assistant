@@ -13,7 +13,16 @@
  *   codex-native 内部再按 runnerKind 收口:仅接受缺省 / 'app-server';
  *   'exec' 与未知 runnerKind 直接 fail-closed('codex exec' legacy 路径不复活)。
  */
-import { type RemoteExecutionBackend, CODEX_ENGINE_MODEL_IDS, CURSOR_ENGINE_MODEL_IDS, GROK_ENGINE_MODEL_IDS, ZCODE_ENGINE_MODEL_IDS, ANTIGRAVITY_ENGINE_MODEL_IDS } from '@openclaude/protocol'
+import {
+  type RemoteExecutionBackend,
+  isRemoteDriverExecutionBackend,
+  parseRemoteDriverExecutionBackend,
+  CODEX_ENGINE_MODEL_IDS,
+  CURSOR_ENGINE_MODEL_IDS,
+  GROK_ENGINE_MODEL_IDS,
+  ZCODE_ENGINE_MODEL_IDS,
+  ANTIGRAVITY_ENGINE_MODEL_IDS,
+} from '@openclaude/protocol'
 import type { AgentDef } from '@openclaude/storage'
 import type { SubprocessRunnerOpts } from '../subprocessRunner.js'
 import type { EngineAdapter } from './engineAdapter.js'
@@ -28,6 +37,11 @@ export type EngineCreateOpts = SubprocessRunnerOpts
 export type EngineFactory = (opts: EngineCreateOpts) => EngineAdapter
 
 const engineFactories = new Map<string, EngineFactory>()
+let remoteDriverAdapterFactory: EngineFactory | undefined
+
+export function registerRemoteDriverAdapter(factory: EngineFactory): void {
+  remoteDriverAdapterFactory = factory
+}
 
 /** Desktop W-01: Host sets OPENCLAUDE_ENGINES=ccb. Unset = all engines (current). */
 export const ENGINE_NOT_ENABLED = 'ENGINE_NOT_ENABLED' as const
@@ -192,6 +206,18 @@ export function resolveEngine(
 export function createEngine(engineId: string, opts: EngineCreateOpts): EngineAdapter {
   if (!isEngineEnabled(engineId)) {
     throw new EngineNotEnabledError(engineId)
+  }
+  if (isRemoteDriverExecutionBackend(opts.executionBackend)) {
+    const backend = parseRemoteDriverExecutionBackend(opts.executionBackend)
+    if (backend.authorityEngine !== engineId) {
+      throw new Error(
+        `[engine] remote-driver-v4 authorityEngine '${backend.authorityEngine}' != resolved engine '${engineId}' — fail-closed`,
+      )
+    }
+    if (!remoteDriverAdapterFactory) {
+      throw new Error('[engine] no remote-driver-v4 adapter registered — fail-closed')
+    }
+    return remoteDriverAdapterFactory(opts)
   }
   const factory = engineFactories.get(engineId)
   if (!factory) {

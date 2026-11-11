@@ -186,6 +186,123 @@ export interface RemoteDriverModelSnapshot {
   readonly observedAt: string
 }
 
+export type RemoteSecurityPayload = RemoteDriverSecurityPayload
+export type RemoteSecurityEvent = RemoteDriverSecurityEvent
+export type RemoteProbeSnapshot = RemoteDriverModelSnapshot
+
+export function validateUsagePolicy(raw: unknown): RemoteDriverUsagePolicy {
+  need(raw && typeof raw === 'object' && !Array.isArray(raw), 'REMOTE_USAGE_POLICY_INVALID')
+  const p = raw as Record<string, unknown>
+  need(
+    typeof p.semanticsId === 'string' &&
+      IDENT_RE.test(p.semanticsId) &&
+      (p.mode === 'per_turn' || p.mode === 'cumulative') &&
+      typeof p.inputField === 'string' &&
+      p.inputField.length > 0 &&
+      typeof p.outputField === 'string' &&
+      p.outputField.length > 0 &&
+      (p.cacheReadField === undefined || (typeof p.cacheReadField === 'string' && p.cacheReadField.length > 0)) &&
+      (p.cacheWriteField === undefined || (typeof p.cacheWriteField === 'string' && p.cacheWriteField.length > 0)) &&
+      (p.reasoningField === undefined || (typeof p.reasoningField === 'string' && p.reasoningField.length > 0)) &&
+      typeof p.inputIncludesCacheRead === 'boolean' &&
+      typeof p.outputIncludesReasoning === 'boolean' &&
+      typeof p.allowCacheWrite === 'boolean',
+    'REMOTE_USAGE_POLICY_INVALID',
+  )
+  return Object.freeze({
+    semanticsId: p.semanticsId,
+    mode: p.mode,
+    inputField: p.inputField,
+    outputField: p.outputField,
+    ...(p.cacheReadField ? { cacheReadField: p.cacheReadField } : {}),
+    ...(p.cacheWriteField ? { cacheWriteField: p.cacheWriteField } : {}),
+    ...(p.reasoningField ? { reasoningField: p.reasoningField } : {}),
+    inputIncludesCacheRead: p.inputIncludesCacheRead,
+    outputIncludesReasoning: p.outputIncludesReasoning,
+    allowCacheWrite: p.allowCacheWrite,
+  })
+}
+
+export function validateRemoteProbeSnapshot(raw: unknown): RemoteDriverModelSnapshot {
+  need(raw && typeof raw === 'object' && !Array.isArray(raw), 'REMOTE_PROBE_SNAPSHOT_INVALID')
+  assertWellFormedJsonValue(raw, true)
+  const s = raw as Record<string, unknown>
+  need(
+    s.schemaVersion === REMOTE_DRIVER_PROTOCOL_VERSION &&
+      typeof s.engineId === 'string' &&
+      /^[a-z0-9][a-z0-9_-]{0,31}$/.test(s.engineId) &&
+      typeof s.driverId === 'string' &&
+      /^[a-z0-9][a-z0-9_-]{0,31}$/.test(s.driverId) &&
+      typeof s.driverVersion === 'string' &&
+      s.driverVersion.length > 0 &&
+      typeof s.source === 'string' &&
+      s.source.includes(':') &&
+      s.freshness === 'cli-observed' &&
+      typeof s.authPresent === 'boolean' &&
+      typeof s.accountObserved === 'boolean' &&
+      typeof s.cliVersion === 'string' &&
+      s.cliVersion.length > 0 &&
+      typeof s.cliSha256 === 'string' &&
+      SHA256_RE.test(s.cliSha256) &&
+      (s.nativeSha256 === undefined || (typeof s.nativeSha256 === 'string' && SHA256_RE.test(s.nativeSha256))) &&
+      (s.bridgeSha256 === undefined || (typeof s.bridgeSha256 === 'string' && SHA256_RE.test(s.bridgeSha256))) &&
+      typeof s.rawResponseSha256 === 'string' &&
+      SHA256_RE.test(s.rawResponseSha256) &&
+      typeof s.observedAt === 'string' &&
+      s.observedAt.length > 0 &&
+      Array.isArray(s.models) &&
+      s.models.length > 0,
+    'REMOTE_PROBE_SNAPSHOT_INVALID',
+  )
+  const seenModels = new Set<string>()
+  const models: RemoteProbedModel[] = []
+  for (const rawModel of s.models) {
+    need(rawModel && typeof rawModel === 'object' && !Array.isArray(rawModel), 'REMOTE_PROBE_MODEL_INVALID')
+    const m = rawModel as Record<string, unknown>
+    need(
+      typeof m.upstreamModelId === 'string' &&
+        /^[a-z0-9][a-z0-9._-]{0,63}$/.test(m.upstreamModelId) &&
+        !seenModels.has(m.upstreamModelId) &&
+        typeof m.displayName === 'string' &&
+        Array.isArray(m.supportedEfforts) &&
+        m.supportedEfforts.every((e) => typeof e === 'string') &&
+        (m.defaultEffort === null ||
+          (typeof m.defaultEffort === 'string' && m.supportedEfforts.includes(m.defaultEffort))) &&
+        typeof m.supportsAdaptiveThinking === 'boolean' &&
+        typeof m.supportsVision === 'boolean',
+      'REMOTE_PROBE_MODEL_INVALID',
+    )
+    seenModels.add(m.upstreamModelId)
+    models.push({
+      upstreamModelId: m.upstreamModelId,
+      displayName: m.displayName,
+      supportedEfforts: [...(m.supportedEfforts as string[])],
+      defaultEffort: m.defaultEffort as string | null,
+      supportsAdaptiveThinking: m.supportsAdaptiveThinking,
+      supportsVision: m.supportsVision,
+    })
+  }
+  return Object.freeze({
+    schemaVersion: REMOTE_DRIVER_PROTOCOL_VERSION,
+    engineId: s.engineId,
+    driverId: s.driverId,
+    driverVersion: s.driverVersion,
+    source: s.source,
+    freshness: 'cli-observed',
+    authPresent: s.authPresent,
+    accountObserved: s.accountObserved,
+    ...(typeof s.accountHint === 'string' ? { accountHint: s.accountHint } : {}),
+    ...(typeof s.planType === 'string' ? { planType: s.planType } : {}),
+    cliVersion: s.cliVersion,
+    cliSha256: s.cliSha256,
+    ...(typeof s.nativeSha256 === 'string' ? { nativeSha256: s.nativeSha256 } : {}),
+    ...(typeof s.bridgeSha256 === 'string' ? { bridgeSha256: s.bridgeSha256 } : {}),
+    models: Object.freeze(models),
+    rawResponseSha256: s.rawResponseSha256,
+    observedAt: s.observedAt,
+  })
+}
+
 function need(condition: unknown, code = 'REMOTE_DRIVER_EVENT_INVALID'): asserts condition {
   if (!condition) throw new Error(code)
 }

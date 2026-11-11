@@ -639,39 +639,17 @@ class RemoteDriverCoreTests(unittest.TestCase):
 
             dispatched_requests: List[Dict[str, Any]] = []
 
+            bridge_rc: List[int] = []
+
             def bridge_thread() -> None:
-                run_socket_bridge(root, src, snk)
+                bridge_rc.append(run_socket_bridge(root, src, snk))
 
             t = threading.Thread(target=bridge_thread, daemon=True)
             t.start()
             try:
                 ready = strict_json(master_out.readline())
                 self.assertEqual(ready["kind"], "socket-ready")
-
-                # Red control: calling MCP tool WITHOUT native observation on disk must fail closed!
                 mcp_script = SCRIPT_DIR / "core" / "mcp_client.py"
-                unobserved_req = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "t0",
-                        "arguments": {"token": "unobserved"},
-                        "_meta": {
-                            "callId": "call_unobs",
-                            "threadId": "thr_wal_1",
-                            "x-codex-turn-metadata": {"turn_id": "turn_1"},
-                        },
-                    },
-                }
-                r_unobs = subprocess.run(
-                    ["/usr/bin/python3", "-I", "-B", str(mcp_script), str(root)],
-                    input=(json.dumps(unobserved_req) + "\n").encode("utf-8"),
-                    capture_output=True,
-                    timeout=5,
-                )
-                self.assertNotEqual(r_unobs.returncode, 0)
-                self.assertIn(b"error", r_unobs.stdout)
 
                 # Green roundtrip + persist `.result.json`: write matching observation first.
                 args_hash = remote_canonical_sha256({"token": "hello"})
@@ -801,12 +779,59 @@ class RemoteDriverCoreTests(unittest.TestCase):
                 )
                 self.assertNotEqual(r_unk.returncode, 0)
                 self.assertEqual(len(dispatched_requests), 1)
+                t.join(timeout=3)
+                self.assertEqual(bridge_rc, [1])
             finally:
                 master_in.close()
                 t.join(timeout=3)
                 src.close()
                 snk.close()
                 master_out.close()
+
+            # Second socket bridge: calling MCP tool WITHOUT native observation on disk must fail-close bridge!
+            (root / "MCP-SOCKET.json").unlink(missing_ok=True)
+            r2_in, w2_in = os.pipe()
+            r2_out, w2_out = os.pipe()
+            src2 = os.fdopen(r2_in, "rb", buffering=0)
+            snk2 = os.fdopen(w2_out, "wb", buffering=0)
+            master2_out = os.fdopen(r2_out, "rb", buffering=0)
+            master2_in = os.fdopen(w2_in, "wb", buffering=0)
+            bridge2_rc: List[int] = []
+            t2 = threading.Thread(target=lambda: bridge2_rc.append(run_socket_bridge(root, src2, snk2)), daemon=True)
+            t2.start()
+            try:
+                ready2 = strict_json(master2_out.readline())
+                self.assertEqual(ready2["kind"], "socket-ready")
+                unobserved_req = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "t0",
+                        "arguments": {"token": "unobserved"},
+                        "_meta": {
+                            "callId": "call_unobs",
+                            "threadId": "thr_wal_1",
+                            "x-codex-turn-metadata": {"turn_id": "turn_1"},
+                        },
+                    },
+                }
+                r_unobs = subprocess.run(
+                    ["/usr/bin/python3", "-I", "-B", str(mcp_script), str(root)],
+                    input=(json.dumps(unobserved_req) + "\n").encode("utf-8"),
+                    capture_output=True,
+                    timeout=5,
+                )
+                self.assertNotEqual(r_unobs.returncode, 0)
+                self.assertIn(b"error", r_unobs.stdout)
+                t2.join(timeout=3)
+                self.assertEqual(bridge2_rc, [1])
+            finally:
+                master2_in.close()
+                t2.join(timeout=3)
+                src2.close()
+                snk2.close()
+                master2_out.close()
 
     def test_06_ssh_guard_drain_role_enforcement(self) -> None:
         # Test guard command structure & drain role restriction against small root-owned files (`<= 262144` bytes).

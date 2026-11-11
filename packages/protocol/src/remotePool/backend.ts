@@ -5,6 +5,8 @@
 import { parseCc5ExecutionBackend } from '../cc5Backend.js'
 import type { ModelAuthorityEngine } from '../modelAuthority.js'
 
+export type RemoteDriverAuthorityEngine = ModelAuthorityEngine
+
 export const REMOTE_DRIVER_BACKEND = 'remote-driver-v4' as const
 
 const ENGINE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/

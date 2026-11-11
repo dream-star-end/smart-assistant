@@ -184,7 +184,7 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                 self.end_headers()
                 self.wfile.write(receipt_bytes)
             except Exception:  # noqa: BLE001
-                failed = failed or dispatched
+                failed = True
                 self.send_error()
 
     try:

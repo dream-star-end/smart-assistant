@@ -527,9 +527,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         term_id = frame.get("uuid")
         need(isinstance(term_id, str) and IDENT_RE.fullmatch(term_id), "CC_RESULT_UUID_INVALID")
         seen_uuids = list(state.get("seenResultUuids") or [])
-        need(term_id not in seen_uuids, "CC_DUPLICATE_RESULT_UUID")
-        seen_uuids.append(term_id)
-        state["seenResultUuids"] = seen_uuids[-64:]
+        if term_id not in seen_uuids:
+            seen_uuids.append(term_id)
+            state["seenResultUuids"] = seen_uuids[-64:]
         state["activeTurn"] = False
 
         usage = frame.get("usage")

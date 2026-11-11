@@ -442,6 +442,10 @@ def stop_unit(unit: str) -> None:
             pid = cur.get("MainPID")
             if isinstance(pid, int) and pid > 1:
                 try:
+                    os.killpg(pid, 9)
+                except OSError:
+                    pass
+                try:
                     os.kill(pid, 9)
                 except OSError:
                     pass

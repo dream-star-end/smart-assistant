@@ -88,6 +88,7 @@ import {
 } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import './engine/antigravityAdapter.js'
+import './remotePool/registerRemoteDriver.js'
 import {
   RESUME_HISTORY_MAX,
   pickResumableId,

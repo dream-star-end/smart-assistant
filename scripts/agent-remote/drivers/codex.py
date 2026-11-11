@@ -557,12 +557,16 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         turn_obj = params.get("turn") or {}
         turn_id = turn_obj.get("id")
         raw_status = turn_obj.get("status")
+        seen_turn_ids = list(state.get("seenTurnIds") or [])
         need(
             isinstance(turn_id, str)
-            and turn_id == state.get("activeTurnId")
+            and (turn_id == state.get("activeTurnId") or turn_id in seen_turn_ids)
             and raw_status in ("completed", "failed", "interrupted"),
             "CODEX_TERMINAL_INVALID",
         )
+        if turn_id not in seen_turn_ids:
+            seen_turn_ids.append(turn_id)
+            state["seenTurnIds"] = seen_turn_ids[-64:]
         mapped = "success" if raw_status == "completed" else ("interrupted" if raw_status == "interrupted" else "error")
         term_ev: Dict[str, Any] = {
             "kind": "turnTerminal",

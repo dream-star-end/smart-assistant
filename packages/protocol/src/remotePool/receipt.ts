@@ -87,6 +87,22 @@ function validateCounterMap(raw: unknown): Readonly<Record<string, number>> {
 }
 
 /**
+ * Deterministic zero counter map derived purely from a driver's `UsagePolicy` (no engine-specific hardcoding).
+ */
+export function zeroCountersForUsagePolicy(
+  policy: RemoteDriverUsagePolicy,
+): Readonly<Record<string, number>> {
+  const out: Record<string, number> = {
+    [policy.inputField]: 0,
+    [policy.outputField]: 0,
+  }
+  if (policy.cacheReadField) out[policy.cacheReadField] = 0
+  if (policy.cacheWriteField) out[policy.cacheWriteField] = 0
+  if (policy.reasoningField) out[policy.reasoningField] = 0
+  return Object.freeze(out)
+}
+
+/**
  * Core-owned usage normalization from a driver's declarative UsagePolicy.
  * Rejects counter drops in cumulative mode, inclusion violations, and unproven cache-write tokens.
  */
