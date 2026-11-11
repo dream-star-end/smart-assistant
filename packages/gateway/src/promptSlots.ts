@@ -143,7 +143,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 
 ## 子 Agent 与并行处理
 
-即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
+仅在当前运行模式与用户授权允许时委派；工具或成员出现在列表中不代表委派授权。模式要求明确指派或用户要求亲自完成时，不自行委派。允许委派时使用以下通道:
 - \`send_to_agent(agentId, message)\`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
 <!-- oc-engine:ccb,codex:start -->
 - CCB/Codex 同步委派走 MCP \`delegate_task(goal, agentId?, model?, context?, effort?, allowSelf?)\`;并行走 \`delegate_tasks(tasks)\`。工具会阻塞到子任务结束。
@@ -154,7 +154,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 
 委派参数契约:唯一必填字段是 \`goal\`(不是 task/message/prompt)。\`agentId\` 是平台成员 id(见「多 Agent 协作」),\`model\` 是「委派可用型号」里的精确 slug(不要猜或截短,\`gpt-6\` 不是 \`gpt-6-astra\`),二者不可互填;不填 \`agentId\` 即派给 \`main\`,不填 \`model\` 用成员绑定型号。派给自己默认拒绝,确需同成员换型号才传 \`allowSelf: true\`(CLI \`--allow-self\`)。最小示例:\`delegate_task({ goal: "...", agentId: "coding-assistant" })\`;换型号自跑:\`delegate_task({ goal: "...", model: "gpt-6-astra", allowSelf: true })\`。
 
-子任务边界清晰、且专业成员能提升质量或并行明显省时(代码库搜索、独立调研、互不依赖的多文件工作、可分离的长步骤)时主动委派;简单、步骤强依赖或委派成本高于收益时自己做。不要把整个任务甩给子 agent,你仍负责核对结果和最终交付。子 agent 在隔离上下文中运行,只有平台允许的工具。
+在上述授权内，只有边界清晰且专业分工或并行有实际收益的子任务才值得委派；简单或强依赖步骤自己做。你仍负责核对结果和最终交付。子 agent 在隔离上下文中运行，只有平台允许的工具；既定独立审计要求不因本段省略。
 
 ## 浏览器操作 (CLI)
 
@@ -172,7 +172,6 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 在**不减少验证、不省略用户要求、不降低结果质量**的前提下:
 - 多个互不依赖的读取、搜索或状态检查应在一次工具调用里批量执行;有先后依赖的步骤仍按顺序执行,不要为省调用而并错流程。
 - 登录二维码/验证码/一次性链接失效或用户要求刷新时,必须重新获取最新页面或截图,用文件修改时间或哈希确认不是旧文件,随后立刻把新文件放到 generated 目录并在回复中给出路径;禁止复用旧二维码或只口头说“已刷新”。
-
 `
 
 /** `# Memory` 常驻指令段;{{MEMORY_DIR}}/{{MEMORY_MD}}/{{USER_MD}} 由

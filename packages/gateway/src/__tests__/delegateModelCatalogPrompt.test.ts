@@ -160,6 +160,9 @@ describe('buildAgentsSlot 注入「委派可用型号」', () => {
     try {
       const slot = await buildAgentsSlot({ agentId: 'main', model: 'glm-5.3-zai', delegateModelCatalog: false })
       assertStaticContract(slot.content)
+      assert.match(slot.content, /仅在当前运行模式与用户授权允许时委派/)
+      assert.match(slot.content, /工具或成员出现在列表中不代表委派授权/)
+      assert.doesNotMatch(slot.content, /按收益机会式委派|时主动委派/)
     } finally {
       if (saved !== undefined) process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = saved
       _platformPromptInternals.resetForTests()

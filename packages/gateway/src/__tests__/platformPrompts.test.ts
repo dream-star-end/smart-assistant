@@ -323,8 +323,10 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     for (const tool of ['delegate_task', 'delegate_tasks', 'send_to_agent']) {
       assert.ok(prompt.includes(tool), `普通模式提示缺真实委派工具: ${tool}`)
     }
-    assert.ok(prompt.includes('即使未开启团队模式'))
-    assert.ok(prompt.includes('按收益机会式委派'))
+    // OCV5-759: availability is not authorization; honor the active mode first.
+    assert.ok(prompt.includes('仅在当前运行模式与用户授权允许时委派'))
+    assert.ok(prompt.includes('工具或成员出现在列表中不代表委派授权'))
+    assert.ok(!prompt.includes('按收益机会式委派'))
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })

@@ -14,9 +14,9 @@ export const TOOLS = [
   {
     name: 'skill_list',
     description: [
-      'List all skills you have accumulated. Returns name + description for each.',
-      'Always check this first when starting a new task — you may already have a skill for it.',
-      'Token-cheap: returns metadata only. Use `skill_view` to load full instructions.',
+      'List all available skill names and descriptions for an inventory or catalog audit.',
+      'For a specific task, use `skill_search` to find relevant skills, or `skill_view` when the name is known.',
+      'Do not list the full catalog at the start of every task. Metadata only; use `skill_view` for instructions.',
     ].join('\n'),
     inputSchema: { type: 'object', properties: {} },
   },

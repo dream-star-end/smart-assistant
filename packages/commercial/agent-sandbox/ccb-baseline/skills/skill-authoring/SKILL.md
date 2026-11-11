@@ -1,7 +1,7 @@
 ---
 name: skill-authoring
-description: "写好一个 skill 的平台规范: 目录结构(references/scripts/assets/evals)、SKILL.md 写法、评测用例(evals.json)格式与评测驱动迭代方法。创建/更新/训练 skill 前先读本文。"
-version: "1.2.0"
+description: "编写与维护平台 skill 的结构、触发范围和验证规范。创建、修改或训练 skill 时使用。"
+version: "1.3.0"
 tags: [system, skill, authoring, evals]
 ---
 
@@ -21,12 +21,14 @@ skill-name/
 
 ## SKILL.md 写法
 
-- frontmatter `description` 是**触发的唯一依据**:第三人称,同时写"做什么 + 何时用",含触发关键词。
+- frontmatter `description` 是目录中的触发说明：用一两句写清"做什么 + 何时用"。只覆盖真实适用任务，不用宽泛主题词扩大触发；命令、历史事故和操作清单放正文或 references/。
 - frontmatter 可选 `priority: N`(-100~100,缺省 0):只影响系统提示 SKILLS 菜单的排序(越大越靠前),不影响搜索与面板;用户自建技能永远排在平台技能之前,一般无需设置。
 - 正文 <500 行,定位是导航页:触发条件、前提、checklist 式步骤、决策分支、常见坑、验证方式。
 - 细节外链到 references/(引用只允许一层深);> 100 行的 reference 文件顶部加目录。
 - 指令里区分 "Run scripts/x.py"(执行)与 "See references/y.md"(阅读)。
 - 自由度判据:多解任务写文字启发式(高自由度);带参数流程写伪代码(中);易碎操作写精确脚本 + `Do not modify`(低)。
+- 多流程技能的根文档只保留共同边界和选路，命中分支后再读对应参考；不要要求所有任务先读完全部参考。
+- 写清完成条件、可自主继续的范围与必须停下的边界，避免无范围的"一直修到通过"；共享技能保留跨模型必要约束，不因某模型更强而删除业务安全门。
 
 ## evals/evals.json 格式
 
