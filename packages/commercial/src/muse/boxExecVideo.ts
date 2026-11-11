@@ -22,7 +22,9 @@ export const BOX_EXEC_MAX_CONCURRENCY = 5
 export const BOX_EXEC_CHUNK_BYTES = 65_536
 export const BOX_EXEC_CLI = '/workspace/muse-relay/bin/muse-exec-cli'
 export const BOX_EXEC_PYTHON = '/usr/bin/python3'
-export const BOX_EXEC_NATIVE_DEADLINE_MS = 6 * 60_000
+/** Native relay jobs take 62-103 s submit->MP4 (OCV5-750, n=5) plus the chunked download; 8 min leaves
+ * room for one relay thread reload (Muse "Video not found") and one stall nudge (~4 min) before failing. */
+export const BOX_EXEC_NATIVE_DEADLINE_MS = 8 * 60_000
 export const BOX_EXEC_COMPOSITE_DEADLINE_MS = 12 * 60_000
 export const BOX_EXEC_POLL_MS = 5_000
 /** Backoff for idempotent read-only relay calls (status, fetch-chunk) after a transient Box Exec failure. */
