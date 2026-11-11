@@ -242,6 +242,8 @@ export interface MuseBridgeHubOptions {
   /** Resolves a per-job Box Exec transport for muse-exec-cli; absent = box path not wired. */
   boxExecRunner?: () => Promise<BoxCliExecFn>
   boxExecPollMs?: number
+  /** Backoff sleep for retried read-only relay calls (tests pass an instant one). */
+  boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 interface Session {
@@ -318,6 +320,7 @@ export class MuseBridgeHub {
   private readonly configuredBackend: MuseVideoBackend
   private readonly boxExecRunner?: () => Promise<BoxCliExecFn>
   private readonly boxExecPollMs: number
+  private readonly boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   private reservedBox = 0
   /** Box-exec jobs waiting for a relay slot, and the ones running on it. */
   private readonly boxExecPending: HubJob[] = []
@@ -362,6 +365,7 @@ export class MuseBridgeHub {
     this.configuredBackend = opts.videoBackend ?? 'hatch'
     this.boxExecRunner = opts.boxExecRunner
     this.boxExecPollMs = opts.boxExecPollMs ?? 5_000
+    this.boxExecRetrySleep = opts.boxExecRetrySleep
   }
 
   /** Runtime file `$stateRoot/video-backend` overrides the env default without a restart. */
@@ -1395,6 +1399,7 @@ export class MuseBridgeHub {
         destDir: join(this.root, job.id, ...(job.durable ? [nonce] : [])),
         now: this.now,
         pollMs: this.boxExecPollMs,
+        retrySleep: this.boxExecRetrySleep,
         signal: job.abort?.signal,
       })
       if (!live()) return
