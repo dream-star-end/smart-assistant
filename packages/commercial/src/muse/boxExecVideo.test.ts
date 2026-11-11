@@ -9,6 +9,7 @@ import type { BoxCcExecRequest } from '@openclaude/gateway'
 
 import {
   BOX_EXEC_CHUNK_BYTES,
+  BOX_EXEC_READ_RETRY_BUDGET,
   BOX_EXEC_READ_RETRY_DELAYS_MS,
   applyChunk,
   canRouteToBoxExec,
@@ -507,5 +508,91 @@ describe('OCV5-750 transient Box Exec failures on read-only relay calls', () => 
       /BOX_EXEC_HTTP_417/,
     )
     assert.equal(calls.filter((c) => c[0] === 'submit').length, 1)
+  })
+})
+
+describe('OCV5-750 Gemini r4: read-retry classification, budget, abort', () => {
+  it('permanent 4xx and pinned-Box guard failures are not transient; 408/417/425/429 are', () => {
+    for (const c of [
+      'BOX_EXEC_HTTP_400',
+      'BOX_EXEC_HTTP_401',
+      'BOX_EXEC_HTTP_403',
+      'BOX_EXEC_HTTP_404',
+    ]) {
+      assert.equal(isTransientBoxExecReadError(new FakeTransportError(c)), false, c)
+    }
+    for (const c of [
+      'BOX_EXEC_HTTP_408',
+      'BOX_EXEC_HTTP_417',
+      'BOX_EXEC_HTTP_425',
+      'BOX_EXEC_HTTP_429',
+    ]) {
+      assert.equal(isTransientBoxExecReadError(new FakeTransportError(c)), true, c)
+    }
+    assert.equal(
+      isTransientBoxExecReadError(new FakeTransportError('BOX_EXEC_ACCOUNT_GUARD_FAILED')),
+      false,
+    )
+    assert.equal(isTransientBoxExecReadError(new FakeTransportError('BOX_EGRESS_CHANGED')), false)
+    // any non-transient token anywhere wins
+    assert.equal(
+      isTransientBoxExecReadError(
+        new Error('BOX_EXEC_HTTP_502 then BOX_EXEC_ACCOUNT_GUARD_FAILED'),
+      ),
+      false,
+    )
+  })
+
+  it('a per-job retry budget bounds retries across all chunks', async () => {
+    const payload = Buffer.alloc(BOX_EXEC_CHUNK_BYTES * 6, 2)
+    const failures = new Map<string, string[]>()
+    for (let i = 0; i < 6; i++)
+      failures.set(`fetch-chunk@${BOX_EXEC_CHUNK_BYTES * i}`, [
+        'BOX_EXEC_HTTP_417',
+        'BOX_EXEC_HTTP_417',
+      ])
+    const { exec } = relayFake(payload, failures)
+    const slept: number[] = []
+    await assert.rejects(
+      downloadRelayFile(exec, 'rj', 0, undefined, async (ms) => {
+        slept.push(ms)
+      }),
+      /BOX_EXEC_HTTP_417/,
+    )
+    assert.equal(slept.length, BOX_EXEC_READ_RETRY_BUDGET)
+  })
+
+  it('the default backoff wakes immediately on abort', async () => {
+    const failures = new Map([['fetch-chunk@0', ['BOX_EXEC_HTTP_417', 'BOX_EXEC_HTTP_417']]])
+    const { exec } = relayFake(Buffer.alloc(10, 1), failures)
+    const ac = new AbortController()
+    const t0 = Date.now()
+    setTimeout(() => ac.abort(), 50)
+    await assert.rejects(
+      downloadRelayFile(exec, 'rj', 0, ac.signal),
+      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_CANCELLED',
+    )
+    assert.ok(Date.now() - t0 < 900, `took ${Date.now() - t0}ms`)
+  })
+
+  it('status retries stop at the job deadline', async () => {
+    let t = 0
+    const failures = new Map([['status', Array(4).fill('BOX_EXEC_HTTP_417')]])
+    const { exec, calls } = relayFake(Buffer.alloc(10, 1), failures)
+    const dest = await mkdtemp(join(tmpdir(), 'muse-box-exec-retry-'))
+    await assert.rejects(
+      runBoxExecVideoJob({
+        exec,
+        spec: spec(),
+        destDir: dest,
+        pollMs: 1,
+        now: () => t,
+        retrySleep: async (ms) => {
+          t += ms + 6 * 60_000 // jump past the native deadline
+        },
+      }),
+      /BOX_EXEC_HTTP_417|MUSE_TIMEOUT/,
+    )
+    assert.ok(calls.filter((c) => c[0] === 'status').length <= 2)
   })
 })

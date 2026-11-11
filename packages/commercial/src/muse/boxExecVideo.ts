@@ -28,15 +28,35 @@ export const BOX_EXEC_POLL_MS = 5_000
 /** Backoff for idempotent read-only relay calls (status, fetch-chunk) after a transient Box Exec failure. */
 export const BOX_EXEC_READ_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000]
 
-type RetrySleep = (ms: number) => Promise<void>
-const defaultRetrySleep: RetrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+/** Total read retries one job may spend (status + every fetch-chunk), so a flapping Box cannot stall it for long. */
+export const BOX_EXEC_READ_RETRY_BUDGET = 8
+
+type RetrySleep = (ms: number, signal?: AbortSignal) => Promise<void>
+const defaultRetrySleep: RetrySleep = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve()
+    const timer = setTimeout(done, ms)
+    function done() {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    signal?.addEventListener('abort', done, { once: true })
+  })
 
 const NON_TRANSIENT_BOX_EXEC_CODES = new Set([
   'BOX_EXEC_REQUEST_INVALID',
   'BOX_EXEC_REQUEST_TOO_LARGE',
   'BOX_EXEC_TARGET_INVALID',
   'BOX_EXEC_RESPONSE_TOO_LARGE',
+  // The job is pinned to one Box after its first call; a guard/egress change will not heal by retrying.
+  'BOX_EXEC_ACCOUNT_GUARD_FAILED',
+  'BOX_EGRESS_CHANGED',
+  'BOX_EXEC_ABORTED',
+  'BOX_EXEC_CANCELLED',
 ])
+/** HTTP 4xx from the Exec service is permanent except these (timeout, the observed 417, too-early, rate limit). */
+const TRANSIENT_BOX_EXEC_HTTP_4XX = new Set(['408', '417', '425', '429'])
 
 /**
  * A Box Exec transport failure (HTTP status from the Exec service, broken stream, remote exit)
@@ -52,9 +72,23 @@ export function isTransientBoxExecReadError(err: unknown, signal?: AbortSignal):
       ? String((err as { code?: unknown }).code ?? '')
       : ''
   const message = err instanceof Error ? err.message : String(err ?? '')
-  const match = /\b(BOX_EXEC_[A-Z0-9_]+|BOX_EGRESS_[A-Z0-9_]+)\b/.exec(`${code} ${message}`)
-  if (!match) return false
-  return !NON_TRANSIENT_BOX_EXEC_CODES.has(match[1]!)
+  const codes = [
+    ...`${code} ${message}`.matchAll(/\b(BOX_EXEC_[A-Z0-9_]+|BOX_EGRESS_[A-Z0-9_]+)\b/g),
+  ].map((m) => m[1]!)
+  if (codes.length === 0) return false
+  return codes.every((c) => {
+    if (NON_TRANSIENT_BOX_EXEC_CODES.has(c)) return false
+    const http = /^BOX_EXEC_HTTP_(4\d\d)$/.exec(c)
+    return !http || TRANSIENT_BOX_EXEC_HTTP_4XX.has(http[1]!)
+  })
+}
+
+export interface ReadRetryBudget {
+  left: number
+}
+
+export function newReadRetryBudget(): ReadRetryBudget {
+  return { left: BOX_EXEC_READ_RETRY_BUDGET }
 }
 
 export function parseMuseVideoBackend(raw: string | undefined): MuseVideoBackend {
@@ -221,14 +255,19 @@ async function runCliRead(
   args: string[],
   opts: { timeoutMs: number; maxResponseBytes?: number; signal?: AbortSignal },
   sleep: RetrySleep = defaultRetrySleep,
+  budget: ReadRetryBudget = newReadRetryBudget(),
+  retryUntil?: { deadline: number; now: () => number },
 ): Promise<Record<string, unknown>> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await runCli(exec, args, opts)
     } catch (err) {
       const delay = BOX_EXEC_READ_RETRY_DELAYS_MS[attempt]
-      if (delay === undefined || !isTransientBoxExecReadError(err, opts.signal)) throw err
-      await sleep(delay)
+      if (delay === undefined || budget.left <= 0 || !isTransientBoxExecReadError(err, opts.signal))
+        throw err
+      if (retryUntil && retryUntil.now() + delay > retryUntil.deadline) throw err
+      budget.left -= 1
+      await sleep(delay, opts.signal)
       if (opts.signal?.aborted) throw new MuseError(499, 'MUSE_CANCELLED', 'cancelled', false)
     }
   }
@@ -260,6 +299,7 @@ export async function downloadRelayFile(
   index: number,
   signal?: AbortSignal,
   retrySleep?: RetrySleep,
+  budget: ReadRetryBudget = newReadRetryBudget(),
 ): Promise<{ bytes: Buffer; sha256: string }> {
   const parts: Buffer[] = []
   let expected: { sha256?: string; total?: number } = {}
@@ -270,6 +310,7 @@ export async function downloadRelayFile(
       ['fetch-chunk', jobId, String(index), String(have), String(BOX_EXEC_CHUNK_BYTES)],
       { timeoutMs: 30_000, maxResponseBytes: 131_072, signal },
       retrySleep,
+      budget,
     )
     const data = Buffer.from(String(payload.data ?? ''), 'base64')
     const frame = {
@@ -345,7 +386,7 @@ export async function runBoxExecVideoJob(input: {
   now?: () => number
   pollMs?: number
   /** Test hook for the read-retry backoff. */
-  retrySleep?: (ms: number) => Promise<void>
+  retrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   signal?: AbortSignal
   onSubmitted?: (relayJobId: string) => void
   /** Called right before the submit call leaves: from here on the relay may hold the job. */
@@ -375,6 +416,7 @@ export async function runBoxExecVideoJob(input: {
   input.onSubmitted?.(jobId)
   try {
     const deadline = (input.now ?? Date.now)() + boxExecDeadlineMs(input.spec)
+    const budget = newReadRetryBudget()
     const pollMs = input.pollMs ?? BOX_EXEC_POLL_MS
     let status = String(submitted.status ?? 'queued')
     let last: Record<string, unknown> = submitted
@@ -394,6 +436,8 @@ export async function runBoxExecVideoJob(input: {
         ['status', jobId],
         { timeoutMs: 20_000, signal: input.signal },
         input.retrySleep,
+        budget,
+        { deadline, now: input.now ?? Date.now },
       )
       status = String(last.status ?? '')
     }
@@ -411,6 +455,7 @@ export async function runBoxExecVideoJob(input: {
         idx,
         input.signal,
         input.retrySleep,
+        budget,
       )
       const filename = `${idx}.mp4`
       const path = join(input.destDir, `${idx}.bin`)

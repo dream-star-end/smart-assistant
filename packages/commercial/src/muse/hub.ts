@@ -187,7 +187,7 @@ export interface MuseBridgeHubOptions {
   boxExecRunner?: () => Promise<BoxCliExecFn>
   boxExecPollMs?: number
   /** Backoff sleep for retried read-only relay calls (tests pass an instant one). */
-  boxExecRetrySleep?: (ms: number) => Promise<void>
+  boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 interface Session {
@@ -239,7 +239,7 @@ export class MuseBridgeHub {
   private readonly fallbackHatch: boolean
   private readonly boxExecRunner?: () => Promise<BoxCliExecFn>
   private readonly boxExecPollMs: number
-  private readonly boxExecRetrySleep?: (ms: number) => Promise<void>
+  private readonly boxExecRetrySleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   private reservedBox = 0
   private readonly boxExecPending: HubJob[] = []
   private readonly boxExecInflight = new Set<HubJob>()
