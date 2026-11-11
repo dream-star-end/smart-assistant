@@ -102,3 +102,4 @@ export type {
 export * from './cc5TestModel.js'
 export * from './cc5Backend.js'
 export * from './remoteExecutionBackend.js'
+export * from './remotePool/index.js'

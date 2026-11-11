@@ -1,5 +1,13 @@
-/** Versioned remote execution identity. Legacy CC wire bytes remain unchanged. */
+/** Versioned remote execution identity. Legacy CC and Codex v1 wire bytes remain unchanged. */
 import { type Cc5ExecutionBackend, isCc5BackendAuthority, parseCc5ExecutionBackend } from './cc5Backend.js'
+import {
+  REMOTE_DRIVER_BACKEND,
+  type RemoteDriverExecutionBackend,
+  isRemoteDriverBackendAuthority,
+  parseRemoteDriverExecutionBackend,
+  sameRemoteDriverExecutionBackend,
+} from './remotePool/backend.js'
+
 export const CODEX_REMOTE_BACKEND = 'codex-app-server-v1' as const
 export interface CodexExecutionBackend {
   readonly kind: typeof CODEX_REMOTE_BACKEND
@@ -10,7 +18,11 @@ export interface CodexExecutionBackend {
   readonly profileId: string
   readonly authEpoch: string
 }
-export type RemoteExecutionBackend = Cc5ExecutionBackend | CodexExecutionBackend
+export type RemoteExecutionBackend =
+  | Cc5ExecutionBackend
+  | CodexExecutionBackend
+  | RemoteDriverExecutionBackend
+
 export function parseCodexExecutionBackend(raw: unknown): CodexExecutionBackend {
   const b = raw as CodexExecutionBackend
   if (!b || typeof b !== 'object' || Array.isArray(b) ||
@@ -25,11 +37,14 @@ export function parseCodexExecutionBackend(raw: unknown): CodexExecutionBackend 
   return Object.freeze({ ...b })
 }
 export function parseRemoteExecutionBackend(raw: unknown): RemoteExecutionBackend {
-  return (raw as { kind?: unknown })?.kind === CODEX_REMOTE_BACKEND
-    ? parseCodexExecutionBackend(raw) : parseCc5ExecutionBackend(raw)
+  const kind = (raw as { kind?: unknown })?.kind
+  if (kind === REMOTE_DRIVER_BACKEND) return parseRemoteDriverExecutionBackend(raw)
+  if (kind === CODEX_REMOTE_BACKEND) return parseCodexExecutionBackend(raw)
+  return parseCc5ExecutionBackend(raw)
 }
 export function isRemoteBackendAuthority(raw: unknown): boolean {
   if (isCc5BackendAuthority(raw)) return true
+  if (isRemoteDriverBackendAuthority(raw)) return true
   const a = raw as { engine?: unknown; canonicalModel?: unknown; executionBackend?: unknown }
   try {
     return a?.engine === 'codex' && typeof a.canonicalModel === 'string' &&
@@ -39,7 +54,11 @@ export function isRemoteBackendAuthority(raw: unknown): boolean {
 export function sameRemoteExecutionBackend(a: RemoteExecutionBackend | undefined, b: RemoteExecutionBackend | undefined): boolean {
   if (!a || !b) return a === b
   const x = parseRemoteExecutionBackend(a), y = parseRemoteExecutionBackend(b)
-  return x.kind === y.kind && x.sessionKey === y.sessionKey && x.operationId === y.operationId &&
+  if (x.kind !== y.kind) return false
+  if (x.kind === REMOTE_DRIVER_BACKEND && y.kind === REMOTE_DRIVER_BACKEND) {
+    return sameRemoteDriverExecutionBackend(x, y)
+  }
+  return x.sessionKey === y.sessionKey && x.operationId === y.operationId &&
     (x.kind !== CODEX_REMOTE_BACKEND || y.kind === CODEX_REMOTE_BACKEND &&
       x.generation === y.generation && x.profileId === y.profileId && x.authEpoch === y.authEpoch)
 }
