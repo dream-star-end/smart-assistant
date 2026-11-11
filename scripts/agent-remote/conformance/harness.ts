@@ -620,11 +620,14 @@ export async function createConformanceHarness(
       }),
     )
   }
+  await Promise.all(idleRealHosts.map((ph) => ph.tools()))
 
   const acquirePooledRealHost = (env: NodeJS.ProcessEnv): Cc5ToolHost => {
     const existing = idleRealHosts.pop() ?? spawnPooledRealHost(env)
     if (!closingHarness && idleRealHosts.length < 2) {
-      idleRealHosts.push(spawnPooledRealHost(env))
+      const replacement = spawnPooledRealHost(env)
+      void replacement.tools().catch(() => {})
+      idleRealHosts.push(replacement)
     }
     return existing
   }

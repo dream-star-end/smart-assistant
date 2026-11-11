@@ -1130,8 +1130,8 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
   ])
 
   const [aArrived, bArrived] = await Promise.all([
-    waitForFile(arriveA, 8_000),
-    waitForFile(arriveB, 8_000),
+    waitForFile(arriveA, 15_000),
+    waitForFile(arriveB, 15_000),
   ])
   assert.equal(aArrived && bArrived, true, 'Both same-account sessions MUST execute simultaneously at barrier')
   writeFileSync(releaseBoth, 'go', 'utf8')
