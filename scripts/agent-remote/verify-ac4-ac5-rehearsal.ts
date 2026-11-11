@@ -28,8 +28,8 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
@@ -44,13 +44,39 @@ import {
 } from '../../packages/gateway/src/remotePool/index.js'
 import {
   RemoteReleaseDrainCoordinator,
+  claimDriverVerificationRun,
+  completeDriverVerificationRun,
   placeRemoteDriverLane,
+  recordDriverProbeSnapshot,
   recordRemoteDriverLaneState,
 } from '../../packages/commercial/src/account-pool/remotePool/index.js'
-import {
-  createAsyncBarrier,
-  createConformanceHarness,
-} from './conformance/harness.js'
+import { createConformanceHarness } from './conformance/harness.js'
+
+function createAsyncBarrier(): {
+  barrier: {
+    onArrive: () => void
+    waitRelease: Promise<void>
+  }
+  waitArrived: Promise<void>
+  release: () => void
+} {
+  let resolveArrived!: () => void
+  let resolveRelease!: () => void
+  const waitArrived = new Promise<void>((r) => {
+    resolveArrived = r
+  })
+  const waitRelease = new Promise<void>((r) => {
+    resolveRelease = r
+  })
+  return {
+    barrier: {
+      onArrive: () => resolveArrived(),
+      waitRelease,
+    },
+    waitArrived,
+    release: () => resolveRelease(),
+  }
+}
 
 const THIS_DIR = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(THIS_DIR, '../..')
@@ -64,15 +90,16 @@ function percentile(sorted: readonly number[], p: number): number {
 async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterations = 50) {
   const worker = new DriverWorkerClient()
   try {
-    const info = await worker.driverInfo(driverId)
+    const info = await worker.info(driverId)
     const samplesMs: number[] = []
-    // Warm up Python IPC worker once before sampling
-    await worker.driverInfo(driverId)
-
-    for (let i = 0; i < iterations; i++) {
+    // Warm up Python IPC worker + V8 JIT + Ajv schema validator for 5 full turns before sampling
+    const warmupTurns = 5
+    for (let step = -warmupTurns; step < iterations; step++) {
+      const i = step < 0 ? 10_000 + Math.abs(step) : step
       const opId = randomUUID()
       const callId = `call_bench_${driverId}_${i}`
-      const sessId = `sess_bench_${driverId}_${i}`
+      const sessId = randomUUID()
+      const turnId = `turn_${i}`
       const toolArgs = { file_path: `/tmp/bench-${i}.txt`, content: `hello-${i}` }
       const argsHash = remoteCanonicalSha256(toolArgs)
       const scope = {
@@ -103,10 +130,10 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
               },
             })
           : JSON.stringify({
-              method: 'item/completed',
+              method: 'item/started',
               params: {
                 threadId: sessId,
-                turnId: `turn_${i}`,
+                turnId,
                 item: {
                   type: 'mcpToolCall',
                   id: callId,
@@ -127,8 +154,12 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
           arguments: toolArgs,
           _meta:
             driverId === 'cc'
-              ? { claudeCode: { toolUseId: callId }, sessionId: sessId }
-              : { codex: { callId, threadId: sessId, turnId: `turn_${i}` } },
+              ? { 'claudecode/toolUseId': callId }
+              : {
+                  callId,
+                  threadId: sessId,
+                  'x-codex-turn-metadata': { turn_id: turnId },
+                },
         },
       })
 
@@ -138,6 +169,7 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
               type: 'result',
               subtype: 'success',
               is_error: false,
+              uuid: `res_uuid_${i}`,
               session_id: sessId,
               result: 'DONE',
               usage: {
@@ -151,7 +183,7 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
               method: 'turn/completed',
               params: {
                 threadId: sessId,
-                turn: { id: `turn_${i}`, status: 'completed' },
+                turn: { id: turnId, status: 'completed' },
               },
             })
 
@@ -159,18 +191,27 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
       gate.beginTurn()
       const enc = await worker.encode(
         driverId,
-        { kind: 'userTurn', prompt: 'bench', turnKey: 'a'.repeat(64) },
-        driverId === 'codex' ? { threadId: sessId, turnSeq: i } : { sessionId: sessId },
+        driverId === 'codex'
+          ? { kind: 'newTurn', commandId: `cmd_${i}`, prompt: 'bench', model: 'gpt-6-luna' }
+          : { kind: 'newTurn', commandId: `cmd_${i}`, prompt: 'bench' },
+        driverId === 'codex'
+          ? { initialized: true, sessionId: sessId, expectedModel: 'gpt-6-luna' }
+          : { initialized: true, sessionId: sessId },
       )
+      const stateAfterTurnStart =
+        driverId === 'codex'
+          ? { ...enc.nextNativeState, activeTurnId: turnId }
+          : enc.nextNativeState
       const dec1 = await worker.decode(driverId, {
         channel: 'native',
         frameSeq: 1,
         rawBytes: nativeToolFrame,
-        nativeState: enc.nextNativeState,
+        nativeState: stateAfterTurnStart,
         envelope: {
           ...scope,
           authorityTurnId: `auth_${i}`,
           nativeSessionId: sessId,
+          ...(driverId === 'codex' ? { nativeTurnId: turnId } : {}),
         },
         eventSeqStart: 1,
       })
@@ -188,6 +229,7 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
           ...scope,
           authorityTurnId: `auth_${i}`,
           nativeSessionId: sessId,
+          ...(driverId === 'codex' ? { nativeTurnId: turnId } : {}),
         },
         eventSeqStart: seq,
       })
@@ -201,43 +243,48 @@ async function measureDriverSchedulingOverhead(driverId: 'cc' | 'codex', iterati
         channel: 'native',
         frameSeq: 3,
         rawBytes: terminalFrame,
-        nativeState:
-          driverId === 'codex'
-            ? {
-                ...decMcp.nextNativeState,
-                latestTotalUsage: {
-                  inputTokens: 150,
-                  cachedInputTokens: 20,
-                  outputTokens: 35,
-                  reasoningOutputTokens: 5,
-                },
-              }
-            : decMcp.nextNativeState,
+        nativeState: decMcp.nextNativeState,
         envelope: {
           ...scope,
           authorityTurnId: `auth_${i}`,
           nativeSessionId: sessId,
+          ...(driverId === 'codex' ? { nativeTurnId: turnId } : {}),
         },
         eventSeqStart: seq,
       })
       for (const ev of decTerm.securityEvents) {
         gate.ingestSecurityEvent(ev)
       }
-      const zero = zeroCountersForUsagePolicy(info.usagePolicy)
-      normalizeUsageWithPolicy(
-        info.usagePolicy,
-        {
-          inputTokens: 150n,
-          outputTokens: 35n,
-          cachedInputTokens: 20n,
-          cacheCreationInputTokens: 0n,
-          reasoningOutputTokens: 5n,
-        },
-        zero,
-      )
+      if (driverId === 'cc') {
+        normalizeUsageWithPolicy(
+          info.usagePolicy,
+          {
+            input_tokens: 150,
+            output_tokens: 35,
+            cache_read_input_tokens: 20,
+            cache_creation_input_tokens: 0,
+          },
+          null,
+        )
+      } else {
+        const zero = zeroCountersForUsagePolicy(info.usagePolicy)
+        normalizeUsageWithPolicy(
+          info.usagePolicy,
+          {
+            inputTokens: 150,
+            outputTokens: 35,
+            cachedInputTokens: 20,
+            cacheWriteInputTokens: 0,
+            reasoningOutputTokens: 5,
+          },
+          zero,
+        )
+      }
       gate.endTurn()
       const elapsed = performance.now() - t0
-      samplesMs.push(elapsed)
+      if (step >= 0) {
+        samplesMs.push(elapsed)
+      }
     }
 
     const sorted = [...samplesMs].sort((a, b) => a - b)
@@ -268,23 +315,43 @@ function runLegacyBaselineSuites() {
     {
       name: 'python-legacy-cc5-codex-core',
       cmd: [
-        'python3 -I -B scripts/agent-remote/test-cc5-fixed-mcp.py',
-        'python3 -I -B scripts/agent-remote/test-cc5-host-controller.py',
-        'python3 -I -B scripts/agent-remote/test-cc5-mcp-socket.py',
-        'python3 -I -B scripts/agent-remote/test-cc5-ssh-guard.py',
-        'python3 -I -B scripts/agent-remote/test-codex-install-transaction.py',
-        'python3 -I -B scripts/agent-remote/test-codex-node.py',
-        'python3 -I -B scripts/agent-remote/test-codex-probe.py',
-        'python3 -I -B scripts/agent-remote/test-remote-engine-resources.py',
-      ].join(' && '),
+        'set -e',
+        'if [ "$(id -u)" = "0" ]; then',
+        '  STAGE=$(mktemp -d /tmp/oc-legacy-py-XXXXXX)',
+        '  trap "rm -rf \\"$STAGE\\"" EXIT',
+        '  chmod 0755 "$STAGE"',
+        '  mkdir -p "$STAGE/scripts" "$STAGE/packages/gateway"',
+        '  cp -a scripts/agent-remote "$STAGE/scripts/agent-remote"',
+        '  cp -a packages/gateway/box-bridge-mod "$STAGE/packages/gateway/box-bridge-mod"',
+        '  chown -R ocheal:ocheal "$STAGE"',
+        '  cd "$STAGE"',
+        '  for f in test-cc5-fixed-mcp.py test-cc5-host-controller.py test-cc5-mcp-socket.py test-cc5-ssh-guard.py test-codex-node.py test-codex-probe.py test-remote-engine-resources.py; do',
+        '    runuser -u ocheal -- env HOME=/home/ocheal TMPDIR=/tmp python3 -I -B "$STAGE/scripts/agent-remote/$f"',
+        '  done',
+        '  TMPDIR=/tmp python3 -I -B "$STAGE/scripts/agent-remote/test-codex-install-transaction.py"',
+        'else',
+        '  for f in test-cc5-fixed-mcp.py test-cc5-host-controller.py test-cc5-mcp-socket.py test-cc5-ssh-guard.py test-codex-node.py test-codex-probe.py test-remote-engine-resources.py; do',
+        '    TMPDIR=/tmp python3 -I -B "scripts/agent-remote/$f"',
+        '  done',
+        'fi',
+      ].join('\n'),
     },
     {
       name: 'gateway-legacy-cc5-codexRemote',
-      cmd: 'npx vitest run packages/gateway/src/__tests__/cc5NativeTool.test.ts packages/gateway/src/__tests__/cc5Relay.test.ts packages/gateway/src/__tests__/cc5Bridge.test.ts packages/gateway/src/__tests__/cc5SshHost.test.ts packages/gateway/src/__tests__/cc5ToolObservation.test.ts packages/gateway/src/__tests__/cc5FixedTool.test.ts packages/gateway/src/__tests__/cc5NativeUsage.test.ts packages/gateway/src/__tests__/codexRemoteRelay.test.ts packages/gateway/src/__tests__/codexRemoteAdapterE2E.test.ts packages/gateway/src/__tests__/codexRemoteSessionRestore.test.ts packages/gateway/src/__tests__/v3CodexRelay.test.ts',
+      cmd: [
+        'set -e',
+        'GW_FILES="packages/gateway/src/__tests__/cc5NativeTool.test.ts packages/gateway/src/__tests__/cc5Relay.test.ts packages/gateway/src/__tests__/cc5Bridge.test.ts packages/gateway/src/__tests__/cc5SshHost.test.ts packages/gateway/src/__tests__/cc5ToolObservation.test.ts packages/gateway/src/__tests__/cc5FixedTool.test.ts packages/gateway/src/__tests__/cc5NativeUsage.test.ts packages/gateway/src/__tests__/codexRemoteRelay.test.ts packages/gateway/src/__tests__/codexRemoteAdapterE2E.test.ts packages/gateway/src/__tests__/codexRemoteSessionRestore.test.ts packages/gateway/src/__tests__/v3CodexRelay.test.ts"',
+        'CONT_CWD="${PWD/#\\/var\\/lib\\/docker\\/volumes\\/oc-v5-data-u3\\/_data/\\/home\\/agent\\/.openclaude}"',
+        'if [ "$(id -u)" = "0" ] && command -v docker >/dev/null 2>&1 && docker inspect -f "{{.State.Running}}" oc-v5-u3 2>/dev/null | grep -qx true && [ "$CONT_CWD" != "$PWD" ]; then',
+        '  docker exec oc-v5-u3 env -u OPENCLAUDE_USER_ID -u OPENCLAUDE_CONTAINER_TOKEN -u OPENCLAUDE_AGENT_ID -u OC_AGENT_ID -u OPENCLAUDE_SESSION_KEY bash -lc "cd \\"$CONT_CWD\\" && npx tsx --test --test-concurrency=1 $GW_FILES"',
+        'else',
+        '  env -u OPENCLAUDE_USER_ID -u OPENCLAUDE_CONTAINER_TOKEN -u OPENCLAUDE_AGENT_ID -u OC_AGENT_ID -u OPENCLAUDE_SESSION_KEY npx tsx --test --test-concurrency=1 $GW_FILES',
+        'fi',
+      ].join('\n'),
     },
     {
       name: 'commercial-legacy-remote-unit-and-integ',
-      cmd: 'npx vitest run --config packages/commercial/vitest.config.ts packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts packages/commercial/src/__tests__/codexRemoteProfile.test.ts packages/commercial/src/__tests__/remoteCodexAuth.test.ts packages/commercial/src/__tests__/remoteBrainPoolTarget.test.ts && npx vitest run --config packages/commercial/vitest.integ.config.ts packages/commercial/src/__tests__/codexRemoteMaster.integ.test.ts',
+      cmd: 'npx tsx --import ./scripts/lib/test-blocking-stdio.mjs --test --test-force-exit --test-concurrency=1 packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts packages/commercial/src/__tests__/codexRemoteProfile.test.ts packages/commercial/src/__tests__/remoteCodexAuth.test.ts packages/commercial/src/__tests__/remoteBrainPoolTarget.test.ts && npx tsx --import ./scripts/lib/test-blocking-stdio.mjs --test --test-force-exit --test-concurrency=1 --test-timeout=180000 packages/commercial/src/__tests__/codexRemoteMaster.integ.test.ts',
     },
   ]
 
@@ -345,7 +412,10 @@ function verifyLiveConformanceEvidence(dirPath: string, expectedDriver: 'cc' | '
       g4.requirements?.every(
         (r: any) => r.greenPassed === true && r.redControlCaught === true,
       ) === true,
-    group4StopEvidenceSample: g4.requirements?.[1]?.greenDetails?.stopProof ?? null,
+    group4StopEvidenceSample:
+      g4.requirements?.[1]?.greenDetails?.verifiedStopEvidence ??
+      g4.requirements?.[1]?.greenDetails?.stopProof ??
+      null,
     group5MultiTurnResumeAndFeeVerified: g5.requirements?.[0]?.greenPassed === true,
     group5TurnSettlementSample: g5.requirements?.[0]?.greenDetails ?? null,
   }
@@ -354,15 +424,79 @@ function verifyLiveConformanceEvidence(dirPath: string, expectedDriver: 'cc' | '
 async function runAc5Rehearsals() {
   const h = await createConformanceHarness('codex', { mode: 'sandbox' })
   try {
+    // Enable persistent per-thread rollout state in sandbox `CODEX_HOME` so g1 -> g2
+    // OS-process generation upgrade resumes exact cumulative counters & turn_seq.
+    const origCliFile = join(h.sandbox, 'codex-conformance-cli')
+    const statefulCliFile = join(h.sandbox, 'codex-stateful-cli')
+    const origCli = readFileSync(origCliFile, 'utf8')
+    const statefulCli = origCli
+      .replace(
+        `    elif method in ("thread/start", "thread/resume"):
+        if method == "thread/resume" and msg.get("params", {}).get("threadId"):
+            thread_id = msg["params"]["threadId"]`,
+        `    elif method in ("thread/start", "thread/resume"):
+        if method == "thread/resume" and msg.get("params", {}).get("threadId"):
+            thread_id = msg["params"]["threadId"]
+            st_file = pathlib.Path(os.environ.get("CODEX_HOME", "/tmp")) / f"rollout-{thread_id}.json"
+            if st_file.exists():
+                st = json.loads(st_file.read_text(encoding="utf-8"))
+                turn_seq = st["turn_seq"]
+                cum_in = st["cum_in"]
+                cum_cached = st["cum_cached"]
+                cum_out = st["cum_out"]
+                cum_reason = st["cum_reason"]`,
+      )
+      .replace(
+        `        cum_in += 1000000
+        cum_cached += 400000
+        cum_out += 250000
+        cum_reason += 100000`,
+        `        cum_in += 1000000
+        cum_cached += 400000
+        cum_out += 250000
+        cum_reason += 100000
+        st_file = pathlib.Path(os.environ.get("CODEX_HOME", "/tmp")) / f"rollout-{thread_id}.json"
+        st_file.write_text(json.dumps({"turn_seq": turn_seq, "cum_in": cum_in, "cum_cached": cum_cached, "cum_out": cum_out, "cum_reason": cum_reason}), encoding="utf-8")`,
+      )
+    assert.notEqual(statefulCli, origCli, 'Expected stateful rollout patch in codex sandbox CLI')
+    writeFileSync(statefulCliFile, statefulCli, { mode: 0o500 })
+    chmodSync(statefulCliFile, 0o500)
+    const newCliSha = createHash('sha256').update(readFileSync(statefulCliFile)).digest('hex')
+    const updatedSnap = {
+      ...h.probedSnapshot,
+      cliSha256: newCliSha,
+      ...(h.probedSnapshot.nativeSha256 ? { nativeSha256: newCliSha } : {}),
+    }
+    const obs = await recordDriverProbeSnapshot(h.pool, {
+      profileId: h.profileId,
+      snapshot: updatedSnap,
+      policySha256: h.expectedPolicySha256,
+    })
+    assert.ok(obs.verificationRunId)
+    const claimed = await claimDriverVerificationRun(h.pool, {
+      leaseOwner: 'ac5-rehearsal-init',
+      profileId: h.profileId,
+    })
+    assert.ok(claimed)
+    const completed = await completeDriverVerificationRun(h.pool, {
+      runId: claimed.id,
+      leaseOwner: 'ac5-rehearsal-init',
+      outcome: 'passed',
+      evidenceDigest: obs.fingerprint,
+    })
+    assert.equal(completed.executionReadyRestored, true)
+    const statefulCtx = { cliPath: statefulCliFile, nativePath: statefulCliFile }
+
     // -------------------------------------------------------------------------
     // Rehearsal 1: In-flight turn triggers R1 drain & waits without killing g1
     // -------------------------------------------------------------------------
-    const sessionKey = `sess-ac5-cutover-${randomUUID().slice(0, 8)}`
+    const sessionKey = `agent:main:webchat:dm:ac5_cutover_${randomUUID().slice(0, 8)}`
     const syncBarrier = createAsyncBarrier()
     const g1 = await h.openLane({
       sessionKey,
       dedicatedToolHost: true,
       toolExecutionBarrier: syncBarrier.barrier,
+      extraDriverContext: statefulCtx,
     })
     assert.equal(g1.placed.generation, '1')
 
@@ -421,7 +555,7 @@ async function runAc5Rehearsals() {
           uid: h.uid,
           containerDbId: '7',
           dockerId: 'd'.repeat(64),
-          sessionKey: `sess-new-during-drain-${randomUUID().slice(0, 8)}`,
+          sessionKey: `agent:main:webchat:dm:ac5_new_drain_${randomUUID().slice(0, 8)}`,
           canonicalModel: h.canonicalModel,
           driverId: h.driverId,
           driverContext: {},
@@ -477,14 +611,27 @@ async function runAc5Rehearsals() {
     assert.equal(relRow.rows[0]?.state, 'released')
     assert.equal(relRow.rows[0]?.native_session_id, g1NativeSessionId)
 
-    const g2 = await h.openLane({ sessionKey, dedicatedToolHost: true })
+    const g2 = await h.openLane({
+      sessionKey,
+      dedicatedToolHost: true,
+      extraDriverContext: statefulCtx,
+    })
     assert.equal(g2.placed.binding.operationId, opId)
     assert.equal(g2.placed.generation, '2')
     assert.equal(g2.placed.spec.manifest.nativeSessionId, g1NativeSessionId)
 
-    // Stale generation state update for g1 must be fenced (returns false)
-    const staleGenAccepted = await recordRemoteDriverLaneState(opId, '1', 'running', h.pool)
-    assert.equal(staleGenAccepted, false)
+    // Stale generation state update for g1 must be fenced with REMOTE_LANE_GENERATION_FENCED
+    let staleGenerationFenced = false
+    try {
+      await recordRemoteDriverLaneState(opId, '1', 'running', h.pool)
+    } catch (err) {
+      if (err instanceof Error && err.message === 'REMOTE_LANE_GENERATION_FENCED') {
+        staleGenerationFenced = true
+      } else {
+        throw err
+      }
+    }
+    assert.equal(staleGenerationFenced, true)
 
     const sentinel2Path = join(g2.containerCwd, 'ac5-g2-sentinel.txt')
     const sentinel2Body = `ac5-gen2-${randomUUID()}`
@@ -492,7 +639,7 @@ async function runAc5Rehearsals() {
     await turn2.run.summary
     assert.equal(readFileSync(sentinel2Path, 'utf8'), sentinel2Body)
     assert.equal(g2.settledReceipts.length, 1)
-    assert.equal(g2.settledReceipts[0].generation, '2')
+    assert.equal(g2.settledReceipts[0].provenance.generation, '2')
     assert.equal(g2.settledReceipts[0].nativeSessionId, g1NativeSessionId)
     const creditsAfterG2 = await h.getUserCredits()
     const g2ChargedFen = creditsAfterG1 - creditsAfterG2
@@ -502,12 +649,13 @@ async function runAc5Rehearsals() {
     // -------------------------------------------------------------------------
     // Rehearsal 3: Disconnect / crash spool recovery (dual-read v3 + v4, zero replay)
     // -------------------------------------------------------------------------
-    const crashSessionKey = `sess-ac5-crash-${randomUUID().slice(0, 8)}`
+    const crashSessionKey = `agent:main:webchat:dm:ac5_crash_${randomUUID().slice(0, 8)}`
     const failOnce = { active: true }
     const crashLane = await h.openLane({
       sessionKey: crashSessionKey,
       dedicatedToolHost: true,
       failTurnInsertOnce: failOnce,
+      extraDriverContext: statefulCtx,
     })
     const sentinel3Path = join(crashLane.containerCwd, 'ac5-crash-sentinel.txt')
     const sentinel3Body = `ac5-crash-${randomUUID()}`
@@ -569,7 +717,7 @@ async function runAc5Rehearsals() {
         upgradedFromGeneration: '1',
         upgradedToGeneration: '2',
         preservedNativeSessionId: g1NativeSessionId,
-        staleGenerationFenced: !staleGenAccepted,
+        staleGenerationFenced,
         settledCreditsFen: g2ChargedFen.toString(),
       },
       rehearsal3CrashSpoolRecovery: {
@@ -604,8 +752,8 @@ async function main() {
     else throw new Error(`Unknown argument: ${a}`)
   }
 
-  const ccOverhead = await measureDriverSchedulingOverhead('cc', 50)
-  const codexOverhead = await measureDriverSchedulingOverhead('codex', 50)
+  const ccOverhead = await measureDriverSchedulingOverhead('cc', 200)
+  const codexOverhead = await measureDriverSchedulingOverhead('codex', 200)
   const ac5 = await runAc5Rehearsals()
   const legacyBaseline = runLegacyBaseline ? runLegacyBaselineSuites() : null
   const liveParity =
