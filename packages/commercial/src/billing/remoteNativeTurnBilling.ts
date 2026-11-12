@@ -23,7 +23,8 @@ import type { Logger } from '../logging/logger.js'
 import { computeCost, type TokenUsage } from './calculator.js'
 import type { CatalogSource } from '../http/proxy/modelAuthorityGate.js'
 import { parseBillingPricing, serializeBillingPricing, type PersistedBillingPricingV1 } from './persistedBillingPricing.js'
-import { CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
+import { CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION, REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
+import { createRemoteDriverTurnFinance, recoverRemoteDriverTurnBilling } from './remoteDriverTurnBilling.js'
 import {
   preCheckWithCost, releasePreCheck, type PreCheckRedis, type ReservationHandle,
 } from './preCheck.js'
@@ -391,7 +392,13 @@ export function createRemoteNativeTurnFinance(
   const claimedTurns = new Set<string>()
   const activeOperations = new Map<string, string>()
   const now = deps.now ?? Date.now
-  return { async admit(input) {
+  let v4Port: ReturnType<typeof createRemoteDriverTurnFinance> | undefined
+  return {
+    admitV4(input) {
+      v4Port ??= createRemoteDriverTurnFinance(deps, fixtures)
+      return v4Port.admit(input)
+    },
+    async admit(input) {
     const scope = scopeOf(input.binding, deps.upstreamModel)
     need(scope.expiresAt > now() && input.sessionKey === scope.sessionKey && HASH.test(input.turnKey))
     const keys = typeof deps.keyring === 'function' ? deps.keyring() : deps.keyring
@@ -689,16 +696,17 @@ export async function recoverRemoteNativeTurnBilling(
   options: { limit?: number; settle?: typeof settleUsageAndLedger; evidenceRoot?: string } = {},
 ): Promise<{ proven: number; pending: number }> {
   const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 25)))
-  const rows = (await deps.pool.query<JournalRow & { request_id: string; user_id: string }>(
+  const allRows = (await deps.pool.query<JournalRow & { request_id: string; user_id: string }>(
     `/* remote-native:recovery-scan */ SELECT request_id,user_id::text,state,ctx,updated_at
      FROM request_finalize_journal WHERE ctx->>'remoteNativeBillingRecovery'=ANY($1::text[])
        AND (state IN ('inflight','finalizing') OR (state='committed' AND EXISTS (
          SELECT 1 FROM remote_native_threads t WHERE t.uid=user_id AND t.pending_request_id=request_id)))
-       AND (ctx#>'{remoteNative,receipt}'<>'null'::jsonb OR ctx->>'remoteNativeBillingRecovery'='remote-native-v2')
-     ORDER BY updated_at ASC LIMIT $2`, [[REMOTE_NATIVE_BILLING_RECOVERY_VERSION, CODEX_REMOTE_BILLING_RECOVERY_VERSION], limit])).rows
+       AND (ctx#>'{remoteNative,receipt}'<>'null'::jsonb OR ctx->>'remoteNativeBillingRecovery'=ANY('{remote-native-v2,remote-native-v4}'::text[]))
+     ORDER BY updated_at ASC LIMIT $2`, [[REMOTE_NATIVE_BILLING_RECOVERY_VERSION, CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION], limit])).rows
+  const v4Rows = allRows.filter((r) => r.ctx?.remoteNativeBillingRecovery === REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION)
   let proven = 0
   let pending = 0
-  for (const row of rows) {
+  for (const row of allRows.filter((r) => r.ctx?.remoteNativeBillingRecovery !== REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION)) {
     try {
       const c = parseContext(row.ctx.remoteNative)
       need(c.requestId === row.request_id && c.scope.uid === row.user_id)
@@ -744,5 +752,6 @@ export async function recoverRemoteNativeTurnBilling(
       deps.log.warn('remote_native_billing_recovery_pending', {})
     }
   }
-  return { proven, pending }
+  const v4 = v4Rows.length ? await recoverRemoteDriverTurnBilling(deps, { ...options, preloadedRows: v4Rows }) : { proven: 0, pending: 0 }
+  return { proven: proven + v4.proven, pending: pending + v4.pending }
 }

@@ -33,6 +33,7 @@ import {
   type AuthorityKeyring,
   type RemoteExecutionBackend,
   parseRemoteExecutionBackend,
+  REMOTE_DRIVER_BACKEND,
   CC5_INTERACTIVE_BACKEND,
   CC5_TEST_UID_ENV,
   type Cc5PolicyEnvironment,
@@ -45,6 +46,14 @@ import type { RemoteFinanceFactory } from './remoteFinance.js'
 import { codexBackend, type RemoteBridgeBinding, type CodexRemoteBinding, codexJsonHash } from './codexRemoteContract.js'
 import { CodexSshHost, type CodexLaneSpec } from './codexRemoteHost.js'
 import { CodexRemoteRelay } from './codexRemoteRelay.js'
+import {
+  RemotePoolRelay,
+  RemotePoolSshHost,
+  remotePoolBackendOf,
+  type RemotePoolBinding,
+  type RemotePoolFinancePort,
+  type RemotePoolLaneSpec,
+} from './remotePool/index.js'
 export { CodexSshHost, type CodexLaneSpec } from './codexRemoteHost.js'
 export { Cc5SshHost } from './cc5SshHost.js'
 import { CC5_BINDING_SLIDING_TTL_MS, CC5_MOUNT, type Cc5BridgeBinding } from './cc5BridgePort.js'
@@ -108,6 +117,12 @@ export interface Cc5PreparedContainer {
   readonly containerDbId: string
 }
 
+export interface RemoteDriverV4LanePlacement {
+  readonly binding: Readonly<RemotePoolBinding>
+  readonly spec: RemotePoolLaneSpec
+  readonly sshTarget: Readonly<RemoteCcTarget>
+}
+
 /** Where one chat runs, decided by the master's pool scheduler for this lane. */
 export interface RemoteLanePlacement {
   readonly target: Readonly<RemoteCcTarget>
@@ -119,6 +134,7 @@ export interface RemoteLanePlacement {
   readonly provisionPacket: Buffer
   readonly generation?: string
   readonly codex?: CodexLaneSpec
+  readonly v4?: RemoteDriverV4LanePlacement
   /** The pool profile whose slot this lane holds. */
   readonly profileId?: string
 }
@@ -132,9 +148,10 @@ export interface RemoteLaneRequest {
 export type RemoteLaneState = 'running' | 'released' | 'unknown'
 export interface RemoteLaneHooks {
   place(request: RemoteLaneRequest & { readonly dockerId: string }): Promise<RemoteLanePlacement>
-  onState?(operationId: string, state: RemoteLaneState, generation?: string): void | Promise<void>
-  onNativeThread?(operationId: string, generation: string, nativeThreadId: string): Promise<void>
-  onRemoteStart?(operationId: string, generation: string): Promise<void>
+  onState?(operationId: string, state: RemoteLaneState, generation?: string, isV4?: boolean): void | Promise<void>
+  onNativeThread?(operationId: string, generation: string, nativeThreadId: string, isV4?: boolean): Promise<void>
+  onRemoteStart?(operationId: string, generation: string, isV4?: boolean): Promise<void>
+  registerDrainRelay?(id: string, relay: { readonly idle: boolean }): () => void
 }
 export type RemoteLaneHost = Cc5InteractiveHostPort & { prepareTask(packet: Buffer): Promise<void> }
 
@@ -172,8 +189,10 @@ interface Lane {
   readonly dir: string
   readonly view: string
   readonly generation: string
-  readonly relay: Cc5Relay | CodexRemoteRelay
-  binding: Readonly<RemoteBridgeBinding>
+  readonly relay: Cc5Relay | CodexRemoteRelay | RemotePoolRelay
+  binding: Readonly<RemoteBridgeBinding | RemotePoolBinding>
+  readonly isV4?: boolean
+  unregisterDrain?: () => void
   stopping?: Promise<void>
   lastUsedAt: number
   /** Preparation may reset/provision remotely before the relay attempts a model launch. */
@@ -326,7 +345,9 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     const live = (lane: Lane | undefined): lane is Lane => !!lane && lane.container === container &&
       !lane.creationFailed && !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
       lane.binding.expiresAt > Date.now() &&
-      (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1')
+      (lane.binding.version === 4
+        ? lane.binding.authorityEngine === (request.engine === 'codex' ? 'codex' : 'ccb')
+        : (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1'))
     // A resident lane answers without waiting; anything else is decided on the chat's tail.
     let lane = owner.lane
     if (!live(lane)) {
@@ -350,7 +371,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
             await this.stopLane(next) // Released while the node was being prepared.
             requireLane(false)
           }
-          try { await this.hooks.onState?.(next.operationId, 'running', next.generation) }
+          try { await this.hooks.onState?.(next.operationId, 'running', next.generation, next.isV4) }
           catch (error) {
             try { await this.stopLane(next) } catch { owner.lane = next } // retain only a fenced lane for proof retry
             throw error
@@ -358,14 +379,18 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
           owner.lane = next
           return next
         } catch (error) {
-          // Node memory admission is a true, actionable cause: keep its label and session count.
+          // Node memory admission & explicit R1 drain / drift reverify are actionable causes.
           if (error instanceof Error &&
-            (error.message === REMOTE_LANE_UNAVAILABLE || memoryRejection(error) !== undefined)) throw error
+            (error.message === REMOTE_LANE_UNAVAILABLE ||
+              error.message === 'REMOTE_POOL_DRAINING_RETRY_LATER' ||
+              error.message === 'REMOTE_DRIVER_REVERIFY_REQUIRED' ||
+              memoryRejection(error) !== undefined)) throw error
           throw new Error(REMOTE_LANE_UNAVAILABLE, { cause: error })
         }
       })
     }
     lane.lastUsedAt = Date.now()
+    if (lane.binding.version === 4) return remotePoolBackendOf(lane.binding)
     if (lane.binding.version === 3) return codexBackend(lane.binding)
     return parseCc5ExecutionBackend({ kind: CC5_INTERACTIVE_BACKEND, sessionKey: lane.sessionKey,
       operationId: lane.operationId })
@@ -425,6 +450,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
 
   private async startLane(container: ContainerState, request: RemoteLaneRequest,
     placement: RemoteLanePlacement): Promise<Lane> {
+    if (placement.v4) return this.startDriverV4Lane(container, request, placement)
     if (request.engine === 'codex') return this.startCodexLane(container, request, placement)
     let lane: Lane | undefined
     try {
@@ -469,7 +495,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
       upstreamModel: placement.target.upstreamModel,
       onBindingExtended: (expiresAt: number) => {
-        requireLane(current && !current.stopping && existsSync(view))
+        requireLane(current && !current.stopping && existsSync(view) && current.binding.version !== 4)
         const next = Object.freeze({ ...current.binding, expiresAt })
         overwriteProtectedBinding(view, next)
         current.binding = next
@@ -477,9 +503,10 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       // A stale cached catalog replaces the remote without re-running task provisioning.
       replaceHost: () => createHost(hostConfig),
     })
+    const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation ?? '1'}`, relay)
     lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
       operationId: placement.operationId, profileId: placement.profileId, generation: placement.generation ?? '1', dir, view, binding, relay,
-      lastUsedAt: Date.now() }
+      unregisterDrain, lastUsedAt: Date.now() }
     lane.preparationStop = () => host.stop()
     await host.prepareTask(placement.provisionPacket)
     lane.preparationStop = undefined
@@ -526,8 +553,9 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     const relay = new CodexRemoteRelay(binding,container.keyring,host,spec,join(dir,'journal'),finance,
       id => this.hooks.onNativeThread!(placement.operationId,placement.generation!,id),
       () => this.hooks.onRemoteStart!(placement.operationId,placement.generation!))
+    const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation}`, relay)
     lane = { container,sessionKey:request.sessionKey,canonicalModel:request.canonicalModel,operationId:placement.operationId,
-      profileId:placement.profileId,generation:placement.generation,dir,view,binding,relay,lastUsedAt:Date.now() }
+      profileId:placement.profileId,generation:placement.generation,dir,view,binding,relay,unregisterDrain,lastUsedAt:Date.now() }
     writePrivate(join(view,'binding.json'),binding,true)
     await this.listen(relay.controlServer,join(view,'relay.sock'),1000,1000)
     return lane
@@ -545,6 +573,57 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     }
   }
 
+  private async startDriverV4Lane(container: ContainerState, request: RemoteLaneRequest, placement: RemoteLanePlacement): Promise<Lane> {
+    let lane: Lane | undefined
+    const view = join(container.handle.mountSource, placement.operationId)
+    try {
+      const v4 = placement.v4
+      requireLane(v4 && placement.generation && this.hooks.onNativeThread && this.hooks.onRemoteStart &&
+        /^[1-9][0-9]{0,15}$/.test(placement.generation))
+      requireLane(v4.binding.version === 4 && v4.binding.backendKind === REMOTE_DRIVER_BACKEND &&
+        v4.binding.operationId === placement.operationId && v4.binding.generation === placement.generation &&
+        v4.binding.canonicalModel === request.canonicalModel && v4.binding.dockerId === container.dockerId)
+      const dir = join(this.options.evidenceRoot ?? join(this.options.baseRoot, 'evidence'), placement.operationId, placement.generation)
+      requireLane(!existsSync(dir) && !existsSync(view))
+      const host = v4.spec.manifest.root.startsWith('/tmp/oc-drvtest-')
+        ? RemotePoolSshHost.forLocalSandbox(v4.spec)
+        : RemotePoolSshHost.forSshTarget(v4.sshTarget, v4.spec)
+      const preflight = await host.preflight()
+      if (!preflight.memoryOk) throw nodeMemoryError(preflight.activeSessions, preflight.code)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      mkdirSync(view, { mode: 0o750 }); chownSync(view, 0, 1000); chmodSync(view, 0o750)
+      const rawFinance = this.financeFactory(v4.binding, { upstreamModel: v4.binding.upstreamModel })
+      requireLane(rawFinance?.admitV4)
+      const v4Finance: RemotePoolFinancePort = { admit: (inp) => rawFinance.admitV4!(inp) }
+      const relay = new RemotePoolRelay({
+        binding: v4.binding,
+        keys: container.keyring,
+        host,
+        spec: v4.spec,
+        journalDir: join(dir, 'journal'),
+        finance: v4Finance,
+        onNativeSession: (id) => this.hooks.onNativeThread!(placement.operationId, placement.generation!, id, true),
+        onRemoteStart: () => this.hooks.onRemoteStart!(placement.operationId, placement.generation!, true),
+      })
+      const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation}`, relay)
+      lane = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
+        operationId: placement.operationId, profileId: placement.profileId, generation: placement.generation,
+        dir, view, binding: v4.binding, relay, isV4: true, unregisterDrain, lastUsedAt: Date.now() }
+      writePrivate(join(view, 'binding.json'), v4.binding, true)
+      await this.listen(relay.controlServer, join(view, 'relay.sock'), 1000, 1000)
+      return lane
+    } catch (error) {
+      if (lane) {
+        lane.creationFailed = true
+        try { await this.stopLane(lane) } catch { this.chat(request.sessionKey).lane = lane }
+      } else {
+        rmSync(view, { recursive: true, force: true })
+        try { await this.hooks.onState?.(placement.operationId, 'released', placement.generation, true) } catch { /* durable no-effect CAS permits recovery */ }
+      }
+      throw error
+    }
+  }
+
   private stopLane(lane: Lane): Promise<void> {
     if (lane.stopping) return lane.stopping
     lane.stopping = (async () => {
@@ -555,11 +634,14 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         proven = (await lane.relay.stop()).remoteStopped === true
       } catch {
         proven = false
+      } finally {
+        lane.unregisterDrain?.()
+        lane.unregisterDrain = undefined
       }
-      await this.hooks.onState?.(lane.operationId, proven ? 'released' : 'unknown', lane.generation)
+      await this.hooks.onState?.(lane.operationId, proven ? 'released' : 'unknown', lane.generation, lane.isV4)
       requireLane(proven)
-      for (const server of [lane.relay.controlServer, lane.relay.toolServer]) {
-        if (!server.listening) continue
+      for (const server of [lane.relay.controlServer, 'toolServer' in lane.relay ? lane.relay.toolServer : undefined]) {
+        if (!server?.listening) continue
         server.closeAllConnections()
         await new Promise<void>((resolve) => server.close(() => resolve()))
       }
@@ -604,8 +686,10 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         try { await this.stopLane(lane) }
         finally {
           // Container release closes transport even when capacity remains quarantined in PG.
-          for (const server of [lane.relay.controlServer,lane.relay.toolServer]) {
-            if (!server.listening) continue
+          lane.unregisterDrain?.()
+          lane.unregisterDrain = undefined
+          for (const server of [lane.relay.controlServer, 'toolServer' in lane.relay ? lane.relay.toolServer : undefined]) {
+            if (!server?.listening) continue
             server.closeAllConnections()
             await new Promise<void>(resolve => server.close(() => resolve()))
           }

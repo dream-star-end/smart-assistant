@@ -2,6 +2,7 @@
 export const REMOTE_NATIVE_BILLING_RECOVERY_VERSION = 'cc5-native-v1'
 
 export const CODEX_REMOTE_BILLING_RECOVERY_VERSION = 'remote-native-v2'
+export const REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION = 'remote-native-v4'
 /** Unknown future remote owners must never fall into generic refund/tape cleanup. */
 export function isRemoteNativeBillingContext(ctx: Record<string, unknown>): boolean {
   return Object.hasOwn(ctx, 'remoteNativeBillingRecovery')

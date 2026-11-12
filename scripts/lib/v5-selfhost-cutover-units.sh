@@ -32,6 +32,9 @@ snapshot_cutover_units_from_release() { # <rel> <out-var>
 }
 
 cleanup_cutover_unit_snap() {
+  if [[ "${REMOTE_V4_CUTOVER_DRAINED:-0}" == 1 && "${CUTOVER_MUTATED:-0}" == 0 ]] && declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
+    remote_v4_cutover_reopen || true
+  fi
   local snap="${CUTOVER_UNIT_SNAP:-}"
   CUTOVER_UNIT_SNAP=""
   [[ -n "$snap" ]] || return 0

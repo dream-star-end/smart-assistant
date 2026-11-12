@@ -2932,7 +2932,7 @@ cmd_cutover() {
     cutover_clog "  .prev-release=$prev_val"
   fi
   tsum_mark E3.wait-idle 2>/dev/null || :
-  cutover_wait_for_user_idle || return 1
+  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 1; fi; cutover_wait_for_user_idle || return 1
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
   if [[ "$DRY" != 1 ]]; then
     cutover_persist_phase "pre-install"

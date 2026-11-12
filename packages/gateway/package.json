@@ -29,6 +29,11 @@
       "types": "./src/cc5ContainerRuntime.ts",
       "openclaude-precompiled": "./dist/cc5ContainerRuntime.js",
       "default": "./src/cc5ContainerRuntime.ts"
+    },
+    "./remote-pool": {
+      "types": "./src/remotePool/index.ts",
+      "openclaude-precompiled": "./dist/remotePool/index.js",
+      "default": "./src/remotePool/index.ts"
     }
   },
   "dependencies": {

@@ -46,6 +46,7 @@ import {
   ModelAuthorityError,
   assertLeaseMatchesAuthority,
   isModelAllowedByAuthority,
+  isRemoteDriverBackendAuthority,
   verifyAuthority,
   verifyTurnLease,
   type AuthorityKeyring,
@@ -372,14 +373,19 @@ export function enforceRemoteNativeModelAuthority(args: EnforceArgs): Promise<Mo
 
 async function enforceForChannel(args: EnforceArgs, channel: 'anthropic' | 'remote-native'): Promise<ModelAuthorityDecision> {
   const now = args.now ?? Date.now();
+  let remoteV4Authority: ModelAuthorityPayload | null = null;
   if (channel === 'remote-native') {
     const raw = readHeader(args.headers, AUTHORITY_HEADER);
     if (!raw || !args.keyring) throw new ModelGateReject('authority_invalid', 'remote native requires signed authority');
     const a = verifyAuthority(raw, args.keyring, now, { allowExpired: true });
     const backend = a.executionBackend;
-    if (a.canonicalModel !== args.model || !(a.engine === 'ccb' && backend?.kind === 'cc5-interactive-v1'
-        || a.engine === 'codex' && backend?.kind === 'codex-app-server-v1'))
+    const legacyNativeOk =
+      (a.engine === 'ccb' && backend?.kind === 'cc5-interactive-v1') ||
+      (a.engine === 'codex' && backend?.kind === 'codex-app-server-v1');
+    const v4NativeOk = isRemoteDriverBackendAuthority(a);
+    if (a.canonicalModel !== args.model || !(legacyNativeOk || v4NativeOk))
       throw new ModelGateReject('authority_invalid', 'remote native backend mismatch');
+    if (v4NativeOk) remoteV4Authority = a;
   }
 
   // ① epoch fence(单行 SELECT;漂移 → 同步重建;重建失败/DB 不可达 → 拒)
@@ -425,8 +431,12 @@ async function enforceForChannel(args: EnforceArgs, channel: 'anthropic' | 'remo
   if (!descriptor) {
     throw new ModelGateReject("not_available", `model '${canonicalModel}' not routable`);
   }
-  if (channel === 'anthropic' ? descriptor.engine !== "ccb"
-      : descriptor.placement !== 'remote_pool' || !['ccb','codex'].includes(descriptor.engine)) {
+  if (
+    channel === 'anthropic'
+      ? descriptor.engine !== "ccb"
+      : descriptor.placement !== 'remote_pool' ||
+        (remoteV4Authority ? descriptor.engine !== remoteV4Authority.engine : !['ccb', 'codex'].includes(descriptor.engine))
+  ) {
     // codex 走 /internal/v3/codex-relay,不该出现在 anthropic proxy。
     throw new ModelGateReject(
       "not_available",

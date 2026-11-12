@@ -284,6 +284,12 @@ export const DURABLE_TABLES: readonly string[] = [
   "pool_user_affinity",
   "antigravity_relay_usage",
   "antigravity_turns",
+  // OCV5-746 / OCV5-749: remote execution pool nodes, profiles, model offers, and active/sticky
+  // session bindings. Lifetime follows admin pool ops or owning user/node/profile FK cascade.
+  "remote_agent_nodes",
+  "remote_agent_profiles",
+  "remote_model_offers",
+  "remote_agent_bindings",
 ] as const;
 
 /**
