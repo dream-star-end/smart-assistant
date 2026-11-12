@@ -958,7 +958,7 @@ for (const driverId of ['cc', 'codex'] as const) {
       })
       await h.submitUserTurn('MSG_TURN_1')
       const turn1NativeId = h.session.runner.nativeSessionId
-      assert.ok(turn1NativeId && turn1NativeId.startsWith('remotev4:'), 'Turn 1 must bind remotev4 nativeSessionId')
+      assert.ok(turn1NativeId?.startsWith('remotev4:'), 'Turn 1 must bind remotev4 nativeSessionId')
 
       const admit1 = h.controlCalls.filter((c) => c.path === '/admit')[0]!
       assert.ok(admit1, 'Turn 1 must call /admit')
@@ -967,8 +967,13 @@ for (const driverId of ['cc', 'codex'] as const) {
 
       // Turn 2 (warm lane): Consent REVOKED (`profile: null`) — MUST recycle remote app & purge `SYNTH_NICK_ALPHA`!
       h.setMasterPolicy({ schemaVersion: 1, profile: null })
+      // Reopening a warm session may request preheat before the next user turn. Remote
+      // admission is lazy: preheat must not run the legacy privacy shutdown path and
+      // permanently close this lane (N1-R5).
+      const preheatOutcome = await h.sm.preheatRunner(h.session)
       const recyclesBeforeTurn2 = h.controlCalls.filter((c) => c.path === '/recycle').length
       await h.submitUserTurn('MSG_TURN_2')
+      assert.equal(preheatOutcome, 'skipped_engine', 'Remote lane must decline eager preheat')
       const recyclesAfterTurn2 = h.controlCalls.filter((c) => c.path === '/recycle').length
       assert.equal(recyclesAfterTurn2, recyclesBeforeTurn2 + 1, 'Turn 2 revocation MUST invoke /recycle exactly once')
       assert.equal(h.session.runner.nativeSessionId, turn1NativeId, 'Turn 2 MUST preserve exact same nativeSessionId')

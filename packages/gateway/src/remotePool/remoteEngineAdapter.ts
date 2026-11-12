@@ -149,9 +149,9 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     // Admission occurs lazily on the first authorized turn (`beginTurn`/`executeTurn`).
   }
 
-  preheat(): Promise<void> {
-    return Promise.resolve()
-  }
+  // Deliberately omit the optional preheat hook: admission is lazy, and the legacy
+  // preheat privacy refresh calls shutdown(), which permanently stops this lane.
+  // Normal submits refresh consent through restartForConfigChange/recycle instead.
 
   submitTurn(params: TurnParams): EngineTurnRun {
     remotePoolNeed(
