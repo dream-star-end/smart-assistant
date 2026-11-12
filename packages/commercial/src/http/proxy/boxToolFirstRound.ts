@@ -12,7 +12,7 @@ import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError,
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
-import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { isBoxExecRejectedError, isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
@@ -696,7 +696,23 @@ export async function runBoxToolFirstRound(input: {
           ? "BOX_TOOL_NAME_UNAVAILABLE" : error.code);
       }
     }
-    if (launchAttempted) await unknown("first_round_unknown");
+    // OCV5-762: Exec refused (417) even after one refreshed retry: the run
+    // cannot be followed; name it and stop it now so the next message is fresh.
+    const execRejected = isBoxExecRejectedError(error);
+    if (launchAttempted) await unknown(execRejected ? "first_round_exec_rejected" : "first_round_unknown");
+    if (execRejected && launchAttempted && admitted && target && deps.stopRejectedRun) {
+      // Same explicit stop as a rejected stream, once, and bounded.
+      const stop = deps.stopRejectedRun;
+      const identity = { requestId: input.requestId, uid: input.uid,
+        accountId: target.accountId, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch };
+      const observed = Promise.resolve().then(() => stop(identity)).then(() => {}, () => {});
+      let stopTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([observed, new Promise<void>((resolve) => {
+          stopTimer = setTimeout(resolve, 25_000);
+        })]);
+      } finally { if (stopTimer) clearTimeout(stopTimer); }
+    }
     if ((!admitted || prestartClosed) && target) {
       await closeBounded(target, "prestart_dispose").catch(() => {});
     }

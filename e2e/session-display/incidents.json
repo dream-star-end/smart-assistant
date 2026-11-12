@@ -9231,214 +9231,222 @@
         "since": "2026-10-31"
       }
     },
-  {
-    "id": "INC-20261101-UPLOAD-TOTAL-UX",
-    "occurredAt": "2026-11-01",
-    "severity": "P1",
-    "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
-    "rootFixCommit": "64ba5a7f",
-    "coverageCommits": [
-      "b4fbbfc8"
-    ],
-    "regressions": [
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "345649213 bytes formats as 330MB over 300MB in two messages"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "attachment total failure code round-trips and rejects other codes"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-        "assertion": "noteAttachmentTotalRejection stamps 2200MB copy and a parseable code"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-        "assertion": "stamped attachment total code round-trips on the state response and is omitted when absent"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/commercial/src/__tests__/attachmentTotalFailure.test.ts",
-        "assertion": "rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
-        "assertion": "errorPresentation attachment total says 2200MB and does not ask to retry"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
-        "assertion": "附件合计超限状态卡说明 2200MB 且没有继续按钮"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "同一帧内第二批附件超过 2048MB 时不再上传"
-      },
-      {
-        "layer": "browser",
-        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
-        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
-      }
-    ]
-  },
-  {
-    "id": "INC-20261101-RECOVER-UX-EMPTY",
-    "occurredAt": "2026-11-01",
-    "severity": "P1",
-    "symptom": "商业版 uid1 发「hi」时，周额度已用尽的登录仍被选中。上游拒绝后自动恢复改发了「从断点继续」，原消息仍显示发送失败和继续。什么都没执行过时应原样重发用户原文；自动恢复成功接手后，原消息不再显示发送失败。",
-    "rootFixCommit": "8c93a18b",
-    "coverageCommits": [
-      "d5f09049"
-    ],
-    "regressions": [
-      {
-        "layer": "browser",
-        "path": "packages/web-react/browser-tests/recover-ux-empty.node-test.mjs",
-        "assertion": "a succeeded automatic recovery does not show 发送失败"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
-        "assertion": "resends the original text when an engine_error tape is only a synthetic refusal"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
-        "assertion": "自动恢复已成功时，原消息不再显示发送失败和继续"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/commercial/src/http/proxy/boxLoginCandidates.test.ts",
-        "assertion": "weekly exhaustion benches a login whose 5-hour reading has aged out"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
-        "assertion": "a weekly-exhausted login is never chosen while another login can run"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
-        "assertion": "a running chat leaves its login once that login's weekly quota is exhausted"
-      }
-    ]
-  },
-  {
-    "id": "INC-20261101-UPLOAD-TOTAL-2G",
-    "occurredAt": "2026-11-01",
-    "severity": "P1",
-    "symptom": "引用式附件合计仍被 300MiB 卡住。uid4 四个 rar 加一个 docx 共 345649213 字节，单文件都在 100MiB 内，发送被拒。合计上限改为 2GiB，按已落盘文件的字节计。单文件仍是 100MiB。内联文本仍是 300MiB，因为它进帧而不是引用。提示队列的正文预算仍是 300MiB。预检和拒绝文案沿用合计、上限和分条，不计费。",
-    "rootFixCommit": "d03b36f0",
-    "regressions": [
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "2GiB is within the total limit and one extra byte is over"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/security.test.ts",
-        "assertion": "MAX_UPLOAD_TOTAL is 2GiB"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-        "assertion": "message attachment total includes bytes after the 2GiB cap is crossed"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
-      },
-      {
-        "layer": "browser",
-        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
-        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
-      }
-    ]
-  },
-  {
-    "id": "INC-20261101-UPLOAD-CHUNK-1G",
-    "occurredAt": "2026-11-01",
-    "severity": "P1",
-    "symptom": "单次 HTTP 正文仍是 100MiB，组装后的单个文件可以到 1GiB。文件按 16MiB 分片上传，可以断点续传并看到进度。跨机路径按片推送，由 agent 流式拼接。每人有 10GiB 免费上传空间，满了提示删除旧文件，本次不收费。已发布文件保留 30 天，最近会话仍引用的不删。残留分片会清理。rar 和 zip 不自动解压。不改计费。",
-    "rootFixCommit": "57b6cbd6",
-    "coverageCommits": ["b228846d", "9717d18b", "32b9c85f", "49bbf9b3", "829a9925"],
-    "regressions": [
-      {
-        "layer": "integration",
-        "path": "packages/commercial/src/__tests__/uploadRetentionAuthority.integ.test.ts",
-        "assertion": "upload retention reads authoritative PG hot, archive and exact deferred payloads with bounded complete scans"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "10GiB quota tells the user to delete old files and does not charge"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadChunk.test.ts",
-        "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/security.test.ts",
-        "assertion": "HTTP body stays 100MiB and the assembled file cap is 1GiB"
-      },
-      {
-        "layer": "browser",
-        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
-        "assertion": "单个文件超过 1024MB 时不上传"
-      }
-    ]
-  },
-  {
-    "id": "INC-20261101-UPLOAD-SCAN-FREEZE",
-    "occurredAt": "2026-11-01",
-    "severity": "P1",
-    "symptom": "个人版PR1337引入每小时同步扫描用户卷与JSONL，master事件循环实测冻结204413ms，healthz超时、聊天桥断开并触发watch回切，遗留双egress混合状态。扫描改为异步目录和256KiB分块IO，自动清理需OC_UPLOAD_RETENTION_ENABLED=1显式开启，默认关闭；保留1GiB/2GiB/10GiB上传限额与不完整引用扫描禁止删除保护。",
-    "rootFixCommit": "f9aa97ce",
-    "coverageCommits": ["6e390db8"],
-    "regressions": [
-      {
-        "layer": "deploy-gate",
-        "path": "scripts/check-v5-upload-retention-proof.ts",
-        "assertion": "UPLOAD_RETENTION_HTTP_RESPONSIVE"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
-        "assertion": "large JSONL directory scans keep heartbeat gaps below one second"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
-        "assertion": "chunk-boundary references survive and failed or oversized reads fail closed"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
-        "assertion": "retention is opt-in and its disabled scheduler and entry point do no filesystem scans"
-      }
-    ]
-  },
+    {
+      "id": "INC-20261101-UPLOAD-TOTAL-UX",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
+      "rootFixCommit": "64ba5a7f",
+      "coverageCommits": [
+        "b4fbbfc8"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "345649213 bytes formats as 330MB over 300MB in two messages"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "attachment total failure code round-trips and rejects other codes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+          "assertion": "noteAttachmentTotalRejection stamps 2200MB copy and a parseable code"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+          "assertion": "stamped attachment total code round-trips on the state response and is omitted when absent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/attachmentTotalFailure.test.ts",
+          "assertion": "rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "errorPresentation attachment total says 2200MB and does not ask to retry"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
+          "assertion": "附件合计超限状态卡说明 2200MB 且没有继续按钮"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "同一帧内第二批附件超过 2048MB 时不再上传"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+          "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261101-RECOVER-UX-EMPTY",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "商业版 uid1 发「hi」时，周额度已用尽的登录仍被选中。上游拒绝后自动恢复改发了「从断点继续」，原消息仍显示发送失败和继续。什么都没执行过时应原样重发用户原文；自动恢复成功接手后，原消息不再显示发送失败。",
+      "rootFixCommit": "8c93a18b",
+      "coverageCommits": [
+        "d5f09049"
+      ],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recover-ux-empty.node-test.mjs",
+          "assertion": "a succeeded automatic recovery does not show 发送失败"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "assertion": "resends the original text when an engine_error tape is only a synthetic refusal"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "自动恢复已成功时，原消息不再显示发送失败和继续"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxLoginCandidates.test.ts",
+          "assertion": "weekly exhaustion benches a login whose 5-hour reading has aged out"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
+          "assertion": "a weekly-exhausted login is never chosen while another login can run"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
+          "assertion": "a running chat leaves its login once that login's weekly quota is exhausted"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261101-UPLOAD-TOTAL-2G",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "引用式附件合计仍被 300MiB 卡住。uid4 四个 rar 加一个 docx 共 345649213 字节，单文件都在 100MiB 内，发送被拒。合计上限改为 2GiB，按已落盘文件的字节计。单文件仍是 100MiB。内联文本仍是 300MiB，因为它进帧而不是引用。提示队列的正文预算仍是 300MiB。预检和拒绝文案沿用合计、上限和分条，不计费。",
+      "rootFixCommit": "d03b36f0",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "2GiB is within the total limit and one extra byte is over"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/security.test.ts",
+          "assertion": "MAX_UPLOAD_TOTAL is 2GiB"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+          "assertion": "message attachment total includes bytes after the 2GiB cap is crossed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+          "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261101-UPLOAD-CHUNK-1G",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "单次 HTTP 正文仍是 100MiB，组装后的单个文件可以到 1GiB。文件按 16MiB 分片上传，可以断点续传并看到进度。跨机路径按片推送，由 agent 流式拼接。每人有 10GiB 免费上传空间，满了提示删除旧文件，本次不收费。已发布文件保留 30 天，最近会话仍引用的不删。残留分片会清理。rar 和 zip 不自动解压。不改计费。",
+      "rootFixCommit": "57b6cbd6",
+      "coverageCommits": [
+        "b228846d",
+        "9717d18b",
+        "32b9c85f",
+        "49bbf9b3",
+        "829a9925"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/uploadRetentionAuthority.integ.test.ts",
+          "assertion": "upload retention reads authoritative PG hot, archive and exact deferred payloads with bounded complete scans"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "10GiB quota tells the user to delete old files and does not charge"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadChunk.test.ts",
+          "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/security.test.ts",
+          "assertion": "HTTP body stays 100MiB and the assembled file cap is 1GiB"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+          "assertion": "单个文件超过 1024MB 时不上传"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261101-UPLOAD-SCAN-FREEZE",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "个人版PR1337引入每小时同步扫描用户卷与JSONL，master事件循环实测冻结204413ms，healthz超时、聊天桥断开并触发watch回切，遗留双egress混合状态。扫描改为异步目录和256KiB分块IO，自动清理需OC_UPLOAD_RETENTION_ENABLED=1显式开启，默认关闭；保留1GiB/2GiB/10GiB上传限额与不完整引用扫描禁止删除保护。",
+      "rootFixCommit": "f9aa97ce",
+      "coverageCommits": [
+        "6e390db8"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-upload-retention-proof.ts",
+          "assertion": "UPLOAD_RETENTION_HTTP_RESPONSIVE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+          "assertion": "large JSONL directory scans keep heartbeat gaps below one second"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+          "assertion": "chunk-boundary references survive and failed or oversized reads fail closed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+          "assertion": "retention is opt-in and its disabled scheduler and entry point do no filesystem scans"
+        }
+      ]
+    },
     {
       "id": "INC-20261104-ANTIGRAVITY-DELIVERY",
       "occurredAt": "2026-11-04",
@@ -9505,6 +9513,69 @@
           "assertion": "a zero-token crashed first turn continues on the same model without a cost dialog"
         }
       ]
+    },
+    {
+      "id": "INC-20261112-BOX-EXEC-417-WEDGE",
+      "occurredAt": "2026-11-12",
+      "severity": "P1",
+      "symptom": "商业 uid 4 的 Box Claude 长回合续跑时 Cursor Exec 返回 HTTP 417，回合断掉、槽位不放，再发一句报 503/409/BOX_RESUME_IN_PROGRESS。个人版同一套 Box 路由代码同步 c97462fb：417 后下一次调用先重取 Exec 描述符（不唤醒），spool 读取重试一次；仍被拒立即显式停 run 释放槽位；417 正文有界脱敏写日志。",
+      "rootFixCommit": "c97462fb",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxExecTransport.test.ts",
+          "assertion": "a 417 is not retried by the transport; the next call uses a refreshed descriptor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxExecTransport.test.ts",
+          "assertion": "a hung refresh fails on its own deadline and the next call refreshes again"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxExecTransport.test.ts",
+          "assertion": "the account guard runs again after a refresh, before anything is sent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.test.ts",
+          "assertion": "OCV5-762 an Exec 417 refreshes this Box's descriptor before the next call and never wakes it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-762: an Exec 417 re-reads the same offset once (on the refreshed descriptor)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-762: a second 417 without progress ends the poll as rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "OCV5-762 a 417 that survives the refreshed retry is journaled as continuation_exec_rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "OCV5-762 an Exec refusal that survived its retry stops the run like a rejected echo"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "OCV5-762 a first round whose Exec reads stay refused is named and stopped once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-762 an exec-rejected round is stopped after the short grace"
+        }
+      ],
+      "proofPending": {
+        "reason": "个人版 canary 没有 Box 模型、个人版发布不跑 Box 事故证明门；商业版由 deploy-gate [ocv5-762-exec-417-wedge]（scripts/check-v5-box-incident-proofs.ts，商业 4cc72ec3）覆盖",
+        "since": "2026-11-12"
+      }
     }
   ]
 }

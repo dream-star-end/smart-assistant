@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
+import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter,
   BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
@@ -691,5 +692,39 @@ test("OCV5-368 a final cut at max_tokens and resumed by the CLI is delivered and
     assert.ok(!sse.includes("max_tokens") && !sse.includes("Output token limit"));
     assert.match(f.emitted.at(-1)!, /"stop_reason":"end_turn"/);
     assert.equal(f.sequence.includes("unknown"), false);
+  }
+});
+
+test("OCV5-762 one Exec 417 is read again and the round still ends with its answer", async () => {
+  const f = fixture("final");
+  const exec = (f.input.published as unknown as { target: { exec: { run: (r: { args: string[] }) => Promise<unknown> } } }).target.exec;
+  const run = exec.run.bind(exec);
+  let refused = 0;
+  exec.run = async (request) => {
+    if (request.args[5] === "--read" && refused === 0) { refused++; throw new BoxExecTransportError("BOX_EXEC_HTTP_417", false); }
+    return run(request);
+  };
+  const result = await runBoxToolContinuation(f.input, f.deps);
+  assert.equal(result.kind, "final");
+  assert.equal(refused, 1);
+  assert.equal(f.sequence.includes("unknown"), false);
+});
+
+test("OCV5-762 a 417 that survives the refreshed retry is journaled as continuation_exec_rejected", async () => {
+  for (const second of ["BOX_EXEC_HTTP_417", "BOX_EXEC_REFRESH_FAILED"]) {
+    const f = fixture("final");
+    const exec = (f.input.published as unknown as { target: { exec: { run: (r: { args: string[] }) => Promise<unknown> } } }).target.exec;
+    let reads = 0;
+    exec.run = async () => {
+      reads++;
+      throw new BoxExecTransportError(reads === 1 ? "BOX_EXEC_HTTP_417" : second, false);
+    };
+    const phases: string[] = [];
+    await assert.rejects(runBoxToolContinuation(f.input, { ...f.deps,
+      journal: { ...(f.deps.journal as object),
+        markUnknown: async (input: { phase: string }) => { phases.push(input.phase); } } as never }),
+    (error: unknown) => error instanceof BoxExecTransportError && error.code === second);
+    assert.equal(reads, 2, second);
+    assert.deepEqual(phases, ["continuation_exec_rejected"], second);
   }
 });

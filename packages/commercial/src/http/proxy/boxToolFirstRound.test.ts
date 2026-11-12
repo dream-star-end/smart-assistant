@@ -1124,3 +1124,21 @@ test("tool task keeps its exact context across confirmed missing egress and auth
   assert.match(f.emitted.join(""), /direct answer/);
   assert.equal(JSON.stringify(f.input.canonicalBody), before);
 });
+
+test("OCV5-762 a first round whose Exec reads stay refused is named and stopped once", async () => {
+  const f = fixture({ directFinal: true });
+  const run = f.target.exec.run.bind(f.target.exec);
+  let refused = 0;
+  f.target.exec.run = async (request) => {
+    if (request.args[5] === "--read") { refused++; throw new BoxExecTransportError("BOX_EXEC_HTTP_417", false); }
+    return run(request);
+  };
+  const events: string[] = [];
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    stopRejectedRun: async () => { events.push("stop"); return "stopped_proven"; } }),
+  (error: unknown) => error instanceof BoxExecTransportError && error.code === "BOX_EXEC_HTTP_417");
+  assert.equal(refused, 2, "exactly one retry on the refreshed descriptor");
+  assert.deepEqual(events, ["stop"]);
+  assert.deepEqual(f.unknownPhases, ["first_round_exec_rejected"]);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+});

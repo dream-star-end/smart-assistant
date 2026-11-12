@@ -13,7 +13,7 @@ import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { BoxToolResultEcho, BoxToolResultEchoError } from "./boxToolResultEcho.js";
 import { boxCliNativeResumeVerified } from "./boxCliVersion.js";
 import type { BoxToolPublishedResume } from "./boxToolResumePublish.js";
-import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { isBoxExecRejectedError, isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxContextHash } from "./boxCallFingerprint.js";
@@ -266,9 +266,12 @@ export async function runBoxToolContinuation(input: {
     // this run at once; nothing it writes afterwards can be delivered.
     // OCV5-328: the same holds when the decoder rejects the stream itself:
     // re-reading the spool fails the same way, so the run is stopped at once.
+    // OCV5-762: an Exec 417 that survived one refreshed retry is named too, so
+    // the run is stopped at once instead of holding the session's slot.
     await unknown(error instanceof BoxToolResultEchoError ? "continuation_echo_rejected"
       : error instanceof BoxCliToolHandoffError ? "continuation_stream_rejected"
-        : "continuation_unknown");
+        : isBoxExecRejectedError(error) ? "continuation_exec_rejected"
+          : "continuation_unknown");
     throw error;
   } finally {
     clearTimeout(timer);
