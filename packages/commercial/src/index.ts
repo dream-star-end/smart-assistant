@@ -1,3 +1,5 @@
+import { readAntigravityRouteAuthority } from './billing/antigravityRouteAuthority.js';
+import { createIoredisAntigravityRelayKv, configureAntigravityRelayAuthority } from './billing/antigravityRouteContext.js';
 import { createBoxFailureDiagnostics } from "./http/proxy/boxFailureDiagnostic.js";
 import { resolveContainerLinkEndpoint } from "./ws/containerLinkEndpoint.js";
 import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
@@ -1615,7 +1617,8 @@ export async function registerCommercial(
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityRelayKv(createIoredisAntigravityRelayKv(redis));
+  configureAntigravityRelayAuthority((route) => readAntigravityRouteAuthority(getPool(), route));
   configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
 
   // 预热 dummy hash:第一次登录无影响

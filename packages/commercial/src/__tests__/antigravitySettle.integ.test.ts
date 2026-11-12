@@ -1,3 +1,12 @@
+import { createHash, randomUUID } from 'node:crypto'
+import IORedis from 'ioredis'
+import { readAntigravityRouteAuthority } from '../billing/antigravityRouteAuthority.js'
+import {
+  _resetAntigravityRelayRoutesForTests, configureAntigravityRelayKv,
+  configureAntigravityRelayAuthority, createIoredisAntigravityRelayKv,
+  mintAntigravityRelayRoute, resolveAntigravityRelayRoute,
+  expireAntigravityRelayRouteForRequest,
+} from '../billing/antigravityRouteContext.js'
 /**
  * OCV5-415 P2 billing on real PG: migration 0307 + relay usage rows + the
  * durable turn claim (Codex r1 P1: a reconnected bridge must still settle).
@@ -549,5 +558,141 @@ describe('Gemini 4 Carbon staged pricing (OCV5-757)', () => {
     assert.deepEqual(r.rows,[{ state:'staged',upstream_model_id:'gemini-4-carbon-medium',context_window:1048576,
       enabled:false,visibility:'public',default_effort:'medium',input:'100',output:'500',cached:'5',
       cache_write:'0',multiplier:'1.000' }])
+  })
+})
+
+// INC-20261112-AGY-ROUTE-LIFETIME: real PG ownership + real Redis CAS.
+// No model request, no shared Redis FLUSH; each test deletes only its minted keys.
+async function lifetimeFixture(kind: 'chat' | 'delegate' | 'legacy' = 'chat') {
+  const uid = await user(100_000n)
+  const requestId = rid()
+  const sessionId = `agy-lifetime-${requestId}`
+  await recordAntigravityTurn(getPool(), { requestId, userId: uid, modelId: MODEL, sessionId, traceId: null })
+  let containerId = 11
+  if (kind === 'chat') {
+    await query(`INSERT INTO turn_dispatches
+      (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,billing_request_id,status)
+      VALUES ($1,$2,$3,'msg-lifetime','main','alias-model',$4,$5,'accepted')`,
+      [randomUUID(), uid.toString(), sessionId, 'a'.repeat(64), requestId])
+  } else if (kind === 'delegate') {
+    const sub = await query<{id: string}>(`INSERT INTO agent_subscriptions(user_id,plan,end_at)
+      VALUES ($1,'basic',NOW()+INTERVAL '1 day') RETURNING id::text`, [uid.toString()])
+    const c = await query<{id: string}>(`INSERT INTO agent_containers
+      (user_id,subscription_id,docker_name,workspace_volume,home_volume,image,status)
+      VALUES ($1,$2,$3,'w','h','test','running') RETURNING id::text`,
+      [uid.toString(), sub.rows[0]!.id, sessionId])
+    containerId = Number(c.rows[0]!.id)
+    await query(`INSERT INTO request_finalize_journal(request_id,user_id,container_id,ctx,precheck_credits)
+      VALUES ($1,$2,$3,'{"source":"delegate_antigravity"}',1000)`, [requestId, uid.toString(), containerId])
+  }
+  const redis = new IORedis('redis://127.0.0.1:56379/15', { lazyConnect: true, maxRetriesPerRequest: 0,
+    connectTimeout: 1500, retryStrategy: () => null })
+  await redis.connect()
+  _resetAntigravityRelayRoutesForTests()
+  const kv = createIoredisAntigravityRelayKv(redis)
+  configureAntigravityRelayKv(kv)
+  configureAntigravityRelayAuthority((route) => readAntigravityRouteAuthority(getPool(), route))
+  const started = Date.now()
+  const minted = await mintAntigravityRelayRoute({ containerId, userId: uid, requestId,
+    modelId: MODEL, accountId: 1n, budgetCredits: 100_000n, relayPort: 18789, nowMs: started })
+  const tk = `oc:v5:antigravity-relay:${createHash('sha256').update(minted.token).digest('hex')}`
+  const rk = `oc:v5:antigravity-relay:req:${requestId}`
+  const resolve = (minute = 0) => resolveAntigravityRelayRoute({ token: minted.token,
+    containerId, userId: uid, nowMs: started + minute * 60_000 })
+  return { uid, requestId, sessionId, containerId, redis, kv, started, tk, rk, resolve,
+    async close() { await redis.del(tk, rk); await redis.quit(); _resetAntigravityRelayRoutesForTests() } }
+}
+
+describe('INC-20261112-AGY-ROUTE-LIFETIME authoritative rolling lease', () => {
+  for (const kind of ['chat', 'delegate'] as const) {
+    test(`${kind} live turn crosses 6 hours with no generation and concurrent renewals`, async (t) => {
+      if (db.skipIfUnavailable(t)) return
+      const f = await lifetimeFixture(kind)
+      try {
+        for (let minute = 31; minute < 500; minute += 31) {
+          const rows = await Promise.all(Array.from({ length: 4 }, () => f.resolve(minute)))
+          assert.ok(rows.every(Boolean), `all concurrent leases valid at ${minute}m`)
+        }
+        assert.ok(await f.resolve(500))
+        assert.equal(await f.redis.get(f.rk), f.tk)
+        assert.ok((await f.redis.ttl(f.rk)) >= 3590, 'reverse index outlives renewed token')
+        // Live >2h turn must not be claimed, released or charged by orphan recovery.
+        await usageRow(f.requestId, f.uid, 20_000, 500)
+        await query("UPDATE antigravity_turns SET updated_at=NOW()-INTERVAL '3 hours' WHERE request_id=$1", [f.requestId])
+        assert.equal((await reconcileStaleAntigravityTurns({ pool: getPool(), pricing, userId: f.uid })).length, 0)
+        const direct = await settleAntigravityTurnRecord({ pool: getPool(), pricing, userId: f.uid,
+          requestId: f.requestId, engineStatus: 'unknown', staleBefore: new Date() })
+        assert.equal(direct, null, 'atomic claim repeats live-owner guard')
+        assert.equal(await turnStatus(f.requestId), 'pending')
+        assert.equal(await balance(f.uid), 100_000n)
+        const once = await settleAntigravityTurnRecord({ pool: getPool(), pricing,
+          userId: f.uid, requestId: f.requestId, engineStatus: 'success' })
+        assert.ok(once, 'normal terminal settlement is not subject to stale guard')
+        const spent = await balance(f.uid)
+        assert.ok(spent < 100_000n)
+        assert.equal(await settleAntigravityTurnRecord({ pool: getPool(), pricing,
+          userId: f.uid, requestId: f.requestId, engineStatus: 'success' }), null)
+        assert.equal(await balance(f.uid), spent)
+        assert.equal(await f.resolve(500), null, 'settled execution cannot use even an unexpired route')
+      } finally { await f.close() }
+    })
+  }
+
+  test('persisted Stop and fenced owner deny; reconnect, alias and old Stop do not', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const f = await lifetimeFixture()
+    try {
+      await query(`UPDATE turn_dispatches SET owner_id='reconnected',lease_epoch=99,
+        lease_until=NOW()-INTERVAL '1 hour' WHERE billing_request_id=$1`, [f.requestId])
+      await query(`INSERT INTO turn_control_requests(control_id,user_id,session_id,kind,payload_json,created_at)
+        VALUES ($1,$2,$3,'stop','{}',NOW()-INTERVAL '1 day')`, [randomUUID(), f.uid.toString(), f.sessionId])
+      assert.ok(await f.resolve(), 'old NULL-root Stop never fences a later turn')
+      const stop = randomUUID()
+      await query(`INSERT INTO turn_control_requests(control_id,user_id,session_id,root_client_message_id,kind,payload_json)
+        VALUES ($1,$2,$3,'unrelated','stop','{}')`, [stop, f.uid.toString(), f.sessionId])
+      assert.ok(await f.resolve(), 'unrelated Stop does not fence this turn')
+      await query('UPDATE turn_control_requests SET root_client_message_id=NULL WHERE control_id=$1', [stop])
+      assert.equal(await f.resolve(), null)
+      await query("UPDATE turn_control_requests SET status='cancelled' WHERE control_id=$1", [stop])
+      assert.ok(await f.resolve())
+      await query('UPDATE turn_dispatches SET producer_fenced_at=NOW() WHERE billing_request_id=$1', [f.requestId])
+      assert.equal(await f.resolve(), null)
+    } finally { await f.close() }
+  })
+
+  test('legacy prompt queue retains bounded lease and never acquires active-owner privileges', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const f = await lifetimeFixture('legacy')
+    try {
+      assert.ok(await f.resolve())
+      for (let min = 31; min < 360; min += 31) assert.ok(await f.resolve(min))
+      assert.equal(await f.resolve(361), null)
+    } finally { await f.close() }
+  })
+
+  test('Redis terminal CAS wins over delayed renew even after revocation marker GC', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const f = await lifetimeFixture()
+    try {
+      const old = await f.resolve()
+      assert.ok(old)
+      await expireAntigravityRelayRouteForRequest(f.requestId)
+      assert.equal(await f.kv.renew!({ row: old!, now: f.started+31*60_000, active: true }), null)
+      await f.redis.del(f.rk) // simulate tombstone TTL elapsed, not a production repair
+      assert.equal(await f.kv.renew!({ row: old!, now: f.started+31*60_000, active: true }), null)
+      assert.equal(await f.redis.exists(f.tk), 0)
+      assert.equal(await f.redis.exists(f.rk), 0)
+    } finally { await f.close() }
+  })
+
+  test('delegate finalizing denies route but remains protected from stale settlement', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const f = await lifetimeFixture('delegate')
+    try {
+      await query("UPDATE request_finalize_journal SET state='finalizing' WHERE request_id=$1", [f.requestId])
+      assert.equal(await f.resolve(), null)
+      await query("UPDATE antigravity_turns SET updated_at=NOW()-INTERVAL '3 hours' WHERE request_id=$1", [f.requestId])
+      assert.equal((await reconcileStaleAntigravityTurns({ pool: getPool(), pricing, userId: f.uid })).length, 0)
+    } finally { await f.close() }
   })
 })

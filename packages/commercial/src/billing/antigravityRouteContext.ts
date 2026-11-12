@@ -7,6 +7,7 @@
  * configure the shared KV (Redis); tests keep the in-memory map.
  */
 import { createHash, randomBytes } from 'node:crypto'
+import type { AntigravityRouteAuthority } from './antigravityRouteAuthority.js'
 
 import { ANTIGRAVITY_RELAY_PREFIX, isAntigravityEngineModel } from '@openclaude/protocol'
 
@@ -17,7 +18,7 @@ export { ANTIGRAVITY_RELAY_PREFIX }
  * 60-minute route). The bridge expires the route when the turn ends.
  */
 export const ANTIGRAVITY_RELAY_TTL_MS = 60 * 60 * 1000
-/** Renewals stop here, counted from mint, for turns that never end. */
+/** Legacy/unowned routes retain the original ceiling; also the index/tombstone TTL. */
 export const ANTIGRAVITY_RELAY_MAX_LIFETIME_MS = 6 * 60 * 60 * 1000
 
 const TOKEN_RE = /^[0-9a-f]{64}$/
@@ -44,10 +45,16 @@ export type AntigravityRelayKv = {
   get(key: string): Promise<string | null>
   set(key: string, value: string, ttlSec: number): Promise<void>
   del(key: string): Promise<void>
+  renew?(args: { row: AntigravityRelayRoute; now: number; active: boolean }): Promise<string | null>
 }
 
 const routes = new Map<string, AntigravityRelayRoute>()
 let kv: AntigravityRelayKv | null = null
+let authority: ((row: AntigravityRelayRoute) => Promise<AntigravityRouteAuthority>) | null = null
+
+export function configureAntigravityRelayAuthority(check: typeof authority): void {
+  authority = check
+}
 
 export function configureAntigravityRelayKv(next: AntigravityRelayKv | null): void {
   kv = next
@@ -168,6 +175,8 @@ export async function resolveAntigravityRelayRoute(args: {
   containerId: number
   userId: bigint | number
   nowMs?: number
+  /** Cleanup only: validates opaque ownership without requiring a live execution. */
+  ownershipOnly?: boolean
 }): Promise<AntigravityRelayRoute | null> {
   if (!TOKEN_RE.test(args.token)) return null
   const now = args.nowMs ?? Date.now()
@@ -179,19 +188,19 @@ export async function resolveAntigravityRelayRoute(args: {
     row = routes.get(args.token) ?? null
   }
   if (!row) return null
-  if (row.expiresAt <= now) {
-    await expireAntigravityRelayRoute(args.token)
-    return null
-  }
+  if (row.expiresAt <= now) return null // TTL cleanup; never delete a concurrently renewed row
   if (row.containerId !== args.containerId) return null
   if (row.userId !== BigInt(args.userId)) return null
+  if (args.ownershipOnly) return row
   // A renewal racing the turn end can briefly write the token key back; the
   // request's mark is authoritative, so no call is served after the turn ended.
   if (kv && (await kv.get(requestKey(row.requestId))) === EXPIRED_MARK) {
     await kv.del(tokenKey(row.token))
     return null
   }
-  return renewIfDue(row, now)
+  const decision = authority ? await authority(row) : 'legacy'
+  if (decision === 'denied') return null
+  return renewIfDue(row, now, decision === 'active')
 }
 
 function ttlSeconds(ms: number): number {
@@ -201,23 +210,82 @@ function ttlSeconds(ms: number): number {
 async function renewIfDue(
   row: AntigravityRelayRoute,
   now: number,
+  active: boolean,
 ): Promise<AntigravityRelayRoute | null> {
+  // Production Lua checks existence/index even outside the renewal window:
+  // a terminal arriving during the authority query wins over a detached row.
+  if (kv?.renew) {
+    const raw = await kv.renew({ row, now, active })
+    return raw ? deserialize(row.token, raw) : null
+  }
+  if (active && kv) throw new Error('Antigravity rolling renewal requires atomic KV')
+  if (!kv) {
+    const current = routes.get(row.token)
+    if (!current || current.expiresAt <= now) return null
+    const next = active ? now + ANTIGRAVITY_RELAY_TTL_MS
+      : Math.min(now + ANTIGRAVITY_RELAY_TTL_MS, current.maxExpiresAt)
+    if (current.expiresAt - now >= ANTIGRAVITY_RELAY_TTL_MS / 2) return current
+    const renewed = { ...current, expiresAt: Math.max(current.expiresAt, next),
+      maxExpiresAt: active ? Math.max(current.maxExpiresAt, next) : current.maxExpiresAt }
+    routes.set(row.token, renewed)
+    return renewed
+  }
+  // Legacy injectable KV (old tests), never used for production active owners.
   const next = Math.min(now + ANTIGRAVITY_RELAY_TTL_MS, row.maxExpiresAt)
   if (row.expiresAt - now >= ANTIGRAVITY_RELAY_TTL_MS / 2 || next <= row.expiresAt) return row
   const renewed = { ...row, expiresAt: next }
-  if (!kv) {
-    // An expired route is gone from the map; renewing a detached row revives nothing.
-    if (routes.get(row.token) === row) routes.set(row.token, renewed)
-    return renewed
-  }
   await kv.set(tokenKey(row.token), serialize(renewed), ttlSeconds(next - now))
-  // expireAntigravityRelayRouteForRequest marks the request before deleting the
-  // token key: if the mark is here now, this write may have put the key back.
   if ((await kv.get(requestKey(row.requestId))) === EXPIRED_MARK) {
     await kv.del(tokenKey(row.token))
     return null
   }
   return renewed
+}
+
+/** Both the token and reverse index are updated in one Redis operation.
+ * A sibling renewal is success; a missing/revoked route is never recreated. */
+export const ANTIGRAVITY_RENEW_LUA = `
+local raw = redis.call('GET', KEYS[1])
+if not raw or redis.call('GET', KEYS[2]) ~= KEYS[1] then return nil end
+local current = cjson.decode(raw)
+local expected = cjson.decode(ARGV[1])
+for _, field in ipairs({'containerId','userId','requestId','modelId','accountId','budgetCredits'}) do
+  if current[field] ~= expected[field] then return nil end
+end
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+if current.expiresAt <= now then return nil end
+if current.expiresAt - now >= ttl / 2 then return raw end
+local ceiling = current.maxExpiresAt or current.expiresAt
+local next = math.min(now + ttl, ceiling)
+if ARGV[4] == '1' then next = now + ttl; ceiling = math.max(ceiling, next) end
+current.expiresAt = math.max(current.expiresAt, next)
+current.maxExpiresAt = ceiling
+local seconds = math.max(1, math.ceil((current.expiresAt - now) / 1000))
+local updated = cjson.encode(current)
+redis.call('SET', KEYS[1], updated, 'EX', seconds)
+redis.call('SET', KEYS[2], KEYS[1], 'EX', math.max(seconds, tonumber(ARGV[5])))
+return updated
+`
+
+export function createIoredisAntigravityRelayKv(client: {
+  get(key: string): Promise<string | null>
+  set(key: string, value: string, mode: 'EX', seconds: number): Promise<unknown>
+  del(key: string): Promise<unknown>
+  eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>
+}): AntigravityRelayKv {
+  return {
+    get: (key) => client.get(key),
+    set: async (key, value, seconds) => { await client.set(key, value, 'EX', seconds) },
+    del: async (key) => { await client.del(key) },
+    renew: async ({ row, now, active }) => {
+      const raw = await client.eval(ANTIGRAVITY_RENEW_LUA, 2,
+        tokenKey(row.token), requestKey(row.requestId), serialize(row), now,
+        ANTIGRAVITY_RELAY_TTL_MS, active ? '1' : '0',
+        ttlSeconds(ANTIGRAVITY_RELAY_MAX_LIFETIME_MS))
+      return typeof raw === 'string' ? raw : null
+    },
+  }
 }
 
 export async function expireAntigravityRelayRoute(token: string): Promise<void> {
@@ -249,4 +317,5 @@ export async function expireAntigravityRelayRouteForRequest(requestId: string): 
 export function _resetAntigravityRelayRoutesForTests(): void {
   routes.clear()
   kv = null
+  authority = null
 }

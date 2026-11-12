@@ -504,11 +504,15 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       }
       throw err
     }
-    const route = await (deps.resolveRoute ?? resolveAntigravityRelayRoute)({
-      token,
-      containerId: identity.containerId,
-      userId: BigInt(identity.userId),
-    })
+    let route: AntigravityRelayRoute | null
+    try {
+      route = await (deps.resolveRoute ?? resolveAntigravityRelayRoute)({
+        token, containerId: identity.containerId, userId: BigInt(identity.userId),
+      })
+    } catch {
+      error(res, 503, 'ANTIGRAVITY_AUTHORITY_UNAVAILABLE', requestId)
+      return
+    }
     if (!route) {
       error(res, 404, 'ANTIGRAVITY_ROUTE_EXPIRED', requestId)
       return

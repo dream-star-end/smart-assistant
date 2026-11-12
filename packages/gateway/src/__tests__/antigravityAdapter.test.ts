@@ -1586,3 +1586,34 @@ describe('Antigravity unindexed resumed errors', () => {
     })
   }
 })
+
+
+test('INC-20261112-AGY-ROUTE-LIFETIME: live silent tool renews exact route and Stop ends heartbeat', async () => {
+  const h = await harness()
+  let calls = 0
+  let active = 0
+  let maximum = 0
+  _internals.setTimingTestHooks({ keepaliveMs: 10, routeRenewMs: 15,
+    renewRoute: async (token) => {
+      assert.equal(token, TOKEN)
+      calls += 1; active += 1; maximum = Math.max(maximum, active)
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      active -= 1
+      throw new Error('temporary control-plane outage')
+    } })
+  try {
+    h.adapter.setAntigravityRoute(ROUTE)
+    const live = await controlledTurn(h, 'silent-route-lease')
+    await live.push(fileStep(30, 'ACTIVE', 'run_command'))
+    await new Promise((resolve) => setTimeout(resolve, 220))
+    assert.ok(calls >= 2, 'actual adapter heartbeat runs without generation output')
+    assert.equal(maximum, 1, 'no overlapping renewals')
+    assert.ok(h.adapter.lastActivityAt > 0, 'renewal outage keeps activity alive')
+    h.adapter.interrupt('user')
+    const stoppedAt = calls
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(calls, stoppedAt, 'Stop suppresses future renewals before process exit')
+    await h.adapter.shutdown()
+    await live.run.summary
+  } finally { await h.adapter.shutdown(); await h.restore(); _internals.setTimingTestHooks(null) }
+})

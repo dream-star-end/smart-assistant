@@ -1384,3 +1384,14 @@ describe('P1 real HTTP transport (no Google traffic)', () => {
     })
   }
 })
+
+
+test('INC-20261112-AGY-ROUTE-LIFETIME: authority outage is 503 and never invokes upstream', async () => {
+  const token = await mintRoute()
+  const res = await relay(`${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:loadCodeAssist`,
+    { body: '{}' }, { status: 200, body: ['{}'] },
+    { resolveRoute: async () => { throw new Error('PG unavailable') } })
+  assert.equal(res.status, 503)
+  assert.match(res.text, /ANTIGRAVITY_AUTHORITY_UNAVAILABLE/)
+  assert.equal(res.captured.calls, 0)
+})

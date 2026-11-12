@@ -1,3 +1,5 @@
+import { readAntigravityRouteAuthority } from '../billing/antigravityRouteAuthority.js';
+import { createIoredisAntigravityRelayKv, configureAntigravityRelayAuthority } from '../billing/antigravityRouteContext.js';
 import { createBoxFailureDiagnostics } from "../http/proxy/boxFailureDiagnostic.js";
 import { FileBoxContextTransport } from "../http/proxy/boxContextTransport.js";
 import { startLogTimingReporter } from '../logging/logTimingReporter.js';
@@ -208,7 +210,8 @@ export async function startEgress(): Promise<void> {
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityRelayKv(createIoredisAntigravityRelayKv(redis));
+  configureAntigravityRelayAuthority((route) => readAntigravityRouteAuthority(getPool(), route));
   configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
   const pricing = new PricingCache();
   try {
