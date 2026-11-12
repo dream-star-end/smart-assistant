@@ -30,6 +30,7 @@ import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 import { rootLogger } from "../../logging/logger.js";
 import type { BoxNativeMissDetail } from "./boxNativeContextDiagnosis.js";
+import { isBoxExecRejectedError } from "./boxSpoolPoller.js";
 
 const fetchLog = rootLogger.child({ subsys: "box-tool-fetch" });
 
@@ -615,8 +616,11 @@ export class BoxToolFetch {
               onUnknown: this.deps.onUnknown }).catch(async (error: unknown) => {
               // OCV5-328: a stream the decoder rejects is as undeliverable
               // as a rejected echo; stop the run instead of holding the slot.
+              // OCV5-762: Exec refused (417) even after one refreshed retry: the
+              // CLI cannot be followed any more; stop it so the slot is free.
               if (error instanceof BoxToolResultEchoError
-                || error instanceof BoxCliToolHandoffError) {
+                || error instanceof BoxCliToolHandoffError
+                || isBoxExecRejectedError(error)) {
                 await this.stopEchoRejected(args, claim);
               }
               throw error;

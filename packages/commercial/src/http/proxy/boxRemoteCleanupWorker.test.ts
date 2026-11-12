@@ -694,3 +694,18 @@ test("OCV5-488 a handoff in the active container is never stopped, however long 
   assert.deepEqual(await raced.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
   assert.deepEqual(raced.sequence, ["proof-read", "intent", "dispose"]);
 });
+
+test("OCV5-762 an exec-rejected round is stopped after the short grace", async () => {
+  const stopped = ["proof-read", "intent", "keeper-stop", "proof-read", "stopped-CAS", "dispose"];
+  for (const phase of ["continuation_exec_rejected", "first_round_exec_rejected"]) {
+    const young = staleResumeWorker({ phase, unknownForMs: 2_000 });
+    assert.deepEqual(await young.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 }, phase);
+  }
+  const rejected = staleResumeWorker({ phase: "continuation_exec_rejected", unknownForMs: 11_000 });
+  assert.deepEqual(await rejected.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(rejected.sequence, stopped);
+  const first = staleResumeWorker({ phase: "first_round_exec_rejected", unknownForMs: 11_000, linked: false });
+  assert.deepEqual(await first.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(first.sequence, ["proof-read", "intent", "keeper-stop", "proof-read",
+    "first-round-CAS", "dispose"]);
+});

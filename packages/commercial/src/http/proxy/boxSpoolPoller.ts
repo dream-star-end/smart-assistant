@@ -25,6 +25,26 @@ export function isTransientBoxSpoolReadError(error: unknown): boolean {
     && TRANSIENT_READ_CODES.has(error.code);
 }
 
+// OCV5-762 (uid 4, 2026-11-12 19:53:39 / 20:03:40 CST): after minutes of a
+// long Box turn Cursor's Exec gateway answered one spool read with HTTP 417
+// and the whole turn was lost; its run then held the session's slot
+// (BOX_CAPACITY_HELD, BOX_RESUME_IN_PROGRESS). The transport now refreshes its
+// descriptor before the next call, so a read at the unchanged offset is
+// retried once on the fresh descriptor. A second 417 with no progress in
+// between, or a failed refresh, ends the round as rejected: the caller stops
+// the run at once so the next message starts fresh.
+const REJECTED_CODES = new Set(["BOX_EXEC_HTTP_417"]);
+export const BOX_SPOOL_REJECTED_RETRIES = 1;
+export function isBoxExecRefreshRetryable(error: unknown): boolean {
+  return error instanceof BoxExecTransportError && !error.terminalKnown
+    && REJECTED_CODES.has(error.code);
+}
+/** The Box run cannot be reached on its descriptor, even after one refresh. */
+export function isBoxExecRejectedError(error: unknown): boolean {
+  return error instanceof BoxExecTransportError && !error.terminalKnown
+    && (REJECTED_CODES.has(error.code) || error.code === "BOX_EXEC_REFRESH_FAILED");
+}
+
 async function pause(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) throw new BoxSpoolPollError("BOX_SPOOL_POLL_ABORTED");
   await new Promise<void>((resolve, reject) => {
@@ -63,6 +83,8 @@ export async function* pollBoxSpoolLines(input: {
   let offset = input.startOffset;
   const retryDelays = input.retryDelaysMs ?? BOX_SPOOL_READ_RETRY_DELAYS_MS;
   let failures = 0;
+  /** OCV5-762: 417 retries since the last read that made progress. */
+  let rejected = 0;
   try {
     while (true) {
       if (abort.signal.aborted) throw new BoxSpoolPollError(expired
@@ -73,6 +95,15 @@ export async function* pollBoxSpoolLines(input: {
       catch (error) {
         if (abort.signal.aborted) throw new BoxSpoolPollError(expired
           ? "BOX_SPOOL_POLL_TIMEOUT" : "BOX_SPOOL_POLL_ABORTED");
+        if (isBoxExecRefreshRetryable(error)) {
+          if (rejected >= BOX_SPOOL_REJECTED_RETRIES) throw error;
+          rejected++;
+          try { await pause(retryDelays[0] ?? 250, abort.signal); }
+          catch {
+            throw new BoxSpoolPollError(expired ? "BOX_SPOOL_POLL_TIMEOUT" : "BOX_SPOOL_POLL_ABORTED");
+          }
+          continue;
+        }
         if (!isTransientBoxSpoolReadError(error) || failures >= retryDelays.length) throw error;
         try { await pause(retryDelays[failures++]!, abort.signal); }
         catch {
@@ -81,6 +112,7 @@ export async function* pollBoxSpoolLines(input: {
         continue;
       }
       failures = 0;
+      if (chunk.bytes.length > 0) rejected = 0;
       const lines = framer.push(chunk.bytes, offset);
       offset = chunk.nextOffset;
       for (const line of lines) {

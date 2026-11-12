@@ -9,6 +9,7 @@ import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxNativePointer } from "./boxNativePointer.js";
+import { BoxExecTransportError } from "./boxExecTransport.js";
 
 const tools = [{ name: "local_echo", description: "synthetic",
   input_schema: { type: "object", properties: {} } }];
@@ -737,4 +738,26 @@ test("real ToolFetch and first-round chain preserve proven no-egress error befor
     if (inherited === undefined) Reflect.deleteProperty(process.env, "OC_INSTANCE_ID");
     else process.env.OC_INSTANCE_ID = inherited;
   }
+});
+
+// OCV5-762 (uid 4, 2026-11-12): the continuation's Exec calls were refused
+// (417) even after one refreshed retry. Left alone, the run held the slot and
+// the retries got 409 BOX_CAPACITY_HELD / BOX_RESUME_IN_PROGRESS.
+test("OCV5-762 an Exec refusal that survived its retry stops the run like a rejected echo", async () => {
+  for (const code of ["BOX_EXEC_HTTP_417", "BOX_EXEC_REFRESH_FAILED"]) {
+    let identity: unknown;
+    const { service, calls, claim } = echoRejectedService(async (seen) => {
+      identity = seen; return "stopped_proven";
+    }, 200, new BoxExecTransportError(code, false));
+    const response = await service.fetch(call(resultBody));
+    await assert.rejects(response.text(), new RegExp(code));
+    assert.deepEqual(calls, ["continuation", "stop"], code);
+    assert.deepEqual(identity, { requestId: "box-next", uid: 3n, accountId: claim.accountId,
+      runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch });
+  }
+  // a plain transport failure keeps the timed path
+  const { service, calls } = echoRejectedService(async () => "stopped_proven", 200,
+    new BoxExecTransportError("BOX_EXEC_HTTP_503", false));
+  await assert.rejects((await service.fetch(call(resultBody))).text(), /BOX_EXEC_HTTP_503/);
+  assert.deepEqual(calls, ["continuation"]);
 });

@@ -575,7 +575,25 @@ export class BoxAccountResolver {
       const descriptor = await client.resolveBoxExec(credential, machine, args.signal,
         { allowWakeIfHibernated: args.allowWakeIfHibernated === true });
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
-      const transport = new BoxExecTransport(descriptor, fetchImpl, assertCurrent);
+      // OCV5-762: after an Exec 417 the transport asks for a fresh descriptor of
+      // this same Box. The credential is re-read and must be the one this target
+      // was resolved with; a Box that is not RUNNING is never woken for it.
+      const refreshTarget = async (signal: AbortSignal) => {
+        await assertCurrent();
+        const fresh = await this.deps.snapshot(accountId);
+        if (!fresh) throw new BoxAccountResolverError("BOX_ACCOUNT_CHANGED");
+        let token: string;
+        try {
+          if (fresh.credential_kind !== "session" || fresh.machine_id !== machine
+            || !fresh.expires_at || fresh.expires_at.getTime() <= now() + MIN_REMAINING_MS
+            || !same(tokenHash, digest([fresh.token]))) {
+            throw new BoxAccountResolverError("BOX_ACCOUNT_CHANGED");
+          }
+          token = fresh.token.toString("utf8");
+        } finally { fresh.token.fill(0); fresh.refresh?.fill(0); }
+        return client.resolveBoxExec(token, machine, signal, { allowWakeIfHibernated: false });
+      };
+      const transport = new BoxExecTransport(descriptor, fetchImpl, assertCurrent, { refreshTarget });
       if (this.deps.profiles && !inspectOnly && profile !== BOX_DEFAULT_PROFILE) {
         await this.guardLogin(transport, accountId, profile, args.signal);
       }

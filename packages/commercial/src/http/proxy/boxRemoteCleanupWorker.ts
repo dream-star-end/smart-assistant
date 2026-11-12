@@ -42,11 +42,14 @@ function probeFailureTag(error: unknown): { reason: string; cause?: string } {
  * or first round (#1a28c670: a continuation_unknown leaf ran on alone for an
  * hour). A rejected result echo is stopped at once: its request already failed
  * and whatever the CLI writes next can reach nobody. OCV5-328: so is a stream
- * the handoff decoder rejected (#27da48a8). */
+ * the handoff decoder rejected (#27da48a8). OCV5-762:
+ * and so is a round whose Exec calls Cursor refused (417) even after one
+ * refreshed retry, first round or continuation. */
 const STALE_UNKNOWN_STOP_AFTER_MS = 20 * 60_000;
 const STALE_UNKNOWN_FAST_STOP_AFTER_MS = 10_000;
 const STALE_UNKNOWN_FAST_PHASES: ReadonlySet<string> = new Set(
-  ["resume_publish_unsent", "continuation_echo_rejected", "continuation_stream_rejected"]);
+  ["resume_publish_unsent", "continuation_echo_rejected", "continuation_stream_rejected",
+    "continuation_exec_rejected", "first_round_exec_rejected"]);
 
 function staleResumeDue(candidate: BoxStoppedFailureProbeCandidate): BoxStaleResumePhase | null {
   const stale = candidate.staleResume;
