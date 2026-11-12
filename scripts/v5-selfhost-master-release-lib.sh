@@ -1999,7 +1999,7 @@ remote_v4_cutover_reopen() {
 remote_v4_cutover_drain() {
   local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
   local timeout_ms="${OC_REMOTE_V4_DRAIN_TIMEOUT_MS:-600000}"
-  local run_id="${LEASE_TRAIN_ID:-cutover-$$}" out rc=0 v4_active
+  local run_id="${LEASE_TRAIN_ID:-cutover-$$}" out rc=0 v4_active has_version
   if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
     return 0
   fi
@@ -2015,13 +2015,28 @@ remote_v4_cutover_drain() {
     return 0
   fi
   if [[ "$rc" == 75 ]]; then
-    v4_active="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
-SELECT CASE WHEN EXISTS (
+    # PostgreSQL resolves column names even in an unselected CASE branch. Check
+    # the schema separately: on the first v4 release this runs before 0339.
+    if ! has_version="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT EXISTS (
   SELECT 1 FROM information_schema.columns
    WHERE table_schema='public' AND table_name='remote_agent_bindings' AND column_name='remote_protocol_version'
-) THEN (
-  SELECT count(*)::text FROM remote_agent_bindings WHERE remote_protocol_version=4 AND state<>'released'
-) ELSE '0' END;" 2>/dev/null || echo "ERR")"
+)::text;" 2>/dev/null)"; then
+      cutover_clog "  ✗ remote-v4 schema 查询失败;拒绝切流"
+      return 1
+    fi
+    case "$has_version" in
+      false) v4_active=0 ;;
+      true)
+        if ! v4_active="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT count(*)::text FROM public.remote_agent_bindings
+ WHERE remote_protocol_version=4 AND state<>'released';" 2>/dev/null)"; then
+          cutover_clog "  ✗ remote-v4 绑定计数查询失败;拒绝切流"
+          return 1
+        fi
+        ;;
+      *) cutover_clog "  ✗ remote-v4 schema 查询结果无效;拒绝切流"; return 1 ;;
+    esac
     if [[ "$v4_active" == "0" ]]; then
       cutover_clog "  remote-v4 drain socket absent ($sock); active_v4_bindings=0,继续切流"
       return 0
