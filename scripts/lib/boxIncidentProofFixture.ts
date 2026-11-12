@@ -780,21 +780,25 @@ function boxTurn(api: Api, db: Db, journal: Journal, who: { uid: bigint; contain
     /** The Box account cannot be reached for a continuation publish. */
     unreachable?: { active: boolean };
     /** OCV5-488: what a liveness look finds of this run on the Box. */
-    liveness?: { state: string; boot: string } } = {}) {
-  const cut = { active: false };
-  const { parked, unreachable, liveness, ...hostOptions } = options;
+    liveness?: { state: string; boot: string };
+    /** OCV5-762: a rejected round is stopped through the product's stop coordinator, as egress wires it. */
+    stopRejected?: boolean } = {}) {
+  const cut = { active: false, code: "BOX_EXEC_HTTP_500" };
+  const { parked, unreachable, liveness, stopRejected, ...hostOptions } = options;
   const host: ReturnType<typeof boxHost> = boxHost(api, spoolOf([cliInit, ...BRIDGE_CALL]), {
     ...(parked ? { proofRead: () => { if (parked === "unreadable" || host.count.stop === 0) throw api.transportError("BOX_EXEC_REMOTE_EXIT"); } } : {}),
     ...(liveness ? { liveness } : {}),
     // the exec stream of a continuation is cut in a way a re-read cannot repair
-    spoolRead: () => { if (cut.active) throw api.transportError("BOX_EXEC_HTTP_500"); },
+    spoolRead: () => { if (cut.active) throw api.transportError(cut.code); },
     real: { journal, ...who, accountId: who.containerId, requestId: `${name}-1`, turnKey, ...hostOptions } });
   const service = api.toolFetch({ ...host.deps, ...(writeMessage ? { writeMessage } : {}),
     ...(unreachable ? { resolveTarget: async () => {
       if (unreachable.active) throw Object.assign(new Error("BOX_TARGET_UNAVAILABLE"), { code: "BOX_TARGET_UNAVAILABLE" });
       return host.target;
     } } : {}),
-    stopOrphanRun: (identity: unknown) => api.stopCoordinator(journal, host.target).requestStop(identity) });
+    stopOrphanRun: (identity: unknown) => api.stopCoordinator(journal, host.target).requestStop(identity),
+    ...(stopRejected ? { stopRejectedRun: (identity: unknown) =>
+      api.stopCoordinator(journal, host.target).requestStop(identity) } : {}) });
   const exchange = [{ role: "user", content: "run it" },
     { role: "assistant", content: [text("Using the bridge."),
       { type: "tool_use", id: "toolu_good_1", name: "Bash", input: { value: "x" } }] },

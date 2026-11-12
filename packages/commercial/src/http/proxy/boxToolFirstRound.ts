@@ -12,7 +12,8 @@ import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError,
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
-import { BoxSpoolTerminalError, isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { BoxSpoolTerminalError, isBoxExecRejectedError, isTransientBoxSpoolReadError,
+  pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { boxFailureFromError } from "./boxFailureEvidence.js";
 import { rootLogger } from "../../logging/logger.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
@@ -729,10 +730,13 @@ export async function runBoxToolFirstRound(input: {
           ? "BOX_TOOL_NAME_UNAVAILABLE" : error.code);
       }
     }
-    if (launchAttempted) await unknown("first_round_unknown");
+    // OCV5-762: Exec refused (417) even after one refreshed retry: the run
+    // cannot be followed; name it and stop it now so the next message is fresh.
+    const execRejected = isBoxExecRejectedError(error);
+    if (launchAttempted) await unknown(execRejected ? "first_round_exec_rejected" : "first_round_unknown");
     if (launchAttempted && admitted && target && deps.stopRejectedRun
-      && error instanceof BoxToolFirstRoundError
-      && error.code === "BOX_TOOL_TERMINAL_UNPROVEN") {
+      && (execRejected || (error instanceof BoxToolFirstRoundError
+        && error.code === "BOX_TOOL_TERMINAL_UNPROVEN"))) {
       // Same explicit stop as a rejected stream, once, and bounded. A keeper
       // proof is settled by that stop path. This catch does not call complete.
       const stop = deps.stopRejectedRun;

@@ -10065,6 +10065,65 @@
           "assertion": "Knowledge Planet login broker loads the WeChat QR image with more than 9 concurrent tunnels"
         }
       ]
+    },
+    {
+      "id": "INC-20261112-BOX-EXEC-417-WEDGE",
+      "occurredAt": "2026-11-12",
+      "severity": "P1",
+      "symptom": "商业 uid 4 新开 Box Claude 对话连续 14 轮工具续跑后，一次续跑的 Exec POST 被 Cursor 返回 HTTP 417，回合断掉且 run 不退出、槽位不放；再发一句先报 503 BOX_REPLAY_UNAVAILABLE / 409 BOX_CAPACITY_HELD，新回合约 5.5 分钟后又遇 417，之后 BOX_RESUME_IN_PROGRESS，「再继续就不行」。417 原本不重试、也不刷新描述符，正文不记录。4cc72ec3 让 417 后下一次调用先向同一台 Box 重取 Exec 描述符（不唤醒），spool 读取同一偏移重试一次；仍被拒则立刻显式停 run 释放槽位，下一句 fresh launch；417 正文有界脱敏写日志。",
+      "rootFixCommit": "4cc72ec3",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxExecTransport.test.ts",
+          "assertion": "a 417 is not retried by the transport; the next call uses a refreshed descriptor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxExecTransport.test.ts",
+          "assertion": "the rejection excerpt is bounded and reads at most 2048 body bytes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.test.ts",
+          "assertion": "OCV5-762 an Exec 417 refreshes this Box's descriptor before the next call and never wakes it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-762: an Exec 417 re-reads the same offset once (on the refreshed descriptor)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-762: a second 417 without progress ends the poll as rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "OCV5-762 a 417 that survives the refreshed retry is journaled as continuation_exec_rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "OCV5-762 an Exec refusal that survived its retry stops the run like a rejected echo"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "OCV5-762 a first round whose Exec reads stay refused is named and stopped once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-762 an exec-rejected round is stopped after the short grace"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-762-exec-417-wedge] PASS"
+        }
+      ]
     }
   ]
 }

@@ -4,6 +4,9 @@ import {
   parseExecFramesStrict,
   type BoxCcExecRequest,
 } from "@openclaude/gateway";
+import { rootLogger } from "../../logging/logger.js";
+
+const transportLog = rootLogger.child({ subsys: "box-exec-transport" });
 
 export interface BoxExecTarget {
   execUrl: string;
@@ -28,6 +31,103 @@ export interface BoxExecResult {
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
 
+/** What one Exec 417 said, already reduced to a bounded, redacted excerpt. */
+export interface BoxExecRejection {
+  status: number;
+  /** Body bytes read (at most BOX_EXEC_REJECTION_READ_BYTES); the rest is never read. */
+  bodyBytes: number;
+  excerpt: string;
+}
+
+export interface BoxExecTransportOptions {
+  /** OCV5-762: Cursor's Exec gateway answered HTTP 417 in the middle of a
+   * long Box turn (uid 4, 2026-11-12 19:53:39 and 20:03:40 CST) and the turn
+   * could never continue. After a 417 the next call first asks for a fresh
+   * Exec descriptor of the same Box (new URL/tokens), so a caller that retries
+   * an idempotent read does not resend on the descriptor that was refused.
+   * The transport itself still never retries a request. */
+  refreshTarget?: (signal: AbortSignal) => Promise<BoxExecTarget>;
+  /** Deadline of one shared refresh (default BOX_EXEC_REFRESH_TIMEOUT_MS). */
+  refreshTimeoutMs?: number;
+  /** Observation hook for a 417 (tests, proofs). Logging happens regardless. */
+  onRejected?: (rejection: BoxExecRejection) => void;
+}
+
+/** GetState + one Ensure each have a 15 s client timeout; a refresh that has not
+ * produced a descriptor by then has failed. */
+export const BOX_EXEC_REFRESH_TIMEOUT_MS = 20_000;
+
+export const BOX_EXEC_REJECTION_READ_BYTES = 2048;
+const BOX_EXEC_REJECTION_EXCERPT_CHARS = 300;
+const BOX_EXEC_REJECTION_READ_MS = 500;
+
+/** Bounded, content-safe excerpt of an Exec rejection body: control
+ * characters dropped, bearer values, JWT-like values, URL queries, long
+ * opaque runs and the caller's own secrets replaced, then capped. */
+export function redactBoxExecRejection(bytes: Uint8Array, secrets: readonly string[] = []): string {
+  let text = Buffer.from(bytes.subarray(0, BOX_EXEC_REJECTION_READ_BYTES)).toString("utf8");
+  for (const secret of secrets) {
+    if (secret.length >= 8) text = text.split(secret).join("<redacted>");
+  }
+  text = Array.from(text, (ch) => {
+    const code = ch.codePointAt(0) ?? 0;
+    return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0xfffd ? " " : ch;
+  }).join("")
+    .replace(/\bbearer\s+[^\s"',;]+/gi, "Bearer <redacted>")
+    .replace(/eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?/g, "<redacted>")
+    .replace(/(https?:\/\/[^\s?#"'<>]+)[?#][^\s"'<>]*/gi, "$1?<redacted>")
+    .replace(/[A-Za-z0-9+/=_.~-]{24,}/g, "<redacted>")
+    .replace(/\s+/g, " ").trim();
+  return text.length > BOX_EXEC_REJECTION_EXCERPT_CHARS
+    ? `${text.slice(0, BOX_EXEC_REJECTION_EXCERPT_CHARS)}…` : text;
+}
+
+function validTarget(target: BoxExecTarget): boolean {
+  if (!target || typeof target.execUrl !== "string" || typeof target.execToken !== "string"
+    || typeof target.networkToken !== "string") return false;
+  let url: URL;
+  try { url = new URL(target.execUrl); }
+  catch { return false; }
+  return url.protocol === "https:" && !url.username && !url.password && !url.hash
+    && target.execToken.length > 0 && target.networkToken.length > 0;
+}
+
+/** Read at most BOX_EXEC_REJECTION_READ_BYTES of a rejection body within a
+ * short, deadline-bounded window, then cancel the rest. Never throws. */
+async function readRejectionBody(body: ReadableStream<Uint8Array> | null,
+  deadlineAt: number): Promise<Buffer> {
+  if (!body) return Buffer.alloc(0);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const stopAt = Math.min(deadlineAt, Date.now() + BOX_EXEC_REJECTION_READ_MS);
+  try {
+    reader = body.getReader();
+    while (total < BOX_EXEC_REJECTION_READ_BYTES) {
+      const remaining = stopAt - Date.now();
+      if (remaining <= 0) break;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const next = await Promise.race([reader.read(), new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), remaining);
+      })]).finally(() => { if (timer) clearTimeout(timer); });
+      if (next === null || next.done) break;
+      const take = Buffer.from(next.value.subarray(0, BOX_EXEC_REJECTION_READ_BYTES - total));
+      chunks.push(take);
+      total += take.length;
+    }
+  } catch { /* an unreadable body is reported as what was read */ }
+  finally {
+    if (reader) {
+      const held = reader;
+      await boundedCancel(() => held.cancel(), deadlineAt);
+      try { held.releaseLock(); } catch { /* pending read/cancel already detached */ }
+    } else {
+      await boundedCancel(() => body.cancel(), deadlineAt);
+    }
+  }
+  return Buffer.concat(chunks);
+}
+
 /** A tee'd or broken stream can keep cancel() pending forever. Cancellation is
  * best-effort cleanup, never a second unbounded phase after the call deadline.
  */
@@ -49,9 +149,14 @@ async function boundedCancel(cancel: () => Promise<unknown>, deadlineAt: number)
 }
 
 export class BoxExecTransport {
-  constructor(private readonly target: BoxExecTarget,
+  private target: BoxExecTarget;
+  /** OCV5-762: set by an HTTP 417; the next call refreshes the descriptor first. */
+  private refreshDue = false;
+  private refreshing: Promise<BoxExecTarget> | null = null;
+  constructor(target: BoxExecTarget,
     private readonly fetchImpl: FetchFn,
-    private readonly assertCurrent: () => Promise<void>) {
+    private readonly assertCurrent: () => Promise<void>,
+    private readonly options: BoxExecTransportOptions = {}) {
     let url: URL;
     try { url = new URL(target.execUrl); }
     catch { throw new BoxExecTransportError("BOX_EXEC_TARGET_INVALID", false); }
@@ -59,6 +164,42 @@ export class BoxExecTransport {
       || !target.execToken || !target.networkToken) {
       throw new BoxExecTransportError("BOX_EXEC_TARGET_INVALID", false);
     }
+    this.target = { execUrl: target.execUrl, execToken: target.execToken,
+      networkToken: target.networkToken };
+  }
+
+  /** One shared refresh at a time, bounded by its own deadline (a hung control
+   * plane must not leave every later call waiting on it); each caller also races
+   * it against its own deadline. */
+  private refreshOnce(): Promise<BoxExecTarget> {
+    const refresh = this.options.refreshTarget;
+    if (!refresh) return Promise.resolve(this.target);
+    if (!this.refreshing) {
+      const own = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          own.abort();
+          reject(new BoxExecTransportError("BOX_EXEC_REFRESH_FAILED", false));
+        }, this.options.refreshTimeoutMs ?? BOX_EXEC_REFRESH_TIMEOUT_MS);
+      });
+      const pending = Promise.race([
+        Promise.resolve().then(() => refresh(own.signal)),
+        expired,
+      ]).then((next) => {
+        if (!validTarget(next)) throw new BoxExecTransportError("BOX_EXEC_REFRESH_FAILED", false);
+        this.target = { execUrl: next.execUrl, execToken: next.execToken,
+          networkToken: next.networkToken };
+        this.refreshDue = false;
+        return this.target;
+      });
+      this.refreshing = pending;
+      void pending.finally(() => {
+        if (timer) clearTimeout(timer);
+        if (this.refreshing === pending) this.refreshing = null;
+      }).catch(() => {});
+    }
+    return this.refreshing;
   }
 
   async run(request: BoxCcExecRequest, opts: {
@@ -113,15 +254,34 @@ export class BoxExecTransport {
         throw new BoxExecTransportError("BOX_EXEC_ACCOUNT_GUARD_FAILED", false);
       }));
       ensureLive();
+      if (this.refreshDue && this.options.refreshTarget) {
+        try { await raceAbort(this.refreshOnce()); }
+        catch (error) {
+          // A caller that gives up is ABORTED; running out of time while the
+          // descriptor is still being refreshed is a failed refresh, not a
+          // transient timeout, so the round is stopped instead of retried.
+          if (abortOrigin === "caller") throw abortedError();
+          if (error instanceof BoxExecTransportError && error.code !== "BOX_EXEC_REFRESH_FAILED"
+            && abortOrigin === null) throw error;
+          throw new BoxExecTransportError("BOX_EXEC_REFRESH_FAILED", false);
+        }
+        ensureLive();
+        // The account/credential/egress may have changed while we waited.
+        await raceAbort(Promise.resolve().then(() => this.assertCurrent()).catch(() => {
+          throw new BoxExecTransportError("BOX_EXEC_ACCOUNT_GUARD_FAILED", false);
+        }));
+        ensureLive();
+      }
+      const target = this.target;
       let response: Response;
       try {
-        response = await raceAbort(this.fetchImpl(this.target.execUrl, {
+        response = await raceAbort(this.fetchImpl(target.execUrl, {
           method: "POST", redirect: "error", signal: abort.signal,
           headers: {
-            authorization: `Bearer ${this.target.execToken}`,
+            authorization: `Bearer ${target.execToken}`,
             "content-type": "application/connect+json",
             "connect-protocol-version": "1",
-            "x-anyrun-network-token": this.target.networkToken,
+            "x-anyrun-network-token": target.networkToken,
           },
           body: new Uint8Array(body),
         }));
@@ -132,7 +292,17 @@ export class BoxExecTransport {
       }
       ensureLive();
       if (!response.ok || !response.body) {
-        if (response.body) await boundedCancel(() => response.body!.cancel(), deadlineAt);
+        if (response.status === 417) {
+          // OCV5-762: the descriptor was refused; refresh it before the next call
+          // and keep a bounded, redacted copy of what Cursor said.
+          this.refreshDue = true;
+          const raw = await readRejectionBody(response.body, deadlineAt);
+          const rejection: BoxExecRejection = { status: 417, bodyBytes: raw.length,
+            excerpt: redactBoxExecRejection(raw, [target.execToken, target.networkToken]) };
+          transportLog.warn("box_exec_http_rejected", { ...rejection,
+            refresh: this.options.refreshTarget ? "next_call" : "unavailable" });
+          try { this.options.onRejected?.(rejection); } catch { /* observation only */ }
+        } else if (response.body) await boundedCancel(() => response.body!.cancel(), deadlineAt);
         throw new BoxExecTransportError(`BOX_EXEC_HTTP_${response.status}`, false);
       }
       reader = response.body.getReader();
