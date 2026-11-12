@@ -12,7 +12,7 @@ import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { after, before, test } from 'node:test'
+import { after, before, mock, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { Pool } from 'pg'
@@ -37,7 +37,8 @@ import {
   zeroNativeTokens,
   type CodexRemoteBinding,
 } from '@openclaude/gateway/remote-finance'
-import { remotePoolBackendOf, type RemotePoolBinding } from '@openclaude/gateway/remote-pool'
+import { RemotePoolSshHost, remotePoolBackendOf, type RemotePoolBinding } from '@openclaude/gateway/remote-pool'
+import { reconcileRemoteChat, reconcileRemoteLane, reconcileStaleContainerLanes } from '../account-pool/remoteLaneRecovery.js'
 import { createMasterCc5Runtime, selectMasterCc5Backend } from '../agent-sandbox/cc5Runtime.js'
 import { EVENTS } from '../admin/alertEvents.js'
 import {
@@ -49,6 +50,7 @@ import {
   placeRemoteDriverLane,
   recordDriverProbeSnapshot,
   recordRemoteDriverLaneState,
+  recordRemoteDriverStartAttempt,
   startRemoteReleaseDrainSocketServer,
   verificationSessionKeyForRun,
 } from '../account-pool/remotePool/index.js'
@@ -392,6 +394,174 @@ before(async () => {
 
 after(async () => {
   await closePool()
+})
+
+// These are recovery/PG contract tests, not the eight-item live commissioning suite.
+for (const driverId of ['cc', 'codex'] as const) {
+  test(`v4 stop-only recovery: ${driverId} needs both proofs, fences restart and preserves pending finance`, async () => {
+    const lane = await placeRemoteDriverLane({
+      uid, containerDbId: '7', dockerId: 'a'.repeat(64),
+      sessionKey: `agent:main:webchat:dm:recovery_${driverId}`,
+      canonicalModel: driverId === 'cc' ? CC_CANONICAL : CODEX_CANONICAL, driverId,
+    }, { pool })
+    const { operationId, generation } = lane.binding
+    const read = async () => (await pool.query('SELECT * FROM remote_agent_bindings WHERE operation_id=$1', [operationId])).rows[0]
+    const requestId = `recovery_${driverId}_${randomUUID()}`
+    const port = createRemoteDriverTurnFinance({
+      pool, preCheckRedis: { eval: async () => 0 } as any,
+      catalog: { assertFresh: async () => catalog } as unknown as ModelCatalogCache,
+      keyring: keys,
+      loadUserModelAuthz: async (userId) => ({ uid: userId, role: 'user', grantedModelIds: new Set<string>(),
+        deniedModelIds: new Set<string>(), userPlanTier: null, orgPlanCode: null }),
+      log: createLogger({ out: () => {} }),
+    }, { reserve: async () => ({ maxCost: 100n }) as any, release: async () => true })
+    const signed = await issueSignedTurn(uid, lane.binding, requestId)
+    const turn = await port.admit({ binding: lane.binding, usagePolicy: driverId === 'cc' ? CC_USAGE_POLICY : CODEX_USAGE_POLICY,
+      sessionKey: lane.binding.sessionKey, turnKey: signed.turnKey,
+      authorityEnvelope: signed.authorityEnvelope, leaseEnvelope: signed.leaseEnvelope })
+    await recordRemoteDriverLaneState(operationId, generation, 'running', pool)
+    await recordRemoteDriverStartAttempt(operationId, generation, pool)
+    await turn.beforeHostStart()
+    await turn.bindNativeThread(`recovery-native-${driverId}`, true)
+    await recordRemoteDriverLaneState(operationId, generation, 'unknown', pool)
+    const financialState = async () => ({
+      journal: (await pool.query('SELECT * FROM request_finalize_journal WHERE request_id=$1', [requestId])).rows,
+      threads: (await pool.query('SELECT * FROM remote_native_threads WHERE operation_id=$1', [operationId])).rows,
+      turns: (await pool.query('SELECT * FROM remote_native_turns WHERE operation_id=$1', [operationId])).rows,
+      balance: (await pool.query('SELECT credits FROM users WHERE id=$1', [uid])).rows,
+    })
+    const before = await financialState()
+    assert.equal(before.threads[0].pending_request_id, requestId)
+    let remoteCalls = 0
+    const proofs = { proveLocal: async () => {}, proveRemoteV4: async () => {
+      remoteCalls++; return { remoteStopped: true as const }
+    } }
+    try {
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, {
+        ...proofs, proveLocal: async () => { throw new Error('local-still-running') },
+      }), /local-still-running/)
+      assert.equal(remoteCalls, 0)
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, {
+        ...proofs, proveRemoteV4: async () => { throw new Error('node-unproven') },
+      }), /node-unproven/)
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, {
+        ...proofs, proveRemoteV4: async () => ({ remoteStopped: false }) as any,
+      }), /UNPROVEN/)
+      assert.equal((await read()).state, 'unknown')
+
+      // Exercise the production factory selection: recovery MUST use restoreExisting=true,
+      // otherwise a new host object's empty opened-set would falsely prove zero host effects.
+      const factory = mock.method(RemotePoolSshHost, 'forSshTarget', (...[target, spec, spawn, restore]: Parameters<typeof RemotePoolSshHost.forSshTarget>) => {
+        assert.deepEqual(target, lane.sshTarget)
+        assert.deepEqual(spec, lane.spec)
+        assert.equal(spawn, undefined)
+        assert.equal(restore, true)
+        return { stop: async () => { remoteCalls++; return { remoteStopped: true, noHostEffect: false } } } as any
+      })
+      try {
+        await reconcileRemoteChat(pool, Number(uid), lane.binding.sessionKey, { proveLocal: async id => {
+          assert.equal(id, lane.binding.dockerId)
+        } })
+      } finally { factory.mock.restore() }
+      assert.equal(remoteCalls, 1)
+      assert.equal((await read()).state, 'released')
+      assert.equal((await read()).no_host_effect_proven, false)
+      assert.deepEqual(await financialState(), before, 'capacity recovery must not finalize or clear the pending owner')
+      await assert.rejects(recordRemoteDriverLaneState(operationId, generation, 'running', pool), /FENCED/)
+      await assert.rejects(recordRemoteDriverStartAttempt(operationId, generation, pool), /FENCED/)
+      await reconcileRemoteLane(pool, operationId, generation, { proveLocal: async () => { throw new Error('already released') } })
+    } finally {
+      // The fixture never dispatched a user turn. Clean it via finance only AFTER proving
+      // that recovery itself left the pending owner/journal intact (later tests scan all journals).
+      await turn.abandonUndispatched()
+      await pool.query("UPDATE remote_agent_bindings SET state='released' WHERE operation_id=$1", [operationId])
+    }
+  })
+}
+
+test('v4 stop-only recovery: unstarted lanes never take the legacy Codex shortcut; stale-container entry uses both proofs', async () => {
+  for (const driverId of ['cc', 'codex'] as const) {
+    const lane = await placeRemoteDriverLane({ uid, containerDbId: '7', dockerId: 'b'.repeat(64),
+      sessionKey: `agent:main:webchat:dm:recovery_unstarted_${driverId}`,
+      canonicalModel: driverId === 'cc' ? CC_CANONICAL : CODEX_CANONICAL, driverId }, { pool })
+    const { operationId, generation } = lane.binding
+    try {
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, {
+        proveLocal: async () => { throw new Error('local-still-running') },
+      }), /local-still-running/)
+      assert.equal(await reconcileStaleContainerLanes(pool, Number(uid), 'a'.repeat(64), {
+        proveLocal: async () => { throw new Error('local-still-running') },
+      }), 0)
+      const calls: string[] = []
+      assert.equal(await reconcileStaleContainerLanes(pool, Number(uid), 'a'.repeat(64), {
+        proveLocal: async id => { assert.equal(id, lane.binding.dockerId); calls.push('local') },
+        proveRemoteV4: async () => { calls.push('remote'); return { remoteStopped: true, noHostEffect: true } },
+      }), 1)
+      assert.deepEqual(calls, ['local', 'remote'])
+      const row = (await pool.query('SELECT * FROM remote_agent_bindings WHERE operation_id=$1', [operationId])).rows[0]
+      assert.equal(row.state, 'released')
+      assert.equal(row.no_host_effect_proven, true)
+    } finally { await pool.query("UPDATE remote_agent_bindings SET state='released' WHERE operation_id=$1", [operationId]) }
+  }
+})
+
+test('v4 stop-only recovery: frozen identity and post-proof CAS reject mismatches without releasing capacity', async () => {
+  const lane = await placeRemoteDriverLane({ uid, containerDbId: '7', dockerId: 'c'.repeat(64),
+    sessionKey: 'agent:main:webchat:dm:recovery_identity', canonicalModel: CC_CANONICAL, driverId: 'cc' }, { pool })
+  const { operationId, generation } = lane.binding
+  await recordRemoteDriverLaneState(operationId, generation, 'unknown', pool)
+  const original = (await pool.query('SELECT * FROM remote_agent_bindings WHERE operation_id=$1', [operationId])).rows[0]
+  let calls = 0
+  const proofs = { proveLocal: async () => { calls++ }, proveRemoteV4: async () => {
+    calls++; return { remoteStopped: true as const }
+  } }
+  const restore = async () => pool.query(`UPDATE remote_agent_bindings SET recovery_spec=$2, manifest_sha256=$3,
+    docker_id=$4, generation=$5, run_id=$6, remote_protocol_version=4, backend_kind=$7, state='unknown' WHERE operation_id=$1`,
+    [operationId, original.recovery_spec, original.manifest_sha256, original.docker_id, original.generation, original.run_id, original.backend_kind])
+  try {
+    // Even a recomputed hash cannot make a different operation/root/driver into this lane.
+    for (const [field, value] of Object.entries({ operationId: randomUUID(), runId: randomUUID(), generation: '2',
+      root: lane.spec.manifest.root + '-other', driverId: 'codex', engineId: 'codex',
+      authEpoch: 'other', driverDigest: 'e'.repeat(64), coreDigest: 'f'.repeat(64) })) {
+      const bad = structuredClone(original.recovery_spec)
+      bad.spec.manifest[field] = value
+      await pool.query('UPDATE remote_agent_bindings SET recovery_spec=$2, manifest_sha256=$3 WHERE operation_id=$1',
+        [operationId, bad, remoteCanonicalSha256(bad.spec.manifest)])
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, proofs), /UNPROVEN/, field)
+      assert.equal(calls, 0, `invalid ${field} must never reach either proof`)
+      await restore()
+    }
+    for (const field of ['operationId', 'runId', 'generation']) {
+      const bad = structuredClone(original.recovery_spec); bad[field] = 'other'
+      await pool.query('UPDATE remote_agent_bindings SET recovery_spec=$2 WHERE operation_id=$1', [operationId, bad])
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, proofs), /UNPROVEN/)
+      assert.equal(calls, 0); await restore()
+    }
+    await pool.query("UPDATE remote_agent_bindings SET manifest_sha256=$2 WHERE operation_id=$1", [operationId, 'd'.repeat(64)])
+    await assert.rejects(reconcileRemoteLane(pool, operationId, generation, proofs), /UNPROVEN/)
+    assert.equal(calls, 0); await restore()
+    for (const [column, value] of [['remote_protocol_version', 1], ['backend_kind', 'cc5-interactive-v1']] as const) {
+      await pool.query(`UPDATE remote_agent_bindings SET ${column}=$2 WHERE operation_id=$1`, [operationId, value])
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, proofs), /UNPROVEN/)
+      assert.equal(calls, 0); await restore()
+    }
+    // Scope changes between stop proof and release must fail the SQL CAS, not free the new owner.
+    for (const [column, value] of [['docker_id', 'd'.repeat(64)], ['generation', '2'], ['run_id', randomUUID()],
+      ['manifest_sha256', 'e'.repeat(64)], ['recovery_spec', { ...original.recovery_spec, changed: true }]] as const) {
+      await assert.rejects(reconcileRemoteLane(pool, operationId, generation, { ...proofs, proveRemoteV4: async () => {
+        await pool.query(`UPDATE remote_agent_bindings SET ${column}=$2 WHERE operation_id=$1`, [operationId, value])
+        return { remoteStopped: true }
+      } }), /UNPROVEN/)
+      assert.equal((await pool.query('SELECT state FROM remote_agent_bindings WHERE operation_id=$1', [operationId])).rows[0].state, 'unknown')
+      await restore()
+    }
+    // Recovery consumes the stored spec; current profile readiness/auth are not authority for an old generation.
+    const profile = (await pool.query('SELECT execution_ready,auth_epoch FROM remote_agent_profiles WHERE id=$1', [ccProfileId])).rows[0]
+    await pool.query("UPDATE remote_agent_profiles SET execution_ready=false,auth_epoch='rotated-after-placement' WHERE id=$1", [ccProfileId])
+    try { await reconcileRemoteLane(pool, operationId, generation, proofs) }
+    finally { await pool.query('UPDATE remote_agent_profiles SET execution_ready=$2,auth_epoch=$3 WHERE id=$1', [ccProfileId, profile.execution_ready, profile.auth_epoch]) }
+    assert.equal((await pool.query('SELECT state FROM remote_agent_bindings WHERE operation_id=$1', [operationId])).rows[0].state, 'released')
+  } finally { await restore(); await pool.query("UPDATE remote_agent_bindings SET state='released' WHERE operation_id=$1", [operationId]) }
 })
 
 test('v4 placement enforces (node, engine, profile) cap=5, same-account 2-session overlap, cross-engine independence, and sticky v3->v4 upgrade', async () => {
