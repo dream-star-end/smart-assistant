@@ -58,6 +58,35 @@
         "recycle-app",
         "reprovision-app"
       ]
+    },
+    "example_echo": {
+      "driverId": "example_echo",
+      "engineId": "example-echo",
+      "authorityEngine": "ccb",
+      "driverVersion": "1.0.0",
+      "module": "drivers/example_echo.py",
+      "runnerMode": "interactive",
+      "slice": "oc-example-echo.slice",
+      "sliceMemoryMiB": 1536,
+      "sliceTasksMax": 768,
+      "appMemoryMiB": 256,
+      "socketMemoryMiB": 32,
+      "probeMemoryMiB": 128,
+      "headroomMiB": 192,
+      "profileMaxLanes": 5,
+      "requireNodeObservation": false,
+      "roles": [
+        "provision",
+        "preflight",
+        "launch",
+        "tool-socket",
+        "stop",
+        "fence-stop",
+        "prove-stopped",
+        "probe",
+        "recycle-app",
+        "reprovision-app"
+      ]
     }
   }
 }
