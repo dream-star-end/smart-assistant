@@ -27,7 +27,7 @@ import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 import { rootLogger } from "../../logging/logger.js";
-import { BoxSpoolTerminalError } from "./boxSpoolPoller.js";
+import { BoxSpoolTerminalError, isBoxExecRejectedError } from "./boxSpoolPoller.js";
 
 const fetchLog = rootLogger.child({ subsys: "box-tool-fetch" });
 
@@ -648,10 +648,13 @@ export class BoxToolFetch {
               // A final whose keeper never proved worker_complete holds the
               // slot the same way a rejected echo does. Stop once, bounded.
               // This is not success: completeToolChain stays on the proof path.
+              // OCV5-762: Exec refused (417) even after one refreshed retry: the
+              // CLI cannot be followed any more; stop it so the slot is free.
               if (error instanceof BoxToolResultEchoError
                 || error instanceof BoxCliToolHandoffError
                 || (error instanceof BoxToolContinuationError
-                  && error.code === "BOX_TOOL_TERMINAL_UNPROVEN")) {
+                  && error.code === "BOX_TOOL_TERMINAL_UNPROVEN")
+                || isBoxExecRejectedError(error)) {
                 await this.stopEchoRejected(args, claim);
               }
               throw error;

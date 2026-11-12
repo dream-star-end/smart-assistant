@@ -428,3 +428,50 @@ test("production active-only selection retains half-open recovery and uncertain 
       (error: unknown) => error === original);
   }
 });
+
+// OCV5-762: after Cursor's Exec gateway answered 417 the next call asks the same Box for a fresh
+// descriptor (state, then one Ensure), never wakes a Box that is not running, and uses the new tokens.
+test("OCV5-762 an Exec 417 refreshes this Box's descriptor before the next call and never wakes it", async () => {
+  const run = (target: { exec: { run: (r: unknown, o: unknown) => Promise<unknown> } }) => target.exec.run(
+    { command: "/usr/bin/python3", args: ["--version"], cwd: "/tmp", environment: {} }, { timeoutMs: 2000 });
+  for (const later of ["SAND_BOX_RUN_STATE_RUNNING", "SAND_BOX_RUN_STATE_HIBERNATED"]) {
+    const f = fixture();
+    let ensures = 0;
+    let execs = 0;
+    const auth: string[] = [];
+    const resolver = new BoxAccountResolver({ ...f.deps,
+      fetch: async (url, init, dispatcher) => {
+        if (url.endsWith("/EnsureSandBox")) {
+          f.calls.push(url);
+          ensures++;
+          return Response.json({ execDaemonUrl: `https://box${ensures}.example.cursorvm.com`,
+            execDaemonAuthToken: `synthetic-exec-token-${ensures}`, networkToken: `synthetic-network-token-${ensures}` });
+        }
+        if (url.endsWith("/agent.v1.ControlService/Exec")) {
+          auth.push(String((init.headers as Record<string, string>).authorization));
+          if (++execs === 1) {
+            f.calls.push(url);
+            f.setBoxState(later);
+            return new Response('{"code":"failed_precondition"}', { status: 417 });
+          }
+        }
+        return f.deps.fetch(url, init, dispatcher);
+      } });
+    const target = await resolver.resolve({ ...f.args, allowWakeIfHibernated: true });
+    await assert.rejects(run(target as never), (error: unknown) => error instanceof BoxExecTransportError
+      && error.code === "BOX_EXEC_HTTP_417");
+    if (later === "SAND_BOX_RUN_STATE_RUNNING") {
+      assert.equal((await run(target as never) as { stdout: string }).stdout, "synthetic-exec-ok");
+      assert.deepEqual(f.calls.map((url) => url.split("/").at(-1)), ["GetSandBoxRunState", "EnsureSandBox",
+        "Exec", "GetSandBoxRunState", "EnsureSandBox", "Exec"]);
+      assert.deepEqual(f.calls.filter((url) => url.endsWith("/Exec")).map((url) => new URL(url).hostname),
+        ["box1.example.cursorvm.com", "box2.example.cursorvm.com"]);
+      assert.deepEqual(auth, ["Bearer synthetic-exec-token-1", "Bearer synthetic-exec-token-2"]);
+    } else {
+      await assert.rejects(run(target as never), (error: unknown) => error instanceof BoxExecTransportError
+        && error.code === "BOX_EXEC_REFRESH_FAILED");
+      assert.equal(ensures, 1, "a Box that stopped running is not woken by a refresh");
+      assert.equal(execs, 1);
+    }
+  }
+});

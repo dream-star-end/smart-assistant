@@ -1318,3 +1318,25 @@ test("tool validation first errors survive first-round cleanup and strict termin
     assert.equal(f.sequence.includes("terminal-journal"), false);
   }
 });
+
+// OCV5-762 (uid 4, 2026-11-12 20:03:40 CST, journal 5bc4629d): a first round
+// ran 5.5 minutes, then its spool reads were refused with HTTP 417. The run was
+// left unknown and the next message got BOX_RESUME_IN_PROGRESS.
+test("OCV5-762 a first round whose Exec reads stay refused is named and stopped once", async () => {
+  const f = fixture({ directFinal: true });
+  const run = f.target.exec.run.bind(f.target.exec);
+  let refused = 0;
+  f.target.exec.run = async (request) => {
+    if (request.args[5] === "--read") { refused++; throw new BoxExecTransportError("BOX_EXEC_HTTP_417", false); }
+    return run(request);
+  };
+  const events: string[] = [];
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    terminalUnprovenStopWaitMs: 40,
+    stopRejectedRun: async () => { events.push("stop"); return "stopped_proven"; } }),
+  (error: unknown) => error instanceof BoxExecTransportError && error.code === "BOX_EXEC_HTTP_417");
+  assert.equal(refused, 2, "exactly one retry on the refreshed descriptor");
+  assert.deepEqual(events, ["stop"]);
+  assert.deepEqual(f.unknownPhases, ["first_round_exec_rejected"]);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+});

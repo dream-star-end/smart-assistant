@@ -2894,6 +2894,7 @@ async function main(): Promise<void> {
       await proveUid4FirstFailurePreserved(uid4Context(db)),
       await proveUid4StoppedWorkerConverges(uid4Context(db)),
       await proveOutputLimitResume(api, db),
+      await (await import("./lib/boxExec417Proof.js")).proveExec417Released({ api, db, boxTurn, boxHost, prechecked, journalRow, must, codeOf, spoolOf, cliInit, FINAL_ANSWER, BRIDGE_CALL }, CANDIDATE), // OCV5-762 (file-size ratchet): [ocv5-762-exec-417-wedge] PASS — one Exec 417 is read again on a refreshed descriptor, and a round still refused is stopped at once so the session's next message runs
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database), await (await import("./lib/serviceRestartFoldProof.js")).proveRestartTapeFold(CANDIDATE, api.tape, (run) => withSessionsBackend(api, database, run))]; // OCV5-646 (file-size ratchet): [ocv5-646-restart-tape-fold] PASS — a boot-recovery SERVICE_RESTART tape keeps the answer and tool steps the dispatch streamed, after its live frames are pruned
