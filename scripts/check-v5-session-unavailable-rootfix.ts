@@ -1228,3 +1228,14 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[antigravity-durable-delivery] PASS — executed terminal/native fallback, one subprocess/side effect/settlement and durable SQLite reopen')
+
+// INC-20261112-AGY-ROUTE-LIFETIME: actual adapter/process keepalive and Stop.
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/antigravityAdapter.test.ts'],
+  expected: ['INC-20261112-AGY-ROUTE-LIFETIME: live silent tool renews exact route and Stop ends heartbeat'],
+  namePattern: 'INC-20261112-AGY-ROUTE-LIFETIME',
+  label: 'antigravity-route-heartbeat',
+  timeoutMs: 120_000,
+})
+console.log('[antigravity-route-heartbeat] PASS — executed live silent tool heartbeat and Stop; local process proof, not paid live inference')

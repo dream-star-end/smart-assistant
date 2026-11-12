@@ -1,3 +1,10 @@
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { Readable } from 'node:stream'
+import { hashSecret } from '../auth/containerIdentity.js'
+import { makeAntigravityRelayHandler, ANTIGRAVITY_RELAY_PREFIX } from '../http/internalAntigravityRelay.js'
+import { makeDelegateAntigravityRouteHandler, DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH } from '../http/internalDelegateAntigravityRoute.js'
+import { renewAntigravityRouteLease } from '../../../gateway/src/delegateAntigravityRoute.js'
 import { createHash, randomUUID } from 'node:crypto'
 import IORedis from 'ioredis'
 import { readAntigravityRouteAuthority } from '../billing/antigravityRouteAuthority.js'
@@ -578,8 +585,8 @@ async function lifetimeFixture(kind: 'chat' | 'delegate' | 'legacy' = 'chat') {
     const sub = await query<{id: string}>(`INSERT INTO agent_subscriptions(user_id,plan,end_at)
       VALUES ($1,'basic',NOW()+INTERVAL '1 day') RETURNING id::text`, [uid.toString()])
     const c = await query<{id: string}>(`INSERT INTO agent_containers
-      (user_id,subscription_id,docker_name,workspace_volume,home_volume,image,status)
-      VALUES ($1,$2,$3,'w','h','test','running') RETURNING id::text`,
+      (user_id,subscription_id,docker_name,workspace_volume,home_volume,image,status,secret_hash)
+      VALUES ($1,$2,$3,'w','h','test','running','test-secret-hash') RETURNING id::text`,
       [uid.toString(), sub.rows[0]!.id, sessionId])
     containerId = Number(c.rows[0]!.id)
     await query(`INSERT INTO request_finalize_journal(request_id,user_id,container_id,ctx,precheck_credits)
@@ -599,7 +606,7 @@ async function lifetimeFixture(kind: 'chat' | 'delegate' | 'legacy' = 'chat') {
   const rk = `oc:v5:antigravity-relay:req:${requestId}`
   const resolve = (minute = 0) => resolveAntigravityRelayRoute({ token: minted.token,
     containerId, userId: uid, nowMs: started + minute * 60_000 })
-  return { uid, requestId, sessionId, containerId, redis, kv, started, tk, rk, resolve,
+  return { uid, requestId, sessionId, containerId, token: minted.token, redis, kv, started, tk, rk, resolve,
     async close() { await redis.del(tk, rk); await redis.quit(); _resetAntigravityRelayRoutesForTests() } }
 }
 
@@ -695,4 +702,62 @@ describe('INC-20261112-AGY-ROUTE-LIFETIME authoritative rolling lease', () => {
       assert.equal((await reconcileStaleAntigravityTurns({ pool: getPool(), pricing, userId: f.uid })).length, 0)
     } finally { await f.close() }
   })
+})
+
+
+test('INC-20261112-AGY-ROUTE-LIFETIME: HTTP heartbeat crosses six hours then Stop blocks upstream', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await lifetimeFixture()
+  const secret = 'b'.repeat(64)
+  const bearer = `oc-v3.${f.containerId}.${secret}`
+  const identityRepo = { async findActiveByHostAndBoundIp() { return {
+    id: f.containerId, user_id: Number(f.uid), bound_ip: '127.0.0.1',
+    host_uuid: 'test-lifetime', secret_hash: hashSecret(secret),
+  } } }
+  const ctx = { hostUuid: 'test-lifetime', boundIp: '127.0.0.1' }
+  let upstreamCalls = 0
+  const relay = makeAntigravityRelayHandler({ identityRepo, clientSecret: 'test',
+    freshToken: async () => Buffer.from('test'), reportOutcome: async () => {},
+    requestFn: (async () => { upstreamCalls += 1; return { statusCode: 200,
+      headers: { 'content-type': 'application/json' }, body: Readable.from(['{"ok":true}']) } }) as never,
+  })
+  const renew = makeDelegateAntigravityRouteHandler({ identityRepo, pool: getPool(),
+    relayPort: 18789, clientSecret: 'test' })
+  const server = createServer((req, res) => {
+    const handler = req.url === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH ? renew : relay
+    void handler(req, res, ctx).catch(() => { res.statusCode = 500; res.end() })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  const env = { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1', OPENCLAUDE_V3_MASTER_BASE_URL: base,
+    OPENCLAUDE_V3_CONTAINER_TOKEN: bearer }
+  const realNow = Date.now
+  let now = f.started
+  Date.now = () => now
+  const request = () => fetch(`${base}${ANTIGRAVITY_RELAY_PREFIX}/route/${f.token}/v1internal:loadCodeAssist`, {
+    method: 'POST', headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' }, body: '{}',
+  })
+  try {
+    for (let minute = 31; minute < 500; minute += 31) {
+      now = f.started + minute * 60_000
+      await renewAntigravityRouteLease(f.token, { env })
+    }
+    assert.equal(upstreamCalls, 0, 'heartbeats are control-only, no paid calls')
+    const ok = await request()
+    assert.equal(ok.status, 200)
+    assert.equal((await ok.json()).ok, true)
+    assert.equal(upstreamCalls, 1)
+    await query(`INSERT INTO turn_control_requests(control_id,user_id,session_id,kind,payload_json)
+      VALUES ($1,$2,$3,'stop','{}')`, [randomUUID(), f.uid.toString(), f.sessionId])
+    const denied = await request()
+    assert.equal(denied.status, 404)
+    await denied.text()
+    assert.equal(upstreamCalls, 1, 'Stop denied before OAuth/upstream dispatch')
+    await assert.rejects(renewAntigravityRouteLease(f.token, { env }), /rejected/)
+  } finally {
+    Date.now = realNow
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    await f.close()
+  }
 })
