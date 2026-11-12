@@ -61,6 +61,9 @@ ALLOWED_NATIVE_ITEMS = frozenset(
 
 DISALLOWED_NOTIFICATION_PREFIXES = (
     "item/commandExecution/",
+    "command/exec/",
+    "process/",
+    "hook/",
     "item/fileChange/",
     "item/permissions/",
     "item/tool/requestUserInput",
@@ -74,6 +77,16 @@ BENIGN_DIAGNOSTIC_NOTIFICATIONS = frozenset(
         "thread/started",
         "thread/status/changed",
         "thread/readState/changed",
+        "thread/settings/updated",
+        "thread/environment/connected",
+        "thread/environment/disconnected",
+        "thread/section/changed",
+        "thread/queue/changed",
+        "thread/prediction/updated",
+        "thread/attachment/updated",
+        "thread/project/updated",
+        "thread/deleted",
+        "thread/reverted",
         "thread/closed",
         "thread/archived",
         "thread/unarchived",
@@ -81,24 +94,44 @@ BENIGN_DIAGNOSTIC_NOTIFICATIONS = frozenset(
         "thread/goal/updated",
         "thread/goal/cleared",
         "thread/compacted",
+        "account/gatewayOAuth/changed",
         "account/rateLimits/updated",
         "account/updated",
         "account/login/completed",
+        "app/list/updated",
+        "autoApprovalReview/strictReviewRequired",
+        "item/autoApprovalReview/started",
+        "item/autoApprovalReview/completed",
         "item/reasoning/summaryPartAdded",
         "item/mcpToolCall/progress",
         "item/plan/delta",
         "turn/plan/updated",
         "turn/diff/updated",
         "turn/moderationMetadata",
+        "mcpServer/event/stream/notification",
         "mcpServer/startupStatus/updated",
         "mcpServer/oauthLogin/completed",
         "remoteControl/status/changed",
+        "serverRequest/resolved",
         "model/rerouted",
+        "model/safetyBuffering/updated",
+        "model/verification",
+        "modelProvider/authRecoveryStarted",
+        "modelProvider/authRecoveryCompleted",
+        "externalAgentConfig/import/progress",
+        "externalAgentConfig/import/completed",
+        "fuzzyFileSearch/sessionUpdated",
+        "fuzzyFileSearch/sessionCompleted",
+        "fs/changed",
+        "project/changed",
+        "guardianWarning",
         "warning",
         "error",
         "configWarning",
         "deprecationNotice",
         "skills/changed",
+        "windows/worldWritableWarning",
+        "windowsSandbox/setupCompleted",
     }
 )
 
@@ -317,7 +350,12 @@ def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, A
             _next_rpc("thread/start", base_params, "resume")
         else:
             need(isinstance(target, str) and IDENT_RE.fullmatch(target), "CODEX_THREAD_ID_INVALID")
-            if state.get("sessionId") and state["sessionId"] == target and state.get("loadedInstructions") == instructions:
+            if (
+                state.get("threadLoaded") is True
+                and state.get("sessionId")
+                and state["sessionId"] == target
+                and state.get("loadedInstructions") == instructions
+            ):
                 immediate.append(
                     {
                         "commandId": cmd_id,
@@ -471,6 +509,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
                 if state.get("expectedModel") and res.get("model"):
                     need(res["model"] == state["expectedModel"], "CODEX_UPSTREAM_MODEL_MISMATCH")
                 state["sessionId"] = tid
+                state["threadLoaded"] = True
                 reply["nativeSessionId"] = tid
                 if isinstance(res.get("model"), str):
                     state["observedModel"] = res["model"]
@@ -642,7 +681,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         )
 
     elif method in BENIGN_DIAGNOSTIC_NOTIFICATIONS or method.startswith(
-        ("remoteControl/", "mcpServer/startupStatus/", "codex/event/")
+        ("remoteControl/", "mcpServer/startupStatus/", "codex/event/", "thread/realtime/")
     ):
         pass
 

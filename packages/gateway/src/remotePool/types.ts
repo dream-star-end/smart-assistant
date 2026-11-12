@@ -169,6 +169,8 @@ export interface RemotePoolProbeOutput {
 export interface RemotePoolHostPort {
   preflight(): Promise<RemotePoolPreflight>
   provision(tools: unknown, defaultsContext?: Readonly<Record<string, unknown>>): Promise<void>
+  recycleApp?(): Promise<{ appStopped: true; noHostEffect?: boolean }>
+  reprovisionApp?(tools: unknown, defaultsContext?: Readonly<Record<string, unknown>>): Promise<void>
   open(role: 'launch' | 'tool-socket'): ChildProcessWithoutNullStreams
   stop(): Promise<{ remoteStopped: true; noHostEffect?: boolean }>
   probe?(context: Record<string, unknown>, probeRoot?: string): Promise<RemotePoolProbeOutput>

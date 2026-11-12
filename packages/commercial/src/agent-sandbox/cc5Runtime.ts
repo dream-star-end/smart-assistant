@@ -1,5 +1,7 @@
 /** Master wiring of the remote-pool lane runtime. OFF performs no configuration I/O. */
+import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { RemoteFinanceFactory } from '@openclaude/gateway/remote-finance'
 import {
   createRemoteLaneRuntime,
@@ -32,6 +34,17 @@ import { reconcileRemoteChat, reconcileStaleContainerLanes } from '../account-po
 
 const BASE_ROOT = '/run/oc-cc5-t1555u'
 
+/**
+ * Model-level v4 cutover selector (Design §5.1 / §7):
+ * - Sticky v4 chats stay pinned to their v4 `driver_id`.
+ * - Once at least one v4 profile for `(canonicalModel, engine)` has been commissioned
+ *   (`execution_ready = TRUE` or `verified_fingerprint IS NOT NULL`), new chats for that model
+ *   route exclusively to v4 and NEVER auto-downgrade to legacy on drift (`REMOTE_DRIVER_REVERIFY_REQUIRED`).
+ * - Uncommissioned staging rows (`execution_ready = FALSE AND verified_fingerprint IS NULL`) do NOT
+ *   hijack traffic while a healthy legacy (`driver_id IS NULL`) offer exists for the same model.
+ * - During cutover, `drainGate` closes new-session admission; warm resident lanes' subsequent turns
+ *   are gated by `cutover_wait_for_user_idle` prior to master restart.
+ */
 async function resolveDriverV4Selection(
   pool: ReturnType<typeof getPool>,
   request: { uid: number; sessionKey: string; canonicalModel: string; engine?: 'ccb' | 'codex' },
@@ -68,6 +81,24 @@ async function resolveDriverV4Selection(
           AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
           AND n.status IN ('active', 'degraded')
           AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')
+          AND (
+            p.execution_ready = TRUE
+            OR p.verified_fingerprint IS NOT NULL
+            OR NOT EXISTS (
+              SELECT 1
+                FROM remote_model_offers o_leg
+                JOIN remote_agent_profiles p_leg ON p_leg.id = o_leg.profile_id
+                JOIN remote_agent_nodes n_leg ON n_leg.id = p_leg.node_id
+               WHERE o_leg.canonical_model_id = $1
+                 AND o_leg.enabled = TRUE
+                 AND p_leg.driver_id IS NULL
+                 AND p_leg.engine = $2
+                 AND p_leg.status IN ('active', 'degraded')
+                 AND (p_leg.disabled_by IS NULL OR p_leg.disabled_by <> 'admin')
+                 AND n_leg.status IN ('active', 'degraded')
+                 AND (n_leg.disabled_by IS NULL OR n_leg.disabled_by <> 'admin')
+            )
+          )
         ORDER BY p.execution_ready DESC, p.weight DESC, p.id ASC
         LIMIT 1`,
       [request.canonicalModel, legacyProfEngine],
@@ -96,7 +127,10 @@ export function createMasterCc5Runtime(
   const uid = input.env[CC5_TEST_UID_ENV]
   if (!input.selfhost || !input.authorityReady || !input.financeFactory || !canUseCc5TestModel(uid, input.env))
     return undefined
-  const controllerPath = resolve('scripts/agent-remote/cc5-host-controller.py')
+  const cwdController = resolve('scripts/agent-remote/cc5-host-controller.py')
+  const controllerPath = existsSync(cwdController)
+    ? cwdController
+    : fileURLToPath(new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url))
   const drainGate = fixture.drainGate ?? getMasterRemoteReleaseDrainCoordinator()
   const activePool = fixture.pool ?? getPool
   try {

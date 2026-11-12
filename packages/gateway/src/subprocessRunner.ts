@@ -1656,8 +1656,22 @@ export class SubprocessRunner extends EventEmitter {
   //   mcp-config.json   — MCP server pointing at @openclaude/mcp-memory
   /** Shared container-only tool context. This does not spawn a model or contact the remote node.
    * Keep it alive until the host's process group has a verified stop proof. */
-  async prepareRemoteToolContext() {
-    const learning = await this.buildLearningContext(null, true)
+  async prepareRemoteToolContext(remoteOpts?: { supportsVision?: boolean }) {
+    const prevDescriptor = this.currentExecutionDescriptor
+    if (remoteOpts?.supportsVision !== undefined) {
+      this.currentExecutionDescriptor = {
+        ...(prevDescriptor ?? ({} as CcbExecutionDescriptor)),
+        supportsVision: remoteOpts.supportsVision,
+      }
+    }
+    let learning: Awaited<ReturnType<SubprocessRunner['buildLearningContext']>>
+    try {
+      learning = await this.buildLearningContext(null, true)
+    } finally {
+      if (remoteOpts?.supportsVision !== undefined) {
+        this.currentExecutionDescriptor = prevDescriptor
+      }
+    }
     if (!learning.mcpConfigFile || !learning.settingsFile) {
       this.cleanupSessionDir()
       throw new Error('CC5_TOOL_CONTEXT_UNAVAILABLE')

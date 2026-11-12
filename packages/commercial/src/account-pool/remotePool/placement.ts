@@ -89,6 +89,7 @@ export interface PlaceRemoteDriverLaneOptions {
   /** Strictly sandbox-fenced (`/tmp/oc-drvtest-*`) fault-injection mode for `AC-1` Group 6 Red controls. */
   readonly allowTestFaultsInSandbox?: boolean
   readonly testFaultSandboxMode?: 'account_mutex' | 'shared_node_cap_5'
+  readonly onAccountMutexBlocked?: (attempt: number) => void
 }
 
 export interface RemoteDriverPlacementResult {
@@ -199,6 +200,7 @@ export async function placeRemoteDriverLane(
 
   const accountMutexDeadline =
     options.testFaultSandboxMode === 'account_mutex' ? Date.now() + 15_000 : 0
+  let accountMutexBlockedCount = 0
   while (true) {
   let retryAccountMutex = false
   const client = await pool.connect()
@@ -701,6 +703,8 @@ export async function placeRemoteDriverLane(
       err.message === 'REMOTE_LANE_CAPACITY_EXHAUSTED' &&
       Date.now() < accountMutexDeadline
     ) {
+      accountMutexBlockedCount += 1
+      options.onAccountMutexBlocked?.(accountMutexBlockedCount)
       retryAccountMutex = true
     } else {
       throw err

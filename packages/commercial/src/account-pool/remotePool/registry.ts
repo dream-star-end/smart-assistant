@@ -35,6 +35,8 @@ const ALLOWED_ROLES = new Set([
   'fence-stop',
   'prove-stopped',
   'probe',
+  'recycle-app',
+  'reprovision-app',
 ])
 
 export interface RemoteDriverRegistryEntry {

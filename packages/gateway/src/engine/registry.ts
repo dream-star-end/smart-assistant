@@ -14,6 +14,7 @@
  *   'exec' 与未知 runnerKind 直接 fail-closed('codex exec' legacy 路径不复活)。
  */
 import {
+  type PromptPrivacyPolicy,
   type RemoteExecutionBackend,
   isRemoteDriverExecutionBackend,
   parseRemoteDriverExecutionBackend,
@@ -24,6 +25,7 @@ import {
   ANTIGRAVITY_ENGINE_MODEL_IDS,
 } from '@openclaude/protocol'
 import type { AgentDef } from '@openclaude/storage'
+import type { IntelligentUiApplied } from '../promptSlots.js'
 import type { SubprocessRunnerOpts } from '../subprocessRunner.js'
 import type { EngineAdapter } from './engineAdapter.js'
 
@@ -36,11 +38,51 @@ export type EngineCreateOpts = SubprocessRunnerOpts
 
 export type EngineFactory = (opts: EngineCreateOpts) => EngineAdapter
 
+export interface EngineRemoteContextInput {
+  readonly opts: EngineCreateOpts
+  readonly supportsVision?: boolean
+  readonly promptPolicy?: PromptPrivacyPolicy
+  readonly promptOnly?: boolean
+}
+
+export interface EngineRemotePreparedContext {
+  readonly profile: {
+    cwd: string
+    mcpConfigPath: string | null
+    settingsPath: string | null
+    disallowedTools: string[]
+  }
+  readonly env: NodeJS.ProcessEnv
+  readonly platformPrompt: string
+  readonly promptCwd: string
+  readonly promptPolicyFingerprint?: string
+  readonly promptIntelligentUi?: IntelligentUiApplied
+  readonly cleanup: () => void
+}
+
+export type EngineRemoteContextBuilder = (
+  input: EngineRemoteContextInput,
+) => Promise<EngineRemotePreparedContext>
+
 const engineFactories = new Map<string, EngineFactory>()
+const engineRemoteContextBuilders = new Map<string, EngineRemoteContextBuilder>()
 let remoteDriverAdapterFactory: EngineFactory | undefined
 
 export function registerRemoteDriverAdapter(factory: EngineFactory): void {
   remoteDriverAdapterFactory = factory
+}
+
+export function registerEngineRemoteContext(
+  engineId: string,
+  builder: EngineRemoteContextBuilder,
+): void {
+  engineRemoteContextBuilders.set(engineId, builder)
+}
+
+export function resolveEngineRemoteContextBuilder(
+  engineId: string,
+): EngineRemoteContextBuilder | undefined {
+  return engineRemoteContextBuilders.get(engineId)
 }
 
 /** Desktop W-01: Host sets OPENCLAUDE_ENGINES=ccb. Unset = all engines (current). */

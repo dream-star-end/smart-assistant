@@ -103,6 +103,12 @@ def arg_val(flag, default=""):
 
 model = arg_val("--model", "claude-sonnet-4-6")
 session_id = arg_val("--session-id") or arg_val("--resume")
+prompt_file = arg_val("--append-system-prompt-file")
+if prompt_file:
+    pathlib.Path(${JSON.stringify(join(dir, 'cli-observed-instructions.txt'))}).write_text(
+        pathlib.Path(prompt_file).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 mcp_cfg = json.loads(pathlib.Path(arg_val("--mcp-config")).read_text())
 oc_srv = mcp_cfg["mcpServers"]["ocbridge"]
 
@@ -227,7 +233,7 @@ function makeCodexCliFixture(dir: string): string {
   return writeExecutable(
     join(dir, 'fake-codex'),
     `#!/usr/bin/env python3
-import json, subprocess, sys
+import json, pathlib, subprocess, sys
 
 args = sys.argv[1:]
 mcp_args = []
@@ -276,6 +282,11 @@ for raw in sys.stdin:
         }, separators=(",", ":")) + "\\n")
         sys.stdout.flush()
     elif method in ("thread/start", "thread/resume"):
+        if isinstance(params.get("baseInstructions"), str):
+            pathlib.Path(${JSON.stringify(join(dir, 'cli-observed-instructions.txt'))}).write_text(
+                params["baseInstructions"],
+                encoding="utf-8",
+            )
         tid = params.get("threadId") or thread_id
         thread_id = tid
         sys.stdout.write(json.dumps({
@@ -445,6 +456,7 @@ for raw in sys.stdin:
 interface E2EHarness {
   readonly sandbox: string
   readonly sentinelFile: string
+  readonly observedInstructionsFile: string
   readonly executedCalls: Array<{ name: string; args: Record<string, unknown>; meta: Record<string, unknown> }>
   readonly settledReceipts: RemoteReceiptV4[]
   readonly billingEvents: EngineBillingEvent[]
@@ -469,13 +481,23 @@ interface E2EHarness {
 async function createDriverHarness(
   t: TestContext,
   driverId: 'cc' | 'codex',
-  opts: { memAvailableBytes?: number; toolAuthorizeTimeoutMs?: number } = {},
+  opts: {
+    memAvailableBytes?: number
+    toolAuthorizeTimeoutMs?: number
+    useRealPlatformContext?: boolean
+    persona?: string
+  } = {},
 ): Promise<E2EHarness> {
   const sandbox = mkdtempSync(`/tmp/oc-drvtest-gw-${driverId}-`)
   const resRoot = join(sandbox, 'resources')
   const fakeSys = join(sandbox, 'fake-systemd')
   const containerExecRoot = join(sandbox, 'container-exec')
   const sentinelFile = join(sandbox, 'container-sentinel.log')
+  const observedInstructionsFile = join(sandbox, 'cli-observed-instructions.txt')
+  const personaFile = opts.persona ? join(sandbox, 'SOUL.md') : undefined
+  if (personaFile && opts.persona) {
+    writeFileSync(personaFile, `# Persona\n${opts.persona}\n`, { mode: 0o600 })
+  }
   mkdirSync(containerExecRoot, { recursive: true, mode: 0o700 })
 
   const probeEnvExtra: Record<string, string> = {
@@ -712,7 +734,8 @@ async function createDriverHarness(
       agentId: 'main',
       agentBaseDir: sandbox,
       model: canonicalModel,
-      config: {} as any,
+      ...(personaFile !== undefined ? { persona: personaFile } : {}),
+      config: { auth: {}, gateway: { port: 18789, accessToken: 'test-token' }, mcpServers: [] } as any,
     },
     {
       binding,
@@ -720,11 +743,16 @@ async function createDriverHarness(
       keyring: keys,
       executionRoot: containerExecRoot,
       hostFactory,
-      toolContextFactory: async () => ({
-        profile: {} as any,
-        env: { PATH: '/usr/bin:/bin' },
-        cleanup: () => {},
-      }),
+      ...(opts.useRealPlatformContext
+        ? {}
+        : {
+            toolContextFactory: async () => ({
+              profile: {} as any,
+              env: { PATH: '/usr/bin:/bin' },
+              platformPrompt: '',
+              cleanup: () => {},
+            }),
+          }),
       toolAuthorizeTimeoutMs: opts.toolAuthorizeTimeoutMs ?? 400,
     },
   )
@@ -838,6 +866,7 @@ async function createDriverHarness(
   return {
     sandbox,
     sentinelFile,
+    observedInstructionsFile,
     executedCalls,
     settledReceipts,
     billingEvents,
@@ -964,6 +993,7 @@ for (const driverId of ['cc', 'codex'] as const) {
     assert.equal(h.executedCalls.length, 0)
     assert.equal(h.relay.stopped, true)
     assert.equal(h.relay.fenceReason, 'REMOTE_DISALLOWED_ITEM')
+    assert.equal(h.adapter.fenceReason, 'REMOTE_DISALLOWED_ITEM')
   })
 
   test(`[${driverId}] duplicate identical terminal deduplicates; conflicting terminal fences REMOTE_TERMINAL_CONFLICT`, async (t) => {
@@ -984,6 +1014,40 @@ for (const driverId of ['cc', 'codex'] as const) {
     await new Promise((r) => setTimeout(r, 80))
     assert.equal(hConflict.relay.stopped, true)
     assert.equal(hConflict.relay.fenceReason, 'REMOTE_TERMINAL_CONFLICT')
+  })
+
+  test(`[${driverId}] production RemoteEngineAdapter injects real platform prompt + persona + <tool-naming> onto wire`, async (t) => {
+    const personaSentinel = `PERSONA_SENTINEL_C1_R3_${driverId.toUpperCase()}_9912`
+    const h = await createDriverHarness(t, driverId, {
+      useRealPlatformContext: true,
+      persona: personaSentinel,
+    })
+    const turn = h.submitPrompt('PING_SENTINEL')
+    await turn.run.submitted
+    const summary = await turn.run.summary
+    await h.adapter.waitForOutputDrain()
+
+    assert.ok(summary, 'Turn must resolve non-null TurnSummary with real platform context')
+    assert.equal(summary.isError, false)
+    assert.equal(existsSync(h.observedInstructionsFile), true, 'CLI must receive wire instructions')
+    const observedInstructions = readFileSync(h.observedInstructionsFile, 'utf8')
+    assert.ok(
+      observedInstructions.includes(personaSentinel),
+      `wire instructions must contain platform persona sentinel (${personaSentinel})`,
+    )
+    assert.ok(
+      observedInstructions.includes('<tool-naming>'),
+      'wire instructions must contain <tool-naming> catalog notice',
+    )
+    assert.ok(
+      observedInstructions.includes('ContainerSentinelWrite'),
+      'wire instructions must contain compiled container tool name',
+    )
+    assert.ok(
+      Buffer.byteLength(observedInstructions, 'utf8') > 2048,
+      `wire instructions must carry full platform prompt (>2 KiB, got ${Buffer.byteLength(observedInstructions, 'utf8')} B)`,
+    )
+    await h.adapter.shutdown()
   })
 }
 

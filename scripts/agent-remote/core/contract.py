@@ -41,7 +41,18 @@ AUTHORITY_ENGINES = frozenset({"ccb", "codex", "grok", "cursor", "zcode", "antig
 COMMAND_KINDS = frozenset({"initialize", "newTurn", "interrupt", "resume", "readState"})
 DECODE_CHANNELS = frozenset({"native", "fixed_mcp", "probe"})
 ALLOWED_ROLES = frozenset(
-    {"provision", "preflight", "launch", "tool-socket", "stop", "fence-stop", "prove-stopped", "probe"}
+    {
+        "provision",
+        "preflight",
+        "launch",
+        "tool-socket",
+        "stop",
+        "fence-stop",
+        "prove-stopped",
+        "probe",
+        "recycle-app",
+        "reprovision-app",
+    }
 )
 REQUIRED_DRIVER_DUTIES = ("launch_spec", "decode", "encode", "probe", "usage_policy")
 

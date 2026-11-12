@@ -20,6 +20,7 @@ import {
   verifyTurnLease,
   type AuthorityKeyring,
   type ModelAuthorityPayload,
+  type PromptPrivacyPolicy,
   type RemoteControlReply,
   type RemoteDriverExecutionBackend,
   type RemotePendingToolRequest,
@@ -38,14 +39,20 @@ import {
   type Cc5ToolCatalog,
 } from '../cc5ToolCatalog.js'
 import { Cc5ToolHost } from '../cc5ToolHost.js'
+import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { TurnParams } from '../engine/engineAdapter.js'
-import type { EngineCreateOpts } from '../engine/registry.js'
+import {
+  resolveEngineRemoteContextBuilder,
+  type EngineCreateOpts,
+} from '../engine/registry.js'
 import { createLogger } from '../logger.js'
 import {
   RenewTurnLeaseError,
   refreshTurnModelAuthorityLease,
   type renewTurnLease,
 } from '../masterTurnLease.js'
+import { promptPrivacyFingerprint } from '../promptPrivacyPolicy.js'
+import type { IntelligentUiApplied } from '../promptSlots.js'
 import { isRemoteResourceCode, nodeMemoryError } from '../remoteNodeMemory.js'
 import { SubprocessRunner } from '../subprocessRunner.js'
 import { RemoteObservationGate } from './observationGate.js'
@@ -426,6 +433,16 @@ export class RemotePoolRelayClient {
     remotePoolNeed(reply.abandoned === true, 'REMOTE_ABANDON_UNKNOWN')
   }
 
+  async recycle(): Promise<{ appStopped: true; noHostEffect?: boolean }> {
+    remotePoolNeed(!this.stopped, 'REMOTE_LANE_CLOSED')
+    const reply = await this.call('/recycle', this.scope())
+    remotePoolNeed(reply.appStopped === true, 'REMOTE_APP_STOP_UNPROVEN')
+    return {
+      appStopped: true,
+      ...(reply.noHostEffect === true ? { noHostEffect: true } : {}),
+    }
+  }
+
   async stop(): Promise<void> {
     this.stopped = true
     return (this.stopping ??= (async () => {
@@ -448,9 +465,16 @@ export interface RemoteContainerLaneOptions {
     profile: Cc5HostProfile,
     env: NodeJS.ProcessEnv,
   ) => LaneToolHost
-  readonly toolContextFactory?: () => Promise<{
+  readonly toolContextFactory?: (input?: {
+    readonly promptPolicy?: PromptPrivacyPolicy
+    readonly promptOnly?: boolean
+  }) => Promise<{
     profile: Cc5HostProfile
     env: NodeJS.ProcessEnv
+    platformPrompt?: string
+    promptCwd?: string
+    promptPolicyFingerprint?: string
+    promptIntelligentUi?: IntelligentUiApplied
     cleanup: () => void
   }>
   readonly binding?: Readonly<RemotePoolBinding>
@@ -529,9 +553,23 @@ export class RemoteContainerLane {
 
   private host?: LaneToolHost
   private cleanupContext?: () => void
+  private resolvedPlatformPrompt = ''
+  private resolvedPromptCwd?: string
   private catalog?: Cc5ToolCatalog
   private clientNameByRemoteName: Readonly<Record<string, string>> = {}
   private toolsInit?: Promise<Cc5ToolCatalog>
+
+  private stagedPromptPrivacy?: PromptPrivacyPolicy
+  private appliedPromptPolicyFingerprint?: string
+  private appliedPromptIntelligentUi?: IntelligentUiApplied
+  private lastBuiltFingerprint?: string
+  private lastBuiltIntelligentUi?: IntelligentUiApplied
+  private promptInitialized = false
+  private promptRefreshRequired = false
+  private remoteAdmissionAttempted = false
+  private remoteAppStoppedProven = true
+  private laneStopCompleted = false
+  private configEpoch = 0
 
   private admitted?: RemoteAdmittedIdentity
   private activeTurn?: ActiveLaneTurn
@@ -592,6 +630,77 @@ export class RemoteContainerLane {
     return this.clientNameByRemoteName[`mcp__ocbridge__${remoteAlias}`] ?? remoteAlias
   }
 
+  get promptPolicyFingerprint(): string | undefined {
+    return this.appliedPromptPolicyFingerprint
+  }
+
+  get promptIntelligentUi(): IntelligentUiApplied | undefined {
+    return this.appliedPromptIntelligentUi
+  }
+
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void {
+    const cloned = structuredClone(policy)
+    const nextFp = promptPrivacyFingerprint(cloned, this.opts.sessionId)
+    if (this.promptInitialized && nextFp !== this.appliedPromptPolicyFingerprint) {
+      this.promptRefreshRequired = true
+    }
+    this.stagedPromptPrivacy = cloned
+  }
+
+  clearPromptPrivacy(): void {
+    this.stagedPromptPrivacy = undefined
+    this.configEpoch += 1
+  }
+
+  isPromptPrivacyStopped(): boolean {
+    if (this.failure && !this.laneStopCompleted) return false
+    if (this.activeTurn !== undefined) return false
+    return this.laneStopCompleted || this.remoteAppStoppedProven
+  }
+
+  async recycleForConfigChange(): Promise<void> {
+    this.configEpoch += 1
+    await this.recycleInternal()
+  }
+
+  private async recycleInternal(): Promise<void> {
+    this.promptRefreshRequired = true
+    if (this.laneStopCompleted) {
+      this.remoteAppStoppedProven = true
+      this.appliedPromptPolicyFingerprint = undefined
+      this.appliedPromptIntelligentUi = undefined
+      return
+    }
+    remotePoolNeed(!this.failure && this.stopRun === undefined, this.failure?.message ?? 'REMOTE_LANE_CLOSED')
+    remotePoolNeed(!this.activeTurn, 'REMOTE_CONFIG_RESTART_DURING_ACTIVE_TURN')
+    if (!this.remoteAdmissionAttempted) {
+      this.remoteAppStoppedProven = true
+      this.appliedPromptPolicyFingerprint = undefined
+      this.appliedPromptIntelligentUi = undefined
+      return
+    }
+    this.remoteAppStoppedProven = false
+    this.appliedPromptPolicyFingerprint = undefined
+    this.appliedPromptIntelligentUi = undefined
+    const reply = await this.client.recycle()
+    remotePoolNeed(reply.appStopped === true, 'REMOTE_APP_STOP_UNPROVEN')
+    this.remoteAppStoppedProven = true
+  }
+
+  setEffortLevel(level: string | undefined): void {
+    if (this.opts.effortLevel !== level) {
+      this.opts.effortLevel = level
+      if (this.promptInitialized) this.promptRefreshRequired = true
+    }
+  }
+
+  updateConfig(config: OpenClaudeConfig): void {
+    if (this.opts.config !== config) {
+      this.opts.config = config
+      if (this.promptInitialized) this.promptRefreshRequired = true
+    }
+  }
+
   private fence(reason: string): void {
     if (this.failure) return
     log.warn('remote-driver-v4 container lane fenced', {
@@ -604,17 +713,106 @@ export class RemoteContainerLane {
     void this.stopLane().catch(() => {})
   }
 
-  private async ensureTools(): Promise<Cc5ToolCatalog> {
+  private async buildPlatformContext(
+    supportsVision: boolean | undefined,
+    frozenPolicy: PromptPrivacyPolicy | undefined,
+    promptOnly: boolean,
+  ): Promise<{
+    profile: Cc5HostProfile
+    env: NodeJS.ProcessEnv
+    platformPrompt?: string
+    promptCwd?: string
+    promptPolicyFingerprint?: string
+    promptIntelligentUi?: IntelligentUiApplied
+    cleanup: () => void
+  }> {
+    if (this.laneOptions.toolContextFactory) {
+      return await this.laneOptions.toolContextFactory({ promptPolicy: frozenPolicy, promptOnly })
+    }
+    const registered = resolveEngineRemoteContextBuilder(this.binding.authorityEngine)
+    if (registered) {
+      return await registered({
+        opts: this.opts,
+        supportsVision,
+        promptPolicy: frozenPolicy,
+        promptOnly,
+      })
+    }
+    const sub = new SubprocessRunner(this.opts)
+    if (frozenPolicy !== undefined) {
+      sub.setPromptPrivacy(frozenPolicy)
+    }
+    const fallback = await sub.prepareRemoteToolContext({ supportsVision })
+    const platformPrompt = fallback.learning.extraPromptFile
+      ? readFileSync(fallback.learning.extraPromptFile, 'utf8')
+      : ''
+    if (promptOnly) {
+      fallback.cleanup()
+      return {
+        profile: fallback.profile,
+        env: fallback.env,
+        platformPrompt,
+        promptCwd: fallback.profile.cwd,
+        promptPolicyFingerprint: sub.promptPolicyFingerprint,
+        promptIntelligentUi: sub.promptIntelligentUi,
+        cleanup: () => {},
+      }
+    }
+    return {
+      profile: fallback.profile,
+      env: fallback.env,
+      platformPrompt,
+      promptCwd: fallback.profile.cwd,
+      promptPolicyFingerprint: sub.promptPolicyFingerprint,
+      promptIntelligentUi: sub.promptIntelligentUi,
+      cleanup: fallback.cleanup,
+    }
+  }
+
+  private async refreshPlatformPrompt(
+    supportsVision: boolean | undefined,
+    frozenPolicy: PromptPrivacyPolicy | undefined,
+  ): Promise<void> {
+    if (this.laneOptions.platformPrompt !== undefined) {
+      this.lastBuiltFingerprint = frozenPolicy
+        ? promptPrivacyFingerprint(frozenPolicy, this.opts.sessionId)
+        : undefined
+      this.promptInitialized = true
+      return
+    }
+    const context = await this.buildPlatformContext(supportsVision, frozenPolicy, true)
+    try {
+      this.resolvedPlatformPrompt = context.platformPrompt ?? ''
+      this.resolvedPromptCwd = context.promptCwd ?? context.profile.cwd ?? this.opts.agentBaseDir
+      this.lastBuiltFingerprint =
+        context.promptPolicyFingerprint ??
+        (frozenPolicy ? promptPrivacyFingerprint(frozenPolicy, this.opts.sessionId) : undefined)
+      this.lastBuiltIntelligentUi = context.promptIntelligentUi
+      this.promptInitialized = true
+    } finally {
+      context.cleanup()
+    }
+  }
+
+  private async ensureTools(
+    supportsVision?: boolean,
+    frozenPolicy?: PromptPrivacyPolicy,
+  ): Promise<Cc5ToolCatalog> {
     return (this.toolsInit ??= (async () => {
       privateDir(this.executionRoot)
       const lifecycleId = randomUUID()
       const root = join(this.executionRoot, `remotev4-${this.binding.driverId}-${lifecycleId}`)
       privateDir(root)
       syncDir(this.executionRoot)
-      const context = this.laneOptions.toolContextFactory
-        ? await this.laneOptions.toolContextFactory()
-        : await new SubprocessRunner(this.opts).prepareRemoteToolContext()
+      const context = await this.buildPlatformContext(supportsVision, frozenPolicy, false)
       this.cleanupContext = context.cleanup
+      this.resolvedPlatformPrompt = context.platformPrompt ?? ''
+      this.resolvedPromptCwd = context.promptCwd ?? context.profile.cwd ?? this.opts.agentBaseDir
+      this.lastBuiltFingerprint =
+        context.promptPolicyFingerprint ??
+        (frozenPolicy ? promptPrivacyFingerprint(frozenPolicy, this.opts.sessionId) : undefined)
+      this.lastBuiltIntelligentUi = context.promptIntelligentUi
+      this.promptInitialized = true
       try {
         const host =
           this.laneOptions.hostFactory?.(root, lifecycleId, context.profile, context.env) ??
@@ -642,7 +840,10 @@ export class RemoteContainerLane {
         this.cleanupContext = undefined
         throw err
       }
-    })())
+    })().catch((err) => {
+      this.toolsInit = undefined
+      throw err
+    }))
   }
 
   validateTurnSubmission(params: TurnParams): {
@@ -728,7 +929,37 @@ export class RemoteContainerLane {
 
     try {
       remotePoolNeed(!this.failure && this.stopRun === undefined, this.failure?.message ?? 'REMOTE_LANE_CLOSED')
-      const catalog = await this.ensureTools()
+      const frozenPolicy = this.stagedPromptPrivacy ? structuredClone(this.stagedPromptPrivacy) : undefined
+      const epochAtStart = this.configEpoch
+      const supportsVision = validated.payload.executionDescriptor.supportsVision
+      const desiredFingerprint = frozenPolicy
+        ? promptPrivacyFingerprint(frozenPolicy, this.opts.sessionId)
+        : undefined
+      const policyChanged =
+        frozenPolicy !== undefined && desiredFingerprint !== this.appliedPromptPolicyFingerprint
+
+      if (
+        this.remoteAdmissionAttempted &&
+        !this.remoteAppStoppedProven &&
+        (this.promptRefreshRequired || policyChanged)
+      ) {
+        await this.recycleInternal()
+      }
+
+      const hadToolsBefore = this.catalog !== undefined
+      const catalog = await this.ensureTools(supportsVision, frozenPolicy)
+      if (hadToolsBefore && (this.promptRefreshRequired || policyChanged || !this.promptInitialized)) {
+        await this.refreshPlatformPrompt(supportsVision, frozenPolicy)
+      }
+
+      remotePoolNeed(
+        this.configEpoch === epochAtStart && !turn.cancelRequested && !turn.abort.signal.aborted,
+        'PROMPT_PRIVACY_TURN_SUPERSEDED',
+      )
+      if ((policyChanged || this.promptRefreshRequired) && this.remoteAdmissionAttempted) {
+        remotePoolNeed(this.remoteAppStoppedProven, 'REMOTE_APP_STOP_UNPROVEN')
+      }
+
       const parsedCatalog = JSON.parse(catalog.json) as {
         tools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>
       }
@@ -737,8 +968,12 @@ export class RemoteContainerLane {
         description: typeof t.description === 'string' ? t.description : t.name,
         inputSchema: t.inputSchema,
       }))
-      const basePrompt = this.laneOptions.platformPrompt ?? ''
-      const instructions = cc5RemotePrompt(basePrompt, catalog, this.opts.agentBaseDir)
+      const basePrompt = this.laneOptions.platformPrompt ?? this.resolvedPlatformPrompt
+      const instructions = cc5RemotePrompt(
+        basePrompt,
+        catalog,
+        this.resolvedPromptCwd ?? this.opts.agentBaseDir,
+      )
 
       this.admitted = {
         authority: turn.authority,
@@ -748,6 +983,8 @@ export class RemoteContainerLane {
         acceptedLeases: [turn.lease.leaseEnvelope],
       }
 
+      this.remoteAdmissionAttempted = true
+      this.remoteAppStoppedProven = false
       const admittedReply = await this.client.admit({
         authority: turn.authority,
         lease: turn.lease.leaseEnvelope,
@@ -755,6 +992,9 @@ export class RemoteContainerLane {
         catalog: { tools: wireTools },
         instructions,
       })
+      this.appliedPromptPolicyFingerprint = this.lastBuiltFingerprint
+      this.appliedPromptIntelligentUi = this.lastBuiltIntelligentUi
+      this.promptRefreshRequired = false
 
       turn.nativeSessionId = admittedReply.nativeSessionId
       this.boundNativeSessionId = admittedReply.nativeSessionId
@@ -1082,6 +1322,10 @@ export class RemoteContainerLane {
         )
       }
       await stopping
+      this.laneStopCompleted = true
+      this.remoteAppStoppedProven = true
+      this.appliedPromptPolicyFingerprint = undefined
+      this.appliedPromptIntelligentUi = undefined
       if (localErr) throw localErr
     })().catch((err) => {
       this.stopRun = undefined

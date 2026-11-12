@@ -192,10 +192,14 @@ export function startRemoteReleaseDrainSocketServer(
     return existing
   }
   const parent = dirname(socketPath)
-  if (!existsSync(parent)) {
-    mkdirSync(parent, { recursive: true, mode: 0o755 })
+  try {
+    if (!existsSync(parent)) {
+      mkdirSync(parent, { recursive: true, mode: 0o755 })
+    }
+    rmSync(socketPath, { force: true })
+  } catch {
+    // Handled asynchronously by `server.on('error')` on `listen()` below.
   }
-  rmSync(socketPath, { force: true })
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
@@ -256,6 +260,14 @@ export function startRemoteReleaseDrainSocketServer(
     })
   })
 
+  server.on('error', (err) => {
+    activeDrainServers.delete(socketPath)
+    console.warn('[selfhost] remote-v4 drain socket unavailable; falling back to PG drain probe', {
+      socketPath,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  })
+
   server.listen(socketPath, () => {
     try {
       chmodSync(socketPath, 0o600)
@@ -273,7 +285,11 @@ export function startRemoteReleaseDrainSocketServer(
       if (server.listening) {
         await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
       }
-      rmSync(socketPath, { force: true })
+      try {
+        rmSync(socketPath, { force: true })
+      } catch {
+        // Ignore cleanup errors on non-existent or invalid socket paths.
+      }
     },
   }
   activeDrainServers.set(socketPath, handle)

@@ -143,6 +143,7 @@ export class RemotePoolRelay {
   private readonly onRemoteStart: () => Promise<void>
   private readonly observeFrame?: (channel: 'app' | 'tool', frame: unknown) => void
   private readonly observationOptions?: RemotePoolRelayOptions['observationOptions']
+  private readonly sandboxDuplicateFaultMode: boolean
 
   private revoked = false
   private firstCause?: string
@@ -153,6 +154,10 @@ export class RemotePoolRelay {
   private readonly acknowledgements = new EventEmitter()
 
   private launched = false
+  private recyclingApp = false
+  private appRecycled = false
+  private launchedInstructions?: string
+  private dispatchedTurnsCount = 0
   private memoryRefused?: 'REMOTE_NODE_MEMORY_EXHAUSTED' | 'REMOTE_NODE_TASKS_EXHAUSTED'
   private turnHostAttempted = false
   private starting = false
@@ -214,6 +219,10 @@ export class RemotePoolRelay {
     this.onRemoteStart = options.onRemoteStart ?? (async () => {})
     this.observeFrame = options.observeFrame
     this.observationOptions = options.observationOptions
+    this.sandboxDuplicateFaultMode =
+      options.observationOptions?.testFaultAllowDuplicateClaim === true &&
+      options.observationOptions?.allowTestBypassInTmp === true &&
+      options.spec.manifest.root.startsWith('/tmp/oc-drvtest-')
     const initialUuid =
       typeof options.spec.driverContext?.initialSessionUuid === 'string'
         ? options.spec.driverContext.initialSessionUuid
@@ -243,7 +252,7 @@ export class RemotePoolRelay {
    * has been polled by the container — safe for R1 generation drain (`AC-5`).
    */
   get idle(): boolean {
-    return !this.revoked && !this.starting && !this.active && this.servedSeq === this.outputSeq
+    return !this.revoked && !this.starting && !this.active && !this.recyclingApp && this.servedSeq === this.outputSeq
   }
 
   private record(kind: string, value: unknown): void {
@@ -315,9 +324,12 @@ export class RemotePoolRelay {
         v.generation === b.generation &&
         v.driverId === b.driverId &&
         v.engineId === b.engineId &&
-        (allowExpired || (!this.revoked && b.expiresAt > Date.now())),
+        (allowExpired || b.expiresAt > Date.now()),
       'REMOTE_SCOPE_REJECTED',
     )
+    if (!allowExpired && this.revoked) {
+      throw new Error(this.firstCause ?? 'REMOTE_RELAY_FENCED')
+    }
   }
 
   private verifyAuthorityAndLease(authority: string, lease: string, allowExpiredAuthority = false): ModelAuthorityPayload {
@@ -461,6 +473,7 @@ export class RemotePoolRelay {
   }
 
   private openApp(): Promise<void> {
+    this.appSeq = 0
     const app = (this.app = this.host.open('launch'))
     return new Promise((resolve, reject) => {
       let ready = false
@@ -474,6 +487,7 @@ export class RemotePoolRelay {
       readJsonLines(
         app,
         (row: Record<string, any>) => {
+          if (this.app !== app) return
           this.observeFrame?.('app', row)
           remotePoolNeed(!this.revoked && row?.seq === ++this.appSeq, 'REMOTE_APP_SEQ_INVALID')
           this.checkNodeIdentity(row)
@@ -513,22 +527,90 @@ export class RemotePoolRelay {
             },
           )
         },
-        fail,
+        (err: Error) => {
+          if (this.app !== app) return
+          fail(err)
+        },
       )
       app.once('close', () => {
-        if (!this.revoked) fail(new Error('REMOTE_HOST_EXIT_UNKNOWN'))
+        if (!this.revoked && this.app === app) fail(new Error('REMOTE_HOST_EXIT_UNKNOWN'))
       })
     })
+  }
+
+  private async recycleWarmApp(allowDuringAdmit = false): Promise<{ appStopped: true; noHostEffect?: boolean }> {
+    remotePoolNeed(
+      !this.revoked &&
+        !this.recyclingApp &&
+        (allowDuringAdmit || (!this.active && !this.starting && !this.admitting)),
+      'REMOTE_RECYCLE_BUSY',
+    )
+    if (!this.launched || this.appRecycled) {
+      return { appStopped: true as const, noHostEffect: true }
+    }
+    remotePoolNeed(
+      typeof this.host.recycleApp === 'function' && typeof this.host.reprovisionApp === 'function',
+      'REMOTE_APP_RECYCLE_UNSUPPORTED',
+    )
+    this.recyclingApp = true
+    const oldApp = this.app
+    this.app = undefined
+    try {
+      const proof = await this.host.recycleApp()
+      try {
+        oldApp?.stdin.end()
+      } catch {
+        /* ignore broken pipe */
+      }
+      try {
+        oldApp?.kill('SIGKILL')
+      } catch {
+        /* ignore already exited */
+      }
+      await this.stateQueue.catch(() => {})
+      remotePoolNeed(proof.appStopped === true && !this.revoked, 'REMOTE_APP_STOP_UNPROVEN')
+      this.appRecycled = true
+      this.launchedInstructions = undefined
+      const initialUuid =
+        typeof this.spec.driverContext?.initialSessionUuid === 'string'
+          ? this.spec.driverContext.initialSessionUuid
+          : undefined
+      const prevConcreteModel =
+        typeof this.masterNativeState.resolvedConcreteModel === 'string'
+          ? this.masterNativeState.resolvedConcreteModel
+          : undefined
+      this.masterNativeState = {
+        expectedModel: this.spec.manifest.model,
+        operationId: this.binding.operationId,
+        ...(initialUuid ? { sessionId: initialUuid } : {}),
+        ...(this.nativeSessionId ? { sessionId: this.nativeSessionId } : {}),
+        ...(prevConcreteModel ? { resolvedConcreteModel: prevConcreteModel } : {}),
+      }
+      this.record('app-recycled', {
+        nativeSessionId: this.nativeSessionId ?? null,
+        noHostEffect: Boolean(proof.noHostEffect),
+      })
+      return {
+        appStopped: true as const,
+        ...(proof.noHostEffect ? { noHostEffect: true } : {}),
+      }
+    } catch (err) {
+      try {
+        oldApp?.kill('SIGKILL')
+      } catch {
+        /* ignore already exited */
+      }
+      this.fence(err instanceof Error ? err.message : 'REMOTE_APP_RECYCLE_FAILED')
+      throw err
+    } finally {
+      this.recyclingApp = false
+    }
   }
 
   private async handleToolSocketRequest(rawBytes: Buffer, seq: number): Promise<void> {
     remotePoolNeed(!this.localStopped && this.active && this.dispatching, 'REMOTE_TOOL_OUTSIDE_ACTIVE_TURN')
     this.appendEvidence('fixed_mcp', rawBytes)
     const wireBody = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(rawBytes)) as Record<string, unknown>
-    const allowSandboxDuplicateTool =
-      this.observationOptions?.testFaultAllowDuplicateClaim === true &&
-      this.observationOptions?.allowTestBypassInTmp === true &&
-      this.spec.manifest.root.startsWith('/tmp/oc-drvtest-')
     remotePoolNeed(
       wireBody &&
         typeof wireBody === 'object' &&
@@ -541,7 +623,7 @@ export class RemotePoolRelay {
         wireBody.profileId === this.binding.profileId &&
         wireBody.authEpoch === this.binding.authEpoch &&
         typeof wireBody.callId === 'string' &&
-        (!this.tools.has(wireBody.callId) || allowSandboxDuplicateTool),
+        (!this.tools.has(wireBody.callId) || this.sandboxDuplicateFaultMode),
       'REMOTE_TOOL_WIRE_BODY_INVALID',
     )
     const pendingReq = validatePendingToolRequest({
@@ -566,9 +648,10 @@ export class RemotePoolRelay {
 
     remotePoolNeed(!this.revoked && !this.localStopped && this.admitted !== undefined, 'REMOTE_TOOL_REVOKED')
     this.verifyAuthorityAndLease(this.admitted.authority, this.admitted.lease, true)
-    const toolMapKey = this.tools.has(pendingReq.callId)
-      ? `${pendingReq.callId}#dup${seq}`
-      : pendingReq.callId
+    const toolMapKey =
+      this.sandboxDuplicateFaultMode && this.tools.has(pendingReq.callId)
+        ? `${pendingReq.callId}#dup${seq}`
+        : pendingReq.callId
     this.tools.set(toolMapKey, {
       seq,
       wireBody,
@@ -1025,9 +1108,37 @@ export class RemotePoolRelay {
         this.countersBaseline = await this.bindSessionFinance(this.nativeSessionId, true)
       }
       await this.onNativeSession(this.nativeSessionId!)
+      this.appRecycled = false
+      this.launchedInstructions = instructions
     } else {
       remotePoolNeed(typeof this.nativeSessionId === 'string', 'REMOTE_WARM_LANE_WITHOUT_SESSION')
       this.countersBaseline = await this.bindSessionFinance(this.nativeSessionId, false)
+      const needsAppRelaunch = this.appRecycled || instructions !== this.launchedInstructions
+      if (needsAppRelaunch) {
+        if (!this.appRecycled) {
+          await this.recycleWarmApp(true)
+        }
+        remotePoolNeed(typeof this.host.reprovisionApp === 'function', 'REMOTE_APP_RECYCLE_UNSUPPORTED')
+        this.turnHostAttempted = true
+        await this.host.reprovisionApp(catalog, {
+          ...(instructions !== undefined ? { systemPrompt: instructions } : {}),
+          nativeSessionId: this.nativeSessionId,
+          transcriptExists: this.dispatchedTurnsCount > 0,
+        })
+        remotePoolNeed(!this.revoked, 'REMOTE_REVOKED_AFTER_REPROVISION')
+        await this.openApp()
+        remotePoolNeed(!this.revoked, 'REMOTE_REVOKED_AFTER_APP')
+        const initReply = await this.dispatchCommand(
+          {
+            kind: 'initialize',
+            commandId: `init-${this.epoch}`,
+            model: this.spec.manifest.model,
+            ...(instructions !== undefined ? { instructions } : {}),
+          },
+          { publishReplies: false, waitReply: true },
+        )
+        remotePoolNeed(initReply?.ok === true, 'REMOTE_INITIALIZE_FAILED')
+      }
       const resumeReply = await this.dispatchCommand(
         {
           kind: 'resume',
@@ -1042,6 +1153,8 @@ export class RemotePoolRelay {
         resumeReply?.ok === true && resumeReply.nativeSessionId === this.nativeSessionId,
         'REMOTE_WARM_RESUME_FAILED',
       )
+      this.appRecycled = false
+      this.launchedInstructions = instructions
     }
 
     remotePoolNeed(!this.revoked && typeof this.nativeSessionId === 'string', 'REMOTE_ADMIT_REVOKED')
@@ -1120,6 +1233,7 @@ export class RemotePoolRelay {
         inputSha256: remoteCanonicalSha256(typedCmd),
       })
       await this.dispatchCommand(typedCmd, { publishReplies: true, waitReply: false })
+      this.dispatchedTurnsCount += 1
       return { dispatched: true }
     }
 
@@ -1236,11 +1350,12 @@ export class RemotePoolRelay {
     }
     if (path === '/tool/result') {
       const callId = typeof v.callId === 'string' ? v.callId : ''
+      const direct = this.tools.get(callId)
       const tool =
-        (this.tools.get(callId)?.delivered && !this.tools.get(callId)?.result
-          ? this.tools.get(callId)
-          : undefined) ??
-        [...this.tools.values()].find((t) => t.request.callId === callId && t.delivered && !t.result)
+        (direct?.delivered && !direct.result ? direct : undefined) ??
+        (this.sandboxDuplicateFaultMode
+          ? [...this.tools.values()].find((t) => t.request.callId === callId && t.delivered && !t.result)
+          : undefined)
       remotePoolNeed(tool?.delivered && !tool.result, 'REMOTE_TOOL_RESULT_UNEXPECTED')
       assertCc5ToolResult(v.result)
       const cleanResult: Cc5ToolResult = {
@@ -1265,13 +1380,14 @@ export class RemotePoolRelay {
     }
     if (path === '/tool/ack') {
       const callId = typeof v.callId === 'string' ? v.callId : ''
+      const direct = this.tools.get(callId)
       const tool =
-        (this.tools.get(callId)?.result !== undefined && !this.tools.get(callId)?.acknowledged
-          ? this.tools.get(callId)
-          : undefined) ??
-        [...this.tools.values()].find(
-          (t) => t.request.callId === callId && t.result !== undefined && !t.acknowledged,
-        )
+        (direct?.result !== undefined && !direct.acknowledged ? direct : undefined) ??
+        (this.sandboxDuplicateFaultMode
+          ? [...this.tools.values()].find(
+              (t) => t.request.callId === callId && t.result !== undefined && !t.acknowledged,
+            )
+          : undefined)
       remotePoolNeed(tool !== undefined && tool.result !== undefined && !tool.acknowledged, 'REMOTE_TOOL_ACK_INVALID')
       this.record('tool-ack', { callId })
       tool.acknowledged = true
@@ -1304,6 +1420,9 @@ export class RemotePoolRelay {
     if (path === '/abandon') {
       await this.abandon(v)
       return { ok: true, abandoned: true }
+    }
+    if (path === '/recycle') {
+      return { ok: true, ...(await this.recycleWarmApp(false)) }
     }
     if (path === '/stop') {
       return { ok: true, ...(await this.stop()) }

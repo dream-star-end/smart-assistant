@@ -33,6 +33,7 @@ import {
   encodeAuthorityEnvelope,
   encodeTurnLeaseEnvelope,
   remoteCanonicalJson,
+  remoteCanonicalSha256,
   turnLeaseSigningInput,
   type AuthorityKeyring,
   type ModelAuthorityPayload,
@@ -134,6 +135,13 @@ export interface ToolExecutionBarrier {
   readonly abortExecution?: () => boolean
 }
 
+export interface DispatchedWirePromptAudit {
+  readonly instructionsSha256: string
+  readonly instructionsBytes: number
+  readonly toolCatalogSha256: string
+  readonly toolCount: number
+}
+
 export interface OpenLaneOptions {
   readonly sessionKey?: string
   readonly sessionIndex?: number
@@ -156,6 +164,11 @@ export interface OpenLaneOptions {
     readonly allowTestBypassInTmp?: boolean
   }
   readonly testFaultSandboxMode?: 'account_mutex' | 'shared_node_cap_5'
+  readonly onAccountMutexBlocked?: (attempt: number) => void
+  readonly useRealPlatformContext?: boolean
+  readonly cwdOverride?: string
+  readonly adapterConfig?: Record<string, unknown>
+  readonly effortLevel?: string
   readonly faultTransformTerminalReceipt?: (
     receipt: RemoteReceiptV4,
   ) => Promise<RemoteReceiptV4> | RemoteReceiptV4
@@ -212,6 +225,7 @@ export interface SessionLaneHandle {
   readonly billingEvents: EngineBillingEvent[]
   readonly stopNotifications: Array<Record<string, unknown>>
   readonly getStopEvidence: () => unknown
+  readonly getDispatchedWirePromptAudit: () => DispatchedWirePromptAudit | null
   readonly getFenceDiag: () => string
   readonly submitTurn: (prompt: string, requestIdOverride?: string) => Promise<SubmittedTurnHandle>
   readonly closeLane: () => Promise<void>
@@ -1346,6 +1360,9 @@ export async function createConformanceHarness(
               ? {
                   allowTestFaultsInSandbox: true,
                   testFaultSandboxMode: laneOpts.testFaultSandboxMode,
+                  ...(laneOpts.onAccountMutexBlocked
+                    ? { onAccountMutexBlocked: laneOpts.onAccountMutexBlocked }
+                    : {}),
                 }
               : {}),
           }
@@ -1500,7 +1517,8 @@ export async function createConformanceHarness(
     await once(relay.controlServer, 'listening')
 
     const containerRoot = join(sandbox, `cnt-${idx}-${randomUUID().slice(0, 6)}`)
-    const containerCwd = join(sharedWorkspaceCwd, `cnt-${idx}-${randomUUID().slice(0, 6)}`)
+    const containerCwd =
+      laneOpts.cwdOverride ?? join(sharedWorkspaceCwd, `cnt-${idx}-${randomUUID().slice(0, 6)}`)
     const containerHome = join(containerRoot, 'home')
     const containerExecRoot = join(containerRoot, 'exec')
     mkdirSync(containerRoot, { recursive: true, mode: 0o700 })
@@ -1539,11 +1557,17 @@ export async function createConformanceHarness(
       if (laneOpts.customHostFactory) {
         return laneOpts.customHostFactory(toolRoot, lifecycleId, containerCwd, containerHome)
       }
-      if (laneOpts.dedicatedToolHost || (laneOpts.disallowedTools?.length ?? 0) > 0) {
+      if (
+        laneOpts.dedicatedToolHost ||
+        laneOpts.useRealPlatformContext ||
+        (laneOpts.disallowedTools?.length ?? 0) > 0
+      ) {
         const realHost = new Cc5ToolHost(
           toolRoot,
           lifecycleId,
-          profile,
+          laneOpts.writeOnlyTools
+            ? { ...profile, mcpConfigPath: null, settingsPath: null }
+            : profile,
           async () => {
             throw new Error('REMOTE_PERMISSION_PROMPT_UNSUPPORTED')
           },
@@ -1628,8 +1652,22 @@ export async function createConformanceHarness(
       }
     }
 
-    const defaultCall = (p: string, b: Readonly<Record<string, unknown>>) =>
-      remotePoolControlRequest(p, b, socketPath)
+    let dispatchedWirePromptAudit: DispatchedWirePromptAudit | null = null
+    const auditedDefaultCall = (p: string, b: Readonly<Record<string, unknown>>) => {
+      if (p === '/admit' && typeof b.instructions === 'string') {
+        const cat =
+          b.catalog && typeof b.catalog === 'object'
+            ? (b.catalog as { tools?: unknown[] })
+            : { tools: [] }
+        dispatchedWirePromptAudit = {
+          instructionsSha256: createHash('sha256').update(b.instructions, 'utf8').digest('hex'),
+          instructionsBytes: Buffer.byteLength(b.instructions, 'utf8'),
+          toolCatalogSha256: remoteCanonicalSha256(cat),
+          toolCount: Array.isArray(cat.tools) ? cat.tools.length : 0,
+        }
+      }
+      return remotePoolControlRequest(p, b, socketPath)
+    }
 
     const adapter = new RemoteEngineAdapter(
       {
@@ -1639,34 +1677,42 @@ export async function createConformanceHarness(
         agentId: 'main',
         agentBaseDir: containerCwd,
         model: activeCanonicalModel,
-        config: {} as any,
+        ...(laneOpts.effortLevel !== undefined ? { effortLevel: laneOpts.effortLevel } : {}),
+        config: (laneOpts.adapterConfig ?? {
+          auth: {},
+          gateway: { port: 18789, accessToken: 'conf-token' },
+          mcpServers: [],
+        }) as any,
       },
       {
         binding: placed.binding,
         socketPath,
-        ...(laneOpts.callInterceptor
-          ? {
-              call: (p, b) => laneOpts.callInterceptor!(p, b, defaultCall),
-            }
-          : {}),
+        call: laneOpts.callInterceptor
+          ? (p, b) => laneOpts.callInterceptor!(p, b, auditedDefaultCall)
+          : auditedDefaultCall,
         keyring: keys,
         executionRoot: containerExecRoot,
         hostFactory,
-        toolContextFactory: async () => ({
-          profile: {
-            cwd: containerCwd,
-            mcpConfigPath: null,
-            settingsPath: null,
-            disallowedTools: [...(laneOpts.disallowedTools ?? [])],
-          },
-          env: {
-            PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
-            HOME: containerHome,
-            CLAUDE_CONFIG_DIR: join(containerHome, '.claude'),
-            LANG: 'C.UTF-8',
-          },
-          cleanup: () => {},
-        }),
+        ...(laneOpts.useRealPlatformContext
+          ? {}
+          : {
+              toolContextFactory: async () => ({
+                profile: {
+                  cwd: containerCwd,
+                  mcpConfigPath: null,
+                  settingsPath: null,
+                  disallowedTools: [...(laneOpts.disallowedTools ?? [])],
+                },
+                env: {
+                  PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+                  HOME: containerHome,
+                  CLAUDE_CONFIG_DIR: join(containerHome, '.claude'),
+                  LANG: 'C.UTF-8',
+                },
+                platformPrompt: '',
+                cleanup: () => {},
+              }),
+            }),
         toolAuthorizeTimeoutMs: laneOpts.toolAuthorizeTimeoutMs ?? defaultAuthTimeoutMs,
         ...(laneOpts.containerObservationOptions
           ? { observationOptions: laneOpts.containerObservationOptions }
@@ -1824,6 +1870,7 @@ export async function createConformanceHarness(
       billingEvents,
       stopNotifications,
       getStopEvidence: () => host.verifiedStopEvidence ?? null,
+      getDispatchedWirePromptAudit: () => dispatchedWirePromptAudit,
       getFenceDiag,
       submitTurn,
       closeLane: async () => {
@@ -1859,8 +1906,8 @@ export async function createConformanceHarness(
       return `SENTINEL_WRITE:${filePath}:${content}${dupConcurrent ? ':DUP_CONCURRENT' : ''}`
     }
     return [
-      `Use the Write tool right now with exact arguments ${JSON.stringify({ file_path: filePath, content })} to create that file.`,
-      'Call Write strictly once and do NOT call any other tool or function. After Write returns, reply ONLY with DONE.',
+      `We are running an automated software conformance test of the workspace Write tool. Please create the plain-text verification fixture file using Write with exact arguments ${JSON.stringify({ file_path: filePath, content })}.`,
+      'Call Write once without calling any other tool, and reply ONLY with DONE after Write succeeds.',
     ].join('\n')
   }
 

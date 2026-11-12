@@ -772,8 +772,8 @@ async function runAc5Rehearsals(codexNodeConfigPath?: string) {
       failTurnInsertOnce: failOnce,
       extraDriverContext: statefulCtx,
     })
-    const sentinel3Path = join(crashLane.containerCwd, 'ac5-crash-sentinel.txt')
-    const sentinel3Body = `ac5-crash-${randomUUID()}`
+    const sentinel3Path = join(crashLane.containerCwd, 'ac5-g3-sentinel.txt')
+    const sentinel3Body = `ac5-g3-${randomUUID()}`
     const creditsBeforeCrash = await h.getUserCredits()
     const turn3 = await crashLane.submitTurn(h.buildWritePrompt(sentinel3Path, sentinel3Body))
     await turn3.run.summary.catch(() => {})

@@ -237,16 +237,7 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
     }
   }
 
-  private checkStopProof(row: any): void {
-    this.checkIdentity(row)
-    remotePoolNeed(
-      row.remoteStopped === true &&
-        typeof row.bootId === 'string' &&
-        /^[a-f0-9-]{36}$/i.test(row.bootId) &&
-        Array.isArray(row.scopes) &&
-        row.scopes.length <= 2,
-      'REMOTE_STOP_PROOF_INVALID',
-    )
+  private checkScopeProofList(row: any, maxScopes: number): void {
     const seenUnits = new Set<string>()
     for (const s of row.scopes) {
       for (const k of ['driverId', 'engineId', 'operationId', 'runId', 'generation', 'profileId', 'authEpoch'] as const) {
@@ -269,6 +260,34 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
       )
       seenUnits.add(s.unit)
     }
+    remotePoolNeed(seenUnits.size <= maxScopes, 'REMOTE_STOP_PROOF_INVALID')
+  }
+
+  private checkStopProof(row: any): void {
+    this.checkIdentity(row)
+    remotePoolNeed(
+      row.remoteStopped === true &&
+        typeof row.bootId === 'string' &&
+        /^[a-f0-9-]{36}$/i.test(row.bootId) &&
+        Array.isArray(row.scopes) &&
+        row.scopes.length <= 2,
+      'REMOTE_STOP_PROOF_INVALID',
+    )
+    this.checkScopeProofList(row, 2)
+  }
+
+  private checkAppRecycleProof(row: any): void {
+    this.checkIdentity(row)
+    remotePoolNeed(
+      row.kind === 'app-recycled' &&
+        row.appStopped === true &&
+        typeof row.bootId === 'string' &&
+        /^[a-f0-9-]{36}$/i.test(row.bootId) &&
+        Array.isArray(row.scopes) &&
+        row.scopes.length <= 1,
+      'REMOTE_APP_RECYCLE_PROOF_INVALID',
+    )
+    this.checkScopeProofList(row, 1)
   }
 
   async preflight(): Promise<RemotePoolPreflight> {
@@ -313,6 +332,40 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
     })
     this.checkIdentity(row)
     remotePoolNeed(row.kind === 'provisioned', 'REMOTE_PROVISION_ACK_INVALID')
+  }
+
+  async recycleApp(): Promise<{ appStopped: true; noHostEffect?: boolean }> {
+    remotePoolNeed(this.opened.has('provision') && !this.revoked, 'REMOTE_RECYCLE_INVALID_STATE')
+    if (!this.opened.has('launch')) {
+      return { appStopped: true, noHostEffect: true }
+    }
+    const row = await this.control('recycle-app')
+    this.checkAppRecycleProof(row)
+    this.opened.delete('launch')
+    return {
+      appStopped: true,
+      ...(row.noHostEffect === true ? { noHostEffect: true } : {}),
+    }
+  }
+
+  async reprovisionApp(tools: unknown, defaultsContext?: Readonly<Record<string, unknown>>): Promise<void> {
+    remotePoolNeed(
+      this.opened.has('provision') && !this.opened.has('launch') && !this.revoked,
+      'REMOTE_REPROVISION_INVALID_STATE',
+    )
+    const { systemPrompt: _staleSystemPrompt, ...baseDriverContext } = this.spec.driverContext ?? {}
+    const mergedContext = defaultsContext
+      ? { ...baseDriverContext, ...defaultsContext }
+      : baseDriverContext
+    const row = await this.control('reprovision-app', {
+      manifest: this.spec.manifest,
+      tools,
+      driverContext: mergedContext,
+      verifiedProbe: this.spec.verifiedProbe,
+      ...(this.spec.registryPath ? { registryPath: this.spec.registryPath } : {}),
+    })
+    this.checkIdentity(row)
+    remotePoolNeed(row.kind === 'reprovisioned', 'REMOTE_REPROVISION_ACK_INVALID')
   }
 
   open(role: 'launch' | 'tool-socket'): ChildProcessWithoutNullStreams {

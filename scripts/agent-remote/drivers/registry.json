@@ -25,7 +25,9 @@
         "stop",
         "fence-stop",
         "prove-stopped",
-        "probe"
+        "probe",
+        "recycle-app",
+        "reprovision-app"
       ]
     },
     "codex": {
@@ -52,7 +54,9 @@
         "stop",
         "fence-stop",
         "prove-stopped",
-        "probe"
+        "probe",
+        "recycle-app",
+        "reprovision-app"
       ]
     }
   }

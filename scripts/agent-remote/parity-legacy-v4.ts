@@ -43,6 +43,7 @@ import {
   encodeAuthorityEnvelope,
   encodeTurnLeaseEnvelope,
   parseCc5ExecutionBackend,
+  remoteCanonicalSha256,
   turnLeaseSigningInput,
   type AuthorityKeyring,
   type ModelAuthorityPayload,
@@ -102,6 +103,39 @@ const CC5_CONTROLLER_PATH = fileURLToPath(
 const CC_INTERSECTION_UPSTREAM_MODEL = 'claude-opus-5-5'
 const CC_INTERSECTION_CANONICAL_MODEL = 'claude-opus-5-5-remote'
 
+const SHARED_PARITY_ADAPTER_CONFIG = Object.freeze({
+  version: 1,
+  terminal: { type: 'local' },
+  provider: 'anthropic',
+  mcpServers: [],
+  auth: { mode: 'subscription', claudeCodePath: '' },
+  gateway: { bind: '127.0.0.1', port: 18790, accessToken: 'parity-token' },
+  channels: { webchat: { enabled: false } },
+  sessions: { dbPath: '' },
+  defaults: { permissionMode: 'bypassPermissions' },
+})
+
+export interface LaneObservedTargetAudit {
+  readonly sshHost: string
+  readonly sshPort: number
+  readonly sshUser: string
+  readonly profileName: string
+  readonly canonicalModel: string
+  readonly upstreamModel: string
+  readonly pricingRatesFenPerMtok: {
+    readonly input: string
+    readonly output: string
+    readonly cacheRead: string
+    readonly cacheWrite: string
+  }
+  readonly dispatchedInstructionsSha256: string
+  readonly dispatchedInstructionsBytes: number
+  readonly dispatchedToolCatalogSha256: string
+  readonly dispatchedToolCount: number
+  readonly turn1UserPromptSha256: string
+  readonly turn2UserPromptSha256: string
+}
+
 interface UsageAuditRecord {
   readonly requestId: string
   readonly status: string
@@ -133,6 +167,7 @@ export interface LaneParityEvidence {
   readonly backendKind: string
   readonly operationId: string
   readonly taskRoot: string
+  readonly observedTarget: LaneObservedTargetAudit
   readonly turn1: TurnParityObservation & {
     readonly sentinelVerified: boolean
   }
@@ -154,15 +189,27 @@ export interface EngineSameNodeParityReport {
     readonly profileName: string
     readonly canonicalModel: string
     readonly upstreamModel: string
-    readonly sameNodeVerified: true
-    readonly sameAccountVerified: true
-    readonly sameModelVerified: true
-    readonly samePromptStructureVerified: true
-    readonly samePricingSnapshotVerified: true
+    readonly sameNodeVerified: boolean
+    readonly sameAccountVerified: boolean
+    readonly sameModelVerified: boolean
+    readonly samePromptStructureVerified: boolean
+    readonly samePricingSnapshotVerified: boolean
   }
   readonly legacy746: LaneParityEvidence
   readonly v4: LaneParityEvidence
   readonly sideBySideComparison: {
+    readonly wirePromptParity: {
+      readonly legacyInstructionsSha256: string
+      readonly v4InstructionsSha256: string
+      readonly instructionsSha256Matched: boolean
+      readonly legacyInstructionsBytes: number
+      readonly v4InstructionsBytes: number
+      readonly legacyToolCatalogSha256: string
+      readonly v4ToolCatalogSha256: string
+      readonly toolCatalogSha256Matched: boolean
+      readonly turn1UserPromptSha256Matched: boolean
+      readonly turn2UserPromptSha256Matched: boolean
+    }
     readonly ttft: {
       readonly includesLiveNetworkAndModelVariance: true
       readonly legacyTurn1Ms: number
@@ -207,6 +254,23 @@ export interface EngineSameNodeParityReport {
       }
       readonly legacyTotalChargedFen: string
       readonly v4TotalChargedFen: string
+      readonly costRatioV4ToLegacy: number
+      readonly relativeCostDeltaPct: number
+      readonly turn1TotalContextTokens: {
+        readonly legacy: number
+        readonly v4: number
+      }
+      readonly tokenRateDeltaDecompositionFen: {
+        readonly inputDeltaFen: number
+        readonly outputDeltaFen: number
+        readonly cacheReadDeltaFen: number
+        readonly cacheWriteDeltaFen: number
+        readonly roundingDeltaFen: number
+        readonly cacheNeutralLegacyFen: number
+        readonly cacheNeutralV4Fen: number
+        readonly cacheNeutralRelativeDeltaPct: number
+        readonly manualReviewRequired: boolean
+      }
       readonly bothMatchExactComputeCostFormula: boolean
       readonly explanation: string
     }
@@ -219,8 +283,8 @@ function sha256Utf8(text: string): string {
 
 function buildParityTurn1Prompt(sentinelPath: string, sentinelContent: string, nonce: string): string {
   return [
-    `Use the Write tool right now with exact arguments ${JSON.stringify({ file_path: sentinelPath, content: sentinelContent })} to create that file.`,
-    `Call Write strictly once and do NOT call any other tool or function. Remember the exact token ${nonce} for the next turn, and after Write returns reply ONLY with DONE.`,
+    `We are running an automated software parity verification test of the workspace Write tool. Please create the plain-text verification fixture file using Write with exact arguments ${JSON.stringify({ file_path: sentinelPath, content: sentinelContent })}.`,
+    `Call Write once without calling any other tool. Remember the verification token ${nonce} for the next turn, and reply ONLY with DONE after Write succeeds.`,
   ].join('\n')
 }
 
@@ -454,17 +518,28 @@ function createLegacyFinanceSetup(input: {
 async function runV4TwoTurnParityLane(
   h: Awaited<ReturnType<typeof createConformanceHarness>>,
   nonce: string,
+  sharedParityCwd: string,
+  effortLevel?: string,
 ): Promise<LaneParityEvidence> {
-  const lane = await h.openLane({ dedicatedToolHost: true, writeOnlyTools: true })
+  rmSync(sharedParityCwd, { recursive: true, force: true })
+  mkdirSync(sharedParityCwd, { recursive: true, mode: 0o700 })
+  const lane = await h.openLane({
+    dedicatedToolHost: true,
+    writeOnlyTools: true,
+    useRealPlatformContext: true,
+    cwdOverride: sharedParityCwd,
+    adapterConfig: SHARED_PARITY_ADAPTER_CONFIG as unknown as Record<string, unknown>,
+    ...(effortLevel ? { effortLevel } : {}),
+  })
   try {
     const sentinelPath = join(lane.containerCwd, 'parity-sentinel.txt')
-    const sentinelContent = `parity-v4-${nonce}`
+    const sentinelContent = `parity-${nonce}`
+    const turn1Prompt = buildParityTurn1Prompt(sentinelPath, sentinelContent, nonce)
+    const turn2Prompt = buildParityTurn2Prompt()
 
     // Turn 1
     const t1Start = performance.now()
-    const turn1 = await lane.submitTurn(
-      buildParityTurn1Prompt(sentinelPath, sentinelContent, nonce),
-    )
+    const turn1 = await lane.submitTurn(turn1Prompt)
     const summary1 = await turn1.run.summary
     const t1End = performance.now()
     const ttft1Ms = Number(((turn1.getFirstContentEventAt() ?? t1End) - t1Start).toFixed(2))
@@ -478,6 +553,12 @@ async function runV4TwoTurnParityLane(
     assert.equal(lane.executedCalls[0]?.name, 'Write')
     const nativeSession1 = lane.settledReceipts[0]?.nativeSessionId ?? ''
     assert.ok(nativeSession1.length > 0, 'v4 Turn 1 must bind non-empty nativeSessionId')
+    const wireAudit = lane.getDispatchedWirePromptAudit()
+    assert.ok(wireAudit, 'v4 lane must capture /admit wire prompt and catalog audit')
+    assert.ok(
+      wireAudit.instructionsBytes > 4096,
+      `v4 wire instructions must carry full platform prompt (>4 KiB, got ${wireAudit.instructionsBytes} B)`,
+    )
     const usage1 = await readAndVerifyUsageRecord(
       h.pool,
       h.uid,
@@ -487,7 +568,7 @@ async function runV4TwoTurnParityLane(
 
     // Turn 2 (warm native resume)
     const t2Start = performance.now()
-    const turn2 = await lane.submitTurn(buildParityTurn2Prompt())
+    const turn2 = await lane.submitTurn(turn2Prompt)
     const summary2 = await turn2.run.summary
     const t2End = performance.now()
     const ttft2Ms = Number(((turn2.getFirstContentEventAt() ?? t2End) - t2Start).toFixed(2))
@@ -524,6 +605,26 @@ async function runV4TwoTurnParityLane(
       backendKind: 'remote-driver-v4',
       operationId: lane.placed.binding.operationId,
       taskRoot: lane.placed.spec.manifest.root,
+      observedTarget: {
+        sshHost: lane.placed.sshTarget.host,
+        sshPort: lane.placed.sshTarget.port,
+        sshUser: lane.placed.sshTarget.user,
+        profileName: lane.placed.binding.profileId,
+        canonicalModel: lane.placed.binding.canonicalModel,
+        upstreamModel: lane.placed.binding.upstreamModel,
+        pricingRatesFenPerMtok: {
+          input: PRICING_RATES.inputPerMtok.toString(),
+          output: PRICING_RATES.outputPerMtok.toString(),
+          cacheRead: PRICING_RATES.cacheReadPerMtok.toString(),
+          cacheWrite: PRICING_RATES.cacheWritePerMtok.toString(),
+        },
+        dispatchedInstructionsSha256: wireAudit.instructionsSha256,
+        dispatchedInstructionsBytes: wireAudit.instructionsBytes,
+        dispatchedToolCatalogSha256: wireAudit.toolCatalogSha256,
+        dispatchedToolCount: wireAudit.toolCount,
+        turn1UserPromptSha256: sha256Utf8(turn1Prompt),
+        turn2UserPromptSha256: sha256Utf8(turn2Prompt),
+      },
       turn1: {
         requestId: turn1.requestId,
         ttftMs: ttft1Ms,
@@ -600,8 +701,9 @@ async function runLegacy746CcTwoTurnParityLane(input: {
   preCheckRedis: ReturnType<typeof wrapIoredisForPreCheck>
   liveCfg: LiveNodeConfig
   nonce: string
+  sharedParityCwd: string
 }): Promise<LaneParityEvidence> {
-  const { pool, preCheckRedis, liveCfg, nonce } = input
+  const { pool, preCheckRedis, liveCfg, nonce, sharedParityCwd } = input
   const selfhostNode = readSelfhostReadOnlyJson<{
     key_id: string
     host_key_fp: string
@@ -692,10 +794,11 @@ async function runLegacy746CcTwoTurnParityLane(input: {
   const toolSocketPath = join(shortDir, 'tool.sock')
   const relaySocketPath = join(shortDir, 'relay.sock')
   const journalDir = join(shortDir, 'journal')
-  const containerCwd = join(shortDir, 'cwd')
+  rmSync(sharedParityCwd, { recursive: true, force: true })
+  mkdirSync(sharedParityCwd, { recursive: true, mode: 0o700 })
+  const containerCwd = sharedParityCwd
   const containerHome = join(shortDir, 'home')
   const execRoot = join(shortDir, 'exec')
-  mkdirSync(containerCwd, { recursive: true, mode: 0o700 })
   mkdirSync(join(containerHome, '.claude'), { recursive: true, mode: 0o700 })
   mkdirSync(execRoot, { recursive: true, mode: 0o700 })
 
@@ -715,7 +818,28 @@ async function runLegacy746CcTwoTurnParityLane(input: {
     controllerPath: localControllerCopy,
     toolSocketPath,
   }
-  const host = new Cc5SshHost(hostConfig)
+  let legacyCcWireAudit: {
+    instructionsSha256: string
+    instructionsBytes: number
+    toolCatalogSha256: string
+    toolCount: number
+  } | null = null
+  const wrapCcHost = (innerHost: Cc5SshHost): Cc5SshHost => {
+    const origConfigure = innerHost.configure.bind(innerHost)
+    innerHost.configure = async (packet: Buffer) => {
+      const parsed = JSON.parse(packet.toString('utf8')) as { catalog: string; prompt: string }
+      const catObj = JSON.parse(parsed.catalog) as { tools?: unknown[] }
+      legacyCcWireAudit = {
+        instructionsSha256: sha256Utf8(parsed.prompt),
+        instructionsBytes: Buffer.byteLength(parsed.prompt, 'utf8'),
+        toolCatalogSha256: remoteCanonicalSha256(catObj),
+        toolCount: Array.isArray(catObj.tools) ? catObj.tools.length : 0,
+      }
+      return await origConfigure(packet)
+    }
+    return innerHost
+  }
+  const host = wrapCcHost(new Cc5SshHost(hostConfig))
   const binding: Readonly<Cc5BridgeBinding> = Object.freeze({
     version: 2,
     backendKind: CC5_INTERACTIVE_BACKEND,
@@ -739,7 +863,7 @@ async function runLegacy746CcTwoTurnParityLane(input: {
     {
       slidingTtlMs: CC5_BINDING_SLIDING_TTL_MS,
       upstreamModel: CC_INTERSECTION_UPSTREAM_MODEL,
-      replaceHost: () => new Cc5SshHost(hostConfig),
+      replaceHost: () => wrapCcHost(new Cc5SshHost(hostConfig)),
     },
   )
 
@@ -873,23 +997,13 @@ async function runLegacy746CcTwoTurnParityLane(input: {
       },
     }
 
-    const adapterConfig = {
-      version: 1,
-      terminal: { type: 'local' },
-      provider: 'anthropic',
-      mcpServers: [{ id: 'parity-noop', command: '/bin/true', args: [] }],
-      auth: {},
-      gateway: { bind: '127.0.0.1', port: 18790, accessToken: 'parity-token' },
-      channels: { webchat: { enabled: false } },
-      sessions: { dbPath: '' },
-    }
     const adapter = new Cc5InteractiveAdapter({
       sessionKey,
       executionBackend,
       agentId: 'main',
       agentBaseDir: containerCwd,
       model: binding.canonicalModel,
-      config: adapterConfig as never,
+      config: SHARED_PARITY_ADAPTER_CONFIG as never,
       cc5BridgePort: port,
     } as EngineCreateOpts)
     activeAdapter = adapter
@@ -934,7 +1048,7 @@ async function runLegacy746CcTwoTurnParityLane(input: {
         expiresAt: now + 300_000,
         executionDescriptor: {
           capabilityProfile: {
-            supportsVision: false,
+            supportsVision: true,
             reasoning: { supported: ['low', 'medium', 'high'] },
             ccb: {
               capabilityZero: false,
@@ -944,7 +1058,7 @@ async function runLegacy746CcTwoTurnParityLane(input: {
           },
           capabilitySchemaVersion: 1,
           contextWindow: 200_000,
-          supportsVision: false,
+          supportsVision: true,
           supportedEfforts: ['low', 'medium', 'high'],
         },
       }
@@ -982,7 +1096,7 @@ async function runLegacy746CcTwoTurnParityLane(input: {
             contextWindow: 200_000,
             capabilityZero: false,
             supportsThinking: true,
-            supportsVision: false,
+            supportsVision: true,
             supportedEfforts: ['low', 'medium', 'high'],
           },
         },
@@ -1007,17 +1121,18 @@ async function runLegacy746CcTwoTurnParityLane(input: {
     }
 
     const sentinelPath = join(containerCwd, 'parity-sentinel.txt')
-    const sentinelContent = `parity-legacy-cc-${nonce}`
+    const sentinelContent = `parity-${nonce}`
+    const turn1Prompt = buildParityTurn1Prompt(sentinelPath, sentinelContent, nonce)
+    const turn2Prompt = buildParityTurn2Prompt()
 
     // Turn 1
-    const t1 = await submitLegacyCcTurn(
-      buildParityTurn1Prompt(sentinelPath, sentinelContent, nonce),
-    )
+    const t1 = await submitLegacyCcTurn(turn1Prompt)
     assert.equal(t1.summary.isError, false, `Legacy cc Turn 1 failed: ${t1.summary.errorDetail ?? ''}`)
     const sentinelVerified = readFileSync(sentinelPath, 'utf8') === sentinelContent
     assert.equal(sentinelVerified, true, 'Legacy cc Turn 1 sentinel mismatch')
     assert.equal(executedCalls.length, 1, 'Legacy cc Turn 1 must execute 1 container tool')
     assert.equal(executedCalls[0]?.name, 'Write')
+    assert.ok(legacyCcWireAudit, 'Legacy cc host.configure must capture wire prompt and catalog')
     const parsedResume1 = adapter.nativeSessionId
       ? parseCc5ResumeId(adapter.nativeSessionId)
       : null
@@ -1031,7 +1146,7 @@ async function runLegacy746CcTwoTurnParityLane(input: {
     )
 
     // Turn 2 (warm native resume on same resident PTY/bridge)
-    const t2 = await submitLegacyCcTurn(buildParityTurn2Prompt())
+    const t2 = await submitLegacyCcTurn(turn2Prompt)
     assert.equal(t2.summary.isError, false, `Legacy cc Turn 2 failed: ${t2.summary.errorDetail ?? ''}`)
     assert.equal(executedCalls.length, 1, 'Legacy cc Turn 2 must execute 0 tools')
     const recalledNonce = t2.summary.assistantText.includes(nonce)
@@ -1071,6 +1186,26 @@ async function runLegacy746CcTwoTurnParityLane(input: {
       backendKind: CC5_INTERACTIVE_BACKEND,
       operationId: placed.operationId,
       taskRoot: placed.taskRoot,
+      observedTarget: {
+        sshHost: placed.target.host,
+        sshPort: placed.target.port,
+        sshUser: placed.target.user,
+        profileName: 'default',
+        canonicalModel: binding.canonicalModel,
+        upstreamModel: CC_INTERSECTION_UPSTREAM_MODEL,
+        pricingRatesFenPerMtok: {
+          input: PRICING_RATES.inputPerMtok.toString(),
+          output: PRICING_RATES.outputPerMtok.toString(),
+          cacheRead: PRICING_RATES.cacheReadPerMtok.toString(),
+          cacheWrite: PRICING_RATES.cacheWritePerMtok.toString(),
+        },
+        dispatchedInstructionsSha256: legacyCcWireAudit.instructionsSha256,
+        dispatchedInstructionsBytes: legacyCcWireAudit.instructionsBytes,
+        dispatchedToolCatalogSha256: legacyCcWireAudit.toolCatalogSha256,
+        dispatchedToolCount: legacyCcWireAudit.toolCount,
+        turn1UserPromptSha256: sha256Utf8(turn1Prompt),
+        turn2UserPromptSha256: sha256Utf8(turn2Prompt),
+      },
       turn1: {
         requestId: t1.requestId,
         ttftMs: t1.ttftMs,
@@ -1130,8 +1265,9 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
   preCheckRedis: ReturnType<typeof wrapIoredisForPreCheck>
   liveCfg: LiveNodeConfig
   nonce: string
+  sharedParityCwd: string
 }): Promise<LaneParityEvidence> {
-  const { pool, preCheckRedis, liveCfg, nonce } = input
+  const { pool, preCheckRedis, liveCfg, nonce, sharedParityCwd } = input
   const selfhostRow = readSelfhostReadOnlyJson<{
     key_id: string
     host_key_fp: string
@@ -1246,11 +1382,12 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
   const shortDir = mkdtempSync('/tmp/oc-parcdx-')
   const relaySocketPath = join(shortDir, 'relay.sock')
   const journalDir = join(shortDir, 'journal')
-  const containerCwd = join(shortDir, 'cwd')
+  rmSync(sharedParityCwd, { recursive: true, force: true })
+  mkdirSync(sharedParityCwd, { recursive: true, mode: 0o700 })
+  const containerCwd = sharedParityCwd
   const containerHome = join(shortDir, 'home')
   const execRoot = join(shortDir, 'exec')
   mkdirSync(journalDir, { recursive: true, mode: 0o700 })
-  mkdirSync(containerCwd, { recursive: true, mode: 0o700 })
   mkdirSync(join(containerHome, '.claude'), { recursive: true, mode: 0o700 })
   mkdirSync(execRoot, { recursive: true, mode: 0o700 })
 
@@ -1263,6 +1400,56 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
   })
 
   const host = new CodexSshHost(placed.target, spec)
+  let legacyCodexCatalogSha256 = ''
+  let legacyCodexToolCount = 0
+  let legacyCodexInstructionsSha256 = ''
+  let legacyCodexInstructionsBytes = 0
+  const origProvision = host.provision.bind(host)
+  host.provision = async (tools: unknown) => {
+    const catObj =
+      tools && typeof tools === 'object' ? (tools as { tools?: unknown[] }) : { tools: [] }
+    legacyCodexCatalogSha256 = remoteCanonicalSha256(catObj)
+    legacyCodexToolCount = Array.isArray(catObj.tools) ? catObj.tools.length : 0
+    return await origProvision(tools)
+  }
+  const origOpen = host.open.bind(host)
+  host.open = (role: 'launch' | 'tool-socket') => {
+    const child = origOpen(role)
+    if (role === 'launch') {
+      let lineBuf = ''
+      const origWrite = child.stdin.write.bind(child.stdin)
+      child.stdin.write = ((chunk: unknown, ...rest: unknown[]) => {
+        const str = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk ?? '')
+        lineBuf += str
+        let nl = lineBuf.indexOf('\n')
+        while (nl >= 0) {
+          const line = lineBuf.slice(0, nl).trim()
+          lineBuf = lineBuf.slice(nl + 1)
+          if (line.startsWith('{')) {
+            try {
+              const msg = JSON.parse(line) as {
+                method?: string
+                params?: { baseInstructions?: unknown }
+              }
+              if (
+                msg.method === 'thread/start' &&
+                typeof msg.params?.baseInstructions === 'string' &&
+                !legacyCodexInstructionsSha256
+              ) {
+                legacyCodexInstructionsSha256 = sha256Utf8(msg.params.baseInstructions)
+                legacyCodexInstructionsBytes = Buffer.byteLength(msg.params.baseInstructions, 'utf8')
+              }
+            } catch {
+              /* ignore partial/non-JSON frame */
+            }
+          }
+          nl = lineBuf.indexOf('\n')
+        }
+        return (origWrite as (...args: any[]) => boolean)(chunk, ...rest)
+      }) as typeof child.stdin.write
+    }
+    return child
+  }
   const preflight = await host.preflight()
   assert.equal(preflight.memoryOk, true, `Legacy codex preflight refused: ${preflight.code ?? ''}`)
 
@@ -1339,12 +1526,7 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
         sessionKey,
         agentId: 'main',
         config: {
-          version: 1,
-          gateway: { bind: '127.0.0.1', port: 18791, accessToken: 'parity-token' },
-          auth: { mode: 'subscription', claudeCodePath: '' },
-          mcpServers: [{ id: 'parity-noop', command: '/bin/true', args: [] }],
-          channels: { webchat: { enabled: false } },
-          sessions: { dbPath: '' },
+          ...SHARED_PARITY_ADAPTER_CONFIG,
           defaults: { model: binding.canonicalModel, permissionMode: 'bypassPermissions' },
         },
         agentBaseDir: containerCwd,
@@ -1434,13 +1616,13 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
         expiresAt: now + 300_000,
         executionDescriptor: {
           capabilityProfile: {
-            supportsVision: false,
+            supportsVision: true,
             reasoning: { supported: ['low', 'medium', 'high'], codexModelDefault: 'medium' },
             ccb: { capabilityZero: false, supportsThinking: true },
           },
           capabilitySchemaVersion: 1,
           contextWindow: 200_000,
-          supportsVision: false,
+          supportsVision: true,
           supportedEfforts: ['low', 'medium', 'high'],
           codexDefaultEffort: 'medium',
         },
@@ -1479,7 +1661,7 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
             contextWindow: 200_000,
             capabilityZero: false,
             supportsThinking: true,
-            supportsVision: false,
+            supportsVision: true,
             supportedEfforts: ['low', 'medium', 'high'],
           },
         },
@@ -1504,12 +1686,12 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
     }
 
     const sentinelPath = join(containerCwd, 'parity-sentinel.txt')
-    const sentinelContent = `parity-legacy-cdx-${nonce}`
+    const sentinelContent = `parity-${nonce}`
+    const turn1Prompt = buildParityTurn1Prompt(sentinelPath, sentinelContent, nonce)
+    const turn2Prompt = buildParityTurn2Prompt()
 
     // Turn 1
-    const t1 = await submitLegacyCodexTurn(
-      buildParityTurn1Prompt(sentinelPath, sentinelContent, nonce),
-    )
+    const t1 = await submitLegacyCodexTurn(turn1Prompt)
     assert.equal(
       t1.summary.isError,
       false,
@@ -1519,6 +1701,10 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
     assert.equal(sentinelVerified, true, 'Legacy codex Turn 1 sentinel mismatch')
     assert.equal(executedCalls.length, 1, 'Legacy codex Turn 1 must execute 1 container tool')
     assert.equal(executedCalls[0]?.name, 'Write')
+    assert.ok(
+      legacyCodexInstructionsSha256.length === 64 && legacyCodexCatalogSha256.length === 64,
+      'Legacy codex must capture wire baseInstructions and provisioned tool catalog',
+    )
     const nativeThread1 = observedNativeThreads[0] ?? adapterSessionIds[0] ?? ''
     assert.ok(nativeThread1.length > 0, 'Legacy codex Turn 1 must bind nativeThreadId')
     const usage1 = await readAndVerifyUsageRecord(
@@ -1529,7 +1715,7 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
     )
 
     // Turn 2 (warm resident app-server turn on same thread)
-    const t2 = await submitLegacyCodexTurn(buildParityTurn2Prompt())
+    const t2 = await submitLegacyCodexTurn(turn2Prompt)
     assert.equal(
       t2.summary.isError,
       false,
@@ -1575,6 +1761,26 @@ async function runLegacy746CodexTwoTurnParityLane(input: {
       backendKind: 'codex-app-server-v1',
       operationId: placed.operationId,
       taskRoot: placed.taskRoot,
+      observedTarget: {
+        sshHost: placed.target.host,
+        sshPort: placed.target.port,
+        sshUser: placed.target.user,
+        profileName: spec.manifest.profileId,
+        canonicalModel: binding.canonicalModel,
+        upstreamModel: placed.target.upstreamModel,
+        pricingRatesFenPerMtok: {
+          input: PRICING_RATES.inputPerMtok.toString(),
+          output: PRICING_RATES.outputPerMtok.toString(),
+          cacheRead: PRICING_RATES.cacheReadPerMtok.toString(),
+          cacheWrite: PRICING_RATES.cacheWritePerMtok.toString(),
+        },
+        dispatchedInstructionsSha256: legacyCodexInstructionsSha256,
+        dispatchedInstructionsBytes: legacyCodexInstructionsBytes,
+        dispatchedToolCatalogSha256: legacyCodexCatalogSha256,
+        dispatchedToolCount: legacyCodexToolCount,
+        turn1UserPromptSha256: sha256Utf8(turn1Prompt),
+        turn2UserPromptSha256: sha256Utf8(turn2Prompt),
+      },
       turn1: {
         requestId: t1.requestId,
         ttftMs: t1.ttftMs,
@@ -1631,7 +1837,109 @@ function buildSideBySideReport(
   legacy746: LaneParityEvidence,
   v4: LaneParityEvidence,
 ): EngineSameNodeParityReport {
+  const sameNodeVerified =
+    legacy746.observedTarget.sshHost === v4.observedTarget.sshHost &&
+    legacy746.observedTarget.sshPort === v4.observedTarget.sshPort &&
+    legacy746.observedTarget.sshUser === v4.observedTarget.sshUser &&
+    legacy746.observedTarget.sshHost === cfg.sshHost
+  const sameAccountVerified =
+    legacy746.observedTarget.profileName === v4.observedTarget.profileName &&
+    legacy746.observedTarget.profileName.length > 0
+  const sameModelVerified =
+    legacy746.observedTarget.canonicalModel === v4.observedTarget.canonicalModel &&
+    legacy746.observedTarget.upstreamModel === v4.observedTarget.upstreamModel &&
+    legacy746.observedTarget.canonicalModel === canonicalModel &&
+    legacy746.observedTarget.upstreamModel === upstreamModel
+  const instructionsSha256Matched =
+    legacy746.observedTarget.dispatchedInstructionsSha256 ===
+    v4.observedTarget.dispatchedInstructionsSha256
+  const toolCatalogSha256Matched =
+    legacy746.observedTarget.dispatchedToolCatalogSha256 ===
+    v4.observedTarget.dispatchedToolCatalogSha256
+  const turn1UserPromptSha256Matched =
+    legacy746.observedTarget.turn1UserPromptSha256 === v4.observedTarget.turn1UserPromptSha256
+  const turn2UserPromptSha256Matched =
+    legacy746.observedTarget.turn2UserPromptSha256 === v4.observedTarget.turn2UserPromptSha256
+  const samePromptStructureVerified =
+    instructionsSha256Matched &&
+    legacy746.observedTarget.dispatchedInstructionsBytes ===
+      v4.observedTarget.dispatchedInstructionsBytes &&
+    legacy746.observedTarget.dispatchedInstructionsBytes > 4096 &&
+    toolCatalogSha256Matched &&
+    legacy746.observedTarget.dispatchedToolCount === v4.observedTarget.dispatchedToolCount &&
+    turn1UserPromptSha256Matched &&
+    turn2UserPromptSha256Matched
+  const samePricingSnapshotVerified =
+    legacy746.observedTarget.pricingRatesFenPerMtok.input ===
+      v4.observedTarget.pricingRatesFenPerMtok.input &&
+    legacy746.observedTarget.pricingRatesFenPerMtok.output ===
+      v4.observedTarget.pricingRatesFenPerMtok.output &&
+    legacy746.observedTarget.pricingRatesFenPerMtok.cacheRead ===
+      v4.observedTarget.pricingRatesFenPerMtok.cacheRead &&
+    legacy746.observedTarget.pricingRatesFenPerMtok.cacheWrite ===
+      v4.observedTarget.pricingRatesFenPerMtok.cacheWrite
+
+  const legacyTurn1ContextTokens =
+    legacy746.turn1.usageRecord.inputTokens +
+    legacy746.turn1.usageRecord.cacheReadTokens +
+    legacy746.turn1.usageRecord.cacheWriteTokens
+  const v4Turn1ContextTokens =
+    v4.turn1.usageRecord.inputTokens +
+    v4.turn1.usageRecord.cacheReadTokens +
+    v4.turn1.usageRecord.cacheWriteTokens
+  const turn1ContextParityOk =
+    Math.abs(v4Turn1ContextTokens - legacyTurn1ContextTokens) <=
+    Math.max(256, Math.round(legacyTurn1ContextTokens * 0.05))
+
+  const legIn = legacy746.turn1.usageRecord.inputTokens + legacy746.turn2Resume.usageRecord.inputTokens
+  const legOut = legacy746.turn1.usageRecord.outputTokens + legacy746.turn2Resume.usageRecord.outputTokens
+  const legCacheRead =
+    legacy746.turn1.usageRecord.cacheReadTokens + legacy746.turn2Resume.usageRecord.cacheReadTokens
+  const legCacheWrite =
+    legacy746.turn1.usageRecord.cacheWriteTokens + legacy746.turn2Resume.usageRecord.cacheWriteTokens
+  const v4In = v4.turn1.usageRecord.inputTokens + v4.turn2Resume.usageRecord.inputTokens
+  const v4Out = v4.turn1.usageRecord.outputTokens + v4.turn2Resume.usageRecord.outputTokens
+  const v4CacheRead = v4.turn1.usageRecord.cacheReadTokens + v4.turn2Resume.usageRecord.cacheReadTokens
+  const v4CacheWrite = v4.turn1.usageRecord.cacheWriteTokens + v4.turn2Resume.usageRecord.cacheWriteTokens
+
+  const inRate = Number(PRICING_RATES.inputPerMtok)
+  const outRate = Number(PRICING_RATES.outputPerMtok)
+  const crRate = Number(PRICING_RATES.cacheReadPerMtok)
+  const cwRate = Number(PRICING_RATES.cacheWritePerMtok)
+
+  const inputDeltaFen = Number((((v4In - legIn) * inRate) / 1_000_000).toFixed(2))
+  const outputDeltaFen = Number((((v4Out - legOut) * outRate) / 1_000_000).toFixed(2))
+  const cacheReadDeltaFen = Number((((v4CacheRead - legCacheRead) * crRate) / 1_000_000).toFixed(2))
+  const cacheWriteDeltaFen = Number((((v4CacheWrite - legCacheWrite) * cwRate) / 1_000_000).toFixed(2))
+
+  const legFenNum = Number(legacy746.totalChargedFen)
+  const v4FenNum = Number(v4.totalChargedFen)
+  const actualDeltaFen = v4FenNum - legFenNum
+  const roundingDeltaFen = Number(
+    (actualDeltaFen - (inputDeltaFen + outputDeltaFen + cacheReadDeltaFen + cacheWriteDeltaFen)).toFixed(2),
+  )
+
+  const cacheNeutralLegacyFen = Math.ceil(
+    ((legIn + legCacheRead + legCacheWrite) * inRate + legOut * outRate) / 1_000_000,
+  )
+  const cacheNeutralV4Fen = Math.ceil(
+    ((v4In + v4CacheRead + v4CacheWrite) * inRate + v4Out * outRate) / 1_000_000,
+  )
+  const cacheNeutralRelativeDeltaPct =
+    cacheNeutralLegacyFen > 0
+      ? Number((((cacheNeutralV4Fen - cacheNeutralLegacyFen) / cacheNeutralLegacyFen) * 100).toFixed(2))
+      : 0
+  const manualReviewRequired =
+    Math.abs(cacheNeutralRelativeDeltaPct) > 20 || Math.abs(roundingDeltaFen) > 4
+
   const passed =
+    sameNodeVerified &&
+    sameAccountVerified &&
+    sameModelVerified &&
+    samePromptStructureVerified &&
+    samePricingSnapshotVerified &&
+    turn1ContextParityOk &&
+    !manualReviewRequired &&
     legacy746.turn1.sentinelVerified &&
     v4.turn1.sentinelVerified &&
     legacy746.turn2Resume.recalledSecretNonce &&
@@ -1645,7 +1953,19 @@ function buildSideBySideReport(
     Boolean(legacy746.stopProof) &&
     Boolean(v4.stopProof)
 
-  assert.equal(passed, true, `Same-node Legacy 746 vs v4 parity failed for ${engine}`)
+  assert.equal(
+    passed,
+    true,
+    `Same-node Legacy 746 vs v4 parity failed for ${engine}: sameNode=${sameNodeVerified} sameAccount=${sameAccountVerified} sameModel=${sameModelVerified} samePrompt=${samePromptStructureVerified} (legPromptSha=${legacy746.observedTarget.dispatchedInstructionsSha256}, v4PromptSha=${v4.observedTarget.dispatchedInstructionsSha256}, legCatSha=${legacy746.observedTarget.dispatchedToolCatalogSha256}, v4CatSha=${v4.observedTarget.dispatchedToolCatalogSha256}) turn1Ctx=${legacyTurn1ContextTokens}vs${v4Turn1ContextTokens} cacheNeutralDeltaPct=${cacheNeutralRelativeDeltaPct}% roundingDeltaFen=${roundingDeltaFen}`,
+  )
+
+  const costRatioV4ToLegacy = legFenNum > 0 ? Number((v4FenNum / legFenNum).toFixed(4)) : 1
+  const relativeCostDeltaPct =
+    legFenNum > 0 ? Number((((v4FenNum - legFenNum) / legFenNum) * 100).toFixed(2)) : 0
+  const cacheBreakdownSummary =
+    `Turn 1 total context tokens match closely (legacy=${legacyTurn1ContextTokens} [in=${legacy746.turn1.usageRecord.inputTokens}, cacheRead=${legacy746.turn1.usageRecord.cacheReadTokens}, cacheWrite=${legacy746.turn1.usageRecord.cacheWriteTokens}, out=${legacy746.turn1.usageRecord.outputTokens}] vs v4=${v4Turn1ContextTokens} [in=${v4.turn1.usageRecord.inputTokens}, cacheRead=${v4.turn1.usageRecord.cacheReadTokens}, cacheWrite=${v4.turn1.usageRecord.cacheWriteTokens}, out=${v4.turn1.usageRecord.outputTokens}]); Turn 2 out=(legacy=${legacy746.turn2Resume.usageRecord.outputTokens} vs v4=${v4.turn2Resume.usageRecord.outputTokens}).`
+  const varianceDecomposition =
+    ` Exact token*rate decomposition at configured test pricing (in=${inRate}, out=${outRate}, cacheRead=${crRate}, cacheWrite=${cwRate} fen/Mtok): total delta ${actualDeltaFen} fen (${relativeCostDeltaPct}%) = input ${inputDeltaFen} + output ${outputDeltaFen} + cacheRead ${cacheReadDeltaFen} + cacheWrite ${cacheWriteDeltaFen} + ceil-rounding ${roundingDeltaFen} fen; cache-neutral fen delta is ${cacheNeutralRelativeDeltaPct}% (${cacheNeutralV4Fen} vs ${cacheNeutralLegacyFen}, manualReviewRequired=${manualReviewRequired}).`
 
   return {
     engine,
@@ -1657,15 +1977,27 @@ function buildSideBySideReport(
       profileName: cfg.profileName ?? 'default',
       canonicalModel,
       upstreamModel,
-      sameNodeVerified: true,
-      sameAccountVerified: true,
-      sameModelVerified: true,
-      samePromptStructureVerified: true,
-      samePricingSnapshotVerified: true,
+      sameNodeVerified,
+      sameAccountVerified,
+      sameModelVerified,
+      samePromptStructureVerified,
+      samePricingSnapshotVerified,
     },
     legacy746,
     v4,
     sideBySideComparison: {
+      wirePromptParity: {
+        legacyInstructionsSha256: legacy746.observedTarget.dispatchedInstructionsSha256,
+        v4InstructionsSha256: v4.observedTarget.dispatchedInstructionsSha256,
+        instructionsSha256Matched,
+        legacyInstructionsBytes: legacy746.observedTarget.dispatchedInstructionsBytes,
+        v4InstructionsBytes: v4.observedTarget.dispatchedInstructionsBytes,
+        legacyToolCatalogSha256: legacy746.observedTarget.dispatchedToolCatalogSha256,
+        v4ToolCatalogSha256: v4.observedTarget.dispatchedToolCatalogSha256,
+        toolCatalogSha256Matched,
+        turn1UserPromptSha256Matched,
+        turn2UserPromptSha256Matched,
+      },
       ttft: {
         includesLiveNetworkAndModelVariance: true,
         legacyTurn1Ms: legacy746.turn1.ttftMs,
@@ -1718,15 +2050,34 @@ function buildSideBySideReport(
         },
         legacyTotalChargedFen: legacy746.totalChargedFen,
         v4TotalChargedFen: v4.totalChargedFen,
+        costRatioV4ToLegacy,
+        relativeCostDeltaPct,
+        turn1TotalContextTokens: {
+          legacy: legacyTurn1ContextTokens,
+          v4: v4Turn1ContextTokens,
+        },
+        tokenRateDeltaDecompositionFen: {
+          inputDeltaFen,
+          outputDeltaFen,
+          cacheReadDeltaFen,
+          cacheWriteDeltaFen,
+          roundingDeltaFen,
+          cacheNeutralLegacyFen,
+          cacheNeutralV4Fen,
+          cacheNeutralRelativeDeltaPct,
+          manualReviewRequired,
+        },
         bothMatchExactComputeCostFormula:
           legacy746.turn1.usageRecord.costMatchesUsageFormula &&
           legacy746.turn2Resume.usageRecord.costMatchesUsageFormula &&
           v4.turn1.usageRecord.costMatchesUsageFormula &&
           v4.turn2Resume.usageRecord.costMatchesUsageFormula,
         explanation:
-          engine === 'cc'
-            ? 'Both Legacy 746 (receipt v2 per_turn_delta) and v4 (receipt v4 per_turn_delta) settle via settleUsageAndLedger into usage_records matching computeCost(usage, pricing) to the exact fen; minor token deltas reflect live LLM output/thinking variance and system prompt wrapper length.'
-            : 'Both Legacy 746 (receipt v3 cumulative_minus_baseline) and v4 (receipt v4 cumulative_minus_baseline, reasoningOutputTokens folded into outputTokens once) settle via settleUsageAndLedger into usage_records matching computeCost(usage, pricing) to the exact fen; minor token deltas reflect live LLM reasoning/cache variance.',
+          (engine === 'cc'
+            ? 'Both Legacy 746 (receipt v2 per_turn_delta) and v4 (receipt v4 per_turn_delta) dispatch byte-identical wire instructions + tool catalog and settle via settleUsageAndLedger into usage_records matching computeCost(usage, pricing) to the exact fen. '
+            : 'Both Legacy 746 (receipt v3 cumulative_minus_baseline) and v4 (receipt v4 cumulative_minus_baseline, reasoningOutputTokens folded into outputTokens once) dispatch byte-identical wire instructions + tool catalog and settle via settleUsageAndLedger into usage_records matching computeCost(usage, pricing) to the exact fen. ') +
+          cacheBreakdownSummary +
+          varianceDecomposition,
       },
     },
   }
@@ -1757,6 +2108,7 @@ export async function runSameNodeLegacyVsV4Parity(input: {
     }
     const opusCcCfgPath = join(tempDir, 'cc-opus-nodecfg.json')
     writeFileSync(opusCcCfgPath, JSON.stringify(opusCcCfg, null, 2), 'utf8')
+    const ccSharedParityCwd = join(tempDir, 'shared-parity-cwd-cc')
 
     const ccNonce = `OC749CC${randomUUID().replaceAll('-', '').slice(0, 10).toUpperCase()}`
     const hCc = await createConformanceHarness('cc', {
@@ -1765,7 +2117,7 @@ export async function runSameNodeLegacyVsV4Parity(input: {
     })
     let ccReport: EngineSameNodeParityReport
     try {
-      const ccV4 = await runV4TwoTurnParityLane(hCc, ccNonce)
+      const ccV4 = await runV4TwoTurnParityLane(hCc, ccNonce, ccSharedParityCwd)
       await hCc.pool.query('UPDATE remote_model_offers SET enabled = FALSE WHERE profile_id = $1', [
         hCc.profileId,
       ])
@@ -1774,6 +2126,7 @@ export async function runSameNodeLegacyVsV4Parity(input: {
         preCheckRedis,
         liveCfg: opusCcCfg,
         nonce: ccNonce,
+        sharedParityCwd: ccSharedParityCwd,
       })
       ccReport = buildSideBySideReport(
         'cc',
@@ -1789,6 +2142,7 @@ export async function runSameNodeLegacyVsV4Parity(input: {
 
     // 2. Codex on 136.86.253.46 (account `default`, intersection model `gpt-6-luna-remote` -> `gpt-6-luna`)
     const codexCfg = JSON.parse(readFileSync(input.codexNodeConfigPath, 'utf8')) as LiveNodeConfig
+    const codexSharedParityCwd = join(tempDir, 'shared-parity-cwd-codex')
     const codexNonce = `OC749CDX${randomUUID().replaceAll('-', '').slice(0, 10).toUpperCase()}`
     const hCodex = await createConformanceHarness('codex', {
       mode: 'live-node',
@@ -1796,7 +2150,12 @@ export async function runSameNodeLegacyVsV4Parity(input: {
     })
     let codexReport: EngineSameNodeParityReport
     try {
-      const codexV4 = await runV4TwoTurnParityLane(hCodex, codexNonce)
+      const codexV4 = await runV4TwoTurnParityLane(
+        hCodex,
+        codexNonce,
+        codexSharedParityCwd,
+        'medium',
+      )
       await hCodex.pool.query(
         'UPDATE remote_model_offers SET enabled = FALSE WHERE profile_id = $1',
         [hCodex.profileId],
@@ -1806,6 +2165,7 @@ export async function runSameNodeLegacyVsV4Parity(input: {
         preCheckRedis,
         liveCfg: codexCfg,
         nonce: codexNonce,
+        sharedParityCwd: codexSharedParityCwd,
       })
       codexReport = buildSideBySideReport(
         'codex',

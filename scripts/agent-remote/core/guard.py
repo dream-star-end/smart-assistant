@@ -11,7 +11,8 @@ Config (`guard.json`, root-owned, mode 0644/0600, non-writable by group/other):
   "controllers": [{"path": "/opt/openclaude/remote-driver/<sha>/core/controller.py", "sha256": "<hex>"}]
 }
 
-New `provision`/`preflight`/`launch`/`tool-socket`/`probe` invocations must use `controllers[0]`.
+New `provision`/`preflight`/`launch`/`tool-socket`/`probe`/`recycle-app`/`reprovision-app`
+invocations must use `controllers[0]`.
 `stop`/`fence-stop`/`prove-stopped` may also invoke older pinned entries in `controllers[1:]` so
 in-flight generations can drain and stop safely across R1/R2 rollouts and rollbacks.
 """
@@ -29,7 +30,18 @@ import sys
 from typing import Any, Dict, List
 
 ROLES = frozenset(
-    {"provision", "preflight", "launch", "tool-socket", "stop", "fence-stop", "prove-stopped", "probe"}
+    {
+        "provision",
+        "preflight",
+        "launch",
+        "tool-socket",
+        "stop",
+        "fence-stop",
+        "prove-stopped",
+        "probe",
+        "recycle-app",
+        "reprovision-app",
+    }
 )
 DRAIN_ROLES = frozenset({"stop", "fence-stop", "prove-stopped"})
 

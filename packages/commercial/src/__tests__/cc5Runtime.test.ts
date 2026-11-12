@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import type { RemoteFinanceFactory } from '@openclaude/gateway/remote-finance'
 import type { RemoteLaneRuntimePort, createRemoteLaneRuntime } from '@openclaude/gateway/cc5-container-runtime'
@@ -177,7 +178,9 @@ test('createMasterCc5Runtime exposes AF_UNIX cutover drain socket driven by scri
       await new Promise((r) => setTimeout(r, 10))
     }
 
-    const drainScript = resolve('scripts/agent-remote/drain-remote-v4.sh')
+    const drainScript = fileURLToPath(
+      new URL('../../../../scripts/agent-remote/drain-remote-v4.sh', import.meta.url),
+    )
     // 1. Short timeout fails closed while relay is non-idle without killing active relay!
     await assert.rejects(
       execFileAsync(drainScript, [
@@ -235,6 +238,126 @@ test('createMasterCc5Runtime exposes AF_UNIX cutover drain socket driven by scri
       pool: () => fakePool,
       socketPath: sockPath,
     }).close()
+    rmSync(sockDir, { recursive: true, force: true })
+  }
+})
+
+test('startRemoteReleaseDrainSocketServer degrades gracefully on AF_UNIX listen error without crashing process', async () => {
+  const drainGate = new RemoteReleaseDrainCoordinator()
+  const badPath = '/dev/null/impossible-drain.sock'
+  const handle = startRemoteReleaseDrainSocketServer(drainGate, {
+    pool: () => ({ query: async () => ({ rows: [{ cnt: '0' }] }) }) as any,
+    socketPath: badPath,
+  })
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(handle.server.listening, false)
+  await handle.close()
+})
+
+test('remote_v4_cutover_drain and cleanup_cutover_unit_snap cover rc=0/1/75, PG fallback, ALLOW_INFLIGHT, and pre-mutation reopen', async () => {
+  const scriptsDir = fileURLToPath(new URL('../../../../scripts', import.meta.url))
+  const releaseLib = fileURLToPath(
+    new URL('../../../../scripts/v5-selfhost-master-release-lib.sh', import.meta.url),
+  )
+  const sockDir = mkdtempSync('/tmp/oc-v4drain-sh-')
+  const sockPath = join(sockDir, 'drain.sock')
+  const absentSock = join(sockDir, 'absent.sock')
+  const drainGate = new RemoteReleaseDrainCoordinator()
+  let relayIdle = false
+  drainGate.registerRelay('op-cutover-sh', {
+    get idle() {
+      return relayIdle
+    },
+  })
+  const fakePool = { query: async () => ({ rows: [{ cnt: '0' }] }) } as any
+  const sockHandle = startRemoteReleaseDrainSocketServer(drainGate, {
+    pool: () => fakePool,
+    socketPath: sockPath,
+  })
+  const listenDeadline = Date.now() + 2_000
+  while (!sockHandle.server.listening && Date.now() < listenDeadline) {
+    await new Promise((r) => setTimeout(r, 10))
+  }
+
+  const runShell = async (body: string, extraEnv: Record<string, string> = {}) => {
+    const wrapped = `
+set -euo pipefail
+SCRIPT_DIR=${JSON.stringify(scriptsDir)}
+PG_DB="test_db"
+cutover_clog() { :; }
+psql_as_postgres() { echo "\${FAKE_PG_V4_ACTIVE:-0}"; }
+source ${JSON.stringify(releaseLib)}
+${body}
+`
+    return execFileAsync('bash', ['-c', wrapped], {
+      env: { ...process.env, ...extraEnv },
+    })
+  }
+
+  try {
+    // 1. ALLOW_INFLIGHT=1 skips drain without touching socket
+    await runShell('remote_v4_cutover_drain', {
+      OC_REMOTE_V4_DRAIN_SOCKET: sockPath,
+      ALLOW_INFLIGHT: '1',
+    })
+    assert.equal(drainGate.isDraining, false)
+
+    // 2. Absent socket (rc=75) + active_v4_bindings=0 -> proceeds (exit 0)
+    await runShell('remote_v4_cutover_drain', {
+      OC_REMOTE_V4_DRAIN_SOCKET: absentSock,
+      FAKE_PG_V4_ACTIVE: '0',
+    })
+
+    // 3. Absent socket (rc=75) + active_v4_bindings=2 -> aborts cutover (exit 1)
+    await assert.rejects(
+      runShell('remote_v4_cutover_drain', {
+        OC_REMOTE_V4_DRAIN_SOCKET: absentSock,
+        FAKE_PG_V4_ACTIVE: '2',
+      }),
+    )
+
+    // 4. Live socket timeout while relay busy (rc=1) -> aborts cutover and leaves gate open
+    await assert.rejects(
+      runShell('remote_v4_cutover_drain', {
+        OC_REMOTE_V4_DRAIN_SOCKET: sockPath,
+        OC_REMOTE_V4_DRAIN_TIMEOUT_MS: '80',
+      }),
+    )
+    assert.equal(drainGate.isDraining, false)
+
+    // 5. Live socket idle (rc=0) + pre-mutation abort (`CUTOVER_MUTATED=0`) -> `cleanup_cutover_unit_snap` reopens gate!
+    relayIdle = true
+    await runShell(
+      `
+remote_v4_cutover_drain
+[[ "$REMOTE_V4_CUTOVER_DRAINED" == "1" ]]
+CUTOVER_MUTATED=0
+cleanup_cutover_unit_snap
+[[ "$REMOTE_V4_CUTOVER_DRAINED" == "0" ]]
+`,
+      {
+        OC_REMOTE_V4_DRAIN_SOCKET: sockPath,
+        OC_REMOTE_V4_DRAIN_TIMEOUT_MS: '3000',
+      },
+    )
+    assert.equal(drainGate.isDraining, false)
+
+    // 6. Live socket idle (rc=0) + post-mutation (`CUTOVER_MUTATED=1`) -> `cleanup_cutover_unit_snap` keeps gate closed for restart!
+    await runShell(
+      `
+remote_v4_cutover_drain
+CUTOVER_MUTATED=1
+cleanup_cutover_unit_snap
+`,
+      {
+        OC_REMOTE_V4_DRAIN_SOCKET: sockPath,
+        OC_REMOTE_V4_DRAIN_TIMEOUT_MS: '3000',
+      },
+    )
+    assert.equal(drainGate.isDraining, true)
+    drainGate.reopen()
+  } finally {
+    await sockHandle.close()
     rmSync(sockDir, { recursive: true, force: true })
   }
 })

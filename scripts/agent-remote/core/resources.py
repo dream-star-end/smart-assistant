@@ -530,6 +530,7 @@ def stop_unit(unit: str) -> None:
     systemctl("stop", unit)
     st = state(unit)
     need(st.get("ActiveState") in ("inactive", "failed") and not st.get("ControlGroup"), "REMOTE_SCOPE_STOP_UNKNOWN")
+    systemctl("reset-failed", unit)
 
 
 def register_fake_scope(unit: str, slice_name: str, memory_max: int, pid: int, cgroup_dir: Path) -> None:

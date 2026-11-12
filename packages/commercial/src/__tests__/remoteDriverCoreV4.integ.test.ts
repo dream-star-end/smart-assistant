@@ -11,8 +11,9 @@ import { execFile } from 'node:child_process'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { after, before, test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { Pool } from 'pg'
 import {
@@ -1814,7 +1815,8 @@ test('W2/C2 production entry: createMasterCc5Runtime + selectMasterCc5Backend ro
     assert.equal(codexBackend.authorityEngine, 'codex')
     await recordRemoteDriverLaneState(codexBackend.operationId, codexBackend.generation, 'released', pool)
 
-    // 2. Unready `driver_id` profile fails closed (`REMOTE_DRIVER_REVERIFY_REQUIRED`), never falls back!
+    // 2. Commissioned (`verified_fingerprint IS NOT NULL`) unready `driver_id` profile fails closed
+    //    (`REMOTE_DRIVER_REVERIFY_REQUIRED`), never auto-downgrading to legacy (`Design §7`)!
     await pool.query('UPDATE remote_agent_profiles SET execution_ready = FALSE WHERE id = $1', [
       ccProfileId,
     ])
@@ -1838,8 +1840,105 @@ test('W2/C2 production entry: createMasterCc5Runtime + selectMasterCc5Backend ro
       ccProfileId,
     ])
 
+    // 2b. Uncommissioned v4 staging profile (`execution_ready = FALSE AND verified_fingerprint IS NULL`)
+    //     does NOT hijack traffic while a healthy legacy (`driver_id IS NULL`) offer exists (`W3-R3`),
+    //     whereas once commissioned (`verified_fingerprint IS NOT NULL`) it fails closed on drift!
+    const stagingCanonical = `claude-staging-w3-${randomUUID().slice(0, 8)}-remote`
+    const legacyProfId = (
+      await pool.query(
+        `INSERT INTO remote_agent_profiles
+           (node_id, engine, profile_name, account_fingerprint, runner_mode, auth_epoch)
+         VALUES ($1, 'cc', 'cc-legacy-w3', 'cc-leg-fp', 'interactive', 'epoch-leg-1')
+         RETURNING id::text`,
+        [nodeId],
+      )
+    ).rows[0].id
+    const stagingV4ProfId = (
+      await pool.query(
+        `INSERT INTO remote_agent_profiles
+           (node_id, engine, profile_name, account_fingerprint, runner_mode, auth_epoch,
+            driver_id, execution_ready, verified_fingerprint)
+         VALUES ($1, 'cc', 'cc-stage-v4-w3', 'cc-stg-fp', 'interactive', 'epoch-stg-1',
+                 'cc', FALSE, NULL)
+         RETURNING id::text`,
+        [nodeId],
+      )
+    ).rows[0].id
+    await pool.query(
+      `INSERT INTO remote_model_offers (profile_id, upstream_model_id, canonical_model_id, base_display_name)
+       VALUES ($1, $3, $4, 'Staging Legacy'), ($2, $3, $4, 'Staging V4')`,
+      [legacyProfId, stagingV4ProfId, CC_UPSTREAM, stagingCanonical],
+    )
+    const rtMixed = {
+      ensureLane: async (req: any) => {
+        const placed = await capturedPlace!({ ...req, dockerId: 'a'.repeat(64) })
+        if (placed.v4) {
+          return remotePoolBackendOf(placed.v4.binding)
+        }
+        return {
+          kind: 'cc5-interactive-v1' as const,
+          sessionKey: req.sessionKey,
+          operationId: placed.operationId,
+        }
+      },
+      close: async () => {},
+    } as any
+    const stageLegBackend = await selectMasterCc5Backend(
+      rtMixed,
+      {
+        uid: Number(uid),
+        containerId: 7,
+        sessionKey: `agent:main:webchat:dm:w3_stage_leg_${randomUUID().slice(0, 8)}`,
+        canonicalModel: stagingCanonical,
+        engine: 'ccb',
+        placement: 'remote_pool',
+      },
+      true,
+      policyEnv,
+    )
+    assert.equal(
+      stageLegBackend?.kind,
+      'cc5-interactive-v1',
+      'uncommissioned v4 staging profile must fall through to healthy legacy offer',
+    )
+    await pool.query(`UPDATE remote_agent_bindings SET state = 'released' WHERE operation_id = $1`, [
+      stageLegBackend!.operationId,
+    ])
+    // Once commissioned (`verified_fingerprint IS NOT NULL`), drift fails closed instead of falling back!
+    await pool.query(
+      'UPDATE remote_agent_profiles SET verified_fingerprint = $2 WHERE id = $1',
+      [stagingV4ProfId, 'f'.repeat(64)],
+    )
+    await assert.rejects(
+      selectMasterCc5Backend(
+        rtMixed,
+        {
+          uid: Number(uid),
+          containerId: 7,
+          sessionKey: `agent:main:webchat:dm:w3_comm_drift_${randomUUID().slice(0, 8)}`,
+          canonicalModel: stagingCanonical,
+          engine: 'ccb',
+          placement: 'remote_pool',
+        },
+        true,
+        policyEnv,
+      ),
+      /REMOTE_DRIVER_REVERIFY_REQUIRED/,
+    )
+    await pool.query('DELETE FROM remote_model_offers WHERE canonical_model_id = $1', [
+      stagingCanonical,
+    ])
+    await pool.query('DELETE FROM remote_agent_bindings WHERE profile_id = ANY($1::uuid[])', [
+      [legacyProfId, stagingV4ProfId],
+    ])
+    await pool.query('DELETE FROM remote_agent_profiles WHERE id = ANY($1::uuid[])', [
+      [legacyProfId, stagingV4ProfId],
+    ])
+
     // 3. Real `drain-remote-v4.sh --drain` blocks `selectMasterCc5Backend` with `REMOTE_POOL_DRAINING_RETRY_LATER`!
-    const drainScript = resolve('scripts/agent-remote/drain-remote-v4.sh')
+    const drainScript = fileURLToPath(
+      new URL('../../../../scripts/agent-remote/drain-remote-v4.sh', import.meta.url),
+    )
     const { stdout } = await execFileAsync(drainScript, [
       '--drain',
       '--socket',

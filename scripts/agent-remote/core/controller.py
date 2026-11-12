@@ -601,13 +601,7 @@ def fence_unprovisioned(root: Path, expected: Dict[str, Any]) -> Dict[str, Any]:
         os.close(ctrl)
 
 
-def stop_scopes(root: Path, m: Dict[str, Any]) -> None:
-    ctrl = lock_wait(root / "CONTROL.lock")
-    try:
-        fence_stopping(root, m)
-    finally:
-        os.close(ctrl)
-
+def _stop_tmux_checks(root: Path) -> None:
     if (root / "LAUNCH.json").exists():
         spec = strict_json(read_private(root / "LAUNCH.json"))
         sc = spec.get("stopChecks")
@@ -619,62 +613,78 @@ def stop_scopes(root: Path, m: Dict[str, Any]) -> None:
                 timeout=5,
             )
 
+
+def _stop_role_scope(root: Path, role: str) -> None:
+    start_file = root / f"{role.upper()}-STARTING.json"
+    if start_file.exists():
+        data = strict_json(read_private(start_file))
+        need(data["bootId"] == boot_id(), "REMOTE_STOP_UNKNOWN")
+        scope_file = root / f"{role.upper()}-SCOPE.json"
+        if scope_file.exists():
+            sdata = strict_json(read_private(scope_file))
+            pgid = sdata.get("pgid")
+            if isinstance(pgid, int) and pgid > 1:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        resources.stop_unit(data["unit"])
+
+
+def stop_app_scope_only(root: Path) -> None:
+    _stop_tmux_checks(root)
+    _stop_role_scope(root, "app")
+
+
+def stop_scopes(root: Path, m: Dict[str, Any]) -> None:
+    ctrl = lock_wait(root / "CONTROL.lock")
+    try:
+        fence_stopping(root, m)
+    finally:
+        os.close(ctrl)
+
+    _stop_tmux_checks(root)
     for role in ("app", "socket"):
-        start_file = root / f"{role.upper()}-STARTING.json"
-        if start_file.exists():
-            data = strict_json(read_private(start_file))
-            need(data["bootId"] == boot_id(), "REMOTE_STOP_UNKNOWN")
-            scope_file = root / f"{role.upper()}-SCOPE.json"
-            if scope_file.exists():
-                sdata = strict_json(read_private(scope_file))
-                pgid = sdata.get("pgid")
-                if isinstance(pgid, int) and pgid > 1:
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-            resources.stop_unit(data["unit"])
+        _stop_role_scope(root, role)
 
 
-def prove_stopped(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
-    details: List[Dict[str, Any]] = []
-    need((root / "STOPPING.json").exists(), "REMOTE_STOP_UNKNOWN")
-
-    for role in ("app", "socket"):
-        wfd = lock_nb(root / f"{role.upper()}-WRITER.lock")
-        os.close(wfd)
-        if not (root / f"{role.upper()}-STARTING.json").exists():
-            continue
-        data = strict_json(read_private(root / f"{role.upper()}-SCOPE.json", 32768))
+def _prove_role_stopped(root: Path, m: Dict[str, Any], role: str) -> Optional[Dict[str, Any]]:
+    wfd = lock_nb(root / f"{role.upper()}-WRITER.lock")
+    os.close(wfd)
+    if not (root / f"{role.upper()}-STARTING.json").exists():
+        return None
+    data = strict_json(read_private(root / f"{role.upper()}-SCOPE.json", 32768))
+    need(
+        data["bootId"] == boot_id() and all(data.get(k) == v for k, v in binding_fields(m).items()),
+        "REMOTE_STOP_UNKNOWN",
+    )
+    pgid = data.get("pgid")
+    if isinstance(pgid, int) and pgid > 1:
+        try:
+            os.killpg(pgid, 0)
+            raise ValueError("REMOTE_STOP_PROCESS_STILL_ALIVE")
+        except ProcessLookupError:
+            pass
+    st_map = resources.state(data["unit"])
+    need(
+        st_map.get("ActiveState") in ("inactive", "failed") and not st_map.get("ControlGroup"),
+        "REMOTE_STOP_UNKNOWN",
+    )
+    cg_path = Path(data["cgroupPath"])
+    if cg_path.exists():
+        st = cg_path.stat()
+        need((st.st_dev, st.st_ino) == (data["dev"], data["inode"]), "REMOTE_STOP_CGROUP_REPLACED")
         need(
-            data["bootId"] == boot_id() and all(data.get(k) == v for k, v in binding_fields(m).items()),
-            "REMOTE_STOP_UNKNOWN",
+            not (cg_path / "cgroup.procs").read_text().strip()
+            and "populated 0" in (cg_path / "cgroup.events").read_text(),
+            "REMOTE_STOP_CGROUP_POPULATED",
         )
-        pgid = data.get("pgid")
-        if isinstance(pgid, int) and pgid > 1:
-            try:
-                os.killpg(pgid, 0)
-                raise ValueError("REMOTE_STOP_PROCESS_STILL_ALIVE")
-            except ProcessLookupError:
-                pass
-        st_map = resources.state(data["unit"])
-        need(
-            st_map.get("ActiveState") in ("inactive", "failed") and not st_map.get("ControlGroup"),
-            "REMOTE_STOP_UNKNOWN",
-        )
-        cg_path = Path(data["cgroupPath"])
-        if cg_path.exists():
-            st = cg_path.stat()
-            need((st.st_dev, st.st_ino) == (data["dev"], data["inode"]), "REMOTE_STOP_CGROUP_REPLACED")
-            need(
-                not (cg_path / "cgroup.procs").read_text().strip()
-                and "populated 0" in (cg_path / "cgroup.events").read_text(),
-                "REMOTE_STOP_CGROUP_POPULATED",
-            )
-        wfd = lock_nb(root / f"{role.upper()}-WRITER.lock")
-        os.close(wfd)
-        details.append({**data, "populated": 0, "domainRemoved": not cg_path.exists()})
+    wfd = lock_nb(root / f"{role.upper()}-WRITER.lock")
+    os.close(wfd)
+    return {**data, "populated": 0, "domainRemoved": not cg_path.exists()}
 
+
+def _prove_tmux_stopped(root: Path) -> None:
     if (root / "LAUNCH.json").exists():
         spec = strict_json(read_private(root / "LAUNCH.json"))
         sc = spec.get("stopChecks")
@@ -687,6 +697,18 @@ def prove_stopped(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
                     timeout=5,
                 )
                 need(r.returncode != 0, "REMOTE_STOP_TMUX_SESSION_ALIVE")
+
+
+def prove_stopped(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
+    details: List[Dict[str, Any]] = []
+    need((root / "STOPPING.json").exists(), "REMOTE_STOP_UNKNOWN")
+
+    for role in ("app", "socket"):
+        proved = _prove_role_stopped(root, m, role)
+        if proved is not None:
+            details.append(proved)
+
+    _prove_tmux_stopped(root)
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(0.5)
@@ -705,6 +727,210 @@ def prove_stopped(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
         "remoteStopped": True,
         "scopes": details,
     }
+
+
+def _clean_tree_rw(target: Path) -> None:
+    if not target.exists() and not target.is_symlink():
+        return
+    need(not target.is_symlink(), "REMOTE_CLEAN_SYMLINK_FORBIDDEN")
+    for cur_root, dirnames, filenames in os.walk(target):
+        cur_p = Path(cur_root)
+        try:
+            cur_p.chmod(0o700)
+        except OSError:
+            pass
+        for d in dirnames:
+            dp = cur_p / d
+            if not dp.is_symlink():
+                try:
+                    dp.chmod(0o700)
+                except OSError:
+                    pass
+        for f in filenames:
+            fp = cur_p / f
+            if not fp.is_symlink():
+                try:
+                    fp.chmod(0o600)
+                except OSError:
+                    pass
+    shutil.rmtree(target)
+
+
+def recycle_app(root: Path, m: Dict[str, Any]) -> Dict[str, Any]:
+    ctrl = lock_wait(root / "CONTROL.lock")
+    try:
+        need(not (root / "STOPPING.json").exists(), "REMOTE_FENCED")
+        if not (root / "APP-STARTING.json").exists() and not (root / "APP-RECYCLING.json").exists():
+            return {
+                "version": PROTOCOL_VERSION,
+                **binding_fields(m),
+                "kind": "app-recycled",
+                "bootId": boot_id(),
+                "appStopped": True,
+                "noHostEffect": True,
+                "scopes": [],
+            }
+        atomic_write(
+            root / "APP-RECYCLING.json",
+            {"version": PROTOCOL_VERSION, "bootId": boot_id(), **binding_fields(m)},
+            mode=0o600,
+        )
+    finally:
+        os.close(ctrl)
+
+    stop_app_scope_only(root)
+    deadline = time.monotonic() + 10.0
+    proved_scope: Optional[Dict[str, Any]] = None
+    while True:
+        try:
+            proved_scope = _prove_role_stopped(root, m, "app")
+            _prove_tmux_stopped(root)
+            wfd_probe = lock_nb(root / "APP-WRITER.lock")
+            os.close(wfd_probe)
+            break
+        except Exception:  # noqa: BLE001
+            if time.monotonic() >= deadline:
+                raise ValueError("REMOTE_APP_RECYCLE_STOP_UNKNOWN") from None
+            time.sleep(0.05)
+
+    ctrl = lock_wait(root / "CONTROL.lock")
+    try:
+        wfd = lock_nb(root / "APP-WRITER.lock")
+        try:
+            need(not (root / "STOPPING.json").exists(), "REMOTE_FENCED")
+            _clean_tree_rw(root / "run")
+            for fname in ("APP-ADMITTED.json", "APP-SCOPE.json", "APP-STARTING.json", "APP-RECYCLING.json"):
+                (root / fname).unlink(missing_ok=True)
+            sync_dir(root)
+        finally:
+            os.close(wfd)
+    finally:
+        os.close(ctrl)
+
+    return {
+        "version": PROTOCOL_VERSION,
+        **binding_fields(m),
+        "kind": "app-recycled",
+        "bootId": boot_id(),
+        "appStopped": True,
+        "scopes": [proved_scope] if proved_scope is not None else [],
+    }
+
+
+def reprovision_app(root: Path, m: Dict[str, Any]) -> None:
+    ctrl = lock_wait(root / "CONTROL.lock")
+    try:
+        wfd = lock_nb(root / "APP-WRITER.lock")
+        try:
+            need(not (root / "STOPPING.json").exists(), "REMOTE_FENCED")
+            need(
+                (root / "PROVISIONED.json").exists()
+                and not (root / "APP-STARTING.json").exists()
+                and not (root / "APP-RECYCLING.json").exists(),
+                "REMOTE_REPROVISION_INVALID_STATE",
+            )
+            line = sys.stdin.buffer.readline(8 * 1024 * 1024 + 1)
+            need(len(line) <= 8 * 1024 * 1024 and line.endswith(b"\n"), "REMOTE_PROVISION_PACKET_OVERFLOW")
+            packet = strict_json(line)
+            need(
+                isinstance(packet, dict)
+                and {"manifest", "tools", "driverContext", "verifiedProbe"} <= set(packet.keys())
+                and set(packet.keys()) <= {"manifest", "tools", "driverContext", "verifiedProbe", "registryPath"},
+                "REMOTE_PROVISION_PACKET_INVALID",
+            )
+            pm = packet["manifest"]
+            need(
+                isinstance(pm, dict)
+                and pm.get("root") == str(root)
+                and binding_fields(pm) == binding_fields(m),
+                "REMOTE_MANIFEST_INVALID",
+            )
+            existing_tools = strict_json(read_private(root / "tools.json"))
+            need(
+                remote_canonical_sha256(packet["tools"]) == remote_canonical_sha256(existing_tools),
+                "REMOTE_CATALOG_DRIFT_ON_LANE",
+            )
+            reg_path = packet.get("registryPath")
+            sandbox = str(root).startswith("/tmp/oc-drvtest-")
+            if reg_path is not None:
+                need(sandbox, "REMOTE_REGISTRY_OVERRIDE_FORBIDDEN")
+            driver_mod, meta, actual_driver_digest = load_driver(
+                m["driverId"],
+                registry_path=reg_path if reg_path is not None else m.get("registryPath"),
+                expected_digest=m["driverDigest"],
+                allow_sandbox_override=sandbox,
+            )
+            need(
+                meta["engineId"] == m["engineId"]
+                and actual_driver_digest == m["driverDigest"]
+                and compute_core_digest() == m["coreDigest"],
+                "REMOTE_DRIVER_OR_CORE_DIGEST_MISMATCH",
+            )
+            raw_dctx = packet["driverContext"] if isinstance(packet["driverContext"], dict) else {}
+            resolved_native_session = raw_dctx.get("nativeSessionId") or m.get("nativeSessionId")
+            driver_ctx = {
+                **raw_dctx,
+                "root": str(root),
+                "mcpClientPath": str((Path(__file__).resolve().parent / "mcp_client.py").resolve()),
+                "operationId": m["operationId"],
+                "runId": m["runId"],
+                "generation": m["generation"],
+                "profileId": m["profileId"],
+                "authEpoch": m["authEpoch"],
+                "model": m["model"],
+                "nativeSessionId": resolved_native_session,
+                "tools": packet["tools"],
+            }
+            spec = validate_launch_spec(driver_mod.launch_spec(driver_ctx, packet["verifiedProbe"]), root)
+            for rel_dir in spec["dirs"]:
+                target_dir = root / rel_dir
+                target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                ensure_private_dir(target_dir)
+            for rel_file, fspec in spec["files"].items():
+                target_file = root / rel_file
+                target_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fbytes = (
+                    base64.b64decode(fspec["contentB64"], validate=True)
+                    if "contentB64" in fspec
+                    else fspec["content"].encode("utf-8", errors="strict")
+                )
+                fmode = int(fspec.get("mode", 0o400))
+                need(fmode in (0o400, 0o500, 0o600), "REMOTE_LAUNCH_FILE_MODE_INVALID")
+                atomic_write(target_file, fbytes, mode=fmode)
+
+            if isinstance(resolved_native_session, str) and resolved_native_session and resolved_native_session != "new":
+                atomic_write(
+                    root / "NATIVE-SESSION.json",
+                    {"nativeSessionId": resolved_native_session},
+                    mode=0o600,
+                )
+                cur_client = strict_json(read_private(root / "client.json"))
+                if cur_client.get("nativeSessionId") != resolved_native_session:
+                    cur_client["nativeSessionId"] = resolved_native_session
+                    atomic_write(root / "client.json", cur_client, mode=0o400)
+
+            atomic_write(root / "LAUNCH.json", spec, mode=0o400)
+            atomic_write(
+                root / "PROVISIONED.json",
+                {
+                    "version": PROTOCOL_VERSION,
+                    **binding_fields(m),
+                    "manifestSha256": sha(read_private(root / "MANIFEST.json")),
+                    "launchSha256": sha(read_private(root / "LAUNCH.json")),
+                },
+                mode=0o400,
+            )
+            print(
+                json.dumps(
+                    {"version": PROTOCOL_VERSION, "kind": "reprovisioned", **binding_fields(m)},
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+        finally:
+            os.close(wfd)
+    finally:
+        os.close(ctrl)
 
 
 def launch_role(root: Path, m: Dict[str, Any]) -> None:
@@ -771,7 +997,7 @@ def launch_role(root: Path, m: Dict[str, Any]) -> None:
         running = True
         try:
             while running:
-                if (root / "STOPPING.json").exists():
+                if (root / "STOPPING.json").exists() or (root / "APP-RECYCLING.json").exists():
                     break
                 for key, _ in sel.select(0.5):
                     chan = key.data
@@ -867,7 +1093,10 @@ def launch_role(root: Path, m: Dict[str, Any]) -> None:
         raise
     finally:
         try:
-            stop_scopes(root, m)
+            if (root / "APP-RECYCLING.json").exists() and not (root / "STOPPING.json").exists():
+                stop_app_scope_only(root)
+            else:
+                stop_scopes(root, m)
             if proc is not None:
                 proc.wait(timeout=10)
         finally:
@@ -1179,6 +1408,15 @@ def main() -> int:
         return worker_entry(root, sys.argv[3])
 
     need(len(sys.argv) == 3, "REMOTE_CONTROLLER_ARGS_INVALID")
+    if role == "recycle-app":
+        result = recycle_app(root, m)
+        print(json.dumps(result, separators=(",", ":")), flush=True)
+        return 0
+
+    if role == "reprovision-app":
+        reprovision_app(root, m)
+        return 0
+
     if role == "launch":
         launch_role(root, m)
         return 0

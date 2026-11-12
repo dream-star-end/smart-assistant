@@ -17,12 +17,14 @@ import {
   sameRemoteExecutionBackend,
   type GoalStateSnapshot,
   type OutboundContentBlock,
+  type PromptPrivacyPolicy,
   type RemoteDriverExecutionBackend,
   type RemoteReceiptV4,
   type RemoteSecurityEvent,
   type TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
 import { buildCodexBillingEvent } from '../engine/codexAdapter.js'
+import type { IntelligentUiApplied } from '../promptSlots.js'
 import type {
   EngineAdapter,
   EngineCapabilities,
@@ -137,6 +139,10 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       laneOptions,
     )
     remotePoolNeed(this.lane.binding.canonicalModel === opts.model, 'REMOTE_MODEL_BINDING_MISMATCH')
+  }
+
+  get fenceReason(): string | undefined {
+    return this.lane.fenceError?.message
   }
 
   async start(): Promise<void> {
@@ -646,17 +652,46 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
   setEffortLevel(level: string | undefined): void {
     this._effortLevel = level
+    this.lane.setEffortLevel(level)
   }
 
   get effortLevel(): string | undefined {
     return this._effortLevel
   }
 
+  get promptPolicyFingerprint(): string | undefined {
+    return this.lane.promptPolicyFingerprint
+  }
+
+  get promptIntelligentUi(): IntelligentUiApplied | undefined {
+    return this.lane.promptIntelligentUi
+  }
+
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void {
+    this.lane.setPromptPrivacy(policy)
+  }
+
+  clearPromptPrivacy(): void {
+    this.lane.clearPromptPrivacy()
+  }
+
+  assertPromptPrivacyStopped(): void {
+    if (!this.lane.isPromptPrivacyStopped()) {
+      throw new Error('助手隐私刷新仍在等待旧进程终结，请稍后重试。')
+    }
+  }
+
+  restartForConfigChange(): Promise<void> {
+    return this.lane.recycleForConfigChange()
+  }
+
   setTraceId(_traceId: string | undefined): void {}
 
   async setGoalState(_goal: GoalStateSnapshot | null): Promise<void> {}
 
-  updateConfig(_config: OpenClaudeConfig): void {}
+  updateConfig(config: OpenClaudeConfig): void {
+    this.lane.updateConfig(config)
+  }
 
   setToolsets(toolsets: string[] | undefined): void {
     this._toolsets = toolsets

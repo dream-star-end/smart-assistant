@@ -73,7 +73,7 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     socket_identity: Optional[Tuple[int, int]] = None
     sequence = 0
-    seen_rpc: Set[Tuple[type, Any]] = set()
+    seen_calls: Set[str] = set()
     attempts = root / "tool-attempts"
     failed = False
 
@@ -148,12 +148,12 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                 need(
                     sequence < 10000
                     and not (root / "STOPPING.json").exists()
-                    and (disable_wal or ((type(ident), ident) not in seen_rpc and not attempt_file.exists())),
+                    and (disable_wal or (call_key not in seen_calls and not attempt_file.exists())),
                     "REMOTE_SOCKET_ATTEMPT_EXISTS",
                 )
                 sequence += 1
                 if not disable_wal:
-                    seen_rpc.add((type(ident), ident))
+                    seen_calls.add(call_key)
                 dispatched = True
                 if not disable_wal:
                     durable_record(attempt_file, remote_canonical_bytes(body))

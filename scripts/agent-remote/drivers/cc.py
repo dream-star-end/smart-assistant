@@ -41,6 +41,9 @@ PLUGIN_REL_FILES = (
     "hooks/register.ts",
     "hooks/frames.ts",
 )
+BENIGN_SYSTEM_SUBTYPES = frozenset(
+    {"informational", "api_retry", "status", "turn_duration", "local_command"}
+)
 
 
 def _mod_digest(files: Dict[str, bytes]) -> str:
@@ -58,10 +61,6 @@ def _deterministic_session_id(operation_id: str) -> str:
 def _check_and_pin_model(state: Dict[str, Any], actual_model: Any) -> None:
     if not isinstance(actual_model, str) or not actual_model or actual_model == "<synthetic>":
         return
-    pinned = state.get("resolvedConcreteModel")
-    if isinstance(pinned, str) and pinned:
-        need(actual_model == pinned, "CC_UPSTREAM_MODEL_MISMATCH")
-        return
     expected = state.get("expectedModel")
     if isinstance(expected, str) and expected:
         if expected in ("opus", "sonnet", "haiku"):
@@ -74,8 +73,16 @@ def _check_and_pin_model(state: Dict[str, Any], actual_model: Any) -> None:
                 actual_model == expected or actual_model.startswith(f"{expected}-"),
                 "CC_UPSTREAM_MODEL_MISMATCH",
             )
-    state["resolvedConcreteModel"] = actual_model
-    state["observedModel"] = actual_model
+    pinned = state.get("resolvedConcreteModel")
+    if isinstance(pinned, str) and pinned:
+        if isinstance(expected, str) and expected:
+            need(actual_model in (pinned, expected), "CC_UPSTREAM_MODEL_MISMATCH")
+        else:
+            need(actual_model == pinned, "CC_UPSTREAM_MODEL_MISMATCH")
+        return
+    if not (isinstance(expected, str) and expected) or actual_model != expected:
+        state["resolvedConcreteModel"] = actual_model
+    state["observedModel"] = state.get("resolvedConcreteModel") or actual_model
 
 
 def _mask_email(email: Optional[str]) -> Optional[str]:
@@ -131,11 +138,21 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
     allowed_arg = ",".join([*allowed_tools_list, *extra_native_tools])
     tools_flag_val = ",".join(extra_native_tools) if extra_native_tools else ""
 
+    home_dir = str(context.get("accountHome") or Path.home())
     existing_session = context.get("nativeSessionId")
     if existing_session and existing_session != "new":
         need(isinstance(existing_session, str) and UUID_RE.fullmatch(existing_session), "CC_SESSION_ID_INVALID")
         session_id = existing_session
-        session_flag = "--resume" if context.get("transcriptExists", False) else "--session-id"
+        transcript_path = (
+            Path(home_dir)
+            / ".claude/projects"
+            / re.sub(r"[^A-Za-z0-9]", "-", str(root / "cwd"))
+            / f"{session_id}.jsonl"
+        )
+        use_resume = transcript_path.exists() or (
+            str(root).startswith("/tmp/oc-drvtest-") and bool(context.get("transcriptExists", False))
+        )
+        session_flag = "--resume" if use_resume else "--session-id"
     else:
         init_uuid = context.get("initialSessionUuid")
         session_id = str(init_uuid) if init_uuid else _deterministic_session_id(str(context["operationId"]))
@@ -187,7 +204,6 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
     ]
     need(not any(a in FORBIDDEN_LAUNCH_FLAGS for a in cli_args), "CC_PRINT_MODE_FORBIDDEN")
 
-    home_dir = str(context.get("accountHome") or Path.home())
     profile_name = str(context.get("profileName") or "default")
     env: Dict[str, str] = {
         "HOME": home_dir,
@@ -457,6 +473,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
     elif ftype == "system" and frame.get("subtype") == "compact_boundary":
         presentation.append({"kind": "compaction"})
 
+    elif ftype == "system" and frame.get("subtype") in BENIGN_SYSTEM_SUBTYPES:
+        pass
+
     elif ftype == "stream_event":
         ev = frame.get("event")
         need(isinstance(ev, dict), "CC_STREAM_EVENT_INVALID")
@@ -477,7 +496,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
 
     elif ftype == "assistant":
         msg = frame.get("message")
-        need(isinstance(msg, dict) and isinstance(msg.get("content"), list), "CC_ASSISTANT_MESSAGE_INVALID")
+        need(isinstance(msg, dict) and isinstance(msg.get("content"), (list, str)), "CC_ASSISTANT_MESSAGE_INVALID")
         msg_model = msg.get("model")
         _check_and_pin_model(state, msg_model)
         if frame.get("parent_tool_use_id") is not None:
@@ -488,7 +507,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
                     "itemType": "parent_tool_use_id",
                 }
             )
-        else:
+        elif isinstance(msg["content"], list):
             for block in msg["content"]:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue

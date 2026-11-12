@@ -908,8 +908,8 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
   // 4a.4 Disconnect AFTER terminal BEFORE PG commit -> recovered via `0000000N-native-terminal.json` spool!
   const failOnce = { active: true }
   const spoolLane = await h.openLane({ failTurnInsertOnce: failOnce, writeOnlyTools: true })
-  const spoolTarget = join(spoolLane.containerCwd, 'g4-spool.txt')
-  const spoolTurn = await spoolLane.submitTurn(h.buildWritePrompt(spoolTarget, 'SPOOL_RECOVER'))
+  const spoolTarget = join(spoolLane.containerCwd, 'g4-verify-note.txt')
+  const spoolTurn = await spoolLane.submitTurn(h.buildWritePrompt(spoolTarget, 'G4_VERIFY_NOTE_OK'))
   const spoolSum = await spoolTurn.run.summary
   assertTurnFailed(spoolSum, 'Crash before PG receipt commit must fail turn cleanly')
   assert.equal(spoolLane.executedCalls.length, 1)
@@ -1154,6 +1154,8 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
         redDetails: {
           environment: 'local-sandbox-fault-injection',
           injectedFault: 'testFaultDisableAttemptWal_and_testFaultAllowDuplicateClaim',
+          defenseLayerNote:
+            'Compound fault disables both defense-in-depth layers: (1) relay in-memory claim set (which blocks same-connection wire duplicates when WAL alone is disabled) and (2) node mcp_socket.py disk WAL (which blocks duplicate execution across relay/socket reconnects or in-memory state loss).',
           attemptWalSkippedOnNode: r4aRedAttemptWalAbsent,
           observedToolHostExecutions: r4aRedExecutions,
           doubleExecutionDetected: r4aRedExecutions > 1,
@@ -1685,16 +1687,68 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
 
   // --- RED CONTROL: Inject real sandbox placement faults (`account_mutex` & `shared_node_cap_5`) into `placeRemoteDriverLane` ---
   let redOverlapCaught = false
+  let posSimultaneousRendezvous = false
+  let mutexBlockedAttempts = 0
+  let bPlacedWhileAActive = false
+  let aReleasedAtPerfMs = 0
+  let bArrivedAtPerfMs = 0
   let redSharedCapCaught = false
   let redSharedCapError = ''
   {
-    // (1) `testFaultSandboxMode: 'account_mutex'` serializes same-account placement (`cap = 1`),
-    //     causing the simultaneous rendezvous barrier (`aArrived && bArrivedDuringHold`) to fail!
+    // (1a) Positive sandbox baseline (no fault): prove A and B achieve simultaneous barrier rendezvous!
+    const posSyncA = createAsyncBarrier()
+    const posSyncB = createAsyncBarrier()
+    let releasePosBoth!: () => void
+    const posSharedRelease = new Promise<void>((r) => {
+      releasePosBoth = r
+    })
+    const [posLaneA, posLaneB] = await Promise.all([
+      h.openFaultInjectionLane({
+        sessionIndex: 599,
+        dedicatedToolHost: true,
+        writeOnlyTools: true,
+        toolExecutionBarrier: {
+          onArrive: () => posSyncA.barrier.onArrive(),
+          waitRelease: posSharedRelease,
+        },
+      }),
+      h.openFaultInjectionLane({
+        sessionIndex: 600,
+        dedicatedToolHost: true,
+        writeOnlyTools: true,
+        toolExecutionBarrier: {
+          onArrive: () => posSyncB.barrier.onArrive(),
+          waitRelease: posSharedRelease,
+        },
+      }),
+    ])
+    const posSentA = join(posLaneA.containerCwd, 'g6-pos-a.txt')
+    const posSentB = join(posLaneB.containerCwd, 'g6-pos-b.txt')
+    const [posTurnA, posTurnB] = await Promise.all([
+      posLaneA.submitTurn(`SENTINEL_WRITE:${posSentA}:POS_A`),
+      posLaneB.submitTurn(`SENTINEL_WRITE:${posSentB}:POS_B`),
+    ])
+    const [posAArrived, posBArrived] = await Promise.all([
+      waitForPromiseWithTimeout(posSyncA.waitArrived, 25_000),
+      waitForPromiseWithTimeout(posSyncB.waitArrived, 25_000),
+    ])
+    posSimultaneousRendezvous = posAArrived && posBArrived
+    releasePosBoth()
+    assert.equal(posSimultaneousRendezvous, true, 'Sandbox baseline must achieve simultaneous barrier rendezvous')
+    const [posSumA, posSumB] = await Promise.all([posTurnA.run.summary, posTurnB.run.summary])
+    assertTurnOk(posSumA, posLaneA, 'Group 6 sandbox baseline A')
+    assertTurnOk(posSumB, posLaneB, 'Group 6 sandbox baseline B')
+    await Promise.all([posLaneA.closeLane(), posLaneB.closeLane()])
+
+    // (1b) `testFaultSandboxMode: 'account_mutex'` serializes same-account placement (`cap = 1`).
+    //      Hold A until B's placement has been actively blocked & retried >= 3 times, verify B
+    //      has NOT placed or arrived while A is active, release A, and assert `bArrivedAtPerfMs > aReleasedAtPerfMs`!
     const mutexSyncA = createAsyncBarrier()
     const mutexSyncB = createAsyncBarrier()
     const redMutexA = await h.openFaultInjectionLane({
       sessionIndex: 601,
       dedicatedToolHost: true,
+      writeOnlyTools: true,
       testFaultSandboxMode: 'account_mutex',
       toolExecutionBarrier: mutexSyncA.barrier,
     })
@@ -1702,32 +1756,59 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
     const redTurnA = await redMutexA.submitTurn(`SENTINEL_WRITE:${redSentA}:MUTEX_A`)
     assert.equal(await waitForPromiseWithTimeout(mutexSyncA.waitArrived, 25_000), true)
 
+    let aStillActive = true
+    let resolveMinBlocks!: () => void
+    const minBlocksReached = new Promise<void>((res) => {
+      resolveMinBlocks = res
+    })
     const redMutexBTask = (async () => {
       const lane = await h.openFaultInjectionLane({
         sessionIndex: 602,
         dedicatedToolHost: true,
+        writeOnlyTools: true,
         testFaultSandboxMode: 'account_mutex',
+        onAccountMutexBlocked: (attempt) => {
+          mutexBlockedAttempts = attempt
+          if (attempt >= 3) resolveMinBlocks()
+        },
         toolExecutionBarrier: mutexSyncB.barrier,
       })
+      if (aStillActive) {
+        bPlacedWhileAActive = true
+      }
       const sentB = join(lane.containerCwd, 'g6-red-mutex-b.txt')
       const turn = await lane.submitTurn(`SENTINEL_WRITE:${sentB}:MUTEX_B`)
       return { lane, turn }
     })()
 
-    const bArrivedWhileAHeld = await waitForPromiseWithTimeout(mutexSyncB.waitArrived, 500)
-    if (!bArrivedWhileAHeld) {
-      redOverlapCaught = true
-    }
-
+    assert.equal(
+      await waitForPromiseWithTimeout(minBlocksReached, 5_000),
+      true,
+      'Session B placement must be blocked >= 3 times while Session A holds account_mutex',
+    )
+    const bArrivedWhileAHeld = await waitForPromiseWithTimeout(mutexSyncB.waitArrived, 100)
     mutexSyncA.release()
     assertTurnOk(await redTurnA.run.summary, redMutexA, 'Group 6 red mutex session A')
+    aReleasedAtPerfMs = performance.now()
+    aStillActive = false
     await redMutexA.closeLane()
 
     const { lane: redMutexB, turn: redTurnB } = await redMutexBTask
     assert.equal(await waitForPromiseWithTimeout(mutexSyncB.waitArrived, 25_000), true)
+    bArrivedAtPerfMs = performance.now()
     mutexSyncB.release()
     assertTurnOk(await redTurnB.run.summary, redMutexB, 'Group 6 red mutex session B')
     await redMutexB.closeLane()
+
+    if (
+      posSimultaneousRendezvous &&
+      mutexBlockedAttempts >= 3 &&
+      !bPlacedWhileAActive &&
+      !bArrivedWhileAHeld &&
+      bArrivedAtPerfMs > aReleasedAtPerfMs
+    ) {
+      redOverlapCaught = true
+    }
 
     // (2) `testFaultSandboxMode: 'shared_node_cap_5'` counts node-wide active bindings (`cap = 5`),
     //     causing cross-engine `placeRemoteDriverLane` for `h.peerDriverId` to fail!
@@ -1822,7 +1903,11 @@ async function runGroup6(h: ConformanceHarness): Promise<GroupResult> {
         redDetails: {
           environment: 'local-sandbox-fault-injection',
           injectedFaults: ['account_mutex', 'shared_node_cap_5'],
+          positiveSandboxSimultaneousRendezvous: posSimultaneousRendezvous,
           accountExclusiveLockCaught: redOverlapCaught,
+          accountMutexBlockedRetries: mutexBlockedAttempts,
+          bPlacedWhileAActive,
+          bArrivedAfterAReleasedDeltaMs: Number((bArrivedAtPerfMs - aReleasedAtPerfMs).toFixed(2)),
           sharedNodeCap5Caught: redSharedCapCaught,
           sharedNodeCap5RejectedWith: redSharedCapError,
         },

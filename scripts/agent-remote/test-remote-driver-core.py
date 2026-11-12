@@ -73,7 +73,7 @@ def make_cc_cli_fixture(dir_path: Path) -> Path:
     return write_executable(
         dir_path / "fake-claude",
         r"""#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys
+import hashlib, json, os, pathlib, re, subprocess, sys
 
 args = sys.argv[1:]
 if "-p" in args:
@@ -110,6 +110,26 @@ def arg_val(flag, default=""):
 
 model = arg_val("--model", "claude-sonnet-4-6")
 session_id = arg_val("--session-id") or arg_val("--resume")
+prompt_path = arg_val("--append-system-prompt-file")
+prompt_text = pathlib.Path(prompt_path).read_text(encoding="utf-8") if prompt_path else ""
+home_dir = pathlib.Path(os.environ.get("HOME", "/tmp"))
+sanitized_cwd = re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
+transcript_file = home_dir / ".claude/projects" / sanitized_cwd / f"{session_id}.jsonl"
+if "--resume" in args:
+    if not transcript_file.exists():
+        sys.stderr.write("CC_FIXTURE_RESUME_TRANSCRIPT_MISSING\n")
+        sys.exit(2)
+elif "--session-id" in args:
+    if transcript_file.exists():
+        sys.stderr.write("CC_FIXTURE_SESSION_ID_ALREADY_EXISTS\n")
+        sys.exit(2)
+    transcript_file.parent.mkdir(parents=True, exist_ok=True)
+    transcript_file.write_text(json.dumps({"sessionId": session_id}) + "\n", encoding="utf-8")
+
+launches_log = pathlib.Path(__file__).resolve().parent / "cc-launches.jsonl"
+with launches_log.open("a", encoding="utf-8") as lf:
+    lf.write(json.dumps({"args": args, "sessionId": session_id, "prompt": prompt_text}) + "\n")
+
 tools_flag = arg_val("--tools", "")
 mcp_cfg_path = arg_val("--mcp-config")
 mcp_cfg = json.loads(pathlib.Path(mcp_cfg_path).read_text())
@@ -134,7 +154,8 @@ for raw in sys.stdin:
     msg = json.loads(raw)
     if msg.get("type") == "user":
         text = msg["message"]["content"][0]["text"]
-        call_id = "toolu_01TestCallCc"
+        call_id = "toolu_" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        res_id = "res-cc-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
         tool_args = {"token": text}
         # 1. Emit native observation on stdout FIRST.
         sys.stdout.write(json.dumps({
@@ -177,7 +198,7 @@ for raw in sys.stdin:
             "subtype": "success",
             "is_error": False,
             "session_id": session_id,
-            "uuid": "res-cc-0001",
+            "uuid": res_id,
             "usage": {
                 "input_tokens": 120,
                 "output_tokens": 45,
@@ -194,7 +215,7 @@ def make_codex_cli_fixture(dir_path: Path) -> Path:
     return write_executable(
         dir_path / "fake-codex",
         r"""#!/usr/bin/env python3
-import json, pathlib, re, subprocess, sys
+import hashlib, json, pathlib, re, subprocess, sys
 
 args = sys.argv[1:]
 mcp_cmd = "/usr/bin/python3"
@@ -254,6 +275,13 @@ for raw in sys.stdin:
     elif method in ("thread/start", "thread/resume"):
         tid = params.get("threadId") or thread_id
         thread_id = tid
+        rpcs_log = pathlib.Path(__file__).resolve().parent / "codex-rpcs.jsonl"
+        with rpcs_log.open("a", encoding="utf-8") as rf:
+            rf.write(json.dumps({
+                "method": method,
+                "threadId": tid,
+                "baseInstructions": params.get("baseInstructions"),
+            }) + "\n")
         sys.stdout.write(json.dumps({
             "id": rid,
             "result": {"thread": {"id": tid}, "model": params.get("model", "gpt-5.4")},
@@ -261,12 +289,13 @@ for raw in sys.stdin:
         sys.stdout.flush()
     elif method == "turn/start":
         turn_seq += 1
-        turn_id = f"turn_codex_{turn_seq}"
         prompt = params["input"][0]["text"]
+        ph = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        turn_id = f"turn_codex_{ph}"
         sys.stdout.write(json.dumps({"id": rid, "result": {"turn": {"id": turn_id}}}, separators=(",", ":")) + "\n")
         sys.stdout.write(json.dumps({"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": turn_id}}}, separators=(",", ":")) + "\n")
 
-        call_id = f"call_codex_{turn_seq}"
+        call_id = f"call_codex_{ph}"
         tool_args = {"token": prompt}
         sys.stdout.write(json.dumps({
             "method": "item/started",
@@ -869,6 +898,21 @@ class RemoteDriverCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "REMOTE_SSH_COMMAND_REJECTED"):
                 guard.verified_argv(old_launch, cfg)
 
+            # Warm app recycle roles (`recycle-app`, `reprovision-app`) allowed on `controllers[0]`, FORBIDDEN on `controllers[1]`!
+            for warm_role in ("recycle-app", "reprovision-app"):
+                cur_cmd = " ".join(
+                    guard.quote(x)
+                    for x in ["/usr/bin/python3", "-I", "-B", str(candidate), warm_role, "/home/box/oc-remotedrv-1234567890abcdef"]
+                )
+                self.assertEqual(guard.verified_argv(cur_cmd, cfg)[4], warm_role)
+
+                old_cmd = " ".join(
+                    guard.quote(x)
+                    for x in ["/usr/bin/python3", "-I", "-B", str(alt), warm_role, "/home/box/oc-remotedrv-1234567890abcdef"]
+                )
+                with self.assertRaisesRegex(ValueError, "REMOTE_SSH_COMMAND_REJECTED"):
+                    guard.verified_argv(old_cmd, cfg)
+
     def _run_full_controller_lifecycle(self, driver_id: str) -> None:
         controller = SCRIPT_DIR / "core" / "controller.py"
         with tempfile.TemporaryDirectory(dir="/tmp", prefix=f"oc-drvtest-{driver_id}-") as sandbox:
@@ -1410,9 +1454,430 @@ class RemoteDriverCoreTests(unittest.TestCase):
                             "artifactHashes": {"cli": "e" * 64},
                         },
                     )
+                # Codex 0.167 turn/start effort notification (`thread/settings/updated`) + command/exec disallowed
+                codex_mod, _, _ = load_driver("codex")
+                cdx_state = {"initialized": True, "sessionId": "thr_01", "expectedModel": "gpt-6-luna"}
+                for benign_method in (
+                    "thread/settings/updated",
+                    "model/safetyBuffering/updated",
+                    "item/autoApprovalReview/started",
+                ):
+                    b_out = codex_mod.decode(
+                        "native",
+                        (json.dumps({"method": benign_method, "params": {"threadId": "thr_01"}}) + "\n").encode(),
+                        dict(cdx_state),
+                    )
+                    self.assertEqual(b_out["securityEvents"], [])
+                dis_out = codex_mod.decode(
+                    "native",
+                    b'{"method":"command/exec/outputDelta","params":{"delta":"ls"}}\n',
+                    dict(cdx_state),
+                )
+                self.assertEqual(dis_out["securityEvents"][0]["kind"], "disallowedItem")
+                with self.assertRaisesRegex(ValueError, "CODEX_UNKNOWN_NOTIFICATION:totally/unknown/v99"):
+                    codex_mod.decode("native", b'{"method":"totally/unknown/v99","params":{}}\n', dict(cdx_state))
+
+                # CC multi-turn model pinning (init alias + concrete snapshot) + fallback/drift rejection + benign system frames
+                cc_sess = "11111111-2222-4333-8444-555555555555"
+                cc_state: Dict[str, Any] = {"expectedModel": "claude-opus-5-5", "sessionId": cc_sess}
+                cc_state = cc_mod.decode(
+                    "native",
+                    (json.dumps({"type": "system", "subtype": "init", "session_id": cc_sess, "model": "claude-opus-5-5", "tools": ["mcp__ocbridge__Write"]}) + "\n").encode(),
+                    cc_state,
+                )["nextNativeState"]
+                self.assertEqual(cc_state.get("observedModel"), "claude-opus-5-5")
+                self.assertIsNone(cc_state.get("resolvedConcreteModel"))
+                cc_state = cc_mod.decode(
+                    "native",
+                    (json.dumps({"type": "stream_event", "session_id": cc_sess, "event": {"type": "message_start", "message": {"model": "claude-opus-5-5-20260701"}}}) + "\n").encode(),
+                    cc_state,
+                )["nextNativeState"]
+                self.assertEqual(cc_state.get("resolvedConcreteModel"), "claude-opus-5-5-20260701")
+                self.assertEqual(cc_state.get("observedModel"), "claude-opus-5-5-20260701")
+                # Turn 2 init repeats alias `claude-opus-5-5`, then `message_start` repeats `claude-opus-5-5-20260701`
+                cc_state = cc_mod.decode(
+                    "native",
+                    (json.dumps({"type": "system", "subtype": "init", "session_id": cc_sess, "model": "claude-opus-5-5", "tools": ["mcp__ocbridge__Write"]}) + "\n").encode(),
+                    cc_state,
+                )["nextNativeState"]
+                self.assertEqual(cc_state.get("resolvedConcreteModel"), "claude-opus-5-5-20260701")
+                self.assertEqual(cc_state.get("observedModel"), "claude-opus-5-5-20260701")
+                cc_state = cc_mod.decode(
+                    "native",
+                    (json.dumps({"type": "assistant", "session_id": cc_sess, "message": {"model": "claude-opus-5-5-20260701", "content": "DONE"}}) + "\n").encode(),
+                    cc_state,
+                )["nextNativeState"]
+                for sys_sub in ("informational", "api_retry", "status", "turn_duration", "local_command"):
+                    sys_dec = cc_mod.decode(
+                        "native",
+                        (json.dumps({"type": "system", "subtype": sys_sub, "session_id": cc_sess}) + "\n").encode(),
+                        dict(cc_state),
+                    )
+                    self.assertEqual(sys_dec["securityEvents"], [])
+                with self.assertRaisesRegex(ValueError, "CC_UPSTREAM_MODEL_MISMATCH"):
+                    cc_mod.decode(
+                        "native",
+                        (json.dumps({"type": "stream_event", "session_id": cc_sess, "event": {"type": "message_start", "message": {"model": "claude-sonnet-4-6"}}}) + "\n").encode(),
+                        dict(cc_state),
+                    )
+                with self.assertRaisesRegex(ValueError, "CC_UPSTREAM_MODEL_MISMATCH"):
+                    cc_mod.decode(
+                        "native",
+                        (json.dumps({"type": "stream_event", "session_id": cc_sess, "event": {"type": "message_start", "message": {"model": "claude-opus-5-5-20990101"}}}) + "\n").encode(),
+                        dict(cc_state),
+                    )
+                with self.assertRaisesRegex(ValueError, "CC_UNKNOWN_NATIVE_FRAME"):
+                    cc_mod.decode(
+                        "native",
+                        (json.dumps({"type": "system", "subtype": "rogue_subtype", "session_id": cc_sess}) + "\n").encode(),
+                        dict(cc_state),
+                    )
             finally:
                 os.environ.clear()
                 os.environ.update(old_env)
+
+    def _run_warm_recycle_lifecycle(self, driver_id: str) -> None:
+        controller = SCRIPT_DIR / "core" / "controller.py"
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix=f"oc-drvtest-rec-{driver_id}-") as sandbox:
+            sdir = Path(sandbox)
+            res_root = sdir / "resources"
+            fake_sys = sdir / "fake-systemd"
+            env = {
+                **os.environ,
+                "OC_REMOTE_RESOURCE_ROOT": str(res_root),
+                "OC_REMOTE_TEST_FAKE_SYSTEMD_DIR": str(fake_sys),
+                "OC_REMOTE_NODE_MEMORY_BUDGET": str(4096 * 1024 * 1024),
+                "OC_REMOTE_TEST_MEM_AVAILABLE_BYTES": str(4096 * 1024 * 1024),
+            }
+
+            if driver_id == "cc":
+                cli_path = make_cc_cli_fixture(sdir)
+                model = "claude-sonnet-4-6"
+                profile_id = "ebc80fa6-0348-49a3-b1c1-8a08017114d6"
+                probe_ctx: Dict[str, Any] = {"cliPath": str(cli_path), "accountHome": str(sdir)}
+                driver_ctx: Dict[str, Any] = {
+                    "cliPath": str(cli_path),
+                    "accountHome": str(sdir),
+                    "bridgeMode": "stdio-fixture",
+                    "initialSessionUuid": "11111111-2222-4333-8444-555555555555",
+                    "systemPrompt": "PROMPT_ALPHA_SECRET",
+                }
+            else:
+                cli_path = make_codex_cli_fixture(sdir)
+                codex_home = sdir / "codex-home"
+                codex_home.mkdir(mode=0o700)
+                (codex_home / "auth.json").write_text('{"token":"redacted"}', encoding="utf-8")
+                model = "gpt-5.4"
+                profile_id = "c240b4a0-4d0b-49e8-b5d4-77252377ad88"
+                probe_ctx = {
+                    "cliPath": str(cli_path),
+                    "nativePath": str(cli_path),
+                    "codexHome": str(codex_home),
+                    "systemCodexRoot": str(sdir / "empty-etc-codex"),
+                }
+                driver_ctx = dict(probe_ctx)
+
+            p_probe = subprocess.run(
+                ["/usr/bin/python3", "-I", "-B", str(controller), "probe", str(sdir / "run-probe-1")],
+                input=(json.dumps({"driverId": driver_id, "profileId": profile_id, "context": probe_ctx}) + "\n").encode("utf-8"),
+                env=env,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertEqual(p_probe.returncode, 0, p_probe.stderr.decode("utf-8"))
+            probe_out = strict_json(p_probe.stdout.splitlines()[0])
+
+            lane_root = sdir / "run-lane-rec-1"
+            manifest = {
+                "version": 4,
+                "root": str(lane_root),
+                "driverId": driver_id,
+                "engineId": driver_id,
+                "operationId": f"op-rec-{driver_id}-01",
+                "runId": f"run-rec-{driver_id}-01",
+                "generation": "1",
+                "profileId": profile_id,
+                "authEpoch": "epoch-01",
+                "model": model,
+                "driverDigest": probe_out["driverDigest"],
+                "coreDigest": probe_out["coreDigest"],
+            }
+            p_prov = subprocess.run(
+                ["/usr/bin/python3", "-I", "-B", str(controller), "provision", str(lane_root)],
+                input=(
+                    json.dumps(
+                        {
+                            "manifest": manifest,
+                            "tools": SAMPLE_TOOLS,
+                            "driverContext": driver_ctx,
+                            "verifiedProbe": probe_out["snapshot"],
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                env=env,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertEqual(p_prov.returncode, 0, p_prov.stderr.decode("utf-8"))
+
+            sock_proc = subprocess.Popen(
+                ["/usr/bin/python3", "-I", "-B", str(controller), "tool-socket", str(lane_root)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            assert sock_proc.stdout is not None and sock_proc.stdin is not None
+            self.assertEqual(strict_json(sock_proc.stdout.readline())["kind"], "socket-ready")
+
+            def tool_host_loop() -> None:
+                for _ in range(2):
+                    line = sock_proc.stdout.readline()
+                    if not line:
+                        return
+                    frame = strict_json(line)
+                    req_body = strict_json(base64.b64decode(frame["body"]))
+                    reply_body = {
+                        **{k: req_body[k] for k in req_body if k != "arguments"},
+                        "ok": True,
+                        "result": {
+                            "content": [{"type": "text", "text": f"CONTAINER_EXEC:{req_body['arguments']['token']}"}],
+                            "isError": False,
+                        },
+                    }
+                    resp = {
+                        "version": 4,
+                        "driverId": driver_id,
+                        "engineId": driver_id,
+                        "kind": "tool-response",
+                        "seq": frame["seq"],
+                        "status": 200,
+                        "body": base64.b64encode(json.dumps(reply_body).encode("utf-8")).decode("ascii"),
+                    }
+                    sock_proc.stdin.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    sock_proc.stdin.flush()
+
+            th = threading.Thread(target=tool_host_loop, daemon=True)
+            th.start()
+
+            drv_mod, _, _ = load_driver(driver_id)
+
+            def run_app_turn(
+                native_sess_arg: str,
+                instructions_arg: str,
+                user_prompt: str,
+            ) -> tuple[subprocess.Popen[bytes], str, List[Dict[str, Any]]]:
+                app_p = subprocess.Popen(
+                    ["/usr/bin/python3", "-I", "-B", str(controller), "launch", str(lane_root)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                assert app_p.stdout is not None and app_p.stdin is not None
+                self.assertEqual(strict_json(app_p.stdout.readline())["kind"], "ready")
+                m_state: Dict[str, Any] = {"expectedModel": model}
+                if native_sess_arg != "new":
+                    m_state["sessionId"] = native_sess_arg
+
+                resolved_session = native_sess_arg
+
+                def send_c(cmd: Dict[str, Any]) -> List[Dict[str, Any]]:
+                    nonlocal m_state, resolved_session
+                    enc = drv_mod.encode(cmd, m_state)
+                    m_state = enc["nextNativeState"]
+                    for rep in enc["immediateControlReplies"]:
+                        if rep.get("nativeSessionId"):
+                            resolved_session = rep["nativeSessionId"]
+                    app_p.stdin.write((json.dumps({"kind": "command", "command": cmd}) + "\n").encode("utf-8"))
+                    app_p.stdin.flush()
+                    return enc["immediateControlReplies"]
+
+                def read_stream(target_cmd: str | None = None, wait_term: bool = False) -> List[Dict[str, Any]]:
+                    nonlocal m_state, resolved_session
+                    evs: List[Dict[str, Any]] = []
+                    dl = time.monotonic() + 10.0
+                    while time.monotonic() < dl:
+                        raw_o = app_p.stdout.readline()
+                        self.assertTrue(raw_o, "Unexpected EOF on launch stdout")
+                        msg = strict_json(raw_o)
+                        if msg["kind"] != "stdout":
+                            continue
+                        raw_nat = base64.b64decode(msg["rawB64"])
+                        dec = validate_decode_batch(
+                            drv_mod.decode("native", raw_nat, m_state),
+                            channel="native",
+                            raw_frame_bytes=raw_nat,
+                            frame_seq=msg["frameSeq"],
+                        )
+                        m_state = dec["nextNativeState"]
+                        evs.extend(dec["securityEvents"])
+                        for rep in dec["controlReplies"]:
+                            if rep.get("nativeSessionId"):
+                                resolved_session = rep["nativeSessionId"]
+                        if target_cmd and any(r["commandId"] == target_cmd and r["ok"] for r in dec["controlReplies"]):
+                            return evs
+                        if wait_term and any(e["kind"] == "turnTerminal" for e in evs):
+                            return evs
+                    self.fail("Timed out waiting on app stream")
+
+                imm_i = send_c({"kind": "initialize", "commandId": f"init-{user_prompt}", "model": model, "instructions": instructions_arg})
+                if not imm_i:
+                    read_stream(target_cmd=f"init-{user_prompt}")
+                imm_r = send_c({
+                    "kind": "resume",
+                    "commandId": f"res-{user_prompt}",
+                    "nativeSessionId": native_sess_arg,
+                    "model": model,
+                    "instructions": instructions_arg,
+                })
+                if not imm_r:
+                    read_stream(target_cmd=f"res-{user_prompt}")
+                if m_state.get("sessionId"):
+                    resolved_session = m_state["sessionId"]
+                send_c({"kind": "newTurn", "commandId": f"turn-{user_prompt}", "prompt": user_prompt, "model": model})
+                turn_evs = read_stream(wait_term=True)
+                return app_p, resolved_session, turn_evs
+
+            # Turn 1 with `PROMPT_ALPHA_SECRET`
+            app1, bound_sess, evs1 = run_app_turn("new", "PROMPT_ALPHA_SECRET", "TURN_ONE")
+            self.assertIn("CONTAINER_EXEC:TURN_ONE", "".join(e["delta"] for e in evs1 if e["kind"] == "textDelta"))
+            # Simulate host.py writing `run/host.pid` to prove `recycle-app` cleans `run/`!
+            (lane_root / "run").mkdir(mode=0o700, exist_ok=True)
+            (lane_root / "run" / "host.pid").write_text("12345\n", encoding="utf-8")
+
+            # Execute `recycle-app` while `app1` and `sock_proc` are still open!
+            p_rec = subprocess.run(
+                ["/usr/bin/python3", "-I", "-B", str(controller), "recycle-app", str(lane_root)],
+                env=env,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(p_rec.returncode, 0, p_rec.stderr.decode("utf-8"))
+            rec_proof = strict_json(p_rec.stdout.splitlines()[0])
+            self.assertEqual(rec_proof["kind"], "app-recycled")
+            self.assertTrue(rec_proof["appStopped"])
+            self.assertEqual(len(rec_proof["scopes"]), 1)
+            self.assertEqual(rec_proof["scopes"][0]["populated"], 0)
+            self.assertFalse((lane_root / "STOPPING.json").exists(), "recycle-app MUST NOT write STOPPING.json")
+            self.assertFalse((lane_root / "run").exists(), "recycle-app MUST clean run/ directory")
+            self.assertIsNone(sock_proc.poll(), "tool-socket MUST stay alive across recycle-app")
+            self.assertEqual(len(list(res_root.glob("*.json"))), 1, "lane resource record MUST stay active")
+
+            app1.stdin.close()
+            app1.wait(timeout=5)
+            app1.stdout.close()
+            if app1.stderr is not None:
+                app1.stderr.close()
+
+            # Red control: `reprovision-app` with drifted tool catalog MUST fail closed (rc=126) without mutating LAUNCH.json!
+            launch_before_bad = (lane_root / "LAUNCH.json").read_bytes()
+            bad_tools = [*SAMPLE_TOOLS, {"name": "extra_drift", "description": "bad", "inputSchema": {"type": "object"}}]
+            p_reprov_bad = subprocess.run(
+                ["/usr/bin/python3", "-I", "-B", str(controller), "reprovision-app", str(lane_root)],
+                input=(
+                    json.dumps(
+                        {
+                            "manifest": manifest,
+                            "tools": bad_tools,
+                            "driverContext": {**driver_ctx, "systemPrompt": "PROMPT_REVOKED_CLEAN", "nativeSessionId": bound_sess},
+                            "verifiedProbe": probe_out["snapshot"],
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                env=env,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(p_reprov_bad.returncode, 126)
+            self.assertIn(b"REMOTE_NODE_REJECTED_OR_STOP_UNKNOWN", p_reprov_bad.stderr)
+            self.assertEqual((lane_root / "LAUNCH.json").read_bytes(), launch_before_bad)
+
+            # Green `reprovision-app` with consent revoked (`PROMPT_REVOKED_CLEAN`, NO `PROMPT_ALPHA_SECRET`)
+            p_reprov = subprocess.run(
+                ["/usr/bin/python3", "-I", "-B", str(controller), "reprovision-app", str(lane_root)],
+                input=(
+                    json.dumps(
+                        {
+                            "manifest": manifest,
+                            "tools": SAMPLE_TOOLS,
+                            "driverContext": {
+                                **driver_ctx,
+                                "systemPrompt": "PROMPT_REVOKED_CLEAN",
+                                "nativeSessionId": bound_sess,
+                                "transcriptExists": True,
+                            },
+                            "verifiedProbe": probe_out["snapshot"],
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                env=env,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(p_reprov.returncode, 0, p_reprov.stderr.decode("utf-8"))
+            self.assertEqual(strict_json(p_reprov.stdout.splitlines()[0])["kind"], "reprovisioned")
+
+            # Launch 2 / Turn 2 on the EXACT SAME `bound_sess` and SAME `sock_proc`!
+            app2, bound_sess_2, evs2 = run_app_turn(bound_sess, "PROMPT_REVOKED_CLEAN", "TURN_TWO")
+            self.assertEqual(bound_sess_2, bound_sess)
+            self.assertIn("CONTAINER_EXEC:TURN_TWO", "".join(e["delta"] for e in evs2 if e["kind"] == "textDelta"))
+            th.join(timeout=5)
+
+            if driver_id == "cc":
+                cc_launches = [
+                    json.loads(line)
+                    for line in (sdir / "cc-launches.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len(cc_launches), 2)
+                self.assertIn("--session-id", cc_launches[0]["args"])
+                self.assertEqual(cc_launches[0]["prompt"], "PROMPT_ALPHA_SECRET")
+                self.assertIn("--resume", cc_launches[1]["args"])
+                self.assertEqual(cc_launches[1]["sessionId"], bound_sess)
+                self.assertEqual(cc_launches[1]["prompt"], "PROMPT_REVOKED_CLEAN")
+                self.assertNotIn("PROMPT_ALPHA_SECRET", cc_launches[1]["prompt"])
+            else:
+                codex_rpcs = [
+                    json.loads(line)
+                    for line in (sdir / "codex-rpcs.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len(codex_rpcs), 2)
+                self.assertEqual(codex_rpcs[0]["method"], "thread/start")
+                self.assertEqual(codex_rpcs[0]["baseInstructions"], "PROMPT_ALPHA_SECRET")
+                self.assertEqual(codex_rpcs[1]["method"], "thread/resume")
+                self.assertEqual(codex_rpcs[1]["threadId"], bound_sess)
+                self.assertEqual(codex_rpcs[1]["baseInstructions"], "PROMPT_REVOKED_CLEAN")
+                self.assertNotIn("PROMPT_ALPHA_SECRET", codex_rpcs[1]["baseInstructions"])
+
+            app2.stdin.close()
+            app2.wait(timeout=10)
+            app2.stdout.close()
+            if app2.stderr is not None:
+                app2.stderr.close()
+            sock_proc.stdin.close()
+            sock_proc.wait(timeout=10)
+            sock_proc.stdout.close()
+            if sock_proc.stderr is not None:
+                sock_proc.stderr.close()
+
+            p_stop = subprocess.run(
+                ["/usr/bin/python3", "-I", "-B", str(controller), "stop", str(lane_root)],
+                env=env,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(p_stop.returncode, 0, p_stop.stderr.decode("utf-8"))
+            self.assertTrue(strict_json(p_stop.stdout.splitlines()[0])["remoteStopped"])
+            self.assertEqual(len(list(res_root.glob("*.json"))), 0)
+
+    def test_11_warm_app_recycle_and_reprovision_cc_and_codex(self) -> None:
+        self._run_warm_recycle_lifecycle("cc")
+        self._run_warm_recycle_lifecycle("codex")
 
 
 if __name__ == "__main__":
