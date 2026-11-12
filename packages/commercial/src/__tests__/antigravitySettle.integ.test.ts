@@ -586,7 +586,7 @@ async function lifetimeFixture(kind: 'chat' | 'delegate' | 'legacy' = 'chat') {
       VALUES ($1,'basic',NOW()+INTERVAL '1 day') RETURNING id::text`, [uid.toString()])
     const c = await query<{id: string}>(`INSERT INTO agent_containers
       (user_id,subscription_id,docker_name,workspace_volume,home_volume,image,status,secret_hash)
-      VALUES ($1,$2,$3,'w','h','test','running','test-secret-hash') RETURNING id::text`,
+      VALUES ($1,$2,$3,'w','h','test','running',decode(repeat('00',32),'hex')) RETURNING id::text`,
       [uid.toString(), sub.rows[0]!.id, sessionId])
     containerId = Number(c.rows[0]!.id)
     await query(`INSERT INTO request_finalize_journal(request_id,user_id,container_id,ctx,precheck_credits)
