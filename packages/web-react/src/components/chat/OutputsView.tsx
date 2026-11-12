@@ -9,10 +9,8 @@ import {
   Download,
   ExternalLink,
   FileCode2,
-  FileText,
   Globe,
   ImageIcon,
-  Inbox,
   MonitorPlay,
 } from "lucide-react";
 import { type ReactNode, Suspense, lazy, useState } from "react";
@@ -476,11 +474,9 @@ export function OutputsView({
   const turn = turns[index];
   if (!turn) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-2 px-8 text-center" data-testid="outputs-empty">
-        <Inbox size={22} className="text-faint" aria-hidden />
-        <p className="text-body font-medium text-fg">还没有产出</p>
-        <p className="text-meta text-muted">助手写的文件、生成的图片、查过的网页会按轮汇总在这里。</p>
-      </div>
+      <p className="px-4 py-4 text-meta text-muted" data-testid="outputs-empty">
+        还没有产出，助手写的文件、生成的图片会按轮汇总在这里
+      </p>
     );
   }
   return (
@@ -553,13 +549,11 @@ function TurnOutputsBody({
           ) : null}
         </div>
       ) : empty ? (
-        <div className="mx-4 flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-6 py-10 text-center" data-testid="outputs-none">
-          {running ? <Spinner size={18} className="text-accent" /> : <FileText size={20} className="text-faint" aria-hidden />}
-          <p className="text-body font-medium text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
-          <p className="text-meta text-muted">
-            {running ? "写出的文件、生成的图片和查过的网页会出现在这里。" : "回答在左侧对话里；想看助手做了什么，可以查看步骤。"}
-          </p>
-        </div>
+        // 空态只占一行(UI-2a):右栏不再为「没有产出」铺一大块虚线框。
+        <p className="flex items-center gap-2 px-4 text-meta text-muted" data-testid="outputs-none">
+          {running && <Spinner size={13} className="shrink-0 text-accent" />}
+          {running ? "这一轮还在进行，写出的文件会出现在这里" : "这一轮没有产出文件，回答在对话里"}
+        </p>
       ) : null}
       {!empty && <OtherOutputs outputs={outputs} hero={hero} onPick={setPicked} />}
     </>

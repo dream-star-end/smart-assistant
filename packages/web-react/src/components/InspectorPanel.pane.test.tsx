@@ -6,12 +6,8 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
-import {
-  InspectorPanel,
-  InspectorPanelContent,
-  PANE_TAB_STORAGE_KEY,
-  paneRequestForSession,
-} from "./InspectorPanel";
+import { paneRequestForSession } from "../hooks/useDetailPane";
+import { InspectorPanel, InspectorPanelContent, PANE_TAB_STORAGE_KEY } from "./InspectorPanel";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 
@@ -54,7 +50,8 @@ const STEPS = { tab: "steps" as const, nonce: 1 };
 describe("详情面板分区与步骤", () => {
   test("步骤页按轮分组、最近一轮在上并默认展开;点一步进入详情,计数与上一步 / 下一步 / 返回", () => {
     render(<InspectorPanelContent messages={session()} request={STEPS} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /步骤\s*4/ })).toHaveAttribute("aria-selected", "true");
+    // UI-2a:分区上的数是正在看的这一轮(最新一轮 3 步),与聊天过程条同口径,不再写全会话 4 步。
+    expect(screen.getByRole("tab", { name: /步骤\s*3/ })).toHaveAttribute("aria-selected", "true");
     const turns = screen.getAllByTestId("pane-turn");
     expect(turns).toHaveLength(2);
     expect(within(turns[0]).getByText("第二轮：写代码并运行")).toBeInTheDocument();

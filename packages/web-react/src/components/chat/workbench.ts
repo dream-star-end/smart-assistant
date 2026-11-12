@@ -15,7 +15,7 @@ import { asArr, asStr, normalizeToolForDisplay } from "../tool/format";
 import { parseWebSearchSources } from "../tool/webSearchHits";
 import { resolveToolStatus } from "../tool/status";
 import { type FileChange, collectFileChanges } from "./workPane";
-import type { WorkTurn } from "./workTurns";
+import { type WorkTurn, collectWorkTurns } from "./workTurns";
 
 export { type WorkTurn, collectWorkTurns, turnIndexOf } from "./workTurns";
 
@@ -222,6 +222,12 @@ export function collectTurnOutputs(turn: WorkTurn): TurnOutputs {
 
 export function outputCount(o: TurnOutputs): number {
   return o.files.length + o.media.length + o.links.length;
+}
+
+/** 最新一轮的产出数:顶栏「产出 N」(UI-2a)。由 useDetailPane 按需动态加载,本模块不进首屏。 */
+export function latestTurnOutputCount(messages: readonly ChatMessage[]): number {
+  const turn = collectWorkTurns(messages).at(-1);
+  return turn ? outputCount(collectTurnOutputs(turn)) : 0;
 }
 
 // ── 主产物 ──────────────────────────────────────────────────────────────

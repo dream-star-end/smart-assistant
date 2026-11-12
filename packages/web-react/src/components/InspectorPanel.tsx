@@ -10,8 +10,9 @@
  *     每一次改动;同会话里对同一文件的再次 Write 按与上次写入的 diff 展示。
  *   - 计划:会话里最近一份 TodoWrite / plan(只读;没有计划时不出这个分区)。
  *
- * 布局接入(App.tsx):宽屏(≥1100px)是与 Sidebar | main 并列的内联 <aside>,可拖宽、
+ * 布局接入(hooks/useDetailPane):宽屏(≥1100px)是与 Sidebar | main 并列的内联 <aside>,可拖宽、
  * 宽度与开合记住;更窄的视口不挤三列,复用 Sheet 贴底抽屉呈现同一 InspectorPanelContent。
+ * 默认收起、有产出才在顶栏出「产出 N」(UI-2a),本模块整块懒加载,不进首屏。
  *
  * 数据:消息对象由 ChatSocket 就地 mutate,App 随 version 重渲时面板自然读到最新流式内容。
  * 状态徽标与卡片共用 {@link resolveToolStatus}(T-05):卡片「受阻/未成功」面板就不会是「完成/已结束」。
@@ -29,7 +30,6 @@ import {
   FilePen,
   ListChecks,
   LoaderCircle,
-  Route,
   X,
 } from "lucide-react";
 import {
@@ -64,7 +64,7 @@ import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { parseShellEnvelope } from "./tool/shellEnvelope";
 import { resolveToolStatus } from "./tool/status";
 import { toneTileClass } from "./tool/tone";
-import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs, useToast } from "./ui";
+import { Badge, IconButton, Skeleton, Spinner, Tabs, useToast } from "./ui";
 
 // 产出页(含主产物渲染)只在面板打开且停在产出时才需要:懒加载,不进首屏(first-screen-budget)。
 const OutputsView = lazy(() => import("./chat/OutputsView").then((m) => ({ default: m.OutputsView })));
@@ -165,11 +165,6 @@ export type DeferredPayloadLoader = {
   ) => Promise<ChatMessage[] | null>;
 };
 
-/** 只把属于当前会话的请求交给面板:请求在切会话前发出、面板在切会话后挂载时,旧请求作废。 */
-export function paneRequestForSession(request: PaneRequest | null, sessionId: string | null | undefined): PaneRequest | null {
-  return request && (request.sessionId ?? null) === (sessionId ?? null) ? request : null;
-}
-
 function idOf(message: ToolLike | null | undefined): string | undefined {
   const id = (message as { id?: unknown } | null | undefined)?.id;
   return typeof id === "string" && id ? id : undefined;
@@ -269,33 +264,6 @@ function DeferredNotice({ hydrated }: { hydrated: Hydrated }) {
 }
 
 export const PANE_TAB_STORAGE_KEY = "oc_v5_detail_pane_tab";
-export const PANE_OPEN_STORAGE_KEY = "oc_v5_detail_pane_open";
-
-/** 宽屏内联面板的宽度范围与记忆键(useResizableWidth;把手在面板左缘)。 */
-export const DETAIL_PANE_WIDTH = {
-  storageKey: "oc_v5_detail_pane_width",
-  defaultWidth: 440,
-  min: 320,
-  max: 720,
-  edge: "left",
-} as const;
-
-/** 宽屏面板是否展开(用户偏好,跨会话、跨刷新)。读不到存储 → 收起(与改版前一致)。 */
-export function readDetailPaneOpen(): boolean {
-  try {
-    return localStorage.getItem(PANE_OPEN_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-export function writeDetailPaneOpen(open: boolean): void {
-  try {
-    localStorage.setItem(PANE_OPEN_STORAGE_KEY, open ? "1" : "0");
-  } catch {
-    /* private mode / quota */
-  }
-}
 
 function requestTab(tab: PaneTab | "changes"): PaneTab {
   return tab === "changes" ? "outputs" : tab;
@@ -529,15 +497,7 @@ function StepList({
 }) {
   // 最近一轮默认展开,更早的轮默认收起;用户点过的以用户为准。
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
-  if (total === 0) {
-    return (
-      <EmptyState
-        icon={Route}
-        title="还没有执行步骤"
-        hint="助手运行命令、读写文件、搜索网页时，每一步都会出现在这里。"
-      />
-    );
-  }
+  if (total === 0) return <p className="px-4 py-3 text-meta text-muted">还没有执行步骤</p>;
   const ordered = [...turns].reverse();
   const newestKey = ordered[0]?.key;
   return (
@@ -845,10 +805,12 @@ export function InspectorPanelContent({
   };
 
   const count = (n: number) => (n > 0 ? <span className="ml-1 tabular-nums text-faint">{n}</span> : null);
+  // 分区上的数都是「正在看的这一轮」的(与浏览器页、产出页摘要、聊天过程条「已执行 N 个步骤」同口径);
+  // 以前步骤写整个会话的总数,和本轮过程条对不上。
   const tabItems = [
     { value: "outputs", label: <span>产出</span> },
     ...(browserCount > 0 || browserPending ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }] : []),
-    { value: "steps", label: <span>步骤{count(steps.length)}</span> },
+    { value: "steps", label: <span>步骤{count(workTurns[outputsIndex]?.steps.length ?? 0)}</span> },
     ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
   ];
 

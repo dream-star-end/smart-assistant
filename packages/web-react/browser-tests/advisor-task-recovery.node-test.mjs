@@ -119,7 +119,8 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
       const boot = async () => {
         await page.waitForURL(`**/s/${BOARD_SESSION}`);
         await page.getByRole("button", { name: /切换智能体/ }).click();
-        await page.getByRole("dialog").getByText(unavailableReason, { exact: true }).first().waitFor();
+        // UI-2a: the picker shows the human reason; the server's wording stays in the tooltip.
+        await page.getByRole("dialog").locator(`[title=${JSON.stringify(unavailableReason)}]`).first().waitFor();
         await page.keyboard.press("Escape");
         await page.getByRole("dialog").waitFor({ state: "hidden" });
       };

@@ -192,8 +192,7 @@ export const composerScenes: Scene[] = [
           header={
             <ChatHeader
               {...headerProps()}
-              teamModeActive
-              advisorModeActive
+              collabMode="advisor"
               advisorModelLabel="Opus 5 High"
             />
           }
