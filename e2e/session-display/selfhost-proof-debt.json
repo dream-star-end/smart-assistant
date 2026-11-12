@@ -14,7 +14,6 @@
     "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT": "Cursor MCP context 注入无法在商业候选 HTTP 上诚实复现(/delegate 对 user JWT 403,且无法从 Playwright 读取候选容器 MCP child env)。回归锁在 spawn 单测 + handleHttp 监听器单测。",
     "INC-20260915-ADVISOR-1M-DUP-PICKER": "商业版的 proof 是 deploy-gate scripts/check-v5-advisor-1m-dup-picker.ts,只在商业发布/商业 CI 跑;个人版发布不跑它。原登记:目前只有型号规范化单测，尚缺真实顾问下拉的浏览器或 live-e2e 证据；不将单测冒充界面验收。",
     "INC-20260919-GROK-RESUME-HANG": "unit coverage on grokAdapter first-stdout watchdog, nativeId drop, and keepalive gate; live proof after user-container rebuild",
-    "INC-20260920-CC-BETA-FALLBACK-CREDIT": "unit coverage on official CC anthropic-beta fallback-credit allowlist; live proof after commercial runtime image rebuild",
     "INC-20260920-CC-BETA-THINKING-COUNT": "unit coverage on official CC anthropic-beta thinking-token-count allowlist; live proof after commercial runtime image rebuild",
     "INC-20260920-CLAUDE-QUOTA-RESET-STALE": "unit coverage on Claude quota-window reset not kicking the account; live proof on commercial pool after a 5h window rollover",
     "INC-20260920-OFFICIAL-CC-OPUS48-GATE": "unit coverage rewriting in-flight claude-opus-4-8 to the turn canonical; live proof on official-cc harness",

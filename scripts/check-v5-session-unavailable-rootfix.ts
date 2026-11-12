@@ -1239,3 +1239,14 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[antigravity-route-heartbeat] PASS — executed live silent tool heartbeat and Stop; local process proof, not paid live inference')
+
+// INC-20260920-CC-BETA-FALLBACK-CREDIT: real loopback HTTP through the proxy.
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/commercial/src/__tests__/anthropicProxy.integ.test.ts'],
+  expected: ['INC-20260920-CC-BETA-FALLBACK-CREDIT: HTTP beta forwarding delivers SSE and rejects unknown beta'],
+  namePattern: 'INC-20260920-CC-BETA-FALLBACK-CREDIT',
+  label: 'cc-fallback-beta-http',
+  timeoutMs: 120_000,
+})
+console.log('[cc-fallback-beta-http] PASS — loopback HTTP delivers SSE with allowed beta and blocks unknown beta; repositories are fixtures, not production ledger proof')

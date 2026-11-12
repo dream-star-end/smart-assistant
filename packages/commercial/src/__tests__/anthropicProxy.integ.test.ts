@@ -48,7 +48,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import {
   makeAnthropicProxyHandler,
   type AnthropicProxyDeps,
@@ -56,6 +56,7 @@ import {
 } from "../http/anthropicProxy.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
+import { resetClaudeIdentityGuardForTest, setClaudeIdentityGuardRuntimeForTest } from "../http/proxy/claudeIdentityGuard.js";
 import type {
   AccountScheduler,
   PickResult,
@@ -786,6 +787,7 @@ function buildHarness(opts: HarnessOpts = {}) {
     events,
     logEvents,
     ctx,
+    token, // Test-generated container secret; never a live credential.
     /** 覆写 strategy 内部的 loadUserModelAuthz 闭包(替代旧 `h.deps.loadUserModelAuthz = ...`)。 */
     setAuthz(
       fn: (uid: bigint) => Promise<{
@@ -2773,6 +2775,99 @@ describe("invariant 4 — DeepSeek (pick=null) noop set + 反向 claude 锚定",
     // 5c) DEEPSEEK_NOT_CONFIGURED 在 preCheck 之前 → reserve 也 0
     assert.equal(h.preCheckSpy.reserveCalls.length, 0);
     assert.equal(h.preCheckSpy.releaseCalls.length, 0);
+  });
+
+  test("INC-20260920-CC-BETA-FALLBACK-CREDIT: HTTP beta forwarding delivers SSE and rejects unknown beta", { timeout: 30_000 }, async () => {
+    // Real HTTP and production handler/identity/header/finalizer code. Only
+    // external repositories/scheduler are fixtures; this is not paid live inference.
+    const upstreamRequests: Array<{ beta: string; body: Record<string, unknown> }> = [];
+    const handlerRuns: Promise<void>[] = [];
+    const handlerErrors: unknown[] = [];
+    const listen = (server: Server) => new Promise<string>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        const address = server.address();
+        assert.ok(address && typeof address !== "string");
+        resolve(`http://127.0.0.1:${address.port}/v1/messages`);
+      });
+    });
+    const close = (server: Server) => new Promise<void>((resolve, reject) => {
+      if (!server.listening) return resolve();
+      server.closeAllConnections();
+      server.close((err) => err ? reject(err) : resolve());
+    });
+    const upstream = createServer((req, res) => {
+      const run = async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.from(chunk));
+        assert.equal(req.method, "POST");
+        assert.equal(req.url, "/v1/messages");
+        upstreamRequests.push({ beta: String(req.headers["anthropic-beta"] ?? ""),
+          body: JSON.parse(Buffer.concat(chunks).toString()) });
+        const sse = makeFullSseChunks();
+        const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+        sse.splice(1, 0,
+          event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+          event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "fallback-beta-answer" } }),
+          event({ type: "content_block_stop", index: 0 }));
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(sse.join(""));
+      };
+      handlerRuns.push(run().catch((err) => { handlerErrors.push(err); res.destroy(); }));
+    });
+    let endpoint = "";
+    const h = buildHarness({ fetchImpl: (async (url, init) => {
+      assert.equal(String(url), endpoint, "fixture must never send to a public upstream");
+      return fetch(url, { ...init, signal: AbortSignal.timeout(10_000) });
+    }) as typeof fetch });
+    const proxy = createServer((req, res) => {
+      handlerRuns.push(h.handler(req, res, h.ctx).catch((err) => {
+        handlerErrors.push(err); res.destroy();
+      }));
+    });
+    try {
+      // Keep identity enforcement enabled, but never probe the public internet.
+      setClaudeIdentityGuardRuntimeForTest({ enabled: true, pinnedIp: "127.0.0.1",
+        pinnedCountry: "", processTz: FIXED_PERSONA.timezone,
+        probeExit: async () => ({ ip: "127.0.0.1", country: null, timezone: FIXED_PERSONA.timezone }) });
+      endpoint = await listen(upstream);
+      h.deps.upstreamEndpoint = endpoint;
+      const url = await listen(proxy);
+      const betaValues = ["fallback-credit-2026-06-01", "fallback-credit-2026-07-01",
+        "server-side-fallback-2026-06-01", "server-side-fallback-2026-07-01"];
+      for (const beta of [...betaValues, betaValues.join(",")]) {
+        const response = await fetch(url, { method: "POST", signal: AbortSignal.timeout(10_000),
+          headers: { authorization: `Bearer ${h.token}`, "content-type": "application/json",
+            "anthropic-version": "2023-06-01", "anthropic-beta": `oauth-2025-04-20,${beta}` },
+          body: JSON.stringify(minBody("claude-sonnet-4-6")) });
+        const text = await response.text();
+        assert.equal(response.status, 200, `legal beta ${beta}: ${text}; upstream=${upstreamRequests.length}`);
+        assert.match(text, /fallback-beta-answer/);
+        assert.match(text, /"type":"message_stop"/);
+        await Promise.all(handlerRuns);
+        const request = upstreamRequests.at(-1)!;
+        const forwarded = request.beta.split(",").map((v) => v.trim());
+        for (const value of ["oauth-2025-04-20", ...beta.split(",")]) assert.ok(forwarded.includes(value), value);
+        assert.equal(request.body.model, "claude-sonnet-4-6");
+        assert.equal(h.schedulerSpy.releaseCalls.at(-1)!.result.kind, "success");
+      }
+      assert.equal(upstreamRequests.length, 5);
+      const denied = await fetch(url, { method: "POST", signal: AbortSignal.timeout(10_000),
+        headers: { authorization: `Bearer ${h.token}`, "content-type": "application/json",
+          "anthropic-beta": "oauth-2025-04-20,unknown-beta-2099-01-01" },
+        body: JSON.stringify(minBody("claude-sonnet-4-6")) });
+      const error = await denied.text();
+      assert.equal(denied.status, 400, error);
+      assert.match(error, /ANTHROPIC_BETA_NOT_ALLOWED/);
+      await Promise.all(handlerRuns);
+      assert.equal(upstreamRequests.length, 5, "unknown beta must not reach upstream");
+      assert.deepEqual(handlerErrors, []);
+    } finally {
+      await Promise.all([close(proxy), close(upstream)]);
+      await Promise.all(handlerRuns);
+      resetClaudeIdentityGuardForTest();
+    }
   });
 
   // 反向锚定:claude 路径必须 merge oauth-2025-04-20 + 重写 metadata.user_id.device_id

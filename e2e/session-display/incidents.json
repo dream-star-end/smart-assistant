@@ -4283,6 +4283,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
           "assertion": "oauth + fallback-credit 多值 → 全过"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "cc-fallback-beta-http"
         }
       ],
       "coverageCommits": [
@@ -9511,7 +9516,7 @@
       "occurredAt": "2026-11-12",
       "severity": "P1",
       "symptom": "An active Antigravity turn outlived the fixed six-hour relay ceiling. Roll only against live authoritative chat/delegate ownership, atomically retain reverse index, heartbeat silent tools, deny Stop/terminal and protect live turns from stale settlement. Legacy prompt-queue without a dispatch remains bounded; already expired routes are not revived. Delegate existing 720-minute heartbeat/journal retention boundaries are not bypassed. A re-mint of the same request invalidates the older token; legacy already-settled turns now deny further routing.",
-      "rootFixCommit": "81f0fea1c",
+      "rootFixCommit": "81f0fea1",
       "regressions": [
         {
           "layer": "integration",
