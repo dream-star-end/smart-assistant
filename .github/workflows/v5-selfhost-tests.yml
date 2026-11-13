@@ -131,7 +131,9 @@ jobs:
           if [[ "$node_bin" != /usr/local/bin/node ]]; then sudo ln -sfn "$node_bin" /usr/local/bin/node; fi
           bun_bin=$(readlink -f "$BUN_BIN")
           if [[ "$bun_bin" != /usr/local/bin/bun ]]; then sudo install -m 755 "$bun_bin" /usr/local/bin/bun; fi
-          sudo -u '#1000' -g '#1000' env HOME=/home/agent CI=true PATH="/usr/local/bin:$PATH"             BUN_BIN=/usr/local/bin/bun TEST_DATABASE_URL="$TEST_DATABASE_URL"             bash -c 'set -e; cd "$1"; test "$(id -u)" = 1000; .github/scripts/gateway-test-shard.sh ${{ matrix.kind }} ${{ matrix.shard }}' -- "$runtime_tree"
+          sudo -u '#1000' -g '#1000' env HOME=/home/agent CI=true PATH="/usr/local/bin:$PATH" \
+            BUN_BIN=/usr/local/bin/bun TEST_DATABASE_URL="$TEST_DATABASE_URL" \
+            bash -c 'set -e; cd "$1"; test "$(id -u)" = 1000; .github/scripts/gateway-test-shard.sh ${{ matrix.kind }} ${{ matrix.shard }}' -- "$runtime_tree"
 
   v5-ops:
     name: selfhost-v5-ops
