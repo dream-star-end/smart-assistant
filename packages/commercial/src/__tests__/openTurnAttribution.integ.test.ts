@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 import { computeDispatchRequestHash, LOSSLESS_TURN_TAPE_VERSION } from '@openclaude/protocol'
+import type { MessageLike } from '@openclaude/storage'
 import { getPool } from '../db/index.js'
 import { createPgSessionsBackend } from '../db/pgSessionsBackend.js'
 import { attributeOpenTurn, rememberOpenTurnKey } from '../billing/openTurnAttribution.js'
@@ -77,7 +78,7 @@ for (const state of ['one', 'none', 'many', 'unkeyed'] as const) {
     }
     const label = async () => {
       const session = await backend.getClientSession(sessionId, owner)
-      const reply = session?.messages.find(m => m.role === 'assistant')
+      const reply = (session?.messages as MessageLike[] | undefined)?.find(m => m.role === 'assistant')
       assert.ok(reply, 'real refreshed session contains the finalized answer')
       return (reply.usage as { costCredits?: string })?.costCredits
     }
