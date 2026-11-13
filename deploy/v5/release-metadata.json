@@ -203,7 +203,8 @@
     "0336_commercial_muse_durable",
     "0337_remote_engine_concurrency",
     "0338_antigravity_gemini_4_carbon",
-    "0339_remote_driver_core_v4"
+    "0339_remote_driver_core_v4",
+    "0341_selfhost_sync_compat"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

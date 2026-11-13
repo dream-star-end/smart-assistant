@@ -10,6 +10,7 @@
     { "id": "box-incident-proofs", "script": "scripts/check-v5-box-incident-proofs.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "box-longtask", "script": "scripts/check-v5-box-longtask.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "cursor-sand-inference", "script": "scripts/check-v5-cursor-sand-inference.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "codex-late-stop-closure", "script": "scripts/check-v5-codex-late-stop-proof.sh", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "ccb-mcp-availability", "script": "scripts/check-v5-ccb-mcp-availability.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "delegate-billing-requestid", "script": "scripts/check-v5-delegate-billing-requestid.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "callback-payload-hash", "script": "scripts/check-v5-callback-payload-hash.mjs", "ci": "v5-selfhost-release-gates.yml" },

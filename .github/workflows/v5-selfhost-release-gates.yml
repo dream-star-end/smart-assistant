@@ -78,6 +78,8 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
+      - name: Codex late-stop closure proof (fresh same-candidate CCB)
+        run: bash scripts/check-v5-codex-late-stop-proof.sh
       - name: Install CCB from lockfile
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts

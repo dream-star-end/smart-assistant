@@ -248,6 +248,7 @@ export async function startCc5ToolHost(profilePath: string): Promise<void> {
   const profile = readCc5HostProfile(profilePath)
   requireHost(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS === '1')
   const bootstrap = await import('../bootstrap/state.js')
+  bootstrap.enableToolOnlyMode()
   bootstrap.setIsInteractive(false)
   bootstrap.setOriginalCwd(profile.cwd)
   bootstrap.setProjectRoot(profile.cwd)

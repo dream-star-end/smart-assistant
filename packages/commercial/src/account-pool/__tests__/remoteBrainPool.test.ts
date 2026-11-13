@@ -291,6 +291,11 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const claudeDir = join(fakeHome, '.claude')
       const codexDir = join(fakeHome, '.codex')
       execFileSync('mkdir', ['-p', claudeDir, codexDir])
+      const fakeBin = join(fakeHome, 'bin')
+      execFileSync('mkdir', ['-p', fakeBin])
+      writeFileSync(join(fakeBin, 'claude'), '#!/bin/sh\n# {id:"claude-opus-4-7",family:"opus",display_name:"Opus 4.7",advisor_rank:1},{id:"claude-sonnet-5",family:"sonnet",display_name:"Sonnet 5",advisor_rank:2},{id:"claude-haiku-4-5",family:"haiku",display_name:"Haiku",advisor_rank:3}\necho fixture-1\n', { mode: 0o755 })
+      writeFileSync(join(fakeBin, 'codex'), '#!/bin/sh\nif [ "$1" = "--version" ]; then echo fixture-1; else exit 1; fi\n', { mode: 0o755 })
+      const probeEnv = { ...process.env, HOME: fakeHome, PATH: `${fakeBin}:${process.env.PATH}` }
       const nowSec = Math.floor(Date.now() / 1000)
 
       for (const exp of [(nowSec - 3600) * 1000, nowSec - 3600, 0]) {
@@ -314,7 +319,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
         const expiredProbe = JSON.parse(
           execFileSync('python3', [scriptPath, '--probe'], {
             encoding: 'utf8',
-            env: { ...process.env, HOME: fakeHome },
+            env: probeEnv,
           }),
         ) as {
           profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
@@ -338,7 +343,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const validProbe = JSON.parse(
         execFileSync('python3', [scriptPath, '--probe'], {
           encoding: 'utf8',
-          env: { ...process.env, HOME: fakeHome },
+          env: probeEnv,
         }),
       ) as {
         profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
@@ -358,7 +363,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const defaultModelsProbe = JSON.parse(
         execFileSync('python3', [scriptPath, '--probe'], {
           encoding: 'utf8',
-          env: { ...process.env, HOME: fakeHome },
+          env: probeEnv,
         }),
       ) as {
         profiles: Array<{
@@ -422,7 +427,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const multiProbe = JSON.parse(
         execFileSync('python3', [scriptPath, '--probe'], {
           encoding: 'utf8',
-          env: { ...process.env, HOME: fakeHome },
+          env: probeEnv,
         }),
       ) as {
         profiles: Array<{

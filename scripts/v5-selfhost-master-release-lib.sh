@@ -1348,6 +1348,11 @@ build_master_release() {
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
   fi
+  # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
+    cleanup_master_staging
+    die "pinned Codex late-stop closure proof failed"
+  fi
   cleanup_master_gate_tmpdir
 
   tsum_mark P.mcp-bundle 2>/dev/null || :

@@ -1631,6 +1631,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
  * 404/401)。两处同步铁律由 routeOwnership.test.ts 运行时契约测试锁死(见该文件头注释)。
  */
 export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
+    '/api/sessions/preheat', // Remote-pool preheat is owned by master, not the container gateway.
     '/api/auth/',
     '/api/me',
     '/api/public/',
