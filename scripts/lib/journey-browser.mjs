@@ -95,29 +95,37 @@ export async function settleJourneyGoalTurn(page, { goalMarker, timeout = 20_000
     return left;
   };
   let stopped = false;
+  let attempted = false;
   for (;;) {
     remaining();
-    const rows = page.getByTestId("user-row").filter({ hasText: goalMarker });
-    const count = await rows.count();
-    if (count > 1) throw new Error("Ambiguous journey goal user-row");
-    if (count === 1 && await rows.isVisible()) {
-      if (await page.getByRole("dialog").count()) throw new Error("Unexpected journey goal dialog");
-      if (await page.getByTestId("queued-send-row").count()) throw new Error("Journey goal still has queued messages");
-      const composer = page.getByTestId("composer-shell");
-      if (await composer.count() !== 1 || !await composer.isVisible()) throw new Error("Ambiguous journey composer");
-      const stop = composer.locator('button[data-product-control][aria-label="停止"]');
-      const stopping = composer.locator('button[data-product-control][aria-label="正在停止"]');
-      const send = composer.locator('button[data-product-control][aria-label="发送"]');
-      const stops = await stop.count();
-      const waiters = await stopping.count();
-      const sends = await send.count();
-      if (stops + waiters + sends !== 1) throw new Error("Ambiguous journey composer control");
-      if (stops === 1 && !stopped && await stop.isVisible() && await stop.isEnabled()) {
+    // One browser task samples all identities and controls. Locator isEnabled()
+    // would wait for an old label if the goal naturally ends between queries.
+    const state = await page.evaluate((marker) => {
+      const visible = (el) => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== "hidden");
+      const rows = [...document.querySelectorAll('[data-testid="user-row"]')].filter((el) => el.textContent.includes(marker));
+      if (rows.length > 1) return { error: "Ambiguous journey goal user-row" };
+      if (rows.length !== 1 || !visible(rows[0])) return { pending: true };
+      if ([...document.querySelectorAll('[role="dialog"],dialog[open]')].some(visible)) return { error: "Unexpected journey goal dialog" };
+      if (document.querySelector('[data-testid="queued-send-row"]')) return { error: "Journey goal still has queued messages" };
+      const composers = document.querySelectorAll('[data-testid="composer-shell"]');
+      if (composers.length !== 1 || !visible(composers[0])) return { error: "Ambiguous journey composer" };
+      const controls = [...composers[0].querySelectorAll('button[data-product-control]')].filter((el) => ["停止", "正在停止", "发送"].includes(el.getAttribute("aria-label")));
+      if (controls.length !== 1) return { error: "Ambiguous journey composer control" };
+      const button = controls[0];
+      return { label: button.getAttribute("aria-label"), ready: visible(button) && !button.matches(":disabled") && button.getAttribute("aria-disabled") !== "true" };
+    }, goalMarker);
+    remaining();
+    if (state.error) throw new Error(state.error);
+    if (state.label === "发送" && state.ready) return { stopped };
+    if (state.label === "停止" && state.ready && !attempted) {
+      attempted = true;
+      try {
+        await page.getByTestId("composer-shell").locator('button[data-product-control][aria-label="停止"]').click({ timeout: Math.min(250, remaining()) });
         stopped = true;
-        await stop.click({ timeout: remaining() });
-      } else if (sends === 1 && await send.isVisible() && await send.isEnabled()) {
-        remaining();
-        return { stopped };
+      } catch (error) {
+        // A natural finish can remove the old Stop during actionability checks.
+        // Re-sample the actual DOM, never retry Stop or start a fresh deadline.
+        if (error?.name !== "TimeoutError") throw error;
       }
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining())));

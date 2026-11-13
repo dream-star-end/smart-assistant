@@ -252,3 +252,42 @@ test('OCV5-763: J3 stops only its anchored goal and reaches a sendable composer'
     })
   } finally { await browser.close() }
 })
+
+
+// Fix the exact browser-task interleaving without fabricating any DOM results.
+test('OCV5-763: J3 natural finish during control sampling keeps the shared deadline', { timeout: 20_000 }, async (t) => {
+  const { settleJourneyGoalTurn } = await import('../lib/journey-browser.mjs')
+  const browser = await launchJourneyBrowser()
+  try {
+    for (const mode of ['finish', 'disappear']) await t.test(mode, async () => {
+      const p = await browser.newPage()
+      p.setDefaultTimeout(5_000)
+      try {
+        await p.setContent(`${userRow('goal-race')}<section data-testid="composer-shell"><button data-product-control aria-label="停止">停止</button></section><script>window.clicks=0;document.querySelector('button').onclick=()=>window.clicks++;</script>`)
+        const evaluate = p.evaluate.bind(p)
+        let interleaved = false
+        p.evaluate = async (...args: any[]) => {
+          const result = await (evaluate as any)(...args)
+          if (!interleaved && result?.label === '停止') {
+            interleaved = true
+            await evaluate((action) => {
+              const button = document.querySelector('button')!
+              if (action === 'finish') button.setAttribute('aria-label', '发送')
+              else button.remove()
+            }, mode)
+          }
+          return result
+        }
+        const started = Date.now()
+        if (mode === 'finish') {
+          assert.deepEqual(await settleJourneyGoalTurn(p, { goalMarker: 'goal-race', timeout: 1_000 }), { stopped: false })
+          assert.equal(await evaluate(() => (window as any).clicks), 0)
+        } else {
+          await assert.rejects(settleJourneyGoalTurn(p, { goalMarker: 'goal-race', timeout: 1_000 }), /Ambiguous journey composer control/)
+        }
+        assert.equal(interleaved, true, 'must hit the actual snapshot→action interleaving')
+        assert.ok(Date.now() - started < 1_200, 'must not use the 5s page default waiting for an obsolete button')
+      } finally { await p.close() }
+    })
+  } finally { await browser.close() }
+})
