@@ -20,6 +20,24 @@ type Proof = { incident: string; slug: string; file: string; db: boolean; cases:
 
 export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
   {
+    incident: 'INC-20261031-TURN-LABEL-UNDERCOUNT', slug: 'inc-20261031-turn-label-realpg', db: true,
+    file: 'packages/commercial/src/__tests__/openTurnAttribution.integ.test.ts',
+    cases: [
+      'real PG attribution one: debit 132 once, refresh label 132',
+      'real PG attribution none: debit 132 once, refresh label 97',
+      'real PG attribution many: debit 132 once, refresh label 97',
+      'real PG attribution unkeyed: debit 132 once, refresh label 97',
+    ],
+  },
+  {
+    incident: 'INC-20261026-REFRESH-GRACE', slug: 'inc-20261026-refresh-grace-realpg', db: true,
+    file: 'packages/commercial/src/__tests__/login.integ.test.ts',
+    cases: [
+      'reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE',
+      'reuse rotated refresh at 50s (default grace=45) → still theft',
+    ],
+  },
+  {
     incident: 'INC-20261109-MUSE-ORIGIN-SCHEMA', slug: 'inc-20261109-muse-origin-schema', db: false,
     file: 'packages/commercial/src/__tests__/museDurable.test.ts',
     cases: ["INC-20261109-MUSE-ORIGIN-SCHEMA: explicit metadata stays strict and out of the bridge spec", "INC-20261109-MUSE-ORIGIN-SCHEMA: HTTP reaches real origin ownership gate before insertion", "INC-20261109-MUSE-ORIGIN-SCHEMA: real oc-muse video submits origin and acknowledges one conversation result"],

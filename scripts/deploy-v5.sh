@@ -4162,6 +4162,28 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # OCV5-763: imported selfhost safety proofs run on this exact pinned checkout.
+  # Isolated SQLite/files/loopback only; no production credentials or billing.
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-approval-proofs.ts); then
+    echo "✗ pinned system-approval-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts); then
+    echo "✗ pinned prompt-privacy-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-executor-proofs.ts); then
+    echo "✗ pinned system-executor-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-upload-retention-proof.ts); then
+    echo "✗ pinned upload-retention-proof failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # Phase A writer / Phase B reader must choose the same physical billing
   # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
   # pinned staging tree, not the shared checkout.

@@ -75,7 +75,7 @@ function runnerRig() {
   const executionBackend = { kind: b.backendKind, sessionKey: b.sessionKey, operationId: b.operationId }
   const runner = new SubprocessRunner({
     sessionKey: b.sessionKey, executionBackend, agentId: 'main', agentBaseDir: process.cwd(),
-    model: b.canonicalModel, config: { terminal: { type: 'local' } } as never, cc5BridgePort: port,
+    model: b.canonicalModel, config: { auth: {}, gateway: { port: 0, accessToken: 'fixture-token' }, terminal: { type: 'local' } } as never, cc5BridgePort: port,
     harness: 'official-cc', boxResidentCc: true, authorityEngine: 'ccb',
   } as never)
   const turn = (n: number) => runner.submit(`turn ${n}`, undefined, {

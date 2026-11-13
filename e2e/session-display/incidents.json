@@ -7617,11 +7617,6 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/openAiChatGoBridge.test.ts",
           "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-go-cache-contract.mjs",
-          "assertion": "G1 OpenCode Go prompt cache hits across turns"
         }
       ],
       "proofPending": {
@@ -7696,11 +7691,6 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
           "assertion": "OCV5-522: a genuine success racing Stop retains its actual positive usage"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-stop-before-start-contract.mjs",
-          "assertion": "S1 Stop sent while the engine starts ends the turn before the model answers"
         }
       ],
       "proofPending": {
@@ -7734,11 +7724,6 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
           "assertion": "the user's words reach the model's context inline, not as a file to read"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-user-contract-smoke.mjs",
-          "assertion": "C3 the model answers from the user's message in its context, never from an offloaded request file"
         }
       ]
     },
@@ -8313,11 +8298,6 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-success-recovery.ts",
           "assertion": "[ocv5-500-recovery-pool-identity] PASS — recovery probes authenticate with the eligible pool identity, send nothing without one, and heal only on a completed inference"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-go-cache-contract.mjs",
-          "assertion": "G1 OpenCode Go prompt cache hits across turns"
         }
       ]
     },
@@ -9548,11 +9528,6 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionWorkspaceBoundary.test.ts",
           "assertion": "every engine prompt keeps file search and deletion inside the current conversation"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/check-v5-session-workspace-boundary.ts",
-          "assertion": "[session-workspace-boundary] PASS every engine prompt keeps file work inside the current conversation"
         }
       ]
     },
@@ -10412,12 +10387,18 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/login.integ.test.ts",
           "assertion": "reuse rotated refresh at 50s (default grace=45) → still theft"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/refresh-cross-tab.node-test.mjs",
+          "assertion": "OCV5-622 actual two browser tabs serialize refresh and preserve cookies after reload"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "reuse rotated refresh at 50s (default grace=45) → still theft"
         }
-      ],
-      "proofPending": {
-        "reason": "OCV5-622 covered by unit BC lock + commercial login.integ mid/over-grace; browser dual-tab BootSplash live proof deferred to post-ride canary",
-        "since": "2026-10-26"
-      }
+      ]
     },
     {
       "id": "INC-20261030-LONGTASK-CONTINUE",
@@ -10713,12 +10694,18 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/processRoundCredits.test.tsx",
           "assertion": "shows 本轮 132 积分 after refresh and while the turn is live"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.integ.test.ts",
+          "assertion": "real PG attribution ${state}: debit 132 once, refresh label ${state === 'one' ? 132 : 97}"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "real PG attribution one: debit 132 once, refresh label 132"
         }
-      ],
-      "proofPending": {
-        "reason": "个人版 canary 不能对真实账户扣费来做活体证明。回归是单测回放：一个开着的回合把模型 97 加四次 vision 7+9+8+11 标成 132，零个或多个开着的回合仍标 97、账本仍是 132。不改金额、不回填历史。",
-        "since": "2026-10-31"
-      }
+      ]
     },
     {
       "id": "INC-20261101-UPLOAD-CHUNK-1G",

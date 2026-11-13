@@ -198,7 +198,9 @@ ${fails.map((line, i) => `    ${i + 1}) echo '{"level":"info"}'; echo ${JSON.str
     setLoad(fx, "12.00");
     const r = run(fx, `${gate(["[box-incident-proofs] LARGE_LINE_CLOSE_still-running"])}
 LEASE_TRAIN_ID=${TID}; tsum_init; MASTER_GATE_TMPDIR="$TMPDIR"
-(sleep 1; echo '3.00 1 1 1/1 1' > "$MASTER_GATE_LOADAVG") &
+# Release fixture load only after the real idle gate observes it, not after a wall-clock guess.
+mlog() { echo "$*" >&2; case "$*" in *"主机繁忙,retry.box-incident-proofs 暂不发车"*) : > "$TMPDIR/busy-observed" ;; esac; }
+(while [[ ! -f "$TMPDIR/busy-observed" ]]; do sleep 0.05; done; echo '3.00 1 1 1/1 1' > "$MASTER_GATE_LOADAVG") &
 rc=0; master_gate_retryable box-incident-proofs fake_gate || rc=$?; echo rc=$rc; tsum_finish 0`, { MASTER_GATE_IDLE_TIMEOUT_S: "20" });
     assert.match(r.stdout, /rc=0/, r.stderr);
     const a1 = path.join(fx.trains, `${TID}.box-incident-proofs.attempt1.log`);
