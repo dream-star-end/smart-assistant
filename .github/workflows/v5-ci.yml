@@ -151,8 +151,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install ripgrep (mcp-memory oc_grep / oc_glob)
-        if: ${{ matrix.name == 'storage' || matrix.name == 'web-react' }}
+      - name: Install ripgrep (mcp-memory and real CCB tools)
+        if: ${{ matrix.name == 'storage' || matrix.name == 'web-react' || matrix.name == 'gateway' }}
         run: command -v rg >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep)
 
       - name: Setup Bun for gateway's real CCB catalog identity
@@ -164,7 +164,28 @@ jobs:
       - name: Run ${{ matrix.name }}
         env:
           TUTORIAL_HISTORY_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
-        run: ${{ matrix.run }}
+        run: |
+          if [[ "${{ matrix.name }}" != "gateway" ]]; then
+            ${{ matrix.run }}
+            exit
+          fi
+          # Remote commissioning deliberately requires the real container UID
+          # and /usr/local/bin/node. Do not mock getuid or relax the worker guard.
+          # GitHub's runner UID and checkout permissions are not that runtime.
+          runtime_tree=$(mktemp -d /tmp/oc-gateway-ci-XXXXXX)
+          trap 'sudo rm -rf -- "$runtime_tree"' EXIT
+          cp -a --reflink=auto "$GITHUB_WORKSPACE/." "$runtime_tree/"
+          getent group 1000 >/dev/null || sudo groupadd --gid 1000 oc-gateway-runtime
+          getent passwd 1000 >/dev/null || sudo useradd --uid 1000 --gid 1000 --no-create-home --home-dir /home/agent oc-gateway-runtime
+          sudo install -d -o 1000 -g 1000 /home/agent/.openclaude
+          sudo chown -R 1000:1000 "$runtime_tree"
+          node_bin=$(readlink -f "$(command -v node)")
+          if [[ "$node_bin" != /usr/local/bin/node ]]; then sudo ln -sfn "$node_bin" /usr/local/bin/node; fi
+          bun_bin=$(readlink -f "$(command -v bun)")
+          if [[ "$bun_bin" != /usr/local/bin/bun ]]; then sudo install -m 755 "$bun_bin" /usr/local/bin/bun; fi
+          sudo -u '#1000' -g '#1000' env HOME=/home/agent CI=true PATH="/usr/local/bin:$PATH" \
+            TUTORIAL_HISTORY_BASE_REF="$TUTORIAL_HISTORY_BASE_REF" \
+            bash -c 'set -e; cd "$1"; test "$(id -u)" = 1000; ${{ matrix.run }}' -- "$runtime_tree"
 
   # 从 suite matrix 拆出,才能单独 needs sentinel。check 上下文名仍是
   # web-react-browser;命令仍是 npm run test:browser。
