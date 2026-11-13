@@ -455,6 +455,24 @@ test('OCV5-763 due recovery carrier selection excludes deleted, foreign and othe
   await seed({ journal: 'inflight' })
   assert.equal(await backend.reconcileAutomaticRecoveryJobs(uid), 1)
   assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'v5'), [{ container_id: 511 }])
+  const pool = getPool()
+  await pool.query("UPDATE agent_containers SET runtime_kind='desktop' WHERE id=511")
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [],
+    'the exact numeric id cannot substitute a different runtime kind')
+  await pool.query("UPDATE turn_dispatches SET runtime_kind='desktop' WHERE user_id=$1", [uid.toString()])
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [{ container_id: 511 }],
+    'a desktop dispatch keeps its desktop carrier; recovery is not docker-only')
+  await pool.query(`INSERT INTO agent_containers(id,user_id,secret_hash,state,runtime_channel,runtime_kind)
+    VALUES (512,$1,$2,'active','v5','docker')`, [uid.toString(), Buffer.alloc(32)])
+  t.after(async () => { await pool.query('DELETE FROM agent_containers WHERE id=512 AND user_id=$1', [uid.toString()]) })
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [{ container_id: 511 }],
+    'a known desktop carrier is not replaced by the other docker carrier')
+  await pool.query('UPDATE turn_dispatches SET agent_container_id=NULL WHERE user_id=$1', [uid.toString()])
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [],
+    'unknown carrier refuses ambiguity across docker and desktop')
+  await pool.query("UPDATE agent_containers SET state='vanished' WHERE id=512")
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [{ container_id: 511 }],
+    'an unbound job can wake the sole active carrier across supported kinds')
   assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid + 1n, 'v5'), [])
   assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'other-channel'), [])
   assert.equal(await backend.softDeleteMasterSession(sessionId, `c:${uid}`), true)

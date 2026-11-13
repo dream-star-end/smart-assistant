@@ -182,7 +182,7 @@ describe('TRUNCATE command versus a table privilege (OCV5-610)', () => {
     test(`other breaking DDL remains blocked: ${sql}`, () => assert.equal(detect(sql).status, 0))
   }
   test('the exact already-applied receipt migration has no breaking DDL', () => {
-    const sql = readFileSync(path.join(root, 'packages/commercial/src/db/migrations/0327_system_action_receipts.sql'), 'utf8')
+    const sql = readFileSync(path.join(root, 'scripts/__tests__/fixtures/0327_system_action_receipts.sql'), 'utf8')
     assert.equal(detect(sql).status, 1)
   })
   test('registered ACL migration passes the actual PR precheck with no breaking warning', () => {

@@ -125,7 +125,7 @@ jobs:
             run: npm run test:channels
             timeout: 10
           - name: gateway
-            run: npm run test:gateway
+            run: npm run build:gateway-test-artifacts && npm run test:gateway
             timeout: 25
           - name: storage
             run: npm run test:storage && npm run test:mcp-memory
@@ -152,8 +152,14 @@ jobs:
         run: npm ci
 
       - name: Install ripgrep (mcp-memory oc_grep / oc_glob)
-        if: ${{ matrix.name == 'storage' }}
+        if: ${{ matrix.name == 'storage' || matrix.name == 'web-react' }}
         run: command -v rg >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep)
+
+      - name: Setup Bun for gateway's real CCB catalog identity
+        if: ${{ matrix.name == 'gateway' }}
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
 
       - name: Run ${{ matrix.name }}
         env:

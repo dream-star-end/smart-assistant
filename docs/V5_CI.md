@@ -26,7 +26,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合;禁止静默 test retry | 10 min |
 | protocol | `npm run test:protocol && npm run test:kernel` | gateway↔web-react↔容器的帧与错误码单一权威(frames / turnErrorTaxonomy / promptQueueFrames / modelAuthority)未漂;kernel 脱敏/日志/trace 契约 | 10 min |
 | channels | `npm run test:channels` | 企微 iLink 收发/媒体/配对链路契约 | 10 min |
-| gateway | `npm run test:gateway` | 网关侧会话/工具/路由行为 | 25 min |
+| gateway | `npm run build:gateway-test-artifacts && npm run test:gateway` | 锁定依赖构建真实 CCB/MCP 工具宿主后验证网关侧会话/工具/路由行为 | 25 min |
 | storage | `npm run test:storage && npm run test:mcp-memory` | 持久化层与记忆子系统 | 15 min |
 | web-react | `bash .github/scripts/run-parallel.sh 'npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials' 'npm run test:web-react' 'npm run build:web-react'`(三组并行,同一 required context) | 历史事故回归清单 + 教程 JSONL 只追加 + 前端组件单测(jsdom) + 正式构建首屏 gzip 预算硬门 | 30 min |
 | web-react-browser | `npm run test:browser` | 真 Chromium 受信点击:附件/选择器一类"jsdom 恒假阴性"的交互真的能点开 | 20 min |

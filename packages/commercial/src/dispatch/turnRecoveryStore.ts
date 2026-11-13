@@ -6,24 +6,30 @@ import { durableRetryDelayMs } from './turnControlStore.js'
 import type { Queryable } from './turnDispatchStore.js'
 
 /** Due recovery wakes only an active carrier of a live, same-owner session.
- * Keep the tombstone/tenant JOIN in this recovery-store read, not in WS transport. */
+ * Keep the tombstone/tenant JOIN in this recovery-store read, not in WS transport.
+ * Both implemented transports are eligible. A recorded dispatch requires its exact
+ * id AND kind; without a carrier id, uniqueness is across both kinds, never per kind. */
 export async function listDueRecoveryCarrierContainers(
   q: Queryable, userId: bigint, channel: string,
 ): Promise<Array<{ container_id: number }>> {
   const result = await q.query<{ container_id: number }>(
-    `SELECT DISTINCT ac.id::int AS container_id
+    `WITH eligible_carriers AS (
+       SELECT id,user_id,runtime_kind FROM agent_containers
+        WHERE user_id=$1 AND state='active' AND runtime_channel=$2
+          AND runtime_kind IN ('docker','desktop')
+     ) SELECT DISTINCT ac.id::int AS container_id
                FROM turn_recovery_jobs r
                JOIN client_sessions s ON s.id=r.session_id AND s.user_id='c:' || r.user_id::text AND s.deleted_at IS NULL
                LEFT JOIN LATERAL (
-                 SELECT d.agent_container_id FROM turn_dispatches d
+                 SELECT d.agent_container_id,d.runtime_kind FROM turn_dispatches d
                   WHERE d.user_id=r.user_id AND d.session_id=r.session_id
                   ORDER BY (d.client_message_id=r.source_client_message_id) DESC NULLS LAST,
                            d.admitted_at DESC, d.dispatch_id DESC LIMIT 1
                ) d ON true
-               JOIN agent_containers ac ON ac.user_id=r.user_id AND ac.state='active' AND ac.runtime_channel=$2
-                AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
-                  SELECT 1 FROM agent_containers other WHERE other.user_id=r.user_id AND other.state='active'
-                    AND other.runtime_channel=$2 AND other.id<>ac.id)))
+               JOIN eligible_carriers ac ON ac.user_id=r.user_id
+                AND ((ac.id=d.agent_container_id AND ac.runtime_kind=d.runtime_kind)
+                  OR (d.agent_container_id IS NULL AND NOT EXISTS (
+                    SELECT 1 FROM eligible_carriers other WHERE other.id<>ac.id)))
               WHERE r.user_id=$1 AND r.status IN ('queued','leased') AND r.next_attempt_at<=NOW()
                 AND (r.status='queued' OR r.lease_until<NOW())
                 AND r.dispatch_id IS NULL
