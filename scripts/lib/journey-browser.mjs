@@ -96,6 +96,7 @@ export async function settleJourneyGoalTurn(page, { goalMarker, timeout = 20_000
   };
   let stopped = false;
   let attempted = false;
+  let trialPassed = false;
   for (;;) {
     remaining();
     // One browser task samples all identities and controls. Locator isEnabled()
@@ -118,6 +119,17 @@ export async function settleJourneyGoalTurn(page, { goalMarker, timeout = 20_000
     if (state.error) throw new Error(state.error);
     if (state.label === "发送" && state.ready) return { stopped };
     if (state.label === "停止" && state.ready && !attempted) {
+      if (!trialPassed) {
+        try {
+          // Trial checks visibility/stability/hit-target without dispatching input.
+          await page.getByTestId("composer-shell").locator('button[data-product-control][aria-label="停止"]').click({ trial: true, timeout: Math.min(250, remaining()) });
+          trialPassed = true;
+        } catch (error) {
+          if (error?.name !== "TimeoutError") throw error;
+        }
+        // Re-sample the exact goal, composer and current label after every trial.
+        continue;
+      }
       attempted = true;
       try {
         await page.getByTestId("composer-shell").locator('button[data-product-control][aria-label="停止"]').click({ timeout: Math.min(250, remaining()) });
@@ -127,6 +139,8 @@ export async function settleJourneyGoalTurn(page, { goalMarker, timeout = 20_000
         // Re-sample the actual DOM, never retry Stop or start a fresh deadline.
         if (error?.name !== "TimeoutError") throw error;
       }
+    } else {
+      trialPassed = false;
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining())));
   }

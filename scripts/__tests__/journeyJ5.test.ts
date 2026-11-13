@@ -291,3 +291,85 @@ test('OCV5-763: J3 natural finish during control sampling keeps the shared deadl
     })
   } finally { await browser.close() }
 })
+
+
+test('OCV5-763: J3 trial actionability never retries an uncertain real Stop', { timeout: 60_000 }, async (t) => {
+  const { settleJourneyGoalTurn, waitJourneyUserRow } = await import('../lib/journey-browser.mjs')
+  const browser = await launchJourneyBrowser()
+  try {
+    for (const mode of ['moving', 'overlay', 'permanent-overlay', 'post-click-timeout', 'after-trial-blocked', 'after-trial-finish']) await t.test(mode, async () => {
+      const p = await browser.newPage()
+      let realCalls = 0
+      try {
+        await p.setContent(`${userRow('goal-actionable')}<section data-testid="composer-shell"><button data-product-control aria-label="停止">Stop</button></section><button id="j4">J4</button>
+          <style>@keyframes move {from{transform:translateX(0)}to{transform:translateX(160px)}}button.moving{animation:move 900ms linear}</style>
+          <script>
+          window.clicks=0;window.busy=true;
+          const b=document.querySelector('[data-product-control]');
+          b.onclick=()=>{window.clicks++;b.setAttribute('aria-label','正在停止');b.disabled=true;setTimeout(()=>{window.busy=false;b.disabled=false;b.setAttribute('aria-label','发送')},75)};
+          window.cover=()=>{const d=document.createElement('div');d.id='cover';d.style='position:fixed;inset:0;z-index:9999;background:transparent';document.body.append(d);return d};
+          const mode=${JSON.stringify(mode)};
+          if(mode==='moving')b.className='moving';
+          if(mode==='overlay'||mode==='permanent-overlay'){const d=window.cover();if(mode==='overlay')setTimeout(()=>d.remove(),900)}
+          document.querySelector('#j4').onclick=()=>document.body.insertAdjacentHTML('beforeend',window.busy?'<div data-testid="queued-send-row">actionable-j4</div>':'<div data-testid="user-row">actionable-j4</div>');
+          </script>`)
+        const getByTestId = p.getByTestId.bind(p)
+        let interleaved = false
+        p.getByTestId = ((id: string) => {
+          const scope = getByTestId(id)
+          if (id !== 'composer-shell') return scope
+          const locate = scope.locator.bind(scope)
+          scope.locator = ((selector: string) => {
+            const control = locate(selector)
+            const click = control.click.bind(control)
+            control.click = async (options: any) => {
+              if (!options?.trial) realCalls++
+              await click(options)
+              if (options?.trial && !interleaved && mode.startsWith('after-trial-')) {
+                interleaved = true
+                await p.evaluate((action) => {
+                  const b = document.querySelector('[data-product-control]')!
+                  if (action === 'after-trial-finish') {
+                    ;(window as any).busy = false
+                    b.setAttribute('aria-label', '发送')
+                  }
+                }, mode)
+                if (mode === 'after-trial-blocked') await p.evaluate(() => {
+                  const cover = (window as any).cover()
+                  setTimeout(() => cover.remove(), 900)
+                })
+              }
+              if (!options?.trial && mode === 'post-click-timeout') {
+                const error = new Error('reported timeout after real DOM click')
+                error.name = 'TimeoutError'
+                throw error
+              }
+            }
+            return control
+          }) as typeof scope.locator
+          return scope
+        }) as typeof p.getByTestId
+        const started = Date.now()
+        const ok = !['permanent-overlay', 'after-trial-blocked'].includes(mode)
+        let result: { stopped: boolean } | undefined
+        let error: unknown
+        try { result = await settleJourneyGoalTurn(p, { goalMarker: 'goal-actionable', timeout: 1_800 }) } catch (e) { error = e }
+        assert.equal(!error, ok, String(error))
+        assert.ok(Date.now() - started < 3_200, 'same deadline, no default Playwright timeout')
+        const delivered = ['moving', 'overlay', 'post-click-timeout'].includes(mode)
+        assert.equal(await p.evaluate(() => (window as any).clicks), delivered ? 1 : 0)
+        assert.equal(realCalls, delivered || mode === 'after-trial-blocked' ? 1 : 0)
+        if (ok) {
+          assert.ok(result)
+          assert.equal(await p.evaluate(() => (window as any).busy), false)
+          await p.locator('#j4').click()
+          await waitJourneyUserRow(p, { marker: 'actionable-j4', modelLabel: 'Grok 4.7', timeout: 600 })
+          assert.equal(await p.getByTestId('queued-send-row').count(), 0)
+        } else {
+          assert.equal(result, undefined)
+          assert.match(String(error), /J3 goal turn did not become sendable/)
+        }
+      } finally { await p.close() }
+    })
+  } finally { await browser.close() }
+})
