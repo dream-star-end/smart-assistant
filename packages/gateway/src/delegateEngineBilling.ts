@@ -21,6 +21,7 @@ import { dirname, join } from 'node:path'
 import {
   CODEX_ENGINE_MODEL_IDS,
   DELEGATE_ENGINE_BILLING_SESSION_KEY_RE,
+  isAntigravityEngineModel,
   isGrokEngineModel,
   type DurableCodexBilling,
 } from '@openclaude/protocol'
@@ -40,7 +41,7 @@ const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const SESSION_ID_RE = DELEGATE_ENGINE_BILLING_SESSION_KEY_RE
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 
-export type DelegateEngineBillingEngine = 'codex' | 'grok'
+export type DelegateEngineBillingEngine = 'codex' | 'grok' | 'antigravity'
 
 export interface DelegateEngineBillingAdmitInput {
   model: string
@@ -57,13 +58,21 @@ export interface DelegateEngineBillingAdmission {
   requestId: string
   engineSessionId: string
   grokExecutionDescriptor?: GrokExecutionDescriptor
-  /** Advisor-consult only. Regular delegate admits omit this. */
+  /** Master-issued provider route for any codex admit (advisor or delegate). */
   route?: unknown
+}
+
+export type DelegateEngineBillingSettlePayload = Omit<DurableCodexBilling, 'terminalCode'> & {
+  terminalCode?:
+    | DurableCodexBilling['terminalCode']
+    | 'AUTH_UNAVAILABLE'
+    | 'QUOTA_UNAVAILABLE'
+    | 'ENGINE_ERROR'
 }
 
 export interface DelegateEngineBillingClient {
   admit(input: DelegateEngineBillingAdmitInput): Promise<DelegateEngineBillingAdmission>
-  settle(billing: DurableCodexBilling): Promise<void>
+  settle(billing: DelegateEngineBillingSettlePayload): Promise<void>
   abandon(requestId: string): Promise<void>
   retryPending?(): Promise<void>
   projectConsults?(store: AdvisorConsultStore): Promise<void>
@@ -75,17 +84,30 @@ export function shouldAdmitDelegateEngineBilling(args: {
   agentModel?: string | null
 }): boolean {
   if (args.delegateEngine) {
-    return args.delegateEngine === 'codex' || args.delegateEngine === 'grok'
+    return (
+      args.delegateEngine === 'codex' ||
+      args.delegateEngine === 'grok' ||
+      args.delegateEngine === 'antigravity'
+    )
   }
   const model = args.requestedModel || args.agentModel
   if (!model) return false
-  return isGrokEngineModel(model) || (CODEX_ENGINE_MODEL_IDS as readonly string[]).includes(model)
+  return (
+    isGrokEngineModel(model) ||
+    isAntigravityEngineModel(model) ||
+    (CODEX_ENGINE_MODEL_IDS as readonly string[]).includes(model)
+  )
 }
 
 export function resolveDelegateEngineBillingEngine(args: {
   delegateEngine?: string | null
   model?: string | null
 }): DelegateEngineBillingEngine {
+  // Antigravity must be classified before the codex fallback: it is a
+  // distinct engine with its own master route and settle authority.
+  if (args.delegateEngine === 'antigravity' || isAntigravityEngineModel(args.model)) {
+    return 'antigravity'
+  }
   if (args.delegateEngine === 'grok' || isGrokEngineModel(args.model)) return 'grok'
   return 'codex'
 }
@@ -94,7 +116,7 @@ function validateAdmitInput(input: DelegateEngineBillingAdmitInput): void {
   if (!input.model || typeof input.model !== 'string') {
     throw new Error('DELEGATE_ENGINE_BILLING_INVALID_MODEL')
   }
-  if (input.engine !== 'codex' && input.engine !== 'grok') {
+  if (input.engine !== 'codex' && input.engine !== 'grok' && input.engine !== 'antigravity') {
     throw new Error('DELEGATE_ENGINE_BILLING_INVALID_ENGINE')
   }
   if (!AGENT_ID_RE.test(input.agentId) || !AGENT_ID_RE.test(input.delegateAgentId)) {
@@ -114,7 +136,9 @@ export function mapDelegateEngineBillingError(err: unknown): {
     return { httpStatus: 402, message: '余额不足，engine-reported 委派未启动' }
   }
   if (code.includes('ROUTE_UNAVAILABLE')) {
-    return { httpStatus: 503, message: '顾问模型路由不可用，未启动' }
+    // Regular delegation and advisor consults share this mapper; the message
+    // must read correctly for both (audit follow-up on PR #1371).
+    return { httpStatus: 503, message: '委派模型路由不可用，未启动' }
   }
   if (code.includes('INVALID_')) {
     return { httpStatus: 400, message: `engine-reported 委派计费初始化失败: ${code}` }
@@ -132,7 +156,7 @@ interface BillingSettledReceipt {
 
 interface BillingQueue {
   schemaVersion: 1
-  pending: DurableCodexBilling[]
+  pending: DelegateEngineBillingSettlePayload[]
   /** Proven terminal, no-usage requests whose abandon has not been ACKed. */
   pendingAbandons?: string[]
   settledReceipts?: BillingSettledReceipt[]
@@ -179,17 +203,17 @@ async function readBillingQueue(queuePath: string): Promise<BillingQueue> {
   }
 }
 
-let defaultSettledHook: ((billing: DurableCodexBilling) => void | Promise<void>) | undefined
+let defaultSettledHook: ((billing: DelegateEngineBillingSettlePayload) => void | Promise<void>) | undefined
 
 export function setDelegateEngineBillingSettledHook(
-  hook: ((billing: DurableCodexBilling) => void | Promise<void>) | undefined,
+  hook: ((billing: DelegateEngineBillingSettlePayload) => void | Promise<void>) | undefined,
 ): void {
   defaultSettledHook = hook
 }
 
 async function emitDelegateEngineBillingSettled(
-  billing: DurableCodexBilling,
-  extra?: (billing: DurableCodexBilling) => void | Promise<void>,
+  billing: DelegateEngineBillingSettlePayload,
+  extra?: (billing: DelegateEngineBillingSettlePayload) => void | Promise<void>,
 ): Promise<void> {
   AdvisorConsultStore.projectSettledRequestId(billing.requestId)
   await extra?.(billing)
@@ -208,7 +232,7 @@ export function createDelegateEngineBillingClient(args?: {
   /** Default true: drain leftover queue files after construct (C1). Tests may set false. */
   startupRecovery?: boolean
   /** Fired only after an authoritative 2xx settle POST, never from an empty queue. */
-  onSettled?: (billing: DurableCodexBilling) => void | Promise<void>
+  onSettled?: (billing: DelegateEngineBillingSettlePayload) => void | Promise<void>
 }): DelegateEngineBillingClient {
   const env = args?.env ?? process.env
   const fetcher = args?.fetcher ?? undiciRequest
@@ -268,7 +292,7 @@ export function createDelegateEngineBillingClient(args?: {
     return run
   }
 
-  const persistBilling = async (billing: DurableCodexBilling): Promise<void> =>
+  const persistBilling = async (billing: DelegateEngineBillingSettlePayload): Promise<void> =>
     withQueueLock(async () => {
       const queue = await readBillingQueue(queuePath)
       const index = queue.pending.findIndex((row) => row.requestId === billing.requestId)
@@ -279,7 +303,7 @@ export function createDelegateEngineBillingClient(args?: {
       await writeDurableJson(queuePath, queue)
     })
 
-  const dropSettled = async (billing: DurableCodexBilling): Promise<void> =>
+  const dropSettled = async (billing: DelegateEngineBillingSettlePayload): Promise<void> =>
     withQueueLock(async () => {
       const queue = await readBillingQueue(queuePath)
       const next = queue.pending.filter((row) => row.requestId !== billing.requestId)
@@ -391,7 +415,7 @@ export function createDelegateEngineBillingClient(args?: {
     async retryPending() {
       return withQueueLock(async () => {
         const queue = await readBillingQueue(queuePath)
-        const remaining: DurableCodexBilling[] = []
+        const remaining: DelegateEngineBillingSettlePayload[] = []
         const remainingAbandons: string[] = []
         const receipts = [...(queue.settledReceipts ?? [])]
         for (const billing of queue.pending) {

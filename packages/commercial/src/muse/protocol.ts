@@ -94,6 +94,8 @@ export const BRIDGE_ERROR_CODES: ReadonlySet<string> = new Set([
   'MUSE_TIMEOUT',
   'MUSE_FILE_TOO_LARGE',
   'MUSE_INVALID_INPUT',
+  // Bridge >= 0.5.1 (commercial base): a source image that could not be downloaded after the ack.
+  'MUSE_SOURCE_FETCH_FAILED',
   'MUSE_CANCELLED',
   'MUSE_BRIDGE_LOST',
   'MUSE_SOURCE_FETCH_FAILED',
@@ -178,13 +180,28 @@ const SubmitSchema = z
   })
   .strict()
 
+export interface MuseSourceRef {
+  n: number
+  bytes: number
+  sha256: string
+  mime: string
+}
+
+/** Strict SemVer negotiation: absent/invalid versions keep the legacy inline wire. */
+export function supportsSourceRefs(version: string | null): boolean {
+  const m = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version ?? '')
+  if (!m || m[4]?.split('.').some((v) => /^0\d+$/.test(v))) return false
+  const [major, minor, patch] = m.slice(1, 4).map(Number)
+  return major! > 0 || minor! > 5 || (minor === 5 && (patch! > 0 || !m[4]))
+}
+
 export interface MuseJobSpec {
   kind: MuseKind
   prompt: string
   orientation?: 'square' | 'vertical' | 'landscape'
   aspect_ratio?: '4:5' | '7:12' | '9:16'
   image_format?: 'png' | 'jpg' | 'jpeg' | 'webp'
-  /** Validated base64 (decoded size and magic checked), forwarded to the bridge as-is. */
+  /** Validated base64 (decoded size and magic checked); hub retains sources until finish. */
   source_images?: string[]
   resume_snapshot_id?: string
   /** Optional video mode for the box-exec backend; ignored by the hatch wire. */

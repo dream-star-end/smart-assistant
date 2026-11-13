@@ -43,7 +43,7 @@
 import type { PoolClient } from 'pg'
 import { query, tx } from '../db/queries.js'
 import { writeAdminAudit } from './audit.js'
-import { isBoxGptWebModel } from '@openclaude/protocol'
+import { isCc5TestModel, isBoxGptWebModel } from '@openclaude/protocol'
 import { isBoxGptWebAllowedUser, isCursorCredentialMember } from '../cursor/access.js'
 
 /**
@@ -166,6 +166,9 @@ export async function addGrant(
 ): Promise<{ inserted: boolean; row: ModelGrantRowView }> {
   const uid = normalizeUserId(userId)
   const mid = normalizeModelId(modelId)
+  if (isCc5TestModel(mid)) {
+    throw new GrantInvalidInputError('cc5_task_model_retired')
+  }
   const out = await tx(async (client: PoolClient) => {
     // 用户存在性 —— FK 会兜底,但提前抛清晰错误码,前端 UX 友好
     const userR = await client.query<{ id: string; role: string }>(

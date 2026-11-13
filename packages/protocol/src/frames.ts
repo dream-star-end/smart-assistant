@@ -239,6 +239,7 @@ export const InboundMessage = Type.Object({
   /** Server-issued generation binding a prepared native model handoff to the
    * first turn on the selected target model. */
   modelSwitchId: Type.Optional(ControlId),
+  modelSwitchConsent: Type.Optional(Type.String({maxLength:4096})),
   // Cursor Opus/Fable 上下文档位(turn 级,2026-09 起)。只对 CURSOR_CONTEXT_TIER_FAMILIES
   // 生效:master 在签发 executionDescriptor 前把 catalog 机制窗口(1M)按档位收窄
   // (300k → 300_000;1m → 原值),CCB auto-compact 阈值随之变化。不换 canonical id、
@@ -449,6 +450,7 @@ export const PromptQueueItem = Type.Object({
     agentId: Type.String({ minLength: 1 }),
     model: Type.Optional(Type.String()),
     modelSwitchId: Type.Optional(ControlId),
+    modelSwitchConsent: Type.Optional(Type.String({maxLength:4096})),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     serviceTier: Type.Optional(Type.Union([Type.Null(), ...SERVICE_TIERS.map((tier) => Type.Literal(tier))])),
     teamMode: Type.Optional(Type.Boolean()),
@@ -542,6 +544,7 @@ export const InboundPromptQueueEnqueue = Type.Object({
   content: PromptQueueMessageContent,
   requestedExecution: Type.Object({
     model: Type.Optional(Type.String()),
+    modelSwitchConsent: Type.Optional(Type.String({maxLength:4096})),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     serviceTier: Type.Optional(Type.Union([Type.Null(), ...SERVICE_TIERS.map((tier) => Type.Literal(tier))])),
     teamMode: Type.Optional(Type.Boolean()),
@@ -1076,6 +1079,7 @@ export const OutboundError = Type.Object({
     Type.Literal('engine_error'),
     Type.Literal('auth_error'),
     Type.Literal('platform_credential_expired'),
+    Type.Literal('antigravity_start_observation_failed'),
     Type.Literal('box_capacity_held'),
     Type.Literal('session_persist_unavailable'),
     Type.Literal('project_context_unavailable'),

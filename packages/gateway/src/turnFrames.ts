@@ -260,6 +260,32 @@ export function _earlyRejectErrorFrames(args: {
 }
 
 /**
+ * Turns a user sent over the chat socket. Only these end a failed session start with their own
+ * error card; internal callers (cron, delegate callbacks, channels) keep the throw they retry on.
+ */
+export const userSentTurnFrames = new WeakSet<object>()
+
+/** The public code of a session-start failure: its leading CODE, never internal detail. */
+export function sessionStartFailureCode(err: unknown): string {
+  if (err instanceof Error && err.name === 'EngineNotEnabledError') return 'ENGINE_NOT_ENABLED'
+  const head = err instanceof Error ? err.message.split(':', 1)[0]!.trim() : ''
+  return /^[A-Z][A-Z0-9_]{2,63}$/.test(head) ? head : 'SESSION_START_FAILED'
+}
+
+const NEW_CHAT_REQUIRED = new Set([
+  'CC5_BACKEND_REQUIRES_NEW_SESSION', 'CC5_BACKEND_SCOPE_CHANGED_NEW_CHAT_REQUIRED',
+  'CC5_BACKEND_SCOPE_CHANGED', 'CC5_TEST_REMOTE_RESUME_UNSUPPORTED',
+])
+
+export function sessionStartFailureMessage(code: string): string {
+  if (NEW_CHAT_REQUIRED.has(code)) {
+    return '这个对话的历史没法接到当前模型上继续。这一轮还没有开始，也不会计费。请新开一个对话再发送，或换回原来的模型。'
+  }
+  if (code === 'MODEL_SWITCH_IN_PROGRESS') return '模型正在切换，这一轮还没有开始，也不会计费。请稍后重新发送。'
+  return `这一轮没能开始（${code}），不会计费。请稍后重新发送；反复出现可以换个模型或新开对话。`
+}
+
+/**
  * Copy the routing tuple(+ public traceId)from the main `out` frame onto a
  * derived outbound frame(outbound.error / outbound.permission_request /
  * outbound.codex_billing).

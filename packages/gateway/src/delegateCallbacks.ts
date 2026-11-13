@@ -238,6 +238,42 @@ export async function _ensureDurableSendToAgentCallback(
     })
     return !('skipped' in result) && result.ok === true
   }
+  if (job.kind === 'delegate' && job.callback === 'origin-inject' && this._delegateJobs) {
+    // Dynamic MCP handoff can race completion with the intent-persist catch-up.
+    // Use the same claim and callback identity regardless of callbackOwner.
+    const store = this._delegateJobs
+    const live = store.snapshotOf(job.id)
+    if (!live) return false
+    if (live.callbackState === 'delivered') return true
+    const fence = live.claimToken
+      ? { claimToken: live.claimToken, fencingEpoch: live.fencingEpoch }
+      : undefined
+    const claim = store.claimNotifyDelivery(job.id, fence)
+    if (!claim.ok) return false
+    const payload = callbackPayloadFromDurableJob(claim.snapshot)
+    try {
+      const result = await this.injectSendToAgentCallback({
+        parentSessionKey: intent.originSessionKey,
+        jobId: intent.jobId,
+        agentId: intent.agentId,
+        goal: intent.goal,
+        userId: intent.userId,
+        output: payload.output,
+        error: payload.error,
+        clientMessageId: delegateCallbackMessageId(intent.jobId, claim.snapshot.callbackEpoch || 1),
+      })
+      if (result.kind !== 'injected') return false
+      const delivered = store.completeNotifyDelivery(job.id, claim.token, fence)
+      if (delivered) {
+        this._activeSendToAgentCallbacks?.delete(job.id)
+        await removeSendToAgentIntent(job.id)
+      }
+      return delivered
+    } finally {
+      store.releaseNotifyClaim(job.id, claim.token, fence)
+      this._armNotifyRetryScheduler()
+    }
+  }
   const epoch = job.callbackEpoch || 1
   const payload = callbackPayloadFromDurableJob(job)
   const result = await this.injectSendToAgentCallback({
@@ -540,6 +576,23 @@ export function _queueSendToAgentCallback(
   runInput: RunDelegateInput,
   args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
 ): void {
+  const snapshot = this._delegateJobs?.snapshotOf(args.jobId)
+  if (snapshot?.kind === 'delegate' && snapshot.callback === 'origin-inject' && snapshot.callbackOriginSessionKey) {
+    if (isDelegateNotifierEffective()) return
+    const active = this._activeSendToAgentCallbacks?.get(args.jobId)
+    void this._ensureDurableSendToAgentCallback(snapshot, {
+      v: 1,
+      jobId: args.jobId,
+      originSessionKey: snapshot.callbackOriginSessionKey,
+      userId: snapshot.callbackOriginUserId ?? active?.userId,
+      agentId: args.agentId,
+      goal: active?.goal ?? args.goal,
+      createdAt: Date.now(),
+    }).catch((err) => {
+      this.log.warn('delegate handoff callback failed', { jobId: args.jobId }, err as Error)
+    })
+    return
+  }
   if (runInput.callbackOnComplete !== 'origin-inject') return
   // Stage 2: EngineNotifier owns origin-inject (and cron-origin-inject)
   // delivery when the flag is on. Completer must not also inject.

@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * Experimental community ZCode CLI adapter (zcode.cjs 0.16.9; behaviour notes below were measured on 0.16.3).
@@ -35,6 +36,7 @@ import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
+import { bindRouteTrace } from '../relayTrace.js'
 import {
   cleanupZcodePlatformArtifacts,
   createZcodePlatformArtifacts,
@@ -119,6 +121,8 @@ interface ZcodeTurnContext {
   hookTimer: NodeJS.Timeout | null
   contentTimer: NodeJS.Timeout | null
   relayTimer: NodeJS.Timeout | null
+  /** Ends this turn's route-token trace binding for the container relay (OCV5-595). */
+  releaseRelayTrace: (() => void) | null
   relayPolling: boolean
   relayAfter: number
   relaySawContent: boolean
@@ -429,6 +433,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   private currentToolsets: string[] | undefined
   private target: ExecutionTarget = { kind: 'local' }
   private route: ZcodeRouteOverride | null = null
+  private traceId: string | undefined
   private drain: Promise<void> = Promise.resolve()
   lastActivityAt = 0
   private platformGoal: GoalStateSnapshot | null = null
@@ -462,7 +467,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   // still retain the requested value so model switches cannot be silently lost.
   setEffortLevel(level: string | undefined): void { this.currentEffort = level }
   get effortLevel(): string | undefined { return this.currentEffort }
-  setTraceId(_traceId: string | undefined): void {}
+  setTraceId(traceId: string | undefined): void { this.traceId = traceId }
   async setGoalState(goal: GoalStateSnapshot | null): Promise<void> {
     this.platformGoal = goal ? structuredClone(goal) : null
   }
@@ -516,6 +521,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       hookTimer: null,
       contentTimer: null,
       relayTimer: null,
+      releaseRelayTrace: null,
       relayPolling: false,
       relayAfter: 0,
       relaySawContent: false,
@@ -615,6 +621,9 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private cleanupArtifacts(ctx: ZcodeTurnContext): void {
+    // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
+    ctx.releaseRelayTrace?.()
+    ctx.releaseRelayTrace = null
     if (ctx.hookTimer) {
       clearInterval(ctx.hookTimer)
       ctx.hookTimer = null
@@ -1053,9 +1062,11 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     this.cleanupArtifacts(ctx)
     try {
       ctx.artifacts = createZcodePlatformArtifacts({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
       identityCompat: this.opts.identityCompat,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
         gatewayPort: this.opts.config.gateway.port,
         gatewayToken: this.opts.config.gateway.accessToken ?? '',
         delegationDepth: this.opts.delegationDepth ?? 0,
@@ -1095,6 +1106,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     ctx.zcodeSessionId = this.nativeId
     if (this.nativeId) args.push('--resume', this.nativeId)
     const env: NodeJS.ProcessEnv = {
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port),
       ...identityCompatEnvironment(this.opts.identityCompat),
       OC_AGENT_ID: this.opts.agentId,
       OPENCLAUDE_AGENT_ID: this.opts.agentId,
@@ -1123,6 +1135,8 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       try { proc.unref() } catch { /* already detached */ }
       return
     }
+    // Bound before any of the child's requests can reach the relay (same tick as spawn).
+    if (this.route) ctx.releaseRelayTrace = bindRouteTrace(this.route.routeToken, this.traceId)
     this.emit('spawn', { resumed: this.nativeId !== null })
     proc.stdout.setEncoding('utf8')
     proc.stdout.on('data', (chunk: string) => {

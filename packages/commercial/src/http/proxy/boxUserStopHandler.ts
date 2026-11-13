@@ -6,7 +6,8 @@ import { IdentityError, type IdentityStrategy } from "../../auth/proxyIdentity.j
 import { BoxDurableJournalError, type BoxDurableJournal } from "./boxDurableJournal.js";
 import type { BoxUserStopCoordinator } from "./boxUserStopCoordinator.js";
 
-type Journal = Pick<BoxDurableJournal, "findCancelableRun">;
+type Journal = Pick<BoxDurableJournal, "findCancelableRun">
+  & Partial<Pick<BoxDurableJournal,"cancelToolRollovers">>;
 type Coordinator = Pick<BoxUserStopCoordinator, "requestStop">;
 const MAX_CONCURRENT_STOPS = 4;
 
@@ -87,10 +88,18 @@ export function makeBoxUserStopHandler(deps: { identity: IdentityStrategy;
         reply(res, 429, { error: "STOP_BUSY" }); return;
       }
       execution = (async () => {
-        const run = await bounded(deps.journal.findCancelableRun({ uid: identity.uid,
-          containerId: identity.containerId!, sessionId: body.session_id as string,
-          turnKey: body.oc_turn_key as string }), 5_000);
-        return deps.coordinator.requestStop(run);
+        const turnIdentity = { uid: identity.uid,containerId: identity.containerId!,
+          sessionId: body.session_id as string,turnKey: body.oc_turn_key as string };
+        const rolloverCancelled = deps.journal.cancelToolRollovers
+          ? await bounded(deps.journal.cancelToolRollovers(turnIdentity),5_000) : false;
+        try {
+          const run = await bounded(deps.journal.findCancelableRun(turnIdentity),5_000);
+          return deps.coordinator.requestStop(run);
+        } catch (error) {
+          if (rolloverCancelled && error instanceof BoxDurableJournalError
+            && error.code === "BOX_CANCEL_RUN_UNKNOWN") return "stopped_proven" as const;
+          throw error;
+        }
       })();
       inFlight.set(key, execution);
     }

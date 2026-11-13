@@ -13,6 +13,7 @@ import {
   BOX_CC_HOME,
   BOX_CC_REAP_FUNCTION,
   boxOfficialClaudeModel,
+  boxReadOnlyClaudeArgs,
   type BoxCcControl,
   type BoxCcExecRequest,
 } from './cursorBoxCcExec.js'
@@ -27,6 +28,49 @@ export function boxCcRunnerFromEnv(env: NodeJS.ProcessEnv): BoxCcRunner {
 }
 
 const SAFE_FLAG = new Set(['--model', '--resume', '--permission-mode'])
+const FORBIDDEN_CC_PRINT_FLAGS = new Set([
+  '-p',
+  '--print',
+  '--input-format',
+  '--output-format',
+  '--include-partial-messages',
+  '--replay-user-messages',
+])
+
+/**
+ * OCV5-721 three-layer hard gate preventing remote `cc` (Claude Code) from ever
+ * degrading to `claude -p` print mode:
+ * 1) `OC_BOX_CC_RUNNER` must be `'interactive'`.
+ * 2) `argv` must not contain `-p`, `--print`, `--input-format`, or `--output-format`.
+ * 3) `modSha256` must be a 64-hex digest matching `expectedModSha256` (if provided),
+ *    and any `sessionProof` must carry `isInteractive === true`.
+ */
+export function assertRemoteCcInteractiveRunner(input: {
+  env: NodeJS.ProcessEnv
+  argv: readonly string[]
+  modSha256: string
+  expectedModSha256?: string
+  sessionProof?: { isInteractive?: boolean }
+}): void {
+  if (boxCcRunnerFromEnv(input.env) !== 'interactive') {
+    throw new Error('REMOTE_CC_PRINT_MODE_FORBIDDEN: OC_BOX_CC_RUNNER must be interactive')
+  }
+  for (const token of input.argv) {
+    const flag = token.split('=')[0] ?? token
+    if (FORBIDDEN_CC_PRINT_FLAGS.has(flag)) {
+      throw new Error(`REMOTE_CC_PRINT_MODE_FORBIDDEN: flag ${flag} is forbidden on remote cc`)
+    }
+  }
+  if (!/^[a-f0-9]{64}$/.test(input.modSha256)) {
+    throw new Error('REMOTE_CC_BRIDGE_MOD_INVALID')
+  }
+  if (input.expectedModSha256 && input.modSha256 !== input.expectedModSha256) {
+    throw new Error('REMOTE_CC_BRIDGE_MOD_DIGEST_MISMATCH')
+  }
+  if (input.sessionProof && input.sessionProof.isInteractive !== true) {
+    throw new Error('REMOTE_CC_INTERACTIVE_PROOF_REQUIRED')
+  }
+}
 
 /** Interactive counterpart of remoteClaudeArgs: the same three adapter-owned
  * flags pass, the stream-json/-p flags do not. Bypass mode also passes the
@@ -45,7 +89,7 @@ export function remoteInteractiveClaudeArgs(argv: readonly string[]): string[] {
       out.push('--dangerously-skip-permissions', '--settings', '{"skipDangerousModePermissionPrompt":true}')
     }
   }
-  return out
+  return [...out, ...boxReadOnlyClaudeArgs(argv)]
 }
 
 export interface BoxBridgeMod {

@@ -9,7 +9,7 @@ import { Alert } from "../ui";
 export function BackgroundTurnBanner({ notice }: { notice: BackgroundTurnNoticeView }) {
   return (
     <div className={notice.compact ? "mb-2" : "mx-auto mb-2 max-w-3xl px-4"}>
-      <Alert tone="info" density="compact" live="polite" data-testid="background-turn-banner">
+      <Alert tone={notice.tone ?? "info"} density="compact" live="polite" data-testid="background-turn-banner">
         {notice.text}
       </Alert>
     </div>

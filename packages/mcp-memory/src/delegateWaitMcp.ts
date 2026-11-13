@@ -7,6 +7,7 @@
  */
 import {
   formatDelegateHttpResult,
+  formatDelegateDeferred,
   interpretDelegateWaitBody,
   type DelegateWaitView,
 } from './delegateCursorFastPath.js'
@@ -25,7 +26,7 @@ export type McpDelegateWaitOnce = (
 
 export type McpDelegateWaitResult = {
   isError: boolean
-  status: 'done' | 'failed' | 'running' | 'not_found' | 'error'
+  status: 'done' | 'failed' | 'running' | 'deferred' | 'not_found' | 'error'
   text: string
   jobId?: string
 }
@@ -54,6 +55,9 @@ export function formatMcpDelegateWaitNotFound(jobId: string, error: string): str
 }
 
 export function formatMcpDelegateWaitView(view: DelegateWaitView, jobId: string): McpDelegateWaitResult {
+  if (view.kind === 'deferred') {
+    return { isError: false, status: 'deferred', jobId: view.jobId, text: formatDelegateDeferred(view.jobId, view.jobId) }
+  }
   if (view.kind === 'running') {
     return {
       isError: false,

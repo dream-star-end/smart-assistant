@@ -1796,6 +1796,50 @@ test('relay passthrough without authority headers sends none (no empty/forged va
   }
 })
 
+test('OCV5-596: passthrough carries the turn trace set on the relay, never a caller one', async () => {
+  const captured: Headers[] = []
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    captured.push(new Headers(init?.headers))
+    return new Response('{"type":"message"}', { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: { baseUrl: 'http://proxy.internal:18892', authToken: 'container-bearer' },
+  })
+  const baseUrl = await relay.start()
+  const T1 = '0a1b2c3d4e5f60718293a4b5c6d7e8f9'
+  const send = () => fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-openclaude-trace-id': 'ffeeddccbbaa99887766554433221100' },
+    body: JSON.stringify({ model: 'glm-5.3-zai', stream: false, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+  }).then((r) => r.text())
+  try {
+    await send()
+    relay.setTraceId(T1)
+    await send()
+    relay.setTraceId('not-a-trace')
+    await send()
+    relay.setTraceId(undefined)
+    await send()
+    assert.deepEqual(captured.map((h) => h.get('x-openclaude-trace-id')), [null, T1, null, null])
+  } finally {
+    await relay.close()
+  }
+})
+
+test('OCV5-596: CursorSandAdapter hands the turn trace to its relay', () => {
+  const traces: Array<string | undefined> = []
+  const relay = { setTraceId: (t: string | undefined) => { traces.push(t) }, close: async () => {} }
+  const adapter = new CursorSandAdapter({
+    sessionKey: 'agent:main:test:sand-trace', agentId: 'main', agentBaseDir: process.cwd(),
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: STABLE_SAND_SELECTION,
+  }, relay as never, () => { throw new Error('no submit') }, () => {})
+  adapter.setTraceId('0a1b2c3d4e5f60718293a4b5c6d7e8f9')
+  adapter.setTraceId(undefined)
+  assert.deepEqual(traces, ['0a1b2c3d4e5f60718293a4b5c6d7e8f9', undefined])
+})
+
 test('relay rejects non-Sand models with 400 (not 502) when no passthrough proxy exists', async () => {
   const relay = new CursorSandRelay({
     fetchImpl: async () => { throw new Error('unreachable') },
@@ -2833,4 +2877,36 @@ test('Box terminal composition rejection: failing optional hook never duplicates
     assert.match(res.text(), /CURSOR_SAND_BOX_CONNECTION_REJECTED/)
     assert.doesNotMatch(res.text(), /synthetic persistence failure|message_stop/)
   } finally { await f.relay.close() }
+})
+
+test('Cursor warm variants forward consent without claiming it applied, and replay only the active operation snapshot', async () => {
+  const previous = process.env.OC_CURSOR_SAND_OFFICIAL_CC
+  const dir = mkdtempSync(resolve(tmpdir(), 'oc-cursor-privacy-proof-'))
+  const policy = { schemaVersion: 1 as const, profile: { nickname: 'fixture-name', sessionId: 'scope-a' } }
+  try {
+    for (const official of ['0', '1']) {
+      process.env.OC_CURSOR_SAND_OFFICIAL_CC = official
+      const router = new CursorRoutingAdapter({ sessionKey: 'agent:main:webchat:dm:scope-a', sessionId: 'scope-a', agentId: 'main', agentBaseDir: dir,
+        config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION })
+      const state = router as any
+      assert.equal(typeof router.setPromptPrivacy, 'function')
+      router.setPromptPrivacy!(policy)
+      assert.deepEqual(state.inner.runner.promptPolicy, policy)
+      assert.equal(router.promptPolicyFingerprint, undefined)
+      const old = state.inner
+      await old.shutdown()
+      state.inner = state.createInner(router.currentVariant)
+      assert.deepEqual(state.inner.runner.promptPolicy, policy)
+      router.clearPromptPrivacy()
+      assert.equal(state.inner.runner.promptPolicy, undefined)
+      await router.shutdown()
+    }
+    const native = new CursorRoutingAdapter({ sessionKey: 'agent:main:webchat:dm:scope-a', sessionId: 'scope-a', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: NATIVE_SELECTION })
+    assert.equal(native.setPromptPrivacy, undefined)
+    await native.shutdown()
+  } finally {
+    if (previous === undefined) Reflect.deleteProperty(process.env, 'OC_CURSOR_SAND_OFFICIAL_CC')
+    else process.env.OC_CURSOR_SAND_OFFICIAL_CC = previous
+  }
 })

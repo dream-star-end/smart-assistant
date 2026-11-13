@@ -84,6 +84,31 @@ export interface CommercialHook {
     hostUuid: string
     remotePath: string
   }) => Promise<Buffer | null>
+  pushRemoteHostUploadFromPath?: (args: {
+    hostUuid: string
+    remotePath: string
+    localPath: string
+    length: number
+  }) => Promise<void>
+  sumRemoteUploadUsage?: (args: {
+    hostUuid: string
+    remoteDir: string
+  }) => Promise<{ usedBytes: number; truncated: boolean; files: { name: string; size: number; mtimeMs: number }[] }>
+  assembleRemoteHostUpload?: (args: {
+    hostUuid: string
+    remoteDir: string
+    uploadId: string
+    count: number
+    ext: string
+    expectedSize: number
+  }) => Promise<{ sha256: string; size: number }>
+  deleteRemoteHostUpload?: (args: { hostUuid: string; remotePath: string }) => Promise<void>
+  openRemoteHostMedia?: (args: {
+    hostUuid: string
+    remotePath: string
+    dest: NodeJS.WritableStream
+    onReady: (info: { size: number }) => boolean
+  }) => Promise<'ok' | 'missing' | 'rejected'>
   /**
    * **textual** 谓词:判定 `resolvedPath` 是否长得像
    * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`。

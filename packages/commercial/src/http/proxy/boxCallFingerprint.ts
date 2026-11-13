@@ -13,7 +13,7 @@ export class BoxCallFingerprintError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxCallFingerprintError"; }
 }
 
-function updateStableJson(value: unknown, emit: (part: string) => void,
+export function updateStableJson(value: unknown, emit: (part: string) => void,
   depth = 0): void {
   if (depth > 64) throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_DEEP");
   if (typeof value === "string") {

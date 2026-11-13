@@ -108,6 +108,37 @@ describe('project context read failure', () => {
     assert.equal(turnStart?.unavailable, 'network')
   })
 
+  it('a spawn uses a recent turn read without asking the master; an old one is read again', async () => {
+    let clock = 1_000_000
+    const now = () => clock
+    const ok = fetcherFrom([{ status: 200, body: PROJECT_BODY }])
+    await resolveTurnProjectContext({ sessionId: 's-recent', env: ENV, fetcher: ok.fetcher, now })
+    clock += 59_000
+    const unused = fetcherFrom([])
+    const spawn = await resolveTurnProjectContext({
+      sessionId: 's-recent', env: ENV, fetcher: unused.fetcher, now, reuseRecentMs: 60_000, reuseLastOnFailure: true,
+    })
+    assert.equal(unused.calls.length, 0)
+    assert.equal(spawn?.instructions, '用学术中文')
+    // Hours later (a respawn with no turn read of its own): the master is asked.
+    clock += 3_600_000
+    const moved = fetcherFrom([{ status: 200, body: { ...PROJECT_BODY, instructions: '改过的说明' } }])
+    const later = await resolveTurnProjectContext({
+      sessionId: 's-recent', env: ENV, fetcher: moved.fetcher, now, reuseRecentMs: 60_000, reuseLastOnFailure: true,
+    })
+    assert.equal(moved.calls.length, 1)
+    assert.equal(later?.instructions, '改过的说明')
+  })
+
+  it('the turn-start read always asks the master, however recent the last answer', async () => {
+    const ok = fetcherFrom([{ status: 200, body: PROJECT_BODY }])
+    await resolveTurnProjectContext({ sessionId: 's-turn', env: ENV, fetcher: ok.fetcher })
+    const down = fetcherFrom(['network', 'network'])
+    const turnStart = await resolveTurnProjectContext({ sessionId: 's-turn', env: ENV, fetcher: down.fetcher })
+    assert.equal(down.calls.length, 2)
+    assert.equal(turnStart?.unavailable, 'network')
+  })
+
   it('a malformed body counts as a failure, not as "no project"', async () => {
     const { fetcher } = fetcherFrom([{ status: 200, body: 'not json' }, { status: 200, body: '[]' }])
     const got = await resolveTurnProjectContext({ sessionId: 's-bad', env: ENV, fetcher })

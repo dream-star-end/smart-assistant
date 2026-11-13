@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote} from "./model-switch-cost-fixture.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -44,6 +45,9 @@ test("full App goal save auto-start (desktop/mobile, failure, retry, busy)", { t
       await page.route("**/api/**", async (route) => {
         const req = route.request(), path = new URL(req.url()).pathname, method = req.method();
         const data = req.postDataJSON() ?? {};
+      if(method==='POST'&&/^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)){
+        await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(fixtureSwitchQuote(data,{empty:true}))});return;
+      }
         const user = { id: "u1", email: "test@example.com", email_verified: true, role: "user", display_name: "Test", credits: "1000" };
         let body = {}, status = 200;
         if (path === "/api/public/config") body = { turnstile_bypass: true, require_email_verified: false, allow_registration: true };

@@ -76,6 +76,16 @@ if (feature('ABLATION_BASELINE') && process.env.CLAUDE_CODE_ABLATION_BASELINE) {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
+  // The bound tool-only host must not import main/init: main's preAction
+  // initializes OAuth account state even when the MCP handler skips setup().
+  // This module has only type imports; argument rejection has no auth/config I/O.
+  if (args.some(arg => arg.startsWith('--tool-profile') || arg.startsWith('--tool-allowlist'))) {
+    const { isCc5ToolHostCommand, startCc5ToolHost } = await import('./cc5ToolHost.js');
+    isCc5ToolHostCommand(args);
+    await startCc5ToolHost(args[5]);
+    return;
+  }
+
   // Fast-path for --version/-v: zero module loading needed
   if (args.length === 1 && (args[0] === '--version' || args[0] === '-v' || args[0] === '-V')) {
     // MACRO.VERSION is inlined at build time

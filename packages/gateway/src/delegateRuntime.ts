@@ -24,14 +24,19 @@ import {
   REVIEW_VERDICT_PASS,
   REVIEW_VERDICT_NEEDS_FIX,
   ADVISOR_AGENT_ID,
+  AGENT_MODEL_AUTO,
 } from '@openclaude/protocol'
 import {
   failureClassFromLocalExecutionCode,
   isDelegateTerminalState,
   type DelegateFailureClass,
 } from '@openclaude/protocol'
+import { mintDelegateTrace, registerDelegateTraceWait, cancelDelegateTraceWait } from './delegateTrace.js'
+import { TaskboardCancelledError, taskboardRunControls, type TaskboardRunControl } from './taskboard/runControl.js'
+import { readTaskboardDelegateBody, TaskboardBodyTimeoutError } from './taskboard/delegateBody.js'
 import { classifyDelegateOutputError } from './errorClassify.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
+import { handoffDelegateWait } from './delegateWaitHandoff.js'
 import type { AgentSession } from './sessionManager.js'
 import { isHiddenSystemAgentId, isTeamReviewExecution } from './agentVisibility.js'
 import { backfillCronOccurrenceDelegateJobs } from './cron.js'
@@ -53,6 +58,7 @@ import {
 import { getDelegateTimeoutReason, resolveDelegateTimeoutConfig } from './delegateTimeout.js'
 import {
   DelegateJobStore,
+  DELEGATE_LEASE_HEARTBEAT_ABSOLUTE_MAX_BEATS,
   DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
   DELEGATE_LEASE_HEARTBEAT_MS,
   resolveDelegateJobTtlMs,
@@ -89,11 +95,23 @@ import {
   type DelegateGrokRouteLease,
 } from './delegateGrokRoute.js'
 import {
+  acquireDelegateAntigravityRoute,
+  type DelegateAntigravityRouteLease,
+} from './delegateAntigravityRoute.js'
+import {
+  _buildCodexAdmitRouteOverride,
+  _buildSafeAntigravityRouteOverride,
+} from './routeOverrides.js'
+import { parseAdvisorAdmitRoute } from './advisorCodexRoute.js'
+import type { CodexProviderConfigOverride } from './engine/codexShared.js'
+import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
+import {
   defaultDelegateEngineBilling,
   mapDelegateEngineBillingError,
   resolveDelegateEngineBillingEngine,
   shouldAdmitDelegateEngineBilling,
   type DelegateEngineBillingAdmission,
+  type DelegateEngineBillingEngine,
 } from './delegateEngineBilling.js'
 import type { DelegateOwnerTurnLocator } from './delegateLateCompletion.js'
 import { eventBus, createEvent } from './eventBus.js'
@@ -116,8 +134,11 @@ import type { DelegateGateBlock, RunDelegateInput } from './delegatePolicy.js'
 
 export interface DelegateRuntimeHost {
   _acquireDelegateGrokRoute: Gateway['_acquireDelegateGrokRoute']
+  _acquireDelegateAntigravityRoute: Gateway['_acquireDelegateAntigravityRoute']
   _activeDelegations: Gateway['_activeDelegations']
   _activeDelegationsByParent: Gateway['_activeDelegationsByParent']
+  _interruptDelegationsForParent: Gateway['_interruptDelegationsForParent']
+  _settlePendingPermissionsForStop: Gateway['_settlePendingPermissionsForStop']
   _activeSendToAgentCallbacks: Gateway['_activeSendToAgentCallbacks']
   _admitDelegateCreate: Gateway['_admitDelegateCreate']
   _applyDelegateCapacityReject: Gateway['_applyDelegateCapacityReject']
@@ -144,6 +165,7 @@ export interface DelegateRuntimeHost {
   _dropDelegateInflightSurface: Gateway['_dropDelegateInflightSurface']
   _ensureDelegateInflightSurface: Gateway['_ensureDelegateInflightSurface']
   _ensureDelegateJobStore: Gateway['_ensureDelegateJobStore']
+  _ensureDurableSendToAgentCallback: Gateway['_ensureDurableSendToAgentCallback']
   _forgetDelegateInflight: Gateway['_forgetDelegateInflight']
   _forgetEvictedDelegateResumes: Gateway['_forgetEvictedDelegateResumes']
   _formatDelegateConcurrencyReject: Gateway['_formatDelegateConcurrencyReject']
@@ -290,6 +312,7 @@ export type DelegateTaskResult =
       message: string
       code?: LocalExecutionRejectCode
       failureClass?: DelegateFailureClass
+      cancelled?: boolean
       /** Capacity reject lost the race to claimQueued; job is already dispatched. */
       alreadyDispatched?: boolean
     }
@@ -300,6 +323,8 @@ export type DelegateTaskResult =
       output: string
       error?: string
       timedOut: boolean
+      cancelled?: boolean
+      actualModel?: string
       runId: string
       verdict?: ReviewVerdict
       /** 从内存 session 抄的用量。taskboard 回写 run;普通 delegate 可忽略。 */
@@ -463,9 +488,13 @@ export type ResolveDelegateParentResult = {
   workspaceMode: 'legacy' | 'isolated_v1'
   billingParentTurnKey?: string
   platformGoal?: GoalStateSnapshot | null
+  workspaceCwd?: string
+  projectId?: string | null
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
 } | null
 
 export type ResolveDelegateParentArgs = {
+    taskboardControl?: TaskboardRunControl
     parentSessionKey?: unknown
     sourceAgent?: unknown
   }
@@ -477,7 +506,8 @@ export function _resolveDelegateParent(
   if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
   const parent = this.sessions.getByKey(args.parentSessionKey)
   if (!parent) return null
-  if (parent.channel !== 'webchat' && parent.channel !== 'delegate') return null
+  if (parent.channel !== 'webchat' && parent.channel !== 'delegate' &&
+      !(parent.channel === 'taskboard' && args.taskboardControl && taskboardRunControls.lookup(parent.sessionKey)?.control === args.taskboardControl)) return null
   if (
     typeof args.sourceAgent === 'string' &&
     args.sourceAgent &&
@@ -502,6 +532,7 @@ export function _resolveDelegateParent(
     // tape/anchor of its own.
     billingParentTurnKey: parent._billingParentTurnKey ?? parent._currentTurnKey,
     platformGoal: parent._platformGoal,
+    ...(args.taskboardControl ? { workspaceCwd: parent.workspaceCwd, projectId: parent.projectId, frozenProjectContext: parent.frozenProjectContext } : {}),
   }
 }
 
@@ -553,7 +584,17 @@ export async function handleDelegateTask(
   targetAgentId: string,
 ): Promise<void> {
   if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-  const body = await this.readBody(req)
+  const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
+  const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader
+  const entryContext = typeof contextRaw === 'string' ? verifyDelegateContextToken(contextRaw) : null
+  const taskboardBinding = entryContext ? taskboardRunControls.lookup(entryContext.sessionKey) : undefined
+  if (taskboardBinding?.closed) return this.sendJson(res, 409, { error: 'USER_CANCELLED: task execution has finished', code: 'USER_CANCELLED', failure_class: 'cancelled' })
+  const taskboardControl = taskboardBinding?.control ?? undefined
+  let leavePending: (() => void) | undefined
+  try {
+    leavePending = taskboardControl?.enterPending(entryContext!.sessionKey)
+  const parentTraceId = entryContext?.traceId
+  const body = await readTaskboardDelegateBody(req, (request) => this.readBody(request), taskboardControl)
   let parsed: any
   try {
     parsed = JSON.parse(body)
@@ -596,8 +637,6 @@ export async function handleDelegateTask(
     }
   }
   const depthHeader = req.headers['x-delegation-depth']
-  const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
-  const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader
   const boundContext =
     typeof contextRaw === 'string' && contextRaw.trim()
       ? verifyDelegateContextToken(contextRaw)
@@ -635,7 +674,11 @@ export async function handleDelegateTask(
     : typeof sourceAgent === 'string'
       ? sourceAgent
       : undefined
+  if (!entryContext && parentSessionKey && taskboardRunControls.lookup(parentSessionKey)) {
+    return this.sendError(res, 403, 'taskboard delegation requires signed caller context')
+  }
   const identityProjection = await fetchIdentityCompatProjection()
+  taskboardControl?.assertOpen(parentSessionKey)
   const callerExecutionId =
     identityProjection && sourceAgentId
       ? resolveIdentityCompat(sourceAgentId, identityProjection).executionAgentId
@@ -685,6 +728,7 @@ export async function handleDelegateTask(
     ? this._resolveDelegateProgressTarget({ parentSessionKey, sourceAgent: sourceAgentId })?.target
     : undefined
   const runInput: RunDelegateInput = {
+    taskboardControl,
     allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
     targetAgentId,
     goal,
@@ -692,6 +736,7 @@ export async function handleDelegateTask(
     sourceAgent: sourceAgentId,
     toolsets,
     parentSessionKey,
+    parentTraceId,
     streamProgress: parsed.streamProgress === true,
     depth,
     effort,
@@ -747,6 +792,7 @@ export async function handleDelegateTask(
     const created = store.create(targetAgentId, {
       sessionKey: resume.sessionKey,
       parentSessionKey,
+      parentTraceId,
       queued: sm,
       kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
       callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
@@ -904,6 +950,13 @@ export async function handleDelegateTask(
   const result = await this._runDelegateTask(runInput)
   const mapped = this._delegateResultToHttp(result, targetAgentId)
   return this.sendJson(res, mapped.httpStatus, mapped.body)
+  } catch (err) {
+    if (err instanceof TaskboardBodyTimeoutError) return this.sendError(res, 408, err.message)
+    if (err instanceof TaskboardCancelledError) return this.sendJson(res, 409, { error: err.message, code: err.code, failure_class: 'cancelled' })
+    throw err
+  } finally {
+    leavePending?.()
+  }
 }
 
 export function _delegateResultToHttp(
@@ -963,10 +1016,23 @@ export async function handleDelegateWait(
   const waitMs = resolveDelegateWaitMs(parsed.waitMs)
   const store = this._ensureDelegateJobStore()
   const view = await store.wait(jobId, waitMs)
+  // A timed-out/reset HTTP reader must not silently consume a later terminal.
+  if (res.destroyed) return
+  if (parsed.handoffOnRunning === true && (view.status === 'running' || view.status === 'queued')) {
+    if (await handoffDelegateWait(this, req, jobId, parsed.goal)) {
+      return this.sendJson(res, 200, { status: 'deferred', jobId })
+    }
+  }
   if (view.status === 'done' || view.status === 'failed') {
     // The parent read this result in-turn; turn-end adoption must not
     // resume-inject it a second time.
     try {
+      const live = store.snapshotOf(jobId)
+      // Once handed off, callback delivery owns the result. A stale waiter
+      // cannot cancel that delivery or return the same terminal in stdout.
+      if (live?.kind === 'delegate' && live.callback === 'origin-inject' && live.callbackOriginSessionKey) {
+        return this.sendJson(res, 200, { status: 'deferred', jobId })
+      }
       store.markResultConsumed(jobId)
     } catch (err) {
       this.log.warn('delegate wait consume mark failed', { jobId }, err as Error)
@@ -1021,22 +1087,52 @@ export async function _runDelegateTask(
   input: RunDelegateInput,
 ): Promise<DelegateTaskResult> {
   let sessionSpawned = false
+  let leave: (() => void) | undefined
+  let detachStop: (() => void) | undefined
   try {
-    const result = await this._runDelegateTaskCore(input, {
-      onSessionSpawned: () => {
-        sessionSpawned = true
-      },
-    })
-    if (result.kind === 'completed' && input.resumable && input.sessionKey) {
-      return { ...result, sessionKey: input.sessionKey }
+    const binding = input.parentSessionKey ? taskboardRunControls.lookup(input.parentSessionKey) : undefined
+    if (binding?.closed) throw new TaskboardCancelledError()
+    const control = input.taskboardControl ?? binding?.control ?? undefined
+    if (control) {
+      input.taskboardControl = control
+      input.sessionKey ??= `agent:${input.targetAgentId}:delegate:${input.sourceAgent || 'system'}:${Date.now()}-${randomBytes(4).toString('hex')}`
+      const key = input.sessionKey
+      leave = control.enter(key, key === control.rootSessionKey ? undefined : input.parentSessionKey)
+      const stop = () => {
+        cancelDelegateTraceWait(this, key)
+        this._delegateQueueWaiters?.get(key)?.()
+        try { this._settlePendingPermissionsForStop(key) } catch (err) { this.log.warn('taskboard stop permission cleanup failed', { sessionKey: key, err: String(err) }) }
+        this._interruptDelegationsForParent(key)
+        if (this.sessions.getByKey(key)) this.sessions.interrupt(key, 'user')
+      }
+      control.signal.addEventListener('abort', stop, { once: true })
+      detachStop = () => control.signal.removeEventListener('abort', stop)
+      control.assertOpen()
     }
+    const result = await this._runDelegateTaskCore(input, {
+      onSessionSpawned: () => { sessionSpawned = true },
+    })
+    if (result.kind === 'completed' && control && input.sessionKey) {
+      control.recordResult({ executionId: result.runId, sessionKey: input.sessionKey, agentId: input.targetAgentId, actualModel: result.actualModel, output: result.output, error: result.error, cancelled: result.cancelled, tokensIn: result.tokensIn, tokensOut: result.tokensOut, costUsd: result.costUsd, costImprecise: result.costImprecise })
+    }
+    if (result.kind === 'completed' && input.resumable && input.sessionKey) return { ...result, sessionKey: input.sessionKey }
     return result
+  } catch (err) {
+    if (err instanceof TaskboardCancelledError) return { kind: 'rejected', httpStatus: 409, message: err.message, failureClass: 'cancelled', cancelled: true }
+    throw err
   } finally {
     if (input._leaseTimer) clearInterval(input._leaseTimer)
-    // 任何早退(rejected return 或 throw)都在这里归还 SM 预占的槽位/waiter;过闸后
-    // 预占已被消费(core 内清 flag),此调用为空操作 → 不会双重释放。
-    this._releasePreadmittedDelegateCapacity(input)
-    await this._completeDelegateResumeClaim(input, sessionSpawned)
+    try {
+      this._releasePreadmittedDelegateCapacity(input)
+      await this._completeDelegateResumeClaim(input, sessionSpawned)
+    } finally {
+      if (input.delegationGuardOwnerKey) {
+        this._hiddenDelegateGuard.resetForParent(input.delegationGuardOwnerKey)
+        this._memberDelegateGuard?.resetForParent(input.delegationGuardOwnerKey)
+      }
+      detachStop?.()
+      leave?.()
+    }
   }
 }
 
@@ -1045,10 +1141,23 @@ export async function _runDelegateTaskCore(
   input: RunDelegateInput,
   hooks?: { onSessionSpawned?: () => void },
 ): Promise<DelegateTaskResult> {
+  const cancelledBeforeSpawn: DelegateTaskResult = { kind: 'rejected', httpStatus: 409, message: 'USER_CANCELLED: stopped before model execution', failureClass: 'cancelled', cancelled: true }
+  input.taskboardControl?.assertOpen()
   const { targetAgentId, goal, sourceAgent, toolsets, depth } = input
   let context = input.context
   let isReview = input.isReview === true
   const parentSessionKey = input.parentSessionKey
+  const launchOwnerSession =
+    typeof parentSessionKey === 'string' && parentSessionKey
+      ? this.sessions.getByKey(parentSessionKey)
+      : undefined
+  const launchOwnerTurnKey =
+    launchOwnerSession?._billingParentTurnKey ?? launchOwnerSession?._currentTurnKey
+  const launchOwnerTurnIndex =
+    launchOwnerSession?._currentTurnIndex ??
+    (launchOwnerSession && Number.isSafeInteger(launchOwnerSession.turns)
+      ? Math.max(1, launchOwnerSession.turns + 1)
+      : undefined)
   /** 审查员本次执行型号(2026-09-04:必须 ≠ 队长/panel 家族;选不出则沿用成员默认绑定)。 */
   let reviewerModelOverride: string | undefined
   let reviewMode: TeamReviewMode = 'execution'
@@ -1125,7 +1234,9 @@ export async function _runDelegateTaskCore(
 
   // Find target agent
   const cfg = await this._getAgentsConfig()
+  input.taskboardControl?.assertOpen()
   const identityProjection = await fetchIdentityCompatProjection()
+  input.taskboardControl?.assertOpen()
   const targetIdentity = identityProjection
     ? resolveIdentityCompat(targetAgentId, identityProjection)
     : undefined
@@ -1187,7 +1298,10 @@ export async function _runDelegateTaskCore(
   // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
   // 审查委派:调用方 model 忽略,改用 gateway 按「≠ 队长 / ≠ panel 家族」选出的审查员型号
   // (选不出 → undefined → 沿用 hidden-reviewer 成员绑定)。
-  const requestedModel = isReview ? reviewerModelOverride : input.model
+  const taskboardDefault = input.modelPolicy === 'taskboard-stage-agent-auto' &&
+    delegatedAgent.model && delegatedAgent.model !== AGENT_MODEL_AUTO
+    ? delegatedAgent.model : undefined
+  const requestedModel = isReview ? reviewerModelOverride : input.model || taskboardDefault
   let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
   let delegateExec: LocalExecutionDecision | undefined
   // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
@@ -1220,10 +1334,10 @@ export async function _runDelegateTaskCore(
   // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。本地预检拒绝不占额度;预检通过后
   // 已启动的失败/超时仍占额度。本闸先于资源闸排队:per-turn 额度等不出来 fail
   // fast、不占等待名额(保守偏置)。
-  const delegateGuardKey =
+  const delegateGuardKey = input.delegationGuardOwnerKey || (
     typeof parentSessionKey === 'string' && parentSessionKey
       ? parentSessionKey
-      : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
+      : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`)
   if (isTeamReviewExecution(targetAgentId)) {
     const hiddenLimit = resolveHiddenDelegationsPerTurn()
     if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
@@ -1256,6 +1370,7 @@ export async function _runDelegateTaskCore(
     }
   }
 
+  input.taskboardControl?.assertOpen()
   const sessionKey =
     input.sessionKey ?? `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
   this.log.info('delegate', {
@@ -1274,16 +1389,21 @@ export async function _runDelegateTaskCore(
   // 嵌套(二级+):直接父是 delegate 会话 → 进度要挂到用户可见的一级委派卡,而非
   // 另开一张卡或(旧行为)整段丢弃。
   const nestedProgress = progressRouting?.nested === true
-  const delegateParent = this._resolveDelegateParent({
+  const rawDelegateParent = this._resolveDelegateParent({
+    taskboardControl: input.taskboardControl,
     parentSessionKey,
     sourceAgent,
   })
+  const delegateParent =
+    rawDelegateParent && !rawDelegateParent.billingParentTurnKey && launchOwnerTurnKey
+      ? { ...rawDelegateParent, billingParentTurnKey: launchOwnerTurnKey }
+      : rawDelegateParent
   // delegate 计费归因:父**客户端**会话 id(web-*)优先,拿不到才落容器内部
   // parentSessionKey(解析链见 resolveDelegateParentClientSessionId JSDoc)。
   // 随 usageAttribution → runner CLAUDE_CODE_EXTRA_METADATA env → master 计费点
   // 落 usage_records.mode='delegate' / parent_session_id / delegate_agent_id,
   // hidden-reviewer 与嵌套 delegate 同路径打标。
-  const parentClientSessionId = resolveDelegateParentClientSessionId({
+  const parentClientSessionId = input.taskboardControl?.rootSessionKey ?? resolveDelegateParentClientSessionId({
     progressPeerId: progressTarget?.peerId,
     parentRepoSessionId: delegateParent?.repoSessionId,
     parentSessionKey,
@@ -1297,15 +1417,25 @@ export async function _runDelegateTaskCore(
   // (= progressTarget.peerId),保证账务 locator 与 tape sessionId 一致。
   const delegateOwnerLocator: DelegateOwnerTurnLocator | undefined = progressTarget
     ? (() => {
+        if (nestedProgress && progressRouting?.firstLevelRunId) {
+          const inherited = this._delegateOwnerByRunId?.get(progressRouting.firstLevelRunId)
+          if (inherited) return inherited
+        }
         const ownerSession = this.sessions.getByKey(progressTarget.sessionKey)
-        const ownerTurnKey = ownerSession?._currentTurnKey
-        if (!ownerSession || !ownerTurnKey) return undefined
+        const currentTurnKey = ownerSession?._currentTurnKey
+        const ownerTurnKey = nestedProgress
+          ? delegateParent?.billingParentTurnKey ?? currentTurnKey
+          : launchOwnerTurnKey ?? currentTurnKey
+        if (!ownerTurnKey) return undefined
+        const currentMatchesOwner = Boolean(currentTurnKey && currentTurnKey === ownerTurnKey)
         return {
           parentSessionId: progressTarget.peerId,
           parentTurnKey: ownerTurnKey,
           turnIndex:
-            ownerSession._currentTurnIndex ??
-            (Number.isSafeInteger(ownerSession.turns) ? Math.max(1, ownerSession.turns + 1) : 1),
+            (currentMatchesOwner ? ownerSession?._currentTurnIndex : launchOwnerTurnIndex) ??
+            (ownerSession && Number.isSafeInteger(ownerSession.turns)
+              ? Math.max(1, ownerSession.turns + 1)
+              : 1),
         }
       })()
     : undefined
@@ -1340,6 +1470,35 @@ export async function _runDelegateTaskCore(
   const nestLabel = nestedProgress
     ? [...(progressRouting?.ancestorAgentPath ?? []), targetAgentId].join('↳')
     : ''
+  const expectedOwnerTurnKey =
+    delegateOwnerLocator?.parentTurnKey ??
+    (nestedProgress ? delegateParent?.billingParentTurnKey : undefined) ??
+    launchOwnerTurnKey
+  const isBackgroundOriginInject = (() => {
+    if (input.callbackOnComplete === 'origin-inject') return true
+    if (
+      input.backgroundJobId &&
+      this._delegateJobs?.snapshotOf(input.backgroundJobId)?.callback === 'origin-inject'
+    ) {
+      return true
+    }
+    if (nestedProgress && this._delegateJobs && typeof parentSessionKey === 'string') {
+      const activeOriginInjectKeys = new Set(
+        this._delegateJobs
+          .listNonTerminal()
+          .filter((j) => j.callback === 'origin-inject' && typeof j.sessionKey === 'string')
+          .map((j) => j.sessionKey as string),
+      )
+      if (activeOriginInjectKeys.size > 0) {
+        let curKey: string | undefined = parentSessionKey
+        for (let hop = 0; hop < 5 && curKey; hop++) {
+          if (activeOriginInjectKeys.has(curKey)) return true
+          curKey = this.sessions.getByKey(curKey)?.parentSessionKey
+        }
+      }
+    }
+    return false
+  })()
   // Live lookup each emit: a retry may have moved the parent cmid, and a
   // terminated parent must not keep receiving dispatch:<old>:N frames.
   const emitProgress = (block: DelegateProgressBlock | null) => {
@@ -1355,8 +1514,13 @@ export async function _runDelegateTaskCore(
       : block
     if (!outBlock) return
     const parentSession = this.sessions.getByKey(progressTarget.sessionKey)
-    const liveCmid =
-      parentSession?._runningClientMessageId ?? parentSession?._currentDispatch?.clientMessageId
+    const sameOwnerTurn = expectedOwnerTurnKey
+      ? parentSession?._currentTurnKey === expectedOwnerTurnKey &&
+        !parentSession?._sealedOwnerTurnKeys?.has(expectedOwnerTurnKey)
+      : parentSession?._currentTurnKey === undefined
+    const liveCmid = sameOwnerTurn
+      ? (parentSession?._runningClientMessageId ?? parentSession?._currentDispatch?.clientMessageId)
+      : undefined
     const binding = resolveDelegateProgressBinding({
       candidate: typeof liveCmid === 'string' ? liveCmid : undefined,
       isFenced: (cmid) =>
@@ -1382,17 +1546,20 @@ export async function _runDelegateTaskCore(
       parallelCount: this._activeDelegationsByParent.get(progressTarget.sessionKey)?.size,
     })
     if (liveDetail) {
-      this.deliver(
-        _buildTurnStatusFrame(
-          {
-            sessionKey: progressTarget.sessionKey,
-            channel: progressTarget.channel,
-            peer: { id: progressTarget.peerId, kind: 'dm' },
-            ...(progressTarget.userId ? { _userId: progressTarget.userId } : {}),
-          },
-          { status: 'working', detail: liveDetail },
-        ),
-      )
+      if (sameOwnerTurn && !isBackgroundOriginInject) {
+        this.deliver(
+          _buildTurnStatusFrame(
+            {
+              sessionKey: progressTarget.sessionKey,
+              channel: progressTarget.channel,
+              peer: { id: progressTarget.peerId, kind: 'dm' },
+              ...(binding.clientMessageId ? { clientMessageId: binding.clientMessageId } : {}),
+              ...(progressTarget.userId ? { _userId: progressTarget.userId } : {}),
+            },
+            { status: 'working', detail: liveDetail },
+          ),
+        )
+      }
     }
     this._touchDelegateInflightSurface({
       // Nested progress hangs on the first-level card: never let the child's
@@ -1431,6 +1598,12 @@ export async function _runDelegateTaskCore(
     delegateParent?.sessionKey,
     sessionKey,
   )
+  if (input.taskboardControl?.signal.aborted) {
+    unregisterDelegation?.()
+    this._delegateOwnerByRunId?.delete(progressRunId)
+    await input.taskboardControl.waitForDescendants(sessionKey)
+    return cancelledBeforeSpawn
+  }
   let queuedNoticeSent = false
   // 过闸即接管:预占槽位的释放责任从 input(早退 finally)转到本函数的 slotOpts 释放路径;
   // 'wait' 预占的 waiter 条目由 _waitForDelegateCapacity 自己的 finally 删除。
@@ -1532,6 +1705,26 @@ export async function _runDelegateTaskCore(
       drop: gate.status === 'queue_full',
     })
   }
+  const cancelPreparation = async (
+    route?: DelegateGrokRouteLease | null,
+    admission?: DelegateEngineBillingAdmission | null,
+    antigravity?: DelegateAntigravityRouteLease | null,
+  ): Promise<DelegateTaskResult> => {
+    try {
+      await input.taskboardControl?.waitForDescendants(sessionKey)
+      if (admission) await (this._delegateEngineBilling ?? defaultDelegateEngineBilling).abandon(admission.requestId).catch(() => {})
+      if (route) await route.release()
+      if (antigravity) await antigravity.release()
+      return cancelledBeforeSpawn
+    } finally {
+      this._delegateOwnerByRunId?.delete(progressRunId)
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+    }
+  }
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
+  let idleLeaseBeats = 0
+  let totalLeaseBeats = 0
   if (isDelegateSmEnabled() && input.backgroundJobId) {
     const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
     if (!claimed?.ok) {
@@ -1567,10 +1760,12 @@ export async function _runDelegateTaskCore(
     const tok = claimed.claimToken
     const epoch = claimed.fencingEpoch
     const jobId = input.backgroundJobId
-    let beats = 0
     const timer = setInterval(() => {
-      beats += 1
-      const capHit = beats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS
+      idleLeaseBeats += 1
+      totalLeaseBeats += 1
+      const capHit =
+        idleLeaseBeats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS ||
+        totalLeaseBeats > DELEGATE_LEASE_HEARTBEAT_ABSOLUTE_MAX_BEATS
       const ok = !capHit && this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
       if (!ok) {
         clearInterval(timer)
@@ -1604,6 +1799,46 @@ export async function _runDelegateTaskCore(
     timer.unref()
     input._leaseTimer = timer
   }
+  const jobSnapshot = input.backgroundJobId ? this._delegateJobs?.snapshotOf(input.backgroundJobId) : undefined
+  input.traceId = jobSnapshot?.traceId ?? input.traceId
+  if (jobSnapshot) input.parentTraceId = jobSnapshot.parentTraceId
+  let traceMissingReason = 'master-trace-not-configured'
+  if (!input.traceId) {
+    let traceAborted = false
+    const traceWait = registerDelegateTraceWait(this, sessionKey)
+    const fence = input.claimToken && input.fencingEpoch !== undefined
+      ? { claimToken: input.claimToken, fencingEpoch: input.fencingEpoch }
+      : jobSnapshot?.claimToken ? { claimToken: jobSnapshot.claimToken, fencingEpoch: jobSnapshot.fencingEpoch } : undefined
+    try {
+      const trace = await mintDelegateTrace({
+        sessionKey, agentId: targetAgentId, delegateRunId: input.backgroundJobId ?? progressRunId,
+        parentTraceId: input.parentTraceId, model: delegateExec?.canonicalModel ?? requestedModel,
+      })
+      if (!traceWait.isAborted() && trace) {
+        if (input.backgroundJobId && (!fence || !this._delegateJobs?.bindTrace(input.backgroundJobId, trace, fence))) {
+          traceAborted = true
+        } else input.traceId = trace.traceId
+      }
+    } catch {
+      traceMissingReason = 'master-trace-unavailable'
+    } finally {
+      traceWait.close()
+    }
+    // Every mint outcome (including timeout/unconfigured) must recheck the owner.
+    const current = input.backgroundJobId ? this._delegateJobs?.snapshotOf(input.backgroundJobId) : undefined
+    if (input.backgroundJobId && (!current || current.state !== 'running' || !fence ||
+        current.claimToken !== fence.claimToken || current.fencingEpoch !== fence.fencingEpoch)) traceAborted = true
+    if (traceAborted || traceWait.isAborted() || this._shuttingDown || input.taskboardControl?.signal.aborted) {
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return { kind: 'rejected', httpStatus: 409, message: 'delegate cancelled before spawn', failureClass: 'cancelled' }
+    }
+  }
+  if (!input.traceId) this.log.warn('delegate_trace_unbound', {
+    parentTraceId: input.parentTraceId, delegateRunId: input.backgroundJobId ?? progressRunId,
+    reason: traceMissingReason,
+  })
   // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
   // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
   // GrokAdapter 在 spawn 前 fail-closed(GROK_ROUTE_REQUIRED)。放在资源闸之后:
@@ -1619,6 +1854,7 @@ export async function _runDelegateTaskCore(
     requestedModel,
     agentModel: execAgent.model,
   })
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
   let grokRoute: { baseUrl: string; routeToken: string } | null = null
   let grokRouteLease: DelegateGrokRouteLease | null = null
   if (grokDelegate) {
@@ -1636,6 +1872,7 @@ export async function _runDelegateTaskCore(
       sessionId: sessionKey,
       log: this.log,
     })
+    if (input.taskboardControl?.signal.aborted) return cancelPreparation(acquired.ok ? acquired.lease : null)
     if (!acquired.ok && !requestedModel) {
       // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
       // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
@@ -1694,6 +1931,7 @@ export async function _runDelegateTaskCore(
   // engine-reported (codex/grok) 委派必须先向 master 签 32-hex requestId +
   // inflight journal,否则 adapter 不 emit billing,usage_records.mode=delegate
   // 永远为空。CCB/GLM 走 anthropicProxy,不进这条。失败 fail-closed,禁止白跑。
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease)
   const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
   const engineReported = shouldAdmitDelegateEngineBilling({
     delegateEngine: delegateExec?.engine,
@@ -1701,10 +1939,18 @@ export async function _runDelegateTaskCore(
     agentModel: execAgent.model,
   })
   let engineBillingAdmission: DelegateEngineBillingAdmission | null = null
+  let billingModel: string | undefined
+  let billingEngine: DelegateEngineBillingEngine | undefined
   let liveEngineBilling: DurableCodexBilling | null = null
   let liveSettleTask: Promise<void> | null = null
+  // OCV5-738 blocker 1: the antigravity adapter's own external_billing
+  // terminal event is authoritative over a generic error-string guess
+  // (e.g. budgetStop reports status:'success' even though the turn's
+  // error string is non-empty, because the usage already consumed up to
+  // the budget cutoff must still be billed, clamped to balance by master).
+  let liveExternalBilling = null as { status: 'success' | 'error' | 'unavailable'; terminalCode?: string } | null
   if (engineReported) {
-    const billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
+    billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
     if (!billingModel) {
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
@@ -1715,14 +1961,15 @@ export async function _runDelegateTaskCore(
         message: 'engine-reported 委派暂不可用: missing model id',
       }
     }
+    billingEngine = resolveDelegateEngineBillingEngine({
+      delegateEngine: delegateExec?.engine,
+      model: billingModel,
+    })
     try {
       engineBillingAdmission = await billingApi.admit({
         model: billingModel,
         ...(grokRoute ? { grokRouteToken: grokRoute.routeToken } : {}),
-        engine: resolveDelegateEngineBillingEngine({
-          delegateEngine: delegateExec?.engine,
-          model: billingModel,
-        }),
+        engine: billingEngine,
         agentId: targetAgentId,
         delegateAgentId: targetAgentId,
         sessionKey,
@@ -1748,6 +1995,111 @@ export async function _runDelegateTaskCore(
       }
     }
   }
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
+  // codex 委派必须有 master 签发的 provider route(OCV5-729):容器里的 codex
+  // CLI 没有任何 baked `model_providers.*`,裸起会退回内建 `openai` provider
+  // 的 workspace routing discovery,被 relay allowlist 404 → 整轮失败。route
+  // 由 master admit 签发并绑定本容器/用户/模型;不可用即 fail-closed,禁止裸起。
+  let codexRoute: CodexProviderConfigOverride | null = null
+  if (billingEngine === 'codex' && engineBillingAdmission && billingModel) {
+    const parsedRoute = parseAdvisorAdmitRoute(engineBillingAdmission.route)
+    codexRoute = parsedRoute.ok
+      ? _buildCodexAdmitRouteOverride({
+          route: parsedRoute.route,
+          agentId: targetAgentId,
+          model: billingModel,
+          officialRelayPort: this.deps.config.gateway.port,
+          ...(delegateExec?.engine === 'codex' && delegateExec.canonicalModel
+            ? {
+                authority: {
+                  canonicalModel: delegateExec.canonicalModel,
+                  engine: 'codex' as const,
+                },
+              }
+            : {}),
+        })
+      : null
+    if (!codexRoute) {
+      this.log.warn('delegate_codex_route_unavailable', {
+        targetAgentId,
+        model: billingModel,
+        reason: parsedRoute.ok ? 'projection_failed' : parsedRoute.reason,
+      })
+      await (this._delegateEngineBilling ?? defaultDelegateEngineBilling)
+        .abandon(engineBillingAdmission.requestId)
+        .catch(() => {})
+      // Audit follow-up on PR #1371: a fail-closed return must not leave the
+      // admission lease heartbeat running (compare the normal end path).
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return {
+        kind: 'rejected',
+        httpStatus: 503,
+        message: 'Codex 委派路由不可用（master 未签发 provider route），未启动',
+      }
+    }
+  }
+  // antigravity 委派同样必须有 master 签发的 relay route(OCV5-738):容器本地
+  // turn 没有 bridge 注入 __oc_antigravity_route,adapter 在 spawn 前就
+  // ANTIGRAVITY_ROUTE_REQUIRED。route 由 master 绑定本次 admit 的 requestId
+  // 签发;不可用即 abandon + 释放名额 + fail-closed,禁止裸起。
+  let antigravityRoute: AntigravityRouteOverride | null = null
+  let antigravityRouteLease: DelegateAntigravityRouteLease | null = null
+  if (billingEngine === 'antigravity' && engineBillingAdmission) {
+    const acquired = await (
+      this._acquireDelegateAntigravityRoute ?? acquireDelegateAntigravityRoute
+    )({
+      requestId: engineBillingAdmission.requestId,
+      log: this.log,
+    })
+    if (input.taskboardControl?.signal.aborted) {
+      if (acquired.ok) await acquired.lease.release().catch(() => {})
+      return cancelPreparation(grokRouteLease, engineBillingAdmission)
+    }
+    if (acquired.ok) {
+      // Mirror chat's inbound projection: the agent/model pair already resolves
+      // to the antigravity engine; authority is only added when the catalog
+      // pinned a canonical model, so a catalog-less selfhost deployment (no
+      // OC_MODEL_AUTHORITY) still passes the master-issued route through.
+      antigravityRoute = _buildSafeAntigravityRouteOverride({
+        agent: delegatedAgent,
+        model: billingModel ?? delegateExec?.canonicalModel,
+        rawRoute: acquired.lease.route,
+        officialRelayPort: this.deps.config.gateway.port,
+        ...(delegateExec?.canonicalModel
+          ? {
+              authority: {
+                canonicalModel: delegateExec.canonicalModel,
+                engine: 'antigravity' as const,
+              },
+            }
+          : {}),
+      })
+    }
+    if (!acquired.ok || !antigravityRoute) {
+      const reason = acquired.ok ? 'projection_failed' : acquired.reason
+      const httpStatus = acquired.ok ? 503 : acquired.httpStatus
+      this.log.warn('delegate_antigravity_route_unavailable', {
+        targetAgentId,
+        model: billingModel,
+        reason,
+      })
+      if (acquired.ok) await acquired.lease.release().catch(() => {})
+      await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return {
+        kind: 'rejected',
+        httpStatus,
+        message: `Antigravity 委派暂不可用（master 未签发 relay route）: ${reason}`,
+      }
+    }
+    antigravityRouteLease = acquired.lease
+  }
   // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
   // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
   const durableTranscript: unknown[] = []
@@ -1757,6 +2109,8 @@ export async function _runDelegateTaskCore(
   let lastChildActivityAt = Date.now()
   const markChildActivity = () => {
     lastChildActivityAt = Date.now()
+    idleLeaseBeats = 0
+    if (session?.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
   }
   let session: AgentSession
   let detachAncestorActivity: (() => void) | undefined
@@ -1771,10 +2125,10 @@ export async function _runDelegateTaskCore(
       peerId: sourceAgent || 'system',
       repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
       workspaceMode: delegateParent?.workspaceMode,
-      workspaceCwd: input.workspaceCwd,
-      projectId: input.projectId,
+      workspaceCwd: input.workspaceCwd ?? delegateParent?.workspaceCwd,
+      projectId: input.projectId ?? delegateParent?.projectId ?? undefined,
       runContext: input.runContext,
-      frozenProjectContext: input.frozenProjectContext,
+      frozenProjectContext: input.frozenProjectContext ?? delegateParent?.frozenProjectContext,
       // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
       parentSessionKey: delegateParent?.sessionKey,
       title: `[delegate] ${goal.slice(0, 40)}`,
@@ -1788,7 +2142,12 @@ export async function _runDelegateTaskCore(
           : {}),
       },
     })
+    if (input.taskboardControl?.signal.aborted) {
+      await this.sessions.destroySession(sessionKey)
+      return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease)
+    }
     hooks?.onSessionSpawned?.()
+    if (session.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
     session._durableDelegateTranscript = durableTranscript
     session._durableDelegateRuntimeEvents = durableRuntimeEvents
     session._durableDelegateEngineBillings = durableEngineBillings
@@ -1837,6 +2196,7 @@ export async function _runDelegateTaskCore(
       await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
     }
     if (grokRouteLease) grokRouteLease.release().catch(() => {})
+    if (antigravityRouteLease) antigravityRouteLease.release().catch(() => {})
     this._releaseDelegateSlot(slotOpts)
     unregisterDelegation?.()
     // flag 未开时 resolveLocalExecutionIfEnforced 是 no-op,显式未知型号在
@@ -1876,6 +2236,13 @@ export async function _runDelegateTaskCore(
       ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
       : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`) + artifactDiscipline
 
+  const ownBaseline = input.taskboardControl ? {
+    input: session.totalInputTokens ?? 0,
+    output: session.totalOutputTokens ?? 0,
+    cost: (session.totalCostUSD ?? 0) > 0 || !(session.totalInputTokens || session.totalOutputTokens)
+      ? session.totalCostUSD ?? 0 : null,
+    imprecise: session.costImprecise === true,
+  } : undefined
   const _dlgRun = this._runLog.start({
     agentId: targetAgentId,
     sessionKey,
@@ -1885,6 +2252,7 @@ export async function _runDelegateTaskCore(
   let output = ''
   let error = ''
   let timedOut = false
+  let cancelled = false
   // P2 债C — review 委派结束时从审查输出解析出的结构化裁决(PASS/NEEDS_FIX);
   // 非 review / 解析不出 → undefined(编排据 undefined 走降级放行)。
   let verdict: ReviewVerdict | undefined
@@ -1907,6 +2275,13 @@ export async function _runDelegateTaskCore(
       reject(err)
     }, timeoutConfig.checkIntervalMs)
   })
+  if (input.taskboardControl?.signal.aborted) {
+    clearTimeoutTimer()
+    detachAncestorActivity?.()
+    await this.sessions.destroySession(sessionKey)
+    return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease)
+  }
+  const turnStartedAt = Date.now()
   const submitPromise = this.sessions.submit(
     session,
     prompt,
@@ -1964,6 +2339,10 @@ export async function _runDelegateTaskCore(
             })
           })
         }
+      } else if (e.kind === 'external_billing') {
+        // OCV5-738 blocker 1 — capture the adapter's authoritative terminal
+        // status/terminalCode for the antigravity settle branch below.
+        liveExternalBilling = { status: e.status, ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}) }
       }
       const progressBlock =
         e.kind === 'usage'
@@ -1977,7 +2356,11 @@ export async function _runDelegateTaskCore(
       if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
       if (!timedOut) {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
-        if (e.kind === 'error') error = e.error
+        if (e.kind === 'error') {
+          error = e.error
+          cancelled = e.errorCode === 'user_cancelled'
+          if (cancelled && input.taskboardControl?.rootSessionKey === sessionKey) input.taskboardControl.requestStop()
+        }
         if (streamProgress) emitProgress(progressBlock)
       }
     },
@@ -1986,11 +2369,16 @@ export async function _runDelegateTaskCore(
     input.effort,
     delegateExec?.canonicalModel ?? requestedModel,
     engineBillingAdmission?.requestId,
+    input.traceId,
     undefined,
-    undefined,
-    { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}),
+    {
+      platformGoal: session._platformGoal ?? null,
       ...(engineBillingAdmission?.grokExecutionDescriptor
-        ? { grokExecutionDescriptor: engineBillingAdmission.grokExecutionDescriptor } : {}) },
+        ? { grokExecutionDescriptor: engineBillingAdmission.grokExecutionDescriptor } : {}),
+      ...(grokRoute ? { grokRoute } : {}),
+      ...(codexRoute ? { codexRoute } : {}),
+      ...(antigravityRoute ? { antigravityRoute } : {}),
+    },
   )
   try {
     await Promise.race([submitPromise, timeoutPromise])
@@ -2132,6 +2520,7 @@ export async function _runDelegateTaskCore(
     }
     this._runLog.complete(_dlgRun, { status: 'failed', error })
   } finally {
+    await input.taskboardControl?.waitForDescendants(sessionKey)
     clearTimeoutTimer()
     detachAncestorActivity?.()
     if (engineBillingAdmission) {
@@ -2140,6 +2529,39 @@ export async function _runDelegateTaskCore(
       } else if (liveEngineBilling) {
         try {
           await billingApi.settle(liveEngineBilling)
+        } catch (err) {
+          this.log.warn('delegate_engine_billing_settle_failed', {
+            targetAgentId,
+            sessionKey,
+            requestId: engineBillingAdmission.requestId,
+            err: String(err),
+          })
+        }
+      } else if (billingEngine === 'antigravity' && submitSettled) {
+        // The antigravity adapter emits no codex_billing frame: the gateway
+        // closes the turn from the terminal state it observed. Usage is
+        // server-metered by the relay, so the frame carries no token counts.
+        //
+        // OCV5-738 blocker 1 — the adapter's own external_billing terminal
+        // event is authoritative when present: a budgetStop reports
+        // status:'success' even though `error` is non-empty, because the
+        // usage already consumed up to the budget cutoff must still be
+        // billed (master clamps to balance). Falling back to the plain
+        // error-string guess would waive that already-spent usage.
+        const externalBillingStatus: 'success' | 'error' =
+          liveExternalBilling === null
+            ? error ? 'error' : 'success'
+            : liveExternalBilling.status === 'success' ? 'success' : 'error'
+        try {
+          await billingApi.settle({
+            requestId: engineBillingAdmission.requestId,
+            engineSessionId: engineBillingAdmission.engineSessionId,
+            status: externalBillingStatus,
+            durationMs: Math.max(0, Date.now() - turnStartedAt),
+            ...(liveExternalBilling?.terminalCode
+              ? { terminalCode: liveExternalBilling.terminalCode as 'USER_CANCELLED' | 'CODEX_ERROR' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE' | 'ENGINE_ERROR' }
+              : {}),
+          })
         } catch (err) {
           this.log.warn('delegate_engine_billing_settle_failed', {
             targetAgentId,
@@ -2195,6 +2617,7 @@ export async function _runDelegateTaskCore(
     // grok delegate 的 master 侧账号槽/路由上下文收尾(release 幂等且内部吞错,
     // 不会因清理失败让已完成的委派翻成失败)。
     if (grokRouteLease) await grokRouteLease.release()
+    if (antigravityRouteLease) await antigravityRouteLease.release()
     // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
     // 作为"父"再委派(hidden 审查员 / 嵌套成员);它收尾后计数键永远不会复用,
     // 两个 per-turn 计数器都清理防泄漏。注意清的是子会话自己的键,不动 delegateGuardKey
@@ -2205,12 +2628,10 @@ export async function _runDelegateTaskCore(
     // HTTP/MCP resumable 走外层 _completeDelegateResumeClaim:await retireKeepResume
     // (杀 runner,保留 resume-map),占用栅栏在退休完成前不释放。
     if (!input.resumable) {
-      this.sessions.destroySession(sessionKey).catch((err) =>
-        this.log.warn('delegate session destroy failed', {
-          sessionKey,
-          err: String(err),
-        }),
+      const destroy = this.sessions.destroySession(sessionKey).catch((err) =>
+        this.log.warn('delegate session destroy failed', { sessionKey, err: String(err) }),
       )
+      if (input.taskboardControl) await destroy
     }
   }
 
@@ -2398,6 +2819,10 @@ export async function _runDelegateTaskCore(
     ...session,
     engine: session.providerTag,
     isError: Boolean(error),
+  }).catch((err) => {
+    if (!input.taskboardControl) throw err
+    this.log.warn('taskboard reference price unavailable; preserving paid output', { sessionKey, err: String(err) })
+    return { costUsd: null, costImprecise: true }
   })
   return {
     kind: 'completed',
@@ -2408,14 +2833,16 @@ export async function _runDelegateTaskCore(
     output: output.trim(),
     error: error || undefined,
     timedOut,
+    cancelled,
+    actualModel: session.runner.model || session.model || undefined,
     runId: progressRunId,
     verdict,
     // destroySession 是 fire-and-forget,此时 session 对象还在内存,用量从这里抄。
     // usage_log 是 eventBus 异步,return 时多半还没落盘,不能只靠它。
-    tokensIn: session.totalInputTokens || null,
-    tokensOut: session.totalOutputTokens || null,
-    costUsd: priced.costUsd,
-    costImprecise: priced.costImprecise,
+    tokensIn: ownBaseline ? (session.totalInputTokens >= ownBaseline.input ? session.totalInputTokens - ownBaseline.input || null : null) : session.totalInputTokens || null,
+    tokensOut: ownBaseline ? (session.totalOutputTokens >= ownBaseline.output ? session.totalOutputTokens - ownBaseline.output || null : null) : session.totalOutputTokens || null,
+    costUsd: ownBaseline ? (priced.costUsd != null && ownBaseline.cost != null && priced.costUsd >= ownBaseline.cost ? priced.costUsd - ownBaseline.cost : null) : priced.costUsd,
+    costImprecise: priced.costImprecise || ownBaseline?.imprecise,
   }
 }
 
@@ -2432,6 +2859,9 @@ export async function _runTaskboardDelegate(
     goal: input.goal,
     context: input.context,
     sourceAgent: 'taskboard',
+    modelPolicy: 'taskboard-stage-agent-auto',
+    delegationGuardOwnerKey: `taskboard-run:${input.sessionKey}`,
+    taskboardControl: input.control,
     toolsets: input.toolsets ?? undefined,
     depth: 0,
     effort: input.effort ?? undefined,
@@ -2444,21 +2874,34 @@ export async function _runTaskboardDelegate(
     runContext: input.runContext,
     frozenProjectContext: input.frozenProjectContext,
   })
-  if (result.kind === 'rejected') {
-    return { ok: false, output: '', error: result.message }
+  await input.control?.waitForDescendants(input.sessionKey)
+  const children = input.control?.childResults() ?? []
+  const ownOutput = result.kind === 'completed' ? result.output : ''
+  const childOutput = children.map((child) => [
+    `### 子任务 · ${child.agentId}`,
+    `执行模型：${child.actualModel ?? '未记录'}${child.cancelled ? ' · 已停止' : child.error ? ' · 失败' : ' · 已完成'}`,
+    child.output,
+    child.error ? `执行说明：${child.error}` : '',
+  ].filter(Boolean).join('\n\n')).join('\n\n')
+  const output = childOutput ? `## 子任务执行记录\n\n${childOutput}\n\n---\n\n## 主任务结果\n\n${ownOutput}` : ownOutput
+  if (result.kind !== 'completed') {
+    return { ok: false, output, summaryOutput: ownOutput, error: result.message, cancelled: result.kind === 'rejected' && (result.cancelled === true || result.failureClass === 'cancelled'), usageIncludesDescendants: children.length > 0, costImprecise: true }
   }
-  if (result.kind === 'error') {
-    return { ok: false, output: '', error: result.message }
-  }
+  const members = [result, ...children]
+  const sumKnown = (field: 'tokensIn' | 'tokensOut' | 'costUsd') => members.every((member) => typeof member[field] === 'number')
+    ? members.reduce((sum, member) => sum + (member[field] as number), 0) : null
   return {
     ok: result.ok && !result.timedOut,
-    output: result.output,
+    summaryOutput: result.output,
+    usageIncludesDescendants: children.length > 0,
+    output,
     error: result.error,
     timedOut: result.timedOut,
-    tokensIn: result.tokensIn ?? null,
-    tokensOut: result.tokensOut ?? null,
-    costUsd: result.costUsd ?? null,
-    costImprecise: result.costImprecise ?? null,
+    cancelled: result.cancelled,
+    tokensIn: sumKnown('tokensIn'),
+    tokensOut: sumKnown('tokensOut'),
+    costUsd: sumKnown('costUsd'),
+    costImprecise: members.some((member) => member.costImprecise === true) || members.some((member) => member.costUsd == null),
   }
 }
 

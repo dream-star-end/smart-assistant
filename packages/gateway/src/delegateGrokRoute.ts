@@ -233,7 +233,7 @@ export async function acquireDelegateGrokRoute(args: {
     // any delegate idle timeout; release() clears the timer earlier.
     let beats = 0
     let heartbeat: NodeJS.Timeout | null = setInterval(() => {
-      if (++beats > 120) {
+      if (++beats > 720) {
         if (heartbeat) clearInterval(heartbeat)
         heartbeat = null
         return

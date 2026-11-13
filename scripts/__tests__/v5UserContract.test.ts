@@ -1,9 +1,10 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { parseModels, parseOptions, turnPolicy, engineMatrix, tapResult, assertOutbound, turnEvidence, continuationCode, continuationPrompts, assertSameSession, assertContinuationAnswer, offloadedRequestReads } from "../lib/user-contract.mjs";
 const catalog = [{ id: "grok-build", engine: "grok" }, { id: "deepseek-v4-flash", engine: "ccb" }];
 test("contract options default dry and reject malformed modes/origins", () => {
@@ -67,46 +68,74 @@ test("continuation must stay in the first turn's session with a new message id",
   assert.throws(() => assertSameSession({ peer: {} }, { peer: {}, clientMessageId: "m2" }));
 });
 const deploy = readFileSync(new URL("../deploy-v5-selfhost.sh", import.meta.url), "utf8");
+const diagnostics = readFileSync(new URL("../lib/v5-selfhost-diagnostics.sh", import.meta.url), "utf8");
 function shellFunction(name: string) {
-  const start = deploy.indexOf(`${name}() {`);
+  const source = name === "cmd_smoke" ? diagnostics : deploy;
+  assert.ok(deploy.includes('source "$SCRIPT_DIR/lib/v5-selfhost-diagnostics.sh"'));
+  const start = source.indexOf(`${name}() {`);
   assert.ok(start >= 0);
-  const end = deploy.indexOf("\n}\n", start);
-  return deploy.slice(start, end + 3);
+  const end = source.indexOf("\n}\n", start);
+  return source.slice(start, end + 3);
+}
+const scriptsDir = fileURLToPath(new URL("../", import.meta.url)).replace(/\/$/, "");
+const gateDirs: string[] = [];
+const shellQuote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+after(() => { for (const dir of gateDirs) rmSync(dir, { recursive: true, force: true }); });
+function gateFixture(prefix: string) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  gateDirs.push(dir);
+  const pw = join(dir, "pw");
+  writeFileSync(pw, "synthetic-only");
+  for (const rel of ["deploy/v5-selfhost/model-availability.json", "scripts/lib/selfhost-model-policy.mjs", "packages/commercial/src/billing/modelAvailability.ts"]) {
+    const path = join(dir, rel);
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(path, readFileSync(join(scriptsDir, "..", rel)));
+  }
+  writeFileSync(join(dir, ".complete"), JSON.stringify({ modelAvailabilityPolicyGeneration: 1, sourceCommit: "a".repeat(40) }));
+  const fn = [
+    `SCRIPT_DIR=${shellQuote(scriptsDir)}; V5_PORT=1; CUTOVER_ROLLBACK=0`,
+    `source ${shellQuote(join(scriptsDir, "lib/v5-selfhost-model-policy.sh"))}`,
+    shellFunction("user_contract_node"),
+    // Process lifetime is covered by the actual Python supervisor tests. This
+    // gate-order fixture only replaces that effect, keeping the real selector.
+    'user_contract_prewarm(){ user_contract_node "$1" "${2:-}"; }',
+    shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw),
+  ].join("\n");
+  const run = (body: string) => execFileSync("bash", ["-c", `${fn}\n${body}`], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).replaceAll(scriptsDir, "/s");
+  return { dir, pw, fn, run, invoke: `user_contract_gate ${shellQuote(dir)}` };
 }
 test("deploy gate missing credential fails closed without executing node", () => {
   const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", "/nonexistent-r2-canary-password");
   const out = execFileSync("bash", ["-c", `${fn}\nnode(){ echo NODE_MUST_NOT_RUN; }; user_contract_gate; echo rc=$?`], { encoding: "utf8" });
   assert.match(out, /rc=1/); assert.doesNotMatch(out, /NODE_MUST_NOT_RUN/);
 });
-test("new gate is within forward smoke before smoked and absent from rollback", () => {
-  assert.match(shellFunction("cutover_smoke_against_release"), /user_contract_gate "\$rel" \|\| \{ cutover_fail "[^"]+"; return 1; \}/);
+test("full smoke retains the contract gate while health-only restoration and diagnostics stay separate", () => {
+  assert.match(shellFunction("cutover_smoke_against_release"), /user_contract_gate "\$rel" "\$context" \|\| \{ cutover_fail "[^"]+"; return 1; \}/);
   assert.doesNotMatch(shellFunction("cutover_smoke_healthz_only"), /user_contract_gate/);
   assert.doesNotMatch(shellFunction("cmd_smoke"), /user_contract_gate/);
   const fn = shellFunction("user_contract_gate");
   assert.match(fn, /V5_CONTRACT_COST=live/);
-  assert.match(fn, /node "\$SCRIPT_DIR\/v5-user-contract-smoke.mjs"/);
+  assert.match(fn, /user_contract_node "\$child_dir\/v5-user-contract-smoke.mjs" "\$models"/);
 });
-test("OCV5-429: canary prewarm runs before the smoke and never decides the verdict", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-429-"));
-  const pw = join(dir, "pw");
-  writeFileSync(pw, "x");
-  const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
-  const run = (prewarmRc: number, smokeRc: number, goCacheRc = 0) => execFileSync("bash", ["-c",
-    `${fn}\nSCRIPT_DIR=/s; V5_PORT=1; node(){ echo "RUN $1 $V5_CONTRACT_COST"; case "$1" in *prewarm*) return ${prewarmRc};; *go-cache*) return ${goCacheRc};; *) return ${smokeRc};; esac; }; user_contract_gate; echo rc=$?`,
-  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  const ok = run(1, 0);
+test("OCV5-709: prewarm runs before the smoke and every failure stops the gate", () => {
+  const fixture = gateFixture("ocv5-429-");
+  const run = (prewarmRc: number, smokeRc: number, goCacheRc = 0) => fixture.run(
+    `node(){ echo "RUN $1 $V5_CONTRACT_COST"; case "\${1##*/}" in *prewarm*) return ${prewarmRc};; *go-cache*) return ${goCacheRc};; *) return ${smokeRc};; esac; }; ${fixture.invoke}; echo rc=$?`);
+  const ok = run(0, 0);
   assert.match(ok, /RUN \/s\/v5-user-contract-prewarm\.mjs \nRUN \/s\/v5-user-contract-smoke\.mjs live\nRUN \/s\/v5-go-cache-contract\.mjs \nRUN \/s\/v5-stop-before-start-contract\.mjs \nrc=0/);
   assert.match(run(0, 1), /rc=1/);
-  assert.match(run(1, 1), /rc=1/);
+  for (const rc of [1, 137, 143]) {
+    const failed = run(rc, 0);
+    assert.match(failed, new RegExp(`rc=${rc}`));
+    assert.doesNotMatch(failed, /RUN .*smoke|RUN .*go-cache|RUN .*stop-before-start/);
+  }
 });
 test("OCV5-432: the go-cache check runs after a passing C1–C3 and decides the verdict", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-432-"));
-  const pw = join(dir, "pw");
-  writeFileSync(pw, "x");
-  const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
-  const run = (smokeRc: number, goCacheRc: number) => execFileSync("bash", ["-c",
-    `${fn}\nSCRIPT_DIR=/s; V5_PORT=1; node(){ echo "RUN $1"; case "$1" in *prewarm*) return 0;; *go-cache*) return ${goCacheRc};; *) return ${smokeRc};; esac; }; user_contract_gate; echo rc=$?`,
-  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const fixture = gateFixture("ocv5-432-");
+  const run = (smokeRc: number, goCacheRc: number) => fixture.run(
+    `node(){ echo "RUN $1"; case "\${1##*/}" in *prewarm*) return 0;; *go-cache*) return ${goCacheRc};; *) return ${smokeRc};; esac; }; ${fixture.invoke}; echo rc=$?`);
   const smokeFailed = run(1, 0);
   assert.match(smokeFailed, /rc=1/);
   assert.doesNotMatch(smokeFailed, /go-cache/);
@@ -116,13 +145,9 @@ test("OCV5-432: the go-cache check runs after a passing C1–C3 and decides the 
   assert.match(run(0, 0), /RUN \/s\/v5-go-cache-contract\.mjs\nRUN \/s\/v5-stop-before-start-contract\.mjs\nrc=0/);
 });
 test("OCV5-435: the stop-before-start check runs after a passing go-cache check and decides the verdict", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-435-"));
-  const pw = join(dir, "pw");
-  writeFileSync(pw, "x");
-  const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
-  const run = (stopRc: number) => execFileSync("bash", ["-c",
-    `${fn}\nSCRIPT_DIR=/s; V5_PORT=1; node(){ echo "RUN $1"; case "$1" in *stop-before-start*) return ${stopRc};; *) return 0;; esac; }; user_contract_gate; echo rc=$?`,
-  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const fixture = gateFixture("ocv5-435-");
+  const run = (stopRc: number) => fixture.run(
+    `node(){ echo "RUN $1"; case "\${1##*/}" in *stop-before-start*) return ${stopRc};; *) return 0;; esac; }; ${fixture.invoke}; echo rc=$?`);
   assert.match(run(1), /RUN \/s\/v5-go-cache-contract\.mjs\nRUN \/s\/v5-stop-before-start-contract\.mjs\nrc=1/);
   assert.match(run(0), /RUN \/s\/v5-stop-before-start-contract\.mjs\nrc=0/);
 });
@@ -155,23 +180,21 @@ test("OCV5-460: the smoke fails C3 when any continuation turn read an offloaded 
 
 // The user-approved OCV5-496 exception is per candidate SHA and only concerns G1.
 test("OCV5-496: exact-SHA approval skips only Go and keeps other verdicts", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-496-gate-"));
-  const pw = join(dir, "pw");
+  const fixture = gateFixture("ocv5-496-gate-");
+  const { dir } = fixture;
   const policy = join(dir, "policy");
   const sha = "a".repeat(40);
-  writeFileSync(pw, "x");
-  const gate = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
-  const functions = [shellFunction("selfhost_policy_get"), shellFunction("go_cache_user_waiver_matches"), gate].join("\n");
+  const functions = [shellFunction("selfhost_policy_get"), shellFunction("go_cache_user_waiver_matches")].join("\n");
   const run = (want: string, actual: string | null, smokeRc = 0, goRc = 1, stopRc = 0) => {
     writeFileSync(policy, `OC_V5_SELFHOST_SKIP_GO_CACHE_SHA=${want}\n`, { mode: 0o600 });
-    writeFileSync(join(dir, ".complete"), JSON.stringify(actual === null ? {} : { sourceCommit: actual }));
-    return execFileSync("bash", ["-c", `${functions}
+    writeFileSync(join(dir, ".complete"), JSON.stringify({ modelAvailabilityPolicyGeneration: 1, ...(actual === null ? {} : { sourceCommit: actual }) }));
+    return fixture.run(`${functions}
       unset OC_V5_SELFHOST_SKIP_GO_CACHE_SHA
-      SELFHOST_POLICY_FILE="$1"; SCRIPT_DIR=/s; V5_PORT=1
+      SELFHOST_POLICY_FILE=${shellQuote(policy)}
       cutover_clog(){ echo "$*"; }
-      node(){ echo "RUN $1"; case "$1" in *prewarm*) return 0;; *user-contract-smoke*) return ${smokeRc};; *go-cache*) return ${goRc};; *stop-before-start*) return ${stopRc};; esac; }
-      user_contract_gate "$2"; echo rc=$?
-    `, "gate", policy, dir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      node(){ echo "RUN $1"; case "\${1##*/}" in *prewarm*) return 0;; *user-contract-smoke*) return ${smokeRc};; *go-cache*) return ${goRc};; *stop-before-start*) return ${stopRc};; esac; }
+      ${fixture.invoke}; echo rc=$?
+    `);
   };
   for (const [want, actual] of [["", sha], ["a", sha], ["b".repeat(40), sha], [sha, "c".repeat(40)], [sha, null]]) {
     const result = run(want!, actual);
@@ -187,4 +210,51 @@ test("OCV5-496: exact-SHA approval skips only Go and keeps other verdicts", () =
   assert.match(smokeFailed, /rc=1/);
   assert.doesNotMatch(smokeFailed, /经用户批准跳过|RUN .*stop-before-start/);
   assert.match(run(sha, sha, 0, 1, 1), /RUN \/s\/v5-stop-before-start-contract\.mjs\nrc=1/);
+});
+
+
+test("OCV5-713: one release policy withdraws Grok and restores the complete two-engine C3", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-713-policy-"));
+  const policy = join(dir, "policy.json");
+  const env = { V5_SELFHOST_MODEL_POLICY_FILE: policy, V5_CONTRACT_COST: "live" };
+  const available = [{ id: "gpt-6-luna", engine: "codex" }, catalog[1]];
+  writeFileSync(policy, JSON.stringify({ grokEnabled: false }));
+  const paused = parseOptions(env);
+  assert.deepEqual(paused.models, ["gpt-6-luna", "deepseek-v4-flash"]);
+  assert.equal(paused.cost, "live");
+  assert.deepEqual(engineMatrix(paused.models, available, paused), available);
+  assert.throws(() => engineMatrix(paused.models, [available[0]], paused), /catalog engine/);
+  assert.throws(() => engineMatrix([available[0].id], available, paused), /two distinct engines/);
+  assert.throws(() => engineMatrix(paused.models, [...available, catalog[0]], paused), /Withdrawn Grok/);
+  for (const id of ["grok-build", "grok-build-fast"]) {
+    assert.throws(() => parseOptions({ ...env, V5_CONTRACT_MODELS: `${id},deepseek-v4-flash` }), /Grok is withdrawn/);
+    assert.throws(() => parseOptions({ ...env, V5_CONTRACT_MODEL_ID: id }), /Grok is withdrawn/);
+  }
+  writeFileSync(policy, JSON.stringify({ grokEnabled: true }));
+  const restored = parseOptions(env);
+  assert.deepEqual(restored.models, ["grok-build", "deepseek-v4-flash"]);
+  assert.deepEqual(engineMatrix(restored.models, catalog, restored), catalog);
+  for (const value of [null, {}, { grokEnabled: "false" }, { grokEnabled: 0 }]) {
+    writeFileSync(policy, JSON.stringify(value));
+    assert.throws(() => parseOptions(env), /boolean grokEnabled/);
+  }
+  assert.throws(() => parseOptions({ V5_SELFHOST_MODEL_POLICY_FILE: join(dir, "missing") }));
+});
+
+test("OCV5-713: the gate pins candidate policy for prewarm and C3, not an ambient override", () => {
+  const fixture = gateFixture("ocv5-713-gate-");
+  const out = fixture.run(`
+    V5_SELFHOST_MODEL_POLICY_FILE=/ambient-must-not-win
+    node(){ echo "RUN $1 policy=$V5_SELFHOST_MODEL_POLICY_FILE"; }
+    ${fixture.invoke}; echo rc=$?
+  `);
+  assert.ok(out.includes(`prewarm.mjs policy=${fixture.dir}/deploy/v5-selfhost/model-availability.json`));
+  assert.ok(out.includes(`smoke.mjs policy=${fixture.dir}/deploy/v5-selfhost/model-availability.json`));
+  assert.match(out, /go-cache/);
+  assert.match(out, /stop-before-start/);
+  assert.match(out, /rc=0/);
+  const smoke = readFileSync(new URL("../v5-user-contract-smoke.mjs", import.meta.url), "utf8");
+  assert.match(smoke, /engineMatrix\(options.models, latest, \{ grokEnabled: options.grokEnabled \}\)/);
+  assert.match(smoke, /for \(const \{ id, engine \} of matrix\)/);
+  assert.match(smoke, /runContinuationTurns\(page, probe, \{ model: id, engine, catalog: latest, cost: options.cost \}\)/);
 });

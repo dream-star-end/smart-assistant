@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/v5-lease-lib.sh
 source "$SCRIPT_DIR/v5-lease-lib.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
 # OCV5-420:recovery_required / manual-recovery / 看护停用不再等人,由 autorecover 接管。
 # shellcheck source=scripts/v5-selfhost-autorecover.sh
 source "$SCRIPT_DIR/v5-selfhost-autorecover.sh"
@@ -325,7 +326,17 @@ dispatch_train() {
   # 取 deploy.lock(fd 8,与 deploy 脚本同一把;取到就持有并传给执行器继承)
   mkdir -p "$(dirname "$LEASE_DEPLOY_LOCK")" 2>/dev/null || true
   exec 8>"$LEASE_DEPLOY_LOCK"
-  flock -n 8 || { wlog "deploy.lock 被持有,不发车"; exec 8>&-; return 0; }
+  if ! flock -n 8; then
+    # 个人版 PG 备份整次运行共享持锁(OCV5-600):写明是备份,列车留在队里,备份结束后下一 tick 发车。
+    local bk=""
+    [[ -f "$LEASE_DEPLOY_LOCK.backup" && ! -L "$LEASE_DEPLOY_LOCK.backup" ]] && bk="$(head -c 200 "$LEASE_DEPLOY_LOCK.backup" 2>/dev/null | head -n1)"
+    if [[ -n "$bk" ]]; then wlog "deploy.lock 被个人版 PG 备份持有($bk),列车排队,备份结束后发车"
+    else wlog "deploy.lock 被持有,不发车"; fi
+    exec 8>&-; return 0
+  fi
+
+  # 持官方锁阻止新预热准入;停净专用预热 cgroup 后才允许 planned 入库。
+  prewarm_quiesce "$LEASE_DEPLOY_LOCK" || { wlog "预热未停净,下 tick 重试"; exec 8>&-; return 0; }
 
   # 宿主工作树 HEAD 必须等于 tip(deploy 脚本认工作树 HEAD;lease 列车只发已 push 的 tip)。
   # OCV5-439:落后时在 deploy.lock 内自动快进;不能快进就告警、不覆盖、不发车。
@@ -361,6 +372,7 @@ SQL
   # 直接 setsid 的子进程仍在同一 cgroup,tick 结束即被收割(2026-09-05 实测:首三班 30s 内全死)。
   # 所以在 systemd 下用 systemd-run 起独立 transient unit;不在 systemd 下(selftest)退回 setsid。
   # 锁:transient unit 无法继承 fd 8 → 这里先释放,让执行器自己走脚本原生 flock 路径;
+  # P4: 两条 spawn 路径都不继承锁;prepare 在锁外,执行器仅在 flip 前加锁。
   # 双发防线仍是 train 唯一开放索引 + 本 tick 已确认锁空。
   local pid
   local deploy_args=(--deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head)
@@ -371,8 +383,14 @@ SQL
   if [[ -n "${INVOCATION_ID:-}" ]] && command -v systemd-run >/dev/null 2>&1; then
     exec 8>&-
     local unit="oc-v5-lease-train-${id#tr-}"
+    # Keep the main deploy's existing signal/cleanup window. Once it exits,
+    # systemd must reap this train's remaining subtree even if its Python
+    # subreaper was SIGKILLed. Independent master/egress/survivor units are
+    # outside this cgroup. This does not promise phase cleanup while main lives.
     if ! systemd-run --quiet --collect --unit="$unit" --description="lease train $id → ${tip:0:12}" \
-         --property=KillMode=process --property=TimeoutStopSec=35min \
+         --property=KillMode=mixed --property=TimeoutStopSec=35min \
+         --property=ExitType=main --property=RemainAfterExit=no \
+         --property=SendSIGKILL=yes --property=FinalKillSignal=SIGKILL \
          --setenv=OC_V5_LEASE_TRAIN_ID="$id" --setenv=OC_V5_LEASE_DB="$LEASE_DB" \
          --setenv=HOME=/root --setenv=PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
          --property=StandardOutput="file:$logf" --property=StandardError="file:$logf" \
@@ -387,11 +405,12 @@ SQL
     done
     [[ -n "$pid" && "$pid" != 0 ]] || { wlog "拿不到 $unit MainPID(可能已秒退),交给对账"; pid=0; }
   else
-    OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 OC_V5_LEASE_TRAIN_ID="$id" OC_V5_LEASE_DB="$LEASE_DB" \
+    exec 8>&-  # P4: planning is over; executor prepares before acquiring its own flip lock
+    OC_V5_LEASE_TRAIN_ID="$id" OC_V5_LEASE_DB="$LEASE_DB" \
       setsid nohup "$DEPLOY_BIN" "${deploy_args[@]}" \
-        >"$logf" 2>&1 </dev/null 8>&8 211>&- 212>&- &
+        >"$logf" 2>&1 </dev/null 8>&- 211>&- 212>&- &
     pid=$!
-    exec 8>&-   # worker 放手;锁随执行器进程生命周期
+    exec 8>&-   # executor owns its later flip lock
   fi
   lease_tx <<SQL || wlog "写 executor_pid 失败(对账将按 planned 超时处理)"
 BEGIN IMMEDIATE;
@@ -594,5 +613,6 @@ main() {
   dispatch_train
   deliver_outbox
   flush_task_spool
+  prewarm_idle_tick || wlog "预热调度失败(不影响列车/投递)"
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

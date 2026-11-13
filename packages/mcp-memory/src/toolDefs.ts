@@ -14,9 +14,9 @@ export const TOOLS = [
   {
     name: 'skill_list',
     description: [
-      'List all skills you have accumulated. Returns name + description for each.',
-      'Always check this first when starting a new task — you may already have a skill for it.',
-      'Token-cheap: returns metadata only. Use `skill_view` to load full instructions.',
+      'List all available skill names and descriptions for an inventory or catalog audit.',
+      'For a specific task, use `skill_search` to find relevant skills, or `skill_view` when the name is known.',
+      'Do not list the full catalog at the start of every task. Metadata only; use `skill_view` for instructions.',
     ].join('\n'),
     inputSchema: { type: 'object', properties: {} },
   },
@@ -208,6 +208,11 @@ export const TOOLS = [
       properties: {
         agentId: { type: 'string', description: '目标 agent ID (必须已存在)' },
         message: { type: 'string', description: '发送给目标 agent 的消息/任务' },
+        model: {
+          type: 'string',
+          description:
+            '可选模型覆盖;必须填上方系统提示「委派可用型号」表里的完整型号名(如 deepseek-v4-flash、gpt-6-astra),留空则用目标成员默认模型。禁止自造简称。',
+        },
       },
       required: ['agentId', 'message'],
     },
@@ -415,6 +420,7 @@ export const TOOLS = [
       '【仅顾问模式】向无工具顾问提出一个疑问或关注点。顾问不能执行工具、写文件或再委派。',
       '只传 question（必填）和可选 concern。不要传 session/model/turn/权限。',
       '顾问建议可能有错，必须用你自己的工具验证后再交付。失败时可继续主任务。',
+      '用户禁止改文件或要求只读、只给建议时，验证只能用只读工具，交付只写回复；不得 Write、Edit 或通过命令、MCP、委派改文件，不要把顾问建议落实到文件。',
     ].join('\n'),
     inputSchema: {
       type: 'object',

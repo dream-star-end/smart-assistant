@@ -158,8 +158,7 @@ async function supervise() {
     // watchdog) starved this gate: tr-20261013T122517Z waited the full 1800s and failed with exit 3.
     // test-mutex still serialises concurrent proof runs and owns process-group cleanup.
     child = spawn('bash', [join(root, 'scripts/test-mutex.sh'), 'commercial-proof',
-      // The mutex's fd-9 exec redirects its stderr to /dev/null. Keep worker
-      // loader/assertion diagnostics on the inherited stdout pipe instead.
+      // Keep worker loader/assertion diagnostics together on the inherited stdout pipe.
       `${quote(process.execPath)} --import tsx ${quote(fileURLToPath(import.meta.url))} --worker 2>&1`], {
       cwd: root, detached: true, stdio: 'inherit',
       // Do not inherit production DB/PG*, Redis, model keys, proxies, runtime

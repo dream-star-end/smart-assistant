@@ -36,11 +36,16 @@ describe("V5 release verification wiring", () => {
   test("lease-only renewal accepts an open dispatch binding when the journal has no evidence", () => {
     const source = read("packages/commercial/src/http/internalTurnLeaseRenew.ts");
     const journal = source.indexOf("FROM request_finalize_journal");
-    const dispatch = source.indexOf("FROM authority_turn_dispatches atd", journal);
-    assert.ok(journal >= 0 && journal < dispatch);
-    const block = source.slice(dispatch, dispatch + 600);
-    assert.match(block, /td\.status IN \('admitted','accepted'\)/);
-    assert.match(block, /td\.terminal_at IS NULL/);
+    const dispatch = source.indexOf("FROM authority_turn_dispatches atd");
+    const legacy = source.indexOf("if (!active || active.turn_key === null)", dispatch);
+    assert.ok(dispatch >= 0 && dispatch < legacy && legacy < journal);
+    const block = source.slice(dispatch, legacy);
+    assert.match(block, /FOR UPDATE OF atd, td/);
+    assert.match(block, /!\['admitted', 'accepted'\]\.includes\(active\.status\)/);
+    assert.match(block, /active\.terminal_at !== null/);
+    assert.match(block, /active\.producer_fenced_at !== null/);
+    assert.match(block, /active\.attempt_no !== active\.dispatch_attempt_no/);
+    assert.match(source.slice(legacy, journal + 500), /created_at >= to_timestamp/);
   });
 
   test("lease-only proxy restores both sponsorship and exact dispatch identity", () => {

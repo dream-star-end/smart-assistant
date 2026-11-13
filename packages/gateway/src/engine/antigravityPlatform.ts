@@ -1,3 +1,5 @@
+import { delegateMcpBudgetEnvironment } from '../delegateMcpBudget.js'
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into the
  * official Google Antigravity CLI (OCV5-415). The CLI inherits nothing from
@@ -120,10 +122,12 @@ export interface AntigravityLaunchCredential {
 }
 
 export interface AntigravityPlatformInput {
+  systemHelpContextFile?: string
   credential: AntigravityLaunchCredential
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
+  traceId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -252,6 +256,7 @@ export function projectAntigravityPlatform(
       `${issueParentCallerToken({
         agentId: input.agentId,
         sessionKey: input.sessionKey,
+        traceId: input.traceId,
         depth: input.delegationDepth,
         consultTurn: input.consultTurn,
       })}\n`,
@@ -260,13 +265,15 @@ export function projectAntigravityPlatform(
       command: mcpLaunch.command,
       args: [...mcpLaunch.args],
       env: {
+        ...delegateMcpBudgetEnvironment(),
         OPENCLAUDE_AGENT_ID: input.agentId,
         OC_AGENT_ID: input.agentId,
         ...identityCompatEnvironment(input.identityCompat),
         ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
         OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME?.trim() || paths.home,
         OPENCLAUDE_SESSION_KEY: input.sessionKey,
-        OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
+        ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
+      OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
         OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
         OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
         OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),

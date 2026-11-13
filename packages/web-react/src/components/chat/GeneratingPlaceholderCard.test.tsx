@@ -97,12 +97,12 @@ describe("GeneratingPlaceholderCard", () => {
     expect(screen.getByText("图片生成失败")).toBeInTheDocument();
     expect(screen.getByText("模型服务暂时不可用")).toBeInTheDocument();
     expect(screen.queryByText("正在生成 · 约几十秒")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /重试/ }));
+    fireEvent.click(screen.getByRole("button", { name: /继续/ }));
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
   test("failed 无 onRetry：不出重试按钮", () => {
     render(<GeneratingPlaceholderCard aspect={1} status="failed" startedAt={Date.now()} />);
-    expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /继续/ })).toBeNull();
   });
 });

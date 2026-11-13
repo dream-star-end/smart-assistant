@@ -311,3 +311,42 @@ test("RF-linkrebuild: restore cannot replace an existing browser stream consumer
     assert.equal(physical.readyState, WebSocket.OPEN);
   } finally { await registry.shutdown(); }
 });
+
+test("OCV5-724: recovery executor stays available after last browser tab detaches while a dispatch is open", async () => {
+  const registry = new ContainerLinkRegistry(pool);
+  const physical = new Transport();
+  const maps = { recovery: new Map<string, Set<RecoveryExecutor>>(), origin: new Map<string, Set<CronOriginExecutor>>() };
+  try {
+    const tab = await registry.attach(7n, 9, () => physical as unknown as WebSocket);
+    const handle = getContainerLinkHandle(tab)!;
+    handle.activate();
+    handle.noteStream("sess-offline", "cm-offline", false);
+    const recovered: string[] = [];
+    registerBridgeExecutors(7n, tab, {
+      recovery: (job) => { recovered.push(job.jobId); },
+      origin: null,
+    }, maps);
+    // User closes the last browser tab while the turn stream is still open (detachUserSide):
+    handle.detach();
+    const executors = availableExecutors(maps.recovery.get("7"));
+    assert.equal(executors.length, 1, "recovery executor must survive last browser detach while dispatch stream is open");
+    executors[0]!({ jobId: "job-offline-1" } as Parameters<RecoveryExecutor>[0]);
+    assert.deepEqual(recovered, ["job-offline-1"]);
+    // If DB heartbeat marks the stream closed while final frame persistence is still in-flight
+    // (pendingPersistCount > 0), the recovery executor must remain available:
+    handle.pendingPersistCount = 1;
+    handle.noteStream("sess-offline", "cm-offline", true);
+    assert.equal(handle.streams.size, 0);
+    assert.equal(handle.hasOpenDispatches, true);
+    assert.equal(availableExecutors(maps.recovery.get("7")).length, 1);
+    // Once final persistence + recovery drain releases the hold and no keepAlive is set, executor becomes idle:
+    handle.pendingPersistCount = 0;
+    handle.persisted("sess-offline", "cm-offline", true);
+    assert.equal(availableExecutors(maps.recovery.get("7")).length, 0);
+    // If a late recovery job needs this still-open link, retainKeepAliveConsumer promotes the handle:
+    assert.equal(registry.retainKeepAliveConsumer(7n, 9), true);
+    assert.equal(availableExecutors(maps.recovery.get("7")).length, 1);
+  } finally {
+    await registry.shutdown();
+  }
+});

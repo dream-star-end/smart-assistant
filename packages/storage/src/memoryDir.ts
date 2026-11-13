@@ -142,25 +142,28 @@ function slugify(s: string): string {
     .slice(0, 40)
 }
 
+export type CoreMemoryPaths = Pick<typeof paths,
+  'agentMemoryDir' | 'agentMemoryMd' | 'agentMemoryLock' | 'agentMemoryBatchJournal' | 'agentMemoryBarrier'>
+
 export class MemoryDir {
-  constructor(private readonly agentId: string) {}
+  constructor(private readonly agentId: string, private readonly locations: CoreMemoryPaths = paths) {}
 
   /** 记忆文件目录 agents/<id>/memory/。 */
   dirPath(): string {
-    return paths.agentMemoryDir(this.agentId)
+    return this.locations.agentMemoryDir(this.agentId)
   }
 
   /** 索引路径 agents/<id>/MEMORY.md(**不变**的跨组件契约路径)。 */
   indexPath(): string {
-    return paths.agentMemoryMd(this.agentId)
+    return this.locations.agentMemoryMd(this.agentId)
   }
 
   private lockPath(): string {
-    return paths.agentMemoryLock(this.agentId)
+    return this.locations.agentMemoryLock(this.agentId)
   }
 
   private batchJournalPath(): string {
-    return paths.agentMemoryBatchJournal(this.agentId)
+    return this.locations.agentMemoryBatchJournal(this.agentId)
   }
 
   private async withFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -184,7 +187,7 @@ export class MemoryDir {
 
   private async recoverBatchWithExclusiveBarrier(timeoutMs = 5_000): Promise<void> {
     const barrier = await acquireKernelFileLock(
-      paths.agentMemoryBarrier(this.agentId),
+      this.locations.agentMemoryBarrier(this.agentId),
       timeoutMs,
       'exclusive',
     )
@@ -224,7 +227,7 @@ export class MemoryDir {
           continue
         }
         const barrier = await acquireKernelFileLock(
-          paths.agentMemoryBarrier(this.agentId),
+          this.locations.agentMemoryBarrier(this.agentId),
           attemptBudget,
           'shared',
         )
@@ -480,6 +483,9 @@ export class MemoryDir {
     return out
   }
 
+  /** Pure directory snapshot: no barrier, recovery or lazy migration. Not a multi-file approval snapshot. */
+  async listReadonly(): Promise<MemoryFileMeta[]> { return this.listLocked() }
+
   /**
    * 读记忆目录,逐文件解析 frontmatter(容错)。非法文件名 / 备份 / 目录项跳过。
    * 按 mtime 倒序(最近优先)。读前进入同一把锁并恢复未提交批次，因此进程
@@ -497,13 +503,17 @@ export class MemoryDir {
     if (!MEMORY_FILE_RE.test(file) || basename(file) !== file) return null
     return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
-      try {
-        const content = await readFile(join(this.dirPath(), file), 'utf-8')
-        return { content, version: sha16(content) }
-      } catch {
-        return null
-      }
+      return this.readReadonly(file)
     })
+  }
+
+  /** Pure single-file read; retain the raw-content version contract of the writer. */
+  async readReadonly(file: string): Promise<{ content: string; version: string } | null> {
+    if (!MEMORY_FILE_RE.test(file) || basename(file) !== file) return null
+    try {
+      const content = await readFile(join(this.dirPath(), file), 'utf-8')
+      return { content, version: sha16(content) }
+    } catch { return null }
   }
 
   /**
@@ -631,7 +641,7 @@ export class MemoryDir {
     if (seen.size === 0) return { ok: true }
 
     const barrier = await acquireKernelFileLock(
-      paths.agentMemoryBarrier(this.agentId),
+      this.locations.agentMemoryBarrier(this.agentId),
       5_000,
       'exclusive',
     )
@@ -759,7 +769,7 @@ export class MemoryDir {
     if (seen.size === 0) return { ok: true, created: [] }
 
     const barrier = await acquireKernelFileLock(
-      paths.agentMemoryBarrier(this.agentId),
+      this.locations.agentMemoryBarrier(this.agentId),
       5_000,
       'exclusive',
     )

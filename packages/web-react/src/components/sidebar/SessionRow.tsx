@@ -8,19 +8,27 @@ import {
   Trash2,
 } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, memo, useRef, useState } from "react";
+import {
+  type SessionNeedsYouKind,
+  resolveSidebarDot,
+  resolveSidebarDotLabel,
+} from "../../lib/sessionStatus";
 import type { ChatProject, Session } from "../../lib/types";
+import { SIDEBAR_DOT_STATUS } from "../../lib/ui/statusTone";
 import { cn } from "../../lib/utils";
 import { SessionStatusDot } from "../SessionStatusDot";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   IconButton,
+  StatusPill,
 } from "../ui";
 import { formatDate } from "../ui/TimeAgo";
 import { formatCompactDuration, sessionDurationWindow } from "./compactDuration";
@@ -44,6 +52,7 @@ export const SessionRow = memo(function SessionRow({
   running,
   lastOutcome,
   lastErrorCode,
+  needsYou,
   now,
   onSelect,
   onRename,
@@ -71,6 +80,8 @@ export const SessionRow = memo(function SessionRow({
   /** 本 tab 终态优先，否则列表元数据。 */
   lastOutcome?: string | null;
   lastErrorCode?: string | null;
+  /** 会话处于待用户回答 / 审批状态（显示 Q 版问号）。 */
+  needsYou?: SessionNeedsYouKind | null;
   /** 只有运行中的行用到(用时算到现在);其余行由 Sidebar 传 0,30s 时钟不打穿它们的 memo。 */
   now: number;
   onSelect: (id: string) => void;
@@ -127,6 +138,7 @@ export const SessionRow = memo(function SessionRow({
     if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) > LONG_PRESS_SLOP_PX) cancelPress();
   };
 
+  const dot = resolveSidebarDot({ running, lastOutcome, lastErrorCode, needsYou }, unread);
   const duration = sessionDurationWindow(s, running, now);
   const durationText = duration ? formatCompactDuration(duration.endAt - duration.startAt) : "";
   const durationTitle = duration
@@ -192,12 +204,13 @@ export const SessionRow = memo(function SessionRow({
         )}
         <span
           data-session-lead
-          className="relative z-[1] flex size-3 shrink-0 items-center justify-center"
+          className="relative z-[1] flex size-3.5 shrink-0 items-center justify-center"
         >
           <SessionStatusDot
             running={running}
             lastOutcome={lastOutcome}
             lastErrorCode={lastErrorCode}
+            needsYou={needsYou}
             unread={unread}
           />
         </span>
@@ -216,13 +229,8 @@ export const SessionRow = memo(function SessionRow({
           // 命中区铺满整行：点状态点 / 用时区也能切会话（原先只有标题文字可点）。
           className="flex h-full min-w-0 flex-1 items-center rounded-sm text-left outline-none after:absolute after:inset-0 after:rounded-sm after:content-[''] focus-visible:after:ring-2 focus-visible:after:ring-ring"
         >
-          <span
-            className={cn(
-              "truncate",
-              active && "font-medium",
-              unread && !active && "font-semibold text-fg",
-            )}
-          >
+          {/* 未读只用行首的点表示，不加粗（UI-SPEC §4.3）。 */}
+          <span className={cn("truncate", active && "font-medium")}>
             {highlightQuery?.trim() ? (
               <HighlightedText text={title} query={highlightQuery} />
             ) : (
@@ -290,6 +298,19 @@ export const SessionRow = memo(function SessionRow({
                 menuViaKeyboardRef.current = false;
               }}
             >
+              {/* 状态点的说明：桌面悬停有 title，触屏长按呼出的就是这份菜单，第一行写清楚。 */}
+              {dot !== "none" && (
+                <>
+                  <DropdownMenuLabel>
+                    <StatusPill
+                      status={SIDEBAR_DOT_STATUS[dot]}
+                      label={resolveSidebarDotLabel(dot, needsYou)}
+                      variant="pill"
+                    />
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                </>
+              )}
               <DropdownMenuItem onSelect={() => onRename(s)}>
                 <Pencil size={14} className="shrink-0 text-muted" />
                 重命名

@@ -147,13 +147,13 @@ describe('community tutorial HTTP routes', () => {
     const blankReject = await request(`/api/admin/tutorials/${id}/review`, {
       method: 'POST',
       token: admin.token,
-      body: { decision: 'reject', note: '' },
+      body: { reviewToken: 'p:1', decision: 'reject', note: '' },
     })
     assert.equal(blankReject.status, 400)
     const approved = await request(`/api/admin/tutorials/${id}/review`, {
       method: 'POST',
       token: admin.token,
-      body: { decision: 'approve', note: '内容完整' },
+      body: { reviewToken: 'p:1', decision: 'approve', note: '内容完整' },
     })
     assert.equal(approved.status, 200)
     const publicList = (await (await request('/api/tutorials')).json()) as {

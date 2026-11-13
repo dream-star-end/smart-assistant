@@ -154,6 +154,7 @@ describe('OCV5-750 hub routing', () => {
     }
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => exec,
     })
@@ -170,6 +171,7 @@ describe('OCV5-750 hub routing', () => {
     const counter = { submits: 0, calls: [] as string[] }
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => okRelay(counter),
     })
@@ -202,6 +204,7 @@ describe('OCV5-750 hub routing', () => {
     let submits = 0
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => {
         await gate
@@ -225,11 +228,12 @@ describe('OCV5-750 hub routing', () => {
     assert.equal(view?.status, 'cancelled')
   })
 
-  it('a relay failure after submit fails the job (Aurora has no box → hatch fallback)', async () => {
+  it('a relay failure after accepted submit never falls back to hatch', async () => {
     const root = tmpRoot()
     let submits = 0
     const hub = makeHub(root, {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => async (request: BoxCcExecRequest) => {
         const verb = request.args[2]
@@ -255,6 +259,7 @@ describe('OCV5-750 hub routing', () => {
     let hatchHello = 0
     const hub = makeHub(root, {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => async (request: BoxCcExecRequest) => {
         const verb = request.args[2]
@@ -459,6 +464,7 @@ describe('OCV5-750 transient Box Exec read failure (personal e2e 2026-11-11)', (
     const slept: number[] = []
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRetrySleep: async (ms) => {
         slept.push(ms)
@@ -502,5 +508,92 @@ describe('OCV5-750 transient Box Exec read failure (personal e2e 2026-11-11)', (
     assert.equal(view?.files?.[0]?.sha256, digest)
     assert.equal(submits, 1)
     assert.deepEqual(slept, [1_000, 1_000])
+  })
+})
+describe('OCV5-750 Gemini r1: box → hatch fallback only before the relay could hold the job', () => {
+  it('a relay-down answer to submit falls back; a status failure after submit does not', async () => {
+    const down = makeHub(tmpRoot(), {
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner: async () => async () => ({
+        stdout: JSON.stringify({
+          ok: false,
+          code: 'MUSE_RELAY_DOWN',
+          message: 'relay unreachable',
+        }),
+      }),
+    })
+    const sid = down.hello('1', '0.5.3')
+    const id = await down.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const job = await down.poll(sid, 2_000)
+    assert.equal(job?.id, id, 'pre-submit relay-down falls back onto hatch')
+  })
+
+  it('a relay-down or egress failure after an accepted submit never falls back to hatch', async (t) => {
+    // Hub timers are unref'd; keep the loop alive while this test long-polls.
+    const keep = setInterval(() => {}, 1000)
+    t.after(() => clearInterval(keep))
+    for (const failure of ['relay-down', 'egress'] as const) {
+      let submits = 0
+      const hub = makeHub(tmpRoot(), {
+        videoBackend: 'box-exec',
+        fallbackHatch: true,
+        boxExecPollMs: 1,
+        boxExecRunner: async () => async (request: BoxCcExecRequest) => {
+          const verb = String(request.args[2])
+          if (verb === 'submit') {
+            submits += 1
+            return { stdout: JSON.stringify({ ok: true, id: 'relay-started', status: 'queued' }) }
+          }
+          if (verb === 'status' && failure === 'egress') {
+            throw Object.assign(new Error('BOX_EGRESS_CHANGED'), { code: 'BOX_EGRESS_CHANGED' })
+          }
+          if (verb === 'status') {
+            return {
+              stdout: JSON.stringify({
+                ok: false,
+                code: 'MUSE_RELAY_DOWN',
+                message: 'relay unreachable',
+              }),
+            }
+          }
+          return { stdout: JSON.stringify({ ok: true }) }
+        },
+      })
+      const sid = hub.hello('1', '0.5.3')
+      const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+      const view = await hub.view('3', id, 2_000)
+      assert.equal(view?.status, 'failed', failure)
+      assert.equal(await hub.poll(sid, 50), null, `${failure}: must not reach hatch`)
+      assert.equal(submits, 1)
+    }
+  })
+
+  it('a deadline-expired box job aborts its CLI calls', async () => {
+    let clock = 1_000_000
+    let aborted = false
+    const hub = makeHub(tmpRoot(), {
+      now: () => clock,
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner:
+        async () => async (_request: BoxCcExecRequest, opts: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.signal?.addEventListener('abort', () => {
+              aborted = true
+              reject(new Error('aborted'))
+            })
+          }),
+    })
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    clock += 60 * 60_000
+    hub.tick()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const view = await hub.view('3', id, 100)
+    assert.equal(view?.error?.code, 'MUSE_TIMEOUT')
+    assert.equal(aborted, true)
   })
 })

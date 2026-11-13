@@ -310,7 +310,8 @@ const args = process.argv.slice(2)
 const output = args[args.indexOf('--output-last-message') + 1]
 const prompt = args[args.length - 1]
 fs.appendFileSync(${JSON.stringify(join(work, 'codex-calls.log'))}, JSON.stringify({ prompt }) + '\\n')
-fs.writeFileSync(output, 'PASS: spec e2e stub')
+const reply = ${JSON.stringify(join(work, 'vision-reply.txt'))}
+fs.writeFileSync(output, fs.existsSync(reply) ? fs.readFileSync(reply, 'utf8') : 'PASS: spec e2e stub')
 `,
     { mode: 0o755 },
   )
@@ -329,6 +330,9 @@ fs.writeFileSync(output, 'PASS: spec e2e stub')
     OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: undefined,
     ANTHROPIC_BASE_URL: undefined,
     OPENAI_API_KEY: undefined,
+    // Cap is per turn. Leave these unset so the golden cases stay unlimited.
+    OC_FIGCHECK_TURN_ID: undefined,
+    CLAUDE_CODE_EXTRA_METADATA: undefined,
   }
 
   after(() => {
@@ -425,6 +429,127 @@ fs.writeFileSync(output, 'PASS: spec e2e stub')
     const report = parseReport(r.stdout)
     assert.equal(report.verdict, 'FAIL')
     assert.ok((report.deterministic as { issues: string[] }).issues.some((m) => m.includes('[spec:spec-parse]')))
+  })
+
+  // OCV5-704: WARN = deterministic checks clean, vision only has suggestions. The skill says
+  // WARN may be delivered; the hint must not tell the agent it failed and must redraw, or a
+  // reviewer that always finds something keeps the agent redrawing the same chart.
+  test('WARN(确定性干净,vision 只有建议):hint 允许交付,不要求重画', async () => {
+    const reply = join(work, 'vision-reply.txt')
+    writeFileSync(reply, '1) 图例与曲线末端轻微重叠(右下)。\n总体:建议把图例移到左上。')
+    try {
+      const r = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'figure'], env)
+      assert.equal(r.code, 0, r.stderr)
+      const report = parseReport(r.stdout)
+      assert.equal((report.deterministic as { issues: unknown[] }).issues.length, 0)
+      assert.equal(report.verdict, 'WARN')
+      const hint = String(report.hint)
+      assert.doesNotMatch(hint, /未通过|重画/)
+      assert.match(hint, /可以交付/)
+    } finally {
+      rmSync(reply, { force: true })
+    }
+  })
+
+  test('FAIL(确定性硬伤):hint 仍要求按 issues 改图重画', async () => {
+    const specFile = join(work, 'broken-for-hint.spec.json')
+    writeFileSync(specFile, '{not json')
+    const r = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--spec', specFile], env)
+    const report = parseReport(r.stdout)
+    assert.equal(report.verdict, 'FAIL')
+    assert.match(String(report.hint), /重画/)
+  })
+
+  test('OCV5-704 cap: 第 4 次不再视觉复核并要求按当前结果交付', async () => {
+    const turn = { ...env, OC_FIGCHECK_TURN_ID: 'turn-cap-main' }
+    const nextTurn = { ...env, OC_FIGCHECK_TURN_ID: 'turn-cap-next' }
+    const other = join(uploads, 'other-round.png')
+    writeFileSync(other, publicationPng())
+    const before = readLogFile(join(work, 'codex-calls.log')).length
+    for (let i = 0; i < 3; i++) {
+      const r = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'figure'], turn)
+      assert.equal(r.code, 0, r.stderr)
+      const report = parseReport(r.stdout)
+      assert.equal(report.verdict, 'PASS')
+      assert.doesNotMatch(String(report.hint), /已达上限/)
+    }
+    assert.equal(readLogFile(join(work, 'codex-calls.log')).length, before + 3)
+
+    const otherRun = await runTs(
+      'packages/gateway/src/ocFigCheckCli.ts',
+      [other, '--kind', 'figure'],
+      turn,
+    )
+    assert.equal(otherRun.code, 0, otherRun.stderr)
+    assert.doesNotMatch(String(parseReport(otherRun.stdout).hint), /已达上限/)
+    assert.equal(readLogFile(join(work, 'codex-calls.log')).length, before + 4)
+
+    const nextRun = await runTs(
+      'packages/gateway/src/ocFigCheckCli.ts',
+      [image, '--kind', 'figure'],
+      nextTurn,
+    )
+    assert.equal(nextRun.code, 0, nextRun.stderr)
+    assert.doesNotMatch(String(parseReport(nextRun.stdout).hint), /已达上限/)
+    assert.equal(readLogFile(join(work, 'codex-calls.log')).length, before + 5)
+
+    const fourth = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'figure'], turn)
+    assert.equal(fourth.code, 0, fourth.stderr)
+    assert.equal(
+      readLogFile(join(work, 'codex-calls.log')).length,
+      before + 5,
+      '第 4 次不得再调用视觉复核',
+    )
+    const report = parseReport(fourth.stdout)
+    assert.equal(report.verdict, 'WARN')
+    assert.match(String(report.hint), /已达上限，按当前结果交付/)
+    assert.match(String(report.hint), /不再做视觉复核/)
+    const rounds = report.rounds as { vision: number; max: number; capped: boolean }
+    assert.equal(rounds.vision, 3)
+    assert.equal(rounds.max, 3)
+    assert.equal(rounds.capped, true)
+    assert.equal((report.vision as { skipped?: boolean }).skipped, true)
+  })
+
+  test('OCV5-704 cap: 视觉复核失败不计入上限', async () => {
+    const flag = join(work, 'vision-fail.flag')
+    const cmd = join(work, 'fake-codex-fail')
+    const log = join(work, 'codex-calls.log')
+    writeFileSync(
+      cmd,
+      `#!${process.execPath}
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+const output = args[args.indexOf('--output-last-message') + 1]
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ prompt: 'fail-stub' }) + '\\n')
+if (fs.existsSync(${JSON.stringify(flag)})) process.exit(1)
+fs.writeFileSync(output, 'PASS: after failure')
+`,
+      { mode: 0o755 },
+    )
+    chmodSync(cmd, 0o755)
+    const turn = {
+      ...env,
+      OC_FIGCHECK_TURN_ID: 'turn-cap-fail',
+      OPENCLAUDE_VISION_CODEX_CMD: cmd,
+    }
+    writeFileSync(flag, '1')
+    const before = readLogFile(log).length
+    const failed = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'figure'], turn)
+    assert.equal(failed.code, 0, failed.stderr)
+    assert.match(failed.stdout, /vision 审图失败/)
+    assert.equal(readLogFile(log).length, before + 1)
+    rmSync(flag, { force: true })
+    for (let i = 0; i < 3; i++) {
+      const r = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'figure'], turn)
+      assert.equal(r.code, 0, r.stderr)
+      assert.equal(parseReport(r.stdout).verdict, 'PASS')
+    }
+    assert.equal(readLogFile(log).length, before + 4)
+    const capped = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'figure'], turn)
+    assert.equal(capped.code, 0, capped.stderr)
+    assert.equal(readLogFile(log).length, before + 4, '失败那一次不算,第 4 次成功后才到上限')
+    assert.match(String(parseReport(capped.stdout).hint), /已达上限，按当前结果交付/)
   })
 
   test('--spec 文件不存在:FAIL 而非崩溃', async () => {

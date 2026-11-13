@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import { VIRTUALIZE_THRESHOLD } from "./constants";
 import { type FlatItem, findIndexAtOffset, itemOffsets } from "./flattenItems";
@@ -30,24 +30,31 @@ export function VirtualList({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const sync = () => setViewportH(el.clientHeight);
+    const sync = () => {
+      setViewportH(el.clientHeight);
+      setScrollTop(el.scrollTop);
+    };
     sync();
     const ro = new ResizeObserver(sync);
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
 
-  const offsets = itemOffsets(items);
+  const offsets = useMemo(() => itemOffsets(items), [items]);
   const total = offsets[items.length] ?? 0;
-  const virtualize = items.length > threshold && viewportH > 0;
+  // A CSS-hidden desktop sidebar has height zero on phones. Keep its DOM
+  // bounded while hidden; ResizeObserver restores the measured window on reveal.
+  const virtualize = items.length > threshold;
+  const windowH = viewportH > 0 ? viewportH : 600;
+  const windowTop = Math.min(scrollTop, Math.max(0, total - windowH));
 
   let start = 0;
   let end = items.length;
   if (virtualize) {
-    start = Math.max(0, findIndexAtOffset(offsets, scrollTop) - OVERSCAN);
+    start = Math.max(0, findIndexAtOffset(offsets, windowTop) - OVERSCAN);
     end = Math.min(
       items.length,
-      findIndexAtOffset(offsets, scrollTop + viewportH) + 1 + OVERSCAN,
+      findIndexAtOffset(offsets, windowTop + windowH) + 1 + OVERSCAN,
     );
   }
   const paddingTop = virtualize ? offsets[start] ?? 0 : 0;

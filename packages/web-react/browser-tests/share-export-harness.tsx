@@ -1,4 +1,5 @@
 import { createRoot } from "react-dom/client";
+import { useState } from "react";
 import { ShareDialog } from "../src/components/ShareDialog";
 import { ToastProvider } from "../src/components/ui/Toast";
 import type { ChatMessage } from "../src/lib/chat/model";
@@ -15,4 +16,8 @@ const messages: ChatMessage[] = [
   { id: "stopped-file", role: "assistant", ts: 10, text: "已交付：[停止前文件](/home/agent/.openclaude/generated/stopped.csv)\n\n[turn failed: user_cancelled]", _errorCode: "USER_CANCELLED", _clientMessageId: "u3" },
   { id: "post-stop-tool", role: "tool", ts: 11, text: "PRIVATE_POST_STOP_TOOL", _clientMessageId: "u3" },
 ];
-createRoot(document.getElementById("root")!).render(<ToastProvider><ShareDialog open onOpenChange={() => {}} messages={messages} sending={false} title="销售分析" agentName="全能助手" /></ToastProvider>);
+function ShareExportHarness() {
+  const [open, setOpen] = useState(true);
+  return <ToastProvider><ShareDialog open={open} onOpenChange={setOpen} messages={messages} sending={false} title="销售分析" agentName="全能助手" /></ToastProvider>;
+}
+createRoot(document.getElementById("root")!).render(<ShareExportHarness />);

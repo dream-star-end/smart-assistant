@@ -259,6 +259,7 @@ class QueryAndReportTest(unittest.TestCase):
         self.assertIn("user_id <> 'c:765'", queries["frame_gap"])
         self.assertIn("fence_hard_cap", queries["orphan"])
         self.assertIn("TURN_NOT_ACTIVE", queries["stop"])
+        self.assertIn("TURN_ALREADY_ENDED", queries["stop"])
         self.assertIn("FIRST_TEXT_PAINT_AFTER_BACKGROUND", queries["paint"])
         self.assertLess(queries["oversize_journal"].index("request_too_large"), queries["oversize_journal"].index("prompt_too_large"))
         self.assertLess(queries["oversize_journal"].index("prompt_too_large"), queries["oversize_journal"].index("context_limit"))
@@ -272,7 +273,7 @@ class QueryAndReportTest(unittest.TestCase):
             None,
             {
                 "cohort": {"classes": {"H_human": 411, "S_recover": 72, "A_automation": 549}, "h_users": 1},
-                "stop": {"stops": 31, "turn_not_active": 7},
+                "stop": {"stops": 31, "turn_not_active": 7, "turn_already_ended": 2},
                 "paint": {"n": 5, "n_with_latency": 5, "p50_ms": 70, "p95_ms": 148.4, "max_ms": 155},
                 "blank": [{"code": "TIMELINE_BLANK_VIEWPORT_GAP_UNKNOWN", "events": 88, "sessions": 35}],
                 "restart": {"web": 14, "h_human": 10, "automation": 18},
@@ -318,6 +319,7 @@ class QueryAndReportTest(unittest.TestCase):
         )
         self.assertEqual(report["w3"]["recovery_display"], "17.5% (72/411)")
         self.assertEqual(report["w1"]["stop_turn_not_active"]["display"], "22.6% (7/31)")
+        self.assertEqual(report["w1"]["stop_turn_already_ended"]["display"], "6.5% (2/31)")
         self.assertEqual(report["w1"]["new_metrics"][0]["status"], "未上线")
         self.assertIn("pruneProjectedLiveFrames", report["w1"]["frame_gap_dispatch"]["prune_note"])
         text = m.render_markdown(report)
@@ -326,6 +328,10 @@ class QueryAndReportTest(unittest.TestCase):
         self.assertIn("pruneProjectedLiveFrames", text)
         self.assertIn("17.5% (72/411)", text)
         self.assertIn("22.6% (7/31)", text)
+        self.assertIn("6.5% (2/31)", text)
+        self.assertIn("停止请求命中已结束回合（TURN_ALREADY_ENDED）", text)
+        self.assertIn("历史 runtime miss（TURN_NOT_ACTIVE）", text)
+        self.assertIn("不是已结束证据", text)
         self.assertNotIn("postgres://", text)
         self.assertIn("BOX_TOOL_OWNER_UNKNOWN", text)
         failed = m.assemble(
@@ -357,6 +363,20 @@ class QueryAndReportTest(unittest.TestCase):
         self.assertEqual(report["w3"]["recovery_display"], "0.0% (0/10)")
         text = m.render_markdown(report)
         self.assertIn("自动恢复回合 S_recover=0，比例 0.0% (0/10)", text)
+
+    def test_legacy_runtime_misses_do_not_count_as_confirmed_ended(self):
+        report = m.assemble({}, [3], {"stop": {"stops": 10, "turn_not_active": 4}}, None)
+        self.assertEqual(report["w1"]["stop_turn_not_active"]["ratio"], 0.4)
+        self.assertEqual(report["w1"]["stop_turn_already_ended"]["ratio"], 0.0)
+        self.assertEqual(report["w1"]["stop_turn_already_ended"]["turn_already_ended"], 0)
+
+    def test_ended_stop_has_no_sample_and_preserves_query_failure(self):
+        report = m.assemble({}, None, {"stop": {"stops": 0, "turn_already_ended": 0}}, None)
+        self.assertIsNone(report["w1"]["stop_turn_already_ended"]["ratio"])
+        self.assertEqual(report["w1"]["stop_turn_already_ended"]["display"], "无样本")
+        failed = m.assemble({}, None, {"stop": {"error": "statement timeout"}}, None)
+        self.assertEqual(failed["w1"]["stop_turn_already_ended"], {"error": "statement timeout"})
+        self.assertEqual(failed["w1"]["stop_turn_not_active"], {"error": "statement timeout"})
 
     def test_redact(self):
         self.assertIn("<redacted>", m.redact("fail postgres://user:secret@localhost/db tail"))

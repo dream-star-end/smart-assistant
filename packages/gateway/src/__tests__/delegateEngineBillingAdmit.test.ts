@@ -33,7 +33,12 @@ after(() => {
 })
 process.env.OC_MODEL_AUTHORITY = '0'
 
-function makeBillingClient(): DelegateEngineBillingClient & {
+const OFFICIAL_ROUTE = { kind: 'official_oauth', groupId: '3' }
+
+function makeBillingClient(
+  admitRoute: unknown = OFFICIAL_ROUTE,
+  includeRoute = true,
+): DelegateEngineBillingClient & {
   admits: unknown[]
   settles: unknown[]
   abandons: string[]
@@ -47,7 +52,11 @@ function makeBillingClient(): DelegateEngineBillingClient & {
     abandons,
     async admit(input) {
       admits.push(input)
-      return { requestId: REQUEST_ID, engineSessionId: `oceng-${'b'.repeat(48)}` }
+      return {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        ...(includeRoute ? { route: admitRoute } : {}),
+      }
     },
     async settle(billing) {
       settles.push(billing)
@@ -137,8 +146,16 @@ function makeGateway(opts?: {
       _effort?: string | null,
       _model?: string,
       requestId?: string,
+      _traceId?: string,
+      _conversationMode?: unknown,
+      submitOpts?: {
+        codexRoute?: unknown
+        grokRoute?: unknown
+        antigravityRoute?: unknown
+      },
     ) => {
       gw._lastSubmitRequestId = requestId
+      gw._lastSubmitOpts = submitOpts
       gw._submitOnEvent = onEvent
       if (opts?.submitError) throw opts.submitError
       if (opts?.hangSubmit) {
@@ -309,6 +326,272 @@ describe('handleDelegateTask engine-reported billing', () => {
         if (value === undefined) delete process.env[key]
         else process.env[key] = value
       }
+    }
+  })
+
+  it('(e) codex 委派 submit 带 master 签发的 official_oauth provider route (OCV5-729)', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    const r = await delegate(gw, 'auditor', memberBody({ model: 'gpt-5.6-sol' }))
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    const route = gw._lastSubmitOpts?.codexRoute as Record<string, unknown> | undefined
+    assert.ok(route, 'codexRoute must reach the runner')
+    assert.equal(route.modelProvider, 'oc_chatgpt_official')
+    assert.equal(route.baseUrl, 'http://127.0.0.1:18789/internal/v3/codex-relay/backend-api/codex')
+    assert.equal(route.providerName, 'OpenAI (OpenClaude relay)')
+    assert.equal(route.wireApi, 'responses')
+    assert.equal(route.preferredAuthMethod, 'chatgpt')
+    assert.equal(route.disableResponseStorage, true)
+    assert.equal(route.requiresOpenaiAuth, true)
+  })
+
+  it('(f) api_relay admit 路由投影为带 token 的 loopback baseUrl (OCV5-729)', async () => {
+    const token = 'cd'.repeat(32)
+    const billing = makeBillingClient({
+      kind: 'api_relay',
+      token,
+      modelProvider: 'openai-codex',
+      providerName: 'relay',
+      wireApi: 'responses',
+      preferredAuthMethod: 'apikey',
+      disableResponseStorage: true,
+    })
+    const gw = makeGateway({ billing })
+    const r = await delegate(gw, 'auditor', memberBody({ model: 'gpt-5.6-sol' }))
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    const route = gw._lastSubmitOpts?.codexRoute as Record<string, unknown> | undefined
+    assert.ok(route, 'codexRoute must reach the runner')
+    assert.equal(route.modelProvider, 'openai-codex')
+    assert.equal(
+      route.baseUrl,
+      `http://127.0.0.1:18789/internal/v3/codex-relay/route/${token}`,
+    )
+  })
+
+  it('(g) codex 委派 admit 未签发 route 时 fail-closed，不创建 submit (OCV5-729)', async () => {
+    const billing = makeBillingClient(undefined, false)
+    const gw = makeGateway({ billing })
+    const r = await delegate(gw, 'auditor', memberBody({ model: 'gpt-5.6-sol' }))
+    assert.equal(r.status, 503, JSON.stringify(r.body))
+    assert.match(String(r.body.error), /Codex 委派路由不可用/)
+    assert.equal(gw._lastSubmitRequestId, 'UNSET', 'runner must not be submitted')
+    assert.equal(gw._lastSubmitOpts, undefined)
+    assert.deepEqual(billing.abandons, [REQUEST_ID])
+  })
+})
+
+
+// ── OCV5-738:委派到 antigravity 引擎必须有 master 签发的 relay route ──────────
+
+const ANTIGRAVITY_MODEL = 'antigravity-claude-sonnet-5.5'
+const ANTIGRAVITY_ROUTE_TOKEN = 'ef'.repeat(32)
+const ANTIGRAVITY_BASE_URL = `http://127.0.0.1:18789/internal/v5/antigravity-relay/route/${ANTIGRAVITY_ROUTE_TOKEN}`
+
+function antigravityRoute(): Record<string, unknown> {
+  return {
+    baseUrl: ANTIGRAVITY_BASE_URL,
+    routeToken: ANTIGRAVITY_ROUTE_TOKEN,
+    accessToken: 'A'.repeat(48),
+    accessTokenExpiresAt: '2026-11-05T00:00:00.000Z',
+  }
+}
+
+describe('handleDelegateTask antigravity delegate route (OCV5-738)', () => {
+  it('(h) submit opts 带 master 签发的 antigravityRoute,admit engine=antigravity', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    const releases: string[] = []
+    let acquiredRequestId: string | undefined
+    gw._acquireDelegateAntigravityRoute = async (args: { requestId: string }) => {
+      acquiredRequestId = args.requestId
+      return {
+        ok: true,
+        lease: {
+          route: antigravityRoute(),
+          routeToken: ANTIGRAVITY_ROUTE_TOKEN,
+          release: async () => {
+            releases.push('released')
+          },
+        },
+      }
+    }
+    const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    // Route was requested for the admission master actually signed.
+    assert.equal(acquiredRequestId, REQUEST_ID)
+    assert.equal((billing.admits[0] as { engine: string }).engine, 'antigravity')
+    const route = gw._lastSubmitOpts?.antigravityRoute as Record<string, unknown> | undefined
+    assert.ok(route, 'antigravityRoute must reach the runner')
+    assert.equal(route.routeToken, ANTIGRAVITY_ROUTE_TOKEN)
+    assert.equal(route.baseUrl, ANTIGRAVITY_BASE_URL)
+    assert.equal(route.accessToken, 'A'.repeat(48))
+    assert.equal(route.accessTokenExpiresAt, '2026-11-05T00:00:00.000Z')
+    // Terminal turn settled explicitly (adapter emits no billing frame) and the
+    // route lease was released exactly once.
+    assert.equal(billing.settles.length, 1)
+    assert.equal((billing.settles[0] as { requestId: string }).requestId, REQUEST_ID)
+    assert.equal((billing.settles[0] as { status: string }).status, 'success')
+    assert.equal(billing.abandons.length, 0)
+    assert.deepEqual(releases, ['released'])
+  })
+
+  it('(i) route 缺失 → 503,未 submit,abandon 恰好一次,名额释放恰好一次', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    let slotReleases = 0
+    const proto = Gateway.prototype as any
+    const origRelease = proto._releaseDelegateSlot
+    proto._releaseDelegateSlot = function (this: unknown, ...args: unknown[]) {
+      slotReleases += 1
+      return origRelease.apply(this, args)
+    }
+    gw._acquireDelegateAntigravityRoute = async () => ({
+      ok: false as const,
+      httpStatus: 503,
+      reason: 'ANTIGRAVITY_NO_ACCOUNT',
+    })
+    try {
+      const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+      assert.equal(r.status, 503, JSON.stringify(r.body))
+      assert.match(String(r.body.error), /Antigravity 委派暂不可用/)
+      assert.equal(gw._lastSubmitRequestId, 'UNSET', 'runner must not be submitted')
+      assert.equal(gw._lastSubmitOpts, undefined)
+      assert.deepEqual(billing.abandons, [REQUEST_ID], 'abandon exactly once')
+      assert.equal(slotReleases, 1, 'delegate slot released exactly once')
+      assert.equal(gw._activeDelegations, 0)
+    } finally {
+      proto._releaseDelegateSlot = origRelease
+    }
+  })
+
+  it('(j) master route 投影失败(非法 baseUrl)→ 503,abandon 一次,不 submit', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    gw._acquireDelegateAntigravityRoute = async () => ({
+      ok: true as const,
+      lease: {
+        route: {
+          ...antigravityRoute(),
+          // Not the gateway loopback relay path: projection must reject it
+          // rather than hand the runner an arbitrary endpoint.
+          baseUrl: 'https://evil.example.com/internal/v5/antigravity-relay/route/x',
+        },
+        routeToken: ANTIGRAVITY_ROUTE_TOKEN,
+        release: async () => {},
+      },
+    })
+    const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+    assert.equal(r.status, 503, JSON.stringify(r.body))
+    assert.equal(gw._lastSubmitRequestId, 'UNSET')
+    assert.equal(gw._lastSubmitOpts, undefined)
+    assert.deepEqual(billing.abandons, [REQUEST_ID])
+  })
+
+  it('(k) fail-closed 分支不留 admission lease 心跳(OCV5-729/738 审计遗留)', async () => {
+    // The fail-closed returns must stop the background-lease heartbeat at the
+    // same point the normal end path does. Each run gets a real interval (the
+    // handle the SM claim would install) and we assert it is destroyed when
+    // the handler has already answered 503.
+    for (const kind of ['codex', 'antigravity'] as const) {
+      const billing =
+        kind === 'codex' ? makeBillingClient(undefined, false) : makeBillingClient()
+      const gw = makeGateway({ billing })
+      if (kind === 'antigravity') {
+        gw._acquireDelegateAntigravityRoute = async () => ({
+          ok: false as const,
+          httpStatus: 503,
+          reason: 'ANTIGRAVITY_NO_ACCOUNT',
+        })
+      }
+      const intervals: Array<ReturnType<typeof setInterval>> = []
+      const original = gw._runDelegateTask
+      gw._runDelegateTask = async function (this: unknown, input: any) {
+        const handle = setInterval(() => {}, 60_000)
+        handle.unref()
+        intervals.push(handle)
+        input._leaseTimer = handle
+        return original.call(this, input)
+      }
+      try {
+        const r = await delegate(
+          gw,
+          'auditor',
+          memberBody({
+            model: kind === 'codex' ? 'gpt-5.6-sol' : ANTIGRAVITY_MODEL,
+          }),
+        )
+        assert.equal(r.status, 503, `${kind}: ${JSON.stringify(r.body)}`)
+        assert.equal(intervals.length, 1)
+        assert.equal(
+          (intervals[0] as unknown as { _destroyed?: boolean })._destroyed,
+          true,
+          `${kind} fail-closed must clear the lease heartbeat`,
+        )
+      } finally {
+        gw._runDelegateTask = original
+      }
+    }
+  })
+
+  it('(l) 预算耗尽停止时消费 external_billing 权威 status=success 与 terminalCode，不免单 (Blocker 1)', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    gw._acquireDelegateAntigravityRoute = async () => ({
+      ok: true as const,
+      lease: {
+        route: antigravityRoute(),
+        routeToken: ANTIGRAVITY_ROUTE_TOKEN,
+        release: async () => {},
+      },
+    })
+    const origSubmit = gw.sessions.submit
+    gw.sessions.submit = async (_s: unknown, _p: string, onEvent: (e: any) => void) => {
+      onEvent({
+        kind: 'external_billing',
+        requestId: REQUEST_ID,
+        status: 'success',
+        terminalCode: 'ENGINE_ERROR',
+      })
+      onEvent({ kind: 'error', error: 'BUDGET_EXHAUSTED: turn exceeded precheck' })
+      onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 100, outputTokens: 50, turn: 1 } })
+    }
+    try {
+      const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(r.body.ok, false)
+      assert.equal(billing.settles.length, 1)
+      assert.equal((billing.settles[0] as { status: string }).status, 'success')
+      assert.equal((billing.settles[0] as { terminalCode?: string }).terminalCode, 'ENGINE_ERROR')
+    } finally {
+      gw.sessions.submit = origSubmit
+    }
+  })
+
+  it('(m) session 初始化抛错时释放 antigravityRouteLease 并 abandon 账本 (Blocker 3)', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    let released = 0
+    gw._acquireDelegateAntigravityRoute = async () => ({
+      ok: true as const,
+      lease: {
+        route: antigravityRoute(),
+        routeToken: ANTIGRAVITY_ROUTE_TOKEN,
+        release: async () => {
+          released += 1
+        },
+      },
+    })
+    const origGetOrCreate = gw.sessions.getOrCreate
+    gw.sessions.getOrCreate = async () => {
+      throw new Error('session init failed')
+    }
+    try {
+      const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+      assert.equal(r.status, 500)
+      assert.equal(released, 1, 'antigravityRouteLease must be released on session init error')
+      assert.deepEqual(billing.abandons, [REQUEST_ID])
+    } finally {
+      gw.sessions.getOrCreate = origGetOrCreate
     }
   })
 })

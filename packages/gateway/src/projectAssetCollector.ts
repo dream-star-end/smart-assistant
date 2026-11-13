@@ -50,7 +50,11 @@ const log = createLogger({ module: 'projectAssets' })
 export const GENERATED_OUTPUT_PATH_RE = /\/home\/agent\/\.openclaude\/generated\/[^\s<"'\`>]+/g
 export const PROJECT_ASSET_TURN_COLLECT_MAX = 5
 /** Outputs above this are registered by source path only, without a version copy. */
-export const OUTPUT_VERSION_COPY_MAX_BYTES = 50 * 1024 * 1024
+export const OUTPUT_VERSION_COPY_MAX_BYTES = 512 * 1024 * 1024
+/** Threshold above which CAS large-file quota is enforced before version copy (OCV5-725). */
+export const OUTPUT_VERSION_LARGE_THRESHOLD_BYTES = 50 * 1024 * 1024
+/** Maximum cumulative bytes of >50 MiB version copies in CAS before falling back to source path. */
+export const OUTPUT_VERSION_LARGE_CAS_QUOTA_BYTES = 2 * 1024 * 1024 * 1024
 const GENERATED_PREFIX = '/home/agent/.openclaude/generated/'
 /** Session-isolated agent cwd (Write tool default). Not in the asset path allowlist. */
 const WORKSPACE_SESSIONS_PREFIX = '/home/agent/.openclaude/workspace/sessions/'
@@ -370,6 +374,10 @@ export interface OutputVersionRoots {
   cas: string
   /** Real directory behind `/home/agent/.openclaude/workspace/sessions/` (test seam). */
   workspaceSessions?: string
+  /** Optional override for per-file copy cap (test seam). */
+  maxCopyBytes?: number
+  /** Optional override for cumulative >50 MiB CAS quota (test seam). */
+  largeVersionQuotaBytes?: number
 }
 
 export interface CapturedOutputVersion {
@@ -427,7 +435,83 @@ async function writeAll(fh: FileHandle, chunk: Buffer): Promise<void> {
  * that matches what is stored). Publish is tmp + link, like uploads: an
  * existing `<digest>.<ext>` is the same bytes and is kept.
  */
-async function copyIntoCas(src: FileHandle, name: string, casDir: string): Promise<CapturedOutputVersion> {
+const largeCasCopyLocks = new Map<string, Promise<void>>()
+
+async function withLargeCasLock<T>(casDir: string, fn: () => Promise<T>): Promise<T> {
+  const prev = largeCasCopyLocks.get(casDir) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const tail = prev.then(() => gate)
+  largeCasCopyLocks.set(casDir, tail)
+  await prev
+  try {
+    return await fn()
+  } finally {
+    release()
+    if (largeCasCopyLocks.get(casDir) === tail) {
+      largeCasCopyLocks.delete(casDir)
+    }
+  }
+}
+
+async function sumLargeCasBytes(casDir: string, thresholdBytes: number): Promise<number> {
+  let names: string[]
+  try {
+    names = await readdir(casDir)
+  } catch {
+    return 0
+  }
+  let total = 0
+  for (const entry of names) {
+    if (entry.startsWith('.tmp-')) continue
+    try {
+      const st = await lstat(join(casDir, entry))
+      if (st.isFile() && st.size > thresholdBytes) total += st.size
+    } catch {
+      // ignore concurrent removals
+    }
+  }
+  return total
+}
+
+async function publishCasVersionFile(
+  tmp: string,
+  finalPath: string,
+  copied: number,
+  casDir: string,
+  quotaBytes: number,
+): Promise<void> {
+  if (copied > OUTPUT_VERSION_LARGE_THRESHOLD_BYTES) {
+    const usedLargeBytes = await sumLargeCasBytes(casDir, OUTPUT_VERSION_LARGE_THRESHOLD_BYTES)
+    const existingSameDigest = await lstat(finalPath).catch(() => null)
+    const alreadyCountedBytes =
+      existingSameDigest && existingSameDigest.isFile() && existingSameDigest.size > OUTPUT_VERSION_LARGE_THRESHOLD_BYTES
+        ? existingSameDigest.size
+        : 0
+    if (usedLargeBytes - alreadyCountedBytes + copied > quotaBytes) {
+      throw new Error('output exceeded large version CAS quota')
+    }
+  }
+  try {
+    await link(tmp, finalPath)
+  } catch (err) {
+    if ((err as { code?: string }).code !== 'EEXIST') throw err
+    // Same digest already stored. Anything that is not a regular file of
+    // the right size there is not those bytes: replace it.
+    const existing = await lstat(finalPath)
+    if (!existing.isFile() || existing.size !== copied) await rename(tmp, finalPath)
+  }
+}
+
+async function copyIntoCas(
+  src: FileHandle,
+  name: string,
+  casDir: string,
+  maxCopyBytes: number = OUTPUT_VERSION_COPY_MAX_BYTES,
+  largeQuotaCheck?: { usedBeforeCopy?: number; quotaBytes: number; lockAlreadyHeld: boolean },
+): Promise<CapturedOutputVersion> {
   await mkdir(casDir, { recursive: true })
   const tmp = join(casDir, `.tmp-output-${process.pid}-${randomUUID()}`)
   const out = await open(tmp, 'wx', 0o644)
@@ -440,7 +524,16 @@ async function copyIntoCas(src: FileHandle, name: string, casDir: string): Promi
         const { bytesRead } = await src.read(buf, 0, buf.length, copied)
         if (bytesRead === 0) break
         copied += bytesRead
-        if (copied > OUTPUT_VERSION_COPY_MAX_BYTES) throw new Error('output grew past the version copy cap')
+        if (copied > maxCopyBytes) throw new Error('output grew past the version copy cap')
+        if (
+          largeQuotaCheck &&
+          copied > OUTPUT_VERSION_LARGE_THRESHOLD_BYTES &&
+          (copied > largeQuotaCheck.quotaBytes ||
+            (largeQuotaCheck.usedBeforeCopy !== undefined &&
+              largeQuotaCheck.usedBeforeCopy + copied > largeQuotaCheck.quotaBytes))
+        ) {
+          throw new Error('output exceeded large version CAS quota')
+        }
         const chunk = buf.subarray(0, bytesRead)
         hash.update(chunk)
         await writeAll(out, chunk)
@@ -452,14 +545,13 @@ async function copyIntoCas(src: FileHandle, name: string, casDir: string): Promi
     const digest = hash.digest('hex')
     const finalName = `${digest}.${outputVersionExt(name)}`
     const finalPath = join(casDir, finalName)
-    try {
-      await link(tmp, finalPath)
-    } catch (err) {
-      if ((err as { code?: string }).code !== 'EEXIST') throw err
-      // Same digest already stored. Anything that is not a regular file of
-      // the right size there is not those bytes: replace it.
-      const existing = await lstat(finalPath)
-      if (!existing.isFile() || existing.size !== copied) await rename(tmp, finalPath)
+    const quotaBytes = largeQuotaCheck?.quotaBytes ?? OUTPUT_VERSION_LARGE_CAS_QUOTA_BYTES
+    if (copied > OUTPUT_VERSION_LARGE_THRESHOLD_BYTES && !largeQuotaCheck?.lockAlreadyHeld) {
+      await withLargeCasLock(casDir, async () => {
+        await publishCasVersionFile(tmp, finalPath, copied, casDir, quotaBytes)
+      })
+    } else {
+      await publishCasVersionFile(tmp, finalPath, copied, casDir, quotaBytes)
     }
     return { size: copied, digest, url: `/api/media/${finalName}` }
   } finally {
@@ -497,9 +589,39 @@ export async function captureOutputVersion(
     }
     const st = await src.stat()
     if (!st.isFile()) return null
-    if (st.size > OUTPUT_VERSION_COPY_MAX_BYTES) return { size: st.size }
+    const maxCopyBytes = roots.maxCopyBytes ?? OUTPUT_VERSION_COPY_MAX_BYTES
+    if (st.size > maxCopyBytes) return { size: st.size }
+    const quotaBytes = roots.largeVersionQuotaBytes ?? OUTPUT_VERSION_LARGE_CAS_QUOTA_BYTES
+    if (st.size > OUTPUT_VERSION_LARGE_THRESHOLD_BYTES) {
+      return await withLargeCasLock(roots.cas, async () => {
+        const usedLargeBytes = await sumLargeCasBytes(roots.cas, OUTPUT_VERSION_LARGE_THRESHOLD_BYTES)
+        if (usedLargeBytes + st.size > quotaBytes) {
+          log.warn('large output version skipped due to CAS quota, registering source path only', {
+            containerPath,
+            size: st.size,
+            usedLargeBytes,
+            quotaBytes,
+          })
+          return { size: st.size }
+        }
+        try {
+          const copied = await copyIntoCas(src, basename(containerPath), roots.cas, maxCopyBytes, {
+            usedBeforeCopy: usedLargeBytes,
+            quotaBytes,
+            lockAlreadyHeld: true,
+          })
+          return { ...copied, capturedAt: Math.round(st.mtimeMs) }
+        } catch (err) {
+          log.warn('output version copy failed, registering the source path only', { containerPath }, err)
+          return { size: st.size }
+        }
+      })
+    }
     try {
-      const copied = await copyIntoCas(src, basename(containerPath), roots.cas)
+      const copied = await copyIntoCas(src, basename(containerPath), roots.cas, maxCopyBytes, {
+        quotaBytes,
+        lockAlreadyHeld: false,
+      })
       return { ...copied, capturedAt: Math.round(st.mtimeMs) }
     } catch (err) {
       log.warn('output version copy failed, registering the source path only', { containerPath }, err)

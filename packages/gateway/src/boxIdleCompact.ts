@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BOX_NATIVE_CONTEXT_OWNER, isBoxApiModel } from '@openclaude/protocol'
 import type { IdleProofResponse } from './engine/boxIdleProofClient.js'
@@ -160,11 +160,29 @@ export function readIdleOp(dir: string, sessionKey: string, revision: string): I
   }
 }
 
-export function writeIdleOp(dir: string, op: IdleOp): void {
+export function writeIdleOp(
+  dir: string,
+  op: IdleOp,
+  opts?: { preservePreparedMtime?: boolean },
+): void {
   const path = opPath(dir, op)
+  const priorMtimeMs =
+    opts?.preservePreparedMtime &&
+    !idleOpSettled(op) &&
+    Boolean(op.summaryText && op.artifact) &&
+    (() => {
+      const prev = readIdleOp(dir, op.sessionKey, op.revision)
+      return Boolean(prev && !idleOpSettled(prev) && prev.summaryText && prev.artifact)
+    })()
+      ? mtimeOf(path)
+      : 0
   mkdirSync(join(path, '..'), { recursive: true })
   const tmp = `${path}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(op))
+  if (priorMtimeMs > 0) {
+    const sec = priorMtimeMs / 1000
+    utimesSync(tmp, sec, sec)
+  }
   renameSync(tmp, path)
 }
 
@@ -220,6 +238,9 @@ export interface IdleNativeFile {
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleAttachment[]
+  /** OCV5-755: pre-expiry compaction summarizes from this outer size, below
+   *  the near-limit fit CCB uses otherwise. */
+  minInputTokens?: number
 }
 
 export function idleNativeDir(home: string, sessionId: string): string {

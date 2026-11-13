@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { fixtureSwitchQuote } from "./model-switch-cost-fixture.mjs";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
@@ -78,6 +79,8 @@ test("a failed advisor save shows inline only and no error is left after a later
       } else if (path === "/api/sessions/list") body = { sessions: [] };
       else if (path === "/api/marketplace/my-agents") {
         body = { agents: [{ id: "main", slug: "main", name: "全能助手", installed: true, isDefault: true }] };
+      } else if (method === "POST" && /^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)) {
+        body = fixtureSwitchQuote(req.postDataJSON(), { empty: true });
       } else if (path === "/api/collaboration-config") {
         calls.push({ kind: "collab", method });
         const doc = (mode, rev) => ({

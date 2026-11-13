@@ -1,3 +1,4 @@
+import { SYSTEM_HELP_LOCAL_PATH } from '../systemHelpRelay.js'
 /**
  * Pre-auth routes (local relays, project search, login): dispatched BEFORE the auth gate
  *
@@ -44,6 +45,7 @@ import type { Gateway, GatewayDeps } from '../server.js'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
 
 export interface PreAuthRoutesIo {
+  handleSystemHelp?(req: IncomingMessage, res: ServerResponse): Promise<void>
   _handleSkillEvalGenStart(
     req: IncomingMessage,
     res: ServerResponse,
@@ -67,6 +69,11 @@ export interface PreAuthRoutesIo {
 }
 
 export const PRE_AUTH_ROUTES: readonly HttpRoute<PreAuthRoutesIo>[] = [
+  predicateRoute('SYSTEM_HELP_LOCAL', (_req, url) => url.pathname === SYSTEM_HELP_LOCAL_PATH, (io, req, res) => {
+    if (!io.handleSystemHelp) { io.sendJson(res, 503, { error: { code: 'UNAVAILABLE' } }); return true }
+    void io.handleSystemHelp(req, res).catch(() => { if (!res.headersSent && !res.destroyed) io.sendJson(res, 503, { error: { code: 'UNAVAILABLE' } }) })
+    return true
+  }),
   // v3 commercial Codex local relay(M1a 复活)。Codex CLI uses Authorization
   // for its upstream token, so the container gateway must translate it into a
   // private header and authenticate to master with OPENCLAUDE_V3_CONTAINER_TOKEN.

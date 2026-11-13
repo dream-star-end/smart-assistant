@@ -1349,6 +1349,11 @@
           "layer": "deploy-gate",
           "path": "scripts/v5-turn-waiver-sql-gate.sh",
           "assertion": "PREPARE oc_v5_turn_waiver_receipt AS"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "historical pending waiver refunds only the exact 259-credit turn to original personal buckets and sends once"
         }
       ]
     },
@@ -3642,7 +3647,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/cards.test.tsx",
-          "assertion": "cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试"
+          "assertion": "a deleted session never defaults to creating another conversation or replaying"
         },
         {
           "layer": "deploy-gate",
@@ -4085,7 +4090,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
-          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+          "assertion": "silence trips idle while waiting and active turns continue beyond 12h/24h"
         },
         {
           "layer": "deploy-gate",
@@ -5531,7 +5536,8 @@
       "rootFixCommit": "f1d63636",
       "coverageCommits": [
         "81b959db",
-        "b6be1f6e"
+        "b6be1f6e",
+        "2cea9e69"
       ],
       "regressions": [
         {
@@ -6283,7 +6289,8 @@
         "92acb899",
         "dc1ea28c",
         "43b509a0",
-        "03d8e914"
+        "03d8e914",
+        "571fa589"
       ],
       "regressions": [
         {
@@ -6435,7 +6442,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/double-failure-card.node-test.mjs",
-          "assertion": "exactly one retry button"
+          "assertion": "exactly one Continue button"
         },
         {
           "layer": "unit",
@@ -6911,12 +6918,17 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
-          "assertion": "the card does not name a button that is not there"
+          "assertion": "the card describes the available continuation"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "MODEL_CONFIG_CHANGED_RETRY_TURN 文案不声称整轮不计费,按钮名与卡片实际一致"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
+          "assertion": "exactly one Continue button"
         }
       ]
     },
@@ -7032,7 +7044,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/project-context-held.node-test.mjs",
-          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one retry runs it"
+          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and continues in the same conversation"
         }
       ]
     },
@@ -8658,6 +8670,9 @@
           "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
           "assertion": "OCV5-584 adjacent citations delivered before a reconnect keep their own links"
         }
+      ],
+      "coverageCommits": [
+        "f9f00cbc"
       ]
     },
     {
@@ -8694,7 +8709,9 @@
         }
       ],
       "coverageCommits": [
-        "65b83b37"
+        "65b83b37",
+        "8a349801",
+        "9cbb8682"
       ]
     },
     {
@@ -8757,7 +8774,10 @@
       ],
       "coverageCommits": [
         "f7bc6630",
-        "a466412d"
+        "a466412d",
+        "43f18ea0",
+        "3ccedbae",
+        "049a2531"
       ]
     },
     {
@@ -9018,7 +9038,8 @@
       "symptom": "商业（2026-10-28，#5adf074e）：uid 4 会话 webmvqbzfs6uiwnwr 全能助手 Box Claude Opus 5.5 改报告，连续显示「任务执行失败 / 内部错误」「自动恢复已停止：已达上限」。根因两处：①23:39Z Box 重启后 23:45Z 的 native resume 回 BOX_EXEC_HTTP_404，journal 行 bff91718 停在 boxState=unknown；Box 上已无该 run，但 OCV5-488 的 closeAbsent 给存活探测传 maxResponseBytes 256，Box exec transport 对 <1024 直接 BOX_EXEC_REQUEST_INVALID（不发请求），catch 静默 false，生产上从未按「进程已不在」释放过一行，只能等 4h15m 过期；期间同会话每条消息 409 BOX_CAPACITY_HELD。②该 409 被分类为 unknown，tape 落 ENGINE_ERROR、wire 落 upstream_failed，二者都 automaticRecovery，master 连排 checkpoint 恢复 1–3，每次再等同一个 hold 约 50 秒。修：探测用 1024 并对不可读/畸形结果 warn box_run_liveness_unreadable；新码 box_capacity_held（可手动重试、不自动恢复）贯通 errorClassify / frames / taxonomy / 文案表。resume 404 本身另票（OCV5-650）。",
       "rootFixCommit": "f7d7af59",
       "coverageCommits": [
-        "a182da53"
+        "a182da53",
+        "ffe666e8"
       ],
       "regressions": [
         {
@@ -9049,7 +9070,10 @@
       "severity": "P2",
       "symptom": "缺省agent的派发已按main受理，但canonical trace仍为NULL及agent:null会话键；接管返回旧agent时也不能从本次帧推断。仅修观测投影，不改变执行、计费或租约身份。",
       "rootFixCommit": "6821243e",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "892f3ed6",
+        "1bb8a534"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -9074,7 +9098,11 @@
       "severity": "P1",
       "symptom": "报障 #a9f49bcf：Box Claude 长任务（~74 分钟）HTTP 200 后 BOX_EXEC_REMOTE_EXIT → BOX_TOOL_TERMINAL_UNPROVEN，回合以 ENGINE_ERROR / BOX_REPLAY_PENDING 收尾，扣费齐但已流出的助手正文不展示，只剩「结果正在收尾」。该 trace 不在个人版数据里（btd-01），按代码静态还原同类回合（CONTINUE-20261027-box-terminal-display §3/§4）。本条只修三处：F1 失败轮部分回答按全文子串判内部串，带 JSON/栈帧引用/以 [ 开头的正常答复整段被丢（改为整体结构判断，detail 守卫不变）；F2 有自动恢复子行时源错误行连正文整行被藏（改为只藏错误卡）；G3 恢复成功的 run 无 native pointer、keep=0 隐私清理不认 <session>/tool-results/，126 后无限重试（按 boxNativeGcFile 规则放行）。请求内 20 秒证明窗口（G1）与恢复正文回写（G2）不在本条。",
       "rootFixCommit": "46b36dc8",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "5f0be34a",
+        "ab2658d1",
+        "48022f40"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -9109,7 +9137,12 @@
       "severity": "P1",
       "symptom": "t1134u：发「怎么根治」后浏览器里看到了流式正文和工具过程，换终端/浏览器再打开这一轮为空。会话 webmvqm6jl6964ekm（k3.1-pro，非 Box），dispatch d70edbec 在 403 后挂起，13:52Z 发版重启时 gateway boot recovery 只用 inbox 字段合成 SERVICE_RESTART crashed tape（text 空），master finalize 把流翻成 tape、读路径不再读帧，每小时的 pruneProjectedLiveFrames 随后删帧，新端 hydrate 只剩合成错误行。修：master 物化这种合成 tape 前用该 dispatch 自己的 live 帧折回正文/思考/工具；前端 SERVICE_RESTART 行把折回的正文作部分回答显示。挂起不结算（G-C）与已删帧会话的补救不在本条（CONTINUE-20261028-box-terminal-verify §4–§6）。",
       "rootFixCommit": "0a6de973",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "3d3f39f1",
+        "5cf81015",
+        "9599479a",
+        "e36fa3b9"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -9144,7 +9177,9 @@
       "severity": "P2",
       "symptom": "商业（2026-10-28）：uid 4 会话 webmvrwwrwvsh1rvi 用 k3.1-pro 发「请再核实一下」后手机 10 秒即断线切后台，引擎 19 秒已就绪、回合在后台持续跑（>30 分钟联网核查），切回时活动行仍显示「全能助手 正在启动引擎 (1184s)…」，用户以为启动卡死。根因：①bridge 在最后一个浏览器断开 60s drain 后关容器 WS，断线期间帧不落库也无法回放，startup 清态帧丢失；②computeTypingLabel 的 engine_* 分支在任何静默判断之前返回；③hello 不给 open dispatch 下发权威阶段，容器 hello 补发也跳过 null。",
       "rootFixCommit": "23de284c",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "6edf026e"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -9216,7 +9251,11 @@
           "assertion": "[multimodal-history-envelope] PASS — actual Antigravity fake-CLI stdin fits after multimodal history trimming"
         }
       ],
-      "coverageCommits": []
+      "coverageCommits": [
+        "142aad7e",
+        "c83f12f2",
+        "aa88f75b"
+      ]
     },
     {
       "id": "INC-20261029-BOX-STOPPED-CREDIT-HOLD",
@@ -9224,7 +9263,9 @@
       "severity": "P1",
       "symptom": "商业 uid2046 已付费 Pro 且余额10000、Opus目录公开启用，但11条 Box首轮失败请求在HTTP finalizer保留预留后，迟到的匹配终止证明只将journal转为aborted/failed_stopped，未释放Redis预留9636，后续请求误报INSUFFICIENT_CREDITS。既有Box billing reconciler补齐已证明终止、零扣费、无usage/handoff/链引用的精确预留释放；原始BOX_TOOL_STOP_REASON_INVALID仍需另行定位，不将预留修复当成模型恢复证明。",
       "rootFixCommit": "1daa6834",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "b96e9e07"
+      ],
       "regressions": [
         {
           "layer": "integration",
@@ -9235,6 +9276,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-master-incident-proofs.ts",
           "assertion": "late proven Box stops release retained credit reservations without charging"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[box-stopped-precheck] PASS — late proven Box stops release retained credit reservations without charging"
         }
       ]
     },
@@ -9244,7 +9290,9 @@
       "severity": "P1",
       "symptom": "商业 Box 模型(box-api-claude-opus-5-5 等)自 2026-10-29 09:41 CST 起全部失败:Box 08:12 恢复后,恢复回来的 cc1 默认登录(/home/box/.claude)首次刷新令牌失败被 CLI 2.1.312 清空,此后每个 Box 回合 CLI 不发请求、只写替身消息「Login expired · Please run /login」。oc-bridge 把这条替身印成真模型名且无 stop_reason,路由报 BOX_TOOL_STOP_REASON_INVALID→BOX_REPLAY_REJECTED(15/15,含 uid2046 的 11 次),登录也从未被 bench。修复让 bridge 按 -p 印成 <synthetic>+is_api_error_message(→BOX_CLI_UPSTREAM_REFUSED,不投递不计费),并把 Login expired/OAuth token revoked/authentication_failed 认成 login_required。恢复服务另需账号持有人重新 OAuth。",
       "rootFixCommit": "9056645e",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "5d1a3366"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -9265,6 +9313,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-master-incident-proofs.ts",
           "assertion": "an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[box-login-expired-stop-reason] PASS — an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p"
         }
       ]
     },
@@ -9275,7 +9328,9 @@
       "symptom": "个人版 #1233：GPT-6.1-Sol 运行时按 Esc 立即终止，且主动停止的 USER_CANCELLED 被会话终态推导缺省映为 executed_error，侧栏和系统通知误报出错。Esc 改为同一回合身份校验的确认框，用户停止归 interrupted 并显示中性已停止。只读核对 usage/journal/ledger：该轮有实际输出，按冻结费率结算9积分且仅扣一次；此改动不更改计费或余额。",
       "rootFixCommit": "26aa6bb3",
       "coverageCommits": [
-        "d1752e0d"
+        "d1752e0d",
+        "3b5c96d3",
+        "5ad56ab1"
       ],
       "regressions": [
         {
@@ -9306,7 +9361,9 @@
       "severity": "P2",
       "symptom": "#1234 个人版 Gemini 4 Argon 高思考的写文件步骤显示约7m44s且一直提示正在思考下一步。只读取证确认整轮completed；上游首字节9.65s、流持续462.94s，思考27290 token，随后write_file仅执行1548ms。此前生成等待被步骤总墙钟并入写文件耗时，完成工具的摘要仍有运行流光。保留总墙钟与既有超时，只把有实证的执行/等待分开显示，并在完成工具后显示等待模型响应及经过时间。",
       "rootFixCommit": "1385e186",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "42720a71"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -9331,7 +9388,9 @@
       "severity": "P2",
       "symptom": "#1234 超时补强：本次 write_file 1548ms 并未挂死，但只读审计发现 Antigravity 30s 合成心跳会持续刷新15min/30min静默门，真实原生文件工具ACTIVE后不结束只剩12h兜底。限定当前turn已开始的5种原生文件读写/编辑工具，用首次ACTIVE复用既有15min阈值与15s巡检；重复ACTIVE、无关输出与合成心跳不续期，完成清理，跨turn隔离。模型生成期和既有计费策略不变；用户主动取消与系统超时原因分离。未扩展全SSE语义进展判定。",
       "rootFixCommit": "cd35591c",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "124a55d7"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -9356,7 +9415,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cron-submit-boundary.ts",
-          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+          "assertion": "silence trips idle while waiting and active turns continue beyond 12h/24h"
         }
       ]
     },
@@ -9410,7 +9469,10 @@
       "severity": "P2",
       "symptom": "#1237 体验官称账单流水无当天扣费、最新一条为 10/28 20:12「其他 · cost=53」。只读核对：流水完整，该行实为 10/29 11:12 CST（浏览器按美西时区显示），下午金融轮 16:56 尚未结算（17:07 入账 -71）。chat 理由未映射成「其他」，memo 为写侧内部 cost=<n>。修复：时间固定北京时间并加入账说明；补全 credit_ledger 全部理由标签；对话扣费行显示模型展示名与会话标题，免单退费转白话。",
       "rootFixCommit": "220fa3e8",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "adfce445",
+        "ae2372b2"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -9447,7 +9509,9 @@
       "rootFixCommit": "220fa3e8",
       "coverageCommits": [
         "e82ad871",
-        "2fbe4f86"
+        "2fbe4f86",
+        "aa21210c",
+        "b95039bc"
       ],
       "regressions": [
         {
@@ -9473,7 +9537,10 @@
       "severity": "P2",
       "symptom": "个人版/商业版 #1240：体验官重命名会话第一次没生效。侧栏列表每 60 秒轮询、窗口每次获得焦点都会重拉并以服务端为准合并；改名前已发出的列表请求在乐观改名之后返回旧标题，把新标题盖回去。改为 PATCH 未落地前钉住本地标题，落地后按服务端 updatedAt 记为已确认，更早的列表快照不再覆盖。商业版（2026-10-30 同步）：商业 useSessionList 没有个人版 confirmedMetadata，按同一语义改为 pendingTitles（PATCH 在飞钉住）+ confirmedTitles（PATCH updatedAt 只为标题背书）。",
       "rootFixCommit": "ec51b675",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "4f0de813",
+        "5ee2cad6"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -9493,7 +9560,9 @@
       "severity": "P2",
       "symptom": "个人版/商业版 #1240：体验官在手机宽度与桌面宽度之间切换时，输入框第一次点击没有反应。窄屏打开的会话抽屉是 Radix 模态 Sheet，靠 md:hidden 隐藏；窗口拉宽后抽屉看不见但模态仍开着，下一次点击只关掉了这个隐形抽屉。改为视口到 md 即关闭抽屉，md 以上不以打开态渲染。",
       "rootFixCommit": "ec51b675",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "4f0de813"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -9528,7 +9597,9 @@
       "severity": "P1",
       "symptom": "本地模型/目录预检未起runner且未计费的拒绝仍消耗每turn委派额度，阻断后续合法委派。",
       "rootFixCommit": "39ea95ed",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "b88a1a6f"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -9553,7 +9624,9 @@
       "severity": "P1",
       "symptom": "Box Agent关闭thinking时发送默认temperature=1，被门禁在预扣前误拒绝为BOX_PARAMETER_UNMAPPED。",
       "rootFixCommit": "9f218caa",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "3cb52acf"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -9573,7 +9646,9 @@
       "severity": "P0",
       "symptom": "Box成功stdout后缺少terminal proof，503且最终aborted/expired_unproven/0。历史keeper实际退出cause无诊断；独立可复现缺陷为收养逃逸后代1s后仍活时keeper永久退出。修复仅对内核pidfd/P_PIDFD可证明的本keeper子进程有界回收，真实ECHILD才准终态；不将历史假设当已证实事故根因，不改变Stop/容量/计费。",
       "rootFixCommit": "946a6e63",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "e5fd53c5"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -9609,6 +9684,9 @@
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[box-stopped-recovery-claim] PASS"
         }
+      ],
+      "coverageCommits": [
+        "03d44825"
       ]
     },
     {
@@ -9638,6 +9716,9 @@
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key"
         }
+      ],
+      "coverageCommits": [
+        "f978157d"
       ]
     },
     {
@@ -9648,7 +9729,8 @@
       "rootFixCommit": "ae556ee5",
       "coverageCommits": [
         "b4fbbfc8",
-        "f8ca2a8c"
+        "f8ca2a8c",
+        "64ba5a7f"
       ],
       "regressions": [
         {
@@ -9735,6 +9817,9 @@
           "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
           "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
         }
+      ],
+      "coverageCommits": [
+        "d03b36f0"
       ]
     },
     {
@@ -9744,7 +9829,9 @@
       "symptom": "商业版 uid1 发「hi」时，周额度已用尽的登录仍被选中。上游拒绝后自动恢复改发了「从断点继续」，原消息仍显示发送失败和继续。什么都没执行过时应原样重发用户原文；自动恢复成功接手后，原消息不再显示发送失败。",
       "rootFixCommit": "228248b9",
       "coverageCommits": [
-        "7714ec8b"
+        "7714ec8b",
+        "d5f09049",
+        "8c93a18b"
       ],
       "regressions": [
         {
@@ -10122,6 +10209,668 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[ocv5-762-exec-417-wedge] PASS"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261023-SYSTEM-APPROVAL-FENCING",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "未上线候选在默认Codex审查及独立SQLite fixture中发现：同资源预先创建的master/browser提案可绕过另一次执行的unknown闸门；DEFERRED事务升级可出现SQLITE_BUSY_SNAPSHOT，使完成回执丢失。未涉及真实用户副作用或资金。",
+      "rootFixCommit": "e72089cd",
+      "coverageCommits": [
+        "987d2125"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-system-approval-proofs.ts",
+          "assertion": "[ocv5-610-durable-approval-fencing] PASS"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261023-PROMPT-PRIVACY-LIFECYCLE",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "未上线候选默认Codex复审发现：隐私metadata失败后可能遗留已修改的desired配置，使重试跳过warm重启；native compact/preheat等待metadata期间销毁会话仍可新启动。仅隔离fixture复现，无真实用户、模型或资金影响。",
+      "rootFixCommit": "4395e393",
+      "coverageCommits": [
+        "4395e393"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-prompt-privacy-proofs.ts",
+          "assertion": "[prompt-privacy-proofs] PASS fresh consent, operation lifetime and stopped-process boundary"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261024-SYSTEM-PROFILE-READ",
+      "occurredAt": "2026-10-24",
+      "severity": "P1",
+      "symptom": "未上线候选默认Codex复审发现enabled=false的保留称呼可被显式跨会话读取；独立fixture复现。主控同时收紧软删除但active账号的提案预览/回执读取。未涉及真实用户数据、模型或费用。",
+      "rootFixCommit": "c0930c6c",
+      "coverageCommits": [
+        "c0930c6c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/preferenceOperations.test.ts",
+          "assertion": "withdrawn profile grants never disclose a retained nickname or session even to the old session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/systemActionsBrowserHttp.test.ts",
+          "assertion": "soft-deleted active accounts cannot read an existing proposal preview or result"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-system-executor-proofs.ts",
+          "assertion": "[system-executor-proofs] PASS independent browser approval, original request replay and frozen executors"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261024-TEAM-MODE-REBOUND",
+      "occurredAt": "2026-10-24",
+      "severity": "P1",
+      "symptom": "体验混合账号保存defaultMode=team，空态关闭后首发solo未落会话配置，后续GET继承团队默认造成回弹；Goal/GitHub提前物化有同类丢失；旧设备全局团队标记还可影响其它账号初态。实际App/Chromium在独立HTTP/WS fixture先红跑确认，未对体验账号写操作。 未上线候选的额外session ensure失败路径曾吞掉solo首发；实际浏览器503红跑确认后已恢复离线队列与重连单次发送契约，无真实用户数据影响。",
+      "rootFixCommit": "6f345868",
+      "coverageCommits": [
+        "6f345868",
+        "e9a2c165",
+        "0f5e6eca"
+      ],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "team close persists solo through first send and reload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "legacy device team flag cannot activate team before account config arrives"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "closing an existing team stays solo on save failure and can persist on explicit retry"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "solo first send stays queued when session creation fails and reconnect sends it once"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "first-send cost confirmation keeps the draft and commits solo only after acceptance"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261025-SWITCH-COST-UX",
+      "occurredAt": "2026-10-25",
+      "severity": "P1",
+      "symptom": "OCV5-614 Grok 过度防御审计 N1/N2：费用服务暂不可用被当成确认拒绝，恢复任务暂停、客户端消息误标重新确认。D1/D2/D3 按用户 t965u 与 2026-10-25 START 已定体验口径收窄。隔离 fixture 证明旧协作冲突路径无法自动保存本次选择、新路径重读并重存一次；无生产写入，未声称真实用户资金损失。D4 因 alt 同样提交 quoteToken 铸 consent 按条件不改。",
+      "rootFixCommit": "876514a7",
+      "coverageCommits": [
+        "876514a7",
+        "1380f14a"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostGuard.test.ts",
+          "assertion": "refusal pauses for confirmation while unavailable errors fail closed and requeue"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostHttp.test.ts",
+          "assertion": "cost API returns 503 for unavailable pricing and preserves user-action statuses"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelSwitchCost.test.ts",
+          "assertion": "expected-cost boundary gates quote, confirmation and dispatch without relaxing consent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/modelSwitchCostDispatch.test.ts",
+          "assertion": "transient cost failure keeps queued payload and permits a later authorized retry"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "one collaboration conflict saves the clicked solo mode without asking again"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261026-REFRESH-GRACE",
+      "occurredAt": "2026-10-26",
+      "severity": "P1",
+      "symptom": "个人版体验-办公：登录后新标签/慢网打开裸首页掉登录。refresh rotate 后旧 oc_rt 超过默认 10s race grace（实测 ~11.6s）被判 theft 整族吊销清 cookie。OCV5-622：grace 默认 45s + 跨 tab refresh 单飞；超 grace / fingerprint 不一致仍 theft。",
+      "rootFixCommit": "c71a59be",
+      "coverageCommits": [
+        "c71a59be",
+        "3bf0f487",
+        "68e5d8b7",
+        "79eef834"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: late joiner waits — holder answers busy (Codex P1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: release during claim settle does not hang waiter (Codex r2 P1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: overlapping acquires serialize"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse rotated refresh at 50s (default grace=45) → still theft"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/refresh-cross-tab.node-test.mjs",
+          "assertion": "OCV5-622 actual two browser tabs serialize refresh and preserve cookies after reload"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "reuse rotated refresh at 50s (default grace=45) → still theft"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261030-LONGTASK-CONTINUE",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "商业回合 #21fdeea1 已有128条成功请求、273352输出tokens，物理Box进程第128轮之后被BOX_TOOL_ROUND_LIMIT截断；续签后的lease未进入gateway自动重试，重试带初始旧lease而报MODEL_AUTHORITY_EXPIRED，最终把已产出的128条请求整轮退款5543积分。修复保持每个物理进程128轮/4h/256MiB边界，在完整exchange/authority/计费身份校验后durably认领继承者，原keeper真实停止证明落库后，从现有历史和已完成工具结果开启新代；保留Stop优先、容量、未知不重发及跨代idle证明。历史已退款不回收。续签共享authority保存最新短票、活跃dispatch严格续期；未来整轮免单只认完整的零产出和结算证据。所有当前错误/中断执行入口统一在原会话继续，零产出同样适用，保留原目标、已完成步骤、路由和费用。",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.integ.test.ts",
+          "assertion": "260 paid-result boundaries span three bounded generations and finish idle"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.test.ts",
+          "assertion": "resource boundaries apply to one generation and reserve a complete next message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.test.ts",
+          "assertion": "only a durable stopped generation reaches fresh launch; unknown and cancellation keep the claim"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxUserStopHandler.test.ts",
+          "assertion": "an authenticated Stop durably cancels the rollover gap before looking for another run"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/boxLongtaskGate.test.ts",
+          "assertion": "long-task release proof rejects silent skip, missing behavior, truncation and false exit-zero TAP"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-longtask.ts",
+          "assertion": "[biz-longtask-box-generations] PASS — 260 requests span 128/128/4 physical generations; proven stops preserve prior usage, gap cancellation and capacity fences hold, and final idle converges"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalTurnLeaseRenew.test.ts",
+          "assertion": "active exact dispatch recovers expired lease after 24h with strict legacy wire"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/masterTurnLease.test.ts",
+          "assertion": "retry refresh saves the latest lease before any subprocess hot-update"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbAdapterTurnParity.test.ts",
+          "assertion": "authority synthetic diagnostic preserves earlier answer in the same segment"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnWaiverPolicy.test.ts",
+          "assertion": "pending canonical engine usage denies before billing job execution (r1 regression)"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "r1: positive canonical engine usage denies before and after its billing job"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "historical applied authority waiver keeps its receipt and is never recaptured"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/useChatCardActionsContinuation.test.tsx",
+          "assertion": "double clicks hydrate and submit only once; late hydration cannot cross sessions"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/manualTaskContinuation.test.ts",
+          "assertion": "a failed user row continues its own first or second goal"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/longtask-continue.node-test.mjs",
+          "assertion": "t1360u real App: paid and zero-output tasks continue in the original conversation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "an admitted manual checkpoint retires the old failed UserCard through running and success"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/manualTaskContinuationChunkFailure.test.tsx",
+          "assertion": "a failed Continue chunk reports once and never falls back to task replay or send"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "manual checkpoint preserves the paid partial answer through completion and reload"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "a manually continued diagnostic-only error does not become a saved answer"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.integ.test.ts",
+          "assertion": "a mutable recovery alias cannot reintroduce 128 retired paid rows into idle"
+        }
+      ],
+      "rootFixCommit": "34388f31",
+      "coverageCommits": [
+        "0035dad5",
+        "edfb7e87",
+        "f3431226",
+        "061ca420",
+        "aebfb4cb",
+        "c0688f55",
+        "031472d3"
+      ]
+    },
+    {
+      "id": "INC-20261030-ADVISOR-NOWRITE",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "uid2058 会话 webmvvde0m9oyavl3 明确要求顾问只给建议、不要改文件，主模型仍以顾问模式验证要求为由成功 Edit 提纲。禁写回合现冻结只读策略，在 CCB/Codex/Grok/Cursor 原生工具和 MCP 调用边界卸掉写入、命令和委派路径，顾问同步收到禁写约束，下一普通回合恢复工具。",
+      "rootFixCommit": "bd2545a8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorNoWriteTurn.test.ts",
+          "assertion": "a queued normal submit cannot clear the active restricted turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorReadOnlyCcb.test.ts",
+          "assertion": "CCB warm transitions rebuild the tool surface and drop external MCP before user input"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorReadOnlyBox.test.ts",
+          "assertion": "preserves no-write tools and closes remote MCP discovery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdvisorReadOnly.test.ts",
+          "assertion": "Codex read-only turn replaces a warm process, removes native execution, and restores normal tools"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/mcp-memory/src/__tests__/advisorReadOnlyPolicy.test.ts",
+          "assertion": "advisor read-only MCP removes mutators and rejects direct calls before gateway or file writes"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "proveAdvisorNoWrite(root);"
+        }
+      ],
+      "coverageCommits": [
+        "c65f8b61",
+        "d2db51a3",
+        "0c9ad494",
+        "0d21054b",
+        "3c5cd019",
+        "2e508c2f",
+        "92d8086c"
+      ]
+    },
+    {
+      "id": "INC-20261030-SHARE-PREVIEW-CLEANUP",
+      "occurredAt": "2026-10-30",
+      "severity": "P2",
+      "symptom": "顾问禁写修复的完整前端门暴露既存分享预览清理缺陷：关闭或卸载弹窗后 FileReader 仍读取，延迟绘图也会新启动读取。Vitest 还原 jsdom realm 后遗留读取触发 Expected an Uint8Array 未处理异常，6624 个断言虽通过但命令失败。现清理时取消读取，并阻止失效绘图启动读取；保留正常预览与导出行为。",
+      "rootFixCommit": "9c4f805b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ShareDialog.test.tsx",
+          "assertion": "关闭后绘图才完成时不会再启动图片读取"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
+          "assertion": "share preview cleanup aborts the native FileReader when the dialog closes"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261030-REFRESH-UNDELIVERED-SETCOOKIE",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "个人版 5 个体验账号（1614 体验官、1617 编码、1618 科研、1619 办公、1620 金融）掉登录：一轮多 tab 续期的最后一张 refresh Set-Cookie 没留在浏览器，数小时后浏览器交出已 rotated 的旧 oc_rt，超 45s grace 被判 theft，把从未用过、11 月才到期的活票整族吊销，页面静默落到营销首页且地址栏仍是 /p/<项目>。修复：旧票的直接后继从未被使用，且 UA、authBoundIp、真实客户端 IP（refresh_tokens.client_ip；个人版 loopback socket 上取 CF-Connecting-IP，不取 X-Forwarded-For 首段）都非空且一致时补发同族新票；被替掉的后继记 revoked_reason='reissued'，之后宽限外再出示即 theft（宽限内同指纹 REFRESH_RACE），补发写 refresh_reissued 日志。后继已用、指纹不符、未存 client_ip 仍 theft。前端：曾登录的浏览器启动续期明确失效时提示「登录已过期，请重新登录」并保留深链，登录后回原页。迁移 0331。",
+      "rootFixCommit": "82d4aabc",
+      "coverageCommits": [
+        "7bfe5016",
+        "99628420",
+        "66fb8310",
+        "d0f30989"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "lost Set-Cookie: reuse at 50s and at 6h, same fingerprint, unused successor → reissue, no theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse outside grace after the successor was itself rotated → still theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse outside grace with unused successor but different client IP → still theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "loopback socket: reissue matches stored client IP; a different one, or an explicit null, is theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-01 a different real client IP cannot reissue through the loopback socket"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-02 a reissued successor cannot be alternated with the attacker"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-03 two tabs presenting the same lost cookie: one reissue, one REFRESH_RACE, the new ticket stays live"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-04 a reissue is stored as reissued, distinct from a normal rotation"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh-http.integ.test.ts",
+          "assertion": "H-02 reissue requires the stored CF-Connecting-IP; XFF spoof and a different IP are theft"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/refreshClientIp.test.ts",
+          "assertion": "loopback trusts one CF-Connecting-IP and ignores a spoofed or missing header"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/App.test.tsx",
+          "assertion": "深链 /p/x 启动续期失效：提示登录已过期，登录后回到该项目"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/auth-expired-deeplink.node-test.mjs",
+          "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261031-TURN-LABEL-UNDERCOUNT",
+      "occurredAt": "2026-10-31",
+      "severity": "P1",
+      "symptom": "个人版一轮实扣 132（模型 97 + 四次 figcheck 视觉复核 7+9+8+11），回复标注只显示 97。工具扣费按容器级会话记账，没有回合键。OCV5-704：容器恰好一个已有 turn key 的 open 回合时，把这次工具扣费归到该回合并推进聊天；零个或多个不猜。金额不变、只改归属、不追溯修改历史记录。",
+      "rootFixCommit": "6e85b2fb",
+      "coverageCommits": [
+        "7f4602e9"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "one open turn labels model 97 plus vision 7+9+8+11"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "zero or several open turns keep the label at 97 while the ledger stays 132"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "does not guess when there is no open turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "does not guess when several open turns are visible"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/processRoundCredits.test.tsx",
+          "assertion": "shows 本轮 132 积分 after refresh and while the turn is live"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.integ.test.ts",
+          "assertion": "real PG attribution ${state}: debit 132 once, refresh label ${state === 'one' ? 132 : 97}"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "real PG attribution one: debit 132 once, refresh label 132"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261101-UPLOAD-CHUNK-1G",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "单次 HTTP 正文仍是 100MiB，组装后的单个文件可以到 1GiB。文件按 16MiB 分片上传，可以断点续传并看到进度。跨机路径按片推送，由 agent 流式拼接。每人有 10GiB 免费上传空间，满了提示删除旧文件，本次不收费。已发布文件保留 30 天，最近会话仍引用的不删。残留分片会清理。rar 和 zip 不自动解压。不改计费。",
+      "rootFixCommit": "57b6cbd6",
+      "coverageCommits": [
+        "b228846d",
+        "9717d18b",
+        "32b9c85f",
+        "49bbf9b3",
+        "829a9925"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/uploadRetentionAuthority.integ.test.ts",
+          "assertion": "upload retention reads authoritative PG hot, archive and exact deferred payloads with bounded complete scans"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+          "assertion": "10GiB quota tells the user to delete old files and does not charge"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadChunk.test.ts",
+          "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/security.test.ts",
+          "assertion": "HTTP body stays 100MiB and the assembled file cap is 1GiB"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+          "assertion": "单个文件超过 1024MB 时不上传"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261101-UPLOAD-SCAN-FREEZE",
+      "occurredAt": "2026-11-01",
+      "severity": "P1",
+      "symptom": "个人版PR1337引入每小时同步扫描用户卷与JSONL，master事件循环实测冻结204413ms，healthz超时、聊天桥断开并触发watch回切，遗留双egress混合状态。扫描改为异步目录和256KiB分块IO，自动清理需OC_UPLOAD_RETENTION_ENABLED=1显式开启，默认关闭；保留1GiB/2GiB/10GiB上传限额与不完整引用扫描禁止删除保护。",
+      "rootFixCommit": "f9aa97ce",
+      "coverageCommits": [
+        "6e390db8"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-upload-retention-proof.ts",
+          "assertion": "UPLOAD_RETENTION_HTTP_RESPONSIVE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+          "assertion": "large JSONL directory scans keep heartbeat gaps below one second"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+          "assertion": "chunk-boundary references survive and failed or oversized reads fail closed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+          "assertion": "retention is opt-in and its disabled scheduler and entry point do no filesystem scans"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261104-ANTIGRAVITY-DELIVERY",
+      "occurredAt": "2026-11-04",
+      "severity": "P1",
+      "symptom": "Antigravity relay disconnects could hang or reset instead of returning errors; completed native answers could be lost when stdout/result was empty, causing red cards and needless context reconstruction. Recovery is read-only and launch-bound, never reruns models or tools.",
+      "rootFixCommit": "29a94025",
+      "coverageCommits": [
+        "75eb8d00",
+        "e155a377"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "spawn-time DB watermark rejects a replayed first USER_INPUT and its old answer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityNativeTrajectory.test.ts",
+          "assertion": "overlong status cannot redirect standard decoder into thinking_signature bytes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityDeliveryPersistence.test.ts",
+          "assertion": "survives SQLite reopen"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[antigravity-durable-delivery] PASS"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261105-FAILED-FIRST-CONTINUE",
+      "occurredAt": "2026-11-05",
+      "severity": "P1",
+      "symptom": "Box synthetic upstream API errors were lost behind shutdown metadata; a finalized zero-token failed first turn retained no source model, so same-model Continue incorrectly opened a switch-cost confirmation. Preserve safe first-cause classification and prove failed-route identity without weakening genuine-switch or ambiguous-history risk checks.",
+      "rootFixCommit": "70836694",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxFailureDiagnosticPipeline.test.ts",
+          "assertion": "actual failed keeper/supervisor survives cleanup as a safe durable diagnostic"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostContext.integ.test.ts",
+          "assertion": "same model continues the failed first turn without a switch quote"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostContext.integ.test.ts",
+          "assertion": "a cheaper different model or different agent still requires an actual risk quote"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostContext.integ.test.ts",
+          "assertion": "the real batched tape writer produces an eligible failed-start anchor"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-switch-cost-continue.node-test.mjs",
+          "assertion": "a zero-token crashed first turn continues on the same model without a cost dialog"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261113-CODEX-LATE-STOP-CLOSURE",
+      "occurredAt": "2026-11-13",
+      "severity": "P1",
+      "symptom": "线程卸载被拒后，真实本地停止证明晚于有界 stop，未执行 admission 未自动释放；迟到证明须完成身份限定清理且不重放模型、不重复计费。",
+      "rootFixCommit": "72cef4a7",
+      "coverageCommits": [
+        "cd2f0391"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexRemoteAdapterE2E.test.ts",
+          "assertion": "after a late local stop proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-codex-late-stop-proof.sh",
+          "assertion": "a node that refuses the thread unload fences the lane and closes the undispatched admission"
         }
       ]
     }

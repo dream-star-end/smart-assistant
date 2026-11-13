@@ -127,6 +127,8 @@ export interface AgentSession {
    * reaches this budget.
    */
   _turnCreditBudgetFen?: bigint
+  /** Set and cleared only while owning session.lock. */
+  _turnReadOnly?: boolean
   /** Active turn's fail-safe tape finalizer. The outer liveness watchdog uses
    * this instead of emitting an unpersisted error and abandoning the parser. */
   _persistActiveTurn?: (
@@ -148,6 +150,8 @@ export interface AgentSession {
    * Nested delegates append their full transcript here in execution order so
    * the first-level durable team card survives reload with every descendant. */
   _durableDelegateTranscript?: unknown[]
+  /** Exact live taskboard activity timestamp; not persisted or inferred from polling. */
+  _taskboardLastActivityAt?: number
   /** Complete raw event stream for this one-shot delegate turn. The delegate
    * channel is not persisted as its own chat session, so handleDelegateTask
    * moves this collector into the parent DurableAgentGroup. */
@@ -231,6 +235,11 @@ export interface AgentSession {
   _boxContextOwner?: string
   /** Set while the lock-held idle path is inside runner.submitTurn. */
   _idleRunning?: boolean
+  /** OCV5-755: armed pre-expiry idle compaction for the last Box turn. */
+  _idlePreExpiryTimer?: ReturnType<typeof setTimeout>
+  _idlePreExpirySource?: { sessionId: string; turnKey: string }
+  /** OCV5-755: a pre-expiry compaction holds session.lock right now. */
+  _idlePreExpiryActive?: boolean
   /** OCV5-297: internal idle compact turns currently using the runner. Not a
    * client turn and not _activeTurnCount (prompt-queue admission asserts that
    * one); lifecycle gates (recycle drain, model switch, preheat) read it. */

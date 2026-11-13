@@ -26,12 +26,19 @@ import type { EngineEvent } from "../engine/engineEvents.js";
 import type { TurnParams } from "../engine/engineAdapter.js";
 import type { SubprocessRunner } from "../subprocessRunner.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
+import { refreshTurnModelAuthorityLease } from "../masterTurnLease.js";
 
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now();
   model: string | undefined = "claude-opus-4-6";
   interrupts = 0;
   submitted: Array<{ input: unknown; requestId?: string }> = [];
+  updatedLeases: string[] = [];
+  failLeaseUpdate = false;
+  async updateTurnLease(lease: string): Promise<void> {
+    this.updatedLeases.push(lease);
+    if (this.failLeaseUpdate) throw new Error('stdin update failed');
+  }
   consultTurnBinding:
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined;
@@ -107,6 +114,45 @@ function beginTurn(
 }
 
 // ── 标准消息构造 ──────────────────────────────────────────────────────────
+
+test('rolling renewal keeps the fresh shared lease when stdin update fails and stops on finalization', async () => {
+  const originalSet = globalThis.setTimeout;
+  const originalClear = globalThis.clearTimeout;
+  const timers = new Map<object, { fn: () => void; ms: number }>();
+  globalThis.setTimeout = ((fn: () => void, ms: number) => {
+    const handle = { unref() {} };
+    timers.set(handle, { fn, ms });
+    return handle;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((handle: object) => { timers.delete(handle); }) as unknown as typeof clearTimeout;
+  try {
+    const { adapter, runner } = makeAdapter();
+    const turn = beginTurn(adapter, []);
+    await turn.submitted;
+    runner.failLeaseUpdate = true;
+    const authority = { leaseEnvelope: 'initial' };
+    const internal = adapter as any;
+    const stop = internal._startLeaseRenewal(internal._activeTurn, 'turn', authority,
+      (key: string, owner: { leaseEnvelope: string }, opts: any) => refreshTurnModelAuthorityLease(key, owner, {
+        ...opts, renew: async () => ({ lease: 'fresh', expiresAt: 99 }),
+      }));
+    const [firstHandle, first] = [...timers.entries()][0]!;
+    assert.equal(first.ms, 30 * 60_000);
+    timers.delete(firstHandle);
+    first.fn();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.equal(authority.leaseEnvelope, 'fresh');
+    assert.deepEqual(runner.updatedLeases, ['fresh']);
+    assert.equal([...timers.values()][0]?.ms, 60_000);
+    stop();
+    assert.equal(timers.size, 0);
+    runner.msg(resultRow());
+    await turn.summary;
+  } finally {
+    globalThis.setTimeout = originalSet;
+    globalThis.clearTimeout = originalClear;
+  }
+});
 
 function textDelta(text: string) {
   return {
@@ -466,6 +512,39 @@ describe("CcbAdapter turn parity", () => {
     assert.equal(summary?.errorKind, undefined);
     assert.equal(summary?.assistantText, prose);
     assert.notEqual(summary?.errorDetail, "MODEL_AUTHORITY_EXPIRED");
+  });
+
+  test("authority synthetic diagnostic preserves earlier answer in the same segment", async () => {
+    const { adapter, runner } = makeAdapter();
+    const events: EngineEvent[] = [];
+    const turn = beginTurn(adapter, events);
+    const answer = '已完成分析，修改内容已保存。';
+    const raw = 'API Error: 403 {"error":{"code":"MODEL_AUTHORITY_INVALID","message":"internal lease details"}}';
+    runner.msg(textDelta(answer));
+    runner.msg({ type: 'assistant', error: 'unknown', message: { content: [{ type: 'text', text: raw }] } });
+    runner.msg(resultRow({ is_error: true, errors: [raw], result: raw }));
+    const summary = await turn.summary;
+    assert.equal(summary?.errorKind, 'model_authority');
+    assert.equal(summary?.assistantText, answer);
+    assert.equal(summary?.assistantSegments.map((s) => s.text).join(''), answer);
+    assert.doesNotMatch(JSON.stringify(summary), /internal lease details|MODEL_AUTHORITY_INVALID/);
+    assert.equal(events.some((e) => e.kind === 'block' && e.block.kind === 'text' && e.block.text.includes('internal lease details')), false);
+  });
+
+  test("authority synthetic diagnostic preserves a completed tool and preceding answer", async () => {
+    const { adapter, runner } = makeAdapter();
+    const turn = beginTurn(adapter, []);
+    runner.msg(textDelta('已读取文件。'));
+    runner.msg(assistantToolUse('read-1', 'Read', { file_path: '/tmp/a' }));
+    runner.msg(toolResult('read-1', 'contents'));
+    const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","message":"expired"}}';
+    runner.msg({ type: 'assistant', error: 'unknown', message: { content: [{ type: 'text', text: raw }] } });
+    runner.msg(resultRow({ is_error: true, errors: [raw], result: raw }));
+    const summary = await turn.summary;
+    assert.equal(summary?.assistantText, '已读取文件。');
+    assert.equal(summary?.tools.length, 1);
+    assert.equal(summary?.tools[0]?.completed, true);
+    assert.doesNotMatch(JSON.stringify(summary?.assistantSegments), /MODEL_AUTHORITY_INVALID/);
   });
 
   test("非 auth 的 isError → errorKind='other'", async () => {

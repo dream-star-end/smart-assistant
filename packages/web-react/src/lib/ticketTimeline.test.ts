@@ -66,6 +66,13 @@ function run(over: Partial<TicketRun> = {}): TicketRun {
 }
 
 describe('buildTicketTimeline', () => {
+  test('keeps actual models and bounded live preview through the real normalization path', () => {
+    const model = buildTicketTimeline([], [run({ status: 'running', finishedAt: null, actualModels: ['actual-a', 'actual-b'], preview: { text: '实时输出', toolNames: ['Read'], lastActivityAt: T0 } })], [])
+    const node = model.nodes.find((entry) => 'run' in entry)
+    expect(node?.run?.actualModels).toEqual(['actual-a', 'actual-b'])
+    expect(node?.run?.preview).toEqual({ text: '实时输出', toolNames: ['Read'], lastActivityAt: T0 })
+  })
+
   test('评论、状态、执行按时间从旧到新', () => {
     const model = buildTicketTimeline(
       [comment({ id: 'c', createdAt: T0 + 20 })],

@@ -6,13 +6,14 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY="${DEPLOY_SCRIPT:-$DIR/deploy-v5-selfhost.sh}"
 LIB="${RELEASE_LIB:-$DIR/v5-selfhost-master-release-lib.sh}"
+DIAGNOSTICS="$(dirname "$DEPLOY")/lib/v5-selfhost-diagnostics.sh"
 
 pass=0
 fail=0
 ok() { pass=$((pass + 1)); echo "PASS $*"; }
 bad() { fail=$((fail + 1)); echo "FAIL $*"; }
 
-fn() { awk -v n="$1() {" 'index($0, n) == 1 {f=1} f {print} f && /^}/ {exit}' "$DEPLOY"; }
+fn() { awk -v n="$1() {" 'index($0, n) == 1 {f=1} f {print} f && /^}/ {exit}' "$DEPLOY" "$DIAGNOSTICS"; }
 BASE="$(mktemp -d /tmp/v5-watch-sync.XXXXXX)"
 trap 'rm -rf "$BASE"' EXIT
 {

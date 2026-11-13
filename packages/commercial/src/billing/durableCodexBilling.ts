@@ -17,11 +17,13 @@ import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { getAgentCostMultiplier, composeMultiplier } from "./agentMultiplier.js";
 import type { TokenUsage } from "./calculator.js";
 import {
+  type CodexFinalizeResult,
   isPermanentCodexWaiver,
   JournalSettlementClaimLostError,
   makeCodexFinalizer,
   permanentCodexWaiverReason,
 } from "./codexFinalizer.js";
+import { costBroadcastParentSessionId, journalTurnKey } from "./openTurnAttribution.js";
 import { parseVerificationSponsorshipSnapshot } from "./verificationSponsorship.js";
 import { parseBillingPricing } from "./persistedBillingPricing.js";
 import type { PricingCache } from "./pricing.js";
@@ -38,6 +40,8 @@ export interface DurableCodexBillingDeps {
   preCheckRedis: PreCheckRedis;
   pricing: PricingCache;
   logger?: Logger;
+  /** Live push for a fresh positive debit. Tape replay omits this. */
+  broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void;
 }
 
 export type DurableCodexBillingSettleOutcome =
@@ -326,9 +330,10 @@ export async function settleDurableCodexBilling(
     attemptNo,
     verificationSponsorship: parseVerificationSponsorshipSnapshot(ctx.verificationSponsorship),
   });
+  let committed: CodexFinalizeResult;
   try {
-    await finalizer.commit(usageFromFrame(frame), frame.status, {
-      turnKey: frame.turnKey ?? null,
+    committed = await finalizer.commit(usageFromFrame(frame), frame.status, {
+      turnKey: journalTurnKey(frame.turnKey, ctx.turnKey),
       parentTurnKey: frame.parentTurnKey ?? null,
       parentSessionId: frame.parentSessionId ?? null,
       delegateAgentId: frame.delegateAgentId ?? null,
@@ -339,6 +344,31 @@ export async function settleDurableCodexBilling(
       return await resolveClaimLoss();
     }
     throw error;
+  }
+  if (
+    committed.debitedCredits !== null &&
+    committed.debitedCredits > 0n &&
+    deps.broadcastToUser
+  ) {
+    const parentSessionId = costBroadcastParentSessionId(frame.parentSessionId, ctx.chatSessionId);
+    try {
+      await deps.broadcastToUser(userId, {
+        type: "outbound.cost_charged",
+        requestId,
+        model,
+        costCredits: committed.costCredits.toString(),
+        debitedCredits: committed.debitedCredits.toString(),
+        balanceAfter: committed.balanceAfter !== null ? committed.balanceAfter.toString() : null,
+        clamped: committed.clamped,
+        sessionId: frame.engineSessionId,
+        ...(parentSessionId ? { parentSessionId } : {}),
+      });
+    } catch (err) {
+      // The debit is already durable. A missed live frame still shows up on refresh.
+      log?.warn("durable_codex_cost_broadcast_failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   log?.info("durable codex billing settled from immutable turn tape", {
     model,

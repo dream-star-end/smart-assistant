@@ -56,7 +56,9 @@ export function contentReviewDbPath(env: NodeJS.ProcessEnv = process.env): strin
 export function openContentReviewStore(dbPath: string): ContentReviewStore {
   mkdirSync(dirname(dbPath), { recursive: true })
   const db = new Database(dbPath)
+  db.pragma('busy_timeout = 5000')
   db.pragma('journal_mode = WAL')
+  db.pragma('synchronous = NORMAL')
   db.exec(`
     CREATE TABLE IF NOT EXISTS content_reviews (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

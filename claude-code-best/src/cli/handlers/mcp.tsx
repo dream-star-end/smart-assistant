@@ -54,7 +54,7 @@ async function checkMcpServerHealth(name: string, server: ScopedMcpServerConfig)
 }
 
 // mcp serve (lines 4512–4532)
-export async function mcpServeHandler({ debug, verbose }: { debug?: boolean; verbose?: boolean }): Promise<void> {
+export async function mcpServeHandler({ debug, verbose, toolAllowlist }: { debug?: boolean; verbose?: boolean; toolAllowlist?: string }): Promise<void> {
   const providedCwd = cwd();
   logEvent('tengu_mcp_start', {});
 
@@ -65,6 +65,12 @@ export async function mcpServeHandler({ debug, verbose }: { debug?: boolean; ver
       cliError(`Error: Directory ${providedCwd} does not exist`);
     }
     throw error;
+  }
+
+  if (toolAllowlist !== undefined) {
+    // The narrow profile is dispatched before main/init by entrypoints/cli.
+    // Never let a direct main caller fall through to the general MCP server.
+    throw new Error('CC5_TOOL_HOST_REQUIRES_BOOTSTRAP_ENTRY');
   }
 
   try {

@@ -224,6 +224,38 @@ export function clientIpOf(req: IncomingMessage): string {
   return socketIp;
 }
 
+/**
+ * Real client IP for refresh_tokens.client_ip and the lost-cookie reissue check.
+ *
+ * Personal ingress is only `cloudflared tunnel --url http://127.0.0.1:18790`,
+ * so authBoundIp is 127.0.0.1 for every visitor. Do not use clientIpOf: that
+ * takes the first X-Forwarded-For hop, and cloudflared forwards a client-supplied
+ * XFF (there is no Caddy overwrite on this edition).
+ *
+ * Loopback socket: trust a single CF-Connecting-IP. Cloudflare overwrites that
+ * header at the edge. A missing header, a comma, or an invalid address is an
+ * incomplete fingerprint (null) and refuses reissue. Non-loopback socket: the
+ * socket address itself is the client; a spoofed CF-Connecting-IP is ignored.
+ * The 45s race grace still uses authBoundIp, not this value.
+ */
+export function refreshClientIpFromRequest(
+  socketIp: string | null | undefined,
+  cfConnectingIpHeader: string | string[] | undefined,
+): string | null {
+  const rawSocket = (socketIp ?? "").trim();
+  if (LOOPBACK_RE.test(rawSocket.toLowerCase())) {
+    const header = Array.isArray(cfConnectingIpHeader)
+      ? (cfConnectingIpHeader.length === 1 ? cfConnectingIpHeader[0] : undefined)
+      : cfConnectingIpHeader;
+    if (typeof header !== "string" || header.includes(",")) return null;
+    const cleaned = cleanClientIp(header);
+    return cleaned ? normalizeClientIp(cleaned) : null;
+  }
+  if (!isIP(rawSocket)) return null;
+  const cleaned = cleanClientIp(rawSocket);
+  return cleaned ? normalizeClientIp(cleaned) : null;
+}
+
 // 导出给测试用,不是 public API
 export const __internal_clientIp = { ipv4ToInt, ipv6ToBigInt, ipInCidrV4, ipInCidrV6, isCloudflareIp, normalizeClientIp };
 

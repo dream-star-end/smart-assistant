@@ -4162,6 +4162,28 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # OCV5-763: imported selfhost safety proofs run on this exact pinned checkout.
+  # Isolated SQLite/files/loopback only; no production credentials or billing.
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-approval-proofs.ts); then
+    echo "✗ pinned system-approval-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts); then
+    echo "✗ pinned prompt-privacy-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-executor-proofs.ts); then
+    echo "✗ pinned system-executor-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-upload-retention-proof.ts); then
+    echo "✗ pinned upload-retention-proof failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # Phase A writer / Phase B reader must choose the same physical billing
   # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
   # pinned staging tree, not the shared checkout.
@@ -4243,6 +4265,13 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # Real remote relay + UID-local ToolHost, rebuilt only from this pinned archive.
+  if ! (cd "$box_cand" && bash scripts/check-v5-codex-late-stop-proof.sh); then
+    echo "✗ pinned Codex late-stop closure proof failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # check-v5-box-incident-proofs.ts stays named here so the deploy-gate ledger
   # still sees it. The runner transpiles that file once before main()'s 120s
   # deadline. Do not switch this back to npx tsx and do not raise LIMIT_MS.
@@ -4263,6 +4292,14 @@ build_release() {
       -u OC_V5_PROOF_TEST_DATABASE_URL \
       npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha"); then
     echo "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+      TEST_DATABASE_URL="$box_dsn" \
+      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha"); then
+    echo "✗ pinned box long-task generations gate failed" >&2
     rm -rf "$box_cand"
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
@@ -6371,46 +6408,58 @@ import sys
 
 root, sha, excl = sys.argv[1], sys.argv[2], sys.argv[3]
 raw = subprocess.check_output(["git", "-C", root, "show", f"{sha}:{excl}"], text=True)
-patterns = []
+rules = []
 for line in raw.splitlines():
     line = line.strip()
     if not line or line.startswith("#"):
         continue
-    patterns.append(line)
-if not patterns:
+    # rsync rule prefixes: "+ " include, "- " exclude, bare = exclude. First match wins.
+    if line.startswith("+ "):
+        rules.append((True, line[2:].strip()))
+    elif line.startswith("- "):
+        rules.append((False, line[2:].strip()))
+    else:
+        rules.append((False, line))
+if not any(not include for include, _pat in rules):
     sys.exit(1)
 listing = subprocess.check_output(["git", "-C", root, "ls-tree", "-r", "--full-tree", sha], text=True)
 if not listing.strip():
     sys.exit(1)
 
 def excluded(relpath: str) -> bool:
-    name = relpath.rsplit("/", 1)[-1]
-    parts = relpath.split("/")
-    for pat in patterns:
-        anchored = pat.startswith("/")
-        if anchored:
-            pat = pat[1:]
-        if pat.endswith("/"):
-            pat = pat[:-1]
-        if not pat:
-            continue
-        if anchored:
-            if relpath == pat or relpath.startswith(pat + "/") or fnmatch.fnmatch(relpath, pat):
-                return True
-            continue
-        if "/" in pat:
-            if (
-                relpath == pat
-                or relpath.startswith(pat + "/")
-                or relpath.endswith("/" + pat)
-                or ("/" + pat + "/") in ("/" + relpath + "/")
-                or fnmatch.fnmatch(relpath, pat)
-            ):
-                return True
-            continue
-        if fnmatch.fnmatch(name, pat) or any(part == pat or fnmatch.fnmatch(part, pat) for part in parts):
+    for include, pat in rules:
+        if include:
+            # A directory include only lets rsync descend; the files below are
+            # still decided by the later rules.
+            if pat.endswith("/"):
+                continue
+            if matches(relpath, pat):
+                return False
+        elif matches(relpath, pat):
             return True
     return False
+
+def matches(relpath: str, pat: str) -> bool:
+    name = relpath.rsplit("/", 1)[-1]
+    parts = relpath.split("/")
+    anchored = pat.startswith("/")
+    if anchored:
+        pat = pat[1:]
+    if pat.endswith("/"):
+        pat = pat[:-1]
+    if not pat:
+        return False
+    if anchored:
+        return relpath == pat or relpath.startswith(pat + "/") or fnmatch.fnmatch(relpath, pat)
+    if "/" in pat:
+        return (
+            relpath == pat
+            or relpath.startswith(pat + "/")
+            or relpath.endswith("/" + pat)
+            or ("/" + pat + "/") in ("/" + relpath + "/")
+            or fnmatch.fnmatch(relpath, pat)
+        )
+    return fnmatch.fnmatch(name, pat) or any(part == pat or fnmatch.fnmatch(part, pat) for part in parts)
 
 rows = []
 for line in listing.splitlines():

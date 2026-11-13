@@ -517,6 +517,31 @@ describe('durable Muse video lifecycle', () => {
     assert.equal(calls.filter((c) => c === 'submit').length, 1)
   })
 
+  it('OCV5-763: reverse fallback cannot restart a durable Box checkpoint on hatch', async () => {
+    let relayCalls = 0
+    const hub = make({
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner: async () => async () => {
+        relayCalls++
+        return { stdout: JSON.stringify({ ok: false, code: 'MUSE_RELAY_DOWN', message: 'relay unreachable' }) }
+      },
+    })
+    const sid = hub.hello('1', '0.5.3')
+    const id = await submit(hub)
+    for (let i = 0; i < 20 && journal.rows.get(id)?.status !== 'failed'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      await flush()
+    }
+    const row = journal.rows.get(id)!
+    assert.equal(row.status, 'failed', 'durable failure remains terminal, never re-queued on hatch')
+    assert.equal(row.fin?.errorCode, 'MUSE_BRIDGE_OFFLINE')
+    assert.equal(row.durable?.via, 'box-exec')
+    assert.equal(relayCalls, 1)
+    assert.equal(await hub.poll(sid, 20), null, 'hatch must not create a second generation')
+  })
+
   it('OCV5-750: a restart while a relay job runs fails it with no charge and never resubmits', async () => {
     const calls: string[] = []
     const first = make({

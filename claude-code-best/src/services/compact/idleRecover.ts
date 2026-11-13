@@ -27,12 +27,15 @@ export interface IdleNativeFit {
 export function outerHistoryNeedsCompact(
   messages: readonly unknown[],
   fit?: IdleNativeFit,
+  /** OCV5-755: a pre-expiry op compacts from this size, not only near the limit. */
+  minInputTokens?: number,
 ): boolean {
+  const floor = Number.isSafeInteger(minInputTokens) && minInputTokens! > 0 ? minInputTokens! : undefined
   if (fit && Number.isSafeInteger(fit.inputTokens) && fit.inputTokens >= 0
     && Number.isSafeInteger(fit.inputBudget) && fit.inputBudget > 0) {
-    return fit.inputTokens >= fit.inputBudget
+    return fit.inputTokens >= Math.min(fit.inputBudget, floor ?? fit.inputBudget)
   }
-  return JSON.stringify(messages).length / 4 >= IDLE_OUTER_TOKEN_FLOOR
+  return JSON.stringify(messages).length / 4 >= Math.min(IDLE_OUTER_TOKEN_FLOOR, floor ?? IDLE_OUTER_TOKEN_FLOOR)
 }
 
 export function trustedIdleOpId(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -73,6 +76,8 @@ export interface IdleNativeFile {
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleFrozenAttachment[]
+  /** OCV5-755: written by the gateway for a pre-expiry op. */
+  minInputTokens?: number
 }
 
 export interface IdleArtifact {
@@ -242,9 +247,29 @@ function boundedTail(messages: readonly Message[]): Message[] {
   return kept.flat()
 }
 
+const EPHEMERAL_IDLE_ATTACHMENT_TYPES = new Set([
+  'hook_success',
+  'hook_error',
+  'hook_progress',
+  'hook_cancelled',
+  'todo_reminder',
+  'skill_listing',
+  'skill_discovery',
+  'dynamic_system_reminder',
+])
+
+function isDefaultIdleLoggableAttachment(message: Message): boolean {
+  const kind = (message as { attachment?: { type?: unknown } }).attachment?.type
+  return typeof kind !== 'string' || !EPHEMERAL_IDLE_ATTACHMENT_TYPES.has(kind)
+}
+
 /** Keep a bounded tail and the attachments that belong to it.
- *  Parents already on disk are not rewritten. */
-export function selectIdlePreserve(messages: readonly Message[]): {
+ *  Parents already on disk are not rewritten. Non-loggable attachments are
+ *  excluded so applyIdleTranscript never expects rows that recordTranscript drops. */
+export function selectIdlePreserve(
+  messages: readonly Message[],
+  isLoggable: (message: Message) => boolean = isDefaultIdleLoggableAttachment,
+): {
   tail: IdleFrozenTail[]
   attachments: IdleFrozenAttachment[]
 } {
@@ -252,7 +277,7 @@ export function selectIdlePreserve(messages: readonly Message[]): {
   const attachmentRows: Array<{ index: number; message: Message }> = []
   messages.forEach((message, index) => {
     if (message.type === 'attachment') {
-      attachmentRows.push({ index, message })
+      if (isLoggable(message)) attachmentRows.push({ index, message })
       return
     }
     if (message.type !== 'user' && message.type !== 'assistant') return
@@ -391,6 +416,7 @@ export async function resumeIdleSummary(input: {
   fit?: IdleNativeFit
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
+  isLoggable?: (message: Message) => boolean
 }): Promise<{ path: string; file: IdleNativeFile; freshSummary: boolean } | undefined> {
   const opId = trustedIdleOpId()
   const path = (opId ? readIdleNativeByOp(input.sessionId, opId, input.home) : undefined)
@@ -400,11 +426,11 @@ export async function resumeIdleSummary(input: {
   if (file.sessionId !== input.sessionId) throw new Error('IDLE_RECOVERY_CORRUPT')
   if (file.applied && !file.summaryText) return { path, file, freshSummary: false }
   if (file.frozenTail.length === 0 && file.attachments.length === 0) {
-    const preserved = selectIdlePreserve(input.messages)
+    const preserved = selectIdlePreserve(input.messages, input.isLoggable)
     file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
     writeIdleNativeFile(path, file)
   }
-  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages, input.fit)) {
+  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages, input.fit, file.minInputTokens)) {
     file = { ...file, applied: true }
     writeIdleNativeFile(path, file)
     return { path, file, freshSummary: false }
@@ -433,6 +459,7 @@ export async function runIdleCompact(input: {
   fit?: IdleNativeFit
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
+  isLoggable?: (message: Message) => boolean
   record: (
     messages: Message[],
     teamInfo?: { teamName?: string; agentName?: string },

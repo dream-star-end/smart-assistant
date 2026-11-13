@@ -99,6 +99,11 @@ describe('OCV5-620 idle apply-stuck (pure)', () => {
     // Fresh mtime: not stuck yet
     writeIdleOp(dir, op)
     assert.equal(idleApplyStuckReason(dir, op, Date.now()), undefined)
+    // OCV5-741: preservePreparedMtime keeps the original prepared mtime across
+    // failed apply retries so IDLE_APPLY_STUCK_MS is not reset on every retry
+    utimesSync(path, old, old)
+    writeIdleOp(dir, { ...op, runnerKilledAt: Date.now() }, { preservePreparedMtime: true })
+    assert.equal(idleApplyStuckReason(dir, op, Date.now()), 'idle_apply_stuck')
   })
 
   test('settling apply-stuck unblocks idleHistoryStillBlocked', async () => {

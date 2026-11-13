@@ -19,6 +19,7 @@ import {
   taskboardApi,
   taskboardErrorMessage,
   writeLastProjectId,
+  syncTicketApprovalFromTicket,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import { useToast } from '../ui'
@@ -166,6 +167,7 @@ export function useTaskboard(
 
   const replaceTicket = useCallback(
     (fresh: Ticket) => {
+      syncTicketApprovalFromTicket(fresh)
       commitTickets((cur) => {
         if (!cur) return [fresh]
         if (cur.some((t) => t.id === fresh.id)) {

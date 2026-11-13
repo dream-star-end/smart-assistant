@@ -234,10 +234,36 @@ export function inspectCcbSpawnWiring(
     return { ok: false, reason: 'start() does not call _startInternal(); spawnOpts is not on the real start path' }
   }
 
-  const init = spawnOptsDecl.initializer
-  if (!init || !ts.isObjectLiteralExpression(init)) {
-    return { ok: false, reason: 'spawnOpts initializer is not an object literal' }
+  // cc5 skips the legacy setup. Its hoisted declaration has one default-path
+  // object assignment inside the real cc5 branch's else; keep checking that object.
+  const objects: ts.ObjectLiteralExpression[] = []
+  if (spawnOptsDecl.initializer) {
+    if (!ts.isObjectLiteralExpression(spawnOptsDecl.initializer)) {
+      return { ok: false, reason: 'spawnOpts initializer is not an object literal' }
+    }
+    objects.push(spawnOptsDecl.initializer)
   }
+  let invalidObjectAssignment = false
+  const visitAssignments = (node: ts.Node): void => {
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && isIdentifierNamed(node.left, 'spawnOpts') && ts.isObjectLiteralExpression(node.right)
+      && containingMethod(node) === owner) {
+      let insideDefaultBranch = false
+      for (let ancestor: ts.Node = node; ancestor.parent && ancestor !== owner; ancestor = ancestor.parent) {
+        const parent = ancestor.parent
+        if (ts.isIfStatement(parent) && parent.elseStatement === ancestor
+          && parent.expression.getText(sf) === 'this.opts.cc5BridgePort') insideDefaultBranch = true
+      }
+      if (insideDefaultBranch) objects.push(node.right)
+      else invalidObjectAssignment = true
+    }
+    ts.forEachChild(node, visitAssignments)
+  }
+  visitAssignments(owner)
+  if (invalidObjectAssignment || objects.length !== 1) {
+    return { ok: false, reason: 'expected exactly one default spawnOpts object on the real start path' }
+  }
+  const init = objects[0]!
 
   const envProp = init.properties.find((prop) => {
     if (!ts.isPropertyAssignment(prop)) return false
@@ -359,8 +385,8 @@ export function variantDuplicateTraceHelper(source: string): string {
 export function variantWrongSessionAlias(source: string): string {
   return replaceOnce(
     source,
-    'OC_SESSION_KEY: this.opts.sessionKey,',
-    'OC_SESSION_KEY: this.opts.sessionId,',
+    PROVIDER_THEN_ALIASES,
+    PROVIDER_THEN_ALIASES.replace('OC_SESSION_KEY: this.opts.sessionKey,', 'OC_SESSION_KEY: this.opts.sessionId,'),
     'wrong-session-alias',
   )
 }

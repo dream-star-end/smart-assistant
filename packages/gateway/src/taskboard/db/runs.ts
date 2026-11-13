@@ -201,6 +201,21 @@ function expireLeasesOnTicket(db: TaskboardDb, ticketId: string, now: number): v
   ).run({ ticketId, now })
 }
 
+/** Latest real execution metadata; never loads a long result for polling. */
+export function getLatestRunMetadata(db: TaskboardDb, ticketId: string): TicketRun | null {
+  const columns = RUN_COLS.replace(/\boutput_md\b/, 'NULL AS output_md')
+    .replace(/\bsummary\b/, 'NULL AS summary').replace(/\berror\b/, 'substr(error, 1, 160) AS error')
+  const row = db.prepare(`SELECT ${columns} FROM tb_ticket_run
+    WHERE ticket_id = ? AND status <> 'skipped' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(ticketId) as RunRow | undefined
+  return row ? mapRun(row) : null
+}
+
+/** A lease expiring is not proof that its worker has finished. */
+export function hasUnfinishedRun(db: TaskboardDb, ticketId: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM tb_ticket_run WHERE ticket_id = ?
+    AND status IN ('queued', 'running') LIMIT 1`).get(ticketId)
+}
+
 export function insertRun(db: TaskboardDb, input: CreateRunInput): TicketRun {
   const now = nowMs()
   const id = newId()
@@ -456,6 +471,30 @@ export function settleLeaseRun(
   return result.changes === 1 ? getRun(db, runId) : null
 }
 
+/** Preserve a late worker's result on its exact old row, without reacquiring authority. */
+export function archiveExpiredRunOutput(db: TaskboardDb, original: TicketRun, output: string, now: number): boolean {
+  if (!output || !original.sessionKey || !original.leaseOwner) return false
+  const current = getRun(db, original.id)
+  if (!current || current.outputMd !== null) return false
+  const expiredActive = (current.status === 'queued' || current.status === 'running') &&
+    current.leaseOwner === original.leaseOwner && current.leaseExpiresAt !== null && current.leaseExpiresAt <= now
+  const reaped = current.status === 'timeout' && current.leaseOwner === null &&
+    current.leaseExpiresAt === null && current.error === 'lease expired' && current.finishedAt !== null
+  if (!expiredActive && !reaped) return false
+  // Reaping clears owner. For that branch controller provenance is checked by the caller;
+  // compare all immutable execution bindings and the observed terminal facts here.
+  return db.prepare(`UPDATE tb_ticket_run SET output_md = @output
+    WHERE id = @id AND ticket_id = @ticketId AND stage_id = @stageId
+      AND session_key = @sessionKey AND agent_id IS @agentId AND started_at IS @startedAt
+      AND status = @status AND lease_owner IS @owner AND lease_expires_at IS @expiresAt
+      AND error IS @error AND finished_at IS @finishedAt AND output_md IS NULL`).run({
+    output, id: original.id, ticketId: original.ticketId, stageId: original.stageId,
+    sessionKey: original.sessionKey, agentId: original.agentId, startedAt: original.startedAt,
+    status: current.status, owner: current.leaseOwner, expiresAt: current.leaseExpiresAt,
+    error: current.error, finishedAt: current.finishedAt,
+  }).changes === 1
+}
+
 /** 清掉 run 上的 lease。不改 status;调用方随后 updateRun 写终态。 */
 export function releaseLease(db: TaskboardDb, runId: string, owner?: string): TicketRun {
   const existing = getRun(db, runId)
@@ -498,4 +537,14 @@ export function getActiveLease(
 ): TicketRun | null {
   const row = findActiveLease(db, ticketId, now)
   return row ? mapRun(row) : null
+}
+
+
+/** Payloads for an already selected, bounded timeline window. */
+export function listRunsByIdsForTicket(db: TaskboardDb, ticketId: string, ids: readonly string[]): TicketRun[] {
+  if (ids.length > 500) throw new RangeError('timeline payload window exceeds 500')
+  if (!ids.length) return []
+  const placeholders = ids.map(() => '?').join(',')
+  const rows = db.prepare(`SELECT ${RUN_COLS} FROM tb_ticket_run WHERE ticket_id = ? AND id IN (${placeholders})`).all(ticketId, ...ids) as RunRow[]
+  return rows.map(mapRun)
 }

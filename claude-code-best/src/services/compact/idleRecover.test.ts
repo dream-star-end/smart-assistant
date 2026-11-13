@@ -226,3 +226,42 @@ test('a typed summary failure keeps the fence and does not store the error', asy
   }), /IDLE_HISTORY_PENDING/)
   delete process.env.CLAUDE_CODE_EXTRA_METADATA
 })
+
+test('selectIdlePreserve drops non-loggable attachments (hook_success, todo_reminder) so applyIdleTranscript never fails on unrecorded rows (OCV5-741)', () => {
+  const hookSuccess = {
+    type: 'attachment' as const,
+    uuid: 'att-hook',
+    attachment: { type: 'hook_success', hookName: 'PostToolUse' },
+  }
+  const todoReminder = {
+    type: 'attachment' as const,
+    uuid: 'att-todo',
+    attachment: { type: 'todo_reminder' },
+  }
+  const deferredDelta = {
+    type: 'attachment' as const,
+    uuid: 'att-deferred',
+    attachment: { type: 'deferred_tools_delta' },
+  }
+  const preservedDefault = selectIdlePreserve([
+    tool,
+    image,
+    hookSuccess,
+    todoReminder,
+    deferredDelta,
+    { type: 'user', uuid: 'cmd', message: { role: 'user', content: '/compact preserve' } },
+  ] as never)
+  assert.deepEqual(preservedDefault.attachments.map((a) => a.uuid), ['att-deferred'])
+
+  const preservedWithPredicate = selectIdlePreserve(
+    [
+      tool,
+      image,
+      attachment,
+      deferredDelta,
+      { type: 'user', uuid: 'cmd', message: { role: 'user', content: '/compact preserve' } },
+    ] as never,
+    (msg) => (msg as { attachment?: { type?: string } }).attachment?.type === 'deferred_tools_delta',
+  )
+  assert.deepEqual(preservedWithPredicate.attachments.map((a) => a.uuid), ['att-deferred'])
+})

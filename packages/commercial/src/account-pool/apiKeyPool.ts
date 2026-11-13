@@ -3,7 +3,7 @@
  *
  * One table holds the API keys of every service that has no account row:
  * Anthropic keys (the claude pool's API tier), static providers (deepseek,
- * minimax, ark, zai, kimi, moonshot, bailian, opencodego) and Gemini. Each
+ * minimax, ark, zai, kimi, moonshot, bailian, opencodego), Gemini and OpenAI. Each
  * service is its own pool; selection, cooldowns and recovery are the shared
  * policy (policy/select, policy/decide, policy/registry) — nothing here decides
  * a cooldown on its own.
@@ -145,6 +145,66 @@ export function apiKeyPoolConfiguredServices(): ReadonlySet<string> {
  */
 export function apiKeyPoolHasMembers(service: string): boolean {
   return (snapshot?.rows ?? []).some((r) => r.service === service)
+}
+
+/**
+ * Whether embedding lookup should call selectApiKey for `service`.
+ *
+ * No snapshot (unit tests, or pool prime failed) means "not configured":
+ * callers keep today's backend instead of blocking on a DB timeout.
+ * An invalidated snapshot may be missing a key just written, so callers reload.
+ */
+export function apiKeyPoolShouldQuery(service: string): boolean {
+  if (!snapshot) return false
+  if (snapshot.at === 0) return true
+  return snapshot.rows.some((r) => r.service === service)
+}
+
+export interface ApiKeyPoolSnapshotMember {
+  id: string
+  service: string
+  status: 'active' | 'cooldown' | 'disabled'
+  /** When set on an active row, the member stays unusable until this time. */
+  cooldownUntil?: Date | null
+}
+
+/**
+ * Install a pool snapshot without reading the database. Tests use this to
+ * prove a disabled or cooling pool stays authoritative. Never call it from
+ * production paths.
+ */
+export function installApiKeyPoolSnapshotForTests(members: ApiKeyPoolSnapshotMember[]): void {
+  snapshot = {
+    at: Date.now(),
+    rows: members.map((member) => ({
+      id: member.id,
+      service: member.service,
+      label: 'test',
+      fingerprint: '0000000000000000',
+      key_hint: '…test',
+      source: 'admin' as const,
+      tier: API_KEY_DEFAULT_TIER,
+      weight: 1,
+      status: member.status === 'cooldown' ? 'cooldown' : member.status,
+      disabled_by: member.status === 'disabled' ? 'admin' : null,
+      health_score: 100,
+      cooldown_until: member.cooldownUntil ?? null,
+      cooldown_reason: member.status === 'active' && member.cooldownUntil == null ? null : 'rate_limited',
+      backoff_level: 0,
+      next_probe_at: null,
+      last_error: null,
+      last_used_at: null,
+      key_enc: Buffer.alloc(0),
+      key_nonce: Buffer.alloc(0),
+    })),
+  }
+  loading = null
+}
+
+/** Drop the in-process pool snapshot. Tests only. */
+export function resetApiKeyPoolSnapshotForTests(): void {
+  snapshot = null
+  loading = null
 }
 
 /** Load the snapshot now (boot); throws if the DB is unreachable. */

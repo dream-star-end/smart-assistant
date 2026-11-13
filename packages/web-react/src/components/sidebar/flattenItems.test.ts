@@ -5,6 +5,7 @@ import {
   GROUP_HEADER_HEIGHT,
   GROUP_HEADER_HEIGHT_TOUCH,
   HINT_ROW_HEIGHT,
+  SESSION_ROW_HEIGHT,
 } from "./constants";
 import { flattenSidebarItems } from "./flattenItems";
 
@@ -29,7 +30,9 @@ function project(over: Partial<ChatProject> & { id: string; name: string }): Cha
 }
 
 describe("flattenSidebarItems empty project hints", () => {
-  it("空非默认项目 hint 带 projectId", () => {
+  // UI-1：空项目不再占一行「暂无会话 新建会话」（体验官截图里每个空项目都多一行）；计数 0 已经说明，
+  // 项目行自带「+」/ 菜单「新建会话」。原用例「空非默认项目 hint 带 projectId」锁的是被删掉的那一行。
+  it("展开的空项目只有项目行，不再跟一行「暂无会话」", () => {
     const items = flattenSidebarItems({
       searching: false,
       showProjects: true,
@@ -44,13 +47,8 @@ describe("flattenSidebarItems empty project hints", () => {
       searchRemote: "idle",
       localEmpty: true,
     });
-    const workHint = items.find((i) => i.kind === "hint" && i.key === "p-empty-p-work");
-    expect(workHint).toMatchObject({
-      kind: "hint",
-      text: "暂无会话",
-      projectId: "p-work",
-      height: HINT_ROW_HEIGHT,
-    });
+    expect(items.some((i) => i.kind === "hint" && i.key === "p-empty-p-work")).toBe(false);
+    expect(items.find((i) => i.kind === "project" && i.project.id === "p-work")).toMatchObject({ collapsed: false });
   });
 
   it("默认未分类空 hint 不带 projectId", () => {
@@ -111,7 +109,7 @@ describe("flattenSidebarItems empty project hints", () => {
       expect(items.map((i) => i.kind)).toEqual(["hint", "archivedToggle", "session"]);
     });
 
-    it("有项目但零会话：不是引导空态，仍是项目头 + 空项目行 + 未分类 empty-list", () => {
+    it("有项目但零会话：不是引导空态，仍是项目头 + 项目行 + 未分类 empty-list", () => {
       const items = flattenSidebarItems({
         ...base,
         showProjects: true,
@@ -142,9 +140,8 @@ describe("flattenSidebarItems empty project hints", () => {
     expect(items.some((i) => i.kind === "hint" && i.key === "p-empty-p-work")).toBe(false);
   });
 
-  // S-01：空分组提示的变体——只有整个活动列表为空时未分类才是 empty-list（叠大 CTA），
-  // 空项目一律 empty-project（普通行高），多个空项目不再把会话挤出视口。
-  it("整个列表为空：未分类 hint 为 empty-list，空项目 hint 仍为 empty-project", () => {
+  // S-01：只有整个活动列表为空时未分类才出 empty-list（叠大 CTA）；UI-1 起空项目不再出提示行。
+  it("整个列表为空：只有未分类的 empty-list，空项目没有提示行", () => {
     const items = flattenSidebarItems({
       searching: false,
       showProjects: true,
@@ -160,15 +157,11 @@ describe("flattenSidebarItems empty project hints", () => {
       localEmpty: true,
     });
     const hints = items.filter((i) => i.kind === "hint");
-    expect(hints.map((h) => (h.kind === "hint" ? h.variant : ""))).toEqual([
-      "empty-project",
-      "empty-project",
-      "empty-list",
-    ]);
+    expect(hints.map((h) => (h.kind === "hint" ? h.variant : ""))).toEqual(["empty-list"]);
     for (const h of hints) expect(h.height).toBe(HINT_ROW_HEIGHT);
   });
 
-  it("别处有会话时，空未分类与空项目都是 empty-project", () => {
+  it("别处有会话时，空未分类与空项目都不出提示行", () => {
     const s = session({ id: "s1", projectId: "p-a" });
     const items = flattenSidebarItems({
       searching: false,
@@ -184,9 +177,60 @@ describe("flattenSidebarItems empty project hints", () => {
       searchRemote: "idle",
       localEmpty: false,
     });
-    const hints = items.filter((i) => i.kind === "hint");
-    expect(hints).toHaveLength(2);
-    expect(hints.every((h) => h.kind === "hint" && h.variant === "empty-project")).toBe(true);
+    expect(items.filter((i) => i.kind === "hint")).toHaveLength(0);
+  });
+});
+
+// UI-1：项目展开最多列 5 条，其余走「查看全部」进项目主页；当前会话不因收起 / 超出上限从侧栏消失。
+describe("flattenSidebarItems 项目会话上限与当前会话", () => {
+  const p = project({ id: "p-big", name: "大项目" });
+  const kids = Array.from({ length: 7 }, (_, i) => session({ id: `k${i}`, projectId: "p-big" }));
+  const base = {
+    searching: false,
+    showProjects: true,
+    pinned: [],
+    projects: [p],
+    projectSessions: new Map([["p-big", kids]]),
+    sessions: kids,
+    ungroupedGroups: [] as [string, Session[]][],
+    archived: [],
+    archivedExpanded: false,
+    searchHits: [],
+    searchRemote: "idle" as const,
+    localEmpty: false,
+  };
+  const shownIds = (items: ReturnType<typeof flattenSidebarItems>) =>
+    items.flatMap((i) => (i.kind === "session" ? [i.session.id] : []));
+
+  it("展开时只列前 5 条，末尾一行「查看全部」带总数", () => {
+    const items = flattenSidebarItems({ ...base, projectLimit: 5 });
+    expect(shownIds(items)).toEqual(["k0", "k1", "k2", "k3", "k4"]);
+    const more = items.findIndex((i) => i.kind === "more");
+    expect(items[more]).toMatchObject({ kind: "more", projectId: "p-big", count: 7, height: SESSION_ROW_HEIGHT });
+    expect(items[more - 1]).toMatchObject({ kind: "session", session: { id: "k4" } });
+  });
+
+  it("不足上限不出「查看全部」；没有上限（无项目主页）时全部列出", () => {
+    const few = flattenSidebarItems({ ...base, projectLimit: 10 });
+    expect(shownIds(few)).toHaveLength(7);
+    expect(few.some((i) => i.kind === "more")).toBe(false);
+    const all = flattenSidebarItems(base);
+    expect(shownIds(all)).toHaveLength(7);
+    expect(all.some((i) => i.kind === "more")).toBe(false);
+  });
+
+  it("当前会话排在上限之外时补在末尾，「查看全部」仍在", () => {
+    const items = flattenSidebarItems({ ...base, projectLimit: 5, activeId: "k6" });
+    expect(shownIds(items)).toEqual(["k0", "k1", "k2", "k3", "k4", "k6"]);
+    expect(items.some((i) => i.kind === "more")).toBe(true);
+  });
+
+  it("项目收起时只留当前会话这一行，没有「查看全部」", () => {
+    const collapsedProjectIds = new Set(["p-big"]);
+    expect(shownIds(flattenSidebarItems({ ...base, projectLimit: 5, collapsedProjectIds }))).toEqual([]);
+    const items = flattenSidebarItems({ ...base, projectLimit: 5, collapsedProjectIds, activeId: "k3" });
+    expect(shownIds(items)).toEqual(["k3"]);
+    expect(items.some((i) => i.kind === "more")).toBe(false);
   });
 });
 

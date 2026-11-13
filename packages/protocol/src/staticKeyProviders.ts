@@ -403,8 +403,10 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
   },
   upstreamModelForRequest(modelId) {
     const m = modelId.toLowerCase()
+    // Go 已下线 deepseek-v4-flash(2026-11 实测 400 "Model is unavailable",400 不触发回落),
+    // 与 DB catalog 当前 upstream 对齐;catalog 之外的路径(平台直连 flash、探活、无 catalog 路由)靠这里。
     return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
-      ? 'deepseek-v4-flash'
+      ? 'deepseek-v4.1-flash'
       : m === 'gemini-4-argon-contributor' ? m : (openCodeGoExtraUpstream(m) ?? modelId)
   },
   stripHeaders: ['anthropic-beta'],

@@ -1,7 +1,7 @@
 /** Authenticated same-round replay from a completed private Message capsule.
  * Lookup/read/render only: no account selection, paid CLI, tool publication,
  * precheck, journal admission or second settlement. */
-import type { BoxDurableJournal, BoxReplayIdentity } from "./boxDurableJournal.js";
+import type { BoxDurableJournal, BoxReplayIdentity, BoxRemoteCleanupCandidate } from "./boxDurableJournal.js";
 import type { BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { boxReplayMessageToSse } from "./boxReplayMessageSse.js";
 import type { ProxyBody } from "./shared.js";
@@ -14,6 +14,7 @@ export class BoxReplayCompletedError extends Error {
 export type BoxReplayLookup =
   | { kind: "missing" }
   | { kind: "failed"; failure: BoxFallbackFailure }
+  | { kind: "failed"; code: "BOX_REPLAY_FAILED" | "BOX_REPLAY_STOPPED" | "BOX_REPLAY_RESULT_REJECTED"; diagnosticId?: string }
   | { kind: "pending"; identity: BoxReplayIdentity }
   | { kind: "ready"; identity: BoxReplayIdentity; response: Response };
 
@@ -24,7 +25,8 @@ export async function findCompletedBoxReplay(input: {
   prepared?: PreparedContinuation;
 }, deps: {
   journal: Pick<BoxDurableJournal, "findReplayIdentity"> &
-    Partial<Pick<BoxDurableJournal, "findReadOnlyFallback">>;
+    Partial<Pick<BoxDurableJournal, "findReadOnlyFallback" | "findSettledFailure">>;
+  readFailureDiagnosticId?: (identity: BoxRemoteCleanupCandidate) => Promise<string | null>;
   readMessage: (pointer: BoxReplayMessagePointer) => Promise<unknown>;
 }): Promise<BoxReplayLookup> {
   let identity = await deps.journal.findReplayIdentity(input);
@@ -34,7 +36,21 @@ export async function findCompletedBoxReplay(input: {
       if (fallback?.kind === "failure") return { kind: "failed", failure: fallback.failure };
       if (fallback?.kind === "identity") identity = fallback.identity;
     }
-    if (!identity) return { kind: "missing" };
+    if (!identity) {
+    if ((input.canonicalBody as { stream?: boolean }).stream === false && deps.journal.findSettledFailure) {
+      const failure = await deps.journal.findSettledFailure(input);
+      if (failure) {
+        // Missing/expired/broken diagnostic storage cannot erase terminal truth.
+        let diagnosticId: string | null = null;
+        try { diagnosticId = await deps.readFailureDiagnosticId?.(failure) ?? null; } catch { /* optional */ }
+        return { kind: "failed", code: failure.proof.reason === "keeper_stopped" ? "BOX_REPLAY_STOPPED"
+          : failure.proof.reason === "worker_complete" ? "BOX_REPLAY_RESULT_REJECTED" : "BOX_REPLAY_FAILED",
+          ...(typeof diagnosticId === "string" && /^bdiag_[a-f0-9]{24}$/.test(diagnosticId)
+            ? { diagnosticId } : {}) };
+      }
+    }
+      return { kind: "missing" };
+    }
   }
   if (!identity.messagePointer) return { kind: "pending", identity };
   const message = await deps.readMessage(identity.messagePointer);

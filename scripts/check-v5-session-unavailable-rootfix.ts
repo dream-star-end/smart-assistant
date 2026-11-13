@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertPreparationLaneCoverage } from './lib/preparationLaneCoverage.js'
 import { assertRejectedDispatchFailureHelper, assertTurnDispatchReceiptCoverage } from './lib/turnDispatchReceiptCoverage.js'
+import { createProofTsxCache } from './lib/proofTsxCache.js'
 
 const root = process.cwd()
 const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
@@ -232,20 +233,22 @@ const preparedPublish = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxToolResumePublish.ts'), 'utf8')
 const preparedJournal = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const preparedClaim = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolResumeClaim.ts'), 'utf8')
 if (!preparedGate.includes('classifyBoxContinuation')
   || !preparedFetch.includes('continuation_candidate')
   || !preparedEgress.includes('continuation_candidate')
   || !preparedPublish.includes('resumeMayPublish(')
-  || !preparedJournal.includes('matchPreparedToolResults(')
-  || !preparedJournal.includes('consumePrepared(')
+  || !preparedJournal.includes('return claimBoundBoxToolResume(')
+  || !preparedClaim.includes('matchPreparedToolResults(')
+  || !preparedClaim.includes('consumePrepared(')
   || !preparedSrc.includes('fingerprintOfPrepared')) {
   throw new Error('[box-prepared-continuation] gate, fetch, or egress does not consume the prepared class')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary')
 const editEcho = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxToolInputEcho.ts'), 'utf8')
-const editJournal = readFileSync(join(root,
-  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const editJournal = `${preparedJournal}\n${preparedClaim}`
 const editFinger = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxCallFingerprint.ts'), 'utf8')
 if (!editEcho.includes('export function editReplaceAllFalseDefault(')
@@ -716,6 +719,8 @@ function assertSelectedTap(tap: string, expected: readonly string[], label: stri
   assert.equal((tap.match(/^# duration_ms [0-9.]+\r?$/gm) ?? []).length, 1, `${label}: missing TAP completion summary`)
 }
 
+const proofTsxCache = createProofTsxCache()
+
 async function runTapProof(opts: {
   fromRoot: string
   files: readonly string[]
@@ -745,6 +750,7 @@ async function runTapProof(opts: {
   if (opts.namePattern) args.push(`--test-name-pattern=${opts.namePattern}`)
   args.push(...opts.files.map((rel) => join(opts.fromRoot, rel)))
   try {
+    proofTsxCache.linkInto(env.TMPDIR)
     const tap = await new Promise<string>((resolveProof, rejectProof) => {
       const child = spawn(process.execPath, args, {
         cwd: opts.fromRoot,
@@ -1217,3 +1223,19 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[relay-request-body-errors] PASS — relay read errors never reserve credits or become 413; metadata and generate byte caps remain enforced')
+
+// INC-20261104-ANTIGRAVITY-DELIVERY: real subprocess -> runner -> SQLite reopen.
+// This is an executed local durability proof, not production PG or wallet proof.
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/antigravityDeliveryPersistence.test.ts'],
+  expected: [
+    'terminal-response-only survives SQLite reopen (1 terminal frames, one delivery/settlement)',
+    'terminal-response-only survives SQLite reopen (3 terminal frames, one delivery/settlement)',
+    'native-only survives SQLite reopen (1 terminal frames, one delivery/settlement)',
+    'native-only survives SQLite reopen (3 terminal frames, one delivery/settlement)',
+  ],
+  label: 'antigravity-durable-delivery',
+  timeoutMs: 120_000,
+})
+console.log('[antigravity-durable-delivery] PASS — executed terminal/native fallback, one subprocess/side effect/settlement and durable SQLite reopen')

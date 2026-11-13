@@ -1,5 +1,10 @@
-import { isBoxApiModel } from '@openclaude/protocol'
-import { grokExecutionUpstream } from '@openclaude/protocol'
+import {
+  type RemoteExecutionBackend,
+  isBoxApiModel,
+  isCc5ExecutionBackend,
+  isRemoteDriverExecutionBackend,
+  grokExecutionUpstream,
+} from '@openclaude/protocol'
 /**
  * modelAuthority(容器侧)—— master 签发的**模型执行权威**的验签消费端。
  *
@@ -129,6 +134,7 @@ export function isEngineLocalTurnExempt(env: NodeJS.ProcessEnv = process.env): b
  * capability / context 都在这里,不再回头查本地表。
  */
 export interface TurnExecutionDescriptor {
+  readonly executionBackend?: RemoteExecutionBackend
   readonly canonicalModel: string
   readonly engine: ModelAuthorityEngine
   readonly contextWindow: number | null
@@ -521,10 +527,17 @@ export class ModelAuthorityConsumer {
       if (ccb.contextOwner !== undefined && ccb.contextOwner !== 'box-native-v1') {
         throw new AuthorityRejected('bad_shape', 'CCB contextOwner is not box-native-v1')
       }
-      if (ccb.contextOwner === 'box-native-v1' && !isBoxApiModel(payload.canonicalModel)) {
+      // A remote-pool chat carries its signed lane; its native context lives on the pool node.
+      const backendScope = (payload as { executionBackend?: unknown }).executionBackend
+      if (
+        ccb.contextOwner === 'box-native-v1' &&
+        !isBoxApiModel(payload.canonicalModel) &&
+        !isCc5ExecutionBackend(backendScope) &&
+        !isRemoteDriverExecutionBackend(backendScope)
+      ) {
         throw new AuthorityRejected(
           'bad_shape',
-          'box-native-v1 contextOwner requires the signed Box model',
+          'box-native-v1 contextOwner requires the signed Box model or a remote lane',
         )
       }
     }
@@ -552,6 +565,7 @@ export class ModelAuthorityConsumer {
     return {
       canonicalModel: payload.canonicalModel,
       engine: payload.engine,
+      ...(payload.executionBackend ? { executionBackend: payload.executionBackend } : {}),
       contextWindow: descriptorRaw.contextWindow,
       supportsVision: descriptorRaw.supportsVision,
       supportedEfforts: descriptorRaw.supportedEfforts,

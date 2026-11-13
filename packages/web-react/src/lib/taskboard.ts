@@ -1,3 +1,4 @@
+import { fetchWithExecutionGuard, type RequestExecutionGuard } from './api/http'
 import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal, type RecordedCostAmounts } from '@openclaude/protocol/browser'
 /**
  * Taskboard 前端类型 + `/api/board` 客户端。
@@ -13,8 +14,8 @@ import type { AuthSession } from './types'
 
 // ── 与 domain.ts 锁步的枚举 / 标签 ─────────────────────────────────────────
 
-export const TICKET_TYPES = ['bug', 'feature', 'spike', 'chore'] as const
-export type TicketType = (typeof TICKET_TYPES)[number]
+import { TICKET_TYPES, type TicketType, syncTicketApprovalFromTicket } from "./taskboardFeature";
+export { TICKET_TYPES, type TicketType, syncTicketApprovalFromTicket };
 
 export const TICKET_TYPE_LABEL: Record<TicketType, string> = {
   bug: '问题单',
@@ -287,6 +288,12 @@ export interface PipelineStage {
 }
 
 export interface TicketRun {
+  /** Read-only response projection from actual usage/live runner; never persisted. */
+  actualModels?: string[]
+  stopRequested?: boolean
+  /** The owning promise tree is still settling, even after lease reaping. */
+  settling?: boolean
+  preview?: { text: string; toolNames: string[]; lastActivityAt: number | null }
   id: string
   ticketId: string
   stageId: string
@@ -421,6 +428,7 @@ export interface ProjectCreateInput {
   labels?: string[]
   /** 省略 = 种四条内置线；`[]` = 不种；非空 = 按 id 套用。 */
   templateIds?: string[]
+  executionAgentId?: string | null
 }
 
 export interface ProjectPatchInput {
@@ -510,6 +518,7 @@ export type TimelineItem =
 
 export interface TicketDetail {
   ticket: Ticket
+  execution?: TicketRun | null
   pipeline?: Pipeline | null
   stage?: PipelineStage | null
 }
@@ -1214,10 +1223,42 @@ function qs(query?: object): string {
   return s ? `?${s}` : ''
 }
 
-function boardGet<T>(a: AuthSession, path: string): Promise<T> {
+function tapTicketApprovalPayload(payload: unknown): void {
+  if (!payload || typeof payload !== "object") return;
+  const rec = payload as Record<string, unknown>;
+  if (rec.ticket && typeof rec.ticket === "object") {
+    syncTicketApprovalFromTicket(rec.ticket as { id?: unknown; identifier?: unknown; status?: unknown });
+  }
+  if (Array.isArray(rec.items)) {
+    for (const item of rec.items) {
+      if (item && typeof item === "object" && "identifier" in (item as Record<string, unknown>)) {
+        syncTicketApprovalFromTicket(item as { id?: unknown; identifier?: unknown; status?: unknown });
+      }
+    }
+  }
+  if (Array.isArray(rec.columns)) {
+    for (const col of rec.columns) {
+      if (col && typeof col === "object" && Array.isArray((col as Record<string, unknown>).tickets)) {
+        for (const t of (col as { tickets: unknown[] }).tickets) {
+          syncTicketApprovalFromTicket(t as { id?: unknown; identifier?: unknown; status?: unknown });
+        }
+      }
+    }
+  }
+  if (rec.backlog && typeof rec.backlog === "object" && Array.isArray((rec.backlog as Record<string, unknown>).tickets)) {
+    for (const t of (rec.backlog as { tickets: unknown[] }).tickets) {
+      syncTicketApprovalFromTicket(t as { id?: unknown; identifier?: unknown; status?: unknown });
+    }
+  }
+}
+
+export function boardGet<T>(a: AuthSession, path: string, guard?: RequestExecutionGuard): Promise<T> {
   return jsonOrThrow<T>(
-    callWithRefresh(a, (t) => fetch(path, { credentials: 'include', headers: bearerHeaders(t) })),
-  )
+    callWithRefresh(a, (t) => fetchWithExecutionGuard(path, { credentials: 'include', headers: bearerHeaders(t) }, guard)),
+  ).then((res) => {
+    tapTicketApprovalPayload(res);
+    return res;
+  })
 }
 
 function boardSend<T>(
@@ -1225,17 +1266,21 @@ function boardSend<T>(
   path: string,
   method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   body?: unknown,
+  guard?: RequestExecutionGuard,
 ): Promise<T> {
   return jsonOrThrow<T>(
     callWithRefresh(a, (t) =>
-      fetch(path, {
+      fetchWithExecutionGuard(path, {
         method,
         credentials: 'include',
         headers: body === undefined ? bearerHeaders(t) : bearerHeaders(t, true),
         body: body === undefined ? undefined : JSON.stringify(body),
-      }),
+      }, guard),
     ),
-  )
+  ).then((res) => {
+    tapTicketApprovalPayload(res);
+    return res;
+  })
 }
 
 function ticketActionPath(idOrIdent: string, action: string): string {
@@ -1367,16 +1412,19 @@ export const taskboardApi = {
   listTickets: (a: AuthSession, query?: TicketListQuery) =>
     boardGet<ListPage<Ticket>>(a, `/api/board/tickets${qs(query)}`),
 
-  getTicket: (a: AuthSession, idOrIdent: string) =>
-    boardGet<TicketDetail>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}`).then(
+  getTicket: (a: AuthSession, idOrIdent: string, guard?: RequestExecutionGuard) =>
+    boardGet<TicketDetail>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}`, guard).then(
       (b) => b.ticket,
     ),
 
   getTicketDetail: (a: AuthSession, idOrIdent: string) =>
     boardGet<TicketDetail>(
       a,
-      `/api/board/tickets/${encodeURIComponent(idOrIdent)}${qs({ expand: 'pipeline,stage' })}`,
+      `/api/board/tickets/${encodeURIComponent(idOrIdent)}${qs({ expand: 'pipeline,stage,execution' })}`,
     ),
+
+  stopRun: (a: AuthSession, idOrIdent: string, expectedVersion: number, runId: string) =>
+    boardSend<{ ok: true; state: 'stopping' | 'terminal'; ticket: Ticket; run: TicketRun }>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}/stop`, 'POST', { expectedVersion, runId }),
 
   createTicket: (a: AuthSession, body: TicketCreateInput) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, '/api/board/tickets', 'POST', body),
@@ -1427,11 +1475,11 @@ export const taskboardApi = {
       reason,
     }),
 
-  approve: (a: AuthSession, idOrIdent: string, expectedVersion: number, close = false) =>
+  approve: (a: AuthSession, idOrIdent: string, expectedVersion: number, close = false, guard?: RequestExecutionGuard) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, ticketActionPath(idOrIdent, 'approve'), 'POST', {
       expectedVersion,
       close,
-    }),
+    }, guard),
 
   reject: (
     a: AuthSession,
@@ -1439,12 +1487,13 @@ export const taskboardApi = {
     expectedVersion: number,
     reason: string,
     targetStageId?: string | null,
+    guard?: RequestExecutionGuard,
   ) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, ticketActionPath(idOrIdent, 'reject'), 'POST', {
       expectedVersion,
       reason,
       targetStageId: targetStageId ?? null,
-    }),
+    }, guard),
 
   done: (a: AuthSession, idOrIdent: string, expectedVersion: number) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, ticketActionPath(idOrIdent, 'done'), 'POST', {
@@ -1493,6 +1542,12 @@ export const taskboardApi = {
       (b) => b.items || [],
     ),
 
+  getRun: (a: AuthSession, id: string) =>
+    boardGet<{ run: TicketRun }>(a, `/api/board/runs/${encodeURIComponent(id)}`).then((body) => body.run),
+
+  listTimelinePage: (a: AuthSession, id: string, options: { before?: string; ifHead?: string } = {}) =>
+    import('./taskboardTimelinePage').then((module) => module.loadTimelinePage(a, id, options)),
+
   listTimeline: (a: AuthSession, idOrIdent: string) =>
     // 时间线接口默认只回最旧的 100 条，上限 500。忙的单据要看到最新评论，必须显式要满额。
     boardGet<{ items: TimelineItem[] }>(
@@ -1528,7 +1583,7 @@ export const taskboardApi = {
   deleteTemplate: (a: AuthSession, id: string) =>
     boardSend<{ ok: boolean }>(a, `/api/board/templates/${encodeURIComponent(id)}`, 'DELETE'),
 
-  applyTemplate: (a: AuthSession, id: string, body: { projectId: string; asDefault?: boolean }) =>
+  applyTemplate: (a: AuthSession, id: string, body: { projectId: string; asDefault?: boolean; executionAgentId?: string | null }) =>
     boardSend<ApplyTemplateResult>(
       a,
       `/api/board/templates/${encodeURIComponent(id)}/apply`,

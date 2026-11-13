@@ -61,15 +61,14 @@ describe("OCV5-178 idle cursor registration", () => {
     // idle hello from cursor 0 would only make the gateway re-peek its ring.
     expect(send).toHaveBeenCalledTimes(1);
   });
-  test("failed registration remains retryable and idle does not consume active candidates", () => {
+  test("failed registration remains retryable; a subscribed session is not re-registered", () => {
     const { socket, hydrate, send } = setup();
     send.mockImplementationOnce(() => { throw new Error("socket unavailable"); });
     hydrate(); hydrate();
     expect(send).toHaveBeenCalledTimes(2);
     socket.applyServerMessages(id, "main", [...structuredClone(history),
       { id: "m-new-candidate", role: "user", text: "next", ts: 3, _seq: 3 }], true, 3);
-    expect(JSON.parse(send.mock.calls[2][0]).peers[0].resumeActiveTurnCandidateMessageIds)
-      .toEqual(["m-new-candidate"]);
+    expect(send).toHaveBeenCalledTimes(2);
   });
   test("idle ring-hit replay of a completed exact answer stays frozen", () => {
     const { hydrate, dispatch, session } = setup(1);

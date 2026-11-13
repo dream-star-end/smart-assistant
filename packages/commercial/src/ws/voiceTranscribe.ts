@@ -27,6 +27,11 @@ const DEFAULT_START_TIMEOUT_MS = 10_000;
 const DEFAULT_NO_AUDIO_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_PER_USER = 1;
 const DEFAULT_MAX_GLOBAL = 50;
+const DEFAULT_OPENAI_TRANSCRIBE_MODEL = "gpt-transcribe";
+const OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions";
+const DEFAULT_MAX_BUFFERED_AUDIO_BYTES = 8 * 1024 * 1024;
+// The browser treats "stopping" as the start of a 15s transcribing stage.
+const DEFAULT_OPENAI_TRANSCRIBE_TIMEOUT_MS = 12_000;
 
 const CLOSE_VOICE = {
   NORMAL: 1000,
@@ -61,6 +66,15 @@ type DeepgramSocketFactory = (url: string, options: { headers: Record<string, st
 export interface VoiceTranscribeDeps {
   jwtSecret: string | Uint8Array;
   deepgramApiKey?: string;
+  /** Test injection. Production resolves the pool/env key per session instead. */
+  openAiApiKey?: string;
+  /**
+   * Lookup at start. A usable key selects gpt-transcribe and does not open Deepgram.
+   * Null, blank, or a thrown lookup keeps the existing Deepgram path.
+   */
+  resolveOpenAiApiKey?: () => Promise<string | null>;
+  maxBufferedAudioBytes?: number;
+  openAiTranscribeTimeoutMs?: number;
   openCodeGoApiKey?: string;
   asrModel?: string;
   asrLanguage?: string;
@@ -523,6 +537,68 @@ async function polishTranscriptOnce(input: {
   return parseVoicePolishText(text, transcript);
 }
 
+function cleanVoiceSecret(value: string | null | undefined): string {
+  const key = (value ?? "").trim();
+  if (!key || /[\r\n\0]/.test(key)) return "";
+  return key;
+}
+
+function openAiLanguageCode(raw: string | undefined): string | undefined {
+  const primary = (raw ?? "").trim().toLowerCase().split(/[-_]/)[0] ?? "";
+  return /^[a-z]{2}$/.test(primary) ? primary : undefined;
+}
+
+function audioUploadName(mime: string): string {
+  if (mime.startsWith("audio/ogg")) return "audio.ogg";
+  if (mime.startsWith("audio/mp4")) return "audio.mp4";
+  if (mime.startsWith("audio/mpeg")) return "audio.mp3";
+  if (mime.startsWith("audio/wav")) return "audio.wav";
+  return "audio.webm";
+}
+
+function openAiPromptFromKeyterms(terms: string[]): string | undefined {
+  if (terms.length === 0) return undefined;
+  const prompt = terms.join(", ").slice(0, 800);
+  return prompt || undefined;
+}
+
+async function transcribeWithOpenAi(input: {
+  audio: Buffer;
+  mimeType: string;
+  apiKey: string;
+  model: string;
+  language?: string;
+  prompt?: string;
+  fetchImpl: FetchLike;
+  signal: AbortSignal;
+}): Promise<string> {
+  const form = new FormData();
+  form.append(
+    "file",
+    new Blob([new Uint8Array(input.audio)], { type: input.mimeType }),
+    audioUploadName(input.mimeType),
+  );
+  form.append("model", input.model);
+  form.append("response_format", "json");
+  if (input.language) form.append("language", input.language);
+  if (input.prompt) form.append("prompt", input.prompt);
+  // Key travels only in this header. Callers must not log the request or the key.
+  const res = await input.fetchImpl(OPENAI_TRANSCRIBE_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${input.apiKey}` },
+    body: form,
+    signal: input.signal,
+    dispatcher: directEgressDispatcher(),
+  } as RequestInit & { dispatcher: Dispatcher });
+  if (!res.ok) {
+    try { await res.body?.cancel(); } catch { /* noop */ }
+    throw new Error("openai_transcribe_http");
+  }
+  const json = await res.json().catch(() => null) as { text?: unknown } | null;
+  if (!json || typeof json.text !== "string") throw new Error("openai_transcribe_body");
+  return json.text;
+}
+
 async function polishTranscript(input: {
   transcript: string;
   context: VoiceContextMessage[];
@@ -577,6 +653,18 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
   );
   const maxSeconds = clampInt(deps.maxSeconds, DEFAULT_MAX_SECONDS, 10, 300);
   const maxAudioFrameBytes = deps.maxAudioFrameBytes ?? DEFAULT_MAX_AUDIO_FRAME_BYTES;
+  const maxBufferedAudioBytes = clampInt(
+    deps.maxBufferedAudioBytes,
+    DEFAULT_MAX_BUFFERED_AUDIO_BYTES,
+    1024,
+    16 * 1024 * 1024,
+  );
+  const openAiTranscribeTimeoutMs = clampInt(
+    deps.openAiTranscribeTimeoutMs,
+    DEFAULT_OPENAI_TRANSCRIBE_TIMEOUT_MS,
+    500,
+    20_000,
+  );
   const finalWaitMs = clampInt(deps.finalWaitMs, DEFAULT_FINAL_WAIT_MS, 500, 15_000);
   const deepgramOpenTimeoutMs = clampInt(deps.deepgramOpenTimeoutMs, DEFAULT_DEEPGRAM_OPEN_TIMEOUT_MS, 1000, 30_000);
   const noAudioTimeoutMs = clampInt(deps.noAudioTimeoutMs, DEFAULT_NO_AUDIO_TIMEOUT_MS, 5_000, 60_000);
@@ -608,6 +696,13 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
     let lastTranscript = "";
     let receivedAudio = false;
     let noAudioTimedOut = false;
+    let engine: "none" | "openai" | "deepgram" = "none";
+    let resolvingOpenAi = false;
+    let deferredStop = false;
+    let openAiKey = "";
+    let transcribeAbort: AbortController | null = null;
+    const audioChunks: Buffer[] = [];
+    let audioBytes = 0;
     const finalSegments = new Map<number, string>();
 
     const currentFinalText = (): string => {
@@ -628,7 +723,11 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
       if (maxTimer) clearTimeout(maxTimer);
       if (finalTimer) clearTimeout(finalTimer);
       if (noAudioTimer) clearTimeout(noAudioTimer);
+      try { transcribeAbort?.abort(); } catch { /* noop */ }
       try { polishAbort?.abort(); } catch { /* noop */ }
+      audioChunks.length = 0;
+      audioBytes = 0;
+      openAiKey = "";
       if (dg && dg.readyState < WebSocket.CLOSING) {
         try { dg.close(); } catch { /* noop */ }
       }
@@ -685,7 +784,115 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
       }, finalWaitMs);
     };
 
+    const armNoAudioTimeout = (): void => {
+      if (noAudioTimer) clearTimeout(noAudioTimer);
+      noAudioTimer = setTimeout(() => {
+        if (receivedAudio || stopping || finalized) return;
+        noAudioTimedOut = true;
+        sendErrorFrame(ws, "VOICE_NO_AUDIO_TIMEOUT", "语音输入待机超时");
+        try { ws.close(CLOSE_VOICE.POLICY, "voice no audio timeout"); } catch { /* noop */ }
+        if (dg && dg.readyState < WebSocket.CLOSING) {
+          try { dg.close(); } catch { /* noop */ }
+        }
+      }, noAudioTimeoutMs);
+    };
+
+    const stopOpenAi = async (): Promise<void> => {
+      if (stopping || finalized) return;
+      stopping = true;
+      if (maxTimer) clearTimeout(maxTimer);
+      if (noAudioTimer) clearTimeout(noAudioTimer);
+      noAudioTimer = null;
+      sendJson(ws, { type: "stopping", rawText: currentFinalText() });
+      if (!receivedAudio || audioBytes === 0) {
+        await finish("client_close");
+        return;
+      }
+      const audio = Buffer.concat(audioChunks, audioBytes);
+      audioChunks.length = 0;
+      audioBytes = 0;
+      const key = openAiKey;
+      const ac = new AbortController();
+      transcribeAbort = ac;
+      let text = "";
+      try {
+        text = await new Promise<string>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            ac.abort();
+            reject(new Error("openai_transcribe_timeout"));
+          }, openAiTranscribeTimeoutMs);
+          transcribeWithOpenAi({
+            audio,
+            mimeType: startPayload.mimeType,
+            apiKey: key,
+            model: DEFAULT_OPENAI_TRANSCRIBE_MODEL,
+            language: openAiLanguageCode(deps.asrLanguage || DEFAULT_ASR_LANGUAGE),
+            prompt: openAiPromptFromKeyterms(startPayload.keyterms),
+            fetchImpl,
+            signal: ac.signal,
+          }).then(
+            (value) => {
+              clearTimeout(timer);
+              resolve(value);
+            },
+            (err: unknown) => {
+              clearTimeout(timer);
+              reject(err);
+            },
+          );
+        });
+      } catch {
+        if (finalized || released) return;
+        log?.warn("voice-transcribe: openai transcription failed", {
+          uid: uid.toString(),
+          connId,
+        });
+        sendErrorFrame(ws, "VOICE_UPSTREAM_ERROR", "语音识别服务暂时不可用");
+        try { ws.close(CLOSE_VOICE.INTERNAL, "voice upstream error"); } catch { /* noop */ }
+        return;
+      } finally {
+        if (transcribeAbort === ac) transcribeAbort = null;
+      }
+      if (finalized || released) return;
+      const trimmed = trimOneLine(text);
+      if (trimmed) {
+        lastTranscript = trimmed;
+        finalSegments.set(0, trimmed);
+        sendJson(ws, {
+          type: "transcript",
+          text: trimmed,
+          finalText: trimmed,
+          isFinal: true,
+          speechFinal: true,
+          confidence: null,
+        });
+      }
+      await finish("client_close");
+    };
+
+    const failOpenAiStop = (): void => {
+      void stopOpenAi().catch(() => {
+        if (finalized || released) return;
+        sendErrorFrame(ws, "VOICE_UPSTREAM_ERROR", "语音识别服务暂时不可用");
+        try { ws.close(CLOSE_VOICE.INTERNAL, "voice upstream error"); } catch { /* noop */ }
+      });
+    };
+
+    const beginOpenAi = (key: string): void => {
+      engine = "openai";
+      openAiKey = key;
+      armNoAudioTimeout();
+      sendJson(ws, {
+        type: "ready",
+        model: DEFAULT_OPENAI_TRANSCRIBE_MODEL,
+        language: deps.asrLanguage || DEFAULT_ASR_LANGUAGE,
+        maxSeconds,
+      });
+      if (deferredStop) failOpenAiStop();
+    };
+
     const openDeepgram = (): void => {
+      engine = "deepgram";
       const url = buildDeepgramListenUrl({
         model: deps.asrModel || DEFAULT_ASR_MODEL,
         language: deps.asrLanguage || DEFAULT_ASR_LANGUAGE,
@@ -704,15 +911,7 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
 
       dg.on("open", () => {
         if (openTimer) clearTimeout(openTimer);
-        noAudioTimer = setTimeout(() => {
-          if (receivedAudio || stopping || finalized) return;
-          noAudioTimedOut = true;
-          sendErrorFrame(ws, "VOICE_NO_AUDIO_TIMEOUT", "语音输入待机超时");
-          try { ws.close(CLOSE_VOICE.POLICY, "voice no audio timeout"); } catch { /* noop */ }
-          if (dg && dg.readyState < WebSocket.CLOSING) {
-            try { dg.close(); } catch { /* noop */ }
-          }
-        }, noAudioTimeoutMs);
+        armNoAudioTimeout();
         sendJson(ws, {
           type: "ready",
           model: deps.asrModel || DEFAULT_ASR_MODEL,
@@ -772,6 +971,23 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
       scheduleFinalFallback();
     };
 
+    const chooseEngine = (key: string): void => {
+      if (key) {
+        beginOpenAi(key);
+        return;
+      }
+      if (!deps.deepgramApiKey) {
+        sendErrorFrame(ws, "VOICE_NOT_CONFIGURED", "语音识别服务未配置");
+        try { ws.close(CLOSE_VOICE.INTERNAL, "voice not configured"); } catch { /* noop */ }
+        return;
+      }
+      if (deferredStop) {
+        stopDeepgram();
+        return;
+      }
+      openDeepgram();
+    };
+
     const handleTextFrame = (data: RawData): void => {
       let msg: Record<string, unknown>;
       try { msg = JSON.parse(rawDataToString(data)) as Record<string, unknown>; }
@@ -786,18 +1002,47 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
           try { ws.close(CLOSE_VOICE.POLICY, "bad sequence"); } catch { /* noop */ }
           return;
         }
-        if (!deps.deepgramApiKey) {
-          sendErrorFrame(ws, "VOICE_NOT_CONFIGURED", "语音识别服务未配置");
-          try { ws.close(CLOSE_VOICE.INTERNAL, "voice not configured"); } catch { /* noop */ }
+        const staticOpenAiKey = cleanVoiceSecret(deps.openAiApiKey);
+        // No OpenAI key and no per-session lookup: Deepgram path, unchanged.
+        if (!deps.resolveOpenAiApiKey && !staticOpenAiKey) {
+          if (!deps.deepgramApiKey) {
+            sendErrorFrame(ws, "VOICE_NOT_CONFIGURED", "语音识别服务未配置");
+            try { ws.close(CLOSE_VOICE.INTERNAL, "voice not configured"); } catch { /* noop */ }
+            return;
+          }
+          if (startTimer) clearTimeout(startTimer);
+          started = true;
+          startPayload = sanitizeVoiceStartPayload(msg);
+          openDeepgram();
           return;
         }
         if (startTimer) clearTimeout(startTimer);
         started = true;
         startPayload = sanitizeVoiceStartPayload(msg);
-        openDeepgram();
+        if (!deps.resolveOpenAiApiKey) {
+          chooseEngine(staticOpenAiKey);
+          return;
+        }
+        resolvingOpenAi = true;
+        void (async () => {
+          let key = "";
+          try { key = cleanVoiceSecret(await deps.resolveOpenAiApiKey?.()); }
+          catch { key = ""; }
+          resolvingOpenAi = false;
+          if (released || finalized) return;
+          chooseEngine(key);
+        })();
         return;
       }
       if (msg.type === "stop") {
+        if (engine === "openai") {
+          failOpenAiStop();
+          return;
+        }
+        if (resolvingOpenAi) {
+          deferredStop = true;
+          return;
+        }
         stopDeepgram();
         return;
       }
@@ -810,7 +1055,30 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
 
     const handleMessage = (data: RawData, isBinary: boolean): void => {
       if (isBinary) {
-        if (!started || !dg || dg.readyState !== WebSocket.OPEN || stopping) return;
+        if (!started || stopping) return;
+        if (engine === "openai") {
+          const buf = rawDataToBuffer(data);
+          if (buf.length > maxAudioFrameBytes) {
+            sendErrorFrame(ws, "VOICE_FRAME_TOO_BIG", "audio frame too large");
+            try { ws.close(CLOSE_VOICE.TOO_BIG, "audio frame too large"); } catch { /* noop */ }
+            return;
+          }
+          if (audioBytes + buf.length > maxBufferedAudioBytes) {
+            sendErrorFrame(ws, "VOICE_AUDIO_TOO_LARGE", "语音过长");
+            try { ws.close(CLOSE_VOICE.POLICY, "voice audio too large"); } catch { /* noop */ }
+            return;
+          }
+          if (!receivedAudio) {
+            receivedAudio = true;
+            if (noAudioTimer) clearTimeout(noAudioTimer);
+            noAudioTimer = null;
+            startMaxTimer();
+          }
+          audioChunks.push(buf);
+          audioBytes += buf.length;
+          return;
+        }
+        if (!dg || dg.readyState !== WebSocket.OPEN) return;
         const bytes = rawDataLen(data);
         if (bytes > maxAudioFrameBytes) {
           sendErrorFrame(ws, "VOICE_FRAME_TOO_BIG", "audio frame too large");

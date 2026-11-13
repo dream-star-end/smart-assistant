@@ -18,7 +18,11 @@ import { createHash } from 'node:crypto'
 import {
   type EmbeddingProvider,
   type EmbeddingProviderConfig,
+  OPENAI_EMBEDDING_BASE_URL,
+  OPENAI_LARGE_EMBEDDING_DIMENSIONS,
+  OPENAI_LARGE_EMBEDDING_MODEL,
   OpenAIEmbeddingProvider,
+  defaultEmbeddingBatchSize,
 } from './embedding.js'
 
 const DASHSCOPE_COMPAT_BASE = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
@@ -50,14 +54,53 @@ function parseDim(value: string | undefined, fallback: number): number {
   return Number.isInteger(n) && n > 0 ? n : fallback
 }
 
-export function skillEmbeddingConfigFromEnv(): EmbeddingProviderConfig {
+function cleanOpenAiKey(value: string | null | undefined): string {
+  const key = (value ?? '').trim()
+  if (!key || /[\r\n\0]/.test(key)) return ''
+  return key
+}
+
+/**
+ * Skill embedding config.
+ *
+ * Default (no OpenAI key, or an explicit SKILL_EMBEDDING_MODEL / BASE_URL pin)
+ * stays on DashScope text-embedding-v4. Batch size follows the base URL:
+ * DashScope compatible-mode stays at 10, anything else uses the OpenAI default
+ * (100) instead of a hardcoded DashScope cap.
+ *
+ * An OpenAI key switches the unpinned config to text-embedding-3-large at
+ * 1024 dimensions on api.openai.com. When `opts` includes `openAiApiKey`,
+ * that value is the only authority: explicit null or blank (the pool has
+ * members but none are usable) does not fall back to OPENAI_API_KEY. The env
+ * key is read only when the override is omitted.
+ */
+export function skillEmbeddingConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  opts: { openAiApiKey?: string | null } = {},
+): EmbeddingProviderConfig {
+  const openAiKey = Object.prototype.hasOwnProperty.call(opts, 'openAiApiKey')
+    ? cleanOpenAiKey(opts.openAiApiKey)
+    : cleanOpenAiKey(env.OPENAI_API_KEY)
+  const pinned = env.SKILL_EMBEDDING_MODEL !== undefined || env.SKILL_EMBEDDING_BASE_URL !== undefined
+  if (openAiKey && !pinned) {
+    return {
+      provider: 'openai',
+      model: OPENAI_LARGE_EMBEDDING_MODEL,
+      dimensions: parseDim(env.SKILL_EMBEDDING_DIMENSIONS, OPENAI_LARGE_EMBEDDING_DIMENSIONS),
+      apiKey: openAiKey,
+      baseUrl: OPENAI_EMBEDDING_BASE_URL,
+      batchSize: defaultEmbeddingBatchSize(OPENAI_EMBEDDING_BASE_URL),
+      timeoutMs: 3000,
+    }
+  }
+  const baseUrl = env.SKILL_EMBEDDING_BASE_URL ?? DASHSCOPE_COMPAT_BASE
   return {
     provider: 'openai', // OpenAI-compatible wire format; real backend tracked via skillEmbeddingBackendId()
-    model: process.env.SKILL_EMBEDDING_MODEL ?? 'text-embedding-v4',
-    dimensions: parseDim(process.env.SKILL_EMBEDDING_DIMENSIONS, 1024),
-    apiKey: process.env.SKILL_EMBEDDING_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? '',
-    baseUrl: process.env.SKILL_EMBEDDING_BASE_URL ?? DASHSCOPE_COMPAT_BASE,
-    batchSize: 10, // DashScope text-embedding-v4 caps batch at 10
+    model: env.SKILL_EMBEDDING_MODEL ?? 'text-embedding-v4',
+    dimensions: parseDim(env.SKILL_EMBEDDING_DIMENSIONS, 1024),
+    apiKey: env.SKILL_EMBEDDING_API_KEY ?? env.DASHSCOPE_API_KEY ?? '',
+    baseUrl,
+    batchSize: defaultEmbeddingBatchSize(baseUrl),
     timeoutMs: 3000, // interactive path — fail fast to keyword fallback
   }
 }
@@ -77,11 +120,26 @@ export function skillEmbeddingBackendId(baseUrl?: string): string {
 }
 
 let _provider: EmbeddingProvider | null = null
+let _providerSignature = ''
+
+function skillProviderSignature(cfg: EmbeddingProviderConfig): string {
+  return [
+    cfg.provider ?? '',
+    cfg.model ?? '',
+    String(cfg.dimensions ?? ''),
+    cfg.baseUrl ?? '',
+    String(cfg.batchSize ?? ''),
+    String(cfg.timeoutMs ?? ''),
+    cfg.apiKey ?? '',
+  ].join('\0')
+}
 
 export function getSkillEmbeddingProvider(config?: EmbeddingProviderConfig): EmbeddingProvider {
-  if (_provider) return _provider
   const cfg = config ?? skillEmbeddingConfigFromEnv()
+  const signature = skillProviderSignature(cfg)
+  if (_provider && _providerSignature === signature) return _provider
   _provider = new OpenAIEmbeddingProvider(cfg) // throws if apiKey missing
+  _providerSignature = signature
   return _provider
 }
 
@@ -96,6 +154,7 @@ export function isSkillEmbeddingAvailable(): boolean {
 /** Reset the dedicated provider singleton (for tests / config reload). */
 export function resetSkillEmbeddingProvider(): void {
   _provider = null
+  _providerSignature = ''
 }
 
 // ── Canonical representation + content hash ───────

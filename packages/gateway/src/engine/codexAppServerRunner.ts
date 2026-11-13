@@ -1,4 +1,8 @@
+import { readLatestCodexNativeHandoff, runnerShutdownTimeoutMs, waitForCloseWithin, killCodexProcessGroup } from './codexLifecycle.js'
+export { readLatestCodexNativeHandoff } from './codexLifecycle.js'
 import { CodexNativeContext } from './codexNativeContext.js'
+import { withFreshPromptPrivacy } from '../promptPrivacyRuntime.js'
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 // Test-only override of the spawn used to launch `codex app-server`. See
@@ -12,25 +16,19 @@ export { _codexMemoryTurnEnv } from './codexMemoryTurnEnv.js'
 import { EventEmitter } from 'node:events'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import {
-  createReadStream,
-  lstatSync,
   mkdtempSync,
-  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
-import { createInterface } from 'node:readline'
+import { join } from 'node:path'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
-  CODEX_EXPLICIT_STANDARD_MODELS,
-  CODEX_STANDARD_SERVICE_TIER,
   codexTransportModelId,
   isToolExitCode,
   turnErrorSemantics,
@@ -50,18 +48,22 @@ import {
   type CodexProviderConfigOverride,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
-  normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
 import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
-import { issueConsultTurnToken, issueDelegateContextToken } from '../delegateContext.js'
+import { writeCodexDelegateContext } from './codexDelegateContext.js'
+import {
+  buildAdvisorReadOnlyArgs, buildCodexThreadPolicyParams,
+  buildCodexTurnPolicyParams, readAdvisorReadOnlyConfig,
+} from './codexAdvisorReadOnly.js'
 import {
   buildHermeticDenial,
   isHermeticExecutionMethod,
 } from './codexHermeticPolicy.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
+import { withCodexTurnTrace } from '../relayTrace.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -140,6 +142,7 @@ import {
   _consumeRateLimitsForEmit as _consumeRateLimitsForEmitImpl,
   emitResult as emitResultImpl,
 } from './codexAppServerNotifications.js'
+import { rememberImageStderr, redactImageUpstream } from './imageGenerationFailure.js'
 export {
   isMissingRolloutError,
   isGoalAlreadyClearedError,
@@ -171,45 +174,6 @@ const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 
 const NATIVE_COMPACTION_TIMEOUT_MS = 15 * 60_000
-const CODEX_ROLLOUT_MAX_BYTES = 256 * 1024 * 1024
-
-export async function readLatestCodexNativeHandoff(
-  rolloutPath: string,
-  compactStartedAt: number,
-): Promise<NativeModelHandoffArtifact> {
-  if (!isAbsolute(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  const canonical = realpathSync(rolloutPath)
-  if (canonical !== resolve(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  const info = lstatSync(canonical)
-  if (!info.isFile() || info.isSymbolicLink() || info.size > CODEX_ROLLOUT_MAX_BYTES) {
-    throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  }
-  let latest: { timestamp: number; message: string } | null = null
-  const lines = createInterface({
-    input: createReadStream(canonical, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  })
-  for await (const line of lines) {
-    if (!line.includes('"type":"compacted"')) continue
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (!parsed || typeof parsed !== 'object') continue
-    const row = parsed as Record<string, unknown>
-    if (row.type !== 'compacted' || !row.payload || typeof row.payload !== 'object') continue
-    const ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : Number.NaN
-    if (!Number.isFinite(ts) || ts + 5_000 < compactStartedAt) continue
-    const payload = row.payload as Record<string, unknown>
-    const message = typeof payload.message === 'string' ? payload.message.trim() : ''
-    if (!message || !Array.isArray(payload.replacement_history)) continue
-    if (!latest || ts >= latest.timestamp) latest = { timestamp: ts, message }
-  }
-  if (!latest) throw new Error('CODEX_NATIVE_COMPACTION_NOT_EXPORTED')
-  return { summaryText: latest.message, source: 'codex', compactStartedAt }
-}
 
 // ── turn/start 窄路径自动重试(turn-retry 批,2026-07-18)──────────────────
 // 只重试 **turn/start 请求本身被拒**的窄路径(app-server 明确 JSON-RPC application
@@ -220,50 +184,6 @@ export async function readLatestCodexNativeHandoff(
 const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
 const RETRY_JITTER_MS = 500
 
-function runnerShutdownTimeoutMs(name: string, fallback: number): number {
-  const raw = Number(process.env[name])
-  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
-}
-
-function waitForCloseWithin(closePromise: Promise<void>, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    let done = false
-    const finish = (closed: boolean) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve(closed)
-    }
-    const timer = setTimeout(() => finish(false), timeoutMs)
-    closePromise.then(() => finish(true))
-  })
-}
-
-function killCodexProcessGroup(proc: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
-  try {
-    if (typeof proc.pid === 'number' && proc.pid > 0) {
-      process.kill(-proc.pid, signal)
-      return
-    }
-  } catch {
-    // Fall back to the direct child if the detached process group is already
-    // gone or unavailable on this platform.
-  }
-  try {
-    proc.kill(signal)
-  } catch {
-    /* ignore */
-  }
-}
-
-const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
-  'You are in implementation mode, not plan-only mode.',
-  'Decide autonomously whether the user request benefits from a visible plan/task list before or during execution.',
-  'For multi-step, risky, ambiguous, or code-changing tasks, create and maintain a concise plan; keep exactly one active step when work is underway.',
-  'For trivial one-step questions or tiny edits, skip the plan and answer or implement directly.',
-  'Do not stop after planning unless the user explicitly asks for plan-only; after planning, continue execution in the same turn when execution is allowed.',
-  'When creating or editing files, prefer native fileChange/apply_patch edits so the UI can render Write/Edit cards; avoid Bash heredocs solely for file writes unless the shell command also needs real shell-side effects such as batch scaffolding.',
-].join(' ')
 
 // ───────────────────────────────────────────────
 // CodexAppServerRunner
@@ -304,6 +224,7 @@ const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
 // ───────────────────────────────────────────────
 
 export interface CodexAppServerRunnerOpts {
+  systemHelpContextFile?: string
   sessionKey: string
   agentId: string
   cwd: string
@@ -360,6 +281,22 @@ export interface CodexAppServerRunnerOpts {
   hermeticNoTools?: boolean
   /** Codex app-server turn/start structured output contract. */
   structuredOutputSchema?: Readonly<Record<string, unknown>>
+  /** Remote lane: the process boundary is the master relay, never a local `codex` child. */
+  remote?: CodexRemoteKernelRuntime
+}
+
+/**
+ * The only thing a remote lane replaces: where bytes come from and go to. Thread/turn/item
+ * parsing, usage accounting and terminal semantics stay in this runner.
+ */
+export interface CodexRemoteKernelRuntime {
+  readonly child: ChildProcessWithoutNullStreams
+  /** This turn's admission (tool catalog + master admit) — nothing may cross the lane before it. */
+  ready(): Promise<void>
+  /** Platform instructions for the native thread (the container tool-naming notice is appended). */
+  instructions(platformPrompt: string): string
+  /** Stop the lane after the container has proven its local tool host stopped. */
+  stop(): Promise<void>
 }
 
 interface QueuedTurn {
@@ -374,7 +311,9 @@ interface QueuedTurn {
   requestId?: string
   collabAgentPolicy?: CollabAgentPolicy
   queueTurn?: boolean
+  traceId?: string
   automaticRetryState?: AutomaticRetryState
+  readOnly?: boolean
 }
 
 export class PromptQueueRunnerInvariantError extends Error {
@@ -414,6 +353,11 @@ export class CodexAppServerRunner extends EventEmitter {
   private shuttingDown = false
   private spawnEmitted = false
   private initialized = false
+  /** Captured from this queue entry; never inferred from a rewritten prompt. */
+  private advisorReadOnly = false
+  /** Tool/MCP schemas are process-scoped, so both policy transitions recycle. */
+  private spawnedAdvisorReadOnly: boolean | null = null
+  private advisorReadOnlyConfig: Record<string, unknown> | undefined
   /**
    * USER_CANCELLED 只发 turn/interrupt、不杀进程。合作式 summary 到达后
    * sessionManager 会跳过 shutdown,下一 turn ensureSpawned 会复用已经
@@ -597,6 +541,8 @@ export class CodexAppServerRunner extends EventEmitter {
   private cachedOverrides: CodexLaunchOverrides | null = null
   private codexRouteConfig: CodexProviderConfigOverride | null = null
   private spawnedProviderSignature: string | null = null
+  /** Native thread instructions for a remote lane (already carrying the tool-naming notice). */
+  private remoteInstructions: string | null = null
 
   // ── Phase 5 GitHub session repo binding(parity with SubprocessRunner)──
   /** ready 状态下记录当前生效的 repo binding — selectionVersion 给
@@ -610,6 +556,14 @@ export class CodexAppServerRunner extends EventEmitter {
   public effortLevel: string | undefined = undefined
   /** Intelligent UI(OCV5-361):当前 app-server 的 instructions 里 INTELLIGENT_UI 段的指纹(没有 = false)。 */
   private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
+  private _promptPolicyFingerprint: string | undefined
+  private promptPolicy: PromptPrivacyPolicy | undefined
+  get promptPolicyFingerprint(): string | undefined { return this._promptPolicyFingerprint }
+  assertPromptPrivacyStopped(): void {
+    if (this.proc) throw new Error("助手隐私刷新仍在等待旧进程终结，请稍后重试。")
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.promptPolicy = structuredClone(policy) }
+  clearPromptPrivacy(): void { this.promptPolicy = undefined }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return this._promptIntelligentUi
   }
@@ -707,6 +661,8 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private async syncPlatformGoal(): Promise<void> {
+    // thread/goal/set is outside the node's closed RPC grammar; goal cards stay container-side.
+    if (this.opts.remote) return
     if (!this.platformGoalInitialized || !this.threadId || !this.attached) return
     const signature = this.platformGoalSignature()
     if (signature === this.syncedPlatformGoalSignature) return
@@ -916,7 +872,41 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitTurnStatus(this.pendingUserInputs.size > 0 ? 'waiting_for_user' : null)
   }
 
+  private compactPrivacyPreparing = false
   async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    // A remote thread's rollout lives on the node; there is no local artifact to export.
+    if (this.opts.remote) throw new Error('CODEX_REMOTE_COMPACTION_UNSUPPORTED')
+    if (!this.proc || !this.attached || !this.threadId) throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
+    if (this.processing || this.currentTurnCompleter || this.pendingNativeCompaction || this.compactPrivacyPreparing) throw new Error('CODEX_NATIVE_COMPACTION_BUSY')
+    const sourceThread = this.threadId
+    let expectedGeneration = this._preheatGeneration
+    const assertCurrent = () => {
+      if (this._preheatGeneration !== expectedGeneration) throw new Error('CODEX_NATIVE_COMPACTION_INTERRUPTED')
+    }
+    this.compactPrivacyPreparing = true
+    try {
+      return await withFreshPromptPrivacy(this, this.opts.sessionId, async () => {
+        if (this.threadId !== sourceThread) throw new Error('CODEX_NATIVE_COMPACTION_SESSION_CHANGED')
+        if (!this.proc || !this.attached) {
+          const repo = this._currentRepoSnapshot()
+          const cwd = this._applyRepoBindingFromSnapshot(repo)
+          await this.ensureSpawned(repo, cwd)
+          assertCurrent()
+          const transportModel = codexTransportModelId(this.opts.model)
+          await this.sendRequest('thread/resume', {
+              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
+            threadId: sourceThread, approvalPolicy: 'never', sandbox: 'danger-full-access', cwd,
+            ...(transportModel ? { model: transportModel } : {}),
+          })
+          assertCurrent()
+          this.attached = true
+        }
+        assertCurrent()
+        return this.compactCurrentThreadForHandoff()
+      }, { assertCurrent, beforeOwnedShutdown: () => { assertCurrent(); expectedGeneration++ } })
+    } finally { this.compactPrivacyPreparing = false }
+  }
+  private async compactCurrentThreadForHandoff(): Promise<NativeModelHandoffArtifact> {
     if (!this.proc || !this.attached || !this.threadId) {
       throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
     }
@@ -967,6 +957,10 @@ export class CodexAppServerRunner extends EventEmitter {
     if (this.nativeContext.running) {
       this.pendingStartInterrupt = true
       this.nativeContext.abort(new Error('Native context compaction interrupted'))
+      return true
+    }
+    if (this.compactPrivacyPreparing) {
+      void this.shutdown()
       return true
     }
     // 审计 R8:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,runTurn 的
@@ -1054,9 +1048,12 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       this.sessionDir = null
     }
+    const privacyGeneration = this._preheatGeneration
     const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
     try {
       const overrides = await buildCodexLaunchOverrides({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
+        promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
@@ -1077,9 +1074,10 @@ export class CodexAppServerRunner extends EventEmitter {
         runContext: this.opts.runContext,
         frozenProjectContext: this.opts.frozenProjectContext,
         cwd: this.opts.cwd,
+        readOnly: this.advisorReadOnly,
       })
+      if (privacyGeneration !== this._preheatGeneration) throw new Error('PROMPT_PRIVACY_SPAWN_STALE')
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
-      this._promptIntelligentUi = overrides.intelligentUiApplied
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).
       if (overrides.tokenFile && overrides.tokenContent !== null) {
         writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
@@ -1089,6 +1087,8 @@ export class CodexAppServerRunner extends EventEmitter {
           mode: 0o600,
         })
       }
+      this._promptIntelligentUi = overrides.intelligentUiApplied
+      this._promptPolicyFingerprint = overrides.promptPolicyFingerprint
       this.sessionDir = dir
       this.cachedOverrides = overrides
       return overrides
@@ -1120,26 +1120,15 @@ export class CodexAppServerRunner extends EventEmitter {
   /** The app-server process is long-lived. Advisor-mode parents mint a v2
    * turn token; changing origin turnKey forces a respawn so MCP env cannot
    * reread a later turn's file. */
-  private refreshDelegateContext(): void {
-    const file = this.cachedOverrides?.delegateContextFile
-    if (!file) return
-    const consult = this.consultTurnBinding
-    const token = consult
-      ? issueConsultTurnToken({
-          agentId: this.opts.agentId,
-          sessionKey: this.opts.sessionKey,
-          depth: this.opts.delegationDepth ?? 0,
-          turnKey: consult.turnKey,
-          turnIndex: consult.turnIndex,
-          collabMode: 'advisor',
-          configVersion: consult.configVersion,
-        })
-      : issueDelegateContextToken({
-          agentId: this.opts.agentId,
-          sessionKey: this.opts.sessionKey,
-          depth: this.opts.delegationDepth ?? 0,
-        })
-    writeFileSync(file, `${token}\n`, { mode: 0o600 })
+  private refreshDelegateContext(traceId?: string): void {
+    writeCodexDelegateContext({
+      file: this.cachedOverrides?.delegateContextFile,
+      agentId: this.opts.agentId,
+      sessionKey: this.opts.sessionKey,
+      depth: this.opts.delegationDepth ?? 0,
+      consultTurn: this.consultTurnBinding,
+      traceId,
+    })
   }
 
   /** Cleanup helper shared by `shutdown()` and the proc close handler so
@@ -1188,7 +1177,10 @@ export class CodexAppServerRunner extends EventEmitter {
     collabAgentPolicy?: CollabAgentPolicy,
     queueTurn = false,
     automaticRetryState?: AutomaticRetryState,
+    traceId?: string | null,
+    readOnly = false,
   ): Promise<void> {
+    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
       this.spawnEmitted = true
@@ -1204,7 +1196,9 @@ export class CodexAppServerRunner extends EventEmitter {
         requestId,
         collabAgentPolicy,
         queueTurn,
+        traceId: turnTraceId,
         automaticRetryState,
+        readOnly,
       })
       void this.drain()
     })
@@ -1263,7 +1257,16 @@ export class CodexAppServerRunner extends EventEmitter {
       const onClose = () => resolveClose()
       proc.once('close', onClose)
       if (proc.exitCode === null && proc.signalCode === null) {
-        killCodexProcessGroup(proc, 'SIGTERM')
+        if (this.opts.remote) {
+          // No local process group exists. The lane stop is the only effect; the relay child
+          // closes as soon as its poll loop can no longer reach the lane.
+          void this.opts.remote.stop().catch((err: Error) => {
+            log.warn('codex remote lane stop failed', { sessionKey: this.opts.sessionKey, err: err.message })
+          })
+          proc.kill()
+        } else {
+          killCodexProcessGroup(proc, 'SIGTERM')
+        }
       }
       let closed = await waitForCloseWithin(
         closePromise,
@@ -1364,6 +1367,8 @@ export class CodexAppServerRunner extends EventEmitter {
         turn.requestId,
         turn.collabAgentPolicy,
         turn.automaticRetryState,
+        turn.traceId ?? null,
+        turn.readOnly === true,
       )
       turn.resolve()
     } catch (err) {
@@ -1496,6 +1501,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // initialize response.
     this.stdoutBuf = ''
     this.relayDeniedTracker.reset()
+    if (this.opts.remote) return this._ensureSpawnedRemote()
     // Build platform context overrides BEFORE spawn so the long-lived
     // app-server proc has model_instructions_file + mcp-memory available
     // from its very first turn. Failure here is non-fatal — fall back to
@@ -1539,6 +1545,7 @@ export class CodexAppServerRunner extends EventEmitter {
         if (overrides) argvOverrides = overrides.argvOverrides
       }
     } catch (err) {
+      if (this.promptPolicy) throw err
       log.warn(
         'codex app-server launch overrides build failed; spawning without platform context',
         {
@@ -1605,6 +1612,9 @@ export class CodexAppServerRunner extends EventEmitter {
       : []
     const args = [
       'app-server',
+      // Register the platform server. Inherited server tables are explicitly
+      // disabled after initialize because empty TOML maps merge with them.
+      ...(this.advisorReadOnly ? ['-c', 'mcp_servers={}'] : []),
       ...argvOverrides,
       ...providerArgs,
       ...modelCatalogArgs,
@@ -1616,6 +1626,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...applyPatchStreamingArgs,
       ...telemetryArgs,
       ...stageAgentArgs,
+      ...(this.advisorReadOnly ? buildAdvisorReadOnlyArgs() : []),
       '--listen',
       'stdio://',
     ]
@@ -1641,10 +1652,12 @@ export class CodexAppServerRunner extends EventEmitter {
         ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey, {
           gatewayPort: this.opts.config?.gateway.port,
           contextFile: this.cachedOverrides?.delegateContextFile,
+          systemHelpContextFile: this.opts.systemHelpContextFile,
         }),
       },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
+    this.spawnedAdvisorReadOnly = this.advisorReadOnly
     proc.stdin.on('error', (err: NodeJS.ErrnoException) => {
       if (this.proc !== proc) return
       log.warn('codex app-server stdin error', {
@@ -1770,13 +1783,105 @@ export class CodexAppServerRunner extends EventEmitter {
     // won't EPIPE.
     const initializeStartedAt = performance.now()
     try {
-      await this.sendRequest('initialize', this.buildInitializeParams())
+      const initialized = await this.sendRequest('initialize', this.buildInitializeParams())
+      this.advisorReadOnlyConfig = await readAdvisorReadOnlyConfig(this.advisorReadOnly, initialized,
+        () => this.sendRequest('config/read', { cwd: effectiveCwd, includeLayers: false }),
+        this.cachedOverrides?.tokenFile != null)
       log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
         stage: 'initialize_ready', durationMs: performance.now() - initializeStartedAt })
     } catch (err) {
       // A live but never-initialized app-server must not survive: later
       // ensureSpawned calls would see proc-alive and (historically) skip the
       // handshake. Tear it down before rethrowing so the next call respawns.
+      try {
+        await this.shutdown()
+      } catch {
+        /* teardown is best-effort on a failed handshake */
+      }
+      throw err
+    }
+    this.initialized = true
+  }
+
+  /**
+   * Remote lane spawn: no argv, no env, no local cwd/config. The platform instructions are the
+   * only local input; the node owns model, sandbox and credentials. Everything after the
+   * process boundary is the same code as a local app-server.
+   */
+  private async _ensureSpawnedRemote(): Promise<void> {
+    const remote = this.opts.remote!
+    // The lane is admitted first: its catalog is the instruction table, and the master rejects
+    // any frame that arrives before it holds this turn's authority.
+    await remote.ready()
+    let platformPrompt = ''
+    try {
+      const overrides = await this.ensureLaunchOverrides(null)
+      platformPrompt = overrides?.instructionsContent ?? ''
+    } catch (err) {
+      // Without platform context the remote model would run blind; unlike the local
+      // path we cannot fall back to a naked launch that still has a tool host.
+      throw err instanceof Error ? err : new Error('CODEX_REMOTE_CONTEXT_UNAVAILABLE')
+    }
+    this.remoteInstructions = remote.instructions(platformPrompt)
+    const proc = remote.child
+    this.proc = proc
+    // The remote lane is spawned from the same route inputs as a local one, so the route-change
+    // guard below must see the real signature: a placeholder would restart the lane every turn.
+    this.spawnedProviderSignature = this.codexRouteSignature()
+    this.outputDrainPromise = new Promise<void>((resolve) => {
+      this.resolveOutputDrain = resolve
+    })
+    proc.stdout.on('data', (chunk: Buffer) => {
+      if (this.proc !== proc) return
+      this.lastActivityAt = Date.now()
+      this.stdoutBuf += chunk.toString('utf8')
+      let nl = this.stdoutBuf.indexOf('\n')
+      while (nl >= 0) {
+        const line = this.stdoutBuf.slice(0, nl).trim()
+        this.stdoutBuf = this.stdoutBuf.slice(nl + 1)
+        if (line) this.handleLine(line)
+        nl = this.stdoutBuf.indexOf('\n')
+      }
+    })
+    // The relay never forwards node stderr; nothing to parse and nothing to echo.
+    proc.stderr.resume()
+    proc.on('error', (err: Error) => {
+      if (this.proc !== proc) return
+      log.error('codex remote lane error', { sessionKey: this.opts.sessionKey, err: err.message })
+      this.emit('error', err)
+      this.wakeRetryBackoffOnProcGone()
+    })
+    proc.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (this.proc !== proc) return
+      log.info('codex remote lane close', { sessionKey: this.opts.sessionKey, code, signal })
+      if (this.stdoutBuf.length > 0) {
+        const trailing = this.stdoutBuf.trim()
+        this.stdoutBuf = ''
+        if (trailing) this.handleLine(trailing)
+      }
+      this.resolveOutputDrain?.()
+      this.resolveOutputDrain = null
+      const wasShutdown = this.shuttingDown
+      const closeReason = `codex remote lane closed code=${code} signal=${signal ?? ''}`
+      if (wasShutdown) this.emitForcedShutdownResult(closeReason)
+      this.failAllPending(closeReason)
+      this.wakeRetryBackoffOnProcGone()
+      this.proc = null
+      this.spawnedProviderSignature = null
+      this.initialized = false
+      this.attached = false
+      this.activeTurnId = null
+      this.stdoutBuf = ''
+      this.remoteInstructions = null
+      this.cleanupLaunchOverrides()
+      if (!wasShutdown) {
+        this.emit('exit', { code: code ?? 0, signal, crashed: code != null && code !== 0 })
+      }
+      if (wasShutdown) this.shuttingDown = false
+    })
+    try {
+      await this.sendRequest('initialize', this.buildInitializeParams())
+    } catch (err) {
       try {
         await this.shutdown()
       } catch {
@@ -2073,43 +2178,20 @@ export class CodexAppServerRunner extends EventEmitter {
     emitGoalBlockImpl.call(this as unknown as CodexNotificationHost, goal)
   }
 
-  private codexReasoningEffort(): string | undefined {
-    return normalizeCodexReasoningEffort(this.opts.model, this.effortLevel) ?? undefined
-  }
-
-  private codexTransportModel(): string | undefined {
-    return codexTransportModelId(this.opts.model)
-  }
-
   private buildTurnStartParams(prompt: string): Record<string, unknown> {
-    const mode = this.conversationMode
-    const reasoningEffort = this.codexReasoningEffort()
-    const params: Record<string, unknown> = {
-      threadId: this.threadId,
-      input: [{ type: 'text', text: prompt }],
-      collaborationMode: {
-        mode,
-        settings: {
-          model: this.codexTransportModel() ?? '',
-          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-          developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
-        },
-      },
-      sandboxPolicy: this.opts.hermeticNoTools
-        ? { type: 'readOnly', networkAccess: false }
-        : mode === 'plan'
-          ? { type: 'readOnly', networkAccess: true }
-          : { type: 'dangerFullAccess' },
+    if (this.opts.remote) {
+      // The relay's grammar is closed: model/sandbox/collaboration settings are the node's,
+      // provisioned from the signed catalog; the container only names thread, text and effort.
+      return {
+        threadId: this.threadId,
+        input: [{ type: 'text', text: prompt }],
+        ...(this.effortLevel ? { effort: this.effortLevel } : {}),
+      }
     }
-    if (this.codexTransportModel()) params.model = this.codexTransportModel()
-    if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
-    // OCV5-434: no Fast on Codex (the backend ignores priority from our client; the user chose to
-    // hide it rather than impersonate Codex CLI). GPT-6 turns state an explicit standard tier so
-    // a catalog Fast default (GPT-6 Luna) never applies.
-    if (CODEX_EXPLICIT_STANDARD_MODELS.has(this.opts.model ?? '')) {
-      params.serviceTierForTurn = CODEX_STANDARD_SERVICE_TIER
-    }
-    return params
+    return buildCodexTurnPolicyParams(prompt, this.threadId, {
+      ...this.opts, effortLevel: this.effortLevel,
+      mode: this.conversationMode, readOnly: this.advisorReadOnly,
+    })
   }
 
   private handleNotification(method: string, params: unknown): void {
@@ -2158,15 +2240,24 @@ export class CodexAppServerRunner extends EventEmitter {
    *  diffed against the old thread's baseline → underbilling or clamp-to-zero.
    *  Resetting all three here is a no-op on the cold-start path (they're
    *  already null on construction) and load-bearing on the self-heal path. */
+  /**
+   * A remote kernel recycled for a privacy/identity/UI refresh keeps its native thread, so the
+   * freshly built instructions must cross on resume too — otherwise the node keeps the old ones.
+   */
+  private remoteResumeParams(threadId: string): Record<string, unknown> {
+    if (this.remoteInstructions === null) throw new Error('CODEX_REMOTE_CONTEXT_UNAVAILABLE')
+    return { threadId, baseInstructions: this.remoteInstructions }
+  }
+
   private async _startNewThread(effectiveCwd: string, preheatGeneration?: number): Promise<void> {
     // Phase 5:effectiveCwd 由 runTurn 顶部一次取的 snapshot 折算而来,
     // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
-    const res = (await this.sendRequest('thread/start', {
-      approvalPolicy: 'never',
-      sandbox: this.opts.hermeticNoTools ? 'read-only' : 'danger-full-access',
-      cwd: effectiveCwd,
-      ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
-    })) as { thread?: { id?: string } } | undefined
+    // A remote node owns cwd/model/sandbox; only the platform instructions cross.
+    const res = (await this.sendRequest('thread/start', this.opts.remote
+      ? (this.remoteInstructions !== null ? { baseInstructions: this.remoteInstructions } : {})
+      : buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+        this.advisorReadOnly, this.advisorReadOnlyConfig, this.opts.hermeticNoTools))) as
+      { thread?: { id?: string } } | undefined
     const tid = res?.thread?.id
     if (typeof tid !== 'string' || !tid) {
       throw new Error('thread/start did not return thread.id')
@@ -2234,7 +2325,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.resetCallUsageAttribution()
     this.attemptHadObservableOutput = false
     this.attemptHadToolOrPermission = false
-    this.attemptEmittedTerminal = false
+    this.attemptEmittedTerminal = false; rememberImageStderr(this, null)
   }
 
   /**
@@ -2246,9 +2337,9 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!ignoreIdentity && this.proc !== proc) return
     const result = this.relayDeniedTracker.consume(chunk)
     for (const line of result.completeLines) {
-      log.warn('codex app-server stderr', {
+      rememberImageStderr(this, line); log.warn('codex app-server stderr', {
         sessionKey: this.opts.sessionKey,
-        line: line.slice(0, 1024),
+        line: redactImageUpstream(line).slice(0, 1024),
       })
     }
     if (result.deniedLines > 0) {
@@ -2389,11 +2480,15 @@ export class CodexAppServerRunner extends EventEmitter {
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
     automaticRetryState?: AutomaticRetryState,
+    traceId?: string | null,
+    readOnly = false,
   ): Promise<void> {
+    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     const startedAt = Date.now()
     const timingStartedAt = performance.now()
     // Join speculative preparation; a failed warmup falls back to normal preparation.
     if (this._preheatPromise) await this._preheatPromise.catch(() => {})
+    this.advisorReadOnly = readOnly
     const seenDeltas = new Set<string>()
     const observeFirstDelta = (message: any): void => {
       const delta = message?.event?.delta
@@ -2401,7 +2496,7 @@ export class CodexAppServerRunner extends EventEmitter {
         : delta?.type === 'thinking_delta' && delta.thinking?.length ? 'first_reasoning_delta' : null
       if (!stage || seenDeltas.has(stage) || message.session_id !== this.threadId) return
       seenDeltas.add(stage)
-      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage, elapsedMs: performance.now() - timingStartedAt })
     }
     this.on('message', observeFirstDelta)
@@ -2417,7 +2512,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const repoSnap = this._currentRepoSnapshot()
     let effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
     log.info('codex app-server turn start', {
-      traceId: this.opts.traceId,
+      traceId: turnTraceId,
       sessionKey: this.opts.sessionKey,
       resumed: this.threadId != null,
       pid: this.proc?.pid ?? null,
@@ -2441,7 +2536,8 @@ export class CodexAppServerRunner extends EventEmitter {
       if (
         this.proc &&
         !this.proc.killed &&
-        ((this.spawnedProviderSignature !== null &&
+        ((this.spawnedAdvisorReadOnly !== null && this.spawnedAdvisorReadOnly !== readOnly) ||
+          (this.spawnedProviderSignature !== null &&
           this.spawnedProviderSignature !== this.codexRouteSignature()) ||
           (this._preheatedSignature !== null &&
             this._preheatedSignature !== this.preheatSignature(repoSnap, effectiveCwd)))
@@ -2471,10 +2567,10 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       const reusedProcess = Boolean(this.proc && this.initialized && !this.staleProcGeneration)
       await this.ensureSpawned(repoSnap, effectiveCwd)
-      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage: 'engine_ready', reusedProcess, elapsedMs: performance.now() - timingStartedAt })
       const threadStartedAt = performance.now()
-      this.refreshDelegateContext()
+      this.refreshDelegateContext(turnTraceId)
 
       // Each fresh app-server proc must explicitly attach a thread before
       // turn/start. `attached` is per-proc (cleared on close/error), so this
@@ -2488,13 +2584,14 @@ export class CodexAppServerRunner extends EventEmitter {
           await this._startNewThread(effectiveCwd)
         } else {
           try {
-            await this.sendRequest('thread/resume', {
-              threadId: this.threadId,
-              approvalPolicy: 'never',
-              sandbox: 'danger-full-access',
-              cwd: effectiveCwd,
-              ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
-            })
+            await this.sendRequest('thread/resume', this.opts.remote
+              ? this.remoteResumeParams(this.threadId)
+              : {
+                  ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
+                  threadId: this.threadId,
+                  ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+                    this.advisorReadOnly, this.advisorReadOnlyConfig),
+                })
           } catch (err) {
             // Self-heal "no rollout found for thread id" (-32600). Caused by
             // master sessionManager persisting `thread_id` across container
@@ -2533,13 +2630,14 @@ export class CodexAppServerRunner extends EventEmitter {
               this.syncedPlatformGoalSignature = null
               this.syncedPlatformGoal = null
               try {
-                await this.sendRequest('thread/resume', {
-                  threadId: fallback,
-                  approvalPolicy: 'never',
-                  sandbox: 'danger-full-access',
-                  cwd: effectiveCwd,
-                  ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
-                })
+                await this.sendRequest('thread/resume', this.opts.remote
+                  ? this.remoteResumeParams(fallback)
+                  : {
+                      ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
+                      threadId: fallback,
+                      ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+                        this.advisorReadOnly, this.advisorReadOnlyConfig),
+                    })
                 this.emit('session_id', fallback)
                 this.attached = true
               } catch (err2) {
@@ -2571,7 +2669,7 @@ export class CodexAppServerRunner extends EventEmitter {
         this.emit('session_id', this.threadId)
       }
       this._preheatedSignature = null
-      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage: 'thread_ready', preheatedThreadClaimed, durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()
 
@@ -2584,9 +2682,11 @@ export class CodexAppServerRunner extends EventEmitter {
       for (;;) {
         // 每个 attempt 起点集中复位 per-attempt 态(见 resetAttemptState)。
         this.resetAttemptState()
-        if (!this.pendingStartInterrupt) {
+        // Native compaction is a local RPC outside the relay grammar; the node manages its
+        // own context window for a remote thread.
+        if (!this.pendingStartInterrupt && !this.opts.remote) {
           await this.nativeContext.compactIfNeeded({
-            threadId: this.threadId,
+            threadId: this.threadId, traceId: turnTraceId,
             timeoutMs: NATIVE_COMPACTION_TIMEOUT_MS,
             send: () => this.sendRequest('thread/compact/start', { threadId: this.threadId }),
             drainFailure: async () => {
@@ -2606,6 +2706,9 @@ export class CodexAppServerRunner extends EventEmitter {
         }>((resolve, reject) => {
           this.currentTurnCompleter = { resolve, reject }
         })
+        // A remote child can die between the completer being set and anyone awaiting it; that
+        // late rejection must stay a turn failure, never a gateway-level unhandled rejection.
+        void completed.catch(() => {})
 
         if (this.pendingStartInterrupt) {
           // OCV5-435: stopped before turn/start — never start it.
@@ -2626,9 +2729,10 @@ export class CodexAppServerRunner extends EventEmitter {
 
         let tres: { turn?: { id?: string } } | undefined
         try {
-          log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+          log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
             stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
-          tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
+          tres = (await withCodexTurnTrace(this.threadId, turnTraceId, () =>
+            this.sendRequest('turn/start', this.buildTurnStartParams(prompt)))) as
             | { turn?: { id?: string } }
             | undefined
         } catch (startErr) {
@@ -2706,7 +2810,7 @@ export class CodexAppServerRunner extends EventEmitter {
           throw startErr
         }
 
-        log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+        log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
           stage: 'turn_start_accepted', elapsedMs: performance.now() - timingStartedAt })
         const turnId = tres?.turn?.id
         if (typeof turnId !== 'string' || !turnId) {

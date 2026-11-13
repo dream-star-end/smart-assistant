@@ -265,7 +265,7 @@ export function loadProjectSkillFileMap(
 function tryOpenTaskboardReadonly(): SqlDb | null {
   try {
     if (!existsSync(paths.taskboardDb)) return null
-    return new Database(paths.taskboardDb, { readonly: true, fileMustExist: true }) as unknown as SqlDb
+    return new Database(paths.taskboardDb, { readonly: true, fileMustExist: true, timeout: 5000 }) as unknown as SqlDb
   } catch {
     return null
   }
@@ -273,7 +273,10 @@ function tryOpenTaskboardReadonly(): SqlDb | null {
 
 export function openProjectSkillLedgerDb(): SqlDb {
   mkdirSync(dirname(paths.taskboardDb), { recursive: true })
-  const db = new Database(paths.taskboardDb) as unknown as SqlDb
+  const raw = new Database(paths.taskboardDb, { timeout: 5000 })
+  raw.pragma('journal_mode = WAL')
+  raw.pragma('synchronous = NORMAL')
+  const db = raw as unknown as SqlDb
   ensureProjectSkillLedger(db)
   return db
 }

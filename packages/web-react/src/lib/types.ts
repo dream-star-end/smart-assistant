@@ -10,6 +10,7 @@ import type {
   MarketplaceCapabilityRef,
   MarketplacePluginType,
   MarketplaceReviewSource,
+  SessionSnapshot,
 } from "@openclaude/protocol/browser";
 
 export type {
@@ -572,6 +573,8 @@ export type DurableLiveFramePage = {
   /** 服务端 tape 投影版本水位(tape 投影流计数,单调递增)。旧后端不带该字段
    * (undefined)时,客户端回退到 hasTapeProjection 一次性布尔自愈。 */
   tapeProjectionVersion?: number;
+  /** Same `buildSessionSnapshot` object the WS hello sends (#1200); old backends omit it. */
+  snapshot?: SessionSnapshot | null;
 };
 
 /** GET /api/sessions/:id/timeline — one exact chronological page containing
@@ -1102,6 +1105,34 @@ export type MemoryUsageDashboard = {
   }>;
 };
 
+/** 上下文读取结果（GET .../memory/context）：只有来源元信息，不含正文。 */
+export type MemoryContextRead =
+  | {
+      status: "ready";
+      sources: Array<{
+        kind: "core-index" | "project-memory";
+        locator: string;
+        bytes: number;
+        sourceVersion: string;
+        expires: string[];
+      }>;
+    }
+  | { status: "unavailable"; reason: string };
+
+/** OpenViking B1 网关门面视图：面板与进行中的对话各自能读到哪些记忆来源。 */
+export type MemoryContextView = {
+  facade: "enabled" | "disabled";
+  cli: "cli_lease_blocked";
+  mode: "legacy" | "formal";
+  panel: MemoryContextRead;
+  turns: Array<{
+    startedAt: number;
+    projectBound: boolean;
+    memoryPolicy: { allowed: boolean; reason: string };
+    context: MemoryContextRead;
+  }>;
+};
+
 /** GET .../memory/files/:file 响应：正文 + 乐观锁 version（sha256 前 16 位）。 */
 export type MemoryFileContent = { content: string; version: string };
 
@@ -1428,17 +1459,18 @@ export type CommunityTutorialEdit = {
   reviewedAt: string | null;
 };
 
-export type CommunityTutorialPending = CommunityTutorialMine & {
-  authorName: string;
-  /** 审核时原样带回（p:<正文版本> / r:<修改稿 id>），作者中途改过服务端返回 409。 */
-  reviewToken?: string;
-};
-
+/** 提交修改的结果：inplace = 稿件回到待审；pending = 已发布帖的修改在审，线上仍是旧版。 */
 export type CommunityTutorialReviseResult = {
   id: string;
   mode: "inplace" | "pending";
   revisionId: string;
   contentVersion: number;
+};
+
+export type CommunityTutorialPending = CommunityTutorialMine & {
+  authorName: string;
+  /** 审核时原样带回（p:<正文版本> / r:<修改稿 id>），作者中途改过服务端返回 409。 */
+  reviewToken?: string;
 };
 
 export type CommunityTutorialDraft = {
@@ -1487,6 +1519,15 @@ export type TutorialSnapshotSubmitResult = {
   leakReport?: TutorialLeakReport | null;
 };
 
+export type CommunityTutorialPage<T> = {
+  tutorials: T[];
+  nextCursor: string | null;
+  /** 公开列表第一页带符合筛选的总篇数。 */
+  total?: number | null;
+};
+
+/** POST /api/tutorials/images 的返回。 */
+/** 对话写博客的投稿预检（POST /api/tutorials/precheck）。block = 投稿会被拒；warn = 能投但会转人工。 */
 export type CommunityBlogPrecheckIssue = {
   code: string;
   level: "block" | "warn";
@@ -1548,13 +1589,6 @@ export type BlogModerationRecord = BlogModeration & {
   postStatus: CommunityTutorialStatus;
   /** 判的是已发布帖的一份修改稿。 */
   revisionId?: string | null;
-};
-
-export type CommunityTutorialPage<T> = {
-  tutorials: T[];
-  nextCursor: string | null;
-  /** 公开列表第一页带符合筛选的总篇数。 */
-  total?: number | null;
 };
 
 export type TutorialEvalSpec = {

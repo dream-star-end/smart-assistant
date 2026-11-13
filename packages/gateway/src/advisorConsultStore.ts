@@ -114,7 +114,9 @@ export class AdvisorConsultStore {
   constructor(dbPath = paths.advisorConsultsDb) {
     mkdirSync(dirname(dbPath), { recursive: true })
     this.db = new Database(dbPath)
+    this.db.pragma('busy_timeout = 5000')
     this.db.pragma('journal_mode = WAL')
+    this.db.pragma('synchronous = NORMAL')
     this.db.exec(DDL)
     try {
       this.db.exec('ALTER TABLE advisor_consults ADD COLUMN advice TEXT')

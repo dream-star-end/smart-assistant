@@ -4,7 +4,7 @@
 # 的原子生命周期在真 SQL 下成立、每张新表都登记了保留策略(retentionRegistry)
 # —— 即"发版带的 schema 变更不会在生产上炸,也不会留下无人清理的表"。
 #
-# min-tests: 204
+# min-tests: 259
 # max-minutes: 20
 packages/commercial/src/__tests__/migrate.integ.test.ts
 packages/commercial/src/__tests__/migrate_full.integ.test.ts
@@ -21,9 +21,9 @@ packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts
 packages/commercial/src/http/proxy/boxContextTransport.claim.integ.test.ts
 packages/commercial/src/http/proxy/boxPreparedContinuation.race.integ.test.ts
 packages/commercial/src/http/proxy/boxPrelaunchJournal.integ.test.ts
+packages/commercial/src/http/proxy/boxToolRollover.integ.test.ts
 packages/commercial/src/__tests__/retentionRegistry.integ.test.ts
 packages/commercial/src/http/proxy/boxCapacityAdmission.integ.test.ts
-packages/commercial/src/http/proxy/boxAgentSubsessionCapacity.integ.test.ts
 
 packages/commercial/src/__tests__/migration0283History.integ.test.ts
 
@@ -44,3 +44,14 @@ packages/commercial/src/__tests__/poolPolicy0306.integ.test.ts
 packages/commercial/src/__tests__/poolUserAffinity0308.integ.test.ts
 packages/commercial/src/__tests__/migration0309BoxProfileQuotaWindows.integ.test.ts
 packages/commercial/src/__tests__/migration0304BillingWorkload.integ.test.ts
+
+packages/commercial/src/__tests__/migration0330TurnLeaseBinding.integ.test.ts
+packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts
+packages/commercial/src/__tests__/sec-authrefresh-http.integ.test.ts
+packages/commercial/src/__tests__/migration0331RefreshReissueClientIp.integ.test.ts
+
+packages/commercial/src/__tests__/codexRemoteMaster.integ.test.ts
+packages/commercial/src/__tests__/remoteDriverCoreV4.integ.test.ts
+packages/commercial/src/__tests__/migrationSyncCompat.integ.test.ts
+
+packages/commercial/src/__tests__/openTurnAttribution.integ.test.ts

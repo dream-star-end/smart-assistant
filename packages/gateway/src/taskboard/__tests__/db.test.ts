@@ -67,6 +67,47 @@ afterEach(() => {
 })
 
 describe('schema / migrate', () => {
+  it('OCV5-743: WAL 模式显式设置 synchronous=NORMAL(1) 与 busy_timeout=10000, 且 lease_init_db 遵守 busy_timeout 5000ms', async () => {
+    const { db, dir } = freshDb()
+    assert.equal(db.pragma('journal_mode', { simple: true }), 'wal')
+    assert.equal(db.pragma('synchronous', { simple: true }), 1)
+    assert.equal(db.pragma('busy_timeout', { simple: true }), 10000)
+
+    const leaseDbPath = join(dir, 'lease.db')
+    const leaseLibPath = join(dirname(fileURLToPath(import.meta.url)), '../../../../../scripts/v5-lease-lib.sh')
+    const runInit = () =>
+      new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const child = spawn('bash', ['-c', `export OC_V5_LEASE_DB=${JSON.stringify(leaseDbPath)}; source ${JSON.stringify(leaseLibPath)}; lease_init_db`])
+        let stderr = ''
+        child.stderr.on('data', (chunk) => {
+          stderr += String(chunk)
+        })
+        child.on('close', (code) => resolve({ code, stderr }))
+      })
+
+    const first = await runInit()
+    assert.equal(first.code, 0)
+    assert.equal(first.stderr.trim(), '')
+
+    const locker = new Database(leaseDbPath)
+    locker.pragma('locking_mode = EXCLUSIVE')
+    locker.exec('BEGIN EXCLUSIVE')
+    locker.exec("INSERT INTO event(subject_id,event,actor,created_at) VALUES ('s','e','a','2026-11-05T00:00:00Z')")
+    setTimeout(() => {
+      try {
+        locker.exec('COMMIT')
+        locker.pragma('locking_mode = NORMAL')
+        locker.prepare('SELECT 1').get()
+      } finally {
+        locker.close()
+      }
+    }, 350)
+
+    const second = await runInit()
+    assert.equal(second.code, 0)
+    assert.equal(second.stderr.trim(), '')
+  })
+
   it('建表后 user_version=5,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)

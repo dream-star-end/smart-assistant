@@ -45,6 +45,7 @@ export class ContainerLinkHandle extends EventEmitter {
   detached = false;
   recoveryOnly = false;
   keepAlive = false;
+  pendingPersistCount = 0;
   active = false;
   opened = false;
   disposed = false;
@@ -60,7 +61,9 @@ export class ContainerLinkHandle extends EventEmitter {
     return this.active ? this.link.ws?.readyState ?? WebSocket.CONNECTING : WebSocket.CONNECTING;
   }
   get bufferedAmount(): number { return this.link.ws?.bufferedAmount ?? 0; }
-  get hasOpenDispatches(): boolean { return !this.link.stopping && this.streams.size > 0; }
+  get hasOpenDispatches(): boolean {
+    return !this.link.stopping && (this.streams.size > 0 || this.pendingPersistCount > 0);
+  }
   activate(): void {
     if (this.disposed) return;
     this.active = true;
@@ -469,6 +472,17 @@ export class ContainerLinkRegistry {
   controlTransport(uid: bigint, containerId: number): WebSocket | null {
     const transport = this.links.get(`${uid}:${containerId}`)?.transport;
     return transport?.readyState === WebSocket.OPEN ? transport : null;
+  }
+  retainKeepAliveConsumer(uid: bigint, containerId: number): boolean {
+    const link = this.links.get(`${uid}:${containerId}`);
+    if (!link || link.stopping || link.ws?.readyState !== WebSocket.OPEN) return false;
+    for (const handle of link.consumers) {
+      if (handle.active && !handle.disposed) {
+        handle.keepAlive = true;
+        return true;
+      }
+    }
+    return false;
   }
   async drain(): Promise<void> { await Promise.allSettled([...this.draining].map((link) => link.drain())); }
   async shutdown(): Promise<void> {

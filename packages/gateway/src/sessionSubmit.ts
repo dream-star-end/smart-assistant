@@ -1,5 +1,13 @@
 import type { GrokExecutionDescriptor } from '@openclaude/protocol'
+import { type RemoteExecutionBackend, sameRemoteExecutionBackend } from '@openclaude/protocol'
+import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
+import { isRemoteV4ResumeId, parseRemoteV4ResumeId } from './remotePool/resumeId.js'
+import { restartRunnerForConfigChange } from './runnerConfigRestart.js'
+import { BOX_IDLE_PRE_EXPIRY_MIN_TOKENS, boxIdlePreExpiryMs, cancelIdlePreExpiry } from './boxContextBudget.js'
+import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
+import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
+import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
 /**
  * Session submit path: submit, getOrCreate / exclusive create, idle finish, external turns, resume-id resolution
  *
@@ -32,7 +40,7 @@ import {
   reserveTurnIndex,
   paths,
   projectSessionFingerprint,
-  loadProjectContext,
+  loadProjectContextAllowReadOnly,
   skillOverlayManifestSha256,
   type KernelFileLock,
 } from '@openclaude/storage'
@@ -47,6 +55,7 @@ import {
   idleProofWaitMs,
   pruneIdleOps,
   sourceNeedsIdleOp,
+  idleCompactAlways,
   type IdleOp,
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
@@ -70,14 +79,10 @@ import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
 import {
   cursorSandBoxCcResumeInnerId,
   cursorSandOfficialCcResumeInnerId,
-  cursorResumeStoreExists,
   cursorSandResumeInnerId,
-  isCursorSandBoxCcResumeId,
-  isAnyCursorSandResumeId,
-  relocateCursorResumeStore,
   usableCursorResumeId,
 } from './engine/cursorAdapter.js'
-import { pickResumableId, probeResumeArtifact } from './engine/resumeArtifacts.js'
+import { probeResumeArtifact } from './engine/resumeArtifacts.js'
 import type { AutomaticRetryState, CollabAgentPolicy } from './engine/engineAdapter.js'
 import type { SessionStreamEvent } from './engine/engineEvents.js'
 import {
@@ -92,11 +97,10 @@ import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
-import { CCB_PROVIDER_TAG, normalizeEngineTag } from './resumeStore.js'
+import { normalizeEngineTag } from './resumeStore.js'
 import { adoptRunContext } from './runContextPersist.js'
 import { deriveLosslessTurnKey, getV3MasterSinkOrNull } from './v3MasterSink.js'
 import {
-  AUTHORITY_TURN_MAX_LIFETIME_MS,
   collectModelHistoryMediaPathHints,
   modelHistorySemanticRole,
   modelHistorySemanticText,
@@ -108,6 +112,7 @@ import { resolveExecutionModel } from './server.js'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
 import { startMemoryTurnPolicyLease } from './memoryTurnPolicyLease.js'
+import { contextAuthorities, type ContextTurnHandle } from './contextAuthority.js'
 import { finalizeEfficiencyTurn, prepareEfficiencyTurnNote } from './agentEfficiencyGuard.js'
 import { log } from './sessionManagerLog.js'
 import {
@@ -256,7 +261,7 @@ async function stopParkedIdleTurn(op: IdleOp): Promise<void> {
 
 /** Persist an op; once settled, rotate old settled files for the session. */
 function writeSettledIdleOp(recoveryDir: string, op: IdleOp): void {
-  writeIdleOp(recoveryDir, op)
+  writeIdleOp(recoveryDir, op, { preservePreparedMtime: true })
   if (idleOpSettled(op)) pruneIdleOps(recoveryDir, op.sessionKey)
 }
 
@@ -282,7 +287,7 @@ async function computeSessionContextFingerprint(
   const id = typeof projectId === 'string' ? projectId.trim() : ''
   if (!id) return projectSessionFingerprint({ projectId: null })
   try {
-    const snap = await loadProjectContext(id)
+    const snap = await loadProjectContextAllowReadOnly(id)
     return projectSessionFingerprint({
       projectId: id,
       contextVersion: snap.version,
@@ -387,13 +392,6 @@ class TurnIdleTimeoutError extends Error {
   readonly code = 'TURN_IDLE_TIMEOUT'
 }
 
-class TurnHardLimitError extends Error {
-  readonly code = 'TURN_HARD_LIMIT'
-  constructor() {
-    super('turn reached the platform 12 hour execution limit')
-  }
-}
-
 export async function submit(
   this: SessionSubmitHost,
   session: AgentSession,
@@ -431,11 +429,13 @@ export async function submit(
     turnChatProjectId?: string | null
     toolsets?: string[]
     collabAgentPolicy?: CollabAgentPolicy
+    readOnly?: boolean
     /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
      *  只有 **bridge turn** 有(server.ts dispatchInbound 从验签产物 TurnExecutionDescriptor
      *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner
      *  自取 `x-oc-local-catalog` token(方案 §3/§4),清位语义在 runner 内单一收口。 */
     modelAuthority?: TurnModelAuthority
+    systemHelpBootstrap?: string
     /** Remaining spendable credits (fen) captured at master admission. */
     creditBudgetFen?: bigint
     /** 长会话热尾巴+归档 §2.3:历史上下文兜底注入**成功后**回调,让上层
@@ -608,15 +608,22 @@ export async function submit(
   let memoryTurnBarrier: KernelFileLock | undefined
   let memoryTurnPolicy: MemoryTurnPolicyDecision | undefined
   let memoryTurnPolicyLease: { stop: () => Promise<void> } | undefined
+  let contextTurn: ContextTurnHandle | undefined
   let replayLifecycleStarted = false
   let unhandledTurnError: unknown | undefined
   const logicalTurnAbort = new AbortController()
+  let closeHelpLogical: (() => void) | undefined
   let logicalTurnRun: Promise<void> | null = null
   if (queueTurn) {
     this._promptQueueExecutions.add(session)
     this._promptQueueExecutionKeys.add(session.sessionKey)
   }
   session.lock = new Promise<void>((r) => (release = r))
+  // OCV5-755: this turn supersedes an armed pre-expiry compaction; if one is
+  // already running, the user sees "compacting" until it hands the lock over.
+  cancelIdlePreExpiry(session)
+  const waitedOnIdleCompaction = Boolean(session._idlePreExpiryActive || session._idleRunning)
+  if (waitedOnIdleCompaction) onEvent({ kind: 'turn_status', status: 'compacting' })
   // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 ++。详见
   // AgentSession._activeTurnCount 注释。位置:lock 新建后、`await prev`
   // 前,即 **submit() 已接受、即将串行化执行** 的一刻起算。注意 scope:
@@ -629,6 +636,11 @@ export async function submit(
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
     await prev
+    if (waitedOnIdleCompaction) onEvent({ kind: 'turn_status', status: null })
+    session._turnReadOnly = opts?.readOnly === true
+    if (!sameRemoteExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
+      throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+    }
     log.info('turn_pipeline_timing', { traceId, stage: 'submit_lock_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
     const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
@@ -711,7 +723,10 @@ export async function submit(
         { assets: undefined, fingerprint: undefined },
         admission.context,
       )
-      if (changed) await session.runner.shutdown() // native id is deliberately retained
+      if (changed) {
+        log.info('runner_config_restart', { sessionKey: session.sessionKey, identityCompatChanged: true })
+        await restartRunnerForConfigChange(session.runner) // native id is deliberately retained
+      }
     } else if (admission.context.assets && session.channel !== 'auto-dream') {
       throw new Error('COMPAT_CONFIG_CONFLICT: runner has no validated identity context')
     }
@@ -763,6 +778,13 @@ export async function submit(
     // 应用。CodexAppServerRunner 在 runTurn 顶部比对 route 签名,变化时自行
     // shutdown + respawn(spawn 期 -c 参数),这里只 stash,不参与下方
     // effort/model 的合并 shutdown。
+    // Freeze consent before changing desired runtime configuration. A failed metadata read
+    // must leave old desired values intact so a retry still knows it must restart the warm process.
+    const privacyRunner = session.runner
+    const assertSessionCurrent = () => {
+      if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_PRIVACY_OPERATION_CANCELLED')
+    }
+    const privacyChanged = await prepareRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertSessionCurrent })
     const maybeSetCodexRoute = (session.runner as any).setCodexRoute
     if (typeof maybeSetCodexRoute === 'function') {
       maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
@@ -802,6 +824,7 @@ export async function submit(
         iuiApplied,
         await getDesiredIntelligentUi(session.sessionKey).catch(() => undefined),
       )
+    assertSessionCurrent()
     if (effortChanged) session.runner.setEffortLevel(desiredEffort)
     if (modelChanged) {
       session.runner.setModel(desiredModel)
@@ -831,12 +854,25 @@ export async function submit(
         opts?.serviceTier === 'fast' ? 'fast' : null,
         modelChanged ? desiredModel : session.runner.model,
       ) === 'restart'
-    if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || serviceTierChanged) {
+    if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
+      // OCV5-755: a restart rebuilds the prompt prefix; record which input asked for it.
+      log.info('runner_config_restart', {
+        sessionKey: session.sessionKey,
+        running: session.runner.isRunning,
+        effortChanged,
+        modelChanged,
+        toolsetsChanged,
+        iuiChanged,
+        privacyChanged,
+        serviceTierChanged,
+      })
       try {
-        await session.runner.shutdown()
+        await restartRunnerForConfigChange(session.runner)
+        if (privacyChanged) assertRunnerPromptPrivacyStopped(session.runner)
         // Delta tracker reset happens automatically on the next 'spawn' event
         // when SubprocessRunner auto-respawns on the next submit().
       } catch (err) {
+        if (privacyChanged) throw new Error('助手隐私设置尚未生效，本轮未发送；请稍后重试或新建会话。', { cause: err })
         log.warn(
           'effort/model/toolsets-change shutdown failed',
           // CG7 — traceId tagged so submit-layer failures join the turn's
@@ -898,6 +934,16 @@ export async function submit(
         })
       },
     })
+    // OpenViking B1: in-process context authority for this turn (gateway callers only).
+    contextTurn = contextAuthorities.beginTurn({
+      sessionId: session.sessionKey,
+      agentId: session.agentId,
+      chatProjectId: session.turnChatProjectId ?? null,
+      memoryPolicy: memoryTurnPolicy,
+      promptPrivacyFingerprint: (privacyRunner as PromptPrivacyRunner).promptPolicyFingerprint,
+      identity: admission.context,
+    })
+    logicalTurnAbort.signal.addEventListener('abort', () => contextTurn?.rotate(), { once: true })
     session.currentAssistantBuf = ''
     // Reset activity baseline so idle timeout measures from turn start, not last stdout
     session.runner.lastActivityAt = Date.now()
@@ -1020,6 +1066,32 @@ export async function submit(
     }
     const spawnCwd = this._cursorWorkspacePathForSession(session)
     const liveNativeId = session.runner.nativeSessionId
+    const storedCc5Resume = this._resumeMap.get(session.sessionKey)
+    const parseBoundResume = (id: string | null | undefined) =>
+      session.runner.executionBackend?.kind === 'remote-driver-v4'
+        ? parseRemoteV4ResumeId(id)
+        : parseCc5ResumeId(id)
+    const isAnyBoundResume = (id: string | null | undefined) =>
+      isCc5ResumeId(id) || isRemoteV4ResumeId(id)
+    if (
+      session.runner.executionBackend &&
+      ((isAnyBoundResume(liveNativeId) &&
+        parseBoundResume(liveNativeId)?.bindingId !== session.runner.executionBackend.operationId) ||
+        (isAnyBoundResume(storedCc5Resume) &&
+          parseBoundResume(storedCc5Resume)?.bindingId !== session.runner.executionBackend.operationId))
+    ) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
+    const liveCc5ResumeId = session.runner.executionBackend
+      ? ((liveNativeId &&
+        parseBoundResume(liveNativeId)?.bindingId === session.runner.executionBackend.operationId
+          ? liveNativeId
+          : undefined) ??
+        (storedCc5Resume &&
+        parseBoundResume(storedCc5Resume)?.bindingId === session.runner.executionBackend.operationId
+          ? storedCc5Resume
+          : undefined))
+      : undefined
     const liveBoxId =
       session.providerTag === 'cursor' ? cursorSandBoxCcResumeInnerId(liveNativeId) : undefined
     const liveSandJsonlId =
@@ -1035,11 +1107,14 @@ export async function submit(
             : usableCursorResumeId({
                 workspacePath: spawnCwd,
                 liveId: liveNativeId,
-                mappedId: this._resumeMap.get(session.sessionKey),
+                mappedId: isAnyBoundResume(this._resumeMap.get(session.sessionKey))
+                  ? undefined : this._resumeMap.get(session.sessionKey),
               })
         : undefined
     let providerResumeId =
-      usableCursorId ?? this._resumeIdFor(session.sessionKey, session.providerTag, spawnCwd)
+      liveCc5ResumeId ??
+      usableCursorId ??
+      this._resumeIdFor(session.sessionKey, session.providerTag, spawnCwd)
     if (
       providerResumeId &&
       session.runner.isResumeIdCompatible &&
@@ -1086,7 +1161,7 @@ export async function submit(
         injectionKey,
         missingCount: providerGapDelta.length,
       })
-    } else if (providerResumeId && injectionKey !== null) {
+    } else if (providerResumeId && injectionKey !== null && !session.runner.executionBackend) {
       log.warn('master history gap invalidated native resume before context rebuild', {
         sessionKey: session.sessionKey,
         provider: session.providerTag,
@@ -1257,19 +1332,13 @@ export async function submit(
     // 只负责按当前 turn 的运行时状态查表 + 触发 reject。_runOneTurn 内还有
     // 一个 30-min 硬背书 timer 作为兜底,不在本路径管。
     const CHECK_INTERVAL = 15_000 // check every 15s
-    const logicalTurnStartedAt = Date.now()
     let livenessTimer: NodeJS.Timeout | null = null
+    assertSessionCurrent()
+    closeHelpLogical = getSystemHelpRelay(this)?.begin(session, opts?.systemHelpBootstrap)
     const livenessPromise = new Promise<never>((_, reject) => {
       livenessTimer = setInterval(() => {
-        if (Date.now() - logicalTurnStartedAt >= AUTHORITY_TURN_MAX_LIFETIME_MS) {
-          const error = new TurnHardLimitError()
-          logicalTurnAbort.abort(error)
-          reject(error)
-          return
-        }
-        // A blocking Codex requestUserInput is an explicit human wait, not
-        // engine silence. Keep checking the immutable 12h hard limit above,
-        // but never turn a pending question into LIVENESS_TIMEOUT/waiver.
+        // A blocking requestUserInput is an explicit human wait, not silence.
+        // Active logical turns have no total wall-clock deadline.
         const idleMs = Date.now() - (
           session.runner.idleWatchdogActivityAt ?? session.runner.lastActivityAt
         )
@@ -1353,32 +1422,13 @@ export async function submit(
         { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
         err,
       )
-    } else if (err instanceof TurnHardLimitError || err?.code === 'TURN_HARD_LIMIT') {
-      const persistLimitedTurn = session._persistActiveTurn
-      try {
-        session.runner.interrupt()
-      } catch {}
-      const reason =
-        '任务已达到 12 小时运行上限，系统已中断。本轮已自动免单，积分将原路退回；请重新发起。'
-      if (persistLimitedTurn) {
-        const persistence = persistLimitedTurn('interrupted', reason, 'TURN_LIMIT', 'turn_limit')
-        this._trackPersistence(persistence)
-        await persistence
-      } else {
-        onEvent({ kind: 'error', error: reason })
-      }
-      await logicalTurnRun?.catch((runErr) => {
-        if (runErr !== logicalTurnAbort.signal.reason) throw runErr
-      })
-      log.warn('turn hard limit reached, interrupted', {
-        sessionKey: session.sessionKey,
-        ...(traceId ? { traceId } : {}),
-      })
     } else {
       unhandledTurnError = err
       throw err
     }
   } finally {
+    closeHelpLogical?.()
+    clearRunnerPromptPrivacy(session.runner)
     if (
       consumingModelSwitch &&
       transition &&
@@ -1394,6 +1444,7 @@ export async function submit(
         err: String(err),
       })
     })
+    contextTurn?.end()
     await memoryTurnPolicyLease?.stop().catch((err) => {
       log.warn('memory turn policy cleanup failed', {
         sessionKey: session.sessionKey,
@@ -1452,7 +1503,7 @@ export async function submit(
           opts?.modelSwitchInternal === undefined
         ) {
           try {
-            if (boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) {
+            if (!session.runner.executionBackend && boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) {
               writeIdleCandidate(paths.home, {
                 v: 1,
                 sessionKey: session.sessionKey,
@@ -1473,6 +1524,7 @@ export async function submit(
         session._currentTurnIndex = undefined
         session._currentDispatch = undefined
         session._turnCreditBudgetFen = undefined
+        session._turnReadOnly = undefined
         if (queueTurn) {
           this._promptQueueExecutions.delete(session)
           this._promptQueueExecutionKeys.delete(session.sessionKey)
@@ -1517,15 +1569,8 @@ export async function _getOrCreateExclusive(
   // 新建时 null 等同 undefined(都让 CCB 用模型默认)
   const initialEffort: string | undefined = opts.effortLevel === null ? undefined : opts.effortLevel
 
-  // ── M1a engine 判定(取代 providerTag 二值假设)────────────────────────
-  // 统一执行模型准入 + engine 解析都在这里一次收口:
-  //   - resolveExecutionModel:agent.model / 入站 model 可能是已下线模型,
-  //     收敛到白名单内(白名单只拦入站帧、agent.model 绕过的教训)。
-  //   - resolveEngine:model→engine 映射 + agentDef.provider 显式 pin 的单一
-  //     权威(gpt-5.5 → 'codex';codex-native pin 仅接受 app-server 形态)。
-  //   - executionAuthority(有则唯一权威):master 签名 descriptor 的 canonicalModel /
-  //     engine 直接落地,两个 baked 表(ALLOWED_INBOUND_MODELS / MODEL_ENGINE_MAP)
-  //     在该 turn **完全不参与** —— 判定单点化(方案 §2)。
+  // Verified authority owns model/engine selection. Local paths retain the
+  // existing registry/catalog admission and fail-closed gates.
   const executionModel = resolveExecutionModel(
     opts.model ?? opts.agent.model,
     this.config.defaults.model,
@@ -1556,6 +1601,17 @@ export async function _getOrCreateExclusive(
   // This runs under the creation gate. A late speculative lookup must not
   // overwrite a real first turn that created its runner while projection awaited.
   if (opts.preheatOnly && existing) return existing
+  const executionBackend = cc5SessionBackend({ ...opts, engineId, executionModel,
+    storedResumeId: this._resumeMap.get(opts.sessionKey) })
+  const backendChanged = !sameRemoteExecutionBackend(existing?.runner.executionBackend, executionBackend)
+  if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+  const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
+    current, storedResumeId: this._resumeMap.get(opts.sessionKey),
+    storedResumeProvider: normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)),
+    executionBackend,
+    sessionIds: [opts.sessionKey, ...(opts.peerId ? [opts.peerId] : [])], hasPersistedTurnActivity,
+  })
+  if (executionBackend && (!existing || backendChanged)) await assertFreshBackendTarget(existing)
   if (existing?._modelSwitchTransition) {
     const transition = existing._modelSwitchTransition
     if (
@@ -1621,10 +1677,22 @@ export async function _getOrCreateExclusive(
         existing._identityAgentFingerprint !== identityAgentFingerprint ||
         existing.providerTag !== desiredEngine ||
         cursorTransportChanged ||
+        backendChanged ||
         workspaceModeChanged ||
         workspaceCwdChanged ||
         projectIdChanged
       ) {
+        log.info('session_runner_replace', {
+          sessionKey: opts.sessionKey,
+          agentChanged: existing.agentId !== opts.agent.id,
+          identityChanged: existing._identityAgentFingerprint !== identityAgentFingerprint,
+          engineChanged: existing.providerTag !== desiredEngine,
+          cursorTransportChanged,
+          backendChanged,
+          workspaceModeChanged,
+          workspaceCwdChanged,
+          projectIdChanged,
+        })
         const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
           existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
         contextRebuildNotice = replacementNotice
@@ -1639,15 +1707,15 @@ export async function _getOrCreateExclusive(
         // 旧 session 在 shutdown() 完成前仍留在 map;无票 inbound 不得沿用其 model。
         // 放在不变量检查之后:检查失败不会留下粘滞 _replacing。
         existing._replacing = true
-        // Same logical client session, but the desired engine changed (model
-        // switch across engines, or agent switched between CCB and Codex).
-        // Native resume ids are engine-specific, so tear down the old runner
-        // and let the fresh one receive a compact transcript preamble on its
-        // first submit().
+        // Wait for the prior owner before replacing its engine or backend.
         try {
           await existing.lock
           const canonical = this.sessions.get(opts.sessionKey)
           if (canonical && canonical !== existing) {
+            await canonical.lock
+            if (canonical.runner.executionBackend && !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend)) {
+              throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+            }
             const desiredEngineNow =
               opts.model !== undefined ||
               opts.executionAuthority !== undefined ||
@@ -1658,6 +1726,7 @@ export async function _getOrCreateExclusive(
               canonical.agentId !== opts.agent.id ||
               canonical._identityAgentFingerprint !== identityAgentFingerprint ||
               canonical.providerTag !== desiredEngineNow ||
+              !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend) ||
               Boolean(
                 (opts.model !== undefined || opts.executionAuthority !== undefined) &&
                   canonical.runner.requiresReopenForModel?.(executionModel),
@@ -1684,6 +1753,12 @@ export async function _getOrCreateExclusive(
             existing = canonical
             existing._replacing = true
           }
+          // A local turn may have completed while the creation path waited.
+          // Reprove freshness under the final canonical session lock, before
+          // shutting anything down; a failed proof preserves the original runner.
+          if (executionBackend && !sameRemoteExecutionBackend(existing.runner.executionBackend, executionBackend)) {
+            await assertFreshBackendTarget(existing)
+          }
           // Identity-only runner refresh keeps the logical owner held by
           // begin/endClientTurn and B1; general engine/workspace switches don't.
           if (
@@ -1696,6 +1771,7 @@ export async function _getOrCreateExclusive(
             existing.providerTag === engineId &&
             existing.model === executionModel &&
             !cursorTransportChanged &&
+            !backendChanged &&
             !workspaceModeChanged &&
             !workspaceCwdChanged &&
             !projectIdChanged &&
@@ -1739,6 +1815,10 @@ export async function _getOrCreateExclusive(
           }
           await existing.runner.shutdown()
         } catch (err) {
+          if (executionBackend || existing.runner.executionBackend) {
+            existing._replacing = false
+            throw err
+          }
           if (identityRefreshSession) throw err
           log.warn(
             'session-replacement shutdown failed',
@@ -1789,20 +1869,52 @@ export async function _getOrCreateExclusive(
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
+    const storedResumeForCreate = this._resumeMap.get(opts.sessionKey)
+    const cc5Backend = executionBackend?.kind === 'cc5-interactive-v1' ? executionBackend : undefined
+    const v4Backend = executionBackend?.kind === 'remote-driver-v4' ? executionBackend : undefined
+    if (
+      cc5Backend &&
+      storedResumeForCreate &&
+      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== cc5Backend.operationId
+    ) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
+    if (
+      v4Backend &&
+      storedResumeForCreate &&
+      parseRemoteV4ResumeId(storedResumeForCreate)?.bindingId !== v4Backend.operationId
+    ) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
     const hadSameProviderResume =
-      Boolean(this._resumeMap.get(opts.sessionKey)) &&
+      Boolean(storedResumeForCreate) &&
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
     const mappedResumeId = opts.hermeticNoTools
       ? undefined
-      : this._resumeIdFor(
-          opts.sessionKey,
-          engineId,
-          this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
-        )
+      : cc5Backend
+        ? (storedResumeForCreate &&
+          parseCc5ResumeId(storedResumeForCreate)?.bindingId === cc5Backend.operationId
+            ? storedResumeForCreate
+            : undefined)
+        : v4Backend
+          ? (storedResumeForCreate &&
+            parseRemoteV4ResumeId(storedResumeForCreate)?.bindingId === v4Backend.operationId
+              ? storedResumeForCreate
+              : undefined)
+          : executionBackend
+            // The rollout lives on the remote node; the relay only resumes the thread its lane bound.
+            ? (normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === 'codex' ? storedResumeForCreate : undefined)
+            : this._resumeIdFor(
+              opts.sessionKey,
+              engineId,
+              this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+            )
     if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
       peerId: opts.peerId,
       sessionKey: opts.sessionKey,
+      executionBackend,
+      systemHelpContextFile: systemHelpContextFile(this, opts.sessionKey),
       agentId: opts.agent.id,
       agentBaseDir: cwd,
       config: this.config,
@@ -2147,6 +2259,7 @@ export async function getOrCreate(
      *     catalog 判定,不许回落 baked)。
      */
     executionAuthority?: {
+      executionBackend?: RemoteExecutionBackend
       canonicalModel: string
       engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
       source?: 'bridge_signed' | 'local_catalog'
@@ -2250,7 +2363,8 @@ export async function finishIdleUnderLock(
     turnKey: string
   },
   recoveryDir: string = paths.home,
-): Promise<void> {
+  mode: 'after_turn' | 'pre_expiry' = 'after_turn',
+): Promise<'deferred' | void> {
   if (session._idleRunning) return
   const pending = readPendingIdle(recoveryDir, session.sessionKey)
   if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
@@ -2302,249 +2416,281 @@ export async function finishIdleUnderLock(
     clearIdleCandidate(recoveryDir, session.sessionKey)
     return
   }
-  const started = startIdleOp({
-    dir: recoveryDir,
-    sessionKey: session.sessionKey,
-    sourceSessionId: source.sessionId,
-    sourceTurnKey: source.turnKey,
-    revision: proof.revision,
-    idleTurnKey: createHash('sha256')
-      .update(`${session.sessionKey}:${proof.revision}`)
-      .digest('hex'),
-    frozenTail: [],
-    attachments: [],
-  })
-  let op = withIncarnationShutdown(recoveryDir, started.op)
-  if (idleOpSettled(op)) {
-    clearIdleCandidate(recoveryDir, session.sessionKey)
-    return
-  }
-  const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+  // OCV5-755: a new op right after the turn would only skip as short (CCB
+  // compacts near the 1M limit) or summarize while the user is still active.
+  // Defer it to shortly before the prompt cache expires; the caller arms the
+  // timer and the next user turn simply supersedes it.
   if (
-    nativeShortForOp(native, {
-      idleTurnKey: op.idleTurnKey,
-      revision: proof.revision,
-      sourceSessionId: source.sessionId,
-    })
+    mode === 'after_turn' &&
+    !readIdleOp(recoveryDir, session.sessionKey, proof.revision) &&
+    !idleCompactAlways() &&
+    boxIdlePreExpiryMs(recoveryDir) > 0
   ) {
     clearIdleCandidate(recoveryDir, session.sessionKey)
-    writeSettledIdleOp(recoveryDir, { ...op, disposition: 'short' })
-    return
+    return 'deferred'
   }
-  if (native?.frozenTail.length)
-    op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
-  const summaryProof = await fetchBoxIdleProof({
-    sessionId: source.sessionId,
-    turnKey: op.idleTurnKey,
-  })
-  const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
-  if (abandon) {
-    log.warn('box idle op abandoned', {
-      sessionKey: session.sessionKey,
-      revision: op.revision,
-      reason: abandon,
-    })
+  const existingIdle = readIdleOp(recoveryDir, session.sessionKey, proof.revision)
+  if (existingIdle && idleOpSettled(existingIdle)) { clearIdleCandidate(recoveryDir, session.sessionKey); return }
+  const existingNative = existingIdle && readIdleNative(recoveryDir, source.sessionId, proof.revision)
+  if (existingIdle && nativeShortForOp(existingNative || undefined, { idleTurnKey: existingIdle.idleTurnKey, revision: proof.revision, sourceSessionId: source.sessionId })) {
     clearIdleCandidate(recoveryDir, session.sessionKey)
-    writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
+    writeSettledIdleOp(recoveryDir, { ...withIncarnationShutdown(recoveryDir, existingIdle), disposition: 'short' })
     return
   }
-  // OCV5-620: apply-stuck is NOT checked here (before apply). Op-file mtime
-  // reflects the last write, not when the summary became prepared, so an early
-  // check could discard a recoverable summary without ever trying to apply it
-  // (Codex r1 P1). It is checked only after an apply attempt, below.
-  const accepted = idleSummaryAccepted(summaryProof, {
-    sessionId: source.sessionId,
-    idleTurnKey: op.idleTurnKey,
-    nativeSummary: native?.summaryText,
-  })
-  if (accepted) {
-    op = {
-      ...op,
-      summaryText: accepted.summaryText,
-      capsuleSha256: accepted.capsuleSha256,
-    }
-    if (!native?.summaryText) {
-      writeIdleNative(recoveryDir, {
-        v: 1,
-        opId: op.idleTurnKey,
-        revision: op.revision,
-        sessionId: source.sessionId,
-        summaryText: accepted.summaryText,
-        modelCalls: native?.modelCalls ?? 1,
-        modelStarted: true,
-        frozenTail: op.frozenTail,
-        attachments: op.attachments,
-      })
-    }
+  const privacyRunner = session.runner
+  const assertIdleCurrent = () => {
+    if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_IDLE_PRIVACY_CANCELLED')
   }
-  let step = advanceIdleOp({
-    op,
-    proof,
-    allowDispatch:
-      started.ownedDispatch && !op.summaryText && !native?.summaryText && !native?.modelStarted,
-  })
-  const needsApply = Boolean(
-    step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest,
-  )
-  if (step.callModel || needsApply) {
-    if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
-      writeIdleNative(recoveryDir, {
-        v: 1,
-        opId: step.op.idleTurnKey,
-        revision: step.op.revision,
-        sessionId: source.sessionId,
-        ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
-        modelCalls: 0,
-        frozenTail: step.op.frozenTail,
-        attachments: step.op.attachments,
-      })
+  await refreshRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertIdleCurrent })
+  try {
+    const started = startIdleOp({
+      dir: recoveryDir,
+      sessionKey: session.sessionKey,
+      sourceSessionId: source.sessionId,
+      sourceTurnKey: source.turnKey,
+      revision: proof.revision,
+      idleTurnKey: createHash('sha256')
+        .update(`${session.sessionKey}:${proof.revision}`)
+        .digest('hex'),
+      frozenTail: [],
+      attachments: [],
+    })
+    let op = withIncarnationShutdown(recoveryDir, started.op)
+    if (idleOpSettled(op)) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
     }
-    session._idleRunning = true
-    session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
-    try {
-      const settled = await runBoxIdleTurn(session.runner, {
-        input: IDLE_COMPACT_PROMPT,
-        turnKey: step.op.idleTurnKey,
-        onEvent: () => {},
-        sessionTotals: session,
-        toolUseIdToName: session.toolUseIdToName ?? new Map(),
+    const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+    if (
+      nativeShortForOp(native, {
+        idleTurnKey: op.idleTurnKey,
+        revision: proof.revision,
+        sourceSessionId: source.sessionId,
       })
-      const receipt = settled?.nativeIdleReceipt
-      const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
-      if (
-        nativeShortForOp(after, {
-          idleTurnKey: step.op.idleTurnKey,
-          revision: proof.revision,
-          sourceSessionId: source.sessionId,
-        })
-      ) {
-        clearIdleCandidate(recoveryDir, session.sessionKey)
-        step = { ...step, op: { ...step.op, disposition: 'short' } }
-      } else if (!step.op.summaryText && after?.summaryText) {
-        const again = await fetchBoxIdleProof({
+    ) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'short' })
+      return
+    }
+    if (native?.frozenTail.length)
+      op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
+    const summaryProof = await fetchBoxIdleProof({
+      sessionId: source.sessionId,
+      turnKey: op.idleTurnKey,
+    })
+    const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
+    if (abandon) {
+      log.warn('box idle op abandoned', {
+        sessionKey: session.sessionKey,
+        revision: op.revision,
+        reason: abandon,
+      })
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
+      return
+    }
+    // OCV5-620: apply-stuck is NOT checked here (before apply). Op-file mtime
+    // reflects the last write, not when the summary became prepared, so an early
+    // check could discard a recoverable summary without ever trying to apply it
+    // (Codex r1 P1). It is checked only after an apply attempt, below.
+    const accepted = idleSummaryAccepted(summaryProof, {
+      sessionId: source.sessionId,
+      idleTurnKey: op.idleTurnKey,
+      nativeSummary: native?.summaryText,
+    })
+    if (accepted) {
+      op = {
+        ...op,
+        summaryText: accepted.summaryText,
+        capsuleSha256: accepted.capsuleSha256,
+      }
+      if (!native?.summaryText) {
+        writeIdleNative(recoveryDir, {
+          v: 1,
+          opId: op.idleTurnKey,
+          revision: op.revision,
           sessionId: source.sessionId,
+          summaryText: accepted.summaryText,
+          modelCalls: native?.modelCalls ?? 1,
+          modelStarted: true,
+          frozenTail: op.frozenTail,
+          attachments: op.attachments,
+        })
+      }
+    }
+    let step = advanceIdleOp({
+      op,
+      proof,
+      allowDispatch:
+        started.ownedDispatch && !op.summaryText && !native?.summaryText && !native?.modelStarted,
+    })
+    const needsApply = Boolean(
+      step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest,
+    )
+    if (step.callModel || needsApply) {
+      if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
+        writeIdleNative(recoveryDir, {
+          v: 1,
+          opId: step.op.idleTurnKey,
+          revision: step.op.revision,
+          sessionId: source.sessionId,
+          ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
+          modelCalls: 0,
+          frozenTail: step.op.frozenTail,
+          attachments: step.op.attachments,
+          ...(mode === 'pre_expiry' ? { minInputTokens: BOX_IDLE_PRE_EXPIRY_MIN_TOKENS } : {}),
+        })
+      }
+      session._idleRunning = true
+      session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
+      try {
+        assertIdleCurrent()
+        const settled = await runBoxIdleTurn(privacyRunner, {
+          input: IDLE_COMPACT_PROMPT,
           turnKey: step.op.idleTurnKey,
+          onEvent: () => {},
+          sessionTotals: session,
+          toolUseIdToName: session.toolUseIdToName ?? new Map(),
         })
-        const confirmed = idleSummaryAccepted(again, {
-          sessionId: source.sessionId,
-          idleTurnKey: step.op.idleTurnKey,
-          nativeSummary: after.summaryText,
-        })
-        if (confirmed) {
-          step = advanceIdleOp({
-            op: {
-              ...step.op,
-              summaryText: confirmed.summaryText,
-              capsuleSha256: confirmed.capsuleSha256,
-              frozenTail: after.frozenTail.length ? after.frozenTail : step.op.frozenTail,
-              attachments: after.attachments,
-            },
-            proof,
-            allowDispatch: false,
+        const receipt = settled?.nativeIdleReceipt
+        const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+        if (
+          nativeShortForOp(after, {
+            idleTurnKey: step.op.idleTurnKey,
+            revision: proof.revision,
+            sourceSessionId: source.sessionId,
           })
-          if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
-            const applied = await runBoxIdleTurn(session.runner, {
-              input: IDLE_COMPACT_PROMPT,
-              turnKey: step.op.idleTurnKey,
-              onEvent: () => {},
-              sessionTotals: session,
-              toolUseIdToName: session.toolUseIdToName ?? new Map(),
+        ) {
+          clearIdleCandidate(recoveryDir, session.sessionKey)
+          step = { ...step, op: { ...step.op, disposition: 'short' } }
+        } else if (!step.op.summaryText && after?.summaryText) {
+          const again = await fetchBoxIdleProof({
+            sessionId: source.sessionId,
+            turnKey: step.op.idleTurnKey,
+          })
+          const confirmed = idleSummaryAccepted(again, {
+            sessionId: source.sessionId,
+            idleTurnKey: step.op.idleTurnKey,
+            nativeSummary: after.summaryText,
+          })
+          if (confirmed) {
+            step = advanceIdleOp({
+              op: {
+                ...step.op,
+                summaryText: confirmed.summaryText,
+                capsuleSha256: confirmed.capsuleSha256,
+                frozenTail: after.frozenTail.length ? after.frozenTail : step.op.frozenTail,
+                attachments: after.attachments,
+              },
+              proof,
+              allowDispatch: false,
             })
-            const applyReceipt = applied?.nativeIdleReceipt
-            if (
-              applyReceipt &&
-              applyReceipt.opId === step.op.idleTurnKey &&
-              applyReceipt.digest === step.op.artifact.digest
-            ) {
-              step = { ...step, op: { ...step.op, receiptDigest: applyReceipt.digest } }
-              clearIdleCandidate(recoveryDir, session.sessionKey)
+            if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
+              assertIdleCurrent()
+              const applied = await runBoxIdleTurn(privacyRunner, {
+                input: IDLE_COMPACT_PROMPT,
+                turnKey: step.op.idleTurnKey,
+                onEvent: () => {},
+                sessionTotals: session,
+                toolUseIdToName: session.toolUseIdToName ?? new Map(),
+              })
+              const applyReceipt = applied?.nativeIdleReceipt
+              if (
+                applyReceipt &&
+                applyReceipt.opId === step.op.idleTurnKey &&
+                applyReceipt.digest === step.op.artifact.digest
+              ) {
+                step = { ...step, op: { ...step.op, receiptDigest: applyReceipt.digest } }
+                clearIdleCandidate(recoveryDir, session.sessionKey)
+              }
             }
           }
         }
-      }
-      if (
-        receipt &&
-        receipt.opId === step.op.idleTurnKey &&
-        step.op.artifact &&
-        receipt.digest === step.op.artifact.digest
-      ) {
-        step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
-        clearIdleCandidate(recoveryDir, session.sessionKey)
-      }
-      // OCV5-319: CCB ends the idle turn normally when its summary request
-      // was refused (e.g. Box egress BOX_PARAMETER_UNMAPPED on the
-      // thinking-disabled compact fallback). No summary arrived and none can
-      // be re-dispatched, so this is the same "ended without result" as a
-      // thrown turn: shut the child down and record it, or the op never
-      // settles and every next message fails with IDLE_HISTORY_PENDING.
-      if (
-        step.callModel &&
-        !step.op.summaryText &&
-        !idleOpSettled(step.op) &&
-        !readIdleNative(recoveryDir, source.sessionId, proof.revision)?.summaryText
-      ) {
-        const killed =
-          typeof session.runner.shutdown === 'function' &&
-          (await session.runner.shutdown().then(
+        if (
+          receipt &&
+          receipt.opId === step.op.idleTurnKey &&
+          step.op.artifact &&
+          receipt.digest === step.op.artifact.digest
+        ) {
+          step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
+          clearIdleCandidate(recoveryDir, session.sessionKey)
+        }
+        // OCV5-319: CCB ends the idle turn normally when its summary request
+        // was refused (e.g. Box egress BOX_PARAMETER_UNMAPPED on the
+        // thinking-disabled compact fallback). No summary arrived and none can
+        // be re-dispatched, so this is the same "ended without result" as a
+        // thrown turn: shut the child down and record it, or the op never
+        // settles and every next message fails with IDLE_HISTORY_PENDING.
+        if (
+          step.callModel &&
+          !step.op.summaryText &&
+          !idleOpSettled(step.op) &&
+          !readIdleNative(recoveryDir, source.sessionId, proof.revision)?.summaryText
+        ) {
+          const killed =
+            typeof session.runner.shutdown === 'function' &&
+            (await session.runner.shutdown().then(
+              () => true,
+              () => false,
+            ))
+          if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
+          if (killed) await stopParkedIdleTurn(step.op)
+          log.warn('box idle turn ended without result', {
+            sessionKey: session.sessionKey,
+            revision: step.op.revision,
+            timeout: false,
+            noSummary: true,
+            runnerKilled: killed,
+          })
+        }
+      } catch (idleErr) {
+        // Timeout, crash or error: never a result and never a re-dispatch
+        // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
+        // runner is recorded as evidence that it can no longer send the
+        // compact request; a later `not_found` past the grace window then
+        // proves nothing was sent. Without it the op waits for egress proof
+        // or the operator reset.
+        let killed = idleErr instanceof IdleTurnTimeoutError && idleErr.killed
+        if (!killed && typeof session.runner.shutdown === 'function') {
+          killed = await session.runner.shutdown().then(
             () => true,
             () => false,
-          ))
+          )
+        }
         if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
         if (killed) await stopParkedIdleTurn(step.op)
-        log.warn('box idle turn ended without result', {
-          sessionKey: session.sessionKey,
-          revision: step.op.revision,
-          timeout: false,
-          noSummary: true,
-          runnerKilled: killed,
-        })
-      }
-    } catch (idleErr) {
-      // Timeout, crash or error: never a result and never a re-dispatch
-      // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
-      // runner is recorded as evidence that it can no longer send the
-      // compact request; a later `not_found` past the grace window then
-      // proves nothing was sent. Without it the op waits for egress proof
-      // or the operator reset.
-      let killed = idleErr instanceof IdleTurnTimeoutError && idleErr.killed
-      if (!killed && typeof session.runner.shutdown === 'function') {
-        killed = await session.runner.shutdown().then(
-          () => true,
-          () => false,
+        log.warn(
+          'box idle turn ended without result',
+          {
+            sessionKey: session.sessionKey,
+            revision: step.op.revision,
+            timeout: idleErr instanceof IdleTurnTimeoutError,
+            runnerKilled: killed,
+          },
+          idleErr,
         )
+      } finally {
+        session._idleRunning = false
+        session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
       }
-      if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
-      if (killed) await stopParkedIdleTurn(step.op)
-      log.warn(
-        'box idle turn ended without result',
-        {
-          sessionKey: session.sessionKey,
-          revision: step.op.revision,
-          timeout: idleErr instanceof IdleTurnTimeoutError,
-          runnerKilled: killed,
-        },
-        idleErr,
-      )
-    } finally {
-      session._idleRunning = false
-      session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
     }
-  }
-  // OCV5-620: after apply attempts, age out a still-unsettled prepared summary.
-  const applyStuckFinal = idleApplyStuckReason(recoveryDir, step.op)
-  if (applyStuckFinal) {
-    log.warn('box idle op abandoned', {
-      sessionKey: session.sessionKey,
-      revision: step.op.revision,
-      reason: applyStuckFinal,
-    })
-    clearIdleCandidate(recoveryDir, session.sessionKey)
-    step = {
-      ...step,
-      op: { ...step.op, disposition: 'abandoned', abandonReason: applyStuckFinal },
+    // OCV5-620: after apply attempts, age out a still-unsettled prepared summary.
+    const applyStuckFinal = idleApplyStuckReason(recoveryDir, step.op)
+    if (applyStuckFinal) {
+      log.warn('box idle op abandoned', {
+        sessionKey: session.sessionKey,
+        revision: step.op.revision,
+        reason: applyStuckFinal,
+      })
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      step = {
+        ...step,
+        op: { ...step.op, disposition: 'abandoned', abandonReason: applyStuckFinal },
+      }
     }
-  }
-  writeSettledIdleOp(recoveryDir, step.op)
+    writeSettledIdleOp(recoveryDir, step.op)
+  } finally { clearRunnerPromptPrivacy(session.runner) }
+
 }
 
 /** Record a platform-executed turn (for example a trusted Image 2 edit)
@@ -2765,189 +2911,4 @@ export async function beginExternalTurn(
   }
 }
 
-/** Return the resumable id for this session iff the persisted entry was
- *  produced by `wantProvider`. Cross-provider mismatches return undefined
- *  so we never feed a CCB session_id to codex (or vice versa).
- *
- *  Durable-artifact gate (all engines): the head id must have a transcript
- *  on disk (CCB / Cursor Sand JSONL, Codex rollout, Grok session dir, native
- *  Cursor store.db at the spawn cwd). When it does not — the CLI emitted
- *  `session_id` and died before writing, or the container was rebuilt
- *  mid-spawn — walk the per-session history ladder and promote the newest
- *  prior id whose artifact exists, instead of dropping straight to lossy
- *  history replay. Only when nothing on the ladder is resumable is the
- *  entry dropped (UI history stays visible in the DB; the engine simply has
- *  no native memory — unavoidable when every transcript is gone).
- *
- *  Native Cursor keeps its special case: a store.db missing at *this* cwd is
- *  first a hash-relocation problem, not staleness. */
-export function _resumeIdFor(
-  this: SessionSubmitHost,
-  sessionKey: string,
-  wantProvider: string,
-  workspacePath?: string,
-): string | undefined {
-  const id = this._resumeMap.get(sessionKey)
-  if (!id) return undefined
-  let tag = normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
-  // A false "no transcript" drop used to delete the provider and let the
-  // live-session overlay save the same id back as implicit ccb. The Fast
-  // transcript is still on disk; a positive Grok artifact puts the tag back.
-  // An unknown probe has no path and must not retag a real ccb id.
-  if (tag !== wantProvider && wantProvider === 'grok' && tag === CCB_PROVIDER_TAG) {
-    const recovered = probeResumeArtifact('grok', id)
-    if (recovered.exists && recovered.path) {
-      this._resumeMapProvider.set(sessionKey, 'grok')
-      tag = 'grok'
-      this._saveResumeMap()
-    }
-  }
-  if (tag !== wantProvider) return undefined
-
-  if (tag === 'cursor' && isCursorSandBoxCcResumeId(id)) {
-    if (!cursorSandBoxCcResumeInnerId(id)) {
-      log.warn('resume-map Cursor box Claude entry is malformed — dropping silently', {
-        sessionKey,
-        resumeId: id,
-      })
-      this._forgetResumeEntry(sessionKey)
-      this._saveResumeMap()
-      return undefined
-    }
-    // The JSONL is on the account box, not in this container.
-    return id
-  }
-
-  if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
-    const sandJsonlId = cursorSandResumeInnerId(id) ?? cursorSandOfficialCcResumeInnerId(id)
-    if (!sandJsonlId) {
-      log.warn('resume-map Cursor Sand entry is malformed — dropping silently', {
-        sessionKey,
-        resumeId: id,
-      })
-      this._forgetResumeEntry(sessionKey)
-      this._saveResumeMap()
-      return undefined
-    }
-    if (this._ccbJsonlExists(sandJsonlId)) return id
-    const promoted = this._resolveDurableResumeId(sessionKey, tag, undefined, workspacePath)
-    if (promoted) return promoted
-    log.warn('resume-map Cursor Sand entry points to missing JSONL — dropping silently', {
-      sessionKey,
-      resumeId: id,
-    })
-    this._forgetResumeEntry(sessionKey)
-    this._saveResumeMap()
-    return undefined
-  }
-
-  if (tag === 'cursor') {
-    if (!workspacePath) return id
-    if (cursorResumeStoreExists(workspacePath, id)) return id
-    // Do not drop the map: spawn cwd is the resume authority, and a
-    // recomputed overlay can hash to a different chats/ dir than the live
-    // CLI. Deleting here forces historical replay on the next follow-up
-    // even when store.db is still on disk.
-    // isolated_v1 次轮绑项目会改 spawn cwd → md5 目录对不上。旧 store 还在
-    // 时迁到当前哈希再 --resume;失败才走 history 梯子;再失败才跳过 lookup。
-    const relocated = relocateCursorResumeStore({
-      resumeId: id,
-      currentWorkspacePath: workspacePath,
-      sessionKey,
-    })
-    if (relocated) {
-      log.info('relocated Cursor resume store to current workspace', {
-        sessionKey,
-        resumeId: id,
-        relocated: relocated.relocated,
-      })
-      return id
-    }
-    const promoted = this._resolveDurableResumeId(sessionKey, tag, undefined, workspacePath)
-    if (promoted) return promoted
-    log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
-      sessionKey,
-      resumeId: id,
-    })
-    return undefined
-  }
-
-  // CCB / codex / grok / zcode: single durable-artifact gate + history ladder.
-  const resolved = this._resolveDurableResumeId(sessionKey, tag, id, workspacePath)
-  if (resolved) return resolved
-  log.warn('resume-map entry has no durable transcript on disk — dropping silently', {
-    sessionKey,
-    provider: tag,
-    resumeId: id,
-  })
-  if (tag === 'grok') this._releaseGrokResumeHead(sessionKey)
-  this._forgetResumeEntry(sessionKey)
-  this._saveResumeMap()
-  return undefined
-}
-
-/**
- * Engine-agnostic durable-artifact fallback. When the mapped head id has no
- * durable transcript on disk, walk the per-session history ladder and promote
- * the newest id that positively exists. Returns the id to resume with, or
- * undefined when nothing on the ladder is resumable (caller then falls back
- * to history replay exactly as before).
- *
- * Head ids whose artifact is *unknown* (engine we cannot probe, unreadable fs)
- * are returned as-is — conservative, same as `_ccbJsonlExists`.
- */
-export function _resolveDurableResumeId(
-  this: SessionSubmitHost,
-  sessionKey: string,
-  provider: string,
-  head: string | undefined,
-  workspacePath?: string,
-  opts?: {
-    /** Id the engine just rejected at runtime — never re-pick it even if its
-     *  artifact looks present (non-empty file ≠ resumable conversation). */
-    exclude?: string
-    /** Default true: steer the live adapter via setResumeSessionId. Pass
-     *  false when the caller IS the engine (codex resolveResumeFallback runs
-     *  inside the kernel's own attach path and sets threadId itself). */
-    syncRunner?: boolean
-  },
-): string | undefined {
-  const exclude = opts?.exclude
-  const rejected = this._resumeRejectedIds.get(sessionKey)
-  const history = (this._resumeMapHistory.get(sessionKey) ?? []).filter(
-    (h) => h !== exclude && h !== head && !rejected?.has(h),
-  )
-  const headCandidate = head && head !== exclude && !rejected?.has(head) ? head : undefined
-  const picked = pickResumableId(provider, headCandidate, history, {
-    workspacePath,
-  })
-  if (!picked) return undefined
-  if (picked.fromHistory) {
-    log.warn('resume-map head has no durable transcript — promoting prior id from history', {
-      sessionKey,
-      provider,
-      staleId: head ?? exclude ?? null,
-      promotedId: picked.id,
-      artifact: picked.probe.path,
-    })
-    // Promote in place: the dead head is dropped (not kept in history — it
-    // has nothing to resume), the promoted id becomes head, remaining
-    // history keeps only ids older than the promoted one.
-    const idx = history.indexOf(picked.id)
-    this._resumeMap.set(sessionKey, picked.id)
-    this._resumeHeadPromotedFromHistory.set(sessionKey, picked.id)
-    this._resumeMapProvider.set(sessionKey, provider)
-    this._resumeMapHistory.set(sessionKey, history.slice(idx + 1))
-    // Sync the live session BEFORE saving: _saveResumeMap overlays live
-    // sessions onto the map, so an unsynced session.ccbSessionId would write
-    // the dead head straight back (review B2). The runner must follow too,
-    // otherwise the next spawn still --resumes the dead id.
-    const live = this.sessions.get(sessionKey)
-    if (live && live.providerTag === provider) {
-      live.ccbSessionId = picked.id
-      if (opts?.syncRunner !== false) live.runner.setResumeSessionId?.(picked.id)
-    }
-    this._saveResumeMap()
-  }
-  return picked.id
-}
+export { _resumeIdFor, _resolveDurableResumeId } from './sessionResumeLadder.js'

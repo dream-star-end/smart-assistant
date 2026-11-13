@@ -73,8 +73,15 @@ import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BoxContinuationDecisionError, isContinuationConflict } from "./boxPreparedContinuation.js";
 import { BoxTextFetchError } from "./boxTextFetch.js";
 import { BoxInvocationConflict } from "./boxInvocationRegistry.js";
-import { BOX_CLI_UPSTREAM_RATE_LIMITED, isBoxCliUpstreamRefusalCode } from "./boxCliUpstreamRefusal.js";
 import type { BoxFirstFailure } from "./boxFailureEvidence.js";
+import { BOX_CLI_UPSTREAM_RATE_LIMITED, isBoxCliUpstreamRefusalCode, type BoxCliUpstreamRefusalCode } from "./boxCliUpstreamRefusal.js";
+
+function extractBoxUpstreamRefusal(err: unknown): BoxCliUpstreamRefusalCode | null {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (isBoxCliUpstreamRefusalCode(code)) return code;
+  const msg = (err as { message?: unknown } | null)?.message;
+  return isBoxCliUpstreamRefusalCode(msg) ? msg : null;
+}
 import {
   clearProviderQuotaBlock,
   isMoonshotBillingQuotaExhausted,
@@ -672,6 +679,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // 那时 signal 已为 true,会把所有 mid-stream 错都误判成 client(Codex MAJOR)。
     let outcome: FinalizeOutcome;
     if (result.error !== null) {
+      if (isBoxApiModel(body.model)) {
+        const boxUpstreamRefusal = extractBoxUpstreamRefusal(result.error);
+        if (boxUpstreamRefusal) ctx.onBoxRefusal?.(boxUpstreamRefusal);
+      }
       if (isClientAbort(result.error)) {
         outcome = await finalize.failClient(observed, result.error, "CLIENT_ABORT");
         if (!localFulfillment)
@@ -784,8 +795,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // A generic refusal is not necessarily quota exhaustion. Remember its
     // typed cause before finalization, even after SSE headers were sent.
     const boxUpstreamRefusal = isBoxApiModel(body.model)
-      ? (isBoxCliUpstreamRefusalCode((err as { code?: unknown } | null)?.code)
-        ? (err as { code: string }).code : null) : null;
+      ? extractBoxUpstreamRefusal(err) : null;
     if (boxUpstreamRefusal) ctx.onBoxRefusal?.(boxUpstreamRefusal);
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。

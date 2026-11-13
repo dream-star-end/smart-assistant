@@ -244,6 +244,7 @@ export function countConsecutiveStageFailures(
     .prepare(
       `SELECT id, status FROM tb_ticket_run
         WHERE stage_id = ? AND status IN ('succeeded', 'failed', 'timeout')
+          AND (error IS NULL OR error NOT LIKE 'USER_CANCELLED:%')
         ORDER BY created_at DESC
         LIMIT 32`,
     )
@@ -270,6 +271,7 @@ export function getStageCircuitSnapshot(db: TaskboardDb, stageId: string): Stage
     .prepare(
       `SELECT COALESCE(finished_at, created_at) AS at FROM tb_ticket_run
         WHERE stage_id = ? AND status IN ('failed', 'timeout')
+          AND (error IS NULL OR error NOT LIKE 'USER_CANCELLED:%')
         ORDER BY COALESCE(finished_at, created_at) DESC
         LIMIT 1`,
     )

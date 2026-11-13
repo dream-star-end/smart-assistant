@@ -14,7 +14,7 @@
  *   6) preCheckWithCost(estimated_input + max_output)
  *   7) pickUpstream(scheduler.pick + refresh / 静态 key 合成 session)
  *   8) startInflightJournal(case (c) release ownership 在这里 fail-only)
- *   9) makeFinalizer(从此 release 唯一调用点 = finalize)
+ *   9) settlement.handOff → makeFinalizer(从此 release 唯一调用点 = finalize;此前出口都走 settlement.abort())
  *
  * 步骤 10-11(upstream round-trip)切到 proxy/core.ts 的 runUpstreamRoundTrip。
  *
@@ -25,6 +25,7 @@
 
 import { apiKeyPoolConfiguredServices, apiKeyPoolHasMembers, selectApiKey } from "../../account-pool/apiKeyPool.js";
 import { rootLogger } from "../../logging/logger.js";
+import { proxyRuntimeFlags } from "../../config.js";
 import { ensureRequestId, setSecurityHeaders } from "../util.js";
 import {
   IdentityError,
@@ -33,12 +34,10 @@ import {
   type ProxyIdentity,
 } from "../../auth/proxyIdentity.js";
 import {
-  preCheckWithCost,
-  releasePreCheck,
   InsufficientCreditsError,
 } from "../../billing/preCheck.js";
+import { openSettlementUnit, type SettlementUnit } from "../../billing/settlementUnit.js";
 import {
-  makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
 import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
@@ -51,6 +50,7 @@ import {
   type VerificationSponsorshipSnapshot,
 } from "../../billing/verificationSponsorship.js";
 import { getDispatchByBillingRequestId } from "../../dispatch/turnDispatchStore.js";
+import { rememberOpenTurnKey, TURN_KEY_RE } from "../../billing/openTurnAttribution.js";
 import { checkRateLimit, type RateLimitConfig } from "../../middleware/rateLimit.js";
 import {
   UnroutableProviderError,
@@ -542,6 +542,9 @@ export function makeAnthropicProxyHandler(
       return;
     }
     let releaseSlot: () => void = sharedSlot;
+    // Set once credits are reserved. The finally below aborts it: a no-op once an exit path has
+    // released it or the finalizer owns it, so it only acts when an exception escaped in between.
+    let openedSettlement: SettlementUnit | undefined;
 
     try {
       // 4) 读 + parse + 校验 body.
@@ -775,7 +778,7 @@ export function makeAnthropicProxyHandler(
       // 不做隐式换模型(红线①):只 503 + 建议同类可用清单,用户/客户端自己换。
       // OCV5-482:主 provider 降级但声明了健康的回落上游 → 不 503,下面选路由时直接走回落上游。
       let healthFallback: StaticRouteFallback | undefined;
-      if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1") {
+      if (proxyRuntimeFlags().providerHealthEnforce) {
         // provider 归属:catalog 判定生效时以 catalog 的 provider_id 为准(数据驱动);
         // legacy 期仍走 matchesRoute 推断。
         const providerId = gate
@@ -972,7 +975,7 @@ export function makeAnthropicProxyHandler(
         routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
         containerId: containerIdBig,
         externalApiKey: identity.apiKey != null,
-        transportConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
+        transportConfigured: proxyRuntimeFlags().boxModelApi && deps.boxModel !== undefined,
       }) === "box-native-v1"
         ? PROXY_BYTE_BUDGET_BOX_NATIVE_V1
         : PROXY_BYTE_BUDGET_LEGACY;
@@ -1128,6 +1131,16 @@ export function makeAnthropicProxyHandler(
               "previous Box response unavailable", requestId);
             return;
           }
+          if (replay.kind === "failed" && "code" in replay) {
+            userLog.warn("proxy_box_replay_failed", { code: replay.code,
+              ...(replay.diagnosticId ? { diagnosticId: replay.diagnosticId } : {}) });
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ type: "error", error: { type: "api_error",
+              code: replay.code, message: replay.code === "BOX_REPLAY_STOPPED" ? "previous Box call stopped"
+                : replay.code === "BOX_REPLAY_RESULT_REJECTED" ? "previous Box result was rejected" : "previous Box call failed",
+              ...(replay.diagnosticId ? { diagnosticId: replay.diagnosticId } : {}) }, request_id: requestId }));
+            return;
+          }
           if (replay.kind === "ready") {
             const bytes = Buffer.from(await replay.response.arrayBuffer());
             const headers: Record<string, string> = {};
@@ -1136,7 +1149,7 @@ export function makeAnthropicProxyHandler(
             res.end(bytes);
             return;
           }
-          if (replay.kind === "failed") {
+          if (replay.kind === "failed" && "failure" in replay) {
             sendBoxFallbackFailure(res, replay.failure, requestId);
             return;
           }
@@ -1187,7 +1200,7 @@ export function makeAnthropicProxyHandler(
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
         apiKeyPoolConfigured: poolWiring.apiKeyPoolConfigured,
-        boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
+        boxConfigured: proxyRuntimeFlags().boxModelApi && deps.boxModel !== undefined,
       });
       if (cfgErr) {
         if (cfgErr.kind === "box_not_configured") {
@@ -1219,7 +1232,7 @@ export function makeAnthropicProxyHandler(
           return;
         }
         const unsupported = runWithVerifiedProxyByteBudget(byteBudget, () => validateBoxRequest(body,
-          process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true,
+          proxyRuntimeFlags().boxToolBridge && deps.boxModel?.toolBridgeReady === true,
           boxPrepared));
         if (unsupported) {
           userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
@@ -1432,20 +1445,21 @@ export function makeAnthropicProxyHandler(
         }
       }
       const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
-      let pre;
+      let settlement: SettlementUnit;
       try {
         // 走 preCheckWithCost(已知 maxCost,跳过 estimateMaxCost 重算)。
         // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
         // balance > 0 即放行;余额 < 估算 cost 时 cap 到 balance(drain-to-zero by cap-to-balance)。
         // 真实 cost 由 finalize 阶段已有的 clamp 路径吃(settleUsageAndLedger)。
         stageTiming("precheck_started");
-        pre = await preCheckWithCost(deps.preCheckRedis, {
+        settlement = await openSettlementUnit(deps.preCheckRedis, {
           userId: uid,
           requestId,
           maxCost: totalMaxCost,
           ...(route.kind === "box"
             ? { ttlSeconds: BOX_TOOL_MAX_WALL_MS / 1000 + 300 } : {}),
-        });
+        }, userLog);
+        openedSettlement = settlement;
       } catch (err) {
         if (err instanceof InsufficientCreditsError) {
           userLog.warn("proxy_insufficient_credits", {
@@ -1465,6 +1479,9 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
+      // P3 pilot S2: the reservation is one unit of work. Until settlement.handOff below, every exit
+      // path calls settlement.abort() (releases once); after hand-off the finalizer owns the release.
+      const pre = settlement.reserved;
       stageTiming("precheck_complete");
       if (pre.capped) {
         incrPrecheckCapped(body.model);
@@ -1523,9 +1540,7 @@ export function makeAnthropicProxyHandler(
       stageTiming("upstream_prepare_complete");
       if (!pickRes.ok) {
         // 释放失败仅告警不阻断(TTL 300s 自愈兜底);但 Redis 故障时预留泄漏必须可观测。
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-        });
+        await settlement.abort();
         switch (pickRes.error.kind) {
           case "pool_busy":
             userLog.warn("proxy_account_pool_busy", { msg: pickRes.error.err.message });
@@ -1679,9 +1694,7 @@ export function makeAnthropicProxyHandler(
       ): Promise<void> => {
         await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
         session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-        });
+        await settlement.abort();
         incrAnthropicProxyReject(rejectKey);
         sendJsonError(res, status, code, message, requestId);
       };
@@ -1775,7 +1788,7 @@ export function makeAnthropicProxyHandler(
       } catch (err) {
         await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
         session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+        await settlement.abort();
         userLog.error("verification_sponsorship_admission_failed", { err: errSummary(err) });
         sendJsonError(res, 503, "VERIFICATION_SPONSORSHIP_UNAVAILABLE", "billing verification unavailable", requestId);
         return;
@@ -1839,9 +1852,7 @@ export function makeAnthropicProxyHandler(
             userLog,
           );
           session.zeroizeSecrets();
-          await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-            userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-          });
+          await settlement.abort();
           userLog.warn("proxy_request_id_conflict");
           incrAnthropicProxyReject("request_id_conflict");
           sendJsonError(
@@ -1861,9 +1872,7 @@ export function makeAnthropicProxyHandler(
           userLog,
         );
         session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-        });
+        await settlement.abort();
         userLog.error("proxy_journal_insert_failed", { err: errSummary(err) });
         recordUserImpactBestEffort({
           conditionKey: "ops.monitor:svc_v5", userId: uid, requestId,
@@ -1873,7 +1882,22 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 9) 装 finalizer(从此 release 唯一调用点 = finalize)
+      if (dispatchIdentity && attribution.turnKey && TURN_KEY_RE.test(attribution.turnKey)) {
+        try {
+          await rememberOpenTurnKey(deps.pgPool, {
+            dispatchId: dispatchIdentity.dispatchId,
+            userId: uid,
+            turnKey: attribution.turnKey,
+          });
+        } catch (err) {
+          userLog.warn("open_turn_key_stamp_failed", {
+            dispatchId: dispatchIdentity.dispatchId,
+            err: errSummary(err),
+          });
+        }
+      }
+
+      // 9) 装 finalizer(settlement.handOff;从此 release 唯一调用点 = finalize)
       //
       // 归因四元组(sessionId/mode/parentSessionId/delegateAgentId)由
       // extractUsageAttribution(body.metadata) 算一次,sessionId 既作为 finalize
@@ -1887,7 +1911,7 @@ export function makeAnthropicProxyHandler(
       if (body.metadata?.user_id !== undefined) {
         body.metadata.user_id = stripUsageAttributionKeys(body.metadata.user_id);
       }
-      const finalize = makeFinalizer(
+      const finalize = settlement.handOff(
         {
           pgPool: deps.pgPool,
           preCheckRedis: deps.preCheckRedis,
@@ -1905,8 +1929,6 @@ export function makeAnthropicProxyHandler(
           slotId: session.slotId,
           model: body.model,
           pricing,
-          precheckCredits: pre.maxCost,
-          preCheckReservation: pre.reservation,
           log: userLog,
           sessionId,
           // delegate 子会话计费归因(mode='delegate' + 父客户端会话 + 目标 agent);
@@ -2007,6 +2029,9 @@ export function makeAnthropicProxyHandler(
       });
     } finally {
       releaseSlot();
+      // An exception between reserve and hand-off (e.g. pickUpstream throwing an error it does not
+      // classify) used to leave the reservation until its TTL expired.
+      await openedSettlement?.abort();
     }
   };
 }

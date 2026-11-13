@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote} from "./model-switch-cost-fixture.mjs";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
@@ -77,6 +78,9 @@ test("CAS reread failure after account switch does not send previous team as the
       const method = req.method();
       const token = String(req.headers()["authorization"] ?? req.headers()["Authorization"] ?? "").replace(/^Bearer\s+/i, "");
       const data = req.postDataJSON() ?? {};
+      if(method==='POST'&&/^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)){
+        await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(fixtureSwitchQuote(data,{empty:true}))});return;
+      }
       let body = {};
       let status = 200;
       const userA = { id: "u1", email: "a@b.com", email_verified: true, role: "user", display_name: "Alice", credits: "1000" };

@@ -9,6 +9,18 @@ const noop = vi.fn();
 
 // C-34:面板用 h1 与 App 的页面级 sr-only h1 并存;余额缺口「12000」与顶栏「128,900」格式不一致。
 describe("AgentGate 标题层级与数字格式", () => {
+  it.each([
+    { kind: "runtime-unavailable" },
+    { kind: "error", message: "暂时无法读取状态" },
+  ] as const)("$kind 的继续只重新检查前置状态", (phase) => {
+    const onRetry = vi.fn();
+    const onOpen = vi.fn();
+    render(<AgentGate phase={phase} onOpen={onOpen} onRetry={onRetry} onTopUp={noop} />);
+    screen.getByRole("button", { name: "继续" }).click();
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
   it("面板标题是 h2(一页只保留 App 的 h1)", () => {
     render(<AgentGate phase={{ kind: "unsubscribed" }} onOpen={noop} onRetry={noop} onTopUp={noop} />);
     expect(screen.getByRole("heading", { level: 2, name: "开通你的专属智能体" })).toBeInTheDocument();

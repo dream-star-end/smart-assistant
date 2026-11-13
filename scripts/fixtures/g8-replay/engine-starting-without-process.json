@@ -1,0 +1,22 @@
+{
+  "id": "engine-starting-without-process",
+  "expect": {
+    "retryable": false,
+    "stopSession": false,
+    "verdict": "engine_state_mismatch",
+    "severity": "warning",
+    "askHuman": false,
+    "alert": true,
+    "reason": "engine_starting_without_process",
+    "point": "turn_end",
+    "traceId": "22222222222222222222222222222222"
+  },
+  "observation": {
+    "point": "turn_end",
+    "traceId": "22222222222222222222222222222222",
+    "engineReported": "starting",
+    "engineProcessAlive": false,
+    "dispatchStatus": "accepted",
+    "settledChargeCount": 0
+  }
+}

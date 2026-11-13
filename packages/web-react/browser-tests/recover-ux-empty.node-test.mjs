@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -15,9 +16,7 @@ const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 
 test("INC-20261101-RECOVER-UX-EMPTY: a succeeded automatic recovery does not show 发送失败", { timeout: 180000 }, async () => {
-  const assets = join(here, ".tmp-recover-ux-empty");
-  rmSync(assets, { recursive: true, force: true });
-  mkdirSync(assets, { recursive: true });
+  const assets = mkdtempSync(join(tmpdir(), "oc-recover-ux-empty-"));
   try {
     await build({
       entryPoints: [join(here, "process-disclosure-app-harness.tsx")], bundle: true,

@@ -1,3 +1,4 @@
+import { scanUploadReferenceRows, UPLOAD_REFERENCE_MAX_BYTES, type UploadReferenceOptions, type UploadReferenceRow } from './sessionUploadReferences.js'
 import type { SessionSnapshot } from '@openclaude/protocol';
 
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
@@ -211,6 +212,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // this aligned with sessionsMigrate.ts.
   db.pragma('busy_timeout = 10000')
   db.pragma('journal_mode = WAL')
+  db.pragma('synchronous = NORMAL')
   registerFtsCjkFunctions(db)
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions_meta (
@@ -1968,6 +1970,25 @@ export async function loadSessionUsage(sessionId: string): Promise<UsageLogEntry
     toolCalls: row.tool_calls,
     terminalStatus: (row.terminal_status ?? 'completed') as UsageTerminalStatus,
   }))
+}
+
+/** Actual recorded models for one bounded run page. No guessed defaults or writes. */
+export async function loadSessionUsageModels(sessionIds: readonly string[]): Promise<Record<string, string[]>> {
+  const keys = [...new Set(sessionIds)]
+  if (keys.length > 200) throw new RangeError('session model lookup exceeds 200 keys')
+  const result: Record<string, string[]> = Object.create(null)
+  if (keys.length === 0) return result
+  const db = await getSessionsDb()
+  const rows = db.prepare(`
+    SELECT session_id, model, MIN(timestamp) AS first_at
+    FROM usage_log
+    WHERE session_id IN (${keys.map(() => '?').join(',')})
+      AND model IS NOT NULL AND model <> '' AND model <> 'auto'
+    GROUP BY session_id, model
+    ORDER BY session_id, first_at, model
+  `).all(...keys) as Array<{ session_id: string; model: string }>
+  for (const row of rows) (result[row.session_id] ??= []).push(row.model)
+  return result
 }
 
 export async function insertUsageLog(entry: UsageLogEntry): Promise<InsertUsageLogResult> {
@@ -5910,7 +5931,26 @@ async function _sqlitePatchServerAuthoredMessage(
   return txn()
 }
 
+async function _sqliteScanRecentClientSessionMessages(opts: UploadReferenceOptions, visit: (body: string) => void): Promise<boolean> {
+  const db = new Database(opts.sessionsDb ?? paths.sessionsDb, { readonly: true, fileMustExist: true, timeout: 5000 })
+  try {
+    const rows = db.prepare(`
+      SELECT id AS sessionId, user_id AS userId,
+             CASE WHEN length(CAST(messages AS BLOB)) < ? THEN messages ELSE NULL END AS messages
+        FROM client_sessions WHERE last_at >= ? AND deleted_at IS NULL AND (? IS NULL OR user_id = ?)
+      UNION ALL
+      SELECT s.id AS sessionId, s.user_id AS userId,
+             CASE WHEN length(CAST(c.messages AS BLOB)) < ? THEN c.messages ELSE NULL END AS messages
+        FROM client_session_archive_chunks c JOIN client_sessions s ON s.id = c.session_id AND s.user_id = c.user_id
+       WHERE s.last_at >= ? AND s.deleted_at IS NULL AND (? IS NULL OR s.user_id = ?)
+    `).iterate(Math.min(opts.maxBytes ?? UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_BYTES), opts.sinceMs, opts.userId, opts.userId,
+      Math.min(opts.maxBytes ?? UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_BYTES), opts.sinceMs, opts.userId, opts.userId) as Iterable<UploadReferenceRow>
+    return await scanUploadReferenceRows(rows, visit, opts)
+  } finally { db.close() }
+}
+
 const sqliteBackend = {
+  scanRecentClientSessionMessages: _sqliteScanRecentClientSessionMessages,
   // ── client_sessions 读写 + 归档 + usage 聚合 ──
   probeSessionsDb: _sqliteProbeSessionsDb,
   upsertClientSession: _sqliteUpsertClientSession,
@@ -6010,6 +6050,12 @@ export function setClientSessionsBackend(b: ClientSessionsBackend): void {
  */
 export function getActiveBackend(): ClientSessionsBackend {
   return _activeBackend
+}
+
+export type { UploadReferenceOptions } from './sessionUploadReferences.js'
+export const scanRecentClientSessionMessages: ClientSessionsBackend['scanRecentClientSessionMessages'] = async (...args) => {
+  if (process.env.OC_SESSIONS_STORE?.trim().toLowerCase() === 'pg' && getActiveBackend() === sqliteBackend) return false
+  try { return await getActiveBackend().scanRecentClientSessionMessages(...args) } catch { return false }
 }
 
 // ── 公有 API:薄委托 active backend ──────────────────────────────────────────

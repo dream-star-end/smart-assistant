@@ -1,8 +1,9 @@
 [Unit]
-# OCV5-443: daily selfhost PostgreSQL backup. core tier local, full tier to an
-# off-host sink when V5SB_FULL_SINK is set. Runs from the live release, like the
-# lease worker. A non-zero exit (failure, low disk, lock busy) raises a watch alert.
-Description=OpenClaude v5 selfhost PostgreSQL backup (oneshot)
+# OCV5-443: daily selfhost PostgreSQL backup, core tier (local; off-host too when
+# V5SB_OFFSITE is set). The full tier has its own weekly unit (OCV5-600). Runs
+# from the live release, like the lease worker. A non-zero exit (failure, low
+# disk, lock busy, off-host upload failed) raises a watch alert.
+Description=OpenClaude v5 selfhost PostgreSQL backup, core tier (oneshot)
 After=network.target postgresql.service
 OnFailure=openclaude-v5-selfhost-watch-alert@%n.service
 
@@ -10,7 +11,7 @@ OnFailure=openclaude-v5-selfhost-watch-alert@%n.service
 Type=oneshot
 User=root
 EnvironmentFile=-/etc/openclaude/selfhost-pg-backup.env
-ExecStart=/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh run
+ExecStart=/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh run --tier core
 Nice=15
 IOSchedulingClass=idle
 TimeoutStartSec=4h

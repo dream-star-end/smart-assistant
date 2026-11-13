@@ -1,3 +1,4 @@
+import { dispatchSessionMetadataRead } from './sessionMetadata.js'
 /**
  * T-16 — 商业化模块的 HTTP 路由器(无框架,基于 node:http)。
  *
@@ -16,17 +17,20 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import {handleModelSwitchCost} from './modelSwitchCost.js'
 // Trace-id child binding on the HTTP request logger (V3 S12e CG9; OCV5-564: x-openclaude-trace-id,
 // x-trace-id alias). The WS bridge has its own connection trace flow.
 import { resolveRequestTrace } from './requestTrace.js'
 import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
+import { handleCodexCommissioning } from './admin/codexCommissioning.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
 import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
+import { dispatchSystemActionsBrowserRoute } from '../system-assistant/browserHttp.js'
 import { dispatchMediaGenerationRoute } from '../media-generation/http.js'
 import { dispatchMuseBridgeRoute } from '../muse/bridgeHttp.js'
 import { dispatchStudioRoute } from '../media-studio/http.js'
@@ -118,6 +122,15 @@ import {
   handleAdminBoxClaudeProfilesSelect,
 } from './admin/boxClaudeProfiles.js'
 import { handleAdminPoolKeyCreate, handleAdminPoolKeyPatch, handleAdminPoolsList } from './admin/pools.js'
+import {
+  handleAdminRemotePoolBindingRevoke,
+  handleAdminRemotePoolGet,
+  handleAdminRemotePoolNodeAction,
+  handleAdminRemotePoolNodeCreate,
+  handleAdminRemotePoolOffersPublish,
+  handleAdminRemotePoolProfilePatch,
+  handleSessionPreheat,
+} from './admin/remotePool.js'
 import {
   handleAdminListAudit,
   handleAdminListHostAudit,
@@ -483,7 +496,7 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // (单条记忆文件 CRUD),与 memory/user 同属 host singleton,必须一并拦死;文件名段
   // 放宽到任意非斜杠段(拦截面宁宽勿漏,文件名合法性校验是容器 gateway 的事)。
   {
-    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|usage|files\/[^/]+)$/,
+    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|usage|context|files\/[^/]+)$/,
     label: '/api/agents/:id/memory/*',
   },
   // Auto-Dream Optimizer 读写用户容器内的审计/建议状态并可应用已确认的变更。
@@ -748,6 +761,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/wx/live', handler: handleWechatLivePage },
     { method: 'GET', path: '/api/wechat/live', handler: handleWechatLiveSnapshot },
     { method: 'GET', path: '/api/me', handler: handleMe },
+    { method: 'POST', pathPrefix: '/api/me/sessions/', handler: (req,res) => handleModelSwitchCost(req,res,deps) },
     { method: ANY_METHOD, path: '/api/media-generation', handler: dispatchMediaGenerationRoute },
     { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
     // OCV5-561 Muse bridge (Muse VM dials out; bridge-token auth in the handler).
@@ -762,6 +776,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       handler: (req, res) => dispatchGoalRoute(req, res, deps),
     },
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
+    { method: ANY_METHOD, pathPrefix: '/api/me/system-actions/', handler: dispatchSystemActionsBrowserRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/auth/system-actions/', handler: dispatchSystemActionsBrowserRoute },
     { method: 'GET', path: '/api/me/preferences', handler: handleGetMyPreferences },
     { method: 'PATCH', path: '/api/me/preferences', handler: handlePatchMyPreferences },
     { method: 'GET', path: '/api/me/qq-binding', handler: handleGetMyQqBinding },
@@ -1261,6 +1277,17 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/admin/pools', handler: handleAdminPoolsList },
     { method: 'POST', path: '/api/admin/pools/keys', handler: handleAdminPoolKeyCreate },
     { method: 'PATCH', pathPrefix: '/api/admin/pools/keys/', handler: handleAdminPoolKeyPatch },
+    // OCV5-721 远端底座服务池(节点、Profile 自动探测、勾选模型上架、Binding 撤销 + 预热)。
+    { method: 'GET', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
+    { method: 'POST', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
+    { method: 'GET', path: '/api/admin/remote-pool', handler: handleAdminRemotePoolGet },
+    { method: 'POST', path: '/api/admin/remote-pool/nodes', handler: handleAdminRemotePoolNodeCreate },
+    { method: 'POST', pathPrefix: '/api/admin/remote-pool/nodes/', handler: handleAdminRemotePoolNodeAction },
+    { method: 'DELETE', pathPrefix: '/api/admin/remote-pool/nodes/', handler: handleAdminRemotePoolNodeAction },
+    { method: 'POST', path: '/api/admin/remote-pool/offers', handler: handleAdminRemotePoolOffersPublish },
+    { method: 'PATCH', pathPrefix: '/api/admin/remote-pool/profiles/', handler: handleAdminRemotePoolProfilePatch },
+    { method: 'POST', pathPrefix: '/api/admin/remote-pool/bindings/', handler: handleAdminRemotePoolBindingRevoke },
+    { method: 'POST', path: '/api/sessions/preheat', handler: handleSessionPreheat },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。
@@ -1550,7 +1577,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'DELETE', path: '/api/me/github', handler: handleDeleteMyGithub },
     { method: 'GET', path: '/api/me/github/repos', handler: handleListMyGithubRepos },
     { method: 'GET', pathPrefix: '/api/me/github/repos/', handler: handleListMyGithubBranches },
-    { method: 'GET', pathPrefix: '/api/me/sessions/', handler: handleGetSessionGithubSelection },
+    { method: 'GET', pathPrefix: '/api/me/sessions/', handler: (req,res,ctx) => dispatchSessionMetadataRead(req,res,ctx,deps,handleGetSessionGithubSelection) },
     { method: 'PUT', pathPrefix: '/api/me/sessions/', handler: handlePutSessionGithubSelection },
     {
       method: 'DELETE',
@@ -1607,6 +1634,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
  * 404/401)。两处同步铁律由 routeOwnership.test.ts 运行时契约测试锁死(见该文件头注释)。
  */
 export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
+    '/api/sessions/preheat', // Remote-pool preheat is owned by master, not the container gateway.
     '/api/auth/',
     '/api/me',
     '/api/public/',

@@ -359,6 +359,7 @@ export class DelegateInflightSurfaceStore {
       // writer-lock contention. SQLITE_BUSY fails immediately and is counted.
       db.pragma(`busy_timeout = ${INFLIGHT_SURFACE_BUSY_TIMEOUT_MS}`)
       db.pragma('journal_mode = WAL')
+      db.pragma('synchronous = NORMAL')
       this.migrate(db)
       this.db = db
       this.upsertStmt = db.prepare(`

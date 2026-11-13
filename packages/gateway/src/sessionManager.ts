@@ -1,7 +1,6 @@
 import type { PreheatPreparation } from './speculativePreheat.js'
 import { renderHistoricalContextJsonPrompt } from './historicalContextPrompt.js'
-import { isBoxApiModel } from '@openclaude/protocol'
-import type { GrokExecutionDescriptor } from '@openclaude/protocol'
+import { type RemoteExecutionBackend, type GrokExecutionDescriptor, isBoxApiModel } from '@openclaude/protocol'
 import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
@@ -72,6 +71,7 @@ import { notifyBoxUserStop } from './engine/boxUserStopClient.js'
 import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
 
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
+import './engine/ccbFactory.js'
 import { isBoxGptWebCatalogModel } from './engine/cursorBoxCc.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
@@ -88,6 +88,7 @@ import {
 } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import './engine/antigravityAdapter.js'
+import './remotePool/registerRemoteDriver.js'
 import {
   RESUME_HISTORY_MAX,
   pickResumableId,
@@ -1890,6 +1891,7 @@ export class SessionManager {
      *     catalog 判定,不许回落 baked)。
      */
     executionAuthority?: {
+      executionBackend?: RemoteExecutionBackend
       canonicalModel: string
       engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
       source?: 'bridge_signed' | 'local_catalog'
@@ -2019,8 +2021,9 @@ export class SessionManager {
   private async finishIdleUnderLock(session: AgentSession, source: {
     sessionId: string
     turnKey: string
-  }, recoveryDir: string = paths.home): Promise<void> {
-    return finishIdleUnderLockImpl.call(this as unknown as SessionSubmitHost, session, source, recoveryDir)
+  }, recoveryDir: string = paths.home,
+  mode: 'after_turn' | 'pre_expiry' = 'after_turn'): Promise<'deferred' | void> {
+    return finishIdleUnderLockImpl.call(this as unknown as SessionSubmitHost, session, source, recoveryDir, mode)
   }
 
   /**
@@ -2105,11 +2108,13 @@ export class SessionManager {
       turnChatProjectId?: string | null
       toolsets?: string[]
       collabAgentPolicy?: CollabAgentPolicy
+      readOnly?: boolean
       /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
        *  只有 **bridge turn** 有(server.ts dispatchInbound 从验签产物 TurnExecutionDescriptor
        *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner
        *  自取 `x-oc-local-catalog` token(方案 §3/§4),清位语义在 runner 内单一收口。 */
       modelAuthority?: TurnModelAuthority
+      systemHelpBootstrap?: string
       /** Remaining spendable credits (fen) captured at master admission. */
       creditBudgetFen?: bigint
       /** 长会话热尾巴+归档 §2.3:历史上下文兜底注入**成功后**回调,让上层
@@ -2491,6 +2496,17 @@ export class SessionManager {
     this._resumeMapProvider.delete(sessionKey)
     this._resumeMapHistory.delete(sessionKey)
     this._saveResumeMap()
+  }
+
+  /** First shutdown stage; never throws so the rest of shutdown always runs. */
+  beginPlannedShutdown(): void {
+    for (const s of this.sessions.values()) {
+      try {
+        s.runner.beginPlannedShutdown?.()
+      } catch (err) {
+        log.warn('beginPlannedShutdown failed', { sessionKey: s.sessionKey }, err)
+      }
+    }
   }
 
   shutdownAll(): Promise<void> {

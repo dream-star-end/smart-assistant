@@ -34,7 +34,7 @@ export type UseProjectAssetsOptions = {
 };
 
 /** 批量上传进度：`done` 为已处理（成功或失败）的文件数，`total` 为本批总数（PA-03）。 */
-export type UploadProgress = { done: number; total: number };
+export type UploadProgress = { done: number; total: number; sentBytes?: number; totalBytes?: number };
 
 export type UseProjectAssets = {
   assets: ProjectAsset[];
@@ -135,7 +135,9 @@ export function useProjectAssets(opts: UseProjectAssetsOptions): UseProjectAsset
             continue;
           }
           if (!cbRef.current.auth) throw new Error("未登录");
-          const uploaded = await api.uploadFile(cbRef.current.authSession, file);
+          const uploaded = await api.uploadFile(cbRef.current.authSession, file, {
+            onProgress: (sentBytes, totalBytes) => setUploadProgress({ done, total: list.length, sentBytes, totalBytes }),
+          });
           const created = await api.createProjectAsset(cbRef.current.authSession, {
             projectId: pid,
             source: "upload",

@@ -1,3 +1,5 @@
+import { delegateMcpBudgetEnvironment, GROK_MCP_TOOL_TIMEOUT_SEC } from '../delegateMcpBudget.js'
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into official
  * Grok CLI. Grok does not inherit CCB/Cursor wiring; this module is the
@@ -7,6 +9,7 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
+import { isAdvisorReadOnlyMcpTool } from '@openclaude/protocol'
 
 import { paths } from '@openclaude/storage'
 import { issueParentCallerToken } from '../delegateContext.js'
@@ -79,9 +82,11 @@ export interface GrokPlatformProjection {
 }
 
 export interface GrokPlatformInput {
+  systemHelpContextFile?: string
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
+  traceId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -92,6 +97,7 @@ export interface GrokPlatformInput {
   skillEvalExclude?: string
   skillEvalDraft?: { name: string; dir: string }
   skillTrainRunId?: string
+  readOnly?: boolean
 }
 
 function tomlString(value: string): string {
@@ -130,22 +136,26 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
       `${issueParentCallerToken({
         agentId: input.agentId,
         sessionKey: input.sessionKey,
+        traceId: input.traceId,
         depth: input.delegationDepth,
         consultTurn: input.consultTurn,
       })}\n`,
     )
     const env: Record<string, string> = {
+      ...delegateMcpBudgetEnvironment(GROK_MCP_TOOL_TIMEOUT_SEC * 1000),
       OPENCLAUDE_AGENT_ID: input.agentId,
       OC_AGENT_ID: input.agentId,
       ...identityCompatEnvironment(input.identityCompat),
       ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
       OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME?.trim() || paths.home,
       OPENCLAUDE_SESSION_KEY: input.sessionKey,
+      ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
       OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
       OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
       OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
       OPENCLAUDE_ENGINE: 'grok',
+      OPENCLAUDE_ADVISOR_READ_ONLY: input.readOnly ? '1' : '0',
       ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
         ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
         : {}),
@@ -168,12 +178,12 @@ command = ${tomlString(mcpLaunch.command)}
 args = [${mcpLaunch.args.map(tomlString).join(', ')}]
 enabled = true
 startup_timeout_sec = 30
-tool_timeout_sec = 600
+tool_timeout_sec = ${GROK_MCP_TOOL_TIMEOUT_SEC}
 
 [mcp_servers."openclaude-memory".env]
 ${envLines}
 `
-    advertisedMcpTools.push(...GROK_MEMORY_MCP_TOOLS)
+    advertisedMcpTools.push(...GROK_MEMORY_MCP_TOOLS.filter((name) => !input.readOnly || isAdvisorReadOnlyMcpTool(name)))
   }
 
   writePrivate(join(callerDir, 'config.toml'), `${MANAGED_GROK_HEAD}${mcpToml}`)

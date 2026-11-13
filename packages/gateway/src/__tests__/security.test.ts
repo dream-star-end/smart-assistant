@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
   FILE_ALLOWED_DIRS,
   FILE_BLOCKED_PATTERNS,
+  MAX_UPLOAD_FILE,
   MAX_UPLOAD_SINGLE,
   MAX_UPLOAD_TOTAL,
   isFileAllowed,
@@ -394,6 +395,11 @@ describe('T03: Upload size limits', () => {
   it('single limit is less than total limit', () => {
     assert.ok(MAX_UPLOAD_SINGLE < MAX_UPLOAD_TOTAL)
   })
+  it('HTTP body stays 100MiB and the assembled file cap is 1GiB', () => {
+    assert.equal(MAX_UPLOAD_FILE, 1024 * 1024 * 1024)
+    assert.ok(MAX_UPLOAD_SINGLE < MAX_UPLOAD_FILE)
+    assert.ok(MAX_UPLOAD_FILE <= MAX_UPLOAD_TOTAL)
+  })
 })
 
 // ── T04: SPA fallback should not serve index.html for static asset requests ──
@@ -514,6 +520,29 @@ describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
   afterEach(() => {
     if (prevEnv === undefined) delete process.env[ENV_KEY]
     else process.env[ENV_KEY] = prevEnv
+  })
+
+  it('denies cc5 task journal/proof and private relay files without blocking workspace products', () => {
+    for (const path of [
+      '/home/agent/.openclaude/.cc5-t1555u',
+      '/home/agent/.openclaude/.cc5-t1555u/op/attempt.json',
+      '/home/agent/.openclaude/.cc5-t1555u/op/receipt.json',
+      '/home/agent/.openclaude/.cc5-t1555u/op/cc5-proof.txt',
+      '/home/agent/workspace/.cc5-t1555u/other-state',
+      '/run/oc/cc5-remote-t1555u/binding.json',
+      '/run/oc/cc5-remote-t1555u/relay.sock',
+    ]) {
+      assert.ok(isFileBlocked(path), path)
+      assert.ok(!isFileAllowed(path), path)
+    }
+    for (const path of [
+      '/home/agent/.openclaude/workspace/result.txt',
+      '/home/agent/.openclaude/.cc5-t1555u-output/result.txt',
+      '/home/agent/.openclaude/my.cc5-t1555u/result.txt',
+    ]) {
+      assert.ok(!isFileBlocked(path), path)
+      assert.ok(isFileAllowed(path), path)
+    }
   })
 
   // ── ALLOW: typical agent work products under /home/agent (boss's actual UX) ──

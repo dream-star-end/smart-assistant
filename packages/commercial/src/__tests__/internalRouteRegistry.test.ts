@@ -26,13 +26,18 @@ import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import {
+  DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH,
+  DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH,
+  DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH,
   DELEGATE_GROK_ROUTE_MINT_PATH,
   DELEGATE_GROK_ROUTE_RELEASE_PATH,
   DELEGATE_GROK_ROUTE_RENEW_PATH,
   EGRESS_FORWARD_EXCEPTION_PATHS,
   INTERNAL_ROUTES,
   type InternalRouteEntry,
+  isDelegateAntigravityRoutePath,
   isDelegateGrokRoutePath,
+  isDelegateRouteForwardException,
   isRegisteredInternalPath,
 } from '@openclaude/protocol'
 
@@ -152,20 +157,23 @@ describe('internalRouteRegistry — gateway 字面量扫描', () => {
 // ── b. forwarder 的 v5 放行例外集合与注册表一致 ─────────────────────────────
 
 describe('internalRouteRegistry — egress forwarder v5 例外一致性', () => {
-  test('注册表例外集合 === delegate grok-route 三条,且与 isDelegateGrokRoutePath 同源', () => {
+  test('注册表例外集合 === delegate grok/antigravity route 六条,且与 isDelegateRouteForwardException 同源', () => {
     assert.deepEqual(
       [...EGRESS_FORWARD_EXCEPTION_PATHS].sort(),
       [
         DELEGATE_GROK_ROUTE_MINT_PATH,
         DELEGATE_GROK_ROUTE_RELEASE_PATH,
         DELEGATE_GROK_ROUTE_RENEW_PATH,
+        DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH,
+        DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH,
+        DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH,
       ].sort(),
     )
     for (const entry of registryEntries) {
       if (entry.plane !== 'v5') continue
       if (entry.match === 'exact') {
         assert.equal(
-          isDelegateGrokRoutePath(entry.path),
+          isDelegateRouteForwardException(entry.path),
           entry.egressForwardException === true,
           `${entry.path}:forwarder 例外判定与注册表 egressForwardException 标记不一致`,
         )
@@ -173,10 +181,28 @@ describe('internalRouteRegistry — egress forwarder v5 例外一致性', () => 
         // v5 prefix 条目(grok/zcode relay)是 egress 本地截胡面,绝不能是转发例外。
         assert.ok(!entry.egressForwardException, `${entry.path}:prefix 条目不允许作为 forwarder 例外`)
         assert.ok(
-          !isDelegateGrokRoutePath(`${entry.path}/route/x`),
-          `${entry.path}:isDelegateGrokRoutePath 不应放行 relay 前缀下的路径`,
+          !isDelegateRouteForwardException(`${entry.path}/route/x`),
+          `${entry.path}:isDelegateRouteForwardException 不应放行 relay 前缀下的路径`,
         )
       }
+    }
+    // 两条 delegate route 家族的判定互不串味(antigravity 不能被 grok 判定放行)。
+    for (const path of [
+      DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH,
+      DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH,
+      DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH,
+    ]) {
+      assert.ok(!isDelegateGrokRoutePath(path), `${path}:antigravity route 竟被 grok 判定放行`)
+    }
+    for (const path of [
+      DELEGATE_GROK_ROUTE_MINT_PATH,
+      DELEGATE_GROK_ROUTE_RELEASE_PATH,
+      DELEGATE_GROK_ROUTE_RENEW_PATH,
+    ]) {
+      assert.ok(
+        !isDelegateAntigravityRoutePath(path),
+        `${path}:grok route 竟被 antigravity 判定放行`,
+      )
     }
   })
 
@@ -189,8 +215,8 @@ describe('internalRouteRegistry — egress forwarder v5 例外一致性', () => 
     )
     assert.match(
       source,
-      /isDelegateGrokRoutePath/,
-      'forwarder 不再引用 isDelegateGrokRoutePath —— v5 例外清单脱离注册表同源',
+      /isDelegateRouteForwardException/,
+      'forwarder 不再引用 isDelegateRouteForwardException —— v5 例外清单脱离注册表同源',
     )
     // 确认没有第二套手写例外(出现其他 /internal/v5/... 字面量 = 有人绕开注册表加例外)。
     const literals = scanInternalLiterals('egress/forwarder.ts', source)
@@ -219,7 +245,7 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       // 当前三条例外都经 isDelegateGrokRoutePath 单点挂载;若未来加入非 grok-route
       // 例外,必须在这里登记它的挂载引用方式,而不是放宽断言。
       assert.ok(
-        isDelegateGrokRoutePath(path),
+        isDelegateRouteForwardException(path),
         `${path}:新 v5 例外的 dispatchInternal 挂载引用方式未登记进本测试`,
       )
     }
@@ -228,8 +254,14 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       /isDelegateGrokRoutePath\(path\)/,
       'dispatchInternal 里没有 delegate grok-route 的挂载引用(放行了 forwarder 却 404 —— 事故形态复现)',
     )
+    assert.match(
+      dispatch,
+      /isDelegateAntigravityRoutePath\(path\)/,
+      'dispatchInternal 里没有 delegate antigravity-route 的挂载引用(放行了 forwarder 却 404)',
+    )
     // OCV5-477:两版都挂载(不再受 OC_SELFHOST_ENGINE_LOCAL_TURNS 门控);mint 不等于计费,
     // 所以 grok relay 必须对 kind=delegate 的路由校验 inflight 计费 journal。
+    // Antigravity route remains selfhost-gated.
     const gateIdx = source.indexOf('const delegateGrokRouteHandler')
     assert.ok(gateIdx >= 0 && gateIdx < start, 'delegateGrokRouteHandler 装配点丢失')
     assert.doesNotMatch(
@@ -243,10 +275,17 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       /context\.kind === 'delegate'[\s\S]{0,200}hasInflightDelegateGrokBilling/,
       'grok relay 不再对 delegate 路由校验计费 journal(mint 后不准入即可白跑)',
     )
+    const antigravityGateIdx = source.indexOf('const delegateAntigravityRouteHandler')
+    assert.ok(antigravityGateIdx >= 0 && antigravityGateIdx < start, 'delegateAntigravityRouteHandler 装配点丢失')
+    assert.match(
+      source.slice(antigravityGateIdx, antigravityGateIdx + 400),
+      /OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"/,
+      'delegate antigravity-route 挂载的 selfhost 门控被改动(注册表 selfhostOnly 标记随之失真)',
+    )
     for (const entry of registryEntries) {
       if (entry.selfhostOnly) {
         assert.ok(
-          isDelegateGrokRoutePath(entry.path),
+          isDelegateRouteForwardException(entry.path),
           `${entry.path}:标记了 selfhostOnly 但本测试不知道它的门控在哪 —— 请登记`,
         )
       }

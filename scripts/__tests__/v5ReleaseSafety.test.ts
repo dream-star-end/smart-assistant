@@ -3619,32 +3619,62 @@ describe('v5 release safety lanes', () => {
     dirs.push(dir)
     const release = path.join(dir, 'release')
     await mkdir(release)
-    const large = path.join(release, 'a-large.bin')
+    const target = path.join(release, 'a-regular.bin')
     const added = path.join(release, 'z-added-after-snapshot')
-    const truncate = spawnSync('truncate', ['-s', '64M', large], { encoding: 'utf8' })
-    assert.equal(truncate.status, 0, truncate.stderr)
-    const harness = [
+    const receipt = path.join(dir, 'digest-injection.json')
+    const shim = path.join(dir, 'digest-open-shim.py')
+    await writeFile(target, 'stable regular file\n')
+    // Run the actual Python received from release_artifact_digest. Its real
+    // file open is after the first snapshot/root check and before the final
+    // snapshot, so injection needs neither a /proc race nor a large file.
+    await writeFile(shim, String.raw`
+import json, os, sys
+from pathlib import Path
+source = sys.stdin.read()
+sys.argv = sys.argv[1:]
+real_open = os.open
+target = os.fsencode(${JSON.stringify(target)})
+added = Path(${JSON.stringify(added)})
+receipt = Path(${JSON.stringify(receipt)})
+def inject_on_open(filename, *args, **kwargs):
+    fd = real_open(filename, *args, **kwargs)
+    if os.fsencode(filename) == target:
+        if receipt.exists():
+            raise RuntimeError("fixture injected twice")
+        added.write_text("injected-after-initial-snapshot\n")
+        receipt.write_text(json.dumps(dict(opened=os.fsdecode(filename), added=str(added), count=1)))
+    return fd
+os.open = inject_on_open
+exec(compile(source, "<actual-release-artifact-digest>", "exec"), dict(__name__="__main__"))
+`)
+    const prefix = [
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
-      'python3() {',
-      '  command /usr/bin/python3 "$@" <&0 & local child=$!',
-      '  (',
-      '    while kill -0 "$child" 2>/dev/null; do',
-      `      for fd in /proc/$child/fd/*; do [[ "$(readlink -f "$fd" 2>/dev/null || true)" == '${large}' ]] && { printf x > '${added}'; exit 0; }; done`,
-      '    done',
-      '  ) & local mutator=$!',
-      '  local rc=0; wait "$child" || rc=$?; wait "$mutator" || true; return "$rc"',
-      '}',
+    ]
+    const invoke = (inject: boolean) => spawnSync('bash', ['-c', [
+      ...prefix,
+      ...(inject ? [`python3() { command /usr/bin/python3 '${shim}' "$@"; }`] : []),
       `release_artifact_digest '${release}'`,
-    ].join('\n')
-    const result = spawnSync('bash', ['-c', harness], {
+    ].join('\n')], {
       cwd: root,
       encoding: 'utf8',
       timeout: 30_000,
       env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
     })
-    assert.notEqual(result.status, 0)
+    const stable = invoke(false)
+    assert.equal(stable.status, 0, stable.stderr)
+    assert.match(stable.stdout.trim(), /^[a-f0-9]{64}$/)
+    assert.equal(existsSync(receipt), false)
+    assert.equal(existsSync(added), false)
+    const result = invoke(true)
+    const injection = await readFile(receipt, 'utf8').catch(() => '')
+    assert.ok(injection, `injection missing; status=${result.status}; signal=${result.signal}; stderr=${result.stderr}`)
+    assert.deepEqual(JSON.parse(injection), { opened: target, added, count: 1 })
+    assert.equal(await readFile(added, 'utf8'), 'injected-after-initial-snapshot\n')
+    assert.equal(result.error, undefined, result.stderr)
+    assert.equal(result.signal, null, result.stderr)
+    assert.notEqual(result.status, 0, result.stderr)
     assert.match(result.stderr, /release tree changed during digest/)
   })
 
@@ -5066,6 +5096,8 @@ describe('v5 release safety lanes', () => {
       'model_authority_v1',
       'lossless-turn-tape-v2',
       'durable-turn-dispatch-v1',
+      'prompt-privacy-v1',
+      'system-help-relay-v1',
     ])
     assert.ok(meta.capabilities.includes('durable-turn-dispatch-v1'))
     assert.ok(meta.requiredMigrations.includes('0170_durable_turn_dispatch'))
@@ -10951,7 +10983,10 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.doesNotMatch(listed.stdout, /packages\/commercial\//)
     assert.match(listed.stdout, /packages\/web\/public\//)
     assert.match(listed.stdout, /packages\/web-react\/package.json/)
-    assert.doesNotMatch(listed.stdout, /\tscripts\//)
+    // Of /scripts/ only the two files the container's remote-lane tool host runs.
+    const scriptPaths = listed.stdout.split('\n').filter((row) => /\tscripts\//.test(row))
+      .map((row) => row.split('\t')[1]).sort()
+    assert.deepEqual(scriptPaths, ['scripts/agent-remote/cc5-toolhost-supervisor.py', 'scripts/ocv5-289/box_keeper.py'])
     assert.doesNotMatch(listed.stdout, /\tpackages\/web-react\/src\//)
     assert.doesNotMatch(listed.stdout, /\te2e\//)
     assert.doesNotMatch(listed.stdout, /\t\.github\//)
@@ -10969,6 +11004,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.equal(changed.status, 0, changed.stderr)
     assert.match(base.stdout.trim(), /^[0-9a-f]{64}$/)
     assert.notEqual(base.stdout.trim(), changed.stdout.trim())
+    const supervisor = danglingFileChange('scripts/agent-remote/cc5-toolhost-supervisor.py')
+    const withSupervisor = invokeHelpers(`compute_runtime_input_digest '${supervisor.commit}' '${image}'`)
+    assert.equal(withSupervisor.status, 0, withSupervisor.stderr)
+    assert.notEqual(base.stdout.trim(), withSupervisor.stdout.trim(), 'tool-host supervisor must be a runtime input')
+    const hostOnly = danglingFileChange('scripts/agent-remote/cc5-host-controller.py')
+    const withHostOnly = invokeHelpers(`compute_runtime_input_digest '${hostOnly.commit}' '${image}'`)
+    assert.equal(withHostOnly.status, 0, withHostOnly.stderr)
+    assert.equal(base.stdout.trim(), withHostOnly.stdout.trim(), 'other scripts stay outside the runtime')
   })
 
   test('B5: host-only web/e2e/github changes must not invalidate runtime digest', () => {
@@ -11148,8 +11191,8 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       scripts?: { gateway?: string }
     }
     const gateway = pkg.scripts?.gateway ?? ''
-    assert.match(gateway, /^bash\s+\S+/)
-    const wrapperRel = gateway.replace(/^bash\s+/, '').trim()
+    assert.match(gateway, /^(?:exec\s+)?bash\s+\S+/)
+    const wrapperRel = gateway.replace(/^(?:exec\s+)?bash\s+/, '').trim()
     assert.ok(
       !wrapperRel.startsWith('scripts/'),
       `gateway wrapper ${wrapperRel} is under excluded /scripts/`,
@@ -11174,7 +11217,18 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       false,
       'root scripts/run-container-gateway.sh must stay excluded',
     )
-    assert.equal(existsSync(path.join(staging, 'scripts')), false, 'root /scripts/ must be pruned')
+    // Remote native tool hosting now has exactly two runtime dependencies in /scripts/.
+    // Enumerate the real pruned tree: retaining any other host operation is still a failure.
+    const scriptFiles: string[] = []
+    const collectScripts = async (relative = ''): Promise<void> => {
+      for (const entry of await readdir(path.join(staging, 'scripts', relative), { withFileTypes: true })) {
+        const name = path.join(relative, entry.name)
+        if (entry.isDirectory()) await collectScripts(name)
+        else scriptFiles.push(name)
+      }
+    }
+    await collectScripts()
+    assert.deepEqual(scriptFiles.sort(), ['agent-remote/cc5-toolhost-supervisor.py', 'ocv5-289/box_keeper.py'])
     assert.equal(
       existsSync(path.join(staging, 'packages/mcp-memory/scripts/build-oc-memory-mcp.sh')),
       true,
@@ -11219,7 +11273,7 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       /if \[ -f "\$staging\/packages\/cli\/scripts\/build-container-gateway\.sh" \]; then/,
     )
     const excludes = await readFile(excludesPath, 'utf8')
-    assert.match(excludes, /^\/scripts\/$/m)
+    assert.match(excludes, /^- \/scripts\/\*\*$/m)
     assert.doesNotMatch(excludes, /packages\/cli\/scripts/)
     const wrapperSrc = await readFile(
       path.join(root, 'packages/cli/scripts/run-container-gateway.sh'),
@@ -11271,6 +11325,11 @@ describe('v5 oc-memory MCP cjs survives runtime prune and gateway precompile', (
       true,
       'production prune dropped packages/mcp-memory/src/index.ts',
     )
+    // The remote-lane tool host (packages/gateway/src/cc5ToolHost.ts) runs these in the container.
+    for (const kept of ['scripts/agent-remote/cc5-toolhost-supervisor.py', 'scripts/ocv5-289/box_keeper.py'])
+      assert.equal(existsSync(path.join(staging, kept)), true, `production prune dropped ${kept}`)
+    for (const dropped of ['scripts/agent-remote/cc5-host-controller.py', 'scripts/deploy-v5-selfhost.sh', 'scripts/lib'])
+      assert.equal(existsSync(path.join(staging, dropped)), false, `production prune kept ${dropped}`)
 
     const dist = path.join(staging, 'packages/mcp-memory/dist')
     await mkdir(dist, { recursive: true })

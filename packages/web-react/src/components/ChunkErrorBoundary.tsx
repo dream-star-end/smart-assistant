@@ -80,7 +80,7 @@ export class ChunkErrorBoundary extends Component<Props, State> {
             autoFocus
             onClick={this.reload}
           >
-            刷新
+            继续
           </Button>
         </div>
       </div>

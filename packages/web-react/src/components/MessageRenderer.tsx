@@ -1,3 +1,4 @@
+import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBoundary";
 /**
  * P5 会话渲染入口。
  *
@@ -10,8 +11,8 @@
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
-import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections, promptShadowedToolIds } from "./chat/ProcessDisclosure";
-import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isInteractiveToolMessage, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
+import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -22,10 +23,9 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  isRetryingTurnStatus,
-  type ChatMessage,
-  type LiveTurnTokenUsageSnapshot,
+import type {
+  ChatMessage,
+  LiveTurnTokenUsageSnapshot,
 } from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
@@ -43,6 +43,7 @@ import {
 import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
 import { collectAutomaticRecoveredSourceIds, recoveryFailureIsPresentedBelow } from "../lib/chat/recoveryFailureOutlet";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
+import { collectRecoveredTurnStatusRecordIds } from "../lib/chat/manualTaskContinuation";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
   EAGER_PAYLOAD_TAIL_ITEMS,
@@ -77,8 +78,7 @@ import {
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TimelineEagerMediaContext } from "./chat/timelineEager";
-import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
-import { TeamPanel } from "./chat/TeamPanel";
+import { GeneratingPlaceholderCard, TeamPanel } from "./chat/lazyTimelineCards";
 import {
   PermissionCard,
   PermissionPromptHost,
@@ -159,7 +159,11 @@ type RendererProps = {
   hostedPermission?: boolean;
 };
 
-export const MessageRenderer = memo(
+export function MessageRenderer(props: RendererProps) {
+  return <ReadOnlySystemActionsBoundary readOnly={props.readOnly ?? false}><MessageRendererInner {...props} /></ReadOnlySystemActionsBoundary>;
+}
+
+const MessageRendererInner = memo(
   function MessageRenderer({
     message,
     sig,
@@ -708,7 +712,7 @@ function DeferredTapeRecordCard({
           }}
           className="text-muted underline-offset-2 hover:text-fg hover:underline"
         >
-          {isUserPayload ? "完整用户消息加载失败，点击重试" : "真实记录加载失败，点击重试"}
+          {isUserPayload ? "完整用户消息加载失败，点击继续" : "真实记录加载失败，点击继续"}
         </button>
       ) : (
         <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
@@ -876,7 +880,9 @@ function continuedErrorIds(messages: ChatMessage[]): Set<string> {
       for (const id of pending) ids.add(id);
       pending = [];
     }
-    if (isErroredAssistant(message) && message.id) pending.push(message.id);
+    // A retired notice must not take its saved answer into a collapsed process
+    // when the continuation replies. Only the notice was consumed by Continue.
+    if (isErroredAssistant(message) && !isErrorCardHeldWithAnswer(message) && message.id) pending.push(message.id);
   }
   return ids;
 }
@@ -940,6 +946,12 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   // the end of its turn (after the answer), and does not split the shell: the
   // rows stored after it (which ran before it, see continuedErrorIds) keep
   // folding into the same 工作过程.
+  let interactive: { boundary: string; items: LeafRenderItem[] } | undefined;
+  const flushInteractive = () => {
+    if (!interactive) return;
+    out.push(...interactive.items);
+    interactive = undefined;
+  };
   let terminal: { boundary: string; items: LeafRenderItem[] } | undefined;
   const flushTerminal = () => {
     if (!terminal) return;
@@ -963,12 +975,17 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     const advanced = advanceDisclosureBoundary(rows, owner);
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;
-    if (terminal && terminal.boundary !== nextBoundary) {
+    if ((interactive && interactive.boundary !== nextBoundary) || (terminal && terminal.boundary !== nextBoundary)) {
       seal(group, boundary);
       if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
-      flushTerminal();
+      if (interactive && interactive.boundary !== nextBoundary) flushInteractive();
+      if (terminal && terminal.boundary !== nextBoundary) flushTerminal();
     }
-    if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !continuedErrors.has(message.id))) {
+    if (rows.length > 0 && rows.every(isInteractiveToolMessage)) {
+      (interactive ??= { boundary: nextBoundary, items: [] }).items.push(item);
+      continue;
+    }
+    if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !isErrorCardHeldWithAnswer(message) && !continuedErrors.has(message.id))) {
       (terminal ??= { boundary: nextBoundary, items: [] }).items.push(item);
       continue;
     }
@@ -1022,6 +1039,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   }
   seal(group, boundary);
   if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+  flushInteractive();
   flushTerminal();
   return out;
 }
@@ -1031,20 +1049,38 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
  * before the shell (the user's message, or a mid-turn reply) ends where the
  * first step's clock starts; the row just after it (the answer) starts where a
  * last step with no recorded end stops. A following user row is a new turn and
- * never closes this one.
+ * never closes this one. `following` is that same turn after the shell, up to
+ * the next user row, so the outcome can see a terminal error past the answer.
+ * Timing still ends on the immediate next row.
  */
 function processTimeBounds(
   items: readonly RenderItem[],
   process: RenderItem,
-): { startedAt: number | null; endedAt: number | null } {
+): { startedAt: number | null; endedAt: number | null; next?: ChatMessage; following: ChatMessage[] } {
   const index = items.indexOf(process);
   const time = (value: unknown) =>
     typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
   const before = index > 0 ? itemRows(items[index - 1]!).at(-1) : undefined;
   const after = index >= 0 && index + 1 < items.length ? itemRows(items[index + 1]!)[0] : undefined;
+  const following: ChatMessage[] = [];
+  if (index >= 0) {
+    for (let cursor = index + 1; cursor < items.length; cursor += 1) {
+      let reachedUser = false;
+      for (const message of itemRows(items[cursor]!)) {
+        if (message.role === "user") {
+          reachedUser = true;
+          break;
+        }
+        following.push(message);
+      }
+      if (reachedUser) break;
+    }
+  }
   return {
     startedAt: before && !before._liveUnit ? time(before.completedAt) ?? time(before.ts) : null,
     endedAt: after && after.role !== "user" && !after._liveUnit ? time(after.ts) : null,
+    next: after,
+    following,
   };
 }
 
@@ -1485,7 +1521,7 @@ export type MessageListArchive = {
   archivedThroughSeq?: number;
   /** 云端加载进行中(按钮转 loading 态、禁用)。 */
   loading: boolean;
-  /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
+  /** 上次云端加载失败(按钮转「加载失败，点击继续」,点击即重试)。 */
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
   onLoadOlder: () => void | Promise<void>;
@@ -1513,18 +1549,6 @@ function turnHasVisibleWork(
     if (message && isPlatedAssistantMessage(message)) return true;
   }
   return false;
-}
-
-/** Retry, stop, and engine status stay. A second 「思考中」 under live steps or body does not. */
-function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
-  if (!info) return false;
-  if (info.recoveryStatus?.kind === "stopping") return true;
-  if (isRetryingTurnStatus(info.turnStatus)) return true;
-  const status = info.turnStatus;
-  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
-    return true;
-  }
-  return !!info.leaderStep;
 }
 
 export function MessageList({
@@ -1555,7 +1579,7 @@ export function MessageList({
   liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot };
   /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
   turnActivity?: TurnActivityInfo | null;
-  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
+  /** 会话级 transient 软提示（"正在发送…"等，非消息卡片，末尾 info 条渲染）。*/
   transientNotice?: { text: string } | null;
   /** 已有部分消息可见，但 canonical history 仍在加载。Journal 水合不再占用此位。 */
   historyLoading?: boolean;
@@ -2154,6 +2178,7 @@ export function MessageList({
   const safeMessages = sanitizeChatMessages(messages, sessionId);
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
   const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages, resolvedDispatchTurnIds);
+  const recoveredStatusRecordIds = collectRecoveredTurnStatusRecordIds(safeMessages);
   // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
   // but are transport controls rather than another user utterance. Automatic
   // and manual children are both hidden. While a child exists, its source
@@ -2187,11 +2212,22 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
+  // A manual continuation retires the notice, never the work stored on its row.
+  // Project a held card for display only: a frozen/raw snapshot remains intact,
+  // and the existing errorPresentation rules still decide whether text is an
+  // answer or a diagnostic. Keeping the row also preserves its exact usage.
+  const continuationViewMessages = safeMessages.map((message): ChatMessage =>
+    message.role === "assistant" && !!message._errorCode &&
+    typeof message._clientMessageId === "string" &&
+    manuallyContinuedSourceIds.has(message._clientMessageId)
+      ? { ...message, _errorHeldForRecovery: true, _errorCardSnapshot: { disposition: "silent" } }
+      : message,
+  );
   // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
   // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
   // OCV5-459: a Stop stamped on mid-turn narration splits into that narration (a step) and the stop row.
   const turnLineageParents = turnRecoveryParents(safeMessages);
-  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(safeMessages.filter(
+  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(continuationViewMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       typeof m.id === "string" &&
@@ -2215,6 +2251,7 @@ export function MessageList({
       ) &&
       !(isErrorCardHeld(m) && !isErrorCardHeldWithAnswer(m)) &&
       !isRedundantRuntimeEnvelope(m) &&
+      !recoveredStatusRecordIds.has(m.id) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
       !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
   ))), turnLineageParents);
@@ -2676,7 +2713,7 @@ export function MessageList({
         {liveUnitsBusy
           ? <><Spinner size={12} /> 加载中…</>
           : liveAttention === "error"
-            ? <span className="text-danger">加载失败，点击重试</span>
+            ? <span className="text-danger">加载失败，点击继续</span>
             : "加载更早的处理步骤"}
       </button>
     </div>
@@ -2735,6 +2772,7 @@ export function MessageList({
             needle,
             bounds.startedAt ?? "",
             bounds.endedAt ?? "",
+            turnOutcome(bounds.following),
             ...sections.map((section) => disclosureValues[`detail:${section.key}`] === true ? 1 : 0),
             ...it.items.map(leafMemoKey),
           ].join("\u0001")}
@@ -2756,10 +2794,9 @@ export function MessageList({
           keyOf={renderItemKey}
           messagesOf={itemMessages}
           olderSteps={olderSteps}
-          startedAt={it.active ? turnActivity?.startedAt ?? null : null}
-          lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
-          turnStartedAt={it.active ? turnActivity?.startedAt ?? bounds.startedAt : bounds.startedAt}
-          turnEndedAt={bounds.endedAt}
+          activity={it.active ? turnActivity : null}
+          bounds={bounds}
+          tokenUsageOf={(item) => ("tokenUsage" in item ? item.tokenUsage : undefined)}
         />
         </ProcessGroupMemo>
       );
@@ -2860,7 +2897,7 @@ export function MessageList({
           : windowStart === 0 && (archive?.loading || archiveQueued)
           ? <><Spinner size={12} /> 加载中…</>
           : windowStart === 0 && archive?.error
-            ? <span className="text-danger">加载失败，点击重试</span>
+            ? <span className="text-danger">加载失败，点击继续</span>
             : windowStart > 0
               ? `查看更早历史记录（还有 ${windowStart} 条）`
               : legacyArchivedRemaining > 0
@@ -2990,6 +3027,7 @@ export function MessageList({
     event.stopPropagation();
   };
   return (
+    <ReadOnlySystemActionsBoundary readOnly={readOnly}>
     <PermissionToolReopenContext.Provider value={permissionReopen}>
     <>
     <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
@@ -3115,7 +3153,7 @@ export function MessageList({
               {archive?.loading || archiveQueued
                 ? <><Spinner size={12} /> 加载中…</>
                 : archive?.error
-                  ? <span className="text-danger">加载失败，点击重试</span>
+                  ? <span className="text-danger">加载失败，点击继续</span>
                   : "搜更早"}
             </button>
           </div>
@@ -3231,5 +3269,6 @@ export function MessageList({
     </div>
     </>
     </PermissionToolReopenContext.Provider>
+    </ReadOnlySystemActionsBoundary>
   );
 }

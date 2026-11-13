@@ -79,6 +79,7 @@ function fakeAdmitted(input: AdmitUserTurnInput): AdmitUserTurnResult {
     workspaceMode: "legacy",
     takeover: false,
     dispatch: {
+      traceId: input.traceId ?? null,
       dispatchId: input.dispatchId,
       userId: input.uid,
       sessionId: input.sessionId,
@@ -292,5 +293,57 @@ describe("injectCronOriginTurn stamps admit + inbound.model", () => {
     });
     assert.deepEqual(result, { kind: "failed", reason: "dispatch_rejected" });
     assert.equal(secondCalls, 0);
+  });
+
+  test("executor carrier metadata stamps agentContainerId and runtimeKind at admission", async () => {
+    const admits: AdmitUserTurnInput[] = [];
+    const executor: CronOriginExecutor = Object.assign(
+      () => ({ kind: "claimed" as const }),
+      { agentContainerId: 7143, runtimeKind: "docker" as const },
+    );
+    const result = await executeCronOriginInject({
+      input,
+      admitUserTurn: async (admitInput) => {
+        admits.push(admitInput);
+        return fakeAdmitted(admitInput);
+      },
+      getExecutors: () => [executor],
+    });
+    assert.equal(result.kind, "injected");
+    assert.equal(admits.length, 1);
+    assert.equal(admits[0]!.agentContainerId, 7143);
+    assert.equal(admits[0]!.runtimeKind, "docker");
+  });
+
+  test("claimed callback stamps sent+_systemCallback and broadcasts cronOrigin outbound.ack", async () => {
+    const admits: AdmitUserTurnInput[] = [];
+    const broadcasted: unknown[] = [];
+    const result = await executeCronOriginInject({
+      input: {
+        uid,
+        sessionId: "webmw2i71k6k399qc",
+        text: "[系统通知 · 自进化租约列车结果]\n终态: failed",
+        clientMessageId: "lsc-eaf9a356aaec2f3a56552236",
+        agentId: "main",
+      },
+      lookupSessionModel: async () => "gemini-3.1-pro-agy",
+      admitUserTurn: async (admitInput) => {
+        admits.push(admitInput);
+        return fakeAdmitted(admitInput);
+      },
+      executor: () => ({ kind: "claimed" }),
+      broadcast: (frame) => broadcasted.push(frame),
+    });
+    assert.equal(result.kind, "injected");
+    assert.equal((admits[0]!.message as { status?: string }).status, "sent");
+    assert.equal((admits[0]!.message as { _systemCallback?: boolean })._systemCallback, true);
+    assert.equal(broadcasted.length, 1);
+    const ack = broadcasted[0] as Record<string, unknown>;
+    assert.equal(ack.type, "outbound.ack");
+    assert.equal(ack.admitted, true);
+    assert.equal(ack.accepted, true);
+    assert.equal(ack.clientMessageId, "lsc-eaf9a356aaec2f3a56552236");
+    assert.deepEqual(ack.peer, { id: "webmw2i71k6k399qc", kind: "dm" });
+    assert.equal((ack.cronOrigin as { model?: string }).model, "gemini-3.1-pro-agy");
   });
 });

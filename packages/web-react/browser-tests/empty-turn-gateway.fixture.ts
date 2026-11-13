@@ -52,6 +52,7 @@ class ExternalCcbRunner extends EventEmitter {
   constructor(public mode: "empty" | "nonempty") { super(); }
   async start() { this.startCalls++; this.isRunning = true; }
   async shutdown() { this.isRunning = false; }
+  assertPromptPrivacyStopped() { assert.equal(this.isRunning, false, "privacy refresh must stop the previous engine"); }
   async waitForOutputDrain() {}
   interrupt() { return false; }
   clearSessionId() {}

@@ -10,22 +10,30 @@
  * says nothing about membership, and a chat can be moved into a project at
  * any time, so no earlier "not in a project" answer can stand in for it.
  *
- * The prompt builder reads again when a runner spawns. Every turn passes the
- * server's read first and is held if that read fails, so a spawn always has
- * a successful read from its own turn: `reuseLastOnFailure` falls back to it
- * instead of building a prompt without the project.
+ * Every turn passes the server's read first and is held if that read fails,
+ * so a spawn always has a successful read from its own turn. The prompt
+ * builder uses it while it is recent (`reuseRecentMs`) and otherwise reads
+ * again, falling back to it (`reuseLastOnFailure`) instead of building a
+ * prompt without the project.
  */
 import {
   getChatProjectBindByBoardProjectId,
   getChatProjectBindBySessionId,
   isProjectContextEnabled,
+  isProjectStorageReadOnlyError,
   listPinnedProjectAssetsForChatProject,
   loadProjectContext,
+  loadProjectContextReadonly,
   parseBoardProjectId,
+  paths,
+  projectInstructionsWithUnwrittenSeed,
   seedProjectInstructionsIfEmpty,
   type ProjectAsset,
+  type ProjectContextSnapshot,
 } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
+
+import { createLogger } from './logger.js'
 
 import { PROJECT_CONTEXT_PATH } from '@openclaude/protocol'
 export { PROJECT_CONTEXT_PATH }
@@ -33,9 +41,16 @@ const ENV_MASTER_URL = 'OPENCLAUDE_V3_MASTER_BASE_URL'
 const ENV_CONTAINER_TOKEN = 'OPENCLAUDE_V3_CONTAINER_TOKEN'
 const FETCH_TIMEOUT_MS = 5_000
 const FETCH_ATTEMPTS = 2
+/**
+ * A spawn follows its turn's server read by milliseconds to seconds. Within
+ * this age the cached answer is that read, so the spawn uses it instead of
+ * asking the master again (a stalled second read once cost a first turn 10 s).
+ */
+export const SPAWN_REUSE_TURN_READ_MS = 60_000
 /** Session → latest successful session-scoped resolution (for reuseLastOnFailure). */
 const LAST_RESOLVED_MAX = 2_000
-const lastResolved = new Map<string, ResolvedTurnProjectContext>()
+const lastResolved = new Map<string, { value: ResolvedTurnProjectContext; at: number }>()
+const log = createLogger({ module: 'projectContext' })
 
 export type ProjectContextUnavailableReason =
   | 'timeout'
@@ -44,6 +59,8 @@ export type ProjectContextUnavailableReason =
   | 'bad_response'
   /** The project's work project could not be created/read in this container. */
   | 'board_unavailable'
+  /** The project's files in this container cannot be read (e.g. EACCES). */
+  | 'project_storage_unavailable'
 
 export interface ResolvedTurnProjectContext {
   boardProjectId: string | null
@@ -55,6 +72,10 @@ export interface ResolvedTurnProjectContext {
   bound: boolean
   /** Set when the master could not be read and the session is or may be in a project. */
   unavailable?: ProjectContextUnavailableReason
+  /** errno code behind `project_storage_unavailable`. */
+  unavailableCode?: string
+  /** Instructions the seed would have written to the read-only project dir. */
+  unwrittenSeed?: string
 }
 
 export interface ResolveTurnProjectContextOpts {
@@ -65,6 +86,9 @@ export interface ResolveTurnProjectContextOpts {
   timeoutMs?: number
   /** Prompt building only: on a failed read, use this session's latest successful resolution. */
   reuseLastOnFailure?: boolean
+  /** Prompt building only: a successful resolution at most this old is used without a read. */
+  reuseRecentMs?: number
+  now?: () => number
 }
 
 interface MasterBody {
@@ -139,16 +163,26 @@ async function fetchMaster(query: string, opts: ResolveTurnProjectContextOpts): 
   if (!baseUrl || !bearer) return null
   const url = `${baseUrl.replace(/\/+$/, '')}${PROJECT_CONTEXT_PATH}?${query}`
   let last: MasterRead = { ok: false, reason: 'network' }
+  const startedAt = performance.now()
   for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt += 1) {
     last = await fetchMasterOnce(url, bearer, opts)
     if (last.ok) return last
   }
+  log.warn('project context master read failed', {
+    reason: last.reason,
+    attempts: FETCH_ATTEMPTS,
+    elapsedMs: Math.round(performance.now() - startedAt),
+  })
   return last
 }
 
-function rememberResolved(sessionId: string, value: ResolvedTurnProjectContext): ResolvedTurnProjectContext {
+function rememberResolved(
+  sessionId: string,
+  value: ResolvedTurnProjectContext,
+  opts: ResolveTurnProjectContextOpts,
+): ResolvedTurnProjectContext {
   lastResolved.delete(sessionId)
-  lastResolved.set(sessionId, value)
+  lastResolved.set(sessionId, { value, at: (opts.now ?? Date.now)() })
   if (lastResolved.size > LAST_RESOLVED_MAX) {
     const oldest = lastResolved.keys().next().value
     if (oldest !== undefined) lastResolved.delete(oldest)
@@ -161,24 +195,64 @@ export function _resetProjectContextCacheForTest(): void {
   lastResolved.clear()
 }
 
+function errnoCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | null)?.code
+  return typeof code === 'string' && code ? code : 'unknown'
+}
+
 async function hydrateBound(
   boardProjectId: string,
   remote: MasterBody | null,
 ): Promise<ResolvedTurnProjectContext> {
-  if (remote?.instructions) {
-    await seedProjectInstructionsIfEmpty(boardProjectId, remote.instructions, remote.name ?? undefined)
-  } else {
-    await seedProjectInstructionsIfEmpty(boardProjectId, null, remote?.name ?? undefined)
+  let instructions: string | null
+  let unwrittenSeed: string | undefined
+  try {
+    await seedProjectInstructionsIfEmpty(boardProjectId, remote?.instructions ?? null, remote?.name ?? undefined)
+    instructions = (await loadProjectContext(boardProjectId)).instructions
+  } catch (writeErr) {
+    // The locked path writes (lock file, seed, meta key). A project dir this
+    // process may only read must not cost the turn its project: read it
+    // without the lock and use what the seed would have written. Any other
+    // failure (lock timeout, bug) is not a safe read-only snapshot.
+    if (!isProjectStorageReadOnlyError(writeErr)) throw writeErr
+    let local: ProjectContextSnapshot
+    try {
+      local = await loadProjectContextReadonly(boardProjectId, paths)
+    } catch (readErr) {
+      const code = errnoCode(readErr)
+      log.warn('project files unreadable; turn held', {
+        boardProjectId,
+        writeErrorCode: errnoCode(writeErr),
+        readErrorCode: code,
+      })
+      return {
+        boardProjectId: null,
+        chatProjectId: remote?.chatProjectId ?? null,
+        name: remote?.name ?? null,
+        instructions: null,
+        assets: [],
+        assetsRevision: 0,
+        bound: false,
+        unavailable: 'project_storage_unavailable',
+        unavailableCode: code,
+      }
+    }
+    log.warn('project files not writable; continuing read-only', {
+      boardProjectId,
+      errorCode: errnoCode(writeErr),
+    })
+    instructions = projectInstructionsWithUnwrittenSeed(local, remote?.instructions)
+    if (instructions && !local.instructions) unwrittenSeed = instructions
   }
-  const local = await loadProjectContext(boardProjectId)
   return {
     boardProjectId,
     chatProjectId: remote?.chatProjectId ?? null,
     name: remote?.name ?? null,
-    instructions: local.instructions,
+    instructions,
     assets: remote?.pinnedAssets ?? [],
     assetsRevision: Number(remote?.assetsRevision) || 0,
     bound: true,
+    ...(unwrittenSeed ? { unwrittenSeed } : {}),
   }
 }
 
@@ -224,9 +298,13 @@ export async function resolveTurnProjectContext(
 
   if (hasMaster) {
     if (sessionId) {
+      const cached = lastResolved.get(sessionId)
+      if (cached && opts.reuseRecentMs !== undefined && (opts.now ?? Date.now)() - cached.at <= opts.reuseRecentMs) {
+        return cached.value
+      }
       const read = await fetchMaster(`sessionId=${encodeURIComponent(sessionId)}`, opts)
       if (read && !read.ok) {
-        const last = opts.reuseLastOnFailure ? lastResolved.get(sessionId) : undefined
+        const last = opts.reuseLastOnFailure ? lastResolved.get(sessionId)?.value : undefined
         if (last) return last
         return {
           boardProjectId: null,
@@ -255,7 +333,8 @@ export async function resolveTurnProjectContext(
             unavailable: 'board_unavailable',
           }
         }
-        return rememberResolved(sessionId, await hydrateBound(id, remote))
+        const hydrated = await hydrateBound(id, remote)
+        return hydrated.unavailable ? hydrated : rememberResolved(sessionId, hydrated, opts)
       }
       return rememberResolved(sessionId, {
         boardProjectId: null,
@@ -265,7 +344,7 @@ export async function resolveTurnProjectContext(
         assets: remote?.pinnedAssets ?? [],
         assetsRevision: Number(remote?.assetsRevision) || 0,
         bound: false,
-      })
+      }, opts)
     }
     return null
   }

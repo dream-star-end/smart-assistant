@@ -44,7 +44,7 @@ import {
 } from "../billing/modelCatalog.js";
 import type { UserModelAuthz, UserModelAuthzLoader } from "../auth/userModelAuthz.js";
 import type { ProviderRoutingAvailability } from "../admin/providerHealthGate.js";
-import { PLATFORM_SEED_AGENT_MODEL_IDS } from "../marketplace/seedPlatformAgents.js";
+import { PLATFORM_SEED_AGENT_MODEL_IDS, requiredPlatformSeedAgentModelIds } from "../marketplace/seedPlatformAgents.js";
 import {
   PLATFORM_DEFAULT_MODEL,
   PLATFORM_HIDDEN_REVIEWER_MODEL,
@@ -352,7 +352,15 @@ export const PLATFORM_SEED_MODEL_IDS: readonly string[] = [
  */
 export function assertSeedModelsActive(snapshot: ModelCatalogSnapshot): void {
   const active = new Set(snapshot.activeModelIds());
-  const missing = PLATFORM_SEED_MODEL_IDS.filter(
+  // Core seed roles are mandatory even if a release policy blocks their model.
+  // Only a preset which is also paused on every runtime surface can be omitted.
+  const required = [...new Set([
+    PLATFORM_DEFAULT_MODEL,
+    PLATFORM_HIDDEN_REVIEWER_MODEL,
+    DEFAULT_CODEX_ENGINE_MODEL,
+    ...requiredPlatformSeedAgentModelIds(),
+  ])];
+  const missing = required.filter(
     (id) => !active.has(snapshot.aliasToCanonical(id)),
   );
   if (missing.length > 0) {

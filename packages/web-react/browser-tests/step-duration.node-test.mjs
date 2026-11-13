@@ -58,14 +58,13 @@ async function bundle(assetDir) {
   writeFileSync(join(assetDir, "styles.css"), readFileSync(join(cssDir, readdirSync(cssDir).find((n) => n.endsWith(".css")))));
 }
 
-/** Label + right-hand meta of every visible step row, in order. */
+/** Title + right-hand meta of every visible step row, in order (UI-3: the row's 技术详情 is open, so text has the command). */
 function steps(page) {
-  return page.locator("[data-testid='tool-step'], [data-testid='thinking-step']").evaluateAll((rows) => rows.map((row) => {
-    const header = row.querySelector("button, div");
+  return page.locator("[data-testid='process-step-row']").evaluateAll((rows) => rows.map((row) => {
     const duration = row.querySelector("[data-testid='step-duration']");
     return {
-      kind: row.getAttribute("data-testid"),
-      text: (header?.textContent ?? "").replace(/\s+/g, " ").trim(),
+      kind: row.querySelector("[data-testid='thinking-step']") ? "thinking-step" : "tool-step",
+      text: (row.textContent ?? "").replace(/\s+/g, " ").trim(),
       duration: duration?.textContent ?? null,
       running: duration?.getAttribute("data-step-running") ?? null,
       title: duration?.getAttribute("title") ?? null,
@@ -79,7 +78,15 @@ async function expandAll(page) {
   for (const toggle of await page.getByTestId("process-detail-toggle").all()) {
     if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
   }
-  await page.locator("[data-testid='tool-step']").first().waitFor();
+  await page.locator("[data-testid='process-step-row']").first().waitFor();
+  for (const prep of await page.getByTestId("process-prep").all()) {
+    const toggle = prep.getByRole("button").first();
+    if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
+  }
+  for (const row of await page.getByTestId("process-step-row").all()) {
+    const toggle = row.getByRole("button").first();
+    if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
+  }
 }
 
 test("OCV5-367: process steps show elapsed time instead of token totals", { timeout: 180000 }, async (t) => {
@@ -118,8 +125,8 @@ test("OCV5-367: process steps show elapsed time instead of token totals", { time
         const rows = await steps(page);
         receipt[`history${width}`] = rows.map((r) => [r.kind, r.duration]);
         for (const r of rows) assert.ok(!/token/i.test(r.text), `step row has no token text: ${r.text}`);
-        // 首步从用户发出算起;并行的第二条命令与第一条重叠的部分不重复计;长命令含模型写它的时间。
-        assert.deepEqual(rows.map((r) => r.duration), ["9.0 秒", "<0.1 秒", "1.3 秒", "执行 0.9 秒等待 20 秒", "执行 2 分 05 秒等待 1 分 03 秒"]);
+        // 首步从用户发出算起;并行的第二条命令与第一条重叠的部分不重复计;长命令含模型写它的时间;准备工作排在末尾。
+        assert.deepEqual(rows.map((r) => r.duration), ["9.0 秒", "1.3 秒", "执行 0.9 秒等待 20 秒", "执行 2 分 05 秒等待 1 分 03 秒", "<0.1 秒"]);
         const shared = rows.find((r) => r.text.includes("pwd"));
         assert.match(shared.title, /本步耗时 1\.3 秒.*所在模型调用共 205,000 token/);
         // 折叠的步骤组摘要给出这一组合计用时。
@@ -171,7 +178,8 @@ test("OCV5-367: process steps show elapsed time instead of token totals", { time
         await page.evaluate(() => window.__stepPage.setScene("file-done"));
         await expandAll(page);
         assert.equal(await page.getByTestId("process-live-tail").count(), 0);
-        const file = page.locator('[data-testid="tool-step"]').last();
+        // UI-3: the duration sits on the step's human title row; the original tool card is its 技术详情.
+        const file = page.locator("[data-testid='process-step-row']:not([data-testid='process-prep'] *)").last();
         assert.match(await file.getByTestId("step-duration").innerText(), /执行 1\.5 秒[\s\S]*等待 7 分 43 秒/);
         const bounds = await file.getByTestId("step-duration").boundingBox();
         assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width, "both durations stay readable on mobile");

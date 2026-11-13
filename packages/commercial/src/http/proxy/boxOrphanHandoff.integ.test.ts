@@ -197,6 +197,19 @@ test("orphan handoff lookup requires same tool ids, another turn and a terminal 
     await row("box-stopped", done, ["toolu_F"], "aa".repeat(32), { boxState: "failed_stopped", boxCancelIntent: true });
     const stopped = await find(["toolu_F"]);
     assert.equal(stopped.kind === "orphan" && stopped.stopped, true, "already stopped exchange is recoverable");
+    assert.equal((await find(["toolu_F"], "aa".repeat(32))).kind, "none",
+      "same-turn user-stopped exchange must not be resurrected");
+    await row("box-same-turn-worker-failed", live, ["toolu_W"], "cc".repeat(32), {
+      boxState: "failed_stopped", boxStopOutcome: "failed",
+      boxTerminalProof: { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+        keeperPid: 100, cliPid: 101, reason: "worker_failed", revision: 2, workerExitCode: 1 } });
+    const sameTurnStopped = await find(["toolu_W"], "cc".repeat(32));
+    assert.equal(sameTurnStopped.kind === "orphan" && sameTurnStopped.stopped, true,
+      "same-turn worker_failed handoff with live dispatch continues fresh");
+    await row("box-same-turn-unproven", live, ["toolu_U"], "cc".repeat(32), {
+      boxState: "failed_stopped", boxStopOutcome: "failed" });
+    assert.equal((await find(["toolu_U"], "cc".repeat(32))).kind, "none",
+      "same-turn stopped handoff without bound terminal proof is ignored");
     // exactly one recovery claims an exchange; release gives it back
     const claims = await Promise.all([1, 2].map((n) =>
       journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: `box-recover-${n}` })));
@@ -274,5 +287,77 @@ test("waiting handoff lookup returns this turn's waiting run, or live when it ca
     assert.deepEqual(await find("s1", ["toolu_1", "toolu_2"]), { kind: "live" });
     await q(`UPDATE request_finalize_journal SET ctx = ctx || '{"boxState":"failed_stopped"}'::jsonb WHERE request_id='box-wait'`);
     assert.deepEqual(await find("s1", ["toolu_1", "toolu_2"]), { kind: "none" });
+  } finally { client.release(); await pool.end(); }
+});
+
+test("resuming handoff with an unsent resume child is reclaimable as waiting or orphan until stop intent is recorded",
+  { skip: !url }, async () => {
+  const pool = new Pool({ connectionString: url, max: 1 });
+  const client = await pool.connect();
+  try {
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (request_id text PRIMARY KEY,
+      user_id bigint NOT NULL, state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz DEFAULT now())`);
+    await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,
+      user_id bigint NOT NULL, status text NOT NULL)`);
+    const q = (sql: string, params: unknown[] = []) => client.query(sql, params);
+    const journal = new BoxDurableJournal({ connect: async () => ({ query: q, release: () => {} }), query: q } as never);
+    const done = "33333333-3333-4333-8333-333333333333";
+    const live = "44444444-4444-4444-8444-444444444444";
+    await q(`INSERT INTO turn_dispatches VALUES ($1,3,'terminal'),($2,3,'running')`, [done, live]);
+    const turn = "aa".repeat(32);
+    const rev = "55555555-5555-4555-8555-555555555555";
+    const handoff = { version: 1, roundNo: 1, messageId: "msg_1",
+      catalogHash: "c".repeat(64), detachedRunnerHash: "d".repeat(64), spoolOffset: 10,
+      assistantContentHash: "1".repeat(64), assistantEchoHash: "2".repeat(64),
+      assistantNoCallerHash: "3".repeat(64), verifiedPendingToolUseIds: ["toolu_U1"],
+      usage: { inputTokens: 2, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      toolUses: [{ id: "toolu_U1", boxName: "mcp__ocbridge__Bash", clientName: "Bash",
+        inputHash: "e".repeat(64) }] };
+    await q(`INSERT INTO request_finalize_journal VALUES ('box-parent',3,'committed',$1::jsonb)`, [JSON.stringify({
+      boxSessionId: "sess-u", boxTurnKey: turn, boxState: "resuming", boxAccountId: "20",
+      boxRunNonce: "a".repeat(24), boxLeaseEpoch: "b".repeat(32), boxToolHandoff: handoff,
+      boxResumeRequestId: "box-unsent", boxResumeRevision: rev,
+      boxBillingContext: { v: 1, sessionId: "web", mode: "chat", parentSessionId: null, delegateAgentId: null,
+        turnKey: turn, parentTurnKey: null, authority: null, dispatchId: done, attemptNo: 1,
+        verificationSponsorship: null, apiKeyId: null } })]);
+    await q(`INSERT INTO request_finalize_journal VALUES ('box-unsent',3,'inflight',$1::jsonb)`, [JSON.stringify({
+      boxSessionId: "sess-u", boxTurnKey: turn, boxState: "unknown", boxUnknownPhase: "resume_publish_unsent",
+      boxOwnerRequestId: "box-parent", boxParentResumeRevision: rev, boxAccountId: "20",
+      boxRunNonce: "a".repeat(24), boxLeaseEpoch: "b".repeat(32) })]);
+
+    assert.deepEqual(await journal.findWaitingToolHandoff({
+      uid: 3n, sessionId: "sess-u", turnKey: turn, toolIds: ["toolu_U1"] }), {
+      kind: "waiting", identity: { requestId: "box-parent", uid: 3n, accountId: 20n,
+        runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) } });
+    assert.deepEqual(await journal.findOrphanToolHandoff({
+      uid: 3n, sessionId: "sess-u", turnKey: "ff".repeat(32), toolIds: ["toolu_U1"] }), {
+      kind: "orphan", stopped: false, identity: { requestId: "box-parent", uid: 3n, accountId: 20n,
+        runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) } });
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-parent", uid: 3n, by: "box-rec-1" }), true);
+    await journal.releaseOrphanRecovery({ requestId: "box-parent", uid: 3n, by: "box-rec-1" });
+
+    // Once stale-resume stop intent lands on the child, neither waiting nor orphan recovery may claim it.
+    await q(`UPDATE request_finalize_journal
+      SET ctx = ctx || '{"boxStaleResumeStop":{"phase":"resume_publish_unsent","atMs":1}}'::jsonb
+      WHERE request_id='box-unsent'`);
+    assert.deepEqual(await journal.findWaitingToolHandoff({
+      uid: 3n, sessionId: "sess-u", turnKey: turn, toolIds: ["toolu_U1"] }), { kind: "live" });
+    assert.deepEqual(await journal.findOrphanToolHandoff({
+      uid: 3n, sessionId: "sess-u", turnKey: "ff".repeat(32), toolIds: ["toolu_U1"] }), { kind: "live" });
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-parent", uid: 3n, by: "box-rec-2" }), false);
+
+    // After the cleanup worker closes the chain on keeper_stopped proof, same-turn recovery continues fresh.
+    await q(`UPDATE request_finalize_journal
+      SET state='aborted', ctx = ctx || $1::jsonb WHERE request_id='box-unsent'`, [JSON.stringify({
+      boxState: "failed_stopped", boxStopOutcome: "failed",
+      boxTerminalProof: { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+        keeperPid: 100, cliPid: 101, reason: "keeper_stopped", revision: 1 } })]);
+    await q(`UPDATE request_finalize_journal
+      SET ctx = ctx || '{"boxState":"failed_stopped","boxStopOutcome":"failed"}'::jsonb
+      WHERE request_id='box-parent'`);
+    const sameTurnAfterWorkerStop = await journal.findOrphanToolHandoff({
+      uid: 3n, sessionId: "sess-u", turnKey: turn, toolIds: ["toolu_U1"] });
+    assert.equal(sameTurnAfterWorkerStop.kind === "orphan" && sameTurnAfterWorkerStop.stopped, true);
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-parent", uid: 3n, by: "box-rec-3" }), true);
   } finally { client.release(); await pool.end(); }
 });

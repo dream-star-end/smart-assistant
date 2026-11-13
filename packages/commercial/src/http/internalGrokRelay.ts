@@ -1,3 +1,4 @@
+import { isModelAvailable } from "../billing/modelAvailability.js";
 import type { Logger } from '../logging/logger.js'
 import { egressTraceFields } from './egressTrace.js'
 import { createPassiveRelayTiming } from './passiveRelayTiming.js'
@@ -135,6 +136,8 @@ function grokRelayPublicMessage(code: string): string {
       return 'grok relay path or token not found'
     case 'METHOD_NOT_ALLOWED':
       return 'grok relay method not allowed'
+    case 'GROK_MODEL_UNAVAILABLE':
+      return 'grok model temporarily unavailable'
     case 'GROK_ROUTE_EXPIRED':
       return 'grok route expired'
     case 'GROK_SLOT_LEASE_LOST':
@@ -227,6 +230,7 @@ export function makeGrokRelayHandler(deps: {
       })
       if (!billed) { error(res, 403, 'GROK_DELEGATE_NOT_BILLED', requestId); return }
     }
+    if (!isModelAvailable(context.modelId)) { error(res, 503, 'GROK_MODEL_UNAVAILABLE', requestId); return }
     // method + suffix are the ALLOWED pair checked above (fixed strings): they split inference from
     // the CLI's models/settings/billing probes in the egress log. Never the route token or query.
     const stage = createPassiveRelayTiming(deps.logger, {

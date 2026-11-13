@@ -72,6 +72,7 @@ export function isRetryingTurnStatus(
 export type ChatRoutingSnapshot = {
   model?: string;
   modelSwitchId?: string;
+  modelSwitchConsent?: string;
   teamMode?: boolean;
   collabMode?: "solo" | "advisor" | "team";
   advisorModel?: string;
@@ -369,6 +370,8 @@ export type ChatMessage = {
   _dispatchLost?: boolean;
   _dispatchTerminal?: boolean;
   _turnStatusRecord?: boolean;
+  /** Server-injected callback turn (lease callback / async delegate callback / origin-session cron). */
+  _systemCallback?: boolean;
 
   // ── lossless turn tape 水合标记（v2 tape;server-authored 行携带，前端只读）──
   /** 该行所属的 lossless turn tape id（tape 是一个原子同步单元）。 */
@@ -437,6 +440,9 @@ export type ChatMessage = {
   /** OCV5-459: view-only, set by splitStoppedNarration on a user-stop row: the text the copy button
    * copies (the turn's last text before the Stop). Never persisted. */
   _stopCopyText?: string;
+  /** View-only, non-enumerable ID minted by splitStoppedNarration. The ID alone
+   * grants no continuation: its in-memory canonical-source proof must match. */
+  _continuationSourceId?: string;
   /** Exact logical order inside one immutable physical tape record. */
   _timelineLogicalOrdinal?: number;
   /** Server-authored lifecycle stamp (OCV5-21). Absent on legacy rows. */
@@ -701,21 +707,21 @@ export type ChatSession = {
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
   _turnStatus?: TurnStatusState | null;
+  /** OCV5-704: when the current `compacting` phase began (local clock). The
+   * 「正在压缩上下文 (Ns)」 seconds count from here, not from turn start. */
+  _turnStatusSince?: number;
   /** Bridge hello snapshot (meta.detached) arrival time; stale once a newer frame lands. */
   _turnDetachedAt?: number;
+  /** Stream of the last applied session snapshot. Hello / HTTP report it with the
+   * matching sessionKey cursor so the server returns only frames after it. */
+  _snapshotStream?: { streamKey: string; agentId: string };
+  /** Actual-debit projection for one client message; retain its settled value after final. */
+  _turnCredits?: { clientMessageId: string; settled: string; requests: number; asOf: number; receivedAt: number };
   /** Live one-line progress from outbound.turn_status status=working. Session
    *  memory only — not a message row, not written to persist snapshots. */
   _turnProgressHint?: string;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
-  /**
-   * Turn whose live frames this browser is re-reading through an
-   * `outbound.active_turn_replay_start` backlog (reload / reconnect). Its
-   * tape-commit completion settles at once from REST instead of waiting for a
-   * live tail that is still queued behind the replay (OCV5-427). Session
-   * memory only — not written to persist snapshots.
-   */
-  _resumeReplayClientMessageId?: string;
   /**
    * Browser-only stop settlement fence. A successful online Stop stays busy
    * until this exact turn reaches a terminal frame and the authoritative REST
@@ -760,10 +766,6 @@ export type ChatSession = {
   /** Client-only rejection feedback survives a placeholder preceding history hydration. */
   _recoveryRejectedNotices?: Record<string, { code: string; notice: string }>;
   _isFirstTurnAfterReady?: boolean;
-  _liveStreamBroken?: boolean;
-  /** Exact restored/disconnected turn is being reconciled with REST authority.
-   * Attempts and wall-clock are capped (see RESTORE_RECONCILE_MAX_*). */
-  _reconciling?: boolean;
   /** Single low-cognition user-visible recovery/control state. */
   _recoveryStatus?: RecoveryStatusState;
   /** master 自动重试的真实进度,按根消息归并(lib/chat/retryStatus.ts)。只用于展示。 */
@@ -802,8 +804,6 @@ export type ChatSession = {
   _turnCostSeenRequestIds?: Set<string>;
   /** Session-wide replay fence for cost badges, retained across turn boundaries. */
   _costChargedSeenRequestIds?: Set<string>;
-  /** Same actual-debit projection as SessionSnapshot.credits. */
-  _turnCredits?: { settled: string; requests: number; asOf: number };
   /** Set once the advisory 500-credit line is reached; UI keeps it live until turn cleanup. */
   _turnCostReminderCredits?: string;
   _tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
@@ -899,6 +899,7 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._lastFrameAt = undefined;
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
+  sess._turnStatusSince = undefined;
   sess._turnProgressHint = undefined;
   sess._turnDetachedAt = undefined;
   sess._liveTurnUsage = undefined;

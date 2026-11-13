@@ -431,3 +431,53 @@ test("OCV5-377 a proven failed retry beside a finished chain leaves the chain's 
     assert.equal(beside.capsuleSha256, alone.capsuleSha256);
   }
 });
+
+
+test("a 128-round terminal chain plus a superseded prestart_stopped unsent resume child projects terminal", () => {
+  const rows: IdleChainRow[] = [];
+  for (let i = 1; i <= 128; i += 1) {
+    const isLeaf = i === 128;
+    rows.push(
+      row(`r-${i}`, {
+        boxRunNonce: NONCE,
+        boxLeaseEpoch: EPOCH,
+        boxAccountId: "20",
+        boxRoundNo: i,
+        ...(i > 1
+          ? {
+              boxOwnerRequestId: `r-${i - 1}`,
+              boxParentResumeRevision: REV,
+            }
+          : {}),
+        ...(isLeaf
+          ? {
+              boxTerminalProof: { reason: "worker_complete", runNonce: NONCE, leaseEpoch: EPOCH },
+              boxReplayMessage: capsule,
+              boxUsage: { inputTokens: 100 },
+            }
+          : {
+              boxToolHandoff: { roundNo: i },
+              boxResumeRequestId: `r-${i + 1}`,
+              boxResumeRevision: REV,
+              boxTerminalProof: { reason: "worker_complete", runNonce: NONCE, leaseEpoch: EPOCH },
+            }),
+      }),
+    );
+  }
+  const retiredUnsent: IdleChainRow = {
+    ...row(
+      "r-2-unsent",
+      {
+        boxState: "prestart_stopped",
+        boxUnsentSupersededBy: "r-2",
+      },
+      "aborted",
+    ),
+    finalCredits: "0",
+  };
+  const proof = projectBoxIdleChain({ sessionId, turnKey, rows: [...rows, retiredUnsent] });
+  assert.equal(proof.status, "terminal");
+  if (proof.status === "terminal") {
+    assert.equal(proof.requestId, "r-128");
+  }
+});

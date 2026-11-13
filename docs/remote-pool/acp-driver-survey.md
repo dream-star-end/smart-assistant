@@ -1,0 +1,77 @@
+# Remote Pool ACP & Multi-Engine Driver Survey (`OCV5-749` / `AC-9`)
+
+> Scope: V5 selfhost remote execution pool (`remote-driver-v4`) architectural boundary, official Agent Client Protocol (ACP) evaluation, and 4-engine (`cc`, `codex`, `Grok`, `Antigravity`) capability matrix.
+> Non-scope: Grok and Antigravity are **not** implemented as remote pool drivers in `OCV5-749`; unverified remote pool properties are explicitly marked **`未核实`**.
+
+---
+
+## 1. Official ACP Specification Assessment
+
+Evaluated against the official Agent Client Protocol specifications:
+
+- Protocol Overview: <https://agentclientprotocol.com/protocol/overview>
+- Tool Calls (`v1`): <https://agentclientprotocol.com/protocol/v1/tool-calls>
+- Session Setup (`v1`): <https://agentclientprotocol.com/protocol/v1/session-setup>
+
+### 1.1 What ACP Standardizes
+
+ACP defines a JSON-RPC 2.0 stdio transport between an editor/client and an agent subprocess:
+
+1. **Lifecycle & Session RPCs**: `initialize`, `session/new`, `session/load` (and optional capability-gated `session/resume`), `session/prompt`, and `session/cancel`.
+2. **Presentation Notifications**: `session/update` streaming `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, and plan updates.
+3. **Optional Client Capabilities**: `fs` (`fs/read_text_file`, `fs/write_text_file`) and `terminal` (`terminal/create`, etc.) declared by the client during `initialize`.
+
+### 1.2 Why ACP Cannot Replace Per-Engine 5-Duty Drivers ("No Policy-Free Universal Driver")
+
+OpenClaude's remote service pool runs untrusted model turns on shared multi-session remote nodes (`box@node`), while real side-effecting tools execute **exclusively inside the user's container** via CCB tool host. Under this threat model, ACP alone cannot serve as a policy-free universal remote driver for four protocol-level reasons:
+
+1. **Omitting client `fs`/`terminal` capabilities does NOT disable native agent tools**:
+   Per ACP `overview` and `v1/tool-calls`, agents execute their own built-in tools directly unless vendor-specific CLI flags, config lockdowns, and catalog overrides disable them at the source (e.g., `--tools ""` + `--strict-mcp-config` on Claude Code; `--strict-config` + 17 `--disable <feature>` flags + 5-field `models.json` `POLICY` override on Codex).
+2. **ACP `tool_call` notifications are advisory UI updates, not authorization proofs**:
+   Per ACP `v1/tool-calls`, reporting tool calls via `session/update` is `SHOULD`, `kind` is a coarse UI category (`read` / `edit` / `execute` / `other` — cf. `packages/gateway/src/engine/grokAdapter.ts:264-273`), and `rawInput` may be omitted or partially populated. OpenClaude's `observationGate` requires exact `callId`, `ocbridge` tool alias, and `remoteCanonicalSha256(arguments)` parity between the native stdout observation and the independent `AF_UNIX` fixed-MCP request.
+3. **ACP does not standardize `toolCallId -> MCP _meta` correlation**:
+   Claude Code passes `_meta["claudecode/toolUseId"]` (`scripts/agent-remote/drivers/cc.py`), whereas Codex passes `_meta.callId` + `_meta.threadId` + `_meta["x-codex-turn-metadata"].turn_id` (`scripts/agent-remote/drivers/codex.py`). Any future ACP CLI must be empirically verified to propagate an unforgeable per-call ID into fixed MCP `tools/call`.
+4. **Session replay & billing semantics are outside ACP's guarantee**:
+   `session/load` replays prior conversation history via `session/update` notifications (`v1/session-setup`), which would re-authorize historical tool calls if fed into `observationGate` without vendor-aware replay fencing. Furthermore, ACP does not define ledger-grade cumulative vs. per-turn token counters (`cacheRead`, `cacheWrite`, reasoning-token inclusion).
+
+**Architectural Decision**: Keep native protocol & source-ban knowledge isolated inside each engine's 5-duty Python driver (`launch_spec`, `decode`, `encode`, `probe`, `usage_policy` under `scripts/agent-remote/drivers/`). Shared JSON-RPC / ACP framing helpers should only be extracted into a driver support module when a **second** real ACP-speaking remote CLI passes P0 verification.
+
+---
+
+## 2. Four-Engine Remote Driver Capability Matrix (`cc`, `codex`, `Grok`, `Antigravity`)
+
+| Dimension | `cc` (Claude Code `2.1.316`) | `codex` (OpenAI Codex `0.167.0`) | `Grok` (`grok-native` / `grok` CLI) | `Antigravity` (`antigravity` CLI `1.3.x` / `1.4.x`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Wire Protocol / ACP Version & Launch Mode** | **Non-ACP** Claude NDJSON + `oc-bridge` Hook plugin via `host.py` + root-scoped `tmux` (`TMUX_TMPDIR=<root>/tmux`). Never `-p`/`--print` for user turns (`drivers/cc.py:105-268`). | **Non-ACP** Codex JSON-RPC 2.0 `app-server --strict-config --listen stdio://` (`drivers/codex.py:115-209`). | Local adapter uses `--output-format streaming-json` (`grokAdapter.ts:685-695`) with ACP-style `kind`/`toolName` fields (`grokAdapter.ts:264-273`). Remote interactive/daemon mode: **`未核实`**. | **Non-ACP** headless NDJSON stream-json (`{"event":"user",...}` on stdin) routed through master `CLOUD_CODE_URL` OAuth swap relay (`antigravityAdapter.ts:7-24`). Remote node pool mode: **`未核实`**. |
+| **2. Live Model Capability Probe (Zero Binary Scan / Fallback)** | **Verified (`PASS`)**: `claude -p --input-format stream-json --output-format stream-json --verbose --tools "" --setting-sources ""` + `control_request{subtype:"initialize"}` -> `control_response.response.models` (`drivers/cc.py:612-758`). | **Verified (`PASS`)**: `codex app-server --strict-config` -> `initialize` + `account/read` + cursor-paginated `model/list` (`drivers/codex.py:591-755`). | Local fast catalog uses HTTP `GROK_MODELS_LIST_URL` (`grokAdapter.ts:648,674-676`). Remote CLI-observed model/effort probe without API key exposure: **`未核实`**. | Models mapped statically via `antigravityCliModelId` (`antigravityAdapter.ts:37`); live CLI-observed per-account model/quota probe on remote node: **`未核实`**. |
+| **3. `toolCallId -> Fixed MCP` Correlation** | **Verified (`PASS`)**: Native `assistant` `tool_use.id` (`mcp__ocbridge__<tN>`) <-> MCP `params._meta["claudecode/toolUseId"]` (`drivers/cc.py:363-399,492-534`; live-node proof in Conformance Group 3 `concurrentDuplicateValidMatch`). | **Verified (`PASS`)**: Native `item/started` `mcpToolCall.id` <-> MCP `params._meta.callId` + `threadId` + `x-codex-turn-metadata.turn_id` (`drivers/codex.py:326-370,482-514`; live-node proof in Conformance Group 3 `concurrentDuplicateValidMatch`). | **`未核实`**: Local `grokAdapter.ts:651-653` notes native Grok discovers project/compat MCPs beyond `--tools`; exact `_meta` call-ID correlation to `ocbridge` on remote node is **`未核实`**. | **`未核实`**: Local adapter normalizes built-in & MCP trajectory steps (`antigravityToolNormalize.ts`); unforgeable `_meta` call-ID propagation to remote fixed MCP is **`未核实`**. |
+| **4. Native Tool Source-Ban** | **Verified (`PASS`)**: `--tools ""`, `--strict-mcp-config`, `--mcp-config <root>/mcp.json`, `--setting-sources ""`, `--disable-slash-commands`, `--allowedTools mcp__ocbridge__*`, plus `system/init` tool-list check (`drivers/cc.py:162-183,422-431`). | **Verified (`PASS`)**: `--strict-config`, 17 `--disable` flags (`shell_tool`, `unified_exec`, `multi_agent*`, `plugins`, etc.), `sandbox_mode="read-only"`, `web_search="disabled"`, config-pollution check, and 5-field `models.json` `POLICY` (`drivers/codex.py:30-98,144-191`). | Partial local evidence: `--tools` restricts model-visible builtins (`grokAdapter.ts:696-700`), `--no-subagents`, `--no-memory`, but project/compat MCP discovery still requires `HOME` isolation (`grokAdapter.ts:651-653`). Full remote zero-native-effect ban: **`未核实`**. | **`未核实`**: Local CLI has native file/command/browser capabilities (`BOUNDED_FILE_TOOLS`, `antigravityAdapter.ts:92-94`); source-level disabling of all native tools while keeping fixed MCP only is **`未核实`**. |
+| **5. Token Usage Semantics & Billing Authority** | **Verified (`PASS`)**: `per_turn` (`cc-result-per-turn-v1`) from `result.usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`); `inputIncludesCacheRead=false`, `allowCacheWrite=true` (`drivers/cc.py:91-102`). | **Verified (`PASS`)**: `cumulative` (`codex-0.167-total-v1`) from `thread/tokenUsage/updated.tokenUsage.total`; core computes `final - baseline`, subtracts `cachedInputTokens` from `inputTokens`, `reasoningOutputTokens` already inside `outputTokens`, rejects `cacheWriteInputTokens > 0` (`drivers/codex.py:100-112`). | **`未核实`**: Remote CLI stream-json token counter completeness, cache split, and multi-turn cumulative vs per-turn invariants are **`未核实`**. | Local adapter explicitly documents that CLI `result.usage` omits title-generation calls and is cumulative across resumes, so billing relies on master's HTTP relay `usageMetadata` instead (`antigravityAdapter.ts:20-24`). CLI-only receipt billing: **Not trustworthy without HTTP relay** (**`未核实`** for remote SSH pool). |
+| **6. `resume` / `cancel` & Stop Proof** | **Verified (`PASS`)**: `--session-id <uuid>` / `--resume <uuid>`, `control_request{subtype:"interrupt"}`, plus `TMUX_TMPDIR` kill + systemd scope `bootId`/inode/`populated 0`/`tool.sock` proof (`core/controller.py:573-678`). | **Verified (`PASS`)**: `thread/start` & `thread/resume` + `turn/interrupt`, plus systemd scope `bootId`/inode/`populated 0`/`tool.sock` proof (`core/controller.py:573-678`). | Local `--resume <nativeId>` exists (`grokAdapter.ts:702`), process-group kill on cancel; remote replay-free `resume` & cgroup containment: **`未核实`**. | Local resume on large conversations in 1.4.0 exhibited `timeout waiting for cascade to start running` ambiguous execution (`antigravityAdapter.ts:135-140`). Remote replay-free `resume`: **`未核实`**. |
+| **7. `OCV5-749` Implementation Status** | **Implemented & Conformance-Gated** (`scripts/agent-remote/drivers/cc.py`). | **Implemented & Conformance-Gated** (`scripts/agent-remote/drivers/codex.py`). | **Out of Scope (`不做`)** — requires dedicated P0 survey & source-ban proof before onboarding. | **Out of Scope (`不做`)** — coupled to master `CLOUD_CODE_URL` OAuth token-swap relay (`antigravityAdapter.ts:12-24`). |
+
+---
+
+## 3. Live Selfhost Node P0 Survey Baseline (`remote-driver-survey.py`)
+
+Survey CLI entrypoint:
+
+```bash
+python3 scripts/agent-remote/remote-driver-survey.py --driver cc|codex|all --output <path>
+```
+
+### 3.1 Live `v4-guard` Verification Summary (`2026-11-11`, `controllerSha256 = ca38203ff040ecba271247473d5b2e1ae415d592c4f5457eea128bd4e69a6c2e`, `coreDigest = a3580d9cbc1a9f588bb3fd238d0e85162260c509e1158178e953c8333f8bbfcb`)
+
+Executed over the real `remote-driver-v4` OpenSSH forced-command guard (`--ssh-mode v4-guard`) inside isolated `systemd --user` probe cgroup scopes (`oc-{cc,codex}-probe-*.scope`) without reading credential file contents or mutating active user lanes (full artifacts at `/home/agent/.openclaude/generated/ocv5-749-survey-{cc,codex}.json`). Legacy `--ssh-mode hostd` strictly reports `"status": "UNVERIFIED"` (`hostd_cache_only_driver_probe_not_executed`) with zero synthetic hash/version fallbacks:
+
+| Check | `cc` on `cc5-att-us` (`99.144.122.98`, `/home/box/.oc-remote-cc/claude-2.1.316`) | `codex` on `cc5-us` (`136.86.253.46`, `/usr/lib/node_modules/@openai/codex/bin/codex.js` `0.167.0`) |
+| :--- | :--- | :--- |
+| **`workerIpc`** (`source = master-local-fixture`) | **`PASS`** (`p50 = 0.227 ms`, `p95 = 0.433 ms` vs `50 ms` SLO; `driverDigest = 9f4ae8d37e1f5e8f01b28b8ef2fc53e634c6971926c07d4b6166a534ea0e408f`) | **`PASS`** (`p50 = 0.209 ms`, `p95 = 0.316 ms` vs `50 ms` SLO; `driverDigest = 15e28b91474a3e9371bdbd6ccc777e9db6430344464d5c0d1dbe1915e120b7b0`) |
+| **`mcpCorrelation`** (`source = master-local-fixture`) | **`PASS`** (synthetic frame decode on master: `_meta["claudecode/toolUseId"] = toolu_01SurveyCheck`, `argsHash = 7d6441497d2a000b8143602a7817c90abe7db88e139f89c062a1c36cfe0ad9d6`; live remote-node proof: `/home/agent/.openclaude/generated/ocv5-749-conformance-cc/group-3.json#concurrentDuplicateValidMatch`) | **`PASS`** (synthetic frame decode on master: `_meta.callId = call_survey_01` + `threadId` + `x-codex-turn-metadata.turn_id`, `argsHash = 7d6441497d2a000b8143602a7817c90abe7db88e139f89c062a1c36cfe0ad9d6`; live remote-node proof: `/home/agent/.openclaude/generated/ocv5-749-conformance-codex/group-3.json#concurrentDuplicateValidMatch`) |
+| **`scopeContainment`** (live remote node) | **`PASS`** (`mode = v4-guard-controller-probe-scope`, `controllerPath = /opt/openclaude/remote-driver/ca38203ff040ecba271247473d5b2e1ae415d592c4f5457eea128bd4e69a6c2e/core/controller.py`) | **`PASS`** (`mode = v4-guard-controller-probe-scope`, `controllerPath = /opt/openclaude/remote-driver/ca38203ff040ecba271247473d5b2e1ae415d592c4f5457eea128bd4e69a6c2e/core/controller.py`) |
+| **`probe`** (live remote node CLI-observed) | **`PASS`** (`source = claude-control:initialize`, `cliVersion = 2.1.316`, `cliSha256 = fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824`, `bridgeSha256 = 168778ab920bd947b254a3ab3e92b958060ab826178070742151c4b7af6fa3a3`, `planType = Claude Pro`, observed models: `claude-opus-5-5`, `opus`, `sonnet`, `haiku`; `probeFingerprint = 2b6e2669d14e02b433e9a31c30ec922a284d780cdb8583c77645c00925506610`) | **`PASS`** (`source = codex-app-server:model/list`, `cliVersion = 0.167.0`, `cliSha256 = e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af`, `nativeSha256 = cdcb45aaa01d0f14e298985e09465aebccd47f64ecd298aea44814af7b62bbda`, `planType = pro`, observed visible models: `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6.1-terra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`; `probeFingerprint = 4e9052f780318a8844fa8a48c81ab4aaf36db0dfe543eedf4d5789d84da6d3dd`) |
+
+### 3.2 `probeFingerprint` Sensitivity & Provenance Boundary Notes
+
+1. **Master-local vs. live-node survey fields**: `remote-driver-survey.py` is strictly non-mutating on remote nodes (it never opens an active user turn or fixed MCP tool listener on `box@node`). Accordingly, `workerIpc` and `mcpCorrelation` inside the survey JSON explicitly carry `"source": "master-local-fixture"` (benchmarking `driver_worker.py` IPC latency and decoding canonical frame fixtures locally on master), whereas `scopeContainment` and `probe` execute live on the remote node via `v4-guard`. End-to-end live-node `toolCallId -> fixed MCP` correlation under concurrent duplicate calls is proven in Conformance Group 3 (`group-3.json#concurrentDuplicateValidMatch`).
+2. **`probeFingerprint` drift across timestamps**: `compute_probe_fingerprint` (`core/contract.py`) strips volatile timestamps (`observedAt`, `rawResponseSha256`) but intentionally hashes the live CLI-observed `models` array, `planType`, and `accountHint` alongside `coreDigest`, `driverDigest`, `policySha256`, and binary SHA-256s (`cliSha256`, `nativeSha256`, `bridgeSha256`). Therefore, survey and conformance runs executed at different times will legitimately produce different `probeFingerprint` values whenever vendor-side `model/list` offerings or account plan metadata change, even when `coreDigest`, `driverDigest`, and binary SHA-256 digests are identical (which in production triggers fail-closed `REMOTE_DRIVER_REVERIFY_REQUIRED` until re-verified).

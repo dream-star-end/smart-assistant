@@ -1,3 +1,4 @@
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * CodexAdapter — codex(gpt-5.5,app-server 形态)底座的 EngineAdapter 实现(M1a)。
  *
@@ -30,8 +31,12 @@
  *     这里收口保证 codex 路径永远命中 scrub,与 buildCodexEnv 的 env scrub 成对。
  */
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type {
   CallTokenUsageSnapshot,
+  CodexExecutionBackend,
   GoalStateSnapshot,
   JobTerminal,
   TurnTokenUsageSnapshot,
@@ -39,11 +44,13 @@ import type {
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
+import { buildCodexLaunchOverrides } from '../codexLaunchOverrides.js'
 import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import { createLogger } from '../logger.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
-import type { SdkMessage, UsageAttributionTag } from '../subprocessRunner.js'
+import { SubprocessRunner, type SdkMessage, type UsageAttributionTag } from '../subprocessRunner.js'
 import { asCcbSessionTotals } from './ccbAdapter.js'
+import { CodexRemoteLane, type CodexRemoteLaneOptions } from '../codexRemoteLane.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import type { CodexProviderConfigOverride } from './codexShared.js'
 import type {
@@ -62,7 +69,11 @@ import type {
   TurnSummary,
 } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
-import { type EngineCreateOpts, registerEngine } from './registry.js'
+import {
+  type EngineCreateOpts,
+  registerEngine,
+  registerEngineRemoteContext,
+} from './registry.js'
 import { buildCodexDelegateTerminalNotification } from '../engineNotifier.js'
 
 const log = createLogger({ module: 'codexAdapter' })
@@ -402,6 +413,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       kernelOverride ??
       new CodexAppServerRunner({
         sessionKey: opts.sessionKey,
+        systemHelpContextFile: opts.systemHelpContextFile,
         agentId: opts.agentId,
         cwd: opts.agentBaseDir,
         resumeSessionId: opts.resumeSessionId,
@@ -612,6 +624,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         params.collabAgentPolicy,
         params.queueTurn,
         params.automaticRetryState,
+        params.traceId ?? null,
+        params.readOnly === true,
       )
     } catch (err) {
       submitted = Promise.reject(err)
@@ -691,6 +705,20 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 
   /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */
+  clearPromptPrivacy(): void {
+    (this.kernel as { clearPromptPrivacy?: () => void }).clearPromptPrivacy?.()
+  }
+  assertPromptPrivacyStopped(): void {
+    const assertStopped = (this.kernel as { assertPromptPrivacyStopped?: () => void }).assertPromptPrivacyStopped
+    if (!assertStopped) throw new Error('助手隐私刷新无法核验旧进程状态。')
+    assertStopped.call(this.kernel)
+  }
+  get promptPolicyFingerprint(): string | undefined {
+    return (this.kernel as { promptPolicyFingerprint?: string }).promptPolicyFingerprint
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void {
+    (this.kernel as { setPromptPrivacy?: (p: PromptPrivacyPolicy) => void }).setPromptPrivacy?.(policy)
+  }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return (this.kernel as { promptIntelligentUi?: IntelligentUiApplied }).promptIntelligentUi
   }
@@ -801,5 +829,148 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 }
 
+/**
+ * Codex on a remote pool node. The protocol kernel is the local one; only the process boundary
+ * is replaced by the master relay lane, whose tool host runs real tools in this container.
+ * The lane is admitted per turn before the kernel may write its first frame.
+ */
+export class CodexRemoteAdapter extends CodexAdapter {
+  // Identical to the local adapter except native compaction: a remote thread's rollout lives on
+  // the node, so the container never compacts it.
+  override readonly capabilities: EngineCapabilities = {
+    billingMode: 'engine-reported',
+    supportsEffort: true,
+    resumeKind: 'codex-thread',
+    needsServerRequestId: true,
+    historyMode: 'native-resume',
+    permissionModel: 'native',
+    emitsCallUsage: true,
+    emitsToolInputDeltas: true,
+    supportsNativeCompact: false,
+    multimodalInput: 'native',
+  }
+  private readonly lane: CodexRemoteLane
+
+  constructor(opts: EngineCreateOpts, laneOptions: CodexRemoteLaneOptions = {}) {
+    const lane = new CodexRemoteLane(opts, laneOptions)
+    super(opts, lane.kernel)
+    this.lane = lane
+  }
+
+  get executionBackend(): CodexExecutionBackend { return this.lane.backend }
+
+  /** Session-open preheat would need an admitted turn; a remote lane starts on its first turn. */
+  override preheat(): Promise<void> {
+    return Promise.resolve()
+  }
+
+  override submitTurn(params: TurnParams): EngineTurnRun {
+    this.lane.beginTurn(params)
+    return super.submitTurn(params)
+  }
+
+  /**
+   * Effort/model/privacy changes only need a fresh kernel: the lane, its node binding and its
+   * admission channel must survive, or the very next beginTurn sees CODEX_LANE_CLOSED.
+   */
+  restartForConfigChange(): Promise<void> {
+    return super.shutdown()
+  }
+
+  override async shutdown(): Promise<void> {
+    try {
+      await this.lane.stopLane()
+    } finally {
+      await super.shutdown()
+    }
+  }
+}
+
 // ── registry 注册(import 本模块即生效;sessionManager 顶部显式 import)──────
-registerEngine('codex', (opts) => new CodexAdapter(opts))
+registerEngine('codex', (opts) =>
+  opts.executionBackend?.kind === 'codex-app-server-v1'
+    ? new CodexRemoteAdapter(opts)
+    : new CodexAdapter(opts),
+)
+
+registerEngineRemoteContext('codex', async ({ opts, promptPolicy, promptOnly }) => {
+  let profile: {
+    cwd: string
+    mcpConfigPath: string | null
+    settingsPath: string | null
+    disallowedTools: string[]
+  }
+  let env: NodeJS.ProcessEnv
+  let cleanup: () => void
+  if (promptOnly) {
+    profile = {
+      cwd: opts.agentBaseDir,
+      mcpConfigPath: null,
+      settingsPath: null,
+      disallowedTools: [],
+    }
+    env = {}
+    cleanup = () => {}
+  } else {
+    const sub = new SubprocessRunner(opts)
+    if (promptPolicy !== undefined) {
+      sub.setPromptPrivacy(promptPolicy)
+    }
+    const prepared = await sub.prepareRemoteToolContext()
+    profile = prepared.profile
+    env = prepared.env
+    cleanup = prepared.cleanup
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'oc-codex-rv4-'))
+  try {
+    let repoSnap: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null = null
+    if (opts.sessionId && opts.getRepoSnapshot) {
+      try {
+        repoSnap = opts.getRepoSnapshot(opts.sessionId)
+      } catch {
+        repoSnap = null
+      }
+    }
+    const overrides = await buildCodexLaunchOverrides({
+      promptPolicy,
+      systemHelpContextFile: opts.systemHelpContextFile,
+      agentId: opts.agentId,
+      sessionKey: opts.sessionKey,
+      persona: opts.persona,
+      identityCompat: opts.identityCompat,
+      provider: 'codex-native',
+      model: opts.model,
+      effortLevel: opts.effortLevel,
+      sessionDir: dir,
+      claudeCodePath: opts.config?.auth?.claudeCodePath,
+      gatewayPort: opts.config?.gateway?.port,
+      gatewayToken: opts.config?.gateway?.accessToken,
+      delegationDepth: opts.delegationDepth,
+      repoSnapshot: repoSnap,
+      sessionId: opts.sessionId,
+      projectId: opts.projectId,
+      runContext: opts.runContext,
+      frozenProjectContext: opts.frozenProjectContext,
+      cwd: opts.agentBaseDir,
+      readOnly: false,
+    })
+    return {
+      profile,
+      env,
+      platformPrompt: overrides.instructionsContent,
+      promptCwd: opts.agentBaseDir,
+      promptPolicyFingerprint: overrides.promptPolicyFingerprint,
+      promptIntelligentUi: overrides.intelligentUiApplied,
+      cleanup,
+    }
+  } catch (err) {
+    cleanup()
+    throw err
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      /* swallow */
+    }
+  }
+})

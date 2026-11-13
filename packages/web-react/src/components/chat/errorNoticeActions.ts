@@ -16,24 +16,15 @@ export function noticeActions(list: readonly ErrorNoticeAction[]): readonly [Not
   return list.length === 1 ? [list[0]!] : [list[0]!, list[1]!];
 }
 
-/**
- * 错误卡的建议动作 → 卡片原有的执行入口。目录只决定「建议什么、按什么顺序」;能不能点仍按原来的门:
- *  - 重发类(重新发送 / 修改消息 / 换个模型 / 刷新)只在该卡属于最后一轮时出现(历史卡一点会把无关的
- *    最新一轮重发出去,Codex 审计 R5);
- *  - 重发优先精确重发原消息(「重试」:可重试码、能找到原 user 行),否则重发最后一条
- *    (「重新尝试」);有可续接的断点时改为「从断点继续」;
- *  - 已有按钮沿用原来的名字(重试 / 切换模型 / 新建会话继续 / 刷新页面),目录新增的建议
- *    (联系管理员、修改消息)用目录的名字;
- *  - 免单卡只留重发和反馈(本轮已退款,不引导换模型或开新会话);
- *  - 「联系管理员」走反馈入口,带上这条消息的追踪信息。
- */
+/** Current task errors continue within their conversation. Navigation keeps its
+ * own admission gates; historical errors never start another task. */
 export type ErrorNoticeActionsInput = {
   msg: ChatMessage;
   cb: CardCallbacks;
   userError: UserError;
   isLastTurn: boolean;
   waived: boolean;
-  /** 精确重发的目标(可重试码 + 原 user 行);没有则退回重发最后一条。 */
+  /** Retained for legacy callers; execution never replays this target. */
   preciseRetryTarget?: ChatMessage;
   /** 原 user 行(修改消息用),不要求可重试。 */
   editTarget?: ChatMessage;
@@ -46,11 +37,7 @@ export function errorNoticeActions(input: ErrorNoticeActionsInput): ErrorNoticeA
   const { cb, isLastTurn, waived } = input;
   const h: ErrorActionHandlers = {};
   if (isLastTurn) {
-    if (input.continueInterrupted) h.retry = { label: "从断点继续", onClick: input.continueInterrupted };
-    else if (input.preciseRetryTarget && cb.onRetrySend) {
-      const target = input.preciseRetryTarget;
-      h.retry = { label: "重试", onClick: () => cb.onRetrySend?.(target) };
-    } else if (cb.onRegenerate) h.retry = { label: "重新尝试", onClick: cb.onRegenerate };
+    if (input.continueInterrupted) h.retry = { label: "继续", onClick: input.continueInterrupted };
     if (!waived) {
       if (cb.onOpenModelPicker) h.switch_model = { label: "切换模型", onClick: cb.onOpenModelPicker };
       const editTarget = input.editTarget;
@@ -60,7 +47,6 @@ export function errorNoticeActions(input: ErrorNoticeActionsInput): ErrorNoticeA
       h.relogin = reload;
     }
   }
-  if (!waived && cb.onStartNewSession) h.new_session = { label: "新建会话继续", onClick: cb.onStartNewSession };
   if (input.topUp && cb.onTopUp) {
     const { label, intent } = input.topUp;
     h.topup = { label, onClick: () => {

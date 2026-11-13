@@ -1,3 +1,4 @@
+import type {AuthorizeSwitch,SwitchAuthorization} from './useModelSwitchCost';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { ApiError, api } from "../lib/api";
@@ -87,6 +88,7 @@ export type UseChatSocket = {
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
+    switchAuthorization?:SwitchAuthorization;
     sessId: string;
     agentId: string;
     text: string;
@@ -102,7 +104,7 @@ export type UseChatSocket = {
     collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
     serviceTier?: InboundMessage["serviceTier"];
-  }) => void;
+  }) => unknown;
   stop: (sessId: string, expectedClientMessageId?: string) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   retryMessage: (p: {
@@ -127,7 +129,7 @@ export type UseChatSocket = {
   setActiveSession: (sessId: string | undefined) => void;
   /** Apply REST/WS platform goal snapshots to the live session model. */
   setGoalState: (sessId: string, goal: ChatSession["goalState"]) => void;
-  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非持久，随 version 快照读回）。*/
+  /** 会话级 transient 软提示（"正在发送…"等，非持久，随 version 快照读回）。*/
   getTransientNotice: (sessId: string | undefined) => { text: string; ts: number } | null;
   respondPermission: (p: {
     sessId: string;
@@ -276,6 +278,7 @@ function userPayloadCacheKey(
 }
 
 export function useChatSocket(opts: {
+  authorizeSwitch?:AuthorizeSwitch;
   auth: AuthSession | null;
   /** gate.ready：容器 running —— WS 连接硬前置。*/
   ready: boolean;
@@ -325,6 +328,8 @@ export function useChatSocket(opts: {
   onRepoBindErrorRef.current = opts.onRepoBindError;
   const onMediaJobRef = useRef(opts.onMediaJob);
   onMediaJobRef.current = opts.onMediaJob;
+  const authorizeSwitchRef=useRef(opts.authorizeSwitch);
+  authorizeSwitchRef.current=opts.authorizeSwitch;
   const queueModelPatchRef = useRef(opts.queueModelPatch);
   queueModelPatchRef.current = opts.queueModelPatch;
   const permissionLookupAtRef = useRef(new Map<string, number>());
@@ -343,6 +348,7 @@ export function useChatSocket(opts: {
   const socketRef = useRef<ChatSocket | null>(null);
   if (!socketRef.current) {
     socketRef.current = new ChatSocket({
+      authorizeSwitch:(input,opts)=>authorizeSwitchRef.current?authorizeSwitchRef.current(input,opts):Promise.resolve({requestId:input.requestId,choice:true}),
       getToken: () => authRef.current?.snapshot().token ?? "",
       getAuthEpoch: () => authRef.current?.snapshot().epoch ?? -1,
       silentRefresh: async (expectedEpoch) => {
@@ -351,6 +357,16 @@ export function useChatSocket(opts: {
         return api.refresh(session, expectedEpoch, "ws_auth");
       },
       onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
+      readSessionSnapshot: async (sessId, query) => {
+        const a = authRef.current;
+        if (!a) throw new Error("signed out");
+        const { limit, ...snapshot } = query;
+        return (await api.getSessionLiveFrames(a, sessId, "0", limit ?? 200, { snapshot })).snapshot;
+      },
+      readLiveFramePayload: (sessId, ref) => {
+        const a = authRef.current;
+        return a ? api.getLiveFramePayload(a, sessId, ref) : Promise.reject(new Error("signed out"));
+      },
       lookupPermissionPrompts: (sessId, requestIds) => {
         const now = Date.now();
         const last = permissionLookupAtRef.current.get(sessId) ?? 0;
@@ -513,7 +529,6 @@ export function useChatSocket(opts: {
             (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
           );
           if (!isCurrent()) return false;
-          sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;
         } catch {

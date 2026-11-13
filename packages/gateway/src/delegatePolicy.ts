@@ -4,7 +4,7 @@
  * Moved verbatim out of server.ts (FINDINGS §7.6, OCV5-533); server.ts re-exports
  * these names, so importers are unchanged.
  */
-import { STATIC_KEY_INBOUND_MODEL_IDS, CODEX_ENGINE_MODEL_IDS, GROK_ENGINE_MODEL_IDS, CURSOR_ENGINE_MODEL_IDS, ZCODE_ENGINE_MODEL_IDS } from '@openclaude/protocol'
+import { STATIC_KEY_INBOUND_MODEL_IDS, CODEX_ENGINE_MODEL_IDS, GROK_ENGINE_MODEL_IDS, CURSOR_ENGINE_MODEL_IDS, ZCODE_ENGINE_MODEL_IDS, ANTIGRAVITY_ENGINE_MODEL_IDS } from '@openclaude/protocol'
 import { resolveExecutionModel } from './localExecution.js'
 
 /**
@@ -38,6 +38,10 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
   ...GROK_ENGINE_MODEL_IDS,
   ...CURSOR_ENGINE_MODEL_IDS,
   ...ZCODE_ENGINE_MODEL_IDS,
+  // antigravity 只经 master 签发的 relay route 执行(adapter 无 route 即
+  // ANTIGRAVITY_ROUTE_REQUIRED);列入白名单只是让它与其它托管引擎一样能通过
+  // 委派/入站的型号校验,不构成执行授权。
+  ...ANTIGRAVITY_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 
@@ -92,6 +96,8 @@ export interface RunDelegateInput {
   sourceAgent?: string
   toolsets?: unknown
   /** 父会话 sessionKey(容器内部键):委派归因 + 进度回传 + per-parent 分桶的解析源。 */
+  traceId?: string
+  parentTraceId?: string
   parentSessionKey?: string
   streamProgress?: boolean
   depth: number
@@ -115,6 +121,11 @@ export interface RunDelegateInput {
   idleTimeoutMs?: number
   /** 可选:覆盖目标成员默认模型的 catalog 型号。审查委派忽略(审查员型号由 gateway 选)。 */
   model?: string
+  /** Internal taskboard adapter only; HTTP request bodies never set this. */
+  modelPolicy?: 'taskboard-stage-agent-auto'
+  /** Internal root guard owner, distinct from real ancestry and billing. */
+  delegationGuardOwnerKey?: string
+  taskboardControl?: import('./taskboard/runControl.js').TaskboardRunControl
   /** 2026-09-04 团队模式:审查任务书模板(execution 验收 / deliberation 审议对比)。
    *  仅审查委派读取;非法/缺省 → execution。只影响提示词,不影响闸与计费。 */
   reviewMode?: string

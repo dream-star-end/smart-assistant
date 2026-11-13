@@ -64,20 +64,20 @@ describe("建议动作", () => {
     const switchModel = vi.fn();
     const admin = vi.fn();
     const picked = pickErrorActions(["switch_model", "wait", "retry", "contact_admin"], {
-      retry: { label: "重试", onClick: retry },
+      retry: { label: "继续", onClick: retry },
       switch_model: { label: "切换模型", onClick: switchModel },
       contact_admin: { label: "联系管理员", onClick: admin },
     });
-    expect(picked.map((a) => a.label)).toEqual(["切换模型", "重试"]);
+    expect(picked.map((a) => a.label)).toEqual(["切换模型", "继续"]);
     picked[1]!.onClick();
     expect(retry).toHaveBeenCalledTimes(1);
   });
 
   test("没有执行入口的建议不出按钮;同名按钮不重复", () => {
     const go = vi.fn();
-    expect(pickErrorActions(["wait", "check_settings"], { retry: { label: "重试", onClick: go } })).toEqual([]);
-    expect(pickErrorActions(["retry", "retry"], { retry: { label: "从断点继续", onClick: go } }))
-      .toEqual([{ label: "从断点继续", onClick: go }]);
+    expect(pickErrorActions(["wait", "check_settings"], { retry: { label: "继续", onClick: go } })).toEqual([]);
+    expect(pickErrorActions(["retry", "retry"], { retry: { label: "继续", onClick: go } }))
+      .toEqual([{ label: "继续", onClick: go }]);
   });
 });
 

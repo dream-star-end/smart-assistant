@@ -113,6 +113,7 @@ const SERVICE_LABELS: Record<string, string> = {
   zai: "Z.AI",
   bailian: "阿里百炼",
   opencodego: "OpenCode Go",
+  openai: "OpenAI",
 };
 
 export function serviceLabel(service: string): string {

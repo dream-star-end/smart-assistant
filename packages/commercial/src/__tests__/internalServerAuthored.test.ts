@@ -552,6 +552,36 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     assert.equal(applyCalls, 3);
   });
 
+  test("denied waiver proposal ACKs paid tape without refund claim or projection", async () => {
+    const broadcasts: unknown[] = [];
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() { return { applied: "stored" }; },
+        async finalizeLosslessTurnTape() {
+          return { applied: "finalized", recordCount: 1, engineBillings: [] };
+        },
+      },
+      async applyTurnWaiver() {
+        return { disposition: 'denied', reason: 'has_output', waiverId: null,
+          newlyApplied: false, refundedCredits: 0n, recordCount: 0, totalAfter: null, inboxMessageId: null };
+      },
+      broadcastToUser(_uid, payload) { broadcasts.push(payload); },
+    });
+    const { res, rec } = makeRes();
+    await handler(makeReq({ auth: `Bearer ${VALID_TOKEN}`, body: JSON.stringify({
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION, action: "finalize", sessionId: "web-test1",
+      agentId: "main", turnIndex: 1, status: "crashed", turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64), tapeSha256: "e".repeat(64), totalBytes: 1, partCount: 1,
+      waiveReason: "platform_authority_expired", createdAt: 1_783_944_000_000,
+    }) }), res, CTX);
+    assert.equal(rec.status, 200);
+    assert.equal(JSON.parse(rec.body).waived, undefined);
+    assert.equal(JSON.parse(rec.body).inboxMessageId, undefined);
+    assert.deepEqual(broadcasts, []);
+  });
+
   test("records one provider timeout only for a newly finalized exact idle_timeout", async () => {
     const seen = new Set<string>();
     const health: Array<{ model: string; kind: string }> = [];

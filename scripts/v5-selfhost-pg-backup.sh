@@ -15,6 +15,15 @@
 #         (V5SB_FULL_SINK) without touching the local disk. Skipped and
 #         reported as "unconfigured" when no sink is set.
 #
+# Off-host copies (OCV5-600): V5SB_OFFSITE names an executable with the
+# interface of scripts/v5-selfhost-pg-backup-r2.sh. It replaces V5SB_FULL_SINK
+# (setting both is a usage error): `precheck` runs before a full dump (exit 3 =
+# skip, the copy would not fit), the dump streams into `full <name>`, and every
+# verified core dump goes to `core <file>`. A failed core upload keeps the local
+# core result ok and is recorded as the coreOffsite tier. The full tier uses
+# V5SB_FULL_COMPRESS (default V5SB_COMPRESS), the first knob to turn when the
+# off-host bucket runs full.
+#
 # Disk safety (core): refuse to start unless free space after the estimated
 # dump stays >= V5SB_MIN_FREE_GIB; while dumping, a watchdog aborts and
 # deletes the partial file if free space drops below V5SB_ABORT_FREE_GIB.
@@ -27,7 +36,8 @@
 #   v5-selfhost-pg-backup.sh drill [<core dump>]          (restore into a scratch DB, compare, drop)
 #
 # Exit codes: 0 ok (full may be "unconfigured"), 1 failure, 2 usage,
-#             3 skipped or aborted for disk space, 4 another backup holds the lock.
+#             3 skipped or aborted for disk space (or, off-host, for the bucket cap),
+#             4 another backup holds the lock, 5 off-host bucket above its warning line.
 # Non-zero exits trigger openclaude-v5-selfhost-watch-alert@ via OnFailure=.
 set -Eeuo pipefail
 umask 077
@@ -43,10 +53,15 @@ STATUS_FILE="${V5SB_STATUS:-/var/lib/openclaude-v5-selfhost/pg-backup-status.jso
 LOCK_FILE="${V5SB_LOCK:-/run/openclaude-v5-selfhost-pg-backup.lock}"
 DEPLOY_LOCK="${V5SB_DEPLOY_LOCK:-/run/openclaude-v5-selfhost/deploy.lock}"
 DEPLOY_WAIT_SEC="${V5SB_DEPLOY_WAIT_SEC:-3600}"
+# Wait this long for another backup run to finish instead of exiting 4 at once
+# (the weekly full unit sets it: the daily core run may still hold the lock).
+LOCK_WAIT_SEC="${V5SB_LOCK_WAIT_SEC:-0}"
 LARGE_TABLES="${V5SB_LARGE_TABLES:-client_session_turn_tape_records client_session_live_frames client_session_turn_tape_model_records}"
 COMPRESS="${V5SB_COMPRESS:-zstd:3}"
 CORE_EST_DEFAULT_BYTES="${V5SB_CORE_EST_BYTES:-1073741824}"
 FULL_SINK="${V5SB_FULL_SINK:-}"
+OFFSITE="${V5SB_OFFSITE:-}"
+FULL_COMPRESS="${V5SB_FULL_COMPRESS:-$COMPRESS}"
 WATCH_INTERVAL="${V5SB_WATCH_INTERVAL:-2}"
 PG_DUMP="${V5SB_PG_DUMP:-pg_dump}"
 PG_RESTORE="${V5SB_PG_RESTORE:-pg_restore}"
@@ -146,10 +161,14 @@ PY
 wait_deploy_free() {
   local waited=0
   [[ -e "$DEPLOY_LOCK" ]] || return 0
-  # Probe with a shared lock and let go at once: deploy takes it exclusively
-  # (scripts/deploy-v5-selfhost.sh acquire_selfhost_deploy_lock) and polls, so a
-  # momentary probe only delays it by one poll interval at worst.
-  while ! flock -n -s "$DEPLOY_LOCK" true 2>/dev/null; do
+  # Take a shared lock and hold it (fd 7) until the run exits: deploy takes it
+  # exclusively (scripts/deploy-v5-selfhost.sh acquire_selfhost_deploy_lock) and
+  # polls for up to 40 min. A dump holds AccessShareLock on every table and the
+  # migrations set no lock_timeout, so a train that started mid-dump would queue
+  # its DDL behind the dump and every query behind the DDL (OCV5-600); now the
+  # train waits for the backup instead.
+  exec 7<"$DEPLOY_LOCK" || return 1
+  while ! flock -n -s 7 2>/dev/null; do
     if (( waited >= DEPLOY_WAIT_SEC )); then
       return 1
     fi
@@ -157,7 +176,31 @@ wait_deploy_free() {
     sleep 10
     waited=$((waited + 10))
   done
+  write_backup_marker
   return 0
+}
+
+# <deploy lock>.backup names this run while it holds the deploy lock, so deploy
+# and the lease worker can say "the backup holds the lock" and keep waiting
+# instead of timing out (scripts/deploy-v5-selfhost.sh selfhost_backup_lock_holder).
+# pid + /proc starttime guard against PID reuse; removed on exit. Best effort:
+# without the marker deploy just falls back to its plain timeout.
+BACKUP_MARKER=""
+write_backup_marker() {
+  local marker="${DEPLOY_LOCK}.backup" dir tmp st
+  dir="$(dirname -- "$marker")"
+  st=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null) || st=""
+  [[ "$st" =~ ^[0-9]+$ ]] || { log "backup marker skipped: no starttime"; return 0; }
+  tmp="$(mktemp -p "$dir" .deploy.lock.backup.XXXXXX 2>/dev/null)" || { log "backup marker skipped: $dir"; return 0; }
+  printf 'pid=%s starttime=%s tier=%s started=%s\n' "$$" "$st" "$tier" "$(now_iso)" >"$tmp" \
+    && chmod 644 -- "$tmp" && mv -T -- "$tmp" "$marker" || { rm -f -- "$tmp"; log "backup marker skipped"; return 0; }
+  BACKUP_MARKER="$marker"
+  trap drop_backup_marker EXIT
+}
+drop_backup_marker() {
+  [[ -n "$BACKUP_MARKER" && ! -L "$BACKUP_MARKER" ]] || return 0
+  # only our own line: a later run may already have replaced it
+  if grep -q "^pid=$$ " "$BACKUP_MARKER" 2>/dev/null; then rm -f -- "$BACKUP_MARKER"; fi
 }
 
 exclude_args() {
@@ -317,7 +360,26 @@ run_core() {
     log "core status write failed"
     return 1
   fi
+  if [[ -n "$OFFSITE" ]]; then
+    offsite_core "$final" || return $?
+  fi
   return 0
+}
+
+# The local core dump is already verified and recorded; an off-host failure only
+# fails the run (so the unit alerts) and is recorded as its own tier.
+offsite_core() { # <final>
+  local orc=0 result=ok
+  "$OFFSITE" core "$1" || orc=$?
+  case "$orc" in
+    0) ;;
+    3) result=skipped_over_cap ;;
+    5) result=ok_usage_warn ;;
+    *) result=failed ;;
+  esac
+  log "coreOffsite ${result^^} rc=$orc"
+  write_status coreOffsite "$(tier_json "result=$result" "at=$(now_iso)" "file=${1##*/}" "rc=$orc")" || true
+  return "$orc"
 }
 
 # Only names that this script creates are ever deleted: each glob result is
@@ -349,25 +411,57 @@ rotate_core() {
 
 # ── full tier ────────────────────────────────────────────────────────────────
 run_full() {
-  local started name rc dump_rc sink_rc
-  if [[ -z "$FULL_SINK" ]]; then
-    log "full UNCONFIGURED (set V5SB_FULL_SINK to an off-host sink executable)"
+  local started name rc dump_rc sink_rc sink prc=0
+  local -a sink_args=()
+  sink="${OFFSITE:-$FULL_SINK}"
+  if [[ -z "$sink" ]]; then
+    log "full UNCONFIGURED (set V5SB_OFFSITE or V5SB_FULL_SINK to an off-host sink executable)"
     write_status full "$(tier_json result=unconfigured "at=$(now_iso)")"
     return 0
   fi
-  if [[ ! -x "$FULL_SINK" ]]; then
-    log "full FAILED sink not executable: $FULL_SINK"
+  if [[ ! -x "$sink" ]]; then
+    log "full FAILED sink not executable: $sink"
     write_status full "$(tier_json result=sink_missing "at=$(now_iso)" "reason=sink not executable")"
     return 1
   fi
+  if [[ -n "$OFFSITE" ]]; then
+    "$OFFSITE" precheck || prc=$?
+    if (( prc == 3 )); then
+      log "full SKIPPED_OVER_CAP (off-host precheck)"
+      write_status full "$(tier_json result=skipped_over_cap "at=$(now_iso)" "compress=$FULL_COMPRESS")"
+      return 3
+    elif (( prc != 0 )); then
+      log "full FAILED off-host precheck rc=$prc"
+      write_status full "$(tier_json result=failed "at=$(now_iso)" "reason=precheck=$prc")"
+      return 1
+    fi
+    sink_args=(full)
+  fi
   started=$(date +%s)
   name="full-$(date -u +%Y%m%dT%H%M%SZ).dump"
-  log "full start -> sink $name"
+  log "full start -> sink $name compress=$FULL_COMPRESS"
   set +e
-  as_pg "$PG_DUMP" -Fc -Z "$COMPRESS" --no-password -d "$DB" | "$FULL_SINK" "$name"
+  as_pg "$PG_DUMP" -Fc -Z "$FULL_COMPRESS" --no-password -d "$DB" | "$sink" "${sink_args[@]}" "$name"
   local -a st=("${PIPESTATUS[@]}")
   set -e
   dump_rc=${st[0]}; sink_rc=${st[1]}
+  if [[ -n "$OFFSITE" ]]; then
+    # 3: the sink killed its upload at the bucket cap (pg_dump then dies of SIGPIPE).
+    if (( sink_rc == 3 )); then
+      log "full ABORTED_OVER_CAP pg_dump=$dump_rc"
+      write_status full "$(tier_json result=aborted_over_cap "at=$(now_iso)" "compress=$FULL_COMPRESS")"
+      return 3
+    fi
+    # A failed pg_dump still ends the stream normally, so the sink may have stored
+    # a truncated copy: have it dropped.
+    if (( dump_rc != 0 )); then
+      "$OFFSITE" discard-full "$name" || log "full: discard of $name failed"
+    elif (( sink_rc == 5 )); then
+      log "full OK name=$name, off-host bucket above its warning line"
+      write_status full "$(tier_json result=ok "at=$(now_iso)" "file=$name" "usageWarn=1" "durationSec=$(( $(date +%s) - started ))")"
+      return 5
+    fi
+  fi
   rc=$(( dump_rc != 0 || sink_rc != 0 ))
   if (( rc != 0 )); then
     log "full FAILED pg_dump=$dump_rc sink=$sink_rc"
@@ -435,12 +529,14 @@ case "$cmd" in
     exit 0
     ;;
   run|drill) ;;
-  -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
   *) die_usage "unknown command: $cmd" ;;
 esac
 
-for knob in KEEP MIN_FREE_GIB ABORT_FREE_GIB DEPLOY_WAIT_SEC DRILL_FACTOR CORE_EST_DEFAULT_BYTES; do
-  [[ "${!knob}" =~ ^[0-9]+$ ]] || die_usage "$knob must be a non-negative integer"
+[[ -z "$OFFSITE" || -z "$FULL_SINK" ]] || die_usage "set V5SB_OFFSITE or V5SB_FULL_SINK, not both"
+for knob in KEEP MIN_FREE_GIB ABORT_FREE_GIB DEPLOY_WAIT_SEC LOCK_WAIT_SEC DRILL_FACTOR CORE_EST_DEFAULT_BYTES; do
+  # decimal without leading zeros: bash arithmetic reads 08 as octal and fails
+  [[ "${!knob}" =~ ^(0|[1-9][0-9]*)$ ]] || die_usage "$knob must be a non-negative integer"
 done
 (( KEEP >= 1 )) || die_usage "V5SB_KEEP must be >= 1"
 (( ABORT_FREE_GIB <= MIN_FREE_GIB )) || die_usage "V5SB_ABORT_FREE_GIB must be <= V5SB_MIN_FREE_GIB"
@@ -461,8 +557,11 @@ fi
 install -d -m 755 -- "$(dirname -- "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-  log "another pg-backup run holds $LOCK_FILE"
-  exit 4
+  if (( LOCK_WAIT_SEC > 0 )); then log "another pg-backup run holds $LOCK_FILE, waiting up to ${LOCK_WAIT_SEC}s"; fi
+  if (( LOCK_WAIT_SEC == 0 )) || ! flock -w "$LOCK_WAIT_SEC" 9; then
+    log "another pg-backup run holds $LOCK_FILE"
+    exit 4
+  fi
 fi
 
 if [[ "$cmd" == drill ]]; then

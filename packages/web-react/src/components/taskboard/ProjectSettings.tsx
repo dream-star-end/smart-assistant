@@ -2,6 +2,7 @@ import { FolderCog, FolderPlus, Pencil } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
+  type BoardAgent,
   BUILTIN_TEMPLATE_OPTIONS,
   PROJECT_KEY_RE,
   type Project,
@@ -14,6 +15,7 @@ import {
 import type { AuthSession } from '../../lib/types'
 import { Button, Field, IconButton, Input, Textarea, useConfirm, useToast } from '../ui'
 import { PanelSheet } from './PanelSheet'
+import { StageAgentSelect } from './StageAgentSelect'
 
 type Mode = 'create' | 'edit'
 type WorkspaceKind = 'default' | 'isolated' | 'container_path'
@@ -39,6 +41,7 @@ const WORKSPACE_OPTIONS: Array<{ kind: WorkspaceKind; label: string; hint: strin
 
 export function ProjectSettings({
   auth,
+  agents,
   current,
   onCreate,
   onPatch,
@@ -50,6 +53,7 @@ export function ProjectSettings({
   hideTrigger = false,
 }: {
   auth: AuthSession
+  agents?: readonly BoardAgent[]
   current: Project | null
   onCreate: (input: ProjectCreateInput) => Promise<Project | null>
   onPatch: (id: string, input: ProjectPatchInput) => Promise<Project | null>
@@ -78,6 +82,7 @@ export function ProjectSettings({
   const [templateIds, setTemplateIds] = useState<string[]>(() =>
     BUILTIN_TEMPLATE_OPTIONS.map((t) => t.id),
   )
+  const [executionAgentId, setExecutionAgentId] = useState('')
   const [workspaceKind, setWorkspaceKind] = useState<WorkspaceKind>('default')
   const [workspacePath, setWorkspacePath] = useState('')
   const [workspaceError, setWorkspaceError] = useState('')
@@ -98,6 +103,7 @@ export function ProjectSettings({
       setName('')
       setDescription('')
       setTemplateIds(BUILTIN_TEMPLATE_OPTIONS.map((t) => t.id))
+      setExecutionAgentId('')
       setWorkspaceKind('default')
       setWorkspacePath('')
       setWorkspaceError('')
@@ -151,6 +157,10 @@ export function ProjectSettings({
       toast('请填写项目名称', 'error')
       return
     }
+    if (templateIds.length > 0 && !executionAgentId) {
+      toast('请选择新增 AI 阶段的执行助手', 'error')
+      return
+    }
     const spec = workspaceSpecPayload()
     if (!spec) return
     setSaving(true)
@@ -163,6 +173,7 @@ export function ProjectSettings({
         description: description.trim() || null,
         workspaceSpec: spec,
         templateIds: allBuiltin ? undefined : none ? [] : templateIds,
+        ...(none ? {} : { executionAgentId }),
       })
       if (created) close()
     } finally {
@@ -384,6 +395,9 @@ export function ProjectSettings({
             </div>
           </Field>
         )}
+        {mode === 'create' && templateIds.length > 0 && (
+          <StageAgentSelect auth={auth} agents={agents} value={executionAgentId} onValueChange={setExecutionAgentId} />
+        )}
         <div className="flex flex-wrap gap-1">
           {mode === 'create' ? (
             <Button
@@ -392,6 +406,7 @@ export function ProjectSettings({
               variant="primary"
               loading={saving}
               data-testid="project-create-submit"
+              disabled={templateIds.length > 0 && !executionAgentId}
               onClick={() => void submitCreate()}
             >
               创建项目

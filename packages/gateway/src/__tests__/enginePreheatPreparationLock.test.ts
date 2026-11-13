@@ -1,3 +1,4 @@
+import { createServer } from 'node:http'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { preheatRunner, type SessionLifecycleHost } from '../sessionLifecycle.js'
@@ -45,4 +46,39 @@ test('effective effort mismatch under lock skips without changing the runner', a
   clearUnusedPreheats(f.host)
   assert.equal(await preheatRunner.call(f.host, f.session, { ...preparation, effortLevel: 'medium' }), 'started')
   clearUnusedPreheats(f.host)
+})
+
+test('destroying a session during fresh privacy cancels speculative preheat', async () => {
+  const f = fixture()
+  const { promptPrivacyFingerprint } = await import('../promptPrivacyPolicy.js')
+  Object.assign(f.runner, { promptPolicyFingerprint: promptPrivacyFingerprint({ schemaVersion: 1, profile: null }, undefined),
+    setPromptPrivacy() {}, clearPromptPrivacy() {}, assertPromptPrivacyStopped() {} })
+  const priorUrl = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+  const priorToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'synthetic-fixture-only'
+  let respond!: () => void
+  let enter!: () => void
+  const reading = new Promise<void>(resolve => { enter = resolve })
+  const server = createServer((_req, res) => {
+    respond = () => res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }))
+    enter()
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+  try {
+    const work = preheatRunner.call(f.host, f.session, preparation)
+    await reading
+    f.session._plannedTeardown = 'service_restart'
+    await f.runner.shutdown()
+    f.host.sessions.delete(f.session.sessionKey)
+    respond()
+    assert.notEqual(await work, 'started')
+    assert.equal(f.events.includes('preheat'), false)
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    if (priorUrl === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL'); else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = priorUrl
+    if (priorToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN'); else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = priorToken
+    clearUnusedPreheats(f.host)
+  }
 })

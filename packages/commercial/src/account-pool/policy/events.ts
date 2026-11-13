@@ -5,7 +5,7 @@
 
 import { query } from '../../db/queries.js'
 
-export type PoolMemberKind = 'account' | 'relay_key' | 'api_key' | 'box_profile'
+export type PoolMemberKind = 'account' | 'relay_key' | 'api_key' | 'box_profile' | 'remote_profile'
 
 export interface PoolEventInput {
   service: string

@@ -32,6 +32,7 @@ export type ClassifiedErrorCode =
   | 'bad_request'
   | 'auth_error'
   | 'platform_credential_expired'
+  | 'antigravity_start_observation_failed'
   | 'box_capacity_held'
   | 'unknown'
 
@@ -57,6 +58,11 @@ const PATTERNS: Array<{
   code: Exclude<ClassifiedErrorCode, 'unknown'>
   message: string
 }> = [
+  {
+    re: /\bANTIGRAVITY_START_OBSERVATION_FAILED\b|\btimeout waiting for cascade to start running\b/i,
+    code: 'antigravity_start_observation_failed',
+    message: '执行进度同步失败，本轮可能已有操作完成，已停止自动重试。请先核对执行结果，再决定是否继续。',
+  },
   {
     re: /BODY_FIELD_TOO_LARGE|PAYLOAD_TOO_LARGE|BOX_CONTEXT_TOO_LARGE|\bRequest too large\b|本轮资料未能完整处理|这轮资料暂时无法完整处理/i,
     code: 'request_too_large',
@@ -91,7 +97,7 @@ const PATTERNS: Array<{
   {
     re: /\bBOX_CAPACITY_HELD\b/,
     code: 'box_capacity_held',
-    message: '上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。',
+    message: '当前会话在 Box 上的前一步执行仍在收尾，本轮暂时中断；已有进度已保留，请稍后继续。',
   },
   // OCV5-556: the Antigravity relay route of a turn lapsed (404
   // ANTIGRAVITY_ROUTE_EXPIRED), or the CLI ended "successfully" right after an

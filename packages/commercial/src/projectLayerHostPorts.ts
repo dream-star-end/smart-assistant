@@ -372,7 +372,7 @@ export function makeApplyPorts(opts: {
       if (!applyArmed()) throw new Error('apply_disabled')
       const slug = input.slug.endsWith('.md') ? input.slug : `${input.slug}.md`
       const { default: Database } = await import('better-sqlite3')
-      const db = new Database(paths.taskboardDb)
+      const db = new Database(paths.taskboardDb, { timeout: 5000 })
       try {
         const ledger = new ProjectMemoryLedger(db)
         const created = await ledger.createCandidate({
@@ -397,7 +397,7 @@ export function makeApplyPorts(opts: {
     async rejectMemoryCandidate(input) {
       if (!applyArmed()) throw new Error('apply_disabled')
       const { default: Database } = await import('better-sqlite3')
-      const db = new Database(paths.taskboardDb)
+      const db = new Database(paths.taskboardDb, { timeout: 5000 })
       try {
         const ledger = new ProjectMemoryLedger(db)
         const rejected = ledger.reject({

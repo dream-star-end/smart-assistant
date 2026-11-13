@@ -42,22 +42,10 @@ export const PROBE_TIMEOUT_VISIBILITY_MS = 1500;
  *  往往来不及在 1.5s 内回来，探活会 close(4000) 把刚活的链路掐掉，横幅闪「已断线」。*/
 export const VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS = 10_000;
 export const PROBE_TIMEOUT_KEEPALIVE_MS = 10000;
-/** 连接"确认存活"窗口：最近这段时间内收到过 pong 或任意帧即视为链路仍活。thinking-safety
- *  超时判定据此分流——未确认存活=静默死链→强制重连而非误报本轮超时（见 socket.resetThinkingSafety）。*/
-export const LIVENESS_CONFIRM_MS = 45_000;
 /** REST 对账去抖：同一会话 5s 内至多触发一次 syncSession（切回前台/重连成功都会打）。*/
 export const SYNC_DEBOUNCE_MS = 5000;
-/** "近期有过 in-flight"的会话窗口：切回/重连时对账这些会话，追回锁屏期静默丢失的帧。*/
-export const RECENT_INFLIGHT_WINDOW_MS = 15 * 60_000;
 /** keepalive 心跳间隔（websocket.js:2113）。*/
 export const KEEPALIVE_INTERVAL_MS = 30_000;
-/** THINKING_SAFETY 兜底：10min 无新帧才杀 turn（websocket.js:274）。*/
-export const THINKING_SAFETY_MS = 10 * 60_000;
-/** reconcile 'turn_state_unknown' 后临时缩短的 thinking-safety 复检间隔(RFC §4)：server 无法
- *  判定在飞 turn 终态时,把默认 10min 首窗降到 60s,尽快 REST 复检拉回终态/error projection。*/
-export const TURN_STATE_UNKNOWN_SAFETY_MS = 60_000;
-/** 重连后等 replay 先赢，再 REST reconcile 的 grace（websocket.js:284）。*/
-export const RECONNECT_RECONCILE_GRACE_MS = 4000;
 /** reconnect 后延迟启动 drain，让 hello/resume isFinal 先到（websocket.js:2104）。*/
 /** drain 单条 isFinal 安全网（不再当失败判定，只提示，websocket.js:1411）。*/
 export const DRAIN_ISFINAL_SAFETY_MS = 120_000;
@@ -293,7 +281,7 @@ export function emptyTurnNoticeText(
     case "end_turn":
       return "模型本轮主动结束(通常表示它判断不需要再回复或上下文已表达完整)。可继续追问。";
     case "pause_turn":
-      return "模型暂停了本轮(通常因长任务超时),可直接重新发送让它继续。";
+      return "模型暂停了本轮(通常因长任务超时),可在当前会话继续。";
     case "max_tokens":
       return '本轮输出达到 token 上限,内容可能不完整。可让它"继续"。';
     case "refusal":
@@ -407,6 +395,58 @@ export function isRecoveryControlUserTurn(
  * one belongs to a turn this tab may not have adopted as `_sendingInFlight`. */
 export function isRecoveryTurnClientMessageId(value: unknown): value is string {
   return typeof value === "string" && value.startsWith("m-recover-");
+}
+
+/** Server-authored callback turns (`lsc-*` lease callbacks, `dlgcb-*` async
+ * delegate callbacks, `cron-origin-*` origin-session cron injections). */
+export function isSystemCallbackClientMessageId(value: unknown): value is string {
+  return typeof value === "string" && /^(?:lsc-|dlgcb-|cron-origin-)/.test(value);
+}
+
+export type SystemCallbackUserTurnLike = {
+  id?: string;
+  role?: string;
+  text?: string;
+  _systemCallback?: boolean;
+};
+
+/** Identify server-injected callback user turns (both live `_systemCallback`
+ * rows and historical persisted rows with deterministic callback IDs or
+ * `[系统通知 ·` headers). */
+export function isSystemCallbackUserTurn(
+  message: SystemCallbackUserTurnLike | null | undefined,
+): boolean {
+  if (!message || message.role !== "user") return false;
+  if (message._systemCallback === true) return true;
+  if (isSystemCallbackClientMessageId(message.id)) return true;
+  if (typeof message.text === "string" && /^\[系统通知\s*·/.test(message.text.trim())) {
+    return true;
+  }
+  return false;
+}
+
+/** Concise single-line explanation for a server-injected callback turn. */
+export function summarizeSystemCallbackUserTurn(
+  message: SystemCallbackUserTurnLike | null | undefined,
+): string {
+  const id = typeof message?.id === "string" ? message.id : "";
+  const text = typeof message?.text === "string" ? message.text.trim() : "";
+  if (id.startsWith("lsc-") || text.includes("自进化租约列车结果")) {
+    if (/终态:\s*committed\b/.test(text) || text.includes("已上线")) {
+      return "系统回调 · 发布列车已上线";
+    }
+    if (/终态:\s*failed\b/.test(text) || text.includes("未通过") || text.includes("失败")) {
+      return "系统回调 · 发布列车未通过，Agent 正在处理";
+    }
+    return "系统回调 · 发布列车状态已更新";
+  }
+  if (id.startsWith("dlgcb-") || text.includes("子任务已完成") || text.includes("后台子任务")) {
+    return "系统回调 · 后台子任务已返回结果";
+  }
+  if (id.startsWith("cron-origin-") || text.startsWith("⏰")) {
+    return "系统回调 · 定时任务已触发";
+  }
+  return "系统回调 · 系统通知已送达";
 }
 
 /** Walk newest-first to the last user utterance that is not a recovery control row. */
@@ -800,56 +840,56 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   // ── 上游模型服务 ──
   model_capacity: "当前模型访问量较大，请稍后重试，或在上方切换到其他模型立即继续。",
   upstream_failed: "任务执行暂时中断，你的消息已保留，可直接重试。",
-  upstream_timeout: "模型响应超时，你的消息已保留，请重试。",
+  upstream_timeout: "模型响应超时，你的消息已保留，可以在当前会话继续。",
   network_error: "网络波动导致本轮中断，请重试。",
   context_too_long:
-    "本会话内容已超过模型的上下文上限。可以精简这条消息后重发、点击下方按钮在新会话中继续，或在上方切换支持更长上下文的模型。",
+    "本会话内容已超过模型的上下文上限。可以精简这条消息，或在上方切换支持更长上下文的模型后继续。",
   request_too_large: "本轮资料未能完整处理，文件和对话均已保留。",
   bad_request: "这条请求无法被处理，请调整内容后重试。",
   // ── 引擎/平台执行 ──
-  engine_error: "任务执行时遇到内部错误，你的消息已保留，可以直接重试。",
-  internal_error: "服务遇到内部错误，你的消息已保留，请重试。",
-  auth_error: "认证状态异常，本轮未正常完成，请重新尝试。",
-  box_capacity_held: "上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。",
+  engine_error: "任务执行时遇到内部错误，你的消息已保留，可以在当前会话继续。",
+  internal_error: "服务遇到内部错误，你的消息已保留，可以在当前会话继续。",
+  auth_error: "认证状态异常，本轮未正常完成，可以继续。",
+  box_capacity_held: "当前会话在 Box 上的前一步执行仍在收尾，本轮暂时中断；已有进度已保留，请稍后继续。",
+  antigravity_start_observation_failed: "执行进度同步失败，本轮可能已有操作完成，已停止自动重试。请先核对执行结果，再决定是否继续。",
   platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
-  service_restart: "服务正在更新，本轮已中断，请重试。",
-  admission_restart_unexecuted: "本轮尚未开始，消息已保留。自动恢复未完成时，可以重新尝试。",
-  session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
-  session_deleted: "这个会话已被删除。请新建会话继续；在这里重试不会把它找回来。从回收站恢复后即可正常发送。",
-  durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击重试。",
-  // 精确「重试」与兜底「重新尝试」都可能出现(看原消息是否带 _routing),文案不点名按钮。
-  project_context_unavailable: "这个会话所在项目的指令和文件暂时没有加载出来，本轮还没有开始，也不会计费。请稍后用下方按钮重新发送。",
+  service_restart: "服务正在更新，本轮已中断，可以继续。",
+  admission_restart_unexecuted: "本轮尚未开始，消息已保留。自动恢复未完成时，可以在当前会话继续。",
+  session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。可以在当前会话继续。",
+  session_deleted: "这个会话已被删除。请先从回收站恢复，再在原会话继续。",
+  durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击继续。",
+  // 未开始的任务也通过原会话继续，不重放其它任务。
+  project_context_unavailable: "这个会话所在项目的指令和文件暂时没有加载出来，本轮还没有开始，也不会计费。请稍后在原会话继续。",
   stopped: "本轮生成已停止。",
   user_cancelled: "本轮已取消。",
-  runner_crashed: "执行环境意外中断，你的消息已保留，请重试。",
+  runner_crashed: "执行环境意外中断，你的消息已保留，可以在当前会话继续。",
   // ── 免单类(waivable;errorPresentation 走 waiver 分支,此处仅供契约完备 + 兜底展示)──
-  model_authority_expired: "长任务的执行凭证未能继续，本轮不收费，你可以重新尝试。",
+  model_authority_expired: "任务暂时中断，已有进度已保留，可以从断点继续。",
   liveness_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   idle_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   no_response: "任务未能产生有效回复，本轮未扣费。",
   phantom_turn: "任务未能产生有效回复，本轮未扣费。",
-  turn_limit: "任务达到运行上限，系统已中断，本轮不收费。",
+  turn_limit: "任务暂时中断，已有进度已保留，可以从断点继续。",
   // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
   // 拒帧可能发生在回合中途(egress 每请求 fence):停止前已完成的调用已经照常计费,只有被拒的
   // 这一次不计费 —— 文案不能说整轮不计费(2026-10-06 一轮 22 次调用 275 积分后被拒,卡片却写
-  // 「不计费」)。该码 retryable:false,卡片只会落到「重新尝试」兜底按钮,不会出精确「重试」,
-  // 所以按钮名也按实际写。
+  // 「不计费」)。接续保留原内容，不把原任务从头重发。
   model_config_changed_retry_turn:
-    "平台的模型配置刚刚更新，本轮在这里停止。停止前已完成的调用照常计费，被拒的这一次不计费。你的消息没有丢：点「重新尝试」即可原样重发。",
+    "平台的模型配置刚刚更新，本轮在这里停止。停止前已完成的调用照常计费，被拒的这一次不计费。你的消息和已有进度已保留，可以在当前会话继续。",
   // 同一码覆盖：上游满载且明说换模型、grok 路由过期、provider 未配置、catalog 下架（errorClassify OCV5-252）。
   // 文案不能只说「已下架/未开通」——满载是最常见来源，那样写会误导用户以为模型被撤了。
   model_not_available: "这个模型暂时接不了这条请求（可能是上游满载，也可能已下架或未对你的账号开通），请在上方切换一个模型后重发。",
   unresolved_agent_model: "没能确定本轮要用的模型，请在上方选择模型后重发。",
-  model_authority_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
-  model_catalog_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
+  model_authority_unavailable: "模型配置正在同步，请稍后在当前会话继续。",
+  model_catalog_unavailable: "模型配置正在同步，请稍后在当前会话继续。",
   unauthorized_model: "当前账号尚未开通这个模型，请切换模型或联系管理员。",
   // ── 连接/环境 ──
   unauthorized: "登录状态已失效，请重新登录后继续。",
   maintenance: "服务正在维护中，请稍后再试。",
   conn_kicked: "连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。",
   // 运行环境已重建:必须**刷新页面**,重试无效(allowPublicServerMessage:服务端 message 指路)。
-  container_outdated: "运行环境已更新，请刷新页面后重新发送（直接重试不会生效）。",
-  err_container: "运行环境出现异常，你的消息已保留，请重试。",
+  container_outdated: "运行环境已更新，请刷新页面后在当前会话继续。",
+  err_container: "运行环境出现异常，你的消息已保留，可以在当前会话继续。",
   err_container_timeout: "运行环境响应超时，请重试。",
   err_internal: "服务遇到内部错误，请重试。",
   forbidden: "该操作被拒绝，请检查后重试。",
@@ -868,7 +908,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   codex_route_unavailable: "模型服务暂时不可用，你的消息已保留，请稍后重试。",
   codex_container_recycled: "环境已重建，请刷新页面后重发。",
   codex_billing: "计费服务暂时不可用，本轮未开始，请稍后重试。",
-  upstream_error: "模型服务暂时不可用，你的消息已保留，请重试。",
+  upstream_error: "模型服务暂时不可用，你的消息已保留，可以在当前会话继续。",
 };
 
 /** 未知码的通用兜底正文(契约测试据此判定「某码是否漏配正文」)。 */

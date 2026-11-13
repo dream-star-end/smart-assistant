@@ -48,7 +48,7 @@
       "mediaKey": "chat-basics",
       "mediaVersion": 5,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "c4140cdab1f09f1e439ec93f817d22d20b8f0f5959ef1976452030459ba3cbd7"
+      "sourceHash": "2158c0bac9cf4cd42865d6fb9fe448dfa517238b119ecbc54a5b3bbbf8f3acde"
     },
     "connectors": {
       "contentHash": "60d53be82da147122f4fef4ea5028d7e02e59148ab15b9454ee7aa933f45a874",
@@ -98,7 +98,7 @@
       "mediaKey": "github-repository",
       "mediaVersion": 2,
       "registryHash": "d2a4d08cdbe9fe8f304ce573f8c818d55007b22f60680c6f5225b59cfc4b6d40",
-      "sourceHash": "a0c22540edeba6a551077ada754075407af494ff5e9abe84903c444a4fe74656"
+      "sourceHash": "04b6ea9dabe641d429a76addd037b5e0b7499c05fc3fdde2dbe5634e9529641f"
     },
     "image-create-edit": {
       "contentHash": "c540c520a658661ef339bdcdea74c6c8d6b7681ae4786a8c109fc9c54b0a6026",
@@ -118,7 +118,7 @@
       "mediaKey": "inbox",
       "mediaVersion": 2,
       "registryHash": "a8a5a10f6db81c8adae5e129d9df1b6d8165d09edcbab9c7ac845ae833303d15",
-      "sourceHash": "8687c33af096bff05e3f114ecbe43ca9b3c4f843037fff1ecca6ec3232137b18"
+      "sourceHash": "196b0a015e658e4b7569972325c1ef340d6f8899198a2cf36c597af117b5764d"
     },
     "marketplace-discovery": {
       "contentHash": "77a9027ba94ce27285b8d2f7c14c6a572b62582f5d986c89a2605ee9567cd4e4",
@@ -158,7 +158,7 @@
       "mediaKey": "models-reasoning",
       "mediaVersion": 3,
       "registryHash": "05d9024636c1060f19b7670c735a8a5bc39bf7dfdacd83a719260e898df68ee2",
-      "sourceHash": "2c672e714556d505f3d41e42cdeb7a9c4c67648ff859787e7a5e7bb0b71501b8"
+      "sourceHash": "3b0deeb7eb7246be5838cb242cca928d4d0b361140725da1cefb921a4ee7d398"
     },
     "organization": {
       "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",
@@ -178,7 +178,7 @@
       "mediaKey": "preferences",
       "mediaVersion": 3,
       "registryHash": "9a662d9d6595c781fa875671bb70a66ae61ff227dc525572656b91e00f631bc2",
-      "sourceHash": "8bbe4989646fcffa0a9bad4c2fc4a629419f669d8c4d4feda2a9ad856356063a"
+      "sourceHash": "09ec5ff15aca815b9e634880a7f801975a07405ce1f47ede6d0c54bbe344649f"
     },
     "schedules-reminders": {
       "contentHash": "164865232cfa3a5371747255c55b87bba9f651ad1086938847fc770fa8e181e0",

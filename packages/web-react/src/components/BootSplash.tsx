@@ -21,7 +21,7 @@ function stageAt(elapsed: number): 0 | 1 | 2 {
   return elapsed >= BOOT_STALL_HINT_MS ? 2 : elapsed >= BOOT_SLOW_HINT_MS ? 1 : 0;
 }
 
-export function BootSplash() {
+export function BootSplash({ slowHint = "网络较慢，正在加载…" }: { slowHint?: string } = {}) {
   const [since] = useState(() => {
     // First splash of the page: count from navigation start, unless it only shows up much later
     // (a lazy chunk long after boot) — then count from now.
@@ -47,7 +47,7 @@ export function BootSplash() {
       <Spinner size={22} />
       {stage >= 1 && (
         <p className="text-meta text-faint" data-testid="boot-slow-hint">
-          网络较慢，正在加载…
+          {slowHint}
         </p>
       )}
       {stage >= 2 && (
@@ -56,7 +56,7 @@ export function BootSplash() {
           onClick={() => window.location.reload()}
           className="rounded-full px-3 py-1 text-meta text-muted underline-offset-2 hover:text-fg hover:underline [@media(hover:none)]:min-h-11"
         >
-          仍在加载？刷新重试
+          继续
         </button>
       )}
     </output>

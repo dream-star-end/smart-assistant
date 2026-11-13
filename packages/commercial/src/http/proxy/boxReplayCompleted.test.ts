@@ -132,3 +132,36 @@ for (const completed of [false, true]) {
     if (result.kind === "pending") assert.equal(result.identity, identity);
   });
 }
+
+test("only non-stream fallback reports proven failure, optional diagnostic is opaque", async () => {
+  const input = { uid: 3n, canonicalModel: body.model, canonicalBody: body,
+    upstreamModel: message.model };
+  let failures = 0;
+  const failure = { uid: 3n, requestId: "failed-http", accountId: 20n,
+    runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), proof: {
+      runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), keeperPid: 1, cliPid: 2,
+      reason: "worker_failed" as const, revision: 2 as const, workerExitCode: 1 } };
+  const deps = { journal: { findReplayIdentity: async () => null,
+    findSettledFailure: async () => { failures++; return failure; } },
+    readMessage: async () => { throw new Error("must not read"); },
+    readFailureDiagnosticId: async () => "bdiag_" + "a".repeat(24) };
+  assert.deepEqual(await findCompletedBoxReplay(input, deps), { kind: "missing" });
+  assert.equal(failures, 0, "stream reopen semantics unchanged");
+  const fallback = { ...input, canonicalBody: { ...body, stream: false } as unknown as ProxyBody };
+  assert.deepEqual(await findCompletedBoxReplay(fallback, deps), { kind: "failed",
+    code: "BOX_REPLAY_FAILED", diagnosticId: "bdiag_" + "a".repeat(24) });
+  for (const [proof, expected] of [
+    [{ ...failure.proof, revision: 1, reason: "keeper_stopped" }, "BOX_REPLAY_STOPPED"],
+    [{ ...failure.proof, revision: 1, reason: "worker_complete" }, "BOX_REPLAY_RESULT_REJECTED"],
+  ] as const) {
+    const result = await findCompletedBoxReplay(fallback, { ...deps,
+      journal: { ...deps.journal, findSettledFailure: async () => ({ ...failure, proof } as never) } });
+    assert.equal(result.kind, "failed");
+    if (result.kind === "failed" && "code" in result) assert.equal(result.code, expected);
+  }
+  for (const readFailureDiagnosticId of [async () => "SECRET /tmp/run", async () => {
+    throw new Error("SECRET"); }]) {
+    assert.deepEqual(await findCompletedBoxReplay(fallback, { ...deps, readFailureDiagnosticId }),
+      { kind: "failed", code: "BOX_REPLAY_FAILED" });
+  }
+});

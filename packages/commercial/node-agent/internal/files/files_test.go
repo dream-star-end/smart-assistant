@@ -9,6 +9,9 @@ package files
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseOwner(t *testing.T) {
@@ -1030,5 +1034,147 @@ func TestHandlePut_PostRenameParentUnsafe_500_PathDiverged(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "PATH_DIVERGED") {
 		t.Fatalf("body should contain PATH_DIVERGED, got %q", rec.Body.String())
+	}
+}
+
+func TestReadCapConstants(t *testing.T) {
+	if MaxReadSize != 1<<30 {
+		t.Fatalf("MaxReadSize = %d", MaxReadSize)
+	}
+	if MaxFileSize != 200<<20 {
+		t.Fatalf("MaxFileSize = %d", MaxFileSize)
+	}
+}
+
+func TestAssembleTwoParts(t *testing.T) {
+	dir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, dir)
+	defer cleanup()
+	chownOrig := chownFile
+	chownFile = func(f *os.File, uid, gid int) error { return nil }
+	t.Cleanup(func() { chownFile = chownOrig })
+
+	id := strings.Repeat("ab", 16)
+	if err := os.WriteFile(filepath.Join(dir, ".part-"+id+"-0"), []byte("hello "), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".part-"+id+"-1"), []byte("world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	q := url.Values{}
+	q.Set("dir", dir)
+	q.Set("id", id)
+	q.Set("count", "2")
+	q.Set("ext", "txt")
+	q.Set("expected", "11")
+	q.Set("mode", "644")
+	q.Set("owner_uid", "1000")
+	q.Set("owner_gid", "1000")
+	req := httptest.NewRequest(http.MethodPost, "/files/assemble?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleAssemble(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+	var body assembleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("hello world"))
+	want := hex.EncodeToString(sum[:])
+	if body.Sha256 != want || body.Size != 11 {
+		t.Fatalf("got %+v want %s", body, want)
+	}
+	if _, err := os.Stat(filepath.Join(dir, want+".txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".part-"+id+"-0")); !os.IsNotExist(err) {
+		t.Fatalf("part 0 still present: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".part-"+id+"-1")); !os.IsNotExist(err) {
+		t.Fatalf("part 1 still present: %v", err)
+	}
+}
+
+func TestAssembleMissingPart(t *testing.T) {
+	dir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, dir)
+	defer cleanup()
+	id := strings.Repeat("cd", 16)
+	if err := os.WriteFile(filepath.Join(dir, ".part-"+id+"-0"), []byte("only"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	q := url.Values{}
+	q.Set("dir", dir)
+	q.Set("id", id)
+	q.Set("count", "2")
+	q.Set("ext", "bin")
+	q.Set("expected", "4")
+	req := httptest.NewRequest(http.MethodPost, "/files/assemble?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleAssemble(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "MISSING_PART") {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReadCapRejectsGetAndStatButNotPut(t *testing.T) {
+	dir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, dir)
+	defer cleanup()
+	orig := maxReadSize
+	maxReadSize = 4
+	t.Cleanup(func() { maxReadSize = orig })
+
+	target := filepath.Join(dir, "five.bin")
+	q := url.Values{}
+	q.Set("path", target)
+	q.Set("mode", "644")
+	req := httptest.NewRequest(http.MethodPut, "/files?"+q.Encode(), bytes.NewReader([]byte("hello")))
+	rec := httptest.NewRecorder()
+	(&Handler{}).handlePut(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PUT status %d body %s", rec.Code, rec.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/files?path="+url.QueryEscape(target), nil)
+	getRec := httptest.NewRecorder()
+	(&Handler{}).handleGet(getRec, getReq)
+	if getRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("GET status %d body %s", getRec.Code, getRec.Body.String())
+	}
+
+	statReq := httptest.NewRequest(http.MethodGet, "/files/stat?path="+url.QueryEscape(target), nil)
+	statRec := httptest.NewRecorder()
+	(&Handler{}).handleStat(statRec, statReq)
+	if statRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("STAT status %d body %s", statRec.Code, statRec.Body.String())
+	}
+}
+
+func TestSweepStalePartsKeepsUploadParts(t *testing.T) {
+	dir := t.TempDir()
+	id := strings.Repeat("a", 32)
+	part := filepath.Join(dir, ".part-"+id+"-0")
+	if err := os.WriteFile(part, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(dir, ".tmp-asm-"+strings.Repeat("b", 32))
+	if err := os.WriteFile(tmp, []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(part, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(tmp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	sweepStaleParts(dir)
+	if _, err := os.Stat(part); err != nil {
+		t.Fatalf("upload part was removed: %v", err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("assemble temp still present: %v", err)
 	}
 }

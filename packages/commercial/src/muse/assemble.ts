@@ -79,6 +79,7 @@ export async function createMuseFromConfig(
     },
     ...(prices.image > 0 || prices.video > 0 ? { billing: createMuseBilling(pool, prices) } : {}),
     orphanGraceMs: (cfg.OC_MUSE_ORPHAN_GRACE_SEC ?? 0) * 1000,
+    fallbackHatch: cfg.OC_MUSE_BOX_EXEC_FALLBACK_HATCH === true,
     videoBackend: parseMuseVideoBackend(cfg.OC_MUSE_VIDEO_BACKEND),
     boxExecRunner:
       cfg.OC_MUSE_BOX_EXEC_UID && cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID

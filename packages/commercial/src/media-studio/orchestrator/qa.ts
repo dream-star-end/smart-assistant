@@ -3,7 +3,7 @@
 // one-image Grok vision call sees, the prompt, strict parsing and the verdict. runQa (execute.ts)
 // does the IO.
 
-import sharp from 'sharp'
+import sharp, { type OverlayOptions } from 'sharp'
 import { z } from 'zod'
 
 import type { BibleEntry, ShotSpecForPrompt } from './prompts.js'
@@ -338,7 +338,7 @@ export async function contactSheet(
   const refSize = refs.length ? Math.min(400, Math.floor(mainH / refs.length)) : 0
   const width = mainW + (refs.length ? refSize + 16 : 0)
   const height = Math.max(mainH, refSize * refs.length)
-  const layers: sharp.OverlayOptions[] = []
+  const layers: OverlayOptions[] = []
   const candidateLabels: string[] = []
   for (const [i, c] of candidates.entries()) {
     const left = (i % grid) * cell

@@ -95,6 +95,8 @@ export const TURN_ERROR_TAXONOMY = {
   bad_request: { retryable: false, cta: 'none' },
 
   // ── 引擎/平台执行 ────────────────────────────────────────
+  // CLI observer failure does not prove that model/tools did not execute.
+  antigravity_start_observation_failed: { retryable: false, cta: 'none' },
   engine_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   internal_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   auth_error: { retryable: false, cta: 'relogin' },
@@ -296,7 +298,8 @@ function recordsShowProgress(records: readonly unknown[], tokenKey: RegExp,
     }
     if (
       role === 'tool' || row.kind === 'tool_use' || row.type === 'tool_use' ||
-      row.kind === 'tool_result' || row.type === 'tool_result'
+      row.kind === 'tool_result' || row.type === 'tool_result' ||
+      row._leftoverTruncated === true
     ) {
       progressed = true
       return
@@ -350,6 +353,17 @@ export function allowUnsafeAutomaticCheckpoint(input: {
   leftoverBacked: boolean
   records: readonly unknown[]
 }): boolean {
+  if (
+    input.records.some(
+      (r) =>
+        Boolean(r) &&
+        typeof r === 'object' &&
+        !Array.isArray(r) &&
+        (r as Record<string, unknown>)._leftoverTruncated === true,
+    )
+  ) {
+    return false
+  }
   if (modelPlaneFailureAfterSettledTools(input.errorCode, input.records)) return true
   if (hasMeaningfulAutomaticRecoveryProgress(input.records)) return false
   if (input.status === 'completed') return true

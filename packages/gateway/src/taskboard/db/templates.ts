@@ -19,6 +19,7 @@ import {
   nowMs,
 } from './schema.js'
 import {
+  type BuiltinExecutionOptions,
   type BuiltinPipelineTemplate,
   builtinTemplateId,
   getBuiltinPipelineTemplate,
@@ -93,7 +94,7 @@ function snapshotFromBuiltin(t: BuiltinPipelineTemplate): PipelineTemplate {
       toolsets: null,
       effort: s.effort,
       patrolCron: s.kind === 'ai' ? t.patrolCron : null,
-      patrolEnabled: s.kind === 'ai',
+      patrolEnabled: s.kind === 'ai' && !!s.agentId,
       patrolTimezone: 'Asia/Shanghai',
       quietHoursStart: t.quietHoursStart,
       quietHoursEnd: t.quietHoursEnd,
@@ -179,14 +180,14 @@ function getCustomTemplate(db: TaskboardDb, idOrSlug: string): PipelineTemplate 
   return row ? mapCustom(row) : null
 }
 
-export function getTemplate(db: TaskboardDb, idOrSlug: string): PipelineTemplate | null {
-  const builtin = getBuiltinPipelineTemplate(idOrSlug)
+export function getTemplate(db: TaskboardDb, idOrSlug: string, options: BuiltinExecutionOptions = {}): PipelineTemplate | null {
+  const builtin = getBuiltinPipelineTemplate(idOrSlug, options)
   if (builtin) return snapshotFromBuiltin(builtin)
   return getCustomTemplate(db, idOrSlug)
 }
 
-export function listTemplates(db: TaskboardDb): PipelineTemplate[] {
-  const builtins = listBuiltinPipelineTemplates().map(snapshotFromBuiltin)
+export function listTemplates(db: TaskboardDb, options: BuiltinExecutionOptions = {}): PipelineTemplate[] {
+  const builtins = listBuiltinPipelineTemplates(options).map(snapshotFromBuiltin)
   const rows = db
     .prepare(
       `SELECT id, slug, name, ticket_type, stages_json, created_at, updated_at
@@ -282,7 +283,7 @@ export interface ApplyTemplateResult {
   skippedStages: number
 }
 
-export interface ApplyTemplateOptions {
+export interface ApplyTemplateOptions extends BuiltinExecutionOptions {
   asDefault?: boolean
 }
 
@@ -361,8 +362,8 @@ export function applyTemplate(
 ): ApplyTemplateResult {
   const builtinType = parseBuiltinTemplateId(templateId)
   if (builtinType) {
-    const template = snapshotFromBuiltin(getBuiltinPipelineTemplate(builtinType)!)
-    const seeded = seedDefaultPipelines(db, projectId, [builtinType])
+    const template = snapshotFromBuiltin(getBuiltinPipelineTemplate(builtinType, opts)!)
+    const seeded = seedDefaultPipelines(db, projectId, [builtinType], opts)
     const pid = `${projectId}.pipeline.${builtinType}`
     return {
       template,
@@ -385,6 +386,7 @@ export function applyTemplates(
   db: TaskboardDb,
   projectId: string,
   templateIds: string[],
+  options: ApplyTemplateOptions = {},
 ): ApplyTemplateResult[] {
-  return templateIds.map((id) => applyTemplate(db, id, projectId))
+  return templateIds.map((id) => applyTemplate(db, id, projectId, options))
 }

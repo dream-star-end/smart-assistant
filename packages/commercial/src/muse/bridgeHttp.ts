@@ -2,6 +2,7 @@
 //
 //   POST /api/muse-bridge/v1/hello
 //   POST /api/muse-bridge/v1/poll                         (long-poll, ≤ POLL_HOLD_SEC)
+//   GET  /api/muse-bridge/v1/jobs/:id/sources/:n         (after ack; supports Range)
 //   POST /api/muse-bridge/v1/jobs/:id/heartbeat           (first one = ack barrier)
 //   GET  /api/muse-bridge/v1/jobs/:id/sources/:n          (bridge >= 0.5, after the ack; Range)
 //   PUT  /api/muse-bridge/v1/jobs/:id/files/:idx/chunks/:n
@@ -19,6 +20,7 @@
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { parseByteRange as parseHttpByteRange } from '@openclaude/gateway'
 
 import { REQUEST_ID_HEADER, ensureRequestId, sendJson, setSecurityHeaders } from '../http/util.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
@@ -88,22 +90,15 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<Record<
   return v as Record<string, unknown>
 }
 
-/**
- * One `bytes=a-b` / `bytes=a-` range within `size`; null for no Range header. Anything else
- * (several ranges, suffix ranges, out of bounds) is 416: the bridge only ever asks for one.
- */
+/** Shared HTTP range syntax, with Muse's fail-closed 416 contract for invalid ranges. */
 export function parseByteRange(
   header: string | undefined,
   size: number,
 ): { start: number; end: number } | null {
   if (header === undefined) return null
-  const m = /^bytes=(\d+)-(\d*)$/.exec(header.trim())
-  const start = m ? Number(m[1]) : Number.NaN
-  const end = m && m[2] !== '' ? Math.min(Number(m[2]), size - 1) : size - 1
-  if (!m || !Number.isSafeInteger(start) || start >= size || end < start) {
-    throw new MuseError(416, 'RANGE_NOT_SATISFIABLE', 'range not satisfiable')
-  }
-  return { start, end }
+  const range = parseHttpByteRange(header, size)
+  if (!range) throw new MuseError(416, 'RANGE_NOT_SATISFIABLE', 'range not satisfiable')
+  return range
 }
 
 function sendErr(res: ServerResponse, err: MuseError, requestId: string): void {
@@ -250,10 +245,18 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
         deps.hub.requireAssignment(src[1]!, nonce, sessionId)
         const source = deps.hub.source(src[1]!, nonce, Number(src[2]))
         const size = source.data.length
-        const range = parseByteRange(req.headers.range, size)
+        let range: ReturnType<typeof parseByteRange>
+        try {
+          range = parseByteRange(req.headers.range, size)
+        } catch (err) {
+          if (err instanceof MuseError && err.status === 416) {
+            res.setHeader('Content-Range', `bytes */${size}`)
+          }
+          throw err
+        }
         const body = range ? source.data.subarray(range.start, range.end + 1) : source.data
         res.statusCode = range ? 206 : 200
-        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Type', source.mime)
         res.setHeader('Content-Length', String(body.length))
         res.setHeader('Accept-Ranges', 'bytes')
         res.setHeader('Cache-Control', 'no-store')

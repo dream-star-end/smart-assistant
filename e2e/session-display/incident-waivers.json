@@ -379,6 +379,66 @@
       "reason": "Muse jobs were failed when the VM bridge process restarted on its half-hour schedule. The fix requeues the same job id with a new nonce and still charges only on success. Locked by museBridge unit tests and the bridge stop test. proofPending is already at its ceiling, so this does not open a new incident id.",
       "approvedBy": "user t1519u, 2026-11-01 grok-muse-bridge: fix jobs that fail across the Muse bridge reconnect; do not touch the VM; commercial release still needs a separate steward confirm",
       "expiresAt": "2026-12-01"
+    },
+    {
+      "commit": "a05e6277a3bf1f89a8a63bbcdd9ce797cd0f10c7",
+      "reason": "OCV5-619: remove GPT Image 2 hard daily >=10 enforce in reserveImageUsage; credits + in-flight lock remain. Cherry-picked from aurora 2896189a6 onto selfhost without image2Run/ImageStudio (paths absent). Not an incident fix.",
+      "approvedBy": "user/steward t1006u-t1007u 2026-10-26 media reverse-sync + full two-tree sync Batch0; standing personal green→merge OK after Grok OD",
+      "expiresAt": "2026-11-26"
+    },
+    {
+      "commit": "e76500624fa00f8133744421e28b7b62777ab8dd",
+      "reason": "OCV5-729: codex 委派注入 master 签发 provider route，并在 route 缺失时 fail-closed。这是委派路由功能修复（Codex CLI 0.159.2 后裸起必然失败），不是 turn 展示/红卡/重试事故修复；只增加 provider override 与 503 门，不改 runner、tape、session 展示。Antigravity 同源问题已拆出未实施。",
+      "approvedBy": "user 2026-11-04 OCV5-729 委派任务：实施 codex 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "2bfc755bc13dbf8d405a0609994a810cba7dd3b9",
+      "reason": "OCV5-738: 委派到 antigravity 引擎时由 master 签发 relay route（mint/renew/release），并把 settle/abandon 对账并入同一 requestId。属于委派路由功能修复，不是 turn 展示/红卡/重试事故修复；只新增 selfhost-only 内部端点、route 透传与 503 fail-closed，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务：实施 antigravity 委派 route 修复、commit+push+开 PR 到 feat/v5-selfhost；明确不合并、不部署、不重启服务",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "16f62434694c4cf0d01e07afd966025edcb242a6",
+      "reason": "OCV5-738: 修复 PR #1373 独立审计发现的 4 项委派 Antigravity 计费守恒问题（external_billing 权威终态、冻结价格快照结算、暂不可结算回退重试、并发 mint 互斥）与 2 项清理 warning。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "94a039f8ea3476a5493e9571a1f9817c5f417679",
+      "reason": "OCV5-738: 修复 PR #1373 第 2 轮独立审计指出的 liveExternalBilling TS 控制流收窄与跨实例并发 mint 持久化回查兜底及单测。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "e6f57268fc06b7e8705c8f4651b8b6a31fc4f944",
+      "reason": "OCV5-738: 保持 DurableCodexBilling.terminalCode 与 OutboundCodexBilling 窄类型一致，将 Antigravity 专属 terminalCode 扩宽收敛到 DelegateEngineBillingSettlePayload，消除 inboundDispatch.ts(2123) 类型冲突。属于新功能 PR 合入前审查修复，不改 runner、tape、会话展示。",
+      "approvedBy": "user 2026-11-04 OCV5-738 委派任务与交接统筹授权",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "7eecab3d67066ae00905a9f806f33d0c4c71b76b",
+      "reason": "OCV5-741: 修复 Box 空闲压缩 selectIdlePreserve 保留非落盘 attachment 导致 applyIdleTranscript 抛 IDLE_ARTIFACT_MISSING 死锁，以及 writeSettledIdleOp 覆写刷新 mtime 导致 10 分钟 IDLE_APPLY_STUCK_MS 兜底失效。属于后台空闲压缩修复，不改会话展示或错误卡。",
+      "approvedBy": "user 2026-11-04 webmw1rclzbt1ckvm 拍板建单修复两个代码 Bug",
+      "expiresAt": "2026-12-04"
+    },
+    {
+      "commit": "adad1823aff5f0fe0851e51a4afed1a5ff2cc5cb",
+      "reason": "服务端注入会话回调（cronOrigin / lease_callback）在 executeCronOriginInject 认领分发后广播带 cronOrigin 元数据的 outbound.ack，并在 getClientSessionPartial 增量拉取时附带 openDispatch，使在线浏览器无需刷新即可实时建立活跃回合与订阅流；同时前端将回调消息渲染为居中单行灰字系统通知（点击展开原始回执）。属于回调实时同步与展示形态优化，不改计费或历史落盘数据。",
+      "approvedBy": "user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」",
+      "expiresAt": "2026-12-05"
+    },
+    {
+      "commit": "ae3b77946db724b6b53b717aceeb5506213158c0",
+      "reason": "OCV5-721 远程模型池提交 ae3b77946（remote_pool 目录投影、多目录 profile、SSH 密码引导）以 fix(v5) 前缀推送但漏写 Incident trailer；已推送到共享 feat/v5-selfhost，不可改写。属于远程模型池功能开发，不对应会话展示/错误卡事故。仅豁免该完整 SHA。",
+      "approvedBy": "user 2026-11-06 webmw49pf18atbm96 选择「给这一个提交加例外后发布」",
+      "expiresAt": "2026-12-06"
+    },
+    {
+      "commit": "de3ca8e4c1a801499aa771172924af06f09d0c8d",
+      "reason": "OCV5-746 Codex 远端容器侧提交 de3ca8e4c（同一准入只认领一次原生线程边界）以 fix(v5) 前缀推送但漏写 Incident trailer；已推送到共享 feat/v5-selfhost，不可改写。修的是开发中自测发现、从未上线的问题，不对应任何线上事故。仅豁免该完整 SHA。",
+      "approvedBy": "user 2026-11-08 webmw4oodqfrsmx3n 选择「登记单提交例外」",
+      "expiresAt": "2026-12-08"
     }
   ]
 }

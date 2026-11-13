@@ -2636,6 +2636,10 @@ async function handleLosslessTurnTapeRequest(args: {
             reason: body.waiveReason,
             logger: args.userLog,
           });
+          if (waiverResult.disposition === 'deferred' && !settlementHandoff) {
+            sendJsonError(args.res, 503, "TURN_WAIVER_PENDING", "authoritative zero-output proof pending", args.requestId);
+            return;
+          }
         } catch (err) {
           args.userLog.error("lossless_turn_waiver_apply_failed", {
             tapeId: body.tapeId,
@@ -2706,7 +2710,7 @@ async function handleLosslessTurnTapeRequest(args: {
         idempotent: result.applied === "idempotent",
         recordCount: result.recordCount,
         ...(settlementHandoff ? { settlementHandoff: true } : {}),
-        ...(waiverResult
+        ...(waiverResult && waiverResult.disposition !== 'denied' && waiverResult.disposition !== 'deferred'
           ? {
               waived: true,
               refundedCredits: waiverResult.refundedCredits.toString(),

@@ -45,6 +45,7 @@ export type ConfirmOpts = {
   altText?: string;
   /** 危险操作(删除类):确认钮红色。 */
   danger?: boolean;
+  confirmDisabled?: boolean;
 };
 
 export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, ReactNode] {
@@ -76,7 +77,7 @@ export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, Re
       }}
       onOpenAutoFocus={(e) => {
         e.preventDefault();
-        const target = opts?.danger ? cancelRef : confirmRef;
+        const target = opts?.danger || opts?.confirmDisabled ? cancelRef : confirmRef;
         target.current?.focus();
       }}
       title={zhPunct(opts?.title)}
@@ -86,13 +87,14 @@ export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, Re
             {zhPunct(opts?.cancelText) ?? "取消"}
           </Button>
           {opts?.altText ? (
-            <Button variant="secondary" onClick={() => settle("alt")}>
+            <Button variant="secondary" disabled={opts.confirmDisabled} onClick={() => settle("alt")}>
               {zhPunct(opts.altText)}
             </Button>
           ) : null}
           <Button
             ref={confirmRef}
             variant={opts?.danger ? "danger" : "primary"}
+            disabled={opts?.confirmDisabled}
             onClick={() => settle(true)}
           >
             {zhPunct(opts?.confirmText) ?? "确定"}

@@ -139,12 +139,15 @@ export async function fetchPlatformFlash(
   const fallback = staticRouteFallback("opencodego", String(input.body.model ?? ""));
   const fallbackKey = fallback ? platformFlashFallbackKey : undefined;
   if (input.goKey) {
+    // 调用方传的是 catalog id;Go 只认自己的上游名(旧名已下线 → 400 且不回落)。
+    const model = String(input.body.model ?? "");
+    const goModel = getStaticProvider("opencodego").upstreamModelForRequest?.(model) ?? model;
     try {
       const res = await fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
         ...input.init,
         method: "POST",
         headers: openCodeGoAuthHeaders(input.goKey, input.accept),
-        body: JSON.stringify(input.body),
+        body: JSON.stringify({ ...input.body, model: goModel }),
       });
       const unusable = res.status === 401 || res.status === 402 || res.status === 403
         || res.status === 429 || res.status >= 500;

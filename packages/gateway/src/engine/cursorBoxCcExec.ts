@@ -52,6 +52,17 @@ export function isBoxInteractiveCatalogModel(model: string | undefined): boolean
   return isBoxClaudeCatalogModel(model) || isBoxGptWebCatalogModel(model)
 }
 
+/** Container MCP files cannot be used on the Box. Preserve the exact
+ * gateway-authored no-write builtin policy and close ambient remote MCPs. */
+export function boxReadOnlyClaudeArgs(argv: readonly string[]): string[] {
+  const index = argv.indexOf('--tools')
+  if (index < 0) return []
+  if (argv[index + 1] !== 'Read,Glob,Grep' || !argv.includes('--strict-mcp-config')) {
+    throw new Error('BOX_ADVISOR_READ_ONLY_POLICY_INVALID')
+  }
+  return ['--tools', 'Read,Glob,Grep', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}']
+}
+
 /** Official stream-json argv that is safe to run inside the box.
  * Container paths (--add-dir, --settings, --mcp-config, prompt files) are dropped. */
 export function remoteClaudeArgs(argv: readonly string[]): string[] {
@@ -76,7 +87,7 @@ export function remoteClaudeArgs(argv: readonly string[]): string[] {
       out.push('--dangerously-skip-permissions')
     }
   }
-  return out
+  return [...out, ...boxReadOnlyClaudeArgs(argv)]
 }
 
 /** End the Claude that reads one fifo: the process whose stdin is that path.

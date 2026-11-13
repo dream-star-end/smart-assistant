@@ -38,6 +38,7 @@ import { query, tx } from '../db/queries.js'
 import { REFRESH_TOKEN_TTL_SECONDS, issueRefresh, refreshTokenHash, signAccess } from './jwt.js'
 import { hashPassword } from './passwords.js'
 import { claimRegistrationIpSlot } from './registrationIpCap.js'
+import { validClientIp } from './clientIp.js'
 import {
   lockRefreshFamily,
   lockRefreshUsers,
@@ -124,6 +125,8 @@ export interface SocialLoginDeps {
   bindIp?: string
   /** 真实客户端 IP(ctx.clientIp),只在新建账号时写 users.registration_ip 并计入同 IP 上限 */
   registrationIp: string | undefined
+  /** 真实客户端 IP(refresh_tokens.client_ip)。缺省 null，不回落到 bindIp。 */
+  clientIp?: string | null
   /** 测试可注入 now(秒) */
   now?: () => number
   accessTtlSeconds?: number
@@ -435,9 +438,9 @@ export async function socialLoginOrCreate(
       }
     }
     await client.query(
-      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), TRUE)`,
-      [current.user_id, refresh.hash, deps.userAgent ?? null, deps.bindIp ?? null, refresh.expires_at],
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at, remember_me)
+       VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), TRUE)`,
+      [current.user_id, refresh.hash, deps.userAgent ?? null, deps.bindIp ?? null, validClientIp(deps.clientIp), refresh.expires_at],
     )
     return {
       userId: current.user_id,

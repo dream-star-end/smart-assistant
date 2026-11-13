@@ -152,7 +152,7 @@ describe("selectUpstreamRoute", () => {
       assert.equal(flash.kind, "static");
       if (flash.kind === "static") {
         assert.equal(flash.provider.id, "opencodego");
-        assert.equal(flash.upstreamModel, "deepseek-v4-flash");
+        assert.equal(flash.upstreamModel, "deepseek-v4.1-flash");
       }
     }
   });
@@ -776,7 +776,7 @@ describe("Kimi 3.1 Pro exact thinking-only transport", () => {
 // ─── OpenCode Go signature-bound history retention ─────────────────────
 
 describe("pickUpstream — OpenCode Go DeepSeek Flash canonical + compatibility alias", () => {
-  test("平台 id 统一，upstream id 不变；两种入站字面量均使用 x-api-key /messages", async () => {
+  test("平台 id 统一，upstream 用 Go 现役名；两种入站字面量均使用 x-api-key /messages", async () => {
     for (const model of ["deepseek-v4-flash", "deepseek-v4-flash-opencode-go"]) {
       const route = selectUpstreamRoute(model);
       const sched = makeScheduler({});
@@ -788,7 +788,7 @@ describe("pickUpstream — OpenCode Go DeepSeek Flash canonical + compatibility 
       );
       assert.equal(res.ok, true);
       if (!res.ok) continue;
-      assert.equal(res.session.upstreamModel, "deepseek-v4-flash");
+      assert.equal(res.session.upstreamModel, "deepseek-v4.1-flash");
       assert.equal(res.session.endpoint, "https://opencode.ai/zen/go/v1/messages");
       const headers: Record<string, string> = {};
       res.session.applyUpstreamAuth(headers, bodyFor(model), log);

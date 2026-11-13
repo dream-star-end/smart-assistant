@@ -340,16 +340,16 @@ function PreviewFallback({
       <p className="text-body font-medium text-fg">{title}</p>
       {hint && <p className="max-w-[36ch] text-meta text-muted">{hint}</p>}
       <div className="flex flex-wrap items-center justify-center gap-2">
-        <Button size="sm" variant="secondary" onClick={onDownload}>
+        {onRetry && (
+          <Button size="sm" variant="secondary" onClick={onRetry}>
+            <RotateCcw size={13} aria-hidden />
+            继续
+          </Button>
+        )}
+        <Button size="sm" variant={onRetry ? "ghost" : "secondary"} onClick={onDownload}>
           <Download size={14} aria-hidden />
           下载
         </Button>
-        {onRetry && (
-          <Button size="sm" variant="ghost" onClick={onRetry}>
-            <RotateCcw size={13} aria-hidden />
-            重试
-          </Button>
-        )}
         {onPreviewAnyway && (
           <Button size="sm" variant="ghost" onClick={onPreviewAnyway}>
             仍要预览

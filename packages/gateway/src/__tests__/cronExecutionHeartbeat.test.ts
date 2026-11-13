@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 /**
  * OCV5-188 C / D1: cron execution-scope heartbeat tests.
  *
@@ -12,7 +13,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { EventEmitter } from 'node:events'
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, it } from 'node:test'
 import { stringify as stringifyYaml } from 'yaml'
@@ -979,7 +979,8 @@ async function assertDestroyBarrier(
   }
 }
 
-class HangRunner extends EventEmitter {
+class HangRunner extends MinimalPrivacyRunner {
+  readonly submitted = deferred()
   lastActivityAt = Date.now()
   isRunning = true
   pendingToolCalls = 0
@@ -995,6 +996,8 @@ class HangRunner extends EventEmitter {
 
   async start() {
     this.isRunning = true
+
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
   }
   interrupt() {
     this.emit('message', {
@@ -1006,11 +1009,16 @@ class HangRunner extends EventEmitter {
     })
     return true
   }
-  async shutdown() {}
+  async shutdown() {
+    this.isRunning = false
+  }
   clearSessionId() {}
   async waitForOutputDrain() {}
   async submit() {
-    // Return immediately so SessionManager can arm the 15s liveness timer.
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
+    // CcbAdapter installs the turn's result route before calling this method.
+    this.submitted.resolve()
     // The turn stays open until a result event or interrupt.
   }
 }
@@ -1067,7 +1075,7 @@ async function waitForLivenessTimer(
 }
 
 describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner (not model E2E)', () => {
-  it('non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires', { timeout: 15_000 }, async () => {
+  it('silence trips idle while waiting and active turns continue beyond 12h/24h', { timeout: 15_000 }, async () => {
     const origNow = Date.now
     const origSetInterval = globalThis.setInterval
     const origClearInterval = globalThis.clearInterval
@@ -1112,11 +1120,9 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
           if (e.kind === 'error') errors.push(String(e.error))
         }).finally(() => { settled = true })
         const timer = await waitForLivenessTimer(timers, fileP)
-        // The watchdog arms before async turn reservation installs persistence.
-        // Wait for that real boundary before advancing the injected clock.
-        for (let i = 0; i < 80 && typeof session._persistActiveTurn !== 'function'; i++) {
-          await new Promise((resolve) => setTimeout(resolve, 25))
-        }
+        // The watchdog arms before async turn preparation finishes. Wait until
+        // the real adapter can receive synthetic results before moving time.
+        await fileRunner.submitted.promise
         assert.equal(typeof session._persistActiveTurn, 'function', 'file work starts only after turn persistence is ready')
         now += 2 * IDLE_TIMEOUT_TOOL_MS
         session.runner.lastActivityAt = now
@@ -1163,6 +1169,7 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
         if (e?.kind === 'error') idleEvents.push(String(e.error))
       })
       const idleTimer = await waitForLivenessTimer(timers, idleP)
+      await idleRunner.submitted.promise
       now += IDLE_TIMEOUT_TOOL_MS + 1
       idleTimer.fn()
       await idleP
@@ -1183,8 +1190,9 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       waitRunner = new HangRunner()
       waitRunner.lastActivityAt = now
       const waitSession = makeCcbSession(waitRunner, 'agent:main:cron:dm:wait-wd:test')
+      let waitingForUserInput = true
       Object.defineProperty(waitSession.runner, 'waitingForUserInput', {
-        get: () => true,
+        get: () => waitingForUserInput,
         configurable: true,
       })
       let waitSettled = false
@@ -1196,6 +1204,7 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
           waitSettled = true
         })
       const waitTimer = await waitForLivenessTimer(timers, waitP)
+      await waitRunner.submitted.promise
       const started = now
       now += 2 * 60 * 60_000
       waitTimer.fn()
@@ -1203,18 +1212,23 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       const waitingSettledAfter2h = waitSettled
       assert.equal(waitSettled, false, 'waiting turn must not idle-timeout at 2h')
       assert.equal(waitEvents.length, 0)
-      now = started + AUTHORITY_TURN_MAX_LIFETIME_MS
+      for (const elapsed of [AUTHORITY_TURN_MAX_LIFETIME_MS, 2 * AUTHORITY_TURN_MAX_LIFETIME_MS]) {
+        now = started + elapsed
+        waitTimer.fn()
+        await new Promise((r) => setImmediate(r))
+        assert.equal(waitSettled, false, 'waiting has no total wall-clock deadline')
+      }
+      waitingForUserInput = false
+      waitRunner.lastActivityAt = now
       waitTimer.fn()
-      await waitP
-      assert.ok(
-        waitEvents.some((msg) => msg.includes('12 小时') || msg.includes('上限')),
-        `12h hard limit must still fire while waiting, got ${JSON.stringify(waitEvents)}`,
-      )
+      await new Promise((r) => setImmediate(r))
+      assert.equal(waitSettled, false, 'a live turn also continues beyond 24h')
+      assert.equal(waitEvents.length, 0)
       const expected = {
         layer: 'session-manager-submit',
         idleTripped: true,
         waitingSkips2h: true,
-        hardLimitAt12h: true,
+        hardLimitAt12h: false,
         waitingSettledAfter2h: false,
       }
       const actual = {
@@ -1229,6 +1243,11 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       assert.equal(actual.waitingSkips2h, expected.waitingSkips2h)
       assert.equal(actual.hardLimitAt12h, expected.hardLimitAt12h)
       assert.equal(actual.waitingSettledAfter2h, expected.waitingSettledAfter2h)
+      waitRunner.emit('message', {
+        type: 'result', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 },
+        is_error: false, stop_reason: 'end_turn',
+      })
+      await waitP
     } finally {
       try {
         fileRunner?.interrupt()

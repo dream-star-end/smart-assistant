@@ -1,5 +1,7 @@
+import { scanUploadReferenceRows, hydrateUploadReferenceMessages, UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_MS, UPLOAD_REFERENCE_MAX_ROWS, type UploadReferenceRow } from '@openclaude/storage';
 import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
 import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
+import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
 import type { CcbNativeTranscriptArchive, CcbTranscriptRestoreBinding, CcbNativeRestoreTape } from '@openclaude/protocol';
 // pgSessionsBackend — master 会话权威六表的 **PostgreSQL 实现**(RFC-v5-sessions-pg,P2)。
@@ -48,7 +50,8 @@ import { recoverAdmissionAfterRestart, reconcileAdmissionRestarts, type Admissio
 import { createHash, randomUUID } from "node:crypto";
 import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gzipSync } from "node:zlib";
+import { expandHydratedRuntimeBatch, type HydratedRuntimeBatchDescriptor } from "./runtimeBatch.js";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
@@ -270,6 +273,7 @@ import {
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
 import {
+  isLeftoverRecoveryRecordsTruncated,
   sessionTurnHasSuccessfulUsage,
   loadLeftoverRecoveryRecords,
   mergeTapeAndLeftoverRecoveryAssessment,
@@ -748,7 +752,7 @@ function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
   };
 }
 
-async function readPgChatProject(
+export async function readPgChatProject(
   queryable: Pick<Pool | PoolClient, "query">,
   userId: string,
   id: string,
@@ -1542,6 +1546,17 @@ export interface PgSessionsBackendOptions {
       pauseReason: string | null;
     },
   ) => void | Promise<void>;
+  /** Runs after a delete tx commits, without waiting: deletion never depends on what it frees. */
+  onClientSessionsDeleted?: (userId: string, sessionIds: readonly string[]) => void | Promise<void>;
+}
+
+function notifySessionsDeleted(
+  callback: PgSessionsBackendOptions["onClientSessionsDeleted"],
+  userId: string | undefined,
+  sessionIds: readonly string[],
+): void {
+  if (!callback || !userId || sessionIds.length === 0) return;
+  try { void Promise.resolve(callback(userId, sessionIds)).catch(() => {}); } catch { /* best-effort */ }
 }
 
 type GoalUsageChange = { userId: string; sessionId: string };
@@ -2256,12 +2271,13 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
     !replayOverSyntheticCheckpoint &&
-    !allowUnsafeAutomaticCheckpoint({
-      status,
-      errorCode,
-      leftoverBacked: assessment.leftoverBacked,
-      records: [...recoveryRecords, ...leftoverRecords],
-    })
+    (isLeftoverRecoveryRecordsTruncated(leftoverRecords) ||
+      !allowUnsafeAutomaticCheckpoint({
+        status,
+        errorCode,
+        leftoverBacked: assessment.leftoverBacked,
+        records: [...recoveryRecords, ...leftoverRecords],
+      }))
   ) {
     return done(declined("checkpoint_unsafe", errorCode));
   }
@@ -2816,134 +2832,7 @@ function hydrateTapeRecord(
   );
 }
 
-export type HydratedRuntimeBatchDescriptor = {
-  batchId: string;
-  logicalCount: number;
-  manifestSha256: string;
-};
-
-function expandHydratedRuntimeBatch(
-  hydrated: MessageLike,
-  row: HydratedTapeRow,
-  anchor: MessageLike,
-): { messages: MessageLike[]; descriptor?: HydratedRuntimeBatchDescriptor } {
-  const rawBatch = hydrated._runtimeEventBatch;
-  if (rawBatch === undefined) return { messages: [hydrated] };
-  if (!rawBatch || typeof rawBatch !== "object" || Array.isArray(rawBatch)) {
-    throw new Error(`[pgSessions] lossless runtime batch malformed: ${row.tape_id}\0${row.msg_id}`);
-  }
-  const batch = rawBatch as Record<string, unknown>;
-  const manifest = batch.manifest;
-  const logicalCount = batch.logicalCount;
-  const uncompressedBytes = batch.uncompressedBytes;
-  const compressedBytes = batch.compressedBytes;
-  const manifestSha256 = batch.manifestSha256;
-  const data = batch.data;
-  if (
-    batch.version !== 1 ||
-    batch.encoding !== "gzip+base64" ||
-    !Array.isArray(manifest) ||
-    typeof logicalCount !== "number" || !Number.isSafeInteger(logicalCount) || logicalCount < 1 ||
-    manifest.length !== logicalCount ||
-    typeof uncompressedBytes !== "number" || !Number.isSafeInteger(uncompressedBytes) || uncompressedBytes < 0 ||
-    typeof compressedBytes !== "number" || !Number.isSafeInteger(compressedBytes) || compressedBytes < 0 ||
-    typeof manifestSha256 !== "string" || !LOSSLESS_TURN_TAPE_SHA256_RE.test(manifestSha256) ||
-    typeof data !== "string" || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)
-  ) {
-    throw new Error(`[pgSessions] lossless runtime batch header invalid: ${row.tape_id}\0${row.msg_id}`);
-  }
-  if (sha256Bytes(Buffer.from(JSON.stringify(manifest), "utf8")) !== manifestSha256) {
-    throw new Error(`[pgSessions] lossless runtime batch manifest hash mismatch: ${row.tape_id}\0${row.msg_id}`);
-  }
-  const compressed = Buffer.from(data, "base64");
-  if (compressed.length !== compressedBytes) {
-    throw new Error(`[pgSessions] lossless runtime batch compressed length mismatch: ${row.tape_id}\0${row.msg_id}`);
-  }
-  let raw: Buffer;
-  try {
-    raw = gunzipSync(compressed);
-  } catch (err) {
-    throw new Error(
-      `[pgSessions] lossless runtime batch gzip invalid: ${row.tape_id}\0${row.msg_id}: ${(err as Error).message}`,
-    );
-  }
-  if (raw.length !== uncompressedBytes) {
-    throw new Error(`[pgSessions] lossless runtime batch raw length mismatch: ${row.tape_id}\0${row.msg_id}`);
-  }
-
-  const messages: MessageLike[] = [];
-  let expectedOffset = 0;
-  for (let index = 0; index < manifest.length; index++) {
-    const value = manifest[index];
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(`[pgSessions] lossless runtime batch manifest entry invalid: ${row.tape_id}\0${row.msg_id}\0${index}`);
-    }
-    const entry = value as Record<string, unknown>;
-    const id = entry.id;
-    const eventOrdinal = entry.eventOrdinal;
-    const ts = entry.ts;
-    const source = entry.source;
-    const offset = entry.offset;
-    const length = entry.length;
-    const payloadSha256 = entry.payloadSha256;
-    if (
-      typeof id !== "string" || id.length === 0 ||
-      typeof eventOrdinal !== "number" || !Number.isSafeInteger(eventOrdinal) || eventOrdinal < 0 ||
-      typeof ts !== "number" || !Number.isSafeInteger(ts) || ts < 0 ||
-      (source !== "ccb" && source !== "codex-jsonrpc" && source !== "gateway") ||
-      typeof offset !== "number" || !Number.isSafeInteger(offset) || offset !== expectedOffset ||
-      typeof length !== "number" || !Number.isSafeInteger(length) || length < 0 ||
-      typeof payloadSha256 !== "string" || !LOSSLESS_TURN_TAPE_SHA256_RE.test(payloadSha256) ||
-      offset + length > raw.length
-    ) {
-      throw new Error(`[pgSessions] lossless runtime batch manifest entry invalid: ${row.tape_id}\0${row.msg_id}\0${index}`);
-    }
-    const payloadBytes = raw.subarray(offset, offset + length);
-    expectedOffset += length;
-    if (sha256Bytes(payloadBytes) !== payloadSha256) {
-      throw new Error(`[pgSessions] lossless runtime batch record hash mismatch: ${row.tape_id}\0${id}`);
-    }
-    let payload: MessageLike;
-    try {
-      const parsed = JSON.parse(payloadBytes.toString("utf8"));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
-      payload = parsed as MessageLike;
-    } catch (err) {
-      throw new Error(
-        `[pgSessions] lossless runtime batch record malformed: ${row.tape_id}\0${id}: ${(err as Error).message}`,
-      );
-    }
-    if (
-      payload.id !== id || payload.role !== "runtime-event" || payload.ts !== ts ||
-      payload._ocEventOrdinal !== eventOrdinal || payload._runtimeSource !== source
-    ) {
-      throw new Error(`[pgSessions] lossless runtime batch record identity mismatch: ${row.tape_id}\0${id}`);
-    }
-    messages.push({
-      ...payload,
-      _source: "server",
-      _turnTapeId: row.tape_id,
-      _turnTapeMsgId: id,
-      _turnTapePhysicalMsgId: row.msg_id,
-      _turnTapeOrdinal: row.ordinal,
-      _turnTapeSha256: row.tape_sha256,
-      _turnTapeExpanded: true,
-      ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
-      ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
-    });
-  }
-  if (expectedOffset !== raw.length) {
-    throw new Error(`[pgSessions] lossless runtime batch manifest coverage mismatch: ${row.tape_id}\0${row.msg_id}`);
-  }
-  const batchUsage = hydrated.usage && typeof hydrated.usage === "object"
-    ? hydrated.usage
-    : undefined;
-  if (batchUsage && messages.length > 0) messages.at(-1)!.usage = batchUsage;
-  return {
-    messages,
-    descriptor: { batchId: row.msg_id, logicalCount, manifestSha256 },
-  };
-}
+export type { HydratedRuntimeBatchDescriptor } from "./runtimeBatch.js";
 
 /** Raw continuity uses the same immutable batch validators as normal tape reads. */
 export function readCcbNativeRestoreArchive(pool: Pool | PoolClient, owner: string,
@@ -5047,6 +4936,7 @@ async function hydrateTurnTapeMessages(
     /** Private runner continuity view: hydrate every user-visible semantic
      * fact, but still skip thinking and opaque audit envelopes. */
     engineContext?: boolean;
+    uploadReferenceMaxBytes?: number;
   } = {},
 ): Promise<MessageLike[]> {
   const refs = messages.filter(
@@ -5121,6 +5011,7 @@ async function hydrateTurnTapeMessages(
     headsByTape.set(head.tape_id, list);
   }
 
+  let uploadReferenceBytes = options.uploadReferenceMaxBytes;
   const hydrated = messages.flatMap((anchor): MessageLike[] => {
     const tapeId = typeof anchor._turnTapeId === "string" ? anchor._turnTapeId : null;
     const tapeSha256 = typeof anchor._turnTapeSha256 === "string" ? anchor._turnTapeSha256 : null;
@@ -5182,7 +5073,12 @@ async function hydrateTurnTapeMessages(
           hydrateTapeRecord(row, anchor, false, anchor._turnTapeComplete === true),
           row,
           anchor,
+          uploadReferenceBytes,
         );
+        if (uploadReferenceBytes !== undefined) {
+          uploadReferenceBytes -= Buffer.byteLength(JSON.stringify(result.messages));
+          if (uploadReferenceBytes <= 0) throw new Error("upload reference expanded tape exceeds budget");
+        }
         expanded.push(...result.messages);
         if (result.descriptor) batchDescriptors.push(result.descriptor);
       }
@@ -8216,7 +8112,7 @@ async function readTapeRecordPayloadChunkImpl(
 }
 
 async function readUserMessagePayloadImpl(
-  pool: Pool,
+  pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
   msgId: string,
@@ -8937,6 +8833,70 @@ export function createPgSessionsBackend(
   const backend: PgSessionsBackend = {
     recoverInterruptedAdmission: (id) => admissionRestartDeps
       ? recoverAdmissionAfterRestart(pool, id, admissionRestartDeps) : Promise.resolve(false),
+    async scanRecentClientSessionMessages(opts, visit) {
+      try {
+        return await withTimelineSnapshot(pool, async client => {
+          let remainingRows = Math.min(opts.maxRows ?? UPLOAD_REFERENCE_MAX_ROWS, UPLOAD_REFERENCE_MAX_ROWS);
+          const deadline = Date.now() + Math.min(opts.maxMs ?? UPLOAD_REFERENCE_MAX_MS, UPLOAD_REFERENCE_MAX_MS);
+          const timeout = async () => {
+            const ms = deadline - Date.now();
+            if (ms <= 0) throw new Error("upload reference scan deadline");
+            await client.query("SELECT set_config('statement_timeout', $1, true)", [`${ms}ms`]);
+          };
+          async function* bodies(): AsyncGenerator<UploadReferenceRow> {
+            await timeout();
+            await client.query(`DECLARE upload_reference_rows NO SCROLL CURSOR FOR
+              SELECT id AS "sessionId", user_id AS "userId",
+                     CASE WHEN octet_length(messages::text) < $3 THEN messages::text ELSE NULL END AS messages
+                FROM client_sessions WHERE last_at >= $1 AND deleted_at IS NULL AND ($2::text IS NULL OR user_id = $2)
+              UNION ALL
+              SELECT s.id AS "sessionId", s.user_id AS "userId",
+                     CASE WHEN octet_length(c.messages::text) < $3 THEN c.messages::text ELSE NULL END AS messages
+                FROM client_session_archive_chunks c JOIN client_sessions s ON s.id = c.session_id AND s.user_id = c.user_id
+               WHERE s.last_at >= $1 AND s.deleted_at IS NULL AND ($2::text IS NULL OR s.user_id = $2)`,
+              [opts.sinceMs, opts.userId, Math.min(opts.maxBytes ?? UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_BYTES)]);
+            for (;;) {
+              await timeout();
+              const row = (await client.query<UploadReferenceRow>("FETCH FORWARD 1 FROM upload_reference_rows")).rows[0];
+              if (!row) return;
+              if (--remainingRows < 0) throw new Error("upload reference row budget");
+              yield row;
+            }
+          }
+          return scanUploadReferenceRows(bodies(), visit, opts, async (row, messages, bytes) => {
+            await timeout();
+            return hydrateUploadReferenceMessages(messages, bytes, {
+              tapeBytes: async ids => {
+                const rows = (await client.query<{ bytes: string; records: string }>(`
+                  SELECT SUM(octet_length(r.payload))::text AS bytes, COUNT(*)::text AS records
+                    FROM client_session_turn_tapes t JOIN client_session_turn_tape_records r
+                      ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+                   WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
+                     AND t.materialization_status='complete' AND t.finalized_at IS NOT NULL
+                     AND t.record_payload_bytes>0 AND t.physical_record_count>0 AND t.logical_record_count>0
+                   GROUP BY t.tape_id,t.record_payload_bytes,t.physical_record_count
+                  HAVING SUM(octet_length(r.payload))=t.record_payload_bytes AND COUNT(*)=t.physical_record_count`,
+                  [row.sessionId, row.userId, ids])).rows;
+                if (rows.length !== ids.length) throw new Error("upload reference tape metadata missing");
+                for (const row of rows) {
+                  const count = Number(row.records);
+                  if (!Number.isSafeInteger(count) || count <= 0 || (remainingRows -= count) < 0) throw new Error("upload reference tape row budget");
+                }
+                return rows.map(r => Number(r.bytes));
+              },
+              tapes: async (raw, budget) => {
+                await timeout();
+                return hydrateTurnTapeMessages(client, row.sessionId, row.userId, raw, { view: "exact", uploadReferenceMaxBytes: budget });
+              },
+              user: async (id, budget) => {
+                await timeout();
+                return readUserMessagePayloadImpl(client, row.sessionId, row.userId, id, 0, budget);
+              },
+            });
+          });
+        });
+      } catch { return false; }
+    },
     async commitVisibleLosslessTurnTape(
       userId: string,
       request: LosslessTurnTapeVisibleRequest,
@@ -9193,12 +9153,13 @@ export function createPgSessionsBackend(
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
                 !replayOverSyntheticCheckpoint &&
-                !allowUnsafeAutomaticCheckpoint({
-                  status: finalized.status,
-                  errorCode: finalizedErrorCode,
-                  leftoverBacked: assessment.leftoverBacked,
-                  records: [...records, ...leftoverRecords],
-                })
+                (isLeftoverRecoveryRecordsTruncated(leftoverRecords) ||
+                  !allowUnsafeAutomaticCheckpoint({
+                    status: finalized.status,
+                    errorCode: finalizedErrorCode,
+                    leftoverBacked: assessment.leftoverBacked,
+                    records: [...records, ...leftoverRecords],
+                  }))
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
               }
@@ -10277,16 +10238,6 @@ export function createPgSessionsBackend(
           assertRecoveryUsageFallback(turn.payload.usage, sourceUsage);
         }
 
-        // The marker and terminal materialization commit (or roll back)
-        // together. Settlement uses the same advisory key, so after this
-        // transaction becomes visible it cannot create a new debit.
-        if (request.waiveReason !== undefined) {
-          await ensurePendingTurnWaiverInTransaction(client, {
-            userId: billingUserId!,
-            turnKey: request.turnKey,
-            reason: request.waiveReason,
-          });
-        }
         const goalTokensUsed = computeGoalTokensUsed(turn.payload);
 
         type PendingTapeCost = {
@@ -10567,6 +10518,17 @@ export function createPgSessionsBackend(
             request.tapeId,
           ],
         );
+        // A header is only a waiver proposal. New long-task fences require
+        // the fully verified canonical records and pending engine usage above.
+        // This still shares the terminal transaction and exact billing lock:
+        // zero-output fence and finalized tape become visible together.
+        if (request.waiveReason !== undefined) {
+          await ensurePendingTurnWaiverInTransaction(client, {
+            userId: billingUserId!,
+            turnKey: request.turnKey,
+            reason: request.waiveReason,
+          });
+        }
         if (tape.settlement_hash !== null && tape.settlement_hash !== canonicalSettlementHash) {
           await client.query(
             `UPDATE turn_tape_settlement_jobs
@@ -11964,6 +11926,7 @@ export function createPgSessionsBackend(
             isPartial: false,
             archivedCount,
             archivedThroughSeq,
+            ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
             ...(await readPermissionPromptsForSession(
               queryable,
               row.id,
@@ -12019,6 +11982,7 @@ export function createPgSessionsBackend(
         isPartial,
         archivedCount,
         archivedThroughSeq,
+        ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
         ...(await readPermissionPromptsForSession(
           queryable,
           row.id,
@@ -12243,7 +12207,7 @@ export function createPgSessionsBackend(
     // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
     async deleteClientSession(id: string, userId?: string): Promise<boolean> {
       const now = Date.now();
-      return withTx(pool, async (client): Promise<boolean> => {
+      const deleted = await withTx(pool, async (client): Promise<boolean> => {
         // updated_at 逻辑版本推进(软删也让并发 stale PUT 因版本落后被拒)。deleted_at 仍是删除权威。
         const sql = userId
           ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
@@ -12268,18 +12232,14 @@ export function createPgSessionsBackend(
         // raced with deletion and financial/audit history remains attributable.
         return true;
       });
+      if (deleted) notifySessionsDeleted(options.onClientSessionsDeleted, userId, [id]);
+      return deleted;
     },
 
     async renameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
       const now = Date.now();
-      const row = (
-        await pool.query<{ updated_at: string }>(
-          `UPDATE client_sessions SET title = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-             WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL RETURNING updated_at`,
-          [title, id, userId],
-        )
-      ).rows[0];
-      return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
+      const result = await withTx(pool, client => patchSessionMetadataInTx(client, id, userId, { title }));
+      return { ok: result.ok, updatedAt: result.ok ? result.updatedAt : now };
     },
 
     async setClientSessionModel(id: string, userId: string, modelId: string): Promise<{ ok: boolean; updatedAt: number }> {
@@ -12296,62 +12256,10 @@ export function createPgSessionsBackend(
       return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
     },
 
-    async patchClientSessionMeta(
-      id: string,
-      userId: string,
-      patch: ClientSessionMetaPatch,
-    ): Promise<PatchClientSessionMetaResult> {
-      return withTx(pool, async (client) => {
-        const ownedSession = (
-          await client.query(
-            "SELECT 1 FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            [id, userId],
-          )
-        ).rows[0];
-        if (!ownedSession) return { ok: false, error: "not_found" };
-        if (patch.projectId !== undefined && patch.projectId !== null) {
-          const owned = (
-            await client.query(
-              "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-              [patch.projectId, userId],
-            )
-          ).rows[0];
-          if (!owned) return { ok: false, error: "project_not_found" };
-        }
-        const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
-        const params: unknown[] = [];
-        let n = 1;
-        if (patch.title !== undefined) {
-          sets.push(`title = $${n++}`);
-          params.push(patch.title);
-        }
-        if (patch.modelId !== undefined) {
-          sets.push(`model_id = $${n++}`);
-          params.push(patch.modelId);
-        }
-        if (patch.projectId !== undefined) {
-          sets.push(`project_id = $${n++}`);
-          params.push(patch.projectId);
-        }
-        if (patch.pinned !== undefined) {
-          sets.push(`pinned = $${n++}`);
-          params.push(patch.pinned ? 1 : 0);
-        }
-        if (patch.archived !== undefined) {
-          sets.push(`archived_at = $${n++}`);
-          params.push(patch.archived ? Date.now() : null);
-        }
-        params.push(id, userId);
-        const row = (
-          await client.query<{ updated_at: string }>(
-            `UPDATE client_sessions SET ${sets.join(", ")}
-              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL
-              RETURNING updated_at`,
-            params,
-          )
-        ).rows[0];
-        if (!row) return { ok: false, error: "not_found" };
-        return { ok: true, updatedAt: bigIntNum(row.updated_at, "updated_at") };
+    async patchClientSessionMeta(id: string, userId: string, patch: ClientSessionMetaPatch): Promise<PatchClientSessionMetaResult> {
+      return withTx(pool, async client => {
+        const result = await patchSessionMetadataInTx(client, id, userId, patch);
+        return result.ok ? { ok: true, updatedAt: result.updatedAt } : result;
       });
     },
 
@@ -12623,7 +12531,8 @@ export function createPgSessionsBackend(
       if ("ok" in parsed) return parsed;
       const { ids, action } = parsed;
       if (ids.length === 0) return { ok: true, updated: 0, skipped: 0, operationId: parsed.operationId };
-      return withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
+      const deletedIds: string[] = [];
+      const batch = await withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
         if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
           const staleIds: string[] = [];
           const liveRows = (
@@ -12692,6 +12601,7 @@ export function createPgSessionsBackend(
             await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
             await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
             await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+            deletedIds.push(id);
             updated++;
           }
         } else if (action === "archive") {
@@ -12771,6 +12681,8 @@ export function createPgSessionsBackend(
         }
         throw err;
       });
+      if (batch.ok && action === "delete") notifySessionsDeleted(options.onClientSessionsDeleted, userId, deletedIds);
+      return batch;
     },
 
     async markClientSessionRead(userId: string, sessionId: string): Promise<MarkClientSessionReadResult> {

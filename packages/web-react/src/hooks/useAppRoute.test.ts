@@ -128,6 +128,25 @@ describe('教程 URL 深链', () => {
     expect(closed.get('campaign')).toBe('summer')
   })
 
+  it('tab=blog 是经验分享页签；文章详情 community=<id> 与它同在（OCV5-577）', () => {
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=blog'))).toBe('blog')
+    const detail = new URLSearchParams('panel=help&tab=blog&community=42')
+    expect(parseTutorialTab(detail)).toBe('blog')
+    expect(parseTutorialCommunity(detail)).toBe('42')
+    // 没有 tab=blog 的 community 仍是教程工作室。
+    expect(parseTutorialTab(new URLSearchParams('panel=help&community=42'))).toBeNull()
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=blog&topic=chat-basics'))).toBeNull()
+
+    const list = withPanelParams(new URLSearchParams('campaign=summer'), 'help', null, null, null, { tab: 'blog' })
+    expect(list.get('tab')).toBe('blog')
+    const article = withPanelParams(list, 'help', null, null, '42', { tab: 'blog' })
+    expect(article.get('tab')).toBe('blog')
+    expect(article.get('community')).toBe('42')
+    expect(article.get('campaign')).toBe('summer')
+    const studio = withPanelParams(article, 'help', null, null, '42', { tab: null })
+    expect(studio.has('tab')).toBe(false)
+  })
+
   it('tab= 只认 start / cases 且只在 help 下生效；案例展厅是默认态不写参数（TU-17）', () => {
     expect(parseTutorialTab(new URLSearchParams('panel=help&tab=start'))).toBe('start')
     expect(parseTutorialTab(new URLSearchParams('panel=help&tab=cases'))).toBe('cases')

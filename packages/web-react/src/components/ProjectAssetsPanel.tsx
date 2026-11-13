@@ -15,6 +15,7 @@ import { useSignedDownload } from "./chat/media";
 import { formatBytes } from "../lib/chat/download";
 import type { AuthSession, ProjectAsset, Session } from "../lib/types";
 import { cn } from "../lib/utils";
+import { uploadProgressText } from "../lib/uploadProgressText";
 import { PINNED_INJECT_LIMIT, type UploadProgress, useProjectAssets } from "../hooks/useProjectAssets";
 import {
   Alert,
@@ -104,7 +105,7 @@ export function ProjectAssetsPanel(props: {
           density="compact"
           action={
             <Button variant="secondary" size="sm" onClick={reload}>
-              重试
+              继续
             </Button>
           }
         >
@@ -141,9 +142,13 @@ export function ProjectAssetsPanel(props: {
 
 /** 上传态文案：多文件时带「第 N/M 个」进度，单文件只说「正在上传…」（PA-03）。 */
 export function uploadingLabel(progress: UploadProgress | null): string {
-  if (!progress || progress.total <= 1) return "正在上传…";
+  const pct =
+    progress?.totalBytes && progress.totalBytes > 0 && typeof progress.sentBytes === "number"
+      ? ` ${uploadProgressText(progress.sentBytes, progress.totalBytes)}`
+      : "";
+  if (!progress || progress.total <= 1) return pct ? `正在上传…${pct}` : "正在上传…";
   const current = Math.min(progress.done + 1, progress.total);
-  return `正在上传 ${current}/${progress.total} 个文件…`;
+  return `正在上传 ${current}/${progress.total} 个文件…${pct}`;
 }
 
 function UploadDropzone({
@@ -372,7 +377,7 @@ function DownloadControl({
   }
   return (
     <IconButton
-      aria-label={state === "error" ? `重试下载 ${filename}` : `下载 ${filename}`}
+      aria-label={state === "error" ? `继续下载 ${filename}` : `下载 ${filename}`}
       variant="muted"
       size="sm"
       shape="square"

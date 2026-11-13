@@ -1,3 +1,7 @@
+import { catalogOwnerIsCurrent } from './hooks/useIdentityModelCatalog'
+import type { ResolvedIdentity } from './lib/resolvedIdentity'
+import {useModelSwitchCost} from './hooks/useModelSwitchCost';
+import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 import { DialogFallback } from "./components/DialogFallback";
 import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
@@ -44,6 +48,7 @@ import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
+import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
@@ -161,15 +166,18 @@ import {
   type ImplicitTarget,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
-import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
+import {
+  deriveLiveTerminalEndedAt,
+  deriveLiveTerminalFromMessages,
+  deriveSessionNeedsYou,
+  getTicketApprovalPendingVersion,
+  hasUnansweredOptionsFence,
+  subscribeTicketApprovalPending,
+} from "./lib/sessionStatus";
 import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
-import {
-  clearTeamModeForSession,
-  readTeamModeForSession,
-  writeTeamMode,
-} from "./lib/teamMode";
+import { clearTeamModeForSession } from "./lib/teamMode";
 import {
   type CollabMode,
   type CollabUiState,
@@ -226,6 +234,7 @@ import type { SaveToProjectRequest } from "./components/project/SaveToProjectDia
 import { useChatScroll } from "./hooks/useChatScroll";
 import { useStopShortcut } from "./hooks/useStopShortcut";
 import { type BlogOpenTarget, useChatCardActions } from "./hooks/useChatCardActions";
+import { useSystemActionCardActions } from "./hooks/useSystemActionCardActions";
 import type { BlogViewRequest } from "./components/tutorials/blog/CommunityBlog";
 import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
 import { useAppNavigationActions } from "./hooks/useAppNavigationActions";
@@ -239,9 +248,9 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
-const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
 const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
+const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const DesktopEnrollPage = lazy(() =>
   import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })),
@@ -322,6 +331,9 @@ const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 
 
 
+const EMPTY_CATALOG_MODELS: PublicModel[] = [];
+const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
+
 export function App() {
   // P7 最小路由（无路由库）：特判页（demo / reset-password / desktop/enroll）与启动深链
   // （会话 /s/<id> + 面板 ?panel=）的解析见 readLocationRoute；此后 URL 是状态的 replaceState 单向镜像。
@@ -369,9 +381,9 @@ export function App() {
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
-  // 经验分享入口（OCV5-577）跟随 feature_community_blog。publicCfg 只在登录页加载，已登录与首页深链时另取一次。
+  // 经验分享入口（OCV5-577）跟随 feature_community_blog。publicCfg 只在登录页加载，已登录与首页深链时
+  // 单独取一次（见下方 effect），不改 publicCfg 的加载时机（image2 等判断依赖它已登录时为 null）。
   const [signedInCommunityBlog, setSignedInCommunityBlog] = useState<boolean | null>(null);
-  const [blogRequest, setBlogRequest] = useState<BlogViewRequest | null>(null);
   // null = 还不知道。只有明确 true 才探测 inflight-delegates；失败 / 缺字段保持 null，不发请求。
   const [delegateInflightSurface, setDelegateInflightSurface] = useState<boolean | null>(null);
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
@@ -394,8 +406,8 @@ export function App() {
   const [pickerOpen, setPickerOpen] = useState(false);
   // 对话模型/默认思考深度:模型能力来自 GET /api/public/models；用户默认来自
   // /api/me/preferences。两者同批 hydrate 后才决定初始值,避免迟到偏好覆盖人工选择。
-  const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
-  const [lockedModels, setLockedModels] = useState<LockedPublicModel[]>([]);
+  const [catalogModels, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
+  const [catalogLockedModels, setLockedModels] = useState<LockedPublicModel[]>([]);
   const [subscribeOpenSignal, setSubscribeOpenSignal] = useState(0);
   const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
   // 最近一次 preferences 快照(default_model 解析用):per-session 模型恢复的回落基准。
@@ -403,6 +415,16 @@ export function App() {
   const [modelPrefs, setModelPrefs] = useState<PrefsView>({});
   const [preferenceEffort, setPreferenceEffort] = useState<PreferenceEffort | undefined>();
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [catalogOwner, setCatalogOwner] = useState<ResolvedIdentity | null>(null);
+  const clearModelCatalog = () => {
+    setCatalogOwner(null);
+    setModels([]);
+    setLockedModels([]);
+    setModelId(undefined);
+    setModelPrefs({});
+    setPreferenceEffort(undefined);
+    setModelsLoading(false);
+  };
   const [modelSwitchPreparing, setModelSwitchPreparing] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   // 输入框上方横幅栈的「展开全部」(shell 审计 S-06)。默认折叠到 MAX_VISIBLE_BANNERS 条。
@@ -483,6 +505,8 @@ export function App() {
   const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(urlRoute.tutorialCommunity);
   // 一级页签（null = 案例展厅，不进 URL）/ 精选作品 / 功能教程目标步骤：镜像到 ?tab= / ?work= / ?step=。
   const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(urlRoute.tutorialTab);
+  // 对话里的经验分享卡请求的子视图（我的投稿 / 带草稿的编辑器）；教程中心关闭即作废。
+  const [blogRequest, setBlogRequest] = useState<BlogViewRequest | null>(null);
   const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(urlRoute.tutorialWork);
   const [tutorialStep, setTutorialStep] = useState<number | null>(urlRoute.tutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
@@ -544,12 +568,9 @@ export function App() {
   // 透传（与 sockRef 同样的 TDZ 规避；handler 本身是 useRepoBinding 的稳定 useCallback）。
   const repoStatusHandlerRef = useRef<(f: RepoStatusWire) => void>(() => {});
   const repoBindErrorHandlerRef = useRef<(f: RepoBindErrorWire) => void>(() => {});
-  // 隐式负反馈上报入口的稳定间接（与 sockRef 同款 TDZ 规避）：send/stopTurn 在
-  // sendImplicitRating 声明之前就要引用它，故经 ref 回填；回调本体在下方 useCallback 定义。
-  // 走 ref 而非直接入 deps → send/stopTurn 引用保持稳定（不被评价态/模型切换牵动重建）。
-  const sendImplicitRatingRef = useRef<
-    ((target: ImplicitTarget, opts: { reason: ImplicitReason }) => void) | null
-  >(null);
+  // 隐式负反馈与发送跳底的稳定间接（TDZ 规避）：回调在下方定义，经 ref 回填以保持 send 引用稳定。
+  const sendImplicitRatingRef = useRef<((target: ImplicitTarget, opts: { reason: ImplicitReason }) => void) | null>(null);
+  const sendScrollRef = useRef<(() => void) | null>(null);
   // 用户主动 Stop 的轮不做完成脉冲高亮：stopTurn 置位，sending 沿的 nudge effect 消费后清。
   const stoppedTurnRef = useRef(false);
 
@@ -592,6 +613,7 @@ export function App() {
     // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/私有面板态,回首页。
     // help 是公开内容：若 URL 明确携带案例/功能深链，静默续期发现未登录时仍应保留。
     onClearAuth: () => {
+      clearModelCatalog();
       teardownComposerDrafts(user?.id);
       resetComposerAttachmentCache();
       // signPath 只在单一租户内唯一；鉴权身份退出/过期时必须丢弃内存图片字节，避免
@@ -620,13 +642,14 @@ export function App() {
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
     onLogout: () => void sockRef.current?.wipePersistence(),
-    // 用着用着被服务端判失效（OCV5-636）：onClearAuth 已收尾并回首页，这里改为直接给登录表单，
-    // useAuth 同时写入「登录状态已失效」提示；地址栏深链保留，重新登录后回到原会话。
+    // 续期明确失效（用着用着，或启动时本浏览器登录过）：直接给登录表单和
+    // 「登录已过期，请重新登录」。地址栏深链（含 /p/<项目>）留在 pending 里，登录后回到原页。
     onSessionExpired: () => {
       setAuthMode("login");
       setView("app");
     },
     onAccountSwitchPending: () => {
+      clearModelCatalog();
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
       setMediaTasksOpen(false);
@@ -643,6 +666,7 @@ export function App() {
     // 登录成功不预载会话：由 useChatSocket IndexedDB 注水（onHydrated）+ listSessions
     // 合并 server canonical 列表填侧栏；selectSession 再按需拉取单会话历史。
     onLoginSuccess: () => {
+      clearModelCatalog();
       imageByteCache.clear();
       sessionsResetRef.current();
       setMessages([]);
@@ -653,6 +677,10 @@ export function App() {
   // 经本地 useRef 再持有一次以保留 biome 的稳定 ref 推断 —— 直接使用 hook 返回的 ref 会在
   // 多处 useCallback/useEffect 误报 useExhaustiveDependencies（lint 只认本地 useRef 为稳定）。
   const authRef = useRef(authSessionRef.current);
+  const catalogVisible = demo || catalogOwnerIsCurrent(catalogOwner, resolvedIdentity, auth, user?.id);
+  const models = catalogVisible ? catalogModels : EMPTY_CATALOG_MODELS;
+  const lockedModels = catalogVisible ? catalogLockedModels : EMPTY_LOCKED_CATALOG_MODELS;
+
 
   // Assistant/tool markdown often exposes a dev-server URL such as
   // http://localhost:3000. That address belongs to the user's container, not
@@ -671,6 +699,30 @@ export function App() {
     document.addEventListener("click", onClick, true);
     return () => document.removeEventListener("click", onClick, true);
   }, [authed, demo]);
+
+  // 已登录（侧栏入口）或教程中心已打开（含匿名访客的 tab=blog 深链）时取一次；登录页与 demo 不多发请求。
+  const needCommunityBlogFlag = !demo && (authed || tutorialOpen);
+  useEffect(() => {
+    if (
+      !needCommunityBlogFlag ||
+      (signedInCommunityBlog !== null && delegateInflightSurface !== null)
+    )
+      return;
+    let cancelled = false;
+    api
+      .getPublicConfig()
+      .then((cfg) => {
+        if (cancelled) return;
+        setSignedInCommunityBlog(cfg.featureCommunityBlog === true);
+        setDelegateInflightSurface(cfg.featureDelegateInflight === true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [needCommunityBlogFlag, signedInCommunityBlog, delegateInflightSurface]);
+  const communityBlogEnabled =
+    !demo && (signedInCommunityBlog ?? publicCfg?.featureCommunityBlog === true);
 
   const interrupt = useCallback(() => {
     stopRef.current = true;
@@ -704,6 +756,7 @@ export function App() {
     loadArchivedSessions,
     loadingArchived,
     searchSessionMessages,
+    applySessionMetadata,
     applySessionTerminal,
     reset: resetSessionList,
     serverListSettled,
@@ -928,6 +981,10 @@ export function App() {
     setPaneSheetOpen(false);
   }, [activeId, boardOpen, projectHome]);
 
+  const authorizeSwitch=useModelSwitchCost({authRef,confirmDialog,toast});
+  const switchOptionsRef=useRef<Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>>({});
+  const getSwitchOptions=useCallback(()=>switchOptionsRef.current,[]);
+
   const {
     applyCollabDoc,
     cancelModelSwitch,
@@ -937,16 +994,18 @@ export function App() {
     collabSaveError,
     collabUi,
     persistCollab,
+    promoteDraftCollab,
     selectModel,
     setCollabAsDefault,
     setCollabMode,
     setCollabSaveError,
     setCollabUi,
     setTeamMode,
-    setTeamModeState,
     teamMode,
   } = useSessionModelAndCollab({
     activeId,
+    authorizeSwitch,
+    getSwitchOptions,
     agent,
     auth,
     confirmDialog,
@@ -970,6 +1029,7 @@ export function App() {
   // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
+  switchOptionsRef.current={teamMode:agent.id==='main'&&teamMode,contextTier,...(serviceTier==='fast'?{serviceTier}: {})};
 
   const { draftSessionId, stopPreparing } = useDraftPreparation({
     auth, userId: user?.id ?? null, activeId, agentId: agent.id, modelId,
@@ -992,6 +1052,7 @@ export function App() {
     uploadMedia,
   } = useComposerSend({
     activeId,
+    authorizeSwitch,
     agent,
     applyCollabDoc,
     auth,
@@ -1000,6 +1061,7 @@ export function App() {
     collabAsDefault,
     collabEpochRef,
     collabUi,
+    promoteDraftCollab,
     contextTier,
     demo,
     draftProjectId,
@@ -1010,9 +1072,10 @@ export function App() {
     newSessionInProject,
     preferenceEffort,
     projectHome,
-    publicCfg,
+    publicCfg, queueModelPatch,
     selectedSessionIdRef,
     sendImplicitRatingRef,
+    sendScrollRef,
     serviceTier,
     sessionEffort,
     sessions,
@@ -1027,7 +1090,6 @@ export function App() {
     setMessages,
     setSessions,
     setStreamText,
-    setTeamModeState,
     sockRef,
     stopPreparing,
     stopRef,
@@ -1056,7 +1118,7 @@ export function App() {
     activeId,
     agent,
     auth,
-    collabMode,
+    promoteDraftCollab,
     confirmDialog,
     contextTier,
     demo,
@@ -1106,49 +1168,10 @@ export function App() {
     view,
   });
 
-  // 已登录（侧栏入口）或教程中心已打开（含匿名访客的 tab=blog 深链）时取一次；登录页与 demo 不多发请求。
-  const needCommunityBlogFlag = !demo && (authed || tutorialOpen);
-  useEffect(() => {
-    if (
-      !needCommunityBlogFlag ||
-      (signedInCommunityBlog !== null && delegateInflightSurface !== null)
-    )
-      return;
-    let cancelled = false;
-    api
-      .getPublicConfig()
-      .then((cfg) => {
-        if (cancelled) return;
-        setSignedInCommunityBlog(cfg.featureCommunityBlog === true);
-        setDelegateInflightSurface(cfg.featureDelegateInflight === true);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [needCommunityBlogFlag, signedInCommunityBlog, delegateInflightSurface]);
-  const communityBlogEnabled =
-    !demo && (signedInCommunityBlog ?? publicCfg?.featureCommunityBlog === true);
-
-  const openBlog = useCallback(
-    (target: BlogOpenTarget) => {
-      openTutorial();
-      setTutorialTab("blog");
-      if (target.kind === "post") setTutorialCommunity(target.id);
-      setBlogRequest(target.kind === "post" ? null : { ...target, nonce: Date.now() });
-    },
-    [openTutorial],
-  );
-  useEffect(() => {
-    if (!tutorialOpen) setBlogRequest(null);
-  }, [tutorialOpen]);
-
-
-  const {
-    inbox,
-    refreshMyAgents,
-  } = useAppDeepLinks({
+  const { inbox, refreshMyAgents, teamLeaderModelId } = useAppDeepLinks({
     auth,
+    resolvedIdentity,
+    setCatalogOwner,
     authRef,
     authed,
     confirmDialog,
@@ -1182,6 +1205,7 @@ export function App() {
   // cost_charged / 余额不足时刷新顶栏余额。demo 不连真实 WS。
   const chat = useChatSocket({
     auth,
+    authorizeSwitch,
     ready: gate.ready,
     // cohort lane 就绪（P3 RFC D1）：与 gate.ready 正交的 WS 连接前置，防首连落错 slot。
     laneReady,
@@ -1281,7 +1305,7 @@ export function App() {
 
   const sendingIdsRef = useRef(new Set<string>());
   const liveTerminalsRef = useRef(
-    new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null }>(),
+    new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt: number }>(),
   );
   const liveTerminals = useMemo(() => {
     void chat.version;
@@ -1291,7 +1315,7 @@ export function App() {
     for (const id of sendingIdsRef.current) {
       if (!now.has(id)) {
         const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
-        if (t) liveTerminalsRef.current.set(id, t);
+        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
       }
     }
     sendingIdsRef.current = now;
@@ -1304,6 +1328,29 @@ export function App() {
   const liveTerminal = useCallback(
     (id: string) => liveTerminals.get(id),
     [liveTerminals],
+  );
+  const ticketApprovalVersion = useSyncExternalStore(
+    subscribeTicketApprovalPending,
+    getTicketApprovalPendingVersion,
+    getTicketApprovalPendingVersion,
+  );
+  const sessionNeedsYou = useCallback(
+    (id: string) => {
+      void chat.version;
+      void ticketApprovalVersion;
+      if (demo) return null;
+      const liveSess = chat.getSession(id);
+      const fromLive = deriveSessionNeedsYou(liveSess);
+      if (fromLive) return fromLive;
+      if (!liveSess || liveSess.messages.length === 0) {
+        const meta = sessions.find((s) => s.id === id);
+        if (meta?.lastMessagePreview && hasUnansweredOptionsFence(meta.lastMessagePreview)) {
+          return "answer";
+        }
+      }
+      return null;
+    },
+    [demo, chat, sessions, ticketApprovalVersion],
   );
 
   useEffect(() => {
@@ -1413,7 +1460,7 @@ export function App() {
   // 的支持集渲染选项;生效档 = 会话显式选择 ?? 全局偏好,不被当前模型支持时如实
   // 显示「跟随」(发送层 effortForModel 同样过滤,所见 = 所发)。
   const effortModel = models.find(
-    (m) => m.id === effectiveEffortModelId(modelId, teamLeaderActive),
+    (m) => m.id === effectiveEffortModelId(modelId, teamLeaderActive, teamLeaderModelId),
   );
   const effortSupported = effortModel?.supported_efforts ?? [];
   const effortCandidate = sessionEffort !== undefined ? sessionEffort : preferenceEffort;
@@ -1431,6 +1478,7 @@ export function App() {
     return {
       dispatch,
       startedAt: activeSess._turnStartedAt ?? null,
+      statusSince: activeSess._turnStatusSince,
       lastFrameAt: activeSess._lastFrameAt,
       transport: chat.status.cls,
       detached: isTurnDetached(activeSess),
@@ -1451,6 +1499,11 @@ export function App() {
           m.role === "plan",
         ),
       coldStart: !!activeSess._isFirstTurnAfterReady,
+      settledCredits:
+        activeSess._sendingInFlight &&
+        activeSess._turnCredits?.clientMessageId === activeSess._activeClientMessageId
+          ? activeSess._turnCredits?.settled
+          : undefined,
       agentName: agent.name || "助手",
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
     };
@@ -1475,7 +1528,7 @@ export function App() {
     historyError,
   });
 
-  // 会话级 transient 软提示（"较长时间未收到新内容…"）：非消息卡片、不落库；随快照读回。
+  // 会话级 transient 软提示（"正在发送…"等）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
   // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。文案与 tone 收口在
   // deriveConnBanner（纯函数，单测锁定）；返回 null 时不显条。demo 恒不显（本地回放无 WS）。
@@ -1490,6 +1543,30 @@ export function App() {
   // 横幅 2s 延迟（P3 RFC D6）：断开 >2s 才点亮，2s 内重连成功零闪烁。只作用于横幅显示——
   // deriveConnBanner 仍即时反映断线真相，断线排队/禁发等发送语义不受影响。
   const connBanner = useDelayedConnBanner(rawConnBanner);
+  useEffect(() => {
+    if (!tutorialOpen) setBlogRequest(null);
+  }, [tutorialOpen]);
+  const openBlog = useCallback(
+    (target: BlogOpenTarget) => {
+      openTutorial();
+      setTutorialTab("blog");
+      if (target.kind === "post") setTutorialCommunity(target.id);
+      setBlogRequest(target.kind === "post" ? null : { ...target, nonce: Date.now() });
+    },
+    [openTutorial],
+  );
+  const { systemActions, preferencesRevision, inboxRevision } = useSystemActionCardActions({
+    authRef,
+    userId: user?.id,
+    identity: resolvedIdentity,
+    demo,
+    applyPreferences: applyConversationPreferences,
+    applyInboxUnreadCount: inbox.applyUnreadCountSnapshot,
+    applySessionMetadata,
+    setTheme,
+    onSyncError: () => toast("操作已完成，页面显示暂未同步，请手动刷新。"),
+  });
+
   const {
     artifactInspect,
     cardCallbacks,
@@ -1500,6 +1577,8 @@ export function App() {
     stopTurnIfCurrent,
     toolActions,
   } = useChatCardActions({
+    identity: resolvedIdentity,
+    systemActions,
     activeId,
     agent,
     authRef,
@@ -1673,12 +1752,8 @@ export function App() {
   sendImplicitRatingRef.current = sendImplicitRating;
 
   const {
-    beginDirectUserChatScroll,
-    endDirectUserChatScroll,
-    markUserChatScroll,
-    onChatScroll,
-    onLoadOlderHistory,
-    stickToBottomRef,
+    beginDirectUserChatScroll, endDirectUserChatScroll, markUserChatScroll,
+    onChatScroll, onLoadOlderHistory, scrollToBottomOnSend, stickToBottomRef,
   } = useChatScroll({
     activeId,
     archiveLoading,
@@ -1698,6 +1773,7 @@ export function App() {
     streamText,
     wsSending,
   });
+  sendScrollRef.current = scrollToBottomOnSend;
 
   const stopShortcutDialog = useStopShortcut({
     enabled: inWorkspace && sending,
@@ -1789,7 +1865,8 @@ export function App() {
 
   // 启动续期检查中:极简 splash(避免"闪一下首页又跳工作区"的割裂;通常 <300ms)。
   if (!demo && booting) {
-    return <BootSplash />;
+    // 这是在恢复登录，不是页面卡死。慢的时候不要先说「网络较慢」再掉进落地页。
+    return <BootSplash slowHint="正在恢复登录…" />;
   }
   if (!demo && pendingAccount) return <LazyBoundary fallback={<SplashFallback />}>
     <AccountSwitchNotice name={pendingAccount.displayName} ready={accountSwitchReady} onAccept={acceptAccountSwitch} onRetry={retryBoot} />
@@ -1842,9 +1919,9 @@ export function App() {
               caseId={tutorialCase}
               communityId={tutorialCommunity}
               browseView={tutorialTab ?? "showcase"}
-              onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
               blogEnabled={communityBlogEnabled}
               blogRequest={blogRequest}
+              onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
               signatureWorkId={tutorialWork}
               onSignatureWorkChange={setTutorialWork}
               stepIndex={tutorialStep}
@@ -2032,6 +2109,7 @@ export function App() {
     onOpenProjectArchive: demo ? undefined : () => setProjectArchiveOpen(true),
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
+    sessionNeedsYou,
     socketVersion: chat.version,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
@@ -2040,11 +2118,11 @@ export function App() {
     // 经验分享入口跟随 feature_community_blog（商业版默认关；配置未到时也不显示）。
     onOpenBlog:
       demo || !communityBlogEnabled
-        ? undefined
-        : () => {
-            openTutorial();
-            setTutorialTab("blog");
-          },
+      ? undefined
+      : () => {
+          openTutorial();
+          setTutorialTab("blog");
+        },
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
     onOpenStudio: !demo && studioAvailable ? () => window.location.assign("/studio") : undefined,
@@ -2347,9 +2425,9 @@ export function App() {
           onSelectServiceTier={demo ? undefined : setServiceTier}
           modelPickerOpen={modelPickerOpen}
           onModelPickerOpenChange={setModelPickerOpen}
-          // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
-          // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
+          // 团队模式知情指示:与 send 生效条件同构(仅 main 生效),顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
+          teamLeaderModelId={teamLeaderModelId}
           onDisableTeamMode={() => setTeamMode(false)}
           advisorModeActive={!demo && collabMode === "advisor" && agent.id === "main"}
           advisorModelLabel={
@@ -2438,7 +2516,7 @@ export function App() {
                       className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg"
                       onClick={() => retryHistory(activeId)}
                     >
-                      重试
+                      继续
                     </button>
                   ) : undefined
                 }
@@ -2571,9 +2649,10 @@ export function App() {
             <ErrorBanner
               error={chatError}
               onRetry={() => {
+                if (!activeId) return;
                 const t = chatError.retryText;
                 setChatError(null);
-                send(t);
+                send(taskContinuationPrompt(t), undefined, undefined, "继续", undefined, { sessionId: activeId });
               }}
               onDismiss={() => setChatError(null)}
               onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}
@@ -2782,6 +2861,8 @@ export function App() {
       </Sheet>
 
       <AppDialogs
+        preferencesRevision={preferencesRevision}
+        inboxRevision={inboxRevision}
         activeId={activeId}
         activeSess={activeSess}
         agent={agent}
@@ -2913,9 +2994,9 @@ export function App() {
             caseId={tutorialCase}
             communityId={tutorialCommunity}
             browseView={tutorialTab ?? "showcase"}
-            onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
             blogEnabled={communityBlogEnabled}
             blogRequest={blogRequest}
+            onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
             signatureWorkId={tutorialWork}
             onSignatureWorkChange={setTutorialWork}
             stepIndex={tutorialStep}

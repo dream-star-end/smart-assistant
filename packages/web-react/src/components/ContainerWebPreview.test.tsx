@@ -684,7 +684,7 @@ describe('ContainerWebPreview immersive UI', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('无法连接网页预览')
     expect(screen.getByText('诊断详情')).toBeInTheDocument()
     const before = previewMock.calls.at(-1)?.reconnectKey ?? 0
-    fireEvent.click(screen.getByRole('button', { name: '重新连接' }))
+    fireEvent.click(screen.getByRole('button', { name: '继续' }))
     expect(previewMock.calls.at(-1)?.reconnectKey).toBe(before + 1)
   })
 
@@ -944,7 +944,7 @@ describe('ContainerWebPreview audit fixes', () => {
     expect(alert).toHaveTextContent('连接已断开')
     expect(alert).toHaveTextContent('重新连接即可继续')
     expect(alert).not.toHaveTextContent('无法连接网页预览')
-    expect(screen.getByRole('button', { name: '重新连接' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '继续' })).toBeInTheDocument()
     const summary = screen.getByText('诊断详情')
     expect(summary).toHaveClass('text-meta')
     expect(summary).toHaveStyle({ minHeight: '44px' })
@@ -952,7 +952,7 @@ describe('ContainerWebPreview audit fixes', () => {
     previewMock.error = { message: 'ticket rejected', retryable: false }
     view.rerender(<PreviewHarness />)
     expect(screen.getByRole('alert')).toHaveTextContent('无法连接网页预览')
-    expect(screen.queryByRole('button', { name: '重新连接' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '继续' })).not.toBeInTheDocument()
   })
 
   test('M-20: the narrow-screen submit label says 加入, not 完成', () => {

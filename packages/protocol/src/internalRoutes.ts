@@ -37,6 +37,26 @@ export function isDelegateGrokRoutePath(path: string): boolean {
   )
 }
 
+// ── delegate antigravity-route(v5 面 forwarder 放行例外)───────────────────
+// 容器本地 delegate turn 没有浏览器 frame 注入 __oc_antigravity_route,
+// gateway 向 master 申请同款 token-bound loopback route(OCV5-738)。
+export const DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH = '/internal/v5/delegate/antigravity-route/mint'
+export const DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH = '/internal/v5/delegate/antigravity-route/release'
+export const DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH = '/internal/v5/delegate/antigravity-route/renew'
+
+export function isDelegateAntigravityRoutePath(path: string): boolean {
+  return (
+    path === DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH ||
+    path === DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH ||
+    path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH
+  )
+}
+
+/** delegate engine relay route 的 forwarder 放行例外集合(grok + antigravity)。 */
+export function isDelegateRouteForwardException(path: string): boolean {
+  return isDelegateGrokRoutePath(path) || isDelegateAntigravityRoutePath(path)
+}
+
 // ── v5 控制面其余路径 ───────────────────────────────────────────────────────
 export const COST_EVENT_PATH = '/internal/v5/cost-event'
 export const EGRESS_HEALTH_PATH = '/internal/v5/egress-health'
@@ -55,6 +75,8 @@ export const PROMPT_QUEUE_DETAIL_PATH = '/internal/v5/prompt-queue/detail'
 export const PROMPT_QUEUE_CLAIM_PATH = '/internal/v5/prompt-queue/claim'
 
 // ── v3 容器→master 面 ──────────────────────────────────────────────────────
+/** Scoped read/prepare help uses the existing container-to-master control transport. */
+export const SYSTEM_ACTIONS_INTERNAL_PATH = '/internal/v3/system-actions'
 export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
 export const CODEX_TOKEN_REFRESH_PATH = '/internal/v3/codex/token-refresh'
 /** 识图后端(oc-figcheck):容器交图片+问题,master 调 Grok 4.7 并计费。 */
@@ -93,6 +115,7 @@ export const AUTO_DREAM_OPTIMIZER_SETTLE_PATH = '/internal/v3/auto-dream/settle'
 export const AUTO_DREAM_OPTIMIZER_ABANDON_PATH = '/internal/v3/auto-dream/abandon'
 export const AUTO_DREAM_OPTIMIZER_FINDINGS_PATH = '/internal/v3/auto-dream/findings'
 export const AUTO_DREAM_OPTIMIZER_ACTION_PATH = '/internal/v3/auto-dream/action'
+export const DELEGATE_TRACE_PATH = '/internal/v3/delegate/trace'
 export const DELEGATE_ENGINE_BILLING_ADMIT_PATH = '/internal/v3/delegate/engine-billing/admit'
 export const DELEGATE_ENGINE_BILLING_SETTLE_PATH = '/internal/v3/delegate/engine-billing/settle'
 export const DELEGATE_ENGINE_BILLING_ABANDON_PATH = '/internal/v3/delegate/engine-billing/abandon'
@@ -169,6 +192,36 @@ export const INTERNAL_ROUTES = [
     plane: 'v5',
     egressForwardException: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
+  },
+  {
+    path: DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH,
+    match: 'exact',
+    plane: 'v5',
+    egressForwardException: true,
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
+  },
+  {
+    path: DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH,
+    match: 'exact',
+    plane: 'v5',
+    egressForwardException: true,
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
+  },
+  {
+    path: DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH,
+    match: 'exact',
+    plane: 'v5',
+    egressForwardException: true,
+    selfhostOnly: true,
+    sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
+  },
+  {
+    path: SYSTEM_ACTIONS_INTERNAL_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/systemHelpRelay.ts', 'commercial/src/system-assistant/internalHttp.ts'],
   },
   // ── v5:控制专用/egress 本地面 ──────────────────────────────────────────
   {
@@ -436,6 +489,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/autoDreamOptimizerClient.ts', 'commercial/src/http/internalAutoDreamOptimizer.ts'],
+  },
+  {
+    path: DELEGATE_TRACE_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/delegateTrace.ts', 'commercial/src/http/internalDelegateTrace.ts'],
   },
   {
     path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,

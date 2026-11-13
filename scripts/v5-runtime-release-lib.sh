@@ -534,6 +534,25 @@ oc_hotcfg_assert_runtime_mcp_cjs() {
   return 0
 }
 
+# A source tree with the cc5 child must retain the independent compiled closure.
+# Historic releases without this opt-in source remain valid rollback targets.
+oc_hotcfg_assert_runtime_cc5_bridge() {
+  local root="$1" entry="$1/packages/gateway/dist/cc5StdioBridge.js"
+  [ -f "$root/packages/gateway/src/cc5BridgePort.ts" ] \
+    || [ -f "$root/packages/gateway/src/cc5StdioBridge.ts" ] || return 0
+  [ -f "$root/packages/gateway/src/cc5StdioBridge.ts" ] \
+    || { oc_hotcfg__die "runtime missing cc5 bridge source @ $root"; return 1; }
+  [ -s "$entry" ] || { oc_hotcfg__die "runtime missing cc5 bridge child @ $root"; return 1; }
+  node --check "$entry" >/dev/null 2>&1 \
+    || { oc_hotcfg__die "runtime cc5 bridge syntax invalid @ $root"; return 1; }
+  node --conditions=openclaude-precompiled --input-type=module - "$entry" >/dev/null 2>&1 <<'CC5_NODE' \
+    || { oc_hotcfg__die "runtime cc5 bridge closure invalid @ $root"; return 1; }
+import { pathToFileURL } from 'node:url'
+const child = await import(pathToFileURL(process.argv[2]).href)
+if (typeof child.runCc5StdioBridge !== 'function') process.exit(1)
+CC5_NODE
+}
+
 # release 落定(§3.1 d/e):在已 archive+prune+敏感扫描过的 staging 上装依赖、建 ccb dist、
 # 生成 MANIFEST(含 depsCacheKey/bunVersion)、按 digest 定名 mv -T。
 # 依赖形态(R2-m2 表述更正,无"两套 node_modules"):root 一套 npm ci;CCB 独立 bun build 仅拷
@@ -577,6 +596,7 @@ oc_hotcfg_finalize_release() {
     || { oc_hotcfg__die "container gateway precompile failed"; return 1; }
   [ -s "$staging/packages/cli/dist/index.js" ] && [ -f "$staging/packages/cli/dist/.precompiled-ok" ] \
     || { oc_hotcfg__die "container gateway precompile missing after build"; return 1; }
+  oc_hotcfg_assert_runtime_cc5_bridge "$staging" || return 1
   # oc-memory CLI/MCP CJS MUST run after gateway precompile (which rmSync dist/).
   # Missing script is a failed finalize, not a skip: containers otherwise pay ~7s tsx/spawn.
   local cli_build="$staging/packages/mcp-memory/scripts/build-oc-memory-cli.sh"
@@ -617,6 +637,7 @@ oc_hotcfg_finalize_release() {
     oc_hotcfg__log "release rel-$digest 已存在 → 抽样重校验后复用"
     if oc_hotcfg_verify_manifest_sampled "$target" 64; then
       oc_hotcfg_assert_runtime_mcp_cjs "$target" || return 1
+      oc_hotcfg_assert_runtime_cc5_bridge "$target" || return 1
       # capability 声明补写(幂等自愈):同 digest = 同源码树 ⇒ 同 capability。旧制品建于本
       # 特性之前(MANIFEST 无 capabilities)会被兼容地板判为"容器面不具备能力"而拒绝激活 ——
       # 那是**假阴性**(树里明明有代码)。此处按当前 caps 就地补写(MANIFEST 不进 digest,

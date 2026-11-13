@@ -6,6 +6,10 @@
  */
 import {
   BOX_API_MODELS,
+  type Cc5ExecutionBackend,
+  type RemoteExecutionBackend,
+  isCc5ExecutionBackend,
+  parseRemoteExecutionBackend,
   OPENAI_FAST_SERVICE_TIER,
   TRACE_ID_HEADER,
   isBoxApiModel,
@@ -27,6 +31,7 @@ import {
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { CCB_ADVISOR_PROFILE_VERSION, type AdvisorConsultExecution } from './advisorMode.js'
+import { figcheckTurnIdEnv } from './figcheckRounds.js'
 
 /** The engine=ccb official-cc lane puts per-turn headers in the spawn env and
  * respawns when they change. Cursor Sand and the box-resident CLI never read
@@ -432,6 +437,8 @@ export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_API_MODELS[0].id
 
 export interface CcbExecutionDescriptor {
+  /** Signed remote scope: a CC lane or a codex lane, never a caller-chosen alias. */
+  readonly executionBackend?: RemoteExecutionBackend
   readonly canonicalModel: string
   readonly contextWindow: number | null
   readonly capabilityZero: boolean
@@ -456,8 +463,8 @@ export function shouldRecycleForVisionCapability(
 export interface TurnModelAuthority {
   /** 完整签名 authority envelope(base64url；仅作已消费的入站启动凭据保留)。 */
   readonly authorityEnvelope: string
-  /** turn lease envelope(base64url;TTL = 最大 turn 窗口 + grace)。 */
-  readonly leaseEnvelope: string
+  /** Latest rolling lease; the logical turn shares this owner across retries. */
+  leaseEnvelope: string
   /** 已验签的 CCB 执行语义；与两张 envelope 同一份 descriptor。 */
   readonly executionDescriptor: CcbExecutionDescriptor
 }
@@ -524,9 +531,26 @@ export function _buildAnthropicCustomHeadersEnv(
   push(AUTHORITY_HEADER, headers?.authority)
   push(TURN_LEASE_HEADER, headers?.lease)
   push(LOCAL_CATALOG_HEADER, headers?.localCatalog)
+  return { ANTHROPIC_CUSTOM_HEADERS: _withTraceIdHeader(lines.join('\n'), traceId) }
+}
+
+/** The turn trace if it is a valid canonical id, else undefined (dropped, never rejected). */
+function validTraceId(traceId: string | undefined): string | undefined {
+  if (traceId === undefined) return undefined
   const trace = parseTraceIdCandidate(traceId)
-  if (traceId !== undefined && trace.ok) push(TRACE_ID_HEADER, trace.traceId)
-  return { ANTHROPIC_CUSTOM_HEADERS: lines.join('\n') }
+  return trace.ok ? trace.traceId : undefined
+}
+
+/**
+ * `ANTHROPIC_CUSTOM_HEADERS` plus the `x-openclaude-trace-id` line for a valid trace (OCV5-570).
+ * official-cc reads its headers only at spawn, so the runner adds the trace to that spawn env once
+ * it knows the process's upstream is egress.
+ */
+export function _withTraceIdHeader(customHeaders: string, traceId: string | undefined): string {
+  const trace = validTraceId(traceId)
+  if (trace === undefined) return customHeaders
+  const line = `${TRACE_ID_HEADER}: ${trace}`
+  return customHeaders === '' ? line : `${customHeaders}\n${line}`
 }
 
 /**
@@ -780,8 +804,14 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 // ───────────────────────────────────────────────
 
 export interface SubprocessRunnerOpts {
+  /** Only supplied from the verified bridge authority; never from local catalog or client fields. */
+  executionBackend?: RemoteExecutionBackend
+  /** Trusted cc5-only transport. No user-selected URL, command or credentials. */
+  cc5BridgePort?: import('./cc5BridgePort.js').Cc5BridgePort
   /** Actual chat peer; sessionId below may be a delegated repository parent. */
   peerId?: string
+  /** Stable, attempt-refreshed opaque help context. Never contains the master signing key. */
+  systemHelpContextFile?: string
   sessionKey: string
   agentId: string
   /** Phase 5 重命名(原 `cwd`):agent 的项目基础目录 = 没绑定 GitHub repo 时
@@ -1029,17 +1059,30 @@ export function projectCcbExecutionDescriptor(input: {
   supportsVision: boolean
   supportedEfforts: readonly string[]
   capabilityProfile: Readonly<Record<string, unknown>>
+  executionBackend?: RemoteExecutionBackend
 }): CcbExecutionDescriptor {
+  // The bound target/offer declares the model; the runner compares it to the port's. A signed
+  // scope of either kind is a valid remote identity; anything else is a mismatch.
+  if (input.executionBackend) {
+    try {
+      parseRemoteExecutionBackend(input.executionBackend)
+    } catch {
+      throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+    }
+  }
   const raw = input.capabilityProfile.ccb
   const ccb = raw !== null && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
   if (ccb.contextOwner !== undefined && ccb.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
-  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && !isBoxApiModel(input.canonicalModel)) {
+  // A remote-lane chat's native context lives on its pool node; the signed lane backend is its proof.
+  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && !isBoxApiModel(input.canonicalModel) &&
+      !input.executionBackend) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
   return {
     canonicalModel: input.canonicalModel,
+    ...(input.executionBackend ? { executionBackend: input.executionBackend } : {}),
     contextWindow: input.contextWindow,
     capabilityZero: ccb.capabilityZero === true,
     supportsThinking: ccb.supportsThinking === true,
@@ -1100,13 +1143,20 @@ export function buildOfficialCcProxySpawnEnv(input: {
   return {
     ..._buildAnthropicCustomHeadersEnv(input.headers),
     ..._buildCcbUsageAttributionEnv(input.usageAttribution, input.turnKey),
+    // OCV5-704: scope the figcheck vision cap to this turn. Empty clears the previous id.
+    ...figcheckTurnIdEnv(input.turnKey),
     [MODEL_EXECUTION_DESCRIPTOR_ENV]: input.executionDescriptorEnv,
     CLAUDE_CODE_MAX_RETRIES: '0',
   }
 }
 
-export function officialCcProxySpawnFingerprint(vars: Record<string, string>): string {
-  return JSON.stringify(vars)
+/** The turn trace is part of the fingerprint: it reaches the stock CLI only through the spawn env. */
+export function officialCcProxySpawnFingerprint(
+  vars: Record<string, string>,
+  traceId?: string,
+): string {
+  const trace = validTraceId(traceId)
+  return trace === undefined ? JSON.stringify(vars) : JSON.stringify([vars, trace])
 }
 
 /**
@@ -1115,6 +1165,7 @@ export function officialCcProxySpawnFingerprint(vars: Record<string, string>): s
  * unit-testable, no side effects, no file I/O.
  */
 export interface CcbCliArgsInput {
+  readOnly?: boolean
   /** e.g. 'bun' or 'node' (maps to `run` vs `--experimental-strip-types`) */
   runtime: string
   /** Entry file path, e.g. src/entrypoints/cli.tsx */
@@ -1199,6 +1250,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     restrictedMemorySources,
     workload,
     hermeticNoTools,
+    readOnly,
     settingsFile,
     structuredOutputSchema,
   } = input
@@ -1232,6 +1284,9 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     args.push('--disallowedTools', ...CCB_PLATFORM_DISALLOWED_TOOLS)
     args.push('--permission-prompt-tool', 'stdio')
   }
+  if (readOnly && !hermeticNoTools) {
+    args.push('--tools', 'Read,Glob,Grep', '--strict-mcp-config')
+  }
   if (hermeticNoTools) {
     args.push('--bare', '--tools', '', '--strict-mcp-config')
   }
@@ -1263,6 +1318,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
 }
 
 export interface OfficialClaudeCliArgsInput {
+  readOnly?: boolean
   model?: string
   permissionMode?: string
   extraPromptFile?: string
@@ -1295,6 +1351,7 @@ export function buildOfficialClaudeCliArgs(input: OfficialClaudeCliArgsInput): s
   }
   args.push('--disallowedTools', ...OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS)
   args.push('--permission-prompt-tool', 'stdio')
+  if (input.readOnly) args.push('--tools', 'Read,Glob,Grep', '--strict-mcp-config')
   if (input.settingsFile) args.push('--settings', input.settingsFile)
   if (input.extraPromptFile) args.push('--append-system-prompt-file', input.extraPromptFile)
   if (input.mcpConfigFile) args.push('--mcp-config', input.mcpConfigFile)

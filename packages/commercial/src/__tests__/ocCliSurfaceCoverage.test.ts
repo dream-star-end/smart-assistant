@@ -549,6 +549,13 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     schema: reviewProbe(['schema'], 0, /ReviewFile/),
     collate: reviewProbe(['collate'], 2, /collate --dir/),
   },
+  'oc-system': {
+    skill: scriptProbe('oc-system.py', ['skill', 'preferences'], { code: 0, stdout: /用户偏好设置/ }),
+    catalog: scriptProbe('oc-system.py', ['catalog'], { code: 1, stderr: /CONTEXT_OR_OPERATION_UNAVAILABLE/ }),
+    read: scriptProbe('oc-system.py', ['read', 'preferences.read'], { code: 1, stderr: /CONTEXT_OR_OPERATION_UNAVAILABLE/ }),
+    prepare: scriptProbe('oc-system.py', ['prepare', 'preferences.update', '--request-id', 'synthetic-surface-probe'], { code: 1, stderr: /CONTEXT_OR_OPERATION_UNAVAILABLE/ }),
+    result: scriptProbe('oc-system.py', ['result', '00000000-0000-4000-8000-000000000001'], { code: 1, stderr: /CONTEXT_OR_OPERATION_UNAVAILABLE/ }),
+  },
   'oc-skill': {
     train: skillProbe(['train', 'demo', '--confirm'], 'request'),
     'train-status': skillProbe(['train-status', 'run-1'], 'request'),
@@ -961,6 +968,7 @@ function productionSurfaces(): Record<string, Set<string>> {
     'oc-rank': tsDispatchCommands('packages/gateway/src/ocRankCli.ts', 'cmd'),
     'oc-report': singlePurpose('packages/gateway/src/ocReportCli.ts', 'render', /usage: oc-report/),
     'oc-review': tsDispatchCommands('packages/gateway/src/ocReviewCli.ts', 'cmd'),
+    'oc-system': pythonArgparseCommands('packages/commercial/agent-sandbox/platform-runtime/bin/oc-system.py'),
     'oc-skill': tsDispatchCommands('packages/gateway/src/ocSkillCli.ts', 'cmd'),
     'oc-slides': singlePurpose('packages/gateway/src/ocSlidesCli.ts', 'render', /usage: oc-slides/),
     'oc-task': tsDispatchCommands('packages/gateway/src/ocTaskCli.ts', 'cmd'),

@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { isStudioPath } from '../lib/studio/path'
 import { type ProductFeatureId, isProductFeatureId } from '../lib/productCapabilities'
-import { TICKET_TYPES, type TicketType } from '../lib/taskboard'
+import { TICKET_TYPES, type TicketType } from "../lib/taskboardFeature"
 import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseId'
 import { SIGNATURE_WORK_IDS, type SignatureWorkId } from '../lib/tutorialSignatureWorkIds'
 import type { Session } from '../lib/types'

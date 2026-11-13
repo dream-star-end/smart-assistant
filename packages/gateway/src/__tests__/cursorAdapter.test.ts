@@ -1486,6 +1486,7 @@ for(const e of [
       },
       tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
       delegateContextFile: '/tmp/openclaude-cursor-context-test/delegate-context',
+      systemHelpContextFile: '/synthetic/system-help-context.json',
       agentId: 'main',
       sessionKey: 'agent:main:webchat:dm:test',
       gatewayPort: 18789,
@@ -1498,6 +1499,7 @@ for(const e of [
     assert.deepEqual(Object.keys(config), ['mcpServers'])
     assert.deepEqual(Object.keys(config.mcpServers), ['openclaude-memory'])
     const server = config.mcpServers['openclaude-memory']
+    assert.equal(server.env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE, '/synthetic/system-help-context.json')
     assert.deepEqual(Object.keys(server).sort(), ['args', 'command', 'env'])
     assert.equal(server.command, '/usr/local/bin/node')
     assert.deepEqual(server.args, [

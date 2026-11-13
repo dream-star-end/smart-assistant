@@ -11,11 +11,12 @@ export function confirmDispatchDelivery(sess: ChatSession, clientMessageId: stri
   const changed = user._deliveryState !== state;
   user._deliveryState = state;
   if (first && !accepted) {
-    sess._turnStartedAt = Date.now();
+    const now = Date.now();
+    sess._turnStartedAt = now;
     sess._turnCostCredits = "0";
     sess._turnCostSeenRequestIds = new Set();
     sess._turnCostReminderCredits = undefined;
-    sess._turnCredits = { settled: "0", requests: 0, asOf: Date.now() };
+    sess._turnCredits = { clientMessageId, settled: "0", requests: 0, asOf: now, receivedAt: now };
   }
   if (user.status !== "read" && user.status !== "replied" && user.status !== "sent") {
     user.status = "sent";

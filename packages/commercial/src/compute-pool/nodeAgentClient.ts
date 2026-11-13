@@ -25,6 +25,7 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { request as httpsRequest } from "node:https";
 import type { OutgoingHttpHeaders } from "node:http";
 import type { Socket } from "node:net";
+import { createReadStream } from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 import { rootLogger } from "../logging/logger.js";
@@ -351,6 +352,9 @@ interface RpcOptions {
   body?: unknown;
   /** 原始 body(互斥于 body);用于 PUT /files 上传二进制。 */
   rawBody?: Buffer;
+  /** 从磁盘流式上传。与 body、rawBody 互斥。 */
+  rawBodyPath?: string;
+  rawBodyLength?: number;
   /** rawBody 的 MIME 类型,默认 application/octet-stream。 */
   rawContentType?: string;
   /** 覆盖默认 30s。 */
@@ -370,8 +374,12 @@ interface RpcOptions {
 
 async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T> {
   const master = await getMasterTls();
-  if (opts.body !== undefined && opts.rawBody !== undefined) {
-    throw new Error("rpcCall: body and rawBody are mutually exclusive");
+  const bodyModes = [opts.body !== undefined, opts.rawBody !== undefined, opts.rawBodyPath !== undefined].filter(Boolean).length;
+  if (bodyModes > 1) {
+    throw new Error("rpcCall: body, rawBody, and rawBodyPath are mutually exclusive");
+  }
+  if (opts.rawBodyPath !== undefined && (!Number.isSafeInteger(opts.rawBodyLength) || (opts.rawBodyLength ?? -1) < 0)) {
+    throw new Error("rpcCall: rawBodyPath requires a safe rawBodyLength");
   }
   let bodyBuf: Buffer | null = null;
   let bodyContentType: string | null = null;
@@ -389,6 +397,9 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
   if (bodyBuf) {
     headers["content-type"] = bodyContentType!;
     headers["content-length"] = bodyBuf.length;
+  } else if (opts.rawBodyPath !== undefined) {
+    headers["content-type"] = opts.rawContentType ?? "application/octet-stream";
+    headers["content-length"] = opts.rawBodyLength!;
   }
   // CG3: trace id 头注入,跨 master → node-agent 边界。详见 _resolveEffectiveTraceId。
   headers[TRACE_ID_HEADER] = _resolveEffectiveTraceId(opts.traceId, target.hostId, opts.path);
@@ -497,7 +508,17 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
         `request to ${target.host}:${target.agentPort}${opts.path} failed: ${err.message}`,
       ));
     });
-    if (bodyBuf) req.end(bodyBuf);
+    if (opts.rawBodyPath !== undefined) {
+      const rs = createReadStream(opts.rawBodyPath);
+      rs.on("error", (err) => {
+        req.destroy();
+        settle(new AgentUnreachableError(
+          target.hostId,
+          `request body stream failed: ${err instanceof Error ? err.message : String(err)}`,
+        ));
+      });
+      rs.pipe(req);
+    } else if (bodyBuf) req.end(bodyBuf);
     else req.end();
   });
 }
@@ -911,10 +932,11 @@ export interface AgentFileStat {
 export async function statFile(
   target: NodeAgentTarget,
   remotePath: string,
-  opts?: { traceId?: string },
+  opts?: { traceId?: string; hash?: boolean },
 ): Promise<AgentFileStat> {
+  const hashQs = opts?.hash === false ? "&hash=0" : "";
   return rpcCall<AgentFileStat>(target, {
-    path: "/files/stat?path=" + encodeURIComponent(remotePath),
+    path: "/files/stat?path=" + encodeURIComponent(remotePath) + hashQs,
     method: "GET",
     timeoutMs: 15_000,
     traceId: opts?.traceId,
@@ -955,6 +977,182 @@ export async function getFile(
     }
     throw err;
   }
+}
+
+/**
+ * Stream a local file as the PUT body. The node-agent PUT cap is 200MiB;
+ * callers keep each body under that cap. This does not raise it.
+ */
+export async function putFileFromPath(
+  target: NodeAgentTarget,
+  remotePath: string,
+  localPath: string,
+  length: number,
+  mode = 0o644,
+  ownerUid?: number,
+  ownerGid?: number,
+  opts?: { traceId?: string },
+): Promise<void> {
+  let qs = `?path=${encodeURIComponent(remotePath)}&mode=${encodeURIComponent(mode.toString(8))}`;
+  const uidGiven = ownerUid !== undefined;
+  const gidGiven = ownerGid !== undefined;
+  if (uidGiven !== gidGiven) {
+    throw new Error(
+      `putFileFromPath: ownerUid and ownerGid must both be set or both omitted (got uid=${ownerUid} gid=${ownerGid})`,
+    );
+  }
+  if (uidGiven) {
+    qs += `&owner_uid=${encodeURIComponent(String(ownerUid))}&owner_gid=${encodeURIComponent(String(ownerGid))}`;
+  }
+  await rpcCall<void>(target, {
+    path: `/files${qs}`,
+    method: "PUT",
+    rawBodyPath: localPath,
+    rawBodyLength: length,
+    rawContentType: "application/octet-stream",
+    timeoutMs: 120_000,
+    traceId: opts?.traceId,
+  });
+}
+
+export async function usageForDir(
+  target: NodeAgentTarget,
+  remoteDir: string,
+  opts?: { traceId?: string },
+): Promise<{ usedBytes: number; truncated: boolean; files: { name: string; size: number; mtimeMs: number }[] }> {
+  return rpcCall(target, {
+    path: `/files/usage?dir=${encodeURIComponent(remoteDir)}`,
+    method: "GET",
+    timeoutMs: 60_000,
+    traceId: opts?.traceId,
+  });
+}
+
+export async function assembleFiles(
+  target: NodeAgentTarget,
+  args: {
+    remoteDir: string;
+    uploadId: string;
+    count: number;
+    ext: string;
+    expectedSize: number;
+    traceId?: string;
+  },
+): Promise<{ sha256: string; size: number }> {
+  const qs = new URLSearchParams({
+    dir: args.remoteDir,
+    id: args.uploadId,
+    count: String(args.count),
+    ext: args.ext,
+    expected: String(args.expectedSize),
+    mode: (0o644).toString(8),
+    owner_uid: "1000",
+    owner_gid: "1000",
+  });
+  return rpcCall(target, {
+    path: `/files/assemble?${qs.toString()}`,
+    method: "POST",
+    timeoutMs: 120_000,
+    traceId: args.traceId,
+  });
+}
+
+/**
+ * GET /files streamed to dest. The server certificate is verified on the
+ * response headers, before any byte is written to dest. A 4xx body is not piped.
+ */
+export async function streamFileTo(
+  target: NodeAgentTarget,
+  remotePath: string,
+  dest: NodeJS.WritableStream,
+  onReady: () => boolean,
+  opts?: { traceId?: string },
+): Promise<"ok" | "missing" | "rejected"> {
+  const master = await getMasterTls();
+  const headers: OutgoingHttpHeaders = {
+    accept: "application/octet-stream",
+  };
+  headers[TRACE_ID_HEADER] = _resolveEffectiveTraceId(opts?.traceId, target.hostId, "/files");
+  if (target.psk) headers.authorization = `Bearer ${target.psk.toString("hex")}`;
+  const path = `/files?path=${encodeURIComponent(remotePath)}`;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err: Error | null, value?: "ok" | "missing" | "rejected") => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(value ?? "ok");
+    };
+    const req = httpsRequest(
+      {
+        host: target.host,
+        port: target.agentPort,
+        method: "GET",
+        path,
+        headers,
+        ca: master.ca,
+        cert: master.cert,
+        key: master.key,
+        rejectUnauthorized: true,
+        checkServerIdentity: () => undefined,
+        servername: "node-agent",
+        timeout: 120_000,
+        agent: false,
+      },
+      (res) => {
+        const sock = res.socket as TLSSocket | null;
+        const status = res.statusCode ?? 0;
+        res.pause();
+        void (async () => {
+          try {
+            if (!sock) {
+              finish(new CertVerifyError(`tls socket unavailable at response for ${target.hostId}`));
+              return;
+            }
+            await verifyServerCert(sock, target.hostId, target.expectedFingerprint, target.requireFingerprint ?? false);
+            if (status === 404) {
+              res.resume();
+              res.destroy();
+              finish(null, "missing");
+              return;
+            }
+            if (status >= 400) {
+              res.resume();
+              res.destroy();
+              finish(new AgentAppError(target.hostId, status, null, `agent returned ${status}`));
+              return;
+            }
+            if (!onReady()) {
+              res.resume();
+              res.destroy();
+              finish(null, "rejected");
+              return;
+            }
+            res.on("error", (err) => finish(err));
+            res.on("end", () => finish(null, "ok"));
+            res.pipe(dest);
+            res.resume();
+          } catch (err) {
+            try {
+              res.destroy();
+            } catch { /* already closed */ }
+            finish(err instanceof Error ? err : new Error(String(err)));
+          }
+        })();
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      finish(new AgentUnreachableError(target.hostId, `request timeout to ${target.host}:${target.agentPort}${path}`));
+    });
+    req.on("error", (err) => {
+      finish(new AgentUnreachableError(
+        target.hostId,
+        `request to ${target.host}:${target.agentPort}${path} failed: ${err.message}`,
+      ));
+    });
+    req.end();
+  });
 }
 
 // ─── SSH ControlMaster RPC (C.1 stub → C.2 impl) ────────────────────

@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs'
 import { performance } from 'node:perf_hooks'
 import WebSocket from 'ws'
 import { tapResult } from './lib/user-contract.mjs'
+import { authorizeContractModelSwitch } from './lib/user-contract-switch-cost.mjs'
 
 const STOP_CASE = 'S1 Stop sent while the engine starts ends the turn before the model answers'
 const MODEL = 'gpt-6-luna'
@@ -155,7 +156,13 @@ async function stoppedTurn(token, peer, cmid) {
   if (waits.length > 0) throw new Error(`stopped turn still asked the user: ${[...new Set(waits)].join(',')}`)
 }
 
-function plainTurn(token, peer, cmid, text) {
+async function plainTurn(token, peer, cmid, text) {
+  const frame = messageFrame(peer, cmid, text)
+  const approval = await authorizeContractModelSwitch((path, init) => api(token, path, init), {
+    sessionId: peer, requestId: cmid, targetModel: MODEL, agentId: 'main', text, mediaCount: 0,
+  })
+  if (approval.consent) frame.modelSwitchConsent = approval.consent
+  console.log(`# follow-up cost mode=${approval.mode} confirmed=${approval.confirmed}`)
   return new Promise((resolve, reject) => {
     openSocket(token).then((ws) => {
       let done = false
@@ -183,7 +190,7 @@ function plainTurn(token, peer, cmid, text) {
             : finish(new Error(`follow-up turn committed as ${f.meta.reconcile}`))
       })
       ws.on('close', () => finish(new Error('chat socket closed before the follow-up final')))
-      ws.send(JSON.stringify(messageFrame(peer, cmid, text)))
+      ws.send(JSON.stringify(frame))
     }, reject)
   })
 }
@@ -193,10 +200,12 @@ try {
   if (!password) throw new Error('Canary password file is empty')
   // Placeholder token: passes only through the account-level Turnstile allowlist the canary is
   // on (same convention as v5-go-cache-contract.mjs); any other account is refused.
-  const { access_token: token } = await api(null, '/api/auth/login', {
+  const identity = await api(null, '/api/auth/login', {
     method: 'POST',
     body: JSON.stringify({ email, password, turnstile_token: 'x' }),
   })
+  if (String(identity.user_id ?? identity.user?.id ?? '') !== '765') throw new Error('Stop contract requires canary uid765')
+  const token = identity.access_token
   if (typeof token !== 'string' || !token) throw new Error('login returned no access token')
   const models = (await api(token, '/api/public/models')).models ?? []
   if (!models.some((m) => m.id === MODEL)) throw new Error(`model ${MODEL} is not in the canary's catalog`)

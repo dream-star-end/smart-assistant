@@ -205,6 +205,12 @@ export class CursorSandAdapter extends CcbAdapter {
     }
   }
 
+  /** The relay calls Cursor itself, so it carries the turn trace for its logs and egress passthrough (OCV5-596). */
+  override setTraceId(traceId: string | undefined): void {
+    super.setTraceId(traceId)
+    this.relay.setTraceId(traceId)
+  }
+
   override submitTurn(params: TurnParams): EngineTurnRun {
     const generation = this.lifecycleGeneration
     const startedAt = Date.now()

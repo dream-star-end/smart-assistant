@@ -1,3 +1,4 @@
+import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
 /**
  * Gateway lifecycle: start-up, shutdown, boot auto-resume, turn-dispatch inbox recovery, notifier and scheduler ticks
@@ -8,6 +9,8 @@ import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
  * touches (typed from the class itself).
  */
 import { mkdirSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs'
+import { startUploadRetention, stopUploadRetention } from './uploadRetention.js'
+import type { LogContext } from './logger.js'
 import { createServer } from 'node:http'
 import { join, resolve } from 'node:path'
 import type { ChannelContext } from '@openclaude/plugin-sdk'
@@ -75,8 +78,10 @@ import {
 } from './localExecution.js'
 import { makePeerKey, PENDING_PERMISSION_SWEEP_MS } from './server.js'
 import type { Gateway } from './server.js'
+import { handedOffDelegateRetryDelay, retryHandedOffDelegateNotifies } from './delegateWaitHandoff.js'
 
 export interface GatewayLifecycleHost {
+  _activeSendToAgentCallbacks: Gateway['_activeSendToAgentCallbacks']
   _armNotifyRetryScheduler: Gateway['_armNotifyRetryScheduler']
   _containerPreview: Gateway['_containerPreview']
   _delegateJobs: Gateway['_delegateJobs']
@@ -403,7 +408,7 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       let totalCleaned = 0
       let dirsSwept = 0
       for (const entry of readdirSync(volsRoot)) {
-        if (!/^oc-v3-data-u[1-9][0-9]{0,18}$/.test(entry)) continue
+        if (!/^oc-(v3|v5)-data-u[1-9][0-9]{0,18}$/.test(entry)) continue
         const userUploads = join(volsRoot, entry, '_data', 'uploads')
         const r = sweepTmpInDir(userUploads)
         if (r >= 0) {
@@ -425,8 +430,28 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       this.log.warn('upload .tmp orphan cleanup (per-user) failed', undefined, err)
     }
   }
+  try {
+    startUploadRetention({
+      info: (msg, ctx) => {
+        this.log.info(msg, ctx as LogContext | undefined)
+      },
+      warn: (msg, ctx, err) => {
+        this.log.warn(msg, ctx as LogContext | undefined, err)
+      },
+    })
+  } catch (err) {
+    this.log.warn('upload retention arm failed', undefined, err)
+  }
 
   this.httpServer = createServer((req, res) => this.handleHttp(req, res))
+  // Loopback CLI relays (Antigravity Go net/http, Codex, CCB, MCP) stream SSE for
+  // minutes and pool idle connections across tool executions (Go DefaultTransport
+  // IdleConnTimeout = 90s). Node's default requestTimeout (300s) and keepAliveTimeout
+  // (5s) otherwise close pooled sockets mid-tool-call (~5.0s-5.7s), causing
+  // `read tcp 127.0.0.1:xxxxx->127.0.0.1:18789: read: connection reset by peer`.
+  this.httpServer.requestTimeout = 0
+  this.httpServer.keepAliveTimeout = 120_000
+  this.httpServer.headersTimeout = 125_000
   // V3 2H: 改用 noServer + 手动 upgrade dispatch,以便商业化模块的 /ws/user-chat-bridge
   // 与 /ws/agent 路径在 gateway 自身的 /ws 之前优先匹配。原 `path: '/ws'` 模式下
   // ws lib 会对所有非 /ws 请求 socket.destroy(),把商业化路径吃掉。
@@ -787,6 +812,7 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       },
     })
     this._taskboardPatrol = new PatrolEngine({
+      preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model })(stages),
       getDb: () => getTaskboardDb(),
       delegate: (input) => this._runTaskboardDelegate(input),
       log: (msg, extra) => this.log.info(msg, extra),
@@ -935,6 +961,10 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
   logTimingStops.delete(this)
   this.log.info('shutting down')
 
+  // ── Stage 0: start settling remote engine runs while the container's stop
+  // grace still has room (sessions are only drained at Stage 4). ──
+  this.sessions.beginPlannedShutdown()
+
   // ── Stage 1: stop accepting new traffic ──
   // `httpServer.close()` stops accepting new HTTP connections but lets
   // in-flight requests finish. WS upgrade happens via the HTTP server so
@@ -981,6 +1011,9 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
     clearInterval(this._taskSchedulerTimer)
     this._taskSchedulerTimer = null
   }
+  try {
+    stopUploadRetention()
+  } catch {}
   if (this._taskboardTickTimer !== null) {
     clearInterval(this._taskboardTickTimer)
     this._taskboardTickTimer = null
@@ -1175,6 +1208,12 @@ export async function bootAutoResume(this: GatewayLifecycleHost): Promise<void> 
         kind: 'prewarm',
         defaultModel: this.deps.config.defaults.model,
       })
+      // As sessionPreheat: a Codex pre-warm without its route would check the chat's
+      // thread against the local rollout store and drop a remote lane's thread id.
+      if (preExec?.engine === 'codex') {
+        this.log.info('engine_preheat_skipped', { sessionKey, outcome: 'skipped_route_unknown' })
+        continue
+      }
       await this.sessions.getOrCreate({
         sessionKey,
         agent,
@@ -1369,19 +1408,25 @@ export function _armNotifyRetryScheduler(this: GatewayLifecycleHost): void {
   }
   if (!this._delegateJobs) return
   const notifierOn = isDelegateNotifierEffective()
-  if (!notifierOn && !isDelegateDurableEffective()) return
-  const delay = notifierOn
-    ? delayUntilNextNotifyRetry(this._delegateJobs)
-    : delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
+  const handoffDelay = notifierOn ? undefined : handedOffDelegateRetryDelay(this._delegateJobs)
+  const cronDelay = !notifierOn && isDelegateDurableEffective()
+    ? delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
         callbacks: ['cron-origin-inject'],
         skipLegacyCron: true,
       })
+    : undefined
+  const delay = notifierOn
+    ? delayUntilNextNotifyRetry(this._delegateJobs)
+    : [handoffDelay, cronDelay].filter((value): value is number => value !== undefined).sort((a, b) => a - b)[0]
   if (delay == null) return
   this._notifyRetryTimer = setTimeout(() => {
     this._notifyRetryTimer = undefined
     const work = notifierOn
       ? this._retryDelegateNotifies({ dueOnly: true })
-      : this._drainFlagOffCronOriginNotifies({ dueOnly: true })
+      : Promise.all([
+          this._drainFlagOffCronOriginNotifies({ dueOnly: true }),
+          retryHandedOffDelegateNotifies(this),
+        ])
     void work.finally(() => this._armNotifyRetryScheduler())
   }, delay)
   this._notifyRetryTimer.unref()

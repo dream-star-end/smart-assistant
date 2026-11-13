@@ -3,6 +3,8 @@
  *
  * 流程（每篇 markdown 投稿一个 community_tutorial_moderation_jobs 行）：
  *   1. 提交时已同步做过泄密扫描（scanMarkdownBody）。
+ *   1b. 有可用 OpenAI key 时，先用免费 omni-moderation-latest 拦硬违规。
+ *       无 key、未命中或调用失败则继续下面的原文审核，不阻断。
  *   2. 正文：平台 deepseek-v4-flash（与市场 AI 审批同一条 fetchPlatformFlash 通道）四问
  *      violation / ad / leak / low_quality，外加一问 addresses_moderator（稿件是否在对审核者
  *      下指令）；每问 yes|no + confidence，强制工具调用拿结构化结果。
@@ -33,6 +35,8 @@ import sharp from 'sharp'
 import { request as undiciRequest, type Dispatcher } from 'undici'
 
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
+import { omniCategoryLabels, omniHardHit } from '../openai/omniModeration.js'
+import { selectOpenAiPlatformKey } from '../openai/openAiPlatformKey.js'
 import { getFreshGrokAccessToken } from '../account-pool/grokOAuth.js'
 import { query, tx, type QueryRunner } from '../db/queries.js'
 import { fetchPlatformFlash } from '../http/proxy/shared.js'
@@ -664,6 +668,36 @@ type Target = { kind: 'post'; version: number } | { kind: 'revision'; revisionId
 
 type Usage = { inputTokens: number; outputTokens: number }
 
+
+/** 免费硬违规前置。未命中、无 key、调用失败都返回 null，交给原审核。 */
+export async function prefilterTutorialWithOmni(input: {
+  title: string
+  summary: string
+  bodyMarkdown: string
+  images: Array<{ body: Buffer }>
+  apiKey: string | null
+  fetchImpl?: typeof fetch
+}): Promise<ModerationDecision | null> {
+  try {
+    const result = await omniHardHit({
+      apiKey: input.apiKey,
+      text: `${input.title}\n${input.summary}\n${input.bodyMarkdown}`,
+      images: input.images.map((image) => ({ body: image.body })),
+      fetchImpl: input.fetchImpl,
+      timeoutMs: 4_000,
+    })
+    if (!result.hit) return null
+    const labels = omniCategoryLabels(result.categories)
+    return {
+      verdict: 'reject',
+      reason: REJECT_REASON.violation,
+      adminNote: `免费审核拦截：${labels}`.slice(0, 500),
+    }
+  } catch {
+    return null
+  }
+}
+
 /** 拿到租约后跑一篇。返回本次结论（测试与日志用）。 */
 export async function runTutorialModerationJob(
   job: ClaimedJob,
@@ -696,13 +730,6 @@ export async function runTutorialModerationJob(
   const images: ImageVerdict[] = []
   let imagesUnreviewed = false
   try {
-    const evaluated = await evaluateTutorialText(
-      { title: post.title, summary: post.summary, bodyMarkdown: post.body_markdown },
-      transport,
-    )
-    text = evaluated.verdict
-    usage.inputTokens += evaluated.inputTokens
-    usage.outputTokens += evaluated.outputTokens
     const blobs =
       target.kind === 'revision'
         ? await listRevisionImages(target.revisionId)
@@ -715,6 +742,42 @@ export async function runTutorialModerationJob(
               [job.publicationId],
             )
           ).rows
+    let openAiKey: string | null = null
+    try {
+      openAiKey = await selectOpenAiPlatformKey('tutorial-moderate')
+    } catch {
+      openAiKey = null
+    }
+    const pre = await prefilterTutorialWithOmni({
+      title: post.title,
+      summary: post.summary,
+      bodyMarkdown: post.body_markdown,
+      images: blobs.map((blob) => ({
+        body: Buffer.isBuffer(blob.body) ? blob.body : Buffer.from(blob.body),
+      })),
+      apiKey: openAiKey,
+    })
+    if (pre) {
+      const injection = detectPromptInjection(`${post.title}\n${post.summary}\n${post.body_markdown}`)
+      const applied = await settle(job, owner, post, target, {
+        verdict: 'reject',
+        decision: pre,
+        text: null,
+        images: [],
+        injection,
+        usage,
+        latencyMs: Date.now() - started,
+        errorCode: null,
+      })
+      return applied ? 'reject' : 'lost'
+    }
+    const evaluated = await evaluateTutorialText(
+      { title: post.title, summary: post.summary, bodyMarkdown: post.body_markdown },
+      transport,
+    )
+    text = evaluated.verdict
+    usage.inputTokens += evaluated.inputTokens
+    usage.outputTokens += evaluated.outputTokens
     if (blobs.length > 0 && !tutorialVisionEnabled(env)) imagesUnreviewed = true
     else {
       for (const blob of blobs) {

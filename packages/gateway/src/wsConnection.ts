@@ -1,4 +1,7 @@
 import { withUserError } from '@openclaude/protocol'
+import { SYSTEM_HELP_CAPABILITY, takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { captureSystemHelpFrame } from './systemHelpFrames.js'
+import { getSystemHelpRelay } from './systemHelpRelay.js'
 /**
  * Gateway WebSocket connection: connection lifecycle, hello auto-resume, stop, delivery and stamped/status frames
  *
@@ -206,6 +209,7 @@ export function handleWsConnection(
           this._durableTurnDispatchReady,
         ),
       ]
+      if (this._dispatchAuthority.enabled && this._durableTurnDispatchReady && getSystemHelpRelay(this.sessions)) attestFrame.capabilities.push(SYSTEM_HELP_CAPABILITY)
       ws.send(JSON.stringify(attestFrame))
     } catch (err) {
       this.log.warn('model_authority.attest_send_failed', {
@@ -232,6 +236,7 @@ export function handleWsConnection(
         ws.send(JSON.stringify(withUserError({ type: 'error', error: 'invalid json' })))
         return
       }
+      const systemHelpBootstrap = takeSystemHelpBootstrap(frame)
       // Client-side application-level ping. Echo a pong (preserving the
       // optional id) so the client's watchdog can distinguish a live socket
       // from one that's still readyState=1 but frozen by an iOS Safari
@@ -415,6 +420,7 @@ export function handleWsConnection(
         // 无票据(非 durable / 非 webchat-DM / 未 enabled)→ return true 放行 legacy;
         // dispatch 票据与 prompt-queue grant 互斥,故此门失败无 queue grant 需取消。
         if (!this._consumeDispatchAuthority(ws, frame as any, isFromBridge)) return
+        captureSystemHelpFrame(frame as object, systemHelpBootstrap, isFromBridge)
         if (isFromBridge) (this.trustedGoalFrames ??= new WeakSet()).add(frame as object)
         // biome-ignore lint/performance/noDelete: moved verbatim from server.ts (OCV5-483); pre-existing there
         else delete (frame as any)._goalState
@@ -853,7 +859,10 @@ export async function autoResumeFromHello(
             kind: 'prewarm',
             defaultModel: this.deps.config.defaults.model,
           })
-          session = await this.sessions.getOrCreate({
+          // As sessionPreheat: a Codex pre-warm without its route would check the chat's
+          // thread against the local rollout store and drop a remote lane's thread id. The
+          // socket is still registered and its replay cursor still served below.
+          if (preExec?.engine !== 'codex') session = await this.sessions.getOrCreate({
             sessionKey,
             agent,
             ...localExecutionOverride(preExec),
@@ -1455,14 +1464,24 @@ export function deliver(
         ? (wire as { sessionKey: string }).sessionKey
         : undefined
     const current = (wire as { clientMessageId?: unknown }).clientMessageId
-    const rebound = rebindOutboundClientMessageId({
-      clientMessageId: typeof current === 'string' ? current : undefined,
-      sessionKey,
-      isFenced: (sk, cmid) => this._outboundRing?.isTurnFenced(sk, cmid) === true,
-      openTurnClientMessageId: sessionKey
-        ? this._outboundRing?.activeTurnClientMessageId(sessionKey)
-        : undefined,
-    })
+    const blocks = (wire as { blocks?: Array<{ kind?: unknown }> }).blocks
+    const isUnboundDelegateProgressOnly =
+      wire.type === 'outbound.message' &&
+      !(wire as { isFinal?: boolean }).isFinal &&
+      typeof current !== 'string' &&
+      Array.isArray(blocks) &&
+      blocks.length > 0 &&
+      blocks.every((b) => b?.kind === 'delegate_progress')
+    const rebound = isUnboundDelegateProgressOnly
+      ? undefined
+      : rebindOutboundClientMessageId({
+          clientMessageId: typeof current === 'string' ? current : undefined,
+          sessionKey,
+          isFenced: (sk, cmid) => this._outboundRing?.isTurnFenced(sk, cmid) === true,
+          openTurnClientMessageId: sessionKey
+            ? this._outboundRing?.activeTurnClientMessageId(sessionKey)
+            : undefined,
+        })
     if (rebound) (wire as { clientMessageId?: string }).clientMessageId = rebound
     // biome-ignore lint/performance/noDelete: moved verbatim from server.ts (OCV5-483); pre-existing there
     else delete (wire as { clientMessageId?: string }).clientMessageId
@@ -1673,7 +1692,7 @@ export function _consumeFrameAuthority(
 
   if (!hasEnvelope) {
     if (this._modelAuthority.required) {
-      this._rejectAuthority(ws, 'missing', 'inbound frame carries no model authority')
+      this._rejectAuthority(ws, 'missing', 'inbound frame carries no model authority', frame)
       return false
     }
     return true
@@ -1691,7 +1710,7 @@ export function _consumeFrameAuthority(
       err instanceof AuthorityRejected
         ? err
         : new AuthorityRejected('bad_shape', (err as Error)?.message ?? String(err))
-    this._rejectAuthority(ws, rejection.code, rejection.message)
+    this._rejectAuthority(ws, rejection.code, rejection.message, frame)
     return false
   }
 }

@@ -93,7 +93,7 @@ describe("GithubRepoModal", () => {
     renderModal();
     expect(await screen.findByText(/加载失败/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /连接 GitHub/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
   });
 
   // GH-02：草稿态（无 sessionId）「确认绑定」禁用此前没有任何提示。

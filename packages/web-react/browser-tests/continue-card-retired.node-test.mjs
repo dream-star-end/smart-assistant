@@ -42,10 +42,10 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
       b.onLoad({ filter: /\/components\/MessageRenderer\.tsx$/ }, ({ path }) => {
         assert.equal(resolve(path), rendererPath);
         const contents = readFileSync(path, "utf8");
-        const needle = "manuallyContinuedSourceIds.has(m._clientMessageId))";
+        const needle = "const manuallyContinuedSourceIds = new Set(\n    safeMessages";
         assert.equal(contents.split(needle).length - 1, 1);
         transformCount += 1;
-        return { contents: contents.replace(needle, "false)"), loader: "tsx" };
+        return { contents: contents.replace(needle, "const manuallyContinuedSourceIds = new Set(\n    ([] as ChatMessage[])"), loader: "tsx" };
       });
     }}] : [], logLevel: "warning",
   });
@@ -87,6 +87,13 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
         };
         return;
       }
+      if (frame.content?.displayText === "继续") {
+        scenario.followups.push(frame);
+        send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
+        send({ type: "outbound.message", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq,
+          blocks: [{ kind: "text", text: "CONTINUE_NORMAL_FOLLOWUP_COMPLETED" }], isFinal: true });
+        return;
+      }
       assert.equal(scenario.source, null, "only one original Composer request");
       scenario.source = id;
       send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
@@ -107,7 +114,7 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
   try {
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
     for (const [width, decline] of [[1280, false], [390, false], [1280, true]]) await t.test(`${width} ${decline ? "declined continuation brings the card back" : "running continuation retires the card"}`, async () => {
-      scenario = { source: null, children: [], seq: 0, decline, finish: null, running: false };
+      scenario = { source: null, children: [], followups: [], seq: 0, decline, finish: null, running: false };
       preview.store.board = []; preview.store.older = []; preview.store.revision += 1;
       const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width === 390, hasTouch: width === 390 });
       const page = await context.newPage(); const errors = [];
@@ -118,7 +125,7 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
         await page.getByRole("button", { name: "发送", exact: true }).click();
         const card = page.getByRole("alert");
         await card.waitFor();
-        const resume = page.getByRole("button", { name: "从断点继续" });
+        const resume = page.getByRole("button", { name: "继续", exact: true });
         await resume.waitFor();
         assert.equal(await card.count(), 1, "one committed failure card");
         assert.equal(scenario.children.length, 0, "an unproven Bash effect is never continued automatically");
@@ -128,17 +135,30 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
         if (decline) {
           await until("the declined card is back with its notice", async () =>
             (await card.count()) === 1 && (await card.innerText()).includes("未从断点继续"));
-          assert.equal(await page.getByRole("button", { name: "从断点继续" }).count(), 0, "a declined continuation is not offered again");
+          // The denied checkpoint is never retried. The newer explicit Continue
+          // action may instead admit an ordinary, non-replay follow-up.
+          await page.getByRole("button", { name: "继续", exact: true }).click();
+          await page.getByText("CONTINUE_NORMAL_FOLLOWUP_COMPLETED", { exact: true }).waitFor();
+          assert.equal(scenario.children.length, 1, "the declined checkpoint is not offered again");
+          assert.equal(scenario.followups.length, 1);
+          assert.equal(scenario.followups[0].content.recovery, undefined);
+          assert.notEqual(scenario.followups[0].clientMessageId, scenario.source);
+          assert.notEqual(scenario.followups[0].content.text, "CONTINUE_ORIGINAL_REQUEST");
+          assert.match(scenario.followups[0].content.text, /CONTINUE_ORIGINAL_REQUEST/);
+          assert.match(scenario.followups[0].content.text, /不要重新执行已经完成的步骤/);
           assert.deepEqual(errors, []);
           console.log("CONTINUE_CARD_RECEIPT", JSON.stringify({ width, decline, children: 1, cardBack: true, red, transformCount }));
           return;
         }
         // The page itself shows the continuation's command running: the process
         // shell is active and counts the resumed command next to the saved one.
-        const running = page.locator('[data-testid="process-disclosure"][data-process-active="true"]')
-          .getByTestId("process-toggle").filter({ hasText: /正在运行命令.*命令 2 项/ });
+        const running = page.locator('[data-testid="process-disclosure"][data-process-active="true"]');
         await running.waitFor();
+        // UI-3 renders the running command in the rail when it is open,
+        // rather than duplicating that label in the shell toggle.
+        await running.getByText("正在运行命令", { exact: true }).waitFor();
         assert.equal(scenario.running, true);
+        assert.ok(preview.store.board.some(row => row.output === "CONTINUE_TOOL_RESULT"), "the saved original tool result is retained");
         // While the continuation runs the source card is resolved, not a live failure.
         assert.equal(await card.count(), 0, "running continuation: the committed failure card is retired");
         assert.equal(await page.getByRole("button", { name: /重新尝试|从断点继续/ }).count(), 0, "running continuation: no retry or resume button remains");

@@ -16,6 +16,8 @@
 #   · 只判 subject ^fix(v5) 且触碰 packages/{gateway,commercial,web-react,protocol,storage}/
 #   · trailer 缺失 → 红(仅 aa583b70 exact emergency 例外,与 TS 一致)
 #   · `Incident: none ...` → 必须在 incident-waivers.json 有 waiver 且未过期
+#     唯一不可变例外是 da9cd548 这一个完整 SHA（管家 2026-11-01 批准）。
+#     不延长原 waiver，不冻结它的祖先。
 #   · 否则必须匹配 ^INC-[0-9]{8}-[A-Z0-9-]{3,40}$ 且在 incidents.json 内且 lineage 含本 commit
 #
 # 本脚本**不**复算 incidents.json 的锚点/layer/runner 等重校验 —— 那些留给 TS 权威门;
@@ -46,6 +48,12 @@ SURFACES=(packages/gateway/ packages/commercial/ packages/web-react/ packages/pr
 INC_RE='^INC-[0-9]{8}-[A-Z0-9-]{3,40}$'
 # 与 TS 门完全相同的唯一 exact emergency 例外(不可变 P0 containment)。
 EMERGENCY_SHA="aa583b702d5e454801e90ff3c6b25df38e808a98"
+# 2026-11-01 管家批准。已上线、不可改写、原 waiver 于 2026-10-31 过期。
+# 不延长 waiver，不冻结祖先。只豁免这一个完整 SHA。
+IMMUTABLE_EXPIRED_WAIVER_SHA="da9cd5484db3b0e5c882f4032ee09685c4e5b5a7"
+# 用户逐条批准（ae3b779 2026-11-06，de3ca8e4 2026-11-08）。已推送到共享分支、不可改写、缺 Incident trailer。
+# 只豁免这些完整 SHA，且必须有 commit 完全相等、未过期的 waiver；不冻结祖先。
+PUSHED_MISSING_TRAILER_SHAS=" ae3b77946db724b6b53b717aceeb5506213158c0 de3ca8e4c1a801499aa771172924af06f09d0c8d "
 
 g() { git -C "$REPO" "$@"; }
 say() { [[ "$QUIET" == 1 ]] || echo "$*"; }
@@ -144,6 +152,11 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
       if [[ "$exp" < "$today" ]]; then bad "$sha8 的 emergency trailer waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
       continue
     fi
+    if [[ "$PUSHED_MISSING_TRAILER_SHAS" == *" $sha "* && -n "$w"&& "$(jq -r '.commit' <<<"$w")" == "$sha" ]]; then
+      exp="$(jq -r '.expiresAt' <<<"$w")"
+      if [[ "$exp" < "$today" ]]; then bad "$sha8 的缺 trailer 例外 waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
+      continue
+    fi
     bad "$sha8 \"$subject\" 触碰用户可见面但缺 trailer:Incident: INC-YYYYMMDD-SLUG,或 Incident: none (<理由>) + waiver"
     violations=$((violations + 1)); continue
   fi
@@ -168,7 +181,13 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
       bad "$sha8 声明 Incident: none,但 $WAIVERS 里没有对应 waiver"; violations=$((violations + 1)); continue
     fi
     exp="$(jq -r '.expiresAt' <<<"$w")"
-    if [[ "$exp" < "$today" ]]; then bad "$sha8 的 waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
+    commit="$(jq -r '.commit' <<<"$w")"
+    if [[ "$exp" < "$today" ]]; then
+      if [[ "$sha" == "$IMMUTABLE_EXPIRED_WAIVER_SHA" && "$exp" == "2026-10-31" && "$commit" == "$IMMUTABLE_EXPIRED_WAIVER_SHA" ]]; then
+        continue
+      fi
+      bad "$sha8 的 waiver 已于 $exp 过期"; violations=$((violations + 1))
+    fi
     continue
   fi
 

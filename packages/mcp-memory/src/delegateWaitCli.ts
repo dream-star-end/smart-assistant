@@ -5,7 +5,9 @@
  * a bounded segment returns the same pending jobIds for the next call.
  */
 import {
+  delegateLeaderResultBudget,
   formatDelegateHttpResult,
+  formatDelegateDeferred,
   interpretDelegateWaitBody,
   isTransientDelegateWaitError,
   type FormattedDelegateResult,
@@ -120,6 +122,10 @@ export async function runDelegateWaitLoop(opts: {
     for (const { jobId, view } of views) {
       if (view.kind === 'running') continue
       pending.delete(jobId)
+      if (view.kind === 'deferred') {
+        results.set(jobId, { kind: 'deferred', jobId, text: formatDelegateDeferred(jobId, jobId) })
+        continue
+      }
       if (view.kind === 'expired') {
         results.set(jobId, { kind: 'error', text: `委派失败: ${view.error}` })
         continue
@@ -128,7 +134,15 @@ export async function runDelegateWaitLoop(opts: {
         results.set(jobId, { kind: 'error', text: view.error })
         continue
       }
-      results.set(jobId, formatDelegateHttpResult(view.httpStatus, view.body, jobId))
+      results.set(
+        jobId,
+        formatDelegateHttpResult(
+          view.httpStatus,
+          view.body,
+          jobId,
+          delegateLeaderResultBudget(unique.length),
+        ),
+      )
     }
     if (pending.size === 0) break
     if (

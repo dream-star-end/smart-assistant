@@ -1,17 +1,26 @@
+import { createBoxFailureDiagnostics } from "./http/proxy/boxFailureDiagnostic.js";
 import { resolveContainerLinkEndpoint } from "./ws/containerLinkEndpoint.js";
 import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
 import { recoveryDecisionFrame } from './ws/recoveryPresentation.js';
 import { configurePluginCatalog } from './plugins/catalogPolicy.js';
+import { configureModelAvailability, isModelAvailable } from './billing/modelAvailability.js';
+import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
-import { readCcbNativeRestoreArchive } from './db/pgSessionsBackend.js';
+import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
+import { assembleSystemActions, type SystemSessionReadBackend } from './system-assistant/assemble.js'
+import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
+import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
+import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
 import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
 import { isInMaintenance } from './middleware/maintenanceMode.js';
-import { HttpError } from './http/util.js';
+import { HttpError, sendJson } from './http/util.js';
 import { startLogTimingReporter } from './logging/logTimingReporter.js';
-import { setContentReviewAlerter } from '@openclaude/gateway'
+import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/gateway'
+import { omniHardHit } from './openai/omniModeration.js'
+import { selectOpenAiPlatformKey } from './openai/openAiPlatformKey.js'
 import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
@@ -59,6 +68,8 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
+import { createMasterCc5Runtime, selectMasterCc5Backend } from "./agent-sandbox/cc5Runtime.js";
+import { createRemoteNativeTurnFinance, recoverRemoteNativeTurnBilling } from "./billing/remoteNativeTurnBilling.js";
 import {
   cursorExternalApiOutboxDirForFlavor,
   openCursorExternalApiOutbox,
@@ -78,6 +89,8 @@ import {
 import { loadConfig, type CommercialConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
+import { CodexCommissioning } from "./account-pool/codexCommissioning.js";
+import { makeAdminCommissionContainerSource } from "./account-pool/codexCommissioningContainer.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { deriveMediaSignKey } from "./http/mediaSign.js";
 import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
@@ -92,16 +105,16 @@ import { canUseModel } from "./billing/authzModels.js";
 import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
 import { setPlatformFlashFallbackKey } from "./http/proxy/shared.js";
 import { getPreferences, patchPreferences } from "./user/preferences.js";
-import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import {
   getPhase6AccountUuidEnforce,
   getSessionPinMode,
 } from "./admin/runtimeFlags.js";
-import { LITERATURE_SKILL_POINTER } from "./literatureSkill.js";
+import { literatureSkillSlotProvider } from "./literatureSkill.js";
 import {
   estimateMaxCost,
   InsufficientCreditsError,
   preCheckWithCost,
+  readTotalSpendableBalance,
   releasePreCheck,
   type ReservationHandle,
   wrapIoredisForPreCheck,
@@ -185,6 +198,7 @@ import {
   startApiKeyPoolCache,
 } from "./account-pool/apiKeyPool.js";
 import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
+import { registerRemoteBrainPoolAdapter } from "./account-pool/remoteBrainPool.js";
 import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
 import { configureAffinitySettings } from "./account-pool/policy/affinity.js";
 import { getSystemSetting } from "./admin/systemSettings.js";
@@ -343,6 +357,11 @@ import {
   type DelegateGrokRouteHandler,
 } from "./http/internalDelegateGrokRoute.js";
 import {
+  isDelegateAntigravityRoutePath,
+  makeDelegateAntigravityRouteHandler,
+  type DelegateAntigravityRouteHandler,
+} from "./http/internalDelegateAntigravityRoute.js";
+import {
   GROK_RELAY_PREFIX,
   makeGrokRelayHandler,
   makeGrokRelayHealthRecorder,
@@ -476,6 +495,9 @@ import {
   makeDelegateEngineBillingHandler,
   type DelegateEngineBillingRuntime,
 } from "./http/internalDelegateEngineBilling.js";
+import { DELEGATE_TRACE_PATH, makeDelegateTraceHandler } from "./http/internalDelegateTrace.js";
+import { makeCommercialRuntimeStatus, type CommercialRuntimeStatus } from "./runtimeStatus.js";
+export type { CommercialRuntimeStatus } from "./runtimeStatus.js";
 import { createDelegateEngineBillingRuntime } from "./billing/delegateEngineBillingRuntime.js";
 import {
   applyAutoDreamPreferenceAction,
@@ -512,7 +534,6 @@ import {
   peekModelCatalogCache,
 } from "./billing/modelCatalogRuntime.js";
 import {
-  MASTER_CAPABILITIES,
   assertModelAuthorityCutoverFloor,
 } from "./runtimeCapabilities.js";
 import {
@@ -541,6 +562,7 @@ import {
 } from "@openclaude/storage";
 import {
   createPgSessionsBackend,
+  readPgChatProject,
   commitVisibleLosslessTurnPhaseA,
   _setAfterLosslessStageBatch,
   type AutomaticRecoveryDecision,
@@ -559,7 +581,6 @@ import {
   DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
 } from "./dispatch/turnDispatchReconciler.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
-import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
@@ -597,11 +618,6 @@ import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlan
 import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
 import { createCommercialLiteratureRuntime } from './plugins/literatureDb/jieyouLoginSession.js'
-import {
-  LITERATURE_ARTIFACT_LOG_MSG,
-  LITERATURE_CALL_LOG_MSG,
-  type LiteratureCallEvent,
-} from './plugins/literatureDb/observability.js'
 import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
 import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
 import {
@@ -661,7 +677,7 @@ import {
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
-import { resolveMiniMaxMediaKey } from "./minimax/mediaKey.js";
+import { mediaProxyKey } from "./minimax/mediaKey.js";
 import { createMuseFromConfig } from "./muse/assemble.js";
 import { createStudioFromConfig } from "./media-studio/assemble.js";
 import { startStudioOrchestrator } from "./media-studio/orchestrator/assemble.js";
@@ -720,7 +736,7 @@ import {
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz, scopeFromAuthz } from "./auth/userModelAuthz.js";
-import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
+import { getProviderRoutingAvailability, getDegradedProviders } from "./admin/providerHealthGate.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
 import { makeExternalModelsHandler, type ExternalModelsHandler } from "./http/proxy/externalModels.js";
@@ -755,6 +771,7 @@ import {
   type CodexFinalizeHandle,
 } from "./billing/codexFinalizer.js";
 import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
+import {makeModelSwitchCostService} from './billing/modelSwitchCostTarget.js';
 import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
 import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
 import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";
@@ -822,6 +839,7 @@ import {
   deleteFile as nodeAgentDeleteFile,
   getFile as nodeAgentGetFile,
 } from "./compute-pool/nodeAgentClient.js";
+import { createRemoteHostChunkHooks, type RemoteHostChunkHooks } from "./compute-pool/remoteHostChunkHooks.js";
 import { createContainerService } from "./compute-pool/containerService.js";
 import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
 import { initComputePool } from "./compute-pool/poolInit.js";
@@ -900,37 +918,8 @@ function shouldAutoMigrate(
  * 经 RegisterCommercialResult 暴露给 gateway,gateway 仅在 /healthz 透传序列化。
  * 用作"控制面是否静默 / 容器·agent 运行时是否启用 / 灰度归属(channel)"的只读断言面。
  */
-export interface CommercialRuntimeStatus {
-  /** 运行时 channel 单一权威(OC_RUNTIME_CHANNEL),默认 "v3"。 */
-  channel: string;
-  /** 后台控制面 mutator 是否启用(v5 follower 恒为 false)。 */
-  controlPlaneEnabled: boolean;
-  /** 启动是否执行了共享 PG migration(COMMERCIAL_AUTO_MIGRATE)。 */
-  autoMigrate: boolean;
-  /** legacy agent 运行时(AGENT_IMAGE/docker)状态。 */
-  agentRuntime: "enabled" | "disabled";
-  /** v3 supervisor 容器运行时(OC_RUNTIME_IMAGE)状态。 */
-  containerRuntime: "enabled" | "disabled";
-  /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。live getter:反映 LeaderBundle 实时启停。 */
-  schedulers: string[];
-  /**
-   * 本 master 构建实现的协议能力(见 runtimeCapabilities.ts)。**构建级事实,不是开关态** ——
-   * deploy 的四面 capability 守卫读 `/healthz` 的 `runtime.capabilities` 判断"这个 master
-   * 版本认不认模型权威协议",据此拒绝把不认的旧版本翻上来(方案 §7 步 5 兼容地板)。
-   * 注:gateway 顶层的 `body.capabilities` 是**容器 file-proxy 面**的语义,与本字段无关。
-   */
-  capabilities: string[];
-  /**
-   * P3 leader lease 归属(RFC-v5-dual-master-cohort D4)。healthz 只读断言面:
-   * state=ineligible(env kill-switch)|standby(有 env 资格但 desired 非本 slot)|
-   * acquiring|leader|fenced。env=1 不再等同 active leader(smoke 断言随之改为断言 state=leader)。
-   */
-  leadership: LeadershipStatus;
-  /** P3 lane 放量观测快照(evaluateLane 命中计数,详见 deploy/laneEvaluate.ts)。 */
-  laneMetrics: LaneMetricsSnapshot;
-}
 
-export interface RegisterCommercialResult {
+export interface RegisterCommercialResult extends RemoteHostChunkHooks {
   /**
    * HTTP 处理器:gateway 在自身 handleHttp 入口前调用,
    * 返回 true 表示已处理完毕,gateway 不再继续路由。
@@ -1326,6 +1315,7 @@ export async function registerCommercial(
   assertModelAuthorityCutoverFloor();
   const flavorIdentity = assertFlavorIdentity();
   configurePluginCatalog(flavorIdentity);
+  configureModelAvailability(flavorIdentity);
   const cursorExternalOutboxDir =
     flavorIdentity.status === "ok"
       ? cursorExternalApiOutboxDirForFlavor(flavorIdentity.flavor)
@@ -1451,11 +1441,15 @@ export async function registerCommercial(
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
   let turnDispatchShutdownHandoff: (() => Promise<unknown>) | undefined;
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
+  let systemSessionReadBackend: SystemSessionReadBackend | undefined;
   // durable turn dispatch(RFC §2):受理、tape-state 与真实终态读需 DispatchAdmissionBackend 面。
   let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
   const goalUsageRefreshRef: {
     current: (userId: string, sessionId: string) => void | Promise<void>;
   } = { current: () => { /* GoalState service is assembled below. */ } };
+  const sessionsDeletedRef: {
+    current: (userId: string, sessionIds: readonly string[]) => void;
+  } = { current: () => { /* the remote lane runtime is assembled below */ } };
   // Phase B finalize decides (inside its tx) whether the master will retry the
   // terminal turn. The browser learns the verdict through this post-commit
   // sideband so it can keep showing 「正在重试中」 instead of flashing a red card
@@ -1516,8 +1510,10 @@ export async function registerCommercial(
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
         onRecoveryJobTerminal: (userId, sessionId, info) =>
           recordRecoveryJobTerminalFriction(userId, sessionId, info),
+        onClientSessionsDeleted: (userId, sessionIds) => sessionsDeletedRef.current(userId, sessionIds),
       });
       setClientSessionsBackend(pgSessionsBackend);
+      systemSessionReadBackend = pgSessionsBackend;
       losslessTurnTapeStorage = pgSessionsBackend;
       dispatchAdmissionBackend = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
@@ -1677,27 +1673,8 @@ export async function registerCommercial(
   // OCV5-482:平台直连 flash(市场审核/语音润色/知识星球)Go 不可用时回落 DeepSeek 官方。
   setPlatformFlashFallbackKey(cfg.DEEPSEEK_API_KEY);
 
-  // 0069 — SKILLS_LITERATURE slot 反向钩子:容器 spawn 重建 system prompt 时读窄配置,
-  // admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY,见 0069 migration 注释)。
-  // 关键最小权限分流:这里**只**调 getLiteratureSkillConfig()(不解密 token),bearer
-  // plaintext 只在 proxy 路径(getLiteratureConfig(false))才会出现。
-  // fail-soft:DB 抖动 → 返 null + warn,prompt 构建照样推进。
-  setLiteratureSkillProvider(async () => {
-    try {
-      const cfg = await getLiteratureSkillConfig();
-      if (!cfg.enabled || !cfg.token_set) return null;
-      return {
-        name: "SKILLS_LITERATURE",
-        content: LITERATURE_SKILL_POINTER,
-      };
-    } catch (err) {
-      // 单行 DB 读失败就跳过 slot,不要让 master DB 闪断拖垮容器系统 prompt 构建。
-      // 选 warn 不 error:这条 slot 是增强非必需,日志噪声压低。
-      // eslint-disable-next-line no-console
-      console.warn("[commercial] literatureSkillProvider read failed, skipping slot:", err);
-      return null;
-    }
-  });
+  // 0069 — SKILLS_LITERATURE slot 反向钩子(provider 见 literatureSkill.ts,fail-soft、不解密 token)。
+  setLiteratureSkillProvider(literatureSkillSlotProvider);
 
   // T-24 虎皮椒:三件套齐全 → 生产 client;否则 undefined(handler 会 503)
   let hupijiao: HupijiaoClient | undefined;
@@ -1751,14 +1728,8 @@ export async function registerCommercial(
   let douyinService: DouyinDockerService | undefined
   let douyinSetup: DouyinSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
-  // 文献插件观测(OCV5-585):每次调用 / PDF 暂存事件一行白名单字段,聚合见 scripts/literature-plugin-metrics.ts。
-  const literatureLog = rootLogger.child({ subsys: "plugins", module: "literature-db" })
-  const literatureObserver = (event: LiteratureCallEvent) => literatureLog.info(LITERATURE_CALL_LOG_MSG, { ...event })
-  const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin } = createCommercialLiteratureRuntime({
-    runtimeChannel,
-    redis,
-    onArtifactEvent: (event) => literatureLog.info(LITERATURE_ARTIFACT_LOG_MSG, { ...event }),
-  })
+  // 文献插件(OCV5-524/585):观测日志 literature_plugin_call / literature_artifact 由 runtime 工厂接到 rootLogger。
+  const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin, literatureObserver } = createCommercialLiteratureRuntime({ runtimeChannel, redis, logger: rootLogger })
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
     const pluginDocker = cfg.AGENT_DOCKER_SOCKET
@@ -1833,9 +1804,7 @@ export async function registerCommercial(
       redis,
       browserRuntime,
       knowledgePlanetMedia: knowledgePlanetMediaDeps,
-      literatureHttp,
-      literatureRelogin,
-      literatureObserver,
+      literatureHttp, literatureRelogin, literatureObserver,
       pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
     })
     knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
@@ -2002,6 +1971,9 @@ export async function registerCommercial(
      */
     origin?: "bridge" | "delegate";
   }) => {
+    if (!isModelAvailable(modelId)) {
+      return { kind: "unavailable" as const, reason: "model temporarily unavailable" };
+    }
     // grok_route_contexts is the durable concurrency authority. Rebuild the
     // local scheduler mirror before every allocation so a browser disconnect,
     // generic slot reaper, or Master restart cannot make a live route vanish
@@ -2287,6 +2259,7 @@ export async function registerCommercial(
   // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
   // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
   let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
+  let systemActions: ReturnType<typeof assembleSystemActions> | undefined;
 
   if (
     !options.skipInternalProxy &&
@@ -2515,19 +2488,11 @@ export async function registerCommercial(
       // OC_PROJECT_CONTEXT and OC_P5_PROJECT_SEARCH are on.
       const projectSearchHandler: InternalProjectSearchHandler =
         makeInternalProjectSearchHandler({ identityRepo });
-      // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
-      // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
-      // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
-      // OCV5-589 / D12: media uses its own key file when configured (search keeps MINIMAX_TOKEN_PLAN_KEY).
-      const minimaxMediaKey = resolveMiniMaxMediaKey({
-        MINIMAX_MEDIA_KEY_FILE: cfg.MINIMAX_MEDIA_KEY_FILE,
-        MINIMAX_TOKEN_PLAN_KEY: cfg.MINIMAX_TOKEN_PLAN_KEY,
-      });
-      if (minimaxMediaKey.error) rootLogger.error("minimax_media_key_unavailable", { reason: minimaxMediaKey.error });
+      // /internal/v3/minimax:master 代持 MiniMax key 调多模态 API 并记账,key 不进容器(OCV5-589/D12 可用独立 key 文件)。
       const minimaxMediaHandler: MiniMaxMediaHandler = makeMiniMaxMediaHandler({
         identityRepo,
         pgPool: getPool(),
-        tokenPlanKey: minimaxMediaKey.key,
+        tokenPlanKey: mediaProxyKey(cfg),
         windowCap: cfg.OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS,
       });
       const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
@@ -2562,6 +2527,7 @@ export async function registerCommercial(
         },
         loadUserModelAuthz,
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
       // OCV5-591 A2-1: the studio's director agent plans with the same Grok core (platform-paid steps).
       if (studioHttp) {
@@ -2655,6 +2621,21 @@ export async function registerCommercial(
         },
         logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
       });
+      // /internal/v5/delegate/antigravity-route/* — 委派到 antigravity 引擎时
+      // master 签发/续/释 relay route(OCV5-738)。与 chat turn 共用账号池、
+      // durable turn row 与 relay meter;同样只在 selfhost 引擎本地 turn 豁免下
+      // 挂载,商业版不暴露这条路由面。
+      const delegateAntigravityRouteHandler: DelegateAntigravityRouteHandler | undefined =
+        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
+          ? makeDelegateAntigravityRouteHandler({
+              identityRepo,
+              pool: getPool(),
+              relayPort: V3_CONTAINER_PORT,
+              clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+              readBalance: readTotalSpendableBalance,
+              logger: rootLogger.child({ subsys: "delegateAntigravityRoute" }),
+            })
+          : undefined;
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
@@ -2700,16 +2681,7 @@ export async function registerCommercial(
       // durable turn dispatch(RFC §2.4 / §3):容器 boot recovery 查 tape 三态。同容器身份双因子。
       const ccbTranscriptRestoreHandler = makeCcbTranscriptRestoreHandler({
         identityRepo,
-        read: async (owner, binding) => {
-          const client = await getPool().connect();
-          try {
-            await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
-            const archive = await readCcbNativeRestoreArchive(client, owner, binding);
-            await client.query('COMMIT');
-            return archive;
-          } catch (error) { await client.query('ROLLBACK'); throw error; }
-          finally { client.release(); }
-        },
+        read: makeCcbTranscriptRestoreReader(getPool()),
       });
       const turnTapeStateHandler: ServerAuthoredHandler = makeTurnTapeStateHandler({
         identityRepo,
@@ -2807,7 +2779,7 @@ export async function registerCommercial(
           },
         },
         loadUserModelAuthz,
-        createAdvisorCodexRoute: async ({ containerId, userId, modelId }) => {
+        createCodexDelegateRoute: async ({ containerId, userId, modelId }) => {
           const createRoute = commercialCodexRouteRef.current
           if (!createRoute) return { kind: 'unavailable' as const, reason: 'selector_unwired' }
           return selectAdvisorCodexAdmitRoute({
@@ -2818,8 +2790,11 @@ export async function registerCommercial(
             readBinding: (id) => advisorCodexRelayDb.readContainerBinding(id),
           })
         },
-        expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
+        expireCodexDelegateRoute: (token) => expireCodexRouteContext(token).then(() => {}),
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        logger: rootLogger.child({ subsys: "openTurnAttribution" }),
       });
+      const delegateTraceHandler = makeDelegateTraceHandler({ pool: getPool(), identityRepo });
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
         identityRepo,
         runtimeRef: delegateEngineBillingRuntimeRef,
@@ -3064,6 +3039,10 @@ export async function registerCommercial(
       }
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
+        if (path === INTERNAL_SYSTEM_ACTIONS_PATH) {
+          if (!systemActions) { sendJson(res, 503, { error: { code: 'UNAVAILABLE', message: '系统操作尚未就绪。' } }); return Promise.resolve(); }
+          return systemActions.handleInternal(req, res, ctx);
+        }
         if (egressSplitEnabled && path === COST_EVENT_PATH) {
           return costEventHandler(req, res);
         }
@@ -3161,6 +3140,9 @@ export async function registerCommercial(
         if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
           return delegateGrokRouteHandler(req, res, ctx);
         }
+        if (delegateAntigravityRouteHandler && isDelegateAntigravityRoutePath(path)) {
+          return delegateAntigravityRouteHandler(req, res, ctx);
+        }
         if (
           promptQueueHandler &&
           (path === PROMPT_QUEUE_MUTATION_PATH || path === PROMPT_QUEUE_SNAPSHOT_PATH ||
@@ -3195,6 +3177,7 @@ export async function registerCommercial(
         if (isAutoDreamOptimizerInternalPath(path)) {
           return autoDreamOptimizerHandler(req, res, ctx, path);
         }
+        if (path === DELEGATE_TRACE_PATH) return delegateTraceHandler(req, res, ctx);
         if (isDelegateEngineBillingInternalPath(path)) {
           return delegateEngineBillingHandler(req, res, ctx, path);
         }
@@ -3806,6 +3789,7 @@ export async function registerCommercial(
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
   let v3Deps: V3SupervisorDeps | undefined;
+  let cc5Runtime: ReturnType<typeof createMasterCc5Runtime>;
   if (cfg.OC_RUNTIME_IMAGE) {
     // 复用 agentRuntime 路径的 docker socket / 默认逻辑,避免 v2/v3 端再各开一个 docker client
     // (一个进程开多个 dockerode 也无副作用,但同一 socket 没必要)
@@ -3874,7 +3858,32 @@ export async function registerCommercial(
       runtimeTuple = t;
     }
 
+    const cc5 = cc5Runtime = createMasterCc5Runtime({
+      selfhost: getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
+      authorityReady: modelAuthoritySigner !== null && modelAuthoritySigner !== undefined && modelAuthorityProvisionRequired,
+      env: process.env,
+      ...(modelAuthoritySigner && modelCatalogCache ? {
+        financeFactory: (_binding, lane) => createRemoteNativeTurnFinance({
+          pool: getPool(), preCheckRedis, catalog: modelCatalogCache!,
+          keyring: () => modelAuthoritySigner!.publicKeyring(), loadUserModelAuthz,
+          log: rootLogger.child({ subsys: "remoteNativeBilling" }),
+          upstreamModel: lane.upstreamModel,
+        }),
+      } : {}),
+    });
+    if (cc5) {
+      sessionsDeletedRef.current = (userId, sessionIds) => {
+        const uid = /^c:(\d+)$/.exec(userId)?.[1];
+        if (!uid) return;
+        for (const id of sessionIds) {
+          cc5.releaseChat(Number(uid), id).catch((error: unknown) =>
+            rootLogger.warn("[selfhost] remote lane release on delete failed", {
+              error: error instanceof Error ? error.message : String(error) }));
+        }
+      };
+    }
     v3Deps = {
+      ...(cc5 ? { cc5 } : {}),
       docker: v3Docker,
       pool: getPool(),
       image: cfg.OC_RUNTIME_IMAGE,
@@ -4447,6 +4456,9 @@ export async function registerCommercial(
   };
   museDeliveryRefs.pushRemote = pushRemoteHostUpload;
 
+
+  const chunkHooks = createRemoteHostChunkHooks();
+
   // Endpoint resolver split (P1-IMPL-09 / design v2 §1.2 / §4.5.3):
   //
   //   dockerEnsureRunning — WeChat / QQ inbound, container-local preview
@@ -4571,8 +4583,39 @@ export async function registerCommercial(
     }
   }
 
+  const resolvePromptPrivacySupport = makePromptPrivacySupportResolver({
+    inspect: async userId => v3Deps ? getV3ContainerStatus(v3Deps, userId) : null,
+    validatedReleasePath: v3Deps?.runtimeTuple?.releaseResolvedPath,
+  });
+  const modelSwitchCost = makeModelSwitchCostService({pool:getPool(),pricing,secret:jwtSecret}, loadUserModelAuthz);
+  if (process.env.OC_SYSTEM_ACTIONS_ENABLED === '1') {
+    if (runtimeChannel !== 'v5' || flavorIdentity.status !== 'ok' || flavorIdentity.flavor !== 'selfhost' || !v3Deps) {
+      throw new Error('System actions require the verified personal Docker deployment');
+    }
+    systemActions = assembleSystemActions({
+      stateParent: '/var/lib/openclaude-v5-selfhost',
+      jwtSecret,
+      firstPartyOrigin: process.env.COMMERCIAL_BASE_URL ?? '',
+      runner: getPool(),
+      identityRepo: createPgIdentityRepo(),
+      privacySupported: async userId => (await resolvePromptPrivacySupport(userId)).state === 'ready',
+      modelReads: { catalog: peekModelCatalogCache() ?? undefined, loadUserModelAuthz, getDegradedProviders },
+      stateReads: { sessions: systemSessionReadBackend, readProject: (uid, id) => readPgChatProject(getPool(), uid, id), readRuntimeStatus: makeSystemRuntimeStatusRead(v3Deps) },
+    });
+  }
+  // Commissioning needs a live v3 runtime: the container identity it binds must come from the
+  // same getV3ContainerStatus source as live lane admission. Without v3Deps the service stays
+  // undefined (503) rather than falling back to any other container source.
+  const codexCommissioning = runtimeChannel === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost"
+    && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache && v3Deps
+    ? new CodexCommissioning({pool:getPool(),preCheckRedis,catalog:modelCatalogCache,keyring:()=>modelAuthoritySigner!.publicKeyring(),
+      signer:modelAuthoritySigner,loadUserModelAuthz,log:rootLogger.child({subsys:"codexCommissioning"}),
+      containerSource:makeAdminCommissionContainerSource(v3Deps)}) : undefined;
   const handler = createCommercialHandler({
+    codexCommissioning,
+    modelSwitchCost,
     jwtSecret,
+    ...systemActions?.http,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
     studio: studioHttp,
@@ -4631,6 +4674,7 @@ export async function registerCommercial(
     containerRuntimeReady: Boolean(v3Deps),
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
+    resolvePromptPrivacySupport,
     prewarmContainer,
     prepareWorkspaceContainer,
     // v1.0.191 — /api/media-signed 冷启动护栏。装配端做了 per-uid singleflight 合并,
@@ -5993,10 +6037,15 @@ export async function registerCommercial(
 
   const containerLinkOn = containerLinkEnabled(flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined);
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
+    cc5BackendSelector: input => selectMasterCc5Backend(cc5Runtime, input,
+      getRuntimeChannel() === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost",
+      process.env),
     containerLinkEnabled: containerLinkOn,
     resolveContainerLinkEndpoint: (uid, cid) => resolveContainerLinkEndpoint(getPool(), runtimeChannel, uid, cid),
     containerLinkRecovery: { channel: runtimeChannel },
+    modelSwitchCost,
     jwtSecret,
+    issueSystemHelpBootstrap: systemActions ? scope => systemActions!.runtime.issueBootstrap(scope) : undefined,
     promptQueueEnabled: isPromptQueueV1Enabled(),
     // Chat / turn dispatch may prefer a live desktop tunnel (P1-IMPL-01).
     resolveContainerEndpoint,
@@ -6210,6 +6259,9 @@ export async function registerCommercial(
       return;
     }
     userChatBridge.broadcastToUser(BigInt(uid), payload);
+    if (verdict.scheduled) {
+      void userChatBridge.drainRecoveryForUser?.(BigInt(uid));
+    }
   };
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
@@ -6225,12 +6277,14 @@ export async function registerCommercial(
     broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
   };
 
-  // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
-  // then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
+  // Browser voice input. A usable OpenAI key buffers the clip and posts it to
+  // gpt-transcribe. Otherwise MediaRecorder streams to Deepgram Nova-3.
+  // Then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
   // Master-only commercial path: no runtime image rebuild required.
   const voiceTranscribeHandler: VoiceTranscribeHandler = createVoiceTranscribeHandler({
     jwtSecret,
     deepgramApiKey: cfg.DEEPGRAM_API_KEY,
+    resolveOpenAiApiKey: () => selectOpenAiPlatformKey("voice-transcribe"),
     openCodeGoApiKey: cfg.OPENCODE_GO_API_KEY,
     asrModel: cfg.VOICE_ASR_MODEL,
     asrLanguage: cfg.VOICE_ASR_LANGUAGE,
@@ -6364,6 +6418,7 @@ export async function registerCommercial(
   registerPoolAdapter(createGeminiPoolAdapter({
     clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? "",
   }));
+  registerRemoteBrainPoolAdapter();
   if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
     leaderBundle.add({
       name: "cooldownRecovery",
@@ -6486,7 +6541,10 @@ export async function registerCommercial(
   if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
     // Local ProxyAgent cleanup state must outlive a temporary loss of shared
     // leadership. Only the scheduler starts/stops on each leader term.
+    const boxFailureDiagnostics = createBoxFailureDiagnostics(process.env.OC_PLATFORM_ROOT);
     const boxRemoteCleanup = new BoxRemoteCleanupWorker({
+      beforeCleanup: boxFailureDiagnostics?.beforeCleanup,
+      sweepDiagnostics: boxFailureDiagnostics ? () => boxFailureDiagnostics.sweep() : undefined,
       journal: new BoxDurableJournal(getPool()),
       resolver: createProductionBoxAccountResolver(),
       writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),
@@ -6528,6 +6586,8 @@ export async function registerCommercial(
             const results = await Promise.allSettled([
               reconcileBoxBillingBatch(getPool(), 20, preCheckRedis),
               boxRemoteCleanup.reconcileBatch(10),
+              recoverRemoteNativeTurnBilling({ pool: getPool(), preCheckRedis,
+                log: rootLogger.child({ subsys: "remoteNativeBillingRecovery" }) }, { limit: 20 }),
             ]);
             if (results.some((result) => result.status === "rejected")) {
               throw new Error("BOX_RECOVERY_PARTIAL_FAILURE");
@@ -6681,12 +6741,17 @@ export async function registerCommercial(
             const reason = (job.payload as { reason?: string; turnKey?: string }).reason;
             const turnKey = (job.payload as { turnKey?: string }).turnKey;
             if (!reason || !turnKey) throw new Error("waiver job payload missing reason/turnKey");
-            await applyTurnWaiver(getPool(), {
+            const waiver = await applyTurnWaiver(getPool(), {
               userId: uid,
               turnKey,
               reason: reason as "idle_timeout",
               logger: rootLogger.child({ subsys: "tapeWaiver" }),
             });
+            if (waiver.disposition === 'deferred') {
+              throw new Error(`turn waiver proof pending: ${waiver.reason}`);
+            }
+            // Denied is a completed proposal, with no fence/refund/receipt.
+            // Billing jobs and later settlements retain their actual charges.
           },
         }));
         // Coalesce: a burst of finalizes runs at most one extra tick at a time;
@@ -6975,6 +7040,7 @@ export async function registerCommercial(
     });
   }
 
+  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // 市场发布 AI 自动审批 worker(deepseek-v4-flash via OpenCode Go)。仅 v5 启动:marketplace 表 v3/v5 共享
   // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
@@ -7195,25 +7261,15 @@ export async function registerCommercial(
     generation: null,
     leasePid: controlPlaneEnabled ? process.pid : null,
   });
-  const runtimeStatus: CommercialRuntimeStatus = {
+  const runtimeStatus = makeCommercialRuntimeStatus({
     channel: runtimeChannel,
     controlPlaneEnabled,
     autoMigrate: autoMigrateEffective,
     agentRuntime: agentRuntime ? "enabled" : "disabled",
     containerRuntime: v3Deps ? "enabled" : "disabled",
-    get schedulers(): string[] {
-      return schedulerRegistry.map((s) => s.name);
-    },
-    capabilities: [...MASTER_CAPABILITIES],
-    get leadership(): LeadershipStatus {
-      return leaderLease ? leaderLease.status() : legacyLeadership();
-    },
-    // P3 放量观测(RFC D1):lane_evaluations(请求次)+lane_users((generation,uid) 去重),
-    // operator 据此判断 promote N% 已覆盖多少活跃用户。只读快照,零成本。
-    get laneMetrics(): ReturnType<typeof getLaneMetricsSnapshot> {
-      return getLaneMetricsSnapshot();
-    },
-  };
+    schedulers: () => schedulerRegistry.map((s) => s.name),
+    leadership: () => leaderLease ? leaderLease.status() : legacyLeadership(),
+  });
   // fail-closed:非 leader 绝不允许 shared mutator 存活 —— 拦"gate 漏配让 follower 写共享现网"。
   // P3 MAJOR 5:判据从**静态 controlPlaneEnabled 改为实时 leadership**。原因:双 master 下两 slot 的
   // OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled 两 slot 都 true,`!controlPlaneEnabled` 恒 false
@@ -7256,6 +7312,15 @@ export async function registerCommercial(
   }
 
   setContentReviewAlerter((event) => { void alertContentReview(event) })
+  setContentReviewPrefilter(async (text) => {
+    try {
+      const key = await selectOpenAiPlatformKey('omni-moderate')
+      const result = await omniHardHit({ apiKey: key, text, timeoutMs: 2_000 })
+      return result.hit
+    } catch {
+      return false
+    }
+  })
 
   void userChatBridge.rebuildContainerLinks?.();
   const stopLogTiming = startLogTimingReporter(rootLogger);
@@ -7281,6 +7346,7 @@ export async function registerCommercial(
       return false;
     },
     shutdown: async () => {
+      systemActions?.runtime.closeAdmission();
       stopLogTiming();
       // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
       // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
@@ -7317,6 +7383,7 @@ export async function registerCommercial(
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
         await Promise.allSettled([
+          systemActions?.runtime.closeAndDrain(),
           knowledgePlanetSetup?.closeAndDrain(),
           weiboSetup?.closeAndDrain(),
           literatureSetup.close(),
@@ -7489,6 +7556,7 @@ export async function registerCommercial(
         target.psk?.fill(0);
       }
     },
+    ...chunkHooks,
     // healthz 深度探活:gateway healthz 经此 seam 探 PG/Redis(gateway 对二者零编译依赖)。
     // 任一失败 → healthz body.ok=false(HTTP 仍 200,monitor 消费 ok 字段自动告警),补上
     // "PG/Redis 宕机但 healthz 仍绿零告警"的盲区(2026-07-06 sessions.db 事故的同构面)。

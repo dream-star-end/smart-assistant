@@ -98,3 +98,15 @@ describe('userProfile — 写 409 三态 + scan', () => {
     assert.equal(r.text, '')
   })
 })
+
+it('CRCRLF is normalized once so a read version remains accepted by the real writer', async () => {
+  await resetUser()
+  const raw = 'Synthetic first\r\r\nSynthetic second'
+  await writeFile(paths.sharedUserMd, raw)
+  const snapshot = await readUserProfile()
+  assert.equal(snapshot.text, raw.replace(/\r\n/g, '\n'))
+  assert.equal(await readFile(paths.sharedUserMd, 'utf8'), raw)
+  const written = await writeUserProfile('- Synthetic replacement', snapshot.version)
+  assert.equal(written.ok, true)
+  assert.equal((await readUserProfile()).text, '- Synthetic replacement')
+})

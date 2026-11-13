@@ -6,6 +6,8 @@
  *   2. 流式半截 → 先渲染已确定部分,否则显示与最终外形接近的骨架;
  *   3. 组件渲染异常 → 组件级错误边界,显示该组件的 Markdown 版本。
  */
+import { parseSystemActionReference } from "@openclaude/protocol/browser";
+import { SystemActionBlock } from "./SystemActionBlock";
 import { Component, type ReactNode, useMemo } from "react";
 import { isNextBlockCode } from "../../lib/nextBlock";
 import { CalculatorBlock } from "./CalculatorBlock";
@@ -241,6 +243,9 @@ export type IuiBlockProps = {
 
 export function IuiBlock({ code, live, readOnly }: IuiBlockProps) {
   const outcome = useMemo(() => {
+    // Privileged references bypass tolerant content parsing. They are never nested IuiSpec values.
+    const system = parseSystemActionReference(code)
+    if (system) return live ? { kind: "skeleton" as const, type: "form" as const } : { kind: "system" as const, id: system.proposalId }
     // 输入预测块(OCV5-375)只给输入框用,回答里不显示,流式中也不出骨架。
     if (isNextBlockCode(code, !!live)) return { kind: "hidden" as const };
     const parsed = parseUiBlock(code, !!live);
@@ -263,6 +268,8 @@ export function IuiBlock({ code, live, readOnly }: IuiBlockProps) {
   }, [code, live]);
 
   switch (outcome.kind) {
+    case "system":
+      return <BlockBoundary resetKey={code} fallback={<BodyMarkdown text="系统操作暂不可用，请稍后重新核验。" />}><SystemActionBlock proposalId={outcome.id} readOnly={readOnly} /></BlockBoundary>;
     case "hidden":
       return null;
     case "skeleton":

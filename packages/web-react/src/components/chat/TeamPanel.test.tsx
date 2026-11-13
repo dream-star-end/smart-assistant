@@ -234,13 +234,13 @@ describe("TeamPanel 审查裁决徽记 + per-delegate 成本(债C/债D)", () => 
     fireEvent.click(header);
   }
 
-  test("审查员行 verdict=PASS → 渲染「质量审查员」+「PASS」通过徽记", () => {
+  test("审查员行 verdict=PASS → 渲染「质量审查员」+「通过」徽记", () => {
     renderExpanded([
       member("a", { _delegateAgentId: "hidden-reviewer", _completed: true, _reviewVerdict: "PASS" }),
       member("b", { _delegateAgentId: "coder", _completed: true }),
     ]);
     expect(screen.getByText("质量审查员")).toBeInTheDocument();
-    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("通过")).toBeInTheDocument();
   });
 
   test("审查员行 verdict=NEEDS_FIX → 渲染「未通过」（即使执行态为完成）", () => {
@@ -264,7 +264,7 @@ describe("TeamPanel 审查裁决徽记 + per-delegate 成本(债C/债D)", () => 
       member("a", { _delegateAgentId: "hidden-reviewer", _completed: true }),
       member("b", { _delegateAgentId: "coder", _completed: true }),
     ]);
-    expect(screen.queryByText("PASS")).not.toBeInTheDocument();
+    expect(screen.queryByText("通过")).not.toBeInTheDocument();
     expect(screen.queryByText("未通过")).not.toBeInTheDocument();
   });
 
@@ -275,7 +275,7 @@ describe("TeamPanel 审查裁决徽记 + per-delegate 成本(债C/债D)", () => 
     ]);
     // 只有审查员的「未通过」出现；coder 的 PASS 被吞。
     expect(screen.getByText("未通过")).toBeInTheDocument();
-    expect(screen.queryByText("PASS")).not.toBeInTheDocument();
+    expect(screen.queryByText("通过")).not.toBeInTheDocument();
   });
 
   test("delegateCosts 匹配 agentId → 队员行显示「N 积分」（千分位）", () => {

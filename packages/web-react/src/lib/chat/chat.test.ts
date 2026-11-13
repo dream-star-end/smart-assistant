@@ -61,9 +61,7 @@ import {
 } from "./reducer";
 import {
   ChatSocket,
-  EMPTY_JOURNAL_POLL_DELAYS_MS,
   LIVE_JOURNAL_MAX_PAGES,
-  RESTORE_RECONCILE_MAX_ATTEMPTS,
   UNPUBLISHED_TAPE_RETRY_MAX_MS,
   automaticTurnRecoveryTarget,
   exactUserReplayPayload,
@@ -87,6 +85,26 @@ function sess(id = "s1", agentId = "main") {
   return s;
 }
 type AnyFrame = Record<string, unknown>;
+function sessionSnapshotFrame(sessId: string, over: Record<string, unknown>) {
+  return JSON.stringify({
+    type: "outbound.session_snapshot", channel: "webchat", peer: { id: sessId, kind: "dm" },
+    snapshot: {
+      v: 1, sessionId: sessId, dispatch: null, streamKey: null, lastFrameSeq: null, lastFrameAt: null,
+      engineReady: null, turnStatus: null, reconcile: null, pendingPermissions: { items: [], completeness: "complete" },
+      usage: null, credits: null, frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf: 1, ...over,
+    },
+  });
+}
+const snapshotDispatch = (clientMessageId: string) => ({
+  id: "77777777-7777-4777-8777-777777777777", clientMessageId, agentId: "main", status: "accepted",
+  outcome: null, attempt: 1, since: 5, acceptedAt: 6, terminalAt: null,
+});
+const snapshotFlush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+/** Recovery grace verification reads this: the recovery child is open on the server. */
+const recoveryChildRunning = (sessId: string) => async () => JSON.parse(sessionSnapshotFrame(sessId, {
+  dispatch: snapshotDispatch("m-recover-child"),
+})).snapshot;
+
 function msgFrame(over: AnyFrame): OutboundMessageWire {
   return {
     type: "outbound.message",
@@ -346,28 +364,29 @@ describe("onopenSetInitialStatus / bridge error", () => {
 });
 
 // 模型权威 gate 的拒帧(bridge / egress;方案 §4 R3-m12)。此前这些码全落进"系统暂时不可用"
-// 的通用兜底 —— 用户既不知道发生了什么,也不知道 config_changed 是**可原样重发**的。
+// 的通用兜底 —— 用户既不知道发生了什么，也不知道可以保留进度继续。
 describe("模型权威拒帧的用户向文案(MODEL_CONFIG_CHANGED_RETRY_TURN 等)", () => {
-  test("MODEL_CONFIG_CHANGED_RETRY_TURN → 归一 + 明确告知可重发,且不是通用兜底", () => {
+  test("MODEL_CONFIG_CHANGED_RETRY_TURN → 归一 + 明确告知可继续，且不是通用兜底", () => {
     expect(normalizeBridgeErrorCode("MODEL_CONFIG_CHANGED_RETRY_TURN")).toBe(
       "model_config_changed_retry_turn",
     );
     const msg = friendlyBridgeErrorMessage("MODEL_CONFIG_CHANGED_RETRY_TURN");
     expect(msg).toMatch(/模型配置/);
-    expect(msg).toMatch(/重发/);
+    expect(msg).toMatch(/继续/);
+    expect(msg).not.toMatch(/原样重发/);
     expect(msg).not.toMatch(/系统暂时不可用/);
   });
 
   // 2026-10-06 个人版:一轮 Box 回合跑了 22 次调用(275 积分)后,第 23 次被 egress 的 epoch fence 拒掉,
   // 卡片却写「本轮已停止(不计费)」。拒帧可以发生在回合中途,整轮不计费这句话不成立;
-  // 且该码 retryable:false,卡片只会出「重新尝试」兜底按钮,不会出精确「重试」。
+  // 手动继续保留之前的上下文，不能借旧 regenerate 入口原样重发。
   test("MODEL_CONFIG_CHANGED_RETRY_TURN 文案不声称整轮不计费,按钮名与卡片实际一致", () => {
     const msg = friendlyBridgeErrorMessage("MODEL_CONFIG_CHANGED_RETRY_TURN");
     expect(msg).not.toMatch(/本轮已停止（不计费）|本轮不计费|本轮未扣费|本轮不收费/);
     expect(msg).toMatch(/已完成的调用照常计费/);
     expect(msg).toMatch(/被拒的这一次不计费/);
-    expect(msg).toMatch(/「重新尝试」/);
-    expect(msg).not.toMatch(/「重试」/);
+    expect(msg).toMatch(/继续/);
+    expect(msg).not.toMatch(/「重新尝试」|「重试」|原样重发/);
   });
 
   test("MODEL_NOT_AVAILABLE / UNRESOLVED_AGENT_MODEL → 引导换模型,而非「稍后重试」", () => {
@@ -387,7 +406,7 @@ describe("模型权威拒帧的用户向文案(MODEL_CONFIG_CHANGED_RETRY_TURN �
     );
     const msg = friendlyBridgeErrorMessage("DURABLE_DISPATCH_UNAVAILABLE");
     expect(msg).toMatch(/执行通道/);
-    expect(msg).toMatch(/重试/);
+    expect(msg).toMatch(/继续/);
     expect(msg).not.toMatch(/系统暂时不可用/);
   });
 
@@ -498,6 +517,26 @@ describe("applyTurnStatus retrying 判别联合", () => {
     const s = sess();
     applyTurnStatus(s, turnStatusFrame({ status: "compacting" }));
     expect(s._turnStatus).toBe("compacting");
+  });
+
+  // OCV5-704: 「正在压缩上下文 (Ns)」 counted from turn start (1943s at minute 32 of a turn
+  // whose compaction took 56s). The phase keeps its own start.
+  test("compacting 记录阶段起点;重复 compacting 帧不重置;null 清除", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      const s = sess();
+      s._turnStartedAt = 1_000;
+      applyTurnStatus(s, turnStatusFrame({ status: "compacting" }));
+      expect(s._turnStatusSince).toBe(1_000_000);
+      vi.setSystemTime(1_030_000);
+      applyTurnStatus(s, turnStatusFrame({ status: "compacting" }));
+      expect(s._turnStatusSince).toBe(1_000_000);
+      applyTurnStatus(s, turnStatusFrame({ status: null }));
+      expect(s._turnStatusSince).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("waiting_for_user → 明确的人类等待态", () => {
@@ -1802,6 +1841,120 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(1);
     expect(s._sendingInFlight).toBe(false);
     expect(s.messages.map((m) => m.role)).toEqual(["user", "delegate-progress", "assistant"]);
+  });
+
+  test("跨轮后台子任务隔离: 新轮在飞时收到旧轮无 cmid 的 delegate_progress 帧，仅原地更新旧轮卡片，不冲掉新轮状态或污染新轮生命周期", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    addMessage(s, "user", "第一轮任务", { id: "m-turn-1", status: "replied" });
+    const bgGroup = addMessage(s, "agent-group", "", {
+      id: "ag-bg-1",
+      agentId: "general-assistant",
+      _delegateRunId: "dlg-bg-1",
+      _delegateJobId: "dlgjob-bg-1",
+      _turnOwnerId: "m-turn-1",
+      childBlocks: [],
+      _completed: false,
+    });
+    addMessage(s, "assistant", "已派发后台任务", { id: "a-turn-1", _clientMessageId: "m-turn-1" });
+
+    // 用户发起第二轮，此时正在启动引擎 / 深度思考中
+    const u2 = addMessage(s, "user", "第二轮新问题", { id: "m-turn-2", status: "sent" });
+    s._activeClientMessageId = "m-turn-2";
+    s._sendingInFlight = true;
+    s._replyingToMsgId = null;
+    s._turnStatus = "engine_starting";
+    s._turnProgressHint = MODEL_THINKING_WORKING_DETAIL;
+
+    // 第一轮后台子任务发来无 clientMessageId 的进度帧
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 10,
+        clientMessageId: undefined,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-bg-1",
+            agentId: "general-assistant",
+            phase: "tool_start",
+            toolName: "Bash",
+            text: "Bash",
+            block: {
+              kind: "tool_use",
+              name: "Bash",
+              input: JSON.stringify({ command: "echo bg" }),
+              blockId: "b-bg-tool-1",
+            },
+          },
+        ],
+      }),
+      { onLiveFrame },
+    );
+
+    // 1. 旧轮卡片原地收到子任务块，且归属仍为 m-turn-1
+    expect(bgGroup.childBlocks).toHaveLength(1);
+    expect(bgGroup._turnOwnerId).toBe("m-turn-1");
+    // 2. 新轮的 engine_starting 与深度思考提示未被冲掉
+    expect(s._turnStatus).toBe("engine_starting");
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+    // 3. 新轮 user 行未被提前标为 read，reply tracker 未被误绑，onLiveFrame 未被误触发
+    expect(u2.status).toBe("sent");
+    expect(s._replyingToMsgId).toBeNull();
+    expect(onLiveFrame).not.toHaveBeenCalled();
+    // 4. 新轮实时 token 估算未被旧轮后台子任务字节污染
+    expect(s._liveTurnUsage).toBeUndefined();
+  });
+
+  test("applyTurnStatus 跨轮隔离与子任务提示消解: 忽略旧轮 cmid 的 working 帧，同步子任务 done 或父轮后续正文到达时自动清掉子任务提示", () => {
+    const s = sess();
+    s._activeClientMessageId = "m-turn-2";
+    s._sendingInFlight = true;
+    s._turnProgressHint = MODEL_THINKING_WORKING_DETAIL;
+
+    // 1. 带旧轮 clientMessageId 的 working 帧被严格忽略
+    applyTurnStatus(
+      s,
+      turnStatusFrame({
+        frameSeq: 1,
+        clientMessageId: "m-turn-1",
+        status: "working",
+        detail: "子任务 通用助手: Bash sleep 10",
+      }),
+    );
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+
+    // 2. 本轮同步子任务 working 帧正常写入提示
+    applyTurnStatus(
+      s,
+      turnStatusFrame({
+        frameSeq: 2,
+        clientMessageId: "m-turn-2",
+        status: "working",
+        detail: "子任务 编程助手: Bash pytest",
+      }),
+    );
+    expect(s._turnProgressHint).toBe("子任务 编程助手: Bash pytest");
+
+    // 3. 同步子任务 done 帧到达时自动清掉残留的「子任务 …」提示
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        clientMessageId: "m-turn-2",
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sync-2",
+            agentId: "coding-assistant",
+            phase: "done",
+            text: "测试通过",
+          },
+        ],
+      }),
+      {},
+    );
+    expect(s._turnProgressHint).toBeUndefined();
   });
 
   test("混合帧(progress + text)行为不变:仍复活发送态", () => {
@@ -4116,12 +4269,11 @@ describe("service_restart 合成 final：无在途流 → 不生成 phantom 中�
 });
 
 describe("applyResumeFailed (§4 layer 3)", () => {
-  test("advances cursor to server currentLast, flags broken, forces sync", () => {
+  test("advances cursor to server currentLast and forces sync", () => {
     const s = sess();
     const forceSync = vi.fn();
     applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 42, reason: "buffer_miss" } as never, { forceSync });
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
-    expect(s._liveStreamBroken).toBe(true);
     expect(forceSync).toHaveBeenCalledWith("s1");
   });
 });
@@ -5880,11 +6032,13 @@ describe("ChatSocket interrupted continuation", () => {
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
+      type: "outbound.resume_failed",
       sessionKey,
       channel: "webchat",
       peer: { id: sessId, kind: "dm" },
-      clientMessageId,
+      from: 1_914,
+      to: 0,
+      reason: "no_buffer",
     }) });
     const livePayload = {
       type: "outbound.message",
@@ -6449,21 +6603,15 @@ describe("ChatSocket interrupted continuation", () => {
       _activeClientMessageId: clientMessageId,
       _turnStartedAt: now,
     });
+    expect(syncSession).not.toHaveBeenCalled();
+    await syncSession();
 
-    await vi.waitFor(() => {
-      expect(resetLists.length).toBeGreaterThan(0);
-      expect(sock.sessions.get(sessId)?._reconciling).toBe(false);
-    });
     const session = sock.sessions.get(sessId)!;
     expect(resetLists[0]).toEqual([clientMessageId]);
     expect(resetLists.slice(1).every((ids) => ids.length === 0)).toBe(true);
     expect(session.messages.find((message) => message.id === "stale-local-retired")).toBeUndefined();
     expect(session.messages.some((message) => message.text === "retired stream answer")).toBe(true);
     expect(session._sendingInFlight).toBe(false);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(syncSession).toHaveBeenCalledTimes(1);
     sock.stop();
   });
 
@@ -7151,10 +7299,16 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
   });
 
   /** 起一条 master 拥有自动恢复、已 admitted 的在飞 turn,再喂一条可自动恢复的 outbound.error。 */
-  function deferredErrorFixture(sessId: string, opts: { masterOwns?: boolean; earlyDecision?: boolean } = {}) {
+  function deferredErrorFixture(
+    sessId: string,
+    opts: { masterOwns?: boolean; earlyDecision?: boolean; snapshot?: () => Promise<unknown> } = {},
+  ) {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket({ syncSession: async () => {} });
+    const sock = makeSocket({
+      syncSession: async () => {},
+      readSessionSnapshot: (opts.snapshot ?? recoveryChildRunning(sessId)) as never,
+    });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
@@ -7319,13 +7473,13 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     sock.stop();
   });
 
-  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: a failed authority read stays soft and keeps reconciling", async () => {
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: a failed authority read stays soft and reads again", async () => {
     const { sock, session, user } = deferredErrorFixture("s-legacy-read-fail", { masterOwns: false });
     const sync = vi.fn(async () => false);
     (sock as any).deps.syncSession = sync;
     await (sock as any).autoRecoverTerminalTurn(session.id, user.id);
+    await vi.advanceTimersByTimeAsync(8_000);
     expect(sync.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(session._reconciling).toBe(true);
     expect(session._sendingInFlight).toBe(true);
     expect(errorCards(session)).toHaveLength(0);
     sock.stop();
@@ -7416,6 +7570,19 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     vi.advanceTimersByTime(60_000);
     expect(errorCards(session)).toHaveLength(0);
     expect(session._sendingInFlight).toBe(true);
+    sock.stop();
+  });
+
+  test("OD1: grace timeout with no recovery running on the server paints the card once and ends 重试中", async () => {
+    const { sock, session } = deferredErrorFixture("s-defer-timeout-none", {
+      snapshot: async () => JSON.parse(sessionSnapshotFrame("s-defer-timeout-none", {})).snapshot,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await snapshotFlush();
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(errorCards(session)).toHaveLength(1);
     sock.stop();
   });
 
@@ -7519,13 +7686,17 @@ describe("ChatSocket problem card reporting", () => {
     traceId?: string;
   };
 
-  function problemCardFixture(sessId: string, opts: { masterOwns?: boolean; code?: string } = {}) {
+  function problemCardFixture(
+    sessId: string,
+    opts: { masterOwns?: boolean; code?: string; snapshot?: () => Promise<unknown> } = {},
+  ) {
     const reports: ProblemCardCall[] = [];
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket({
       syncSession: async () => {},
       reportProblemCard: (p) => { reports.push({ ...p }); },
+      readSessionSnapshot: (opts.snapshot ?? recoveryChildRunning(sessId)) as never,
     });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
@@ -7644,6 +7815,17 @@ describe("ChatSocket problem card reporting", () => {
     vi.advanceTimersByTime(60_000);
     expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
     expect(reports.filter((r) => r.path === "decision_timeout")).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("OD1: grace timeout with no recovery on the server reports failed/decision_timeout once", async () => {
+    const { sock, reports } = problemCardFixture("s-pc-dtimeout-none", {
+      snapshot: async () => JSON.parse(sessionSnapshotFrame("s-pc-dtimeout-none", {})).snapshot,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await snapshotFlush();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reports.filter((r) => r.outcome === "failed").map((r) => r.path)).toEqual(["decision_timeout"]);
     sock.stop();
   });
 
@@ -8750,104 +8932,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(restored[0]!.bashTail).toBeUndefined();
   });
 
-  test("hello names every trailing user-row candidate and ignores only an image placeholder", () => {
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-old", role: "assistant", text: "old", ts: now - 4 },
-        { id: "m-user-1", role: "user", text: "running", ts: now - 3, status: "sent" },
-        { id: "m-placeholder", role: "system", text: "", ts: now - 2, _genPlaceholder: {
-          jobId: "a".repeat(32), aspect: 1, status: "running", startedAt: now - 2,
-        } },
-        { id: "m-user-2", role: "user", text: "queued", ts: now - 1, status: "queued" },
-      ],
-      createdAt: now - 4,
-      lastAt: now - 1,
-    });
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    expect(hello.peers[0].resumeActiveTurnCandidateMessageIds).toEqual(["m-user-1", "m-user-2"]);
-    sock.stop();
-  });
-
-  test("hello never advertises an exact turn already fenced by user Stop", () => {
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-old", role: "assistant", text: "old", ts: now - 3 },
-        { id: "m-user-stopped", role: "user", text: "stopped", ts: now - 2, status: "sent" },
-        { id: "m-user-running", role: "user", text: "running", ts: now - 1, status: "sent" },
-      ],
-      createdAt: now - 3,
-      lastAt: now - 1,
-      _cancelledAutomaticRecoveryIds: { "m-user-stopped": true },
-    });
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-
-    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    expect(hello.peers[0].resumeActiveTurnCandidateMessageIds).toEqual(["m-user-running"]);
-
-    const restored = sock.sessions.get("s1")!;
-    restored._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 42 };
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId: "m-user-stopped",
-    }) });
-    expect(restored._lastFrameSeqByKey["agent:main:webchat:dm:s1"]).toBe(42);
-    expect(sock.isSessionBusy("s1")).toBe(false);
-    sock.stop();
-  });
-
-  test("hello keeps the oldest lock-owner candidate when a queued user block exceeds 32 rows", () => {
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-old", role: "assistant", text: "old", ts: now - 100 },
-        ...Array.from({ length: 35 }, (_, i) => ({
-          id: `m-user-${i}`,
-          role: "user" as const,
-          text: `queued ${i}`,
-          ts: now - 35 + i,
-          status: i === 0 ? "sent" as const : "queued" as const,
-        })),
-      ],
-      createdAt: now - 100,
-      lastAt: now,
-    });
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    const candidates = hello.peers[0].resumeActiveTurnCandidateMessageIds as string[];
-    expect(candidates).toHaveLength(32);
-    expect(candidates[0]).toBe("m-user-0");
-    expect(candidates.slice(1)).toEqual(Array.from({ length: 31 }, (_, i) => `m-user-${i + 4}`));
-    sock.stop();
-  });
-
-  test("shell miss → REST user row → verified active replay resets only then restores the full prefix", () => {
+  test("shell miss → REST user row subscribes once → cursor_reset snapshot rebuilds the full prefix", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const syncSession = vi.fn();
     const persistSession = vi.fn();
@@ -8857,7 +8942,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     const initialHello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    expect(initialHello.peers[0].resumeActiveTurnCandidateMessageIds).toBeUndefined();
+    expect(initialHello.peers[0]).toEqual({ peerId: "s1", agentId: "main", inFlight: false, lastFrameSeq: 0 });
 
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.resume_failed",
@@ -8872,44 +8957,30 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(syncSession).toHaveBeenCalledTimes(1);
 
     const user = { id: "m-user-running", role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage;
-    sock.applyServerMessages("s1", "main", [user], true, 1);
-    const targeted = ws.sent
-      .map((raw) => JSON.parse(raw))
-      .filter((frame) => frame.type === "inbound.hello")
-      .at(-1);
-    expect(targeted.peers[0]).toMatchObject({
-      peerId: "s1",
-      inFlight: false,
-      lastFrameSeq: 42,
-      resumeActiveTurnCandidateMessageIds: ["m-user-running"],
-    });
     const helloCount = ws.sent.filter((raw) => raw.includes('"inbound.hello"')).length;
+    sock.applyServerMessages("s1", "main", [user], true, 1);
     sock.applyServerMessages("s1", "main", [user], true, 1);
     expect(ws.sent.filter((raw) => raw.includes('"inbound.hello"'))).toHaveLength(helloCount);
 
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId: "m-user-running",
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch("m-user-running"),
+      streamKey: "dispatch:77777777-7777-4777-8777-777777777777:1",
+      lastFrameSeq: 10, nextAfterSeq: 10, gap: { reason: "cursor_reset" },
+      frames: [{ recordId: "1", frameSeq: 10, payload: JSON.parse(JSON.stringify(msgFrame({
+        frameSeq: 10, ts: 10, clientMessageId: "m-user-running", blocks: [{ kind: "text", text: "prefix restored" }],
+      }))) }],
     }) });
+    await snapshotFlush();
     const active = sock.sessions.get("s1")!;
-    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
     expect(active._activeClientMessageId).toBe("m-user-running");
-
-    ws.onmessage?.({ data: JSON.stringify(msgFrame({
-      frameSeq: 10,
-      ts: 10,
-      blocks: [{ kind: "text", text: "prefix restored" }],
-    })) });
+    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(10);
     expect(active.messages.some((m) => m.role === "assistant" && m.text === "prefix restored")).toBe(true);
     expect(active.messages.find((m) => m.role === "assistant")?._clientMessageId).toBe("m-user-running");
     expect(persistSession).toHaveBeenCalledWith("s1");
     sock.stop();
   });
 
-  test("a replay-start already in flight cannot resurrect the exact turn after user Stop", async () => {
+  test("a snapshot already in flight cannot resurrect or rewind the exact turn after user Stop", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const syncSession = vi.fn(async () => true);
     const sock = makeSocket({ syncSession });
@@ -8932,16 +9003,19 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(active._cancelledAutomaticRecoveryIds?.[clientMessageId]).toBe(true);
     expect(sock.isSessionBusy("s1")).toBe(true);
 
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId,
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch(clientMessageId),
+      streamKey: "dispatch:77777777-7777-4777-8777-777777777777:1",
+      lastFrameSeq: 41, nextAfterSeq: 41, gap: { reason: "cursor_reset" },
+      frames: [{ recordId: "1", frameSeq: 41, payload: JSON.parse(JSON.stringify(msgFrame({
+        frameSeq: 41, ts: 41, clientMessageId, blocks: [{ kind: "text", text: "replayed after Stop" }],
+      }))) }],
     }) });
+    await snapshotFlush();
     expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
     expect(active._activeClientMessageId).toBe(clientMessageId);
     expect(active._localTeardownAt).toBe(teardownAt);
+    expect(active.messages.some((message) => message.text === "replayed after Stop")).toBe(false);
     expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
@@ -8968,7 +9042,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("a user Stop fence does not block a different exact active-turn replay", () => {
+  test("a historical Stop fence follows server settlement before a different open dispatch", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.ensureSession("s1", "main");
@@ -8977,18 +9051,31 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     ws.open();
     const active = sock.sessions.get("s1")!;
     active._cancelledAutomaticRecoveryIds = { "m-user-stopped": true };
-    active._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 42 };
 
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId: "m-user-new",
-    }) });
-    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
+    // START #1216 decision ④: a historical local cancellation cannot overrule
+    // a server snapshot that still says accepted. An outstanding Stop has its
+    // own _stopSettlement fence, covered by the preceding test.
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: snapshotDispatch("m-user-stopped") }) });
+    await snapshotFlush();
+    expect(active._activeClientMessageId).toBe("m-user-stopped");
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    expect(active._stopSettlement).toBeUndefined();
+    expect(active._cancelledAutomaticRecoveryIds?.["m-user-stopped"]).toBe(true);
+
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: {
+      ...snapshotDispatch("m-user-stopped"), status: "terminal", outcome: "executed_error", terminalAt: 7,
+    } }) });
+    await snapshotFlush();
+    expect(active._activeClientMessageId).toBeUndefined();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: {
+      ...snapshotDispatch("m-user-new"), id: "88888888-8888-4888-8888-888888888888",
+    } }) });
+    await snapshotFlush();
     expect(active._activeClientMessageId).toBe("m-user-new");
     expect(sock.isSessionBusy("s1")).toBe(true);
+    expect(active._cancelledAutomaticRecoveryIds?.["m-user-stopped"]).toBe(true);
     sock.stop();
   });
 
@@ -9290,359 +9377,6 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     await Promise.resolve();
     expect(session._stopSettlement).toMatchObject({ clientMessageId, phase: "awaiting_receipt" });
     expect(sock.isSessionBusy("s1")).toBe(true);
-    sock.stop();
-  });
-
-  test("restored exact in-flight turn retries REST with backoff until authority completes it", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      if (syncSession.mock.calls.length === 1) return false;
-      const session = sock.sessions.get("s1")!;
-      session._sendingInFlight = false;
-      session._activeClientMessageId = undefined;
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-old", role: "user", text: "long task", ts: now - 20 * 60_000, status: "sent" }],
-      createdAt: now - 20 * 60_000,
-      lastAt: now - 20 * 60_000,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-old",
-      _turnStartedAt: now - 20 * 60_000,
-    });
-    const session = sock.sessions.get("s1")!;
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    expect(session._recoveryStatus).toMatchObject({ kind: "retrying", errorCode: "sync_failed" });
-
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    sock.stop();
-  });
-
-  test("successful active journal sync stays on a one-second live cadence", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 2,
-        liveClientMessageIds: ["u-live"],
-        hasTapeProjection: false,
-      });
-      if (syncSession.mock.calls.length === 3) {
-        const session = sock.sessions.get("s1")!;
-        session._sendingInFlight = false;
-        session._activeClientMessageId = undefined;
-      }
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-live", role: "user", text: "long task", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-live",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    // Active journal (live owner + frames) stays at 1s so a broken-WS client
-    // does not look stale. Empty journals use backoff; see the sibling test.
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(syncSession).toHaveBeenCalledTimes(3);
-    expect(sock.sessions.get("s1")?._reconciling).toBe(false);
-    sock.stop();
-  });
-
-  test("empty journal without a live owner backs off instead of 1s death-polling", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: false,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-empty", role: "user", text: "done turn", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-empty",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[1] - EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(3);
-    sock.stop();
-  });
-
-  test("empty journal with session-level tape projection keeps 思考中", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-tape", role: "user", text: "new turn", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-tape",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(true);
-    expect(session._reconciling).toBe(true);
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    expect(session._sendingInFlight).toBe(true);
-    sock.stop();
-  });
-
-  test("visible server-authored body after reconcile exits restore", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      const session = sock.sessions.get("s1")!;
-      session.messages.push({
-        id: "srv-a1",
-        role: "assistant",
-        text: "已经写完的答复",
-        ts: Date.now(),
-        _source: "server",
-        _clientMessageId: "u-vis",
-      });
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: false,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-vis", role: "user", text: "please", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-vis",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    sock.stop();
-  });
-
-  test("thinking-only kitchen after reconcile does not count as plated body", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      const session = sock.sessions.get("s1")!;
-      session.messages.push({
-        id: "srv-t1",
-        role: "thinking",
-        text: "先想清楚再写",
-        ts: Date.now(),
-        _source: "server",
-        _clientMessageId: "u-kit",
-      });
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 1,
-        liveClientMessageIds: [],
-        hasTapeProjection: false,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-kit", role: "user", text: "please", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-kit",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(true);
-    sock.stop();
-  });
-
-  test("restore attempt cap exits even when journal metadata never arrives", async () => {
-    vi.useFakeTimers();
-    const syncSession = vi.fn(async () => true);
-    const sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-cap", role: "user", text: "orphan", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-cap",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
-      await vi.advanceTimersByTimeAsync(10_000);
-    }
-    const session = sock.sessions.get("s1")!;
-    expect(syncSession.mock.calls.length).toBeLessThanOrEqual(RESTORE_RECONCILE_MAX_ATTEMPTS);
-    expect(session._reconciling).toBe(false);
-    expect(session._sendingInFlight).toBe(true);
-    expect(session._recoveryStatus?.kind).toBe("resumed");
-    sock.stop();
-  });
-
-  test("cap exit clears 思考中 when a cmid-less terminal body follows the active user row", async () => {
-    // 终态行(tape fallback)可能不带本轮 _clientMessageId。窗口内严格判定不认它
-    // (防过早消失),但打满对账窗口后必须以它为退出,否则「思考中」永挂。
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      const session = sock.sessions.get("s1")!;
-      if (!session.messages.some((m) => m.id === "srv-fallback")) {
-        session.messages.push({
-          id: "srv-fallback",
-          role: "assistant",
-          text: "终态正文(fallback 不带 cmid)",
-          ts: Date.now(),
-          _source: "server",
-        });
-      }
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-loose", role: "user", text: "please", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-loose",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    // 窗口内:严格判定不认 cmid-less 行,「思考中」保持。
-    expect(session._sendingInFlight).toBe(true);
-    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
-      await vi.advanceTimersByTimeAsync(10_000);
-    }
-    expect(session._reconciling).toBe(false);
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    sock.stop();
-  });
-
-  test("prior-turn cmid-less body before the active user row keeps 思考中 at the cap", async () => {
-    // 27344ba55 的初衷:上一轮遗留的无主正文不能证明本轮已完成 —— 松弛判定
-    // 有位置约束(必须在本轮 user 行之后),之前的行打满窗口也不触发退出。
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-prev", role: "assistant", text: "上一轮的回复", ts: now - 60_000, _source: "server" },
-        { id: "u-next", role: "user", text: "new turn", ts: now, status: "sent" },
-      ],
-      createdAt: now - 60_000,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-next",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
-      await vi.advanceTimersByTimeAsync(10_000);
-    }
-    expect(session._reconciling).toBe(false);
-    expect(session._sendingInFlight).toBe(true);
-    expect(session._recoveryStatus?.kind).toBe("resumed");
     sock.stop();
   });
 
@@ -11088,14 +10822,7 @@ describe("openDispatch hydrate restores in-flight", () => {
   test("prior-turn tape + empty live journal does not hide 思考中 for the new turn", async () => {
     vi.useFakeTimers();
     let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s-open-2", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
+    const syncSession = vi.fn(async () => true);
     sock = makeSocket({ syncSession });
     const now = Date.now();
     sock.loadStored({
@@ -11125,7 +10852,8 @@ describe("openDispatch hydrate restores in-flight", () => {
     const session = sock.sessions.get("s-open-2")!;
     expect(session._sendingInFlight).toBe(true);
     expect(session._activeClientMessageId).toBe("m-open-2");
-    expect(session._reconciling).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(session._sendingInFlight).toBe(true);
     sock.stop();
   });
 });
@@ -11604,13 +11332,6 @@ describe("OCV5-427 resume replay catch-up", () => {
     _activeClientMessageId: running,
   });
   const hellos = (ws: FakeWS) => ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.hello");
-  const replayStart = () => JSON.stringify({
-    type: "outbound.active_turn_replay_start",
-    sessionKey: key,
-    channel: "webchat",
-    peer: { id: "s1", kind: "dm" },
-    clientMessageId: running,
-  });
 
   test("INC-20261015-RESUME-REPLAY-LAG: the page-load hello asks for the running turn once and the REST sync does not ask again", () => {
     FakeWS.instances = [];
@@ -11622,16 +11343,16 @@ describe("OCV5-427 resume replay catch-up", () => {
     ws.open();
     const first = hellos(ws);
     expect(first).toHaveLength(1);
-    expect(first[0].peers[0]).toMatchObject({ peerId: "s1", lastFrameSeq: 1134, resumeActiveTurnCandidateMessageIds: [running] });
+    expect(first[0].peers[0]).toEqual({ peerId: "s1", agentId: "main", inFlight: true, lastFrameSeq: 1134, inFlightClientMessageId: running });
 
     // REST history has only the running user row: before OCV5-427 this sent a second hello naming the same turn.
     sock.applyServerMessages("s1", "main", [{ id: running, role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage], true, 1);
     expect(hellos(ws)).toHaveLength(1);
 
-    // Later registration hellos on the same page keep the cheap cursor replay.
+    // A registration hello (repo bind) never reports the running turn.
     sock.sendRepoBind("s1", "main", 1);
     const later = hellos(ws).at(-1);
-    expect(later.peers[0].resumeActiveTurnCandidateMessageIds).toBeUndefined();
+    expect(later.peers[0]).toEqual({ peerId: "s1", agentId: "main", inFlight: false, lastFrameSeq: 1134 });
     sock.stop();
     vi.unstubAllGlobals();
   });
@@ -11653,7 +11374,6 @@ describe("OCV5-427 resume replay catch-up", () => {
     }));
     ws.onmessage?.({ data: delta(1, "A") });
     ws.onmessage?.({ data: delta(2, "B") });
-    ws.onmessage?.({ data: replayStart() });
     const beforeReplay = notify.mock.calls.length;
     ws.onmessage?.({ data: delta(1, "A") });
     ws.onmessage?.({ data: delta(2, "B") });
@@ -11661,6 +11381,45 @@ describe("OCV5-427 resume replay catch-up", () => {
     ws.onmessage?.({ data: delta(3, "C") });
     expect(notify.mock.calls.length).toBeGreaterThan(beforeReplay);
     expect(s.messages.find((m) => m.id === "srv-s1-main-t1-s0")?.text).toBe("ABC");
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history", async () => {
+    // The resume replay is now the snapshot catch-up of the running turn's stream.
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let releasePage!: (page: unknown) => void;
+    const readSessionSnapshot = vi.fn(() => new Promise((resolve) => { releasePage = resolve; }));
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ syncSession, readSessionSnapshot } as never);
+    sock.loadStored(storedInFlight() as never);
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const streamKey = "dispatch:77777777-7777-4777-8777-777777777777:1";
+    const record = (frameSeq: number, text: string, isFinal = false) => ({
+      recordId: String(frameSeq), frameSeq,
+      payload: JSON.parse(JSON.stringify(msgFrame({ frameSeq, clientMessageId: running, isFinal, blocks: [{ kind: "text", text }] }))),
+    });
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch(running), streamKey, lastFrameSeq: 2, nextAfterSeq: 1, hasMore: true,
+      gap: { reason: "cursor_reset" }, frames: [record(1, "partial")],
+    }) });
+    await snapshotFlush();
+    // The tape-commit completion overtakes the replayed tail.
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      isFinal: true, clientMessageId: running, meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
+    })) });
+    const s = sock.sessions.get("s1")!;
+    syncSession.mockClear();
+    releasePage(JSON.parse(sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch(running), streamKey, lastFrameSeq: 2, nextAfterSeq: 2, frames: [record(2, " done", true)],
+    })).snapshot);
+    await snapshotFlush();
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.some((m) => m.role === "assistant" && m.text === "partial done")).toBe(true);
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: running });
     sock.stop();
     vi.unstubAllGlobals();
   });
@@ -11674,9 +11433,8 @@ describe("OCV5-427 resume replay catch-up", () => {
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     expect(hellos(ws)).toHaveLength(1);
-    ws.onmessage?.({ data: replayStart() });
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
-      frameSeq: 7, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: " done", messageId: "srv-s1-main-t1-s0" }],
+      frameSeq: 1135, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: " done", messageId: "srv-s1-main-t1-s0" }],
     })) });
     expect(sock.sessions.get("s1")!._sendingInFlight).toBeFalsy();
     sock.applyServerMessages("s1", "main", [
@@ -11740,49 +11498,52 @@ describe("OCV5-427 resume replay catch-up", () => {
     vi.unstubAllGlobals();
   });
 
-  test("INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history", () => {
-    const s = sess();
-    s._sendingInFlight = true;
-    s._activeClientMessageId = running;
-    s._resumeReplayClientMessageId = running;
-    const deferTapeCommitFinal = vi.fn(() => true);
-    const forceSync = vi.fn();
-    const onFinal = vi.fn();
-    const completion = msgFrame({
-      isFinal: true,
-      clientMessageId: running,
-      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
-    });
-    applyOutboundMessage(s, completion, { deferTapeCommitFinal, forceSync, onFinal });
-    expect(deferTapeCommitFinal).not.toHaveBeenCalled();
-    expect(s._sendingInFlight).toBe(false);
-    expect(forceSync).toHaveBeenCalledWith("s1", { clientMessageId: running });
-
-    // Without a resume replay the OCV5-424 grace for the live tail stays.
-    const live = sess();
-    live._sendingInFlight = true;
-    live._activeClientMessageId = running;
-    applyOutboundMessage(live, completion, { deferTapeCommitFinal, forceSync: vi.fn(), onFinal: vi.fn() });
-    expect(deferTapeCommitFinal).toHaveBeenCalledTimes(1);
-    expect(live._sendingInFlight).toBe(true);
-  });
-
-  test("the resume replay marker is set by replay_start and cleared by the turn's final", () => {
+  test("server-injected callback turn (lsc-*) adopts in-flight state on outbound.ack and renders live stream", () => {
     FakeWS.instances = [];
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket({ syncSession: vi.fn() });
+    const sock = makeSocket();
     sock.ensureSession("s1", "main");
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
-    ws.onmessage?.({ data: replayStart() });
     const s = sock.sessions.get("s1")!;
-    expect(s._resumeReplayClientMessageId).toBe(running);
-    ws.onmessage?.({ data: JSON.stringify(msgFrame({
-      frameSeq: 5, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: "done", messageId: "srv-s1-main-t1-s0" }],
-    })) });
-    expect(s._resumeReplayClientMessageId).toBeUndefined();
+    expect(s._sendingInFlight).toBeFalsy();
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        admitted: true,
+        accepted: true,
+        peer: { id: "s1", kind: "dm" },
+        clientMessageId: "lsc-eaf9a356aaec2f3a56552236",
+        cronOrigin: {
+          text: "[系统通知 · 自进化租约列车结果]\n终态: failed",
+          ts: 1793821656967,
+          agentId: "main",
+          model: "gemini-3.1-pro-agy",
+        },
+      }),
+    });
+
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._activeClientMessageId).toBe("lsc-eaf9a356aaec2f3a56552236");
+    expect(s._turnStartedAt).toBe(1793821656967);
+    const callbackRow = s.messages.find((m) => m.id === "lsc-eaf9a356aaec2f3a56552236");
+    expect(callbackRow?.role).toBe("user");
+    expect(callbackRow?._systemCallback).toBe(true);
+    expect(callbackRow?.status).toBe("sent");
+
+    ws.onmessage?.({
+      data: JSON.stringify(msgFrame({
+        frameSeq: 1,
+        clientMessageId: "lsc-eaf9a356aaec2f3a56552236",
+        blocks: [{ kind: "text", text: "正在排查列车失败原因…", messageId: "srv-s1-main-t3-s0" }],
+      })),
+    });
+    const reply = s.messages.find((m) => m.role === "assistant" && m._clientMessageId === "lsc-eaf9a356aaec2f3a56552236");
+    expect(reply?.text).toBe("正在排查列车失败原因…");
     sock.stop();
     vi.unstubAllGlobals();
   });
+
 });

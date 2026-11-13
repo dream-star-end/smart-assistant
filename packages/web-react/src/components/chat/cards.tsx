@@ -35,10 +35,13 @@ import {
   formatDurationSeconds,
   insufficientCreditsCopy,
   isSilentTurnErrorCode,
+  isSystemCallbackUserTurn,
   problemCardPresentation,
   speechLangFor,
+  summarizeSystemCallbackUserTurn,
 } from "../../lib/chat/pure";
 import { BRAND } from "../../lib/brand";
+import { STATUS } from "../../lib/ui/statusTone";
 import {
   CONTINUE_PROMPT,
   defaultCollapsed,
@@ -77,6 +80,7 @@ import {
   TooltipProvider,
   useToast,
 } from "../ui";
+import { Notice } from "../ui/Notice";
 import { formatDate } from "../ui/TimeAgo";
 import type { ErrorNoticeActionsInput } from "./errorNoticeActions";
 import { ErrorNotice } from "./lazyTurnErrorNotice";
@@ -184,9 +188,8 @@ export type CardCallbacks = {
     messageId: string,
     expected: { recordId: string; role: string; contentSha256?: string },
   ) => ChatMessage[] | null;
-  /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
-   *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
-   *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
+  /** Locate the exact failed source for editing. Error execution uses the
+   * continuation resolver and never falls back to regenerating another task. */
   resolveRetryTarget?: (clientMessageId: string) => ChatMessage | undefined;
   /** P5b:把一条已完成的回答存到所在项目（「记住这条」= 项目记忆，「存为项目技能」）。
    *  App 只在 OC_P5_CHIPS 打开、会话属于有看板的项目、非 demo 时提供；缺省不出这两个入口。 */
@@ -689,6 +692,39 @@ function ReplyQuoteBlock({
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
 // 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
+function SystemCallbackNoticeCard({ msg }: { msg: ChatMessage }) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = summarizeSystemCallbackUserTurn(msg);
+  return (
+    <div
+      className="flex min-w-0 flex-col items-center py-2 animate-in"
+      data-testid="system-callback-row"
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((prev) => !prev)}
+        aria-expanded={expanded}
+        className="inline-flex max-w-full items-center gap-1 rounded-full px-3 py-1 text-[12px] leading-snug text-faint transition-colors hover:bg-hover hover:text-muted"
+        data-testid="system-callback-summary"
+      >
+        <span className="truncate">{summary}</span>
+        <ChevronRight
+          size={12}
+          className={cn("shrink-0 transition-transform", expanded && "rotate-90")}
+        />
+      </button>
+      {expanded && msg.text && (
+        <div
+          className="mt-1.5 min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-2 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] [overflow-wrap:anywhere]"
+          data-testid="message-text"
+        >
+          {msg.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function UserCard({
   msg,
   cb,
@@ -705,9 +741,12 @@ export function UserCard({
   /** 这一轮还在进行,且这条消息下面还没有任何内容。只有这时 sent 才显示「已送达」。 */
   awaitingReply?: boolean;
 }) {
+  if (isSystemCallbackUserTurn(msg)) {
+    return <SystemCallbackNoticeCard msg={msg} />;
+  }
   const status = msg.status;
   // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
-  // 用户自己停止的待发消息:中性说明 + 「重新发送」,不是红色失败。
+  // 用户自己停止的待发消息保留中性说明，通过当前来源门继续。
   const cancelledByUser = status === "error" && msg._sendCancelled === true;
   const statusLabel = cancelledByUser
     ? (msg._errorDetail || "发送已取消")
@@ -715,6 +754,8 @@ export function UserCard({
       ? status === "sent" && msg._deliveryState === "accepted" ? "已送达" : USER_STATUS_LABEL[status]
       : undefined;
   const showStatus = Boolean(statusLabel) && !(status === "error" && failurePresentedBelow);
+  const canContinue = status === "error" && !failurePresentedBelow && Boolean(cb?.onContinueInterrupted) &&
+    (!cb?.resolveInterruptedContinuation || !!cb.resolveInterruptedContinuation(msg));
   const canQuote = !readOnly && status !== "error" && Boolean(cb?.onQuote);
   const canEdit = !readOnly && Boolean(cb?.onEditResend);
   return (
@@ -794,17 +835,17 @@ export function UserCard({
               立即发送
             </button>
           )}
-          {/* 发送失败 → 「重试」：复用原消息 payload（含附件引用）走既有发送入口原地重发。 */}
-          {status === "error" && cb?.onRetrySend && (
+          {/* 仅当前仍可恢复的来源提供同会话继续。 */}
+          {status === "error" && canContinue && (
             <button
               type="button"
-              onClick={() => cb.onRetrySend?.(msg)}
+              onClick={() => cb?.onContinueInterrupted?.(msg)}
               className={cn(
                 "inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11",
                 cancelledByUser ? "bg-card text-fg" : "bg-danger-soft text-danger",
               )}
             >
-              <RotateCcw size={11} /> {cancelledByUser ? "重新发送" : "重试"}
+              <RotateCcw size={11} /> 继续
             </button>
           )}
         </div>
@@ -824,10 +865,12 @@ export function ProgressiveMarkdown({
   text,
   live = false,
   caret = false,
+  readOnly = false,
 }: {
   text: string;
   live?: boolean;
   caret?: boolean;
+  readOnly?: boolean;
 }) {
   const [visibleChars, setVisibleChars] = useState(LONG_MARKDOWN_STEP);
   // OCV5-421: 这条正文出生时在流式 → 一直按顶层块分段渲染(结构从挂载起不变,生成结束也不重挂)。
@@ -857,7 +900,7 @@ export function ProgressiveMarkdown({
           return (
             // 流式中的尾段不做无语言代码块的语言探测(同步跑全部语法,随长度平方增长);块一写完
             // 就进前段,按原规则高亮。
-            <Markdown key={key} bare signMedia live={live} caret={tail && caret && !hasLiveGap}
+            <Markdown readOnly={readOnly} key={key} bare signMedia live={live} caret={tail && caret && !hasLiveGap}
               autoDetectCode={!(live && tail)}>
               {chunk}
             </Markdown>
@@ -867,7 +910,7 @@ export function ProgressiveMarkdown({
     );
   } else {
     primaryView = (
-      <Markdown signMedia live={live} caret={caret && !hasLiveGap}>
+      <Markdown readOnly={readOnly} signMedia live={live} caret={caret && !hasLiveGap}>
         {primary}
       </Markdown>
     );
@@ -887,7 +930,7 @@ export function ProgressiveMarkdown({
         </button>
       )}
       {hasLiveGap && (
-        <Markdown signMedia live caret={caret}>
+        <Markdown readOnly={readOnly} signMedia live caret={caret}>
           {text.slice(liveTailStart)}
         </Markdown>
       )}
@@ -983,7 +1026,7 @@ export function AssistantCard({
     cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
   );
   const shownMessage = isEmptyNoReply
-    ? "模型没有生成内容，本轮未扣费。点重试再发一次。"
+    ? "模型没有生成新回复。可以在当前会话继续，已完成的调用按实际用量计费。"
     : (frozenCard?.message ?? presentedError?.message);
   // W3:正文用错误目录的人话 —— 帧带的 userError 优先,否则由懒加载的错误卡按码查目录;免单 /
   // 未计费 / 收尾 / 开通引导 / 恢复被跳过这类这一轮特有的说法用 fixedBody。冻结快照按提交时的
@@ -996,27 +1039,15 @@ export function AssistantCard({
       ? creditsCopy.message
       : isEmptyNoReply || presentedError?.fixedMessage ? shownMessage : undefined);
   const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
-  // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
-  // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 「重新尝试」走
-  // onRegenerate 重发最后一条(现状语义)。
-  const retryEligible =
-    !!presentedError &&
-    !presentedError.waived &&
-    sem.retryable &&
-    (sem.cta === "retry" || sem.cta === "retry_or_switch");
+  // Editing may reuse the exact failed source. Execution is available only for
+  // the current unfinished turn, never a historical error from another task.
   const sourceUser = msg._clientMessageId ? cb.resolveRetryTarget?.(msg._clientMessageId) : undefined;
-  // ── 重发按钮末轮门控(Codex 审计 R5)────────────────────────────────────────────────
-  // onRegenerate 兜底 = 重发**最后一条** user 消息;历史中间错误卡若显示任何重发按钮,一点就把
-  // 无关的最新一轮内容重发出去(精确重发亦会把历史消息插到当前会话尾,乱序)。故错误卡上的重发类
-  // 按钮只在**该错误卡属于最后一轮**时显示。末轮判据复用 turnSegment 单一权威 inActiveTurn。
-  // 充值、新建会话、联系管理员是导航,不受此门控。
   const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
   const interruptedContinuationTarget =
-    isLastTurn && ctx.isLast
+    isLastTurn && !ctx.sending
       ? cb.resolveInterruptedContinuation?.(msg)
       : undefined;
   const showInterruptedContinuation =
-    !msg._recoverySkippedNotice &&
     !!interruptedContinuationTarget &&
     !!cb.onContinueInterrupted &&
     presentedError?.code !== "attachment_total_exceeded";
@@ -1038,7 +1069,6 @@ export function AssistantCard({
       cb,
       isLastTurn,
       waived: presentedError?.waived === true,
-      preciseRetryTarget: retryEligible && !isInsufficient ? sourceUser : undefined,
       editTarget: sourceUser,
       continueInterrupted: showInterruptedContinuation ? () => cb.onContinueInterrupted?.(msg) : undefined,
       topUp: isInsufficient && cb.onTopUp
@@ -1098,12 +1128,12 @@ export function AssistantCard({
         {msg.text && !hasError && !isSyntheticEmptyNotice && !standaloneError ? (
           <OptionsGroupProvider live={live}>
             {/* 流式光标由 Markdown(caret)内联注入到最后一个文本块末尾,不再落在正文下一行。 */}
-            <ProgressiveMarkdown text={msg.text} live={live} caret={live} />
+            <ProgressiveMarkdown text={msg.text} live={live} caret={live} readOnly={readOnly} />
             <OptionsGroupFooter />
           </OptionsGroupProvider>
         ) : hasError && presentedError?.bodyText ? (
           <OptionsGroupProvider>
-            <ProgressiveMarkdown text={presentedError.bodyText} />
+            <ProgressiveMarkdown text={presentedError.bodyText} readOnly={readOnly} />
             <OptionsGroupFooter />
           </OptionsGroupProvider>
         ) : live && !hasError && !ctx.activityInFooter ? (
@@ -1119,11 +1149,11 @@ export function AssistantCard({
             title="这轮没有回复"
           >
             <div className="min-w-0">
-              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以重试。</p>
-              {isLastTurn && cb.onRegenerate && (
+              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以在当前会话继续。</p>
+              {isLastTurn && showInterruptedContinuation && (
                 <div className="mt-2.5">
-                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-                    <RotateCcw size={14} /> 重试
+                  <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                    <RotateCcw size={14} /> 继续
                   </Button>
                 </div>
               )}
@@ -1140,7 +1170,7 @@ export function AssistantCard({
                   ? "模型暂停了本轮（通常因长任务超时），可让它继续。"
                   : "回复达到长度上限被截断，可让模型继续写。"}
               </span>
-              {cb.onContinue && (
+              {isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast) && cb.onContinue && (
                 <Button size="sm" variant="secondary" shape="pill" onClick={cb.onContinue}>
                   继续
                 </Button>
@@ -1162,12 +1192,16 @@ export function AssistantCard({
 
         {/* 终态错误卡：自动免单用温和提示，不把平台 JSON/英文堆栈甩给用户。 */}
         {errorCardHeld ? null : isUserCancelled ? (
-          <output
-            className="mt-2.5 flex items-center gap-2 py-1 text-body text-muted"
-            aria-label="已停止生成"
-          >
-            <Square size={14} className="shrink-0" />
-            <span>已停止生成</span>
+          // UI-3:已停止是本轮末尾的一条时间线提示(实心停止块)。当前未完成轮的「继续」留在同一条状态上。
+          <output className="mt-2.5 block" aria-label="已停止生成">
+            <Notice tone="stopped" title={STATUS.stopped.label} />
+            {showInterruptedContinuation && (
+              <div className="mt-2">
+                <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                  继续
+                </Button>
+              </div>
+            )}
           </output>
         ) : recoveredStep && sem.automaticRecovery === true ? (
           // OCV5-390: an error the platform retries by itself and that the turn got past is not the
@@ -1205,7 +1239,7 @@ export function AssistantCard({
             tone="attention"
             className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
             title="这句没有发出去"
-            actions={() => isLastTurn && cb.onRegenerate ? [{ label: "重试", onClick: cb.onRegenerate }] : []}
+            actions={() => showInterruptedContinuation ? [{ label: "继续", onClick: () => cb.onContinueInterrupted?.(msg) }] : []}
             details={technicalDetails}
             fixedBody={msg._recoverySkippedNotice}
           />

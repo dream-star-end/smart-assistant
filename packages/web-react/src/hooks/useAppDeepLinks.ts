@@ -1,17 +1,18 @@
+import { useIdentityModelCatalog } from './useIdentityModelCatalog'
+import type { ResolvedIdentity } from '../lib/resolvedIdentity'
 /**
  * One-shot app entry effects: workspace transitions, inbox, GitHub return, org invite and agent list refresh
  *
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-import { useRef, useEffect, useCallback } from "react";
+import { useRef, useEffect, useCallback, useState } from "react";
 import { useInbox } from "./useInbox";
 import { githubErrorText } from "../lib/github";
 import { connectorErrorText } from "../lib/connectors";
 import { replaceSearchParams } from "./useAppRoute";
 import { api, apiErrorMessage } from "../lib/api";
-import { applyIntelligentUiSnapshot } from "../lib/intelligentUi";
-import { extractPrefs, type PrefsView } from "../lib/modelPreferences";
+import type { PrefsView } from "../lib/modelPreferences";
 import { type Agent, DEFAULT_AGENT, agentFromApiRow } from "../lib/agents";
 import type { AuthSession, LockedPublicModel, PublicConfig, PublicModel, User } from "../lib/types";
 import type { ConfirmChoice, ConfirmOpts } from "../components/ui/ConfirmDialog";
@@ -21,6 +22,8 @@ import type { ToastFn } from "../components/ui/Toast";
 
 export type AppDeepLinksInput = {
   auth: AuthSession | null;
+  resolvedIdentity: ResolvedIdentity | null;
+  setCatalogOwner: React.Dispatch<React.SetStateAction<ResolvedIdentity | null>>;
   authRef: React.RefObject<AuthSession>;
   authed: boolean;
   confirmDialog: (opts: ConfirmOpts) => Promise<ConfirmChoice>;
@@ -48,6 +51,8 @@ export type AppDeepLinksInput = {
 
 export function useAppDeepLinks({
   auth,
+  resolvedIdentity,
+  setCatalogOwner,
   authRef,
   authed,
   confirmDialog,
@@ -72,6 +77,7 @@ export function useAppDeepLinks({
   user,
   view,
 }: AppDeepLinksInput) {
+  const [teamLeaderModelId, setTeamLeaderModelId] = useState<string | undefined>(undefined);
   // 登录后消费待跑案例：只在 inWorkspace false→true 时读一次；有键先删再预填，禁止自动发送。
   const wasInWorkspaceRef = useRef(inWorkspace);
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setComposerPrefill is App useState setter/useRef passed in, stable
@@ -208,43 +214,10 @@ export function useAppDeepLinks({
     };
   }, [demo, authed, view, publicCfgRetryNonce]);
 
-  // 进入工作区后拉取模型列表（公开端点；登录态带 Bearer 走 grants 视图）。失败不阻断
-  // 对话前置——选择器降级为「暂无可用模型」，对话仍可在订阅就绪后进行。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setLockedModels, setModelPrefs, setModels, setModelsLoading, setPreferenceEffort are App useState setter/useRef passed in, stable
-  useEffect(() => {
-    if (demo || !auth) return;
-    let cancelled = false;
-    setModelsLoading(true);
-    Promise.all([
-      api.getPublicModels(auth),
-      api
-        .getPreferences(auth)
-        .then((snap) => {
-          // Intelligent UI 开关(OCV5-361)与模型偏好同批水合。
-          applyIntelligentUiSnapshot(snap);
-          return extractPrefs(snap);
-        })
-        .catch(() => ({} as PrefsView)),
-    ])
-      .then(([catalog, prefs]) => {
-        if (cancelled) return;
-        setModels(catalog.models);
-        setLockedModels(catalog.lockedModels);
-        // 初始 modelId 不在此直接写:models/modelPrefs 落定会触发 per-session resolver
-        // effect,按「活动会话持久化选择 > default_model > 首个健康模型」统一解析。
-        setModelPrefs(prefs);
-        setPreferenceEffort(prefs.default_effort);
-      })
-      .catch(() => {
-        /* 公开端点失败：保持空列表，选择器禁用，不弹错误打断前置流程 */
-      })
-      .finally(() => {
-        if (!cancelled) setModelsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [demo, auth]);
+  // Per-account model visibility and preference effects share the verified identity fence.
+  useIdentityModelCatalog({ auth, authRef, demo, resolvedIdentity, setCatalogOwner,
+    setModels, setLockedModels, setModelPrefs, setPreferenceEffort, setModelsLoading,
+    setTeamLeaderModelId });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef is App useState setter/useRef passed in, stable
   const fetchMyAgents = useCallback(async (): Promise<Agent[]> => {
@@ -278,5 +251,6 @@ export function useAppDeepLinks({
   return {
     inbox,
     refreshMyAgents,
+    teamLeaderModelId,
   };
 }

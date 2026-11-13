@@ -334,6 +334,9 @@ exit 0
       const got = runBash(
         [
           'source "$WATCH_POLICY_SOURCE"',
+          // This egress fixture has no CC5 deployment; real pending/owner
+          // guard behavior is covered by the dedicated activation suites.
+          "cc5_activation_recovery_safe() { return 0; }",
           "prev_release_is_valid() { return 0; }",
           "is_true_dry() { return 1; }",
           'wlog() { echo "$*"; }',

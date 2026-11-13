@@ -82,7 +82,15 @@ function makeBillingClient(): BillingStub {
     abandons,
     async admit(input) {
       admits.push(input as unknown as Record<string, unknown>);
-      return { requestId: REQUEST_ID, engineSessionId: `oceng-${"b".repeat(48)}` };
+      // Master admits every codex delegate with a provider route (OCV5-729);
+      // without it the gateway fail-closes and never submits.
+      return {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${"b".repeat(48)}`,
+        ...(input.engine === "codex"
+          ? { route: { kind: "official_oauth", groupId: "3" } }
+          : {}),
+      };
     },
     async settle(billing) {
       settles.push(billing as unknown as Record<string, unknown>);

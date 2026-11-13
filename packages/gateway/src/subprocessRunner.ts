@@ -1,14 +1,20 @@
+import { sameRemoteExecutionBackend } from '@openclaude/protocol'
+import { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
+import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
+import { systemHelpEnvironment } from './systemHelpEnvironment.js'
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { PassiveStageTiming } from './passiveStageTiming.js'
 import { fastServiceTierRoute } from '@openclaude/protocol'
 import {
   identityCompatEnvironment,
   isProjectSearchEnabled,
+  paths as storagePaths,
 } from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type OpenClaudeConfig } from '@openclaude/storage'
@@ -30,6 +36,16 @@ import { relocateCcbJsonlToCwd, relocateCcbJsonlToCwdManaged } from './engine/cc
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext, type IntelligentUiApplied } from './promptSlots.js'
+import {
+  applyPromptFreeze,
+  type FrozenPromptBuild,
+  PROMPT_FREEZE_TOUCH_MS,
+  type PromptFreezeInputs,
+  promptFreezeInputsKey,
+  resolvePromptFreezeMode,
+  touchFrozenPrompt,
+} from './promptFreeze.js'
+import { boxAutoCompactWindowEnv } from './boxContextBudget.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -53,6 +69,7 @@ import {
   type TurnUpstreamHeaders,
   _buildAnthropicCustomHeadersEnv,
   _ccbUpstreamIsEgress,
+  _withTraceIdHeader,
   _buildUpdateEnvStdinLine,
   renewTurnHeaderBundle,
   resolveTurnRuntime,
@@ -76,7 +93,9 @@ import {
   MAX_STDERR_BUF_BYTES,
   appendCrashStderrTail,
   redactCrashStderrTail,
+  CCB_PLATFORM_DISALLOWED_TOOLS as CCB_LANE_DISALLOWED_TOOLS,
 } from './subprocessSpawnConfig.js'
+import { figcheckTurnIdEnv } from './figcheckRounds.js'
 export {
   _officialCcProxyLane,
   _buildCcbServiceTierEnv,
@@ -246,6 +265,9 @@ export function _boxCcOneShotExitSkipsCrashLoop(args: {
   return args.boxResidentCc && args.code === 0 && args.signal == null
 }
 
+/** Never handed to a remote lane's container tool host: it makes no model calls. */
+const CC5_LANE_CREDENTIAL_ENV = /^(?:ANTHROPIC_|CLAUDE_CODE_OAUTH|OPENAI_|GEMINI_|GOOGLE_API|NODE_OPTIONS$)|(?:_API_KEY|_AUTH_TOKEN|_SECRET)$/
+
 export class SubprocessRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null
   /** 本 turn 解析后的 descriptor；首次 spawn 也必须看到，不能等 stdin 才补。 */
@@ -302,10 +324,23 @@ export class SubprocessRunner extends EventEmitter {
   private advisorConfigDir: string | null = null
   /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
   private delegateContextFile: string | null = null
+  private delegateContextTraceId: string | undefined
   private platformGoal: GoalStateSnapshot | null = null
   /** Intelligent UI(OCV5-361):本次 spawn 的 extra-prompt 里 INTELLIGENT_UI 段的指纹(没有 = false)。
    *  undefined = 还没组装过 / 组装失败;sessionManager 用它判断开关切换后是否需要重启。 */
   private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
+  private _promptPolicyFingerprint: string | undefined
+  /** OCV5-755: CCB context snapshot for this spawn ('' = CCB uses live values). */
+  private _ccbContextFreezeFile = ''
+  private _promptFreezeActive = false
+  private _promptFreezeTouchedAt = 0
+  private promptPolicy: PromptPrivacyPolicy | undefined
+  get promptPolicyFingerprint(): string | undefined { return this._promptPolicyFingerprint }
+  assertPromptPrivacyStopped(): void {
+    if (this.proc) throw new Error("助手隐私刷新仍在等待旧进程终结，请稍后重试。")
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.promptPolicy = structuredClone(policy) }
+  clearPromptPrivacy(): void { this.promptPolicy = undefined }
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
@@ -320,6 +355,17 @@ export class SubprocessRunner extends EventEmitter {
 
   /** Explicit ccb harness for a not-yet-spawned runner that carries the signed token. */
   pinBoxNativeHarness(descriptor: CcbExecutionDescriptor | undefined): 'ccb' | 'official-cc' {
+    if (this.opts.cc5BridgePort) {
+      if (descriptor?.canonicalModel !== this.opts.cc5BridgePort.canonicalModel ||
+          descriptor.contextOwner !== BOX_NATIVE_CONTEXT_OWNER ||
+          !descriptor.executionBackend ||
+          !sameRemoteExecutionBackend(descriptor.executionBackend, this.opts.executionBackend) ||
+          !sameRemoteExecutionBackend(descriptor.executionBackend, this.opts.cc5BridgePort.executionBackend)) {
+        throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
+      }
+      return 'official-cc'
+    }
+    if (descriptor?.executionBackend || this.opts.executionBackend) throw new Error('CC5_BACKEND_TRANSPORT_REQUIRED')
     const next = applyBoxNativeHarness({
       model: this.opts.model,
       descriptor,
@@ -482,6 +528,9 @@ export class SubprocessRunner extends EventEmitter {
   private _startEpoch = 0
 
   async start(): Promise<void> {
+    if (this.opts.cc5BridgePort && !this.currentExecutionDescriptor) {
+      throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
+    }
     if (this.proc) return
     const inflight = this._startPromise
     if (inflight) return inflight
@@ -536,6 +585,31 @@ export class SubprocessRunner extends EventEmitter {
     // is assigned would never bump _consecutiveCrashes, and the caller could
     // retry immediately and re-throw, burning CPU.
     try {
+    let proc: ReturnType<TerminalBackend['spawn']>
+    let spawnOpts: SpawnOpts
+    try {
+    if (this.opts.cc5BridgePort) {
+      // The remote model gets what a local chat gets: this prompt, and tools from these files run here.
+      const { learning, profile, env: laneEnv } = await this.prepareRemoteToolContext()
+      const laneCwd = learning.workingDir ?? this.opts.agentBaseDir
+      const laneProfile = resolve(this.sessionDir!, 'lane-profile.json')
+      writeFileSync(laneProfile, JSON.stringify({
+        version: 1,
+        platformPrompt: learning.extraPromptFile ? readFileSync(learning.extraPromptFile, 'utf8') : '',
+        host: profile,
+      }), { mode: 0o600, flag: 'wx' })
+      spawnOpts = await this.opts.cc5BridgePort.prepare({ cwd: laneCwd, laneProfile, env: laneEnv })
+      this._boundRepoBinding = null
+      this.spawnedUpstreamIsEgress = false
+      this.pendingOfficialSpawnEnv = null
+      this.spawnedOfficialHeaderFingerprint = undefined
+      if (this.promptPolicy) {
+        this._promptPolicyFingerprint = promptPrivacyFingerprint(
+          this.promptPolicy,
+          this.opts.sessionId ?? this.promptPolicy.profile?.sessionId,
+        )
+      }
+    } else {
     if (this.opts.boxResidentCc && !this.boxCcControlPath) {
       if (!this.opts.prepareBoxCc) {
         this.starting = false
@@ -684,6 +758,7 @@ export class SubprocessRunner extends EventEmitter {
     }
     let args = harness === 'official-cc'
       ? buildOfficialClaudeCliArgs({
+          readOnly: this.readOnlyTurn,
           model: this.opts.model,
           permissionMode: this.opts.permissionMode,
           extraPromptFile: learningContext.extraPromptFile,
@@ -696,6 +771,7 @@ export class SubprocessRunner extends EventEmitter {
       : buildCcbCliArgs({
           runtime: ccbRuntime!,
           entry: ccbEntry!,
+          readOnly: this.readOnlyTurn,
           model: this.opts.model,
           permissionMode: this.opts.permissionMode,
           extraPromptFile: learningContext.extraPromptFile,
@@ -769,9 +845,7 @@ export class SubprocessRunner extends EventEmitter {
       }
     }
 
-    let proc: ReturnType<TerminalBackend['spawn']>
-    try {
-      const spawnOpts: SpawnOpts = {
+      spawnOpts = {
           command,
           args,
           ccbBinaryDir: binaryDir,
@@ -788,6 +862,8 @@ export class SubprocessRunner extends EventEmitter {
           OC_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile ?? '',
+          ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway?.port),
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
           ...(this.delegateContextFile
@@ -800,7 +876,8 @@ export class SubprocessRunner extends EventEmitter {
           CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
           // OCV5-434: OpenCode Go GPT Fast (see _buildCcbServiceTierEnv).
           ..._buildCcbServiceTierEnv(this._serviceTier),
-          ...(this.opts.hermeticNoTools ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
+          ...(this.opts.hermeticNoTools || this.readOnlyTurn ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
+          ...(this.readOnlyTurn ? { ENABLE_SEARCH_EXTRA_TOOLS: 'false' } : {}),
           // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
           // here to strip run_in_background from Bash/Agent/PowerShell tool
           // schemas (visibility band-aid for Opus 4.7 over-using background
@@ -823,6 +900,10 @@ export class SubprocessRunner extends EventEmitter {
           OPENCLAUDE_PROMPT_LAYOUT: usesStaticFirstPromptLayout(harness, this.opts.boxResidentCc)
             ? '2'
             : '',
+          // OCV5-755: per-session gitStatus / CLAUDE.md / date snapshot; empty = live values.
+          OPENCLAUDE_CONTEXT_FREEZE_FILE: this._ccbContextFreezeFile,
+          // OCV5-755: Box Claude compacts at a 400k working window; the model keeps 1M.
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: boxAutoCompactWindowEnv(this.opts.model, storagePaths.home),
           ...(harness === 'official-cc'
             ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }
             : {}),
@@ -888,6 +969,15 @@ export class SubprocessRunner extends EventEmitter {
       }
       // OCV5-570: only a CCB whose upstream is egress gets the turn's internal trace header.
       this.spawnedUpstreamIsEgress = _ccbUpstreamIsEgress(spawnOpts.env as NodeJS.ProcessEnv)
+      // official-cc has no stdin env update, so its trace header goes in at spawn.
+      const officialSpawnTrace = harness === 'official-cc' && !this.opts.boxResidentCc && this.pendingOfficialSpawnEnv
+        ? this.egressTraceId()
+        : undefined
+      if (officialSpawnTrace !== undefined) {
+        const env = spawnOpts.env as Record<string, string>
+        env.ANTHROPIC_CUSTOM_HEADERS = _withTraceIdHeader(env.ANTHROPIC_CUSTOM_HEADERS ?? '', officialSpawnTrace)
+      }
+    }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
       if (epoch !== this._startEpoch) return
       timing.once('spawn_requested')
@@ -923,6 +1013,7 @@ export class SubprocessRunner extends EventEmitter {
     if (resolveCcbHarness(this.opts.harness) === 'official-cc' && this.pendingOfficialSpawnEnv) {
       this.spawnedOfficialHeaderFingerprint = officialCcProxySpawnFingerprint(
         this.pendingOfficialSpawnEnv,
+        this.opts.traceId,
       )
     }
     // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
@@ -1072,6 +1163,7 @@ export class SubprocessRunner extends EventEmitter {
       // failed" crash. Record it so the gate fires on the next call.
       this.starting = false
       this._recordCrash({ startError: err instanceof Error ? err.message : String(err) })
+      if (this.opts.cc5BridgePort) await this.opts.cc5BridgePort.close()
       throw err
     }
 
@@ -1129,6 +1221,10 @@ export class SubprocessRunner extends EventEmitter {
 
   private handleStdout(chunk: string, timing = this.processTiming): void {
     this.lastActivityAt = Date.now()
+    if (this._promptFreezeActive && this.lastActivityAt - this._promptFreezeTouchedAt >= PROMPT_FREEZE_TOUCH_MS) {
+      this._promptFreezeTouchedAt = this.lastActivityAt
+      touchFrozenPrompt(storagePaths.home, this.opts.sessionKey, this.lastActivityAt)
+    }
 
     // Scan `chunk` in place rather than first concatenating the entire chunk
     // onto stdoutBuf. Complete lines are parsed one by one and only the final
@@ -1185,7 +1281,7 @@ export class SubprocessRunner extends EventEmitter {
               this.emit('telemetry', telemetryMsg)
             }
           } else {
-            if (this.opts.harness === 'official-cc' && _isOfficialClaudeAbortResult(msg)) {
+            if (this.opts.harness === 'official-cc' && _isOfficialClaudeAbortResult(msg) && !this.opts.cc5BridgePort) {
               this.officialAbortResultObserved = true
               // Official Claude Code exits 1 a few seconds after this frame; a
               // user turn submitted in that window would be written into a
@@ -1258,8 +1354,10 @@ export class SubprocessRunner extends EventEmitter {
     _requestId?: string,
     authority?: TurnModelAuthority,
     turnKey?: string,
+    traceId?: string | null,
   ): Promise<void> {
-    const turnTiming = new PassiveStageTiming({ engine: 'ccb', traceId: this.opts.traceId,
+    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
+    const turnTiming = new PassiveStageTiming({ engine: 'ccb', traceId: turnTraceId,
       sessionKey: this.opts.sessionKey, model: this.opts.model },
       (fields) => runnerLog.info('engine_submit_timing', { ...fields, generation: this.spawnGeneration }))
     turnTiming.once('submit_received')
@@ -1272,7 +1370,16 @@ export class SubprocessRunner extends EventEmitter {
       this.opts.authorityEngine ?? 'ccb',
     )
     turnTiming.once('runtime_resolved')
-    this.pinBoxNativeHarness(runtime.descriptor)
+    if (this.opts.cc5BridgePort) {
+      if (!authority || !turnKey
+        || runtime.descriptor?.canonicalModel !== this.opts.cc5BridgePort.canonicalModel
+        || !runtime.descriptor.executionBackend
+        || !sameRemoteExecutionBackend(runtime.descriptor.executionBackend, this.opts.executionBackend)
+        || typeof userTextOrBlocks !== 'string' || this.readOnlyTurn || this.consultTurnBinding) {
+        throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
+      }
+      this.pinBoxNativeHarness(runtime.descriptor)
+    } else this.pinBoxNativeHarness(runtime.descriptor)
     if (isCcbAdvisorHermeticProfile(this.opts)) {
       await assertCcbAdvisorCatalogLock({
         lock: this.opts.advisorExecutionLock,
@@ -1307,7 +1414,7 @@ export class SubprocessRunner extends EventEmitter {
         turnKey,
         executionDescriptorEnv: this.currentExecutionDescriptorEnv,
       })
-      const fingerprint = officialCcProxySpawnFingerprint(spawnEnv)
+      const fingerprint = officialCcProxySpawnFingerprint(spawnEnv, this.opts.traceId)
       if (this.proc && this.spawnedOfficialHeaderFingerprint !== fingerprint) {
         await this.shutdown()
       }
@@ -1321,6 +1428,8 @@ export class SubprocessRunner extends EventEmitter {
           {
             ..._buildAnthropicCustomHeadersEnv(runtime.headers),
             ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution, turnKey),
+            // OCV5-704: bash children inherit this, so oc-figcheck can cap one image per turn.
+            ...figcheckTurnIdEnv(turnKey),
             [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
             // SessionManager owns the one global 1..10 retry budget. CCB's native
             // withRetry loop is per API call, so leaving it enabled can exceed the
@@ -1334,10 +1443,21 @@ export class SubprocessRunner extends EventEmitter {
       : null
 
     turnTiming.once('recycle_complete')
+    // Admission durably reserves and marks possible remote effects BEFORE any
+    // local bridge /session/open can launch the native TUI.
+    if (this.opts.cc5BridgePort) {
+      try {
+        await this.opts.cc5BridgePort.admit({ authority: authority!, turnKey: turnKey!, model: this.opts.model! })
+      } catch (err) {
+        await this.shutdown()
+        throw err
+      }
+    }
     if (!this.proc) await this.start()
     turnTiming.once('process_available')
     if (!this.proc) throw new Error('failed to start agent subprocess')
-    this.refreshDelegateContext()
+    this.delegateContextTraceId = turnTraceId
+    if (!this.opts.cc5BridgePort) this.refreshDelegateContext(turnTraceId)
     const envUpdateLine = envUpdateVars
       ? _buildUpdateEnvStdinLine({
           ...envUpdateVars,
@@ -1370,6 +1490,10 @@ export class SubprocessRunner extends EventEmitter {
    * live query and every subsequent `/v1/messages` call reads the new header.
    */
   async updateTurnLease(leaseEnvelope: string): Promise<void> {
+    if (this.opts.cc5BridgePort) {
+      await this.opts.cc5BridgePort.renew(leaseEnvelope)
+      return
+    }
     if (resolveCcbHarness(this.opts.harness) === 'official-cc') {
       if (
         this.opts.authorityEngine === 'cursor'
@@ -1381,6 +1505,7 @@ export class SubprocessRunner extends EventEmitter {
         // loopback Cursor relay does not consume this header, so there is no
         // subprocess write in this narrowly-scoped lane.
         void leaseEnvelope
+        this.refreshRollingDelegateContext()
         return
       }
       if (this.opts.authorityEngine === 'cursor') {
@@ -1390,6 +1515,7 @@ export class SubprocessRunner extends EventEmitter {
         // The box CLI never sees these headers. Marking the process stale here
         // would only make the next turn kill a healthy box process.
         void leaseEnvelope
+        this.refreshRollingDelegateContext()
         return
       }
       // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the renewed
@@ -1403,6 +1529,7 @@ export class SubprocessRunner extends EventEmitter {
         ...headerEnv,
       }
       this.spawnedOfficialHeaderFingerprint = undefined
+      this.refreshRollingDelegateContext()
       return
     }
     const renewed = renewTurnHeaderBundle(this.currentTurnHeaders, leaseEnvelope)
@@ -1412,6 +1539,7 @@ export class SubprocessRunner extends EventEmitter {
     )
     if (!this.proc) throw new Error('cannot renew turn lease without a running CCB subprocess')
     await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
+    this.refreshRollingDelegateContext()
   }
 
   /** The turn trace for CCB's egress requests (OCV5-570), or undefined when CCB's upstream is not egress. */
@@ -1459,6 +1587,7 @@ export class SubprocessRunner extends EventEmitter {
   async writeDelegateUserMessage(
     content: string,
   ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
+    if (this.opts.cc5BridgePort) return { ok: false, processAlive: this.isRunning }
     const proc = this.proc
     if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
     const stdin = proc.stdin
@@ -1525,7 +1654,93 @@ export class SubprocessRunner extends EventEmitter {
   // Writes temp files under /tmp/openclaude-<sessionKey>-XXXXXX/:
   //   extra-prompt.md   — USER.md content + skill metadata digest
   //   mcp-config.json   — MCP server pointing at @openclaude/mcp-memory
-  private async buildLearningContext(repoSnapshot: RepoSnapshot | null = null): Promise<{
+  /** Shared container-only tool context. This does not spawn a model or contact the remote node.
+   * Keep it alive until the host's process group has a verified stop proof. */
+  async prepareRemoteToolContext(remoteOpts?: { supportsVision?: boolean }) {
+    const prevDescriptor = this.currentExecutionDescriptor
+    if (remoteOpts?.supportsVision !== undefined) {
+      this.currentExecutionDescriptor = {
+        ...(prevDescriptor ?? ({} as CcbExecutionDescriptor)),
+        supportsVision: remoteOpts.supportsVision,
+      }
+    }
+    let learning: Awaited<ReturnType<SubprocessRunner['buildLearningContext']>>
+    try {
+      learning = await this.buildLearningContext(null, true)
+    } finally {
+      if (remoteOpts?.supportsVision !== undefined) {
+        this.currentExecutionDescriptor = prevDescriptor
+      }
+    }
+    if (!learning.mcpConfigFile || !learning.settingsFile) {
+      this.cleanupSessionDir()
+      throw new Error('CC5_TOOL_CONTEXT_UNAVAILABLE')
+    }
+    // The container tool host runs tools with a local chat's environment, minus model credentials.
+    const laneEnv: Record<string, string> = {}
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined && !CC5_LANE_CREDENTIAL_ENV.test(key)) laneEnv[key] = value
+    }
+    Object.assign(laneEnv, {
+      OC_SESSION_KEY: this.opts.sessionKey,
+      OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
+      OPENCLAUDE_AGENT_ID: this.opts.agentId,
+      OC_AGENT_ID: this.opts.agentId,
+      OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile ?? '',
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway?.port),
+      ...identityCompatEnvironment(this.opts.identityCompat),
+      IS_SANDBOX: '1',
+      CLAUDE_CODE_DISABLE_CRON: '1',
+      CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+    })
+    return {
+      learning,
+      profile: { cwd: learning.workingDir ?? this.opts.agentBaseDir,
+        mcpConfigPath: learning.mcpConfigFile, settingsPath: learning.settingsFile,
+        disallowedTools: [...CCB_LANE_DISALLOWED_TOOLS] },
+      env: laneEnv,
+      cleanup: () => this.cleanupSessionDir(),
+    }
+  }
+
+  /** OCV5-755: the platform prompt this spawn runs with (see promptFreeze.ts).
+   *  Freezing is an optimization: any failure runs the fresh build. */
+  private applySessionPromptFreeze(fresh: FrozenPromptBuild, inputs: PromptFreezeInputs): FrozenPromptBuild {
+    this._ccbContextFreezeFile = ''
+    this._promptFreezeActive = false
+    try {
+      const home = storagePaths.home
+      const mode = resolvePromptFreezeMode(home)
+      if (mode === 'off') return fresh
+      const outcome = applyPromptFreeze({
+        home,
+        sessionKey: this.opts.sessionKey,
+        mode,
+        inputsKey: promptFreezeInputsKey(inputs),
+        fresh,
+      })
+      this._ccbContextFreezeFile = outcome.ccbContextFile
+      this._promptFreezeActive = true
+      this._promptFreezeTouchedAt = Date.now()
+      runnerLog.info('prompt_freeze', {
+        sessionKey: this.opts.sessionKey,
+        mode,
+        decision: outcome.decision,
+        reused: outcome.reused,
+        same_content: outcome.sameContent,
+        changed_slots: outcome.changedSlots,
+        age_min: outcome.ageMs === null ? null : Math.round(outcome.ageMs / 60_000),
+      })
+      return outcome.chosen
+    } catch (err) {
+      this._ccbContextFreezeFile = ''
+      this._promptFreezeActive = false
+      runnerLog.warn('prompt_freeze failed; using fresh prompt', { sessionKey: this.opts.sessionKey }, err)
+      return fresh
+    }
+  }
+
+  private async buildLearningContext(repoSnapshot: RepoSnapshot | null = null, toolOnly = false): Promise<{
     extraPromptFile?: string
     mcpConfigFile?: string
     settingsFile?: string
@@ -1545,6 +1760,8 @@ export class SubprocessRunner extends EventEmitter {
     const safeDirName = this.opts.sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_')
     const sessionDir = mkdtempSync(resolve(tmpdir(), `openclaude-${safeDirName}-`))
     this.sessionDir = sessionDir
+    this._ccbContextFreezeFile = ''
+    this._promptFreezeActive = false
 
     if (this.opts.hermeticNoTools) {
       const mcpPath = resolve(sessionDir, 'mcp-config.json')
@@ -1600,13 +1817,13 @@ export class SubprocessRunner extends EventEmitter {
       for (const tool of tools ?? []) availableMcpTools.add(tool)
     }
     for (const srv of this.opts.config.mcpServers ?? []) {
-      if (srv.enabled === false) continue
+      if (this.readOnlyTurn || srv.enabled === false) continue
       if (srv.provider && srv.provider !== effectiveProvider) continue
       if (allowedMcpIds && !allowedMcpIds.has(srv.id)) continue
       addAvailableTools(srv.tools)
     }
     for (const srv of this.opts.agentMcpServers ?? []) {
-      if (srv.enabled === false) continue
+      if (this.readOnlyTurn || srv.enabled === false) continue
       addAvailableTools(srv.tools)
     }
 
@@ -1618,7 +1835,7 @@ export class SubprocessRunner extends EventEmitter {
     let mcpLaunch: ReturnType<typeof resolveMcpMemoryLaunch> = null
     try {
       mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
-        fallback: 'npx-tsx',
+        fallback: toolOnly ? 'node-tsx' : 'npx-tsx',
       })
     } catch (err) {
       runnerLog.warn(
@@ -1628,6 +1845,7 @@ export class SubprocessRunner extends EventEmitter {
       )
     }
     const projectedMcpTools = projectCcbMcpAvailability({
+      readOnly: this.readOnlyTurn,
       configuredTools: [...availableMcpTools],
       mcpLaunch,
       skillEvalMode: this.opts.skillEvalMode,
@@ -1641,9 +1859,12 @@ export class SubprocessRunner extends EventEmitter {
     //  a background sync on startup. All call the same idempotent reconcile.)
 
     // Build merged extra system prompt via structured prompt slots
+    const privacyEpoch = this._startEpoch
     this._promptIntelligentUi = undefined
+    this._promptPolicyFingerprint = undefined
     try {
       const promptResult = await buildPromptContext({
+        promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
@@ -1673,23 +1894,54 @@ export class SubprocessRunner extends EventEmitter {
         projectBound: Boolean(this.opts.projectId),
         desktopWorkspaceDir: resolveDesktopWorkspaceDir(),
       })
+      const freshPrompt: FrozenPromptBuild = {
+        content: promptResult.content,
+        contentSha256: promptResult.contentSha256,
+        applied: promptResult.applied,
+        ...(promptResult.frozenProjectContext
+          ? { frozenProjectContext: promptResult.frozenProjectContext }
+          : {}),
+      }
+      const chosenPrompt = this.applySessionPromptFreeze(freshPrompt, {
+        agentId: this.opts.agentId,
+        model: this.opts.model,
+        effortLevel: this.opts.effortLevel,
+        provider: effectiveProvider === 'claude-subscription' ? 'claude-subscription' : 'ccb',
+        cacheLayout: usesStaticFirstPromptLayout(resolveCcbHarness(this.opts.harness), this.opts.boxResidentCc)
+          ? 'static-first'
+          : 'legacy',
+        modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
+        availableMcpTools: [...projectedMcpTools],
+        projectId: this.opts.projectId ?? null,
+        sessionId: this.opts.sessionId,
+        cwd: cwdDecision.cwd,
+        persona: this.opts.persona,
+        // The fingerprint covers profile + persona/manual digests (sessionSubmit restarts on it).
+        identityProfile: this.opts.identityCompat?.fingerprint ?? this.opts.identityCompat?.assets?.profile,
+        repoSnapshot,
+        skillEval: [this.opts.skillEvalExclude ?? null, this.opts.skillEvalDraft ?? null],
+        intelligentUi: promptResult.intelligentUi ?? false,
+        promptPolicyFingerprint: promptResult.promptPolicyFingerprint,
+      })
       await persistRunContextSnapshot({
         descriptor: this.opts.runContext,
-        applied: promptResult.applied,
-        promptContentSha256: promptResult.contentSha256,
-        frozen: promptResult.frozenProjectContext,
+        applied: chosenPrompt.applied,
+        promptContentSha256: chosenPrompt.contentSha256,
+        frozen: chosenPrompt.frozenProjectContext,
         cwd: cwdDecision.cwd,
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
-      this._promptIntelligentUi = promptResult.intelligentUi ?? false
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
-      const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
+      const mergedPrompt = [chosenPrompt.content, goalPrompt].filter(Boolean).join('\n\n')
       if (mergedPrompt) {
         const path = resolve(sessionDir, 'extra-prompt.md')
         writeFileSync(path, mergedPrompt)
         out.extraPromptFile = path
       }
+      if (this.promptPolicy && privacyEpoch !== this._startEpoch) throw new Error("PROMPT_PRIVACY_SPAWN_STALE")
+      this._promptIntelligentUi = promptResult.intelligentUi ?? false
+      this._promptPolicyFingerprint = promptResult.promptPolicyFingerprint
       const mergedPromptSha256 = createHash('sha256').update(mergedPrompt).digest('hex')
       runnerLog.info('prompt_context_built', {
         sessionKey: this.opts.sessionKey,
@@ -1705,7 +1957,7 @@ export class SubprocessRunner extends EventEmitter {
       // 不携带 spawn 入参的 raw model — 后者外部可控,用作 label 会撑爆 Prom counter
       // cardinality(观测面 DoS),作为日志字段同样会污染按字段建索引的日志后端。
       // 需要 raw → canonical 的对应关系时,用 sessionKey/agentId 与上下文 launch log 关联。
-      const hint = promptResult.applied.find((s) => s.name === 'MODEL_HINT')
+      const hint = chosenPrompt.applied.find((s) => s.name === 'MODEL_HINT')
       const canonicalModelId = hint?.meta?.model_id
       if (hint && canonicalModelId) {
         runnerLog.info('model_hint_applied', {
@@ -1719,7 +1971,7 @@ export class SubprocessRunner extends EventEmitter {
         modelHintAppliedTotal.inc({ model_id: canonicalModelId, backend: 'ccb' })
       }
     } catch (err) {
-      if (this.opts.identityCompat?.assets) throw err
+      if (this.opts.identityCompat?.assets || this.promptPolicy) throw err
       runnerLog.warn(
         'failed to build extra prompt',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
@@ -1757,7 +2009,9 @@ export class SubprocessRunner extends EventEmitter {
           command: mcpLaunch.command,
           args: mcpLaunch.args,
           env: {
+            ...ccbDelegateMcpBudgetEnvironment(),
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
+            OPENCLAUDE_ADVISOR_READ_ONLY: this.readOnlyTurn ? '1' : '0',
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
             ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
@@ -1775,6 +2029,7 @@ export class SubprocessRunner extends EventEmitter {
               ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME }
               : {}),
             OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
+            ...(this.opts.systemHelpContextFile ? { OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile } : {}),
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
             OPENCLAUDE_GATEWAY_TOKEN: this.opts.config.gateway.accessToken,
             OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
@@ -1817,7 +2072,7 @@ export class SubprocessRunner extends EventEmitter {
 
       // Layer 1 + 2: Global MCPs
       for (const srv of this.opts.config.mcpServers ?? []) {
-        if (srv.enabled === false) continue
+        if (this.readOnlyTurn || srv.enabled === false) continue
         if (srv.provider && srv.provider !== effectiveProvider) continue
         if (allowedMcpIds && !allowedMcpIds.has(srv.id)) continue
         mcpServers[srv.id] = {
@@ -1830,7 +2085,7 @@ export class SubprocessRunner extends EventEmitter {
 
       // Layer 3: Agent-specific MCPs (override same id, bypass toolset filter)
       for (const srv of this.opts.agentMcpServers ?? []) {
-        if (srv.enabled === false) continue
+        if (this.readOnlyTurn || srv.enabled === false) continue
         mcpServers[srv.id] = {
           type: 'stdio',
           command: srv.command,
@@ -1848,6 +2103,7 @@ export class SubprocessRunner extends EventEmitter {
         out.mcpConfigFile = mcpPath
       }
     } catch (err) {
+      if (this.readOnlyTurn) throw err
       runnerLog.warn(
         'failed to write mcp config',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
@@ -1896,6 +2152,10 @@ export class SubprocessRunner extends EventEmitter {
 
   // 发送 interrupt control request — CCB 会中止当前 turn
   interrupt(): boolean {
+    if (this.opts.cc5BridgePort?.interrupt) {
+      void this.opts.cc5BridgePort.interrupt().catch(() => {})
+      return true
+    }
     if (!this.proc) return false
     try {
       const req = {
@@ -1965,12 +2225,20 @@ export class SubprocessRunner extends EventEmitter {
       this.advisorConfigDir = null
     }
     this.delegateContextFile = null
+    this.delegateContextTraceId = undefined
   }
 
   private consultTurnBinding:
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined
   private pendingConsultRespawn = false
+  private readOnlyTurn = false
+
+  /** Tool schemas and MCP children are spawn-scoped. Recycle on both edges. */
+  setReadOnly(readOnly: boolean): void {
+    if (readOnly !== this.readOnlyTurn && this.proc) this.pendingConsultRespawn = true
+    this.readOnlyTurn = readOnly
+  }
 
   setConsultTurn(
     binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
@@ -1982,8 +2250,16 @@ export class SubprocessRunner extends EventEmitter {
     }
   }
 
+  private refreshRollingDelegateContext(): void {
+    // Advisor invocations persist the exact v2 token hash as their receipt.
+    // Reminting that token would break replay/result retrieval. Its separate
+    // renewal protocol must preserve those receipts; ordinary v1 delegates
+    // can safely roll their same-turn caller identity now.
+    if (!this.consultTurnBinding) this.refreshDelegateContext(this.delegateContextTraceId)
+  }
+
   /** Refresh caller binding at the actual turn boundary, not process spawn. */
-  private refreshDelegateContext(): void {
+  private refreshDelegateContext(traceId?: string): void {
     if (!this.delegateContextFile) return
     const consult = this.consultTurnBinding
     const token = consult
@@ -1991,6 +2267,7 @@ export class SubprocessRunner extends EventEmitter {
           agentId: this.opts.agentId,
           sessionKey: this.opts.sessionKey,
           depth: this.opts.delegationDepth ?? 0,
+          traceId,
           turnKey: consult.turnKey,
           turnIndex: consult.turnIndex,
           collabMode: 'advisor',
@@ -2000,6 +2277,7 @@ export class SubprocessRunner extends EventEmitter {
           agentId: this.opts.agentId,
           sessionKey: this.opts.sessionKey,
           depth: this.opts.delegationDepth ?? 0,
+          traceId,
         })
     writeFileSync(this.delegateContextFile, `${token}\n`, { mode: 0o600 })
   }
@@ -2030,6 +2308,11 @@ export class SubprocessRunner extends EventEmitter {
     this._startEpoch += 1
     this._startPromise = null
     this.starting = false
+    // Revoke first; remote proof and local shutdown proceed independently.
+    let remoteStopFailure: unknown
+    const remoteStop = this.opts.cc5BridgePort?.close().catch((error: unknown) => { remoteStopFailure = error })
+    try {
+    await (async () => {
     // Always clean up the session directory, even if there is no live process
     // (failed starts, already-exited runners, crash paths).
     if (!this.proc) {
@@ -2109,6 +2392,11 @@ export class SubprocessRunner extends EventEmitter {
     // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。
     this._boundRepoBinding = null
     this.cleanupSessionDir()
+    })()
+    } finally {
+      await remoteStop
+    }
+    if (remoteStopFailure) throw new Error('CC5_REMOTE_STOP_UNPROVEN')
   }
 
   /** Capture-by-value barrier for the current process generation. */

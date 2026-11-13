@@ -27,6 +27,8 @@ import {
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  Suspense,
+  lazy,
   useEffect,
   useMemo,
   useRef,
@@ -39,7 +41,7 @@ import { SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN } from "../hooks/useSidebarWidth";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
-import { isSidebarSessionRunning } from "../lib/sessionStatus";
+import { type SessionNeedsYouKind, isSidebarSessionRunning } from "../lib/sessionStatus";
 import type {
   ChatProject,
   Session,
@@ -50,13 +52,13 @@ import type {
 import { cn, formatCompactCount, formatCredits } from "../lib/utils";
 import { BrandMark } from "./BrandMark";
 import { ThemeToggle } from "./ThemeToggle";
-import { BatchBar } from "./sidebar/BatchBar";
 import { ProjectRow } from "./sidebar/ProjectRow";
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
 import {
   DEFAULT_PROJECT_ID,
   PROJECT_DRAG_TYPE,
+  PROJECT_SESSION_LIMIT,
   SEARCH_DEBOUNCE_MS,
   SIDEBAR_DURATION_TICK_MS,
   VIRTUALIZE_THRESHOLD,
@@ -78,7 +80,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   IconButton,
+  StatusPill,
 } from "./ui";
+
+/** 多选批量条只在进入多选后出现，懒加载，不进首屏（UI-1 用它抵掉本片首屏增量）。 */
+const BatchBar = lazy(() => import("./sidebar/BatchBar").then((m) => ({ default: m.BatchBar })));
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
@@ -152,6 +158,7 @@ export type SidebarProps = {
   liveTerminal?: (
     id: string,
   ) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  sessionNeedsYou?: (id: string) => SessionNeedsYouKind | null | undefined;
   socketVersion?: number;
   onCollapse?: () => void;
   /**
@@ -243,6 +250,7 @@ export function Sidebar({
   onNewWithAgent,
   isSending,
   liveTerminal,
+  sessionNeedsYou,
   socketVersion,
   onCollapse,
   collapseLabel = "折叠侧栏",
@@ -495,6 +503,8 @@ export function Sidebar({
         localEmpty: filtered.length === 0,
         isRunning: (s) => runningIds.has(s.id),
         coarsePointer: coarse,
+        projectLimit: onOpenProject ? PROJECT_SESSION_LIMIT : undefined,
+        activeId,
       }),
     [
       searching,
@@ -513,6 +523,8 @@ export function Sidebar({
       filtered.length,
       runningIds,
       coarse,
+      onOpenProject,
+      activeId,
     ],
   );
 
@@ -623,7 +635,8 @@ export function Sidebar({
   // 无余额（个人版 / 自托管未接计费、demo、未登录）时副标题此前写死「多模型 · 计量计费」——
   // 商业化营销文案出现在不计费的部署形态里（S-14）。改为有邮箱显邮箱、没有就不占这一行；
   // 最小改动、可回退、不引入新的能力开关判断，计费形态下仍显示余额。
-  const accountSubtitle = credits != null ? null : user?.email?.trim() || null;
+  const email = user?.email?.trim() || null;
+  const accountSubtitle = credits != null ? null : email;
   const userChip = (
     <button
       type="button"
@@ -739,19 +752,10 @@ export function Sidebar({
           </div>
         );
       }
-      // 整个列表为空：居中大 CTA（新用户唯一出口）。空项目：普通一行 + 行内「新建会话」文字钮，
-      // 保留直达 onNewInProject 的出口但不再占 108px（S-01）。空未分类而别处有会话：顶部按钮已覆盖，只留文字。
+      // 整个列表为空：居中大 CTA（新用户唯一出口）。空项目不再占行（UI-1）。
       const emptyList = item.variant === "empty-list";
-      const emptyProject = item.variant === "empty-project";
       const emptyCenter = emptyList || item.text === "没有匹配的会话";
       const isSearchHint = item.key.startsWith("search-");
-      const onNewHere =
-        item.projectId && onNewInProject
-          ? () => {
-              const pid = item.projectId;
-              if (pid) onNewInProject(pid);
-            }
-          : onNew;
       return (
         <div
           // 搜索三态（正在搜索 / 无匹配 / 失败）对读屏播报（S-07）。
@@ -762,32 +766,30 @@ export function Sidebar({
             emptyCenter && "justify-center py-6",
             item.text === "消息搜索失败" && "text-danger",
             emptyList && "flex-col items-center gap-2",
-            // 空项目提示落在子会话标题列上，并延续项目的层级引导线（与 SessionRow 同轴）。
-            emptyProject && "gap-2 pl-[44px] text-caption",
           )}
         >
-          {emptyProject && (
-            <span
-              aria-hidden
-              className="pointer-events-none absolute inset-y-0 left-[15px] w-px bg-border"
-            />
-          )}
           <span>{item.text}</span>
           {emptyList && (
-            <Button variant="secondary" size="sm" onClick={onNewHere}>
+            <Button variant="secondary" size="sm" onClick={onNew}>
               新建会话
             </Button>
           )}
-          {emptyProject && item.projectId && (
-            <button
-              type="button"
-              onClick={onNewHere}
-              // 行内文字钮桌面只有 16px 高(t-762 sidebar#4):触控档补 44px 命中高与左右内距,桌面零变化。
-              className="inline-flex items-center rounded-sm text-caption font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
-            >
-              新建会话
-            </button>
-          )}
+        </div>
+      );
+    }
+    if (item.kind === "more") {
+      // 与子会话同轴（缩进 + 层级引导线），读作这一组的最后一行。
+      return (
+        <div className="relative h-full py-px pl-[22px]">
+          <span aria-hidden className="pointer-events-none absolute inset-y-0 left-[15px] w-px bg-border" />
+          <button
+            type="button"
+            onClick={() => onOpenProject?.(item.projectId)}
+            className="flex h-full w-full items-center gap-1 rounded-sm pl-7.5 text-left text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            查看全部 {item.count} 条
+            <ChevronRight size={12} aria-hidden />
+          </button>
         </div>
       );
     }
@@ -804,6 +806,7 @@ export function Sidebar({
           running={running}
           lastOutcome={live?.lastOutcome ?? s.lastOutcome}
           lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
+          needsYou={sessionNeedsYou?.(s.id) ?? null}
           now={running ? now : 0}
           onSelect={rowActions.select}
           onRename={rowActions.rename}
@@ -895,18 +898,12 @@ export function Sidebar({
             onMarkRead?.(hit.sessionId);
             onSelect(hit.sessionId);
           }}
-          className={
-            unreadIds?.has(hit.sessionId) || hit.unread
-              ? "flex h-full w-full min-w-0 flex-col justify-center gap-0.5 rounded-sm px-2.5 text-left text-section text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-              : "flex h-full w-full min-w-0 flex-col justify-center gap-0.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          }
+          className="flex h-full w-full min-w-0 flex-col justify-center gap-0.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <span
-            className={
-              unreadIds?.has(hit.sessionId) || hit.unread ? "truncate font-semibold" : "truncate"
-            }
-          >
-            {hit.title || "新对话"}
+          {/* 未读只用点表示，不加粗（UI-SPEC §4.3）。 */}
+          <span className="flex min-w-0 items-center gap-1.5">
+            {(unreadIds?.has(hit.sessionId) || hit.unread) && <StatusPill status="unread" size="md" />}
+            <span className="truncate">{hit.title || "新对话"}</span>
           </span>
           <span className="truncate text-caption text-faint">
             {hit.projectId
@@ -1188,6 +1185,7 @@ export function Sidebar({
       </div>
 
       {multiSelect && onBatch && (
+        <Suspense fallback={null}>
         <BatchBar
           count={selectedIds.size}
           projects={orderedProjects}
@@ -1199,6 +1197,7 @@ export function Sidebar({
           }}
           onCancel={clearMulti}
         />
+        </Suspense>
       )}
 
       {/* 会话列表导航语义:读屏用户按 landmark/region 快速跳到会话区(探针:工作区 nav=0)。 */}
@@ -1221,162 +1220,163 @@ export function Sidebar({
             onClick={onLoadMore}
             className="rounded-md px-2 py-1 text-caption font-medium text-danger outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
           >
-            加载更早会话失败，点击重试
+            加载更早会话失败，点击继续
           </button>
         </div>
       ) : null}
 
-      <div
-        className="flex items-center gap-0.5 border-t border-border/70 px-2 pt-1.5 sidebar-foot-safe-b"
-        data-product-entry-scope="sidebar-account"
-      >
-        {hasAccountMenu ? (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>{userChip}</DropdownMenuTrigger>
-            <DropdownMenuContent
-              side="top"
-              align="start"
-              sideOffset={8}
-              className="w-64 p-1.5"
-              data-product-entry-scope="account-menu"
-            >
-              <div className="flex items-center gap-2.5 px-2 py-2">
-                <Avatar
-                  tone="neutral"
-                  className="bg-accent-soft text-body text-accent ring-1 ring-inset ring-accent/15"
-                >
-                  {(user?.displayName || "U").slice(0, 1).toUpperCase()}
-                </Avatar>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-section font-medium text-fg">
-                    {user?.displayName || "未登录"}
-                  </p>
-                  {credits != null ? (
-                    <p className="truncate text-caption text-faint">{`${formatCredits(credits)} 积分`}</p>
-                  ) : accountSubtitle ? (
-                    <p className="truncate text-caption text-faint">{accountSubtitle}</p>
-                  ) : null}
+      {/* 底栏：账号区，右侧是案例展厅与主题切换。任务 / 经验分享在搜索下方以文字行呈现；
+          管理 / 市场仍在账号菜单里（T41 契约）。 */}
+      <div className="border-t border-border/70 px-2 pt-1 sidebar-foot-safe-b">
+        <div className="flex items-center" data-product-entry-scope="sidebar-account">
+          {hasAccountMenu ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>{userChip}</DropdownMenuTrigger>
+              <DropdownMenuContent
+                side="top"
+                align="start"
+                sideOffset={8}
+                className="w-64 p-1.5"
+                data-product-entry-scope="account-menu"
+              >
+                <div className="flex items-center gap-2.5 px-2 py-2">
+                  <Avatar
+                    tone="neutral"
+                    className="bg-accent-soft text-body text-accent ring-1 ring-inset ring-accent/15"
+                  >
+                    {(user?.displayName || "U").slice(0, 1).toUpperCase()}
+                  </Avatar>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-section font-medium text-fg">
+                      {user?.displayName || "未登录"}
+                    </p>
+                    {/* 登录邮箱始终在菜单头部（体验官：有余额时账号区看不到邮箱）。 */}
+                    {email && <p className="truncate text-caption text-faint">{email}</p>}
+                    {credits != null && (
+                      <p className="truncate text-caption text-faint">{`${formatCredits(credits)} 积分`}</p>
+                    )}
+                  </div>
                 </div>
-              </div>
-              <DropdownMenuSeparator />
-              {onOpenManage && (
-                <DropdownMenuItem
-                  data-product-feature={PRODUCT_CAPABILITIES.memory.id}
-                  onSelect={onOpenManage}
-                >
-                  <LayoutGrid size={16} className="shrink-0 text-muted" />
-                  <span className="flex-1">管理中心</span>
-                  <span className="text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
-                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                {onOpenManage && (
+                  <DropdownMenuItem
+                    data-product-feature={PRODUCT_CAPABILITIES.memory.id}
+                    onSelect={onOpenManage}
+                  >
+                    <LayoutGrid size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">管理中心</span>
+                    <span className="text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
+                  </DropdownMenuItem>
+                )}
+                {onOpenMarketplace && (
+                  <DropdownMenuItem
+                    data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
+                    onSelect={onOpenMarketplace}
+                  >
+                    <Store size={16} className="shrink-0 text-muted" />
+                    市场
+                  </DropdownMenuItem>
+                )}
+                {onOpenOrg && (
+                  <DropdownMenuItem
+                    data-product-feature={PRODUCT_CAPABILITIES.organization.id}
+                    onSelect={onOpenOrg}
+                  >
+                    <Building2 size={16} className="shrink-0 text-muted" />
+                    组织
+                  </DropdownMenuItem>
+                )}
+                {showAdmin && (
+                  <DropdownMenuItem asChild data-product-control>
+                    <a data-product-control href="/admin.html">
+                      <ShieldCheck size={16} className="shrink-0 text-muted" />
+                      管理后台
+                    </a>
+                  </DropdownMenuItem>
+                )}
+                {onOpenStudio && (
+                  <DropdownMenuItem data-product-control onSelect={onOpenStudio}>
+                    <Clapperboard size={16} className="shrink-0 text-muted" />
+                    媒体工作台
+                  </DropdownMenuItem>
+                )}
+                {onOpenMediaTasks && (
+                  <DropdownMenuItem data-product-control onSelect={onOpenMediaTasks}>
+                    <Film size={16} className="shrink-0 text-muted" />
+                    视频任务
+                  </DropdownMenuItem>
+                )}
+                {onOpenChatGptProxy && (
+                  <DropdownMenuItem data-product-control onSelect={onOpenChatGptProxy}>
+                    <Globe size={16} className="shrink-0 text-muted" />
+                    ChatGPT 直连
+                  </DropdownMenuItem>
+                )}
+                {onOpenApiAccess && (
+                  <DropdownMenuItem data-product-control onSelect={onOpenApiAccess}>
+                    <KeyRound size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">API 接入</span>
+                    <span className="text-caption text-faint">本地 Claude Code</span>
+                  </DropdownMenuItem>
+                )}
+                {(onOpenAccount || onOpenFeedback || onLogout) &&
+                  (onOpenManage ||
+                    onOpenMarketplace ||
+                    onOpenOrg ||
+                    showAdmin ||
+                    onOpenStudio ||
+                    onOpenMediaTasks ||
+                    onOpenChatGptProxy ||
+                    onOpenApiAccess) && <DropdownMenuSeparator />}
+                {onOpenAccount && (
+                  <DropdownMenuItem
+                    data-product-feature={PRODUCT_CAPABILITIES.billing.id}
+                    onSelect={onOpenAccount}
+                  >
+                    <Settings size={16} className="shrink-0 text-muted" />
+                    设置
+                  </DropdownMenuItem>
+                )}
+                {onOpenFeedback && (
+                  <DropdownMenuItem
+                    data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
+                    onSelect={onOpenFeedback}
+                  >
+                    <MessageSquareText size={16} className="shrink-0 text-muted" />
+                    意见反馈
+                  </DropdownMenuItem>
+                )}
+                {onLogout && (
+                  <DropdownMenuItem data-product-control destructive onSelect={onLogout}>
+                    <LogOut size={16} className="shrink-0" />
+                    退出登录
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            userChip
+          )}
+          {onOpenTutorial && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              data-product-control
+              onClick={onOpenTutorial}
+              aria-label="打开案例展厅"
+              title="案例展厅"
+              className={cn(
+                "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:size-11",
+                footerCompact ? "w-7 px-0" : "px-2",
               )}
-              {onOpenMarketplace && (
-                <DropdownMenuItem
-                  data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
-                  onSelect={onOpenMarketplace}
-                >
-                  <Store size={16} className="shrink-0 text-muted" />
-                  市场
-                </DropdownMenuItem>
-              )}
-              {onOpenOrg && (
-                <DropdownMenuItem
-                  data-product-feature={PRODUCT_CAPABILITIES.organization.id}
-                  onSelect={onOpenOrg}
-                >
-                  <Building2 size={16} className="shrink-0 text-muted" />
-                  组织
-                </DropdownMenuItem>
-              )}
-              {showAdmin && (
-                <DropdownMenuItem asChild data-product-control>
-                  <a data-product-control href="/admin.html">
-                    <ShieldCheck size={16} className="shrink-0 text-muted" />
-                    管理后台
-                  </a>
-                </DropdownMenuItem>
-              )}
-              {onOpenStudio && (
-                <DropdownMenuItem data-product-control onSelect={onOpenStudio}>
-                  <Clapperboard size={16} className="shrink-0 text-muted" />
-                  媒体工作台
-                </DropdownMenuItem>
-              )}
-              {onOpenMediaTasks && (
-                <DropdownMenuItem data-product-control onSelect={onOpenMediaTasks}>
-                  <Film size={16} className="shrink-0 text-muted" />
-                  视频任务
-                </DropdownMenuItem>
-              )}
-              {onOpenChatGptProxy && (
-                <DropdownMenuItem data-product-control onSelect={onOpenChatGptProxy}>
-                  <Globe size={16} className="shrink-0 text-muted" />
-                  ChatGPT 直连
-                </DropdownMenuItem>
-              )}
-              {onOpenApiAccess && (
-                <DropdownMenuItem data-product-control onSelect={onOpenApiAccess}>
-                  <KeyRound size={16} className="shrink-0 text-muted" />
-                  <span className="flex-1">API 接入</span>
-                  <span className="text-caption text-faint">本地 Claude Code</span>
-                </DropdownMenuItem>
-              )}
-              {(onOpenAccount || onOpenFeedback || onLogout) &&
-                (onOpenManage ||
-                  onOpenMarketplace ||
-                  onOpenOrg ||
-                  showAdmin ||
-                  onOpenMediaTasks ||
-                  onOpenStudio ||
-                  onOpenChatGptProxy ||
-                  onOpenApiAccess) && <DropdownMenuSeparator />}
-              {onOpenAccount && (
-                <DropdownMenuItem
-                  data-product-feature={PRODUCT_CAPABILITIES.billing.id}
-                  onSelect={onOpenAccount}
-                >
-                  <Settings size={16} className="shrink-0 text-muted" />
-                  设置
-                </DropdownMenuItem>
-              )}
-              {onOpenFeedback && (
-                <DropdownMenuItem
-                  data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
-                  onSelect={onOpenFeedback}
-                >
-                  <MessageSquareText size={16} className="shrink-0 text-muted" />
-                  意见反馈
-                </DropdownMenuItem>
-              )}
-              {onLogout && (
-                <DropdownMenuItem data-product-control destructive onSelect={onLogout}>
-                  <LogOut size={16} className="shrink-0" />
-                  退出登录
-                </DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        ) : (
-          userChip
-        )}
-        {onOpenTutorial && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            data-product-control
-            onClick={onOpenTutorial}
-            aria-label="打开案例展厅"
-            title="案例展厅"
-            className={cn(
-              "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:size-11",
-              footerCompact ? "w-7 px-0" : "px-2",
-            )}
-          >
-            <BookOpen size={16} />
-            {!footerCompact && <span className="text-caption font-medium">案例</span>}
-          </Button>
-        )}
-        {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} compact />}
+            >
+              <BookOpen size={16} />
+              {!footerCompact && <span className="text-caption font-medium">案例</span>}
+            </Button>
+          )}
+          {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} compact />}
+        </div>
       </div>
     </aside>
   );

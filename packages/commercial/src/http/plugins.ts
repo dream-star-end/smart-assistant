@@ -221,6 +221,8 @@ async function accountProvider(
 }
 
 function mapRuntimeError(error: unknown, provider?: string): never {
+  if (error instanceof ConnectorError)
+    throw pluginHttpError(error.httpStatus, error.code, resolvePluginErrorGuidance({ code: error.code, provider }).message)
   if (error instanceof PluginRuntimeFacadeError) {
     switch (error.code) {
       case 'BAD_REQUEST':
@@ -303,10 +305,7 @@ export async function dispatchPluginsRoute(
   if (setupProvider && !isPluginAvailable(setupProvider) && method !== 'DELETE')
     throw new HttpError(404, 'NOT_FOUND', '插件已下架')
 
-  if (
-    path === '/api/plugins/literature-db/setup' ||
-    path.startsWith('/api/plugins/literature-db/setup/')
-  ) {
+  if (path === '/api/plugins/literature-db/setup' || path.startsWith('/api/plugins/literature-db/setup/')) {
     await dispatchLiteratureSetup(req, res, userId, deps.literatureSetup, path)
     return
   }

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { type TaskboardDb, openTaskboardDb } from '../db/index.js'
-import { listPipelines, listStages } from '../db/pipelines.js'
+import { listPipelines, listStages, updateStage } from '../db/pipelines.js'
 import { createProject } from '../db/projects.js'
 import { listSeedStageNames, seedDefaultPipelines } from '../db/seed.js'
 import {
@@ -117,4 +117,25 @@ describe('自定义模板', () => {
     assert.equal(getTemplate(db, custom.id), null)
     db.close()
   })
+})
+
+
+it('builtin preview clones bindings; custom snapshots retain their own agent/model', () => {
+  const db = freshDb()
+  const src = createProject(db, { key: 'SRC2', name: '源' })
+  const selected = getTemplate(db, 'builtin:bug', { executionAgentId: 'explicit-helper' })!
+  assert.ok(selected.stages.filter((s) => s.kind === 'ai').every((s) => s.agentId === 'explicit-helper' && s.model === null && s.patrolEnabled))
+  assert.ok(getTemplate(db, 'builtin:bug')!.stages.filter((s) => s.kind === 'ai').every((s) => s.agentId === null && !s.patrolEnabled))
+  seedDefaultPipelines(db, src.id, ['feature'], { executionAgentId: 'custom-helper' })
+  const pipe = listPipelines(db, src.id)[0]!
+  const first = listStages(db, pipe.id)[0]!
+  updateStage(db, first.id, { model: 'custom-explicit-model' })
+  const snapshot = createTemplateFromPipeline(db, { pipelineId: pipe.id, slug: 'preserved-custom' })
+  const dst = createProject(db, { key: 'DST2', name: '目标' })
+  const applied = applyTemplate(db, snapshot.id, dst.id, { executionAgentId: 'unrelated-choice' })
+  const stages = listStages(db, applied.pipeline!.id)
+  assert.equal(stages[0]!.agentId, 'custom-helper')
+  assert.equal(stages[0]!.model, 'custom-explicit-model')
+  assert.deepEqual(stages.map((s) => [s.agentId, s.model]), snapshot.stages.map((s) => [s.agentId, s.model]))
+  db.close()
 })

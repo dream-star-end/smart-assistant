@@ -97,6 +97,10 @@ test('cutover refuses before survivor/mutation and does not compensate idle fail
   assert.ok(check < body.indexOf('cutover_persist_phase "pre-install"'))
   assert.ok(check < body.indexOf('cutover_arm_survivor "$backup"'))
   assert.ok(check < body.indexOf('CUTOVER_MUTATED=1'))
+  const installPolicy = body.indexOf('install_host_log_policy_from_snapshot "$rel" "$unit_snap"')
+  assert.ok(installPolicy > body.indexOf('CUTOVER_MUTATED=1'))
+  assert.ok(check < installPolicy)
+  assert.ok(installPolicy < body.indexOf('install_unit "$unit_snap/$V5_EGRESS_UNIT"'))
   assert.ok(check < body.indexOf('install_unit "$unit_snap/$V5_EGRESS_UNIT"'))
   assert.ok(check < body.indexOf('atomic_flip_live_symlink "$rel"'))
   assert.doesNotMatch(fn, /cutover_compensate|systemctl|survivor|atomic_flip/)
@@ -173,29 +177,35 @@ test('commercial deployment rejects the parameter without invoking external oper
 
 test('an early claimed train keeps its exact source when shared HEAD advances during auxiliary setup', () => {
   const deploy = readFileSync(path.join(root, 'scripts/deploy-v5-selfhost.sh'), 'utf8')
-  const start = deploy.indexOf('  ensure_model_authority\n', deploy.indexOf('cmd_deploy()'))
+  // P4 moves legacy setup/build into explicit branches; extract a balanced region.
+  const start = deploy.indexOf('  if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then\n    ensure_selfhost_env_keys', deploy.indexOf('cmd_deploy()'))
   const end = deploy.indexOf('  build_master_release "$sha"', start)
   assert.ok(start > 0 && end > start)
-  const actual = `${deploy.slice(start, end)}  build_master_release "$sha"\n`
+  const actual = `${deploy.slice(start, end)}  build_master_release "$sha"\nfi\n`
   const a = 'a'.repeat(40)
   const b = 'b'.repeat(40)
   for (const active of [0, 1]) {
     const r = spawnSync('bash', ['-c', `set -Eeuo pipefail
-sha=${a}; LEASE_TRAIN_ACTIVE=${active}; BUILT_MASTER_RELEASE=fixture
+sha=${a}; LEASE_TRAIN_ACTIVE=${active}; BUILT_MASTER_RELEASE=fixture; SELFHOST_SPLIT_PREPARED=0
+ensure_selfhost_env_keys() { :; }; seed_web_assets_pool_from_live() { :; }; ensure_node_modules() { :; }
+install_aux_units() { :; }; refresh_ccb_proxy_path() { :; }
 source_commit() { echo ${b}; }
 ensure_model_authority() { :; }
 assert_env_key_drift() { :; }
 lease_train_begin() { echo "CLAIM:$1"; }
+selfhost_release_preflight() { echo "L0:$1"; }
 assert_fix_trailers() { :; }
 assert_p0_web_overlay_contained() { :; }
 log() { :; }
-start_runtime_release_bg() { echo "RUNTIME:$1"; }
-build_master_release() { echo "MASTER:$1"; }
+build_master_release() { echo "MASTER:$1 BG:\${MASTER_RUNTIME_BG_AFTER_ADMISSION:-0}"; }
 ${actual}`], { encoding: 'utf8' })
     assert.equal(r.status, 0, r.stderr)
     const expected = active ? a : b
-    assert.match(r.stdout, new RegExp(`RUNTIME:${expected}`))
-    assert.match(r.stdout, new RegExp(`MASTER:${expected}`))
+    // OCV5-648 (P2): build_master_release starts the runtime bg build from its own $1 after admission
+    assert.match(r.stdout, new RegExp(`MASTER:${expected} BG:1`))
+    // OCV5-581: L0 checks the same exact source the build uses, after the claim and before the build
+    assert.match(r.stdout, new RegExp(`L0:${expected}[\\s\\S]*MASTER:${expected}`))
+    if (!active) assert.match(r.stdout, new RegExp(`CLAIM:${b}[\\s\\S]*L0:${b}`))
     if (active) assert.doesNotMatch(r.stdout, /CLAIM:/)
     else assert.match(r.stdout, new RegExp(`CLAIM:${b}`))
   }

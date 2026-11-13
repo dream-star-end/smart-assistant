@@ -1,22 +1,23 @@
+import type { LegacyCardIo } from '../lib/legacyCardIo';
+import { assertResolvedIdentity, identityIsCurrent, type ResolvedIdentity } from '../lib/resolvedIdentity';
 /**
  * Chat turn and card actions: stop, media signing, permission response, feedback, tool actions, retry/continue and card callbacks
  *
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-import type { BlogDraft } from "../components/tutorials/blog/blogLib";
-import { tutorialHref } from "./useAppRoute";
 import { useCallback, useMemo, useRef } from "react";
 import { findStopTarget } from "../lib/implicitFeedback";
 import { api } from "../lib/api";
 import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
 import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
-import type { ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
+import type { ToolCardActions, SystemActionCardActions, ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
 import { isBrowserStepMessage } from "../components/tool/browserDetect";
 import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
-import { preciseRetryEligible, interruptedContinuationTarget } from "../lib/chat/socket";
+import { preciseRetryEligible } from "../lib/chat/socket";
+import { manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
 import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
@@ -30,6 +31,10 @@ import type { ImplicitReason } from "./useResponseRatings";
 import type { ChatError } from "../components/ErrorBanner";
 import type { SaveToProjectRequest } from "../components/project/SaveToProjectDialog";
 import type { ToastFn } from "../components/ui/Toast";
+import type { BlogDraft } from "../components/tutorials/blog/blogLib";
+import { tutorialHref } from "./useAppRoute";
+
+/** 对话里的经验分享卡要打开的地方（App 负责打开教程中心的经验分享页签）。 */
 
 function replyQuoteText(message: ChatMessage): string {
   if (message.text.trim()) return message.text;
@@ -53,6 +58,8 @@ export type ChatCardActionsInput = {
   chipsBoardProjectId: string | null;
   chipsProjectName: string;
   demo: boolean;
+  systemActions?: SystemActionCardActions;
+  identity: ResolvedIdentity | null;
   loadExactUserMessage: (message: ChatMessage) => Promise<ChatMessage | null>;
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
@@ -63,7 +70,7 @@ export type ChatCardActionsInput = {
   openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined) => void;
   openSettings: (section?: SettingsDestinationSection) => void;
   regenerate: () => Promise<void>;
-  send: (text: string, media?: { url?: string | undefined; base64?: string | undefined; mimeType?: string | undefined; filename?: string | undefined; hidden?: boolean | undefined; localSrc?: string | undefined; kind: "image" | "audio" | "video" | "file"; }[] | undefined, imageEdit?: { mode?: "annotated" | "outpaint" | undefined; maskIndex?: number | undefined; targetAspect?: "16:9" | "4:3" | "9:16" | "3:4" | "1:1" | undefined; clientJobId: string; sourceIndex: number; guideIndex: number; width: number; height: number; } | undefined, displayText?: string | undefined, replyTo?: { text: string; messageId: string; role: "user" | "assistant"; } | undefined, target?: { sessionId: string; projectId?: string | null | undefined; } | undefined) => Promise<void>;
+  send: (text: string, media?: { url?: string | undefined; base64?: string | undefined; mimeType?: string | undefined; filename?: string | undefined; hidden?: boolean | undefined; localSrc?: string | undefined; kind: "image" | "audio" | "video" | "file"; }[] | undefined, imageEdit?: { mode?: "annotated" | "outpaint" | undefined; maskIndex?: number | undefined; targetAspect?: "16:9" | "4:3" | "9:16" | "3:4" | "1:1" | undefined; clientJobId: string; sourceIndex: number; guideIndex: number; width: number; height: number; } | undefined, displayText?: string | undefined, replyTo?: { text: string; messageId: string; role: "user" | "assistant"; } | undefined, target?: { sessionId: string; projectId?: string | null | undefined; } | undefined) => Promise<unknown>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
   sending: boolean;
   setBoardOpen: (open: boolean) => void;
@@ -91,6 +98,8 @@ export function useChatCardActions({
   chipsBoardProjectId,
   chipsProjectName,
   demo,
+  systemActions,
+  identity,
   loadExactUserMessage,
   messageFeedbackTriggerRef,
   newSession,
@@ -176,81 +185,69 @@ export function useChatCardActions({
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setMessageFeedback(ctx);
   }, []);
-  // 工具卡上下文动作（记忆/技能/定时任务卡上的「打开…」按钮 + 连接器写操作确认卡的
-  // 鉴权动作）。稳定引用经 context 注入，不污染 ToolCard 数据契约。demo 无网络 → 不提供
-  //（按钮自动隐藏 / 确认卡降级纯展示）。authRef 是稳定 ref，不入依赖。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, setCollapsed are App useState setter/useRef passed in, stable
-  const toolActions = useMemo(
-    () =>
-      demo
-        ? {}
-        : {
-            onOpenMemory: () => openManage("memory"),
-            onOpenSkills: () => openManage("skills"),
-            onOpenTasks: () => openManage("cron"),
-            downloadLiteratureArtifact: (artifactId: string) =>
-              api.downloadLiteratureArtifact(authRef.current, artifactId),
-            literatureArtifactMeta: (artifactId: string) =>
-              api.literatureArtifactMeta(authRef.current, artifactId),
-            connectorConfirm: {
-              getDetail: (id: string) => api.getConnectorConfirmation(authRef.current, id),
-              decide: (id: string, decision: "approve" | "deny") =>
-                api.decideConnectorConfirmation(authRef.current, id, decision),
-            },
-            ...(TASKBOARD_ENABLED
-              ? {
-                  taskApproval: {
-                    getTicket: async (id: string) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.getTicket(authRef.current, id);
-                    },
-                    approve: async (id: string, expectedVersion: number) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.approve(authRef.current, id, expectedVersion);
-                    },
-                    reject: async (id: string, expectedVersion: number, reason: string) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.reject(authRef.current, id, expectedVersion, reason);
-                    },
-                  },
-                  onOpenTaskboard: () => {
-                    setCollapsed(false);
-                    setBoardOpen(true);
-                  },
-                }
-              : {}),
-            ...(communityBlogEnabled && authRef.current.snapshot().token
-              ? {
-                  communityBlog: {
-                    precheck: (draft: BlogDraft) =>
-                      api.precheckCommunityTutorial(authRef.current, draft),
-                    readContainerImage: async (path: string) => {
-                      const url = (await api.mediaSign(authRef.current, [path])).urls[path];
-                      if (!url) throw new Error("图片签名失败");
-                      const res = await fetch(url);
-                      if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
-                      return res.blob();
-                    },
-                    uploadImage: (image: Blob) => api.uploadTutorialImage(authRef.current, image),
-                    submit: (draft: BlogDraft) => api.submitCommunityTutorial(authRef.current, draft),
-                    getMine: (id: string) => api.getMyCommunityTutorial(authRef.current, id),
-                    postUrl: (id: string) =>
-                      `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
-                    openPost: (id: string) => {
-                      if (authRef.current.snapshot().token) openBlog({ kind: "post", id });
-                    },
-                    openMine: () => {
-                      if (authRef.current.snapshot().token) openBlog({ kind: "mine" });
-                    },
-                    openEditor: (seed: BlogDraft) => {
-                      if (authRef.current.snapshot().token) openBlog({ kind: "editor", seed });
-                    },
-                  },
-                }
-              : {}),
+  const cardAuth = authRef.current;
+  const toolActions = useMemo<ToolCardActions>(() => {
+    if (demo) return {};
+    const auth = cardAuth;
+    const assertCurrent = () => {
+      if (!identity) throw new Error("请等待登录状态核验完成");
+      assertResolvedIdentity(identity, authRef.current);
+    };
+    const guard = { assertCurrent };
+    let io: Promise<LegacyCardIo> | undefined;
+    function defer<K extends keyof LegacyCardIo>(key: K): LegacyCardIo[K] {
+      return (async (...args: unknown[]) => {
+        assertCurrent();
+        io ??= import('../lib/legacyCardIo').then(module => {
+          assertCurrent();
+          return module.createLegacyCardIo(auth, guard);
+        }).catch(error => { io = undefined; throw error; });
+        const client = await io;
+        assertCurrent();
+        return Reflect.apply(client[key], null, args);
+      }) as LegacyCardIo[K];
+    }
+    const verified = identityIsCurrent(identity, auth);
+    return {
+      systemActions,
+      onOpenMemory: () => openManage("memory"),
+      onOpenSkills: () => openManage("skills"),
+      onOpenTasks: () => openManage("cron"),
+      downloadLiteratureArtifact: (id: string) => api.downloadLiteratureArtifact(authRef.current, id),
+      literatureArtifactMeta: (id: string) => api.literatureArtifactMeta(authRef.current, id),
+      ...(verified ? {
+        connectorConfirm: {
+          getDetail: defer('connectorDetail'),
+          decide: defer('connectorDecide'),
+        },
+      } : {}),
+      ...(TASKBOARD_ENABLED ? {
+        onOpenTaskboard: () => { setCollapsed(false); setBoardOpen(true); },
+        ...(verified ? {
+          taskApproval: {
+            getTicket: defer('taskGet'),
+            approve: defer('taskApprove'),
+            reject: defer('taskReject'),
           },
-    [demo, openManage, setBoardOpen, communityBlogEnabled, openBlog],
-  );
+        } : {}),
+      } : {}),
+      ...(communityBlogEnabled && auth.snapshot().token ? {
+        communityBlog: {
+          ...(verified ? {
+            precheck: (draft: BlogDraft) => defer('precheck')({ ...draft }),
+            readContainerImage: defer('readContainerImage'),
+            uploadImage: defer('uploadImage'),
+            submit: (draft: BlogDraft) => defer('submit')({ ...draft }),
+            getMine: defer('getMine'),
+          } : {}),
+          postUrl: (id: string) => `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
+          openPost: (id: string) => { if (authRef.current.snapshot().token) openBlog({ kind: "post", id }); },
+          openMine: () => { if (authRef.current.snapshot().token) openBlog({ kind: "mine" }); },
+          openEditor: (seed: BlogDraft) => { if (authRef.current.snapshot().token) openBlog({ kind: "editor", seed }); },
+        },
+      } : {}),
+    };
+  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, communityBlogEnabled, openBlog]);
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
   // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。
@@ -305,6 +302,7 @@ export function useChatCardActions({
     [demo, activeId, agent.id, loadExactOrToast, toast],
   );
 
+
   const editResend = useCallback(
     async (msg: ChatMessage) => {
       const exact = await loadExactOrToast(msg);
@@ -313,13 +311,8 @@ export function useChatCardActions({
     [activeId, loadExactOrToast, setComposerPrefill],
   );
 
-  // 红卡 CTA 硬门(任务④ / Codex 审计 R4)的精确重试目标解析:按 assistant 错误行的
-  // _clientMessageId 在当前会话里定位可**原样重发**的 user 行。现场取 messages(稳定句柄 sockRef,
-  // 不捕获每帧刷新的 wsMessages),与 retrySend 同 deps(仅随会话切换变)。资格三条:
-  //   (a) 该 user 行存在且 status='error'(有完整 payload、确实失败);
-  //   (b)(c) 自带 _routing 快照 + 附件重发证据仍在 —— 见 preciseRetryEligible(与 retryMessage
-  //   实际读取的字段严格对齐,防止借用别轮 _lastRouting / 静默丢附件)。任一不满足 → 返回
-  //   undefined,红卡落回 onRegenerate 兜底(见 AssistantCard 的 R5 末轮门控)。
+  // Editing resolves the exact failed user row. Error-card execution uses
+  // Continue below and never falls back to replaying the latest request.
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sockRef is App useState setter/useRef passed in, stable
   const resolveRetryTarget = useCallback(
     (clientMessageId: string): ChatMessage | undefined => {
@@ -338,22 +331,29 @@ export function useChatCardActions({
     (error: ChatMessage): ChatMessage | undefined => {
       if (demo || !activeId) return undefined;
       const msgs = sockRef.current?.getMessages(activeId) ?? [];
-      return interruptedContinuationTarget(msgs, error, activeId)?.user;
+      return manualTaskContinuationSource(msgs, error);
     },
     [demo, activeId],
   );
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sockRef is App useState setter/useRef passed in, stable
+  const pendingContinuations = useRef(new Set<string>());
   const continueInterrupted = useCallback(
-    (error: ChatMessage) => {
-      if (demo || !activeId) return;
-      sockRef.current?.continueInterruptedTurn({
-        sessId: activeId,
-        errorMessageId: error.id,
-        agentId: agent.id,
-      });
+    async (error: ChatMessage) => {
+      if (demo || !activeId || activeSessionRef.current !== activeId) return;
+      if (!identity || !identityIsCurrent(identity, authRef.current)) return;
+      let action: typeof import("./manualTaskContinuationAction");
+      try {
+        action = await import("./manualTaskContinuationAction");
+      } catch {
+        if (activeSessionRef.current === activeId && identityIsCurrent(identity, authRef.current)) {
+          toast("继续功能加载失败，请稍后再试", "error");
+        }
+        return;
+      }
+      await action.continueManualTask({ activeId, demo, identity, authRef, sockRef, send, error,
+        agentId: agent.id, activeSessionRef, pendingContinuations, loadExactOrToast });
     },
-    [demo, activeId, agent.id],
+    [demo, activeId, agent.id, authRef, identity, loadExactOrToast, send, sockRef, toast],
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。

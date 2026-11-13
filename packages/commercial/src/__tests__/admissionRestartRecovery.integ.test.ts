@@ -8,7 +8,7 @@ import { createPgSessionsBackend, type PgSessionsBackend } from '../db/pgSession
 import { snapshotAdmissionRequest, ADMISSION_RESTART_UNEXECUTED } from '../dispatch/admissionRestartRecovery.js'
 import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
 import { casAdmittedToRejecting, casToTerminal, getDispatch } from '../dispatch/turnDispatchStore.js'
-import { claimDueRecoveryJobs, releaseRecoveryPreReceipt } from '../dispatch/turnRecoveryStore.js'
+import { claimDueRecoveryJobs, releaseRecoveryPreReceipt, listDueRecoveryCarrierContainers } from '../dispatch/turnRecoveryStore.js'
 import { admitDurableControl } from '../dispatch/turnControlStore.js'
 import { runReconcileTick, runShutdownDispatchHandoff } from '../dispatch/turnDispatchReconciler.js'
 import { truncateAllForTest, useDedicatedTestDatabase } from './helpers/db.js'
@@ -447,4 +447,35 @@ test('OCV5-511 a permanently rejected automatic identity hands off once and its 
   await completeTask(successor.dispatchId, successor.clientMessageId)
   assert.equal((await getDispatch(getPool(), successor.dispatchId))?.outcome, 'completed')
   assert.ok((await jobs()).every(row => row.status === 'completed'))
+})
+
+
+test('OCV5-763 due recovery carrier selection excludes deleted, foreign and other-channel sessions', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  await seed({ journal: 'inflight' })
+  assert.equal(await backend.reconcileAutomaticRecoveryJobs(uid), 1)
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'v5'), [{ container_id: 511 }])
+  const pool = getPool()
+  await pool.query("UPDATE agent_containers SET runtime_kind='desktop' WHERE id=511")
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [],
+    'the exact numeric id cannot substitute a different runtime kind')
+  await pool.query("UPDATE turn_dispatches SET runtime_kind='desktop' WHERE user_id=$1", [uid.toString()])
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [{ container_id: 511 }],
+    'a desktop dispatch keeps its desktop carrier; recovery is not docker-only')
+  await pool.query(`INSERT INTO agent_containers(id,user_id,secret_hash,state,runtime_channel,runtime_kind)
+    VALUES (512,$1,$2,'active','v5','docker')`, [uid.toString(), Buffer.alloc(32)])
+  t.after(async () => { await pool.query('DELETE FROM agent_containers WHERE id=512 AND user_id=$1', [uid.toString()]) })
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [{ container_id: 511 }],
+    'a known desktop carrier is not replaced by the other docker carrier')
+  await pool.query('UPDATE turn_dispatches SET agent_container_id=NULL WHERE user_id=$1', [uid.toString()])
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [],
+    'unknown carrier refuses ambiguity across docker and desktop')
+  await pool.query("UPDATE agent_containers SET state='vanished' WHERE id=512")
+  assert.deepEqual(await listDueRecoveryCarrierContainers(pool, uid, 'v5'), [{ container_id: 511 }],
+    'an unbound job can wake the sole active carrier across supported kinds')
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid + 1n, 'v5'), [])
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'other-channel'), [])
+  assert.equal(await backend.softDeleteMasterSession(sessionId, `c:${uid}`), true)
+  assert.equal((await jobs()).length, 1, 'the tombstone filter, not deleting the recovery job, prevents a wake')
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'v5'), [])
 })

@@ -862,8 +862,380 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     assert.equal(theftRows.length, 0, "race must not produce any theft-marked rows");
   });
 
+  // OCV5-622:默认 grace=45 后，rotate 后 11s / 40s 同 fingerprint 复用仍走 race
+  // （覆盖办公号实测 ~11.6s 误判 theft）；超 grace 仍 theft。
+  test("reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = ""; // force default 45 (!raw)
+    try {
+      for (const ageSec of [11, 40] as const) {
+        const email = `paula-midgrace-${ageSec}@example.com`;
+        await setupUser(email, "paula midgrace password");
+        const lr = await login(
+          { email, password: "paula midgrace password", turnstile_token: "tok" },
+          { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", userAgent: "race-test-ua" },
+        );
+        const oldRaw = lr.refresh_token;
+        const r1 = await refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        });
+        await query(
+          "UPDATE refresh_tokens SET revoked_at = NOW() - make_interval(secs => $2) WHERE token_hash = $1",
+          [refreshTokenHash(oldRaw), ageSec],
+        );
+        let theftFired = false;
+        await assert.rejects(
+          refresh(oldRaw, {
+            jwtSecret: JWT_SECRET,
+            remoteIp: "10.1.2.3",
+            userAgent: "race-test-ua",
+            onTheftDetected: () => {
+              theftFired = true;
+            },
+          }),
+          (err: unknown) =>
+            err instanceof RefreshError && err.code === "REFRESH_RACE",
+        );
+        assert.equal(theftFired, false, `age=${ageSec}s must stay race under default grace=45`);
+        // live sibling still usable
+        const r2 = await refresh(r1.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        });
+        assert.ok(typeof r2.refresh_token === "string" && r2.refresh_token.length > 0);
+      }
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
+  test("reuse rotated refresh at 50s (default grace=45) → still theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+    try {
+      await setupUser("paula-overgrace@example.com", "paula overgrace password");
+      const lr = await login(
+        {
+          email: "paula-overgrace@example.com",
+          password: "paula overgrace password",
+          turnstile_token: "tok",
+        },
+        {
+          jwtSecret: JWT_SECRET,
+          turnstileBypass: true,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        },
+      );
+      const oldRaw = lr.refresh_token;
+      const r1 = await refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        userAgent: "race-test-ua",
+      });
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '50 seconds' WHERE token_hash = $1",
+        [refreshTokenHash(oldRaw)],
+      );
+      let theftFired = false;
+      await assert.rejects(
+        refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+          onTheftDetected: () => {
+            theftFired = true;
+          },
+        }),
+        (err: unknown) =>
+          err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(theftFired, true, "age=50s must still theft under default grace=45");
+      await assert.rejects(
+        refresh(r1.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        }),
+        (err: unknown) =>
+          err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
+  // INC-20261030-REFRESH-UNDELIVERED-SETCOOKIE: the anchored case above records no real
+  // client IP, so it stays theft. Reissue needs UA, bound IP and the stored client_ip
+  // (CF-Connecting-IP in production) to all match, and the successor to be unused.
+  test("lost Set-Cookie: reuse at 50s and at 6h, same fingerprint, unused successor → reissue, no theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+    try {
+      for (const [label, interval] of [
+        ["50s", "50 seconds"],
+        ["6h", "6 hours"],
+      ] as const) {
+        const email = `paula-undelivered-${label}@example.com`;
+        await setupUser(email, "paula overgrace password");
+        const lr = await login(
+          { email, password: "paula overgrace password", turnstile_token: "tok" },
+          { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", clientIp: "203.0.113.10", userAgent: "race-test-ua" },
+        );
+        const oldRaw = lr.refresh_token;
+        const delivered = await refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
+          userAgent: "race-test-ua",
+        });
+        await query(
+          "UPDATE refresh_tokens SET revoked_at = NOW() - $2::interval WHERE token_hash = $1",
+          [refreshTokenHash(oldRaw), interval],
+        );
+        let theftFired = false;
+        const again = await refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
+          userAgent: "race-test-ua",
+          onTheftDetected: () => { theftFired = true; },
+        });
+        assert.equal(theftFired, false, `${label}: unused successor is a lost Set-Cookie, not theft`);
+        assert.notEqual(again.refresh_token, delivered.refresh_token);
+        assert.ok(again.access_token.length > 0);
+        const rows = await query<{ revoked_reason: string | null }>(
+          `SELECT revoked_reason FROM refresh_tokens
+            WHERE family_id = (SELECT family_id FROM refresh_tokens WHERE token_hash = $1)`,
+          [refreshTokenHash(oldRaw)],
+        );
+        assert.equal(rows.rows.filter((r) => r.revoked_reason === "theft").length, 0, `${label}: family must stay free of theft`);
+        assert.equal(rows.rows.filter((r) => r.revoked_reason === "reissued").length, 1, `${label}: the unused successor is marked reissued`);
+        // 同一密钥再次续期 = 进程重启后会话仍有效（票在库里，不在内存）。
+        const kept = await refresh(again.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
+          userAgent: "race-test-ua",
+        });
+        assert.ok(kept.access_token.length > 0);
+      }
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
+  test("reuse outside grace after the successor was itself rotated → still theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+    try {
+      await setupUser("paula-consumed@example.com", "paula overgrace password");
+      const lr = await login(
+        { email: "paula-consumed@example.com", password: "paula overgrace password", turnstile_token: "tok" },
+        { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", clientIp: "203.0.113.10", userAgent: "race-test-ua" },
+      );
+      const oldest = lr.refresh_token;
+      const mid = await refresh(oldest, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        clientIp: "203.0.113.10",
+        userAgent: "race-test-ua",
+      });
+      const tip = await refresh(mid.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        clientIp: "203.0.113.10",
+        userAgent: "race-test-ua",
+      });
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '50 seconds' WHERE token_hash = $1",
+        [refreshTokenHash(oldest)],
+      );
+      let theftFired = false;
+      await assert.rejects(
+        refresh(oldest, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
+          userAgent: "race-test-ua",
+          onTheftDetected: () => { theftFired = true; },
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(theftFired, true, "a used successor means the new cookie was delivered");
+      await assert.rejects(
+        refresh(tip.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
+          userAgent: "race-test-ua",
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
+  test("reuse outside grace with unused successor but different client IP → still theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await setupUser("paula-otherip@example.com", "paula overgrace password");
+    const lr = await login(
+      { email: "paula-otherip@example.com", password: "paula overgrace password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", clientIp: "203.0.113.10", userAgent: "race-test-ua" },
+    );
+    const oldRaw = lr.refresh_token;
+    const live = await refresh(oldRaw, {
+      jwtSecret: JWT_SECRET,
+      remoteIp: "10.1.2.3",
+      clientIp: "203.0.113.10",
+      userAgent: "race-test-ua",
+    });
+    await query(
+      "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '50 seconds' WHERE token_hash = $1",
+      [refreshTokenHash(oldRaw)],
+    );
+    let theftFired = false;
+    await assert.rejects(
+      refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        clientIp: "198.51.100.66",
+        userAgent: "race-test-ua",
+        onTheftDetected: () => { theftFired = true; },
+      }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+    assert.equal(theftFired, true, "different fingerprint stays theft even if the successor was never used");
+    await assert.rejects(
+      refresh(live.refresh_token, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        userAgent: "race-test-ua",
+      }),
+      (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+    );
+  });
+
+  test("loopback socket: reissue matches stored client IP; a different one, or an explicit null, is theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+    const base = { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "127.0.0.1", clientIp: "203.0.113.10", userAgent: "race-test-ua" };
+    const call = { jwtSecret: JWT_SECRET, remoteIp: "127.0.0.1", clientIp: "203.0.113.10", userAgent: "race-test-ua" };
+    try {
+      await setupUser("paula-cfip@example.com", "paula overgrace password");
+      const lr = await login(
+        { email: "paula-cfip@example.com", password: "paula overgrace password", turnstile_token: "tok" },
+        base,
+      );
+      const oldRaw = lr.refresh_token;
+      const live = await refresh(oldRaw, call);
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '6 hours' WHERE token_hash = $1",
+        [refreshTokenHash(oldRaw)],
+      );
+      let theftFired = false;
+      await assert.rejects(
+        refresh(oldRaw, {
+          ...call,
+          clientIp: "198.51.100.66",
+          onTheftDetected: () => { theftFired = true; },
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(theftFired, true, "different CF client IP is theft even though the socket is loopback");
+      await assert.rejects(
+        refresh(live.refresh_token, call),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+
+      await setupUser("paula-cfnull@example.com", "paula overgrace password");
+      const lrNull = await login(
+        { email: "paula-cfnull@example.com", password: "paula overgrace password", turnstile_token: "tok" },
+        base,
+      );
+      const nullRaw = lrNull.refresh_token;
+      await refresh(nullRaw, call);
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '6 hours' WHERE token_hash = $1",
+        [refreshTokenHash(nullRaw)],
+      );
+      let nullTheft = false;
+      await assert.rejects(
+        refresh(nullRaw, {
+          ...call,
+          clientIp: null,
+          onTheftDetected: () => { nullTheft = true; },
+        }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(nullTheft, true, "explicit null must not fall back to the loopback remoteIp");
+
+      await setupUser("paula-cfsame@example.com", "paula overgrace password");
+      const lr2 = await login(
+        { email: "paula-cfsame@example.com", password: "paula overgrace password", turnstile_token: "tok" },
+        base,
+      );
+      const x = lr2.refresh_token;
+      const y = await refresh(x, call);
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '6 hours' WHERE token_hash = $1",
+        [refreshTokenHash(x)],
+      );
+      let noted = 0;
+      const z = await refresh(x, { ...call, onReissued: () => { noted += 1; }, onTheftDetected: () => { noted += 100; } });
+      assert.equal(noted, 1);
+      assert.notEqual(z.refresh_token, y.refresh_token);
+      const yReason = await query<{ revoked_reason: string | null }>(
+        "SELECT revoked_reason FROM refresh_tokens WHERE token_hash = $1",
+        [refreshTokenHash(y.refresh_token)],
+      );
+      assert.equal(yReason.rows[0].revoked_reason, "reissued");
+      const stored = await query<{ client_ip: string | null; ip: string | null }>(
+        "SELECT host(client_ip) AS client_ip, host(ip) AS ip FROM refresh_tokens WHERE token_hash = $1",
+        [refreshTokenHash(z.refresh_token)],
+      );
+      assert.equal(stored.rows[0].client_ip, "203.0.113.10");
+      assert.equal(stored.rows[0].ip, "127.0.0.1");
+      // Grace still uses the loopback bound IP, not client_ip.
+      await assert.rejects(
+        refresh(y.refresh_token, { ...call, clientIp: "198.51.100.66" }),
+        (err: unknown) => err instanceof RefreshError && err.code === "REFRESH_RACE",
+      );
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '50 seconds' WHERE token_hash = $1",
+        [refreshTokenHash(y.refresh_token)],
+      );
+      let theft2 = false;
+      await assert.rejects(
+        refresh(y.refresh_token, { ...call, onTheftDetected: () => { theft2 = true; } }),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(theft2, true, "outside grace a reissued ticket is theft");
+      await assert.rejects(
+        refresh(z.refresh_token, call),
+        (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
   // R2 finding 加固:grace 窗口内但 UA/IP 不一致 → 视作攻击者从异地 replay,
-  // 仍走 theft 路径。哪怕攻击者抢在 10s 内复用,只要 fingerprint 不匹配,
+  // 仍走 theft 路径。哪怕攻击者抢在 grace 内复用,只要 fingerprint 不匹配,
   // family 就被砍。
   test("reuse INSIDE grace 但 UA/IP 不一致 → theft (fingerprint mismatch)", async (t) => {
     if (skipIfNoPg(t)) return;
@@ -916,7 +1288,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
       );
       assert.equal(theftFired, true, "grace=0 must disable race window entirely");
     } finally {
-      if (prev === undefined) delete process.env.REFRESH_ROTATION_GRACE_SECONDS;
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
       else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
     }
   });

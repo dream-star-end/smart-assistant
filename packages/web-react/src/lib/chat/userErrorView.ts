@@ -41,6 +41,6 @@ export function knownUserError(value: unknown): UserError | undefined {
   return userError && userError.code !== "unexpected_error" ? userError : undefined;
 }
 
-export type ErrorActionHandler = { label: string; onClick: () => void };
+export type ErrorActionHandler = { label: string; onClick: () => void; disabled?: boolean; loading?: boolean };
 export type ErrorActionHandlers = Partial<Record<UserErrorAction, ErrorActionHandler>>;
 export type ErrorNoticeAction = ErrorActionHandler;

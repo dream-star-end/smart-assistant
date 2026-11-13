@@ -33,7 +33,8 @@ const detail: CommunityTutorialDetail = {
     '# 操作步骤\n\n先核对来源，再整理行动项。\n\n![追踪图](https://tracker.test/pixel.png)\n\n```htmlpreview\n<script>window.bad = true</script>\n```',
 }
 
-const auth = createMemoryAuthSession(() => {}, 'token')
+const auth = createMemoryAuthSession(() => {})
+auth.commitToken(auth.beginIdentity(), 'token')
 
 beforeEach(() => {
   vi.spyOn(api, 'listCommunityTutorials').mockResolvedValue({

@@ -19,13 +19,16 @@ export const PROJECT_ROW_HEIGHT_TOUCH = 44;
 export const HINT_ROW_HEIGHT = 36;
 export const SEARCH_HIT_HEIGHT = 62;
 
+/** 展开的项目最多列几条会话；更多的走「查看全部」进项目主页（UI-1）。 */
+export const PROJECT_SESSION_LIMIT = 5;
+
 export const SESSION_DRAG_TYPE = "application/x-openclaude-session-id";
 export const PROJECT_DRAG_TYPE = "application/x-openclaude-project-id";
 
 export const PAGE_SIZE = 50;
 export const SEARCH_DEBOUNCE_MS = 250;
 
-/** 前端虚拟分组：无 projectId 的会话归入此组。不写入数据库。 */
+/** 前端虚拟分组：无 projectId 的会话归入此组。不写入数据库。项目默认收起，这一组默认展开。 */
 export const DEFAULT_PROJECT_ID = "__oc_virtual_default__";
 export const DEFAULT_PROJECT_NAME = "未分类";
 

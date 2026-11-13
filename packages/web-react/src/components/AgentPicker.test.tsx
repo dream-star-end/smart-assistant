@@ -66,6 +66,18 @@ describe("AgentPicker 团队模式开关文案（知情同意）", () => {
 });
 
 describe("AgentPicker 三态协作", () => {
+  it("顾问说明明确主模型也遵守本轮用户禁写，并保留验证和计费说明", async () => {
+    renderPicker({
+      onCollabModeChange: () => {},
+      collabMode: "advisor",
+      advisorModels: [{ id: "gpt-6-astra", label: "GPT-6-Astra", engine: "codex" }],
+    });
+    const explanation = await screen.findByText(/用户说不要改文件时，这一轮主模型也不会写。/);
+    expect(explanation.textContent).toContain("顾问只出主意，不能改文件、跑命令或再派人。");
+    expect(explanation.textContent).toContain("只读工具验证");
+    expect(explanation.textContent).toContain("咨询按实际顾问型号计费");
+  });
+
   it("onCollabModeChange 时渲染单人/顾问/团队三选一", async () => {
     const onCollabModeChange = vi.fn();
     renderPicker({ onCollabModeChange, collabMode: "solo", advisorModels: [{ id: "gpt-6-astra", label: "GPT-6-Astra", engine: "codex" }] });

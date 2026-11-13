@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "generation": 1,
+  "logs": ["openclaude-v5-selfhost.log", "openclaude-v5-selfhost-egress.log"],
+  "snippets": ["openclaude-v5-selfhost", "openclaude-v5-selfhost-egress-watch"]
+}

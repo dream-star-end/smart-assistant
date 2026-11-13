@@ -465,7 +465,7 @@ describe('积压列与有条件拖动', () => {
     )
   })
 
-  test('running_run_active 询问取消 run 后重试', async () => {
+  test('running_run_active 请求停止后等待收尾，不提前移动', async () => {
     const card = sampleTicket({
       id: 't4',
       status: 'running',
@@ -496,10 +496,7 @@ describe('积压列与有条件拖动', () => {
           },
         }),
       )
-      .mockResolvedValueOnce({
-        ticket: { ...card, status: 'ready', stageId: 's2', version: 4 },
-        move: { action: 'skip_forward', label: '跳站前进', fromStageId: 's1', toStageId: 's2' },
-      })
+      .mockRejectedValueOnce(new ApiError({ status: 409, code: 'stop_pending', message: '等待收尾', body: { error: '等待收尾', code: 'stop_pending', detail: { runId: 'run-99' } } }))
     renderBoard()
     expect(await screen.findByText('正在跑的单')).toBeInTheDocument()
     const dt = fakeDt()
@@ -510,9 +507,11 @@ describe('积压列与有条件拖动', () => {
     expect(await screen.findByText(/run-99/)).toBeInTheDocument()
     expect(screen.getByText(/取消当前 run 后再移动/)).toBeInTheDocument()
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '取消并移动' }))
+      fireEvent.click(screen.getByRole('button', { name: '停止本次执行' }))
     })
     await waitFor(() => expect(moveTicket).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('已请求停止，收尾完成后请再次移动任务。')).toBeInTheDocument()
+    expect(screen.queryByText('已跳站前进到「定位根因」站')).not.toBeInTheDocument()
     expect(moveTicket.mock.calls[1]?.[2]).toEqual(
       expect.objectContaining({ cancelRunningRun: true, toStageId: 's2' }),
     )
