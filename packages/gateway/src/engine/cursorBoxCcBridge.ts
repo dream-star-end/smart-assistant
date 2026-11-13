@@ -742,39 +742,48 @@ class BoxSession {
     try {
       const response = await postExec(this.control, launch, this.o.fetchImpl, this.abort.signal)
       const reader = response.body!.getReader()
-      let pendingBytes = Buffer.alloc(0)
-      for (;;) {
-        const chunk = await reader.read()
-        if (chunk.done) break
-        pendingBytes = Buffer.concat([pendingBytes, Buffer.from(chunk.value)])
-        const parsed = parseExecFrames(pendingBytes)
-        pendingBytes = Buffer.from(parsed.rest)
-        for (const event of parsed.events) {
-          if (event.kind === 'stdout' && event.data) {
-            this.sawStdout = true
-            this.o.out.write(event.data)
-            const ends = this.signals.push(event.data)
-            if (ends.length > 0) {
-              this.activeGptWebUserLine = null
-            }
-            for (const end of ends) await this.onTurnEnd(end.rotate)
-          } else if (event.kind === 'stderr' && event.data) {
-            this.o.stderr.write(event.data)
-            if (this.held && !this.abandoned) {
-              this.hostErr = (this.hostErr + event.data).slice(-4096)
-              if (this.hostErr.includes('BOX_INTERACTIVE_READY')) {
-                this.readySeen = true
-                const lines = this.held
-                this.held = null
-                this.heldBytes = 0
-                void this.flushFirst(lines)
+      // Own the pending read directly: fetch abort propagation may disappear after GC.
+      const cancelReader = (): void => { void reader.cancel(this.abort.signal.reason).catch(() => {}) }
+      this.abort.signal.addEventListener('abort', cancelReader, { once: true })
+      if (this.abort.signal.aborted) cancelReader()
+      try {
+        let pendingBytes = Buffer.alloc(0)
+        for (;;) {
+          const chunk = await reader.read()
+          if (chunk.done) break
+          pendingBytes = Buffer.concat([pendingBytes, Buffer.from(chunk.value)])
+          const parsed = parseExecFrames(pendingBytes)
+          pendingBytes = Buffer.from(parsed.rest)
+          for (const event of parsed.events) {
+            if (event.kind === 'stdout' && event.data) {
+              this.sawStdout = true
+              this.o.out.write(event.data)
+              const ends = this.signals.push(event.data)
+              if (ends.length > 0) {
+                this.activeGptWebUserLine = null
               }
+              for (const end of ends) await this.onTurnEnd(end.rotate)
+            } else if (event.kind === 'stderr' && event.data) {
+              this.o.stderr.write(event.data)
+              if (this.held && !this.abandoned) {
+                this.hostErr = (this.hostErr + event.data).slice(-4096)
+                if (this.hostErr.includes('BOX_INTERACTIVE_READY')) {
+                  this.readySeen = true
+                  const lines = this.held
+                  this.held = null
+                  this.heldBytes = 0
+                  void this.flushFirst(lines)
+                }
+              }
+            } else if (event.kind === 'exit') {
+              this.sawExit = true
+              this.exitCode = event.code ?? 0
             }
-          } else if (event.kind === 'exit') {
-            this.sawExit = true
-            this.exitCode = event.code ?? 0
           }
         }
+      } finally {
+        this.abort.signal.removeEventListener('abort', cancelReader)
+        reader.releaseLock()
       }
       this.hostStreamEnded = true
     } catch (error) {

@@ -39,7 +39,7 @@ import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchJourneyBrowser, selectJourneyModel, waitJourneyUserRow } from "./lib/journey-browser.mjs";
+import { launchJourneyBrowser, selectJourneyModel, waitJourneyUserRow, settleJourneyGoalTurn } from "./lib/journey-browser.mjs";
 import { waitJ5Delivered } from "./lib/journey-j5.mjs";
 import { selectJourneyValidation } from "./lib/v5-validation-journey.mjs";
 
@@ -392,6 +392,7 @@ try {
     await dialog.getByRole("button", { name: "设置并开始", exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "hidden", timeout: STEP_TIMEOUT });
+    await settleJourneyGoalTurn(page, { goalMarker, timeout: STEP_TIMEOUT });
   });
 
   const marker = `e2e journey canary ${Date.now().toString(36)}`;

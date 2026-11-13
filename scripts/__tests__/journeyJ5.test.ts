@@ -177,3 +177,117 @@ test('OCV5-763: J4 cost confirmation is bounded and anchored to the sent user ro
     })
   } finally { await browser.close() }
 })
+
+
+// Real DOM events reproduce the queue that the old J3 left in front of J4.
+test('OCV5-763: J3 stops only its anchored goal and reaches a sendable composer', { timeout: 60_000 }, async (t) => {
+  const { settleJourneyGoalTurn, waitJourneyUserRow } = await import('../lib/journey-browser.mjs')
+  const browser = await launchJourneyBrowser()
+  const goalMarker = 'e2e-goal-owned'
+  function fixture(mode: string) {
+    return `<!doctype html><aside>${goalMarker}</aside><main id="chat">${['missing-row', 'sidebar-only'].includes(mode) ? '' : userRow(goalMarker)}</main>
+      <section data-testid="composer-shell"><div id="controls"></div></section><button id="j4">Send J4</button>
+      <script>
+      const mode=${JSON.stringify(mode)}, marker=${JSON.stringify(MARKER)};
+      window.stopClicks=0;window.busy=mode!=='natural';
+      function controls(label, disabled=false) {
+        document.querySelector('#controls').innerHTML='<button data-product-control aria-label="'+label+'" '+(disabled?'disabled':'')+'>'+label+'</button>';
+        document.querySelector('#controls button').onclick=()=>{
+          window.stopClicks++;
+          if(mode==='stuck')return;
+          controls('正在停止',true);
+          setTimeout(()=>{window.busy=false;controls('发送');},150);
+        };
+      }
+      if(mode==='natural')controls('发送');
+      else if(mode==='initial-stopping'){
+        controls('正在停止',true);setTimeout(()=>{window.busy=false;controls('发送');},150);
+      } else controls('停止');
+      if(mode==='disabled-send'){window.busy=false;controls('发送',true);}
+      if(mode==='duplicate-stop')document.querySelector('#controls').insertAdjacentHTML('beforeend','<button data-product-control aria-label="停止">停止</button>');
+      if(mode==='queued')document.body.insertAdjacentHTML('beforeend','<div data-testid="queued-send-row">queued</div>');
+      if(mode==='dialog')document.body.insertAdjacentHTML('beforeend','<div role="dialog" aria-label="unrelated">dialog</div>');
+      document.querySelector('#j4').onclick=()=>{
+        if(window.busy)document.body.insertAdjacentHTML('beforeend','<div data-testid="queued-send-row">'+marker+'</div>');
+        else document.querySelector('#chat').insertAdjacentHTML('beforeend','<div data-testid="user-row">'+marker+'</div>');
+      };
+      </script>`
+  }
+  try {
+    for (const mode of ['active', 'natural', 'initial-stopping', 'stuck', 'missing-row', 'sidebar-only', 'queued', 'duplicate-stop', 'dialog', 'disabled-send']) await t.test(mode, async () => {
+      const p = await browser.newPage()
+      try {
+        await p.setContent(fixture(mode))
+        const started = Date.now()
+        let result: { stopped: boolean } | undefined
+        let error: unknown
+        try { result = await settleJourneyGoalTurn(p, { goalMarker, timeout: 600 }) } catch (e) { error = e }
+        const ok = ['active', 'natural', 'initial-stopping'].includes(mode)
+        assert.equal(!error, ok, String(error))
+        const clicks = await p.evaluate(() => (window as any).stopClicks)
+        assert.equal(clicks, ['active', 'stuck'].includes(mode) ? 1 : 0)
+        assert.ok(Date.now() - started < 3_000, 'no separate default Playwright timeout')
+        if (ok) {
+          assert.equal(result?.stopped, mode === 'active')
+          assert.equal(await p.evaluate(() => (window as any).busy), false)
+          await p.locator('#j4').click()
+          await waitJourneyUserRow(p, { marker: MARKER, modelLabel: 'Grok 4.7', timeout: 600 })
+          assert.equal(await p.getByTestId('queued-send-row').count(), 0)
+        } else {
+          assert.equal(result, undefined)
+          assert.match(String(error), /J3 goal turn|queued messages|Ambiguous journey composer control|Unexpected journey goal dialog/)
+        }
+      } finally { await p.close() }
+    })
+    await t.test('red control: old J3 without Stop queues J4 and cannot prove admission', async () => {
+      const p = await browser.newPage()
+      try {
+        await p.setContent(fixture('active'))
+        await p.locator('#j4').click()
+        assert.equal(await p.getByTestId('queued-send-row').count(), 1)
+        await assert.rejects(waitJourneyUserRow(p, { marker: MARKER, modelLabel: 'Grok 4.7', timeout: 600 }), /J4 user-row did not arrive/)
+        assert.equal(await p.evaluate(() => (window as any).stopClicks), 0)
+        assert.equal(await p.getByTestId('user-row').filter({ hasText: MARKER }).count(), 0)
+      } finally { await p.close() }
+    })
+  } finally { await browser.close() }
+})
+
+
+// Fix the exact browser-task interleaving without fabricating any DOM results.
+test('OCV5-763: J3 natural finish during control sampling keeps the shared deadline', { timeout: 20_000 }, async (t) => {
+  const { settleJourneyGoalTurn } = await import('../lib/journey-browser.mjs')
+  const browser = await launchJourneyBrowser()
+  try {
+    for (const mode of ['finish', 'disappear']) await t.test(mode, async () => {
+      const p = await browser.newPage()
+      p.setDefaultTimeout(5_000)
+      try {
+        await p.setContent(`${userRow('goal-race')}<section data-testid="composer-shell"><button data-product-control aria-label="停止">停止</button></section><script>window.clicks=0;document.querySelector('button').onclick=()=>window.clicks++;</script>`)
+        const evaluate = p.evaluate.bind(p)
+        let interleaved = false
+        p.evaluate = async (...args: any[]) => {
+          const result = await (evaluate as any)(...args)
+          if (!interleaved && result?.label === '停止') {
+            interleaved = true
+            await evaluate((action) => {
+              const button = document.querySelector('button')!
+              if (action === 'finish') button.setAttribute('aria-label', '发送')
+              else button.remove()
+            }, mode)
+          }
+          return result
+        }
+        const started = Date.now()
+        if (mode === 'finish') {
+          assert.deepEqual(await settleJourneyGoalTurn(p, { goalMarker: 'goal-race', timeout: 1_000 }), { stopped: false })
+          assert.equal(await evaluate(() => (window as any).clicks), 0)
+        } else {
+          await assert.rejects(settleJourneyGoalTurn(p, { goalMarker: 'goal-race', timeout: 1_000 }), /Ambiguous journey composer control/)
+        }
+        assert.equal(interleaved, true, 'must hit the actual snapshot→action interleaving')
+        assert.ok(Date.now() - started < 1_200, 'must not use the 5s page default waiting for an obsolete button')
+      } finally { await p.close() }
+    })
+  } finally { await browser.close() }
+})
