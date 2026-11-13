@@ -208,7 +208,7 @@ const ROOT_PACKAGE_JSON = readFileSync(join(ROOT, "package.json"), "utf8");
 let selfhostDeployCache: string | null = null;
 /** OCV5-488: a shell command that runs a script (see selfhostDeployScript). */
 const RUNS_SCRIPT =
-  /(?:^|[;&|(])\s*(?:(?:env(?:\s+-u\s+\S+)*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:npx --no-install tsx|node) scripts\/[\w.-]+/;
+  /(?:^|[;&|(])\s*(?:(?:env(?:\s+-u\s+\S+)*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:npx --no-install tsx|node|bash) scripts\/[\w.-]+/;
 /** OCV5-488: the command lines of build_master_release() in the selfhost master release library
  * that run a script. Lexical only: continuation lines joined, heredoc bodies skipped, quoted
  * text and comments dropped (an echo, a message, a file-presence check or a trailing comment
