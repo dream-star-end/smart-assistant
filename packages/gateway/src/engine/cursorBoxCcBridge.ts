@@ -750,8 +750,6 @@ class BoxSession {
         let pendingBytes = Buffer.alloc(0)
         for (;;) {
           const chunk = await reader.read()
-          // cancel() can produce done rather than reject; preserve the original abort/error path.
-          if (this.abort.signal.aborted) throw this.abort.signal.reason
           if (chunk.done) break
           pendingBytes = Buffer.concat([pendingBytes, Buffer.from(chunk.value)])
           const parsed = parseExecFrames(pendingBytes)
