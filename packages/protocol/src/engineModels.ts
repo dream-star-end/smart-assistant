@@ -365,6 +365,19 @@ export const ANTIGRAVITY_ENGINE_MODELS = [
     experimental: true,
   },
   {
+    id: 'antigravity-gemini-4-hydrogen',
+    displayName: 'Gemini 4 Hydrogen (Antigravity)',
+    efforts: ['low', 'medium', 'high', 'xhigh'],
+    defaultEffort: 'high',
+    cliModels: {
+      low: 'gemini-4-hydrogen-low',
+      medium: 'gemini-4-hydrogen-medium',
+      high: 'gemini-4-hydrogen-high',
+      xhigh: 'gemini-4-hydrogen-xhigh',
+    },
+    experimental: true,
+  },
+  {
     id: 'antigravity-claude-sonnet-5.5',
     displayName: 'Claude Sonnet 5.5 (Antigravity)',
     efforts: ['low', 'medium', 'high'],
