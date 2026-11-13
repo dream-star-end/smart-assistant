@@ -826,6 +826,48 @@ describe("platformAuxModels —— 平台次级模型", () => {
   });
 });
 
+describe("OCV5-575 commercial box-gpt-6-astra-pro allowlist (uid 1 and uid 4)", () => {
+  test("OC_BOX_GPT_WEB_ALLOWED_UIDS=1,4: visible and routable for uid 1 and 4, never for uid 3 or 247 even if granted", () => {
+    const prev = { uids: process.env.OC_V5_CURSOR_CREDENTIAL_UIDS, gpt: process.env.OC_BOX_GPT_WEB_ALLOWED_UIDS };
+    process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "all";
+    process.env.OC_BOX_GPT_WEB_ALLOWED_UIDS = "1,4";
+    try {
+      const astra = entry({
+        entryId: 575,
+        modelId: "box-gpt-6-astra-pro",
+        engine: "cursor",
+        providerId: "cursor",
+        upstreamModelId: "gpt-6-astra-pro",
+        contextWindow: 400_000,
+      });
+      const s = snap({
+        entries: [GLM, astra],
+        pricing: [
+          price("glm-5.2"),
+          price("box-gpt-6-astra-pro", { visibility: "hidden", displayName: "GPT-6-Astra-Pro" }),
+        ],
+      });
+      const grantSet = new Set(["box-gpt-6-astra-pro"]);
+      for (const scope of [{ uid: 1, role: "admin" as const }, { uid: 4, role: "user" as const }]) {
+        assert.equal(s.canUseModel({ ...scope, grantedModelIds: grantSet }, "box-gpt-6-astra-pro"), true, String(scope.uid));
+        assert.deepEqual(
+          s.listForUser({ ...scope, grantedModelIds: grantSet }).map((m) => m.modelId),
+          ["box-gpt-6-astra-pro", "glm-5.2"],
+        );
+      }
+      for (const scope of [{ uid: 3, role: "admin" as const }, { uid: 247, role: "user" as const }]) {
+        assert.equal(s.canUseModel({ ...scope, grantedModelIds: grantSet }, "box-gpt-6-astra-pro"), false, String(scope.uid));
+        assert.deepEqual(s.listForUser({ ...scope, grantedModelIds: grantSet }).map((m) => m.modelId), ["glm-5.2"]);
+      }
+    } finally {
+      for (const [key, value] of [["OC_V5_CURSOR_CREDENTIAL_UIDS", prev.uids], ["OC_BOX_GPT_WEB_ALLOWED_UIDS", prev.gpt]] as const) {
+        if (value === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = value;
+      }
+    }
+  });
+});
+
 describe("OCV5-551 box-gpt-6-astra-pro owner uid=3 restriction", () => {
   test("box-gpt-6-astra-pro is visible and routable only for uid=3, never for uid=765 or admin uid=2", () => {
     const prevUids = process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;

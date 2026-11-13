@@ -6,12 +6,14 @@ import type { BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { boxReplayMessageToSse } from "./boxReplayMessageSse.js";
 import type { ProxyBody } from "./shared.js";
 import type { AuthorityProjection, PreparedContinuation } from "./boxPreparedContinuation.js";
+import type { BoxFallbackFailure } from "./boxFailureEvidence.js";
 
 export class BoxReplayCompletedError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxReplayCompletedError"; }
 }
 export type BoxReplayLookup =
   | { kind: "missing" }
+  | { kind: "failed"; failure: BoxFallbackFailure }
   | { kind: "failed"; code: "BOX_REPLAY_FAILED" | "BOX_REPLAY_STOPPED" | "BOX_REPLAY_RESULT_REJECTED"; diagnosticId?: string }
   | { kind: "pending"; identity: BoxReplayIdentity }
   | { kind: "ready"; identity: BoxReplayIdentity; response: Response };
@@ -22,13 +24,19 @@ export async function findCompletedBoxReplay(input: {
   trustedAuthority?: AuthorityProjection;
   prepared?: PreparedContinuation;
 }, deps: {
-  journal: Pick<BoxDurableJournal, "findReplayIdentity">
-    & Partial<Pick<BoxDurableJournal, "findSettledFailure">>;
+  journal: Pick<BoxDurableJournal, "findReplayIdentity"> &
+    Partial<Pick<BoxDurableJournal, "findReadOnlyFallback" | "findSettledFailure">>;
   readFailureDiagnosticId?: (identity: BoxRemoteCleanupCandidate) => Promise<string | null>;
   readMessage: (pointer: BoxReplayMessagePointer) => Promise<unknown>;
 }): Promise<BoxReplayLookup> {
-  const identity = await deps.journal.findReplayIdentity(input);
+  let identity = await deps.journal.findReplayIdentity(input);
   if (!identity) {
+    if (input.canonicalBody.stream === false && deps.journal.findReadOnlyFallback) {
+      const fallback = await deps.journal.findReadOnlyFallback(input);
+      if (fallback?.kind === "failure") return { kind: "failed", failure: fallback.failure };
+      if (fallback?.kind === "identity") identity = fallback.identity;
+    }
+    if (!identity) {
     if ((input.canonicalBody as { stream?: boolean }).stream === false && deps.journal.findSettledFailure) {
       const failure = await deps.journal.findSettledFailure(input);
       if (failure) {
@@ -41,7 +49,8 @@ export async function findCompletedBoxReplay(input: {
             ? { diagnosticId } : {}) };
       }
     }
-    return { kind: "missing" };
+      return { kind: "missing" };
+    }
   }
   if (!identity.messagePointer) return { kind: "pending", identity };
   const message = await deps.readMessage(identity.messagePointer);

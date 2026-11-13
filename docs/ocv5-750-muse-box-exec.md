@@ -16,7 +16,7 @@ Images and `--resume` always stay on hatch.
 
 1. **Boot default** (master restart): `OC_MUSE_VIDEO_BACKEND=hatch|hatch-with-box-fallback|box-exec` plus `OC_MUSE_BOX_EXEC_UID=<uid>` and `OC_MUSE_BOX_EXEC_ACCOUNT_ID=<Box account id that hosts the relay>` (both required; the runner is not wired without them).
 2. **Live override** (no restart): write one of the three values to `$OC_MUSE_STATE_ROOT/video-backend`. The hub re-reads it on every routing decision. Delete the file (or write `hatch`) to switch back. The directory is master-owned `0700`; containers cannot flip it.
-3. Optional `OC_MUSE_BOX_EXEC_FALLBACK_HATCH=1` (only meaningful for `box-exec`): a relay that is down before submit re-queues onto hatch. Never applies to a job that already fell back from hatch.
+3. Optional `OC_MUSE_BOX_EXEC_FALLBACK_HATCH=1` (only meaningful for `box-exec`): a relay that is down before submit re-queues onto hatch. Never applies to a job that already fell back from hatch, to an accepted or uncertain submit, or to a durable job whose running checkpoint may survive this process. Durable commercial jobs retain their existing failure/no-double-generation contract.
 
 GET `/internal/v3/muse-media/status` reports `video_backend`.
 

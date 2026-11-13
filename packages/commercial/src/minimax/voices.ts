@@ -9,7 +9,7 @@ import { HttpError } from '../http/util.js'
  * Designed and cloned voices belong to the whole MiniMax account behind the
  * media key, so anyone who learns a voice_id could synthesize with it. Every
  * synthesis therefore checks that the voice is either a MiniMax system voice
- * or one this user created (`minimax_voices`, migration 0328). When the system
+ * or one this user created (`minimax_voices`, migration 0322). When the system
  * list cannot be fetched we fail closed: only the historic default voice and
  * the user's own voices pass.
  */

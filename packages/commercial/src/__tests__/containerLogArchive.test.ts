@@ -286,10 +286,15 @@ describe('container log archive', () => {
       },
       'channelMigration/cutover.ts': { count: 1, why: 'migration cutover, keeps volumes' },
       'plugins/biliAccount.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
+      'plugins/douyin.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
       'plugins/knowledgePlanet.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
       'plugins/weibo.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
       'plugins/zhihu.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
       'plugins/localSandbox.ts': { count: 1, why: 'plugin local sandbox, not a turn runtime' },
+      'media-studio/compose/runner.ts': {
+        count: 4,
+        why: 'one-shot ffmpeg compose sandbox (OCV5-588), not a turn runtime; its output is captured by the runner over attach (the 4th removes a container whose create answered after the setup deadline)',
+      },
     }
     const found: Record<string, number> = {}
     const walk = (dir: string) => {

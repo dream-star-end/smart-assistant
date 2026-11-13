@@ -1,0 +1,23 @@
+# OCV5-391 (commercial): egress blue-green slots, port of selfhost 6db5df24e.
+# Each slot gets its own SO_REUSEPORT listener on the shared 172.31.0.1:18892, handed to the
+# slot service as fd 3 (sd_listen_fds). A deploy starts the idle slot, waits for its private
+# health port, then closes the old slot's listener and lets its service drain in the background,
+# so new container calls never meet a closed port. 172.31.0.1 lives on a Docker bridge: start
+# after Docker and allow binding before the address exists.
+[Unit]
+Description=OpenClaude v5 Egress shared listener (slot %i)
+After=network.target docker.service
+Wants=docker.service
+Conflicts=openclaude-v5-egress.service
+
+[Socket]
+ListenStream=172.31.0.1:18892
+ReusePort=yes
+FreeBind=yes
+Backlog=511
+NoDelay=true
+Accept=no
+Service=openclaude-v5-egress@%i.service
+
+[Install]
+WantedBy=sockets.target

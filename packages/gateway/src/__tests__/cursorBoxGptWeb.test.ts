@@ -1020,6 +1020,13 @@ rl.on('line', (line) => {
     assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '765' }), false)
     assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '2' }), false)
     assert.equal(isBoxGptWebAllowedContainerUser({ OC_CONTAINER_ID: '1150' }), false)
+    // OCV5-575: the master-written flag decides; without it the original owner rule applies.
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '1', OC_BOX_GPT_WEB_ALLOWED: '1' }), true)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '4', OC_BOX_GPT_WEB_ALLOWED: '1' }), true)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '3', OC_BOX_GPT_WEB_ALLOWED: '0' }), false)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '247', OC_BOX_GPT_WEB_ALLOWED: '0' }), false)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '247', OC_BOX_GPT_WEB_ALLOWED: 'true' }), false)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '247', OC_BOX_GPT_WEB_ALLOWED: '' }), false)
 
     const baseEnv = {
       OC_CURSOR_SAND_BOX_CC: '1',
@@ -1973,6 +1980,7 @@ rl.on('line', (line) => {
     }
 
     const firstFetch = await fetchConversationPayloadInPage(fakePage, null, {
+      // oc-retry: transport the product's own in-page fetch retry option under test, not a test retry
       retries: 2,
       tokenTtlMs: 240_000,
     })
@@ -1982,6 +1990,7 @@ rl.on('line', (line) => {
 
     // Subsequent poll reuses cached token without calling /api/auth/session again
     const secondFetch = await fetchConversationPayloadInPage(fakePage, null, {
+      // oc-retry: transport the product's own in-page fetch retry option under test, not a test retry
       retries: 2,
       tokenTtlMs: 240_000,
     })

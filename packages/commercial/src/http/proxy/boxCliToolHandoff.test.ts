@@ -41,6 +41,126 @@ function records() {
 }
 const lines = (values: unknown[]) => values.map((item) => JSON.stringify(item) + "\n");
 
+function diagnosticError(source: unknown[]): BoxCliToolHandoffError {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  let caught: BoxCliToolHandoffError | undefined;
+  assert.throws(() => { for (const line of lines(source)) decoder.push(line); },
+    (error: unknown) => {
+      assert.ok(error instanceof BoxCliToolHandoffError);
+      caught = error;
+      return true;
+    });
+  assert.ok(caught);
+  return caught;
+}
+
+test("invalid tool input retains only its branch and UTF-8 partial byte count", () => {
+  const secret = "synthetic-sensitive-input-中";
+  const malformed = `{"value":"${secret}"`;
+  const valid = JSON.stringify({ value: secret });
+  for (const variant of [
+    { name: boxName, input: {}, partial: malformed, branch: "tool_input_json" },
+    { name: "unexposed_synthetic_tool", input: {}, partial: malformed, branch: "tool_input_json" },
+    { name: boxName, input: { value: "synthetic-start-input" }, partial: valid, branch: "tool_input_conflict" },
+  ]) {
+    const error = diagnosticError([records()[0], records()[1],
+      event({ type: "content_block_start", index: 0,
+        content_block: { type: "tool_use", id: "toolu_synthetic_private", name: variant.name, input: variant.input } }),
+      event({ type: "content_block_delta", index: 0,
+        delta: { type: "input_json_delta", partial_json: variant.partial } }),
+      event({ type: "content_block_stop", index: 0 })]);
+    assert.equal(error.code, "BOX_TOOL_INPUT_INVALID");
+    assert.equal(error.message, error.code);
+    assert.deepEqual(error.boxFailureDiagnostic, {
+      branch: variant.branch, observedBytes: Buffer.byteLength(variant.partial),
+    });
+    const encoded = JSON.stringify(error.boxFailureDiagnostic);
+    assert.ok(Buffer.byteLength(encoded) <= 2048);
+    for (const forbidden of [secret, variant.partial, variant.name, "toolu_synthetic_private", "synthetic-start-input"]) {
+      assert.ok(!encoded.includes(forbidden));
+    }
+  }
+});
+
+test("event order failures retain fixed event type, state bits and only a bounded numeric index", () => {
+  const start = event({ type: "content_block_start", index: 0,
+    content_block: { type: "text", text: "synthetic-private-message" } });
+  const started = [records()[0], records()[1]];
+  const cases = [
+    { before: [], next: records()[1], eventType: "message_start", stateFlags: 0 },
+    { before: [], next: start, eventType: "content_block_start", stateFlags: 0, blockIndex: 0 },
+    { before: started, next: event({ type: "content_block_delta", index: 0,
+      delta: { type: "text_delta", text: "synthetic-private-delta" } }),
+    eventType: "content_block_delta", stateFlags: 1, blockIndex: 0 },
+    { before: started, next: event({ type: "content_block_stop", index: 0 }),
+      eventType: "content_block_stop", stateFlags: 1, blockIndex: 0 },
+    { before: [...started, start], next: event({ type: "message_delta", delta: { stop_reason: "tool_use" } }),
+      eventType: "message_delta", stateFlags: 17 },
+    { before: started, next: event({ type: "message_stop" }), eventType: "message_stop", stateFlags: 1 },
+    ...["synthetic-private-index", -1, 100_001, Number.MAX_SAFE_INTEGER + 1].map(index => ({
+      before: started, next: event({ type: "content_block_stop", index }),
+      eventType: "content_block_stop", stateFlags: 1,
+    })),
+  ];
+  for (const item of cases) {
+    const error = diagnosticError([...item.before, item.next]);
+    assert.equal(error.code, "BOX_TOOL_ORDER_INVALID");
+    assert.equal(error.message, error.code);
+    assert.deepEqual(error.boxFailureDiagnostic, { branch: "tool_event_order", eventType: item.eventType,
+      stateFlags: item.stateFlags, ...("blockIndex" in item ? { blockIndex: item.blockIndex } : {}) });
+    const encoded = JSON.stringify(error.boxFailureDiagnostic);
+    assert.ok(Buffer.byteLength(encoded) <= 2048);
+    for (const forbidden of ["synthetic-private", boxName, "msg_tool_1"]) assert.ok(!encoded.includes(forbidden));
+  }
+});
+
+test("snapshot failures keep their code and expose only bounded structure diagnostics", () => {
+  const secret = "private tool input that must not be retained";
+  const variants = [
+    { branch: "missing_snapshot", source: records().filter(item => item.type !== "assistant") },
+    { branch: "snapshot_coverage", source: records().filter(item => item.type !== "assistant"
+      || (item as { message: { content: unknown[] } }).message.content.length !== 2) },
+    { branch: "snapshot_content", source: records().map(item => item.type !== "assistant" ? item
+      : { ...item, message: { ...(item as { message: object }).message,
+        content: [{ ...use("toolu_parallel_a"), input: { value: secret } }] } }) },
+  ];
+  for (const variant of variants) {
+    const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+    assert.throws(() => { for (const line of lines(variant.source)) decoder.push(line); },
+      (error: unknown) => {
+        assert.ok(error instanceof BoxCliToolHandoffError);
+        assert.equal(error.message, "BOX_TOOL_SNAPSHOT_MISMATCH");
+        assert.equal(error.boxFailureDiagnostic?.branch, variant.branch);
+        const encoded = JSON.stringify(error.boxFailureDiagnostic);
+        assert.ok(Buffer.byteLength(encoded) <= 2048);
+        assert.ok(!encoded.includes(secret));
+        if (variant.branch === "snapshot_content") {
+          assert.equal(error.boxFailureDiagnostic?.expectedType, "tool_use");
+          assert.equal(error.boxFailureDiagnostic?.observedType, "tool_use");
+          assert.match(error.boxFailureDiagnostic?.observedSha256 ?? "", /^[a-f0-9]{64}$/);
+          assert.notEqual(error.boxFailureDiagnostic?.observedSha256,
+            error.boxFailureDiagnostic?.expectedSha256);
+        }
+        return true;
+      });
+  }
+});
+
+test("synthetic refusals preserve the fixed error message and bounded tag diagnostic", () => {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  assert.throws(() => decoder.push(JSON.stringify({ type: "assistant",
+    error: "authentication_failed", is_api_error_message: true,
+    message: { model: "<synthetic>", content: [{ type: "text", text: "private API error body" }] } }) + "\n"),
+  (error: unknown) => {
+    assert.ok(error instanceof BoxCliToolHandoffError);
+    assert.equal(error.message, "BOX_CLI_UPSTREAM_REFUSED");
+    assert.deepEqual(error.boxFailureDiagnostic,
+      { branch: "synthetic_api_error", upstreamTag: "authentication_failed" });
+    assert.ok(!JSON.stringify(error.boxFailureDiagnostic).includes("private API"));
+    return true;
+  });
+});
+
 test("interleaved real-CC-style snapshots and two identical tools form one guarded handoff", () => {
   const decoder = new BoxCliToolHandoffDecoder(model, catalog);
   const observer = new _UsageObserver();

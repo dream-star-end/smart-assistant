@@ -2,21 +2,28 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { type Socket, createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 
 import type Docker from 'dockerode'
 
+import {
+  DEFAULT_MANAGED_BROWSER_BROKER_LIMITS,
+  createManagedBrowserTlsBroker,
+} from './browserBroker.js'
 import { ManagedBrowserRuntime } from './browserRuntime.js'
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
 
 import {
   COMPILED_KNOWLEDGE_PLANET_PLUGIN,
+  KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS,
   KNOWLEDGE_PLANET_DRIVER_ID,
   KNOWLEDGE_PLANET_DRIVER_VERSION,
   KNOWLEDGE_PLANET_LAUNCHER_ID,
   KNOWLEDGE_PLANET_LAUNCHER_VERSION,
+  KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS,
   KNOWLEDGE_PLANET_LOGIN_ORIGINS,
   KNOWLEDGE_PLANET_PLUGIN_CONTRACT,
   KNOWLEDGE_PLANET_PLUGIN_SLUG,
@@ -29,6 +36,7 @@ import {
   createKnowledgePlanetRuntimeRegistries,
   decodeKnowledgePlanetWorkerFramesForTest,
   isOfficialKnowledgePlanetPluginIdentity,
+  knowledgePlanetBrokerLimits,
   validateKnowledgePlanetAccountState,
 } from './knowledgePlanet.js'
 import {
@@ -41,6 +49,7 @@ import {
   KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION,
   KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION,
+  KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS,
   KNOWLEDGE_PLANET_TOPIC_PAGE_MAX,
   KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES,
   KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES,
@@ -124,11 +133,11 @@ describe('official Knowledge Planet Plugin', () => {
       }),
       'current',
     )
-    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 5)
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 8)
     assert.deepEqual(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0], {
-      version: '1.4.0',
-      artifactHash: 'bc027e75eade8285c776f0ca6aa1f10bc32d8f6e4bc870b1be35a965946a04fb',
-      execContractHash: '02d496327bf1d088b3f6b1821731416980ac6a77e21df16dabeea2da0882d8b8',
+      version: '1.5.2',
+      artifactHash: '77a0e77acd066eeee5d411d4f6cee43abb374037d632ba19b8c667bbc3b38c3e',
+      execContractHash: 'a2d7c186e81d936f3eb7e561f54b9385899c372341b633a799afac7874d845fe',
     })
     for (const predecessor of KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS)
       assert.equal(classifyKnowledgePlanetSetupPin(predecessor), 'compatible-predecessor')
@@ -142,7 +151,7 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(
       classifyKnowledgePlanetSetupPin({
         ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
-        version: '1.5.0',
+        version: '1.5.3',
       }),
       null,
     )
@@ -174,6 +183,16 @@ describe('official Knowledge Planet Plugin', () => {
     })
     assert.ok(KNOWLEDGE_PLANET_PLUGIN_CONTRACT.runtime.accountState.origins.length > 1)
     assert.ok(KNOWLEDGE_PLANET_LOGIN_ORIGINS.includes('https://open.weixin.qq.com:443'))
+    assert.ok(KNOWLEDGE_PLANET_LOGIN_ORIGINS.includes('https://lp.open.weixin.qq.com:443'))
+    assert.ok(
+      KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS >= 60_000,
+      'WeChat qrconnect long-poll needs >15s or scan confirmation never arrives',
+    )
+    assert.ok(
+      KNOWLEDGE_PLANET_WORKER_SOURCE.includes(
+        `client.setTimeout(${KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS}, () => client.destroy())`,
+      ),
+    )
     assert.equal(
       KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'read').length,
       16,
@@ -185,7 +204,7 @@ describe('official Knowledge Planet Plugin', () => {
   })
 
   test('v1.5 exposes bounded reply-aware reads plus default-confirmed or account-preapproved rich writes without credential-bearing results', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.5.0')
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.5.3')
     assert.equal(KNOWLEDGE_PLANET_DRIVER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.equal(KNOWLEDGE_PLANET_LAUNCHER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.deepEqual(
@@ -814,7 +833,7 @@ describe('official Knowledge Planet Plugin', () => {
     assert.doesNotMatch(actionSource, /writeFrame\(\{ event: 'failed'/)
   })
 
-  test('waits for the real QR image and never publishes the iframe loading mask', () => {
+  test('waits for the real QR image via element screenshot and never publishes the iframe loading mask', () => {
     assert.equal(KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS, 45_000)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION, 0.15)
     assert.equal(KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION, 0.2)
@@ -855,11 +874,16 @@ describe('official Knowledge Planet Plugin', () => {
     assert.match(captureSource, /style\.filter !== 'none'/)
     assert.match(captureSource, /Number\(style\.opacity\) < 0\.99/)
     assert.match(captureSource, /document\.elementFromPoint\([\s\S]*\) !== element/)
+    assert.match(captureSource, /image\.screenshot\(\{ type: 'png'/)
+    assert.ok(
+      /image\.screenshot\(\{ type: 'png'/.test(captureSource) && !/drawImage\(element/.test(captureSource),
+      'INC-20261109-KP-QR-TAINTED-CANVAS: captureQr uses element screenshot not cross-origin canvas',
+    )
     assert.match(captureSource, /sampleContext\.fillStyle = '#fff'/)
     assert.match(captureSource, /sampleContext\.imageSmoothingEnabled = false/)
     assert.match(captureSource, /sampleContext\.getImageData/)
-    assert.match(captureSource, /output\.toDataURL\('image\/png'\)/)
-    assert.match(captureSource, /png\.toString\('base64'\) !== encodedQr/)
+    assert.match(captureSource, /data:image\/png;base64,/)
+    assert.match(captureSource, /drawImage\(probe/)
     assert.match(captureSource, /Buffer\.from\(\[137, 80, 78, 71, 13, 10, 26, 10\]\)/)
     assert.match(
       captureSource,
@@ -874,7 +898,8 @@ describe('official Knowledge Planet Plugin', () => {
       /beforeCaptureDeadline\([\s\S]*\(\) => image\.evaluate\([\s\S]*undefined,[\s\S]*timeout: remainingCaptureTimeout\(captureDeadline\)[\s\S]*captureDeadline/,
     )
     assert.match(captureSource, /remainingCaptureTimeout\(captureDeadline\);\s*return png/)
-    assert.doesNotMatch(captureSource, /\.screenshot\(|iframe/)
+    assert.doesNotMatch(captureSource, /drawImage\(element|output\.toDataURL\(|iframe/)
+    assert.doesNotMatch(captureSource, /const encodedQr/)
     assert.match(
       KNOWLEDGE_PLANET_WORKER_SOURCE,
       /const qrCaptureDeadline = Math\.min\(input\.deadlineMs,[\s\S]*const qrButton =[\s\S]*const switchButton =[\s\S]*const qr = await beforeCaptureDeadline\([\s\S]*captureQr\(page, qrButton, switchButton, qrCaptureDeadline\)[\s\S]*remainingCaptureTimeout\(qrCaptureDeadline\);\s*writeFrame/,
@@ -1352,5 +1377,169 @@ describe('official Knowledge Planet Plugin', () => {
     )
     await closing
     assert.equal(created, false)
+  })
+})
+
+function brokerFrame(value: unknown): Buffer {
+  const body = Buffer.from(JSON.stringify(value))
+  const header = Buffer.alloc(4)
+  header.writeUInt32BE(body.length)
+  return Buffer.concat([header, body])
+}
+
+/** Opens one authenticated broker tunnel; resolves 'open' on ack 0, 'dropped' if the broker closes it. */
+async function openBrokerTunnel(
+  socketPath: string,
+  token: string,
+  host: string,
+  port: number,
+): Promise<{ status: 'open' | 'dropped'; socket: Socket; received: () => string }> {
+  const socket = createConnection(socketPath)
+  const chunks: Buffer[] = []
+  socket.on('data', (chunk) => chunks.push(chunk))
+  socket.on('error', () => {})
+  const status = await new Promise<'open' | 'dropped'>((resolveStatus) => {
+    socket.once('connect', () => socket.write(brokerFrame({ token, host, port })))
+    const timer = setInterval(() => {
+      if (Buffer.concat(chunks).length >= 1) {
+        clearInterval(timer)
+        resolveStatus(Buffer.concat(chunks)[0] === 0 ? 'open' : 'dropped')
+      }
+    }, 5)
+    socket.once('close', () => {
+      clearInterval(timer)
+      resolveStatus(Buffer.concat(chunks)[0] === 0 ? 'open' : 'dropped')
+    })
+  })
+  return { status, socket, received: () => Buffer.concat(chunks).subarray(1).toString() }
+}
+
+describe('Knowledge Planet login broker concurrency (INC-20261109-KP-QR-BROKER-CONCURRENCY)', () => {
+  const brokerRoots: string[] = []
+  afterEach(async () => {
+    await Promise.all(
+      brokerRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+    )
+  })
+
+  test('login raises only maxConcurrent to 16; every other limit and the action envelope are unchanged', () => {
+    assert.deepEqual(
+      { ...KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS },
+      {
+        maxConnections: 64,
+        maxConcurrent: 8,
+        maxBytesPerDirection: 64 * 1024 * 1024,
+        idleTimeoutMs: 120_000,
+        connectTimeoutMs: 10_000,
+      },
+    )
+    assert.deepEqual(
+      { ...KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS },
+      { ...KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS, maxConcurrent: 16 },
+    )
+    assert.equal(knowledgePlanetBrokerLimits('login'), KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS)
+    assert.equal(knowledgePlanetBrokerLimits('action'), KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS)
+    assert.ok(Object.isFrozen(KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS))
+    assert.ok(Object.isFrozen(KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS))
+    // platform default (used by plugins that pass no limits) is untouched
+    assert.equal(DEFAULT_MANAGED_BROWSER_BROKER_LIMITS.maxConcurrent, 8)
+    assert.equal(DEFAULT_MANAGED_BROWSER_BROKER_LIMITS.maxConnections, 64)
+  })
+
+  test('the worker launcher selects broker limits by run kind', async () => {
+    const source = await import('node:fs/promises').then((fs) =>
+      fs.readFile(new URL('./knowledgePlanet.ts', import.meta.url), 'utf8'),
+    )
+    const launch = source.slice(source.indexOf('createManagedBrowserTlsBroker({'))
+    const call = launch.slice(0, launch.indexOf('})') + 2)
+    assert.match(call, /limits: knowledgePlanetBrokerLimits\(args\.kind\)/)
+    assert.doesNotMatch(call, /maxConcurrent:/)
+  })
+
+  test('more than 9 concurrent WeChat login tunnels still deliver the QR image through the real broker', async () => {
+    const held: Socket[] = []
+    const upstream = createServer((socket) => {
+      held.push(socket)
+      socket.on('data', (data) => {
+        if (data.toString() === 'GET /connect/qrcode') socket.write('QR-PNG')
+      })
+    })
+    await new Promise<void>((resolveListen) => upstream.listen(0, '127.0.0.1', resolveListen))
+    const address = upstream.address()
+    assert.ok(address && typeof address === 'object')
+    const pin = {
+      origin: `https://open.weixin.qq.com:${address.port}`,
+      hostname: 'open.weixin.qq.com',
+      port: address.port,
+      ip: '127.0.0.1',
+      family: 4 as const,
+    }
+    const run = async (limits: typeof KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS, parallel: number) => {
+      const root = await mkdtemp(join(tmpdir(), 'oc-kp-broker-'))
+      brokerRoots.push(root)
+      const broker = await createManagedBrowserTlsBroker({
+        root,
+        invocationId: randomUUID(),
+        pins: [pin],
+        expectedOwnerUid: process.getuid?.() ?? 0,
+        socketUid: process.getuid?.() ?? 0,
+        socketGid: process.getgid?.() ?? 0,
+        limits,
+      })
+      const tunnels: Awaited<ReturnType<typeof openBrokerTunnel>>[] = []
+      try {
+        // page assets keep their tunnels open while the QR request is issued
+        for (let index = 0; index < parallel; index++)
+          tunnels.push(
+            await openBrokerTunnel(
+              broker.mount.hostSocketPath,
+              broker.mount.token,
+              pin.hostname,
+              pin.port,
+            ),
+          )
+        const qr = await openBrokerTunnel(
+          broker.mount.hostSocketPath,
+          broker.mount.token,
+          pin.hostname,
+          pin.port,
+        )
+        tunnels.push(qr)
+        let image = ''
+        if (qr.status === 'open') {
+          qr.socket.write('GET /connect/qrcode')
+          const deadline = Date.now() + 2_000
+          while (Date.now() < deadline && qr.received() !== 'QR-PNG')
+            await new Promise((resolveTick) => setTimeout(resolveTick, 5))
+          image = qr.received()
+        }
+        const openCount = tunnels
+          .slice(0, parallel)
+          .filter((tunnel) => tunnel.status === 'open').length
+        return { openCount, qrStatus: qr.status, image }
+      } finally {
+        for (const tunnel of tunnels) tunnel.socket.destroy()
+        await broker.close()
+      }
+    }
+    try {
+      // the WeChat page opens 9–11 tunnels; the QR request is the 11th
+      const login = await run(KNOWLEDGE_PLANET_LOGIN_BROKER_LIMITS, 10)
+      assert.equal(login.openCount, 10)
+      assert.equal(login.qrStatus, 'open')
+      assert.equal(
+        login.image,
+        'QR-PNG',
+        'INC-20261109-KP-QR-BROKER-CONCURRENCY: login broker carries more than 9 concurrent WeChat tunnels so the QR image still loads',
+      )
+      // the old envelope (8) reproduces the incident: the QR tunnel is dropped
+      const action = await run(KNOWLEDGE_PLANET_ACTION_BROKER_LIMITS, 10)
+      assert.equal(action.openCount, 8)
+      assert.equal(action.qrStatus, 'dropped')
+      assert.equal(action.image, '')
+    } finally {
+      for (const socket of held) socket.destroy()
+      await new Promise<void>((resolveClose) => upstream.close(() => resolveClose()))
+    }
   })
 })

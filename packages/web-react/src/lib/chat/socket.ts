@@ -1,4 +1,4 @@
-import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch,MODEL_SWITCH_CANCELLED_MESSAGE} from './modelSwitchCostDispatch';
+import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch} from './modelSwitchCostDispatch';
 import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
 import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 /**
@@ -13,6 +13,7 @@ import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
+import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
 import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
@@ -170,7 +171,9 @@ import type {
   RepoBindErrorWire,
   RepoStatusWire,
   RelayReadyWire,
+  StudioEventWire,
 } from "./frames";
+import { emitStudioPush } from "../studio/push";
 import { incidentStore } from "../incidentStore";
 import {
   type AutomaticTurnRecoverySnapshot,
@@ -1845,8 +1848,16 @@ export class ChatSocket {
         }
       }
 
-      // 重连期间可能有别的设备在选中会话里收尾了回合：hello 快照只管 open dispatch，
-      // 历史读一次即可。首连的历史由会话打开时的读入口负责。
+      // OCV5-593 FE-6: sys.studio_event is live-only too; whatever changed while the socket was
+      // down is picked up by reloading the open studio project.
+      try {
+        emitStudioPush(null);
+      } catch {
+        /* a studio listener failing must not break the socket open path */
+      }
+
+      // Reconnect history supplements the authoritative hello/HTTP snapshot;
+      // do not restore the retired client-side thinking timeout state machine.
       if (reconnected && this.activeSessionId) this.reconcileSession(this.activeSessionId);
       this.scheduleNotify();
     };
@@ -2229,8 +2240,23 @@ export class ChatSocket {
         incidentStore.ingest(f as IncidentWire);
         return;
       }
+      case "sys.muse_result": {
+        // A background result is a persisted message, not the final of the current user turn.
+        // Reuse server-wins history hydration without touching that turn's streaming state.
+        const sessionId = (f as { sessionId?: unknown }).sessionId;
+        if (typeof sessionId === "string" && this.sessions.has(sessionId)) {
+          void Promise.resolve(this.deps.syncSession?.(sessionId)).catch(() => {});
+        }
+        return;
+      }
       case "sys.media_job": {
         this.deps.onMediaJob?.(f as MediaJobWire);
+        return;
+      }
+      case "sys.studio_event": {
+        // OCV5-593 FE-6: the open studio project reloads its view (useStudioProject).
+        const frame = f as StudioEventWire;
+        if (typeof frame.projectId === "string") emitStudioPush(frame.projectId);
         return;
       }
       case "sys.recovery_decision": {

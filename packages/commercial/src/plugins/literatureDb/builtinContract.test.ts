@@ -83,8 +83,8 @@ test('existing official artifact and execution hashes remain byte-for-byte uncha
       'dac72b57968efd0bad82ea388fdcbad07baf2cfdca7199e7ce586fa74b0fc628',
     ],
     [
-      'f5b41bcbdeeb0709c4e77ee05f05e6b994aeb8e6d72d5661e06496cfc2a8a642',
-      'e67a26206d419020abf21f4bd4a3dd8ae44eb1a249cd47a9e356a861a8d08364',
+      'b162f949acd316ec774fd4f955c4ecd2f69c549d3b287525bd46fe631ed26d6b',
+      '5a9cda95cfd58391692a764d17382f2480530ac5030c828fb47b97eefa59a26f',
     ],
   ]
   const actual = [

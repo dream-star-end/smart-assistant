@@ -1545,6 +1545,27 @@ export const SysGoalSnapshot = Type.Object({
 })
 export type SysGoalSnapshot = Static<typeof SysGoalSnapshot>
 
+// OCV5-591 A2-1c-2 media studio activity (master-authored, never from a container): a hint for the
+// studio page to refresh its project view; history stays on the REST view.
+export const SysMuseResult = Type.Object({
+  type: Type.Literal('sys.muse_result'),
+  sessionId: Type.String(), jobId: Type.String(), ts: Type.Number(),
+})
+export type SysMuseResult = Static<typeof SysMuseResult>
+
+export const SysStudioEvent = Type.Object({
+  type: Type.Literal('sys.studio_event'),
+  projectId: Type.String(),
+  status: Type.String(),
+  event: Type.Object({
+    id: Type.String(),
+    type: Type.String(),
+    ts: Type.String(),
+    message: Type.Union([Type.String(), Type.Null()]),
+  }),
+})
+export type SysStudioEvent = Static<typeof SysStudioEvent>
+
 // ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
@@ -1632,7 +1653,9 @@ export const AnyFrame = Type.Union([
   SysContextCompacted,
   SysIncident,
   SysGoalSnapshot,
+  SysStudioEvent,
   SysMediaJob,
+  SysMuseResult,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

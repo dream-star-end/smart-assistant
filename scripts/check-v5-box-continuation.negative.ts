@@ -693,4 +693,3 @@ test("auditor hook-space tree is business-red under this gate", {
     rmSync(dir, { recursive: true, force: true });
   }
 });
-

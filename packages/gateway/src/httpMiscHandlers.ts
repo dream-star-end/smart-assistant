@@ -1280,9 +1280,6 @@ export async function handleCollaborationConfig(
   res: ServerResponse,
   url: URL,
 ): Promise<void> {
-  if (!isEngineLocalTurnExempt()) {
-    return this.sendError(res, 404, 'collaboration-config is selfhost only')
-  }
   const userId = this.getUserId(req)
   // Selfhost ACCESS / container-proxy / static MCP resolve to 'default' after
   // outer checkHttpAuth (or a valid bridge nonce). That identity owns this

@@ -1,3 +1,4 @@
+import { readMigrationSource } from "./helpers/migrationSource.js";
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
@@ -12,7 +13,7 @@ test('0330 keeps old authority bindings valid and persists an exact turn key', a
     await client.query('BEGIN')
     await client.query('CREATE TEMP TABLE authority_turn_dispatches (authority_turn_id text PRIMARY KEY)')
     await client.query('INSERT INTO authority_turn_dispatches VALUES ($1)', ['a'.repeat(32)])
-    const sql = await readFile(new URL('../db/migrations/0330_turn_lease_binding.sql', import.meta.url), 'utf8')
+    const sql = readMigrationSource("0330_turn_lease_binding")
     await client.query(sql)
     assert.equal((await client.query('SELECT turn_key FROM authority_turn_dispatches')).rows[0].turn_key, null)
     // Old writers may continue omitting the additive nullable column.

@@ -64,6 +64,11 @@ MIN_REQUIRED_TOPLEVEL=(AGENTS.md CLAUDE.md skills)
 MIN_FORBIDDEN_SKILLS=()
 MIN_FORBIDDEN_RELATIVE_PATHS=()
 
+# Serving predecessor compatibility only: skills a later release retired that an older serving
+# release still carries (oc-vision, retired by OCV5-547). Legacy mode accepts them when present;
+# new releases remain exact-manifest strict.
+LEGACY_RETIRED_SKILLS=(oc-vision)
+
 # Serving predecessor compatibility only: pre-admin/taskboard releases may lack
 # the two admin prompt variants and the cursor/taskboard skills; releases built
 # before the SSH skill landed may lack that skill too; serving releases before
@@ -169,6 +174,11 @@ assert_structure() { # <baseline-dir>
         skills_expected="$(grep -vx "$skill" <<<"$skills_expected")"
       fi
     done
+    for skill in "${LEGACY_RETIRED_SKILLS[@]}"; do
+      if [[ -e "$root/skills/$skill" ]]; then
+        skills_expected="$(printf '%s\n%s\n' "$skills_expected" "$skill")"
+      fi
+    done
   fi
   skills_expected="$(sorted_lines <<<"$skills_expected")"
   # Runtime resolveCcbBaselineMounts() enumerates every skills/ entry before it
@@ -187,6 +197,11 @@ assert_structure() { # <baseline-dir>
     fi
     assert_skill_inner "$root" "$skill"
   done
+  if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 ]]; then
+    for skill in "${LEGACY_RETIRED_SKILLS[@]}"; do
+      if [[ -e "$root/skills/$skill" ]]; then assert_skill_inner "$root" "$skill"; fi
+    done
+  fi
 }
 
 # Question (a): the release matches its own baked expectedSkills / top-level
@@ -374,6 +389,8 @@ usage:
   v5-baseline-security.sh harden-release <absolute-release-root>
   v5-baseline-security.sh check-release-legacy-cursor <absolute-release-root>
   v5-baseline-security.sh harden-release-legacy-cursor <absolute-release-root>
+  v5-baseline-security.sh check-structure-release <absolute-release-root>
+  v5-baseline-security.sh check-structure-release-legacy-cursor <absolute-release-root>
   v5-baseline-security.sh check-dir <absolute-baseline-dir>
   v5-baseline-security.sh harden-dir <absolute-baseline-dir>
   v5-baseline-security.sh write-manifest <absolute-release-root> <40-hex-sourceCommit>
@@ -408,6 +425,21 @@ case "$mode" in
   check-dir)
     [[ $# == 0 ]] || usage
     check_baseline "${path%/}"
+    ;;
+  # OCV5-581 L0 departure preflight: the structure half of check-release / its legacy variant
+  # (top level, exact skill manifest, per-skill whitelist, no special nodes). Read-only: find/stat
+  # only. Ownership and modes are left out on purpose, because harden-release-legacy-cursor fixes
+  # those before it checks; a structure mismatch is what harden cannot fix (seq365, 2026-10-22).
+  check-structure-release)
+    [[ $# == 0 ]] || usage
+    assert_structure "${path%/}/$BASELINE_REL"
+    printf 'ok structure=%s skills=%s\n' "${path%/}/$BASELINE_REL" "${#EXPECTED_SKILLS[@]}"
+    ;;
+  check-structure-release-legacy-cursor)
+    [[ $# == 0 ]] || usage
+    ALLOW_LEGACY_BASELINE_GAPS=1
+    assert_structure "${path%/}/$BASELINE_REL"
+    printf 'ok structure=%s skills=%s legacy\n' "${path%/}/$BASELINE_REL" "${#EXPECTED_SKILLS[@]}"
     ;;
   harden-dir)
     [[ $# == 0 ]] || usage

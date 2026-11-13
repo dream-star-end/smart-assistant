@@ -83,7 +83,7 @@ import { selectOpenAiPlatformKey } from "../openai/openAiPlatformKey.js";
 import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import { boxGptWebContainerEnv, isCursorCredentialMember } from "../cursor/access.js";
 import {
   removeCodexContainerAuthDir,
   writeCodexContainerAuthFile,
@@ -2910,6 +2910,9 @@ export async function provisionV3Container(
     // envProbe 把它渲染进 ENV prompt slot(user_tz=…),让模型不再把子进程 `date` 当用户
     // 时间。只透传合法 IANA 名;缺省/非法不注入,容器侧自行回落 Asia/Shanghai。
     env.push(...resolveUserTimeZoneEnv(process.env.OC_USER_TZ));
+    // OCV5-575: the container gateway launches the Box ChatGPT Web runner only when the master marks
+    // this container's uid as allowed (OC_BOX_GPT_WEB_ALLOWED_UIDS). Always written, 1 or 0.
+    env.push(boxGptWebContainerEnv(uid));
     const promptQueueEnabled = getRuntimeChannel() === "v5" && isPromptQueueV1Enabled();
     if (promptQueueEnabled) {
       // Both halves of the container-side strict gate are server-authored.
@@ -3042,6 +3045,10 @@ export async function provisionV3Container(
         }
         env.push("OC_SELFHOST_ENGINE_LOCAL_TURNS=1");
       }
+      // 顾问引擎开放名单由 master 单向下发(默认不开;过真实蜜罐验证后运维在 master env 设
+      // OC_ADVISOR_OPEN_ENGINES=codex)。只放行已知引擎名,其它值不注入。
+      const advisorOpen = advisorOpenEnginesEnv(process.env.OC_ADVISOR_OPEN_ENGINES);
+      if (advisorOpen) env.push(advisorOpen);
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master
       // 单向下发**:master 签发 authority 时把它列进 auxModels(egress 据此放行),这里注入同一
       // 值让容器实际用它 —— 二者同源,消除"master 签 A、容器发 B"的版本 skew(master 与
@@ -4337,4 +4344,12 @@ export async function preheatV3Image(
     logger?.warn?.("[v3 preheat] image pull failed; first provision will pay latency", { image, error: message });
     return { image, outcome: "error", error: message, durationMs };
   }
+}
+
+/** `OC_ADVISOR_OPEN_ENGINES=<list>` for the container, or null. Only `codex` is a known advisor engine. */
+export function advisorOpenEnginesEnv(raw: string | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const engines = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (engines.length === 0 || engines.some((e) => e !== "codex")) return null;
+  return `OC_ADVISOR_OPEN_ENGINES=${[...new Set(engines)].join(",")}`;
 }

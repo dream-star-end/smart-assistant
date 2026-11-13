@@ -65,6 +65,7 @@ function startFixture({ defaultMode = "solo" } = {}) {
   const sessionCollab = new Map();
   let defaultCollab = collabDoc({ defaultMode, session: { mode: defaultMode, advisorModel: null, configVersion: `v1:${defaultMode}:`, source: "default" } });
   const inbounds = [];
+  const pendingFinals = new Map();
   let writeStatus = 0;
   let sessionWriteStatus = 0;
   let seq = 0;
@@ -377,14 +378,21 @@ function startFixture({ defaultMode = "solo" } = {}) {
           ],
         });
         const finalSeq = (seq += 1);
-        setTimeout(() => {
+        assert.equal(pendingFinals.has(clientMessageId), false, "each actual inbound owns one final release");
+        pendingFinals.set(clientMessageId, () => {
           send({ ...base, frameSeq: finalSeq, blocks: [], isFinal: true });
-        }, 2000);
+        });
       }
     });
   });
 
-  return { http, inbounds, sessions, sessionCollab, setWriteStatus: status => { writeStatus = status; }, setSessionWriteStatus: status => { sessionWriteStatus = status; } };
+  const releaseFinal = (clientMessageId) => {
+    const release = pendingFinals.get(clientMessageId);
+    assert.ok(release, "release must belong to a real pending inbound exactly once");
+    pendingFinals.delete(clientMessageId);
+    release();
+  };
+  return { http, inbounds, sessions, sessionCollab, pendingFinals, releaseFinal, setWriteStatus: status => { writeStatus = status; }, setSessionWriteStatus: status => { sessionWriteStatus = status; } };
 }
 
 async function bootPage(context, origin, bundle) {
@@ -475,7 +483,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     logLevel: "error",
   });
   const js = bundle.outputFiles[0].text;
-  const { http, inbounds } = startFixture();
+  const { http, inbounds, pendingFinals, releaseFinal } = startFixture();
   await new Promise((done) => http.listen(0, "127.0.0.1", done));
   const origin = `http://127.0.0.1:${http.address().port}`;
   let browser;
@@ -519,6 +527,9 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     assert.equal(inbound.advisorModel, "gpt-6-astra");
     assert.match(String(inbound.collabConfigVersion || ""), /v1:advisor:gpt-6-astra/);
     const sessionId = inbound.peer.id;
+    // Every consult/card/unique Stop assertion above must observe the live turn.
+    // Final is a real WS frame, released by actual inbound identity, not a timer.
+    releaseFinal(inbound.clientMessageId);
 
     await a.page.getByRole("button", { name: "发送" }).waitFor({ timeout: 15_000 });
     await a.page.getByPlaceholder(/和「全能助手」对话/).fill(RETRY_TEXT);
@@ -582,6 +593,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     assert.equal(await consultCardToggle(a.page).count(), 2, "completed advisor tool remains once across Continue");
     await a.page.getByText(ADVICE, { exact: true }).waitFor();
 
+    releaseFinal(retried.clientMessageId);
     await a.page.close();
     const a2 = await bootPage(ctxA, origin, js);
     const reopened = a2.page.getByRole("button", { name: new RegExp(USER_TEXT) });
@@ -615,12 +627,15 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     assert.ok(last, "the non-main send must dispatch inbound.message");
     assert.notEqual(last.collabMode, "advisor");
     assert.equal(last.advisorModel, undefined);
+    releaseFinal(last.clientMessageId);
+    assert.equal(pendingFinals.size, 0, "all actual inbounds have settled or errored; no pending fixture finals");
     assert.deepEqual(a.errors.filter((e) => !/ResizeObserver/.test(e)), []);
     assert.deepEqual(a2.errors.filter((e) => !/ResizeObserver/.test(e)), []);
     assert.deepEqual(b.errors.filter((e) => !/ResizeObserver/.test(e)), []);
     await ctxA.close();
     await ctxB.close();
   } finally {
+    pendingFinals.clear();
     await browser?.close();
     await new Promise((done) => http.close(done));
   }

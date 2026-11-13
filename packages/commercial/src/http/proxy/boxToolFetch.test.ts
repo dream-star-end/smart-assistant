@@ -4,8 +4,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
 import { BoxToolFirstRoundError } from "./boxToolFirstRound.js";
+import { prepareBoxContinuation, BoxContinuationDecisionError } from "./boxPreparedContinuation.js";
 import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
 import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
+import { BoxExecTransportError } from "./boxExecTransport.js";
+import { BoxToolContinuationError } from "./boxToolContinuation.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxNativePointer } from "./boxNativePointer.js";
@@ -13,9 +16,7 @@ import type { BoxNativePointer } from "./boxNativePointer.js";
 const tools = [{ name: "local_echo", description: "synthetic",
   input_schema: { type: "object", properties: {} } }];
 const firstBody: ProxyBody = { model: "box-api-claude-opus-5-5", max_tokens: 128,
-  stream: true, tools, messages: [{ role: "user", content: "first" }],
-  metadata: { user_id: JSON.stringify({ session_id: "session",
-    oc_turn_key: "a".repeat(64) }) } };
+  stream: true, tools, metadata: { user_id: JSON.stringify({ session_id: "session", oc_turn_key: "a".repeat(64) }) }, messages: [{ role: "user", content: "first" }] };
 const nextBody: ProxyBody = { ...firstBody, messages: [
   { role: "assistant", content: [{ type: "tool_use", id: "toolu_A",
     name: "local_echo", input: {} }] },
@@ -146,6 +147,11 @@ test("same internal model fetch streams first handoff then next final without to
         + "Use Read rather than cat.\n</system-reminder>",
       cache_control: { type: "ephemeral" } }] },
     nextBody.messages[2]!] } as ProxyBody;
+  const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: hookedNext.model,
+    rawBody: hookedNext, authorityKind: "local_catalog", authorityTurnId: null });
+  assert.equal(prepared.classification, "continuation_candidate");
+  assert.equal(prepared.sessionId, "session");
+  assert.equal(prepared.turnKey, "a".repeat(64));
   const second = await service.fetch(call(hookedNext));
   assert.match(await second.text(), /event: message_stop/);
   assert.deepEqual(calls, ["first", "claim-and-publish", "continued-final"]);
@@ -615,6 +621,25 @@ test("cleanup status query failure never poisons an already-final SSE response",
   assert.equal(disposed, true);
 });
 
+test("missing continuation metadata rejects before any publish, launch, resolve or wake", async () => {
+  let sideEffects = 0;
+  const forbidden = async (): Promise<never> => { sideEffects++; throw new Error("unexpected side effect"); };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
+    virtualMcpAsset: Buffer.from("m"), detachedRunnerAsset: Buffer.from("d"), journal: journal(),
+    maxOutputTokensForModel: () => 128_000, resolveTarget: forbidden,
+    onUnknown: forbidden, runFirst: forbidden as never, publishResume: forbidden as never,
+    runContinuation: forbidden as never });
+  const { metadata: _metadata, ...missing } = nextBody;
+  const body = missing as ProxyBody;
+  const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: body.model,
+    rawBody: body, authorityKind: "local_catalog", authorityTurnId: null });
+  assert.equal(prepared.classification, "reject");
+  assert.equal(prepared.rejectCode, "BOX_PREPARED_REJECT");
+  await assert.rejects(() => service.fetch(call(body)), (error: unknown) =>
+    error instanceof BoxContinuationDecisionError && error.code === "BOX_PREPARED_REJECT");
+  assert.equal(sideEffects, 0);
+});
+
 // OCV5-313 (#1a28c670): a rejected tool-result echo failed the request and the
 // CLI then ran on alone for an hour, holding the session and its idle proof.
 const resultBody = { ...firstBody, messages: [{ role: "user", content: "first" },
@@ -681,6 +706,40 @@ test("OCV5-313 the stop wait is bounded and a late or failing stop is still obse
   } finally { process.off("unhandledRejection", onUnhandled); }
 });
 
+test("BOX_TOOL_TERMINAL_UNPROVEN stops once through the bounded echo path and does not complete the chain", async () => {
+  let completes = 0;
+  let release!: () => void;
+  const hung = new Promise<string>((resolve) => { release = () => resolve("pending"); });
+  const calls: string[] = [];
+  const target = { accountId: 25n,
+    exec: { run: async () => ({ stdout: "clean" + String.fromCharCode(10), stderrBytes: 0, exitCode: 0 as const }) },
+    dispose: async () => {} };
+  const base = journal() as unknown as Record<string, unknown>;
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { ...base, completeToolChain: async () => { completes++; } } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    echoStopWaitMs: 40,
+    publishResume: (async () => ({ claim: { runNonce: "e".repeat(24),
+      leaseEpoch: "f".repeat(32), accountId: 25n, spoolOffset: 1, roundNo: 2 },
+    target, access: {} })) as never,
+    runContinuation: (async () => {
+      calls.push("continuation");
+      throw new BoxToolContinuationError("BOX_TOOL_TERMINAL_UNPROVEN");
+    }) as never,
+    stopRejectedRun: (async () => { calls.push("stop"); return hung; }) as never });
+  const started = Date.now();
+  const response = await service.fetch(call(resultBody));
+  await assert.rejects(response.text(), /BOX_TOOL_TERMINAL_UNPROVEN/);
+  assert.deepEqual(calls, ["continuation", "stop"]);
+  assert.ok(Date.now() - started < 2_000, "the request does not wait out a hanging stop");
+  assert.equal(completes, 0);
+  release();
+  await hung;
+});
+
 test("OCV5-313 other continuation failures do not request a stop", async () => {
   const calls: string[] = [];
   const target = { accountId: 25n,
@@ -737,4 +796,26 @@ test("real ToolFetch and first-round chain preserve proven no-egress error befor
     if (inherited === undefined) Reflect.deleteProperty(process.env, "OC_INSTANCE_ID");
     else process.env.OC_INSTANCE_ID = inherited;
   }
+});
+
+// OCV5-762 (uid 4, 2026-11-12): the continuation's Exec calls were refused
+// (417) even after one refreshed retry. Left alone, the run held the slot and
+// the retries got 409 BOX_CAPACITY_HELD / BOX_RESUME_IN_PROGRESS.
+test("OCV5-762 an Exec refusal that survived its retry stops the run like a rejected echo", async () => {
+  for (const code of ["BOX_EXEC_HTTP_417", "BOX_EXEC_REFRESH_FAILED"]) {
+    let identity: unknown;
+    const { service, calls, claim } = echoRejectedService(async (seen) => {
+      identity = seen; return "stopped_proven";
+    }, 200, new BoxExecTransportError(code, false));
+    const response = await service.fetch(call(resultBody));
+    await assert.rejects(response.text(), new RegExp(code));
+    assert.deepEqual(calls, ["continuation", "stop"], code);
+    assert.deepEqual(identity, { requestId: "box-next", uid: 3n, accountId: claim.accountId,
+      runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch });
+  }
+  // a plain transport failure keeps the timed path
+  const { service, calls } = echoRejectedService(async () => "stopped_proven", 200,
+    new BoxExecTransportError("BOX_EXEC_HTTP_503", false));
+  await assert.rejects((await service.fetch(call(resultBody))).text(), /BOX_EXEC_HTTP_503/);
+  assert.deepEqual(calls, ["continuation"]);
 });

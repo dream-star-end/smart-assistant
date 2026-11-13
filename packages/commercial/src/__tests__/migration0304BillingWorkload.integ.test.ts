@@ -11,11 +11,13 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
-import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
+import { migrationsDirBefore, resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("billing_workload_0304_test");
 const VERSION = "0304_billing_workload_column";
 const rollbackPath = fileURLToPath(new URL(`../db/rollbacks/${VERSION}.sql`, import.meta.url));
+// Later migrations (0306+) are outside this test; stop the chain right after 0304.
+const throughVersion = () => migrationsDirBefore("0305");
 
 async function user(email: string): Promise<string> {
   const r = await query<{ id: string }>(
@@ -67,7 +69,7 @@ describe("0304 billing workload column", () => {
       "SELECT (SELECT SUM(delta) FROM credit_ledger)::text AS l, (SELECT SUM(cost_credits) FROM usage_records)::text AS u")).rows[0];
     const before = await sums();
 
-    assert.deepEqual((await runMigrations()).applied, [VERSION]);
+    assert.deepEqual((await runMigrations({ dir: await throughVersion() })).applied, [VERSION]);
 
     assert.deepEqual(await tags(dream.usageId), { usage: { mode: "chat", workload: "auto_dream" }, ledger: CHAT_LEDGER });
     for (const other of [chat, cron, aborted]) {
@@ -86,7 +88,7 @@ describe("0304 billing workload column", () => {
     await assert.rejects(
       query("INSERT INTO credit_ledger(user_id, delta, balance_after, reason) VALUES ($1, -1, 0, 'auto_dream')", [a]), /check/i,
       "reason CHECK is unchanged");
-    assert.deepEqual((await runMigrations()).applied, [], "applied once");
+    assert.deepEqual((await runMigrations({ dir: await throughVersion() })).applied, [], "applied once");
 
     // Rollback clears the usage tag and unregisters; the append-only ledger keeps its tagged row.
     await query(await readFile(rollbackPath, "utf8"));
@@ -96,7 +98,7 @@ describe("0304 billing workload column", () => {
     assert.equal((await query("SELECT count(*)::int AS n FROM billing_workload_0304_backup")).rows[0]!.n, 1, "backup kept");
 
     // Re-apply tags again without duplicating the backup.
-    assert.deepEqual((await runMigrations()).applied, [VERSION]);
+    assert.deepEqual((await runMigrations({ dir: await throughVersion() })).applied, [VERSION]);
     assert.deepEqual((await tags(dream.usageId)).usage, { mode: "chat", workload: "auto_dream" });
     assert.equal((await query("SELECT count(*)::int AS n FROM billing_workload_0304_backup")).rows[0]!.n, 1);
   });

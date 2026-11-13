@@ -65,6 +65,12 @@ const WHITELIST = new Set<string>([
   "packages/storage/src/clientSessionsPlan.ts",
   "packages/storage/src/sessionsMigrate.ts",
   "packages/commercial/src/db/pgSessionsBackend.ts",
+  // #1200: PG sessions backend 的快照拆分模块；在调用方同一 REPEATABLE READ
+  // READ ONLY 事务内读取 session 归属、dispatch 与帧，不能另开 backend 事务。
+  "packages/commercial/src/db/sessionSnapshot.ts",
+  // #1200: 快照积分只读投影在同一事务内合并已落 tape 与 pending 的实际扣费，
+  // 按 request_id 去重；不写六表，另开事务会让两种归属之间的迁移被漏计/重计。
+  "packages/commercial/src/billing/dispatchSettledCredits.ts",
   // OCV5-607: PG sessions backend 拆分；在同一只读事务内验证归属与完整原生存档，
   // 仍由 pgSessionsBackend 委托并注入原 batch validators，不新增业务 SQL 入口。
   "packages/commercial/src/db/pgCcbTranscriptRestore.ts",
@@ -96,11 +102,29 @@ const WHITELIST = new Set<string>([
   // client_sessions 仅**只读 LEFT JOIN**(id+user_id 归属 + deleted_at 墓碑,判定"用户面已
   // 消失"的 open dispatch)——不写六表;dispatch 域的离场判定放 sessions backend 反而内聚更差。
   "packages/commercial/src/dispatch/turnDispatchStore.ts",
+  // Recovery-store carrier lookup reads the same owner's non-deleted session in
+  // one SELECT. No session writes; WS transport delegates this decision here.
+  "packages/commercial/src/dispatch/turnRecoveryStore.ts",
+  // One read-only ledger reconciliation statement snapshots pending/tape costs
+  // with usage and journals; the operator executes under BEGIN READ ONLY.
+  "packages/commercial/src/billing/turnLabelLedgerReconcile.ts",
+  // SELECT-only split of modelSwitchCostContextReader: whole-session failed-start
+  // proof keeps the same uid/deleted_at/history predicates in one database read.
+  "packages/commercial/src/db/modelSwitchCostFailedStart.ts",
+  // PG metadata backend split: rename/patch both delegate here; receipt and xmin
+  // CAS share the caller's runner and FOR UPDATE ownership lock (OCV5-610/624).
+  "packages/commercial/src/db/sessionMetadataApproval.ts",
+  // Help actor reads session ownership/tombstone with dispatch, user and security
+  // epoch in a single snapshot. It never writes any of the six authority tables.
+  "packages/commercial/src/system-assistant/helpActor.ts",
   // Settle-time usage attribution snapshots chat_projects.board_project_id via a
   // read-only JOIN of client_sessions on the same billing client/transaction.
   // It does not write the six tables. Routing through sessions backend would
   // open a second transaction and lose the settle-time bind snapshot.
   "packages/commercial/src/billing/boardProjectAttribution.ts",
+  // #1237: /api/me/usage ledger rows read the owner's session title through one
+  // SELECT-only LEFT JOIN of client_sessions, bounded to the caller's uid and ledger ids.
+  "packages/commercial/src/billing/ledgerRowContext.ts",
   // Orphan dispatch finalize owns one atomic PG transaction: lock dispatch + lock the
   // tenant session row + append a visible tapeless fallback + close the dispatch.
   // Splitting the session projection through a backend call would lose that fence.
@@ -108,7 +132,24 @@ const WHITELIST = new Set<string>([
   "scripts/v5-sessions-backfill-pg.ts",
   "scripts/v5-sessions-spill-archive.ts",
   "scripts/sessions-fix-oversized.ts",
+  // OCV5-380: selfhost one-off backfill of output assets the old container collector left in its local
+  // SQLite (scripts/*selfhost* is selfhost deploy scope, never run on commercial). Its only six-table SQL is
+  // a read-only lookup of client_sessions to classify each row by tenant before one insert transaction.
+  "scripts/v5-selfhost-backfill-output-assets.ts",
 ])
+
+// This operator pins every journal/finalizer query to one client and proves all
+// financial relations resolve to pg_temp before admission. Only these two TEMP
+// DDL statements are legal; this does NOT whitelist future persistent SQL, the
+// whole file, or other files sharing a directory/name prefix.
+const TEMP_SHADOW_TOOL = "scripts/ocv5-289/boxToolFetchLiveProbe.ts"
+const TEMP_SHADOW_LINES = new Set([
+  'await client.query("CREATE TEMP TABLE pending_usage_patches (LIKE public.pending_usage_patches INCLUDING ALL)");',
+  'await client.query("CREATE TEMP TABLE client_sessions (LIKE public.client_sessions INCLUDING ALL)");',
+])
+function isAllowedTempShadowSql(relativePath: string, line: string): boolean {
+  return relativePath === TEMP_SHADOW_TOOL && TEMP_SHADOW_LINES.has(line.trim())
+}
 
 // 扫描根目录(仓内一级)。node_modules/dist/.git 等在遍历时剪掉。
 const SCAN_ROOTS = ["packages", "scripts"]
@@ -154,7 +195,7 @@ describe("架构:master 六张权威表 SQL 字面量白名单(RFC D6b)", () => 
       }
       const lines = text.split("\n")
       for (let i = 0; i < lines.length; i++) {
-        if (SQL_CONTEXT.test(lines[i])) {
+        if (SQL_CONTEXT.test(lines[i]) && !isAllowedTempShadowSql(rel, lines[i])) {
           violations.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 120)}`)
         }
       }
@@ -170,9 +211,24 @@ describe("架构:master 六张权威表 SQL 字面量白名单(RFC D6b)", () => 
   })
 
   test("白名单自洽:每个白名单文件都真实存在(防陈旧路径)", () => {
-    for (const rel of WHITELIST) {
+    for (const rel of [...WHITELIST, TEMP_SHADOW_TOOL]) {
       const abs = join(REPO_ROOT, rel)
       assert.doesNotThrow(() => readFileSync(abs, "utf8"), `白名单文件不存在(路径陈旧?): ${rel}`)
     }
   })
+
+  test("TEMP operator exception cannot admit persistent SQL, another file, or near-matching DDL", () => {
+    for (const line of TEMP_SHADOW_LINES) {
+      assert.equal(isAllowedTempShadowSql(TEMP_SHADOW_TOOL, line), true)
+      assert.equal(isAllowedTempShadowSql("scripts/ocv5-289/anotherProbe.ts", line), false)
+      assert.equal(isAllowedTempShadowSql(TEMP_SHADOW_TOOL, line.replace("TEMP ", "")), false)
+    }
+    for (const line of ['await client.query("UPDATE client_sessions SET user_id=3");',
+      'await client.query("DELETE FROM pending_usage_patches");',
+      'await client.query("CREATE TEMP TABLE client_sessions AS SELECT * FROM public.client_sessions");']) {
+      assert.equal(SQL_CONTEXT.test(line), true)
+      assert.equal(isAllowedTempShadowSql(TEMP_SHADOW_TOOL, line), false)
+    }
+  })
+
 })

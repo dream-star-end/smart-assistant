@@ -180,7 +180,7 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       entry({
         entryId: 4,
         modelId: DEFAULT_CCB_SUBAGENT_MODEL,
-        providerId: "zai",
+        providerId: "scnet",
         contextWindow: 200_000,
       }),
     );
@@ -1459,15 +1459,19 @@ describe("OCV5-613 canonical identity follows the admitted dispatch", () => {
       for (const container of rig.containerWss.clients) container.close(1011, "613 isolated close");
       await waitFor(() => client!.readyState === WebSocket.CLOSED);
       releaseAdmit();
-      await waitFor(() => queries.some((q) => q.params[2] === "bridge_closed_during_admission"));
+      await waitFor(() => queries.some((q) => q.params[1] === "bridge-admission-handoff"));
       assert.equal(admissions.length, 1);
       const admission = admissions[0]!;
       assert.equal(admission.agentId, "main");
-      const terminal = queries.filter((q) => /status = 'terminal'/.test(q.sql));
-      assert.equal(terminal.length, 1);
-      assert.equal(terminal[0]!.params[0], admission.dispatchId);
-      assert.equal(terminal[0]!.params[1], "executed_error");
-      assert.equal(terminal[0]!.params[2], "bridge_closed_during_admission");
+      // Commercial e37d6ce8 keeps a closed admission rejecting until exact
+      // inbox proof resolves ownership; a late close must not invent a terminal.
+      const rejecting = queries.filter((q) => /status = 'rejecting'/.test(q.sql));
+      assert.equal(rejecting.length, 1);
+      assert.equal(rejecting[0]!.params[0], admission.dispatchId);
+      assert.equal(rejecting[0]!.params[1], "bridge-admission-handoff");
+      assert.equal(rejecting[0]!.params[3], "1", "handoff remains fenced by the admitted epoch");
+      assert.match(rejecting[0]!.sql, /status = 'admitted' AND lease_epoch = \$4/);
+      assert.equal(queries.filter((q) => /status = 'terminal'/.test(q.sql)).length, 0);
       const insert = queries.find((q) => /INSERT INTO turn_traces/.test(q.sql));
       assert.ok(insert);
       const links = queries.filter((q) => /SET dispatch_id = COALESCE/.test(q.sql));
@@ -2362,7 +2366,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
     }
   });
 
-  test("R4-B6 container close during enrichment still terminalizes immediately", async () => {
+  test("R4-B6 container close during enrichment immediately hands ownership to durable proof", async () => {
     const queries: { sql: string; params: unknown[] }[] = [];
     const pgPool = {
       query: async (sql: string, params: unknown[] = []) => {
@@ -2394,7 +2398,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => historyStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "test close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseHistory!([]);
@@ -2478,7 +2482,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => bindingStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "post lookup close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseBinding();
@@ -2857,6 +2861,45 @@ test('OCV5-179 identity: slow readiness cannot be overtaken on the same raw peer
   } finally {release();await stopRig(rig);}
 });
 
+
+test("OCV5-511 exact replay snapshot commits before ACK and survives shutdown during delayed enrichment", async () => {
+  let admitted: AdmitUserTurnInput | undefined;
+  let releaseHistory!: (rows: unknown[]) => void;
+  let historyStarted = false;
+  const gate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const rig = await startRig({ attest: "yes", durableDispatch: true,
+    pgPool: { query: async (sql: string, params: unknown[] = []) => {
+      queries.push({ sql, params }); return { rows: [], rowCount: 1 };
+    } },
+    admitUserTurn: async (input) => { admitted = input; return fakeAdmittedDispatch(input); },
+    loadMasterSessionMessages: async () => { historyStarted = true; return gate; },
+  });
+  try {
+    const ws = await openClient(rig.port);
+    const received = frameCollector(ws);
+    ws.send(inboundFrame({ clientMessageId: "cm-511-shutdown", idempotencyKey: "web:cm-511-shutdown:0",
+      peer: { id: "sess-511-shutdown", kind: "dm" }, model: "glm-5.2", serviceTier: "fast",
+      contextTier: "1m", collabMode: "advisor", advisorModel: "gpt-6-astra", conversationMode: "plan" }));
+    const ack = await received.next();
+    assert.equal(ack.type, "outbound.ack");
+    assert.ok(admitted?.message._admissionRestartRequest, "snapshot supplied to transactional admission before ACK");
+    const snapshot = admitted.message._admissionRestartRequest as { version: number; wireBase64: string };
+    assert.equal(snapshot.version, 1);
+    const request = JSON.parse(Buffer.from(snapshot.wireBase64, "base64").toString("utf8"));
+    assert.equal(request.serviceTier, "fast"); assert.equal(request.contextTier, "1m");
+    assert.equal(request.collabMode, "advisor"); assert.equal(request.advisorModel, "gpt-6-astra");
+    assert.equal(request.conversationMode, "plan");
+    await waitFor(() => historyStarted);
+    await rig.bridge.shutdown();
+    await waitFor(() => queries.some(q => q.params[1] === "bridge-admission-handoff"));
+    releaseHistory([]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(rig.containerSeen.some(row => row.includes('"clientMessageId":"cm-511-shutdown"')), false);
+  } finally { releaseHistory([]); await stopRig(rig); }
+});
+
+
 describe('OCV5-610 independent help sidecar', () => {
   for (const capable of [false, true]) test(`help capability ${capable} keeps dispatch wire intact and strips browser-forged context`, { timeout: 15000 }, async () => {
     const scopes: Parameters<NonNullable<UserChatBridgeDeps['issueSystemHelpBootstrap']>>[0][] = []
@@ -2931,8 +2974,6 @@ test("RF-step3: attested tabs share the same executor through owner detach", asy
     b.close();
   } finally { await stopRig(rig); }
 });
-
-
 describe('remote-pool lane authority', () => {
   const operationId = '00000000-0000-4000-8000-000000000123';
   const sessionKey = 'agent:main:webchat:dm:cc5-native-chat';

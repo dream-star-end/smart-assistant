@@ -1,8 +1,8 @@
-import { createMemoryAuthSession } from '../../lib/authSession'
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../lib/api'
+import { createMemoryAuthSession } from '../../lib/authSession'
 import type {
   CommunityTutorialDetail,
   CommunityTutorialSummary,

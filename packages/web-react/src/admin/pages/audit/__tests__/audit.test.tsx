@@ -281,10 +281,13 @@ describe("AuditPage", () => {
     expect(await screen.findByText("近窗没有问题卡事件。")).toBeTruthy();
   });
 
-  test("问题卡区块有数据时渲染漏斗与裁决", async () => {
+  for (const deferred of [false, true]) test(deferred ? "问题卡静态标题不代表数据就绪，延迟响应后仍渲染全部漏斗与裁决" : "问题卡区块有数据时渲染漏斗与裁决", async () => {
+    let resolvePayload!: (payload: unknown) => void;
+    const pending = new Promise((resolve) => { resolvePayload = resolve; });
+    let payload: unknown;
     adminGet.mockImplementation((path: string) => {
       if (path === "/product-friction") {
-        return Promise.resolve({
+        payload = {
           ...PRODUCT_FRICTION,
           problemCards: {
             // 与 commercial audit.ts 真实返回同形：双窗对象，行内不带 window（前端展平时补）。
@@ -320,7 +323,8 @@ describe("AuditPage", () => {
             jobs: [{ code: "upstream_failed", outcome: "recovered", reason: null, count: 2 }],
             fallbacks: [{ code: "interrupted", reason: "visible_fallback", count: 1 }],
           },
-        });
+        };
+        return deferred ? pending : Promise.resolve(payload);
       }
       if (path === "/audit") return Promise.resolve({ rows: [ADMIN_ROW], next_before: null });
       return Promise.resolve({ rows: [], next_before: null });
@@ -331,7 +335,11 @@ describe("AuditPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "产品摩擦" }));
 
     expect(await screen.findByText("问题卡")).toBeTruthy();
-    // 区块标题先于数据渲染；等数据行出现再做同步断言（单 worker 跑全量时偶发先断言）。
+    if (deferred) {
+      await waitFor(() => expect(adminGet.mock.calls.some((call) => call[0] === "/product-friction")).toBe(true));
+      expect(screen.queryAllByText("upstream_failed")).toHaveLength(0);
+      resolvePayload(payload);
+    }
     expect((await screen.findAllByText("upstream_failed")).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("immediate")).toBeTruthy();
     // 双窗对象被展平：24h 与 7d 各一行，window 标由前端补齐。

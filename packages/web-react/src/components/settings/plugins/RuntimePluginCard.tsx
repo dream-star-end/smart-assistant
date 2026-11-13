@@ -66,7 +66,9 @@ export function RuntimePluginCard({
   const literature = plugin.slug === 'literature-db'
   const qrProvider = managedPluginProvider(plugin.slug)
   const canSelfAuthorize =
-    ['knowledge-planet', 'weibo', 'zhihu', 'bili-account', 'literature-db'].includes(plugin.slug) &&
+    ['knowledge-planet', 'weibo', 'zhihu', 'bili-account', 'douyin', 'literature-db'].includes(
+      plugin.slug,
+    ) &&
     plugin.installedCurrent
   const authorizeLabel = literature ? '连接文献数据库' : qrProvider.authorizeLabel
   const writeCount = plugin.actions.filter((action) => !action.readOnly).length

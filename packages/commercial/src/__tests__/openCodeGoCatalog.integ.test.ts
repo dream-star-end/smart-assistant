@@ -15,7 +15,7 @@ import {
 } from '../admin/openCodeGoCatalog.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
-import { resetAndMigrateTestSchema, useDedicatedTestDatabase } from './helpers/db.js'
+import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js'
 
 const DB = 'opencode_go_425_test'
 const db = useDedicatedTestDatabase(DB)
@@ -50,7 +50,8 @@ const others = async () =>
 
 test('OpenCode Go catalog op: reviewed rows, idempotent, reversible, drift-refusing', async (t) => {
   if (db.skipIfUnavailable(t)) return
-  await resetAndMigrateTestSchema()
+  // The selfhost catalog op owns these ids there; commercial 0313 stages its own Go rows (OCV5-sync1020).
+  await resetAndMigrateBefore('0313')
   await query(
     "INSERT INTO users(id,email,password_hash,role) VALUES(3,'g425-test@example.invalid','test-hash','admin') ON CONFLICT (id) DO NOTHING",
   )

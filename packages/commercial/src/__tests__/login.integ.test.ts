@@ -97,11 +97,18 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   return false;
 }
 
+let testIpSeq = 0;
+/** 每次一个新 IP:这里的用例不验同 IP 上限,不让它们互相占名额。 */
+function nextTestIp(): string {
+  testIpSeq += 1;
+  return `198.51.${Math.floor(testIpSeq / 250)}.${(testIpSeq % 250) + 1}`;
+}
+
 async function setupUser(email: string, password: string): Promise<{ userId: string }> {
   const mailer = new CapturingMailer();
   const r = await register(
     { email, password, turnstile_token: "tok" },
-    { mailer, turnstileBypass: true },
+    { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
   );
   return { userId: r.user_id };
 }

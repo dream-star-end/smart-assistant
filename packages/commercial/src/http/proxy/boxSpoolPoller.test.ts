@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { isBoxExecRejectedError, isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 
@@ -105,4 +105,55 @@ test("OCV5-306: a deadline during a retry pause reports poll timeout", async () 
   const iter = pollBoxSpoolLines({ exec: exec as never, access, startOffset: 0,
     deadlineMs: 20, pollIntervalMs: 1, retryDelaysMs: [5000] });
   await assert.rejects(() => iter.next(), /BOX_SPOOL_POLL_TIMEOUT/);
+});
+
+test("OCV5-762: an Exec 417 re-reads the same offset once (on the refreshed descriptor)", async () => {
+  const raw = Buffer.from('{"type":"assistant"}\n', "utf8");
+  const offsets: number[] = [];
+  const exec = { run: async (req: { args: string[] }) => {
+    const offset = Number(req.args[7]);
+    offsets.push(offset);
+    if (offsets.length === 1) throw new BoxExecTransportError("BOX_EXEC_HTTP_417", false);
+    return { stdout: encoded(offsets.length === 2 ? raw : Buffer.alloc(0), offset),
+      stderrBytes: 0, exitCode: 0 as const };
+  } };
+  const iter = pollBoxSpoolLines({ exec: exec as never, access, startOffset: 9,
+    deadlineMs: 1000, pollIntervalMs: 1, retryDelaysMs: [1, 1] });
+  const first = await iter.next();
+  assert.equal(first.value?.text, raw.toString("utf8"));
+  await iter.return(undefined);
+  assert.deepEqual(offsets, [9, 9]);
+});
+
+test("OCV5-762: a second 417 without progress ends the poll as rejected", async () => {
+  const raw = Buffer.from('{"type":"assistant"}\n', "utf8");
+  let calls = 0;
+  const exec = { run: async (req: { args: string[] }) => {
+    calls++;
+    // 417, progress (reset), 417 retried, empty read (no progress), 417 surfaces
+    if (calls === 1 || calls === 3 || calls === 5) throw new BoxExecTransportError("BOX_EXEC_HTTP_417", false);
+    return { stdout: encoded(calls === 2 ? raw : Buffer.alloc(0), Number(req.args[7])),
+      stderrBytes: 0, exitCode: 0 as const };
+  } };
+  const iter = pollBoxSpoolLines({ exec: exec as never, access, startOffset: 0,
+    deadlineMs: 1000, pollIntervalMs: 1, retryDelaysMs: [1, 1] });
+  assert.equal((await iter.next()).value?.text, raw.toString("utf8"));
+  const surfaced = await iter.next().then(() => null, (error: unknown) => error);
+  assert.ok(surfaced instanceof BoxExecTransportError && surfaced.code === "BOX_EXEC_HTTP_417");
+  assert.equal(calls, 5);
+  assert.equal(isBoxExecRejectedError(surfaced), true);
+  assert.equal(isBoxExecRejectedError(new BoxExecTransportError("BOX_EXEC_REFRESH_FAILED", false)), true);
+  assert.equal(isBoxExecRejectedError(new BoxExecTransportError("BOX_EXEC_HTTP_503", false)), false);
+});
+
+test("OCV5-762: a failed descriptor refresh is not retried", async () => {
+  let calls = 0;
+  const exec = { run: async () => {
+    calls++;
+    throw new BoxExecTransportError(calls === 1 ? "BOX_EXEC_HTTP_417" : "BOX_EXEC_REFRESH_FAILED", false);
+  } };
+  const iter = pollBoxSpoolLines({ exec: exec as never, access, startOffset: 0,
+    deadlineMs: 1000, pollIntervalMs: 1, retryDelaysMs: [1, 1, 1] });
+  await assert.rejects(() => iter.next(), /BOX_EXEC_REFRESH_FAILED/);
+  assert.equal(calls, 2);
 });

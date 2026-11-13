@@ -4,6 +4,7 @@
 //   POST /api/muse-bridge/v1/poll                         (long-poll, ≤ POLL_HOLD_SEC)
 //   GET  /api/muse-bridge/v1/jobs/:id/sources/:n         (after ack; supports Range)
 //   POST /api/muse-bridge/v1/jobs/:id/heartbeat           (first one = ack barrier)
+//   GET  /api/muse-bridge/v1/jobs/:id/sources/:n          (bridge >= 0.5, after the ack; Range)
 //   PUT  /api/muse-bridge/v1/jobs/:id/files/:idx/chunks/:n
 //   POST /api/muse-bridge/v1/jobs/:id/result
 //
@@ -19,7 +20,7 @@
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { parseByteRange } from '@openclaude/gateway'
+import { parseByteRange as parseHttpByteRange } from '@openclaude/gateway'
 
 import { REQUEST_ID_HEADER, ensureRequestId, sendJson, setSecurityHeaders } from '../http/util.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
@@ -89,6 +90,17 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<Record<
   return v as Record<string, unknown>
 }
 
+/** Shared HTTP range syntax, with Muse's fail-closed 416 contract for invalid ranges. */
+export function parseByteRange(
+  header: string | undefined,
+  size: number,
+): { start: number; end: number } | null {
+  if (header === undefined) return null
+  const range = parseHttpByteRange(header, size)
+  if (!range) throw new MuseError(416, 'RANGE_NOT_SATISFIABLE', 'range not satisfiable')
+  return range
+}
+
 function sendErr(res: ServerResponse, err: MuseError, requestId: string): void {
   sendJson(res, err.status, {
     error: { code: err.code, message: err.message, request_id: requestId },
@@ -147,10 +159,10 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
     })
   }
 
-  function requireSession(req: IncomingMessage): string {
+  function requireSession(req: IncomingMessage, credentialId: string): string {
     const raw = req.headers['x-muse-bridge-session']
     const sessionId = typeof raw === 'string' ? raw : undefined
-    const check = deps.hub.checkSession(sessionId)
+    const check = deps.hub.checkSession(sessionId, credentialId)
     if (check === 'superseded') {
       throw new MuseError(409, 'SUPERSEDED', 'a newer bridge session took over')
     }
@@ -186,22 +198,30 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
           poll_hold_sec: POLL_HOLD_SEC,
           heartbeat_sec: HEARTBEAT_SEC,
           limits: MUSE_LIMITS,
+          // Bridges >= 0.4.0 run this many jobs at once (capped by their --max-concurrency).
+          max_concurrency: deps.hub.bridgeConcurrency(),
         })
         return
       }
 
-      const sessionId = requireSession(req)
+      const sessionId = requireSession(req, credentialId)
       touch(credentialId, null)
 
       if (method === 'POST' && sub === '/poll') {
         await readJson(req, JSON_MAX_BYTES)
         // Detect the client going away on the *response* side; req 'close' also fires after
-        // a normally consumed body and must not be used here.
+        // a normally consumed body and must not be used here. One bridge keeps a poll per free
+        // slot, so the abort names this poll, not the session.
+        const gone = new AbortController()
         const onClose = () => {
-          if (!res.writableEnded) deps.hub.cancelPoll(sessionId)
+          if (!res.writableEnded) gone.abort()
         }
         res.on('close', onClose)
-        const job = await deps.hub.poll(sessionId, deps.pollHoldMs ?? POLL_HOLD_SEC * 1000)
+        const job = await deps.hub.poll(
+          sessionId,
+          deps.pollHoldMs ?? POLL_HOLD_SEC * 1000,
+          gone.signal,
+        )
         res.off('close', onClose)
         if (!job) {
           if (!res.destroyed && !res.writableEnded) {
@@ -211,32 +231,38 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
           return
         }
         if (res.destroyed || res.writableEnded) {
-          deps.hub.undeliverable(job.id)
+          deps.hub.undeliverable(job.id, job.nonce)
           return
         }
         sendJson(res, 200, { job })
         return
       }
 
-      const sourceMatch = /^\/jobs\/([^/]+)\/sources\/(\d+)$/.exec(sub)
-      if (method === 'GET' && sourceMatch && JOB_ID_RE.test(sourceMatch[1]!)) {
-        const { data, ref } = deps.hub.sourceFor(
-          sourceMatch[1]!,
-          String(req.headers['x-job-nonce'] ?? ''),
-          Number(sourceMatch[2]),
-        )
-        res.setHeader('Cache-Control', 'no-store')
-        res.setHeader('Accept-Ranges', 'bytes')
-        const range = parseByteRange(req.headers.range, data.length)
-        if (req.headers.range !== undefined && !range) {
-          res.setHeader('Content-Range', `bytes */${data.length}`)
-          throw new MuseError(416, 'INVALID_RANGE', 'source range is not satisfiable')
+      const src = /^\/jobs\/([^/]+)\/sources\/(\d+)$/.exec(sub)
+      if (src && method === 'GET') {
+        if (!JOB_ID_RE.test(src[1]!)) throw new MuseError(404, 'NOT_FOUND', 'not found')
+        const nonce = String(req.headers['x-job-nonce'] ?? '')
+        deps.hub.requireAssignment(src[1]!, nonce, sessionId)
+        const source = deps.hub.source(src[1]!, nonce, Number(src[2]))
+        const size = source.data.length
+        let range: ReturnType<typeof parseByteRange>
+        try {
+          range = parseByteRange(req.headers.range, size)
+        } catch (err) {
+          if (err instanceof MuseError && err.status === 416) {
+            res.setHeader('Content-Range', `bytes */${size}`)
+          }
+          throw err
         }
-        const body = range ? data.subarray(range.start, range.end + 1) : data
-        if (range) res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${data.length}`)
-        res.setHeader('Content-Type', ref.mime)
-        res.setHeader('Content-Length', body.length)
+        const body = range ? source.data.subarray(range.start, range.end + 1) : source.data
         res.statusCode = range ? 206 : 200
+        res.setHeader('Content-Type', source.mime)
+        res.setHeader('Content-Length', String(body.length))
+        res.setHeader('Accept-Ranges', 'bytes')
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('X-Source-Sha256', source.sha256)
+        res.setHeader('X-Source-Bytes', String(size))
+        if (range) res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${size}`)
         res.end(body)
         return
       }
@@ -248,12 +274,14 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
       if (method === 'POST' && m[2] === 'heartbeat') {
         const body = await readJson(req, JSON_MAX_BYTES)
         const nonce = typeof body.job_nonce === 'string' ? body.job_nonce : ''
-        sendJson(res, 200, deps.hub.heartbeat(jobId, nonce))
+        deps.hub.requireAssignment(jobId, nonce, sessionId)
+        sendJson(res, 200, await deps.hub.heartbeat(jobId, nonce))
         return
       }
       if (method === 'POST' && m[2] === 'result') {
         const body = await readJson(req, JSON_MAX_BYTES)
         const nonce = typeof body.job_nonce === 'string' ? body.job_nonce : ''
+        deps.hub.requireAssignment(jobId, nonce, sessionId)
         await deps.hub.result(jobId, nonce, body)
         sendJson(res, 200, { ok: true })
         return
@@ -262,6 +290,7 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
         const nonce = String(req.headers['x-job-nonce'] ?? '')
         const sha = String(req.headers['x-chunk-sha256'] ?? '').toLowerCase()
         const data = await readBodyBuffer(req, MUSE_LIMITS.chunk_bytes)
+        deps.hub.requireAssignment(jobId, nonce, sessionId)
         await deps.hub.putChunk(jobId, nonce, Number(m[3]), Number(m[4]), data, sha)
         sendJson(res, 200, { ok: true })
         return

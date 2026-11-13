@@ -49,6 +49,7 @@ describe('OpenCode Go pricing', () => {
       'longcat-2.0-go': [15, 60, 1, 0], // $0.30 / $1.20 / $0.006
       'longcat-2.5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
       'step-5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
+      'step-5-preview-go': [50, 135, 5, 0], // $1.00 / $2.70 / $0.10 (4x limited-time quota)
       'minimax-m3.1-flash-free-go': [0, 0, 0, 0], // Free (limited time)
       'beam-free-go': [0, 0, 0, 0], // Free (limited time)
       'opencode-grok-4.7': [100, 300, 25, 0], // ≤200K $2 / $6 / $0.50

@@ -83,7 +83,7 @@ async function turnStatus(requestId: string): Promise<string | undefined> {
 }
 
 describe('0307 antigravity engine schema', () => {
-  test('engine CHECK accepts antigravity; catalog rows are staged, pricing disabled, claude/gpt-oss admin-only', async (t) => {
+  test('engine CHECK accepts antigravity; catalog rows are staged, pricing disabled, all admin-only (commercial)', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const rows = await query<{
       model_id: string
@@ -124,13 +124,13 @@ describe('0307 antigravity engine schema', () => {
         model_id: 'antigravity-gemini-3.8-flash',
         state: 'staged',
         enabled: false,
-        visibility: 'public',
+        visibility: 'admin',
       },
       {
         model_id: 'antigravity-gemini-4-argon',
         state: 'staged',
         enabled: false,
-        visibility: 'public',
+        visibility: 'admin',
       },
       {
         model_id: 'antigravity-gemini-4-carbon',
@@ -529,13 +529,14 @@ describe('OCV5-515 authoritative retirement waiver', () => {
 
 
 describe('Gemini 4 Argon staged pricing (OCV5-517)', () => {
+  // Commercial: 0312 keeps the row admin-only (OCV5-411) and 0313 prices it as Claude Opus 5.5 (user 2026-10-20).
   test('new public family stays staged with explicit medium effort and verified introductory rates', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const r=await query(`SELECT c.state,c.upstream_model_id,c.context_window,p.enabled,p.visibility,p.default_effort,
       p.input_per_mtok::text AS input,p.output_per_mtok::text AS output,p.cache_read_per_mtok::text AS cached
       FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-gemini-4-argon'`)
     assert.deepEqual(r.rows,[{ state:'staged',upstream_model_id:'gemini-4-argon-medium',context_window:1048576,
-      enabled:false,visibility:'public',default_effort:'medium',input:'100',output:'500',cached:'5' }])
+      enabled:false,visibility:'admin',default_effort:'medium',input:'1400',output:'5000',cached:'36' }])
   })
 })
 

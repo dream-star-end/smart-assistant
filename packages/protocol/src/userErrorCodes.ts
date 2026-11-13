@@ -91,7 +91,7 @@ export const HTTP_ERROR_GROUPS = {
     "goal_state_unavailable", "goal_unavailable", "grok_delegate_lease_limit", "grok_pool_unavailable",
     "handler_fail", "has_active_containers", "host_only", "human_required", "identity_compat_managed",
     "image_attempt_limit", "image_request_in_progress", "ingest_failed", "inject_failed", "internal",
-    "internal_error", "leaks_found", "lease_callback_failed", "lease_held", "lease_invalid",
+    "internal_error", "ip_registration_limit", "leaks_found", "lease_callback_failed", "lease_held", "lease_invalid",
     "lease_secret_unset", "legacy_turn_not_ready", "lookup_error", "lookup_unavailable", "maintenance",
     "marketplace_agent_managed", "minimax_clone_rejected", "minimax_download_failed", "no_bound_account",
     "no_bound_codex_account", "no_compatible_agent", "no_container", "no_master", "no_response",

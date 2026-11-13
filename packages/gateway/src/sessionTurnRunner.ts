@@ -1,3 +1,5 @@
+import { normalizeAssistantOutputUiFences } from './uiFenceNormalize.js'
+import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 import { getSystemHelpRelay } from './systemHelpRelay.js'
 import { refreshTurnModelAuthorityLease, RenewTurnLeaseError } from './masterTurnLease.js'
 import type { UpstreamRetryHint } from '@openclaude/protocol'
@@ -317,6 +319,7 @@ export async function _runOneTurn(
   attemptOrdinal = 0,
   automaticRetryState?: AutomaticRetryState,
   modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
+  grokExecutionDescriptor?: GrokExecutionDescriptor,
 ): Promise<void> {
   const { runner } = session
   const turnStartTime = Date.now()
@@ -1664,11 +1667,13 @@ export async function _runOneTurn(
           ?? (result.isError || result.errorDetail !== undefined ? 'crashed' : 'completed')
         terminalPersistenceClaim = 'complete'
         flushTerminalBilling()
-        const completedAssistantRaw = combineRetryAssistantOutput(
-          retryAssistantSegments,
-          result.assistantText,
-          freezeSegments(result.assistantSegments, assistantMessageId),
-          Date.now(),
+        const completedAssistantRaw = normalizeAssistantOutputUiFences(
+          combineRetryAssistantOutput(
+            retryAssistantSegments,
+            result.assistantText,
+            freezeSegments(result.assistantSegments, assistantMessageId),
+            Date.now(),
+          ),
         )
         const completedAssistantText = emptyCompletedTurnAssistantText({
           status: persistedResultStatus,
@@ -2194,6 +2199,7 @@ export async function _runOneTurn(
         // 模型权威批次 §4:bridge turn 的两张签名票(本地路径 undefined → CCB runner
         // 自取 local_catalog token;codex adapter 不消费本字段)。
         ...(modelAuthority !== undefined ? { modelAuthority } : {}),
+        ...(grokExecutionDescriptor !== undefined ? { grokExecutionDescriptor } : {}),
         traceId,
         assistantMessageId,
         thinkingMessageId,
@@ -2313,6 +2319,7 @@ export async function runOneTurnWithRetry(
   contextOverflowRetryInputs: string[] = [],
   automaticRetryState?: AutomaticRetryState,
   modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
+  grokExecutionDescriptor?: GrokExecutionDescriptor,
 ): Promise<void> {
   const retryState: AutomaticRetryState = automaticRetryState ?? {
     rootClientMessageId: clientMessageId ?? session.sessionKey,
@@ -2552,6 +2559,7 @@ export async function runOneTurnWithRetry(
         attemptOrdinal,
         retryState,
         modelSwitchTransition,
+        grokExecutionDescriptor,
       )
       return // success
     } catch (err: any) {

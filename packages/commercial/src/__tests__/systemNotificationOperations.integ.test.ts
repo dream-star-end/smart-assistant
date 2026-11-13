@@ -1,3 +1,4 @@
+import { readMigrationSource } from "./helpers/migrationSource.js";
 /** Private synthetic schemas only. Exact approved inbox writes and their real PG receipts. */
 import assert from 'node:assert/strict'
 import { randomBytes, randomUUID } from 'node:crypto'
@@ -29,7 +30,7 @@ async function fixture(t: import('node:test').TestContext, loseReply = false) {
     INSERT INTO users VALUES(765,'user','active',NULL,now()-interval '1 day');
     CREATE TABLE inbox_messages(id bigserial PRIMARY KEY,audience text,user_id bigint,title text,body_md text,created_at timestamptz DEFAULT now(),expires_at timestamptz);
     CREATE TABLE inbox_message_reads(user_id bigint,message_id bigint REFERENCES inbox_messages(id) ON DELETE CASCADE,read_at timestamptz DEFAULT now(),PRIMARY KEY(user_id,message_id));`)
-  await pool.query(readFileSync(new URL('../db/migrations/0327_system_action_receipts.sql', import.meta.url), 'utf8'))
+  await pool.query(readMigrationSource("0327_system_action_receipts"))
   setPoolOverride(pool)
   const ledger = new SystemActionStore({ dbPath: join(mkdtempSync(join(tmpdir(), 'oc-notification-ledger-')), 'ledger.sqlite'), key: randomBytes(32) })
   t.after(() => ledger.close())

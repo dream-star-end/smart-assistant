@@ -6,8 +6,9 @@ tags: [plugins, github, knowledge-planet, weibo, literature-db, ths]
 
 # app-connectors 插件(CLI)
 
-当前支持微博、知识星球、GitHub、同花顺、文献数据库。对用户统称「插件」，连接入口为「管理中心 → 插件」。
-微博、知识星球、GitHub、文献数据库统一使用 `oc-plugin list → describe → call`，无需判断底层实现。
+访问用户在管理中心绑定的第三方账号，对用户统称「插件」，连接入口为「管理中心 → 插件」。
+先用 `oc-plugin list → describe → call` 发现并调用当前账号实际可用的插件；不要用另一版本的目录猜当前能力。
+微博、知识星球、GitHub、文献数据库支持统一入口；商业目录还可能包含邮箱、WebDAV、Notion、飞书、知乎、B 站与抖音，均以 list/describe 为准。平台在服务端托管凭据与浏览器登录状态。
 同花顺在用户容器本机运行：先读取 `ths` 技能，再按其中命令调用，不能把它当远程账号。
 
 **不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/插件
@@ -150,6 +151,13 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 - **PDF 暂存约 30 分钟**：`download` 成功后文件只在平台暂存约 30 分钟（服务重启也会丢失），要提醒用户及时在文献卡片上点「保存 PDF」。文件过期后用同一 `documentId` 重新 `download` 即可；同一篇重复 `download` 会直接复用已校验的文件。
 - **错误码**：`LITERATURE_ARTIFACT_CAPACITY` = 暂存已满（不是限流），先让用户保存已就绪的 PDF 或等较早的文件到期再下；`LITERATURE_NO_ACCESS` = 该篇不在订阅范围或机构通道拒绝访问，换一篇，账号无需重新绑定；`LITERATURE_UPSTREAM_RATE_LIMITED` = 文献源限流，等几分钟再试；`LITERATURE_UPSTREAM_CHALLENGE` = 人机验证/风控，不要自动重试；`LITERATURE_UPSTREAM_CHANGED` = 页面无法识别，**不是零结果**，可重试一次。
 - **串行下载**：下载多篇文献或遇到 `RATE_LIMITED`（账号正忙）/ `TIMEOUT` 时，**必须一篇一篇串行下载，每篇间隔 20-30 秒**，不要并发或紧挨着连续连打。
+
+### 抖音（douyin）
+
+只在 AI 市场，用户没装时先引导去安装；装好后在 管理中心 → 插件 → 抖音 用抖音 App 扫码登录个人账号（二维码约 1 分钟才出现）。
+- 当前版本只读：`oc-plugin call douyin me` 读取登录账号的昵称、uid、粉丝 / 关注 / 作品 / 获赞数，也用来确认登录是否有效。作品、评论、搜索、发布等能力还没有，不要假装能做。
+- 这是浏览器自动化，不在抖音官方开放能力之内，可能触发账号风控。不要连续反复调用，也不要索要 cookie、短信或验证码。
+- RELINK_REQUIRED / LOGIN_EXPIRED_ACCOUNT：请用户到 管理中心 → 插件 → 抖音 重新扫码。DOUYIN_VERIFICATION_REQUIRED：请用户先在手机抖音完成本人验证再扫码。DOUYIN_UPSTREAM_CHALLENGE：抖音触发风控，如实告知、立即停止，不要重试或换动作绕过。
 
 ### 连接与恢复
 

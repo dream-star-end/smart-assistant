@@ -64,7 +64,7 @@ function scriptedPool(): Pool {
             },
           ],
         }
-      if (sql.includes('FROM client_sessions cs'))
+      if (sql.includes('model-switch-session-meta'))
         return {
           rows: [
             {

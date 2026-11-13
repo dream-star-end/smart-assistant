@@ -118,7 +118,7 @@ const section = async (desc: RegExp) => {
 
 describe("服务池(合并后的一个 tab)", () => {
   test("导航只有一个服务池入口;旧的 #tab=accounts 链接打开它", () => {
-    expect(adminPages.filter((p) => p.group === "账号与调度").map((p) => p.title)).toEqual(["服务池", "账号分组", "代理池"]);
+    expect(adminPages.filter((p) => p.group === "账号与调度").map((p) => p.title)).toEqual(["服务池", "远端服务池", "账号分组", "代理池"]);
     expect(parseAdminHash("#tab=accounts").tab).toBe("pools");
     expect(getAdminPage("accounts").key).toBe("pools");
   });

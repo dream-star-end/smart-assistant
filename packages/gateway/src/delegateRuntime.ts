@@ -1310,7 +1310,7 @@ export async function _runDelegateTaskCore(
   try {
     delegateExec = await resolveLocalExecutionIfEnforced({
       agent: execAgent,
-      kind: 'turn',
+      kind: 'billed_delegate',
       model: requestedModel,
       defaultModel: this.deps.config.defaults.model,
       preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
@@ -1968,6 +1968,7 @@ export async function _runDelegateTaskCore(
     try {
       engineBillingAdmission = await billingApi.admit({
         model: billingModel,
+        ...(grokRoute ? { grokRouteToken: grokRoute.routeToken } : {}),
         engine: billingEngine,
         agentId: targetAgentId,
         delegateAgentId: targetAgentId,
@@ -2372,6 +2373,8 @@ export async function _runDelegateTaskCore(
     undefined,
     {
       platformGoal: session._platformGoal ?? null,
+      ...(engineBillingAdmission?.grokExecutionDescriptor
+        ? { grokExecutionDescriptor: engineBillingAdmission.grokExecutionDescriptor } : {}),
       ...(grokRoute ? { grokRoute } : {}),
       ...(codexRoute ? { codexRoute } : {}),
       ...(antigravityRoute ? { antigravityRoute } : {}),

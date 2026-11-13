@@ -547,6 +547,7 @@ import {
   appendServerAuthoredMessageDrainByUser,
   drainDelegateCostForClientSession,
   getClientSession,
+  classifyClientSessions,
   patchServerAuthoredMessage,
   readArchivedMessages,
   getEngineContextMessages,
@@ -626,6 +627,13 @@ import {
   createBiliAccountRuntimeRegistries,
 } from './plugins/biliAccount.js'
 import { BiliAccountSetupManager } from './plugins/biliAccountSetup.js'
+import {
+  DOUYIN_BROKER_ROOT,
+  DOUYIN_WORKER_ROOT,
+  DouyinDockerService,
+  createDouyinRuntimeRegistries,
+} from './plugins/douyin.js'
+import { DouyinSetupManager } from './plugins/douyinSetup.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
@@ -671,6 +679,8 @@ import {
 } from "./minimax/mediaProxy.js";
 import { mediaProxyKey } from "./minimax/mediaKey.js";
 import { createMuseFromConfig } from "./muse/assemble.js";
+import { createStudioFromConfig } from "./media-studio/assemble.js";
+import { startStudioOrchestrator } from "./media-studio/orchestrator/assemble.js";
 import { makeMuseInternalHandler } from "./muse/internalHttp.js";
 import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
@@ -685,6 +695,9 @@ import {
 } from "./grok/webSearchProxy.js";
 import {
   GROK_VISION_PATH,
+  grokRunMaxCost,
+  makeGrokRunner,
+  resettleGrokRun,
   makeGrokVisionHandler,
   type GrokVisionHandler,
 } from "./grok/visionProxy.js";
@@ -1489,6 +1502,9 @@ export async function registerCommercial(
       sessionsStoreGeneration = decision.generation;
       const pgSessionsBackend = createPgSessionsBackend(getPool(), {
         expectedGeneration: decision.generation,
+        admissionRestartRecovery: {
+          releaseReservation: (ref) => releasePreCheck(preCheckRedis, ref).then(() => {}),
+        },
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
         onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
@@ -1709,6 +1725,8 @@ export async function registerCommercial(
   let zhihuSetup: ZhihuSetupManager | undefined
   let biliAccountService: BiliAccountDockerService | undefined
   let biliAccountSetup: BiliAccountSetupManager | undefined
+  let douyinService: DouyinDockerService | undefined
+  let douyinSetup: DouyinSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
   // 文献插件(OCV5-524/585):观测日志 literature_plugin_call / literature_artifact 由 runtime 工厂接到 rootLogger。
   const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin, literatureObserver } = createCommercialLiteratureRuntime({ runtimeChannel, redis, logger: rootLogger })
@@ -1750,22 +1768,34 @@ export async function registerCommercial(
       socketUid: 1000,
       socketGid: 1000,
     })
+    // OCV5-553: Douyin Plugin (market only; this version is QR login + read-only `me`).
+    douyinService = new DouyinDockerService(pluginDocker, {
+      imageId: cfg.OC_RUNTIME_IMAGE_ID,
+      workerRoot: DOUYIN_WORKER_ROOT,
+      brokerRoot: DOUYIN_BROKER_ROOT,
+      expectedOwnerUid: 0,
+      socketUid: 1000,
+      socketGid: 1000,
+    })
     const knowledgePlanetRegistries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
     const weiboRegistries = createWeiboRuntimeRegistries(weiboService)
     const zhihuRegistries = createZhihuRuntimeRegistries(zhihuService)
     const biliAccountRegistries = createBiliAccountRuntimeRegistries(biliAccountService)
+    const douyinRegistries = createDouyinRuntimeRegistries(douyinService)
     const browserRuntime = new ManagedBrowserRuntime({
       drivers: new Map([
         ...knowledgePlanetRegistries.drivers,
         ...weiboRegistries.drivers,
         ...zhihuRegistries.drivers,
         ...biliAccountRegistries.drivers,
+        ...douyinRegistries.drivers,
       ]),
       launchers: new Map([
         ...knowledgePlanetRegistries.launchers,
         ...weiboRegistries.launchers,
         ...zhihuRegistries.launchers,
         ...biliAccountRegistries.launchers,
+        ...douyinRegistries.launchers,
       ]),
       profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
       expectedOwnerUid: 0,
@@ -1789,6 +1819,10 @@ export async function registerCommercial(
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     biliAccountSetup = new BiliAccountSetupManager(biliAccountService, {
+      redis,
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
+    douyinSetup = new DouyinSetupManager(douyinService, {
       redis,
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
@@ -2039,8 +2073,34 @@ export async function registerCommercial(
       start: () => mediaGenerationService.start(),
     });
   }
+  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
-  const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool());
+  const museDeliveryRefs: {
+    pushRemote?: (args: { hostUuid: string; remotePath: string; content: Buffer }) => Promise<void>;
+    resolveMedia?: (userId: string) => Promise<UserMediaLocation>;
+  } = {};
+  const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool(),
+    flavorIdentity.status === "ok" && flavorIdentity.flavor === "commercial" ? {
+      append: appendServerAuthoredMessage,
+      originActive: async (sessionId, userId) =>
+        (await classifyClientSessions([{ sessionId, userId }]))[0]?.state === "active",
+      resolveMedia: async (userId) => {
+        if (!museDeliveryRefs.resolveMedia) throw new Error("Muse media resolver not ready");
+        return museDeliveryRefs.resolveMedia(userId);
+      },
+      pushRemote: async (args) => {
+        if (!museDeliveryRefs.pushRemote) throw new Error("Muse remote uploader not ready");
+        await museDeliveryRefs.pushRemote(args);
+      },
+      broadcast: (uid, frame) => bridgeBroadcastRef.current(uid, frame),
+    } : undefined);
+  // OCV5-591 media studio. Off unless OC_STUDIO_ENABLED=1 (→ /api/studio/* 404, no GC tick).
+  const studioHttp = await createStudioFromConfig(cfg, getPool(), { preCheckRedis, museHub });
+  let stopStudioOrchestrator: (() => Promise<void>) | undefined;
+  // OCV5-591 A2-1c-2: studio activity to this slot's connections (assigned once the bridge exists).
+  const studioPushRef: { current: (uid: bigint, payload: unknown) => void } = {
+    current: () => { /* bridge not assembled yet */ },
+  };
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -2469,6 +2529,39 @@ export async function registerCommercial(
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
+      // OCV5-591 A2-1: the studio's director agent plans with the same Grok core (platform-paid steps).
+      if (studioHttp) {
+        const studioGrokCatalog = {
+          async assertFresh() {
+            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+            if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
+            return cache.assertFresh();
+          },
+        };
+        stopStudioOrchestrator = startStudioOrchestrator({
+          cfg,
+          pool: getPool(),
+          studio: studioHttp,
+          museHub,
+          push: (uid, frame) => studioPushRef.current(uid, frame),
+          grok: makeGrokRunner({
+            getPool,
+            preCheckRedis,
+            pricing,
+            catalog: studioGrokCatalog,
+            loadUserModelAuthz,
+            recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
+          }),
+          // OCV5-591 A2-1b-1: visual QA reserves one run's worst case against the project budget.
+          grokMaxCost: (model) => grokRunMaxCost(studioGrokCatalog, model),
+          // A stored QA answer whose settle may not have happened is settled again (idempotent).
+          grokResettle: (i) =>
+            resettleGrokRun(
+              { getPool, preCheckRedis, pricing },
+              { ...i, containerId: null, durationMs: 0 },
+            ),
+        })?.stop;
+      }
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -2503,35 +2596,31 @@ export async function registerCommercial(
         },
       });
       // /internal/v5/delegate/grok-route/* — 容器本地 delegate turn 的 grok route
-      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。仅在
-      // selfhost engine-local-turn 豁免下挂载(与 gateway modelAuthority
-      // isEngineLocalTurnExempt 同一 env 语义);生产不路由 → 容器侧 delegate 在
-      // decideLocalExecution 已 fail-closed,不会也不该到达这里。
-      const delegateGrokRouteHandler: DelegateGrokRouteHandler | undefined =
-        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
-          ? makeDelegateGrokRouteHandler({
-              identityRepo,
-              // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
-              // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
-              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
-              release: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-                if (!context) return false;
-                await expireGrokRouteContextByLease(context.accountId, context.slotId);
-                scheduler.releaseCodexSlot(context.accountId, context.slotId);
-                return true;
-              },
-              renew: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-                if (!context) return false;
-                if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
-                  scheduler.restoreCodexSlot(context.accountId, context.slotId);
-                }
-                return true;
-              },
-              logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
-            })
-          : undefined;
+      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。两版都挂载:
+      // 容器在 mint 后必须先过 delegate 计费准入(绑定 routeTokenHash),grok relay 对
+      // kind=delegate 的路由只在有 inflight 计费 journal 时放行(OCV5-477)。
+      const delegateGrokRouteHandler: DelegateGrokRouteHandler = makeDelegateGrokRouteHandler({
+        identityRepo,
+        // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
+        // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
+        allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
+        release: async ({ routeToken, containerId, userId }) => {
+          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+          if (!context) return false;
+          await expireGrokRouteContextByLease(context.accountId, context.slotId);
+          scheduler.releaseCodexSlot(context.accountId, context.slotId);
+          return true;
+        },
+        renew: async ({ routeToken, containerId, userId }) => {
+          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+          if (!context) return false;
+          if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
+            scheduler.restoreCodexSlot(context.accountId, context.slotId);
+          }
+          return true;
+        },
+        logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
+      });
       // /internal/v5/delegate/antigravity-route/* — 委派到 antigravity 引擎时
       // master 签发/续/释 relay route(OCV5-738)。与 chat turn 共用账号池、
       // durable turn row 与 relay meter;同样只在 selfhost 引擎本地 turn 豁免下
@@ -4339,6 +4428,7 @@ export async function registerCommercial(
         docker: mediaResolverDocker,
       })
     : undefined;
+  museDeliveryRefs.resolveMedia = userMediaResolver;
   knowledgePlanetMediaResolverRef.current = userMediaResolver
 
   // Shared remote-host upload closure. It is used by both gateway /api/uploads
@@ -4364,6 +4454,7 @@ export async function registerCommercial(
       target.psk?.fill(0);
     }
   };
+  museDeliveryRefs.pushRemote = pushRemoteHostUpload;
 
 
   const chunkHooks = createRemoteHostChunkHooks();
@@ -4527,6 +4618,7 @@ export async function registerCommercial(
     ...systemActions?.http,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
+    studio: studioHttp,
     goalStateService,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
@@ -4539,6 +4631,7 @@ export async function registerCommercial(
     literatureArtifacts,
     zhihuSetup,
     biliAccountSetup,
+    douyinSetup,
     knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
@@ -6173,6 +6266,9 @@ export async function registerCommercial(
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
+  studioPushRef.current = (uid, payload) => {
+    userChatBridge.broadcastToUser(uid, payload);
+  };
   goalSyncRef.current = (uid, payload) => {
     userChatBridge.syncGoalToContainers(uid, payload);
   };
@@ -6713,6 +6809,8 @@ export async function registerCommercial(
           },
         });
         const reconcilerDeps = {
+          recoverInterruptedAdmission: dispatchAdmissionBackend
+            ? (id: string) => dispatchAdmissionBackend!.recoverInterruptedAdmission(id) : undefined,
           containerLinkEnabled: containerLinkOn,
           pool: getPool(),
           container,
@@ -7274,6 +7372,9 @@ export async function registerCommercial(
       chatgptProxyServer = undefined;
       try { await cgpServer?.close(); } catch { /* ignore */ }
       try { await closeMusePublic?.(); } catch { /* ignore */ }
+      try { await stopStudioOrchestrator?.(); } catch { /* ignore */ }
+      // OCV5-574: close this process's open Muse jobs (MUSE_MASTER_RESTARTED, never charged).
+      try { await museHub?.stop(); } catch { /* ignore */ }
       try { await directPreview?.shutdown(); } catch { /* ignore */ }
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
@@ -7289,6 +7390,7 @@ export async function registerCommercial(
           Promise.resolve().then(() => literatureArtifacts?.close()),
           zhihuSetup?.closeAndDrain(),
           biliAccountSetup?.closeAndDrain(),
+          douyinSetup?.closeAndDrain(),
         ])
       } catch {
         /* ignore */

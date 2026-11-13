@@ -1,3 +1,4 @@
+import { grokExecutionUpstream } from '@openclaude/protocol'
 import { ContainerLinkControls } from "./containerLinkControls.js";
 import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
 import { rebuildContainerLink } from "./containerLinkRebuild.js";
@@ -61,10 +62,11 @@ import { applyTeamLeaderForwarding } from './teamModeForwarding.js'
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { desktopAllowsEngine } from "./containerTransportKind.js";
+import { snapshotAdmissionRequest } from "../dispatch/admissionRestartRecovery.js";
 import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool, PoolClient } from "pg";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import { isBoxGptWebAllowedUser, isCursorCredentialMember } from "../cursor/access.js";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
@@ -194,12 +196,12 @@ import {
   type RemoteExecutionBackend,
   isCc5TestModel,
   isBoxGptWebModel,
-  isBoxGptWebOwnerUid,
   type DurableCodexBilling,
 } from "@openclaude/protocol";
 import { systemHelpDispatchFields } from "../system-assistant/helpBridge.js";
 import {
   backfillDispatchTraceId,
+  casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
   heartbeatLease,
@@ -231,6 +233,7 @@ import {
 } from "../dispatch/turnControlStore.js";
 import {
   claimDueRecoveryJobs,
+  listDueRecoveryCarrierContainers,
   forwardRecoveryUnderRootFence,
   releaseRecoveryPreReceipt,
   pauseRecoveryForRefusal,
@@ -738,6 +741,8 @@ const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
  *   - commercial/billing/modelCatalog 的那份是 DB 投影(带 providerId / upstreamModelId
  *     —— **路由**语义,只有 master/egress 需要,容器不该看见上游身份);
  *   - protocol 的那份是**容器执行**语义(capability / context / effort / vision)。
+ * Grok CLI exception: a public model version is required by --model; project
+ * it from this same snapshot, never provider credentials or endpoints.
  * 这里做一次显式收窄 = 「凭据与路由不进容器」这条边界在类型层的落点。
  *
  * `contextWindow` 的 null 原样进入签名载荷；0 不是合法窗口，不能拿哨兵值混淆语义。
@@ -748,6 +753,7 @@ function toProtocolDescriptor(
   const profile = d.capabilityProfile;
   return {
     capabilityProfile: {
+      ...(d.engine === 'grok' ? { grok: { upstreamModelId: grokExecutionUpstream(d.canonicalModel, d.upstreamModelId) } } : {}),
       supportsVision: profile.supportsVision,
       reasoning: {
         supported: [...profile.reasoning.supported],
@@ -2320,27 +2326,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (recovery && links) {
         try {
           const channel = deps.containerLinkRecovery?.channel ?? "v5";
-          const carriers = await deps.pgPool.query<{ container_id: number }>(
-            `SELECT DISTINCT ac.id::int AS container_id
-               FROM turn_recovery_jobs r
-               JOIN client_sessions s ON s.id=r.session_id AND s.user_id='c:' || r.user_id::text AND s.deleted_at IS NULL
-               LEFT JOIN LATERAL (
-                 SELECT d.agent_container_id FROM turn_dispatches d
-                  WHERE d.user_id=r.user_id AND d.session_id=r.session_id
-                  ORDER BY (d.client_message_id=r.source_client_message_id) DESC NULLS LAST,
-                           d.admitted_at DESC, d.dispatch_id DESC LIMIT 1
-               ) d ON true
-               JOIN agent_containers ac ON ac.user_id=r.user_id AND ac.state='active' AND ac.runtime_channel=$2
-                AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
-                  SELECT 1 FROM agent_containers other WHERE other.user_id=r.user_id AND other.state='active'
-                    AND other.runtime_channel=$2 AND other.id<>ac.id)))
-              WHERE r.user_id=$1 AND r.status IN ('queued','leased') AND r.next_attempt_at<=NOW()
-                AND (r.status='queued' OR r.lease_until<NOW())
-                AND r.dispatch_id IS NULL
-              LIMIT 5`,
-            [key, channel],
-          );
-          for (const row of carriers.rows ?? []) {
+          const carriers = await listDueRecoveryCarrierContainers(deps.pgPool, uid, channel);
+          for (const row of carriers) {
             if (links.retainKeepAliveConsumer(uid, row.container_id)) {
               continue;
             }
@@ -3826,13 +3813,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       failureCode: string,
       opts?: PreForwardFailOpts,
     ): boolean => {
+      const wasTransferring = state.phase === "transferring";
       if (!claimEnrichmentTerminalization(state)) return false;
       const record = state.record;
       const pool = deps.pgPool;
       void (async (): Promise<void> => {
         try {
           if (!pool) return;
-          if (record.recoveryJob) {
+          if (failureCode === "bridge_closed_during_admission" &&
+              (!record.recoveryJob || wasTransferring)) {
+            // A send can reach the durable inbox before its local callback.
+            // Keep the task open until exact proof resolves ownership: live
+            // work continues; a rejected tombstone schedules a fresh identity.
+            await casAdmittedToRejecting(pool, {
+              dispatchId: record.dispatchId,
+              expectedEpoch: record.leaseEpoch,
+              ownerId: "bridge-admission-handoff",
+            });
+          } else if (record.recoveryJob) {
             const refusalKey = `${record.recoveryJob.jobId}:${record.recoveryJob.leaseEpoch}`;
             const refusal = refusedRecoveryJobs.get(refusalKey)
               ?? (_recoveryRefusalAction(failureCode) === "pause" ? failureCode : undefined);
@@ -3959,8 +3957,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return state;
     };
 
-    /** The websocket send callback is the physical-transfer linearization
-     * point. Until it succeeds, cleanup may still terminalize this state. */
+    /** A successful websocket callback releases enrichment ownership. If
+     * cleanup wins first, exact inbox proof resolves the uncertain delivery. */
     const completeEnrichmentTransfer = (state: EnrichmentDispatchState | null): void => {
       if (state) acceptEnrichmentReceipt(state.record);
     };
@@ -4643,6 +4641,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(displayText !== modelText ? { _modelText: modelText } : {}),
           ...(replyTo ? { _replyTo: replyTo } : {}),
           _routing: routing,
+          _admissionRestartRequest: snapshotAdmissionRequest(frameObj),
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
@@ -6239,9 +6238,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;
             }
-            if (isBoxGptWebModel(modelCapture) && !isBoxGptWebOwnerUid(uid)) {
+            if (isBoxGptWebModel(modelCapture) && !isBoxGptWebAllowedUser(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
-              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'gpt-6-astra-pro is restricted to owner account user_id=3', cursorTurnIdentity);
+              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'gpt-6-astra-pro is not enabled for this account', cursorTurnIdentity);
               return;
             }
             // The local supervisor mounts the owner credential only on this
@@ -6353,9 +6352,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
             }
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
-            let cursorSpendable: bigint;
+            // box-gpt-6-astra-pro is never billed (no audit row, so no settle; OCV5-575): an allowed
+            // account with a zero balance may still use it.
+            const cursorBilled = !isBoxGptWebModel(modelCapture);
+            let cursorSpendable: bigint | null = null;
             try {
-              cursorSpendable = await readTotalSpendableBalance(uid);
+              if (cursorBilled) cursorSpendable = await readTotalSpendableBalance(uid);
             } catch (err) {
               logCapture?.error('user-chat-bridge: cursor spendable lookup failed', { err });
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
@@ -6365,7 +6367,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            if (cursorSpendable <= 0n) {
+            if (cursorSpendable !== null && cursorSpendable <= 0n) {
               rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
               failDispatchPreForward(dispatchRecord, 'insufficient_credits');
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
@@ -6399,7 +6401,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
-            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
+            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable === null ? undefined : cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
             if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
             await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len, dispatchRecord);
@@ -8660,7 +8662,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : null;
       if (
         masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
-        masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" || masterOnlyFrameType === "sys.recovery_status"
+        masterOnlyFrameType === "sys.recovery_status" || masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" ||
+        // OCV5-591 A2-1c-2: studio activity is master-authored only.
+        masterOnlyFrameType === "sys.studio_event" || masterOnlyFrameType === "sys.muse_result"
       ) {
         if (!loggedRejectedContainerIncident) {
           loggedRejectedContainerIncident = true;

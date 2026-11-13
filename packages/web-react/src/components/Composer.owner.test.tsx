@@ -39,7 +39,7 @@ describe("FQ-03 Composer attachments follow draft owner", () => {
       wrap(
         <Composer
           draftKey="session-A"
-          onSend={(text, media) => sends.push({ session: "A", media })}
+          onSend={(text, media) => { sends.push({ session: "A", media }); }}
           onUpload={onUpload}
         />,
       ),
@@ -60,7 +60,7 @@ describe("FQ-03 Composer attachments follow draft owner", () => {
         wrap(
           <Composer
             draftKey="session-B"
-            onSend={(text, media) => sends.push({ session: "B", media })}
+            onSend={(text, media) => { sends.push({ session: "B", media }); }}
             onUpload={onUpload}
           />,
         ),
@@ -76,7 +76,7 @@ describe("FQ-03 Composer attachments follow draft owner", () => {
         wrap(
           <Composer
             draftKey="session-A"
-            onSend={(text, media) => sends.push({ session: "A", media })}
+            onSend={(text, media) => { sends.push({ session: "A", media }); }}
             onUpload={onUpload}
           />,
         ),
@@ -98,7 +98,7 @@ describe("FQ-03 Composer attachments follow draft owner", () => {
       wrap(
         <Composer
           draftKey="session-A"
-          onSend={(text, media) => sends.push({ session: "A", media })}
+          onSend={(text, media) => { sends.push({ session: "A", media }); }}
           onUpload={onUpload}
         />,
       ),
@@ -114,7 +114,7 @@ describe("FQ-03 Composer attachments follow draft owner", () => {
         wrap(
           <Composer
             draftKey="session-B"
-            onSend={(text, media) => sends.push({ session: "B", media })}
+            onSend={(text, media) => { sends.push({ session: "B", media }); }}
             onUpload={onUpload}
           />,
         ),

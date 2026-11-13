@@ -326,6 +326,15 @@ describe("errorLabel / stripMarkdown", () => {
     expect(errorLabel("model_authority_unavailable")).toBe("模型服务暂时不可用");
     expect(errorLabel("model_catalog_unavailable")).toBe("模型服务暂时不可用");
   });
+  test("INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE: historical unavailable copy stays neutral about capacity", () => {
+    const presented = errorPresentation("model_not_available", undefined,
+      "Selected model is at capacity. Please try a different model.");
+    expect(presented.title).toBe("模型暂不可用");
+    expect(presented.message).toBe(friendlyBridgeErrorMessage("model_not_available"));
+    expect(presented.message).toContain("（可能是上游满载，也可能已下架或未对你的账号开通）");
+    expect(presented.message).not.toMatch(/(?:模型|该模型)已(?:经)?(?:退役|下架|停用)/);
+    expect(presented.message).toContain("请在上方切换一个模型后重发");
+  });
   test("存量 MODEL_AUTHORITY_INVALID 会脱敏，但无账务证据时不谎报免单/站内信", () => {
     const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"},"request_id":"9cad8ad4bf74b7050694873e6ab16b01"}';
     const presented = errorPresentation("ENGINE_ERROR", raw, raw);
@@ -480,6 +489,246 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
     expect(p.bodyText).toBeUndefined();
     expect(p.message).toContain("内部错误");
     expect(JSON.stringify(p)).not.toContain("API Error");
+  });
+
+  test("OCV5-620: BOX_REPLAY_PENDING → 软收尾文案,保留部分回答,不粉红硬失败", () => {
+    const detail =
+      'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
+    const p = errorPresentation(
+      "engine_error",
+      "博客大纲已写完，正在排版。\n\n[turn failed: BOX_REPLAY_PENDING]",
+      detail,
+    );
+    expect(p.title).toBe("结果正在收尾");
+    expect(p.message).toContain("不会重复扣费");
+    expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+    expect(JSON.stringify(p)).not.toContain("任务执行失败");
+  });
+});
+
+describe("sealed failure tape skips BOX_REPLAY_PENDING soft copy", () => {
+  const detail =
+    'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
+  const partial = "博客大纲已写完，正在排版。\n\n[turn failed: BOX_REPLAY_PENDING]";
+  const sealed = { turnTapeComplete: true as const, dispatchOutcome: "crashed" };
+
+  test("sealed crashed ENGINE_ERROR keeps the partial answer and the engine_error card", () => {
+    const p = errorPresentation("ENGINE_ERROR", partial, detail, false, sealed);
+    expect(p.title).toBe(errorLabel("engine_error"));
+    expect(p.title).not.toBe("结果正在收尾");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("engine_error"));
+    expect(p.message).not.toMatch(/仍在确认|稍后刷新|不会重复扣费/);
+    expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+    expect(p.waived).toBe(false);
+  });
+
+  test("executed_error, not_accepted, and mixed-case crashed also skip the soft card", () => {
+    for (const dispatchOutcome of ["executed_error", "not_accepted", "CRASHED"]) {
+      const p = errorPresentation("ENGINE_ERROR", partial, detail, false, {
+        turnTapeComplete: true,
+        dispatchOutcome,
+      });
+      expect(p.title).toBe("任务执行失败");
+      expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+      expect(p.waived).toBe(false);
+    }
+  });
+
+  test("missing outcome, an open tape, or a non-error outcome stays on the soft card", () => {
+    const contexts = [
+      undefined,
+      {},
+      { turnTapeComplete: true },
+      { dispatchOutcome: "crashed" },
+      { turnTapeComplete: false, dispatchOutcome: "crashed" },
+      { turnTapeComplete: true, dispatchOutcome: "running" },
+      { turnTapeComplete: true, dispatchOutcome: "completed" },
+      { turnTapeComplete: true, dispatchOutcome: "interrupted" },
+    ];
+    for (const context of contexts) {
+      const p = errorPresentation("ENGINE_ERROR", partial, detail, false, context);
+      expect(p.title).toBe("结果正在收尾");
+      expect(p.message).toContain("不会重复扣费");
+      expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+      expect(p.waived).toBe(false);
+    }
+  });
+
+  test("a sealed crash with an empty body is only the failure card", () => {
+    const p = errorPresentation("ENGINE_ERROR", "", detail, false, sealed);
+    expect(p.title).toBe("任务执行失败");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("engine_error"));
+    expect(p.message).not.toMatch(/仍在确认|稍后刷新|不会重复扣费|完整结果/);
+    expect(p.bodyText).toBeUndefined();
+    expect(p.waived).toBe(false);
+  });
+
+  test("waiverApplied does not turn a sealed engine_error into a waived card", () => {
+    const p = errorPresentation("ENGINE_ERROR", partial, detail, true, sealed);
+    expect(p.waived).toBe(false);
+    expect(p.title).toBe("任务执行失败");
+  });
+});
+
+describe("OCV5-645 失败轮部分回答按整体结构判断内部串", () => {
+  const T = "\n\n[turn failed: BOX_REPLAY_PENDING]";
+  const pending = 'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
+  // btd-02:长任务最终答复的常见写法,旧的全文子串判断丢掉了后四种。
+  const answers = [
+    "博客大纲已写完，正在排版。",
+    '已修好接口，返回示例：\n```json\n{ "status": "ok", "code": 0 }\n```',
+    "[README.md](./README.md) 已更新，共改 3 处。",
+    "根因在 at handler (src/api.ts:42) 的空指针，已修。",
+    "上游偶发 API Error 已加重试。",
+  ];
+
+  test("结果正在收尾:带 JSON / 栈帧引用 / 链接开头的答复仍作 bodyText", () => {
+    for (const answer of answers) {
+      const p = errorPresentation("engine_error", answer + T, pending);
+      expect(p.title).toBe("结果正在收尾");
+      expect(p.bodyText).toBe(answer);
+      expect(p.detail).toBeUndefined();
+    }
+  });
+
+  test("engine_error:同样的答复不再整段换成内部错误卡", () => {
+    for (const answer of answers) {
+      const p = errorPresentation("engine_error", `${answer}\n\n[turn failed: upstream disconnected]`, undefined);
+      expect(p.bodyText).toBe(answer);
+      expect(p.message).toBe(friendlyBridgeErrorMessage("engine_error"));
+    }
+  });
+
+  test("尾部 CCB API Error 信封切掉,不进正文", () => {
+    const p = errorPresentation("engine_error", `第一步已完成。\n\n${pending}${T}`, pending);
+    expect(p.bodyText).toBe("第一步已完成。");
+    expect(JSON.stringify(p)).not.toContain("previous Box call");
+  });
+
+  test("整段是 JSON / API Error 信封 / 堆栈时仍不外泄", () => {
+    const overloaded = 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+    for (const raw of [
+      overloaded,
+      `${overloaded}\n\n[turn failed: upstream disconnected]`,
+      '{\n  "error": {\n    "type": "overloaded_error"\n  }\n}',
+      "TypeError: Cannot read properties of undefined (reading 'id')\n    at run (/srv/app.js:1:2)\n    at /srv/main.js:9:1",
+      // Codex r1:无状态码的信封、异步栈帧
+      'API Error: {"error":{"message":"overloaded_error internal diagnostic"}}\n\n[turn failed: upstream disconnected]',
+      "TypeError: fetch failed\n    at async Promise.all (index 0)\n    at run (/srv/app.js:1:2)\n\n[turn failed: upstream disconnected]",
+      // 前面有一句话也不行:代码块之外有一行以内部标记开头,整段仍按内部串处理(同基线)
+      "请求失败：\n    at TLSWrap.onStreamRead (node:internal/stream_base_commons:217:20) {\n  errno: -104,\n  code: 'ECONNRESET'\n}",
+    ]) {
+      const p = errorPresentation("engine_error", raw, raw);
+      expect(p.bodyText).toBeUndefined();
+      expect(p.message).toContain("内部错误");
+      expect(JSON.stringify(p)).not.toMatch(/overloaded_error|Cannot read|fetch failed|srv\/app|ECONNRESET/);
+    }
+    const soft = errorPresentation("engine_error", `${pending}${T}`, pending);
+    expect(soft.title).toBe("结果正在收尾");
+    expect(soft.bodyText).toBeUndefined();
+    expect(JSON.stringify(soft)).not.toContain("previous Box call");
+  });
+});
+
+
+describe("大请求完整资料错误", () => {
+  const old = "Request too large (max 20MB). Try with a smaller file.";
+  test("旧ENGINE_ERROR与新分类都不把固定英文当作回答", () => {
+    for (const code of ["ENGINE_ERROR", "request_too_large"]) {
+      const shown = errorPresentation(code, old, old);
+      expect(shown.title).toBe("资料暂未处理完成");
+      expect(shown.message).toContain("文件和对话均已保留");
+      expect(shown.bodyText).toBeUndefined();
+      expect(JSON.stringify(shown)).not.toContain("Request too large");
+      expect(JSON.stringify(shown)).not.toContain("内部错误");
+      expect(shown.waived).toBe(false);
+    }
+  });
+  test("保留此前真实回答，只去掉末尾固定诊断", () => {
+    const shown = errorPresentation("request_too_large", `已完成的分析。\n${old}`, undefined);
+    expect(shown.bodyText).toBe("已完成的分析。");
+    expect(shown.message).toContain("文件和对话均已保留");
+  });
+  test("已产生的合法回答不会因错误详情含413而丢失", () => {
+    const shown = errorPresentation("request_too_large", "这是已完成的分析。", old);
+    expect(shown.bodyText).toBe("这是已完成的分析。");
+    expect(shown.detail).toBeUndefined();
+  });
+});
+
+describe("legacy size card compatibility stays exact", () => {
+  const diagnostic = "Request too large (max 20MB). Try with a smaller file.";
+  test("only a complete legacy SDK diagnostic changes presentation semantics", () => {
+    expect(isLegacyRequestTooLargeDiagnostic("ENGINE_ERROR", diagnostic)).toBe(true);
+    expect(isLegacyRequestTooLargeDiagnostic(undefined, diagnostic)).toBe(false);
+    expect(isLegacyRequestTooLargeDiagnostic("upstream_failed", diagnostic)).toBe(false);
+    expect(isLegacyRequestTooLargeDiagnostic("ENGINE_ERROR", `真实部分回答\n${diagnostic}`)).toBe(false);
+    expect(isLegacyRequestTooLargeDiagnostic("ENGINE_ERROR", "普通旧错误内容")).toBe(false);
+  });
+  test("cached diagnostic details expose only the original request ID", () => {
+    const requestId = "60760760760760760760760760760760";
+    const view = errorPresentation("request_too_large", diagnostic, `${diagnostic} request id: ${requestId}`);
+    expect(view.title).toBe("资料暂未处理完成");
+    expect(view.bodyText).toBeUndefined();
+    expect(view.detail).toBe(`请求 ID：${requestId}`);
+  });
+});
+
+describe("引擎/路由内部码不外露(t1049u)", () => {
+  const raw = "ANTIGRAVITY_PROMPT_TOO_LARGE: 371964 bytes > 307200";
+
+  test("旧 tape:Antigravity 超限 ENGINE_ERROR 原文 → 上下文超限人话,原文不进正文/详情", () => {
+    const p = errorPresentation("ENGINE_ERROR", raw, raw);
+    expect(p.title).toBe("会话内容超出模型上限");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("context_too_long"));
+    expect(p.bodyText).toBeUndefined();
+    expect(p.detail).toBeUndefined();
+    expect(JSON.stringify(p)).not.toMatch(/ANTIGRAVITY|bytes|307200/);
+  });
+
+  test("新 tape:context_too_long + 原文 detail → 详情只留请求 ID", () => {
+    const requestId = "0123456789abcdef0123456789abcdef";
+    const p = errorPresentation("context_too_long", "", `${raw} request id: ${requestId}`);
+    expect(p.title).toBe("会话内容超出模型上限");
+    expect(p.detail).toBe(`请求 ID：${requestId}`);
+  });
+
+  test("其它适配器内部码(无正文失败轮,text == detail)→ 通用人话,不当部分回答", () => {
+    for (const code of [
+      "CURSOR_SAND_SESSION_EXPIRED",
+      "MODEL_SWITCH_IN_PROGRESS: session busy",
+      "Error: GROK_ROUTE_REQUIRED: missing master-owned route",
+      "engine reported an error",
+    ]) {
+      const p = errorPresentation("ENGINE_ERROR", code, code);
+      expect(p.title).toBe("任务执行失败");
+      expect(p.bodyText).toBeUndefined();
+      expect(p.message).toContain("你的消息已保留");
+      expect(p.message).not.toContain(code);
+      if (/_/.test(code)) expect(JSON.stringify(p)).not.toContain(code.replace(/^Error: /, "").split(":")[0]);
+    }
+  });
+
+  test("终止器里夹内部码 → 详情脱敏;纯 prose 终止器仍保留(回归)", () => {
+    const p = errorPresentation("upstream_failed", "[turn failed: ZCODE_RELAY_MISSING]", undefined);
+    expect(p.detail).toBeUndefined();
+    expect(JSON.stringify(p)).not.toContain("ZCODE_RELAY_MISSING");
+    const prose = errorPresentation("upstream_failed", "[turn failed: model overloaded]", undefined);
+    expect(prose.detail).toBe("[turn failed: model overloaded]");
+  });
+
+  test("单行合法部分回答以环境变量名开头或含字节对比 → 仍作 bodyText 保留(Codex r1)", () => {
+    for (const answer of ["OPENAI_API_KEY: 用于配置 API 密钥。", "缓冲区为 4096 bytes > 1024 bytes，所以需要扩容。"]) {
+      const p = errorPresentation("engine_error", answer, "upstream disconnected");
+      expect(p.bodyText).toBe(answer);
+    }
+  });
+
+  test("多行合法部分回答提到环境变量名 → 仍作 bodyText 保留", () => {
+    const answer = "先设置 OPENAI_API_KEY:\n然后重启服务。";
+    const p = errorPresentation("engine_error", answer, "CURSOR_SAND_DOWNSTREAM_CLOSED");
+    expect(p.bodyText).toBe(answer);
+    expect(p.detail).toBeUndefined();
   });
 
   test("OCV5-620: BOX_REPLAY_PENDING → 软收尾文案,保留部分回答,不粉红硬失败", () => {

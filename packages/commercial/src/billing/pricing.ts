@@ -20,7 +20,8 @@
 
 import { Client } from "pg";
 import { isModelAvailable } from "./modelAvailability.js";
-import { COST_INDEX_BASELINE_MODEL_ID, isCc5TestModel, costXVsBaseline, isBoxGptWebModel, isBoxGptWebOwnerUid, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { COST_INDEX_BASELINE_MODEL_ID, isCc5TestModel, costXVsBaseline, isBoxGptWebModel, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { isBoxGptWebAllowedUser } from "../cursor/access.js";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 import { CATALOG_CHANNEL } from "./modelCatalog.js";
@@ -429,7 +430,7 @@ export class PricingCache {
         if (!p.enabled || !isModelAvailable(p.model_id)) return false;
         if (isCc5TestModel(p.model_id)) return false; // retired task model, independent of legacy flags
         if (isBoxGptWebModel(p.model_id)) {
-          if (!isBoxGptWebOwnerUid(args.uid)) return false;
+          if (!isBoxGptWebAllowedUser(args.uid)) return false;
           if (!args.grantedModelIds.has(p.model_id)) return false;
         }
         if (args.deniedModelIds?.has(p.model_id)) return false;

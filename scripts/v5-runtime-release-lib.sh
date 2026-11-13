@@ -1339,6 +1339,7 @@ oc_hotcfg_activate_saga() {
       else
         rm -f "$platform_root/current" 2>/dev/null || rb_failed=1
       fi
+      oc_hotcfg_fsync_path "$platform_root" || rb_failed=1
     fi
     _hotcfg_policy_owner || return 86
     if [ "$env_done" = 1 ]; then oc_hotcfg_env_restore_tuple "$env_file" "$snap" || rb_failed=1; fi
