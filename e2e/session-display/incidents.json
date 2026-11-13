@@ -10851,6 +10851,26 @@
           "assertion": "a zero-token crashed first turn continues on the same model without a cost dialog"
         }
       ]
+    },
+    {
+      "id": "INC-20261113-CODEX-LATE-STOP-CLOSURE",
+      "occurredAt": "2026-11-13",
+      "severity": "P1",
+      "symptom": "线程卸载被拒后，真实本地停止证明晚于有界 stop，未执行 admission 未自动释放；迟到证明须完成身份限定清理且不重放模型、不重复计费。",
+      "rootFixCommit": "72cef4a7c18a6d5b876391d7cbf64ebe9e54bbba",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexRemoteAdapterE2E.test.ts",
+          "assertion": "after a late local stop proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-codex-late-stop-proof.sh",
+          "assertion": "a node that refuses the thread unload fences the lane and closes the undispatched admission"
+        }
+      ]
     }
   ]
 }
