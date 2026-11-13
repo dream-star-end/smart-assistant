@@ -46,7 +46,7 @@ function currentHashes(): Record<string, string> {
   return out
 }
 
-test('every platform seed agent keeps the artifact hash pinned for its slug@version', () => {
+test('INC-20261011-GENERAL-ASSISTANT-STALE-MODEL: every platform seed agent keeps the artifact hash pinned for its slug@version', () => {
   const current = currentHashes()
   for (const [key, hash] of Object.entries(current)) {
     const pinned = PINNED[key]
@@ -63,7 +63,7 @@ test('every platform seed agent keeps the artifact hash pinned for its slug@vers
   assert.deepEqual(Object.keys(PINNED).sort(), Object.keys(current).sort(), 'PINNED lists exactly the current seed versions')
 })
 
-test('general-assistant does not pin a model (auto follows the user)', () => {
+test('INC-20261011-GENERAL-ASSISTANT-STALE-MODEL: general-assistant does not pin a model (auto follows the user)', () => {
   const def = PLATFORM_SEED_AGENT_DEFS.find((item) => item.slug === 'general-assistant')
   assert.equal(def?.body.model, 'auto')
 })

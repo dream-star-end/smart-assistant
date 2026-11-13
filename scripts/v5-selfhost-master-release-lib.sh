@@ -1113,6 +1113,13 @@ build_master_release() {
       return 1
     fi
   }
+  master_job_ocv5_376_platform_tool() {
+    mlog "  OCV5-376 platform seed + lazy tool-body retry proofs @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+      mlog "pinned OCV5-376 platform/tool proofs 失败"
+      return 1
+    fi
+  }
   master_job_host_log_policy() {
     mlog "  host log policy filesystem/logrotate gate @ pinned staging"
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-host-log-policy.test.sh ); then
@@ -1222,6 +1229,7 @@ build_master_release() {
   for job in \
     D:master_job_frontend \
     C.session-rootfix:master_job_session_rootfix:session-unavailable-rootfix \
+    C.ocv5-376-platform-tool:master_job_ocv5_376_platform_tool:ocv5-376-platform-tool \
     C.watch-gate:master_job_watch_gate:watch-gate \
     C.cursor-sand:master_job_cursor_sand \
     C.delegate-billing:master_job_delegate_billing:delegate-billing-requestid \
