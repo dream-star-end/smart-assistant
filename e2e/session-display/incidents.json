@@ -10632,7 +10632,8 @@
       "symptom": "线程卸载被拒后，真实本地停止证明晚于有界 stop，未执行 admission 未自动释放；迟到证明须完成身份限定清理且不重放模型、不重复计费。",
       "rootFixCommit": "72cef4a7",
       "coverageCommits": [
-        "3e73c155"
+        "3e73c155",
+        "cd2f0391"
       ],
       "regressions": [
         {
