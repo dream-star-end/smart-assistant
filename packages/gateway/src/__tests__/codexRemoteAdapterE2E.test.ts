@@ -375,6 +375,14 @@ async function lane(t: TestContext, options: {
       if (await predicate()) return
       await pause(20)
     }
+    // Emit only fixture lifecycle state, never authority envelopes or tool data.
+    const state = relay as unknown as Record<string, unknown>
+    t.diagnostic(JSON.stringify({ label, abandonCauses, relay: {
+      active: state.active, dispatching: state.dispatching, revoked: state.revoked,
+      firstCause: state.firstCause, localStopped: state.localStopped,
+      stopping: Boolean(state.stopping), admitting: Boolean(state.admitting),
+      hasFinanceTurn: Boolean(state.financeTurn),
+    } }))
     assert.fail(`timed out waiting for ${label}`)
   }
   t.after(async () => {
