@@ -154,10 +154,12 @@ describe("check:v5:fast 不得削弱 CI", () => {
     // 全量链直接 npm run 数；新增门必须同时进 CI 与 check:v5（OCV5-119 加了 check:test-retries，
     // OCV5-548 加了 test:kernel，OCV5-607 加了 test:ccb:box-context，首屏预算加了 build:web-react）。
     const runs = pkg.scripts["check:v5"].match(/\bnpm run \S+/g) ?? [];
-    assert.equal(runs.length, 23, `check:v5 应为 23 个直接步骤,实际 ${runs.length}: ${runs.join(" , ")}`);
+    assert.equal(runs.length, 24, `check:v5 应为 24 个直接步骤,实际 ${runs.length}: ${runs.join(" , ")}`);
     assert.ok(pkg.scripts["check:v5"].includes("check:test-retries"), "check:v5 必须含 check:test-retries");
     assert.ok(pkg.scripts["check:v5"].includes("npm run test:kernel"), "check:v5 必须含 test:kernel");
     assert.ok(pkg.scripts["check:v5"].includes("npm run test:ccb:box-context"), "check:v5 必须含 test:ccb:box-context");
+    assert.ok(runs.includes("npm run build:gateway-test-artifacts"), "gateway tests require actual CCB/MCP artifacts");
+    assert.ok(runs.indexOf("npm run build:gateway-test-artifacts") < runs.indexOf("npm run test:gateway"));
     assert.ok(runs.includes("npm run build:web-react"), "check:v5 必须含生产构建首屏预算门 build:web-react");
   });
 

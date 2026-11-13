@@ -36,6 +36,7 @@ const CLIENT_IP = "203.0.113.10";
 const fp = { jwtSecret: JWT_SECRET, remoteIp: PROXY_IP, clientIp: CLIENT_IP, userAgent: UA };
 
 let pgAvailable = false;
+let registrationNetwork = 0;
 let resetAuthRows: (() => Promise<void>) | undefined;
 
 class NullMailer implements Mailer {
@@ -83,7 +84,7 @@ const isInvalid = (e: unknown) => e instanceof RefreshError && e.code === "INVAL
 async function staleChain(label: string, opts: { remember?: boolean; clientIp?: string | null } = {}) {
   const email = `sec-${label}@example.com`;
   const bound = opts.clientIp === undefined ? fp : { ...fp, clientIp: opts.clientIp };
-  await register({ email, password: PASSWORD, turnstile_token: "tok" }, { mailer: new NullMailer(), turnstileBypass: true, remoteIp: CLIENT_IP });
+  await register({ email, password: PASSWORD, turnstile_token: "tok" }, { mailer: new NullMailer(), turnstileBypass: true, remoteIp: `198.18.${++registrationNetwork}.1` });
   const x = await login(
     { email, password: PASSWORD, turnstile_token: "tok", ...(opts.remember === undefined ? {} : { remember: opts.remember }) },
     { ...bound, turnstileBypass: true },

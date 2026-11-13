@@ -59,7 +59,7 @@ function emptyLiveFrames() {
   };
 }
 
-function startFixture({ defaultMode = "solo" } = {}) {
+function startFixture({ defaultMode = "solo", holdFinals = false } = {}) {
   const sessions = new Map();
   const goals = new Map();
   const sessionCollab = new Map();
@@ -341,7 +341,12 @@ function startFixture({ defaultMode = "solo" } = {}) {
         }
         if (f.content?.displayText === "继续" && !f.content?.recovery) {
           send({ ...base, frameSeq: ++seq,
-            blocks: [{ kind: "text", text: "ADVISOR_TASK_CONTINUED" }], isFinal: true });
+            blocks: [{ kind: "text", text: "ADVISOR_TASK_CONTINUED" }], isFinal: !holdFinals });
+          if (holdFinals) {
+            const finalSeq = ++seq;
+            assert.equal(pendingFinals.has(clientMessageId), false);
+            pendingFinals.set(clientMessageId, () => send({ ...base, frameSeq: finalSeq, blocks: [], isFinal: true }));
+          }
           return;
         }
         seq += 1;
@@ -379,9 +384,9 @@ function startFixture({ defaultMode = "solo" } = {}) {
         });
         const finalSeq = (seq += 1);
         assert.equal(pendingFinals.has(clientMessageId), false, "each actual inbound owns one final release");
-        pendingFinals.set(clientMessageId, () => {
-          send({ ...base, frameSeq: finalSeq, blocks: [], isFinal: true });
-        });
+        const finish = () => send({ ...base, frameSeq: finalSeq, blocks: [], isFinal: true });
+        if (holdFinals) pendingFinals.set(clientMessageId, finish);
+        else finish();
       }
     });
   });
@@ -483,7 +488,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     logLevel: "error",
   });
   const js = bundle.outputFiles[0].text;
-  const { http, inbounds, pendingFinals, releaseFinal } = startFixture();
+  const { http, inbounds, pendingFinals, releaseFinal } = startFixture({ holdFinals: true });
   await new Promise((done) => http.listen(0, "127.0.0.1", done));
   const origin = `http://127.0.0.1:${http.address().port}`;
   let browser;
