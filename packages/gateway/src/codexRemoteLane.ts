@@ -407,14 +407,16 @@ export class CodexRemoteLane {
   private async buildTools(generation: LaneGeneration): Promise<Cc5ToolCatalog> {
     const host: LaneToolHost = generation.host ?? await this.startHost(generation)
     generation.host = host
-    if (!this.catalog) {
-      try {
-        this.bindCatalog(compileCc5ToolCatalog(await host.tools()))
-      } catch (error) {
-        await host.close()
-        generation.host = undefined
-        throw error
-      }
+    try {
+      // The catalog is lane-owned, readiness is not: every new supervisor must
+      // finish its real handshake before this generation can admit a turn.
+      // Otherwise a fast refused resume can SIGTERM it before stop handlers exist.
+      const tools = await host.tools()
+      if (!this.catalog) this.bindCatalog(compileCc5ToolCatalog(tools))
+    } catch (error) {
+      await host.close()
+      generation.host = undefined
+      throw error
     }
     codexNeed(this.catalog !== undefined, 'CODEX_TOOL_CATALOG_UNAVAILABLE')
     return this.catalog
