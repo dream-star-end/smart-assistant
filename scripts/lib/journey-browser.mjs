@@ -101,7 +101,7 @@ export async function settleJourneyGoalTurn(page, { goalMarker, timeout = 20_000
     // One browser task samples all identities and controls. Locator isEnabled()
     // would wait for an old label if the goal naturally ends between queries.
     const state = await page.evaluate((marker) => {
-      const visible = (el) => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== "hidden");
+      const visible = (el) => !!(el?.getClientRects().length && getComputedStyle(el).visibility !== "hidden");
       const rows = [...document.querySelectorAll('[data-testid="user-row"]')].filter((el) => el.textContent.includes(marker));
       if (rows.length > 1) return { error: "Ambiguous journey goal user-row" };
       if (rows.length !== 1 || !visible(rows[0])) return { pending: true };
