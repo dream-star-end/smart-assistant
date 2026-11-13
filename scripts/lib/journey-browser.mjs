@@ -81,3 +81,45 @@ export async function waitJourneyUserRow(page, { marker, modelLabel, timeout = 2
     await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining())));
   }
 }
+
+// J3 deliberately starts a goal turn. Clearing the goal does not stop that turn:
+// settle this test-owned turn before J4, without treating queued text as delivery.
+export async function settleJourneyGoalTurn(page, { goalMarker, timeout = 20_000 }) {
+  if (!goalMarker || !Number.isFinite(timeout) || timeout <= 0 || timeout > 20_000) {
+    throw new Error("Invalid journey goal boundary");
+  }
+  const deadline = Date.now() + timeout;
+  const remaining = () => {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error("J3 goal turn did not become sendable before the deadline");
+    return left;
+  };
+  let stopped = false;
+  for (;;) {
+    remaining();
+    const rows = page.getByTestId("user-row").filter({ hasText: goalMarker });
+    const count = await rows.count();
+    if (count > 1) throw new Error("Ambiguous journey goal user-row");
+    if (count === 1 && await rows.isVisible()) {
+      if (await page.getByRole("dialog").count()) throw new Error("Unexpected journey goal dialog");
+      if (await page.getByTestId("queued-send-row").count()) throw new Error("Journey goal still has queued messages");
+      const composer = page.getByTestId("composer-shell");
+      if (await composer.count() !== 1 || !await composer.isVisible()) throw new Error("Ambiguous journey composer");
+      const stop = composer.locator('button[data-product-control][aria-label="停止"]');
+      const stopping = composer.locator('button[data-product-control][aria-label="正在停止"]');
+      const send = composer.locator('button[data-product-control][aria-label="发送"]');
+      const stops = await stop.count();
+      const waiters = await stopping.count();
+      const sends = await send.count();
+      if (stops + waiters + sends !== 1) throw new Error("Ambiguous journey composer control");
+      if (stops === 1 && !stopped && await stop.isVisible() && await stop.isEnabled()) {
+        stopped = true;
+        await stop.click({ timeout: remaining() });
+      } else if (sends === 1 && await send.isVisible() && await send.isEnabled()) {
+        remaining();
+        return { stopped };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining())));
+  }
+}
