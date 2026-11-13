@@ -9282,6 +9282,15 @@ wait $!
     const modelApplied = journeySource.indexOf('await selectJourneyModel(page, JOURNEY_MODEL_ID')
     const j2 = journeySource.indexOf('await step("J2 ')
     const j4 = journeySource.indexOf('await step("J4 ')
+    const j5 = journeySource.indexOf('await step("J5 ')
+    const j4Body = journeySource.slice(j4, j5)
+    const clicked = j4Body.indexOf('await send.click()')
+    const anchored = j4Body.indexOf('await waitJourneyUserRow(page, { marker, modelLabel: journeyModelLabel, timeout: deadline - Date.now() })')
+    const attachmentCheck = j4Body.indexOf('移除 ${probeName}')
+    assert.ok(clicked >= 0 && anchored > clicked && attachmentCheck > anchored)
+    assert.doesNotMatch(j4Body, /page\.getByText\(marker/)
+    assert.match(journeySource, /journeyModelLabel = await selectJourneyModel/)
+
     assert.match(
       journeySource,
       /getByRole\("button", \{ name: "添加附件", exact: true \}\)/,

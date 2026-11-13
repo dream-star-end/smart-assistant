@@ -39,7 +39,7 @@ import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchJourneyBrowser, selectJourneyModel } from "./lib/journey-browser.mjs";
+import { launchJourneyBrowser, selectJourneyModel, waitJourneyUserRow } from "./lib/journey-browser.mjs";
 import { waitJ5Delivered } from "./lib/journey-j5.mjs";
 import { selectJourneyValidation } from "./lib/v5-validation-journey.mjs";
 
@@ -129,6 +129,7 @@ function backendReplyHasProbe(probeToken) {
   }
 }
 let j5Evidence = null;
+let journeyModelLabel = "";
 
 function fatal(code, msg) {
   console.error(`e2e-journey: ${msg}`);
@@ -329,7 +330,7 @@ try {
 
     // 走真实模型选择器固定本轮模型，不直接改 storage/API。触发器回显菜单项的权威
     // display_name 才算选择生效；模型缺失、降级禁选或 UI 状态未更新都会 fail-loud。
-    await selectJourneyModel(page, JOURNEY_MODEL_ID, { timeout: STEP_TIMEOUT });
+    journeyModelLabel = await selectJourneyModel(page, JOURNEY_MODEL_ID, { timeout: STEP_TIMEOUT });
   });
 
   const probeName = `e2e-journey-${Date.now().toString(36)}.txt`;
@@ -405,8 +406,9 @@ try {
       await new Promise((r) => setTimeout(r, 200));
     }
     await send.click();
-    // .first():模型回复若复读 marker 会出现第二个匹配,strict 单元素断言会误报。
-    await page.getByText(marker, { exact: false }).first().waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    // A cost dialog is a real required UI action, not a completed send. Only
+    // our chat user-row anchors J4; sidebar/composer text cannot prove admission.
+    await waitJourneyUserRow(page, { marker, modelLabel: journeyModelLabel, timeout: deadline - Date.now() });
     if ((await page.getByRole("button", { name: `移除 ${probeName}` }).count()) > 0) {
       throw new Error("发送后附件区未清空");
     }
