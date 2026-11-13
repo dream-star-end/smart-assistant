@@ -1373,6 +1373,12 @@ build_master_release() {
   fi
   cleanup_master_gate_tmpdir
 
+  # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
+  if ! ( cd "$staging" && bash scripts/check-v5-codex-late-stop-proof.sh ); then
+    cleanup_master_staging
+    die "pinned Codex late-stop closure proof failed"
+  fi
+
   tsum_mark P.mcp-bundle 2>/dev/null || :
   # openclaude-memory MCP server 预编译 CJS(dist/ 被 gitignore,git archive 不带产物,
   # 必须在 staging 构建;缺产物则引擎回落 tsx ~7s 冷启动路径,故 fail-loud)。

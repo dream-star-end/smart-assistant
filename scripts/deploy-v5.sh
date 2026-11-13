@@ -4265,6 +4265,13 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # Real remote relay + UID-local ToolHost, rebuilt only from this pinned archive.
+  if ! (cd "$box_cand" && bash scripts/check-v5-codex-late-stop-proof.sh); then
+    echo "✗ pinned Codex late-stop closure proof failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # check-v5-box-incident-proofs.ts stays named here so the deploy-gate ledger
   # still sees it. The runner transpiles that file once before main()'s 120s
   # deadline. Do not switch this back to npx tsx and do not raise LIMIT_MS.
