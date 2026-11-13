@@ -10,6 +10,7 @@ SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '60s';
 
 -- sync-section: 0319_commercial_muse_billing
+-- compat: All new billing fields are nullable; legacy Muse inserts omit them and keep NULL, without any quote or charge.
 ALTER TABLE muse_media_jobs
   -- The quote at admission: open jobs' quotes are summed for the balance check across both A/B slots.
   ADD COLUMN IF NOT EXISTS price_credits BIGINT CHECK (price_credits IS NULL OR price_credits >= 0),
@@ -19,18 +20,23 @@ ALTER TABLE muse_media_jobs
   ADD COLUMN IF NOT EXISTS ledger_id BIGINT REFERENCES credit_ledger(id) ON DELETE SET NULL;
 
 -- Only a succeeded job is ever charged.
+-- compat: Replace the charge guard in this same transaction; no billing data is updated and all old NULL-cost rows stay valid.
 ALTER TABLE muse_media_jobs DROP CONSTRAINT IF EXISTS muse_media_jobs_charge_only_succeeded;
+-- compat: NULL cost remains valid for every old status; only succeeded jobs may carry a cost. Legacy writes are unchanged.
 ALTER TABLE muse_media_jobs ADD CONSTRAINT muse_media_jobs_charge_only_succeeded
   CHECK (cost_credits IS NULL OR status = 'succeeded');
 
 -- Site-wide daily counts (OC_MUSE_GLOBAL_*_PER_DAY).
 CREATE INDEX IF NOT EXISTS muse_media_jobs_kind_queued_idx ON muse_media_jobs (kind, queued_at DESC);
 
+-- compat: Transactional replacement only; the next CHECK retains all legacy reasons and adds the approved new reasons without editing rows.
 ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS credit_ledger_reason_check;
+-- compat: Strict superset of existing reason encodings; old readers and writers keep their existing values and no balances or ledger rows are changed.
 ALTER TABLE credit_ledger ADD CONSTRAINT credit_ledger_reason_check CHECK (reason IN (
   'topup','chat','agent_chat','agent_subscription','refund','admin_adjust','promotion',
   'minimax_media','image_generation','subscription','subscription_expire','pack','muse_media'
 )) NOT VALID;
+-- compat: Validate the widened CHECK against existing rows; all legacy reason values remain accepted and invalid reasons remain rejected.
 ALTER TABLE credit_ledger VALIDATE CONSTRAINT credit_ledger_reason_check;
 -- end-sync-section: 0319_commercial_muse_billing
 
@@ -253,12 +259,15 @@ CREATE TABLE IF NOT EXISTS studio_charges (
   UNIQUE (user_id, request_id)
 );
 
+-- compat: Transactional replacement only; the next CHECK retains all legacy reasons and adds the approved new reasons without editing rows.
 ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS credit_ledger_reason_check;
+-- compat: Strict superset of existing reason encodings; old readers and writers keep their existing values and no balances or ledger rows are changed.
 ALTER TABLE credit_ledger ADD CONSTRAINT credit_ledger_reason_check CHECK (reason IN (
   'topup','chat','agent_chat','agent_subscription','refund','admin_adjust','promotion',
   'minimax_media','image_generation','subscription','subscription_expire','pack','muse_media',
   'media_studio'
 )) NOT VALID;
+-- compat: Validate the widened CHECK against existing rows; all legacy reason values remain accepted and invalid reasons remain rejected.
 ALTER TABLE credit_ledger VALIDATE CONSTRAINT credit_ledger_reason_check;
 -- end-sync-section: 0324_media_studio
 

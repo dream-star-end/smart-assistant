@@ -198,7 +198,7 @@ describe('buildPromptContext literature slot ordering', () => {
     // provider='codex-native',保证本 gate 对 codex engine 恒命中。
     setLiteratureSkillProvider(async () => ({
       name: 'SKILLS_LITERATURE',
-      content: '# 平台技能: 文献检索',
+      content: '# 平台技能: 文献检索 LITERATURE_PROVIDER_PRIVATE_SENTINEL',
     }))
     const result = await buildPromptContext({
       agentId: 'nonexistent-agent-for-test',
@@ -210,7 +210,7 @@ describe('buildPromptContext literature slot ordering', () => {
       false,
       'codex-native must NOT receive SKILLS_LITERATURE slot',
     )
-    assert.equal(result.content.includes('文献检索'), false)
+    assert.equal(result.content.includes('LITERATURE_PROVIDER_PRIVATE_SENTINEL'), false)
   })
 
   it('CCB providers (claude-subscription / minimax) 仍然注入 SKILLS_LITERATURE', async () => {
