@@ -2692,7 +2692,7 @@ export function App() {
           key={activeId ?? "demo"}
           fallback={
             <aside className="flex shrink-0 flex-col items-center gap-3 border-l border-border p-4" style={{ width: paneWidth.width }}>
-              <span role="status" className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</span>
+              <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
               <Button variant="ghost" onClick={() => setPaneOpen(false)}>关闭详情面板</Button>
             </aside>
           }
@@ -2730,7 +2730,7 @@ export function App() {
               key={activeId ?? "demo"}
               fallback={
                 <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-4">
-                  <span role="status" className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</span>
+                  <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
                   <Button variant="ghost" onClick={() => setPaneSheetOpen(false)}>关闭详情面板</Button>
                 </div>
               }

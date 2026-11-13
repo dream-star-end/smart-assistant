@@ -1242,7 +1242,7 @@ async function attachAdmissionRestartSnapshot(client: PoolClient, sessionId: str
     if (!deferred) throw new Error("admission snapshot payload conflict");
     messages[index] = { ...deferred, _seq: hot._seq, _orderSeq: hot._orderSeq };
   }
-  await client.query(`UPDATE client_sessions SET messages=$3 WHERE id=$1 AND user_id=$2`,
+  await client.query('UPDATE client_sessions SET messages=$3 WHERE id=$1 AND user_id=$2',
     [sessionId, userId, escapeNulInSessionMessagesJson(JSON.stringify(messages))]);
 }
 

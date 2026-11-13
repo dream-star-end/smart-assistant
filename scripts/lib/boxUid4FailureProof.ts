@@ -18,7 +18,9 @@ function fail(message: string): never { throw new Error(`[uid4-box-proof] ${mess
 // and the next message is admitted. The spool is the capture from the Box.
 export async function proveUpstreamRefusal(ctx: Uid4BoxProofContext): Promise<string> {
   const { api, db, money, prechecked, boxHost, spoolOf, cliInit, codeOf, journalRow, must } = ctx;
-  const MODEL = ctx.model, CLI_MODEL = ctx.upstreamModel, FINAL_ANSWER = ctx.finalAnswer;
+  const MODEL = ctx.model;
+  const CLI_MODEL = ctx.upstreamModel;
+  const FINAL_ANSWER = ctx.finalAnswer;
   const who = { uid: 900_000_321n, containerId: 321n, sessionId: "session-upstream-refusal" };
   const journal = api.journal(db);
   await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'upstream-refusal@test.invalid','unused',10000)",
@@ -83,7 +85,8 @@ export async function proveUpstreamRefusal(ctx: Uid4BoxProofContext): Promise<st
 export async function proveUid4FirstFailurePreserved(ctx: Uid4BoxProofContext): Promise<string> {
   const { api, db, boxHost, prechecked, journalRow, money, must, codeOf, spoolOf, cliInit } = ctx;
   const who = { uid: 900_001_102n, containerId: 1102n, sessionId: "uid4-first-failure-proof" };
-  const requestId = "uid4-first-failure-proof", turnKey = "a1".repeat(32);
+  const requestId = "uid4-first-failure-proof";
+  const turnKey = "a1".repeat(32);
   const journal = api.journal(db);
   await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'uid4-first-failure@test.invalid','unused',10000)",
     [who.uid.toString()]);
@@ -142,12 +145,15 @@ export async function proveUid4FirstFailurePreserved(ctx: Uid4BoxProofContext): 
 export async function proveUid4StoppedWorkerConverges(ctx: Uid4BoxProofContext): Promise<string> {
   const { api, db, boxHost, prechecked, journalRow, money, must, spoolOf, cliInit } = ctx;
   const who = { uid: 900_001_103n, containerId: 1103n, sessionId: "uid4-worker-terminal-proof" };
-  const requestId = "uid4-worker-terminal-proof", turnKey = "a2".repeat(32), journal = api.journal(db);
+  const requestId = "uid4-worker-terminal-proof";
+  const turnKey = "a2".repeat(32);
+  const journal = api.journal(db);
   await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'uid4-worker-terminal@test.invalid','unused',10000)",
     [who.uid.toString()]);
   const beforeMoney = await money(db, who.uid);
   await prechecked(api, db, { ...who, requestId, turnKey });
-  let stops = 0, unknowns = 0;
+  let stops = 0;
+  let unknowns = 0;
   const host = boxHost(api, spoolOf([cliInit]), {
     spoolRead: (call) => { if (call === 2) host.clearSpool(); },
     proofRead: () => {},

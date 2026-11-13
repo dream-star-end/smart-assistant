@@ -54,12 +54,12 @@ async function fixture(ttlSeconds: number) {
   const laneMarker = path.join(dir, 'mutation-lane-inflight')
   const envFile = path.join(dir, 'v5.env')
   const fixtureUrl = 'postgresql://test:test@127.0.0.1:55432/openclaude_test'
-  await writeFile(envFile, [
+  await writeFile(envFile, `${[
     `DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
     `MODEL_AUTHORITY_DEPLOY_DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
     `MODEL_CATALOG_ADMIN_DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
     `OC_EGRESS_SECRET=${JSON.stringify('e'.repeat(32))}`,
-  ].join('\n') + '\n', { mode: 0o600 })
+  ].join('\n')}\n`, { mode: 0o600 })
   return {
     dir,
     lock,

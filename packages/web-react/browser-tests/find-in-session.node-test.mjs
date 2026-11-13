@@ -364,11 +364,11 @@ async function installPendingCancelObserver(page) {
       }
       const top = toolbar && toolbar !== s ? toolbar.getBoundingClientRect().bottom : view.top;
       const style = getComputedStyle(s);
-      const borderLeft = parseFloat(style.borderLeftWidth) || 0;
-      const borderRight = parseFloat(style.borderRightWidth) || 0;
+      const borderLeft = Number.parseFloat(style.borderLeftWidth) || 0;
+      const borderRight = Number.parseFloat(style.borderRightWidth) || 0;
       const gutter = s.offsetWidth - s.clientWidth - borderLeft - borderRight;
       const thumbHeight = s.clientHeight * s.clientHeight / s.scrollHeight;
-      const thumbTop = view.top + (parseFloat(style.borderTopWidth) || 0)
+      const thumbTop = view.top + (Number.parseFloat(style.borderTopWidth) || 0)
         + (s.clientHeight - thumbHeight) * s.scrollTop / (s.scrollHeight - s.clientHeight);
       window.__findPendingCancelEvents.push({
         type: event.type, trusted: event.isTrusted, deltaY: event.deltaY,
@@ -399,12 +399,12 @@ async function cancelPendingWithRealInput(page, events, kind) {
     const point = await page.getByTestId("find-chat-scroll").evaluate((s, mode) => {
       const r = s.getBoundingClientRect();
       const style = getComputedStyle(s);
-      const right = parseFloat(style.borderRightWidth) || 0;
-      const left = parseFloat(style.borderLeftWidth) || 0;
+      const right = Number.parseFloat(style.borderRightWidth) || 0;
+      const left = Number.parseFloat(style.borderLeftWidth) || 0;
       const gutter = s.offsetWidth - s.clientWidth - left - right;
       if (mode === "drag" && gutter <= 0) throw new Error("native scrollbar gutter absent");
       const thumbHeight = s.clientHeight * s.clientHeight / s.scrollHeight;
-      const thumbTop = r.y + (parseFloat(style.borderTopWidth) || 0)
+      const thumbTop = r.y + (Number.parseFloat(style.borderTopWidth) || 0)
         + (s.clientHeight - thumbHeight) * s.scrollTop / (s.scrollHeight - s.clientHeight);
       return { x: mode === "drag" ? r.right - right - gutter / 2 : r.x + r.width / 2,
         y: mode === "drag" ? thumbTop + thumbHeight / 2 : r.y + s.clientHeight * 0.7 };
@@ -439,7 +439,7 @@ async function cancelPendingWithRealInput(page, events, kind) {
     assert.equal(observed.visible, false);
     return { pending, observed }; // Never retry a qualified gesture's business outcome.
   }
-  assert.fail("no trusted " + kind + " reached the actual pending m250 input window");
+  assert.fail(`no trusted ${kind} reached the actual pending m250 input window`);
 }
 
 /** Pending pin without re-holding the synthetic fence. */

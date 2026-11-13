@@ -25,13 +25,13 @@ const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const before = Object.fromEntries(inputs.map(p => [p, hash(readFileSync(p))]));
 const digest = hash(JSON.stringify(before));
 const changes = [];
-const queuedText = "QUEUE_FULL_TEXT_" + "这段待发送的原文需要完整保留。".repeat(12);
-const editedText = "QUEUE_EDITED_FULL_TEXT_" + "修改后的内容只能发送一次。".repeat(9);
+const queuedText = `QUEUE_FULL_TEXT_${"这段待发送的原文需要完整保留。".repeat(12)}`;
+const editedText = `QUEUE_EDITED_FULL_TEXT_${"修改后的内容只能发送一次。".repeat(9)}`;
 
 async function until(label, read, timeout = 15000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { const value = await read(); if (value) return value; await new Promise(done => setTimeout(done, 30)); }
-  throw new Error(label + ": timed out");
+  throw new Error(`${label}: timed out`);
 }
 async function stored(page) {
   return page.evaluate(async id => {
@@ -49,8 +49,9 @@ test("INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before
     b.onLoad({ filter: /\/(App|MessageRenderer)\.tsx$/ }, ({ path }) => {
       const actual = resolve(path);
       if (![appPath, messagePath].includes(actual)) return;
-      let text = readFileSync(actual, "utf8");
-      let needle, replacement;
+      const text = readFileSync(actual, "utf8");
+      let needle;
+      let replacement;
       if (mode === "stream" && actual === appPath) {
         needle = '  const timelineMessages = wsMessages.filter(\n    (message) => message.role !== "user" || message.status !== "queued",\n  );';
         replacement = "  const timelineMessages = wsMessages;";
@@ -80,7 +81,8 @@ test("INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before
     const send=frame=>ws.readyState===1 && ws.send(JSON.stringify(frame));
     send({type:"sys.relay_ready",automaticRecoveryOwner:"master-v1"});
     ws.on("message",raw=>{
-      const frame=JSON.parse(String(raw)),peer={id:BOARD_SESSION,kind:"dm"};
+      const frame=JSON.parse(String(raw));
+      const peer={id:BOARD_SESSION,kind:"dm"};
       if(frame.type==="ping")return send({type:"pong",id:frame.id});
       if(frame.type==="inbound.hello")return send({type:"sys.relay_ready",automaticRecoveryOwner:"master-v1"});
       if(frame.type==="inbound.control.stop"){
@@ -109,11 +111,12 @@ test("INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before
   let browser;
   try{
     browser=await chromium.launch({executablePath:resolveBrowserExecutable(),headless:true,args:["--no-sandbox"]});
-    for(const width of [1280,390])await t.test(width+" queued outside transcript; full edit and stop-terminal-before-dispatch",async()=>{
+    for(const width of [1280,390])await t.test(`${width} queued outside transcript; full edit and stop-terminal-before-dispatch`,async()=>{
       scenario={inbound:[],stops:[],terminal:false,afterTerminal:[],seq:0,first:null,releaseOriginal:null};
       preview.store.board=[];preview.store.older=[];preview.store.revision+=1;
       const context=await browser.newContext({viewport:{width,height:950},isMobile:width===390,hasTouch:width===390});
-      const page=await context.newPage(),errors=[];page.on("pageerror",e=>errors.push(e.message));
+      const page=await context.newPage();
+      const errors=[];page.on("pageerror",e=>errors.push(e.message));
       try{
         await page.goto(preview.url);
         const composer=page.getByPlaceholder(/对话/);
@@ -132,10 +135,14 @@ test("INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before
         const row=list.getByTestId("queued-send-row");
         assert.equal(await row.count(),1);
         assert.equal((await row.locator("p").textContent()).trim(),queuedText);
-        const edit=row.getByRole("button",{name:"修改",exact:true}),now=row.getByRole("button",{name:"立即发送",exact:true});
+        const edit=row.getByRole("button",{name:"修改",exact:true});
+        const now=row.getByRole("button",{name:"立即发送",exact:true});
         assert.equal(await edit.count(),1);assert.equal(await now.count(),1);
         const geometry=await row.evaluate(el=>{
-          const p=el.querySelector("p"),buttons=el.querySelectorAll("button"),list=el.closest('[data-testid="queued-send-list"]'),textarea=document.querySelector("textarea");
+          const p=el.querySelector("p");
+          const buttons=el.querySelectorAll("button");
+          const list=el.closest('[data-testid="queued-send-list"]');
+          const textarea=document.querySelector("textarea");
           const r=x=>{const y=x.getBoundingClientRect();return {top:y.top,bottom:y.bottom,left:y.left,right:y.right,height:y.height};};
           return {p:r(p),buttons:[...buttons].map(r),list:r(list),composer:r(textarea),outsideChatScroller:list.closest(".chat-scroll-area")===null,scrollWidth:document.documentElement.scrollWidth,viewport:innerWidth};
         });

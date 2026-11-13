@@ -23,7 +23,7 @@ const inputs = [...files(resolve(here, "../src")), ...files(here), ...files(join
 const hashes = () => Object.fromEntries(inputs.map(p=>[p,createHash("sha256").update(readFileSync(p)).digest("hex")]));
 const before = hashes();
 const digest = createHash("sha256").update(JSON.stringify(before)).digest("hex");
-async function until(label, fn, timeout=15000) { const end=Date.now()+timeout; while(Date.now()<end) { const value=await fn(); if(value)return value; await new Promise(r=>setTimeout(r,30)); } throw new Error(label+": timeout"); }
+async function until(label, fn, timeout=15000) { const end=Date.now()+timeout; while(Date.now()<end) { const value=await fn(); if(value)return value; await new Promise(r=>setTimeout(r,30)); } throw new Error(`${label}: timeout`); }
 const receipts = [];
 test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callback admission", {timeout:240000}, async t => {
   const assetDir=mkdtempSync(join(tmpdir(),"oc-empty-browser-"));
@@ -33,15 +33,17 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
   writeFileSync(join(assetDir,"styles.css"),readFileSync(join(cssDir,readdirSync(cssDir).find(n=>n.endsWith(".css")))));
   const home=mkdtempSync(join(tmpdir(),"oc-empty-engine-"));
   const child=spawn(process.execPath,["--import","tsx",join(here,"empty-turn-gateway.fixture.ts")],{cwd:root,env:{PATH:process.env.PATH,HOME:home,OPENCLAUDE_HOME:home,LANG:"C.UTF-8"},stdio:["ignore","pipe","pipe"]});
-  let childOut="",childErr="";
+  let childOut="";
+  let childErr="";
   child.stdout.on("data",b=>childOut+=b);child.stderr.on("data",b=>childErr+=b);
-  let preview,browser;
+  let preview;
+  let browser;
   async function control(path,args={}) { const response=await fetch(engine.url+path,{method:"POST",body:JSON.stringify(args)}); const body=await response.json(); assert.equal(response.status,200,JSON.stringify(body));return body; }
   let engine;
   const wires=[];
   const proxies=new Set();
   try {
-    const ready=await until("isolated fixture startup",()=> { if(child.exitCode!==null)throw new Error(childOut+"\n"+childErr); return /OC_EMPTY_READY (\{[^\n]+\})/.exec(childOut+"\n"+childErr)?.[1]; },60000);
+    const ready=await until("isolated fixture startup",()=> { if(child.exitCode!==null)throw new Error(`${childOut}\n${childErr}`); return /OC_EMPTY_READY (\{[^\n]+\})/.exec(`${childOut}\n${childErr}`)?.[1]; },60000);
     engine=JSON.parse(ready);
     assert.equal(engine.tree,resolve(root,"packages"));
     preview=await startPreviewServer(assetDir);
@@ -144,7 +146,8 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
       } finally {closing=true;releaseTerminalReads();await context.close();}
     });
     await t.test("stopped duplicate suppressed while different summary and session scope admit real turns",async()=>{
-      const p1="wsess-0123456789abc101",p2="wsess-0123456789abc102";
+      const p1="wsess-0123456789abc101";
+      const p2="wsess-0123456789abc102";
       for(const peer of [p1,p2])await control("/reset",{peer,mode:"nonempty"});
       const note=(taskId,summary)=>({taskId,status:"stopped",outputFile:"",summary});
       const first=await control("/notify",{peer:p1,notification:note("stopped-1","EMPTY_STOP_SUMMARY_A")});

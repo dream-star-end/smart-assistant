@@ -224,7 +224,8 @@ test("synchronous and rejected diagnostic writes cannot mask the publication fai
 test("a hanging diagnostic write is bounded to 200ms and a late rejection stays observed", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture({ failAt: "pending-read" });
-  let started!: () => void, rejectLate!: (error: Error) => void;
+  let started!: () => void;
+  let rejectLate!: (error: Error) => void;
   const recorded = new Promise<void>((resolve) => { started = resolve; });
   withFailureRecorder(f, () => {
     f.sequence.push("first-failure"); started();

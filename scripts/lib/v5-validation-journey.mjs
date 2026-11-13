@@ -20,7 +20,8 @@ export function selectJourneyValidation(args) {
   }
   const bytes = Buffer.from(encoded, "base64");
   if (bytes.toString("base64") !== encoded) throw new Error("invalid validation scope base64");
-  let text, value;
+  let text;
+  let value;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     value = JSON.parse(text);

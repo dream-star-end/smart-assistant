@@ -19,7 +19,7 @@ const migrationDir = fileURLToPath(new URL("../db/migrations/", import.meta.url)
 const operatorPath = fileURLToPath(new URL("../../../../ops/ocv5-308/history/0283_cursor_gpt56_luna_sand.operator.sql", import.meta.url));
 const version = "0283_cursor_gpt56_luna_sand";
 const efforts = ["low", "medium", "high", "xhigh", "max"];
-const ids = efforts.flatMap(e => ["cursor-gpt-5.6-luna-" + e, "cursor-gpt-5.6-luna-" + e + "-fast"]).sort();
+const ids = efforts.flatMap(e => [`cursor-gpt-5.6-luna-${e}`, `cursor-gpt-5.6-luna-${e}-fast`]).sort();
 
 async function family() {
   const result = await query<Record<string, unknown>>(
@@ -82,7 +82,7 @@ describe("commercial 0283 normal-runner historical representation", () => {
     const before = await assertFamily();
     const oldDir = await mkdtemp(path.join(tmpdir(), "oc-0283-old-dir-"));
     try {
-      for (const f of await readdir(migrationDir)) if (f.endsWith(".sql") && f !== version + ".sql") await symlink(path.join(migrationDir, f), path.join(oldDir, f));
+      for (const f of await readdir(migrationDir)) if (f.endsWith(".sql") && f !== `${version}.sql`) await symlink(path.join(migrationDir, f), path.join(oldDir, f));
       await assert.rejects(runMigrations({dir: oldDir}), e => e instanceof MigrationIntegrityError && /applied migration\(s\) missing from dir: 0283_cursor_gpt56_luna_sand/.test(e.message));
       const result = await runMigrations();
       assert.ok(result.skipped.includes(version));
@@ -100,7 +100,7 @@ describe("commercial 0283 normal-runner historical representation", () => {
     try {
       await client.query("BEGIN");
       assert.equal((await client.query("UPDATE model_pricing SET min_plan_code='lite' WHERE model_id='cursor-gpt-5.6-luna-low'")).rowCount, 1);
-      const sql = await readFile(path.join(migrationDir,version+".sql"),"utf8");
+      const sql = await readFile(path.join(migrationDir,`${version}.sql`),"utf8");
       await assert.rejects(client.query(sql), /semantic drift/);
     } finally { await client.query("ROLLBACK"); client.release(); }
     await assertFamily();

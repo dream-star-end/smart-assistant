@@ -48,7 +48,8 @@ test("mid-stream Box refusal survives the resolved pipe error after headers were
   const f = fixture();
   const key = { uid: 4n, sessionId: "synthetic-session", turnKey: "a".repeat(64),
     model: f.ctx.body.model };
-  let launches = 0, reads = 0;
+  let launches = 0;
+  let reads = 0;
   const error = new BoxCliToolHandoffError("BOX_CLI_UPSTREAM_RATE_LIMITED");
   await runUpstreamRoundTrip({ ...f.ctx,
     onBoxRefusal: (code: string) => {

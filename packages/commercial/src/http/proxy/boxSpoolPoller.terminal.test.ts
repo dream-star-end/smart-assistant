@@ -25,7 +25,7 @@ const proof = (reason: BoxTerminalProof["reason"]): BoxTerminalProof => ({
   cliPid: 102, ...(reason === "worker_failed"
     ? { reason, revision: 2 as const, workerExitCode: 1 }
     : { reason, revision: 1 as const }) });
-const proved = (reason: BoxTerminalProof["reason"]) => result(JSON.stringify(proof(reason)) + "\n");
+const proved = (reason: BoxTerminalProof["reason"]) => result(`${JSON.stringify(proof(reason))}\n`);
 const fake = (handler: (request: Request, options: Options) => Result | Promise<Result>): Exec => ({
   run: async (request, options) => handler(request, options) });
 const poll = (exec: Exec, overrides: Partial<Input> = {}) => pollBoxSpoolLines({
@@ -83,7 +83,7 @@ test("a final appended between empty read and proof is drained from the unchange
 });
 
 test("terminal draining preserves split UTF-8 and fails a trailing partial line rather than ending normally", async () => {
-  const complete = Buffer.from(JSON.stringify({ text: "x".repeat(65_500) + "你好" }) + "\n");
+  const complete = Buffer.from(`${JSON.stringify({ text: `${"x".repeat(65_500)}你好` })}\n`);
   const split = complete.indexOf(Buffer.from("你")) + 1;
   const pieces = [complete.subarray(0, split),
     Buffer.concat([complete.subarray(split), Buffer.from('{"partial":')])];
@@ -120,12 +120,13 @@ test("a cleaned empty stdout beyond the old cursor stops on its strict failure p
 for (const [name, unknown] of [
   ["missing", new BoxExecTransportError("BOX_EXEC_REMOTE_EXIT", true, 1)],
   ["malformed", "{not-json}\n"],
-  ["wrong nonce", JSON.stringify({ ...proof("worker_failed"), runNonce: "d".repeat(24) }) + "\n"],
-  ["wrong epoch", JSON.stringify({ ...proof("worker_failed"), leaseEpoch: "d".repeat(32) }) + "\n"],
+  ["wrong nonce", `${JSON.stringify({ ...proof("worker_failed"), runNonce: "d".repeat(24) })}\n`],
+  ["wrong epoch", `${JSON.stringify({ ...proof("worker_failed"), leaseEpoch: "d".repeat(32) })}\n`],
 ] as const) {
   test(`${name} terminal evidence stays unknown and does not discard later live data`, async () => {
     const bytes = Buffer.from('{"type":"tool_handoff","synthetic":true}\n');
-    let reads = 0, probes = 0;
+    let reads = 0;
+    let probes = 0;
     const exec = fake((request) => {
       if (isSpool(request)) return chunk(request, ++reads < 3 ? Buffer.alloc(0) : bytes);
       probes++;

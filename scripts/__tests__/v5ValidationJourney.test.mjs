@@ -21,7 +21,7 @@ test("default_grok: no scope pins the whole journey despite model environment ov
   process.env.V5_TURN_MODELS = "deepseek-v4-flash";
   try { assert.deepEqual(selectJourneyValidation([]), { model: "grok-build", scope: null }); }
   finally {
-    if (previous === undefined) delete process.env.V5_TURN_MODELS;
+    if (previous === undefined) assert.equal(Reflect.deleteProperty(process.env, "V5_TURN_MODELS"), true);
     else process.env.V5_TURN_MODELS = previous;
   }
 });

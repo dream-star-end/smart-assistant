@@ -42,7 +42,7 @@ async function assertPrepared() {
   const acceptance = await query<{model_id:string;accepted:boolean}>(
     // box-gpt-6-astra-pro (0318, OCV5-575) is a cursor-engine row that never writes an audit row: the chat
     // bridge skips the insert for it (it is not billed), so the audit CHECK need not accept it.
-    "SELECT model_id,("+constraint.expr+") AS accepted FROM (SELECT DISTINCT model_id FROM model_catalog WHERE engine='cursor' AND model_id <> 'box-gpt-6-astra-pro') q ORDER BY model_id");
+    `SELECT model_id,(${constraint.expr}) AS accepted FROM (SELECT DISTINCT model_id FROM model_catalog WHERE engine='cursor' AND model_id <> 'box-gpt-6-astra-pro') q ORDER BY model_id`);
   assert.ok(acceptance.rows.length>30);
   assert.ok(acceptance.rows.every(x=>x.accepted===true),JSON.stringify(acceptance.rows.filter(x=>!x.accepted)));
 }
@@ -63,7 +63,7 @@ describe("0293 commercial prepare new models without activating or changing old 
     await query("UPDATE model_catalog SET state='disabled' WHERE model_id='gpt-6-astra-1m' AND state='active'");
     const seeded = new Map<string,string>();
     for (const [provider,donor] of [["claude","claude-opus-5"],["cursor","cursor-grok-4.6-high"],["grok","grok-build"],["codex","gpt-5.6-sol"]]) {
-      const group=(await query<{id:string}>("INSERT INTO account_groups(label,provider,kind,enabled) VALUES ($1,$2,'official_oauth',TRUE) RETURNING id::text",["OCV5-308 test "+provider,provider])).rows[0]!;
+      const group=(await query<{id:string}>("INSERT INTO account_groups(label,provider,kind,enabled) VALUES ($1,$2,'official_oauth',TRUE) RETURNING id::text",[`OCV5-308 test ${provider}`,provider])).rows[0]!;
       seeded.set(provider,group.id);
       await query("INSERT INTO account_group_models(group_id,model_id) VALUES($1,$2)",[group.id,donor]);
       if(provider==="codex") await query("INSERT INTO account_group_models(group_id,model_id) VALUES($1,'gpt-5.6-luna')",[group.id]);

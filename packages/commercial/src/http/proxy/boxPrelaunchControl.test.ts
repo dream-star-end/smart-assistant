@@ -38,7 +38,7 @@ function waitForLockLine(holder: ReturnType<typeof spawn>): Promise<void> {
       }
     };
     const onError = (error: Error) => finish(error);
-    const onExit = (code: number | null) => finish(new Error("lock holder exited " + code));
+    const onExit = (code: number | null) => finish(new Error(`lock holder exited ${code}`));
     const timer = setTimeout(() => finish(new Error("lock holder did not start")), 2000);
     holder.stdout!.on("data", onData);
     holder.once("error", onError);
@@ -61,7 +61,7 @@ function stopHolder(holder: ReturnType<typeof spawn>, signal: NodeJS.Signals): P
 test("lock receipt accepts real split pipe writes and rejects an invalid full line", async () => {
   for (const [suffix, valid] of [["ed\\n", true], ["ed-invalid\\n", false]] as const) {
     const holder = spawn(process.execPath, ["-e",
-      "process.stdout.write('lock'); process.stdin.once('data', () => process.stdout.write('" + suffix + "')); setTimeout(() => {}, 10000)"],
+      `process.stdout.write('lock'); process.stdin.once('data', () => process.stdout.write('${suffix}')); setTimeout(() => {}, 10000)`],
       { stdio: ["pipe", "pipe", "pipe"] });
     const chunks: string[] = [];
     const advance = (data: Buffer) => {

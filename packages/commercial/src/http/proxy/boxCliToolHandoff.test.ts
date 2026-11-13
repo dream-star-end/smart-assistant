@@ -148,9 +148,9 @@ test("snapshot failures keep their code and expose only bounded structure diagno
 
 test("synthetic refusals preserve the fixed error message and bounded tag diagnostic", () => {
   const decoder = new BoxCliToolHandoffDecoder(model, catalog);
-  assert.throws(() => decoder.push(JSON.stringify({ type: "assistant",
+  assert.throws(() => decoder.push(`${JSON.stringify({ type: "assistant",
     error: "authentication_failed", is_api_error_message: true,
-    message: { model: "<synthetic>", content: [{ type: "text", text: "private API error body" }] } }) + "\n"),
+    message: { model: "<synthetic>", content: [{ type: "text", text: "private API error body" }] } })}\n`),
   (error: unknown) => {
     assert.ok(error instanceof BoxCliToolHandoffError);
     assert.equal(error.message, "BOX_CLI_UPSTREAM_REFUSED");

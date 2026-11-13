@@ -113,7 +113,7 @@ export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: strin
     const next = lineage(source)
     if (!request || !next || next.root !== initialLineage.root || next.attempt !== initialLineage.attempt) return false
     const tapes = await client.query(
-      `SELECT 1 FROM client_session_turn_tapes WHERE session_id=$1 AND user_id=$2 AND client_message_id=$3 LIMIT 1`,
+      'SELECT 1 FROM client_session_turn_tapes WHERE session_id=$1 AND user_id=$2 AND client_message_id=$3 LIMIT 1',
       [row.sessionId, `c:${row.userId}`, row.clientMessageId],
     )
     if (tapes.rowCount) return false
@@ -211,7 +211,7 @@ export async function reconcileAdmissionRestarts(pool: Pool, userId: bigint, lim
   let scheduled = 0
   for (const row of candidates.rows) {
     if (!await recoverAdmissionAfterRestart(pool, row.dispatch_id, deps)) continue
-    const job = await pool.query(`SELECT 1 FROM turn_recovery_jobs WHERE source_turn_key=$1`,
+    const job = await pool.query('SELECT 1 FROM turn_recovery_jobs WHERE source_turn_key=$1',
       [`dispatch:${row.dispatch_id}:${row.attempt_no}`])
     if (job.rowCount) scheduled++
   }

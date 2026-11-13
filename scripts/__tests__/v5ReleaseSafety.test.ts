@@ -100,7 +100,7 @@ describe('core health polling', () => {
     try {
       await writeFile(path.join(dir, 'clock'), '0')
       await writeFile(path.join(dir, 'calls'), '0')
-      for (const [i, body] of bodies.entries()) await writeFile(path.join(dir, 'body-' + (i + 1)), body)
+      for (const [i, body] of bodies.entries()) await writeFile(path.join(dir, `body-${i + 1}`), body)
       return spawnSync('bash', ['-c', `
 set -eu
 source "$CORE_DEPLOY_SCRIPT"
@@ -1333,7 +1333,7 @@ async function manualOsPgTransport(dir: string, bin: string, deployDelaySeconds 
   const config = path.join(dir, 'os-pg-transport-config.json')
   await writeFile(config, JSON.stringify({ dsns, identitySql, deploySql, receipt, deployDelaySeconds }), { mode: 0o600 })
   await writeFile(receipt, JSON.stringify({ events: [] }), { mode: 0o600 })
-  await writeFile(transport, '#!/usr/bin/python3\n' + String.raw`
+  await writeFile(transport, `#!/usr/bin/python3\n${String.raw`
 import fcntl, json, os, sys, time
 from pathlib import Path
 cfg = json.loads(Path(${JSON.stringify(config)}).read_text())
@@ -1380,7 +1380,7 @@ def complete(state):
     sys.stdout.flush()
     record(state, 'completed')
 transact(complete)
-`, { mode: 0o755 })
+`}`, { mode: 0o755 })
   return { dsns, identitySql, deploySql, receipt, transport }
 }
 
@@ -1455,12 +1455,12 @@ async function manualLeaseFixture(options?: ManualPgTransportOptions) {
   const envFile = path.join(dir, 'v5.env')
   const fixtureUrl = 'postgresql://test:test@127.0.0.1:55432/openclaude_test'
   const pgTransport = options ? await manualOsPgTransport(dir, bin, options.deployDelaySeconds) : undefined
-  await writeFile(envFile, [
+  await writeFile(envFile, `${[
     `DATABASE_URL=${JSON.stringify(pgTransport?.dsns.gateway ?? fixtureUrl)}`,
     `MODEL_AUTHORITY_DEPLOY_DATABASE_URL=${JSON.stringify(pgTransport?.dsns.deploy ?? fixtureUrl)}`,
     `MODEL_CATALOG_ADMIN_DATABASE_URL=${JSON.stringify(pgTransport?.dsns.admin ?? fixtureUrl)}`,
     `OC_EGRESS_SECRET=${JSON.stringify('e'.repeat(32))}`,
-  ].join('\n') + '\n', { mode: 0o600 })
+  ].join('\n')}\n`, { mode: 0o600 })
   const envNeedle = 'V5_ENV="/etc/openclaude/commercial-v5.env"'
   assert.equal(source.split(envNeedle).length - 1, 1, 'manual wrapper env path replacement drifted')
   const helperBytes = await readFile(path.join(root, 'scripts/lib/v5-mutation-admission.sh'))

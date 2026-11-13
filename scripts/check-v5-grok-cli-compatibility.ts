@@ -56,7 +56,8 @@ function parseArgs(argv: string[]): string {
   return args[1]!;
 }
 const atLeast = (version: string, minimum: string): boolean => {
-  const a = version.split(".").map(Number), b = minimum.split(".").map(Number);
+  const a = version.split(".").map(Number);
+  const b = minimum.split(".").map(Number);
   for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
   return true;
 };
@@ -64,9 +65,9 @@ const atLeast = (version: string, minimum: string): boolean => {
 /** Stand-ins for the programs the production host runs. Each appends its
  * arguments to calls.log; what it answers is fixed by the capsule's state. */
 const STANDINS: Record<string, string> = {
-  hostname: `echo capsule-host`,
+  hostname: 'echo capsule-host',
   curl: `echo '{"ok":true,"channel":"v5"}'`,
-  npx: `exit 0`,
+  npx: 'exit 0',
   systemctl: `case "$1" in
   is-active) if [[ "$STANDIN_UNIT" == active ]]; then [[ "\${2:-}" == --quiet ]] || echo active; exit 0; fi
     [[ "\${2:-}" == --quiet ]] || echo inactive; exit 3 ;;

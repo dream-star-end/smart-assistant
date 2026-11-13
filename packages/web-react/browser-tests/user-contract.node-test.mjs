@@ -15,7 +15,8 @@ const legacyBlocks = ["  {\n    family: 'gpt-5.6-sol',\n    familyLabel: 'GPT-5.
 async function pickerBundle() {
   const source = await readFile(authorityPath, 'utf8')
   const negative = process.env.OC_LEGACY_CONTEXT_RED === '1'
-  let replacements = 0, bundledSource = source
+  let replacements = 0
+  let bundledSource = source
   const bundle = await build({
     entryPoints: [fileURLToPath(new URL('./user-contract-harness.tsx', import.meta.url))],
     bundle: true,
@@ -50,7 +51,7 @@ async function pickerBundle() {
   })
   assert.equal(replacements, negative ? 3 : 0)
   assert.equal(await readFile(authorityPath, 'utf8'), source, 'in-memory negative control leaves authority unchanged')
-  console.log('legacy-context-evidence ' + JSON.stringify({ negative, replacements, sourceSha: sha(source), bundledSha: sha(bundledSource) }))
+  console.log(`legacy-context-evidence ${JSON.stringify({ negative, replacements, sourceSha: sha(source), bundledSha: sha(bundledSource) })}`)
   return bundle
 }
 test('R2 real collapsed picker selects exact model (shared deployment helper)', async () => {

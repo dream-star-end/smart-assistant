@@ -17,12 +17,12 @@ globalThis.fetch = ((input: any, init: any) => {
   assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname), "fixture network must remain loopback");
   return nativeFetch(input, init);
 }) as typeof fetch;
-process.stderr.write("OC_EMPTY_STAGE before-storage "+Date.now()+"\n");
+process.stderr.write(`OC_EMPTY_STAGE before-storage ${Date.now()}\n`);
 const storage = await import("../../storage/src/index.js");
-process.stderr.write("OC_EMPTY_STAGE before-gateway "+Date.now()+"\n");
+process.stderr.write(`OC_EMPTY_STAGE before-gateway ${Date.now()}\n`);
 const { Gateway } = await import("../../gateway/src/server.js");
 const gatewayRequire = createRequire(new URL("../../gateway/src/server.js", import.meta.url));
-const aliases = Object.fromEntries(["storage","protocol"].map(name => { const path=realpathSync(gatewayRequire.resolve("@openclaude/"+name)); assert.ok(path.startsWith(realpathSync(join(import.meta.dirname,"../.."))+"/"), "gateway alias must use this scratch source"); return [name,{path,sha256:createHash("sha256").update(readFileSync(path)).digest("hex")}]; }));
+const aliases = Object.fromEntries(["storage","protocol"].map(name => { const path=realpathSync(gatewayRequire.resolve(`@openclaude/${name}`)); assert.ok(path.startsWith(`${realpathSync(join(import.meta.dirname,"../.."))}/`), "gateway alias must use this scratch source"); return [name,{path,sha256:createHash("sha256").update(readFileSync(path)).digest("hex")}]; }));
 assert.equal((await import("@openclaude/storage")).getClientSession, storage.getClientSession, "fixture and Gateway storage must be the same module instance");
 const { CcbAdapter } = await import("../../gateway/src/engine/ccbAdapter.js");
 const { setV3MasterSinkSingleton } = await import("../../gateway/src/v3MasterSink.js");
@@ -33,11 +33,11 @@ const agent = { id: "main", model: "glm-5.2" };
 const agentsConfig = { agents: [agent], default: "main", routes: [] };
 await storage.writeAgentsConfig(agentsConfig);
 const config: any = { version: 1, gateway: { bind: "127.0.0.1", port: 0, accessToken: "proof-only" }, auth: { mode: "subscription", claudeCodePath: "/NONEXISTENT-NO-ENGINE-MAY-SPAWN" }, defaults: { model: "glm-5.2", permissionMode: "bypassPermissions" }, sessions: { dbPath: join(home, "sessions.db") }, channels: { webchat: { enabled: true } } };
-process.stderr.write("OC_EMPTY_STAGE before-constructor "+Date.now()+"\n");
+process.stderr.write(`OC_EMPTY_STAGE before-constructor ${Date.now()}\n`);
 const gateway: any = new Gateway({ config, agentsConfig });
 const sessions = gateway.sessions;
 assert.equal(sessions.constructor, (await import("../../gateway/src/sessionManager.js")).SessionManager, "actual Gateway owns this exact SessionManager module");
-const consumers=Object.fromEntries(["sessionManager","ccbLocalAgentCallback"].map(name=>{const path=realpathSync(fileURLToPath(new URL("../../gateway/src/"+name+".ts",import.meta.url)));return [name,{path,sha256:createHash("sha256").update(readFileSync(path)).digest("hex")}];}));
+const consumers=Object.fromEntries(["sessionManager","ccbLocalAgentCallback"].map(name=>{const path=realpathSync(fileURLToPath(new URL(`../../gateway/src/${name}.ts`,import.meta.url)));return [name,{path,sha256:createHash("sha256").update(readFileSync(path)).digest("hex")}];}));
 const payloads: any[] = [];
 const durableFile = join(home, "terminal-payloads.json");
 setV3MasterSinkSingleton({
@@ -158,8 +158,8 @@ wss.on("connection", ws => {
 await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
 const sqlite = await (await import("../../storage/src/sessionsDb.js")).getSessionsDb();
 const databaseFiles = sqlite.pragma("database_list") as Array<{file:string}>;
-assert.ok(databaseFiles.some(row=>row.file.startsWith(home+"/")), "real SQLite must be within exclusive fixture HOME");
-console.log("OC_EMPTY_READY " + JSON.stringify({ aliases, consumers, databaseFiles, url: "http://127.0.0.1:" + (server.address() as any).port, tree: realpathSync(join(import.meta.dirname, "../..")) }));
+assert.ok(databaseFiles.some(row=>row.file.startsWith(`${home}/`)), "real SQLite must be within exclusive fixture HOME");
+console.log(`OC_EMPTY_READY ${JSON.stringify({ aliases, consumers, databaseFiles, url: `http://127.0.0.1:${(server.address() as any).port}`, tree: realpathSync(join(import.meta.dirname, "../..")) })}`);
 async function stop() {
   setV3MasterSinkSingleton(null);
   await sessions.shutdownAll();

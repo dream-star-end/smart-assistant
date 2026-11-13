@@ -32,30 +32,14 @@ const SITE = "claudeai.chat";
 function renderText(input: VerifyEmailInput): string {
   const { kind, code, ttlMinutes } = input;
   const tail =
-    `请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n` +
-    `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
-    `   并把 ${BRAND} 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n` +
-    `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n` +
-    `—— ${BRAND} 团队\n` +
-    `${SITE}`;
+    `请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n   并把 ${BRAND} 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n—— ${BRAND} 团队\n${SITE}`;
   if (kind === "register") {
     return (
-      `你好,欢迎使用 ${BRAND}。\n\n` +
-      `这是一封由 ${BRAND}（${SITE}）发出的邮箱验证邮件。你的验证码是:\n\n` +
-      `    ${code}\n\n` +
-      `请在有效期内回到注册页输入此验证码完成验证。\n` +
-      `验证码 ${ttlMinutes} 分钟内有效,一次性使用。若验证码过期,可在注册页点「重新发送」。\n\n` +
-      tail
+      `你好,欢迎使用 ${BRAND}。\n\n这是一封由 ${BRAND}（${SITE}）发出的邮箱验证邮件。你的验证码是:\n\n    ${code}\n\n请在有效期内回到注册页输入此验证码完成验证。\n验证码 ${ttlMinutes} 分钟内有效,一次性使用。若验证码过期,可在注册页点「重新发送」。\n\n${tail}`
     );
   }
   return (
-    `你好,这是一封由 ${BRAND}（${SITE}）发出的邮件。\n\n` +
-    `你的新邮箱验证码是:\n\n` +
-    `    ${code}\n\n` +
-    `请在有效期内回到注册页输入此验证码完成验证。\n` +
-    `验证码 ${ttlMinutes} 分钟内有效,一次性使用。此前发出的旧验证码已作废。\n` +
-    `若验证码过期,可在注册页点「重新发送」。\n\n` +
-    tail
+    `你好,这是一封由 ${BRAND}（${SITE}）发出的邮件。\n\n你的新邮箱验证码是:\n\n    ${code}\n\n请在有效期内回到注册页输入此验证码完成验证。\n验证码 ${ttlMinutes} 分钟内有效,一次性使用。此前发出的旧验证码已作废。\n若验证码过期,可在注册页点「重新发送」。\n\n${tail}`
   );
 }
 
@@ -68,7 +52,7 @@ function renderHtml(input: VerifyEmailInput): string {
   const lead =
     kind === "register"
       ? `欢迎使用 ${BRAND}。请在注册页输入以下验证码，完成邮箱验证。`
-      : `这是你重新获取的验证码，此前发出的旧验证码已作废。`;
+      : '这是你重新获取的验证码，此前发出的旧验证码已作废。';
   const preheader = `你的 ${BRAND} 邮箱验证码，${ttlMinutes} 分钟内有效。`;
   // 字间距让 6 位数字更好抄;最后一位后面的 letter-spacing 用 padding-left 抵消,视觉居中。
   return `<!DOCTYPE html>

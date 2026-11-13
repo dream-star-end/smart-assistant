@@ -37,7 +37,7 @@ const GROK_ROUTE_TOKEN = 'f'.repeat(64)
 const GROK_DESCRIPTOR = {
   canonicalModel: 'grok-build', upstreamModelId: 'grok-4.6',
   billingRequestId: 'a'.repeat(32), executionRevision: 'test-execution-revision',
-  engineSessionId: `oceng-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`,
+  engineSessionId: 'oceng-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
   routeTokenHash: createHash('sha256').update(GROK_ROUTE_TOKEN).digest('hex'),
 }
 

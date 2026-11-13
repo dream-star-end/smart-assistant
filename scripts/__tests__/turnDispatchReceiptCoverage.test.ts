@@ -100,7 +100,7 @@ describe('extracted turn dispatch receipt source guard', () => {
   })
   it('rejects a historical return hidden after an unconditional return', () => {
     const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
-    const before = `export function rejectedDispatchFailureCode(res: { kind: string; userFailureCode?: unknown }): string {\n`
+    const before = 'export function rejectedDispatchFailureCode(res: { kind: string; userFailureCode?: unknown }): string {\n'
     const after = `${before}  return attachmentTotalExceededFailureCode(parsed.totalBytes)\n`
     assert.throws(() => assertRejectedDispatchFailureHelper(mutate(helper, before, after)), pattern)
   })

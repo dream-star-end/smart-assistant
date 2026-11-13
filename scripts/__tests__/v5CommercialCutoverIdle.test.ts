@@ -53,7 +53,8 @@ test('only an exact authoritative never-launched failed proof excludes an unsett
 });
 
 test('two fresh idle snapshots are required after work that starts during the build', async () => {
-  let time = 0, reads = 0;
+  let time = 0;
+  let reads = 0;
   const samples = [false, true, false, true, true];
   await waitForIdle(async () => ({ free: samples[reads++]! }), async ms => { time += ms; }, () => time);
   assert.equal(reads, 5); assert.equal(time, 60_000);

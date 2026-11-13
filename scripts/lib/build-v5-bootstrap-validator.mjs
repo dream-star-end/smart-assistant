@@ -14,5 +14,5 @@ export async function buildBootstrapValidator() {
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const artifact = await buildBootstrapValidator();
-  process.stdout.write(artifact.sha256 + " " + artifact.compressed + "\n");
+  process.stdout.write(`${artifact.sha256} ${artifact.compressed}\n`);
 }

@@ -27,7 +27,8 @@ test("logical new idle-fixture users get fresh signed identities after thirty mi
   const first = mintIdleUserAuthority(privateKey, keyId, model, start);
   const later = start + 31 * 60_000;
   const second = mintIdleUserAuthority(privateKey, keyId, model, later);
-  const a = validPair(first, start), b = validPair(second, later);
+  const a = validPair(first, start);
+  const b = validPair(second, later);
   assert.notEqual(a.authority.authorityTurnId, b.authority.authorityTurnId);
   assert.equal(a.authority.expiresAt - a.authority.issuedAt, AUTHORITY_TTL_MS);
   assert.equal(b.authority.expiresAt - b.authority.issuedAt, AUTHORITY_TTL_MS);
@@ -62,7 +63,8 @@ test("an actually expired old pair is rejected even as a continuation", () => {
 test("separately valid fresh signatures from different user turns cannot be paired", () => {
   const first = mintIdleUserAuthority(privateKey, keyId, model, start);
   const second = mintIdleUserAuthority(privateKey, keyId, model, start);
-  const a = validPair(first, start), b = validPair(second, start);
+  const a = validPair(first, start);
+  const b = validPair(second, start);
   assert.throws(() => assertLeaseMatchesAuthority(a.lease, b.authority),
     (error: unknown) => error instanceof ModelAuthorityError && error.code === "LeaseMismatch");
 });

@@ -159,10 +159,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
         sequence.push("proof-read");
         const reason = options.terminalProof ?? "worker_complete";
-        return { stdout: JSON.stringify({ runNonce: currentNonce,
+        return { stdout: `${JSON.stringify({ runNonce: currentNonce,
           leaseEpoch: currentEpoch, keeperPid: 101, cliPid: 102,
           reason, ...(reason === "worker_failed" ? { revision: 2, workerExitCode: 1 }
-            : { revision: 1 }) }) + "\n",
+            : { revision: 1 }) })}\n`,
         stderrBytes: 0, exitCode: 0 as const };
       }
 
@@ -983,7 +983,7 @@ const syntheticTurnRaw = Buffer.from([records[0], records[1],
   { type: "user", isSynthetic: true, parent_tool_use_id: null,
     message: { role: "user", content: [{ type: "text",
       text: "Output token limit hit. Resume directly" }] } },
-  ...records.slice(2)].map((record) => JSON.stringify(record) + "\n").join(""));
+  ...records.slice(2)].map((record) => `${JSON.stringify(record)}\n`).join(""));
 
 test("INC-20261006 a synthetic CLI turn inside a message is stopped and settled, not left unknown", async () => {
   const f = fixture({ spoolBody: syntheticTurnRaw });
@@ -1279,7 +1279,8 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and 
     assert.equal(input.phase, "first_round");
     events.push("first-failure"); return null;
   };
-  let stops = 0, stopStartedAt = 0;
+  let stops = 0;
+  let stopStartedAt = 0;
   let release!: () => void;
   const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
   try {
@@ -1308,10 +1309,10 @@ test("tool validation first errors survive first-round cleanup and strict termin
   const malformedInput = Buffer.from([records[0], records[1], records[2],
     event({ type: "content_block_delta", index: 0,
       delta: { type: "input_json_delta", partial_json: '{"private-input":' } }),
-    records[5]].map((item) => JSON.stringify(item) + "\n").join(""));
+    records[5]].map((item) => `${JSON.stringify(item)}\n`).join(""));
   const outOfOrder = Buffer.from([records[0], event({ type: "content_block_delta", index: 0,
     delta: { type: "text_delta", text: "private-output" } })]
-    .map((item) => JSON.stringify(item) + "\n").join(""));
+    .map((item) => `${JSON.stringify(item)}\n`).join(""));
   for (const item of [
     { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput },
     { code: "BOX_TOOL_ORDER_INVALID", spoolBody: outOfOrder },

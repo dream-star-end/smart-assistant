@@ -712,7 +712,7 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops once through the bounded echo path and do
   const hung = new Promise<string>((resolve) => { release = () => resolve("pending"); });
   const calls: string[] = [];
   const target = { accountId: 25n,
-    exec: { run: async () => ({ stdout: "clean" + String.fromCharCode(10), stderrBytes: 0, exitCode: 0 as const }) },
+    exec: { run: async () => ({ stdout: `clean${String.fromCharCode(10)}`, stderrBytes: 0, exitCode: 0 as const }) },
     dispose: async () => {} };
   const base = journal() as unknown as Record<string, unknown>;
   const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
