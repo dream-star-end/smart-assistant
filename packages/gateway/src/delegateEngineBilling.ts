@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { freezeGrokExecutionDescriptor, type GrokExecutionDescriptor } from '@openclaude/protocol'
 /**
  * Container gateway → master admit/settle/abandon for engine-reported
  * (codex/grok) delegate billing.
@@ -49,11 +51,13 @@ export interface DelegateEngineBillingAdmitInput {
   sessionKey: string
   parentSessionId?: string
   parentTurnKey?: string
+  grokRouteToken?: string
 }
 
 export interface DelegateEngineBillingAdmission {
   requestId: string
   engineSessionId: string
+  grokExecutionDescriptor?: GrokExecutionDescriptor
   /** Master-issued provider route for any codex admit (advisor or delegate). */
   route?: unknown
 }
@@ -338,6 +342,7 @@ export function createDelegateEngineBillingClient(args?: {
         sessionKey: input.sessionKey,
         ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
         ...(input.parentTurnKey ? { parentTurnKey: input.parentTurnKey } : {}),
+        ...(input.grokRouteToken ? { grokRouteToken: input.grokRouteToken } : {}),
       })
       if (
         typeof result.requestId !== 'string' ||
@@ -347,9 +352,17 @@ export function createDelegateEngineBillingClient(args?: {
       ) {
         throw new Error('DELEGATE_ENGINE_BILLING_ADMISSION_INVALID')
       }
+      const grokExecutionDescriptor = input.engine === 'grok'
+        ? freezeGrokExecutionDescriptor(result.grokExecutionDescriptor as GrokExecutionDescriptor, {
+            canonicalModel: input.model, billingRequestId: result.requestId,
+            engineSessionId: result.engineSessionId,
+            routeTokenHash: createHash('sha256').update(input.grokRouteToken ?? '').digest('hex'),
+          })
+        : undefined
       return {
         requestId: result.requestId,
         engineSessionId: result.engineSessionId,
+        ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}),
         ...(result.route !== undefined ? { route: result.route } : {}),
       }
     },

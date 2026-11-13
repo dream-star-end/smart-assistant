@@ -13,6 +13,7 @@
  *  - 没有投影时**不静默消失**:给一行提示,让模型知道去哪确认。
  */
 import type { LocalCatalogModel } from './modelCatalogClient.js'
+import { isEngineLocalTurnExempt } from './modelAuthority.js'
 
 export const DELEGATE_MODEL_SECTION_HEADING = '## 委派可用型号'
 
@@ -142,10 +143,14 @@ export const DELEGATE_MODEL_SECTION_UNAVAILABLE = [
   '当前拿不到模型 catalog 投影,委派时不要填 `model`(留空用成员绑定型号);显式型号会由服务端校验,填错返回 `DELEGATE_MODEL_UNKNOWN` 并附候选。',
 ].join('\n')
 
-export function renderDelegateModelSection(input: DelegateModelSectionInput): string {
+export function renderDelegateModelSection(
+  input: DelegateModelSectionInput,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const localExempt = isEngineLocalTurnExempt(env)
   const byEngine = new Map<LocalCatalogModel['engine'], string[]>()
   for (const m of input.models) {
-    if (m.available !== true) continue
+    if (m.available !== true || (!localExempt && m.engine !== 'ccb' && m.engine !== 'grok')) continue
     const list = byEngine.get(m.engine) ?? []
     list.push(m.modelId)
     byEngine.set(m.engine, list)
@@ -167,6 +172,9 @@ export function renderDelegateModelSection(input: DelegateModelSectionInput): st
   }
   if (!any) {
     lines.push('- (投影里当前没有可用型号;委派时不要填 `model`)')
+  }
+  if (!localExempt) {
+    lines.push('其它 engine 的型号不能填入委派 model,否则在起进程前返回 `DELEGATE_CODEX_UNSUPPORTED`。')
   }
   return lines.join('\n')
 }

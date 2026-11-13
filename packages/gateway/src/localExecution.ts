@@ -164,7 +164,12 @@ export function decideLocalExecution(args: {
     if (kind === 'prewarm' || kind === 'auto_dream') {
       return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
-    if (kind === 'turn') {
+    // These callers admit master billing before executing locally.
+    if ((kind === 'billed_delegate' && engine === 'grok') ||
+      (kind === 'billed_advisor' && engine === 'codex')) {
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
+    }
+    if (kind === 'turn' || kind === 'billed_delegate' || kind === 'billed_advisor') {
       // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)未开 -> 结构化拒(现状)。
       if (!isEngineLocalTurnExempt(env)) {
         // 无票沿用的会话模型若是 cursor/codex/grok,生产环境不能本地跑 —— 跳过它
@@ -321,7 +326,7 @@ export interface LocalExecutionDecision {
 //      → 保持 fail-closed)同向,只是把"晚期 guard 拒"提前成结构化错误。
 
 /** 本地路径的 turn 语义分类(决定 codex 意图怎么处理,见上方真值表)。 */
-export type LocalTurnKind = 'synthetic' | 'turn' | 'prewarm' | 'auto_dream'
+export type LocalTurnKind = 'synthetic' | 'turn' | 'prewarm' | 'auto_dream' | 'billed_delegate' | 'billed_advisor'
 
 /**
  * 把 agent/config 级模型收敛到平台真实支持的集合。

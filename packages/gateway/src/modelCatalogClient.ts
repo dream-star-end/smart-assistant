@@ -36,7 +36,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { MODEL_CATALOG_EPOCH_PATH, MODEL_CATALOG_PATH } from '@openclaude/protocol'
+import { MODEL_CATALOG_PATH, MODEL_CATALOG_EPOCH_PATH, MODEL_CATALOG_PROJECTION_FORMAT, BOX_NATIVE_CONTEXT_OWNER, isBoxApiModel } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 import { createLogger } from './logger.js'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
@@ -91,6 +91,7 @@ export interface LocalCatalogModel {
   readonly capabilityZero: boolean
   readonly supportsThinking: boolean
   readonly defaultEffort: string | null
+  readonly contextOwner?: typeof BOX_NATIVE_CONTEXT_OWNER
   /** Provider quota/health routing availability; old masters omit it (= true). */
   readonly available: boolean
   /** model_pricing 四维 + multiplier。旧 master / 旧 LKG 可缺席。 */
@@ -108,6 +109,8 @@ export interface LocalCatalogPricing {
 /** 该 uid 的可执行模型投影(master 已按 role/grants 过滤;容器不再自己判可见性)。 */
 export interface LocalCatalogView {
   readonly models: readonly LocalCatalogModel[]
+  /** Actual wire source; omitted on a legacy in-memory view. */
+  readonly projectionFormat?: number
   readonly projectionRevision: string
   readonly availabilityRevision: string
   readonly securityEpoch: string
@@ -388,7 +391,7 @@ export class ModelCatalogClient {
   private async ensureFresh(checkAvailability = false): Promise<LocalCatalogView> {
     const cached = this.snapshot ?? this.loadLkg()
     if (cached) {
-      let state: { epoch: string; availabilityRevision: string }
+      let state: { epoch: string; availabilityRevision: string; projectionFormat: number }
       try {
         state = await this.fetchCatalogState()
       } catch (err) {
@@ -399,7 +402,9 @@ export class ModelCatalogClient {
       }
       if (
         state.epoch === cached.view.securityEpoch &&
-        (!checkAvailability || state.availabilityRevision === cached.view.availabilityRevision)
+        state.projectionFormat === (cached.view.projectionFormat ?? 1) &&
+        (!checkAvailability ||
+          state.availabilityRevision === cached.view.availabilityRevision)
       ) {
         if (!this.pricingUpgradeAttempted && !catalogHasAnyPricing(cached.view)) {
           this.pricingUpgradeAttempted = true
@@ -420,11 +425,23 @@ export class ModelCatalogClient {
         this.snapshot = { view: cached.view, verifiedAt: this.now() }
         return cached.view
       }
+      if (state.projectionFormat !== (cached.view.projectionFormat ?? 1)) {
+        // A full read started before this state probe may still return the old
+        // wire format. Drain it before fetching the newly observed projection.
+        if (this.catalogFetchInflight) await this.catalogFetchInflight.catch(() => {})
+        const current = this.snapshot
+        if (current && current.view !== cached.view &&
+          (current.view.projectionFormat ?? 1) === state.projectionFormat &&
+          current.view.securityEpoch === state.epoch &&
+          (!checkAvailability || current.view.availabilityRevision === state.availabilityRevision)) return current.view
+      }
       this.log('epoch_drift_force_refetch', {
         cached: cached.view.securityEpoch,
         db: state.epoch,
         cachedAvailability: cached.view.availabilityRevision,
         dbAvailability: state.availabilityRevision,
+        cachedFormat: cached.view.projectionFormat ?? 1,
+        dbFormat: state.projectionFormat,
       })
       // 漂移 → 强拉。拉不到 → 拒(下面 fetchCatalog 抛)。
     }
@@ -449,6 +466,7 @@ export class ModelCatalogClient {
   private async fetchCatalogState(): Promise<{
     epoch: string
     availabilityRevision: string
+    projectionFormat: number
   }> {
     const body = await this.getJson(MODEL_CATALOG_EPOCH_PATH)
     const epoch = (body as { epoch?: unknown }).epoch
@@ -458,6 +476,7 @@ export class ModelCatalogClient {
     const availability = (body as { availability_revision?: unknown }).availability_revision
     return {
       epoch,
+      projectionFormat: parseProjectionFormat((body as { projection_format?: unknown }).projection_format),
       availabilityRevision:
         typeof availability === 'string' && availability !== '' ? availability : 'legacy',
     }
@@ -560,6 +579,7 @@ interface WireRow {
   capability_zero: boolean
   supports_thinking: boolean
   default_effort: string | null
+  context_owner?: typeof BOX_NATIVE_CONTEXT_OWNER
   available?: boolean
   input_per_mtok?: string
   output_per_mtok?: string
@@ -569,6 +589,7 @@ interface WireRow {
 }
 
 interface WireResponse {
+  projection_format?: number
   models: WireRow[]
   projection_revision: string
   availability_revision?: string
@@ -589,6 +610,7 @@ function toWire(view: LocalCatalogView): WireResponse {
   const aliases: Record<string, string> = {}
   for (const [alias, canonical] of aliasEntries) aliases[alias] = canonical
   return {
+    projection_format: view.projectionFormat ?? 1,
     models: view.models.map((m) => ({
       model_id: m.modelId,
       display_name: m.displayName,
@@ -600,6 +622,7 @@ function toWire(view: LocalCatalogView): WireResponse {
       capability_zero: m.capabilityZero,
       supports_thinking: m.supportsThinking,
       default_effort: m.defaultEffort,
+      ...(m.contextOwner ? { context_owner: m.contextOwner } : {}),
       available: m.available,
       ...(m.pricing
         ? {
@@ -620,6 +643,14 @@ function toWire(view: LocalCatalogView): WireResponse {
       ? { agent_cost_overrides: Object.fromEntries(view.agentCostOverrides) }
       : {}),
   }
+}
+
+function parseProjectionFormat(raw: unknown): number {
+  if (raw === undefined) return 1
+  if (raw !== 1 && raw !== MODEL_CATALOG_PROJECTION_FORMAT) {
+    throw new ModelCatalogUnavailableError('catalog projection_format unsupported')
+  }
+  return raw
 }
 
 /** fail-closed 解析:任何形状不符 → 抛(宁可拒 turn,也不要拿半个投影去判定)。 */
@@ -652,6 +683,10 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     ) {
       throw new ModelCatalogUnavailableError('catalog row shape invalid')
     }
+    if (r.context_owner !== undefined && (r.context_owner !== BOX_NATIVE_CONTEXT_OWNER ||
+      r.engine !== 'ccb' || r.provider_id !== 'box_cli' || !isBoxApiModel(r.model_id))) {
+      throw new ModelCatalogUnavailableError('catalog row context_owner invalid')
+    }
     const pricing = parseOptionalPricing(r)
     return {
       modelId: r.model_id,
@@ -664,6 +699,7 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
       capabilityZero: r.capability_zero,
       supportsThinking: r.supports_thinking,
       defaultEffort: typeof r.default_effort === 'string' ? r.default_effort : null,
+      ...(r.context_owner ? { contextOwner: r.context_owner } : {}),
       available: r.available !== false,
       ...(pricing ? { pricing } : {}),
     }
@@ -694,6 +730,7 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     aliases.get(modelIdOrAlias) ?? modelIdOrAlias
   return {
     models,
+    projectionFormat: parseProjectionFormat(o.projection_format),
     projectionRevision: o.projection_revision,
     availabilityRevision:
       typeof o.availability_revision === 'string' && o.availability_revision !== ''

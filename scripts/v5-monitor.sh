@@ -772,7 +772,14 @@ fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_
 }
 
 check_serving_masters
-check_service svc_egress openclaude-v5-egress
+# OCV5-391: egress runs as the legacy unit or as one of the blue-green slots.
+egress_state="$(systemctl is-active openclaude-v5-egress 2>&1)"
+for _slot in A B; do
+  [ "$egress_state" = active ] && break
+  [ "$(systemctl is-active "openclaude-v5-egress@$_slot" 2>/dev/null)" = active ] && egress_state=active
+done
+if [ "$egress_state" = active ]; then record svc_egress ok "openclaude-v5-egress active(legacy 或 @A/@B 槽)"
+else record svc_egress bad "openclaude-v5-egress 及 @A/@B 均未 active(legacy 状态=$egress_state)"; fi
 check_http http_egress "$EGRESS_HEALTH_URL" '.ok == true and .role == "egress"'  "egress health"
 check_public_route
 check_disk disk_root /

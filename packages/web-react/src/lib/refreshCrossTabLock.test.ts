@@ -237,4 +237,3 @@ test("BroadcastChannel: release during claim settle does not hang waiter (Codex 
   // CLAIM_WAIT is 60ms; full hang was ~35s. Allow generous headroom under load.
   expect(elapsed).toBeLessThan(3_000);
 });
-

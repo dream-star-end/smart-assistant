@@ -22,7 +22,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { GROK_VISION_PATH } from "@openclaude/protocol";
+import { GROK_VISION_PATH, grokExecutionUpstream } from "@openclaude/protocol";
 import type { Pool } from "pg";
 import type { Dispatcher } from "undici";
 import { request as undiciRequest } from "undici";
@@ -66,6 +66,7 @@ import {
   setSecurityHeaders,
 } from "../http/util.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
+import { readResponses, ResponsesDeltaError, ResponsesStreamError, type ResponsesSource } from "./responsesStream.js";
 
 export { GROK_VISION_PATH };
 export const GROK_VISION_UPSTREAM = "https://cli-chat-proxy.grok.com/v1/responses";
@@ -106,9 +107,8 @@ const VisionRequestSchema = z
 
 type HandlerCtx = { hostUuid: string; boundIp: string };
 
-type UpstreamResponse = {
+type UpstreamResponse = ResponsesSource & {
   statusCode: number;
-  body: { text: () => Promise<string> };
 };
 
 export interface GrokVisionCatalog {
@@ -135,6 +135,7 @@ export interface GrokVisionHandlerDeps {
       dispatcher?: Dispatcher;
       headersTimeout: number;
       bodyTimeout: number;
+      signal?: AbortSignal;
     },
   ) => Promise<UpstreamResponse>;
   recordStatus?: (accountId: bigint, statusCode: number) => Promise<void>;
@@ -202,12 +203,6 @@ function sniffMediaType(buf: Buffer): VisionMediaType | null {
     return "image/webp";
   }
   return null;
-}
-
-/** Selfhost runs grok-build on a single fixed upstream (the grok adapter maps it to the same id). */
-function grokExecutionUpstream(canonicalModel: string, upstream: unknown): string {
-  if (canonicalModel === GROK_VISION_MODEL && upstream === "grok-4.7") return upstream;
-  throw new Error("GROK_VISION_UPSTREAM_INVALID: canonical/upstream mismatch");
 }
 
 export function grokVisionBody(input: {
@@ -367,11 +362,20 @@ export interface GrokRunInput {
   prompt: string;
   image?: { mediaType: VisionMediaType; data: string };
   /**
-   * "user" (default): authorized model, precheck, journal, settle at the grok-build price.
-   * "platform": platform-paid master step (no precheck/journal/ledger). Only reachable from master
-   * code — the HTTP route always uses "user".
+   * Director model for plan, interpret, and visual QA. Absent means grok-build.
+   * The HTTP vision route does not accept this field; that route stays on grok-build.
+   */
+  model?: string;
+  /**
+   * "user" (default): authorized model, precheck, journal, settle at the selected model's price.
+   * "platform": platform-paid master step (no precheck/journal/ledger) that still checks the
+   * user's permission for the selected model. Only reachable from master code — the HTTP route
+   * always uses "user".
    */
   billTo?: "user" | "platform";
+  /** Text-only callers may persist incremental previews; callbacks are awaited in stream order. */
+  onDelta?: (delta: string) => Promise<void>;
+  signal?: AbortSignal;
   /** Called after a successful upstream answer and before settlement (studio persists it first). */
   onResult?: (result: { text: string; usage: GrokVisionUsage; model: string; requestId: string }) => Promise<void>;
   /** Rate-limit key; defaults to the container id, or `studio:<userId>` without a container. */
@@ -398,10 +402,13 @@ export type GrokRunner = (input: GrokRunInput) => Promise<GrokRunResult>;
  * OCV5-591 A2-1b-1: the worst case of one user-billed run (the same estimate its precheck
  * reserves), for the media studio's project budget. null when the catalog cannot price it.
  */
-export async function grokRunMaxCost(catalog: GrokVisionCatalog): Promise<bigint | null> {
+export async function grokRunMaxCost(
+  catalog: GrokVisionCatalog,
+  model: string = GROK_VISION_MODEL,
+): Promise<bigint | null> {
   try {
     const snapshot = await catalog.assertFresh();
-    const pricing = snapshot.billingPricingFor(snapshot.aliasToCanonical(GROK_VISION_MODEL));
+    const pricing = snapshot.billingPricingFor(snapshot.aliasToCanonical(model));
     return pricing ? estimateMaxCost(PRECHECK_TOKEN_ESTIMATE, pricing) : null;
   } catch {
     return null;
@@ -420,13 +427,14 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
   const now = deps.now ?? Date.now;
   const runPreCheck = deps.preCheckWithCostFn ?? preCheckWithCost;
   const runStartJournal = deps.startInflightJournalFn ?? startInflightJournal;
+  const runReadJournal = deps.readJournalForTakeoverFn ?? readJournalForTakeover;
   const runSettle = deps.settleDurableCodexBillingFn ?? settleDurableCodexBilling;
   const runAbort = deps.abortInflightJournalFn ?? abortInflightJournal;
   const runReleasePreCheck = deps.releasePreCheckFn ?? releasePreCheck;
-  const runReadJournal = deps.readJournalForTakeoverFn ?? readJournalForTakeover;
   const baseLog = (deps.logger ?? rootLogger).child({ subsys: "grokVisionProxy" });
 
   return async function run(input: GrokRunInput): Promise<GrokRunResult> {
+    input.signal?.throwIfAborted();
     const reqLog = input.logger ?? baseLog;
     const { userId, containerId } = input;
     const billTo = input.billTo ?? "user";
@@ -464,7 +472,11 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
     } catch {
       throw new GrokRunError(503, "GROK_VISION_CATALOG_UNAVAILABLE", "model catalog unavailable");
     }
-    const canonical = snapshot.aliasToCanonical(GROK_VISION_MODEL);
+    const requested = typeof input.model === "string" ? input.model.trim() : "";
+    if (requested && !/^[A-Za-z0-9._:-]{1,64}$/.test(requested)) {
+      throw new GrokRunError(400, "BAD_BODY", "model id is invalid");
+    }
+    const canonical = snapshot.aliasToCanonical(requested || GROK_VISION_MODEL);
     let upstreamModel: string;
     try {
       const descriptor = snapshot.resolve(canonical);
@@ -479,16 +491,16 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       containerId !== null ? `vision:${userId}:${containerId}` : `studio:${userId}`,
     );
     let abandon: (reason: string) => Promise<void> = async () => {};
+    let scope: ReturnType<typeof scopeFromAuthz>;
+    try {
+      scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
+    } catch {
+      throw new GrokRunError(503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable");
+    }
+    if (!snapshot.canUseModel(scope, canonical)) {
+      throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "this model is not available to this user");
+    }
     if (billTo === "user") {
-      let scope;
-      try {
-        scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
-      } catch {
-        throw new GrokRunError(503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable");
-      }
-      if (!snapshot.canUseModel(scope, canonical)) {
-        throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "vision model is not available to this user");
-      }
       const pricing = snapshot.billingPricingFor(canonical);
       if (!pricing) {
         throw new GrokRunError(503, "GROK_VISION_PRICING_UNAVAILABLE", "vision model pricing unavailable");
@@ -583,28 +595,27 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
         throw new GrokRunError(503, "GROK_VISION_NOT_CONFIGURED", "no active grok account");
       }
       accessToken = await freshToken(accountId);
+      input.signal?.throwIfAborted();
+      const streaming = !input.image && !!input.onDelta;
       const upstream = await requestFn(GROK_VISION_UPSTREAM, {
         method: "POST",
         dispatcher: directEgressDispatcher(),
         headersTimeout: UPSTREAM_TIMEOUT_MS,
         bodyTimeout: UPSTREAM_TIMEOUT_MS,
-        headers: grokVisionHeaders(accessToken, canonical),
+        signal: input.signal,
+        headers: { ...grokVisionHeaders(accessToken, canonical), ...(streaming ? { accept: "text/event-stream" } : {}) },
         body: input.image
           ? grokVisionBody({ upstreamModel, mediaType: input.image.mediaType, data: input.image.data, prompt: input.prompt })
-          : grokTextBody({ upstreamModel, prompt: input.prompt }),
+          : grokTextBody({ upstreamModel, prompt: input.prompt, stream: streaming }),
       });
-      const text = await upstream.body.text();
       void recordStatus(accountId, upstream.statusCode).catch(() => {});
       if (upstream.statusCode >= 400) {
+        await upstream.body.text();
         reqLog.warn("grok_vision_upstream_status", { status: upstream.statusCode });
         throw new GrokRunError(502, "GROK_UPSTREAM_ERROR", "grok vision upstream rejected the request");
       }
-      let json: unknown;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned invalid JSON");
-      }
+      const json = await readResponses(upstream, streaming ? input.onDelta : undefined, input.signal);
+      input.signal?.throwIfAborted();
       answer = textFromGrokVisionResponse(json);
       if (!answer) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no text");
       const metered = usageFromGrokVisionResponse(json);
@@ -612,6 +623,11 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       usage = metered;
     } catch (err) {
       await abandon("grok_vision_upstream_failed");
+      if (err instanceof ResponsesDeltaError) throw err.original;
+      if (input.signal?.aborted) throw err;
+      if (err instanceof ResponsesStreamError) {
+        throw new GrokRunError(502, "GROK_BAD_RESPONSE", err.message);
+      }
       if (err instanceof GrokRunError) {
         reqLog.warn("grok_vision_failed", { code: err.code, status: err.status });
         throw err;
@@ -663,13 +679,7 @@ async function settleGrokRun(
 ): Promise<void> {
   try {
     const outcome = await runSettle(
-      {
-        pgPool: deps.getPool(),
-        preCheckRedis: deps.preCheckRedis,
-        pricing: deps.pricing,
-        logger: reqLog,
-        broadcastToUser: deps.broadcastToUser,
-      },
+      { pgPool: deps.getPool(), preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, logger: reqLog, broadcastToUser: deps.broadcastToUser },
       userId,
       { requestId: frame.requestId, engineSessionId: frame.engineSessionId, status: "success", durationMs: frame.durationMs, usage: frame.usage },
     );
@@ -704,13 +714,14 @@ export async function resettleGrokRun(
 }
 
 /** Text-only Responses body (studio planning / prompt / interpret steps). */
-export function grokTextBody(input: { upstreamModel: string; prompt: string }): string {
+export function grokTextBody(input: { upstreamModel: string; prompt: string; stream?: boolean }): string {
   return JSON.stringify({
     model: input.upstreamModel,
     input: [{ role: "user", content: [{ type: "input_text", text: input.prompt }] }],
     reasoning: { effort: "low" },
     max_output_tokens: MAX_OUTPUT_TOKENS,
     store: false,
+    ...(input.stream ? { stream: true } : {}),
   });
 }
 
@@ -730,7 +741,7 @@ export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHa
       return;
     }
 
-    let verified;
+    let verified: Awaited<ReturnType<typeof verifyContainerIdentity>>;
     try {
       verified = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization);
     } catch (err) {

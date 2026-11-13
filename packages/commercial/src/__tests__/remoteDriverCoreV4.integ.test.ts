@@ -1,3 +1,4 @@
+import { migrationSourceVersion } from "./helpers/migrationSource.js";
 /**
  * Real-PostgreSQL integration suite for `remote-driver-v4` commercial master modules (`OCV5-749`):
  * - `0339_remote_driver_core_v4.sql` schema & v3 -> v4 sticky/thread continuity (`AC-5`)
@@ -333,7 +334,7 @@ before(async () => {
   setPoolOverride(pool)
   await resetAndMigrateBefore('0338')
   const applied = await runMigrations()
-  assert.ok(applied.applied.includes('0339_remote_driver_core_v4'))
+  assert.ok(applied.applied.includes(migrationSourceVersion('0339_remote_driver_core_v4')))
 
   uid = (
     await pool.query(

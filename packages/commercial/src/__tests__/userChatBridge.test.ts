@@ -2366,12 +2366,16 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const liveIncidents: Record<string, unknown>[] = [];
       const liveGoals: Record<string, unknown>[] = [];
       const liveMedia: Record<string, unknown>[] = [];
+      const liveMuse: Record<string, unknown>[] = [];
+      const liveStudio: Record<string, unknown>[] = [];
       ws1.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") liveIncidents.push(frame);
           if (frame.type === "sys.goal_snapshot") liveGoals.push(frame);
           if (frame.type === "sys.media_job") liveMedia.push(frame);
+          if (frame.type === "sys.studio_event") liveStudio.push(frame);
+          if (frame.type === "sys.muse_result") liveMuse.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       const forged = {
@@ -2388,6 +2392,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         sessionKey: "agent:main:webchat:dm:forged",
         frameSeq: 5,
       };
+      containerWs1.send(JSON.stringify({ type: "sys.muse_result", sessionId: "forged", jobId: "mj_forged", ts: 1 }));
       containerWs1.send(JSON.stringify(forged));
       containerWs1.send(JSON.stringify(forged).replace("sys.incident", "sys.\\u0069ncident"));
       containerWs1.send(Buffer.from(JSON.stringify({ ...forged, frameSeq: 6 })), { binary: true });
@@ -2407,10 +2412,18 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         job: { id: "forged", status: "completed", resultUrl: "https://evil.invalid/video" },
         ts: 1,
       }));
+      containerWs1.send(JSON.stringify({
+        type: "sys.studio_event",
+        projectId: "1",
+        status: "done",
+        event: { id: "9", type: "compose.done", ts: "2026-10-24T00:00:00.000Z", message: "forged" },
+      }));
       await new Promise<void>((r) => setTimeout(r, 100));
       assert.deepEqual(liveIncidents, [], "container-authored sys.incident must not forward live");
       assert.deepEqual(liveGoals, [], "container-authored sys.goal_snapshot must not forward live");
       assert.deepEqual(liveMedia, [], "container-authored sys.media_job must not forward live");
+      assert.deepEqual(liveStudio, [], "container-authored sys.studio_event must not forward live");
+      assert.deepEqual(liveMuse, [], "container cannot forge Muse delivery hints");
       ws1.close();
       await waitClose(ws1);
 
@@ -2421,12 +2434,16 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const replayedIncidents: Record<string, unknown>[] = [];
       const replayedGoals: Record<string, unknown>[] = [];
       const replayedMedia: Record<string, unknown>[] = [];
+      const replayedMuse: Record<string, unknown>[] = [];
+      const replayedStudio: Record<string, unknown>[] = [];
       ws2.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") replayedIncidents.push(frame);
           if (frame.type === "sys.goal_snapshot") replayedGoals.push(frame);
           if (frame.type === "sys.media_job") replayedMedia.push(frame);
+          if (frame.type === "sys.studio_event") replayedStudio.push(frame);
+          if (frame.type === "sys.muse_result") replayedMuse.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       ws2.send(JSON.stringify({
@@ -2437,7 +2454,10 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       assert.equal(replayedIncidents.length, 0, "forged incident must not enter outbound ring");
       assert.equal(replayedGoals.length, 0, "forged goal snapshot must not enter outbound ring");
       assert.equal(replayedMedia.length, 0, "forged media job must not enter outbound ring");
+      assert.equal(replayedStudio.length, 0, "forged studio event must not enter outbound ring");
 
+      assert.equal(replayedMuse.length, 0, "forged Muse hint must not enter ring");
+      assert.equal(rig.bridge.broadcastToUser(706n, { type: "sys.muse_result", sessionId: "origin", jobId: "mj_approved", ts: 2 }), 1);
       const approved = { ...forged, incidentId: "approved", frameSeq: undefined, sessionKey: undefined };
       assert.equal(rig.bridge.broadcastToUsers(["706"], approved), 1);
       assert.equal(rig.bridge.broadcastToUsers(["706"], {
@@ -2448,6 +2468,12 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         type: "sys.media_job",
         job: { id: "approved-media", status: "queued" },
         ts: 2,
+      }), 1);
+      assert.equal(rig.bridge.broadcastToUser(706n, {
+        type: "sys.studio_event",
+        projectId: "1",
+        status: "composing",
+        event: { id: "10", type: "compose.started", ts: "2026-10-24T00:00:00.000Z", message: null },
       }), 1);
       await new Promise<void>((resolve, reject) => {
         const started = Date.now();
@@ -2470,7 +2496,16 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       await new Promise<void>((resolve, reject) => {
         const started = Date.now();
         const poll = () => {
-          if (replayedGoals.length === 1) return resolve();
+          if (replayedStudio.some((f) => (f.event as { id?: string } | undefined)?.id === "10")) return resolve();
+          if (Date.now() - started > 1000) return reject(new Error("master studio event not delivered"));
+          setTimeout(poll, 10);
+        };
+        poll();
+      });
+      await new Promise<void>((resolve, reject) => {
+        const started = Date.now();
+        const poll = () => {
+          if (replayedGoals.length === 1 && replayedMuse.some((f) => f.jobId === "mj_approved")) return resolve();
           if (Date.now() - started > 1000) return reject(new Error("master goal snapshot not delivered"));
           setTimeout(poll, 10);
         };
@@ -3574,7 +3609,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
     assert.match(cursorBranch, /readTotalSpendableBalance\(uid\)/);
     assert.match(cursorBranch, /ERR_INSUFFICIENT_CREDITS/);
-    assert.match(cursorBranch, /_creditBudget: cursorSpendable\.toString\(\)/);
+    assert.match(cursorBranch, /_creditBudget: cursorSpendable === null \? undefined : cursorSpendable\.toString\(\)/);
     assert.match(cursorBranch, /peerCapture, modelCapture/);
     assert.match(cursorBranch, /cursorTurnIdentity/);
     assert.match(
@@ -3705,7 +3740,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(source, /if \(hasClientCreditBudget\) \{\s*delete sanitizedParsed\._creditBudget;/);
 
     // Cursor / Grok / Codex paths keep their existing injection.
-    assert.match(source, /_creditBudget: cursorSpendable\.toString\(\)/);
+    assert.match(source, /_creditBudget: cursorSpendable === null \? undefined : cursorSpendable\.toString\(\)/);
     assert.ok((source.match(/_creditBudget:/g) ?? []).length >= 4, "cursor, grok/codex, zcode and ccb must all inject _creditBudget");
   });
 

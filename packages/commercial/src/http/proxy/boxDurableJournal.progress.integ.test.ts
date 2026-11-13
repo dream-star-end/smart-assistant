@@ -1,3 +1,4 @@
+import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../../scripts/lib/testDatabaseIdentity.mjs";
 /** Read-only owner-chain projection. Loopback 55432 / openclaude_test only.
  * Tables are session TEMP; a second connection must not see those rows. */
 import test from "node:test";
@@ -8,6 +9,7 @@ import { consumePrepared } from "./boxPreparedContinuation.js";
 import type { ProxyBody } from "./shared.js";
 
 const url = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+assertTestDatabaseUrl(url);
 const allowed = process.env.TEST_DATABASE_URL === url
   || process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL === url;
 const native = "a3672b03-820a-4834-8d6a-c644d0f0df10";
@@ -23,10 +25,7 @@ test("TEMP owner chain projects prior tool uses and the root native session",
     connectionTimeoutMillis: 4000, statement_timeout: 8000 });
   const client = await pool.connect();
   try {
-    const where = await client.query<{ db: string; port: number }>(
-      "select current_database() as db, inet_server_port() as port");
-    assert.equal(where.rows[0]?.db, "openclaude_test");
-    assert.equal(Number(where.rows[0]?.port), 55432);
+    await assertConnectedTestDatabase(client);
     const publicRel = async () => {
       const rel = await outsider.query<{ rel: string | null }>(
         "SELECT to_regclass('public.request_finalize_journal')::text AS rel");

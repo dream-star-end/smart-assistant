@@ -470,6 +470,42 @@ function errorJson(status: number, code: string, message: string) {
   return json({ error: { code, message } }, status);
 }
 
+// 协作配置（/api/collaboration-config）：按 gateway handleCollaborationConfig 的响应形状回放，
+// 会话级 mode 由 PUT 落地、GET 读回；状态挂在本场景的 sentSessions 上，场景之间互不串。
+type CollabFixtureRow = {
+  mode: "solo" | "advisor" | "team";
+  advisorModel: string | null;
+};
+const COLLAB_FIXTURE_STATE = new WeakMap<
+  object,
+  { rev: number; sessions: Map<string, CollabFixtureRow> }
+>();
+const COLLAB_ADVISOR_MODELS = [
+  { id: "gpt-5.6-terra", label: "GPT-5.6-Terra", engine: "codex" },
+];
+
+function collabFixtureDoc(
+  state: { rev: number; sessions: Map<string, CollabFixtureRow> },
+  sessionId: string | undefined,
+) {
+  const row = sessionId ? state.sessions.get(sessionId) : undefined;
+  const mode = row?.mode ?? "solo";
+  const advisorModel = row?.advisorModel ?? null;
+  return {
+    rev: state.rev,
+    defaultMode: "solo",
+    defaultAdvisorModel: null,
+    session: {
+      mode,
+      advisorModel,
+      configVersion: `tutorial-${mode}-${advisorModel ?? "none"}`,
+      source: row ? "session" : "default",
+    },
+    advisorModels: COLLAB_ADVISOR_MODELS,
+    advisorConsultAllowed: true,
+  };
+}
+
 async function fixtureFor(
   method: string,
   url: URL,
@@ -494,6 +530,32 @@ async function fixtureFor(
       allow_registration: true,
     });
   if (method === "GET" && path === "/api/public/models") return json(MODELS);
+  if (path === "/api/collaboration-config") {
+    let state = COLLAB_FIXTURE_STATE.get(sentSessions);
+    if (!state) {
+      state = { rev: 1, sessions: new Map() };
+      COLLAB_FIXTURE_STATE.set(sentSessions, state);
+    }
+    if (method === "GET")
+      return json(
+        collabFixtureDoc(state, url.searchParams.get("sessionId") ?? undefined),
+      );
+    if (method === "PUT") {
+      const body = JSON.parse(request.postData() || "{}");
+      if (!["solo", "advisor", "team"].includes(body.mode))
+        return errorJson(400, "BAD_REQUEST", "mode must be solo|advisor|team");
+      const sessionId =
+        typeof body.sessionId === "string" ? body.sessionId : undefined;
+      if (sessionId)
+        state.sessions.set(sessionId, {
+          mode: body.mode,
+          advisorModel:
+            body.mode === "advisor" ? (body.advisorModel ?? null) : null,
+        });
+      state.rev += 1;
+      return json(collabFixtureDoc(state, sessionId));
+    }
+  }
   if (method === "POST" && path === "/api/response-rating")
     return json({ ok: true });
   if (method === "GET" && path === "/api/chatgpt-proxy/access")
@@ -2184,6 +2246,8 @@ const SCENARIOS: ScenarioDefinition[] = [
   {
     featureId: "advisor-mode",
     async run(ctx) {
+      // 与 team-mode 用不同的会话作背景：两章终帧都是顶栏状态浮层，同一会话下感知重复。
+      await selectRichSession(ctx);
       await plainClick(ctx, 'header button[data-product-feature="agents"]');
       await assertVisible(
         ctx,
@@ -2443,9 +2507,13 @@ const SCENARIOS: ScenarioDefinition[] = [
   {
     featureId: "billing-usage",
     async run(ctx) {
+      await plainClick(
+        ctx,
+        'aside button[data-product-feature="billing-usage"][aria-label="账号菜单"]',
+      );
       await tracedClick(
         ctx,
-        'aside button[data-product-feature="billing-usage"][aria-label="设置"]',
+        '[role="menuitem"][data-product-feature="billing-usage"]',
         "打开账户与计费",
       );
       await assertVisible(

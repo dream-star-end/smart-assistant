@@ -2,12 +2,21 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 // Real ModelSelector + trusted Chromium clicks. This is NOT a full App/login/live test.
 import { test } from 'node:test'
+import { readFile } from 'node:fs/promises'
+import { cpSync, copyFileSync, readFileSync, symlinkSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { launchJourneyBrowser, selectJourneyModel } from '../../../scripts/lib/journey-browser.mjs'
 const { build } = createRequire(import.meta.url)('esbuild')
-// 93696701d moved the selfhost contract smoke to a visible gpt-6-luna (requireCollapsed: false); after
-// 573b7c88b no selfhost family is collapsed, so the old GPT-5.6 collapsed-group proof had no members (OCV5-355).
-test('R2 real picker selects exact visible model (shared deployment helper)', async () => {
+const authorityPath = fileURLToPath(new URL('../../protocol/src/engineModels.ts', import.meta.url))
+const sha = (text) => createHash('sha256').update(text).digest('hex')
+const legacyBlocks = ["  {\n    family: 'gpt-5.6-sol',\n    familyLabel: 'GPT-5.6-Sol',\n    standardId: 'gpt-5.6-sol',\n    longId: 'gpt-5.6-sol-1m',\n    collapsedByDefault: false,\n  },\n", "  {\n    family: 'gpt-5.6-terra',\n    familyLabel: 'GPT-5.6-Terra',\n    standardId: 'gpt-5.6-terra',\n    longId: 'gpt-5.6-terra-1m',\n    collapsedByDefault: true,\n  },\n", "  {\n    family: 'gpt-5.6-luna',\n    familyLabel: 'GPT-5.6-Luna',\n    standardId: 'gpt-5.6-luna',\n    longId: 'gpt-5.6-luna-1m',\n    collapsedByDefault: true,\n  },\n"]
+async function pickerBundle() {
+  const source = await readFile(authorityPath, 'utf8')
+  const negative = process.env.OC_LEGACY_CONTEXT_RED === '1'
+  let replacements = 0
+  let bundledSource = source
   const bundle = await build({
     entryPoints: [fileURLToPath(new URL('./user-contract-harness.tsx', import.meta.url))],
     bundle: true,
@@ -24,29 +33,75 @@ test('R2 real picker selects exact visible model (shared deployment helper)', as
         new URL('../../protocol/src/index.ts', import.meta.url),
       ),
     },
+    plugins: negative ? [{ name: 'remove-only-commercial-legacy-context', setup(api) {
+      api.onLoad({ filter: /[\/]engineModels\.tsx?$/ }, async ({ path }) => {
+        assert.equal(path, authorityPath)
+        const current = await readFile(path, 'utf8')
+        assert.equal(current, source)
+        bundledSource = current
+        for (const block of legacyBlocks) {
+          assert.equal(bundledSource.split(block).length - 1, 1, 'exactly one restored legacy family')
+          bundledSource = bundledSource.replace(block, '')
+          replacements++
+        }
+        return { contents: bundledSource, loader: 'ts', resolveDir: dirname(path) }
+      })
+    }}] : [],
     define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env.MODE': '"production"' },
   })
+  assert.equal(replacements, negative ? 3 : 0)
+  assert.equal(await readFile(authorityPath, 'utf8'), source, 'in-memory negative control leaves authority unchanged')
+  console.log(`legacy-context-evidence ${JSON.stringify({ negative, replacements, sourceSha: sha(source), bundledSha: sha(bundledSource) })}`)
+  return bundle
+}
+test('R2 real collapsed picker selects exact model (shared deployment helper)', async () => {
+  const bundle = await pickerBundle()
   const browser = await launchJourneyBrowser()
   try {
     const page = await browser.newPage()
     await page.setContent('<html><body><div id="root"></div></body></html>')
     await page.addScriptTag({ content: bundle.outputFiles[0].text })
-    await selectJourneyModel(page, 'gpt-6-luna', { requireCollapsed: false })
-    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-6-luna')
-    assert.equal(await page.locator('[data-collapsed-group]').count(), 0, 'selfhost has no default-collapsed family')
-    // A fresh mount still reaches the same exact row through the shared helper.
+    await selectJourneyModel(page, 'gpt-5.6-luna', { requireCollapsed: true })
+    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-luna')
+    // A new component mount must start collapsed (selected Luna correctly auto-opens on reopen).
     await page.setContent('<html><body><div id="root"></div></body></html>')
     await page.addScriptTag({ content: bundle.outputFiles[0].text })
-    await selectJourneyModel(page, 'gpt-6-luna', { requireCollapsed: false })
-    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-6-luna')
+    await selectJourneyModel(page, 'gpt-5.6-luna', { requireCollapsed: true })
   } finally {
     await browser.close()
   }
 })
 
-import { execFileSync, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { copyFileSync, cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+test('legacy commercial 1M selection requires real cancel or confirmation', async () => {
+  const bundle = await pickerBundle()
+  const browser = await launchJourneyBrowser()
+  try {
+    const page = await browser.newPage()
+    await page.setContent('<html><body><div id="root"></div></body></html>')
+    await page.addScriptTag({ content: bundle.outputFiles[0].text })
+    const selectLong = async () => {
+      await page.getByRole('button', { name: '选择对话模型' }).click()
+      await page.getByRole('menu').waitFor()
+      const long = page.locator('[data-context="1m"]')
+      assert.equal(await long.count(), 1, 'legacy selected family must offer exactly one 1M choice')
+      await long.click()
+      await page.getByRole('dialog').waitFor()
+      assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-sol', 'no selection before consent')
+    }
+    await selectLong()
+    await page.getByRole('button', { name: '保留标准', exact: true }).click()
+    await page.getByRole('dialog').waitFor({ state: 'hidden' })
+    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-sol', 'cancel preserves standard model')
+    await selectLong()
+    await page.getByRole('button', { name: '仍要切换', exact: true }).click()
+    await page.getByRole('dialog').waitFor({ state: 'hidden' })
+    await page.waitForFunction(() => document.querySelector('[data-testid="selected-model"]')?.textContent === 'gpt-5.6-sol-1m')
+    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-sol-1m', 'only confirmation selects long model')
+  } finally { await browser.close() }
+})
+
+import { spawn, execFileSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 // Synthetic HTTP/WS backend: validates the gate runner, not production auth/engine integration.
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -93,9 +148,9 @@ function legacyRunner(dir) {
 }
 const fixtureHtml = (grokEnabled) => `<!doctype html><body><div id="app"><button id="login">登录</button></div>
 <script>
-const app=document.querySelector('#app');let model='glm-5.3',peer=0,ws;
+const app=document.querySelector('#app');let model='gpt-5.6-sol',peer=0,ws;
 document.querySelector('#login').onclick=()=>{app.innerHTML='<form><input type="email"><input type="password"><button>登录</button></form>';document.querySelector('form').onsubmit=async(e)=>{e.preventDefault();if(localStorage.getItem('oc_auth_hint'))throw Error('unexpected hint');await fetch('/api/auth/login',{method:'POST',body:'{}'});localStorage.setItem('oc_auth_hint','1');await fetch('/api/public/models');ws=new WebSocket('ws://'+location.host+'/ws/user-chat-bridge');ws.onmessage=(e)=>{const f=JSON.parse(e.data);if(f.type==='outbound.message'){const row=document.createElement('div');row.dataset.testid='assistant-row';row.innerHTML='<div class="prose"></div>';row.firstChild.textContent=f.text;document.querySelector('#answer').append(row)}};app.innerHTML='<button id="new">新建会话</button><div id="chat"></div>';document.querySelector('#new').onclick=newSession;};};
-function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-6-luna">gpt-6-luna</button>${grokEnabled ? '<button data-model-id="grok-build">grok-build</button>' : ''}<button data-model-id="deepseek-v4-flash">deepseek-v4-flash</button></div>';bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
+function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-6-luna"><span class="truncate">gpt-6-luna</span></button>${grokEnabled ? '<button data-model-id="grok-build"><span class="truncate">grok-build</span></button>' : ''}<button data-model-id="deepseek-v4-flash"><span class="truncate">deepseek-v4-flash</span></button></div>';bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
 function bindModels(){for(const b of document.querySelectorAll('[data-model-id]'))b.onclick=()=>{model=b.dataset.modelId;document.querySelector('#model').textContent=model;document.querySelector('#menu').innerHTML='';};}
 </script>`
 for (const artifact of [false, true, 'legacy'])

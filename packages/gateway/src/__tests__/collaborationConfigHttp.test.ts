@@ -243,12 +243,28 @@ describe('Gateway HTTP collaboration-config ACCESS/default identity', () => {
     })
   })
 
-  it('non-selfhost is 404; non-main session is 400; unknown parent fail-closes advisor PUT; CAS is 409', async () => {
+  it('commercial (no exemption) serves and saves collaboration-config; non-main session is 400; unknown parent fail-closes advisor PUT; CAS is 409', async () => {
     await withServer(async (base) => {
       const access = { authorization: `Bearer ${ACCESS}`, 'content-type': 'application/json' }
       delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
-      const closed = await json(base, 'GET', '/api/collaboration-config', access)
-      assert.equal(closed.status, 404)
+      // OCV5-477: commercial containers used to 404 here, which locked the web mode picker.
+      const open = await json(base, 'GET', '/api/collaboration-config', access)
+      assert.equal(open.status, 200, JSON.stringify(open.body))
+      const teamDefault = await json(base, 'PUT', '/api/collaboration-config', access, {
+        mode: 'team',
+        asDefault: true,
+        expectedRev: open.body.rev,
+      })
+      assert.equal(teamDefault.status, 200, JSON.stringify(teamDefault.body))
+      assert.equal(teamDefault.body.defaultMode, 'team')
+      const reread = await json(base, 'GET', '/api/collaboration-config', access)
+      assert.equal(reread.body.defaultMode, 'team')
+      const back = await json(base, 'PUT', '/api/collaboration-config', access, {
+        mode: 'solo',
+        asDefault: true,
+        expectedRev: reread.body.rev,
+      })
+      assert.equal(back.status, 200)
       process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
 
       const coder = await json(base, 'PUT', '/api/sessions/collabcoder', access, {

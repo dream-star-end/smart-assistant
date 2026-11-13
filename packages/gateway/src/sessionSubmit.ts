@@ -1,3 +1,4 @@
+import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 import { type RemoteExecutionBackend, sameRemoteExecutionBackend } from '@openclaude/protocol'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { isRemoteV4ResumeId, parseRemoteV4ResumeId } from './remotePool/resumeId.js'
@@ -409,6 +410,7 @@ export async function submit(
     codexRoute?: CodexProviderConfigOverride | null
     /** Grok CLI receives only this one-turn opaque loopback relay route. */
     grokRoute?: GrokRouteOverride | null
+    grokExecutionDescriptor?: GrokExecutionDescriptor
     /** Master-authored recovery fence for a first-event silent engine turn.
      * Only Grok currently consumes it; arbitrary client input cannot set it. */
     resetNativeSession?: boolean
@@ -1379,6 +1381,7 @@ export async function submit(
       consumingModelSwitch ? [] : contextOverflowRetryInputs,
       opts?.automaticRetryState,
       consumingModelSwitch ? transition : undefined,
+      opts?.grokExecutionDescriptor,
     )
     try {
       await Promise.race([logicalTurnRun, livenessPromise])

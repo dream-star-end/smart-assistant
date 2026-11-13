@@ -30,6 +30,12 @@ const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 let pgAvailable = false;
+let testIpSeq = 0;
+/** 每次一个新 IP:这里的用例不验同 IP 上限,不让它们互相占名额。 */
+function nextTestIp(): string {
+  testIpSeq += 1;
+  return `198.51.${Math.floor(testIpSeq / 250)}.${(testIpSeq % 250) + 1}`;
+}
 let resetAuthRows: (() => Promise<void>) | undefined;
 
 async function cleanCommercialSchema(): Promise<void> {
@@ -117,7 +123,7 @@ describe("auth.register (integ)", () => {
       },
       {
         mailer,
-        turnstileBypass: true,
+        turnstileBypass: true, remoteIp: nextTestIp(),
         verifyEmailUrlBase: "https://claudeai.chat",
       },
     );
@@ -199,6 +205,9 @@ describe("auth.register (integ)", () => {
     assert.match(mailer.sent[0].text, /不要把验证码转发/, "须提示勿转发验证码");
     assert.match(mailer.sent[0].text, /账号不会被激活/);
     assert.match(mailer.sent[0].text, /—— OpenClaude 团队\nclaudeai\.chat/);
+    // OCV5-363:同时带 HTML 卡片版,验证码与文本版一致。
+    const textCode = mailer.sent[0].text.match(/\n {4}(\d{6})\n/)?.[1] ?? "";
+    assert.ok(mailer.sent[0].html?.includes(`>${textCode}<`), "html 必须含同一个验证码");
     // 邮件正文中的 raw code 不能等于 DB 里的 token_hash(存的是 sha256 hex)
     const code = mailer.sent[0].text.match(/\n {4}(\d{6})\n/)?.[1] ?? "";
     assert.ok(code.length === 6);
@@ -219,7 +228,7 @@ describe("auth.register (integ)", () => {
         turnstile_token: "tok",
         display_name: "  小明同学  ",
       },
-      { mailer, turnstileBypass: true },
+      { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
     );
     const namedRow = await query<{ display_name: string | null }>(
       "SELECT display_name FROM users WHERE id = $1",
@@ -234,7 +243,7 @@ describe("auth.register (integ)", () => {
         turnstile_token: "tok",
         display_name: "   ",
       },
-      { mailer, turnstileBypass: true },
+      { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
     );
     const anonRow = await query<{ display_name: string | null }>(
       "SELECT display_name FROM users WHERE id = $1",
@@ -254,7 +263,7 @@ describe("auth.register (integ)", () => {
           turnstile_token: "tok",
           display_name: "n".repeat(33),
         },
-        { mailer, turnstileBypass: true },
+        { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
       ),
       (err: unknown) => err instanceof RegisterError && err.code === "VALIDATION",
     );
@@ -275,7 +284,7 @@ describe("auth.register (integ)", () => {
         turnstile_token: "ignored-because-bypass",
         terms_version: "2026-07-10",
       },
-      { mailer, turnstileBypass: true, verifyEmailUrlBase: "https://claudeai.chat" },
+      { mailer, turnstileBypass: true, remoteIp: nextTestIp(), verifyEmailUrlBase: "https://claudeai.chat" },
     );
     const withoutTerms = await register(
       {
@@ -283,7 +292,7 @@ describe("auth.register (integ)", () => {
         password: "correct horse battery staple",
         turnstile_token: "ignored-because-bypass",
       },
-      { mailer, turnstileBypass: true, verifyEmailUrlBase: "https://claudeai.chat" },
+      { mailer, turnstileBypass: true, remoteIp: nextTestIp(), verifyEmailUrlBase: "https://claudeai.chat" },
     );
 
     const rows = await query<{ id: string; tv: string | null; ta: string | null }>(
@@ -309,7 +318,7 @@ describe("auth.register (integ)", () => {
         password: "another good one",
         turnstile_token: "tok",
       },
-      { mailer, turnstileBypass: true },
+      { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
     );
     const u = await query<{ email: string }>("SELECT email FROM users");
     assert.equal(u.rows.length, 1);
@@ -325,7 +334,7 @@ describe("auth.register (integ)", () => {
         password: "first password ok",
         turnstile_token: "tok",
       },
-      { mailer, turnstileBypass: true },
+      { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
     );
 
     await assert.rejects(
@@ -335,7 +344,7 @@ describe("auth.register (integ)", () => {
           password: "second password also ok",
           turnstile_token: "tok",
         },
-        { mailer, turnstileBypass: true },
+        { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
       ),
       (err: unknown) =>
         err instanceof RegisterError && err.code === "CONFLICT",
@@ -369,7 +378,7 @@ describe("auth.register (integ)", () => {
           password: "short",
           turnstile_token: "tok",
         },
-        { mailer, turnstileBypass: true },
+        { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
       ),
       (err: unknown) => {
         if (!(err instanceof RegisterError)) return false;
@@ -396,7 +405,7 @@ describe("auth.register (integ)", () => {
           password: "long enough password",
           turnstile_token: "tok",
         },
-        { mailer, turnstileBypass: true },
+        { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
       ),
       (err: unknown) =>
         err instanceof RegisterError &&
@@ -416,7 +425,7 @@ describe("auth.register (integ)", () => {
           password: "reasonable password",
           turnstile_token: "",
         },
-        { mailer, turnstileBypass: true },
+        { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
       ),
       (err: unknown) =>
         err instanceof RegisterError && err.code === "VALIDATION",
@@ -433,7 +442,7 @@ describe("auth.register (integ)", () => {
         password: "yet another password",
         turnstile_token: "tok",
       },
-      { mailer, turnstileBypass: true },
+      { mailer, turnstileBypass: true, remoteIp: nextTestIp() },
     );
     assert.equal(result.verify_email_sent, false);
     const u = await query<{ cnt: string }>(
@@ -466,6 +475,7 @@ describe("auth.register (integ)", () => {
         {
           mailer,
           turnstileBypass: false,
+          remoteIp: nextTestIp(),
           turnstileSecret: "fake-secret",
           fetchImpl,
         },
@@ -500,7 +510,7 @@ describe("auth.register (integ)", () => {
         },
         {
           mailer,
-          turnstileBypass: true,
+          turnstileBypass: true, remoteIp: nextTestIp(),
           emailDomainBlocklist: ["tempmail.test"],
         },
       ),
@@ -523,7 +533,7 @@ describe("auth.register (integ)", () => {
         },
         {
           mailer,
-          turnstileBypass: true,
+          turnstileBypass: true, remoteIp: nextTestIp(),
           emailDomainBlocklist: ["tempmail.test"],
         },
       ),
@@ -544,7 +554,7 @@ describe("auth.register (integ)", () => {
       },
       {
         mailer,
-        turnstileBypass: true,
+        turnstileBypass: true, remoteIp: nextTestIp(),
         emailDomainBlocklist: ["tempmail.test"],
       },
     );
@@ -554,6 +564,78 @@ describe("auth.register (integ)", () => {
 });
 
 // ─── isEmailDomainBlocked 纯函数单元测试(无 DB) ─────────────────────
+describe("auth.register same-IP account cap (integ)", () => {
+  const ip = "203.0.113.7";
+  const registerFrom = (email: string, remoteIp: string | undefined, mailer = new CapturingMailer()) =>
+    register(
+      { email, password: "supersecret", turnstile_token: "tok" },
+      { mailer, turnstileBypass: true, remoteIp },
+    );
+  const countUsers = async (): Promise<number> =>
+    (await query<{ n: number }>("SELECT COUNT(*)::int AS n FROM users")).rows[0].n;
+  const isIpLimit = (err: unknown): boolean =>
+    err instanceof RegisterError && err.code === "IP_REGISTRATION_LIMIT";
+
+  test("0/1/2/3 existing accounts: the first three pass, the fourth is refused without side effects", async (t) => {
+    if (skipIfNoPg(t)) return;
+    for (const n of [1, 2, 3]) {
+      await registerFrom(`cap${n}@example.com`, ip);
+      const stored = await query<{ ip: string }>(
+        "SELECT host(registration_ip) AS ip FROM users WHERE email = $1",
+        [`cap${n}@example.com`],
+      );
+      assert.equal(stored.rows[0].ip, ip);
+    }
+    const mailer = new CapturingMailer();
+    await assert.rejects(registerFrom("cap4@example.com", ip, mailer), isIpLimit);
+    assert.equal(await countUsers(), 3);
+    assert.equal(mailer.sent.length, 0);
+  });
+
+  test("a different IP keeps its own quota", async (t) => {
+    if (skipIfNoPg(t)) return;
+    for (const n of [1, 2, 3]) await registerFrom(`full${n}@example.com`, ip);
+    await registerFrom("other@example.com", "203.0.113.8");
+    assert.equal(await countUsers(), 4);
+  });
+
+  test("legacy rows with NULL registration_ip take no quota", async (t) => {
+    if (skipIfNoPg(t)) return;
+    for (const n of [1, 2, 3, 4]) {
+      await query("INSERT INTO users(email, password_hash) VALUES ($1, 'x')", [`legacy${n}@example.com`]);
+    }
+    for (const n of [1, 2, 3]) await registerFrom(`fresh${n}@example.com`, ip);
+    await assert.rejects(registerFrom("fresh4@example.com", ip), isIpLimit);
+  });
+
+  test("two spellings of one IPv6 address share a quota", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await registerFrom("v6a@example.com", "2001:db8::1");
+    await registerFrom("v6b@example.com", "2001:DB8:0:0::1");
+    await registerFrom("v6c@example.com", "2001:0db8::0001");
+    await assert.rejects(registerFrom("v6d@example.com", "2001:db8::1"), isIpLimit);
+  });
+
+  test("no usable client IP fails closed", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await assert.rejects(registerFrom("noip@example.com", undefined), isIpLimit);
+    await assert.rejects(registerFrom("unknown@example.com", "unknown"), isIpLimit);
+    assert.equal(await countUsers(), 0);
+  });
+
+  test("concurrent registrations from one IP cannot overshoot the cap", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const results = await Promise.allSettled(
+      [1, 2, 3, 4, 5, 6].map((n) => registerFrom(`race${n}@example.com`, ip)),
+    );
+    assert.equal(results.filter((r) => r.status === "fulfilled").length, 3);
+    for (const r of results) {
+      if (r.status === "rejected") assert.ok(isIpLimit(r.reason));
+    }
+    assert.equal(await countUsers(), 3);
+  });
+});
+
 describe("isEmailDomainBlocked", () => {
   test("平台系统主体域名始终保留，不依赖动态黑名单", () => {
     assert.equal(isEmailDomainBlocked("x@system.openclaude", []), true);

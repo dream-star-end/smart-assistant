@@ -7,6 +7,12 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Cc5ToolHost } from '../cc5ToolHost.js'
 
+// Deliberately no model credential or ambient config: this is a tool-only host.
+const credentialFreeCiEnv = (home: string): NodeJS.ProcessEnv => ({
+  HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'),
+  PATH: process.env.PATH, LANG: 'C.UTF-8', CI: 'true',
+})
+
 const NATIVE_SESSION = 'd71e4679-e7df-482a-a129-a998a8f51f7e'
 const identity = (toolUseId: string) => ({
   nativeSessionId: NATIVE_SESSION,
@@ -65,7 +71,7 @@ test(
       mcpConfigPath,
       settingsPath: null,
       disallowedTools: [],
-    })
+    }, undefined, credentialFreeCiEnv(home))
     try {
       const profilePath = join(root, 'host-profile.json')
       assert.equal(statSync(profilePath).mode & 0o777, 0o600)
@@ -204,6 +210,7 @@ test(
           updatedInput: { ...record(record(request).input), answers: { [QUESTION]: ANSWER_LABEL } },
         }
       },
+      credentialFreeCiEnv(home),
     )
     try {
       const tools = await host.tools()

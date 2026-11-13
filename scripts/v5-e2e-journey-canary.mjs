@@ -7,7 +7,7 @@
 //   J1 登录表单形态断言(widget 必须在 + turnstile_bypass 必须 false)+ API 登录种 cookie
 //      (2026-07-26 安全整改:全局旁路改账号级白名单,widget 对 headless 出交互挑战解不了,
 //       故登录本体走 API;表单形态仍被断言,反而多了一条'旁路被偷偷打开'的活体探针)
-//   J2 附件全链:「+」菜单 → 添加附件 → filechooser 真实弹出 → 真实上传 → chip done
+//   J2 附件全链:一级回形针「添加附件」→ filechooser 真实弹出 → 真实上传 → chip done
 //   J3 目标全链:「+」菜单 → 创建目标 → active 可见 → 清除并恢复未设置
 //   J4 带附件发送:消息上屏 + 附件区清空
 //   J5 送达硬断言:失败签名零容忍 + 助手回复完成且最终正文含附件秘密探针
@@ -39,9 +39,17 @@ import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchJourneyBrowser, selectJourneyModel } from "./lib/journey-browser.mjs";
+import { launchJourneyBrowser, selectJourneyModel, waitJourneyUserRow, settleJourneyGoalTurn } from "./lib/journey-browser.mjs";
+import { waitJ5Delivered } from "./lib/journey-j5.mjs";
+import { selectJourneyValidation } from "./lib/v5-validation-journey.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+let journeyValidation;
+try {
+  journeyValidation = selectJourneyValidation(process.argv.slice(2));
+} catch (err) {
+  fatal(2, `validation scope: ${err.message}`);
+}
 
 const SSH_HOST = process.env.V5_E2E_SSH_HOST ?? "kl-mirror";
 const REMOTE_PORT = Number(process.env.V5_E2E_REMOTE_PORT ?? 18790);
@@ -68,19 +76,60 @@ const BOOT_TIMEOUT = 60_000;
 /** J1-J4 的总防挂预算；进入 J5 后改由 TURN_WAIT_TIMEOUT 单独计时。 */
 const PRE_J5_TIMEOUT = 240_000;
 /**
- * 旅程固定使用平台自有的 Codex/Luna 模型。双引擎真 turn 矩阵已经单独验证
+ * 旅程固定使用官方 Grok Build（grok-build）。Codex/Luna 额度耗尽或 catalog disabled 时不能再钉 luna。双引擎真 turn 矩阵已经单独验证
  * CCB/DeepSeek；UI/附件门若继续选择同一个 provider 模型，会在该 provider 被健康
  * 系统降级时卡死在“禁用模型不可点击”，重复前一道模型门并把 J1-J5 误判成前端
  * 回归。固定 Luna 仍通过真实模型选择器和真实 J5 回复验证完整用户路径，同时避免
  * 旅程继承 canary 账号历史会话的粘滞模型。
  */
-const JOURNEY_MODEL_ID = "grok-build";
+// The explicit, bound batch scope selects one model for the entire J1-J5 journey,
+// including the J3 goal auto-start in this same session. Default remains Grok.
+const JOURNEY_MODEL_ID = journeyValidation.model;
+const journeyModelLog = journeyValidation.scope ? ` model=${JOURNEY_MODEL_ID}` : "";
+if (journeyValidation.scope) {
+  console.log(`e2e-journey: Grok journey SKIPPED profile=skip-grok; J1-J5 model=${JOURNEY_MODEL_ID} remains required`);
+}
 /**
  * J5 等一轮真回复的上限。2026-07-28 两次生产慢轮分别在 122.53s / 126.70s
  * 正常 completed，120s 会把真实成功误判成挂起；180s 只扩等待窗，失败签名与附件
  * 探针等成功判据仍保持不变。
  */
 const TURN_WAIT_TIMEOUT = 180_000;
+/**
+ * J5 到 TURN_WAIT_TIMEOUT 仍未判定时的**一次**有界宽限(2026-10-08 冒烟健壮性)。只有后端权威
+ * 证据先成立才给:kl-mirror 上本 canary 的 assistant turn-tape 记录里已出现本次附件秘密探针
+ * (探针随机唯一,不会与并行的双引擎 smoke turn 混淆)。宽限期内 UI 判据一条不放松;收尾即通过但
+ * 打印 `warn slow_ui_settle` 供 v5-smoke-flake-report 统计,仍未收尾照样失败。查不到/查询失败 = 不宽限。
+ */
+const J5_BACKEND_GRACE = 60_000;
+const V5_ENV_PATH = process.env.V5_ENV ?? "/etc/openclaude/commercial-v5.env";
+
+/** 只读核对后端是否已落下含探针的 assistant 回复。返回 { checked, found, detail }。 */
+function backendReplyHasProbe(probeToken) {
+  if (DIRECT_BASE) return { checked: false, found: false, detail: "direct-base mode: no backend access" };
+  if (!/^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$/.test(EMAIL) || !/^OC_ATTACH_[a-z0-9_]+$/.test(probeToken) || !/^\/[A-Za-z0-9._\/-]+$/.test(V5_ENV_PATH)) {
+    return { checked: false, found: false, detail: "refused: unexpected email/probe/env path shape" };
+  }
+  const sql = [
+    "BEGIN READ ONLY;",
+    "SELECT 'n=' || count(*) FROM client_session_turn_tape_model_records r",
+    " WHERE r.user_id = 'c:' || (SELECT id::text FROM users WHERE email = :'email')",
+    "   AND r.role = 'assistant' AND position(:'probe' in r.semantic_text) > 0;",
+    "COMMIT;",
+  ].join("\n");
+  try {
+    const out = execFileSync("ssh", [SSH_HOST,
+      `set -a; . ${V5_ENV_PATH}; set +a; psql "$DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -v email=${EMAIL} -v probe=${probeToken}`],
+      { input: sql, encoding: "utf8", timeout: 20_000, stdio: ["pipe", "pipe", "ignore"] });
+    const m = /^n=(\d+)$/m.exec(out);
+    if (!m) return { checked: false, found: false, detail: "unparseable backend answer" };
+    return { checked: true, found: Number(m[1]) > 0, detail: `assistant tape records with probe: ${m[1]}` };
+  } catch (err) {
+    return { checked: false, found: false, detail: `backend query failed: ${String(err?.message ?? err).split("\n")[0].slice(0, 120)}` };
+  }
+}
+let j5Evidence = null;
+let journeyModelLabel = "";
 
 function fatal(code, msg) {
   console.error(`e2e-journey: ${msg}`);
@@ -182,7 +231,7 @@ let stepName = "init";
 async function step(name, fn) {
   stepName = name;
   await fn();
-  console.log(`e2e-journey: ✓ ${name}`);
+  console.log(`e2e-journey: ✓ ${name}${journeyModelLog}`);
 }
 
 try {
@@ -193,8 +242,11 @@ try {
     // 这一步用 BOOT_TIMEOUT:它是整个门里唯一紧贴"服务刚重启"执行的 UI 等待,
     // 落地页又是 lazy 组件,boot 未落定时 DOM 里根本没有可点的「登录」(见常量注释)。
     await page.getByText("登录", { exact: true }).first().click({ timeout: BOOT_TIMEOUT });
-    await page.getByPlaceholder("邮箱").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    await page.getByPlaceholder("密码").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    // AuthGate L-11: visible label is 邮箱/密码; placeholders are example format, not the label.
+    // Default getByLabel on the password field is substring and also matches the show-password toggle
+    // (8c20469c1 J1: strict mode violation, 2 elements). Pin textbox + exact.
+    await page.getByRole("textbox", { name: "邮箱", exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await page.getByRole("textbox", { name: "密码", exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
 
     // ── 2026-07-26 安全整改后的形态断言 ──────────────────────────────────
     // 生产已把全局 TURNSTILE_TEST_BYPASS 摘掉(改账号级白名单),真实用户必须看到
@@ -278,14 +330,15 @@ try {
 
     // 走真实模型选择器固定本轮模型，不直接改 storage/API。触发器回显菜单项的权威
     // display_name 才算选择生效；模型缺失、降级禁选或 UI 状态未更新都会 fail-loud。
-    await selectJourneyModel(page, JOURNEY_MODEL_ID, { timeout: STEP_TIMEOUT });
+    journeyModelLabel = await selectJourneyModel(page, JOURNEY_MODEL_ID, { timeout: STEP_TIMEOUT });
   });
 
   const probeName = `e2e-journey-${Date.now().toString(36)}.txt`;
   const probeToken = `OC_ATTACH_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   await step("J2 附件全链:菜单→filechooser→真实上传→chip done", async () => {
-    await page.getByRole("button", { name: "更多选项" }).click();
-    const attachItem = page.getByText("添加附件");
+    // Composer: attach is a first-class paperclip label(role=button, accessible name 添加附件).
+    // The + menu only has 设定目标. Visible text attach item is gone (063d2c9b3 J2 timeout).
+    const attachItem = page.getByRole("button", { name: "添加附件", exact: true });
     await attachItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     const [chooser] = await Promise.all([
       page.waitForEvent("filechooser", { timeout: STEP_TIMEOUT }),
@@ -316,24 +369,33 @@ try {
 
   await step("J3 目标全链:菜单→创建→active 可见→清除", async () => {
     await page.getByRole("button", { name: "更多选项" }).click();
-    const goalItem = page.getByText("设定目标");
+    // EmptyState button "为这次会话设定目标" also contains 设定目标 (86ad3da3 J3 strict 2).
+    const goalItem = page.getByRole("menuitem", { name: "设定目标", exact: true });
     await goalItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await goalItem.click();
     const dialog = page.getByRole("dialog");
     await dialog.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     const goalMarker = `e2e-goal-${Date.now().toString(36)}`;
     await dialog.getByPlaceholder("这次会话要达成什么？").fill(goalMarker);
-    await dialog.getByRole("button", { name: "开始目标" }).click();
-    await dialog.getByRole("button", { name: /清除/ }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    await dialog.getByText("进行中", { exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    // GoalDialog: first submit is 设置并开始 (2163a324 waited on 开始目标). Saving closes the modal.
+    await dialog.getByRole("button", { name: "设置并开始", exact: true }).click();
+    await dialog.waitFor({ state: "hidden", timeout: STEP_TIMEOUT });
+
+    await page.getByRole("button", { name: "更多选项" }).click();
+    const openGoal = page.getByRole("menuitem", { name: "目标", exact: true });
+    await openGoal.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await openGoal.click();
+    await dialog.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await dialog.getByText("已启用", { exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await dialog.getByRole("button", { name: /清除/ }).click();
-    await dialog.getByRole("button", { name: "开始目标" }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await page.getByRole("button", { name: "清除目标", exact: true }).click();
+    await dialog.getByRole("button", { name: "设置并开始", exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "hidden", timeout: STEP_TIMEOUT });
+    await settleJourneyGoalTurn(page, { goalMarker, timeout: STEP_TIMEOUT });
   });
 
   const marker = `e2e journey canary ${Date.now().toString(36)}`;
-  let assistantRowsBefore = 0;
   await step("J4 带附件发送:消息上屏+附件区清空", async () => {
     const input = page.locator("textarea").first();
     await input.fill(`${marker}(自动冒烟)。请读取刚上传的附件「${probeName}」第一行，并只把第一行原样回复；不要猜测、不要描述文件名。`);
@@ -344,10 +406,10 @@ try {
       if (Date.now() > deadline) throw new Error("发送按钮在超时窗内未变为可用(上传未完成?)");
       await new Promise((r) => setTimeout(r, 200));
     }
-    assistantRowsBefore = await page.getByTestId("assistant-row").count();
     await send.click();
-    // .first():模型回复若复读 marker 会出现第二个匹配,strict 单元素断言会误报。
-    await page.getByText(marker, { exact: false }).first().waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    // A cost dialog is a real required UI action, not a completed send. Only
+    // our chat user-row anchors J4; sidebar/composer text cannot prove admission.
+    await waitJourneyUserRow(page, { marker, modelLabel: journeyModelLabel, timeout: deadline - Date.now() });
     if ((await page.getByRole("button", { name: `移除 ${probeName}` }).count()) > 0) {
       throw new Error("发送后附件区未清空");
     }
@@ -360,38 +422,18 @@ try {
     //   失败判据 = ErrorBanner 签名(发送失败 / 消息暂未安全送达),一出现立即 fail;
     //   成功判据 = 新 assistant 行出现 + 流式光标消失 + composer 从「停止」恢复「发送」；
     //   新行不得含 alert（终态错误/空轮/截断都必须 fail）。不依赖回复文案或可选操作按钮。
-    const failSig = page.getByText(/发送失败|消息暂未安全送达/).first();
-    const assistantRows = page.getByTestId("assistant-row");
-    const send = page.getByRole("button", { name: "发送", exact: true });
-    const deadline = Date.now() + TURN_WAIT_TIMEOUT;
-    for (;;) {
-      if ((await failSig.count()) > 0) {
-        throw new Error("发送失败签名出现(消息未送达,见截图)");
-      }
-      if ((await assistantRows.count()) > assistantRowsBefore) {
-        const newestAssistant = assistantRows.last();
-        const responseFinished =
-          (await newestAssistant.locator(".caret-blink").count()) === 0 &&
-          (await send.count()) > 0;
-        if (responseFinished) {
-          if ((await newestAssistant.locator('[role="alert"]').count()) > 0) {
-            throw new Error("assistant 以错误/空轮/截断提示结束(非正常回复)");
-          }
-          const finalBody = (await newestAssistant.locator(".prose").last().textContent())?.trim() ?? "";
-          if (!finalBody.includes(probeToken)) {
-            throw new Error("assistant 最终正文未包含附件秘密探针(附件未送达 Agent、未读取或回复不完整)");
-          }
-          break;
-        }
-      }
-      if (Date.now() > deadline) {
-        throw new Error(`assistant 回复在 ${TURN_WAIT_TIMEOUT / 1000}s 内未完成(无失败卡亦无完整回复 = turn 挂起)`);
-      }
-      await new Promise((r) => setTimeout(r, 500));
-    }
+    // 判定逻辑与判据见 scripts/lib/journey-j5.mjs(锚定本次用户消息行;超时先只读核对后端,再至多一次宽限)。
+    await waitJ5Delivered(page, {
+      marker,
+      probeToken,
+      turnWaitMs: TURN_WAIT_TIMEOUT,
+      graceMs: J5_BACKEND_GRACE,
+      backendCheck: () => backendReplyHasProbe(probeToken),
+      onEvidence: (e) => { j5Evidence = e; },
+    });
   });
 
-  console.log("e2e-journey: 旅程全过(登录/附件读取/目标创建清除/发送/送达)");
+  console.log(`e2e-journey: 旅程全过(登录/附件读取/目标创建清除/发送/送达)${journeyModelLog}`);
   await browser.close();
   cleanupTunnel();
   process.exit(0);
@@ -400,8 +442,12 @@ try {
   try {
     await page.screenshot({ path: shot, fullPage: true });
     console.error(`e2e-journey: 失败截图 ${shot}`);
+    if (j5Evidence) {
+      writeFileSync(`${shot}.json`, JSON.stringify(j5Evidence, null, 2));
+      console.error(`e2e-journey: J5 证据 ${shot}.json`);
+    }
   } catch {}
-  console.error(`e2e-journey: ✗ 步骤「${stepName}」失败: ${String(err?.message ?? err).slice(0, 500)}`);
+  console.error(`e2e-journey: ✗ 步骤「${stepName}」失败${journeyModelLog}: ${String(err?.message ?? err).slice(0, 500)}`);
   await browser.close().catch(() => {});
   cleanupTunnel();
   process.exit(1);

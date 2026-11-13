@@ -8,7 +8,9 @@ priority: 4
 
 Video goes to Muse first: try `oc-muse video` (see `oc-muse --help`). If it reports
 `MUSE_NOT_ENABLED` or `MUSE_BRIDGE_OFFLINE`, tell the user Muse is unavailable, then
-fall back to the commands below.
+fall back to the commands below. A successful `delivery=conversation` / background queue acknowledgment
+is still a Muse job: tell the user it will return to this conversation, and do not submit H3 or
+repeat the generation. The server delivers the durable result, including after reconnect.
 
 For ordinary video requests, use `oc-h3` or `oc-video`. For images, speech, music,
 lyrics, or an explicitly requested Hailuo/MMX cloud video, use the built-in `mmx`

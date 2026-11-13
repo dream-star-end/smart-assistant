@@ -78,7 +78,10 @@ protect_unit_cwd "$egress_unit"
 # 只要有 MainPID(含 deactivating 中仍在 drain 的旧槽)其 cwd 一律保护。
 for _u in openclaude-v5-selfhost-egress.service \
           openclaude-v5-selfhost-egress@A.service \
-          openclaude-v5-selfhost-egress@B.service; do
+          openclaude-v5-selfhost-egress@B.service \
+          openclaude-v5-egress.service \
+          openclaude-v5-egress@A.service \
+          openclaude-v5-egress@B.service; do
   protect_unit_cwd "$_u"
 done
 

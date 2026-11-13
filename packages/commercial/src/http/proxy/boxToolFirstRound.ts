@@ -12,7 +12,10 @@ import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError,
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
-import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { BoxSpoolTerminalError, isBoxExecRejectedError, isTransientBoxSpoolReadError,
+  pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { boxFailureFromError } from "./boxFailureEvidence.js";
+import { rootLogger } from "../../logging/logger.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
@@ -36,6 +39,8 @@ import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { ProxyBody } from "./shared.js";
 import { waitingForBoxCapacity } from "./boxCapacityWait.js";
 
+const firstRoundLog = rootLogger.child({ subsys: "box-tool-first-round" });
+
 export class BoxToolFirstRoundError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolFirstRoundError"; }
 }
@@ -58,7 +63,7 @@ type Journal = Pick<BoxDurableJournal, "admit" |
   "markPrestartStopped" | "recordPrelaunchControl" | "armGuardedLaunch" |
   "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">
   & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer"
-    | "markFirstRoundRejectedStream" | "findNativeTranscriptSources">>;
+    | "markFirstRoundRejectedStream" | "findNativeTranscriptSources" | "recordFirstFailure">>;
 
 /** Decoder rejections that are a deterministic property of this stream (not a
  * transport or service failure) and may be stopped and settled explicitly. */
@@ -66,6 +71,11 @@ const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID",
   // The CLI answered an upstream refusal (usage window exhausted, API error)
   // with its own synthetic message: nothing was generated, nothing is billed.
   BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED,
+  // The CLI's own synthetic user turns (output-limit resume, empty-answer
+  // nudge) inside a model message are not a stream this request can deliver.
+  "BOX_CLI_COMPACT_PHASE", "BOX_CLI_COMPACT_UNBOUND", "BOX_CLI_COMPACT_DUPLICATE",
+  "BOX_CLI_COMPACT_INTERRUPTED", "BOX_CLI_COMPACT_SUMMARY_INVALID",
+  "BOX_CLI_COMPACT_BOUNDARY_INVALID",
   // OCV5-377: the model's safety stop is final for this call as well.
   BOX_CLI_MODEL_REFUSED]);
 
@@ -120,6 +130,9 @@ export async function runBoxToolFirstRound(input: {
    * session. Anything else keeps the fail-closed unknown path. */
   stopRejectedRun?: (identity: { requestId: string; uid: bigint; accountId: bigint;
     runNonce: string; leaseEpoch: string }) => Promise<"stopped_proven" | "completed_unsettled" | "pending">;
+  /** Bound for the one stop after BOX_TOOL_TERMINAL_UNPROVEN. The stop keeps
+   * running after this; the request does not. */
+  terminalUnprovenStopWaitMs?: number;
   /** Test seam; production reads the keeper proof from the Box. */
   readTerminalProof?: typeof readBoxTerminalProof;
 }): Promise<BoxToolFirstHandoff | BoxToolFirstFinal> {
@@ -190,6 +203,7 @@ export async function runBoxToolFirstRound(input: {
   let prelaunchReceipt: BoxPrelaunchReceipt | null = null;
   let prestartClosed = false;
   let unknownNotified = false;
+  let observedTerminalProof: BoxTerminalProof | undefined;
   type Disposal = { pending: Promise<void>; retained: boolean };
   const disposals = new WeakMap<BoxResolvedTarget, Disposal>();
   const retainCleanup = (owned: BoxResolvedTarget, state: Disposal,
@@ -562,12 +576,19 @@ export async function runBoxToolFirstRound(input: {
     const decoder = new BoxCliToolHandoffDecoder(plan.expectedModel, plan.catalog,
       { allowFinal: true, ...(nativeEnabled ? { trustedNativeSessionId: plan.sessionId } : {}) });
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access: plan,
-      startOffset: 0, deadlineMs: Math.max(1, remaining()), signal })) {
+      startOffset: 0, deadlineMs: Math.max(1, remaining()), signal,
+      terminal: { accountId: target.accountId, expectedAccountId: target.accountId,
+        runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch } })) {
+      observedTerminalProof = line.terminalProof ?? observedTerminalProof;
       const decoded = decoder.push(line.text);
       if (decoded.sse) input.emit(decoded.sse);
       if (decoded.finalCandidate) {
+        if (observedTerminalProof && observedTerminalProof.reason !== "worker_complete") {
+          throw new BoxSpoolTerminalError({ proof: observedTerminalProof,
+            accountId: target.accountId });
+        }
         const final = decoded.finalCandidate;
-        let proof: BoxTerminalProof | null = null;
+        let proof: BoxTerminalProof | null = observedTerminalProof ?? null;
         const until = Date.now() + 20_000;
         while (!proof && Date.now() < until && !signal.aborted) {
           try { proof = await race(readBoxTerminalProof({ target,
@@ -579,8 +600,11 @@ export async function runBoxToolFirstRound(input: {
             await new Promise<void>((resolve) => setTimeout(resolve, 50));
           }
         }
-        if (!proof || proof.reason !== "worker_complete") {
+        if (!proof) {
           throw new BoxToolFirstRoundError("BOX_TOOL_TERMINAL_UNPROVEN");
+        }
+        if (proof.reason !== "worker_complete") {
+          throw new BoxSpoolTerminalError({ proof, accountId: target.accountId });
         }
         const trailing = await race(readBoxSpoolChunk({ exec: target.exec,
           plan, offset: line.endOffset, signal }));
@@ -631,6 +655,8 @@ export async function runBoxToolFirstRound(input: {
           ...(nativePointer ? { nativePointer } : {}) };
       }
       if (!decoded.candidate) continue;
+      if (observedTerminalProof) throw new BoxSpoolTerminalError({
+        proof: observedTerminalProof, accountId: target.accountId });
       const candidate = decoded.candidate;
       const pending = new Set<string>();
       const pendingDeadline = Date.now() + Math.min(5000, remaining());
@@ -664,7 +690,28 @@ export async function runBoxToolFirstRound(input: {
         spoolOffset: line.endOffset };
     }
     throw new BoxToolFirstRoundError("BOX_TOOL_STREAM_INCOMPLETE");
-  } catch (error) {
+  } catch (caught) {
+    const error = observedTerminalProof && target && caught instanceof BoxCliToolHandoffError
+      ? new BoxSpoolTerminalError({ proof: observedTerminalProof,
+        accountId: target.accountId, cause: caught }) : caught;
+    const failure = boxFailureFromError(caught instanceof BoxSpoolTerminalError
+      ? caught.cause ?? caught : caught, "first_round")
+      ?? boxFailureFromError(error, "first_round");
+    if (admitted && target && failure && deps.journal.recordFirstFailure) {
+      try {
+        await bounded(deps.journal.recordFirstFailure({ requestId: input.requestId,
+          uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
+          leaseEpoch: plan.leaseEpoch, ...failure }), 5_000);
+      } catch {
+        firstRoundLog.warn("box_first_failure_record_failed", {
+          requestId: input.requestId, phase: "first_round" });
+      }
+    }
+    if (error instanceof BoxSpoolTerminalError || observedTerminalProof) {
+      if (admitted && target) deps.retainUnknownTarget({ target, plan,
+        uid: input.uid, requestId: input.requestId });
+      throw error;
+    }
     if (launchAttempted && admitted && target && deps.stopRejectedRun
       && error instanceof BoxCliToolHandoffError
       && BOX_LOCALLY_REJECTED_STREAM.has(error.code)) {
@@ -696,7 +743,27 @@ export async function runBoxToolFirstRound(input: {
           ? "BOX_TOOL_NAME_UNAVAILABLE" : error.code);
       }
     }
-    if (launchAttempted) await unknown("first_round_unknown");
+    // OCV5-762: Exec refused (417) even after one refreshed retry: the run
+    // cannot be followed; name it and stop it now so the next message is fresh.
+    const execRejected = isBoxExecRejectedError(error);
+    if (launchAttempted) await unknown(execRejected ? "first_round_exec_rejected" : "first_round_unknown");
+    if (launchAttempted && admitted && target && deps.stopRejectedRun
+      && (execRejected || (error instanceof BoxToolFirstRoundError
+        && error.code === "BOX_TOOL_TERMINAL_UNPROVEN"))) {
+      // Same explicit stop as a rejected stream, once, and bounded. A keeper
+      // proof is settled by that stop path. This catch does not call complete.
+      const stop = deps.stopRejectedRun;
+      const identity = { requestId: input.requestId, uid: input.uid,
+        accountId: target.accountId, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch };
+      const waitMs = deps.terminalUnprovenStopWaitMs ?? 25_000;
+      const observed = Promise.resolve().then(() => stop(identity)).then(() => {}, () => {});
+      let stopTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([observed, new Promise<void>((resolve) => {
+          stopTimer = setTimeout(resolve, waitMs);
+        })]);
+      } finally { if (stopTimer) clearTimeout(stopTimer); }
+    }
     if ((!admitted || prestartClosed) && target) {
       await closeBounded(target, "prestart_dispose").catch(() => {});
     }

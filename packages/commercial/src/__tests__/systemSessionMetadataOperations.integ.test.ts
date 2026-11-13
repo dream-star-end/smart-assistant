@@ -1,3 +1,4 @@
+import { readMigrationSource } from "./helpers/migrationSource.js";
 import { createServer } from 'node:http'
 import { signAccess } from '../auth/jwt.js'
 import { dispatchSessionMetadataRead } from '../http/sessionMetadata.js'
@@ -57,7 +58,7 @@ async function fixture(t: import('node:test').TestContext, mode: 'normal' | 'los
  INSERT INTO chat_projects VALUES('project','c:765',NULL);
  INSERT INTO project_assets(id,user_id,project_id,source,session_id,name,container_path,created_at,updated_at)
    VALUES('asset-orphan','c:765',NULL,'output','target','orphan.html','/tmp/orphan.html',100,100);`)
- await pool.query(readFileSync(new URL('../db/migrations/0327_system_action_receipts.sql', import.meta.url), 'utf8'))
+ await pool.query(readMigrationSource("0327_system_action_receipts"))
  setPoolOverride(pool)
  const ledger = new SystemActionStore({ dbPath: join(mkdtempSync(join(tmpdir(), 'oc-session-meta-ledger-')), 'ledger.sqlite'), key: randomBytes(32) })
  t.after(() => ledger.close())

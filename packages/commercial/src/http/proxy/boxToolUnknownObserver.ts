@@ -135,7 +135,7 @@ export async function observeBoxToolUnknown(input: {
         if (record && typeof record === "object" && !Array.isArray(record)
           && (record as { type?: unknown }).type === "user"
           && !resume && !(modelStarted && decoder.awaitingCliToolError())
-        && !decoder.priorCliToolErrorDue(record)) {
+          && !decoder.priorCliToolErrorDue(record)) {
           if (!echo || modelStarted) {
             throw new BoxToolUnknownObserverError("BOX_OBSERVER_ECHO_UNEXPECTED");
           }

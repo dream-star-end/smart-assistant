@@ -175,7 +175,10 @@ describe("assert-flavor.sh matches TS fixtures", () => {
   });
 
   test("B5: activate_release and activate_runtime_tuple call the commercial assertion", () => {
-    const src = readFileSync(path.join(root, "scripts/deploy-v5.sh"), "utf8");
+    const entry = readFileSync(path.join(root, "scripts/deploy-v5.sh"), "utf8");
+    const wire = 'source "$SCRIPT_DIR/lib/v5-release-artifacts.sh"';
+    assert.equal(entry.split(wire).length, 2, "artifact helpers must be sourced exactly once");
+    const src = entry.replace(wire, readFileSync(path.join(root, "scripts/lib/v5-release-artifacts.sh"), "utf8"));
     assert.match(src, /assert_commercial_flavor_on_target "\$reldir"/);
     assert.match(src, /assert_commercial_flavor_on_target "\$BUILT_RELEASE"/);
     assert.match(src, /flavorGuardGeneration:\$flavorGuardGeneration/);
@@ -185,7 +188,9 @@ describe("assert-flavor.sh matches TS fixtures", () => {
     const finalizeIdx = src.indexOf("oc_hotcfg_finalize_release \"$staging\"");
     assert.ok(runtimeIdx > 0 && mintIdx > runtimeIdx && finalizeIdx > mintIdx, "hotcfg mints before finalize");
     const activateIdx = src.indexOf("activate_release()");
-    const tupleIdx = src.indexOf("activate_runtime_tuple()");
+    const tupleSource = readFileSync(path.join(root, "scripts/lib/v5-commercial-release-policy.sh"), "utf8");
+    assert.match(tupleSource, /activate_runtime_tuple\(\)[\s\S]*assert_commercial_flavor_on_target "\$BUILT_RELEASE"/);
+    const tupleIdx = src.indexOf('source "$SCRIPT_DIR/lib/v5-commercial-release-policy.sh"');
     const distIdx = src.indexOf("activate_release \"$BUILT_RELEASE\"");
     const rbIdx = src.indexOf("activate_release \"$target\"");
     assert.ok(activateIdx > 0 && tupleIdx > 0);

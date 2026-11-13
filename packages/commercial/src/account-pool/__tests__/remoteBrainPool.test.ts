@@ -1,3 +1,4 @@
+import { readMigrationSource } from "../../__tests__/helpers/migrationSource.js";
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
@@ -690,10 +691,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
     )
 
     // 7. Admin activate/disable stored procedures in 0333_remote_agent_pool.sql explicitly reset pool_auto_disabled = FALSE (W1)
-    const migSql = readFileSync(
-      resolve(import.meta.dirname, '../../db/migrations/0333_remote_agent_pool.sql'),
-      'utf8',
-    )
+    const migSql = readMigrationSource("0333_remote_agent_pool")
     assert.match(
       migSql,
       /CREATE OR REPLACE FUNCTION fn_model_activate_entry[\s\S]*?SET state = 'active',\s*pool_auto_disabled = FALSE/,

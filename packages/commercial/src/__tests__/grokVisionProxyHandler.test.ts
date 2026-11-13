@@ -230,7 +230,6 @@ describe("grok vision handler", () => {
       grokVisionSnapshot({ state: "disabled" }),
       grokVisionSnapshot({ engine: "ccb" }),
       grokVisionSnapshot({ upstreamModelId: "grok-9" }),
-      grokVisionSnapshot({ upstreamModelId: "grok-4.6" }),
     ]) {
       const h = harness({ snapshot });
       const out = await h.run();
@@ -326,10 +325,10 @@ describe("grok vision handler", () => {
   });
 
   it("the container cannot pick the model, the upstream model, or the price", async () => {
-    const h = harness();
-    const out = await h.run({ ...BODY });
+    const h = harness({ snapshot: grokVisionSnapshot({ upstreamModelId: "grok-4.6" }) });
+    const out = await h.run();
     assert.equal(out.status, 200);
-    assert.equal(JSON.parse(h.calls.upstream[0]!.init.body).model, "grok-4.7");
+    assert.equal(JSON.parse(h.calls.upstream[0]!.init.body).model, "grok-4.6");
     assert.equal(h.calls.journal[0].model, "grok-build");
   });
 

@@ -1,6 +1,6 @@
 /* 管理中心「插件」分区的组成部分 —— 从 ConnectorsTab.tsx 原样拆出（OCV5-379），行为不变。 */
 import { Check, ExternalLink, QrCode } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api } from '../../../lib/api'
 import type {
   KnowledgePlanetSetupView,
@@ -34,6 +34,11 @@ export function ManagedBrowserSetupDialog({
   const [error, setError] = useState<string | null>(null)
   const [reportedActive, setReportedActive] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
   const setupSessionId = setup?.sessionId ?? null
   const setupStatus = setup?.status ?? null
   const setupQrReady = setup?.qrReady === true
@@ -85,6 +90,13 @@ export function ManagedBrowserSetupDialog({
   )
 
   useEffect(() => {
+    if (setupStatus && setupStatus !== 'waiting_for_scan') {
+      setQrUrl(null)
+      setLoadedQrKey(null)
+    }
+  }, [setupStatus])
+
+  useEffect(() => {
     if (
       !setupSessionId ||
       !setupStatus ||
@@ -92,12 +104,14 @@ export function ManagedBrowserSetupDialog({
     )
       return
     let cancelled = false
+    let terminal = false
     let timer: number | undefined
     const poll = () => {
       const request = provider.get(auth, setupSessionId)
       void request
         .then((next) => {
           if (!cancelled) {
+            terminal = !['waiting_for_scan', 'finalizing'].includes(next.status)
             setSetup(next)
             setError(null)
           }
@@ -105,6 +119,7 @@ export function ManagedBrowserSetupDialog({
         .catch(async (e) => {
           if (cancelled) return
           if (e instanceof ApiError && e.code === 'SETUP_NOT_FOUND') {
+            terminal = true
             if (!relinkAccountId) {
               const account = await findExistingAccount().catch(() => undefined)
               if (cancelled) return
@@ -124,7 +139,7 @@ export function ManagedBrowserSetupDialog({
           setError(errText(e, '读取扫码状态失败，请重试'))
         })
         .finally(() => {
-          if (!cancelled) timer = window.setTimeout(poll, 900)
+          if (!cancelled && !terminal) timer = window.setTimeout(poll, 900)
         })
     }
     timer = window.setTimeout(poll, 900)
@@ -143,7 +158,7 @@ export function ManagedBrowserSetupDialog({
   ])
 
   useEffect(() => {
-    if (!setupQrReady || !setupSessionId) return
+    if (setupStatus !== 'waiting_for_scan' || !setupQrReady || !setupSessionId) return
     const qrKey = `${setupSessionId}:${setupQrRevision}`
     const revisionBound = provider.slug === 'knowledge-planet' && hasSetupQrRevision
     if (revisionBound && loadedQrKey === qrKey) return
@@ -183,6 +198,7 @@ export function ManagedBrowserSetupDialog({
     setupQrReady,
     setupQrRevision,
     setupSessionId,
+    setupStatus,
   ])
 
   useEffect(() => {
@@ -211,7 +227,12 @@ export function ManagedBrowserSetupDialog({
     setStarting(true)
     setError(null)
     try {
-      setSetup(await provider.start(auth, relinkAccountId ?? undefined))
+      const next = await provider.start(auth, relinkAccountId ?? undefined)
+      if (!mounted.current) {
+        if (next.status === 'waiting_for_scan') await provider.cancel(auth, next.sessionId)
+        return
+      }
+      setSetup(next)
     } catch (e) {
       if (!relinkAccountId && e instanceof ApiError && e.code === 'ACCOUNT_ALREADY_EXISTS') {
         const account = await findExistingAccount().catch(() => undefined)
@@ -220,7 +241,8 @@ export function ManagedBrowserSetupDialog({
           return
         }
       }
-      setError(errText(e, `发起${label}授权失败`))
+      const codeText = e instanceof ApiError && e.code ? provider.codeTexts?.[e.code] : undefined
+      setError(codeText ?? errText(e, `发起${label}授权失败`))
     } finally {
       setStarting(false)
     }
@@ -305,6 +327,11 @@ export function ManagedBrowserSetupDialog({
             点击“同意并生成二维码”即表示你同意用{scanner}扫码保存{label}
             登录状态。登录状态加密保存在服务端，插件只访问固定域名；扫码不会开启写入，写入需在账号行另行开启，且每次执行仍需确认。
           </p>
+        )}
+        {!setup && provider.setupNotice && (
+          <Alert tone="warning" density="compact">
+            {provider.setupNotice}
+          </Alert>
         )}
         {setup && !terminalFailure && (
           <ol

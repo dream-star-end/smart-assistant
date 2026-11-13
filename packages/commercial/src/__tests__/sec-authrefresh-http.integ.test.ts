@@ -140,8 +140,13 @@ async function post(path: string, body: unknown, headers: Record<string, string>
 const victimNet = { "X-Forwarded-For": "203.0.113.10", "CF-Connecting-IP": "203.0.113.10" };
 const attackerNet = { "X-Forwarded-For": "198.51.100.66", "CF-Connecting-IP": "198.51.100.66" };
 
+let registrationSequence = 0;
 async function loginCookie(email: string, remember?: boolean): Promise<string> {
-  const reg = await post("/api/auth/register", { email, password: PASSWORD, turnstile_token: "tok" }, victimNet);
+  // Registration and refresh bindings are different contracts. Each synthetic account
+  // registers from its own network; all later logins still share victimNet.
+  const registrationIp = `192.0.2.${++registrationSequence}`;
+  const registrationNet = { "CF-Connecting-IP": registrationIp, "X-Forwarded-For": registrationIp };
+  const reg = await post("/api/auth/register", { email, password: PASSWORD, turnstile_token: "tok" }, registrationNet);
   assert.ok(reg.status === 200 || reg.status === 201, `register ${reg.status} ${JSON.stringify(reg.json)}`);
   const lr = await post("/api/auth/login", { email, password: PASSWORD, turnstile_token: "tok", ...(remember === undefined ? {} : { remember }) }, victimNet);
   assert.equal(lr.status, 200, JSON.stringify(lr.json));

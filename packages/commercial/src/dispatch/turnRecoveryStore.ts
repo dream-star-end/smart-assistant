@@ -5,16 +5,52 @@ import { AUTOMATIC_TURN_RETRY_MAX } from '@openclaude/protocol'
 import { durableRetryDelayMs } from './turnControlStore.js'
 import type { Queryable } from './turnDispatchStore.js'
 
+/** Due recovery wakes only an active carrier of a live, same-owner session.
+ * Keep the tombstone/tenant JOIN in this recovery-store read, not in WS transport.
+ * Both implemented transports are eligible. A recorded dispatch requires its exact
+ * id AND kind; without a carrier id, uniqueness is across both kinds, never per kind. */
+export async function listDueRecoveryCarrierContainers(
+  q: Queryable, userId: bigint, channel: string,
+): Promise<Array<{ container_id: number }>> {
+  const result = await q.query<{ container_id: number }>(
+    `WITH eligible_carriers AS (
+       SELECT id,user_id,runtime_kind FROM agent_containers
+        WHERE user_id=$1 AND state='active' AND runtime_channel=$2
+          AND runtime_kind IN ('docker','desktop')
+     ) SELECT DISTINCT ac.id::int AS container_id
+               FROM turn_recovery_jobs r
+               JOIN client_sessions s ON s.id=r.session_id AND s.user_id='c:' || r.user_id::text AND s.deleted_at IS NULL
+               LEFT JOIN LATERAL (
+                 SELECT d.agent_container_id,d.runtime_kind FROM turn_dispatches d
+                  WHERE d.user_id=r.user_id AND d.session_id=r.session_id
+                  ORDER BY (d.client_message_id=r.source_client_message_id) DESC NULLS LAST,
+                           d.admitted_at DESC, d.dispatch_id DESC LIMIT 1
+               ) d ON true
+               JOIN eligible_carriers ac ON ac.user_id=r.user_id
+                AND ((ac.id=d.agent_container_id AND ac.runtime_kind=d.runtime_kind)
+                  OR (d.agent_container_id IS NULL AND NOT EXISTS (
+                    SELECT 1 FROM eligible_carriers other WHERE other.id<>ac.id)))
+              WHERE r.user_id=$1 AND r.status IN ('queued','leased') AND r.next_attempt_at<=NOW()
+                AND (r.status='queued' OR r.lease_until<NOW())
+                AND r.dispatch_id IS NULL
+              LIMIT 5`,
+    [userId.toString(), channel],
+  )
+  return result.rows ?? []
+}
+
 export interface AutomaticRecoveryJobInput {
   userId: bigint
   sessionId: string
   rootClientMessageId: string
   sourceClientMessageId: string
+  /** Finalized turn key, or dispatch:<uuid>:<attempt> for a rejected-inbox proof. */
   sourceTurnKey: string
   errorCode: string
   recoveryMode: 'replay' | 'checkpoint'
   semanticRecoveryAttempt: number
   request: Record<string, unknown>
+  /** Legacy column name: SHA256 of the tape, or the exact dispatch rejection proof. */
   tapeSha256: string
 }
 
@@ -93,6 +129,20 @@ export async function enqueueAutomaticRecoveryJob(
   return result.rowCount === 1
 }
 
+/** Dispatch-proof replay preserves exact JSON bytes (including NUL escapes),
+ * while leaving clientMessageId queryable by Stop/refund SQL. Legacy tape
+ * recovery rows keep their ordinary request_json representation. */
+export function decodeRecoveryRequest(stored: Record<string, unknown>, source: string): Record<string, unknown> {
+  if (!source.startsWith('dispatch:') || stored._admissionRestartWireVersion !== 1) return stored
+  if (typeof stored._admissionRestartWire !== 'string') throw new Error('invalid admission restart wire')
+  const request: unknown = JSON.parse(Buffer.from(stored._admissionRestartWire, 'base64').toString('utf8'))
+  if (!request || typeof request !== 'object' || Array.isArray(request) ||
+      (request as Record<string, unknown>).clientMessageId !== stored.clientMessageId) {
+    throw new Error('admission restart wire identity mismatch')
+  }
+  return request as Record<string, unknown>
+}
+
 export async function claimDueRecoveryJobs(
   pool: Pool,
   input: { userId: bigint; ownerId: string; leaseMs: number; limit?: number },
@@ -118,6 +168,12 @@ export async function claimDueRecoveryJobs(
         WHERE candidate.user_id=$1 AND candidate.status IN ('queued','leased','sent')
           AND candidate.next_attempt_at<=NOW()
           AND (candidate.status='queued' OR candidate.lease_until<NOW())
+          AND NOT EXISTS (
+            SELECT 1 FROM turn_dispatches bound
+             WHERE bound.dispatch_id=candidate.dispatch_id
+               AND bound.attempt_no=candidate.dispatch_attempt_no
+               AND bound.status<>'admitted'
+          )
           AND NOT EXISTS (
             SELECT 1 FROM turn_recovery_jobs paused
              WHERE paused.user_id=candidate.user_id
@@ -151,7 +207,7 @@ export async function claimDueRecoveryJobs(
     recoveryMode: row.recovery_mode,
     semanticRecoveryAttempt: row.semantic_recovery_attempt,
     transportWaitAttempt: row.transport_wait_attempt,
-    request: row.request_json,
+    request: decodeRecoveryRequest(row.request_json, row.source_turn_key),
     leaseOwner: input.ownerId,
     leaseEpoch: Number(row.lease_epoch),
   }))

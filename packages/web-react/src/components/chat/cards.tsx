@@ -49,6 +49,8 @@ import {
   isErrorCardHeld,
   isLegacyRequestTooLargeDiagnostic,
   isLive,
+  isSealedDispatchFailure,
+  isStaleSoftBoxReplaySnapshot,
   stripMarkdown,
 } from "../../lib/chat/render";
 import {
@@ -975,7 +977,10 @@ export function AssistantCard({
       typeof value === "string" && value.length > 0).join("\n")
     : msg._errorDetail;
   const presentedError = hasError
-    ? errorPresentation(effectiveCode, msg.text, effectiveDetail, msg.usage?.waived === true)
+    ? errorPresentation(effectiveCode, msg.text, effectiveDetail, msg.usage?.waived === true, {
+        turnTapeComplete: msg._turnTapeComplete,
+        dispatchOutcome: msg._dispatchOutcome,
+      })
     : null;
   if (errorCardHeld && !presentedError?.bodyText) return null;
   // 没有错误码、只带 userError 的终态行(服务端「自动重试已停止」卡):正文换成同样的人话提示。
@@ -989,7 +994,13 @@ export function AssistantCard({
   const isEmptyNoReply =
     normalizedCode === "no_response" || normalizedCode === "phantom_turn";
   const sem = turnErrorSemantics(normalizedCode);
-  const frozenCard = !legacySize && msg._errorCardSnapshot?.disposition === "card" ? msg._errorCardSnapshot : undefined;
+  // Same narrow exception as legacy size: a sealed failure must not keep
+  // a frozen「结果正在收尾」title. Every other snapshot stays monotone.
+  const ignoreStaleSoftSnapshot =
+    isSealedDispatchFailure(msg) && isStaleSoftBoxReplaySnapshot(msg._errorCardSnapshot);
+  const frozenCard = !legacySize && !ignoreStaleSoftSnapshot && msg._errorCardSnapshot?.disposition === "card"
+    ? msg._errorCardSnapshot
+    : undefined;
   const errorTone = frozenCard
     ? (frozenCard.tone === "yellow" ? "warning" : "danger")
     : (problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"

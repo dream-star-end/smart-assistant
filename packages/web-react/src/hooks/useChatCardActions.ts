@@ -35,7 +35,6 @@ import type { BlogDraft } from "../components/tutorials/blog/blogLib";
 import { tutorialHref } from "./useAppRoute";
 
 /** 对话里的经验分享卡要打开的地方（App 负责打开教程中心的经验分享页签）。 */
-export type BlogOpenTarget = { kind: "post"; id: string } | { kind: "mine" } | { kind: "editor"; seed: BlogDraft };
 
 function replyQuoteText(message: ChatMessage): string {
   if (message.text.trim()) return message.text;
@@ -46,6 +45,11 @@ function replyQuoteText(message: ChatMessage): string {
   return media.length > 0 ? "[附件]" : "";
 }
 
+export type BlogOpenTarget =
+  | { kind: "post"; id: string }
+  | { kind: "mine" }
+  | { kind: "editor"; seed: BlogDraft };
+
 export type ChatCardActionsInput = {
   activeId: string | undefined;
   agent: Agent;
@@ -53,16 +57,16 @@ export type ChatCardActionsInput = {
   chat: UseChatSocket;
   chipsBoardProjectId: string | null;
   chipsProjectName: string;
-  /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
-  communityBlogEnabled: boolean;
   demo: boolean;
   systemActions?: SystemActionCardActions;
   identity: ResolvedIdentity | null;
   loadExactUserMessage: (message: ChatMessage) => Promise<ChatMessage | null>;
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
-  openBlog: (target: BlogOpenTarget) => void;
   openManage: (tab: ManageTab) => void;
+  /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
+  communityBlogEnabled: boolean;
+  openBlog: (target: BlogOpenTarget) => void;
   openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined) => void;
   openSettings: (section?: SettingsDestinationSection) => void;
   regenerate: () => Promise<void>;
@@ -93,15 +97,15 @@ export function useChatCardActions({
   chat,
   chipsBoardProjectId,
   chipsProjectName,
-  communityBlogEnabled,
   demo,
   systemActions,
   identity,
   loadExactUserMessage,
   messageFeedbackTriggerRef,
   newSession,
-  openBlog,
   openManage,
+  communityBlogEnabled,
+  openBlog,
   openPane,
   openSettings,
   regenerate,
@@ -297,6 +301,7 @@ export function useChatCardActions({
     },
     [demo, activeId, agent.id, loadExactOrToast, toast],
   );
+
 
   const editResend = useCallback(
     async (msg: ChatMessage) => {

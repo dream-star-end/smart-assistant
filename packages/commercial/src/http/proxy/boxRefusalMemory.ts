@@ -1,6 +1,6 @@
 /** CCB answers a failed streaming call with a non-streaming retry of the same
  * request. The Box route never launches that retry (a second paid call), so
- * after an upstream refusal (usage window exhausted) the client's last answer
+ * after an upstream refusal the client's last answer
  * was an unrelated "previous Box call not found". This remembers, per logical
  * turn, that the call was refused so the fallback gets the same clear 503.
  * Process-local on purpose: it only shapes an error message, never admission,
@@ -16,6 +16,8 @@ const keyOf = (key: BoxRefusalKey): string =>
 
 export function rememberBoxRefusal(key: BoxRefusalKey, code: string, nowMs = Date.now()): void {
   const id = keyOf(key);
+  const prior = entries.get(id);
+  if (prior && nowMs - prior.atMs <= TTL_MS) return;
   entries.delete(id);
   entries.set(id, { code, atMs: nowMs });
   while (entries.size > MAX_ENTRIES) entries.delete(entries.keys().next().value as string);

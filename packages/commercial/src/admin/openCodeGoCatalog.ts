@@ -246,6 +246,15 @@ const rows: Array<Omit<GoCatalogModel, 'upstreamModelId'>> = [
   },
   // 2026-10-20 page (fetched 01:38 Taipei): paid Step 5 Preview and two limited-time free models.
   {
+    modelId: 'step-5-preview-go',
+    displayName: 'Step 5 Preview (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '1.00', output: '2.70', cacheRead: '0.10', cacheWrite: null },
+    sortOrder: 329,
+    defaultEffort: null,
+  },
+  {
     modelId: 'minimax-m3.1-flash-free-go',
     displayName: 'MiniMax M3.1 Flash Free (Go)',
     contextWindow: 1_000_000,

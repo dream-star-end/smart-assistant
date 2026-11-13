@@ -1,3 +1,4 @@
+import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../../scripts/lib/testDatabaseIdentity.mjs";
 /**
  * OCV5-296 C pipeline proof.
  *
@@ -45,6 +46,7 @@ import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from "./modelAuthorityG
 const MODEL = "box-api-claude-opus-5-5";
 const CHUNK = 128 * 1024;
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+assertTestDatabaseUrl(TEST_DB);
 const SCHEMA = `ocv5_296_cpipe_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/14";
 const READY_FALSE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;";
@@ -561,9 +563,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
   const previousBox = process.env.OC_BOX_MODEL_API;
   process.env.OC_BOX_MODEL_API = "1";
   try {
-    const ident = await admin.query("SELECT current_database() AS db, inet_server_port() AS port");
-    assert.equal(ident.rows[0].db, "openclaude_test");
-    assert.equal(Number(ident.rows[0].port), 55432);
+    await assertConnectedTestDatabase(admin);
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
     await admin.query(`

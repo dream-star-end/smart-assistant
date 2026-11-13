@@ -102,7 +102,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 
 发送文件给用户: 必须先保存到平台生成目录 \`/home/agent/.openclaude/generated/\` 再回复**绝对路径**。不要用 \`/tmp\` 临时目录,不要用 \`![]()\` 语法。
 详细规则见 \`skill_view("platform-capabilities")\`。
-生成视频: 优先用 Bash \`oc-muse video "<描述>"\`(图生视频加 \`--image <图片路径>\`,用法见 \`oc-muse --help\`),成品路径照常写进回复。Muse 只对已开通的账号可用:报 \`MUSE_NOT_ENABLED\`、\`MUSE_BRIDGE_OFFLINE\` 等错误时,如实告诉用户 Muse 视频当前不可用及原因,不要声称已生成;之后再按 \`skill_view("minimax-media")\` 用 \`oc-h3\`。\`MUSE_VIDEO_REGION_BLOCKED\` 不要重试。
+生成视频: 优先用 Bash \`oc-muse video "<描述>"\`(图生视频加 \`--image <图片路径>\`,用法见 \`oc-muse --help\`),成品路径照常写进回复。若返回 delivery=conversation 或后台队列确认，简短告知等待 Muse 回调到本会话，不要重复生成或转用 H3；结果由服务端持久送达。Muse 只对已开通的账号可用:报 \`MUSE_NOT_ENABLED\`、\`MUSE_BRIDGE_OFFLINE\` 等错误时,如实告诉用户 Muse 视频当前不可用及原因,不要声称已生成;之后再按 \`skill_view("minimax-media")\` 用 \`oc-h3\`。\`MUSE_VIDEO_REGION_BLOCKED\` 不要重试。
 
 <!-- oc-channel:wechat:start -->
 ## 微信通道操作技能
@@ -679,7 +679,7 @@ export async function buildProjectSlot(ctx: PromptSlotContext): Promise<PromptSl
 function renderDelegateModelSectionForCtx(ctx: PromptSlotContext): string | null {
   if (ctx.delegateModelCatalog === false) return null
   if (ctx.delegateModelCatalog === null) return DELEGATE_MODEL_SECTION_UNAVAILABLE
-  if (ctx.delegateModelCatalog) return renderDelegateModelSection(ctx.delegateModelCatalog)
+  if (ctx.delegateModelCatalog) return renderDelegateModelSection(ctx.delegateModelCatalog, process.env)
   try {
     const peek = getModelCatalogClient().peekView()
     if (!peek) return DELEGATE_MODEL_SECTION_UNAVAILABLE
@@ -687,7 +687,7 @@ function renderDelegateModelSectionForCtx(ctx: PromptSlotContext): string | null
       models: peek.view.models,
       projectionRevision: peek.view.projectionRevision,
       verifiedAt: peek.verifiedAt,
-    })
+    }, process.env)
   } catch {
     return DELEGATE_MODEL_SECTION_UNAVAILABLE
   }

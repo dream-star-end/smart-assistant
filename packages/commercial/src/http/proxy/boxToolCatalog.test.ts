@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BOX_MCP_TOOL_NAME, BoxToolCatalogError, boxCatalogMatching, boxMcpAliasFor,
-  compileBoxToolCatalog, mapBoxCliEffort,
+  compileBoxToolCatalog, mapBoxCliEffort, capBoxCliEffort, BOX_SMALL_OUTPUT_CAP_TOKENS,
   rehydrateBoxToolCatalog } from "./boxToolCatalog.js";
 
 // Names observed from an isolated real Claude Code 2.1.280 Messages request;
@@ -149,4 +149,24 @@ test("OCV5-300 natural aliases expose client names and keep opaque chains bindin
   assert.equal(boxCatalogMatching(drifted, natural.bindingSha256), null);
   assert.equal(boxCatalogMatching(natural, "0".repeat(64)), null);
   assert.equal(boxCatalogMatching(natural, undefined), null);
+});
+
+// INC-20261006-BOX-SYNTHETIC-TURN-HELD: Claude Code's context compaction asks
+// for 20000 output tokens with thinking disabled but forwards the user's
+// `max` effort. The CLI spent the whole cap on thinking, wrote synthetic
+// "Output token limit hit" user turns and the stream was rejected.
+test("INC-20261006 a small output cap never runs above low effort", () => {
+  assert.equal(BOX_SMALL_OUTPUT_CAP_TOKENS, 20_000);
+  for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
+    assert.equal(mapBoxCliEffort(undefined, { effort }, 20_000), "low", effort);
+    assert.equal(mapBoxCliEffort({ type: "adaptive" }, { effort }, 4096), "low", effort);
+    assert.equal(mapBoxCliEffort(undefined, { effort }, 20_001), effort, effort);
+    assert.equal(mapBoxCliEffort(undefined, { effort }, 128_000), effort, effort);
+    assert.equal(mapBoxCliEffort(undefined, { effort }), effort, "no cap given");
+  }
+  for (const odd of [undefined, null, "20000", 0, -5, 1.5, Number.NaN]) {
+    assert.equal(capBoxCliEffort("max", odd), "max", String(odd));
+  }
+  assert.throws(() => mapBoxCliEffort(undefined, { effort: "ultra" }, 20_000),
+    /BOX_EFFORT_UNMAPPED/, "an unknown effort still fails closed");
 });

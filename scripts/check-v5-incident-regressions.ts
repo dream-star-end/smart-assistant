@@ -35,9 +35,12 @@ const ASSERTION_DEBT_BASELINE = 37;
  * 11 = 4 条存量(3 条 Weibo/Kimi 原本用无关脚本充数 + 1 条把 CI unit 误标 deploy-gate)
  *   + 5 条 2026-07-25 紧急通道事故(补登记时如实标注:回归只到 unit 层)
  *   + 2 条 SCNet 关机后从 V5 主发布门移除的 OCR 活体 proof。
+ * 17 → 19(2026-10-16 管家决定,OCV5-411 #723 最终同步):INC-20261015-GO-CACHE-PREFIX 与
+ *   INC-20261015-PRESTART-STOP-LOST 的发版证据 G1/S1 只接在个人版 deploy-v5-selfhost.sh,商业版
+ *   没有对应模型/测试账号,deploy-v5.sh 跑不了;两条的 proofPending 写明原因与补证到期 2026-11-15。
  * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
  */
-const PROOF_PENDING_BASELINE = 11;
+const PROOF_PENDING_BASELINE = 19;
 
 // ── 个人版(--edition=selfhost)────────────────────────────────────────────────
 // 个人版的发布(deploy-v5-selfhost.sh)不跑商业的 deploy-gate / live-e2e proof,所以同一条事故在
@@ -590,6 +593,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // gate ran. Shared branch forbids rewriting it. Deploy failed before it
   // became live. Freeze this tip only; later commits still go through the gate.
   "197735db77dfbf05280c526963ae04846544cabe",
+
+  // OCV5-308: preserve all immutable commercial fences and freeze imported selfhost history.
+  "839ad442098f8e68e0b9fd2b0e8f01519334031e",
+  "f4f1430885612c9d377b7495831fb08375d0c6cb",
+  "3772295e774a6c50406e3d975f5136f590834be3",
   // 2026-11-10 user chose to freeze the live selfhost history instead of renewing
   // expiring waivers: rel-3a4aba64d is live and its commits (793c4f0b among them)
   // cannot be rewritten. Only its ancestors are exempt; later commits still go
@@ -601,6 +609,28 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
 // imported-history exemption. The full SHA binds the original tree and message;
 // the mapped ID must still satisfy ALL ordinary manifest/proof/lineage checks.
 function normalizeImmutableIncidentTrailer(sha: string, trailer: string): string {
+  // User-approved 2026-11-02 exact historical closure: the copy guard joins
+  // the existing capacity incident and must pass its ordinary proof/lineage checks.
+  // User-approved 2026-11-09 (t1669u) exact historical closure for OCV5-376 expired
+  // Incident:none waivers. Full SHA + exact trailer only; ordinary INC/proof/lineage required.
+  if (
+    sha === "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0"
+    && trailer === "none (preset kept a stale model; found in the OCV5-376 startup-log review)"
+  ) {
+    return "INC-20261011-GENERAL-ASSISTANT-STALE-MODEL";
+  }
+  if (
+    sha === "785b3e0425e9ccc1720043c501946c31abfea22b"
+    && trailer === "none (latent; no user report — found during the OCV5-376 test-suite change)"
+  ) {
+    return "INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE";
+  }
+  if (
+    sha === "793c4f0b15928a59eaaedab3f8ba6194d1fb496a"
+    && trailer === "none (user-facing copy only; no behavior change)"
+  ) {
+    return "INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE";
+  }
   if (
     sha === "f496228de43718852cebda8fb9f35eb0e9c3a9c0"
     && trailer === "OCV5-171 follow-up"
@@ -719,6 +749,11 @@ function checkTrailerClosure(): number {
       if (waiver && waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 trailer 例外 waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
+    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
+    if (normalizedTrailer !== trailer) {
+      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
+    }
+    trailer = normalizedTrailer;
     if (/^none\b/.test(trailer)) {
       const waiver = waivers.get(sha.slice(0, 8));
       if (!waiver) fail(`${sha.slice(0, 8)} 声明 Incident: none,但 incident-waivers.json 里没有对应 waiver`);
@@ -734,11 +769,6 @@ function checkTrailerClosure(): number {
       }
       continue;
     }
-    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
-    if (normalizedTrailer !== trailer) {
-      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
-    }
-    trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
       // fbb9020fd was pushed as Incident: OCV5-276. The shared branch forbids
       // rewriting it. The waiver records the user-approved smoke-only fix.

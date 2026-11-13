@@ -486,6 +486,7 @@ async function createDriverHarness(
     toolAuthorizeTimeoutMs?: number
     useRealPlatformContext?: boolean
     persona?: string
+    afterRelayListen?: (sandbox: string) => void
   } = {},
 ): Promise<E2EHarness> {
   const sandbox = mkdtempSync(`/tmp/oc-drvtest-gw-${driverId}-`)
@@ -550,10 +551,33 @@ async function createDriverHarness(
   }
 
   const worker = new DriverWorkerClient()
-  t.after(async () => {
-    await worker.close().catch(() => {})
-    rmSync(sandbox, { recursive: true, force: true })
-  })
+  const cleanupResources: { relay?: RemotePoolRelay; adapter?: RemoteEngineAdapter } = {}
+  let cleanupPromise: Promise<void> | undefined
+  const cleanup = (): Promise<void> => (cleanupPromise ??= (async () => {
+    const errors: unknown[] = []
+    const release = async (fn: () => unknown | Promise<unknown>) => {
+      try { await fn() } catch (error) { errors.push(error) }
+    }
+    // One owner, registered before setup can fail: stop writers before removing their journal.
+    const adapter = cleanupResources.adapter
+    const relay = cleanupResources.relay
+    if (adapter) await release(() => adapter.shutdown())
+    if (relay) {
+      await release(async () => assert.deepEqual(await relay.stop(), { remoteStopped: true }))
+      relay.controlServer.closeAllConnections()
+      if (relay.controlServer.listening) {
+        await release(() => new Promise<void>((resolve, reject) => {
+          relay.controlServer.close((error) => error ? reject(error) : resolve())
+        }))
+      }
+      assert.equal(relay.controlServer.listening, false)
+    }
+    await release(() => worker.close())
+    await release(() => rmSync(sandbox, { recursive: true, force: true }))
+    assert.equal(existsSync(sandbox), false)
+    if (errors.length) throw new AggregateError(errors, 'remote driver fixture cleanup failed')
+  })())
+  t.after(cleanup)
   const workerInfo = await worker.info(driverId)
 
   const operationId = randomUUID()
@@ -687,9 +711,11 @@ async function createDriverHarness(
     observationOptions: { authorizeTimeoutMs: opts.toolAuthorizeTimeoutMs ?? 400 },
   })
 
+  cleanupResources.relay = relay
   const socketPath = join(sandbox, 'relay.sock')
   relay.controlServer.listen(socketPath)
   await once(relay.controlServer, 'listening')
+  opts.afterRelayListen?.(sandbox)
 
   const executedCalls: Array<{
     name: string
@@ -757,6 +783,7 @@ async function createDriverHarness(
     },
   )
 
+  cleanupResources.adapter = adapter
   const billingEvents: EngineBillingEvent[] = []
   adapter.on('billing', (ev: EngineBillingEvent) => {
     billingEvents.push(ev)
@@ -847,21 +874,6 @@ async function createDriverHarness(
     const run = adapter.submitTurn(params)
     return { events, run }
   }
-
-  let cleaned = false
-  const cleanup = async () => {
-    if (cleaned) return
-    cleaned = true
-    await adapter.shutdown().catch(() => {})
-    await relay.stop().catch(() => {})
-    relay.controlServer.closeAllConnections()
-    await new Promise<void>((res) => relay.controlServer.close(() => res()))
-    await worker.close().catch(() => {})
-    rmSync(sandbox, { recursive: true, force: true })
-  }
-  t.after(async () => {
-    await cleanup()
-  })
 
   return {
     sandbox,
@@ -969,6 +981,13 @@ for (const driverId of ['cc', 'codex'] as const) {
     // Clean dual-proof shutdown.
     await h.adapter.shutdown()
     assert.equal(h.relay.stopped, true)
+    const closing = h.cleanup()
+    assert.equal(h.cleanup(), closing, 'repeat cleanup must join the same teardown')
+    await closing
+    assert.equal(h.relay.controlServer.listening, false)
+    assert.equal(existsSync(h.sandbox), false)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(existsSync(h.sandbox), false, 'no writer may recreate the removed sandbox')
   })
 
   test(`[${driverId}] unobserved MCP tool call executes ZERO times and fences lane fail-closed`, async (t) => {
@@ -1148,4 +1167,19 @@ test('cc5SessionBackend and createEngine enforce remote-driver-v4 authorityEngin
       }),
     /authorityEngine 'codex' != resolved engine 'ccb'/,
   )
+})
+
+
+test('driver fixture tears down a real listening relay when setup fails before adapter creation', async (t) => {
+  let sandbox = ''
+  await assert.rejects(createDriverHarness(t, 'codex', {
+    afterRelayListen: (root) => { sandbox = root; throw new Error('fixture setup failure') },
+  }), /fixture setup failure/)
+  assert.ok(sandbox)
+  // Registered after the harness's single cleanup: its real stop and close must finish first.
+  t.after(async () => {
+    assert.equal(existsSync(sandbox), false)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(existsSync(sandbox), false)
+  })
 })

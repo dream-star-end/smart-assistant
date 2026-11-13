@@ -239,7 +239,7 @@ describe("SessionManager pending-persistence tracking", () => {
     const secondPromise = sm.beginExternalTurn(session);
     await Promise.resolve();
     assert.equal(session._externalTurnAbort?.signal, first.signal);
-    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(sm.interrupt(session.sessionKey, "user"), true);
     assert.equal(first.signal.aborted, true);
 
     first.finish("errored");
@@ -296,26 +296,20 @@ describe("SessionManager pending-persistence tracking", () => {
     assert.equal(drained, true);
   });
 
-  test("a reason-less interrupt is a system interrupt, never a user cancel", () => {
-    // 577ba459a made 'system' the default; only explicit user Stop paths pass 'user'.
+  test("unspecified interruption remains system; exact stale browser Stop never aborts the live owner", async () => {
     const sm = new SessionManager(makeConfigStub());
-    const runner = new FakeTurnRunner(() => {});
-    const session = makeTurnSession(runner);
+    const session = makeTurnSession(new FakeTurnRunner(() => {}));
     const calls: Array<{ status: string; reason: string; errorCode: string }> = [];
-    session._persistActiveTurn = async (status, reason, errorCode) => {
-      calls.push({ status, reason, errorCode });
-    };
-    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-      session.sessionKey,
-      session,
-    );
-
+    session._runningClientMessageId = "live-owner";
+    session._externalTurnAbort = new AbortController();
+    session._persistActiveTurn = async (status, reason, errorCode) => { calls.push({ status, reason, errorCode }); };
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+    assert.equal(sm.interruptClientTurn(session.sessionKey, "stale-owner"), false);
+    assert.equal(session._externalTurnAbort.signal.aborted, false);
+    assert.deepEqual(calls, []);
     assert.equal(sm.interrupt(session.sessionKey), true);
-    assert.deepEqual(calls, [{
-      status: "interrupted",
-      reason: "本轮因系统调度中断。",
-      errorCode: "SYSTEM_INTERRUPT",
-    }]);
+    await sm.awaitPendingPersistence();
+    assert.deepEqual(calls, [{ status: "interrupted", reason: "本轮因系统调度中断。", errorCode: "SYSTEM_INTERRUPT" }]);
   });
 
   test("user Stop retains the direct runner fallback before the persistence hook exists", () => {

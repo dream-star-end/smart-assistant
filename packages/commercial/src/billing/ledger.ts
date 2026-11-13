@@ -32,7 +32,7 @@ import type { PoolClient } from "pg";
 import { tx, query as rootQuery } from "../db/queries.js";
 import { writeAdminAudit } from "../admin/audit.js";
 
-/** credit_ledger.reason 的 CHECK 白名单,和 0002 / 0077 / 0096 迁移保持同步。 */
+/** credit_ledger.reason 的 CHECK 白名单,和 0002 / 0077 / 0096 / 0131 / 0319 迁移保持同步。 */
 export const LEDGER_REASONS = [
   "topup",
   "chat",
@@ -47,6 +47,8 @@ export const LEDGER_REASONS = [
   "subscription",
   "subscription_expire",
   "pack",
+  // 0319 (OCV5-574): Muse image/video job charged on success.
+  "muse_media",
 ] as const;
 export type LedgerReason = (typeof LEDGER_REASONS)[number];
 

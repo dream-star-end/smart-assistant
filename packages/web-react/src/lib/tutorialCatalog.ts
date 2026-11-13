@@ -22,9 +22,21 @@ const TUTORIAL_MEDIA_V3 = new Set<TutorialMediaKey>([
   "team-mode",
   "models-reasoning",
   "sessions-history",
+  "advisor-mode",
+  "billing-usage",
+  "taskboard",
 ]);
-const TUTORIAL_MEDIA_V4 = new Set<TutorialMediaKey>(["agents", "chat-basics"]);
-const TUTORIAL_MEDIA_V5 = new Set<TutorialMediaKey>(["container-web-preview"]);
+const TUTORIAL_MEDIA_V4 = new Set<TutorialMediaKey>([
+  "agents",
+  "chat-basics",
+  "sessions-history",
+  "team-mode",
+]);
+const TUTORIAL_MEDIA_V5 = new Set<TutorialMediaKey>([
+  "container-web-preview",
+  "agents",
+  "chat-basics",
+]);
 
 export const TUTORIAL_MEDIA: Record<
   TutorialMediaKey,
@@ -107,7 +119,7 @@ export type TutorialTopic = {
 export const TUTORIAL_TOPICS = {
   "chat-basics": {
     featureId: "chat-basics",
-    contentVersion: 9,
+    contentVersion: 11,
     intro:
       "从简不是只回答一句话的聊天框，而是能持续执行任务的工作区。你可以像给同事派活一样说明目标、材料、限制和交付格式；过程中会看到思考、工具、进度与阶段结果，有时还会出现可点击的选择卡。任务结束后还能继续追问或让它修改。",
     outcome: "把一个模糊想法变成可核验、可继续迭代的完整交付。",
@@ -127,7 +139,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "观察执行而不是反复催促",
-        body: "任务运行时查看进度、工具卡和计划；确需改方向时再停止。想补一句但不想打断这一轮，可先把内容写进输入框，再点工具条上的「排队发送」按钮（提示“本轮结束后自动发送”）：它会显示“已加入队列，本轮结束后发送”，等这一轮结束自动发出；生成中的「停止」仍是唯一的中止按钮。",
+        body: "任务运行时查看进度、工具卡和计划；确需改方向时再停止。想补一句但不想打断这一轮，可先把内容写进输入框，再点工具条上的「排队发送」按钮（提示“本轮结束后自动发送”）：成功接收后会显示“已加入队列，本轮结束后发送”，等这一轮结束自动发出；未能接收时会保留草稿，处理问题后可再次发送。生成中的「停止」仍是唯一的中止按钮。",
       },
       {
         title: "看清选择卡再点",
@@ -135,7 +147,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "用反馈完成最后一公里",
-        body: "对结果指出具体问题，或使用重新生成、继续、点赞/点踩，让下一轮更贴近预期。",
+        body: "对结果指出具体问题，或用回复下方的动作行和「⋯」更多操作里的重新生成、继续、点赞/点踩，让下一轮更贴近预期。",
       },
     ],
     tips: [
@@ -385,7 +397,7 @@ export const TUTORIAL_TOPICS = {
   },
   "web-research": {
     featureId: "web-research",
-    contentVersion: 4,
+    contentVersion: 5,
     intro:
       "智能体可以搜索公开网页、提取页面与文档、检索论文并整理引用。检索到的论文会以文献检索卡片出现在对话里，回答中的来源卡片可打开核对，适合需要时效性和证据链的任务。",
     outcome: "得到带来源、能回查的调研结论，而不是只有一段无法验证的概括。",
@@ -588,7 +600,7 @@ export const TUTORIAL_TOPICS = {
   },
   agents: {
     featureId: "agents",
-    contentVersion: 5,
+    contentVersion: 6,
     intro:
       "智能体是一套长期稳定的角色、工作方式和专用能力。新任务可从侧栏“新建会话”右侧箭头先选助手；已有任务可点击顶栏当前助手名称切换。每个会话记录自己的智能体归属，重新打开时会恢复。",
     outcome: "把专业任务交给更懂该领域、带有合适工具和流程的助手。",
@@ -697,7 +709,7 @@ export const TUTORIAL_TOPICS = {
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",
-    contentVersion: 9,
+    contentVersion: 10,
     intro:
       "长期记忆按智能体隔离保存稳定信息，例如你的职业、沟通偏好和项目背景，后续会话会自动参考。你可以在管理中心 → 记忆按类型查看、编辑和删除条目；后台整理出新的记忆时，那里还会出现 Auto-Dream 梦境报告。",
     outcome: "让智能体记住真正长期有用的信息，并由你随时核对和修正。",
@@ -738,7 +750,7 @@ export const TUTORIAL_TOPICS = {
   },
   "schedules-reminders": {
     featureId: "schedules-reminders",
-    contentVersion: 5,
+    contentVersion: 6,
     intro:
       "定时任务让智能体在未来某个时间自动执行提示词，并把结果送到网页对话或其他已配置通道。既支持一次性提醒，也支持工作日、每周、每月等周期计划；管理中心可暂停、编辑和删除。",
     outcome: "把重复的信息整理、提醒和例行检查交给系统自动完成。",
@@ -775,7 +787,7 @@ export const TUTORIAL_TOPICS = {
   },
   "skills-training": {
     featureId: "skills-training",
-    contentVersion: 5,
+    contentVersion: 7,
     intro:
       "技能是一套在特定场景自动启用的可复用工作流程，包含说明、参考资料、脚本和评测用例。管理中心可查看市场安装和个人自建的技能，编辑自己的技能，运行评测，并让训练流程基于失败案例提出改进草稿。",
     outcome: "把一次成功做法固化成稳定流程，并用评测防止后续修改退化。",
@@ -791,7 +803,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "创建技能与评测",
-        body: "在对话中引导创建，或在管理中心编辑正文、文件和 evals 用例。",
+        body: "还没有技能时，在管理中心点击“在对话中创建技能”，会打开新会话并预填创建提示；确认或修改后再发送，不会自动发送。已有技能可在管理中心编辑正文、文件和 evals 用例。",
       },
       {
         title: "运行评测",
@@ -814,9 +826,9 @@ export const TUTORIAL_TOPICS = {
   },
   connectors: {
     featureId: "connectors",
-    contentVersion: 4,
+    contentVersion: 6,
     intro:
-      "插件让智能体在获得授权后读取或写入外部服务。市场负责发现、审核和安装；管理中心只负责账号与授权。除 Notion、飞书、GitHub 和声明式 HTTP 插件外，知识星球支持微信扫码登录及只读内容检索。",
+      "插件让智能体在获得授权后读取或写入外部服务。市场负责发现、审核和安装；管理中心的「插件」页是一排开关，按需打开或关闭某个插件，账号、授权和其他设置都在该插件的详情页。除 Notion、飞书、GitHub 和声明式 HTTP 插件外，知识星球支持微信扫码登录及只读内容检索。",
     outcome: "让 AI 在真实业务系统里查数据和执行动作，而不靠手工搬运。",
     scenarios: [
       "读取 Notion 或飞书文档",
@@ -831,7 +843,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "绑定账号",
-        body: "安装知识星球后会自动打开授权弹层；点击同意并用微信扫码，手机确认后页面会自动显示成功并启用。其他插件按提示 OAuth 授权或填写凭据。",
+        body: "安装知识星球后会自动打开授权弹层；点击同意并用微信扫码，手机确认后页面会自动显示成功并启用。其他插件在管理中心「插件」里点进详情页，按提示 OAuth 授权或填写凭据。",
       },
       {
         title: "在任务里明确账号与动作",
@@ -839,7 +851,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "随时解绑",
-        body: "不再使用时在管理中心解绑账号或卸载插件，撤销后后续调用立即失效。",
+        body: "暂时不用时在管理中心「插件」里关掉它的开关；不再使用时进入详情页解绑账号或卸载插件。关闭或撤销后，后续调用立即失效。",
       },
     ],
     tips: [
@@ -859,7 +871,7 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-discovery": {
     featureId: "marketplace-discovery",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "AI 市场汇集三类能力：技能沉淀可复用的方法与流程；智能体组合模型、人设、工具权限和依赖；插件提供可安装、可授权、可审计的外部能力。当前插件分类先支持声明式 HTTP API。",
     outcome: "按任务快速加装专业能力，而不把所有功能塞进一个助手。",
@@ -894,7 +906,7 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-publishing": {
     featureId: "marketplace-publishing",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "你可以把自己的技能、智能体或插件发布到公共市场。发布页支持由 AI 在对话中生成结构化确认单；提交后自动审核，高风险或不确定内容转人工，状态变化会在市场内实时显示。当前插件发布支持声明式 HTTP API。",
     outcome: "把可复用能力版本化、接受审核，并分享给市场用户。",
@@ -962,7 +974,7 @@ export const TUTORIAL_TOPICS = {
   },
   preferences: {
     featureId: "preferences",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "设置 → 偏好集中管理浅色/深色主题、默认模型、默认思考深度、本设备的发送键与字号，以及通知方式。主题会立即生效，账户偏好会保存到服务端并在其他设备继承。",
     outcome: "让每个新会话从符合你习惯的外观、模型和输入方式开始。",

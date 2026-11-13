@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { clickSend, waitUntil } from "../../../scripts/lib/user-contract-browser.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -135,10 +136,9 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         const notice = !navigate && !red && !catalogRed && variant !== "restore-original"
           ? page.getByText(NOTICE, { exact: true }).first().waitFor({ timeout: 10000 }) : null;
         if (notice) void notice.catch(() => {});
-        const blocked = navigate ? new Promise((resolve) => { current.refreshStarted = resolve; }) : null;
-        await page.getByRole("button", { name: "发送", exact: true }).click();
+        await clickSend(page);
         if (navigate) {
-          await blocked;
+          await waitUntil(() => current.refreshBlocked, 10000, `original-session refresh did not start: ${label}/${width}`);
           await page.evaluate((sid) => { history.pushState(null, "", `/s/${sid}`); dispatchEvent(new PopStateEvent("popstate")); }, WAIT_SESSION);
           await page.waitForURL(`**/s/${WAIT_SESSION}`);
           await page.getByPlaceholder(/对话/).fill("G512_B_DRAFT_MUST_SURVIVE");

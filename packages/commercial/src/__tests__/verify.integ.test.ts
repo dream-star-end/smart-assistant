@@ -102,6 +102,13 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   return false;
 }
 
+let testIpSeq = 0;
+/** 每次一个新 IP:这里的用例不验同 IP 上限,不让它们互相占名额。 */
+function nextTestIp(): string {
+  testIpSeq += 1;
+  return `198.51.${Math.floor(testIpSeq / 250)}.${(testIpSeq % 250) + 1}`;
+}
+
 /**
  * 注册 + 从邮件正文抓 6 位验证码。
  *
@@ -120,6 +127,7 @@ async function registerAndCaptureVerifyToken(email: string, password: string): P
     {
       mailer,
       turnstileBypass: true,
+      remoteIp: nextTestIp(),
       verifyEmailUrlBase: "https://claudeai.chat",
     },
   );
@@ -524,6 +532,7 @@ describe("auth.verify.resendVerification (integ)", () => {
     assert.doesNotMatch(mailer.sent[0].text, /https?:\/\//, "重发验证码邮件不应含 URL");
     assert.match(mailer.sent[0].text, /旧验证码已作废/);
     assert.match(mailer.sent[0].text, /不要把验证码转发/);
+    assert.match(mailer.sent[0].html ?? "", /旧验证码已作废/, "重发也带 HTML 卡片版");
     const newCodeMatch = mailer.sent[0].text.match(/\n {4}(\d{6})\n/);
     assert.ok(newCodeMatch, "新邮件必须含 6 位码");
     const newCode = newCodeMatch![1];

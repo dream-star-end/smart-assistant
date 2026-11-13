@@ -297,6 +297,12 @@ describe('advisorMode snapshot', () => {
 
   it('does not treat untrusted web/shell mentions as file authorization', async (t) => {
     const root = '/home/agent/.openclaude/generated'
+    try {
+      await mkdir(root, { recursive: true })
+    } catch {
+      t.skip('requires writable /home/agent/.openclaude/generated')
+      return
+    }
     const authorized = join(root, 'ocv5-210-e4-this-task.txt')
     const sentinel = join(root, 'ocv5-210-e4-other-task-sentinel.txt')
     t.after(() => Promise.all([rm(authorized, { force: true }), rm(sentinel, { force: true })]))
@@ -350,6 +356,12 @@ describe('advisorMode snapshot', () => {
 
   it('Write/Edit content is not a target path; Read/Write file_path is', async (t) => {
     const root = '/home/agent/.openclaude/generated'
+    try {
+      await mkdir(root, { recursive: true })
+    } catch {
+      t.skip('requires writable /home/agent/.openclaude/generated')
+      return
+    }
     const output = join(root, 'ocv5-210-m6-own-output.txt')
     const sentinel = join(root, 'ocv5-210-m6-other-task-sentinel.txt')
     t.after(() => Promise.all([rm(output, { force: true }), rm(sentinel, { force: true })]))

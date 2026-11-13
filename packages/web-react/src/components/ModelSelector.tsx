@@ -35,7 +35,7 @@ import {
   resolveContextPickerSelection,
   resolveCursorPickerSelection,
 } from '../lib/cursorModelPicker'
-import { EFFORT_OPTIONS, type PreferenceEffort } from '../lib/modelPreferences'
+import type { PreferenceEffort } from '../lib/modelPreferences'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import { readRecentModels, writeRecentModel } from '../lib/recentModels'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
@@ -46,6 +46,7 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from './LongContextCostWarning'
+import { EFFORT_OPTIONS } from './settings/effortOptions'
 import {
   Badge,
   DropdownMenu,

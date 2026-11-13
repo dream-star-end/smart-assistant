@@ -137,5 +137,8 @@ export {
   setContentReviewAlerter,
   setContentReviewPrefilter,
 } from './jevContentReview.js'
+
+// Content review management seams: commercial consumes the package boundary,
+// never another package's src path. Keep the public surface intentionally small.
 export { getContentReviewStore } from './contentReviewStore.js'
 export { shouldBanForStrikes, violationInbox } from './contentReviewNotice.js'
