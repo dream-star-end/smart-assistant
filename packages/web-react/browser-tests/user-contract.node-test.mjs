@@ -3,6 +3,7 @@ import { createRequire } from 'node:module'
 // Real ModelSelector + trusted Chromium clicks. This is NOT a full App/login/live test.
 import { test } from 'node:test'
 import { readFile } from 'node:fs/promises'
+import { cpSync, copyFileSync, readFileSync, symlinkSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -98,7 +99,7 @@ test('legacy commercial 1M selection requires real cancel or confirmation', asyn
   } finally { await browser.close() }
 })
 
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 // Synthetic HTTP/WS backend: validates the gate runner, not production auth/engine integration.
 import { createServer } from 'node:http'

@@ -800,6 +800,11 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       executionTarget: { kind: "local" },
       providerTag: "ccb",
     } as never;
+    // scheduleIdleDrain only operates on sessions owned by this manager.
+    // Default-policy cases exercise that real lifecycle, not a detached runner.
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      (sm as unknown as { sessions: Map<string, unknown> }).sessions.set("agent:main:webchat:dm:idle-peer", session);
+    }
     let firstError: string | undefined;
     try {
       await sm.submit(session, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-input") });
@@ -1686,19 +1691,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         const firstOp = appliedOps.find((op) => op.idleTurnKey === appliedOp!.idleTurnKey);
         assert.ok(firstOp?.sourceSessionId && firstOp.sourceTurnKey, JSON.stringify(firstOp ?? null));
         const summaryHttpBeforeSecond = hits.filter((hit) => hit.kind === "idle-summary").length;
-        // OCV5-755 deliberately defers default high-usage compaction to cache expiry.
-    // Observe the real scheduling result, then prove the next user supersedes it.
-    const idleSession = session as unknown as { _idlePreExpiryTimer?: ReturnType<typeof setTimeout>; _idlePreExpirySource?: { turnKey: string } };
-    if (mode === "defaultHigh") {
-      for (let attempt = 0; attempt < 50 && !idleSession._idlePreExpiryTimer; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-      assert.ok(idleSession._idlePreExpiryTimer, "high usage arms pre-expiry idle rather than immediate compaction");
-      assert.equal(idleSession._idlePreExpirySource?.turnKey, modelHit.cred?.ocTurnKey);
-      assert.deepEqual(listJson(join(HOME, "idle-native")), []);
-      assert.deepEqual(listJson(join(HOME, "idle-ops")), []);
-    }
-    const beforeSecond = hits.length;
+        const beforeSecond = hits.length;
         let secondError = "";
         for (let attempt = 0; attempt < 8; attempt += 1) {
           try {

@@ -82,6 +82,12 @@ test("OCV5-313: actual App refresh preserves owner isolation and quiet failed st
  for(const shell of [oldest,previous,latest]){const toggle=shell.getByTestId("process-toggle");if(await toggle.getAttribute("aria-expanded")!=="true")await toggle.click();const detail=shell.getByTestId("process-detail-toggle");console.log("STRAY_DISCLOSURE_CONTROL",JSON.stringify({width,phase,owner:shell===previous ? "u1" : shell===oldest ? "u0" : "u2",detailControls:await detail.count()}));for(let i=0;i<await detail.count();i++){const control=detail.nth(i);if(await control.getAttribute("aria-expanded")!=="true")await control.click();}}
  assert.equal(await oldest.getByText("OWNER_OLD_QUESTION",{exact:true}).count(),1);
  assert.equal(await latest.getByText(/OWNER_OLD_QUESTION|OWNER_STRAY/).count(),0);
+ // UI-3 step rows keep their ToolCard body folded until the real step toggle opens it.
+ for (const step of await previous.getByTestId("process-step-row").all()) {
+   const toggle = step.getByRole("button").first();
+   if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
+ }
+ await previous.getByTestId("tool-step").first().waitFor();
  assert.equal(await previous.getByTestId("tool-step").count(),2);
  const failed=previous.getByTestId("tool-step").filter({hasText:"未成功"});assert.equal(await failed.count(),1);
  const status=failed.getByText("未成功",{exact:true});await status.waitFor();
