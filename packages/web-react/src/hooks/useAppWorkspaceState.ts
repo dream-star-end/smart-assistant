@@ -47,7 +47,7 @@ export function useAppWorkspaceState() {
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   return {
     urlRoute, params, demo, resetToken, desktopEnroll, studio, routingEnabled,
-    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, projectHome,
+    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, setBoardOpenState, projectHome,
     setProjectHome, pendingRouteProject, setPendingRouteProject, boardView, setBoardView,
     boardTicketId, setBoardTicketId, boardTicketType, setBoardTicketType, view,
     setView, authMode, setAuthMode,

@@ -260,7 +260,7 @@ const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
 export function App() {
   const {
     urlRoute, params, demo, resetToken, desktopEnroll, studio, routingEnabled,
-    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, projectHome,
+    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, setBoardOpenState, projectHome,
     setProjectHome, pendingRouteProject, setPendingRouteProject, boardView, setBoardView,
     boardTicketId, setBoardTicketId, boardTicketType, setBoardTicketType, view,
     setView, authMode, setAuthMode,
@@ -722,7 +722,7 @@ export function App() {
     setPendingRouteProject(null);
     setBoardOpenState(false);
     setProjectHome({ projectId, tab: "overview" });
-  }, []);
+  }, [setPendingRouteProject, setBoardOpenState, setProjectHome]);
   const projectSettingsOpen = projectSettings !== null || ungroupedAssetsOpen;
   const projectSettingsMounted = useMountedOnce(projectSettingsOpen);
   // 新建项目对话框:null=关;{}=普通新建;{sessionId,title}=从该会话创建并移入。
@@ -816,7 +816,7 @@ export function App() {
   // 主页上的项目被删除(本页 ⋯ 删除或别处删除)：列表落定后不再存在 → 回对话。
   useEffect(() => {
     if (projectHome && projectsLoaded && !homeProject) setProjectHome(null);
-  }, [projectHome, projectsLoaded, homeProject]);
+  }, [projectHome, projectsLoaded, homeProject, setProjectHome]);
 
   // Ctrl/⌘K recents: whatever the user actually lands on (project home or a chat).
   const paletteUserId = user?.id ?? (demo ? "demo" : null);
