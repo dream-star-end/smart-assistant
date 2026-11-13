@@ -6050,6 +6050,11 @@
       ],
       "regressions": [
         {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "closing stdin drains the launch reader after one GC"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[ocv5-315-box-cli-follow-up-turn] PASS — a follow-up turn reaches the same box Claude and closing stdin ends it"
