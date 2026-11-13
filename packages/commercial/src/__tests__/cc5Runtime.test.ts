@@ -285,7 +285,10 @@ set -euo pipefail
 SCRIPT_DIR=${JSON.stringify(scriptsDir)}
 PG_DB="test_db"
 cutover_clog() { :; }
-psql_as_postgres() { echo "\${FAKE_PG_V4_ACTIVE:-0}"; }
+psql_as_postgres() {
+  if [[ "$*" == *information_schema.columns* ]]; then echo "\${FAKE_PG_V4_SCHEMA:-true}";
+  else echo "\${FAKE_PG_V4_ACTIVE:-0}"; fi
+}
 source ${JSON.stringify(releaseLib)}
 ${body}
 `

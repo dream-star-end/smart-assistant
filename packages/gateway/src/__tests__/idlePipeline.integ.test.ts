@@ -20,7 +20,7 @@ function queueIdle(name: string, timeout: number, mode: Parameters<typeof runIdl
 }
 
 queueIdle("default low usage skips idle and preserves exact paid business turns", 300_000, "defaultLow");
-queueIdle("default high input plus cache usage reaches real idle proof floor", 300_000, "defaultHigh");
+queueIdle("default high usage reaches proof floor, defers idle and lets the next user supersede it", 300_000, "defaultHigh");
 queueIdle("real submit reaches a short idle no-op without a summary HTTP", 300_000, "short");
 queueIdle("fresh stock summary and business roots short-close through terminal_set", 900_000, "fresh");
 test("live tool continuation keeps the persisted deferred-tools announcement", { timeout: 300_000 }, () => runIdleCase("live2"));

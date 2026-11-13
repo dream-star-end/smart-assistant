@@ -83,7 +83,7 @@ const isInvalid = (e: unknown) => e instanceof RefreshError && e.code === "INVAL
 async function staleChain(label: string, opts: { remember?: boolean; clientIp?: string | null } = {}) {
   const email = `sec-${label}@example.com`;
   const bound = opts.clientIp === undefined ? fp : { ...fp, clientIp: opts.clientIp };
-  await register({ email, password: PASSWORD, turnstile_token: "tok" }, { mailer: new NullMailer(), turnstileBypass: true });
+  await register({ email, password: PASSWORD, turnstile_token: "tok" }, { mailer: new NullMailer(), turnstileBypass: true, remoteIp: CLIENT_IP });
   const x = await login(
     { email, password: PASSWORD, turnstile_token: "tok", ...(opts.remember === undefined ? {} : { remember: opts.remember }) },
     { ...bound, turnstileBypass: true },

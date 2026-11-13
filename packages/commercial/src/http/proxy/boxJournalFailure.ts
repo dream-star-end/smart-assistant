@@ -149,7 +149,7 @@ export async function selectBoxReadOnlyCandidate(client: Pick<PoolClient, "query
     `SELECT request_id,ctx FROM request_finalize_journal
       WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
         AND ctx->>'boxTurnKey'=$3 AND ctx->>'model'=$4 AND ctx->>$5=$6
-        AND NOT (${unsentResumeChildClaimSql("request_finalize_journal")})
+        AND (${unsentResumeChildClaimSql("request_finalize_journal")}) IS NOT TRUE
         AND (${predicate}) LIMIT 2`, values);
   const normal = await query(`NOT (state='aborted' AND NOT (ctx ? 'boxReplayMessage')
     AND COALESCE(ctx->>'boxState','') IN ('failed_stopped','prestart_stopped'))`, params);

@@ -55,7 +55,7 @@ import { type ChatMessage, isTurnDetached } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 import type { User } from "../src/lib/types";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
-import { EPOCH_BAND, packEpoch, timelineIdentity } from "@openclaude/protocol";
+import { EPOCH_BAND, packEpoch, timelineIdentity } from "@openclaude/protocol/browser";
 import { repairPostFinalProcessOrder } from "../src/lib/chat/order";
 import { identityOf, lifecycleOf, projectTimeline } from "../src/lib/timeline/projectLifecycle";
 import {

@@ -342,7 +342,7 @@ describe("delegate admit wiring", () => {
       modelId,
       engine,
       providerId: engine,
-      upstreamModelId: null,
+      upstreamModelId: engine === "grok" ? "grok-4.6" : null,
       contextWindow: 128_000,
       capabilityProfile: {
         supportsVision: false,
@@ -388,7 +388,11 @@ describe("delegate admit wiring", () => {
     let lookups = 0;
     let ctx: any = null;
     const runtime = createDelegateEngineBillingRuntime({
-      getPool: () => ({ async query() { return { rows: [], rowCount: 0 }; } }) as any,
+      getPool: () => ({ async query(sql: string, params: unknown[]) {
+        assert.match(sql, /FROM grok_route_contexts/);
+        assert.deepEqual(params.slice(1), ["7", "42", "grok-build"]);
+        return { rows: [{ model_id: "grok-build" }], rowCount: 1 };
+      } }) as any,
       preCheckRedis: {} as any,
       pricing: { get() { return undefined; } } as any,
       catalog: { assertFresh: async () => snapshot() },
@@ -414,6 +418,7 @@ describe("delegate admit wiring", () => {
       body: {
         model: "grok-build",
         engine: "grok",
+        grokRouteToken: "f".repeat(64),
         agentId: "auditor",
         delegateAgentId: "auditor",
         sessionKey: "agent:auditor:delegate:main:1",
@@ -430,6 +435,7 @@ describe("delegate admit wiring", () => {
       body: {
         model: "grok-build",
         engine: "grok",
+        grokRouteToken: "f".repeat(64),
         agentId: "auditor",
         delegateAgentId: "auditor",
         sessionKey: "agent:auditor:delegate:main:1",

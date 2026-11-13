@@ -835,6 +835,18 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       if (committed >= 1) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    // OCV5-755 deliberately defers default high-usage compaction to cache expiry.
+    // Observe the real scheduling result, then prove the next user supersedes it.
+    const idleSession = session as unknown as { _idlePreExpiryTimer?: ReturnType<typeof setTimeout>; _idlePreExpirySource?: { turnKey: string } };
+    if (mode === "defaultHigh") {
+      for (let attempt = 0; attempt < 50 && !idleSession._idlePreExpiryTimer; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.ok(idleSession._idlePreExpiryTimer, "high usage arms pre-expiry idle rather than immediate compaction");
+      assert.equal(idleSession._idlePreExpirySource?.turnKey, modelHit.cred?.ocTurnKey);
+      assert.deepEqual(listJson(join(HOME, "idle-native")), []);
+      assert.deepEqual(listJson(join(HOME, "idle-ops")), []);
+    }
     const beforeSecond = hits.length;
     let secondSubmitError: unknown;
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -852,9 +864,10 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
     if (secondSubmitError) throw secondSubmitError;
     const short = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ applied?: boolean; summaryText?: string }>;
     report.nativeFiles = short;
-    if (mode === "defaultLow") {
-      assert.deepEqual(short, [], "low-usage default policy must not dispatch native idle");
-      assert.deepEqual(listJson(join(HOME, "idle-ops")), [], "low-usage default policy creates no idle op");
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      assert.deepEqual(short, [], "default policy must not compact immediately after a turn");
+      assert.deepEqual(listJson(join(HOME, "idle-ops")), [], "default policy creates no immediate idle op");
+      assert.equal(idleSession._idlePreExpiryTimer, undefined, "next low-usage user supersedes the old pre-expiry timer");
     } else {
       assert.equal(short.some((file) => file.applied && !file.summaryText), true, JSON.stringify(short));
     }
@@ -1673,7 +1686,19 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         const firstOp = appliedOps.find((op) => op.idleTurnKey === appliedOp!.idleTurnKey);
         assert.ok(firstOp?.sourceSessionId && firstOp.sourceTurnKey, JSON.stringify(firstOp ?? null));
         const summaryHttpBeforeSecond = hits.filter((hit) => hit.kind === "idle-summary").length;
-        const beforeSecond = hits.length;
+        // OCV5-755 deliberately defers default high-usage compaction to cache expiry.
+    // Observe the real scheduling result, then prove the next user supersedes it.
+    const idleSession = session as unknown as { _idlePreExpiryTimer?: ReturnType<typeof setTimeout>; _idlePreExpirySource?: { turnKey: string } };
+    if (mode === "defaultHigh") {
+      for (let attempt = 0; attempt < 50 && !idleSession._idlePreExpiryTimer; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.ok(idleSession._idlePreExpiryTimer, "high usage arms pre-expiry idle rather than immediate compaction");
+      assert.equal(idleSession._idlePreExpirySource?.turnKey, modelHit.cred?.ocTurnKey);
+      assert.deepEqual(listJson(join(HOME, "idle-native")), []);
+      assert.deepEqual(listJson(join(HOME, "idle-ops")), []);
+    }
+    const beforeSecond = hits.length;
         let secondError = "";
         for (let attempt = 0; attempt < 8; attempt += 1) {
           try {

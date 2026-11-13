@@ -34,7 +34,6 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         'INTERNAL_ERROR','USER_CANCELLED')), final_credits bigint)`);
     await client.query(`CREATE TEMP TABLE usage_records (
       request_id text NOT NULL, user_id bigint NOT NULL)`);
-    await client.query(`CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY, state text NOT NULL)`);
     // Pin all journal operations to this one connection, whose temp table
     // shadows the real table. No shared schema or persistent row is touched.
     const privateMarker = "synthetic-private-marker";
@@ -1799,7 +1798,7 @@ test("first Box failure survives cleanup/restart with exact, read-only fallback 
     await query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY,user_id bigint NOT NULL,state text NOT NULL,
       ctx jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),
-      updated_at timestamptz NOT NULL DEFAULT now(),failure_code text,final_credits bigint)`);
+      updated_at timestamptz NOT NULL DEFAULT now(),error_msg text,failure_code text,final_credits bigint)`);
     await query("CREATE TEMP TABLE usage_records(request_id text NOT NULL,user_id bigint NOT NULL)");
     const model = "box-api-claude-opus-5-5";
     const authority = { kind: "bridge_signed" as const, authorityTurnId: "1".repeat(32) };
