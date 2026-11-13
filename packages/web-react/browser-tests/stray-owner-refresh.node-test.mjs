@@ -33,9 +33,9 @@ test("OCV5-313: actual App refresh preserves owner isolation and quiet failed st
  plugins: ownerRed || quietRed ? [{ name: "one-causal-stray-consumer-ablation", setup(b) { b.onLoad({ filter: ownerRed ? /MessageRenderer\.tsx$/ : /ToolCard\.tsx$/ }, ({path}) => {
    assert.equal(resolve(path), ownerRed ? renderer : toolPath);
    const contents=readFileSync(path,"utf8");
-   const needle=ownerRed ? "const renderableMessages = returnStrayRowsToOwnerTurn(safeMessages.filter(" : '<span className="text-faint">{status.label}</span>';
+   const needle=ownerRed ? "returnStrayRowsToOwnerTurn(continuationViewMessages.filter(" : '<span className="text-faint">{status.label}</span>';
    assert.equal(contents.split(needle).length-1,1); transforms++;
-   return {contents:contents.replace(needle, ownerRed ? "const renderableMessages = ((rows) => rows)(safeMessages.filter(" : '<span className="text-danger">{status.label}</span>'),loader:"tsx"};
+   return {contents:contents.replace(needle, ownerRed ? "((rows) => rows)(continuationViewMessages.filter(" : '<span className="text-danger">{status.label}</span>'),loader:"tsx"};
  }); }}] : [], logLevel:"warning" });
  assert.equal(transforms,ownerRed || quietRed ? 1 : 0);
  const cssDir=join(assetDir,"css-build");mkdirSync(cssDir);

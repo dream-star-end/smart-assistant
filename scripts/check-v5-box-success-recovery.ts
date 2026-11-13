@@ -1153,7 +1153,7 @@ async function runWorker(argv: string[]): Promise<void> {
     1, "BOX_STOPPED_PRECHECK_PROOF_MISSING");
   assert.doesNotMatch(stopped.stdout, /^\s*not ok \d+|^\s*(?:not )?ok \d+ .*#\s*(?:SKIP|TODO)\b/m,
     "BOX_STOPPED_PRECHECK_PROOF_NOT_GREEN");
-  emit(BEHAVIOR[8]!);
+  emit(BEHAVIOR[10]!);
   // INC-20261029-BOX-LOGIN-EXPIRED-STOP-REASON: both decoders must reject
   // CLI API-error stand-ins while preserving real answers that mention login.
   const login = spawnSync(process.execPath, ["--import", "tsx", "--test",
@@ -1169,7 +1169,7 @@ async function runWorker(argv: string[]): Promise<void> {
     1, "BOX_LOGIN_STANDIN_PROOF_MISSING");
   assert.doesNotMatch(login.stdout, /^\s*not ok \d+|^\s*(?:not )?ok \d+ .*#\s*(?:SKIP|TODO)\b/m,
     "BOX_LOGIN_STANDIN_PROOF_NOT_GREEN");
-  emit(BEHAVIOR[9]!);
+  emit(BEHAVIOR[11]!);
 }
 
 function parseFormal(argv: string[]): string {

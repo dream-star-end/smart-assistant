@@ -69,6 +69,7 @@ type State = {
   initialMainLoopModel: ModelSetting
   modelStrings: ModelStrings | null
   isInteractive: boolean
+  isToolOnly: boolean
   kairosActive: boolean
   // When true, ensureToolResultPairing throws on mismatch instead of
   // repairing with synthetic placeholders. HFI opts in at startup so
@@ -293,6 +294,7 @@ function getInitialState(): State {
     initialMainLoopModel: null,
     modelStrings: null,
     isInteractive: false,
+    isToolOnly: false,
     kairosActive: false,
     strictToolResultPairing: false,
     sdkAgentProgressSummariesEnabled: false,
@@ -1038,6 +1040,15 @@ export function setTracerProvider(provider: BasicTracerProvider | null): void {
 
 export function getIsNonInteractiveSession(): boolean {
   return !STATE.isInteractive
+}
+
+/** Set only by the explicit credential-free MCP tool-host entrypoint. */
+export function enableToolOnlyMode(): void {
+  STATE.isToolOnly = true
+}
+
+export function getIsToolOnly(): boolean {
+  return STATE.isToolOnly
 }
 
 export function getIsInteractive(): boolean {
