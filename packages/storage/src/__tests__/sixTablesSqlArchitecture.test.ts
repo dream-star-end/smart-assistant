@@ -65,11 +65,17 @@ const WHITELIST = new Set<string>([
   "packages/storage/src/clientSessionsPlan.ts",
   "packages/storage/src/sessionsMigrate.ts",
   "packages/commercial/src/db/pgSessionsBackend.ts",
-  // Snapshot and credits readers stay in the caller's read-only transaction.
+  // #1200: PG sessions backend 的快照拆分模块；在调用方同一 REPEATABLE READ
+  // READ ONLY 事务内读取 session 归属、dispatch 与帧，不能另开 backend 事务。
   "packages/commercial/src/db/sessionSnapshot.ts",
+  // #1200: 快照积分只读投影在同一事务内合并已落 tape 与 pending 的实际扣费，
+  // 按 request_id 去重；不写六表，另开事务会让两种归属之间的迁移被漏计/重计。
   "packages/commercial/src/billing/dispatchSettledCredits.ts",
-  // Transcript restore and bounded metadata cost reader share backend ownership.
+  // OCV5-607: PG sessions backend 拆分；在同一只读事务内验证归属与完整原生存档，
+  // 仍由 pgSessionsBackend 委托并注入原 batch validators，不新增业务 SQL 入口。
   "packages/commercial/src/db/pgCcbTranscriptRestore.ts",
+  // OCV5-614: bounded, SELECT-only PG metadata/exact-call reader. Billing delegates
+  // to this backend module; no history hydration or session mutation is introduced.
   "packages/commercial/src/db/modelSwitchCostContextReader.ts",
   // OCV5-509: the refused-recovery card sweep, split out of pgSessionsBackend for its size cap;
   // it writes only through the backend card writer under the session row lock.
@@ -96,6 +102,21 @@ const WHITELIST = new Set<string>([
   // client_sessions 仅**只读 LEFT JOIN**(id+user_id 归属 + deleted_at 墓碑,判定"用户面已
   // 消失"的 open dispatch)——不写六表;dispatch 域的离场判定放 sessions backend 反而内聚更差。
   "packages/commercial/src/dispatch/turnDispatchStore.ts",
+  // Recovery-store carrier lookup reads the same owner's non-deleted session in
+  // one SELECT. No session writes; WS transport delegates this decision here.
+  "packages/commercial/src/dispatch/turnRecoveryStore.ts",
+  // One read-only ledger reconciliation statement snapshots pending/tape costs
+  // with usage and journals; the operator executes under BEGIN READ ONLY.
+  "packages/commercial/src/billing/turnLabelLedgerReconcile.ts",
+  // SELECT-only split of modelSwitchCostContextReader: whole-session failed-start
+  // proof keeps the same uid/deleted_at/history predicates in one database read.
+  "packages/commercial/src/db/modelSwitchCostFailedStart.ts",
+  // PG metadata backend split: rename/patch both delegate here; receipt and xmin
+  // CAS share the caller's runner and FOR UPDATE ownership lock (OCV5-610/624).
+  "packages/commercial/src/db/sessionMetadataApproval.ts",
+  // Help actor reads session ownership/tombstone with dispatch, user and security
+  // epoch in a single snapshot. It never writes any of the six authority tables.
+  "packages/commercial/src/system-assistant/helpActor.ts",
   // Settle-time usage attribution snapshots chat_projects.board_project_id via a
   // read-only JOIN of client_sessions on the same billing client/transaction.
   // It does not write the six tables. Routing through sessions backend would

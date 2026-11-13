@@ -11217,7 +11217,18 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       false,
       'root scripts/run-container-gateway.sh must stay excluded',
     )
-    assert.equal(existsSync(path.join(staging, 'scripts')), false, 'root /scripts/ must be pruned')
+    // Remote native tool hosting now has exactly two runtime dependencies in /scripts/.
+    // Enumerate the real pruned tree: retaining any other host operation is still a failure.
+    const scriptFiles: string[] = []
+    const collectScripts = async (relative = ''): Promise<void> => {
+      for (const entry of await readdir(path.join(staging, 'scripts', relative), { withFileTypes: true })) {
+        const name = path.join(relative, entry.name)
+        if (entry.isDirectory()) await collectScripts(name)
+        else scriptFiles.push(name)
+      }
+    }
+    await collectScripts()
+    assert.deepEqual(scriptFiles.sort(), ['agent-remote/cc5-toolhost-supervisor.py', 'ocv5-289/box_keeper.py'])
     assert.equal(
       existsSync(path.join(staging, 'packages/mcp-memory/scripts/build-oc-memory-mcp.sh')),
       true,
@@ -11262,7 +11273,7 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       /if \[ -f "\$staging\/packages\/cli\/scripts\/build-container-gateway\.sh" \]; then/,
     )
     const excludes = await readFile(excludesPath, 'utf8')
-    assert.match(excludes, /^\/scripts\/$/m)
+    assert.match(excludes, /^- \/scripts\/\*\*$/m)
     assert.doesNotMatch(excludes, /packages\/cli\/scripts/)
     const wrapperSrc = await readFile(
       path.join(root, 'packages/cli/scripts/run-container-gateway.sh'),

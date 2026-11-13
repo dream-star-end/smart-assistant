@@ -8,7 +8,7 @@ import { createPgSessionsBackend, type PgSessionsBackend } from '../db/pgSession
 import { snapshotAdmissionRequest, ADMISSION_RESTART_UNEXECUTED } from '../dispatch/admissionRestartRecovery.js'
 import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
 import { casAdmittedToRejecting, casToTerminal, getDispatch } from '../dispatch/turnDispatchStore.js'
-import { claimDueRecoveryJobs, releaseRecoveryPreReceipt } from '../dispatch/turnRecoveryStore.js'
+import { claimDueRecoveryJobs, releaseRecoveryPreReceipt, listDueRecoveryCarrierContainers } from '../dispatch/turnRecoveryStore.js'
 import { admitDurableControl } from '../dispatch/turnControlStore.js'
 import { runReconcileTick, runShutdownDispatchHandoff } from '../dispatch/turnDispatchReconciler.js'
 import { truncateAllForTest, useDedicatedTestDatabase } from './helpers/db.js'
@@ -447,4 +447,17 @@ test('OCV5-511 a permanently rejected automatic identity hands off once and its 
   await completeTask(successor.dispatchId, successor.clientMessageId)
   assert.equal((await getDispatch(getPool(), successor.dispatchId))?.outcome, 'completed')
   assert.ok((await jobs()).every(row => row.status === 'completed'))
+})
+
+
+test('OCV5-763 due recovery carrier selection excludes deleted, foreign and other-channel sessions', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  await seed({ journal: 'inflight' })
+  assert.equal(await backend.reconcileAutomaticRecoveryJobs(uid), 1)
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'v5'), [{ container_id: 511 }])
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid + 1n, 'v5'), [])
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'other-channel'), [])
+  assert.equal(await backend.softDeleteMasterSession(sessionId, `c:${uid}`), true)
+  assert.equal((await jobs()).length, 1, 'the tombstone filter, not deleting the recovery job, prevents a wake')
+  assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'v5'), [])
 })

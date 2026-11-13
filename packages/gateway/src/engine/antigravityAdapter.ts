@@ -1244,7 +1244,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   interrupt(reason: 'user' | 'system' = 'system'): boolean {
     const ctx = this.active
-    if (!ctx?.proc || ctx.terminal || ctx.sawResult || ctx.abandoned || (ctx.proc.killed && !ctx.procClosed)) return false
+    if (!ctx?.proc || ctx.terminal || ctx.abandoned || (ctx.proc.killed && !ctx.procClosed)) return false
     ctx.interruptReason ??= reason
     ctx.interrupted = true
     if (!ctx.procClosed) killProcessGroup(ctx.proc, 'SIGINT')
