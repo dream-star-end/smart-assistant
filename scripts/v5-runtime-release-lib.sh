@@ -432,7 +432,31 @@ oc_hotcfg_install_deps_in_image() {
   "$OC_DOCKER_BIN" run --rm --network=host --entrypoint /bin/sh --user 0:0 \
     -v "$staging:/build" -w /build "$image_id" -c '
       set -e
-      npm ci --include=dev --no-audit --no-fund
+      log=$(mktemp /tmp/oc-runtime-npm.XXXXXX)
+      trap "rm -f \"$log\"" EXIT
+      lock=$(sha256sum package-lock.json)
+      attempt=1
+      while :; do
+        [ "$(sha256sum package-lock.json)" = "$lock" ] || {
+          echo "FATAL[hotcfg]: npm ci lock changed" >&2; exit 1;
+        }
+        rc=0
+        npm ci --include=dev --no-audit --no-fund >"$log" 2>&1 || rc=$?
+        cat "$log" >&2
+        [ "$(sha256sum package-lock.json)" = "$lock" ] || {
+          echo "FATAL[hotcfg]: npm ci lock changed" >&2; exit 1;
+        }
+        [ "$rc" -eq 0 ] && break
+        # npm can abort a response body without retrying its download. Only
+        # this observed transient failure gets one retry in the same isolated
+        # container; npm ci cleans its partial install, never a live donor.
+        [ "$attempt" -eq 1 ] && [ "$rc" -eq 1 ] \
+          && [ "$(sed -n "s/^npm error code //p" "$log")" = ECONNRESET ] \
+          && grep -qx "npm error network aborted" "$log" || exit "$rc"
+        attempt=2
+        echo "[hotcfg] npm response reset; retry original npm ci once" >&2
+        sleep 1
+      done
     ' >&2 || { oc_hotcfg__die "npm ci 失败(整体失败,不降级 npm install)"; return 1; }
 }
 
