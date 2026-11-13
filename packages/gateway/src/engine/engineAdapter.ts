@@ -22,7 +22,7 @@ import type { GrokExecutionDescriptor } from '@openclaude/protocol'
  */
 import type { EventEmitter } from 'node:events'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import type { GoalStateSnapshot, JobTerminal, OutboundContentBlock } from '@openclaude/protocol'
+import type { RemoteExecutionBackend, GoalStateSnapshot, JobTerminal, OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
 import type {
@@ -105,6 +105,8 @@ export interface AutomaticRetryState {
 /** 一次 turn 的入参。spec 契约字段之外,M0 为保 CCB 成本 delta 基线逐字节不变,
  *  额外携带 sessionTotals ref / toolUseIdToName(spec 明示允许 totals ref 方案)。 */
 export interface TurnParams {
+  /** Frozen user no-write restriction for this advisor turn, including retries. */
+  readOnly?: boolean
   input: string | Array<{ type: string; [k: string]: unknown }>
   /** PG coordinator-originated turn. Adapters may use this to enforce that
    * no hidden runner-local queue forms behind the platform claim. */
@@ -209,6 +211,7 @@ export interface EngineTurnRun {
  * M0 保持与 SubprocessRunner 同名同语义,后续底座各自实现或声明不支持。
  */
 export interface EngineAdapter extends EventEmitter {
+  readonly executionBackend?: RemoteExecutionBackend
   readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
   readonly capabilities: EngineCapabilities
 
@@ -224,6 +227,10 @@ export interface EngineAdapter extends EventEmitter {
   /** Only the explicit browser Stop may use reason='user'; automatic timeout,
    * quota and recovery interrupts default to system. */
   interrupt(reason?: 'user' | 'system'): boolean
+  /** Process is exiting (SIGTERM/SIGINT): no live turn of this generation can
+   * continue. Synchronous and fire-and-forget; called before any other
+   * shutdown stage so remote side effects start inside the stop grace. */
+  beginPlannedShutdown?(): void
   shutdown(): Promise<void>
   /** Resolves only after the current process generation's stdout has closed.
    * `shutdown()` itself is deliberately bounded for process supervision, so

@@ -6,6 +6,7 @@ import type { OutboundMessageWire } from "../lib/chat/frames";
 import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
+import { manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS, shouldShowScrollToBottom } from "./MessageRenderer";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
 import * as AgentGroupMod from "./chat/AgentGroupCard";
@@ -20,11 +21,15 @@ import {
   THINKING_MULTI_SEGMENT,
 } from "./tool/__fixtures__/sessionToolTexts";
 import { ChatInteractionContext, ToolCardActionsContext } from "./tool/context";
+import { preloadTimelineCards } from "./chat/lazyTimelineCards";
+import { preloadProcessStages } from "./chat/lazyProcessStages";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 
-// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+// 渲染工具卡展开体与低频时间线卡片的断言先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(preloadToolBody);
+loadBeforeAll(preloadTimelineCards);
+loadBeforeAll(preloadProcessStages);
 
 afterEach(() => {
   cleanup();
@@ -207,20 +212,20 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(onTopUp).toHaveBeenCalledTimes(1);
   });
 
-  test("assistant：权威过期用温和免单卡，隐藏原始 JSON 并可重试", () => {
-    const onRegenerate = vi.fn();
+  test("assistant：历史已免单权威错误隐藏原始 JSON 并在原会话继续", () => {
+    const onContinueInterrupted = vi.fn();
     const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"}}';
     const { container } = renderMsg(mk("assistant", {
       text: raw,
       _errorCode: "ENGINE_ERROR",
       _errorDetail: raw,
       usage: { waived: true },
-    }), { cb: { onRegenerate } });
+    }), { cb: { onContinueInterrupted, resolveInterruptedContinuation: () => mk("user") } });
     expect(screen.getByText("本轮已自动免单")).toBeInTheDocument();
     expect(screen.getByText(/已发送站内信说明/)).toBeInTheDocument();
     expect(container.textContent).not.toMatch(/MODEL_AUTHORITY_INVALID|forbidden|403/);
-    fireEvent.click(screen.getByRole("button", { name: "重新尝试" }));
-    expect(onRegenerate).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
   });
 
   test("assistant：截断 banner 含「继续」，点击触发 onContinue", () => {
@@ -953,8 +958,8 @@ describe("MessageList 失败轮单一错误出口", () => {
     status: "error",
   });
 
-  test("可见助手错误卡接管失败说明与重试，用户行不重复展示", () => {
-    const onRetrySend = vi.fn();
+  test("可见助手错误卡接管失败说明与继续，用户行不重复展示", () => {
+    const onContinueInterrupted = vi.fn();
     const messages = [
       failedUser,
       mk("assistant", {
@@ -969,8 +974,8 @@ describe("MessageList 失败轮单一错误出口", () => {
         messages={messages}
         sending={false}
         cb={{
-          onRetrySend,
-          resolveRetryTarget: (id) => id === failedUser.id ? failedUser : undefined,
+          onContinueInterrupted,
+          resolveInterruptedContinuation: () => failedUser,
         }}
         onRespondPermission={() => {}}
       />,
@@ -978,7 +983,7 @@ describe("MessageList 失败轮单一错误出口", () => {
 
     expect(screen.getByText("你是什么模型")).toBeInTheDocument();
     expect(screen.queryByText("发送失败")).toBeNull();
-    const retries = screen.getAllByRole("button", { name: "重试" });
+    const retries = screen.getAllByRole("button", { name: "继续" });
     expect(retries).toHaveLength(1);
     // W3:错误卡正文是错误目录的人话(codex_route_unavailable)。
     expect(screen.getByRole("alert")).toHaveTextContent("模型连接暂时不可用，请稍后重试。");
@@ -986,21 +991,21 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(screen.queryByText("查看请求信息")).toBeNull();
 
     fireEvent.click(retries[0]);
-    expect(onRetrySend).toHaveBeenCalledTimes(1);
-    expect(onRetrySend).toHaveBeenCalledWith(failedUser);
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(onContinueInterrupted).toHaveBeenCalledWith(messages[1]);
   });
 
-  test("没有可见错误卡的 transport-only 失败仍保留用户行重试", () => {
+  test("没有可见错误卡的 transport-only 失败仍保留用户行继续", () => {
     render(
       <MessageList
         messages={[failedUser]}
         sending={false}
-        cb={{ onRetrySend: vi.fn() }}
+        cb={{ onContinueInterrupted: vi.fn() }}
         onRespondPermission={() => {}}
       />,
     );
     expect(screen.getByText("发送失败")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "重试" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
   });
 
   test("自动恢复最终耗尽时把隐藏 child 的错误归回可见原问题", () => {
@@ -1012,7 +1017,7 @@ describe("MessageList 失败轮单一错误出口", () => {
       _automaticRecovery: true,
       _recoveryOfClientMessageId: failedUser.id,
     });
-    const onRetrySend = vi.fn();
+    const onContinueInterrupted = vi.fn();
     render(
       <MessageList
         messages={[
@@ -1031,8 +1036,8 @@ describe("MessageList 失败轮单一错误出口", () => {
         ]}
         sending={false}
         cb={{
-          onRetrySend,
-          resolveRetryTarget: (id) => id === recoveryChild.id ? recoveryChild : undefined,
+          onContinueInterrupted,
+          resolveInterruptedContinuation: (error) => error._clientMessageId === recoveryChild.id ? recoveryChild : undefined,
         }}
         onRespondPermission={() => {}}
       />,
@@ -1041,10 +1046,10 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(screen.getByText("你是什么模型")).toBeInTheDocument();
     expect(screen.queryByText("AUTO_RECOVERY_CONTROL_ROW")).toBeNull();
     expect(screen.queryByText("发送失败")).toBeNull();
-    const retries = screen.getAllByRole("button", { name: "重试" });
+    const retries = screen.getAllByRole("button", { name: "继续" });
     expect(retries).toHaveLength(1);
     fireEvent.click(retries[0]);
-    expect(onRetrySend).toHaveBeenCalledWith(recoveryChild);
+    expect(onContinueInterrupted).toHaveBeenCalledWith(expect.objectContaining({ id: "a-final-recovery-error" }));
   });
 
   test("自动恢复已成功时，原消息不再显示发送失败和继续", () => {
@@ -1086,6 +1091,8 @@ describe("MessageList 失败轮单一错误出口", () => {
 
   test("自动恢复子轮的错误卡被滤掉时，原消息仍显示发送失败", () => {
     const onRetrySend = vi.fn();
+    const onContinueInterrupted = vi.fn();
+    const original = structuredClone(failedUser);
     render(
       <MessageList
         messages={[
@@ -1106,15 +1113,19 @@ describe("MessageList 失败轮单一错误出口", () => {
           } as unknown as Partial<ChatMessage>),
         ]}
         sending={false}
-        cb={{ onRetrySend }}
+        cb={{ onRetrySend, onContinueInterrupted }}
         onRespondPermission={() => {}}
       />,
     );
     expect(screen.getByText("发送失败")).toBeInTheDocument();
-    const retries = screen.getAllByRole("button", { name: "重试" });
-    expect(retries).toHaveLength(1);
-    fireEvent.click(retries[0]);
-    expect(onRetrySend).toHaveBeenCalledWith(failedUser);
+    const buttons = screen.getAllByRole("button", { name: "继续" });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(onContinueInterrupted).toHaveBeenCalledWith(failedUser);
+    expect(onRetrySend).not.toHaveBeenCalled();
+    expect(failedUser).toEqual(original);
+    expect(screen.queryByText("↻ 自动重试")).toBeNull();
   });
 
   test("OCV5-645 自动恢复子行在、源行无快照但已有正文:正文照常显示,只藏错误卡", () => {
@@ -1202,7 +1213,7 @@ describe("MessageList 失败轮单一错误出口", () => {
           failedUser,
           mk("assistant", {
             id: "a-source-error-after-manual",
-            text: "SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY",
+            text: "SOURCE_PARTIAL_ANSWER_AFTER_MANUAL_RECOVERY",
             _clientMessageId: failedUser.id,
             _errorCode: "model_capacity",
           }),
@@ -1221,7 +1232,7 @@ describe("MessageList 失败轮单一错误出口", () => {
     );
     expect(screen.getByText("你是什么模型")).toBeInTheDocument();
     expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
-    expect(screen.queryByText("SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY")).toBeNull();
+    expect(screen.getByText("SOURCE_PARTIAL_ANSWER_AFTER_MANUAL_RECOVERY")).toBeInTheDocument();
     expect(screen.getByText("RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW")).toBeInTheDocument();
     // W3:错误卡正文是错误目录的人话(codex_route_unavailable)。
     expect(screen.getByRole("alert")).toHaveTextContent("模型连接暂时不可用，请稍后重试。");
@@ -1231,7 +1242,7 @@ describe("MessageList 失败轮单一错误出口", () => {
 describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
   const failedUser = mk("user", { id: "u-continued-source", text: "部署并验证", status: "sent" });
   const committed = (id: string, text: string) => mk("assistant", {
-    id, text, _clientMessageId: failedUser.id, _errorCode: "engine_error",
+    id, text: "SOURCE_PARTIAL_ANSWER", _clientMessageId: failedUser.id, _errorCode: "engine_error",
     _errorCardSnapshot: { disposition: "card", tone: "red", title: "任务执行失败", message: text },
   });
   const child = (extra: Partial<ChatMessage>) => mk("user", {
@@ -1250,6 +1261,7 @@ describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
     renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"), child({}),
       mk("assistant", { id: "a-resumed", text: "RESUMED_PROGRESS", _clientMessageId: "u-continue-child" })]);
     expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.getByText("SOURCE_PARTIAL_ANSWER")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.queryByRole("button", { name: /重新尝试|从断点继续/ })).toBeNull();
     expect(screen.getByText("RESUMED_PROGRESS")).toBeInTheDocument();
@@ -1260,6 +1272,7 @@ describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
       mk("assistant", { id: "a-child-error", text: "CHILD_REAL_FAILURE", _clientMessageId: "u-continue-child",
         _errorCode: "codex_route_unavailable" })]);
     expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.getByText("SOURCE_PARTIAL_ANSWER")).toBeInTheDocument();
     expect(screen.getByText("CHILD_REAL_FAILURE")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toBeInTheDocument();
   });
@@ -1678,7 +1691,7 @@ describe("AgentGroupCard server-authored 骨架行渲染(债A)", () => {
         _reviewVerdict: "PASS",
       }),
     );
-    const verdict = screen.getByText("PASS");
+    const verdict = screen.getByText("通过");
     expect(screen.getByText("完成")).toBeInTheDocument();
     expect(verdict.parentElement).toHaveClass("flex-wrap", "max-w-[55%]");
   });
@@ -1714,7 +1727,7 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("通过")).toBeInTheDocument();
     expect(screen.getByText("7 积分")).toBeInTheDocument();
   });
 
@@ -1761,7 +1774,7 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
     expect(screen.queryByText(/团队协作/)).not.toBeInTheDocument();
     expect(screen.getByText("3 积分")).toBeInTheDocument();
     expect(screen.getByText("5 积分")).toBeInTheDocument();
-    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("通过")).toBeInTheDocument();
   });
 
   test("典型团队叙事流:并行批次面板 → 队长整合文本 → 审查卡按时序独立在后(债D 成本齐全)", () => {
@@ -1784,7 +1797,7 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
     ]);
     // 面板只含并行两人;审查卡独立出现,且 DOM 顺序在整合文本之后。
     expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
-    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("通过")).toBeInTheDocument();
     const html = container.innerHTML;
     expect(html.indexOf("队长整合结论")).toBeGreaterThan(html.indexOf("团队协作"));
     expect(html.indexOf("审查草稿")).toBeGreaterThan(html.indexOf("队长整合结论"));
@@ -1973,10 +1986,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
         }}
       />,
     );
-    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击重试" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击继续" })).toBeTruthy());
     expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击重试" }));
+    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击继续" }));
     await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(2));
   });
 
@@ -2419,10 +2432,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(button).toHaveAttribute("aria-busy", "true");
   });
 
-  test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", async () => {
+  test("云端加载失败 → 按钮显示「加载失败，点击继续」且可点(重试)", async () => {
     const onLoadOlder = vi.fn();
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, error: true, onLoadOlder });
-    const btn = screen.getByRole("button", { name: /加载失败，点击重试/ });
+    const btn = screen.getByRole("button", { name: /加载失败，点击继续/ });
     expect(btn).not.toBeDisabled();
     fireEvent.click(btn);
     await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
@@ -4260,12 +4273,12 @@ test("frozen error keeps original card and displays recovery rejection once", ()
     mk("assistant", { id: "notice-error", text: "", _clientMessageId: "notice-source", _errorCode: "ENGINE_ERROR",
       _recoverySkippedNotice: notice,
       _errorCardSnapshot: { disposition: "card", tone: "red", title: "首次错误标题", message: "首次错误正文不可改" } }),
-  ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
+  ]} sending={false} cb={{ onContinueInterrupted: () => {}, resolveInterruptedContinuation: () => mk("user") }} onRespondPermission={() => {}} />);
   expect(screen.getAllByText("首次错误标题")).toHaveLength(1);
   expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveAttribute("data-notice-tone", "failed");
   expect(screen.getAllByText("首次错误正文不可改")).toHaveLength(1);
   expect(screen.getAllByText(notice)).toHaveLength(1);
-  expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
+  expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
 });
 
 
@@ -4275,7 +4288,7 @@ test("silent error rejection uses only the existing warning feedback surface", (
     mk("user", { id: "silent-source", text: "原请求" }),
     mk("assistant", { id: "silent-error", text: "", _clientMessageId: "silent-source", _errorCode: "engine_error",
       _recoverySkippedNotice: notice, _errorCardSnapshot: { disposition: "silent" } }),
-  ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
+  ]} sending={false} cb={{ onContinueInterrupted: () => {}, resolveInterruptedContinuation: () => mk("user") }} onRespondPermission={() => {}} />);
   expect(screen.getAllByText(notice)).toHaveLength(1);
   expect(screen.getAllByText("这句没有发出去")).toHaveLength(1);
   expect(screen.queryByTestId("recovery-skipped-notice")).toBeNull();
@@ -4286,7 +4299,7 @@ test("same-reference recovery feedback updates through memo without rewriting th
   const row = mk("assistant", { id: "memo-error", text: "", _clientMessageId: "memo-source", _errorCode: "engine_error",
     _errorCardSnapshot: { disposition: "card", tone: "red", title: "固定标题", message: "固定错误正文" } });
   const messages = [mk("user", { id: "memo-source", text: "请求" }), row];
-  const props = { messages, sending: false, cb: { onRegenerate: () => {} }, onRespondPermission: () => {} };
+  const props = { messages, sending: false, cb: { onContinueInterrupted: () => {}, resolveInterruptedContinuation: () => mk("user") }, onRespondPermission: () => {} };
   const view = render(<MessageList {...props} />);
   const context = { isLast: true, sending: false };
   const absent = messageSignature(row, context);
@@ -4302,7 +4315,7 @@ test("same-reference recovery feedback updates through memo without rewriting th
   expect(screen.queryByText("反馈乙")).toBeNull(); expect(screen.queryByTestId("recovery-skipped-notice")).toBeNull();
   expect(screen.getAllByText("固定标题")).toHaveLength(1); expect(screen.getAllByText("固定错误正文")).toHaveLength(1);
   expect(screen.getByText("固定标题").closest("[role=alert]")).toHaveAttribute("data-notice-tone", "failed");
-  expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
+  expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
 });
 
 
@@ -4313,11 +4326,11 @@ test("frozen rejection already in original message appears only once", () => {
     mk("assistant", { id: "same-notice-error", text: "", _clientMessageId: "same-notice-source", _errorCode: "ENGINE_ERROR",
       _recoverySkippedNotice: notice,
       _errorCardSnapshot: { disposition: "card", tone: "red", title: "首次错误标题", message: notice } }),
-  ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
+  ]} sending={false} cb={{ onContinueInterrupted: () => {}, resolveInterruptedContinuation: () => mk("user") }} onRespondPermission={() => {}} />);
   expect(screen.getAllByText(notice)).toHaveLength(1);
   expect(screen.getAllByText("首次错误标题")).toHaveLength(1);
   expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveAttribute("data-notice-tone", "failed");
-  expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
+  expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
 });
 
 describe("OCV5-390: one action row per turn, on its final answer", () => {
@@ -4385,6 +4398,43 @@ describe("OCV5-390: one action row per turn, on its final answer", () => {
       .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
   });
 });
+
+describe('system action authority in actual message history', () => {
+  const id = 'b5be0795-e604-45ee-bd8b-a519324b5cf4'
+  const text = ['```ui', JSON.stringify({ type: 'system_action', proposalId: id }), '```'].join('\n')
+  function actionFixture() {
+    const detail = { id, operationId: 'preferences.update', title: '更改通知', state: 'prepared' as const, executor: 'master' as const,
+      createdAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 60000, result: null, previewHash: 'a'.repeat(64),
+      preview: { title: '更改通知', description: '后续通知', scope: '当前账号', before: [], after: [], consequences: [], price: { kind: 'none' as const, label: '无费用' }, destructive: false } }
+    return { identityKey: 'fixture-history-person', getDetail: vi.fn(async () => detail),
+      getConfirmation: vi.fn(async () => ({ detail, nonce: 'n'.repeat(43) })),
+      confirm: vi.fn(async () => detail), deny: vi.fn(async () => detail) }
+  }
+  test('read-only MessageList cannot inherit global approval actions', async () => {
+    const actions = actionFixture()
+    render(<ToolCardActionsContext.Provider value={{ systemActions: actions }}>
+      <MessageList messages={[mk('assistant', { text })]} sending={false} cb={{}} onRespondPermission={() => {}} readOnly />
+    </ToolCardActionsContext.Provider>)
+    await screen.findByText('只读记录')
+    expect(actions.getDetail).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: '查看并确认' })).not.toBeInTheDocument()
+  })
+  test('changing an already interactive message to read-only revokes its open sheet', async () => {
+    const actions = actionFixture()
+    const tree = (readOnly: boolean) => <ToolCardActionsContext.Provider value={{ systemActions: actions }}>
+      <MessageRenderer message={mk('assistant', { text })} sig='stable-history-row' isLast sending={false} inActiveTurn={false}
+        cb={{}} onRespondPermission={() => {}} readOnly={readOnly} />
+    </ToolCardActionsContext.Provider>
+    const view = render(tree(false))
+    fireEvent.click(await screen.findByRole('button', { name: '查看并确认' }))
+    await screen.findByRole('dialog')
+    view.rerender(tree(true))
+    await screen.findByText('只读记录')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(actions.confirm).not.toHaveBeenCalled()
+  })
+})
+
 // 「已送达」= 容器已确认接单、回复还没开始。sent 同时也是停止 / 服务重启中断 / 重复受理 / 自动恢复源轮的
 // 落定态,REST 对账、自动重试软状态、停止收尾都会把一条早已出过回复的用户行写回 sent;标签若只看
 // status,就会在已回复或已结束的消息下反复冒出来又消失。
@@ -4415,4 +4465,56 @@ describe("「已送达」只属于在飞且还没有回复的那一轮", () => {
     expect(screen.getByText("第二问")).toBeInTheDocument();
     expect(screen.queryByText("已送达")).not.toBeInTheDocument();
   });
+});
+
+
+test("real MessageList keeps one Continue on a terminal error before trailing transport rows", () => {
+  const user = mk("user", { id: "continue-source", text: "原目标", status: "error" });
+  const terminal = mk("assistant", { id: "continue-terminal", text: "已完成前半段",
+    _clientMessageId: user.id, _errorCode: "MODEL_AUTHORITY_EXPIRED", usage: { costCredits: "12" } });
+  const messages = [user, terminal,
+    mk("assistant", { id: "continue-locator", text: "", _clientMessageId: user.id, _payloadDeferred: true }),
+    mk("assistant", { id: "continue-status", text: "本轮结束", _clientMessageId: user.id, _turnStatusRecord: true })];
+  const onContinueInterrupted = vi.fn();
+  const onRegenerate = vi.fn();
+  render(<MessageList messages={messages} sending={false}
+    cb={{ onContinueInterrupted, onRegenerate, resolveInterruptedContinuation: (error) => manualTaskContinuationSource(messages, error) }}
+    onRespondPermission={() => {}} />);
+  const buttons = screen.getAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  fireEvent.click(buttons[0]);
+  expect(onContinueInterrupted).toHaveBeenCalledWith(terminal);
+  expect(onRegenerate).not.toHaveBeenCalled();
+  expect(screen.getByText("已完成前半段")).toBeInTheDocument();
+});
+
+test("system callback user turn renders as centered gray single-line notice with click-to-expand details", () => {
+  const rawCallbackText = [
+    "[系统通知 · 自进化租约列车结果]",
+    "租约: ls-20261104T194918Z-7edb9cb07a72",
+    "终态: failed",
+    "期望 SHA: 702f5ca064b76bd37a01dae8ff9cbfac3437c3b8",
+  ].join("\n");
+  const callbackMsg = mk("user", {
+    id: "lsc-eaf9a356aaec2f3a56552236",
+    text: rawCallbackText,
+    status: "sent",
+  });
+  render(
+    <MessageList
+      messages={[callbackMsg]}
+      sending={true}
+      cb={{ onQuote: vi.fn(), onEditResend: vi.fn() }}
+      onRespondPermission={() => {}}
+    />,
+  );
+  expect(screen.getByTestId("system-callback-row")).toBeInTheDocument();
+  expect(screen.queryByTestId("user-row")).not.toBeInTheDocument();
+  expect(screen.getByText("系统回调 · 发布列车未通过，Agent 正在处理")).toBeInTheDocument();
+  expect(screen.queryByText(/ls-20261104T194918Z-7edb9cb07a72/)).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "引用" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "编辑" })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByTestId("system-callback-summary"));
+  expect(screen.getByText(/ls-20261104T194918Z-7edb9cb07a72/)).toBeInTheDocument();
 });

@@ -10,6 +10,7 @@ import { V5_GROK_RELAY_PREFIX } from './v5GrokRelay.js'
 import { V5_ZCODE_RELAY_PREFIX } from './v5ZcodeRelay.js'
 import { V5_ANTIGRAVITY_RELAY_PREFIX } from './v5AntigravityRelay.js'
 import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
+import type { AdvisorAdmitRouteOk } from './advisorCodexRoute.js'
 import { resolveEngine } from './engine/registry.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 
@@ -302,6 +303,56 @@ export function _buildSafeGrokRouteOverride(args: {
 //     从 v3 的"取已知字段"收紧为"未知字段即拒",并加长度上限)。
 //   - 门控用 resolveEngine(model, agent) === 'codex' 单点收口,而非 v3 的
 //     agent.provider 判断 —— v5 任何 agent 都能以 gpt-5.5 骑 codex 底座。
+
+/**
+ * Project a master-issued Codex admit route (official_oauth marker or opaque
+ * api_relay token) into this process's provider override. Shared by advisor
+ * consults and regular delegates (OCV5-729). The loopback base URL is built
+ * from this gateway's own listen port — master never supplies a baseUrl, and
+ * official_oauth stays the exact single-key `{ kind }` shape.
+ */
+export function _buildCodexAdmitRouteOverride(args: {
+  route: AdvisorAdmitRouteOk
+  agentId: string
+  model: string
+  officialRelayPort: number
+  /** Signed master catalog projection, when the caller has one. */
+  authority?: {
+    canonicalModel: string
+    engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
+  }
+}): CodexProviderConfigOverride | null {
+  if (args.route.kind === 'official_oauth') {
+    return _buildSafeCodexRouteOverride({
+      agent: { id: args.agentId },
+      model: args.model,
+      rawRoute: { kind: 'official_oauth' },
+      officialRelayPort: args.officialRelayPort,
+      ...(args.authority ? { authority: args.authority } : {}),
+    })
+  }
+  if (
+    !Number.isInteger(args.officialRelayPort) ||
+    args.officialRelayPort <= 0 ||
+    args.officialRelayPort > 65535
+  ) {
+    return null
+  }
+  return _buildSafeCodexRouteOverride({
+    agent: { id: args.agentId },
+    model: args.model,
+    rawRoute: {
+      baseUrl: `http://127.0.0.1:${args.officialRelayPort}${V3_CODEX_RELAY_PREFIX}/route/${args.route.token}`,
+      modelProvider: args.route.modelProvider,
+      providerName: args.route.providerName ?? null,
+      wireApi: args.route.wireApi ?? 'responses',
+      preferredAuthMethod: args.route.preferredAuthMethod ?? 'apikey',
+      disableResponseStorage: args.route.disableResponseStorage ?? true,
+    },
+    officialRelayPort: args.officialRelayPort,
+    ...(args.authority ? { authority: args.authority } : {}),
+  })
+}
 
 /** official_oauth relay override 的 codex provider id(TOML key,只允许
  *  [A-Za-z0-9_-])。 */

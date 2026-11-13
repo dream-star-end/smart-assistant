@@ -1,3 +1,4 @@
+import { isCc5ExecutionBackend, type Cc5ExecutionBackend, type PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * CcbAdapter — CCB(claude-code-best)底座的 EngineAdapter 实现。
  *
@@ -29,6 +30,7 @@ import {
   resolveCcbHarness,
   type PermissionResponse,
   type SdkMessage,
+  type TurnModelAuthority,
 } from '../subprocessRunner.js'
 import { TelemetryChannel, type OcTelemetryEvent } from '../telemetryChannel.js'
 import type {
@@ -49,7 +51,7 @@ import type {
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { notifyClaimFenceOf } from '../engineNotifier.js'
 import { createLogger } from '../logger.js'
-import { renewTurnLease } from '../masterTurnLease.js'
+import { refreshTurnModelAuthorityLease, RenewTurnLeaseError } from '../masterTurnLease.js'
 import { notifyBoxUserStop } from './boxUserStopClient.js'
 
 const log = createLogger({ module: 'ccbAdapter' })
@@ -310,9 +312,9 @@ function buildTurnSummary(
       cacheCreationTokens: result.cacheCreationTokens,
       totalTokens: result.totalTokens,
     },
-    assistantText: errorKind === 'model_authority' ? '' : result.assistantText,
+    assistantText: result.assistantText,
     thinkingText: result.thinkingText,
-    assistantSegments: errorKind === 'model_authority' ? [] : result.assistantSegments,
+    assistantSegments: result.assistantSegments,
     thinkingSegments: result.thinkingSegments,
     tools: result.tools,
     runtimeEvents: errorKind === 'model_authority'
@@ -380,6 +382,7 @@ const FORWARDED_RUNNER_EVENTS = [
 
 export class CcbAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId: string = 'ccb'
+  readonly executionBackend?: Cc5ExecutionBackend
   readonly capabilities: EngineCapabilities = {
     billingMode: 'proxy',
     supportsEffort: true,
@@ -431,6 +434,9 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
+    if (Boolean(opts.executionBackend) !== Boolean(opts.cc5BridgePort)) throw new Error('CC5_BACKEND_TRANSPORT_REQUIRED')
+    if (opts.executionBackend && !isCc5ExecutionBackend(opts.executionBackend)) throw new Error('CC5_BACKEND_SCOPE_INVALID')
+    this.executionBackend = opts.executionBackend ? Object.freeze({ ...opts.executionBackend }) : undefined
     // Hermetic one-shots (Auto-Dream, advisor) only run on CCB: the stock CLI
     // refuses them (OFFICIAL_CC_REQUIRES_LOCAL_NON_HERMETIC), so OC_CCB_OFFICIAL_CC
     // must not move them off CCB.
@@ -491,7 +497,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       onEvent: (e: SessionStreamEvent) => {
         // A platform lease rejection is not a provider-login failure and its
         // raw internal response must not become a red user-facing card. The
-        // terminal result below emits one normalized, waived outcome.
+        // terminal result below emits one normalized, recoverable outcome.
         if (e.kind === 'error' && containsModelAuthorityInvalid(e.error)) return
         // P1-6:登记未决 permission_request(waitingForUserInput 数据源)。
         if (e.kind === 'permission_request' && e.request.requestId) {
@@ -606,6 +612,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     this._interrupting = false
     // InlinePush must not treat a not-yet-ingested parent turn as live.
     // _activeTurn is armed only after submit() confirms the user line landed.
+    this.runner.setReadOnly?.(params.readOnly === true)
     if (params.consultTurn && params.turnKey) {
       this.runner.setConsultTurn({
         turnKey: params.turnKey,
@@ -616,16 +623,17 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       this.runner.setConsultTurn(undefined)
     }
     const submitted = this.runner
-      .submit(params.input, params.requestId, params.modelAuthority, params.turnKey)
+      .submit(params.input, params.requestId, params.modelAuthority, params.turnKey, params.traceId ?? null)
       .then(() => {
         if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
+          if (this._activeTurn !== ctx) this._activeTurn?.stopLeaseRenewal?.()
           this._activeTurn = ctx
         }
         if (params.modelAuthority && params.turnKey && this._activeTurn === ctx) {
           ctx.stopLeaseRenewal = this._startLeaseRenewal(
             ctx,
             params.turnKey,
-            params.modelAuthority.leaseEnvelope,
+            params.modelAuthority,
           )
         }
       })
@@ -652,12 +660,12 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   private _startLeaseRenewal(
     ctx: CcbTurnContext,
     turnKey: string,
-    initialLease: string,
+    authority: TurnModelAuthority,
+    refresh = refreshTurnModelAuthorityLease,
   ): () => void {
     let stopped = false
     let timer: NodeJS.Timeout | null = null
-    let currentLease = initialLease
-    let failures = 0
+    const controller = new AbortController()
     const schedule = (delayMs: number): void => {
       if (stopped) return
       timer = setTimeout(() => void run(), delayMs)
@@ -666,30 +674,36 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     const run = async (): Promise<void> => {
       if (stopped || this._activeTurn !== ctx) return
       try {
-        const renewed = await renewTurnLease(turnKey, currentLease)
+        const renewed = await refresh(turnKey, authority, {
+          signal: controller.signal,
+          onRetry: (err, failures) => {
+            if (failures === 1 || failures % 10 === 0) {
+              log.warn('rolling turn lease renewal failed; retrying', {
+                turnKey, failures, error: (err as Error).message,
+              })
+            }
+          },
+        })
         if (stopped || this._activeTurn !== ctx) return
         await this.runner.updateTurnLease(renewed.lease)
-        currentLease = renewed.lease
-        failures = 0
         log.info('rolling turn lease renewed', { turnKey, expiresAt: renewed.expiresAt })
         schedule(TURN_LEASE_RENEW_AFTER_MS)
       } catch (err) {
-        failures++
-        if (failures === 1 || failures % 10 === 0) {
-          log.warn('rolling turn lease renewal failed; retrying', {
-            turnKey,
-            failures,
-            error: (err as Error).message,
-          })
-        }
-        // Initial renewal starts with 20 minutes of lease headroom. A one-minute
-        // retry cadence tolerates control-plane deploys without request floods.
+        if (stopped || this._activeTurn !== ctx) return
+        log.warn('rolling turn lease could not update live runner', {
+          turnKey, error: (err as Error).message,
+        })
+        // Revoked/finalized identities are never renewed again. A fallible
+        // subprocess update may retry; the shared owner already has its new
+        // lease, so a process restart cannot resurrect the initial ticket.
+        if (err instanceof RenewTurnLeaseError && !err.retryable) return
         schedule(60_000)
       }
     }
     schedule(TURN_LEASE_RENEW_AFTER_MS)
     return () => {
       stopped = true
+      controller.abort(new Error('turn lease renewal stopped'))
       if (timer) clearTimeout(timer)
       timer = null
     }
@@ -793,22 +807,41 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** Settle this turn's Box chain through the internal Stop route, once.
    * Browser Stop is explicit; an ordinary provider HTTP disconnect never
    * calls this notifier. The gateway owns it beyond the CLI interrupt. */
-  private _notifyBoxStop(turn: CcbTurnContext, cause: 'user' | 'continuation_rejected'): void {
+  private _notifyBoxStop(turn: CcbTurnContext,
+    cause: 'user' | 'continuation_rejected' | 'planned_shutdown'): void {
     const nativeSessionId = this.runner.sessionId
-    if (turn.boxStopNotified || !isBoxApiModel(this.model)
+    if (this.executionBackend || turn.boxStopNotified || !isBoxApiModel(this.model)
       || !turn.turnKey || !nativeSessionId) return
     turn.boxStopNotified = true
-    this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,
+    const sent = notifyBoxUserStop({ sessionId: nativeSessionId,
       turnKey: turn.turnKey }).then((outcome) => {
       if (outcome === 'skipped') log.warn('box_user_stop_notification_skipped', { cause })
-      else if (cause !== 'user') log.info('box_stop_after_continuation_reject', { outcome })
+      else if (cause === 'continuation_rejected') log.info('box_stop_after_continuation_reject', { outcome })
+      else if (cause === 'planned_shutdown') log.info('box_stop_on_planned_shutdown', { outcome })
     }).catch(() => {
       log.warn('box_user_stop_notification_pending', { cause })
     })
+    const prior = this._boxStopPending
+    this._boxStopPending = prior ? Promise.all([prior, sent]).then(() => {}) : sent
+  }
+
+  /** OCV5-733: a container restart killed the CLI mid Box run; egress keeps
+   * an ordinary disconnect's run alive on purpose (first_round_unknown), so
+   * the account seat stayed held until the stop probe settled it ~20 min
+   * later. A process exit is final for this generation's turns (the restart
+   * synthesizes SERVICE_RESTART; recovery uses a new turn key), so settle each
+   * unfinished Box turn through the same Stop route a browser Stop uses.
+   * Best effort: shutdown() waits at most 2s; egress finishes the stop on its
+   * own and its fences decide what is cancelable. Finished turns are skipped. */
+  beginPlannedShutdown(): void {
+    for (const turn of new Set([this._activeTurn, this._routeTurn])) {
+      if (turn && !turn.parser.finalized) this._notifyBoxStop(turn, 'planned_shutdown')
+    }
   }
 
   interrupt(reason: 'user' | 'system' = 'system'): boolean {
     const active = this._activeTurn
+    active?.stopLeaseRenewal?.()
     if (reason === 'user' && active) this._notifyBoxStop(active, 'user')
     this._interrupting = true
     if (this._activeTurn) this._activeTurn = null
@@ -816,6 +849,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   async shutdown(): Promise<void> {
+    this._activeTurn?.stopLeaseRenewal?.()
+    this._routeTurn?.stopLeaseRenewal?.()
     if (this._boxStopPending) {
       let timer: ReturnType<typeof setTimeout> | undefined
       try {
@@ -888,6 +923,20 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */
+  clearPromptPrivacy(): void {
+    (this.runner as { clearPromptPrivacy?: () => void }).clearPromptPrivacy?.()
+  }
+  assertPromptPrivacyStopped(): void {
+    const assertStopped = (this.runner as { assertPromptPrivacyStopped?: () => void }).assertPromptPrivacyStopped
+    if (!assertStopped) throw new Error('助手隐私刷新无法核验旧进程状态。')
+    assertStopped.call(this.runner)
+  }
+  get promptPolicyFingerprint(): string | undefined {
+    return (this.runner as { promptPolicyFingerprint?: string }).promptPolicyFingerprint
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void {
+    (this.runner as { setPromptPrivacy?: (p: PromptPrivacyPolicy) => void }).setPromptPrivacy?.(policy)
+  }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return (this.runner as { promptIntelligentUi?: IntelligentUiApplied }).promptIntelligentUi
   }
@@ -997,4 +1046,6 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 }
 
 // ── registry 注册(import 本模块即生效;sessionManager 顶部显式 import)──────
+// Local-only registration keeps direct adapter imports compatible. The production
+// ccbFactory module installs the explicit backend selector after both classes initialize.
 registerEngine('ccb', (opts) => new CcbAdapter(opts))

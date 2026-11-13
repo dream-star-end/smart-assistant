@@ -31,6 +31,7 @@ import {
   sendJson,
   sendError,
   asString,
+  asNullableString,
   asBoolean,
   resolveProject,
 } from './httpShared.js'
@@ -232,15 +233,17 @@ export async function handleApplyTemplate(
     sendError(res, 403, 'forbidden', { code: 'forbidden' })
     return
   }
-  await assertTemplatesValidForApply(db, [templateId], ctx)
+  const executionAgentId = asNullableString(body.executionAgentId)?.trim() || null
+  const validated = await assertTemplatesValidForApply(db, [templateId], ctx, { executionAgentId })
   const projectRef = asString(body.projectId)
   if (!projectRef) throw new TaskboardValidationError('projectId is required')
   const project = resolveProject(db, projectRef)
   if (!project) throw new TaskboardNotFound('project', projectRef)
   const asDefault = asBoolean(body.asDefault)
-  const result = applyTemplate(db, templateId, project.id, {
-    asDefault,
-  })
+  const result = db.transaction(() => {
+    validated.assertUnchanged()
+    return applyTemplate(db, validated.templateIds[0]!, project.id, { asDefault, executionAgentId })
+  })()
   sendJson(res, 200, {
     ok: true,
     template: result.template,

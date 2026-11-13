@@ -92,6 +92,7 @@ function humanCtx(db: TaskboardDb, over: Partial<TaskboardHttpContext> = {}): Ta
   return {
     db,
     actor: 'human',
+    preflightStages: async (stages) => stages.map(() => null),
     listAgents: async () => [
       { id: 'main', name: '主助手', model: 'x', description: '' },
       { id: 'coding-assistant', name: '编码', model: 'x', description: '' },
@@ -110,6 +111,7 @@ async function seedProject(
   base: string,
 ): Promise<{ projectId: string; ticket: Record<string, unknown> }> {
   const created = await call(base, 'POST', '/api/board/projects', {
+    executionAgentId: 'main',
     key: 'OCV5',
     name: 'V5 自用',
   })
@@ -205,6 +207,7 @@ describe('建项目自动 seed / 建单挂默认流水线', () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
       const created = await call(base, 'POST', '/api/board/projects', {
+    executionAgentId: 'main',
         key: 'ocv5',
         name: 'V5',
       })
@@ -592,6 +595,7 @@ type StageJson = {
 
 async function createProjectOnly(base: string): Promise<string> {
   const created = await call(base, 'POST', '/api/board/projects', {
+    executionAgentId: 'main',
     key: 'OCV5',
     name: 'V5 自用',
   })
@@ -841,7 +845,7 @@ describe('PUT /pipelines/:id/reorder', () => {
     let pipelineId = ''
     let ids: string[] = []
     await withServer(humanCtx(db), async (base) => {
-      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5', executionAgentId: 'main' })
       const projectId = (created.body.project as { id: string }).id
       const listed = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
       const pipes = listed.body.items as Array<{ id: string; ticketType: string }>
@@ -1168,6 +1172,7 @@ describe('advance 换站清零 stageLoopCount', () => {
     let nextStageId = ''
     await withServer(humanCtx(db), async (base) => {
       const created = await call(base, 'POST', '/api/board/projects', {
+    executionAgentId: 'main',
         key: 'OCV5',
         name: 'V5 自用',
       })
@@ -1298,6 +1303,7 @@ describe('stage ops actor hardening', () => {
       assert.equal(apply.status, 403)
 
       const bypass = await call(base, 'POST', '/api/board/projects', {
+    executionAgentId: 'main',
         key: 'BYP',
         name: 'Bypass',
         templateIds: ['builtin:bug'],
@@ -1316,7 +1322,7 @@ describe('stage ops actor hardening', () => {
     const db = freshDb()
     let stageId = ''
     await withServer(humanCtx(db), async (base) => {
-      const created = await call(base, 'POST', '/api/board/projects', { key: 'UX', name: 'UX' })
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'UX', name: 'UX', executionAgentId: 'main' })
       const projectId = (created.body.project as { id: string }).id
       const pipelines = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
       const pipelineId = (pipelines.body.items as Array<{ id: string }>)[0].id
@@ -1448,6 +1454,44 @@ describe('POST /tickets/:id/approve 积压批准', () => {
         owner: 'agent:main',
       })
       assert.equal(res.status, 403)
+    })
+    db.close()
+  })
+})
+
+
+describe('explicit builtin execution binding', () => {
+  it('validates the selected installed helper before creating any project or stages', async () => {
+    const db = freshDb()
+    const seen: Array<Array<string | null>> = []
+    await withServer(humanCtx(db, { preflightStages: async (stages) => {
+      seen.push(stages.map((s) => s.agentId))
+      return stages.map((s) => s.kind === 'ai' && s.agentId !== 'main' ? { code: 'stage_agent_unavailable', status: 422, message: '请重新选择已安装助手' } : null)
+    } }), async (base) => {
+      const missing = await call(base, 'POST', '/api/board/projects', { key: 'MISS', name: '未选择' })
+      assert.equal(missing.status, 400)
+      const unavailable = await call(base, 'POST', '/api/board/projects', { key: 'BAD', name: '不存在', executionAgentId: 'absent' })
+      assert.equal(unavailable.status, 422)
+      assert.deepEqual((await call(base, 'GET', '/api/board/projects')).body.items, [])
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'GOOD', name: '明确助手', executionAgentId: 'main' })
+      assert.equal(created.status, 201, JSON.stringify(created.body))
+      assert.ok(seen.at(-1)!.filter(Boolean).every((id) => id === 'main'))
+      const project = created.body.project as { id: string }
+      for (const pipe of listPipelines(db, project.id)) {
+        for (const stage of listStages(db, pipe.id).filter((s) => s.kind === 'ai')) {
+          assert.equal(stage.agentId, 'main')
+          assert.equal(stage.model, null)
+        }
+      }
+    })
+    await withServer(agentCtx(db), async (base) => {
+      const explicit = await call(base, 'POST', '/api/board/projects', { key: 'DENY', name: '权限', executionAgentId: 'main' })
+      assert.equal(explicit.status, 403)
+      const inert = await call(base, 'POST', '/api/board/projects', { key: 'INERT', name: '待配置' })
+      assert.equal(inert.status, 201)
+      for (const pipe of listPipelines(db, (inert.body.project as { id: string }).id)) {
+        assert.ok(listStages(db, pipe.id).filter((s) => s.kind === 'ai').every((s) => s.agentId === null && !s.patrolEnabled))
+      }
     })
     db.close()
   })

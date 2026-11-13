@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote} from "./model-switch-cost-fixture.mjs";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
@@ -56,6 +57,9 @@ test("commercial 404 collaboration-config: solo/team stay selectable and team st
       const req = route.request();
       const path = new URL(req.url()).pathname;
       const method = req.method();
+      if(method==='POST'&&/^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)){
+        await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(fixtureSwitchQuote(req.postDataJSON(),{empty:true}))});return;
+      }
       const user = {
         id: "u1",
         email: "test@example.com",
@@ -118,7 +122,8 @@ test("commercial 404 collaboration-config: solo/team stay selectable and team st
       await soloPut;
       await page.waitForTimeout(200);
       assert.equal(await pressed(/主模型独立完成/), "true", "solo must stick after a 404 save");
-      assert.equal(await page.getByRole("dialog").getByText(/协作配置保存失败/).count(), 0, "no inline save error once solo is picked");
+      await page.getByRole("dialog").getByText(/协作配置保存失败/).waitFor();
+      assert.equal(await page.getByRole("dialog").getByText(/协作配置保存失败/).count(), 1, "persistence failure stays visible while the solo choice remains selected");
 
       const teamPut = putDone();
       await page.getByRole("button", { name: /队长切换为/ }).click();

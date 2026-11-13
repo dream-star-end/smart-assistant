@@ -1,0 +1,22 @@
+{
+  "id": "compact-busy-after-terminal",
+  "expect": {
+    "retryable": false,
+    "stopSession": false,
+    "verdict": "engine_state_mismatch",
+    "severity": "warning",
+    "askHuman": false,
+    "alert": true,
+    "reason": "engine_busy_after_terminal",
+    "point": "compact_summary",
+    "traceId": "77777777777777777777777777777777"
+  },
+  "observation": {
+    "point": "compact_summary",
+    "traceId": "77777777777777777777777777777777",
+    "engineReported": "running",
+    "dispatchStatus": "terminal",
+    "dispatchOutcome": "completed",
+    "summaryWritten": true
+  }
+}

@@ -97,7 +97,7 @@ REDIS_URL="redis://127.0.0.1:6379/3"
 # the previous tag stays for rollback.
 # cc2302/codex01630/grok1062/zcode3153/agy140 (OCV5-470) = Claude Code 2.1.302, Codex 0.163.0,
 # Grok 1.0.62, ZCode 3.15.3 (CLI 0.16.9), Antigravity 1.4.0 and Cursor Agent 2026.10.16-e3cb207; the agy134 tag stays for rollback.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2302-codex01630-grok1062-zcode3153-agy140-slim"
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2302-codex01630-grok1062-zcode3153-agy150-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
@@ -119,6 +119,7 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 source "$RUNTIME_LIB"
 # Explicit per-train policy; legacy invocations keep the original default.
 source "$SCRIPT_DIR/lib/v5-selfhost-release-policy.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-host-memory.sh"
 MASTER_RELEASE_LIB="$SCRIPT_DIR/v5-selfhost-master-release-lib.sh"
 
 DRY=0
@@ -143,6 +144,7 @@ ROLLBACK_ORIG_PREV=""
 LEASE_TRAIN_ID=""
 LEASE_TARGET_SHA=""
 RELEASE_POLICY_RESUME=0
+RELEASE_POLICY_SAMPLER_RESTORE=0
 LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
 # Incident trailer 发布前快检(2026-09-09):selfhost 此前从不跑 trailer 门,坏 trailer 一律
 # 上线后才被 CI 发现,已上线源提交不可 amend,只能一次次冻结 tip(已冻 18 条)。这里在构建
@@ -170,6 +172,9 @@ SELFHOST_DEPLOY_LOCK_DIR="/run/openclaude-v5-selfhost"
 SELFHOST_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-${SELFHOST_DEPLOY_LOCK_DIR}/deploy.lock}"
 SELFHOST_DEPLOY_LOCK_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_WAIT:-2400}"
 SELFHOST_DEPLOY_LOCK_POLL="${OC_V5_SELFHOST_DEPLOY_LOCK_POLL:-15}"
+# 个人版 PG 备份(scripts/v5-selfhost-pg-backup.sh)整次运行共享持锁(OCV5-600),每周全量可超过
+# 一小时。持锁者是活着的备份时,等待不计入上面的超时,改按这个上限排队。
+SELFHOST_DEPLOY_LOCK_BACKUP_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
 SELFHOST_DEPLOY_LOCK_HOLDER=""
 SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
 PLATFORM_ARCHIVE_TMP=""
@@ -182,19 +187,29 @@ die() {
 # shellcheck source=scripts/v5-selfhost-master-release-lib.sh
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
+source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-runtime-build.sh"
 # shellcheck source=lib/v5-selfhost-env.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.sh"
 # shellcheck source=lib/v5-selfhost-rollback.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # shellcheck source=lib/v5-selfhost-train-summary.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
 source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
+source "$SCRIPT_DIR/lib/v5-selfhost-prepare.sh"       # P4: lock-free prepare, locked flip
+source "$SCRIPT_DIR/lib/v5-selfhost-backup-lock.sh"     # OCV5-600: selfhost_backup_lock_holder
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
 source "$SCRIPT_DIR/v5-web-overlay-lib.sh"
 # shellcheck source=scripts/v5-selfhost-p0-web-lib.sh
 source "$SCRIPT_DIR/v5-selfhost-p0-web-lib.sh"
+# /assets 资产池(OCV5-633,X-P1-1):master 在 spa 模式 /assets 未命中 webRoot 时回落 <pool>/assets
+# (网关侧 PR-a #1146)。--deploy 切流前播种 live 资产,cutover 收尾按保护集 GC,--smoke 验回落面。
+WEB_ASSETS_POOL="${OC_V5_WEB_ASSETS_POOL:-/opt/openclaude/openclaude-v5-selfhost-assets}"
+# shellcheck source=scripts/v5-web-assets-pool-lib.sh
+source "$SCRIPT_DIR/v5-web-assets-pool-lib.sh"
 BOOT_SCRIPT_DIR="${BOOT_SCRIPT_DIR:-${BREAKGLASS_ROOT}/boot}"
 # 看护 timer 执行的是这个安装目录里的 watch.sh,不是 release(OCV5-404)。
 V5_WATCH_DIR="${V5_WATCH_DIR:-/opt/openclaude/v5-selfhost-watch}"
@@ -215,8 +230,41 @@ own_instance_present() {
   [[ -f "$V5_ENV" ]] || systemctl cat "$V5_UNIT" >/dev/null 2>&1
 }
 
+# The async wait lets signal traps run immediately. Drain prewarm before
+# recording the first failure or releasing this invocation's resources.
+USER_CONTRACT_PREWARM_PID=""
+user_contract_prewarm_cleanup() {
+  local pid="${USER_CONTRACT_PREWARM_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  python3 "$SCRIPT_DIR/lib/v5-selfhost-prewarm-process.py" --stop "$pid" "$BASHPID"
+  wait "$pid" 2>/dev/null || :
+  USER_CONTRACT_PREWARM_PID=""
+}
+
+user_contract_prewarm() {
+  local rc=0 parent_pid="$BASHPID" entry="${1:-$SCRIPT_DIR/v5-user-contract-prewarm.mjs}" models="${2:-}"
+  local -a command=(node "$entry")
+  if [[ -n "$models" ]]; then command=(env "V5_CONTRACT_MODELS=$models" node "$entry"); fi
+  python3 "$SCRIPT_DIR/lib/v5-selfhost-prewarm-process.py" "$parent_pid" \
+    "${command[@]}" &
+  USER_CONTRACT_PREWARM_PID=$!
+  wait "$USER_CONTRACT_PREWARM_PID" || rc=$?
+  USER_CONTRACT_PREWARM_PID=""
+  return "$rc"
+}
+
 cleanup_selfhost_deploy() {
   local exit_rc=$?
+  trap '' HUP INT TERM
+  if declare -F user_contract_prewarm_cleanup >/dev/null 2>&1; then
+    user_contract_prewarm_cleanup
+  fi
+  if [[ "${MODE:-}" == prewarm-artifacts ]]; then
+    prewarm_cleanup_invocation "$exit_rc" || :
+    return "$exit_rc"
+  fi
+  # P3: no lease/train release or staging cleanup while our C/D workers still run.
+  reap_master_build_jobs
   tsum_finish "$exit_rc" 2>/dev/null || :
   # Owner loss forbids successor state/holder writes from this invocation.
   [[ "$exit_rc" == 86 ]] && return 86
@@ -224,12 +272,15 @@ cleanup_selfhost_deploy() {
     trap - EXIT
     exit 86
   fi
-  if [[ "$exit_rc" != 0 ]]; then release_policy_abort_unexposed || true; fi
-  if [[ "$exit_rc" != 0 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
+  # Explicit sampler recovery keeps the existing application intent/phase intact.
+  # It must not resolve preparation-abort or restore an application pointer.
+  if [[ "$exit_rc" != 0 && "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" != 1 ]]; then release_policy_abort_unexposed || true; fi
+  if [[ "$exit_rc" != 0 && "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" != 1 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
     rollback_restore_prev_if_unchanged || true
   fi
-  # 后台 runtime release 段必须先收尾,再释放锁/train(否则下一次 deploy 可能与它并发写 runtime-releases)。
+  # 后台 runtime release 先收尾再释放锁/train;split prepare 子进程继承 artifact fd 9。
   if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
+  master_gate_load_budget_stop
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
   if declare -F lease_train_on_exit >/dev/null 2>&1; then lease_train_on_exit "$exit_rc" || true; fi
   if [[ -n "${PLATFORM_ARCHIVE_TMP:-}" && -d "$PLATFORM_ARCHIVE_TMP" ]]; then
@@ -245,6 +296,9 @@ cleanup_selfhost_deploy() {
   fi
 }
 trap cleanup_selfhost_deploy EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 selfhost_lock_holder_info() {
   local lock="$1" holder_path holder pids
@@ -410,7 +464,7 @@ t=open("/proc/%d/stat"%int(sys.argv[1])).read(); print(t[t.rfind(")")+2:].split(
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
 # OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
 acquire_selfhost_deploy_lock() {
-  local lock wait_s interval waited info holder_line starttime
+  local lock wait_s interval waited info holder_line starttime backup_waited backup_info backup_wait
   if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
     release_policy_mutation_barrier || exit "$?"
     log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
@@ -420,8 +474,13 @@ acquire_selfhost_deploy_lock() {
   lock="$SELFHOST_DEPLOY_LOCK"
   wait_s="$SELFHOST_DEPLOY_LOCK_WAIT"
   interval="$SELFHOST_DEPLOY_LOCK_POLL"
-  [[ "$wait_s" =~ ^[0-9]+$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
+  # 十进制、无前导零:bash 算术把 08 当八进制并报错,比较恒假就会永远等(Codex r2)。
+  [[ "$wait_s" =~ ^(0|[1-9][0-9]*)$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_POLL 必须是正整数秒(当前=$interval)"
+  # 非法值会让下面的算术比较恒假,备份持锁时就永远等下去(Codex r1)。
+  backup_wait="${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
+  [[ "$backup_wait" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || die "OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT 必须是非负整数秒(当前=$backup_wait)"
   if (( interval > wait_s && wait_s > 0 )); then
     interval="$wait_s"
   fi
@@ -434,7 +493,22 @@ acquire_selfhost_deploy_lock() {
   exec 8<>"$lock" || die "无法打开锁文件 $lock"
   if ! flock -n 8; then
     waited=0
+    backup_waited=0
     while ! flock -n 8; do
+      # 备份占锁:排队等它结束,不计入 wait_s,也不当成超时失败(OCV5-600)。
+      if backup_info="$(selfhost_backup_lock_holder "$lock")"; then
+        if (( backup_waited >= backup_wait )); then
+          echo "✗ 个人版 PG 备份占锁中,已排队 ${backup_waited}s 仍未结束(上限 ${backup_wait}s)。锁=$lock 备份=$backup_info
+补救: systemctl status openclaude-v5-selfhost-pg-backup-full.service / openclaude-v5-selfhost-pg-backup.service;备份结束后重发。" >&2
+          exit 1
+        fi
+        if (( backup_waited % 300 == 0 )); then
+          log "⏳ 个人版 PG 备份占锁中($backup_info),列车排队等它结束: 已等 ${backup_waited}s / ${backup_wait}s(不计入 ${wait_s}s 超时)"
+        fi
+        sleep "$interval"
+        backup_waited=$((backup_waited + interval))
+        continue
+      fi
       if (( waited >= wait_s )); then
         info="$(selfhost_lock_holder_info "$lock")"
         echo "✗ 等待 selfhost 发布锁超时(${wait_s}s)。锁=$lock $info
@@ -466,7 +540,15 @@ maybe_acquire_selfhost_deploy_lock() {
   case "$MODE" in
     deploy|bootstrap|build-master-only|cutover|rollback)
       [[ "$DRY" == 1 ]] && return 0
+      if [[ "$MODE" == deploy && "$PLATFORM_FROM_HEAD" == 1 && "$RELEASE_POLICY_RESUME" == 0 ]]; then
+        return 0  # prepare first; selfhost_prepared_enter_flip owns the deploy lock later
+      fi
       acquire_selfhost_deploy_lock
+      # Sampler-only recovery needs the same official lock/fencing, but never
+      # stops artifact prewarm or enters application preparation.
+      [[ "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" == 1 ]] && return 0
+      prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "预热未停净,拒绝发布"
+      case "$MODE" in deploy|bootstrap|build-master-only) selfhost_prepare_lock ;; esac
       ;;
   esac
 }
@@ -480,7 +562,9 @@ usage() {
 
   --preflight           只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
   --bootstrap           仅首次安装。本机已有 live symlink / env 时请改用 --deploy
-  --deploy              常规发布:构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
+  --deploy              --platform-from-head 时先无锁 prepare、再持锁 flip;否则保持旧锁边界。构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
+  --prepare             --target-sha=SHA: 无 deploy.lock 构建并封存三面制品;不登记列车、不改 live
+  --prewarm-artifacts   idle worker 专用:锁外预热 tip 制品,不建列车/不切 live
   --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
   --cutover             手动逃生:已有 rel-* 时只做翻转(静态门+迁移门+备份+survivor+装 unit+symlink+重启+smoke)
   --rollback            退回 .prev-release 及它当时的运行四元组(一次一步;不跑迁移、不回滚 schema;
@@ -494,7 +578,10 @@ usage() {
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,防脏 platform 进全员容器)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --resume-release-policy --lease-train=ID --target-sha=SHA
-                        仅核对/补齐同 operation 历史与验收;不切流、不重启,未知现场保持阻塞
+                        仅核对/补齐同 operation 历史与验收;不切应用流量、不重启 master/egress,
+                        finalizer 可补齐独立采样器;未知现场保持阻塞
+  --restore-host-memory 仅与上述 resume 同用:由原 operation 回执选择首次 snapshot,
+                        只恢复独立采样器;保留应用 hold,返回79,不继续 forward 或写成功
   --lease-train=ID --target-sha=SHA
                         仅配合 --deploy:由 v5-lease-worker 发车时传入;HEAD 必须精确等于 SHA,否则拒绝。
                         人工直跑 --deploy 会自动登记 manual train(有 open train 时拒绝并行发布)。见 scripts/oc-lease.sh
@@ -539,9 +626,10 @@ for arg in "$@"; do
     --force-npm-ci) FORCE_NPM_CI=1 ;;
     --release=*) CUTOVER_RELEASE="${arg#--release=}" ;;
     --resume-release-policy) RELEASE_POLICY_RESUME=1 ;;
+    --restore-host-memory) RELEASE_POLICY_SAMPLER_RESTORE=1 ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
-    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
+    --preflight|--bootstrap|--deploy|--prepare|--smoke|--status|--build-master-only|--prewarm-artifacts|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -562,6 +650,10 @@ if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
   [[ "$MODE" == deploy && -n "$LEASE_TRAIN_ID" && -n "$LEASE_TARGET_SHA" && "$DRY" != 1 ]] \
     || die "--resume-release-policy requires --deploy --lease-train=<original> --target-sha=<original>; no dry-run"
 fi
+if [[ "$RELEASE_POLICY_SAMPLER_RESTORE" == 1 ]]; then
+  [[ "$RELEASE_POLICY_RESUME" == 1 ]] \
+    || die "--restore-host-memory requires --resume-release-policy and its original train/SHA; no snapshot path"
+fi
 [[ "$FORCE_ENV" == 1 && "$MODE" != "bootstrap" ]] && die "--force-env 只能与 --bootstrap 同用"
 [[ "$ALLOW_DIRTY" == 1 && "$MODE" != "deploy" ]] && die "--allow-dirty 只能与 --deploy 同用"
 [[ "$PLATFORM_FROM_HEAD" == 1 && "$MODE" != "deploy" && "$MODE" != "bootstrap" ]] \
@@ -572,8 +664,8 @@ fi
   && die "--release= 只能与 --cutover 同用"
 [[ -n "$LEASE_TRAIN_ID" && "$MODE" != "deploy" ]] \
   && die "--lease-train= 只能与 --deploy 同用"
-[[ -n "$LEASE_TARGET_SHA" && "$MODE" != "deploy" && "$MODE" != "p0-web" ]] \
-  && die "--target-sha= 只能与 --deploy 或 --p0-web 同用"
+[[ -n "$LEASE_TARGET_SHA" && "$MODE" != "deploy" && "$MODE" != "prepare" && "$MODE" != "p0-web" && "$MODE" != "prewarm-artifacts" ]] \
+  && die "--target-sha= 只能与 --deploy/--prepare/--p0-web/--prewarm-artifacts 同用"
 [[ "$DRY" == 1 && "$MODE" == p0-web* ]] && die "--p0-web* 没有 dry-run(构建在锁外、切换可秒级回退)"
 [[ -n "$LEASE_TRAIN_ID" && -z "$LEASE_TARGET_SHA" ]] && die "--lease-train= 必须同时给 --target-sha="
 [[ -z "$LEASE_TARGET_SHA" || "$LEASE_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || die "--target-sha= 必须是 40 位 sha"
@@ -595,7 +687,7 @@ fi
 
 if [[ "$DRY" != 1 ]]; then
   case "$MODE" in
-    deploy|bootstrap|build-master-only|cutover|rollback|p0-web|p0-web-revert)
+    deploy|prepare|bootstrap|build-master-only|cutover|rollback|p0-web|p0-web-revert)
       if [[ "$RELEASE_POLICY_RESUME" != 1 ]]; then
         release_policy_context_present && { log "unresolved release-policy context blocks mutation"; exit 79; }
       fi ;;
@@ -1405,12 +1497,6 @@ SQL
   fi
   LEASE_TRAIN_ACTIVE=1
 }
-runtime_caps_from_metadata() {
-  local sha="$1"
-  git -C "$REPO_ROOT" show "${sha}:deploy/v5/release-metadata.json" \
-    | jq -er '.runtimeCapabilities | join(" ")'
-}
-
 build_platform_bundle() {
   local sha="$1" nonce staging rev src
   log "── build platform bundle ──"
@@ -1459,47 +1545,14 @@ build_platform_bundle() {
   log "  ✓ platform bundle rev=$BUILT_BUNDLE_REV"
 }
 
-build_runtime_release() {
-  local sha="$1" caps nonce raw staging prev image_id
-  log "── build runtime release(git archive + prune + finalize) ──"
-  caps="$(runtime_caps_from_metadata "$sha")" \
-    || die "读 release-metadata.json runtimeCapabilities 失败"
-  image_id="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE")" \
-    || die "inspect runtime 镜像失败"
-  RUNTIME_IMAGE_ID="$image_id"
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] git archive $sha → prune --exclude-from=$EXCLUDES → oc_hotcfg_finalize_release"
-    BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-dryrunrelease"
-    return 0
-  fi
-  prev="$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_RELEASE || true)"
-  nonce="$(openssl rand -hex 8)"
-  raw="$OC_HOTCFG_RELEASES_ROOT/.raw-$nonce"
-  staging="$OC_HOTCFG_RELEASES_ROOT/.staging-$nonce"
-  mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
-  rm -rf "$raw" "$staging"
-  mkdir -p "$raw" "$staging"
-  git -C "$REPO_ROOT" archive --format=tar "$sha" | tar -x -C "$raw" \
-    || { rm -rf "$raw" "$staging"; die "git archive 失败"; }
-  rsync -a --exclude-from="$EXCLUDES" "$raw/" "$staging/" \
-    || { rm -rf "$raw" "$staging"; die "rsync prune 失败"; }
-  rm -rf "$raw"
-  write_flavor_manifest "$staging" selfhost "$sha" \
-    || { rm -rf "$staging"; die "写 runtime flavor.manifest.json 失败"; }
-  BUILT_RUNTIME_RELEASE="$(oc_hotcfg_finalize_release "$staging" "$image_id" "$sha" "${prev:-}" "$caps")" \
-    || { rm -rf "$staging"; die "release finalize 失败(npm ci / ccb bun build / MANIFEST)"; }
-  BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
-  [[ "$BUILT_RUNTIME_RELEASE" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* ]] \
-    || die "release 目录非法: $BUILT_RUNTIME_RELEASE"
-  log "  ✓ runtime release=$BUILT_RUNTIME_RELEASE"
-}
 
 # ── runtime release 与 master release 并行构建(2026-10-08 devflow-opt)──
 # 两者都只读 pinned SHA 的 git archive,写各自独立的 staging(runtime: $OC_HOTCFG_RELEASES_ROOT,
 # master: $MASTER_RELEASES_ROOT),互不依赖;实测串行时 runtime 段约 3.5 分钟。
 # 后台段的输出落独立日志,收尾时整段回放,保持 train 日志可读;结果经结果文件回传父 shell。
 # 父 shell 无论成功失败退出,EXIT 清理都会先等后台段结束(不留在飞写 runtime-releases 的进程)。
-# 父进程被直接杀掉(不走 EXIT)时:后台段继承了发布锁 fd 8,锁会一直持有到它结束,不会有第二趟发布并发写。
+# 父进程被直接杀掉时:后台段继承 artifact fd 9(split)或发布 fd 8(legacy),保护持续到它结束。
+# OCV5-648(P2):cmd_deploy 不再自己起后台段,由 build_master_release 在发车准入通过后起(准入不等本列车自己)。
 RUNTIME_BG_PID=""
 RUNTIME_BG_LOG=""
 RUNTIME_BG_RESULT=""
@@ -1774,6 +1827,9 @@ egress_assert_no_orphan_listener() {
 }
 
 egress_slot_flip_then_master_restart() {
+  # The generic saga still calls restart after an extra-revert error. Fail closed
+  # here, before either service effect, unless the two-key receipt proves safety.
+  cc5_activation_restart_guard || return "$?"
   egress_slot_flip && systemctl restart "$V5_UNIT"
 }
 
@@ -1832,9 +1888,11 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
   mkdir -p "$(dirname "$OC_HOTCFG_HISTORY")"
   if release_policy_enabled; then
     policy_adapter=release_policy_saga_adapter
-    extra_apply="release_policy_flip_live $(printf '%q' "$master_rel")"
-    extra_revert="release_policy_restore_live_before $(printf '%q' "$prev_arg")"
   fi
+  # Keep policy source hooks and the fixed two-key carrier in one compensated
+  # extra step. The generic saga marks it attempted before invoking the wrapper.
+  extra_apply="cc5_activation_extra_apply $(printf '%q' "$master_rel") $(printf '%q' "$prev_arg")"
+  extra_revert="cc5_activation_extra_revert $(printf '%q' "$prev_arg")"
   oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$BUILT_BUNDLE_REV" "$OC_HOTCFG_HISTORY" \
     "$RUNTIME_IMAGE" "$image_id" "$BUILT_RUNTIME_RELEASE" "$bundle_val" \
@@ -1881,25 +1939,34 @@ assert_ssh_rule_before_drop() {
 }
 
 # Fail closed; the caller owns the existing compensation/exit path.
-user_contract_gate() { # <candidate release>
-  local rel="${1:-}"
+user_contract_node() { # <verified child entry> [legacy matrix]
+  if [[ -n "${2:-}" ]]; then V5_CONTRACT_MODELS="$2" node "$1"; else node "$1"; fi
+}
+
+user_contract_gate() { # <candidate release> [internal recovery context]
+  local rel="${1:-}" context="${2:-forward}" child_dir models model_policy_file
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
   tsum_mark F.prewarm 2>/dev/null || :
+  # CUTOVER_ROLLBACK is cleared at entry and set only by cmd_rollback after lineage validation.
+  if [[ "$context" == forward && "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then context=rollback; fi
+  model_policy_select_contract_runner "$rel" "$context" || return $?
+  child_dir="$MODEL_POLICY_CONTRACT_DIR"; models="$MODEL_POLICY_CONTRACT_MODELS"; model_policy_file="$MODEL_POLICY_FILE"
   # OCV5-429: the cutover may recycle the canary container onto the new runtime tuple (or it was
   # idle-swept); its cold start outlasts C2's 20s window. Warm it first (same UI login, no message,
-  # wait for relay_ready). Not part of the verdict: a prewarm that never gets ready only warns.
+  # wait for relay_ready). OCV5-709: a killed Node/browser or incomplete prewarm
+  # must fail the gate before any paid contract turn is sent.
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
-    V5_CANARY_PASSWORD_FILE="$password_file" \
-    node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" \
-    || echo "  ⚠ canary 预热未就绪,门禁照跑(由 C1–C3 判定)" >&2
+    V5_CANARY_PASSWORD_FILE="$password_file" V5_SELFHOST_MODEL_POLICY_FILE="$model_policy_file" \
+    user_contract_prewarm "$child_dir/v5-user-contract-prewarm.mjs" "$models" || return $?
   tsum_mark F.C1-C3 2>/dev/null || :
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
-    node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
+    V5_SELFHOST_MODEL_POLICY_FILE="$model_policy_file" \
+    user_contract_node "$child_dir/v5-user-contract-smoke.mjs" "$models" || return 1
   tsum_mark F.G1 2>/dev/null || :
   # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache
   # (INC-20261015-GO-CACHE-PREFIX wrote the whole prompt every request and read 0).
@@ -1920,148 +1987,9 @@ user_contract_gate() { # <candidate release>
     node "$SCRIPT_DIR/v5-stop-before-start-contract.mjs"
 }
 
-cmd_smoke() {
-  local hz i ok=0 code
-  log "══ selfhost smoke ══"
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] curl healthz + leadership=leader + GET / oc-build + SSH 规则 + 个人版 18789"
-    return 0
-  fi
-  for i in $(seq 1 90); do
-    hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
-    if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
-      ok=1
-      break
-    fi
-    log "  /healthz 未收敛 leadership=leader,重试 $i/30…"
-    sleep 2
-  done
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" || true)"
-  [[ "$code" == 200 ]] || die "selfhost /healthz HTTP $code(期望 200)。补救: journalctl -u $V5_UNIT -n 80。"
-  [[ "$ok" == 1 ]] || die "healthz HTTP 200 但未收敛: ok=true 且 runtime.controlPlaneEnabled=true 且 runtime.leadership.state=leader。
-  最近响应: ${hz:-<empty>}
-  说明: V5 channel 走 leader lease(不是只看 OC_CONTROL_PLANE_LEADER);0135 seed desired_leader_slot=A,本实例 OC_SLOT 默认 A。补救: 查 journalctl 是否拒启,以及 deploy_state / leader_lease 行。"
-  log "  ✓ /healthz 200 + controlPlaneEnabled + leadership.state=leader"
-  local dist_html="" live_root=""
-  if [[ -L "$MASTER_LIVE_LINK" ]]; then
-    live_root="$(readlink -f "$MASTER_LIVE_LINK" 2>/dev/null || true)"
-    if [[ -n "$live_root" && -f "$live_root/packages/web-react/dist/index.html" ]]; then
-      dist_html="$live_root/packages/web-react/dist/index.html"
-    fi
-  fi
-  if [[ -z "$dist_html" ]]; then
-    dist_html="$REPO_ROOT/packages/web-react/dist/index.html"
-  fi
-  [[ -f "$dist_html" ]] \
-    || die "缺 SPA dist/index.html($dist_html)。master 从 live release 的 packages/web-react/dist serve。补救: 重跑 --deploy。"
-  local html spa_ok=0 expected_build got_build
-  expected_build="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist_html" | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
-  for i in $(seq 1 15); do
-    html="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/" 2>/dev/null || true)"
-    if echo "$html" | grep -q 'name="oc-build"'; then
-      spa_ok=1
-      break
-    fi
-    log "  GET / 尚未 serve SPA,重试 $i/15…"
-    sleep 2
-  done
-  [[ "$spa_ok" == 1 ]] \
-    || die "GET / 不是 SPA index.html(缺 oc-build meta)。补救: 确认 OC_RUNTIME_CHANNEL=v5 且 dist 已构建后 restart master。"
-  got_build="$(echo "$html" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
-  if [[ -n "$expected_build" && -n "$got_build" && "$got_build" != "$expected_build" ]]; then
-    die "GET / oc-build=$got_build 不等于 ${dist_html} 的 $expected_build。补救: 确认 live 指向本次 release 后 restart master。"
-  fi
-  log "  ✓ GET / 返回 SPA index.html(oc-build=${got_build:-present} src=${dist_html})"
-  assert_ssh_rule_before_drop
-  assert_personal_alive
-  log "  ✓ 个人版 $PERSONAL_UNIT 仍 active 且 :$PERSONAL_PORT 仍 200"
-  assert_watch_matches_live "$live_root"
-  log "✓ smoke 通过"
-}
+source "$SCRIPT_DIR/lib/v5-selfhost-diagnostics.sh"
 
-# One state word per unit. `systemctl is-active` prints "inactive"/"failed" AND exits
-# non-zero, so `$(systemctl is-active X || echo n/a)` printed two lines (OCV5-449).
-status_unit_state() { # <unit> [fallback]
-  local s
-  s="$(systemctl is-active "$1" 2>/dev/null)" || true
-  printf '%s' "${s:-${2:-n/a}}"
-}
 
-cmd_status() {
-  local live_now prev_now
-  log "══ selfhost status ══"
-  log "  worktree: $REPO_ROOT"
-  log "  HEAD: $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')"
-  if [[ -L "$MASTER_LIVE_LINK" ]]; then
-    live_now="$(readlink -f "$MASTER_LIVE_LINK" 2>/dev/null || echo dangling)"
-    log "  live: $MASTER_LIVE_LINK → $live_now"
-  else
-    log "  live: MISSING $MASTER_LIVE_LINK"
-  fi
-  if [[ -f "$MASTER_RELEASES_ROOT/.prev-release" ]]; then
-    prev_now="$(tr -d '[:space:]' <"$MASTER_RELEASES_ROOT/.prev-release")"
-    log "  prev: $prev_now"
-  else
-    log "  prev: MISSING"
-  fi
-  log "  env: $V5_ENV $([ -f "$V5_ENV" ] && echo present || echo MISSING) mode=$(stat -c %a "$V5_ENV" 2>/dev/null || echo -)"
-  if [[ -f "$V5_ENV" ]]; then
-    log "  OC_RUNTIME_IMAGE=$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_IMAGE)"
-    log "  OC_RUNTIME_IMAGE_ID=$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_IMAGE_ID)"
-    log "  OC_RUNTIME_RELEASE=$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_RELEASE)"
-    log "  OC_PLATFORM_BUNDLE=$(oc_hotcfg_env_get "$V5_ENV" OC_PLATFORM_BUNDLE)"
-    log "  OC_CONTROL_PLANE_LEADER=$(oc_hotcfg_env_get "$V5_ENV" OC_CONTROL_PLANE_LEADER)"
-  fi
-  log "  unit master:  $(status_unit_state "$V5_UNIT" n/a)"
-  log "  unit egress:  legacy=$(status_unit_state "$V5_EGRESS_UNIT" n/a) slotA=$(status_unit_state "$(egress_slot_unit A service)" n/a) slotB=$(status_unit_state "$(egress_slot_unit B service)" n/a) serving=$(egress_describe_topology) tcp_migrate_req=$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo n/a)"
-  log "  unit hostnet: $(status_unit_state "$V5_HOSTNET_UNIT" n/a)"
-  log "  unit ccb-proxy: $(status_unit_state "$V5_CCB_PROXY_UNIT" n/a)"
-  log "  unit sshgate: $(status_unit_state "$V5_SSHGATE_UNIT" n/a)"
-  # tunnel 是公网入口,不随部署自动 enable —— 由人显式决定是否对外暴露。
-  log "  unit tunnel:  $(status_unit_state "$V5_TUNNEL_UNIT" inactive) (enable 后跑 scripts/selfhost-sync-tunnel-url.sh --apply)"
-  # What is served is the live release, not this worktree (OCV5-449).
-  if [[ -n "${live_now:-}" && -d "$live_now" ]]; then
-    if [[ -f "$live_now/packages/web-react/dist/index.html" ]]; then
-      log "  spa dist:    present (live)"
-    else
-      log "  spa dist:    MISSING (live $live_now)"
-    fi
-    if [[ -f "$live_now/.complete" ]]; then
-      log "  .complete:   present (live) $(jq -er '.sourceCommit' "$live_now/.complete" 2>/dev/null || echo '?')"
-    else
-      log "  .complete:   MISSING (live $live_now)"
-    fi
-  else
-    log "  spa dist:    n/a (no live release)"
-    log "  .complete:   n/a (no live release)"
-  fi
-  log "  watch:       $(watch_summary "${live_now:-}")"
-  log "  gate-fail:   policy=$(gate_fail_policy 2>/dev/null) survivor-phase=$(sed -n 's/^phase=//p' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null | head -n1 || true) maint=$(sed -n 's/^until=//p' "$V5_WATCH_MAINT" 2>/dev/null | head -n1 || true)"
-  if [[ -f "$V5_ENV" ]]; then
-    log "  OC_SESSIONS_STORE=$(oc_hotcfg_env_get "$V5_ENV" OC_SESSIONS_STORE)"
-    log "  env keys:    $(bash "$SCRIPT_DIR/v5-selfhost-env-drift.sh" --env "$V5_ENV" --quiet \
-      --template "$REPO_ROOT/deploy/v5-selfhost/commercial-v5-selfhost.env.template" 2>&1 | tail -n1 || true)"
-  fi
-  log "  personal:     $(status_unit_state "$PERSONAL_UNIT" n/a)"
-  if docker network inspect openclaude-v5-net >/dev/null 2>&1; then
-    log "  net: openclaude-v5-net 存在"
-  else
-    log "  net: openclaude-v5-net 不存在"
-  fi
-  if sudo -u postgres psql -X -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" >/dev/null 2>&1; then
-    if pg_db_exists; then
-      log "  pg: $PG_DB 存在"
-    else
-      log "  pg: $PG_DB 不存在"
-    fi
-  else
-    log "  pg: 无法查询(postgres 不可达)"
-  fi
-  local p
-  for p in "$V5_PORT" "$V5_EGRESS_PORT" "$PERSONAL_PORT"; do
-    if port_in_use "$p"; then log "  port $p: listen"; else log "  port $p: idle"; fi
-  done
-}
 
 # ── bootstrap / deploy / cutover ─────────────────────────────────────────
 
@@ -2084,17 +2012,6 @@ cmd_bootstrap() {
 2) 联系维护者跑带 joint 的首次 bootstrap,或先手工写 env/网再 --deploy。"
 }
 
-explain_dirty_semantics() {
-  log "── 脏工作树三面语义 ──"
-  log "  master live     : git archive HEAD → 脏文件不会进线上进程 cwd"
-  log "  runtime-release : git archive HEAD → 脏文件不会进容器 bind"
-  if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
-    log "  platform bundle : --platform-from-head → 也从已提交树 archive,不带脏"
-  else
-    log "  platform bundle : 默认拷工作树 → 未提交的 platform-runtime 会进全员容器"
-    log "                    要干净请加 --platform-from-head"
-  fi
-}
 
 # 发布前 Incident trailer 快检。放在 lease_train_begin 之后、构建之前:
 #   · 之后 —— 失败要经 EXIT trap 把本班 train 记 failed(worker 对同 target 不自动重发,
@@ -2124,12 +2041,65 @@ $out
   esac
 }
 
+# OCV5-633:切流前把此刻 live 正在 serve 的前端资产(P0-Web 指针 webroot 或 release dist)加法同步进
+# 资产池。切流后仍开着旧版的标签页懒加载的正是这一份;新 release 的资产由它自己的 webRoot 提供,
+# 下次发版它成为 live 时再被播种。同步失败中止本次发布(live 未动);池所在盘可用 <1GiB 或找不到
+# live 资产目录则跳过并告警(只是回到无池现状,不阻断发版)。
+seed_web_assets_pool_from_live() {
+  local live src avail_kb out
+  log "── /assets 资产池播种(live 前端资产 → $WEB_ASSETS_POOL/assets;加法,排除 .map)──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 同步 live webroot 的 assets → $WEB_ASSETS_POOL/assets(加法,无删除)"
+    return 0
+  fi
+  live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  if ! src="$(wap_live_assets_dir "$WEB_OVERLAY_ROOT" "$live" 2>&1)"; then
+    log "  ⚠ 找不到 live 前端资产目录($src),跳过播种(旧标签页懒加载仍可能 404)"
+    return 0
+  fi
+  mkdir -p -- "$WEB_ASSETS_POOL" || die "建不了资产池根 $WEB_ASSETS_POOL。live 未动。"
+  avail_kb="$(df -Pk -- "$WEB_ASSETS_POOL" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ "$avail_kb" =~ ^[0-9]+$ ]] && ((avail_kb < 1048576)); then
+    log "  ⚠ 资产池所在盘可用 <1GiB,跳过播种(仅告警)"
+    return 0
+  fi
+  out="$(wap_sync "$WEB_ASSETS_POOL" "$src" 2>&1)" \
+    || die "资产池播种失败:$out。live 未动。补救: 检查 $WEB_ASSETS_POOL 的权限与磁盘后重发。"
+  log "  ✓ 已播种 $src($out)"
+}
+
+# OCV5-633 cutover 收尾(仅告警,不回滚):保护集 = 保留的 rel-*(含新 live)+ .prev-release +
+# 各 P0-Web 桶 current 指向的 webroot;只删池内不在保护集且超过 14 天未被播种的文件。
+web_assets_pool_gc() {
+  local r b prev
+  local -a dirs=()
+  for r in "$MASTER_RELEASES_ROOT"/rel-*; do
+    [[ -d "$r/packages/web-react/dist/assets" ]] && dirs+=("$r/packages/web-react/dist/assets")
+  done
+  prev="$(cat -- "$MASTER_RELEASES_ROOT/.prev-release" 2>/dev/null || true)"
+  [[ "$prev" == /* ]] && dirs+=("$prev/packages/web-react/dist/assets")
+  for b in "$WEB_OVERLAY_ROOT"/rel-*; do
+    [[ -L "$b/current" ]] && dirs+=("$b/current/assets")
+  done
+  echo "── /assets 资产池 GC(保护集 ${#dirs[@]} 个目录;只删非保护且 >14 天)──"
+  wap_gc "$WEB_ASSETS_POOL" 14 "${dirs[@]}"
+}
+
 cmd_deploy() {
   local sha dirty
+  local SELFHOST_SPLIT_PREPARED=0
   if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
     local recovery_rc=0
-    release_policy_recover_forward || recovery_rc=$?
+    if [[ "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" == 1 ]]; then
+      release_policy_recover_host_memory || recovery_rc=$?
+    else
+      release_policy_recover_forward || recovery_rc=$?
+    fi
     [[ "$recovery_rc" == 0 ]] || exit "$recovery_rc"
+    # Resume has no current cutover backup. The fixed index may locate only this
+    # same operation's original receipt; closure still verifies real history.
+    local CUTOVER_BACKUP=""
+    cc5_activation_finalize || { log "CC5 activation receipt unresolved after policy recovery; hold"; return 79; }
     log "✓ same-operation policy recovery verified; no serving pointer changed"
     return 0
   fi
@@ -2157,32 +2127,48 @@ $dirty
     fi
     log "$dirty"
   fi
-  sha="$(source_commit)"; selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"  # OCV5-581 L0,只读
+  sha="$(source_commit)"
+  if [[ "$PLATFORM_FROM_HEAD" == 1 && "$DRY" != 1 ]]; then
+    lease_train_begin "$sha"
+    assert_fix_trailers "$sha"
+    selfhost_prepare_candidate "$sha"
+    selfhost_prepared_enter_flip "$sha"
+    preflight_common  # mutable live dependencies may have changed while preparing
+  fi
   local policy_bind_rc=0
   release_policy_bind_official_train_request "$sha" || policy_bind_rc=$?
   [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
   cutover_adopt_inflight_request "$sha" || exit "$?"
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
-  ensure_selfhost_env_keys
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
     || die "openclaude-v5-net 不存在。补救: 不要在 --deploy 里建网;确认 bootstrap 做过或手工恢复该网。"
   [[ -L "$MASTER_LIVE_LINK" ]] \
     || die "缺 live symlink $MASTER_LIVE_LINK。本 --deploy 假定首次翻转已完成。
 补救: --cutover --release=<已有 rel-*> 完成首次翻转,或跑应急 restore-worktree-units.sh。"
-
-  ensure_node_modules
-  install_aux_units
-  refresh_ccb_proxy_path
-  ensure_model_authority
-  assert_env_key_drift
+  if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
+    ensure_selfhost_env_keys
+    seed_web_assets_pool_from_live
+    ensure_node_modules
+    install_aux_units
+    refresh_ccb_proxy_path
+    ensure_model_authority
+    assert_env_key_drift
+  fi
   if [[ "${LEASE_TRAIN_ACTIVE:-0}" != 1 ]]; then
     sha="$(source_commit)"
     lease_train_begin "$sha"
   fi
+  # Split prepare already ran L0; its build-space admission is not a flip-space requirement.
+  # Live migration/overlay/source checks still run under the flip lock.
+  if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
+    selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"
+  fi
   assert_fix_trailers "$sha"
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
-  start_runtime_release_bg "$sha"
+  # P2(OCV5-648):后台 runtime 构建由 build_master_release 在发车准入通过之后起,准入不再等本列车自己的构建。
+  if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
+  MASTER_RUNTIME_BG_AFTER_ADMISSION=1
   build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
   if [[ "$DRY" != 1 ]]; then
@@ -2194,6 +2180,7 @@ $dirty
   tsum_mark P.platform-bundle 2>/dev/null || :
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
+  fi
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
   DEPLOY_BUILT_SOURCE_COMMIT="$sha"
   CUTOVER_JOINT=1
@@ -2219,8 +2206,14 @@ cutover_fail() {
   return 1
 }
 
-cutover_smoke_against_release() { # <rel>
-  local rel="$1" hz i ok=0 html spa_ok=0 expected_build got_build
+cutover_smoke_against_release() { # <rel> [internal recovery context]
+  local rel="$1" context="${2:-forward}" hz i ok=0 html spa_ok=0 expected_build got_build
+  local policy_rc=0
+  host_log_policy_check_release "$rel" || policy_rc=$?
+  if (( policy_rc != 0 )); then
+    cutover_fail "cutover smoke: host log policy check failed" || :
+    return "$policy_rc"
+  fi
   expected_build="$(dist_oc_build "$rel")"
   [[ -n "$expected_build" ]] || { cutover_fail "smoke: release dist 缺 oc-build"; return 1; }
   for i in $(seq 1 90); do
@@ -2272,7 +2265,7 @@ cutover_smoke_against_release() { # <rel>
     cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
   fi
   # Must pass before either branch persists phase=smoked (survivor invariant).
-  user_contract_gate "$rel" || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
+  user_contract_gate "$rel" "$context" || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
 }
 
 cutover_smoke_healthz_only() {
@@ -2324,6 +2317,10 @@ cutover_arm_survivor() { # <backup-dir>
   [[ -f "$src" ]] || { cutover_clog "缺仓库 survivor 脚本 $src"; return 1; }
   mkdir -p -- "$BREAKGLASS_ROOT"
   install -m 0755 "$src" "$BREAKGLASS_ROOT/cutover-survivor.sh" || return 1
+  install -m 0755 "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.py" "$BREAKGLASS_ROOT/cc5-activation.py" || return 1
+  # Preserve the existing installed live-backup recovery implementation.
+  # Its two official callers (this controller and the installed survivor) guard
+  # pending activation before invoking it; never replace it with worktree-only code.
   script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script"; return 1; }
   if [[ "$backup" == *"/pre-cutover-20260818-144626" ]]; then
@@ -2354,6 +2351,7 @@ cutover_backup_units_are_live_wd() { # <backup-dir>
 
 cutover_tier2_restore() { # <backup-dir>
   local backup="$1" restore
+  cc5_activation_restore_guard || return "$?"
   restore="/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh"
   [[ -d "$backup" ]] || { cutover_clog "二级失败:备份目录不存在 $backup"; return 1; }
   if ! cutover_backup_units_are_live_wd "$backup"; then
@@ -2373,6 +2371,10 @@ cutover_tier2_restore() { # <backup-dir>
 
 cutover_rollback_inplace() { # <failed-rel> <backup-dir>
   local backup="$2" raw prev
+  local CC5_ACTIVATION_COMPENSATING=1
+  # A post-saga cutover failure also reaches this path. Restore the two keys
+  # before switching/restarting the predecessor; UNKNOWN stops every fallback.
+  cc5_activation_revert || return "$?"
   cutover_clog "── 统一补偿出口 phase=${CUTOVER_PHASE:-?} ──"
   write_cutover_grace || true
   raw="$(tr -d '[:space:]' <"$MASTER_RELEASES_ROOT/.prev-release" 2>/dev/null || true)"
@@ -2838,7 +2840,20 @@ cmd_cutover() {
   tsum_mark E1 2>/dev/null || :
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
   assert_master_release_static_gate "$rel" "$head"
+  if [[ "${CUTOVER_ROLLBACK:-0}" != 1 ]]; then
+    model_policy_require_forward_release "$rel" || die "正向发布需要完整 generation 1 model policy。尚未改任何运行面。"
+  fi
   assert_master_release_tsx_selfcheck "$rel"
+  if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
+    # E1 has verified the sealed candidate before the first live setup write.
+    ensure_selfhost_env_keys
+    seed_web_assets_pool_from_live
+    ensure_node_modules
+    install_aux_units
+    refresh_ccb_proxy_path
+    ensure_model_authority
+    assert_env_key_drift
+  fi
   cutover_clog "  Box success recovery 已在 build_master_release 封存前执行;已封存 rel 的切流与回退不再依赖该脚本"
   expected_build="$(dist_oc_build "$rel")"
   cutover_clog "  dist oc-build=$expected_build"
@@ -2917,7 +2932,7 @@ cmd_cutover() {
     cutover_clog "  .prev-release=$prev_val"
   fi
   tsum_mark E3.wait-idle 2>/dev/null || :
-  cutover_wait_for_user_idle || return 1
+  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 1; fi; cutover_wait_for_user_idle || return 1
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
   if [[ "$DRY" != 1 ]]; then
     cutover_persist_phase "pre-install"
@@ -2943,6 +2958,11 @@ cmd_cutover() {
     fi
     cutover_clog "  [dry-run] systemctl daemon-reload"
   else
+    release_policy_guard_owner || return 86
+    if ! install_host_log_policy_from_snapshot "$rel" "$unit_snap"; then
+      cutover_compensate "install-host-log-policy"
+      return $?
+    fi
     release_policy_guard_owner || return 86
     if ! install_unit "$unit_snap/$V5_EGRESS_UNIT"; then
       cutover_compensate "install-egress-unit"
@@ -3110,32 +3130,42 @@ cmd_cutover() {
   clear_stay_maintenance || cutover_clog "  ⚠ 撤销 stay 维护窗口失败(到期后看护自动忽略)"
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
+  # Genuine saga/history is committed. Close the selected-key receipt before
+  # installing a predecessor watch on an official rollback.
+  cc5_activation_finalize || { cutover_clog "CC5 activation receipt unresolved; hold"; return 79; }
   sync_watch_from "$rel" \
     || cutover_clog "  ⚠ 看护同步失败(仅告警,不回滚;--smoke 会因看护漂移失败)"
+  fi
+  if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
+    selfhost_prepared_complete "$head" "$rel" || cutover_clog "  ⚠ prepared receipt cleanup deferred"
   fi
   # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
   # master release:引用感知 v5-release-gc.sh,keep 3(OCV5-376:当前 + 上一个 + 一个回滚点;根盘曾 96%,
   # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/
   # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
   # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
-  bash "$SCRIPT_DIR/v5-release-gc.sh" \
+  selfhost_prepared_gc bash "$SCRIPT_DIR/v5-release-gc.sh" \
     "$MASTER_RELEASES_ROOT" 3 \
     "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
     "$MASTER_RELEASES_ROOT/.prev-release" \
     "$V5_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)" \
     '' '' '' 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ master release GC 失败/安全跳过(仅告警,不回滚)"
-  oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
+  selfhost_prepared_gc oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ runtime GC 失败(仅告警,不回滚)"
   wo_gc_buckets "$WEB_OVERLAY_ROOT" "$MASTER_RELEASES_ROOT" 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ P0-Web overlay 桶 GC 失败(仅告警,不回滚)"
+  web_assets_pool_gc 2>&1 | sed 's/^/  /' \
+    || cutover_clog "  ⚠ /assets 资产池 GC 失败(仅告警,不回滚)"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 
 case "$MODE" in
+  prewarm-artifacts) cmd_prewarm_artifacts ;;
   preflight) cmd_preflight ;;
   bootstrap) cmd_bootstrap ;;
   deploy) cmd_deploy ;;
+  prepare) cmd_prepare ;;
   build-master-only) cmd_build_master_only ;;
   cutover) cmd_cutover ;;
   rollback) cmd_rollback ;;

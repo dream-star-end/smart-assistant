@@ -418,8 +418,18 @@ release_policy_assert_no_service_jobs() {
 
 release_policy_install_guards() { # <verified candidate> <captured predecessor>
   release_policy_enabled || return 0
-  local rel="$1" previous="$2" unit probe old_watch_fd old_watch_identity readers
+  local rel="$1" previous="$2" guard_rel="$1" unit probe old_watch_fd old_watch_identity readers
   release_policy_require_owner || return 86
+  # Retain a current activation guard during rollback; when rolling forward
+  # from an older unguarded release, install the candidate guard instead.
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
+    [[ -f "$previous/scripts/v5-selfhost-watch.sh" && ! -L "$previous/scripts/v5-selfhost-watch.sh" ]] || return 2
+    if LC_ALL=C grep -Fqx -- '# CC5 activation mutation guard v1' "$previous/scripts/v5-selfhost-watch.sh"; then
+      guard_rel="$previous"
+    else
+      [[ "$?" == 1 ]] || return 2
+    fi
+  fi
   [[ -f "$V5_WATCH_DIR/watch.sh" && ! -L "$V5_WATCH_DIR/watch.sh" ]] || return 2
   [[ -f "$rel/scripts/lib/v5-release-policy.py" && -f "$rel/scripts/v5-lease-worker.sh" && -f "$rel/scripts/v5-lease-lib.sh" ]] || return 2
   cmp -s "$RELEASE_POLICY_HELPER" "$rel/scripts/lib/v5-release-policy.py" || return 2
@@ -427,12 +437,12 @@ release_policy_install_guards() { # <verified candidate> <captured predecessor>
   # identifiable after the atomic install; no process is signalled.
   exec {old_watch_fd}<"$V5_WATCH_DIR/watch.sh" || return 2
   old_watch_identity="$(stat -Lc '%d:%i' "/proc/$$/fd/$old_watch_fd")" || return 2
-  sync_watch_from "$rel" || { exec {old_watch_fd}<&-; return 2; }
+  sync_watch_from "$guard_rel" || { exec {old_watch_fd}<&-; return 2; }
   readers="$(release_policy_watch_readers "$old_watch_identity")" || { exec {old_watch_fd}<&-; return 2; }
   release_policy_drain_watch_readers "$readers" || { local rc=$?; exec {old_watch_fd}<&-; return "$rc"; }
   exec {old_watch_fd}<&-
-  cmp -s "$V5_WATCH_DIR/watch.sh" "$rel/scripts/v5-selfhost-watch.sh" || return 2
-  cmp -s "$V5_WATCH_DIR/alert.sh" "$rel/scripts/v5-selfhost-watch-alert.sh" || return 2
+  cmp -s "$V5_WATCH_DIR/watch.sh" "$guard_rel/scripts/v5-selfhost-watch.sh" || return 2
+  cmp -s "$V5_WATCH_DIR/alert.sh" "$guard_rel/scripts/v5-selfhost-watch-alert.sh" || return 2
   # New stable-path invocations load the new self-contained guard. Existing
   # loaded old actions must finish before the context or any unit can change.
   for unit in openclaude-v5-selfhost-watch.service openclaude-v5-selfhost-autorecover-action.service \
@@ -465,6 +475,7 @@ release_policy_flip_live() { # saga extra_apply, after real prechecks/context ar
   release_policy_assert_no_service_jobs || return $?
   # A user may have begun a turn while the old reader was draining. Apply the
   # existing real idle gate again before runtime/egress/master are restarted.
+  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 79; fi
   cutover_wait_for_user_idle || return 79
   release_policy_require_owner || return 86
 }
@@ -624,8 +635,18 @@ release_policy_original_finalizer() { # exact target; caller keeps intent active
   release_policy_require_owner || return 86
   ( set -e; sync_boot_scripts_from "$rel" ) || return 79
   release_policy_require_owner || return 86
+  # The history was already proved by finalize_forward. Complete carrier state
+  # before any watch downgrade; unresolved activation must keep the policy hold.
+  cc5_activation_finalize || return 79
+  release_policy_require_owner || return 86
   sync_watch_from "$rel" || return 79
   [[ "$(watch_install_state "$rel")" == same ]] || return 79
+  # Still inside this operation's intent barrier. The child asks this exact
+  # deploy process to re-run its existing owner/fencing guard before each write.
+  # Ordinary failures hold an already-committed app; owner loss remains 86.
+  if [[ -f "$rel/scripts/v5-selfhost-host-memory.py" ]]; then
+    host_memory_sampler_finalize "$rel" || return $?
+  fi
   return 0
 }
 
@@ -659,7 +680,7 @@ release_policy_finish_compensation() { # saga already restored exact predecessor
   served="$(release_policy_py field mayHaveServed)" || return 79
   digest="$(release_policy_probe_stack before)" || return $?
   # Confirm original full user gates, not only healthz, before releasing hold.
-  if cutover_smoke_against_release "$before"; then :; else return 79; fi
+  if cutover_smoke_against_release "$before" compensation; then :; else return 79; fi
   release_policy_require_owner || return 86
   cutover_persist_phase kept-failed || return 79
   cutover_disarm_survivor || return 79
@@ -675,10 +696,10 @@ release_policy_finish_compensation() { # saga already restored exact predecessor
   return 1 # Failed deployment, never accepted/satisfied as target.
 }
 
-# Same-operation forward reconciliation. This never builds, flips a serving
-# pointer, restarts services, restores an env file or adjusts billing records.
+# Claim the original operation for a supported recovery action. The claim itself
+# changes only lease metadata; it never grants a new owner outside this fencing.
 release_policy_resume_claim() {
-  local info original_pid now ticks owner_doc
+  local info original_pid now ticks owner_doc resume_detail
   [[ -n "$LEASE_TRAIN_ID" && -n "$LEASE_TARGET_SHA" ]] || return 2
   lease_train_load_lib || return 2
   lease_valid_train_id "$LEASE_TRAIN_ID" && lease_valid_sha "$LEASE_TARGET_SHA" || return 2
@@ -695,6 +716,10 @@ release_policy_resume_claim() {
   ticks="$(proc_starttime_of "$$")" || return 86
   owner_doc="$(jq -cn --arg nonce "$RELEASE_POLICY_NONCE" --argjson pid "$$" --arg ticks "$ticks" '{nonce:$nonce,pid:$pid,startTicks:$ticks}')" || return 79
   now="$(lease_now)"
+  resume_detail='same operation; metadata-only forward reconciliation'
+  if [[ "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" == 1 ]]; then
+    resume_detail='same operation; explicit sampler snapshot restore; application hold retained'
+  fi
   lease_tx <<SQL || return 79
 .bail on
 BEGIN IMMEDIATE;
@@ -707,7 +732,7 @@ UPDATE train SET status='building',executor_pid=$$,finished_at=NULL,updated_at='
  AND COALESCE(executor_pid,0)=$original_pid AND json_extract(evidence_json,'$.releasePolicyOwner.nonce')='$RELEASE_POLICY_NONCE'
  AND status IN ('failed','building','cutover','committed');
 INSERT INTO _policy_resume_guard VALUES(changes());
-$(lease_event_sql "$LEASE_TRAIN_ID" policy-resume "deploy:$$" 'same operation; metadata-only forward reconciliation')
+$(lease_event_sql "$LEASE_TRAIN_ID" policy-resume "deploy:$$" "$resume_detail")
 COMMIT;
 SQL
   RELEASE_POLICY_MODE=user-impact-only
@@ -715,6 +740,29 @@ SQL
   LEASE_TRAIN_ACTIVE=1
   RELEASE_POLICY_RESUME_INFO="$info"
   release_policy_require_owner || return 86
+}
+
+release_policy_recover_host_memory() { # explicit restore; never forward/resolve
+  local rel
+  # This action repairs a held, interrupted install. An already-resolved archive
+  # does not authorize revoking an accepted sampler or recreating an app barrier.
+  release_policy_context_present || return 79
+  release_policy_resume_claim || return $?
+  [[ "$(jq -r .archived <<<"$RELEASE_POLICY_RESUME_INFO")" == false ]] || return 79
+  rel="$(jq -er .rel <<<"$RELEASE_POLICY_RESUME_INFO")" || return 79
+  CUTOVER_REL="$rel"
+  CUTOVER_JOINT=1
+  CUTOVER_LOG="$(train_field "$LEASE_TRAIN_ID" log_path)" || return 79
+  CUTOVER_PHASE="$(survivor_state_phase)" || return 79
+  release_policy_probe_stack target >/dev/null || return $?
+  release_policy_require_owner || return 86
+  host_memory_sampler_restore "$rel" || return $?
+  release_policy_require_owner || return 86
+  release_policy_context_present || return 79
+  CUTOVER_KEPT_FAILED_REL="$rel"
+  lease_train_finish failed "sampler snapshot restored; application not reaccepted; policy hold retained" || return $?
+  cutover_clog "host-memory: sampler restored; application not reaccepted; existing intent/phase unchanged; hold retained; forward requires a separate request"
+  return 79
 }
 
 release_policy_recover_forward() {
@@ -729,6 +777,9 @@ release_policy_recover_forward() {
   if [[ "$(jq -r .archived <<<"$RELEASE_POLICY_RESUME_INFO")" == true ]]; then
     # Exact archive and fresh physical target permit only same-operation
     # receipt repair. No paid gates, history append or serving mutation repeats.
+    if [[ -f "$rel/scripts/v5-selfhost-host-memory.py" ]]; then
+      cutover_clog "host-memory: archived replay repairs application receipts only; sampler unchanged, OOM acceptance still requires independent verification"
+    fi
     release_policy_require_owner || return 86
     if cutover_persist_phase committed; then
       :
@@ -746,6 +797,7 @@ release_policy_recover_forward() {
     return 0
   fi
   ( assert_master_release_static_gate "$rel" "$LEASE_TARGET_SHA" ) || return 79
+  model_policy_require_forward_release "$rel" || return 79
   state="$(release_policy_history_status)" || return 79
   if [[ "$state" == missing ]]; then
     release_policy_require_owner || return 86

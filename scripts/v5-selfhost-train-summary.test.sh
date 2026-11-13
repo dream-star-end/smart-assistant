@@ -36,6 +36,8 @@ out="$(run "$d" "
   LEASE_TRAIN_ID=$TID LEASE_TARGET_SHA=0123456789abcdef0123456789abcdef01234567
   MASTER_DEPS_MODE=hardlink MASTER_FRONTEND_MODE=reused
   tsum_init 2>/dev/null || :
+  tsum_note frontendTscSec 1.250 2>/dev/null || :
+  tsum_note flip.verifySec 0.125 2>/dev/null || :
   tsum_mark B 2>/dev/null || :; sleep 0.05
   tsum_mark C.box-success-recovery 2>/dev/null || :; sleep 0.05
   tsum_mark D 2>/dev/null || :
@@ -58,6 +60,8 @@ check "C phase measured (>= 40 ms)" jq -e '.phases[2].durationMs >= 40' "$f"
 check "cache modes and sourceCommit recorded" \
   jq -e '.cache.nodeModules == "hardlink" and .cache.frontend == "reused" and .sourceCommit == "0123456789abcdef0123456789abcdef01234567"' "$f"
 check "load recorded" jq -e '(.load.start | type) == "number" and .load.peakAtMarks >= .load.start and .load.samples == 6' "$f"
+check "only the two S1 measurements are added as notes" \
+  jq -e '.notes == {frontendTscSec:"1.250", "flip.verifySec":"0.125"}' "$f"
 check "no temp file left" bash -c "! ls '$d' | grep -q tmp"
 
 # 2. A failed train: failedPhase is the last non-compensation phase; exit code kept.
@@ -137,14 +141,65 @@ check "guarded call site without the lib: runs silently" test "$out" = body
 sites="$(grep -hE '^\s*tsum_(init|mark|finish|note)\b' "$DEPLOY" "$MLIB")"
 check "every call site is guarded (2>/dev/null || :)" bash -c "! printf '%s\n' \"\$1\" | grep -vE ' 2>/dev/null \|\| :\$'" _ "$sites"
 check "deploy sources the lib" grep -qE '^source "\$SCRIPT_DIR/lib/v5-selfhost-train-summary\.sh"' "$DEPLOY"
-check "EXIT cleanup calls tsum_finish right after reading the exit code" \
-  bash -c "grep -A1 -F '  local exit_rc=\$?' '$DEPLOY' | grep -qF '  tsum_finish \"\$exit_rc\" 2>/dev/null || :'"
+# P1 (a3bd7741e): prewarm now exits through private cleanup before train recording.
+# Exercise the actual function: ordinary deploy drains C/D before recording the original status,
+# including owner loss; prewarm must never call the recorder or production cleanup.
+sed -n '/^cleanup_selfhost_deploy() {/,/^}/p' "$DEPLOY" >"$T/cleanup.sh"
+for mode in deploy prewarm-artifacts; do
+  for code in 0 7 86; do
+    trace="$T/cleanup-$mode-$code.log"
+    env -i PATH="$PATH" HOME="$T" MODE="$mode" TRACE="$trace" bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      note() { printf "%s\n" "$*" >>"$TRACE"; }
+      user_contract_prewarm_cleanup() { note prewarm-drain; }
+      reap_master_build_jobs() { note drain; }
+      tsum_finish() { note "finish:$1"; }
+      prewarm_cleanup_invocation() { note "prewarm:$1"; }
+      release_policy_enabled() { note policy; return 1; }
+      release_policy_abort_unexposed() { note abort; }
+      reap_runtime_release_bg() { note reap; }
+      master_gate_load_budget_stop() { note load-stop; }
+      lease_train_on_exit() { note "lease:$1"; }
+      cleanup_master_staging() { note master; }
+      cleanup_cutover_unit_snap() { note units; }
+      p0web_cleanup_build() { note web; }
+      trap cleanup_selfhost_deploy EXIT
+      exit "$2"
+    ' _ "$T/cleanup.sh" "$code"
+    rc=$?
+    check "$mode EXIT cleanup preserves status $code" test "$rc" = "$code"
+    expected=$'prewarm-drain\nprewarm:'"$code"
+    if [[ "$mode" == deploy ]]; then
+      expected=$'prewarm-drain\ndrain\nfinish:'"$code"
+      if [[ "$code" != 86 ]]; then
+        expected+=$'\npolicy'
+        [[ "$code" == 0 ]] || expected+=$'\nabort'
+        expected+=$'\nreap\nload-stop\nlease:'"$code"$'\nmaster\nunits\nweb'
+      fi
+    fi
+    check "$mode EXIT cleanup $code has only its ordered effects" test "$(cat "$trace")" = "$expected"
+  done
+done
 check "cmd_deploy starts the recorder" bash -c "sed -n '/^cmd_deploy() {/,/^}/p' '$DEPLOY' | grep -qE '^  tsum_init '"
-# OCV5-557: the retryable gates run as `if ! master_gate_retryable <gate> <command> ...`.
-gates="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB" | grep -cE '^\s*if ! (\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" |master_gate_retryable )')"
-cmarks="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB" | grep -cE '^\s*tsum_mark C\.')"
-check "one C.* mark per fixed gate ($gates gates, $cmarks marks)" test "$gates" -ge 10 -a "$gates" = "$cmarks"
-for p in A B D P.mcp-bundle P.seal P.runtime-wait P.platform-bundle E1 E2 E2.apply E3.prep E3.wait-idle E3.units E4 F.prewarm F.C1-C3 F.G1 F.S1 G X.compensate; do
+# P3: thirteen C jobs + D share one wall-clock phase; five isolated C gates retain marks.
+# Exact execution/parent-only per-job receipts are covered by v5SelfhostParallelGates.node-test.mjs.
+body="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB")"
+queued="$(printf '%s\n' "$body" | grep -cE '^    C\.[a-z-]+:master_job_')"
+check "all thirteen deterministic C jobs are queued" test "$queued" = 13
+model_policy_queued="$(printf '%s\n' "$body" | grep -cE '^    C\.model-policy:master_job_model_policy \\$')"
+check "model-policy proof is explicitly queued once" test "$model_policy_queued" = 1
+cmarks="$(printf '%s\n' "$body" | sed -n 's/^  tsum_mark \(C\.[a-z-]*\) .*/\1/p')"
+check "one C.parallel mark plus all five isolated C marks" test "$cmarks" = $'C.parallel\nC.box-success-recovery\nC.box-continuation\nC.box-incident-proofs\nC.box-longtask\nC.ccb-mcp'
+check "D is queued and its measured duration returns to the parent" \
+  python3 - "$MLIB" <<'PY_CHECK'
+import sys
+s = open(sys.argv[1]).read()
+assert '    D:master_job_frontend' in s
+assert 'tsum_note frontendElapsedSec "$MASTER_FRONTEND_ELAPSED_S"' in s
+assert 'tsum_note frontendTscSec ' in s
+PY_CHECK
+for p in A B P.mcp-bundle P.seal P.runtime-wait P.platform-bundle E1 E2 E2.apply E3.prep E3.wait-idle E3.units E4 F.prewarm F.C1-C3 F.G1 F.S1 G X.compensate; do
   if [[ "$p" == A ]]; then continue; fi
   check "phase $p is marked" grep -qE "^\s*tsum_mark ${p//./\\.} 2>/dev/null \|\| :\$" "$DEPLOY" "$MLIB"
 done
@@ -165,10 +220,10 @@ LEASE_TRAIN_ID=$TID; tsum_init || :; master_note_architecture '$T/missing.json';
 check "unreadable architecture report: noted, train goes on" test "$out" = survived
 check "unreadable architecture report is noted" jq -e '.notes["arch.report"] == "unreadable"' "$(S "$d")"
 body="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB")"
-check "architecture step runs at pinned staging and fails the train when the checker fails" \
-  bash -c "printf '%s\\n' \"\$1\" | grep -A3 -F 'npx --no-install tsx scripts/check-architecture.ts' | grep -qF 'die \"pinned architecture guardrails'" _ "$body"
+check "architecture worker returns failure to the parent job barrier" \
+  bash -c "printf '%s\\n' \"\$1\" | grep -A3 -F 'npx --no-install tsx scripts/check-architecture.ts' | grep -qF 'return 1'" _ "$body"
 check "architecture counts are noted after the step" \
-  bash -c "printf '%s\\n' \"\$1\" | grep -qF 'master_note_architecture \"\$MASTER_GATE_TMPDIR/architecture.json\"'" _ "$body"
+  bash -c "printf '%s\\n' \"\$1\" | grep -qF 'master_note_architecture \"\$MASTER_GATE_TMPDIR/C.architecture/architecture.json\"'" _ "$body"
 
 echo "---"
 if (( fails )); then echo "FAIL: $fails" >&2; exit 1; fi

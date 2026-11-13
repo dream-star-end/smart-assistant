@@ -1,5 +1,6 @@
 import { hashRouteToken } from '../account-pool/groups.js'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 
 import { DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS } from '@openclaude/protocol'
@@ -120,6 +121,8 @@ function defaultSnapshot(over?: {
         capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION + 1,
       }),
       catalogEntry({ entryId: 8, modelId: 'retired-codex', engine: 'codex', state: 'disabled' }),
+      catalogEntry({ entryId: 9, modelId: 'antigravity-claude-sonnet-5.5', engine: 'antigravity' }),
+      catalogEntry({ entryId: 10, modelId: 'antigravity-gemini-4-argon', engine: 'antigravity' }),
     ],
     aliases: new Map([
       ['sol-alias', 1],
@@ -134,6 +137,14 @@ function defaultSnapshot(over?: {
       ['max-codex', price('max-codex', { minPlanCode: 'max', minPlanTier: 3, displayName: 'Max Codex' })],
       ['future-codex', price('future-codex', { displayName: 'Future Codex' })],
       ['retired-codex', price('retired-codex', { displayName: 'Retired Codex' })],
+      [
+        'antigravity-claude-sonnet-5.5',
+        price('antigravity-claude-sonnet-5.5', { displayName: 'Antigravity Sonnet 5.5' }),
+      ],
+      [
+        'antigravity-gemini-4-argon',
+        price('antigravity-gemini-4-argon', { displayName: 'Antigravity Gemini 4 Argon' }),
+      ],
     ]),
     securityEpoch: over?.epoch ?? SECURITY_EPOCH,
   })
@@ -171,6 +182,15 @@ function makeRuntime(opts?: {
   advisorRoute?: import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute | (() => Promise<import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute>)
   advisorRouteThrow?: Error
   grokRouteMatches?: boolean
+  antigravity?: {
+    journalState?: string
+    usageRows?: Array<{ id: string; ledger_id: string | null; cost_credits: string }>
+    turnRows?: Array<{ status: string; has_usage: boolean }>
+    claim?: (pool: unknown, requestId: string) => Promise<string | null>
+    finalize?: (pool: unknown, args: Record<string, unknown>) => Promise<void>
+    settle?: (args: Record<string, unknown>) => Promise<unknown>
+    abandon?: (pool: unknown, requestId: string, userId: bigint) => Promise<void>
+  }
 }) {
   const journals =
     opts?.journals ??
@@ -184,6 +204,16 @@ function makeRuntime(opts?: {
   const authzCalls: Array<{ uid: bigint; requiredEpoch?: bigint }> = []
   const advisorRouteCalls: unknown[] = []
   const expireCalls: string[] = []
+  const antigravityCalls = {
+    claim: [] as string[],
+    finalize: [] as Record<string, unknown>[],
+    settle: [] as Record<string, unknown>[],
+    abandon: [] as string[],
+    expire: [] as string[],
+    expireForRequest: [] as string[],
+    releaseInflight: [] as string[],
+  }
+  const journalUpdates: Array<{ sql: string; params: unknown[] }> = []
   let assertFreshCalls = 0
   let snapshot = opts?.snapshot ?? defaultSnapshot()
   const runtime = createDelegateEngineBillingRuntime({
@@ -198,12 +228,25 @@ function makeRuntime(opts?: {
             return { rows: opts?.grokRouteMatches === false ? [] : [{model_id: 'grok-build'}] }
           }
           if (String(sql).includes('FROM request_finalize_journal')) {
+            if (String(sql).includes('state FROM request_finalize_journal')) {
+              return { rows: opts?.antigravity?.journalState ? [{ state: opts.antigravity.journalState }] : [] }
+            }
             const row = journals.get(String(params?.[0]))
             return {
               rows: row
                 ? [{ user_id: row.user_id, container_id: row.container_id, ctx: row.ctx }]
                 : [],
             }
+          }
+          if (String(sql).includes('FROM usage_records')) {
+            return { rows: opts?.antigravity?.usageRows ?? [], rowCount: 0 }
+          }
+          if (String(sql).includes('FROM antigravity_turns')) {
+            return { rows: opts?.antigravity?.turnRows ?? [], rowCount: 0 }
+          }
+          if (String(sql).includes('UPDATE request_finalize_journal')) {
+            journalUpdates.push({ sql: String(sql), params: params ?? [] })
+            return { rows: [], rowCount: 0 }
           }
           return { rows: [], rowCount: 0 }
         },
@@ -261,7 +304,7 @@ function makeRuntime(opts?: {
       abortCalls.push(requestId)
       return true
     },
-    createAdvisorCodexRoute: opts?.advisorRouteThrow
+    createCodexDelegateRoute: opts?.advisorRouteThrow
       ? async (args) => {
           advisorRouteCalls.push(args)
           throw opts.advisorRouteThrow
@@ -272,12 +315,44 @@ function makeRuntime(opts?: {
             return typeof opts.advisorRoute === 'function' ? opts.advisorRoute() : opts.advisorRoute!
           }
         : undefined,
-    expireAdvisorCodexRoute: async (token) => {
+    expireCodexDelegateRoute: async (token) => {
       expireCalls.push(token)
     },
     releasePreCheckFn: async (redis, reservation) => {
       releaseCalls.push({ redis, reservation })
       return true
+    },
+    claimInflightJournalForSettlementFn: async (_pool, requestId) => {
+      antigravityCalls.claim.push(requestId)
+      return opts?.antigravity?.claim
+        ? opts.antigravity.claim(_pool, requestId)
+        : 'claim-0001'
+    },
+    finalizeInflightJournalFn: async (_pool, args) => {
+      antigravityCalls.finalize.push(args as Record<string, unknown>)
+      if (opts?.antigravity?.finalize) await opts.antigravity.finalize(_pool, args as Record<string, unknown>)
+    },
+    settleAntigravityTurnFn: async (args) => {
+      antigravityCalls.settle.push(args as Record<string, unknown>)
+      return opts?.antigravity?.settle
+        ? ((await opts.antigravity.settle(args as Record<string, unknown>)) as never)
+        : ({
+            settled: { settledCostCredits: 123n, ledgerId: 9n, usageId: 8n },
+            released: { tokens: 0 },
+          } as never)
+    },
+    abandonAntigravityTurnFn: async (_pool, requestId, userId) => {
+      antigravityCalls.abandon.push(requestId)
+      if (opts?.antigravity?.abandon) await opts.antigravity.abandon(_pool, requestId, userId)
+    },
+    expireAntigravityRoute: async (token) => {
+      antigravityCalls.expire.push(token)
+    },
+    expireAntigravityRouteForRequest: async (requestId) => {
+      antigravityCalls.expireForRequest.push(requestId)
+    },
+    releaseAntigravityInflightFn: (requestId) => {
+      antigravityCalls.releaseInflight.push(requestId)
     },
   })
   return {
@@ -292,6 +367,8 @@ function makeRuntime(opts?: {
     authzCalls,
     advisorRouteCalls,
     expireCalls,
+    antigravityCalls,
+    journalUpdates,
     get assertFreshCalls() {
       return assertFreshCalls
     },
@@ -301,9 +378,99 @@ function makeRuntime(opts?: {
   }
 }
 
+it('paused preset delegate identity rejects nongrok overrides before side effects and preserves old journal cleanup', () => {
+  // The policy is boot-scoped. Isolate it so normal Grok/control admissions in
+  // this file keep their original deployment identity and assertions.
+  const child = spawnSync(process.execPath, [
+    '--import', import.meta.resolve('tsx'), '--input-type=module', '-e', `
+      import assert from 'node:assert/strict';
+      import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+      import { tmpdir } from 'node:os';
+      import { join } from 'node:path';
+      import { configureModelAvailability } from ${JSON.stringify(new URL('../billing/modelAvailability.ts', import.meta.url).href)};
+      import { createDelegateEngineBillingRuntime } from ${JSON.stringify(new URL('../billing/delegateEngineBillingRuntime.ts', import.meta.url).href)};
+      import { DELEGATE_ENGINE_BILLING_ADMIT_PATH, DELEGATE_ENGINE_BILLING_SETTLE_PATH, DELEGATE_ENGINE_BILLING_ABANDON_PATH } from ${JSON.stringify(new URL('../http/internalDelegateEngineBilling.ts', import.meta.url).href)};
+
+      const root = mkdtempSync(join(tmpdir(), 'delegate-preset-policy-'));
+      const policyFile = join(root, 'deploy/v5-selfhost/model-availability.json');
+      mkdirSync(join(root, 'deploy/v5-selfhost'), { recursive: true });
+      const configure = (grokEnabled) => {
+        writeFileSync(policyFile, JSON.stringify({ grokEnabled }));
+        configureModelAvailability({ status: 'ok', flavor: 'selfhost', manifestPath: join(root, 'flavor.manifest.json') });
+      };
+      const identity = { userId: 42, containerId: 7 };
+      const body = { model: 'gpt-5.6-sol', engine: 'codex', agentId: 'auditor', delegateAgentId: 'auditor', sessionKey: 'agent:auditor:delegate:main:1' };
+      const requestId = 'ab'.repeat(16);
+      const rig = () => {
+        const calls = [];
+        const forbidden = (name) => () => { calls.push(name); throw new Error('UNEXPECTED_SIDE_EFFECT_' + name); };
+        const runtime = createDelegateEngineBillingRuntime({
+          getPool: forbidden('pool'), preCheckRedis: {}, pricing: { get: forbidden('pricing') },
+          catalog: { assertFresh: forbidden('catalog') }, loadUserModelAuthz: forbidden('authz'),
+          newRequestId: forbidden('request-id'), getAgentCostMultiplierFn: forbidden('multiplier'),
+          preCheckWithCostFn: forbidden('precheck'), startInflightJournalFn: forbidden('journal'),
+          attributeOpenTurnFn: forbidden('open-turn'), createCodexDelegateRoute: forbidden('codex-route'),
+        });
+        return { calls, runtime };
+      };
+      try {
+        configure(false);
+        for (const fields of [
+          { delegateAgentId: 'office-assistant' },
+          { agentId: 'office-assistant' },
+          { agentId: 'office-assistant', delegateAgentId: 'office-assistant' },
+        ]) {
+          const { calls, runtime } = rig();
+          await assert.rejects(() => runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity, body: { ...body, ...fields } }),
+            /^Error: DELEGATE_ENGINE_BILLING_AGENT_UNAVAILABLE$/, JSON.stringify(fields));
+          assert.deepEqual(calls, [], 'paused preset must reject before catalog, authz, pool, reservation, routing or journal');
+        }
+        {
+          const { calls, runtime } = rig();
+          await assert.rejects(() => runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity, body }), /CATALOG_UNAVAILABLE/);
+          assert.deepEqual(calls, ['catalog'], 'unpaused delegates retain fenced catalog admission');
+        }
+
+        const cleanupCalls = [];
+        const pool = { query: async () => ({ rows: [{ user_id: '42', container_id: '7', ctx: { source: 'delegate_grok', agentId: 'office-assistant', delegateAgentId: 'office-assistant', engineSessionId: 'existing-office-engine' } }] }) };
+        const cleanup = createDelegateEngineBillingRuntime({
+          getPool: () => pool, preCheckRedis: {}, pricing: {},
+          catalog: { assertFresh: () => { throw new Error('cleanup must not read catalog'); } },
+          loadUserModelAuthz: () => { throw new Error('cleanup must not load fresh authz'); },
+          settleDurableCodexBillingFn: async (...args) => { cleanupCalls.push(['settle', args[2].delegateAgentId]); return 'committed'; },
+          abortInflightJournalFn: async (_pool, id) => { cleanupCalls.push(['abort', id]); return true; },
+          releasePreCheckFn: async (_redis, reservation) => { cleanupCalls.push(['release', reservation.requestId]); return true; },
+        });
+        assert.deepEqual(await cleanup.handle({ path: DELEGATE_ENGINE_BILLING_SETTLE_PATH, identity, body: { requestId, status: 'success' } }), { settled: true });
+        assert.deepEqual(cleanupCalls, [['settle', 'office-assistant']]);
+        cleanupCalls.length = 0;
+        assert.deepEqual(await cleanup.handle({ path: DELEGATE_ENGINE_BILLING_ABANDON_PATH, identity, body: { requestId } }), { abandoned: true });
+        assert.deepEqual(cleanupCalls, [['abort', requestId], ['release', requestId]]);
+        cleanupCalls.length = 0;
+        for (const path of [DELEGATE_ENGINE_BILLING_SETTLE_PATH, DELEGATE_ENGINE_BILLING_ABANDON_PATH]) {
+          await assert.rejects(() => cleanup.handle({ path, identity: { ...identity, userId: 43 }, body: { requestId } }), /INVALID_JOURNAL_IDENTITY/);
+          await assert.rejects(() => cleanup.handle({ path, identity: { ...identity, containerId: 8 }, body: { requestId } }), /INVALID_JOURNAL_IDENTITY/);
+        }
+        assert.deepEqual(cleanupCalls, [], 'a pause must not weaken existing journal ownership checks');
+
+        configure(true);
+        const restored = rig();
+        await assert.rejects(() => restored.runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity, body: { ...body, agentId: 'office-assistant', delegateAgentId: 'office-assistant' } }), /CATALOG_UNAVAILABLE/);
+        assert.deepEqual(restored.calls, ['catalog'], 'restored presets retain fenced catalog admission');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    `,
+  ], { encoding: 'utf8', timeout: 30_000 })
+  assert.equal(child.error, undefined, child.error?.message)
+  assert.equal(child.status, 0, child.stdout + child.stderr)
+})
+
 describe('delegate engine-billing runtime', () => {
   it('admits a codex delegate with source + attribution in journal ctx', async () => {
-    const { runtime, journalCalls } = makeRuntime()
+    const { runtime, journalCalls } = makeRuntime({
+      advisorRoute: { kind: 'official_oauth', groupId: '9' },
+    })
     const result = await runtime.handle({
       path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
       identity: IDENTITY,
@@ -319,7 +486,8 @@ describe('delegate engine-billing runtime', () => {
     })
     assert.equal(result.requestId, REQUEST_ID)
     assert.match(String(result.engineSessionId), /^oceng-[0-9a-f]{48}$/)
-    assert.equal('route' in result, false)
+    // OCV5-729: codex delegates must carry the master-issued route.
+    assert.deepEqual(result.route, { kind: 'official_oauth', groupId: '9' })
     const ctx = journalCalls[0] as {
       model: string
       ctxJson: Record<string, unknown>
@@ -1020,6 +1188,39 @@ describe('delegate engine-billing admit uses one fenced snapshot', () => {
     assert.notEqual(stillFrozen.input_per_mtok, later.billingPricingFor('gpt-5.6-sol')?.input_per_mtok)
   })
 
+  it('regular codex delegate gets the same master-issued route (OCV5-729)', async () => {
+    const { runtime, advisorRouteCalls, journalCalls } = makeRuntime({
+      advisorRoute: { kind: 'official_oauth', groupId: '9' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody(),
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.deepEqual(result.route, { kind: 'official_oauth', groupId: '9' })
+    assert.equal(advisorRouteCalls.length, 1)
+    assert.equal((advisorRouteCalls[0] as { modelId: string }).modelId, 'gpt-5.6-sol')
+    assert.equal(
+      (journalCalls[0] as { ctxJson: { advisorRouteKind: string } }).ctxJson.advisorRouteKind,
+      'official_oauth',
+    )
+  })
+
+  it('grok delegate never requests a codex delegate route (OCV5-729)', async () => {
+    const { runtime, advisorRouteCalls } = makeRuntime({
+      advisorRoute: { kind: 'official_oauth', groupId: '9' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ model: 'grok-build', engine: 'grok' }),
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(advisorRouteCalls.length, 0)
+    assert.equal('route' in result, false)
+  })
+
   it('advisor official_oauth returns kind metadata without a hardcoded loopback URL', async () => {
     const { runtime, advisorRouteCalls, journalCalls } = makeRuntime({
       advisorRoute: { kind: 'official_oauth', groupId: '9' },
@@ -1200,5 +1401,286 @@ describe('Grok admission execution and billing generation', () => {
     const rig = makeRuntime(opts)
     await assert.rejects(() => rig.runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity: IDENTITY, body }), error)
     assert.equal(rig.precheckCalls.length, 0); assert.equal(rig.journalCalls.length, 0); assert.equal(rig.journals.size, 0)
+  })
+})
+
+// ── OCV5-738: 委派 antigravity 的 admit/settle/abandon 对账 ─────────────────
+
+const AG_MODEL = 'antigravity-claude-sonnet-5.5'
+const AG_ROUTE_TOKEN = 'ef'.repeat(32)
+
+function antigravityJournal(ctx: Record<string, unknown> = {}) {
+  return {
+    user_id: '42',
+    container_id: '7',
+    ctx: {
+      source: 'delegate_antigravity',
+      model: AG_MODEL,
+      delegateAgentId: 'auditor',
+      parentSessionId: 'web-parent',
+      parentTurnKey: 'c'.repeat(64),
+      antigravityRouteToken: AG_ROUTE_TOKEN,
+      ...ctx,
+    },
+  }
+}
+
+function antigravitySettleBody(over: Record<string, unknown> = {}) {
+  return {
+    requestId: REQUEST_ID,
+    engineSessionId: `oceng-${'b'.repeat(48)}`,
+    status: 'success',
+    durationMs: 15,
+    ...over,
+  }
+}
+
+describe('delegate engine-billing antigravity reconciliation (OCV5-738)', () => {
+  it('admits antigravity without minting a route at admit (two-phase)', async () => {
+    const { runtime, journalCalls, advisorRouteCalls } = makeRuntime()
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: {
+        model: AG_MODEL,
+        engine: 'antigravity',
+        agentId: 'auditor',
+        delegateAgentId: 'auditor',
+        sessionKey: 'agent:auditor:delegate:main:1',
+        parentSessionId: 'web-parent',
+      },
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.equal(result.route, undefined, 'route is minted by the antigravity endpoint')
+    assert.equal(advisorRouteCalls.length, 0, 'antigravity must not borrow the codex route')
+    const ctx = journalCalls[0] as { model: string; ctxJson: Record<string, unknown> }
+    assert.equal(ctx.model, AG_MODEL)
+    assert.equal(ctx.ctxJson.source, 'delegate_antigravity')
+    assert.equal(ctx.ctxJson.delegateAgentId, 'auditor')
+    assert.equal(ctx.ctxJson.antigravityRouteToken, undefined, 'token is persisted at mint')
+    assert.equal(ctx.ctxJson.antigravityBudgetCredits, '100', 'persists full spendable balance for multi-step antigravity turn')
+  })
+
+  it('settles exactly once: expires the route, claims the journal, finalizes and releases the precheck', async () => {
+    const { runtime, journals, antigravityCalls, releaseCalls } = makeRuntime()
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    assert.deepEqual(antigravityCalls.expire, [AG_ROUTE_TOKEN])
+    assert.deepEqual(antigravityCalls.expireForRequest, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls.claim, [REQUEST_ID])
+    assert.equal(antigravityCalls.settle.length, 1)
+    const settled = antigravityCalls.settle[0] as {
+      requestId: string
+      userId: bigint
+      engineStatus: string
+      attribution: unknown
+    }
+    assert.equal(settled.requestId, REQUEST_ID)
+    assert.equal(settled.userId, 42n)
+    assert.equal(settled.engineStatus, 'success')
+    assert.deepEqual(settled.attribution, {
+      delegateAgentId: 'auditor',
+      parentSessionId: 'web-parent',
+      parentTurnKey: 'c'.repeat(64),
+    })
+    assert.equal(antigravityCalls.finalize.length, 1)
+    assert.deepEqual(antigravityCalls.finalize[0], {
+      requestId: REQUEST_ID,
+      finalCredits: 123n,
+      ledgerId: 9n,
+      usageId: 8n,
+      settlementClaimId: 'claim-0001',
+    })
+    assert.equal(releaseCalls.length, 1, 'precheck reservation released once')
+    assert.equal(antigravityCalls.abandon.length, 0)
+  })
+
+  it('settles a turn that never recorded usage by aborting the journal, not debiting', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls, releaseCalls } = makeRuntime({
+      antigravity: { settle: async () => null },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: false })
+    assert.deepEqual(abortCalls, [REQUEST_ID])
+    assert.equal(antigravityCalls.finalize.length, 0, 'no usage row means no debit')
+    assert.deepEqual(antigravityCalls.releaseInflight, [REQUEST_ID])
+    assert.equal(releaseCalls.length, 1)
+  })
+
+  it('repairs a missing turn row from durable usage_records instead of double-settling', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls } = makeRuntime({
+      antigravity: {
+        settle: async () => null,
+        usageRows: [{ id: '77', ledger_id: '88', cost_credits: '456' }],
+      },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    assert.equal(abortCalls.length, 0)
+    assert.deepEqual(antigravityCalls.finalize[0], {
+      requestId: REQUEST_ID,
+      finalCredits: 456n,
+      ledgerId: 88n,
+      usageId: 77n,
+      settlementClaimId: 'claim-0001',
+    })
+  })
+
+  it('treats an already-committed journal as settled and never debits twice', async () => {
+    const { runtime, journals, antigravityCalls, releaseCalls } = makeRuntime({
+      antigravity: { claim: async () => null, journalState: 'committed' },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    assert.equal(antigravityCalls.settle.length, 0)
+    assert.equal(antigravityCalls.finalize.length, 0)
+    assert.equal(releaseCalls.length, 0)
+  })
+
+  it('hands a failed settle back to inflight so the durable retry can finish', async () => {
+    const { runtime, journals, journalUpdates, antigravityCalls, releaseCalls } = makeRuntime({
+      antigravity: {
+        settle: async () => {
+          throw new Error('db down')
+        },
+      },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+          identity: IDENTITY,
+          body: antigravitySettleBody(),
+        }),
+      /db down/,
+    )
+    assert.equal(releaseCalls.length, 0, 'precheck stays reserved for the retry')
+    assert.equal(
+      journalUpdates.some(
+        (u) =>
+          u.sql.includes("state='inflight'") &&
+          u.params[0] === REQUEST_ID &&
+          u.params[1] === 'claim-0001',
+      ),
+      true,
+    )
+    assert.equal(antigravityCalls.abandon.length, 0)
+  })
+
+  it('abandons an antigravity admission exactly once across every resource', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls, releaseCalls } = makeRuntime()
+    journals.set(REQUEST_ID, antigravityJournal())
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+      identity: IDENTITY,
+      body: { requestId: REQUEST_ID },
+    })
+    assert.deepEqual(result, { abandoned: true })
+    assert.deepEqual(antigravityCalls.expire, [AG_ROUTE_TOKEN])
+    assert.deepEqual(antigravityCalls.expireForRequest, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls.abandon, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls.releaseInflight, [REQUEST_ID])
+    assert.deepEqual(abortCalls, [REQUEST_ID])
+    assert.equal(releaseCalls.length, 1)
+  })
+
+  it('leaves grok abandon on the generic path (no antigravity cleanup)', async () => {
+    const { runtime, journals, antigravityCalls, abortCalls } = makeRuntime()
+    journals.set(REQUEST_ID, {
+      user_id: '42',
+      container_id: '7',
+      ctx: { source: 'delegate_grok', model: 'grok-build' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+      identity: IDENTITY,
+      body: { requestId: REQUEST_ID },
+    })
+    assert.deepEqual(result, { abandoned: true })
+    assert.deepEqual(abortCalls, [REQUEST_ID])
+    assert.deepEqual(antigravityCalls, {
+      claim: [],
+      finalize: [],
+      settle: [],
+      abandon: [],
+      expire: [],
+      expireForRequest: [],
+      releaseInflight: [],
+    })
+  })
+
+  it('settles using the journal frozen billingPricing snapshot instead of live cache (Blocker 2)', async () => {
+    const { runtime, journals, antigravityCalls } = makeRuntime()
+    journals.set(
+      REQUEST_ID,
+      antigravityJournal({
+        billingPricing: {
+          v: 1,
+          modelId: AG_MODEL,
+          displayName: 'Claude Sonnet 5.5',
+          inputPerMtok: '3000',
+          outputPerMtok: '15000',
+          cacheReadPerMtok: '300',
+          cacheWritePerMtok: '3750',
+          multiplier: '2.000',
+        },
+      }),
+    )
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+      identity: IDENTITY,
+      body: antigravitySettleBody(),
+    })
+    assert.deepEqual(result, { settled: true })
+    const passedPricing = (antigravityCalls.settle[0] as { pricing: { get(m: string): any } }).pricing
+    const resolved = passedPricing.get(AG_MODEL)
+    assert.equal(resolved?.multiplier, '2.000')
+    assert.equal(resolved?.input_per_mtok, 3000n)
+  })
+
+  it('keeps journal inflight for retry when settle returns null but turn row is still pending/has usage (Blocker 3)', async () => {
+    const { runtime, journals, journalUpdates, abortCalls, releaseCalls } = makeRuntime({
+      antigravity: {
+        settle: async () => null,
+        turnRows: [{ status: 'pending', has_usage: true }],
+      },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+          identity: IDENTITY,
+          body: antigravitySettleBody(),
+        }),
+      /DELEGATE_ANTIGRAVITY_SETTLE_RETRYABLE/,
+    )
+    assert.equal(abortCalls.length, 0, 'must not abort journal when turn is pending with usage')
+    assert.equal(releaseCalls.length, 0, 'must keep precheck reserved for retry')
+    assert.equal(
+      journalUpdates.some((u) => u.sql.includes("state='inflight'") && u.params[0] === REQUEST_ID),
+      true,
+    )
   })
 })

@@ -11,6 +11,9 @@ import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { type TaskboardDb, openTaskboardDb } from '../db/index.js'
 import { listPipelines } from '../db/pipelines.js'
+import { createProject } from '../db/projects.js'
+import { seedDefaultPipelines } from '../db/seed.js'
+import { createTemplateFromPipeline, deleteTemplate } from '../db/templates.js'
 import { insertRun, updateRun } from '../db/runs.js'
 import { type TaskboardHttpContext, handleTaskboardApi } from '../http.js'
 import { zonedYmd } from '../notify.js'
@@ -82,7 +85,7 @@ async function call(base: string, method: string, path: string, body?: unknown):
 }
 
 function humanCtx(db: TaskboardDb): TaskboardHttpContext {
-  return { db, actor: 'human' }
+  return { db, actor: 'human', preflightStages: async (stages) => stages.map(() => null) }
 }
 
 describe('成本统计 HTTP', () => {
@@ -90,6 +93,7 @@ describe('成本统计 HTTP', () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
       const created = await call(base, 'POST', '/api/board/projects', {
+        executionAgentId: 'main',
         key: 'COST',
         name: '成本',
         templateIds: ['builtin:chore'],
@@ -156,6 +160,7 @@ describe('周报 HTTP', () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
       const created = await call(base, 'POST', '/api/board/projects', {
+        executionAgentId: 'main',
         key: 'WEEK',
         name: '周报',
         templateIds: [],
@@ -194,6 +199,7 @@ describe('流水线模板 HTTP', () => {
       assert.ok(items.some((t) => t.id === 'builtin:bug'))
 
       const created = await call(base, 'POST', '/api/board/projects', {
+        executionAgentId: 'main',
         key: 'TMPL',
         name: '模板项目',
         templateIds: ['builtin:spike'],
@@ -214,6 +220,7 @@ describe('流水线模板 HTTP', () => {
       assert.equal(template.slug, 'my-spike')
 
       const other = await call(base, 'POST', '/api/board/projects', {
+        executionAgentId: 'main',
         key: 'TMP2',
         name: '另一项目',
         templateIds: [],
@@ -231,4 +238,35 @@ describe('流水线模板 HTTP', () => {
     })
     db.close()
   })
+})
+
+
+it('a template replaced under the same slug during preflight is rejected before any stage write', async () => {
+  const db = freshDb()
+  const src = createProject(db, { key: 'RACESRC', name: '源' })
+  const dst = createProject(db, { key: 'RACEDST', name: '目标' })
+  seedDefaultPipelines(db, src.id, ['bug'], { executionAgentId: 'approved-helper' })
+  const pipeline = listPipelines(db, src.id)[0]!
+  const original = createTemplateFromPipeline(db, { pipelineId: pipeline.id, slug: 'race-template' })
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let entered!: () => void
+  const started = new Promise<void>((resolve) => { entered = resolve })
+  await withServer({ ...humanCtx(db), preflightStages: async (stages) => {
+    entered()
+    await gate
+    return stages.map(() => null)
+  } }, async (base) => {
+    const applying = call(base, 'POST', '/api/board/templates/race-template/apply', { projectId: dst.id })
+    await started
+    deleteTemplate(db, original.id)
+    const replacement = createTemplateFromPipeline(db, { pipelineId: pipeline.id, slug: 'race-template' })
+    assert.notEqual(replacement.id, original.id)
+    release()
+    const result = await applying
+    assert.equal(result.status, 409, JSON.stringify(result.body))
+    assert.equal(result.body.code, 'template_configuration_changed')
+    assert.deepEqual(listPipelines(db, dst.id), [])
+  })
+  db.close()
 })

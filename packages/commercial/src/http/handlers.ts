@@ -1,3 +1,7 @@
+import type { readSessionMetadata } from '../db/sessionMetadataApproval.js'
+import { projectPublicModels, projectLockedModels } from '../billing/modelPublicProjection.js'
+export type { PublicModelProjection, LockedPublicModelProjection } from '../billing/modelPublicProjection.js'
+import { DEFAULT_CODEX_ENGINE_MODEL, DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
 import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
 import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
 /**
@@ -15,6 +19,7 @@ import {
   readJsonBody,
   sendJson,
   clientIpOf,
+  refreshClientIpFromRequest,
   userAgentOf,
   ensureRequestId,
   setSecurityHeaders,
@@ -80,8 +85,7 @@ import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLi
 import { FallbackRateLimiter } from "./proxy/shared.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
-import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline } from "@openclaude/protocol";
-import { perKtokCredits, type PricingCache, type PublicModel } from "../billing/pricing.js";
+import type { PricingCache, PublicModel } from "../billing/pricing.js";
 import {
   CatalogUnknownError,
   type ModelCatalogSnapshot,
@@ -128,6 +132,12 @@ import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
 import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 
 export interface CommercialHttpDeps {
+  codexCommissioning?: import('../account-pool/codexCommissioning.js').CodexCommissioning
+  sessionMetadataRead?: typeof readSessionMetadata
+  modelSwitchCost?: import('../billing/modelSwitchCost.js').ModelSwitchCostService;
+  /** Master-private system actions; absent until explicit composition has initialized the ledger. */
+  systemActionsHttp?: (req: IncomingMessage, res: ServerResponse) => Promise<void>
+  resolvePromptPrivacySupport?: (userId: string) => Promise<PromptPrivacySupport>;
   literatureSetup?: LiteratureSetupService
   literatureArtifacts?: LiteratureArtifactStore
   jwtSecret: string | Uint8Array;
@@ -750,6 +760,10 @@ async function resolveLaneAndApply(
 
 // ─── POST /api/auth/login ───────────────────────────────────────────
 
+function reissueClientIp(req: IncomingMessage, ctx: RequestContext): string | null {
+  return refreshClientIpFromRequest(ctx.authBoundIp, req.headers["cf-connecting-ip"]);
+}
+
 export async function handleLogin(
   req: IncomingMessage,
   res: ServerResponse,
@@ -783,6 +797,7 @@ export async function handleLogin(
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       bindIp: ctx.authBoundIp,
+      clientIp: reissueClientIp(req, ctx),
       userAgent: ctx.userAgent ?? undefined,
       requireEmailVerified: deps.requireEmailVerified,
       replaceRefreshToken: readRefreshCookie(req),
@@ -964,7 +979,11 @@ export async function handleRefresh(
     const r = await refresh(rawRefresh, {
       jwtSecret: deps.jwtSecret,
       remoteIp: ctx.authBoundIp,
+      clientIp: reissueClientIp(req, ctx),
       userAgent: ctx.userAgent ?? undefined,
+      onReissued: (ev) => {
+        ctx.log.info("refresh_reissued", { family_id: ev.family_id, user_id: ev.user_id });
+      },
     });
     // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导。
     // 2026-04-24 "记住我":继承 refresh_tokens.remember_me(refresh() 返回),
@@ -1084,6 +1103,7 @@ export async function handleVerifyEmail(
     const session = await issueVerifiedUserSession(r.user_id, {
       jwtSecret: deps.jwtSecret,
       bindIp: ctx.authBoundIp,
+      clientIp: reissueClientIp(req, ctx),
       userAgent: ctx.userAgent ?? undefined,
       replaceRefreshToken: readRefreshCookie(req),
     });
@@ -1373,8 +1393,9 @@ export async function handleGetPublicConfig(
     // FEATURE_REMOTE_SSH 灰度状态 —— 前端据此决定是否渲染执行环境切换器。
     feature_remote_ssh: deps.remoteSshEnabled === true,
     feature_image2: process.env.OC_IMAGE2_ENABLED === "true",
-    // OCV5-577 经验分享：默认关（未设 OC_COMMUNITY_BLOG_ENABLED / 非 1|true → false）
+    // 经验分享（OCV5-577）：个人版开，商业版默认关。
     feature_community_blog: communityBlogEnabled(),
+    // 编辑器底部文案：on = 「提交后由 AI 自动审核」；否则「提交后由管理员审核」。
     feature_community_blog_ai_review: tutorialModerationMode() === "on",
     // 会话级 inflight 委派条。关（商业默认）时前端不发探测，避免控制台 404。
     // 直接打路由时 flag-off 仍是 404，契约不变。
@@ -1459,6 +1480,7 @@ export async function handleListPublicModels(
     sendJson(res, 200, {
       models: projectPublicModels(snapshot, effective, degraded),
       locked_models: projectLockedModels(snapshot, effective),
+      team_leader_model: DEFAULT_CODEX_ENGINE_MODEL,
     });
     return;
   }
@@ -1469,7 +1491,7 @@ export async function handleListPublicModels(
   const models = scope
     ? pricing.listForUser(scope)
     : pricing.listPublic();
-  sendJson(res, 200, { models: annotateDegraded(models, degraded) });
+  sendJson(res, 200, { models: annotateDegraded(models, degraded), team_leader_model: DEFAULT_CODEX_ENGINE_MODEL });
 }
 
 function anonymousModelScope(): UserModelScope {
@@ -1507,115 +1529,6 @@ async function loadPublicModelScope(
     userPlanTier: null,
     orgPlanCode: null,
   };
-}
-
-/** `/api/public/models` 的 catalog 投影行:PublicModel + catalog 的 provider 归属(方案 §6)。 */
-export interface PublicModelProjection extends PublicModel {
-  /** catalog.provider_id(engine='codex' 的虚拟条目也有值;null = 未归属静态 provider)。 */
-  provider_id: string | null;
-}
-
-/**
- * active catalog + pricing join → 公共/用户投影(单一权威;不经 PricingCache)。
- *
- * 价格来自快照里随 catalog 同一个 REPEATABLE READ 事务读进来的 pricing 行 —— 与
- * `snapshot.listForUser` 的行集天然一致(不会出现"catalog 说有、pricing 说无"的半行)。
- */
-function projectPublicModels(
-  snapshot: ModelCatalogSnapshot,
-  scope: UserModelScope,
-  degraded: ReadonlySet<string>,
-): PublicModelProjection[] {
-  const out: PublicModelProjection[] = [];
-  for (const row of snapshot.listForUser(scope)) {
-    // listForUser 已保证可路由(有价);这里 get 只是取值,理论不可能 miss。
-    const p = snapshot.pricing.get(row.modelId);
-    if (!p) continue;
-    const baseline = snapshot.pricing.get(COST_INDEX_BASELINE_MODEL_ID);
-    const costX = costXVsBaseline(
-      {
-        inputPerMtok: p.inputPerMtok,
-        cacheReadPerMtok: p.cacheReadPerMtok,
-        outputPerMtok: p.outputPerMtok,
-        multiplier: p.multiplier,
-      },
-      baseline
-        ? {
-            inputPerMtok: baseline.inputPerMtok,
-            cacheReadPerMtok: baseline.cacheReadPerMtok,
-            outputPerMtok: baseline.outputPerMtok,
-            multiplier: baseline.multiplier,
-          }
-        : null,
-    );
-    out.push({
-      id: row.modelId,
-      display_name: row.displayName,
-      input_per_ktok_credits: perKtokCredits(p.inputPerMtok, p.multiplier),
-      output_per_ktok_credits: perKtokCredits(p.outputPerMtok, p.multiplier),
-      cache_read_per_ktok_credits: perKtokCredits(p.cacheReadPerMtok, p.multiplier),
-      cache_write_per_ktok_credits: perKtokCredits(p.cacheWritePerMtok, p.multiplier),
-      multiplier: p.multiplier,
-      supported_efforts: [...row.supportedEfforts],
-      engine: row.engine,
-      context_window: row.contextWindow,
-      supports_vision: row.supportsVision,
-      provider_id: row.providerId,
-      ...(costX !== undefined ? { cost_x: costX } : {}),
-      ...(row.providerId && degraded.has(row.providerId) ? { degraded: true } : {}),
-      ...(row.promoLabel ? { promo_label: row.promoLabel } : {}),
-    });
-  }
-  return out;
-}
-
-/** Locked picker rows: visible except for the subscription floor. */
-export interface LockedPublicModelProjection {
-  id: string;
-  display_name?: string;
-  engine?: string;
-  min_plan_code: string;
-  min_plan_name?: string;
-  cost_x?: number;
-  promo_label?: string;
-}
-
-function projectLockedModels(
-  snapshot: ModelCatalogSnapshot,
-  scope: UserModelScope,
-): LockedPublicModelProjection[] {
-  const out: LockedPublicModelProjection[] = [];
-  for (const row of snapshot.listLockedForUser(scope)) {
-    const p = snapshot.pricing.get(row.modelId);
-    if (!p) continue;
-    const baseline = snapshot.pricing.get(COST_INDEX_BASELINE_MODEL_ID);
-    const costX = costXVsBaseline(
-      {
-        inputPerMtok: p.inputPerMtok,
-        cacheReadPerMtok: p.cacheReadPerMtok,
-        outputPerMtok: p.outputPerMtok,
-        multiplier: p.multiplier,
-      },
-      baseline
-        ? {
-            inputPerMtok: baseline.inputPerMtok,
-            cacheReadPerMtok: baseline.cacheReadPerMtok,
-            outputPerMtok: baseline.outputPerMtok,
-            multiplier: baseline.multiplier,
-          }
-        : null,
-    );
-    out.push({
-      id: row.modelId,
-      display_name: row.displayName,
-      engine: row.engine,
-      min_plan_code: row.minPlanCode,
-      ...(row.minPlanName ? { min_plan_name: row.minPlanName } : {}),
-      ...(costX !== undefined ? { cost_x: costX } : {}),
-      ...(row.promoLabel ? { promo_label: row.promoLabel } : {}),
-    });
-  }
-  return out;
 }
 
 /**
@@ -1659,6 +1572,7 @@ export async function handleGetMyPreferences(
       auto_dream: autoDream,
       intelligent_ui: intelligentUiFeatureView(snap.prefs),
       input_prediction: inputPredictionFeatureView(snap.prefs),
+      prompt_privacy: await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })),
     },
   });
 }
@@ -1674,24 +1588,14 @@ export async function handlePatchMyPreferences(
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
   }
-  const requestedAutoDream = (body as Record<string, unknown>).auto_dream_enabled;
-  const requestedOptimizer = (body as Record<string, unknown>).auto_optimizer_enabled;
-  if (requestedAutoDream === true || requestedOptimizer === true) {
-    const { getAutoDreamFeature } = await import("../user/autoDream.js");
-    const feature = await getAutoDreamFeature(user.id, true);
-    if (!feature.eligible) {
-      throw new HttpError(403, "AUTO_DREAM_MAX_REQUIRED", "Auto-Dream requires Max or above");
-    }
-    if (!feature.available) {
-      throw new HttpError(503, "AUTO_DREAM_UNAVAILABLE", "Auto-Dream model is unavailable");
-    }
+  const profile = (body as Record<string, unknown>).system_assistant_profile;
+  if (profile && typeof profile === 'object' && (profile as { enabled?: unknown }).enabled === true) {
+    const support = await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT }));
+    if (support.state !== 'ready') throw new HttpError(409, 'PRIVACY_RUNTIME_REQUIRED', '当前运行环境尚未支持此设置，请更新运行环境后再授权。');
   }
-  const { normalizeAutoDreamPreferencePatch } = await import("../user/autoDream.js");
-  const effectiveBody = normalizeAutoDreamPreferencePatch(body as Record<string, unknown>);
-  // V2 and V1 are mutually exclusive. Turning on V2 first turns the legacy
-  // auto-mutating path off, so rolling back to an older runtime remains safe.
-  const { patchPreferences, PreferencesError } = await import("../user/preferences.js");
+  const { patchPreferences, PreferencesError, resolvePreferencesPatch } = await import("../user/preferences.js");
   try {
+    const effectiveBody = await resolvePreferencesPatch(user.id, body);
     const snap = await patchPreferences(user.id, effectiveBody);
     const { getAutoDreamFeature } = await import("../user/autoDream.js");
     const autoDream = await getAutoDreamFeature(
@@ -1706,6 +1610,7 @@ export async function handlePatchMyPreferences(
         auto_dream: autoDream,
         intelligent_ui: intelligentUiFeatureView(snap.prefs),
         input_prediction: inputPredictionFeatureView(snap.prefs),
+      prompt_privacy: await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })),
       },
     });
   } catch (err) {

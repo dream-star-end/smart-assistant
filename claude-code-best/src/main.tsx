@@ -4642,9 +4642,10 @@ async function run(): Promise<CommanderCommand> {
     .description(`Start the Claude Code MCP server`)
     .option('-d, --debug', 'Enable debug mode', () => true)
     .option('--verbose', 'Override verbose mode setting from config', () => true)
-    .action(async ({ debug, verbose }: { debug?: boolean; verbose?: boolean }) => {
+    .option('--tool-allowlist <tools>', 'Limit the personal tool-only host to Read,Edit,Bash')
+    .action(async ({ debug, verbose, toolAllowlist }: { debug?: boolean; verbose?: boolean; toolAllowlist?: string }) => {
       const { mcpServeHandler } = await import('./cli/handlers/mcp.js');
-      await mcpServeHandler({ debug, verbose });
+      await mcpServeHandler({ debug, verbose, toolAllowlist });
     });
 
   // Register the mcp add subcommand (extracted for testability)

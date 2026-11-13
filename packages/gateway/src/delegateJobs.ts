@@ -31,9 +31,10 @@ export const MAX_DELEGATE_WAIT_MS = 55_000
 
 export const DEFAULT_MAX_DELEGATE_JOBS = 256
 
-/** B1 lease heartbeat. 480 * 15s = 2h hard cap. */
+/** B1 lease heartbeat. 480 * 15s = 2h idle beat cap; 2880 * 15s = 12h absolute cap (TURN_MAX_MS). */
 export const DELEGATE_LEASE_HEARTBEAT_MS = 15_000
 export const DELEGATE_LEASE_HEARTBEAT_MAX_BEATS = 480
+export const DELEGATE_LEASE_HEARTBEAT_ABSOLUTE_MAX_BEATS = 2880
 
 /**
  * OCV5-164 heartbeat-timeout reaper.
@@ -157,6 +158,8 @@ export type DelegateJobWaitView =
 export type DelegateCreateMeta = {
   sessionKey?: string
   parentSessionKey?: string
+  traceId?: string
+  parentTraceId?: string
   queued?: boolean
   kind?: DelegateJobKind
   callback?: DelegateCallback
@@ -175,6 +178,8 @@ export type DelegateJobSnapshot = {
   state: DelegateJobState
   sessionKey?: string
   parentSessionKey?: string
+  traceId?: string
+  parentTraceId?: string
   failureClass?: DelegateFailureClass
   failureDetail?: string
   claimToken?: string
@@ -214,6 +219,8 @@ type JobEntry = {
   expiresAt: number | null
   sessionKey?: string
   parentSessionKey?: string
+  traceId?: string
+  parentTraceId?: string
   result: DelegateJobHttpResult | null
   waiters: Array<(view: DelegateJobWaitView) => void>
   state: DelegateJobState
@@ -411,6 +418,8 @@ export class DelegateJobStore {
       expiresAt: null,
       sessionKey: meta?.sessionKey,
       parentSessionKey: meta?.parentSessionKey,
+      traceId: meta?.traceId,
+      parentTraceId: meta?.parentTraceId,
       result: null,
       waiters: [],
       state: queued ? 'queued' : 'running',
@@ -491,7 +500,7 @@ export class DelegateJobStore {
       }
     }
     const draft = this.cloneEntry(job)
-    if (this.sm) {
+    if (this.sm || (job.kind === 'delegate' && job.callback === 'origin-inject')) {
       const next: DelegateJobState = result.httpStatus >= 200 && result.httpStatus < 300 ? 'completed' : 'failed'
       const gate = assertDelegateTransition(draft.state, next)
       if (!gate.ok && draft.state !== next) return false
@@ -571,7 +580,7 @@ export class DelegateJobStore {
     if (isResumeInjectCallback(draft.callback)) {
       draft.callbackState = 'pending'
       draft.callbackEpoch = 1
-    } else {
+    } else if (draft.callback === 'none') {
       draft.callbackState = 'skipped_silent'
     }
     draft.ownerLeaseUntil = null
@@ -707,6 +716,22 @@ export class DelegateJobStore {
     if (job.state === 'running' && job.ownerInstanceId === this.bootId) {
       draft.ownerLeaseUntil = now + this.leaseMs
     }
+    return this.commit(job, draft, false)
+  }
+
+  /** Bind observation identity only while the exact running owner still holds the job. */
+  bindTrace(
+    jobId: string,
+    trace: { traceId: string; parentTraceId?: string },
+    fence: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job || job.state !== 'running' || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
+    if (job.traceId) return job.traceId === trace.traceId && job.parentTraceId === trace.parentTraceId
+    const draft = this.cloneEntry(job)
+    draft.traceId = trace.traceId
+    // Parent was frozen at enqueue; never replace it with a later session turn.
+    if (draft.parentTraceId !== trace.parentTraceId) return false
     return this.commit(job, draft, false)
   }
 
@@ -1037,6 +1062,8 @@ export class DelegateJobStore {
       createdAt: job.createdAt,
       lastActivityAt: job.lastActivityAt,
       parentSessionKey: job.parentSessionKey,
+      traceId: job.traceId,
+      parentTraceId: job.parentTraceId,
       parentEngine: job.parentEngine,
       notifyLane: job.notifyLane,
       notifyId: job.notifyId,
@@ -1061,6 +1088,8 @@ export class DelegateJobStore {
       agentId: job.agentId,
       state: job.state,
       sessionKey: job.sessionKey,
+      ...(job.traceId ? { traceId: job.traceId } : {}),
+      ...(job.parentTraceId ? { parentTraceId: job.parentTraceId } : {}),
       failureClass: job.failureClass,
       failureDetail: job.failureDetail,
       claimToken: job.claimToken,
@@ -1350,6 +1379,33 @@ export class DelegateJobStore {
     draft.notifyRetryAt = null
     draft.lastActivityAt = this.now()
     return this.commit(job, draft, false)
+  }
+
+  /** Transfer only this waiter-owned job; other members may still have live readers. */
+  handoffStdoutWait(
+    jobId: string,
+    parentSessionKey: string,
+    meta: { callbackOriginUserId?: string; parentEngine?: string } = {},
+  ): DelegateJobSnapshot | undefined {
+    const job = this.refreshJob(jobId)
+    if (!job || job.kind !== 'delegate' || job.parentSessionKey !== parentSessionKey) return undefined
+    if (job.callback === 'origin-inject' && job.callbackOriginSessionKey === parentSessionKey) {
+      return job.callbackState === 'skipped_silent' ? undefined : this.snapshot(job)
+    }
+    if (job.callback !== 'stdout-wait' || job.callbackState !== 'none') return undefined
+    const draft = this.cloneEntry(job)
+    draft.callback = 'origin-inject'
+    draft.callbackOriginSessionKey = parentSessionKey
+    if (meta.callbackOriginUserId) draft.callbackOriginUserId = meta.callbackOriginUserId
+    if (meta.parentEngine) draft.parentEngine = meta.parentEngine
+    // SM-off keeps historical stdout rows in state=running even with a result.
+    // Only a dynamically handed-off row needs a terminal state for notify claims.
+    if (job.result && !isDelegateTerminalState(draft.state)) {
+      draft.state = job.result.httpStatus >= 200 && job.result.httpStatus < 300 ? 'completed' : 'failed'
+    }
+    if (job.result || isDelegateTerminalState(job.state)) initTerminalCallback(draft)
+    draft.lastActivityAt = this.now()
+    return this.commit(job, draft, false) ? this.snapshot(job) : undefined
   }
 
   /**
@@ -1664,6 +1720,8 @@ export class DelegateJobStore {
       expiresAt: snap.expiresAt ?? null,
       sessionKey: snap.sessionKey,
       parentSessionKey: snap.parentSessionKey,
+      traceId: snap.traceId,
+      parentTraceId: snap.parentTraceId,
       result: snap.result ?? reconstructed,
       waiters: [],
       state: snap.state,
@@ -1719,6 +1777,8 @@ export class DelegateJobStore {
       state: row.state,
       sessionKey: row.sessionKey,
       parentSessionKey: row.parentSessionKey,
+      traceId: row.traceId,
+      parentTraceId: row.parentTraceId,
       failureClass: row.failureClass,
       failureDetail: row.failureDetail,
       claimToken: row.claimToken,
@@ -1882,6 +1942,8 @@ export class DelegateJobStore {
       expiresAt: snap.expiresAt ?? null,
       sessionKey: snap.sessionKey,
       parentSessionKey: snap.parentSessionKey,
+      traceId: snap.traceId,
+      parentTraceId: snap.parentTraceId,
       result: snap.result ?? reconstructed,
       waiters: [],
       state: snap.state,
@@ -1922,6 +1984,8 @@ export class DelegateJobStore {
       kind: job.kind,
       sessionKey: job.sessionKey,
       parentSessionKey: job.parentSessionKey,
+      traceId: job.traceId,
+      parentTraceId: job.parentTraceId,
       generation: job.generation,
       ownerInstanceId: job.ownerInstanceId,
       ownerLeaseUntil: job.ownerLeaseUntil,

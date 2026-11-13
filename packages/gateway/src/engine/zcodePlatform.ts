@@ -1,3 +1,5 @@
+import { delegateMcpBudgetEnvironment } from '../delegateMcpBudget.js'
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -25,8 +27,10 @@ export interface ZcodePlatformArtifacts {
 }
 
 export interface CreateZcodePlatformArtifactsInput {
+  systemHelpContextFile?: string
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
+  traceId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -89,17 +93,20 @@ export function createZcodePlatformArtifacts(
         `${issueDelegateContextToken({
           agentId: input.agentId,
           sessionKey: input.sessionKey,
+          traceId: input.traceId,
           depth: input.delegationDepth,
         })}\n`,
       )
       const env: Record<string, string> = {
+        ...delegateMcpBudgetEnvironment(),
         OPENCLAUDE_AGENT_ID: input.agentId,
         OC_AGENT_ID: input.agentId,
         ...identityCompatEnvironment(input.identityCompat),
         ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
         OPENCLAUDE_HOME: openclaudeHome,
         OPENCLAUDE_SESSION_KEY: input.sessionKey,
-        OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
+        ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
+      OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
         OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
         OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
         OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),

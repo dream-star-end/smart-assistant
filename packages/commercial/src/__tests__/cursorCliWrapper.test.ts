@@ -333,6 +333,22 @@ describe('oc-cursor wrapper', () => {
   })
 
 
+  test('advisor read-only turns remove write, shell, worker and mode-switch tool kinds', () => {
+    const f = fixture()
+    const result = spawnSync(f.wrapper, ['--mode', 'ask', '--', 'review only'], {
+      cwd: f.dir,
+      env: { ...f.env, OPENCLAUDE_ADVISOR_READ_ONLY: '1' },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
+    assert.ok(argv.includes('--mode'))
+    assert.equal(argv.includes('--force'), false)
+    const tools = argv[argv.indexOf('--allowed-tools') + 1]!.split(',')
+    for (const name of ['read_tool_call', 'grep_tool_call', 'mcp_tool_call', 'get_mcp_tools_tool_call']) assert.ok(tools.includes(name), name)
+    for (const name of ['shell_tool_call', 'edit_tool_call', 'delete_tool_call', 'task_tool_call', 'switch_mode_tool_call', 'generate_image_tool_call']) assert.equal(tools.includes(name), false, name)
+  })
+
   test('copies one validated adapter hooks.json and unsets the source env', () => {
     const f = fixture()
     const hooks = join(f.dir, 'adapter-hooks.json')

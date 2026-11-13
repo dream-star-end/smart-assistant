@@ -1,3 +1,4 @@
+import { createServer } from 'node:http'
 import * as assert from 'node:assert/strict'
 /**
  * Tests for CodexAppServerRunner — the JSON-RPC 2.0 client over
@@ -15,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { paths } from '@openclaude/storage'
+import { DEFAULT_CODEX_ENGINE_MODEL } from '@openclaude/protocol'
 import {
   _CODEX_5H_WINDOW_MINS,
   _CODEX_7D_WINDOW_MINS,
@@ -283,6 +285,19 @@ describe('CodexAppServerRunner turn/start params', () => {
     const invalidParams = (h.runner as any).buildTurnStartParams('hi')
     assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
     await h.cleanup()
+  })
+
+  it('passes explicit high for the team leader while retaining its global xhigh default', async () => {
+    const h = await makeHarness({ model: DEFAULT_CODEX_ENGINE_MODEL })
+    try {
+      const defaultParams = (h.runner as any).buildTurnStartParams('hi')
+      assert.equal((defaultParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
+      h.runner.setEffortLevel('high')
+      const teamParams = (h.runner as any).buildTurnStartParams('hi')
+      assert.equal((teamParams.collaborationMode as any).settings.reasoning_effort, 'high')
+    } finally {
+      await h.cleanup()
+    }
   })
 
   it('enforces no-network read-only execution and structured output for hermetic audits', async () => {
@@ -1368,7 +1383,81 @@ describe('handleNotification — item/completed', () => {
     assert.equal(tr.message.content[0].termination_reason, 'tool_error')
     assert.equal(tr.message.content[0].content.includes(resultB64), false)
     assert.equal(tr.message.content[0].content.includes(rawMarker), false)
+    assert.match(tr.message.content[0].content, /图片生成没有完成/)
+    assert.equal(tr.message.content[0].content.includes('upstream failed'), false)
+    assert.match(tr.message.content[0].content, /继续/)
     await rm(join(paths.generatedDir, 'codex-thr-img-failed-img-failed.png'), { force: true })
+    await h.cleanup()
+  })
+
+  it('imageGeneration stderr IMAGE2_DISABLED becomes a clear continue note', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-img-disabled'
+    ;(h.runner as any).threadId = 'thr-img-disabled'
+    h.runner.feedStderrForTests(
+      '\u001b[31mERROR\u001b[0m image generation failed: http 503 Service Unavailable: Some("{\\"error\\":{\\"code\\":\\"IMAGE2_DISABLED\\",\\"message\\":\\"Image 2 is temporarily unavailable\\"}}")\n',
+    )
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-img-disabled',
+        turnId: 't-img-disabled',
+        item: {
+          id: 'img-disabled',
+          type: 'imageGeneration',
+          status: 'failed',
+          failure: null,
+          result: '',
+        },
+      },
+    })
+    await waitFor(() =>
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.type === 'tool_result'),
+    )
+    const tr = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(tr)
+    assert.equal(tr.message.content[0].is_error, true)
+    assert.match(tr.message.content[0].content, /Image 2 还没打开/)
+    assert.equal(tr.message.content[0].content.includes('IMAGE2_DISABLED'), false)
+    assert.equal(tr.message.content[0].content.includes('requestId'), false)
+    await h.cleanup()
+  })
+
+  it('imageGeneration short token in the completion frame stays out of tool_result', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-img-token'
+    ;(h.runner as any).threadId = 'thr-img-token'
+    const sentinel = 'demo-secret-123'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-img-token',
+        turnId: 't-img-token',
+        item: {
+          id: 'img-token',
+          type: 'imageGeneration',
+          status: 'failed',
+          failure: null,
+          result: '',
+          error: { message: `access_token=${sentinel}` },
+        },
+      },
+    })
+    await waitFor(() =>
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.type === 'tool_result'),
+    )
+    const tr = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(tr)
+    assert.equal(tr.message.content[0].is_error, true)
+    assert.equal(tr.message.content[0].content.includes(sentinel), false)
+    assert.equal(tr.message.content[0].content.includes('access_token'), false)
+    assert.match(tr.message.content[0].content, /图片生成没有完成/)
     await h.cleanup()
   })
 
@@ -4375,5 +4464,95 @@ it('reads the exact native Codex compacted payload from rollout JSONL', async ()
     })
   } finally {
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+it('privacy withdrawal resumes the same native thread with current instructions before compaction', async (t) => {
+  const { promptPrivacyFingerprint } = await import('../promptPrivacyPolicy.js')
+  const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'privacy-source-thread' })
+  const r = h.runner as any
+  const calls: string[] = []
+  r.attached = true
+  r._promptPolicyFingerprint = promptPrivacyFingerprint({ schemaVersion: 1, profile: { nickname: 'old-fixture-name', sessionId: 'scope-a' } }, 'scope-a')
+  t.mock.method(r, 'shutdown', async () => { calls.push('stop'); r._preheatGeneration++; r.proc = null; r.attached = false })
+  t.mock.method(r, 'ensureSpawned', async () => {
+    calls.push('spawn')
+    assert.equal(r.proc, null)
+    assert.deepEqual(r.promptPolicy, { schemaVersion: 1, profile: null })
+    r.proc = {}; r.cachedOverrides = { instructionsContent: 'NEW_SAFE_INSTRUCTIONS' }
+  })
+  t.mock.method(r, 'sendRequest', async (method: string, params: Record<string, unknown>) => {
+    calls.push(method)
+    assert.equal(method, 'thread/resume')
+    assert.equal(params.threadId, 'privacy-source-thread')
+    assert.equal(params.baseInstructions, 'NEW_SAFE_INSTRUCTIONS')
+    return {}
+  })
+  t.mock.method(r, 'compactCurrentThreadForHandoff', async () => {
+    calls.push('compact')
+    assert.equal(r.attached, true)
+    return { summaryText: 'isolated-fixture-summary' }
+  })
+  try {
+    await h.runner.compactForHandoff()
+    assert.deepEqual(calls, ['stop', 'spawn', 'thread/resume', 'compact'])
+    assert.equal(r.promptPolicy, undefined)
+    assert.equal(r.threadId, 'privacy-source-thread')
+  } finally { await h.cleanup() }
+})
+
+it('native compaction cannot reach the model when the old privacy process has not closed', async (t) => {
+  const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'privacy-source-thread' })
+  const r = h.runner as any
+  r.attached = true
+  r._promptPolicyFingerprint = 'old-policy'
+  let effects = 0
+  t.mock.method(r, 'shutdown', async () => { r._preheatGeneration++ })
+  t.mock.method(r, 'compactCurrentThreadForHandoff', async () => { effects++; return {} })
+  try {
+    await assert.rejects(h.runner.compactForHandoff(), /尚未生效/)
+    assert.equal(effects, 0)
+    assert.equal(r.promptPolicy, undefined)
+  } finally { await h.cleanup() }
+})
+
+it('shutdown during a delayed privacy read cancels native compact before any new spawn or model call', async (t) => {
+  const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'privacy-source-thread' })
+  const r = h.runner as any
+  r.attached = true
+  const { promptPrivacyFingerprint } = await import('../promptPrivacyPolicy.js')
+  r._promptPolicyFingerprint = promptPrivacyFingerprint({ schemaVersion: 1, profile: null }, undefined)
+  const priorUrl = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+  const priorToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'synthetic-fixture-only'
+  let respond!: () => void
+  let entered!: () => void
+  const reading = new Promise<void>(resolve => { entered = resolve })
+  const server = createServer((_req, res) => {
+    respond = () => res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }))
+    entered()
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+  let effects = 0
+  t.mock.method(r, 'ensureSpawned', async () => { effects++ })
+  t.mock.method(r, 'sendRequest', async () => { effects++; return {} })
+  t.mock.method(r, 'compactCurrentThreadForHandoff', async () => { effects++; return {} })
+  const compact = h.runner.compactForHandoff()
+  const rejected = assert.rejects(compact, /尚未生效|INTERRUPTED/)
+  try {
+    await reading
+    await h.runner.shutdown()
+    respond()
+    await rejected
+    assert.equal(effects, 0)
+    assert.equal(r.proc, null)
+    assert.equal(r.promptPolicy, undefined)
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    if (priorUrl === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL'); else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = priorUrl
+    if (priorToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN'); else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = priorToken
+    await h.cleanup()
   }
 })

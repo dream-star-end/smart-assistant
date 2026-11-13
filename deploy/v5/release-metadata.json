@@ -196,7 +196,8 @@
     "0328_community_tutorial_revisions",
     "0329_media_studio_music",
     "0334_users_registration_ip",
-    "0336_commercial_muse_durable"
+    "0336_commercial_muse_durable",
+    "0340_commercial_sync_compat"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

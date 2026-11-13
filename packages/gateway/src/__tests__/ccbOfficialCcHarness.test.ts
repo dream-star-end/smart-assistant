@@ -144,7 +144,14 @@ describe('official-cc CCB proxy spawn env', () => {
       executionDescriptorEnv: JSON.stringify(DESCRIPTOR),
     })
     assert.equal(a.CLAUDE_CODE_MAX_RETRIES, '0')
+    assert.equal(a.OC_FIGCHECK_TURN_ID, '')
     assert.ok(a[MODEL_EXECUTION_DESCRIPTOR_ENV])
+    const withTurn = buildOfficialCcProxySpawnEnv({
+      headers: { lease: 'LEASE1' },
+      turnKey: 'ab'.repeat(32),
+      executionDescriptorEnv: JSON.stringify(DESCRIPTOR),
+    })
+    assert.equal(withTurn.OC_FIGCHECK_TURN_ID, 'ab'.repeat(32))
     assert.equal(officialCcProxySpawnFingerprint(a), officialCcProxySpawnFingerprint(same))
     assert.notEqual(officialCcProxySpawnFingerprint(a), officialCcProxySpawnFingerprint(b))
   })

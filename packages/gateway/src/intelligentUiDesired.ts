@@ -6,7 +6,7 @@
  * sessionManager.submit 在应用 effort/model 的同一把锁里用本模块取「现在应当是否注入」,
  * 不一致就并入已有的「shutdown → 本次 submit 以 resume 自动重启」路径。
  *
- * 取值:同一容器只属于一个用户,所以按容器缓存 5 秒;过期同步拉一次 master slots(本机,
+ * 取值:同一容器只属于一个用户,分别按网页对话/任务展示面缓存 5 秒;过期同步拉一次 master slots(本机,
  * 超时 1 秒)。拉取失败返回 undefined —— 调用方不得据此重启(失败 ≠ 已关闭)。
  *
  * 比的是 INTELLIGENT_UI 段的内容指纹(intelligentUiFingerprint),不只是有没有这一段:
@@ -20,12 +20,13 @@ import {
   type IntelligentUiApplied,
   intelligentUiFingerprint,
   isWebchatSessionKey,
+  isWebRenderedIuiSessionKey,
 } from './promptSlots.js'
 
 const TTL_MS = 5_000
 const TIMEOUT_MS = 1_000
 
-let cache: { value: IntelligentUiApplied; at: number } | null = null
+const cache = new Map<'webchat' | 'taskboard', { value: IntelligentUiApplied; at: number }>()
 /** 测试替身:替换「拉 master」这一步(webchat 判定与缓存之外的部分)。 */
 let fetchOverride: (() => Promise<IntelligentUiApplied | undefined>) | null = null
 
@@ -33,18 +34,20 @@ export async function getDesiredIntelligentUi(
   sessionKey: string | undefined,
   deps: FetchPlatformSlotsDeps & { now?: () => number } = {},
 ): Promise<IntelligentUiApplied | undefined> {
-  // 非 webchat 会话永远不注入:期望值恒为 false(与 runner 记录一致,不会触发重启)。
-  if (!isWebchatSessionKey(sessionKey)) return false
+  // Other channels do not render IUI. Each web surface has its own content fingerprint.
+  if (!isWebRenderedIuiSessionKey(sessionKey)) return false
+  const surface = isWebchatSessionKey(sessionKey) ? 'webchat' : 'taskboard'
   const now = deps.now ?? Date.now
   if (fetchOverride) return fetchOverride()
-  if (cache && now() - cache.at < TTL_MS) return cache.value
+  const cached = cache.get(surface)
+  if (cached && now() - cached.at < TTL_MS) return cached.value
   const r = await fetchPlatformSlotsFromMasterDetailed(
-    { agentId: 'main' },
+    { agentId: 'main', sessionKey },
     { ...deps, timeoutMs: deps.timeoutMs ?? TIMEOUT_MS },
   )
   if (r === null || !r.ok) return undefined
   const value = intelligentUiFingerprint(r.slots.find((s) => s.name === INTELLIGENT_UI_SLOT)?.content)
-  cache = { value, at: now() }
+  cache.set(surface, { value, at: now() })
   return value
 }
 
@@ -62,7 +65,7 @@ export function isIntelligentUiApplied(v: unknown): v is IntelligentUiApplied {
 }
 
 export function __resetIntelligentUiDesiredCacheForTests(): void {
-  cache = null
+  cache.clear()
   fetchOverride = null
 }
 

@@ -24,7 +24,7 @@
  *   - role=admin + visibility='hidden' + 没 grant → false。admin 不自动 bypass hidden,
  *     与 listForUser 同源:hidden 是"必须显式授权才能用"的最严格语义,plan v3 §E1 定义。
  */
-import { isBoxGptWebModel } from '@openclaude/protocol'
+import { isCc5TestModel, isBoxGptWebModel } from '@openclaude/protocol'
 import { isBoxGptWebAllowedUser } from '../cursor/access.js'
 import type { PricingCache } from './pricing.js'
 import { canonicalizeModelId } from './pricing.js'
@@ -60,6 +60,8 @@ export function canUseModel(deps: CanUseModelDeps, input: CanUseModelInput): boo
   const pricing = deps.pricing.get(canonical)
   if (!pricing) return false
   if (!pricing.enabled) return false
+  // Retired task model: cc5 now uses a signed backend of the existing Sonnet model.
+  if (isCc5TestModel(pricing.model_id)) return false
   if (isBoxGptWebModel(pricing.model_id)) {
     if (!isBoxGptWebAllowedUser(input.uid)) return false
     if (!input.grantedModelIds.has(pricing.model_id)) return false

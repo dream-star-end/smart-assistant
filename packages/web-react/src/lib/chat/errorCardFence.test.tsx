@@ -37,13 +37,14 @@ class FakeWS {
   }
 }
 
-function makeSocket(): ChatSocket {
+function makeSocket(overrides: Partial<ChatSocketDeps> = {}): ChatSocket {
   const deps: ChatSocketDeps = {
     getToken: () => "tok",
     getAuthEpoch: () => 0,
     silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
     onAuthExpired: () => {},
     defaultAgentId: "main",
+    ...overrides,
   };
   return new ChatSocket(deps);
 }
@@ -89,7 +90,18 @@ function tape(session: ChatSession, fullText = ""): ChatMessage[] {
 function boot(id: string): { sock: ChatSocket; ws: FakeWS; session: ChatSession } {
   FakeWS.instances = [];
   vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-  const sock = makeSocket();
+  // Recovery grace verification: the recovery child is open on the server.
+  const sock = makeSocket({
+    readSessionSnapshot: async () => ({
+      v: 1, sessionId: id, streamKey: null, lastFrameSeq: null, lastFrameAt: null, engineReady: null,
+      dispatch: {
+        id: "77777777-7777-4777-8777-777777777777", clientMessageId: "m-recover-child", agentId: "main",
+        status: "accepted", outcome: null, attempt: 1, since: 1, acceptedAt: 1, terminalAt: null,
+      },
+      turnStatus: null, reconcile: null, pendingPermissions: { items: [], completeness: "complete" },
+      usage: null, credits: null, frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf: 1,
+    }) as never,
+  });
   sock.setGateReady(true);
   const ws = FakeWS.instances.at(-1)!;
   ws.open();
@@ -134,8 +146,8 @@ describe("error card fence", () => {
     for (const full of [true, false]) {
       const { sock, ws, session } = boot(`reload-${full}`);
       sendError(ws, session.id);
-      (sock as unknown as { materializePendingRecoveryError(id: string, cause: string): void })
-        .materializePendingRecoveryError(session.id, "decision_timeout");
+      (sock as unknown as { verifyDeferredRecovery(id: string, cause: string): void })
+        .verifyDeferredRecovery(session.id, "decision_timeout");
       sock.applyServerMessages(session.id, "main", tape(session), full);
       expect(alerts(session)).toBe(0);
       expect(pending(sock, session.id)).toBe(true);

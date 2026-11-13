@@ -13,4 +13,4 @@
 保存(Write/Edit;无 `oc-memory memory`):
 1. Write `{{MEMORY_DIR}}/<slug>.md`,frontmatter:`name`/`description`/`type`
 2. Edit `{{MEMORY_MD}}` 追加 `- [标题](memory/<slug>.md) — 钩子`
-更新优先;删时同步删文件和索引。仅明确“默认/所有未来会话”的偏好才写入 `{{USER_MD}}` 的 `<!-- oc-user-always:start -->`/`<!-- oc-user-always:end -->`。
+更新优先;删时同步删文件和索引。用户画像 `{{USER_MD}}` 仅按需读取，不因写入 always 标记而常驻；称呼投影由本人在“隐私与助手”中按会话授权。

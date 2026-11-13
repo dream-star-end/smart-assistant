@@ -1151,6 +1151,7 @@ async function readSnapshot(
       requestedExecution: row.requested_execution as {
         agentId: string
         model?: string
+        modelSwitchConsent?:string
         effortLevel?: string | null
         teamMode?: boolean
         contextTier?: CursorContextTier
@@ -1387,6 +1388,7 @@ function assertOptionalString(name: string, value: unknown, maxBytes: number): v
 function validateRequestedExecution(value: Record<string, unknown>): void {
   if (value.agentId !== undefined) assertBoundedId('requestedExecution.agentId', value.agentId, 64)
   assertOptionalString('requestedExecution.model', value.model, 256)
+  assertOptionalString('requestedExecution.modelSwitchConsent',value.modelSwitchConsent,4096)
   if (value.effortLevel !== null) {
     assertOptionalString('requestedExecution.effortLevel', value.effortLevel, 64)
   }

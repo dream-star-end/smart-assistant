@@ -12,8 +12,9 @@ import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
 import { uploadFilesToProject } from "../lib/projectFileUpload";
 import { normalizeManageTab } from "../lib/manageTabs";
 import { CHAT_CREATE_TEMPLATES } from "../lib/chatCreateTemplates";
+import { taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
 import { DEFAULT_AGENT } from "../lib/agents";
-import { lazy } from "react";
+import { lazy, useEffect, useState } from "react";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import type { Agent } from "../lib/agents";
 import type { PrefsView } from "../lib/modelPreferences";
@@ -33,6 +34,8 @@ import type { ProjectRoute } from "../hooks/useAppRoute";
 import type { Theme } from "../hooks/useTheme";
 import type { SettingsDestinationSection } from "../lib/productCapabilities";
 import type { ToastFn } from "./ui/Toast";
+
+const AgentPicker = lazy(() => import("./AgentPicker").then((m) => ({ default: m.AgentPicker })));
 
 const SettingsCenter = lazy(() =>
   import("./SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
@@ -70,6 +73,16 @@ const MediaTaskCenter = lazy(() =>
   import("./MediaTaskCenter").then((m) => ({ default: m.MediaTaskCenter })),
 );
 
+/** No active-session fallback: an old media job belongs only to its original session. */
+export function mediaTaskContinuationDraft(
+  job: { prompt?: string; sessionId?: string | null },
+  sessions: readonly Pick<Session, "id">[],
+): { sessionId: string; text: string } | null {
+  const sessionId = job.sessionId;
+  if (!sessionId || !job.prompt?.trim() || !sessions.some((session) => session.id === sessionId)) return null;
+  return { sessionId, text: taskContinuationPrompt(job.prompt) };
+}
+
 const ShareDialog = lazy(() => import("./ShareDialog").then((m) => ({ default: m.ShareDialog })));
 
 const ChatGptProxyDialog = lazy(() =>
@@ -90,6 +103,8 @@ const MarketplaceCenter = lazy(() =>
 const OrgCenter = lazy(() => import("./OrgCenter").then((m) => ({ default: m.OrgCenter })));
 
 export type AppDialogsProps = {
+  preferencesRevision?: number;
+  inboxRevision?: number;
   activeId: string | undefined;
   activeSess: ChatSession | undefined;
   agent: Agent;
@@ -332,6 +347,8 @@ export function AppDialogs({
   settingsSection,
   shareOpen,
   subscribeOpenSignal,
+  preferencesRevision,
+  inboxRevision,
   teamMode,
   theme,
   toast,
@@ -340,6 +357,7 @@ export function AppDialogs({
   user,
   wsMessages,
 }: AppDialogsProps) {
+  const mediaAuthEpoch = auth?.snapshot().epoch;
   return (
     <>
       <LazyAgentPicker
@@ -412,6 +430,8 @@ export function AppDialogs({
       {settingsOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <SettingsCenter
+            preferencesRevision={preferencesRevision}
+            activeSessionId={activeId}
             open={settingsOpen}
             initialSection={settingsSection}
             auth={auth}
@@ -567,8 +587,9 @@ export function AppDialogs({
               const moving = from?.sessionId ? sessions.find((x) => x.id === from.sessionId) : undefined;
               if (moving) moveSessionToProject(moving, created.id);
               else {
+                // 新建项目后进项目主页（体验官 10-27：以前开一个项目内空白会话，看起来像回到了空首页）。
                 setBoardOpen(false);
-                newSessionInProject(created.id);
+                setProjectHome({ projectId: created.id, tab: "overview" });
               }
               return true;
             }}
@@ -606,6 +627,8 @@ export function AppDialogs({
       {inboxMounted && (
         <LazyBoundary fallback={<DialogFallback />}>
           <InboxDialog
+            key={`inbox:${user?.id ?? 'none'}:${auth?.snapshot().epoch ?? -1}`}
+            refreshRevision={inboxRevision}
             open={inboxOpen}
             auth={auth}
             onClose={() => setInboxOpen(false)}
@@ -621,11 +644,23 @@ export function AppDialogs({
             auth={auth}
             liveJob={liveMediaJob}
             onOpenChange={setMediaTasksOpen}
-            onReusePrompt={(prompt) => {
-              // media M-17 / X-M4:失败任务「重新发起」→ 关任务中心,提示词写进 Composer 草稿
-              //(与教程 starterPrompt / 编辑重发同一条 prefill 路),用户改一改就能再发。
+            onReusePrompt={async (job) => {
+              if (!authed || !auth || authRef.current !== auth || auth.snapshot().epoch !== mediaAuthEpoch) return;
+              const draft = mediaTaskContinuationDraft(job, sessions);
+              if (!draft) {
+                try {
+                  await navigator.clipboard.writeText(job.prompt ?? "");
+                  if (authRef.current === auth && auth.snapshot().epoch === mediaAuthEpoch)
+                    toast("原会话暂不可用，已复制提示词；没有发送新任务。", "info");
+                } catch {
+                  if (authRef.current === auth && auth.snapshot().epoch === mediaAuthEpoch)
+                    toast("原会话暂不可用，请手动复制提示词。", "info");
+                }
+                return;
+              }
+              selectSession(draft.sessionId);
               setMediaTasksOpen(false);
-              setComposerPrefill({ text: prompt, nonce: Date.now() });
+              setComposerPrefill({ text: draft.text, nonce: Date.now() });
             }}
           />
         </LazyBoundary>

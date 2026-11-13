@@ -72,7 +72,7 @@ describe('project memory HTTP', () => {
     })
     void created
     await withServer({ db, actor: 'human' }, async (base) => {
-      const proj = await call(base, 'POST', '/api/board/projects', { key: 'TEST', name: 'V5' })
+      const proj = await call(base, 'POST', '/api/board/projects', { key: 'TEST', name: 'V5', templateIds: [] })
       assert.equal(proj.status, 201)
       const projectId = (proj.body.project as { id: string }).id
 
@@ -121,7 +121,7 @@ describe('project memory HTTP', () => {
   it('deprecate is still the undo for an auto-promoted memory', async () => {
     const db = freshDb()
     await withServer({ db, actor: 'human' }, async (base) => {
-      const proj = await call(base, 'POST', '/api/board/projects', { key: 'UNDO', name: 'undo' })
+      const proj = await call(base, 'POST', '/api/board/projects', { key: 'UNDO', name: 'undo', templateIds: [] })
       const projectId = (proj.body.project as { id: string }).id
       const created = await call(base, 'POST', `/api/board/projects/${projectId}/memories`, {
         slug: 'undo.md',
@@ -145,8 +145,8 @@ describe('project memory HTTP', () => {
   it('projects are isolated', async () => {
     const db = freshDb()
     await withServer({ db, actor: 'human' }, async (base) => {
-      const a = await call(base, 'POST', '/api/board/projects', { key: 'AAA', name: 'A' })
-      const b = await call(base, 'POST', '/api/board/projects', { key: 'BBB', name: 'B' })
+      const a = await call(base, 'POST', '/api/board/projects', { key: 'AAA', name: 'A', templateIds: [] })
+      const b = await call(base, 'POST', '/api/board/projects', { key: 'BBB', name: 'B', templateIds: [] })
       const idA = (a.body.project as { id: string }).id
       const idB = (b.body.project as { id: string }).id
       await call(base, 'POST', `/api/board/projects/${idA}/memories`, { slug: 'a.md', content: CONTENT })
@@ -160,7 +160,7 @@ describe('project memory HTTP', () => {
   it('GET context/preview and old run context columns stay null', async () => {
     const db = freshDb()
     await withServer({ db, actor: 'human' }, async (base) => {
-      const proj = await call(base, 'POST', '/api/board/projects', { key: 'CTX', name: 'ctx' })
+      const proj = await call(base, 'POST', '/api/board/projects', { key: 'CTX', name: 'ctx', templateIds: [] })
       const projectId = (proj.body.project as { id: string }).id
       const ctx = await call(base, 'GET', `/api/board/projects/${projectId}/context`)
       assert.equal(ctx.status, 200)
@@ -191,7 +191,7 @@ describe('project memory HTTP', () => {
   it('agent bearer cannot write skill overlay ledger', async () => {
     const db = freshDb()
     await withServer({ db, actor: 'human' }, async (base) => {
-      const proj = await call(base, 'POST', '/api/board/projects', { key: 'SKL', name: 'skills' })
+      const proj = await call(base, 'POST', '/api/board/projects', { key: 'SKL', name: 'skills', templateIds: [] })
       const projectId = (proj.body.project as { id: string }).id
       await withServer({ db, actor: 'agent' }, async (agentBase) => {
         const denied = await call(agentBase, 'PUT', `/api/board/projects/${projectId}/context`, {

@@ -16,6 +16,7 @@
 // 编码规则 = 签名互不认账。私钥逻辑**不在本文件**(master 独占)。
 
 import { BOX_API_MODELS } from './boxApiModels.js'
+import { type RemoteExecutionBackend, isRemoteBackendAuthority, parseRemoteExecutionBackend } from './remoteExecutionBackend.js'
 import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto'
 
 import type { PlatformReasoningEffort } from './engineModels.js'
@@ -54,19 +55,16 @@ export const AUTHORITY_TTL_MS = 120_000
 
 /**
  * turn lease 是 50min 的滚动签名窗口，不是 turn/delegate 总运行时长。
- * 活跃长 turn 在 30min 时续签；平台绝对安全上限由下方
- * AUTHORITY_TURN_MAX_LIFETIME_MS 单独定义。常量名为 wire 兼容保留。
+ * 活跃长 turn 在 30min 时续签，任务本身没有总墙钟期限。
+ * 常量名为 wire 兼容保留。
  */
 export const PLATFORM_MAX_TURN_MS = 45 * 60_000
 export const TURN_LEASE_GRACE_MS = 5 * 60_000
 export const TURN_LEASE_TTL_MS = PLATFORM_MAX_TURN_MS + TURN_LEASE_GRACE_MS
 
 /**
- * bridge turn 的绝对寿命上限。lease 本身仍保持 50min 的短滚动窗口；活跃长任务由
- * master 在每次续签时把 `expiresAt` 向后滚动，但永远不能越过 durable journal 的
- * turn 起点加 `AUTHORITY_TURN_MAX_LIFETIME_MS`。gateway 对同一逻辑 turn 起点执行平台级
- * 安全终止；delegate 自身没有 45min 墙钟截止线。起点不进
- * lease wire，避免破坏仍在滚动运行的严格 v1 reader。
+ * 兼容既有 caller token / pending permission 的有限保留窗口。
+ * 不是逻辑 turn 的总执行上限；活跃 turn 通过短 lease 与 caller token 滚动续期。
  */
 export const AUTHORITY_TURN_MAX_LIFETIME_MS = 12 * 60 * 60_000
 
@@ -144,6 +142,8 @@ export interface ModelAuthorityPayload {
   readonly canonicalModel: string
   readonly engine: ModelAuthorityEngine
   readonly executionDescriptor: ModelExecutionDescriptor
+  /** Optional per-chat backend selected by the trusted signer, never by model/catalog aliases. */
+  readonly executionBackend?: RemoteExecutionBackend
   readonly executionRevision: string
   readonly securityEpoch: number
   readonly issuedAt: number
@@ -204,8 +204,8 @@ export interface TurnLease {
   readonly connectionChallenge: string
   /**
    * 一次未成功上线的滚动续签实验曾携带此字段。生产签发与续签必须省略它，
-   * 以保持旧 v1 严格 reader 的字段集不变；master 从 durable journal 取绝对起点。
-   * reader 只保留可选解析，用于把实验票保守收敛回旧 wire shape。
+   * 以保持旧 v1 严格 reader 的字段集不变。
+   * reader 只保留可选解析，用于把实验票收敛回旧 wire shape。
    */
   readonly originalIssuedAt?: number
   /** 本张 lease 的签发/续签时刻。 */
@@ -456,16 +456,20 @@ export function verifyTurnLease(
   envelopeB64: string,
   keyring: AuthorityKeyring,
   now: number,
+  opts?: { allowExpired?: boolean },
 ): TurnLease {
   const { payload, sig } = decodeEnvelope(envelopeB64, TURN_LEASE_KIND)
   const typed = parseTurnLease(payload)
   verifySignature(turnLeaseSigningInput(typed), sig, typed.keyId, keyring)
   assertLeaseTimeWindow(typed)
-  assertNotExpired(typed.expiresAt, now)
+  // Only the authenticated master renewal endpoint may recover an expired
+  // signature after proving the exact durable dispatch is still active.
+  // Egress callers omit this option and always reject expired credentials.
+  if (opts?.allowExpired !== true) assertNotExpired(typed.expiresAt, now)
   return typed
 }
 
-/** 只供实验票保守解析；生产绝对起点来自 master durable journal。 */
+/** 只供旧实验票兼容解析；不作为逻辑 turn 的总寿命界。 */
 export function turnLeaseOriginalIssuedAt(lease: TurnLease): number {
   return lease.originalIssuedAt ?? lease.issuedAt
 }
@@ -478,8 +482,8 @@ function assertLeaseTimeWindow(lease: TurnLease): void {
   if (lease.issuedAt >= lease.expiresAt) {
     throw new ModelAuthorityError('BadShape', 'turn lease issuedAt must be before expiresAt')
   }
-  if (lease.expiresAt > original + AUTHORITY_TURN_MAX_LIFETIME_MS) {
-    throw new ModelAuthorityError('BadShape', 'turn lease exceeds absolute turn lifetime')
+  if (lease.expiresAt > lease.issuedAt + TURN_LEASE_TTL_MS) {
+    throw new ModelAuthorityError('BadShape', 'turn lease exceeds rolling credential window')
   }
 }
 
@@ -734,6 +738,7 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     expiresAt: int(o, 'expiresAt'),
     ...(o.auxModels === undefined ? {} : { auxModels: modelList(o, 'auxModels') }),
     ...(o.billingRequestId === undefined ? {} : { billingRequestId: str(o, 'billingRequestId') }),
+    ...(o.executionBackend === undefined ? {} : { executionBackend: parseExecutionBackend(o.executionBackend) }),
   }
   // 重建对象后必须与 wire 载荷**字段集完全一致**:多出的未知字段一律拒 —— 否则
   // 「签名覆盖 wire 全字段、验签只取已知字段」会让未知字段成为不被校验的携带面。
@@ -753,8 +758,20 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     'expiresAt',
     'auxModels',
     'billingRequestId',
+    'executionBackend',
   ])
+  if (payload.executionBackend !== undefined && !isRemoteBackendAuthority(payload)) {
+    throw new ModelAuthorityError('BadShape', 'payload: execution backend/model/engine mismatch')
+  }
   return payload
+}
+
+function parseExecutionBackend(value: unknown): RemoteExecutionBackend {
+  try {
+    return parseRemoteExecutionBackend(value)
+  } catch {
+    throw new ModelAuthorityError('BadShape', 'payload: invalid execution backend scope')
+  }
 }
 
 function parseTurnLease(raw: unknown): TurnLease {

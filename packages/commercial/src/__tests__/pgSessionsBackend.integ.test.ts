@@ -174,7 +174,9 @@ before(async () => {
   await pool.query(`CREATE TABLE IF NOT EXISTS usage_records (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT,
+    request_id TEXT,
     turn_key TEXT,
+    parent_turn_key TEXT,
     status TEXT,
     output_tokens BIGINT NOT NULL DEFAULT 0,
     cache_read_tokens BIGINT NOT NULL DEFAULT 0
@@ -8269,6 +8271,42 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       fullReads: () => fullReads,
     };
   }
+
+  maybe("Antigravity observation loss never creates a recovery job, including reconciliation", async () => {
+    _resetAutomaticRecoveryReconcileSkipsForTest();
+    const sessionId = "s-agy-observation-loss";
+    const sourceClientMessageId = "cm-agy-observation-loss";
+    const admitted = await backend.admitUserTurn(admitInput({
+      sessionId, clientMessageId: sourceClientMessageId,
+      billingRequestId: "brq-agy-observation-loss",
+      message: { id: sourceClientMessageId, role: "user", text: "fixture write", ts: 1,
+        _routing: { model: "gpt-5.6-sol", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.ok(admitted.kind === "admitted");
+    const dispatch = { dispatchId: admitted.dispatch.dispatchId, attemptNo: admitted.dispatch.attemptNo };
+    const tape = buildTape({
+      sessionId, agentId: "main", turnIndex: 1, status: "crashed",
+      turnKey: "a".repeat(64), clientMessageId: sourceClientMessageId,
+      text: "execution observation failed", thinkingText: "durable checkpoint",
+      errorCode: "antigravity_start_observation_failed", createdAt: 1_783_950_100_000,
+      usage: { inputTokens: 10, outputTokens: 1 },
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, dispatch);
+    }
+    assert.equal((await backend.finalizeLosslessTurnTape(CUSER, {
+      ...tape.finalize, ...dispatch,
+    })).applied, "finalized");
+    const count = async () => (await pool.query(
+      "SELECT 1 FROM turn_recovery_jobs WHERE user_id=$1 AND session_id=$2",
+      [UID, sessionId],
+    )).rowCount;
+    assert.equal(await count(), 0, "finalize must not enqueue a recovery");
+    const counting = countingBackend();
+    assert.equal(await counting.backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
+    assert.equal(await count(), 0, "reconciler must not recreate a suppressed recovery");
+  });
 
   maybe("reconcile sweep skips full tape read for non-recoverable terminal error and remembers the verdict", async () => {
     _resetAutomaticRecoveryReconcileSkipsForTest();

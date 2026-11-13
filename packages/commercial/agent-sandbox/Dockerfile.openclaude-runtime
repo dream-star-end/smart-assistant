@@ -800,12 +800,12 @@ RUN set -eux; \
 # ------------------------------------------------------------
 # Opt-in like Grok/ZCode. Placed at the end of `base` so the heavy cached layers
 # above stay valid. Release-bucket URL + sha512 from the official manifest for
-# 1.4.0 (docs/ocv5-415-antigravity-cli.md §2). No Node dependency. Auto-update
+# 1.5.0 (docs/antigravity-large-history-resume.md). No Node dependency. Auto-update
 # is disabled at runtime by the adapter (AGY_CLI_DISABLE_AUTO_UPDATE=true).
 ARG OC_INCLUDE_ANTIGRAVITY=0
-ARG OC_ANTIGRAVITY_CLI_VERSION=1.4.0
-ARG OC_ANTIGRAVITY_CLI_BUILD=1.4.0-5281842794987520
-ARG OC_ANTIGRAVITY_CLI_SHA512=6c4b298c2a69b6bd0f58567031cc56d8097a32be54c4b633aa80ad395871b389618ab3860d4ba0a12599831b8226b51b03e258ee2ec7fae105a45b8e0fce2188
+ARG OC_ANTIGRAVITY_CLI_VERSION=1.5.0
+ARG OC_ANTIGRAVITY_CLI_BUILD=1.5.0-5269980577660928
+ARG OC_ANTIGRAVITY_CLI_SHA512=e6031f850929210705d8c2393a5665b82b8c3b19684a6d3c556cafa31f26f77acbf164dfee96ca84a5ae7670ac0cc238a974c981c517b269194bdccff271cbd5
 RUN if [ "$OC_INCLUDE_ANTIGRAVITY" = "1" ]; then set -eux; \
       test "$(dpkg --print-architecture)" = amd64; \
       archive=/tmp/antigravity-cli-${OC_ANTIGRAVITY_CLI_VERSION}.tar.gz; \

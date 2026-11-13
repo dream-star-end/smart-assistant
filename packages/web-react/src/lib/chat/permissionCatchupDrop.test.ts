@@ -66,18 +66,6 @@ function stampedPermissionFrame(frameSeq: number) {
   return catchupFrame({ frameSeq });
 }
 
-function replayStartFrame() {
-  return {
-    type: "outbound.active_turn_replay_start",
-    sessionKey: SESSION_KEY,
-    channel: "webchat",
-    peer: { id: SESS, kind: "dm" },
-    clientMessageId: CMID,
-    baseSeq: 0,
-    ts: Date.now(),
-  };
-}
-
 function stampedMessageFrame(frameSeq: number) {
   return {
     type: "outbound.message",
@@ -183,10 +171,9 @@ describe("INC-20260904-EXITPLAN-PROMPT-BURIED: open prompt survives reconnect ca
         // (a) hello catch-up frame WITHOUT frameSeq: dispatched immediately
         // even though durable hydration is in progress.
         ws.onmessage?.({ data: JSON.stringify(catchupFrame()) });
-        // (b) active-turn ring replay boundary + stamped frames (incl. the
-        // original stamped permission_request); stamped frames are buffered by
+        // (b) ring replay of stamped frames (incl. the original stamped
+        // permission_request); stamped frames are buffered by
         // bufferStampedFrameDuringDurableHydration and drained after REST.
-        ws.onmessage?.({ data: JSON.stringify(replayStartFrame()) });
         ws.onmessage?.({ data: JSON.stringify(stampedMessageFrame(238)) });
         ws.onmessage?.({ data: JSON.stringify(stampedMessageFrame(239)) });
         ws.onmessage?.({ data: JSON.stringify(stampedPermissionFrame(240)) });

@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { proveWebSearchCli } from "./lib/webSearchCliProof.js";
+import { proveAdvisorNoWrite } from "./lib/advisorNoWriteProof.js";
 
 import { MEMORY_MCP_TOOL_NAMES } from "../packages/mcp-memory/src/toolNames.js";
 
@@ -289,3 +290,5 @@ console.log("[ocv5-510-codex-web-search-cli] PASS — the real CLI restores cont
 console.log(
   "[ccb-mcp-availability] PASS — CCB prompt advertises built-in openclaude-memory tools; ExecuteExtraTool wrapper unwraps to inner MCP tool",
 );
+
+proveAdvisorNoWrite(root);

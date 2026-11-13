@@ -33,9 +33,10 @@ import { isPluginAvailable } from '../plugins/catalogPolicy.js'
  *   - 不做合并冲突保护(冲突几率 ≈ 同一用户两个 tab 同时改;最坏后果 = 后写覆盖前写)
  */
 
-import { PLATFORM_REASONING_EFFORTS } from "@openclaude/protocol";
+import { scanMemoryContent } from "@openclaude/storage";
+import { PLATFORM_REASONING_EFFORTS, hasPromptPrivacyControlCharacters } from "@openclaude/protocol";
 import { z } from "zod";
-import { query } from "../db/queries.js";
+import { query, type QueryRunner } from "../db/queries.js";
 
 // ─── zod schema ───────────────────────────────────────────────────────────
 
@@ -52,6 +53,13 @@ const disabledPluginsSchema = z
   .array(z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/, "invalid plugin slug"))
   .max(200)
   .refine((a) => new Set(a).size === a.length, { message: "duplicate plugin slug" });
+
+/** Explicit nickname consent is scoped to one conversation; absent means disabled. */
+const assistantProfileSchema = z.object({
+  enabled: z.boolean(),
+  nickname: z.string().trim().min(1).max(80).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符").refine(value => scanMemoryContent(value).ok, "称呼应为简短名称，不能包含系统指令"),
+  sessionId: z.string().min(1).max(256).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符"),
+}).strict();
 
 /**
  * 全字段 schema(GET 返回 / 内部表示)。所有字段都是可选 — DB 默认行不存在时为空对象。
@@ -73,6 +81,8 @@ export const PreferencesSchema = z
     input_prediction: z.boolean().optional(),
     disabled_plugins: disabledPluginsSchema.optional(),
     enabled_plugins: disabledPluginsSchema.optional(),
+    system_assistant_profile: assistantProfileSchema.optional(),
+    system_assistant_recommendations: z.boolean().optional(),
   })
   .strict();
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -98,6 +108,8 @@ export const PreferencesPatchSchema = z
     input_prediction: z.boolean().nullable().optional(),
     disabled_plugins: disabledPluginsSchema.nullable().optional(),
     enabled_plugins: disabledPluginsSchema.nullable().optional(),
+    system_assistant_profile: assistantProfileSchema.nullable().optional(),
+    system_assistant_recommendations: z.boolean().nullable().optional(),
   })
   .strict();
 export type PreferencesPatch = z.infer<typeof PreferencesPatchSchema>;
@@ -147,7 +159,13 @@ export async function getPreferences(userId: bigint | string): Promise<Preferenc
 export async function patchPreferences(
   userId: bigint | string,
   rawPatch: unknown,
+  expectedVersion?: string,
+  expectedRole?: "user" | "admin",
+  runner?: QueryRunner,
 ): Promise<PreferencesSnapshot> {
+  if (expectedVersion !== undefined && expectedVersion !== 'missing' && !/^[1-9][0-9]{0,19}$/.test(expectedVersion)) {
+    throw new PreferencesError('VALIDATION', 'invalid preference snapshot version');
+  }
   const parsed = PreferencesPatchSchema.safeParse(rawPatch);
   if (!parsed.success) {
     throw new PreferencesError(
@@ -194,16 +212,45 @@ export async function patchPreferences(
   // INSERT 路径:不存在的旧行,COALESCE 落到 '{}',语义同上
   const insertNewExpr = `('{}'::jsonb${unsetExpr}) || $2::jsonb`;
 
-  let r;
+  // A locked CTE protects an existing row from delete/reinsert between checking and writing.
+  // On absent-row races, ON CONFLICT checks the real conflicting tuple instead of overwriting it.
+  let prefix = '';
+  let values = `VALUES ($1, ${insertNewExpr}, NOW())`;
+  let conflictGuard = '';
+  if (expectedVersion !== undefined) {
+    params.push(expectedVersion);
+    const expected = `$${params.length}`;
+    prefix = `WITH current_preferences AS MATERIALIZED (
+      SELECT xmin::text AS version FROM user_preferences WHERE user_id=$1 FOR UPDATE
+    ) `;
+    values = `SELECT $1, ${insertNewExpr}, NOW() WHERE
+      (${expected}='missing' AND NOT EXISTS (SELECT 1 FROM current_preferences))
+      OR EXISTS (SELECT 1 FROM current_preferences WHERE version=${expected})`;
+    conflictGuard = ` WHERE user_preferences.xmin::text=${expected}`;
+  }
+  if (expectedRole !== undefined) {
+    if (expectedVersion === undefined || !['user', 'admin'].includes(expectedRole)) throw new PreferencesError('VALIDATION', 'confirmed preference mutation requires a version and role');
+    params.push(expectedRole);
+    const roleParam = `$${params.length}`;
+    // Lock the actor row for this same statement. Concurrent role/status changes
+    // serialize with the approved mutation, rather than racing a prior ACL read.
+    prefix = prefix.replace('WITH ', `WITH eligible_user AS MATERIALIZED (
+      SELECT id FROM users WHERE id=$1 AND status='active' AND deleted_at IS NULL AND role=${roleParam} FOR SHARE
+    ), `);
+    values = values.replace('WHERE\n      ', 'WHERE EXISTS (SELECT 1 FROM eligible_user) AND (\n      ') + ')';
+    conflictGuard += ' AND EXISTS (SELECT 1 FROM eligible_user)';
+  }
+  let r: { rows: { prefs: unknown; updated_at: Date }[] };
   try {
     r = await query<{ prefs: unknown; updated_at: Date }>(
-      `INSERT INTO user_preferences (user_id, prefs, updated_at)
-       VALUES ($1, ${insertNewExpr}, NOW())
+      `${prefix}INSERT INTO user_preferences (user_id, prefs, updated_at)
+       ${values}
        ON CONFLICT (user_id) DO UPDATE
          SET prefs = ${newPrefsExpr},
-             updated_at = NOW()
+             updated_at = NOW()${conflictGuard}
        RETURNING prefs, updated_at`,
       params,
+      runner,
     );
   } catch (err) {
     if (err instanceof Error && /violates foreign key/i.test(err.message)) {
@@ -217,6 +264,7 @@ export async function patchPreferences(
   void exprParamIdx; // 仅供构造时计数
 
   const row = r.rows[0];
+  if (!row) throw new PreferencesError('CONFLICT', '偏好已变化，请重新查看并确认。');
   const verified = PreferencesSchema.safeParse(row.prefs);
   return {
     prefs: visiblePreferences(verified.success ? verified.data : {}),

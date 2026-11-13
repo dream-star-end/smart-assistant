@@ -6,9 +6,11 @@
  * Run: npx tsx --test packages/commercial/src/__tests__/antigravityRelay.test.ts
  */
 import assert from 'node:assert/strict'
-import { createServer } from 'node:http'
+import { createServer, request as httpRequest, type IncomingMessage } from 'node:http'
+import { once } from 'node:events'
 import type { AddressInfo } from 'node:net'
 import { Readable } from 'node:stream'
+import { handleV5AntigravityRelayLocal } from '../../../gateway/src/v5AntigravityRelay.js'
 import { afterEach, describe, test } from 'node:test'
 
 import {
@@ -232,6 +234,65 @@ describe('Antigravity relay handler', () => {
       const res = await refuseBody(req, generate)
       assert.equal(res.statusCode, 413)
       assert.equal(JSON.parse(res.text).error.code, 'BODY_TOO_LARGE')
+    }
+  })
+
+  for (const state of ['destroyed', 'aborted', 'aborted-event', 'incomplete-close'] as const) {
+    test(`body reader settles on ${state}, clears readers and tolerates a late error`, async () => {
+      const source = new Readable({ read() {} })
+      if (state === 'destroyed') source.destroy()
+      if (state === 'aborted') Object.assign(source, { aborted: true })
+      const result = refuseBody(source, true)
+      if (state === 'aborted-event' || state === 'incomplete-close') {
+        // Wait for identity/route checks and reader attachment, not an arbitrary sleep.
+        while (source.listenerCount('data') === 0) await new Promise((r) => setImmediate(r))
+        source.emit('data', Buffer.from('partial'))
+        source.emit(state === 'aborted-event' ? 'aborted' : 'close')
+      }
+      const res = await deadline(result, 'body reader stayed pending')
+      assert.equal(res.statusCode, 400)
+      assert.equal(JSON.parse(res.text).error.code, 'REQUEST_BODY_READ_FAILED')
+      for (const event of ['data', 'end', 'aborted', 'close']) assert.equal(source.listenerCount(event), 0, event)
+      assert.doesNotThrow(() => source.emit('error', new Error('late private error')))
+      source.destroy()
+    })
+  }
+
+  test('oversize settles once without destroying or retaining body listeners', async () => {
+    const source = new Readable({ read() {} })
+    const result = refuseBody(source, false)
+    while (source.listenerCount('data') === 0) await new Promise((r) => setImmediate(r))
+    source.emit('data', Buffer.alloc(1024 * 1024))
+    source.emit('data', Buffer.from('x'))
+    const res = await deadline(result, 'size rejection waited for end')
+    assert.equal(res.statusCode, 413)
+    assert.equal(source.destroyed, false, '413 must be sent before closing the HTTP connection')
+    for (const event of ['data', 'end', 'aborted', 'close']) assert.equal(source.listenerCount(event), 0, event)
+    source.emit('data', Buffer.alloc(1024))
+    source.emit('end')
+    source.emit('aborted')
+    assert.doesNotThrow(() => source.emit('error', new Error('late private error')))
+    assert.equal(res.statusCode, 413)
+    source.destroy()
+  })
+
+  test('JSON/model refusals have distinct payload-free egress stages and no upstream call', async () => {
+    for (const [body, status, stage] of [
+      ['{"private-body":', 400, 'json_rejected'],
+      ['{"model":"private-model","private-body":"secret"}', 403, 'model_rejected'],
+    ] as const) {
+      const token = await mintRoute()
+      const logs: Array<Record<string, unknown>> = []
+      const result = await relay(
+        `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`,
+        { body }, { status: 200, body: SSE },
+        { logger: { info: (_message, fields) => { logs.push(fields ?? {}) } } },
+      )
+      assert.equal(result.status, status)
+      assert.equal(result.captured.calls, 0)
+      assert.ok(logs.some((row) => row.stage === stage && row.statusCode === status))
+      assert.doesNotMatch(JSON.stringify(logs), /private-body|private-model|secret|Bearer|https?:\/\//)
+      assert.ok(!JSON.stringify(logs).includes(token))
     }
   })
 
@@ -1180,4 +1241,146 @@ describe('Google retirement banners are errors, never successful paid answers (O
     assert.equal(plan.settleStatus, 'error')
     assert.equal(JSON.parse(plan.snapshotJson).antigravity_terminal_code, 'ANTIGRAVITY_MODEL_RETIRED')
   })
+})
+
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((r) => { resolve = r })
+  return { promise, resolve }
+}
+
+async function deadline<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(message)), 3000) }),
+    ])
+  } finally { clearTimeout(timer) }
+}
+
+describe('P1 real HTTP transport (no Google traffic)', () => {
+  test('disconnect during delayed identity lookup settles the handler with upstream=0', async () => {
+    const token = await mintRoute()
+    const entered = deferred()
+    const release = deferred()
+    const finished = deferred()
+    let incoming!: IncomingMessage
+    let upstreamCalls = 0
+    let handlerError: unknown
+    const realRepo = repo()
+    const handler = makeAntigravityRelayHandler({
+      identityRepo: {
+        async findActiveByHostAndBoundIp(host, ip) {
+          entered.resolve()
+          await release.promise
+          return realRepo.findActiveByHostAndBoundIp(host, ip)
+        },
+      },
+      clientSecret: 'test-secret',
+      freshToken: async () => { assert.fail('disconnected body cannot fetch credentials') },
+      requestFn: (async () => { upstreamCalls++; assert.fail('cannot forward disconnected body') }) as never,
+    })
+    const server = createServer((req, res) => {
+      incoming = req
+      void handler(req, res, CTX).catch((err) => { handlerError = err }).finally(() => finished.resolve())
+    })
+    const port = await listen(server)
+    const client = httpRequest({
+      hostname: '127.0.0.1', port, method: 'POST',
+      path: `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`,
+      headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-length': 1000 },
+    })
+    client.on('error', () => {}) // intentional client cancellation
+    try {
+      client.write('{')
+      await deadline(entered.promise, 'identity lookup not reached')
+      const closed = new Promise<void>((resolve) => incoming.once('close', resolve))
+      client.destroy()
+      await deadline(closed, 'server did not observe client disconnect')
+      assert.ok(incoming.destroyed || incoming.aborted)
+      release.resolve()
+      await deadline(finished.promise, 'handler hung after delayed identity completed')
+      assert.equal(handlerError, undefined)
+      assert.equal(upstreamCalls, 0)
+      assert.equal(_antigravityInflightForTests().has(token), false)
+      console.log('P1 delayed-auth disconnect: handler=settled upstream=0')
+    } finally {
+      release.resolve()
+      client.destroy()
+      server.closeAllConnections()
+      await close(server)
+    }
+  })
+
+  for (const twoHops of [false, true]) {
+    test(`32MiB+1 receives 413 before upload EOF, then small request succeeds (${twoHops ? 'two hops' : 'egress'})`, async () => {
+      const token = await mintRoute()
+      let upstreamCalls = 0
+      const handler = makeAntigravityRelayHandler({
+        identityRepo: repo(), clientSecret: 'test-secret',
+        freshToken: async () => Buffer.from(FULL_TOKEN),
+        meteredCost: async () => 0n, estimateCost: () => 0n,
+        recordUsage: async () => {}, reportOutcome: async () => {}, reportModelOutcome: async () => {},
+        requestFn: (async () => {
+          upstreamCalls++
+          return { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, body: Readable.from(SSE.map((chunk) => Buffer.from(chunk))) }
+        }) as never,
+      })
+      const errors: unknown[] = []
+      const egress = createServer((req, res) => { void handler(req, res, CTX).catch((err) => errors.push(err)) })
+      const egressPort = await listen(egress)
+      const local = createServer((req, res) => {
+        void handleV5AntigravityRelayLocal(req, res, {
+          masterBaseUrl: `http://127.0.0.1:${egressPort}`, containerToken: CONTAINER_TOKEN,
+        }).catch((err) => errors.push(err))
+      })
+      const port = twoHops ? await listen(local) : egressPort
+      const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+      let client: ReturnType<typeof httpRequest> | undefined
+      try {
+        const result = new Promise<{ status: number; connection: string | undefined; text: string }>((resolve, reject) => {
+          client = httpRequest({
+            hostname: '127.0.0.1', port, path, method: 'POST',
+            headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+          }, (res) => {
+            let text = ''
+            res.setEncoding('utf8')
+            res.on('data', (chunk) => { text += chunk })
+            res.on('error', reject)
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, connection: res.headers.connection, text }))
+          })
+          client.on('error', reject)
+        })
+        // Keep the chunked upload OPEN after the cap: rejecting must not wait for drain/end.
+        const chunk = Buffer.alloc(64 * 1024, 'x')
+        for (let i = 0; i < 512; i++) {
+          if (!client!.write(chunk)) await deadline(once(client!, 'drain').then(() => {}), 'upload stalled')
+        }
+        client!.write('x')
+        const oversized = await deadline(result, '413 not delivered before upload end')
+        assert.equal(oversized.status, 413)
+        assert.equal(oversized.connection, 'close')
+        assert.equal(JSON.parse(oversized.text).error.code, 'BODY_TOO_LARGE')
+        assert.equal(upstreamCalls, 0)
+        client!.destroy()
+        const small = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method: 'POST', headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+          body: generateBody('gemini-3.8-flash-low'),
+        })
+        assert.equal(small.status, 200)
+        assert.equal(await small.text(), SSE.join(''))
+        assert.equal(upstreamCalls, 1)
+        assert.deepEqual(errors, [])
+        console.log(`P1 ${twoHops ? 'two-hop' : 'egress'}: bytes=33554433 status=413 connection=close upstream=0; small=200 upstream=1`)
+      } finally {
+        client?.destroy()
+        local.closeAllConnections()
+        if (twoHops) await close(local)
+        egress.closeAllConnections()
+        await close(egress)
+      }
+    })
+  }
 })

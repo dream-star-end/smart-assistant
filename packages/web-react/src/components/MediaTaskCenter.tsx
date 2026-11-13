@@ -219,9 +219,8 @@ function FailureNote({ job }: { job: MediaGenerationJob }) {
 }
 
 /**
- * 失败任务的恢复入口(审计 M-17)。后端没有 jobs/:id/retry;App 接了 onReusePrompt 时走「重新发起」
- * (关抽屉 + 提示词写进 Composer 草稿,见 X-M4),没接线的宿主(demo / 独立挂载)退回这一步:
- * 把提示词复制走,用户回到对话里重新发起即可。
+ * 后端没有 jobs/:id/retry。宿主负责验证原会话并预填继续草稿；
+ * 独立挂载没有会话接续能力时，仅允许复制提示词。
  */
 function CopyPromptButton({ prompt }: { prompt: string }) {
   const [copied, setCopied] = useState(false)
@@ -242,12 +241,12 @@ function CopyPromptButton({ prompt }: { prompt: string }) {
   )
 }
 
-/** 失败任务「重新发起」(M-17 完整形态):把提示词交还宿主,由宿主关抽屉并预填 Composer。 */
-function ReusePromptButton({ prompt, onReuse }: { prompt: string; onReuse: (prompt: string) => void }) {
+/** Keep the failed job's original session identity through the explicit Continue. */
+function ReusePromptButton({ job, onReuse }: { job: MediaGenerationJob; onReuse: (job: MediaGenerationJob) => void }) {
   return (
-    <Button size="sm" variant="secondary" onClick={() => onReuse(prompt)}>
+    <Button size="sm" variant="secondary" onClick={() => onReuse(job)}>
       <RotateCcw size={12} />
-      重新发起
+      继续
     </Button>
   )
 }
@@ -317,10 +316,10 @@ export function MediaTaskCenter({
   liveJob: MediaGenerationJob | null
   onOpenChange: (open: boolean) => void
   /**
-   * 失败任务「重新发起」(审计 M-17 / X-M4):宿主负责关抽屉并把提示词写进 Composer 草稿。
+   * 宿主验证 job.sessionId 后回原会话，预填继续草稿；不自动发送。
    * 不传则退回「复制提示词」。
    */
-  onReusePrompt?: (prompt: string) => void
+  onReusePrompt?: (job: MediaGenerationJob) => void
 }) {
   const [jobs, setJobs] = useState<MediaGenerationJob[]>([])
   const [projects, setProjects] = useState<VideoProject[]>([])
@@ -708,7 +707,7 @@ export function MediaTaskCenter({
               {job.status === 'failed' && job.prompt && (
                 <div className="mt-3">
                   {onReusePrompt ? (
-                    <ReusePromptButton prompt={job.prompt} onReuse={onReusePrompt} />
+                    <ReusePromptButton job={job} onReuse={onReusePrompt} />
                   ) : (
                     <CopyPromptButton prompt={job.prompt} />
                   )}

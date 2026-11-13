@@ -1,0 +1,24 @@
+{
+  "id": "clean-completed",
+  "expect": {
+    "retryable": false,
+    "stopSession": false,
+    "verdict": "ok",
+    "severity": "info",
+    "askHuman": false,
+    "alert": false,
+    "reason": "ok",
+    "point": "turn_end",
+    "traceId": "44444444444444444444444444444444"
+  },
+  "observation": {
+    "point": "turn_end",
+    "traceId": "44444444444444444444444444444444",
+    "dispatchStatus": "terminal",
+    "dispatchOutcome": "completed",
+    "settledChargeCount": 1,
+    "engineReported": "ended",
+    "engineProcessAlive": true,
+    "boxDecision": "accepted"
+  }
+}

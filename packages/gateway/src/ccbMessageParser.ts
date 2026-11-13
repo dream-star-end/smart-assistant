@@ -422,6 +422,8 @@ export class CcbMessageParser {
   public pendingToolCalls = 0
   /** Assistant text accumulated in this turn */
   public assistantBuf = ''
+  /** A platform credential diagnostic is not model-produced answer text. */
+  private suppressedAuthorityDiagnostic = false
   /** Main-agent thinking text accumulated in this turn from thinking_delta
    *  events without semantic truncation.
    *  Subagent thinking (parentToolUseId set) is excluded — it lives inside
@@ -1355,6 +1357,13 @@ export class CcbMessageParser {
         // Native raw protocol retention remains lossless; model text is untouched.
         const text = stripUpstreamRetryHint(c.text)
         if (!text) continue
+        if (/\bMODEL_AUTHORITY_INVALID\b/.test(text)) {
+          // This branch is restricted to SDK synthetic API-error messages.
+          // Never remove real streaming text that merely discusses this code,
+          // including a partial answer sharing the same segment.
+          if (!parentToolUseId) this.suppressedAuthorityDiagnostic = true
+          continue
+        }
         // Only accumulate into assistantBuf for main-agent turns (mirrors
         // _handleStreamEvent's text_delta rule). Subagent error text is
         // still surfaced to the UI but not merged into the parent's buffer.
@@ -1585,7 +1594,9 @@ export class CcbMessageParser {
     const apiErrorStatus = (msg as { api_error_status?: unknown }).api_error_status
     const retryHint = isError && rawErrorDetail && (apiErrorStatus === undefined || apiErrorStatus === 429)
       ? decodeUpstreamRetryHint(rawErrorDetail) : undefined
-    const errorDetail = rawErrorDetail === undefined ? undefined : stripUpstreamRetryHint(rawErrorDetail)
+    const errorDetail = isError && this.suppressedAuthorityDiagnostic
+      ? 'MODEL_AUTHORITY_INVALID'
+      : rawErrorDetail === undefined ? undefined : stripUpstreamRetryHint(rawErrorDetail)
     const staleResumeId =
       Array.isArray(errorsField) &&
       errorsField.some(

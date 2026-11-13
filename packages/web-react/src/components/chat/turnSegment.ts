@@ -14,6 +14,7 @@
 import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import { hasVisibleAssistantContent } from "../../lib/assistantVisibleContent";
 import type { ChatMessage } from "../../lib/chat/model";
+import { registerStoppedNarrationSource } from "../../lib/chat/stoppedNarrationSource";
 import { errorPresentation, isCollapsedAnchorTerminalEvidence } from "../../lib/chat/render";
 
 /** 当前活跃段的起始下标(最后一条 user 消息的下一条;无 user 消息 → 0)。 */
@@ -292,6 +293,7 @@ export function splitStoppedNarration(messages: ChatMessage[]): ChatMessage[] {
       ts: stoppedAt > 0 ? stoppedAt : m.ts,
       ...(m._timelineUnitKey ? { _timelineUnitKey: `${m._timelineUnitKey}:stopped` } : {}),
     };
+    registerStoppedNarrationSource(stop, m);
     const at = end - 1;
     moved.set(at, [...(moved.get(at) ?? []), stop]);
   }

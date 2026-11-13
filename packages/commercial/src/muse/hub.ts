@@ -62,6 +62,7 @@ import {
   MuseError,
   type MuseJobSpec,
   type MuseKind,
+  type MuseSourceRef,
   QUEUE_MAX,
   QUEUE_WAIT_MS,
   SNAPSHOT_ID_RE,
@@ -181,6 +182,39 @@ export interface MuseJobView {
 }
 
 /** What the bridge receives from /poll. */
+function canFallbackBoxExecToHatch(input: {
+  /** The submit call was started (it may have reached the relay even without a reply). */
+  submitAttempted: boolean
+  /** The relay answered submit with a job id: it is generating, whatever fails afterwards. */
+  relaySubmitted: boolean
+  museErr: MuseError | null
+  message: string
+}): boolean {
+  // Status/fetch failures after an accepted submit (relay restart, egress/guard change mid-poll)
+  // must never re-run the job on hatch: Muse is already generating it (Gemini r2 NEW-1).
+  if (input.relaySubmitted) return false
+  if (input.submitAttempted) {
+    // The submit call left. Only failures proven to precede the relay may fall back: the CLI's
+    // own "relay unreachable" answer (connect/send failed, nothing was queued) or a transport
+    // guard failure (raised before the Exec request is sent).
+    return (
+      input.museErr?.code === 'MUSE_BRIDGE_OFFLINE' ||
+      /BOX_EXEC_ACCOUNT_GUARD_FAILED|BOX_EGRESS_CHANGED/.test(input.message)
+    )
+  }
+  // BOX_EXEC_INCOMPLETE / TIMEOUT / AFTER_EXIT can happen after the remote
+  // already accepted submit (missing terminal frame). Falling back would
+  // double-generate. Only treat clearly pre-submit reachability failures
+  // as hatch-fallback candidates.
+  if (/BOX_EXEC_INCOMPLETE|BOX_EXEC_TIMEOUT|BOX_EXEC_AFTER_EXIT/.test(input.message)) {
+    return false
+  }
+  if (input.museErr?.code === 'MUSE_BRIDGE_OFFLINE') return true
+  return /relay is down|not wired|ECONNREFUSED|BOX_EXEC_ACCOUNT_GUARD_FAILED|BOX_EGRESS_CHANGED/.test(
+    input.message,
+  )
+}
+
 export interface MuseWireJob {
   id: string
   nonce: string
@@ -240,6 +274,7 @@ export interface MuseBridgeHubOptions {
   /** OCV5-750 video backend; default 'hatch'. `$stateRoot/video-backend` overrides it live. */
   videoBackend?: MuseVideoBackend
   /** Resolves a per-job Box Exec transport for muse-exec-cli; absent = box path not wired. */
+  fallbackHatch?: boolean
   boxExecRunner?: () => Promise<BoxCliExecFn>
   boxExecPollMs?: number
   /** Backoff sleep for retried read-only relay calls (tests pass an instant one). */
@@ -317,6 +352,7 @@ export class MuseBridgeHub {
   private reservedTotal = 0
   private readonly reserved = new Map<string, number>()
   private readonly reservedByUser = new Map<string, { count: number; credits: bigint }>()
+  private readonly fallbackHatch: boolean
   private readonly configuredBackend: MuseVideoBackend
   private readonly boxExecRunner?: () => Promise<BoxCliExecFn>
   private readonly boxExecPollMs: number
@@ -363,6 +399,7 @@ export class MuseBridgeHub {
     this.now = opts.now ?? Date.now
     this.log = (opts.logger ?? rootLogger).child({ subsys: 'museBridge' })
     this.configuredBackend = opts.videoBackend ?? 'hatch'
+    this.fallbackHatch = opts.fallbackHatch === true
     this.boxExecRunner = opts.boxExecRunner
     this.boxExecPollMs = opts.boxExecPollMs ?? 5_000
     this.boxExecRetrySleep = opts.boxExecRetrySleep
@@ -568,6 +605,12 @@ export class MuseBridgeHub {
     }
     job.lastBeatAt = now
     return { cancel: false }
+  }
+
+  /** Source bytes are available only after the ack barrier, for this dispatch nonce. */
+  sourceFor(jobId: string, nonce: string, n: number): { data: Buffer; ref: MuseSourceRef } {
+    const source = this.source(jobId, nonce, n)
+    return { data: source.data, ref: { n, bytes: source.data.length, sha256: source.sha256, mime: source.mime } }
   }
 
   async putChunk(
@@ -1015,7 +1058,7 @@ export class MuseBridgeHub {
       id,
       userId,
       containerId,
-      spec,
+      spec: { ...spec },
       state: 'queued',
       nonce,
       durable,
@@ -1369,6 +1412,8 @@ export class MuseBridgeHub {
   }
 
   private async runBoxExec(job: HubJob): Promise<void> {
+    let submitAttempted = false
+    let relaySubmitted = false
     const nonce = job.nonce
     const live = () =>
       this.jobs.get(job.id) === job &&
@@ -1401,6 +1446,8 @@ export class MuseBridgeHub {
         pollMs: this.boxExecPollMs,
         retrySleep: this.boxExecRetrySleep,
         signal: job.abort?.signal,
+        onSubmitAttempt: () => { submitAttempted = true },
+        onSubmitted: () => { relaySubmitted = true },
       })
       if (!live()) return
       if (result.modeMismatch) {
@@ -1417,6 +1464,25 @@ export class MuseBridgeHub {
       if (!live()) return
       const museErr = err instanceof MuseError ? err : null
       const message = err instanceof Error ? err.message : 'box-exec failed'
+      // Reverse fallback is the selfhost/non-durable contract. A durable Box job's running
+      // checkpoint is irreversible here; never reinterpret it as an unsubmitted hatch job.
+      if (this.fallbackHatch && !job.durable && !job.movedToBox && !this.stopped &&
+          this.bridgeOnline() && this.queue.length + this.reservedTotal < this.queueMax &&
+          canFallbackBoxExecToHatch({ submitAttempted, relaySubmitted, museErr, message })) {
+        this.boxExecInflight.delete(job)
+        job.abort?.abort()
+        job.abort = undefined
+        job.via = 'hatch'
+        job.movedToBox = true // one transport switch only, even if the live backend flag changes
+        job.state = 'queued'
+        job.nonce = randomUUID()
+        job.queuedAt = this.now()
+        this.queue.push(job)
+        this.log.warn('muse_box_exec_fell_back_to_hatch', { jobId: job.id })
+        this.pump()
+        this.pumpBoxExec()
+        return
+      }
       this.log.warn('muse_box_exec_failed', { jobId: job.id, code: museErr?.code ?? null })
       this.finish(
         job,

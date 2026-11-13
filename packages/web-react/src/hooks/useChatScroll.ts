@@ -6,7 +6,7 @@
  */
 import { useRef, useMemo, useCallback, useEffect, useLayoutEffect } from "react";
 import { createStickToBottomController } from "../components/chat/stickToBottom";
-import { attachWheelFence } from "../components/chat/wheelFence";
+import { attachWheelFence, isScrollNavigationKey, type ScrollKeyEventLike } from "../components/chat/wheelFence";
 import { captureVisibleVirtualRowAnchor, restoreVisibleVirtualRowAnchor } from "../components/chat/archivePaging";
 import type { VisibleVirtualRowAnchor } from "../components/chat/archivePaging";
 import type { UseChatSocket } from "./useChatSocket";
@@ -76,10 +76,31 @@ export function useChatScroll({
     const anchor = archiveScrollAnchorRef.current;
     if (anchor) anchor.cancelled = true;
   }, []);
-  const markUserChatScroll = useCallback(() => {
-    stick.markUserIntent();
+  const pendingSendJumpRef = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: scrollRef is stable ref from App()
+  const scrollToBottomOnSend = useCallback(() => {
+    pendingSendJumpRef.current = true;
     cancelArchiveCorrection();
+    const el = scrollRef.current;
+    if (el) stick.jumpToBottom(el);
+    else stick.reset();
   }, [stick, cancelArchiveCorrection]);
+  const markUserChatScroll = useCallback(
+    (event?: ScrollKeyEventLike | { type: string }) => {
+      if (
+        event &&
+        "key" in event &&
+        typeof event.key === "string" &&
+        !isScrollNavigationKey(event as ScrollKeyEventLike)
+      ) {
+        return;
+      }
+      pendingSendJumpRef.current = false;
+      stick.markUserIntent();
+      cancelArchiveCorrection();
+    },
+    [stick, cancelArchiveCorrection],
+  );
   // Wheel / trackpad fence (see wheelFence.ts). The React `onWheel` above keeps
   // the zero-tolerance leave mark; the fence itself lives in native listeners so
   // begin and release share one ordering with the browser's scrollend.
@@ -88,7 +109,22 @@ export function useChatScroll({
     if (!el) return;
     return attachWheelFence(el, stick);
   }, [chatScrollParent, stick]);
+  // 容器高度收缩/展开（底部任务条、错误条、多行输入框伸缩）时，若用户原本就在跟随态则补齐贴底。
+  useEffect(() => {
+    const el = chatScrollParent;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let prevHeight = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const nextHeight = el.clientHeight;
+      if (nextHeight === prevHeight) return;
+      prevHeight = nextHeight;
+      if (stick.following.current) stick.scrollToBottom(el);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [chatScrollParent, stick]);
   const beginDirectUserChatScroll = useCallback(() => {
+    pendingSendJumpRef.current = false;
     stick.beginDirectManipulation();
     cancelArchiveCorrection();
   }, [stick, cancelArchiveCorrection]);
@@ -124,6 +160,7 @@ export function useChatScroll({
     const el = scrollRef.current;
     if (!el) return;
     stick.onScroll(el);
+    if (!stick.following.current) pendingSendJumpRef.current = false;
     const anchor = archiveScrollAnchorRef.current;
     if (
       anchor && !anchor.cancelled && !anchor.restoring &&
@@ -147,20 +184,37 @@ export function useChatScroll({
       settleArchiveAnchor();
     };
   }, [activeId, scrollToChatBottom, settleArchiveAnchor, stick]);
-  // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
-  // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
-  // layout 阶段贴底,避免普通 DOM 时间线先画出旧顶部再跳到底部。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: messages/streamText/chat.version/wsSending 是内容变更触发器;stickToBottomRef.current 是稳定对象上的 getter,执行时现读。
+  const activeSending = demo ? sending : wsSending;
+  const wasSendingRef = useRef(activeSending);
+  // 内容变更跟随:demo 走 messages/streamText/sending,真实路径走 version/wsSending。
+  // 刚发送那一次显式恢复粘滞并跳底;回合完成(sending true→false)过程块折叠后补一帧对齐新交付底部。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 内容与发送态变更触发器;scrollRef/stickToBottomRef 均为稳定句柄。
   useLayoutEffect(() => {
+    const turnJustCompleted = wasSendingRef.current && !activeSending;
+    wasSendingRef.current = activeSending;
+    if (pendingSendJumpRef.current) {
+      pendingSendJumpRef.current = false;
+      const el = scrollRef.current;
+      if (el) stick.jumpToBottom(el);
+      else stick.reset();
+      return;
+    }
     if (!stickToBottomRef.current) return;
     scrollToChatBottom();
-  }, [messages, streamText, chat.version, wsSending, scrollToChatBottom]);
+    if (turnJustCompleted && typeof requestAnimationFrame === "function") {
+      const raf = requestAnimationFrame(() => {
+        if (stick.following.current) scrollToChatBottom();
+      });
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [messages, streamText, chat.version, wsSending, sending, activeSending, scrollToChatBottom, stick]);
 
   // 归档「查看更早历史记录」:记录点击时屏幕里真实可见的消息行。前插渲染后持续把
   // 该行恢复到原位置；底部仍在增长的实时 Agent 响应不会污染这次校正。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); archiveRequestTokenRef, archiveScrollAnchorRef, scrollRef, setArchiveError, setArchiveLoading, sockRef are App useState setter/useRef passed in, stable
   const onLoadOlderHistory = useCallback(async () => {
     if (demo || !activeId) return;
+    pendingSendJumpRef.current = false;
     stick.following.current = false;
     settleArchiveAnchor();
     const token = ++archiveRequestTokenRef.current;
@@ -312,6 +366,7 @@ export function useChatScroll({
     markUserChatScroll,
     onChatScroll,
     onLoadOlderHistory,
+    scrollToBottomOnSend,
     stickToBottomRef,
   };
 }

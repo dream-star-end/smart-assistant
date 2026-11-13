@@ -12,8 +12,9 @@
   委派回调 dlgcb-、租约回调 lsc- 单独计数，不进 H，也不进恢复比的分子。
 
 W1
-  停止命中已结束回合：turn_control_requests.kind='stop' 且 error_code='TURN_NOT_ACTIVE'，
-  分母是同一窗口、同一人群的 web 停止请求。比率 = not_active / stops。
+  停止命中已结束回合：turn_control_requests.kind='stop' 且 error_code='TURN_ALREADY_ENDED'，
+  仅 Master 的 PG exact dispatch 终态证据确认。分母是同一窗口、同一人群的 web 停止请求。
+  TURN_NOT_ACTIVE 单列为历史 runtime miss，包含准入前未命中，不作为已结束证据。
   切后台首绘：product_friction_events.code='FIRST_TEXT_PAINT_AFTER_BACKGROUND' 的
   latency_ms，用 percentile_cont（p50 / p95）。没有 latency 的事件计入 n，但不进分位。
   空白视口：code LIKE 'TIMELINE_BLANK%' 的事件次数（web）。
@@ -624,7 +625,8 @@ SELECT json_build_object(
         "stop": f"""
 SELECT json_build_object(
   'stops', count(*),
-  'turn_not_active', count(*) FILTER (WHERE error_code = 'TURN_NOT_ACTIVE')
+  'turn_not_active', count(*) FILTER (WHERE error_code = 'TURN_NOT_ACTIVE'),
+  'turn_already_ended', count(*) FILTER (WHERE error_code = 'TURN_ALREADY_ENDED')
 )
 FROM turn_control_requests
 WHERE kind = 'stop' AND {created} AND {user} AND session_id ~ '^web';
@@ -888,6 +890,7 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
     stop = sql_results.get("stop")
     if _failed(stop) or not isinstance(stop, dict):
         stop_section = stop if _failed(stop) else {"error": "missing"}
+        ended_stop_section = stop_section
     else:
         stops = int(stop.get("stops") or 0)
         not_active = int(stop.get("turn_not_active") or 0)
@@ -896,6 +899,15 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
             "turn_not_active": not_active,
             "ratio": ratio(not_active, stops),
             "display": fmt_ratio(not_active, stops),
+            "note": "历史 runtime miss，包含准入前未命中；不是已结束证据。",
+        }
+        already_ended = int(stop.get("turn_already_ended") or 0)
+        ended_stop_section = {
+            "stops": stops,
+            "turn_already_ended": already_ended,
+            "ratio": ratio(already_ended, stops),
+            "display": fmt_ratio(already_ended, stops),
+            "note": "仅 Master 的 PG exact dispatch 终态证据确认；与历史 runtime miss 分开计数。",
         }
     paint = sql_results.get("paint")
     gap = sql_results.get("frame_gap")
@@ -964,6 +976,7 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
             "log_files": None if not log_stats else log_stats.get("log_files"),
         },
         "w1": {
+            "stop_turn_already_ended": ended_stop_section,
             "stop_turn_not_active": stop_section,
             "first_text_paint_after_background": paint,
             "blank_viewport": sql_results.get("blank"),
@@ -1050,14 +1063,26 @@ def render_markdown(report: dict) -> str:
     w1 = report.get("w1") or {}
     lines.append("## W1")
     lines.append("")
+    stop = w1.get("stop_turn_already_ended")
+    lines.append("### 停止请求命中已结束回合（TURN_ALREADY_ENDED）")
+    lines.append("")
+    if _failed(stop):
+        lines.append("查询失败：" + str(stop.get("error")))
+    elif isinstance(stop, dict):
+        lines.append(
+            f"比率 {stop.get('display')}。停止请求 {stop.get('stops')}，其中 TURN_ALREADY_ENDED {stop.get('turn_already_ended')}。"
+            f"{stop.get('note')}"
+        )
+    lines.append("")
     stop = w1.get("stop_turn_not_active")
-    lines.append("### 停止请求命中已结束回合（TURN_NOT_ACTIVE）")
+    lines.append("### 停止请求历史 runtime miss（TURN_NOT_ACTIVE）")
     lines.append("")
     if _failed(stop):
         lines.append("查询失败：" + str(stop.get("error")))
     elif isinstance(stop, dict):
         lines.append(
             f"比率 {stop.get('display')}。停止请求 {stop.get('stops')}，其中 TURN_NOT_ACTIVE {stop.get('turn_not_active')}。"
+            f"{stop.get('note')}"
         )
     lines.append("")
     lines.append("### 切后台回来后首绘（FIRST_TEXT_PAINT_AFTER_BACKGROUND）")

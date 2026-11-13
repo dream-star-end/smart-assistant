@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 /**
  * OCV5-180 B1 — exact-owner late delegate completion 回归。
  *
@@ -623,7 +624,7 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
 
 // ── 3. B-R2-1 controlled sink: T1 drain/seal → sink pending → child完成 → T2 ──
 
-class FakeCcbRunner extends EventEmitter {
+class FakeCcbRunner extends MinimalPrivacyRunner {
   lastActivityAt = Date.now()
   isRunning = true
   consultTurnBinding:
@@ -642,14 +643,20 @@ class FakeCcbRunner extends EventEmitter {
   setSubmitHandler(onSubmit: (runner: FakeCcbRunner) => void | Promise<void>): void {
     this.submitHandler = onSubmit
   }
-  async start(): Promise<void> {}
+  async start(): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+  }
   interrupt(): boolean {
     return false
   }
-  async shutdown(): Promise<void> {}
+  async shutdown(): Promise<void> {
+    this.isRunning = false
+  }
   clearSessionId(): void {}
   async waitForOutputDrain(): Promise<void> {}
   async submit(): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
     await this.submitHandler(this)
   }
   text(text: string): void {

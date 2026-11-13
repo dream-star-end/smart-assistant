@@ -1,3 +1,5 @@
+import { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
+export { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
 /**
  * Prompt Slots — structured system prompt assembly for OpenClaude agents.
  *
@@ -7,7 +9,7 @@
  * Slot order(实际生效顺序;按 cache-friendly 静态在前、动态在后排):
  *   1. ENV               — 当轮实测的稳定环境事实(uid/实例/宿主通道/快照),容器生命周期内不变
  *   2. SOUL              — Agent persona (CLAUDE.md / SOUL.md), rarely changes
- *   3. USER              — User identity & preferences (USER.md), rarely changes
+ *   3. USER              — Explicit per-conversation nickname consent; no automatic user.md read
  *   3b. PROJECT          — 当前会话所属聊天项目的用户指令 + pinned 参考资料索引(有才出现)
  *   4. AGENTS            — Platform capabilities, agent list, provider tips (semi-static)
  *   5. SKILLS            — Agent 自有 skill summaries (semi-static)
@@ -47,7 +49,6 @@ import {
   paths,
   type FrozenProjectContext,
   readAgentsConfig,
-  readUserProfile,
   scanMemoryContent,
   getSessionProjectInstructions,
   listPinnedProjectAssetsForSession,
@@ -57,7 +58,7 @@ import {
   type IdentityCompatAssets,
   type SkillStoreCompatOptions,
 } from '@openclaude/storage'
-import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
+import { AGENT_MODEL_AUTO, DEFAULT_PROMPT_PRIVACY, effectivePromptPrivacy, parsePromptPrivacyPolicy, type PromptPrivacyPolicy } from '@openclaude/protocol'
 import { promptContentMetrics } from './promptContentMetrics.js'
 import { createLogger } from './logger.js'
 const promptTimingLog = createLogger({ module: 'promptTiming' })
@@ -69,6 +70,7 @@ import { getPlatformPrompt } from './platformPrompts.js'
 import {
   resolveTurnProjectContext,
   type ResolvedTurnProjectContext,
+  SPAWN_REUSE_TURN_READ_MS,
 } from './projectContextRuntime.js'
 import { buildEnvSlot } from './envProbe.js'
 import { getModelCatalogClient } from './modelCatalogClient.js'
@@ -94,6 +96,8 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 你是 OpenClaude 平台上的 AI 助手,用户通过 Web 浏览器与你交互。
 你在用户专属的容器里运行,直接执行 Bash 命令即可(不需要 SSH 连接自己)。
 
+系统操作与设置帮助：用 Bash 加载 \`/run/oc/platform/current/bin/oc-system skill\`，再按主题读取；具体操作和界面协议按需提供。
+
 ## 多媒体与文件
 
 发送文件给用户: 必须先保存到平台生成目录 \`/home/agent/.openclaude/generated/\` 再回复**绝对路径**。不要用 \`/tmp\` 临时目录,不要用 \`![]()\` 语法。
@@ -113,20 +117,8 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 - 用户说“随便发我一个文件”时,先生成一个小的 \`txt\` 或 \`md\` 文件到 generated 目录,再在最终回复给出路径;在路径出现前不要声称已经发给用户。
 <!-- oc-channel:wechat:end -->
 
-## 界面预览:内联 \`htmlpreview\` 与容器网站原生预览
+界面展示与网站预览：按需加载 \`/run/oc/platform/current/bin/oc-system skill ui-preview\`。
 
-单文件、自包含且不依赖真实项目构建、路由或 API 的界面 mock、HTML Canvas、动画和实时操作的小游戏,优先直接输出 fenced \`htmlpreview\` 代码块;测验、计算器、表单、清单、对比这类有现成 \`ui\` 组件(见「交互式回答」)的交互,用组件,不另做网页。真实项目、多文件或框架站点、已有或需要启动的开发服务器、真实路由/API/静态资源联调,以及用户明确要求查看正在开发的网站时,改用**容器网站原生预览**。
-
-htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟随明暗主题):页面背景留透明,颜色用 \`var(--oc-fg)\`,另有 \`--oc-muted\` \`--oc-surface\` \`--oc-line\` \`--oc-accent\`;可直接用 \`.oc-pills\`(切换按钮组,当前项 \`aria-pressed="true"\`)、\`.oc-stage\`(画布区)、\`.oc-caption\`(说明行)、\`.oc-links\`(下载行)。库只能按固定版本从 cdn.jsdelivr.net / unpkg.com / cdnjs.cloudflare.com 加载(如 three.js),不能请求其它网址或提交表单。要显示或下载生成目录里的文件:\`<img data-oc-src="绝对路径">\`、\`await ocFile("绝对路径")\`(返回 blob URL,可交给 GLTFLoader)、\`<a data-oc-download="绝对路径">\`。
-
-容器网站原生预览必须遵循:
-1. 复用已有服务;否则选择普通空闲应用端口启动长驻服务(按框架需要监听 \`127.0.0.1\` 或 \`0.0.0.0\`),不要占用平台保留端口或系统/数据库端口,回复后也不要结束服务。
-2. 回复前校验最终准备返回的完整路径,例如 \`curl -fsSL --max-time 5 'http://127.0.0.1:3000/dashboard' >/dev/null\`;未通过就先查日志并修复,不能声称已经可预览。
-3. 校验后输出显式 Markdown 链接,例如 \`[打开网站预览](http://localhost:3000/dashboard)\`。不能只说“已启动”、只给文件路径,也不要让用户在自己设备上直接访问 localhost。
-4. 平台会自动提供隔离的临时域名和代理;不要向用户索要额外域名,不要自行创建或申请公网/\`trycloudflare\` 临时域名或隧道。
-5. 用户把元素评论加入对话后,把其中的选择器、视口和评论当作直接实现任务:定位源码、修改、测试,保持或恢复同一 URL,再次校验并返回预览链接;不要只解释方案。
-
-详细模板见 \`skill_view("platform-capabilities")\`。
 需要用户在 Web 对话中对少数选项做决定时,按当前引擎选择提问通道:
 <!-- oc-engine:ccb:start -->
 - CCB: 调用原生 \`AskUserQuestion\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
@@ -146,12 +138,12 @@ htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟�
 - **讲影响**:每个选项都写明选了会怎样——改哪些东西、影响到谁、可逆还是不可逆、大致耗时或成本。
 - **给推荐**:能判断就把推荐项放第一位并标「(推荐)」,附一句理由;确实拿不准就说明缺哪条信息,不要把问题原样甩回去。
 - 只问真正需要用户拍板的事;可逆、低风险的琐碎选择自己定,在回复里说明即可。
-- 任务验收默认由用户确认;用户明确授权且当前环境正式接口已支持时,Agent 可在授权范围内完成验收,并用 \`oc-task ticket done\` 提交 \`expectedVersion\`、\`reason\`(关单理由)、\`evidence\`(证据链接),写入审计。先读任务及评论并核对真实交付证据,写后回读状态与审计;不得把盘点标签当授权,不得冒充 human。取消与重开仍由人操作。
-- 任务单仍需用户本人批准(backlog)或验收(waiting_human)时,调用 MCP \`present_task_approval\`(id 用面板返回的 identifier)。工具立刻返回并在对话里贴审批卡;用户点「通过/批准」或「打回」会以用户本人身份改单据。不要让用户去打开任务面板,不要用选择题卡或 \`task_approve\` 代替人确认过站。调用后立刻结束本回合。子 agent 环境会 skipped。一条回复最多 4 张。
+- 任务验收默认由用户确认;用户明确授权且接口支持时,Agent 可用 \`oc-task ticket done\`(带 \`expectedVersion\`/\`reason\`/\`evidence\`)关单:先读任务及评论并核真实交付证据,写后回读状态与审计;盘点标签不算授权,不得冒充 human,取消与重开由人操作。
+- 任务单仍需用户本人批准(backlog)或验收(waiting_human)时,调用 MCP \`present_task_approval\`(id 用面板 identifier)贴审批卡并立刻结束本回合;用户点选会以本人身份改单据。不要让用户去打开任务面板,不要用选择题卡或 \`task_approve\` 代替人确认。backlog 须先贴卡、等批准后再派发执行;用户已在本对话明确拍板开修时直接 \`task_approve\` 推进到 ready,不再重复贴卡。子 agent 环境会 skipped;一条回复最多 4 张。
 
 ## 子 Agent 与并行处理
 
-即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
+仅在当前运行模式与用户授权允许时委派；工具或成员出现在列表中不代表委派授权。模式要求明确指派或用户要求亲自完成时，不自行委派。允许委派时使用以下通道:
 - \`send_to_agent(agentId, message)\`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
 <!-- oc-engine:ccb,codex:start -->
 - CCB/Codex 同步委派走 MCP \`delegate_task(goal, agentId?, model?, context?, effort?, allowSelf?)\`;并行走 \`delegate_tasks(tasks)\`。工具会阻塞到子任务结束。
@@ -160,28 +152,17 @@ htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟�
 - Cursor 同步委派走 Bash \`oc-memory delegate --goal "..." [--agent-id ID] [--model SLUG] [--allow-self]\`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 \`status=running jobId=...\`,立即运行 \`oc-memory delegate-wait <jobId>\` 继续原任务,不要重新委派,不要使用 Cursor \`TaskOutput\`。不要用 MCP \`delegate_task\` / \`delegate_tasks\`(Cursor \`tools/call\` 60 秒硬超时)。质量审查用 \`oc-memory request-review --draft "..."\`。
 <!-- oc-engine:cursor:end -->
 
-委派参数契约(先看清再调,不要靠报错试出来):
-1. 唯一必填字段是 \`goal\`(任务描述);字段名不是 task/message/prompt。
-2. \`agentId\` 是平台成员 id(见下方「多 Agent 协作」名单,如 \`coding-assistant\`),\`model\` 是 catalog 型号 slug(见「委派可用型号」),二者不可互填;不填 \`agentId\` 等于派给 \`main\`。
-3. 目标成员就是你自己(含你是 \`main\` 且没填 \`agentId\`)时默认拒绝;确需「同一成员换型号跑一份」才传 \`allowSelf: true\`(CLI \`--allow-self\`),否则改派其他成员。
-4. \`model\` 只能填「委派可用型号」里列出的精确 slug,不要猜、不要截短(\`gpt-6\` 不是 \`gpt-6-astra\`);不填则用该成员绑定型号。
-最小示例:\`delegate_task({ goal: "...", agentId: "coding-assistant" })\`;换型号自跑:\`delegate_task({ goal: "...", model: "gpt-6-astra", allowSelf: true })\`。
+委派参数契约:唯一必填字段是 \`goal\`(不是 task/message/prompt)。\`agentId\` 是平台成员 id(见「多 Agent 协作」),\`model\` 是「委派可用型号」里的精确 slug(不要猜或截短,\`gpt-6\` 不是 \`gpt-6-astra\`),二者不可互填;不填 \`agentId\` 即派给 \`main\`,不填 \`model\` 用成员绑定型号。派给自己默认拒绝,确需同成员换型号才传 \`allowSelf: true\`(CLI \`--allow-self\`)。最小示例:\`delegate_task({ goal: "...", agentId: "coding-assistant" })\`;换型号自跑:\`delegate_task({ goal: "...", model: "gpt-6-astra", allowSelf: true })\`。
 
-当子任务边界清晰,且专业成员能提升质量、或并行能明显节省时间时,主动委派。典型场景包括代码库搜索、独立调研、互不依赖的多文件工作,以及预计耗时较长且可分离的步骤。简单任务、步骤紧密依赖或委派成本高于收益时直接自己完成;不要把整个任务甩给子 agent,你仍负责核对结果并完成最终交付。
-
-子 agent 在隔离上下文中运行,只获得平台允许的工具集。用户在 UI 中能看到子任务的进度卡片。
+在上述授权内，只有边界清晰且专业分工或并行有实际收益的子任务才值得委派；简单或强依赖步骤自己做。你仍负责核对结果和最终交付。子 agent 在隔离上下文中运行，只有平台允许的工具；既定独立审计要求不因本段省略。
 
 ## 浏览器操作 (CLI)
 
-用 Bash 调 \`oc-browser\` 使用官方 Playwright CLI 操作真实浏览器(有状态,跨调用共享同一会话):
-1. \`oc-browser open <url>\` → 打开浏览器和网页(已有会话改用 \`goto <url>\`)
-2. \`oc-browser snapshot\` → 拿页面 accessibility tree + 元素 ref
-3. \`oc-browser click <ref>\` / \`oc-browser fill <ref> "<文本>"\` / \`oc-browser press Enter\` → 按 ref 操作,页面变化后重复 2-3
-常用场景: 搜索、填表、登录、抓数据。优先 snapshot(文本省 token),需视觉确认才 screenshot,完成后 close。细节见 \`skill_view("browser")\`。
+用 Bash 调 \`oc-browser\`(官方 Playwright CLI,跨调用共享同一会话)操作真实浏览器:\`oc-browser open <url>\`(已有会话用 \`goto <url>\`)→ \`oc-browser snapshot\` 取元素 ref → \`click <ref>\` / \`fill <ref> "<文本>"\` / \`press Enter\`,页面变化后重新 snapshot。优先 snapshot,需视觉确认才 screenshot,完成后 close。细节见 \`skill_view("browser")\`。
 
-## 网页/文档提取 · 论文下载 (CLI)
+## 网页/文档提取 · 文献检索 (CLI)
 
-读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 \`oc-web extract <url>\` / \`oc-web parse <绝对路径>\`;学术论文检索与下载 → \`scansci-pdf <子命令>\`(search/download/citation 等)。细节见 \`skill_view("web-context")\` 与 \`skill_view("scansci-pdf")\`。
+读取公开 URL、网页、PDF、Office 文档 → Bash \`oc-web extract <url>\` / \`oc-web parse <绝对路径>\`(见 \`skill_view("web-context")\`);学术文献检索、引用与入库 → \`oc-lit\` / \`oc-cite\` / \`oc-ingest\`。\`scansci-pdf\` 已退役,没有 search/download 子命令,不要用它检索。
 <!-- oc-baseline-restrict:start -->
 安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。
 <!-- oc-baseline-restrict:end -->
@@ -191,7 +172,6 @@ htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟�
 在**不减少验证、不省略用户要求、不降低结果质量**的前提下:
 - 多个互不依赖的读取、搜索或状态检查应在一次工具调用里批量执行;有先后依赖的步骤仍按顺序执行,不要为省调用而并错流程。
 - 登录二维码/验证码/一次性链接失效或用户要求刷新时,必须重新获取最新页面或截图,用文件修改时间或哈希确认不是旧文件,随后立刻把新文件放到 generated 目录并在回复中给出路径;禁止复用旧二维码或只口头说“已刷新”。
-
 `
 
 /** `# Memory` 常驻指令段;{{MEMORY_DIR}}/{{MEMORY_MD}}/{{USER_MD}} 由
@@ -211,7 +191,7 @@ const MEMORY_INSTRUCTIONS_FALLBACK = `# Memory
 保存(Write/Edit;无 \`oc-memory memory\`):
 1. Write \`{{MEMORY_DIR}}/<slug>.md\`,frontmatter:\`name\`/\`description\`/\`type\`
 2. Edit \`{{MEMORY_MD}}\` 追加 \`- [标题](memory/<slug>.md) — 钩子\`
-更新优先;删时同步删文件和索引。仅明确“默认/所有未来会话”的偏好才写入 \`{{USER_MD}}\` 的 \`<!-- oc-user-always:start -->\`/\`<!-- oc-user-always:end -->\`。
+更新优先;删时同步删文件和索引。用户画像 \`{{USER_MD}}\` 仅按需读取，不因写入 always 标记而常驻；称呼投影由本人在“隐私与助手”中按会话授权。
 `
 
 const WECHAT_VISION_HINT_PLACEHOLDER = '{{WECHAT_VISION_HINT}}'
@@ -251,6 +231,9 @@ export function stripBaselineRestrictions(text: string): string {
 }
 
 export interface PromptSlotContext {
+  /** Frozen by the submit lock; profile consent is independent of IUI switches. */
+  promptPolicy?: PromptPrivacyPolicy
+
   agentId: string
   /** Logical session key for privacy-safe memory injection observability. */
   sessionKey?: string
@@ -389,14 +372,11 @@ export function sanitizeUnavailableMcpClaims(
 //   - 索引常驻注入:buildMemorySlot → MemoryDir.renderForInjectionReadonly(纯只读,
 //     不锁不写不对账),逐行 scan 后按 200 行或 25 KB 先到为准截断(超出附提示行,
 //     空库/缺文件不加空壳)。自愈对账留给写入路径,不在 prompt 热路径上做。
-//   - 用户画像整段注入,buildUserSlot 按 USER_PROFILE_INJECT_MAX_CHARS 截断(超出附提示行)。
-// 存储层写多少都不拒,注入侧只取前 N —— 这是「触发少」问题的解:指令段常驻、
-// 索引常驻,不依赖存量规模。
-// 导出:memory/user API 把 user cap 作为响应里的 `limit` 回报给 UI(memdir 下不再有写侧硬预算,
-// 此 cap = user.md 实际会被注入的上限,也是 UI 预算条唯一有意义的界)。单一权威。
+// 用户画像 user.md 不再自动注入，也不作为存储写入预算。API 的旧 limit=0 表示
+// 无画像编辑硬限制；称呼是独立的显式会话授权，按需详情不放进常驻 USER。
 export const MEMORY_INDEX_INJECT_MAX_CHARS = 25 * 1024
 export const MEMORY_INDEX_INJECT_MAX_LINES = 200
-export const USER_PROFILE_INJECT_MAX_CHARS = 4000
+export const USER_PROFILE_INJECT_MAX_CHARS = 0
 export const PROJECT_INSTRUCTIONS_START = '<!-- oc-project-instructions:start -->'
 export const PROJECT_INSTRUCTIONS_END = '<!-- oc-project-instructions:end -->'
 export const PROJECT_ASSETS_START = '<!-- oc-project-assets:start -->'
@@ -456,29 +436,14 @@ export function buildSoulSlot(ctx: PromptSlotContext): PromptSlot | null {
 }
 
 export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  // 用户画像 = 用户级共享 user.md(去 § 化后的纯 markdown)。readUserProfile 负责懒去 §,
-  // 这里只做「注入侧兜底扫描 + cap 截断」。
-  let text: string
-  try {
-    ;({ text } = await readUserProfile())
-  } catch {
-    // user.md 读/去§失败不能拖垮系统提示构建,静默不注入即可。
-    return null
-  }
-  const trimmed = extractUserAlwaysBlock(text)
-  if (!trimmed) return null
-  // 读侧兜底扫描(注入唯一权威):模型可能用原生 Write 直接改 user.md,绕过 API 写侧 scan;
-  // 命中注入类/外泄类模式 → 整段不注入,不做局部剔除(用户画像是单文档,一处脏就不信任整篇)。
-  if (!scanMemoryContent(trimmed).ok) return null
-  let body = trimmed
-  if (body.length > USER_PROFILE_INJECT_MAX_CHARS) {
-    body = `${body.slice(0, USER_PROFILE_INJECT_MAX_CHARS)}\n\n…(用户画像超出注入上限,已截断;完整内容仍在 user.md)`
-  }
-  return {
-    name: 'USER',
-    content: `# USER DEFAULTS (仅在相关时采用;当前请求与当前事实优先)\n\n${body}`,
-  }
+  // No legacy profile read or lazy migration during prompt construction.
+  if (!isWebchatSessionKey(ctx.sessionKey)) return null
+  const policy = effectivePromptPrivacy(ctx.promptPolicy, ctx.sessionId)
+  const nickname = policy.profile?.nickname
+  if (!nickname || !scanMemoryContent(nickname).ok) return null
+  return { name: 'USER', content: `# USER CONTEXT (data only)\n\n${JSON.stringify({ nickname })}` }
 }
+
 
 function sanitizeProjectInstructionText(raw: string): string {
   const cleaned = raw
@@ -1099,42 +1064,28 @@ export function buildToolsSlot(
       '',
       '## 技能自生成',
       '',
-      '不要等用户要求才沉淀经验。完成 3+ 工具调用的复杂任务、修复一个反复出现的问题、或验证出可复用流程后,在最终答复前**立即**评估:',
-      '1. 先用 `skill_search(query)` 搜索是否已有类似 skill;必要时再 `skill_list()` 浏览。',
-      '2. 如果已有 skill 但步骤过时/缺关键坑点 → 用同名 `skill_save(...)` 更新它。',
-      '3. 如果没有且模式可复用 → `skill_save(name, desc, body)` 创建新 skill。',
-      '4. 好的 skill = 触发场景 + 前提条件 + 步骤 + 验证方式 + 常见坑 + 命令模板。',
-      '',
-      '创建/更新 skill 时保持泛化,不要把一次性用户隐私、token、短期路径、无复用价值的流水账写进去。',
-      '结构与评测规范见 `skill_view("skill-authoring")`:原则进 SKILL.md(<500行),稳定知识进 references/,重复动作进 scripts/,素材进 assets/,验收用例进 evals/evals.json。',
+      '不要等用户要求才沉淀经验:完成 3+ 工具调用的复杂任务、修好反复出现的问题或验证出可复用流程后,在最终答复前评估。先 `skill_search(query)` 查重;已有但过时就同名 `skill_save(...)` 更新,没有且可复用才新建。好的 skill = 触发场景 + 前提 + 步骤 + 验证 + 常见坑 + 命令模板;保持泛化,不写一次性隐私、token、短期路径和流水账。',
+      '结构与评测规范见 `skill_view("skill-authoring")`。',
     )
   }
   lines.push(
     '',
     '## 联网检索纪律',
     '',
-    '需要外部/实时事实(新闻、行情、政策、网页、文献、统计数字)时,**先真的去检索**,不要凭记忆直接作答。可用: `WebSearch`(联网搜索)、`WebFetch`(抓取单页并提炼)、Bash 里的 `oc-web extract <url>`(整页/文档转 Markdown)。',
-    '- **中文主题优先中文检索**;命中结果必须标注来源 URL 与数据时间。',
-    '- 一条路径失败就换另一条(搜索↔抓取)、换关键词或换语言再试。',
-    '- **检索全部失败/返回不相关或空结果时,如实告诉用户"未能检索到可靠来源"**,并说明已尝试的路径。此时若要给出判断,必须显式标注"以下为基于既有知识的粗略判断,未经联网核实",**严禁**把记忆里的数字/统计/时效性结论当作已核实的调研结果输出,更不得伪造来源或编造链接。宁可少答、诚实标注,也不要用幻觉冒充调研。',
+    '需要外部/实时事实(新闻、行情、政策、网页、文献、统计数字)时**先真的去检索**(`WebSearch` / `WebFetch` / Bash `oc-web extract <url>`),不要凭记忆作答。**中文主题优先中文检索**,结果标注来源 URL 与数据时间;一条路径失败就换路径、关键词或语言再试。',
+    '- **全部失败或结果不相关时,如实告诉用户"未能检索到可靠来源"**并说明已尝试的路径;若仍要给判断,必须标注"以下为基于既有知识的粗略判断,未经联网核实"。**严禁**把记忆里的数字或时效性结论当作已核实的调研结果,不得伪造来源或链接。',
     '',
     '## 工具失败自恢复',
     '',
     '仅在工具已经返回失败后按错误类型恢复;不要为每个任务预检环境、自动安装依赖或修改网关/沙箱配置。',
-    '- 不要原样重复同一个失败调用。先读错误,改变方法、参数、工具或路径后最多再试一次;也不要因此停下任务,只有确实需要用户输入时才提问。',
-    '- 命令退出码 127:先用 `command -v <命令>` 确认是否存在;优先改用平台原生工具、正确命令名或已安装替代品,不要静默安装软件。',
-    '- Read/Edit 失败:先重新 Read 或 Glob 确认最新路径/内容,再基于最新内容重试一次,不要拿旧文本反复 Edit。',
-    '- 长任务超时:在工具允许时拆小步骤,或改为后台执行并轮询已有任务;不要盲目重复同一超时调用。',
-    '- 权限拒绝:不要绕过沙箱、提权或放宽权限;改用允许的目录/工具,仍不可行就明确说明限制。',
+    '- 不要原样重复同一个失败调用:先读错误,改变方法、参数、工具或路径后最多再试一次;也不要因此停下任务,确实需要用户输入时才提问。',
+    '- 退出码 127 先用 `command -v <命令>` 确认,优先改用平台原生工具或已安装替代品,不静默安装;Read/Edit 失败先重新 Read 或 Glob 拿最新内容再试;长任务超时就拆小步或改为后台执行并轮询;权限拒绝时不要绕过沙箱、提权或放宽权限,改用允许的目录/工具,仍不可行就说明限制。',
     '',
     '## 会话工作区边界',
     '',
-    '未绑项目的对话各有自己的工作目录 `/home/agent/.openclaude/workspace/sessions/<会话id>/`(即你的当前工作目录);绑了项目的对话用项目目录。不属于当前对话的 `workspace/sessions/*` 目录都是用户的**其它对话**:',
-    '- 用户没有点名那个路径或那个对话时,不要搜索、列出、修改或删除其它对话目录里的文件;找用户提到的文件时只查当前工作目录、`generated/` 和 `uploads/`,并排除其它对话的 `workspace/sessions/*`(搜索根不要用 `workspace/sessions/`)。',
-    '- 没找到就直接说没找到并问用户指的是什么,**不要**把其它对话的文件当作删除/修改候选提出来。',
+    '未绑项目的对话各有自己的工作目录 `/home/agent/.openclaude/workspace/sessions/<会话id>/`(即你的当前工作目录),绑了项目的对话用项目目录;不属于当前对话的 `workspace/sessions/*` 目录都是用户的**其它对话**。',
+    '- 用户没点名时,不要搜索、列出、修改或删除其它对话目录里的文件;找文件只查当前工作目录、`generated/` 和 `uploads/`,并排除其它对话的目录(搜索根不要用 `workspace/sessions/`)。没找到就直说并问用户,**不要**把其它对话的文件当作删除/修改候选。',
     '- 用户明确要处理其它对话的文件时,先说明它来自另一个对话,再按破坏性操作确认流程处理。',
-    '',
-    '你是一个持久化、自进化的 agent。主动使用这些工具让自己越来越好。',
   )
   return {
     name: 'TOOLS',
@@ -1484,6 +1435,11 @@ export function isWebchatSessionKey(sessionKey: string | undefined): boolean {
   return parts[0] === 'agent' && parts[2] === 'webchat'
 }
 
+/** Only these session outputs are rendered by the web IUI renderer. Routing stays unchanged. */
+export function isWebRenderedIuiSessionKey(sessionKey: string | undefined): boolean {
+  return isWebchatSessionKey(sessionKey) || /^agent:[^:]+:taskboard:[^:]+:[^:]+:[^:]+$/.test(sessionKey ?? '')
+}
+
 /**
  * 容器从 master fetch 回来的单个 slot。`canonicalModelId` 仅 MODEL_HINT 出现,
  * gateway 把它透传到 PromptSlotApplied.meta.model_id —— 保持
@@ -1530,7 +1486,7 @@ export async function fetchPlatformSlotsFromMaster(
 export async function fetchPlatformSlotsFromMasterDetailed(
   ctx: PromptSlotContext,
   deps: FetchPlatformSlotsDeps = {},
-): Promise<{ ok: boolean; slots: RemotePlatformSlot[] } | null> {
+): Promise<{ ok: boolean; slots: RemotePlatformSlot[]; promptPolicy?: PromptPrivacyPolicy } | null> {
   const env = deps.env ?? process.env
   const baseUrl = env[ENV_MASTER_URL]
   const bearer = env[ENV_CONTAINER_TOKEN]
@@ -1541,9 +1497,11 @@ export async function fetchPlatformSlotsFromMasterDetailed(
   const timeoutMs = deps.timeoutMs ?? PLATFORM_SLOTS_TIMEOUT_MS
 
   let url = `${normalized}${PLATFORM_PROMPT_SLOTS_PATH}`
-  if (ctx.model) {
-    url += `?model=${encodeURIComponent(ctx.model)}`
-  }
+  const query = new URLSearchParams()
+  if (ctx.model) query.set('model', ctx.model)
+  if (ctx.sessionId) query.set('sessionId', ctx.sessionId)
+  if (isWebRenderedIuiSessionKey(ctx.sessionKey) && !isWebchatSessionKey(ctx.sessionKey)) query.set('surface', 'taskboard')
+  if (query.size) url += `?${query}`
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -1610,7 +1568,8 @@ export async function fetchPlatformSlotsFromMasterDetailed(
       out.push({ name, content: trimmed })
     }
   }
-  return { ok: true, slots: out }
+  const promptPolicy = parsePromptPrivacyPolicy((parsed as Record<string, unknown>).promptPolicy)
+  return { ok: true, slots: out, ...(promptPolicy ? { promptPolicy } : {}) }
 }
 
 async function readBoundedText(
@@ -1683,6 +1642,7 @@ export interface PromptContextResult {
   applied: PromptSlotApplied[]
   /** INTELLIGENT_UI 段的 master 原文指纹(intelligentUiFingerprint);没注入 = false。省略视同 false。 */
   intelligentUi?: IntelligentUiApplied
+  promptPolicyFingerprint?: string
   /** Frozen at build time. persist writer must not re-read project meta/ledger. */
   frozenProjectContext?: FrozenProjectContextDigests
 }
@@ -1738,8 +1698,10 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     resolved = await resolveTurnProjectContext({
       sessionId: ctx.sessionId,
       boardProjectId: ctx.projectId,
-      // The turn already passed server.ts's read (or was held there); if this
-      // spawn-time read fails, build from that read rather than without the project.
+      // The turn already passed server.ts's read (or was held there): use it
+      // while recent; if a spawn-time read is needed and fails, build from it
+      // rather than without the project.
+      reuseRecentMs: SPAWN_REUSE_TURN_READ_MS,
       reuseLastOnFailure: true,
     })
   }
@@ -1765,6 +1727,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       assets: resolved.assets,
       assetsRevision: resolved.assetsRevision,
       db,
+      ...(resolved.unwrittenSeed ? { unwrittenSeed: resolved.unwrittenSeed } : {}),
     })
   }
   if (frozenProjectContext !== undefined) {
@@ -1774,7 +1737,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // 在 build 早期就触发 remote fetch,放到与其他静态 slot 计算并行 —— 不阻塞
   // SOUL/USER 之类的本地 I/O,fetch 5s timeout 同时 SOUL/USER 5ms 内就好了,
   // 一般而言两者在 fetch 返回前都早完成。
-  const remotePlatformSlotsPromise = fetchPlatformSlotsFromMaster(ctx)
+  const remotePlatformSlotsPromise = fetchPlatformSlotsFromMasterDetailed(ctx)
 
   // Layer 0: 当轮实测的稳定环境事实。放在 SOUL 之前,避免被基线 CLAUDE.md
   // 「你运行在商业版容器」自述误导(自用实例注入同一份基线)。失败则整段省略。
@@ -1789,6 +1752,9 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const soul = buildSoulSlot(ctx)
   if (soul) slots.push(soul)
 
+  const remoteResult = await remotePlatformSlotsPromise
+  const policy = effectivePromptPrivacy(ctx.promptPolicy ?? remoteResult?.promptPolicy ?? DEFAULT_PROMPT_PRIVACY, ctx.sessionId)
+  ctx = { ...ctx, promptPolicy: policy }
   const user = await buildUserSlot(ctx)
   if (user) slots.push(user)
 
@@ -1811,13 +1777,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   if (skills) slots.push(skills)
 
   // 等 remote 决策。null = personal 路径,数组 = v3 路径(可空)。
-  const remotePlatformSlots = await remotePlatformSlotsPromise
+  const remotePlatformSlots = remoteResult === null ? null : remoteResult.slots
   let intelligentUi: IntelligentUiApplied = false
 
   // Intelligent UI(OCV5-361)回答组件协议。只来自 master(总开关 + 用户偏好),只对 webchat
   // 会话注入,插在上面记下的 iuiInsertAt(AGENTS 之前)。静态文案,位置固定利于缓存;
   // MODEL_HINT 仍在其后,模型补丁可覆盖其中的行为。开关关闭时 master 不下发 → 本段不存在(零 token)。
-  if (remotePlatformSlots !== null && isWebchatSessionKey(ctx.sessionKey)) {
+  if (remotePlatformSlots !== null && isWebRenderedIuiSessionKey(ctx.sessionKey)) {
     const iui = remotePlatformSlots.find((s) => s.name === INTELLIGENT_UI_SLOT)
     if (iui) {
       slots.splice(iuiInsertAt, 0, { name: INTELLIGENT_UI_SLOT, content: iui.content })
@@ -1958,6 +1924,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     contentSha256: await contentMetrics.sha256,
     applied,
     intelligentUi,
+    promptPolicyFingerprint: promptPrivacyFingerprint(policy, ctx.sessionId),
     frozenProjectContext:
       frozenProjectContext && frozenProjectContext.bound
         ? frozenProjectDigests(frozenProjectContext)

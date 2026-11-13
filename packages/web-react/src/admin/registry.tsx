@@ -86,6 +86,7 @@ export const adminPages: AdminPage[] = [
   // ── 账号与调度 ──
   // OCV5-424: 服务池 and 订阅账号 are one tab (each service: subscription accounts with quota + API keys).
   { key: "pools", title: "服务池", group: "账号与调度", desc: "各服务的订阅账号、使用额度与 API key", icon: Boxes, Component: lz(() => import("./pages/accounts")) },
+  { key: "remotePools", title: "远端服务池", group: "账号与调度", desc: "远端 Agent 底座节点（CC 交互模式 / Codex / Antigravity / Grok）探测与模型上架", icon: Server, Component: lz(() => import("./pages/remotePools")) },
   { key: "accountGroups", title: "账号分组", group: "账号与调度", desc: "容量、权重和调度边界", icon: Layers, Component: lz(() => import("./pages/accountGroups")) },
   { key: "egressProxies", title: "代理池", group: "账号与调度", desc: "出口线路和失败冷却", icon: Network, Component: lz(() => import("./pages/egressProxies")) },
   // ── 运行资源 ──

@@ -363,6 +363,43 @@ test('live Grok overlay keeps provider when the resume-map provider slot is empt
   }
 })
 
+test('a remote Codex lane keeps its native thread id after a config restart; a local Codex id without rollout is still dropped', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-codex-remote-resume-'))
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCodexHome = process.env.CODEX_HOME
+  try {
+    process.env.OPENCLAUDE_HOME = join(dir, 'oc-home')
+    process.env.CODEX_HOME = join(dir, 'codex-home')
+    // A container that also runs local Codex has a rollout tree, so a missing rollout is positive absence.
+    mkdirSync(join(dir, 'codex-home', 'sessions', '2026', '11', '09'), { recursive: true })
+    const manager = new SessionManager(makeConfigStub())
+    const internals = manager as unknown as ResumeMapInternals & {
+      sessions: Map<string, { providerTag: string; ccbSessionId: string | null; _lastCcbCumulativeCost: number
+        runner: { executionBackend?: { kind: string }; clearSessionId: () => void } }>
+    }
+    internals.resumeMapPath = join(dir, 'resume-map.json')
+    const thread = '01a1bf9f-835d-70a0-955e-8f213fb695ae'
+    for (const [key, backend] of [['remote', { kind: 'codex-app-server-v1' }], ['local', undefined]] as const) {
+      internals._resumeMap.set(key, thread)
+      internals._resumeMapProvider.set(key, 'codex')
+      internals.sessions.set(key, { providerTag: 'codex', ccbSessionId: null, _lastCcbCumulativeCost: 0,
+        runner: { executionBackend: backend, clearSessionId: () => {} } })
+    }
+    assert.equal(internals._resumeIdFor('remote', 'codex', join(dir, 'ws')), thread,
+      'the next turn resumes the node thread instead of a full rebuild the relay refuses')
+    assert.equal(internals._resumeMap.get('remote'), thread)
+    assert.equal(internals._resumeIdFor('local', 'codex', join(dir, 'ws')), undefined)
+    assert.equal(internals._resumeMap.has('local'), false)
+    await internals.awaitResumeMapFlush()
+  } finally {
+    if (previousHome === undefined) delete process.env.OPENCLAUDE_HOME
+    else process.env.OPENCLAUDE_HOME = previousHome
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME
+    else process.env.CODEX_HOME = previousCodexHome
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test("box Claude resume id is kept without a local JSONL", async () => {
   const dir = mkdtempSync(join(tmpdir(), "oc-box-cc-resume-"))
   try {

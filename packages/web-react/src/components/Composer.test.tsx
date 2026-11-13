@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { BRAND } from "../lib/brand";
 import { Composer, ENV_PREP_EXPECTED_MS } from "./Composer";
@@ -291,7 +291,7 @@ describe("Composer 拖拽上传", () => {
     const shell = screen.getByTestId("composer-shell");
     const file = new File(["hello"], "drop-note.txt", { type: "text/plain" });
     fireEvent.drop(shell as Element, { dataTransfer: fileDt(file) });
-    expect(await screen.findByText("drop-note.txt")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("drop-note.txt")).toBeInTheDocument());
   });
 
   test("dragover 含 Files 时根容器出现高亮 class；拖纯文本不高亮", () => {
@@ -338,7 +338,7 @@ describe("Composer 长文字数", () => {
 });
 
 describe("Composer goalOpenRequest", () => {
-  test("nonce 变化打开 GoalDialog", () => {
+  test("nonce 变化打开 GoalDialog", async () => {
     const { rerender } = render(
       <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} />,
     );
@@ -346,7 +346,7 @@ describe("Composer goalOpenRequest", () => {
     rerender(
       <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} goalOpenRequest={1} />,
     );
-    expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
+    expect(await screen.findByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
     expect(screen.getByText("会话目标")).toBeInTheDocument();
   });
 });

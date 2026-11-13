@@ -73,12 +73,15 @@ const reconcilerLog: Logger = rootLogger.child({ subsys: 'turnDispatchReconciler
  */
 function logTransition(
   deps: Pick<TurnDispatchReconcilerDeps, 'log'>,
-  row: { dispatchId: string; userId: bigint | string; sessionId: string; clientMessageId: string },
+  row: { dispatchId: string; userId: bigint | string; sessionId: string; clientMessageId: string; traceId: string | null; attemptNo: number },
   fields: Record<string, unknown>,
   level: 'info' | 'warn' = 'warn',
 ): void {
   ;(deps.log ?? reconcilerLog)[level]('dispatch transition by reconciler', {
     dispatchId: row.dispatchId,
+    traceId: row.traceId,
+    ...(row.traceId ? {} : { traceIdMissing: 'legacy-dispatch-no-trace' }),
+    attempt: row.attemptNo,
     userId: String(row.userId),
     sessionId: row.sessionId,
     clientMessageId: row.clientMessageId,
@@ -576,7 +579,7 @@ export async function runReconcileTick(
         now: now(),
       })
       if (held) {
-        logTransition(deps, row, {
+        logTransition(deps, held, {
           to: 'manual_reconcile',
           conflictReason: `container_${res.state}`,
           containerState: res.state,
@@ -714,6 +717,10 @@ async function projectTapelessVisibleToSession(
  * prefetchFirstVisibleTraces) — after taking the row lock and before any
  * write. Any advancement ⇒ ROLLBACK, no write, retry next tick.
  */
+type OrphanFinalizeResult =
+  | { committed: false; evidenceStale: boolean }
+  | { committed: true; evidenceStale: false; terminal: TurnDispatchRow }
+
 async function finalizeOrphanDispatch(input: {
   deps: TurnDispatchReconcilerDeps
   row: {
@@ -731,8 +738,8 @@ async function finalizeOrphanDispatch(input: {
   /** Scan-time evidence snapshot for the in-lock comparison. */
   scanLastFrameAtMs: number | null
   scanFirstVisibleAtMs: number | null
-}): Promise<{ committed: boolean; evidenceStale: boolean }> {
-  const stale = async (): Promise<{ committed: boolean; evidenceStale: boolean }> => {
+}): Promise<OrphanFinalizeResult> {
+  const stale = async (): Promise<OrphanFinalizeResult> => {
     await client.query('ROLLBACK')
     return { committed: false, evidenceStale: true }
   }
@@ -860,7 +867,7 @@ async function finalizeOrphanDispatch(input: {
         clientMessageId: input.row.client_message_id,
       })
     }
-    return { committed: true, evidenceStale: false }
+    return { committed: true, evidenceStale: false, terminal }
   } catch (err) {
     try {
       await client.query('ROLLBACK')
@@ -874,6 +881,7 @@ async function finalizeOrphanDispatch(input: {
 }
 
 type VisibleOrphanScanRow = {
+  trace_id: string | null
   dispatch_id: string
   attempt_no: number
   agent_container_id: number | null
@@ -1016,7 +1024,7 @@ async function closeVisibleOrphans(
   const queryVisible = async (offset: number) =>
     deps.pool.query<VisibleOrphanScanRow>(
       `SELECT -- closeVisibleOrphans
-            d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
+            d.dispatch_id, d.trace_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
             d.status, d.admitted_at, d.accepted_at, d.attempt_no, d.agent_container_id, d.runtime_kind,
             t.visible_at::text AS tape_visible_at,
             t.part_count AS tape_part_count,
@@ -1222,13 +1230,8 @@ async function closeVisibleOrphans(
     closed++
     logTransition(
       deps,
-      {
-        dispatchId: row.dispatch_id,
-        userId: row.user_id,
-        sessionId: row.session_id,
-        clientMessageId: row.client_message_id,
-      },
-      { to: 'terminal', outcome, via: 'visible_orphan', action },
+      ok.terminal,
+      { to: 'terminal', outcome: ok.terminal.outcome, via: 'visible_orphan', action },
       'info',
     )
     if (projectFallback === true) {
@@ -1314,7 +1317,7 @@ async function settleTerminalUnnotified(
       })
       await client.query('COMMIT')
       if (held)
-        logTransition(deps, row, {
+        logTransition(deps, held, {
           to: 'manual_reconcile',
           conflictReason: 'missing_anchor_seq',
           outcome: row.outcome,
@@ -1350,7 +1353,7 @@ async function settleTerminalUnnotified(
       })
       await client.query('COMMIT')
       if (held)
-        logTransition(deps, row, {
+        logTransition(deps, held, {
           to: 'manual_reconcile',
           conflictReason: 'billed_but_failed',
           outcome: row.outcome,
@@ -1483,7 +1486,7 @@ async function resolveRejecting(
     })
     if (terminal) {
       counts.rejectedTerminal++
-      logTransition(deps, row, {
+      logTransition(deps, terminal, {
         to: 'terminal',
         outcome: 'not_accepted',
         failureCode,
@@ -1583,7 +1586,7 @@ async function closeAcceptedAsExecutedError(
     client.release()
   }
   if (terminal)
-    logTransition(deps, row, {
+    logTransition(deps, terminal, {
       to: 'terminal',
       outcome: 'executed_error',
       failureCode,

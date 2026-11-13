@@ -32,6 +32,8 @@ export type DelegateProgressBlock = {
   /** Identity of the original child execution, also used for absolute usage.
    * `runId` may be rebound to a visible card; wrappers never infer this id. */
   usageRunId?: string
+  /** Preserves child terminal phase across nested text rebinding. */
+  nestedPhase?: DelegateProgressPhase
   usage?: TurnTokenUsageSnapshot
   /**
    * 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),供新前端
@@ -92,6 +94,7 @@ export function normalizeDelegateGoalKey(raw: unknown): string {
 export function makeDelegateProgressBlock(args: {
   runId: string
   usageRunId?: string
+  nestedPhase?: DelegateProgressPhase
   agentId: string
   phase: DelegateProgressPhase
   text?: unknown
@@ -109,6 +112,7 @@ export function makeDelegateProgressBlock(args: {
     phase: args.phase,
   }
   if (args.usageRunId !== undefined) block.usageRunId = args.usageRunId
+  if (args.nestedPhase !== undefined) block.nestedPhase = args.nestedPhase
   const text = sanitizeDelegateProgressText(args.text, args.maxLen ?? DEFAULT_TEXT_LIMIT, {
     trim: !args.preserveWhitespace,
   })
@@ -595,7 +599,12 @@ export function toNestedDelegateProgressLine(
   return {
     kind: 'delegate_progress',
     runId: args.runId,
-    ...(source.usageRunId === undefined ? {} : { usageRunId: source.usageRunId }),
+    ...(source.usageRunId === undefined
+      ? {}
+      : {
+          usageRunId: source.usageRunId,
+          ...(source.phase === "done" ? { nestedPhase: "done" as const } : {}),
+        }),
     agentId: args.agentId,
     phase: 'text',
     text,

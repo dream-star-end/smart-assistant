@@ -16,10 +16,10 @@ import {
  * 空态提示行的变体：
  * - `empty-all`：零会话且零项目（新用户）——整个列表只剩这一块引导（说明 + 新建会话 + 新建项目），
  *   不再渲染「项目 +」「未分类 0」骨架（审计 S-13）；「已归档」开关照常保留，它是归档会话唯一的入口；
- * - `empty-list`：整个活动列表一条会话都没有但已有项目（全部归档 / 建了项目还没聊）——未分类空态叠大 CTA；
- * - `empty-project`：某个分组暂无会话但别处有会话——只占一行普通高度，避免多个空项目把会话挤出视口（审计 S-01）。
+ * - `empty-list`：整个活动列表一条会话都没有但已有项目（全部归档 / 建了项目还没聊）——未分类空态叠大 CTA。
+ * 空项目、别处有会话时的空未分类不再占「暂无会话」行（UI-1）：计数 0 已经说明，项目行自带新建入口。
  */
-export type EmptyHintVariant = "empty-all" | "empty-list" | "empty-project";
+export type EmptyHintVariant = "empty-all" | "empty-list";
 
 export type FlatItem =
   | { kind: "header"; key: string; label: string; height: number }
@@ -42,7 +42,9 @@ export type FlatItem =
       variant?: EmptyHintVariant;
     }
   | { kind: "searchHit"; key: string; hit: SessionSearchHit; height: number }
-  | { kind: "archivedToggle"; key: string; count: number; expanded: boolean; height: number };
+  | { kind: "archivedToggle"; key: string; count: number; expanded: boolean; height: number }
+  /** 项目会话超过上限时的「查看全部」行（进项目主页）。 */
+  | { kind: "more"; key: string; projectId: string; count: number; height: number };
 
 export type FlattenInput = {
   searching: boolean;
@@ -63,6 +65,10 @@ export type FlattenInput = {
   isRunning?: (s: Session) => boolean;
   /** 触屏（hover:none）：带按钮的分组标题行升到 44px，给触控靶留位（S-04）。 */
   coarsePointer?: boolean;
+  /** 真实项目展开时最多列几条（其余走「查看全部」）；缺省不限（没有项目主页可去时）。 */
+  projectLimit?: number;
+  /** 当前会话：所在项目收起或它排在上限之外时仍单独列出，选中态不会从侧栏消失。 */
+  activeId?: string;
 };
 
 function virtualDefaultProject(count: number): ChatProject {
@@ -190,27 +196,16 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
         runningCount: runningIn(kids, input.isRunning),
         height: PROJECT_H,
       });
-      if (!collapsed) {
-        if (kids.length === 0) {
-          items.push({
-            kind: "hint",
-            key: `p-empty-${p.id}`,
-            text: "暂无会话",
-            height: HINT_ROW_HEIGHT,
-            variant: "empty-project",
-            // 默认项目不带 projectId，空态 CTA 走顶部 onNew；真实项目带上以便 onNewInProject。
-            ...(p.id !== DEFAULT_PROJECT_ID ? { projectId: p.id } : {}),
-          });
-        }
-        for (const s of kids) {
-          items.push({
-            kind: "session",
-            key: `s-${s.id}`,
-            session: s,
-            indent: true,
-            height: SESSION_H,
-          });
-        }
+      // 收起 = 0 条、展开 = 至多 projectLimit 条；当前会话落在外面时补在末尾。
+      const limit = collapsed ? 0 : (input.projectLimit ?? kids.length);
+      const shown = kids.slice(0, limit);
+      const active = kids.find((s, i) => i >= limit && s.id === input.activeId);
+      if (active) shown.push(active);
+      for (const s of shown) {
+        items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: SESSION_H });
+      }
+      if (!collapsed && kids.length > limit) {
+        items.push({ kind: "more", key: `more-${p.id}`, projectId: p.id, count, height: SESSION_H });
       }
     }
   }
@@ -228,13 +223,13 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       height: PROJECT_H,
     });
     if (!defaultCollapsed) {
-      if (defaultKids.length === 0) {
+      if (listEmpty) {
         items.push({
           kind: "hint",
           key: `p-empty-${DEFAULT_PROJECT_ID}`,
           text: "暂无会话",
           height: HINT_ROW_HEIGHT,
-          variant: listEmpty ? "empty-list" : "empty-project",
+          variant: "empty-list",
         });
       }
       for (const s of defaultKids) {

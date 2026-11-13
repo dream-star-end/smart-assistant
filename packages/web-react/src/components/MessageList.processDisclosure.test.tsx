@@ -3,11 +3,14 @@ import type { ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
+import { canonicalTaskContinuationError, manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
-import { operationSummary } from "./chat/ProcessDisclosure";
+import { workSummary } from "./chat/ProcessDisclosure";
 import { collectPaneSteps } from "./chat/workPane";
 import { MessageList } from "./MessageRenderer";
 import { ArtifactInspectContext } from "./tool/context";
+import { preloadTimelineCards } from "./chat/lazyTimelineCards";
+import { preloadProcessStages } from "./chat/lazyProcessStages";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 import { prefetchMarkdownImpl } from "./Markdown";
@@ -15,8 +18,10 @@ import { prefetchMarkdownImpl } from "./Markdown";
 // 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(prefetchMarkdownImpl);
 
-// These tests assert expanded tool bodies synchronously, so the lazy chunk must be loaded first.
+// These tests assert expanded tool bodies and TeamPanel synchronously, so lazy chunks must be loaded first.
 loadBeforeAll(preloadToolBody);
+loadBeforeAll(preloadTimelineCards);
+loadBeforeAll(preloadProcessStages);
 
 afterEach(() => {
   cleanup();
@@ -44,9 +49,22 @@ function renderList(
 }
 
 /** 展开外壳和每一组步骤,让过程里的每一行都渲染出来。 */
+function expandDetailButtons(root: HTMLElement, passes = 2) {
+  for (let pass = 0; pass < passes; pass += 1) {
+    const closed = within(root)
+      .queryAllByRole("button")
+      .filter((button) => button.getAttribute("aria-expanded") === "false");
+    if (!closed.length) break;
+    for (const button of closed) fireEvent.click(button);
+  }
+}
+
 function expandAllProcess() {
   fireEvent.click(screen.getByTestId("process-toggle"));
   for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  // UI-3:「准备工作 N 步」和每一步的「技术详情」也点开,原卡(命令、输出入口)才渲染。
+  for (const prep of screen.queryAllByTestId("process-prep")) fireEvent.click(within(prep).getAllByRole("button")[0]!);
+  for (const step of screen.queryAllByTestId("process-step-row")) fireEvent.click(within(step).getAllByRole("button")[0]!);
 }
 
 function settledTurn(): ChatMessage[] {
@@ -104,7 +122,11 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText(/probe-thinking-trace/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
-    const pdf = screen.getByText(/paper\.pdf/);
+    expect(screen.queryByText("probe-stock-layout")).not.toBeInTheDocument();
+    for (const step of screen.getAllByTestId("process-step-row")) {
+      fireEvent.click(within(step).getAllByRole("button")[0]!);
+    }
+    const pdf = screen.getAllByText(/paper\.pdf/)[0]!;
     expect(pdf.closest("[data-testid=process-disclosure]")).not.toBeNull();
     expect(screen.getByText("生成图片").closest("[data-testid=process-disclosure]")).not.toBeNull();
     expect(screen.getByText("probe-stock-layout")).toBeInTheDocument();
@@ -311,16 +333,16 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("模型暂不可用").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留重试出口", () => {
+  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留继续出口", () => {
     renderList(
       [
         row("u", "user", "继续合并", { status: "replied" }),
         row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
         midTurnError("engine_error"),
       ],
-      { cb: { onRegenerate: () => {} } },
+      { cb: { onContinueInterrupted: () => {}, resolveInterruptedContinuation: () => row("u", "user", "继续合并") } },
     );
-    const retry = screen.getByRole("button", { name: /重新尝试|重试/ });
+    const retry = screen.getByRole("button", { name: "继续" });
     // 以错误收尾 = 本轮结局:仍是完整错误卡,不是「已继续」说明。
     expect(screen.queryByTestId("recovered-error-note")).toBeNull();
     expect(screen.getByRole("alert")).toBeInTheDocument();
@@ -345,7 +367,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
     expect(card.textContent ?? "").not.toMatch(/任务执行失败|本轮已继续|出错了/);
     expect(within(card).queryByRole("alert")).toBeNull();
-    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/]) {
+    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/, /^继续$/]) {
       expect(within(card).queryByRole("button", { name })).toBeNull();
     }
   });
@@ -376,7 +398,7 @@ describe("MessageList Manus 过程披露", () => {
     ]);
     expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
     expect(screen.queryByText("T2 校验迁移")).not.toBeInTheDocument();
-    expect(screen.getByTestId("process-toggle")).toHaveTextContent("子任务 1 项");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("派出 1 个子任务");
   });
 
   test("OCV5-307: 未回答的提问留在过程外，同一轮已回答的提问在过程轨线上", () => {
@@ -664,7 +686,8 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
     // 已结束的轮次过程默认收起:已回答的提问跟着收在里面,不再单独一张卡挂在过程外。
     expect(screen.queryByTestId("permission-card")).not.toBeInTheDocument();
-    expect(screen.getByTestId("process-toggle")).toHaveTextContent("问答 1 项");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("运行了 2 条命令");
+    expect(screen.getByTestId("process-toggle")).not.toHaveTextContent("问答");
     const approval = await screen.findByText("任务待你确认");
     expect(approval.closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.getByText("后台盘点还在跑")).toBeInTheDocument();
@@ -679,6 +702,58 @@ describe("MessageList Manus 过程披露", () => {
     expect(within(details).getAllByText("未成功").length).toBeGreaterThan(0);
     expect(within(details).getAllByText("probe-error-detail").length).toBeGreaterThan(0);
     expect(details.closest("[data-testid=process-disclosure]")).not.toBeNull();
+  });
+
+
+  test("OCV5-739: ExecuteExtraTool / call_mcp_tool 包装且已完成的 present_task_approval 不被折进工作过程，默认展开且排在本轮最终回复正文下方", async () => {
+    renderList([
+      row("u-738", "user", "现在开始修", { status: "replied" }),
+      row("s-738", "assistant", "两个模型的修复都已经派到后台了，现在先请你确认工单：", {
+        _clientMessageId: "u-738",
+      }),
+      row("search-1", "tool", "查找工具", {
+        _clientMessageId: "u-738",
+        toolName: "SearchExtraTools",
+        inputJson: { query: "select:mcp__openclaude-memory__present_task_approval" },
+        _completed: true,
+        output: "found",
+      }),
+      row("approval-738", "tool", "ExecuteExtraTool", {
+        _clientMessageId: "u-738",
+        toolName: "ExecuteExtraTool",
+        inputJson: {
+          tool_name: "mcp__openclaude-memory__present_task_approval",
+          params: { id: "OCV5-738" },
+        },
+        _completed: true,
+        output: JSON.stringify({
+          ok: true,
+          kind: "task_approval",
+          status: "presented",
+          id: "OCV5-738",
+        }),
+      }),
+      row("search-2", "tool", "查找工具", {
+        _clientMessageId: "u-738",
+        toolName: "SearchExtraTools",
+        inputJson: { query: "select:mcp__openclaude-memory__task_get" },
+        _completed: true,
+        output: "found",
+      }),
+      row("ans-738", "assistant", "下面有 OCV5-738 的审批卡，请点一下“批准开工”，正式确认这张工单。", {
+        _clientMessageId: "u-738",
+      }),
+    ]);
+
+    const answerEl = screen.getByText(/下面有 OCV5-738 的审批卡/);
+    const approvalEl = await screen.findByText("任务待你确认");
+    // 1. 审批卡绝不折进工作过程，且 search-1/search-2 合并在同一个工作过程壳内（不分裂出第二个工作过程）
+    expect(approvalEl.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    // 2. 审批卡即使 _completed: true 也默认展开可见，且在 DOM 顺序中位于最终回复正文下方
+    expect(
+      Boolean(answerEl.compareDocumentPosition(approvalEl) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
   });
 
   test("两轮、分页、刷新和切会话不会串组或带走展开", () => {
@@ -798,8 +873,8 @@ describe("MessageList Manus 过程披露", () => {
       row("answer", "assistant", "最终回答在外面", { _clientMessageId: "u" }),
     ]);
     expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
-    expect(screen.getByTestId("process-toggle")).toHaveTextContent("搜索 1 项");
-    expect(screen.getByTestId("process-toggle")).toHaveTextContent("编辑 1 项");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("搜索了 1 次");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("写了 1 个文件");
     expect(screen.getByText("最终回答在外面").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
@@ -907,7 +982,7 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(screen.getByTestId("process-toggle"));
     const link = await screen.findByRole("link", { name: "口径说明" });
     expect(link).toHaveAttribute("href", "https://example.com/stock-note");
-    expect(screen.getByTestId("process-toggle")).toHaveTextContent("命令 1 项");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("运行了 1 条命令");
   });
 
   test("未发布降级正文放进过程后仍然不可见", () => {
@@ -996,13 +1071,11 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(toggles[0]!);
     fireEvent.click(screen.getAllByTestId("process-detail-toggle")[0]!);
     const first = screen.getAllByTestId("process-details")[0]!;
-    expect(within(first).getByText(/paper\.pdf/).closest("[data-testid=process-details]")).not.toBeNull();
+    expandDetailButtons(first, 3);
+    expect(within(first).getAllByText(/paper\.pdf/)[0]!.closest("[data-testid=process-details]")).not.toBeNull();
     expect(within(first).getByText("生成图片").closest("[data-testid=process-details]")).not.toBeNull();
     expect(first.textContent ?? "").toMatch(/cp x \/home\/agent\/\.openclaude\/generated\//);
     const second = first;
-    for (const button of within(second).getAllByRole("button")) {
-      if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
-    }
     const onlyText = within(second).getByText(/only-board\.csv/);
     expect(onlyText.closest("[data-testid=process-details]")).not.toBeNull();
     expect(within(second).getAllByText("未成功").length).toBeGreaterThan(0);
@@ -1058,9 +1131,7 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(screen.getByTestId("process-toggle"));
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     const details = screen.getByTestId("process-details");
-    for (const button of within(details).getAllByRole("button")) {
-      if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
-    }
+    expandDetailButtons(details, 3);
     expect(details.textContent ?? "").toMatch(/not-created\.pdf/);
     expect(details.textContent ?? "").toMatch(/still-running\.pdf/);
     expect(details.textContent ?? "").toMatch(/already-there\.docx/);
@@ -1134,9 +1205,7 @@ describe("MessageList Manus 过程披露", () => {
     for (const toggle of screen.getAllByTestId("process-toggle")) fireEvent.click(toggle);
     for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
     for (const details of screen.getAllByTestId("process-details")) {
-      for (const button of within(details).getAllByRole("button")) {
-        if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
-      }
+      expandDetailButtons(details, 3);
     }
     const betaSource = screen.getByText(/PREVIEW_BETA/);
     const betaPre = betaSource.closest("pre");
@@ -1501,6 +1570,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(shells[0]!.compareDocumentPosition(answerRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(screen.getByTestId("process-toggle"));
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expandDetailButtons(screen.getByTestId("process-details"), 2);
     expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/probe-before[\s\S]*probe-after-1[\s\S]*probe-after-2/);
   });
 
@@ -1563,6 +1633,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("会话目标已清除这句话只是阶段说明")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("process-toggle"));
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expandDetailButtons(screen.getByTestId("process-details"), 2);
     expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/goal-not-a-card/);
     expect(screen.getByText("会话目标已清除这句话只是阶段说明").closest("[data-testid=process-stage]")).not.toBeNull();
   });
@@ -1804,8 +1875,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(summaries[0]!.className).toContain("text-faint");
     expect(summaries[1]!.getAttribute("data-live-working")).toBe("true");
     expect(summaries[1]!.className).toContain("oc-live-status-shine");
-    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
-    expect(screen.getByTestId("process-step-live").className).toContain("text-faint");
+    // UI-3:展开时唯一的运行状态行就是在干活的那一段;外壳只留「处理中」和计时。
+    expect(summaries[1]).toContainElement(screen.getByTestId("process-step-live"));
+    expect(screen.getByTestId("process-title")).toHaveTextContent("处理中");
     expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
 
     fireEvent.click(screen.getByTestId("process-toggle"));
@@ -2082,6 +2154,8 @@ describe("MessageList Manus 过程披露", () => {
 
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在运行命令");
+    expect(screen.getByTestId("process-details")).not.toHaveTextContent("LIVE_STILL_RUNNING");
+    expandDetailButtons(screen.getByTestId("process-details"), 1);
     expect(screen.getByTestId("process-details")).toHaveTextContent("LIVE_STILL_RUNNING");
   });
 
@@ -2274,6 +2348,10 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    // UI-3:步骤行是人话标题,原始命令收在点开后的「技术详情」里。
+    expect(screen.getByTestId("process-step-row")).toHaveTextContent("等待子任务完成");
+    expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
     expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/dlgjob/);
 
@@ -2291,26 +2369,46 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/\/bin\/bash|dlgjob/);
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
     expect(screen.getByTestId("process-raw-command").textContent ?? "").toBe(wrapped);
   });
 
-  test("命令计数看工具名或命令首词，不扫参数里的子串", () => {
-    expect(operationSummary([
+  test("UI-3 人话摘要：按工具类别或命令首词归类，不扫参数；思考、准备工作、目标不算；最多三类", () => {
+    expect(workSummary([
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo complicated-catalog" } }),
-    ])).toBe("命令 1 项");
-    expect(operationSummary([
+    ])).toBe("运行了 1 条命令");
+    expect(workSummary([
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "cat /tmp/a" } }),
-    ])).toBe("读取 1 项");
-    expect(operationSummary([
+    ])).toBe("读了 1 个文件");
+    expect(workSummary([
       row("t", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/tmp/a" } }),
-    ])).toBe("读取 1 项");
-    expect(operationSummary([
+    ])).toBe("读了 1 个文件");
+    expect(workSummary([
       row("g", "goal", "库存目标", { cleared: true, goalStatus: "cleared" }),
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo keep" } }),
-    ])).toBe("命令 1 项");
-    expect(operationSummary([
-      row("g", "goal", "做完的目标", { goalStatus: "completed" }),
-    ])).toBe("目标 1 项");
+    ])).toBe("运行了 1 条命令");
+    expect(workSummary([row("g", "goal", "做完的目标", { goalStatus: "completed" })])).toBe("");
+    // 查技能、平台自检、--help 是准备工作,思考也不进摘要。
+    expect(workSummary([
+      row("s", "tool", "查看技能", { toolName: "mcp__openclaude-memory__skill_view", inputJson: { name: "coding-suite" } }),
+      row("p", "tool", "终端", { toolName: "Bash", inputJson: { command: "/run/oc/platform/current/bin/oc-system status" } }),
+      row("h", "tool", "终端", { toolName: "Bash", inputJson: { command: "oc-browser --help" } }),
+      row("th", "thinking", "Planning the timer controls"),
+      row("w", "tool", "写入", { toolName: "Write", inputJson: { file_path: "/w/纪要.docx", content: "x" } }),
+    ])).toBe("写了 1 个文件");
+    // 委派命令和它的子任务卡是同一件事,不重复数。
+    expect(workSummary([
+      row("d", "tool", "终端", { toolName: "Bash", inputJson: { command: "oc-memory delegate --goal 写计时器" } }),
+      row("ag", "agent-group", "写计时器", { _delegate: true }),
+    ])).toBe("派出 1 个子任务");
+    // 最多三类,次数多的在前。
+    expect(workSummary([
+      row("r1", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/a" } }),
+      row("c1", "tool", "终端", { toolName: "Bash", inputJson: { command: "ls" } }),
+      row("r2", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/b" } }),
+      row("e1", "tool", "编辑", { toolName: "Edit", inputJson: { file_path: "/a" } }),
+      row("g1", "tool", "搜索", { toolName: "WebSearch", inputJson: { query: "q" } }),
+    ])).toBe("读了 2 个文件、运行了 1 条命令、写了 1 个文件");
   });
 
   test("已清除目标不占过程，只剩它时没有空壳，普通句子里的同样字句还在", () => {
@@ -2387,9 +2485,8 @@ describe("MessageList Manus 过程披露", () => {
     expect(meta).not.toHaveTextContent(/token/i);
     expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
     const goalToggle = screen.getByTestId("process-toggle");
-    expect(goalToggle).toHaveTextContent("目标 1 项");
-    expect(goalToggle).toHaveTextContent("命令 1 项");
-    expect(goalToggle).not.toHaveTextContent("目标 2");
+    expect(goalToggle).toHaveTextContent("运行了 1 条命令");
+    expect(goalToggle).not.toHaveTextContent("目标");
     fireEvent.click(goalToggle);
     const historical = screen.getByTestId("process-goal");
     expect(within(historical).getByText("做完的目标")).toBeInTheDocument();
@@ -2492,7 +2589,8 @@ describe("MessageList Manus 过程披露", () => {
     expect(shell.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(screen.getByTestId("process-toggle"));
     for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
-    expect(screen.getByText("late-probe-cmd", { exact: false }).closest("[data-testid=process-disclosure]")).toBe(shell);
+    for (const details of screen.getAllByTestId("process-details")) expandDetailButtons(details, 2);
+    expect(screen.getAllByText("late-probe-cmd", { exact: false })[0]!.closest("[data-testid=process-disclosure]")).toBe(shell);
   });
 
   // OCV5-307 实况(webmuqjhduqb0ifd9 / tape b16e514b):网关把 turn 终态错误(codex serverOverloaded)
@@ -2514,7 +2612,7 @@ describe("MessageList Manus 过程披露", () => {
     );
     const shells = screen.getAllByTestId("process-disclosure");
     expect(shells).toHaveLength(1);
-    expect(screen.getByTestId("process-toggle")).toHaveTextContent("命令 4 项");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("运行了 4 条命令");
     const answer = screen.getByText("已明确：新增模型按个人版价格上线").closest("[data-testid=assistant-row]");
     const outcome = screen.getByText("模型暂不可用");
     if (!answer) throw new Error("missing answer row");
@@ -2543,6 +2641,50 @@ describe("MessageList Manus 过程披露", () => {
     expect(shell.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(answer.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(error.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  // 验收 r1 P1:bounds.next 停在普通回答上,总览写成「完成」,下面却是终态错误。
+  // 结局跟同轮终态走(到下一条用户消息为止);下一轮自己的完成不受影响。位置断言仍在上面的用例里。
+  test("同轮普通回答之后的终态错误让过程总览写没完成，下一轮仍写完成", () => {
+    renderList([
+      row("u", "user", "同步两边分支", { status: "replied" }),
+      row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      row("s2", "assistant", "审查发现一个不能直接合并的问题", { _clientMessageId: "u" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("err", "assistant", "合并中断", { _clientMessageId: "u", _errorCode: "model_not_available" }),
+      row("u2", "user", "下一轮", { status: "replied" }),
+      row("t2", "tool", "终端", { _clientMessageId: "u2", toolName: "Bash", inputJson: { command: "git status" }, _completed: true, output: "ok" }),
+      row("a2", "assistant", "下一轮已经对齐", { _clientMessageId: "u2" }),
+    ]);
+    const shells = screen.getAllByTestId("process-disclosure");
+    expect(shells).toHaveLength(2);
+    expect(within(shells[0]!).getByTestId("process-title")).toHaveTextContent(/^没完成 · 运行了 2 条命令$/);
+    expect(within(shells[0]!).getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "failed");
+    expect(within(shells[1]!).getByTestId("process-title")).toHaveTextContent(/^完成 · 运行了 1 条命令$/);
+    expect(within(shells[1]!).getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
+    const answer = screen.getByText("审查发现一个不能直接合并的问题").closest("[data-testid=assistant-row]");
+    const error = screen.getByText("模型暂不可用");
+    if (!answer) throw new Error("missing answer row");
+    expect(shells[0]!.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(answer.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(error.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 越过的中途错误不把过程总览写成没完成", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      row("err-mid", "assistant", "通用代码已生成商业版候选并推送", {
+        _clientMessageId: "u",
+        _errorCode: "model_not_available",
+        _errorDetail: '{"subtype":"error_during_execution","result":"Selected model is at capacity."}',
+        usage: { traceId: "trace-mid-err" },
+      }),
+      row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("answer", "assistant", "已合并并推送", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getByTestId("process-title")).toHaveTextContent(/^完成 · 运行了 2 条命令$/);
+    expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
   });
 });
 
@@ -2608,8 +2750,72 @@ test("OCV5-525: hidden next tail leaves the task summary visible outside the ste
   expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
 });
 
-// OCV5-640：同一轮聊天写「已执行 28 个步骤」、右栏写「17 步」。两处都只数工具调用；思考 / 子任务只进分类小计。
-test("过程条「已执行 N 个步骤」与右栏本轮步数同口径：只数工具调用", () => {
+// UI-3（体验官 C1/C2/C4）：过程默认是一行人话；展开后每步是「动词 + 对象」，命令、技能 ID、任务 ID、
+// 英文思考小标题只在点开那一步的「技术详情」里；查技能 / 平台自检 / --help 归成「准备工作 N 步」。
+test("UI-3 步骤行说人话，技术信息收进技术详情，底层步骤并成准备工作", () => {
+  const owner = { _clientMessageId: "u1" };
+  renderList([
+    row("u1", "user", "做一个番茄钟", { status: "replied", ts: 1_700_000_000_000 }),
+    row("sk", "tool", "查看技能", { ...owner, toolName: "mcp__openclaude-memory__skill_view", inputJson: { name: "coding-suite" }, _completed: true, output: "x" }),
+    row("sys", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "/run/oc/platform/current/bin/oc-system status" }, _completed: true, output: "ok" }),
+    row("th", "thinking", "**Planning the timer controls**\n\n先想按钮。", { ...owner }),
+    row("py", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "python - <<'PY'\nprint(1)\nPY" }, _completed: true, output: "1" }),
+    row("rd", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "/home/agent/.openclaude/uploads/周会记录.txt" }, _completed: true, output: "notes" }),
+    row("bad", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "/w/missing.txt" }, _completed: true, error: true, output: "File does not exist." }),
+    row("a1", "assistant", "做好了。", { ...owner, ts: 1_700_000_402_000 }),
+  ]);
+  // 历史轮外壳:结局 + 人话摘要 + 用时;附件和文件分开说;准备工作、思考不进摘要。
+  expect(screen.getByTestId("process-title")).toHaveTextContent("完成 · 运行了 1 条命令、读了 1 个附件、读了 1 个文件");
+  expect(screen.getByTestId("process-meta")).toHaveTextContent("6 分 42 秒");
+  expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  const titles = screen.getAllByTestId("process-step-row").map((node) => node.querySelector("button span")?.textContent);
+  expect(titles).toEqual(["思考", "运行命令", "读取 周会记录.txt", "读取 missing.txt"]);
+  expect(screen.getByTestId("process-prep")).toHaveTextContent("准备工作 2 步");
+  // 默认视图里没有命令、技能 ID、英文思考标题;失败的那一步写原因。
+  const rail = screen.getByTestId("process-stages");
+  expect(rail.textContent ?? "").not.toMatch(/<<'PY'|oc-system|coding-suite|Planning the timer/);
+  expect(screen.getByTestId("process-step-reason")).toHaveTextContent("File does not exist.");
+  // 点开一步才出现技术详情(原卡,命令原样);耗时不在技术详情里重复。
+  fireEvent.click(within(screen.getAllByTestId("process-step-row")[1]!).getAllByRole("button")[0]!);
+  const tech = screen.getByTestId("process-step-tech");
+  expect(tech).toHaveTextContent("技术详情");
+  expect(tech.textContent ?? "").toContain("python - <<'PY'");
+  expect(within(tech).queryByTestId("step-duration")).toBeNull();
+  fireEvent.click(within(screen.getByTestId("process-prep")).getAllByRole("button")[0]!);
+  expect(within(screen.getByTestId("process-prep")).getAllByTestId("process-step-row")).toHaveLength(2);
+});
+
+test("UI-3 停止的一轮外壳不写「完成」", () => {
+  const owner = { _clientMessageId: "u1" };
+  renderList([
+    row("u1", "user", "跑一下", { status: "replied" }),
+    row("c1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "a" }),
+    row("a1", "assistant", "", { ...owner, error: true, _errorCode: "stopped" }),
+  ]);
+  expect(screen.getByTestId("process-title")).toHaveTextContent("已停止 · 运行了 1 条命令");
+  expect(screen.getByTestId("process-title").textContent ?? "").not.toMatch(/完成/);
+  expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "stopped");
+  expect(screen.getAllByRole("status", { name: "已停止生成" })).toHaveLength(1);
+});
+
+test("UI-3 重试等阶段由 TurnActivity 一行说，过程外壳不再挂第二行「正在…」", () => {
+  const owner = { _clientMessageId: "u1" };
+  renderList([
+    row("u1", "user", "跑一下", { status: "sent" }),
+    row("c1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "a" }),
+  ], {
+    sending: true,
+    turnActivity: { startedAt: Date.now() - 5_000, agentName: "主助手", turnStatus: { kind: "retrying", attempt: 1, max: 3, retryAt: Date.now() + 1_000 } },
+  });
+  expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
+  expect(screen.getByTestId("turn-activity-footer")).toHaveTextContent(/重试/);
+});
+
+// OCV5-640：同一轮聊天写「已执行 28 个步骤」、右栏写「17 步」。UI-3 起过程条不再写步数(TurnSummary 是人话摘要 + 用时),
+// 两处不会再对不上;右栏的步数口径不变。
+test("过程条写人话摘要而不是步数，右栏本轮步数口径不变", () => {
   const messages = [
     row("u1", "user", "核对库存", { status: "replied" }),
     row("think-1", "thinking", "先看目录", { _clientMessageId: "u1" }),
@@ -2640,9 +2846,353 @@ test("过程条「已执行 N 个步骤」与右栏本轮步数同口径：只�
   renderList(messages);
   const panelSteps = collectPaneSteps(messages).turns[0]?.steps.length;
   expect(panelSteps).toBe(2);
-  expect(screen.getByTestId("process-title")).toHaveTextContent(`已执行 ${panelSteps} 个步骤`);
-  // 思考和子任务没有消失，仍在分类小计里。
-  const tally = screen.getByTestId("process-tally");
-  expect(within(tally).getByTitle("思考 3")).toBeInTheDocument();
-  expect(within(tally).getByTitle("子任务 1")).toBeInTheDocument();
+  expect(screen.getByTestId("process-title")).toHaveTextContent("完成 · 运行了 1 条命令、派出 1 个子任务、读了 1 个文件");
+  expect(screen.getByTestId("process-title").textContent ?? "").not.toMatch(/步/);
+  expect(screen.queryByTestId("process-tally")).not.toBeInTheDocument();
+});
+
+// P3（体验官 10-29 pm）：没发附件却写「读取 1 个文件」。读技能说明是准备工作；`cat > f <<EOF` 是写；
+// 只有读 uploads 目录才叫附件；等子任务不是又一条命令。
+test("P3 读取归类：技能说明、heredoc 写文件、附件、等待委派各归其位", () => {
+  const bash = (id: string, command: string) => row(id, "tool", "终端", { toolName: "Bash", inputJson: { command } });
+  expect(workSummary([bash("s", "cat /home/agent/.openclaude/skills/docx/SKILL.md")])).toBe("");
+  expect(workSummary([bash("w", "cat > /home/agent/.openclaude/generated/纪要.md <<'EOF'\n# 纪要\nEOF")])).toBe("写了 1 个文件");
+  expect(workSummary([bash("r", "cat /tmp/a.txt 2>/dev/null")])).toBe("读了 1 个文件");
+  expect(workSummary([bash("u", "cat /home/agent/.openclaude/uploads/周会.txt")])).toBe("读了 1 个附件");
+  expect(workSummary([row("ur", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/home/agent/.openclaude/uploads/周会.txt" } })])).toBe("读了 1 个附件");
+  expect(workSummary([bash("dw", "oc-memory delegate-wait dlgjob-mvon5yk2-7398486c106a")])).toBe("");
+});
+
+// P3：团队模式下看不出发生了委派。过程里的委派步骤写「委派给 谁：做什么」+ 进行中 / 完成。
+test("P3 委派步骤写出谁接了、做什么、进行中 / 完成", () => {
+  const owner = { _clientMessageId: "u1" };
+  const view = renderList([
+    row("u1", "user", "审一下报告", { status: "replied" }),
+    row("c1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "a" }),
+    row("ag", "agent-group", "检查报告格式", { ...owner, _delegate: true, _delegateAgentId: "researcher", _delegateGoal: "检查报告格式", _completed: true }),
+    row("a1", "assistant", "审完了。", { ...owner }),
+  ]);
+  expect(screen.getByTestId("process-title")).toHaveTextContent("派出 1 个子任务");
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  const step = screen.getAllByTestId("process-step-row").find((node) => (node.textContent ?? "").includes("委派给"))!;
+  expect(step).toHaveTextContent("委派给 researcher：检查报告格式");
+  expect(within(step).getByTestId("process-delegate-state")).toHaveTextContent("完成");
+  // 原委派卡(子代理的过程)在技术详情里,标题也写出接手的子代理。
+  fireEvent.click(within(step).getAllByRole("button")[0]!);
+  expect(within(step).getByTestId("agent-group-assignee")).toHaveTextContent("委派给 researcher");
+  view.unmount();
+
+  renderList([
+    row("u1", "user", "审一下报告", { status: "sent" }),
+    row("ag", "agent-group", "检查报告格式", { ...owner, _delegate: true, _delegateAgentId: "researcher", _delegateGoal: "检查报告格式" }),
+  ], { sending: true, turnActivity: { startedAt: Date.now() - 5_000, agentName: "主助手" } });
+  expect(screen.getByTestId("process-step-live")).toHaveTextContent("委派给 researcher：检查报告格式");
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) {
+    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+  }
+  expect(screen.getByTestId("process-delegate-state")).toHaveTextContent("进行中");
+});
+
+// U6(A81)：委派卡计数不一致。多个子任务合成单个 TeamPanel(含同一子代理接多单)或 fan-out delegate_tasks 时，
+// 过程总览、分组折叠行与委派步骤标题的子任务数必须与实际子任务数一致。
+test("U6 委派多子任务在过程总览、分组折叠行与 TeamPanel 步骤间计数一致", () => {
+  const owner = { _clientMessageId: "u1" };
+  renderList([
+    row("u1", "user", "对比三款笔记软件", { status: "replied" }),
+    row("c1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "a" }),
+    row("ag1", "agent-group", "调研 Notion", { ...owner, _delegate: true, _delegateAgentId: "research-assistant", _delegateGoal: "调研 Notion", _completed: true }),
+    row("ag2", "agent-group", "调研 Obsidian", { ...owner, _delegate: true, _delegateAgentId: "research-assistant", _delegateGoal: "调研 Obsidian", _completed: true }),
+    row("ag3", "agent-group", "调研 Logseq", { ...owner, _delegate: true, _delegateAgentId: "research-assistant", _delegateGoal: "调研 Logseq", _completed: true }),
+    row("a1", "assistant", "三款软件对比如下。", { ...owner }),
+  ]);
+  expect(screen.getByTestId("process-title")).toHaveTextContent("派出 3 个子任务");
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  const detailToggle = screen.getByTestId("process-detail-toggle");
+  expect(detailToggle).toHaveTextContent("派出 3 个子任务");
+  fireEvent.click(detailToggle);
+  const step = screen.getAllByTestId("process-step-row").find((node) => (node.textContent ?? "").includes("委派给"))!;
+  expect(step).toHaveTextContent("委派给 research-assistant（3 个子任务）");
+  fireEvent.click(within(step).getAllByRole("button")[0]!);
+  expect(step).toHaveTextContent("3 个智能体");
+
+  const fanoutCall = row("df", "tool", "并行委派", {
+    ...owner,
+    toolName: "mcp__openclaude-memory__delegate_tasks",
+    inputJson: {
+      tasks: [
+        { agentId: "research-assistant", goal: "调研 Notion" },
+        { agentId: "research-assistant", goal: "调研 Obsidian" },
+        { agentId: "coding-assistant", goal: "校验导入脚本" },
+      ],
+    },
+    _completed: true,
+    output: "并行委派 3 个子任务已全部返回:3 成功 / 0 失败。",
+  });
+  expect(workSummary([fanoutCall])).toBe("派出 3 个子任务");
+  expect(
+    workSummary([
+      fanoutCall,
+      row("ag1", "agent-group", "调研 Notion", { _delegate: true, _completed: true }),
+      row("ag2", "agent-group", "调研 Obsidian", { _delegate: true, _completed: true }),
+      row("ag3", "agent-group", "校验导入脚本", { _delegate: true, _completed: true }),
+    ]),
+  ).toBe("派出 3 个子任务");
+});
+
+
+test("the real stopped narration projection has one Continue bound to its canonical raw message", () => {
+  const user = { id: "stopped-human", role: "user", text: "原始目标", ts: 1, status: "error" } as ChatMessage;
+  const stopped = { id: "stopped-narration", role: "assistant", text: "已经完成第一步", ts: 2,
+    _errorCode: "USER_CANCELLED", _clientMessageId: user.id } as ChatMessage;
+  const tool = { id: "stopped-tool", role: "tool", text: "", ts: 3, toolName: "Read", output: "saved",
+    _completed: true, _clientMessageId: user.id } as ChatMessage;
+  const messages = [user, stopped, tool];
+  const go = vi.fn();
+  render(<MessageList messages={messages} sending={false}
+    cb={{ resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view),
+      onContinueInterrupted: (view) => {
+        const canonical = canonicalTaskContinuationError(messages, view);
+        if (canonical && manualTaskContinuationSource(messages, view)) go(canonical.id);
+      } }} onRespondPermission={() => {}} />);
+  const buttons = screen.getAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(stopped.id);
+  expect(messages).toEqual([user, stopped, tool]);
+  expect(stopped._continuationSourceId).toBeUndefined();
+});
+
+
+test("real dispatch status keeps one Continue before its hidden duplicate engine error", async () => {
+  const user = row("double-failure-human", "user", "原始部署目标", { status: "error", _source: "server" });
+  const status = row("turn-status:double-failure-human", "system", "", {
+    _source: "server", _turnStatusRecord: true, _dispatchTerminal: true,
+    _errorCode: "dispatch_lost", _clientMessageId: user.id });
+  const duplicate = row("double-failure-error", "assistant", "", {
+    _source: "server", _errorCode: "ENGINE_ERROR", _clientMessageId: user.id });
+  const messages = [user, status, duplicate];
+  const before = JSON.stringify(messages);
+  const go = vi.fn();
+  renderList(messages, { cb: {
+    resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view), onContinueInterrupted: go,
+  } });
+  const buttons = await screen.findAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  expect(screen.getAllByText("消息未开始处理")).toHaveLength(1);
+  expect(screen.queryByText("任务执行失败")).toBeNull();
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(status);
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+test("eleven real failed attempts render one final status and Continue while all 33 raw rows survive", async () => {
+  const messages: ChatMessage[] = [];
+  for (let attempt = 0; attempt <= 10; attempt++) {
+    const id = `dispatch-attempt-${attempt}`;
+    messages.push(row(id, "user", attempt ? "RECOVERY_CONTROL" : "原始目标", {
+      status: "error", _source: "server", ts: 1_700_000_000_000 + attempt * 3,
+      ...(attempt ? { _recoveryOfClientMessageId: `dispatch-attempt-${attempt - 1}`, _recoveryMode: "replay" as const,
+        _automaticRecovery: true, _automaticRecoveryRootClientMessageId: "dispatch-attempt-0",
+        _automaticRecoveryAttempt: attempt, _automaticRecoveryMax: 10 } : {}) }),
+    row(`turn-status:${id}`, "system", "", { _source: "server", _turnStatusRecord: true, _dispatchTerminal: true,
+      _errorCode: "dispatch_lost", _clientMessageId: id, ts: 1_700_000_000_001 + attempt * 3 }),
+    row(`duplicate:${id}`, "assistant", "", { _source: "server", _errorCode: "ENGINE_ERROR",
+      _clientMessageId: id, ts: 1_700_000_000_002 + attempt * 3 }));
+  }
+  const before = JSON.stringify(messages);
+  const go = vi.fn();
+  renderList(messages, { cb: {
+    resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view), onContinueInterrupted: go,
+  } });
+  const buttons = await screen.findAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  expect(screen.getAllByText("消息未开始处理")).toHaveLength(1);
+  expect(screen.queryByText("任务执行失败")).toBeNull();
+  expect(screen.queryByText("RECOVERY_CONTROL")).toBeNull();
+  expect(manualTaskContinuationSource(messages, messages[31])).toBe(messages[0]);
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(messages[31]);
+  expect(messages).toHaveLength(33);
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+
+test("an admitted manual checkpoint retires the old failed UserCard through running and success", async () => {
+  const source = row("retired-user-source", "user", "原始目标", { status: "error", _source: "server" });
+  const saved = row("retired-saved-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo saved" },
+    output: "saved", _completed: true, _source: "server", _clientMessageId: source.id });
+  const error = row("retired-source-error", "assistant", "", { _errorCode: "ENGINE_ERROR", _source: "server",
+    _clientMessageId: source.id, _errorCardSnapshot: { disposition: "card", tone: "red", title: "原失败", message: "原任务未完成" } });
+  const original = [source, saved, error];
+  const before = JSON.stringify(original);
+  let messages = original;
+  let sending = false;
+  const go = vi.fn();
+  const cb = { onContinueInterrupted: go,
+    resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+  const screenState = () => <MessageList processDisclosure messages={messages} sending={sending}
+    sessionId="session-a" cb={cb} onRespondPermission={() => {}} />;
+  const view = render(screenState());
+  expect(await screen.findAllByRole("button", { name: "继续" })).toHaveLength(1);
+  const child = row("retired-manual-child", "user", "CHECKPOINT_CONTROL", { status: "sent", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const active = row("retired-running-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo resumed" },
+    _completed: false, _source: "server", _clientMessageId: child.id });
+  messages = [...original, child, active];
+  sending = true;
+  view.rerender(screenState());
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByText("发送失败")).toBeNull();
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(screen.queryByText("CHECKPOINT_CONTROL")).toBeNull();
+  messages = [...original, { ...child, status: "replied" }, { ...active, _completed: true, output: "done" },
+    row("retired-success", "assistant", "继续后完成", { _source: "server", _clientMessageId: child.id })];
+  sending = false;
+  view.rerender(screenState());
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByText("发送失败")).toBeNull();
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+  // A later failed human send is independent and must retain its own recovery action.
+  const newest = row("new-independent-failure", "user", "新的失败目标", { status: "error" });
+  messages = [...messages, newest];
+  view.rerender(screenState());
+  const action = await screen.findByRole("button", { name: "继续" });
+  expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
+  fireEvent.click(action);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(newest);
+  expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+});
+
+test("a refused checkpoint returns the original source; a real failed child owns one new Continue", async () => {
+  const source = row("refused-user-source", "user", "原始目标", { status: "error", _source: "server" });
+  const error = row("refused-source-error", "assistant", "", { _errorCode: "ENGINE_ERROR", _source: "server",
+    _clientMessageId: source.id, _recoverySkippedNotice: "未从断点继续，原任务仍已保留。",
+    _errorCardSnapshot: { disposition: "card", tone: "red", title: "原失败", message: "原任务未完成" } });
+  let messages = [source, error];
+  const go = vi.fn();
+  const cb = { onContinueInterrupted: go,
+    resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+  const screenState = () => <MessageList messages={messages} sending={false} sessionId="session-a"
+    cb={cb} onRespondPermission={() => {}} />;
+  const view = render(screenState());
+  fireEvent.click(await screen.findByRole("button", { name: "继续" }));
+  expect(go).toHaveBeenLastCalledWith(error);
+  go.mockClear();
+  const child = row("new-failed-child", "user", "CHECKPOINT_CONTROL", { status: "error", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const terminal = row("new-child-error", "assistant", "", { _source: "server", _errorCode: "ENGINE_ERROR", _clientMessageId: child.id });
+  messages = [source, error, child, terminal];
+  view.rerender(screenState());
+  const actions = await screen.findAllByRole("button", { name: "继续" });
+  expect(actions).toHaveLength(1);
+  expect(screen.queryByText("发送失败")).toBeNull();
+  fireEvent.click(actions[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(terminal);
+});
+
+test.each(["committed", "uncommitted", "held"] as const)(
+  "manual checkpoint preserves the paid partial answer through completion and reload (%s)",
+  async (snapshot) => {
+    const source = row("paid-source", "user", "完成报告，保留已执行步骤", { status: "error", _source: "server" });
+    const saved = row("paid-saved-tool", "tool", "", { toolName: "Read", inputJson: { file_path: "saved-report.md" },
+      output: "SAVED_REPORT_RESULT", _completed: true, _source: "server", _clientMessageId: source.id });
+    const diagnostic = 'API Error: {"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"PRIVATE_DIAGNOSTIC"}}';
+    const error = row("paid-partial-error", "assistant", `SAVED_PAID_FIRST_PARAGRAPH\n\nSAVED_PAID_SECOND_PARAGRAPH\n\n${diagnostic}`, {
+      _source: "server", _clientMessageId: source.id, _errorCode: "MODEL_AUTHORITY_EXPIRED",
+      _turnTapeId: "paid-tape", _turnTapeComplete: true, _dispatchOutcome: "crashed",
+      usage: { costCredits: "71", waived: false, inputTokens: 50, outputTokens: 100 },
+      _errorHeldForRecovery: snapshot === "held" ? true : undefined,
+      _errorCardSnapshot: snapshot === "committed"
+        ? { disposition: "card", tone: "red", title: "原中断提示", message: "原任务未完成" }
+        : undefined,
+    });
+    const original = [source, saved, error];
+    const before = JSON.stringify(original);
+    let messages = original;
+    let sending = false;
+    const cb = { onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+    const screenState = () => <MessageList processDisclosure messages={messages} sending={sending}
+      sessionId="session-a" cb={cb} onRespondPermission={() => {}} />;
+    const view = render(screenState());
+    expect(await screen.findByText("SAVED_PAID_FIRST_PARAGRAPH")).toBeVisible();
+
+    const assertSavedBody = () => {
+      expect(screen.getByText("SAVED_PAID_FIRST_PARAGRAPH")).toBeVisible();
+      expect(screen.getByText("SAVED_PAID_SECOND_PARAGRAPH")).toBeVisible();
+      expect(screen.queryByText(/PRIVATE_DIAGNOSTIC/)).toBeNull();
+      expect(screen.queryByText("原中断提示")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+      expect(screen.queryByText("MANUAL_CHECKPOINT_CONTROL")).toBeNull();
+      expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+    };
+    const assertSavedUsage = () => {
+      const answer = screen.getByText("SAVED_PAID_FIRST_PARAGRAPH").closest("[data-testid=assistant-row]");
+      if (!answer) throw new Error("missing saved partial answer row");
+      expect(within(answer as HTMLElement).getByLabelText("消耗 71 积分")).toHaveTextContent("71 积分");
+      expect(screen.queryByLabelText("本轮已免单")).toBeNull();
+    };
+    const child = row("paid-manual-child", "user", "MANUAL_CHECKPOINT_CONTROL", { status: "sent", _source: "server",
+      _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+    const active = row("paid-continuing-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo continue" },
+      _source: "server", _clientMessageId: child.id, _completed: false });
+    messages = [...original, child, active];
+    sending = true;
+    view.rerender(screenState());
+    assertSavedBody();
+
+    messages = [...original, { ...child, status: "replied" }, { ...active, _completed: true, output: "done" },
+      row("paid-finished", "assistant", "CONTINUED_PAID_ANSWER", { _source: "server", _clientMessageId: child.id })];
+    sending = false;
+    view.rerender(screenState());
+    expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
+    assertSavedBody();
+    assertSavedUsage();
+    expect(
+      screen.getByText("SAVED_PAID_FIRST_PARAGRAPH").compareDocumentPosition(screen.getByText("CONTINUED_PAID_ANSWER")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText("没完成")).toBeNull();
+
+    // A fresh component receives only the persisted rows, without a local held-card repair.
+    view.unmount();
+    messages = JSON.parse(JSON.stringify(messages)) as ChatMessage[];
+    render(screenState());
+    expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
+    assertSavedBody();
+    assertSavedUsage();
+    expect(
+      screen.getByText("SAVED_PAID_FIRST_PARAGRAPH").compareDocumentPosition(screen.getByText("CONTINUED_PAID_ANSWER")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText("没完成")).toBeNull();
+  },
+);
+
+test("a manually continued diagnostic-only error does not become a saved answer", async () => {
+  const source = row("diagnostic-source", "user", "继续原任务", { status: "error", _source: "server" });
+  const error = row("diagnostic-only-error", "assistant",
+    'API Error: {"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"PRIVATE_DIAGNOSTIC"}}', {
+      _source: "server", _clientMessageId: source.id, _errorCode: "MODEL_AUTHORITY_EXPIRED",
+      _errorCardSnapshot: { disposition: "card", tone: "red", title: "原中断提示", message: "原任务未完成" },
+    });
+  const child = row("diagnostic-manual-child", "user", "MANUAL_CHECKPOINT_CONTROL", { status: "replied", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const messages = [source, error, child,
+    row("diagnostic-finished", "assistant", "CONTINUED_WITHOUT_DIAGNOSTIC", { _source: "server", _clientMessageId: child.id })];
+  const before = JSON.stringify(messages);
+  renderList(messages);
+  expect(await screen.findByText("CONTINUED_WITHOUT_DIAGNOSTIC")).toBeVisible();
+  expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
+  expect(screen.queryByText(/PRIVATE_DIAGNOSTIC|MODEL_AUTHORITY_INVALID/)).toBeNull();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(JSON.stringify(messages)).toBe(before);
 });

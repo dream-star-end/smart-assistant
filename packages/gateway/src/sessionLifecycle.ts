@@ -1,3 +1,4 @@
+import { withFreshPromptPrivacy } from './promptPrivacyRuntime.js'
 import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
 /**
  * Session runner lifecycle: preheat, repo-change recycle, eviction loop, shutdown/destroy, idle drain, execution target and model switch
@@ -17,8 +18,13 @@ import {
   pruneIdleOps,
   readIdleReset,
   IdleCompactRejected,
+  clearIdleCandidate,
+  readPendingIdle,
+  writeIdleCandidate,
 } from './boxIdleCompact.js'
+import { boxIdlePreExpiryMs, cancelIdlePreExpiry } from './boxContextBudget.js'
 import { decideEngineCwd } from './engineCwd.js'
+import { clearFrozenPrompt } from './promptFreeze.js'
 import { type ExecutionTarget, RemoteTargetUnavailableError } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { log } from './sessionManagerLog.js'
@@ -142,7 +148,11 @@ export async function preheatRunner(
       }
       const deadlineMs = resolveEnginePreheatDeadlineMs()
       try {
-        await withPreheatDeadline(session.runner.preheat!(), deadlineMs)
+        await withFreshPromptPrivacy(runner, session.peerId, () => withPreheatDeadline(runner.preheat!(), deadlineMs), {
+          assertCurrent: () => {
+            if (session._plannedTeardown || session._replacing || session.runner !== runner || this.sessions.get(session.sessionKey) !== session) throw new Error('SESSION_PREHEAT_PRIVACY_CANCELLED')
+          },
+        })
       } catch (err) {
         if (!isPreheatDeadline(err)) throw err
         log.warn('engine_preheat', {
@@ -490,6 +500,9 @@ export async function destroySession(
     // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目让后续 recycle 找到死 session)。
     this._sessionIdToKey.delete(s.peerId)
   }
+  // OCV5-755: a destroyed conversation must not inherit the old prompt snapshot.
+  clearFrozenPrompt(paths.home, sessionKey)
+  if (s) cancelIdlePreExpiry(s)
   // Always clear resume-map (handles both live and evicted sessions)
   if (this._resumeMap.has(sessionKey)) {
     this._resumeMap.delete(sessionKey)
@@ -578,7 +591,8 @@ export function scheduleIdleDrain(
         return
       const source = currentIdleSource(paths.home, session.sessionKey)
       if (!source) return
-      await this.finishIdleUnderLock(session, source)
+      const outcome = await this.finishIdleUnderLock(session, source)
+      if (outcome === 'deferred') armIdlePreExpiry(this, session, source)
       again = currentIdleSource(paths.home, session.sessionKey) !== undefined
     } catch (err) {
       again = true
@@ -613,6 +627,8 @@ export async function applyIdleResetIfRequested(
   }
   if (session.runner.isRunning) await session.runner.shutdown().catch(() => {})
   const sessionKey = session.sessionKey
+  clearFrozenPrompt(paths.home, sessionKey)
+  cancelIdlePreExpiry(session)
   this._resumeMap.delete(sessionKey)
   this._resumeMapTimestamps.delete(sessionKey)
   this._resumeMapProvider.delete(sessionKey)
@@ -901,4 +917,96 @@ export function armRuntimeRecycleDrain(
   }
   if (activeTurns > 0) this.releaseRuntimeRecycleDrain()
   return { accepted: activeTurns === 0, activeTurns }
+}
+
+
+/**
+ * OCV5-755: compact an idle Box session shortly before its 1h prompt cache
+ * expires, while the summary request can still read the cached prefix. Only
+ * the newest source counts; any submit in between cancels the timer. Best
+ * effort: a gateway restart drops it (nothing is durable before it fires).
+ */
+function armIdlePreExpiry(
+  host: SessionLifecycleHost,
+  session: AgentSession,
+  source: { sessionId: string; turnKey: string },
+): void {
+  cancelIdlePreExpiry(session)
+  const delay = boxIdlePreExpiryMs(paths.home)
+  if (delay <= 0) return
+  session._idlePreExpirySource = source
+  const timer = setTimeout(() => runIdlePreExpiry(host, session, source), delay)
+  timer.unref?.()
+  session._idlePreExpiryTimer = timer
+  log.info('box_idle_pre_expiry_armed', { sessionKey: session.sessionKey, delayMin: Math.round(delay / 60_000) })
+}
+
+function runIdlePreExpiry(
+  host: SessionLifecycleHost,
+  session: AgentSession,
+  source: { sessionId: string; turnKey: string },
+): void {
+  if (session._idlePreExpirySource !== source) return
+  session._idlePreExpiryTimer = undefined
+  session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
+  void (async () => {
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((resolve) => (release = resolve))
+    const startedAt = Date.now()
+    let outcome = 'skipped'
+    let wroteCandidate = false
+    try {
+      await prev
+      if (
+        session._idlePreExpirySource !== source ||
+        host.sessions.get(session.sessionKey) !== session ||
+        session._plannedTeardown ||
+        session._replacing ||
+        (session._activeTurnCount ?? 0) > 0 ||
+        // An external turn, reset or new native session replaced what this op would summarize.
+        session.runner.nativeSessionId !== source.sessionId ||
+        currentIdleSource(paths.home, session.sessionKey)
+      )
+        return
+      session._idlePreExpirySource = undefined
+      session._idlePreExpiryActive = true
+      wroteCandidate = true
+      writeIdleCandidate(paths.home, {
+        v: 1,
+        sessionKey: session.sessionKey,
+        sessionId: source.sessionId,
+        turnKey: source.turnKey,
+        createdAt: Date.now(),
+      })
+      await host.finishIdleUnderLock(session, source, paths.home, 'pre_expiry')
+      outcome = readPendingIdle(paths.home, session.sessionKey) ? 'pending' : 'settled'
+    } catch (err) {
+      outcome = 'failed'
+      if (!(err instanceof IdleCompactRejected)) {
+        log.warn('box idle pre-expiry compaction failed', { sessionKey: session.sessionKey }, err)
+      }
+    } finally {
+      // Proof not ready, or a throw before the op existed: the candidate written
+      // above must not outlive this attempt, or the next user turn would be
+      // refused with IDLE_HISTORY_PENDING. An op that does exist settles normally.
+      if (wroteCandidate) {
+        try {
+          if (!readPendingIdle(paths.home, session.sessionKey)) clearIdleCandidate(paths.home, session.sessionKey)
+        } catch (err) {
+          log.warn('box idle pre-expiry candidate cleanup failed', { sessionKey: session.sessionKey }, err)
+        }
+      }
+      session._idlePreExpiryActive = false
+      session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
+      release()
+      log.info('box_idle_pre_expiry', {
+        sessionKey: session.sessionKey,
+        outcome,
+        elapsedMs: Date.now() - startedAt,
+      })
+    }
+    // A pending op settles on the next drain or submit, same as after-turn idle work.
+    if (outcome === 'pending') host.scheduleIdleDrain(session)
+  })()
 }

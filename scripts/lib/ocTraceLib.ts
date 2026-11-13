@@ -9,6 +9,7 @@ export type Source =
   | 'turn_dispatches'
   | 'request_finalize_journal'
   | 'usage_records'
+  | 'credit_ledger'
   | 'turn_upstream_performance'
   | 'turn_runtime_observations'
   | 'master-log'
@@ -38,6 +39,7 @@ export const RETENTION_DAYS: Record<Source, number | null> = {
   request_finalize_journal: null, // conditional GC by updated_at; see JOURNAL_RETENTION_POLICY
   turn_dispatches: null,
   usage_records: null,
+  credit_ledger: null,
   'master-log': 14, // logrotate daily, rotate 14, maxsize 200M (may be shorter under load)
   'egress-log': 14,
   'container-log': 14, // saved before removal to /var/log/openclaude-v5-containers (§7.5, OCV5-568), pruned at 14 days / 1 GiB
@@ -190,6 +192,12 @@ export function eventsFromRows(source: Source, rows: Record<string, string>[]): 
         break
       case 'turn_runtime_observations':
         add(r, 'observed_at', 'runtime.observed')
+        break
+      case 'credit_ledger':
+        // the chain's billing end: one row per bucket debited (or refunded) for a usage row
+        add(r, 'created_at', `ledger.${r.reason || 'entry'}${r.bucket ? `:${r.bucket}` : ''}`, {
+          ids: pick(r, ['ledger_id', 'usage_id']),
+        })
         break
       default:
         break

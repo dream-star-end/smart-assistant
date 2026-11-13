@@ -6,10 +6,11 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 /** Supervised stream JSONL is already refused above 1 MiB. A summary is model
  * text inside that stream, so its UTF-8 size stays under the stream cap and
  * still above a short fixture. 512 KiB leaves the billed turn room in 1 MiB.
- * Preserved UUID lists use the existing 128-round product cap, not an
- * unbounded tail and not the previous ungrounded cap of 8. */
+ * Preserved UUID metadata has its own bounded byte budget. It is unrelated
+ * to the number of physical invocations in the logical task. */
 export const MAX_SUMMARY_UTF8_BYTES = 512 * 1024;
-export const MAX_PRESERVED_UUIDS = 128;
+// A quoted UUID and its comma occupy at least 39 bytes in the carrier.
+export const MAX_PRESERVED_UUIDS = Math.floor(MAX_SUMMARY_UTF8_BYTES / 39);
 export type BoxCliCompactionPhase = "pre-model" | "in-model";
 
 export class BoxCliCompactionError extends Error {

@@ -459,7 +459,7 @@ class Host:
         if '--permission-mode' in self.args:
             i = self.args.index('--permission-mode')
             mode = self.args[i + 1] if i + 1 < len(self.args) else mode
-        env = ['HOME=/home/box', 'PATH=' + PATH, 'LANG=C.UTF-8', 'TERM=xterm-256color',
+        env = ['HOME=' + os.environ.get('HOME', '/home/box'), 'PATH=' + PATH, 'LANG=C.UTF-8', 'TERM=xterm-256color',
                'DISABLE_AUTOUPDATER=1', 'OC_BRIDGE_DIR=' + self.run_dir, 'OC_BRIDGE_PERMISSION_MODE=' + mode]
         if self.config_dir:
             env.append('CLAUDE_CONFIG_DIR=' + self.config_dir)

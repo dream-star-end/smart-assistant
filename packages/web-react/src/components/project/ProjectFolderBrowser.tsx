@@ -121,7 +121,7 @@ export function ProjectFolderBrowser({
       ) : error === "load" ? (
         <Alert tone="danger" title="项目文件夹没有加载出来">
           <Button size="sm" variant="secondary" onClick={() => void load(path)}>
-            重试
+            继续
           </Button>
         </Alert>
       ) : !listing ? (

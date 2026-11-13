@@ -112,10 +112,17 @@ function grokMcpOutputText(obj: Record<string, unknown>): string | null {
 function unwrapUseTool(input: unknown): { name: string; input: unknown } | null {
   const obj = recordOf(input);
   if (!obj) return null;
-  const qualified = pickString(obj, "tool_name", "name");
-  if (!qualified || (!qualified.includes("__") && !qualified.startsWith("mcp__"))) return null;
-  const inner = obj.tool_input ?? obj.arguments ?? obj.input ?? obj.toolInput;
-  return { name: qualified, input: inner ?? {} };
+  const inner = obj.tool_input ?? obj.arguments ?? obj.Arguments ?? obj.input ?? obj.toolInput ?? obj.params;
+  const qualified = pickString(obj, "tool_name", "ToolName", "name", "tool");
+  if (qualified && (qualified.includes("__") || qualified.startsWith("mcp__"))) {
+    return { name: qualified, input: inner ?? {} };
+  }
+  const server = pickString(obj, "server", "server_name", "serverIdentifier", "ServerName");
+  const tool = pickString(obj, "tool_name", "ToolName", "tool", "name");
+  if (server && tool && !tool.includes("__")) {
+    return { name: `mcp__${server}__${tool}`, input: inner ?? {} };
+  }
+  return null;
 }
 
 export function grokProductToolOutput(raw: unknown): string {
@@ -226,8 +233,8 @@ export function grokProductToolName(nativeName: string, input?: unknown): string
     const unwrapped = unwrapUseTool(input);
     if (unwrapped) return grokProductToolName(unwrapped.name, unwrapped.input);
     const obj = recordOf(input);
-    const server = obj ? pickString(obj, "server", "server_name", "serverIdentifier") : "";
-    const tool = obj ? pickString(obj, "tool_name", "tool", "name") : "";
+    const server = obj ? pickString(obj, "server", "server_name", "serverIdentifier", "ServerName") : "";
+    const tool = obj ? pickString(obj, "tool_name", "ToolName", "tool", "name") : "";
     if (server && tool && !tool.includes("__")) return `mcp__${server}__${tool}`;
   }
   const mapped = GROK_PRODUCT_NAMES[key];

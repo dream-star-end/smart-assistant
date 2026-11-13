@@ -56,7 +56,7 @@ it('ignores hint removal, other keys, reset links and tabs that are already sign
   expect(refreshCalls(fetcher)).toBe(1)
 })
 
-it('an in-page server invalidation reports the expiry; boot failure and explicit logout stay quiet', async () => {
+it('in-page invalidation and a dead boot cookie both report expiry; explicit logout stays quiet', async () => {
   const fetcher = signedInFetch()
   vi.stubGlobal('fetch', fetcher)
   localStorage.setItem('oc_auth_hint', '1')
@@ -84,8 +84,8 @@ it('an in-page server invalidation reports the expiry; boot failure and explicit
   const bootClear = vi.fn()
   const deadCookie = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: bootClear, onSessionExpired }))
   await waitFor(() => expect(bootClear).toHaveBeenCalledTimes(1))
-  expect(deadCookie.result.current.authError).toBeNull()
-  expect(onSessionExpired).toHaveBeenCalledTimes(1)
+  expect(deadCookie.result.current.authError).toBe(SESSION_EXPIRED_MESSAGE)
+  expect(onSessionExpired).toHaveBeenCalledTimes(2)
 })
 
 // OCV5-638: both boot rounds ran the whole REFRESH_RACE ladder without ever seeing a new cookie — this

@@ -1,5 +1,6 @@
 export * from './frames.js'
 export * from './uploadLimits.js'
+export * from './uploadChunkSizing.js'
 export * from './contextPressure.js'
 export * from './liveUnits.js'
 export * from './timelineLifecycle.js'
@@ -78,4 +79,33 @@ export {
 } from './boxGptWebModels.js'
 
 export * from './ccbTranscriptRestore.js'
+export * from './promptPrivacy.js'
+export * from './systemActions.js'
+
+export type { ModelSwitchCostRequest, ModelSwitchCostQuote, ModelSwitchCostRange, ModelSwitchCostAuthorization, ModelSwitchUnitPrice } from './modelSwitchCost.js'
+export * from './systemHelp.js'
+
 export * from './automaticRetryStatus.js'
+export * from './advisorReadOnly.js'
+
+export {
+  G8_BOX_REJECT_CODES,
+  g8CompactSummaryCheckpointInput,
+  g8TurnEndCheckpointInput,
+  judgeG8Replay,
+  resetG8ReplayCheckpointForTest,
+  runG8ReplayCheckpoint,
+  setG8ReplayChecker,
+  setG8ReplayCheckpoint,
+} from './g8ReplayJudge.js'
+export type {
+  G8ReplayObservation,
+  G8ReplayPoint,
+  G8ReplayVerdict,
+  G8ReplayVerdictName,
+} from './g8ReplayJudge.js'
+
+export * from './cc5TestModel.js'
+export * from './cc5Backend.js'
+export * from './remoteExecutionBackend.js'
+export * from './remotePool/index.js'

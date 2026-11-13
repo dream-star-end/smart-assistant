@@ -18,6 +18,7 @@ import {
   runUserContentReview,
   setContentReviewAlerter,
   setContentReviewDepsForTests,
+  setContentReviewPrefilter,
 } from '../jevContentReview.js'
 
 describe('jev content review', () => {
@@ -114,6 +115,111 @@ describe('jev content review', () => {
     await flushContentReviewForTests()
     assert.equal(alerts, 0)
     assert.equal(store.list(20).some((row) => row.choice === 'none'), true)
+  })
+
+  it('omni prefilter hit records a violation and does not call Jev', async () => {
+    process.env[CONTENT_REVIEW_FLAG] = '1'
+    process.env[CONTENT_REVIEW_KEY] = 'test-key'
+    let calls = 0
+    setContentReviewPrefilter(async () => true)
+    setContentReviewDepsForTests({
+      fetchImpl: async () => {
+        calls += 1
+        return { status: 200, json: async () => ({}) }
+      },
+    })
+    const row = await runUserContentReview({ text: 'hello there friend', userId: '3', sessionKey: 's' })
+    assert.equal(calls, 0)
+    assert.equal(row?.choice, 'policy_violation')
+    assert.equal(row?.thresholdMet, true)
+  })
+
+  it('omni prefilter failure still calls Jev', async () => {
+    process.env[CONTENT_REVIEW_FLAG] = '1'
+    process.env[CONTENT_REVIEW_KEY] = 'test-key'
+    let calls = 0
+    setContentReviewPrefilter(async () => {
+      throw new Error('down')
+    })
+    setContentReviewDepsForTests({
+      fetchImpl: async () => {
+        calls += 1
+        return {
+          status: 200,
+          json: async () => ({ answers: { risk: { choice: 'none', confidence: 0.99 } } }),
+        }
+      },
+    })
+    const row = await runUserContentReview({ text: 'hello there friend', userId: '3', sessionKey: 's' })
+    assert.equal(calls, 1)
+    assert.equal(row?.choice, 'none')
+    assert.equal(row?.thresholdMet, false)
+  })
+
+  async function reviewAfterSlowPrefilter(finish: () => Promise<boolean>): Promise<{
+    aborted: boolean
+    alerts: number
+    choice: string | undefined
+    thresholdMet: boolean | undefined
+  }> {
+    process.env[CONTENT_REVIEW_FLAG] = '1'
+    process.env[CONTENT_REVIEW_KEY] = 'test-key'
+    let aborted = true
+    let alerts = 0
+    setContentReviewAlerter(() => {
+      alerts += 1
+    })
+    setContentReviewDepsForTests({
+      timeoutMs: 80,
+      fetchImpl: async (_url, init) => {
+        aborted = init.signal.aborted
+        init.signal.throwIfAborted()
+        return {
+          status: 200,
+          json: async () => ({ answers: { risk: { choice: 'policy_violation', confidence: 0.99 } } }),
+        }
+      },
+    })
+    setContentReviewPrefilter(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      return finish()
+    })
+    const row = await runUserContentReview({
+      text: 'mock policy violation input',
+      userId: 'acceptance',
+      sessionKey: 'acceptance-only',
+    })
+    return { aborted, alerts, choice: row?.choice, thresholdMet: row?.thresholdMet }
+  }
+
+  it('a slow prefilter miss still records and alerts on a fresh JEV budget', async () => {
+    const result = await reviewAfterSlowPrefilter(async () => false)
+    assert.equal(result.aborted, false)
+    assert.equal(result.choice, 'policy_violation')
+    assert.equal(result.thresholdMet, true)
+    assert.equal(result.alerts, 1)
+  })
+
+  it('a slow prefilter failure still records and alerts on a fresh JEV budget', async () => {
+    const result = await reviewAfterSlowPrefilter(async () => {
+      throw new Error('mock upstream failure')
+    })
+    assert.equal(result.aborted, false)
+    assert.equal(result.choice, 'policy_violation')
+    assert.equal(result.thresholdMet, true)
+    assert.equal(result.alerts, 1)
+  })
+
+  it('a prefilter timeout still records and alerts on a fresh JEV budget', async () => {
+    const result = await reviewAfterSlowPrefilter(async () => {
+      const error = new Error('The operation was aborted due to timeout')
+      error.name = 'TimeoutError'
+      throw error
+    })
+    assert.equal(result.aborted, false)
+    assert.equal(result.choice, 'policy_violation')
+    assert.equal(result.thresholdMet, true)
+    assert.equal(result.alerts, 1)
   })
 
   it('counts the third open strike as an account ban and tags the appeal', () => {

@@ -49,6 +49,7 @@ export async function installQueuedConsumerProofFixture(input: { pool: Pool; sch
       '0170_durable_turn_dispatch.sql',
       '0239_turn_dispatch_shutdown_ctx.sql',
       '0267_turn_dispatches_agent_container.sql',
+      '0323_turn_dispatches_trace_id.sql',
     ]) {
       await client.query(await readFile(new URL('../../db/migrations/' + migration, import.meta.url), 'utf8'))
     }

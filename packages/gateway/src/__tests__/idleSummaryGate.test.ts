@@ -6,7 +6,8 @@ import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
-import { BOX_NATIVE_CONTEXT_MODEL, BOX_NATIVE_CONTEXT_OWNER } from '@openclaude/protocol'
+import { BOX_NATIVE_CONTEXT_MODEL, BOX_NATIVE_CONTEXT_OWNER, type PromptPrivacyPolicy } from '@openclaude/protocol'
+import { promptPrivacyFingerprint } from '../promptPrivacyPolicy.js'
 import {
   assembleIdleArtifact,
   idleHistoryStillBlocked,
@@ -21,6 +22,10 @@ import { SessionManager } from '../sessionManager.js'
 import { CcbAdapter } from '../engine/ccbAdapter.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { SubprocessRunner } from '../subprocessRunner.js'
+
+// These cases drive the dispatch machinery itself; OCV5-755 moved the
+// default dispatch to the pre-expiry timer, so pin the legacy timing here.
+process.env.OC_BOX_IDLE_PRE_EXPIRY_MS = 'off'
 
 const finish = (SessionManager.prototype as unknown as {
   finishIdleUnderLock: (
@@ -42,6 +47,11 @@ test('a prepared summary waits for its own committed capsule', async () => {
   let idleReady = false
   let submits = 0
   const server: Server = createServer((req, res) => {
+    if (req.method === 'GET' && new URL(req.url ?? '/', 'http://fixture').pathname === '/internal/v3/platform-prompt-slots') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }))
+      return
+    }
     const chunks: Buffer[] = []
     req.on('data', (chunk) => chunks.push(chunk as Buffer))
     req.on('end', () => {
@@ -147,6 +157,11 @@ test('a summary error does not dispatch again or clear the candidate', async () 
   const dir = await mkdtemp(join(tmpdir(), 'idle-summary-error-'))
   let submits = 0
   const server: Server = createServer((req, res) => {
+    if (req.method === 'GET' && new URL(req.url ?? '/', 'http://fixture').pathname === '/internal/v3/platform-prompt-slots') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }))
+      return
+    }
     const chunks: Buffer[] = []
     req.on('data', (chunk) => chunks.push(chunk as Buffer))
     req.on('end', () => {
@@ -219,6 +234,11 @@ for (const stage of ['prepare', 'apply'] as const) {
     let calls = 0
     let summaries = 0
     const server = createServer((req, res) => {
+    if (req.method === 'GET' && new URL(req.url ?? '/', 'http://fixture').pathname === '/internal/v3/platform-prompt-slots') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }))
+      return
+    }
       const chunks: Buffer[] = []
       req.on('data', chunk => chunks.push(chunk as Buffer))
       req.on('end', () => {
@@ -243,8 +263,18 @@ for (const stage of ['prepare', 'apply'] as const) {
     class Transport extends EventEmitter {
       model = BOX_NATIVE_CONTEXT_MODEL
       sessionId = 'native-session'
+      isRunning = false
+      promptPolicyFingerprint: string | undefined
+      desiredPolicy: PromptPrivacyPolicy | undefined
+      setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.desiredPolicy = policy }
+      clearPromptPrivacy(): void { this.desiredPolicy = undefined }
+      async shutdown(): Promise<void> { this.isRunning = false }
+      assertPromptPrivacyStopped(): void { assert.equal(this.isRunning, false) }
       setConsultTurn(): void {}
       async submit(): Promise<void> {
+        assert.ok(this.desiredPolicy, 'the real adapter must install the fresh privacy snapshot before model entry')
+        this.promptPolicyFingerprint = promptPrivacyFingerprint(this.desiredPolicy, this.sessionId)
+        this.isRunning = true
         calls++
         const native = readIdleNative(dir, sessionId, revision)!
         if (!native.modelStarted) {
@@ -258,6 +288,7 @@ for (const stage of ['prepare', 'apply'] as const) {
             return
           }
         }
+        this.isRunning = false
         this.emit('exit', { code: null, signal: 'SIGKILL', crashed: true })
       }
     }

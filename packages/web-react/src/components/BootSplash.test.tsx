@@ -22,9 +22,9 @@ test("spinner only at first, slow hint after 4 s, reload after 20 s", () => {
   expect(screen.queryByTestId("boot-slow-hint")).toBeNull();
   act(() => { vi.advanceTimersByTime(4100); });
   expect(screen.getByTestId("boot-slow-hint")).toHaveTextContent("网络较慢，正在加载…");
-  expect(screen.queryByRole("button", { name: /刷新重试/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: /^继续$/ })).toBeNull();
   act(() => { vi.advanceTimersByTime(16_000); });
-  expect(screen.getByRole("button", { name: /刷新重试/ })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^继续$/ })).toBeInTheDocument();
 });
 
 // Several lazy boundaries mount their own splash in turn during boot; the clock must not restart.

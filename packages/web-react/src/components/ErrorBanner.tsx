@@ -1,5 +1,5 @@
 import { AlertTriangle, RotateCcw, X } from "lucide-react";
-import { ErrorTechDetails } from "./ErrorTechDetails";
+import { ErrorTechDetails } from "./chat/lazyTurnErrorNotice";
 import { Button, IconButton } from "./ui";
 
 /** 一次失败的对话发送：错误文案、可选追踪号、用于重试的原文。 */
@@ -39,10 +39,10 @@ export function ErrorBanner({
           variant="ghost"
           size="sm"
           onClick={onRetry}
-          aria-label="重试发送"
+          aria-label="继续"
           className="text-accent [@media(hover:none)]:h-11"
         >
-          <RotateCcw size={13} /> 重试
+          <RotateCcw size={13} /> 继续
         </Button>
         {onSwitchModel && (
           <Button

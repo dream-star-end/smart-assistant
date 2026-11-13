@@ -1,3 +1,4 @@
+import type {ModelSwitchCostRequest,ModelSwitchCostQuote} from '@openclaude/protocol/browser';
 export interface WorkspaceDraftHint {
   viewId: string
   revision: number
@@ -638,6 +639,11 @@ function apiKeyFromWire(k: ApiKeyWire): ApiKeySummary {
 }
 
 export const api = {
+  async modelSwitchCost(auth:AuthSession,input:ModelSwitchCostRequest,proof?:{consent?:string;quoteToken?:string}):Promise<ModelSwitchCostQuote>{
+    return jsonOrThrow<ModelSwitchCostQuote>(await callWithRefresh(auth,token=>fetch(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`,{
+      method:'POST',credentials:'include',headers:{...bearerHeaders(token),'content-type':'application/json'},body:JSON.stringify({...input,...proof}),
+    })));
+  },
   // ── 鉴权 ───────────────────────────────────────────────────────────
 
   /**
@@ -1208,18 +1214,25 @@ export const api = {
    */
   async getPublicModels(
     a?: AuthSession,
-  ): Promise<{ models: PublicModel[]; lockedModels: LockedPublicModel[] }> {
+  ): Promise<{ models: PublicModel[]; lockedModels: LockedPublicModel[]; teamLeaderModelId?: string }> {
     const run = (t?: string) =>
       fetch("/api/public/models", {
         headers: t ? bearerHeaders(t) : { Accept: "application/json" },
       });
     const res = a ? await callWithRefresh(a, (t) => run(t)) : await run();
-    const b = await jsonOrThrow<{ models?: PublicModel[]; locked_models?: LockedPublicModel[] }>(
-      res,
-    );
+    const b = await jsonOrThrow<{
+      models?: PublicModel[];
+      locked_models?: LockedPublicModel[];
+      team_leader_model?: unknown;
+    }>(res);
+    const teamLeaderModelId =
+      typeof b.team_leader_model === "string" && b.team_leader_model.trim()
+        ? b.team_leader_model.trim()
+        : undefined;
     return {
       models: Array.isArray(b.models) ? b.models : [],
       lockedModels: Array.isArray(b.locked_models) ? b.locked_models : [],
+      ...(teamLeaderModelId ? { teamLeaderModelId } : {}),
     };
   },
 
@@ -1581,9 +1594,19 @@ export const api = {
     id: string,
     after = "0",
     limit = 200,
-    opts?: { signal?: AbortSignal; timeoutMs?: number },
+    opts?: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      /** Session snapshot cursor: afterSeq pairs with streamKey; dispatch is the in-flight cmid. */
+      snapshot?: { afterSeq: number; streamKey?: string; dispatch?: string };
+    },
   ): Promise<DurableLiveFramePage> => {
     const params = new URLSearchParams();
+    if (opts?.snapshot) {
+      params.set("afterSeq", String(opts.snapshot.afterSeq));
+      if (opts.snapshot.streamKey) params.set("streamKey", opts.snapshot.streamKey);
+      if (opts.snapshot.dispatch) params.set("dispatch", opts.snapshot.dispatch);
+    }
     // First shot uses after=0 (LIVE_JOURNAL_OPEN_CURSOR). seek=tail is
     // opt-in only — do not send it as the open-session default.
     if (after === "tail") {

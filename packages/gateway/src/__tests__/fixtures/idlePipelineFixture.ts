@@ -10,8 +10,9 @@ import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign as cryptoSign } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, lstatSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { isolatedBoxArgs } from "./isolatedBoxArgs.js";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -208,6 +209,10 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
   let offCandidate = "";
   let schemaOwned = false;
   const cleanupErrors: string[] = [];
+  let failedBeforeCleanup = false;
+  const traceFailureCleanup = (stage: string) => {
+    if (failedBeforeCleanup) console.error(`[idle-fixture] cleanup ${stage}`);
+  };
   let serverClose: (() => Promise<void>) | undefined;
   let adapterShutdown: (() => Promise<void>) | undefined;
   let adminEnd: (() => Promise<void>) | undefined;
@@ -497,7 +502,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
     const textFetchMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxTextFetch.ts")).href);
     const registryMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxInvocationRegistry.ts")).href);
     const preparedMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxPreparedContinuation.ts")).href);
-    const boxProjects = "/home/box/.claude/projects";
+    const boxProjects = join(HOME, "synthetic-box", "projects");
     if (!existsSync(boxProjects)) mkdirSync(boxProjects, { recursive: true, mode: 0o755 });
     const boxStat = statSync(boxProjects);
     if (!boxStat.isDirectory() || boxStat.uid !== (process.getuid?.() ?? 0)) {
@@ -620,6 +625,11 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       if (path === "/internal/box/idle-proof") {
         await proof(replay, res, { hostUuid: "ocv5-296-idle", boundIp: "127.0.0.1" });
         hits.push({ url: path, status: res.statusCode, bytes: raw.length, summary: false, body: responseBody.slice(0, 4000) });
+        return;
+      }
+      if (req.method === "GET" && path === "/internal/v3/platform-prompt-slots") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }));
         return;
       }
       if (path !== "/v1/messages") {
@@ -1549,6 +1559,9 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       const ids = continuation.map((hit) => hit.requestId).filter((id): id is string => Boolean(id));
       const firstId = liveHits.find((hit) => hit.kind !== "live-continuation" && hit.status === 200)?.requestId;
       assert.equal(typeof firstId, "string");
+      // HTTP/native completion precedes billing COMMIT; await both exact requests before reading.
+      await waitForCommitted(admin, SCHEMA, firstId!);
+      await waitForCommitted(admin, SCHEMA, ids[0]!);
       const linked = await pool.query<{ request_id: string; state: string; owner: string | null; resume: string | null }>(
         `SELECT request_id, state, ctx->>'boxOwnerRequestId' AS owner, ctx->>'boxResumeRequestId' AS resume
            FROM request_finalize_journal WHERE request_id = $1 OR request_id = $2`,
@@ -1769,6 +1782,18 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       }
     }
   } catch (error) {
+    failedBeforeCleanup = true;
+    // Cleanup can block before the final report is written. Preserve source
+    // locations without printing error messages, request bodies or credentials.
+    console.error("[idle-fixture] failure before cleanup", {
+      mode,
+      kind: error instanceof assert.AssertionError ? "AssertionError" : "error",
+      locations: error instanceof Error
+        ? [...(error.stack ?? "").split("\n").filter((line) => /^\s+at /.test(line)).join("\n")
+          .matchAll(/([A-Za-z0-9_-]+\.[cm]?[jt]sx?):(\d+):(\d+)/g)]
+          .slice(0, 8).map((match) => `${match[1]}:${match[2]}:${match[3]}`)
+        : [],
+    });
     report.failure = error instanceof Error ? { message: error.message, stack: error.stack } : String(error);
     throw error;
   } finally {
@@ -1783,6 +1808,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
     restoreLocalAuth?.();
     releaseHeldCommits();
     if (adapterShutdown) {
+      traceFailureCleanup("adapter");
       const shutdown = adapterShutdown();
       const timed = await Promise.race([
         shutdown.then(() => "down", (error) => `shutdown:${error instanceof Error ? error.message : String(error)}`),
@@ -1790,9 +1816,16 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       ]);
       if (timed !== "down") cleanupErrors.push(String(timed));
     }
-    if (serverClose) await serverClose();
-    if (poolEnd) await poolEnd().catch(() => undefined);
+    if (serverClose) {
+      traceFailureCleanup("http");
+      await serverClose();
+    }
+    if (poolEnd) {
+      traceFailureCleanup("pool");
+      await poolEnd().catch(() => undefined);
+    }
     if (schemaOwned) {
+      traceFailureCleanup("schema");
       const pg = (await import("pg")).default;
       const admin = new pg.Pool({ connectionString: TEST_DB, max: 1 });
       try {
@@ -1805,6 +1838,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       await admin.end();
     }
     if (redisQuit) {
+      traceFailureCleanup("redis");
       try { await redisQuit(); }
       catch (error) { cleanupErrors.push(`redis-quit: ${error instanceof Error ? error.message : String(error)}`); }
     }
@@ -1814,7 +1848,10 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       rmSync(join(candidate, "claude-code-best/node_modules"), { force: true });
       rmSync(candidate, { recursive: true, force: true });
     }
-    if (adminEnd) await adminEnd().catch(() => undefined);
+    if (adminEnd) {
+      traceFailureCleanup("admin");
+      await adminEnd().catch(() => undefined);
+    }
     rmSync(HOME, { recursive: true, force: true });
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
     const path = join(rawDir, `ocv5-296-idle-${mode}-r23-${SCHEMA.slice(-6)}-raw.json`);
@@ -2239,7 +2276,7 @@ function makeLocalPythonExec(toolNames: () => string[]): {
         return { stdout: JSON.stringify({ runNonce, leaseEpoch, keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 }) + "\n", stderrBytes: 0, exitCode: 0 as const };
       }
       log.push("python");
-      const ran = spawnSync(request.command, request.args, {
+      const ran = spawnSync(request.command, isolatedBoxArgs(request.args, join(HOME, "synthetic-box")), {
         cwd: request.cwd && existsSync(request.cwd) ? request.cwd : "/tmp",
         env: { ...process.env, ...request.environment },
         encoding: "utf8",
@@ -2308,16 +2345,16 @@ function capturePreIdleTranscript(label: string): { files: Array<{ file: string;
     for (const name of names) {
       const path = join(dir, name);
       let info;
-      try { info = statSync(path); } catch { continue; }
+      try { info = lstatSync(path); } catch { continue; }
+      if (info.isSymbolicLink()) continue;
       if (info.isDirectory()) {
         if (name === "node_modules" || name === "candidate") continue;
         walk(path);
       } else if (name.endsWith(".jsonl") && info.size <= 20_000_000 && Date.now() - info.mtimeMs < 6 * 60 * 60 * 1000) jsonl.push(path);
     }
   };
-  for (const root of [process.env.CLAUDE_CONFIG_DIR, HOME, "/home/box/.claude"]) {
-    if (root) walk(root);
-  }
+  // Only this fixture owns HOME. Never discover another user/session transcript.
+  walk(HOME);
   const tag = SCHEMA.slice(-6);
   jsonl.sort().forEach((file, index) => {
     const dest = join(rawDir, `ocv5-296-pre-idle-${label}-${tag}-${index}.jsonl`);
@@ -2378,14 +2415,13 @@ async function execStage(plan: {
   run: { command: string; args: string[] }; cleanup: { command: string; args: string[]; cwd: string; environment: NodeJS.ProcessEnv };
 }): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "ocv5-296-idle-stage-"));
-  const from = "/home/box/.claude/projects";
   const runKey = JSON.stringify([plan.run.command, plan.run.args]);
   try {
     for (const step of [...plan.stageInputs, plan.cleanup]) {
       if (JSON.stringify([step.command, step.args]) === runKey) throw new Error("refusing inner claude exec");
       if (step.command !== "/usr/bin/python3") throw new Error(`refusing ${step.command}`);
       await new Promise<void>((resolveStep, reject) => {
-        const child: ChildProcess = spawn(step.command, step.args.map((arg) => arg.replaceAll(from, root)), {
+        const child: ChildProcess = spawn(step.command, isolatedBoxArgs(step.args, root), {
           cwd: step.cwd, env: step.environment,
         });
         let stderr = "";

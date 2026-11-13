@@ -1,0 +1,21 @@
+{
+  "id": "user-cancel",
+  "expect": {
+    "retryable": false,
+    "stopSession": false,
+    "verdict": "ok",
+    "severity": "info",
+    "askHuman": false,
+    "alert": false,
+    "reason": "ok",
+    "point": "turn_end",
+    "traceId": "55555555555555555555555555555555"
+  },
+  "observation": {
+    "point": "turn_end",
+    "traceId": "55555555555555555555555555555555",
+    "dispatchStatus": "terminal",
+    "dispatchOutcome": "not_accepted",
+    "failureCode": "USER_CANCELLED"
+  }
+}

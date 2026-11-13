@@ -1,3 +1,4 @@
+import type { AuthorityPaths } from './authorityPaths.js'
 // SkillStore — overlayed skill library.
 //
 // Layers (read priority high→low; name-dedup, higher layer wins):
@@ -431,6 +432,8 @@ export interface SkillStoreCompatOptions {
 }
 
 export interface SkillStoreOptions {
+  /** Trusted explicit formal root; absent preserves the legacy storage layout. */
+  authorityPaths?: AuthorityPaths
   /**
    * Optional read-only platform baseline skills directory. When set, entries here
    * win on read paths and are rejected on write paths (save with colliding name).
@@ -496,6 +499,7 @@ export interface SkillStoreOptions {
 }
 
 export class SkillStore {
+  private readonly storagePaths: Pick<typeof paths, 'home' | 'agentsDir' | 'agentSkillsDir' | 'agentSeedSkillsDir'>
   private readonly agentId: string
   /** Absolute, realpath-resolved baseline root (platform ro), or null. */
   private readonly baselineRoot: string | null
@@ -524,6 +528,7 @@ export class SkillStore {
   private readonly writeRoot: string
 
   constructor(agentId: string, opts: SkillStoreOptions = {}) {
+    this.storagePaths = opts.authorityPaths ?? paths
     if (!agentId || !VALID_AGENT_ID_RE.test(agentId)) {
       throw new Error(`invalid agentId: ${agentId}`)
     }
@@ -555,9 +560,9 @@ export class SkillStore {
       // cannot escape home and have read paths scan outside it. When absent, use a
       // lexical resolve (ensureWriteRoot re-validates via realpath on first write).
       const resolved = existsSync(sd) ? realpathSync(sd) : resolve(sd)
-      const homeResolved = existsSync(paths.home) ? realpathSync(paths.home) : resolve(paths.home)
+      const homeResolved = existsSync(this.storagePaths.home) ? realpathSync(this.storagePaths.home) : resolve(this.storagePaths.home)
       if (resolved !== homeResolved && !resolved.startsWith(homeResolved + sep)) {
-        throw new Error(`sharedDir must resolve within home (${paths.home}): ${sd}`)
+        throw new Error(`sharedDir must resolve within home (${this.storagePaths.home}): ${sd}`)
       }
       this.sharedRoot = resolved
     } else {
@@ -572,7 +577,7 @@ export class SkillStore {
       this.projectRoot = existsSync(opts.projectDir)
         ? resolveExistingDir(opts.projectDir, 'projectDir')
         : resolve(opts.projectDir)
-      const homeResolved = existsSync(paths.home) ? realpathSync(paths.home) : resolve(paths.home)
+      const homeResolved = existsSync(this.storagePaths.home) ? realpathSync(this.storagePaths.home) : resolve(this.storagePaths.home)
       const projectsRoot = join(homeResolved, 'projects')
       const resolved = existsSync(this.projectRoot) ? realpathSync(this.projectRoot) : this.projectRoot
       if (resolved !== projectsRoot && !resolved.startsWith(projectsRoot + sep)) {
@@ -590,9 +595,9 @@ export class SkillStore {
         throw new Error(`hubDir must be an absolute path: ${opts.hubDir}`)
       }
       const resolved = realpathSync(opts.hubDir)
-      const homeResolved = existsSync(paths.home) ? realpathSync(paths.home) : resolve(paths.home)
+      const homeResolved = existsSync(this.storagePaths.home) ? realpathSync(this.storagePaths.home) : resolve(this.storagePaths.home)
       if (resolved !== homeResolved && !resolved.startsWith(homeResolved + sep)) {
-        throw new Error(`hubDir must resolve within home (${paths.home}): ${opts.hubDir}`)
+        throw new Error(`hubDir must resolve within home (${this.storagePaths.home}): ${opts.hubDir}`)
       }
       this.hubRoot = resolved
     } else {
@@ -642,14 +647,14 @@ export class SkillStore {
     this.writeRoot = this.writesToShared
       ? (this.sharedRoot as string)
       : this.compat
-        ? paths.agentSkillsDir(this.compat.profile.localSkillStorageId)
-        : paths.agentSkillsDir(agentId)
+        ? this.storagePaths.agentSkillsDir(this.compat.profile.localSkillStorageId)
+        : this.storagePaths.agentSkillsDir(agentId)
   }
 
   /** Canonical agent's own private skills root, when it exists (compat conflict detection only). */
   private compatCanonicalPrivateRoot(): string | null {
     if (!this.compat) return null
-    const root = paths.agentSkillsDir(this.compat.profile.canonicalAgentId)
+    const root = this.storagePaths.agentSkillsDir(this.compat.profile.canonicalAgentId)
     return existsSync(root) ? root : null
   }
 
@@ -664,7 +669,7 @@ export class SkillStore {
     if (!this.compat) return
     const canonicalRoot = this.compatCanonicalPrivateRoot()
     if (!canonicalRoot) return
-    const registeredRoot = paths.agentSkillsDir(this.compat.profile.localSkillStorageId)
+    const registeredRoot = this.storagePaths.agentSkillsDir(this.compat.profile.localSkillStorageId)
     const names = name ? [name] : readdirSyncDirs(canonicalRoot)
     const conflicts = names.filter(
       (n) =>
@@ -687,14 +692,14 @@ export class SkillStore {
       if (this.compat) {
         return [
           {
-            root: paths.agentSkillsDir(this.compat.profile.localSkillStorageId),
+            root: this.storagePaths.agentSkillsDir(this.compat.profile.localSkillStorageId),
             agentId: this.compat.profile.localSkillStorageId,
           },
         ]
       }
-      return [{ root: paths.agentSkillsDir(this.agentId), agentId: this.agentId }]
+      return [{ root: this.storagePaths.agentSkillsDir(this.agentId), agentId: this.agentId }]
     }
-    const agentsDir = paths.agentsDir
+    const agentsDir = this.storagePaths.agentsDir
     if (!existsSync(agentsDir)) return []
     let entries: Dirent[]
     try {
@@ -706,7 +711,7 @@ export class SkillStore {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       if (!VALID_AGENT_ID_RE.test(entry.name)) continue
-      roots.push({ root: paths.agentSkillsDir(entry.name), agentId: entry.name })
+      roots.push({ root: this.storagePaths.agentSkillsDir(entry.name), agentId: entry.name })
     }
     // Deterministic order: readdir() order is filesystem-dependent, and in aggregate
     // mode a same-named skill can now exist under >1 agent (per-agent isolation). Sort
@@ -923,7 +928,7 @@ export class SkillStore {
    */
   private async anyAgentSeedHas(name: string): Promise<boolean> {
     if (!validateSkillName(name).ok) return false
-    const agentsDir = paths.agentsDir
+    const agentsDir = this.storagePaths.agentsDir
     if (!existsSync(agentsDir)) return false
     let entries: Dirent[]
     try {
@@ -934,7 +939,7 @@ export class SkillStore {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       if (!VALID_AGENT_ID_RE.test(entry.name)) continue
-      if (await this.rootHas(paths.agentSeedSkillsDir(entry.name), name)) return true
+      if (await this.rootHas(this.storagePaths.agentSeedSkillsDir(entry.name), name)) return true
     }
     return false
   }
@@ -1116,7 +1121,7 @@ export class SkillStore {
   private async ensureWriteRoot(): Promise<{ ok: boolean; error?: string }> {
     await mkdir(this.writeRoot, { recursive: true })
     const realWrite = await realpath(this.writeRoot)
-    const realHome = await realpath(paths.home)
+    const realHome = await realpath(this.storagePaths.home)
     if (realWrite !== realHome && !realWrite.startsWith(realHome + sep)) {
       return { ok: false, error: 'write root resolves outside home' }
     }
@@ -1127,7 +1132,7 @@ export class SkillStore {
     // library (which would defeat the cross-agent isolation). Shared writeRoot is
     // validated within-home in the constructor and intentionally cross-agent.
     if (!this.writesToShared) {
-      const expected = join(realHome, relative(paths.home, this.writeRoot))
+      const expected = join(realHome, relative(this.storagePaths.home, this.writeRoot))
       if (realWrite !== expected) {
         return { ok: false, error: 'per-agent skills root must not traverse a symlink' }
       }
@@ -1457,7 +1462,7 @@ export class SkillStore {
   private async cleanLegacyResidue(name: string): Promise<number> {
     const v = validateSkillName(name)
     if (!v.ok) return 0
-    const agentsDir = paths.agentsDir
+    const agentsDir = this.storagePaths.agentsDir
     if (!existsSync(agentsDir)) return 0
     let entries: Dirent[]
     try {
@@ -1469,7 +1474,7 @@ export class SkillStore {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       if (!VALID_AGENT_ID_RE.test(entry.name)) continue
-      const legacyRoot = paths.agentSkillsDir(entry.name) // .../skills (NOT seed-skills)
+      const legacyRoot = this.storagePaths.agentSkillsDir(entry.name) // .../skills (NOT seed-skills)
       const dir = join(legacyRoot, name)
       if (!existsSync(dir)) continue
       try {

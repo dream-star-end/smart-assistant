@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import assert from 'node:assert/strict'
 import { after, beforeEach, test } from 'node:test'
 import { mkdtemp, mkdir, writeFile, readFile, readdir, symlink, rm } from 'node:fs/promises'
@@ -22,8 +23,13 @@ let projection: any = { schema: 1, userId: '3', profiles: [{ profile, readiness:
 let status = 200
 let fetches = 0
 const server = createServer((req, res) => {
-  assert.equal(req.url, '/internal/v3/marketplace/sync')
   assert.equal(req.headers.authorization, 'Bearer fixture-token')
+  if (req.url === '/internal/v3/delegate/trace') {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ traceId: randomBytes(16).toString('hex') }))
+    return
+  }
+  assert.equal(req.url, '/internal/v3/marketplace/sync')
   fetches++
   res.writeHead(status, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify({ skills: [], agents: [], identityCompat: projection }))

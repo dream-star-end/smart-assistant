@@ -1,3 +1,7 @@
+import { BoxToolRolloverRequired, finishToolRollover, cancelToolRollovers,
+  assertToolRolloverLaunch, withToolRolloverLaunchFence, retiredToolRolloverSql,
+  type BoxToolRolloverClaim } from "./boxToolRollover.js";
+import { claimBoundBoxToolResume, type BoxToolResumeInput } from "./boxToolResumeClaim.js";
 import { deriveBoxImageIdentity } from './boxImageIdentity.js';
 /** Box invocation fence on the existing request_finalize_journal.ctx JSONB.
  * No schema change. This is deliberately stricter than HTTP idempotency: an
@@ -16,18 +20,19 @@ import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, validExpiredCh
   type BoxIdleProof, type IdleChainRow } from "./boxIdleChain.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
-import { orphanRecoveryHolderIsStale } from "./boxOrphanRecovery.js";
+import { orphanRecoveryHolderIsStale, resumingParentWithUnsentChildSql,
+  sameTurnOrphanStoppedProofValid, stoppedUnsentChildCtxSql, supersededUnsentResumeSql,
+  unsentChildStopInflightSql, unsentResumeChildClaimSql } from "./boxOrphanRecovery.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
-  deriveBoxFallbackAlias, incomingAssistantAccepted } from "./boxCallFingerprint.js";
-import { comparableAssistantContent } from "./boxToolInputEcho.js";
-import { matchPreparedToolResults, type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
+  deriveBoxFallbackAlias } from "./boxCallFingerprint.js";
+import type { BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { projectRootCliSession } from "./boxToolProgress.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES,
-  reserveBoxToolEcho, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
+  BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { authorityFromJournalCtx, consumePrepared, isContinuationConflict,
   PreparedConsumptionError, trustedIdentitiesBind,
   type AuthorityProjection, type PreparedContinuation,
@@ -154,6 +159,7 @@ export interface BoxToolResumeClaim {
 }
 export type BoxResumeDecision =
   | { readonly kind: "new_claim"; readonly claim: BoxToolResumeClaim }
+  | { readonly kind: "rollover_claim"; readonly claim: BoxToolRolloverClaim }
   | { readonly kind: "in_progress_or_unknown"; readonly code: string }
   | { readonly kind: "reject"; readonly code: string };
 /** A matched HTTP request is observable, never permission to launch it again. */
@@ -439,7 +445,7 @@ function goodId(input: BoxJournalAdmission): void {
   }
 }
 
-async function lock(client: PoolClient, keys: string[]): Promise<void> {
+export async function lock(client: PoolClient, keys: string[]): Promise<void> {
   for (const key of [...keys].sort()) {
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [key]);
   }
@@ -525,11 +531,16 @@ export class BoxDurableJournal implements BoxJournalPort {
     | { kind: "waiting"; identity: { requestId: string; uid: bigint; accountId: bigint;
       runNonce: string; leaseEpoch: string } }> {
     const want = [...input.toolIds].sort().join(",");
-    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
-      `SELECT request_id, ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
-          AND ctx->>'boxState'='handoff'
-          AND state IN ('inflight','finalizing','committed')`,
+    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown>;
+      unsent_stop_inflight: boolean }>(
+      `SELECT handoff_row.request_id, handoff_row.ctx,
+          ${unsentChildStopInflightSql("handoff_row")} AS unsent_stop_inflight
+        FROM request_finalize_journal handoff_row
+        WHERE handoff_row.user_id=$1 AND handoff_row.ctx->>'boxSessionId'=$2
+          AND handoff_row.ctx->>'boxTurnKey'=$3
+          AND (handoff_row.ctx->>'boxState'='handoff'
+            OR ${resumingParentWithUnsentChildSql("handoff_row")})
+          AND handoff_row.state IN ('inflight','finalizing','committed')`,
       [input.uid.toString(), input.sessionId, input.turnKey]);
     const matches = rows.rows.filter((row) => {
       const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
@@ -539,6 +550,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (matches.length !== 1) return { kind: "live" };
     const row = matches[0]!, ctx = row.ctx;
     if (parseBoxStoredToolHandoff(ctx.boxToolHandoff) === null
+      || row.unsent_stop_inflight === true
       || ctx.boxCancelIntent !== undefined || ctx.boxRecoveredBy !== undefined
       || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
       || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
@@ -566,12 +578,18 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (input.toolIds.length < 1 || input.toolIds.length > 32
       || input.toolIds.some((id) => !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))) return { kind: "none" };
     const want = [...input.toolIds].sort().join(",");
-    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
-      `SELECT request_id, ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
-          AND ctx->>'boxState' IN ('handoff','failed_stopped')
-          AND ctx->>'boxTurnKey' IS DISTINCT FROM $3
-          AND state IN ('inflight','finalizing','committed','aborted')`,
+    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown>;
+      unsent_stop_inflight: boolean; stopped_unsent_child_ctx: Record<string, unknown> | null }>(
+      `SELECT handoff_row.request_id, handoff_row.ctx,
+          ${unsentChildStopInflightSql("handoff_row")} AS unsent_stop_inflight,
+          ${stoppedUnsentChildCtxSql("handoff_row")} AS stopped_unsent_child_ctx
+        FROM request_finalize_journal handoff_row
+        WHERE handoff_row.user_id=$1 AND handoff_row.ctx->>'boxSessionId'=$2
+          AND (handoff_row.ctx->>'boxState' IN ('handoff','failed_stopped')
+            OR ${resumingParentWithUnsentChildSql("handoff_row")})
+          AND (handoff_row.ctx->>'boxTurnKey' IS DISTINCT FROM $3
+            OR handoff_row.ctx->>'boxState'='failed_stopped')
+          AND handoff_row.state IN ('inflight','finalizing','committed','aborted')`,
       [input.uid.toString(), input.sessionId, input.turnKey]);
     const matches = rows.rows.filter((row) => {
       const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
@@ -580,6 +598,15 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (matches.length === 0) return { kind: "none" };
     if (matches.length !== 1) return { kind: "live" };
     const row = matches[0]!, ctx = row.ctx;
+    const sameTurn = ctx.boxTurnKey === input.turnKey;
+    const stopped = ctx.boxState === "failed_stopped";
+    // Same-turn live handoff belongs to claimToolResume; a user Stop (or
+    // supersedeWaiting stop) on this turn must not be resurrected by late tool
+    // results. Only a remote worker failure/keeper stop already proven while
+    // the container waited on the tool (e.g. AskUserQuestion) continues fresh.
+    if (sameTurn && !sameTurnOrphanStoppedProofValid(ctx, row.stopped_unsent_child_ctx)) {
+      return { kind: "none" };
+    }
     // A failed recovery gives the exchange back only before admission or
     // after its admitted invocation is proven stopped without a successor.
     let staleClaim: string | undefined;
@@ -594,9 +621,10 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       staleClaim = ctx.boxRecoveredBy;
     }
-    const stopped = ctx.boxState === "failed_stopped";
     // A Stop already in flight (cancel intent, not yet proven) is not ours.
-    if (!stopped && ctx.boxCancelIntent !== undefined) return { kind: "live" };
+    if (!stopped && (ctx.boxCancelIntent !== undefined || row.unsent_stop_inflight === true)) {
+      return { kind: "live" };
+    }
     const billing = parseBoxBillingContext(ctx.boxBillingContext);
     if (!billing?.dispatchId || typeof ctx.boxAccountId !== "string"
       || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -607,7 +635,10 @@ export class BoxDurableJournal implements BoxJournalPort {
     const dispatch = await this.pool.query<{ status: string }>(
       `SELECT status FROM turn_dispatches WHERE user_id=$1 AND dispatch_id::text=$2`,
       [input.uid.toString(), billing.dispatchId]);
-    if (dispatch.rows[0]?.status !== "terminal") return { kind: "live" };
+    const dispatchStatus = dispatch.rows[0]?.status;
+    if (sameTurn
+      ? !dispatchStatus || !["admitted", "accepted", "running", "terminal"].includes(dispatchStatus)
+      : dispatchStatus !== "terminal") return { kind: "live" };
     return { kind: "orphan", stopped, ...(staleClaim ? { staleClaim } : {}),
       identity: { requestId: row.request_id, uid: input.uid,
       accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch } };
@@ -648,12 +679,16 @@ export class BoxDurableJournal implements BoxJournalPort {
         }
       }
       const changed = await client.query(
-        `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxRecoveredBy', $3::text),
-            updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxSessionId'=$4
-            AND (NOT (ctx ? 'boxRecoveredBy') OR ctx->>'boxRecoveredBy' = $5)
-            AND (ctx->>'boxState'='failed_stopped'
-              OR (ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')))`,
+        `UPDATE request_finalize_journal handoff_row
+            SET ctx = handoff_row.ctx || jsonb_build_object('boxRecoveredBy', $3::text),
+                updated_at=NOW()
+          WHERE handoff_row.request_id=$1 AND handoff_row.user_id=$2
+            AND handoff_row.ctx->>'boxSessionId'=$4
+            AND (NOT (handoff_row.ctx ? 'boxRecoveredBy') OR handoff_row.ctx->>'boxRecoveredBy' = $5)
+            AND (handoff_row.ctx->>'boxState'='failed_stopped'
+              OR ((handoff_row.ctx->>'boxState'='handoff'
+                OR ${resumingParentWithUnsentChildSql("handoff_row", unsentResumeChildClaimSql("resume_child"))})
+                AND NOT (handoff_row.ctx ? 'boxCancelIntent')))`,
         [input.requestId, input.uid.toString(), input.by, sessionId, input.replacing ?? null]);
       await client.query("COMMIT"); committed = true;
       return changed.rowCount === 1;
@@ -1091,6 +1126,115 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
   }
 
+  /** A non-streaming fallback may explain an already settled failure, never
+   * resurrect it. Deliberately separate from admission / replay exclusions. */
+  async findSettledFailure(input: { uid: bigint; canonicalModel: string;
+    canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection;
+    prepared?: PreparedContinuation }): Promise<BoxRemoteCleanupCandidate | null> {
+    if ((input.canonicalBody as { stream?: boolean }).stream !== false) return null;
+    if (input.uid <= 0n || input.canonicalBody.model !== input.canonicalModel) {
+      throw new BoxDurableJournalError("BOX_REPLAY_IDENTITY_INVALID");
+    }
+    let view: PreparedConsumption;
+    try { view = consumePrepared({ ...input, allowPrepareOnce: input.prepared === undefined,
+      replayAlias: true }); }
+    catch (error) {
+      if (error instanceof PreparedConsumptionError
+        && ["BOX_AUTHORITY_MALFORMED", "BOX_AUTHORITY_REJECTED", "BOX_PREPARED_STALE"].includes(error.code)) {
+        throw new BoxDurableJournalError(error.code);
+      }
+      throw new BoxDurableJournalError("BOX_REPLAY_IDENTITY_INVALID");
+    }
+    const fp = view.fingerprint;
+    const invalid = (): never => { throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID"); };
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      await lock(client, [`box:session:${input.uid}:${fp.sessionId}`]);
+      type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
+      const found = await client.query<Row>(`SELECT request_id,state,ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
+          AND ctx->>'model'=$4 AND ctx->>'boxFallbackAlias'=$5 LIMIT 2`,
+      [input.uid.toString(), fp.sessionId, fp.turnKey, input.canonicalModel, view.fallbackAlias]);
+      if (found.rows.length > 1) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
+      const leaf = found.rows[0];
+      if (!leaf || leaf.state !== "aborted" || leaf.ctx.boxState !== "failed_stopped"
+        || Object.hasOwn(leaf.ctx, "boxReplayMessage")) {
+        await client.query("COMMIT"); committed = true; return null;
+      }
+      const basis = leaf.ctx;
+      const accountId = basis.boxAccountId, runNonce = basis.boxRunNonce, leaseEpoch = basis.boxLeaseEpoch;
+      const mode = basis.boxInvocationMode, round = basis.boxRoundNo ?? 1;
+      if (typeof accountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(accountId)
+        || typeof runNonce !== "string" || !/^[a-f0-9]{24}$/.test(runNonce)
+        || typeof leaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(leaseEpoch)
+        || (mode !== "text" && mode !== "detached_tool")
+        || !Number.isSafeInteger(round) || Number(round) < 1 || Number(round) > BOX_TOOL_MAX_ROUNDS
+        || (mode === "text" && round !== 1)
+        || (Number(round) > 1 && (typeof basis.boxCatalogHash !== "string"
+          || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
+          || typeof basis.boxDetachedRunnerHash !== "string" || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)))
+        || Object.hasOwn(basis, "boxToolHandoff") || Object.hasOwn(basis, "boxResumeRequestId")) invalid();
+      let proof: BoxTerminalProof;
+      try { proof = parseBoxTerminalProof(JSON.stringify(basis.boxTerminalProof) + "\n",
+        { runNonce: runNonce as string, leaseEpoch: leaseEpoch as string }); }
+      catch { return invalid(); }
+      if ((proof.reason === "worker_complete") !== (basis.boxStopOutcome === "rejected_stream")) invalid();
+      const rows: Row[] = [], seen = new Set<string>();
+      let row: Row | undefined = leaf;
+      while (row) {
+        const ctx = row.ctx;
+        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(row.request_id)
+          || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
+          || ctx.boxInvocationRecovery !== "v1" || ctx.boxInvocationMode !== mode
+          || ctx.boxAccountId !== accountId || ctx.boxRunNonce !== runNonce || ctx.boxLeaseEpoch !== leaseEpoch
+          || ctx.boxSessionId !== fp.sessionId || ctx.boxTurnKey !== fp.turnKey || ctx.model !== input.canonicalModel
+          || (ctx.boxUpstreamModel !== undefined && !isBoxApiModelPair(ctx.model, ctx.boxUpstreamModel))) invalid();
+        const bound = trustedIdentitiesBind({ uid: view.prepared.uid, sessionId: fp.sessionId,
+          canonicalModel: view.prepared.canonicalModel, turnKey: fp.turnKey, authority: view.prepared.authority },
+        { uid: input.uid, sessionId: String(ctx.boxSessionId), canonicalModel: String(ctx.model),
+          turnKey: String(ctx.boxTurnKey), authority: authorityFromJournalCtx(ctx) });
+        if (!bound.ok) throw new BoxDurableJournalError(bound.code);
+        seen.add(row.request_id); rows.push(row);
+        const child = rows[rows.length - 2];
+        if (child) {
+          const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+          const hashes = ctx.boxResumeResultHashes;
+          if (!Array.isArray(hashes) || hashes.length < 1 || hashes.length > 32
+            || hashes.some((item) => !item || typeof item !== "object" || Array.isArray(item)
+              || Object.keys(item).sort().join(",") !== "contentHash,isError,modelToolUseId"
+              || typeof item.modelToolUseId !== "string" || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.modelToolUseId)
+              || typeof item.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(item.contentHash)
+              || typeof item.isError !== "boolean")
+            || new Set(hashes.map((item) => item.modelToolUseId)).size !== hashes.length) invalid();
+          if (!handoff || handoff.roundNo !== Number(round) - rows.length + 1
+            || handoff.catalogHash !== basis.boxCatalogHash
+            || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash
+            || !["inflight", "finalizing", "committed"].includes(row.state)
+            || ctx.boxState !== "failed_stopped" || ctx.boxResumeRequestId !== child.request_id
+            || typeof ctx.boxResumeRevision !== "string" || !UUID_V4.test(ctx.boxResumeRevision)
+            || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) invalid();
+        }
+        const owner: unknown = ctx.boxOwnerRequestId;
+        if (owner === undefined) break;
+        if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) invalid();
+        const parent = await client.query<Row>(
+          "SELECT request_id,state,ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2",
+          [owner, input.uid.toString()]);
+        if (parent.rowCount !== 1) invalid();
+        row = parent.rows[0];
+      }
+      if (rows.length !== round) invalid();
+      await client.query("COMMIT"); committed = true;
+      return { uid: input.uid, requestId: leaf.request_id, accountId: BigInt(accountId as string),
+        runNonce: runNonce as string, leaseEpoch: leaseEpoch as string, proof };
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
   /** Background takeover of only armed, unknown detached text. This produces
    * read identity, never another admission or paid launch permission. */
   async listTextUnknownCandidates(limit = 10): Promise<BoxReplayIdentity[]> {
@@ -1256,23 +1400,25 @@ export class BoxDurableJournal implements BoxJournalPort {
         account_occupied: string; user_occupied: string; malformed_ids: string[] | null }>(
         `WITH rows AS (
            SELECT request_id, user_id, created_at,
-             ctx->>'boxSessionId' AS session_id, ctx->>'boxAccountId' AS account_id,
-             CASE WHEN COALESCE(ctx->>'boxRunNonce','') ~ '^[a-f0-9]{24}$'
-                    AND COALESCE(ctx->>'boxLeaseEpoch','') ~ '^[a-f0-9]{32}$'
-                    AND ctx->>'boxAccountId' IS NOT NULL
+             ctx->>'boxSessionId' AS session_id, COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') AS account_id,
+             (state='inflight' AND ctx ? 'boxRolloverFrom' AND NOT (ctx ? 'boxState')) AS rollover_pending,
+             CASE WHEN COALESCE(COALESCE(ctx->>'boxRunNonce',ctx#>>'{boxRolloverFrom,runNonce}'),'') ~ '^[a-f0-9]{24}$'
+                    AND COALESCE(COALESCE(ctx->>'boxLeaseEpoch',ctx#>>'{boxRolloverFrom,leaseEpoch}'),'') ~ '^[a-f0-9]{32}$'
+                    AND COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') IS NOT NULL
                     AND ctx->>'boxSessionId' IS NOT NULL
-                  THEN 'run:' || (ctx->>'boxRunNonce') || ':' || (ctx->>'boxLeaseEpoch')
+                  THEN 'run:' || (COALESCE(ctx->>'boxRunNonce',ctx#>>'{boxRolloverFrom,runNonce}')) || ':' || (COALESCE(ctx->>'boxLeaseEpoch',ctx#>>'{boxRolloverFrom,leaseEpoch}'))
                   ELSE 'row:' || request_id END AS run_key,
-             NOT (COALESCE(ctx->>'boxRunNonce','') ~ '^[a-f0-9]{24}$'
-                    AND COALESCE(ctx->>'boxLeaseEpoch','') ~ '^[a-f0-9]{32}$'
-                    AND ctx->>'boxAccountId' IS NOT NULL
+             NOT (COALESCE(COALESCE(ctx->>'boxRunNonce',ctx#>>'{boxRolloverFrom,runNonce}'),'') ~ '^[a-f0-9]{24}$'
+                    AND COALESCE(COALESCE(ctx->>'boxLeaseEpoch',ctx#>>'{boxRolloverFrom,leaseEpoch}'),'') ~ '^[a-f0-9]{32}$'
+                    AND COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') IS NOT NULL
                     AND ctx->>'boxSessionId' IS NOT NULL) AS malformed
            FROM request_finalize_journal
-           WHERE ctx->>'boxState' = ANY($1::text[])
-             AND (ctx->>'boxAccountId' = $2 OR user_id = $3)),
+           WHERE (ctx->>'boxState' = ANY($1::text[])
+              OR (state='inflight' AND ctx ? 'boxRolloverFrom' AND NOT (ctx ? 'boxState') AND request_id<>$6))
+             AND (COALESCE(ctx->>'boxAccountId',ctx#>>'{boxRolloverFrom,accountId}') = $2 OR user_id = $3)),
          active AS (
            SELECT * FROM rows
-            WHERE run_key IN (SELECT run_key FROM rows GROUP BY run_key
+            WHERE rollover_pending OR run_key IN (SELECT run_key FROM rows GROUP BY run_key
               HAVING MIN(created_at) > NOW() - make_interval(secs => $5::double precision)))
          SELECT
            COALESCE(bool_or(user_id = $3 AND session_id = $4), false) AS same_session,
@@ -1281,7 +1427,7 @@ export class BoxDurableJournal implements BoxJournalPort {
            (array_agg(request_id ORDER BY request_id) FILTER (WHERE malformed))[1:5] AS malformed_ids
          FROM active`,
         [ACTIVE, input.accountId.toString(), input.uid.toString(),
-          input.fingerprint.sessionId, BOX_RUN_EXPIRED_AFTER_MS / 1000]);
+          input.fingerprint.sessionId, BOX_RUN_EXPIRED_AFTER_MS / 1000,input.requestId]);
       const usage = occupied.rows[0];
       if (!usage || usage.same_session) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
       if (usage.malformed_ids?.length) {
@@ -1341,6 +1487,13 @@ export class BoxDurableJournal implements BoxJournalPort {
             JSON.stringify({ boxNativeClaimRequestId: input.requestId })]);
         if (claimed.rowCount !== 1) throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
       }
+      const rolloverChild = await client.query<{ ctx: Record<string,unknown> }>(
+        `SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2 FOR UPDATE`,
+        [input.uid.toString(),input.requestId]);
+      if (rolloverChild.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_NOT_INFLIGHT");
+      await assertToolRolloverLaunch(client,input.uid,input.requestId,rolloverChild.rows[0]!.ctx,
+        { model: input.model,sessionId: input.fingerprint.sessionId,turnKey: input.fingerprint.turnKey,
+          contextHash: input.contextHash });
       const identity = { boxInvocationRecovery: "v1", boxState: "reserved",
         ...(input.replayRequired === true ? { boxReplayRequired: true } : {}),
         boxInvocationMode: input.invocationMode ?? "text",
@@ -1482,7 +1635,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
     { receipt: BoxPrelaunchReceipt }): Promise<void> {
     this.validatePrelaunchReceipt(input);
-    const changed = await this.pool.query(
+    await withToolRolloverLaunchFence(this.pool,input.uid,input.requestId,async (query) => {
+    const changed = await query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || '{"boxState":"running","boxLaunchPermit":true}'::jsonb,
               updated_at=NOW()
@@ -1499,6 +1653,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (changed.rowCount !== 1) {
       throw new BoxDurableJournalError("BOX_PRELAUNCH_ARM_FENCE_LOST");
     }
+    });
   }
 
   /** Remote CLEANED is necessary but not sufficient: this CAS also proves
@@ -1749,6 +1904,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `UPDATE request_finalize_journal
             SET state='aborted', failure_code='STREAM_FAILED',
                 final_credits=0,
+                error_msg=COALESCE(NULLIF(error_msg, ''), 'box_stopped:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'failed')),
                 ctx=ctx || $4::jsonb, updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND state='inflight'
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
@@ -1824,6 +1980,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `UPDATE request_finalize_journal
             SET state='aborted', failure_code='STREAM_FAILED',
                 final_credits=0,
+                error_msg=COALESCE(NULLIF(error_msg, ''), 'box_rejected_stream:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'rejected')),
                 ctx=ctx || $4::jsonb, updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND state='inflight'
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
@@ -2065,6 +2222,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     try {
       return { kind: "new_claim", claim: await this.claimToolResume(input) };
     } catch (error) {
+      if (error instanceof BoxToolRolloverRequired) return { kind: "rollover_claim",claim: error.claim };
       if (error instanceof BoxDurableJournalError && isContinuationConflict(error.code)) {
         const kind = error.code === "BOX_CALL_AMBIGUOUS" || error.code === "BOX_RESUME_IN_PROGRESS"
           ? "in_progress_or_unknown" : "reject";
@@ -2074,260 +2232,14 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
   }
 
-  async claimToolResume(input: { requestId: string; uid: bigint;
-    canonicalModel: string; canonicalBody: ProxyBody;
-    trustedAuthority?: AuthorityProjection;
-    prepared?: PreparedContinuation }): Promise<BoxToolResumeClaim> {
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
-      || input.uid <= 0n || input.canonicalBody.model !== input.canonicalModel) {
-      throw new BoxDurableJournalError("BOX_TOOL_RESUME_IDENTITY_INVALID");
-    }
-    let view: PreparedConsumption;
-    try {
-      view = consumePrepared({
-        uid: input.uid, canonicalModel: input.canonicalModel,
-        canonicalBody: input.canonicalBody, prepared: input.prepared,
-        trustedAuthority: input.trustedAuthority,
-        allowPrepareOnce: input.prepared === undefined,
-      });
-    } catch (error) {
-      if (error instanceof PreparedConsumptionError) {
-        throw new BoxDurableJournalError(error.code === "BOX_PREPARED_REJECT"
-          ? "BOX_TOOL_RESUME_IDENTITY_INVALID" : error.code);
-      }
-      throw new BoxDurableJournalError("BOX_TOOL_RESUME_IDENTITY_INVALID");
-    }
-    if (view.prepared.classification === "reject") {
-      throw new BoxDurableJournalError(view.prepared.rejectCode ?? "BOX_PREPARED_REJECT");
-    }
-    if (view.prepared.classification !== "continuation_candidate" || !view.catalog
-      || view.assistantContent == null || !view.priorContextHash || !view.nextContextHash
-      || !view.effectiveBody) {
-      throw new BoxDurableJournalError("BOX_PREPARED_REJECT");
-    }
-    const fingerprint = view.fingerprint;
-    const fallbackAlias = view.fallbackAlias;
-    const priorContextHash = view.priorContextHash;
-    const nextContextHash = view.nextContextHash;
-    const imageIdentity = deriveBoxImageIdentity(view.effectiveBody);
-    // Rolling compatibility (OCV5-300): a chain handed off on the opaque-alias
-    // release keeps resolving against that exact catalog variant.
-    let boundCatalog = view.catalog;
-    const assistantContent = view.assistantContent;
-    const client = await this.pool.connect();
-    let committed = false;
-    try {
-      await client.query("BEGIN");
-      await lock(client, [`box:fingerprint:${fingerprint.replayFingerprint}`,
-        `box:session:${input.uid}:${fingerprint.sessionId}`]);
-      const duplicate = await client.query(
-        `SELECT 1 FROM request_finalize_journal
-          WHERE ctx->>'boxReplayFingerprint'=$1
-             OR ctx->>'boxFallbackAlias'=$2 LIMIT 1`,
-        [fingerprint.replayFingerprint, fallbackAlias]);
-      if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
-      if (this.resumeLookupBarrier) await this.resumeLookupBarrier();
-      const owners = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
-        `SELECT request_id,ctx FROM request_finalize_journal
-          WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
-            AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
-            AND NOT (ctx ? 'boxRecoveredBy')
-            AND state IN ('inflight','finalizing','committed') FOR UPDATE`,
-        [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey]);
-      if (owners.rows.length !== 1) {
-        const consumed = await client.query(
-          `SELECT 1 FROM request_finalize_journal
-            WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
-              AND ctx->>'model'=$4
-              AND ctx->>'boxState' IN ('resuming','unknown','linked')
-              AND NOT (ctx ? 'boxCancelIntent')
-            LIMIT 1`,
-          [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
-            input.canonicalModel]);
-        // A cancelled chain has no live resume: its rounds must not read as one
-        // in progress, or the orphan release (BOX_TOOL_OWNER_UNKNOWN) is never tried.
-        if (consumed.rowCount) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
-        throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
-      }
-      const owner = owners.rows[0]!, ctx = owner.ctx;
-      const nativeSessionId = ctx.boxNativeSessionId;
-      const nativeCliCwd = ctx.boxNativeCliCwd;
-      const nativeCliVersion = typeof ctx.boxNativeCliVersion === "string"
-        && /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(ctx.boxNativeCliVersion)
-        ? ctx.boxNativeCliVersion : undefined;
-      const nativePromptLayout = ctx.boxNativePromptLayout === BOX_PROMPT_LAYOUT_STATIC_FIRST
-        ? BOX_PROMPT_LAYOUT_STATIC_FIRST : undefined;
-      if (ctx.model !== input.canonicalModel
-        || ctx.boxInvocationMode !== "detached_tool"
-        || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
-        || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
-        || typeof ctx.boxLeaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)
-        || typeof ctx.boxContextHash !== "string"
-        || !/^[a-f0-9]{64}$/.test(ctx.boxContextHash)
-        || typeof ctx.boxHandoffRevision !== "string" || ctx.boxHandoffRevision.length > 128
-        || !ctx.boxToolHandoff || typeof ctx.boxToolHandoff !== "object"
-        || Array.isArray(ctx.boxToolHandoff)
-        || (nativeSessionId === undefined) !== (nativeCliCwd === undefined)
-        || (nativeSessionId !== undefined &&
-          (typeof nativeSessionId !== "string" || !UUID_V4.test(nativeSessionId)
-            || typeof nativeCliCwd !== "string"
-            || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(nativeCliCwd)))) {
-        throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
-      }
-      const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
-      if (!handoff) throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
-      if (handoff.roundNo >= BOX_TOOL_MAX_ROUNDS) {
-        throw new BoxDurableJournalError("BOX_TOOL_ROUND_LIMIT");
-      }
-      const priorIds = ctx.boxPriorMessageIds === undefined ? [] : ctx.boxPriorMessageIds;
-      if (!Array.isArray(priorIds) || priorIds.length !== handoff.roundNo - 1
-        || new Set(priorIds).size !== priorIds.length
-        || priorIds.some((id) => typeof id !== "string" || id.length < 1 || id.length > 128)
-        || Array.from({ length: priorIds.length }, (_, i) => i)
-          .some((i) => !Object.hasOwn(priorIds, i))
-        || priorIds.includes(handoff.messageId)) {
-        throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
-      }
-      const matchedCatalog = boxCatalogMatching(boundCatalog, handoff.catalogHash);
-      if (!matchedCatalog) {
-        throw new BoxDurableJournalError("BOX_TOOL_CATALOG_CHANGED");
-      }
-      boundCatalog = matchedCatalog;
-      if (ctx.boxContextHash !== priorContextHash) {
-        throw new BoxDurableJournalError("BOX_TOOL_CONTEXT_CHANGED");
-      }
-      const effectiveBody = view.effectiveBody!;
-      const digests = handoff.toolUses;
-      let results: readonly BoxMatchedToolResult[];
-      try { results = matchPreparedToolResults({ effectiveBody },
-        digests, boundCatalog); }
-      catch { throw new BoxDurableJournalError("BOX_TOOL_RESULT_MISMATCH"); }
-      // OCV5-302: publish (and hash) images the way the Box CLI keeps them, so
-      // its echo is byte-identical on the live and every recovery path.
-      results = await normalizeBoxResultImagesForCli(results);
-      try {
-        const compared = comparableAssistantContent(assistantContent, digests, boundCatalog);
-        if (!incomingAssistantAccepted(compared, handoff)) {
-          throw new Error("assistant message changed");
-        }
-      } catch {
-        throw new BoxDurableJournalError("BOX_TOOL_ASSISTANT_CHANGED");
-      }
-      try {
-        reserveBoxToolEcho(handoff.spoolOffset, effectiveBody.messages.at(-1));
-      } catch {
-        throw new BoxDurableJournalError("BOX_TOOL_SPOOL_CAPACITY_EXCEEDED");
-      }
-      const child = await client.query<{ ctx: Record<string, unknown> }>(
-        `SELECT ctx FROM request_finalize_journal
-          WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
-        [input.requestId, input.uid.toString()]);
-      const childCtx = child.rows[0]?.ctx;
-      if (child.rowCount !== 1 || !childCtx) {
-        throw new BoxDurableJournalError("BOX_TOOL_RESUME_JOURNAL_INVALID");
-      }
-      const preparedIdentity = {
-        uid: view.prepared.uid, sessionId: fingerprint.sessionId,
-        canonicalModel: view.prepared.canonicalModel, turnKey: fingerprint.turnKey,
-        authority: view.prepared.authority,
-      };
-      const ownerBound = trustedIdentitiesBind(preparedIdentity, {
-        uid: input.uid, sessionId: String(ctx.boxSessionId ?? ""),
-        canonicalModel: String(ctx.model ?? ""), turnKey: String(ctx.boxTurnKey ?? ""),
-        authority: authorityFromJournalCtx(ctx),
-      });
-      if (!ownerBound.ok) throw new BoxDurableJournalError(ownerBound.code);
-      const ownerBilling = parseBoxBillingContext(ctx.boxBillingContext);
-      const childBilling = parseBoxBillingContext(childCtx.boxBillingContext);
-      if (!ownerBilling?.sessionId || !ownerBilling.turnKey
-        || !childBilling?.sessionId || !childBilling.turnKey) {
-        throw new BoxDurableJournalError("BOX_TOOL_RESUME_JOURNAL_INVALID");
-      }
-      // The prepared/owner session above is the native CLI identity. Billing
-      // is frozen from the server dispatch and may use a different UI session.
-      // Bind each namespace independently; null dispatches are exact, not wildcards.
-      if (ownerBilling.turnKey !== preparedIdentity.turnKey
-        || ownerBilling.dispatchId !== childBilling.dispatchId
-        || ownerBilling.attemptNo !== childBilling.attemptNo) {
-        throw new BoxDurableJournalError("BOX_AUTHORITY_REJECTED");
-      }
-      const childBound = trustedIdentitiesBind({ ...preparedIdentity,
-        sessionId: ownerBilling.sessionId }, {
-        uid: input.uid, sessionId: childBilling.sessionId,
-        canonicalModel: String(childCtx.model ?? ""), turnKey: childBilling.turnKey,
-        authority: authorityFromJournalCtx(childCtx),
-      });
-      if (!childBound.ok) throw new BoxDurableJournalError(childBound.code);
-      const durableRevision = randomUUID();
-      const resultHashes = results.map((result) => ({
-        modelToolUseId: result.modelToolUseId, contentHash: result.contentHash,
-        isError: result.isError }));
-      const claimedOwner = await client.query(
-        `UPDATE request_finalize_journal
-            SET ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2
-            AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
-            AND state IN ('inflight','finalizing','committed')
-            AND ctx->>'boxHandoffRevision'=$3`,
-        [owner.request_id, input.uid.toString(), ctx.boxHandoffRevision,
-          JSON.stringify({ boxState: "resuming", boxResumeRequestId: input.requestId,
-            boxResumeRevision: durableRevision, boxResumeResultHashes: resultHashes })]);
-      if (claimedOwner.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_RESUME_FENCE_LOST");
-      const linked = await client.query<{ ctx: Record<string, unknown> }>(
-        `UPDATE request_finalize_journal
-            SET ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
-            AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
-            AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'
-            AND NOT (ctx ? 'boxState') RETURNING ctx`,
-        [input.requestId, input.uid.toString(), input.canonicalModel,
-          JSON.stringify({ boxState: "linked", boxOwnerRequestId: owner.request_id,
-            boxInvocationMode: "detached_tool",
-            boxAccountId: ctx.boxAccountId, boxRunNonce: ctx.boxRunNonce,
-            boxLeaseEpoch: ctx.boxLeaseEpoch, boxTurnKey: fingerprint.turnKey,
-            boxResumeSpoolOffset: handoff.spoolOffset,
-            boxRoundNo: handoff.roundNo + 1,
-            boxPriorMessageIds: [...priorIds, handoff.messageId],
-            boxDetachedRunnerHash: handoff.detachedRunnerHash,
-            boxCatalogHash: handoff.catalogHash,
-            boxSessionId: fingerprint.sessionId,
-             boxReplayFingerprint: fingerprint.replayFingerprint,
-             boxFallbackAlias: fallbackAlias,
-             ...(ctx.boxReplayRequired === true ? { boxReplayRequired: true } : {}),
-             boxRequestHash: fingerprint.requestHash,
-             boxContextHash: nextContextHash,
-             boxImageIdentity: imageIdentity,
-             boxParentResumeRevision: durableRevision,
-             ...(nativeSessionId === undefined ? {} : {
-               boxNativeSessionId: nativeSessionId,
-               boxNativeCliCwd: nativeCliCwd,
-               ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}),
-               ...(nativePromptLayout ? { boxNativePromptLayout: nativePromptLayout } : {}) }) })]);
-      const linkedCtx = linked.rows[0]?.ctx;
-      const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
-      if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
-        || !parseBillingPricing(linkedCtx?.billingPricing, input.canonicalModel)) {
-        throw new BoxDurableJournalError("BOX_TOOL_RESUME_JOURNAL_INVALID");
-      }
-      await client.query("COMMIT");
-      committed = true;
-      return { ownerRequestId: owner.request_id, accountId: BigInt(ctx.boxAccountId),
-        runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch,
-        spoolOffset: handoff.spoolOffset, roundNo: handoff.roundNo + 1,
-        durableRevision, results,
-        detachedRunnerHash: handoff.detachedRunnerHash,
-         catalogHash: handoff.catalogHash,
-         toolUses: digests,
-         ...(handoff.rejectedToolUses ? { rejectedToolUses: handoff.rejectedToolUses } : {}),
-         ...(nativeSessionId === undefined ? {} : {
-           nativeSessionId: nativeSessionId as string,
-           nativeCliCwd: nativeCliCwd as string,
-           ...(nativeCliVersion ? { nativeCliVersion } : {}),
-           ...(nativePromptLayout ? { nativePromptLayout } : {}) }) };
-    } finally {
-      if (!committed) await client.query("ROLLBACK").catch(() => {});
-      client.release();
-    }
+  async finishToolRollover(input: { uid: bigint; requestId: string; claim: BoxToolRolloverClaim }): Promise<void> {
+    return finishToolRollover(this.pool,input);
+  }
+  async cancelToolRollovers(input: { uid: bigint; containerId: bigint; sessionId: string; turnKey: string }): Promise<boolean> {
+    return cancelToolRollovers(this.pool,input);
+  }
+  async claimToolResume(input: BoxToolResumeInput): Promise<BoxToolResumeClaim> {
+    return claimBoundBoxToolResume(this.pool, input, this.resumeLookupBarrier);
   }
 
   /** A final model message closes every row in its one remote invocation.
@@ -2594,6 +2506,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         : await client.query(
           `UPDATE request_finalize_journal
               SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
+                  error_msg=COALESCE(NULLIF(error_msg, ''), 'box_toolchain_stopped:' || COALESCE($4::jsonb#>>'{boxTerminalProof,reason}', 'failed')),
                   ctx=ctx || $4::jsonb, updated_at=NOW()
             WHERE request_id=$1 AND user_id=$2 AND state='inflight'
               AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
@@ -2794,6 +2707,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         : await client.query(
           `UPDATE request_finalize_journal
               SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
+                  error_msg=COALESCE(NULLIF(error_msg, ''), 'box_expired_unproven:' || COALESCE($8::text, 'expired')),
                   ctx=${marker}, updated_at=NOW()
             WHERE ${fence} AND NOT (ctx ? 'boxToolHandoff')
               AND state='inflight' AND final_credits IS NULL`, params);
@@ -3220,12 +3134,14 @@ export class BoxDurableJournal implements BoxJournalPort {
         state: row.state, ctx: row.ctx, finalCredits: row.final_credits,
         failureCode: row.failure_code });
       const found = await client.query<IdleRow>(
-        `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx
-           FROM request_finalize_journal
+        `SELECT current_row.request_id,current_row.state,current_row.final_credits::text AS final_credits,current_row.failure_code,current_row.ctx
+           FROM request_finalize_journal current_row
           WHERE user_id=$1 AND container_id=$2
             AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
             AND ctx->>'model' IN (${BOX_MODEL_IDS_SQL})
-            AND ctx->>'boxInvocationRecovery'='v1'`,
+            AND ctx->>'boxInvocationRecovery'='v1'
+            AND NOT ${retiredToolRolloverSql("current_row")}
+            AND NOT ${supersededUnsentResumeSql("current_row")} LIMIT 129`,
         [input.uid.toString(), input.containerId.toString(), input.sessionId, input.turnKey]);
       const open = await client.query<{ request_id: string }>(
         `SELECT request_id FROM request_finalize_journal

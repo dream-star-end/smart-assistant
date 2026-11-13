@@ -2,7 +2,7 @@ import { AlertTriangle, RotateCcw, Sparkles, Wallet } from "lucide-react";
 import type { ReactNode } from "react";
 import type { AgentGatePhase } from "../hooks/useAgentGate";
 import { groupDigits } from "../lib/utils";
-import { ErrorTechDetails } from "./ErrorTechDetails";
+import { ErrorTechDetails } from "./chat/lazyTurnErrorNotice";
 import { Button, Spinner } from "./ui";
 
 /**
@@ -122,7 +122,7 @@ export function AgentGate({
           desc="系统的智能体运行时正在准备中，请稍后再试。"
         >
           <Button variant="secondary" size="md" shape="pill" onClick={onRetry}>
-            <RotateCcw size={15} /> 重试
+            <RotateCcw size={15} /> 继续
           </Button>
         </Panel>
       );
@@ -131,7 +131,7 @@ export function AgentGate({
       return (
         <Panel icon={<AlertTriangle size={28} className="text-danger" />} title="出错了" desc={phase.message}>
           <Button variant="secondary" size="md" shape="pill" onClick={onRetry}>
-            <RotateCcw size={15} /> 重试
+            <RotateCcw size={15} /> 继续
           </Button>
           {/* 追踪号只放「技术详情」,展开后可复制(W3)。 */}
           {phase.requestId && <ErrorTechDetails collapsible text={`追踪号：${phase.requestId}`} />}

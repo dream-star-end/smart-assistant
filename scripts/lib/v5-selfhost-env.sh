@@ -119,7 +119,7 @@ OC_CLAUDE_CODE_TZ=Asia/Tokyo
 #                       追加「用户本地日期+UTC 偏移」;② 注入容器 env(docker Create.Env),
 #                       容器 gateway envProbe 渲染成 ENV slot 的 user_tz= 行给网页/cron 会话。
 #                       不改子进程 TZ、不参与选路;非缺省值改后需重建容器才进 PID1。
-OC_USER_TZ=Asia/Shanghai
+OC_USER_TZ=Asia/Taipei
 # 不要在本文件写入 OPENCLAUDE_V3_MASTER_BASE_URL / OPENCLAUDE_V3_CONTAINER_TOKEN。
 # 这两项由 v3supervisor 按用户容器注入;写进 host env 会让 cron 站内信全部落到同一个 uid。
 # token 明文不得进 git。上线无需改本文件,下一次容器重建即带上 supervisor 注入的 env。
@@ -173,6 +173,8 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_RUNTIME_RELEASES_ROOT "$OC_HOTCFG_RELEASES_ROOT"
   ensure_env_kv "$V5_ENV" OC_SESSIONS_STORE pg
   ensure_env_kv "$V5_ENV" OC_TOOL_FAILURE_AUDIT 1
+  # Codex imageGeneration. Bound Codex account, not OPENAI_API_KEY. Read at process start.
+  ensure_env_kv "$V5_ENV" OC_IMAGE2_ENABLED true
   ensure_env_kv "$V5_ENV" OC_SKILL_SHADOW_SAMPLE_RATE 0.1
   ensure_env_kv "$V5_ENV" OC_DURABLE_METRIC_ROLLUPS 1
   ensure_env_kv "$V5_ENV" OC_LOCAL_OBSERVABILITY_RETENTION 1
@@ -185,9 +187,11 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_P5_RECIPE_SCHEDULE 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
-  ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Shanghai"
+  ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Taipei"
   ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
   ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
   ensure_env_kv "$V5_ENV" OC_V5_WEB_OVERLAY_ROOT "$WEB_OVERLAY_ROOT"
+  # OCV5-633:master 在 spa 模式 /assets 未命中时回落的资产池根(网关只认绝对路径;master 重启生效)。
+  ensure_env_kv "$V5_ENV" OC_V5_WEB_ASSETS_POOL "$WEB_ASSETS_POOL"
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
 }

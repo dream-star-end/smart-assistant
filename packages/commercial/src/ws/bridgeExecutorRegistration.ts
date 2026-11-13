@@ -20,6 +20,9 @@ export class ContainerLinkExecutors {
     for (const [handle, value] of this.candidates) {
       if (handle.active && !handle.detached && !handle.disposed) return value;
     }
+    for (const [handle, value] of this.candidates) {
+      if (handle.active && !handle.disposed && (handle.hasOpenDispatches || handle.keepAlive)) return value;
+    }
     return undefined;
   }
   readonly recovery: RecoveryExecutor = (job) => {
@@ -33,6 +36,16 @@ export class ContainerLinkExecutors {
   constructor() {
     availability.set(this.recovery, () => this.current()?.recovery != null);
     availability.set(this.origin, () => this.current()?.origin != null);
+    Object.defineProperties(this.origin, {
+      agentContainerId: {
+        enumerable: true,
+        get: () => this.current()?.origin?.agentContainerId,
+      },
+      runtimeKind: {
+        enumerable: true,
+        get: () => this.current()?.origin?.runtimeKind,
+      },
+    });
   }
   register(handle: ContainerLinkHandle, callbacks: BridgeExecutors, mount: (value: BridgeExecutors) => () => void): () => void {
     this.candidates.set(handle, callbacks);

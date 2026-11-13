@@ -1,7 +1,8 @@
 import { Library } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
+  type BoardAgent,
   type PipelineTemplate,
   TICKET_TYPE_LABEL,
   type TicketType,
@@ -21,6 +22,7 @@ import {
   useToast,
 } from '../ui'
 import { PanelSheet } from './PanelSheet'
+import { StageAgentSelect } from './StageAgentSelect'
 
 function typeLabel(type: TicketType | null): string {
   return type ? TICKET_TYPE_LABEL[type] : '通用'
@@ -28,6 +30,7 @@ function typeLabel(type: TicketType | null): string {
 
 export function TemplateLibrary({
   auth,
+  agents,
   projectId,
   onChanged,
   compact = false,
@@ -36,6 +39,7 @@ export function TemplateLibrary({
   hideTrigger = false,
 }: {
   auth: AuthSession
+  agents?: readonly BoardAgent[]
   projectId: string | null
   onChanged?: () => void
   compact?: boolean
@@ -56,6 +60,12 @@ export function TemplateLibrary({
   const [loading, setLoading] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [items, setItems] = useState<PipelineTemplate[] | null>(null)
+  const [executionAgentId, setExecutionAgentId] = useState('')
+  const selectionOwner = useRef({ projectId, open, auth })
+  if (selectionOwner.current.projectId !== projectId || selectionOwner.current.open !== open || selectionOwner.current.auth !== auth) {
+    selectionOwner.current = { projectId, open, auth }
+    if (executionAgentId) setExecutionAgentId('')
+  }
   const [asDefault, setAsDefault] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -83,11 +93,16 @@ export function TemplateLibrary({
       toast('请先选择项目', 'error')
       return
     }
+    if (template.source === 'builtin' && !executionAgentId) {
+      toast('请选择新增 AI 阶段的执行助手', 'error')
+      return
+    }
     setBusyId(template.id)
     try {
       const out = await taskboardApi.applyTemplate(auth, template.id, {
         projectId,
         asDefault,
+        ...(template.source === 'builtin' ? { executionAgentId } : {}),
       })
       if (out.createdPipelines === 0 && out.skippedPipelines > 0) {
         toast(`「${template.name}」已在该项目中，未重复种入`, 'success')
@@ -173,6 +188,7 @@ export function TemplateLibrary({
               onCheckedChange={setAsDefault}
             />
           </div>
+          <StageAgentSelect auth={auth} agents={agents} value={executionAgentId} onValueChange={setExecutionAgentId} />
           {loading && !items ? (
             <ListSkeleton rows={4} variant="row" />
           ) : error ? (
@@ -219,7 +235,7 @@ export function TemplateLibrary({
                       type="button"
                       size="sm"
                       data-testid={`template-apply-${t.id}`}
-                      disabled={!projectId}
+                      disabled={!projectId || (builtin && !executionAgentId)}
                       loading={busyId === t.id}
                       onClick={() => void apply(t)}
                     >

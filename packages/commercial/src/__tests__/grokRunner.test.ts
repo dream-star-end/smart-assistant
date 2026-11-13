@@ -27,6 +27,7 @@ function harness(
     upstreams?: Array<{ statusCode: number; text: string }>
     admit?: (requestId: string) => boolean
     onAbort?: (requestId: string) => void
+    journalState?: (requestId: string) => string | null
     stream?: AsyncIterable<Uint8Array>
   } = {},
 ) {
@@ -85,6 +86,12 @@ function harness(
     }) as any,
     releasePreCheckFn: (async () => {
       events.push('release')
+    }) as any,
+    readJournalForTakeoverFn: (async (_p: unknown, requestId: string) => {
+      const state = opts.journalState ? opts.journalState(requestId) : null
+      return state === null
+        ? null
+        : { state, userId: '7', dispatchId: null, attemptNo: null, model: null }
     }) as any,
   })
   return { run, events, bodies, settled }
@@ -278,6 +285,28 @@ describe('makeGrokRunner (OCV5-591 A0)', () => {
     assert.equal(persisted, 'studio:task-3~1')
     assert.equal(h.settled.at(-1)!.frame.requestId, 'studio:task-3~1')
     await assert.rejects(h.run({ ...base, attempt: -1 }), { code: 'BAD_BODY' })
+  })
+
+  it('a journal conflict never releases the reservation of a call still in flight (Codex #1130 r1/r2 P1)', async () => {
+    const base = { userId: 7n, containerId: null, requestId: 'studio:task-4', prompt: 'x' }
+    for (const state of ['inflight', 'finalizing']) {
+      const running = harness({ admit: () => false, journalState: () => state })
+      await assert.rejects(running.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
+      assert.deepEqual(running.events, ['precheck', 'journal:null'], state)
+    }
+    const unreadable = harness({
+      admit: () => false,
+      journalState: () => {
+        throw new Error('db down')
+      },
+    })
+    await assert.rejects(unreadable.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
+    assert.ok(!unreadable.events.includes('release'))
+    for (const state of ['committed', 'aborted', null]) {
+      const ended = harness({ admit: () => false, journalState: () => state })
+      await assert.rejects(ended.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
+      assert.deepEqual(ended.events, ['precheck', 'journal:null', 'release'])
+    }
   })
 
   it('resettleGrokRun settles a persisted step idempotently by request id', async () => {

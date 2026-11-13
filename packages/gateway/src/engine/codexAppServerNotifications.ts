@@ -58,9 +58,16 @@ import {
   stripShellWrapper,
 } from './codexAppServerProtocol.js'
 import { log } from './codexAppServerRunner.js'
+import {
+  formatImageGenerationFailure,
+  imageFailureDetail,
+  rememberImageStderr,
+  takeImageFailureNote,
+} from './imageGenerationFailure.js'
 import type { CodexAppServerRunner } from './codexAppServerRunner.js'
 
 export interface CodexNotificationHost {
+  advisorReadOnly: CodexAppServerRunner['advisorReadOnly']
   nativeContext: CodexAppServerRunner['nativeContext']
   _handleChatgptAuthTokensRefresh: CodexAppServerRunner['_handleChatgptAuthTokensRefresh']
   activeTurnId: CodexAppServerRunner['activeTurnId']
@@ -323,6 +330,14 @@ export function handleLine(this: CodexNotificationHost, line: string): void {
           sessionKey: this.opts.sessionKey,
           method: msg.method,
         })
+        this.writeRaw(jsonRpcResult(msg.id, denial))
+        return
+      }
+    }
+    if (this.advisorReadOnly && msg.method !== 'item/tool/requestUserInput' && isHermeticExecutionMethod(msg.method)) {
+      const denial = buildHermeticDenial(msg.method)
+      if (denial) {
+        this.attemptHadToolOrPermission = true
         this.writeRaw(jsonRpcResult(msg.id, denial))
         return
       }
@@ -1014,13 +1029,25 @@ export async function handleItemCompleted(
     return
   }
   if (itemType === 'imageGeneration') {
-    const outcome = codexToolOutcome(item)
-    if (outcome.isError) {
-      this.emitToolResult(itemId, 'imageGeneration failed', true, undefined, {
-        terminationReason: outcome.terminationReason ?? 'tool_error',
-      })
+    if (this.advisorReadOnly) {
+      this.emitToolResult(itemId, 'Image generation is unavailable for this read-only turn', true)
       return
     }
+    const outcome = codexToolOutcome(item)
+    if (outcome.isError) {
+      const stderrNote = takeImageFailureNote(this)
+      this.emitToolResult(
+        itemId,
+        stderrNote ?? formatImageGenerationFailure({ detail: imageFailureDetail(item) }),
+        true,
+        undefined,
+        { terminationReason: outcome.terminationReason ?? 'tool_error' },
+      )
+      return
+    }
+    // A stderr note belongs to the failed item that just consumed it. Drop any
+    // leftover before a later item in this attempt can reuse it.
+    rememberImageStderr(this, null)
     // codex's image_gen tool emits two notification shapes depending on the
     // upstream auth mode (verified 2026-05-03 via JSON-RPC spike vs codex
     // 0.125.0):
@@ -1123,7 +1150,9 @@ export async function handleItemCompleted(
     this.emitToolResult(
       itemId,
       isError
-        ? `imageGeneration failed: ${failedNames.join(', ') || 'tool reported an error'}`
+        ? formatImageGenerationFailure({
+            detail: failedNames.length > 0 ? `没有写入 ${failedNames.join(', ')}` : undefined,
+          })
         : `imageGeneration → ${summary}`,
       isError,
       undefined,

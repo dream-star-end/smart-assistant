@@ -188,13 +188,14 @@ type RunResponse struct {
 
 // InspectResponse 跟 TS AgentContainerInspect 对齐。时间用可空字符串保留 null 语义。
 type InspectResponse struct {
-	Id         string  `json:"id"`
-	State      string  `json:"state"` // running|exited|created|dead|paused|restarting|removing
-	ExitCode   *int    `json:"exitCode"`
-	StartedAt  *string `json:"startedAt"`
-	FinishedAt *string `json:"finishedAt"`
-	OomKilled  bool    `json:"oomKilled"`
-	BoundIP    string  `json:"boundIp"`
+	RuntimeInspection *RuntimeInspection `json:"runtimeInspection,omitempty"`
+	Id                string             `json:"id"`
+	State             string             `json:"state"` // running|exited|created|dead|paused|restarting|removing
+	ExitCode          *int               `json:"exitCode"`
+	StartedAt         *string            `json:"startedAt"`
+	FinishedAt        *string            `json:"finishedAt"`
+	OomKilled         bool               `json:"oomKilled"`
+	BoundIP           string             `json:"boundIp"`
 }
 
 // ─── Docker CLI wrapper ───────────────────────────────────────────
@@ -447,10 +448,11 @@ func (r *Runner) Inspect(ctx context.Context, cid string) (*InspectResponse, err
 	state := normalizeState(i.State.Status)
 	ec := i.State.ExitCode
 	resp := &InspectResponse{
-		Id:        i.ID,
-		State:     state,
-		ExitCode:  &ec,
-		OomKilled: i.State.OOMKilled,
+		RuntimeInspection: runtimeInspectionFromInspect([]byte(out), cid),
+		Id:                i.ID,
+		State:             state,
+		ExitCode:          &ec,
+		OomKilled:         i.State.OOMKilled,
 	}
 	// 跟 TS containerService.ts inspect() 严格对齐:
 	//   startedAt: state.StartedAt ?? null
@@ -519,6 +521,8 @@ func (r *Runner) List(ctx context.Context) ([]*InspectResponse, error) {
 		if err != nil {
 			continue
 		}
+		// Detailed metadata belongs to the single-container inspect RPC, not list polling.
+		ii.RuntimeInspection = nil
 		res = append(res, ii)
 	}
 	return res, nil

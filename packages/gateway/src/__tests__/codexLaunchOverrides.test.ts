@@ -346,7 +346,7 @@ describe('buildCodexLaunchOverrides', () => {
     }
   })
 
-  it('keeps a bounded Codex MCP call window; long delegates return async handles', async () => {
+  it('shares the configured Codex deadline with the delegate polling budget', async () => {
     assert.equal(codexMcpToolTimeoutSec({}), 3600)
     assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '900' }), 900)
     assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '5' }), 60)
@@ -366,6 +366,9 @@ describe('buildCodexLaunchOverrides', () => {
         out.argvOverrides.includes('mcp_servers.openclaude_memory.tool_timeout_sec=900'),
         `argv must include tool_timeout_sec override; got ${out.argvOverrides.join(' ')}`,
       )
+      const envOverride = out.argvOverrides.find((arg) => arg.startsWith('mcp_servers.openclaude_memory.env='))
+      assert.ok(envOverride)
+      assert.match(envOverride, /"OPENCLAUDE_DELEGATE_MCP_BUDGET_MS"="885000"/)
     })
   })
 
@@ -383,8 +386,12 @@ describe('buildCodexLaunchOverrides', () => {
       sessionDir: dir,
       gatewayPort: 18789,
       gatewayToken: TOKEN,
+      systemHelpContextFile: '/synthetic/system-help-context.json',
     })
     const envKey = out.argvOverrides.find((s) => s.startsWith('mcp_servers.openclaude_memory.env='))
+    assert.ok(envKey)
+    assert.ok(envKey.includes('OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE'))
+    assert.ok(envKey.includes('/synthetic/system-help-context.json'))
     if (envKey) {
       // env table must carry the FILE path, not the token itself.
       assert.ok(

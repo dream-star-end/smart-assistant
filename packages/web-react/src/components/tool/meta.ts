@@ -469,12 +469,12 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   if (cli === "oc-browser") {
     const args = browserCommandArgs(command, op).filter((token) => token && !token.startsWith("-"));
     if (op === "open" || op === "goto" || op === "tab-new") {
-      return args[0] ? displayDomain(args[0]) : op;
+      return args[0] ? displayDomain(args[0]) : "";
     }
-    if (op === "fill") return humanSummaryToken(args[1] ?? args[0]) || op;
-    if (op === "type" || op === "press" || op === "find") return humanSummaryToken(args[0]) || op;
-    if (op === "click" || op === "dblclick") return args[0] ? `元素 ${args[0]}` : op;
-    return humanSummaryToken(commandFlag(command, "filename")) || op;
+    if (op === "fill") return humanSummaryToken(args[1] ?? args[0]);
+    if (op === "type" || op === "press" || op === "find") return humanSummaryToken(args[0]);
+    if (op === "click" || op === "dblclick") return args[0] ? `元素 ${args[0]}` : "";
+    return humanSummaryToken(commandFlag(command, "filename"));
   }
   if (cli === "oc-web") {
     const url = commandFlag(command, "url") || command.match(/https?:\/\/[^\s'";|]+/)?.[0] || "";
@@ -691,6 +691,28 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
   return mcpSummary(mcp.server, mcp.op, input).slice(0, 80);
 }
 
+const FILE_STEP_VERB: Record<string, string> = { 读取文件: "读取", 写入文件: "写入", 编辑文件: "修改", 笔记本: "编辑" };
+/** 摘要是正则、命令或代码的标签:标题只留动词。 */
+const NO_OBJECT_LABELS = new Set(["搜索内容", "搜索文件", "执行命令", "执行脚本", "执行代码", "等待输出"]);
+
+/**
+ * UI-3 过程时间轴里一步的人话标题「动词 + 对象」。命令、目录、技能 / 任务 ID、内部操作名都不进标题,
+ * 只在这一步的「技术详情」(原工具卡)里。对象不是人话就只留动词,绝不回落到原始命令。
+ */
+export function humanStepTitle(name: string, input: Record<string, unknown> | null): string {
+  const label = resolveToolMeta(name, input).label;
+  if (label === "终端") return "运行命令";
+  if (label === "等待委派") return "等待子任务完成";
+  if (!/[\u0080-\uffff]/.test(label)) return "调用工具";
+  let object = NO_OBJECT_LABELS.has(label) ? "" : toolSummary(name, input).trim();
+  const verb = FILE_STEP_VERB[label];
+  if (verb) return object ? `${verb} ${object.replace(/^.*\//, "")}` : label;
+  if (/^https?:\/\//.test(object)) object = displayDomain(object);
+  // 纯 ASCII、无空格、也不像文件名或域名的(技能 ID、任务 ID、蛇形操作名、`--help`)不是人话。
+  if (!/[\u0080-\uffff]|\s|\.[a-z]{2,5}$/i.test(object)) object = "";
+  return object ? `${label} ${object}` : label;
+}
+
 /** MCP per-server 摘要（端口自 `_mcpSummary`，去 codex）。 */
 function mcpSummary(server: string, op: string, input: Record<string, unknown>): string {
   if (!input) return "";
@@ -718,7 +740,22 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     return "";
   }
   if (server === "openclaude-memory") {
-    if (op === "memory") return `${asStr(input.action) || asStr(input.op) || "read"} ${asStr(input.target) || asStr(input.section)}`.trim();
+    if (op === "memory") {
+      const rawAct = (asStr(input.action) || asStr(input.op) || "read").toLowerCase();
+      const act =
+        rawAct === "write" || rawAct === "set"
+          ? "写入"
+          : rawAct === "append" || rawAct === "add"
+            ? "追加"
+            : rawAct === "replace" || rawAct === "update"
+              ? "更新"
+              : rawAct === "delete" || rawAct === "remove"
+                ? "删除"
+                : rawAct === "list"
+                  ? "查看"
+                  : "读取";
+      return `${act} ${asStr(input.target) || asStr(input.section)}`.trim();
+    }
     if (op === "archival_add" || op === "archival_search" || op === "archival_delete") {
       return asStr(input.query) || asStr(input.id) || asStr(input.text).slice(0, 50);
     }

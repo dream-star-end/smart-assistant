@@ -21,6 +21,7 @@ import {
   POLL_HOLD_SEC,
   base64DecodedBytes,
   bridgeFetchesSources,
+  supportsSourceRefs,
   parseAllowedUids,
   parseSubmission,
 } from '../muse/protocol.js'
@@ -125,6 +126,14 @@ const pngOf = (n: number) => Buffer.concat([PNG.subarray(0, 8), Buffer.alloc(n -
 const flush = () => new Promise((r) => setImmediate(r))
 
 describe('muse protocol', () => {
+  it('negotiates source refs by SemVer, including prereleases and build metadata', () => {
+    for (const v of [null, '', '0.3.2', '0.4.0', '0.5', '0.5.0-rc.1', '0.5.0-01', '00.5.0', 'garbage']) {
+      assert.equal(supportsSourceRefs(v), false, String(v))
+    }
+    for (const v of ['0.5.0', '0.5.0+build.1', '0.5.1-rc.1', '0.6.0', '1.0.0']) {
+      assert.equal(supportsSourceRefs(v), true, v)
+    }
+  })
   it('allowlist defaults to uid 3 and never enables uid 4', () => {
     assert.deepEqual([...parseAllowedUids(undefined)], ['3'])
     assert.deepEqual([...parseAllowedUids(['3', '4', '765'])], ['3', '765'])
@@ -204,15 +213,16 @@ describe('muse source references (OCV5-591 ref-A)', () => {
       assert.equal(base64DecodedBytes(Buffer.alloc(n, 9).toString('base64')), n)
     }
   })
-  it('byte ranges: none, a-b, a-, clamped end; anything else 416', () => {
+  it('byte ranges: none, a-b, a-, suffix, clamped end; invalid ranges 416', () => {
     assert.equal(parseByteRange(undefined, 10), null)
     assert.deepEqual(parseByteRange('bytes=0-3', 10), { start: 0, end: 3 })
     assert.deepEqual(parseByteRange('bytes=4-', 10), { start: 4, end: 9 })
     assert.deepEqual(parseByteRange('bytes=8-99', 10), { start: 8, end: 9 })
+    assert.deepEqual(parseByteRange('bytes=-3', 10), { start: 7, end: 9 })
     for (const bad of [
       'bytes=10-',
       'bytes=5-2',
-      'bytes=-3',
+      'bytes=-0',
       'bytes=0-1,4-5',
       'items=0-1',
       'bytes=a-b',
@@ -851,6 +861,42 @@ describe('muse bridge http', () => {
     const text = await r.text()
     return { status: r.status, json: text ? JSON.parse(text) : null }
   }
+
+  it('source GET requires token, session, nonce and ack; serves ranges only until finish', async () => {
+    const sid = (await post('/hello', { bridge_version: '0.5.0' })).json.session_id
+    const hdr = { 'x-muse-bridge-session': sid }
+    await hub.submit('3', null, { kind: 'image', prompt: 'x', source_images: [PNG.toString('base64')] })
+    const job = (await post('/poll', {}, hdr)).json.job
+    const get = (extra: Record<string, string> = {}, n = '0') => fetch(`${base}/jobs/${job.id}/sources/${n}`, {
+      headers: { authorization: `Bearer ${TOKEN}`, ...hdr, 'x-job-nonce': job.nonce, ...extra },
+    })
+    assert.equal((await get({ authorization: 'Bearer invalid' })).status, 401)
+    assert.equal((await get({ 'x-muse-bridge-session': '' })).status, 400)
+    assert.equal((await get()).status, 410)
+    await post(`/jobs/${job.id}/heartbeat`, { job_nonce: job.nonce }, hdr)
+    assert.equal((await get({ 'x-job-nonce': 'wrong' })).status, 410)
+    assert.equal((await get({}, '1')).status, 404)
+    const full = await get()
+    assert.equal(full.status, 200)
+    assert.equal(full.headers.get('cache-control'), 'no-store')
+    assert.equal(full.headers.get('content-type'), 'image/png')
+    assert.deepEqual(Buffer.from(await full.arrayBuffer()), PNG)
+    for (const [range, start, end] of [['bytes=0-7', 0, 7], ['bytes=8-', 8, PNG.length - 1], ['bytes=-4', PNG.length - 4, PNG.length - 1]] as const) {
+      const r = await get({ range })
+      assert.equal(r.status, 206)
+      assert.equal(r.headers.get('content-range'), `bytes ${start}-${end}/${PNG.length}`)
+      assert.deepEqual(Buffer.from(await r.arrayBuffer()), PNG.subarray(start, end + 1))
+    }
+    for (const range of ['bytes=9999-', 'bytes=7-2', 'bytes=0-1,4-5', 'bytes=-0', 'bad']) {
+      const r = await get({ range })
+      assert.equal(r.status, 416, range)
+      assert.equal(r.headers.get('content-range'), `bytes */${PNG.length}`)
+    }
+    await post(`/jobs/${job.id}/result`, { job_nonce: job.nonce, ok: false, error_code: 'MUSE_INVALID_INPUT' }, hdr)
+    assert.equal((await get()).status, 410)
+    await post('/hello', { bridge_version: '0.5.0' })
+    assert.equal((await get()).status, 409)
+  })
 
   it('401 for a bad token, 429 after repeated failures from one IP', async () => {
     let last = 0

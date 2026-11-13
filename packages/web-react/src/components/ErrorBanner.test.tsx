@@ -22,7 +22,7 @@ test("聊天错误条在窄屏把操作区换到下一行，且重试/关闭仍�
   expect(trace).not.toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: /技术详情/ }));
   expect(trace).toBeVisible();
-  const retry = screen.getByRole("button", { name: "重试发送" });
+  const retry = screen.getByRole("button", { name: "继续" });
   expect(retry.parentElement).toHaveClass("w-full", "sm:w-auto");
   expect(retry).toHaveClass("[@media(hover:none)]:h-11");
   fireEvent.click(retry);

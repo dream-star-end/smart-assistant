@@ -88,11 +88,16 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
       const id = frame.clientMessageId;
       const sessionKey = `agent:main:webchat:dm:${BOARD_SESSION}`;
       send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
-      if (frame.content?.recovery) {
-        assert.equal(frame.content.recovery.sourceClientMessageId, scenario.source);
-        assert.equal(frame.content.recovery.mode, "checkpoint");
+      if (frame.content?.recovery || frame.content?.displayText === "继续") {
+        if (frame.content?.recovery) {
+          assert.equal(frame.content.recovery.sourceClientMessageId, scenario.source);
+          assert.equal(frame.content.recovery.mode, "checkpoint");
+        }
+        const automatic = frame.content?.recovery?.automatic === true;
+        if (!automatic) scenario.manual.push(frame);
         preview.store.board.push({ id, role: "user", text: frame.content.displayText, ts: 4,
-          status: "replied", _source: "server", _automaticRecovery: true, _recoveryOfClientMessageId: scenario.source },
+          status: "replied", _source: "server", _automaticRecovery: automatic,
+          ...(frame.content?.recovery ? { _recoveryOfClientMessageId: scenario.source } : {}) },
           { id: `answer-${id}`, role: "assistant", text: "恢复后任务已完成", ts: 5, _source: "server", _clientMessageId: id });
         preview.store.revision += 1;
         send({ type: "outbound.message", peer, sessionKey, clientMessageId: id,
@@ -116,7 +121,7 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
     for (const width of [1280, 390]) for (const mode of ["success", "terminal", "cold", "phase-a"]) {
       await t.test(`${width} ${mode}`, async () => {
-        scenario = { mode, source: historyMode(mode) ? `m-${mode}-proof-source` : null, sends: 0, seq: 0, active: true, decisionPending: mode === "phase-a", hold: false, releaseReads: [] };
+        scenario = { mode, source: historyMode(mode) ? `m-${mode}-proof-source` : null, sends: 0, manual: [], seq: 0, active: true, decisionPending: mode === "phase-a", hold: false, releaseReads: [] };
         preview.store.board = historyMode(mode) ? sourceRows(scenario.source, false, scenario.decisionPending) : [];
         preview.store.older = []; preview.store.revision += 1; preview.store.detailDelayUntil = 0;
         const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width === 390, hasTouch: width === 390 });
@@ -180,6 +185,21 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
             assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 1, "a confirmed terminal failure paints exactly one card");
             assert.equal(await page.getByText(RETRY_ACTIVITY).count(), 0);
             if (mode === "terminal") assert.equal(scenario.sends, 1, "exhausted budget never dispatches again");
+            const originalRows = structuredClone(preview.store.board);
+            const beforeManual = scenario.sends;
+            const go = page.getByRole("button", { name: "继续", exact: true });
+            assert.equal(await go.count(), 1, "terminal errors keep one explicit same-session Continue");
+            await go.click();
+            await page.getByText("恢复后任务已完成", { exact: true }).first().waitFor();
+            assert.equal(scenario.sends, beforeManual + 1);
+            assert.equal(scenario.manual.length, 1);
+            const continuation = scenario.manual[0];
+            assert.equal(continuation.peer.id, BOARD_SESSION);
+            assert.notEqual(continuation.clientMessageId, scenario.source);
+            assert.notEqual(continuation.content.text, "请完成核验任务");
+            assert.match(continuation.content.text, /不要重新执行已经完成的步骤/);
+            assert.notEqual(continuation.content.recovery?.automatic, true);
+            assert.deepEqual(preview.store.board.slice(0, originalRows.length), originalRows, "manual continuation preserves prior context and steps");
           }
           await shot("final");
           assert.deepEqual(pageErrors, []);

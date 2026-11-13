@@ -3,6 +3,21 @@ import type { MessageLike } from "@openclaude/storage";
 import { assessTurnRecoveryTape, normalizeTurnErrorCode } from "@openclaude/protocol";
 import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
 
+export const LEFTOVER_RECOVERY_FRAME_LIMIT = 4000;
+
+const truncatedLeftoverRecords = new WeakSet<readonly unknown[]>();
+
+export function isLeftoverRecoveryRecordsTruncated(records: readonly unknown[]): boolean {
+  if (truncatedLeftoverRecords.has(records)) return true;
+  return records.some(
+    (item) =>
+      Boolean(item) &&
+      typeof item === "object" &&
+      !Array.isArray(item) &&
+      (item as Record<string, unknown>)._leftoverTruncated === true,
+  );
+}
+
 /** Leftover live frames are display-isolated after tape projection, but they
  * remain the SERVICE_RESTART checkpoint store. Recovery admission is not the
  * hot hydrate path, so it may read them without putting leftover back into
@@ -86,7 +101,17 @@ export function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): u
           && !/[\s\u0000-\u001f\u007f]/u.test(rawKey) ? rawKey : null;
         // Routing runId/agentId may be rebound to an ancestor's card. Only
         // the producer's immutable execution key can supersede old progress.
-        const completed = key !== null && item.phase === "done";
+        // OCV5-716: nested grandchild lifecycle frames have phase rewritten to
+        // "text" so they do not close the first-level parent card, while
+        // preserving nestedPhase="done" for their own usageRunId.
+        const completed =
+          key !== null &&
+          ((item.phase === "done" && !Object.hasOwn(item, "block")) ||
+            (item.phase === "text" &&
+              item.nestedPhase === "done" &&
+              typeof item.runId === "string" &&
+              item.runId.length > 0 &&
+              item.runId !== key));
         const known = key ? delegatesByExecution.get(key) : undefined;
         if (known) known._completed = completed;
         else {
@@ -105,7 +130,11 @@ export async function loadLeftoverRecoveryRecords(
   sessionId: string,
   sessionUserId: string,
   clientMessageId: string,
+  maxFrames: number = LEFTOVER_RECOVERY_FRAME_LIMIT,
 ): Promise<unknown[]> {
+  const safeLimit = Number.isSafeInteger(maxFrames) && maxFrames >= 1
+    ? maxFrames
+    : LEFTOVER_RECOVERY_FRAME_LIMIT;
   const rows = (
     await client.query<{ payload: Buffer }>(
       `SELECT f.payload
@@ -113,19 +142,34 @@ export async function loadLeftoverRecoveryRecords(
          JOIN client_session_live_frames f ON f.stream_key=s.stream_key
         WHERE s.session_id=$1 AND s.user_id=$2 AND s.client_message_id=$3
         ORDER BY f.record_id
-        LIMIT 4000`,
-      [sessionId, sessionUserId, clientMessageId],
+        LIMIT $4`,
+      [sessionId, sessionUserId, clientMessageId, safeLimit + 1],
     )
   ).rows;
+  const truncated = rows.length > safeLimit;
+  const boundedRows = truncated ? rows.slice(0, safeLimit) : rows;
   const payloads: unknown[] = [];
-  for (const row of rows) {
+  for (const row of boundedRows) {
     try {
       payloads.push(JSON.parse(Buffer.from(row.payload).toString("utf8")));
     } catch {
       // Corrupt leftover frames must not poison tape-backed recovery.
     }
   }
-  return leftoverFramesToRecoveryRecords(filterMonotonicLiveFramePayloads(payloads));
+  const records = leftoverFramesToRecoveryRecords(filterMonotonicLiveFramePayloads(payloads));
+  if (truncated) {
+    // OCV5-717: if leftover frames exceeded the read cap, later tool_use or
+    // delegate_progress start frames may have been truncated away. Append an
+    // unsettled sentinel so both assessment and allowUnsafeAutomaticCheckpoint
+    // fail closed (checkpoint_unsafe).
+    records.push({
+      role: "delegate-progress",
+      _completed: false,
+      _leftoverTruncated: true,
+    });
+    truncatedLeftoverRecords.add(records);
+  }
+  return records;
 }
 
 export function mergeTapeAndLeftoverRecoveryAssessment(
@@ -133,13 +177,20 @@ export function mergeTapeAndLeftoverRecoveryAssessment(
   leftoverRecords: readonly unknown[],
 ): ReturnType<typeof assessTurnRecoveryTape> & { leftoverBacked: boolean } {
   const tape = assessTurnRecoveryTape(tapeRecords);
+  if (isLeftoverRecoveryRecordsTruncated(leftoverRecords)) {
+    const base = tape.mode === "checkpoint" ? tape : assessTurnRecoveryTape(leftoverRecords);
+    return {
+      ...base,
+      mode: "checkpoint",
+      checkpointSafe: false,
+      leftoverBacked: tape.mode !== "checkpoint",
+    };
+  }
   if (tape.mode === "checkpoint") return { ...tape, leftoverBacked: false };
   const leftover = assessTurnRecoveryTape(leftoverRecords);
   if (leftover.mode === "checkpoint") return { ...leftover, leftoverBacked: true };
   return { ...tape, leftoverBacked: false };
 }
-
-
 
 /** The last assistant record is the semantic terminal surface. An earlier
  * error followed by a later answer is not a failed turn, while trailing tool

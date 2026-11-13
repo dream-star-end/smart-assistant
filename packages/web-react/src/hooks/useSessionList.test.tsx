@@ -5,6 +5,10 @@ import { api, ApiError } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
+import { addMessage } from "../lib/chat/model";
+import { ChatSocket } from "../lib/chat/socket";
+import { deriveLiveTerminalEndedAt, deriveLiveTerminalFromMessages } from "../lib/sessionStatus";
+import { formatCompactDuration, sessionDurationWindow } from "../components/sidebar/compactDuration";
 import { useSessionList } from "./useSessionList";
 
 // OCV5-421: 历史读取的瞬时失败会静默重试;本文件用真实重试逻辑、零间隔,免得每条用例等 12 秒。
@@ -740,6 +744,123 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(result.current.sessions[0].lastAt).toBe(3_000);
   });
 
+  // 侧栏用时 = createdAt → lastAt：本 tab 刚跑完的回合，列表 lastAt 还停在回合开始前（下一轮刷新 ≤60s 才更新），
+  // 行会从「运行中算到现在」跌回旧值。终态带上本 tab 看到的结束时刻；只前进不后退，也不重复标未读。
+  test("迟到 REST 终态与本地观察时间补齐：优先采用真实终态时刻，且列表刷新后不被保留的 liveTerminal 覆盖 (#1254)", async () => {
+    const id = "weblatedone01";
+    const start = Date.parse("2026-10-30T10:00:00Z");
+    const end = Date.parse("2026-10-30T10:02:00Z");
+    const observed = Date.parse("2026-10-30T11:00:00Z");
+    const socket = new ChatSocket({
+      getToken: () => "test-token",
+      getAuthEpoch: () => 0,
+      silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
+      onAuthExpired: () => {},
+      defaultAgentId: "main",
+    });
+    try {
+      const session = socket.ensureSession(id, "main", "迟到的终态");
+      const userMessage = addMessage(session, "user", "两分钟任务", { status: "sent" });
+      session.createdAt = start;
+      session.lastAt = start;
+      session._sendingInFlight = true;
+      session._activeClientMessageId = userMessage.id;
+      expect(socket.isSessionBusy(id)).toBe(true);
+
+      vi.spyOn(api, "listSessions").mockResolvedValue([
+        {
+          id,
+          title: "迟到的终态",
+          agentId: "main",
+          createdAt: start,
+          lastAt: end,
+          updatedAt: end,
+          messageCount: 2,
+          runState: "idle",
+          lastOutcome: "completed",
+          lastErrorCode: null,
+        },
+      ] as never);
+      const auth = createMemoryAuthSession(() => {}, "test-token");
+      const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+      const { result } = renderHook(() =>
+        useSessionList({
+          demo: false,
+          auth,
+          authSession: auth,
+          user,
+          agentId: "main",
+          holdAutoSelect: true,
+          sockRef: { current: {} as never },
+          confirmDialog: async () => false,
+          promptText: async () => null,
+          clearChatError: () => {},
+          onNewSessionReset: () => {},
+          onDeleteSession: () => {},
+          onActiveSessionDeleted: () => {},
+        }),
+      );
+      const row = () => result.current.sessions.find((s) => s.id === id)!;
+      await waitFor(() => expect(row()?.lastAt).toBe(end));
+
+      socket.applyServerMessages(
+        id,
+        "main",
+        [
+          {
+            id: "late-final",
+            role: "assistant",
+            text: "完成",
+            ts: end,
+            completedAt: end,
+            _source: "server",
+            _clientMessageId: userMessage.id,
+            _turnTapeComplete: true,
+            _dispatchOutcome: "completed",
+          },
+        ],
+        true,
+        2,
+        { serverUpdatedAt: end },
+      );
+      expect(socket.isSessionBusy(id)).toBe(false);
+      const msgs = socket.sessions.get(id)!.messages;
+      const terminal = deriveLiveTerminalFromMessages(msgs);
+      expect(terminal).toEqual({ lastOutcome: "completed", lastErrorCode: null });
+
+      vi.spyOn(Date, "now").mockReturnValue(observed);
+      expect(deriveLiveTerminalEndedAt(msgs)).toBe(end);
+
+      // 即使调用方传入本地观察时刻作为临时补齐，权威列表刷新后重放保留的 liveTerminal 也必须保持服务端 2 分。
+      const observedTerminal = { ...terminal!, endedAt: Date.now() };
+      act(() => result.current.applySessionTerminal(id, observedTerminal));
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      await waitFor(() => expect(row().lastAt).toBe(end));
+      act(() => result.current.applySessionTerminal(id, observedTerminal));
+      const win = sessionDurationWindow(row(), false, observed)!;
+      expect(formatCompactDuration(win.endAt - win.startAt)).toBe("2分");
+    } finally {
+      socket.stop();
+    }
+  });
+
+  test("applySessionTerminal 用本 tab 的结束时刻补齐 lastAt，不倒退、不重复标未读", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    const row = () => result.current.sessions.find((s) => s.id === "webkeepme001")!;
+    expect(row().lastAt).toBe(2_000);
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 9_000 }));
+    expect(row()).toMatchObject({ lastAt: 9_000, runState: "idle", lastOutcome: "completed", unread: true });
+    // 用户点开读过（未读由 useUnreadSessions 清，这里直接改列表模拟）。
+    act(() => result.current.setSessions((c) => c.map((x) => (x.id === "webkeepme001" ? { ...x, unread: false } : x))));
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 5_000 }));
+    expect(row().lastAt).toBe(9_000);
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 12_000 }));
+    expect(row()).toMatchObject({ lastAt: 12_000, unread: false });
+    expect(result.current.sessions.find((s) => s.id === "webdropme001")!.lastAt).toBe(2_000);
+  });
+
   test("toggleArchiveSession 乐观更新并 PATCH archived；失败回滚", async () => {
     vi.spyOn(api, "listSessions").mockResolvedValue([
       { id: "webkeepme001", title: "保留的会话", agentId: "main", archived: false, updatedAt: 2_000, lastAt: 2_000, messageCount: 1 },
@@ -971,6 +1092,59 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
   });
 });
 
+test("confirmed metadata refreshes sidebar and local socket title without issuing another write", async () => {
+  const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+  const patch = vi.spyOn(api, "patchSessionMeta");
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Approved", pinned: true, updatedAt: 3000 }));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")).toMatchObject({ title: "Approved", pinned: true });
+  expect(harness.socket.renameSession).toHaveBeenCalledExactlyOnceWith("webkeepme001", "Approved");
+  expect(harness.patchSessionTitle).not.toHaveBeenCalled();
+  expect(patch).not.toHaveBeenCalled();
+});
+test("a delayed list response cannot restore metadata older than a confirmed receipt snapshot", async () => {
+  const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+  const old = deferred<Awaited<ReturnType<typeof api.listSessions>>>();
+  vi.mocked(api.listSessions).mockImplementationOnce(() => old.promise);
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await waitFor(() => expect(api.listSessions).toHaveBeenCalledTimes(2));
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Approved", pinned: true, updatedAt: 3000 }));
+  await act(async () => old.resolve([meta("webkeepme001", "Old response")] as never));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")).toMatchObject({ title: "Approved", pinned: true });
+});
+test("older display snapshots cannot overwrite a newer one and reset retires their version floor", async () => {
+  const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Newest", pinned: true, updatedAt: 4000 }));
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Older", pinned: false, updatedAt: 3000 }));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")?.title).toBe("Newest");
+  expect(harness.socket.renameSession).toHaveBeenCalledTimes(1);
+  act(() => result.current.reset());
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "New identity", pinned: false, updatedAt: 2000 }));
+  expect(harness.socket.renameSession).toHaveBeenLastCalledWith("webkeepme001", "New identity");
+});
+
+test("a newer normal canonical page wins over the first delayed metadata snapshot", async () => {
+  const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+  vi.spyOn(api,"listSessionsPage").mockResolvedValue({ sessions: [{ ...meta("webkeepme001","Newest page"), updatedAt: 4000 }], nextCursor: null } as never);
+  await act(async () => result.current.loadArchivedSessions());
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Delayed receipt", pinned: true, updatedAt: 3000 }));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")?.title).toBe("Newest page");
+  expect(harness.socket.renameSession).not.toHaveBeenCalled();
+});
+test("a metadata watermark cannot make an older model payload pass the existing confirmed model floor", async () => {
+  const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+  vi.spyOn(api,"patchSessionModel").mockResolvedValue({ ok: true, updatedAt: 2500 } as never);
+  await act(async () => {
+    result.current.setSessions(current => current.map(session => session.id === "webkeepme001" ? { ...session, modelId: "confirmed-model" } : session));
+    result.current.queueModelPatch("webkeepme001","confirmed-model");
+  });
+  await waitFor(() => expect(api.patchSessionModel).toHaveBeenCalledTimes(1));
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Approved name", pinned: true, updatedAt: 3000 }));
+  vi.spyOn(api,"listSessionsPage").mockResolvedValue({ sessions: [{ ...meta("webkeepme001","Stale"), updatedAt: 1000, modelId: "stale-model" }], nextCursor: null } as never);
+  await act(async () => result.current.loadArchivedSessions());
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")).toMatchObject({ title: "Approved name", pinned: true, modelId: "confirmed-model" });
+});
+
 // #1240「重命名第一次没生效」:60s 轮询 / 窗口 focus 重拉随时可能在飞，它带回的是改名前的标题。
 describe("useSessionList 重命名与在飞的列表请求", () => {
   async function renameWithListInFlight(order: "list-first" | "patch-first") {
@@ -1016,5 +1190,23 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
     await waitFor(() =>
       expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.title).toBe("别处又改了"),
     );
+  });
+
+  test("改名只为标题背书：此前已确认的置顶不被改名框打开时的旧值盖掉", async () => {
+    const { result, harness } = await renderSessionList({ confirmResult: true, promptResult: "office-1029pm" });
+    const target = result.current.sessions.find((s) => s.id === "webkeepme001")!;
+    expect(target.pinned).not.toBe(true);
+    act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "保留的会话", pinned: true, updatedAt: 2_500 }));
+    const stale = deferred<Awaited<ReturnType<typeof api.listSessions>>>();
+    vi.mocked(api.listSessions).mockImplementationOnce(() => stale.promise);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(api.listSessions).toHaveBeenCalledTimes(2));
+    harness.patchSessionTitle.mockResolvedValue({ ok: true, updatedAt: 3_000 });
+    await act(async () => {
+      await result.current.renameSessionPrompt(target);
+    });
+    await act(async () => stale.resolve([meta("webkeepme001", "保留的会话")] as never));
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({ title: "office-1029pm", pinned: true });
   });
 });

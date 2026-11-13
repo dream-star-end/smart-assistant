@@ -16,6 +16,8 @@ import { Writable } from "node:stream";
 
 import type { Pool } from "pg";
 
+import { g8CompactSummaryCheckpointInput, runG8ReplayCheckpoint } from "@openclaude/protocol";
+
 import type { AccountScheduler } from "../../account-pool/scheduler.js";
 import type { ModelCatalogSnapshot } from "../../billing/modelCatalog.js";
 import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
@@ -271,6 +273,8 @@ export interface BoxSwitchInput {
   sessionId: string | null;
   authority: BillingAuthorityStamp | null;
   signal: AbortSignal;
+  /** Set when the caller already has a trace. A request id is not a trace. */
+  traceId?: string | null;
 }
 
 export type BoxSwitchOutcome =
@@ -295,6 +299,7 @@ export async function prepareBoxSwitch(deps: BoxSwitchDeps, input: BoxSwitchInpu
   const rawMessages = [...raw];
   const existing = deps.store.get(input.uid, cliSessionId);
   const applied = existing ? applyBoxSwitchRecord(input.body, existing) : false;
+  if (applied) runG8ReplayCheckpoint(g8CompactSummaryCheckpointInput(input.traceId ?? null));
   const offset = applied ? existing!.boundary : 0;
   let mustMove = false;
   try { mustMove = await deps.chatMustMove(input.uid, cliSessionId); } catch { mustMove = false; }
@@ -386,6 +391,7 @@ export async function prepareBoxSwitch(deps: BoxSwitchDeps, input: BoxSwitchInpu
   deps.store.set(input.uid, record);
   input.body.messages = rawMessages as ProxyBody["messages"];
   applyBoxSwitchRecord(input.body, record);
+  runG8ReplayCheckpoint(g8CompactSummaryCheckpointInput(input.traceId ?? null));
   const tokensAfter = estimateTokens(input.body.messages);
   deps.log.info("box_switch_compaction", { outcome: "compacted", billingRequestId, boundary,
     tokensBefore, tokensAfter, credits: outcome.finalCredits.toString(), ms: Date.now() - started });

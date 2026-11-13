@@ -28,9 +28,11 @@
  */
 
 import { createHash } from "node:crypto";
+import { isModelAvailable } from "./modelAvailability.js";
 import { Client } from "pg";
 import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
+  isCc5TestModel,
   isBoxGptWebModel,
   PLATFORM_REASONING_EFFORTS,
   type PlatformReasoningEffort,
@@ -49,6 +51,7 @@ import { meetsMinPlan } from "./planEntitlement.js";
 
 export type ModelEngine = "ccb" | "codex" | "grok" | "cursor" | "zcode" | "antigravity";
 export type ModelCatalogState = "staged" | "active" | "disabled" | "retired";
+export type ModelPlacement = "local" | "remote_pool";
 
 /**
  * 本进程能理解的 capability_profile schema 版本上限。
@@ -68,6 +71,9 @@ export interface ModelCapabilityProfile {
     /** 仅 codex 型号有值;用户未覆盖时 runner 必须沿用它。 */
     codexModelDefault: PlatformReasoningEffort | null;
   };
+  /** Observed node capabilities and the separately proven transport intersection. */
+  remote?: { source: 'codex-app-server:model/list'; observed_service_tiers: string[]; observed_vision: boolean;
+    service_tiers: string[]; supports_fast: boolean };
   /** CCB 本地曾经 baked 的执行开关；权威化后随 descriptor 每 turn 下发。 */
   ccb: {
     capabilityZero: boolean;
@@ -91,6 +97,7 @@ export interface ModelCatalogEntry {
   capabilitySchemaVersion: number;
   state: ModelCatalogState;
   lockVersion: number;
+  placement?: ModelPlacement;
 }
 
 /** catalog 侧不管价格;计费/授权面从 model_pricing 随快照一起读入。 */
@@ -128,6 +135,8 @@ export interface ModelExecutionDescriptor {
   capabilitySchemaVersion: number;
   /** model_pricing.default_effort(null = 不注入)。 */
   defaultEffort: string | null;
+  /** 执行放置位置:local 或 remote_pool。 */
+  placement?: ModelPlacement;
 }
 
 /** per-uid 投影的一行(/internal/v3/model-catalog + /api/public/models 的服务端投影底稿)。 */
@@ -139,11 +148,14 @@ export interface ModelProjectionRow {
   contextWindow: number | null;
   supportedEfforts: readonly string[];
   supportsVision: boolean;
+  remoteCapabilities?: ModelCapabilityProfile["remote"];
+  supportsFast?: boolean;
   capabilityZero: boolean;
   supportsThinking: boolean;
   defaultEffort: string | null;
   sortOrder: number;
   promoLabel?: string | null;
+  placement?: ModelPlacement;
 }
 
 /** Rows the caller could use if they met the subscription floor (picker lock list). */
@@ -155,6 +167,7 @@ export interface LockedModelProjectionRow {
   minPlanName: string | null;
   promoLabel: string | null;
   sortOrder: number;
+  placement?: ModelPlacement;
 }
 
 export interface UserModelScope {
@@ -253,6 +266,7 @@ type CatalogRow = {
   capability_schema_version: number;
   state: string;
   lock_version: number;
+  placement?: string | null;
 };
 
 type AliasRow = { alias: string; entry_id: string };
@@ -325,7 +339,17 @@ export function parseCapabilityProfile(modelId: string, raw: unknown): ModelCapa
     }
     contextOwner = "box-native-v1";
   }
+  let remote: ModelCapabilityProfile['remote'];
+  if (obj.remote !== undefined) {
+    const r = obj.remote as NonNullable<ModelCapabilityProfile['remote']>;
+    if (!r || r.source !== 'codex-app-server:model/list' || typeof r.observed_vision !== 'boolean'
+        || r.supports_fast !== false || !Array.isArray(r.service_tiers) || r.service_tiers.length !== 0
+        || !Array.isArray(r.observed_service_tiers) || !r.observed_service_tiers.every(t => typeof t === 'string'))
+      throw new TypeError(`model ${modelId}: remote capability proof invalid`);
+    remote = structuredClone(r);
+  }
   return {
+    ...(remote ? { remote } : {}),
     supportsVision: vision,
     reasoning: {
       supported,
@@ -351,6 +375,7 @@ function rowToEntry(r: CatalogRow): ModelCatalogEntry {
     capabilitySchemaVersion: r.capability_schema_version,
     state: r.state as ModelCatalogState,
     lockVersion: r.lock_version,
+    placement: r.placement === "remote_pool" ? "remote_pool" : "local",
   };
 }
 
@@ -411,7 +436,7 @@ export class ModelCatalogSnapshot {
     const byId = new Map<number, ModelCatalogEntry>();
     for (const e of args.entries) {
       byId.set(e.entryId, e);
-      if (e.state === "active") active.set(e.modelId, e);
+      if (e.state === "active" && isModelAvailable(e.modelId)) active.set(e.modelId, e);
     }
     this.activeByModel = active;
     this.byEntryId = byId;
@@ -444,7 +469,7 @@ export class ModelCatalogSnapshot {
     const aliases = [...this.aliases.entries()]
       .map(([alias, entryId]) => ({ alias, entry: this.byEntryId.get(entryId) }))
       .filter((a): a is { alias: string; entry: ModelCatalogEntry } =>
-        a.entry !== undefined && a.entry.state === "active",
+        a.entry !== undefined && this.activeByModel.get(a.entry.modelId) === a.entry,
       )
       .map((a) => ({ alias: a.alias, canonicalModel: a.entry.modelId }))
       .sort((a, b) => (a.alias < b.alias ? -1 : a.alias > b.alias ? 1 : 0));
@@ -507,6 +532,9 @@ export class ModelCatalogSnapshot {
     const e = this.activeByModel.get(canonical);
     if (!e) return false;
     if (e.capabilitySchemaVersion > CAPABILITY_SCHEMA_VERSION) return false;
+    if (e.placement === "remote_pool" && process.env.OC_REMOTE_POOL_EXECUTION_ENABLED === "0") {
+      return false;
+    }
     return this.pricing.has(canonical);
   }
 
@@ -554,7 +582,7 @@ export class ModelCatalogSnapshot {
     if (e.capabilitySchemaVersion > CAPABILITY_SCHEMA_VERSION) {
       throw new UnknownCapabilitySchemaError(e.modelId, e.capabilitySchemaVersion);
     }
-    if (!this.pricing.has(canonical)) return null;
+    if (!this.isRoutable(canonical)) return null;
     return {
       canonicalModel: e.modelId,
       engine: e.engine,
@@ -564,6 +592,7 @@ export class ModelCatalogSnapshot {
       capabilityProfile: e.capabilityProfile,
       capabilitySchemaVersion: e.capabilitySchemaVersion,
       defaultEffort: this.pricing.get(canonical)?.defaultEffort ?? null,
+      placement: e.placement ?? "local",
     };
   }
 
@@ -598,9 +627,12 @@ export class ModelCatalogSnapshot {
     const pricing = this.pricing.get(canonical);
     const schemaOk =
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
-    const routable = entry !== undefined && schemaOk && pricing !== undefined;
+    const remotePoolOk =
+      entry?.placement !== "remote_pool" || process.env.OC_REMOTE_POOL_EXECUTION_ENABLED !== "0";
+    const routable = entry !== undefined && schemaOk && remotePoolOk && pricing !== undefined;
     const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebAllowedUser(scope.uid);
-    const cursorOk =
+    const cc5Ok = !isCc5TestModel(canonical); // retired task model; backend routing uses existing Sonnet
+    const cursorOk = cc5Ok &&
       (entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;
     // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid
     // credential uid). Anonymous is a placeholder identity: after subscribe
@@ -609,7 +641,7 @@ export class ModelCatalogSnapshot {
     // allow-list that does not contain the uid stays excluded. Execution
     // (`canUseModel` / `listForUser`) stays on strict `cursorOk`.
     const lockedCursorOk =
-      boxGptWebOwnerOk &&
+      cc5Ok && boxGptWebOwnerOk &&
       (cursorOk ||
         (entry?.engine === "cursor" &&
           scope.uid === 0 &&
@@ -624,7 +656,7 @@ export class ModelCatalogSnapshot {
         })
       : false;
     const visible =
-      pricing && boxGptWebOwnerOk
+      pricing && boxGptWebOwnerOk && cc5Ok
         ? pricing.visibility === "public" ||
           (pricing.visibility === "admin" &&
             (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||
@@ -666,11 +698,13 @@ export class ModelCatalogSnapshot {
         contextWindow: projectContextWindowForRole(e.modelId, e.contextWindow, scope.role),
         supportedEfforts: e.capabilityProfile.reasoning.supported,
         supportsVision: e.capabilityProfile.supportsVision,
+        ...(e.capabilityProfile.remote ? { remoteCapabilities:e.capabilityProfile.remote, supportsFast:e.capabilityProfile.remote.supports_fast } : {}),
         capabilityZero: e.capabilityProfile.ccb.capabilityZero,
         supportsThinking: e.capabilityProfile.ccb.supportsThinking,
         defaultEffort: p.defaultEffort,
         sortOrder: p.sortOrder,
         promoLabel: p.promoLabel ?? null,
+        placement: e.placement ?? (e.modelId.endsWith("-remote") ? "remote_pool" : "local"),
       });
     }
     return rows.sort((a, b) => a.sortOrder - b.sortOrder || (a.modelId < b.modelId ? -1 : 1));
@@ -704,6 +738,7 @@ export class ModelCatalogSnapshot {
         minPlanName: p.minPlanName ?? null,
         promoLabel: p.promoLabel ?? null,
         sortOrder: p.sortOrder,
+        placement: e.placement ?? (e.modelId.endsWith("-remote") ? "remote_pool" : "local"),
       });
     }
     return rows.sort((a, b) => a.sortOrder - b.sortOrder || (a.modelId < b.modelId ? -1 : 1));
@@ -723,6 +758,7 @@ export class ModelCatalogSnapshot {
       contextWindow: r.contextWindow,
       supportedEfforts: [...r.supportedEfforts],
       supportsVision: r.supportsVision,
+      ...(r.remoteCapabilities ? { remoteCapabilities:r.remoteCapabilities, supportsFast:r.supportsFast } : {}),
       capabilityZero: r.capabilityZero,
       supportsThinking: r.supportsThinking,
       defaultEffort: r.defaultEffort,
@@ -846,7 +882,8 @@ export async function loadCatalogSnapshot(pool = getPool()): Promise<ModelCatalo
     }
     const catalog = await client.query<CatalogRow>(
       `SELECT entry_id::text AS entry_id, model_id, engine, provider_id, upstream_model_id,
-              context_window, capability_profile, capability_schema_version, state, lock_version
+              context_window, capability_profile, capability_schema_version, state, lock_version,
+              placement
          FROM model_catalog`,
     );
     const aliases = await client.query<AliasRow>(

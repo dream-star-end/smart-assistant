@@ -77,6 +77,8 @@ type DockerCaptured = {
 };
 
 type DockerBehavior = {
+  /** Dedicated cc5 fixture returns the real full-CID shape; existing defaults are unchanged. */
+  containerId?: string;
   imageMissing?: boolean;
   startFails?: boolean;
   inspectMissing?: boolean;
@@ -162,7 +164,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
     }
     captured.containersCreated.push(opts);
     return {
-      id: `dockerid-${captured.containersCreated.length}`,
+      id: behavior.containerId ?? `dockerid-${captured.containersCreated.length}`,
       start: async () => {
         behavior.onStartContainer?.();
         if (behavior.startFails) throw httpError(500, "start failed");
@@ -4712,5 +4714,120 @@ describe("R2-M5 classifyRuntimeArtifactFailure(激活中间态 vs 部署级坏�
     for (const code of ["NameConflict", "HostFull", "MigratedToV5", "CcbBaselineMissing", "Unknown"] as const) {
       assert.equal(classifyRuntimeArtifactFailure(code), null, `${code} 不属 runtime artifact 分级`);
     }
+  });
+});
+
+
+describe("cc5 fresh container supervisor boundary", () => {
+  const keys = ["OC_RUNTIME_CHANNEL", "OC_V3_CCB_BASELINE_OPTIONAL", "OC_PLATFORM_BUNDLE_OPTIONAL",
+    "OC_SELFHOST_CC5_T1555U_ENABLED", "OC_SELFHOST_CC5_T1555U_TEST_UID"] as const;
+  const saved = new Map<string, string | undefined>();
+  before(() => {
+    for (const key of keys) saved.set(key, process.env[key]);
+    Object.assign(process.env, { OC_RUNTIME_CHANNEL: "v5", OC_V3_CCB_BASELINE_OPTIONAL: "1",
+      OC_PLATFORM_BUNDLE_OPTIONAL: "1", OC_SELFHOST_CC5_T1555U_ENABLED: "1", OC_SELFHOST_CC5_T1555U_TEST_UID: "912" });
+  });
+  after(() => {
+    for (const key of keys) { const value = saved.get(key); if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  });
+  function setup(failure?: "prepare" | "bind" | "start" | "tx2" | "activate" | "release") {
+    const pool = new FakePool();
+    const order: string[] = [];
+    const releaseRows: string[] = [];
+    const full = "a".repeat(64);
+    const { docker, captured } = makeDocker({ containerId: full, startFails: failure === "start",
+      onCreateContainer: () => order.push("create"),
+      onStartContainer: () => { order.push("start"); if (failure === "tx2") pool.rows[0]!.state = "vanished"; } });
+    let getterCalls = 0;
+    const ring = `fixture-key:${Buffer.alloc(32, 9).toString("base64url")}`;
+    let handle: { mountSource: string; containerDbId: string };
+    const deps = { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST,
+      randomIp: () => "172.31.8.12", randomSecret: fixedSecret("a".repeat(64)),
+      modelAuthority: { required: true, keyringEnvAssignment: () => { getterCalls++; return `OC_MODEL_AUTHORITY_KEYRING=${ring}`; } },
+      cc5: {
+        async ensureLane(): Promise<never> { throw new Error("not used by provisioning"); },
+        async releaseChat(): Promise<never> { throw new Error("not used by provisioning"); },
+        async prepare(input: { uid: number; containerDbId: string; local: boolean; publicKeyring: string }) {
+          order.push("prepare"); assert.equal(pool.clientLog.at(-1), "COMMIT");
+          assert.equal(input.uid, 912); assert.equal(input.local, true); assert.equal(input.publicKeyring, ring);
+          assert.equal(input.containerDbId, String(pool.rows[0]!.id));
+          if (failure === "prepare") throw new Error("fixture prepare failure");
+          handle = Object.freeze({ mountSource: "/own-test-only/cc5-view", containerDbId: input.containerDbId });
+          return handle;
+        },
+        async bindCreated(value: object, cid: string) {
+          order.push("bind"); assert.equal(value, handle); assert.equal(cid, full);
+          if (failure === "bind") throw new Error("fixture bind failure");
+        },
+        async activate(value: object, cid: string) {
+          order.push("activate"); assert.equal(value, handle); assert.equal(cid, full);
+          assert.equal(pool.rows[0]!.container_internal_id, full); assert.equal(pool.rows[0]!.state, "active");
+          if (failure === "activate") throw new Error("fixture activation failure");
+        },
+        async release(rowId: string) { order.push("release"); releaseRows.push(rowId); if (failure === "release") throw new Error("fixture remote unknown"); },
+      },
+    };
+    return { deps, pool, captured, order, releaseRows, full, ring, get getterCalls() { return getterCalls; } };
+  }
+  test("fresh Tx1 prepare → full CID bind before start → successful Tx2 activate with one public-ring snapshot", async () => {
+    const f = setup(); const result = await provisionV3Container(f.deps, 912);
+    assert.deepEqual(f.order, ["prepare", "create", "bind", "start", "activate"]);
+    assert.equal(f.getterCalls, 1);
+    const opts = f.captured.containersCreated[0]!;
+    assert.ok(opts.HostConfig!.Binds!.includes("/own-test-only/cc5-view:/run/oc/cc5-remote-t1555u:ro"));
+    assert.ok(opts.Env!.includes("OC_SELFHOST_CC5_T1555U_ENABLED=1"));
+    assert.ok(opts.Env!.includes("OC_SELFHOST_CC5_T1555U_TEST_UID=912"));
+    assert.ok(opts.Env!.includes(`OC_MODEL_AUTHORITY_KEYRING=${f.ring}`));
+    assert.equal(result.dockerContainerId, f.full);
+  });
+  test("ordinary UID and OFF do not prepare, mount or activate cc5", async () => {
+    for (const off of [false, true]) {
+      const f = setup(); if (off) Reflect.deleteProperty(process.env, "OC_SELFHOST_CC5_T1555U_ENABLED");
+      try {
+        await provisionV3Container(f.deps, off ? 912 : 913);
+        assert.deepEqual(f.order, ["create", "start"]);
+        assert.equal(f.captured.containersCreated[0]!.HostConfig!.Binds!.some((v) => v.includes("cc5")), false);
+        assert.equal(f.captured.containersCreated[0]!.Env!.some((v) => v.startsWith("OC_SELFHOST_CC5_")), false);
+      } finally { process.env.OC_SELFHOST_CC5_T1555U_ENABLED = "1"; }
+    }
+  });
+  test("target UID without a valid runtime or with prepare failure degrades cc5 lane without blocking container creation", async () => {
+    const fMissing = setup(); const { cc5: _unused, ...depsMissing } = fMissing.deps;
+    const resMissing = await provisionV3Container(depsMissing, 912);
+    assert.equal(resMissing.dockerContainerId, fMissing.full);
+    assert.deepEqual(fMissing.order, ["create", "start"]);
+    assert.equal(fMissing.captured.containersCreated[0]!.HostConfig!.Binds!.some((v) => v.includes("cc5")), false);
+    assert.equal(fMissing.captured.containersCreated[0]!.Env!.some((v) => v.startsWith("OC_SELFHOST_CC5_")), false);
+
+    const fPrep = setup("prepare");
+    const resPrep = await provisionV3Container(fPrep.deps, 912);
+    assert.equal(resPrep.dockerContainerId, fPrep.full);
+    assert.deepEqual(fPrep.order, ["prepare", "release", "create", "start"]);
+    assert.deepEqual(fPrep.releaseRows, [String(fPrep.pool.rows[0]!.id)]);
+    assert.equal(fPrep.captured.containersCreated[0]!.HostConfig!.Binds!.some((v) => v.includes("cc5")), false);
+    assert.equal(fPrep.captured.containersCreated[0]!.Env!.some((v) => v.startsWith("OC_SELFHOST_CC5_")), false);
+  });
+  for (const failure of ["bind", "start", "tx2", "activate"] as const) {
+    test(`${failure} failure releases only the fresh row and still compensates Docker`, async () => {
+      const f = setup(failure);
+      await assert.rejects(provisionV3Container(f.deps, 912));
+      assert.deepEqual(f.releaseRows, [String(f.pool.rows[0]!.id)]);
+      assert.equal(f.pool.rows[0]!.state, "vanished");
+      assert.ok(f.captured.removed > 0);
+      if (failure === "tx2") assert.equal(f.order.includes("activate"), false);
+    });
+  }
+  test("stop releases after the DB guard; unknown remote exit still allows Docker stop/remove", async () => {
+    const f = setup("release"); const row = await provisionV3Container(f.deps, 912);
+    await assert.rejects(stopAndRemoveV3Container(f.deps, { id: row.containerId, container_internal_id: row.dockerContainerId }),
+      (error: unknown) => error instanceof SupervisorError && error.code === "PartialV3Cleanup");
+    assert.ok(f.captured.stopped > 0 && f.captured.removed > 0);
+    assert.equal(f.pool.rows[0]!.state, "vanished");
+    assert.deepEqual(f.releaseRows, [String(row.containerId)]);
+  });
+  test("DB guard zero rows causes no release and no Docker cleanup", async () => {
+    const f = setup();
+    assert.equal(await stopAndRemoveV3Container(f.deps, { id: 999, container_internal_id: f.full }), false);
+    assert.equal(f.releaseRows.length, 0); assert.equal(f.captured.stopped, 0); assert.equal(f.captured.removed, 0);
   });
 });

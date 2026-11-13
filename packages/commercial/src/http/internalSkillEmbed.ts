@@ -30,6 +30,7 @@ import {
   skillEmbeddingConfigFromEnv,
 } from '@openclaude/storage'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
+import { resolvePlatformSkillEmbeddingConfig } from '../openai/platformSkillEmbedding.js'
 import {
   ContainerIdentityError,
   type ContainerIdentityRepo,
@@ -197,17 +198,6 @@ function parseRequest(raw: string): SkillEmbedRequest | null {
 
 export function makeSkillEmbedHandler(deps: SkillEmbedDeps): SkillEmbedHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: 'internalSkillEmbed' })
-  // Force DIRECT egress: DashScope is China-region and must bypass the process
-  // -global EnvHttpProxyAgent (which routes overseas for Anthropic). Same pattern
-  // as the MiniMax media proxy.
-  const provider = () =>
-    getSkillEmbeddingProvider({
-      ...skillEmbeddingConfigFromEnv(),
-      dispatcher: directEgressDispatcher(),
-    })
-  const embed =
-    deps.embedImpl ??
-    ((texts: string[], kind: 'query' | 'document') => provider().embed(texts, kind))
   // recordSearch is best-effort and must never affect the response, even if a
   // caller-supplied sink throws synchronously.
   const safeRecord = (row: SkillSearchLogRow) => {
@@ -249,10 +239,20 @@ export function makeSkillEmbedHandler(deps: SkillEmbedDeps): SkillEmbedHandler {
     const userLog = reqLog.child({ uid: identity.userId, containerId: identity.containerId })
 
     // If embedding is not configured, tell the caller to use keyword fallback —
-    // never 500 (skill_search must keep working).
-    if (!isSkillEmbeddingAvailable()) {
-      sendJson(res, 200, { ok: false, reason: 'embedding_unavailable' }, requestId)
-      return
+    // never 500 (skill_search must keep working). An OpenAI pool key counts as
+    // configured and switches the unpinned backend to text-embedding-3-large.
+    let platformCfg: Awaited<ReturnType<typeof resolvePlatformSkillEmbeddingConfig>> | null = null
+    if (deps.embedImpl) {
+      if (!isSkillEmbeddingAvailable()) {
+        sendJson(res, 200, { ok: false, reason: 'embedding_unavailable' }, requestId)
+        return
+      }
+    } else {
+      platformCfg = await resolvePlatformSkillEmbeddingConfig()
+      if (!(platformCfg.apiKey ?? '').trim()) {
+        sendJson(res, 200, { ok: false, reason: 'embedding_unavailable' }, requestId)
+        return
+      }
     }
 
     let body: string
@@ -278,14 +278,23 @@ export function makeSkillEmbedHandler(deps: SkillEmbedDeps): SkillEmbedHandler {
       return
     }
 
-    const prov = provider()
-    const backendId = `${skillEmbeddingBackendId()}/${prov.modelId}` // namespace by model too
+    // Force DIRECT egress: DashScope is China-region and must bypass the process
+    // -global EnvHttpProxyAgent. OpenAI from this host is also reached directly;
+    // a failed call falls back to keyword search.
+    const prov = getSkillEmbeddingProvider({
+      ...(platformCfg ?? skillEmbeddingConfigFromEnv()),
+      dispatcher: directEgressDispatcher(),
+    })
+    const embedWith =
+      deps.embedImpl ??
+      ((texts: string[], kind: 'query' | 'document') => prov.embed(texts, kind))
+    const backendId = `${skillEmbeddingBackendId(platformCfg?.baseUrl)}/${prov.modelId}` // namespace by model too
     const dim = prov.dimensions
     const cleaned = cleanSkillQuery(parsed.query)
 
     try {
       // 1) query vector (cleaned query, query-side embedding)
-      const [queryVec] = await embed([cleaned], 'query')
+      const [queryVec] = await embedWith([cleaned], 'query')
       if (!queryVec) throw new Error('empty query embedding')
 
       // 2) master computes the content hash + embed text ITSELF from the raw
@@ -303,7 +312,7 @@ export function makeSkillEmbedHandler(deps: SkillEmbedDeps): SkillEmbedHandler {
       if (missing.length > 0) {
         const textByHash = new Map<string, string>()
         for (const it of items) if (!textByHash.has(it.hash)) textByHash.set(it.hash, it.text)
-        const vecs = await embed(
+        const vecs = await embedWith(
           missing.map((h) => textByHash.get(h) ?? ''),
           'document',
         )

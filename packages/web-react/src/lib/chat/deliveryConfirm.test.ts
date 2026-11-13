@@ -4,6 +4,7 @@ import { mergeFullServerWins, applyServerIncremental } from "../persist";
 import { createSession } from "./model";
 import { messageSignature, agentTerminalStatus } from "./render";
 import { ChatSocket } from "./socket";
+import type { SessionSnapshot } from "./sessionSnapshot";
 
 const sockets: ChatSocket[] = [];
 afterEach(() => {
@@ -42,27 +43,27 @@ describe("container-confirmed delivery", () => {
     const before = messageSignature(user, { isLast: true, sending: true });
     sess._turnCostCredits = "23";
     sess._turnCostSeenRequestIds = new Set(["charge-1"]);
-    sess._turnCredits = { settled: "23", requests: 1, asOf: 90_001 };
+    sess._turnCredits = { clientMessageId: user.id, settled: "23", requests: 1, asOf: 90_001, receivedAt: 90_002 };
     frame({ type: "outbound.ack", accepted: true });
     frame({ type: "outbound.ack", admitted: true });
     expect(user._deliveryState).toBe("accepted");
     expect(messageSignature(user, { isLast: true, sending: true })).not.toBe(before);
     expect(sess._turnCostCredits).toBe("23");
     expect(sess._turnCostSeenRequestIds).toEqual(new Set(["charge-1"]));
-    expect(sess._turnCredits?.settled).toBe("23");
+    expect(sess._turnCredits).toEqual({ clientMessageId: user.id, settled: "23", requests: 1, asOf: 90_001, receivedAt: 90_002 });
   });
 
   test("accepted after a lost admission ACK preserves already confirmed charges", () => {
     const { sess, user, frame } = setup();
     sess._turnCostCredits = "35";
     sess._turnCostSeenRequestIds = new Set(["charge-before-receipt"]);
-    sess._turnCredits = { settled: "35", requests: 1, asOf: 100 };
+    sess._turnCredits = { clientMessageId: user.id, settled: "35", requests: 1, asOf: 100, receivedAt: 101 };
     sess._turnStartedAt = 42;
     frame({ type: "outbound.ack", accepted: true });
     expect(user._deliveryState).toBe("accepted");
     expect(sess._turnCostCredits).toBe("35");
     expect(sess._turnCostSeenRequestIds).toEqual(new Set(["charge-before-receipt"]));
-    expect(sess._turnCredits?.settled).toBe("35");
+    expect(sess._turnCredits).toEqual({ clientMessageId: user.id, settled: "35", requests: 1, asOf: 100, receivedAt: 101 });
     expect(sess._turnStartedAt).toBe(42);
     frame({ type: "outbound.ack", admitted: true });
     expect(sess._turnCostCredits).toBe("35");
@@ -90,14 +91,27 @@ describe("container-confirmed delivery", () => {
     expect(user._deliveryState).toBe("accepted");
   });
 
-  test("history and hello snapshot acceptedAt mark delivery without starting a cost window", () => {
-    const { sess, user, frame } = setup();
+  test("history and hello snapshot acceptedAt mark delivery without starting a cost window", async () => {
+    const { sock, sess, user, frame } = setup();
     sess._turnCostCredits = "71";
+    sess._turnCredits = { clientMessageId: user.id, settled: "71", requests: 2, asOf: 90, receivedAt: 91 };
     confirmSnapshotDelivery(sess, { clientMessageId: user.id, acceptedAt: null });
     expect(user._deliveryState).toBeUndefined();
-    frame({ type: "outbound.session_snapshot", snapshot: { dispatch: { clientMessageId: user.id, acceptedAt: 100 } } });
+    const snapshot: SessionSnapshot = {
+      v: 1, sessionId: sess.id,
+      dispatch: {
+        id: "11111111-1111-1111-1111-111111111111", clientMessageId: user.id, agentId: "main",
+        status: "accepted", outcome: null, attempt: 1, since: 50, acceptedAt: 100, terminalAt: null,
+      },
+      streamKey: null, lastFrameSeq: null, lastFrameAt: null, engineReady: null, turnStatus: null, reconcile: null,
+      pendingPermissions: { items: [], completeness: "complete" }, usage: null, credits: null,
+      frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf: 100,
+    };
+    frame({ type: "outbound.session_snapshot", snapshot });
+    await (sock as any).durableHydrationTails.get(sess.id);
     expect(user._deliveryState).toBe("accepted");
     expect(sess._turnCostCredits).toBe("71");
+    expect(sess._turnCredits).toEqual({ clientMessageId: user.id, settled: "71", requests: 2, asOf: 90, receivedAt: 91 });
   });
 
   test.each([false, true])("late history preserves confirmed delivery (timeline=%s)", (timeline) => {

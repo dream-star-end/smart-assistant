@@ -1,4 +1,6 @@
 import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
+import { takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { getSystemHelpBootstrap } from './systemHelpFrames.js'
 /**
  * Gateway inbound dispatch: the per-frame chat dispatch path (dispatchInbound)
  *
@@ -61,6 +63,7 @@ import {
   ADVISOR_CONSULT_PARENT_REASON,
   isAdvisorConsultParentEngine,
   stripAdvisorPreambleFromInjected,
+  detectAdvisorNoWrite,
 } from './advisorMode.js'
 import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { noteForegroundBashToolResult } from './ccbLocalAgentCallback.js'
@@ -95,7 +98,8 @@ import {
 import { buildContextObservationFrame } from './contextObservationFrames.js'
 import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessionReuseSkipReason, readLiveRunnerModel, resolveLocalExecutionIfEnforced, localExecutionOverride, collectAvailableMcpToolNames, _buildSafeCodexRouteOverride, _buildSafeGrokRouteOverride, _buildSafeZcodeRouteOverride, _buildSafeAntigravityRouteOverride, makePeerKey, _buildTurnTraceContext, _inheritOutboundRouting, _buildEngineErrorFrame, _buildTurnStatusFrame, _earlyRejectErrorFrames, _buildContextRebuiltFrame, isUploadMimeAllowed, uploadExtForMime } from './server.js'
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
-import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
+import { sessionStartFailureCode, sessionStartFailureMessage, userSentTurnFrames } from './turnFrames.js'
+import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_FILE, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
 export interface InboundDispatchHost {
@@ -168,6 +172,7 @@ export async function dispatchInbound(
 ): Promise<void> {
   // A few compatibility tests invoke this method with a minimal Gateway-shaped
   // object. Keep the flag-off/non-queue path independent of coordinator state.
+  takeSystemHelpBootstrap(frame)
   const gatewayReceivedAt = performance.now()
   const promptQueueLifecycle = this._promptQueueLifecycleByFrame?.get(frame as object)
   const promptQueueExecutionFence = this._promptQueueExecutionFenceByFrame?.get(frame as object)
@@ -698,8 +703,10 @@ export async function dispatchInbound(
       this.log.warn('project context unavailable; turn held', {
         sessionKey,
         reason: chatWorkspace.unavailable,
+        ...(chatWorkspace.unavailableCode ? { errorCode: chatWorkspace.unavailableCode } : {}),
         traceId: turnTraceId,
       })
+      const storage = chatWorkspace.unavailable === 'project_storage_unavailable'
       const heldFrames = _earlyRejectErrorFrames({
         sessionKey,
         channel: frame.channel,
@@ -707,9 +714,12 @@ export async function dispatchInbound(
         userId: activeUserId,
         traceId: turnTraceId,
         code: 'project_context_unavailable',
-        message:
-          '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。',
-        legacyErrorText: '[error] PROJECT_CONTEXT_UNAVAILABLE',
+        message: !storage
+          ? '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。'
+          : chatWorkspace.unavailableCode === 'EACCES' || chatWorkspace.unavailableCode === 'EPERM'
+            ? `这个项目在容器里的文件没有读取权限（${chatWorkspace.unavailableCode}），这一轮还没有开始，也不会计费。重试不会好转，需要先修复项目目录的权限。`
+            : `这个项目在容器里的文件读取出错（${chatWorkspace.unavailableCode ?? 'unknown'}），这一轮还没有开始，也不会计费。可以稍后重新发送；反复出现需要检查容器存储。`,
+        legacyErrorText: storage ? '[error] PROJECT_STORAGE_UNAVAILABLE' : '[error] PROJECT_CONTEXT_UNAVAILABLE',
       })
       for (const f of heldFrames) this.deliver(f, adapter)
       return
@@ -726,6 +736,25 @@ export async function dispatchInbound(
       persistSnapshot: Boolean(chatWorkspace.projectId && chatWorkspace.bound),
     })
 
+    // A turn whose session cannot be created never started. Without its own error frames the
+    // failure only reached the socket as an unowned error, so the chat spun until its timeout.
+    const rejectSessionStart = (err: unknown): undefined => {
+      if (!userSentTurnFrames.has(frame)) throw err
+      const code = sessionStartFailureCode(err)
+      this.log.warn('session create failed; turn rejected', { sessionKey, code, traceId: turnTraceId }, err as Error)
+      const frames = _earlyRejectErrorFrames({
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        userId: activeUserId,
+        traceId: turnTraceId,
+        code: 'engine_error',
+        message: sessionStartFailureMessage(code),
+        legacyErrorText: `[error] ${code}`,
+      })
+      for (const f of frames) this.deliver(f, adapter)
+      return undefined
+    }
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: effectiveAgent,
@@ -764,11 +793,13 @@ export async function dispatchInbound(
               canonicalModel: turnAuthority.canonicalModel,
               engine: turnAuthority.engine,
               source: 'bridge_signed' as const,
+              ...(turnAuthority.executionBackend ? { executionBackend: turnAuthority.executionBackend } : {}),
             },
           }
         : {}),
       ...(promptQueueExecutionFence ? { promptQueueExecutionFence } : {}),
-    })
+    }).catch(rejectSessionStart)
+    if (!session) return
     admitCmid =
       typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
         ? safeClientMessageId
@@ -868,8 +899,9 @@ export async function dispatchInbound(
     // ── Multimodal handling ──
     // Save all uploaded media to local disk and inject descriptive prompt hints
     // so the agent knows how to access them via MCP tools or Read.
+    const rawUserText = frame.content.text ?? ''
     const text = formatMessageReplyPrompt(
-      frame.content.text ?? '',
+      rawUserText,
       normalizeMessageReplyQuote(frame.content.replyTo),
     )
     const media = frame.content.media ?? []
@@ -1049,6 +1081,13 @@ export async function dispatchInbound(
           // /api/media path applies via fstatSync().isFile().
           if (!stat.isFile()) {
             rejectFrame('媒体类型非文件')
+            return
+          }
+          if (stat.size > MAX_UPLOAD_FILE) {
+            rejectFrame(
+              `单个文件超过 ${MAX_UPLOAD_FILE / 1024 / 1024}MB 上限 (${(stat.size / 1024 / 1024).toFixed(1)}MB)`,
+              { byteLen: stat.size },
+            )
             return
           }
           // Aggregate against MAX_UPLOAD_TOTAL — same budget the legacy base64
@@ -1703,7 +1742,7 @@ export async function dispatchInbound(
       session._advisorTurn = advisorTurnAllowed
         ? { advisorModel: frozenAdvisorModel, configVersion: inboundConfigVersion }
         : undefined
-      session._currentTurnUserText = text ?? ''
+      session._currentTurnUserText = rawUserText
       {
         const userText = text ?? ''
         let injected = payload
@@ -2244,6 +2283,8 @@ export async function dispatchInbound(
               }
             : undefined
       const leaderSubmitOpts = {
+        readOnly: advisorTurnAllowed && detectAdvisorNoWrite(rawUserText),
+        systemHelpBootstrap: getSystemHelpBootstrap(frame as object),
         historicalMessages: masterHistoricalMessages,
         codexRoute: safeCodexRoute,
         grokRoute: safeGrokRoute,
@@ -2304,6 +2345,7 @@ export async function dispatchInbound(
                   supportsVision: turnAuthority.supportsVision,
                   supportedEfforts: turnAuthority.supportedEfforts,
                   capabilityProfile: turnAuthority.capabilityProfile,
+                  executionBackend: turnAuthority.executionBackend,
                 }),
               },
             }

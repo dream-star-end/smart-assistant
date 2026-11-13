@@ -96,3 +96,13 @@ export function listActivities(
     .all(ticketId, limit, offset) as ActivityRow[]
   return rows.map(mapActivity)
 }
+
+
+/** Payloads for an already selected, bounded timeline window. */
+export function listActivitiesByIdsForTicket(db: TaskboardDb, ticketId: string, ids: readonly string[]): TicketActivity[] {
+  if (ids.length > 500) throw new RangeError('timeline payload window exceeds 500')
+  if (!ids.length) return []
+  const placeholders = ids.map(() => '?').join(',')
+  const rows = db.prepare(`SELECT ${ACTIVITY_COLS} FROM tb_ticket_activity WHERE ticket_id = ? AND id IN (${placeholders})`).all(ticketId, ...ids) as ActivityRow[]
+  return rows.map(mapActivity)
+}

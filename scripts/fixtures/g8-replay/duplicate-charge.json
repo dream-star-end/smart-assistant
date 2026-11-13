@@ -1,0 +1,26 @@
+{
+  "id": "duplicate-charge",
+  "expect": {
+    "retryable": false,
+    "stopSession": false,
+    "verdict": "duplicate_charge",
+    "severity": "critical",
+    "askHuman": true,
+    "alert": true,
+    "reason": "duplicate_charge",
+    "point": "turn_end",
+    "traceId": "33333333333333333333333333333333"
+  },
+  "observation": {
+    "point": "turn_end",
+    "traceId": "33333333333333333333333333333333",
+    "settledChargeCount": 2,
+    "stackedSettledTurns": 2,
+    "idempotentReplay": false,
+    "engineReported": "ended",
+    "engineProcessAlive": true,
+    "dispatchStatus": "terminal",
+    "dispatchOutcome": "completed",
+    "boxDecision": "accepted"
+  }
+}

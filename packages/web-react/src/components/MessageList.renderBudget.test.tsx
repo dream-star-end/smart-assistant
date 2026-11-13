@@ -6,6 +6,10 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import type { CardCallbacks } from "./chat/cards";
 import { MessageList } from "./MessageRenderer";
+import { preloadProcessStages } from "./chat/lazyProcessStages";
+import { loadBeforeAll } from "../test/moduleLoad";
+
+loadBeforeAll(preloadProcessStages);
 
 const disclosureRenders = vi.hoisted(() => ({ live: 0, settled: 0 }));
 vi.mock("./chat/ProcessDisclosure", async (importOriginal) => {

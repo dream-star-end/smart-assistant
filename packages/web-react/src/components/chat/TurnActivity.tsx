@@ -33,6 +33,8 @@ export type TurnActivityInfo = {
   dispatch?: DispatchStatus | null;
   /** 本轮开始时刻（_turnStartedAt）。null 时退化为无秒数的「思考中」。 */
   startedAt: number | null;
+  /** OCV5-704: start of the current compacting phase (_turnStatusSince). */
+  statusSince?: number;
   /** 最近一帧到达时刻（_lastFrameAt），用于静默时长升级文案。 */
   lastFrameAt?: number;
   /** Chat transport state (chat.status.cls); "connected" when absent. */
@@ -59,6 +61,8 @@ export type TurnActivityInfo = {
   agentName: string;
   /** 团队模式：队长当前正在执行的 plan step 文本（非团队模式恒 null，由 App 门控）。 */
   leaderStep?: string | null;
+  /** 进行中这一轮已结算的实扣合计，字符串积分。缺省或 0 不显示。 */
+  settledCredits?: string;
 };
 
 /**
@@ -170,7 +174,10 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
     }));
   } else if (info.turnStatus === "compacting") {
     // 压缩上下文（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。
-    ({ text, cls } = computeTypingLabel({ name: info.agentName, secs, silenceMs, turnStatus: "compacting" }));
+    // OCV5-704: seconds of this compaction, not of the whole turn.
+    const compactSecs =
+      typeof info.statusSince === "number" ? Math.max(0, Math.round((now - info.statusSince) / 1000)) : secs;
+    ({ text, cls } = computeTypingLabel({ name: info.agentName, secs: compactSecs, silenceMs, turnStatus: "compacting" }));
   } else if (info.turnStatus === "waiting_for_user") {
     text = "等待你确认后继续";
     cls = "waiting-for-user";

@@ -188,13 +188,18 @@ async function listAnon(d: CommercialHttpDeps): Promise<PublicModelProjection[]>
 async function listCatalogBody(
   d: CommercialHttpDeps,
   auth?: string,
-): Promise<{ models: PublicModelProjection[]; locked_models?: LockedPublicModelProjection[] }> {
+): Promise<{
+  models: PublicModelProjection[];
+  locked_models?: LockedPublicModelProjection[];
+  team_leader_model?: string;
+}> {
   const res = makeRes();
   await handleListPublicModels(makeReq(auth), res, {} as never, d);
   assert.equal(res.statusCode, 200);
   return res.body as {
     models: PublicModelProjection[];
     locked_models?: LockedPublicModelProjection[];
+    team_leader_model?: string;
   };
 }
 
@@ -544,6 +549,12 @@ describe("/api/public/models — catalog 未注入 → legacy 投影(兼容)", (
     pricing._setForTests([legacyRow("glm-5.2")]);
     const body = await listCatalogBody(deps({ pricing }));
     assert.equal(body.locked_models, undefined);
+    assert.equal(body.team_leader_model, "gpt-6-astra");
+  });
+
+  test("catalog 与 legacy 均下发服务端权威队长模型 team_leader_model", async () => {
+    const body = await listCatalogBody(deps({ modelCatalog: catalogOf(snap()) }));
+    assert.equal(body.team_leader_model, "gpt-6-astra");
   });
 
   test("pricing 与 catalog 都没有 → 503 PRICING_NOT_READY", async () => {

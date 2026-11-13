@@ -154,11 +154,10 @@ export function TaskboardView({
     return (board.board?.columns ?? []).flatMap((c) => c.tickets ?? []).find(match) ?? null
   }, [board.backlogTickets, board.board, board.tickets, ticketId])
 
-  const actionTicket =
-    selected ??
-    (detailTicket && ticketId && (detailTicket.identifier === ticketId || detailTicket.id === ticketId)
-      ? detailTicket
-      : null)
+  const ownedDetail = detailTicket && ticketId &&
+    (detailTicket.identifier === ticketId || detailTicket.id === ticketId) ? detailTicket : null
+  const actionTicket = ownedDetail && (!selected || ownedDetail.version > selected.version)
+    ? ownedDetail : selected
 
   const openTicket = (ticket: Ticket) => onOpenTicket(ticket.identifier)
 
@@ -231,11 +230,20 @@ export function TaskboardView({
       const ok = await confirm({
         title: '单据正在执行',
         body: formatRunningRunMessage(runId),
-        confirmText: '取消并移动',
+        confirmText: '停止本次执行',
         cancelText: '先不移动',
         danger: true,
       })
       if (ok) return runMove(ticket, toStageId, { ...extras, cancelRunningRun: true })
+      return false
+    }
+    if (code === 'stop_pending') {
+      toast('已请求停止，收尾完成后请再次移动任务。', 'success')
+      void board.refresh()
+      return false
+    }
+    if (code === 'run_control_unavailable' || code === 'run_changed') {
+      toast(outcome.error instanceof Error ? outcome.error.message : '执行状态已变化，请稍后重试', 'error')
       return false
     }
     if (code === 'version_conflict') {
@@ -372,9 +380,9 @@ export function TaskboardView({
     return items
   }
 
-  const renderActions = (ticket: Ticket, layout: 'board' | 'full' = 'full') => {
+  const renderActions = (ticket: Ticket, layout: 'board' | 'full' | 'drawer' = 'full') => {
     const busy = board.isPending(ticket.id)
-    const items = collectActions(ticket)
+    const items = collectActions(ticket).filter((action) => layout !== 'drawer' || action.testId !== 'inbox-revise')
     const moves = ticket.allowedMoves ?? []
     const isPendingOne = (testId: string) =>
       busy && pendingAction?.ticketId === ticket.id && pendingAction.testId === testId
@@ -420,7 +428,7 @@ export function TaskboardView({
           </DropdownMenuContent>
         </DropdownMenu>
       ) : null
-    if (layout !== 'board') {
+    if (layout === 'full') {
       // 详情抽屉:所有动作平铺成带文字的按钮(移动端也一样,不再折叠成一个无标签的「···」,审计 T-06);
       // 「移动到…」单独做成带文字的按钮。
       if (!items.length && !moves.length) return null
@@ -458,8 +466,9 @@ export function TaskboardView({
                 size="sm"
                 shape="square"
                 variant="ghost"
-                aria-label="更多操作"
+                aria-label={layout === 'drawer' ? '更多任务操作' : '更多操作'}
                 data-testid="ticket-more-actions"
+                aria-busy={busy || undefined}
                 disabled={busy}
               >
                 <MoreHorizontal size={14} />
@@ -808,6 +817,7 @@ export function TaskboardView({
     return (
       <TicketListView
         tickets={board.tickets ?? []}
+        scopeKey={board.projectId}
         query={board.listQuery}
         agents={board.agents}
         onQueryChange={(q) => void board.applyListQuery(q)}
@@ -864,6 +874,7 @@ export function TaskboardView({
           <div className={desktop ? 'flex shrink-0 items-center gap-1' : 'hidden'}>
             <ProjectSettings
               auth={auth}
+              agents={board.agents}
               current={currentProject}
               mode={projectMode}
               onModeChange={setProjectMode}
@@ -902,6 +913,7 @@ export function TaskboardView({
             />
             <TemplateLibrary
               auth={auth}
+              agents={board.agents}
               projectId={board.projectId}
               onChanged={() => void board.reconcile()}
               open={templatesOpen}
@@ -1026,7 +1038,7 @@ export function TaskboardView({
         stages={(board.board?.columns ?? []).map((c) => c.stage).filter(Boolean)}
         sessionIds={sessionIds}
         startEditing={reviseOpen}
-        actions={actionTicket ? renderActions(actionTicket, 'full') : null}
+        actions={actionTicket ? renderActions(actionTicket, 'drawer') : null}
         onClose={() => {
           setReviseOpen(false)
           onOpenTicket(null)
@@ -1035,6 +1047,7 @@ export function TaskboardView({
         onTicketUpdated={board.replaceTicket}
         onDetailLoaded={setDetailTicket}
         onOpenSession={onOpenSession}
+        onConfigureStage={() => { setReviseOpen(false); onOpenTicket(null); setStageSettingsOpen(true) }}
       />
       {confirmEl}
       {promptEl}

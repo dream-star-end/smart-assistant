@@ -18,6 +18,8 @@ type ClaimResult = { kind: 'claimed' } | { kind: 'rejected' } | { kind: 'deliver
 type ReceiptContext<R extends ReceiptRecord, E extends { record: R }> = {
   pool: Pool | null | undefined
   uid: bigint
+  agentContainerId?: number | null
+  runtimeKind?: string | null
   admittedDispatches: ReadonlyMap<string, R>
   enrichmentDispatches: Map<string, E>
   claimEnrichmentTerminalization(state: E): boolean
@@ -132,6 +134,8 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
       try {
         const accepted = await casAdmittedToAccepted(pool, {
           dispatchId: rec.dispatchId, expectedEpoch: rec.leaseEpoch,
+          ...(context.agentContainerId !== undefined ? { agentContainerId: context.agentContainerId } : {}),
+          ...(context.runtimeKind !== undefined ? { runtimeKind: context.runtimeKind } : {}),
         })
         if (accepted !== null) {
           claimed = true

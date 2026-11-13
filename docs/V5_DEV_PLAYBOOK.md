@@ -778,6 +778,20 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
   production-mutation lease，并确认 markers absent、deploy_state stable/candidate empty
   后才原子记审计并释放。任一证明失败都保持 active，禁止手改 SQLite。
 
+### 个人版上传保留扫描（OCV5-708）
+
+`uploadRetention` 的自动清理默认关闭，只有 `OC_UPLOAD_RETENTION_ENABLED=1` 显式开启；引用扫描与上传限额不受该开关绕过。开启后的定时点是 master 启动后每 60 分钟，观察窗口应跨过实际触发时间。`check-v5-upload-retention-proof.ts` 在个人列车封存前和 CI 用合成目录验证扫描期间真实 HTTP 仍能响应；不读取用户附件。禁用版本上线后仍需检查启动后的首个一小时窗口、`eventLoopMaxMs` 和 watch 历史失败数。
+
+### 个人版发布预热生命周期（OCV5-709）
+
+F.prewarm 非零（包括超时、浏览器崩溃、Node 被杀）必须中止后续付费契约门。父部署显式将
+HUP/INT/TERM 记为 129/130/143；退出时先等待预热子树清净，再写 summary 和 train 终态。
+预热 supervisor 用 Linux subreaper 收养并回收 detached Chrome 后代，父丢失也自行清理。
+SIGKILL 无法运行父 EXIT trap，只能保留 final=false 的未完成 summary，不能当成功。
+历史 transient 被 collect 后的默认 success/not-found 不能推翻 journal 中的 oom-kill；
+memory peak 是峰值，不能当 MemoryMax。资源原因需保留 kernel OOM dump 与进程归属快照，
+不得把被杀 Chrome 或其 total-vm 直接当成实际内存大户。
+
 ### 4.6b 上线后核验清单
 - [ ] `/version` = 预期 commit;smoke 通过(含 OC_EGRESS_SPLIT=1 时 egress 无条件断言)
 - [ ] `openclaude-v3` 保持 inactive(绝不因 V5 任务启动/重启个人版或 V3)

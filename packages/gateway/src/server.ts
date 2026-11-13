@@ -1,4 +1,7 @@
 import { withUserError } from '@openclaude/protocol'
+import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
+import { handleSystemHelpLocal } from './systemHelpHttp.js'
+import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
@@ -117,6 +120,7 @@ import type {
   SendToAgentIntent,
 } from './sendToAgentIntentStore.js'
 import type { PatrolEngine } from './taskboard/patrol.js'
+import { projectTaskboardRunSnapshots } from './taskboard/runSnapshots.js'
 import { postInboxMessage } from './v3InboxPost.js'
 import type {
   DelegateProgressRouting,
@@ -137,9 +141,8 @@ import type { DefaultEngineNotifier } from './engineNotifier.js'
 import type {
   parseParentEngine,
 } from './jobTerminal.js'
-import type {
-  acquireDelegateGrokRoute,
-} from './delegateGrokRoute.js'
+import type { acquireDelegateGrokRoute } from './delegateGrokRoute.js'
+import type { acquireDelegateAntigravityRoute } from './delegateAntigravityRoute.js'
 import type {
   defaultDelegateEngineBilling,
   DelegateEngineBillingClient,
@@ -198,7 +201,7 @@ import {
 } from './autoDreamOptimizer.js'
 import { AutoDreamOptimizerClient } from './autoDreamOptimizerClient.js'
 import { GATEWAY_PENDING_PERMISSION_TTL_MS } from './pendingPermissionSnapshot.js'
-import { type AgentHandlersHost, handleAgentsCollection as handleAgentsCollectionImpl, handleAgentItem as handleAgentItemImpl, handlePersona as handlePersonaImpl, handleMemory as handleMemoryImpl, handleMemoryUsage as handleMemoryUsageImpl, handleAutoDreamReport as handleAutoDreamReportImpl, handleAutoDreamOptimizer as handleAutoDreamOptimizerImpl, handleAutoDreamOptimizerCancel as handleAutoDreamOptimizerCancelImpl, handleAutoDreamOptimizerProposal as handleAutoDreamOptimizerProposalImpl, handleMemoryFile as handleMemoryFileImpl, _loadAutoDreamAuditDataset as _loadAutoDreamAuditDatasetImpl, _runAutoDreamOptimizerModel as _runAutoDreamOptimizerModelImpl, _hydrateAutoDreamOptimizerProposals as _hydrateAutoDreamOptimizerProposalsImpl, _applyAutoDreamOptimizerProposal as _applyAutoDreamOptimizerProposalImpl, _runAutoDreamModel as _runAutoDreamModelImpl } from './agentHandlers.js'
+import { type AgentHandlersHost, handleAgentsCollection as handleAgentsCollectionImpl, handleAgentItem as handleAgentItemImpl, handlePersona as handlePersonaImpl, handleMemory as handleMemoryImpl, handleMemoryUsage as handleMemoryUsageImpl, handleMemoryContext as handleMemoryContextImpl, handleAutoDreamReport as handleAutoDreamReportImpl, handleAutoDreamOptimizer as handleAutoDreamOptimizerImpl, handleAutoDreamOptimizerCancel as handleAutoDreamOptimizerCancelImpl, handleAutoDreamOptimizerProposal as handleAutoDreamOptimizerProposalImpl, handleMemoryFile as handleMemoryFileImpl, _loadAutoDreamAuditDataset as _loadAutoDreamAuditDatasetImpl, _runAutoDreamOptimizerModel as _runAutoDreamOptimizerModelImpl, _hydrateAutoDreamOptimizerProposals as _hydrateAutoDreamOptimizerProposalsImpl, _applyAutoDreamOptimizerProposal as _applyAutoDreamOptimizerProposalImpl, _runAutoDreamModel as _runAutoDreamModelImpl } from './agentHandlers.js'
 import { type SkillHandlersHost, handleSkillsList as handleSkillsListImpl, handleSkillItem as handleSkillItemImpl, handleUserSkillsList as handleUserSkillsListImpl, _handleUserSkillFiles as _handleUserSkillFilesImpl, _handleUserSkillHistory as _handleUserSkillHistoryImpl, _handleUserSkillRestore as _handleUserSkillRestoreImpl, validateSkillAgentScopeInput as validateSkillAgentScopeInputImpl, handleUserSkillItem as handleUserSkillItemImpl, _handleSkillEvalsFile as _handleSkillEvalsFileImpl, _handleSkillEvalStart as _handleSkillEvalStartImpl, _handleSkillEvalRunStatus as _handleSkillEvalRunStatusImpl, _handleSkillEvalGenStart as _handleSkillEvalGenStartImpl, _handleSkillEvalGenStatus as _handleSkillEvalGenStatusImpl, _handleReleaseJobStatus as _handleReleaseJobStatusImpl, _runSkillEvalGen as _runSkillEvalGenImpl, _skillEvalTurn as _skillEvalTurnImpl, _runSkillEval as _runSkillEvalImpl, _startSkillAutoRegression as _startSkillAutoRegressionImpl, _skillAutoRegressionTick as _skillAutoRegressionTickImpl, _collectSkillFeedbackScenarios as _collectSkillFeedbackScenariosImpl, _handleSkillTrainStart as _handleSkillTrainStartImpl, _handleSkillTrainList as _handleSkillTrainListImpl, _handleSkillTrainRun as _handleSkillTrainRunImpl, _handleSkillTrainDrafts as _handleSkillTrainDraftsImpl, _handleSkillTrainDraftItem as _handleSkillTrainDraftItemImpl, _handleSkillTrainComment as _handleSkillTrainCommentImpl, _handleSkillTrainMerge as _handleSkillTrainMergeImpl } from './skillHandlers.js'
 import { type DelegateCallbacksHost, _dispatchDelegateNotify as _dispatchDelegateNotifyImpl, _adoptOrphanedStdoutWaitDelegates as _adoptOrphanedStdoutWaitDelegatesImpl, _retryDelegateNotifies as _retryDelegateNotifiesImpl, _persistSendToAgentIntent as _persistSendToAgentIntentImpl, _deliverInterruptedSendToAgentIntent as _deliverInterruptedSendToAgentIntentImpl, _persistInterruptedSendToAgentCallbacks as _persistInterruptedSendToAgentCallbacksImpl, _ensureDurableSendToAgentCallback as _ensureDurableSendToAgentCallbackImpl, handleCcbLocalAgentNotification as handleCcbLocalAgentNotificationImpl, handleCcbLocalAgentDelivered as handleCcbLocalAgentDeliveredImpl, flushCcbLocalAgentPendingOnFinalize as flushCcbLocalAgentPendingOnFinalizeImpl, queueCcbLocalAgentInject as queueCcbLocalAgentInjectImpl, injectCcbLocalAgentCallback as injectCcbLocalAgentCallbackImpl, tryCcbLocalAgentCallbackDispatch as tryCcbLocalAgentCallbackDispatchImpl, _queueSendToAgentCallback as _queueSendToAgentCallbackImpl, injectSendToAgentCallback as injectSendToAgentCallbackImpl, trySendToAgentCallbackDispatch as trySendToAgentCallbackDispatchImpl, _sendToAgentCallbackTurnAlreadyQueued as _sendToAgentCallbackTurnAlreadyQueuedImpl } from './delegateCallbacks.js'
 import { type DelegateSupervisionHost, _ensureDelegateInflightSurface as _ensureDelegateInflightSurfaceImpl, _projectDelegateInflightFromJob as _projectDelegateInflightFromJobImpl, _forgetDelegateInflight as _forgetDelegateInflightImpl, _dropDelegateInflightSurface as _dropDelegateInflightSurfaceImpl, _touchDelegateInflightSurface as _touchDelegateInflightSurfaceImpl, _armDelegateReconcileFollowup as _armDelegateReconcileFollowupImpl, _armDelegateReaper as _armDelegateReaperImpl, _delegateRunnerIdle as _delegateRunnerIdleImpl, _delegateChildAlive as _delegateChildAliveImpl, _forgetEvictedDelegateResumes as _forgetEvictedDelegateResumesImpl, _completeDelegateResumeClaim as _completeDelegateResumeClaimImpl, _persistAndCloseDelegateJobs as _persistAndCloseDelegateJobsImpl } from './delegateSupervision.js'
@@ -207,6 +210,7 @@ import { type AdvisorHandlersHost, advisorConsultStore as advisorConsultStoreImp
 import { type AskUserPermissionsHost, handlePermissionResponse as handlePermissionResponseImpl, _broadcastPermissionSettled as _broadcastPermissionSettledImpl, handleEngineAskUser as handleEngineAskUserImpl, _finishInWindowAskUserWait as _finishInWindowAskUserWaitImpl, _compensateInWindowAskUserAnswer as _compensateInWindowAskUserAnswerImpl, _persistDetachedAskUserCard as _persistDetachedAskUserCardImpl, _patchDetachedAskUserResolved as _patchDetachedAskUserResolvedImpl, _loadDetachedAskUserCard as _loadDetachedAskUserCardImpl, _hydrateDetachedAskUserPending as _hydrateDetachedAskUserPendingImpl, _submitDetachedAskUserAnswer as _submitDetachedAskUserAnswerImpl, _forceDenyPendingPermission as _forceDenyPendingPermissionImpl, _reapCrashedSessionPendingPermissions as _reapCrashedSessionPendingPermissionsImpl, _settlePendingPermissionsForStop as _settlePendingPermissionsForStopImpl, _autoDenyPendingPermissions as _autoDenyPendingPermissionsImpl, _sweepStalePendingPermissions as _sweepStalePendingPermissionsImpl } from './askUserPermissions.js'
 import { type CronTaskWebhookHost, _drainFlagOffCronOriginNotifies as _drainFlagOffCronOriginNotifiesImpl, _handleWebhook as _handleWebhookImpl, _handleTasksApi as _handleTasksApiImpl, _handleTaskItem as _handleTaskItemImpl, _triggerTask as _triggerTaskImpl, injectCronOriginFromTerminal as injectCronOriginFromTerminalImpl, injectCronOriginSession as injectCronOriginSessionImpl, cronProjectPorts as cronProjectPortsImpl, stampCronProject as stampCronProjectImpl, handleCronChannels as handleCronChannelsImpl, handleCronApi as handleCronApiImpl, handleCronItem as handleCronItemImpl } from './cronTaskWebhook.js'
 import { type HttpMiscHandlersHost, _resolveMediaDirs as _resolveMediaDirsImpl, _sendMediaResolveError as _sendMediaResolveErrorImpl, handleApiFile as handleApiFileImpl, handleMediaGet as handleMediaGetImpl, handleUpload as handleUploadImpl, handleCollaborationConfig as handleCollaborationConfigImpl, handleSearch as handleSearchImpl, handleOAuthStart as handleOAuthStartImpl, handleOAuthCallback as handleOAuthCallbackImpl, refreshClaudeOAuthIfNeeded as refreshClaudeOAuthIfNeededImpl } from './httpMiscHandlers.js'
+import { handleChunkedUpload as handleChunkedUploadImpl } from './httpUploadChunks.js'
 import { type ChannelHandlersHost, _updateWechatIdempotency as _updateWechatIdempotencyImpl, checkInboundBypass as checkInboundBypassImpl, handleTurnCancelIfQueued as handleTurnCancelIfQueuedImpl, handleTurnRejectIfAbsent as handleTurnRejectIfAbsentImpl, handleTurnDispatchState as handleTurnDispatchStateImpl, handleWechatInbound as handleWechatInboundImpl, handleWechatStop as handleWechatStopImpl, handleWechatInboundCompensate as handleWechatInboundCompensateImpl, _handleWechat as _handleWechatImpl, handleEnginePreheat as handleEnginePreheatImpl } from './channelHandlers.js'
 import { type InboundDispatchHost, dispatchInbound as dispatchInboundImpl } from './inboundDispatch.js'
 import { type WsConnectionHost, handleWsConnection as handleWsConnectionImpl, autoResumeFromHello as autoResumeFromHelloImpl, handleStop as handleStopImpl, deliver as deliverImpl, _sendStatusFrame as _sendStatusFrameImpl, _sendStampedSessionFrame as _sendStampedSessionFrameImpl, _consumeFrameAuthority as _consumeFrameAuthorityImpl } from './wsConnection.js'
@@ -254,7 +258,7 @@ import type { InjectCcbLocalAgentCallbackArgs, InjectSendToAgentCallbackArgs, Se
 import type { AutoResumeFromHelloPeers, DeliverOut, HandleStopFrame } from './wsConnection.js'
 import type { BroadcastPermissionSettledPayload, CompensateInWindowAskUserAnswerPending, FinishInWindowAskUserWaitArgs, HandlePermissionResponseFrame, HydrateDetachedAskUserPendingFrame, PatchDetachedAskUserResolvedPending, PersistDetachedAskUserCardArgs, SubmitDetachedAskUserAnswerPending } from './askUserPermissions.js'
 // Moved to ./httpUploadStatic.js (FINDINGS §7.6, OCV5-533); re-exported for existing importers.
-export { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, SAFE_UPLOAD_EXTENSION_RE, mimeFor, staticCacheControl, shouldLogHttpAccess } from './httpUploadStatic.js'
+export { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, MAX_UPLOAD_FILE, SAFE_UPLOAD_EXTENSION_RE, mimeFor, staticCacheControl, shouldLogHttpAccess } from './httpUploadStatic.js'
 // Moved to ./autoDreamSchedule.js (FINDINGS §7.6, OCV5-533); re-exported for existing importers.
 export { AUTO_DREAM_SCHEDULE_KEYS, normalizeAutoDreamSchedule } from './autoDreamSchedule.js'
 // Moved to ./askUserSanitize.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
@@ -734,6 +738,7 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
+    installSystemHelpRelay(this.sessions)
     this.sessions.onCcbTaskNotification = (session, payload) => {
       void this.handleCcbLocalAgentNotification(session, payload)
     }
@@ -880,6 +885,7 @@ export class Gateway {
   }
   /** Narrow view of the Gateway for routes/preAuth.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
+    handleSystemHelp: (req, res) => handleSystemHelpLocal(req, res, getSystemHelpRelay(gw.sessions)),
     _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
     _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
     _handleSkillTrainRun: (...args) => gw._handleSkillTrainRun(...args),
@@ -1021,6 +1027,7 @@ export class Gateway {
     handleMemory: (...args) => gw.handleMemory(...args),
     handleMemoryFile: (...args) => gw.handleMemoryFile(...args),
     handleMemoryUsage: (...args) => gw.handleMemoryUsage(...args),
+    handleMemoryContext: (...args) => gw.handleMemoryContext(...args),
     handlePersona: (...args) => gw.handlePersona(...args),
     handleSkillItem: (...args) => gw.handleSkillItem(...args),
     handleSkillsList: (...args) => gw.handleSkillsList(...args),
@@ -1031,6 +1038,8 @@ export class Gateway {
 
   /** Narrow view of the Gateway for routes/workspaceApi.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly workspaceApiRoutesIo: WorkspaceApiRoutesIo = ((gw: Gateway): WorkspaceApiRoutesIo => ({
+    preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => gw._getAgentsConfig(), defaultModel: gw.deps.config.defaults.model })(stages),
+    getRunSnapshots: (runs) => projectTaskboardRunSnapshots(runs, (key) => gw.sessions.getByKey(key)),
     _getAgentsConfigUserView: (...args) => gw._getAgentsConfigUserView(...args),
     _handleTaskItem: (...args) => gw._handleTaskItem(...args),
     _handleTasksApi: (...args) => gw._handleTasksApi(...args),
@@ -1047,6 +1056,7 @@ export class Gateway {
     handleOAuthStart: (...args) => gw.handleOAuthStart(...args),
     handleSearch: (...args) => gw.handleSearch(...args),
     handleUpload: (...args) => gw.handleUpload(...args),
+    handleChunkedUpload: (...args) => gw.handleChunkedUpload(...args),
     readBody: (...args) => gw.readBody(...args),
     sendInternalError: (...args) => gw.sendInternalError(...args),
     sendJson: (...args) => gw.sendJson(...args),
@@ -1493,6 +1503,11 @@ export class Gateway {
     return handleUploadImpl.call(this as unknown as HttpMiscHandlersHost, req, res)
   }
 
+  /** Chunked upload. One HTTP body stays at 100MiB; the assembled file may be 1GiB. */
+  private handleChunkedUpload(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    return handleChunkedUploadImpl.call(this as unknown as HttpMiscHandlersHost, req, res, url)
+  }
+
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
   private handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1525,6 +1540,10 @@ export class Gateway {
 
   private handleMemoryUsage(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void> {
     return handleMemoryUsageImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, url)
+  }
+
+  private handleMemoryContext(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+    return handleMemoryContextImpl.call(this as unknown as AgentHandlersHost, req, res, agentId)
   }
 
   // GET /api/agents/:id/auto-dream-report → sanitized latest result/progress.
@@ -1865,6 +1884,8 @@ export class Gateway {
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
   /** Test seam: grok relay route mint(默认 grok-build 优先 → mint 失败回落 glm 的用例注入)。 */
   private _acquireDelegateGrokRoute: typeof acquireDelegateGrokRoute | undefined
+  /** Test seam: antigravity relay route mint (OCV5-738, delegate engine route). */
+  private _acquireDelegateAntigravityRoute: typeof acquireDelegateAntigravityRoute | undefined
   /** Test seam: skip the 60s idle-timeout floor so timeout/billing races are unit-testable. */
   private _delegateTimeoutConfig: DelegateTimeoutConfig | undefined
   /** Stage 1: durable boot reconciler has finished (or durable is off). */
@@ -2552,8 +2573,8 @@ export class Gateway {
     return _consumeFrameAuthorityImpl.call(this as unknown as WsConnectionHost, ws, frame, isFromBridge)
   }
 
-  private _rejectAuthority(ws: WebSocket, code: string, detail: string): void {
-    _rejectAuthorityImpl.call(this as unknown as TurnDispatchHost, ws, code, detail)
+  private _rejectAuthority(ws: WebSocket, code: string, detail: string, frame?: Record<string, unknown>): void {
+    _rejectAuthorityImpl.call(this as unknown as TurnDispatchHost, ws, code, detail, frame)
   }
 
   /**

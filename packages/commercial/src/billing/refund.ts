@@ -16,6 +16,7 @@ import type { Pool, PoolClient } from 'pg'
 
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { lockTurnBillingKeys } from './turnLock.js'
+import { readTurnWaiverPolicy, requiresZeroOutputProof, type TurnWaiverPolicyDecision } from './turnWaiverPolicy.js'
 
 export interface TurnWaiverInput {
   userId: bigint
@@ -24,7 +25,9 @@ export interface TurnWaiverInput {
   logger?: Logger
 }
 
-export interface TurnWaiverResult {
+export interface AppliedTurnWaiverResult {
+  /** Optional for rolling callers that already return the applied receipt. */
+  disposition?: 'applied'
   waiverId: string
   /** true only for the transaction that changed pending → applied. */
   newlyApplied: boolean
@@ -33,6 +36,16 @@ export interface TurnWaiverResult {
   totalAfter: bigint | null
   inboxMessageId: string
 }
+
+type UnappliedTurnWaiverDecision = Exclude<TurnWaiverPolicyDecision, { disposition: 'eligible' }>
+export type TurnWaiverResult = AppliedTurnWaiverResult | (UnappliedTurnWaiverDecision & {
+  waiverId: null
+  newlyApplied: false
+  refundedCredits: bigint
+  recordCount: number
+  totalAfter: null
+  inboxMessageId: null
+})
 
 type LedgerBucketRow = 'wallet' | 'period' | 'org_wallet' | 'org_period'
 
@@ -52,6 +65,8 @@ interface WaiverRow {
   record_count: number
   inbox_message_id: string | null
 }
+
+export type TurnWaiverFenceResult = WaiverRow | UnappliedTurnWaiverDecision
 
 interface WaiverLineage {
   sessionId: string
@@ -160,7 +175,7 @@ function waiverReceiptBody(input: {
 export async function ensurePendingTurnWaiverInTransaction(
   client: PoolClient,
   input: TurnWaiverInput,
-): Promise<WaiverRow> {
+): Promise<TurnWaiverFenceResult> {
   await lockTurnBillingKeys(client, input.userId, [input.turnKey])
   const uid = input.userId.toString()
   const existing = await client.query<WaiverRow>(
@@ -180,6 +195,10 @@ export async function ensurePendingTurnWaiverInTransaction(
     }
     return row
   }
+  if (requiresZeroOutputProof(input.reason)) {
+    const decision = await readTurnWaiverPolicy(client, input)
+    if (decision.disposition !== 'eligible') return decision
+  }
   const inserted = await client.query<WaiverRow>(
     `INSERT INTO turn_waivers (user_id, turn_key, reason, status)
      VALUES ($1, $2, $3, 'pending')
@@ -192,12 +211,13 @@ export async function ensurePendingTurnWaiverInTransaction(
 }
 
 /** Manual/rolling compatibility entry: durable pending fence first. */
-export async function ensurePendingTurnWaiver(pool: Pool, input: TurnWaiverInput): Promise<void> {
+export async function ensurePendingTurnWaiver(pool: Pool, input: TurnWaiverInput): Promise<TurnWaiverFenceResult> {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    await ensurePendingTurnWaiverInTransaction(client, input)
+    const result = await ensurePendingTurnWaiverInTransaction(client, input)
     await client.query('COMMIT')
+    return result
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
     throw err
@@ -226,6 +246,13 @@ export async function applyTurnWaiver(
     await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('oc_waiver_user:' || $1::text, 0))`, [uid])
     await lockTurnBillingKeys(client, input.userId, [input.turnKey])
     const waiver = await ensurePendingTurnWaiverInTransaction(client, input)
+
+    if ('disposition' in waiver) {
+      await client.query('COMMIT')
+      log.info('turn_waiver_not_applied', { turnKey: input.turnKey, ...waiver })
+      return { ...waiver, waiverId: null, newlyApplied: false, refundedCredits: 0n,
+        recordCount: 0, totalAfter: null, inboxMessageId: null }
+    }
 
     if (waiver.status === 'applied') {
       if (!waiver.inbox_message_id) throw new Error('applied turn waiver missing inbox receipt')

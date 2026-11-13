@@ -26,9 +26,57 @@ import { PRE_AUTH_ROUTES } from '../routes/preAuth.js'
 import { dispatchRoutes, type HttpRoute, matchingRouteIds } from '../routes/routeTable.js'
 import { SYSTEM_ROUTES } from '../routes/system.js'
 import { WORKSPACE_API_ROUTES } from '../routes/workspaceApi.js'
-import { LEGACY_HTTP_DISPATCH } from './fixtures/legacyHttpDispatch.js'
+import { LEGACY_HTTP_DISPATCH, type LegacyGroup } from './fixtures/legacyHttpDispatch.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
+// Preserve the frozen extraction baseline; specify later route additions independently.
+const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
+  ...LEGACY_HTTP_DISPATCH,
+  PRE_AUTH_ROUTES: {
+    ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES,
+    routes: [{ id: 'SYSTEM_HELP_LOCAL', line: 0, calls: ['handleSystemHelp'],
+      match: (_req, url) => url.pathname === '/api/internal/system-help' }, ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.routes],
+    samples: ['/api/internal/system-help', ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.samples],
+  },
+  AGENT_ROUTES: (() => {
+    const agents = LEGACY_HTTP_DISPATCH.AGENT_ROUTES
+    const at = agents.routes.findIndex((r) => r.id === '/api/agents/:1/memory/usage') + 1
+    // OpenViking B1 façade view (gateway-only), right after memory/usage.
+    const memoryContext = { id: '/api/agents/:1/memory/context', line: 0, calls: ['handleMemoryContext', 'sendInternalError'],
+      match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/context$/.test(url.pathname) }
+    return {
+      ...agents,
+      routes: [...agents.routes.slice(0, at), memoryContext, ...agents.routes.slice(at)],
+      samples: [...agents.samples, '/api/agents/a/memory/context', '/api/agents/aaa/memory/context'],
+    }
+  })(),
+  WORKSPACE_API_ROUTES: (() => {
+    const group = LEGACY_HTTP_DISPATCH.WORKSPACE_API_ROUTES
+    const at = group.routes.findIndex((r) => r.id === 'POST /api/uploads')
+    const hex = 'a'.repeat(32)
+    const chunkRoutes = [
+      { id: 'POST /api/uploads/init', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => url.pathname === '/api/uploads/init' && req.method === 'POST' },
+      { id: 'PUT /api/uploads/:id/chunks/:index', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => req.method === 'PUT' && /^\/api\/uploads\/[a-f0-9]{32}\/chunks\/\d+$/.test(url.pathname) },
+      { id: 'GET /api/uploads/:id', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => req.method === 'GET' && /^\/api\/uploads\/[a-f0-9]{32}$/.test(url.pathname) },
+      { id: 'POST /api/uploads/:id/complete', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => req.method === 'POST' && /^\/api\/uploads\/[a-f0-9]{32}\/complete$/.test(url.pathname) },
+    ]
+    return {
+      ...group,
+      routes: [...group.routes.slice(0, at), ...chunkRoutes, ...group.routes.slice(at)],
+      samples: [
+        '/api/uploads/init',
+        `/api/uploads/${hex}/chunks/0`,
+        `/api/uploads/${'b'.repeat(32)}`,
+        `/api/uploads/${'c'.repeat(32)}/complete`,
+        ...group.samples,
+      ],
+    }
+  })(),
+}
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 
 // Original chain order (the client-session block between SYSTEM and APP_CONFIG was already a module).
@@ -55,7 +103,7 @@ function corpus(): string[] {
     '/healthz/',
     '/metricsx',
   ])
-  for (const group of Object.values(LEGACY_HTTP_DISPATCH)) {
+  for (const group of Object.values(CURRENT_HTTP_DISPATCH)) {
     for (const s of group.samples) {
       out.add(s)
       out.add(`${s}/`)
@@ -73,7 +121,7 @@ function corpus(): string[] {
 describe('route tables ≡ original if-chain', () => {
   it('fixture covers exactly these tables, in chain order', () => {
     assert.deepEqual(
-      Object.keys(LEGACY_HTTP_DISPATCH),
+      Object.keys(CURRENT_HTTP_DISPATCH),
       TABLES.map(([name]) => name),
     )
   })
@@ -82,7 +130,7 @@ describe('route tables ≡ original if-chain', () => {
     it(`${name}: same routes, same order`, () => {
       assert.deepEqual(
         table.map((r) => r.id),
-        LEGACY_HTTP_DISPATCH[name].routes.map((r) => r.id),
+        CURRENT_HTTP_DISPATCH[name].routes.map((r) => r.id),
       )
     })
   }
@@ -94,7 +142,7 @@ describe('route tables ≡ original if-chain', () => {
       for (const method of METHODS) {
         const req = reqOf(method)
         const legacy = TABLES.flatMap(([name]) =>
-          LEGACY_HTTP_DISPATCH[name].routes
+          CURRENT_HTTP_DISPATCH[name].routes
             .filter((r) => r.match(req, url))
             .map((r) => `${name}:${r.id}`),
         )
@@ -112,7 +160,7 @@ describe('route tables ≡ original if-chain', () => {
     const unreached: string[] = []
     for (const [name, table] of TABLES) {
       const hit = new Set<string>()
-      for (const path of LEGACY_HTTP_DISPATCH[name].samples) {
+      for (const path of CURRENT_HTTP_DISPATCH[name].samples) {
         const url = new URL(path, 'http://gateway.test')
         for (const method of METHODS)
           for (const id of matchingRouteIds(table, reqOf(method), url)) hit.add(id)
@@ -142,7 +190,7 @@ function recordingIo() {
 
 describe('thin-dispatch routes call the original handler', () => {
   for (const [name, table] of TABLES) {
-    const legacy = LEGACY_HTTP_DISPATCH[name]
+    const legacy = CURRENT_HTTP_DISPATCH[name]
     // routes whose original branch only did `this.handler(...).catch((err) => this.sendInternalError(res, err))`
     const thin = legacy.routes.filter(
       (r) =>

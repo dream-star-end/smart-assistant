@@ -65,6 +65,14 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByLabelText("生成中").textContent).toContain("正在压缩上下文");
   });
 
+  test("compacting 秒数从压缩开始算,不从本轮开始算(OCV5-704)", () => {
+    renderTA({ startedAt: Date.now() - 1_943_000, statusSince: Date.now() - 17_000, turnStatus: "compacting" });
+    const text = screen.getByLabelText("生成中").textContent ?? "";
+    expect(text).toContain("正在压缩上下文");
+    expect(text).toContain("17s");
+    expect(text).not.toContain("1943s");
+  });
+
   test("engine_starting → 正在启动引擎(不误标思考中)", () => {
     renderTA({ startedAt: Date.now() - 8000, turnStatus: "engine_starting" });
     const text = screen.getByLabelText("生成中").textContent ?? "";

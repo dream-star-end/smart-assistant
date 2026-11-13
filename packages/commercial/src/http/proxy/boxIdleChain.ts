@@ -1,9 +1,12 @@
 import { isBoxApiModel, isBoxApiModelPair } from "@openclaude/protocol";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { parseBoxReplayMessagePointer, type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { BOX_EXPIRED_UNPROVEN_STATE, parseBoxExpiredClose } from "./boxExpiredClose.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { BOX_TOOL_MAX_ROUNDS } from "./boxToolCapacity.js";
+import { unadmittedToolRollover } from "../../billing/boxToolRolloverIdentity.js";
+import { parseBoxTerminalProof } from "./boxTerminalProof.js";
 
 /** Real autocompact floor for a 200k window minus the stock buffer. Not a test override. */
 export const IDLE_COMPACT_USAGE_FLOOR = 167_000;
@@ -326,11 +329,54 @@ function singleRevision(input: { sessionId: string; turnKey: string }, chain: Id
   });
 }
 
+/** One cancelled successor that never reached admission is not another
+ * physical round. Only its exact 128-row, proof-closed predecessor can
+ * authorize this additional idle component before retirement commits. */
+function cancelledRolloverExtra(row: IdleChainRow, byId: Map<string,IdleChainRow>): boolean {
+  const ctx = row.ctx;
+  const receipt = unadmittedToolRollover(ctx,row.requestId);
+  if (!receipt || ctx.boxState !== "prestart_stopped" || ctx.boxRolloverCancelled !== true
+    || !["inflight","aborted"].includes(row.state)
+    || (row.finalCredits != null && row.finalCredits !== "0")) return false;
+  const prior = byId.get(receipt.ownerRequestId);
+  if (!prior || prior.ctx.boxRecoveredBy !== row.requestId
+    || !isDeepStrictEqual(prior.ctx.boxRolloverTo,receipt)) return false;
+  let proof: ReturnType<typeof parseBoxTerminalProof>;
+  try { proof = parseBoxTerminalProof(`${JSON.stringify(prior.ctx.boxTerminalProof)}\n`,
+    { runNonce: receipt.runNonce,leaseEpoch: receipt.leaseEpoch }); }
+  catch { return false; }
+  if (proof.reason === "worker_complete") return false;
+  const chain = projectFailedChain(prior.requestId,byId);
+  return chain !== null && chain.length === BOX_TOOL_MAX_ROUNDS && chain.length === receipt.roundNo
+    && chain.every((part,index) => {
+      const handoff = parseBoxStoredToolHandoff(part.ctx.boxToolHandoff);
+      return part.ctx.boxRunNonce === receipt.runNonce && part.ctx.boxLeaseEpoch === receipt.leaseEpoch
+        && part.ctx.boxAccountId === receipt.accountId && handoff?.roundNo === receipt.roundNo-index
+        && handoff.catalogHash === receipt.catalogHash && handoff.detachedRunnerHash === receipt.detachedRunnerHash;
+    });
+}
+
 /**
  * Project one authenticated session/turn snapshot.
  * One complete chain keeps the original terminal result. Several independent
  * complete chains are a ready set, not a summary.
  */
+function isSupersededUnsentResume(
+  row: IdleChainRow,
+  byId: ReadonlyMap<string, IdleChainRow>,
+): boolean {
+  const by = row.ctx.boxUnsentSupersededBy;
+  return row.state === "aborted"
+    && (row.finalCredits == null || row.finalCredits === "0")
+    && row.ctx.boxState === "prestart_stopped"
+    && !Object.hasOwn(row.ctx, "boxLaunchPermit")
+    && row.ctx.boxOwnerRequestId === undefined
+    && row.ctx.boxResumeRequestId === undefined
+    && row.ctx.boxRunNonce === undefined
+    && typeof by === "string" && by.length > 0 && by !== row.requestId
+    && byId.get(by)?.ctx.model === row.ctx.model;
+}
+
 export function projectBoxIdleChain(input: {
   sessionId: string;
   turnKey: string;
@@ -339,14 +385,20 @@ export function projectBoxIdleChain(input: {
   /** Text already checked against the capsule file hash by the replay reader. */
   verifiedSummaryText?: string;
 }): BoxIdleProof {
-  const scoped = input.rows.filter((row) => row.ctx.boxSessionId === input.sessionId
+  const rawScoped = input.rows.filter((row) => row.ctx.boxSessionId === input.sessionId
     && row.ctx.boxTurnKey === input.turnKey
     && isBoxApiModel(row.ctx.model)
     && row.ctx.boxInvocationRecovery === "v1");
-  if (scoped.length === 0) return { status: "not_found" };
-  if (scoped.length > 128) return { status: "pending", reason: "cycle" };
+  if (rawScoped.length === 0) return { status: "not_found" };
+  const rawById = new Map(rawScoped.map((row) => [row.requestId, row]));
+  if (rawById.size !== rawScoped.length) return { status: "pending", reason: "fork" };
+  const scoped = rawScoped.filter((row) => !isSupersededUnsentResume(row, rawById));
+  if (scoped.length === 0) return { status: "pending", reason: "cycle" };
   const byId = new Map(scoped.map((row) => [row.requestId, row]));
-  if (byId.size !== scoped.length) return { status: "pending", reason: "fork" };
+  if (scoped.length > BOX_TOOL_MAX_ROUNDS && (scoped.length !== BOX_TOOL_MAX_ROUNDS + 1
+    || scoped.filter((row) => cancelledRolloverExtra(row,byId)).length !== 1)) {
+    return { status: "pending", reason: "cycle" };
+  }
   const children = new Map<string, string>();
   for (const row of scoped) {
     const parent = row.ctx.boxOwnerRequestId;

@@ -68,7 +68,15 @@ const SELFHOST_PROOF_DEBT_CEILING = 63;
  *     核对(账号 25 生命周期 ready、账号池写入 ≥1、真实 box-claude 回合),记在事故 proofPending 里。
  *     补上 proof 后同步调低。
  */
-const SELFHOST_PROOF_PENDING_BASELINE = 2;
+// 2026-10-26 OCV5-622: office refresh-grace / cross-tab lock is unit+integ proven;
+// dual-tab BootSplash live proof needs post-ride canary on personal office session
+// (browser harness cannot yet drive two real tabs against live auth cookies).
+// 2026-10-31 OCV5-704: turn-label undercount stays unit-replay only. A live proof
+// would debit a real personal account, which this change refuses to do. The
+// regression is the 97+35=132 replay plus the process-header test. Amounts are
+// unchanged and historical rows are not rewritten. Lower this when a non-debiting
+// proof layer exists.
+const SELFHOST_PROOF_PENDING_BASELINE = 4;
 const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
 /** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
 function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {
@@ -590,6 +598,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   "839ad442098f8e68e0b9fd2b0e8f01519334031e",
   "f4f1430885612c9d377b7495831fb08375d0c6cb",
   "3772295e774a6c50406e3d975f5136f590834be3",
+  // 2026-11-10 user chose to freeze the live selfhost history instead of renewing
+  // expiring waivers: rel-3a4aba64d is live and its commits (793c4f0b among them)
+  // cannot be rewritten. Only its ancestors are exempt; later commits still go
+  // through the trailer gate.
+  "3a4aba64d1e9a54a4915d40606c5977296bd59bb",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
@@ -720,11 +733,20 @@ function checkTrailerClosure(): number {
         && waiver?.emergencyMissingTrailer === true
         && incident?.id === "INC-20260804-RETRY-ERROR-REDCARD"
         && incident.rootFixCommit === "aa583b70";
-      if (!exactImmutableEmergency) {
+      // 用户逐条批准（ae3b779 2026-11-06，de3ca8e4 2026-11-08）：已推送、不可改写的缺 trailer
+      // 提交。只放行这些完整 SHA，需 commit 完全相等的未过期 waiver；不写入
+      // IMPORTED_TRAILER_HISTORY_TIPS。与 check-v5-fix-trailers.sh 的 PUSHED_MISSING_TRAILER_SHAS 保持一致。
+      const pushedMissingTrailerException =
+        [
+          "ae3b77946db724b6b53b717aceeb5506213158c0",
+          "de3ca8e4c1a801499aa771172924af06f09d0c8d",
+        ].includes(sha)
+        && waiver?.commit === sha;
+      if (!exactImmutableEmergency && !pushedMissingTrailerException) {
         fail(`${sha.slice(0, 8)} "${subject}" 触碰用户可见面但缺 trailer:`
           + "Incident: INC-YYYYMMDD-SLUG,或仅对已登记 exact P0 containment 使用带审批的 emergencyMissingTrailer waiver");
       }
-      if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 emergency trailer waiver 已于 ${waiver.expiresAt} 过期`);
+      if (waiver && waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 trailer 例外 waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
     const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
@@ -735,7 +757,16 @@ function checkTrailerClosure(): number {
     if (/^none\b/.test(trailer)) {
       const waiver = waivers.get(sha.slice(0, 8));
       if (!waiver) fail(`${sha.slice(0, 8)} 声明 Incident: none,但 incident-waivers.json 里没有对应 waiver`);
-      if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
+      if (waiver.expiresAt < today) {
+        // 2026-11-01 管家批准的单 SHA 不可变例外。da9cd548 已上线，源提交不可改写，
+        // 原 waiver 于 2026-10-31 过期。不延长这份 waiver，也不把该提交或其祖先写入
+        // IMPORTED_TRAILER_HISTORY_TIPS。只放行这一个完整 SHA。
+        const stewardImmutableExpiredWaiver =
+          sha === "da9cd5484db3b0e5c882f4032ee09685c4e5b5a7"
+          && waiver.commit === sha
+          && waiver.expiresAt === "2026-10-31";
+        if (!stewardImmutableExpiredWaiver) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
+      }
       continue;
     }
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {

@@ -1,3 +1,6 @@
+import type {AuthorizeSwitch} from './useModelSwitchCost';
+import {mintMsgId} from '../lib/chat/model';
+import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 /**
  * Composer send pipeline: send, project start, media upload and image edit/comment actions
  *
@@ -12,7 +15,6 @@ import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";
 import { findRewriteTarget } from "../lib/implicitFeedback";
 import { prepareAdvisorSend, saveInitialCollaboration, persistRecoveredAdvisor } from "../lib/collaborationSend";
-import { writeTeamMode } from "../lib/teamMode";
 import { writeSessionEffort } from "../lib/sessionEffort";
 import { writeContextTier } from "../lib/sessionContextTier";
 import { writeSessionServiceTier } from "../lib/sessionServiceTier";
@@ -34,6 +36,7 @@ import type { ToastFn } from "../components/ui/Toast";
 
 export type ComposerSendInput = {
   activeId: string | undefined;
+  authorizeSwitch?: AuthorizeSwitch;
   agent: Agent;
   applyCollabDoc: (doc: CollaborationConfigDoc) => void;
   auth: AuthSession | null;
@@ -52,9 +55,12 @@ export type ComposerSendInput = {
   newSessionInProject: (projectId: string) => void;
   preferenceEffort: PreferenceEffort | undefined;
   projectHome: ProjectRoute | null;
+  promoteDraftCollab: (sessionId: string, state?: CollabUiState, persist?: boolean) => void;
   publicCfg: PublicConfig | null;
+  queueModelPatch: (sessId: string, modelId: string) => void;
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
+  sendScrollRef?: React.RefObject<(() => void) | null>;
   serviceTier: "fast" | null;
   sessionEffort: PreferenceEffort | null | undefined;
   sessions: Session[];
@@ -69,7 +75,6 @@ export type ComposerSendInput = {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setSessions: React.Dispatch<React.SetStateAction<Session[]>>;
   setStreamText: React.Dispatch<React.SetStateAction<string>>;
-  setTeamModeState: React.Dispatch<React.SetStateAction<boolean>>;
   sockRef: React.RefObject<UseChatSocket | null>;
   stopPreparing: () => void;
   stopRef: React.RefObject<boolean>;
@@ -79,6 +84,7 @@ export type ComposerSendInput = {
 
 export function useComposerSend({
   activeId,
+  authorizeSwitch,
   agent,
   applyCollabDoc,
   auth,
@@ -97,9 +103,12 @@ export function useComposerSend({
   newSessionInProject,
   preferenceEffort,
   projectHome,
+  promoteDraftCollab,
   publicCfg,
+  queueModelPatch,
   selectedSessionIdRef,
   sendImplicitRatingRef,
+  sendScrollRef,
   serviceTier,
   sessionEffort,
   sessions,
@@ -114,14 +123,13 @@ export function useComposerSend({
   setMessages,
   setSessions,
   setStreamText,
-  setTeamModeState,
   sockRef,
   stopPreparing,
   stopRef,
   toast,
   user,
 }: ComposerSendInput) {
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, setTeamModeState, sockRef, stopRef are App useState setter/useRef passed in, stable
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, sockRef, stopRef are App useState setter/useRef passed in, stable
   const send = useCallback(
     async (
       text: string,
@@ -144,6 +152,7 @@ export function useComposerSend({
           createdAt: new Date().toISOString(),
         };
         setMessages((m) => [...m, userMsg]);
+        sendScrollRef?.current?.();
         setBusy(true);
         setStreamText("");
         stopRef.current = false;
@@ -158,12 +167,12 @@ export function useComposerSend({
         ]);
         setStreamText("");
         setBusy(false);
-        return;
+        return true;
       }
 
       if (!user || !sockRef.current) {
         if (target) throw new Error("登录状态或会话连接不可用");
-        return;
+        return false;
       }
       const sendProjectId = target ? target.projectId : draftProjectRef.current;
       // 隐式负反馈（改写重发）：发送前用**当前会话**的现有消息判定「5min 内高相似改写」——
@@ -185,24 +194,30 @@ export function useComposerSend({
       const recoverySelection = selectedSessionIdRef.current;
       const recoveryIdentity = auth?.snapshot().epoch;
       const recoveryIdentityIsCurrent = () => auth?.snapshot().epoch === recoveryIdentity;
-      const recoveryIsCurrent = () => collabEpochRef.current === recoveryEpoch
-        && selectedSessionIdRef.current === recoverySelection && (!target || target.sessionId === recoverySelection) && recoveryIdentityIsCurrent();
+      const recoveryIsCurrent = () =>
+        (selectedSessionIdRef.current === recoverySelection
+          ? collabEpochRef.current === recoveryEpoch
+          : !originalSessionId &&
+            selectedSessionIdRef.current === sessionId &&
+            collabEpochRef.current <= recoveryEpoch + 1) &&
+        (!target || target.sessionId === recoverySelection) &&
+        recoveryIdentityIsCurrent();
       if (!originalSessionId) stopPreparing();
       const recovery = await prepareAdvisorSend({
         agentId: agent.id, original: collabUi, auth, sessionId: originalSessionId,
         parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
         isCurrent: recoveryIdentityIsCurrent,
         update: (state, recovered) => {
-          if (!recoveryIsCurrent()) return;
+          if (!recoveryIsCurrent()) return false;
           setCollabUi(state);
-          setTeamModeState(false);
           setCollabSaveError(null);
           if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
         },
       });
-      if (!recovery || !recoveryIdentityIsCurrent()) return;
+      if (!recovery || !recoveryIdentityIsCurrent()) return false;
       let latestCollab = recovery.state;
       const recoveredAdvisor = recovery.recoveredAdvisor;
+      let persistInitialCollab: (() => Promise<boolean>) | undefined;
       if (!originalSessionId) {
         createdSession = {
           id: sessionId,
@@ -213,44 +228,37 @@ export function useComposerSend({
           // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
           ...(sendProjectId ? { projectId: sendProjectId } : {}),
           // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
-          // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
+          // 之后 default_model 变更/其它会话换模都不影响它。
           ...(modelId ? { modelId } : {}),
         };
-        // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
-        // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, latestCollab.mode === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
         writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (auth && !recoveredAdvisor && (latestCollab.mode !== "solo" || collabAsDefault)) {
-          const collabAuth = auth;
-          const identityEpoch = collabAuth.snapshot().epoch;
-          const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
-          if (!ensured) {
-            toast("会话尚未创建成功，请检查网络后重试", "error");
-            return;
-          }
-          try {
-            const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
-            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return;
-            if (recoveryIsCurrent()) applyCollabDoc(doc);
-            latestCollab = docToUiState(doc);
-          } catch (err) {
-            if (collabAuth.snapshot().epoch !== identityEpoch) return;
-            // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
-            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) {
-              const msg = apiErrorMessage(err, "协作配置保存失败");
-              setCollabSaveError(msg);
+        if (auth && agent.id === "main" && !recoveredAdvisor) {
+          const keepCollab = keepCollabChoiceOnSaveFailure(latestCollab.mode);
+          persistInitialCollab = async () => {
+            try {
+              const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+              if (!recoveryIdentityIsCurrent()) return false;
+              if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
+              const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, recoveryIdentity!);
+              if (!doc || !recoveryIdentityIsCurrent()) return false;
+              if (recoveryIsCurrent()) applyCollabDoc(doc);
+              latestCollab = docToUiState(doc);
+              return true;
+            } catch (err) {
+              if (!recoveryIdentityIsCurrent()) return false;
+              const msg = apiErrorMessage(err, "协作配置保存失败，请重新选择后重试");
+              if (recoveryIsCurrent()) setCollabSaveError(msg);
               toast(msg, "error");
-              return;
+              return keepCollab;
             }
-          }
+          };
+          if (!keepCollab && !(await persistInitialCollab())) return false;
         }
-        setSessions((c) => [createdSession!, ...c]);
-        if (recoveryIsCurrent()) setActiveId(sessionId);
       }
       const sendCollab = sendCollabFields({
         ...latestCollab, agentId: agent.id,
@@ -258,8 +266,18 @@ export function useComposerSend({
       });
       if (sendCollab.blockedReason) {
         toast(sendCollab.blockedReason, "error");
-        return;
+        return false;
       }
+      const authorization=!imageEdit&&modelId&&authorizeSwitch?await authorizeSwitch({
+        sessionId,requestId:mintMsgId(),targetModel:modelId,agentId:agent.id,teamMode:sendCollab.teamMode,
+        text:formatMessageReplyPrompt(text,replyTo),mediaCount:media?.length??0,
+        ...(cursorModelSupportsContextTier(modelId)?{contextTier}:{}),
+        ...(serviceTier==='fast'&&supportsFastServiceTier(modelId)?{serviceTier}:{}),
+      },{useCachedRequestId:true,allowOfflineQueue:true,
+        canPrompt:recoveryIsCurrent,
+        isCurrent:()=>recoveryIdentityIsCurrent()&&(!originalSessionId||!!sockRef.current?.getSession(sessionId))}):undefined;
+      if(!imageEdit&&modelId&&authorizeSwitch&&!authorization)return false;
+      if (persistInitialCollab && keepCollabChoiceOnSaveFailure(latestCollab.mode)) void persistInitialCollab();
       const materializedDraft =
         !createdSession && (
           sessions.some((session) => session.id === sessionId && session.messageCount === 0) ||
@@ -281,6 +299,12 @@ export function useComposerSend({
           // 行尚未建时 PATCH 可 404；随后 send 的幂等 PUT 会使用上面已更新的 socket 标题。
         });
       }
+      const existingHasModel = Boolean(sessions.find((session) => session.id === sessionId)?.modelId);
+      if ((materializedDraft || (!createdSession && !existingHasModel)) && modelId) {
+        sockRef.current?.setSessionModel(sessionId, modelId);
+        // 与 selectModel 共用 queueModelPatch 同会话单飞队列/水位，避免首发在途 PATCH 后落库覆盖用户随后的显式换模。
+        if (!demo) queueModelPatch(sessionId, modelId);
+      }
       // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
       // 当前模型不支持时省略(null=显式清除回模型默认),让模型沿用自身默认。
       // effort 来源:本会话显式选择(sessionEffort,聊天头档位选择器)优先,缺省回落
@@ -288,8 +312,12 @@ export function useComposerSend({
       // 的支持集过滤(不支持 → null 发送,不硬塞)。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
       // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
+      if (!target || target.sessionId === selectedSessionIdRef.current) {
+        sendScrollRef?.current?.();
+      }
       const teamLeaderTurn = sendCollab.teamMode;
-      sockRef.current?.send({
+      const sent=await sockRef.current?.send({
+        ...(authorization?{switchAuthorization:authorization}:{}),
         sessId: sessionId,
         agentId: agent.id,
         text,
@@ -317,22 +345,30 @@ export function useComposerSend({
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
         ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
+      if(sent===false)return false;
+      // Fee confirmation keeps ownership of the draft until the send is accepted.
+      if (createdSession && recoveryIsCurrent()) {
+        promoteDraftCollab(sessionId, latestCollab, false);
+        setActiveId(sessionId);
+      }
       if (recoveredAdvisor && auth) void persistRecoveredAdvisor({
         auth, sessionId, rev: latestCollab.rev, isCurrent: recoveryIsCurrent,
         ensureSession: (recoverySession) => sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle),
       });
-      // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
+      // 侧栏：提到顶 + 更新标题/时间/计数/模型（同步刷新 lastAt 与 modelId，供新建会话取最近使用模型）。
+      const sentAtMs = Date.now();
       setSessions((c) => {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
-        const base: Session =
-          found ?? createdSession ?? { id: sid, title: sessionTitle, ownerUserId: user.id, updatedAt: "", messageCount: 0 };
+        const base = found ?? createdSession ?? ({ ownerUserId: user.id } as Session);
         const updated: Session = {
           ...base,
           id: sid,
           title: found?.title && found.messageCount > 0 ? found.title : sessionTitle,
-          updatedAt: new Date().toISOString(),
+          lastAt: sentAtMs,
+          updatedAt: new Date(sentAtMs).toISOString(),
           messageCount: (found?.messageCount ?? 0) + 1,
+          ...(modelId ? { modelId } : {}),
         };
         return [updated, ...c.filter((s) => s.id !== sid)];
       });
@@ -355,6 +391,7 @@ export function useComposerSend({
           applyProject(1);
         }
       }
+      return true;
     },
     // teamMode 不再入依赖:自 08326136f 起 send 只从 collabUi/collabMode 取模式(sendCollabFields),
     // 不读 teamMode 本身(OCV5-376)。applyCollabDoc/toast/setDraftProject 都是稳定引用,补齐不改重建时机。
@@ -362,6 +399,7 @@ export function useComposerSend({
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      authorizeSwitch,
       draftSessionId,
       stopPreparing,
       auth,
@@ -380,6 +418,8 @@ export function useComposerSend({
       setSessions,
       setActiveId,
       applyCollabDoc,
+      promoteDraftCollab,
+      queueModelPatch,
       toast,
       setDraftProject,
     ],
@@ -441,8 +481,8 @@ export function useComposerSend({
 
   // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef is App useState setter/useRef passed in, stable
-  const uploadMedia = useCallback(async (file: File): Promise<MediaRef> => {
-    const r = await api.uploadFile(authRef.current, file);
+  const uploadMedia = useCallback(async (file: File, onProgress?: (sent: number, total: number) => void): Promise<MediaRef> => {
+    const r = await api.uploadFile(authRef.current, file, { onProgress });
     const mime = r.mimeType || file.type || "";
     const kind: MediaRef["kind"] = mime.startsWith("image/")
       ? "image"
@@ -471,44 +511,20 @@ export function useComposerSend({
   // 天然落 annotated 分支，向后兼容。
   const submitImageEdit = useCallback(
     async (value: ImageEditSubmit) => {
+      const base = { clientJobId: value.clientJobId, sourceIndex: 0, width: value.width, height: value.height };
       if (value.mode === "resize") {
-        // 调整大小（outpaint）：源图（hidden）+ guide（可见），无 mask；带目标比例 targetAspect。
-        const [sourceMedia, guideMedia] = await Promise.all([
-          uploadMedia(value.source),
-          uploadMedia(value.guide),
-        ]);
-        const media: MediaRef[] = [{ ...sourceMedia, hidden: true }, guideMedia];
-        await send(value.prompt, media, {
-          mode: "outpaint",
-          targetAspect: value.targetAspect,
-          clientJobId: value.clientJobId,
-          sourceIndex: 0,
-          guideIndex: 1,
-          width: value.width,
-          height: value.height,
+        const [sourceMedia, guideMedia] = await Promise.all([uploadMedia(value.source), uploadMedia(value.guide)]);
+        await send(value.prompt, [{ ...sourceMedia, hidden: true }, guideMedia], {
+          ...base, mode: "outpaint", targetAspect: value.targetAspect, guideIndex: 1,
         });
         toast("已提交调整大小，成功生成后扣 50 积分", "success");
         return;
       }
-      // 编辑/评论（annotated）：源图 + mask（均 hidden）+ guide 三件套（既有链路，逐字保留）。
       const [sourceMedia, maskMedia, guideMedia] = await Promise.all([
-        uploadMedia(value.source),
-        uploadMedia(value.mask),
-        uploadMedia(value.guide),
+        uploadMedia(value.source), uploadMedia(value.mask), uploadMedia(value.guide),
       ]);
-      const media: MediaRef[] = [
-        { ...sourceMedia, hidden: true },
-        { ...maskMedia, hidden: true },
-        guideMedia,
-      ];
-      await send(value.prompt, media, {
-        mode: "annotated",
-        clientJobId: value.clientJobId,
-        sourceIndex: 0,
-        maskIndex: 1,
-        guideIndex: 2,
-        width: value.width,
-        height: value.height,
+      await send(value.prompt, [{ ...sourceMedia, hidden: true }, { ...maskMedia, hidden: true }, guideMedia], {
+        ...base, mode: "annotated", maskIndex: 1, guideIndex: 2,
       });
       toast("已提交精确修改，成功生成后扣 50 积分", "success");
     },

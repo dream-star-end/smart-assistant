@@ -442,4 +442,111 @@ describe('emitProgress respects terminal fence', () => {
       assert.equal(out.clientMessageId, 'retry-parent-cmid')
     }
   })
+
+  it('跨轮隔离: 父会话进入新 turn 后，旧轮委派进度不得盖新轮 cmid，也不得向新轮发 working turn_status（含真实 deliver 链路）', async () => {
+    const gw = makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    const TURN_1_KEY = 'a'.repeat(64)
+    const TURN_2_KEY = 'b'.repeat(64)
+    parent._currentTurnKey = TURN_1_KEY
+    parent._currentTurnIndex = 1
+    parent._runningClientMessageId = 'm-turn-1'
+    gw._outboundRing.beginActiveTurn(PARENT_KEY, 'm-turn-1')
+
+    const wireFrames: any[] = []
+    gw.clientsByPeer = new Map([
+      [
+        `1:webchat:${PARENT_PEER}`,
+        new Set([{ send: (raw: string) => wireFrames.push(JSON.parse(raw)) }]),
+      ],
+    ])
+    gw.deliver = (out: any) => {
+      gw.delivered.push(out)
+      ;(Gateway.prototype as any).deliver.call(gw, out)
+    }
+
+    gw.sessions.submit = async (_session: unknown, _payload: string, onEvent: (e: any) => void) => {
+      // 子任务运行中途：父会话 Turn 1 已收尾，用户发起 Turn 2
+      gw._outboundRing.endActiveTurn(PARENT_KEY, 'm-turn-1')
+      parent._currentTurnKey = TURN_2_KEY
+      parent._currentTurnIndex = 2
+      parent._runningClientMessageId = 'm-turn-2'
+      gw._outboundRing.beginActiveTurn(PARENT_KEY, 'm-turn-2')
+
+      onEvent({
+        kind: 'block',
+        block: {
+          kind: 'tool_use',
+          name: 'Bash',
+          input: JSON.stringify({ command: 'pytest -q' }),
+          blockId: 'b-tool-1',
+        },
+      })
+      onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+    }
+
+    const r = await delegate(gw, 'coding-assistant', taskBody({ streamProgress: true }))
+    assert.equal(r.status, 200)
+
+    const progressWire = wireFrames.filter(
+      (f) =>
+        f.type === 'outbound.message' &&
+        (f.blocks || []).some((b: any) => b?.kind === 'delegate_progress'),
+    )
+    assert.ok(progressWire.length >= 3, '应至少发出 start / tool_use / done 三条进度帧')
+    // start 帧发出时 Turn 1 仍在飞 -> 归属 m-turn-1
+    assert.equal(progressWire[0].clientMessageId, 'm-turn-1')
+    // Turn 2 启动后旧轮子任务发出的 tool_use 与 done 帧绝不能被绑到 m-turn-2
+    for (const f of progressWire.slice(1)) {
+      assert.equal(f.clientMessageId, undefined)
+    }
+
+    const turnStatusWire = wireFrames.filter((f) => f.type === 'outbound.turn_status')
+    // 仅 Turn 1 在飞时的 start 允许发 working turn_status；Turn 2 启动后的 Bash tool_use 绝不向父会话发 working turn_status
+    assert.equal(turnStatusWire.length, 1)
+    assert.equal(turnStatusWire[0].clientMessageId, 'm-turn-1')
+    assert.match(String(turnStatusWire[0].detail ?? ''), /子任务 coding-assistant/)
+  })
+
+  it('后台 send_to_agent (origin-inject): 正常发 delegate_progress，但绝不发 working turn_status 抢占父轮状态栏', async () => {
+    const gw = makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent._currentTurnKey = 'a'.repeat(64)
+    parent._currentTurnIndex = 1
+    parent._runningClientMessageId = 'm-turn-1'
+    gw._outboundRing.beginActiveTurn(PARENT_KEY, 'm-turn-1')
+
+    gw.sessions.submit = async (_session: unknown, _payload: string, onEvent: (e: any) => void) => {
+      onEvent({
+        kind: 'block',
+        block: {
+          kind: 'tool_use',
+          name: 'Bash',
+          input: JSON.stringify({ command: 'ls -la' }),
+          blockId: 'b-bg-1',
+        },
+      })
+      onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+    }
+
+    const r = await delegate(
+      gw,
+      'coding-assistant',
+      taskBody({ streamProgress: true, callbackOnComplete: 'origin-inject' }),
+    )
+    assert.equal(r.status, 200)
+
+    const progressOuts = gw.delivered.filter((o: any) =>
+      (o.blocks || []).some((b: any) => b?.kind === 'delegate_progress'),
+    )
+    assert.ok(progressOuts.length >= 3, '后台 send_to_agent 仍应推送卡片进度帧')
+    const workingStatuses = gw.delivered.filter(
+      (o: any) => o.type === 'outbound.turn_status' && o.status === 'working',
+    )
+    assert.equal(
+      workingStatuses.length,
+      0,
+      '后台 send_to_agent 不得发送 working turn_status 覆盖父轮底部实时状态行',
+    )
+  })
 })

@@ -4477,6 +4477,85 @@ describe("userChatBridge — first_visible persist is not permanently suppressed
     }
   });
 });
+
+// P2b entry freeze (docs/ARCH_P2B_FUND_ENTRY_GATES.md §6.3 #1, B5/B7): the bridge's account status
+// check as it behaves today. Non-active status closes the socket before any container connection;
+// a missing row and a failed status query both let the connection through (fail-open is a
+// documented availability trade-off in ws/userChatBridge.ts). A change to either flips its case.
+describe("P2b entry freeze: user-chat-bridge account status", () => {
+  function statusPool(status: () => Promise<{ status: string }[]>): UserChatBridgeDeps["pgPool"] {
+    return {
+      query: async (sql: unknown) => {
+        const text = typeof sql === "string" ? sql : String((sql as { text?: unknown })?.text ?? "");
+        if (/SELECT status FROM users WHERE id/.test(text)) {
+          const rows = await status();
+          return { rows, rowCount: rows.length };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    } as UserChatBridgeDeps["pgPool"];
+  }
+  const billingStubs = {
+    preCheckRedis: {
+      async atomicReserve() { return { ok: true as const, locked: 0n, needed: 0n }; },
+      async releaseReservation() { return true; },
+    } as UserChatBridgeDeps["preCheckRedis"],
+    pricing: { get() { return null; } } as unknown as UserChatBridgeDeps["pricing"],
+  };
+
+  test("banned account: close 1008 'account inactive', no container connection", async () => {
+    const rig = await startRig({ pgPool: statusPool(async () => [{ status: "banned" }]), ...billingStubs });
+    try {
+      const ws = openClient(rig.gatewayPort, await makeJwt("901"));
+      const closed = await waitClose(ws);
+      assert.equal(closed.code, 1008);
+      assert.equal(closed.reason, "account inactive");
+      assert.equal(rig.containerSockets.length, 0);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  for (const [name, status] of [
+    ["known gap: missing users row is let through", async () => []],
+    ["known gap: status query failure is let through (fail-open)", async () => { throw new Error("db down"); }],
+  ] as const) {
+    test(name, async () => {
+      const rig = await startRig({ pgPool: statusPool(status), ...billingStubs });
+      try {
+        const containerOpen = waitNextContainerSocket(rig);
+        const ws = openClient(rig.gatewayPort, await makeJwt("902"));
+        await containerOpen;
+        assert.equal(ws.readyState, WebSocket.OPEN);
+        ws.close();
+      } finally {
+        await stopRig(rig);
+      }
+    });
+  }
+});
+
+// P2b entry freeze B8 (docs/ARCH_P2B_FUND_ENTRY_GATES.md §6.3/§6.4): the bridge does not check the
+// Origin header today. The bearer token travels in the WebSocket subprotocol, not a cookie, so a
+// cross-site page cannot ride an ambient session. Frozen as a known gap; enforcing Origin is a
+// separate product/security change and flips this case.
+describe("P2b entry freeze: user-chat-bridge Origin", () => {
+  test("known gap: a foreign Origin with a valid bearer subprotocol is accepted", async () => {
+    const rig = await startRig();
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = new WebSocket(`ws://127.0.0.1:${rig.gatewayPort}${BRIDGE_WS_PATH}`, ["bearer", await makeJwt("903")], {
+        origin: "https://evil.example",
+      });
+      await containerOpen;
+      assert.equal(ws.readyState, WebSocket.OPEN);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
 // RF-link replaces A1: one container transport persists across browser detach/attach.
 describe("RF-link singleton transport for open dispatch streams", () => {
   const ENV_KEYS = [
@@ -4721,6 +4800,43 @@ describe("RF-link singleton transport for open dispatch streams", () => {
     } finally {
       process.env.OC_CONTAINER_LINK = "1";
       await stopRig(rig);
+    }
+  });
+});
+
+describe('cc5 task route hard admission', () => {
+  test('default-off and spoofed client UID cannot bypass a permissive general checker', async () => {
+    const keys = ['OC_SELFHOST_CC5_T1555U_ENABLED', 'OC_SELFHOST_CC5_T1555U_TEST_UID'] as const;
+    const saved = keys.map(key => process.env[key]);
+    try {
+      for (const flag of ['0', '1']) {
+        process.env.OC_SELFHOST_CC5_T1555U_ENABLED = flag;
+        process.env.OC_SELFHOST_CC5_T1555U_TEST_UID = flag === '0' ? '200' : '314159';
+        const rig = await startRig({ loadAllowedModelChecker: async () => () => true });
+        try {
+          const containerOpen = waitNextContainerSocket(rig);
+          const ws = openClient(rig.gatewayPort, await makeJwt('200'));
+          const fc = frameCollector(ws);
+          await new Promise<void>(r => ws.once('open', r));
+          const container = await containerOpen;
+          ws.send(JSON.stringify({ type: 'inbound.message', model: 'cc5-remote-t1555u',
+            uid: 314159, userId: '314159', user_id: '314159',
+            peer: { id: 'cc5-hard-gate', kind: 'dm' }, clientMessageId: `cc5-denied-${flag}` }));
+          const error = await nextBusinessFrame(fc);
+          assert.equal(error.code, 'UNAUTHORIZED_MODEL');
+          assert.equal(error.clientMessageId, `cc5-denied-${flag}`);
+          assert.equal(ws.readyState, WebSocket.OPEN);
+          assert.equal(rig.containerSeen.some(row => row.data.toString().includes('cc5-denied-')), false);
+          const next = new Promise<string>(resolve => container.once('message', data => resolve(data.toString())));
+          ws.send(JSON.stringify({ type: 'inbound.message', model: 'glm-5.2',
+            peer: { id: 'cc5-hard-gate', kind: 'dm' }, clientMessageId: 'normal-positive-control' }));
+          assert.equal(JSON.parse(await next).model, 'glm-5.2');
+          ws.close();
+          await waitClose(ws);
+        } finally { await stopRig(rig); }
+      }
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
     }
   });
 });

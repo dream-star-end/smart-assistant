@@ -4267,6 +4267,14 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+      TEST_DATABASE_URL="$box_dsn" \
+      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha"); then
+    echo "✗ pinned box long-task generations gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   rm -rf "$box_cand"
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
     echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
@@ -6371,46 +6379,58 @@ import sys
 
 root, sha, excl = sys.argv[1], sys.argv[2], sys.argv[3]
 raw = subprocess.check_output(["git", "-C", root, "show", f"{sha}:{excl}"], text=True)
-patterns = []
+rules = []
 for line in raw.splitlines():
     line = line.strip()
     if not line or line.startswith("#"):
         continue
-    patterns.append(line)
-if not patterns:
+    # rsync rule prefixes: "+ " include, "- " exclude, bare = exclude. First match wins.
+    if line.startswith("+ "):
+        rules.append((True, line[2:].strip()))
+    elif line.startswith("- "):
+        rules.append((False, line[2:].strip()))
+    else:
+        rules.append((False, line))
+if not any(not include for include, _pat in rules):
     sys.exit(1)
 listing = subprocess.check_output(["git", "-C", root, "ls-tree", "-r", "--full-tree", sha], text=True)
 if not listing.strip():
     sys.exit(1)
 
 def excluded(relpath: str) -> bool:
-    name = relpath.rsplit("/", 1)[-1]
-    parts = relpath.split("/")
-    for pat in patterns:
-        anchored = pat.startswith("/")
-        if anchored:
-            pat = pat[1:]
-        if pat.endswith("/"):
-            pat = pat[:-1]
-        if not pat:
-            continue
-        if anchored:
-            if relpath == pat or relpath.startswith(pat + "/") or fnmatch.fnmatch(relpath, pat):
-                return True
-            continue
-        if "/" in pat:
-            if (
-                relpath == pat
-                or relpath.startswith(pat + "/")
-                or relpath.endswith("/" + pat)
-                or ("/" + pat + "/") in ("/" + relpath + "/")
-                or fnmatch.fnmatch(relpath, pat)
-            ):
-                return True
-            continue
-        if fnmatch.fnmatch(name, pat) or any(part == pat or fnmatch.fnmatch(part, pat) for part in parts):
+    for include, pat in rules:
+        if include:
+            # A directory include only lets rsync descend; the files below are
+            # still decided by the later rules.
+            if pat.endswith("/"):
+                continue
+            if matches(relpath, pat):
+                return False
+        elif matches(relpath, pat):
             return True
     return False
+
+def matches(relpath: str, pat: str) -> bool:
+    name = relpath.rsplit("/", 1)[-1]
+    parts = relpath.split("/")
+    anchored = pat.startswith("/")
+    if anchored:
+        pat = pat[1:]
+    if pat.endswith("/"):
+        pat = pat[:-1]
+    if not pat:
+        return False
+    if anchored:
+        return relpath == pat or relpath.startswith(pat + "/") or fnmatch.fnmatch(relpath, pat)
+    if "/" in pat:
+        return (
+            relpath == pat
+            or relpath.startswith(pat + "/")
+            or relpath.endswith("/" + pat)
+            or ("/" + pat + "/") in ("/" + relpath + "/")
+            or fnmatch.fnmatch(relpath, pat)
+        )
+    return fnmatch.fnmatch(name, pat) or any(part == pat or fnmatch.fnmatch(part, pat) for part in parts)
 
 rows = []
 for line in listing.splitlines():

@@ -28,15 +28,14 @@ import type {
   InboundPromptQueueInterject,
   InboundPromptQueueReorder,
   MediaRef,
-  OutboundActiveTurnReplayStart,
   OutboundCallUsage,
-  OutboundSessionSnapshot,
   OutboundContentBlock,
   OutboundError,
   OutboundMessage,
   OutboundPermissionRequest,
   OutboundPermissionSettled,
   OutboundResumeFailed,
+  OutboundSessionSnapshot,
   OutboundTurnStatus,
   OutboundTurnUsage,
   Peer,
@@ -113,8 +112,8 @@ export type OutboundErrorWire = OutboundError & WireRuntimeFields;
 export type OutboundPermissionRequestWire = OutboundPermissionRequest & WireRuntimeFields;
 export type OutboundPermissionSettledWire = OutboundPermissionSettled & WireRuntimeFields;
 export type OutboundResumeFailedWire = OutboundResumeFailed & WireRuntimeFields;
-export type OutboundActiveTurnReplayStartWire = OutboundActiveTurnReplayStart;
-export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
+export type OutboundSessionSnapshotWire = OutboundSessionSnapshot;
+export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields & { clientMessageId?: string };
 export type OutboundTurnUsageWire = OutboundTurnUsage & WireRuntimeFields;
 export type OutboundCallUsageWire = OutboundCallUsage & WireRuntimeFields;
 export type OutboundModelSwitchPreparedWire = {
@@ -320,6 +319,15 @@ export type AckWire = {
     model?: string;
     displayText?: string;
   };
+  /** Server-injected callback turn (lease callback / async delegate callback /
+   * origin-session cron). Broadcast to every tab of the uid on acceptance so
+   * the active session adopts the turn and mounts TurnActivity immediately. */
+  cronOrigin?: {
+    text: string;
+    ts?: number;
+    agentId?: string;
+    model?: string;
+  };
 };
 
 /** master 把恢复子轮交给容器后广播「正在重试」(#1206)。按 rootClientMessageId 归并。 */
@@ -361,7 +369,7 @@ export type OutboundWire =
   | OutboundPermissionRequestWire
   | OutboundPermissionSettledWire
   | OutboundResumeFailedWire
-  | OutboundActiveTurnReplayStartWire
+  | OutboundSessionSnapshotWire
   | OutboundTurnStatusWire
   | OutboundSessionSnapshot
   | OutboundTurnUsageWire
@@ -403,7 +411,8 @@ export type InboundHelloWire = {
     agentId: string;
     inFlight: boolean;
     lastFrameSeq: number;
-    resumeActiveTurnCandidateMessageIds?: string[];
+    /** Stream of the last applied session snapshot; pairs with lastFrameSeq as afterSeq. */
+    lastStreamKey?: string;
     /**
      * durable turn dispatch(RFC §4 身份对称):该 peer 当前在飞 turn 的 clientMessageId
      * (= _activeClientMessageId)。**仅在 inFlight 时携带**;autoResumeFromHello 用它绑定

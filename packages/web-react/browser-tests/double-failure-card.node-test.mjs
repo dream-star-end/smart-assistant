@@ -13,7 +13,7 @@ import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.m
 
 // INC-20261006-DOUBLE-FAILURE-CARD in the real App: one turn that never started
 // carries the verified unbilled status record and an assistant error row. The
-// page must show one failure card with one retry button. OC_DOUBLE_CARD_RED=1
+// page must show one failure card with one Continue button. OC_DOUBLE_CARD_RED=1
 // removes only the superseded-error clause from MessageList and reproduces it.
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
@@ -29,7 +29,7 @@ async function until(label, fn, timeout = 15000) {
   throw new Error(`${label}: timed out`);
 }
 
-test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one retry button", { timeout: 180000 }, async (t) => {
+test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one Continue button", { timeout: 180000 }, async (t) => {
   const assetDir = mkdtempSync(join(tmpdir(), "oc-double-card-browser-"));
   t.after(() => rmSync(assetDir, { recursive: true, force: true }));
   await build({
@@ -68,16 +68,43 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
       const peer = { id: BOARD_SESSION, kind: "dm" };
       const sessionKey = `agent:main:webchat:dm:${BOARD_SESSION}`;
       scenario.sent.push(id);
-      if (frame.content?.recovery?.automatic === true) scenario.attempts.push(frame.content.recovery.attempt);
+      if (frame.content?.displayText === "继续" && !frame.content?.recovery) {
+        scenario.manual.push(frame);
+        const ts = Date.now();
+        const peer = { id: BOARD_SESSION, kind: "dm" };
+        preview.store.board.push({ id, role: "user", text: "继续", _modelText: frame.content.text,
+          ts, status: "replied", _source: "server" },
+          { id: `manual-answer-${id}`, role: "assistant", text: "DOUBLE_CARD_CONTINUED",
+            ts: ts + 1, _source: "server", _clientMessageId: id });
+        preview.store.revision += 1;
+        send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
+        send({ type: "outbound.message", peer, sessionKey, clientMessageId: id,
+          frameSeq: ++scenario.seq, blocks: [{ kind: "text", text: "DOUBLE_CARD_CONTINUED" }], isFinal: true });
+        return;
+      }
+      const recovery = frame.content?.recovery;
+      if (recovery?.automatic === true) scenario.attempts.push(recovery.attempt);
       send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
       const ts = Date.now();
-      // The same failed turn as the server stores it: the verified status record
-      // (dispatch never started, not billed) and the assistant error row.
-      preview.store.board = structuredClone([
-        { id, role: "user", text: frame.content.text, status: "error", ts, _source: "server", _routing: { model: "glm-5.2", effortLevel: "high", teamMode: false } },
+      // Match PG admission: append every user/dispatch-status/error, retaining
+      // the original human goal and the exact recovery metadata from the frame.
+      // The renderer must fold intermediate failures without deleting raw rows.
+      preview.store.board.push(...structuredClone([
+        { id, role: "user", text: frame.content.text, status: "error", ts, _source: "server",
+          _routing: { model: "glm-5.2", effortLevel: "high", teamMode: false },
+          ...(recovery ? {
+            _recoveryOfClientMessageId: recovery.sourceClientMessageId,
+            _recoveryMode: recovery.mode,
+            _automaticRecovery: recovery.automatic,
+            ...(recovery.automatic ? {
+              _automaticRecoveryRootClientMessageId: recovery.rootClientMessageId,
+              _automaticRecoveryAttempt: recovery.attempt,
+              _automaticRecoveryMax: recovery.max,
+            } : {}),
+          } : {}) },
         { id: `turn-status:${id}`, role: "system", text: "", _turnStatusRecord: true, _dispatchTerminal: true, _errorCode: "dispatch_lost", ts: ts + 1, _source: "server", _clientMessageId: id },
         { id: `error-${id}`, role: "assistant", text: "", _errorCode: "ENGINE_ERROR", ts: ts + 2, _source: "server", _clientMessageId: id },
-      ]);
+      ]));
       preview.store.revision += 1;
       send({ type: "outbound.error", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq, code: "ENGINE_ERROR", message: "Context exhausted", isFinal: true, ts: ts + 2 });
     });
@@ -85,8 +112,8 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
   let browser;
   try {
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
-    for (const width of [1280, 390]) await t.test(`${width} one failure card, one retry`, async () => {
-      scenario = { sent: [], seq: 0, attempts: [] };
+    for (const width of [1280, 390]) await t.test(`${width} one failure card, one Continue`, async () => {
+      scenario = { sent: [], seq: 0, attempts: [], manual: [] };
       preview.store.board = []; preview.store.older = []; preview.store.revision += 1;
       const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width === 390, hasTouch: width === 390 });
       const page = await context.newPage(); const errors = [];
@@ -104,13 +131,40 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
         await new Promise((done) => setTimeout(done, 1500));
         assert.deepEqual(scenario.attempts, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "automatic retry lineage climbs 1..10 and stops");
         assert.equal(scenario.sent.length, 11, "the original send plus exactly ten automatic retries");
+        assert.equal(preview.store.board.length, 33, "all eleven raw user/status/error triplets survive server echoes");
+        assert.equal(preview.store.board[0].id, scenario.sent[0], "the original human goal is retained");
+        assert.equal(preview.store.board[0].text, "DOUBLE_CARD_REQUEST");
+        const recoveredUsers = preview.store.board.filter((row) => row.role === "user" && row._automaticRecovery === true);
+        assert.deepEqual(recoveredUsers.map((row) => row._automaticRecoveryAttempt), [1,2,3,4,5,6,7,8,9,10]);
+        for (const row of recoveredUsers) {
+          assert.ok(scenario.sent.includes(row._recoveryOfClientMessageId), "recovery source is a retained admitted user");
+          assert.equal(row._automaticRecoveryRootClientMessageId, scenario.sent[0]);
+          assert.equal(row._automaticRecoveryMax, 10);
+          assert.ok(row._recoveryMode === "replay" || row._recoveryMode === "checkpoint");
+        }
         const body = await page.locator("body").innerText();
         assert.equal(await page.getByText("消息未开始处理", { exact: true }).count(), 1, "the unbilled status card is shown once");
         assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0, "the second red card of the same failure is not shown");
-        assert.equal(await page.getByRole("button", { name: /重试|重新尝试/ }).count(), 1, "exactly one retry button");
+        assert.equal(await page.getByRole("button", { name: "继续", exact: true }).count(), 1, "exactly one Continue button");
+        assert.equal(await page.getByRole("button", { name: /^(重试|重新尝试|重新发送)$/ }).count(), 0);
         assert.match(body, /已确认未计费/);
+        const sourceRows = structuredClone(preview.store.board);
+        const previousId = scenario.sent.at(-1);
+        await page.getByRole("button", { name: "继续", exact: true }).click();
+        await page.getByText("DOUBLE_CARD_CONTINUED", { exact: true }).first().waitFor();
+        assert.equal(scenario.manual.length, 1);
+        const continuation = scenario.manual[0];
+        assert.equal(continuation.peer.id, BOARD_SESSION);
+        assert.notEqual(continuation.clientMessageId, previousId);
+        assert.notEqual(continuation.content.text, "DOUBLE_CARD_REQUEST");
+        assert.match(continuation.content.text, /DOUBLE_CARD_REQUEST/);
+        assert.match(continuation.content.text, /不要重新执行已经完成的步骤/);
+        assert.equal(continuation.content.recovery, undefined, "explicit human continuation uses normal admission");
+        assert.deepEqual(preview.store.board.slice(0, sourceRows.length), sourceRows, "failed task context remains intact");
+        assert.equal(scenario.sent.length, 12);
+        assert.deepEqual(scenario.attempts, [1,2,3,4,5,6,7,8,9,10]);
         assert.deepEqual(errors, []);
-        console.log("DOUBLE_CARD_RECEIPT", JSON.stringify({ width, cards: 1, retryButtons: 1, red, transformCount }));
+        console.log("DOUBLE_CARD_RECEIPT", JSON.stringify({ width, cards: 1, continueButtons: 1, red, transformCount }));
       } catch (error) {
         console.error("DOUBLE_CARD_DIAGNOSTIC", JSON.stringify({ scenario, alerts: await page.getByRole("alert").allInnerTexts(), body: (await page.locator("body").innerText()).slice(-1500), errors }));
         throw error;

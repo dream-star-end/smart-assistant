@@ -1,0 +1,21 @@
+# 惰性画像数据 worker
+
+本切片未注册 `memory.profile.update`、未接HTTP/composition、未迁移用户根、未挂容器RO、未广播保护能力。既有workspace/runtime与默认关闭的system-actions开关保持。
+
+主机运维构建 `node --import tsx scripts/build-v5-profile-control-worker.ts` 生成固定位置的独立ESM artifact。受信release提供其SHA256与runtimeRoot；broker核实际文件、inode权限及完整不可替换父链后用固定Node运行它。worker没有tsx loader、动态用户module、hook、eval或shell；仅接纯数据。HOME/TMPDIR为独立0700目录，环境固定，私有ledger/key/审批nonce/JWT不传child。当前惰性prototype保留空的`.worker-*`临时目录；接生产前纳入仅本job所有目录的退出清理和磁盘上限。
+
+新增固定control@v1操作的expectedVersion是 `profile-generation-v1:<parentSHA64>:<baseVersion16>:<targetRawSHA64>`。inputHash已冻结它；终态清除sealed args后仍保留。baseVersion沿用profileSnapshot的CRLF归一化语义，targetRawSHA按实际写入UTF-8字节计算。
+
+private store的controlRecoveryRecord只SELECT状态/原executor/精确binding/condition；不expire、不解密、不发grant、不写状态。仅executing/unknown/succeeded且固定op/version/control/合法hash可读。executing供本host校验，不授权恢复或批量markExecutorLost。
+
+专用Linux generation lock保留Node文件fd，固定flock fd-form成功退出后，同一open-file-description继续持锁。base manifest/profile CAS通过后，worker在stage创建前发READY，等主进程重核lineage与当前actor权限再GO。GO前EOF/撤权无effect；GO后锁持有到generation、manifest、seal全部fsync完成。原通用kernelFileLock及Windows行为未修改。
+
+parent按精确child handle监督直到实际close，结果与close均正常才返回；drain先关闭新admission，再等全部实际job结束。失联/超时不重跑业务，调用方必须保留unknown。未sealed恢复要求同broker确实监督到原publish child退出，或受信supervisor证明原host executor已死；新broker没有Map记录不能当成退出证明。recovery child不覆盖原执行停止证据。
+
+恢复只核当前selected manifest及token父代、原始target字节、完整树、exact receipt、父代历史seal后补durability，不重做mutation、不激活orphan、不按当前正文相同推断成功。sealed正向查询核receipt所属原始immutable generation，因此后续合法代改变正文不会误伤旧回执。无receipt或条件不符保持unknown。
+
+现有generation历史重放用例更新为重复原冻结intent仍返回原receipt，新增changed-version/body不能复用回执的拒绝断言；原来用同binding改输入的快捷返回已不符合本次冻结条件要求。没有降低测试门槛或增加timeout。
+
+真实formal container reader、TS/Go/各引擎native发现/所有旧写旁路及同代缓存仍为激活前后续；本片不能作为已完成全量保护的证据。
+
+CI使用setup-node的可写toolcache时，fixture将同一Node二进制复制到本次私有目录并以固定sudo chown设root owner；factory仅接受host配置的绝对nodeExecutable，仍核完整祖先及root owner，不让测试豁免或放宽生产检查。生产缺省仍process.execPath且同样校验。

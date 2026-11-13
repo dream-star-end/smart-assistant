@@ -55,6 +55,7 @@ export function countActiveFilters(query: TicketListQuery): number {
  */
 export function TicketListView({
   tickets,
+  scopeKey,
   query,
   agents,
   onQueryChange,
@@ -68,6 +69,7 @@ export function TicketListView({
   onCreateTicket,
 }: {
   tickets: Ticket[]
+  scopeKey?: string | null
   query: TicketListQuery
   agents?: BoardAgent[]
   onQueryChange: (next: TicketListQuery) => void
@@ -82,6 +84,22 @@ export function TicketListView({
   /** 空态里「新建单据」的入口。 */
   onCreateTicket?: () => void
 }) {
+  const filterKey = JSON.stringify([scopeKey, query.projectId, query.stageId, query.q, query.type, query.status, query.priority, query.assignee, query.label])
+  const [pageState, setPageState] = useState({ key: '', index: 0 })
+  const listScrollRef = useRef<HTMLDivElement>(null)
+  const pageSize = 50
+  const pageCount = Math.max(1, Math.ceil(tickets.length / pageSize))
+  const page = Math.min(pageState.key === filterKey ? pageState.index : 0, pageCount - 1)
+  useEffect(() => {
+    setPageState((state) => state.key !== filterKey || state.index >= pageCount
+      ? { key: filterKey, index: state.key === filterKey ? pageCount - 1 : 0 } : state)
+  }, [filterKey, pageCount])
+  const pageStart = page * pageSize
+  const pageTickets = tickets.slice(pageStart, pageStart + pageSize)
+  const goToPage = (index: number) => {
+    setPageState({ key: filterKey, index })
+    if (listScrollRef.current) listScrollRef.current.scrollTop = 0
+  }
   const desktop = useMdViewport()
   const [filtersOpen, setFiltersOpen] = useState(false)
   const agentOptions = [
@@ -293,9 +311,9 @@ export function TicketListView({
       {tickets.length === 0 ? (
         renderEmpty()
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div ref={listScrollRef} className="min-h-0 flex-1 overflow-y-auto">
           {desktop ? (
-            <table className="w-full border-collapse text-left text-body">
+            <table aria-rowcount={tickets.length + 1} className="w-full border-collapse text-left text-body">
               <thead className="sticky top-0 bg-bg text-caption text-faint">
                 <tr>
                   <th className="px-2 py-2 font-medium">编号</th>
@@ -311,12 +329,13 @@ export function TicketListView({
                 </tr>
               </thead>
               <tbody>
-                {tickets.map((ticket) => {
+                {pageTickets.map((ticket, index) => {
                   const Icon = ticketTypeIcon(ticket.type)
                   return (
                     <tr
                       key={ticket.id}
                       data-testid="ticket-card"
+                      aria-rowindex={pageStart + index + 2}
                       className={cn('border-t border-border', onOpenTicket && 'hover:bg-hover')}
                     >
                       <td className="px-2 py-2 font-mono text-caption text-faint">
@@ -361,7 +380,7 @@ export function TicketListView({
             </table>
           ) : (
             <div className="flex flex-col gap-2" data-testid="ticket-list-cards">
-              {tickets.map((ticket) => (
+              {pageTickets.map((ticket) => (
                 <TicketCard
                   key={ticket.id}
                   ticket={ticket}
@@ -374,13 +393,24 @@ export function TicketListView({
           )}
         </div>
       )}
+      {tickets.length > pageSize && (
+        <nav aria-label="任务列表分页" className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
+          <output className="text-caption text-muted" aria-live="polite" data-testid="ticket-list-page-range">
+            第 {pageStart + 1}–{Math.min(pageStart + pageSize, tickets.length)} 条 · 已加载 {tickets.length} 条
+          </output>
+          <div className="flex gap-2">
+            <Button type="button" size="sm" variant="secondary" data-testid="ticket-list-page-previous" disabled={page === 0} onClick={() => goToPage(page - 1)}>上一页</Button>
+            <Button type="button" size="sm" variant="secondary" data-testid="ticket-list-page-next" disabled={page >= pageCount - 1} onClick={() => goToPage(page + 1)}>下一页</Button>
+          </div>
+        </nav>
+      )}
       {typeof total === 'number' && total > (loadedCount ?? tickets.length) && (
         <div
           data-testid="ticket-list-truncated"
           className="mt-3 flex flex-wrap items-center justify-between gap-2 text-caption text-muted"
         >
           <p>
-            {loadedCount == null ? '已显示' : '已加载'} {loadedCount ?? tickets.length} / {total} 条
+            {loadedCount == null && tickets.length <= pageSize ? '已显示' : '已加载'} {loadedCount ?? tickets.length} / {total} 条
           </p>
           {onLoadMore ? (
             <Button

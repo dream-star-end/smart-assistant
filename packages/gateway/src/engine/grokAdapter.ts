@@ -1,5 +1,6 @@
 import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
 import { isV3ContainerRuntime } from '../hostStaticProviders.js'
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
@@ -45,6 +46,7 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
+import { bindRouteTrace } from '../relayTrace.js'
 import {
   CREDIT_EXHAUSTED_DETAIL,
   runningCostFenForUsage,
@@ -138,6 +140,7 @@ type GrokProcessKeepaliveTestHooks = {
 
 interface GrokLaunchSpec {
   cwd: string
+  readOnlyWorkspaceCwd?: string
   env: NodeJS.ProcessEnv
   bin: string
   promptFile: string
@@ -402,9 +405,14 @@ interface GrokTurnContext {
   spawnGeneration: number
   firstStdoutTimer: NodeJS.Timeout | null
   launchSpec: GrokLaunchSpec | null
+  /** Ends this turn's route-token trace binding for the container relay (OCV5-580). */
+  releaseRelayTrace: (() => void) | null
 }
 
 function cleanupPromptDir(ctx: GrokTurnContext): void {
+  // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
+  ctx.releaseRelayTrace?.()
+  ctx.releaseRelayTrace = null
   const promptDir = ctx.promptDir
   if (!promptDir) return
   ctx.promptDir = null
@@ -527,6 +535,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       spawnGeneration: 0,
       firstStdoutTimer: null,
       launchSpec: null,
+      releaseRelayTrace: null,
     }
     this.active = ctx
     this.lastActivityAt = Date.now()
@@ -589,13 +598,16 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     })
     const cwd = cwdDecision.cwd
     const platform = projectGrokPlatform({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
       identityCompat: this.opts.identityCompat,
       agentId: this.opts.agentId,
       projectId: this.opts.projectId,
       sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
       delegationDepth: this.opts.delegationDepth ?? 0,
+      readOnly: ctx.params.readOnly,
       ...(ctx.params.consultTurn && ctx.params.turnKey
         ? {
             consultTurn: {
@@ -628,6 +640,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     const env: NodeJS.ProcessEnv = {
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port),
       ...isolatedEnv,
       PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
       OC_AGENT_ID: this.opts.agentId,
@@ -653,6 +666,9 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_MODELS_LIST_URL: `${route.baseUrl.replace(/\/$/, '')}/models`,
       GROK_CLI_AUTO_UPDATE: 'false',
       GROK_TELEMETRY_ENABLED: 'false',
+      // Native Grok also discovers project/compat MCPs beyond --tools. Keep
+      // discovery away from the user's repo and home for this restricted turn.
+      ...(ctx.params.readOnly ? { HOME: promptDir } : {}),
       GROK_HOME: (() => {
         const runtimeHome = grokRuntimeHome(platform.launchHome, ctx.canonicalModel)
         const stableRoot = ctx.canonicalModel === 'grok-build-fast'
@@ -668,11 +684,16 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
-    ctx.launchSpec = { cwd, env, bin, promptFile }
+    ctx.launchSpec = {
+      cwd: ctx.params.readOnly ? promptDir : cwd,
+      ...(ctx.params.readOnly ? { readOnlyWorkspaceCwd: cwd } : {}),
+      env, bin, promptFile,
+    }
     if (ctx.canonicalModel === 'grok-build-fast' && env.GROK_HOME) {
       seedFastCatalog(platform.grokHome, env.GROK_HOME, env.GROK_MODELS_LIST_URL)
       ensureFastCatalog(bin, env, env.GROK_HOME)
     }
+    ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     this.spawnGrokChild(ctx, { resume: Boolean(this.nativeId) })
   }
 
@@ -690,6 +711,12 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       '--no-memory',
       '--cwd', spec.cwd,
     ]
+    // --tools is the native model-visible builtin allowlist. In particular,
+    // no shell, image generation, editor, or subagent can bypass the MCP gate.
+    if (ctx.params.readOnly) {
+      args.push('--tools', 'read_file,grep,list_dir')
+      args.push('--rules', `This turn is read-only. The user's workspace is ${JSON.stringify(spec.readOnlyWorkspaceCwd)}. Read and search it using absolute paths. Only the supplied read-only platform MCP tools may be used.`)
+    }
     if (resume && this.nativeId) args.push('--resume', this.nativeId)
     if (this.currentEffort && ['low', 'medium', 'high'].includes(this.currentEffort)) {
       args.push('--reasoning-effort', this.currentEffort)

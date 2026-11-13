@@ -65,6 +65,7 @@ import {
   parseHumanMeta,
 } from './marketplaceMeta.js'
 import { platformPresetAgentSlugs } from './platformPresets.js'
+import { isPlatformPresetPaused } from './seedPlatformAgents.js'
 import { prepareConnectorPublish } from './publishConnectorPipeline.js'
 import { PUBLISH_MAX_REQUEST_BYTES, prepareSkillPublish } from './publishSkillPipeline.js'
 import { scanSkillArtifact } from './skillScanner.js'
@@ -130,7 +131,9 @@ async function assignableAgentIds(userId: number): Promise<Set<string>> {
     listPlatformPresetAgents(presetSlugs),
     listActiveInstalledAgents(userId),
   ])
-  return new Set(['main', ...presets.map((a) => a.slug), ...installed.map((a) => a.slug)])
+  return new Set(['main', ...presets.map((a) => a.slug), ...installed
+    .filter((a) => !isPlatformPresetPaused(a.slug))
+    .map((a) => a.slug)])
 }
 
 async function validateAssignableAgentScope(userId: number, input: unknown): Promise<string[]> {
@@ -474,7 +477,7 @@ export async function handleMarketplaceMyAgents(
   const candidates = [
     ...presets.map((agent) => ({ agent, preset: true })),
     ...installed
-      .filter((agent) => !presetSet.has(agent.slug))
+      .filter((agent) => !presetSet.has(agent.slug) && !isPlatformPresetPaused(agent.slug))
       .map((agent) => ({ agent, preset: false })),
   ]
   const readiness = await getAgentCapabilityReadinessMany(

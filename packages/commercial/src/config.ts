@@ -638,8 +638,10 @@ export const commercialConfigSchema = z
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。
      * - 连接 Deepgram 时通过 `Authorization: Token <DEEPGRAM_API_KEY>` header,
      *   绝不放 URL query,避免 access log / browser history 泄漏。
-     * - 未配置时语音 WS 返回 VOICE_NOT_CONFIGURED,前端回退浏览器内置
-     *   SpeechRecognition。
+     * - 未配置 Deepgram、且没有可用 OpenAI key 时，语音 WS 返回
+     *   VOICE_NOT_CONFIGURED，前端回退浏览器内置 SpeechRecognition。
+     * - 服务池 openai 或 OPENAI_API_KEY 有可用 key 时优先 gpt-transcribe，
+     *   不要求本字段。
      */
     DEEPGRAM_API_KEY: z.string().trim().min(1).max(512).optional(),
     VOICE_ASR_MODEL: z.string().trim().min(1).max(64).optional(),
@@ -776,6 +778,11 @@ export const commercialConfigSchema = z
           "OC_MUSE_VIDEO_BACKEND must be hatch, box-exec or hatch-with-box-fallback",
         )
       }),
+    /** When "1", a down box-exec relay may fall back onto hatch if the hatch bridge is online. */
+    OC_MUSE_BOX_EXEC_FALLBACK_HATCH: z
+      .enum(["0", "1", ""])
+      .optional()
+      .transform((value) => value === "1"),
     /** Decimal uid used to resolve the Box Exec target (no Claude login is scheduled). */
     OC_MUSE_BOX_EXEC_UID: z
       .string()
@@ -1052,6 +1059,23 @@ function assertNoProductionDangerSwitches(env: Record<string, string | undefined
         "remove it and use an account-scoped allowlist (e.g. TURNSTILE_BYPASS_ACCOUNTS) instead",
     })),
   );
+}
+
+/**
+ * Proxy flags read per request, not part of the loadConfig snapshot: the supervisor and the box test
+ * harnesses flip them at runtime. llm-proxy reads them here, through the env authority
+ * (P3 pilot S1b), instead of from process.env.
+ */
+export function proxyRuntimeFlags(env: Record<string, string | undefined> = process.env): {
+  providerHealthEnforce: boolean;
+  boxModelApi: boolean;
+  boxToolBridge: boolean;
+} {
+  return {
+    providerHealthEnforce: env.OC_PROVIDER_HEALTH_ENFORCE === "1",
+    boxModelApi: env.OC_BOX_MODEL_API === "1",
+    boxToolBridge: env.OC_BOX_TOOL_BRIDGE === "1",
+  };
 }
 
 /**

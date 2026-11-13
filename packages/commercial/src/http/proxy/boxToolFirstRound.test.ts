@@ -1081,6 +1081,38 @@ test("a native claim lost to a concurrent turn degrades to a cold start, not an 
   }
 });
 
+test("OCV5-756: a context miss after a written pointer logs which part changed, without content", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const priorBody = { ...canonicalBody, system: "SECRET system v1",
+      messages: [{ role: "user", content: "SECRET prior question" }] } as ProxyBody;
+    const first = fixture({ directFinal: true });
+    const written = await runBoxToolFirstRound({ ...first.input, canonicalBody: priorBody,
+      init: { ...first.input.init, body: JSON.stringify({ ...priorBody, model }) } }, first.deps);
+    assert.ok(written.kind === "final" && written.nativePointer, "the first turn writes a pointer");
+    const pointer = written.kind === "final" ? written.nativePointer! : null;
+    const next = { ...priorBody, system: "SECRET system v2", messages: [
+      ...priorBody.messages,
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "SECRET new question" }] } as ProxyBody;
+    const f = fixture({ directFinal: true, nativeCandidate: { ownerRequestId: "native-owner", pointer: pointer! } });
+    const decisions: Array<{ reason: string; detail?: unknown }> = [];
+    const result = await runBoxToolFirstRound({ ...f.input, canonicalBody: next,
+      init: { ...f.input.init, body: JSON.stringify({ ...next, model }) } },
+    { ...f.deps, onNativeDecision: (info) => { decisions.push(info); } });
+    assert.equal(result.kind, "final");
+    const context = decisions.find((item) => item.reason === "context");
+    assert.deepEqual(context?.detail, { basis: "known",
+      system: { prev: 1, next: 1, firstDiff: 0 }, changed: ["system"] });
+    assert.doesNotMatch(JSON.stringify(decisions), /SECRET/);
+    assert.equal(f.admittedNative, null, "a diagnosed miss is still a cold start");
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
 test("OCV5-384: a re-staged conversation carries the session's native context records", async () => {
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";

@@ -17,6 +17,7 @@ import { Markdown } from "../Markdown";
 import { ToolCardSlot } from "./toolCardSlot";
 import { DelegateProcessList } from "./delegateProcessList";
 import { delegateTokenUsage, TokenUsageBadge } from "./tokenUsage";
+import { agentDisplayName } from "./agentNames";
 
 /** 终态图标(与 agentTerminalStatus tone 对齐):完成→Users、失败→X、超时→Clock。 */
 export function TerminalIcon({ tone, size }: { tone: "success" | "danger" | "warning" | "neutral"; size: number }) {
@@ -67,6 +68,16 @@ function ProgressiveChildRaw({ text }: { text: string }) {
 
 /** Records that are not a tool-use shell remain first-class process rows.
  * They are never dropped or summarized; large string fields mount in chunks. */
+const RAW_CHILD_FIELD_LABELS: Record<string, string> = {
+  output: "输出",
+  preview: "预览",
+  tail: "尾部输出",
+  error: "错误",
+  text: "正文",
+  explanation: "说明",
+  objective: "目标",
+};
+
 function RawChildEventView({ child }: { child: ChildBlock }) {
   const [open, setOpen] = useState(false);
   const source = child as ChildBlock & Record<string, unknown>;
@@ -115,7 +126,7 @@ function RawChildEventView({ child }: { child: ChildBlock }) {
           {serialized !== "{}" && <ProgressiveChildRaw text={serialized} />}
           {bulk.map((field) => (
             <section key={field.name}>
-              <div className="mb-1 text-caption font-medium text-faint">{field.name}</div>
+              <div className="mb-1 text-caption font-medium text-faint">{RAW_CHILD_FIELD_LABELS[field.name] ?? field.name}</div>
               <ProgressiveChildRaw text={field.text} />
             </section>
           ))}
@@ -218,6 +229,10 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
           {running ? <Spinner size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
         </span>
+        {/* 团队模式:谁接了这件事先写出来(体验官 P3「看不出委派」)。 */}
+        {msg._delegateAgentId ? (
+          <span data-testid="agent-group-assignee" className="shrink-0 text-body text-muted">{`委派给 ${agentDisplayName(msg._delegateAgentId)}`}</span>
+        ) : null}
         <span className="min-w-0 truncate text-body font-medium text-fg">{msg.text || "子任务"}</span>
         <span className="ml-auto flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {running ? (

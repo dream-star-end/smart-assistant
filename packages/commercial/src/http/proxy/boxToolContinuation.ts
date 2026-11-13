@@ -1,6 +1,7 @@
 /** Resume the same detached CLI after OpenClaude-local tool results publish.
  * Delivers either the next durable tool handoff or a remotely-proven final
  * message. The caller retains the Box target until terminal cleanup. */
+import { boxFailureObservation } from "./boxFailureCause.js";
 import { boxCatalogMatching, compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
@@ -25,6 +26,7 @@ import { boxFastPathEnabled } from "./boxFastPath.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
+import { rememberBoxNativeContext } from "./boxNativeContextDiagnosis.js";
 
 const continuationLog = rootLogger.child({ subsys: "box-tool-continuation" });
 
@@ -263,6 +265,7 @@ export async function runBoxToolContinuation(input: {
               requestId: input.requestId, uid: input.uid,
               accountId: claim.accountId, proof, pointer: candidate })) {
               nativePointer = candidate;
+              rememberBoxNativeContext(candidate.contextHashBeforeFinal, input.canonicalBody);
             }
           } catch { /* Cache miss must not erase durable usage or model result. */ }
         }
@@ -274,6 +277,8 @@ export async function runBoxToolContinuation(input: {
     }
     throw new BoxToolContinuationError("BOX_TOOL_STREAM_INCOMPLETE");
   } catch (caught) {
+    rootLogger.warn("box_continuation_transport_observation", { requestId: input.requestId,
+      ...boxFailureObservation(caught, "stream") });
     const decoderFailure = caught instanceof BoxCliToolHandoffError
       || caught instanceof BoxToolResultEchoError
       || caught instanceof BoxToolContinuationError

@@ -61,7 +61,7 @@ lease_tx() {
 lease_init_db() {
   lease_need_tool sqlite3
   mkdir -p "$(dirname "$LEASE_DB")"
-  sqlite3 "$LEASE_DB" >/dev/null <<'SQL'
+  sqlite3 -cmd '.timeout 5000' "$LEASE_DB" >/dev/null <<'SQL'
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
 PRAGMA foreign_keys=ON;

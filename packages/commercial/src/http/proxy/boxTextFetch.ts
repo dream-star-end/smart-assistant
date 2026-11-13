@@ -1,3 +1,4 @@
+import { beforeBoxPrivacyCleanup, type BoxBeforeCleanup } from "./boxFailureDiagnostic.js";
 import { BoxEgressNotConfiguredError } from "./boxAccountResolver.js";
 /** Off-by-default Box text transport behind the existing internal Messages
  * identity/authority/precheck/finalizer. Account selection and durable lease
@@ -63,6 +64,7 @@ export class BoxTextFetch {
     registry: BoxInvocationRegistry;
     journal: BoxJournalPort;
     writeMessage?: BoxReplayMessageWriter;
+    beforeCleanup?: BoxBeforeCleanup;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
       upstreamModel: string; signal: AbortSignal;
@@ -535,6 +537,7 @@ export class BoxTextFetch {
                   if (!await this.deps.journal.claimRemoteCleanup!(candidate)) {
                     throw new BoxTextFetchError("BOX_TEXT_CLEANUP_CLAIMED_ELSEWHERE");
                   }
+                  await beforeBoxPrivacyCleanup(this.deps.beforeCleanup, candidate, resolved!);
                   const cleaned = await exec(makeBoxRunCleanup(plan.runNonce), 20_000, false);
                   if (cleaned.stdout.trim() !== "clean") {
                     throw new BoxTextFetchError("BOX_TEXT_CLEANUP_UNPROVEN");

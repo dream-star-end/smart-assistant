@@ -1,3 +1,5 @@
+import { beforeBoxPrivacyCleanup, type BoxBeforeCleanup } from "./boxFailureDiagnostic.js";
+import { BoxToolRolloverRequired } from "./boxToolRollover.js";
 /** Internal Box tool transport on the existing OpenClaude Messages route.
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
@@ -28,6 +30,7 @@ import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 import { rootLogger } from "../../logging/logger.js";
 import { BoxSpoolTerminalError, isBoxExecRejectedError } from "./boxSpoolPoller.js";
+import type { BoxNativeMissDetail } from "./boxNativeContextDiagnosis.js";
 
 const fetchLog = rootLogger.child({ subsys: "box-tool-fetch" });
 
@@ -75,6 +78,7 @@ export class BoxToolFetch {
     toolAliasMode?: BoxMcpAliasMode;
     journal: BoxDurableJournal;
     writeMessage?: BoxReplayMessageWriter;
+    beforeCleanup?: BoxBeforeCleanup;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null;
       requestId: string; upstreamModel: string; signal: AbortSignal;
@@ -85,7 +89,7 @@ export class BoxToolFetch {
       requestId: string; phase: string }) => Promise<void>;
     runFirst?: First;
     onNativeDecision?: (info: { requestId: string; decision: "resume" | "miss";
-      reason: string; cliVersion: string }) => void;
+      reason: string; cliVersion: string; detail?: BoxNativeMissDetail }) => void;
     publishResume?: Publish;
     runContinuation?: Continue;
     /** Test-only shortening of the bounded restart-cleanup resolver wait. */
@@ -470,6 +474,7 @@ export class BoxToolFetch {
     target: BoxResolvedTarget, candidate: BoxRemoteCleanupCandidate): Promise<void> {
     const keepNativeProject = candidate.nativePointer?.cliCwd
       === `/tmp/ocv5-289-run-${runNonce}`;
+    await beforeBoxPrivacyCleanup(this.deps.beforeCleanup, candidate, target);
     const remote = target.exec.run(makeBoxRunCleanup(runNonce,
       keepNativeProject), {
       timeoutMs: 20_000, maxResponseBytes: 4096 });
@@ -614,7 +619,19 @@ export class BoxToolFetch {
             } catch (error) {
               // OCV5-304: no claim was made and nothing launched; a recovered
               // dispatch continues the exchange as a fresh Box invocation.
-              if (!(await this.releaseOrphanedExchange(args, error))) {
+              if (error instanceof BoxToolRolloverRequired) {
+                // The journal has already matched the entire exchange, attribution and successor.
+                // No sidecar was written. An uncertain stop never authorizes a fresh invocation.
+                if (abort.signal.aborted || !this.deps.stopOrphanRun) throw error;
+                const claim = error.claim;
+                const outcome = await this.deps.stopOrphanRun({ requestId: claim.ownerRequestId,
+                  uid: args.uid,accountId: claim.accountId,runNonce: claim.runNonce,leaseEpoch: claim.leaseEpoch });
+                if (outcome !== "stopped_proven" || abort.signal.aborted) {
+                  throw new BoxContinuationDecisionError("in_progress_or_unknown","BOX_TOOL_ROLLOVER_PENDING");
+                }
+                await this.deps.journal.finishToolRollover({ requestId: args.requestId,uid: args.uid,claim });
+                if (abort.signal.aborted) throw new BoxContinuationDecisionError("reject","BOX_TOOL_ROLLOVER_CANCELLED");
+              } else if (!(await this.releaseOrphanedExchange(args, error))) {
                 if (error instanceof BoxDurableJournalError || error instanceof BoxContinuationDecisionError) {
                   recordBoxContinuationRejection("claim", error.code);
                 }

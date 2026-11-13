@@ -89,3 +89,120 @@ test("the existing caller fence orders sequence numbers and drops duplicates bef
     frame(progress("done"), 3), frame(progress("start"), 4),
   ]))), false);
 });
+
+test("OCV5-716: nested grandchild start -> tool -> done settles its own execution once parent also completes", () => {
+  const routing = { runId: "execution-a", agentId: "worker", label: "worker↳grandchild" };
+  const nestedStart = toNestedDelegateProgressLine(progress("start", "execution-grandchild"), routing);
+  const nestedTool = toNestedDelegateProgressLine(progress("tool", "execution-grandchild"), routing);
+  const nestedDone = toNestedDelegateProgressLine(progress("done", "execution-grandchild"), routing);
+  assert.equal(nestedDone?.phase, "text");
+  assert.equal(nestedDone?.nestedPhase, "done");
+  assert.equal(nestedDone?.usageRunId, "execution-grandchild");
+  // While parent execution-a is still running, nestedDone alone does not make the turn eligible.
+  assert.equal(eligible(project(progress("start", "execution-a"), nestedStart, nestedTool, nestedDone)), false);
+  // Once parent execution-a also emits done, both executions are settled and checkpoint is eligible.
+  const settled = project(
+    progress("start", "execution-a"),
+    nestedStart,
+    nestedTool,
+    nestedDone,
+    progress("done", "execution-a"),
+  );
+  assert.deepEqual(settled, [
+    { role: "delegate-progress", _completed: true },
+    { role: "delegate-progress", _completed: true },
+  ]);
+  assert.equal(eligible(settled), true);
+});
+
+test("OCV5-717: loadLeftoverRecoveryRecords queries limit+1 and fails closed when leftover stream is truncated", async () => {
+  const {
+    loadLeftoverRecoveryRecords,
+    mergeTapeAndLeftoverRecoveryAssessment,
+    isLeftoverRecoveryRecordsTruncated,
+  } = await import("../db/sessionRecoveryEvidence.js");
+  const seenParams: unknown[][] = [];
+  const fakeClient = {
+    query: async (_sql: string, params: unknown[]) => {
+      seenParams.push(params);
+      const limitPlusOne = Number(params[3]);
+      const rows = Array.from({ length: limitPlusOne }, (_, idx) => ({
+        payload: Buffer.from(
+          JSON.stringify(
+            frame(
+              idx === 0 ? progress("start", "exec-1") : progress("done", "exec-1"),
+              idx + 1,
+            ),
+          ),
+          "utf8",
+        ),
+      }));
+      return { rows };
+    },
+  };
+  const truncatedRecords = await loadLeftoverRecoveryRecords(
+    fakeClient as never,
+    "sess-trunc",
+    "c:3",
+    "cm-trunc",
+    5,
+  );
+  assert.equal(seenParams[0]?.[3], 6);
+  assert.equal(isLeftoverRecoveryRecordsTruncated(truncatedRecords), true);
+  assert.equal(eligible(truncatedRecords), false);
+  const merged = mergeTapeAndLeftoverRecoveryAssessment(completedTape, truncatedRecords);
+  assert.equal(merged.mode, "checkpoint");
+  assert.equal(merged.checkpointSafe, false);
+
+  // Even if all 5 returned frames are telemetry usage frames (so records only has
+  // the _leftoverTruncated sentinel) and status="completed" / errorCode="service_restart",
+  // allowUnsafeAutomaticCheckpoint and shouldDeclineLiveServiceRestartRecovery must fail closed.
+  const {
+    allowUnsafeAutomaticCheckpoint,
+    shouldDeclineLiveServiceRestartRecovery,
+  } = await import("@openclaude/protocol");
+  const usageOnlyClient = {
+    query: async (_sql: string, params: unknown[]) => {
+      const limitPlusOne = Number(params[3]);
+      const rows = Array.from({ length: limitPlusOne }, (_, idx) => ({
+        payload: Buffer.from(
+          JSON.stringify(
+            frame(
+              idx < limitPlusOne - 1
+                ? { kind: "delegate_progress", phase: "usage", usageRunId: "exec-u" }
+                : { kind: "tool_use", blockId: "open-tool-after-cap" },
+              idx + 1,
+            ),
+          ),
+          "utf8",
+        ),
+      }));
+      return { rows };
+    },
+  };
+  const usageTruncated = await loadLeftoverRecoveryRecords(
+    usageOnlyClient as never,
+    "sess-usage-trunc",
+    "c:3",
+    "cm-usage-trunc",
+    5,
+  );
+  assert.equal(isLeftoverRecoveryRecordsTruncated(usageTruncated), true);
+  assert.equal(
+    allowUnsafeAutomaticCheckpoint({
+      status: "completed",
+      errorCode: "service_restart",
+      leftoverBacked: true,
+      records: usageTruncated,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldDeclineLiveServiceRestartRecovery({
+      errorCode: "service_restart",
+      records: [],
+      leftoverRecords: usageTruncated,
+    }),
+    true,
+  );
+});

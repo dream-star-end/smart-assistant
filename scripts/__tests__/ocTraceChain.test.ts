@@ -254,3 +254,71 @@ test('604: expansion preserves distinct runtime observations at the same timesta
     2,
   )
 })
+
+// Pilot (plan §9.4): the turn's chain ends in the ledger rows written for its usage rows.
+const usageQuery =
+  (ledger: NonNullable<TraceIo['query']>): NonNullable<TraceIo['query']> =>
+  (sql, vars, timeoutMs) => {
+    if (sql.includes('FROM credit_ledger')) return ledger(sql, vars, timeoutMs)
+    if (sql.includes('FROM usage_records') && vars.ids?.includes(D))
+      return [
+        {
+          id: '9101',
+          request_id: 'pilot-request-0001',
+          dispatch_id: D,
+          status: 'success',
+          created_at: at,
+        },
+      ]
+    return durableQuery(sql, vars, timeoutMs)
+  }
+
+test('pilot: usage rows lead to their ledger rows (debit per bucket), read by usage id only', async () => {
+  const seen: Record<string, string>[] = []
+  const r = await trace(D, {
+    query: usageQuery((sql, vars) => {
+      seen.push(vars)
+      assert.match(sql, /ref_type = 'usage_record' AND ref_id = ANY\(:'uids'::text\[\]\)/)
+      return [
+        { ledger_id: '77', usage_id: '9101', reason: 'chat', bucket: 'period', created_at: at },
+        { ledger_id: '78', usage_id: '9101', reason: 'chat', bucket: 'wallet', created_at: at },
+      ]
+    }),
+    readLogs: noLogs,
+  })
+  assert.deepEqual(seen, [{ uids: '{"9101"}' }])
+  const ledger = r.events.filter((e) => e.source === 'credit_ledger')
+  assert.deepEqual(
+    ledger.map((e) => [e.event, e.ids.ledger_id, e.ids.usage_id]),
+    [
+      ['ledger.chat:period', '77', '9101'],
+      ['ledger.chat:wallet', '78', '9101'],
+    ],
+  )
+  assert.ok(!r.incomplete.length)
+})
+
+test('pilot: no usage rows → no ledger query', async () => {
+  let ledgerReads = 0
+  await trace(D, {
+    query: (sql, vars, timeoutMs) => {
+      if (sql.includes('FROM credit_ledger')) ledgerReads += 1
+      return durableQuery(sql, vars, timeoutMs)
+    },
+    readLogs: noLogs,
+  })
+  assert.equal(ledgerReads, 0)
+})
+
+test('pilot: a failed ledger read marks the trace incomplete instead of looking unbilled', async () => {
+  const r = await trace(D, {
+    query: usageQuery(() => {
+      throw new Error('database-read-failed')
+    }),
+    readLogs: noLogs,
+  })
+  assert.ok(
+    r.incomplete.includes('credit_ledger:database-read-failed'),
+    JSON.stringify(r.incomplete),
+  )
+})

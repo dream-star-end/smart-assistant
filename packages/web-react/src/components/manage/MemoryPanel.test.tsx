@@ -100,6 +100,58 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     expect(screen.queryByText(/MEMORY\.md/)).not.toBeInTheDocument();
   });
 
+  test("「智能体现在能用到哪些记忆」展开才请求，展示来源与进行中对话的记忆规则", async () => {
+    mockIndex([{ file: "a.md", name: "A" }]);
+    const context = vi.spyOn(api, "getMemoryContext").mockResolvedValue({
+      facade: "enabled",
+      cli: "cli_lease_blocked",
+      mode: "legacy",
+      panel: {
+        status: "ready",
+        sources: [{ kind: "core-index", locator: "MEMORY.md", bytes: 2048, sourceVersion: "abcdef012345", expires: [] }],
+      },
+      turns: [
+        {
+          startedAt: Date.now() - 60_000,
+          projectBound: true,
+          memoryPolicy: { allowed: true, reason: "on_demand_session" },
+          context: { status: "ready", sources: [] },
+        },
+        {
+          startedAt: Date.now() - 30_000,
+          projectBound: false,
+          memoryPolicy: { allowed: false, reason: "explicit_ignore" },
+          context: { status: "unavailable", reason: "policy_denied" },
+        },
+      ],
+    });
+
+    renderPanel();
+    const toggle = await screen.findByRole("button", { name: "智能体现在能用到哪些记忆" });
+    expect(context).not.toHaveBeenCalled();
+    fireEvent.click(toggle);
+    const region = await screen.findByRole("region", { name: "记忆使用情况" });
+    expect(await within(region).findByText("可读取：记忆索引（2 KB）")).toBeInTheDocument();
+    expect(context).toHaveBeenCalledWith(auth, "main");
+    expect(within(region).getByText(/已绑定项目/)).toHaveTextContent("需要时查阅记忆；还没有可用的记忆");
+    expect(within(region).getByText(/按你的要求不参考历史记忆/)).toHaveTextContent("这一轮不读取记忆");
+    // 内部定位符不透给用户
+    expect(within(region).queryByText(/MEMORY\.md/)).not.toBeInTheDocument();
+
+    fireEvent.click(within(region).getByRole("button", { name: "刷新" }));
+    await waitFor(() => expect(context).toHaveBeenCalledTimes(2));
+  });
+
+  test("记忆使用情况读取失败只影响这一块，核心记忆列表照常", async () => {
+    mockIndex([{ file: "a.md", name: "照常显示" }]);
+    vi.spyOn(api, "getMemoryContext").mockRejectedValue(new ApiError({ status: 404, message: "not found" }));
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "智能体现在能用到哪些记忆" }));
+    const region = await screen.findByRole("region", { name: "记忆使用情况" });
+    await waitFor(() => expect(within(region).queryByText("正在读取…")).not.toBeInTheDocument());
+    expect(screen.getByText("照常显示")).toBeInTheDocument();
+  });
+
   test("空记忆走 EmptyState：图标 + 说明 + 唯一的新建 CTA", async () => {
     mockIndex([]);
     renderPanel();

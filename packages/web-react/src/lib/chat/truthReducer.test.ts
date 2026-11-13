@@ -1,7 +1,11 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { turnCreditsLine } from "./backgroundTurnNotice";
 import type { CostChargedWire, OutboundMessageWire, OutboundTurnStatusWire } from "./frames";
 import { addMessage, clearTurnTiming, createSession } from "./model";
 import { applyCostCharged, applyOutboundError, applyOutboundMessage, applyTurnStatus } from "./reducer";
+import { ChatSocket } from "./socket";
+
+afterEach(() => vi.useRealTimers());
 
 function activeSession() {
   const sess = createSession({ id: "truth-session", agentId: "main" });
@@ -34,7 +38,9 @@ describe("TRUTH-07: 实扣展示按会话 requestId 去重", () => {
     }
     expect(assistant.usage?.costCredits).toBe("35");
     expect(sess._turnCostCredits).toBe("35");
-    expect(sess._turnCredits).toEqual({ settled: "35", requests: 1, asOf: expect.any(Number) });
+    expect(sess._turnCredits).toEqual({
+      clientMessageId: "truth-user", settled: "35", requests: 1, asOf: expect.any(Number), receivedAt: expect.any(Number),
+    });
     expect(refreshBalance).toHaveBeenCalledTimes(2);
   });
 
@@ -42,7 +48,7 @@ describe("TRUTH-07: 实扣展示按会话 requestId 去重", () => {
     const sess = activeSession();
     applyCostCharged(sess, charged());
     clearTurnTiming(sess);
-    sess._turnCredits = { settled: "0", requests: 0, asOf: Date.now() };
+    sess._turnCredits = { clientMessageId: "truth-user", settled: "0", requests: 0, asOf: Date.now(), receivedAt: Date.now() };
     const next = addMessage(sess, "assistant", "下一轮", { usage: {} });
     sess._streamingAssistant = next;
     applyCostCharged(sess, charged());
@@ -71,9 +77,13 @@ describe("TRUTH-07: 实扣展示按会话 requestId 去重", () => {
       sessionKey: "agent:main:webchat:dm:truth-session", status: "working",
       meta: { detached: true, credits: { settled: "200", requests: 2, asOf: 1 } },
     } as OutboundTurnStatusWire);
-    expect(sess._turnCredits).toEqual({ settled: "200", requests: 2, asOf: 1 });
+    expect(sess._turnCredits).toEqual({
+      clientMessageId: "truth-user", settled: "200", requests: 2, asOf: 1, receivedAt: expect.any(Number),
+    });
     applyCostCharged(sess, charged());
-    expect(sess._turnCredits).toEqual({ settled: "235", requests: 3, asOf: expect.any(Number) });
+    expect(sess._turnCredits).toEqual({
+      clientMessageId: "truth-user", settled: "235", requests: 3, asOf: expect.any(Number), receivedAt: expect.any(Number),
+    });
   });
 
   test("去重缓存有界且保留最近请求", () => {
@@ -134,5 +144,89 @@ describe("TRUTH-10: 异常收尾保留取消真相", () => {
       code: "upstream_failed", message: "上游断开", isFinal: false,
     });
     expect(group).toMatchObject({ _completed: true, cancelled: true });
+  });
+});
+
+describe("snapshot recovery integrates the actual-debit projection", () => {
+  test("an accepted-only next turn starts its debit projection at zero after the previous final", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    const sess = activeSession();
+    const sock = new ChatSocket({
+      getToken: () => "test", getAuthEpoch: () => 0,
+      silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
+      onAuthExpired: () => {},
+    });
+    sock.sessions.set(sess.id, sess);
+    try {
+      applyCostCharged(sess, charged());
+      applyOutboundMessage(sess, message({ blocks: [{ kind: "text", text: "首轮完成", messageId: "answer-first" }] }));
+      applyOutboundMessage(sess, message({ isFinal: true, meta: { stopReason: "end_turn" } }));
+      expect(sess._sendingInFlight).toBe(false);
+      expect(sess._turnCredits).toEqual({
+        clientMessageId: "truth-user", settled: "35", requests: 1, asOf: 20_000, receivedAt: 20_000,
+      });
+      expect(sess.messages.find((row) => row.id === "answer-first")?.usage?.costCredits).toBe("35");
+
+      const nextUser = addMessage(sess, "user", "下一轮", { id: "truth-next", status: "sending" });
+      sess._activeClientMessageId = nextUser.id;
+      sess._sendingInFlight = true;
+      (sock as any).dispatch({
+        type: "outbound.ack", peer: { id: sess.id, kind: "dm" }, clientMessageId: nextUser.id, accepted: true,
+      });
+      expect(nextUser._deliveryState).toBe("accepted");
+      // Admission ACK was lost: acceptance cannot reset already confirmed facts.
+      expect(sess._turnCredits).toEqual({
+        clientMessageId: "truth-user", settled: "35", requests: 1, asOf: 20_000, receivedAt: 20_000,
+      });
+      vi.setSystemTime(21_000);
+      applyCostCharged(sess, charged({ requestId: "request-next", debitedCredits: "15" }));
+      expect(sess._turnCredits).toEqual({
+        clientMessageId: "truth-next", settled: "15", requests: 1, asOf: 21_000, receivedAt: 21_000,
+      });
+      expect(turnCreditsLine(sess, 21_000, false)).toBe("本轮已扣 15 积分");
+      applyCostCharged(sess, charged());
+      expect(sess._turnCredits).toEqual({
+        clientMessageId: "truth-next", settled: "15", requests: 1, asOf: 21_000, receivedAt: 21_000,
+      });
+    } finally {
+      sock.stop();
+    }
+  });
+
+  test("an explicitly different turn_status cannot overwrite the current turn's credits", () => {
+    const sess = activeSession();
+    const current = { clientMessageId: "truth-user", settled: "35", requests: 1, asOf: 100, receivedAt: 101 };
+    sess._turnCredits = current;
+    applyTurnStatus(sess, {
+      type: "outbound.turn_status", channel: "webchat", peer: { id: sess.id, kind: "dm" },
+      sessionKey: "agent:main:webchat:dm:truth-session", clientMessageId: "other-turn", status: "working",
+      meta: { detached: true, credits: { settled: "900", requests: 9, asOf: 200 } },
+    } as OutboundTurnStatusWire);
+    expect(sess._turnCredits).toBe(current);
+    expect(sess._turnCredits).toEqual({ clientMessageId: "truth-user", settled: "35", requests: 1, asOf: 100, receivedAt: 101 });
+    expect(turnCreditsLine(sess, 101, false)).toBe("本轮已扣 35 积分");
+  });
+
+  test("turn_status and live cost retain the metadata used by the background credit line", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(30_000);
+    const sess = activeSession();
+    applyTurnStatus(sess, {
+      type: "outbound.turn_status", channel: "webchat", peer: { id: sess.id, kind: "dm" },
+      sessionKey: "agent:main:webchat:dm:truth-session", clientMessageId: "truth-user", status: "working",
+      meta: { detached: true, credits: { settled: "200", requests: 2, asOf: 1 } },
+    } as OutboundTurnStatusWire);
+    expect(sess._turnCredits).toEqual({
+      clientMessageId: "truth-user", settled: "200", requests: 2, asOf: 1, receivedAt: 30_000,
+    });
+    expect(turnCreditsLine(sess, 30_000, false)).toBe("本轮已扣 200 积分");
+    vi.setSystemTime(31_000);
+    applyCostCharged(sess, charged());
+    expect(sess._turnCredits).toEqual({
+      clientMessageId: "truth-user", settled: "235", requests: 3, asOf: 31_000, receivedAt: 31_000,
+    });
+    expect(turnCreditsLine(sess, 31_000, false)).toBe("本轮已扣 235 积分");
+    expect(turnCreditsLine(sess, 91_000, false)).toBe("本轮已扣 235 积分（截至 1 分钟前）");
   });
 });

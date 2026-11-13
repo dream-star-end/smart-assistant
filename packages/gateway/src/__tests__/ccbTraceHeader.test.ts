@@ -1,3 +1,7 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { verifyDelegateContextToken } from '../delegateContext.js'
 /**
  * OCV5-570 (plan v3.6 §7.3 row 1): every CCB request to egress carries the turn's canonical traceId
  * as `x-openclaude-trace-id`, through the same per-turn `ANTHROPIC_CUSTOM_HEADERS` hot update that
@@ -125,4 +129,22 @@ describe('CCB turn trace header', () => {
     await runner.updateTurnLease('LEASE1b')
     for (const w of [writes[0]!, writes[2]!]) assert.equal(customHeaders(w)[TRACE_ID_HEADER], undefined)
   })
+})
+
+it('delegate context uses the CCB submit snapshot even when current trace changes during runtime resolution', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'oc-605-ccb-'))
+  try {
+    const { runner } = harness(true)
+    const file = join(dir, 'context')
+    ;(runner as any).delegateContextFile = file
+    runner.setTraceId(T1)
+    const first = runner.submit('one', 'request-1', authority('L1'))
+    runner.setTraceId(T2)
+    await first
+    assert.equal(verifyDelegateContextToken((await readFile(file, 'utf8')).trim())?.traceId, T1)
+    await runner.submit('two', 'request-2', authority('L2'), undefined, T2)
+    assert.equal(verifyDelegateContextToken((await readFile(file, 'utf8')).trim())?.traceId, T2)
+    await runner.submit('legacy', 'request-3', authority('L3'), undefined, null)
+    assert.equal(verifyDelegateContextToken((await readFile(file, 'utf8')).trim())?.traceId, undefined)
+  } finally { await rm(dir, { recursive: true, force: true }) }
 })

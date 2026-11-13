@@ -354,3 +354,31 @@ describe("OCV5-762 Exec 417: refresh the descriptor before the next call", () =>
     assert.equal(BOX_EXEC_REJECTION_READ_BYTES, 2048);
   });
 });
+
+it("fetch and reader preserve only safe cause and stage, not native errors", async () => {
+  const secret = "SECRET_PROMPT_TOKEN_URL";
+  const native = new Error(secret, { cause: { code: "ECONNRESET", message: secret } });
+  const fetchFailure = await code(new BoxExecTransport(target, async () => { throw native; },
+    async () => {}).run(request, { timeoutMs: 1000 }));
+  assert.equal(fetchFailure.causeTag, "connection_reset");
+  assert.equal(fetchFailure.stage, "fetch");
+  const streamFailure = await code(new BoxExecTransport(target, async () => new Response(
+    new ReadableStream({ pull(controller) { controller.error(native); } })),
+  async () => {}).run(request, { timeoutMs: 1000 }));
+  assert.equal(streamFailure.causeTag, "connection_reset");
+  assert.equal(streamFailure.stage, "stream");
+  for (const e of [fetchFailure, streamFailure]) {
+    assert.equal(Object.hasOwn(e, "cause"), false);
+    assert.ok(!JSON.stringify(e).includes(secret));
+    assert.ok(!String(e.stack).includes(secret));
+  }
+});
+
+it("poisoned transport rejection cannot escape the fixed error boundary", async () => {
+  const revoked = Proxy.revocable({}, {}); revoked.revoke();
+  const failure = await code(new BoxExecTransport(target, async () => { throw revoked.proxy; },
+    async () => {}).run(request, { timeoutMs: 1000 }));
+  assert.equal(failure.code, "BOX_EXEC_TRANSPORT_UNKNOWN");
+  assert.equal(failure.causeTag, "unknown");
+  assert.equal(failure.stage, "fetch");
+});

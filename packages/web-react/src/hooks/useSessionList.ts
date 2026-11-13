@@ -1,3 +1,4 @@
+import type { SessionMetadataSnapshot } from "../lib/api/systemActionsApi";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useToast } from "../components/ui";
 import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
@@ -192,9 +193,10 @@ export type UseSessionList = {
     projectId?: string | null,
     includeArchived?: boolean,
   ) => Promise<SessionSearchHit[]>;
+  applySessionMetadata: (metadata: SessionMetadataSnapshot) => void;
   applySessionTerminal: (
     sessId: string,
-    terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+    terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt?: number } | null,
   ) => void;
   /** 登出/登录时的整体重置：清列表与选中、清已拉历史标记、允许重新自动选中最近会话。 */
   reset: () => void;
@@ -222,10 +224,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const { demo, auth, user, agentId, holdAutoSelect = false } = opts;
   // 回调/句柄经 ref 镜像：App 每渲染可能传新闭包，这里始终读最新版本而不进 useCallback
   // 依赖（保持 selectSession/newSession 依赖面与拆分前一致；useChatSocket persistRef 同款）。
+  const confirmedMetadata = useRef(new Map<string, SessionMetadataSnapshot>());
   /** 重命名 PATCH 未落地期间的本地标题：此前已发出的列表请求带回旧标题，不能盖掉它(#1240)。 */
   const pendingTitles = useRef(new Map<string, string>());
-  /** PATCH 落地后服务端确认的标题与 updatedAt：更早的列表快照(updatedAt 更小)不能把它盖回(#1240)。 */
-  const confirmedTitles = useRef(new Map<string, { title: string; updatedAt: number }>());
   const cbRef = useRef(opts);
   cbRef.current = opts;
   const toast = useToast();
@@ -259,6 +260,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   //  - pending:最新未落库的显式选择。存续期内一切载荷 modelId 不应用(本地意图优先);
   //    也是"连选合并"的载体 —— 单飞循环每轮取最新 pending,旧值绝不出网,写天然串行无倒序。
   //  - inflight:单飞闸(同会话同时至多一个 PATCH 在途)。
+  const terminalFillRef = useRef<Map<string, { endedAt: number; serverSettled: boolean }>>(
+    new Map(),
+  );
   const modelSyncRef = useRef<Map<string, { floor: number; pending?: string; inflight: boolean }>>(
     new Map(),
   );
@@ -535,12 +539,14 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     (metas: SessionMeta[]): Session[] => {
       if (!user) return [];
       return metas.map((m) => {
+        const payloadUpdatedAt = m.updatedAt;
+        const confirmed = confirmedMetadata.current.get(m.id);
+        if (confirmed && m.updatedAt < confirmed.updatedAt) m = { ...m, ...confirmed };
+        else confirmedMetadata.current.set(m.id, { id: m.id, title: m.title, pinned: m.pinned === true, updatedAt: m.updatedAt });
         const pendingTitle = pendingTitles.current.get(m.id);
-        const confirmed = confirmedTitles.current.get(m.id);
         if (pendingTitle !== undefined) m = { ...m, title: pendingTitle };
-        else if (confirmed && m.updatedAt < confirmed.updatedAt) m = { ...m, title: confirmed.title };
         const s = metaToSession(m, user.id);
-        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, payloadUpdatedAt)) {
           const { modelId: _stale, ...rest } = s;
           return rest;
         }
@@ -561,6 +567,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       try {
         const metas = await api.listSessions(cbRef.current.authSession);
         if (!isCurrent()) return false;
+        for (const m of metas) {
+          if (m.runState !== "running") {
+            const fill = terminalFillRef.current.get(m.id);
+            if (fill) fill.serverSettled = true;
+          }
+        }
         const server = mapListMetas(metas);
         setSessions((cur) => upsertSessions(cur, server, true));
         if (opts?.initial) {
@@ -633,6 +645,16 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     selectSession(sessions[0].id);
   }, [demo, auth, holdAutoSelect, activeId, sessions, selectSession]);
 
+  const applySessionMetadata = useCallback((metadata: SessionMetadataSnapshot) => {
+    if (!cbRef.current.user || cbRef.current.demo) return;
+    const previous = confirmedMetadata.current.get(metadata.id);
+    if (previous && previous.updatedAt > metadata.updatedAt) return;
+    confirmedMetadata.current.set(metadata.id, metadata);
+    setSessions(current => current.map(session => session.id === metadata.id
+      ? { ...session, title: metadata.title, pinned: metadata.pinned, updatedAt: new Date(metadata.updatedAt).toISOString() } : session));
+    cbRef.current.sockRef.current?.renameSession(metadata.id, metadata.title);
+  }, []);
+
   // rename 一次收口三个持有方:App state(侧栏)+ WS service/IndexedDB + 服务端 canonical。
   // 此前只改 App state → listSessions server-wins 下次直接盖回旧标题(纯本地幻觉)。
   const renameSessionPrompt = async (s: Session) => {
@@ -643,13 +665,14 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       cbRef.current.sockRef.current?.renameSession(s.id, t);
       // 60s 轮询 / 窗口 focus 重拉随时可能在飞：PATCH 落地前带回的旧标题曾把乐观标题盖回去，
       // 用户看到「第一次重命名没生效」(#1240)。落地前钉住本地标题，落地后按服务端 updatedAt 记为已确认，
-      // 更早的列表快照(updatedAt 更小)由 mapListMetas 挡住。
+      // 更早的列表快照(updatedAt 更小)由 mapListMetas 的 confirmed 分支挡住。
       pendingTitles.current.set(s.id, t);
       try {
         const res = await api.patchSessionTitle(cbRef.current.authSession, s.id, t);
-        const prev = confirmedTitles.current.get(s.id);
+        const prev = confirmedMetadata.current.get(s.id);
         if (typeof res?.updatedAt === "number" && (!prev || prev.updatedAt <= res.updatedAt)) {
-          confirmedTitles.current.set(s.id, { title: t, updatedAt: res.updatedAt });
+          // 标题 PATCH 只为标题背书：置顶沿用最近一次已确认的值，没有才用本地值。
+          confirmedMetadata.current.set(s.id, { id: s.id, title: t, pinned: prev ? prev.pinned : s.pinned === true, updatedAt: res.updatedAt });
         }
         if (pendingTitles.current.get(s.id) === t) pendingTitles.current.delete(s.id);
       } catch (e) {
@@ -901,22 +924,39 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const applySessionTerminal = useCallback(
     (
       sessId: string,
-      terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+      terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt?: number } | null,
     ) => {
+      let allowEndedAtFill = false;
+      if (terminal?.endedAt != null) {
+        const prev = terminalFillRef.current.get(sessId);
+        if (!prev || terminal.endedAt > prev.endedAt) {
+          terminalFillRef.current.set(sessId, { endedAt: terminal.endedAt, serverSettled: false });
+          allowEndedAtFill = true;
+        } else {
+          allowEndedAtFill = !prev.serverSettled;
+        }
+      }
       setSessions((c) =>
         c.map((x) => {
           if (x.id !== sessId) return x;
           const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
           const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
+          // 侧栏用时 = createdAt → lastAt。本 tab 刚跑完的回合，列表里的 lastAt 可能还停在回合开始前，
+          // 临时补齐防回跳；一旦服务端权威 idle 列表到达校正（serverSettled），重放不再覆盖权威 lastAt。
+          const ended =
+            allowEndedAtFill && terminal?.endedAt != null && terminal.endedAt > (x.lastAt ?? 0)
+              ? { lastAt: terminal.endedAt }
+              : null;
           if (
             x.runState === "idle" &&
             x.lastOutcome === nextOutcome &&
             x.lastErrorCode === nextCode
           ) {
-            return x;
+            return ended ? { ...x, ...ended } : x;
           }
           return {
             ...x,
+            ...ended,
             runState: "idle" as const,
             ...(terminal
               ? {
@@ -937,12 +977,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     listGenerationRef.current += 1;
     listRefreshInflightRef.current = null;
     loadMoreInflightRef.current = false;
+    confirmedMetadata.current.clear();
     pendingTitles.current.clear();
-    confirmedTitles.current.clear();
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
     setHistoryErrorBySession(new Map());
+    terminalFillRef.current.clear();
     modelSyncRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     nextCursorRef.current = undefined;
@@ -978,6 +1019,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     loadArchivedSessions,
     loadingArchived,
     searchSessionMessages,
+    applySessionMetadata,
     applySessionTerminal,
     reset,
     serverListSettled,

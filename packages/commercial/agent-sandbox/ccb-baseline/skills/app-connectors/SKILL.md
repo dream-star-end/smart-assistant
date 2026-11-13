@@ -6,10 +6,10 @@ tags: [plugins, github, knowledge-planet, weibo, literature-db, ths]
 
 # app-connectors 插件(CLI)
 
-访问用户在管理中心绑定的第三方账号。对用户一律把这些统称为「插件」，绑定 / 授权入口是「管理中心 → 插件」
-（不要换成别的叫法，界面上只有「插件」）。平台在服务端托管全部凭据与浏览器登录状态：
-- API 插件（邮箱、WebDAV、Notion、GitHub、飞书、B 站公开数据 bili）用 `oc-connect`；
-- 浏览器与受管插件（知识星球、微博、知乎、B 站账号 bili-account、抖音 douyin、文献数据库 literature-db）用 `oc-plugin`。
+访问用户在管理中心绑定的第三方账号，对用户统称「插件」，连接入口为「管理中心 → 插件」。
+先用 `oc-plugin list → describe → call` 发现并调用当前账号实际可用的插件；不要用另一版本的目录猜当前能力。
+微博、知识星球、GitHub、文献数据库支持统一入口；商业目录还可能包含邮箱、WebDAV、Notion、飞书、知乎、B 站与抖音，均以 list/describe 为准。平台在服务端托管凭据与浏览器登录状态。
+同花顺在用户容器本机运行：先读取 `ths` 技能，再按其中命令调用，不能把它当远程账号。
 
 **不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/插件
 只有一个可用账号时直接调用。仅在多个账号必须消歧、未安装或未授权时才请用户介入。
@@ -152,14 +152,6 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 - **错误码**：`LITERATURE_ARTIFACT_CAPACITY` = 暂存已满（不是限流），先让用户保存已就绪的 PDF 或等较早的文件到期再下；`LITERATURE_NO_ACCESS` = 该篇不在订阅范围或机构通道拒绝访问，换一篇，账号无需重新绑定；`LITERATURE_UPSTREAM_RATE_LIMITED` = 文献源限流，等几分钟再试；`LITERATURE_UPSTREAM_CHALLENGE` = 人机验证/风控，不要自动重试；`LITERATURE_UPSTREAM_CHANGED` = 页面无法识别，**不是零结果**，可重试一次。
 - **串行下载**：下载多篇文献或遇到 `RATE_LIMITED`（账号正忙）/ `TIMEOUT` 时，**必须一篇一篇串行下载，每篇间隔 20-30 秒**，不要并发或紧挨着连续连打。
 
-### 连接与恢复
-
-两个插件都只在 AI 市场，用户没装时先引导去安装：
-- `bili`：公开数据，免登录、只读。安装后在 管理中心 → 插件 点「启用」。`oc-connect call bili <action>`：
-  search / video / rank / popular / comments / danmaku。评论要 aid、弹幕要 cid，先调 video 拿；参数看 `oc-connect describe bili <action>`。
-- `bili-account`：字幕、收藏夹、观看历史，要用 B 站 App 扫码登录（同微博的扫码流程）。用 `oc-plugin call bili-account <action>`。
-- 报 UPSTREAM_RATE_LIMITED（B 站风控）时如实告诉用户稍后再试，不要连续重试，也不要索要 cookie。
-
 ### 抖音（douyin）
 
 只在 AI 市场，用户没装时先引导去安装；装好后在 管理中心 → 插件 → 抖音 用抖音 App 扫码登录个人账号（二维码约 1 分钟才出现）。
@@ -167,34 +159,12 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 - 这是浏览器自动化，不在抖音官方开放能力之内，可能触发账号风控。不要连续反复调用，也不要索要 cookie、短信或验证码。
 - RELINK_REQUIRED / LOGIN_EXPIRED_ACCOUNT：请用户到 管理中心 → 插件 → 抖音 重新扫码。DOUYIN_VERIFICATION_REQUIRED：请用户先在手机抖音完成本人验证再扫码。DOUYIN_UPSTREAM_CHALLENGE：抖音触发风控，如实告知、立即停止，不要重试或换动作绕过。
 
-## 各 provider 一览
+### 连接与恢复
 
-| provider | 读 | 写(需确认) |
-|---|---|---|
-| webdav | list_dir / get_file | put_file |
-| imap | list_mailboxes / search_messages / get_message | send_email |
-| notion | search / get_page | create_page |
-| github | search_issues / get_issue | (v1 只读) |
-| feishu | get_doc / list_calendar_events | create_calendar_event / send_message |
-
-用户没绑定对应 API 应用时，引导到 管理中心 → 插件；知识星球或微博未安装时先引导到 AI 市场安装，
-安装后分别使用微信或微博客户端扫码授权。二维码在对话框内看不到时，引导用户打开界面提供的独立
-网页链接；不要把临时二维码图片当永久链接。不要空转重试，也不要索要 cookie/token。
-
-## 市场 API 插件(以 GNSS-X 地学工具为例)
-
-用户从 AI 市场安装并在「管理中心 → 插件」填好 Token 后，`oc-connect list` 才会出现 `gnss-x`。
-它提供 60 个只读的地学计算/查询 action(时间系统、坐标、轨道、电离层、空间天气、大气、重力、
-海洋、GNSS、测量平差、电波传播)，action 名就是 GNSS-X 的工具名。
-
-- 先 `oc-connect describe gnss-x <action>` 看参数，再 `echo '<JSON>' | oc-connect call gnss-x <action>`；
-  矩阵、剖面、坐标对象等复杂输入按说明以 **JSON 字符串**传。
-- 结果是 JSON-RPC 外壳：数据在 `result`(通常是 `result.content[].text`)；出现 `error` 就如实转告。
-- `UPSTREAM_AUTH_FAILED`(HTTP 401)或 `error.code=-32001`：Token 无效、被撤销或该工具配额用完。
-  请用户到 https://mcp.gnss-x.ac.cn 「用户」页检查 Token 和剩余配额，必要时在「管理中心 → 插件」
-  重新填写；不要自动重试。用户还没有 Token 时，说明需要他本人去该网站注册并领取，平台不代领。
-- `RESULT_TOO_LARGE`：缩小时间/高度范围、增大步长或减少条数后重试。
-- 每次调用都消耗用户在 GNSS-X 的配额，只调用回答问题所需的 action，不要批量试探。
+尚未安装的微博、知识星球或文献数据库插件先去 AI 市场安装，再到管理中心连接。
+微博/知识星球扫码时保留条款接受步骤；文献数据库使用私密表单。
+二维码看不到时使用界面提供的独立网页链接，不把临时二维码当永久链接。
+`PLUGIN_UNAVAILABLE` 表示此插件已下架：不要引导重新启用、安装、授权或绕过产品限制。
 
 ## 工具调用纪律(重要)
 

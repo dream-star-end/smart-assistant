@@ -3,7 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { AttachChip, Composer, middleTruncate } from "./Composer";
+import { Composer } from "./Composer";
+import { AttachChip, middleTruncate } from "./ComposerAttachChip";
 import type { MediaRef } from "../lib/chat/frames";
 
 afterEach(cleanup);
@@ -117,7 +118,7 @@ describe("F1b 剪贴板图片直接上传", () => {
 
     expect(event.defaultPrevented).toBe(true);
     await waitFor(() => expect(onUpload).toHaveBeenCalledTimes(1));
-    expect(onUpload).toHaveBeenCalledWith(file);
+    expect(onUpload).toHaveBeenCalledWith(file, expect.any(Function));
     expect(screen.getByRole("button", { name: "移除 paste-probe.png" })).toBeInTheDocument();
   });
 
@@ -136,7 +137,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     });
 
     expect(event.defaultPrevented).toBe(true);
-    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file));
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file, expect.any(Function)));
   });
 
   test("图片与文本/HTML 混合粘贴时只附图，不污染已有正文", async () => {
@@ -160,7 +161,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     });
 
     expect(event.defaultPrevented).toBe(true);
-    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file));
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file, expect.any(Function)));
     expect(textarea).toHaveValue("保留这段正文");
   });
 
@@ -186,7 +187,7 @@ describe("F1b 剪贴板图片直接上传", () => {
 });
 
 describe("Composer 目标 chip", () => {
-  test("有可见目标时在输入框上方渲染 chip，点击打开对话框", () => {
+  test("有可见目标时在输入框上方渲染 chip，点击打开对话框", async () => {
     render(
       <Composer
         onSend={() => {}}
@@ -200,7 +201,7 @@ describe("Composer 目标 chip", () => {
     expect(chip).toHaveTextContent("迁移并验证");
     expect(chip).toHaveTextContent("已启用");
     fireEvent.click(chip);
-    expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
+    expect(await screen.findByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
   });
 
   test("保存响应把 goal 传入后 chip 立即出现；无目标不渲染", () => {
@@ -345,7 +346,7 @@ describe("AttachChip 触控尺寸、失败原因与文件名截断", () => {
   test("移除 / 重试在触屏下 44px;失败原因就地可见;文件名中段截断保留扩展名", () => {
     render(<AttachChip a={errored} onRemove={() => {}} onRetry={() => {}} />);
     expect(screen.getByRole("button", { name: `移除 ${errored.name}` })).toHaveClass("[@media(hover:none)]:size-11");
-    expect(screen.getByLabelText(`重试上传 ${errored.name}`)).toHaveClass("[@media(hover:none)]:min-h-11");
+    expect(screen.getByLabelText(`继续上传 ${errored.name}`)).toHaveClass("[@media(hover:none)]:min-h-11");
     expect(screen.getByRole("status")).toHaveTextContent("文件超过 20 MB");
     const shown = screen.getByText(/…/).textContent ?? "";
     expect(shown.endsWith(".sketch")).toBe(true);
@@ -390,7 +391,7 @@ describe("发送键禁用原因可见(C-10)", () => {
     const file = new File(["x"], "fail.txt", { type: "text/plain" });
     Object.defineProperty(input, "files", { value: [file], configurable: true });
     fireEvent.change(input);
-    await waitFor(() => expect(screen.getByLabelText("重试上传 fail.txt")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("继续上传 fail.txt")).toBeInTheDocument());
     expect(screen.getByTestId("composer-send-blocked-reason")).toHaveTextContent("有附件上传失败");
     fireEvent.click(screen.getByRole("button", { name: "移除 fail.txt" }));
     expect(screen.queryByTestId("composer-send-blocked-reason")).toBeNull();
@@ -415,7 +416,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRetry={onRetry}
       />,
     );
-    const btn = screen.getByLabelText("重试上传 report.pdf");
+    const btn = screen.getByLabelText("继续上传 report.pdf");
     fireEvent.click(btn);
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
@@ -427,7 +428,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRemove={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("重试上传 a.txt")).toBeNull();
+    expect(screen.queryByLabelText("继续上传 a.txt")).toBeNull();
   });
 
   test("done 态不显示「重试」", () => {
@@ -437,7 +438,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRemove={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("重试上传 b.txt")).toBeNull();
+    expect(screen.queryByLabelText("继续上传 b.txt")).toBeNull();
   });
 
   test("error 态但未传 onRetry（如无持有 File）→ 不渲染重试按钮", () => {
@@ -447,7 +448,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRemove={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("重试上传 c.txt")).toBeNull();
+    expect(screen.queryByLabelText("继续上传 c.txt")).toBeNull();
   });
 });
 
@@ -526,14 +527,14 @@ describe("附件 error 态不得静默发送", () => {
     });
     fireEvent(screen.getByPlaceholderText("给从简发消息…"), event);
 
-    await waitFor(() => expect(screen.getByLabelText("重试上传 fail-probe.png")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("继续上传 fail-probe.png")).toBeInTheDocument());
     fireEvent.change(screen.getByPlaceholderText("给从简发消息…"), { target: { value: "带附件发送" } });
     const send = screen.getByRole("button", { name: "发送" });
     expect(send).toBeDisabled();
     expect(send).toHaveAttribute("title", "有附件上传失败，请重试或移除后再发送");
     fireEvent.click(send);
     expect(onSend).not.toHaveBeenCalled();
-    expect(screen.getByLabelText("重试上传 fail-probe.png")).toBeInTheDocument();
+    expect(screen.getByLabelText("继续上传 fail-probe.png")).toBeInTheDocument();
   });
 });
 
@@ -550,11 +551,11 @@ describe("附件合计 2GiB", () => {
     render(<Composer onSend={onSend} onUpload={onUpload} />);
     fireEvent.change(screen.getByPlaceholderText("给从简发消息…"), { target: { value: "请看附件" } });
     const shell = screen.getByTestId("composer-shell");
-    const big = 1100 * 1024 * 1024;
+    const mib = 1024 * 1024;
     fireEvent.drop(shell, {
       dataTransfer: {
         types: ["Files"],
-        files: [fileWithSize("a.rar", big), fileWithSize("b.rar", big)],
+        files: [fileWithSize("a.rar", 800 * mib), fileWithSize("b.rar", 800 * mib), fileWithSize("c.rar", 600 * mib)],
         dropEffect: "copy",
         items: [],
       },
@@ -574,20 +575,23 @@ describe("附件合计 2GiB", () => {
     const onUpload = vi.fn(async () => ({ kind: "file", url: "/api/media/part" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
     const shell = screen.getByTestId("composer-shell");
-    const part = 1500 * 1024 * 1024;
-    const drop = (name: string) => ({
+    const mib = 1024 * 1024;
+    const drop = (files: File[]) => ({
       dataTransfer: {
         types: ["Files"],
-        files: [fileWithSize(name, part)],
+        files,
         dropEffect: "copy",
         items: [],
       },
     });
     act(() => {
-      fireEvent.drop(shell, drop("first.rar"));
-      fireEvent.drop(shell, drop("second.rar"));
+      fireEvent.drop(shell, drop([fileWithSize("first.rar", 800 * mib)]));
+      fireEvent.drop(shell, drop([fileWithSize("second.rar", 800 * mib), fileWithSize("third.rar", 600 * mib)]));
     });
     expect(onUpload).toHaveBeenCalledTimes(1);
-    expect(screen.getByTestId("composer-upload-total-limit")).toHaveTextContent("3000MB");
+    const notice = screen.getByTestId("composer-upload-total-limit");
+    expect(notice).toHaveTextContent("2200MB");
+    expect(notice).toHaveTextContent("2048MB");
+    expect(notice.textContent ?? "").not.toContain("请重试");
   });
 });

@@ -3,6 +3,7 @@
 # The future author executes under normal train/test mutex. No production roots.
 set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODEL_POLICY_FIXTURE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEPLOY_SCRIPT="${DEPLOY_SCRIPT:-$SCRIPT_DIR/deploy-v5-selfhost.sh}"
 POLICY_SCRIPT="${POLICY_SCRIPT:-$SCRIPT_DIR/lib/v5-selfhost-release-policy.sh}"
 MASTER_SCRIPT="${MASTER_SCRIPT:-$SCRIPT_DIR/v5-selfhost-master-release-lib.sh}"
@@ -38,7 +39,7 @@ out=Path(sys.argv[1]);sources=list(map(Path,sys.argv[2:]))
 groups=[
  ['activate_tuple_joint','cmd_cutover','cutover_gate_against_release','cutover_clog','cutover_fail','cutover_persist_phase_or_compensate','selfhost_policy_get','gate_fail_policy','stay_window_sec','gate_fail_drill_armed'],
  ['survivor_state_phase','release_policy_enabled','release_policy_guard_owner','release_policy_flip_live','release_policy_restore_live_before','release_policy_rejected_phase','release_policy_bind_official_train_request','release_policy_context_present'],
- ['atomic_flip_live_symlink','write_prev_release_file'],
+ ['atomic_flip_live_symlink','write_prev_release_file','release_artifact_digest'],
  ['policy_drill_adapter']]
 manifest=[]
 for path,names in zip(sources,groups):
@@ -71,6 +72,8 @@ EXTRACT
 export OC_HOTCFG_PLATFORM_ROOT="$WORK/platform" OC_HOTCFG_RELEASES_ROOT="$WORK/runtime" OC_HOTCFG_ENV_FILE="$WORK/tuple.env" OC_HOTCFG_HISTORY="$WORK/history"
 export LOSSLESS_TURN_TAPE_RUNTIME_BATCHING=1
 source "$RUNTIME_LIB"
+source "$SCRIPT_DIR/lib/v5-selfhost-model-policy.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.sh"
 for file in "$WORK/functions/"*.sh; do source "$file"; done
 
 # Transparent observer: exact Bash-declared real function body, name alone is
@@ -91,6 +94,8 @@ ARGS
 # Runtime/service/receipt boundaries, never saga/caller copies. Every mutation
 # intent is a fixture trace entry; no systemctl, SQL, network, model or deploy.
 trace() { printf '%s\n' "$*" >>"$OUTER_TRACE"; }
+# Root-private opt-in is absent in this policy-only fixture.
+cc5_activation_py() { trace "cc5-carrier:$1"; }
 log() { :; }; mlog() { :; }; die() { trace "UNEXPECTED_DIE:$*"; return 90; }
 source_commit() { printf '%040d\n' 0 | tr 0 2; }
 cutover_expected_source_commit() { source_commit; }
@@ -104,6 +109,11 @@ gate_cutover_migrations() { CUTOVER_HAS_MIGRATION=0; trace migration-read; }
 backup_installed_units_for_cutover() { printf -v "$1" '%s' "$WORK/backup"; trace backup; }
 cutover_arm_survivor() { CUTOVER_SURVIVOR_ARMED=1; trace arm-survivor; }
 cutover_persist_phase() { CUTOVER_PHASE="$1"; printf 'phase=%s\n' "$1" >"$SURVIVOR_STATE"; trace "phase:$1"; }
+install_host_log_policy_from_snapshot() {
+  [[ "$1" == "$DEPLOY_BUILT_RELEASE" && "$2" == "$WORK/units" ]] || return 92
+  trace host-log-install
+  [[ "$OUTER_CASE" != host-policy-failure ]] || return 43
+}
 install_unit() { trace install-unit; }
 install_egress_slot_units_from() { trace install-slot; }
 systemctl() { trace "service-boundary:$*"; }
@@ -128,6 +138,7 @@ release_policy_keep_failed() { trace "KEEP:$3"; return "$3"; }
 release_policy_finalize_forward() { trace UNEXPECTED_FINALIZE; return 97; }
 oc_hotcfg_gc() { trace UNEXPECTED_GC; return 97; }
 wo_gc_buckets() { trace UNEXPECTED_GC; return 97; }
+web_assets_pool_gc() { trace UNEXPECTED_GC; return 97; }
 egress_slot_unit() { printf 'fixture-egress-%s.%s' "$1" "$2"; }
 # cmd_cutover's external master-GC script must never resolve to a real script.
 # The caller body is unchanged: its SCRIPT_DIR dependency is sandbox-owned.
@@ -174,6 +185,21 @@ setup_case() {
   DEPLOY_BUILT_RELEASE="$MASTER_RELEASES_ROOT/rel-new";OLD_REL="$MASTER_RELEASES_ROOT/rel-old"
   MASTER_LIVE_LINK="$OUTER_CASE_DIR/master-live";ln -s "$OLD_REL" "$MASTER_LIVE_LINK"
   for master in "$OLD_REL" "$DEPLOY_BUILT_RELEASE";do printf '{"capabilities":["lossless-turn-runtime-batch-v1"],"runtimeCapabilities":[]}\n' >"$master/deploy/v5/release-metadata.json";done
+  # These are current forward artifacts. Keep the real generation admission
+  # active, with complete policy files, rather than stubbing the new E1 guard.
+  for master in "$OLD_REL" "$DEPLOY_BUILT_RELEASE";do
+    for relative in deploy/v5-selfhost/model-availability.json scripts/lib/selfhost-model-policy.mjs packages/commercial/src/billing/modelAvailability.ts;do
+      mkdir -p "$(dirname "$master/$relative")"
+      cp "$MODEL_POLICY_FIXTURE_ROOT/$relative" "$master/$relative"
+    done
+    model_digest="$(release_artifact_digest "$master")"
+    model_metadata="$(sha256sum "$master/deploy/v5/release-metadata.json" | awk '{print $1}')"
+    model_source="$(source_commit)"
+    [[ "$master" != "$OLD_REL" ]] || model_source=1111111111111111111111111111111111111111
+    jq -cn --arg sha "$model_source" --arg artifact "$model_digest" --arg metadata "$model_metadata" \
+      '{schemaVersion:2,sourceCommit:$sha,builtAt:"20261102-000000",artifactSha256:$artifact,metadataSha256:$metadata,modelAvailabilityPolicyGeneration:1}' \
+      >"$master/.complete"
+  done
   mkdir -p "$OC_HOTCFG_PLATFORM_ROOT/bundles/p521-old" "$OC_HOTCFG_PLATFORM_ROOT/bundles/p521-new" "$WORK/units" "$WORK/backup"
   command rm -f "$OC_HOTCFG_PLATFORM_ROOT/current";ln -s bundles/p521-old "$OC_HOTCFG_PLATFORM_ROOT/current"
   V5_ENV="$OUTER_CASE_DIR/tuple.env";printf 'OC_RUNTIME_IMAGE=img:OLD\nOC_RUNTIME_IMAGE_ID=sha256:OLD\nOC_RUNTIME_RELEASE=/rel/OLD\nOC_PLATFORM_BUNDLE=\n' >"$V5_ENV"
@@ -203,12 +229,28 @@ import json,sys
 c=json.load(open(sys.argv[1]));assert c['argc']==19 and c['arg19']=='release_policy_saga_adapter'
 assert c['liveBefore']==sys.argv[2],'outer flipped live before actual saga'
 assert c['master']==sys.argv[3] and c['previous']==sys.argv[2]
-assert c['extraApply'].startswith('release_policy_flip_live ') and c['extraRevert'].startswith('release_policy_restore_live_before ')
+assert c['extraApply'].startswith('cc5_activation_extra_apply ') and c['extraRevert'].startswith('cc5_activation_extra_revert ')
 CHECK_ARGS
   [[ "$(readlink -f "$MASTER_LIVE_LINK")" == "$DEPLOY_BUILT_RELEASE" ]]
   grep -qx "drain:$DEPLOY_BUILT_RELEASE" "$OUTER_TRACE"
+  python3 - "$OUTER_TRACE" "$OLD_REL" <<'ORDER'
+from pathlib import Path
+import sys
+lines=Path(sys.argv[1]).read_text().splitlines()
+assert lines.index('idle:'+sys.argv[2]) < lines.index('phase:mutated') < lines.index('host-log-install') < lines.index('install-unit')
+ORDER
   printf 'PASS actual-outer rc=%s no-compensation arg19-and-real-hook\n' "$want"
 done
+
+# Actual caller refuses before the first unit install when policy installation fails.
+setup_case host-policy-failure;rc=0
+cmd_cutover >"$OUTER_CASE_DIR/caller.log" 2>&1 || rc=$?
+[[ "$rc" == 97 ]]
+grep -qx host-log-install "$OUTER_TRACE"
+grep -qx OUTER_COMPENSATE "$OUTER_TRACE"
+! grep -Eq 'install-unit|install-slot|service-boundary:|runtime-restart' "$OUTER_TRACE"
+[[ "$(readlink -f "$MASTER_LIVE_LINK")" == "$OLD_REL" ]]
+printf 'PASS actual-host-policy refuses-before-unit-install\n'
 
 # Direct actual gate wrapper: global policy opts in, legacy stay must not turn
 # a failed raw gate into false0; keep a legacy control using actual policy getter.
@@ -240,7 +282,7 @@ cp "$V5_ENV" "$V5_ENV.before";cp "$OC_HOTCFG_HISTORY" "$OC_HOTCFG_HISTORY.before
 before_live="$(readlink "$MASTER_LIVE_LINK")";before_current="$(readlink "$OC_HOTCFG_PLATFORM_ROOT/current")"
 rc=0;cmd_cutover >"$OUTER_CASE_DIR/caller.log" 2>&1 || rc=$?
 [[ "$rc" == 0 ]];! grep -Eq 'command not found|unbound variable' "$OUTER_CASE_DIR/caller.log"
-! grep -Eq 'phase:|arm-survivor|install-unit|install-slot|service-boundary:|grace|overlay-seed|runtime-restart|guard-install|outer-prepare|OUTER_COMPENSATE|FINISH_COMPENSATE|LEGACY_KEEP|KEEP:|UNEXPECTED_|FORBIDDEN_' "$OUTER_TRACE"
+! grep -Eq 'phase:|arm-survivor|host-log-install|install-unit|install-slot|service-boundary:|grace|overlay-seed|runtime-restart|guard-install|outer-prepare|OUTER_COMPENSATE|FINISH_COMPENSATE|LEGACY_KEEP|KEEP:|UNEXPECTED_|FORBIDDEN_' "$OUTER_TRACE"
 [[ ! -e "$SURVIVOR_STATE" && ! -e "$RELEASE_POLICY_CONTEXT" ]]
 [[ "$(readlink "$MASTER_LIVE_LINK")" == "$before_live" && "$(readlink "$OC_HOTCFG_PLATFORM_ROOT/current")" == "$before_current" ]]
 cmp -s "$V5_ENV" "$V5_ENV.before";cmp -s "$OC_HOTCFG_HISTORY" "$OC_HOTCFG_HISTORY.before"

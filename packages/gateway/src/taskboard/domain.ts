@@ -269,6 +269,12 @@ export interface PipelineStage {
 }
 
 export interface TicketRun {
+  /** Read-only response projection from actual usage/live runner; never persisted. */
+  actualModels?: string[]
+  stopRequested?: boolean
+  /** The owning promise tree is still settling, even after lease reaping. */
+  settling?: boolean
+  preview?: { text: string; toolNames: string[]; lastActivityAt: number | null }
   id: string
   ticketId: string
   stageId: string

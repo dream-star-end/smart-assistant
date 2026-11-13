@@ -54,6 +54,7 @@ describe('automatic turn recovery policy', () => {
       assert.equal(supportsAutomaticTurnRecovery(code), true, code)
     }
     for (const code of [
+      'antigravity_start_observation_failed',
       'auth_error',
       'platform_credential_expired',
       'box_capacity_held',

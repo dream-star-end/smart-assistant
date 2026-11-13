@@ -261,6 +261,7 @@ export function checkSnapshotCapabilities(snapshot: {
     providerId: string | null;
     upstreamModelId?: string | null;
     state: string;
+    placement?: string;
     capabilityProfile: {
       supportsVision: boolean;
       reasoning: { supported: readonly string[] };
@@ -270,6 +271,8 @@ export function checkSnapshotCapabilities(snapshot: {
   const violations: string[] = [];
   for (const e of snapshot.entries) {
     if (e.state !== "active" || e.engine !== "ccb") continue;
+    // Remote-pool rows run on their pool node through a lane, never through this proxy.
+    if (e.placement === "remote_pool") continue;
     let route: UpstreamRoute;
     try {
       route = selectUpstreamRoute(e.modelId, {

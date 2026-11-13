@@ -56,13 +56,16 @@ import { addRelation, listRelations, removeRelation } from './db/relations.js'
 import {
   acquireLease,
   getActiveLease,
+  getLatestRunMetadata,
   getRun,
   insertRun,
   listRuns,
-  releaseLease,
   updateRun,
 } from './db/runs.js'
-import { seedDefaultPipelines } from './db/seed.js'
+import { assertTaskboardStagesRunnable, TaskboardPreflightError } from './stagePreflight.js'
+import { hasPendingTaskboardExecution } from './executionState.js'
+import { listBuiltinPipelineTemplates, seedDefaultPipelines } from './db/seed.js'
+import { listTicketTimelinePage } from './db/timeline.js'
 import {
   type TaskboardSettings,
   type TaskboardUsage,
@@ -116,11 +119,13 @@ import {
   publicStageRef,
 } from './moveIntent.js'
 import { hasOpenBlockers, listOpenBlockers } from './patrol.js'
+import { taskboardRunControls } from './runControl.js'
 import { dispatchProjectMemory } from './projectMemoryHttp.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 import {
   type BoardAgent,
   type TaskboardHttpContext,
+  enrichTaskboardRuns,
   sendJson,
   sendError,
   asString,
@@ -138,6 +143,7 @@ import {
   handlePatchPipeline,
   handleListStages,
   assertTemplatesValidForApply,
+  TaskboardTemplateChangedError,
   handleCreateStage,
   handleGetStage,
   handleReorderStages,
@@ -179,6 +185,7 @@ const TICKET_ACTIONS = [
   'cancel',
   'comment',
   'patrol',
+  'stop',
   'move',
 ] as const
 type TicketAction = (typeof TICKET_ACTIONS)[number]
@@ -549,6 +556,8 @@ function recordAudit(
 }
 
 function mapHttpError(res: ServerResponse, err: unknown): boolean {
+  if (err instanceof TaskboardTemplateChangedError) { sendError(res, 409, err.message, { code: 'template_configuration_changed' }); return true }
+  if (err instanceof TaskboardPreflightError) { sendError(res, err.issue.status, err.message, { code: err.issue.code }); return true }
   if (err instanceof BodyTooLargeError) {
     sendError(res, 413, 'payload too large')
     return true
@@ -771,6 +780,7 @@ async function dispatch(
         actor,
         idOrIdent,
         sub as TicketCollection,
+        ctx,
       )
     }
     if ((TICKET_ACTIONS as readonly string[]).includes(sub)) {
@@ -782,6 +792,7 @@ async function dispatch(
         actor,
         idOrIdent,
         sub as TicketAction,
+        ctx,
       )
     }
     return sendError(res, 404, 'not found', { code: 'not_found' })
@@ -790,7 +801,7 @@ async function dispatch(
   const ticketItem = path.match(/^\/api\/board\/tickets\/([^/]+)$/)
   if (ticketItem) {
     const idOrIdent = decodeURIComponent(ticketItem[1])
-    if (method === 'GET') return handleGetTicket(res, url, db, idOrIdent)
+    if (method === 'GET') return handleGetTicket(res, url, db, idOrIdent, ctx)
     if (method === 'PATCH') {
       return handlePatchTicket(res, await readJsonBody(req), db, actor, idOrIdent)
     }
@@ -844,7 +855,7 @@ async function dispatch(
 
   const runItem = path.match(/^\/api\/board\/runs\/([^/]+)$/)
   if (runItem) {
-    if (method === 'GET') return handleGetRun(res, db, decodeURIComponent(runItem[1]))
+    if (method === 'GET') return handleGetRun(res, db, decodeURIComponent(runItem[1]), ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -928,13 +939,18 @@ async function handleCreateProject(
   const name = asString(body.name)
   if (!key || !name) throw new TaskboardValidationError('key and name are required')
   const templateIds = asStringArray(body.templateIds)
-  if (actor !== 'human' && templateIds !== undefined && templateIds.length > 0) {
+  const executionAgentId = asNullableString(body.executionAgentId)?.trim() || null
+  if (actor !== 'human' && (Object.hasOwn(body, 'executionAgentId') || (templateIds !== undefined && templateIds.length > 0))) {
     sendError(res, 403, 'forbidden', { code: 'forbidden' })
     return
   }
-  if (templateIds?.length) await assertTemplatesValidForApply(db, templateIds, ctx)
+  const options = { executionAgentId }
+  const selectedTemplates = templateIds ?? listBuiltinPipelineTemplates().map((template) => template.id)
+  const validated = actor === 'human' && selectedTemplates.length > 0
+    ? await assertTemplatesValidForApply(db, selectedTemplates, ctx, options) : null
   try {
     const created = db.transaction(() => {
+      validated?.assertUnchanged()
       const project = createProject(db, {
         key,
         name,
@@ -944,9 +960,9 @@ async function handleCreateProject(
         labels: asStringArray(body.labels) ?? [],
       })
       if (templateIds === undefined) {
-        seedDefaultPipelines(db, project.id)
+        seedDefaultPipelines(db, project.id, undefined, options)
       } else if (templateIds.length > 0) {
-        applyTemplates(db, project.id, templateIds)
+        applyTemplates(db, project.id, validated?.templateIds ?? templateIds, options)
       }
       return project
     })()
@@ -1393,7 +1409,7 @@ function handleCreateTicket(
   sendJson(res, 201, { ok: true, ticket })
 }
 
-function handleGetTicket(res: ServerResponse, url: URL, db: TaskboardDb, idOrIdent: string): void {
+async function handleGetTicket(res: ServerResponse, url: URL, db: TaskboardDb, idOrIdent: string, ctx: TaskboardHttpContext): Promise<void> {
   const ticket = requireTicket(db, idOrIdent)
   const expand = (url.searchParams.get('expand') ?? '')
     .split(',')
@@ -1406,6 +1422,12 @@ function handleGetTicket(res: ServerResponse, url: URL, db: TaskboardDb, idOrIde
   }
   if (expand.includes('stage')) {
     extra.stage = ticket.stageId ? getStage(db, ticket.stageId) : null
+  }
+  if (expand.includes('execution')) {
+    const run = getActiveLease(db, ticket.id) ?? getLatestRunMetadata(db, ticket.id)
+    const execution = run ? { ...(await enrichTaskboardRuns(ctx, [run]))[0], outputMd: null, summary: null } : null
+    sendJson(res, 200, { ticket, ...extra, execution })
+    return
   }
   sendJson(res, 200, { ticket, ...extra })
 }
@@ -1443,6 +1465,7 @@ async function handleTicketCollection(
   actor: Actor,
   idOrIdent: string,
   collection: TicketCollection,
+  ctx: TaskboardHttpContext,
 ): Promise<void> {
   const ticket = requireTicket(db, idOrIdent)
   if (collection === 'runs') {
@@ -1459,7 +1482,7 @@ async function handleTicketCollection(
       limit: parseLimit(url),
       offset: parseOffset(url),
     })
-    return sendJson(res, 200, result)
+    return sendJson(res, 200, { ...result, items: await enrichTaskboardRuns(ctx, result.items) })
   }
   if (collection === 'relations') {
     if (method === 'GET') return sendJson(res, 200, { items: listRelations(db, ticket.id) })
@@ -1488,7 +1511,7 @@ async function handleTicketCollection(
     })
   }
   if (method !== 'GET') return sendError(res, 405, 'method not allowed')
-  return handleTimeline(res, url, db, ticket)
+  return handleTimeline(res, url, db, ticket, ctx)
 }
 
 function handleAddRelation(
@@ -1523,8 +1546,16 @@ function handleAddRelation(
   sendJson(res, 201, { ok: true, relation })
 }
 
-function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: Ticket): void {
+async function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: Ticket, ctx: TaskboardHttpContext): Promise<void> {
   const limit = parseLimit(url, 100, 500)
+  if (url.searchParams.get('window') === 'latest') {
+    const page = listTicketTimelinePage(db, ticket.id, { limit, before: url.searchParams.get('before'), ifHead: url.searchParams.get('ifHead') })
+    const runs = page.items.flatMap((item) => item.kind === 'run' ? [item.run] : [])
+    const enriched = await enrichTaskboardRuns(ctx, runs)
+    const byId = new Map(enriched.map((run) => [run.id, run]))
+    sendJson(res, 200, { ...page, items: page.items.map((item) => item.kind === 'run' ? { ...item, run: byId.get(item.run.id) ?? item.run } : item) })
+    return
+  }
   const comments = listComments(db, ticket.id, { limit: 500, offset: 0 })
   const activities = listActivities(db, ticket.id, { limit: 500, offset: 0 })
   const runs = listRuns(db, { ticketId: ticket.id, limit: 200, offset: 0 }).items
@@ -1546,20 +1577,32 @@ function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: 
     })),
   ]
   items.sort((a, b) => a.createdAt - b.createdAt || a.kind.localeCompare(b.kind))
-  sendJson(res, 200, { items: items.slice(0, limit) })
+  const window = items.slice(0, limit)
+  const enriched = await enrichTaskboardRuns(ctx, window.flatMap((item) => item.kind === 'run' ? [item.run] : []))
+  const byId = new Map(enriched.map((run) => [run.id, run]))
+  sendJson(res, 200, { items: window.map((item) => item.kind === 'run' ? { ...item, run: byId.get(item.run.id) ?? item.run } : item) })
 }
 
-function handleTicketAction(
+async function handleTicketAction(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   actor: Actor,
   idOrIdent: string,
   action: TicketAction,
-): void {
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const ticket = requireTicket(db, idOrIdent)
+  const activeExecution = getActiveLease(db, ticket.id)
+  const control = activeExecution?.leaseOwner ? taskboardRunControls.get(activeExecution.id, ticket.id, activeExecution.leaseOwner) : undefined
+  const runningControl = control ?? taskboardRunControls.getActiveForTicket(ticket.id)
+  if (actor !== 'human' && action !== 'comment' && runningControl?.signal.aborted) return sendError(res, 409, '本次执行已停止', { code: 'USER_CANCELLED' })
+  if (actor === 'human' && !['comment', 'patrol', 'stop', 'move'].includes(action) && hasPendingTaskboardExecution(db, ticket.id)) {
+    return sendError(res, 409, '请先停止本次执行，收尾完成后再操作', { code: 'active_execution' })
+  }
   if (action === 'comment') handleComment(res, body, db, actor, ticket)
-  else if (action === 'patrol') handlePatrol(res, body, db, actor, ticket)
+  else if (action === 'patrol') await handlePatrol(res, body, db, actor, ticket, ctx)
+  else if (action === 'stop') handleStop(res, body, db, actor, ticket)
   else if (action === 'claim') handleClaim(res, body, db, actor, ticket)
   else if (action === 'ready') handleReady(res, body, db, actor, ticket)
   else if (action === 'advance') handleAdvance(res, body, db, actor, ticket)
@@ -1584,6 +1627,10 @@ function handleMove(
 ): void {
   if (actor !== 'human') {
     sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  if (!getActiveLease(db, ticket.id) && hasPendingTaskboardExecution(db, ticket.id)) {
+    sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
     return
   }
   const expectedVersion = requireExpectedVersion(body)
@@ -1653,7 +1700,7 @@ function handleMove(
   }
 
   const activeRun = getActiveLease(db, ticket.id)
-  if (ticket.status === 'running' && !cancelRunningRun) {
+  if (activeRun && !cancelRunningRun) {
     throw new TaskboardMoveDenied(
       409,
       'running_run_active',
@@ -1707,13 +1754,15 @@ function handleMove(
     )
   }
 
+  if (activeRun && cancelRunningRun) {
+    const stopped = requestHumanRunStop(db, ticket.id, expectedVersion, activeRun.id)
+    if (stopped.kind === 'conflict') throw new TaskboardMoveDenied(409, stopped.code, stopped.message)
+    if (stopped.kind !== 'terminal') throw new TaskboardMoveDenied(409, 'stop_pending', '已请求停止本次执行，收尾完成后请再次移动任务。', { ticket: stopped.ticket, runId: activeRun.id })
+  }
   const actorId = actorIdOf(actor)
   const fromStage = currentStage(db, ticket)
   const toStage = intent.toStageId ? getStage(db, intent.toStageId) : null
   const result = db.transaction(() => {
-    if (ticket.status === 'running' && cancelRunningRun) {
-      cancelActiveRunForMove(db, ticket)
-    }
 
     let updated: Ticket
     if (intent.action === 'ack_advance') {
@@ -1899,19 +1948,6 @@ function applyHumanAckAdvance(
   return updated
 }
 
-function cancelActiveRunForMove(db: TaskboardDb, ticket: Ticket): void {
-  const run = getActiveLease(db, ticket.id)
-  if (!run) return
-  releaseLease(db, run.id)
-  const now = Date.now()
-  updateRun(db, run.id, {
-    status: 'failed',
-    error: 'canceled_by_human_move',
-    finishedAt: now,
-    durationMs: run.startedAt != null ? now - run.startedAt : null,
-  })
-}
-
 function handleComment(
   res: ServerResponse,
   body: Record<string, unknown>,
@@ -1943,21 +1979,21 @@ function handleReady(
 ): void {
   const expectedVersion = requireExpectedVersion(body)
   const actorId = actorIdOf(actor, asString(body.owner) ?? asString(body.author))
-  if (ticket.status === 'backlog') {
-    const updated = applyBacklogApproval(db, ticket, expectedVersion, actor, actorId)
-    sendJson(res, 200, { ok: true, ticket: updated })
+  const updated = db.transaction(() => {
+    const current = requireTicket(db, ticket.id)
+    if (current.version !== expectedVersion) throw new TaskboardVersionConflict(ticket.id, expectedVersion, current.version)
+    if (hasPendingTaskboardExecution(db, ticket.id)) return null
+    if (current.status === 'backlog') return applyBacklogApproval(db, current, expectedVersion, actor, actorId)
+    const stage = currentStage(db, current)
+    assertTransition({ from: current.status, to: 'ready', actor, autoClose: stage?.autoClose, stageOnSuccess: stage?.onSuccess })
+    const result = updateTicket(db, current.id, expectedVersion, { status: 'ready' })
+    recordActivity(db, current.id, actor, actorId, 'status_changed', 'status', current.status, 'ready')
+    return result
+  }).immediate()
+  if (!updated) {
+    sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
     return
   }
-  const stage = currentStage(db, ticket)
-  assertTransition({
-    from: ticket.status,
-    to: 'ready',
-    actor,
-    autoClose: stage?.autoClose,
-    stageOnSuccess: stage?.onSuccess,
-  })
-  const updated = updateTicket(db, ticket.id, expectedVersion, { status: 'ready' })
-  recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'ready')
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
@@ -2308,18 +2344,86 @@ function handleCancel(
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
-function handlePatrol(
+/** A stop controls execution; already closed business tickets remain closed. */
+function recordHumanRunStop(db: TaskboardDb, current: Ticket, runId: string, expectedVersion: number): Ticket {
+  const closed = current.status === 'done' || current.status === 'canceled'
+  if (!closed && current.status !== 'blocked') assertTransition({ from: current.status, to: 'blocked', actor: 'human' })
+  const updated = closed ? current : updateTicket(db, current.id, expectedVersion, { status: 'blocked', blockedReason: '用户停止本次执行' })
+  if (closed) recordActivity(db, current.id, 'human', HUMAN_ACTOR_ID, 'run_stop_requested', null, null, runId)
+  else recordActivity(db, current.id, 'human', HUMAN_ACTOR_ID, 'status_changed', 'status', current.status, 'blocked')
+  createComment(db, { ticketId: current.id, authorKind: 'human', author: HUMAN_ACTOR_ID, runId, body: closed
+    ? '已请求停止仍在运行的本次执行，保留单据关闭状态与已有输出。'
+    : '已请求停止本次执行，正在保留输出并收尾。结束后可重试。' })
+  return updated
+}
+
+function requestHumanRunStop(db: TaskboardDb, ticketId: string, expectedVersion: number, runId: string) {
+  const outcome = db.transaction(() => {
+    const current = requireTicket(db, ticketId)
+    const run = getRun(db, runId)
+    if (!run || run.ticketId !== current.id) throw new TaskboardNotFound('run', runId)
+    if (run.status !== 'running' && run.status !== 'queued') {
+      const latest = getLatestRunMetadata(db, current.id)
+      const active = getActiveLease(db, current.id)
+      if (latest?.id !== run.id || (active && active.id !== run.id)) return { kind: 'terminal' as const, ticket: current, run }
+      const closing = taskboardRunControls.getActiveForTicket(current.id)
+      if (!closing || closing.runId !== run.id || closing.rootSessionKey !== run.sessionKey) return { kind: 'terminal' as const, ticket: current, run }
+      if (closing.humanStopRegistered && (current.status === 'blocked' || current.status === 'done' || current.status === 'canceled')) return { kind: 'pending' as const, ticket: current, run }
+      if (current.version !== expectedVersion) throw new TaskboardVersionConflict(current.id, expectedVersion, current.version)
+      const updated = recordHumanRunStop(db, current, run.id, expectedVersion)
+      return { kind: 'requested' as const, ticket: updated, run, control: closing }
+    }
+    const now = Date.now()
+    const active = getActiveLease(db, current.id, now)
+    if (!active || active.id !== run.id || !run.leaseOwner) return { kind: 'conflict' as const, code: 'run_changed', message: '当前执行已变化，请刷新后操作' }
+    const control = taskboardRunControls.get(run.id, current.id, run.leaseOwner)
+    if (!control) return { kind: 'conflict' as const, code: 'run_control_unavailable', message: '当前执行控制不可用，请等待执行收尾后重试' }
+    if (control.humanStopRegistered && (current.status === 'blocked' || current.status === 'done' || current.status === 'canceled')) return { kind: 'pending' as const, ticket: current, run }
+    if (current.version !== expectedVersion) throw new TaskboardVersionConflict(current.id, expectedVersion, current.version)
+    const updated = recordHumanRunStop(db, current, run.id, expectedVersion)
+    return { kind: 'requested' as const, ticket: updated, run, control }
+  }).immediate()
+  if (outcome.kind === 'requested') outcome.control.registerHumanStop()
+  return outcome
+}
+
+/** Human stop is an exact-run request, never a lease release or terminal claim. */
+function handleStop(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   actor: Actor,
   ticket: Ticket,
 ): void {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  const expectedVersion = requireExpectedVersion(body)
+  const runId = asString(body.runId)
+  if (!runId) throw new TaskboardValidationError('runId is required')
+  const outcome = requestHumanRunStop(db, ticket.id, expectedVersion, runId)
+  if (outcome.kind === 'conflict') {
+    sendError(res, 409, outcome.message, { code: outcome.code })
+    return
+  }
+  sendJson(res, outcome.kind === 'terminal' ? 200 : 202, { ok: true, state: outcome.kind === 'terminal' ? 'terminal' : 'stopping', ticket: outcome.ticket, run: outcome.run })
+}
+
+async function handlePatrol(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const expectedVersion = requireExpectedVersion(body)
   if (ticket.version !== expectedVersion) {
     throw new TaskboardVersionConflict(ticket.id, expectedVersion, ticket.version)
   }
-  const settings = getSettings(db)
+  if (hasPendingTaskboardExecution(db, ticket.id)) return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+  let settings = getSettings(db)
   if (settings.patrolPaused) {
     throw new TaskboardValidationError('patrol is paused')
   }
@@ -2328,6 +2432,9 @@ function handlePatrol(
   const stage = getStage(db, stageRef)
   if (!stage) throw new TaskboardNotFound('stage', stageRef)
   if (stage.kind !== 'ai') throw new TaskboardValidationError('stage is not an ai stage')
+  await assertTaskboardStagesRunnable(ctx.preflightStages, [stage])
+  settings = getSettings(db)
+  if (settings.patrolPaused) return sendError(res, 409, '巡检已暂停，请先恢复巡检', { code: 'patrol_paused' })
 
   const usage = getUsage(db)
   const slots = getSharedPatrolSlots()
@@ -2361,6 +2468,14 @@ function handlePatrol(
 
   const owner = actorIdOf(actor, asString(body.owner), stage.agentId)
   const result = db.transaction(() => {
+    const fresh = requireTicket(db, ticket.id)
+    if (fresh.version !== expectedVersion) throw new TaskboardVersionConflict(ticket.id, expectedVersion, fresh.version)
+    if (hasPendingTaskboardExecution(db, ticket.id)) return { kind: 'busy' } as const
+    const freshStage = getStage(db, stage.id)
+    if (!freshStage || JSON.stringify(freshStage) !== JSON.stringify(stage)) return { kind: 'stage_changed' } as const
+    const liveSettings = getSettings(db)
+    if (liveSettings.patrolPaused) return { kind: 'paused' } as const
+    if (getUsage(db).activeRuns >= liveSettings.maxConcurrentRuns || slots.getActive() >= liveSettings.maxConcurrentRuns) return { kind: 'full' } as const
     const run = acquireLease(db, ticket.id, stage.id, owner, alignedLeaseTtlMs(stage.timeoutSec), {
       agentId: stage.agentId,
       trigger: 'manual',
@@ -2384,8 +2499,12 @@ function handlePatrol(
         'running',
       )
     }
-    return { run: withKey, ticket: updated }
-  })()
+    return { kind: 'claimed', run: withKey, ticket: updated } as const
+  }).immediate()
+  if (result.kind === 'busy') return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+  if (result.kind === 'stage_changed') return sendError(res, 409, '阶段配置已更新，请刷新后重试', { code: 'stage_configuration_changed' })
+  if (result.kind === 'paused') return sendError(res, 409, '巡检已暂停，请先恢复巡检', { code: 'patrol_paused' })
+  if (result.kind === 'full') return sendError(res, 429, 'taskboard concurrency full', { code: 'concurrency_full' })
 
   enqueuePatrolExecution({
     ticketId: result.ticket.id,

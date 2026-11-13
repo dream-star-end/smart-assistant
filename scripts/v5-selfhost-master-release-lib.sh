@@ -28,6 +28,13 @@ CUTOVER_UNIT_SNAP="${CUTOVER_UNIT_SNAP:-}"
 SURVIVOR_STATE="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
 SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-survivor.committed}"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-host-log-policy.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-model-policy.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-cutover-units.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-gate-receipts.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-build-jobs.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-load-budget.sh"
+
 mlog() { echo "$*" >&2; }
 
 # 只允许删除「本进程创建、仍是同一 inode」的 ${MASTER_RELEASES_ROOT}/.staging-*。
@@ -35,6 +42,7 @@ mlog() { echo "$*" >&2; }
 cleanup_master_staging() {
   local candidate canon root_canon parent parent_dev root_dev st_dev st_ino
   local live_canon worktree_canon
+  reap_master_build_jobs
   # 门的临时测试库、临时目录跟 staging 同生命周期:所有失败路径(含 EXIT trap)都经过这里。
   # 测试库要用 staging 里的 node_modules/pg 删,所以排在删 staging 之前。
   master_gate_db_drop
@@ -209,13 +217,19 @@ master_gate_base_dsn() {
 master_gate_load1() {
   local a="" rest=""
   read -r a rest <"$MASTER_GATE_LOADAVG" 2>/dev/null || a=""
-  [[ "$a" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$a"
+  if [[ "$a" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    if [[ "${MASTER_GATE_ADMISSION_BUDGET:-0}" == 1 && -n "${MASTER_GATE_LOAD_BUDGET_DIR:-}" ]]; then
+      master_gate_admission_load1 "$a"
+    else
+      printf '%s' "$a"
+    fi
+  fi
   return 0
 }
 
 # 等待倍数 = clamp(load1/8, 1, 3),两位小数;读不到负载按 1。
 master_gate_load_scale() {
-  local l
+  local l MASTER_GATE_ADMISSION_BUDGET=0
   l="$(master_gate_load1)"
   if [[ -z "$l" ]]; then printf '1.00'; return 0; fi
   awk -v l="$l" -v d="$MASTER_BOX_GATE_LOAD_MAX" -v m="$MASTER_GATE_LOAD_SCALE_MAX" \
@@ -257,7 +271,7 @@ master_gate_busy_reason() {
 }
 
 master_gate_wait_host_idle() { # <why> → rc 1 when still busy after MASTER_GATE_IDLE_TIMEOUT_S
-  local why="$1" t0 now reason=""
+  local why="$1" t0 now reason="" MASTER_GATE_ADMISSION_BUDGET=1
   t0="$(date +%s)"
   while :; do
     reason="$(master_gate_busy_reason)"
@@ -343,6 +357,14 @@ master_gate_flaky_signature() { # <attempt-log>
   printf '%s' "$sig"
 }
 
+# 失败尝试的首错签名(第一条 [gate-failure] 行;没有就记退出码),写进 train summary 时首跑与重跑分开(OCV5-583)。
+master_gate_first_failure() { # <attempt-log> <rc>
+  local line=""
+  line="$(sed -n '/^\[gate-failure\] /{s/^\[gate-failure\] //p;q;}' "$1" 2>/dev/null)" || line=""
+  [[ -n "$line" ]] || line="rc=$2 (no [gate-failure] line)"
+  printf '%s' "${line:0:200}"
+}
+
 # 跑一道可重跑的门:最多两次,第二次只在第一次是已知假失败时才跑。rc 0 = 某一次通过。
 master_gate_retryable() { # <gate> <command...>
   local gate="$1" n log first="" rcf rc sig
@@ -363,6 +385,7 @@ master_gate_retryable() { # <gate> <command...>
     rc="$(cat -- "$rcf" 2>/dev/null)"
     rm -f -- "$rcf"
     [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+    [[ "$rc" == 0 ]] || tsum_note "gateFailure.$gate.attempt$n" "$(master_gate_first_failure "$log" "$rc")" 2>/dev/null || :
     if [[ "$rc" == 0 ]]; then
       if [[ "$n" == 2 ]]; then
         tsum_note "retry.$gate.result" passed 2>/dev/null || :
@@ -565,6 +588,8 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     echo 'FATAL: strong release root 非法' >&2
     return 1
   }
+  host_log_policy_require_bundle "$root" || return $?
+  model_policy_require_bundle "$root" || return $?
   chown 0:0 -- "$root" || return 1
   chmod go-w -- "$root" || return 1
   read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$root")
@@ -596,7 +621,7 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     --arg artifactSha256 "$artifact_sha" \
     '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
       metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
-      flavorGuardGeneration:1}' >"$marker_tmp"; then
+      flavorGuardGeneration:1,hostLogPolicyGeneration:1,modelAvailabilityPolicyGeneration:1}' >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -696,7 +721,7 @@ find_master_release_donor() { # <staging-lock>
 # shellcheck source=scripts/lib/v5-release-preflight.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-release-preflight.sh"
 
-selfhost_release_preflight() { # <target-sha>
+selfhost_release_preflight() { # <target-sha> [prepared: immutable source may be ahead of HEAD]
   local target="$1" live from=""
   live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
   if [[ -n "$live" && -f "$live/.complete" ]]; then
@@ -704,7 +729,17 @@ selfhost_release_preflight() { # <target-sha>
   fi
   mlog "── L0 发车预检(只读:不建库、不加锁、不写标记;OCV5-581)target=${target:0:12} ──"
   rpf_reset
-  rpf_check_source_pin "$REPO_ROOT" "$target"
+  if [[ "${2:-head}" == prepared ]]; then
+    # selfhost_prepare_assert_tip already verified the exact remote tip/controller.
+    # A prebuild is allowed ahead of canonical HEAD; archive/object identity is its pin.
+    if [[ "$target" =~ ^[0-9a-f]{40}$ ]] && git -C "$REPO_ROOT" cat-file -e "$target^{commit}"; then
+      rpf_add ok source-pin "prepared immutable source ${target:0:12}"
+    else
+      rpf_add fail source-pin "prepared source is not an available commit"
+    fi
+  else
+    rpf_check_source_pin "$REPO_ROOT" "$target"
+  fi
   rpf_check_workspace_links "$REPO_ROOT" 1
   rpf_check_migrations "$REPO_ROOT" "$from" "$target"
   rpf_check_proof_db "$REPO_ROOT" gate-db "$(master_gate_base_dsn)"
@@ -759,7 +794,7 @@ write_master_version_json() { # <staging> <short-sha>
 #   packages/protocol 整棵 tree(@openclaude/protocol 依赖)
 #   packages/mcp-memory/src(web-react 唯一越包相对 import:mcp-memory/src/toolNames)
 #   根 package-lock.json / package.json(依赖版本)
-#   本文件自身(构建步骤一变就作废所有旧 key)
+#   本文件与 selfhost prewarm 库(任一构建步骤改变即作废旧 key)
 #   node --version
 #   构建进程环境里会进产物的变量:VITE_*(Vite 编译期内联)、NODE_ENV、BROWSERSLIST*
 # donor 必须是完整封存的 release:.complete 结构合法、根 0:0 且不可组/他写、release_artifact_digest
@@ -774,6 +809,7 @@ WEB_DIST_KEY_PATHS=(
   package-lock.json
   package.json
   scripts/v5-selfhost-master-release-lib.sh
+  scripts/lib/v5-selfhost-prewarm.sh
 )
 
 master_web_dist_key() { # <full-sha> → stdout 64-hex;任一输入取不到 → rc=1(调用方照常构建)
@@ -800,6 +836,17 @@ web_dist_digest() { # <dist-dir> → stdout 64-hex(相对路径 + 内容;拒绝�
 
 # stdout 只打印可复用 dist 的 release 绝对路径;找不到 rc=1。日志走 stderr。
 # 候选:live 优先,其次最近的已封存 rel-*(最多 8 份);拒绝 .poisoned / 缺 .complete / 记录不符 / 摘要不符。
+copy_verified_web_dist() { # <donor-root> <staging-root>; freeze evidence BEFORE verification/copy.
+  local donor="$1" staging="$2" expected got
+  [[ ! -e "$staging/packages/web-react/dist" && ! -L "$staging/packages/web-react/dist" ]] || return 1
+  expected="$(jq -er .distDigest "$donor/$WEB_DIST_REUSE_RECORD")" || return 1
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+  web_dist_donor_sealed "$donor" || return 1
+  cp -a -- "$donor/packages/web-react/dist" "$staging/packages/web-react/dist" || return 1
+  got="$(web_dist_digest "$staging/packages/web-react/dist")" || return 1
+  [[ "$got" == "$expected" ]]
+}
+
 web_dist_donor_sealed() { # <release-root> → rc 0 = 完整封存且未被改动
   local rel="$1" marker schema commit art root_uid root_gid root_mode got
   marker="$rel/.complete"
@@ -816,6 +863,7 @@ web_dist_donor_sealed() { # <release-root> → rc 0 = 完整封存且未被改�
 
 find_web_dist_donor() { # <key>
   local key="$1" cand rec rkey rdigest got live=""
+  if declare -F prewarm_web_donor >/dev/null && prewarm_web_donor "$key"; then return 0; fi
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
   if [[ -L "$MASTER_LIVE_LINK" ]]; then
     live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
@@ -863,6 +911,16 @@ write_web_dist_reuse_record() { # <staging> <key-or-empty> <mode> <full-sha> [do
     > "$staging/$WEB_DIST_REUSE_RECORD"
 }
 
+master_seed_frontend_buildinfo() { # <donor-or-empty> <staging>; never share a writable donor inode
+  local donor="$1" staging="$2" src dest
+  src="$donor/packages/web-react/tsconfig.tsbuildinfo"
+  [[ -n "$donor" && -f "$src" ]] || return 0
+  dest="$staging/packages/web-react/tsconfig.tsbuildinfo"
+  cp --remove-destination -- "$src" "$dest" || return 1
+  # Force tsc -b to compare input hashes even when git archive gave changed sources older mtimes.
+  touch -d @0 -- "$dest"
+}
+
 # OCV5-545:把 check-architecture.ts --json 的计数记进列车 summary.json(只记录,读不到就记 unreadable)。
 master_note_architecture() { # <report.json>
   local counts v
@@ -886,10 +944,13 @@ master_note_architecture() { # <report.json>
 
 build_master_release() {
   local full_sha short_sha ts staging reldir donor t0 t1 build_id web_key web_donor
+  MASTER_GATE_RECEIPT_IDS=""
+  MASTER_GATE_RECEIPT_SHA=""
   BUILT_MASTER_RELEASE=""
   MASTER_DEPS_MODE=""
   MASTER_DEPS_ELAPSED_S=""
   MASTER_FRONTEND_ELAPSED_S=""
+  MASTER_FRONTEND_TSC_S=""
   MASTER_FRONTEND_MODE=""
 
   # Explicit invocation pin; build-master-only keeps the no-argument HEAD snapshot.
@@ -907,12 +968,23 @@ build_master_release() {
     return 0
   fi
 
+  # Start own-tree history before runtime/C/D children; all prior host history stays external.
+  master_gate_load_budget_start
   # Shared tsx cache belongs to live services and other work; only private gate dirs are cleaned.
   assert_master_releases_disk
   command -v python3 >/dev/null 2>&1 || die "缺少 python3(算 artifact digest 需要)"
   command -v npm >/dev/null 2>&1 || die "缺少 npm"
   command -v jq >/dev/null 2>&1 || die "缺少 jq"
   [[ ! -e "$reldir" ]] || die "目标已存在,拒绝覆盖: $reldir"
+  # OCV5-583 资源准入前移:主机忙(负载、被持有的 test-mutex、别的会话在跑全量测试)时,以前先建候选
+  # (archive + 依赖)再在 Box 门前等最多 900s;现在先在这里等,超时就在建任何东西之前放弃。
+  # Box 门前那次等待保留(构建期间可能又忙起来),通常立即通过。
+  master_gate_wait_host_idle admission \
+    || die "发车准入:主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s,未建候选(live 未改)"
+  # P2(OCV5-648):后台 runtime 构建在准入之后才起。先起的话它把 load1 推到 20+,准入等的就是本列车自己。
+  if [[ "${MASTER_RUNTIME_BG_AFTER_ADMISSION:-0}" == 1 ]]; then
+    start_runtime_release_bg "$full_sha"
+  fi
 
   mkdir -p -- "$MASTER_RELEASES_ROOT"
   chown 0:0 -- "$MASTER_RELEASES_ROOT"
@@ -973,6 +1045,224 @@ build_master_release() {
     die "无法创建发布门私有 TMPDIR(${MASTER_GATE_TMP_PREFIX}.$$.*)"
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
+  master_gate_receipt_prepare "$staging" "$full_sha"
+  # P3: C/D share up to three load-budgeted slots; Box/ccb-mcp stay isolated.
+  # Keep literal commands in these nested functions: parity/incident gates inspect this body.
+  tsum_mark C.parallel 2>/dev/null || :
+  MASTER_BUILD_JOB_FAILED=0
+  master_job_cursor_sand() {
+    mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
+      mlog "pinned Cursor Sand InferenceService contract gate 失败"
+      return 1
+    fi
+  }
+  master_job_delegate_billing() {
+    mlog "  delegate engine billing requestId contract gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
+      mlog "pinned delegate engine billing requestId contract gate 失败"
+      return 1
+    fi
+  }
+  master_job_callback_ws() {
+    mlog "  callback payload hash WS proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" node scripts/check-v5-callback-payload-hash.mjs ); then
+      mlog "pinned callback payload hash WS proof 失败"
+      return 1
+    fi
+  }
+  master_job_cron_submit() {
+    mlog "  cron submit durability + execution-heartbeat proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
+      mlog "pinned cron submit durability boundary gate 失败"
+      return 1
+    fi
+  }
+  master_job_prompt_privacy() {
+    mlog "  fresh prompt privacy lifecycle proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts ); then
+      mlog "pinned prompt privacy lifecycle proof 失败"
+      return 1
+    fi
+  }
+  master_job_session_boundary() {
+    mlog "  session workspace boundary in every engine prompt @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-workspace-boundary.ts ); then
+      mlog "pinned session workspace boundary proof 失败"
+      return 1
+    fi
+  }
+  master_job_system_approval() {
+    mlog "  durable system approval fencing proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-approval-proofs.ts ); then
+      mlog "pinned system approval fencing proof failed"
+      return 1
+    fi
+  }
+  master_job_system_executor() {
+    mlog "  independent browser approval and frozen executor proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-executor-proofs.ts ); then
+      mlog "pinned system executor fencing proof failed"
+      return 1
+    fi
+  }
+  master_job_session_rootfix() {
+    mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
+      mlog "pinned session unavailable / data-safety rootfix contract gate 失败"
+      return 1
+    fi
+  }
+  master_job_host_log_policy() {
+    mlog "  host log policy filesystem/logrotate gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-host-log-policy.test.sh ); then
+      mlog "pinned host log policy filesystem/logrotate gate 失败"
+      return 1
+    fi
+  }
+  master_job_model_policy() {
+    mlog "  model policy artifact/recovery gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-model-policy.test.sh ); then
+      mlog "pinned model policy artifact/recovery gate failed"
+      return 1
+    fi
+  }
+  # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
+  # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
+  # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
+  master_job_architecture() {
+    mlog "  architecture guardrails (report period) @ pinned staging"
+    if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
+      mlog "新候选缺 scripts/check-architecture.ts"
+      return 1
+    fi
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
+        --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
+      mlog "pinned architecture guardrails 失败(检查器 fail-closed)"
+      return 1
+    fi
+  }
+  # OCV5-404:committed 后会把本 release 的 watch.sh 装到宿主,所以它的判定逻辑与停用/重新武装
+  # 行为必须先在 pinned staging 上过一遍。测试只写 mktemp 目录,不碰宿主标记与安装副本。
+  # OCV5-418:门禁失败 stay 路径(survivor kept-failed / 维护窗口 / 列车 failed / 告警)同样先在 staging 跑。
+  # OCV5-420:中途退出 / 补偿失败的列车终态(recovery_required、不结算搭车)同样先在 staging 跑。
+  # OCV5-420 二期:autorecover(不等人,自动恢复/重跑/升级派 AI)与 watch.sh --auto-recover 同样先在 staging 跑。
+  master_job_watch_gate() {
+    mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
+    # OCV5-447:清单只在 scripts/v5-selfhost-watch-gate.sh 一处,PR CI(v5-selfhost-gates.yml)跑同一份。
+    if [[ ! -f "$staging/scripts/v5-selfhost-watch-gate.sh" ]]; then
+      mlog "新候选缺 scripts/v5-selfhost-watch-gate.sh"
+      return 1
+    fi
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
+        --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
+      mlog "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"
+      return 1
+    fi
+  }
+  master_job_frontend() {
+    local tsc_sec
+    t0="$(date +%s)"
+    MASTER_FRONTEND_TSC_S=0
+    web_key="$(master_web_dist_key "$full_sha" || true)"
+    web_donor=""
+    if [[ -n "$web_key" && "${OC_V5_FORCE_WEB_BUILD:-0}" != 1 ]]; then
+      web_donor="$(find_web_dist_donor "$web_key" || true)"
+    fi
+    if [[ -n "$web_donor" ]]; then
+      mlog "  web-react 构建输入未变(key=${web_key:0:12})→ 复用 $web_donor 的 dist(摘要已复核)"
+      if ! copy_verified_web_dist "$web_donor" "$staging"; then
+        mlog "复用 web dist 失败或复制后的摘要不符(donor=$web_donor)"
+        return 1
+      fi
+      master_seed_frontend_buildinfo "$web_donor" "$staging" || return 1
+      MASTER_FRONTEND_MODE="reused"
+    else
+      [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
+      master_seed_frontend_buildinfo "${donor:-}" "$staging" || return 1
+      mlog "  web-react official build @ staging(不碰工作树 dist)"
+      if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+          OC_V5_SELFHOST_TSC_TIMER_FILE="$MASTER_GATE_TMPDIR/frontend-tsc-sec" \
+          NODE_OPTIONS="--max-old-space-size=4096 --require=\"$SCRIPT_DIR/lib/v5-selfhost-tsc-timer.cjs\"" \
+          npm run build --workspace packages/web-react ); then
+        mlog "staging web-react 构建失败"
+        return 1
+      fi
+      MASTER_FRONTEND_TSC_S=unknown
+      if [[ -f "$MASTER_GATE_TMPDIR/frontend-tsc-sec" ]] \
+        && read -r tsc_sec <"$MASTER_GATE_TMPDIR/frontend-tsc-sec" \
+        && [[ "$tsc_sec" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        MASTER_FRONTEND_TSC_S="$tsc_sec"
+      fi
+      MASTER_FRONTEND_MODE="built"
+    fi
+    t1="$(date +%s)"
+    MASTER_FRONTEND_ELAPSED_S="$((t1 - t0))"
+    mlog "  frontend elapsed=${MASTER_FRONTEND_ELAPSED_S}s mode=$MASTER_FRONTEND_MODE"
+    [[ -f "$staging/packages/web-react/dist/index.html" ]] || {
+      mlog "构建后缺 staging dist/index.html"
+      return 1
+    }
+    build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$staging/packages/web-react/dist/index.html" \
+      | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
+    [[ -n "$build_id" ]] || {
+      mlog "staging dist/index.html 缺 oc-build meta"
+      return 1
+    }
+    mlog "  dist oc-build=$build_id"
+    if ! write_web_dist_reuse_record "$staging" "$web_key" "$MASTER_FRONTEND_MODE" "$full_sha" "$web_donor"; then
+      mlog "写 $WEB_DIST_REUSE_RECORD 失败"
+      return 1
+    fi
+
+    printf '%s %s %s\n' "$MASTER_FRONTEND_MODE" "$MASTER_FRONTEND_ELAPSED_S" "$MASTER_FRONTEND_TSC_S" >"$MASTER_GATE_TMPDIR/frontend.result"
+  }
+
+  local job job_id job_fn gate_id
+  for job in \
+    D:master_job_frontend \
+    C.session-rootfix:master_job_session_rootfix:session-unavailable-rootfix \
+    C.watch-gate:master_job_watch_gate:watch-gate \
+    C.cursor-sand:master_job_cursor_sand \
+    C.delegate-billing:master_job_delegate_billing:delegate-billing-requestid \
+    C.callback-ws:master_job_callback_ws:callback-payload-hash \
+    C.cron-submit:master_job_cron_submit:cron-submit-boundary \
+    C.prompt-privacy:master_job_prompt_privacy:prompt-privacy-lifecycle \
+    C.session-boundary:master_job_session_boundary \
+    C.system-approval:master_job_system_approval:system-approval-fencing \
+    C.system-executor:master_job_system_executor:system-executor-fencing \
+    C.host-log-policy:master_job_host_log_policy \
+    C.model-policy:master_job_model_policy \
+    C.architecture:master_job_architecture \
+  ; do
+    IFS=: read -r job_id job_fn gate_id <<<"$job"
+    # Receipt decisions write summary evidence only in the parent. A hit never
+    # bypasses a prior worker failure; all local jobs still meet the final barrier.
+    if ! master_build_jobs_poll; then
+      cleanup_master_staging
+      die "pinned C/D 并行任务失败(收据不能绕过已失败任务)"
+    fi
+    if [[ -n "$gate_id" ]] && master_gate_receipt_has "$gate_id" "$full_sha"; then continue; fi
+    if ! master_build_job_start "$job_id" "$job_fn"; then
+      cleanup_master_staging
+      die "pinned C/D 并行任务失败或负载预算超时"
+    fi
+  done
+  if ! master_build_jobs_wait; then
+    cleanup_master_staging
+    die "pinned C/D 并行任务失败(逐项退出码与日志见上)"
+  fi
+  # Only the parent writes the summary; never source/eval a worker's result.
+  local frontend_extra
+  if ! read -r MASTER_FRONTEND_MODE MASTER_FRONTEND_ELAPSED_S MASTER_FRONTEND_TSC_S frontend_extra <"$MASTER_GATE_TMPDIR/D/frontend.result" \
+    || [[ ! "$MASTER_FRONTEND_MODE" =~ ^(built|reused)$ || ! "$MASTER_FRONTEND_ELAPSED_S" =~ ^[0-9]+$ || -n "$frontend_extra" ]]; then
+    cleanup_master_staging
+    die "frontend 结果缺失/非法"
+  fi
+  [[ "$MASTER_FRONTEND_TSC_S" =~ ^[0-9]+([.][0-9]+)?$ ]] || MASTER_FRONTEND_TSC_S=unknown
+  tsum_note frontendElapsedSec "$MASTER_FRONTEND_ELAPSED_S" 2>/dev/null || :
+  tsum_note frontendTscSec "$MASTER_FRONTEND_TSC_S" 2>/dev/null || :
+  master_note_architecture "$MASTER_GATE_TMPDIR/C.architecture/architecture.json"
   tsum_mark C.box-success-recovery 2>/dev/null || :
   # OCV5-557:Box 门不与后台 runtime 构建并行,也不在主机繁忙时发车(见上方「Box 门假失败治理」)。
   if declare -F await_runtime_release_bg >/dev/null; then
@@ -1032,12 +1322,21 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box incident proofs gate (OCV5-488) 失败"
   fi
-  master_gate_db_drop
-  tsum_mark C.cursor-sand 2>/dev/null || :
-  mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
+  tsum_mark C.box-longtask 2>/dev/null || :
+  tsum_note gateEvidence.box-longtask local 2>/dev/null || :
+  mlog "  Box long-task generations gate @ pinned staging"
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha" ); then
     cleanup_master_staging
-    die "pinned Cursor Sand InferenceService contract gate 失败"
+    die "pinned Box long-task generations gate 失败"
+  fi
+  master_gate_db_drop
+  mlog "  upload retention HTTP responsiveness proof @ pinned staging"
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
+    cleanup_master_staging
+    die "pinned upload retention HTTP responsiveness proof failed"
   fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
   mlog "  CCB MCP availability contract gate @ pinned staging"
@@ -1049,106 +1348,7 @@ build_master_release() {
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
   fi
-  tsum_mark C.delegate-billing 2>/dev/null || :
-  mlog "  delegate engine billing requestId contract gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
-    cleanup_master_staging
-    die "pinned delegate engine billing requestId contract gate 失败"
-  fi
-  tsum_mark C.callback-ws 2>/dev/null || :
-  mlog "  callback payload hash WS proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" node scripts/check-v5-callback-payload-hash.mjs ); then
-    cleanup_master_staging
-    die "pinned callback payload hash WS proof 失败"
-  fi
-  tsum_mark C.cron-submit 2>/dev/null || :
-  mlog "  cron submit durability + execution-heartbeat proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
-    cleanup_master_staging
-    die "pinned cron submit durability boundary gate 失败"
-  fi
-  tsum_mark C.session-rootfix 2>/dev/null || :
-  mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
-    cleanup_master_staging
-    die "pinned session unavailable / data-safety rootfix contract gate 失败"
-  fi
-  # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
-  # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
-  # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
-  tsum_mark C.architecture 2>/dev/null || :
-  mlog "  architecture guardrails (report period) @ pinned staging"
-  if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-architecture.ts"
-  fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
-      --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
-    cleanup_master_staging
-    die "pinned architecture guardrails 失败(检查器 fail-closed)"
-  fi
-  master_note_architecture "$MASTER_GATE_TMPDIR/architecture.json"
-  # OCV5-404:committed 后会把本 release 的 watch.sh 装到宿主,所以它的判定逻辑与停用/重新武装
-  # 行为必须先在 pinned staging 上过一遍。测试只写 mktemp 目录,不碰宿主标记与安装副本。
-  # OCV5-418:门禁失败 stay 路径(survivor kept-failed / 维护窗口 / 列车 failed / 告警)同样先在 staging 跑。
-  # OCV5-420:中途退出 / 补偿失败的列车终态(recovery_required、不结算搭车)同样先在 staging 跑。
-  # OCV5-420 二期:autorecover(不等人,自动恢复/重跑/升级派 AI)与 watch.sh --auto-recover 同样先在 staging 跑。
-  tsum_mark C.watch-gate 2>/dev/null || :
-  mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
-  # OCV5-447:清单只在 scripts/v5-selfhost-watch-gate.sh 一处,PR CI(v5-selfhost-gates.yml)跑同一份。
-  if [[ ! -f "$staging/scripts/v5-selfhost-watch-gate.sh" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/v5-selfhost-watch-gate.sh"
-  fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
-      --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
-    cleanup_master_staging
-    die "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"
-  fi
   cleanup_master_gate_tmpdir
-
-  tsum_mark D 2>/dev/null || :
-  t0="$(date +%s)"
-  web_key="$(master_web_dist_key "$full_sha" || true)"
-  web_donor=""
-  if [[ -n "$web_key" && "${OC_V5_FORCE_WEB_BUILD:-0}" != 1 ]]; then
-    web_donor="$(find_web_dist_donor "$web_key" || true)"
-  fi
-  if [[ -n "$web_donor" ]]; then
-    mlog "  web-react 构建输入未变(key=${web_key:0:12})→ 复用 $web_donor 的 dist(摘要已复核)"
-    if [[ -e "$staging/packages/web-react/dist" ]] \
-      || ! cp -a -- "$web_donor/packages/web-react/dist" "$staging/packages/web-react/dist"; then
-      cleanup_master_staging
-      die "复用 web dist 失败(donor=$web_donor)"
-    fi
-    MASTER_FRONTEND_MODE="reused"
-  else
-    [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
-    mlog "  web-react official build @ staging(不碰工作树 dist)"
-    if ! ( cd "$staging" && NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ); then
-      cleanup_master_staging
-      die "staging web-react 构建失败"
-    fi
-    MASTER_FRONTEND_MODE="built"
-  fi
-  t1="$(date +%s)"
-  MASTER_FRONTEND_ELAPSED_S="$((t1 - t0))"
-  mlog "  frontend elapsed=${MASTER_FRONTEND_ELAPSED_S}s mode=$MASTER_FRONTEND_MODE"
-  [[ -f "$staging/packages/web-react/dist/index.html" ]] || {
-    cleanup_master_staging
-    die "构建后缺 staging dist/index.html"
-  }
-  build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$staging/packages/web-react/dist/index.html" \
-    | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
-  [[ -n "$build_id" ]] || {
-    cleanup_master_staging
-    die "staging dist/index.html 缺 oc-build meta"
-  }
-  mlog "  dist oc-build=$build_id"
-  if ! write_web_dist_reuse_record "$staging" "$web_key" "$MASTER_FRONTEND_MODE" "$full_sha" "$web_donor"; then
-    cleanup_master_staging
-    die "写 $WEB_DIST_REUSE_RECORD 失败"
-  fi
 
   tsum_mark P.mcp-bundle 2>/dev/null || :
   # openclaude-memory MCP server 预编译 CJS(dist/ 被 gitignore,git archive 不带产物,
@@ -1295,6 +1495,8 @@ assert_master_release_static_gate() { # <rel> [expected-full-sha]
     || die "静态门: release 根 ownership/mode 不可信 uid=$root_uid gid=$root_gid mode=$root_mode"
   got="$(release_artifact_digest "$rel")"
   [[ "$got" == "$art" ]] || die "静态门: artifactSha256 复算不匹配 expected=$art got=$got"
+  host_log_policy_generation "$rel" >/dev/null || die "静态门: host log policy generation/bundle 不合法"
+  model_policy_generation "$rel" >/dev/null || die "静态门: model policy generation/bundle 不合法"
   mlog "  ✓ 静态门通过 $rel sourceCommit=${commit:0:9} digest=${art:0:12}…"
 }
 
@@ -1572,34 +1774,6 @@ PY
 }
 
 # 从已过 digest 的候选 release 快照 unit 到 root-owned 临时目录。危险窗口只读这份。
-snapshot_cutover_units_from_release() { # <rel> <out-var>
-  local rel="$1" dest_var="$2" snap src_dir
-  [[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
-  src_dir="$rel/deploy/v5-selfhost"
-  [[ -d "$src_dir" ]] || { mlog "候选缺 $src_dir"; return 1; }
-  assert_unit_templates_live_wd "$src_dir"
-  snap="/run/openclaude-v5-selfhost/cutover-unit-snap.$$"
-  rm -rf -- "$snap"
-  mkdir -p -- "$snap" || return 1
-  chmod 0700 -- "$snap" || return 1
-  cp -a -- "$src_dir/${V5_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
-  cp -a -- "$src_dir/${V5_EGRESS_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
-  # 双槽 egress 模板 + sysctl(候选自带才快照)。
-  local f
-  for f in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
-           "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}" \
-           "${V5_EGRESS_SYSCTL_FILE:-99-openclaude-v5-selfhost-egress.sysctl.conf}"; do
-    if [[ -f "$src_dir/$f" && ! -L "$src_dir/$f" ]]; then
-      cp -a -- "$src_dir/$f" "$snap/" || { rm -rf -- "$snap"; return 1; }
-      fsync_path "$snap/$f" || { rm -rf -- "$snap"; return 1; }
-    fi
-  done
-  assert_unit_templates_live_wd "$snap"
-  fsync_path "$snap/${V5_UNIT}" || { rm -rf -- "$snap"; return 1; }
-  fsync_path "$snap/${V5_EGRESS_UNIT}" || { rm -rf -- "$snap"; return 1; }
-  CUTOVER_UNIT_SNAP="$snap"
-  printf -v "$dest_var" '%s' "$snap"
-}
 
 # 解析已验证的工作树 unit 备份(二级回滚目标)。不更新任何指针。
 resolve_worktree_unit_backup() {
@@ -1711,16 +1885,6 @@ run_migrations_from_release() { # <rel>  失败 return 1,不 exit(调用方走�
   fi
 }
 
-cleanup_cutover_unit_snap() {
-  local snap="${CUTOVER_UNIT_SNAP:-}"
-  CUTOVER_UNIT_SNAP=""
-  [[ -n "$snap" ]] || return 0
-  case "$snap" in
-    /run/openclaude-v5-selfhost/cutover-unit-snap.*)
-      rm -rf -- "$snap"
-      ;;
-  esac
-}
 
 # Bootstrap the new executor even when the installed live worker predates the flag.
 # Only the typed, exact-source registration can authorize this local CLI state.
@@ -1817,4 +1981,69 @@ COMMIT;")"; then
     fi
     sleep 5
   done
+}
+
+REMOTE_V4_CUTOVER_DRAINED=0
+
+remote_v4_cutover_reopen() {
+  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  REMOTE_V4_CUTOVER_DRAINED=0
+  [[ "${DRY:-0}" != 1 ]] || return 0
+  [[ -S "$sock" ]] || return 0
+  bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || true
+}
+
+# OCV5-749 AC-5: R1 generation cutover drain fence. Closes new remote-pool admissions
+# (`REMOTE_POOL_DRAINING_RETRY_LATER`) and waits for active relays + remote journals;
+# aborts cutover without killing active turns if drain times out.
+remote_v4_cutover_drain() {
+  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  local timeout_ms="${OC_REMOTE_V4_DRAIN_TIMEOUT_MS:-600000}"
+  local run_id="${LEASE_TRAIN_ID:-cutover-$$}" out rc=0 v4_active has_version
+  if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
+    return 0
+  fi
+  if [[ "${DRY:-0}" == 1 ]]; then
+    cutover_clog "  [dry-run] R1 远端驱动池排空闸门 ($sock, timeout=${timeout_ms}ms)"
+    return 0
+  fi
+  out="$(bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" \
+    --drain --socket "$sock" --timeout-ms "$timeout_ms" --release-run-id "$run_id" 2>&1)" || rc=$?
+  if [[ "$rc" == 0 ]]; then
+    REMOTE_V4_CUTOVER_DRAINED=1
+    cutover_clog "  remote-v4 drain ok: $out"
+    return 0
+  fi
+  if [[ "$rc" == 75 ]]; then
+    # PostgreSQL resolves column names even in an unselected CASE branch. Check
+    # the schema separately: on the first v4 release this runs before 0339.
+    if ! has_version="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT EXISTS (
+  SELECT 1 FROM information_schema.columns
+   WHERE table_schema='public' AND table_name='remote_agent_bindings' AND column_name='remote_protocol_version'
+)::text;" 2>/dev/null)"; then
+      cutover_clog "  ✗ remote-v4 schema 查询失败;拒绝切流"
+      return 1
+    fi
+    case "$has_version" in
+      false) v4_active=0 ;;
+      true)
+        if ! v4_active="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT count(*)::text FROM public.remote_agent_bindings
+ WHERE remote_protocol_version=4 AND state<>'released';" 2>/dev/null)"; then
+          cutover_clog "  ✗ remote-v4 绑定计数查询失败;拒绝切流"
+          return 1
+        fi
+        ;;
+      *) cutover_clog "  ✗ remote-v4 schema 查询结果无效;拒绝切流"; return 1 ;;
+    esac
+    if [[ "$v4_active" == "0" ]]; then
+      cutover_clog "  remote-v4 drain socket absent ($sock); active_v4_bindings=0,继续切流"
+      return 0
+    fi
+    cutover_clog "  ✗ remote-v4 drain socket 缺失但存在活跃 v4 绑定 ($v4_active);拒绝切流"
+    return 1
+  fi
+  cutover_clog "  ✗ remote-v4 排空超时或失败 (rc=$rc): $out;中止切流,不强杀在途回合"
+  return 1
 }

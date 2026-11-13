@@ -34,6 +34,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         'INTERNAL_ERROR','USER_CANCELLED')), final_credits bigint)`);
     await client.query(`CREATE TEMP TABLE usage_records (
       request_id text NOT NULL, user_id bigint NOT NULL)`);
+    await client.query(`CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY, state text NOT NULL)`);
     // Pin all journal operations to this one connection, whose temp table
     // shadows the real table. No shared schema or persistent row is touched.
     const privateMarker = "synthetic-private-marker";
@@ -479,8 +480,14 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       WHERE request_id=$1`, [toolCall.requestId, 256 * 1024 * 1024 - 1_000_000]);
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
-    (error: unknown) => error instanceof BoxDurableJournalError
-      && error.code === "BOX_TOOL_SPOOL_CAPACITY_EXCEEDED");
+    (error: unknown) => error instanceof Error
+      && (error as Error & { code: string }).code === "BOX_TOOL_ROLLOVER_REQUIRED");
+    // Capacity now rolls a fully validated exchange into a bounded new invocation.
+    // Restore this synthetic claim so the remaining mismatch/normal-resume matrix keeps its original scope.
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx-'boxRecoveredBy'-'boxRolloverTo'
+      WHERE request_id=$1`,[toolCall.requestId]);
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx-'boxRolloverFrom'-'boxSessionId'-'boxTurnKey'
+      WHERE request_id=$1`,[`box-d-${suffix}`]);
     await client.query(`UPDATE request_finalize_journal SET
       ctx=jsonb_set(ctx,'{boxToolHandoff,spoolOffset}',to_jsonb(1234::bigint))
       WHERE request_id=$1`, [toolCall.requestId]);
@@ -589,8 +596,23 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
     assert.equal(stillHandoff.rows[0]?.ctx.boxState, "handoff",
       "context mismatch must reject before claim and file publication");
+    await put(`box-d-unsent-${suffix}`);
+    await journal.claimToolResume({ requestId: `box-d-unsent-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody });
+    await journal.markUnknown({ requestId: `box-d-unsent-${suffix}`,
+      uid: 3n, leaseEpoch: toolCall.leaseEpoch, phase: "resume_publish_unsent" });
+    assert.equal(await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: resumeBody as ProxyBody }), null,
+      "an unsent resume child has nothing on the Box to observe and must not trap a retry in replay wait");
     const resumed = await journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody });
+    const retiredUnsent = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+      "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [`box-d-unsent-${suffix}`]);
+    assert.equal(retiredUnsent.rows[0]?.state, "aborted");
+    assert.equal(retiredUnsent.rows[0]?.ctx.boxState, "prestart_stopped");
+      assert.equal(retiredUnsent.rows[0]?.ctx.boxUnsentSupersededBy, `box-d-${suffix}`);
+    assert.equal(retiredUnsent.rows[0]?.ctx.boxOwnerRequestId, undefined);
+    assert.equal(retiredUnsent.rows[0]?.ctx.boxRunNonce, undefined);
     assert.equal(resumed.ownerRequestId, toolCall.requestId);
     assert.equal(resumed.accountId, 20n);
     assert.equal(resumed.spoolOffset, 1234);
@@ -1206,6 +1228,22 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     enforceChainLockOrder = false;
     await journal.markToolChainStoppedFailure({ requestId: `box-h-${suffix}`,
       uid: 3n, leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof });
+    const failedFallbackInput = { uid: 3n, canonicalModel: basis.model,
+      canonicalBody: { ...failedResumeBody, stream: false } as unknown as ProxyBody };
+    assert.equal(await journal.findReplayIdentity(failedFallbackInput), null);
+    assert.equal((await journal.findSettledFailure(failedFallbackInput))?.requestId, `box-h-${suffix}`);
+    const ownerSnapshot = (await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [failedChainRoot.requestId])).rows[0]!.ctx;
+    for (const poison of [{ boxAccountId: "21" }, { boxResumeRequestId: "unrelated" },
+      { boxResumeRevision: "invalid" }, { boxResumeResultHashes: [] },
+      { authorityKind: "bridge_signed", authorityTurnId: "a".repeat(32) }]) {
+      await client.query("UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1",
+        [failedChainRoot.requestId, JSON.stringify(poison)]);
+      await assert.rejects(() => journal.findSettledFailure(failedFallbackInput),
+        /BOX_REPLAY_EVIDENCE_INVALID|BOX_AUTHORITY_REJECTED/);
+      await client.query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",
+        [failedChainRoot.requestId, JSON.stringify(ownerSnapshot)]);
+    }
     const failedChainRows = await client.query<{ request_id: string; state: string;
       ctx: Record<string, unknown>; final_credits: string | null }>(
       `SELECT request_id,state,ctx,final_credits::text

@@ -1,12 +1,14 @@
 // App-isomorphic find harness: real MessageList + real stick controller +
 // attachWheelFence + following getter (not canRestick) + production CSS.
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { MessageList } from "../src/components/MessageRenderer";
 import { createStickToBottomController } from "../src/components/chat/stickToBottom";
 import { attachWheelFence } from "../src/components/chat/wheelFence";
 import { ToastProvider, TooltipProvider } from "../src/components/ui";
 import type { ChatMessage } from "../src/lib/chat/model";
+import { createFindPendingFence } from "./find-pending-fence";
 
 type Scene = "tail" | "coalesce" | "multi" | "budget" | "midtail";
 
@@ -55,6 +57,7 @@ declare global {
       wheelFence: boolean;
       directManipulation: boolean;
       holdFence: () => void;
+      releaseFence: () => void;
       setScene: (scene: Scene) => void;
       setSessionId: (id: string) => void;
       replaceNeedle: (needle: string) => void;
@@ -76,6 +79,7 @@ function Harness() {
   const [mounted, setMounted] = useState(true);
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const stick = useRef(createStickToBottomController()).current;
+  const pendingFence = useMemo(() => createFindPendingFence(stick), [stick]);
   const followBottomRef = useMemo(() => ({
     get current() {
       return stick.following.current;
@@ -91,8 +95,12 @@ function Harness() {
 
   useLayoutEffect(() => {
     if (!scroller) return;
-    return attachWheelFence(scroller, stick);
-  }, [scroller, stick]);
+    const detach = attachWheelFence(scroller, pendingFence.native);
+    return () => {
+      detach();
+      pendingFence.reset();
+    };
+  }, [scroller, pendingFence]);
 
   useLayoutEffect(() => {
     if (!scroller) return;
@@ -117,24 +125,28 @@ function Harness() {
       configurable: true,
       get: () => stick.directManipulation.current,
     });
-    window.__findPage.holdFence = () => stick.beginWheelFence();
-  }, [stick]);
+    window.__findPage.holdFence = pendingFence.hold;
+    window.__findPage.releaseFence = pendingFence.release;
+  }, [stick, pendingFence]);
 
   // Fixture/scene changes may reset; same-session needle replace and sessionId
   // changes must not steal success by resetting the controller.
   useLayoutEffect(() => {
     if (!scroller) return;
+    pendingFence.reset();
     stick.reset();
     stick.scrollToBottom(scroller);
-  }, [scroller, stick, scene]);
+  }, [scroller, stick, pendingFence, scene]);
 
   window.__findPage.setScene = setScene;
-  window.__findPage.setSessionId = setSessionId;
-  window.__findPage.replaceNeedle = setNeedle;
-  window.__findPage.setSending = setSending;
-  window.__findPage.closeFind = () => setFindOpen(false);
+  // The driver can capture pending, commit the cancellation, then release its
+  // hold in one browser task. Setters never release a native or manual fence.
+  window.__findPage.setSessionId = (id) => flushSync(() => setSessionId(id));
+  window.__findPage.replaceNeedle = (value) => flushSync(() => setNeedle(value));
+  window.__findPage.setSending = (value) => flushSync(() => setSending(value));
+  window.__findPage.closeFind = () => flushSync(() => setFindOpen(false));
   window.__findPage.openFind = () => setFindOpen(true);
-  window.__findPage.setMounted = setMounted;
+  window.__findPage.setMounted = (value) => flushSync(() => setMounted(value));
 
   const messages = sceneMessages(scene, needle);
   const mark = useCallback(() => stick.markUserIntent(), [stick]);
@@ -193,6 +205,7 @@ window.__findPage = {
   wheelFence: false,
   directManipulation: false,
   holdFence: () => {},
+  releaseFence: () => {},
   setScene: () => {},
   setSessionId: () => {},
   replaceNeedle: () => {},

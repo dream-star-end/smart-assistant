@@ -67,6 +67,9 @@ export const FILE_BLOCKED_PATTERNS = [
   /\/\.codex\/state_[^/]*\.sqlite(-wal|-shm)?$/,
   /\/\.codex\/config\.toml$/, // model/profile + api keys
 
+  // Task-only fixed-command attempt, receipt and proof state (persistent data volume).
+  /(^|\/)\.cc5-t1555u(\/|$)/,
+
   // Gateway state files (SQLite + WAL/SHM, JSONL outbox, tasks store).
   /\/sessions\.db(-wal|-shm)?$/,
   /\/msg-outbox\.jsonl$/,

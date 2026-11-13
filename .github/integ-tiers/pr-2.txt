@@ -34,3 +34,9 @@ packages/commercial/src/__tests__/admissionRestartRecovery.integ.test.ts
 packages/commercial/src/plugins/literatureDb/platformUsage.integ.test.ts
 packages/commercial/src/plugins/literatureDb/accounts.integ.test.ts
 packages/commercial/src/__tests__/kimi31Catalog.integ.test.ts
+# 四小时的 Box 预留锁不会被同一用户后来的普通预留缩短（独立 unix socket 的
+# redis-server，本机缺该二进制时用例会 skip，本片即红）。
+
+packages/commercial/src/__tests__/modelSwitchCostContext.integ.test.ts
+# Existing Box capacity regression was unregistered; execute it in the billing shard.
+packages/commercial/src/http/proxy/boxAgentSubsessionCapacity.integ.test.ts

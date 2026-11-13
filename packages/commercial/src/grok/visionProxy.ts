@@ -38,6 +38,11 @@ import {
 import { scopeFromAuthz, type UserModelAuthzLoader } from "../auth/userModelAuthz.js";
 import { deriveEngineSessionId } from "../billing/codexFinalizer.js";
 import { settleDurableCodexBilling } from "../billing/durableCodexBilling.js";
+import {
+  attributeOpenTurn,
+  openTurnDispatchColumns,
+  visionOpenTurnCtx,
+} from "../billing/openTurnAttribution.js";
 import type { ModelCatalogSnapshot } from "../billing/modelCatalog.js";
 import { serializeBillingPricing } from "../billing/persistedBillingPricing.js";
 import type { PricingCache } from "../billing/pricing.js";
@@ -48,7 +53,7 @@ import {
   releasePreCheck,
   type PreCheckRedis,
 } from "../billing/preCheck.js";
-import { abortInflightJournal, startInflightJournal } from "../billing/proxyBilling.js";
+import { abortInflightJournal, readJournalForTakeover, startInflightJournal } from "../billing/proxyBilling.js";
 import { query } from "../db/queries.js";
 import { classifyGrokRelayStatus } from "../http/internalGrokRelay.js";
 import {
@@ -141,6 +146,11 @@ export interface GrokVisionHandlerDeps {
   settleDurableCodexBillingFn?: typeof settleDurableCodexBilling;
   abortInflightJournalFn?: typeof abortInflightJournal;
   releasePreCheckFn?: typeof releasePreCheck;
+  readJournalForTakeoverFn?: typeof readJournalForTakeover;
+  /** Frozen at admit. A failed lookup returns null and must not be stamped. */
+  attributeOpenTurnFn?: typeof attributeOpenTurn;
+  /** Live outbound.cost_charged. Absent on replay so a replay cannot push twice. */
+  broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void;
 }
 
 export type GrokVisionHandler = (
@@ -417,6 +427,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
   const now = deps.now ?? Date.now;
   const runPreCheck = deps.preCheckWithCostFn ?? preCheckWithCost;
   const runStartJournal = deps.startInflightJournalFn ?? startInflightJournal;
+  const runReadJournal = deps.readJournalForTakeoverFn ?? readJournalForTakeover;
   const runSettle = deps.settleDurableCodexBillingFn ?? settleDurableCodexBilling;
   const runAbort = deps.abortInflightJournalFn ?? abortInflightJournal;
   const runReleasePreCheck = deps.releasePreCheckFn ?? releasePreCheck;
@@ -507,7 +518,16 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
         }
         throw err;
       }
-      let admitted = false;
+      // One open turn on this container owns the charge. Several, none, or a
+      // missing turn key stay unattributed. Lookup failure is not a skip stamp.
+      const openTurn = containerId === null
+        ? null
+        : await (deps.attributeOpenTurnFn ?? attributeOpenTurn)(
+            deps.getPool(),
+            { userId, containerId },
+            reqLog,
+          );
+      let admitted: boolean;
       try {
         admitted = await runStartJournal(deps.getPool(), {
           requestId: billingRequestId,
@@ -515,6 +535,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
           containerId,
           model: canonical,
           precheckCredits: precheck.maxCost,
+          ...(openTurnDispatchColumns(openTurn) ?? {}),
           ctxJson: {
             agentId: "vision",
             source: GROK_VISION_JOURNAL_SOURCE,
@@ -527,12 +548,28 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
             },
             upstreamModelId: upstreamModel,
             engineSessionId,
+            // chatSessionId routes the live frame. It is not parentSessionId,
+            // so the charge stays mode=chat and lands on this turn key.
+            ...visionOpenTurnCtx(openTurn),
           },
         });
-      } finally {
-        if (!admitted) await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+      } catch (err) {
+        await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+        throw err;
       }
       if (!admitted) {
+        // The request id already has a journal row. Until that row is terminal another call with
+        // this id still owns the reservation (inflight, or finalizing before its charge lands),
+        // and the precheck above re-wrote that same reservation: releasing it here would drop the
+        // running call's hold on the balance (Codex #1130 r1/r2 P1). Release only for a missing
+        // or terminal row; any other or unreadable state is left to the running call or the TTL.
+        const state = await runReadJournal(deps.getPool(), billingRequestId).then(
+          (row) => row?.state ?? null,
+          () => "unknown",
+        );
+        if (state === null || state === "committed" || state === "aborted") {
+          await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+        }
         throw new GrokRunError(409, "GROK_VISION_JOURNAL_CONFLICT", "billing journal conflict");
       }
       abandon = async (reason: string): Promise<void> => {
@@ -634,7 +671,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
 }
 
 async function settleGrokRun(
-  deps: Pick<GrokVisionHandlerDeps, "getPool" | "preCheckRedis" | "pricing">,
+  deps: Pick<GrokVisionHandlerDeps, "getPool" | "preCheckRedis" | "pricing" | "broadcastToUser">,
   runSettle: typeof settleDurableCodexBilling,
   reqLog: Logger,
   userId: bigint,
@@ -642,7 +679,7 @@ async function settleGrokRun(
 ): Promise<void> {
   try {
     const outcome = await runSettle(
-      { pgPool: deps.getPool(), preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, logger: reqLog },
+      { pgPool: deps.getPool(), preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, logger: reqLog, broadcastToUser: deps.broadcastToUser },
       userId,
       { requestId: frame.requestId, engineSessionId: frame.engineSessionId, status: "success", durationMs: frame.durationMs, usage: frame.usage },
     );

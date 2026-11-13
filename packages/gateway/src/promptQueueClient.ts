@@ -62,6 +62,7 @@ export interface PromptQueueDetail {
     agentId: string
     model?: string
     modelSwitchId?: string
+    modelSwitchConsent?: string
     effortLevel?: string | null
     teamMode?: boolean
     collabMode?: 'solo' | 'advisor' | 'team'
@@ -487,10 +488,11 @@ function assertOwner(value: unknown, expected: PromptQueueWireOwner, userId: str
 
 function assertRequestedExecution(value: unknown, agentId: string): void {
   const execution = record(value, 'requestedExecution')
-  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'], 'requestedExecution')
+  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'modelSwitchConsent', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'], 'requestedExecution')
   if (execution.agentId !== agentId) invalidResponse('requestedExecution.agentId mismatch')
   if (execution.model !== undefined && typeof execution.model !== 'string')
     invalidResponse('requestedExecution.model invalid')
+  if (execution.modelSwitchConsent !== undefined && (typeof execution.modelSwitchConsent !== 'string' || execution.modelSwitchConsent.length>4096)) invalidResponse('requestedExecution.modelSwitchConsent invalid')
   if (execution.modelSwitchId !== undefined && (
     typeof execution.modelSwitchId !== 'string' ||
     !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId)

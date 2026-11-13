@@ -6,6 +6,7 @@ import {
   isConsultTurnClaims,
   issueConsultTurnToken,
   issueDelegateContextToken,
+  issueParentCallerToken,
   resetDelegateContextKeyForTests,
   verifyDelegateContextToken,
 } from '../delegateContext.js'
@@ -74,5 +75,22 @@ describe('delegateContext token', () => {
     assert.equal(claims.turnKey, 'a'.repeat(64))
     assert.equal(claims.turnIndex, 3)
     assert.equal(claims.collabMode, 'advisor')
+  })
+})
+
+describe('canonical parent trace in signed caller snapshots', () => {
+  it('v1 and advisor v2 preserve the parent trace; legacy stays absent', () => {
+    const base = { agentId: 'main', sessionKey: 'agent:main:webchat:dm:p2', depth: 1 }
+    for (const consultTurn of [undefined, { turnKey: 'a'.repeat(64), turnIndex: 2, configVersion: 'v1' }]) {
+      const traceId = '1'.repeat(32)
+      const signed = issueParentCallerToken({ ...base, traceId, consultTurn })
+      assert.equal(verifyDelegateContextToken(signed)?.traceId, traceId)
+      const [payload, signature] = signed.split('.')
+      const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString())
+      claims.traceId = '2'.repeat(32)
+      assert.equal(verifyDelegateContextToken(`${Buffer.from(JSON.stringify(claims)).toString('base64url')}.${signature}`), null)
+    }
+    assert.equal(verifyDelegateContextToken(issueParentCallerToken(base))?.traceId, undefined)
+    assert.throws(() => issueParentCallerToken({ ...base, traceId: 'request-id-is-not-canonical' }))
   })
 })

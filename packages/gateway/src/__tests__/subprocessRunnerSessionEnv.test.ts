@@ -47,3 +47,12 @@ test('real LocalBackend child receives runner session aliases, not parent or pro
   assert.equal(probe.OPENCLAUDE_SESSION_KEY, sessionKey)
   assertNotInheritedWrongValues(probe)
 })
+
+
+test('oracle rejects a second default spawn object even when hidden in a dead branch', () => {
+  const mutated = src.replace('spawnOpts = {', 'if (false) { spawnOpts = {} }\n      spawnOpts = {')
+  assert.notEqual(mutated, src)
+  const result = inspectCcbSpawnWiring(mutated)
+  if (result.ok) assert.fail('expected ambiguous default spawn objects to be rejected')
+  assert.match(result.reason, /exactly one default spawnOpts object/)
+})

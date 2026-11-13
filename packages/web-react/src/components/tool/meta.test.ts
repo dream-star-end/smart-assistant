@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
 import { Bot, Clock, ShieldCheck } from "lucide-react";
-import { detectOcCli, isMemoryFilePath, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
+import { detectOcCli, humanStepTitle, isMemoryFilePath, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 // 跨包取 openclaude-memory 工具名单一权威表(与 index.ts TOOLS 声明同源),做锁步断言。
 import {
   MEMORY_MCP_TOOL_NAMES,
@@ -350,6 +350,15 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
       "搜索 AI 市场",
     );
     expect(toolSummary("Bash", { command: "oc-market search image" })).toBe("image");
+    // 无位置参数时不把英文子命令(snapshot/screenshot)当用户摘要露出(U7)
+    expect(toolSummary("Bash", { command: "oc-browser snapshot" })).toBe("");
+    expect(toolSummary("Bash", { command: "oc-browser screenshot" })).toBe("");
+    expect(toolSummary("mcp__openclaude-memory__memory", { action: "read", section: "用户偏好" })).toBe(
+      "读取 用户偏好",
+    );
+    expect(toolSummary("mcp__openclaude-memory__memory", { action: "replace", target: "项目背景" })).toBe(
+      "更新 项目背景",
+    );
   });
 });
 
@@ -764,5 +773,22 @@ describe("CCB ExecuteExtraTool / SearchExtraTools 包装归一化", () => {
       "mcp__openclaude-memory__skill_view",
     );
     expect(toolSummary("ExecuteExtraTool", { tool_name: "TeamCreate" })).toBe("TeamCreate");
+  });
+});
+
+describe("humanStepTitle（UI-3 过程步骤的人话标题）", () => {
+  test("文件类只留文件名，命令只说「运行命令」，等待委派不带任务 ID", () => {
+    expect(humanStepTitle("Read", { file_path: "/home/agent/work/周会记录.txt" })).toBe("读取 周会记录.txt");
+    expect(humanStepTitle("Edit", { file_path: "src/app/timer.ts" })).toBe("修改 timer.ts");
+    expect(humanStepTitle("Write", { file_path: "/w/纪要.docx", content: "x" })).toBe("写入 纪要.docx");
+    expect(humanStepTitle("Bash", { command: "python - <<'PY'\nprint(1)\nPY" })).toBe("运行命令");
+    expect(humanStepTitle("Bash", { command: "oc-memory delegate-wait dlgjob-mvon5yk2-7398486c106a" })).toBe("等待子任务完成");
+    expect(humanStepTitle("Grep", { pattern: "foo.*bar" })).toBe("搜索内容");
+  });
+  test("技能 ID、蛇形操作名、--help 不进标题；网址只留域名；人话对象保留", () => {
+    expect(humanStepTitle("mcp__openclaude-memory__skill_view", { name: "coding-suite" })).toBe("查看技能");
+    expect(humanStepTitle("mcp__browser__browser_navigate", { url: "https://www.example.com/a?b=1" })).toBe("打开网页 example.com");
+    expect(humanStepTitle("WebSearch", { query: "东京 商务酒店" })).toBe('网页搜索 "东京 商务酒店"');
+    expect(humanStepTitle("some_raw_tool", {})).toBe("调用工具");
   });
 });

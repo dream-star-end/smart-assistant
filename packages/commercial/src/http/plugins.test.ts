@@ -758,10 +758,7 @@ describe('Plugin management HTTP dispatcher', () => {
     )
     await assert.rejects(
       dispatchPluginsRoute(
-        await request(
-          'GET',
-          '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff',
-        ),
+        await request('GET', '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff'),
         response(),
         {} as any,
         deps({ literatureArtifacts: store }),

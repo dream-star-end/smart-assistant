@@ -119,6 +119,7 @@ export function openTaskboardDb(dbPath: string, opts: OpenTaskboardDbOptions = {
   const db = new Database(dbPath)
   db.pragma('busy_timeout = 10000')
   db.pragma('journal_mode = WAL')
+  db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
   migrate(db)
 

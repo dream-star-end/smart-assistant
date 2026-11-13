@@ -322,17 +322,24 @@ test('control file is private and the bridge copies one stdin line to stdout', a
 // INC-20261005-BOX-CC-FOLLOWUP-TURN: closing stdin used to do nothing. The
 // runner then SIGKILLed the bridge, the next turn was reported as a crash,
 // and the box Claude stayed alive on the session.
-async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
+async function bridgeAgainstFakeBox(
+  remoteEndsOnStop: boolean,
+  opts: { holdStopResponseOpen?: boolean } = {},
+): Promise<{
   code: number | 'pending'
   out: string
   launchFifo: string
   stopFifos: string[]
+  phases: Array<{ phase: string; ms: number }>
 }> {
   const previousNoProxy = process.env.NO_PROXY
   process.env.NO_PROXY = '127.0.0.1,localhost'
   const launch: { res: ServerResponse | null } = { res: null }
   let launchFifo = ''
   const stopFifos: string[] = []
+  const phases: Array<{ phase: string; ms: number }> = []
+  const started = performance.now()
+  const mark = (phase: string) => phases.push({ phase, ms: Math.round(performance.now() - started) })
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (chunk) => chunks.push(chunk))
@@ -348,11 +355,18 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
         launch.res?.write(frame({ stdoutEvent: { data: '{"type":"result","subtype":"success"}\n' } }))
       } else if (body.args[1] === BOX_CC_STOP_SCRIPT) {
         stopFifos.push(String(body.args[3]))
-        res.end(frame({ exitEvent: {} }))
+        mark('stop-request')
+        res.on('finish', () => mark('stop-response-eof'))
+        if (opts.holdStopResponseOpen) {
+          res.write(frame({ exitEvent: {} }))
+          mark('stop-response-held-open')
+        } else res.end(frame({ exitEvent: {} }))
         if (remoteEndsOnStop) launch.res?.end(frame({ exitEvent: { exitCode: 143 } }))
       } else {
         launchFifo = String(body.args[3])
         launch.res = res
+        mark('main-open')
+        res.on('close', () => mark('main-response-close'))
         res.write(frame({ stderrEvent: { data: 'BOX_INTERACTIVE_READY plugins=oc-bridge\n' } }))
       }
     })
@@ -363,6 +377,7 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
   const stdin = new PassThrough()
   const stdout = new PassThrough()
   let out = ''
+  let observationTimer: ReturnType<typeof setTimeout> | undefined
   stdout.on('data', (chunk) => { out += chunk.toString('utf8') })
   try {
     const running = runBoxCcBridge({
@@ -384,13 +399,22 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
     // The turn is over and the process is idle. Now the gateway retires it.
+    mark('stdin-close')
     stdin.end()
+    void running.then(() => mark('bridge-resolved'), () => mark('bridge-rejected'))
     const code = await Promise.race([
       running,
-      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 2_000)),
+      // Production allows 2s for stop exec/body, then 300ms for the launch
+      // stream. Observe through the runner's existing 3s shutdown grace.
+      new Promise<'pending'>((resolve) => {
+        observationTimer = setTimeout(() => resolve('pending'), 3_000)
+      }),
     ])
-    return { code, out, launchFifo, stopFifos }
+    mark('observation-complete')
+    return { code, out, launchFifo, stopFifos, phases }
   } finally {
+    if (observationTimer !== undefined) clearTimeout(observationTimer)
+    mark('fixture-cleanup')
     stdin.destroy()
     launch.res?.destroy()
     server.closeAllConnections()
@@ -400,18 +424,33 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
   }
 }
 
-test('closing stdin ends the box Claude and the bridge exits 0', async () => {
+test('closing stdin ends the box Claude and the bridge exits 0', async (t) => {
   const run = await bridgeAgainstFakeBox(true)
+  t.diagnostic(JSON.stringify({ remoteEndsOnStop: true, phases: run.phases }))
   assert.match(run.out, /"result"/)
   assert.equal(run.code, 0)
   assert.match(run.launchFifo, /^\/tmp\/oc-box-cc-0123456789abcdef\.[a-f0-9]{16}\.fifo$/)
   assert.deepEqual(run.stopFifos, [run.launchFifo])
 })
 
-test('closing stdin exits 0 even when the box never reports the exit', async () => {
+test('closing stdin exits 0 even when the box never reports the exit', async (t) => {
   const run = await bridgeAgainstFakeBox(false)
+  t.diagnostic(JSON.stringify({ remoteEndsOnStop: false, phases: run.phases }))
   assert.equal(run.code, 0)
   assert.deepEqual(run.stopFifos, [run.launchFifo])
+})
+
+test('closing stdin exits 0 before cleanup when the stop response body never ends', async (t) => {
+  const run = await bridgeAgainstFakeBox(false, { holdStopResponseOpen: true })
+  t.diagnostic(JSON.stringify({ remoteEndsOnStop: false, holdStopResponseOpen: true, phases: run.phases }))
+  assert.equal(run.code, 0)
+  assert.deepEqual(run.stopFifos, [run.launchFifo])
+  const phases = run.phases.map(({ phase }) => phase)
+  assert.ok(phases.includes('stop-response-held-open'))
+  assert.equal(phases.includes('stop-response-eof'), false)
+  const resolved = phases.indexOf('bridge-resolved')
+  const cleanup = phases.indexOf('fixture-cleanup')
+  assert.ok(resolved >= 0 && resolved < cleanup, 'bridge must settle before fixture cleanup closes either response')
 })
 
 function stdinReaders(fifo: string): number[] {

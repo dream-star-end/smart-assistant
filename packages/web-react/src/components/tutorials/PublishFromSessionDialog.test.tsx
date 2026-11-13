@@ -1,9 +1,9 @@
+import { createMemoryAuthSession } from '../../lib/authSession'
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../lib/api'
 import type { ChatMessage } from '../../lib/chat/model'
-import { createMemoryAuthSession } from '../../lib/authSession'
 import type { ProjectAsset } from '../../lib/types'
 import { MAX_TUTORIAL_ARTIFACT_BYTES } from '../../lib/tutorialStudio'
 import { PublishFromSessionDialog } from './PublishFromSessionDialog'
@@ -33,7 +33,8 @@ vi.mock('../MessageRenderer', () => ({
   ),
 }))
 
-const auth = createMemoryAuthSession(() => {}, 'token')
+const auth = createMemoryAuthSession(() => {})
+auth.commitToken(auth.beginIdentity(), 'token')
 
 const messages: ChatMessage[] = [
   { id: 'u1', role: 'user', text: '帮我整理这份公开数据', ts: 1 },

@@ -20,7 +20,7 @@ test('Goal/GitHub identity promotion preserves an explicit draft effort through 
     const options = useSessionEngineOptions(activeId)
     const materialize = useDraftSessionMaterialization({
       demo: false, userId: '42', activeId, draftSessionId: id, stopPreparing: () => {},
-      agentId: 'main', modelId: 'gpt-6.1-sol', teamMode: false, ...options,
+      agentId: 'main', modelId: 'gpt-6.1-sol', ...options,
       sockRef, setSessions, setActiveId,
     })
     return { activeId, sessions, materialize, ...options }

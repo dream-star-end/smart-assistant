@@ -6,6 +6,7 @@
  */
 import type { AuthSession, RefreshOutcome, RefreshResult } from "../types";
 import { reportClientFriction } from "../clientFriction";
+import { withCrossTabRefreshLock } from "../refreshCrossTabLock";
 
 /**
  * v5 商业版前端网络层。
@@ -59,8 +60,9 @@ export const refreshStates = new WeakMap<AuthSession, RefreshState>();
 
 const authResponseFences = new WeakMap<Response, { session: AuthSession; epoch: number }>();
 
-// 本 tab 内所有会写 oc_rt 的调用按发起顺序落地。跨 tab 的 refresh 冲突由后端
-// REFRESH_RACE 协议处理；主动 logout 另有 token-free 广播让其它 tab 立即撤退。
+// 本 tab 内所有会写 oc_rt 的调用按发起顺序落地。跨 tab refresh 另走
+// withCrossTabRefreshLock（Web Locks / BroadcastChannel）；后端 REFRESH_RACE
+// 仍是安全网。主动 logout 另有 token-free 广播让其它 tab 立即撤退。
 let authCookieMutationTail: Promise<void> = Promise.resolve();
 
 export function withAuthCookieMutation<T>(run: () => Promise<T>): Promise<T> {
@@ -197,6 +199,9 @@ export function refreshAuth(
 
   const flight = withAuthCookieMutation(async (): Promise<RefreshOutcome> => {
     // 排队不计入 refresh 自身网络期限；login/logout 队首也各自有同样的 30s 上限。
+    // Cross-tab lock wraps only the network rotate so sibling tabs wait for
+    // Set-Cookie before their own refresh (OCV5-622).
+    return withCrossTabRefreshLock(async (): Promise<RefreshOutcome> => {
     timeout = setTimeout(
       () => controller.abort(new DOMException("refresh timeout", "TimeoutError")),
       REFRESH_TIMEOUT_MS,
@@ -265,6 +270,7 @@ export function refreshAuth(
     return raw.kind === "transient" && raw.superseded
       ? { kind: "transient", epoch: expectedEpoch, retryAfterMs, superseded: true }
       : { kind: "transient", epoch: expectedEpoch, retryAfterMs };
+    });
   }).finally(() => {
     if (timeout) clearTimeout(timeout);
     if (state.flight === flight) state.flight = null;
@@ -490,8 +496,9 @@ export async function throwApi(res: Response): Promise<never> {
       if (typeof e.code === "string") code = e.code;
       if (Array.isArray(e.issues)) issues = e.issues as ApiIssue[];
     } else if (typeof err === "string") {
-      // gateway：{ error: "<string>" }
+      // gateway：{ error: "<string>", code? }
       message = err;
+      if (typeof b?.code === "string") code = b.code;
     } else if (typeof b?.message === "string") {
       message = b.message as string;
     }
@@ -518,4 +525,12 @@ export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T
   const body = (await res.json()) as T;
   assertAuthResponseCurrent(res);
   return body;
+}
+
+/** Local execution capability; never accepted from model/card JSON. */
+export type RequestExecutionGuard = { signal?: AbortSignal; assertCurrent: () => void }
+export function fetchWithExecutionGuard(input: RequestInfo | URL, init: RequestInit, guard?: RequestExecutionGuard): Promise<Response> {
+  guard?.assertCurrent()
+  if (guard?.signal?.aborted) throw new DOMException('aborted', 'AbortError')
+  return fetch(input, { ...init, ...(guard ? { signal: guard.signal } : {}) })
 }

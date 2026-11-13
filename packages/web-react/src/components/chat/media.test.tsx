@@ -259,7 +259,7 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
     fireEvent.click(await screen.findByRole("link", { name: /报表\.html/ }));
 
     expect(await screen.findByText("下载失败")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /重试/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /继续/ })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "直接下载" })).toBeInTheDocument();
   });
 

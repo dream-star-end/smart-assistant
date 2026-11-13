@@ -9,9 +9,10 @@
 import * as assert from 'node:assert/strict'
 import { sign as cryptoSign, generateKeyPairSync } from 'node:crypto'
 import { describe, it } from 'node:test'
+import { CC5_INTERACTIVE_BACKEND, CC5_NATIVE_MODEL, type Cc5ExecutionBackend } from '../cc5Backend.js'
 
 import {
-  AUTHORITY_TURN_MAX_LIFETIME_MS,
+  TURN_LEASE_TTL_MS,
   AUTHORITY_TTL_MS,
   type JsonValue,
   MODEL_AUTHORITY_FIELD,
@@ -110,6 +111,63 @@ function expectCode(fn: () => unknown, code: string): void {
   }
   assert.fail(`expected throw with code ${code}`)
 }
+
+describe('signed execution backend scope', () => {
+  const backend: Cc5ExecutionBackend = {
+    kind: CC5_INTERACTIVE_BACKEND,
+    sessionKey: 'agent:main:webchat:dm:new_chat_123',
+    operationId: '11111111-1111-4111-8111-111111111111',
+  }
+  function nativePayload(): ModelAuthorityPayload {
+    return makePayload({ engine: 'ccb', canonicalModel: CC5_NATIVE_MODEL, executionBackend: backend,
+      executionDescriptor: { capabilityProfile: { ccb: { capabilityZero: false,
+        supportsThinking: true, contextOwner: 'box-native-v1' } },
+        capabilitySchemaVersion: 1, contextWindow: 200000, supportsVision: true,
+        supportedEfforts: [] } })
+  }
+  it('roundtrips the existing Sonnet identity and context owner with its immutable backend', () => {
+    const payload = nativePayload()
+    const verified = verifyAuthority(signAuthorityEnvelope(payload), keyring, NOW)
+    assert.deepEqual(verified, payload)
+    assert.equal(Object.isFrozen(verified.executionBackend), true)
+  })
+  it('absence preserves ordinary authority payloads without synthesizing a backend', () => {
+    const original = makePayload()
+    assert.deepEqual(verifyAuthority(signAuthorityEnvelope(original), keyring, NOW), original)
+    assert.equal('executionBackend' in verifyAuthority(signAuthorityEnvelope(original), keyring, NOW), false)
+  })
+  it('changing a valid session or operation after signing fails verification', () => {
+    const payload = nativePayload()
+    const envelope = JSON.parse(Buffer.from(signAuthorityEnvelope(payload), 'base64url').toString())
+    for (const change of [
+      { sessionKey: 'agent:main:webchat:dm:other_chat_123' },
+      { operationId: '22222222-2222-4222-8222-222222222222' },
+    ]) {
+      const forged = structuredClone(envelope)
+      Object.assign(forged.payload.executionBackend, change)
+      expectCode(() => verifyAuthority(Buffer.from(JSON.stringify(forged)).toString('base64url'), keyring, NOW), 'VerifyFail')
+    }
+  })
+  it('any approved remote model slug may carry a signed cc5 backend, and its exact value is retained', () => {
+    const payload = { ...nativePayload(), canonicalModel: 'claude-opus-5' }
+    const verified = verifyAuthority(signAuthorityEnvelope(payload), keyring, NOW)
+    assert.equal(verified.canonicalModel, 'claude-opus-5')
+    assert.deepEqual(verified.executionBackend, backend)
+  })
+  it('even valid signatures cannot authorize unknown shape, backend, model or engine', () => {
+    for (const change of [
+      { engine: 'cursor' }, { canonicalModel: 'Claude Opus 5' }, { canonicalModel: '' },
+      { executionBackend: { ...backend, other: true } },
+      { executionBackend: { ...backend, kind: 'other-backend' } },
+      { executionBackend: { ...backend, sessionKey: 'agent:main:main' } },
+      { executionBackend: { ...backend, operationId: 'not-a-uuid' } },
+      { executionBackend: null },
+    ]) {
+      const payload = { ...nativePayload(), ...change } as ModelAuthorityPayload
+      expectCode(() => verifyAuthority(signAuthorityEnvelope(payload), keyring, NOW), 'BadShape')
+    }
+  })
+})
 
 // --- JCS ---------------------------------------------------------------------
 
@@ -457,12 +515,12 @@ describe('verifyTurnLease + assertLeaseMatchesAuthority', () => {
     assert.ok(verifyTurnLease(signLeaseEnvelope(l), keyring, t))
   })
 
-  it('滚动续签保持 originalIssuedAt，可用到 12h 绝对上限前', () => {
+  it('滚动续签跨过 24h，单张 lease 仍只具有短窗口', () => {
     const originalIssuedAt = NOW
     const renewed = makeLease({
       originalIssuedAt,
-      issuedAt: NOW + 11 * 60 * 60_000,
-      expiresAt: originalIssuedAt + AUTHORITY_TURN_MAX_LIFETIME_MS,
+      issuedAt: NOW + 24 * 60 * 60_000,
+      expiresAt: NOW + 24 * 60 * 60_000 + TURN_LEASE_TTL_MS,
     })
     const verified = verifyTurnLease(
       signLeaseEnvelope(renewed),
@@ -480,19 +538,37 @@ describe('verifyTurnLease + assertLeaseMatchesAuthority', () => {
     assert.equal(turnLeaseOriginalIssuedAt(verified), legacy.issuedAt)
   })
 
-  it('拒绝倒置时间窗口和越过 12h 绝对上限的签名 lease', () => {
+  it('拒绝倒置时间窗口和单张超过 50min 的签名 lease', () => {
     const cases: TurnLease[] = [
       makeLease({ originalIssuedAt: NOW + 1, issuedAt: NOW }),
       makeLease({ originalIssuedAt: NOW, issuedAt: NOW + 10, expiresAt: NOW + 10 }),
       makeLease({
         originalIssuedAt: NOW,
         issuedAt: NOW + 60_000,
-        expiresAt: NOW + AUTHORITY_TURN_MAX_LIFETIME_MS + 1,
+        expiresAt: NOW + 60_000 + TURN_LEASE_TTL_MS + 1,
       }),
     ]
     for (const lease of cases) {
       expectCode(() => verifyTurnLease(signLeaseEnvelope(lease), keyring, NOW), 'BadShape')
     }
+  })
+
+  it('只有显式 renewal 验签允许过期，签名和窗口校验仍不可绕过', () => {
+    const lease = makeLease()
+    const expiredAt = lease.expiresAt + 1
+    const envelope = signLeaseEnvelope(lease)
+    expectCode(() => verifyTurnLease(envelope, keyring, expiredAt), 'Expired')
+    assert.deepEqual(verifyTurnLease(envelope, keyring, expiredAt, { allowExpired: true }), lease)
+    const tampered = JSON.parse(Buffer.from(envelope, 'base64url').toString('utf8'))
+    tampered.payload.uid += 1
+    expectCode(
+      () => verifyTurnLease(Buffer.from(JSON.stringify(tampered)).toString('base64url'), keyring, expiredAt, { allowExpired: true }),
+      'VerifyFail',
+    )
+    expectCode(
+      () => verifyTurnLease(signLeaseEnvelope(makeLease({ expiresAt: NOW + TURN_LEASE_TTL_MS + 1 })), keyring, expiredAt, { allowExpired: true }),
+      'BadShape',
+    )
   })
 
   it('绑定字段任一不一致 → LeaseMismatch', () => {

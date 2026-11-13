@@ -9,6 +9,31 @@
       "types": "./src/index.ts",
       "openclaude-precompiled": "./dist/index.js",
       "default": "./src/index.ts"
+    },
+    "./remote-finance": {
+      "types": "./src/remoteFinance.ts",
+      "openclaude-precompiled": "./dist/remoteFinance.js",
+      "default": "./src/remoteFinance.ts"
+    },
+    "./codex-commissioning": {
+      "types": "./src/codexCommissioning.ts",
+      "openclaude-precompiled": "./dist/codexCommissioning.js",
+      "default": "./src/codexCommissioning.ts"
+    },
+    "./cc5-finance": {
+      "types": "./src/cc5Finance.ts",
+      "openclaude-precompiled": "./dist/cc5Finance.js",
+      "default": "./src/cc5Finance.ts"
+    },
+    "./cc5-container-runtime": {
+      "types": "./src/cc5ContainerRuntime.ts",
+      "openclaude-precompiled": "./dist/cc5ContainerRuntime.js",
+      "default": "./src/cc5ContainerRuntime.ts"
+    },
+    "./remote-pool": {
+      "types": "./src/remotePool/index.ts",
+      "openclaude-precompiled": "./dist/remotePool/index.js",
+      "default": "./src/remotePool/index.ts"
     }
   },
   "dependencies": {
@@ -22,7 +47,7 @@
     "mammoth": "^1.12.0",
     "pdf-parse": "^2.4.5",
     "protobufjs": "^8.8.0",
-    "sharp": "^0.34.3",
+    "sharp": "^0.35.5",
     "ws": "^8.18.0",
     "yaml": "^2.6.0"
   },

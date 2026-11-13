@@ -1352,6 +1352,16 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
       status: string; revision?: string; compactRequired?: boolean };
     if (proof.status !== "terminal" || proof.compactRequired !== true || !proof.revision) fail(`IDLE_SOURCE_PROOF_${proof.status}`);
     const revision = proof.revision;
+    // OCV5-755: by default the next message no longer dispatches the idle turn; it is deferred to the
+    // pre-expiry timer. The message passes at once, nothing is dispatched and no candidate is left.
+    const deferredKey = "idle-deferred";
+    api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: deferredKey, sessionId: who.sessionId, turnKey: sourceTurn });
+    if (await submit(deferredKey) !== "admitted") fail("IDLE_DEFERRED_BLOCKS_NEXT_MESSAGE");
+    if (counters.submits !== 0 || api.idle.readIdleCandidate(dir, deferredKey) !== undefined
+      || api.idle.readIdleOp(dir, deferredKey, revision) !== undefined) fail("IDLE_DEFERRED_DISPATCHED");
+    // The incident below drives the dispatch and settlement path itself. Production reaches it from the
+    // pre-expiry timer; here the immediate timing is pinned so the next message is what dispatches.
+    process.env.OC_BOX_IDLE_PRE_EXPIRY_MS = "off";
     const key = "idle-no-summary";
     api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: key, sessionId: who.sessionId, turnKey: sourceTurn });
     const before = Date.now();
@@ -1407,6 +1417,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
       || api.idle.readPendingIdle(dir, lost) !== undefined || counters.submits !== submits) fail("IDLE_LOST_SOURCE_OP");
     return "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released";
   } finally {
+    delete process.env.OC_BOX_IDLE_PRE_EXPIRY_MS;
     api.idle.setRuntimeIncarnationStartForTest(undefined);
     await routes.close();
     rmSync(root, { recursive: true, force: true });
@@ -2876,7 +2887,7 @@ async function main(): Promise<void> {
     model: MODEL, upstreamModel: CLI_MODEL, candidate: CANDIDATE });
   const proofs = [(await import("./lib/boxKeeperOwnedChildrenProof.js")).proveKeeperOwnedChildren(CANDIDATE), proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
-    proveForeignToolHistory(api), await proveGptWebCitationMarkers(CANDIDATE), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    proveForeignToolHistory(api), await (await import("./lib/boxGptWebCitationProof.js")).proveGptWebCitationMarkers(CANDIDATE), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api), await (await import("./lib/boxCapacityHeldProof.js")).proveCapacityHeldReleased(CANDIDATE), // OCV5-649 (file-size ratchet): [ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),

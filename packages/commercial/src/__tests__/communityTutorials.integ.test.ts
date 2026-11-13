@@ -23,6 +23,7 @@ beforeEach(async () => {
     'tutorial_compass_notes',
     'tutorial_eval_jobs',
     'tutorial_blob_refs',
+    'tutorial_blob_uploads',
     'tutorial_blobs',
     'tutorial_case_specs',
     'community_tutorials',

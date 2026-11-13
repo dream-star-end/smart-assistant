@@ -26,7 +26,7 @@ export const CRON_EXECUTION_HEARTBEAT_LEAVES = [
   'submit cancel then hung destroy does not keep renewing',
   'origin-session inject/ACK pending archive creates no local heartbeat',
   'stop during submit stops renewal; queued callback and the next due job cannot start',
-  'non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires',
+  'silence trips idle while waiting and active turns continue beyond 12h/24h',
 ] as const
 
 const WORKSPACE_PACKAGES = ['gateway', 'storage', 'protocol', 'kernel'] as const

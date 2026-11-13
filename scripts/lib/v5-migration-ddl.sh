@@ -21,6 +21,23 @@ if re.search(r"\bALTER\b[\s\S]{0,200}\bDROP\b", text, re.I):
     print("ALTER ... DROP"); sys.exit(0)
 if re.search(r"\bRENAME\s+(TO|COLUMN|TABLE)\b", text, re.I):
     print("RENAME"); sys.exit(0)
+# A privilege named TRUNCATE is not a TRUNCATE command. Recognize only complete,
+# simple table ACL statements; leave complex/unrecognized SQL conservatively intact.
+priv = r"(?:SELECT|INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER|MAINTAIN|ALL(?:\s+PRIVILEGES)?)"
+privs = priv + r"(?:\s*,\s*" + priv + r")*"
+ident = r"[A-Za-z_][A-Za-z_0-9$]*(?:\.[A-Za-z_][A-Za-z_0-9$]*)?"
+names = ident + r"(?:\s*,\s*" + ident + r")*"
+acl = (r"(?:GRANT\s+(?P<grant_privs>" + privs + r")\s+ON\s+(?:TABLE\s+)?" + names +
+       r"\s+TO\s+" + names + r"(?:\s+WITH\s+GRANT\s+OPTION)?|" +
+       r"REVOKE\s+(?:GRANT\s+OPTION\s+FOR\s+)?(?P<revoke_privs>" + privs +
+       r")\s+ON\s+(?:TABLE\s+)?" + names + r"\s+FROM\s+" + names + r"(?:\s+(?:CASCADE|RESTRICT))?)")
+def mask_acl_privilege(match):
+    group = "grant_privs" if match.group("grant_privs") is not None else "revoke_privs"
+    start, end = match.span(group)
+    start -= match.start(); end -= match.start()
+    sql = match.group(0)
+    return sql[:start] + re.sub(r"\bTRUNCATE\b", "        ", sql[start:end], flags=re.I) + sql[end:]
+text = re.sub(r"(?:^|;)\s*" + acl + r"\s*(?=;|$)", mask_acl_privilege, text, flags=re.I)
 if re.search(r"\bTRUNCATE\b", text, re.I):
     print("TRUNCATE"); sys.exit(0)
 sys.exit(1)

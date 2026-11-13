@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFileSync,spawnSync} from 'node:child_process';
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,chmodSync,existsSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,chmodSync,existsSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -11,21 +11,24 @@ const root=process.env.OC_SOURCE_PIN_TEST_ROOT||fileURLToPath(new URL('../../',i
 const d=readFileSync(join(root,'scripts/deploy-v5-selfhost.sh'),'utf8'),m=readFileSync(join(root,'scripts/v5-selfhost-master-release-lib.sh'),'utf8');
 function fn(s,n){const match=s.match(new RegExp('^'+n+'\\(\\) \\{[^\\n]*\\n[\\s\\S]*?^\\}','m'));assert.ok(match,n);return match[0];}
 function block(s,startRe,endRe){const a=s.search(startRe);assert.ok(a>=0,String(startRe));const rest=s.slice(a);const b=rest.search(endRe);assert.ok(b>0,String(endRe));return rest.slice(0,b);}
+const hostPolicy=readFileSync(join(root,'scripts/lib/v5-selfhost-host-log-policy.sh'),'utf8');
+const hostPolicyFiles=['scripts/v5-selfhost-host-log-policy.py','deploy/v5-selfhost/host-log-policy.json','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost-egress-watch'];
+const modelPolicyFiles=['deploy/v5-selfhost/model-availability.json','scripts/lib/selfhost-model-policy.mjs','packages/commercial/src/billing/modelAvailability.ts'];
 const q=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
-const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(m,'write_strong_release_marker_local')].join('\n');
+const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',`source ${q(join(root,'scripts/lib/v5-selfhost-model-policy.sh'))}`,block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'master_seed_frontend_buildinfo'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
 const asRoot=typeof process.getuid==='function'&&process.getuid()===0;
 function fixture(t){
  const dir=mkdtempSync(join(tmpdir(),'oc-deploy-speed-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const repo=join(dir,'repo');
  const env={PATH:process.env.PATH,HOME:dir,TMPDIR:dir,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',LC_ALL:'C.UTF-8'};
  const git=(...a)=>execFileSync('git',['-C',repo,...a],{env,encoding:'utf8'}).trim();
- for(const p of['packages/web-react/src','packages/protocol/src','packages/mcp-memory/src','packages/gateway/src','scripts'])mkdirSync(join(repo,p),{recursive:true});
- const files={'packages/web-react/src/App.tsx':'app-1\n','packages/protocol/src/frames.ts':'p-1\n','packages/mcp-memory/src/toolNames.ts':'t-1\n','packages/gateway/src/x.ts':'g-1\n','package-lock.json':'{"l":1}\n','package.json':'{}\n','scripts/v5-selfhost-master-release-lib.sh':'# lib-1\n'};
+ for(const p of['packages/web-react/src','packages/protocol/src','packages/mcp-memory/src','packages/gateway/src','scripts/lib'])mkdirSync(join(repo,p),{recursive:true});
+ const files={'packages/web-react/src/App.tsx':'app-1\n','packages/protocol/src/frames.ts':'p-1\n','packages/mcp-memory/src/toolNames.ts':'t-1\n','packages/gateway/src/x.ts':'g-1\n','package-lock.json':'{"l":1}\n','package.json':'{}\n','scripts/v5-selfhost-master-release-lib.sh':'# lib-1\n','scripts/lib/v5-selfhost-prewarm.sh':'# prewarm-1\n'};
  execFileSync('git',['init','-q',repo],{env});git('config','user.name','t');git('config','user.email','t@example.invalid');
  for(const[k,v]of Object.entries(files))writeFileSync(join(repo,k),v);git('add','.');git('commit','-qm','base');
  const commit=(path,content)=>{writeFileSync(join(repo,path),content);git('commit','-qam','c '+path);return git('rev-parse','HEAD');};
  return{dir,repo,env,git,commit,base:git('rev-parse','HEAD')};
 }
-function bash(f,src,body){return spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),'TEST_ROOT='+q(f.dir),'log() { echo "$*"; }; mlog() { echo "$*" >&2; }; die() { echo "$*" >&2; exit 73; }','MASTER_RELEASES_ROOT="$TEST_ROOT/releases"; MASTER_LIVE_LINK="$TEST_ROOT/live"',src,body].join('\n')],{env:f.env,cwd:f.dir,encoding:'utf8',timeout:20000});}
+function bash(f,src,body){return spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),`SCRIPT_DIR=${q(join(root,'scripts'))}`,'TEST_ROOT='+q(f.dir),'log() { echo "$*"; }; mlog() { echo "$*" >&2; }; die() { echo "$*" >&2; exit 73; }','MASTER_RELEASES_ROOT="$TEST_ROOT/releases"; MASTER_LIVE_LINK="$TEST_ROOT/live"',src,body].join('\n')],{env:f.env,cwd:f.dir,encoding:'utf8',timeout:20000});}
 function ok(o){assert.equal(o.status,0,o.stdout+'\n'+o.stderr);return o.stdout.trim();}
 const key=(f,sha)=>ok(bash(f,webLib,'master_web_dist_key '+q(sha)));
 
@@ -43,7 +46,7 @@ test('web dist key changes with every web build input and ignores unrelated back
  const f=fixture(t);const k0=key(f,f.base);assert.match(k0,/^[0-9a-f]{64}$/);
  const gw=f.commit('packages/gateway/src/x.ts','g-2\n');assert.equal(key(f,gw),k0,'gateway-only change must keep the key');
  let prev=k0;
- for(const p of['packages/web-react/src/App.tsx','packages/protocol/src/frames.ts','packages/mcp-memory/src/toolNames.ts','package-lock.json','package.json','scripts/v5-selfhost-master-release-lib.sh']){
+ for(const p of['packages/web-react/src/App.tsx','packages/protocol/src/frames.ts','packages/mcp-memory/src/toolNames.ts','package-lock.json','package.json','scripts/v5-selfhost-master-release-lib.sh','scripts/lib/v5-selfhost-prewarm.sh']){
   const sha=f.commit(p,'changed '+p+'\n');const k=key(f,sha);assert.notEqual(k,prev,p+' must change the key');prev=k;
  }
  assert.equal(bash(f,webLib,'master_web_dist_key 0000000000000000000000000000000000000000').status===0,false,'unknown sha must not produce a key');
@@ -53,9 +56,11 @@ test('web dist key changes with every web build input and ignores unrelated back
 function release(f,name,{key:k,html='<html><head><meta name="oc-build" content="0123456789abcdef"></head></html>',seal=true,record=true,poison=false}={}){
  const rel=join(f.dir,'releases',name),dist=join(rel,'packages/web-react/dist');mkdirSync(join(dist,'assets'),{recursive:true});
  writeFileSync(join(dist,'index.html'),html);writeFileSync(join(dist,'assets/main.js'),'console.log(1)\n');
+ writeFileSync(join(rel,'packages/web-react/tsconfig.tsbuildinfo'),'fixture-buildinfo\n');
  mkdirSync(join(rel,'node_modules/tsx'),{recursive:true});mkdirSync(join(rel,'deploy/v5'),{recursive:true});
  writeFileSync(join(rel,'package.json'),'{}');writeFileSync(join(rel,'deploy/v5/release-metadata.json'),'{}');
  writeFileSync(join(rel,'VERSION.json'),JSON.stringify({commit:f.base.slice(0,9)}));
+ for(const policyPath of [...hostPolicyFiles,...modelPolicyFiles]){const target=join(rel,policyPath);mkdirSync(join(target,'..'),{recursive:true});writeFileSync(target,readFileSync(join(root,policyPath)));}
  if(poison)writeFileSync(join(rel,'.poisoned'),'');
  if(record)ok(bash(f,webLib,'write_web_dist_reuse_record '+q(rel)+' '+q(k)+' built '+q(f.base)));
  if(seal)ok(bash(f,webLib,'write_strong_release_marker_local '+q(rel)+' '+q(f.base)+' '+q(f.base.slice(0,9))+' 20261008-000000 2'));
@@ -86,13 +91,20 @@ test('build_master_release reuses a matching dist instead of running the web bui
  const f=fixture(t);const k=key(f,f.base);const live=release(f,'rel-live',{key:k});symlinkSync(live,join(f.dir,'live'));
  // Extract just the frontend section of build_master_release and run it against a staging dir.
  const bmr=fn(m,'build_master_release');
- const section=block(bmr,/^  t0="\$\(date \+%s\)"\n  web_key=/m,/^  # openclaude-memory MCP server/m);
+ // P3 moves the same reuse/build contract into the scheduled D worker.
+ const section=block(bmr,/^  master_job_frontend\(\) \{/m,/^  local job\b/m);
  const body=['staging="$TEST_ROOT/staging"; full_sha='+q(f.base)+'; mkdir -p "$staging/packages/web-react"','cleanup_master_staging() { :; }',
-  'npm() { echo NPM_BUILD_RAN >&2; return 99; }',section,'echo "mode=$MASTER_FRONTEND_MODE"; cat "$staging/.web-dist-reuse.json"'].join('\n');
+  'npm() { echo NPM_BUILD_RAN >&2; return 99; }',
+  'MASTER_GATE_TMPDIR="$TEST_ROOT"',section,'master_job_frontend || die frontend-failed','echo "mode=$MASTER_FRONTEND_MODE"; cat "$staging/.web-dist-reuse.json"'].join('\n');
  const out=bash(f,webLib,body);const s=ok(out);
  assert.match(s,/mode=reused/);assert.doesNotMatch(out.stderr,/NPM_BUILD_RAN/);
  const rec=JSON.parse(s.slice(s.indexOf('{')));assert.equal(rec.key,k);assert.equal(rec.mode,'reused');assert.equal(rec.donor,live);
  assert.equal(readFileSync(join(f.dir,'staging/packages/web-react/dist/assets/main.js'),'utf8'),'console.log(1)\n');
+ const donorInfo=join(live,'packages/web-react/tsconfig.tsbuildinfo');
+ const stagingInfo=join(f.dir,'staging/packages/web-react/tsconfig.tsbuildinfo');
+ assert.equal(readFileSync(stagingInfo,'utf8'),readFileSync(donorInfo,'utf8'));
+ assert.notEqual(statSync(stagingInfo).ino,statSync(donorInfo).ino,'a reused release must carry a private buildinfo for the next train');
+ assert.equal(readFileSync(join(f.dir,'frontend.result'),'utf8').trim().split(' ')[2],'0','reused D has no tsc work');
  // OC_V5_FORCE_WEB_BUILD=1 → the real build path runs (our npm stub fails it → die 73).
  rmSync(join(f.dir,'staging'),{recursive:true,force:true});
  const forced=bash(f,webLib,'OC_V5_FORCE_WEB_BUILD=1\n'+body);assert.equal(forced.status,73,forced.stderr);assert.match(forced.stderr,/NPM_BUILD_RAN/);
@@ -157,10 +169,15 @@ test('dry-run and OC_V5_SERIAL_RUNTIME_BUILD=1 keep the serial in-place build',t
 
 test('cmd_deploy wires the bg runtime build around build_master_release and the EXIT trap reaps it',()=>{
  const cd=fn(d,'cmd_deploy');
- assert.ok(cd.indexOf('start_runtime_release_bg "$sha"')>=0&&cd.indexOf('start_runtime_release_bg "$sha"')<cd.indexOf('build_master_release "$sha"'));
+ // OCV5-648 (P2): build_master_release starts the bg build right after admission; cmd_deploy only opts in.
+ assert.doesNotMatch(cd,/^\s+start_runtime_release_bg /m,'cmd_deploy must not start the bg build before admission');
+ const optIn=cd.indexOf('MASTER_RUNTIME_BG_AFTER_ADMISSION=1');
+ assert.ok(optIn>=0&&optIn<cd.indexOf('build_master_release "$sha"'));
  assert.ok(cd.indexOf('collect_runtime_release_bg "$sha"')>cd.indexOf('build_master_release "$sha"')&&cd.indexOf('collect_runtime_release_bg "$sha"')<cd.indexOf('build_platform_bundle "$sha"'));
  assert.doesNotMatch(cd,/^\s+build_runtime_release "\$sha"/m);
- const cleanup=fn(d,'cleanup_selfhost_deploy');assert.ok(cleanup.indexOf('reap_runtime_release_bg')<cleanup.indexOf('lease_train_on_exit'),'reap before train/lock release');
+ const cleanup=fn(d,'cleanup_selfhost_deploy');
+ assert.ok(cleanup.indexOf('reap_master_build_jobs')<cleanup.indexOf('lease_train_on_exit'),'C/D drained before train/lock release');
+ assert.ok(cleanup.indexOf('reap_runtime_release_bg')<cleanup.indexOf('lease_train_on_exit'),'reap before train/lock release');
 });
 
 test('if the parent is killed outright (no EXIT trap), the bg build keeps holding the deploy lock fd until it finishes',async t=>{
@@ -177,4 +194,39 @@ test('if the parent is killed outright (no EXIT trap), the bg build keeps holdin
  assert.ok(existsSync(join(f.dir,'bg-done')),'bg build must run to completion');
  spawnSync('sleep',['0.3']);
  const free=spawnSync('flock',['-n',lock,'true']);assert.equal(free.status,0,'lock is released once the bg build exits');
+});
+
+// OCV5-648 (P2): admission no longer waits on the train's own runtime build; the deterministic non-Box gates
+// overlap the build; the Box gates (and the load-scaled ccb-mcp gate) still run only after it (OCV5-557).
+test('P2: bg build starts after admission; non-Box gates overlap it; Box gates and ccb-mcp run after await',()=>{
+ const b=fn(m,'build_master_release');
+ const at=s=>{const i=b.indexOf(s);assert.ok(i>=0,s);assert.equal(b.indexOf(s,i+1),-1,`once: ${s}`);return i;};
+ const admission=at('master_gate_wait_host_idle admission');
+ const start=at('    start_runtime_release_bg "$full_sha"');
+ assert.match(b.slice(start-120,start),/if \[\[ "\$\{MASTER_RUNTIME_BG_AFTER_ADMISSION:-0\}" == 1 \]\]; then\n$/,'only when cmd_deploy opts in');
+ assert.ok(admission<start&&start<at('mkdir -p -- "$staging"'),'after admission, before the candidate is built');
+ const wait=at('    await_runtime_release_bg\n');
+ const idle=at('master_gate_wait_host_idle box-gates');
+ const db=at('master_gate_db_create "$staging"');
+ const drop=at('  master_gate_db_drop\n');
+ assert.ok(wait<idle&&idle<db&&db<drop);
+ const marks=[...b.matchAll(/^ {2}tsum_mark (C\.[a-z-]+) /gm)].map(x=>[x[1],x.index]);
+ const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.box-longtask','C.ccb-mcp']);
+ // P3 aggregates overlapping jobs under C.parallel; each still has its own receipt.
+ assert.deepEqual(marks.map(x=>x[0]),['C.parallel',...after]);
+ const queued=[...b.matchAll(/^ {4}(C\.[a-z-]+):master_job_/gm)].map(x=>x[1]);
+ assert.deepEqual(queued,['C.session-rootfix','C.watch-gate','C.cursor-sand','C.delegate-billing','C.callback-ws','C.cron-submit','C.prompt-privacy','C.session-boundary','C.system-approval','C.system-executor','C.host-log-policy','C.model-policy','C.architecture']);
+ assert.ok(at('  if ! master_build_jobs_wait;')<wait,'C/D drained before runtime/Box barrier');
+ for(const g of after)assert.ok(marks.some(([n])=>n===g),g);
+ // the first Box gate's mark opens its phase, then the await (OCV5-557 wait is counted inside that phase)
+ const boxMark=at('  tsum_mark C.box-success-recovery ');assert.ok(boxMark<wait&&wait-boxMark<400);
+ for(const[n,i]of marks){
+  if(after.has(n))assert.ok(i>=boxMark,`${n} must run after the runtime build has finished`);
+  else assert.ok(i<boxMark,`${n} overlaps the runtime build`);
+ }
+ // every Box gate and the ccb-mcp gate command is after the await; every DB gate is between create and drop
+ for(const g of['check-v5-box-success-recovery.ts','check-v5-box-continuation.ts','check-v5-box-incident-proofs.ts','check-v5-box-longtask.ts','check-v5-ccb-mcp-availability.ts'])
+  for(const x of b.matchAll(new RegExp(g.replaceAll('.','\\.'),'g')))assert.ok(x.index>idle,g);
+ for(const x of b.matchAll(/TEST_DATABASE_URL="\$MASTER_GATE_DB_URL"/g))assert.ok(x.index>db&&x.index<drop);
+ assert.ok(at('  tsum_mark C.ccb-mcp ')>drop&&at('  tsum_mark C.ccb-mcp ')<at('\n  cleanup_master_gate_tmpdir\n'));
 });

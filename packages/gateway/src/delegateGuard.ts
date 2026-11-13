@@ -1,3 +1,4 @@
+import { cancelDelegateTraceWait } from './delegateTrace.js'
 /**
  * Gateway delegate guard: resource/concurrency gates, active-delegation registry and parent interrupts, collaboration engine/capability and consult liveness
  *
@@ -133,6 +134,7 @@ export function _interruptDelegationsForParent(this: DelegateGuardHost, parentSe
   for (const childSessionKey of [...childSessionKeys]) {
     attempted++
     const descendantInterrupted = this._interruptDelegationsForParent(childSessionKey, visited)
+    interrupted = cancelDelegateTraceWait(this, childSessionKey) || interrupted
     this._advisorConsultAborts?.get(childSessionKey)?.abort()
     // 还在资源闸排队等待的委派(尚未 spawn,session 不存在):唤醒并中止其等待,
     // 否则 Stop 级联对它不可达,要干等到排队超时。

@@ -28,7 +28,8 @@ import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { randomBytes } from "node:crypto";
-import { explainBoxNativeHistory, withPromptLayout } from "./boxNativeHistory.js";
+import { explainBoxNativeHistoryDetailed, withPromptLayout } from "./boxNativeHistory.js";
+import { rememberBoxNativeContext, type BoxNativeMissDetail } from "./boxNativeContextDiagnosis.js";
 import { boxPromptLayoutOf } from "./boxMessagesMapper.js";
 import { boxRunnerLoginScope, boxRunnerPlanInput, type BoxInteractiveHostAsset } from "./boxTextPlan.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
@@ -121,7 +122,7 @@ export async function runBoxToolFirstRound(input: {
   budgetMs?: number;
   /** Content-free record of the native resume decision (hit, or why not). */
   onNativeDecision?: (info: { requestId: string; decision: "resume" | "miss";
-    reason: string; cliVersion: string }) => void;
+    reason: string; cliVersion: string; detail?: BoxNativeMissDetail }) => void;
   /** OCV5-299: stop a launched run whose stream this decoder deterministically
    * rejected (e.g. a tool name outside this invocation's catalog). Returns the
    * explicit-stop outcome; only "stopped_proven" means the row is now a proven
@@ -336,6 +337,7 @@ export async function runBoxToolFirstRound(input: {
       // the staged MCP catalog stay identical across the rolling deploy.
       const pointerCatalog = candidate
         ? boxCatalogMatching(plan.catalog, candidate.pointer.catalogHash) : null;
+      let missDetail: BoxNativeMissDetail | undefined;
       const miss = !candidate ? "no_candidate"
         : candidate.pointer.accountId !== target.accountId.toString() ? "account"
         : candidate.pointer.upstreamModel !== input.upstreamModel ? "model"
@@ -345,9 +347,13 @@ export async function runBoxToolFirstRound(input: {
         // OCV5-383: a transcript staged with the other prompt layout would lose
         // (or duplicate) the per-session context on resume.
         : (candidate.pointer.promptLayout ?? null) !== boxPromptLayoutOf(input.canonicalBody) ? "layout"
-        : explainBoxNativeHistory(input.canonicalBody, candidate.pointer);
+        : (() => {
+          const explained = explainBoxNativeHistoryDetailed(input.canonicalBody, candidate.pointer);
+          missDetail = explained.detail;
+          return explained.reason;
+        })();
       deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
-        reason: miss, cliVersion: String(target.cliVersion) });
+        reason: miss, cliVersion: String(target.cliVersion), ...(missDetail ? { detail: missDetail } : {}) });
       if (candidate && pointerCatalog && miss === "ok") {
         const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
@@ -377,6 +383,12 @@ export async function runBoxToolFirstRound(input: {
             reason: "preflight", cliVersion: String(target.cliVersion) });
         }
       }
+    }
+    if (input.resumeToolResults && nativeEnabled && boxCliNativeResumeVerified(target.cliVersion)) {
+      // OCV5-756: a tool exchange whose held CLI is gone is re-staged by design
+      // (OCV5-304); record it so these misses are counted apart from history ones.
+      deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
+        reason: "tool_resume", cliVersion: String(target.cliVersion) });
     }
     // OCV5-384: a re-staged conversation carries the context records of the session's previous
     // native transcript after its first user message, where that transcript has them, so the
@@ -633,6 +645,7 @@ export async function runBoxToolFirstRound(input: {
               requestId: input.requestId, uid: input.uid,
               accountId: target.accountId, proof, pointer: candidate })) {
               nativePointer = candidate;
+              rememberBoxNativeContext(contextHash, input.canonicalBody);
             }
           } catch { /* Optional cache failure cannot erase settled model usage. */ }
         }

@@ -15,11 +15,33 @@ import { _tapeErrorCodeForGenericFailure } from '../sessionManager.js'
 import { _buildEngineErrorFrame } from '../turnFrames.js'
 
 describe('classifyRunError', () => {
+  it('preserves the Antigravity observation failure on wire/tape without automatic recovery', () => {
+    for (const raw of [
+      'timeout waiting for cascade to start running',
+      'ANTIGRAVITY_START_OBSERVATION_FAILED: timeout waiting for cascade to start running',
+    ]) {
+      const cls = classifyRunError(raw)
+      assert.equal(cls.code, 'antigravity_start_observation_failed')
+      assert.match(cls.message, /可能已有操作完成/)
+      const frame = _buildEngineErrorFrame({ sessionKey: 'sk', channel: 'webchat',
+        peer: { id: 'u3', kind: 'dm' } }, { kind: 'error', error: raw })
+      assert.equal(frame.code, cls.code)
+      assert.equal(_tapeErrorCodeForGenericFailure(raw), cls.code)
+      assert.equal(supportsAutomaticTurnRecovery(cls.code), false)
+    }
+    assert.notEqual(classifyRunError('timeout waiting for a network connection').code,
+      'antigravity_start_observation_failed')
+    assert.equal(supportsAutomaticTurnRecovery(classifyRunError('upstream 503 unavailable').code), true)
+  })
+
   it('OCV5-649 Box slot 409 stays box_capacity_held on the wire and tape and is never auto-recovered', () => {
     // The exact production terminal (commercial uid 4, 10-28 trace 5adf074e).
     const raw = JSON.stringify({ subtype: 'success',
       result: 'API Error: 409 {"error":{"code":"BOX_CAPACITY_HELD","message":"Box slot busy"},"request_id":"065f563d454c692b1f828fd3d36d49c3"}' })
-    assert.equal(classifyRunError(raw).code, 'box_capacity_held')
+    const classified = classifyRunError(raw)
+    assert.equal(classified.code, 'box_capacity_held')
+    assert.match(classified.message, /已有进度已保留/)
+    assert.doesNotMatch(classified.message, /尚未开始|未开始处理/)
     const frame = _buildEngineErrorFrame({ sessionKey: 'sk', channel: 'webchat',
       peer: { id: 'u4', kind: 'dm' } }, { kind: 'error', error: raw })
     assert.equal(frame.code, 'box_capacity_held')

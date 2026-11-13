@@ -23,7 +23,6 @@ const editSchema = {
 const plain = { file_path: "/tmp/ocv5-edit-default/sample.txt", old_string: "OLD", new_string: "NEW" };
 const explicit = { ...plain, replace_all: false as const };
 const model = "box-api-claude-opus-5-5";
-const nonce = "d".repeat(24);
 const epoch = "e".repeat(32);
 const runner = "f".repeat(64);
 
@@ -85,7 +84,8 @@ async function withDb(run: (handle: Handle) => Promise<void>): Promise<void> {
   try {
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
-      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      state text NOT NULL, ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     await client.query(`CREATE TEMP TABLE usage_records (
       request_id text NOT NULL, user_id bigint NOT NULL)`);
@@ -111,6 +111,7 @@ async function seed(handle: Handle, label: string, tools: Tool[],
   baseline: { raw: string; replay: string; request: string; full: string; tail: string };
 }> {
   const key = ids(label);
+  const nonce = randomBytes(12).toString("hex");
   const catalog = compileBoxToolCatalog(tools);
   const hashes = storedHashes(assistant);
   const body = bodyOf(key.session, key.turn, tools, assistant, results);

@@ -11,6 +11,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { acquireFileLock, scanMemoryContent } from './memoryShared.js'
 import { paths } from './paths.js'
+import type { AuthorityPaths } from './authorityPaths.js'
 
 type WriteResult =
   | { ok: true; version: string }
@@ -23,6 +24,13 @@ function sha16(s: string): string {
 
 function normalizeEol(s: string): string {
   return s.replace(/\r\n/g, '\n')
+}
+
+export type UserProfileSnapshot = { text: string; version: string }
+/** One version contract for both the legacy writer and the pure authority reader. */
+export function profileSnapshot(raw: string): UserProfileSnapshot {
+  const text = normalizeEol(raw)
+  return { text, version: sha16(text) }
 }
 
 /** 把存量 §-blob 去 § 化为 bullet 列表:每条 → 单行 `- ...`(内部换行压平成空格)。 */
@@ -63,11 +71,11 @@ export async function readUserProfile(): Promise<{ text: string; version: string
   try {
     raw = await readFile(paths.sharedUserMd, 'utf-8')
   } catch {
-    return { text: '', version: sha16('') }
+    return profileSnapshot('')
   }
   const normalized = normalizeEol(raw)
   if (!normalized.includes('\n§\n')) {
-    return { text: normalized, version: sha16(normalized) }
+    return profileSnapshot(raw)
   }
   // 含 § → 锁内改写(幂等)。
   const release = await acquireFileLock(paths.sharedUserLock)
@@ -81,11 +89,11 @@ export async function readUserProfile(): Promise<{ text: string; version: string
     const curNorm = normalizeEol(cur)
     if (!curNorm.includes('\n§\n')) {
       // 别的进程已去 § → 直接用最新盘上内容。
-      return { text: curNorm, version: sha16(curNorm) }
+      return profileSnapshot(cur)
     }
     const converted = deSection(curNorm)
     await atomicWrite(paths.sharedUserMd, converted)
-    return { text: converted, version: sha16(converted) }
+    return profileSnapshot(converted)
   } finally {
     await release()
   }
@@ -98,27 +106,39 @@ export async function readUserProfile(): Promise<{ text: string; version: string
  *  - 未传 expectedVersion → last-writer-wins 直接写。
  * version 一律对**归一化后**文本计算,与 readUserProfile 返回的 version 一致。
  */
-export async function writeUserProfile(
+type ProfileWriteLocations = Pick<AuthorityPaths, 'sharedUserMd' | 'sharedUserLock'>
+
+/** Explicit staging writer: no global HOME paths, read repair, or unconditional overwrite. */
+export async function writeUserProfileAt(
+  locations: ProfileWriteLocations,
   text: string,
-  expectedVersion?: string,
+  expectedVersion: string,
 ): Promise<WriteResult> {
+  if (!/^[a-f0-9]{16}$/.test(expectedVersion)) throw new Error('A profile CAS version is required')
+  return writeProfile(locations, text, expectedVersion)
+}
+
+export async function writeUserProfile(text: string, expectedVersion?: string): Promise<WriteResult> {
+  return writeProfile(paths, text, expectedVersion)
+}
+
+async function writeProfile(locations: ProfileWriteLocations, text: string, expectedVersion?: string): Promise<WriteResult> {
   const scan = scanMemoryContent(text)
   if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
-  const release = await acquireFileLock(paths.sharedUserLock)
+  const release = await acquireFileLock(locations.sharedUserLock)
   try {
-    let cur = ''
+    let raw = ''
     try {
-      cur = await readFile(paths.sharedUserMd, 'utf-8')
-    } catch {
-      cur = ''
+      raw = await readFile(locations.sharedUserMd, 'utf-8')
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
     }
-    const current = normalizeEol(cur)
-    const currentVersion = sha16(current)
-    if (expectedVersion !== undefined && expectedVersion !== currentVersion) {
-      return { ok: false, conflict: { current, version: currentVersion } }
+    const current = profileSnapshot(raw)
+    if (expectedVersion !== undefined && expectedVersion !== current.version) {
+      return { ok: false, conflict: { current: current.text, version: current.version } }
     }
-    await atomicWrite(paths.sharedUserMd, text)
-    return { ok: true, version: sha16(normalizeEol(text)) }
+    await atomicWrite(locations.sharedUserMd, text)
+    return { ok: true, version: profileSnapshot(text).version }
   } finally {
     await release()
   }

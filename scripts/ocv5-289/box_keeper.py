@@ -339,6 +339,11 @@ def main() -> int:
     keeper_pid = os.getpid()
     env = { **os.environ, "OCV5_KEEPER_REPORT_FD": str(report_write),
         "OCV5_KEEPER_ACK_FD": str(ack_read) }
+    # Caller environment cannot select an unrelated diagnostic identity.
+    for key in ("OCV5_DIAGNOSTIC_PROOF_DIR", "OCV5_DIAGNOSTIC_LEASE_EPOCH"):
+        env.pop(key, None)
+    if proof_dir is not None:
+        env.update(OCV5_DIAGNOSTIC_PROOF_DIR=proof_dir, OCV5_DIAGNOSTIC_LEASE_EPOCH=epoch)
     try:
         worker = subprocess.Popen([sys.executable, "-I", sys.argv[1], *worker_args],
             env=env, stdin=subprocess.DEVNULL, stdout=None, stderr=None,

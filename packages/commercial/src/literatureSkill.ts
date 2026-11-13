@@ -42,7 +42,7 @@
  * 而且这段文本对 prompt 是 source-of-truth,不应被任何外部产物污染。
  */
 
-import type { LiteratureSkillConfig } from "./admin/literatureConfig.js";
+import { type LiteratureSkillConfig, getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 
 /**
  * 容器内 POST /v3/literature/search 的协议契约(写到 system prompt 让 LLM 看)。
@@ -163,3 +163,21 @@ export const DEEPXIV_SECTION_END = "<!-- deepxiv:end -->";
 export const DEEPXIV_SKILL_RENDER_CONFIG: LiteratureSkillConfig = {
   enabled: true, token_set: true, default_size: 10,
 };
+
+/**
+ * 0069 — SKILLS_LITERATURE slot provider(commercial/index.ts 启动时 setLiteratureSkillProvider)。
+ * 容器 spawn 重建 system prompt 时读窄配置,admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY)。
+ * 最小权限:只调 getLiteratureSkillConfig()(不解密 token),bearer plaintext 只在 proxy 路径出现。
+ * fail-soft:DB 抖动 → 返 null + warn,prompt 构建照样推进(这条 slot 是增强非必需,用 warn 压低噪声)。
+ */
+export async function literatureSkillSlotProvider(): Promise<{ name: string; content: string } | null> {
+  try {
+    const cfg = await getLiteratureSkillConfig();
+    if (!cfg.enabled || !cfg.token_set) return null;
+    return { name: "SKILLS_LITERATURE", content: LITERATURE_SKILL_POINTER };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[commercial] literatureSkillProvider read failed, skipping slot:", err);
+    return null;
+  }
+}

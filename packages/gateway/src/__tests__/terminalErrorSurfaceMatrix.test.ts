@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 /**
  * Terminal-error surface matrix —— "错误以正常返回值出现" 这一类引擎适配 bug 的门。
  *
@@ -28,7 +29,6 @@
  */
 
 import * as assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -143,6 +143,12 @@ const SCENARIOS: readonly Scenario[] = [
     why: 'E7 — 凭据坏了重试只会再 401,不进 TRANSIENT_RETRY_ERROR_CODES,立即给 relogin 引导',
   },
   {
+    code: 'antigravity_start_observation_failed',
+    sample: 'ANTIGRAVITY_START_OBSERVATION_FAILED: timeout waiting for cascade to start running',
+    attempts: 1,
+    why: 'CLI lost observation while tools may have executed: neither resolved nor thrown error may resubmit',
+  },
+  {
     code: 'platform_credential_expired',
     sample:
       'ANTIGRAVITY_CREDENTIAL_EXPIRED: agent executor error: generating and executing: request failed: Post \"http://127.0.0.1:18789/internal/v5/antigravity-relay/route/<route>/v1internal:streamGenerateContent?alt=sse\": oauth2: token expired and refresh token is not set',
@@ -174,7 +180,9 @@ function makeConfigStub(): OpenClaudeConfig {
   } as unknown as OpenClaudeConfig
 }
 
-class FakeCcbRunner extends EventEmitter {
+class FakeCcbRunner extends MinimalPrivacyRunner {
+  isRunning = false
+
   lastActivityAt = Date.now()
   submits = 0
   consultTurnBinding:
@@ -194,11 +202,15 @@ class FakeCcbRunner extends EventEmitter {
   interrupt(): boolean {
     return false
   }
-  async shutdown(): Promise<void> {}
+  async shutdown(): Promise<void> {
+    this.isRunning = false
+  }
   clearSessionId(): void {}
   async waitForOutputDrain(): Promise<void> {}
 
   async submit(): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
     this.submits += 1
     this.onSubmit(this)
   }

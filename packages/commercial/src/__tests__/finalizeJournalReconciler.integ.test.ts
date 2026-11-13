@@ -27,7 +27,8 @@ import {
   claimInflightJournalForSettlement,
   finalizeInflightJournal,
 } from '../billing/proxyBilling.js'
-import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
+import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
+import { REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from '../billing/remoteNativeBillingIdentity.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 
@@ -154,6 +155,7 @@ async function insertJournal(
     settlementClaimId?: string
     gatewayExitedAt?: string
     dispatchId?: string
+    remoteNative?: boolean
   } = {},
 ): Promise<void> {
   const state = opts.state ?? 'inflight'
@@ -168,6 +170,7 @@ async function insertJournal(
       JSON.stringify({
         model: 'claude-x',
         ...(opts.durable ? { durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION } : {}),
+        ...(opts.remoteNative ? { remoteNativeBillingRecovery: REMOTE_NATIVE_BILLING_RECOVERY_VERSION } : {}),
         ...(opts.settlementClaimId ? { settlementClaimId: opts.settlementClaimId } : {}),
         ...(opts.gatewayExitedAt ? { gatewayExitedAt: opts.gatewayExitedAt } : {}),
       }),
@@ -524,6 +527,56 @@ describe('gcFinalizeJournal (integ)', () => {
 
 // G2:三条 CAS 都不覆盖的死角 —— durable finalizing 无 usage 老化行,只读扫描检出、
 // **绝不改状态**(告警交人工裁定,状态原样)。这里锁真 SQL 谓词与"行状态不变"。
+describe('remote native journal isolation (integ)', () => {
+  test('generic abort cannot cancel inflight or owned finalizing native effects', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('native-abort-guard@t.co')
+    await insertJournal('native-inflight', u, { remoteNative: true })
+    await insertJournal('native-finalizing', u, { remoteNative: true,
+      state: 'finalizing', settlementClaimId: 'native-claim' })
+    assert.equal(await abortInflightJournal(getPool(), 'native-inflight', 'synthetic stop'), false)
+    assert.equal(await abortInflightJournal(getPool(), 'native-finalizing', 'synthetic failure',
+      'INTERNAL_ERROR', 'native-claim'), false)
+    assert.equal((await getJournal('native-inflight'))?.state, 'inflight')
+    assert.equal((await getJournal('native-finalizing'))?.state, 'finalizing')
+  })
+
+  test('legacy reconcile cannot commit or time-waive native rows, including overlapping markers', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('native-reconcile-guard@t.co')
+    await insertJournal('native-unknown', u, { remoteNative: true, ageMs: DURABLE_EXPIRED_MS,
+      gatewayExitedAt: new Date().toISOString() })
+    await insertJournal('native-has-usage', u, { remoteNative: true, ageMs: DURABLE_EXPIRED_MS })
+    await insertUsage(u, 'native-has-usage', { cost: 9n })
+    await insertJournal('native-overlap', u, { remoteNative: true, durable: true,
+      ageMs: DURABLE_EXPIRED_MS })
+    const r = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
+    assert.deepEqual(r, { committed: 0, aborted: 0, durableWaived: 0 })
+    for (const id of ['native-unknown', 'native-has-usage', 'native-overlap']) {
+      assert.equal((await getJournal(id))?.state, 'inflight')
+    }
+  })
+
+  test('generic GC retains native receipt/decision evidence in every partition', async (t) => {
+    if (skipIfNoPg(t)) return
+    const u = await createUser('native-gc-guard@t.co')
+    const ageMs = 100 * 24 * 3_600_000
+    for (const [id, state, durable] of [
+      ['native-committed', 'committed', false],
+      ['native-aborted', 'aborted', false],
+      ['native-durable-committed', 'committed', true],
+      ['native-durable-aborted', 'aborted', true],
+    ] as const) {
+      await insertJournal(id, u, { state, durable, ageMs, remoteNative: true })
+      if (state === 'committed') await insertUsage(u, id, { cost: 1n })
+    }
+    assert.equal(await gcFinalizeJournal(GC_AGE_MS, 100), 0)
+    for (const id of ['native-committed', 'native-aborted', 'native-durable-committed', 'native-durable-aborted']) {
+      assert.ok(await getJournal(id))
+    }
+  })
+})
+
 describe('scanStuckDurableFinalizing (integ)', () => {
   const ALERT_AGE_MS = 48 * 3_600_000 // 48h 告警龄
   const AGED_MS = 60 * 3_600_000 // 60h(> 告警龄)

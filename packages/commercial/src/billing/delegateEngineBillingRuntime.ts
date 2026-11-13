@@ -26,10 +26,15 @@ import {
 } from './codexFinalizer.js'
 import { settleDurableCodexBilling } from './durableCodexBilling.js'
 import {
+  attributeOpenTurn,
+  delegateOpenTurnCtx,
+  openTurnDispatchColumns,
+} from './openTurnAttribution.js'
+import {
   UnknownCapabilitySchemaError,
   type ModelCatalogSnapshot,
 } from './modelCatalog.js'
-import { serializeBillingPricing } from './persistedBillingPricing.js'
+import { parseBillingPricing, serializeBillingPricing } from './persistedBillingPricing.js'
 import type { PricingCache } from './pricing.js'
 import {
   InsufficientCreditsError,
@@ -38,8 +43,23 @@ import {
   releasePreCheck,
   type PreCheckRedis,
 } from './preCheck.js'
-import { abortInflightJournal, startInflightJournal } from './proxyBilling.js'
+import {
+  abortInflightJournal,
+  claimInflightJournalForSettlement,
+  finalizeInflightJournal,
+  startInflightJournal,
+} from './proxyBilling.js'
+import {
+  abandonAntigravityTurn,
+  settleAntigravityTurnRecord,
+} from './antigravitySettle.js'
+import {
+  expireAntigravityRelayRoute,
+  expireAntigravityRelayRouteForRequest,
+} from './antigravityRouteContext.js'
+import { releaseInflight } from '../account-pool/policy/affinity.js'
 import type { AdvisorCodexAdmitRoute } from './advisorCodexAdmitRoute.js'
+import { isPlatformPresetPaused } from '../marketplace/seedPlatformAgents.js'
 
 const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
@@ -48,7 +68,6 @@ const SESSION_ID_RE = DELEGATE_ENGINE_BILLING_SESSION_KEY_RE
 const PARENT_TURN_KEY_RE = /^[0-9a-f]{64}$/
 const MODEL_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
-const ADVISOR_AGENT_ID = 'advisor'
 
 export interface DelegateEngineCatalog {
   assertFresh(): Promise<ModelCatalogSnapshot>
@@ -72,17 +91,27 @@ export interface DelegateEngineBillingRuntimeDeps {
   releasePreCheckFn?: typeof releasePreCheck
   getAgentCostMultiplierFn?: typeof getAgentCostMultiplier
   /**
-   * Advisor-consult only. Regular delegate admits must not call this.
-   * Selection is metadata + short-lived api_relay context; 179 catalog/authz/
-   * price/precheck/journal stay unchanged.
+   * Master-issued Codex route for every codex delegate (OCV5-729) and for
+   * advisor consults. Selection is metadata + short-lived api_relay context;
+   * catalog/authz/price/precheck/journal stay unchanged.
    */
-  createAdvisorCodexRoute?: (args: {
+  createCodexDelegateRoute?: (args: {
     containerId: number
     userId: bigint
     modelId: string
     requestId: string
   }) => Promise<AdvisorCodexAdmitRoute>
-  expireAdvisorCodexRoute?: (token: string) => Promise<void> | void
+  expireCodexDelegateRoute?: (token: string) => Promise<void> | void
+  claimInflightJournalForSettlementFn?: typeof claimInflightJournalForSettlement
+  finalizeInflightJournalFn?: typeof finalizeInflightJournal
+  settleAntigravityTurnFn?: typeof settleAntigravityTurnRecord
+  abandonAntigravityTurnFn?: typeof abandonAntigravityTurn
+  expireAntigravityRoute?: (token: string) => Promise<void> | void
+  expireAntigravityRouteForRequest?: (requestId: string) => Promise<void> | void
+  releaseAntigravityInflightFn?: typeof releaseInflight
+  attributeOpenTurnFn?: typeof attributeOpenTurn
+  broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void
+  logger?: { warn(msg: string, fields?: Record<string, unknown>): void }
 }
 
 function requireString(
@@ -110,8 +139,17 @@ function optionalString(
   return value
 }
 
-function sourceForEngine(engine: 'codex' | 'grok'): 'delegate_codex' | 'delegate_grok' {
-  return engine === 'grok' ? 'delegate_grok' : 'delegate_codex'
+type DelegateBillingSource = 'delegate_codex' | 'delegate_grok' | 'delegate_antigravity'
+
+function sourceForEngine(engine: 'codex' | 'grok' | 'antigravity'): DelegateBillingSource {
+  if (engine === 'grok') return 'delegate_grok'
+  if (engine === 'antigravity') return 'delegate_antigravity'
+  return 'delegate_codex'
+}
+
+/** Bounded terminal classification from the container frame (same contract as codex). */
+function normalizeTerminalCode(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[A-Z0-9_]{1,40}$/.test(value) ? value : undefined
 }
 
 function journalString(
@@ -198,16 +236,28 @@ export function createDelegateEngineBillingRuntime(
   const runAbort = deps.abortInflightJournalFn ?? abortInflightJournal
   const runReleasePreCheck = deps.releasePreCheckFn ?? releasePreCheck
   const runAgentMul = deps.getAgentCostMultiplierFn ?? getAgentCostMultiplier
+  const runClaimJournal =
+    deps.claimInflightJournalForSettlementFn ?? claimInflightJournalForSettlement
+  const runFinalizeJournal = deps.finalizeInflightJournalFn ?? finalizeInflightJournal
+  const runSettleAntigravity = deps.settleAntigravityTurnFn ?? settleAntigravityTurnRecord
+  const runAbandonAntigravity = deps.abandonAntigravityTurnFn ?? abandonAntigravityTurn
+  const runExpireAntigravityRoute = deps.expireAntigravityRoute ?? expireAntigravityRelayRoute
+  const runExpireAntigravityRouteForRequest =
+    deps.expireAntigravityRouteForRequest ?? expireAntigravityRelayRouteForRequest
+  const runReleaseAntigravityInflight = deps.releaseAntigravityInflightFn ?? releaseInflight
 
   return {
     async handle({ path, identity, body }) {
       const userId = BigInt(identity.userId)
       if (path === DELEGATE_ENGINE_BILLING_ADMIT_PATH) {
         const model = requireString(body, 'model', MODEL_ID_RE)
-        const engineRaw = requireString(body, 'engine', /^(codex|grok)$/)
-        const engine = engineRaw as 'codex' | 'grok'
+        const engineRaw = requireString(body, 'engine', /^(codex|grok|antigravity)$/)
+        const engine = engineRaw as 'codex' | 'grok' | 'antigravity'
         const agentId = requireString(body, 'agentId', AGENT_ID_RE)
         const delegateAgentId = requireString(body, 'delegateAgentId', AGENT_ID_RE)
+        if (isPlatformPresetPaused(agentId) || isPlatformPresetPaused(delegateAgentId)) {
+          throw new Error('DELEGATE_ENGINE_BILLING_AGENT_UNAVAILABLE')
+        }
         const sessionKey = requireString(body, 'sessionKey', SESSION_ID_RE)
         const parentSessionId = optionalString(body, 'parentSessionId', SESSION_ID_RE)
         const parentTurnKey = optionalString(body, 'parentTurnKey', PARENT_TURN_KEY_RE)
@@ -276,12 +326,26 @@ export function createDelegateEngineBillingRuntime(
               engineSessionId, routeTokenHash: grokRouteTokenHash,
             })
           : undefined
-        const advisorConsult = delegateAgentId === ADVISOR_AGENT_ID && engine === 'codex'
-        let advisorRoute: AdvisorCodexAdmitRoute | undefined
-        if (advisorConsult) {
+        const openTurn = parentTurnKey
+          ? null
+          : await (deps.attributeOpenTurnFn ?? attributeOpenTurn)(
+              deps.getPool(),
+              { userId, containerId: BigInt(identity.containerId) },
+              deps.logger,
+            )
+        const openTurnColumns = parentTurnKey ? undefined : openTurnDispatchColumns(openTurn)
+        // Every codex delegate needs a master-issued route (OCV5-729): the
+        // container's codex CLI is spawned with no provider override and would
+        // otherwise fall back to the built-in `openai` provider plus workspace
+        // routing discovery, which the relay allowlist rejects. Advisor
+        // consults use the same authority; the route stays master-signed and
+        // bound to this container/user/model.
+        const codexRouteRequired = engine === 'codex'
+        let codexRoute: AdvisorCodexAdmitRoute | undefined
+        if (codexRouteRequired) {
           try {
-            advisorRoute = deps.createAdvisorCodexRoute
-              ? await deps.createAdvisorCodexRoute({
+            codexRoute = deps.createCodexDelegateRoute
+              ? await deps.createCodexDelegateRoute({
                   containerId: identity.containerId,
                   userId,
                   modelId: canonical,
@@ -293,8 +357,8 @@ export function createDelegateEngineBillingRuntime(
             throw new Error('DELEGATE_ENGINE_BILLING_ROUTE_UNAVAILABLE')
           }
         }
-        const advisorRouteToken =
-          advisorRoute?.kind === 'api_relay' ? advisorRoute.token : undefined
+        const codexRouteToken =
+          codexRoute?.kind === 'api_relay' ? codexRoute.token : undefined
         try {
           const admitted = await runStartJournal(deps.getPool(), {
             requestId,
@@ -302,12 +366,21 @@ export function createDelegateEngineBillingRuntime(
             containerId: BigInt(identity.containerId),
             model: canonical,
             precheckCredits: precheck.maxCost,
+            ...(openTurnColumns ?? {}),
             ctxJson: {
               agentId,
               delegateAgentId,
-              ...(parentSessionId ? { parentSessionId } : {}),
-              ...(parentTurnKey ? { parentTurnKey } : {}),
+              ...delegateOpenTurnCtx({ parentSessionId, parentTurnKey, stamp: openTurn }),
               source: sourceForEngine(engine),
+              ...(engine === 'antigravity'
+                ? {
+                    antigravityBudgetCredits: (
+                      typeof precheck.balance === 'bigint' && precheck.balance > precheck.maxCost
+                        ? precheck.balance
+                        : precheck.maxCost
+                    ).toString(),
+                  }
+                : {}),
               durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
               billingPricing: serializeBillingPricing(derivedPricing),
               ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}),
@@ -318,20 +391,22 @@ export function createDelegateEngineBillingRuntime(
                 securityEpoch: snapshot.securityEpoch.toString(),
               },
               engineSessionId,
-              ...(advisorRouteToken ? { advisorRouteToken } : {}),
-              ...(advisorRoute ? { advisorRouteKind: advisorRoute.kind } : {}),
+              // Historical key names, shared with advisor consults: settle and
+              // abandon recovery read them to expire api_relay routes.
+              ...(codexRouteToken ? { advisorRouteToken: codexRouteToken } : {}),
+              ...(codexRoute ? { advisorRouteKind: codexRoute.kind } : {}),
             },
           })
           if (!admitted) throw new Error('DELEGATE_ENGINE_BILLING_JOURNAL_CONFLICT')
         } catch (err) {
           await runReleasePreCheck(deps.preCheckRedis, precheck.reservation).catch(() => {})
-          if (advisorRouteToken) {
-            await Promise.resolve(deps.expireAdvisorCodexRoute?.(advisorRouteToken)).catch(() => {})
+          if (codexRouteToken) {
+            await Promise.resolve(deps.expireCodexDelegateRoute?.(codexRouteToken)).catch(() => {})
           }
           throw err
         }
-        if (advisorConsult) {
-          return { requestId, engineSessionId, route: advisorRoute }
+        if (codexRouteRequired) {
+          return { requestId, engineSessionId, route: codexRoute }
         }
         return { requestId, engineSessionId, ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}) }
       }
@@ -352,9 +427,154 @@ export function createDelegateEngineBillingRuntime(
         !journalRow ||
         journalRow.user_id !== String(identity.userId) ||
         journalRow.container_id !== String(identity.containerId) ||
-        (source !== 'delegate_codex' && source !== 'delegate_grok')
+        source !== 'delegate_codex' &&
+        source !== 'delegate_grok' &&
+        source !== 'delegate_antigravity'
       ) {
         throw new Error('DELEGATE_ENGINE_BILLING_INVALID_JOURNAL_IDENTITY')
+      }
+
+      if (path === DELEGATE_ENGINE_BILLING_SETTLE_PATH && source === 'delegate_antigravity') {
+        const engineStatus = body.status === 'success' ? 'success' : 'error'
+        // The route is done the moment the turn is: stop relay traffic before
+        // the (idempotent) usage settle so no late call can add unattributed
+        // spend to this turn.
+        const routeToken = journalString(journalRow.ctx, 'antigravityRouteToken', ROUTE_TOKEN_RE)
+        if (routeToken) {
+          await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
+        }
+        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId)).catch(() => {})
+        const pool = deps.getPool()
+        const reservation = { userId: String(identity.userId), requestId }
+        const claimId = await runClaimJournal(pool, requestId)
+        if (claimId === null) {
+          // Another owner already finalized/claimed this admission. Never
+          // double-debit; the retry converges once that owner reports state.
+          const state = await pool.query<{ state: string }>(
+            'SELECT state FROM request_finalize_journal WHERE request_id=$1',
+            [requestId],
+          )
+          if (state.rows[0]?.state === 'committed') return { settled: true }
+          throw new Error('DELEGATE_ENGINE_BILLING_JOURNAL_CONFLICT')
+        }
+        try {
+          // OCV5-738 blocker 2: settle with the immutable price snapshot frozen
+          // at admission (includes composed agent multiplier). Fall back to
+          // live pricing cache only for legacy journals without billingPricing.
+          const frozenModel = typeof journalRow.ctx?.model === 'string' ? journalRow.ctx.model : undefined
+          const hasFrozenPricing = journalRow.ctx?.billingPricing !== undefined
+          const frozenPricing =
+            frozenModel && hasFrozenPricing
+              ? parseBillingPricing(journalRow.ctx?.billingPricing, frozenModel)
+              : null
+          if (hasFrozenPricing && frozenPricing === null) {
+            await runAbort(
+              pool,
+              requestId,
+              'durable_billing_pricing_invalid',
+              'INTERNAL_ERROR',
+              claimId,
+            )
+            runReleaseAntigravityInflight(requestId)
+            await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+            return { settled: false }
+          }
+          const settlePricing: Pick<PricingCache, 'get'> = frozenPricing
+            ? {
+                get: (modelId: string) =>
+                  modelId === frozenPricing.model_id ? frozenPricing : deps.pricing.get(modelId),
+              }
+            : deps.pricing
+          const done = await runSettleAntigravity({
+            pool,
+            pricing: settlePricing,
+            requestId,
+            userId,
+            engineStatus,
+            terminalCode: normalizeTerminalCode(body.terminalCode),
+            attribution: resolveDelegateBillingAttribution(journalRow.ctx, body),
+          })
+          if (done === null) {
+            // No turn row (route never minted → nothing ran), pricing missing,
+            // or another settle already owns it. Prefer durable usage truth when present.
+            const usage = await pool.query<{
+              id: string
+              ledger_id: string | null
+              cost_credits: string
+            }>(
+              `SELECT id::text AS id, ledger_id::text AS ledger_id, cost_credits::text AS cost_credits
+                 FROM usage_records WHERE user_id=$1 AND request_id=$2`,
+              [String(identity.userId), requestId],
+            )
+            const row = usage.rows[0]
+            if (!row) {
+              // OCV5-738 blocker 3: distinguish "route never minted / abandoned
+              // with zero relay usage" from "turn exists (pending due to missing
+              // price, or settling by another worker) / relay usage recorded".
+              const turnState = await pool.query<{
+                status: string
+                has_usage: boolean
+              }>(
+                `SELECT t.status,
+                        EXISTS (
+                          SELECT 1 FROM antigravity_relay_usage u
+                           WHERE u.request_id = t.request_id AND u.user_id = t.user_id
+                        ) AS has_usage
+                   FROM antigravity_turns t
+                  WHERE t.request_id = $1 AND t.user_id = $2`,
+                [requestId, String(identity.userId)],
+              )
+              const turnRow = turnState.rows[0]
+              if (turnRow && (turnRow.status !== 'abandoned' || turnRow.has_usage)) {
+                throw new Error('DELEGATE_ANTIGRAVITY_SETTLE_RETRYABLE')
+              }
+              await runAbort(
+                pool,
+                requestId,
+                'delegate_antigravity_never_started',
+                'INTERNAL_ERROR',
+                claimId,
+              )
+              // No turn row means the account in-flight unit admitted at mint
+              // was never released by settleAntigravityTurn: give it back here
+              // or ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE fills with ghosts.
+              runReleaseAntigravityInflight(requestId)
+              await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+              return { settled: false }
+            }
+            await runFinalizeJournal(pool, {
+              requestId,
+              finalCredits: BigInt(row.cost_credits),
+              ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
+              usageId: BigInt(row.id),
+              settlementClaimId: claimId,
+            })
+            await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+            return { settled: true }
+          }
+          await runFinalizeJournal(pool, {
+            requestId,
+            finalCredits: done.settled.settledCostCredits ?? 0n,
+            ledgerId: done.settled.ledgerId,
+            usageId: done.settled.usageId,
+            settlementClaimId: claimId,
+          })
+        } catch (err) {
+          // A DB/settle failure is not a waiver: hand finalizing back to
+          // inflight so the container's durable settle retry can finish. The
+          // precheck reservation must survive for that retry.
+          await pool
+            .query(
+              `UPDATE request_finalize_journal
+                  SET state='inflight', ctx=ctx - 'settlementClaimId', updated_at=NOW()
+                WHERE request_id=$1 AND state='finalizing' AND ctx->>'settlementClaimId'=$2`,
+              [requestId, claimId],
+            )
+            .catch(() => {})
+          throw err
+        }
+        await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {})
+        return { settled: true }
       }
 
       if (path === DELEGATE_ENGINE_BILLING_SETTLE_PATH) {
@@ -374,6 +594,7 @@ export function createDelegateEngineBillingRuntime(
             pgPool: deps.getPool(),
             preCheckRedis: deps.preCheckRedis,
             pricing: deps.pricing,
+            broadcastToUser: deps.broadcastToUser,
           },
           userId,
           {
@@ -392,9 +613,34 @@ export function createDelegateEngineBillingRuntime(
         )
         const settledRouteToken = journalString(journalRow.ctx, 'advisorRouteToken', ROUTE_TOKEN_RE)
         if (settledRouteToken) {
-          await Promise.resolve(deps.expireAdvisorCodexRoute?.(settledRouteToken)).catch(() => {})
+          await Promise.resolve(deps.expireCodexDelegateRoute?.(settledRouteToken)).catch(() => {})
         }
         return { settled: true }
+      }
+
+      if (path === DELEGATE_ENGINE_BILLING_ABANDON_PATH && source === 'delegate_antigravity') {
+        // Exactly-once terminal cleanup for an admission whose turn never
+        // started: drop the route, mark the durable turn abandoned (refuses
+        // when relay usage proves a turn ran), give back the account in-flight
+        // slot and the precheck reservation, then abort the journal.
+        const routeToken = journalString(journalRow.ctx, 'antigravityRouteToken', ROUTE_TOKEN_RE)
+        if (routeToken) {
+          await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
+        }
+        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId)).catch(() => {})
+        await runAbandonAntigravity(deps.getPool(), requestId, userId).catch(() => {})
+        runReleaseAntigravityInflight(requestId)
+        await runAbort(
+          deps.getPool(),
+          requestId,
+          'delegate_engine_billing_abandoned',
+          'INTERNAL_ERROR',
+        )
+        await runReleasePreCheck(deps.preCheckRedis, {
+          userId: String(identity.userId),
+          requestId,
+        }).catch(() => {})
+        return { abandoned: true }
       }
 
       if (path === DELEGATE_ENGINE_BILLING_ABANDON_PATH) {
@@ -410,7 +656,7 @@ export function createDelegateEngineBillingRuntime(
         }).catch(() => {})
         const abandonedRouteToken = journalString(journalRow.ctx, 'advisorRouteToken', ROUTE_TOKEN_RE)
         if (abandonedRouteToken) {
-          await Promise.resolve(deps.expireAdvisorCodexRoute?.(abandonedRouteToken)).catch(() => {})
+          await Promise.resolve(deps.expireCodexDelegateRoute?.(abandonedRouteToken)).catch(() => {})
         }
         return { abandoned: true }
       }
