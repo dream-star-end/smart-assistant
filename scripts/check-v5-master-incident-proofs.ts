@@ -132,6 +132,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/gateway/src/__tests__/promptToolRecovery.test.ts',
     cases: ['keeps file search/deletion inside the current conversation unless the user names another one'],
   },
+  {
+    incident: 'INC-20261114-LOCAL-CATALOG-OWNER', slug: 'inc-20261114-local-catalog-owner', db: false,
+    file: 'packages/commercial/src/__tests__/internalModelCatalog.test.ts',
+    cases: ['remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)'],
+  },
 ]
 
 function fail(message: string): never {
