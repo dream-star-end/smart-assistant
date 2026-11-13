@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
+import { syncBuiltinESMExports } from 'node:module'
 import test from 'node:test'
 import sharp from 'sharp'
 import type { PoolOutcome } from '../../account-pool/policy/outcome.js'
@@ -114,11 +116,26 @@ function fixture(config = binding()) {
   }
 }
 
-test('Claude official request uses only fixed image protocol and the platform API-key pool', async () => {
+test('Claude official request uses only fixed image protocol and the platform API-key pool', async (t) => {
+  // A legitimate random UUID can contain the recognized digits without leaking the answer.
+  const requestIds = ['12340000-0000-4000-8000-000000000001', '12340000-0000-4000-8000-000000000002'] as const
   const f = fixture()
   const reader = f.reader()
-  assert.equal(await reader.recognize(await request()), '1234')
-  assert.equal(await reader.recognize(await request()), '1234')
+  const recognize = async (requestId: typeof requestIds[number]) => {
+    const input = await request()
+    const uuid = t.mock.method(crypto, 'randomUUID', () => requestId)
+    syncBuiltinESMExports()
+    try {
+      // recognize allocates its ID synchronously, before its first await. Restore before
+      // async HTTP/Response internals run: those also generate their own UUIDs.
+      return reader.recognize(input)
+    } finally {
+      uuid.mock.restore()
+      syncBuiltinESMExports()
+    }
+  }
+  assert.equal(await recognize(requestIds[0]), '1234')
+  assert.equal(await recognize(requestIds[1]), '1234')
   assert.deepEqual(f.keys, ['claude', 'claude'])
   assert.deepEqual(
     f.health.map((h) => h.member),
@@ -153,7 +170,20 @@ test('Claude official request uses only fixed image protocol and the platform AP
     f.events.map((e) => e.requestId),
     f.begun.map((e) => e.requestId),
   )
-  assert(!JSON.stringify(f.events).includes('1234'))
+  assert.deepEqual(f.events, requestIds.map((requestId) => ({
+    requestId,
+    provider: 'anthropic',
+    model: 'claude-fixture',
+    outcome: 'success',
+    usage: {
+      inputTokens: 10,
+      outputTokens: 2,
+      cacheReadTokens: 3,
+      cacheWriteTokens: 4,
+      thoughtTokens: 0,
+      totalTokens: 19,
+    },
+  })))
   assert(!JSON.stringify(f.events).includes('synthetic-fixture-api-key'))
 })
 
