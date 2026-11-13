@@ -380,76 +380,10 @@ const HELLO_LIVE_CATCHUP_MAX_SESSIONS = 8;
 /** 单会话 hello 补齐帧数封顶,与 GET live-frames 页大小对齐。 */
 const HELLO_LIVE_CATCHUP_MAX_FRAMES = 500;
 
-export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
-export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
-export const PROMPT_QUEUE_DISPATCH_CANCEL_TYPE = "outbound.prompt_queue.dispatch_cancel";
-export const PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE = "outbound.prompt_queue.dispatch_activated";
-export const PROMPT_QUEUE_GRANT_FIELD = "__oc_prompt_queue_grant";
-
-export interface PromptQueueDispatchRequest {
-  type: typeof PROMPT_QUEUE_DISPATCH_REQUEST_TYPE;
-  grantId: string;
-  owner: {
-    sessionKey: string;
-    clientSessionId: string;
-    agentId: string;
-    peer: { id: string; kind: "dm" };
-  };
-  claim: { epoch: string; claimToken: string };
-  item: {
-    itemId: string;
-    clientMessageId: string;
-    contentHash: string;
-    content: Record<string, unknown>;
-    requestedExecution: {
-      agentId: string;
-      model?: string;
-      modelSwitchId?: string;
-      modelSwitchConsent?: string;
-      effortLevel?: string | null;
-      teamMode?: boolean;
-      collabMode?: "solo" | "advisor" | "team";
-      advisorModel?: string;
-      collabConfigVersion?: string;
-      contextTier?: CursorContextTier;
-      serviceTier?: ServiceTier | null;
-    };
-  };
-}
-
-export interface PromptQueueDispatchResult {
-  type: typeof PROMPT_QUEUE_DISPATCH_RESULT_TYPE;
-  grantId: string;
-  owner: PromptQueueDispatchRequest["owner"];
-  itemId: string;
-  contentHash: string;
-  epoch: string;
-  claimToken: string;
-  outcome: "rejected";
-  disposition: "retryable" | "user_action_required";
-  reasonCode: string;
-}
-
-export interface PromptQueueDispatchCancel {
-  type: typeof PROMPT_QUEUE_DISPATCH_CANCEL_TYPE;
-  grantId: string;
-  owner: PromptQueueDispatchRequest["owner"];
-  itemId: string;
-  contentHash: string;
-  epoch: string;
-  claimToken: string;
-  reasonCode: string;
-}
-
-export interface PromptQueueDispatchActivated {
-  type: typeof PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE;
-  grantId: string;
-  owner: PromptQueueDispatchRequest["owner"];
-  itemId: string;
-  contentHash: string;
-  epoch: string;
-  claimToken: string;
-}
+import { PROMPT_QUEUE_DISPATCH_REQUEST_TYPE, PROMPT_QUEUE_DISPATCH_RESULT_TYPE, PROMPT_QUEUE_DISPATCH_CANCEL_TYPE, PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE, PROMPT_QUEUE_GRANT_FIELD } from "./promptQueueDispatchTypes.js";
+export { PROMPT_QUEUE_DISPATCH_REQUEST_TYPE, PROMPT_QUEUE_DISPATCH_RESULT_TYPE, PROMPT_QUEUE_DISPATCH_CANCEL_TYPE, PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE, PROMPT_QUEUE_GRANT_FIELD } from "./promptQueueDispatchTypes.js";
+import type { PromptQueueDispatchRequest, PromptQueueDispatchResult, PromptQueueDispatchCancel, PromptQueueDispatchActivated } from "./promptQueueDispatchTypes.js";
+export type { PromptQueueDispatchRequest, PromptQueueDispatchResult, PromptQueueDispatchCancel, PromptQueueDispatchActivated } from "./promptQueueDispatchTypes.js";
 
 /**
  * Parse the trusted container→master queue hand-off. This is deliberately a

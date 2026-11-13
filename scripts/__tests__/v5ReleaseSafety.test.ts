@@ -27,6 +27,14 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const artifactHelpers = path.join(root, 'scripts/lib/v5-release-artifacts.sh')
+async function readDeployWithArtifactHelpers(): Promise<string> {
+  const entry = await readFile(deploy, 'utf8')
+  const wire = 'source "$SCRIPT_DIR/lib/v5-release-artifacts.sh"'
+  assert.equal(entry.split(wire).length, 2, 'entry must source the real artifact helper exactly once')
+  return entry.replace(wire, await readFile(artifactHelpers, 'utf8'))
+}
+
 const commercialPolicy = path.join(root, 'scripts/lib/v5-commercial-release-policy.sh')
 const selfhostDeploy = path.join(root, 'scripts/deploy-v5-selfhost.sh')
 const branchPolicy = path.join(root, 'scripts/v5-branch-policy.sh')
@@ -3417,7 +3425,7 @@ describe('v5 release safety lanes', () => {
   })
 
   test('strong release markers detect tampering and legacy trust is exact-invocation predecessor only', async () => {
-    const deploySource = await readFile(deploy, 'utf8')
+    const deploySource = await readDeployWithArtifactHelpers()
     assert.match(
       deploySource,
       /write_strong_release_marker_local\(\)[\s\S]*schemaVersion:\$schemaVersion[\s\S]*sourceCommit:\$sourceCommit[\s\S]*metadataSha256:\$metadataSha256[\s\S]*artifactSha256:\$artifactSha256/,
@@ -10678,7 +10686,7 @@ describe('v5 release speedup (B1-B5, C4)', () => {
   })
 
   test('B4: strong marker probe accepts distReuse without reindexing the string context', async () => {
-    const source = await readFile(deploy, 'utf8')
+    const source = await readDeployWithArtifactHelpers()
     const probe = source.slice(
       source.indexOf('\nrelease_marker_probe() {'),
       source.indexOf('\nassert_release_metadata_matches_commit() {'),
@@ -11563,4 +11571,22 @@ describe('v5 versioned baseline manifest', () => {
     assert.match(verify, /release_source_predates_manifest_cutoff/)
     assert.match(verify, /OC_V5_LEGACY_BASELINE_FALLBACK/)
   })
+})
+
+
+test('artifact helper definitions are loaded by the real deploy source-only entry', () => {
+  const ran = spawnSync('bash', ['-c', [
+    'set -euo pipefail',
+    'entry="$1"; set --',
+    'export V5_DEPLOY_SOURCE_ONLY=1',
+    'source "$entry"',
+    'shopt -s extdebug',
+    'declare -F release_artifact_digest release_marker_probe assert_release_marker write_strong_release_marker_local publish_strong_release',
+  ].join('\n'), '--', deploy], {
+    cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+  })
+  assert.equal(ran.status, 0, ran.stderr)
+  const rows = ran.stdout.trim().split('\n')
+  assert.equal(rows.length, 5)
+  for (const row of rows) assert.equal(row.split(' ').slice(2).join(' '), artifactHelpers, row)
 })

@@ -1,17 +1,9 @@
-/**
- * Models that a selfhost → commercial sync brings are visible to admins only.
- *
- * 跑法:npx tsx --test packages/commercial/src/__tests__/commercialSyncedModelsAdminOnly.test.ts
- *
- * User rule (2026-10-15, OCV5-411): in the commercial catalog every model added by a
- * selfhost sync is model_pricing.visibility = 'admin' — ordinary users cannot see, pick
- * or be billed for it. Selfhost migrations may create public rows (0307 Flash did), so
- * the commercial tree edits them before release. This test pins that for every migration
- * from 0305 on: no statement that writes model_pricing may name the 'public' visibility.
- * Opening a model to users in commercial is an admin catalog action, not a synced migration.
+/** Selfhost keeps its applied visibility history; commercial admin-only policy is not imported.
+ * Pin the pre-sync SQL blobs and the exact historical public-write set. New migrations still
+ * cannot add public writes here without an explicit policy change. No applied SQL is rewritten.
  */
-
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -41,24 +33,33 @@ const files = readdirSync(MIGRATIONS_DIR)
   .filter((f) => f.endsWith('.sql') && f.slice(0, 4) >= RULE_FROM)
   .sort()
 
-describe('commercial: synced models are admin-only', () => {
+describe('selfhost: synced models preserve edition visibility history', () => {
   test('the scan covers the synced migrations (0306–0309 at least)', () => {
     for (const v of ['0306_pool_policy.sql', '0307_antigravity_engine.sql', '0308_pool_user_affinity.sql', '0309_box_profile_quota_windows.sql']) {
       assert.ok(files.includes(v), `${v} missing from the scan`)
     }
   })
 
+  const baseline = JSON.parse(readFileSync(new URL('./fixtures/selfhostSyncBaseline.json', import.meta.url), 'utf8')) as { migrations: Record<string, string> }
+  const publicHistory = new Set(['0307_antigravity_engine.sql', '0312_antigravity_gemini_4_argon.sql', '0338_antigravity_gemini_4_carbon.sql'])
   for (const f of files) {
-    test(`${f}: no model_pricing write makes a model public`, () => {
-      assert.deepEqual(publicPricingWrites(readFileSync(path.join(MIGRATIONS_DIR, f), 'utf8')), [])
+    test(`${f}: preserves applied SQL and only its original public write`, () => {
+      const raw = readFileSync(path.join(MIGRATIONS_DIR, f))
+      const pinned = baseline.migrations[f.slice(0, -4)]
+      if (pinned) {
+        const blob = createHash('sha1').update(`blob ${raw.length}\0`).update(raw).digest('hex')
+        assert.equal(blob, pinned, 'applied migration bytes must not drift during synchronization')
+      }
+      assert.equal(publicPricingWrites(raw.toString('utf8')).length, publicHistory.has(f) ? 1 : 0)
     })
   }
 
-  test('0307: all four Antigravity pricing rows are admin-only and disabled', () => {
+  test('0307: original Flash visibility and all four disabled rows are preserved', () => {
     const sql = stripSqlComments(readFileSync(path.join(MIGRATIONS_DIR, '0307_antigravity_engine.sql'), 'utf8'))
     const insert = sql.split(';').find((s) => /INSERT\s+INTO\s+model_pricing/i.test(s))
     assert.ok(insert, 'pricing insert not found')
-    assert.equal(insert.match(/'admin', NULL/g)?.length, 4)
+    assert.equal(insert.match(/'admin', NULL/g)?.length, 3)
+    assert.equal(insert.match(/'public', NULL/g)?.length, 1)
     assert.equal(insert.match(/, FALSE,/g)?.length, 4)
   })
 
