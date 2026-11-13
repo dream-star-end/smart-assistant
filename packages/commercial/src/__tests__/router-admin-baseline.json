@@ -534,6 +534,60 @@
     "handler": "handleAdminPoolKeyPatch"
   },
   {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/codex-commissioning",
+    "handler": "handleCodexCommissioning"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/codex-commissioning",
+    "handler": "handleCodexCommissioning"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/remote-pool",
+    "handler": "handleAdminRemotePoolGet"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/remote-pool/nodes",
+    "handler": "handleAdminRemotePoolNodeCreate"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/nodes/",
+    "handler": "handleAdminRemotePoolNodeAction"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/nodes/",
+    "handler": "handleAdminRemotePoolNodeAction"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/remote-pool/offers",
+    "handler": "handleAdminRemotePoolOffersPublish"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/profiles/",
+    "handler": "handleAdminRemotePoolProfilePatch"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/bindings/",
+    "handler": "handleAdminRemotePoolBindingRevoke"
+  },
+  {
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/accounts/",

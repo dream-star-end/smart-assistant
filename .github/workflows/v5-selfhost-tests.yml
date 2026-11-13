@@ -91,6 +91,18 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Build same-candidate CCB tool host
+        env:
+          OC_BUN_BIN: ${{ steps.bun.outputs.bun-path }}
+        run: |
+          source scripts/v5-runtime-release-lib.sh
+          oc_hotcfg_build_ccb_dist "$PWD" ""
+
+      - name: Install real tool-host prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Install CCB from lockfile
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts
