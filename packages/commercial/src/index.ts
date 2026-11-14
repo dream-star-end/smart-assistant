@@ -1,5 +1,3 @@
-import { readAntigravityRouteAuthority } from './billing/antigravityRouteAuthority.js';
-import { createIoredisAntigravityRelayKv, configureAntigravityRelayAuthority } from './billing/antigravityRouteContext.js';
 import { createBoxFailureDiagnostics } from "./http/proxy/boxFailureDiagnostic.js";
 import { resolveContainerLinkEndpoint } from "./ws/containerLinkEndpoint.js";
 import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
@@ -358,11 +356,7 @@ import {
   type DelegateGrokRouteAllocation,
   type DelegateGrokRouteHandler,
 } from "./http/internalDelegateGrokRoute.js";
-import {
-  isDelegateAntigravityRoutePath,
-  makeDelegateAntigravityRouteHandler,
-  type DelegateAntigravityRouteHandler,
-} from "./http/internalDelegateAntigravityRoute.js";
+import { isDelegateAntigravityRoutePath } from "./http/internalDelegateAntigravityRoute.js";
 import {
   GROK_RELAY_PREFIX,
   makeGrokRelayHandler,
@@ -380,21 +374,12 @@ import {
   configureZcodeRelayKv,
   createIoredisZcodeRelayKv,
 } from "./billing/zcodeRouteContext.js";
+import { ANTIGRAVITY_RELAY_PREFIX } from "./http/internalAntigravityRelay.js";
 import {
-  ANTIGRAVITY_RELAY_PREFIX,
-  makeAntigravityRelayHandler,
-  type AntigravityRelayHandler,
-} from "./http/internalAntigravityRelay.js";
-import {
-  configureAntigravityRelayKv,
-  expireAntigravityRelayRoute,
-  expireAntigravityRelayRouteForRequest,
-} from "./billing/antigravityRouteContext.js";
-import { admitAntigravityTurn } from "./account-pool/antigravityAdmission.js";
-import {
-  configureAntigravityModelCooldownStore,
-  createIoredisAntigravityModelCooldownStore,
-} from "./account-pool/antigravityModelCooldown.js";
+  configureAntigravityRouteStores,
+  createAntigravityBridgeHooks,
+  createAntigravityRouteRuntime,
+} from "./http/antigravityRouteRuntime.js";
 import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
@@ -1442,9 +1427,7 @@ export async function registerCommercial(
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityRelayKv(createIoredisAntigravityRelayKv(redis));
-  configureAntigravityRelayAuthority((route) => readAntigravityRouteAuthority(getPool(), route));
-  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
+  configureAntigravityRouteStores({ redis, pool: getPool() });
 
   // 预热 dummy hash:第一次登录无影响
   await warmupLoginDummyHash();
@@ -2433,31 +2416,21 @@ export async function registerCommercial(
         },
         logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
       });
-      // /internal/v5/delegate/antigravity-route/* — 委派到 antigravity 引擎时
-      // master 签发/续/释 relay route(OCV5-738)。与 chat turn 共用账号池、
-      // durable turn row 与 relay meter;同样只在 selfhost 引擎本地 turn 豁免下
-      // 挂载,商业版不暴露这条路由面。
-      const delegateAntigravityRouteHandler: DelegateAntigravityRouteHandler | undefined =
+      // /internal/v5/delegate/antigravity-route/* & /internal/v5/antigravity-relay/* (OCV5-738/761)
+      const antigravityRouteRuntime = createAntigravityRouteRuntime({
+        identityRepo, pool: getPool(), relayPort: V3_CONTAINER_PORT,
+        clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+        readBalance: readTotalSpendableBalance, rootLogger, pricing,
+      });
+      const delegateAntigravityRouteHandler =
         process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
-          ? makeDelegateAntigravityRouteHandler({
-              identityRepo,
-              pool: getPool(),
-              relayPort: V3_CONTAINER_PORT,
-              clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
-              readBalance: readTotalSpendableBalance,
-              logger: rootLogger.child({ subsys: "delegateAntigravityRoute" }),
-            })
+          ? antigravityRouteRuntime.makeDelegateHandler()
           : undefined;
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
       });
-      const antigravityRelayHandler: AntigravityRelayHandler = makeAntigravityRelayHandler({
-        identityRepo,
-        logger: rootLogger.child({ subsys: "antigravityRelay" }),
-        clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
-        pricing,
-      });
+      const antigravityRelayHandler = antigravityRouteRuntime.relayHandler;
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -6000,17 +5973,10 @@ export async function registerCommercial(
     expireZcodeRoute: async (token) => {
       await expireZcodeRelayRoute(token);
     },
-    admitAntigravityTurn: ({ containerId, userId, requestId, modelId, budgetCredits }) =>
-      admitAntigravityTurn(
-        { containerId, userId, requestId, modelId, budgetCredits, relayPort: V3_CONTAINER_PORT },
-        { clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "" },
-      ),
-    expireAntigravityRoute: async (token) => {
-      await expireAntigravityRelayRoute(token);
-    },
-    expireAntigravityRouteForRequest: async (requestId) => {
-      await expireAntigravityRelayRouteForRequest(requestId);
-    },
+    ...createAntigravityBridgeHooks({
+      relayPort: V3_CONTAINER_PORT,
+      clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+    }),
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is
       // unavailable the slot remains occupied and the immutable terminal frame

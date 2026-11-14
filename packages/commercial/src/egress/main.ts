@@ -1,5 +1,3 @@
-import { readAntigravityRouteAuthority } from '../billing/antigravityRouteAuthority.js';
-import { createIoredisAntigravityRelayKv, configureAntigravityRelayAuthority } from '../billing/antigravityRouteContext.js';
 import { createBoxFailureDiagnostics } from "../http/proxy/boxFailureDiagnostic.js";
 import { FileBoxContextTransport } from "../http/proxy/boxContextTransport.js";
 import { startLogTimingReporter } from '../logging/logTimingReporter.js';
@@ -113,11 +111,7 @@ import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRel
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
 import { ANTIGRAVITY_RELAY_PREFIX, makeAntigravityRelayHandler } from "../http/internalAntigravityRelay.js";
-import {
-  configureAntigravityModelCooldownStore,
-  createIoredisAntigravityModelCooldownStore,
-} from "../account-pool/antigravityModelCooldown.js";
-import { configureAntigravityRelayKv } from "../billing/antigravityRouteContext.js";
+import { configureAntigravityRouteStores } from "../http/antigravityRouteRuntime.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -210,9 +204,7 @@ export async function startEgress(): Promise<void> {
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityRelayKv(createIoredisAntigravityRelayKv(redis));
-  configureAntigravityRelayAuthority((route) => readAntigravityRouteAuthority(getPool(), route));
-  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
+  configureAntigravityRouteStores({ redis, pool: getPool() });
   const pricing = new PricingCache();
   try {
     await pricing.load();
