@@ -603,6 +603,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // cannot be rewritten. Only its ancestors are exempt; later commits still go
   // through the trailer gate.
   "3a4aba64d1e9a54a4915d40606c5977296bd59bb",
+  // 2026-11-14 user approved freezing the already-live commercial sync baseline
+  // (rel-578837176, merged into selfhost via OCV5-763) instead of renewing
+  // expiring Oct-2026 waivers (6fda2cdf et al.). Reachable on both editions;
+  // only its immutable ancestors are exempt, later commits still go through the gate.
+  "57883717626705624dfd39e53f782297a6d3af88",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
