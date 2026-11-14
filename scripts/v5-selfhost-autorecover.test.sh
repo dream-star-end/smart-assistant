@@ -210,5 +210,69 @@ g2="$(env -u OC_V5_AUTORECOVER_DIR LEASE_DB=/var/lib/openclaude-v5-selfhost/leas
 g3="$(OC_V5_AUTORECOVER_DIR=/tmp/y LEASE_DB=/tmp/x.db bash -c "wlog(){ :; }; source '$AR'; ar_enabled && echo on || echo off")"
 [[ "$g1 $g2 $g3" == "off on on" ]] && ok "A14 redirected lease DB without redirected state dir → disabled (test isolation)" || bad "A14 $g1 $g2 $g3"
 
+# ── OCV5-616: rc=75 锁跳过不按 1800s 墙钟误建单,有界上限 7200s 兜底,释锁后恢复/失败仍按原规则 ──
+setup a19; printf 'reason=schema\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+tick 1000; tick 1010; tick 2810; tick 2820
+tk19="$(inc ticket)"; at19="$(inc attempts)"; ls19="$(inc lock_skip_since)"
+echo 0 >"$C/watch.rc"; tick 2850; tick 2860; tick 2870
+if [[ -z "$tk19" && "$at19" == 0 && "$ls19" == 1000 && ! -f "$C/task.calls" && ! -f "$C/state/incident.env" \
+  && -n "$(ls "$C/state/history/"*.env 2>/dev/null)" ]]; then
+  ok "A19 continuous rc=75 past 1800s (<7200s) does not escalate; later recovery archives incident cleanly"
+else bad "A19 tk=$tk19 at=$at19 ls=$ls19 tasks=$(cat "$C/task.calls" 2>/dev/null) inc=$(cat "$C/state/incident.env" 2>/dev/null)"; fi
+
+setup a20; printf 'reason=schema\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+tick 1000; tick 1010; tick 2810; tick 2820
+tk_mid="$(inc ticket)"
+tick 8200
+tk20="$(inc ticket)"; ap20="$(inc approved)"; at20="$(inc attempts)"
+echo 0 >"$C/watch.rc"; tick 8230; tick 8240; tick 8250
+if [[ -z "$tk_mid" && "$tk20" == OCV5-900 && "$ap20" == 1 && "$at20" == 0 ]] \
+  && grep -q '恢复锁持续占用超过 7200s 未能执行自动恢复' "$C/task.calls" \
+  && grep -q '已做:恢复动作 0 次,最后结果 rc=75' "$C/task.calls" \
+  && [[ ! -f "$C/state/incident.env" ]] && grep -q '^ticket comment OCV5-900' "$C/task.calls"; then
+  ok "A20 continuous rc=75 >= AR_LOCK_SKIP_MAX_SEC (7200s) escalates with 0 actions and lock-hold reason; later recovery closes"
+else bad "A20 mid=$tk_mid tk=$tk20 ap=$ap20 at=$at20 tasks=$(cat "$C/task.calls" 2>/dev/null)"; fi
+
+setup a20b; printf 'reason=schema\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+AR_LOCK_SKIP_MAX_SEC=600 tick 1000; AR_LOCK_SKIP_MAX_SEC=600 tick 1010; AR_LOCK_SKIP_MAX_SEC=600 tick 1600
+if [[ "$(inc ticket)" == OCV5-900 && "$(inc attempts)" == 0 ]] \
+  && grep -q '恢复锁持续占用超过 600s 未能执行自动恢复' "$C/task.calls"; then
+  ok "A20b custom AR_LOCK_SKIP_MAX_SEC=600 triggers bounded lock-skip escalation"
+else bad "A20b tk=$(inc ticket) at=$(inc attempts) tasks=$(cat "$C/task.calls" 2>/dev/null)"; fi
+
+setup a21; printf 'reason=x\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+tick 1000; tick 1010
+echo 3 >"$C/watch.rc"; tick 2500; tick 2510; tick 2810
+tk21_early="$(inc ticket)"; lsec21="$(inc lock_skip_sec)"
+tick 4300
+tk21="$(inc ticket)"; ap21="$(inc approved)"; at21="$(inc attempts)"
+if [[ -z "$tk21_early" && "$lsec21" == 1500 && "$tk21" == OCV5-900 && "$ap21" == 1 && "$at21" == 2 ]] \
+  && grep -q '已做:恢复动作 2 次,最后结果 rc=3' "$C/task.calls" \
+  && grep -q '已扣除锁跳过 1500s' "$C/task.calls"; then
+  ok "A21 after lock release, effective unconverged time (excluding 1500s skip) escalates at +1800s"
+else bad "A21 early=$tk21_early lsec=$lsec21 tk=$tk21 ap=$ap21 at=$at21 tasks=$(cat "$C/task.calls" 2>/dev/null)"; fi
+
+setup a22; printf 'reason=x\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+tick 1000; tick 1010
+echo 1 >"$C/watch.rc"
+tick 2000; tick 2010
+tick 2300; tick 2310
+tick 3210; tick 3220
+if [[ "$(inc ticket)" == OCV5-900 && "$(inc attempts)" == 3 ]] \
+  && grep -q '两级兜底已自动重试 3 次仍未恢复' "$C/task.calls" \
+  && grep -q '已做:恢复动作 3 次,最后结果 rc=1' "$C/task.calls"; then
+  ok "A22 after lock release, 3 failed real attempts still escalate by AR_RESTORE_MAX without rc=75 inflation"
+else bad "A22 tk=$(inc ticket) at=$(inc attempts) tasks=$(cat "$C/task.calls" 2>/dev/null)"; fi
+
+setup a23; printf 'reason=schema\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
+printf 'id=ar-legacy\nstarted=1000\nattempts=0\nlast=0\nreasons=watch-disarmed\nlast_rc=75\nlast_out=AUTORECOVER_SKIP lock\n' >"$C/state/incident.env"
+tick 2810; tick 2820
+tk23_early="$(inc ticket)"
+tick 8200
+if [[ -z "$tk23_early" && "$(inc ticket)" == OCV5-900 && "$(inc attempts)" == 0 ]] \
+  && grep -q '恢复锁持续占用超过 7200s' "$C/task.calls"; then
+  ok "A23 legacy incident.env without lock_skip_* fields is backward-compatible"
+else bad "A23 early=$tk23_early tk=$(inc ticket) at=$(inc attempts) tasks=$(cat "$C/task.calls" 2>/dev/null)"; fi
+
 echo "autorecover: pass=$pass fail=$fail"
 [[ "$fail" == 0 ]]

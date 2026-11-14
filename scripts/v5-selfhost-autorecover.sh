@@ -31,6 +31,8 @@ AR_RESTORE_MAX="${OC_V5_AUTORECOVER_RESTORE_MAX:-3}"
 AR_BACKOFF_SEC="${OC_V5_AUTORECOVER_BACKOFF_SEC:-0 300 900}"
 AR_PROBE_EVERY_SEC="${OC_V5_AUTORECOVER_PROBE_EVERY_SEC:-900}"
 AR_ESCALATE_AFTER_SEC="${OC_V5_AUTORECOVER_ESCALATE_AFTER_SEC:-1800}"
+AR_LOCK_SKIP_MAX_SEC="${AR_LOCK_SKIP_MAX_SEC:-${OC_V5_AUTORECOVER_LOCK_SKIP_MAX_SEC:-7200}}"
+[[ "$AR_LOCK_SKIP_MAX_SEC" =~ ^[0-9]+$ ]] || AR_LOCK_SKIP_MAX_SEC=7200
 AR_RERUN_MAX="${OC_V5_AUTORECOVER_RERUN_MAX:-2}"
 AR_PROJECT_ID="${OC_V5_AUTORECOVER_PROJECT_ID:-852859fa-cf1d-481c-96fd-23f2966b8b5f}"
 AR_TASK_UID="${OC_V5_AUTORECOVER_TASK_UID:-3}"
@@ -219,9 +221,60 @@ ar_enabled() {
   fi
 }
 
+ar_lock_skip_total() { # <now>
+  local now="$1" acc since cur=0
+  acc="$(ar_get lock_skip_sec)"; acc="${acc:-0}"
+  since="$(ar_get lock_skip_since)"; since="${since:-0}"
+  if (( since > 0 && now > since )); then
+    cur=$((now - since))
+  fi
+  printf '%s' "$((acc + cur))"
+}
+
+ar_lock_skip_close() { # <end_ts>
+  local end_ts="$1" acc since
+  since="$(ar_get lock_skip_since)"; since="${since:-0}"
+  (( since > 0 )) || return 0
+  acc="$(ar_get lock_skip_sec)"; acc="${acc:-0}"
+  if (( end_ts > since )); then
+    ar_set lock_skip_sec "$((acc + end_ts - since))"
+  fi
+  ar_set lock_skip_since 0
+}
+
+ar_check_escalation() { # <now> <attempts>   返回 10 表示本 tick 刚新建工单
+  local now="$1" attempts="$2" started skip_total effective had_ticket=0
+  [[ -n "$(ar_get ticket)" ]] && had_ticket=1
+  started="$(ar_get started)"; started="${started:-$now}"
+  skip_total="$(ar_lock_skip_total "$now")"
+  effective=$((now - started - skip_total))
+  (( effective < 0 )) && effective=0
+
+  if [[ -n "$(ar_get need_escalate)" ]]; then
+    ar_escalate "$(ar_get need_escalate)" || return 0
+  elif (( attempts >= AR_RESTORE_MAX )) && [[ "$(ar_get last_rc)" != 0 ]]; then
+    ar_escalate "两级兜底已自动重试 $attempts 次仍未恢复" || return 0
+  elif (( skip_total >= AR_LOCK_SKIP_MAX_SEC )); then
+    ar_escalate "恢复锁持续占用超过 ${AR_LOCK_SKIP_MAX_SEC}s 未能执行自动恢复" || return 0
+  elif (( effective >= AR_ESCALATE_AFTER_SEC )); then
+    if (( skip_total > 0 )); then
+      ar_escalate "事件超过 ${AR_ESCALATE_AFTER_SEC}s 未恢复(已扣除锁跳过 ${skip_total}s)" || return 0
+    else
+      ar_escalate "事件超过 ${AR_ESCALATE_AFTER_SEC}s 未恢复" || return 0
+    fi
+  elif [[ -n "$(ar_get ticket)" && "$(ar_get approved)" != 1 ]]; then
+    ar_approve "$(ar_get ticket)" || true
+    return 0
+  else
+    return 0
+  fi
+  [[ "$had_ticket" == 0 && -n "$(ar_get ticket)" ]] && return 10
+  return 0
+}
+
 autorecover_tick() {
   lease_release_policy_held && { ar_log "release-policy hold: no automatic recovery"; return 0; }
-  local why now rc out attempts last mode delay
+  local why now rc out attempts last mode delay skip_since esc_rc=0
   ar_enabled || return 0
   mkdir -p -- "$AR_STATE_DIR" || return 0
   why="$(ar_incident_active)"
@@ -236,11 +289,19 @@ autorecover_tick() {
   fi
   now="$(ar_now)"
   if [[ ! -f "$AR_INCIDENT" ]]; then
-    printf 'id=ar-%s\nstarted=%s\nattempts=0\nlast=0\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$now" >"$AR_INCIDENT"
+    printf 'id=ar-%s\nstarted=%s\nattempts=0\nlast=0\nlock_skip_sec=0\nlock_skip_since=0\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$now" >"$AR_INCIDENT"
     ar_log "新事件:$why"
     ar_alert warning autorecover_started "自动恢复接管:$why"
   fi
   ar_set reasons "$why"
+  # 向后兼容旧版 incident.env(无 lock_skip_since 且已在 rc=75 等待中)
+  if [[ -z "$(ar_get lock_skip_since)" && "$(ar_get last_rc)" == 75 ]]; then
+    if [[ "$(ar_get attempts)" == 0 ]]; then
+      ar_set lock_skip_since "$(ar_get started)"
+    else
+      ar_set lock_skip_since "$now"
+    fi
+  fi
   # 1 不抢
   if lease_deploy_process_running; then ar_log "发布在跑,等待"; return 0; fi
   if ar_unit_active "$AR_SURVIVOR_UNIT"; then ar_log "cutover survivor 仍在,等待"; return 0; fi
@@ -252,26 +313,32 @@ autorecover_tick() {
     rm -f -- "$AR_RESULT"
     ar_set last_rc "${rc:-?}"; ar_set last_out "$(printf '%s' "$out" | tr -cd '[:print:]' | cut -c1-120)"
     ar_log "恢复动作结果 rc=${rc:-?} $out"
+    last="$(ar_get last)"; last="${last:-0}"
     if [[ "$rc" == 0 ]]; then
+      ar_lock_skip_close "$(( last > 0 ? last : now ))"
       ar_resolve_trains
       [[ -n "$(ar_get need_escalate)" ]] && ar_escalate "$(ar_get need_escalate)"
       return 0   # 标记已由动作归档;下一 tick 若无事件即结束
     fi
-    if [[ "$rc" == 75 ]]; then  # 现在不能动(锁/窗口),不计次数,下 tick 再来
-      attempts="$(ar_get attempts)"; ar_set attempts "$(( ${attempts:-1} > 0 ? ${attempts:-1} - 1 : 0 ))"; ar_set last 0
+    if [[ "$rc" == 75 ]]; then  # 现在不能动(锁/窗口),不计次数,累计跳过窗口并下 tick 再来
+      skip_since="$(ar_get lock_skip_since)"; skip_since="${skip_since:-0}"
+      if (( skip_since == 0 )); then
+        ar_set lock_skip_since "$(( last > 0 ? last : now ))"
+      fi
+      attempts="$(ar_get attempts)"
+      attempts="$(( ${attempts:-1} > 0 ? ${attempts:-1} - 1 : 0 ))"
+      ar_set attempts "$attempts"
+      ar_set last 0
+      ar_check_escalation "$now" "$attempts" || true
       return 0
     fi
+    ar_lock_skip_close "$(( last > 0 ? last : now ))"
   fi
   # 3 升级判定
   attempts="$(ar_get attempts)"; attempts="${attempts:-0}"
   last="$(ar_get last)"; last="${last:-0}"
-  if [[ -n "$(ar_get need_escalate)" ]]; then
-    ar_escalate "$(ar_get need_escalate)"
-  elif (( attempts >= AR_RESTORE_MAX )) && [[ "$(ar_get last_rc)" != 0 ]]; then
-    ar_escalate "两级兜底已自动重试 $attempts 次仍未恢复"
-  elif (( now - $(ar_get started) >= AR_ESCALATE_AFTER_SEC )); then
-    ar_escalate "事件超过 ${AR_ESCALATE_AFTER_SEC}s 未恢复"
-  fi
+  ar_check_escalation "$now" "$attempts" || esc_rc=$?
+  (( esc_rc == 10 )) && return 0
   # 4 退避后发下一次动作
   if (( attempts < AR_RESTORE_MAX )); then
     mode=restore; delay="$(ar_backoff_for "$attempts")"
