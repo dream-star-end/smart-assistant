@@ -54,7 +54,7 @@ async function strategySnapshot() {
 test(`${version} empty database runs the real migration chain and creates only empty compatibility tables`, async (t) => {
   if (db.skipIfUnavailable(t)) return;
   // useDedicatedTestDatabase runs migrate.ts on a new template0 database, not a hand-built schema.
-  assert.equal((await getPool().query("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")).rows[0].version, version);
+  assert.equal((await getPool().query("SELECT version FROM schema_migrations WHERE version = $1", [version])).rows[0]?.version, version);
   await assertAdditions();
   const again = await runMigrations();
   assert.equal(again.applied.length, 0, "runner re-entry must be idempotent");
@@ -65,7 +65,7 @@ test(`${version} upgrades the exact live target versions and schema without chan
   const dir = await mkdtemp(path.join(tmpdir(), "ocv5-763-target-baseline-"));
   try {
     const expected = Object.keys(baseline.migrations).sort();
-    const files = (await readdir(migrations)).filter(f => f.endsWith(".sql")).sort();
+    const files = (await readdir(migrations)).filter(f => f.endsWith(".sql") && f <= `${version}.sql`).sort();
     assert.deepEqual(files.map(f => f.slice(0, -4)), [...expected, version]);
     for (const v of expected) {
       const data = await readFile(path.join(migrations, `${v}.sql`));
@@ -85,10 +85,12 @@ test(`${version} upgrades the exact live target versions and schema without chan
         : ['credit_ledger','muse_media_jobs']])).rows;
     assert.deepEqual(shape, baseline.columns, "upgrade fixture must match the observed live affected-table schema");
     const before = await strategySnapshot();
-    const result = await runMigrations();
+    await copyFile(path.join(migrations, `${version}.sql`), path.join(dir, `${version}.sql`));
+    const result = await runMigrations({ dir });
     assert.deepEqual(result.applied, [version]);
     assert.deepEqual(await strategySnapshot(), before, "DDL must not change commercial policy or money");
     await assertAdditions();
+    await runMigrations();
     if (!commercial) {
       await assertSelfhostLegacyWriters();
       const studioShape = (await getPool().query(`SELECT table_name,column_name,ordinal_position,data_type,is_nullable,column_default

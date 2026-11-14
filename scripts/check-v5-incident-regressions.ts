@@ -208,7 +208,7 @@ const ROOT_PACKAGE_JSON = readFileSync(join(ROOT, "package.json"), "utf8");
 let selfhostDeployCache: string | null = null;
 /** OCV5-488: a shell command that runs a script (see selfhostDeployScript). */
 const RUNS_SCRIPT =
-  /(?:^|[;&|(])\s*(?:(?:env(?:\s+-u\s+\S+)*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:npx --no-install tsx|node) scripts\/[\w.-]+/;
+  /(?:^|[;&|(])\s*(?:(?:env(?:\s+-u\s+\S+)*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:npx --no-install tsx|node|bash) scripts\/[\w.-]+/;
 /** OCV5-488: the command lines of build_master_release() in the selfhost master release library
  * that run a script. Lexical only: continuation lines joined, heredoc bodies skipped, quoted
  * text and comments dropped (an echo, a message, a file-presence check or a trailing comment
@@ -603,6 +603,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // cannot be rewritten. Only its ancestors are exempt; later commits still go
   // through the trailer gate.
   "3a4aba64d1e9a54a4915d40606c5977296bd59bb",
+  // 2026-11-14 user approved freezing the already-live commercial sync baseline
+  // (rel-578837176, merged into selfhost via OCV5-763) instead of renewing
+  // expiring Oct-2026 waivers (6fda2cdf et al.). Reachable on both editions;
+  // only its immutable ancestors are exempt, later commits still go through the gate.
+  "57883717626705624dfd39e53f782297a6d3af88",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an

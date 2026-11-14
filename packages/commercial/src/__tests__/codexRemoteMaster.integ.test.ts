@@ -26,7 +26,12 @@ import { buildCodexReceipt, codexBackend, zeroNativeTokens, type CodexRemoteBind
 const selfhost = existsSync(new URL('../db/migrations/0341_selfhost_sync_compat.sql', import.meta.url))
 assert.notEqual(selfhost, existsSync(new URL('../db/migrations/0340_commercial_sync_compat.sql', import.meta.url)))
 const baseline = JSON.parse(readFileSync(new URL(`./fixtures/${selfhost ? 'selfhost' : 'commercial'}SyncBaseline.json`, import.meta.url), 'utf8'))
-const expectedSuffix = [...Object.keys(baseline.migrations).filter(v => v >= '0334'), selfhost ? '0341_selfhost_sync_compat' : '0340_commercial_sync_compat'].sort()
+const expectedSuffix = [
+  ...Object.keys(baseline.migrations).filter(v => v >= '0334'),
+  ...(selfhost
+    ? ['0341_selfhost_sync_compat', '0342_antigravity_gemini_4_hydrogen', '0343_antigravity_orchestrator_carbon']
+    : ['0340_commercial_sync_compat', '0341_commercial_antigravity_gemini_4_models']),
+].sort()
 const url = process.env.TEST_DATABASE_URL
 assert.ok(url && new URL(url).pathname.endsWith('_test'), 'explicit isolated TEST_DATABASE_URL required')
 const pool = new Pool({ connectionString: url, max: 8, connectionTimeoutMillis: 2000 })
