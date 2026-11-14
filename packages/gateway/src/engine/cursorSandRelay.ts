@@ -41,7 +41,13 @@ import {
   TRACE_ID_HEADER,
 } from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
-import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../modelCatalogClient.js'
+import { classifyRunError } from '../errorClassify.js'
+import {
+  AUTHORITY_HEADER,
+  LOCAL_CATALOG_HEADER,
+  TURN_LEASE_HEADER,
+  triggerLocalCatalogRefreshOnConfigChanged,
+} from '../modelCatalogClient.js'
 
 import { CursorSandBoxError, CursorSandBoxResolver, cursorSandBoxHeaders, cursorSandBoxTicketError, isCursorSandBoxError, type CursorSandBoxConnection, type CursorSandBoxPolicy } from './cursorSandBox.js'
 
@@ -1505,11 +1511,28 @@ export class CursorSandRelay {
       return
     }
     const reader = upstream.body.getReader()
+    const inspect409 = upstream.status === 409
+    const bodyChunks: Buffer[] = []
+    let bodySnippetBytes = 0
     try {
       for (;;) {
         const { value, done } = await reader.read()
         if (done) break
-        if (value && value.length > 0) res.write(Buffer.from(value))
+        if (value && value.length > 0) {
+          const buf = Buffer.from(value)
+          if (inspect409 && bodySnippetBytes < 2048) {
+            const slice = buf.subarray(0, 2048 - bodySnippetBytes)
+            bodyChunks.push(slice)
+            bodySnippetBytes += slice.length
+          }
+          res.write(buf)
+        }
+      }
+      if (inspect409 && bodyChunks.length > 0) {
+        const snippet = Buffer.concat(bodyChunks).toString('utf8')
+        if (classifyRunError(snippet).code === 'model_config_changed_retry_turn') {
+          triggerLocalCatalogRefreshOnConfigChanged('cursor_relay_passthrough_409')
+        }
       }
     } finally {
       reader.releaseLock()

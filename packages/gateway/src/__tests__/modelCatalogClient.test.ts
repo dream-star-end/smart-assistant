@@ -14,7 +14,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
@@ -23,13 +23,17 @@ import { MODEL_CATALOG_PROJECTION_FORMAT } from '@openclaude/protocol'
 
 import {
   AGENT_COST_OVERRIDE_TTL_MS,
+  DEFAULT_CONFIG_CHANGED_COOLDOWN_MS,
   LOCAL_CATALOG_KIND,
   MODEL_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH,
   ModelCatalogClient,
   ModelCatalogUnavailableError,
+  _setModelCatalogClientForTests,
+  invalidateModelCatalogOnConfigChanged,
   lookupCatalogAgentMultiplier,
   parseCatalogResponse,
+  triggerLocalCatalogRefreshOnConfigChanged,
 } from '../modelCatalogClient.js'
 
 const ENV = {
@@ -824,4 +828,384 @@ test('OCV5-518 format upgrade cannot reuse an in-flight snapshot with stale rout
     assert.equal(view.isRoutable(BOX_OWNER_MODEL), false)
     assert.equal(full, 3)
   } finally { releaseOld?.(); lkg.cleanup() }
+})
+
+describe('OCV5-745 — 409 MODEL_CONFIG_CHANGED_RETRY_TURN self-healing & anti-storm', () => {
+  test('409 invalidation refreshes constant-epoch LKG + memory snapshot and updates projectionRevision', async () => {
+    const lkg = tmpLkg()
+    let masterProjRev = 'proj-rev-old'
+    const calls: string[] = []
+    const response = (body: unknown) => ({
+      statusCode: 200,
+      body: (async function* () { yield Buffer.from(JSON.stringify(body)) })(),
+    })
+    try {
+      const client = new ModelCatalogClient({
+        env: ENV,
+        lkgPath: lkg.path,
+        fetcher: (async (url: string) => {
+          const isEpoch = url.includes(MODEL_CATALOG_EPOCH_PATH)
+          calls.push(isEpoch ? 'epoch' : 'catalog')
+          return response(
+            isEpoch
+              ? { epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT }
+              : { ...CATALOG_BODY, projection_format: MODEL_CATALOG_PROJECTION_FORMAT, projection_revision: masterProjRev },
+          )
+        }) as any,
+      })
+
+      const v1 = await client.getView()
+      assert.equal(v1.projectionRevision, 'proj-rev-old')
+      assert.deepEqual(calls, ['catalog'])
+
+      // Master changes per-uid projection WITHOUT bumping security_epoch or projection_format.
+      masterProjRev = 'proj-rev-new'
+      // Before 409 invalidation, TTL shortcut keeps returning stale revision.
+      assert.equal((await client.getView()).projectionRevision, 'proj-rev-old')
+      assert.deepEqual(calls, ['catalog'])
+
+      // Simulate 409 MODEL_CONFIG_CHANGED_RETRY_TURN trigger.
+      const v2 = await client.invalidateOnConfigChanged('409_test')
+      assert.equal(v2?.projectionRevision, 'proj-rev-new')
+      assert.deepEqual(calls, ['catalog', 'catalog'])
+
+      // Both in-memory snapshot and on-disk LKG now hold the refreshed projection_revision.
+      assert.equal((await client.getView()).projectionRevision, 'proj-rev-new')
+      const tok = JSON.parse(Buffer.from(await client.getToken(), 'base64url').toString('utf8'))
+      assert.equal(tok.projectionRevision, 'proj-rev-new')
+      const persisted = JSON.parse(readFileSync(lkg.path, 'utf8'))
+      assert.equal(persisted.projection_revision, 'proj-rev-new')
+    } finally {
+      lkg.cleanup()
+    }
+  })
+
+  test('failed 409 refetch preserves on-disk LKG and keeps forceFullFetch until master recovers', async () => {
+    const lkg = tmpLkg()
+    let failMaster = false
+    let masterProjRev = 'proj-rev-1'
+    const calls: string[] = []
+    try {
+      writeFileSync(lkg.path, JSON.stringify({
+        ...CATALOG_BODY,
+        projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+        projection_revision: 'proj-rev-1',
+      }))
+      const client = new ModelCatalogClient({
+        env: ENV,
+        lkgPath: lkg.path,
+        fetcher: (async (url: string) => {
+          const isEpoch = url.includes(MODEL_CATALOG_EPOCH_PATH)
+          calls.push(isEpoch ? 'epoch' : 'catalog')
+          if (!isEpoch && failMaster) {
+            return { statusCode: 503, body: (async function* () { yield Buffer.from('down') })() }
+          }
+          const body = isEpoch
+            ? { epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT }
+            : { ...CATALOG_BODY, projection_format: MODEL_CATALOG_PROJECTION_FORMAT, projection_revision: masterProjRev }
+          return { statusCode: 200, body: (async function* () { yield Buffer.from(JSON.stringify(body)) })() }
+        }) as any,
+      })
+
+      assert.equal((await client.getView()).projectionRevision, 'proj-rev-1')
+      masterProjRev = 'proj-rev-2'
+      failMaster = true
+
+      await assert.rejects(() => client.invalidateOnConfigChanged('409_fail'), ModelCatalogUnavailableError)
+      // On-disk LKG must NOT be deleted when refetch fails.
+      assert.equal(existsSync(lkg.path), true)
+      assert.equal(JSON.parse(readFileSync(lkg.path, 'utf8')).projection_revision, 'proj-rev-1')
+
+      // Still failing closed while master is down, not falling back to stale LKG via epoch match.
+      await assert.rejects(() => client.getView(), ModelCatalogUnavailableError)
+
+      // Once master recovers, next getView retries full fetch and heals.
+      failMaster = false
+      const recovered = await client.getView()
+      assert.equal(recovered.projectionRevision, 'proj-rev-2')
+      assert.equal(JSON.parse(readFileSync(lkg.path, 'utf8')).projection_revision, 'proj-rev-2')
+    } finally {
+      lkg.cleanup()
+    }
+  })
+
+  test('anti-storm: concurrent 409s share single-flight and cooldown throttles rapid rolling-deploy retries', async () => {
+    const lkg = tmpLkg()
+    let nowMs = 10_000
+    let fullFetches = 0
+    let releaseFetch!: () => void
+    const gate = new Promise<void>((r) => { releaseFetch = r })
+    let gated = false
+    try {
+      const client = new ModelCatalogClient({
+        env: ENV,
+        lkgPath: lkg.path,
+        now: () => nowMs,
+        configChangedCooldownMs: DEFAULT_CONFIG_CHANGED_COOLDOWN_MS,
+        fetcher: (async (url: string) => {
+          if (url.includes(MODEL_CATALOG_EPOCH_PATH)) {
+            return {
+              statusCode: 200,
+              body: (async function* () {
+                yield Buffer.from(JSON.stringify({ epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT }))
+              })(),
+            }
+          }
+          fullFetches += 1
+          if (gated) await gate
+          return {
+            statusCode: 200,
+            body: (async function* () {
+              yield Buffer.from(JSON.stringify({
+                ...CATALOG_BODY,
+                projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+                projection_revision: `proj-rev-${fullFetches}`,
+              }))
+            })(),
+          }
+        }) as any,
+      })
+
+      await client.getView()
+      assert.equal(fullFetches, 1)
+
+      // Concurrent storm (409s + getView/getRoutingView) coalesces into 1 full fetch.
+      gated = true
+      const storm = [
+        client.invalidateOnConfigChanged('t1'),
+        client.invalidateOnConfigChanged('t2'),
+        client.invalidateOnConfigChanged('t3'),
+        client.getView(),
+        client.getRoutingView(),
+      ]
+      await new Promise((r) => setTimeout(r, 0))
+      assert.equal(fullFetches, 2)
+      releaseFetch()
+      const settled = await Promise.all(storm)
+      for (const v of settled) assert.equal(v?.projectionRevision, 'proj-rev-2')
+
+      // Repeated 409s within cooldown (< DEFAULT_CONFIG_CHANGED_COOLDOWN_MS) do NOT hammer master.
+      gated = false
+      nowMs += DEFAULT_CONFIG_CHANGED_COOLDOWN_MS - 1
+      const throttled = await client.invalidateOnConfigChanged('within_cooldown')
+      assert.equal(throttled?.projectionRevision, 'proj-rev-2')
+      assert.equal(fullFetches, 2)
+
+      // Once cooldown elapses, next 409 performs a fresh full fetch.
+      nowMs += 1
+      const postCooldown = await client.invalidateOnConfigChanged('after_cooldown')
+      assert.equal(postCooldown?.projectionRevision, 'proj-rev-3')
+      assert.equal(fullFetches, 3)
+    } finally {
+      releaseFetch?.()
+      lkg.cleanup()
+    }
+  })
+
+  test('pre-invalidation in-flight full fetch cannot overwrite LKG or clear forceFullFetch', async () => {
+    const lkg = tmpLkg()
+    let full = 0
+    let releaseEarly!: () => void
+    const earlyGate = new Promise<void>((r) => { releaseEarly = r })
+    try {
+      const client = new ModelCatalogClient({
+        env: ENV,
+        lkgPath: lkg.path,
+        fetcher: (async (url: string) => {
+          if (url.includes(MODEL_CATALOG_EPOCH_PATH)) {
+            return {
+              statusCode: 200,
+              body: (async function* () {
+                yield Buffer.from(JSON.stringify({ epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT }))
+              })(),
+            }
+          }
+          full += 1
+          const myCall = full
+          if (myCall === 1) await earlyGate
+          return {
+            statusCode: 200,
+            body: (async function* () {
+              yield Buffer.from(JSON.stringify({
+                ...CATALOG_BODY,
+                projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+                projection_revision: myCall === 1 ? 'stale-inflight' : 'fresh-post-409',
+              }))
+            })(),
+          }
+        }) as any,
+      })
+
+      const earlyViewPromise = client.getView()
+      await new Promise((r) => setTimeout(r, 0))
+      assert.equal(full, 1)
+
+      const invalidationPromise = client.invalidateOnConfigChanged('race_409')
+      await new Promise((r) => setTimeout(r, 0))
+      // Post-invalidation fetch waits for early in-flight fetch to drain first.
+      assert.equal(full, 1)
+      releaseEarly()
+
+      const [earlyResult, healedResult] = await Promise.all([earlyViewPromise, invalidationPromise])
+      assert.equal(earlyResult.projectionRevision, 'stale-inflight')
+      assert.equal(healedResult?.projectionRevision, 'fresh-post-409')
+      assert.equal(full, 2)
+      assert.equal((await client.getView()).projectionRevision, 'fresh-post-409')
+      assert.equal(JSON.parse(readFileSync(lkg.path, 'utf8')).projection_revision, 'fresh-post-409')
+    } finally {
+      releaseEarly?.()
+      lkg.cleanup()
+    }
+  })
+
+  test('proactive projection_algo_version: compatible with legacy master and refreshes on version change', async () => {
+    const lkg = tmpLkg()
+    let masterAlgo: string | undefined
+    let masterProjRev = 'proj-legacy'
+    const calls: string[] = []
+    try {
+      // Seed LKG written by legacy master (no projection_algo_version).
+      writeFileSync(lkg.path, JSON.stringify({
+        ...CATALOG_BODY,
+        projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+        projection_revision: 'proj-legacy',
+      }))
+      const client = new ModelCatalogClient({
+        env: ENV,
+        lkgPath: lkg.path,
+        ttlMs: 0,
+        fetcher: (async (url: string) => {
+          const isEpoch = url.includes(MODEL_CATALOG_EPOCH_PATH)
+          calls.push(isEpoch ? 'epoch' : 'catalog')
+          const body = isEpoch
+            ? {
+                epoch: '5',
+                availability_revision: 'availability-1',
+                projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+                ...(masterAlgo ? { projection_algo_version: masterAlgo } : {}),
+              }
+            : {
+                ...CATALOG_BODY,
+                projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+                ...(masterAlgo ? { projection_algo_version: masterAlgo } : {}),
+                projection_revision: masterProjRev,
+              }
+          return { statusCode: 200, body: (async function* () { yield Buffer.from(JSON.stringify(body)) })() }
+        }) as any,
+      })
+
+      // Legacy master omits projection_algo_version -> matches legacy LKG with 0 full fetches.
+      assert.equal((await client.getView()).projectionRevision, 'proj-legacy')
+      assert.deepEqual(calls, ['epoch'])
+
+      // Master upgrades and starts emitting projection_algo_version -> proactive refetch before any 409!
+      masterAlgo = 'algo-0001'
+      masterProjRev = 'proj-v2'
+      assert.equal((await client.getView()).projectionRevision, 'proj-v2')
+      assert.deepEqual(calls, ['epoch', 'epoch', 'catalog'])
+
+      // Next epoch check matches algo-0001 -> no extra full fetch.
+      assert.equal((await client.getView()).projectionRevision, 'proj-v2')
+      assert.deepEqual(calls, ['epoch', 'epoch', 'catalog', 'epoch'])
+      assert.equal(JSON.parse(readFileSync(lkg.path, 'utf8')).projection_algo_version, 'algo-0001')
+    } finally {
+      lkg.cleanup()
+    }
+  })
+
+  test('singleton triggerLocalCatalogRefreshOnConfigChanged initiates refresh without rejecting', async () => {
+    const lkg = tmpLkg()
+    let masterProjRev = 'proj-a'
+    try {
+      const client = new ModelCatalogClient({
+        env: ENV,
+        lkgPath: lkg.path,
+        fetcher: (async (url: string) => {
+          const body = url.includes(MODEL_CATALOG_EPOCH_PATH)
+            ? { epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT }
+            : { ...CATALOG_BODY, projection_format: MODEL_CATALOG_PROJECTION_FORMAT, projection_revision: masterProjRev }
+          return { statusCode: 200, body: (async function* () { yield Buffer.from(JSON.stringify(body)) })() }
+        }) as any,
+      })
+      _setModelCatalogClientForTests(client)
+      assert.equal((await client.getView()).projectionRevision, 'proj-a')
+
+      masterProjRev = 'proj-b'
+      triggerLocalCatalogRefreshOnConfigChanged('unit_wire_hook')
+      // Next getView joins the synchronously launched single-flight refresh.
+      assert.equal((await client.getView()).projectionRevision, 'proj-b')
+      assert.equal((await invalidateModelCatalogOnConfigChanged('unit_await'))?.projectionRevision, 'proj-b')
+    } finally {
+      _setModelCatalogClientForTests(null)
+      lkg.cleanup()
+    }
+  })
+
+  test('B1: throttled 409 during cooldown promotes deferred full refetch after cooldown even within 30s TTL', async () => {
+    const lkg = tmpLkg()
+    let nowMs = 1_000
+    let masterProjRev = 'rev-v1'
+    let fullFetches = 0
+    try {
+      const client = new ModelCatalogClient({
+        env: ENV,
+        lkgPath: lkg.path,
+        now: () => nowMs,
+        configChangedCooldownMs: DEFAULT_CONFIG_CHANGED_COOLDOWN_MS,
+        fetcher: (async (url: string) => {
+          if (url.includes(MODEL_CATALOG_EPOCH_PATH)) {
+            return {
+              statusCode: 200,
+              body: (async function* () {
+                yield Buffer.from(JSON.stringify({ epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT }))
+              })(),
+            }
+          }
+          fullFetches += 1
+          if (fullFetches === 2) {
+            // Simulate response arriving at t=1050 so snapshot.verifiedAt=1050.
+            nowMs = 1_050
+          }
+          return {
+            statusCode: 200,
+            body: (async function* () {
+              yield Buffer.from(JSON.stringify({
+                ...CATALOG_BODY,
+                projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+                projection_revision: masterProjRev,
+              }))
+            })(),
+          }
+        }) as any,
+      })
+
+      await client.getView()
+      assert.equal(fullFetches, 1)
+
+      // t=1000ms: Egress upgraded ahead of master -> 409 refetch completes at t=1050 with old rev-v1.
+      const r1 = await client.invalidateOnConfigChanged('rolling_first_409')
+      assert.equal(r1?.projectionRevision, 'rev-v1')
+      assert.equal(fullFetches, 2)
+
+      // t=1200ms: Master rolls out new projection rev-v2.
+      masterProjRev = 'rev-v2'
+
+      // t=1500ms: Another 409 within 3000ms cooldown is throttled (no network call), queues deferred refresh.
+      nowMs = 1_500
+      const throttled = await client.invalidateOnConfigChanged('rolling_second_409_throttled')
+      assert.equal(throttled?.projectionRevision, 'rev-v1')
+      assert.equal(fullFetches, 2)
+
+      // t=4500ms: Cooldown elapsed (4500 >= 4000) while 30s TTL from 1050 has NOT expired.
+      // getToken()/getView() promotes the deferred refresh and recovers rev-v2 without another 409.
+      nowMs = 4_500
+      const healedToken = await client.getToken()
+      const decoded = JSON.parse(Buffer.from(healedToken, 'base64url').toString('utf8'))
+      assert.equal(decoded.projectionRevision, 'rev-v2')
+      assert.equal((await client.getView()).projectionRevision, 'rev-v2')
+      assert.equal(fullFetches, 3)
+    } finally {
+      lkg.cleanup()
+    }
+  })
 })

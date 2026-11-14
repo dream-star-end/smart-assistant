@@ -783,6 +783,23 @@ export class ModelCatalogSnapshot {
   }
 }
 
+/**
+ * 投影算法/字段语义的版本指纹(零 DB 开销,模块加载时计算一次)。
+ *
+ * 只要 `listForUser` / `projectionRevisionFor` 投影或签名摘要逻辑发生代码变更,
+ * 即使未 bump DB `model_security_epoch`,新 master 的 `/internal/v3/model-catalog-epoch`
+ * 也会携带不同的 `projection_algo_version`,使容器在下一次 epoch 检查时主动重拉全量目录,
+ * 避免等到请求撞上 egress 409 `MODEL_CONFIG_CHANGED_RETRY_TURN` 才触发自愈。
+ */
+export const MODEL_PROJECTION_ALGO_VERSION = sha256Hex(
+  canonicalJson({
+    v: 1,
+    listForUser: ModelCatalogSnapshot.prototype.listForUser.toString(),
+    projectionRevisionFor: ModelCatalogSnapshot.prototype.projectionRevisionFor.toString(),
+    projectContextWindowForRole: projectContextWindowForRole.toString(),
+  }),
+).slice(0, 16);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 平台次级模型(platform aux models)
 // ─────────────────────────────────────────────────────────────────────────────

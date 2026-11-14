@@ -27,7 +27,12 @@ import {
   GROK_VISION_PATH,
 } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
-import { LOCAL_CATALOG_HEADER, getLocalCatalogToken } from './modelCatalogClient.js'
+import { classifyRunError } from './errorClassify.js'
+import {
+  LOCAL_CATALOG_HEADER,
+  getLocalCatalogToken,
+  triggerLocalCatalogRefreshOnConfigChanged,
+} from './modelCatalogClient.js'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
 
 const DEFAULT_MODEL = DEFAULT_CODEX_ENGINE_MODEL
@@ -835,6 +840,12 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
       })
       if (!resp.ok) {
         const detail = (await resp.text().catch(() => '')).slice(0, 300)
+        if (
+          classifyRunError(detail).code === 'model_config_changed_retry_turn' ||
+          (resp.status === 409 && detail.includes('MODEL_CONFIG_CHANGED_RETRY_TURN'))
+        ) {
+          triggerLocalCatalogRefreshOnConfigChanged('minimax_vision_http_409')
+        }
         throw new Error(`minimax vision upstream ${resp.status}${detail ? `: ${detail}` : ''}`)
       }
       return await readAnthropicSseText(resp)

@@ -29,6 +29,7 @@ import { DEFAULT_CODEX_ENGINE_MODEL, MODEL_CATALOG_PROJECTION_FORMAT } from "@op
 import { hashSecret, type ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import type { UserModelAuthz } from "../auth/userModelAuthz.js";
 import {
+  MODEL_PROJECTION_ALGO_VERSION,
   ModelCatalogSnapshot,
   type ModelCatalogEntry,
   type ModelCatalogPricing,
@@ -358,8 +359,12 @@ describe("internalModelCatalog — epoch 窄端点", () => {
     const res = makeRes();
     await h(makeReq({ auth: `Bearer ${TOKEN}`, url: MODEL_CATALOG_EPOCH_PATH }), res, CTX);
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.body, { epoch: "9", availability_revision: "availability-1",
-      projection_format: MODEL_CATALOG_PROJECTION_FORMAT });
+    assert.deepEqual(res.body, {
+      epoch: "9",
+      availability_revision: "availability-1",
+      projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+      projection_algo_version: MODEL_PROJECTION_ALGO_VERSION,
+    });
     assert.equal(res.headers[SECURITY_EPOCH_HEADER], "9");
   });
 
@@ -508,6 +513,15 @@ describe("OCV5-518 local Box context ownership", () => {
     await handler({ assertFreshFails: true, authzFails: true })(makeReq({ auth: `Bearer ${TOKEN}`, url: MODEL_CATALOG_EPOCH_PATH }), res, CTX);
     assert.equal(res.statusCode, 200);
     assert.equal(res.body.projection_format, MODEL_CATALOG_PROJECTION_FORMAT);
+    assert.equal(res.body.projection_algo_version, MODEL_PROJECTION_ALGO_VERSION);
+    assert.match(String(res.body.projection_algo_version), /^[0-9a-f]{16}$/);
+  });
+
+  test("OCV5-745 catalog response carries projection_algo_version matching epoch endpoint (INC-20261114-CATALOG-EPOCH-409)", async () => {
+    const res = makeRes();
+    await handler({})(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    assert.equal((res.body as WireCatalogResponse).projection_algo_version, MODEL_PROJECTION_ALGO_VERSION);
   });
 
   test("remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)", async () => {
