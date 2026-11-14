@@ -315,6 +315,7 @@ export async function runBoxToolFirstRound(input: {
     let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
     const launchCliVersion = target.cliVersion;
     const coldPlan = plan;
+    let priorReason: string | null = null;
     // A resumed tool exchange must be staged from history: a native
     // transcript stops at the unanswered tool_use (OCV5-304).
     // OCV5-313: only where this Box's CLI build has verified native resume.
@@ -352,6 +353,7 @@ export async function runBoxToolFirstRound(input: {
           missDetail = explained.detail;
           return explained.reason;
         })();
+      priorReason = miss;
       deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
         reason: miss, cliVersion: String(target.cliVersion), ...(missDetail ? { detail: missDetail } : {}) });
       if (candidate && pointerCatalog && miss === "ok") {
@@ -379,6 +381,7 @@ export async function runBoxToolFirstRound(input: {
           if (signal.aborted || error instanceof BoxToolFirstRoundError
             && error.code === "BOX_TOOL_ABORTED") throw error;
           // Preflight is read-only/no paid CLI. A miss falls back exactly once.
+          priorReason = "preflight";
           deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
             reason: "preflight", cliVersion: String(target.cliVersion) });
         }
@@ -387,6 +390,7 @@ export async function runBoxToolFirstRound(input: {
     if (input.resumeToolResults && nativeEnabled && boxCliNativeResumeVerified(target.cliVersion)) {
       // OCV5-756: a tool exchange whose held CLI is gone is re-staged by design
       // (OCV5-304); record it so these misses are counted apart from history ones.
+      priorReason = "tool_resume";
       deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
         reason: "tool_resume", cliVersion: String(target.cliVersion) });
     }
@@ -424,7 +428,8 @@ export async function runBoxToolFirstRound(input: {
             ...(input.resumeToolResults ? { resumeToolResults: true } : {}),
             stagedAttachments: records });
           deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
-            reason: "restage_attachments", cliVersion: String(target.cliVersion) });
+            reason: "restage_attachments", cliVersion: String(target.cliVersion),
+            detail: { priorReason: priorReason ?? "cold", attachmentCount: records.length } });
         }
       } catch (error) {
         if (signal.aborted || error instanceof BoxToolFirstRoundError
