@@ -3,6 +3,7 @@ import { createServer, type ServerResponse } from 'node:http'
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import { createHash, randomBytes } from 'node:crypto'
@@ -324,13 +325,14 @@ test('control file is private and the bridge copies one stdin line to stdout', a
 // and the box Claude stayed alive on the session.
 async function bridgeAgainstFakeBox(
   remoteEndsOnStop: boolean,
-  opts: { holdStopResponseOpen?: boolean } = {},
+  opts: { holdStopResponseOpen?: boolean; collectAfterStop?: boolean } = {},
 ): Promise<{
   code: number | 'pending'
   out: string
   launchFifo: string
   stopFifos: string[]
   phases: Array<{ phase: string; ms: number }>
+  collections: number
 }> {
   const previousNoProxy = process.env.NO_PROXY
   process.env.NO_PROXY = '127.0.0.1,localhost'
@@ -340,6 +342,11 @@ async function bridgeAgainstFakeBox(
   const phases: Array<{ phase: string; ms: number }> = []
   const started = performance.now()
   const mark = (phase: string) => phases.push({ phase, ms: Math.round(performance.now() - started) })
+  let collections = 0
+  let gcTimer: ReturnType<typeof setTimeout> | undefined
+  let launchClosed!: () => void
+  const launchClose = new Promise<void>((resolve) => { launchClosed = resolve })
+  if (opts.collectAfterStop) assert.equal(typeof global.gc, 'function')
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (chunk) => chunks.push(chunk))
@@ -356,7 +363,15 @@ async function bridgeAgainstFakeBox(
       } else if (body.args[1] === BOX_CC_STOP_SCRIPT) {
         stopFifos.push(String(body.args[3]))
         mark('stop-request')
-        res.on('finish', () => mark('stop-response-eof'))
+        res.on('finish', () => {
+          mark('stop-response-eof')
+          if (opts.collectAfterStop) gcTimer = setTimeout(() => {
+            mark('gc-begin')
+            global.gc!()
+            collections++
+            mark('gc-complete')
+          }, 80)
+        })
         if (opts.holdStopResponseOpen) {
           res.write(frame({ exitEvent: {} }))
           mark('stop-response-held-open')
@@ -366,7 +381,7 @@ async function bridgeAgainstFakeBox(
         launchFifo = String(body.args[3])
         launch.res = res
         mark('main-open')
-        res.on('close', () => mark('main-response-close'))
+        res.on('close', () => { mark('main-response-close'); launchClosed() })
         res.write(frame({ stderrEvent: { data: 'BOX_INTERACTIVE_READY plugins=oc-bridge\n' } }))
       }
     })
@@ -393,6 +408,13 @@ async function bridgeAgainstFakeBox(
       stdin,
       stdout,
       stderr: new PassThrough(),
+      ...(opts.collectAfterStop ? { fetchImpl: async (url: string, init: RequestInit) => {
+        const body = JSON.parse(Buffer.from(init.body as Uint8Array).subarray(5).toString())
+        if (body.command !== 'python3' && body.args[1] !== BOX_CC_STOP_SCRIPT) {
+          init.signal!.addEventListener('abort', () => mark('main-abort'), { once: true })
+        }
+        return fetch(url, init)
+      } } : {}),
     })
     stdin.write('{"type":"user","message":{"role":"user","content":"first"}}\n')
     for (let i = 0; i < 200 && !out.includes('"result"'); i++) {
@@ -403,7 +425,7 @@ async function bridgeAgainstFakeBox(
     stdin.end()
     void running.then(() => mark('bridge-resolved'), () => mark('bridge-rejected'))
     const code = await Promise.race([
-      running,
+      opts.collectAfterStop ? running.then(async (code) => { await launchClose; return code }) : running,
       // Production allows 2s for stop exec/body, then 300ms for the launch
       // stream. Observe through the runner's existing 3s shutdown grace.
       new Promise<'pending'>((resolve) => {
@@ -411,9 +433,10 @@ async function bridgeAgainstFakeBox(
       }),
     ])
     mark('observation-complete')
-    return { code, out, launchFifo, stopFifos, phases }
+    return { code, out, launchFifo, stopFifos, phases, collections }
   } finally {
     if (observationTimer !== undefined) clearTimeout(observationTimer)
+    if (gcTimer !== undefined) clearTimeout(gcTimer)
     mark('fixture-cleanup')
     stdin.destroy()
     launch.res?.destroy()
@@ -472,6 +495,41 @@ async function until(check: () => boolean, ms = 5_000): Promise<boolean> {
   }
   return check()
 }
+
+test('closing stdin drains the launch reader after one GC', async (t) => {
+  if (process.env.OC_BOX_CC_GC_CHILD === '1') {
+    const run = await bridgeAgainstFakeBox(false, { collectAfterStop: true })
+    t.diagnostic(JSON.stringify({ node: process.version, collections: run.collections, phases: run.phases }))
+    assert.equal(run.collections, 1)
+    assert.equal(run.code, 0)
+    assert.deepEqual(run.stopFifos, [run.launchFifo])
+    const phases = run.phases.map(({ phase }) => phase)
+    for (const phase of ['gc-complete', 'main-abort', 'bridge-resolved', 'main-response-close']) {
+      assert.ok(phases.includes(phase), phase)
+      assert.ok(phases.indexOf(phase) < phases.indexOf('fixture-cleanup'), phase)
+    }
+    assert.ok(phases.indexOf('gc-complete') < phases.indexOf('main-abort'))
+    return
+  }
+  const child = spawn(process.execPath, [
+    '--expose-gc', '--import', 'tsx', '--test',
+    '--test-name-pattern=^closing stdin drains the launch reader after one GC$',
+    fileURLToPath(import.meta.url),
+  ], { env: { ...process.env, NODE_TEST_CONTEXT: undefined, OC_BOX_CC_GC_CHILD: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
+  let output = ''
+  child.stdout.on('data', (chunk) => { output += chunk })
+  child.stderr.on('data', (chunk) => { output += chunk })
+  // Startup has its own bound; the child's business assertion keeps the existing 3s grace.
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 30_000)
+  t.after(() => { clearTimeout(timeout); if (child.exitCode === null) child.kill('SIGKILL') })
+  const result = await new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code, signal) => resolve({ code, signal }))
+  })
+  clearTimeout(timeout)
+  assert.deepEqual(result, { code: 0, signal: null }, output)
+  assert.match(output, /"collections":1/)
+})
 
 test('box scripts: stop ends the launched Claude, and a new launch retires the old one of the same session', {
   skip: process.platform !== 'linux',

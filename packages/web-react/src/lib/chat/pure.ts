@@ -854,6 +854,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   antigravity_start_observation_failed: "执行进度同步失败，本轮可能已有操作完成，已停止自动重试。请先核对执行结果，再决定是否继续。",
   platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
   service_restart: "服务正在更新，本轮已中断，可以继续。",
+  admission_restart_unexecuted: "本轮尚未开始，消息已保留。自动恢复未完成时，可以在当前会话继续。",
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。可以在当前会话继续。",
   session_deleted: "这个会话已被删除。请先从回收站恢复，再在原会话继续。",
   durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击继续。",

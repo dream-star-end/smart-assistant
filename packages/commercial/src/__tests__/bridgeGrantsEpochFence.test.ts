@@ -87,7 +87,7 @@ function snapshotAt(epoch: bigint): ModelCatalogSnapshot {
     entries: [
       entry({ entryId: 1, modelId: MODEL }),
       entry({ entryId: 2, modelId: DEFAULT_SECONDARY_UTILITY_MODEL, providerId: "deepseek" }),
-      entry({ entryId: 3, modelId: DEFAULT_CCB_SUBAGENT_MODEL, providerId: "zai" }),
+      entry({ entryId: 3, modelId: DEFAULT_CCB_SUBAGENT_MODEL, providerId: "scnet" }),
     ],
     aliases: new Map(),
     pricing: new Map([

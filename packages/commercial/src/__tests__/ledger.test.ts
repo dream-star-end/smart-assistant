@@ -44,11 +44,13 @@ describe("LEDGER_REASONS (schema sync check)", () => {
       "pack",
       // 0131 codex 原生生图按张计费
       "image_generation",
+      // 0319 Muse 图片/视频按次计费(OCV5-574)
+      "muse_media",
     ]) {
       assert.ok(LEDGER_REASONS.includes(r as (typeof LEDGER_REASONS)[number]));
     }
-    // 不允许悄悄加东西而忘了同步 0002_init_billing.sql + 后续约束迁移（0077 +1, 0096 +3, 0131 +1）。
-    assert.equal(LEDGER_REASONS.length, 12);
+    // 不允许悄悄加东西而忘了同步 0002_init_billing.sql + 后续约束迁移（0077 +1, 0096 +3, 0131 +1, 0319 +1）。
+    assert.equal(LEDGER_REASONS.length, 13);
   });
 });
 

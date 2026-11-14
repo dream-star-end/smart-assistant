@@ -100,9 +100,11 @@ test('PG failure preserves delivery uncertainty and never emits accepted', async
   assert.equal(h.warnings.length, 1)
 })
 
-test('rejection retains terminal convergence and Cron refusal semantics', async () => {
+test('ordinary and recovery rejections retain terminal convergence and Cron refusal semantics', async () => {
+  for (const recoveryJob of [undefined, { jobId: 'rejected-recovery-job', leaseOwner: 'scheduler', leaseEpoch: 2, transportWaitAttempt: 0 } as ClaimedRecoveryJob]) {
   const queries: string[] = []
   const h = harness(async (sql) => { queries.push(sql); return { rows: [acceptedRow], rowCount: 1 } })
+  if (recoveryJob) h.context.admittedDispatches.set(record.clientMessageId, { ...record, ...{ recoveryJob } })
   const enrichment = { record }
   h.context.enrichmentDispatches.set(record.clientMessageId, enrichment)
   assert.equal(handleTurnDispatchReceipt(receipt({ state: 'rejected', outcome: 'not_accepted' }), h.context), true)
@@ -112,6 +114,7 @@ test('rejection retains terminal convergence and Cron refusal semantics', async 
   assert.deepEqual(h.settlements, [{ dispatchId: record.dispatchId, result: { kind: 'rejected' } }])
   assert.equal(h.context.enrichmentDispatches.size, 0)
   assert.equal(h.context.admittedDispatches.size, 0)
+  }
 })
 
 test('an enrichment fence that already terminalized wins before any database await', async () => {

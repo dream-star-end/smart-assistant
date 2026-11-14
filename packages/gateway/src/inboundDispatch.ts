@@ -1,3 +1,4 @@
+import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
 import { takeSystemHelpBootstrap } from '@openclaude/protocol'
 import { getSystemHelpBootstrap } from './systemHelpFrames.js'
 /**
@@ -554,12 +555,10 @@ export async function dispatchInbound(
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
-    const inboundCollabMode = !isEngineLocalTurnExempt()
-      ? normalizeCollabMode({ teamMode })
-      : normalizeCollabMode({
-          collabMode: (frame as { collabMode?: unknown }).collabMode,
-          teamMode,
-        })
+    const inboundCollabMode = normalizeCollabMode({
+      collabMode: (frame as { collabMode?: unknown }).collabMode,
+      teamMode,
+    })
 
     // v5 codex route 消费链(A1):master bridge 注入的 `__oc_codex_route` →
     // 严格校验(_buildSafeCodexRouteOverride)→ submit opts.codexRoute →
@@ -2326,6 +2325,15 @@ export async function dispatchInbound(
         //
         // 无 descriptor(本地路径 / flag 未开)→ 不传 → runner 写空串清位 + (flag 开时)自取
         // local_catalog token。清位判定收在 runner 单点,任何 submit 入口都漏不掉。
+        ...(turnAuthority?.engine === 'grok'
+          ? { grokExecutionDescriptor: freezeGrokExecutionDescriptor({
+              canonicalModel: turnAuthority.canonicalModel,
+              upstreamModelId: (turnAuthority.capabilityProfile.grok as {upstreamModelId:string}).upstreamModelId,
+              billingRequestId: turnAuthority.billingRequestId ?? '',
+              executionRevision: turnAuthority.executionRevision,
+              authorityTurnId: turnAuthority.authorityTurnId,
+            }, {canonicalModel: turnAuthority.canonicalModel, billingRequestId: turnAuthority.billingRequestId ?? ''}) }
+          : {}),
         ...(turnAuthority !== undefined
           ? {
               modelAuthority: {

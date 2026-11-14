@@ -1331,6 +1331,29 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box long-task generations gate 失败"
   fi
+  # OCV5-763: reverse-imported commercial incidents need actual selfhost runners.
+  # Existing train-isolated test DB only; no production credentials or model invocation.
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      REQUIRE_TEST_DB=1 TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+      npx --no-install tsx scripts/check-v5-master-incident-proofs.ts ); then
+    cleanup_master_staging
+    die "pinned imported master incident proofs failed"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
+    cleanup_master_staging
+    die "pinned imported codex-chatgpt-ws proof failed"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+    cleanup_master_staging
+    die "pinned imported ocv5-376-platform-tool-proofs proof failed"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
+    cleanup_master_staging
+    die "pinned imported box-terminal-unproven-probe proof failed"
+  fi
   master_gate_db_drop
   mlog "  upload retention HTTP responsiveness proof @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
@@ -1347,6 +1370,11 @@ build_master_release() {
   if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
+  fi
+  # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
+    cleanup_master_staging
+    die "pinned Codex late-stop closure proof failed"
   fi
   cleanup_master_gate_tmpdir
 

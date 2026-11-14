@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { waitForBoxReplay } from "./boxReplayWait.js";
 
-type R = { kind: "pending" | "ready" | "missing" };
+type R = { kind: "pending" | "ready" | "missing" | "failed" };
 const clock = () => { let t = 0; return { now: () => t,
   sleep: async (ms: number) => { t += ms; } }; };
 
@@ -44,4 +44,18 @@ test("non-pending results and a gone client never wait", async () => {
   assert.equal((await waitForBoxReplay<R>({ kind: "pending" }, lookup,
     { budgetMs: 10_000, intervalMs: 1_000, signal: gone.signal, ...clock() })).kind, "pending");
   assert.equal(lookups, 0);
+});
+
+test("a persisted failure ends pending observation without another lookup", async () => {
+  let lookups = 0;
+  const result = await waitForBoxReplay<R>({ kind: "pending" }, async () => {
+    lookups++; return { kind: "failed" };
+  }, { budgetMs: 10_000, intervalMs: 1_000,
+    signal: new AbortController().signal, ...clock() });
+  assert.equal(result.kind, "failed");
+  assert.equal(lookups, 1);
+  await waitForBoxReplay<R>({ kind: "failed" }, async () => {
+    throw new Error("failed replay must never be observed or launched");
+  }, { budgetMs: 10_000, intervalMs: 1_000,
+    signal: new AbortController().signal, ...clock() });
 });

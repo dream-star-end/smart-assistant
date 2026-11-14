@@ -549,6 +549,7 @@ import {
   appendServerAuthoredMessageDrainByUser,
   drainDelegateCostForClientSession,
   getClientSession,
+  classifyClientSessions,
   patchServerAuthoredMessage,
   readArchivedMessages,
   getEngineContextMessages,
@@ -628,6 +629,13 @@ import {
   createBiliAccountRuntimeRegistries,
 } from './plugins/biliAccount.js'
 import { BiliAccountSetupManager } from './plugins/biliAccountSetup.js'
+import {
+  DOUYIN_BROKER_ROOT,
+  DOUYIN_WORKER_ROOT,
+  DouyinDockerService,
+  createDouyinRuntimeRegistries,
+} from './plugins/douyin.js'
+import { DouyinSetupManager } from './plugins/douyinSetup.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
@@ -673,6 +681,8 @@ import {
 } from "./minimax/mediaProxy.js";
 import { mediaProxyKey } from "./minimax/mediaKey.js";
 import { createMuseFromConfig } from "./muse/assemble.js";
+import { createStudioFromConfig } from "./media-studio/assemble.js";
+import { startStudioOrchestrator } from "./media-studio/orchestrator/assemble.js";
 import { makeMuseInternalHandler } from "./muse/internalHttp.js";
 import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
@@ -687,6 +697,9 @@ import {
 } from "./grok/webSearchProxy.js";
 import {
   GROK_VISION_PATH,
+  grokRunMaxCost,
+  makeGrokRunner,
+  resettleGrokRun,
   makeGrokVisionHandler,
   type GrokVisionHandler,
 } from "./grok/visionProxy.js";
@@ -901,199 +914,8 @@ function shouldAutoMigrate(
   );
   return true;
 }
-
-/**
- * v5 灰度运行时状态 — 由 commercial 自身计算(它拥有控制面/运行时的事实),
- * 经 RegisterCommercialResult 暴露给 gateway,gateway 仅在 /healthz 透传序列化。
- * 用作"控制面是否静默 / 容器·agent 运行时是否启用 / 灰度归属(channel)"的只读断言面。
- */
-
-export interface RegisterCommercialResult extends RemoteHostChunkHooks {
-  /**
-   * HTTP 处理器:gateway 在自身 handleHttp 入口前调用,
-   * 返回 true 表示已处理完毕,gateway 不再继续路由。
-   */
-  handle: CommercialHandler;
-  /** v5 灰度运行时状态(见 CommercialRuntimeStatus)。 */
-  runtimeStatus?: CommercialRuntimeStatus;
-  /**
-   * WebSocket upgrade 处理器:gateway 在 HTTP server 的 `upgrade` 事件里调用。
-   * 返回 true → commercial 已处理(可能是鉴权失败 + destroy,也可能是成功 upgrade);
-   * 返回 false → 非 commercial 路由(如 `/ws`),gateway 自行处理。
-   */
-  handleWsUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => boolean;
-  /** 关闭所有商业化资源(pool / redis / ws)。 */
-  shutdown: () => Promise<void>;
-  /**
-   * V3 2H:内部 anthropic 代理监听地址(`{host, port}`),用于:
-   *   - /healthz 反映启用状态
-   *   - 测试断言代理已上线
-   *   - dev 工具按地址探活
-   * 未启用(env 缺失 / skipInternalProxy / 监听失败)时为 undefined。
-   */
-  internalProxyAddress?: { host: string; port: number };
-  /**
-   * V3 D.1b:外部 mTLS 监听地址(18443)。remote-host node-agent L7 反代从这里进。
-   * 未启用(EXTERNAL_MTLS_ENABLED != 1 / 缺 bind/port / 监听失败)时为 undefined。
-   */
-  externalMtlsAddress?: { host: string; port: number };
-  /**
-   * Commercial access JWT 的 HMAC 密钥(已规范化为 ≥32 byte Uint8Array)。
-   *
-   * 暴露给 gateway,使其在 checkHttpAuth / getUserId 时能识别 commercial
-   * 模块签发的 JWT —— 否则商用版用户登录后调 personal-version 沿用的
-   * `/api/agents` `/api/sessions/*` 等路由会一律 401(因为 personal 版
-   * checkHttpAuth 用 `gateway.accessToken` 当 HMAC,而 commercial JWT
-   * 用 JWT_SECRET,两个 secret 完全不同)。
-   *
-   * gateway 用同步 HS256 验签(node:crypto.createHmac),不引入 jose 依赖,
-   * 也不需要把 checkHttpAuth 链路改 async(改动面太大)。
-   */
-  jwtSecret: Uint8Array;
-  /**
-   * V3 multi-tenant `/api/uploads` 写入与 `/api/media` 读取的存储路径解析器。
-   *
-   * 把 `c:<uid>` 形式的 userId 映射到这台 master 上**用户 docker volume 宿主路径**
-   * 的 uploads / generated **两个子目录**(同一 docker volume,一次 inspect 同时
-   * 确认两 dir 可用)。容器侧 dispatchInbound / codex `image_gen` 通过相同的
-   * volume mount 分别看到 `/home/agent/.openclaude/(uploads|generated)/`,从而
-   * 消除 "master 写到自己 paths.{uploads,generated}Dir / 容器读自己同名 dir"
-   * 的双视图 bug(两次同型回归:2026-05-09 uploads + 2026-05-12 generated)。
-   *
-   * 装配条件:agentRuntime 起得来(有 docker client)+ pool 已建立。两者任一缺失
-   * (e.g. AGENT_IMAGE 没配),resolver 为 undefined,gateway 自动回退到旧的
-   * `paths.uploadsDir` / `paths.generatedDir`(personal/单租户兼容)。
-   *
-   * fail-closed:DB 查无 active container → not-ready;远程 host → remote-host;
-   * 多条 active → ambiguous;volume 不存在 → volume-missing。gateway 转译为对应
-   * HTTP 4xx/5xx,不做静默回退。
-   */
-  resolveUserMediaDirs?: (userId: string) => Promise<UserMediaLocation>;
-  /**
-   * V3 multi-tenant **textual** 谓词:判定一个 resolvedPath 是否长得像
-   * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`。
-   *
-   * **不是 user-scoped** —— 只检查路径形态,不验证 uid 等于当前请求 userId。
-   * gateway HTTP allowlist **不能**用它(会引入 cross-tenant IDOR:用户 A 拿到
-   * 用户 B 的绝对路径就能读)。allowlist 的 user-scoped predicate 应该用
-   * `resolveUserMediaDirs(userId)` 解析出当前用户的 `{uploads, generated}` 后
-   * 自己 closure。
-   *
-   * 唯一合法用途:启动时 `.tmp-*` orphan sweep(无 userId 上下文,只想匹配
-   * docker volumes 根下的 user volume 目录壳子)。
-   */
-  isUserVolumeMediaPath?: (resolvedPath: string) => boolean;
-  /**
-   * v1.0.192 — 给 gateway `handleUpload` 在写 user docker volume 之前用的
-   * 冷启动护栏。**结构化返回**(不抛 ContainerUnreadyError),让 gateway 保持
-   * 零编译期依赖 commercial 子模块的边界(server.ts 头部明确注释:不 import
-   * @openclaude/commercial)。
-   *
-   * 其他 error(DB 抖 / docker daemon 不可达 / supervisor wired-but-broken)
-   * 仍然 throw,gateway 端 catch 后兜底 503。
-   *
-   * 共享同一 per-uid singleflight(与 commercial 内部 `/api/media-signed` +
-   * WS bridge 同闭包),reload 时不会让 upload 路径成为 DB INSERT race 输家。
-   *
-   * 未注入(agentRuntime 没起 / v3Deps 缺) → gateway 直接跳过冷启动护栏,
-   * 走原 `_resolveMediaDirs` 行为(personal/legacy 单租户路径)。
-   */
-  ensureContainerReady?: (
-    uid: bigint,
-  ) => Promise<{ ok: true } | { ok: false; retryAfterSec: number; reason: string }>;
-  /**
-   * GET /api/sessions/:id 时 master 把引擎预热打到用户容器
-   * `/internal/v3/engine-preheat`。失败必须 swallow。
-   */
-  preheatUserContainer?: (args: {
-    userId: string;
-    sessionId: string;
-    agentId: string;
-    modelId?: string;
-  }) => Promise<void>;
-  /**
-   * 2026-05-16 hotfix — remote-host upload push hook。
-   *
-   * 当 `resolveUserMediaDirs(userId)` 返回 `{kind:"fail", reason:"remote-host",
-   * hostUuid, uploads, generated}` 时,gateway 把本地暂存好的字节(stream→
-   * digest 校验完成)通过这个 hook 推到 host 上的 docker volume:
-   *   `${uploads}/${digest}.${ext}` 或 `${generated}/${name}`
-   *
-   * 实现:getHostById(hostUuid) → hostRowToTarget → nodeAgentPutFile(target,
-   * remotePath, content, 0o644, 1000, 1000) → finally psk.fill(0)。
-   *
-   * 错误语义:任意阶段失败(row 不存在 / agent 不可达 / HTTP >=400)直接抛,
-   * gateway 转 502 "remote storage push failed";frontend 重试合理。
-   *
-   * 装配条件同 `resolveUserMediaDirs`(agentRuntime 在手),为简化保持总是
-   * 装配 —— closure 内部自己用 pool,与上面的 resolver 一致。
-   */
-  pushRemoteHostUpload?: (args: {
-    hostUuid: string;
-    remotePath: string;
-    content: Buffer;
-  }) => Promise<void>;
-  /**
-   * 2026-05-16 hotfix Phase 2 — remote-host **读路径**对称 hook。
-   *
-   * 当 `resolveUserMediaDirs(userId)` 返回 `remote-host` 失败,gateway 的
-   * `handleMediaGet` / `handleApiFile` 通过本 hook 从远端 node-agent /files GET
-   * 拉用户卷下的文件回 master,由 master 服给浏览器/API 客户端。
-   *
-   * 实现:getHostById(hostUuid) → hostRowToTarget → nodeAgentGetFile(target,
-   * remotePath) → finally psk.fill(0)。
-   *
-   * 返回:
-   *   - `Buffer` (含空 Buffer = 0 字节文件,合法):远端命中
-   *   - `null`:远端 404(node-agent 明确不存在,gateway 可选择 fallback 到另一
-   *     目录或最终 404 给用户)
-   *
-   * 错误:任意阶段失败(row 不存在 / agent 不可达 / mTLS / HTTP >=400 非 404)
-   *   直接抛 → gateway 转 502 "remote storage pull failed";frontend 重试合理。
-   *
-   * 装配条件、psk 清零纪律与 `pushRemoteHostUpload` 完全对称。
-   */
-  pullRemoteHostMedia?: (args: {
-    hostUuid: string;
-    remotePath: string;
-  }) => Promise<Buffer | null>;
-  /**
-   * P1.7 slice 7c — WeChat broker 入站入口。
-   *
-   * 装配条件:
-   *   - cfg.WECHAT_BROKER_ENABLED === true (env WECHAT_BROKER_ENABLED=1)
-   *   - selfHostUuid / dispatchInternal 等基础设施已就绪
-   *
-   * gateway 不 import commercial 类型 — 这里只暴露 broker.onInbound 的最小投影
-   * (结构对齐 gateway 的 `CommercialHook.wechatBroker.onInbound` 形状)。返回
-   * `unknown` 让 caller 不感知 BrokerInboundOutcome 内部 union;broker 自己
-   * never-throw,caller 不需要 try/catch。
-   */
-  /**
-   * healthz 深度探活:gateway healthz 经此 seam 探 commercial 强依赖(PG/Redis),
-   * 补"依赖宕机但 healthz 仍绿零告警"的盲区。返回 { pg, redis } 各自 ok/err,
-   * 内部 2s 超时;gateway 未拿到该函数(旧接线/个人版)时退回仅探 sessions.db。
-   */
-  probeDeps?: () => Promise<Record<string, { ok: true } | { ok: false; error: string }>>;
-  wechatBroker?: {
-    onInbound(evt: {
-      bindingUserId: string;
-      accountId?: string;
-      senderId: string;
-      text: string;
-      messageId?: string;
-      itemTypes?: string;
-      rawPayload?: unknown;
-      mediaAttachments?: import("@openclaude/channel-wechat").WechatMediaAttachment[];
-      imageAttachments?: import("@openclaude/channel-wechat").WechatImageAttachment[];
-      idempotencyKey: string;
-      receivedAt: number;
-      channel?: "wechat";
-      agentId?: string;
-    }): Promise<unknown>;
-    cleanupBinding(bindingUserId: string): Promise<unknown>;
-  };
-}
+import type { RegisterCommercialResult } from "./commercialRegistrationTypes.js";
+export type { RegisterCommercialResult } from "./commercialRegistrationTypes.js";
 
 // ─── D.1b: 18443 mTLS 反代前置校验 ─────────────────────────────────────────
 //
@@ -1491,6 +1313,9 @@ export async function registerCommercial(
       sessionsStoreGeneration = decision.generation;
       const pgSessionsBackend = createPgSessionsBackend(getPool(), {
         expectedGeneration: decision.generation,
+        admissionRestartRecovery: {
+          releaseReservation: (ref) => releasePreCheck(preCheckRedis, ref).then(() => {}),
+        },
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
         onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
@@ -1712,6 +1537,8 @@ export async function registerCommercial(
   let zhihuSetup: ZhihuSetupManager | undefined
   let biliAccountService: BiliAccountDockerService | undefined
   let biliAccountSetup: BiliAccountSetupManager | undefined
+  let douyinService: DouyinDockerService | undefined
+  let douyinSetup: DouyinSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
   // 文献插件(OCV5-524/585):观测日志 literature_plugin_call / literature_artifact 由 runtime 工厂接到 rootLogger。
   const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin, literatureObserver } = createCommercialLiteratureRuntime({ runtimeChannel, redis, logger: rootLogger })
@@ -1753,22 +1580,34 @@ export async function registerCommercial(
       socketUid: 1000,
       socketGid: 1000,
     })
+    // OCV5-553: Douyin Plugin (market only; this version is QR login + read-only `me`).
+    douyinService = new DouyinDockerService(pluginDocker, {
+      imageId: cfg.OC_RUNTIME_IMAGE_ID,
+      workerRoot: DOUYIN_WORKER_ROOT,
+      brokerRoot: DOUYIN_BROKER_ROOT,
+      expectedOwnerUid: 0,
+      socketUid: 1000,
+      socketGid: 1000,
+    })
     const knowledgePlanetRegistries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
     const weiboRegistries = createWeiboRuntimeRegistries(weiboService)
     const zhihuRegistries = createZhihuRuntimeRegistries(zhihuService)
     const biliAccountRegistries = createBiliAccountRuntimeRegistries(biliAccountService)
+    const douyinRegistries = createDouyinRuntimeRegistries(douyinService)
     const browserRuntime = new ManagedBrowserRuntime({
       drivers: new Map([
         ...knowledgePlanetRegistries.drivers,
         ...weiboRegistries.drivers,
         ...zhihuRegistries.drivers,
         ...biliAccountRegistries.drivers,
+        ...douyinRegistries.drivers,
       ]),
       launchers: new Map([
         ...knowledgePlanetRegistries.launchers,
         ...weiboRegistries.launchers,
         ...zhihuRegistries.launchers,
         ...biliAccountRegistries.launchers,
+        ...douyinRegistries.launchers,
       ]),
       profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
       expectedOwnerUid: 0,
@@ -1792,6 +1631,10 @@ export async function registerCommercial(
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     biliAccountSetup = new BiliAccountSetupManager(biliAccountService, {
+      redis,
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
+    douyinSetup = new DouyinSetupManager(douyinService, {
       redis,
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
@@ -2042,8 +1885,34 @@ export async function registerCommercial(
       start: () => mediaGenerationService.start(),
     });
   }
+  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
-  const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool());
+  const museDeliveryRefs: {
+    pushRemote?: (args: { hostUuid: string; remotePath: string; content: Buffer }) => Promise<void>;
+    resolveMedia?: (userId: string) => Promise<UserMediaLocation>;
+  } = {};
+  const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool(),
+    flavorIdentity.status === "ok" && flavorIdentity.flavor === "commercial" ? {
+      append: appendServerAuthoredMessage,
+      originActive: async (sessionId, userId) =>
+        (await classifyClientSessions([{ sessionId, userId }]))[0]?.state === "active",
+      resolveMedia: async (userId) => {
+        if (!museDeliveryRefs.resolveMedia) throw new Error("Muse media resolver not ready");
+        return museDeliveryRefs.resolveMedia(userId);
+      },
+      pushRemote: async (args) => {
+        if (!museDeliveryRefs.pushRemote) throw new Error("Muse remote uploader not ready");
+        await museDeliveryRefs.pushRemote(args);
+      },
+      broadcast: (uid, frame) => bridgeBroadcastRef.current(uid, frame),
+    } : undefined);
+  // OCV5-591 media studio. Off unless OC_STUDIO_ENABLED=1 (→ /api/studio/* 404, no GC tick).
+  const studioHttp = await createStudioFromConfig(cfg, getPool(), { preCheckRedis, museHub });
+  let stopStudioOrchestrator: (() => Promise<void>) | undefined;
+  // OCV5-591 A2-1c-2: studio activity to this slot's connections (assigned once the bridge exists).
+  const studioPushRef: { current: (uid: bigint, payload: unknown) => void } = {
+    current: () => { /* bridge not assembled yet */ },
+  };
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -2472,6 +2341,39 @@ export async function registerCommercial(
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
+      // OCV5-591 A2-1: the studio's director agent plans with the same Grok core (platform-paid steps).
+      if (studioHttp) {
+        const studioGrokCatalog = {
+          async assertFresh() {
+            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+            if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
+            return cache.assertFresh();
+          },
+        };
+        stopStudioOrchestrator = startStudioOrchestrator({
+          cfg,
+          pool: getPool(),
+          studio: studioHttp,
+          museHub,
+          push: (uid, frame) => studioPushRef.current(uid, frame),
+          grok: makeGrokRunner({
+            getPool,
+            preCheckRedis,
+            pricing,
+            catalog: studioGrokCatalog,
+            loadUserModelAuthz,
+            recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
+          }),
+          // OCV5-591 A2-1b-1: visual QA reserves one run's worst case against the project budget.
+          grokMaxCost: (model) => grokRunMaxCost(studioGrokCatalog, model),
+          // A stored QA answer whose settle may not have happened is settled again (idempotent).
+          grokResettle: (i) =>
+            resettleGrokRun(
+              { getPool, preCheckRedis, pricing },
+              { ...i, containerId: null, durationMs: 0 },
+            ),
+        })?.stop;
+      }
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -2506,35 +2408,31 @@ export async function registerCommercial(
         },
       });
       // /internal/v5/delegate/grok-route/* — 容器本地 delegate turn 的 grok route
-      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。仅在
-      // selfhost engine-local-turn 豁免下挂载(与 gateway modelAuthority
-      // isEngineLocalTurnExempt 同一 env 语义);生产不路由 → 容器侧 delegate 在
-      // decideLocalExecution 已 fail-closed,不会也不该到达这里。
-      const delegateGrokRouteHandler: DelegateGrokRouteHandler | undefined =
-        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
-          ? makeDelegateGrokRouteHandler({
-              identityRepo,
-              // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
-              // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
-              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
-              release: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-                if (!context) return false;
-                await expireGrokRouteContextByLease(context.accountId, context.slotId);
-                scheduler.releaseCodexSlot(context.accountId, context.slotId);
-                return true;
-              },
-              renew: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-                if (!context) return false;
-                if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
-                  scheduler.restoreCodexSlot(context.accountId, context.slotId);
-                }
-                return true;
-              },
-              logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
-            })
-          : undefined;
+      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。两版都挂载:
+      // 容器在 mint 后必须先过 delegate 计费准入(绑定 routeTokenHash),grok relay 对
+      // kind=delegate 的路由只在有 inflight 计费 journal 时放行(OCV5-477)。
+      const delegateGrokRouteHandler: DelegateGrokRouteHandler = makeDelegateGrokRouteHandler({
+        identityRepo,
+        // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
+        // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
+        allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
+        release: async ({ routeToken, containerId, userId }) => {
+          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+          if (!context) return false;
+          await expireGrokRouteContextByLease(context.accountId, context.slotId);
+          scheduler.releaseCodexSlot(context.accountId, context.slotId);
+          return true;
+        },
+        renew: async ({ routeToken, containerId, userId }) => {
+          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+          if (!context) return false;
+          if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
+            scheduler.restoreCodexSlot(context.accountId, context.slotId);
+          }
+          return true;
+        },
+        logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
+      });
       // /internal/v5/delegate/antigravity-route/* — 委派到 antigravity 引擎时
       // master 签发/续/释 relay route(OCV5-738)。与 chat turn 共用账号池、
       // durable turn row 与 relay meter;同样只在 selfhost 引擎本地 turn 豁免下
@@ -4342,6 +4240,7 @@ export async function registerCommercial(
         docker: mediaResolverDocker,
       })
     : undefined;
+  museDeliveryRefs.resolveMedia = userMediaResolver;
   knowledgePlanetMediaResolverRef.current = userMediaResolver
 
   // Shared remote-host upload closure. It is used by both gateway /api/uploads
@@ -4367,6 +4266,7 @@ export async function registerCommercial(
       target.psk?.fill(0);
     }
   };
+  museDeliveryRefs.pushRemote = pushRemoteHostUpload;
 
 
   const chunkHooks = createRemoteHostChunkHooks();
@@ -4530,6 +4430,7 @@ export async function registerCommercial(
     ...systemActions?.http,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
+    studio: studioHttp,
     goalStateService,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
@@ -4542,6 +4443,7 @@ export async function registerCommercial(
     literatureArtifacts,
     zhihuSetup,
     biliAccountSetup,
+    douyinSetup,
     knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
@@ -6176,6 +6078,9 @@ export async function registerCommercial(
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
+  studioPushRef.current = (uid, payload) => {
+    userChatBridge.broadcastToUser(uid, payload);
+  };
   goalSyncRef.current = (uid, payload) => {
     userChatBridge.syncGoalToContainers(uid, payload);
   };
@@ -6716,6 +6621,8 @@ export async function registerCommercial(
           },
         });
         const reconcilerDeps = {
+          recoverInterruptedAdmission: dispatchAdmissionBackend
+            ? (id: string) => dispatchAdmissionBackend!.recoverInterruptedAdmission(id) : undefined,
           containerLinkEnabled: containerLinkOn,
           pool: getPool(),
           container,
@@ -7277,6 +7184,9 @@ export async function registerCommercial(
       chatgptProxyServer = undefined;
       try { await cgpServer?.close(); } catch { /* ignore */ }
       try { await closeMusePublic?.(); } catch { /* ignore */ }
+      try { await stopStudioOrchestrator?.(); } catch { /* ignore */ }
+      // OCV5-574: close this process's open Muse jobs (MUSE_MASTER_RESTARTED, never charged).
+      try { await museHub?.stop(); } catch { /* ignore */ }
       try { await directPreview?.shutdown(); } catch { /* ignore */ }
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
@@ -7292,6 +7202,7 @@ export async function registerCommercial(
           Promise.resolve().then(() => literatureArtifacts?.close()),
           zhihuSetup?.closeAndDrain(),
           biliAccountSetup?.closeAndDrain(),
+          douyinSetup?.closeAndDrain(),
         ])
       } catch {
         /* ignore */

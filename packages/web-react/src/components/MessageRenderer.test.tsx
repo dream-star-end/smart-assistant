@@ -1090,6 +1090,9 @@ describe("MessageList 失败轮单一错误出口", () => {
   });
 
   test("自动恢复子轮的错误卡被滤掉时，原消息仍显示发送失败", () => {
+    const onRetrySend = vi.fn();
+    const onContinueInterrupted = vi.fn();
+    const original = structuredClone(failedUser);
     render(
       <MessageList
         messages={[
@@ -1110,12 +1113,19 @@ describe("MessageList 失败轮单一错误出口", () => {
           } as unknown as Partial<ChatMessage>),
         ]}
         sending={false}
-        cb={{ onContinueInterrupted: vi.fn() }}
+        cb={{ onRetrySend, onContinueInterrupted }}
         onRespondPermission={() => {}}
       />,
     );
     expect(screen.getByText("发送失败")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
+    const buttons = screen.getAllByRole("button", { name: "继续" });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(onContinueInterrupted).toHaveBeenCalledWith(failedUser);
+    expect(onRetrySend).not.toHaveBeenCalled();
+    expect(failedUser).toEqual(original);
+    expect(screen.queryByText("↻ 自动重试")).toBeNull();
   });
 
   test("OCV5-645 自动恢复子行在、源行无快照但已有正文:正文照常显示,只藏错误卡", () => {

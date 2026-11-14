@@ -90,6 +90,8 @@ function mapErrorCode(code: string): string {
       return 'disabled'
     case 'REGISTRATION_DISABLED':
       return 'registration_disabled'
+    case 'IP_REGISTRATION_LIMIT':
+      return 'ip_registration_limit'
     case 'CONFIG_MISSING':
       return 'unavailable'
     default:
@@ -256,6 +258,7 @@ export async function handleLinuxdoCallback(
         jwtSecret: deps.jwtSecret,
         userAgent: ctx.userAgent ?? undefined,
         bindIp: ctx.authBoundIp,
+        registrationIp: ctx.clientIp,
         clientIp: refreshClientIpFromRequest(ctx.authBoundIp, req.headers['cf-connecting-ip']),
         allowCreate: allowRegSetting.value === true,
         replaceRefreshToken: readRefreshCookie(req),

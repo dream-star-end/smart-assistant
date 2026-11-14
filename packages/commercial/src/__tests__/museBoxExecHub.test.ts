@@ -1,11 +1,12 @@
-// OCV5-750: default-off box-exec video backend must not change the hatch path.
+// OCV5-750 (Aurora port): default-off box-exec video backend must not change the hatch path.
+// Aurora keeps offline hatch jobs queued with a retry budget instead of rejecting at submit.
 
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 
 import type { BoxCcExecRequest } from '@openclaude/gateway'
 
@@ -41,8 +42,22 @@ class MemStore implements MuseStore {
   async findJob(userId: string, id: string) {
     const r = this.rows.get(id)
     return r && r.userId === userId
-      ? { id, kind: r.kind, status: r.status as 'queued', errorCode: r.error }
+      ? {
+          id,
+          kind: r.kind,
+          status: r.status as 'queued',
+          errorCode: r.error,
+          files: null,
+          snapshotId: null,
+          debitedCredits: null,
+        }
       : null
+  }
+  async countSiteToday() {
+    return 0
+  }
+  async openCredits() {
+    return 0n
   }
   async findCredential() {
     return null
@@ -50,11 +65,12 @@ class MemStore implements MuseStore {
   async touchCredential() {}
 }
 
+const hubs: MuseBridgeHub[] = []
 function makeHub(
   root: string,
   extra: ConstructorParameters<typeof MuseBridgeHub>[0] extends infer T ? Partial<T> : never = {},
 ) {
-  return new MuseBridgeHub({
+  const hub = new MuseBridgeHub({
     store: extra.store ?? new MemStore(),
     stateRoot: root,
     allowedUids: new Set(['3']),
@@ -65,6 +81,8 @@ function makeHub(
     boxExecRetrySleep: async () => {},
     ...extra,
   })
+  hubs.push(hub)
+  return hub
 }
 
 const roots: string[] = []
@@ -74,17 +92,28 @@ function tmpRoot(): string {
   return root
 }
 
-afterEach(() => {
+// Hub timers are unref'd; keep the loop alive while a test long-polls (as museDurable.test does).
+let keep: NodeJS.Timeout | null = null
+beforeEach(() => {
+  keep = setInterval(() => {}, 1000)
+})
+afterEach(async () => {
+  if (keep) clearInterval(keep)
+  for (const hub of hubs.splice(0)) await hub.stop()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
 describe('OCV5-750 hub routing', () => {
-  it('flag off: video submit without a hatch session still fails MUSE_BRIDGE_OFFLINE', async () => {
-    const hub = makeHub(tmpRoot())
-    await assert.rejects(
-      hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' }),
-      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_BRIDGE_OFFLINE',
-    )
+  it('flag off: an offline video stays queued for hatch and never reaches the relay', async () => {
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      boxExecPollMs: 1,
+      boxExecRunner: async () => okRelay(counter),
+    })
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const view = await hub.view('3', id, 50)
+    assert.equal(view?.status, 'queued')
+    assert.equal(counter.calls.length, 0)
   })
 
   it('flag on: video jobs skip the hatch offline check and finish via Exec', async () => {
@@ -125,6 +154,7 @@ describe('OCV5-750 hub routing', () => {
     }
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => exec,
     })
@@ -137,16 +167,23 @@ describe('OCV5-750 hub routing', () => {
     assert.ok(file)
   })
 
-  it('flag on: image jobs and --resume videos still require the hatch bridge', async () => {
-    const hub = makeHub(tmpRoot(), { videoBackend: 'box-exec' })
-    await assert.rejects(
-      hub.submit('3', null, { kind: 'image', prompt: 'a still' }),
-      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_BRIDGE_OFFLINE',
-    )
-    await assert.rejects(
-      hub.submit('3', null, { kind: 'video', prompt: 'continue', resume_snapshot_id: 'abc:v1' }),
-      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_BRIDGE_OFFLINE',
-    )
+  it('flag on: image jobs and --resume videos stay on the hatch queue', async () => {
+    const counter = { submits: 0, calls: [] as string[] }
+    const hub = makeHub(tmpRoot(), {
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRunner: async () => okRelay(counter),
+    })
+    const a = await hub.submit('3', null, { kind: 'image', prompt: 'a still' })
+    const b = await hub.submit('3', null, {
+      kind: 'video',
+      prompt: 'continue',
+      resume_snapshot_id: 'abc:v1',
+    })
+    assert.equal((await hub.view('3', a, 50))?.status, 'queued')
+    assert.equal((await hub.view('3', b, 50))?.status, 'queued')
+    assert.equal(counter.calls.length, 0)
   })
 
   it('runtime file overrides env without a process restart', async () => {
@@ -167,6 +204,7 @@ describe('OCV5-750 hub routing', () => {
     let submits = 0
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => {
         await gate
@@ -190,7 +228,7 @@ describe('OCV5-750 hub routing', () => {
     assert.equal(view?.status, 'cancelled')
   })
 
-  it('does not fall back to hatch after the relay job was already submitted', async () => {
+  it('a relay failure after accepted submit never falls back to hatch', async () => {
     const root = tmpRoot()
     let submits = 0
     const hub = makeHub(root, {
@@ -215,7 +253,7 @@ describe('OCV5-750 hub routing', () => {
     assert.equal(view?.status, 'failed')
     assert.equal(view?.error?.code, 'MUSE_UPSTREAM_ERROR')
   })
-  it('does not fall back to hatch when submit ends with BOX_EXEC_INCOMPLETE', async () => {
+  it('an incomplete submit fails the job and never reaches hatch', async () => {
     const root = tmpRoot()
     let submits = 0
     let hatchHello = 0
@@ -277,7 +315,7 @@ function okRelay(counter: { submits: number; calls: string[] }) {
 }
 
 describe('OCV5-750 hatch-with-box-fallback', () => {
-  it('hatch offline at submit: a fresh video goes to the relay; images and resume still fail', async () => {
+  it('hatch offline at submit: a fresh video goes to the relay; images and resume stay on hatch', async () => {
     const counter = { submits: 0, calls: [] as string[] }
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'hatch-with-box-fallback',
@@ -288,14 +326,15 @@ describe('OCV5-750 hatch-with-box-fallback', () => {
     const view = await hub.view('3', id, 2_000)
     assert.equal(view?.status, 'succeeded')
     assert.equal(counter.submits, 1)
-    await assert.rejects(
-      hub.submit('3', null, { kind: 'image', prompt: 'still' }),
-      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_BRIDGE_OFFLINE',
-    )
-    await assert.rejects(
-      hub.submit('3', null, { kind: 'video', prompt: 'more', resume_snapshot_id: 'abc:v1' }),
-      (err: unknown) => err instanceof MuseError && err.code === 'MUSE_BRIDGE_OFFLINE',
-    )
+    const img = await hub.submit('3', null, { kind: 'image', prompt: 'still' })
+    const res = await hub.submit('3', null, {
+      kind: 'video',
+      prompt: 'more',
+      resume_snapshot_id: 'abc:v1',
+    })
+    assert.equal((await hub.view('3', img, 50))?.status, 'queued')
+    assert.equal((await hub.view('3', res, 50))?.status, 'queued')
+    assert.equal(counter.submits, 1)
   })
 
   it('hatch online: the job goes to hatch and the relay is never called', async () => {
@@ -342,16 +381,13 @@ describe('OCV5-750 hatch-with-box-fallback', () => {
     })
     const sid = hub.hello('1', '0.5.3')
     const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
-    let last: { id: string; nonce: string } | null = null
-    for (let attempt = 1; attempt <= MAX_DISPATCH_ATTEMPTS; attempt++) {
-      const job = (await hub.poll(sid, 50))!
-      last = job
-      clock += ACK_TIMEOUT_MS + 1
-      hub.checkSession(sid)
-      hub.tick()
-    }
-    assert.throws(
-      () => hub.heartbeat(last!.id, last!.nonce),
+    const last = (await hub.poll(sid, 50))!
+    assert.equal(last.id, id)
+    // No ack, and the bridge then goes silent: the requeue hook moves the job to the relay.
+    clock += ACK_TIMEOUT_MS + BRIDGE_ONLINE_MS + 1
+    hub.tick()
+    await assert.rejects(
+      async () => hub.heartbeat(last.id, last.nonce),
       (err: unknown) => err instanceof MuseError && err.status === 410,
     )
     const view = await hub.view('3', id, 2_000)
@@ -371,19 +407,22 @@ describe('OCV5-750 hatch-with-box-fallback', () => {
     const sid = hub.hello('1', '0.5.3')
     const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
     const job = (await hub.poll(sid, 50))!
-    hub.heartbeat(job.id, job.nonce)
-    clock += 200_000
-    hub.tick()
-    const view = await hub.view('3', id, 100)
-    assert.equal(view?.status, 'failed')
-    assert.equal(view?.error?.code, 'MUSE_BRIDGE_LOST')
+    await hub.heartbeat(job.id, job.nonce)
+    // Heartbeat lost: Aurora requeues it for hatch (state back to queued). Later sweeps (offline,
+    // queue wait, retry budget) must still never hand an acked job to the relay (Gemini r3 NEW-1).
+    for (let i = 0; i < 8; i++) {
+      clock += 200_000
+      hub.tick()
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    const view = await hub.view('3', id, 50)
+    assert.notEqual(view?.status, 'succeeded')
     assert.equal(counter.calls.length, 0)
   })
 
-  it('a job that fell back to the relay never bounces back to hatch', async () => {
+  it('a relay failure fails the job and never bounces back to hatch', async () => {
     const hub = makeHub(tmpRoot(), {
       videoBackend: 'hatch-with-box-fallback',
-      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner: async () => async () => {
         throw new Error('relay is down')
@@ -395,7 +434,7 @@ describe('OCV5-750 hatch-with-box-fallback', () => {
     assert.equal(view?.status, 'failed')
   })
 
-  it('plain hatch mode still fails queued jobs when the bridge goes offline', async () => {
+  it('plain hatch mode never moves a queued job to the relay when the bridge goes offline', async () => {
     let clock = 1_000_000
     const counter = { submits: 0, calls: [] as string[] }
     const hub = makeHub(tmpRoot(), {
@@ -408,13 +447,69 @@ describe('OCV5-750 hatch-with-box-fallback', () => {
     clock += BRIDGE_ONLINE_MS + 1_000
     hub.tick()
     const view = await hub.view('3', id, 100)
-    assert.equal(view?.error?.code, 'MUSE_BRIDGE_OFFLINE')
+    assert.notEqual(view?.status, 'succeeded')
     assert.equal(counter.calls.length, 0)
   })
 })
 
 void BOX_EXEC_CHUNK_BYTES
 
+describe('OCV5-750 transient Box Exec read failure (personal e2e 2026-11-11)', () => {
+  it('a transient 417 on status and fetch-chunk still delivers the MP4 without a second submit', async () => {
+    const payload = Buffer.alloc(300_000, 5)
+    payload.write('ftyp', 4)
+    const digest = createHash('sha256').update(payload).digest('hex')
+    let submits = 0
+    const failOnce = new Set(['status', 'fetch-chunk'])
+    const slept: number[] = []
+    const hub = makeHub(tmpRoot(), {
+      videoBackend: 'box-exec',
+      fallbackHatch: true,
+      boxExecPollMs: 1,
+      boxExecRetrySleep: async (ms) => {
+        slept.push(ms)
+      },
+      boxExecRunner: async () => async (request: BoxCcExecRequest) => {
+        const verb = request.args[2]!
+        if (failOnce.delete(verb)) throw new Error('BOX_EXEC_HTTP_417')
+        if (verb === 'submit') {
+          submits += 1
+          return { stdout: JSON.stringify({ ok: true, id: 'relay-417', status: 'queued' }) }
+        }
+        if (verb === 'status') {
+          return {
+            stdout: JSON.stringify({
+              ok: true,
+              id: 'relay-417',
+              status: 'done',
+              files: [{ index: 0 }],
+            }),
+          }
+        }
+        if (verb === 'fetch-chunk') {
+          const offset = Number(request.args[5])
+          const slice = payload.subarray(offset, offset + Number(request.args[6]))
+          return {
+            stdout: JSON.stringify({
+              ok: true,
+              offset,
+              total: payload.length,
+              sha256: digest,
+              data: slice.toString('base64'),
+            }),
+          }
+        }
+        throw new Error(`unexpected ${verb}`)
+      },
+    })
+    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
+    const view = await hub.view('3', id, 2_000)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(view?.files?.[0]?.sha256, digest)
+    assert.equal(submits, 1)
+    assert.deepEqual(slept, [1_000, 1_000])
+  })
+})
 describe('OCV5-750 Gemini r1: box → hatch fallback only before the relay could hold the job', () => {
   it('a relay-down answer to submit falls back; a status failure after submit does not', async () => {
     const down = makeHub(tmpRoot(), {
@@ -481,6 +576,7 @@ describe('OCV5-750 Gemini r1: box → hatch fallback only before the relay could
     const hub = makeHub(tmpRoot(), {
       now: () => clock,
       videoBackend: 'box-exec',
+      fallbackHatch: true,
       boxExecPollMs: 1,
       boxExecRunner:
         async () => async (_request: BoxCcExecRequest, opts: { signal?: AbortSignal }) =>
@@ -499,63 +595,5 @@ describe('OCV5-750 Gemini r1: box → hatch fallback only before the relay could
     const view = await hub.view('3', id, 100)
     assert.equal(view?.error?.code, 'MUSE_TIMEOUT')
     assert.equal(aborted, true)
-  })
-})
-
-describe('OCV5-750 transient Box Exec read failure (personal e2e 2026-11-11)', () => {
-  it('a transient 417 on status and fetch-chunk still delivers the MP4 without a second submit', async () => {
-    const payload = Buffer.alloc(300_000, 5)
-    payload.write('ftyp', 4)
-    const digest = createHash('sha256').update(payload).digest('hex')
-    let submits = 0
-    const failOnce = new Set(['status', 'fetch-chunk'])
-    const slept: number[] = []
-    const hub = makeHub(tmpRoot(), {
-      videoBackend: 'box-exec',
-      fallbackHatch: true,
-      boxExecPollMs: 1,
-      boxExecRetrySleep: async (ms) => {
-        slept.push(ms)
-      },
-      boxExecRunner: async () => async (request: BoxCcExecRequest) => {
-        const verb = request.args[2]!
-        if (failOnce.delete(verb)) throw new Error('BOX_EXEC_HTTP_417')
-        if (verb === 'submit') {
-          submits += 1
-          return { stdout: JSON.stringify({ ok: true, id: 'relay-417', status: 'queued' }) }
-        }
-        if (verb === 'status') {
-          return {
-            stdout: JSON.stringify({
-              ok: true,
-              id: 'relay-417',
-              status: 'done',
-              files: [{ index: 0 }],
-            }),
-          }
-        }
-        if (verb === 'fetch-chunk') {
-          const offset = Number(request.args[5])
-          const slice = payload.subarray(offset, offset + Number(request.args[6]))
-          return {
-            stdout: JSON.stringify({
-              ok: true,
-              offset,
-              total: payload.length,
-              sha256: digest,
-              data: slice.toString('base64'),
-            }),
-          }
-        }
-        throw new Error(`unexpected ${verb}`)
-      },
-    })
-    hub.hello('1', '0.5.0')
-    const id = await hub.submit('3', null, { kind: 'video', prompt: 'a red bicycle' })
-    const view = await hub.view('3', id, 2_000)
-    assert.equal(view?.status, 'succeeded')
-    assert.equal(view?.files?.[0]?.sha256, digest)
-    assert.equal(submits, 1)
-    assert.deepEqual(slept, [1_000, 1_000])
   })
 })

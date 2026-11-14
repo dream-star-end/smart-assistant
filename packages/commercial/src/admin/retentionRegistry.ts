@@ -64,6 +64,9 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
   // pruneProjectedLiveFrames is the dedicated DELETE path (not age-based TTL).
   client_session_live_frames: "pruneProjectedLiveFrames (db/liveTurnFrames.ts)",
   client_session_live_unit_checkpoints: "deleteLiveUnitCheckpoints via pruneProjectedLiveFrames (db/liveUnitCheckpoints.ts)",
+  // OCV5-591: a write deletes its own hold on settle; holds left by a crashed writer expire and are
+  // removed by the studio GC tick.
+  studio_quota_holds: "StudioBlobStore.gc (media-studio/blobs.ts)",
 };
 
 /**
@@ -110,6 +113,10 @@ export const DURABLE_TABLES: readonly string[] = [
   "compute_hosts",
   "compute_pool_state",
   "connections",
+  // 内容审查打击、申诉和账号封禁是执法状态，不按年龄静默删除。
+  "content_review_account_bans",
+  "content_review_appeals",
+  "content_review_strikes",
   "connector_platform_oauth_apps",
   "connector_token_cache",
   "credit_ledger",
@@ -184,6 +191,25 @@ export const DURABLE_TABLES: readonly string[] = [
   "sessions_store_migration_state",
   "skill_embedding_cache",
   "skill_search_log",
+  // OCV5-591 media studio: user-owned projects and their content; removed with the user (FK cascade),
+  // by project hard-delete, or by the studio GC (unadopted takes after 30 days). studio_charges is the
+  // studio's own charge index; credit_ledger stays the billing authority.
+  "studio_annotations",
+  "studio_assets",
+  "studio_blob_refs",
+  "studio_blobs",
+  "studio_charges",
+  "studio_lines",
+  // OCV5-591 M1 (0329): the curated music catalog is site data kept as licence evidence (rows are
+  // retired, not deleted); studio_user_tracks is user-owned music removed with the user (FK cascade).
+  "studio_music_catalog",
+  "studio_projects",
+  "studio_quota",
+  "studio_shots",
+  "studio_step_results",
+  "studio_takes",
+  "studio_tasks",
+  "studio_user_tracks",
   "subscription_plans",
   "system_settings",
   "topup_plans",
@@ -230,11 +256,11 @@ export const DURABLE_TABLES: readonly string[] = [
   "chat_projects",
   "client_session_live_streams",
   "community_tutorials",
-  // 0321 经验分享 AI 审核:作业(每篇一行)与判定记录,FK community_tutorials ON DELETE CASCADE,
+  // 0327 经验分享 AI 审核:作业(每篇一行)与判定记录,FK community_tutorials ON DELETE CASCADE,
   // 随稿件离场;稿件本身无基于时间的清理。
   "community_tutorial_moderation_jobs",
   "community_tutorial_moderations",
-  // 0326 经验分享修改记录与修改稿图片：FK community_tutorials / 修改稿 ON DELETE CASCADE，随稿件离场。
+  // 0328 经验分享修改记录与修改稿图片：FK community_tutorials / 修改稿 ON DELETE CASCADE，随稿件离场。
   "community_tutorial_revisions",
   "community_tutorial_revision_images",
   "cursor_external_usage_audit",
@@ -254,7 +280,7 @@ export const DURABLE_TABLES: readonly string[] = [
   "turn_tape_materialization_jobs",
   "turn_tape_settlement_jobs",
   "tutorial_blob_refs",
-  // 0320 经验分享图片上传者(FK tutorial_blobs/users ON DELETE CASCADE),随 blob 离场。
+  // 0326 经验分享图片上传者(FK tutorial_blobs/users ON DELETE CASCADE),随 blob 离场。
   "tutorial_blob_uploads",
   "tutorial_blobs",
   "tutorial_case_specs",
@@ -266,19 +292,12 @@ export const DURABLE_TABLES: readonly string[] = [
   // rows overwritten by heartbeat/attach). Live state, no time-based sweep.
   "chatgpt_proxy_credentials",
   "desktop_tunnel_owners",
-  // 0285 content review (strike count, appeal, account ban): live moderation
-  // state per user. A row changes by status UPDATE (revoked / decided) and is
-  // read for the user's current count; there is no time-based sweep.
-  "content_review_account_bans",
-  "content_review_appeals",
-  "content_review_strikes",
-  // OCV5-424 / OCV5-415 migrations 0306–0308 (retention settled in the 2026-10-16 commercial
-  // sync review, OCV5-445). Admin-managed pool members (pool_api_keys: env rows replaced by
-  // fingerprint, admin rows edited/disabled on the 服务池 page; gemini_oauth_accounts:
-  // Antigravity Google accounts), one affinity row per (service, user) overwritten on rebind
-  // (expires_at is a logical expiry, not a sweep), and the Antigravity billing evidence
-  // (per-call relay usage + per-turn admission record, read by settlement and kept like
-  // cursor_external_usage_audit). No time-based DELETE.
+  // 2026-10-16 selfhost sync (OCV5-424 / OCV5-415, migrations 0306–0308). Admin-managed pool
+  // members (pool_api_keys: env rows replaced by fingerprint, admin rows edited/disabled on the
+  // 服务池 page; gemini_oauth_accounts: Antigravity Google accounts), one affinity row per
+  // (service, user) overwritten on rebind (expires_at is a logical expiry, not a sweep), and the
+  // Antigravity billing evidence (per-call relay usage + per-turn admission record, read by
+  // settlement and kept like cursor_external_usage_audit). No time-based DELETE.
   "pool_api_keys",
   "gemini_oauth_accounts",
   "pool_user_affinity",

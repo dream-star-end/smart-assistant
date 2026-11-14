@@ -222,7 +222,8 @@ export type BoxCliEffort = typeof BOX_CLI_EFFORTS[number];
  * own native adaptive thinking at that level, so the client either sends
  * Opus 5.5's adaptive thinking with the effort, or (Box's capability-zero
  * CCB profile, OCV5-305) the effort alone. Any other shape fails closed. */
-export function mapBoxCliEffort(thinking: unknown, outputConfig: unknown): BoxCliEffort {
+export function mapBoxCliEffort(thinking: unknown, outputConfig: unknown,
+  maxTokens?: unknown): BoxCliEffort {
   if ((thinking !== undefined && (!record(thinking) || thinking.type !== "adaptive"
       || (thinking.display !== undefined && thinking.display !== "omitted")
       || Object.keys(thinking).some((key) => key !== "type" && key !== "display")))
@@ -233,5 +234,17 @@ export function mapBoxCliEffort(thinking: unknown, outputConfig: unknown): BoxCl
   if (!(BOX_CLI_EFFORTS as readonly string[]).includes(outputConfig.effort)) {
     throw new BoxToolCatalogError("BOX_EFFORT_UNMAPPED");
   }
-  return outputConfig.effort as BoxCliEffort;
+  return capBoxCliEffort(outputConfig.effort as BoxCliEffort, maxTokens);
+}
+
+/** A request whose output cap is this small is a bounded text job (Claude
+ * Code's own context compaction asks for 20000 with thinking disabled and still
+ * forwards the user's effort). The CLI draws its adaptive thinking from the same
+ * cap: at `max` effort it spends all of it before the first visible word, the
+ * CLI answers with its own synthetic "Output token limit hit" user turns, and
+ * the stream is rejected as BOX_CLI_COMPACT_PHASE. Such a job runs at `low`. */
+export const BOX_SMALL_OUTPUT_CAP_TOKENS = 20_000;
+export function capBoxCliEffort(effort: BoxCliEffort, maxTokens: unknown): BoxCliEffort {
+  return typeof maxTokens === "number" && Number.isSafeInteger(maxTokens)
+    && maxTokens > 0 && maxTokens <= BOX_SMALL_OUTPUT_CAP_TOKENS ? "low" : effort;
 }

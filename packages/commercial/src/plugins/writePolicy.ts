@@ -1,5 +1,6 @@
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
 import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
+import type { ManagedPluginWriteDailyCapPolicy } from './writeDailyCap.js'
 import { ZHIHU_PLUGIN_SLUG } from './zhihuContract.js'
 
 export interface ManagedPluginWritePolicy {
@@ -54,6 +55,15 @@ export function managedPluginWritePolicy(slug: string): ManagedPluginWritePolicy
   if (slug === KNOWLEDGE_PLANET_PLUGIN_SLUG) return KNOWLEDGE_PLANET_WRITE_POLICY
   if (slug === WEIBO_PLUGIN_SLUG) return WEIBO_WRITE_POLICY
   if (slug === ZHIHU_PLUGIN_SLUG) return ZHIHU_WRITE_POLICY
+  return null
+}
+
+/**
+ * Per-account daily write caps (OCV5-553). `null` = no cap; every existing Plugin stays uncapped
+ * so its behavior is unchanged. A Plugin that declares a cap is enforced by
+ * `consumeManagedPluginWriteDailyCap` before the write is dispatched.
+ */
+export function managedPluginWriteDailyCap(_slug: string): ManagedPluginWriteDailyCapPolicy | null {
   return null
 }
 

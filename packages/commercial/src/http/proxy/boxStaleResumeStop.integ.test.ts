@@ -15,6 +15,8 @@ test("stale resume leaves are listed with phase and age and take one stop intent
   const client = await pool.connect();
   try {
     // Temp table shadows the real one on this pinned connection only.
+    // OCV5-488 discovery reads the owning container in this same isolated fixture.
+    await client.query("CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY, state text NOT NULL)");
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL,
       container_id bigint, state text NOT NULL,

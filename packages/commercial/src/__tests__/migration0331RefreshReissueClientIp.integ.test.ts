@@ -1,3 +1,4 @@
+import { readMigrationSource } from "./helpers/migrationSource.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
@@ -28,7 +29,7 @@ test("0331 keeps old refresh_tokens rows and writers valid, adds client_ip and '
     await client.query(oldInsert, ["live-before", null, null]);
     for (const reason of OLD_REASONS) await client.query(oldInsert, [`before-${reason}`, new Date(), reason]);
 
-    const sql = await readFile(new URL("../db/migrations/0331_refresh_reissue_client_ip.sql", import.meta.url), "utf8");
+    const sql = readMigrationSource("0331_refresh_reissue_client_ip");
     await client.query(sql);
     // Re-applying is a no-op (IF NOT EXISTS / IF EXISTS), as migrate.ts may meet a half-known schema.
     await client.query(sql);

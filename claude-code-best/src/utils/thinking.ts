@@ -16,6 +16,7 @@ import {
   isCapabilityZeroStaticModel,
   isMoonshotKimiK3Model,
   isOpencodeGoModel,
+  isScnetGlmModel,
   isOpencodeGoNoThinkingModel,
   isZaiGlm53Model,
 } from './model/staticKeyModels.js'
@@ -113,6 +114,10 @@ export function modelSupportsThinking(model: string): boolean {
   }
   // Z.AI Coding Plan glm-5.3 alias 支持 enabled+budget；与 Ark 同品牌但独立 provider。
   if (isZaiGlm53Model(model)) {
+    return true
+  }
+  // 超算互联网 Token Plan glm-5.3 / glm-5.3-flash：探活 thinking.enabled 200，disabled 400。
+  if (isScnetGlmModel(model)) {
     return true
   }
   // MiniMax-M3 是思考模型 —— 它在 isCapabilityZeroStaticModel 集合里(betas/effort/adaptive-thinking

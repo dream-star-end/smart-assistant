@@ -1,0 +1,2227 @@
+{
+  "source_captured_at": "2026-10-02T15:56:34.210545+08:00",
+  "commercial_captured_at": "2026-10-02T07:56:35.066257+00:00",
+  "new_models": [
+    {
+      "model_id": "box-claude-haiku-4-5",
+      "display_name": "Claude Haiku 4.5",
+      "input_per_mtok": 200,
+      "output_per_mtok": 1000,
+      "cache_read_per_mtok": 20,
+      "cache_write_per_mtok": 250,
+      "multiplier": 1.0,
+      "default_effort": null,
+      "sort_order": 17,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "claude-haiku-4-5",
+      "context_window": 200000,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "box-claude-haiku-4-5"
+    },
+    {
+      "model_id": "box-claude-opus-5-5",
+      "display_name": "Claude Opus 5.5",
+      "input_per_mtok": 1400,
+      "output_per_mtok": 5000,
+      "cache_read_per_mtok": 36,
+      "cache_write_per_mtok": 1750,
+      "multiplier": 1.0,
+      "default_effort": null,
+      "sort_order": 15,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "claude-opus-5-5",
+      "context_window": 1000000,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "box-claude-opus-5-5"
+    },
+    {
+      "model_id": "box-claude-sonnet-5",
+      "display_name": "Claude Sonnet 5",
+      "input_per_mtok": 600,
+      "output_per_mtok": 3000,
+      "cache_read_per_mtok": 60,
+      "cache_write_per_mtok": 750,
+      "multiplier": 1.0,
+      "default_effort": null,
+      "sort_order": 16,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "claude-sonnet-5",
+      "context_window": 1000000,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "box-claude-sonnet-5"
+    },
+    {
+      "model_id": "claude-opus-5-5",
+      "display_name": "Claude Opus 5.5",
+      "input_per_mtok": 250,
+      "output_per_mtok": 1250,
+      "cache_read_per_mtok": 25,
+      "cache_write_per_mtok": 312,
+      "multiplier": 2.5,
+      "default_effort": null,
+      "sort_order": 139,
+      "engine": "ccb",
+      "provider_id": "anthropic",
+      "upstream_model_id": null,
+      "context_window": 1000000,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "claude-opus-5",
+      "group_provider": "claude",
+      "group_key": "claude-opus-5-5"
+    },
+    {
+      "model_id": "cursor-grok-4.7-high",
+      "display_name": "Grok 4.7 High",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 1.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-high",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-high"
+    },
+    {
+      "model_id": "cursor-grok-4.7-high-fast",
+      "display_name": "Grok 4.7 High Fast",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 2.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-high-fast",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-high-fast"
+    },
+    {
+      "model_id": "cursor-grok-4.7-low",
+      "display_name": "Grok 4.7 Low",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 1.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-low",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-low"
+    },
+    {
+      "model_id": "cursor-grok-4.7-low-fast",
+      "display_name": "Grok 4.7 Low Fast",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 2.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-low-fast",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-low-fast"
+    },
+    {
+      "model_id": "cursor-grok-4.7-medium",
+      "display_name": "Grok 4.7 Medium",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 1.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-medium",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-medium"
+    },
+    {
+      "model_id": "cursor-grok-4.7-medium-fast",
+      "display_name": "Grok 4.7 Medium Fast",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 2.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-medium-fast",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-medium-fast"
+    },
+    {
+      "model_id": "cursor-grok-4.7-xhigh",
+      "display_name": "Grok 4.7 Extra High",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 1.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-xhigh",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-xhigh"
+    },
+    {
+      "model_id": "cursor-grok-4.7-xhigh-fast",
+      "display_name": "Grok 4.7 Extra High Fast",
+      "input_per_mtok": 190,
+      "output_per_mtok": 950,
+      "cache_read_per_mtok": 48,
+      "cache_write_per_mtok": 238,
+      "multiplier": 2.0,
+      "default_effort": null,
+      "sort_order": 143,
+      "engine": "cursor",
+      "provider_id": "cursor",
+      "upstream_model_id": "grok-4.7-xhigh-fast",
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": true
+        },
+        "reasoning": {
+          "supported": [],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "cursor-grok-4.6-high",
+      "group_provider": "cursor",
+      "group_key": "cursor-grok-4.7-xhigh-fast"
+    },
+    {
+      "model_id": "gpt-6-luna",
+      "display_name": "GPT-6-Luna",
+      "input_per_mtok": 5,
+      "output_per_mtok": 25,
+      "cache_read_per_mtok": 1,
+      "cache_write_per_mtok": 6,
+      "multiplier": 0.4,
+      "default_effort": "medium",
+      "sort_order": 111,
+      "engine": "codex",
+      "provider_id": "codex",
+      "upstream_model_id": null,
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": false
+        },
+        "reasoning": {
+          "supported": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "codex_model_default": "medium"
+        },
+        "supports_vision": true
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "gpt-5.6-luna",
+      "group_provider": "codex",
+      "group_key": "gpt-6-luna"
+    },
+    {
+      "model_id": "gpt-6-luna-1m",
+      "display_name": "GPT-6-Luna",
+      "input_per_mtok": 8,
+      "output_per_mtok": 38,
+      "cache_read_per_mtok": 2,
+      "cache_write_per_mtok": 9,
+      "multiplier": 0.4,
+      "default_effort": "medium",
+      "sort_order": 111,
+      "engine": "codex",
+      "provider_id": "codex",
+      "upstream_model_id": "gpt-6-luna",
+      "context_window": 1000000,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": false
+        },
+        "reasoning": {
+          "supported": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "codex_model_default": "medium"
+        },
+        "supports_vision": true
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "gpt-5.6-luna",
+      "group_provider": "codex",
+      "group_key": "gpt-6-luna"
+    },
+    {
+      "model_id": "gpt-6.1-sol",
+      "display_name": "GPT-6.1-Sol",
+      "input_per_mtok": 100,
+      "output_per_mtok": 500,
+      "cache_read_per_mtok": 5,
+      "cache_write_per_mtok": 125,
+      "multiplier": 1.0,
+      "default_effort": "medium",
+      "sort_order": 109,
+      "engine": "codex",
+      "provider_id": "codex",
+      "upstream_model_id": null,
+      "context_window": null,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": false
+        },
+        "reasoning": {
+          "supported": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "codex_model_default": "medium"
+        },
+        "supports_vision": true
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "gpt-5.6-sol",
+      "group_provider": "codex",
+      "group_key": "gpt-6.1-sol"
+    },
+    {
+      "model_id": "gpt-6.1-sol-1m",
+      "display_name": "GPT-6.1-Sol",
+      "input_per_mtok": 150,
+      "output_per_mtok": 750,
+      "cache_read_per_mtok": 8,
+      "cache_write_per_mtok": 188,
+      "multiplier": 1.0,
+      "default_effort": "medium",
+      "sort_order": 109,
+      "engine": "codex",
+      "provider_id": "codex",
+      "upstream_model_id": "gpt-6.1-sol",
+      "context_window": 1000000,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": false
+        },
+        "reasoning": {
+          "supported": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "codex_model_default": "medium"
+        },
+        "supports_vision": true
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "gpt-5.6-sol",
+      "group_provider": "codex",
+      "group_key": "gpt-6.1-sol"
+    },
+    {
+      "model_id": "grok-build-fast",
+      "display_name": "Grok 4.7 Fast",
+      "input_per_mtok": 250,
+      "output_per_mtok": 1500,
+      "cache_read_per_mtok": 25,
+      "cache_write_per_mtok": 0,
+      "multiplier": 4.0,
+      "default_effort": "high",
+      "sort_order": 141,
+      "engine": "grok",
+      "provider_id": "grok",
+      "upstream_model_id": "grok-4.7-build-fast",
+      "context_window": 500000,
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": false
+        },
+        "reasoning": {
+          "supported": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1,
+      "min_plan_code": null,
+      "group_donor": "grok-build",
+      "group_provider": "grok",
+      "group_key": "grok-build-fast"
+    }
+  ],
+  "existing_active_enabled": [
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 1,
+        "model_id": "MiniMax-M3",
+        "created_at": "2026-07-13T12:07:13.328312+00:00",
+        "updated_at": "2026-07-13T12:07:13.328312+00:00",
+        "updated_by": null,
+        "provider_id": "minimax",
+        "lock_version": 0,
+        "context_window": 512000,
+        "upstream_model_id": null,
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": true
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "MiniMax-M3",
+        "multiplier": 1.0,
+        "sort_order": 130,
+        "updated_at": "2026-08-21T12:35:53.992032+00:00",
+        "updated_by": 1,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "MiniMax M3 (512k)",
+        "lock_version": 2,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 105,
+        "output_per_mtok": 420,
+        "cache_read_per_mtok": 21,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 137,
+        "model_id": "cursor-gemini-3.8-flash-high",
+        "created_at": "2026-09-05T03:12:23.131548+00:00",
+        "updated_at": "2026-09-05T03:12:23.131548+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gemini-3.8-flash-high",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gemini-3.8-flash-high",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.237063+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "Gemini 3.8 Flash High",
+        "lock_version": 3,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 120,
+        "output_per_mtok": 150,
+        "cache_read_per_mtok": 5,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 150
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 135,
+        "model_id": "cursor-gemini-3.8-flash-low",
+        "created_at": "2026-09-05T03:12:23.131548+00:00",
+        "updated_at": "2026-09-05T03:12:23.131548+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gemini-3.8-flash-low",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gemini-3.8-flash-low",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.236948+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "Gemini 3.8 Flash Low",
+        "lock_version": 3,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 120,
+        "output_per_mtok": 150,
+        "cache_read_per_mtok": 5,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 150
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 136,
+        "model_id": "cursor-gemini-3.8-flash-medium",
+        "created_at": "2026-09-05T03:12:23.131548+00:00",
+        "updated_at": "2026-09-05T03:12:23.131548+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gemini-3.8-flash-medium",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gemini-3.8-flash-medium",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.237024+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "Gemini 3.8 Flash Medium",
+        "lock_version": 3,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 120,
+        "output_per_mtok": 150,
+        "cache_read_per_mtok": 5,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 150
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 166,
+        "model_id": "cursor-gpt-5.6-luna-high",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-high",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-high",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna High",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 167,
+        "model_id": "cursor-gpt-5.6-luna-high-fast",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-high-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-high-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna High Fast",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 162,
+        "model_id": "cursor-gpt-5.6-luna-low",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-low",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-low",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Low",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 163,
+        "model_id": "cursor-gpt-5.6-luna-low-fast",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-low-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-low-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Low Fast",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 170,
+        "model_id": "cursor-gpt-5.6-luna-max",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-max",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-max",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Max",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 171,
+        "model_id": "cursor-gpt-5.6-luna-max-fast",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-max-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-max-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Max Fast",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 164,
+        "model_id": "cursor-gpt-5.6-luna-medium",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-medium",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-medium",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Medium",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 165,
+        "model_id": "cursor-gpt-5.6-luna-medium-fast",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-medium-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-medium-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Medium Fast",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 168,
+        "model_id": "cursor-gpt-5.6-luna-xhigh",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-xhigh",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-xhigh",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Extra High",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 169,
+        "model_id": "cursor-gpt-5.6-luna-xhigh-fast",
+        "created_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "gpt-5.6-luna-xhigh-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-gpt-5.6-luna-xhigh-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-21T01:32:09.356491+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6 Luna Extra High Fast",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 74,
+        "output_per_mtok": 444,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 52,
+        "model_id": "cursor-grok-4.6-high",
+        "created_at": "2026-08-14T01:17:10.263989+00:00",
+        "updated_at": "2026-08-15T10:01:51.143117+00:00",
+        "updated_by": 1,
+        "provider_id": "cursor",
+        "lock_version": 3,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-high",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-high",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.236785+00:00",
+        "updated_by": 1,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 High",
+        "lock_version": 8,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 65,
+        "model_id": "cursor-grok-4.6-high-fast",
+        "created_at": "2026-08-21T12:31:21.801668+00:00",
+        "updated_at": "2026-08-21T12:31:21.801668+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-high-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-high-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.236827+00:00",
+        "updated_by": null,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 High Fast",
+        "lock_version": 6,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 66,
+        "model_id": "cursor-grok-4.6-low",
+        "created_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-low",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-low",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.23659+00:00",
+        "updated_by": null,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 Low",
+        "lock_version": 6,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 67,
+        "model_id": "cursor-grok-4.6-low-fast",
+        "created_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-low-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-low-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.236655+00:00",
+        "updated_by": null,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 Low Fast",
+        "lock_version": 6,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 68,
+        "model_id": "cursor-grok-4.6-medium",
+        "created_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-medium",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-medium",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.2367+00:00",
+        "updated_by": null,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 Medium",
+        "lock_version": 6,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 69,
+        "model_id": "cursor-grok-4.6-medium-fast",
+        "created_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-medium-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-medium-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.236743+00:00",
+        "updated_by": null,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 Medium Fast",
+        "lock_version": 6,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 70,
+        "model_id": "cursor-grok-4.6-xhigh",
+        "created_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-xhigh",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-xhigh",
+        "multiplier": 1.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.236867+00:00",
+        "updated_by": null,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 Extra High",
+        "lock_version": 6,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "cursor",
+        "entry_id": 71,
+        "model_id": "cursor-grok-4.6-xhigh-fast",
+        "created_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_at": "2026-08-21T12:35:52.69615+00:00",
+        "updated_by": null,
+        "provider_id": "cursor",
+        "lock_version": 1,
+        "context_window": null,
+        "upstream_model_id": "cursor-grok-4.6-xhigh-fast",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "cursor-grok-4.6-xhigh-fast",
+        "multiplier": 2.0,
+        "sort_order": 10002,
+        "updated_at": "2026-09-06T06:27:07.236907+00:00",
+        "updated_by": null,
+        "visibility": "admin",
+        "promo_label": null,
+        "display_name": "Grok 4.6 Extra High Fast",
+        "lock_version": 6,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 190,
+        "output_per_mtok": 950,
+        "cache_read_per_mtok": 48,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 238
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 147,
+        "model_id": "deepseek-v4-flash",
+        "created_at": "2026-09-14T17:03:59.892271+00:00",
+        "updated_at": "2026-09-14T17:03:59.892271+00:00",
+        "updated_by": 1,
+        "provider_id": "opencodego",
+        "lock_version": 1,
+        "context_window": 1000000,
+        "upstream_model_id": "deepseek-v4.1-flash",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "deepseek-v4-flash",
+        "multiplier": 1.0,
+        "sort_order": 120,
+        "updated_at": "2026-09-14T17:04:00.037313+00:00",
+        "updated_by": 1,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "DeepSeek V4.1 Flash (1M)",
+        "lock_version": 3,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 112,
+        "output_per_mtok": 337,
+        "cache_read_per_mtok": 3,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 46,
+        "model_id": "deepseek-v4-pro",
+        "created_at": "2026-08-01T04:32:25.760185+00:00",
+        "updated_at": "2026-08-01T04:32:25.760185+00:00",
+        "updated_by": null,
+        "provider_id": "deepseek",
+        "lock_version": 1,
+        "context_window": 1000000,
+        "upstream_model_id": null,
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "deepseek-v4-pro",
+        "multiplier": 1.0,
+        "sort_order": 80,
+        "updated_at": "2026-08-21T12:35:53.991378+00:00",
+        "updated_by": 1,
+        "visibility": "hidden",
+        "promo_label": null,
+        "display_name": "DeepSeek V4 Pro (1M)",
+        "lock_version": 5,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 225,
+        "output_per_mtok": 675,
+        "cache_read_per_mtok": 7,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 151,
+        "model_id": "glm-5.3",
+        "created_at": "2026-09-17T11:34:17.587777+00:00",
+        "updated_at": "2026-09-17T11:34:17.587777+00:00",
+        "updated_by": null,
+        "provider_id": "scnet",
+        "lock_version": 1,
+        "context_window": 1000000,
+        "upstream_model_id": "GLM-5.3",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "glm-5.3",
+        "multiplier": 1.0,
+        "sort_order": 83,
+        "updated_at": "2026-08-21T12:35:53.988447+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GLM-5.3",
+        "lock_version": 2,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 226,
+        "output_per_mtok": 712,
+        "cache_read_per_mtok": 42,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 149,
+        "model_id": "glm-5.3-flash",
+        "created_at": "2026-09-17T09:23:02.729573+00:00",
+        "updated_at": "2026-09-17T11:34:17.587777+00:00",
+        "updated_by": null,
+        "provider_id": "scnet",
+        "lock_version": 3,
+        "context_window": 1000000,
+        "upstream_model_id": "GLM-5.3-Flash",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "glm-5.3-flash",
+        "multiplier": 1.0,
+        "sort_order": 84,
+        "updated_at": "2026-09-17T11:34:17.587777+00:00",
+        "updated_by": null,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GLM-5.3-Flash",
+        "lock_version": 2,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 24,
+        "output_per_mtok": 81,
+        "cache_read_per_mtok": 5,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 64,
+        "model_id": "glm-5.3-zai",
+        "created_at": "2026-08-15T11:09:18.434888+00:00",
+        "updated_at": "2026-08-17T11:31:55.295456+00:00",
+        "updated_by": 1,
+        "provider_id": "zai",
+        "lock_version": 7,
+        "context_window": 1000000,
+        "upstream_model_id": "glm-5.3",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [
+              "high",
+              "max"
+            ],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "glm-5.3-zai",
+        "multiplier": 1.0,
+        "sort_order": 84,
+        "updated_at": "2026-09-17T11:34:17.587777+00:00",
+        "updated_by": 1,
+        "visibility": "hidden",
+        "promo_label": null,
+        "display_name": "GLM-5.3 (Z.AI)",
+        "lock_version": 7,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 226,
+        "output_per_mtok": 712,
+        "cache_read_per_mtok": 42,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "codex",
+        "entry_id": 27,
+        "model_id": "gpt-5.6-sol",
+        "created_at": "2026-07-16T11:33:39.862577+00:00",
+        "updated_at": "2026-09-21T01:29:55.135827+00:00",
+        "updated_by": 1,
+        "provider_id": "codex",
+        "lock_version": 3,
+        "context_window": null,
+        "upstream_model_id": null,
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": false
+          },
+          "reasoning": {
+            "supported": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "codex_model_default": "xhigh"
+          },
+          "supports_vision": true
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "gpt-5.6-sol",
+        "multiplier": 1.0,
+        "sort_order": 110,
+        "updated_at": "2026-08-21T12:36:02.041623+00:00",
+        "updated_by": 1,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-5.6-Sol",
+        "lock_version": 7,
+        "min_plan_code": null,
+        "default_effort": "xhigh",
+        "input_per_mtok": 299,
+        "output_per_mtok": 1799,
+        "cache_read_per_mtok": 30,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "codex",
+        "entry_id": 138,
+        "model_id": "gpt-6-astra",
+        "created_at": "2026-09-05T03:15:25.833304+00:00",
+        "updated_at": "2026-09-19T01:49:31.605688+00:00",
+        "updated_by": 1,
+        "provider_id": "codex",
+        "lock_version": 5,
+        "context_window": null,
+        "upstream_model_id": null,
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": false
+          },
+          "reasoning": {
+            "supported": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "codex_model_default": "xhigh"
+          },
+          "supports_vision": true
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "gpt-6-astra",
+        "multiplier": 1.0,
+        "sort_order": 109,
+        "updated_at": "2026-09-17T06:26:42.800362+00:00",
+        "updated_by": 1,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "GPT-6-Astra",
+        "lock_version": 2,
+        "min_plan_code": null,
+        "default_effort": "xhigh",
+        "input_per_mtok": 598,
+        "output_per_mtok": 3598,
+        "cache_read_per_mtok": 60,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "grok",
+        "entry_id": 49,
+        "model_id": "grok-build",
+        "created_at": "2026-08-13T07:18:35.524105+00:00",
+        "updated_at": "2026-08-13T08:40:34.643147+00:00",
+        "updated_by": 1,
+        "provider_id": "grok",
+        "lock_version": 3,
+        "context_window": 500000,
+        "upstream_model_id": "grok-4.6",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": false,
+            "supports_thinking": false
+          },
+          "reasoning": {
+            "supported": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "grok-build",
+        "multiplier": 1.0,
+        "sort_order": 10000,
+        "updated_at": "2026-08-25T13:11:39.077944+00:00",
+        "updated_by": 1,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "Grok 4.6",
+        "lock_version": 8,
+        "min_plan_code": null,
+        "default_effort": "high",
+        "input_per_mtok": 250,
+        "output_per_mtok": 1500,
+        "cache_read_per_mtok": 25,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 63,
+        "model_id": "k3-256k",
+        "created_at": "2026-08-15T08:11:59.153399+00:00",
+        "updated_at": "2026-08-17T06:28:24.609898+00:00",
+        "updated_by": 1,
+        "provider_id": "moonshot",
+        "lock_version": 3,
+        "context_window": 262144,
+        "upstream_model_id": null,
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [
+              "low",
+              "high",
+              "max"
+            ],
+            "codex_model_default": null
+          },
+          "supports_vision": true
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "k3-256k",
+        "multiplier": 1.0,
+        "sort_order": 90,
+        "updated_at": "2026-08-21T12:35:53.989881+00:00",
+        "updated_by": 1,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "Kimi K3 256K",
+        "lock_version": 3,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 609,
+        "output_per_mtok": 3046,
+        "cache_read_per_mtok": 61,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 7,
+        "model_id": "kimi-k2.7-code",
+        "created_at": "2026-07-13T12:07:13.328312+00:00",
+        "updated_at": "2026-07-13T12:07:13.328312+00:00",
+        "updated_by": null,
+        "provider_id": "kimi",
+        "lock_version": 0,
+        "context_window": 256000,
+        "upstream_model_id": null,
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "kimi-k2.7-code",
+        "multiplier": 1.0,
+        "sort_order": 88,
+        "updated_at": "2026-08-21T12:35:53.993524+00:00",
+        "updated_by": 1,
+        "visibility": "hidden",
+        "promo_label": null,
+        "display_name": "Kimi K2.7 Code (256k)",
+        "lock_version": 3,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 322,
+        "output_per_mtok": 1358,
+        "cache_read_per_mtok": 64,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 62,
+        "model_id": "kimi-k3",
+        "created_at": "2026-08-15T08:11:59.153399+00:00",
+        "updated_at": "2026-08-17T06:27:27.007178+00:00",
+        "updated_by": 1,
+        "provider_id": "moonshot",
+        "lock_version": 3,
+        "context_window": 1048576,
+        "upstream_model_id": null,
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [
+              "low",
+              "high",
+              "max"
+            ],
+            "codex_model_default": null
+          },
+          "supports_vision": true
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "kimi-k3",
+        "multiplier": 1.0,
+        "sort_order": 89,
+        "updated_at": "2026-08-21T12:35:54.697631+00:00",
+        "updated_by": 1,
+        "visibility": "public",
+        "promo_label": null,
+        "display_name": "Kimi K3",
+        "lock_version": 10,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 914,
+        "output_per_mtok": 4569,
+        "cache_read_per_mtok": 92,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    },
+    {
+      "catalog": {
+        "state": "active",
+        "engine": "ccb",
+        "entry_id": 17,
+        "model_id": "oc-catalog-canary-glm52",
+        "created_at": "2026-07-13T17:30:47.952149+00:00",
+        "updated_at": "2026-07-13T17:30:47.952149+00:00",
+        "updated_by": null,
+        "provider_id": "ark",
+        "lock_version": 1,
+        "context_window": 1000000,
+        "upstream_model_id": "glm-5.2",
+        "capability_profile": {
+          "ccb": {
+            "capability_zero": true,
+            "supports_thinking": true
+          },
+          "reasoning": {
+            "supported": [
+              "high",
+              "max"
+            ],
+            "codex_model_default": null
+          },
+          "supports_vision": false
+        },
+        "capability_schema_version": 1
+      },
+      "pricing": {
+        "enabled": true,
+        "model_id": "oc-catalog-canary-glm52",
+        "multiplier": 0.5,
+        "sort_order": 9999,
+        "updated_at": "2026-08-21T12:35:53.992868+00:00",
+        "updated_by": null,
+        "visibility": "hidden",
+        "promo_label": null,
+        "display_name": "Catalog Canary (restricted)",
+        "lock_version": 1,
+        "min_plan_code": null,
+        "default_effort": null,
+        "input_per_mtok": 300,
+        "output_per_mtok": 1200,
+        "cache_read_per_mtok": 60,
+        "extra_system_prompt": null,
+        "cache_write_per_mtok": 0
+      }
+    }
+  ],
+  "standard_grok_target": {
+    "catalog": {
+      "state": "active",
+      "engine": "grok",
+      "entry_id": 156,
+      "model_id": "grok-build",
+      "created_at": "2026-09-22T00:28:25.030189+08:00",
+      "updated_at": "2026-09-22T00:28:25.030189+08:00",
+      "updated_by": null,
+      "provider_id": "grok",
+      "lock_version": 1,
+      "context_window": 500000,
+      "upstream_model_id": "grok-4.7",
+      "capability_profile": {
+        "ccb": {
+          "capability_zero": false,
+          "supports_thinking": false
+        },
+        "reasoning": {
+          "supported": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "codex_model_default": null
+        },
+        "supports_vision": false
+      },
+      "capability_schema_version": 1
+    },
+    "pricing": {
+      "enabled": true,
+      "model_id": "grok-build",
+      "multiplier": 2.0,
+      "sort_order": 142,
+      "updated_at": "2026-08-20T12:43:22.99257+08:00",
+      "updated_by": 3,
+      "visibility": "public",
+      "promo_label": null,
+      "display_name": "Grok 4.7",
+      "lock_version": 7,
+      "min_plan_code": null,
+      "default_effort": "high",
+      "input_per_mtok": 250,
+      "output_per_mtok": 1500,
+      "cache_read_per_mtok": 25,
+      "extra_system_prompt": null,
+      "cache_write_per_mtok": 0
+    }
+  },
+  "excluded_from_activation": [
+    "gpt-6-astra-1m"
+  ],
+  "policy": {
+    "new_min_plan_code": null,
+    "existing_min_plan_code": "unchanged",
+    "activation": "separate CAS operator after compatible runtime release"
+  }
+}

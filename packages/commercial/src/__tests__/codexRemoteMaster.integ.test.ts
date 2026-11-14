@@ -1,7 +1,7 @@
 /** Dedicated TEST_DATABASE_URL only. Real PG migrations, locks, journals, usage/ledger and balances. */
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
-import { readFileSync,mkdtempSync,mkdirSync,writeFileSync,rmSync } from 'node:fs'
+import { existsSync,readFileSync,mkdtempSync,mkdirSync,writeFileSync,rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { reconcileRemoteLane } from '../account-pool/remoteLaneRecovery.js'
@@ -23,6 +23,13 @@ import { authoritySigningInput, encodeAuthorityEnvelope, encodeTurnLeaseEnvelope
   type ModelAuthorityPayload, type TurnLease } from '@openclaude/protocol'
 import { buildCodexReceipt, codexBackend, zeroNativeTokens, type CodexRemoteBinding } from '@openclaude/gateway/remote-finance'
 
+const selfhost = existsSync(new URL('../db/migrations/0341_selfhost_sync_compat.sql', import.meta.url))
+assert.notEqual(selfhost, existsSync(new URL('../db/migrations/0340_commercial_sync_compat.sql', import.meta.url)))
+const baseline = JSON.parse(readFileSync(new URL(`./fixtures/${selfhost ? 'selfhost' : 'commercial'}SyncBaseline.json`, import.meta.url), 'utf8'))
+const expectedSuffix = [
+  ...Object.keys(baseline.migrations).filter(v => v >= '0334'),
+  ...(selfhost ? ['0341_selfhost_sync_compat', '0342_antigravity_gemini_4_hydrogen', '0343_antigravity_orchestrator_carbon'] : ['0340_commercial_sync_compat']),
+].sort()
 const url = process.env.TEST_DATABASE_URL
 assert.ok(url && new URL(url).pathname.endsWith('_test'), 'explicit isolated TEST_DATABASE_URL required')
 const pool = new Pool({ connectionString: url, max: 8, connectionTimeoutMillis: 2000 })
@@ -40,8 +47,7 @@ before(async () => {
   setPoolOverride(pool)
   await resetAndMigrateBefore('0334')
   const applied = await runMigrations()
-  assert.deepEqual(applied.applied.slice(0, 4), ['0334_users_registration_ip','0335_codex_remote_native','0336_commercial_muse_durable','0337_remote_engine_concurrency'])
-  assert.ok(applied.applied.includes('0339_remote_driver_core_v4'))
+  assert.deepEqual(applied.applied, expectedSuffix)
   uid = (await pool.query(`INSERT INTO users(email,password_hash,credits) VALUES('codex746@example.test','test-only',100000) RETURNING id::text`)).rows[0].id
   await pool.query(`INSERT INTO agent_containers(id,user_id,secret_hash) VALUES(7,$1,$2)`,[uid,Buffer.alloc(32,1)])
   node = (await pool.query(`INSERT INTO remote_agent_nodes(label,ssh_host,ssh_user,host_key_fp,key_id,controller_sha256,status)
@@ -385,8 +391,7 @@ test('R1 missing Codex profiles withdraw exclusive models; surviving ready suppl
 
 test('complete migration chain preserves old users/Muse writes and records exact ordered versions', async () => {
   const applied=(await pool.query(`SELECT version FROM schema_migrations WHERE version > '0333_remote_agent_pool' ORDER BY version`)).rows.map(r=>r.version)
-  assert.deepEqual(applied.slice(0, 4),['0334_users_registration_ip','0335_codex_remote_native','0336_commercial_muse_durable','0337_remote_engine_concurrency'])
-  assert.ok(applied.includes('0339_remote_driver_core_v4'))
+  assert.deepEqual(applied, expectedSuffix)
   const user=(await pool.query(`INSERT INTO users(email,password_hash) VALUES('r1-old-writer@example.test','fixture') RETURNING id,registration_ip`)).rows[0]
   assert.equal(user.registration_ip,null)
   const id=`mj_${randomUUID()}`

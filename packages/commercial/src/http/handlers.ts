@@ -14,8 +14,6 @@ import type { LiteratureSetupService } from '../plugins/literatureDb/setupServic
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
-import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
-import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 import {
   HttpError,
   readJsonBody,
@@ -124,10 +122,14 @@ import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetu
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
 import type { ZhihuSetupManager } from '../plugins/zhihuSetup.js'
 import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
+import type { DouyinSetupManager } from '../plugins/douyinSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
+import type { StudioHttpDeps } from '../media-studio/http.js'
+import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
+import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 
 export interface CommercialHttpDeps {
   codexCommissioning?: import('../account-pool/codexCommissioning.js').CodexCommissioning
@@ -143,6 +145,8 @@ export interface CommercialHttpDeps {
   mediaGeneration?: MediaGenerationService;
   /** OCV5-561 Muse bridge endpoints; undefined (→ 404) unless OC_MUSE_BRIDGE_ENABLED=1. */
   museBridgeHttp?: MuseBridgeHttpHandler;
+  /** OCV5-591 media studio; undefined or disabled (→ 404) unless OC_STUDIO_ENABLED=1. */
+  studio?: StudioHttpDeps;
   /** Platform-authoritative session GoalState service. */
   goalStateService?: GoalStateService;
   /** Short-lived one-time browser tickets for V5 container-local preview. */
@@ -163,6 +167,8 @@ export interface CommercialHttpDeps {
   zhihuSetup?: ZhihuSetupManager
   /** Short-lived managed login coordinator for the official Bilibili account Plugin (OCV5-402). */
   biliAccountSetup?: BiliAccountSetupManager
+  /** Short-lived managed login coordinator for the official Douyin Plugin (OCV5-553). */
+  douyinSetup?: DouyinSetupManager
   /** Separate high-risk control/rules for official Knowledge Planet unattended replies. */
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
   mailer: Mailer
@@ -636,9 +642,9 @@ async function emitAuthFunnel(input: {
 /** Map register business errors onto the frozen funnel code set. */
 export function mapRegisterFunnelCode(
   code: string,
-): "CONFLICT" | "TURNSTILE" | "EMAIL_DOMAIN_BLOCKED" | null {
+): "CONFLICT" | "TURNSTILE" | "EMAIL_DOMAIN_BLOCKED" | "IP_REGISTRATION_LIMIT" | null {
   if (code === "TURNSTILE_FAILED") return "TURNSTILE";
-  if (code === "CONFLICT" || code === "EMAIL_DOMAIN_BLOCKED") return code;
+  if (code === "CONFLICT" || code === "EMAIL_DOMAIN_BLOCKED" || code === "IP_REGISTRATION_LIMIT") return code;
   return null;
 }
 
@@ -674,8 +680,8 @@ export async function handleRegister(
 
   const body = await readJsonBody(req);
   try {
-    // register 里 remoteIp 只给 Turnstile(CF bot scoring 需要真实访客 IP),不写
-    // refresh_tokens。用 ctx.clientIp(CF-Connecting-IP)。
+    // register 里 remoteIp 给 Turnstile(CF bot scoring 需要真实访客 IP)和同 IP 账号
+    // 上限,不写 refresh_tokens。用 ctx.clientIp(CF-Connecting-IP)。
     const result = await register(body, {
       mailer: deps.mailer,
       turnstileSecret: deps.turnstileSecret,
@@ -714,6 +720,7 @@ export async function handleRegister(
         TURNSTILE_FAILED: { status: 400 },
         CONFLICT: { status: 409 },
         EMAIL_DOMAIN_BLOCKED: { status: 400 },
+        IP_REGISTRATION_LIMIT: { status: 403 },
       };
       const m = map[err.code];
       throw new HttpError(m.status, err.code, err.message, { issues: err.issues });

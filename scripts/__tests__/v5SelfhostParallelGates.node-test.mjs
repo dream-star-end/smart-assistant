@@ -8,7 +8,23 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const lib = readFileSync(join(root, 'scripts/v5-selfhost-master-release-lib.sh'), 'utf8');
-const isSerialGate = (id) => id.startsWith('C.box-') || id === 'C.upload-retention' || id === 'C.ccb-mcp';
+const serialGateIds = ['box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask',
+  'master-incident-proofs', 'codex-chatgpt-ws', 'platform-tool-proofs', 'terminal-unproven',
+  'upload-retention', 'ccb-mcp', 'codex-late-stop'].map((id) => `C.${id}`);
+const isSerialGate = (id) => serialGateIds.includes(id);
+const assertSerialTail = (lines) => {
+  let previousEnd = lines.indexOf('runtime-awaited');
+  for (const id of serialGateIds) {
+    const start = lines.findIndex((line) => line.startsWith(`start ${id} `));
+    const end = lines.indexOf(`end ${id}`);
+    assert.ok(previousEnd >= 0 && previousEnd < start && start < end, id);
+    previousEnd = end;
+  }
+  assert.ok(lines.indexOf('end C.terminal-unproven') < lines.indexOf('db-drop'));
+  assert.ok(lines.indexOf('db-drop') < lines.findIndex((line) => line.startsWith('start C.upload-retention ')));
+  assert.ok(previousEnd < lines.indexOf('tmp-cleanup'));
+  assert.ok(lines.indexOf('tmp-cleanup') < lines.indexOf('seal built'));
+};
 const q = (s) => `'${s.replaceAll("'", "'\\''")}'`;
 const fn = (name) => {
   const m = lib.match(new RegExp(`^${name}\\(\\) \\{[^\\n]*\\n[\\s\\S]*?^\\}`, 'm'));
@@ -442,8 +458,13 @@ case "$*" in
   *check-v5-box-continuation.ts*) id=C.box-continuation ;;
   *check-v5-box-incident-proofs.ts*) id=C.box-incident-proofs ;;
   *check-v5-box-longtask.ts*) id=C.box-longtask ;;
+  *check-v5-master-incident-proofs.ts*) id=C.master-incident-proofs ;;
+  *check-v5-codex-chatgpt-ws.ts*) id=C.codex-chatgpt-ws ;;
+  *check-v5-ocv5-376-platform-tool-proofs.ts*) id=C.platform-tool-proofs ;;
+  *check-v5-box-terminal-unproven-probe.ts*) id=C.terminal-unproven ;;
   *check-v5-upload-retention-proof.ts*) id=C.upload-retention ;;
   *check-v5-ccb-mcp-availability.ts*) id=C.ccb-mcp ;;
+  *check-v5-codex-late-stop-proof.sh*) id=C.codex-late-stop ;;
 esac
 printf 'start %s %s %s\\n' "$id" "$PWD" "$TMPDIR" >>"$EVENTS"
 touch "$EVENTS.started-$id"
@@ -496,7 +517,7 @@ run_gates
 `;
 }
 
-test('production wiring: all 19 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
+test('production wiring: all 24 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
   const f = fixture(t);
   const r = run(f, wireFixture(f));
   assert.equal(r.status, 0, r.stderr);
@@ -505,7 +526,9 @@ test('production wiring: all 19 C gates + D run pinned; C/D overlap; Box waits f
   const ids = starts.map((l) => l.split(' ')[1]);
   const expected = ['session-rootfix', 'watch-gate', 'cursor-sand', 'delegate-billing', 'callback-ws',
     'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'model-policy', 'architecture',
-    'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask', 'upload-retention', 'ccb-mcp'].map((id) => `C.${id}`);
+    'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask',
+    'master-incident-proofs', 'codex-chatgpt-ws', 'platform-tool-proofs', 'terminal-unproven',
+    'upload-retention', 'ccb-mcp', 'codex-late-stop'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
   const queued = [...r.stderr.matchAll(/\[([^\]]+)\] 后台启动/g)].map((match) => match[1]);
   assert.deepEqual(queued, ['D', ...expected.filter((id) => !isSerialGate(id))]);
@@ -536,7 +559,12 @@ test('production wiring: all 19 C gates + D run pinned; C/D overlap; Box waits f
   assert.ok(lines.indexOf('db-drop') < uploadStart);
   assert.ok(uploadStart < uploadEnd);
   assert.ok(uploadEnd < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
+  const lateStart = lines.findIndex((l) => l.startsWith('start C.codex-late-stop '));
+  assert.ok(lines.indexOf('end C.ccb-mcp') < lateStart);
+  assert.ok(lateStart < lines.indexOf('end C.codex-late-stop'));
+  assert.ok(lines.indexOf('end C.codex-late-stop') < lines.indexOf('tmp-cleanup'));
   assert.equal(lines.at(-1), 'seal built');
+  assertSerialTail(lines);
   assert.equal(notes(f).frontendTscSec, '0.125');
   for (const id of ids.filter((id) => !isSerialGate(id))) {
     assert.equal(notes(f)[`job.${id}.rc`], '0', id);
@@ -579,11 +607,13 @@ for (const receipt of ['hit', 'wrong-sha']) {
     }
     const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.model-policy', 'C.architecture'];
     for (const phase of local) assert.ok(ids.includes(phase), phase);
-    assert.equal(ids.length, receipt === 'hit' ? 12 : 20);
+    assert.deepEqual([...ids].sort(), [...local, ...serialGateIds, ...(receipt === 'hit' ? [] : Object.keys(receiptPhases))].sort());
+    assert.equal(ids.length, receipt === 'hit' ? 17 : 25);
+    assertSerialTail(lines);
     assert.equal(notes(f)['gateEvidence.box-longtask'], 'local');
     const awaited = lines.indexOf('runtime-awaited');
     for (const phase of local) assert.ok(lines.indexOf(`end ${phase}`) < awaited, phase);
-    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.box-longtask', 'C.upload-retention', 'C.ccb-mcp']) {
+    for (const phase of serialGateIds) {
       assert.ok(lines.findIndex((l) => l.startsWith(`start ${phase} `)) > awaited, phase);
     }
     assert.equal(lines.at(-1), 'seal built');
@@ -614,4 +644,43 @@ for (const receipt of ['hit', 'miss']) {
     assert.match(r.stderr, /pinned upload retention HTTP responsiveness proof failed/);
     assert.equal(lines.at(-1), 'cleanup');
   });
+}
+
+for (const receipt of ['hit', 'miss']) {
+  test(`production wiring: late-stop proof failure blocks cleanup and seal with receipt ${receipt}`, (t) => {
+    const f = fixture(t);
+    const r = run(f, wireFixture(f, 'C.codex-late-stop', receipt));
+    assert.equal(r.status, 73, r.stderr);
+    const lines = events(f);
+    assert.ok(lines.some((l) => l.startsWith('start C.codex-late-stop ')));
+    assert.ok(lines.includes('end C.ccb-mcp'));
+    assert.ok(!lines.some((l) => l === 'tmp-cleanup' || l.startsWith('seal ')), lines.join('\n'));
+    assert.match(r.stderr, /pinned Codex late-stop closure proof failed/);
+    assert.equal(lines.at(-1), 'cleanup');
+  });
+}
+
+for (const [gate, diagnostic] of [
+  ['C.master-incident-proofs', 'pinned imported master incident proofs failed'],
+  ['C.codex-chatgpt-ws', 'pinned imported codex-chatgpt-ws proof failed'],
+  ['C.platform-tool-proofs', 'pinned imported ocv5-376-platform-tool-proofs proof failed'],
+  ['C.terminal-unproven', 'pinned imported box-terminal-unproven-probe proof failed']]) {
+  for (const receipt of ['hit', 'miss']) {
+    test(`production wiring: ${gate} failure blocks all successors and seal with receipt ${receipt}`, (t) => {
+      const f = fixture(t);
+      const r = run(f, wireFixture(f, gate, receipt));
+      assert.equal(r.status, 73, r.stderr);
+      const lines = events(f);
+      assert.equal(lines.filter((line) => line.startsWith(`start ${gate} `)).length, 1);
+      assert.match(r.stdout, /\[gate-failure\] fixture failed/);
+      assert.ok(r.stderr.includes(diagnostic), r.stderr);
+      assert.ok(!lines.includes(`end ${gate}`));
+      for (const successor of serialGateIds.slice(serialGateIds.indexOf(gate) + 1)) {
+        assert.ok(!lines.some((line) => line.startsWith(`start ${successor} `)), successor);
+      }
+      assert.ok(!lines.includes('db-drop'));
+      assert.ok(!lines.some((line) => line === 'tmp-cleanup' || line.startsWith('seal ')), lines.join('\n'));
+      assert.equal(lines.at(-1), 'cleanup');
+    });
+  }
 }

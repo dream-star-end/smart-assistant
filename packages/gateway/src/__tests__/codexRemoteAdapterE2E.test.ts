@@ -88,6 +88,7 @@ interface Lane {
   holdAbandon: (hold: boolean) => void
   abandonAcksHeld: () => boolean
   abandons: () => number
+  admissionCalls: () => number
   abandonCauses: () => Array<{ failureCode: string; diagnostic: string } | null>
   /** The master applied `/renew`, then the container's ACK is held: a legal early delivery. */
   holdRenewAck: (hold: boolean) => void
@@ -113,6 +114,8 @@ async function lane(t: TestContext, options: {
   leaseRenewAfterMs?: number
   platformTools?: boolean
   closeFailure?: { active: boolean }
+  localStopProofDelay?: { ms: number }
+  hostReadyGate?: { hold?: Promise<void>; entered: boolean }
   /** The web chat's peer id; the prompt only projects a nickname consented for this session. */
   sessionId?: string
   /** The node refuses thread/unsubscribe, as an older controller does. */
@@ -248,8 +251,10 @@ async function lane(t: TestContext, options: {
   let abandons = 0
   let abandonsHeld = false
   const abandonCauses: Array<{ failureCode: string; diagnostic: string } | null> = []
+  let admissionCalls = 0
   const relay = new CodexRemoteRelay(binding, keys, hostPort, spec, join(root, 'journal'), {
     admit: async () => {
+      admissionCalls++
       const held = admissionHold
       if (held) await held
       // The real port claims a thread boundary once per finance turn and rejects a second claim,
@@ -324,9 +329,17 @@ async function lane(t: TestContext, options: {
         throw new Error('CODEX_REMOTE_PERMISSION_UNSUPPORTED')
       }, env)
       return {
-        tools: () => inner.tools(),
+        tools: async () => {
+          const tools = await inner.tools()
+          if (options.hostReadyGate?.hold) {
+            options.hostReadyGate.entered = true
+            await options.hostReadyGate.hold
+          }
+          return tools
+        },
         close: async () => {
           await inner.close()
+          if (options.localStopProofDelay?.ms) await pause(options.localStopProofDelay.ms)
           if (options.closeFailure?.active) throw new Error('FIXTURE_STOP_PROOF_LOST')
         },
         execute: (name, args, identity) => {
@@ -375,6 +388,14 @@ async function lane(t: TestContext, options: {
       if (await predicate()) return
       await pause(20)
     }
+    // Emit only fixture lifecycle state, never authority envelopes or tool data.
+    const state = relay as unknown as Record<string, unknown>
+    t.diagnostic(JSON.stringify({ label, abandonCauses, relay: {
+      active: state.active, dispatching: state.dispatching, revoked: state.revoked,
+      firstCause: state.firstCause, localStopped: state.localStopped,
+      stopping: Boolean(state.stopping), admitting: Boolean(state.admitting),
+      hasFinanceTurn: Boolean(state.financeTurn),
+    } }))
     assert.fail(`timed out waiting for ${label}`)
   }
   t.after(async () => {
@@ -407,6 +428,7 @@ async function lane(t: TestContext, options: {
     child, emit, sendTool, nativeItem, toolRequest, until,
     renewals: () => renewals,
     abandons: () => abandons,
+    admissionCalls: () => admissionCalls,
     abandonCauses: () => abandonCauses,
     abandonAcksHeld: () => abandonsHeld,
     holdAbandon: (hold: boolean) => {
@@ -782,13 +804,15 @@ test('a withdrawn nickname is gone from the instructions the node resumes the wa
   assert.equal(h.launches, 1)
 })
 
-test('a node that refuses the thread unload fences the lane and closes the undispatched admission',
+for (const lateProof of [false, true]) test(`a node that refuses the thread unload fences the lane and closes the undispatched admission${lateProof ? ' after a late local stop proof' : ''}`,
   { timeout: 180000 }, async (t) => {
   // OCV5-746 audit R3 B2: the admission already claimed the bound thread but never wrote turn/start;
   // the plain stop leaves that inflight, so the fence must close it by identity, with its cause.
   const nickname = 'Zq746Nick'
   const sessionId = 'codex_container_e2e'
-  const h = await lane(t, { sessionId, rejectUnsubscribe: true })
+  const localStopProofDelay = { ms: 0 }
+  const hostReadyGate: { hold?: Promise<void>; entered: boolean } = { entered: false }
+  const h = await lane(t, { sessionId, rejectUnsubscribe: true, localStopProofDelay, hostReadyGate })
   const nodeFrames = (method: string) => h.received('launch')
     .map((row) => row?.received).filter((frame) => frame?.method === method)
   h.adapter.setPromptPrivacy({ schemaVersion: 1, profile: { nickname, sessionId } })
@@ -802,8 +826,19 @@ test('a node that refuses the thread unload fences the lane and closes the undis
 
   h.adapter.setPromptPrivacy({ schemaVersion: 1, profile: null })
   await restartRunnerForConfigChange(h.adapter)
+  // A genuine stopped host can report its proof after the relay's bounded
+  // stop attempt. No user turn was dispatched: that late proof must finish
+  // identity-scoped closure without another user request or a model replay.
+  if (lateProof) localStopProofDelay.ms = 6000
+  let ready!: () => void
+  hostReadyGate.hold = new Promise<void>(resolve => { ready = resolve })
   const second = h.authority('req-unload-2')
   const run2 = h.adapter.submitTurn(h.turnParams(second, 'f'.repeat(64), 'req-unload-2'))
+  try {
+    await h.until(() => hostReadyGate.entered || h.admissionCalls() > 1, 'new host readiness or premature admission')
+    assert.equal(h.admissionCalls(), 1, 'a cached catalog cannot admit before the new tool host is ready')
+    assert.equal(nodeFrames('turn/start').length, 1, 'the held new tool host cannot run a second model turn')
+  } finally { ready() }
   const summary2 = await run2.summary.catch((error: unknown) => ({ isError: true, error }))
   assert.equal(summary2?.isError, true, 'the turn fails instead of running on the old instructions')
   await h.until(() => h.abandonCauses().length === 1, 'the undispatched admission is closed')

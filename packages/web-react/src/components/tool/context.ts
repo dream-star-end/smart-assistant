@@ -9,9 +9,9 @@
  * 由上层 App/MessageRenderer 注入，不污染 props，也不引入第二套传参机制。
  */
 import { createContext, type ReactNode, useContext } from "react";
+import type { CommunityTutorialCategory, CommunityTutorialMine, CommunityBlogPrecheck } from "../../lib/types";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
 import type { Ticket } from "../../lib/taskboard";
-import type { CommunityBlogPrecheck, CommunityTutorialCategory, CommunityTutorialMine } from "../../lib/types";
 import type { ToolLike } from "./format";
 
 import type { SystemActionDetail, SystemActionSummary } from '@openclaude/protocol/browser';

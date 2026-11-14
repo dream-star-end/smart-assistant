@@ -1,5 +1,5 @@
 /**
- * OCV5-589 MiniMax media client on real Postgres (0328 minimax_voices).
+ * OCV5-589 MiniMax media client on real Postgres (0322 minimax_voices).
  *
  *   1. speech: a system voice and the caller's own voice pass; another user's voice is 403 and
  *      never reaches upstream; with no system list the check fails closed to the default voice.

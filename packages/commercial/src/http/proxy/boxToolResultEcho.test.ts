@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { BoxToolResultEcho } from "./boxToolResultEcho.js";
+import { BoxToolResultEcho, BoxToolResultEchoError } from "./boxToolResultEcho.js";
 
 const result = (id: string, text: string) => ({ modelToolUseId: id,
   content: [{ type: "text" as const, text }], isError: false,
@@ -11,6 +11,47 @@ const expected = [result("toolu_A", "first"), result("toolu_B", "second")];
 const echo = (id: string, content: string) => ({ type: "user",
   message: { role: "user", content: [{ type: "tool_result",
     tool_use_id: id, content }] } });
+
+test("echo mismatches retain bounded metadata and distinguish hash-only and error-bit failures", () => {
+  const privateText = "private tool output, image or credential ".repeat(2000);
+  const published = result("toolu_private", privateText);
+  const { content: _content, ...hashOnly } = published;
+  for (const item of [published, hashOnly]) {
+    assert.throws(() => new BoxToolResultEcho([item]).accept(echo("toolu_private", "changed")),
+      (error: unknown) => {
+        assert.ok(error instanceof BoxToolResultEchoError);
+        assert.equal(error.message, "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+        assert.equal(error.boxFailureDiagnostic?.branch, "echo_content");
+        assert.equal(error.boxFailureDiagnostic?.hashOnly, item === hashOnly);
+        assert.equal(error.boxFailureDiagnostic?.expectedSha256, published.contentHash);
+        assert.equal(error.boxFailureDiagnostic?.observedType, "text");
+        const encoded = JSON.stringify(error.boxFailureDiagnostic);
+        assert.ok(Buffer.byteLength(encoded) <= 2048);
+        assert.ok(!encoded.includes("private tool output"));
+        return true;
+      });
+  }
+  const raw = echo("toolu_private", privateText);
+  Object.assign(raw.message.content[0]!, { is_error: true });
+  assert.throws(() => new BoxToolResultEcho([published]).accept(raw), (error: unknown) => {
+    assert.ok(error instanceof BoxToolResultEchoError);
+    assert.equal(error.message, "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+    assert.equal(error.boxFailureDiagnostic?.branch, "echo_error_bit");
+    return true;
+  });
+});
+
+test("deferred rewrite rejection keeps its original code and content-free diagnostic", async () => {
+  const verifier = new BoxToolResultEcho([result("toolu_A", "private nonempty output")]);
+  verifier.accept(echo("toolu_A", "(mcp__ocbridge__Bash completed with no output)"));
+  await assert.rejects(() => verifier.verifyDeferred(), (error: unknown) => {
+    assert.ok(error instanceof BoxToolResultEchoError);
+    assert.equal(error.message, "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+    assert.equal(error.boxFailureDiagnostic?.branch, "echo_content");
+    assert.ok(!JSON.stringify(error.boxFailureDiagnostic).includes("private nonempty"));
+    return true;
+  });
+});
 
 test("CLI user echoes bind both published tool results in any dispatch order", () => {
   const verifier = new BoxToolResultEcho(expected);

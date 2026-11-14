@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { ProxyBody } from './shared.js'
+import { memoPureBody } from './boxPureMemo.js'
 
 export type BoxImageIdentity = { version: 1; complete: false } | {
   version: 1; complete: true; sha256: string; imageCount: number; uniqueImageCount: number; mediaBytes: number
@@ -7,6 +8,10 @@ export type BoxImageIdentity = { version: 1; complete: false } | {
 /** Constant-size private journal evidence, beside the existing full body hashes.
  * No content, paths, per-image digests or new model decisions leave this function. */
 export function deriveBoxImageIdentity(body: Pick<ProxyBody, 'messages'>): BoxImageIdentity {
+  return memoPureBody(body, 'image', () => deriveBoxImageIdentityUncached(body))
+}
+
+function deriveBoxImageIdentityUncached(body: Pick<ProxyBody, 'messages'>): BoxImageIdentity {
   try {
     const identities: string[] = []
     let mediaBytes = 0

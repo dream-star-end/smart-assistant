@@ -1,3 +1,4 @@
+import { useAppWorkspaceState } from "./hooks/useAppWorkspaceState";
 import { catalogOwnerIsCurrent } from './hooks/useIdentityModelCatalog'
 import type { ResolvedIdentity } from './lib/resolvedIdentity'
 import {useModelSwitchCost} from './hooks/useModelSwitchCost';
@@ -7,7 +8,6 @@ import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMateriali
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
 import {
-  lazy,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -58,7 +58,6 @@ import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
 import { pushPaletteRecent } from "./lib/paletteRecents";
 import { type BannerKind, collapsedBannersLabel, resolveBanners } from "./lib/bannerStack";
-import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
 import { DEFAULT_MANAGE_TAB, type ManageTab, normalizeManageTab } from "./lib/manageTabs";
@@ -94,14 +93,12 @@ import { isBrowserStepMessage } from "./components/tool/browserDetect";
 import {
   DETAIL_PANE_WIDTH,
   type DeferredPayloadLoader,
-  InspectorPanel,
-  InspectorPanelContent,
   type PaneRequest,
   type PaneTab,
   paneRequestForSession,
   readDetailPaneOpen,
   writeDetailPaneOpen,
-} from "./components/InspectorPanel";
+} from "./components/chat/inspectorState";
 import type { ToolLike } from "./components/tool/format";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
@@ -228,6 +225,7 @@ import {
   modelSwitchCompactionReason,
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
+import { probeStudio } from "./hooks/useStudioProviders";
 import { useServerFeatures } from "./hooks/useServerFeatures";
 import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } from "./lib/unfiledSuggest";
 import { projectChipsBoardId } from "./lib/projectChips";
@@ -243,78 +241,14 @@ import { useComposerSend } from "./hooks/useComposerSend";
 import { useSessionModelAndCollab } from "./hooks/useSessionModelAndCollab";
 import { AppDialogs } from "./components/AppDialogs";
 
-// 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
-// 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
-// 对话框仅在 open 时挂载 → 首屏零下载,首次打开拉块时短暂显 loading；React.lazy 解析后模块
-// 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
-// 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
-const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
-const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
-const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
-const DesktopEnrollPage = lazy(() => import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })));
-const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
-const TutorialCenter = lazy(() =>
-  import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
-);
-const ContainerWebPreview = lazy(() =>
-  import("./components/ContainerWebPreview").then((m) => ({ default: m.ContainerWebPreview })),
-);
-const TaskboardView = lazy(() =>
-  import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
-);
-// 2026-09-17 首屏体量门(first-screen-budget)超限修复:下列对话框/编辑器都是「点开才需要」的
-// 覆盖层,此前静态 import 把它们(连同 ImageViewer 三模式、ProjectAssetsPanel 等)钉在入口静态
-// 闭包里。改 React.lazy 后由渲染点的挂载闸(useMountedOnce / 条件挂载)控制首次下载;打开过
-// 一次即常驻,状态保留与关闭语义与原先「始终挂载、按 open 显隐」一致。
-const ImageAnnotationEditor = lazy(() =>
-  import("./components/ImageAnnotationEditor").then((m) => ({ default: m.ImageAnnotationEditor })),
-);
-// 项目主页(/p/<id>)是并列工作区,点开项目才需要;带着 ProjectAssetsPanel,不能进入口闭包。
-const ProjectHome = lazy(() =>
-  import("./components/project/ProjectHome").then((m) => ({ default: m.ProjectHome })),
-);
-
-// UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
-// loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
-// 的动态 import 去重,预取后 React.lazy 解析即命中,首开零延迟;弱网下预取失败静默,
-// 行为退化为按需加载,不比没有预取更差。
-export function prefetchLazyCentersOnIdle(): void {
-  const prefetch = () => {
-    // 省流量模式 / 2G 下不在后台下完全部中心(shell 审计 S-16);API 缺席的浏览器照常预取。
-    if (!shouldPrefetchCenters(readNetworkInformation())) return;
-    void import("./components/Landing").catch(() => {});
-    void import("./components/SettingsCenter").catch(() => {});
-    void import("./components/ManageCenter").catch(() => {});
-    void import("./components/MarketplaceCenter").catch(() => {});
-    void import("./components/OrgCenter").catch(() => {});
-    void import("./components/TutorialCenter").catch(() => {});
-    void import("./components/MediaTaskCenter").catch(() => {});
-    // 全屏图片查看器(含圈选编辑/评论/调整大小)也是懒块:时间线里点图即开,预热后首开零延迟。
-    void import("./components/ImageViewer").catch(() => {});
-    if (TASKBOARD_ENABLED) {
-      void import("./components/taskboard/TaskboardView").catch(() => {});
-    }
-  };
-  if (typeof requestIdleCallback === "function") {
-    requestIdleCallback(prefetch, { timeout: 8000 });
-  } else {
-    setTimeout(prefetch, 3000);
-  }
-}
-
-/** 全屏懒块加载态（营销首页 chunk 下载期）——与启动续期 splash 同视觉,不割裂。*/
-function SplashFallback() {
-  return <BootSplash />;
-}
-/** 懒加载对话框的挂载闸:首次 open 之前不挂载(不下载 chunk);打开过一次后常驻返回 true,
- *  保持与原先「始终挂载、按 open 显隐」相同的状态保留/关闭语义。渲染期 setState 是 React
- *  认可的「由 props 派生状态」写法,只在 open 首次翻真时触发一次。 */
-function useMountedOnce(open: boolean): boolean {
-  const [mounted, setMounted] = useState(open);
-  if (open && !mounted) setMounted(true);
-  return mounted || open;
-}
+import {
+  IdentityRecoveryNotice, AccountSwitchNotice, AuthGate, Landing, DesktopEnrollPage,
+  TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, InspectorPanel,
+  InspectorPanelContent, ImageAnnotationEditor, ProjectHome,
+  prefetchLazyCentersOnIdle, SplashFallback, useMountedOnce,
+} from "./appLazyViews";
+export { prefetchLazyCentersOnIdle } from "./appLazyViews";
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 
@@ -324,46 +258,13 @@ const EMPTY_CATALOG_MODELS: PublicModel[] = [];
 const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
 
 export function App() {
-  // P7 最小路由（无路由库）：特判页（demo / reset-password / desktop/enroll）与启动深链
-  // （会话 /s/<id> + 面板 ?panel=）的解析见 readLocationRoute；此后 URL 是状态的 replaceState 单向镜像。
-  const urlRoute = readLocationRoute(location);
-  const { params, demo, resetToken, desktopEnroll, routingEnabled } = urlRoute;
-  // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
-  // （URL 指定 > 最近会话）；resolve/放弃后置 null。
-  const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
-    routingEnabled ? parseSessionPath(location.pathname) : null,
-  );
-  // 任务面板是并列工作区（整段替换 <main>），不是管理中心 Tab。boot 自 /board。
-  const [boardOpen, setBoardOpenState] = useState(
-    () => TASKBOARD_ENABLED && routingEnabled && location.pathname === "/board",
-  );
-  // 项目主页(/p/<id>[/<tab>])：第三个并列工作区。null = 不在项目主页。
-  const [projectHome, setProjectHome] = useState<ProjectRoute | null>(null);
-  // 启动深链 /p/<id> 的未决目标：等项目列表到达再打开(useAppRoute),不存在则回 /。
-  const [pendingRouteProject, setPendingRouteProject] = useState<ProjectRoute | null>(() =>
-    routingEnabled ? parseProjectPath(location.pathname) : null,
-  );
-  // 所有「去对话 / 去任务面板」的入口都经这里：切工作区即离开项目主页。
-  // 用户主动导航也作废未决的 /p/<id> 深链恢复(否则列表迟到后会把人拽回项目主页)。
-  const setBoardOpen = useCallback((open: boolean) => {
-    setBoardOpenState(open);
-    setProjectHome(null);
-    setPendingRouteProject(null);
-  }, []);
-  const [boardView, setBoardView] = useState<BoardViewParam>(() =>
-    routingEnabled ? parseBoardView(params, preferredBoardView()) : preferredBoardView(),
-  );
-  const [boardTicketId, setBoardTicketId] = useState<string | null>(() =>
-    routingEnabled ? parseBoardTicket(params) : null,
-  );
-  const [boardTicketType, setBoardTicketType] = useState(() =>
-    routingEnabled ? parseBoardTicketType(params) : null,
-  );
-  // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
-  // 直接置 app,失败停在 home。
-  const [view, setView] = useState<"home" | "app">(resetToken || desktopEnroll ? "app" : "home");
-  // AuthGate 初始模式：「免费开始」=register，顶栏「登录」=login，重置链接=reset。
-  const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
+  const {
+    urlRoute, params, demo, resetToken, desktopEnroll, studio, routingEnabled,
+    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, setBoardOpenState, projectHome,
+    setProjectHome, pendingRouteProject, setPendingRouteProject, boardView, setBoardView,
+    boardTicketId, setBoardTicketId, boardTicketType, setBoardTicketType, view,
+    setView, authMode, setAuthMode,
+  } = useAppWorkspaceState();
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
   // 与设置中心「偏好·外观」分区，二者共享同一状态——杜绝多个 useTheme 实例各自镜像、互不同步。
   const { theme, setTheme, cycle } = useTheme();
@@ -475,6 +376,8 @@ export function App() {
   // 「ChatGPT 直连」入口门控:服务端 GET /api/chatgpt-proxy/access 明确 enabled 才显示(默认隐藏)。
   const [chatGptProxyEnabled, setChatGptProxyEnabled] = useState(false);
   const [chatGptProxyOpen, setChatGptProxyOpen] = useState(false);
+  // 「媒体工作台」入口门控(OCV5-593):GET /api/studio/providers 明确 200 才显示(默认隐藏)。
+  const [studioAvailable, setStudioAvailable] = useState(false);
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const repoModalMounted = useMountedOnce(repoModalOpen);
@@ -819,7 +722,7 @@ export function App() {
     setPendingRouteProject(null);
     setBoardOpenState(false);
     setProjectHome({ projectId, tab: "overview" });
-  }, []);
+  }, [setPendingRouteProject, setBoardOpenState, setProjectHome]);
   const projectSettingsOpen = projectSettings !== null || ungroupedAssetsOpen;
   const projectSettingsMounted = useMountedOnce(projectSettingsOpen);
   // 新建项目对话框:null=关;{}=普通新建;{sessionId,title}=从该会话创建并移入。
@@ -913,7 +816,7 @@ export function App() {
   // 主页上的项目被删除(本页 ⋯ 删除或别处删除)：列表落定后不再存在 → 回对话。
   useEffect(() => {
     if (projectHome && projectsLoaded && !homeProject) setProjectHome(null);
-  }, [projectHome, projectsLoaded, homeProject]);
+  }, [projectHome, projectsLoaded, homeProject, setProjectHome]);
 
   // Ctrl/⌘K recents: whatever the user actually lands on (project home or a chat).
   const paletteUserId = user?.id ?? (demo ? "demo" : null);
@@ -1683,6 +1586,25 @@ export function App() {
     };
   }, [mediaGateEnabled]);
 
+  // 媒体工作台开放探测:登录后拉一次(按身份 epoch 缓存),失败一律视为未开放。
+  useEffect(() => {
+    if (demo || !user) {
+      setStudioAvailable(false);
+      return;
+    }
+    let cancelled = false;
+    probeStudio(authRef.current)
+      .then((view) => {
+        if (!cancelled) setStudioAvailable(view !== null);
+      })
+      .catch(() => {
+        if (!cancelled) setStudioAvailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [demo, user]);
+
   // ChatGPT 直连授权探测:登录后拉一次。与视频任务相反,这里默认隐藏、只有服务端明确
   // enabled:true 才显示入口 —— 未授权用户看不到任何代理信息。
   useEffect(() => {
@@ -1922,7 +1844,8 @@ export function App() {
               }}
               caseActionLabel="登录后试用"
               onRunCase={runTutorialCase}
-              auth={auth}
+              userId={user?.id ?? null}
+            auth={auth}
               onRequireLogin={() => {
                 setTutorialOpen(false);
                 setTutorialCommunity(null);
@@ -1999,7 +1922,19 @@ export function App() {
   }
 
   if (desktopEnroll && auth) {
-    return <LazyBoundary fallback={<SplashFallback />}><DesktopEnrollPage auth={auth} /></LazyBoundary>;
+    return (
+      <LazyBoundary fallback={<SplashFallback />}>
+        <DesktopEnrollPage auth={auth} />
+      </LazyBoundary>
+    );
+  }
+
+  if (studio && auth) {
+    return (
+      <LazyBoundary fallback={<SplashFallback />}>
+        <StudioApp auth={auth} theme={theme} onCycleTheme={cycle} />
+      </LazyBoundary>
+    );
   }
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
@@ -2080,6 +2015,7 @@ export function App() {
         },
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
+    onOpenStudio: !demo && studioAvailable ? () => window.location.assign("/studio") : undefined,
     onOpenChatGptProxy: !demo && chatGptProxyEnabled ? () => setChatGptProxyOpen(true) : undefined,
     // 「API 接入」:admin-only rollout(与后端 requireAdmin / strategy Layer 2 同门)。
     onOpenApiAccess: !demo && user?.role === "admin" ? () => openSettings("api-access") : undefined,
@@ -2243,6 +2179,7 @@ export function App() {
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
           onOpenPalette={closeMobileThen(sidebarProps.onOpenPalette)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
+          onOpenStudio={closeMobileThen(sidebarProps.onOpenStudio)}
           onOpenChatGptProxy={closeMobileThen(sidebarProps.onOpenChatGptProxy)}
           onOpenApiAccess={closeMobileThen(sidebarProps.onOpenApiAccess)}
           onLogout={closeMobileThen(sidebarProps.onLogout)}
@@ -2751,23 +2688,33 @@ export function App() {
       {/* 详情面板(右侧第三栏)。宽屏:与 Sidebar|main 并列的内联 aside;
           更窄:贴底 Sheet(共用 InspectorPanelContent)。任务看板 / 项目主页占据 main 时不渲染。 */}
       {paneInline && (
-        <InspectorPanel
+        <LazyBoundary
           key={activeId ?? "demo"}
-          messages={wsMessages}
-          version={chat.version}
-          running={wsSending}
-          request={paneRequestHere}
-          deferredLoader={paneDeferredLoader}
-          focusNonce={paneRequestHere?.nonce}
-          onClose={() => setPaneOpen(false)}
-          onActiveChange={setPaneActive}
-          width={paneWidth.width}
-          resizing={paneWidth.resizing}
-          widthMin={DETAIL_PANE_WIDTH.min}
-          widthMax={DETAIL_PANE_WIDTH.max}
-          onResizeStart={paneWidth.onResizeStart}
-          onResizeKeyDown={paneWidth.onResizeKeyDown}
-        />
+          fallback={
+            <aside className="flex shrink-0 flex-col items-center gap-3 border-l border-border p-4" style={{ width: paneWidth.width }}>
+              <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
+              <Button variant="ghost" onClick={() => setPaneOpen(false)}>关闭详情面板</Button>
+            </aside>
+          }
+        >
+          <InspectorPanel
+            key={activeId ?? "demo"}
+            messages={wsMessages}
+            version={chat.version}
+            running={wsSending}
+            request={paneRequestHere}
+            deferredLoader={paneDeferredLoader}
+            focusNonce={paneRequestHere?.nonce}
+            onClose={() => setPaneOpen(false)}
+            onActiveChange={setPaneActive}
+            width={paneWidth.width}
+            resizing={paneWidth.resizing}
+            widthMin={DETAIL_PANE_WIDTH.min}
+            widthMax={DETAIL_PANE_WIDTH.max}
+            onResizeStart={paneWidth.onResizeStart}
+            onResizeKeyDown={paneWidth.onResizeKeyDown}
+          />
+        </LazyBoundary>
       )}
       <Sheet
         open={paneAvailable && paneSheetOpen && !isWideViewport}
@@ -2779,16 +2726,26 @@ export function App() {
       >
         {paneSheetOpen && (
           <div className="flex h-[80dvh] min-h-0 flex-col">
-            <InspectorPanelContent
+            <LazyBoundary
               key={activeId ?? "demo"}
-              messages={wsMessages}
-              version={chat.version}
-              running={wsSending}
-              request={paneRequestHere}
-              deferredLoader={paneDeferredLoader}
-              onClose={() => setPaneSheetOpen(false)}
-              onActiveChange={setPaneActive}
-            />
+              fallback={
+                <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-4">
+                  <output className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</output>
+                  <Button variant="ghost" onClick={() => setPaneSheetOpen(false)}>关闭详情面板</Button>
+                </div>
+              }
+            >
+              <InspectorPanelContent
+                key={activeId ?? "demo"}
+                messages={wsMessages}
+                version={chat.version}
+                running={wsSending}
+                request={paneRequestHere}
+                deferredLoader={paneDeferredLoader}
+                onClose={() => setPaneSheetOpen(false)}
+                onActiveChange={setPaneActive}
+              />
+            </LazyBoundary>
           </div>
         )}
       </Sheet>
@@ -2962,6 +2919,7 @@ export function App() {
             }}
             caseActionLabel="带着指令去对话"
             onRunCase={runTutorialCase}
+            userId={user?.id ?? null}
             auth={auth}
             onRequireLogin={() => {
               setAuthMode("login");

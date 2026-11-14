@@ -45,6 +45,7 @@ import type { OpenClaudeConfig } from "@openclaude/storage";
 import type { ToolCalledEvent, TurnCompletedEvent } from "@openclaude/protocol";
 import { eventBus } from "../eventBus.js";
 import { EMPTY_COMPLETED_TURN_NOTICE } from "../emptyCompletedTurn.js";
+import { classifyRunError } from "../errorClassify.js";
 
 function collectTurnCompleted(): { events: TurnCompletedEvent[]; stop: () => void } {
   const events: TurnCompletedEvent[] = [];
@@ -792,29 +793,33 @@ describe("phantom three-state judgment", () => {
     assert.equal(session.turns, 1, "skipped 是正常完成,不回滚");
   });
 
-  test("called(willCallApi 已发)+ 全零 → 不判 phantom(诊断仅告警)", async () => {
-    const sm = new SessionManager(makeConfigStub());
-    const events: SessionStreamEvent[] = [];
-    const runner = new FakeCcbRunner((r) => {
-      setImmediate(() => {
-        r.telemetry("turn.willCallApi");
-        r.result(); // 无 stop_reason、零 blocks → incomplete 诊断路径
+  test("called 全零不是 phantom，但真实终态 NO_RESPONSE 带免单标记且无空完成正文", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.telemetry("turn.willCallApi");
+          r.result();
+        });
       });
-    });
-    const session = makeSession(runner);
-
-    await runOneTurn(sm, session, events);
-    // Not phantom: one engine attempt, no PHANTOM_TURN reject/retry. Since
-    // fc0e393ac a zero-token, zero-output turn is not a reply either: it ends
-    // as NO_RESPONSE instead of a completed final.
-    assert.equal(runner.submittedInputs.length, 1, "no phantom retry");
-    assert.equal(events.some((e) => e.kind === "final"), false, "a zero-token turn is not a completed reply");
-    assert.deepEqual(
-      events.filter((e) => e.kind === "error"),
-      [{ kind: "error", error: "任务未能产生有效回复。本轮已自动免单；请重新尝试。" }],
-      "the turn ends with the NO_RESPONSE notice",
-    );
-    assert.equal(session.turns, 1);
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" } as Partial<AgentSession>);
+      await runOneTurn(sm, session, events);
+      await sm.awaitPendingPersistence();
+      assert.equal(runner.submittedInputs.length, 1, "called-empty is not phantom/retry");
+      assert.equal(session.turns, 1);
+      assert.equal(events.some((e) => e.kind === "final"), false);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "crashed");
+      assert.equal(captured.payloads[0]!.errorCode, "NO_RESPONSE");
+      assert.equal(captured.payloads[0]!.waiveReason, "no_response");
+      assert.equal(captured.payloads[0]!.text ?? "", "");
+      assert.equal((captured.payloads[0]!.text ?? "").includes(EMPTY_COMPLETED_TURN_NOTICE), false);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
   });
 
   test("unknown + 有输出(blocks>0)→ 不判 phantom", async () => {
@@ -1048,7 +1053,35 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("capacity failure succeeds within the shared 10-retry budget and persists one exact paid turn", async () => {
+  test("try a different model is unavailable, not a capacity retry", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => setImmediate(() => r.result({
+        is_error: true, subtype: "error_during_execution",
+        // Real CCB result has raw text only, not a forged conflicting class. OCV5-407: the
+        // Codex at-capacity wording is a capacity retry now (covered by the capacity tests
+        // below); "try a different model" without capacity wording stays deterministic.
+        result: "This model is not available for this account. Please try a different model.",
+      })));
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" } as Partial<AgentSession>);
+      await sm.submit(session, "finish task", (event) => events.push(event));
+      await sm.awaitPendingPersistence();
+      assert.equal(runner.submittedInputs.length, 1);
+      assert.equal(events.some((event) => event.kind === "turn_status" && typeof event.status === "object" && event.status?.status === "retrying"), false);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "model_not_available");
+      const errors = events.filter((event) => event.kind === "error");
+      assert.equal(errors.length, 1);
+      assert.ok(errors[0]!.kind === "error" && errors[0]!.error.includes("Please try a different model."));
+      assert.equal(errors[0]!.kind === "error" && classifyRunError(errors[0]!.error).code, "model_not_available");
+
+    } finally { setV3MasterSinkSingleton(null); }
+  });
+
+  test("capacity failure succeeds within the shared 3-failure circuit and persists one exact paid turn", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     // The same-class breaker (3, transientRetryCircuitBreaker.test.ts) would open
@@ -1071,11 +1104,11 @@ describe("crash/interrupt partial persistence", () => {
             requestId,
             turnKey: session._currentTurnKey!,
             engineSessionId: `oceng-${String(attempt).repeat(48)}`,
-            status: attempt <= 3 ? "error" : "success",
+            status: attempt <= 2 ? "error" : "success",
             durationMs: attempt,
-            usage: { input_tokens: attempt, output_tokens: attempt <= 3 ? 0 : 4 },
+            usage: { input_tokens: attempt, output_tokens: attempt <= 2 ? 0 : 4 },
           });
-          if (attempt <= 3) {
+          if (attempt <= 2) {
             r.thinking(`attempt ${attempt} thinking`);
             r.text(`attempt ${attempt} process`);
             r.toolPair(`retry-tool-${attempt}`, "Read", `attempt ${attempt} output`);
@@ -1088,7 +1121,7 @@ describe("crash/interrupt partial persistence", () => {
             r.result({
               is_error: true,
               subtype: "error_during_execution",
-              result: "Selected model is at capacity. Please try a different model.",
+              result: "Selected model is at capacity. Please retry later.",
               errorClass: "model_capacity",
             });
             return;
@@ -1112,12 +1145,11 @@ describe("crash/interrupt partial persistence", () => {
         requestId,
       );
 
-      assert.equal(submits, 4, "initial attempt + three automatic retries before success");
+      assert.equal(submits, 3, "initial attempt + two automatic retries before success");
       assert.equal(events.filter((event) => event.kind === "error").length, 0,
         "INC-20261019-RECOVERABLE-ERROR-RED-CARD: recovered attempts never publish an error");
       assert.deepEqual(runner.submittedInputs, [
         "finish the task",
-        TRANSIENT_RETRY_INPUT,
         TRANSIENT_RETRY_INPUT,
         TRANSIENT_RETRY_INPUT,
       ]);
@@ -1126,15 +1158,14 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(payload.status, "completed");
       assert.ok(payload.text.includes("attempt 1 process"));
       assert.ok(payload.text.includes("attempt 2 process"));
-      assert.ok(payload.text.includes("attempt 3 process"));
-      assert.ok(payload.text.endsWith("retry succeeded"));
+            assert.ok(payload.text.endsWith("retry succeeded"));
       assert.deepEqual(
         payload.thinkingSegments?.map((segment) => segment.text),
-        ["attempt 1 thinking", "attempt 2 thinking", "attempt 3 thinking"],
+        ["attempt 1 thinking", "attempt 2 thinking"],
       );
       assert.deepEqual(
         payload.tools?.map((tool) => tool.output),
-        ["attempt 1 output", "attempt 2 output", "attempt 3 output"],
+        ["attempt 1 output", "attempt 2 output"],
       );
       assert.ok(payload.tools?.every((tool) =>
         (tool as typeof tool & { _toolEffect?: { authority?: string; safety?: string } })
@@ -1144,21 +1175,21 @@ describe("crash/interrupt partial persistence", () => {
       ));
       assert.deepEqual(
         payload.structuredBlocks?.map((block) => block.text),
-        ["attempt 1 plan", "attempt 2 plan", "attempt 3 plan"],
+        ["attempt 1 plan", "attempt 2 plan"],
       );
       assert.equal(
         payload.runtimeEvents?.filter((event) =>
           (event.payload as { type?: unknown }).type === "retry_status"
         ).length,
-        3,
+        2,
       );
       assert.deepEqual(payload.engineBilling, {
         requestId,
         turnKey: payload.turnKey,
-        engineSessionId: `oceng-${"4".repeat(48)}`,
+        engineSessionId: `oceng-${"3".repeat(48)}`,
         status: "success",
-        durationMs: 4,
-        usage: { input_tokens: 4, output_tokens: 4 },
+        durationMs: 3,
+        usage: { input_tokens: 3, output_tokens: 4 },
       });
       assert.equal(
         events.filter((event) => event.kind === "codex_billing").length,
@@ -1300,7 +1331,7 @@ describe("crash/interrupt partial persistence", () => {
           r.result({
             is_error: true,
             subtype: "error_during_execution",
-            result: "Selected model is at capacity. Please try a different model.",
+            result: "Selected model is at capacity. Please retry later.",
             errorClass: "model_capacity",
           });
         });
@@ -1359,7 +1390,7 @@ describe("crash/interrupt partial persistence", () => {
             r.result({
               is_error: true,
               subtype: "error_during_execution",
-              result: "Selected model is at capacity. Please try a different model.",
+              result: "Selected model is at capacity. Please retry later.",
               errorClass: "model_capacity",
             });
             return;
@@ -1406,7 +1437,7 @@ describe("crash/interrupt partial persistence", () => {
           r.result({
             is_error: true,
             subtype: "error_during_execution",
-            result: "Selected model is at capacity. Please try a different model.",
+            result: "Selected model is at capacity. Please retry later.",
             errorClass: "model_capacity",
           });
         });
@@ -2737,9 +2768,6 @@ describe("crash/interrupt partial persistence", () => {
           dispatchId: "77777777-7777-4777-8777-777777777777",
           attemptNo: 1,
         },
-      // Production routes Cursor models on official Claude Code through
-      // CursorSandAdapter, which marks the Cursor authority (since 430cb38b8 the
-      // pseudo-USD is external only for that authority).
       } as Partial<AgentSession>, { harness: "official-cc", authorityEngine: "cursor" } as EngineCreateOpts);
       (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
 
@@ -4097,9 +4125,10 @@ describe("crash/interrupt partial persistence", () => {
     assert.equal(session._contextRebuildNotice, undefined);
   });
 
-  test("runner error waits for drained late output instead of freezing an early partial", async () => {
+  test("runner error waits for drained late output instead of freezing an early partial", { timeout: 5_000 }, async (t) => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     try {
       const sm = new SessionManager(makeConfigStub());
       const events: SessionStreamEvent[] = [];
@@ -4116,7 +4145,13 @@ describe("crash/interrupt partial persistence", () => {
       } as Partial<AgentSession>);
 
       await runOneTurn(sm, session, events);
-      await sm.awaitPendingPersistence();
+      let persistenceDrained = false;
+      const drain = sm.awaitPendingPersistence().then(() => { persistenceDrained = true; });
+      await Promise.resolve();
+      assert.equal(persistenceDrained, false, "actual tracked200ms callback must still be pending");
+      t.mock.timers.tick(200);
+      await drain;
+      assert.equal(persistenceDrained, true);
 
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0]!.status, "completed");
@@ -4129,6 +4164,7 @@ describe("crash/interrupt partial persistence", () => {
         ),
       );
     } finally {
+      t.mock.timers.reset();
       setV3MasterSinkSingleton(null);
     }
   });

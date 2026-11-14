@@ -12,7 +12,7 @@ import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
 import { runBoxToolFirstRound, type BoxToolFirstHandoff,
   type BoxToolFirstFinal } from "./boxToolFirstRound.js";
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
-import { runBoxToolContinuation } from "./boxToolContinuation.js";
+import { runBoxToolContinuation, BoxToolContinuationError } from "./boxToolContinuation.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { makeBoxNativeGcDelete, parseBoxNativeGcResult } from "./boxNativeGcFile.js";
 import { prepareBoxContinuation, preparedMatchesBody,
@@ -29,6 +29,7 @@ import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 import { rootLogger } from "../../logging/logger.js";
+import { BoxSpoolTerminalError, isBoxExecRejectedError } from "./boxSpoolPoller.js";
 import type { BoxNativeMissDetail } from "./boxNativeContextDiagnosis.js";
 
 const fetchLog = rootLogger.child({ subsys: "box-tool-fetch" });
@@ -530,6 +531,47 @@ export class BoxToolFetch {
     catch { /* retain pinned target and private files for bounded retry */ }
   }
 
+  /** Finish only a run this fetcher owns and whose exact keeper proved it
+   * stopped. A background worker may already have settled/cleaned it; the
+   * existing journal methods remain the idempotent settlement authority. */
+  private async finishTerminalFailure(args: FetchArgs, error: BoxSpoolTerminalError,
+    linked: boolean): Promise<void> {
+    const proof = error.proof;
+    const owned = this.ownedRunIdentity.get(proof.runNonce);
+    // Already released by reconciliation, or no local ownership: never infer
+    // permission to settle or clean a different run from an error object.
+    if (!owned) return;
+    if (owned.uid !== args.uid || owned.accountId !== error.accountId
+      || owned.leaseEpoch !== proof.leaseEpoch) {
+      throw new Error("BOX_LOCAL_TERMINAL_IDENTITY_MISMATCH");
+    }
+    const stopped = { requestId: args.requestId, uid: args.uid,
+      leaseEpoch: proof.leaseEpoch, proof };
+    if (linked) {
+      await this.deps.journal.markToolChainStoppedFailure({ ...stopped,
+        ...(proof.reason === "worker_complete" ? { rejectedStream: true as const } : {}) });
+    } else if (proof.reason === "worker_complete") {
+      await this.deps.journal.markFirstRoundRejectedStream(stopped);
+    } else {
+      await this.deps.journal.markFirstRoundStoppedFailure(stopped);
+    }
+    await this.releaseAfterProof({ ...stopped, accountId: error.accountId,
+      runNonce: proof.runNonce });
+  }
+
+  private async convergeTerminalFailure(args: FetchArgs, error: BoxSpoolTerminalError,
+    linked: boolean): Promise<void> {
+    try { await this.finishTerminalFailure(args, error, linked); }
+    catch (failure) {
+      // Preserve the stream's first typed failure. Existing reconciliation
+      // retains the target and retries any incomplete journal/cleanup work.
+      const code = (failure as { code?: unknown } | null)?.code;
+      fetchLog.warn("box_terminal_failure_pending", { requestId: args.requestId,
+        reason: typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code)
+          ? code : "BOX_TERMINAL_CONVERGENCE_PENDING" });
+    }
+  }
+
   async fetch(args: FetchArgs): Promise<Response> {
     let responseReady = false;
     let readyResolve!: () => void;
@@ -613,10 +655,23 @@ export class BoxToolFetch {
                 this.own(held.claim.runNonce, held.target,
                   args.uid, held.claim.leaseEpoch),
               onUnknown: this.deps.onUnknown }).catch(async (error: unknown) => {
-              // OCV5-328: a stream the decoder rejects is as undeliverable
-              // as a rejected echo; stop the run instead of holding the slot.
+              if (error instanceof BoxSpoolTerminalError) {
+                await this.convergeTerminalFailure(args, error, true);
+                throw error;
+              }
+              // OCV5-328 / OCV5-377: a stream the decoder rejects (e.g. a model
+              // safety stop) is as undeliverable as a rejected echo; stop the
+              // run instead of holding the slot.
+              // A final whose keeper never proved worker_complete holds the
+              // slot the same way a rejected echo does. Stop once, bounded.
+              // This is not success: completeToolChain stays on the proof path.
+              // OCV5-762: Exec refused (417) even after one refreshed retry: the
+              // CLI cannot be followed any more; stop it so the slot is free.
               if (error instanceof BoxToolResultEchoError
-                || error instanceof BoxCliToolHandoffError) {
+                || error instanceof BoxCliToolHandoffError
+                || (error instanceof BoxToolContinuationError
+                  && error.code === "BOX_TOOL_TERMINAL_UNPROVEN")
+                || isBoxExecRejectedError(error)) {
                 await this.stopEchoRejected(args, claim);
               }
               throw error;
@@ -649,6 +704,11 @@ export class BoxToolFetch {
                 target, args.uid, plan.leaseEpoch),
               retainCleanupTarget: (handle) => this.retainCleanup(handle),
               ...(this.deps.stopRejectedRun ? { stopRejectedRun: this.deps.stopRejectedRun } : {}),
+            }).catch(async (error: unknown) => {
+              if (error instanceof BoxSpoolTerminalError) {
+                await this.convergeTerminalFailure(args, error, false);
+              }
+              throw error;
             });
             acknowledge(); // injected completed runner compatibility; live path acks at launch
             this.own(outcome.plan.runNonce, outcome.target,

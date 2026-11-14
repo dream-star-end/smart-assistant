@@ -383,8 +383,6 @@ export async function handleConsultAdvisor(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  if (!isEngineLocalTurnExempt())
-    return this.sendError(res, 404, 'advisor consult is selfhost only')
   if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
   const body = await this.readBody(req)
   let parsed: { question?: unknown; concern?: unknown }
@@ -1267,7 +1265,7 @@ export async function _spawnAdvisorConsult(
     }
     const execution = await resolveLocalExecutionIfEnforced({
       agent,
-      kind: 'turn',
+      kind: 'billed_advisor',
       model: input.snapshot.advisorModel,
       defaultModel: this.deps.config.defaults.model,
     })

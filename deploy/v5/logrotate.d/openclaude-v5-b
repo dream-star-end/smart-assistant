@@ -1,0 +1,21 @@
+# Commercial B-slot master log only (OCV5-579). Not installed by deploy-v5.sh.
+# The host-managed openclaude-v5 snippet covers the A-slot log but not this
+# file; openclaude-v5-b.service appends to it
+# via StandardOutput=append:, so systemd holds the fd open.
+# maxsize is checked when logrotate runs, not a realtime cap.
+# copytruncate keeps the live inode; bytes written between copy and
+# truncate can be dropped. This is not a lossless audit log.
+# su matches the global "su root adm" in /etc/logrotate.conf. /var/log is
+# root:syslog and group-writable, so logrotate 3.21 skips the file without su
+# when this snippet is read on its own.
+/var/log/openclaude-v5-b.log {
+    su root adm
+    daily
+    maxsize 200M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

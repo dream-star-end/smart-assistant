@@ -1,5 +1,5 @@
 import { AlertTriangle, RotateCcw, X } from "lucide-react";
-import { ErrorTechDetails } from "./chat/lazyTurnErrorNotice";
+import { ErrorTechDetails } from "./ErrorTechDetails";
 import { Button, IconButton } from "./ui";
 
 /** 一次失败的对话发送：错误文案、可选追踪号、用于重试的原文。 */

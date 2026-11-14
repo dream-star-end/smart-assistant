@@ -13,6 +13,7 @@ import { getModelStrings } from 'src/utils/model/modelStrings.js'
 import { getAPIProvider } from 'src/utils/model/providers.js'
 import {
   getIsNonInteractiveSession,
+  getIsToolOnly,
   preferThirdPartyAuthentication,
 } from '../bootstrap/state.js'
 import {
@@ -230,6 +231,11 @@ export function getAnthropicApiKeyWithSource(
   key: null | string
   source: ApiKeySource
 } {
+  // Local tool execution has no inference identity. Tool descriptions and
+  // Skill may inspect auth metadata, but must never require or retrieve a key.
+  // Ordinary CLI/CI authentication remains unchanged.
+  if (getIsToolOnly()) return { key: null, source: 'none' }
+
   // --bare: hermetic auth. Only ANTHROPIC_API_KEY env or apiKeyHelper from
   // the --settings flag. Never touches keychain, config file, or approval
   // lists. 3P (Bedrock/Vertex/Foundry) uses provider creds, not this path.

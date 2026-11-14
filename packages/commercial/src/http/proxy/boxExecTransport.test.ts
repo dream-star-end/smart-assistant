@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { BoxExecTransport, BoxExecTransportError } from "./boxExecTransport.js";
+import { BOX_EXEC_REJECTION_READ_BYTES, BoxExecTransport, BoxExecTransportError,
+  redactBoxExecRejection } from "./boxExecTransport.js";
 
 const target = {
   execUrl: "https://box.example.test/connect.exec.v1.ExecService/Exec",
@@ -214,6 +215,143 @@ describe("bounded Box Connect Exec transport", () => {
       if (timeout) clearTimeout(timeout);
       await second.cancel();
     }
+  });
+});
+
+describe("OCV5-762 Exec 417: refresh the descriptor before the next call", () => {
+  const fresh = {
+    execUrl: "https://box2.example.test/agent.v1.ControlService/Exec",
+    execToken: "synthetic-fresh-exec-secret",
+    networkToken: "synthetic-fresh-network-secret",
+  };
+  const ok = () => streamResponse(frame({ stdoutEvent: { data: "ok" } }), frame({ exitEvent: {} }), frame({}, 2));
+  const refused = () => new Response(JSON.stringify({ code: "failed_precondition",
+    message: "exec session expectation failed",
+    detail: `Bearer ${target.execToken} ${target.networkToken} eyJhbGciOi.eyJzdWIiOiJ4.c2ln https://api2.cursor.sh/x?token=abc ${"f".repeat(40)}` }),
+  { status: 417 });
+
+  it("a 417 is not retried by the transport; the next call uses a refreshed descriptor", async () => {
+    const seen: Array<{ url: string; auth: string; network: string }> = [];
+    let refreshes = 0;
+    const rejections: Array<{ status: number; bodyBytes: number; excerpt: string }> = [];
+    const transport = new BoxExecTransport(target, async (url, init) => {
+      const headers = init.headers as Record<string, string>;
+      seen.push({ url, auth: headers.authorization!, network: headers["x-anyrun-network-token"]! });
+      return seen.length === 1 ? refused() : ok();
+    }, async () => {}, { refreshTarget: async () => { refreshes++; return fresh; },
+      onRejected: (rejection) => rejections.push(rejection) });
+    const error = await code(transport.run(request, { timeoutMs: 2000 }));
+    assert.equal(error.code, "BOX_EXEC_HTTP_417");
+    assert.equal(seen.length, 1);
+    assert.equal(refreshes, 0);
+    assert.equal(rejections.length, 1);
+    const excerpt = rejections[0]!.excerpt;
+    assert.match(excerpt, /exec session expectation failed/);
+    for (const secret of [target.execToken, target.networkToken, fresh.execToken, "eyJhbGciOi", "token=abc", "f".repeat(40)]) {
+      assert.ok(!excerpt.includes(secret), secret);
+    }
+    assert.ok(excerpt.length <= 301);
+    assert.deepEqual(await transport.run(request, { timeoutMs: 2000 }), { stdout: "ok", stderrBytes: 0, exitCode: 0 });
+    assert.equal(refreshes, 1);
+    assert.deepEqual(seen[1], { url: fresh.execUrl, auth: `Bearer ${fresh.execToken}`, network: fresh.networkToken });
+    await transport.run(request, { timeoutMs: 2000 });
+    assert.equal(refreshes, 1, "a successful refresh is not repeated");
+    assert.equal(seen[2]!.url, fresh.execUrl);
+  });
+
+  it("a failed or invalid refresh sends nothing and is BOX_EXEC_REFRESH_FAILED", async () => {
+    for (const refreshTarget of [async () => { throw new Error(`denied ${target.execToken}`); },
+      async () => ({ ...fresh, execUrl: "http://box2.example.test/Exec" }),
+      async () => ({ ...fresh, execToken: "" })]) {
+      let calls = 0;
+      const transport = new BoxExecTransport(target, async () => { calls++; return refused(); },
+        async () => {}, { refreshTarget });
+      assert.equal((await code(transport.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_HTTP_417");
+      assert.equal((await code(transport.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_REFRESH_FAILED");
+      assert.equal(calls, 1);
+    }
+  });
+
+  it("a hung refresh fails on its own deadline and the next call refreshes again", async () => {
+    let calls = 0;
+    let refreshes = 0;
+    let firstAborted = false;
+    const transport = new BoxExecTransport(target, async () => { calls++; return calls === 1 ? refused() : ok(); },
+      async () => {}, { refreshTimeoutMs: 200, refreshTarget: (signal) => {
+        refreshes++;
+        if (refreshes > 1) return Promise.resolve(fresh);
+        return new Promise((_, reject) => signal.addEventListener("abort", () => {
+          firstAborted = true;
+          reject(new Error("aborted"));
+        }, { once: true }));
+      } });
+    assert.equal((await code(transport.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_HTTP_417");
+    assert.equal((await code(transport.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_REFRESH_FAILED");
+    assert.ok(firstAborted, "the hung refresh is aborted at its deadline");
+    assert.equal(calls, 1);
+    assert.deepEqual(await transport.run(request, { timeoutMs: 2000 }), { stdout: "ok", stderrBytes: 0, exitCode: 0 });
+    assert.equal(refreshes, 2);
+  });
+
+  it("running out of time during a refresh is BOX_EXEC_REFRESH_FAILED; a caller abort stays ABORTED", async () => {
+    let calls = 0;
+    const transport = new BoxExecTransport(target, async () => { calls++; return refused(); },
+      async () => {}, { refreshTimeoutMs: 1300, refreshTarget: (signal) => new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }) });
+    assert.equal((await code(transport.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_HTTP_417");
+    const caller = new AbortController();
+    setTimeout(() => caller.abort(), 50);
+    assert.equal((await code(transport.run(request, { timeoutMs: 2000, signal: caller.signal }))).code, "BOX_EXEC_ABORTED");
+    assert.equal((await code(transport.run(request, { timeoutMs: 1000 }))).code, "BOX_EXEC_REFRESH_FAILED");
+    assert.equal(calls, 1);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  });
+
+  it("the account guard runs again after a refresh, before anything is sent", async () => {
+    let calls = 0;
+    let guards = 0;
+    const transport = new BoxExecTransport(target, async () => { calls++; return refused(); },
+      async () => { guards++; if (guards === 3) throw new Error("credential changed"); },
+      { refreshTarget: async () => fresh });
+    assert.equal((await code(transport.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_HTTP_417");
+    assert.equal((await code(transport.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_ACCOUNT_GUARD_FAILED");
+    assert.equal(guards, 3);
+    assert.equal(calls, 1);
+  });
+
+  it("other HTTP failures never refresh, and without a refresher a 417 keeps the descriptor", async () => {
+    let refreshes = 0;
+    const urls: string[] = [];
+    const statuses = [503, 200];
+    const t1 = new BoxExecTransport(target, async (url) => {
+      urls.push(url);
+      const status = statuses.shift()!;
+      return status === 200 ? ok() : new Response("busy", { status });
+    }, async () => {}, { refreshTarget: async () => { refreshes++; return fresh; } });
+    assert.equal((await code(t1.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_HTTP_503");
+    await t1.run(request, { timeoutMs: 2000 });
+    assert.equal(refreshes, 0);
+    assert.deepEqual(urls, [target.execUrl, target.execUrl]);
+    let calls = 0;
+    const t2 = new BoxExecTransport(target, async (url) => {
+      calls++;
+      assert.equal(url, target.execUrl);
+      return calls === 1 ? refused() : ok();
+    }, async () => {});
+    assert.equal((await code(t2.run(request, { timeoutMs: 2000 }))).code, "BOX_EXEC_HTTP_417");
+    await t2.run(request, { timeoutMs: 2000 });
+  });
+
+  it("the rejection excerpt is bounded and reads at most 2048 body bytes", () => {
+    const body = Buffer.from(`${"word ".repeat(1000)}\u0000\u0007 Bearer abc.def ${"x".repeat(5000)}`);
+    const excerpt = redactBoxExecRejection(body);
+    assert.ok(excerpt.length <= 301);
+    assert.ok(Array.from(excerpt).every((ch) => (ch.codePointAt(0) ?? 0) >= 0x20), "no control characters");
+    assert.equal(redactBoxExecRejection(Buffer.from("plain short reason")), "plain short reason");
+    assert.equal(redactBoxExecRejection(Buffer.from("use synthetic-secret here"), ["synthetic-secret"]),
+      "use <redacted> here");
+    assert.equal(BOX_EXEC_REJECTION_READ_BYTES, 2048);
   });
 });
 

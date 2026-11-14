@@ -83,7 +83,7 @@ import { selectOpenAiPlatformKey } from "../openai/openAiPlatformKey.js";
 import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import { boxGptWebContainerEnv, isCursorCredentialMember } from "../cursor/access.js";
 import {
   removeCodexContainerAuthDir,
   writeCodexContainerAuthFile,
@@ -1122,48 +1122,8 @@ export async function acquireHostCapLock(
     [HOST_CAP_LOCK_NS, hostIdToLockKey(hostUuid)],
   );
 }
-
-// ───────────────────────────────────────────────────────────────────────
-// 公共类型
-// ───────────────────────────────────────────────────────────────────────
-
-/**
- * v5 runtime tuple(热生效改造,plan §1)。仅 v5 channel + 显式配置时真正生效。
- *
- * 分工:
- *   - provision:挂平台稳定根(→ /run/oc/platform:ro)+ release(→ /opt/openclaude:ro)、
- *     打 4 个 runtime label、注入 3 个平台 env。**昂贵的全量 bundle 校验(逐文件 sha256)
- *     不在这里做**,而在 index.ts 启动期一次性 resolvePlatformBundleMount / resolveRuntimeReleaseMount
- *     完成后把结果(bundleRev/bootHash/resolved 路径)灌进本结构;provision 每次只做便宜的
- *     `assertCurrentMatches`(current symlink realpath 对照,防激活中间态)。
- *   - ensureRunning:desired 三元组(imageId / release / bootHash)做 runtimeStale 判定。
- *
- * 字段全 optional:未配置(v3 常态)→ 整套逻辑跳过,provision/ensureRunning 行为逐字节同旧。
- */
-export interface V3RuntimeTuple {
-  /**
-   * OC_RUNTIME_IMAGE_ID —— 部署时验证过的 immutable image ID(sha256:...)。
-   * label image_id 值 + runtimeStale 的 desired imageId。缺省 → runtimeStale 回落 tag 比较
-   * (过渡兼容;**部署后必填**,否则同 tag 重指新镜像漏判,见 plan §1.1 R2-M4)。
-   */
-  imageId?: string;
-  /** OC_PLATFORM_BUNDLE —— bundles/<bundleRev12>(内容 digest 命名)。assertCurrentMatches 对照目标。 */
-  bundlePath?: string;
-  /** 启动期解析:bundle realpath(== platform current 目标)。 */
-  bundleResolvedPath?: string;
-  /** 启动期解析:bundleRev(= digest12 = bundle 目录名)。label bundle_rev。 */
-  bundleRev?: string;
-  /** 启动期解析:bootHash(entrypoint/+seed/ 子集)。label boot_hash + runtimeStale desired。 */
-  bootHash?: string;
-  /** OC_RUNTIME_RELEASE —— releases/rel-<digest12>。 */
-  releasePath?: string;
-  /** 启动期解析:release realpath(bind /opt/openclaude:ro 的源;绝不挂 symlink)。 */
-  releaseResolvedPath?: string;
-  /** 平台稳定根(默认 DEFAULT_PLATFORM_ROOT);挂 /run/oc/platform:ro + assertCurrentMatches。 */
-  platformRoot?: string;
-  /** releases 根(默认 DEFAULT_RUNTIME_RELEASES_ROOT);release realpath 必在其下。 */
-  releasesRoot?: string;
-}
+import type { V3RuntimeTuple } from "./v3RuntimeTupleTypes.js";
+export type { V3RuntimeTuple } from "./v3RuntimeTupleTypes.js";
 
 /**
  * 读 env `OC_PLATFORM_BUNDLE_OPTIONAL`:**只认 "1"**(fail-closed)。
@@ -2910,6 +2870,9 @@ export async function provisionV3Container(
     // envProbe 把它渲染进 ENV prompt slot(user_tz=…),让模型不再把子进程 `date` 当用户
     // 时间。只透传合法 IANA 名;缺省/非法不注入,容器侧自行回落 Asia/Shanghai。
     env.push(...resolveUserTimeZoneEnv(process.env.OC_USER_TZ));
+    // OCV5-575: the container gateway launches the Box ChatGPT Web runner only when the master marks
+    // this container's uid as allowed (OC_BOX_GPT_WEB_ALLOWED_UIDS). Always written, 1 or 0.
+    env.push(boxGptWebContainerEnv(uid));
     const promptQueueEnabled = getRuntimeChannel() === "v5" && isPromptQueueV1Enabled();
     if (promptQueueEnabled) {
       // Both halves of the container-side strict gate are server-authored.
@@ -3042,6 +3005,10 @@ export async function provisionV3Container(
         }
         env.push("OC_SELFHOST_ENGINE_LOCAL_TURNS=1");
       }
+      // 顾问引擎开放名单由 master 单向下发(默认不开;过真实蜜罐验证后运维在 master env 设
+      // OC_ADVISOR_OPEN_ENGINES=codex)。只放行已知引擎名,其它值不注入。
+      const advisorOpen = advisorOpenEnginesEnv(process.env.OC_ADVISOR_OPEN_ENGINES);
+      if (advisorOpen) env.push(advisorOpen);
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master
       // 单向下发**:master 签发 authority 时把它列进 auxModels(egress 据此放行),这里注入同一
       // 值让容器实际用它 —— 二者同源,消除"master 签 A、容器发 B"的版本 skew(master 与
@@ -4337,4 +4304,12 @@ export async function preheatV3Image(
     logger?.warn?.("[v3 preheat] image pull failed; first provision will pay latency", { image, error: message });
     return { image, outcome: "error", error: message, durationMs };
   }
+}
+
+/** `OC_ADVISOR_OPEN_ENGINES=<list>` for the container, or null. Only `codex` is a known advisor engine. */
+export function advisorOpenEnginesEnv(raw: string | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const engines = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (engines.length === 0 || engines.some((e) => e !== "codex")) return null;
+  return `OC_ADVISOR_OPEN_ENGINES=${[...new Set(engines)].join(",")}`;
 }

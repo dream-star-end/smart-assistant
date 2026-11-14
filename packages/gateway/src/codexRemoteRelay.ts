@@ -535,6 +535,10 @@ export class CodexRemoteRelay {
       this.localStopped = true
       this.record('local-stopped', { generation: this.binding.generation, authorityTurnId: v.authorityTurnId, turnKey: v.turnKey })
       this.localStops.emit('stopped')
+      // A previous bounded stop can have timed out before this genuine local
+      // proof arrived. Join it, or retry its idempotent closure now that both
+      // stop proofs can be established; never leave an undispatched claim live.
+      await this.stop()
     }
     else if (path === '/renew') { this.verify(this.admitted!.authority, v.lease, true); this.admitted!.lease = v.lease; this.arm(v.lease) }
     else if (path === '/abandon') { await this.abandon(v); result = { abandoned: true } }

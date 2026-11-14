@@ -28,6 +28,7 @@ export const LEDGER_REASON_LABEL: Record<string, string> = {
   subscription: "订阅额度到账",
   subscription_expire: "周期额度结清",
   agent_open: "开通智能体",
+  muse_media: "Muse 图片/视频",
 };
 
 /** 退费 memo `waive:<code>;turn:<hash>` 的 code → 用户说明(#1237)。 */
@@ -116,8 +117,7 @@ export function apiRequestStatusLabel(status: string | null | undefined): string
   return API_REQUEST_STATUS_LABEL[status] || status;
 }
 
-/** 思考深度档位（preferences.default_effort 枚举；具体模型支持集由 API 决定）。 */
-export { EFFORT_OPTIONS } from "../../lib/modelPreferences";
+export { EFFORT_OPTIONS } from "./effortOptions";
 
 /** 订单状态 → 中文（虎皮椒：pending|paid|expired|canceled）。 */
 export function orderStatusLabel(status: string): string {

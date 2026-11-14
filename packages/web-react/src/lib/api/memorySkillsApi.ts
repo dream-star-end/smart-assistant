@@ -10,7 +10,6 @@ import type {
   AuthSession,
   CommunityTutorialCategory,
   CommunityTutorialDraft,
-  TutorialKind,
   TutorialSnapshotDraft,
   CronCreateInput,
   CronJob,
@@ -29,7 +28,11 @@ import type {
   AutoDreamOptimizerState,
   MemoryFileContent,
   PutMemoryFileResult,
-} from "../types";
+  CommunityBlogPrecheck,
+  TutorialImageUpload,
+  CommunityTutorialReviseResult,
+  TutorialKind,
+} from "../types";;;
 import {
   callWithRefresh,
   assertAuthResponseCurrent,

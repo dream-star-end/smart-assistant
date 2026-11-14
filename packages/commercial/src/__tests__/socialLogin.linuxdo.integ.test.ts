@@ -102,6 +102,13 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   return false
 }
 
+let testIpSeq = 0
+/** 每次一个新 IP:这里的用例不验同 IP 上限,不让它们互相占名额。 */
+function nextTestIp(): string {
+  testIpSeq += 1
+  return `198.51.${Math.floor(testIpSeq / 250)}.${(testIpSeq % 250) + 1}`
+}
+
 describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
   test('first login (TL2) creates user + identity and bootstraps the free plan', async (t) => {
     if (skipIfNoPg(t)) return
@@ -114,7 +121,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
         trustLevel: 2,
         avatarUrl: 'https://cdn.linux.do/u/12345.png',
       },
-      { jwtSecret: testJwtSecret, userAgent: 'test-ua', bindIp: '127.0.0.1' },
+      { jwtSecret: testJwtSecret, registrationIp: nextTestIp(), userAgent: 'test-ua', bindIp: '127.0.0.1' },
     )
 
     assert.equal(result.isNew, true)
@@ -201,7 +208,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
         trustLevel: 1,
         avatarUrl: null,
       },
-      { jwtSecret: testJwtSecret },
+      { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
     )
     assert.equal(r1.isNew, true)
 
@@ -214,7 +221,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
         trustLevel: 3,
         avatarUrl: 'https://cdn.linux.do/u/777_v2.png',
       },
-      { jwtSecret: testJwtSecret },
+      { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
     )
     assert.equal(r2.isNew, false)
     assert.equal(r2.user.id, r1.user.id)
@@ -254,7 +261,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
         trustLevel: null,
         avatarUrl: null,
       },
-      { jwtSecret: testJwtSecret },
+      { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
     )
     await query(`UPDATE users SET status='banned' WHERE id=$1`, [r1.user.id])
 
@@ -268,10 +275,62 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
           trustLevel: null,
           avatarUrl: null,
         },
-        { jwtSecret: testJwtSecret },
+        { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
       ),
       (err: unknown) => err instanceof SocialLoginError && err.code === 'USER_DISABLED',
     )
+  })
+
+  // ── 同 IP 账号上限(2026-11-06):社交建号与邮箱注册共用名额 ──────
+  const capIp = '203.0.113.9'
+  const ldc = (id: string) => ({
+    provider: 'linuxdo' as const,
+    providerUserId: id,
+    username: `u${id}`,
+    email: null,
+    trustLevel: 1,
+    avatarUrl: null,
+  })
+  const seedIpAccounts = async (n: number): Promise<void> => {
+    for (let i = 0; i < n; i += 1) {
+      await query(
+        `INSERT INTO users(email, password_hash, registration_ip) VALUES ($1, 'x', $2::inet)`,
+        [`seed${i}@example.com`, capIp],
+      )
+    }
+  }
+  const isIpLimit = (err: unknown): boolean =>
+    err instanceof SocialLoginError && err.code === 'IP_REGISTRATION_LIMIT'
+
+  test('new SSO account stores registration_ip and counts against the shared quota', async (t) => {
+    if (skipIfNoPg(t)) return
+    await seedIpAccounts(2)
+    const r = await socialLoginOrCreate(ldc('9001'), { jwtSecret: testJwtSecret, registrationIp: capIp })
+    const stored = await query<{ ip: string }>(
+      'SELECT host(registration_ip) AS ip FROM users WHERE id = $1',
+      [r.user.id],
+    )
+    assert.equal(stored.rows[0]?.ip, capIp)
+    await assert.rejects(
+      socialLoginOrCreate(ldc('9002'), { jwtSecret: testJwtSecret, registrationIp: capIp }),
+      isIpLimit,
+    )
+    const identities = await query(`SELECT 1 FROM oauth_identities WHERE provider_user_id = '9002'`)
+    assert.equal(identities.rows.length, 0)
+  })
+
+  test('existing SSO user still logs in from a full IP', async (t) => {
+    if (skipIfNoPg(t)) return
+    const first = await socialLoginOrCreate(ldc('9003'), { jwtSecret: testJwtSecret, registrationIp: nextTestIp() })
+    await seedIpAccounts(3)
+    const again = await socialLoginOrCreate(ldc('9003'), { jwtSecret: testJwtSecret, registrationIp: capIp })
+    assert.equal(again.user.id, first.user.id)
+    assert.equal(again.isNew, false)
+  })
+
+  test('new SSO account without a usable client IP fails closed', async (t) => {
+    if (skipIfNoPg(t)) return
+    await assert.rejects(socialLoginOrCreate(ldc('9004'), { jwtSecret: testJwtSecret, registrationIp: undefined }), isIpLimit)
   })
 
   // ── allowCreate gate(2026-05-25 注册关停)─────────────────────────
@@ -294,7 +353,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
           trustLevel: 2,
           avatarUrl: null,
         },
-        { jwtSecret: testJwtSecret, allowCreate: false },
+        { jwtSecret: testJwtSecret, registrationIp: nextTestIp(), allowCreate: false },
       ),
       (err: unknown) =>
         err instanceof SocialLoginError && err.code === 'REGISTRATION_DISABLED',
@@ -321,7 +380,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
         trustLevel: 1,
         avatarUrl: null,
       },
-      { jwtSecret: testJwtSecret, allowCreate: true },
+      { jwtSecret: testJwtSecret, registrationIp: nextTestIp(), allowCreate: true },
     )
     assert.equal(seeded.isNew, true)
 
@@ -335,7 +394,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
         trustLevel: 2,
         avatarUrl: 'https://cdn.linux.do/u/8002.png',
       },
-      { jwtSecret: testJwtSecret, allowCreate: false },
+      { jwtSecret: testJwtSecret, registrationIp: nextTestIp(), allowCreate: false },
     )
     assert.equal(r.isNew, false)
     assert.equal(r.user.id, seeded.user.id)
@@ -364,7 +423,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
           trustLevel: null,
           avatarUrl: null,
         },
-        { jwtSecret: testJwtSecret },
+        { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
       ),
       (err: unknown) => err instanceof SocialLoginError && err.code === 'INVALID_INPUT',
     )
@@ -386,7 +445,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
           trustLevel: 1,
           avatarUrl: null,
         },
-        { jwtSecret: testJwtSecret },
+        { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
       ),
       socialLoginOrCreate(
         {
@@ -397,7 +456,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
           trustLevel: 1,
           avatarUrl: null,
         },
-        { jwtSecret: testJwtSecret },
+        { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
       ),
     ])
     // 两个都要 fulfilled(没人因 23505 失败)
@@ -449,7 +508,7 @@ describe('auth.socialLoginOrCreate (linuxdo) — 免费档与 TL 无关', () => 
           trustLevel: tier.tl,
           avatarUrl: null,
         },
-        { jwtSecret: testJwtSecret },
+        { jwtSecret: testJwtSecret, registrationIp: nextTestIp() },
       )
       assert.equal(result.isNew, true)
       assert.equal(result.user.credits, '300')

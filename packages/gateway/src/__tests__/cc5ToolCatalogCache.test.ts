@@ -126,11 +126,14 @@ async function harness(options: { seed?: keyof typeof TOOLS; live: keyof typeof 
   const socketPath = join(f.root, 'bridge.sock')
   const recorder: Recorder = { events: [], registers: [], refuseRelaunch: options.refuseRelaunch ?? false,
     executed: [] }
+  const key = cc5ToolCatalogCacheKey(f.lane.host)
+  // Fail a missing build before opening a socket; otherwise a prerequisite failure
+  // leaks this server and stalls the whole gateway job instead of reporting red.
+  if (!key) f.cleanup()
+  assert.ok(key, 'build CCB before exercising its real tool catalog cache identity')
   const server = controlServer(socketPath, recorder)
   server.listen(socketPath)
   await new Promise<void>((resolve) => server.once('listening', () => resolve()))
-  const key = cc5ToolCatalogCacheKey(f.lane.host)
-  assert.ok(key)
   if (options.seed) writeCc5ToolCatalogCache(f.executionRoot, key, catalog(options.seed))
   let releaseTools!: () => void
   const toolsGate = new Promise<void>((resolve) => {
