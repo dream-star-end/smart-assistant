@@ -44,6 +44,7 @@ import {
 } from '../billing/antigravitySettle.js'
 import {
   expireAntigravityRelayRoute,
+  expireAntigravityRelayRouteForRequest,
   resolveAntigravityRelayRoute,
 } from '../billing/antigravityRouteContext.js'
 import {
@@ -85,6 +86,7 @@ export interface DelegateAntigravityRouteDeps {
   recordTurn?: typeof recordAntigravityTurn
   abandonTurn?: typeof abandonAntigravityTurn
   expireRoute?: (token: string) => Promise<void>
+  expireRequest?: typeof expireAntigravityRelayRouteForRequest
   resolveRoute?: typeof resolveAntigravityRelayRoute
   releaseInflightFn?: typeof releaseInflight
   /** Optional live spendable balance lookup; falls back to journal antigravityBudgetCredits / precheck_credits. */
@@ -411,6 +413,7 @@ export function makeDelegateAntigravityRouteHandler(
     const userId = BigInt(identity.userId)
 
     if (path === DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH) {
+      let ownedRequestId: string | undefined
       // Idempotent terminal cleanup: unknown/already-expired is success.
       let owned = false
       try {
@@ -418,7 +421,9 @@ export function makeDelegateAntigravityRouteHandler(
           token: routeToken,
           containerId: identity.containerId,
           userId,
+          ownershipOnly: true,
         })
+        ownedRequestId = route?.requestId
         owned = route !== null
       } catch (err) {
         log.error('delegate_antigravity_route_release_lookup_failed', {
@@ -435,6 +440,7 @@ export function makeDelegateAntigravityRouteHandler(
         return
       }
       try {
+        if (ownedRequestId) await (deps.expireRequest ?? expireAntigravityRelayRouteForRequest)(ownedRequestId)
         await runExpire(routeToken)
       } catch (err) {
         log.error('delegate_antigravity_route_release_failed', {
@@ -464,7 +470,7 @@ export function makeDelegateAntigravityRouteHandler(
           requestId,
           err: (err as Error).message,
         })
-        sendJson(res, 500, { error: { code: 'INTERNAL', message: 'route renew failed' } })
+        sendJson(res, 503, { error: { code: 'ANTIGRAVITY_AUTHORITY_UNAVAILABLE', message: 'route renew unavailable' } })
         return
       }
       sendJson(res, 200, { ok: live, ...(live ? {} : { expired: true }) })

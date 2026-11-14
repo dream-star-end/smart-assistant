@@ -450,8 +450,8 @@ describe('internalDelegateAntigravityRoute', () => {
     })
     assert.deepEqual(expired, [ROUTE_TOKEN], 'unknown/already-expired release is a no-op')
     assert.deepEqual(resolved, [
-      { token: ROUTE_TOKEN, containerId: 11, userId: 42n },
-      { token: ROUTE_TOKEN, containerId: 11, userId: 42n },
+      { token: ROUTE_TOKEN, containerId: 11, userId: 42n, ownershipOnly: true },
+      { token: ROUTE_TOKEN, containerId: 11, userId: 42n, ownershipOnly: true },
     ])
   })
 

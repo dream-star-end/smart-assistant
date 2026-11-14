@@ -1,3 +1,4 @@
+import * as routeContext from '../billing/antigravityRouteContext.js'
 /**
  * Antigravity relay (OCV5-415 P2): route binding, method/model allowlists,
  * token injection, per-call metering, budget stop, interim pool policy and
@@ -1383,4 +1384,32 @@ describe('P1 real HTTP transport (no Google traffic)', () => {
       }
     })
   }
+})
+
+
+test('INC-20261112-AGY-ROUTE-LIFETIME: authority outage is 503 and never invokes upstream', async () => {
+  const token = await mintRoute()
+  const res = await relay(`${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:loadCodeAssist`,
+    { body: '{}' }, { status: 200, body: ['{}'] },
+    { resolveRoute: async () => { throw new Error('PG unavailable') } })
+  assert.equal(res.status, 503)
+  assert.match(res.text, /ANTIGRAVITY_AUTHORITY_UNAVAILABLE/)
+  assert.equal(res.captured.calls, 0)
+})
+
+
+test('INC-20261112-AGY-ROUTE-LIFETIME: actual resolver keeps an authorized turn beyond the old ceiling', async () => {
+  _resetAntigravityRelayRoutesForTests()
+  // Optional only so this exact regression can execute on the unfixed parent.
+  // The HTTP+PG+Redis integration suite proves the real authorization source.
+  routeContext.configureAntigravityRelayAuthority?.(async () => 'active')
+  try {
+    const minted = await mintAntigravityRelayRoute({ containerId: 11, userId: 42,
+      requestId: REQUEST_ID, modelId: 'antigravity-gemini-3.8-flash', accountId: 7n,
+      budgetCredits: 1000n, relayPort: 18789, nowMs: 0 })
+    for (let minute = 31; minute <= 496; minute += 31) {
+      assert.ok(await resolveAntigravityRelayRoute({ token: minted.token, containerId: 11,
+        userId: 42, nowMs: minute * 60_000 }), `active route must survive ${minute} minutes`)
+    }
+  } finally { _resetAntigravityRelayRoutesForTests() }
 })

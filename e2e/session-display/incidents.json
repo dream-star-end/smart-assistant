@@ -4357,6 +4357,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
           "assertion": "oauth + fallback-credit 多值 → 全过"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "cc-fallback-beta-http"
         }
       ],
       "coverageCommits": [
@@ -10631,6 +10636,35 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/model-switch-cost-continue.node-test.mjs",
           "assertion": "a zero-token crashed first turn continues on the same model without a cost dialog"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261112-AGY-ROUTE-LIFETIME",
+      "occurredAt": "2026-11-12",
+      "severity": "P1",
+      "symptom": "An active Antigravity turn outlived the fixed six-hour relay ceiling. Roll only against live authoritative chat/delegate ownership, atomically retain reverse index, heartbeat silent tools, deny Stop/terminal and protect live turns from stale settlement. Legacy prompt-queue without a dispatch remains bounded; already expired routes are not revived. Delegate existing 720-minute heartbeat/journal retention boundaries are not bypassed. A re-mint of the same request invalidates the older token; legacy already-settled turns now deny further routing.",
+      "rootFixCommit": "81f0fea1",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/antigravitySettle.integ.test.ts",
+          "assertion": "HTTP heartbeat crosses six hours then Stop blocks upstream"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/antigravitySettle.integ.test.ts",
+          "assertion": "Redis terminal CAS wins over delayed renew even after revocation marker GC"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/antigravityRelay.test.ts",
+          "assertion": "authority outage is 503 and never invokes upstream"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "antigravity-route-heartbeat"
         }
       ]
     },

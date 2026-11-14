@@ -111,11 +111,7 @@ import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRel
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
 import { ANTIGRAVITY_RELAY_PREFIX, makeAntigravityRelayHandler } from "../http/internalAntigravityRelay.js";
-import {
-  configureAntigravityModelCooldownStore,
-  createIoredisAntigravityModelCooldownStore,
-} from "../account-pool/antigravityModelCooldown.js";
-import { configureAntigravityRelayKv } from "../billing/antigravityRouteContext.js";
+import { configureAntigravityRouteStores } from "../http/antigravityRouteRuntime.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -208,8 +204,7 @@ export async function startEgress(): Promise<void> {
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
+  configureAntigravityRouteStores({ redis, pool: getPool() });
   const pricing = new PricingCache();
   try {
     await pricing.load();

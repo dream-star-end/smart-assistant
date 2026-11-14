@@ -313,3 +313,19 @@ export async function acquireDelegateAntigravityRoute(args: {
     reason: `master antigravity route mint HTTP ${mint.statusCode}: ${errorText(mint)}`,
   }
 }
+
+/** Main turns use the same identity-scoped renew endpoint, never the mint endpoint. */
+export async function renewAntigravityRouteLease(
+  routeToken: string,
+  opts: { env?: NodeJS.ProcessEnv; fetcher?: typeof undiciRequest } = {},
+): Promise<void> {
+  const env = opts.env ?? process.env
+  if (env.OC_SELFHOST_ENGINE_LOCAL_TURNS !== '1') return
+  const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.replace(/\/+$/, '')
+  const bearer = env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  if (!base || !bearer || !ROUTE_TOKEN_RE.test(routeToken)) return
+  const result = await postJson(opts.fetcher ?? undiciRequest, `${base}${RENEW_PATH}`,
+    bearer, { routeToken }, RENEW_RELEASE_TIMEOUT_MS)
+  if (result.statusCode !== 200) throw new Error(`Antigravity route renewal HTTP ${result.statusCode}`)
+  if (JSON.parse(result.text)?.ok !== true) throw new Error('Antigravity route renewal rejected')
+}

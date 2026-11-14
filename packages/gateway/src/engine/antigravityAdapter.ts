@@ -1,3 +1,4 @@
+import { renewAntigravityRouteLease } from '../delegateAntigravityRoute.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment } from '@openclaude/storage'
@@ -110,7 +111,7 @@ function antigravitySpawnPath(hostPathDir: string | null): string {
   return hostPathDir ? `${hostPathDir}:${ANTIGRAVITY_SPAWN_PATH}` : ANTIGRAVITY_SPAWN_PATH
 }
 
-let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null = null
+let timingTestHooks: { keepaliveMs?: number; routeRenewMs?: number; renewRoute?: typeof renewAntigravityRouteLease; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null = null
 const STDERR_MAX_CHARS = 64 * 1024
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** 1.3.4 without usable credentials prints an OAuth URL and blocks for 60 s. */
@@ -195,6 +196,9 @@ interface TurnContext {
   pendingResult: Record<string, unknown> | null
   resultTimer: NodeJS.Timeout | null
   keepalive: NodeJS.Timeout | null
+  routeToken: string | null
+  routeRenewAt: number
+  routeRenewBusy: boolean
   /** Ends this turn's route-token trace binding for the container relay (OCV5-595). */
   releaseRelayTrace: (() => void) | null
   sawOutput: boolean
@@ -393,6 +397,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       pendingResult: null,
       resultTimer: null,
       keepalive: null,
+      routeToken: null,
+      routeRenewAt: 0,
+      routeRenewBusy: false,
       releaseRelayTrace: null,
       sawOutput: false,
       terminal: false,
@@ -578,6 +585,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       throw new Error('ANTIGRAVITY_RESUME_BASELINE_UNKNOWN: native launch boundary unavailable')
     }
     if (ctx.requestedConversationId) args.push('--conversation', ctx.requestedConversationId)
+    ctx.routeToken = route.routeToken
+    ctx.routeRenewAt = Date.now()
     ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     this.spawnChild(ctx, { bin, args, env, cwd: cwdDecision.cwd, line })
   }
@@ -1232,6 +1241,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
       this.lastActivityAt = Date.now()
       this.emit('activity')
+      // CLI stdout and browser WS may both be idle during a long native tool.
+      // Renew only this live execution; metadata is not our liveness proof.
+      if (!ctx.interrupted && !ctx.procClosed && ctx.routeToken && !ctx.routeRenewBusy &&
+          Date.now() - ctx.routeRenewAt >= (timingTestHooks?.routeRenewMs ?? 60_000)) {
+        ctx.routeRenewAt = Date.now()
+        ctx.routeRenewBusy = true
+        void (timingTestHooks?.renewRoute ?? renewAntigravityRouteLease)(ctx.routeToken)
+          .catch(() => log.warn('antigravity route heartbeat unavailable', {
+            sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId,
+          }))
+          .finally(() => { ctx.routeRenewBusy = false })
+      }
     }, timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS)
     ctx.keepalive.unref()
   }
@@ -1343,7 +1364,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 export const _internals = {
   promptText,
   assemblePrompt,
-  setTimingTestHooks(hooks: { keepaliveMs?: number; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null): void {
+  setTimingTestHooks(hooks: { keepaliveMs?: number; routeRenewMs?: number; renewRoute?: typeof renewAntigravityRouteLease; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null): void {
     timingTestHooks = hooks
   },
 }
