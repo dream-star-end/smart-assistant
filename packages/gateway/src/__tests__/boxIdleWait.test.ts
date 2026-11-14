@@ -27,7 +27,8 @@ async function reconnect(session: AgentSession) {
 
 test('OCV5-747 concurrent idle waiters retain live status and reconnect hello until last exit', async () => {
   const { session, events, emit } = fixture()
-  const first = beginIdleWait(session, emit), second = beginIdleWait(session, emit)
+  const first = beginIdleWait(session, emit)
+  const second = beginIdleWait(session, emit)
   assert.deepEqual(await reconnect(session), ['compacting'])
   first()
   assert.equal(session._idleWaiters?.size, 1)
@@ -46,7 +47,8 @@ test('OCV5-747 idle cleanup cannot clear a different owner or a handed-off user 
   first()
   assert.equal(session.currentTurnStatus, 'engine_starting')
   assert.deepEqual(events, ['compacting'])
-  const second = beginIdleWait(session, emit), third = beginIdleWait(session, emit)
+  const second = beginIdleWait(session, emit)
+  const third = beginIdleWait(session, emit)
   endIdleWait(session) // actual submit handoff, before the user engine starts
   runner.isRunning = true
   session.currentTurnStatus = 'compacting' // now owned by the user turn

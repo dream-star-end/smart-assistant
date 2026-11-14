@@ -116,23 +116,80 @@ export function assertTurnDispatchReceiptCoverage(bridgeSource: string, receiptS
     fence.end > accepted.getStart()) fail('rejection and enrichment fence must run before acceptance')
 }
 
-/** Reachable returns may only be DISPATCH_NOT_ACCEPTED or the parsed byte count.
- * Dead returns and a local shadow of the protocol helper do not count. */
-export function assertRejectedDispatchFailureHelper(source: string): void {
-  const file = parse('attachmentTotalFailure.ts', source)
-  const imported = file.statements.some(node => ts.isImportDeclaration(node) &&
+function importsFromProtocol(file: ts.SourceFile, name: string): boolean {
+  return file.statements.some(node => ts.isImportDeclaration(node) &&
     ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text === '@openclaude/protocol' &&
     node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings) &&
-    ['attachmentTotalExceededFailureCode', 'parseAttachmentTotalExceeded'].every(name =>
-      node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings) &&
-      node.importClause.namedBindings.elements.some(element => element.name.text === name && !element.propertyName)))
+    node.importClause.namedBindings.elements.some(element => element.name.text === name && !element.propertyName))
+}
+
+function isIdleRecoveryTemplate(expr: ts.Expression): boolean {
+  if (!ts.isTemplateExpression(expr)) return false
+  if (expr.head.text !== 'IDLE_RECOVERY_PENDING:') return false
+  if (expr.templateSpans.length !== 1) return false
+  const span = expr.templateSpans[0]!
+  return ts.isIdentifier(span.expression) && span.expression.text === 'minutes' && span.literal.text === ''
+}
+
+function hasIdleMinutesBinding(statement: ts.ReturnStatement, fnBody: ts.Block): boolean {
+  let cursor: ts.Node | undefined = statement.parent
+  while (cursor) {
+    if (ts.isBlock(cursor)) {
+      for (let i = cursor.statements.length - 1; i >= 0; i--) {
+        const stmt = cursor.statements[i]!
+        if (stmt.end > statement.getStart()) continue
+        if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === 'minutes') return false
+        if (ts.isVariableStatement(stmt)) {
+          const isConst = (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0
+          for (let j = stmt.declarationList.declarations.length - 1; j >= 0; j--) {
+            const decl = stmt.declarationList.declarations[j]!
+            if (ts.isIdentifier(decl.name) && decl.name.text === 'minutes') {
+              return Boolean(
+                isConst && decl.initializer && ts.isCallExpression(decl.initializer) &&
+                text(decl.initializer.expression) === 'parseIdleRecoveryPending' &&
+                decl.initializer.arguments.length === 1 &&
+                text(decl.initializer.arguments[0]!) === 'res.userFailureCode',
+              )
+            }
+          }
+        }
+      }
+    }
+    if (cursor === fnBody) break
+    cursor = cursor.parent
+  }
+  return false
+}
+
+/** Reachable returns may only be DISPATCH_NOT_ACCEPTED, the parsed byte count,
+ * or an idle-recovery pending interval parsed by the protocol helper.
+ * Dead returns and local shadows of the protocol helpers do not count. */
+export function assertRejectedDispatchFailureHelper(source: string): void {
+  const file = parse('attachmentTotalFailure.ts', source)
+  const imported = ['attachmentTotalExceededFailureCode', 'parseAttachmentTotalExceeded'].every(name =>
+    importsFromProtocol(file, name))
   if (!imported) fail('attachment-total codes must be imported from protocol')
+  const protectedHelpers = new Set([
+    'attachmentTotalExceededFailureCode',
+    'parseAttachmentTotalExceeded',
+    'parseIdleRecoveryPending',
+  ])
   let shadow = false
   function see(node: ts.Node): void {
-    if (ts.isFunctionDeclaration(node) && node.name &&
-      (node.name.text === 'attachmentTotalExceededFailureCode' || node.name.text === 'parseAttachmentTotalExceeded')) shadow = true
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
-      (node.name.text === 'attachmentTotalExceededFailureCode' || node.name.text === 'parseAttachmentTotalExceeded')) shadow = true
+    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name && protectedHelpers.has(node.name.text)) {
+      shadow = true
+    }
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)) &&
+      ts.isIdentifier(node.name) && protectedHelpers.has(node.name.text)) {
+      shadow = true
+    }
+    if (ts.isImportSpecifier(node) && protectedHelpers.has(node.name.text)) {
+      const decl = node.parent?.parent?.parent
+      if (!decl || !ts.isImportDeclaration(decl) || !ts.isStringLiteral(decl.moduleSpecifier) ||
+        decl.moduleSpecifier.text !== '@openclaude/protocol' || Boolean(node.propertyName)) {
+        shadow = true
+      }
+    }
     ts.forEachChild(node, see)
   }
   see(file)
@@ -145,6 +202,7 @@ export function assertRejectedDispatchFailureHelper(source: string): void {
   const reachable = reachableReturns(fn.body)
   let sawHistorical = false
   let sawAttachment = false
+  let sawIdleRecovery = false
   for (const statement of reachable.returns) {
     const expr = statement.expression
     if (expr && ts.isStringLiteral(expr) && expr.text === 'DISPATCH_NOT_ACCEPTED') {
@@ -156,9 +214,16 @@ export function assertRejectedDispatchFailureHelper(source: string): void {
       sawAttachment = true
       continue
     }
+    if (expr && isIdleRecoveryTemplate(expr) && hasIdleMinutesBinding(statement, fn.body)) {
+      sawIdleRecovery = true
+      continue
+    }
     fail('rejectedDispatchFailureCode must return only terminal codes')
   }
   if (!sawHistorical || !sawAttachment) fail('rejectedDispatchFailureCode must keep both terminal returns')
+  if (sawIdleRecovery && !importsFromProtocol(file, 'parseIdleRecoveryPending')) {
+    fail('idle-recovery codes must be imported from protocol')
+  }
 }
 
 function reachableReturns(node: ts.Node): { returns: ts.ReturnStatement[]; always: boolean } {

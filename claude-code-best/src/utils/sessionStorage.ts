@@ -4597,7 +4597,7 @@ async function getStatOnlyLogsForWorktrees(
     if (seenDirs.has(dirName)) continue
 
     for (const { path: wtPath, prefix } of indexed) {
-      if (dirName === prefix || dirName.startsWith(prefix + '-')) {
+      if (dirName === prefix || dirName.startsWith(`${prefix}-`)) {
         seenDirs.add(dirName)
         allLogs.push(
           ...(await getSessionFilesLite(

@@ -33,7 +33,7 @@ test('OCV5-747 browser: compacting clears into reply; unsafe recovery has no imm
     const page = await browser.newPage()
     page.setDefaultTimeout(10000)
     const errors = []; page.on('pageerror', e => errors.push(e.message))
-    await page.goto('http://127.0.0.1:' + server.address().port)
+    await page.goto(`http://127.0.0.1:${server.address().port}`)
     await page.getByText(/正在压缩上下文/).waitFor()
     await page.getByRole('button', { name: 'finish safe recovery' }).click()
     await page.getByText('正常回复，原上下文保留。').waitFor()

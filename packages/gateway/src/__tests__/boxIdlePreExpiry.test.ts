@@ -18,9 +18,9 @@ import { BOX_NATIVE_CONTEXT_MODEL, BOX_NATIVE_CONTEXT_OWNER } from '@openclaude/
 
 const HOME = mkdtempSync(join(tmpdir(), 'ocv5-755-idle-home-'))
 process.env.OPENCLAUDE_HOME = HOME
-delete process.env.OC_BOX_IDLE_PRE_EXPIRY_MS
-delete process.env.OC_BOX_IDLE_COMPACT_ALWAYS
-delete process.env.OC_BOX_AUTO_COMPACT_WINDOW
+Reflect.deleteProperty(process.env, 'OC_BOX_IDLE_PRE_EXPIRY_MS')
+Reflect.deleteProperty(process.env, 'OC_BOX_IDLE_COMPACT_ALWAYS')
+Reflect.deleteProperty(process.env, 'OC_BOX_AUTO_COMPACT_WINDOW')
 
 const budget = await import('../boxContextBudget.js')
 const idle = await import('../boxIdleCompact.js')
@@ -34,7 +34,7 @@ const finish = (SessionManager.prototype as unknown as {
     source: { sessionId: string; turnKey: string },
     recoveryDir?: string,
     mode?: 'after_turn' | 'pre_expiry',
-  ) => Promise<'deferred' | void>
+  ) => Promise<'deferred' | undefined>
 }).finishIdleUnderLock
 
 const revision = 'ab'.repeat(32)
@@ -129,7 +129,7 @@ test('pre-OCV5-755 timing (pre-expiry off): the idle turn runs right after the t
     assert.equal(seen.submits, 1)
     assert.equal(seen.minInputTokens, undefined, 'after-turn ops keep the near-limit fit')
   } finally {
-    delete process.env.OC_BOX_IDLE_PRE_EXPIRY_MS
+    Reflect.deleteProperty(process.env, 'OC_BOX_IDLE_PRE_EXPIRY_MS')
   }
 })
 
@@ -300,9 +300,9 @@ test('submit cancels the armed timer and holds compacting until pre-expiry hando
   const savedChannel = process.env.OC_RUNTIME_CHANNEL
   const savedMasterUrl = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
   const savedContainerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
-  delete process.env.OC_RUNTIME_CHANNEL
-  delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
-  delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  Reflect.deleteProperty(process.env, 'OC_RUNTIME_CHANNEL')
+  Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL')
+  Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN')
   const submitPromise = (SessionManager.prototype.submit as (...args: unknown[]) => Promise<void>).call(
     host,
     session,

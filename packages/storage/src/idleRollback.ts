@@ -29,7 +29,7 @@ export function readIdleRollbacks(home: string, sessionId: string): IdleRollback
     try {
       const r = JSON.parse(readFileSync(join(folder(home, sessionId), name), 'utf8')) as IdleRollback
       if (r.v !== 1 || r.sessionId !== sessionId || !/^[a-f0-9]{64}$/.test(r.opId)
-        || name !== r.opId + '.json' || typeof r.restoreTip !== 'string'
+        || name !== `${r.opId}.json` || typeof r.restoreTip !== 'string'
         || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(r.restoreTip)) throw new IdleRecoveryCorrupt()
       return r
     } catch { throw new IdleRecoveryCorrupt() }
@@ -38,8 +38,8 @@ export function readIdleRollbacks(home: string, sessionId: string): IdleRollback
 export function writeIdleRollback(home: string, rollback: IdleRollback): void {
   const dir = folder(home, rollback.sessionId)
   mkdirSync(dir, { recursive: true })
-  const path = join(dir, rollback.opId + '.json')
-  const tmp = path + '.' + process.pid + '.tmp'
+  const path = join(dir, `${rollback.opId}.json`)
+  const tmp = `${path}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(rollback), { mode: 0o600 })
   const file = openSync(tmp, 'r')
   try { fsyncSync(file) } finally { closeSync(file) }
@@ -60,8 +60,8 @@ export function filterAbandonedIdleRows(bytes: Buffer, rollbacks: readonly IdleR
   const ids = new Set(rows.map(r => r.uuid))
   for (const r of rollbacks) if (!ids.has(r.restoreTip) || removed.has(r.restoreTip))
     throw new IdleRecoveryCorrupt()
-  return Buffer.from(rows.filter(r => !removed.has(String(r.uuid))).map(r => {
+  return Buffer.from(`${rows.filter(r => !removed.has(String(r.uuid))).map(r => {
     const tip = removed.get(String(r.parentUuid))
     return JSON.stringify(tip ? { ...r, parentUuid: tip } : r)
-  }).join('\n') + '\n')
+  }).join('\n')}\n`)
 }

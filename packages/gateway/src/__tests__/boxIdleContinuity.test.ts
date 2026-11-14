@@ -20,7 +20,7 @@ const { SessionManager } = await import('../sessionManager.js')
 const { setV3MasterSinkSingleton } = await import('../v3MasterSink.js')
 const settledPath = join(home, 'user-settlements.jsonl')
 setV3MasterSinkSingleton({
-  async persistOrQueue(payload) { await appendFile(settledPath, JSON.stringify(payload) + '\n'); return { ok: true } },
+  async persistOrQueue(payload) { await appendFile(settledPath, `${JSON.stringify(payload)}\n`); return { ok: true } },
   async attemptOnce() {},
 })
 
@@ -172,7 +172,9 @@ function gatewayFixture() {
 
 const { createServer } = await import('node:http')
 const { writeIdleCandidate, writeIdleNative, writeIdleOp, readIdleOp, assembleIdleArtifact } = await import('../boxIdleCompact.js')
-const revision = 'b'.repeat(64), idleKey = 'c'.repeat(64), sourceKey = 'd'.repeat(64)
+const revision = 'b'.repeat(64)
+const idleKey = 'c'.repeat(64)
+const sourceKey = 'd'.repeat(64)
 const nativeId = '74700000-0000-4000-8000-000000000001'
 function seed(key: string) {
   const artifact = assembleIdleArtifact({ opId: idleKey, summaryText: 'summary', tail: [], attachments: [] })
@@ -212,9 +214,9 @@ async function proofServer(unknownProof = false, proofSessionId = nativeId) {
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'oc-v3.fixture'
   process.env.OC_BOX_IDLE_PROOF_WAIT_MS = '0'
   return async () => {
-    delete process.env.OC_USER_ID
-    delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
-    delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    Reflect.deleteProperty(process.env, 'OC_USER_ID')
+    Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL')
+    Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN')
     await new Promise<void>(r => server.close(() => r()))
   }
 }
@@ -225,7 +227,8 @@ for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-
     const artifact = seed(f.sessionKey)
     const close = await proofServer(mode === 'unknown-proof')
     const rejected = ['unstoppable', 'unknown-proof', 'hung-stop', 'false-stop', 'corrupt'].includes(mode)
-    let release!: () => void, entered!: () => void
+    let release!: () => void
+    let entered!: () => void
     const held = new Promise<void>(r => { release = r })
     const started = new Promise<void>(r => { entered = r })
     f.runner.idleHook = async () => {
@@ -248,7 +251,7 @@ for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-
       for (let i = 0; i < 100 && !f.events.some(e => e.type === 'outbound.turn_status' && e.status === 'compacting'); i++)
         await new Promise(r => setTimeout(r, 50))
       const status = f.events.find(e => e.type === 'outbound.turn_status' && e.status === 'compacting')
-      if (mode === 'receipt') assert.ok(status, 'waiting client receives compacting: ' + JSON.stringify(f.events))
+      if (mode === 'receipt') assert.ok(status, `waiting client receives compacting: ${JSON.stringify(f.events)}`)
       if (mode === 'receipt') {
         assert.equal(f.session.currentTurnStatus, 'compacting', 'hello reconnect has phase cache while waiting')
         release()
@@ -260,7 +263,7 @@ for (const mode of ['receipt', 'missing', 'unstoppable', 'unknown-proof', 'hung-
       } else {
         await work
         const finals = f.events.filter(e => e.type === 'outbound.message' && e.isFinal)
-        assert.equal(finals.length, 1, 'one user completion/settlement: ' + JSON.stringify(f.events))
+        assert.equal(finals.length, 1, `one user completion/settlement: ${JSON.stringify(f.events)}`)
         assert.equal(finals[0].meta.cost, 0.125, 'one final usage amount, no idle duplicate charge')
         assert.equal(f.runner.calls.filter(c => !String(c.input).startsWith('/compact')).length, 1, 'one billable user execution')
         assert.ok(JSON.stringify(f.events).includes('已完成只读核验'), 'client gets the actual normal reply')
@@ -346,7 +349,10 @@ test('OCV5-747 two real inbound waiters: first unsafe exit preserves second comp
   f.session.channel = 'webchat'
   seed(f.sessionKey)
   const close = await proofServer()
-  let releaseFirst!: () => void, releaseSecond!: () => void, firstEntered!: () => void, secondEntered!: () => void
+  let releaseFirst!: () => void
+  let releaseSecond!: () => void
+  let firstEntered!: () => void
+  let secondEntered!: () => void
   const firstGate = new Promise<void>(r => { releaseFirst = r })
   const secondGate = new Promise<void>(r => { releaseSecond = r })
   const startedFirst = new Promise<void>(r => { firstEntered = r })

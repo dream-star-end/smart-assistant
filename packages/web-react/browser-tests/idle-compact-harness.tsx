@@ -11,8 +11,8 @@ function Harness() {
   const msg = { id: 'idle-wait', role: 'system', ts: 1, text: '',
     _turnStatusRecord: true, _errorCode: 'IDLE_RECOVERY_PENDING:7' } as ChatMessage
   return <>
-    <button onClick={() => setPhase('reply')}>finish safe recovery</button>
-    <button onClick={() => setPhase('unsafe')}>unconfirmed stop</button>
+    <button type="button" onClick={() => setPhase('reply')}>finish safe recovery</button>
+    <button type="button" onClick={() => setPhase('unsafe')}>unconfirmed stop</button>
     {phase === 'compacting' && <TurnActivity info={{
       startedAt: Date.now(), agentName: '助手', turnStatus: 'compacting',
     }} />}

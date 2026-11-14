@@ -55,7 +55,7 @@ describe('idle summary is prepared before it is applied', () => {
     const applied = readFileSync(join(home, 'idle-native', encodeURIComponent(sessionId), 'rev-1.json'), 'utf8')
     expect(applied.includes('"applied":true')).toBe(true)
     expect(modelCalls).toBe(1)
-    delete process.env.CLAUDE_CODE_EXTRA_METADATA
+    Reflect.deleteProperty(process.env, 'CLAUDE_CODE_EXTRA_METADATA')
     await rm(home, { recursive: true, force: true })
   })
 })
@@ -68,7 +68,8 @@ describe('proof-only one-shot pre-apply anchor', () => {
     writeIdleNativeFile(path, { v: 1, sessionId, opId, revision: 'proof', summaryText: 'accepted proof',
       modelStarted: true, modelCalls: 1, frozenTail: [], attachments: [], captureRollbackTip: true } as IdleNativeFile)
     const messages = [{ type: 'user', uuid: tip, message: { role: 'user', content: 'original full context' } }] as never
-    let persisted = messages, reads = 0
+    let persisted = messages
+    let reads = 0
     try {
       await expect(runIdleCompact({ sessionId, home, messages,
         flush: async () => {}, load: async () => { reads++; return { messages: persisted } },
