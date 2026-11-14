@@ -42,6 +42,8 @@ const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
 const HASH = /^[a-f0-9]{64}$/
 const POSITIVE_ID = /^[1-9][0-9]{0,18}$/
 const STALE_SETTLEMENT_MS = 5 * 60_000
+const NULL_RECEIPT_TERMINAL_GRACE_MS = 60_000
+const NULL_RECEIPT_VANISHED_GRACE_MS = 5 * 60_000
 const reject = (): never => { throw new Error('REMOTE_NATIVE_BILLING_REJECTED') }
 function need(value: unknown): asserts value { if (!value) reject() }
 function object(value: unknown): Record<string, unknown> {
@@ -690,18 +692,110 @@ async function importCodexSpool(pool: Pool, c: Context, root: string): Promise<v
   }
 }
 
-/** Only durable terminal receipts enter this recovery path; no model/SSH port exists here. */
+/** Only durable terminal receipts (or proven-dead pre-receipt turns) enter this recovery path; no model/SSH port exists here. */
+async function abortDeadNullReceiptCc5Turn(pool: Pool, c: Context, graceMs: number): Promise<boolean> {
+  if (c.v !== 1 || c.receipt !== null) return false
+  const boundedGraceMs = Math.max(0, Math.floor(graceMs))
+  const staleVanishedMs = Math.max(boundedGraceMs, NULL_RECEIPT_VANISHED_GRACE_MS)
+  const res = await pool.query(`/* remote-native:null-receipt-abort */
+    UPDATE request_finalize_journal j
+       SET state='aborted',
+           final_credits=0,
+           failure_code=ev.journal_failure_code,
+           error_msg=ev.reason,
+           updated_at=NOW()
+      FROM (
+        SELECT
+          CASE
+            WHEN d.outcome='interrupted' OR d.failure_code='USER_CANCELLED' THEN 'USER_CANCELLED'
+            ELSE 'INTERNAL_ERROR'
+          END AS journal_failure_code,
+          CASE
+            WHEN NOT $5::boolean AND NOT $6::boolean
+              AND (d.dispatch_id IS NULL OR d.outcome IS DISTINCT FROM 'completed')
+              AND (
+                b.state='released' OR b.expires_at <= NOW()
+                OR ac.state='vanished'
+                OR (d.status='terminal' AND d.outcome=ANY('{crashed,not_accepted,executed_error,interrupted}'::text[]))
+                OR d.producer_fenced_at IS NOT NULL
+              ) THEN 'remote_native_prehost_stopped'
+            WHEN d.status='terminal'
+              AND d.outcome=ANY('{crashed,not_accepted,executed_error,interrupted}'::text[])
+              AND (
+                ac.state='vanished' OR ac.id IS NULL
+                OR b.state='released' OR b.expires_at <= NOW() OR b.operation_id IS NULL
+              ) THEN 'remote_native_cc5_terminal_null_receipt'
+            WHEN d.status='terminal'
+              AND d.outcome=ANY('{crashed,not_accepted,executed_error,interrupted}'::text[])
+              AND d.terminal_at IS NOT NULL
+              AND d.terminal_at <= NOW()-($12::bigint*INTERVAL '1 millisecond')
+              THEN 'remote_native_cc5_terminal_grace_null_receipt'
+            WHEN d.producer_fenced_at IS NOT NULL
+              AND (d.dispatch_id IS NULL OR d.outcome IS DISTINCT FROM 'completed')
+              AND d.producer_fenced_at <= NOW()-($12::bigint*INTERVAL '1 millisecond')
+              THEN 'remote_native_cc5_fenced_null_receipt'
+            WHEN ac.state='vanished'
+              AND (d.dispatch_id IS NULL OR d.outcome IS DISTINCT FROM 'completed')
+              AND (b.state='released' OR b.expires_at <= NOW() OR b.operation_id IS NULL)
+              AND COALESCE(ac.updated_at,j0.created_at) <= NOW()-($12::bigint*INTERVAL '1 millisecond')
+              THEN 'remote_native_cc5_vanished_released_null_receipt'
+            WHEN ac.state='vanished'
+              AND (d.dispatch_id IS NULL OR d.outcome IS DISTINCT FROM 'completed')
+              AND COALESCE(ac.updated_at,j0.created_at) <= NOW()-($13::bigint*INTERVAL '1 millisecond')
+              THEN 'remote_native_cc5_vanished_stale_null_receipt'
+            ELSE NULL
+          END AS reason
+        FROM request_finalize_journal j0
+        LEFT JOIN turn_dispatches d
+          ON d.dispatch_id=$7::uuid AND d.user_id=$2::bigint AND d.attempt_no=$8::integer
+        LEFT JOIN agent_containers ac
+          ON ac.id=$9::bigint AND ac.user_id=$2::bigint
+        LEFT JOIN remote_agent_bindings b
+          ON b.operation_id=$10::uuid AND b.backend_kind=$11
+        WHERE j0.request_id=$1 AND j0.user_id=$2::bigint
+          AND (ac.id IS NULL OR (ac.state IN ('active','vanished') AND ac.runtime_kind IN ('docker','desktop')))
+      ) ev
+     WHERE j.request_id=$1
+       AND j.user_id=$2::bigint
+       AND j.ctx->>'remoteNativeBillingRecovery'=$3
+       AND j.state='inflight'
+       AND j.ctx->'remoteNative'=$4::jsonb
+       AND j.ctx#>'{remoteNative,receipt}'='null'::jsonb
+       AND ev.reason IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM usage_records u
+         WHERE u.request_id=j.request_id AND u.user_id=j.user_id
+       )`,
+  [
+    c.requestId,
+    c.scope.uid,
+    marker(c),
+    JSON.stringify(c),
+    c.hostStartAttempted,
+    c.input !== null,
+    c.dispatchId,
+    c.attemptNo,
+    c.scope.containerDbId,
+    c.scope.operationId,
+    BACKEND,
+    boundedGraceMs,
+    staleVanishedMs,
+  ])
+  return res.rowCount === 1
+}
+
 export async function recoverRemoteNativeTurnBilling(
   deps: Pick<RemoteNativeTurnFinanceDeps, 'pool' | 'preCheckRedis' | 'log'>,
-  options: { limit?: number; settle?: typeof settleUsageAndLedger; evidenceRoot?: string } = {},
+  options: { limit?: number; settle?: typeof settleUsageAndLedger; evidenceRoot?: string; nullReceiptGraceMs?: number } = {},
 ): Promise<{ proven: number; pending: number }> {
   const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 25)))
+  const nullReceiptGraceMs = options.nullReceiptGraceMs ?? NULL_RECEIPT_TERMINAL_GRACE_MS
   const allRows = (await deps.pool.query<JournalRow & { request_id: string; user_id: string }>(
     `/* remote-native:recovery-scan */ SELECT request_id,user_id::text,state,ctx,updated_at
      FROM request_finalize_journal WHERE ctx->>'remoteNativeBillingRecovery'=ANY($1::text[])
        AND (state IN ('inflight','finalizing') OR (state='committed' AND EXISTS (
          SELECT 1 FROM remote_native_threads t WHERE t.uid=user_id AND t.pending_request_id=request_id)))
-       AND (ctx#>'{remoteNative,receipt}'<>'null'::jsonb OR ctx->>'remoteNativeBillingRecovery'=ANY('{remote-native-v2,remote-native-v4}'::text[]))
+       AND (ctx#>'{remoteNative,receipt}'<>'null'::jsonb OR state='inflight')
      ORDER BY updated_at ASC LIMIT $2`, [[REMOTE_NATIVE_BILLING_RECOVERY_VERSION, CODEX_REMOTE_BILLING_RECOVERY_VERSION, REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION], limit])).rows
   const v4Rows = allRows.filter((r) => r.ctx?.remoteNativeBillingRecovery === REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION)
   let proven = 0
@@ -711,6 +805,10 @@ export async function recoverRemoteNativeTurnBilling(
       const c = parseContext(row.ctx.remoteNative)
       need(c.requestId === row.request_id && c.scope.uid === row.user_id)
       await importCodexSpool(deps.pool,c,options.evidenceRoot ?? '/var/lib/openclaude/remote-native')
+      if (!c.receipt && c.v === 1 && await abortDeadNullReceiptCc5Turn(deps.pool, c, nullReceiptGraceMs)) {
+        await releaseSoftReservation(deps.preCheckRedis, c, deps.log)
+        proven++; continue
+      }
       if (!c.receipt && c.v === 2 && !c.input && !c.native) {
         // No current native/input marker means no turn effect could be dispatched. An older
         // resident app/scope is irrelevant; require its exact generation independently released.
@@ -724,7 +822,7 @@ export async function recoverRemoteNativeTurnBilling(
       }
       if (!c.receipt) {
         // Rotate still-unknown spools; an old batch must not starve a later recoverable terminal.
-        await deps.pool.query(`UPDATE request_finalize_journal SET updated_at=NOW()
+        await deps.pool.query(`/* remote-native:rotate-null */ UPDATE request_finalize_journal SET updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND state='inflight' AND ctx->'remoteNative'=$3::jsonb
             AND ctx#>'{remoteNative,receipt}'='null'::jsonb`,[c.requestId,c.scope.uid,JSON.stringify(c)])
         pending++; continue

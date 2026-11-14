@@ -137,6 +137,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/internalModelCatalog.test.ts',
     cases: ['remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)'],
   },
+  {
+    incident: 'INC-20261114-CC5-NULL-RECEIPT-DRAIN', slug: 'inc-20261114-cc5-null-receipt-drain', db: false,
+    file: 'packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts',
+    cases: ['cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)'],
+  },
 ]
 
 function fail(message: string): never {
