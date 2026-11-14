@@ -10681,6 +10681,35 @@
           "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
         }
       ]
+    },
+    {
+      "id": "INC-20261114-CC5-NULL-RECEIPT-DRAIN",
+      "occurredAt": "2026-11-14",
+      "severity": "P2",
+      "symptom": "cc5-native-v1 (cc5-interactive-v1) remote billing journal rows whose ctx.remoteNative.receipt stayed null after container crash/vanish were excluded from recoverRemoteNativeTurnBilling() recovery-scan and skipped by finalizeJournalReconciler, remaining permanently inflight and blocking release drain (REMOTE_RELEASE_DRAIN_TIMEOUT). Fixed by admitting inflight cc5-native-v1 null-receipt rows to recovery-scan and closing strictly proven dead non-completed turns via abortDeadNullReceiptCc5Turn CAS + Redis soft-reservation release, while keeping active turns and terminal completed turns untouched.",
+      "rootFixCommit": "4bb36a0a",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts",
+          "assertion": "cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/remoteNativeNullReceiptRecovery.integ.test.ts",
+          "assertion": "closes isomorphic crashed incident (terminal/crashed + vanished + binding running) and unblocks drainGate"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/remoteNativeNullReceiptRecovery.integ.test.ts",
+          "assertion": "never closes terminal completed turn with null receipt even past 60s grace or vanished container"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)"
+        }
+      ]
     }
   ]
 }
