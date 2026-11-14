@@ -118,7 +118,11 @@ import { eventBus, createEvent } from './eventBus.js'
 import { parseVerificationVerdict } from './sessionManager.js'
 import { resolveDelegateToolsets } from './toolsetIntent.js'
 import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
-import { getLocalCatalogView, type LocalExecutionRejectCode } from './modelCatalogClient.js'
+import {
+  getLocalCatalogView,
+  triggerLocalCatalogRefreshOnConfigChanged,
+  type LocalExecutionRejectCode,
+} from './modelCatalogClient.js'
 import { resolveDelegateCostUsd } from './usageCost.js'
 import {
   buildTeamReviewContext,
@@ -2373,6 +2377,9 @@ export async function _runDelegateTaskCore(
     if (!error) {
       const delegatedApiError = classifyDelegateOutputError(output)
       if (delegatedApiError) {
+        if (delegatedApiError.code === 'model_config_changed_retry_turn') {
+          triggerLocalCatalogRefreshOnConfigChanged('delegate_output_error')
+        }
         error = `${delegatedApiError.message}\n\n${delegatedApiError.detail}`
       }
     }

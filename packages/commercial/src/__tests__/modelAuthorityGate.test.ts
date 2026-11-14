@@ -19,6 +19,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 
 import {
@@ -29,9 +32,14 @@ import {
   LOCAL_CATALOG_KIND as GW_LOCAL_CATALOG_KIND,
   MODEL_CATALOG_EPOCH_PATH as GW_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH as GW_CATALOG_PATH,
+  ModelCatalogClient,
   TURN_LEASE_HEADER as GW_TURN_LEASE_HEADER,
 } from "@openclaude/gateway";
-import { AUTHORITY_TTL_MS, TURN_LEASE_TTL_MS } from "@openclaude/protocol";
+import {
+  AUTHORITY_TTL_MS,
+  MODEL_CATALOG_PROJECTION_FORMAT,
+  TURN_LEASE_TTL_MS,
+} from "@openclaude/protocol";
 
 import {
   ModelCatalogSnapshot,
@@ -1141,5 +1149,178 @@ describe("modelAuthorityGate — 可路由性(fence 之后、验票之前)", () 
       }),
       "MODEL_NOT_AVAILABLE",
     );
+  });
+});
+
+// ─── OCV5-745: constant-epoch projection drift self-healing E2E ─────────────
+
+describe("modelAuthorityGate × ModelCatalogClient — OCV5-745 constant-epoch 409 self-healing", () => {
+  const TEST_ENV = {
+    OPENCLAUDE_V3_MASTER_BASE_URL: "http://master.invalid:18791",
+    OPENCLAUDE_V3_CONTAINER_TOKEN: "oc-v3.1.deadbeef",
+  } as NodeJS.ProcessEnv;
+
+  function makeWireCatalog(projectionRevision: string, projectionAlgoVersion?: string) {
+    return {
+      projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+      ...(projectionAlgoVersion ? { projection_algo_version: projectionAlgoVersion } : {}),
+      models: [
+        {
+          model_id: "glm-5.2",
+          display_name: "GLM 5.2",
+          engine: "ccb",
+          provider_id: "ark",
+          context_window: 1_000_000,
+          supported_efforts: ["high", "max"],
+          supports_vision: false,
+          capability_zero: true,
+          supports_thinking: true,
+          default_effort: "high",
+          available: true,
+          input_per_mtok: "600",
+          output_per_mtok: "2400",
+          cache_read_per_mtok: "120",
+          cache_write_per_mtok: "0",
+          multiplier: "1.000",
+        },
+      ],
+      projection_revision: projectionRevision,
+      availability_revision: "availability-1",
+      security_epoch: "5",
+      aliases: {},
+    };
+  }
+
+  test("stale constant-epoch LKG hits 409 at egress; invalidateOnConfigChanged recovers to 200 pass", async () => {
+    const s = snap();
+    const freshProjRev = s.projectionRevisionFor({
+      uid: UID.toString(),
+      role: "user",
+      grantedModelIds: new Set(),
+    });
+    const staleProjRev = `stale-${freshProjRev.slice(6)}`;
+    const dir = mkdtempSync(join(tmpdir(), "ocv5-745-e2e-"));
+    const lkgPath = join(dir, "model-catalog-lkg.json");
+    writeFileSync(lkgPath, JSON.stringify(makeWireCatalog(staleProjRev)));
+
+    let nowMs = 1_000;
+    const calls: string[] = [];
+    const client = new ModelCatalogClient({
+      env: TEST_ENV,
+      lkgPath,
+      now: () => nowMs,
+      configChangedCooldownMs: 3_000,
+      fetcher: (async (url: string) => {
+        const isEpoch = url.includes(MODEL_CATALOG_EPOCH_PATH);
+        calls.push(isEpoch ? "epoch" : "catalog");
+        const body = isEpoch
+          ? {
+              epoch: "5",
+              availability_revision: "availability-1",
+              projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+            }
+          : makeWireCatalog(freshProjRev);
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(body));
+          })(),
+        };
+      }) as any,
+    });
+
+    try {
+      // 1) Before self-healing: epoch & projection_format match -> client reuses stale LKG.
+      const staleToken = await client.getToken();
+      assert.deepEqual(calls, ["epoch"]);
+
+      // 2) Egress rejects stale projection_revision with 409 MODEL_CONFIG_CHANGED_RETRY_TURN.
+      const err = await expectReject(
+        enforceModelAuthority({
+          catalog: source(s),
+          keyring: null,
+          headers: headers({ [LOCAL_CATALOG_HEADER]: staleToken }),
+          uid: UID,
+          containerId: CONTAINER_ID,
+          model: "glm-5.2",
+        }),
+        "MODEL_CONFIG_CHANGED_RETRY_TURN",
+      );
+      assert.equal(err.status, 409);
+
+      // 3) Container handles 409 via invalidateOnConfigChanged -> full refetch & LKG update.
+      nowMs += 100;
+      await client.invalidateOnConfigChanged("409_e2e_test");
+      assert.deepEqual(calls, ["epoch", "catalog"]);
+      const persisted = JSON.parse(readFileSync(lkgPath, "utf8")) as { projection_revision: string };
+      assert.equal(persisted.projection_revision, freshProjRev);
+
+      // 4) Next turn obtains fresh token -> egress gate allows execution.
+      const freshToken = await client.getToken();
+      const decision = await enforceModelAuthority({
+        catalog: source(s),
+        keyring: null,
+        headers: headers({ [LOCAL_CATALOG_HEADER]: freshToken }),
+        uid: UID,
+        containerId: CONTAINER_ID,
+        model: "glm-5.2",
+      });
+      assert.equal(decision.authorityKind, "local_catalog");
+      assert.equal(decision.securityEpoch, s.securityEpoch);
+      assert.equal(decision.projectionRevision, freshProjRev);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("proactive projection_algo_version upgrade refreshes stale LKG on epoch check before any 409", async () => {
+    const s = snap();
+    const freshProjRev = s.projectionRevisionFor({
+      uid: UID.toString(),
+      role: "user",
+      grantedModelIds: new Set(),
+    });
+    const staleProjRev = `stale-${freshProjRev.slice(6)}`;
+    const dir = mkdtempSync(join(tmpdir(), "ocv5-745-proactive-"));
+    const lkgPath = join(dir, "model-catalog-lkg.json");
+    writeFileSync(lkgPath, JSON.stringify(makeWireCatalog(staleProjRev)));
+
+    const client = new ModelCatalogClient({
+      env: TEST_ENV,
+      lkgPath,
+      fetcher: (async (url: string) => {
+        const isEpoch = url.includes(MODEL_CATALOG_EPOCH_PATH);
+        const body = isEpoch
+          ? {
+              epoch: "5",
+              availability_revision: "availability-1",
+              projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+              projection_algo_version: "algo-v2-abcdef01",
+            }
+          : makeWireCatalog(freshProjRev, "algo-v2-abcdef01");
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(body));
+          })(),
+        };
+      }) as any,
+    });
+
+    try {
+      const token = await client.getToken();
+      const decision = await enforceModelAuthority({
+        catalog: source(s),
+        keyring: null,
+        headers: headers({ [LOCAL_CATALOG_HEADER]: token }),
+        uid: UID,
+        containerId: CONTAINER_ID,
+        model: "glm-5.2",
+      });
+      assert.equal(decision.authorityKind, "local_catalog");
+      assert.equal(decision.projectionRevision, freshProjRev);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

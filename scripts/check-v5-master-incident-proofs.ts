@@ -137,6 +137,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/internalModelCatalog.test.ts',
     cases: ['remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)'],
   },
+  {
+    incident: 'INC-20261114-CATALOG-EPOCH-409', slug: 'inc-20261114-catalog-epoch-409', db: false,
+    file: 'packages/commercial/src/__tests__/internalModelCatalog.test.ts',
+    cases: ['OCV5-745 catalog response carries projection_algo_version matching epoch endpoint (INC-20261114-CATALOG-EPOCH-409)'],
+  },
 ]
 
 function fail(message: string): never {

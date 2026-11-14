@@ -83,7 +83,10 @@ import {
   type TurnExecutionDescriptor,
 } from './modelAuthority.js'
 import { getDispatchContext } from './turnDispatchInbox.js'
-import { getLocalCatalogView } from './modelCatalogClient.js'
+import {
+  getLocalCatalogView,
+  triggerLocalCatalogRefreshOnConfigChanged,
+} from './modelCatalogClient.js'
 import {
   buildTeamPreamble,
   pickDeliberationPanel,
@@ -1874,6 +1877,9 @@ export async function dispatchInbound(
             // unknown 4xx variants that intentionally keep the legacy UX.
             autoDreamHasCanonicalApiError = true
             const _cls = classifyRunError(_b0.text)
+            if (_cls.code === 'model_config_changed_retry_turn') {
+              triggerLocalCatalogRefreshOnConfigChanged('inbound_api_error_block')
+            }
             _apiErrorIntercepted = true
             _apiErrorText = _b0.text
             // Every canonical API error gets the structured UX. Unknown
@@ -2224,6 +2230,9 @@ export async function dispatchInbound(
           // the compatibility `[error]` final below; modern clients suppress
           // that raw bubble and keep the technical string folded in `detail`.
           const errFrame = _buildEngineErrorFrame(_inheritOutboundRouting(out), e)
+          if (errFrame.code === 'model_config_changed_retry_turn') {
+            triggerLocalCatalogRefreshOnConfigChanged('inbound_engine_error')
+          }
           this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
           // E2 — 兼容 [error] 气泡只携带分类后的受控中文文案(errFrame.message)。
           // 上游原始错误原文(可能含 API JSON、路径)不再直达微信/Telegram 等渠道

@@ -66,6 +66,7 @@ import {
   type OutboundContentBlock,
 } from '@openclaude/protocol'
 import { classifyRunError } from './errorClassify.js'
+import { triggerLocalCatalogRefreshOnConfigChanged } from './modelCatalogClient.js'
 import type {
   GatewayEngineErrorEvent,
   GatewayTerminalErrorCode,
@@ -1263,6 +1264,12 @@ export async function _runOneTurn(
 
       const terminalResultErrorClass =
         result?.errorClass ?? classifyRunError(result?.errorDetail).code
+      if (
+        terminalResultErrorClass === 'model_config_changed_retry_turn' ||
+        (result && classifyRunError(result.assistantText).code === 'model_config_changed_retry_turn')
+      ) {
+        triggerLocalCatalogRefreshOnConfigChanged('session_turn_result')
+      }
       if (
         terminalResultErrorClass === 'context_too_long' &&
         (session.providerTag === 'ccb' || session.providerTag === 'codex')
@@ -2601,6 +2608,9 @@ export async function runOneTurnWithRetry(
       }
 
       const errorClass = classifyRunError(msg).code
+      if (errorClass === 'model_config_changed_retry_turn') {
+        triggerLocalCatalogRefreshOnConfigChanged('session_turn_throw')
+      }
       // A full Codex native thread is recoverable: immediately rebuild it
       // from a smaller exact master-history suffix. Surface progress to the
       // user and do not add transient backoff latency.

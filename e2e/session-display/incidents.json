@@ -10681,6 +10681,35 @@
           "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
         }
       ]
+    },
+    {
+      "id": "INC-20261114-CATALOG-EPOCH-409",
+      "occurredAt": "2026-11-14",
+      "severity": "P1",
+      "symptom": "当 modelCatalog.ts 修改 per-uid 投影逻辑但未 bump DB model_security_epoch 或 projection_format 时，容器 ModelCatalogClient.ensureFresh 因 epoch/projection_format/availability_revision 均相等而持续复用内存快照与 model-catalog-lkg.json，导致 x-oc-local-catalog 请求在 egress enforceModelAuthority 被持续 409 MODEL_CONFIG_CHANGED_RETRY_TURN 拒绝。修复：为 409 路径接入单飞+冷却(+冷却后延迟补刷提升)的容器自愈重拉，同时保留离线 LKG 并在 /internal/v3/model-catalog-epoch 增加零成本 projection_algo_version 主动探测。",
+      "rootFixCommit": "6540b22d",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelCatalogClient.test.ts",
+          "assertion": "409 invalidation refreshes constant-epoch LKG + memory snapshot and updates projectionRevision"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelCatalogClient.test.ts",
+          "assertion": "B1: throttled 409 during cooldown promotes deferred full refetch after cooldown even within 30s TTL"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalModelCatalog.test.ts",
+          "assertion": "OCV5-745 catalog response carries projection_algo_version matching epoch endpoint (INC-20261114-CATALOG-EPOCH-409)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "OCV5-745 catalog response carries projection_algo_version matching epoch endpoint (INC-20261114-CATALOG-EPOCH-409)"
+        }
+      ]
     }
   ]
 }
