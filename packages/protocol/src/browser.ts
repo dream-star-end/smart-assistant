@@ -1,3 +1,4 @@
+export * from './idleRecoveryError.js'
 /**
  * @openclaude/protocol/browser: the protocol entry for the browser (web-react) and any other
  * non-Node consumer (phase 3 plan v3.6 §3.6, OCV5-558). Everything here is free of `node:*` in its

@@ -1,3 +1,4 @@
+import { canonicalUserFailureCode } from '@openclaude/protocol'
 /**
  * turnDispatchInbox(容器侧)—— durable turn dispatch 的执行准入 + 去重权威封装。
  *
@@ -27,8 +28,6 @@ import {
   ModelAuthorityError,
   TURN_DISPATCH_STATE_PATH,
   TURN_TAPE_STATE_PATH,
-  attachmentTotalExceededFailureCode,
-  parseAttachmentTotalExceeded,
   computeDispatchRequestHash,
   parseAuthorityKeyring,
   verifyDispatchAuthority,
@@ -401,8 +400,7 @@ export function inboxReject(
   now?: number,
   userFailureCode?: string,
 ): Promise<TurnDispatchInboxRow | null> {
-  const parsed = parseAttachmentTotalExceeded(userFailureCode)
-  const canonical = parsed ? attachmentTotalExceededFailureCode(parsed.totalBytes) : undefined
+  const canonical = canonicalUserFailureCode(userFailureCode)
   return casTurnDispatchState({
     ...key,
     fromStates: ['queued'],
@@ -802,11 +800,15 @@ export async function runDurableDispatchAdmission(input: {
     return 'duplicate'
   }
 
+  let dispatchFailureCode: string | undefined
   try {
     // B2: first durable acceptance is acknowledged before model dispatch so
     // the master can CAS admitted → accepted on a single transport delivery.
     input.sendReceipt(admitted.row)
     await input.dispatch()
+  } catch (error) {
+    dispatchFailureCode = canonicalUserFailureCode(error instanceof Error ? error.message : undefined)
+    throw error
   } finally {
     try {
       await inboxReject(
@@ -816,7 +818,7 @@ export async function runDurableDispatchAdmission(input: {
           clientMessageId: ctx.clientMessageId,
         },
         undefined,
-        input.userFailureCode?.(),
+        dispatchFailureCode ?? input.userFailureCode?.(),
       )
     } catch (err) {
       input.onOrphanRejectError?.(err)
@@ -1040,13 +1042,13 @@ export async function rejectTurnDispatchIfAbsent(input: {
     payloadHash: '',
     ...(input.now !== undefined ? { now: input.now } : {}),
   })
-  const parsed = parseAttachmentTotalExceeded(res.row?.userFailureCode)
+  const canonical = canonicalUserFailureCode(res.row?.userFailureCode)
   return {
     inserted: res.inserted,
     state: res.row?.state ?? null,
     outcome: res.row?.outcome ?? null,
     conflict: res.conflict ?? false,
-    ...(parsed ? { userFailureCode: attachmentTotalExceededFailureCode(parsed.totalBytes) } : {}),
+    ...(canonical ? { userFailureCode: canonical } : {}),
   }
 }
 
@@ -1092,8 +1094,8 @@ export function buildTurnDispatchStateResponse(
     dispatchId: row?.dispatchId ?? null,
     attemptNo: row?.attemptNo ?? null,
   }
-  const parsed = parseAttachmentTotalExceeded(row?.userFailureCode)
-  if (parsed) body.userFailureCode = attachmentTotalExceededFailureCode(parsed.totalBytes)
+  const canonical = canonicalUserFailureCode(row?.userFailureCode)
+  if (canonical) body.userFailureCode = canonical
   return body
 }
 
@@ -1123,7 +1125,7 @@ export function buildTurnDispatchReceiptFrame(
   row: Pick<TurnDispatchInboxRow, 'state' | 'outcome' | 'userFailureCode'> | null | undefined,
   ts: number,
 ): TurnDispatchReceiptFrame {
-  const parsed = parseAttachmentTotalExceeded(row?.userFailureCode)
+  const canonical = canonicalUserFailureCode(row?.userFailureCode)
   return {
     type: 'outbound.control.turn_dispatch_receipt',
     dispatchId: ctx.dispatchId,
@@ -1133,6 +1135,6 @@ export function buildTurnDispatchReceiptFrame(
     state: row?.state ?? null,
     outcome: row?.outcome ?? null,
     ts,
-    ...(parsed ? { userFailureCode: attachmentTotalExceededFailureCode(parsed.totalBytes) } : {}),
+    ...(canonical ? { userFailureCode: canonical } : {}),
   }
 }

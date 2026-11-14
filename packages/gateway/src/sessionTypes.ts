@@ -323,6 +323,9 @@ export interface AgentSession {
    * 不持久化、不跨进程 —— gateway 重启后默认 null(下次阶段帧自然把它推回对应
    * 状态,不依赖任何持久状态)。
    */
+  _idleWaiters?: Set<() => void>
+  /** One budget across background drain and the waiting submit, not per apply. */
+  _idleDeadline?: number
   currentTurnStatus?: GatewayTurnPhase
   /**
    * Active turn count — number of in-flight `submit()` promises for this session.

@@ -1,3 +1,5 @@
+import { withIdleNativeLock } from '../../../../packages/storage/src/idleNativeLock.js'
+import { readIdleRollbacks, IdleRecoveryCorrupt } from '../../../../packages/storage/src/idleRollback.js'
 /** Idle compact: freeze the tail, then either summarize once or rebuild
  * the same post-compact messages from a stored capsule. Hooks are not run. */
 import { createHash } from 'node:crypto'
@@ -72,6 +74,10 @@ export interface IdleNativeFile {
   modelStarted?: boolean
   /** Loader receipt stored. The file stays readable; it is not the active op. */
   applied?: boolean
+  /** Last original chain row, frozen before any apply writes. */
+  rollbackTip?: string
+  /** One-shot gateway authorization: reconstructed proof, never dispatched for apply. */
+  captureRollbackTip?: boolean
   /** Digest of the post-compact projection this process wrote. */
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
@@ -142,6 +148,20 @@ export function writeIdleNativeFile(path: string, file: IdleNativeFile): void {
   renameSync(tmp, path)
 }
 
+/** All runtime native writers share the gateway's per-file lock and merge only
+ * explicitly changed fields into the latest state, never a pre-await snapshot. */
+async function updateIdleNativeFile(path: string, expected: IdleNativeFile,
+  update: (current: IdleNativeFile) => IdleNativeFile): Promise<IdleNativeFile> {
+  return withIdleNativeLock(path, () => {
+    const current = readIdleNativeFile(path)
+    if (current.sessionId !== expected.sessionId || current.opId !== expected.opId
+      || current.revision !== expected.revision) throw new Error('IDLE_RECOVERY_CORRUPT')
+    const next = update(current)
+    if (next !== current) writeIdleNativeFile(path, next)
+    return next
+  })
+}
+
 export function listIdleNativeFiles(sessionId: string, home = idleNativeHome()): string[] {
   let names: string[] = []
   try { names = readdirSync(nativeDir(sessionId, home)) } catch { return [] }
@@ -154,13 +174,15 @@ export function listIdleNativeFiles(sessionId: string, home = idleNativeHome()):
 export function findIdleNativeFile(sessionId: string, home = idleNativeHome()): string | undefined {
   const paths = listIdleNativeFiles(sessionId, home)
   if (paths.length === 0) return undefined
-  const active = paths.filter((path) => !readIdleNativeFile(path).applied)
+  const abandoned = new Set(readIdleRollbacks(home, sessionId).map(r => r.opId))
+  const active = paths.filter((path) => { const f = readIdleNativeFile(path); return !f.applied && !abandoned.has(f.opId) })
   if (active.length === 1) return active[0]
   if (active.length === 0) return undefined
   throw new Error('IDLE_HISTORY_PENDING')
 }
 
 export function readIdleNativeByOp(sessionId: string, opId: string, home = idleNativeHome()): string | undefined {
+  if (readIdleRollbacks(home, sessionId).some(r => r.opId === opId)) throw new Error('IDLE_OP_ABANDONED')
   return listIdleNativeFiles(sessionId, home).find((path) => readIdleNativeFile(path).opId === opId)
 }
 
@@ -358,6 +380,7 @@ export function buildIdleCompactionResult(file: IdleNativeFile, _messages: reado
       preTokens: 0,
       idleReceiptDigest: artifact.digest,
       idleOpId: file.opId,
+      idlePreservedUuids: file.frozenTail.map(item => item.uuid),
     },
   } as CompactionResult['boundaryMarker'], summaryUuid as UUID, kept)
   const result: CompactionResult = {
@@ -417,6 +440,7 @@ export async function resumeIdleSummary(input: {
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
   isLoggable?: (message: Message) => boolean
+  loadOriginalTip?: () => Promise<string | undefined>
 }): Promise<{ path: string; file: IdleNativeFile; freshSummary: boolean } | undefined> {
   const opId = trustedIdleOpId()
   const path = (opId ? readIdleNativeByOp(input.sessionId, opId, input.home) : undefined)
@@ -424,27 +448,53 @@ export async function resumeIdleSummary(input: {
   if (!path) return undefined
   let file = readIdleNativeFile(path)
   if (file.sessionId !== input.sessionId) throw new Error('IDLE_RECOVERY_CORRUPT')
+  file = await updateIdleNativeFile(path, file, current => {
+    // Empty tails can be intentional. After capture/apply, never freeze synthetic context.
+    if (!current.applied && !current.artifact && !current.rollbackTip
+      && current.frozenTail.length === 0 && current.attachments.length === 0) {
+      const preserved = selectIdlePreserve(input.messages, input.isLoggable)
+      current = { ...current, frozenTail: preserved.tail, attachments: preserved.attachments }
+    }
+    if (!current.summaryText && !current.modelStarted
+      && !outerHistoryNeedsCompact(input.messages, input.fit, current.minInputTokens)) current = { ...current, applied: true }
+    return current
+  })
   if (file.applied && !file.summaryText) return { path, file, freshSummary: false }
-  if (file.frozenTail.length === 0 && file.attachments.length === 0) {
-    const preserved = selectIdlePreserve(input.messages, input.isLoggable)
-    file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
-    writeIdleNativeFile(path, file)
-  }
-  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages, input.fit, file.minInputTokens)) {
-    file = { ...file, applied: true }
-    writeIdleNativeFile(path, file)
-    return { path, file, freshSummary: false }
+  // Only proof-only reconstruction carries this capability. Persist its
+  // consumption with the original tip before ANY transcript mutation. A
+  // crash before this write has not applied; after it, retries reuse the tip.
+  if (file.captureRollbackTip) {
+    if (file.applied || file.artifact || file.rollbackTip || !file.summaryText)
+      throw new Error('IDLE_RECOVERY_CORRUPT')
+    const rollbackTip = await input.loadOriginalTip?.()
+    file = await updateIdleNativeFile(path, file, current => {
+      // Another process may have captured AND applied while our load was suspended.
+      // Reuse its first anchor and receipt, even if our sampled tip is now synthetic.
+      if (current.rollbackTip || current.applied || current.artifact) return current
+      if (!current.captureRollbackTip || !current.summaryText) throw new Error('IDLE_RECOVERY_CORRUPT')
+      if (!rollbackTip) throw new Error('IDLE_HISTORY_PENDING')
+      return { ...current, rollbackTip, captureRollbackTip: undefined }
+    })
   }
   let freshSummary = false
   if (!file.summaryText) {
     if (file.modelStarted || !input.summarize) throw new Error('IDLE_HISTORY_PENDING')
-    file = { ...file, modelStarted: true }
-    writeIdleNativeFile(path, file)
-    const summaryText = (await input.summarize([...input.messages])).trim()
-    if (!summaryText) throw new Error('IDLE_HISTORY_PENDING')
-    file = { ...file, summaryText, modelCalls: file.modelCalls + 1 }
-    writeIdleNativeFile(path, file)
-    freshSummary = true
+    const rollbackTip = await input.loadOriginalTip?.()
+    let ownedSummary = false
+    file = await updateIdleNativeFile(path, file, current => {
+      if (current.summaryText || current.applied) return current
+      if (current.modelStarted) throw new Error('IDLE_HISTORY_PENDING')
+      ownedSummary = true
+      return { ...current, modelStarted: true, rollbackTip: current.rollbackTip ?? rollbackTip }
+    })
+    if (ownedSummary) {
+      const summaryText = (await input.summarize([...input.messages])).trim()
+      if (!summaryText) throw new Error('IDLE_HISTORY_PENDING')
+      file = await updateIdleNativeFile(path, file, current =>
+        current.summaryText || current.applied ? current
+          : { ...current, summaryText, modelCalls: current.modelCalls + 1 })
+      freshSummary = true
+    }
   }
   return { path, file, freshSummary }
 }
@@ -470,7 +520,10 @@ export async function runIdleCompact(input: {
   flush: () => Promise<void>
   load: (sessionId: string) => Promise<{ messages: Message[] } | null>
 }): Promise<CompactionResult | 'short' | 'prepared' | undefined> {
-  const resumed = await resumeIdleSummary(input)
+  const resumed = await resumeIdleSummary({ ...input, loadOriginalTip: async () => {
+    await input.flush()
+    return (await input.load(input.sessionId))?.messages.at(-1)?.uuid
+  } })
   if (!resumed) return undefined
   if (resumed.file.applied && !resumed.file.summaryText) return 'short'
   // The summary is durable, but the transcript stays untouched until the
@@ -494,6 +547,27 @@ export async function runIdleCompact(input: {
     flush: input.flush,
     load: input.load,
   })
-  writeIdleNativeFile(resumed.path, { ...resumed.file, applied: true, artifact: built.artifact })
+  await updateIdleNativeFile(resumed.path, resumed.file, current => {
+    if (current.summaryText !== resumed.file.summaryText
+      || (current.artifact && current.artifact.digest !== built.artifact.digest))
+      throw new Error('IDLE_RECOVERY_CORRUPT')
+    return { ...current, applied: true, artifact: current.artifact ?? built.artifact }
+  })
   return result
+}
+
+/** An earlier failed apply may already have dedup-persisted its boundary
+ * without the ordered-tail metadata. Recover only from its exact native
+ * projection and matching digest; no transcript rewrite or weakened verifier. */
+export function recoverIdlePreservedUuids(sessionId: string, metadata: Record<string, unknown>): unknown {
+  if (metadata.idlePreservedUuids !== undefined) return metadata.idlePreservedUuids
+  if (typeof metadata.idleOpId !== 'string' || typeof metadata.idleReceiptDigest !== 'string') return undefined
+  const path = readIdleNativeByOp(sessionId, metadata.idleOpId)
+  if (!path) return undefined
+  const file = readIdleNativeFile(path)
+  if (!file.summaryText || file.sessionId !== sessionId) throw new IdleRecoveryCorrupt()
+  const projection = projectIdleArtifact({ opId: file.opId, summaryText: file.summaryText,
+    tail: file.frozenTail, attachments: file.attachments })
+  if (projection.digest !== metadata.idleReceiptDigest) throw new IdleRecoveryCorrupt()
+  return file.frozenTail.map(row => row.uuid)
 }

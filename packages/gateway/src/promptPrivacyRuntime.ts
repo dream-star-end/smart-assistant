@@ -5,6 +5,8 @@ export interface PromptPrivacyLifecycle {
   assertCurrent(): void
   /** Reserve the expected generation change of this operation's own shutdown. */
   beforeOwnedShutdown?(): void
+  /** Idle work must bound shutdown before returning the session lock. */
+  shutdown?(): Promise<void>
 }
 export interface PromptPrivacyRunner {
   promptPolicyFingerprint?: string
@@ -32,7 +34,7 @@ export async function refreshRunnerPromptPrivacy(runner: PromptPrivacyRunner, se
     if (await prepareRunnerPromptPrivacy(runner, sessionId, lifecycle)) {
       lifecycle?.assertCurrent()
       lifecycle?.beforeOwnedShutdown?.()
-      await runner.shutdown()
+      await (lifecycle?.shutdown ? lifecycle.shutdown() : runner.shutdown())
       lifecycle?.assertCurrent()
       assertRunnerPromptPrivacyStopped(runner)
     }

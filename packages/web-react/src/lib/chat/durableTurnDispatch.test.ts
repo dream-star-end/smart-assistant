@@ -715,6 +715,13 @@ describe("durable failure status 渲染 (RFC §5)", () => {
     expect(isDispatchLostCode("engine_error")).toBe(false);
     expect(isDispatchLostCode(undefined)).toBe(false);
   });
+  test("idle recovery rejection shows remaining minutes, not an immediate retry invitation", () => {
+    const p = errorPresentation("IDLE_RECOVERY_PENDING:7", "", undefined);
+    expect(p.waived).toBe(true);
+    expect(p.title).toBe("正在整理长对话");
+    expect(p.message).toContain("约 7 分钟");
+    expect(p.message).not.toContain("请重试");
+  });
   test("errorPresentation dispatch_not_accepted → 免单 tone(MIN2)", () => {
     const p = errorPresentation("DISPATCH_NOT_ACCEPTED", "", undefined);
     expect(p.waived).toBe(true);

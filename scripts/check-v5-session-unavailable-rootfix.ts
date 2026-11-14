@@ -856,13 +856,15 @@ await runTapProof({
     'rejects an attachment code that is not the parsed byte count',
     'rejects a historical return hidden after an unconditional return',
     'rejects a local function shadowing the protocol helper',
+    'rejects a local function shadowing parseIdleRecoveryPending',
+    'rejects an idle-recovery template literal that does not interpolate the parsed minutes',
     'rejects an enrichment fence that no longer stops a terminalized turn',
     'rejects malformed source instead of accepting a partial parse',
   ],
   label: 'turn-dispatch-receipt-coverage',
   timeoutMs: 120_000,
 })
-console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 20 exact cases')
+console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 22 exact cases')
 
 await runTapProof({
   fromRoot: candidateRoot,

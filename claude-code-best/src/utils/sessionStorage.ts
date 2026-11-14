@@ -1,3 +1,5 @@
+import { readIdleRollbacks, filterAbandonedIdleRows, IdleRecoveryCorrupt } from '../../../packages/storage/src/idleRollback.js'
+import { idleNativeHome, recoverIdlePreservedUuids } from '../services/compact/idleRecover.js'
 import { transcriptNeedsRecovery, readNativeTranscriptArchive, recoverNativeTranscript } from './nativeTranscriptRecovery.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { feature } from 'bun:bundle'
@@ -1884,6 +1886,7 @@ export async function hydrateRemoteSession(
     logForDebugging(`Hydrated ${remoteLogs.length} entries from remote`)
     return remoteLogs.length > 0
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw error
     logForDebugging(`Error hydrating session from remote: ${error}`)
     logForDiagnosticsNoPII('error', 'hydrate_remote_session_fail')
@@ -1984,6 +1987,7 @@ export async function hydrateFromCCRv2InternalEvents(
     })
     return events.length > 0
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw error
     // Re-throw epoch mismatch so the worker doesn't race against gracefulShutdown
     if (
@@ -2122,6 +2126,7 @@ function applyPreservedSegmentRelinks(
   // Find the absolute-last boundary and the last seg-boundary (can differ:
   // manual /compact after reactive compact → seg is stale).
   let lastSeg: Seg | undefined
+  let idleBoundary: TranscriptMessage | undefined
   let lastSegBoundaryIdx = -1
   let absoluteLastBoundaryIdx = -1
   const entryIndex = new Map<UUID, number>()
@@ -2133,6 +2138,7 @@ function applyPreservedSegmentRelinks(
       const seg = entry.compactMetadata?.preservedSegment
       if (seg) {
         lastSeg = seg
+        idleBoundary = entry
         lastSegBoundaryIdx = i
       }
     }
@@ -2144,11 +2150,33 @@ function applyPreservedSegmentRelinks(
   // Seg stale (no-seg boundary came after): skip relink, still prune at
   // absolute — otherwise the stale preserved chain becomes a phantom leaf.
   const segIsLive = lastSegBoundaryIdx === absoluteLastBoundaryIdx
+  const idlePreservedUuids = segIsLive && idleBoundary && isCompactBoundaryMessage(idleBoundary)
+    ? recoverIdlePreservedUuids(String(idleBoundary.sessionId), idleBoundary.compactMetadata)
+    : undefined
 
   // Validate tail→head BEFORE mutating so malformed metadata is a true
   // no-op (walk stops at headUuid, doesn't need the relink to run first).
   const preservedUuids = new Set<UUID>()
-  if (segIsLive) {
+  if (segIsLive && idlePreservedUuids !== undefined) {
+    // Idle freezes an ordered projection, including parallel tool-result siblings
+    // which are NOT all ancestors of tailUuid. Never drop them via a single walk.
+    if (!Array.isArray(idlePreservedUuids) || idlePreservedUuids.length === 0
+      || new Set(idlePreservedUuids).size !== idlePreservedUuids.length
+      || idlePreservedUuids[0] !== lastSeg.headUuid
+      || idlePreservedUuids.at(-1) !== lastSeg.tailUuid
+      || !messages.has(lastSeg.anchorUuid) || idlePreservedUuids.includes(lastSeg.anchorUuid)
+      || idlePreservedUuids.some(id => typeof id !== 'string' || !messages.has(id as UUID)
+        || (entryIndex.get(id as UUID) ?? Infinity) >= absoluteLastBoundaryIdx)) {
+      throw new IdleRecoveryCorrupt()
+    }
+    let parent = lastSeg.anchorUuid
+    for (const id of idlePreservedUuids as UUID[]) {
+      const message = messages.get(id)!
+      messages.set(id, { ...message, parentUuid: parent })
+      preservedUuids.add(id)
+      parent = id
+    }
+  } else if (segIsLive) {
     const walkSeen = new Set<UUID>()
     let cur = messages.get(lastSeg.tailUuid)
     let reachedHead = false
@@ -2634,6 +2662,7 @@ export async function loadTranscriptFromFile(
   try {
     parsed = jsonParse(content)
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_IMPORT_INVALID')
     throw new Error(`Invalid JSON in transcript file: ${error}`)
   }
@@ -3381,6 +3410,7 @@ export async function loadFullLog(log: LogOption): Promise<LogOption> {
           : undefined,
     }
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo()) throw error
     // Legacy callers keep their existing unreadable-log behavior.
     return log
@@ -3890,6 +3920,7 @@ export async function loadTranscriptFile(
   // Last-wins — later entries supersede.
   let contextCollapseSnapshot: ContextCollapseSnapshotEntry | undefined
 
+  const idleRollbacks = readIdleRollbacks(idleNativeHome(), basename(filePath, '.jsonl'))
   const leafPruneEnabled = getFeatureValue_CACHED_MAY_BE_STALE('tengu_pebble_leaf_prune', false)
   let originalLeafUuids: Set<UUID> | undefined
   let originalSnipPlan: TranscriptSnipPlan | undefined
@@ -3911,7 +3942,7 @@ export async function loadTranscriptFile(
       let buf: Buffer | null = null
     let metadataLines: string[] | null = null
     let hasPreservedSegment = false
-    if (!isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP)) {
+    if (!idleRollbacks.length && !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP)) {
       const { size } = verifiedHandle ? await verifiedHandle.stat() : await stat(filePath)
       if (size > SKIP_PRECOMPACT_THRESHOLD) {
         const scan = await readTranscriptForLoad(filePath, size, verifiedHandle)
@@ -3934,7 +3965,7 @@ export async function loadTranscriptFile(
       }
     }
     buf ??= verifiedHandle ? await readTranscriptHandle(verifiedHandle) : await readFile(filePath)
-      return { buf, metadataLines, hasPreservedSegment }
+      return { buf: filterAbandonedIdleRows(buf, idleRollbacks), metadataLines, hasPreservedSegment }
     }
     const snapshot = managedTranscriptIo()
       ? await withSessionFile(filePath, transcriptIoScope(filePath), false, async (file, patch, recordReceipt) => {
@@ -4000,6 +4031,7 @@ export async function loadTranscriptFile(
     // optimization and the scan it depends on for hasPreservedSegment did
     // not run).
     if (
+      !idleRollbacks.length &&
       !opts?.keepAllLeaves &&
       !hasPreservedSegment &&
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP) &&
@@ -4139,6 +4171,7 @@ export async function loadTranscriptFile(
       }
     }
   } catch (error) {
+    if (error instanceof IdleRecoveryCorrupt) throw error
     if (managedTranscriptIo() && !(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error
     // A genuinely absent transcript is handled by the existing session lookup.
   }
@@ -4564,7 +4597,7 @@ async function getStatOnlyLogsForWorktrees(
     if (seenDirs.has(dirName)) continue
 
     for (const { path: wtPath, prefix } of indexed) {
-      if (dirName === prefix || dirName.startsWith(prefix + '-')) {
+      if (dirName === prefix || dirName.startsWith(`${prefix}-`)) {
         seenDirs.add(dirName)
         allLogs.push(
           ...(await getSessionFilesLite(

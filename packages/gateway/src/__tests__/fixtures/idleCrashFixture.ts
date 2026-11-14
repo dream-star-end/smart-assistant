@@ -39,8 +39,13 @@ async function testIdleFault(point: string, evidence: unknown): Promise<void> {
     await testIdleFault('native-half', { file: resumed.file, writtenUuids: messages.slice(0, 2).map(m => m.uuid) })
   }
   await input.record(messages, undefined, undefined, undefined, true)`);
-  replace("  writeIdleNativeFile(resumed.path, { ...resumed.file, applied: true, artifact: built.artifact })",
-    "  writeIdleNativeFile(resumed.path, { ...resumed.file, applied: true, artifact: built.artifact })\n  await testIdleFault('receipt-lost', { file: readIdleNativeFile(resumed.path), messageUuids: messages.map(m => m.uuid) })");
+  const receiptNeedle = `  await updateIdleNativeFile(resumed.path, resumed.file, current => {
+    if (current.summaryText !== resumed.file.summaryText
+      || (current.artifact && current.artifact.digest !== built.artifact.digest))
+      throw new Error('IDLE_RECOVERY_CORRUPT')
+    return { ...current, applied: true, artifact: current.artifact ?? built.artifact }
+  })`;
+  replace(receiptNeedle, `${receiptNeedle}\n  await testIdleFault('receipt-lost', { file: readIdleNativeFile(resumed.path), messageUuids: messages.map(m => m.uuid) })`);
   writeFileSync(path, after);
   return { before: createHash("sha256").update(before).digest("hex"), after: createHash("sha256").update(after).digest("hex") };
 }
@@ -64,7 +69,11 @@ export function saveIdleCheckpoint(home: string, root: string, sessionKey: strin
       else if (entry.isFile() && filter(entry.name)) files.push(file);
     }
   };
-  const directories = [join("idle-ops", encodeURIComponent(sessionKey)), join("idle-native", encodeURIComponent(nativeId))];
+  const directories = [
+    join("idle-ops", encodeURIComponent(sessionKey)),
+    join("idle-native", encodeURIComponent(nativeId)),
+    join("idle-abandoned", encodeURIComponent(nativeId)),
+  ];
   for (const dir of directories) walk(join(home, dir), name => name.endsWith(".json"));
   const candidate = join(home, "idle-candidates", `${encodeURIComponent(sessionKey)}.json`);
   assert.ok(existsSync(candidate), "checkpoint requires the real pending candidate");

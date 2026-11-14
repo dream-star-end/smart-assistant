@@ -10640,6 +10640,54 @@
       ]
     },
     {
+      "id": "INC-20261107-BOX-IDLE-CONTINUITY",
+      "occurredAt": "2026-11-07",
+      "severity": "P1",
+      "symptom": "Box idle compact 漏并行 tool_result 导致 apply 缺回执；等待无阶段提示且后续用户消息被 IDLE_HISTORY_PENDING 拒收。",
+      "rootFixCommit": "34a81bb6",
+      "coverageCommits": [
+        "81e0569a",
+        "871e1365",
+        "3942bd13",
+        "583cdc48",
+        "d05df02f",
+        "4d57b785",
+        "d4ce2020"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleContinuity.test.ts",
+          "assertion": "OCV5-747 real inbound + submit:"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/services/compact/idleConcurrentRecovery.test.ts",
+          "assertion": "two proof-only recoverers retain the pre-apply anchor and applied receipt:"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/services/compact/idleConcurrentRecovery.test.ts",
+          "assertion": "concurrent native summary claims call the model only once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "IDLE_RECOVERY_PENDING:7"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/idle-compact.node-test.mjs",
+          "assertion": "OCV5-747 browser: compacting clears into reply; unsafe recovery has no immediate retry"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleWait.test.ts",
+          "assertion": "OCV5-747 crash fixture installs all 3 fault seams and checkpoint restore clears post-fault rollback tombstones"
+        }
+      ]
+    },
+    {
       "id": "INC-20261112-AGY-ROUTE-LIFETIME",
       "occurredAt": "2026-11-12",
       "severity": "P1",
