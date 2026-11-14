@@ -322,7 +322,7 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
  *   only the route model's CLI ids plus ANTIGRAVITY_AUX_UPSTREAM_MODELS and
  *   meters every call it forwards.
  */
-export const ANTIGRAVITY_CLI_VERSION = '1.4.0'
+export const ANTIGRAVITY_CLI_VERSION = '1.5.8'
 /** Title generation (`requestType: checkpoint`) the CLI makes on every new
  * conversation. It is NOT included in the CLI's own `result.usage`, so CLI
  * usage alone under-bills. */
@@ -375,6 +375,14 @@ export const ANTIGRAVITY_ENGINE_MODELS = [
       high: 'gemini-4-hydrogen-high',
       xhigh: 'gemini-4-hydrogen-xhigh',
     },
+    experimental: true,
+  },
+  {
+    id: 'antigravity-orchestrator-carbon',
+    displayName: 'Orchestrator Carbon (Antigravity)',
+    efforts: [],
+    defaultEffort: 'default',
+    cliModels: { default: 'gemini-pro-orchestrator' },
     experimental: true,
   },
   {
