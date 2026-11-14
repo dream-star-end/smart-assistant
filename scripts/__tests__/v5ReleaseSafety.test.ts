@@ -4986,7 +4986,7 @@ exec(compile(source, "<actual-release-artifact-digest>", "exec"), dict(__name__=
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
       '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
-      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.62 (test)}"',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.77 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',
@@ -5024,8 +5024,8 @@ exec(compile(source, "<actual-release-artifact-digest>", "exec"), dict(__name__=
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
       [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
       [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
-      [{ GROK_VERSION: 'grok 1.0.5 (incident image)' }, /Grok binary=.*expected='grok 1\.0\.62/],
-      [{ GROK_VERSION: 'grok 1.0.13 (previous commercial)' }, /Grok binary=.*expected='grok 1\.0\.62/],
+      [{ GROK_VERSION: 'grok 1.0.5 (incident image)' }, /Grok binary=.*expected='grok 1\.0\.77/],
+      [{ GROK_VERSION: 'grok 1.0.13 (previous commercial)' }, /Grok binary=.*expected='grok 1\.0\.77/],
       [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
     ] as const) {
       await writeFile(capture, '')

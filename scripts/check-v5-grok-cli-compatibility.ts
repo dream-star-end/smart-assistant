@@ -35,9 +35,9 @@ const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const DEPLOY = join(CANDIDATE, "scripts/deploy-v5.sh");
 /** The oldest Grok CLI xAI still serves. */
 const MINIMUM = "1.0.13";
-/** The Grok CLI the runtime image pins and deploy-v5.sh demands (OCV5-470: 1.0.13 -> 1.0.62). The PASS
+/** The Grok CLI the runtime image pins and deploy-v5.sh demands (OCV5-771: 1.0.62 -> 1.0.77). The PASS
  * lines below spell it out literally because incidents.json anchors them verbatim. */
-const PINNED = "1.0.62";
+const PINNED = "1.0.77";
 const IMAGE = "openclaude/openclaude-runtime:v5-proof-slim";
 const OLD_IMAGE = "openclaude/openclaude-runtime:v5-proof-previous";
 const IMAGE_ID = `sha256:${"8".repeat(64)}`;
@@ -87,14 +87,14 @@ esac`,
       *"{{.Id}}|"*) echo "$id|$STANDIN_COMMIT|0|1" ;;
       *"{{.Id}}"*) echo "$id" ;;
       *oc.runtime.source_commit*) echo "$STANDIN_COMMIT" ;;
-      *oc.runtime.codex_version*) echo 0.163.0 ;;
+      *oc.runtime.codex_version*) echo 0.169.0 ;;
       *oc.runtime.include_grok*) echo 1 ;;
       *) : ;;
     esac ;;
   "run --rm")
     case "$*" in
       *"--entrypoint grok-native"*) echo "$STANDIN_GROK" ;;
-      *"--entrypoint codex"*) echo "codex-cli 0.163.0" ;;
+      *"--entrypoint codex"*) echo "codex-cli 0.169.0" ;;
       *) exit 64 ;;
     esac ;;
   *) exit 64 ;;
@@ -204,7 +204,7 @@ function proveOfflinePrepare(box: Capsule): string {
   if (manifest.target_image !== IMAGE || manifest.target_image_id !== IMAGE_ID || manifest.old_image !== OLD_IMAGE
     || manifest.target_commit !== box.commit) fail("OFFLINE_PREPARE_MANIFEST");
   if (!ok.calls.includes(`docker run --rm --entrypoint grok-native ${IMAGE} --version`)) fail("OFFLINE_PREPARE_CLI_NOT_RUN");
-  return "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.62";
+  return "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.77";
 }
 
 // The online slim image switch.
@@ -218,7 +218,7 @@ assert_target_runtime_image_ready`;
   }
   const ok = consumer(box, current, "active", call);
   if (ok.status !== 0 || !ok.out.includes(`grok=${current}`)) fail(`ONLINE_IMAGE_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
-  return "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.62";
+  return "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.77";
 }
 
 // The staged activation: the stopped unit may be started only on a checked image.
@@ -236,12 +236,12 @@ function proveStagedActivation(box: Capsule): string {
   }
   if (old.calls.some((line) => line.startsWith("systemctl start"))) fail("STAGED_ACTIVATION_OLD_CLI_STARTED");
   const ok = staged(current);
-  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.163.0,grok=${current}`)) {
+  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.169.0,grok=${current}`)) {
     fail(`STAGED_ACTIVATION_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
   }
   // the manifest's image was installed into the env file before the check, by the product's own step
   if (!box.read("remote/commercial-v5.env").includes(`OC_RUNTIME_IMAGE=${IMAGE}\n`)) fail("STAGED_ACTIVATION_ENV");
-  return "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.62 before it may start";
+  return "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.77 before it may start";
 }
 
 /** xAI's CLI chat proxy as the incident recorded it: older clients get 426. */
