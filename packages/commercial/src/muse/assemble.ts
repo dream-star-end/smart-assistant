@@ -1,14 +1,19 @@
 // OCV5-561 Muse media bridge — build the hub and bridge endpoints from config (kept out of
 // index.ts). Off unless OC_MUSE_BRIDGE_ENABLED=1; a failed start leaves the feature off instead
-// of failing master boot. Selfhost runs a single master, which owns the in-memory hub.
+// of failing master boot. Each master process owns its in-memory hub; commercial (OCV5-574) adds
+// concurrency, per-account caps, credits and an orphan grace for its A/B slots, all from config.
 
 import type { Pool } from 'pg'
 
 import type { CommercialConfig } from '../config.js'
 import { rootLogger } from '../logging/logger.js'
+import { createMuseDurability } from './durable.js'
+import { createMuseDelivery, type MuseDeliveryDeps } from './delivery.js'
+import { createMuseBilling } from './billing.js'
+import { createMuseBoxExecRunner, parseMuseVideoBackend } from './boxExecVideo.js'
 import { type MuseBridgeHttpHandler, makeMuseBridgeHttpHandler } from './bridgeHttp.js'
 import { MuseBridgeHub } from './hub.js'
-import { CLI_TIMEOUT_SEC, parseAllowedUids } from './protocol.js'
+import { CLI_TIMEOUT_SEC, MAX_CONCURRENCY, QUEUE_WAIT_MS, parseAllowedUids } from './protocol.js'
 import { startMusePublicFromConfig } from './publicListener.js'
 import { createPgMuseStore } from './store.js'
 
@@ -17,6 +22,7 @@ export const MUSE_DEFAULT_STATE_ROOT = '/var/lib/openclaude-v5-selfhost/muse-med
 export async function createMuseFromConfig(
   cfg: CommercialConfig,
   pool: Pool,
+  delivery?: MuseDeliveryDeps,
 ): Promise<{
   hub?: MuseBridgeHub
   bridgeHttp?: MuseBridgeHttpHandler
@@ -24,8 +30,20 @@ export async function createMuseFromConfig(
 }> {
   if (!cfg.OC_MUSE_BRIDGE_ENABLED) return {}
   const store = createPgMuseStore(pool)
+  const prices = {
+    image: cfg.OC_MUSE_PRICE_IMAGE_CREDITS ?? 0,
+    video: cfg.OC_MUSE_PRICE_VIDEO_CREDITS ?? 0,
+  }
+  const queueWait = (sec: number | undefined) => (sec === undefined ? QUEUE_WAIT_MS : sec * 1000)
   const hub = new MuseBridgeHub({
     store,
+    durability: delivery
+      ? createMuseDurability(
+          pool,
+          createMuseDelivery(pool, cfg.OC_MUSE_STATE_ROOT ?? MUSE_DEFAULT_STATE_ROOT, delivery),
+          delivery.originActive,
+        )
+      : undefined,
     stateRoot: cfg.OC_MUSE_STATE_ROOT ?? MUSE_DEFAULT_STATE_ROOT,
     allowedUids: parseAllowedUids(cfg.OC_MUSE_ALLOWED_UIDS, (msg, meta) =>
       rootLogger.warn(msg, meta),
@@ -37,6 +55,38 @@ export async function createMuseFromConfig(
       videoPerDay: cfg.OC_MUSE_VIDEO_PER_DAY ?? 40,
     },
     cliTimeoutSec: CLI_TIMEOUT_SEC,
+    multiBridge: Boolean(delivery), // delivery is supplied only for verified commercial flavor
+    perBridgeConcurrency: cfg.OC_MUSE_BRIDGE_CONCURRENCY,
+    concurrency: Math.min(cfg.OC_MUSE_CONCURRENCY ?? 1, MAX_CONCURRENCY),
+    ...(cfg.OC_MUSE_QUEUE_MAX !== undefined ? { queueMax: cfg.OC_MUSE_QUEUE_MAX } : {}),
+    queueWaitMs: {
+      image: queueWait(cfg.OC_MUSE_QUEUE_WAIT_IMAGE_SEC),
+      video: queueWait(cfg.OC_MUSE_QUEUE_WAIT_VIDEO_SEC),
+    },
+    ...(cfg.OC_MUSE_USER_INFLIGHT_MAX !== undefined
+      ? { userInflightMax: cfg.OC_MUSE_USER_INFLIGHT_MAX }
+      : {}),
+    ...(cfg.OC_MUSE_USER_RUNNING_MAX !== undefined
+      ? { userRunningMax: cfg.OC_MUSE_USER_RUNNING_MAX }
+      : {}),
+    globalPerDay: {
+      ...(cfg.OC_MUSE_GLOBAL_IMAGE_PER_DAY !== undefined
+        ? { image: cfg.OC_MUSE_GLOBAL_IMAGE_PER_DAY }
+        : {}),
+      ...(cfg.OC_MUSE_GLOBAL_VIDEO_PER_DAY !== undefined
+        ? { video: cfg.OC_MUSE_GLOBAL_VIDEO_PER_DAY }
+        : {}),
+    },
+    ...(prices.image > 0 || prices.video > 0 ? { billing: createMuseBilling(pool, prices) } : {}),
+    orphanGraceMs: (cfg.OC_MUSE_ORPHAN_GRACE_SEC ?? 0) * 1000,
+    fallbackHatch: cfg.OC_MUSE_BOX_EXEC_FALLBACK_HATCH === true,
+    videoBackend: parseMuseVideoBackend(cfg.OC_MUSE_VIDEO_BACKEND),
+    boxExecRunner:
+      cfg.OC_MUSE_BOX_EXEC_UID && cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID
+        ? createMuseBoxExecRunner(cfg.OC_MUSE_BOX_EXEC_UID, {
+            accountId: cfg.OC_MUSE_BOX_EXEC_ACCOUNT_ID,
+          })
+        : undefined,
   })
   try {
     await hub.start()

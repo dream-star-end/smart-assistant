@@ -114,7 +114,9 @@ test("the detached text lane runs each listed Box model under its own upstream i
       [requestId, JSON.stringify({ boxUpstreamModel: listed.upstreamModel })]);
       assert.equal(await journal.claimTextUnknownCandidate(unknown), true);
     }
-    assert.equal(n, 4);
+    // box-api-claude-* (4, `claude -p`) and box-claude-* (3, interactive runner, OCV5-378): every
+    // listed model passes the same journal fences.
+    assert.equal(n, 7);
   } finally {
     client.release();
     await pool.end();

@@ -113,19 +113,30 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
     assert.equal(modelReasoningPolicy('gpt-5.6-sol').supported.includes('ultra' as never), false)
   })
 
-  test('context-tier families: GPT-6 Astra/6.1 Sol/Luna expanded, retired Sol not selectable', () => {
+  test('context-tier families: new GPT-6 families expanded and legacy commercial GPT-5.6 context contract preserved', () => {
     assert.deepEqual(
       CONTEXT_TIER_FAMILIES.map((f) => f.family),
-      ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'kimi-k3'],
+      ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'kimi-k3'],
     )
     assert.deepEqual(
       CONTEXT_TIER_FAMILIES.filter((f) => f.collapsedByDefault).map((f) => f.family),
-      [],
+      ['gpt-5.6-terra', 'gpt-5.6-luna'],
     )
     assert.equal(contextFamilyCollapsedByDefault('gpt-6-astra'), false)
     assert.equal(contextFamilyCollapsedByDefault('gpt-6.1-sol'), false)
     assert.equal(contextFamilyCollapsedByDefault('gpt-6-luna'), false)
-    assert.equal(contextFamilyByModelId('gpt-5.6-sol'), undefined)
+    assert.equal(contextFamilyByModelId('gpt-5.6-sol')?.family, 'gpt-5.6-sol')
+    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-sol'), false)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-terra'), true)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-luna'), true)
+    for (const id of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'] as const) {
+      const standard = contextFamilyByModelId(id)!
+      const long = contextFamilyByModelId(`${id}-1m`)!
+      assert.equal(standard.family, id)
+      assert.deepEqual(long, standard)
+      assert.equal(long.standardId, id)
+      assert.equal(long.longId, `${id}-1m`)
+    }
     assert.equal(contextFamilyByModelId('gpt-6-sol'), undefined)
     assert.equal(contextFamilyByModelId('gpt-6-sol-1m'), undefined)
     assert.equal(contextFamilyCollapsedByDefault('kimi-k3'), false)
@@ -556,6 +567,9 @@ describe('Antigravity CLI engine model authority (OCV5-415)', () => {
     assert.deepEqual(ANTIGRAVITY_ENGINE_MODEL_IDS, [
       'antigravity-gemini-3.8-flash',
       'antigravity-gemini-4-argon',
+      'antigravity-gemini-4-carbon',
+      'antigravity-gemini-4-hydrogen',
+      'antigravity-orchestrator-carbon',
       'antigravity-claude-sonnet-5.5',
       'antigravity-claude-opus-5.5',
       'antigravity-gpt-oss-120b',
@@ -610,5 +624,58 @@ describe('Gemini 4 Argon account-verified CLI model authority (OCV5-517)', () =>
       'gemini-4-argon-low','gemini-4-argon-medium','gemini-4-argon-high','gemini-3.5-flash-lite',
     ])
     assert.equal(isAntigravityEngineModel('gemini-4-argon-medium'),false)
+  })
+})
+
+describe('Gemini 4 Carbon account-verified CLI model authority (OCV5-757)', () => {
+  test('all three choices map to the exact CLI id and the relay never admits Argon ids for a Carbon route', () => {
+    for (const effort of ['low','medium','high']) {
+      assert.equal(antigravityCliModelId('antigravity-gemini-4-carbon',effort),`gemini-4-carbon-${effort}`)
+    }
+    assert.equal(antigravityCliModelId('antigravity-gemini-4-carbon',undefined),'gemini-4-carbon-medium')
+    assert.deepEqual(modelReasoningPolicy('antigravity-gemini-4-carbon').supported,['low','medium','high'])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-4-carbon'),[
+      'gemini-4-carbon-low','gemini-4-carbon-medium','gemini-4-carbon-high','gemini-3.5-flash-lite',
+    ])
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-argon').some((m) => m.includes('carbon')),false)
+    assert.equal(isAntigravityEngineModel('gemini-4-carbon-medium'),false)
+  })
+})
+
+describe('Gemini 4 Hydrogen account-verified CLI model authority (OCV5-768)', () => {
+  test('all four choices map to the exact CLI id with explicit high default and cross-family isolation', () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh']) {
+      assert.equal(antigravityCliModelId('antigravity-gemini-4-hydrogen', effort), `gemini-4-hydrogen-${effort}`)
+    }
+    assert.equal(antigravityCliModelId('antigravity-gemini-4-hydrogen', undefined), 'gemini-4-hydrogen-high')
+    assert.equal(antigravityCliModelId('antigravity-gemini-4-hydrogen', 'max'), 'gemini-4-hydrogen-high')
+    assert.deepEqual(modelReasoningPolicy('antigravity-gemini-4-hydrogen').supported, ['low', 'medium', 'high', 'xhigh'])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-4-hydrogen'), [
+      'gemini-4-hydrogen-low',
+      'gemini-4-hydrogen-medium',
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-xhigh',
+      'gemini-3.5-flash-lite',
+    ])
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-carbon').some((m) => m.includes('hydrogen')), false)
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-argon').some((m) => m.includes('hydrogen')), false)
+    assert.equal(isAntigravityEngineModel('antigravity-gemini-4-hydrogen'), true)
+    assert.equal(isAntigravityEngineModel('gemini-4-hydrogen-high'), false)
+  })
+})
+
+describe('Orchestrator Carbon account-verified CLI model authority (OCV5-769)', () => {
+  test('fixed default maps to gemini-pro-orchestrator with empty efforts and cross-family isolation', () => {
+    assert.equal(antigravityCliModelId('antigravity-orchestrator-carbon', undefined), 'gemini-pro-orchestrator')
+    assert.equal(antigravityCliModelId('antigravity-orchestrator-carbon', 'high'), 'gemini-pro-orchestrator')
+    assert.deepEqual(modelReasoningPolicy('antigravity-orchestrator-carbon').supported, [])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-orchestrator-carbon'), [
+      'gemini-pro-orchestrator',
+      'gemini-3.5-flash-lite',
+    ])
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-carbon').some((m) => m.includes('orchestrator')), false)
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-hydrogen').some((m) => m.includes('orchestrator')), false)
+    assert.equal(isAntigravityEngineModel('antigravity-orchestrator-carbon'), true)
+    assert.equal(isAntigravityEngineModel('gemini-pro-orchestrator'), false)
   })
 })

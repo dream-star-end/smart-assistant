@@ -8,6 +8,7 @@ describe("OCV5-104 funnel event mapping", () => {
     assert.equal(mapRegisterFunnelCode("CONFLICT"), "CONFLICT");
     assert.equal(mapRegisterFunnelCode("TURNSTILE_FAILED"), "TURNSTILE");
     assert.equal(mapRegisterFunnelCode("EMAIL_DOMAIN_BLOCKED"), "EMAIL_DOMAIN_BLOCKED");
+    assert.equal(mapRegisterFunnelCode("IP_REGISTRATION_LIMIT"), "IP_REGISTRATION_LIMIT");
     assert.equal(mapRegisterFunnelCode("VALIDATION"), null);
     assert.equal(mapRegisterFunnelCode("REGISTRATION_DISABLED"), null);
   });

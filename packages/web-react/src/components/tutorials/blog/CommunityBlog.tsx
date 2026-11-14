@@ -47,12 +47,15 @@ export type BlogViewRequest = { kind: "editor"; seed: BlogDraft; nonce: number }
  */
 export function CommunityBlog({
   auth,
+  userId = null,
   onRequireLogin,
   detailId = null,
   onDetailIdChange,
   request = null,
 }: {
   auth?: AuthSession | null;
+  /** 登录用户 id；编辑器本地草稿按账号隔离。未登录不进编辑器。 */
+  userId?: string | null;
   onRequireLogin?: () => void;
   detailId?: string | null;
   onDetailIdChange?: (id: string | null) => void;
@@ -89,7 +92,7 @@ export function CommunityBlog({
   }, []);
 
   const needAuth = (next: BlogView) => {
-    if (!auth) {
+    if (!auth || (next.kind === "editor" && !userId)) {
       onRequireLogin?.();
       return;
     }
@@ -105,11 +108,12 @@ export function CommunityBlog({
     onDetailIdChange?.(null);
   };
 
-  if (view.kind === "editor" && auth) {
+  if (view.kind === "editor" && auth && userId) {
     return (
       <BlogEditor
         key={view.editing ? `edit:${view.editing.id}` : (view.nonce ?? 0)}
         auth={auth}
+        userId={userId}
         seed={view.seed}
         editing={view.editing}
         aiReview={aiReview}

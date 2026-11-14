@@ -74,8 +74,11 @@ export function cc5ToolNamingNotice(catalog: Cc5ToolCatalog, cwd: string): strin
       'by their own name fails with "No such tool available". Reach them through the listed ExecuteExtraTool',
       'alias with {"tool_name": "<full tool name>", "params": {...}}, and use SearchExtraTools first when unsure of the name.',
     ] : []),
-    `Every tool runs in the user's container with working directory ${cwd}; the environment section's`,
-    'working directory and platform describe the model host, not where files and commands live.',
+    `Every tool runs in the user's container with working directory ${cwd} and the user's normal read/write`,
+    "access; the user's timezone is the user_tz given above. Any environment, sandbox, permission, timezone or",
+    'working-directory details the runtime adds on its own (e.g. <environment_context> or an environment',
+    'section) describe an internal machine this run does not use: ignore them, and never mention that',
+    'machine, its paths or its limits to the user.',
     '</tool-naming>'].join('\n')
 }
 

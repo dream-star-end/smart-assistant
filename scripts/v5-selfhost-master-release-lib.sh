@@ -1331,6 +1331,29 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box long-task generations gate 失败"
   fi
+  # OCV5-763: reverse-imported commercial incidents need actual selfhost runners.
+  # Existing train-isolated test DB only; no production credentials or model invocation.
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      REQUIRE_TEST_DB=1 TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+      npx --no-install tsx scripts/check-v5-master-incident-proofs.ts ); then
+    cleanup_master_staging
+    die "pinned imported master incident proofs failed"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
+    cleanup_master_staging
+    die "pinned imported codex-chatgpt-ws proof failed"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+    cleanup_master_staging
+    die "pinned imported ocv5-376-platform-tool-proofs proof failed"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
+    cleanup_master_staging
+    die "pinned imported box-terminal-unproven-probe proof failed"
+  fi
   master_gate_db_drop
   mlog "  upload retention HTTP responsiveness proof @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
@@ -1347,6 +1370,11 @@ build_master_release() {
   if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
+  fi
+  # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
+    cleanup_master_staging
+    die "pinned Codex late-stop closure proof failed"
   fi
   cleanup_master_gate_tmpdir
 
@@ -1981,4 +2009,69 @@ COMMIT;")"; then
     fi
     sleep 5
   done
+}
+
+REMOTE_V4_CUTOVER_DRAINED=0
+
+remote_v4_cutover_reopen() {
+  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  REMOTE_V4_CUTOVER_DRAINED=0
+  [[ "${DRY:-0}" != 1 ]] || return 0
+  [[ -S "$sock" ]] || return 0
+  bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || true
+}
+
+# OCV5-749 AC-5: R1 generation cutover drain fence. Closes new remote-pool admissions
+# (`REMOTE_POOL_DRAINING_RETRY_LATER`) and waits for active relays + remote journals;
+# aborts cutover without killing active turns if drain times out.
+remote_v4_cutover_drain() {
+  local sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"
+  local timeout_ms="${OC_REMOTE_V4_DRAIN_TIMEOUT_MS:-600000}"
+  local run_id="${LEASE_TRAIN_ID:-cutover-$$}" out rc=0 v4_active has_version
+  if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
+    return 0
+  fi
+  if [[ "${DRY:-0}" == 1 ]]; then
+    cutover_clog "  [dry-run] R1 远端驱动池排空闸门 ($sock, timeout=${timeout_ms}ms)"
+    return 0
+  fi
+  out="$(bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" \
+    --drain --socket "$sock" --timeout-ms "$timeout_ms" --release-run-id "$run_id" 2>&1)" || rc=$?
+  if [[ "$rc" == 0 ]]; then
+    REMOTE_V4_CUTOVER_DRAINED=1
+    cutover_clog "  remote-v4 drain ok: $out"
+    return 0
+  fi
+  if [[ "$rc" == 75 ]]; then
+    # PostgreSQL resolves column names even in an unselected CASE branch. Check
+    # the schema separately: on the first v4 release this runs before 0339.
+    if ! has_version="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT EXISTS (
+  SELECT 1 FROM information_schema.columns
+   WHERE table_schema='public' AND table_name='remote_agent_bindings' AND column_name='remote_protocol_version'
+)::text;" 2>/dev/null)"; then
+      cutover_clog "  ✗ remote-v4 schema 查询失败;拒绝切流"
+      return 1
+    fi
+    case "$has_version" in
+      false) v4_active=0 ;;
+      true)
+        if ! v4_active="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT count(*)::text FROM public.remote_agent_bindings
+ WHERE remote_protocol_version=4 AND state<>'released';" 2>/dev/null)"; then
+          cutover_clog "  ✗ remote-v4 绑定计数查询失败;拒绝切流"
+          return 1
+        fi
+        ;;
+      *) cutover_clog "  ✗ remote-v4 schema 查询结果无效;拒绝切流"; return 1 ;;
+    esac
+    if [[ "$v4_active" == "0" ]]; then
+      cutover_clog "  remote-v4 drain socket absent ($sock); active_v4_bindings=0,继续切流"
+      return 0
+    fi
+    cutover_clog "  ✗ remote-v4 drain socket 缺失但存在活跃 v4 绑定 ($v4_active);拒绝切流"
+    return 1
+  fi
+  cutover_clog "  ✗ remote-v4 排空超时或失败 (rc=$rc): $out;中止切流,不强杀在途回合"
+  return 1
 }

@@ -641,7 +641,9 @@ class E2eCcbKernel extends EventEmitter {
   consultTurnBinding:
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined
-  get isRunning() { return true }
+  private running = true
+  get isRunning() { return this.running }
+  assertPromptPrivacyStopped(): void { assert.equal(this.running, false) }
   setConsultTurn(
     binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
   ): void {
@@ -654,8 +656,8 @@ class E2eCcbKernel extends EventEmitter {
       stop_reason: 'end_turn', is_error: false,
     })
   }
-  async start(): Promise<void> {}
-  async shutdown(): Promise<void> {}
+  async start(): Promise<void> { this.running = true }
+  async shutdown(): Promise<void> { this.running = false }
   async waitForOutputDrain(): Promise<void> {}
   interrupt(): boolean { return false }
   clearSessionId(): void { this.sessionId = null }
@@ -680,7 +682,9 @@ class E2eCodexKernel extends EventEmitter {
   consultTurnBinding:
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined
-  get isRunning() { return true }
+  private running = true
+  get isRunning() { return this.running }
+  assertPromptPrivacyStopped(): void { assert.equal(this.running, false) }
   setConsultTurn(
     binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
   ): void {
@@ -697,8 +701,8 @@ class E2eCodexKernel extends EventEmitter {
       stop_reason: 'end_turn', is_error: false, requestId: this.requestId,
     })
   }
-  async start(): Promise<void> {}
-  async shutdown(): Promise<void> {}
+  async start(): Promise<void> { this.running = true }
+  async shutdown(): Promise<void> { this.running = false }
   async waitForOutputDrain(): Promise<void> {}
   interrupt(): boolean { return false }
   clearSessionId(): void {}

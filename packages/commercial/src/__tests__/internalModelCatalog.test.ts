@@ -19,8 +19,12 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { describe, test } from "node:test";
 
-import { matchBridgeApiAllowlist, matchCommercialContainerApiProxy } from "@openclaude/gateway";
-import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import {
+  matchBridgeApiAllowlist,
+  matchCommercialContainerApiProxy,
+  parseCatalogResponse,
+} from "@openclaude/gateway";
+import { DEFAULT_CODEX_ENGINE_MODEL, MODEL_CATALOG_PROJECTION_FORMAT } from "@openclaude/protocol";
 
 import { hashSecret, type ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import type { UserModelAuthz } from "../auth/userModelAuthz.js";
@@ -354,7 +358,8 @@ describe("internalModelCatalog — epoch 窄端点", () => {
     const res = makeRes();
     await h(makeReq({ auth: `Bearer ${TOKEN}`, url: MODEL_CATALOG_EPOCH_PATH }), res, CTX);
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.body, { epoch: "9", availability_revision: "availability-1" });
+    assert.deepEqual(res.body, { epoch: "9", availability_revision: "availability-1",
+      projection_format: MODEL_CATALOG_PROJECTION_FORMAT });
     assert.equal(res.headers[SECURITY_EPOCH_HEADER], "9");
   });
 
@@ -455,5 +460,80 @@ describe("internalModelCatalog — seed 完整性(全局断言)", () => {
     assert.ok(PLATFORM_SEED_MODEL_IDS.includes("deepseek-v4-flash"));
     assert.ok(!PLATFORM_SEED_MODEL_IDS.includes("glm-5.3-zai"));
     assert.ok(!PLATFORM_SEED_MODEL_IDS.includes("glm-5.3"));
+  });
+});
+
+
+describe("OCV5-518 local Box context ownership", () => {
+  test("projects only declared exact Box ownership from the fenced authorized catalog", async () => {
+    const profile = (owner = true) => ({ supportsVision: false,
+      reasoning: { supported: ["low" as const], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: false,
+        ...(owner ? { contextOwner: "box-native-v1" as const } : {}) } });
+    const models = [
+      entry({ entryId: 51, modelId: "box-api-claude-haiku-5-5", providerId: "box_cli", capabilityProfile: profile() }),
+      entry({ entryId: 52, modelId: "box-api-claude-sonnet-5-5", providerId: "ark", capabilityProfile: profile() }),
+      entry({ entryId: 53, modelId: "box-api-claude-haiku-4-5", providerId: "box_cli", capabilityProfile: profile(false) }),
+      entry({ entryId: 54, modelId: "glm-5.2", providerId: "box_cli", capabilityProfile: profile() }),
+      entry({ entryId: 55, modelId: "box-api-claude-opus-5-5", providerId: "box_cli", engine: "codex", capabilityProfile: profile() }),
+    ];
+    const snap = new ModelCatalogSnapshot({ entries: models, aliases: new Map(),
+      pricing: new Map(models.map(m => [m.modelId, price(m.modelId)])), securityEpoch: 5n });
+    const res = makeRes();
+    await handler({ snapshot: snap })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.projection_format, MODEL_CATALOG_PROJECTION_FORMAT);
+    assert.deepEqual(body.models.filter(m => m.context_owner).map(m => m.model_id), ["box-api-claude-haiku-5-5"]);
+    assert.equal(body.models.find(m => m.model_id === "box-api-claude-haiku-5-5")?.context_owner, "box-native-v1");
+    // The v1 token projection stays compatible with existing gateways/egresses.
+    assert.equal(body.projection_revision, snap.projectionRevisionFor({ uid: 42, role: "user", grantedModelIds: new Set() }));
+  });
+
+  test("ungranted hidden Box ownership is not exposed", async () => {
+    const model = "box-api-claude-haiku-5-5";
+    const snap = new ModelCatalogSnapshot({ entries: [entry({ entryId: 56, modelId: model,
+      providerId: "box_cli", capabilityProfile: { supportsVision: false,
+        reasoning: { supported: [], codexModelDefault: null },
+        ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" } } })],
+      aliases: new Map(), pricing: new Map([[model, price(model, { visibility: "hidden" })]]), securityEpoch: 5n });
+    const res = makeRes();
+    await handler({ snapshot: snap })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.body.models, []);
+  });
+
+  test("projection format state does not add snapshot or authz dependencies", async () => {
+    const res = makeRes();
+    await handler({ assertFreshFails: true, authzFails: true })(makeReq({ auth: `Bearer ${TOKEN}`, url: MODEL_CATALOG_EPOCH_PATH }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.projection_format, MODEL_CATALOG_PROJECTION_FORMAT);
+  });
+
+  test("remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)", async () => {
+    const ownerProfile = {
+      supportsVision: false,
+      reasoning: { supported: ["low" as const], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" as const },
+    };
+    const models = [
+      entry({ entryId: 61, modelId: "box-api-claude-haiku-5-5", providerId: "box_cli", capabilityProfile: ownerProfile }),
+      entry({ entryId: 62, modelId: "claude-opus-5-5-remote", providerId: "remote_pool", capabilityProfile: ownerProfile }),
+    ];
+    const snap = new ModelCatalogSnapshot({
+      entries: models,
+      aliases: new Map(),
+      pricing: new Map(models.map((m) => [m.modelId, price(m.modelId)])),
+      securityEpoch: 6n,
+    });
+    const res = makeRes();
+    await handler({ snapshot: snap })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.models.find((m) => m.model_id === "box-api-claude-haiku-5-5")?.context_owner, "box-native-v1");
+    assert.equal(body.models.find((m) => m.model_id === "claude-opus-5-5-remote")?.context_owner, undefined);
+    const view = parseCatalogResponse(body);
+    assert.equal(view.resolve("box-api-claude-haiku-5-5")?.contextOwner, "box-native-v1");
+    assert.equal(view.resolve("claude-opus-5-5-remote")?.contextOwner, undefined);
   });
 });

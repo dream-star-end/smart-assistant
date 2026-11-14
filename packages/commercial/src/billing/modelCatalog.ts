@@ -34,7 +34,6 @@ import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@op
 import {
   isCc5TestModel,
   isBoxGptWebModel,
-  isBoxGptWebOwnerUid,
   PLATFORM_REASONING_EFFORTS,
   type PlatformReasoningEffort,
 } from "@openclaude/protocol";
@@ -43,7 +42,7 @@ import { query, type QueryRunner } from "../db/queries.js";
 import { getPool } from "../db/index.js";
 import { projectContextWindowForRole } from "./modelRolePolicy.js";
 import type { ModelPricing, ModelVisibility } from "./pricing.js";
-import { isCursorCredentialMember, parseCursorCredentialUids } from "../cursor/access.js";
+import { isBoxGptWebAllowedUser, isCursorCredentialMember, parseCursorCredentialUids } from "../cursor/access.js";
 import { meetsMinPlan } from "./planEntitlement.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -631,7 +630,7 @@ export class ModelCatalogSnapshot {
     const remotePoolOk =
       entry?.placement !== "remote_pool" || process.env.OC_REMOTE_POOL_EXECUTION_ENABLED !== "0";
     const routable = entry !== undefined && schemaOk && remotePoolOk && pricing !== undefined;
-    const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebOwnerUid(scope.uid);
+    const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebAllowedUser(scope.uid);
     const cc5Ok = !isCc5TestModel(canonical); // retired task model; backend routing uses existing Sonnet
     const cursorOk = cc5Ok &&
       (entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;

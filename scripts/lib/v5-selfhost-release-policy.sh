@@ -475,6 +475,7 @@ release_policy_flip_live() { # saga extra_apply, after real prechecks/context ar
   release_policy_assert_no_service_jobs || return $?
   # A user may have begun a turn while the old reader was draining. Apply the
   # existing real idle gate again before runtime/egress/master are restarted.
+  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 79; fi
   cutover_wait_for_user_idle || return 79
   release_policy_require_owner || return 86
 }

@@ -134,9 +134,10 @@ export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
 
 /**
  * 标准/1M 上下文成对家族。`collapsedByDefault` 是选择器的展示语义:为 true 的家族默认
- * 收进「更多 GPT 模型」折叠组。GPT-5.6(0288)与 GPT-6 Sol(0292)退出选择器;
+ * 收进「更多 GPT 模型」折叠组。个人版目录下线的 GPT-5.6 不据此删除商业兼容映射;GPT-6 Sol 不进该家族表;
  * GPT-6 Astra / GPT-6.1 Sol / Luna 都直接展示,不进「更多」。切流冒烟 C2 选可见模型,
- * 不再依赖折叠组。当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
+ * 不再依赖折叠组。商业仍启用的 GPT-5.6 家族保留原上下文与折叠合同，目录决定可见性。
+ * 当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
  */
 export const CONTEXT_TIER_FAMILIES = [
   {
@@ -159,6 +160,27 @@ export const CONTEXT_TIER_FAMILIES = [
     standardId: 'gpt-6-luna',
     longId: 'gpt-6-luna-1m',
     collapsedByDefault: false,
+  },
+  {
+    family: 'gpt-5.6-sol',
+    familyLabel: 'GPT-5.6-Sol',
+    standardId: 'gpt-5.6-sol',
+    longId: 'gpt-5.6-sol-1m',
+    collapsedByDefault: false,
+  },
+  {
+    family: 'gpt-5.6-terra',
+    familyLabel: 'GPT-5.6-Terra',
+    standardId: 'gpt-5.6-terra',
+    longId: 'gpt-5.6-terra-1m',
+    collapsedByDefault: true,
+  },
+  {
+    family: 'gpt-5.6-luna',
+    familyLabel: 'GPT-5.6-Luna',
+    standardId: 'gpt-5.6-luna',
+    longId: 'gpt-5.6-luna-1m',
+    collapsedByDefault: true,
   },
   {
     family: 'kimi-k3',
@@ -300,7 +322,7 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
  *   only the route model's CLI ids plus ANTIGRAVITY_AUX_UPSTREAM_MODELS and
  *   meters every call it forwards.
  */
-export const ANTIGRAVITY_CLI_VERSION = '1.4.0'
+export const ANTIGRAVITY_CLI_VERSION = '1.5.8'
 /** Title generation (`requestType: checkpoint`) the CLI makes on every new
  * conversation. It is NOT included in the CLI's own `result.usage`, so CLI
  * usage alone under-bills. */
@@ -328,6 +350,39 @@ export const ANTIGRAVITY_ENGINE_MODELS = [
       medium: 'gemini-4-argon-medium',
       high: 'gemini-4-argon-high',
     },
+    experimental: true,
+  },
+  {
+    id: 'antigravity-gemini-4-carbon',
+    displayName: 'Gemini 4 Carbon (Antigravity)',
+    efforts: ['low', 'medium', 'high'],
+    defaultEffort: 'medium',
+    cliModels: {
+      low: 'gemini-4-carbon-low',
+      medium: 'gemini-4-carbon-medium',
+      high: 'gemini-4-carbon-high',
+    },
+    experimental: true,
+  },
+  {
+    id: 'antigravity-gemini-4-hydrogen',
+    displayName: 'Gemini 4 Hydrogen (Antigravity)',
+    efforts: ['low', 'medium', 'high', 'xhigh'],
+    defaultEffort: 'high',
+    cliModels: {
+      low: 'gemini-4-hydrogen-low',
+      medium: 'gemini-4-hydrogen-medium',
+      high: 'gemini-4-hydrogen-high',
+      xhigh: 'gemini-4-hydrogen-xhigh',
+    },
+    experimental: true,
+  },
+  {
+    id: 'antigravity-orchestrator-carbon',
+    displayName: 'Orchestrator Carbon (Antigravity)',
+    efforts: [],
+    defaultEffort: 'default',
+    cliModels: { default: 'gemini-pro-orchestrator' },
     experimental: true,
   },
   {

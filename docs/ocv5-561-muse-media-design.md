@@ -58,8 +58,8 @@ agent（任意引擎，shell）
 
 | # | 方法与路径 | 作用 | 要点 |
 |---|---|---|---|
-| 1 | `POST /hello` | 建立会话 | 请求体 `{bridge_version, hostname_hash, cli_path, cli_version}`。返回 `{session_id, poll_hold_sec:25, heartbeat_sec:15, limits:{…}}`。新 hello 会**顶替**旧 session（旧 session 的后续请求返回 409 `superseded`），保证同一时间只有一个 bridge 在线 |
-| 2 | `POST /poll` | 取任务（长轮询） | master 最多挂起 25 s。有任务就返回 `{job}`，没有就 204。每次 poll 都刷新 `last_seen`。job 里带一次性 `job_nonce` |
+| 1 | `POST /hello` | 建立会话 | 请求体 `{bridge_version, hostname_hash, cli_path, cli_version}`。返回 `{session_id, poll_hold_sec:15, heartbeat_sec:15, limits:{…}}`。新 hello 会**顶替**旧 session（旧 session 的后续请求返回 409 `superseded`），保证同一时间只有一个 bridge 在线 |
+| 2 | `POST /poll` | 取任务（长轮询） | master 最多挂起 15 s（OCV5-758 前为 25 s）。有任务就返回 `{job}`，没有就 204。每次 poll 都刷新 `last_seen`。job 里带一次性 `job_nonce` |
 | 3 | `POST /jobs/{id}/heartbeat` | 任务进行中保活 | 每 15 s 一次，带 `job_nonce`。返回 `{cancel:true}` 表示 master 已放弃这个任务（超时或调用方断开），bridge 要立刻杀掉 CLI |
 | 4 | `PUT /jobs/{id}/files/{idx}/chunks/{n}` | 分片上传成品 | 原始字节，`Content-Type: application/octet-stream`，每片 ≤ 4 MiB，头里带 `X-Chunk-Sha256`。master 校验后追加写入临时文件 |
 | 5 | `POST /jobs/{id}/result` | 结束任务 | 成功：`{ok:true, files:[{idx, filename, mime, bytes, sha256}], meta:{artifact_ids, snapshot_id, media_type}}`。失败：`{ok:false, error_code, error_message, downstream_status, retryable, exit_code}`。master 核对每个文件的总长度和整体 sha256 |
@@ -102,7 +102,7 @@ bridge 端的安全约束：
 
 | 场景 | 处理 |
 |---|---|
-| 空闲 | bridge 循环 `/poll`，master 挂起 25 s，低于 Cloudflare 约 100 s 的空闲断开阈值 |
+| 空闲 | bridge 循环 `/poll`，master 挂起 15 s（OCV5-758 前 25 s；Muse VM 出口代理+Cloudflare 会掐 25 s 空闲连接），低于 Cloudflare 约 100 s 的空闲断开阈值 |
 | 判断在线 | `now - last_seen ≤ 60 s` 算在线。不在线时工具立即返回 `MUSE_BRIDGE_OFFLINE`，不排队 |
 | 网络错误或 5xx | 指数退避 1、2、4 … 60 s，加 ±20% 抖动，然后重新 `/hello` |
 | 401 或 403 | token 无效或已吊销。bridge 打印“token 失效”后**退出**，不死循环 |

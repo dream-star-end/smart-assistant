@@ -20,7 +20,7 @@ import time
 import tempfile
 import types
 
-PINNED = {'oc-remote-hostd.py': '304f22eb46ba990081334fbee12c7de81db686957f196d994c53f43b9c7d4377', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
+PINNED = {'oc-remote-hostd.py': 'f1e019dc2c65b1332155df0553ffbed913c010f458fa25215241aaf2edaffc14', 'codex-fixed-mcp.py': 'eb27f0a14c1c6dcda98b009ae29e6800b39aeb8905894e0173a8477642e8ce3a', 'codex-mcp-socket.py': 'c8f184d0981c53bffbd9ffeff39dbe7d295e029f972cd85b0af5ad592411974d'}
 CLI = Path('/usr/bin/codex')
 NATIVE = Path('/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
 MAX_FRAME = 2 * 1024 * 1024
@@ -229,7 +229,10 @@ def provision_locked(root):
     client=module('codex-fixed-mcp.py'); client.read_catalog(root)
     h=module('oc-remote-hostd.py')
     h.codex_check_config_sources(Path(m['codexHome']),root/'cwd')
-    argv=[str(CLI),*h.codex_policy_args(),'-c','model_catalog_json='+json.dumps(str(root/'models.json')),
+    # thread_unload_delay_secs=0: an unsubscribed thread unloads at once, so a refreshed-instructions
+    # resume reloads it instead of reusing the old instructions held in memory.
+    argv=[str(CLI),*h.codex_policy_args(),'-c','thread_unload_delay_secs=0',
+          '-c','model_catalog_json='+json.dumps(str(root/'models.json')),
           '-c','mcp_servers.ocbridge.command="/usr/bin/python3"',
           '-c','mcp_servers.ocbridge.args='+json.dumps(['-I','-B',str(root/'codex-fixed-mcp.py'),str(root)]),
           '-c','mcp_servers.ocbridge.required=true','-c','mcp_servers.ocbridge.default_tools_approval_mode="approve"']
@@ -339,7 +342,7 @@ class Policy:
         method=frame.get('method'); p=frame.get('params',{})
         require(isinstance(p,dict),'CODEX_RPC_REJECTED')
         allowed={'initialize','initialized','model/list','account/read','mcpServerStatus/list','thread/start','thread/resume',
-                 'thread/read','turn/start','turn/interrupt'}
+                 'thread/read','thread/unsubscribe','turn/start','turn/interrupt'}
         require(method in allowed,'CODEX_RPC_REJECTED')
         if method=='initialized':
             require(self.initialized and not p and 'id' not in frame,'CODEX_RPC_REJECTED'); return frame
@@ -360,7 +363,8 @@ class Policy:
         elif method=='turn/start':
             require(set(p)<={'threadId','input','effort','serviceTier','summary','model','cwd','approvalPolicy','sandboxPolicy'},'CODEX_RPC_REJECTED')
             require(self.thread and p.get('threadId')==self.thread and not self.turn
-                    and 'turn/start' not in self.pending.values(),'CODEX_RPC_REJECTED')
+                    and not any(x in ('turn/start','thread/start','thread/resume','thread/unsubscribe')
+                                for x in self.pending.values()),'CODEX_RPC_REJECTED')
             require(isinstance(p.get('input'),list) and p['input'] and all(isinstance(x,dict) and set(x)<={'type','text','text_elements'}
                     and x.get('type')=='text' and isinstance(x.get('text'),str) for x in p['input']),'CODEX_RPC_REJECTED')
             model=next(x for x in self.models if (x.get('model') or x.get('id'))==self.m['model'])
@@ -370,6 +374,10 @@ class Policy:
                 require(p['serviceTier'] in model.get('serviceTiers',[]),'CODEX_RPC_REJECTED')
             p={**p,'model':self.m['model'],'cwd':str(self.root/'cwd'),'approvalPolicy':'never',
                'sandboxPolicy':{'type':'readOnly','networkAccess':False}}
+        elif method=='thread/unsubscribe':
+            # Unloads the thread so the next resume re-reads its instructions; never mid-turn.
+            require(set(p)=={'threadId'} and self.thread and p['threadId']==self.thread and not self.turn
+                    and not any(x.startswith(('thread/','turn/')) for x in self.pending.values()),'CODEX_RPC_REJECTED')
         elif method in ('turn/interrupt','thread/read'):
             require(set(p)<=({'threadId','turnId'} if method=='turn/interrupt' else {'threadId','includeTurns'})
                     and self.thread and p.get('threadId')==self.thread,'CODEX_RPC_REJECTED')

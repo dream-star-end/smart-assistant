@@ -3,8 +3,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { runBoxToolFirstRound } from "./boxToolFirstRound.js";
+import { runBoxToolFirstRound, BoxToolFirstRoundError } from "./boxToolFirstRound.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
+import { BoxSpoolTerminalError } from "./boxSpoolPoller.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxNativeHistoryBasis } from "./boxNativeHistory.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
@@ -70,6 +71,8 @@ const finalRaw = Buffer.from(finalRecords.map((record) => JSON.stringify(record)
 
 function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean;
   directFinal?: boolean; finalTrailing?: boolean;
+  terminalProof?: "worker_complete" | "keeper_stopped" | "worker_failed";
+  emptyFirstRead?: boolean;
   failAssetStage?: number; failInputStage?: number;
   stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
   badAssetManifest?: boolean;
@@ -89,6 +92,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   const unknownPhases: string[] = [];
   const emitted: string[] = [];
   let disposed = false, launches = 0, recordedOffset = -1;
+  let spoolReads = 0;
   let currentNonce = "", currentEpoch = "";
   let controlHash = "";
   let retained = false, cleanupRetained = false;
@@ -132,6 +136,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         && args[5] === "--read") {
         sequence.push("spool-read");
         const offset = Number(args[7]);
+        if (options.emptyFirstRead && spoolReads++ === 0) {
+          return { stdout: JSON.stringify({ data: "", offset }), stderrBytes: 0,
+            exitCode: 0 as const };
+        }
         const body = options.spoolBody ?? (options.directFinal
           ? options.finalTrailing ? Buffer.concat([finalRaw, Buffer.from("bad-after-success\n")])
             : finalRaw : raw);
@@ -150,11 +158,14 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       }
       if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
         sequence.push("proof-read");
-        return { stdout: JSON.stringify({ runNonce: currentNonce,
+        const reason = options.terminalProof ?? "worker_complete";
+        return { stdout: `${JSON.stringify({ runNonce: currentNonce,
           leaseEpoch: currentEpoch, keeperPid: 101, cliPid: 102,
-          reason: "worker_complete", revision: 1 }) + "\n",
+          reason, ...(reason === "worker_failed" ? { revision: 2, workerExitCode: 1 }
+            : { revision: 1 }) })}\n`,
         stderrBytes: 0, exitCode: 0 as const };
       }
+
       if (args[2]?.includes("if kind=='attachment':")) {
         sequence.push("transcript-read");
         return { stdout: `${JSON.stringify({ records: options.transcriptRecords ?? [] })}\n`,
@@ -964,6 +975,40 @@ test("OCV5-313 an unread CLI version never looks up, claims or records a native 
     else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
+
+// INC-20261006-BOX-SYNTHETIC-TURN-HELD: the CLI's own synthetic user turn inside
+// a model message (here without a trusted native session, so it is unbound) is a
+// property of this stream: stop the run and settle it, never leave it unknown.
+const syntheticTurnRaw = Buffer.from([records[0], records[1],
+  { type: "user", isSynthetic: true, parent_tool_use_id: null,
+    message: { role: "user", content: [{ type: "text",
+      text: "Output token limit hit. Resume directly" }] } },
+  ...records.slice(2)].map((record) => `${JSON.stringify(record)}\n`).join(""));
+
+test("INC-20261006 a synthetic CLI turn inside a message is stopped and settled, not left unknown", async () => {
+  const f = fixture({ spoolBody: syntheticTurnRaw });
+  let stops = 0;
+  const deps = { ...f.deps, stopRejectedRun: async () => { stops++; return "stopped_proven" as const; } };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_COMPACT_UNBOUND");
+  assert.equal(stops, 1);
+  assert.ok(!f.sequence.includes("unknown"));
+  assert.deepEqual(f.unknownPhases, []);
+  assert.equal(f.retained, false);
+  // the run finished on its own: settled from its keeper proof, not billed
+  const g = fixture({ spoolBody: syntheticTurnRaw });
+  const settled: unknown[] = [];
+  const d = { ...g.deps, stopRejectedRun: async () => "completed_unsettled" as const,
+    readTerminalProof: (async (args: { runNonce: string; leaseEpoch: string }) => ({
+      reason: "worker_complete", runNonce: args.runNonce, leaseEpoch: args.leaseEpoch })) as never,
+    journal: { ...(g.deps.journal as object), markFirstRoundRejectedStream: async (input: unknown) => {
+      settled.push(input); } } as never };
+  await assert.rejects(() => runBoxToolFirstRound(g.input, d),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_COMPACT_UNBOUND");
+  assert.equal(settled.length, 1);
+  assert.deepEqual(g.unknownPhases, []);
+});
+
 const upstreamRefusalRaw = Buffer.from([records[0], ...readFileSync(new URL(
   "./__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl", import.meta.url), "utf8")
   .trim().split("\n").map((line) => JSON.parse(line) as unknown)]
@@ -1036,6 +1081,38 @@ test("a native claim lost to a concurrent turn degrades to a cold start, not an 
   }
 });
 
+test("OCV5-756: a context miss after a written pointer logs which part changed, without content", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const priorBody = { ...canonicalBody, system: "SECRET system v1",
+      messages: [{ role: "user", content: "SECRET prior question" }] } as ProxyBody;
+    const first = fixture({ directFinal: true });
+    const written = await runBoxToolFirstRound({ ...first.input, canonicalBody: priorBody,
+      init: { ...first.input.init, body: JSON.stringify({ ...priorBody, model }) } }, first.deps);
+    assert.ok(written.kind === "final" && written.nativePointer, "the first turn writes a pointer");
+    const pointer = written.kind === "final" ? written.nativePointer! : null;
+    const next = { ...priorBody, system: "SECRET system v2", messages: [
+      ...priorBody.messages,
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "SECRET new question" }] } as ProxyBody;
+    const f = fixture({ directFinal: true, nativeCandidate: { ownerRequestId: "native-owner", pointer: pointer! } });
+    const decisions: Array<{ reason: string; detail?: unknown }> = [];
+    const result = await runBoxToolFirstRound({ ...f.input, canonicalBody: next,
+      init: { ...f.input.init, body: JSON.stringify({ ...next, model }) } },
+    { ...f.deps, onNativeDecision: (info) => { decisions.push(info); } });
+    assert.equal(result.kind, "final");
+    const context = decisions.find((item) => item.reason === "context");
+    assert.deepEqual(context?.detail, { basis: "known",
+      system: { prev: 1, next: 1, firstDiff: 0 }, changed: ["system"] });
+    assert.doesNotMatch(JSON.stringify(decisions), /SECRET/);
+    assert.equal(f.admittedNative, null, "a diagnosed miss is still a cold start");
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
 test("OCV5-384: a re-staged conversation carries the session's native context records", async () => {
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";
@@ -1091,4 +1168,208 @@ test("tool task keeps its exact context across confirmed missing egress and auth
   assert.equal(f.launches, 1);
   assert.match(f.emitted.join(""), /direct answer/);
   assert.equal(JSON.stringify(f.input.canonicalBody), before);
+});
+
+test("a strictly proven stopped worker is retained without another Stop or unknown transition", async () => {
+  const f = fixture({ directFinal: true, terminalProof: "keeper_stopped" });
+  let stops = 0;
+  let release!: () => void;
+  const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
+  const deps = { ...f.deps, terminalUnprovenStopWaitMs: 40,
+    stopRejectedRun: async () => { stops++; return hung; } };
+  const started = Date.now();
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => error instanceof BoxSpoolTerminalError
+      && error.code === "BOX_SPOOL_KEEPER_STOPPED");
+  assert.equal(stops, 0);
+  assert.ok(Date.now() - started < 2_000, "a hanging stop does not hold the request");
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.deepEqual(f.unknownPhases, []);
+  assert.equal(f.retained, true);
+  release();
+  await hung;
+});
+
+
+test("first round notices failed terminal after cleanup empties its spool and records the cause first", async () => {
+  const f = fixture({ spoolBody: Buffer.alloc(0), terminalProof: "worker_failed" });
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_SPOOL_WORKER_FAILED");
+    assert.equal(input.phase, "first_round");
+    f.sequence.push("first-failure"); return null;
+  };
+  let stops = 0;
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    stopRejectedRun: async () => { stops++; return "pending"; } }),
+  (error: unknown) => error instanceof BoxSpoolTerminalError
+    && error.proof.reason === "worker_failed" && error.accountId === 20n);
+  assert.equal(stops, 0);
+  assert.equal(f.launches, 1);
+  assert.equal(f.disposed, false);
+  assert.equal(f.retained, true);
+  assert.ok(f.sequence.indexOf("first-failure") < f.sequence.indexOf("retain-unknown"));
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+});
+
+test("first round drains a late final after strict worker_complete and commits once", async () => {
+  const f = fixture({ directFinal: true, emptyFirstRead: true });
+  const result = await runBoxToolFirstRound(f.input, f.deps);
+  assert.equal(result.kind, "final");
+  assert.equal(f.sequence.filter((x) => x === "terminal-journal").length, 1);
+  assert.ok(f.sequence.indexOf("proof-read") < f.sequence.lastIndexOf("spool-read"));
+  assert.equal(f.sequence.includes("unknown"), false);
+});
+
+test("first round never records a handoff drained after the writer is proven terminal", async () => {
+  const f = fixture({ emptyFirstRead: true });
+  await assert.rejects(runBoxToolFirstRound(f.input, f.deps),
+    (error: unknown) => error instanceof BoxSpoolTerminalError
+      && error.code === "BOX_SPOOL_TERMINAL_INCOMPLETE");
+  assert.equal(f.sequence.includes("pending-read"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.equal(f.sequence.includes("unknown"), false);
+  assert.equal(f.retained, true);
+});
+
+
+test("first upstream refusal is durably projected before the explicit Stop can clean its spool", async () => {
+  const f = fixture({ spoolBody: upstreamRefusalRaw });
+  const events: string[] = [];
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_CLI_UPSTREAM_RATE_LIMITED");
+    assert.equal(input.phase, "first_round");
+    events.push("first-failure"); return null;
+  };
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    stopRejectedRun: async () => { events.push("stop"); return "stopped_proven"; } }),
+  /BOX_CLI_UPSTREAM_RATE_LIMITED/);
+  assert.deepEqual(events, ["first-failure", "stop"]);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+});
+
+
+test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and does not complete it", async (t) => {
+  const f = fixture({ directFinal: true });
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const run = f.target.exec.run.bind(f.target.exec);
+  f.target.exec.run = async (request) => {
+    if (request.args[2]?.includes("terminal.json")) {
+      f.sequence.push("proof-missing");
+      // Exhaust the real proof-wait budget without spending 20 wall seconds.
+      // Missing strict proof stays unknown; it is not keeper_stopped evidence.
+      now += 20_001;
+      throw new BoxExecTransportError("BOX_EXEC_REMOTE_EXIT", true, 1);
+    }
+    return run(request);
+  };
+  const events: string[] = [];
+  const journal = f.deps.journal as unknown as {
+    recordFirstFailure?: (input: { code: string; phase: string }) => Promise<null> };
+  journal.recordFirstFailure = async (input) => {
+    assert.equal(input.code, "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.equal(input.phase, "first_round");
+    events.push("first-failure"); return null;
+  };
+  let stops = 0;
+  let stopStartedAt = 0;
+  let release!: () => void;
+  const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
+  try {
+    await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+      terminalUnprovenStopWaitMs: 40,
+      stopRejectedRun: async () => {
+        events.push("stop"); stops++; stopStartedAt = performance.now(); return hung;
+      } }),
+    (error: unknown) => error instanceof BoxToolFirstRoundError
+      && error.code === "BOX_TOOL_TERMINAL_UNPROVEN");
+    assert.ok(f.sequence.includes("proof-missing"));
+    assert.equal(stops, 1);
+    assert.deepEqual(events, ["first-failure", "stop"],
+      "save the original UNPROVEN failure before Stop can clean its spool");
+    assert.ok(performance.now() - stopStartedAt < 2_000,
+      "the hanging Stop cannot hold this unproven request indefinitely");
+    assert.equal(f.sequence.includes("terminal-journal"), false);
+    assert.equal(f.sequence.includes("durable-handoff"), false);
+    assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+    assert.equal(f.retained, true);
+    assert.equal(f.disposed, false, "unknown remote stop cannot release the owned target");
+  } finally { release(); await hung; }
+});
+
+test("tool validation first errors survive first-round cleanup and strict terminal wrapping", async () => {
+  const malformedInput = Buffer.from([records[0], records[1], records[2],
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"private-input":' } }),
+    records[5]].map((item) => `${JSON.stringify(item)}\n`).join(""));
+  const outOfOrder = Buffer.from([records[0], event({ type: "content_block_delta", index: 0,
+    delta: { type: "text_delta", text: "private-output" } })]
+    .map((item) => `${JSON.stringify(item)}\n`).join(""));
+  for (const item of [
+    { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput },
+    { code: "BOX_TOOL_ORDER_INVALID", spoolBody: outOfOrder },
+    { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput,
+      terminalProof: "worker_failed" as const, emptyFirstRead: true },
+  ]) {
+    const f = fixture(item);
+    const journal = f.deps.journal as unknown as {
+      recordFirstFailure?: (input: { code: string; phase: string; diagnostic?: unknown }) => Promise<null> };
+    const saved: Array<{ code: string; phase: string; diagnostic?: unknown }> = [];
+    journal.recordFirstFailure = async (input) => {
+      saved.push(input); f.sequence.push("first-failure"); return null;
+    };
+    await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+      stopRejectedRun: async () => { f.sequence.push("stop"); return "stopped_proven"; } }),
+    (error: unknown) => {
+      if (item.terminalProof) {
+        assert.ok(error instanceof BoxSpoolTerminalError);
+        assert.equal(error.proof.reason, "worker_failed");
+        assert.equal((error.cause as { code: string }).code, item.code);
+      } else assert.equal((error as { code: string }).code, item.code);
+      return true;
+    });
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0]!.code, item.code);
+    assert.equal(saved[0]!.phase, "first_round");
+    assert.ok(saved[0]!.diagnostic);
+    assert.ok(!JSON.stringify(saved, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value).includes("private"));
+    for (const later of ["stop", "unknown", "retain-unknown"]) {
+      if (f.sequence.includes(later))
+        assert.ok(f.sequence.indexOf("first-failure") < f.sequence.indexOf(later));
+    }
+    assert.equal(f.launches, 1);
+    assert.equal(f.sequence.includes("durable-handoff"), false);
+    assert.equal(f.sequence.includes("terminal-journal"), false);
+  }
+});
+
+// OCV5-762 (uid 4, 2026-11-12 20:03:40 CST, journal 5bc4629d): a first round
+// ran 5.5 minutes, then its spool reads were refused with HTTP 417. The run was
+// left unknown and the next message got BOX_RESUME_IN_PROGRESS.
+test("OCV5-762 a first round whose Exec reads stay refused is named and stopped once", async () => {
+  const f = fixture({ directFinal: true });
+  const run = f.target.exec.run.bind(f.target.exec);
+  let refused = 0;
+  f.target.exec.run = async (request) => {
+    if (request.args[5] === "--read") { refused++; throw new BoxExecTransportError("BOX_EXEC_HTTP_417", false); }
+    return run(request);
+  };
+  const events: string[] = [];
+  await assert.rejects(runBoxToolFirstRound(f.input, { ...f.deps,
+    terminalUnprovenStopWaitMs: 40,
+    stopRejectedRun: async () => { events.push("stop"); return "stopped_proven"; } }),
+  (error: unknown) => error instanceof BoxExecTransportError && error.code === "BOX_EXEC_HTTP_417");
+  assert.equal(refused, 2, "exactly one retry on the refreshed descriptor");
+  assert.deepEqual(events, ["stop"]);
+  assert.deepEqual(f.unknownPhases, ["first_round_exec_rejected"]);
+  assert.equal(f.sequence.includes("terminal-journal"), false);
 });

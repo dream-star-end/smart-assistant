@@ -76,6 +76,15 @@ start_run() {
   [[ -z "$dirty" ]] || die "V5 canonical 非 clean，拒绝 detached deploy"
   active_runner_exists && die "已有 detached V5 deploy unit 正在运行；保持只读并先查 status"
 
+  # 发车前只读预检:队列 / 证明门测试库 / egress 面这几类确定性错误在建 unit 之前就报,
+  # 不再等 unit 跑 20s–7min 才由 deploy-v5.sh 报同样的错。deploy-v5.sh 的门全部照跑。
+  # OC_V5_DETACHED_SKIP_PREFLIGHT=1 只在预检自身出故障时用;它不跳过 deploy-v5.sh 的任何门。
+  if [[ "${OC_V5_DETACHED_SKIP_PREFLIGHT:-0}" == 1 ]]; then
+    echo "! OC_V5_DETACHED_SKIP_PREFLIGHT=1:跳过发车预检(deploy-v5.sh 自身门照跑)" >&2
+  else
+    bash "$SCRIPT_DIR/v5-deploy-preflight.sh" -- "$@" || die "发车预检未通过,未创建 detached unit"
+  fi
+
   sha="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
   mode="${1:---deploy}"
   mode="${mode#--}"
@@ -106,6 +115,8 @@ start_run() {
   add_optional_env runner V5_ENV
   add_optional_env runner CADDY_HTTP_PORT
   add_optional_env runner OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS
+  # build_release 的 Box 事故证明门要求显式测试库(回环 *_test);transient unit 不继承调用方环境。
+  add_optional_env runner OC_V5_PROOF_TEST_DATABASE_URL
 
   runner+=(/usr/bin/bash "$SCRIPT_DIR/deploy-v5.sh" "$@")
   "${runner[@]}"
@@ -126,7 +137,7 @@ show_status() {
 }
 
 wait_run() {
-  local unit="$1" state substate status
+  local unit="$1" state substate status result
   validate_unit "$unit"
   require_tool systemctl
   require_loaded_unit "$unit"
@@ -149,10 +160,14 @@ wait_run() {
   done
   status="$(systemctl show "$unit" --property=ExecMainStatus --value)"
   [[ "$status" =~ ^[0-9]+$ ]] || die "无法读取 ExecMainStatus:$unit"
+  result="$(systemctl show "$unit" --property=Result --value)"
   show_status "$unit"
   systemctl stop "$unit" >/dev/null 2>&1 \
     || echo "! 已完成的 detached deploy unit 清理失败:$unit" >&2
   (( status <= 255 )) || status=1
+  if (( status == 0 )) && [[ "$result" != success || "$state" == failed ]]; then
+    status=1
+  fi
   exit "$status"
 }
 

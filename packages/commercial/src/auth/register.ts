@@ -18,10 +18,11 @@
  *   - CONFLICT:邮箱已存在
  *   - EMAIL_DOMAIN_BLOCKED:邮箱域名命中 system_settings.register_email_domain_blocklist
  *     (一次性邮箱黑名单 — 反薅羊毛;verify 路径也会再查一次,详见 verify.ts)
+ *   - IP_REGISTRATION_LIMIT:同 IP 账号数已满,或拿不到合法客户端 IP(registrationIpCap.ts)
  *
  * 不在本文件:
  *   - HTTP/Express 路由(T-14+)
- *   - 同 IP 限流(T-14+ 速率限制中间件)
+ *   - 同 IP 短时尝试限流(T-14+ 速率限制中间件)
  */
 
 import { z } from "zod";
@@ -31,6 +32,8 @@ import { tx } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
 import type { Mailer } from "./mail.js";
+import { renderVerifyEmail } from "./verifyEmailTemplate.js";
+import { claimRegistrationIpSlot } from "./registrationIpCap.js";
 
 /** RFC 5322 简化邮箱正则,长度 ≤ 254(05-SEC §7) */
 const emailSchema = z
@@ -67,7 +70,8 @@ export type RegisterErrorCode =
   | "VALIDATION"
   | "TURNSTILE_FAILED"
   | "CONFLICT"
-  | "EMAIL_DOMAIN_BLOCKED";
+  | "EMAIL_DOMAIN_BLOCKED"
+  | "IP_REGISTRATION_LIMIT";
 
 export class RegisterError extends Error {
   readonly code: RegisterErrorCode;
@@ -112,7 +116,7 @@ export interface RegisterDeps {
   turnstileBypass?: boolean;
   /** 账号级旁路白名单(env TURNSTILE_BYPASS_ACCOUNTS),生产给自动化账号留的合法通道 */
   turnstileBypassAccounts?: readonly string[];
-  /** 用户 IP — 转给 turnstile + 反滥用日志 */
+  /** 用户 IP — 转给 turnstile,并作为 users.registration_ip 计入同 IP 账号上限 */
   remoteIp?: string;
   /** 测试可注入 fetch(传给 turnstile) */
   fetchImpl?: typeof fetch;
@@ -200,6 +204,7 @@ export function isEmailDomainBlocked(
 
 /** Internal normal-registration core; register() owns validation, transaction and mail policy. */
 async function insertUnverifiedAccount(client: PoolClient, input: {
+  remoteIp?: string;
   email: string;
   passwordHash: string;
   verificationHash: string;
@@ -207,6 +212,9 @@ async function insertUnverifiedAccount(client: PoolClient, input: {
   display_name?: string;
   terms_version?: string;
 }): Promise<string> {
+  if (!(await claimRegistrationIpSlot(client, input.remoteIp))) {
+    throw new RegisterError("IP_REGISTRATION_LIMIT", "该网络注册的账号数已达上限");
+  }
   // INSERT user;email UNIQUE 约束撞了会抛 23505。
   // credits 不带,默认 0。注册赠金已于 2026-07-07 下线;免费额度由 login/SSO/
   // GET /api/me 调用 ensureFreeSubscription 发放期内桶 300,verifyEmail 不再发积分。
@@ -217,11 +225,11 @@ async function insertUnverifiedAccount(client: PoolClient, input: {
   // NOW();无值两列 NULL(旧 bundle / 直连 API),语义见迁移头注释。
   const ins = await client.query<{ id: string }>(
     `INSERT INTO users(email, password_hash, display_name, v5_migrated_at, v5_migration_status,
-                       terms_version, terms_accepted_at)
+                       terms_version, terms_accepted_at, registration_ip)
      VALUES ($1, $2, $3, NOW(), 'migrated',
-             $4, CASE WHEN $4::text IS NULL THEN NULL ELSE NOW() END)
+             $4, CASE WHEN $4::text IS NULL THEN NULL ELSE NOW() END, $5::inet)
      RETURNING id::text AS id`,
-    [input.email, input.passwordHash, input.display_name ?? null, input.terms_version ?? null],
+    [input.email, input.passwordHash, input.display_name ?? null, input.terms_version ?? null, input.remoteIp],
   );
   const uid = ins.rows[0].id;
   await client.query(
@@ -307,7 +315,7 @@ export async function register(
   try {
     userId = await tx<string>(async (client) => {
       return insertUnverifiedAccount(client, { ...input, passwordHash,
-        verificationHash: verify.hash, expiresAtIso });
+        verificationHash: verify.hash, expiresAtIso, remoteIp: deps.remoteIp });
     });
   } catch (err) {
     // pg 唯一约束冲突
@@ -326,23 +334,16 @@ export async function register(
   //      163/QQ 把注册确认邮件扔垃圾箱概率较高;主动提示能省掉大量
   //      "没收到邮件"工单。boss 2026-04-23 明确要求加此提示。
   //   3) 告知 30min 过期 + 如何重发
+  // 2026-10-09 OCV5-363:正文移到 verifyEmailTemplate.ts,另带 HTML 卡片版。
   let sent = true;
   try {
     await deps.mailer.send({
       to: input.email,
-      subject: "[OpenClaude] 邮箱验证码 · 完成注册",
-      text:
-        `你好,欢迎使用 OpenClaude。\n\n` +
-        `这是一封由 OpenClaude（claudeai.chat）发出的邮箱验证邮件。你的验证码是:\n\n` +
-        `    ${verify.raw}\n\n` +
-        `请在有效期内回到注册页输入此验证码完成验证。\n` +
-        `验证码 30 分钟内有效,一次性使用。若验证码过期,可在注册页点「重新发送」。\n\n` +
-        `请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n` +
-        `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
-        `   并把 OpenClaude 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n` +
-        `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n` +
-        `—— OpenClaude 团队\n` +
-        `claudeai.chat`,
+      ...renderVerifyEmail({
+        kind: "register",
+        code: verify.raw,
+        ttlMinutes: VERIFY_EMAIL_TTL_SECONDS / 60,
+      }),
     });
   } catch {
     sent = false;

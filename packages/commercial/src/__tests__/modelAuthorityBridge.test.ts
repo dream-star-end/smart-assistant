@@ -180,7 +180,7 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       entry({
         entryId: 4,
         modelId: DEFAULT_CCB_SUBAGENT_MODEL,
-        providerId: "zai",
+        providerId: "scnet",
         contextWindow: 200_000,
       }),
     );
@@ -238,6 +238,9 @@ interface Rig {
   traceWrites: Array<{ sql: string; params: unknown[] }>;
   deferredPoolErrors: Error[];
   dispatchValidationErrors: Error[];
+  /** 真容器 gateway 侧的 consumer/connection(attest 用的同一个 challenge)。 */
+  containerConsumer?: ModelAuthorityConsumer;
+  containerConn?: ReturnType<ModelAuthorityConsumer["newConnection"]>;
 }
 
 async function startRig(opts: {
@@ -288,6 +291,8 @@ async function startRig(opts: {
   deferContainerSendCompletionForTest?: (complete: () => void) => void;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
+  /** OCV5-746:注入可观察的 preCheckRedis(默认空桩,断言不到 releaseReservation)。 */
+  preCheckRedis?: unknown;
 }): Promise<Rig> {
   const containerSeen: string[] = [];
   const recycled: Array<{ containerId: number; reason: string }> = [];
@@ -434,6 +439,10 @@ async function startRig(opts: {
     : undefined;
   const pgPool = opts.pgPool ?? defaultDurablePgPool;
 
+  // 测试用**生产 gateway 代码**真消费 bridge 转发给容器的帧(OCV5-746)。
+  let containerConsumer: ModelAuthorityConsumer | undefined;
+  let containerConn: ReturnType<ModelAuthorityConsumer["newConnection"]> | undefined;
+
   const containerWss = new WebSocketServer({ port: 0 });
   await new Promise<void>((r) => containerWss.once("listening", () => r()));
   const containerPort = (containerWss.address() as { port: number }).port;
@@ -442,15 +451,27 @@ async function startRig(opts: {
     const sendAttest = () => {
       if (opts.attest === "silent") return;
       if (opts.durableDispatch && opts.attest === "yes") {
-        // B10:手工 attest 帧携带 durable-turn-dispatch-v1 + model-authority 双 capability。
-        // 省略 keyIds(keyIdsUnknown → 不判死),仅为驱动 dispatch 受理路径。
+        // B10:attest 帧同时携带 durable-turn-dispatch-v1 + model-authority 双 capability。
+        // OCV5-746:改用**真 gateway 构造**(真 challenge/keyIds),测试才能用同一
+        // consumer/conn 真消费 bridge 转发的帧,而不是只验签 authority 字段。
+        const consumer = new ModelAuthorityConsumer({
+          keyring: signer.publicKeyring(),
+          containerId: CONTAINER_ID,
+          uid: UID,
+          required: true,
+        });
+        const conn = consumer.newConnection();
+        containerConsumer = consumer;
+        containerConn = conn;
+        const attest = buildContainerAttestFrame(consumer, conn, CONTAINER_ID);
         ws.send(
           JSON.stringify({
-            type: CONTAINER_ATTEST_FRAME_TYPE,
-            capabilities: [MODEL_AUTHORITY_CAPABILITY, DURABLE_TURN_DISPATCH_CAPABILITY, ...(opts.systemHelp ? [SYSTEM_HELP_CAPABILITY] : [])],
-            connectionChallenge: "chal-" + Math.random().toString(16).slice(2),
-            containerId: CONTAINER_ID,
-            authorityTtlMs: 120_000,
+            ...attest,
+            capabilities: [
+              ...attest.capabilities,
+              DURABLE_TURN_DISPATCH_CAPABILITY,
+              ...(opts.systemHelp ? [SYSTEM_HELP_CAPABILITY] : []),
+            ],
           }),
         );
         return;
@@ -465,6 +486,8 @@ async function startRig(opts: {
           required: true,
         });
         const conn = consumer.newConnection();
+        containerConsumer = consumer;
+        containerConn = conn;
         ws.send(JSON.stringify(buildContainerAttestFrame(consumer, conn, CONTAINER_ID)));
         return;
       }
@@ -588,10 +611,10 @@ async function startRig(opts: {
     ...(pgPool
       ? {
           pgPool: pgPool as UserChatBridgeDeps["pgPool"],
-          preCheckRedis: {
+          preCheckRedis: (opts.preCheckRedis ?? {
             atomicReserve: async () => ({ ok: true }),
             release: async () => {},
-          } as unknown as UserChatBridgeDeps["preCheckRedis"],
+          }) as UserChatBridgeDeps["preCheckRedis"],
           pricing: { get: () => undefined } as unknown as UserChatBridgeDeps["pricing"],
         }
       : {}),
@@ -618,6 +641,9 @@ async function startRig(opts: {
     traceWrites,
     deferredPoolErrors,
     dispatchValidationErrors,
+    // attest 在 bridge 连上容器后才发生 —— 用 getter 读取,不能在 return 时快照。
+    get containerConsumer() { return containerConsumer; },
+    get containerConn() { return containerConn; },
   };
 }
 
@@ -1433,15 +1459,19 @@ describe("OCV5-613 canonical identity follows the admitted dispatch", () => {
       for (const container of rig.containerWss.clients) container.close(1011, "613 isolated close");
       await waitFor(() => client!.readyState === WebSocket.CLOSED);
       releaseAdmit();
-      await waitFor(() => queries.some((q) => q.params[2] === "bridge_closed_during_admission"));
+      await waitFor(() => queries.some((q) => q.params[1] === "bridge-admission-handoff"));
       assert.equal(admissions.length, 1);
       const admission = admissions[0]!;
       assert.equal(admission.agentId, "main");
-      const terminal = queries.filter((q) => /status = 'terminal'/.test(q.sql));
-      assert.equal(terminal.length, 1);
-      assert.equal(terminal[0]!.params[0], admission.dispatchId);
-      assert.equal(terminal[0]!.params[1], "executed_error");
-      assert.equal(terminal[0]!.params[2], "bridge_closed_during_admission");
+      // Commercial e37d6ce8 keeps a closed admission rejecting until exact
+      // inbox proof resolves ownership; a late close must not invent a terminal.
+      const rejecting = queries.filter((q) => /status = 'rejecting'/.test(q.sql));
+      assert.equal(rejecting.length, 1);
+      assert.equal(rejecting[0]!.params[0], admission.dispatchId);
+      assert.equal(rejecting[0]!.params[1], "bridge-admission-handoff");
+      assert.equal(rejecting[0]!.params[3], "1", "handoff remains fenced by the admitted epoch");
+      assert.match(rejecting[0]!.sql, /status = 'admitted' AND lease_epoch = \$4/);
+      assert.equal(queries.filter((q) => /status = 'terminal'/.test(q.sql)).length, 0);
       const insert = queries.find((q) => /INSERT INTO turn_traces/.test(q.sql));
       assert.ok(insert);
       const links = queries.filter((q) => /SET dispatch_id = COALESCE/.test(q.sql));
@@ -2336,7 +2366,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
     }
   });
 
-  test("R4-B6 container close during enrichment still terminalizes immediately", async () => {
+  test("R4-B6 container close during enrichment immediately hands ownership to durable proof", async () => {
     const queries: { sql: string; params: unknown[] }[] = [];
     const pgPool = {
       query: async (sql: string, params: unknown[] = []) => {
@@ -2368,7 +2398,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => historyStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "test close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseHistory!([]);
@@ -2394,6 +2424,11 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       connect: async () => ({
         query: async (sql: string, params: unknown[] = []) => {
           if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+          // OCV5-746:pre-forward 失败出口现在走事务 client,终态 CAS 在这里被观察到。
+          if (/UPDATE turn_dispatches/.test(sql) && /status = 'terminal'/.test(sql)) {
+            queries.push({ sql, params });
+            return { rows: [], rowCount: 1 };
+          }
           if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
             return { rows: [{
               user_id: UID.toString(),
@@ -2447,7 +2482,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => bindingStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "post lookup close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseBinding();
@@ -2826,6 +2861,45 @@ test('OCV5-179 identity: slow readiness cannot be overtaken on the same raw peer
   } finally {release();await stopRig(rig);}
 });
 
+
+test("OCV5-511 exact replay snapshot commits before ACK and survives shutdown during delayed enrichment", async () => {
+  let admitted: AdmitUserTurnInput | undefined;
+  let releaseHistory!: (rows: unknown[]) => void;
+  let historyStarted = false;
+  const gate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const rig = await startRig({ attest: "yes", durableDispatch: true,
+    pgPool: { query: async (sql: string, params: unknown[] = []) => {
+      queries.push({ sql, params }); return { rows: [], rowCount: 1 };
+    } },
+    admitUserTurn: async (input) => { admitted = input; return fakeAdmittedDispatch(input); },
+    loadMasterSessionMessages: async () => { historyStarted = true; return gate; },
+  });
+  try {
+    const ws = await openClient(rig.port);
+    const received = frameCollector(ws);
+    ws.send(inboundFrame({ clientMessageId: "cm-511-shutdown", idempotencyKey: "web:cm-511-shutdown:0",
+      peer: { id: "sess-511-shutdown", kind: "dm" }, model: "glm-5.2", serviceTier: "fast",
+      contextTier: "1m", collabMode: "advisor", advisorModel: "gpt-6-astra", conversationMode: "plan" }));
+    const ack = await received.next();
+    assert.equal(ack.type, "outbound.ack");
+    assert.ok(admitted?.message._admissionRestartRequest, "snapshot supplied to transactional admission before ACK");
+    const snapshot = admitted.message._admissionRestartRequest as { version: number; wireBase64: string };
+    assert.equal(snapshot.version, 1);
+    const request = JSON.parse(Buffer.from(snapshot.wireBase64, "base64").toString("utf8"));
+    assert.equal(request.serviceTier, "fast"); assert.equal(request.contextTier, "1m");
+    assert.equal(request.collabMode, "advisor"); assert.equal(request.advisorModel, "gpt-6-astra");
+    assert.equal(request.conversationMode, "plan");
+    await waitFor(() => historyStarted);
+    await rig.bridge.shutdown();
+    await waitFor(() => queries.some(q => q.params[1] === "bridge-admission-handoff"));
+    releaseHistory([]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(rig.containerSeen.some(row => row.includes('"clientMessageId":"cm-511-shutdown"')), false);
+  } finally { releaseHistory([]); await stopRig(rig); }
+});
+
+
 describe('OCV5-610 independent help sidecar', () => {
   for (const capable of [false, true]) test(`help capability ${capable} keeps dispatch wire intact and strips browser-forged context`, { timeout: 15000 }, async () => {
     const scopes: Parameters<NonNullable<UserChatBridgeDeps['issueSystemHelpBootstrap']>>[0][] = []
@@ -2900,8 +2974,6 @@ test("RF-step3: attested tabs share the same executor through owner detach", asy
     b.close();
   } finally { await stopRig(rig); }
 });
-
-
 describe('remote-pool lane authority', () => {
   const operationId = '00000000-0000-4000-8000-000000000123';
   const sessionKey = 'agent:main:webchat:dm:cc5-native-chat';
@@ -2977,4 +3049,428 @@ test('Codex remote signed dispatch bypasses local Codex account acquisition and 
     assert.equal(localRouteCalls,0);assert.equal(frame.__oc_codex_route,undefined);
     assert.deepEqual(payload.executionDescriptor.supportedEfforts,['low']);ws.close();
   } finally {await stopRig(rig);}
+});
+
+const CODEX_REMOTE_BACKEND = (sessionKey: string) => ({
+  kind: 'codex-app-server-v1' as const, version: 1 as const,
+  operationId: '00000000-0000-4000-8000-000000000746',
+  sessionKey, generation: '1', profileId: 'default', authEpoch: '1',
+});
+
+describe('OCV5-746 chat turn model authority', () => {
+  test('codex -remote first frame is consumable by the real gateway (requestId === signed billingRequestId)', async () => {
+    const rig = await startRig({
+      attest: 'yes',
+      durableDispatch: true,
+      cc5BackendSelector: async (input) => CODEX_REMOTE_BACKEND(input.sessionKey),
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        model: 'gpt-6-luna-remote',
+        peer: { id: 'codex-remote-746', kind: 'dm' },
+        clientMessageId: 'cm-746-codex',
+        idempotencyKey: 'web:cm-746-codex:0',
+      }));
+      await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
+      const frame = firstInbound(rig.containerSeen);
+      const bundle = frame[MODEL_AUTHORITY_FIELD] as { authority: string; lease: string };
+      const payload = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
+      assert.equal(payload.engine, 'codex');
+      assert.equal(payload.executionBackend?.kind, 'codex-app-server-v1');
+      assert.match(String(frame.requestId), /^[0-9a-f]{32}$/);
+      assert.equal(frame.requestId, payload.billingRequestId,
+        'frame.requestId 必须与签名里的 billingRequestId 同源同值');
+      assert.ok(rig.containerConsumer && rig.containerConn, 'durable attest must expose the real consumer');
+      assert.doesNotThrow(
+        () => rig.containerConsumer!.consume(frame, rig.containerConn!),
+        '真实 gateway consume 不得以 billing_request_mismatch 拒掉首轮',
+      );
+      ws.close();
+    } finally { await stopRig(rig); }
+  });
+
+  test('container authority rejection terminalizes the dispatch, releases the remote binding and shows a bound error card', async () => {
+    const queries: Array<{ sql: string; params: unknown[] }> = [];
+    let admittedRow: Extract<ReturnType<typeof fakeAdmittedDispatch>, { kind: 'admitted' }>['dispatch'] | null = null;
+    let authorityBinding: Record<string, unknown> | null = null;
+    // OCV5-746: 不再只断言"发过 SQL" —— 夹具要真的命中 CAS / journal abort / 绑定释放,
+    // 否则即使一行都没改用例也会绿(独立审查指出的假绿)。
+    let terminalCasHits = 0;
+    let journalAbortParams: unknown[] | null = null;
+    let terminalCasParams: unknown[] | null = null;
+    let chatBindingParams: unknown[] | null = null;
+    let bindingReleaseHits = 0;
+    const reservationReleases: Array<{ userId: string; requestId: string }> = [];
+    // R2-C1:终态 CAS 与 journal abort 必须落在同一事务且顺序固定(BEGIN→CAS→ABORT→COMMIT)。
+    const txLog: string[] = [];
+    const clientQueries: Array<{ sql: string; params: unknown[] }> = [];
+    let dispatchStatus: 'admitted' | 'terminal' = 'admitted';
+    let journalStatus: 'inflight' | 'aborted' = 'inflight';
+    const remoteBinding = {
+      operation_id: '00000000-0000-4000-8000-000000000746', generation: '1',
+      state: 'running', engine: 'codex', remote_start_attempted: false,
+    };
+    const terminalRowOf = () => {
+      const d = admittedRow!;
+      return {
+        trace_id: d.traceId, dispatch_id: d.dispatchId, user_id: d.userId.toString(),
+        session_id: d.sessionId, client_message_id: d.clientMessageId, agent_id: d.agentId,
+        model: d.model, request_hash: d.requestHash, billing_request_id: d.billingRequestId,
+        attempt_no: d.attemptNo, status: 'terminal', outcome: 'executed_error',
+        failure_code: 'model_authority_rejected', conflict_reason: null, resolution: null,
+        resolved_at: null, client_notified: false, owner_id: d.ownerId,
+        lease_epoch: String(d.leaseEpoch), lease_until: null,
+        anchor_seq: d.anchorSeq === null ? null : d.anchorSeq.toString(),
+        admitted_at: d.admittedAt, accepted_at: null, terminal_at: new Date(),
+        last_attempt_at: new Date(), visible_head: null, visible_at: null,
+        producer_fenced_at: null, shutdown_ctx: null,
+        agent_container_id: null, runtime_kind: null,
+      };
+    };
+    // 受理需要 authority→dispatch 事务绑定;这里给出最小可核对的 client 桩。
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        if (/remote_agent_bindings/.test(sql) && /operation_id::text/.test(sql)) {
+          chatBindingParams = params;
+          // uid + session_key 精确匹配:传错命名空间(如浏览器 peer id)就必须查不到行。
+          const hit = params.every((p) => p !== undefined) &&
+            String(params[0]) === String(UID) && String(params[1]) === laneSessionKey;
+          return {
+            rows: hit ? [{ operation_id: remoteBinding.operation_id, generation: remoteBinding.generation }] : [],
+            rowCount: hit ? 1 : 0,
+          };
+        }
+        if (/SELECT \* FROM remote_agent_bindings/.test(sql)) {
+          // 按 operation_id/generation 精确匹配(R2-W1:不再恒返回一条绑定)。
+          const hit = params[0] === remoteBinding.operation_id &&
+            String(params[1]) === remoteBinding.generation;
+          return { rows: hit ? [{ ...remoteBinding }] : [], rowCount: hit ? 1 : 0 };
+        }
+        if (/UPDATE remote_agent_bindings/.test(sql)) {
+          if (remoteBinding.state === 'released') return { rows: [], rowCount: 0 };
+          remoteBinding.state = 'released';
+          bindingReleaseHits++;
+          return { rows: [], rowCount: 1 };
+        }
+        // R2-C1:终态 CAS / journal 补偿只允许在事务 client 上发生;pool 层遇到即 0 行,
+        // 让「退回非事务实现」的回归直接失败,而不是被夹具兜住。
+        return { rows: [], rowCount: 0 };
+      },
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          clientQueries.push({ sql, params });
+          if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) {
+            txLog.push(sql);
+            return { rows: [] };
+          }
+          // R2-C1:终态 CAS 与 journal abort 走同一事务 client,夹具按真实状态机 CAS。
+          if (/UPDATE turn_dispatches/.test(sql) && /status = 'terminal'/.test(sql)) {
+            if (dispatchStatus !== 'admitted') return { rows: [], rowCount: 0 };
+            dispatchStatus = 'terminal';
+            terminalCasHits++;
+            terminalCasParams = params;
+            txLog.push('CAS');
+            return { rows: [terminalRowOf()], rowCount: 1 };
+          }
+          if (/UPDATE request_finalize_journal/.test(sql)) {
+            if (journalStatus !== 'inflight') return { rows: [], rowCount: 0 };
+            journalStatus = 'aborted';
+            journalAbortParams = params;
+            txLog.push('ABORT');
+            return { rows: [{ user_id: String(admittedRow!.userId), request_id: 'req-746' }], rowCount: 1 };
+          }
+          if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
+            const d = admittedRow!;
+            return {
+              rows: [{
+                user_id: d.userId.toString(), session_id: d.sessionId, model: d.model,
+                attempt_no: d.attemptNo, status: d.status, owner_id: d.ownerId,
+                lease_epoch: String(d.leaseEpoch), lease_until: d.leaseUntil,
+              }],
+            };
+          }
+          if (/INSERT INTO authority_turn_dispatches/.test(sql)) {
+            authorityBinding = {
+              authority_turn_id: String(params[0]), user_id: String(params[1]),
+              dispatch_model: params[2], canonical_model: String(params[3]),
+              session_id: String(params[4]), dispatch_id: String(params[5]),
+              attempt_no: Number(params[6]),
+            };
+            return { rows: [] };
+          }
+          if (/FROM authority_turn_dispatches/.test(sql)) {
+            return { rows: authorityBinding ? [authorityBinding] : [] };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release: () => {},
+      }),
+    };
+    let dispatchId: string | null = null;
+    let billingRequestId: string | null = null;
+    let laneSessionKey: string | null = null;
+    const rig = await startRig({
+      attest: 'yes',
+      durableDispatch: true,
+      // 保持受理记录在 bridge map 里,直到我们注入拒帧(不让 mock 容器先回 receipt)。
+      holdDispatchReceipt: true,
+      pgPool,
+      // OCV5-746: journal 被永久 waiver 后,对应 preCheck 预留必须一并释放(否则额度占死)。
+      preCheckRedis: {
+        releaseReservation: async (ref: { userId: string; requestId: string }) => {
+          reservationReleases.push(ref);
+          return true;
+        },
+      },
+      cc5BackendSelector: async (input) => {
+        laneSessionKey = input.sessionKey;
+        return CODEX_REMOTE_BACKEND(input.sessionKey);
+      },
+      admitUserTurn: async (input) => {
+        dispatchId = input.dispatchId;
+        billingRequestId = input.billingRequestId;
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== 'admitted') throw new Error('fixture must admit the turn');
+        admittedRow = admitted.dispatch;
+        return admitted;
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const frames = frameCollector(ws);
+      ws.send(inboundFrame({
+        model: 'gpt-6-luna-remote',
+        peer: { id: 'codex-remote-746', kind: 'dm' },
+        clientMessageId: 'cm-746-codex',
+        idempotencyKey: 'web:cm-746-codex:0',
+      }));
+      await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
+      const forwarded = firstInbound(rig.containerSeen);
+      assert.equal(forwarded.requestId, billingRequestId);
+
+      const container = [...rig.containerWss.clients][0];
+      assert.ok(container, 'container socket must be connected');
+      container.send(JSON.stringify({
+        type: 'error',
+        code: 'MODEL_AUTHORITY_REJECTED',
+        error: 'model authority rejected',
+        message: 'model authority rejected',
+        peer: { id: 'codex-remote-746', kind: 'dm' },
+        clientMessageId: 'cm-746-codex',
+        model: 'gpt-6-luna-remote',
+      }));
+
+      // 1) dispatch 真的进入终态(executed_error)+ client_notified=false + epoch fence;
+      //    夹具按 epoch/status 真 CAS,只有 admitted 才命中。
+      await waitFor(() => terminalCasHits === 1);
+      assert.equal(terminalCasParams![0], dispatchId);
+      assert.equal(terminalCasParams![1], 'executed_error');
+      assert.equal(terminalCasParams![2], 'model_authority_rejected');
+      assert.equal(terminalCasParams![3], false);
+      assert.equal(terminalCasParams![6], '1', '必须带受理时的 lease epoch 作为 CAS fence');
+      // 2) trajectory: BEGIN → CAS → ABORT → COMMIT 必须在**同一事务**里完成,
+      //    reconciler ③ 无法插进 CAS 与 journal 补偿之间(R2-C1)。
+      await waitFor(() => txLog.includes('ABORT'));
+      // 末段事务 = 拒帧收敛(前面还有受理时 authority→dispatch 的那个事务)。
+      assert.deepEqual(txLog.slice(-4), ['BEGIN', 'CAS', 'ABORT', 'COMMIT']);
+      // 本地 Codex 的 pre-forward inflight journal 按 never-executed waiver abort,
+      // 且内嵌 no-usage 守卫(有账就不动 → 财务绝不静默免单)。
+      await waitFor(() => journalAbortParams !== null);
+      const abortQuery = clientQueries.find((q) => /UPDATE request_finalize_journal/.test(q.sql))!;
+      assert.equal(journalAbortParams![0], dispatchId);
+      assert.match(abortQuery.sql, /state='inflight'/);
+      assert.match(abortQuery.sql, /NOT EXISTS \(SELECT 1 FROM usage_records/);
+      // 2b) 被 abort 的 pre-forward journal 对应预留额度真的被释放,且用户身份来自 journal 行。
+      await waitFor(() => reservationReleases.length === 1);
+      assert.deepEqual(reservationReleases[0], { userId: String(UID), requestId: 'req-746' });
+      // 3) 远端绑定释放用的是受理时的**引擎 sessionKey**,不是浏览器 peer id;
+      //    并且真的走到了 proof-only 的 released CAS。
+      await waitFor(() => bindingReleaseHits === 1);
+      assert.equal(laneSessionKey, 'agent:main:webchat:dm:codex-remote-746');
+      assert.deepEqual(chatBindingParams, [UID, laneSessionKey]);
+      // 最终状态,不只是调用计数:dispatch 终态、journal 永久 waiver、绑定 released。
+      assert.equal(dispatchStatus, 'terminal');
+      assert.equal(journalStatus, 'aborted');
+      assert.equal(remoteBinding.state, 'released');
+      // 3) 浏览器收到能绑定到本轮的明确错误卡(peer + clientMessageId)。
+      let errFrame: Record<string, unknown> | null = null;
+      for (let i = 0; i < 30 && errFrame === null; i++) {
+        const f = await Promise.race([
+          frames.next(),
+          new Promise<Record<string, unknown>>((r) => setTimeout(() => r({ type: '__timeout' }), 200)),
+        ]);
+        if (f.type === 'error' && f.code === 'MODEL_AUTHORITY_REJECTED') errFrame = f;
+        else if (f.type === '__timeout') break;
+      }
+      assert.ok(errFrame, '用户必须收到 MODEL_AUTHORITY_REJECTED 错误卡');
+      assert.deepEqual(errFrame.peer, { id: 'codex-remote-746', kind: 'dm' });
+      assert.equal(errFrame.clientMessageId, 'cm-746-codex');
+      ws.close();
+    } finally { await stopRig(rig); }
+  });
+
+  type RejectProbe = {
+    terminalCasHits: number;
+    journalAbortHits: number;
+    bindingReleaseHits: number;
+    bindingState: string;
+    browserErrorFrames: Array<Record<string, unknown>>;
+  };
+  // 同一受理夹具:终态 CAS 恒 0 行(未命中),只观察拒帧会不会触发副作用。
+  const runRejectionProbe = async (rejectFrame: Record<string, unknown>): Promise<RejectProbe> => {
+    let admittedRow: Extract<ReturnType<typeof fakeAdmittedDispatch>, { kind: 'admitted' }>['dispatch'] | null = null;
+    let authorityBinding: Record<string, unknown> | null = null;
+    let terminalCasHits = 0;
+    let journalAbortHits = 0;
+    let bindingReleaseHits = 0;
+    let laneSessionKey: string | null = null;
+    const remoteBinding = {
+      operation_id: '00000000-0000-4000-8000-000000000747', generation: '1',
+      state: 'running', engine: 'codex', remote_start_attempted: false,
+    };
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        if (/remote_agent_bindings/.test(sql) && /operation_id::text/.test(sql)) {
+          const hit = String(params[1]) === laneSessionKey;
+          return {
+            rows: hit ? [{ operation_id: remoteBinding.operation_id, generation: remoteBinding.generation }] : [],
+            rowCount: hit ? 1 : 0,
+          };
+        }
+        if (/SELECT \* FROM remote_agent_bindings/.test(sql)) {
+          const hit = params[0] === remoteBinding.operation_id &&
+            String(params[1]) === remoteBinding.generation;
+          return { rows: hit ? [{ ...remoteBinding }] : [], rowCount: hit ? 1 : 0 };
+        }
+        if (/UPDATE remote_agent_bindings/.test(sql)) {
+          remoteBinding.state = 'released';
+          bindingReleaseHits++;
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+          if (/UPDATE turn_dispatches/.test(sql) && /status = 'terminal'/.test(sql)) {
+            terminalCasHits++;
+            return { rows: [], rowCount: 0 };
+          }
+          if (/UPDATE request_finalize_journal/.test(sql)) {
+            journalAbortHits++;
+            return { rows: [], rowCount: 0 };
+          }
+          if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
+            const d = admittedRow!;
+            return {
+              rows: [{
+                user_id: d.userId.toString(), session_id: d.sessionId, model: d.model,
+                attempt_no: d.attemptNo, status: d.status, owner_id: d.ownerId,
+                lease_epoch: String(d.leaseEpoch), lease_until: d.leaseUntil,
+              }],
+            };
+          }
+          if (/INSERT INTO authority_turn_dispatches/.test(sql)) {
+            authorityBinding = {
+              authority_turn_id: String(params[0]), user_id: String(params[1]),
+              dispatch_model: params[2], canonical_model: String(params[3]),
+              session_id: String(params[4]), dispatch_id: String(params[5]),
+              attempt_no: Number(params[6]),
+            };
+            return { rows: [] };
+          }
+          if (/FROM authority_turn_dispatches/.test(sql)) {
+            return { rows: authorityBinding ? [authorityBinding] : [] };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release: () => {},
+      }),
+    };
+    const rig = await startRig({
+      attest: 'yes',
+      durableDispatch: true,
+      holdDispatchReceipt: true,
+      pgPool,
+      cc5BackendSelector: async (input) => {
+        laneSessionKey = input.sessionKey;
+        return CODEX_REMOTE_BACKEND(input.sessionKey);
+      },
+      admitUserTurn: async (input) => {
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== 'admitted') throw new Error('fixture must admit the turn');
+        admittedRow = admitted.dispatch;
+        return admitted;
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const browserErrorFrames: Array<Record<string, unknown>> = [];
+      ws.on('message', (data) => {
+        try {
+          const f = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (f.type === 'error' && f.code === 'MODEL_AUTHORITY_REJECTED') browserErrorFrames.push(f);
+        } catch { /* non-JSON */ }
+      });
+      ws.send(inboundFrame({
+        model: 'gpt-6-luna-remote',
+        peer: { id: 'codex-remote-747', kind: 'dm' },
+        clientMessageId: 'cm-747-codex',
+        idempotencyKey: 'web:cm-747-codex:0',
+      }));
+      await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
+      const container = [...rig.containerWss.clients][0];
+      assert.ok(container, 'container socket must be connected');
+      container.send(JSON.stringify({
+        type: 'error',
+        code: 'MODEL_AUTHORITY_REJECTED',
+        error: 'model authority rejected',
+        message: 'model authority rejected',
+        model: 'gpt-6-luna-remote',
+        ...rejectFrame,
+      }));
+      // 给错误路径充足时间真的跑到(若错误地释放/终态,这里必然能观察到)。
+      await new Promise((r) => setTimeout(r, 400));
+      ws.close();
+      return {
+        terminalCasHits, journalAbortHits, bindingReleaseHits,
+        bindingState: remoteBinding.state, browserErrorFrames,
+      };
+    } finally { await stopRig(rig); }
+  };
+
+  const unverifiedRejections: Array<[string, Record<string, unknown>]> = [
+    ['mismatched peer', { peer: { id: 'someone-else', kind: 'dm' }, clientMessageId: 'cm-747-codex' }],
+    ['missing peer', { clientMessageId: 'cm-747-codex' }],
+    ['null peer', { peer: null, clientMessageId: 'cm-747-codex' }],
+    ['empty peer id', { peer: { id: '', kind: 'dm' }, clientMessageId: 'cm-747-codex' }],
+    ['missing clientMessageId', { peer: { id: 'codex-remote-747', kind: 'dm' } }],
+  ];
+  for (const [label, fields] of unverifiedRejections) {
+    test(`rejection with ${label} has zero side effects and shows no error card`, async () => {
+      // audit R1-C1/W1:身份字段缺失或不匹配一律 fail-closed —— 不终态、不免单、不释放绑定、不发卡。
+      const probe = await runRejectionProbe(fields);
+      assert.equal(probe.terminalCasHits, 0, `${label}: 不得终态 dispatch`);
+      assert.equal(probe.journalAbortHits, 0, `${label}: 不得免单 journal`);
+      assert.equal(probe.bindingReleaseHits, 0, `${label}: 不得释放远端绑定`);
+      assert.equal(probe.bindingState, 'running');
+      assert.equal(probe.browserErrorFrames.length, 0, `${label}: 不得给用户发终止错误卡`);
+    });
+  }
+
+  test('verified rejection whose terminal CAS misses does not release the remote lane', async () => {
+    // audit R1-W2:身份对上但 CAS 未命中(别的路径已接管) → 不得撤销 lane。
+    const probe = await runRejectionProbe({
+      peer: { id: 'codex-remote-747', kind: 'dm' },
+      clientMessageId: 'cm-747-codex',
+    });
+    assert.equal(probe.terminalCasHits, 1, '身份合法的拒帧必须尝试终态 CAS');
+    assert.equal(probe.journalAbortHits, 0, 'CAS 未命中不得免单');
+    assert.equal(probe.bindingReleaseHits, 0, 'CAS 未命中不得释放远端绑定');
+    assert.equal(probe.bindingState, 'running');
+    assert.equal(probe.browserErrorFrames.length, 1, '身份合法的拒帧仍要给用户可绑定错误卡');
+  });
 });

@@ -10,14 +10,20 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 
 import type { Logger } from '../logging/logger.js'
-import { makeMuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
+import { makeMuseBridgeHttpHandler, parseByteRange } from '../muse/bridgeHttp.js'
 import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse/hub.js'
 import {
+  INLINE_SOURCE_MAX_BYTES,
   MAX_DISPATCH_ATTEMPTS,
+  MUSE_RETRY_INTERVAL_MS,
+  MUSE_LIMITS,
   MuseError,
+  POLL_HOLD_SEC,
+  base64DecodedBytes,
+  bridgeFetchesSources,
+  supportsSourceRefs,
   parseAllowedUids,
   parseSubmission,
-  supportsSourceRefs,
 } from '../muse/protocol.js'
 import type { MuseJobFinish, MuseStore } from '../muse/store.js'
 
@@ -54,14 +60,28 @@ class MemStore implements MuseStore {
   async countRecent() {
     return this.recent
   }
+  async countSiteToday() {
+    return 0
+  }
   async failOrphans() {
     return 0
   }
   async findJob(userId: string, id: string) {
     const r = this.rows.get(id)
     return r && r.userId === userId
-      ? { id, kind: r.kind, status: r.status as 'queued', errorCode: r.error }
+      ? {
+          id,
+          kind: r.kind,
+          status: r.status as 'queued',
+          errorCode: r.error,
+          files: null,
+          snapshotId: null,
+          debitedCredits: null,
+        }
       : null
+  }
+  async openCredits() {
+    return 0n
   }
   async findCredential(s: Buffer) {
     const id = this.creds.get(s.toString('hex'))
@@ -84,9 +104,24 @@ function makeHub(
     rate,
     cliTimeoutSec: { image: 120, video: 300 },
     now: () => clock.t,
-    logger,
+    ...(logger ? { logger } : {}),
   })
 }
+
+/** A logger that records warnings (msg + meta). */
+function captureLogger(warns: Array<[string, Record<string, unknown>]>): Logger {
+  const l = {
+    child: () => l,
+    debug: () => {},
+    info: () => {},
+    error: () => {},
+    warn: (msg: string, meta?: Record<string, unknown>) => warns.push([msg, meta ?? {}]),
+  }
+  return l as unknown as Logger
+}
+
+/** A PNG-signed buffer of exactly n bytes (the hub only sniffs the magic number). */
+const pngOf = (n: number) => Buffer.concat([PNG.subarray(0, 8), Buffer.alloc(n - 8, 3)])
 
 const flush = () => new Promise((r) => setImmediate(r))
 
@@ -137,6 +172,68 @@ describe('muse protocol', () => {
     })
     assert.equal(ok.source_images?.length, 1)
   })
+  // INC-20261026-MUSE-SOURCE-CHUNK-256K: hello overrides the bridge defaults, so a smaller master
+  // value silently undid the 1 MiB Range chunk of the CDN short-read hardening (bridge 0.5.1).
+  it('hello source_chunk_bytes is never below the bridge default and within its hard limit', () => {
+    const py = readFileSync(new URL('../../muse-bridge/muse_bridge.py', import.meta.url), 'utf8')
+    const limit = (block: string): number => {
+      const body = py.match(new RegExp(`^${block} = \\{([^}]*)\\}`, 'm'))?.[1] ?? ''
+      const m = body.match(/"source_chunk_bytes":\s*(\d+)\s*\*\s*MIB/)
+      assert.ok(m, `${block}.source_chunk_bytes not found in muse_bridge.py`)
+      return Number(m[1]) * 1024 * 1024
+    }
+    const sent = MUSE_LIMITS.source_chunk_bytes
+    // Explicit messages: a message-less assert.ok makes node re-read the source and hangs under tsx.
+    assert.ok(sent >= limit('DEFAULT_LIMITS'), `hello ${sent} < bridge default ${limit('DEFAULT_LIMITS')}`)
+    assert.ok(sent <= limit('HARD_LIMITS'), `hello ${sent} > bridge hard limit ${limit('HARD_LIMITS')}`)
+  })
+})
+
+describe('muse source references (OCV5-591 ref-A)', () => {
+  it('only bridges >= 0.5.0 fetch sources themselves', () => {
+    for (const v of ['0.5.0', '0.5.0+build.1', '0.5.1', '0.5.1-rc.1', '0.6.0', '1.0.0', '0.10.0'])
+      assert.equal(bridgeFetchesSources(v), true, v)
+    for (const v of [
+      null,
+      '',
+      '0.4.0',
+      '0.4.9',
+      '0.3.2',
+      'x',
+      '0.5',
+      '0.5.0-rc.1',
+      '0.5.0-01',
+      '00.5.0',
+      '0.5.1-01',
+    ])
+      assert.equal(bridgeFetchesSources(v), false, String(v))
+  })
+  it('decoded size of canonical base64', () => {
+    for (const n of [1, 2, 3, 4, 1000, 524_288]) {
+      assert.equal(base64DecodedBytes(Buffer.alloc(n, 9).toString('base64')), n)
+    }
+  })
+  it('byte ranges: none, a-b, a-, suffix, clamped end; invalid ranges 416', () => {
+    assert.equal(parseByteRange(undefined, 10), null)
+    assert.deepEqual(parseByteRange('bytes=0-3', 10), { start: 0, end: 3 })
+    assert.deepEqual(parseByteRange('bytes=4-', 10), { start: 4, end: 9 })
+    assert.deepEqual(parseByteRange('bytes=8-99', 10), { start: 8, end: 9 })
+    assert.deepEqual(parseByteRange('bytes=-3', 10), { start: 7, end: 9 })
+    for (const bad of [
+      'bytes=10-',
+      'bytes=5-2',
+      'bytes=-0',
+      'bytes=0-1,4-5',
+      'items=0-1',
+      'bytes=a-b',
+    ]) {
+      assert.throws(
+        () => parseByteRange(bad, 10),
+        (e: MuseError) => e.status === 416,
+        bad,
+      )
+    }
+  })
 })
 
 describe('muse hub', () => {
@@ -168,64 +265,15 @@ describe('muse hub', () => {
     return job
   }
 
+  function retryReady(target = hub, sid = (target as any).sessions.keys().next().value) {
+    clock.t += MUSE_RETRY_INTERVAL_MS
+    target.checkSession(sid)
+    target.tick()
+  }
+
   async function upload(job: MuseWireJob, data: Buffer) {
     await hub.putChunk(job.id, job.nonce, 0, 0, data, sha(data))
   }
-
-  it('source refs keep a multi-MiB claim small; legacy versions still receive inline sources', async () => {
-    const data = Buffer.concat([PNG, Buffer.alloc(3 * 1024 * 1024)])
-    for (const version of [null, '0.3.2', '0.4.0', '0.5.0-rc.1', '0.5.0', '0.6.0']) {
-      const sid = hub.hello('1', version)
-      const id = await hub.submit('3', null, parseSubmission({
-        kind: 'video', prompt: 'animate fox', source_images: [{ base64: data.toString('base64') }],
-      }))
-      const job = (await hub.poll(sid, 50))!
-      if (supportsSourceRefs(version)) {
-        assert.equal('source_images' in job, false)
-        assert.deepEqual(job.source_refs, [{ n: 0, bytes: data.length, sha256: sha(data), mime: 'image/png' }])
-        assert.ok(Buffer.byteLength(JSON.stringify({ job })) < 1024)
-      } else {
-        assert.equal('source_refs' in job, false)
-        assert.equal(job.source_images?.[0]?.base64, data.toString('base64'))
-      }
-      hub.cancel('3', id)
-    }
-  })
-
-  it('source bytes survive requeue but only the acked current nonce can read them', async () => {
-    const sid = hub.hello('1', '0.5.0')
-    await hub.submit('3', null, { kind: 'image', prompt: 'x', source_images: [PNG.toString('base64')] })
-    const first = (await hub.poll(sid, 50))!
-    assert.throws(() => hub.sourceFor(first.id, first.nonce, 0), (e: MuseError) => e.status === 410)
-    clock.t += 21_000
-    hub.tick()
-    const second = (await hub.poll(sid, 50))!
-    hub.heartbeat(second.id, second.nonce)
-    assert.throws(() => hub.sourceFor(first.id, first.nonce, 0), (e: MuseError) => e.status === 410)
-    assert.deepEqual(hub.sourceFor(second.id, second.nonce, 0).data, PNG)
-    hub.cancel('3', second.id)
-    assert.throws(() => hub.sourceFor(second.id, second.nonce, 0), (e: MuseError) => e.status === 410)
-  })
-
-  it('ack timeout logs the actual UTF-8 claim response bytes on requeue and exhaustion', async () => {
-    const entries: Array<{ msg: string; meta: Record<string, unknown> }> = []
-    const logger = {
-      child() { return this }, info() {}, error() {},
-      warn(msg: string, meta: Record<string, unknown>) { entries.push({ msg, meta }) },
-    } as unknown as Logger
-    hub = makeHub(store, clock, root, undefined, logger)
-    const sid = hub.hello('1', '0.5.0')
-    await hub.submit('3', null, { kind: 'image', prompt: '红狐', source_images: [PNG.toString('base64')] })
-    for (let attempt = 1; attempt <= MAX_DISPATCH_ATTEMPTS; attempt++) {
-      const job = (await hub.poll(sid, 50))!
-      clock.t += 21_000
-      hub.checkSession(sid)
-      hub.tick()
-      const entry = entries[attempt - 1]!
-      assert.equal(entry.msg, attempt === MAX_DISPATCH_ATTEMPTS ? 'muse_job_ack_timeout_failed' : 'muse_job_ack_timeout_requeued')
-      assert.equal(entry.meta.claimResponseBytes, Buffer.byteLength(JSON.stringify({ job })))
-    }
-  })
 
   it('deterministic job ids make submission idempotent (OCV5-591 A0)', async () => {
     await online()
@@ -269,8 +317,7 @@ describe('muse hub', () => {
     assert.equal(await hub.submit('3', null, { kind: 'image', prompt: 'fox' }, { jobId: id }), id)
   })
 
-  it('refuses when offline, not allowed, busy, or rate limited', async () => {
-    await assert.rejects(hub.submit('3', null, { kind: 'image', prompt: 'x' }), /not connected/)
+  it('refuses when not allowed, busy, or rate limited', async () => {
     await online()
     await assert.rejects(
       hub.submit('765', null, { kind: 'image', prompt: 'x' }),
@@ -299,6 +346,7 @@ describe('muse hub', () => {
       () => hub.heartbeat(first.id, first.nonce),
       (e: MuseError) => e.status === 410,
     )
+    retryReady()
     const second = (await hub.poll(sid, 50))!
     assert.equal(second.id, first.id)
     assert.notEqual(second.nonce, first.nonce)
@@ -307,67 +355,296 @@ describe('muse hub', () => {
     assert.deepEqual(store.running, [first.id])
   })
 
-  it('gives up after five un-acked dispatches, not before (relay drops poll replies)', async () => {
+  it('gives up after four un-acked dispatches, not before (relay drops poll replies)', async () => {
     const sid = await online()
     const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
-    assert.equal(MAX_DISPATCH_ATTEMPTS, 5)
-    for (let i = 0; i < 5; i++) {
+    assert.equal(MAX_DISPATCH_ATTEMPTS, 4)
+    for (let i = 0; i < MAX_DISPATCH_ATTEMPTS; i++) {
       assert.ok(await hub.poll(sid, 50), `dispatch ${i + 1}`)
       clock.t += 21_000
       hub.checkSession(sid)
       hub.tick()
-      if (i < 4) assert.notEqual((await hub.view('3', id, 0))?.status, 'failed', `alive after ${i + 1}`)
+      if (i < MAX_DISPATCH_ATTEMPTS - 1) {
+        assert.notEqual((await hub.view('3', id, 0))?.status, 'failed', `alive after ${i + 1}`)
+        retryReady()
+      }
     }
     const v = await hub.view('3', id, 0)
     assert.equal(v?.status, 'failed')
     assert.equal(v?.error?.code, 'MUSE_BRIDGE_LOST')
   })
 
+  it('the ack-timeout and give-up logs carry the claim size (OCV5-591)', async () => {
+    const warns: Array<[string, Record<string, unknown>]> = []
+    const logged = makeHub(store, clock, root, undefined, captureLogger(warns))
+    const sid = logged.hello('1', '0.4.0')
+    await logged.submit('3', null, {
+      kind: 'video',
+      prompt: 'x',
+      source_images: [pngOf(1000).toString('base64')],
+    })
+    for (let i = 0; i < MAX_DISPATCH_ATTEMPTS; i++) {
+      const job = (await logged.poll(sid, 50))!
+      assert.ok(job.source_images, `dispatch ${i + 1}`)
+      clock.t += 21_000
+      logged.checkSession(sid)
+      logged.tick()
+      if (i < MAX_DISPATCH_ATTEMPTS - 1) retryReady(logged, sid)
+    }
+    logged.stop()
+    const sizes = warns
+      .filter(([m]) => m === 'muse_job_ack_timeout_requeued')
+      .map(([m, meta]) => [m, meta.claimResponseBytes])
+    assert.equal(sizes.length, MAX_DISPATCH_ATTEMPTS)
+    assert.equal(sizes[MAX_DISPATCH_ATTEMPTS - 1]![0], 'muse_job_ack_timeout_requeued')
+    for (const [, n] of sizes) assert.ok(typeof n === 'number' && n > 1300, String(n))
+  })
+
+  it('bridges < 0.5 get sources inline; >= 0.5 get references and download them after the ack', async () => {
+    const src = pngOf(2000)
+    const spec = { kind: 'video' as const, prompt: 'cat', source_images: [src.toString('base64')] }
+    const oldSid = hub.hello('1', '0.4.0')
+    await hub.submit('3', null, spec)
+    const inline = (await hub.poll(oldSid, 50))!
+    assert.deepEqual(inline.source_images, [{ base64: src.toString('base64') }])
+    assert.equal(inline.source_refs, undefined)
+    // A 0.5 bridge says hello: the dispatched job goes back to the queue and comes out by reference.
+    const sid = hub.hello('1', '0.5.0')
+    retryReady()
+    const byRef = (await hub.poll(sid, 50))!
+    assert.equal(byRef.id, inline.id)
+    assert.equal(byRef.source_images, null)
+    assert.deepEqual(byRef.source_refs, [
+      { n: 0, bytes: 2000, sha256: sha(src), mime: 'image/png' },
+    ])
+    assert.ok(JSON.stringify({ job: byRef }).length < 1000)
+    // Not before the ack, never for a stale nonce, never out of range.
+    assert.throws(
+      () => hub.source(byRef.id, byRef.nonce, 0),
+      (e: MuseError) => e.status === 410,
+    )
+    hub.heartbeat(byRef.id, byRef.nonce)
+    assert.throws(
+      () => hub.source(byRef.id, inline.nonce, 0),
+      (e: MuseError) => e.status === 410,
+    )
+    assert.throws(
+      () => hub.source(byRef.id, byRef.nonce, 1),
+      (e: MuseError) => e.status === 404,
+    )
+    clock.t += 50_000
+    const got = hub.source(byRef.id, byRef.nonce, 0)
+    assert.ok(got.data.equals(src))
+    assert.equal(got.sha256, sha(src))
+    // The download counts as a sign of life: 50 s after the ack plus 50 s more is not "lost".
+    clock.t += 50_000
+    hub.tick()
+    assert.equal((await hub.view('3', byRef.id, 0))?.status, 'running')
+    // Gone once the job is finished.
+    await hub.result(byRef.id, byRef.nonce, {
+      ok: false,
+      error_code: 'MUSE_SOURCE_FETCH_FAILED',
+      retryable: true,
+    })
+    const v = await hub.view('3', byRef.id, 0)
+    assert.equal(v?.status, 'queued')
+    assert.equal(v?.retry_count, 2)
+    assert.throws(
+      () => hub.source(byRef.id, byRef.nonce, 0),
+      (e: MuseError) => e.status === 410,
+    )
+  })
+
+  it('large inline sources are refused up front only while the bridge is older than 0.5', async () => {
+    const big = {
+      kind: 'video' as const,
+      prompt: 'x',
+      source_images: [pngOf(INLINE_SOURCE_MAX_BYTES + 1).toString('base64')],
+    }
+    const atCap = {
+      kind: 'video' as const,
+      prompt: 'x',
+      source_images: [pngOf(INLINE_SOURCE_MAX_BYTES).toString('base64')],
+    }
+    for (const version of ['0.4.0', null]) {
+      hub.hello('1', version)
+      await assert.rejects(
+        hub.submit('3', null, big),
+        (e: MuseError) =>
+          e.status === 413 && e.code === 'MUSE_SOURCE_TOO_LARGE' && /0\.5/.test(e.message),
+      )
+    }
+    assert.ok(await hub.submit('3', null, atCap))
+    hub.hello('1', '0.5.0')
+    assert.ok(await hub.submit('3', null, big))
+  })
+
   it('a poll response that could not be written puts the job back', async () => {
     const sid = await online()
     await hub.submit('3', null, { kind: 'image', prompt: 'x' })
     const j = (await hub.poll(sid, 50))!
-    hub.undeliverable(j.id)
+    hub.undeliverable(j.id, j.nonce)
+    retryReady()
     const again = (await hub.poll(sid, 50))!
     assert.equal(again.id, j.id)
     assert.notEqual(again.nonce, j.nonce)
   })
 
-  it('lost heartbeat and deadline fail the running job', async () => {
+  it('lost heartbeat requeues a running job and gives up only after four dispatches', async () => {
+    hub.stop()
+    hub = new MuseBridgeHub({
+      store,
+      stateRoot: root,
+      allowedUids: new Set(['3']),
+      rate: { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
+      cliTimeoutSec: { image: 120, video: 300 },
+      queueWaitMs: { image: 3_600_000, video: 3_600_000 },
+      now: () => clock.t,
+    })
     const a = await runningJob()
     // 61 s of silence is tolerated (relay-dropped heartbeats); 121 s is lost contact.
     clock.t += 61_000
-    hub.checkSession((hub as any).session.id)
+    hub.checkSession((hub as any).sessions.keys().next().value)
     hub.tick()
     assert.equal((await hub.view('3', a.id, 0))?.status, 'running', 'still running after 61 s')
-    clock.t += 60_000
-    hub.checkSession((hub as any).session.id)
+    for (let i = 0; i < MAX_DISPATCH_ATTEMPTS - 1; i++) {
+      clock.t += 121_000
+      hub.checkSession((hub as any).sessions.keys().next().value)
+      hub.tick()
+      assert.notEqual((await hub.view('3', a.id, 0))?.status, 'failed', `alive after gap ${i + 1}`)
+      retryReady()
+      const again = (await hub.poll((hub as any).sessions.keys().next().value, 50))!
+      assert.equal(again.id, a.id)
+      hub.heartbeat(again.id, again.nonce)
+    }
+    clock.t += 121_000
+    hub.checkSession((hub as any).sessions.keys().next().value)
     hub.tick()
-    assert.equal((await hub.view('3', a.id, 0))?.error?.code, 'MUSE_BRIDGE_LOST')
+    const lost = await hub.view('3', a.id, 0)
+    assert.equal(lost?.status, 'failed')
+    assert.equal(lost?.error?.code, 'MUSE_BRIDGE_LOST')
+    assert.equal(lost?.error?.retryable, true)
+    assert.equal(
+      store.finished.some(([, fin]) => fin.status === 'succeeded'),
+      false,
+    )
     const b = await runningJob()
     for (let i = 0; i < 20; i++) {
       clock.t += 10_000
-      hub.checkSession((hub as any).session.id)
+      hub.checkSession((hub as any).sessions.keys().next().value)
       if (i < 19) hub.heartbeat(b.id, b.nonce)
       hub.tick()
     }
     const v = await hub.view('3', b.id, 0)
-    assert.equal(v?.error?.code, 'MUSE_TIMEOUT')
-    assert.equal(v?.error?.retryable, true)
+    assert.equal(v?.status, 'queued')
+    assert.equal(v?.retry_count, 1)
   })
 
-  it('a new hello requeues a dispatched job but fails a running one', async () => {
+  it('a new hello requeues a dispatched job and a running one', async () => {
     const sid = await online()
     await hub.submit('3', null, { kind: 'image', prompt: 'x' })
     const d = (await hub.poll(sid, 50))!
     const sid2 = await online()
     assert.equal(hub.checkSession(sid), 'superseded')
     assert.equal(hub.checkSession('never-seen'), 'unknown')
+    retryReady()
     const again = (await hub.poll(sid2, 50))!
     assert.equal(again.id, d.id)
+    assert.notEqual(again.nonce, d.nonce)
     hub.heartbeat(again.id, again.nonce)
+    const sid3 = await online()
+    assert.equal((await hub.view('3', d.id, 0))?.status, 'queued')
+    retryReady()
+    const third = (await hub.poll(sid3, 50))!
+    assert.equal(third.id, d.id)
+    assert.notEqual(third.nonce, again.nonce)
+    assert.throws(
+      () => hub.heartbeat(again.id, again.nonce),
+      (e: MuseError) => e.status === 410,
+    )
+    assert.equal(store.finished.length, 0)
+  })
+
+  it('a quiet bridge accepts jobs but exhausts their offline retries', async () => {
     await online()
-    assert.equal((await hub.view('3', d.id, 0))?.error?.code, 'MUSE_BRIDGE_LOST')
+    const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
+    clock.t += 61_000
+    hub.tick()
+    const id2 = await hub.submit('3', null, { kind: 'image', prompt: 'y' })
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await hub.view('3', id, 0))?.status, 'queued')
+      clock.t += MUSE_RETRY_INTERVAL_MS
+      hub.tick()
+    }
+    assert.equal((await hub.view('3', id, 0))?.error?.code, 'MUSE_BRIDGE_OFFLINE')
+    assert.equal((await hub.view('3', id2, 0))?.error?.code, 'MUSE_BRIDGE_OFFLINE')
+  })
+
+  it('a bridge stop requeues the same job, which can still succeed once', async () => {
+    const sid = await online()
+    const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
+    const first = (await hub.poll(sid, 50))!
+    hub.heartbeat(first.id, first.nonce)
+    await hub.result(first.id, first.nonce, {
+      ok: false,
+      error_code: 'MUSE_BRIDGE_LOST',
+      error_message: 'bridge 正在停止',
+      retryable: false,
+    })
+    assert.equal((await hub.view('3', id, 0))?.status, 'queued')
+    assert.equal(store.finished.length, 0)
+    retryReady()
+    const again = (await hub.poll(sid, 50))!
+    assert.equal(again.id, id)
+    assert.notEqual(again.nonce, first.nonce)
+    hub.heartbeat(again.id, again.nonce)
+    await hub.putChunk(again.id, again.nonce, 0, 0, WEBP, sha(WEBP))
+    await hub.result(again.id, again.nonce, {
+      ok: true,
+      files: [
+        {
+          idx: 0,
+          filename: 'x.webp',
+          mime: 'image/webp',
+          bytes: WEBP.length,
+          sha256: sha(WEBP),
+          chunks: 1,
+        },
+      ],
+    })
+    assert.equal((await hub.view('3', id, 0))?.status, 'succeeded')
+    assert.equal(
+      store.finished.filter(([, fin]) => fin.status !== 'succeeded').length,
+      0,
+    )
+  })
+
+  it('gives up after four bridge-stop reports and still charges nothing', async () => {
+    const sid = await online()
+    const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
+    for (let i = 0; i < MAX_DISPATCH_ATTEMPTS; i++) {
+      const job = (await hub.poll(sid, 50))!
+      assert.equal(job.id, id)
+      hub.heartbeat(job.id, job.nonce)
+      await hub.result(job.id, job.nonce, {
+        ok: false,
+        error_code: 'MUSE_BRIDGE_LOST',
+        error_message: 'bridge 正在停止',
+        retryable: false,
+      })
+      if (i < MAX_DISPATCH_ATTEMPTS - 1) {
+        assert.equal((await hub.view('3', id, 0))?.status, 'queued', `alive after stop ${i + 1}`)
+        retryReady()
+      }
+    }
+    const v = await hub.view('3', id, 0)
+    assert.equal(v?.status, 'failed')
+    assert.equal(v?.error?.code, 'MUSE_BRIDGE_LOST')
+    assert.equal(v?.error?.retryable, true)
+    assert.equal(
+      store.finished.some(([, fin]) => fin.status === 'succeeded'),
+      false,
+    )
   })
 
   it('chunks: sequential, sha-checked, idempotent retry, size cap fails the job', async () => {
@@ -397,9 +674,9 @@ describe('muse hub', () => {
     assert.equal(v?.status, 'succeeded')
     assert.equal(v?.snapshot_id, 'c51d:981z14')
     assert.match(v!.files![0]!.filename, /^muse-image-[0-9a-f-]{8}-1\.webp$/)
-    const f = hub.fileFor('3', job.id, 0)!
+    const f = (await hub.fileFor('3', job.id, 0))!
     assert.deepEqual(readFileSync(f.path), WEBP)
-    assert.equal(hub.fileFor('765', job.id, 0), null)
+    assert.equal(await hub.fileFor('765', job.id, 0), null)
     assert.equal(await hub.view('765', job.id, 0), null)
 
     const big = await runningJob('image')
@@ -513,7 +790,7 @@ describe('muse hub', () => {
     const v = await hub.view('3', job.id, 0)
     assert.equal(v?.status, 'succeeded')
     assert.equal(v?.files?.[0]?.bytes, PNG.length)
-    assert.deepEqual(readFileSync(hub.fileFor('3', job.id, 0)!.path), PNG)
+    assert.deepEqual(readFileSync((await hub.fileFor('3', job.id, 0))!.path), PNG)
   })
 
   it('view waits for the terminal state and falls back to the audit row', async () => {
@@ -555,6 +832,12 @@ describe('muse bridge http', () => {
       } as { t: number },
       root,
     )
+    await hub.stop()
+    hub = new MuseBridgeHub({
+      store, stateRoot: root, allowedUids: new Set(['3']), multiBridge: true,
+      rate: { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
+      cliTimeoutSec: { image: 120, video: 300 },
+    })
     const h = makeMuseBridgeHttpHandler({ hub, store, pollHoldMs: 1500 })
     server = createServer(
       (req, res) => void h(req, res, { clientIp: String(req.headers['x-test-ip'] ?? '1.1.1.1') }),
@@ -630,12 +913,50 @@ describe('muse bridge http', () => {
     assert.equal((await post('/hello', {}, { 'x-test-ip': '8.8.8.8' })).status, 200)
   })
 
+  it('hello tells the bridge to hold polls 15 s (OCV5-758: a 25 s idle hold was cut in transit)', async () => {
+    assert.equal(POLL_HOLD_SEC, 15)
+    const hello = (await post('/hello', { bridge_version: '0.5.3' })).json
+    assert.equal(hello.poll_hold_sec, 15)
+  })
+
   it('unknown session → 400 (hello again), superseded → 409, empty poll → 204', async () => {
     assert.equal((await post('/poll', {}, { 'x-muse-bridge-session': 'nope' })).status, 400)
     const a = (await post('/hello', { bridge_version: '0.3.0' })).json.session_id
     const b = (await post('/hello', { bridge_version: '0.3.0' })).json.session_id
     assert.equal((await post('/poll', {}, { 'x-muse-bridge-session': a })).status, 409)
     assert.equal((await post('/poll', {}, { 'x-muse-bridge-session': b })).status, 204)
+  })
+
+  it('binds independent tokens to sessions and all attempt endpoints to their assigned bridge', async () => {
+    const secondToken = `mbr_${'z'.repeat(43)}`
+    store.creds.set(sha(Buffer.from(secondToken)), '2')
+    const a = (await post('/hello', { bridge_version: '0.5.0' })).json.session_id
+    const b = (await post('/hello', { bridge_version: '0.3.0' }, {
+      authorization: `Bearer ${secondToken}`,
+    })).json.session_id
+    const ah = { 'x-muse-bridge-session': a }
+    const bh = { authorization: `Bearer ${secondToken}`, 'x-muse-bridge-session': b }
+    const id = await hub.submit('3', null, {
+      kind: 'image', prompt: 'x', source_images: [PNG.toString('base64')],
+    })
+    assert.equal((await post('/poll', {}, { ...ah, authorization: `Bearer ${secondToken}` })).status, 400)
+    const wire = (await post('/poll', {}, ah)).json.job
+    assert.equal(wire.id, id)
+    assert.ok(wire.source_refs, 'assigned 0.5 capability survives the later 0.3 hello')
+    const payload = { job_nonce: wire.nonce }
+    assert.equal((await post(`/jobs/${id}/heartbeat`, payload, bh)).status, 410)
+    assert.equal((await post(`/jobs/${id}/heartbeat`, payload, ah)).status, 200)
+    assert.equal((await post(`/jobs/${id}/result`, { ...payload, ok: false }, bh)).status, 410)
+    const source = await fetch(`${base}/jobs/${id}/sources/0`, {
+      headers: { ...bh, 'x-job-nonce': wire.nonce },
+    })
+    assert.equal(source.status, 410)
+    const chunk = await fetch(`${base}/jobs/${id}/files/0/chunks/0`, {
+      method: 'PUT', headers: { ...bh, 'x-job-nonce': wire.nonce, 'x-chunk-sha256': sha(WEBP) },
+      body: WEBP,
+    })
+    assert.equal(chunk.status, 410)
+    assert.equal((await hub.view('3', id, 0))?.status, 'running')
   })
 
   it('a live poll keeps waiting after its body is read and receives a job submitted later', async () => {
@@ -707,5 +1028,43 @@ describe('muse bridge http', () => {
     assert.equal(res.status, 200)
     assert.equal((await hub.view('3', job.id, 0))?.status, 'succeeded')
     assert.equal((await post('/jobs/../../etc/heartbeat', {}, hdr)).status, 404)
+  })
+
+  it('GET sources (bridge 0.5): 410 before the ack, whole file, a Range slice, 416, 404', async () => {
+    const sid = (await post('/hello', { bridge_version: '0.5.0' })).json.session_id
+    const hdr = { 'x-muse-bridge-session': sid }
+    const src = pngOf(3000)
+    await hub.submit('3', null, {
+      kind: 'video',
+      prompt: 'x',
+      source_images: [src.toString('base64')],
+    })
+    const job = (await post('/poll', {}, hdr)).json.job
+    assert.equal(job.source_images, null)
+    assert.equal(job.source_refs[0].sha256, sha(src))
+    const get = (n: number, extra: Record<string, string> = {}, nonce = job.nonce) =>
+      fetch(`${base}/jobs/${job.id}/sources/${n}`, {
+        headers: { authorization: `Bearer ${TOKEN}`, ...hdr, 'x-job-nonce': nonce, ...extra },
+      })
+    assert.equal((await get(0)).status, 410)
+    assert.equal(
+      (await post(`/jobs/${job.id}/heartbeat`, { job_nonce: job.nonce }, hdr)).status,
+      200,
+    )
+    assert.equal((await get(0, {}, 'stale')).status, 410)
+    const whole = await get(0)
+    assert.equal(whole.status, 200)
+    assert.equal(whole.headers.get('x-source-sha256'), sha(src))
+    assert.ok(Buffer.from(await whole.arrayBuffer()).equals(src))
+    const part = await get(0, { range: 'bytes=1000-1999' })
+    assert.equal(part.status, 206)
+    assert.equal(part.headers.get('content-range'), 'bytes 1000-1999/3000')
+    assert.ok(Buffer.from(await part.arrayBuffer()).equals(src.subarray(1000, 2000)))
+    assert.equal((await get(0, { range: 'bytes=3000-' })).status, 416)
+    assert.equal((await get(1)).status, 404)
+    const noSession = await fetch(`${base}/jobs/${job.id}/sources/0`, {
+      headers: { authorization: `Bearer ${TOKEN}`, 'x-job-nonce': job.nonce },
+    })
+    assert.equal(noSession.status, 400)
   })
 })

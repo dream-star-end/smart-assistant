@@ -117,6 +117,20 @@ print(c.file_sha(Path(sys.argv[2])))
         self.assertEqual(frame['params']['sandboxPolicy']['type'],'readOnly');self.assertEqual(frame['params']['model'],'fixture-model')
         with self.assertRaisesRegex(ValueError,'CODEX_RPC_REJECTED'):
             self.policy.incoming({'id':2,'method':'turn/start','params':{'threadId':'foreign','input':[]}})
+    def test_thread_unsubscribe_only_for_own_idle_thread(self):
+        with self.assertRaisesRegex(ValueError,'CODEX_RPC_REJECTED'):  # mid-turn
+            self.policy.incoming({'id':10,'method':'thread/unsubscribe','params':{'threadId':'thread'}})
+        self.policy.turn=None
+        for p in ({'threadId':'foreign'},{},{'threadId':'thread','extra':1}):
+            with self.assertRaisesRegex(ValueError,'CODEX_RPC_REJECTED'):
+                self.policy.incoming({'id':'u'+str(len(p)),'method':'thread/unsubscribe','params':p})
+        frame=self.policy.incoming({'id':11,'method':'thread/unsubscribe','params':{'threadId':'thread'}})
+        self.assertEqual(frame['params'],{'threadId':'thread'})
+        with self.assertRaisesRegex(ValueError,'CODEX_RPC_REJECTED'):  # no resume while the unload is pending
+            self.policy.incoming({'id':12,'method':'thread/resume','params':{'threadId':'thread'}})
+        self.policy.outgoing({'id':11,'result':{'status':'unsubscribed'}})
+        self.policy.outgoing({'method':'thread/closed','params':{'threadId':'thread'}})
+        self.policy.incoming({'id':13,'method':'thread/resume','params':{'threadId':'thread','baseInstructions':'new'}})
     def test_pinned_catalog_excludes_unobserved_models_and_disables_native_tools(self):
         result=ctrl.pinned_catalog([{'id':'visible'}],{'models':[{'slug':'visible','tool_mode':'code_mode_only'},{'slug':'cache-only'}]})
         self.assertEqual([m['slug'] for m in result['models']],['visible']);self.assertEqual(result['models'][0]['tool_mode'],'direct')

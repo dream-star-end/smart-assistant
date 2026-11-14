@@ -13,6 +13,10 @@ Videos are a fixed ~10 s clip; there are no duration or resolution options. Text
 1280x720; image-to-video and resume-with-a-new-image follow the source image's size.
 Failures print one JSON line on stderr ({"ok":false,"code":"MUSE_…",...}) and exit 1.
 Only enabled accounts can use it (others get MUSE_NOT_ENABLED).
+While the job waits for a free slot, stderr shows `# Muse queue: position N of M`; tell the user.
+Where Muse is billed, stderr ends a success with `# charged: N credits` (nothing is charged on failure).
+--timeout counts from when the job starts running; the server bounds the time spent in the queue.
+`oc-muse fetch <job_id>` downloads an earlier job's files (for example after a MUSE_TIMEOUT).
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -44,6 +49,12 @@ DEFAULT_OUT_DIR = Path("/home/agent/.openclaude/generated")
 TERMINAL = {"succeeded", "failed", "cancelled"}
 MAX_SOURCE_BYTES = 3 * 1024 * 1024
 MAX_SOURCES = 4
+# Safety net only: the server ends a queued job itself (MUSE_BUSY) well before this.
+QUEUE_WAIT_MAX_SEC = 3700
+# A timeout's cancel is refused while the result is being recorded and charged: keep waiting for
+# it (checking again every this many seconds) instead of leaving a charged result behind.
+SETTLE_RECHECK_SEC = 60
+JOB_ID_RE = re.compile(r"^mj_[0-9a-f-]{36}$")
 EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm"}
 
 
@@ -99,7 +110,7 @@ def call(method: str, path: str, payload: dict | None = None, timeout: int = 60,
         raise MuseFailure(
             code or f"HTTP_{exc.code}",
             message or body or f"HTTP {exc.code}",
-            bool(detail.get("retryable")) if isinstance(detail, dict) else False,
+            exc.code in (502, 503, 504) or (bool(detail.get("retryable")) if isinstance(detail, dict) else False),
         ) from None
     except (error.URLError, TimeoutError, ConnectionError) as exc:
         reason = getattr(exc, "reason", exc)
@@ -158,11 +169,32 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         payload["source_images"] = read_sources(ns.image)
     if ns.resume:
         payload["resume_snapshot_id"] = ns.resume
+    if getattr(ns, "mode", None):
+        payload["mode"] = ns.mode
+    if getattr(ns, "count", None) is not None:
+        payload["count"] = ns.count
 
     status = call("GET", "/status")
-    if not status.get("bridge_online"):
+    backend = status.get("video_backend") or "hatch"
+    box_exec_ok = (
+        kind == "video"
+        and not ns.resume
+        and backend in ("box-exec", "hatch-with-box-fallback")
+    )
+    if not status.get("bridge_online") and not status.get("retry") and not box_exec_ok:
         raise MuseFailure("MUSE_BRIDGE_OFFLINE", "the Muse bridge is not connected; ask the user to start it in the Muse VM")
+    server_delivery = kind == "video" and bool(status.get("durable_video"))
+    if server_delivery:
+        payload["session_key"] = os.environ.get("OPENCLAUDE_SESSION_KEY") or os.environ.get("OC_SESSION_KEY") or ""
     job_id = call("POST", "/jobs", payload, timeout=120)["job_id"]
+
+    def acknowledge(background=False, terminal=False):
+        message = "Muse 视频处理结束，结果会回到本会话。" if terminal else (
+            "Muse 视频已进入后台队列，完成后会回到本会话。" if background else
+            "Muse 视频请求已受理，服务恢复后会继续处理，结果会回到本会话。")
+        print(json.dumps({"ok": True, "job_id": job_id, "background": background,
+                          "delivery": "conversation", "message": message}, ensure_ascii=False))
+        return 0
 
     def cancel(signum, _frame):
         try:
@@ -173,19 +205,73 @@ def run(kind: str, ns: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, cancel)
     signal.signal(signal.SIGTERM, cancel)
-    deadline = time.monotonic() + ns.timeout
+    # --timeout runs from when the job leaves the queue; the queue itself is bounded by the server.
+    queue_until = time.monotonic() + QUEUE_WAIT_MAX_SEC
+    # Safety net only: past this even a job whose cancel keeps being refused is left to `fetch`.
+    give_up = queue_until + ns.timeout
+    deadline: float | None = None
+    last_position = None
+    retry_count = 0
     view: dict = {}
-    while time.monotonic() < deadline:
-        view = call("GET", f"/jobs/{job_id}?wait=25", timeout=60)
-        if view.get("status") in TERMINAL:
-            break
-    else:
+    while True:
+        now = time.monotonic()
+        if now >= (deadline if deadline is not None else queue_until):
+            try:
+                left = call("DELETE", f"/jobs/{job_id}", timeout=10)
+            except MuseFailure:
+                left = {}
+            if left.get("status") == "succeeded":
+                view = left
+                break
+            if left.get("status") == "running" and now < give_up:
+                # Not cancelled: the job is finishing (its result is being recorded). Wait for it.
+                deadline = now + SETTLE_RECHECK_SEC
+                continue
+            if left.get("status") == "running":
+                raise MuseFailure(
+                    "MUSE_TIMEOUT",
+                    f"no result yet; it may still finish — run `oc-muse fetch {job_id}` later",
+                    True,
+                    job_id=job_id,
+                )
+            raise MuseFailure("MUSE_TIMEOUT", f"no result within {ns.timeout} s", True, job_id=job_id)
+        # First look right away (a queued job reports its place at once), then long-poll.
+        wait = 25 if view else 0
         try:
-            call("DELETE", f"/jobs/{job_id}", timeout=10)
-        except MuseFailure:
-            pass
-        raise MuseFailure("MUSE_TIMEOUT", f"no result within {ns.timeout} s", True, job_id=job_id)
+            view = call("GET", f"/jobs/{job_id}?wait={wait}", timeout=60)
+        except MuseFailure as exc:
+            if server_delivery and exc.payload.get("retryable"):
+                # POST already acknowledged the durable journal. A master restart must not
+                # turn an accepted video into an H3 fallback or a second submission.
+                return acknowledge()
+            raise
+        # The server owns retries of this same job. --timeout remains per execution attempt;
+        # queue_until/give_up still bound the overall wait and explicit cancellation still works.
+        retries = view.get("retry_count", 0)
+        if retries > retry_count:
+            retry_count = retries
+            deadline = None
+        status = view.get("status")
+        if view.get("delivery") == "conversation" and (view.get("background") or status in TERMINAL):
+            # The master owns the durable callback, including synchronous video success. Never
+            # download/re-emit it in a second assistant message or invoke an H3 fallback.
+            return acknowledge(bool(view.get("background")), status in TERMINAL)
+        if status in TERMINAL:
+            break
+        if status == "queued":
+            position = view.get("queue_position")
+            if position and position != last_position:
+                total = view.get("queue_length") or position
+                print(f"# Muse queue: position {position} of {total}", file=sys.stderr, flush=True)
+                last_position = position
+        elif deadline is None:
+            deadline = now + ns.timeout
 
+    return deliver(job_id, view, ns.json)
+
+
+def deliver(job_id: str, view: dict, as_json: bool) -> int:
+    """Download a finished job's files and print them (or raise its failure)."""
     if view.get("status") != "succeeded":
         err = view.get("error") or {}
         raise MuseFailure(
@@ -197,7 +283,9 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         )
     out_dir = Path(os.environ.get(OUT_DIR_ENV) or DEFAULT_OUT_DIR)
     paths = download(job_id, view.get("files") or [], out_dir)
-    if ns.json:
+    if view.get("charged_credits") is not None:
+        print(f"# charged: {view['charged_credits']} credits", file=sys.stderr, flush=True)
+    if as_json:
         print(json.dumps({
             "ok": True,
             "job_id": job_id,
@@ -239,8 +327,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     common(video)
     video.add_argument("--aspect-ratio", dest="aspect_ratio", choices=("4:5", "7:12", "9:16"))
+    video.add_argument("--mode", choices=("native", "first_frame", "reference", "composite"),
+                       help="video generation mode (optional; inferred from --image if omitted)")
+    video.add_argument("--count", type=int, default=None, help="native-family variations, 1-4")
+
+    fetch = subparsers.add_parser("fetch", help="get the files of an earlier job by its job_id")
+    fetch.add_argument("job_id")
+    fetch.add_argument("--json", action="store_true", help="print one JSON line instead of paths")
 
     ns = parser.parse_args(argv)
+    if ns.command == "fetch":
+        try:
+            if not JOB_ID_RE.match(ns.job_id):
+                raise MuseFailure("MUSE_INVALID_INPUT", "job_id looks like mj_<uuid>")
+            view = call("GET", f"/jobs/{ns.job_id}?wait=25", timeout=60)
+            if view.get("status") in ("queued", "running"):
+                raise MuseFailure("MUSE_PENDING", "the job has not finished yet; try again shortly", True,
+                                  job_id=ns.job_id)
+            return deliver(ns.job_id, view, ns.json)
+        except MuseFailure as exc:
+            print(json.dumps(exc.payload, ensure_ascii=False), file=sys.stderr)
+            return 1
     if ns.timeout is None:
         ns.timeout = 600 if ns.command == "video" else 360
     try:

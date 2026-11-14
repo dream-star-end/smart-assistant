@@ -1,7 +1,15 @@
 import { beginIdleWait, endIdleWait } from './boxIdleWait.js'
 import { recoverUnconfirmedIdle } from './boxIdleRecovery.js'
-import { type RemoteExecutionBackend, isCc5ExecutionBackend, sameRemoteExecutionBackend } from '@openclaude/protocol'
+import {
+  type GrokExecutionDescriptor,
+  type RemoteExecutionBackend,
+  isCc5ExecutionBackend,
+  sameRemoteExecutionBackend,
+} from '@openclaude/protocol'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
+import { isRemoteV4ResumeId, parseRemoteV4ResumeId } from './remotePool/resumeId.js'
+import { restartRunnerForConfigChange } from './runnerConfigRestart.js'
+import { BOX_IDLE_PRE_EXPIRY_MIN_TOKENS, boxIdlePreExpiryMs, cancelIdlePreExpiry } from './boxContextBudget.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
@@ -53,6 +61,7 @@ import {
   idleProofWaitMs,
   pruneIdleOps,
   sourceNeedsIdleOp,
+  idleCompactAlways,
   type IdleOp,
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
@@ -78,14 +87,10 @@ import { BOX_IDLE_TURN_TIMEOUT_MS, boxIdleTurnTimeoutMs, IdleTurnTimeoutError, r
 import {
   cursorSandBoxCcResumeInnerId,
   cursorSandOfficialCcResumeInnerId,
-  cursorResumeStoreExists,
   cursorSandResumeInnerId,
-  isCursorSandBoxCcResumeId,
-  isAnyCursorSandResumeId,
-  relocateCursorResumeStore,
   usableCursorResumeId,
 } from './engine/cursorAdapter.js'
-import { pickResumableId, probeResumeArtifact } from './engine/resumeArtifacts.js'
+import { probeResumeArtifact } from './engine/resumeArtifacts.js'
 import type { AutomaticRetryState, CollabAgentPolicy } from './engine/engineAdapter.js'
 import type { SessionStreamEvent } from './engine/engineEvents.js'
 import {
@@ -100,7 +105,7 @@ import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
-import { CCB_PROVIDER_TAG, normalizeEngineTag } from './resumeStore.js'
+import { normalizeEngineTag } from './resumeStore.js'
 import { adoptRunContext } from './runContextPersist.js'
 import { deriveLosslessTurnKey, getV3MasterSinkOrNull } from './v3MasterSink.js'
 import {
@@ -403,6 +408,7 @@ export async function submit(
     codexRoute?: CodexProviderConfigOverride | null
     /** Grok CLI receives only this one-turn opaque loopback relay route. */
     grokRoute?: GrokRouteOverride | null
+    grokExecutionDescriptor?: GrokExecutionDescriptor
     /** Master-authored recovery fence for a first-event silent engine turn.
      * Only Grok currently consumes it; arbitrary client input cannot set it. */
     resetNativeSession?: boolean
@@ -612,6 +618,9 @@ export async function submit(
     this._promptQueueExecutionKeys.add(session.sessionKey)
   }
   session.lock = new Promise<void>((r) => (release = r))
+  // OCV5-755: this turn supersedes an armed pre-expiry compaction; if one is
+  // already running, beginIdleWait keeps "compacting" up until handoff.
+  cancelIdlePreExpiry(session)
   // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 ++。详见
   // AgentSession._activeTurnCount 注释。位置:lock 新建后、`await prev`
   // 前,即 **submit() 已接受、即将串行化执行** 的一刻起算。注意 scope:
@@ -624,7 +633,10 @@ export async function submit(
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
     if (opts?.modelSwitchInternal === undefined && (
-      (session._idleInternalTurns ?? 0) > 0 || currentIdleSource(paths.home, session.sessionKey)
+      (session._idleInternalTurns ?? 0) > 0 ||
+      Boolean(session._idlePreExpiryActive) ||
+      Boolean(session._idleRunning) ||
+      currentIdleSource(paths.home, session.sessionKey)
     )) closeIdleWait = beginIdleWait(session, onEvent)
     await prev
     session._turnReadOnly = opts?.readOnly === true
@@ -723,7 +735,10 @@ export async function submit(
         { assets: undefined, fingerprint: undefined },
         admission.context,
       )
-      if (changed) await session.runner.shutdown() // native id is deliberately retained
+      if (changed) {
+        log.info('runner_config_restart', { sessionKey: session.sessionKey, identityCompatChanged: true })
+        await restartRunnerForConfigChange(session.runner) // native id is deliberately retained
+      }
     } else if (admission.context.assets && session.channel !== 'auto-dream') {
       throw new Error('COMPAT_CONFIG_CONFLICT: runner has no validated identity context')
     }
@@ -852,9 +867,19 @@ export async function submit(
         modelChanged ? desiredModel : session.runner.model,
       ) === 'restart'
     if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
+      // OCV5-755: a restart rebuilds the prompt prefix; record which input asked for it.
+      log.info('runner_config_restart', {
+        sessionKey: session.sessionKey,
+        running: session.runner.isRunning,
+        effortChanged,
+        modelChanged,
+        toolsetsChanged,
+        iuiChanged,
+        privacyChanged,
+        serviceTierChanged,
+      })
       try {
-        // A cold CC5 port is single-use: shutdown would revoke it before its first admission.
-        if (!isCc5ExecutionBackend(session.runner.executionBackend) || session.runner.isRunning) await session.runner.shutdown()
+        await restartRunnerForConfigChange(session.runner)
         if (privacyChanged) assertRunnerPromptPrivacyStopped(session.runner)
         // Delta tracker reset happens automatically on the next 'spawn' event
         // when SubprocessRunner auto-respawns on the next submit().
@@ -1054,22 +1079,28 @@ export async function submit(
     const spawnCwd = this._cursorWorkspacePathForSession(session)
     const liveNativeId = session.runner.nativeSessionId
     const storedCc5Resume = this._resumeMap.get(session.sessionKey)
+    const parseBoundResume = (id: string | null | undefined) =>
+      session.runner.executionBackend?.kind === 'remote-driver-v4'
+        ? parseRemoteV4ResumeId(id)
+        : parseCc5ResumeId(id)
+    const isAnyBoundResume = (id: string | null | undefined) =>
+      isCc5ResumeId(id) || isRemoteV4ResumeId(id)
     if (
       session.runner.executionBackend &&
-      ((isCc5ResumeId(liveNativeId) &&
-        parseCc5ResumeId(liveNativeId)?.bindingId !== session.runner.executionBackend.operationId) ||
-        (isCc5ResumeId(storedCc5Resume) &&
-          parseCc5ResumeId(storedCc5Resume)?.bindingId !== session.runner.executionBackend.operationId))
+      ((isAnyBoundResume(liveNativeId) &&
+        parseBoundResume(liveNativeId)?.bindingId !== session.runner.executionBackend.operationId) ||
+        (isAnyBoundResume(storedCc5Resume) &&
+          parseBoundResume(storedCc5Resume)?.bindingId !== session.runner.executionBackend.operationId))
     ) {
       throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
     }
     const liveCc5ResumeId = session.runner.executionBackend
       ? ((liveNativeId &&
-        parseCc5ResumeId(liveNativeId)?.bindingId === session.runner.executionBackend.operationId
+        parseBoundResume(liveNativeId)?.bindingId === session.runner.executionBackend.operationId
           ? liveNativeId
           : undefined) ??
         (storedCc5Resume &&
-        parseCc5ResumeId(storedCc5Resume)?.bindingId === session.runner.executionBackend.operationId
+        parseBoundResume(storedCc5Resume)?.bindingId === session.runner.executionBackend.operationId
           ? storedCc5Resume
           : undefined))
       : undefined
@@ -1088,7 +1119,7 @@ export async function submit(
             : usableCursorResumeId({
                 workspacePath: spawnCwd,
                 liveId: liveNativeId,
-                mappedId: isCc5ResumeId(this._resumeMap.get(session.sessionKey))
+                mappedId: isAnyBoundResume(this._resumeMap.get(session.sessionKey))
                   ? undefined : this._resumeMap.get(session.sessionKey),
               })
         : undefined
@@ -1362,6 +1393,7 @@ export async function submit(
       consumingModelSwitch ? [] : contextOverflowRetryInputs,
       opts?.automaticRetryState,
       consumingModelSwitch ? transition : undefined,
+      opts?.grokExecutionDescriptor,
     )
     try {
       await Promise.race([logicalTurnRun, livenessPromise])
@@ -1591,6 +1623,7 @@ export async function _getOrCreateExclusive(
   if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
   const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
     current, storedResumeId: this._resumeMap.get(opts.sessionKey),
+    storedResumeProvider: normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)),
     executionBackend,
     sessionIds: [opts.sessionKey, ...(opts.peerId ? [opts.peerId] : [])], hasPersistedTurnActivity,
   })
@@ -1665,6 +1698,17 @@ export async function _getOrCreateExclusive(
         workspaceCwdChanged ||
         projectIdChanged
       ) {
+        log.info('session_runner_replace', {
+          sessionKey: opts.sessionKey,
+          agentChanged: existing.agentId !== opts.agent.id,
+          identityChanged: existing._identityAgentFingerprint !== identityAgentFingerprint,
+          engineChanged: existing.providerTag !== desiredEngine,
+          cursorTransportChanged,
+          backendChanged,
+          workspaceModeChanged,
+          workspaceCwdChanged,
+          projectIdChanged,
+        })
         const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
           existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
         contextRebuildNotice = replacementNotice
@@ -1842,10 +1886,19 @@ export async function _getOrCreateExclusive(
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
     const storedResumeForCreate = this._resumeMap.get(opts.sessionKey)
+    const cc5Backend = executionBackend?.kind === 'cc5-interactive-v1' ? executionBackend : undefined
+    const v4Backend = executionBackend?.kind === 'remote-driver-v4' ? executionBackend : undefined
     if (
-      executionBackend &&
+      cc5Backend &&
       storedResumeForCreate &&
-      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== executionBackend.operationId
+      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== cc5Backend.operationId
+    ) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
+    if (
+      v4Backend &&
+      storedResumeForCreate &&
+      parseRemoteV4ResumeId(storedResumeForCreate)?.bindingId !== v4Backend.operationId
     ) {
       throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
     }
@@ -1854,16 +1907,24 @@ export async function _getOrCreateExclusive(
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
     const mappedResumeId = opts.hermeticNoTools
       ? undefined
-      : executionBackend
+      : cc5Backend
         ? (storedResumeForCreate &&
-          parseCc5ResumeId(storedResumeForCreate)?.bindingId === executionBackend.operationId
+          parseCc5ResumeId(storedResumeForCreate)?.bindingId === cc5Backend.operationId
             ? storedResumeForCreate
             : undefined)
-        : this._resumeIdFor(
-            opts.sessionKey,
-            engineId,
-            this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
-          )
+        : v4Backend
+          ? (storedResumeForCreate &&
+            parseRemoteV4ResumeId(storedResumeForCreate)?.bindingId === v4Backend.operationId
+              ? storedResumeForCreate
+              : undefined)
+          : executionBackend
+            // The rollout lives on the remote node; the relay only resumes the thread its lane bound.
+            ? (normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === 'codex' ? storedResumeForCreate : undefined)
+            : this._resumeIdFor(
+              opts.sessionKey,
+              engineId,
+              this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+            )
     if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
       peerId: opts.peerId,
@@ -2318,7 +2379,8 @@ export async function finishIdleUnderLock(
     turnKey: string
   },
   recoveryDir: string = paths.home,
-): Promise<void> {
+  mode: 'after_turn' | 'pre_expiry' = 'after_turn',
+): Promise<'deferred' | void> {
   if (session._idleRunning) return
   const pending = readPendingIdle(recoveryDir, session.sessionKey)
   if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
@@ -2380,6 +2442,19 @@ export async function finishIdleUnderLock(
   if (!readIdleOp(recoveryDir, session.sessionKey, proof.revision) && !sourceNeedsIdleOp(proof)) {
     clearIdleCandidate(recoveryDir, session.sessionKey)
     return
+  }
+  // OCV5-755: a new op right after the turn would only skip as short (CCB
+  // compacts near the 1M limit) or summarize while the user is still active.
+  // Defer it to shortly before the prompt cache expires; the caller arms the
+  // timer and the next user turn simply supersedes it.
+  if (
+    mode === 'after_turn' &&
+    !readIdleOp(recoveryDir, session.sessionKey, proof.revision) &&
+    !idleCompactAlways() &&
+    boxIdlePreExpiryMs(recoveryDir) > 0
+  ) {
+    clearIdleCandidate(recoveryDir, session.sessionKey)
+    return 'deferred'
   }
   const existingIdle = readIdleOp(recoveryDir, session.sessionKey, proof.revision)
   if (existingIdle && idleOpSettled(existingIdle)) { clearIdleCandidate(recoveryDir, session.sessionKey); return }
@@ -2508,6 +2583,7 @@ export async function finishIdleUnderLock(
             modelCalls: 0,
             frozenTail: step.op.frozenTail,
             attachments: step.op.attachments,
+            ...(mode === 'pre_expiry' ? { minInputTokens: BOX_IDLE_PRE_EXPIRY_MIN_TOKENS } : {}),
           })
         }
       })
@@ -2895,190 +2971,4 @@ export async function beginExternalTurn(
   }
 }
 
-/** Return the resumable id for this session iff the persisted entry was
- *  produced by `wantProvider`. Cross-provider mismatches return undefined
- *  so we never feed a CCB session_id to codex (or vice versa).
- *
- *  Durable-artifact gate (all engines): the head id must have a transcript
- *  on disk (CCB / Cursor Sand JSONL, Codex rollout, Grok session dir, native
- *  Cursor store.db at the spawn cwd). When it does not — the CLI emitted
- *  `session_id` and died before writing, or the container was rebuilt
- *  mid-spawn — walk the per-session history ladder and promote the newest
- *  prior id whose artifact exists, instead of dropping straight to lossy
- *  history replay. Only when nothing on the ladder is resumable is the
- *  entry dropped (UI history stays visible in the DB; the engine simply has
- *  no native memory — unavoidable when every transcript is gone).
- *
- *  Native Cursor keeps its special case: a store.db missing at *this* cwd is
- *  first a hash-relocation problem, not staleness. */
-export function _resumeIdFor(
-  this: SessionSubmitHost,
-  sessionKey: string,
-  wantProvider: string,
-  workspacePath?: string,
-): string | undefined {
-  const id = this._resumeMap.get(sessionKey)
-  if (!id) return undefined
-  if (isCc5ResumeId(id)) return undefined
-  let tag = normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
-  // A false "no transcript" drop used to delete the provider and let the
-  // live-session overlay save the same id back as implicit ccb. The Fast
-  // transcript is still on disk; a positive Grok artifact puts the tag back.
-  // An unknown probe has no path and must not retag a real ccb id.
-  if (tag !== wantProvider && wantProvider === 'grok' && tag === CCB_PROVIDER_TAG) {
-    const recovered = probeResumeArtifact('grok', id)
-    if (recovered.exists && recovered.path) {
-      this._resumeMapProvider.set(sessionKey, 'grok')
-      tag = 'grok'
-      this._saveResumeMap()
-    }
-  }
-  if (tag !== wantProvider) return undefined
-
-  if (tag === 'cursor' && isCursorSandBoxCcResumeId(id)) {
-    if (!cursorSandBoxCcResumeInnerId(id)) {
-      log.warn('resume-map Cursor box Claude entry is malformed — dropping silently', {
-        sessionKey,
-        resumeId: id,
-      })
-      this._forgetResumeEntry(sessionKey)
-      this._saveResumeMap()
-      return undefined
-    }
-    // The JSONL is on the account box, not in this container.
-    return id
-  }
-
-  if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
-    const sandJsonlId = cursorSandResumeInnerId(id) ?? cursorSandOfficialCcResumeInnerId(id)
-    if (!sandJsonlId) {
-      log.warn('resume-map Cursor Sand entry is malformed — dropping silently', {
-        sessionKey,
-        resumeId: id,
-      })
-      this._forgetResumeEntry(sessionKey)
-      this._saveResumeMap()
-      return undefined
-    }
-    if (this._ccbJsonlExists(sandJsonlId)) return id
-    const promoted = this._resolveDurableResumeId(sessionKey, tag, undefined, workspacePath)
-    if (promoted) return promoted
-    log.warn('resume-map Cursor Sand entry points to missing JSONL — dropping silently', {
-      sessionKey,
-      resumeId: id,
-    })
-    this._forgetResumeEntry(sessionKey)
-    this._saveResumeMap()
-    return undefined
-  }
-
-  if (tag === 'cursor') {
-    if (!workspacePath) return id
-    if (cursorResumeStoreExists(workspacePath, id)) return id
-    // Do not drop the map: spawn cwd is the resume authority, and a
-    // recomputed overlay can hash to a different chats/ dir than the live
-    // CLI. Deleting here forces historical replay on the next follow-up
-    // even when store.db is still on disk.
-    // isolated_v1 次轮绑项目会改 spawn cwd → md5 目录对不上。旧 store 还在
-    // 时迁到当前哈希再 --resume;失败才走 history 梯子;再失败才跳过 lookup。
-    const relocated = relocateCursorResumeStore({
-      resumeId: id,
-      currentWorkspacePath: workspacePath,
-      sessionKey,
-    })
-    if (relocated) {
-      log.info('relocated Cursor resume store to current workspace', {
-        sessionKey,
-        resumeId: id,
-        relocated: relocated.relocated,
-      })
-      return id
-    }
-    const promoted = this._resolveDurableResumeId(sessionKey, tag, undefined, workspacePath)
-    if (promoted) return promoted
-    log.warn('resume-map Cursor store not at this workspace — keeping map, skipping this lookup', {
-      sessionKey,
-      resumeId: id,
-    })
-    return undefined
-  }
-
-  // CCB / codex / grok / zcode: single durable-artifact gate + history ladder.
-  const resolved = this._resolveDurableResumeId(sessionKey, tag, id, workspacePath)
-  if (resolved) return resolved
-  log.warn('resume-map entry has no durable transcript on disk — dropping silently', {
-    sessionKey,
-    provider: tag,
-    resumeId: id,
-  })
-  if (tag === 'grok') this._releaseGrokResumeHead(sessionKey)
-  this._forgetResumeEntry(sessionKey)
-  this._saveResumeMap()
-  return undefined
-}
-
-/**
- * Engine-agnostic durable-artifact fallback. When the mapped head id has no
- * durable transcript on disk, walk the per-session history ladder and promote
- * the newest id that positively exists. Returns the id to resume with, or
- * undefined when nothing on the ladder is resumable (caller then falls back
- * to history replay exactly as before).
- *
- * Head ids whose artifact is *unknown* (engine we cannot probe, unreadable fs)
- * are returned as-is — conservative, same as `_ccbJsonlExists`.
- */
-export function _resolveDurableResumeId(
-  this: SessionSubmitHost,
-  sessionKey: string,
-  provider: string,
-  head: string | undefined,
-  workspacePath?: string,
-  opts?: {
-    /** Id the engine just rejected at runtime — never re-pick it even if its
-     *  artifact looks present (non-empty file ≠ resumable conversation). */
-    exclude?: string
-    /** Default true: steer the live adapter via setResumeSessionId. Pass
-     *  false when the caller IS the engine (codex resolveResumeFallback runs
-     *  inside the kernel's own attach path and sets threadId itself). */
-    syncRunner?: boolean
-  },
-): string | undefined {
-  const exclude = opts?.exclude
-  const rejected = this._resumeRejectedIds.get(sessionKey)
-  const history = (this._resumeMapHistory.get(sessionKey) ?? []).filter(
-    (h) => h !== exclude && h !== head && !rejected?.has(h),
-  )
-  const headCandidate = head && head !== exclude && !rejected?.has(head) ? head : undefined
-  const picked = pickResumableId(provider, headCandidate, history, {
-    workspacePath,
-  })
-  if (!picked) return undefined
-  if (picked.fromHistory) {
-    log.warn('resume-map head has no durable transcript — promoting prior id from history', {
-      sessionKey,
-      provider,
-      staleId: head ?? exclude ?? null,
-      promotedId: picked.id,
-      artifact: picked.probe.path,
-    })
-    // Promote in place: the dead head is dropped (not kept in history — it
-    // has nothing to resume), the promoted id becomes head, remaining
-    // history keeps only ids older than the promoted one.
-    const idx = history.indexOf(picked.id)
-    this._resumeMap.set(sessionKey, picked.id)
-    this._resumeHeadPromotedFromHistory.set(sessionKey, picked.id)
-    this._resumeMapProvider.set(sessionKey, provider)
-    this._resumeMapHistory.set(sessionKey, history.slice(idx + 1))
-    // Sync the live session BEFORE saving: _saveResumeMap overlays live
-    // sessions onto the map, so an unsynced session.ccbSessionId would write
-    // the dead head straight back (review B2). The runner must follow too,
-    // otherwise the next spawn still --resumes the dead id.
-    const live = this.sessions.get(sessionKey)
-    if (live && live.providerTag === provider) {
-      live.ccbSessionId = picked.id
-      if (opts?.syncRunner !== false) live.runner.setResumeSessionId?.(picked.id)
-    }
-    this._saveResumeMap()
-  }
-  return picked.id
-}
+export { _resumeIdFor, _resolveDurableResumeId } from './sessionResumeLadder.js'

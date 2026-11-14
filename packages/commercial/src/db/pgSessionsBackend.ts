@@ -46,6 +46,7 @@ import type { CcbNativeTranscriptArchive, CcbTranscriptRestoreBinding, CcbNative
 //     Number()+MAX_SAFE_INTEGER 断言;**不改全局 type parser**(不影响 commercial 其它模块)。
 
 import type { Pool, PoolClient } from "pg";
+import { recoverAdmissionAfterRestart, reconcileAdmissionRestarts, type AdmissionRestartRecoveryDeps } from "../dispatch/admissionRestartRecovery.js";
 import { createHash, randomUUID } from "node:crypto";
 import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
@@ -1117,6 +1118,11 @@ function deferredUserReplayMetadata(message: MessageLike): MessageLike {
     ...(typeof message._idem === "string" && message._idem.length <= 256
       ? { _idem: message._idem }
       : {}),
+    // Recovery admission re-reads the hot row before dispatch takeover; these
+    // small server-owned lineage fields must survive payload deferral too.
+    ...Object.fromEntries(["_recoveryOfClientMessageId", "_recoveryMode", "_automaticRecovery",
+      "_automaticRecoveryRootClientMessageId", "_automaticRecoveryAttempt", "_automaticRecoveryMax"]
+      .filter(key => message[key] !== undefined).map(key => [key, message[key]])),
     _deferredRetryEligible: retryEligible,
   };
 }
@@ -1204,6 +1210,40 @@ function stripWorkspaceMode(
 ): ServerAuthoredAppendResult & { seq?: number } {
   const { workspaceMode: _workspaceMode, ...publicResult } = result;
   return publicResult;
+}
+
+/** First dispatch admission may follow an optimistic history PUT. Attach
+ * server-owned recovery metadata before ACK even when append is idempotent.
+ * Only a newly admitted dispatch calls this, never a conflicting/dedup retry. */
+async function attachAdmissionRestartSnapshot(client: PoolClient, sessionId: string,
+  userId: string, message: MessageLike & { id: string }): Promise<void> {
+  const row = (await client.query<{ messages: string }>(
+    "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE", [sessionId, userId],
+  )).rows[0];
+  const messages = JSON.parse(row.messages) as MessageLike[];
+  const index = messages.findIndex(item => item?.id === message.id && item.role === "user");
+  if (index < 0) throw new Error("admission snapshot source missing");
+  const hot = messages[index];
+  const source = await hydrateRecoverySourceUser(client, sessionId, userId, hot);
+  if (!source) throw new Error("admission snapshot source payload missing");
+  if (source._admissionRestartRequest !== undefined) return;
+  const exact = { ...source, _source: "server", _admissionRestartRequest: message._admissionRestartRequest };
+  if (hot._userPayloadDeferred === true) {
+    // Content is unchanged; augment the never-dispatched row's server metadata
+    // and update its locator hash atomically with first dispatch admission.
+    const payload = Buffer.from(JSON.stringify(exact));
+    const digest = sha256Bytes(payload);
+    await client.query(`UPDATE client_session_user_payloads SET payload=$4,content_sha256=$5,payload_bytes=$6
+      WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+      [sessionId, userId, message.id, payload, digest, payload.length]);
+    messages[index] = { ...hot, _source: "server", _payloadSha256: digest, _payloadBytes: payload.length };
+  } else {
+    const deferred = await deferOversizedUserMessage(client, sessionId, userId, exact as MessageLike & { id: string });
+    if (!deferred) throw new Error("admission snapshot payload conflict");
+    messages[index] = { ...deferred, _seq: hot._seq, _orderSeq: hot._orderSeq };
+  }
+  await client.query('UPDATE client_sessions SET messages=$3 WHERE id=$1 AND user_id=$2',
+    [sessionId, userId, escapeNulInSessionMessagesJson(JSON.stringify(messages))]);
 }
 
 async function pgAppendServerAuthoredCore(
@@ -1480,6 +1520,7 @@ export type AutomaticRecoveryDecision = { retryStatus?: AutomaticRetryStatus } &
 export interface PgSessionsBackendOptions {
   /** 启动时快照的权威 generation(RFC D5:probe 复核 marker 未漂移)。 */
   expectedGeneration: number;
+  admissionRestartRecovery?: AdmissionRestartRecoveryDeps;
   /** Runs only after the owning tape/cost transaction commits. Callback
    * failures must never turn a committed billing write into retry. */
   onGoalUsageChanged?: (userId: string, sessionId: string) => void | Promise<void>;
@@ -1505,6 +1546,17 @@ export interface PgSessionsBackendOptions {
       pauseReason: string | null;
     },
   ) => void | Promise<void>;
+  /** Runs after a delete tx commits, without waiting: deletion never depends on what it frees. */
+  onClientSessionsDeleted?: (userId: string, sessionIds: readonly string[]) => void | Promise<void>;
+}
+
+function notifySessionsDeleted(
+  callback: PgSessionsBackendOptions["onClientSessionsDeleted"],
+  userId: string | undefined,
+  sessionIds: readonly string[],
+): void {
+  if (!callback || !userId || sessionIds.length === 0) return;
+  try { void Promise.resolve(callback(userId, sessionIds)).catch(() => {}); } catch { /* best-effort */ }
 }
 
 type GoalUsageChange = { userId: string; sessionId: string };
@@ -1842,6 +1894,7 @@ export interface DispatchAdmissionBackend {
   /** Rolling-upgrade compensator: reconstruct finalized recoverable tapes
    * that committed before the scheduler-owning Master published their job. */
   reconcileAutomaticRecoveryJobs(userId: bigint, limit?: number): Promise<number>;
+  recoverInterruptedAdmission(dispatchId: string): Promise<boolean>;
   /** Read the server-persisted cwd policy for lanes whose user row was
    * materialized before this bridge invocation (for example prompt queue). */
   getClientSessionWorkspaceMode(
@@ -1892,6 +1945,10 @@ async function mergeVerifiedTurnStatusRows(
         WHERE user_id=$1 AND session_id=$2
           AND status='terminal' AND client_notified=TRUE
           AND outcome IN ('not_accepted','executed_error')
+          AND NOT EXISTS (SELECT 1 FROM turn_recovery_jobs j
+            WHERE j.user_id=turn_dispatches.user_id AND j.session_id=turn_dispatches.session_id
+              AND j.source_client_message_id=turn_dispatches.client_message_id
+              AND j.status IN ('queued','leased','sent','forwarded','completed'))
           AND anchor_seq IS NOT NULL
         ORDER BY anchor_seq, dispatch_id`,
       [uidMatch[1], sessionId],
@@ -1952,13 +2009,14 @@ const AUTOMATIC_RECOVERY_CONTINUE_PROMPT =
 const PRE_EXECUTION_RECOVERY_CODES = new Set([
   "model_authority_unavailable", "model_catalog_unavailable",
   "codex_pool_busy", "codex_route_unavailable", "codex_container_recycled",
+  "admission_restart_unexecuted",
 ]);
 function recoveryWithoutCheckpointIsProven(code: string): boolean {
   return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));
 }
 
 async function hydrateRecoverySourceUser(
-  client: PoolClient,
+  client: Pool | PoolClient,
   sessionId: string,
   userId: string,
   source: MessageLike,
@@ -7240,6 +7298,10 @@ async function readUnifiedTimelineStatuses(
         WHERE user_id=$1 AND session_id=$2
           AND status='terminal' AND client_notified=TRUE
           AND outcome IN ('not_accepted','executed_error')
+          AND NOT EXISTS (SELECT 1 FROM turn_recovery_jobs j
+            WHERE j.user_id=turn_dispatches.user_id AND j.session_id=turn_dispatches.session_id
+              AND j.source_client_message_id=turn_dispatches.client_message_id
+              AND j.status IN ('queued','leased','sent','forwarded','completed'))
           AND anchor_seq=ANY($3::bigint[])
         ORDER BY anchor_seq,dispatch_id`,
       [uidMatch[1], sessionId, anchorSeqs],
@@ -8737,6 +8799,26 @@ async function readPermissionPromptsForSession(
   }
 }
 
+async function loadAdmissionRestartSource(q: Pool | PoolClient,
+  row: { sessionId: string; userId: bigint; clientMessageId: string }, lock: boolean): Promise<MessageLike | null> {
+  const result = await q.query<{ messages: string; deleted_at: string | null }>(
+    `SELECT messages,deleted_at FROM client_sessions WHERE id=$1 AND user_id=$2${lock ? ' FOR UPDATE' : ''}`,
+    [row.sessionId, `c:${row.userId}`],
+  )
+  const session = result.rows[0]
+  if (!session || session.deleted_at !== null) return null
+  let messages: MessageLike[]
+  try {
+    const parsed: unknown = JSON.parse(session.messages)
+    if (!Array.isArray(parsed)) return null
+    messages = parsed as MessageLike[]
+  } catch { return null }
+  const source = [...messages].reverse().find(item => item?.role === 'user')
+  if (source?.id !== row.clientMessageId) return null
+  return hydrateRecoverySourceUser(q, row.sessionId, `c:${row.userId}`, source)
+}
+
+
 export function createPgSessionsBackend(
   pool: Pool,
   options: PgSessionsBackendOptions,
@@ -8744,7 +8826,13 @@ export function createPgSessionsBackend(
   const expectedGeneration = options.expectedGeneration;
   const finalizeSingleflight = _createFinalizeSingleflight<LosslessTurnTapeFinalizeResult>();
 
+  const admissionRestartDeps = options.admissionRestartRecovery ? {
+    ...options.admissionRestartRecovery, loadLatestSource: loadAdmissionRestartSource,
+    advanceTimeline: advanceClientTimelineIdentityInTransaction,
+  } : undefined;
   const backend: PgSessionsBackend = {
+    recoverInterruptedAdmission: (id) => admissionRestartDeps
+      ? recoverAdmissionAfterRestart(pool, id, admissionRestartDeps) : Promise.resolve(false),
     async scanRecentClientSessionMessages(opts, visit) {
       try {
         return await withTimelineSnapshot(pool, async client => {
@@ -9191,6 +9279,9 @@ export function createPgSessionsBackend(
           ...(input.runtimeKind !== undefined ? { runtimeKind: input.runtimeKind } : {}),
           ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
         });
+        if (dispatch.kind === "admitted" && !dispatch.takeover && !appended.applied && message._admissionRestartRequest !== undefined) {
+          await attachAdmissionRestartSnapshot(client, input.sessionId, input.sessionUserId, message);
+        }
         if (input.recoveryJob) {
           const bound = await bindRecoveryJobDispatch(client, {
             jobId: input.recoveryJob.jobId,
@@ -9276,7 +9367,8 @@ export function createPgSessionsBackend(
           LIMIT $3`,
         [sessionUserId, userId.toString(), boundedLimit],
       );
-      let scheduled = 0;
+      let scheduled = admissionRestartDeps
+        ? await reconcileAdmissionRestarts(pool, userId, boundedLimit, admissionRestartDeps) : 0;
       for (const candidate of candidates.rows) {
         const skipKey = automaticRecoveryReconcileSkipKey(
           sessionUserId,
@@ -12115,7 +12207,7 @@ export function createPgSessionsBackend(
     // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
     async deleteClientSession(id: string, userId?: string): Promise<boolean> {
       const now = Date.now();
-      return withTx(pool, async (client): Promise<boolean> => {
+      const deleted = await withTx(pool, async (client): Promise<boolean> => {
         // updated_at 逻辑版本推进(软删也让并发 stale PUT 因版本落后被拒)。deleted_at 仍是删除权威。
         const sql = userId
           ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
@@ -12140,6 +12232,8 @@ export function createPgSessionsBackend(
         // raced with deletion and financial/audit history remains attributable.
         return true;
       });
+      if (deleted) notifySessionsDeleted(options.onClientSessionsDeleted, userId, [id]);
+      return deleted;
     },
 
     async renameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
@@ -12437,7 +12531,8 @@ export function createPgSessionsBackend(
       if ("ok" in parsed) return parsed;
       const { ids, action } = parsed;
       if (ids.length === 0) return { ok: true, updated: 0, skipped: 0, operationId: parsed.operationId };
-      return withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
+      const deletedIds: string[] = [];
+      const batch = await withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
         if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
           const staleIds: string[] = [];
           const liveRows = (
@@ -12506,6 +12601,7 @@ export function createPgSessionsBackend(
             await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
             await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
             await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+            deletedIds.push(id);
             updated++;
           }
         } else if (action === "archive") {
@@ -12585,6 +12681,8 @@ export function createPgSessionsBackend(
         }
         throw err;
       });
+      if (batch.ok && action === "delete") notifySessionsDeleted(options.onClientSessionsDeleted, userId, deletedIds);
+      return batch;
     },
 
     async markClientSessionRead(userId: string, sessionId: string): Promise<MarkClientSessionReadResult> {

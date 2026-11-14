@@ -385,8 +385,8 @@ export function variantDuplicateTraceHelper(source: string): string {
 export function variantWrongSessionAlias(source: string): string {
   return replaceOnce(
     source,
-    'OC_SESSION_KEY: this.opts.sessionKey,',
-    'OC_SESSION_KEY: this.opts.sessionId,',
+    PROVIDER_THEN_ALIASES,
+    PROVIDER_THEN_ALIASES.replace('OC_SESSION_KEY: this.opts.sessionKey,', 'OC_SESSION_KEY: this.opts.sessionId,'),
     'wrong-session-alias',
   )
 }

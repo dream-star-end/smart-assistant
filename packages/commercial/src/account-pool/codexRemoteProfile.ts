@@ -35,11 +35,15 @@ export function projectCodexRemoteCapabilities(profile: Record<string, any>, ups
   const snapshot = parseCodexExecutionSnapshot(profile.probe_snapshot?.execution_snapshot)
   const model = snapshot.modelList.find(m => (m.model ?? m.id) === upstream)
   if (!model || model.hidden === true) throw new Error('CODEX_MODEL_NOT_OBSERVED')
-  const supported = Array.isArray(model.supportedReasoningEfforts)
+  const observed = Array.isArray(model.supportedReasoningEfforts)
     ? model.supportedReasoningEfforts.map((e: any) => e.reasoningEffort) : []
-  if (supported.some((e: any) => !PLATFORM_REASONING_EFFORTS.includes(e)) || new Set(supported).size !== supported.length)
+  // Match the local Codex policy (protocol/engineModels): ultra enables native delegation,
+  // which is owned by OpenClaude. Keep the native snapshot intact; reject every other unknown.
+  const supported = observed.filter((e: any) => e !== 'ultra')
+  if (supported.some((e: any) => !PLATFORM_REASONING_EFFORTS.includes(e)) || new Set(observed).size !== observed.length)
     throw new Error('CODEX_REASONING_PROFILE_INVALID')
   const def = model.defaultReasoningEffort ?? null
+  // Never invent a remote default or let an omitted effort fall back to native ultra.
   if (def !== null && !supported.includes(def)) throw new Error('CODEX_REASONING_PROFILE_INVALID')
   const tiers = Array.isArray(model.serviceTiers) && model.serviceTiers.every((t: unknown) => typeof t === 'string') ? model.serviceTiers : []
   const image = Array.isArray(model.inputModalities) && model.inputModalities.includes('image')

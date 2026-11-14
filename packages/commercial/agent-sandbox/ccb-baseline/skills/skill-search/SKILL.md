@@ -1,7 +1,7 @@
 ---
 name: skill-search
-description: "搜索和发现当前可用 skills 的流程: 先用 skill_search 找候选,再 skill_view 加载,必要时用 skill_save 沉淀新技能"
-version: "1.0.0"
+description: "查找已有技能或为新技能查重。用户要找技能、盘点技能目录，或不确定具体技能名时使用。"
+version: "1.1.0"
 tags: [system, meta, learning, discovery]
 related_skills: [skill-management, memory-management]
 priority: 6
@@ -20,7 +20,7 @@ priority: 6
 
 ## 推荐流程
 
-1. **先搜索**: 用自然语言或关键词调用 `skill_search`。
+1. **按需选入口**: 已知准确名称就直接 `skill_view(name)`；需要专门流程但名称不明时，用关键词 `skill_search`。普通自足任务不必先查技能，不为搜索再加载本指南。
    ```
    skill_search(query="定时任务 cron", limit=5)
    skill_search(query="wechat image vision")
@@ -31,7 +31,8 @@ priority: 6
    - `source=user`: 用户或 agent 自建 skill,可用 `skill_save` 更新。
 3. **加载候选**: 对最相关结果调用 `skill_view(name)` 阅读完整步骤。
 4. **没有结果时**:
-   - 换更宽泛的关键词再搜一次;或调用 `skill_list()` 浏览全部名称和描述。
+   - 换关键词再搜一次；仍无合适结果就按现有能力完成任务，注明能力缺口，不为凑流程加载无关技能。
+   - `skill_list()` 用于用户要浏览全部技能或本次任务确需盘点目录，不作为每个任务的启动步骤。
    - 如果刚完成了一个可复用流程,用 `skill_save` 创建新 skill。
 
 ## 主动沉淀规则

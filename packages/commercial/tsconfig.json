@@ -5,15 +5,33 @@
     "tsBuildInfoFile": "dist-types/.tsbuildinfo",
     "baseUrl": ".",
     "paths": {
-      "@openclaude/protocol": ["../protocol/src/index.ts"]
+      "@openclaude/protocol": [
+        "../protocol/src/index.ts"
+      ]
     }
   },
-  "include": ["src", "scripts"],
+  "include": [
+    "src",
+    "scripts"
+  ],
   "references": [
-    { "path": "../gateway" },
-    { "path": "../storage" },
-    { "path": "../channels/wechat" },
-    { "path": "../protocol" },
-    { "path": "../kernel" }
+    {
+      "path": "../gateway"
+    },
+    {
+      "path": "../storage"
+    },
+    {
+      "path": "../channels/wechat"
+    },
+    {
+      "path": "../protocol"
+    },
+    {
+      "path": "../kernel"
+    },
+    {
+      "path": "../../ops/ocv5-308"
+    }
   ]
 }

@@ -1208,6 +1208,12 @@ export async function bootAutoResume(this: GatewayLifecycleHost): Promise<void> 
         kind: 'prewarm',
         defaultModel: this.deps.config.defaults.model,
       })
+      // As sessionPreheat: a Codex pre-warm without its route would check the chat's
+      // thread against the local rollout store and drop a remote lane's thread id.
+      if (preExec?.engine === 'codex') {
+        this.log.info('engine_preheat_skipped', { sessionKey, outcome: 'skipped_route_unknown' })
+        continue
+      }
       await this.sessions.getOrCreate({
         sessionKey,
         agent,

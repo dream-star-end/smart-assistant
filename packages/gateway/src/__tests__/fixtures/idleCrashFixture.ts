@@ -84,9 +84,8 @@ export function saveIdleCheckpoint(home: string, root: string, sessionKey: strin
     const rel = relative(home, file);
     assert.ok(!rel.startsWith(".."));
     mkdirSync(dirname(join(root, rel)), { recursive: true });
-    // One read: the copy and its hash are the same bytes. Copying then re-reading
-    // the live file raced a concurrent write on a fast runner, so the snapshot
-    // failed its own integrity check at restore.
+    // The live runner may append after this read. Receipt and saved bytes must
+    // describe the same observation, not a second read of the live file.
     const bytes = readFileSync(file);
     writeFileSync(join(root, rel), bytes);
     return { relative: rel, sha256: createHash("sha256").update(bytes).digest("hex") };

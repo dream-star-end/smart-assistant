@@ -44,7 +44,7 @@ export async function readSwitchContext(
       deleted_at: unknown
       archived: boolean
     }>(
-      `SELECT history_revision::text,timeline_generation::text,messages <> '[]' AS has_content,deleted_at,
+      `SELECT /* model-switch-session-meta */ history_revision::text,timeline_generation::text,messages <> '[]' AS has_content,deleted_at,
        EXISTS(SELECT 1 FROM client_session_archive_chunks a WHERE a.session_id=cs.id AND a.user_id=cs.user_id) AS archived
        FROM client_sessions cs WHERE id=$1 AND user_id=$2`,
       [sessionId, owner],

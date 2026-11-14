@@ -87,6 +87,8 @@ export const GROK_SEARCH_PATH = '/internal/v3/grok-search'
 export const TURN_LEASE_RENEW_PATH = '/internal/v3/turn-lease/renew'
 export const MODEL_CATALOG_PATH = '/internal/v3/model-catalog'
 export const MODEL_CATALOG_EPOCH_PATH = '/internal/v3/model-catalog-epoch'
+/** Wire/LKG projection semantics; legacy masters omit this field (= 1). */
+export const MODEL_CATALOG_PROJECTION_FORMAT = 2
 export const SERVER_AUTHORED_PATH = '/internal/v3/server-authored-message'
 export const CCB_TRANSCRIPT_RESTORE_PATH = '/internal/v3/ccb-transcript-restore'
 export const TURN_TAPE_STATE_PATH = '/internal/v3/turn-tape-state'
@@ -169,13 +171,12 @@ export interface InternalRouteEntry {
 }
 
 export const INTERNAL_ROUTES = [
-  // ── v5:delegate grok-route(forwarder 唯一放行例外;selfhost 门控挂载)──
+  // ── v5:delegate grok-route(forwarder 唯一放行例外;两版都挂载,relay 按计费 journal 放行)──
   {
     path: DELEGATE_GROK_ROUTE_MINT_PATH,
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
   },
   {
@@ -183,7 +184,6 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
   },
   {
@@ -191,7 +191,6 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
   },
   {

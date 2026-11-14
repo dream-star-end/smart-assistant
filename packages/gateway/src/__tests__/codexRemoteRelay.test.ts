@@ -13,7 +13,7 @@ import { codexBackend,zeroNativeTokens,type CodexRemoteBinding } from '../codexR
 import { cc5ToolInputSha256 } from '../cc5NativeTool.js'
 import type { CodexLaneSpec } from '../codexRemoteHost.js'
 const pause=(ms=30)=>new Promise(r=>setTimeout(r,ms))
-async function harness(t: any, ttl=120000) {
+async function harness(t: any, ttl=120000, rejectEffort?: string) {
  const root=mkdtempSync(join(tmpdir(),'codex-master-')), now=Date.now()
  const b:CodexRemoteBinding={version:3,backendKind:'codex-app-server-v1',uid:'3',containerDbId:'7',dockerId:'a'.repeat(64),
   operationId:randomUUID(),runId:randomUUID(),sessionKey:'agent:main:webchat:dm:codex_fixture',canonicalModel:'gpt-6-luna-remote',
@@ -59,8 +59,14 @@ async function harness(t: any, ttl=120000) {
  await rpc({id:1,method:'thread/start',params:{}})
  async function until(fn:()=>Promise<boolean>){for(let i=0;i<150;i++){if(await fn())return;await pause(10)}assert.fail('timed out')}
  await until(async()=>{const r=await call('/poll',{afterSeq:0});return r.frames.some((x:any)=>x.frame.id===1)})
- await rpc({id:2,method:'turn/start',params:{threadId:'thread-fixture',input:[{type:'text',text:'fixture'}],effort:'low'}})
- await until(async()=>{const r=await call('/poll',{afterSeq:0});return r.frames.some((x:any)=>x.frame.method==='turn/started')})
+ if (rejectEffort) {
+  const result=await call('/rpc',{frame:{id:2,method:'turn/start',params:{threadId:'thread-fixture',input:[{type:'text',text:'fixture'}],effort:rejectEffort}}})
+  assert.equal(result.status,403)
+  await until(async()=>stopCalls>0)
+ } else {
+  await rpc({id:2,method:'turn/start',params:{threadId:'thread-fixture',input:[{type:'text',text:'fixture'}],effort:'low'}})
+  await until(async()=>{const r=await call('/poll',{afterSeq:0});return r.frames.some((x:any)=>x.frame.method==='turn/started')})
+ }
  const args={file_path:join(root,'effect'),content:'real-container-marker'}
  const item={type:'mcpToolCall',id:'call1',server:'ocbridge',tool:'Write',arguments:args}
  const tool={version:3,engine:'codex',operationId:b.operationId,runId:b.runId,generation:b.generation,callId:'call1',
@@ -80,6 +86,16 @@ async function harness(t: any, ttl=120000) {
  }
  return {root,call,rpc,until,emit,sendTool,nativeItem,item,tool,args,relay,receipts,received,a,turnKey,nextAdmission,financeStops,get charged(){return charged},get stopCalls(){return stopCalls}}
 }
+test('ultra is rejected by the signed effort policy before any turn reaches the node',async t=>{
+ const h=await harness(t,120000,'ultra')
+ assert.equal(h.relay.stopped,true)
+ assert.equal(h.received.some(x=>x.received?.method==='turn/start'),false)
+ assert.equal(h.receipts.length,0)
+ // A separate admitted lane still dispatches an allowed effort through the same real transport.
+ const allowed=await harness(t)
+ await allowed.until(async()=>allowed.received.some(x=>x.received?.method==='turn/start'))
+ assert.deepEqual(allowed.received.filter(x=>x.received?.method==='turn/start').map(x=>x.received.params.effort),['low'])
+})
 test('independent native gate, real two-child relay, tool effect once, terminal waits for ACK + finance; expired admitted authority works',async t=>{
  const h=await harness(t,600);await pause(650)
  h.sendTool();await pause();assert.equal((await h.call('/tool/next')).request,undefined)
@@ -95,8 +111,11 @@ test('independent native gate, real two-child relay, tool effect once, terminal 
  assert.ok(!(await h.call('/poll',{afterSeq:0})).frames.some((x:any)=>x.frame.method==='turn/completed'))
  await h.call('/tool/ack',{callId:'call1'});await h.until(async()=>h.charged)
  h.emit(final);await pause();assert.equal(h.receipts.length,1)
+ // Settled but the container has not read the terminal yet: a full pool must not reclaim this lane.
+ assert.equal(h.relay.idle,false)
  const frames=(await h.call('/poll',{afterSeq:0})).frames
  assert.equal(frames.filter((x:any)=>x.frame.method==='turn/completed').length,1)
+ assert.equal(h.relay.idle,true)
  assert.equal(readdirSync(join(h.root,'journal')).filter(f=>f.includes('native-terminal')).length,1)
  const stop=h.call('/stop');await pause();assert.equal((await h.call('/tool/stopped',{authorityTurnId:h.a.authorityTurnId,turnKey:h.turnKey})).status,200)
  assert.equal((await stop).remoteStopped,true)

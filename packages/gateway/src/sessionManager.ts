@@ -1,6 +1,6 @@
 import type { PreheatPreparation } from './speculativePreheat.js'
 import { renderHistoricalContextJsonPrompt } from './historicalContextPrompt.js'
-import { type RemoteExecutionBackend, isBoxApiModel } from '@openclaude/protocol'
+import { type RemoteExecutionBackend, type GrokExecutionDescriptor, isBoxApiModel } from '@openclaude/protocol'
 import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
@@ -88,6 +88,7 @@ import {
 } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import './engine/antigravityAdapter.js'
+import './remotePool/registerRemoteDriver.js'
 import {
   RESUME_HISTORY_MAX,
   pickResumableId,
@@ -2020,8 +2021,9 @@ export class SessionManager {
   private async finishIdleUnderLock(session: AgentSession, source: {
     sessionId: string
     turnKey: string
-  }, recoveryDir: string = paths.home): Promise<void> {
-    return finishIdleUnderLockImpl.call(this as unknown as SessionSubmitHost, session, source, recoveryDir)
+  }, recoveryDir: string = paths.home,
+  mode: 'after_turn' | 'pre_expiry' = 'after_turn'): Promise<'deferred' | void> {
+    return finishIdleUnderLockImpl.call(this as unknown as SessionSubmitHost, session, source, recoveryDir, mode)
   }
 
   /**
@@ -2087,6 +2089,7 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       /** Grok CLI receives only this one-turn opaque loopback relay route. */
       grokRoute?: GrokRouteOverride | null
+      grokExecutionDescriptor?: GrokExecutionDescriptor
       /** Master-authored recovery fence for a first-event silent engine turn.
        * Only Grok currently consumes it; arbitrary client input cannot set it. */
       resetNativeSession?: boolean
@@ -2162,8 +2165,8 @@ export class SessionManager {
         turnKey: string
         traceId?: string
       }): Promise<void>
-    }, logicalTurnSignal?: AbortSignal, contextOverflowRetryInputs: string[] = [], automaticRetryState?: AutomaticRetryState, modelSwitchTransition?: AgentSession['_modelSwitchTransition']): Promise<void> {
-    return runOneTurnWithRetryImpl.call(this as unknown as TurnRunnerHost, session, userTextOrBlocks, onEvent, requestId, traceId, collabAgentPolicy, modelAuthority, clientMessageId, dispatchContext, queueLifecycle, logicalTurnSignal, contextOverflowRetryInputs, automaticRetryState, modelSwitchTransition)
+    }, logicalTurnSignal?: AbortSignal, contextOverflowRetryInputs: string[] = [], automaticRetryState?: AutomaticRetryState, modelSwitchTransition?: AgentSession['_modelSwitchTransition'], grokExecutionDescriptor?: GrokExecutionDescriptor): Promise<void> {
+    return runOneTurnWithRetryImpl.call(this as unknown as TurnRunnerHost, session, userTextOrBlocks, onEvent, requestId, traceId, collabAgentPolicy, modelAuthority, clientMessageId, dispatchContext, queueLifecycle, logicalTurnSignal, contextOverflowRetryInputs, automaticRetryState, modelSwitchTransition, grokExecutionDescriptor)
   }
 
   private _transientRetryDelayMs(attempt: number): number {
@@ -2211,8 +2214,8 @@ export class SessionManager {
   // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
   //  知识;本层只消费 TurnSummary.errorKind === 'auth'。)
 
-  private _runOneTurn(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, requestId?: string, traceId?: string, collabAgentPolicy?: CollabAgentPolicy, assistantMessageId?: string, thinkingMessageId?: string, toolMessageIdFactory?: (blockId: string) => string, turnKey?: string, clientMessageId?: string, modelAuthority?: TurnModelAuthority, retryRuntimeEvents: DurableRuntimeEvent[] = [], retryAssistantSegments: SegmentRecord[] = [], retryThinkingSegments: SegmentRecord[] = [], retryTools: TurnToolEntry[] = [], retryStructuredBlocks: Array<Record<string, unknown>> = [], queueTurn = false, retryAuthErrors = true, retryPhantomErrors = true, retryTransientErrors = false, attemptOrdinal = 0, automaticRetryState?: AutomaticRetryState, modelSwitchTransition?: AgentSession['_modelSwitchTransition']): Promise<void> {
-    return _runOneTurnImpl.call(this as unknown as TurnRunnerHost, session, userTextOrBlocks, onEvent, requestId, traceId, collabAgentPolicy, assistantMessageId, thinkingMessageId, toolMessageIdFactory, turnKey, clientMessageId, modelAuthority, retryRuntimeEvents, retryAssistantSegments, retryThinkingSegments, retryTools, retryStructuredBlocks, queueTurn, retryAuthErrors, retryPhantomErrors, retryTransientErrors, attemptOrdinal, automaticRetryState, modelSwitchTransition)
+  private _runOneTurn(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, requestId?: string, traceId?: string, collabAgentPolicy?: CollabAgentPolicy, assistantMessageId?: string, thinkingMessageId?: string, toolMessageIdFactory?: (blockId: string) => string, turnKey?: string, clientMessageId?: string, modelAuthority?: TurnModelAuthority, retryRuntimeEvents: DurableRuntimeEvent[] = [], retryAssistantSegments: SegmentRecord[] = [], retryThinkingSegments: SegmentRecord[] = [], retryTools: TurnToolEntry[] = [], retryStructuredBlocks: Array<Record<string, unknown>> = [], queueTurn = false, retryAuthErrors = true, retryPhantomErrors = true, retryTransientErrors = false, attemptOrdinal = 0, automaticRetryState?: AutomaticRetryState, modelSwitchTransition?: AgentSession['_modelSwitchTransition'], grokExecutionDescriptor?: GrokExecutionDescriptor): Promise<void> {
+    return _runOneTurnImpl.call(this as unknown as TurnRunnerHost, session, userTextOrBlocks, onEvent, requestId, traceId, collabAgentPolicy, assistantMessageId, thinkingMessageId, toolMessageIdFactory, turnKey, clientMessageId, modelAuthority, retryRuntimeEvents, retryAssistantSegments, retryThinkingSegments, retryTools, retryStructuredBlocks, queueTurn, retryAuthErrors, retryPhantomErrors, retryTransientErrors, attemptOrdinal, automaticRetryState, modelSwitchTransition, grokExecutionDescriptor)
   }
 
   interrupt(sessionKey: string, reason: 'user' | 'system' = 'system'): boolean {

@@ -1,3 +1,4 @@
+import { grokExecutionUpstream } from '@openclaude/protocol'
 import { ContainerLinkControls } from "./containerLinkControls.js";
 import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
 import { rebuildContainerLink } from "./containerLinkRebuild.js";
@@ -61,10 +62,11 @@ import { applyTeamLeaderForwarding } from './teamModeForwarding.js'
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { desktopAllowsEngine } from "./containerTransportKind.js";
+import { snapshotAdmissionRequest } from "../dispatch/admissionRestartRecovery.js";
 import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
-import type { Pool } from "pg";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import type { Pool, PoolClient } from "pg";
+import { isBoxGptWebAllowedUser, isCursorCredentialMember } from "../cursor/access.js";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
@@ -150,6 +152,7 @@ import {
   resolveUsedCursorAccountId,
 } from "../account-pool/cursorMaterializer.js";
 import { getCursorTokenSnapshot } from "../account-pool/store.js";
+import { reconcileRemoteChat } from "../account-pool/remoteLaneRecovery.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
@@ -193,18 +196,22 @@ import {
   type RemoteExecutionBackend,
   isCc5TestModel,
   isBoxGptWebModel,
-  isBoxGptWebOwnerUid,
   type DurableCodexBilling,
 } from "@openclaude/protocol";
 import { systemHelpDispatchFields } from "../system-assistant/helpBridge.js";
 import {
   backfillDispatchTraceId,
+  casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
   heartbeatLease,
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
 } from "../dispatch/turnDispatchStore.js";
+import {
+  abortNeverExecutedJournalForDispatch,
+  type AbortedJournalRef,
+} from "../dispatch/turnDispatchReconciler.js";
 import {
   HELLO_LIVE_CATCHUP_MAX_BYTES,
   liveCatchupSendDecision,
@@ -226,6 +233,7 @@ import {
 } from "../dispatch/turnControlStore.js";
 import {
   claimDueRecoveryJobs,
+  listDueRecoveryCarrierContainers,
   forwardRecoveryUnderRootFence,
   releaseRecoveryPreReceipt,
   pauseRecoveryForRefusal,
@@ -372,76 +380,10 @@ const HELLO_LIVE_CATCHUP_MAX_SESSIONS = 8;
 /** 单会话 hello 补齐帧数封顶,与 GET live-frames 页大小对齐。 */
 const HELLO_LIVE_CATCHUP_MAX_FRAMES = 500;
 
-export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
-export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
-export const PROMPT_QUEUE_DISPATCH_CANCEL_TYPE = "outbound.prompt_queue.dispatch_cancel";
-export const PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE = "outbound.prompt_queue.dispatch_activated";
-export const PROMPT_QUEUE_GRANT_FIELD = "__oc_prompt_queue_grant";
-
-export interface PromptQueueDispatchRequest {
-  type: typeof PROMPT_QUEUE_DISPATCH_REQUEST_TYPE;
-  grantId: string;
-  owner: {
-    sessionKey: string;
-    clientSessionId: string;
-    agentId: string;
-    peer: { id: string; kind: "dm" };
-  };
-  claim: { epoch: string; claimToken: string };
-  item: {
-    itemId: string;
-    clientMessageId: string;
-    contentHash: string;
-    content: Record<string, unknown>;
-    requestedExecution: {
-      agentId: string;
-      model?: string;
-      modelSwitchId?: string;
-      modelSwitchConsent?: string;
-      effortLevel?: string | null;
-      teamMode?: boolean;
-      collabMode?: "solo" | "advisor" | "team";
-      advisorModel?: string;
-      collabConfigVersion?: string;
-      contextTier?: CursorContextTier;
-      serviceTier?: ServiceTier | null;
-    };
-  };
-}
-
-export interface PromptQueueDispatchResult {
-  type: typeof PROMPT_QUEUE_DISPATCH_RESULT_TYPE;
-  grantId: string;
-  owner: PromptQueueDispatchRequest["owner"];
-  itemId: string;
-  contentHash: string;
-  epoch: string;
-  claimToken: string;
-  outcome: "rejected";
-  disposition: "retryable" | "user_action_required";
-  reasonCode: string;
-}
-
-export interface PromptQueueDispatchCancel {
-  type: typeof PROMPT_QUEUE_DISPATCH_CANCEL_TYPE;
-  grantId: string;
-  owner: PromptQueueDispatchRequest["owner"];
-  itemId: string;
-  contentHash: string;
-  epoch: string;
-  claimToken: string;
-  reasonCode: string;
-}
-
-export interface PromptQueueDispatchActivated {
-  type: typeof PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE;
-  grantId: string;
-  owner: PromptQueueDispatchRequest["owner"];
-  itemId: string;
-  contentHash: string;
-  epoch: string;
-  claimToken: string;
-}
+import { PROMPT_QUEUE_DISPATCH_REQUEST_TYPE, PROMPT_QUEUE_DISPATCH_RESULT_TYPE, PROMPT_QUEUE_DISPATCH_CANCEL_TYPE, PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE, PROMPT_QUEUE_GRANT_FIELD } from "./promptQueueDispatchTypes.js";
+export { PROMPT_QUEUE_DISPATCH_REQUEST_TYPE, PROMPT_QUEUE_DISPATCH_RESULT_TYPE, PROMPT_QUEUE_DISPATCH_CANCEL_TYPE, PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE, PROMPT_QUEUE_GRANT_FIELD } from "./promptQueueDispatchTypes.js";
+import type { PromptQueueDispatchRequest, PromptQueueDispatchResult, PromptQueueDispatchCancel, PromptQueueDispatchActivated } from "./promptQueueDispatchTypes.js";
+export type { PromptQueueDispatchRequest, PromptQueueDispatchResult, PromptQueueDispatchCancel, PromptQueueDispatchActivated } from "./promptQueueDispatchTypes.js";
 
 /**
  * Parse the trusted container→master queue hand-off. This is deliberately a
@@ -733,6 +675,8 @@ const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
  *   - commercial/billing/modelCatalog 的那份是 DB 投影(带 providerId / upstreamModelId
  *     —— **路由**语义,只有 master/egress 需要,容器不该看见上游身份);
  *   - protocol 的那份是**容器执行**语义(capability / context / effort / vision)。
+ * Grok CLI exception: a public model version is required by --model; project
+ * it from this same snapshot, never provider credentials or endpoints.
  * 这里做一次显式收窄 = 「凭据与路由不进容器」这条边界在类型层的落点。
  *
  * `contextWindow` 的 null 原样进入签名载荷；0 不是合法窗口，不能拿哨兵值混淆语义。
@@ -743,6 +687,7 @@ function toProtocolDescriptor(
   const profile = d.capabilityProfile;
   return {
     capabilityProfile: {
+      ...(d.engine === 'grok' ? { grok: { upstreamModelId: grokExecutionUpstream(d.canonicalModel, d.upstreamModelId) } } : {}),
       supportsVision: profile.supportsVision,
       reasoning: {
         supported: [...profile.reasoning.supported],
@@ -2315,27 +2260,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (recovery && links) {
         try {
           const channel = deps.containerLinkRecovery?.channel ?? "v5";
-          const carriers = await deps.pgPool.query<{ container_id: number }>(
-            `SELECT DISTINCT ac.id::int AS container_id
-               FROM turn_recovery_jobs r
-               JOIN client_sessions s ON s.id=r.session_id AND s.user_id='c:' || r.user_id::text AND s.deleted_at IS NULL
-               LEFT JOIN LATERAL (
-                 SELECT d.agent_container_id FROM turn_dispatches d
-                  WHERE d.user_id=r.user_id AND d.session_id=r.session_id
-                  ORDER BY (d.client_message_id=r.source_client_message_id) DESC NULLS LAST,
-                           d.admitted_at DESC, d.dispatch_id DESC LIMIT 1
-               ) d ON true
-               JOIN agent_containers ac ON ac.user_id=r.user_id AND ac.state='active' AND ac.runtime_channel=$2
-                AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
-                  SELECT 1 FROM agent_containers other WHERE other.user_id=r.user_id AND other.state='active'
-                    AND other.runtime_channel=$2 AND other.id<>ac.id)))
-              WHERE r.user_id=$1 AND r.status IN ('queued','leased') AND r.next_attempt_at<=NOW()
-                AND (r.status='queued' OR r.lease_until<NOW())
-                AND r.dispatch_id IS NULL
-              LIMIT 5`,
-            [key, channel],
-          );
-          for (const row of carriers.rows ?? []) {
+          const carriers = await listDueRecoveryCarrierContainers(deps.pgPool, uid, channel);
+          for (const row of carriers) {
             if (links.retainKeepAliveConsumer(uid, row.container_id)) {
               continue;
             }
@@ -3711,6 +3637,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       recoveryJob?: ClaimedRecoveryJob;
       /** OCV5-730: deferred recovery ACK emitted only after pre-forward admission gates pass. */
       pendingRecoveryAck?: Record<string, unknown>;
+      /** OCV5-746: server-owned engine sessionKey of this turn's lane (NOT the browser peer id).
+       *  remote_agent_bindings 按它建键,拒帧释放必须复用同值。 */
+      engineSessionKey?: string;
+      /** OCV5-746: this turn was admitted on a remote_pool lane (server-owned placement fact). */
+      remoteLane?: boolean;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
     type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
@@ -3804,17 +3735,36 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return true;
     };
 
+    type PreForwardFailOpts = {
+      abortNeverExecutedJournal?: boolean;
+      fromStatuses?: Array<"admitted" | "accepted">;
+      /** Fires only after this call itself moved the dispatch to a terminal/paused
+       *  state and committed; never on CAS miss, rollback, or a non-durable pool. */
+      onTerminal?: () => void;
+    };
     const terminalizeEnrichmentDispatch = (
       state: EnrichmentDispatchState,
       failureCode: string,
+      opts?: PreForwardFailOpts,
     ): boolean => {
+      const wasTransferring = state.phase === "transferring";
       if (!claimEnrichmentTerminalization(state)) return false;
       const record = state.record;
       const pool = deps.pgPool;
       void (async (): Promise<void> => {
         try {
           if (!pool) return;
-          if (record.recoveryJob) {
+          if (failureCode === "bridge_closed_during_admission" &&
+              (!record.recoveryJob || wasTransferring)) {
+            // A send can reach the durable inbox before its local callback.
+            // Keep the task open until exact proof resolves ownership: live
+            // work continues; a rejected tombstone schedules a fresh identity.
+            await casAdmittedToRejecting(pool, {
+              dispatchId: record.dispatchId,
+              expectedEpoch: record.leaseEpoch,
+              ownerId: "bridge-admission-handoff",
+            });
+          } else if (record.recoveryJob) {
             const refusalKey = `${record.recoveryJob.jobId}:${record.recoveryJob.leaseEpoch}`;
             const refusal = refusedRecoveryJobs.get(refusalKey)
               ?? (_recoveryRefusalAction(failureCode) === "pause" ? failureCode : undefined);
@@ -3827,19 +3777,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             };
             if (refusal !== undefined) {
               const paused = await pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal });
-              if (paused) broadcastRecoveryJobRefused(record.recoveryJob, refusal);
+              if (paused) {
+                broadcastRecoveryJobRefused(record.recoveryJob, refusal);
+                opts?.onTerminal?.();
+              }
             } else {
               await releaseRecoveryPreReceipt(pool, fenced);
             }
           } else {
-            await casToTerminal(pool, {
-              dispatchId: record.dispatchId,
-              outcome: "executed_error",
-              failureCode,
-              clientNotified: false,
+            // 与普通出口共用同一单事务收敛(R2-C1):enrichment 期也可能已经有本地 Codex
+            // 的 inflight journal,补偿不能落在事务外。
+            const settled = await settlePreForwardDispatch(pool, record, failureCode, {
+              abortNeverExecutedJournal: opts?.abortNeverExecutedJournal === true,
               fromStatuses: ["admitted"],
-              expectedEpoch: record.leaseEpoch,
             });
+            if (settled) opts?.onTerminal?.();
           }
         } catch (err) {
           bridgeLog?.error("user-chat-bridge: pre-transfer dispatch terminalization failed", {
@@ -3939,8 +3891,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return state;
     };
 
-    /** The websocket send callback is the physical-transfer linearization
-     * point. Until it succeeds, cleanup may still terminalize this state. */
+    /** A successful websocket callback releases enrichment ownership. If
+     * cleanup wins first, exact inbox proof resolves the uncertain delivery. */
     const completeEnrichmentTransfer = (state: EnrichmentDispatchState | null): void => {
       if (state) acceptEnrichmentReceipt(state.record);
     };
@@ -4013,15 +3965,82 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
       } catch { /* sideband only */ }
     };
+    /** OCV5-746: pre-forward 失败出口的**单事务**收敛(CAS + 可选 never-executed 补偿)。
+     *  转发前失败一律 executed_error/notified=false;本地 Codex 已有 inflight journal 时,
+     *  补偿必须和终态 CAS 在同一事务、同一行锁里完成,否则 reconciler ③ 可能插在中间判
+     *  billed 并钉成 manual_reconcile。正常出口与 enrichment 出口共用本实现。 */
+    const settlePreForwardDispatch = async (
+      pool: NonNullable<UserChatBridgeDeps["pgPool"]>,
+      record: AdmittedDispatch,
+      failureCode: string,
+      opts: Omit<PreForwardFailOpts, "onTerminal"> = {},
+    ): Promise<boolean> => {
+      // pg.Pool 一定暴露 connect();没有 connect 的池只出现在单测桩里。此时退回单语句
+      // 路径,并且**拒绝**做免单补偿 —— 拿不到事务/行锁就不敢声称"从未执行"。
+      const txCapable = typeof (pool as { connect?: unknown }).connect === "function";
+      let client: PoolClient | null = null;
+      let aborted: AbortedJournalRef[] = [];
+      let committed = false;
+      let terminalHit = false;
+      try {
+        client = txCapable
+          ? await pool.connect()
+          : (pool as unknown as PoolClient);
+        if (txCapable) await client.query("BEGIN");
+        const terminal = await casToTerminal(client, {
+          dispatchId: record.dispatchId,
+          outcome: "executed_error",
+          failureCode,
+          clientNotified: false,
+          expectedEpoch: record.leaseEpoch,
+          ...(opts.fromStatuses === undefined ? {} : { fromStatuses: opts.fromStatuses }),
+        });
+        // 只有本轮**确实**被 CAS 成终态才允许 abort journal(钱安全):CAS 未命中说明
+        // 别的路径已经接管(可能真的执行过),不能凭一张错误帧免单。补偿必须与 CAS 同事务。
+        if (terminal !== null && opts.abortNeverExecutedJournal === true && txCapable) {
+          aborted = await abortNeverExecutedJournalForDispatch(client, record.dispatchId);
+        }
+        if (txCapable) await client.query("COMMIT");
+        committed = true;
+        terminalHit = terminal !== null;
+      } catch (error) {
+        // 补偿失败就整体回滚:宁可留在 admitted 等 reconciler/用户重试,也不能留下
+        // 「已 executed_error 但 journal 未补偿」的财务歧义窗口。
+        if (txCapable && client !== null) {
+          try { await client.query("ROLLBACK"); } catch { /* already closed */ }
+        }
+        bridgeLog?.warn("user-chat-bridge: pre-forward terminalize failed", {
+          dispatchId: record.dispatchId,
+          failureCode,
+          error,
+        });
+      } finally {
+        if (txCapable && client !== null) client.release();
+      }
+      if (!committed) return false;
+      // 被 abort 的 pre-forward journal 对应的 preCheck 预留额度在 commit 之后释放
+      // (best-effort:tx 内不能做 Redis I/O,失败只影响额度 TTL 到期,不影响财务事实)。
+      const redis = deps.preCheckRedis;
+      if (redis !== undefined) {
+        for (const ref of aborted) {
+          await releasePreCheck(redis, ref).catch(() => {});
+        }
+      }
+      return terminalHit;
+    };
     const failDispatchPreForward = (
       record: AdmittedDispatch | undefined,
       failureCode: string,
+      /** OCV5-746: abortNeverExecutedJournal — 容器模型权威已在准入前拒帧 = 本轮可证明未执行
+       *  → 终态之后把 pre-forward inflight journal 按 never-executed waiver abort(内嵌 no-usage
+       *  守卫),否则 reconciler 会把 executed_error 判成 billed_but_failed 转人工。 */
+      opts?: PreForwardFailOpts,
     ): void => {
       if (record === undefined) return;
       const enrichment = enrichmentDispatches.get(record.clientMessageId);
       if (enrichment?.record === record) {
         if (enrichment.phase === "terminalizing") return;
-        if (terminalizeEnrichmentDispatch(enrichment, failureCode)) return;
+        if (terminalizeEnrichmentDispatch(enrichment, failureCode, opts)) return;
       }
       const pool = deps.pgPool;
       settleCronOriginClaim(record.dispatchId, { kind: "delivery_unknown" });
@@ -4042,7 +4061,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const pausedJob = record.recoveryJob;
           void pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal })
             .then((paused) => {
-              if (paused) broadcastRecoveryJobRefused(pausedJob, refusal);
+              if (!paused) return;
+              broadcastRecoveryJobRefused(pausedJob, refusal);
+              opts?.onTerminal?.();
             })
             .catch(() => {});
         } else {
@@ -4050,12 +4071,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         return;
       }
-      void casToTerminal(pool, {
-        dispatchId: record.dispatchId,
-        outcome: "executed_error",
-        failureCode,
-        clientNotified: false,
-        expectedEpoch: record.leaseEpoch,
+      const { onTerminal, ...settleOpts } = opts ?? {};
+      void settlePreForwardDispatch(pool, record, failureCode, settleOpts).then((settled) => {
+        if (settled) onTerminal?.();
       }).catch(() => {});
     };
     /** 按帧的 clientMessageId 反查本连接受理记录(IIFE forward/失败出口共用)。 */
@@ -4557,6 +4575,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(displayText !== modelText ? { _modelText: modelText } : {}),
           ...(replyTo ? { _replyTo: replyTo } : {}),
           _routing: routing,
+          _admissionRestartRequest: snapshotAdmissionRequest(frameObj),
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
@@ -6153,9 +6172,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;
             }
-            if (isBoxGptWebModel(modelCapture) && !isBoxGptWebOwnerUid(uid)) {
+            if (isBoxGptWebModel(modelCapture) && !isBoxGptWebAllowedUser(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
-              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'gpt-6-astra-pro is restricted to owner account user_id=3', cursorTurnIdentity);
+              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'gpt-6-astra-pro is not enabled for this account', cursorTurnIdentity);
               return;
             }
             // The local supervisor mounts the owner credential only on this
@@ -6267,9 +6286,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
             }
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
-            let cursorSpendable: bigint;
+            // box-gpt-6-astra-pro is never billed (no audit row, so no settle; OCV5-575): an allowed
+            // account with a zero balance may still use it.
+            const cursorBilled = !isBoxGptWebModel(modelCapture);
+            let cursorSpendable: bigint | null = null;
             try {
-              cursorSpendable = await readTotalSpendableBalance(uid);
+              if (cursorBilled) cursorSpendable = await readTotalSpendableBalance(uid);
             } catch (err) {
               logCapture?.error('user-chat-bridge: cursor spendable lookup failed', { err });
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
@@ -6279,7 +6301,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            if (cursorSpendable <= 0n) {
+            if (cursorSpendable !== null && cursorSpendable <= 0n) {
               rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
               failDispatchPreForward(dispatchRecord, 'insufficient_credits');
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
@@ -6313,7 +6335,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
-            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
+            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable === null ? undefined : cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
             if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
             await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len, dispatchRecord);
@@ -7712,6 +7734,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             if (enrichedParsed === null) return;
             dispatchRecordC = lookupAdmittedDispatch(enrichedParsed);
+            // OCV5-746: 拒帧后释放远端 lane 只能用**服务端**身份。ccbTurnIdentity.sessionKey
+            // 就是传给 cc5BackendSelector / 写 remote_agent_bindings 的同一个值(sessionId
+            // 是浏览器 peer id,不是绑定键)。placement 同样在签票前已定,不从回帧推断。
+            if (dispatchRecordC !== undefined) {
+              if (typeof ccbTurnIdentity.sessionKey === "string" && ccbTurnIdentity.sessionKey) {
+                dispatchRecordC.engineSessionKey = ccbTurnIdentity.sessionKey;
+              }
+              dispatchRecordC.remoteLane = authorityExec?.placement === "remote_pool";
+            }
             const authorityTurnId = authorityExec === null
               ? undefined
               : authorityDeps!.signer.mintAuthorityTurnId();
@@ -7754,14 +7785,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 签发边界(MAJOR-2):CCB turn 的计费在 egress 逐请求结算,此处无预扣/无 journal
             // → 无需补偿;但 epoch 重读一样不能省 —— 拿过时快照签出的票 lease 长达 50min,
             // 会让「刚被 admin 撤销的模型」在这条 turn 里继续跑到 egress 的下一次 fence 才拦下。
+            // OCV5-746: codex 帧进容器后,gateway 断言 signed envelope 的 billingRequestId 与
+            // frame.requestId 同源同值(engine=codex 的计费身份绑定,见 gateway modelAuthority)。
+            // 远端(-remote / remote_pool)codex 帧不走 6812 的本地 codex 分支,而是落到这条通用
+            // CCB 分支;这里以前只把 dispatch.billingRequestId 签进 envelope、从不写
+            // frame.requestId → 首轮必被容器以 billing_request_mismatch 拒。
+            // 现在只铸**一个** server-owned 值:有 dispatch 复用它的稳定 billingRequestId
+            // (egress 据此写 usage_records.dispatch_id/attempt_no),没有 dispatch 才铸新 id
+            // (legacy 连接)。同值既签进 envelope,也在 spread 之后覆写 frame.requestId ——
+            // 浏览器伪造值不能存活。
+            const codexFrameRequestId = authorityExec !== null && authorityExec.engine === "codex"
+              ? (dispatchRecordC?.billingRequestId ?? ensureRequestIdServerSide())
+              : undefined;
+            const authorityBillingRequestId = codexFrameRequestId ?? dispatchRecordC?.billingRequestId;
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
               const sealed = await sealAuthorityFieldsOrReject({
                 exec: authorityExec,
-                // B7a:CCB turn 把 dispatch 的稳定 billingRequestId 签进 model-authority envelope,
+                // B7a:CCB turn 把稳定 billingRequestId 签进 model-authority envelope,
                 // egress gate 据此反查 dispatch 身份写 usage_records.dispatch_id/attempt_no(否则
                 // CCB 计费行丢失 turn↔dispatch 关联)。legacy(无 dispatch 记录)→ undefined 不带。
-                ...(dispatchRecordC ? { billingRequestId: dispatchRecordC.billingRequestId } : {}),
+                ...(authorityBillingRequestId === undefined ? {} : { billingRequestId: authorityBillingRequestId }),
                 ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
@@ -7787,6 +7831,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             const rewrittenObj = {
               ...enrichedParsed,
+              // OCV5-746: 与 signed billingRequestId 同源同值的 server-owned requestId。
+              ...(codexFrameRequestId !== undefined ? { requestId: codexFrameRequestId } : {}),
               traceId: turnTraceIdCapture,
               // After the spread so a browser-forged budget cannot survive.
               ...(ccbSpendable !== null ? { _creditBudget: ccbSpendable.toString() } : {}),
@@ -8319,6 +8365,102 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
+        // OCV5-746: 容器侧模型执行权威在准入前拒帧。这不是一条可以透传的普通错误帧 ——
+        // master 已为本轮建了 dispatch(admitted + lease)。若只是把 error 转发给浏览器,
+        // PG 侧那一行永远停在 admitted,用户的 Stop 打到容器只会拿到 TURN_NOT_ACTIVE
+        // (容器根本没有这一轮的会话),而前端按设计不把 runtime miss 当 turn 已结束,
+        // 于是这一轮会一直"运行中",直到容器重建后 reconciler 把它 CAS 成 rejecting
+        // 再也等不到 tombstone。这里必须由 master 自己把它收敛:
+        //   普通轮:CAS terminal(executed_error)+ 释放 lease + 移除本连接受理记录 +
+        //   按 never-executed waiver abort pre-forward journal(本地 Codex 可能在转发前
+        //   已建 inflight journal;不 abort 会被 reconciler 判成 billed_but_failed 转人工);
+        //   recoveryJob 轮:该失败码属需用户处理(MODEL_AUTHORITY_REJECTED 已进
+        //   userActionRequiredCodes)→ 走既有 pauseRecoveryPreReceipt(dispatch 终态
+        //   not_accepted + job paused + 通知),不重复写第二套终态;
+        //   远端 lane 若已建(ensureLane 发生在签票前)→ 用受理时记录的**引擎 sessionKey**
+        //   走既有 proof-only 的 reconcileRemoteChat 释放绑定,不新造第二套释放语义。
+        if (attestPeek !== null && attestPeek.includes('"MODEL_AUTHORITY_REJECTED"')) {
+          let rejectedFrame: unknown = null;
+          try { rejectedFrame = JSON.parse(attestPeek); } catch { /* ordinary frame */ }
+          if (
+            isPlainRecord(rejectedFrame) &&
+            rejectedFrame.type === "error" &&
+            rejectedFrame.code === "MODEL_AUTHORITY_REJECTED"
+          ) {
+            const rejectedPeer = isPlainRecord(rejectedFrame.peer) ? rejectedFrame.peer : null;
+            const rejectedPeerId = typeof rejectedPeer?.id === "string" && rejectedPeer.id
+              ? rejectedPeer.id
+              : null;
+            const rejectedCmid = isClientMessageId(rejectedFrame.clientMessageId)
+              ? rejectedFrame.clientMessageId
+              : null;
+            const rejectedRecord = rejectedCmid === null
+              ? undefined
+              : admittedDispatches.get(rejectedCmid);
+            // Fail closed: every side effect below needs BOTH a non-empty peer and a cmid
+            // that exactly match this connection's server-owned admission. A frame missing
+            // either identity field must not be promoted to "this turn" (audit R1-C1).
+            const rejectedSessionId = rejectedRecord !== undefined &&
+              rejectedPeerId !== null &&
+              rejectedRecord.sessionId === rejectedPeerId
+              ? rejectedRecord.sessionId
+              : null;
+            // No admission record at all (non-durable path) but full identity → UI-only
+            // bound card so the turn does not hang; no PG/lease/lane effect.
+            const unadmittedButIdentified = rejectedRecord === undefined &&
+              rejectedPeerId !== null &&
+              rejectedCmid !== null;
+            if (rejectedSessionId === null && !unadmittedButIdentified) {
+              bridgeLog?.warn("user-chat-bridge: dropped authority rejection with unverified identity", {
+                hasPeer: rejectedPeerId !== null,
+                hasClientMessageId: rejectedCmid !== null,
+                admitted: rejectedRecord !== undefined,
+              });
+              return;
+            }
+            if (rejectedRecord !== undefined && rejectedSessionId !== null) {
+              // 本地 Codex 在物理转发前就已登记 bridge turn state(账号槽 / route token);
+              // 容器拒帧意味着引擎永远不会发 final/outbound.error,必须在这里按精确身份收口。
+              const rejectedCodexState = activeCodexTurnsByPeer.get(codexPeerKey(rejectedSessionId));
+              if (
+                rejectedCodexState !== undefined &&
+                rejectedCodexState.clientMessageId !== null &&
+                rejectedCodexState.clientMessageId === rejectedCmid
+              ) {
+                releaseCodexTurnState(rejectedCodexState, "turn_error");
+              }
+              // 远端绑定只按**服务端**受理时记录的引擎 sessionKey + placement 释放;回帧
+              // model/channel 都是容器可控字段,不能拿来推导资源身份。必须与终态收敛同门:
+              // 只有本次调用自己把这条 admitted dispatch CAS 成终态并 COMMIT 后才释放
+              // (R2-C2 / audit R1-W2);CAS 未命中说明别的路径已接管,不碰 lane。
+              const lanePool = deps.pgPool;
+              const laneKey = rejectedRecord.engineSessionKey ?? null;
+              const releaseRemoteLane = lanePool && rejectedRecord.remoteLane === true && laneKey !== null
+                ? (): void => {
+                    void reconcileRemoteChat(lanePool, Number(uid), laneKey).catch((error) => {
+                      bridgeLog?.warn("user-chat-bridge: remote lane release after authority rejection failed", {
+                        engineSessionKey: laneKey,
+                        error,
+                      });
+                    });
+                  }
+                : undefined;
+              failDispatchPreForward(rejectedRecord, "model_authority_rejected", {
+                abortNeverExecutedJournal: true,
+                fromStatuses: ["admitted"],
+                ...(releaseRemoteLane === undefined ? {} : { onTerminal: releaseRemoteLane }),
+              });
+            }
+            // 发一张绑定到本轮的可展示错误卡(模型配置未通过校验,本轮未开始未计费)。
+            sendErrorFrame(
+              userWs,
+              "MODEL_AUTHORITY_REJECTED",
+              "模型执行权威拒绝了本次请求，本轮未开始也未计费，请重新选择模型后发送。",
+              { peerId: rejectedSessionId ?? rejectedPeerId, clientMessageId: rejectedCmid },
+            );
+            return;
+          }
+        }
       }
       // Queue dispatch is a container→master control request, never a browser
       // broadcast. Convert it into one ordinary inbound.message and feed that
@@ -8454,7 +8596,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : null;
       if (
         masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
-        masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" || masterOnlyFrameType === "sys.recovery_status"
+        masterOnlyFrameType === "sys.recovery_status" || masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" ||
+        // OCV5-591 A2-1c-2: studio activity is master-authored only.
+        masterOnlyFrameType === "sys.studio_event" || masterOnlyFrameType === "sys.muse_result"
       ) {
         if (!loggedRejectedContainerIncident) {
           loggedRejectedContainerIncident = true;

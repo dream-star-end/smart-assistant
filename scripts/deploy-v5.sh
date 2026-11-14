@@ -92,6 +92,10 @@ V5_BASELINE_PORT_GUARD_SERVICE="openclaude-v5-baseline-port-guard.service"
 # overrides 无条件 OC_EGRESS_SPLIT=1,unit 缺失 → master 以 split 模式起但 18892
 # 无人监听,容器 LLM 流量全挂(新机 bootstrap 曾踩此雷)。
 V5_EGRESS_UNIT="openclaude-v5-egress.service"
+# OCV5-391: egress blue-green slots (openclaude-v5-egress@{A,B}.socket/.service, one shared
+# SO_REUSEPORT listener). scripts/v5-egress-slots.sh runs the flip on the production host.
+V5_EGRESS_SLOT_SERVICE_TPL="openclaude-v5-egress@.service"
+EGRESS_SLOT_PREDRAIN_SEC="${EGRESS_SLOT_PREDRAIN_SEC:-600}"
 # 全局 egress 独立 release 指针。它不能跟随 A/B candidate 自动切换；只有显式
 # --egress 才原子翻转到本次 release，避免 P3 stable=B 时仍从 slot A 跑旧代码。
 V5_EGRESS_SRC="/opt/openclaude/openclaude-v5-egress"
@@ -167,6 +171,9 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 [ -f "$RUNTIME_LIB" ] || { echo "FATAL: 缺 runtime release lib: $RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 source "$RUNTIME_LIB"
+source "$SCRIPT_DIR/lib/v5-commercial-release-policy.sh"
+source "$SCRIPT_DIR/lib/v5-host-admission.sh"
+source "$SCRIPT_DIR/lib/v5-commercial-cutover-idle.sh"
 FLAVOR_LIB="$SCRIPT_DIR/lib/assert-flavor.sh"
 if [[ -f "$FLAVOR_LIB" ]]; then
   # shellcheck source=scripts/lib/assert-flavor.sh
@@ -188,6 +195,8 @@ HOT_CONFIG_LIB="$SCRIPT_DIR/v5-hot-config-lib.sh"
 [ -f "$HOT_CONFIG_LIB" ] || { echo "FATAL: 缺 hot-config lib: $HOT_CONFIG_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-hot-config-lib.sh
 source "$HOT_CONFIG_LIB"
+# shellcheck source=scripts/lib/v5-prebuilt-resume.sh
+source "$SCRIPT_DIR/lib/v5-prebuilt-resume.sh"
 HOST_MAINT_LIB="$SCRIPT_DIR/v5-host-maint-lib.sh"
 [ -f "$HOST_MAINT_LIB" ] || { echo "FATAL: 缺 host maint lib: $HOST_MAINT_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-host-maint-lib.sh
@@ -264,11 +273,15 @@ assert_overrides_no_remove_keys() {
   [ "$bad" = 0 ] || exit 1
 }
 
+CP_USER_IMPACT_EVIDENCE=""
+VALIDATION_PROFILE="normal"; VALIDATION_AUTHORIZATION_REF=""
+VALIDATION_SCOPE_JSON="null"; VALIDATION_SCOPE_RESTORED=0
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0; HOT_CONFIG=0; HOT_CONFIG_FORCE=0
 DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
 # P3 cohort lane 参数
+RESUME_BUILT_RELEASE="" # ordinary-only sealed artifacts from an idle-gate failure
 CANARY_RELEASE=""     # --canary [<rel-*目录名>];空=从当前 HEAD build_release
 PROMOTE_PCT=""        # --promote <0..100>
 DRAIN_WS=0            # --finalize 时可选 WS drain(step3)
@@ -291,6 +304,9 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
+    --validation-profile=*) VALIDATION_PROFILE="${arg#*=}" ;;
+    --validation-authorization-ref=*) VALIDATION_AUTHORIZATION_REF="${arg#*=}" ;;
+    --resume-built-release=*) RESUME_BUILT_RELEASE="${arg#*=}" ;;
     --hot-config) HOT_CONFIG=1 ;;
     --hot-config-force) HOT_CONFIG=1; HOT_CONFIG_FORCE=1 ;;
     # 一次性 setup-first lane：仅把扫码实时感知/加密持久化先上线，DB 继续钉旧
@@ -362,9 +378,26 @@ for arg in "$@"; do
     # 【不】重启它(这正是解耦目的);仅 egress 相关代码(anthropicProxy/账号池/
     # 计费 finalize/egress/*)变更时显式带本 flag。重启走 SIGTERM drain。
     --egress) RESTART_EGRESS=1 ;;
+    --user-impact-evidence=*) CP_USER_IMPACT_EVIDENCE="${arg#*=}" ;;
+    --failure-policy=*) COMMERCIAL_FAILURE_POLICY="${arg#*=}" ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done
+# A model exclusion is an explicit per-batch CLI scope, never an inherited global switch.
+case "$VALIDATION_PROFILE" in
+  normal)
+    [[ -z "$VALIDATION_AUTHORIZATION_REF" ]] || { echo '✗ validation authorization requires an explicit profile' >&2; exit 2; }
+    ;;
+  skip-grok)
+    [[ "$MODE" == deploy && "$WITH_DIST" == 1 && -z "$RESUME_BUILT_RELEASE" ]] || { echo '✗ skip-grok requires ordinary --with-dist; recovery inherits its saved scope' >&2; exit 2; }
+    [[ ${#VALIDATION_AUTHORIZATION_REF} -ge 8 && ${#VALIDATION_AUTHORIZATION_REF} -le 512 && ! "$VALIDATION_AUTHORIZATION_REF" =~ [[:cntrl:]] ]] || { echo '✗ skip-grok requires a traceable authorization reference' >&2; exit 2; }
+    [[ -z "${V5_TURN_MODELS+x}" && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_SMOKE_E2E:-1}" == 1 && "${V5_CANARY_REQUIRE_COST:-1}" == 1       && "$ALLOW_UNVERIFIED_CI" == 0 && "$ALLOW_LEGACY_MANIFEST_MISSING" == 0 && "$HOT_CONFIG" == 0       && "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 0 && "${OC_V5_SKIP_MUTATION_LEASE:-0}" == 0 && -z "${OC_CAPMATRIX_COMPAT:-}" ]] || {
+      echo '✗ skip-grok cannot combine model overrides or any other gate/lease waiver' >&2; exit 2;
+    }
+    ;;
+  *) echo "✗ unknown validation profile: $VALIDATION_PROFILE" >&2; exit 2 ;;
+esac
+
 if [[ -n "$EMERGENCY_INCIDENT$EMERGENCY_APPROVAL$EMERGENCY_COMMIT" ]]; then
   [[ -n "$EMERGENCY_INCIDENT" && -n "$EMERGENCY_APPROVAL" && -n "$EMERGENCY_COMMIT" ]] \
     || { echo "✗ emergency containment 必须同时提供 incident/approval/exact commit" >&2; exit 2; }
@@ -399,6 +432,16 @@ if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 \
   echo "✗ --defer-knowledge-planet-upgrade 仅允许与普通 deploy + --with-dist 同用" >&2
   exit 2
 fi
+if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then
+  [[ "$MODE" == deploy && "$WITH_DIST" == 1 && "$DRY" == 0 && "$RESTART_EGRESS" == 0 && "$ALLOW_UNVERIFIED_CI" == 0 && "$ALLOW_LEGACY_MANIFEST_MISSING" == 0 && "$HOT_CONFIG" == 0 && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 0 && "${V5_SMOKE_E2E:-1}" == 1 && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_CANARY_REQUIRE_COST:-1}" == 1 \
+    && "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 0 && "${OC_V5_SKIP_MUTATION_LEASE:-0}" == 0 && -z "${OC_CAPMATRIX_COMPAT:-}" \
+    && "$ENABLE_BUNDLE_FLAG$ENABLE_RELEASE_FLAG$DISABLE_BUNDLE_FLAG$DISABLE_RELEASE_FLAG" == 0000 \
+    && -z "$TARGET_RUNTIME_IMAGE$TARGET_RUNTIME_IMAGE_ID$EMERGENCY_INCIDENT$EMERGENCY_APPROVAL$EMERGENCY_COMMIT" ]] || {
+    echo '✗ --resume-built-release requires ordinary --with-dist, all gates, existing axes; no force/waiver/image/egress/dry-run flags' >&2
+    exit 2
+  }
+fi
+
 if [[ "$HOT_CONFIG" == 1 ]]; then
   [[ "$MODE" == "deploy" ]] || {
     echo "✗ --hot-config 只允许普通 deploy lane(不要和 --canary/--dist/--smoke 叠用)" >&2
@@ -463,6 +506,15 @@ if [[ -n "$TARGET_RUNTIME_IMAGE$TARGET_RUNTIME_IMAGE_ID" ]]; then
     || { echo "✗ 在线 slim image 切换不能同时 --disable-runtime-release" >&2; exit 2; }
 fi
 
+if [[ -n "$COMMERCIAL_FAILURE_POLICY" ]]; then
+  [[ "$COMMERCIAL_FAILURE_POLICY" == user-impact-only && ( "$MODE" == deploy || "$MODE" == recover || ( "$MODE" == rollback && "$ROLLBACK_N" == 1 ) ) ]] \
+    || { echo '✗ --failure-policy=user-impact-only supports normal deploy, exact-context recover, or confirmed-impact N1 rollback only' >&2; exit 2; }
+  [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" != 1 ]] \
+    || { echo '✗ setup-first requires its own policy adapter; no exposure performed' >&2; exit 2; }
+fi
+
+[[ -z "$CP_USER_IMPACT_EVIDENCE" || ( "$MODE" == rollback && "$COMMERCIAL_FAILURE_POLICY" == user-impact-only && "$CP_USER_IMPACT_EVIDENCE" =~ ^[0-9a-f]{64}$ ) ]] || { echo "invalid operator user-impact evidence" >&2; exit 2; }
+
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
 
@@ -473,7 +525,7 @@ slot_baseline_dir() { # <A|B>
 run_baseline_guard_remote() { # <mode> <absolute-path> [extra-args...]
   local guard_mode="$1" target="$2" qmode qtarget extra_q="" q a
   shift 2
-  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-structure-release|check-structure-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
     || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
   [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
@@ -1148,6 +1200,30 @@ same_supervised_process() { # <pid> <starttime>; stopped supervisors are not hea
   [[ "$start" == "$2" ]]
 }
 
+mutation_process_live() { # <role> <live|supervised> <pid> <starttime> [anchor-release-file]
+  local role="$1" mode="$2" pid="$3" expected="$4" state="" start="" reason=""
+  # Capture the SAME read which makes the fencing decision, before any cleanup
+  # can kill a different supervisor and make it appear to be the original loss.
+  if ! read -r state start < <(process_state_start "$pid"); then
+    reason=proc-read-failed
+  elif [[ "$start" != "$expected" ]]; then
+    reason=start-mismatch
+  else
+    case "$state" in
+      Z|X|x) reason=dead ;;
+      T|t) [[ "$mode" == supervised ]] && reason=stopped ;;
+    esac
+  fi
+  [[ -n "$reason" ]] || return 0
+  # Preserve sentinel-first / release-file-second ordering at normal handoff.
+  [[ "$role" == anchor && -n "${5:-}" && -e "$5" ]] && return 0
+  # Only bounded, controlled identifiers; never argv, environment or credentials.
+  printf 'MUTATION_PROCESS_LOST time=%s observer=%s role=%s mode=%s pid=%s expected_start=%s state=%s actual_start=%s reason=%s\n' \
+    "$EPOCHREALTIME" "$BASHPID" "$role" "$mode" "$pid" "$expected" \
+    "${state:-missing}" "${start:-missing}" "$reason" >&2
+  return 1
+}
+
 terminate_exact_process() { # <pid> <starttime>; never signal a reused pid
   local pid="$1" start="$2" i
   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && -n "$start" ]] || return 0
@@ -1269,7 +1345,9 @@ jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=
 # turn_failures 是窗口聚合检查(v5-monitor.sh):部署窗内 turn 瞬断是预期行为,无条件静默。
 healthy+=(turn_failures)
 if [[ "$include_egress" == 1 ]]; then
-  systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null && healthy+=(svc_egress)
+  { systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null \
+    || systemctl is-active --quiet openclaude-v5-egress@A.service 2>/dev/null \
+    || systemctl is-active --quiet openclaude-v5-egress@B.service 2>/dev/null; } && healthy+=(svc_egress)
   body="$(curl -fsS --max-time 5 'http://172.31.0.1:18892/internal/v5/egress-health' 2>/dev/null || true)"
   jq -e '.ok == true and .role == "egress"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_egress)
 fi
@@ -1476,6 +1554,10 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
   local ttl_margin=2 local_ttl
   # deploy_id/holder_host = fencing 证据(reclaim 打印持有者身份;deploy_id 也用作 holder 自清 meta 的归属校验)。
   local deploy_id holder_host meta_path
+  local admission_nonce admission_helper_b64
+  admission_nonce="$(openssl rand -hex 16)"
+  [[ "$admission_nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+  admission_helper_b64="$(base64 -w0 "$REPO_ROOT/scripts/lib/v5-mutation-admission.sh")" || return 1
   deploy_id="$(openssl rand -hex 12)"
   holder_host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
   meta_path="$PRODUCTION_MUTATION_LEASE_META"
@@ -1508,7 +1590,9 @@ current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev
 case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
 [ \"\$current_parent\" = \"\$lease_parent\" ] || exit 76
 write_meta
-echo LEASED
+eval \"\$(printf '%s' '$admission_helper_b64' | base64 -d)\" || exit 79
+v5_mutation_admission '$PRODUCTION_MUTATION_LOCK.admission-nonce' '$admission_nonce' '$V5_ENV' \"\$lease_start\" \"\$lease_ttl\" \"\$lease_parent\" || { drop_meta; exit 79; }
+echo \"LEASED $admission_nonce\"
 while :; do
   current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || { drop_meta; exit 0; }
   case \"\$current_parent\" in ''|*[!0-9]*) drop_meta; exit 0 ;; esac
@@ -1604,7 +1688,7 @@ done"
   while (( waited < poll_attempts )); do
     same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" || break
     same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" || break
-    if grep -q LEASED "$out" 2>/dev/null; then got=1; break; fi
+    if grep -Fxq "LEASED $admission_nonce" "$out" 2>/dev/null; then got=1; break; fi
     sleep 0.1; waited=$((waited + 1))
   done
   rm -f "$out"
@@ -1618,6 +1702,7 @@ done"
     return 1
   fi
   MUTATION_DEPLOY_ID="$deploy_id"
+  MUTATION_ADMISSION_NONCE="$admission_nonce"
   MUTATION_HOLDER_IDENTITY="$holder_host:$$:$MODE"
   echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,本地安全 TTL ${local_ttl}s,远端 holder 硬 TTL ${lease_ttl}s,deploy_id=$deploy_id)"
   return 0
@@ -1790,8 +1875,8 @@ mutation_lease_live() {
   [[ "$MUTATION_LEASE_ACTIVE" == 1 ]] || return 1
   [[ -n "$MUTATION_LEASE_PID" && -n "$MUTATION_LEASE_START" \
     && -n "$MUTATION_LEASE_TTL_PID" && -n "$MUTATION_LEASE_TTL_START" ]] || return 1
-  same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
-    && same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"
+  mutation_process_live lease-ssh live "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
+    && mutation_process_live lease-ttl live "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"
 }
 
 # 翻转/激活类关键点前活体断言:后台 ssh 死 → 远端 flock 已随通道关闭释放,自愈 host-action
@@ -1898,7 +1983,7 @@ image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime
 actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
 [[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
 actual_grok="$(docker run --rm --entrypoint grok-native "$target_image" --version)"
-[[ "$actual_grok" == grok\ 1.0.5\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
+[[ "$actual_grok" == grok\ 1.0.62\ * ]] || { echo 'FATAL: image Grok binary mismatch (expected grok 1.0.62 (...))' >&2; exit 1; }
 
 dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
 [[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
@@ -2538,7 +2623,20 @@ REMOTE
 
 assert_no_deploy_recovery_marker() {
   [[ "$DRY" == 1 ]] && return 0
-  if [[ "$MODE" != "recover" ]] && ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
+  local policy_rollback=0
+  if [[ "$MODE" == rollback ]] && commercial_policy_enabled; then
+    commercial_policy_rollback_preflight || return $?
+    policy_rollback=1
+  fi
+  if [[ "$MODE" != recover && "$policy_rollback" != 1 ]] && ! ssh "$KL_HOST" "test ! -e '$CP_ROOT/active.json' && test ! -L '$CP_ROOT/active.json'"; then
+    echo '✗ unresolved commercial release policy context; exact-context recover required' >&2
+    return 79
+  fi
+  if [[ "$MODE" == recover ]] && ! commercial_policy_enabled && ! ssh "$KL_HOST" "test ! -e '$CP_ROOT/active.json' && test ! -L '$CP_ROOT/active.json'"; then
+    echo '✗ typed context requires --recover --failure-policy=user-impact-only' >&2
+    return 79
+  fi
+  if [[ "$MODE" != "recover" && "$policy_rollback" != 1 ]] && ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
     echo "✗ 检测到未收敛的人工恢复标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER" >&2
     ssh "$KL_HOST" "sed -n '1,20p' '$DEPLOY_RECOVERY_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
     echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，再走官方 --recover 收敛并清除。" >&2
@@ -2584,12 +2682,13 @@ clear_deploy_recovery_marker_after_stable_recover() {
 # 【红线】恢复 lane(abort/rollback/recover/reclaim/smoke/hide-luna/emergency containment)
 # 永不被本机制阻断 —— 回退路径永远优先于任何新门。
 GATE_WAIVER_DIR="$RELEASES_ROOT/.gate-waivers"
-GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification"
+GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification grok-live-validation"
 
 # 每个 key 的「还债 lane」= 会真跑该门的 mode。不在此列的普通写 lane 一律被阻断。
 gate_waiver_repay_modes() { # <key>
   case "$1" in
     smoke-turn)           echo "deploy dist canary promote finalize" ;;
+    grok-live-validation) echo "deploy dist canary finalize" ;;
     e2e-journey)          echo "deploy dist canary finalize" ;;
     canary-turn-cost)     echo "deploy dist canary promote finalize" ;;
     finalize-egress-gate) echo "canary promote finalize" ;;
@@ -2603,6 +2702,7 @@ gate_waiver_repay_modes() { # <key>
 gate_waiver_env_active() { # <key>
   case "$1" in
     smoke-turn)           [[ "${V5_SMOKE_TURN:-1}" != 1 ]] ;;
+    grok-live-validation) [[ "$VALIDATION_PROFILE" == skip-grok ]] ;;
     e2e-journey)          [[ "${V5_SMOKE_E2E:-1}" != 1 ]] ;;
     canary-turn-cost)     [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] ;;
     finalize-egress-gate) [[ "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 1 ]] ;;
@@ -2689,6 +2789,10 @@ assert_no_open_gate_waivers() {
       echo "  先走能还债的 lane($modes)让门真跑一次;回退 lane(abort/rollback/recover)不受本闸影响。" >&2
       blocked=1; continue
     fi
+    if { [[ "$VALIDATION_PROFILE" == skip-grok && "$key" =~ ^(smoke-turn|e2e-journey|canary-turn-cost)$ ]]; }       || { [[ "$key" == grok-live-validation ]] && ! validation_scope_grok_matrix_planned; }; then
+      echo "✗ current validation scope cannot repay existing complete-gate debt key=$key" >&2
+      blocked=1; continue
+    fi
     if gate_waiver_env_active "$key"; then
       echo "✗ 未偿还的门禁豁免债务 key=$key,而本次调用仍带着同一豁免 env —— 禁止连环跳过。" >&2
       echo "  去掉豁免 env 让门真跑一次即自动销账。" >&2
@@ -2715,12 +2819,76 @@ record_declared_gate_waivers() {
       echo "  · 忽略与本 lane 无关的豁免声明 key=$key(本 lane=$MODE 不跑该门;它只在 $modes 生效)"
       continue
     fi
-    record_gate_waiver "$key" "lane 入口声明豁免(mode=$MODE)" || rc=1
+    if [[ "$key" == grok-live-validation ]]; then
+      validation_scope_bind || return 1
+      validation_scope_receipt declared "" not-run not-run || return 1
+      record_gate_waiver "$key" "SKIPPED by explicit batch scope $VALIDATION_SCOPE_JSON" || rc=1
+    else
+      record_gate_waiver "$key" "lane 入口声明豁免(mode=$MODE)" || rc=1
+    fi
   done
   [[ "$rc" == 0 ]] || {
     echo "✗ 门禁豁免债务登记失败 —— 拒绝以「无痕豁免」的方式发布。去掉豁免 env 让门真跑,或修复 $KL_HOST 记账通路。" >&2
     return 1
   }
+}
+
+# Normal runs retain their exact historical policy shape. A scope is bound to the
+# official pinned source and real mutation owner; recovery restores the saved scope.
+validation_scope_preflight() { # pinned source (read only)
+  [[ "$VALIDATION_PROFILE" == skip-grok ]] || return 0
+  python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" normalize \
+    --profile "$VALIDATION_PROFILE" --authorization-ref "$VALIDATION_AUTHORIZATION_REF" \
+    --queue-id "${OC_V5_RELEASE_QUEUE_ID:-}" --source-sha "$1" >/dev/null
+}
+validation_scope_restore() { # JSON read from the verified operation descriptor
+  VALIDATION_SCOPE_JSON="$(printf '%s' "$1" | python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" validate)" || return 1
+  VALIDATION_PROFILE="$(jq -r '.profile // "normal"' <<<"$VALIDATION_SCOPE_JSON")"
+  VALIDATION_AUTHORIZATION_REF="$(jq -r '.authorizationRef // ""' <<<"$VALIDATION_SCOPE_JSON")"
+  VALIDATION_SCOPE_RESTORED=1
+}
+validation_scope_bind() {
+  if [[ "$VALIDATION_SCOPE_RESTORED" == 1 ]]; then
+    printf '%s' "$VALIDATION_SCOPE_JSON" | python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" validate >/dev/null
+    return $?
+  fi
+  [[ "$VALIDATION_PROFILE" == skip-grok ]] || { VALIDATION_SCOPE_JSON=null; return 0; }
+  local sha operation
+  "$RELEASE_QUEUE_SCRIPT" check --id "${OC_V5_RELEASE_QUEUE_ID:-}" >/dev/null || return 1
+  sha="$("$RELEASE_QUEUE_SCRIPT" pinned-sha --id "${OC_V5_RELEASE_QUEUE_ID:-}")" || return 1
+  [[ "${BUILT_RELEASE_SOURCE_COMMIT:-$sha}" == "$sha" ]] || { echo '✗ validation scope source differs from built candidate' >&2; return 1; }
+  operation="${MUTATION_DEPLOY_ID:-}"
+  [[ "$DRY" == 1 ]] && operation=dry-run-only
+  [[ -n "$operation" ]] || { echo '✗ validation scope lacks actual operation owner' >&2; return 1; }
+  VALIDATION_SCOPE_JSON="$(python3 -B "$SCRIPT_DIR/lib/v5-validation-profile.py" normalize \
+    --profile "$VALIDATION_PROFILE" --authorization-ref "$VALIDATION_AUTHORIZATION_REF" \
+    --queue-id "${OC_V5_RELEASE_QUEUE_ID:-}" --source-sha "$sha" --operation-id "$operation")" || return 1
+}
+validation_scope_grok_matrix_planned() {
+  [[ "$VALIDATION_PROFILE" == normal && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_SMOKE_E2E:-1}" == 1 ]] || return 1
+  local model
+  for model in ${V5_TURN_MODELS:-grok-build deepseek-v4-flash}; do [[ "$model" != grok-build ]] || return 0; done
+  return 1
+}
+validation_scope_clear_repaid() {
+  # Called only after BOTH complete matrix and journey actually succeeded.
+  validation_scope_grok_matrix_planned && clear_gate_waiver grok-live-validation
+  return 0
+}
+validation_scope_receipt() { # phase, release under test, actual matrix/journey status
+  [[ "$VALIDATION_PROFILE" == skip-grok ]] || return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] validation scope $1 (Grok SKIPPED)"; return 0; }
+  local payload encoded
+  assert_mutation_lease_alive validation-scope-receipt || return 86
+  payload="$(jq -cn --argjson scope "$VALIDATION_SCOPE_JSON" --arg operation "${MUTATION_DEPLOY_ID:-}" \
+    --arg phase "$1" --arg release "$2" --arg turn "$3" --arg journey "$4" \
+    '{schemaVersion:1,executingDeploymentId:$operation,scope:$scope,phase:$phase,releaseUnderTest:$release,
+      grokMatrix:"SKIPPED",grokJourney:"SKIPPED",deepseekMatrix:$turn,deepseekJourney:$journey}')" || return 1
+  encoded="$(printf '%s' "$payload" | base64 -w0)" || return 1
+  ssh "$KL_HOST" python3 - "$RELEASES_ROOT/.validation-scopes" "$MUTATION_DEPLOY_ID" \
+    "$PRODUCTION_MUTATION_LOCK" "${MUTATION_ADMISSION_NONCE:-}" "$encoded" \
+    <"$SCRIPT_DIR/lib/v5-validation-receipt.py" || return 1
+  assert_mutation_lease_alive validation-scope-receipt || return 86
 }
 
 # ── 传统 deploy/dist/rollback 的严格状态快照 ──
@@ -2801,477 +2969,7 @@ TRUSTED_LEGACY_EGRESS_PREDECESSOR=""
 TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT=""
 TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256=""
 
-# 对 release 全树（含 node_modules/dist、常规文件 mode 与 symlink 原始 target）做稳定
-# SHA-256；只排除根 `.complete` 本身，避免 marker 自引用。函数既可本地自测，也会通过
-# `declare -f` 原样流到 kl-mirror，build/verify 共用一份算法，禁止双实现漂移。
-release_artifact_digest() { # <absolute-release-root>
-  local root="$1"
-  [[ -d "$root" && ! -L "$root" ]] || {
-    echo "FATAL: release artifact root 非真实目录:$root" >&2
-    return 1
-  }
-  # One Python walker avoids spawning ~4 processes per file (the old shell
-  # manifest took >90 s on the 38k-file production release). Length-prefixed
-  # byte fields cover arbitrary path/symlink bytes without TSV ambiguity; file,
-  # directory and symlink type/mode/uid/gid are all bound. Root .complete alone
-  # is excluded to avoid self-reference.
-  python3 - "$root" <<'PY'
-import hashlib
-import os
-import stat
-import sys
-
-root = os.fsencode(os.path.abspath(sys.argv[1]))
-if not os.path.isdir(root) or os.path.islink(root):
-    raise SystemExit("FATAL: release artifact root is not a real directory")
-
-def identity(st):
-    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid,
-            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-
-def snapshot_tree():
-    root_stat = os.lstat(root)
-    if not stat.S_ISDIR(root_stat.st_mode):
-        raise RuntimeError("release artifact root changed type")
-    rows = []
-
-    def collect(directory, prefix=b""):
-        with os.scandir(directory) as scan:
-            for entry in scan:
-                name = entry.name
-                rel = name if not prefix else prefix + b"/" + name
-                if rel == b".complete":
-                    continue
-                st = entry.stat(follow_symlinks=False)
-                mode = st.st_mode
-                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
-                    raise RuntimeError(f"non-regular release entry: {os.fsdecode(rel)!r}")
-                rows.append((rel, entry.path, identity(st)))
-                if stat.S_ISDIR(mode):
-                    collect(entry.path, rel)
-
-    collect(root)
-    rows.sort(key=lambda item: item[0])
-    return identity(root_stat), rows
-
-root_before, entries = snapshot_tree()
-digest = hashlib.sha256(b"openclaude-release-artifact-v2\0")
-
-def field(value):
-    if isinstance(value, str):
-        value = value.encode("ascii")
-    digest.update(len(value).to_bytes(8, "big"))
-    digest.update(value)
-
-root_stat = os.lstat(root)
-if identity(root_stat) != root_before:
-    raise RuntimeError("release artifact root changed before digest")
-field(b"D")
-field(b"")
-field(str(stat.S_IMODE(root_stat.st_mode)))
-field(str(root_stat.st_uid))
-field(str(root_stat.st_gid))
-
-for rel, absolute, before in entries:
-    st = os.lstat(absolute)
-    if identity(st) != before:
-        raise RuntimeError(f"release entry changed during digest: {os.fsdecode(rel)!r}")
-    mode = st.st_mode
-    kind = b"F" if stat.S_ISREG(mode) else b"D" if stat.S_ISDIR(mode) else b"L"
-    field(kind)
-    field(rel)
-    field(str(stat.S_IMODE(mode)))
-    field(str(st.st_uid))
-    field(str(st.st_gid))
-    if kind == b"F":
-        field(str(st.st_size))
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(absolute, flags)
-        if identity(os.fstat(fd)) != before:
-            os.close(fd)
-            raise RuntimeError(f"release file changed before open: {os.fsdecode(rel)!r}")
-        with os.fdopen(fd, "rb", buffering=1024 * 1024) as fh:
-            while chunk := fh.read(1024 * 1024):
-                digest.update(chunk)
-            if identity(os.fstat(fh.fileno())) != before:
-                raise RuntimeError(f"release file changed while open: {os.fsdecode(rel)!r}")
-    elif kind == b"L":
-        field(os.readlink(absolute))
-    if identity(os.lstat(absolute)) != before:
-        raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
-
-# A per-entry check alone misses a new/deleted path after the directory was
-# scanned or after that directory's own hash step. Re-snapshot the entire tree
-# and compare the exact path/type/identity set plus the release root identity.
-root_after, entries_after = snapshot_tree()
-before_signature = [(rel, before) for rel, _absolute, before in entries]
-after_signature = [(rel, after) for rel, _absolute, after in entries_after]
-if root_after != root_before or after_signature != before_signature:
-    raise RuntimeError("release tree changed during digest")
-
-print(digest.hexdigest())
-PY
-}
-
-# 远端只读 probe：物理边界、marker schema、目录名、VERSION、metadata digest 与全树
-# artifact digest 一次核完。stdout 是内部 TSV，不承载人类日志。
-release_marker_probe() { # <release-dir>
-  local reldir="$1"
-  {
-    declare -f release_artifact_digest
-    cat <<'REMOTE'
-set -Eeuo pipefail
-reldir="$1"; releases_root="$2"; schema="$3"
-root_real="$(readlink -f -- "$releases_root")"
-dir_real="$(readlink -f -- "$reldir")"
-[[ -n "$root_real" && -n "$dir_real" && "$dir_real" == "$reldir" \
-  && "$(dirname -- "$dir_real")" == "$root_real" && -d "$dir_real" && ! -L "$dir_real" ]] || {
-  echo "FATAL: release 不是真实 releases-root 直系目录:$reldir" >&2; exit 1;
-}
-marker="$reldir/.complete"; metadata="$reldir/deploy/v5/release-metadata.json"; version="$reldir/VERSION.json"
-[[ -f "$marker" && ! -L "$marker" && -f "$metadata" && ! -L "$metadata" \
-  && -f "$version" && ! -L "$version" ]] || {
-  echo "FATAL: release marker/metadata/VERSION 缺失或为 symlink:$reldir" >&2; exit 1;
-}
-read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$reldir")
-read -r marker_uid marker_gid marker_mode < <(stat -Lc '%u %g %a' -- "$marker")
-[[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] || {
-  echo "FATAL: release root ownership/mode 不可信:$reldir uid=$root_uid gid=$root_gid mode=$root_mode" >&2; exit 1;
-}
-[[ "$marker_uid" == 0 && "$marker_gid" == 0 \
-  && ( "$marker_mode" == 644 || "$marker_mode" == 444 ) ]] || {
-  echo "FATAL: release marker ownership/mode 不可信:$marker uid=$marker_uid gid=$marker_gid mode=$marker_mode" >&2; exit 1;
-}
-kind="$(jq -er --argjson schema "$schema" '
-  if (.schemaVersion == $schema) then "strong"
-  elif (has("schemaVersion") | not) then "legacy"
-  else error("unsupported release marker schema") end
-' "$marker")" || exit 1
-base="$(basename -- "$reldir")"
-version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || exit 1
-if [[ "$kind" == strong ]]; then
-  row="$(jq -er --argjson schema "$schema" '
-    if (((["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] - keys) | length) == 0
-      and ((keys - ["artifactSha256","baselineManifestSha256","builtAt","distReuse","flavorGuardGeneration","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
-      and .schemaVersion == $schema
-      and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
-      and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
-      and (.metadataSha256 | type == "string" and test("^[0-9a-f]{64}$"))
-      and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$"))
-      and ((has("baselineManifestSha256") | not)
-        or (.baselineManifestSha256 | type == "string" and test("^[0-9a-f]{64}$")))
-      and ((has("distReuse") | not)
-        or ((.distReuse | type == "object")
-          and (.distReuse.fromRelease | type == "string" and startswith("/"))
-          and (.distReuse.fromSourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
-          and (.distReuse.comparedPaths | type == "array" and length > 0))))
-    then [.sourceCommit,.builtAt,.metadataSha256,.artifactSha256] | @tsv
-    else error("invalid strong release marker") end
-  ' "$marker")" || exit 1
-  IFS=$'\t' read -r source_commit built_at metadata_want artifact_want <<<"$row"
-  stem="${base#rel-}"; stem="${stem%-migrated}"; suffix="-$built_at"
-  [[ "$base" == rel-* && "$stem" == *"$suffix" ]] || {
-    echo "FATAL: strong marker builtAt 与 release dirname 不一致:$base" >&2; exit 1;
-  }
-  short="${stem%"$suffix"}"
-  [[ "$short" =~ ^[0-9a-f]{7,40}$ && "$source_commit" == "$short"* \
-    && "$version_commit" == "$short" ]] || {
-    echo "FATAL: strong marker sourceCommit/dirname/VERSION 不一致:$base" >&2; exit 1;
-  }
-  metadata_have="$(sha256sum -- "$metadata" | cut -d' ' -f1)"
-  [[ "$metadata_have" == "$metadata_want" ]] || {
-    echo "FATAL: release metadata digest mismatch:$reldir" >&2; exit 1;
-  }
-  artifact_have="$(release_artifact_digest "$reldir")"
-  [[ "$artifact_have" == "$artifact_want" ]] || {
-    echo "FATAL: release artifact digest mismatch:$reldir" >&2; exit 1;
-  }
-  if jq -e '.baselineManifestSha256 | type == "string"' "$marker" >/dev/null; then
-    manifest="$reldir/.baseline-manifest.json"
-    [[ -f "$manifest" && ! -L "$manifest" ]] || {
-      echo "FATAL: baselineManifestSha256 present but .baseline-manifest.json missing:$reldir" >&2; exit 1;
-    }
-    manifest_want="$(jq -er '.baselineManifestSha256' "$marker")"
-    manifest_have="$(sha256sum -- "$manifest" | cut -d' ' -f1)"
-    [[ "$manifest_have" == "$manifest_want" ]] || {
-      echo "FATAL: baseline manifest digest mismatch:$reldir" >&2; exit 1;
-    }
-  fi
-  printf 'strong\t%s\t%s\t%s\t%s\n' "$source_commit" "$short" "$built_at" "$artifact_want"
-else
-  row="$(jq -er '
-    if (((keys | sort) == (["builtAt","sha"] | sort)
-        or (keys | sort) == (["builtAt","migrated","sha"] | sort))
-      and (.sha | type == "string" and test("^[0-9a-f]{7,40}$"))
-      and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
-      and ((has("migrated") | not) or .migrated == true))
-    then [.sha,.builtAt] | @tsv else error("invalid legacy release marker") end
-  ' "$marker")" || exit 1
-  IFS=$'\t' read -r short built_at <<<"$row"
-  [[ "$base" == "rel-$short-$built_at" || "$base" == "rel-$short-$built_at-migrated" ]] || {
-    echo "FATAL: legacy marker sha/builtAt 与 release dirname 不一致:$base" >&2; exit 1;
-  }
-  [[ "$version_commit" == "$short" ]] || {
-    echo "FATAL: legacy marker 与 VERSION.commit 不一致:$base" >&2; exit 1;
-  }
-  artifact_have="$(release_artifact_digest "$reldir")"
-  [[ "$artifact_have" =~ ^[0-9a-f]{64}$ ]] || exit 1
-  # Keep probe columns uniform:kind,source identity,dirname short,builtAt,artifact.
-  # Legacy has no full source identity, so its validated short SHA occupies both
-  # identity columns until the caller resolves it against trusted git objects.
-  printf 'legacy\t%s\t%s\t%s\t%s\n' "$short" "$short" "$built_at" "$artifact_have"
-fi
-REMOTE
-  } | ssh "$KL_HOST" bash -s -- "$reldir" "$RELEASES_ROOT" "$RELEASE_COMPLETE_SCHEMA_VERSION"
-}
-
-assert_release_metadata_matches_commit() { # <release-dir> <full-commit>
-  local reldir="$1" full="$2"
-  [[ "$full" =~ ^[0-9a-f]{40}$ ]] || return 1
-  git -C "$REPO_ROOT" cat-file -e "${full}^{commit}" 2>/dev/null || {
-    echo "✗ release sourceCommit 不在本地 trusted git object store:$full" >&2; return 1;
-  }
-  if ! git -C "$REPO_ROOT" show "${full}:deploy/v5/release-metadata.json" \
-      | ssh "$KL_HOST" "cmp - '$reldir/deploy/v5/release-metadata.json'"; then
-    echo "✗ release-metadata 原始字节不等于 trusted git $full:$reldir" >&2
-    return 1
-  fi
-}
-
-assert_release_marker() { # <release-dir> [master|egress legacy trust scope]
-  local reldir="$1" trust_scope="${2:-master}" probe kind source short built artifact
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] 验证 release strong marker/full sourceCommit/metadata+artifact digest:$reldir"
-    return 0
-  fi
-  probe="$(release_marker_probe "$reldir")" || {
-    echo "✗ release 完整标记校验失败:$reldir" >&2; return 1;
-  }
-  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
-  case "$kind" in
-    strong)
-      assert_release_metadata_matches_commit "$reldir" "$source" || return 1
-      ;;
-    legacy)
-      local trusted_path trusted_source trusted_artifact
-      case "$trust_scope" in
-        master)
-          trusted_path="$TRUSTED_LEGACY_PREDECESSOR"
-          trusted_source="$TRUSTED_LEGACY_SOURCE_COMMIT"
-          trusted_artifact="$TRUSTED_LEGACY_ARTIFACT_SHA256"
-          ;;
-        egress)
-          trusted_path="$TRUSTED_LEGACY_EGRESS_PREDECESSOR"
-          trusted_source="$TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT"
-          trusted_artifact="$TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256"
-          ;;
-        *) echo "✗ legacy release trust scope 非法:$trust_scope" >&2; return 1 ;;
-      esac
-      [[ -n "$trusted_path" && "$reldir" == "$trusted_path" \
-        && "$trusted_source" =~ ^[0-9a-f]{40}$ && "$trusted_source" == "$source"* \
-        && "$trusted_artifact" =~ ^[0-9a-f]{64}$ && "$artifact" == "$trusted_artifact" ]] || {
-        echo "✗ generic legacy .complete 非本 invocation 精确捕获且制品未变的 $trust_scope predecessor，拒绝:$reldir" >&2
-        return 1
-      }
-      assert_release_metadata_matches_commit "$reldir" "$trusted_source" || return 1
-      ;;
-    *) echo "✗ release marker probe 返回非法 kind:${kind:-<empty>}" >&2; return 1 ;;
-  esac
-  echo "  ✓ release marker 校验通过(kind=$kind path=$reldir)"
-}
-
-capture_trusted_release_predecessor() { # [explicit-release-dir，仅供 hermetic test]
-  local current="${1:-}" probe kind source short built artifact full
-  [[ "$DRY" == 1 ]] && return 0
-  if [[ -z "$current" ]]; then
-    resolve_active_lane || return 1
-    current="$(bg_current_release "$ACTIVE_SRC")"
-  fi
-  [[ -n "$current" ]] || { echo "✗ 无法在 mutation 前捕获 serving predecessor" >&2; return 1; }
-  probe="$(release_marker_probe "$current")" || {
-    echo "✗ serving predecessor marker/目录/VERSION 校验失败:$current" >&2; return 1;
-  }
-  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
-  CAPTURED_RELEASE_PREDECESSOR="$current"
-  TRUSTED_LEGACY_PREDECESSOR=""; TRUSTED_LEGACY_SOURCE_COMMIT=""; TRUSTED_LEGACY_ARTIFACT_SHA256=""
-  case "$kind" in
-    strong)
-      assert_release_metadata_matches_commit "$current" "$source" || return 1
-      ;;
-    legacy)
-      full="$(git -C "$REPO_ROOT" rev-parse --verify "${source}^{commit}" 2>/dev/null || true)"
-      [[ "$full" =~ ^[0-9a-f]{40}$ && "$full" == "$source"* ]] || {
-        echo "✗ legacy predecessor short SHA 无法唯一解析为 trusted full commit:$source" >&2; return 1;
-      }
-      assert_release_metadata_matches_commit "$current" "$full" || return 1
-      TRUSTED_LEGACY_PREDECESSOR="$current"
-      TRUSTED_LEGACY_SOURCE_COMMIT="$full"
-      TRUSTED_LEGACY_ARTIFACT_SHA256="$artifact"
-      ;;
-    *) echo "✗ serving predecessor marker kind 非法:${kind:-<empty>}" >&2; return 1 ;;
-  esac
-  echo "  ✓ 已在 deploy+mutation lock 内捕获 predecessor(kind=$kind path=$current)"
-}
-
-# Egress may intentionally lag the serving master by many releases. Capture its
-# real process cwd under the same two locks, but grant this legacy pin only to
-# egress activation/compensation; it is never a master rollback trust root.
-capture_trusted_egress_predecessor() { # [explicit-release-dir，仅供 hermetic test]
-  local current="${1:-}" probe kind source short built artifact full
-  [[ "$DRY" == 1 ]] && return 0
-  if [[ -z "$current" ]]; then
-    current="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
-  fi
-  [[ -n "$current" ]] || { echo "✗ 无法在 mutation 前捕获 egress predecessor" >&2; return 1; }
-  probe="$(release_marker_probe "$current")" || {
-    echo "✗ egress predecessor marker/目录/VERSION 校验失败:$current" >&2; return 1;
-  }
-  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
-  CAPTURED_EGRESS_PREDECESSOR="$current"
-  TRUSTED_LEGACY_EGRESS_PREDECESSOR=""; TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT=""
-  TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256=""
-  case "$kind" in
-    strong)
-      assert_release_metadata_matches_commit "$current" "$source" || return 1
-      ;;
-    legacy)
-      full="$(git -C "$REPO_ROOT" rev-parse --verify "${source}^{commit}" 2>/dev/null || true)"
-      [[ "$full" =~ ^[0-9a-f]{40}$ && "$full" == "$source"* ]] || {
-        echo "✗ legacy egress predecessor short SHA 无法唯一解析:$source" >&2; return 1;
-      }
-      assert_release_metadata_matches_commit "$current" "$full" || return 1
-      TRUSTED_LEGACY_EGRESS_PREDECESSOR="$current"
-      TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT="$full"
-      TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256="$artifact"
-      ;;
-    *) echo "✗ egress predecessor marker kind 非法:${kind:-<empty>}" >&2; return 1 ;;
-  esac
-  echo "  ✓ 已在 deploy+mutation lock 内捕获 egress predecessor(kind=$kind path=$current)"
-}
-
-# 蓝绿前置:active slot 的 src 必须已是 symlink 布局且指向 RELEASES_ROOT 下的完整 release(否则先迁移)。
-# $1=要校验的 src(默认 ACTIVE_SRC;传统 lane resolve_active_lane 后传 active slot 的 src)。
-assert_bluegreen_layout() {
-  local src="${1:-${ACTIVE_SRC:-$REMOTE_SRC}}"
-  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 断言蓝绿 symlink 布局(src=$src)"; return 0; }
-  ssh "$KL_HOST" "set -e
-    test -L '$src'
-    t=\$(readlink -f '$src')
-    case \"\$t\" in '$RELEASES_ROOT'/rel-*) : ;; *) echo '✗ $src symlink 未指向 RELEASES_ROOT/rel-*: '\"\$t\" >&2; exit 1 ;; esac
-    test -f \"\$t/.complete\" || { echo '✗ current release 无 .complete 标记' >&2; exit 1; }" || {
-    echo "✗ 蓝绿布局校验失败:$src 需为指向 RELEASES_ROOT/rel-* 完整 release 的 symlink。先在受控窗口跑:deploy-v5.sh --migrate-bluegreen" >&2
-    exit 1
-  }
-}
-
-# P0#4(Codex):offline cutover lane(stage/activate-staged/offline-recycle/prepare-offline-cutover)
-# 仍按**实目录 in-place + mv 语义**操作 REMOTE_SRC,在 symlink 布局下会把 symlink 搬走/装回实目录、
-# 破坏蓝绿不变量。该 lane 尚未适配蓝绿 → symlink 布局下 **fail-closed 拒绝**(不静默破坏)。
-assert_not_bluegreen_for_cutover() {
-  [[ "$DRY" == 1 ]] && return 0
-  if ssh "$KL_HOST" "test -L '$REMOTE_SRC'"; then
-    echo "✗ 蓝绿 symlink 布局下 offline cutover lane 尚未适配(会破坏布局)。该 lane 需单独迁移蓝绿(登记 playbook 债);当前 fail-closed 拒绝。" >&2
-    exit 1
-  fi
-}
-
-# 建不可变 release:**当前 shell 执行**(不走 command-substitution 子 shell,否则 errexit 被清、
-# 失败被吞、DIST_BUILD_ID 丢,Codex P0#1),成功后**设全局 BUILT_RELEASE**,失败 return 1。
-# 建到唯一 .staging-* → 完整性校验 → 写 .complete → **原子 mv -T 改名**为 rel-*(半成品永不落
-# rel-* 命名空间,activate/rollback/GC 只认带 .complete 的目录,Codex P0#3)。sha 全程钉死一次
-# 贯穿 archive/VERSION/dist(工作树必须干净=即该 sha,Codex P0#2)。
-BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""
-
-write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <builtAt> <schema>
-  local root="$1" full_sha="$2" short_sha="$3" built_at="$4" schema="$5"
-  local metadata_sha artifact_sha marker_tmp root_uid root_gid root_mode marker_uid marker_gid marker_mode
-  [[ "$full_sha" =~ ^[0-9a-f]{40}$ && "$short_sha" =~ ^[0-9a-f]{7,40}$ \
-    && "$full_sha" == "$short_sha"* && "$built_at" =~ ^[0-9]{8}-[0-9]{6}$ \
-    && "$schema" =~ ^[1-9][0-9]*$ ]] || {
-    echo 'FATAL: strong release identity 参数非法' >&2; return 1;
-  }
-  [[ -d "$root" && ! -L "$root" ]] || { echo 'FATAL: strong release root 非法' >&2; return 1; }
-  # Legacy real-directory migration may start from the historical 0775 root.
-  # Normalize only the release root itself while stopped/staged, then prove the
-  # trust anchor is root-owned and not group/other writable before hashing it.
-  chown 0:0 -- "$root" || return 1
-  chmod go-w -- "$root" || return 1
-  read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$root")
-  [[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] || {
-    echo "FATAL: strong release root ownership/mode 不可信:$root" >&2; return 1;
-  }
-  test -f "$root/package.json"
-  test -d "$root/node_modules"
-  test -f "$root/VERSION.json"
-  test -f "$root/packages/web-react/dist/index.html"
-  test -f "$root/deploy/v5/release-metadata.json"
-  [[ "$(jq -er '.commit | select(type == "string")' "$root/VERSION.json")" == "$short_sha" ]] || {
-    echo 'FATAL: VERSION.commit 与 pinned source short SHA 不一致' >&2; return 1;
-  }
-  metadata_sha="$(sha256sum -- "$root/deploy/v5/release-metadata.json" | cut -d' ' -f1)"
-  artifact_sha="$(release_artifact_digest "$root")"
-  [[ "$metadata_sha" =~ ^[0-9a-f]{64}$ && "$artifact_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  marker_tmp="${root}.complete.$$"
-  local jq_args=(
-    -n
-    --argjson schemaVersion "$schema"
-    --arg sourceCommit "$full_sha"
-    --arg builtAt "$built_at"
-    --arg metadataSha256 "$metadata_sha"
-    --arg artifactSha256 "$artifact_sha"
-    --argjson flavorGuardGeneration 1
-  )
-  local jq_prog='{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
-      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
-      flavorGuardGeneration:$flavorGuardGeneration}'
-  local baked_manifest="$root/.baseline-manifest.json" manifest_sha
-  if [[ -e "$baked_manifest" ]]; then
-    [[ -f "$baked_manifest" && ! -L "$baked_manifest" ]] || {
-      echo "FATAL: .baseline-manifest.json 必须是常规文件:$baked_manifest" >&2; return 1;
-    }
-    manifest_sha="$(sha256sum -- "$baked_manifest" | cut -d' ' -f1)"
-    [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-    jq_args+=(--arg baselineManifestSha256 "$manifest_sha")
-    jq_prog='{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
-      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
-      flavorGuardGeneration:$flavorGuardGeneration,
-      baselineManifestSha256:$baselineManifestSha256}'
-  fi
-  if ! jq "${jq_args[@]}" "$jq_prog" >"$marker_tmp"; then
-    rm -f -- "$marker_tmp"
-    return 1
-  fi
-  chmod 0644 "$marker_tmp" || { rm -f -- "$marker_tmp"; return 1; }
-  chown 0:0 "$marker_tmp" || { rm -f -- "$marker_tmp"; return 1; }
-  mv -f -- "$marker_tmp" "$root/.complete" || { rm -f -- "$marker_tmp"; return 1; }
-  read -r marker_uid marker_gid marker_mode < <(stat -Lc '%u %g %a' -- "$root/.complete")
-  [[ "$marker_uid" == 0 && "$marker_gid" == 0 && "$marker_mode" == 644 ]] || {
-    echo "FATAL: strong release marker ownership/mode 不可信:$root/.complete" >&2; return 1;
-  }
-  # Re-hash after the marker is durably in place (the marker itself is excluded)
-  # so a concurrent tree mutation between the first digest and publish cannot
-  # create a self-consistent-looking marker that was never verified as a whole.
-  [[ "$(release_artifact_digest "$root")" == "$artifact_sha" ]] || {
-    echo "FATAL: strong release tree changed while publishing marker:$root" >&2; return 1;
-  }
-}
-
-publish_strong_release() { # <staging> <final-dir> <full-sha> <short-sha> <builtAt>
-  local staging="$1" reldir="$2" full_sha="$3" short_sha="$4" built_at="$5"
-  {
-    declare -f release_artifact_digest write_strong_release_marker_local
-    cat <<'REMOTE'
-set -Eeuo pipefail
-staging="$1"; reldir="$2"; full_sha="$3"; short_sha="$4"; built_at="$5"; schema="$6"
-[[ -d "$staging" && ! -L "$staging" && ! -e "$reldir" ]] || {
-  echo 'FATAL: strong release staging/final path 非法' >&2; exit 1;
-}
-write_strong_release_marker_local "$staging" "$full_sha" "$short_sha" "$built_at" "$schema"
-mv -T -- "$staging" "$reldir"
-REMOTE
-  } | ssh "$KL_HOST" bash -s -- \
-    "$staging" "$reldir" "$full_sha" "$short_sha" "$built_at" "$RELEASE_COMPLETE_SCHEMA_VERSION"
-}
+source "$SCRIPT_DIR/lib/v5-release-artifacts.sh"
 
 # ══════════ 部署与 CI 绿的机械绑定(2026-07-26;审计 9)══════════
 # 背景:`grep -n "gh run|gh api|check-runs|conclusion" scripts/deploy-v5.sh` 此前**零命中** ——
@@ -3282,6 +2980,7 @@ REMOTE
 # 判定口径故意只认 required_status_checks.contexts(分支保护的权威必需集),不把可选/实验 job
 # 的红当成阻断 —— 否则一个 flaky 可选 job 就能卡死正常发布。
 CI_PROTECTED_BRANCH="${CI_PROTECTED_BRANCH:-feat/v5-aurora-rewrite}"
+
 _gh_api() { env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy gh api "$@"; }
 assert_ci_green_for_source_commit() { # <full sha>
   local sha="$1" required missing="" pending="" bad="" unverifiable=""
@@ -3353,7 +3052,10 @@ assert_ci_green_for_source_commit() { # <full sha>
           in_progress|queued|waiting) pending="$pending $ctx(status=$status)" ;;
           *) bad="$bad $ctx(status=$status)" ;;
         esac
-      elif [[ ! "$conclusion" =~ ^(success|skipped|neutral)$ ]]; then
+      # skipped 不算绿:v5-ci.yml 在合并后 push 上会按 same-tree 证据跳过全部 job(2026-10-08),
+      # 被构建 commit 上的 required check 因此可能是 skipped。那不是这次 commit 自己的绿证据 ——
+      # 走下方 same-tree 复用,由本门自己核对父提交的 tree 与 required check。
+      elif [[ ! "$conclusion" =~ ^(success|neutral)$ ]]; then
         bad="$bad $ctx(conclusion=$conclusion)"
       fi
     done <<<"$required"
@@ -3975,6 +3677,44 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # OCV5-380: master-side incidents that came with the selfhost merge (alert inbox fallback, inbox
+  # delivery key, project output assets, PROJECT.md seed). Each named regression case must pass on
+  # this pinned tree; the alert cases run on the same hermetic test PostgreSQL.
+  if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+        npx --no-install tsx scripts/check-v5-master-incident-proofs.ts); then
+    echo "✗ pinned master incident proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  # OCV5-376 historical INC closure proofs (seed hash pin + lazy tool-body retry).
+  if ! (cd "$REPO_ROOT" && \
+        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts); then
+    echo "✗ pinned OCV5-376 platform/tool proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  # OCV5-763: imported selfhost safety proofs run on this exact pinned checkout.
+  # Isolated SQLite/files/loopback only; no production credentials or billing.
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-approval-proofs.ts); then
+    echo "✗ pinned system-approval-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts); then
+    echo "✗ pinned prompt-privacy-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-system-executor-proofs.ts); then
+    echo "✗ pinned system-executor-proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && npx --no-install tsx scripts/check-v5-upload-retention-proof.ts); then
+    echo "✗ pinned upload-retention-proof failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # Phase A writer / Phase B reader must choose the same physical billing
   # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
   # pinned staging tree, not the shared checkout.
@@ -4056,6 +3796,37 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # Real remote relay + UID-local ToolHost, rebuilt only from this pinned archive.
+  if ! (cd "$box_cand" && bash scripts/check-v5-codex-late-stop-proof.sh); then
+    echo "✗ pinned Codex late-stop closure proof failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  # check-v5-box-incident-proofs.ts stays named here so the deploy-gate ledger
+  # still sees it. The runner transpiles that file once before main()'s 120s
+  # deadline. Do not switch this back to npx tsx and do not raise LIMIT_MS.
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
+      TEST_DATABASE_URL="$box_dsn" \
+      node scripts/run-v5-box-incident-proofs.mjs --expect-sha "$full_sha"); then
+    echo "✗ pinned box incident proofs gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts); then
+    echo "✗ pinned box terminal-unproven liveness probe failed" >&2
+    rm -rf "$box_cand"; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1
+  fi
+  if ! (cd "$box_cand" && timeout 126 env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha"); then
+    echo "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
       TEST_DATABASE_URL="$box_dsn" \
       npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha"); then
@@ -4072,6 +3843,11 @@ build_release() {
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts"; then
     echo "✗ pinned Codex ChatGPT websocket hang gate (INC-20260915-CODEX-CHATGPT-WS) failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-advisor-1m-dup-picker.ts"; then
+    echo "✗ pinned advisor 1M twin picker gate (INC-20260915-ADVISOR-1M-DUP-PICKER) failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
@@ -5292,6 +5068,15 @@ model_authority_egress_ready_once() { # <true|false> <request-timeout-seconds>
     "$V5_EGRESS_UNIT" "$request_timeout" <<'REMOTE'
 set +e
 unit="$1"; request_timeout="$2"
+# OCV5-391: after the slot migration the serving egress is the newest active slot.
+if [[ "$(systemctl is-active "$unit" 2>/dev/null)" != active ]]; then
+  best_t=-1
+  for c in openclaude-v5-egress@A.service openclaude-v5-egress@B.service; do
+    [[ "$(systemctl is-active "$c" 2>/dev/null)" == active ]] || continue
+    t="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$c" 2>/dev/null || echo 0)"
+    (( ${t:-0} > best_t )) && { unit="$c"; best_t=${t:-0}; }
+  done
+fi
 state_before="$(systemctl is-active "$unit" 2>/dev/null || true)"
 pid_before="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
 health=""
@@ -5372,7 +5157,7 @@ model_authority_rollback_diagnostics() { # <reason>
   echo "FATAL:模型权威回滚未完成:$reason" >&2
   echo "  安全态可能仍为 flag=1 + egress enforce=true；不要手工只关一面。" >&2
   echo "  修复故障后原命令重跑:scripts/deploy-v5.sh --disable-model-authority" >&2
-  ssh "$KL_HOST" "systemctl --no-pager --full status '$ACTIVE_UNIT' '$V5_EGRESS_UNIT' 2>&1 | tail -n 50" >&2 || true
+  ssh "$KL_HOST" "systemctl --no-pager --full status '$ACTIVE_UNIT' '$V5_EGRESS_UNIT' openclaude-v5-egress@A.service openclaude-v5-egress@B.service 2>&1 | tail -n 60" >&2 || true
 }
 
 # 步骤 4 的统一回滚闭环。关键顺序：
@@ -5409,7 +5194,7 @@ rollback_model_authority_before_cutover() { # <reason>
     wait_for_model_authority_master_ready "$ACTIVE_UNIT" 0 0 - 60 \
       || { model_authority_rollback_diagnostics "active master legacy 未就绪 flag=0/provision=0"; return 1; }
   fi
-  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" \
+  egress_restart_in_place \
     || { model_authority_rollback_diagnostics "egress 后撤重启失败"; return 1; }
   wait_for_model_authority_egress_ready false 60 \
     || { model_authority_rollback_diagnostics "egress 未活体确认 enforce=false"; return 1; }
@@ -5423,7 +5208,7 @@ rollback_model_authority_before_cutover() { # <reason>
 rollback_model_authority_egress_only() {
   require_mutation_lease_for_compensation "model-authority-egress-rollback" || exit 86
   remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || return 1
-  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || return 1
+  egress_restart_in_place || return 1
   wait_for_model_authority_egress_ready false 60
 }
 
@@ -5448,7 +5233,7 @@ enable_model_authority() {
     exit 1
   fi
   echo "── 先重启 egress 并确认 enforce=true(允许短暂 fail-closed,禁止新 master+旧 egress fail-open)──"
-  if ! ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'"; then
+  if ! egress_restart_in_place; then
     rollback_model_authority_egress_only \
       || { model_authority_rollback_diagnostics "egress enable 失败后的窄补偿未确认"; exit 1; }
     echo "✗ egress 重启失败,已窄补偿为 flag=0/enforce=false" >&2
@@ -5861,6 +5646,10 @@ activate_release() {
   [[ "$ACTIVE_SLOT" == A ]] && old_prev_file="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
   # 前端资产先于任何 live 翻转就位；失败仅留下加法式孤儿资产，无运行态变化。
   sync_assets_to_pool "$reldir" || return 1
+  # Ordinary deploy's direct path synchronizes assets here; recheck after that work.
+  if [[ "${2:-}" == --wait-user-idle ]]; then
+    commercial_wait_for_cutover_idle "$prev" || return $?
+  fi
   prepare_direct_turn_timeline_activation "$reldir" "$prev" || return 1
   tmplink="$ACTIVE_SRC.newlink.$$"
   # A slot:同时写 .prev-release 文件(传统 lane 兼容兜底);B slot:rollback 权威在 deploy_state.previous_active_release,不写文件(不污染 A 的兜底)。
@@ -5978,6 +5767,10 @@ hotcfg_ship_lib() {
 # stdout = 该函数 stdout(如 bundleRev / releaseDir),供 $(...) 捕获;lib 的日志走 stderr。
 hotcfg_rmt() {
   local fn="$1"; shift
+  if commercial_policy_enabled && [[ "$fn" == oc_hotcfg_activate_saga ]]; then
+    commercial_policy_rmt "$fn" "$@"
+    return $?
+  fi
   hotcfg_ship_lib || return 1
   ssh "$KL_HOST" "bash -s -- $(printf '%q ' "$@")" <<RLIB
 set -Eeuo pipefail
@@ -6056,8 +5849,8 @@ assert_target_runtime_image_ready() {
     return 1
   }
   actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE' --version")" || return 1
-  [[ "$actual_grok" == grok\ 1.0.5\ * ]] || {
-    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.5 (...)'" >&2
+  [[ "$actual_grok" == grok\ 1.0.62\ * ]] || {
+    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.62 (...)'" >&2
     return 1
   }
   [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
@@ -6386,120 +6179,38 @@ build_runtime_release() {
 # 激活提交的核心健康门(单一权威,R4-M2):正常激活与 emergency 激活**同强度**,
 # 恒含 sessionsDb=ok(数据库失联时不许提交任何 tuple history)。
 hotcfg_core_smoke_cmd() {
-  printf '%s' 'hz=""; for i in $(seq 1 15); do hz=$(curl -fsS http://127.0.0.1:'"$ACTIVE_PORT"'/healthz 2>/dev/null||true); [ -n "$hz" ] && break; sleep 2; done; printf "%s" "$hz" | grep -q "\"ok\":true" && printf "%s" "$hz" | grep -q "\"channel\":\"v5\"" && printf "%s" "$hz" | grep -q "\"sessionsDb\":\"ok\""'
+  printf '_oc_core_port=%q\n' "$ACTIVE_PORT"
+  cat <<'CORE_SMOKE'
+_oc_core_deadline=$(( $(date +%s) + 90 ))
+_oc_core_ready=0; _oc_core_curl_rc=0; _oc_core_http=000; _oc_core_body=''
+while [ "$(date +%s)" -lt "$_oc_core_deadline" ]; do
+  _oc_core_curl_rc=0
+  _oc_core_reply="$(curl -fsS --connect-timeout 1 --max-time 2 --write-out $'\n%{http_code}' "http://127.0.0.1:$_oc_core_port/healthz" 2>/dev/null)" || _oc_core_curl_rc=$?
+  _oc_core_http="${_oc_core_reply##*$'\n'}"
+  _oc_core_body="${_oc_core_reply%$'\n'*}"
+  if [ "$_oc_core_curl_rc" -eq 0 ] && printf '%s' "$_oc_core_body" | jq -e '.ok==true and .channel=="v5" and .deps.sessionsDb=="ok"' >/dev/null 2>&1; then
+    _oc_core_ready=1; break
+  fi
+  sleep 2
+done
+if [ "$_oc_core_ready" -eq 1 ]; then
+  printf 'core health readiness passed: port=%s\n' "$_oc_core_port" >&2
+else
+  [[ "$_oc_core_http" =~ ^[0-9]{3}$ ]] || _oc_core_http=unknown
+  _oc_core_safe="$(printf '%s' "$_oc_core_body" | jq -c '{ok:(.ok==true),channel:(if .channel=="v5" then "v5" else "unexpected" end),deps:{pg:(if .deps.pg=="ok" then "ok" else "not-ok" end),redis:(if .deps.redis=="ok" then "ok" else "not-ok" end),sessionsDb:(if .deps.sessionsDb=="ok" then "ok" else "not-ok" end)}}' 2>/dev/null)" || _oc_core_safe='{"json":"invalid-or-empty"}'
+  printf 'core health readiness failed: port=%s curl_rc=%s http=%s last=%s\n' "$_oc_core_port" "$_oc_core_curl_rc" "$_oc_core_http" "$_oc_core_safe" >&2
+  false
+fi
+CORE_SMOKE
 }
 
 # 把 deploy_state release CAS 作为 hotcfg saga 的 commit/revert 钩子。命令在 kl-mirror 的
 # bash 内执行，严格复用 v5-deploy-state-lib.sh 生成的 SQL；commit 落空/PG 错误会触发 hotcfg
 # 原有的 env/current/symlink/unit 全补偿，history 写失败则再用 revert SQL 恢复原 release 血缘。
 HOTCFG_STATE_COMMIT_CMD=""; HOTCFG_STATE_REVERT_CMD=""
-build_hotcfg_state_hooks() {  # $1=target master release
-  local target="$1" apply_sql revert_sql status_sql next_lock
-  next_lock=$((ACTIVE_STATE_LOCK_VERSION + 1))
-  apply_sql="$(ds_stable_release_commit_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" "$ACTIVE_STATE_RELEASE" "$target")"
-  revert_sql="$(ds_stable_release_revert_sql "$next_lock" "$ACTIVE_SLOT" "$target" "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE")"
-  status_sql="$(ds_stable_release_status_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" \
-    "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE" "$target")"
-  # commit 三态协议:0=applied(含“UPDATE 已提交但回执丢失后回读确认”)；10=original 确认；
-  # 11=unknown。命令包在子 shell，避免 exit/return 穿透调用 saga。
-  printf -v HOTCFG_STATE_COMMIT_CMD \
-    '( set -a; . %q; if out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null)" && [ -n "$out" ]; then exit 0; fi; for i in 1 2 3; do status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in applied) exit 0 ;; original) exit 10 ;; esac; sleep 1; done; exit 11 )' \
-    "$V5_ENV" "$apply_sql" "$status_sql"
-  # revert 是幂等 reconcile：无论 apply 明确成功、回执不明或明确未命中，只有回读确认
-  # original/reverted 才返回 0；PG 不可读/竞争/alien state 均返回 11，让 saga 保持新运行面。
-  printf -v HOTCFG_STATE_REVERT_CMD \
-    '( set -a; . %q; for i in 1 2 3; do out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; [ -n "$out" ] && exit 0; status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in original|reverted) exit 0 ;; esac; sleep 1; done; exit 11 )' \
-    "$V5_ENV" "$revert_sql" "$status_sql"
-}
+# build_hotcfg_state_hooks is defined in the mandatory commercial policy library.
 
-activate_runtime_tuple() {
-  echo "── 激活 runtime tuple saga ──"
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
-    return 0
-  fi
-  assert_commercial_flavor_on_target "$BUILT_RELEASE" || return 1
-  assert_release_marker "$BUILT_RELEASE" || return 1
-  assert_release_required_migrations "$BUILT_RELEASE" || return 1
-  assert_release_baseline_security "$BUILT_RELEASE" || return 1
-  # hotcfg 路径的 master symlink 翻转走 saga 的 extra_apply,**不经 activate_release** →
-  # 两个 capability 门必须在这里显式再挂一次(否则开了 hotcfg 就等于绕过了所有制品守卫)。
-  # 容器 tuple 面由 lib 的 assert_tuple_viable ③ 在 saga 内覆盖(release MANIFEST / 镜像 label)。
-  assert_release_capability_for_sessions_pg "$BUILT_RELEASE"
-  assert_lossless_turn_tape_floor "$BUILT_RELEASE"
-  assert_model_authority_floor "$BUILT_RELEASE"
-  local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
-  prev_src="$(bg_current_release "$ACTIVE_SRC")"
-  [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
-  assert_web_storage_rollback_transition \
-    "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$BUILT_RELEASE" \
-    "runtime hotcfg master activation" || return 1
-  assert_release_marker "$prev_src" || {
-    echo "✗ hotcfg 激活前 exact predecessor marker 无效:$prev_src" >&2; return 1;
-  }
-  assert_direct_turn_timeline_pair "$prev_src" "$BUILT_RELEASE" "runtime hotcfg activation" || return 1
-  # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
-  if [[ "$ACTIVE_SLOT" == A ]]; then
-    old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
-    prev_apply="printf '%s\\n' '$prev_src' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release';"
-    if [[ -n "$old_prev" ]]; then
-      prev_revert="printf '%s\\n' '$old_prev' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release';"
-    else
-      prev_revert="rm -f '$RELEASES_ROOT/.prev-release';"
-    fi
-  fi
-  # image / image_id **恒写**:release 轴启用则用刚 inspect 的;否则从 env 取 image 并 inspect 出 id(供 stale/label/canary)。
-  if hotcfg_release_axis_on; then
-    image="$RUNTIME_IMAGE_REF"; image_id="$RUNTIME_IMAGE_ID"; release="$BUILT_RUNTIME_RELEASE"
-  else
-    if [[ "$DISABLE_RELEASE_FLAG" == 1 && -n "$EMERG_IMAGE" ]]; then
-      # R3-B1:禁用 release 轴时显式切换到内嵌源码镜像(tuple 可行性守卫要求 embed_source≠0;
-      # ID 就地核验,tag 漂移在此拦下而非等 saga)。
-      image="$EMERG_IMAGE"
-      image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
-      [[ "$image_id" == "$EMERG_IMAGE_ID" ]] \
-        || { echo "✗ --image 的 immutable ID($image_id)与 --image-id($EMERG_IMAGE_ID)不符" >&2; return 1; }
-    else
-      image="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
-      image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
-    fi
-    # R2-B1:release 轴禁用/未启用 → 传**空串**(恒写 OC_RUNTIME_RELEASE=,值空=禁用,--disable 后即稳态)。
-    # 注:saga 内 oc_hotcfg_assert_tuple_viable 会对"镜像 embed_source=0 + 空 release"fail-loud(R3-B1)。
-    release=""
-  fi
-  # This activation introduces a v2 writer together with its capable master.
-  # Prove the actual target tuple before any saga side effect, even before the
-  # first tape exists; metadata-only declarations are insufficient.
-  assert_lossless_runtime_tuple_capability "$image_id" "$release" || return 1
-  # bundle 轴:启用则翻新 rev + 写新绝对路径;禁用/未启用 → flip_rev 空(不翻 current)+ 写空值(R2-B1)。
-  if hotcfg_bundle_axis_on; then
-    flip_rev="$BUILT_BUNDLE_REV"; bundle_val="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
-  else
-    flip_rev=""; bundle_val=""
-  fi
-  restart_cmd="systemctl restart '$ACTIVE_UNIT'"
-  # 远端核心健康门(fail-closed):ok=true + channel=v5 + sessionsDb=ok(与 smoke() 深度探活同不变量)。
-  # 全量 smoke(调度器白名单等第二道防线)在 saga 提交后由 deploy() 另跑本地 smoke() 兜底。
-  smoke_cmd="$(hotcfg_core_smoke_cmd)"
-  # extra:master 源码 symlink 翻转(先原子落 .prev-release=prev_src,再 ln+mv -T);
-  # revert(M7c):**先还原 .prev-release=old_prev**(翻转前快照),再翻回 master symlink=prev_src。
-  extra_apply="$prev_apply rm -f '$ACTIVE_SRC.hotlink'; ln -s '$BUILT_RELEASE' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
-  extra_revert="$prev_revert rm -f '$ACTIVE_SRC.hotlink'; ln -s '$prev_src' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
-  build_hotcfg_state_hooks "$BUILT_RELEASE"
-  # M7a:masterRelease=$BUILT_RELEASE(本次激活的 master 蓝绿 release)进 history,rollback 从同一条取回对齐。
-  # R2-B2:prev_master=$prev_src(激活前 live master)供首次启用的 pre-state 记录。
-  hotcfg_rmt oc_hotcfg_activate_saga \
-    "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
-    "$image" "$image_id" "$release" "$bundle_val" \
-    "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$BUILT_RELEASE" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "joint" \
-    || { echo "✗ 激活 saga 失败,已自动回滚旧 tuple(env/current/master 源码/.prev-release/重启旧 master)" >&2; return 1; }
-  ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
-  ACTIVE_STATE_RELEASE="$BUILT_RELEASE"
-  ACTIVE_STATE_LOCK_VERSION=$((ACTIVE_STATE_LOCK_VERSION + 1))
-  echo "  ✓ runtime tuple 激活并提交 history(release=${release:-<none>} bundle=${flip_rev:-<unchanged>} master=$BUILT_RELEASE)"
-  run "sleep 3"
-}
+# activate_runtime_tuple is defined in the mandatory commercial policy library.
 
 # ── 4. gc_runtime_artifacts:best-effort GC(§1.4)。失败只告警不回滚。──
 gc_runtime_artifacts() {
@@ -6781,6 +6492,12 @@ wait_for_master_healthz_ready() { # <port>
 }
 
 # ───────────────────────── smoke:健康 + 隔离断言 ─────────────────────────
+# OCV5-391/411: egress serves from the legacy unit or from one of the blue-green slots
+# (openclaude-v5-egress@{A,B}); after the slot migration the legacy unit is inactive by design.
+egress_serving_unit_active() {
+  ssh "$KL_HOST" "systemctl is-active --quiet openclaude-v5-egress.service || systemctl is-active --quiet openclaude-v5-egress@A.service || systemctl is-active --quiet openclaude-v5-egress@B.service"
+}
+
 smoke() {
   # V5_PORT/smoke 参数化(RFC D5;$1=探测端口,默认 A 的 18790)。finalize 后 candidate 已成 leader,
   # 用其端口跑本 smoke 即验证"新 active 完整健康+leader 形态"。
@@ -6900,8 +6617,8 @@ smoke() {
   split="$(ssh "$KL_HOST" "test -r '$V5_ENV' && grep -E '^OC_EGRESS_SPLIT=' '$V5_ENV' | tail -n 1 | cut -d= -f2-")" \
     || { echo "✗ 读取 $V5_ENV 的 OC_EGRESS_SPLIT 失败(env 文件缺失或 ssh 异常)" >&2; return 1; }
   if [[ "$split" == "1" ]]; then
-    ssh "$KL_HOST" "systemctl is-active --quiet openclaude-v5-egress" \
-      || { echo "✗ OC_EGRESS_SPLIT=1 但 openclaude-v5-egress 非 active —— 容器 LLM 流量无人监听" >&2; return 1; }
+    egress_serving_unit_active \
+      || { echo "✗ OC_EGRESS_SPLIT=1 但 openclaude-v5-egress 及 @A/@B 槽均非 active —— 容器 LLM 流量无人监听" >&2; return 1; }
     local eg; eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
     echo "  egress-health: $eg"
     echo "$eg" | grep -q '"role":"egress"' || { echo "✗ egress 进程不健康(18892 无响应或非 egress)" >&2; return 1; }
@@ -6937,7 +6654,40 @@ smoke() {
 }
 
 # ───────────────────────── bootstrap:首次建立 v5 ─────────────────────────
+assert_bootstrap_complete_env() {
+  # Full candidate schema is bootstrap-only, never a repair/recovery lease gate.
+  assert_mutation_lease_alive "bootstrap-env" || return 86
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] require complete pre-provisioned bootstrap V5 env"
+    return 0
+  fi
+  local artifact digest compressed
+  artifact="$(node "$REPO_ROOT/scripts/lib/build-v5-bootstrap-validator.mjs")" || return 79
+  digest="${artifact%% *}"; compressed="${artifact#* }"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ && -n "$compressed" ]] || return 79
+  ssh "$KL_HOST" bash -s -- "$V5_ENV" "$digest" "$compressed" <<'BOOTSTRAP_ENV'
+set -Eeuo pipefail
+env_file="$1"; expected_sha="$2"; compressed="$3"
+[[ "$(id -u)" == 0 && -f "$env_file" && ! -L "$env_file" &&
+   "$(stat -c '%u:%a' "$env_file")" == "0:600" ]] || exit 77
+umask 077
+tmp="$(mktemp)" || exit 77
+trap 'rm -f "$tmp"' EXIT
+printf '%s' "$compressed" | base64 -d | gzip -d >"$tmp" || exit 79
+actual_sha="$(sha256sum "$tmp")"; actual_sha="${actual_sha%% *}"
+[[ "$actual_sha" == "$expected_sha" ]] || { echo "bootstrap: validator SHA-256 mismatch" >&2; exit 79; }
+# No public/live source, unit, env or dependency installation in validation.
+timeout --signal=KILL --kill-after=1 20 bash -c '
+  set -euo pipefail
+  set -a; . "$1"; set +a
+  export NODE_ENV=production
+  exec node "$2"
+' bootstrap-env "$env_file" "$tmp"
+BOOTSTRAP_ENV
+}
+
 bootstrap() {
+  assert_bootstrap_complete_env || return $?
   echo "══ v5 bootstrap on $KL_HOST ══"
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
@@ -7012,11 +6762,44 @@ EGRESS_READY_LAST_STATE=""; EGRESS_READY_LAST_PID=""; EGRESS_READY_LAST_CWD=""; 
 # egress 冷启动会先加载 pricing/catalog/host identity，再 bind 18892；固定 sleep 会在宿主
 # 抖动时把“尚未 ready”误判成坏 release。单次探针把 systemd/PID/cwd/health 绑在同一轮，
 # 整个 SSH+curl transport 由本地 timeout 钉死，供下面绝对截止轮询消费。
+# OCV5-391: run scripts/v5-egress-slots.sh on the production host (streamed, like the baseline guard).
+egress_slots_remote() { # <active|install <rel>|flip [predrain-sec]|legacy>
+  local a q args=""
+  for a in "$@"; do printf -v q '%q' "$a"; args+=" $q"; done
+  if commercial_policy_enabled && [[ "$1" != active ]]; then
+    commercial_policy_rmt commercial_policy_egress "$@"
+    return $?
+  fi
+  ssh "$KL_HOST" "bash -s --$args" < "$SCRIPT_DIR/v5-egress-slots.sh"
+}
+
+# Release dir of the egress process serving new connections (legacy unit or active slot).
+egress_running_cwd() {
+  egress_slots_remote active 2>/dev/null | awk 'NR == 1 { print $3 }'
+}
+
+# Restart the serving egress on the same release (env change): a slot flip when the slot
+# templates are installed, else the legacy unit's restart.
+egress_restart_in_place() {
+  if ssh "$KL_HOST" "test -f '/etc/systemd/system/$V5_EGRESS_SLOT_SERVICE_TPL'"; then
+    if [[ "${CP_EGRESS_RESTORE:-0}" == 1 ]]; then egress_slots_remote restore "$EGRESS_SLOT_PREDRAIN_SEC"
+    else egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC"; fi
+  else
+    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'"
+  fi
+}
+
 egress_release_ready_once() { # <expected-release> <require-authority-cap:0|1> <request-timeout-seconds>
   local expected="$1" require_cap="$2" request_timeout="${3:-2}" raw health_b64
   raw="$(timeout --signal=KILL "${request_timeout}s" ssh "$KL_HOST" "set +e
-    state=\$(systemctl is-active '$V5_EGRESS_UNIT' 2>/dev/null || true)
-    pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || true)
+    u='$V5_EGRESS_UNIT'; best_t=-1
+    for c in '$V5_EGRESS_UNIT' openclaude-v5-egress@A.service openclaude-v5-egress@B.service; do
+      [[ \"\$(systemctl is-active \"\$c\" 2>/dev/null)\" == active ]] || continue
+      t=\$(systemctl show -p ActiveEnterTimestampMonotonic --value \"\$c\" 2>/dev/null || echo 0)
+      (( \${t:-0} > best_t )) && { u=\"\$c\"; best_t=\${t:-0}; }
+    done
+    state=\$(systemctl is-active \"\$u\" 2>/dev/null || true)
+    pid=\$(systemctl show -p MainPID --value \"\$u\" 2>/dev/null || true)
     cwd=''
     if [[ \"\$pid\" =~ ^[1-9][0-9]*\$ ]]; then cwd=\$(readlink -f \"/proc/\$pid/cwd\" 2>/dev/null || true); fi
     hz=\$(curl -fsS --max-time '$request_timeout' http://172.31.0.1:18892/internal/v5/egress-health 2>/dev/null || true)
@@ -7275,14 +7058,13 @@ smoke_turn_canary() { # <pinned master release> [port] [model] [cost-evidence-mo
 }
 
 # ══════════ 双引擎真 turn 矩阵(2026-07-26;审计 13)══════════
-# 旧 deploy lane 的真 turn 只跑 v5-smoke-turn-canary.mjs 默认模型(gpt-5.6-sol / codex 引擎),
-# CCB(claude)引擎在 deploy 与 --dist 通道零真 turn 覆盖 —— 与 canary 的固定 live 矩阵
-# (Codex/gpt-5.6-luna + CCB/deepseek-v4-flash)不对齐。此处对齐成双引擎各一 turn。
+# 真 turn 矩阵默认 grok-build(grok 引擎)+ deepseek-v4-flash(CCB)。
+# 不再默认消耗 GPT 额度;Codex 引擎覆盖改由显式 V5_TURN_MODELS 打开。
 # 稳定 lane 每个 turn 仍严格要求三信号(exactText='2' + isFinal + cost_charged)。
 # 只有 0% candidate/promote-candidate 的 deepseek-v4-flash 因 cost-event 必然投旧 active，
 # 才允许用同一 smoke session 的精确 usage+ledger 闭环替代 live cost frame；finalize
 # 交接 control VIP 后仍必须回到 live frame，不能把 candidate 拓扑例外扩散到稳定态。
-V5_TURN_ENGINE_MATRIX_DEFAULT="gpt-5.6-sol deepseek-v4-flash"
+V5_TURN_ENGINE_MATRIX_DEFAULT="grok-build deepseek-v4-flash"
 smoke_turn_matrix() { # <pinned master release> [port] [lane]
   local release="$1" port="${2:-$ACTIVE_PORT}" lane="${3:-stable}" model models cost_evidence_mode
   if [[ "${V5_SMOKE_TURN:-1}" != 1 ]]; then
@@ -7294,7 +7076,13 @@ smoke_turn_matrix() { # <pinned master release> [port] [lane]
     record_gate_waiver canary-turn-cost "V5_CANARY_REQUIRE_COST=0 关闭了真 turn 的计费到账断言(mode=$MODE)" || return 1
   fi
   models="${V5_TURN_MODELS:-$V5_TURN_ENGINE_MATRIX_DEFAULT}"
-  echo "── 双引擎真 turn 矩阵(models=$models,port=$port,lane=$lane)──"
+  if [[ "$VALIDATION_PROFILE" == skip-grok ]]; then
+    [[ -z "${V5_TURN_MODELS+x}" ]] || { echo '✗ scoped matrix rejects ambient model override' >&2; return 1; }
+    models=deepseek-v4-flash
+    echo "── batch validation profile=skip-grok: Grok matrix SKIPPED; DeepSeek true turn required(port=$port,lane=$lane)──"
+  else
+    echo "── 双引擎真 turn 矩阵(models=$models,port=$port,lane=$lane)──"
+  fi
   for model in $models; do
     cost_evidence_mode=live
     if [[ ( "$lane" == canary-ready || "$lane" == promote-candidate ) && "$model" == deepseek-v4-flash ]]; then
@@ -7305,9 +7093,13 @@ smoke_turn_matrix() { # <pinned master release> [port] [lane]
       return 1
     }
   done
-  clear_gate_waiver smoke-turn
-  [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] || clear_gate_waiver canary-turn-cost
-  echo "  ✓ 双引擎真 turn 矩阵全部通过($models)"
+  if [[ "$VALIDATION_PROFILE" == normal ]]; then
+    clear_gate_waiver smoke-turn
+    [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] || clear_gate_waiver canary-turn-cost
+    echo "  ✓ 双引擎真 turn 矩阵全部通过($models)"
+  else
+    echo '  ✓ DeepSeek true turn passed; Grok matrix SKIPPED by recorded batch scope'
+  fi
 }
 
 # 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。背景:「点击添加附件无反应」
@@ -7344,13 +7136,18 @@ smoke_e2e_journey() { # [port]
   fi
   echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送,remote port=$port)──"
   # 外层只作最终失控保护；脚本内 J1-J4 总预算 240s、J5 独立 180s，另留 30s 清理余量。
-  if ! V5_E2E_REMOTE_PORT="$port" timeout 450 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
+  local -a journey_args=()
+  if [[ "$VALIDATION_PROFILE" == skip-grok ]]; then
+    journey_args+=("--validation-scope=$(printf '%s' "$VALIDATION_SCOPE_JSON" | base64 -w0)")
+    echo '  · Grok journey SKIPPED; full DeepSeek J1–J5 required by recorded batch scope'
+  fi
+  if ! V5_E2E_REMOTE_PORT="$port" timeout 510 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs" "${journey_args[@]}"; then
     echo "✗✗ E2E 旅程门失败:用户可感知路径疑似回归(登录/附件/目标/发送其一)。" >&2
     echo "   核查失败截图(/tmp/e2e-journey-fail-*.png);本门已进补偿链,调用方会走对称回滚/abort。" >&2
     echo "   确认假阳性则修 journey 脚本断言并登记;紧急放行用 V5_SMOKE_E2E=0(会登记 durable debt)。" >&2
     return 1
   fi
-  clear_gate_waiver e2e-journey   # 门真跑通过 → 自动销账
+  [[ "$VALIDATION_PROFILE" != normal ]] || clear_gate_waiver e2e-journey   # Full original gate only
 }
 
 # ══════════ 最小功能核(2026-07-26 出口矩阵整改;审计 1)══════════
@@ -7364,16 +7161,28 @@ smoke_e2e_journey() { # [port]
 # 适用 lane:deploy / --dist / canary READY / promote / finalize / activate-emergency-tuple(非阻断)。
 minimum_functional_core() { # <lane-label> <pinned release> <port>
   local lane="$1" release="$2" port="$3"
-  echo "══ 最小功能核(lane=$lane,release=$release,port=$port)══"
+  validation_scope_bind || return 1
+  if [[ "$VALIDATION_PROFILE" == skip-grok ]]; then
+    [[ -z "${V5_TURN_MODELS+x}" && "${V5_SMOKE_TURN:-1}" == 1 && "${V5_SMOKE_E2E:-1}" == 1 && "${V5_CANARY_REQUIRE_COST:-1}" == 1 ]] || return 1
+    echo "══ minimum functional core(profile=skip-grok,lane=$lane,release=$release,port=$port): Grok SKIPPED; full DeepSeek checks required ══"
+  else
+    echo "══ 最小功能核(lane=$lane,release=$release,port=$port)══"
+  fi
+  validation_scope_receipt running "$release" pending pending || return 1
   # B3:默认 turn 组 ∥ E2E。两条真 turn 共用 v5-canary@claudeai.chat,并发会撞配额/会话,
   # 故矩阵内部保持串行;E2E 与 turn 无数据依赖才并行。OC_V5_SMOKE_PARALLEL=0 回退全串行。
   if [[ "${OC_V5_SMOKE_PARALLEL:-1}" != 1 ]]; then
     echo "  · OC_V5_SMOKE_PARALLEL=0 → 全串行(kill-switch)"
     smoke_turn_matrix "$release" "$port" "$lane" || {
+      validation_scope_receipt failed "$release" failed not-run || return 1
       echo "✗ 最小功能核失败(lane=$lane):真 turn 矩阵未通过。" >&2; return 1; }
     smoke_e2e_journey "$port" || {
+      validation_scope_receipt failed "$release" passed failed || return 1
       echo "✗ 最小功能核失败(lane=$lane):E2E 用户旅程未通过。" >&2; return 1; }
-    echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn + J1-J5 旅程"
+    validation_scope_receipt passed "$release" passed passed || return 1
+    validation_scope_clear_repaid
+    if [[ "$VALIDATION_PROFILE" == normal ]]; then echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn + J1-J5 旅程"
+    else echo "  ✓ scoped functional core passed(lane=$lane): DeepSeek true turn + full J1-J5; Grok SKIPPED"; fi
     return 0
   fi
   echo "  · smoke 并行:真 turn 矩阵 ∥ E2E J1-J5(双引擎 turn 仍串行;同 canary 账号)"
@@ -7394,11 +7203,14 @@ minimum_functional_core() { # <lane-label> <pinned release> <port>
   echo "── E2E 旅程日志 ──"
   sed 's/^/  [e2e] /' "$e2e_log" || true
   rm -f "$turn_log" "$e2e_log"
+  validation_scope_receipt "$([[ "$turn_rc" == 0 && "$e2e_rc" == 0 ]] && echo passed || echo failed)" "$release"     "$([[ "$turn_rc" == 0 ]] && echo passed || echo failed)" "$([[ "$e2e_rc" == 0 ]] && echo passed || echo failed)" || return 1
   if [[ "$turn_rc" != 0 || "$e2e_rc" != 0 ]]; then
     echo "✗ 最小功能核失败(lane=$lane):turn_rc=$turn_rc e2e_rc=$e2e_rc" >&2
     return 1
   fi
-  echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn ∥ J1-J5 旅程"
+  validation_scope_clear_repaid
+  if [[ "$VALIDATION_PROFILE" == normal ]]; then echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn ∥ J1-J5 旅程"
+  else echo "  ✓ scoped functional core passed(lane=$lane): DeepSeek true turn ∥ full J1-J5; Grok SKIPPED"; fi
 }
 
 # ══════════ 公网面 + 资产面验证(2026-07-26;审计 8)══════════
@@ -8159,6 +7971,7 @@ weibo_plugin_finish_or_seed() { # <release> <previous> <hotcfg:0|1> <egress-swit
   if weibo_plugin_seed "$release"; then
     return 0
   fi
+  commercial_policy_failure weibo-seed || return $?
   echo "✗ Weibo Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
   require_mutation_lease_for_compensation "weibo-seed-compensation" || exit 86
   weibo_compensate_deploy "$release" "$previous" "$hotcfg" "$egress_switched" "$previous_egress" "$wb_had_previous" \
@@ -8177,48 +7990,66 @@ weibo_plugin_finish_or_seed() { # <release> <previous> <hotcfg:0|1> <egress-swit
 }
 
 activate_egress_release() {
-  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps running_cwd require_cap=0
+  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps running_cwd require_cap=0 slots=0
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;安装目标 unit→restart→health/cwd；失败回切"
+    echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;目标 release 带双槽模板 → 起空闲槽→私有健康→关旧槽 listener→旧槽后台 drain(无模板 → legacy 单 unit restart);health/cwd;失败回切"
     return 0
   fi
   assert_release_marker "$reldir" egress || return 1
   assert_release_marker "$prev" egress || return 1
-  running_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+  running_cwd="$(egress_running_cwd)"
   [[ "$running_cwd" == "$prev" ]] || {
     echo "✗ egress 激活前进程 cwd 已漂移(expected=$prev actual=${running_cwd:-<none>})" >&2; return 1;
   }
   ssh "$KL_HOST" "test -f '$reldir/deploy/v5/$V5_EGRESS_UNIT'" || {
     echo "✗ egress 目标 release 不完整或缺 unit:$reldir" >&2; return 1;
   }
+  # OCV5-391: a release that ships the slot templates is served by a slot flip (no window in
+  # which the shared port is closed); an older release (rollback) goes back to the legacy unit.
+  ssh "$KL_HOST" "test -f '$reldir/deploy/v5/$V5_EGRESS_SLOT_SERVICE_TPL'" && slots=1
   if ! ssh "$KL_HOST" "set -Eeuo pipefail
     rm -f '$tmplink'
     ln -s '$reldir' '$tmplink'
     mv -T '$tmplink' '$V5_EGRESS_SRC'
     install -m 0644 '$reldir/deploy/v5/$V5_EGRESS_UNIT' '/etc/systemd/system/$V5_EGRESS_UNIT'
-    systemctl daemon-reload
-    systemctl restart '$V5_EGRESS_UNIT'"; then
-    echo "✗ egress 新 release 安装/restart 失败，尝试回切 $prev" >&2
-  else
+    systemctl daemon-reload"; then
+    echo "✗ egress 指针/unit 安装失败，尝试回切 $prev" >&2
+  elif { if (( slots )); then
+           egress_slots_remote install "$reldir" && egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC"
+         else
+           egress_slots_remote legacy
+         fi; }; then
     caps="$(release_declared_caps "$reldir" 2>/dev/null || true)"
     caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP" && require_cap=1
     if wait_for_egress_release_ready "$reldir" "$require_cap" 30; then
-      echo "  ✓ egress 已从独立指针运行目标 release:$reldir"
+      echo "  ✓ egress 已从独立指针运行目标 release:$reldir$( (( slots )) && echo '(双槽翻转)')"
       return 0
     fi
     echo "✗ egress 新 release 活体/进程 cwd/capability 未就绪，尝试回切 $prev" >&2
+  else
+    local egress_rc=$?; [[ "$egress_rc" != 86 ]] || return 86
+    echo "✗ egress 新 release 启动失败（双槽:新槽未就绪时旧槽仍在服务），尝试回切 $prev" >&2
   fi
 
-  # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切只需原子翻回旧 release；
-  # 不必恢复旧 unit 文件（旧代码仍由同一个 ExecStart 入口启动）。
+  local egress_user_impairment=1
+  if commercial_policy_enabled; then if commercial_policy_rmt commercial_policy_egress_unavailable "$reldir"; then egress_user_impairment=0; else egress_user_impairment=$?; fi; else egress_user_impairment=0; fi
+  [[ "$egress_user_impairment" != 86 ]] || return 86
+  [[ "$egress_user_impairment" == 0 ]] || commercial_policy_failure egress-activation || return $?
+
+  local COMMERCIAL_FAILURE_POLICY="" CP_EGRESS_RESTORE=1 # scoped confirmed-impairment restoration
+  # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切先原子翻回旧 release。
+  # 旧进程仍在服务时(新槽没起来)指针翻回即可；否则在旧 release 上再翻一次槽(或 legacy restart)。
   require_mutation_lease_for_compensation "egress-release-compensation" || exit 86
   if ssh "$KL_HOST" "set -Eeuo pipefail
     rm -f '$tmplink'
     ln -s '$prev' '$tmplink'
     mv -T '$tmplink' '$V5_EGRESS_SRC'
-    systemctl daemon-reload
-    systemctl restart '$V5_EGRESS_UNIT'"; then
-    if wait_for_egress_release_ready "$prev" 0 30; then
+    systemctl daemon-reload"; then
+    if [[ "$(egress_running_cwd)" == "$prev" ]] && wait_for_egress_release_ready "$prev" 0 30; then
+      echo "  ✓ egress 仍由旧 release 服务，指针已回切:$prev" >&2
+      return 1
+    fi
+    if egress_restart_in_place && wait_for_egress_release_ready "$prev" 0 60; then
       echo "  ✓ egress 已回切旧 release:$prev" >&2
       return 1
     fi
@@ -8253,7 +8084,7 @@ deploy() {
     # 必须在 master symlink 翻转前钉住旧 egress 真正 cwd；active=A 时翻转后再读会丢回退点。
     egress_prev_release="$CAPTURED_EGRESS_PREDECESSOR"
     local current_egress_cwd
-    current_egress_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+    current_egress_cwd="$(egress_running_cwd)"
     [[ -n "$egress_prev_release" && "$current_egress_cwd" == "$egress_prev_release" ]] \
       && assert_release_marker "$egress_prev_release" egress || {
       echo "✗ --egress 起手无法钉住完整旧 egress cwd:$egress_prev_release；拒绝先改 master" >&2; exit 1;
@@ -8266,7 +8097,11 @@ deploy() {
   # reldir,代码+前端同一 release 共享一次翻转+重启;无 --with-dist 则硬链继承当前 dist)。
   # 背景(2026-07-10 事故):deploy 后紧跟 --dist 的成对重启会把刚续写的 turn 二次掐死 →
   # 蓝绿下天然一次翻转一次重启,不会再成对重启。
-  build_release || { echo "✗ build_release 失败,未激活任何 release(live 未改)" >&2; exit 1; }
+  if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then
+    prebuilt_resume_load || { local resume_rc=$?; echo '✗ prebuilt resume rejected; no build fallback, live untouched' >&2; exit "$resume_rc"; }
+  else
+    build_release || { echo "✗ build_release 失败,未激活任何 release(live 未改)" >&2; exit 1; }
+  fi
   # 历史部署曾把 release 解成 775/664，并在共享 env 留 dev-only OPTIONAL=1。
   # 目标 release 已由 build_release 收紧后，先无重启地修 current+unit+env；即使后续
   # tuple/激活失败，未来意外重启也不会再无 baseline 裸奔。
@@ -8304,18 +8139,30 @@ deploy() {
     echo "  · 首次 direct timeline capability 升级改走普通单-master restart；runtime tuple 保持不变。"
     hc_bundle=0; hc_release=0; hc_any=0
   fi
+  if [[ -n "${RESUME_BUILT_RELEASE:-}" && ( "$hc_bundle" != 1 || "$hc_release" != 1 ) ]]; then
+    echo '✗ prebuilt resume requires both existing runtime/platform axes; tuple not changed' >&2; exit 1
+  fi
   if [[ "$hc_any" == 1 ]]; then
     echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release disable_bundle=$DISABLE_BUNDLE_FLAG disable_release=$DISABLE_RELEASE_FLAG)──"
+    if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then
+      prebuilt_resume_select_runtime || { local resume_rc=$?; echo '✗ prebuilt runtime selection rejected' >&2; exit "$resume_rc"; }
+    else
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
+    fi
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
   fi
+  commercial_wait_for_cutover_idle "$kp_previous_release" || { local idle_rc=$?; echo "✗ 未证明商业空窗,live 未切换" >&2; exit "$idle_rc"; }
+  if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then prebuilt_resume_recheck || exit $?; fi
   begin_planned_maintenance deploy "$RESTART_EGRESS"
   # RFC §1.2:进入不可逆翻转段(KP 门关闭 / release 激活 / egress)前活体断言远端 lease 仍持有。
   # 此刻 live master 仍未改,失活即 end maintenance 后干净退出(无 KP 门需回滚)。
   if ! assert_mutation_lease_alive "deploy-master-flip"; then
     echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
     exit 86
+  fi
+  if commercial_policy_enabled && [[ "$DRY" != 1 && "$hc_any" != 1 ]]; then
+    echo '✗ user-impact-only requires runtime saga; direct activation not attempted' >&2; exit 2
   fi
   echo "── Knowledge Planet Plugin:关闭跨版本执行门──"
   local kp_deploy_bracket=1
@@ -8394,7 +8241,9 @@ deploy() {
   fi
   local wb_deploy_bracket="$WEIBO_DEPLOY_BRACKET" wb_had_previous_plugin="$WEIBO_HAD_PREVIOUS_PLUGIN"
   if [[ "$hc_any" == 1 ]]; then
-    if ! activate_runtime_tuple; then
+    if activate_runtime_tuple; then :; else
+      local activation_rc=$?
+      case "$activation_rc" in 78|79) commercial_policy_keep_failed "$activation_rc"; exit $? ;; 86) exit 86 ;; esac
       require_mutation_lease_for_compensation "runtime-tuple-activation-recovery" || exit 86
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
         if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
@@ -8416,7 +8265,7 @@ deploy() {
       exit 1
     fi
   else
-    if ! activate_release "$BUILT_RELEASE"; then
+    if ! activate_release "$BUILT_RELEASE" --wait-user-idle; then
       require_mutation_lease_for_compensation "release-activation-gate-recovery" || exit 86
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
         if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
@@ -8448,6 +8297,7 @@ deploy() {
       if activate_egress_release "$BUILT_RELEASE" "$egress_prev_release"; then
         egress_switched=1
       else
+        local egress_activation_rc=$?; case "$egress_activation_rc" in 78|79|86) exit "$egress_activation_rc" ;; esac
         validation_failure="egress activation failed"
       fi
     fi
@@ -8487,6 +8337,7 @@ deploy() {
     fi
   fi
   if [[ -n "$validation_failure" ]]; then
+    commercial_policy_failure validation || exit $?
     echo "✗ $validation_failure；Plugin 门仍关闭，开始 source/DB 对称补偿" >&2
     # F7:补偿(恢复旧稳态)前 复核 lease,缩小与自愈 host-action 并发窗;失活则 crash-stop，禁止无 lease 补偿。
     require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
@@ -8518,9 +8369,10 @@ deploy() {
     weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
       "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
       "$wb_had_previous_plugin" "$kp_had_previous_plugin" "$kp_setup_plugin_version_id" \
-      || exit 1
+      || exit $?
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
+    commercial_policy_finish || exit $?
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
@@ -8531,9 +8383,10 @@ deploy() {
     weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
       "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
       "$wb_had_previous_plugin" "$kp_had_previous_plugin" \
-      || exit 1
+      || exit $?
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
+    commercial_policy_finish || exit $?
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=zero-touch)。"
@@ -8541,6 +8394,7 @@ deploy() {
   fi
   echo "── Knowledge Planet Plugin:消费加密交接 + 绑定账号 + 官方发布/install 升级 + 旧 Skill 加法迁移──"
   if ! knowledge_planet_plugin_seed "$BUILT_RELEASE"; then
+    commercial_policy_failure knowledge-planet-seed || exit $?
     echo "✗ Knowledge Planet Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
     # F7:同上,补偿前 复核 lease(helper 幂等,与上方 validation 补偿可安全连调)。
     require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
@@ -8559,9 +8413,10 @@ deploy() {
   weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
     "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
     "$wb_had_previous_plugin" "$kp_had_previous_plugin" \
-    || exit 1
+    || exit $?
   end_planned_maintenance
   smoke_sourcemap_sealed || exit 1
+  commercial_policy_finish || exit $?
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
   echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -8700,19 +8555,19 @@ activate_staged_inner() {
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
-    [[ "$image_codex_version" == "0.159.2" ]] || {
-      echo "✗ runtime image codex label=$image_codex_version,expected=0.159.2" >&2; exit 1;
+    [[ "$image_codex_version" == "0.163.0" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.163.0" >&2; exit 1;
     }
     [[ "$image_include_grok" == 1 ]] || {
       echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
     }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
-    [[ "$actual_codex_version" == "codex-cli 0.159.2" ]] || {
-      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.159.2'" >&2; exit 1;
+    [[ "$actual_codex_version" == "codex-cli 0.163.0" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.163.0'" >&2; exit 1;
     }
     actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
-    [[ "$actual_grok_version" == grok\ 1.0.5\ * ]] || {
-      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.5 (...)'" >&2; exit 1;
+    [[ "$actual_grok_version" == grok\ 1.0.62\ * ]] || {
+      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.62 (...)'" >&2; exit 1;
     }
     echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version,grok=$actual_grok_version"
   fi
@@ -8854,6 +8709,7 @@ deploy_dist() {
   end_planned_maintenance
   # dist(纯前端)是 UI 回归的最高发面(2026-07-18 附件事故即 --dist 上线),E2E 旅程门必跑。
   smoke_sourcemap_sealed || exit 1
+  commercial_policy_finish || exit $?
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
   echo "✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -10053,7 +9909,7 @@ SQL
 }
 
 current_egress_release() {
-  ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true
+  egress_running_cwd
 }
 
 # ── egress surface gate(2026-09-04 INC:cursor 子 agent 409 VERIFICATION_SPONSORSHIP_CONFLICT)──
@@ -11085,6 +10941,11 @@ abort_continue() {
 # ═════════ --recover:崩溃重跑,按 (phase, transition_step) 走 §8 恢复矩阵 ═════════
 recover() {
   echo "══ v5 --recover(按 §8 恢复矩阵从 (phase, transition_step) 续作)══"
+  if commercial_policy_enabled; then
+    resolve_active_lane
+    commercial_policy_recover
+    return $?
+  fi
   ds_snapshot
   local p="$DS_phase" s="$DS_transition_step" cand="${DS_candidate_slot:-}" old="$DS_active_slot"
   OP="${DS_operation_id:-p3-recover-$$}"
@@ -11403,11 +11264,10 @@ run_mutation_lane_supervised() { # <function> [args...]
     set +m
     close_mutation_lane_inherited_locks
     : >"$ready"
-    while same_supervised_process "$outer_pid" "$outer_start" \
-        && same_supervised_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
-        && same_supervised_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" \
-        && { same_supervised_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" \
-          || [[ -e "$anchor_release" ]]; }; do
+    while mutation_process_live outer supervised "$outer_pid" "$outer_start" \
+        && mutation_process_live lease-ssh supervised "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
+        && mutation_process_live lease-ttl supervised "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" \
+        && mutation_process_live anchor supervised "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" "$anchor_release"; do
       # Sentinel first, release file second. The sentinel exits only after the
       # leader has written the release file, so a sentinel seen gone here with
       # the file present is the controlled end. The other order could read "no
@@ -11638,7 +11498,7 @@ run_selected_mode() { # [mode]
     offline-recycle) assert_not_bluegreen_for_cutover; offline_recycle ;;
     stage)     assert_not_bluegreen_for_cutover; stage ;;
     activate-staged) assert_not_bluegreen_for_cutover; activate_staged ;;
-    rollback)  rollback ;;
+    rollback)  if commercial_policy_enabled; then commercial_policy_rollback; else rollback; fi ;;
     reclaim-mutation-lease) reclaim_production_mutation_lease ;;
     reclaim-mutation-inflight) reclaim_mutation_lane_inflight ;;
     canary)    canary ;;
@@ -11854,6 +11714,8 @@ fi
 maybe_run_ci_green_gate_for_mode || exit 1
 # egress surface gate 同样在 lease 外、只读:egress 面有变更却没带 --egress 直接拒,别等构建完才发现。
 assert_egress_surface_covered || exit 1
+if [[ -n "${RESUME_BUILT_RELEASE:-}" ]]; then prebuilt_resume_prepare || exit 1; fi
+v5_host_admission_for_mode || exit 1
 
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。
 case "$MODE" in

@@ -80,6 +80,8 @@ interface SetupSession {
   stateBuffer: Buffer | null
   handle: KnowledgePlanetLoginWorkerHandle | null
   completion: Promise<void> | null
+  stopPromise: Promise<void> | null
+  expiryTimer: NodeJS.Timeout | null
   accountId: string | null
   errorCode: string | null
   agentReady: boolean
@@ -253,6 +255,14 @@ export class KnowledgePlanetSetupManager {
   }
 
   private failSession(session: SetupSession, code = 'SETUP_FAILED'): void {
+    console.warn('knowledge_planet.setup_failed', {
+      sessionId: session.id,
+      stage: session.phase,
+      code,
+    })
+    // Also fence late callbacks when done rejects without a terminal frame.
+    session.terminal ??= 'failed'
+    this.clearExpiry(session)
     wipe(session.qr)
     session.qr = null
     wipe(session.stateBuffer)
@@ -260,6 +270,25 @@ export class KnowledgePlanetSetupManager {
     session.status = 'failed'
     session.phase = 'failed'
     session.errorCode = code
+  }
+
+  private clearExpiry(session: SetupSession): void {
+    if (session.expiryTimer) clearTimeout(session.expiryTimer)
+    session.expiryTimer = null
+  }
+
+  private stopSession(session: SetupSession): Promise<void> {
+    this.clearExpiry(session)
+    // Failure/cancel may arrive synchronously before startLogin returns its handle.
+    if (!session.handle) return Promise.resolve()
+    if (!session.stopPromise) {
+      session.stopPromise = session.handle.stop().catch(() => {
+        console.warn('knowledge_planet.setup_cleanup_failed', { sessionId: session.id })
+        // Keep the runtime reservation; a later cancel/retry may retry cleanup.
+        session.stopPromise = null
+      })
+    }
+    return session.stopPromise
   }
 
   async start(userIdInput: number, acceptTerms: boolean): Promise<KnowledgePlanetSetupView> {
@@ -289,6 +318,8 @@ export class KnowledgePlanetSetupManager {
       // recover the private session id instead of being locked out until TTL.
       if (current && ['waiting_for_scan', 'finalizing'].includes(current.status))
         return this.view(current)
+      if (current && ['failed', 'expired', 'cancelled'].includes(current.status))
+        await this.stopSession(current)
       // A terminal setup is only a UI/history cache. The encrypted account row
       // remains authoritative: unlink may happen immediately after success, so
       // retaining an `active` session must never block re-authorization for the
@@ -330,18 +361,27 @@ export class KnowledgePlanetSetupManager {
       stateBuffer: null,
       handle: null,
       completion: null,
+      stopPromise: null,
+      expiryTimer: null,
       accountId: null,
       errorCode: null,
       agentReady: entitled.agentReady,
     }
     this.sessions.set(session.id, session)
     this.currentByUser.set(userId, session.id)
+    // Expiration must not depend on a browser continuing to poll.
+    session.expiryTimer = setTimeout(() => void this.expireIfNeeded(session), SETUP_TTL_MS)
+    session.expiryTimer.unref()
     try {
       const handle = await this.service.startLogin({
         sessionId: session.id,
         pins,
         deadlineMs: session.expiresAt,
         onQr: (png) => {
+          if (this.now() >= session.expiresAt) {
+            void this.expireIfNeeded(session)
+            return
+          }
           if (session.terminal !== null || session.status !== 'waiting_for_scan') return
           wipe(session.qr)
           session.qr = Buffer.from(png)
@@ -349,7 +389,12 @@ export class KnowledgePlanetSetupManager {
           session.phase = 'waiting_for_scan'
         },
         onAuthenticated: (state) => {
+          if (this.now() >= session.expiresAt) {
+            void this.expireIfNeeded(session)
+            return
+          }
           if (!claim(session, 'authenticated')) return
+          this.clearExpiry(session)
           wipe(session.qr)
           session.qr = null
           try {
@@ -359,6 +404,7 @@ export class KnowledgePlanetSetupManager {
             session.phase = 'scan_confirmed'
           } catch {
             this.failSession(session)
+            void this.stopSession(session)
           }
         },
         onFailed: (code) => {
@@ -369,11 +415,23 @@ export class KnowledgePlanetSetupManager {
           session.status = terminal === 'expired' ? 'expired' : 'failed'
           session.phase = terminal === 'expired' ? 'expired' : 'failed'
           session.errorCode = code
+          if (terminal === 'failed' && session.qrRevision === 0)
+            session.errorCode = code === 'QR_GENERATION_TIMEOUT' ? code : 'QR_GENERATION_FAILED'
+          console.warn('knowledge_planet.setup_failed', {
+            sessionId: session.id,
+            stage: session.qrRevision === 0 ? 'generating_qr' : 'waiting_for_scan',
+            code: session.errorCode,
+          })
+          void this.stopSession(session)
         },
       })
       session.handle = handle
       session.completion = handle.done
         .then(async () => {
+          if (session.terminal === null) {
+            this.failSession(session, session.qrRevision === 0 ? 'QR_GENERATION_FAILED' : 'SETUP_FAILED')
+            return
+          }
           if (session.terminal !== 'authenticated' || session.status !== 'finalizing') return
           const stateBuffer = session.stateBuffer
           session.stateBuffer = null
@@ -408,13 +466,18 @@ export class KnowledgePlanetSetupManager {
           }
         })
         .catch(() => {
-          if (session.status === 'waiting_for_scan' || session.status === 'finalizing')
-            this.failSession(session)
+          if (session.status === 'waiting_for_scan' || session.status === 'finalizing') {
+            this.failSession(session, session.qrRevision === 0 ? 'QR_GENERATION_FAILED' : 'SETUP_FAILED')
+            void this.stopSession(session)
+          }
         })
+      if (['failed', 'expired', 'cancelled'].includes(session.status))
+        await this.stopSession(session)
       return this.view(session)
     } catch (error) {
+      this.clearExpiry(session)
       this.sessions.delete(session.id)
-      this.currentByUser.delete(userId)
+      if (this.currentByUser.get(userId) === session.id) this.currentByUser.delete(userId)
       wipe(session.qr)
       wipe(session.stateBuffer)
       if (error instanceof KnowledgePlanetRuntimeError && error.code === 'CAPACITY_EXCEEDED')
@@ -429,12 +492,17 @@ export class KnowledgePlanetSetupManager {
   private async expireIfNeeded(session: SetupSession): Promise<void> {
     if (session.status !== 'waiting_for_scan' || this.now() < session.expiresAt) return
     if (!claim(session, 'expired')) return
-    session.status = 'expired'
-    session.phase = 'expired'
-    session.errorCode = 'LOGIN_EXPIRED'
+    session.status = session.qrRevision === 0 ? 'failed' : 'expired'
+    session.phase = session.status
+    session.errorCode = session.qrRevision === 0 ? 'QR_GENERATION_TIMEOUT' : 'LOGIN_EXPIRED'
+    console.warn('knowledge_planet.setup_expired', {
+      sessionId: session.id,
+      stage: session.qrRevision === 0 ? 'generating_qr' : 'waiting_for_scan',
+      code: session.errorCode,
+    })
     wipe(session.qr)
     session.qr = null
-    await session.handle?.stop().catch(() => {})
+    await this.stopSession(session)
   }
 
   async status(userIdInput: number, sessionId: string): Promise<KnowledgePlanetSetupView> {
@@ -460,8 +528,8 @@ export class KnowledgePlanetSetupManager {
       session.qr = null
       wipe(session.stateBuffer)
       session.stateBuffer = null
-      await session.handle?.stop().catch(() => {})
     }
+    if (['failed', 'expired', 'cancelled'].includes(session.status)) await this.stopSession(session)
     return this.view(session)
   }
 
@@ -477,8 +545,8 @@ export class KnowledgePlanetSetupManager {
         session.qr = null
         wipe(session.stateBuffer)
         session.stateBuffer = null
-        if (session.handle) stops.push(session.handle.stop().catch(() => {}))
       }
+      if (['failed', 'expired', 'cancelled'].includes(session.status)) stops.push(this.stopSession(session))
     }
     await Promise.all(stops)
     await Promise.all(

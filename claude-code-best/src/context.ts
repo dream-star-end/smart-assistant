@@ -2,7 +2,9 @@ import { feature } from 'bun:bundle'
 import memoize from 'lodash-es/memoize.js'
 import {
   getAdditionalDirectoriesForClaudeMd,
+  getLastEmittedDate,
   setCachedClaudeMdContent,
+  setLastEmittedDate,
 } from './bootstrap/state.js'
 import { getLocalISODate } from './constants/common.js'
 import {
@@ -16,6 +18,12 @@ import { execFileNoThrow } from './utils/execFileNoThrow.js'
 import { getBranch, getDefaultBranch, getIsGit, gitExe } from './utils/git.js'
 import { shouldIncludeGitInstructions } from './utils/gitSettings.js'
 import { logError } from './utils/log.js'
+import {
+  getFrozenSystemContext,
+  getFrozenUserContext,
+  recordSystemContext,
+  recordUserContext,
+} from './utils/openclaudeContextFreeze.js'
 
 const MAX_STATUS_CHARS = 1000
 
@@ -117,6 +125,14 @@ export const getSystemContext = memoize(
   async (): Promise<{
     [k: string]: string
   }> => {
+    // OCV5-755: a respawned OpenClaude process reuses the session's snapshot
+    // so the cached prefix survives the restart (the cache-breaker is ant-only).
+    const breakingCache = feature('BREAK_CACHE_COMMAND')
+      ? getSystemPromptInjection() !== null
+      : false
+    const frozen = breakingCache ? null : getFrozenSystemContext()
+    if (frozen) return frozen
+
     const startTime = Date.now()
     logForDiagnosticsNoPII('info', 'system_context_started')
 
@@ -138,7 +154,7 @@ export const getSystemContext = memoize(
       has_injection: injection !== null,
     })
 
-    return {
+    const systemContext = {
       ...(gitStatus && { gitStatus }),
       ...(feature('BREAK_CACHE_COMMAND') && injection
         ? {
@@ -146,6 +162,8 @@ export const getSystemContext = memoize(
           }
         : {}),
     }
+    if (!breakingCache) recordSystemContext(systemContext)
+    return systemContext
   },
 )
 
@@ -156,6 +174,15 @@ export const getUserContext = memoize(
   async (): Promise<{
     [k: string]: string
   }> => {
+    const frozen = getFrozenUserContext()
+    if (frozen) {
+      setCachedClaudeMdContent(frozen.ctx.claudeMd || null)
+      // The frozen prefix keeps its start date; let date_change tell the model
+      // at the tail when today differs (same contract as a long live process).
+      if (frozen.localDate && getLastEmittedDate() === null) setLastEmittedDate(frozen.localDate)
+      return frozen.ctx
+    }
+
     const startTime = Date.now()
     logForDiagnosticsNoPII('info', 'user_context_started')
 
@@ -181,9 +208,12 @@ export const getUserContext = memoize(
       claudemd_disabled: Boolean(shouldDisableClaudeMd),
     })
 
-    return {
+    const localDate = getLocalISODate()
+    const userContext = {
       ...(claudeMd && { claudeMd }),
-      currentDate: `Today's date is ${getLocalISODate()}.`,
+      currentDate: `Today's date is ${localDate}.`,
     }
+    recordUserContext(userContext, localDate)
+    return userContext
   },
 )

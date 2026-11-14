@@ -45,6 +45,17 @@ const CC5_CONTROLLER_PATH = fileURLToPath(
 
 const CODEX_CONTROLLER_PATH = fileURLToPath(new URL('../../../../scripts/agent-remote/codex-host-controller.py', import.meta.url))
 
+/**
+ * Probe budget for one SSH probe round-trip.
+ *
+ * The first cold probe on a fresh node runs the hostd probe (engine discovery, app-server
+ * start, per-profile model/list) and took >15s on the live Codex node while the warm probe
+ * took ~8s; the old hardcoded 15s killed the cold run with REMOTE_SSH_PROBE_TIMEOUT. 45s
+ * covers a cold start with headroom while staying bounded (the SSH connection itself is
+ * still capped at 10s per attempt, and every probe path clears this timer on close/error).
+ */
+export const REMOTE_SSH_PROBE_TIMEOUT_MS = 45_000
+
 export const REMOTE_BRAIN_ENGINES = ['cc', 'codex', 'antigravity', 'grok-build'] as const
 export type RemoteBrainEngine = (typeof REMOTE_BRAIN_ENGINES)[number]
 
@@ -892,27 +903,31 @@ export async function placeRemoteLane(
       FROM remote_agent_bindings WHERE uid=$1 AND session_key=$2 AND engine=$3 ORDER BY updated_at DESC LIMIT 1`,
     [input.uid,input.sessionKey,engine])).rows[0]
     const eligible: typeof candidates = []
-    let capacityBlocked = false
+    const full = new Set<string>()
     for (const row of candidates) {
       if (engine === 'codex' && !codexExecutionReady(row)) continue
       // `unknown` and every other un-released state still occupies a slot of its own pool:
       // a stop that cannot be proven must not free capacity for a new lane.
       const used = (await client.query(`SELECT COUNT(*)::int AS profile_used
         FROM remote_agent_bindings WHERE profile_id=$1 AND state<>'released'`, [row.profile_id])).rows[0]
-      if (Number(used.profile_used) >= Number(row.max_concurrent_lanes)) capacityBlocked = true
+      if (Number(used.profile_used) >= Number(row.max_concurrent_lanes)) full.add(String(row.profile_id))
       else eligible.push(row)
     }
+    // A full pool names the profiles whose freed slot would place this chat, so the caller can
+    // reclaim a lane that actually ends the wait.
+    const exhausted = (profiles: string[]) => Object.assign(new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'), { profiles })
     let row: Record<string, any> | undefined
     if (sticky) {
       row = eligible.find(r => String(r.profile_id) === sticky.profile_id)
-      if (!row) throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
+      // A home profile that is only full is a capacity wait, which a reclaimed lane can end.
+      if (!row) throw full.has(sticky.profile_id) ? exhausted([sticky.profile_id]) : new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
     } else {
       const ranked = rankRemotePoolCandidates(eligible.map(r => ({ profileId: String(r.profile_id),nodeId: String(r.node_id),
         engine:r.engine,profileName:r.profile_name,weight:Number(r.weight),healthScore:Number(r.health_score),
         hotSlots:Number(r.hot_slots),activeSlots:Number(r.active_slots),maxHotSlots:Number(r.max_hot_slots),
         maxActiveSlots:Number(r.max_concurrent_lanes),nodeRttMsP50:r.rtt_ms_p50 })), `${input.uid}:${input.sessionKey}:${input.canonicalModel}`)
       row = eligible.find(r => String(r.profile_id) === ranked[0]?.profileId)
-      if (!row) throw new Error(capacityBlocked ? 'REMOTE_LANE_CAPACITY_EXHAUSTED' : 'NO_ELIGIBLE_REMOTE_PROFILE')
+      if (!row) throw full.size ? exhausted([...full]) : new Error('NO_ELIGIBLE_REMOTE_PROFILE')
     }
     const operationId = sticky?.operation_id ?? randomUUID(), runId = sticky?.run_id ?? randomUUID()
     if (engine === 'codex' && sticky) {
@@ -1063,7 +1078,7 @@ async function runSshMuxProbeOnce(input: {
         child.kill('SIGKILL')
       } catch {}
       rejectOut(new Error('REMOTE_SSH_PROBE_TIMEOUT'))
-    }, 15000)
+    }, REMOTE_SSH_PROBE_TIMEOUT_MS)
     child.stdout.on('data', (c: Buffer) => outChunks.push(Buffer.from(c)))
     child.stderr.on('data', (c: Buffer) => errChunks.push(Buffer.from(c)))
     child.once('error', (err) => {
@@ -1164,7 +1179,7 @@ async function runCc5LegacyReadonlyProbeOnce(input: {
         child.kill('SIGKILL')
       } catch {}
       rejectOut(new Error('REMOTE_SSH_PROBE_TIMEOUT'))
-    }, 15000)
+    }, REMOTE_SSH_PROBE_TIMEOUT_MS)
     child.stdout.on('data', (c: Buffer) => outChunks.push(Buffer.from(c)))
     child.stderr.on('data', (c: Buffer) => errChunks.push(Buffer.from(c)))
     child.once('error', (err) => {

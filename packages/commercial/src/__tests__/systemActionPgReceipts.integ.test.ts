@@ -1,3 +1,4 @@
+import { readMigrationSource } from "./helpers/migrationSource.js";
 /** Real commits/rollbacks in one new private schema. No shared resets or product account access. */
 import assert from 'node:assert/strict'
 import { randomBytes, randomUUID } from 'node:crypto'
@@ -29,7 +30,7 @@ before(async () => {
   await pool.query('CREATE TABLE user_preferences (user_id bigint PRIMARY KEY,prefs jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now())')
   await pool.query('CREATE TABLE receipt_effect_counter (id integer PRIMARY KEY,n integer NOT NULL)')
   await pool.query('INSERT INTO receipt_effect_counter VALUES(1,0)')
-  await pool.query(readFileSync(new URL('../db/migrations/0327_system_action_receipts.sql', import.meta.url), 'utf8'))
+  await pool.query(readMigrationSource("0327_system_action_receipts"))
   setPoolOverride(pool)
 })
 after(async () => { await closePool(); await admin.end() }) // Retain the uniquely named proof schema.

@@ -140,4 +140,3 @@ export function expandHydratedRuntimeBatch<Row extends RuntimeBatchRow>(
     descriptor: { batchId: row.msg_id, logicalCount, manifestSha256 },
   };
 }
-

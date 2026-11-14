@@ -23,6 +23,10 @@ import { CcbAdapter } from '../engine/ccbAdapter.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { SubprocessRunner } from '../subprocessRunner.js'
 
+// These cases drive the dispatch machinery itself; OCV5-755 moved the
+// default dispatch to the pre-expiry timer, so pin the legacy timing here.
+process.env.OC_BOX_IDLE_PRE_EXPIRY_MS = 'off'
+
 const finish = (SessionManager.prototype as unknown as {
   finishIdleUnderLock: (
     this: { _idleRunning?: boolean },

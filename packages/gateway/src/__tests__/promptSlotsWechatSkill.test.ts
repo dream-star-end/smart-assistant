@@ -39,7 +39,8 @@ describe('WeChat channel operation skill prompt', () => {
     assert.match(slot.content, /## 浏览器操作 \(CLI\)/)
     assert.match(slot.content, /oc-browser open <url>/)
     assert.match(slot.content, /oc-browser snapshot/)
-    assert.match(slot.content, /oc-browser fill <ref>/)
+    // The CLI name is established by open/snapshot; the compact workflow abbreviates subcommands.
+    assert.match(slot.content, /`fill <ref> "<文本>"`/)
     assert.match(slot.content, /skill_view\("browser"\)/)
     assert.doesNotMatch(slot.content, /browser_navigate|browser_snapshot/)
   })

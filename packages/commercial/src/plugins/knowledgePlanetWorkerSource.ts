@@ -1,4 +1,11 @@
+import { KNOWLEDGE_PLANET_LOGIN_DIAGNOSTIC_SOURCE } from './knowledgePlanetLoginDiagnostics.js'
+
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS = 3_000
+// WeChat qrconnect long-polls GET lp.open.weixin.qq.com/connect/l/qrconnect and only
+// returns (typically wx_errcode=408) after ~20s when unscanned. Node socket idle
+// timeouts abort the CONNECT tunnel if shorter than that, so the iframe never sees
+// a later scan/confirm and never redirects to wx.zsxq.com/load.
+export const KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS = 60_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS = 5_000
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_MAX_ATTEMPTS = 48
 export const KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS = 45_000
@@ -124,6 +131,10 @@ const MAX_OUTPUT = ${KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES};
 const MAX_STATE_JSON = ${KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES};
 const NUMERIC_ID = /^\d{6,32}$/;
 let terminal = false;
+let loginMode = false;
+const loginDiagnostic = { stage: 'launch', reason: 'unknown' };
+
+${KNOWLEDGE_PLANET_LOGIN_DIAGNOSTIC_SOURCE}
 
 ${KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE}
 ${KNOWLEDGE_PLANET_WRITE_REQUEST_SOURCE}
@@ -199,7 +210,7 @@ function brokerFrame(token, host, port) {
 
 async function startRelay(token, allowedHosts) {
   const server = createServer((client) => {
-    client.setTimeout(15_000, () => client.destroy());
+    client.setTimeout(${KNOWLEDGE_PLANET_RELAY_IDLE_TIMEOUT_MS}, () => client.destroy());
     let pending = Buffer.alloc(0);
     const readConnect = (chunk) => {
       pending = Buffer.concat([pending, chunk]);
@@ -1116,7 +1127,7 @@ async function captureQr(page, qrButton, switchButton, captureDeadline) {
       for (let i = 0; i < count; i += 1) {
         const image = images.nth(i);
         if (!await beforeCaptureDeadline(() => image.isVisible(), captureDeadline).catch(() => false)) continue;
-        const encodedQr = await beforeCaptureDeadline(
+        const ready = await beforeCaptureDeadline(
           () => image.evaluate(
             (element) => {
               if (!element.complete || element.naturalWidth < 180 || element.naturalHeight < 180) return null;
@@ -1130,54 +1141,79 @@ async function captureQr(page, qrButton, switchButton, captureDeadline) {
               if (bounds.width < 180 || bounds.height < 180) return null;
               if (Math.abs(bounds.width - bounds.height) > Math.max(bounds.width, bounds.height) * 0.05) return null;
               if (document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2) !== element) return null;
-              const sample = document.createElement('canvas');
-              sample.width = 128;
-              sample.height = 128;
-              const sampleContext = sample.getContext('2d', { willReadFrequently: true });
-              if (!sampleContext) return null;
-              sampleContext.fillStyle = '#fff';
-              sampleContext.fillRect(0, 0, sample.width, sample.height);
-              sampleContext.imageSmoothingEnabled = false;
-              sampleContext.drawImage(element, 0, 0, sample.width, sample.height);
-              const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
-              let dark = 0;
-              let light = 0;
-              let luminanceSum = 0;
-              let luminanceSquareSum = 0;
-              const pixelCount = pixels.length / 4;
-              for (let index = 0; index < pixels.length; index += 4) {
-                const luminance = 0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2];
-                if (luminance < 96) dark += 1;
-                if (luminance > 224) light += 1;
-                luminanceSum += luminance;
-                luminanceSquareSum += luminance * luminance;
-              }
-              const mean = luminanceSum / pixelCount;
-              const deviation = Math.sqrt(Math.max(0, luminanceSquareSum / pixelCount - mean * mean));
-              if (dark / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION} || light / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION} || deviation < ${KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION}) return null;
-              const output = document.createElement('canvas');
-              output.width = element.naturalWidth;
-              output.height = element.naturalHeight;
-              const outputContext = output.getContext('2d');
-              if (!outputContext) return null;
-              outputContext.fillStyle = '#fff';
-              outputContext.fillRect(0, 0, output.width, output.height);
-              outputContext.imageSmoothingEnabled = false;
-              outputContext.drawImage(element, 0, 0, output.width, output.height);
-              const dataUrl = output.toDataURL('image/png');
-              const prefix = 'data:image/png;base64,';
-              const encoded = dataUrl.startsWith(prefix) ? dataUrl.slice(prefix.length) : '';
-              return encoded.length > 0 && encoded.length <= Math.ceil(512 * 1024 / 3) * 4 ? encoded : null;
+              return true;
             },
             undefined,
             { timeout: remainingCaptureTimeout(captureDeadline) },
           ),
           captureDeadline,
-        ).catch(() => null);
-        if (!encodedQr || !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedQr) || encodedQr.length % 4 !== 0) continue;
-        const png = Buffer.from(encodedQr, 'base64');
-        if (png.toString('base64') !== encodedQr || png.length > 512 * 1024) continue;
+        ).catch((error) => {
+          const reason = loginFailureReason(error);
+          if (reason !== 'unknown') loginDiagnostic.reason = reason;
+          return null;
+        });
+        if (!ready) {
+          if (loginDiagnostic.reason === 'unknown') loginDiagnostic.reason = 'image_not_ready';
+          continue;
+        }
+        // Element screenshot avoids tainted-canvas SecurityError on cross-origin WeChat QR <img>.
+        // Live and verify share this path; do not draw the remote <img> into canvas.
+        const png = await beforeCaptureDeadline(
+          () => image.screenshot({ type: 'png', timeout: remainingCaptureTimeout(captureDeadline) }),
+          captureDeadline,
+        ).catch((error) => {
+          const reason = loginFailureReason(error);
+          if (reason !== 'unknown') loginDiagnostic.reason = reason;
+          return null;
+        });
+        if (!png || !Buffer.isBuffer(png) || png.length < 256 || png.length > 512 * 1024) {
+          if (loginDiagnostic.reason === 'unknown') loginDiagnostic.reason = 'image_not_ready';
+          continue;
+        }
         if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) continue;
+        const sampleOk = await beforeCaptureDeadline(
+          () => page.evaluate(
+            ({ encoded }) => new Promise((resolve) => {
+              const probe = new Image();
+              probe.onload = () => {
+                const sample = document.createElement('canvas');
+                sample.width = 128;
+                sample.height = 128;
+                const sampleContext = sample.getContext('2d', { willReadFrequently: true });
+                if (!sampleContext) return resolve(null);
+                sampleContext.fillStyle = '#fff';
+                sampleContext.fillRect(0, 0, sample.width, sample.height);
+                sampleContext.imageSmoothingEnabled = false;
+                sampleContext.drawImage(probe, 0, 0, sample.width, sample.height);
+                const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
+                let dark = 0;
+                let light = 0;
+                let luminanceSum = 0;
+                let luminanceSquareSum = 0;
+                const pixelCount = pixels.length / 4;
+                for (let index = 0; index < pixels.length; index += 4) {
+                  const luminance = 0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2];
+                  if (luminance < 96) dark += 1;
+                  if (luminance > 224) light += 1;
+                  luminanceSum += luminance;
+                  luminanceSquareSum += luminance * luminance;
+                }
+                const mean = luminanceSum / pixelCount;
+                const deviation = Math.sqrt(Math.max(0, luminanceSquareSum / pixelCount - mean * mean));
+                if (dark / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_DARK_FRACTION} || light / pixelCount < ${KNOWLEDGE_PLANET_QR_MIN_LIGHT_FRACTION} || deviation < ${KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION}) return resolve(null);
+                resolve(true);
+              };
+              probe.onerror = () => resolve(null);
+              probe.src = 'data:image/png;base64,' + encoded;
+            }),
+            { encoded: png.toString('base64') },
+          ),
+          captureDeadline,
+        ).catch(() => null);
+        if (!sampleOk) {
+          if (loginDiagnostic.reason === 'unknown') loginDiagnostic.reason = 'image_not_ready';
+          continue;
+        }
         remainingCaptureTimeout(captureDeadline);
         return png;
       }
@@ -1191,20 +1227,21 @@ async function captureQr(page, qrButton, switchButton, captureDeadline) {
 }
 
 async function runLogin(input, relay) {
-  const allowed = new Set(input.allowedOrigins.map((origin) => new URL(origin).origin));
-  const browser = await chromium.launch({
-    headless: true,
-    proxy: { server: relay.proxy },
-    args: [
-      '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking',
-      '--disable-breakpad', '--disable-component-update', '--disable-default-apps',
-      '--disable-domain-reliability', '--disable-extensions', '--disable-features=AutofillServerCommunication,MediaRouter,OptimizationHints,Translate',
-      '--disable-quic', '--disable-sync', '--metrics-recording-only', '--no-first-run',
-      '--no-default-browser-check', '--no-pings', '--password-store=basic',
-      '--use-mock-keychain', '--webrtc-ip-handling-policy=disable_non_proxied_udp',
-    ],
-  });
+  let browser;
   try {
+    const allowed = new Set(input.allowedOrigins.map((origin) => new URL(origin).origin));
+    browser = await chromium.launch({
+      headless: true,
+      proxy: { server: relay.proxy },
+      args: [
+        '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking',
+        '--disable-breakpad', '--disable-component-update', '--disable-default-apps',
+        '--disable-domain-reliability', '--disable-extensions', '--disable-features=AutofillServerCommunication,MediaRouter,OptimizationHints,Translate',
+        '--disable-quic', '--disable-sync', '--metrics-recording-only', '--no-first-run',
+        '--no-default-browser-check', '--no-pings', '--password-store=basic',
+        '--use-mock-keychain', '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+      ],
+    });
     const context = await browser.newContext({
       locale: 'zh-CN', timezoneId: 'Asia/Shanghai', viewport: { width: 1280, height: 900 },
       serviceWorkers: 'block', storageState: { cookies: [], origins: [] },
@@ -1218,7 +1255,18 @@ async function runLogin(input, relay) {
       return route.continue();
     });
     if (typeof page.routeWebSocket === 'function') await page.routeWebSocket('**/*', (socket) => socket.close());
+    loginDiagnostic.stage = 'navigate';
+    page.on('requestfailed', (request) => {
+      const reason = loginFailureReason({ message: request.failure()?.errorText });
+      if (reason !== 'unknown') loginDiagnostic.reason = reason;
+    });
+    page.on('response', (response) => {
+      // Unauthenticated /self 401 is expected; only QR document/image failures matter.
+      if (response.status() >= 400 && ['document', 'image'].includes(response.request().resourceType()))
+        loginDiagnostic.reason = 'http_error';
+    });
     await page.goto('https://wx.zsxq.com/login', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    loginDiagnostic.stage = 'capture_qr';
     const qrCaptureDeadline = Math.min(input.deadlineMs, Date.now() + ${KNOWLEDGE_PLANET_QR_CAPTURE_TIMEOUT_MS});
     const qrButton = page.getByRole('button', { name: /获取登录二维码/ }).first();
     const switchButton = page.getByText('切换至微信登录', { exact: true }).first();
@@ -1229,6 +1277,8 @@ async function runLogin(input, relay) {
     if (qr.length > 512 * 1024) throw new Error('qr');
     remainingCaptureTimeout(qrCaptureDeadline);
     writeFrame({ event: 'qr', png: qr.toString('base64') });
+    loginDiagnostic.stage = 'wait_scan';
+    loginDiagnostic.reason = 'unknown';
     let lastQrHash = createHash('sha256').update(qr).digest('hex');
     let nextQrRecaptureAt = Date.now() + ${KNOWLEDGE_PLANET_QR_RECAPTURE_INTERVAL_MS};
     let nextProbeAt = Date.now() + ${KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS};
@@ -1270,15 +1320,22 @@ async function runLogin(input, relay) {
       }
       await page.waitForTimeout(1000);
     }
-    writeFrame({ event: 'failed', code: 'LOGIN_EXPIRED' });
-    terminal = true;
+    await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
+  } catch (error) {
+    const reason = loginFailureReason(error);
+    const code = loginDiagnostic.stage === 'wait_scan' ? 'WORKER_FAILED'
+      : reason === 'timeout' ? 'QR_GENERATION_TIMEOUT' : 'QR_GENERATION_FAILED';
+    await writeTerminalAndExit({ event: 'failed', code, diagnostic: {
+      stage: loginDiagnostic.stage, reason: loginDiagnostic.reason === 'unknown' ? reason : loginDiagnostic.reason,
+    } });
   } finally {
-    await browser.close();
+    await browser?.close();
   }
 }
 
 try {
   const input = await readFrame();
+  loginMode = input.mode === 'login';
   const required = input.mode === 'action'
     ? ['actionId', 'cookieDomains', 'deadlineMs', 'mode', 'params', 'stateOrigins', 'storageState', 'token']
     : ['allowedOrigins', 'cookieDomains', 'deadlineMs', 'mode', 'stateOrigins', 'token'];
@@ -1298,7 +1355,8 @@ try {
     await relay.close();
   }
   if (!terminal) fail();
-} catch {
-  fail();
+} catch (error) {
+  if (loginMode) await writeTerminalAndExit({ event: 'failed', code: 'QR_GENERATION_FAILED', diagnostic: { stage: loginDiagnostic.stage, reason: loginFailureReason(error) } });
+  else fail();
 }
 `

@@ -241,6 +241,16 @@ export type IncidentWire = {
   ts: number;
 };
 
+/** OCV5-591 A2-1c-2 studio activity (master-authored; a hint for the studio page to reload). */
+export type StudioEventWire = {
+  type: "sys.studio_event";
+  projectId: string;
+  status: string;
+  event: { id: string; type: string; ts: string; message: string | null };
+};
+
+export type MuseResultWire = { type: "sys.muse_result"; sessionId: string; jobId: string; ts: number };
+
 export type MediaJobWire = {
   type: "sys.media_job";
   job: MediaGenerationJob;
@@ -361,6 +371,7 @@ export type OutboundWire =
   | OutboundResumeFailedWire
   | OutboundSessionSnapshotWire
   | OutboundTurnStatusWire
+  | OutboundSessionSnapshot
   | OutboundTurnUsageWire
   | OutboundCallUsageWire
   | OutboundControlReceiptWire
@@ -375,7 +386,9 @@ export type OutboundWire =
   | ContextRebuiltWire
   | GoalSnapshotWire
   | IncidentWire
+  | MuseResultWire
   | MediaJobWire
+  | StudioEventWire
   | RecoveryDecisionWire
   | RecoveryStatusWire
   | AckWire

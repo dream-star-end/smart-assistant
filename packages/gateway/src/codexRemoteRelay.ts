@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events'
 import { constants, closeSync, fsyncSync, mkdirSync, openSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { assertLeaseMatchesAuthority, verifyAuthority, verifyTurnLease, sameRemoteExecutionBackend,
   type AuthorityKeyring, type ModelAuthorityPayload } from '@openclaude/protocol'
@@ -45,6 +46,8 @@ export class CodexRemoteRelay {
   private appSeq = 0
   private socketSeq = 0
   private outputSeq = 0
+  /** The highest output seq a /poll has handed to the container. */
+  private servedSeq = 0
   private recordSeq = 0
   private output: Array<{ seq: number; frame: unknown }> = []
   private outputBytes = 0
@@ -55,7 +58,15 @@ export class CodexRemoteRelay {
    * admission is recognized by its epoch and dropped: it must never collide with the fresh
    * kernel's own numbering.
    */
-  private readonly laneIds = new Map<number, { kernelId: unknown; method: string; epoch: number }>()
+  private readonly laneIds = new Map<number, { kernelId: unknown; method: string; epoch: number; instructions?: string }>()
+  /**
+   * The native app only reads a thread's instructions when it loads the thread: a resume of a
+   * thread it still holds keeps the old ones. `loadedInstructions` is what the node loaded the
+   * current thread with (undefined = not loaded, or loaded with unknown instructions).
+   */
+  private threadLoaded = false
+  private loadedInstructions?: string
+  private unloading?: { id: number; resolve: () => void; reject: (e: Error) => void; closed: boolean; acked: boolean }
   private laneIdSeq = 0
   private epoch = 0
   private readonly usedIds = new Set<string>()
@@ -88,6 +99,13 @@ export class CodexRemoteRelay {
     this.record('binding', { binding, spec })
   }
   get stopped(): boolean { return this.revoked }
+  /**
+   * No admission is being started or served and every frame (a settled turn's terminal too) has
+   * reached the container: stopping the lane cannot cut a turn short.
+   */
+  get idle(): boolean {
+    return !this.revoked && !this.starting && !this.active && !this.unloading && this.servedSeq === this.outputSeq
+  }
   private record(kind: string, value: unknown): void {
     const fd = openSync(join(this.journal, `${String(++this.recordSeq).padStart(8,'0')}-${kind}.json`),
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
@@ -103,6 +121,8 @@ export class CodexRemoteRelay {
     }
     this.revoked = true
     this.observation?.revoke(this.firstCause)
+    // A fenced lane cannot prove an unload any more; fail the waiting resume now, not on the timer.
+    this.unloading?.reject(new Error(this.firstCause))
     void this.stop().catch(() => {})
   }
   private scope(v: any, expired = false): void {
@@ -280,6 +300,24 @@ export class CodexRemoteRelay {
     }
     this.observation!.observe(frame)
     let out = frame
+    const unloading = this.unloading
+    if (unloading && frame.id === unloading.id) {
+      codexNeed(frame.method === undefined && !frame.error &&
+        ['unsubscribed', 'notLoaded'].includes(frame.result?.status), 'CODEX_THREAD_UNLOAD_UNPROVEN')
+      this.laneIds.delete(frame.id)
+      unloading.acked = true
+      if (frame.result.status === 'notLoaded') unloading.closed = true
+      if (unloading.closed) unloading.resolve()
+      return
+    }
+    if (unloading && ['thread/closed', 'thread/status/changed'].includes(frame.method)) {
+      codexNeed(frame.params?.threadId === this.thread, 'CODEX_THREAD_UNLOAD_UNPROVEN')
+      if (frame.method === 'thread/closed') {
+        unloading.closed = true
+        if (unloading.acked) unloading.resolve()
+      }
+      return
+    }
     if (frame.id !== undefined) {
       // Answers only ever come back on ids this relay minted itself (see translate()).
       const entry = this.laneIds.get(frame.id)
@@ -301,11 +339,25 @@ export class CodexRemoteRelay {
         codexNeed(typeof id === 'string' && frame.result.model === this.spec.manifest.model &&
           (!this.spec.manifest.nativeThreadId || id === this.spec.manifest.nativeThreadId))
         this.observation!.bindThread(id); this.thread = id
+        // A warm resume keeps whatever the node loaded before; only a load sets new instructions.
+        if (entry.method === 'thread/start' || !this.threadLoaded) this.loadedInstructions = entry.instructions
+        this.threadLoaded = true
         this.baseline = await this.bindThread(id, entry.method === 'thread/start')
         await this.onThread(id)
       }
     }
     const p = frame.params
+    if (frame.method === 'thread/tokenUsage/updated' && !this.dispatching) {
+      // Codex 0.167 re-emits a resumed thread's last cumulative usage before any turn/start. It is
+      // only droppable when it is exactly the boundary finance already settled for this thread.
+      const { totalTokens, ...usage } = p?.tokenUsage?.total ?? {}
+      const total = nativeTokens(usage), bound = this.boundThread
+      codexNeed(this.active && p?.threadId === this.thread && bound !== undefined && bound.id === this.thread &&
+        Number.isSafeInteger(totalTokens) && totalTokens === total.inputTokens + total.outputTokens &&
+        isDeepStrictEqual(total, bound.baseline), 'CODEX_USAGE_REPLAY_UNPROVEN')
+      this.record('usage-replay', { threadId: p.threadId, turnId: p.turnId ?? null })
+      return
+    }
     if (frame.method === 'thread/tokenUsage/updated') {
       codexNeed(this.active && this.dispatching && p?.threadId === this.thread && p.turnId === this.observation!.nativeTurnId)
       const { totalTokens, ...usage } = p.tokenUsage?.total ?? {}
@@ -336,10 +388,11 @@ export class CodexRemoteRelay {
     codexNeed(!this.revoked); this.publish(out)
   }
   /** Hands the app a lane-unique id so a response can never be mistaken across admissions. */
-  private translate(frame: any, method: string): any {
+  private translate(frame: any, method: string, instructions?: string): any {
     codexNeed(this.laneIds.size < 100000, 'CODEX_ID_TRANSLATION_LIMIT')
     const laneId = ++this.laneIdSeq
-    this.laneIds.set(laneId, { kernelId: frame.id, method, epoch: this.epoch })
+    this.laneIds.set(laneId, { kernelId: frame.id, method, epoch: this.epoch,
+      ...(instructions === undefined ? {} : { instructions }) })
     return { ...frame, id: laneId }
   }
   private waitAcknowledgements(): Promise<void> {
@@ -355,10 +408,12 @@ export class CodexRemoteRelay {
   }
   private async rpc(frame: any): Promise<void> {
     codexNeed(this.active && !this.revoked && this.app && frame && Object.keys(frame).every(k => ['id','method','params','jsonrpc'].includes(k)))
+    // An unload is one atomic step of this admission: nothing else reaches the node meanwhile.
+    codexNeed(!this.unloading, 'CODEX_THREAD_UNLOAD_PENDING')
     const p = frame.params ?? {}, method = frame.method
     codexNeed(p && typeof p === 'object' && !Array.isArray(p))
     const allowed: Record<string, string[]> = { initialize: ['clientInfo','capabilities'], initialized: [],
-      'thread/start': ['baseInstructions','developerInstructions'], 'thread/resume': ['threadId'],
+      'thread/start': ['baseInstructions','developerInstructions'], 'thread/resume': ['threadId','baseInstructions'],
       'turn/start': ['threadId','input','effort'], 'turn/interrupt': ['threadId','turnId'], 'thread/read': ['threadId','includeTurns'],
       'model/list': ['cursor','limit','includeHidden'], 'mcpServerStatus/list': ['cursor','limit'], 'account/read': [] }
     codexNeed(Object.hasOwn(allowed, method) && Object.keys(p).every(k => allowed[method]!.includes(k)))
@@ -398,8 +453,48 @@ export class CodexRemoteRelay {
       }
       this.handshake = { paramsHash }
     }
-    const forwarded = method === 'initialized' ? frame : this.translate(frame, method)
+    const instructions = ['thread/start', 'thread/resume'].includes(method) && typeof p.baseInstructions === 'string'
+      ? p.baseInstructions : undefined
+    if (method === 'thread/resume' && instructions !== undefined && this.threadLoaded &&
+        this.loadedInstructions !== instructions) {
+      await this.unloadThread()
+    }
+    const forwarded = method === 'initialized' ? frame : this.translate(frame, method, instructions)
     this.app.stdin.write(`${JSON.stringify(forwarded)}\n`)
+  }
+  /**
+   * Makes the node drop the thread from memory so the next resume loads it — and the instructions
+   * it carries — from the rollout. Fails closed: a resume that cannot prove the reload never goes out.
+   */
+  private async unloadThread(): Promise<void> {
+    const app = this.app
+    codexNeed(app !== undefined && this.thread !== undefined && !this.dispatching && !this.unloading,
+      'CODEX_THREAD_UNLOAD_UNPROVEN')
+    codexNeed(this.laneIds.size < 100000, 'CODEX_ID_TRANSLATION_LIMIT')
+    // A resume after the unload may only go out for the admission it served.
+    const owner = { finance: this.financeTurn, epoch: this.epoch }
+    const id = ++this.laneIdSeq
+    this.laneIds.set(id, { kernelId: undefined, method: 'thread/unsubscribe', epoch: -1 })
+    const done = new Promise<void>((resolve, reject) => {
+      this.unloading = { id, resolve, reject, closed: false, acked: false }
+    })
+    const timer = setTimeout(() => this.unloading?.reject(new Error('CODEX_THREAD_UNLOAD_UNPROVEN')), 15000)
+    try {
+      this.record('thread-unload', { threadId: this.thread })
+      app!.stdin.write(`${JSON.stringify({ id, method: 'thread/unsubscribe', params: { threadId: this.thread } })}\n`)
+      await done
+      this.threadLoaded = false
+      this.loadedInstructions = undefined
+      this.record('thread-unloaded', { threadId: this.thread })
+      codexNeed(!this.revoked && this.active && this.epoch === owner.epoch && this.financeTurn === owner.finance,
+        'CODEX_THREAD_UNLOAD_STALE')
+    } catch (error) {
+      this.fence(error instanceof Error ? error.message : 'CODEX_THREAD_UNLOAD_UNPROVEN')
+      throw error
+    } finally {
+      clearTimeout(timer)
+      this.unloading = undefined
+    }
   }
   private async control(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const v = await body(req), path = req.url
@@ -413,6 +508,7 @@ export class CodexRemoteRelay {
       codexNeed(Number.isSafeInteger(v.afterSeq) && v.afterSeq >= 0 && v.afterSeq <= this.outputSeq)
       this.output = this.output.filter(f => f.seq > v.afterSeq)
       this.outputBytes = Buffer.byteLength(JSON.stringify(this.output)); result = { frames: this.output }
+      this.servedSeq = this.outputSeq
     } else if (path === '/baseline') {
       // A container that restarts its kernel inside an admitted turn needs to know where the
       // stream stands, so the fresh kernel is not fed the turn it already rendered.
@@ -439,6 +535,10 @@ export class CodexRemoteRelay {
       this.localStopped = true
       this.record('local-stopped', { generation: this.binding.generation, authorityTurnId: v.authorityTurnId, turnKey: v.turnKey })
       this.localStops.emit('stopped')
+      // A previous bounded stop can have timed out before this genuine local
+      // proof arrived. Join it, or retry its idempotent closure now that both
+      // stop proofs can be established; never leave an undispatched claim live.
+      await this.stop()
     }
     else if (path === '/renew') { this.verify(this.admitted!.authority, v.lease, true); this.admitted!.lease = v.lease; this.arm(v.lease) }
     else if (path === '/abandon') { await this.abandon(v); result = { abandoned: true } }
@@ -487,6 +587,18 @@ export class CodexRemoteRelay {
         remoteStopped: proof.remoteStopped && this.localStopped,
         ...(this.memoryRefused ? { nodeAdmissionRejected: true, nodeAdmissionReason: this.memoryRefused } : {}) })
       codexNeed(proof.remoteStopped && this.localStopped, 'CODEX_STOP_UNKNOWN')
+      // An admission stopped before turn/start never reached the model, a shape the ordinary stop
+      // leaves inflight with its thread claimed. With both stop proofs in hand, close it unbilled
+      // by identity (as the container's own abandon does), keeping the fence's first cause.
+      const finance = this.financeTurn
+      if (finance && this.active && !this.dispatching) {
+        codexNeed(typeof finance.abandonUndispatched === 'function', 'CODEX_ABANDON_UNSUPPORTED')
+        const outcome = await finance.abandonUndispatched(this.firstCause
+          ? { failureCode: 'INTERNAL_ERROR', diagnostic: this.firstCause.toLowerCase().slice(0, 64) } : undefined)
+        codexNeed(outcome.state === 'proven', 'CODEX_ABANDON_UNSETTLED')
+        this.active = false
+        this.record('abandoned', { authorityTurnId: this.admitted?.payload.authorityTurnId, cause: this.firstCause })
+      }
       this.record('stopped', { remoteStopped: true }); return { remoteStopped: true as const }
     })().catch(error => { this.stopping = undefined; throw error })
   }

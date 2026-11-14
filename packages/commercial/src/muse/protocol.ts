@@ -23,9 +23,15 @@ export const MUSE_LIMITS = Object.freeze({
   chunk_bytes: 4 * MIB,
   source_max_bytes: 10 * MIB,
   max_source_images: 4,
+  /** One Range request when a bridge >= 0.5 downloads a source image (GET …/sources/:n). */
+  source_chunk_bytes: 1 * MIB,
 })
 
-export const POLL_HOLD_SEC = 25
+// 15 s, was 25 s (OCV5-758): the commercial Muse VM reaches the master through an egress proxy and
+// Cloudflare, and ~22% of polls held 25 s idle came back "Remote end closed connection without
+// response" (11-08..11-10). A shorter idle hold gives those hops less time to cut the connection.
+// The bridge reads it from hello and waits hold + 15 s, so no bridge update is needed.
+export const POLL_HOLD_SEC = 15
 export const HEARTBEAT_SEC = 15
 /** media-generation --timeout-secs. Video measured ~40 s for a 10 s clip; give it room. */
 export const CLI_TIMEOUT_SEC = Object.freeze({ image: 120, video: 300 })
@@ -35,15 +41,38 @@ export const JOB_DEADLINE_MS = Object.freeze({ image: 180_000, video: 390_000 })
 export const SOURCE_UPLOAD_EXTRA_MS = 120_000
 /** A dispatched job not acked within this window was never started: requeue it. */
 export const ACK_TIMEOUT_MS = 20_000
-// A bridge behind a relay that drops some responses (commercial Muse VM, 2026-10-26: poll replies,
-// heartbeat and result replies lost) needs more slack before a job is given up as MUSE_BRIDGE_LOST:
-// 5 dispatches (was 3) before "never acknowledged", 120 s without a sign of life (was 60 s) before
-// "lost contact during the job". A bridge that is really gone is noticed up to a minute later.
-export const MAX_DISPATCH_ATTEMPTS = 5
+/** One initial attempt plus three server retries, with a fixed delay after each failure. */
+export const MUSE_RETRY_MAX = 3
+export const MUSE_RETRY_INTERVAL_MS = 40_000
+export const MAX_DISPATCH_ATTEMPTS = 1 + MUSE_RETRY_MAX
+/** Retry only errors that can recover on a replacement bridge or a later upstream request. */
+export const MUSE_TRANSIENT_ERRORS: ReadonlySet<string> = new Set([
+  'MUSE_BRIDGE_OFFLINE',
+  'MUSE_BRIDGE_LOST',
+  'MUSE_UPSTREAM_ERROR',
+  'MUSE_UPLOAD_FAILED',
+  'MUSE_SOURCE_FETCH_FAILED',
+  'MUSE_TIMEOUT',
+])
+/**
+ * Bridges from this version get source images by reference and download them after the ack
+ * (GET /jobs/:id/sources/:n); older bridges keep receiving them inline in the poll response.
+ * Multi-MB inline claims were never acked through the CDN in production (OCV5-591, 0 of 12).
+ */
+export const SOURCE_REFS_MIN_BRIDGE: readonly [number, number, number] = [0, 5, 0]
+/**
+ * Total decoded source bytes per job while the connected bridge is older than 0.5 (inline only).
+ * Production claims of 3.1–3.9 MB were acked 0 of 12 times and a 217 KB one on its third
+ * dispatch; this keeps an inline claim under ~0.7 MB. Bridges >= 0.5 are not limited by it.
+ */
+export const INLINE_SOURCE_MAX_BYTES = 512 * 1024
 export const HEARTBEAT_LOST_MS = 120_000
 export const BRIDGE_ONLINE_MS = 60_000
+/** Defaults for the personal edition (one bridge slot); commercial overrides them through config. */
 export const QUEUE_MAX = 3
 export const QUEUE_WAIT_MS = 240_000
+/** Hard ceiling for OC_MUSE_CONCURRENCY; the bridge clamps to its own --max-concurrency too. */
+export const MAX_CONCURRENCY = 32
 /** Finished jobs (and their files) stay fetchable this long. */
 export const DONE_RETAIN_MS = 60 * 60_000
 
@@ -69,6 +98,7 @@ export const BRIDGE_ERROR_CODES: ReadonlySet<string> = new Set([
   'MUSE_SOURCE_FETCH_FAILED',
   'MUSE_CANCELLED',
   'MUSE_BRIDGE_LOST',
+  'MUSE_SOURCE_FETCH_FAILED',
 ])
 
 const ALLOWED_MIME: Record<MuseKind, ReadonlySet<string>> = {
@@ -143,6 +173,10 @@ const SubmitSchema = z
       .max(MUSE_LIMITS.max_source_images)
       .optional(),
     resume_snapshot_id: z.string().regex(SNAPSHOT_ID_RE).optional(),
+    // Origin metadata is validated for ownership by durability, never forwarded to the bridge.
+    session_key: z.string().min(1).max(512).refine((v) => v.trim().length > 0, 'session key is blank').optional(),
+    mode: z.enum(['native', 'first_frame', 'reference', 'composite']).optional(),
+    count: z.number().int().min(1).max(MUSE_LIMITS.max_files).optional(),
   })
   .strict()
 
@@ -170,6 +204,9 @@ export interface MuseJobSpec {
   /** Validated base64 (decoded size and magic checked); hub retains sources until finish. */
   source_images?: string[]
   resume_snapshot_id?: string
+  /** Optional video mode for the box-exec backend; ignored by the hatch wire. */
+  mode?: 'native' | 'first_frame' | 'reference' | 'composite'
+  count?: number
 }
 
 /** Validate a container submission. Throws MuseError(400, MUSE_INVALID_INPUT). */
@@ -214,7 +251,35 @@ export function parseSubmission(raw: unknown): MuseJobSpec {
     ...(v.image_format ? { image_format: v.image_format } : {}),
     ...(sources.length ? { source_images: sources } : {}),
     ...(v.resume_snapshot_id ? { resume_snapshot_id: v.resume_snapshot_id } : {}),
+    ...(v.mode ? { mode: v.mode } : {}),
+    ...(v.count !== undefined ? { count: v.count } : {}),
   }
+}
+
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+
+/**
+ * True when a bridge of this version downloads source images itself: SemVer >= 0.5.0. A
+ * pre-release of 0.5.0 (0.5.0-rc.1) precedes 0.5.0 and stays inline; anything unparseable too.
+ * Same rule as the personal edition (#1102).
+ */
+export function bridgeFetchesSources(version: string | null): boolean {
+  const m = SEMVER_RE.exec(version ?? '')
+  if (!m) return false
+  const pre = m[4]
+  if (pre?.split('.').some((id) => /^0\d+$/.test(id))) return false
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])]
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== SOURCE_REFS_MIN_BRIDGE[i]) return v[i]! > SOURCE_REFS_MIN_BRIDGE[i]!
+  }
+  return pre === undefined
+}
+
+/** Decoded size of canonical base64 (parseSubmission and the studio adapter only produce that). */
+export function base64DecodedBytes(b64: string): number {
+  const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0
+  return (b64.length / 4) * 3 - pad
 }
 
 export function jobDeadlineMs(spec: MuseJobSpec): number {
@@ -241,11 +306,16 @@ export function normalizeBridgeFailure(body: Record<string, unknown>): {
   return { code, message, retryable: body.retryable === true, upstreamCode: upstream }
 }
 
-/** Parse comma-separated decimal uids; uid 4 is never enabled (task rule). */
+/** Who may submit jobs: a set of uids, or every signed-in account (commercial, OCV5-574). */
+export type MuseAllowlist = ReadonlySet<string> | 'all'
+
+/** Parse comma-separated decimal uids; uid 4 is never enabled in a list (selfhost task rule).
+ * The single token `all` opens Muse to every account. */
 export function parseAllowedUids(
   raw: readonly string[] | undefined,
   warn: (msg: string, meta: Record<string, unknown>) => void = () => {},
-): ReadonlySet<string> {
+): MuseAllowlist {
+  if (raw?.length === 1 && raw[0] === 'all') return 'all'
   const out = new Set<string>()
   for (const uid of raw ?? ['3']) {
     if (uid === '4') {

@@ -6,6 +6,8 @@ import { deriveBoxContextHash, hashBoxAssistantContent } from "./boxCallFingerpr
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 import { boxPromptLayoutOf } from "./boxMessagesMapper.js";
 import type { BOX_PROMPT_LAYOUT_STATIC_FIRST } from "./boxNativePointer.js";
+import { describeBoxNativeContextMiss, describeBoxNativeTail,
+  type BoxNativeMissDetail } from "./boxNativeContextDiagnosis.js";
 
 export interface BoxNativeHistoryBasis {
   readonly contextHashBeforeFinal: string;
@@ -34,36 +36,59 @@ export function matchesBoxNativeHistory(nextBody: ProxyBody,
 /** Why a next request does or does not continue a native transcript. Content
  * free: a reason code only, so a miss can be logged and diagnosed. */
 export function explainBoxNativeHistory(nextBody: ProxyBody,
-  basis: BoxNativeHistoryBasis): "ok" | "shape" | "roles" | "tool_result" | "context" | "assistant" | "error" {
+  basis: BoxNativeHistoryBasis): BoxNativeHistoryReason {
+  return explainBoxNativeHistoryDetailed(nextBody, basis).reason;
+}
+
+export type BoxNativeHistoryReason = "ok" | "shape" | "roles" | "tool_result" | "context" | "assistant" | "error";
+
+/** OCV5-756: the reason plus a content-free detail for misses (see
+ * boxNativeContextDiagnosis): which part changed for "context", the tail shape
+ * for "shape"/"roles"/"tool_result". */
+export function explainBoxNativeHistoryDetailed(nextBody: ProxyBody,
+  basis: BoxNativeHistoryBasis): { reason: BoxNativeHistoryReason; detail?: BoxNativeMissDetail } {
   try {
     const rawMessages = nextBody.messages;
     if (!Array.isArray(rawMessages) || rawMessages.length < 3
-      || !Object.hasOwn(rawMessages, rawMessages.length - 1)) return "shape";
+      || !Object.hasOwn(rawMessages, rawMessages.length - 1)) {
+      return { reason: "shape", detail: describeBoxNativeTail(rawMessages) };
+    }
     const rawCurrent = rawMessages.at(-1);
     if (!rawCurrent || typeof rawCurrent !== "object" || Array.isArray(rawCurrent)
-      || !Object.hasOwn(rawCurrent, "content")) return "shape";
+      || !Object.hasOwn(rawCurrent, "content")) {
+      return { reason: "shape", detail: describeBoxNativeTail(rawMessages) };
+    }
     const normalized = normalizeBoxSemanticBody(nextBody);
     const messages = normalized.messages;
-    if (!Array.isArray(messages) || messages.length < 3) return "shape";
+    if (!Array.isArray(messages) || messages.length < 3) {
+      return { reason: "shape", detail: describeBoxNativeTail(messages) };
+    }
     const previousUser = messages.at(-3);
     const assistant = messages.at(-2);
     const currentUser = messages.at(-1);
     if (!hasRoleAndContent(previousUser, "user")
       || !hasRoleAndContent(assistant, "assistant")
-      || !hasRoleAndContent(currentUser, "user")) return "roles";
+      || !hasRoleAndContent(currentUser, "user")) {
+      return { reason: "roles", detail: describeBoxNativeTail(messages) };
+    }
     const currentContent = currentUser.content;
     if (Array.isArray(currentContent) && currentContent.some((part) => part
-      && typeof part === "object" && "type" in part && part.type === "tool_result")) return "tool_result";
+      && typeof part === "object" && "type" in part && part.type === "tool_result")) {
+      return { reason: "tool_result", detail: describeBoxNativeTail(messages) };
+    }
     const prefixBody = { ...normalized, messages: messages.slice(0, -2) } as ProxyBody;
     // Semantic normalization collapses a one-block text assistant to a string.
     // The existing assistant hash takes block arrays, so restore that exact
     // text-block representation rather than weakening the hash comparison.
     const assistantBlocks = typeof assistant.content === "string"
       ? [{ type: "text", text: assistant.content }] : assistant.content;
-    if (deriveBoxContextHash(prefixBody) !== basis.contextHashBeforeFinal) return "context";
-    if (hashBoxAssistantContent(assistantBlocks) !== basis.assistantContentHash) return "assistant";
-    return "ok";
-  } catch { return "error"; }
+    if (deriveBoxContextHash(prefixBody) !== basis.contextHashBeforeFinal) {
+      return { reason: "context",
+        detail: describeBoxNativeContextMiss(prefixBody, basis.contextHashBeforeFinal) };
+    }
+    if (hashBoxAssistantContent(assistantBlocks) !== basis.assistantContentHash) return { reason: "assistant" };
+    return { reason: "ok" };
+  } catch { return { reason: "error" }; }
 }
 
 /** OCV5-383: the pointer field recording the layout the transcript was staged with. */

@@ -51,9 +51,9 @@ EMERGENCY_SHA="aa583b702d5e454801e90ff3c6b25df38e808a98"
 # 2026-11-01 管家批准。已上线、不可改写、原 waiver 于 2026-10-31 过期。
 # 不延长 waiver，不冻结祖先。只豁免这一个完整 SHA。
 IMMUTABLE_EXPIRED_WAIVER_SHA="da9cd5484db3b0e5c882f4032ee09685c4e5b5a7"
-# 2026-11-06 用户批准。已推送到共享分支、不可改写、缺 Incident trailer。
-# 只豁免这一个完整 SHA，且必须有 commit 完全相等、未过期的 waiver；不冻结祖先。
-PUSHED_MISSING_TRAILER_SHA="ae3b77946db724b6b53b717aceeb5506213158c0"
+# 用户逐条批准（ae3b779 2026-11-06，de3ca8e4 2026-11-08）。已推送到共享分支、不可改写、缺 Incident trailer。
+# 只豁免这些完整 SHA，且必须有 commit 完全相等、未过期的 waiver；不冻结祖先。
+PUSHED_MISSING_TRAILER_SHAS=" ae3b77946db724b6b53b717aceeb5506213158c0 de3ca8e4c1a801499aa771172924af06f09d0c8d "
 
 g() { git -C "$REPO" "$@"; }
 say() { [[ "$QUIET" == 1 ]] || echo "$*"; }
@@ -152,7 +152,7 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
       if [[ "$exp" < "$today" ]]; then bad "$sha8 的 emergency trailer waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
       continue
     fi
-    if [[ "$sha" == "$PUSHED_MISSING_TRAILER_SHA" && -n "$w" && "$(jq -r '.commit' <<<"$w")" == "$sha" ]]; then
+    if [[ "$PUSHED_MISSING_TRAILER_SHAS" == *" $sha "* && -n "$w"&& "$(jq -r '.commit' <<<"$w")" == "$sha" ]]; then
       exp="$(jq -r '.expiresAt' <<<"$w")"
       if [[ "$exp" < "$today" ]]; then bad "$sha8 的缺 trailer 例外 waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
       continue
@@ -163,7 +163,13 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
 
   # exact immutable trailer mapping — keep byte-aligned with
   # normalizeImmutableIncidentTrailer in check-v5-incident-regressions.ts
-  if [[ "$sha" == "f496228de43718852cebda8fb9f35eb0e9c3a9c0" && "$trailer" == "OCV5-171 follow-up" ]]; then
+  if [[ "$sha" == "8f8d44fc2697ec7a80555f7f003b6ca64dc022b0" && "$trailer" == "none (preset kept a stale model; found in the OCV5-376 startup-log review)" ]]; then
+    trailer="INC-20261011-GENERAL-ASSISTANT-STALE-MODEL"
+  elif [[ "$sha" == "785b3e0425e9ccc1720043c501946c31abfea22b" && "$trailer" == "none (latent; no user report — found during the OCV5-376 test-suite change)" ]]; then
+    trailer="INC-20261011-LAZY-TOOL-BODY-REJECT-CACHE"
+  elif [[ "$sha" == "793c4f0b15928a59eaaedab3f8ba6194d1fb496a" && "$trailer" == "none (user-facing copy only; no behavior change)" ]]; then
+    trailer="INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE"
+  elif [[ "$sha" == "f496228de43718852cebda8fb9f35eb0e9c3a9c0" && "$trailer" == "OCV5-171 follow-up" ]]; then
     trailer="INC-20260908-CC-SWITCH-ASCII-NAME"
   elif [[ "$sha" == "7b2ae241d6445042fb196cfc1ca03c063aab2fb8" && "$trailer" == "OCV5-220 in-flight consult card showed missing-field copy as" ]]; then
     trailer="INC-20260915-ADVISOR-CONSULT-CARD"

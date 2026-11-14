@@ -83,6 +83,17 @@ describe("auth.mail.createResendMailer", () => {
     assert.ok(req.init.signal, "fetch should be called with an AbortSignal");
   });
 
+  test("html: passed through to Resend only when present", async () => {
+    const { fetchImpl, captured } = makeFakeFetch(
+      new Response(JSON.stringify({ id: "msg_html" }), { status: 200 }),
+    );
+    const mailer = createResendMailer({ apiKey: "re_test", from: "auth@claudeai.chat", fetchImpl });
+
+    await mailer.send({ to: "u@example.com", subject: "s", text: "t", html: "<p>t</p>" });
+    assert.equal(JSON.parse(captured[0].init.body as string).html, "<p>t</p>");
+    assert.equal(JSON.parse(captured[0].init.body as string).text, "t");
+  });
+
   test("4xx: rejects with status in message", async () => {
     const { fetchImpl } = makeFakeFetch(
       new Response("Invalid API key", {

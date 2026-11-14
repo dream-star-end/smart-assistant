@@ -58,6 +58,8 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "agent_audit", column: "occurred_at", days: 90 },
   // OCV5-561 Muse job audit (prompt preview + outcome); rate limits only look back one day.
   { table: "muse_media_jobs", column: "queued_at", days: 180 },
+  // OCV5-591 media studio activity log / push source.
+  { table: "studio_events", column: "ts", days: 180 },
   { table: "agent_tool_rollup_reports", column: "created_at", days: 90 },
   { table: "compute_host_audit", column: "ts", days: 90 },
   { table: "turn_traces", column: "created_at", days: 90 },
@@ -134,10 +136,11 @@ export const PERMANENT_AUDIT_TABLES: readonly string[] = ["admin_audit"] as cons
  * 任一 ops-ledger 表若被误加进删除政策或与合规永久表重名,resolveRetentionPolicies 抛错拒启。
  */
 export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
-  // OCV5-746: native usage boundaries and turn receipt uniqueness must survive master restarts.
-  // Deleting either would permit a resumed thread to lose its baseline or be charged twice.
+  // OCV5-746 / OCV5-749: native usage boundaries, turn receipt uniqueness, and drift
+  // verification run + alert deduplication ledgers must survive master restarts.
   "remote_native_threads",
   "remote_native_turns",
+  "remote_driver_verification_runs",
   "incidents",
   "codex_repairs",
   "codex_repair_events",
@@ -162,6 +165,8 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   // P0 containment debt. Same class as model_default_transition_snapshots —
   // small, immutable ops ledgers; deleting them would drop rollback proof.
   "model_dsv4pro_transition_snapshots",
+  // 2026-10-06 OCV5-322: before-images of the 0296 MiniMax-M3 / gpt-5.6-sol transition (rollback proof).
+  "model_0296_transition_snapshots",
   "model_flash_opencode_subject_snapshots",
   "model_flash_opencode_transition",
   "model_k3_256k_transition",

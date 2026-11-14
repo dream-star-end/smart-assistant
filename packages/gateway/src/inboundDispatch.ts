@@ -1,3 +1,4 @@
+import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
 import { takeSystemHelpBootstrap } from '@openclaude/protocol'
 import { getSystemHelpBootstrap } from './systemHelpFrames.js'
 /**
@@ -97,6 +98,7 @@ import {
 import { buildContextObservationFrame } from './contextObservationFrames.js'
 import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessionReuseSkipReason, readLiveRunnerModel, resolveLocalExecutionIfEnforced, localExecutionOverride, collectAvailableMcpToolNames, _buildSafeCodexRouteOverride, _buildSafeGrokRouteOverride, _buildSafeZcodeRouteOverride, _buildSafeAntigravityRouteOverride, makePeerKey, _buildTurnTraceContext, _inheritOutboundRouting, _buildEngineErrorFrame, _buildTurnStatusFrame, _earlyRejectErrorFrames, _buildContextRebuiltFrame, isUploadMimeAllowed, uploadExtForMime } from './server.js'
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
+import { sessionStartFailureCode, sessionStartFailureMessage, userSentTurnFrames } from './turnFrames.js'
 import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_FILE, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
@@ -553,12 +555,10 @@ export async function dispatchInbound(
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
-    const inboundCollabMode = !isEngineLocalTurnExempt()
-      ? normalizeCollabMode({ teamMode })
-      : normalizeCollabMode({
-          collabMode: (frame as { collabMode?: unknown }).collabMode,
-          teamMode,
-        })
+    const inboundCollabMode = normalizeCollabMode({
+      collabMode: (frame as { collabMode?: unknown }).collabMode,
+      teamMode,
+    })
 
     // v5 codex route 消费链(A1):master bridge 注入的 `__oc_codex_route` →
     // 严格校验(_buildSafeCodexRouteOverride)→ submit opts.codexRoute →
@@ -736,6 +736,25 @@ export async function dispatchInbound(
       persistSnapshot: Boolean(chatWorkspace.projectId && chatWorkspace.bound),
     })
 
+    // A turn whose session cannot be created never started. Without its own error frames the
+    // failure only reached the socket as an unowned error, so the chat spun until its timeout.
+    const rejectSessionStart = (err: unknown): undefined => {
+      if (!userSentTurnFrames.has(frame)) throw err
+      const code = sessionStartFailureCode(err)
+      this.log.warn('session create failed; turn rejected', { sessionKey, code, traceId: turnTraceId }, err as Error)
+      const frames = _earlyRejectErrorFrames({
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        userId: activeUserId,
+        traceId: turnTraceId,
+        code: 'engine_error',
+        message: sessionStartFailureMessage(code),
+        legacyErrorText: `[error] ${code}`,
+      })
+      for (const f of frames) this.deliver(f, adapter)
+      return undefined
+    }
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: effectiveAgent,
@@ -779,7 +798,8 @@ export async function dispatchInbound(
           }
         : {}),
       ...(promptQueueExecutionFence ? { promptQueueExecutionFence } : {}),
-    })
+    }).catch(rejectSessionStart)
+    if (!session) return
     admitCmid =
       typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
         ? safeClientMessageId
@@ -2305,6 +2325,15 @@ export async function dispatchInbound(
         //
         // 无 descriptor(本地路径 / flag 未开)→ 不传 → runner 写空串清位 + (flag 开时)自取
         // local_catalog token。清位判定收在 runner 单点,任何 submit 入口都漏不掉。
+        ...(turnAuthority?.engine === 'grok'
+          ? { grokExecutionDescriptor: freezeGrokExecutionDescriptor({
+              canonicalModel: turnAuthority.canonicalModel,
+              upstreamModelId: (turnAuthority.capabilityProfile.grok as {upstreamModelId:string}).upstreamModelId,
+              billingRequestId: turnAuthority.billingRequestId ?? '',
+              executionRevision: turnAuthority.executionRevision,
+              authorityTurnId: turnAuthority.authorityTurnId,
+            }, {canonicalModel: turnAuthority.canonicalModel, billingRequestId: turnAuthority.billingRequestId ?? ''}) }
+          : {}),
         ...(turnAuthority !== undefined
           ? {
               modelAuthority: {

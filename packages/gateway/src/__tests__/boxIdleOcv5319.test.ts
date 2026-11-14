@@ -32,6 +32,10 @@ import {
 import type { IdleProofResponse } from '../engine/boxIdleProofClient.js'
 import { SessionManager } from '../sessionManager.js'
 
+// These cases drive the dispatch machinery itself; OCV5-755 moved the
+// default dispatch to the pre-expiry timer, so pin the legacy timing here.
+process.env.OC_BOX_IDLE_PRE_EXPIRY_MS = 'off'
+
 const finish = (SessionManager.prototype as unknown as {
   finishIdleUnderLock: (this: object, session: object, source: { sessionId: string; turnKey: string },
     recoveryDir?: string) => Promise<void>

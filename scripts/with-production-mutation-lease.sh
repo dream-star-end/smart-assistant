@@ -20,35 +20,54 @@ set -euo pipefail
 KL_HOST="${KL_HOST:-kl-mirror}"
 PRODUCTION_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"
 MANUAL_LEASE_PROOF="${PRODUCTION_MUTATION_LOCK}.manual-holder"
+MUTATION_ADMISSION_PROOF="${PRODUCTION_MUTATION_LOCK}.admission-nonce"
+V5_ENV="/etc/openclaude/commercial-v5.env"
 MUTATION_LEASE_TTL_SECONDS="${OC_V5_MUTATION_LEASE_TTL_SECONDS:-7200}"
 [[ "$MUTATION_LEASE_TTL_SECONDS" =~ ^[1-9][0-9]*$ ]] || MUTATION_LEASE_TTL_SECONDS=7200
 (( MUTATION_LEASE_TTL_SECONDS >= 2 )) || MUTATION_LEASE_TTL_SECONDS=7200
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 process_state_start() { # <pid> -> "state starttime"
-  local raw rest
-  raw="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  local raw="" rest output_state="${2:-}" output_start="${3:-}"
+  # Only fixed internal caller locals are accepted, in a pair. Clear stale
+  # outputs before any failed read; the single-argument stdout API is unchanged.
+  if (( $# != 1 )); then
+    [[ $# == 3 && "$output_state" == state && "$output_start" == start ]] || return 1
+    printf -v "$output_state" '%s' ""
+    printf -v "$output_start" '%s' ""
+  fi
+  # Kernel comm may contain newlines. Read the whole proc record without a cat
+  # subprocess; EOF is normal only after a nonempty read, never an open failure.
+  if ! IFS= read -r -d '' raw 2>/dev/null <"/proc/$1/stat"; then
+    [[ -n "$raw" ]] || return 1
+  fi
   rest="${raw##*) }"
   set -- $rest
   [[ $# -ge 20 ]] || return 1
-  printf '%s %s\n' "$1" "${20}"
+  if [[ -n "$output_state" ]]; then
+    printf -v "$output_state" '%s' "$1"
+    printf -v "$output_start" '%s' "${20}"
+  else
+    printf '%s %s
+' "$1" "${20}"
+  fi
 }
 
 process_start_time() { # <pid>
   local state start
-  read -r state start < <(process_state_start "$1") || return 1
+  process_state_start "$1" state start || return 1
   printf '%s\n' "$start"
 }
 
 same_live_process() { # <pid> <starttime>
   local state start
-  read -r state start < <(process_state_start "$1") || return 1
+  process_state_start "$1" state start || return 1
   [[ "$state" != Z && "$state" != X && "$state" != x && "$start" == "$2" ]]
 }
 
 same_supervised_process() { # stopped supervision is equivalent to lost supervision
   local state start
-  read -r state start < <(process_state_start "$1") || return 1
+  process_state_start "$1" state start || return 1
   case "$state" in Z|X|x|T|t) return 1 ;; esac
   [[ "$start" == "$2" ]]
 }
@@ -253,6 +272,8 @@ supervisor_main() { # <outer-pid> <outer-starttime> <cmd> [args...]
   # supervisor/ssh 极端同时失联时永久焊锁。TTL 到点会让本地 lease_pid 退出，随即由
   # wait-n 路径终止仍在运行的命令进程组。
   local remote_holder manual_lease_nonce
+  local admission_helper_b64
+  admission_helper_b64="$(base64 -w0 "$(dirname "$SELF")/lib/v5-mutation-admission.sh")" || return 3
   manual_lease_nonce="$(openssl rand -hex 16)"
   [[ "$manual_lease_nonce" =~ ^[0-9a-f]{32}$ ]] \
     || { echo "✗ 无法生成 manual lease proof nonce" >&2; return 3; }
@@ -277,6 +298,8 @@ case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
 kill -0 \"\$lease_parent\" 2>/dev/null || exit 76
 lease_start=\"\$(date +%s)\"
 lease_ttl=$MUTATION_LEASE_TTL_SECONDS
+eval \"\$(printf '%s' '$admission_helper_b64' | base64 -d)\" || exit 79
+v5_mutation_admission '$MUTATION_ADMISSION_PROOF' '$manual_lease_nonce' '$V5_ENV' \"\$lease_start\" \"\$lease_ttl\" \"\$lease_parent\" || exit 79
 umask 077
 proof_tmp=\"\$proof.tmp.\$\$\"
 printf '%s\n' \"\$nonce\" >\"\$proof_tmp\" || exit 77
@@ -344,6 +367,8 @@ done"
     unset OC_V5_MANUAL_LEASE_INTERNAL
     export OC_V5_MANUAL_LEASE_NONCE="$manual_lease_nonce"
     export OC_V5_MANUAL_LEASE_PROOF="$MANUAL_LEASE_PROOF"
+    export OC_V5_MUTATION_ADMISSION_NONCE="$manual_lease_nonce"
+    export OC_V5_MUTATION_ADMISSION_PROOF="$MUTATION_ADMISSION_PROOF"
     exec "$@"
   ) &
   SUP_COMMAND_PID=$!

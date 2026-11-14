@@ -160,26 +160,26 @@
     },
     {
       "commit": "793c4f0b15928a59eaaedab3f8ba6194d1fb496a",
-      "reason": "The model-unavailable card said the model was retired, but the same code also covers an upstream at-capacity reply. Only the card copy changed; retry policy and classification are unchanged. Renewal through 2026-11-09 gives the immutable, already-published copy-only commit a bounded seven-day window for the reviewed PR #1344 personal release and the next nightly sync; the expiry gate remains in force.",
-      "approvedBy": "user 2026-10-02 改下吧（模型不可用文案）; user 2026-11-02 11:12 CST card reply: renew this expired waiver, then review/merge PR #1344 and ship selfhost; approval recorded in /workspace/codex/prewarm-ship/CODEX-START.md (OCV5-710)",
-      "expiresAt": "2026-11-09"
+      "reason": "The model-unavailable card said the model was retired, but the same code also covers an upstream at-capacity reply. Only the card copy changed; retry policy and classification are unchanged.",
+      "approvedBy": "user 2026-10-02 改下吧（模型不可用文案）",
+      "expiresAt": "2026-11-01"
     },
     {
       "commit": "ac5f476106a00b0d4d33fcf3f0773b1592fe1571",
       "reason": "An answered CCB question showed its AskUserQuestion tool row (raw 'User has answered your questions' echo) outside 处理过程, duplicating the 用户问答 card. The tool row is now hidden only when a question card with the same tool_use id exists. Display-only; covered by a MessageList component regression test, no engine or protocol change.",
-      "approvedBy": "user 2026-10-05 改下（问答卡漏到处理过程外）; user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」（续期已上线不可变 display-only 豁免以放行 selfhost 发布列车）",
+      "approvedBy": "user 2026-10-05 改下（问答卡漏到处理过程外）; user 2026-11-06 t1618u 要求把 #1378 CI 修绿并合并(aurora 同步个人版 2026-11-05 已批的续期,到期日一致,范围仅此三条)",
       "expiresAt": "2026-12-04"
     },
     {
       "commit": "3595422d41439b7800ebad13ca7a4e902fec5639",
       "reason": "A resolved CCB plan review showed its ExitPlanMode tool row (raw 'User has approved your plan' / rejected / timed-out echo) outside 处理过程, duplicating the 退出计划模式 card that already shows the plan and outcome. The tool row is now hidden only when a card with the same tool name and tool_use id exists. Display-only; covered by a MessageList component regression test, no engine or protocol change.",
-      "approvedBy": "user 2026-10-05 一起改下（退出计划模式卡同样重复）; user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」（续期已上线不可变 display-only 豁免以放行 selfhost 发布列车）",
+      "approvedBy": "user 2026-10-05 一起改下（退出计划模式卡同样重复）; user 2026-11-06 t1618u 要求把 #1378 CI 修绿并合并(aurora 同步个人版 2026-11-05 已批的续期,到期日一致,范围仅此三条)",
       "expiresAt": "2026-12-04"
     },
     {
       "commit": "98e7e988728643c380d7e1ba40c1fb39716fa014",
       "reason": "During a turn the 已送达 label under the user's message kept appearing and disappearing: every live frame carrying the turn's clientMessageId re-ran admission confirmation, which rewrote the row from read back to sent until the next answer block. Admission now never downgrades read/replied. Display-only client status change; covered by a socket regression test, no gateway or protocol change.",
-      "approvedBy": "user 2026-10-05 v5个人版用户消息底下的已送达会反复出现和消失; user 2026-11-05 webmw2j5t350yr9az 要求「修改上线」（续期已上线不可变 display-only 豁免以放行 selfhost 发布列车）",
+      "approvedBy": "user 2026-10-05 v5个人版用户消息底下的已送达会反复出现和消失; user 2026-11-06 t1618u 要求把 #1378 CI 修绿并合并(aurora 同步个人版 2026-11-05 已批的续期,到期日一致,范围仅此三条)",
       "expiresAt": "2026-12-04"
     },
     {
@@ -197,6 +197,12 @@
     {
       "commit": "1f4e95be548610b2e99ff3d82eb36c3cc55ddf9a",
       "reason": "Antigravity relay prefix was a raw /internal/v5 literal missing from the internal route registry; only the commercial-unit contract test failed during the OCV5-411 two-tree sync. Engine is hidden and fail-closed, no user-visible behaviour, billing or data change.",
+      "approvedBy": "user 2026-10-14 要求在个人版正规修复内部路由注册表登记 (OCV5-415, cc3-sync 反馈)",
+      "expiresAt": "2026-11-13"
+    },
+    {
+      "commit": "6fda2cdf1a509994fe80811bc776e15f76c3a600",
+      "reason": "Antigravity relay prefix was a raw /internal/v5 literal missing from the internal route registry; only the commercial-unit contract test failed during the OCV5-411 two-tree sync. Engine is hidden and fail-closed, no user-visible behaviour, billing or data change. Commercial cherry-pick -x of selfhost 1f4e95be5 (same patch); mirrors that waiver.",
       "approvedBy": "user 2026-10-14 要求在个人版正规修复内部路由注册表登记 (OCV5-415, cc3-sync 反馈)",
       "expiresAt": "2026-11-13"
     },
@@ -285,6 +291,24 @@
       "expiresAt": "2026-11-15"
     },
     {
+      "commit": "6588fe7c2ff2c6ce265e49a41a0dba881df1e6b9",
+      "reason": "OCV5-411 #723 Codex r1 P1: the Antigravity relay parked on a drain that never came when the CLI disconnected under backpressure (usage unrecorded, reservation held). Latent: Antigravity is admin-only and disabled in commercial and no commercial release carried it; on selfhost it is owner-only.",
+      "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "0d54eea02425d164ed68a6c77f21a5d563744756",
+      "reason": "OCV5-411 #723 Codex r1 P1: six tables from selfhost migrations 0306–0308 had no retention disposition; pool_events now gets its documented 30-day sweep. Latent: the tables do not exist in commercial yet; nothing user-visible.",
+      "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "51790b628c2c9daddf200f9ad9645e5cee6df93e",
+      "reason": "OCV5-411 #723 CI red (commercial-integ pr-3): getFreshAntigravityAccessToken leaked a pool client when the KMS key failed to load, so poolPolicy0306 hung in its after hook. Latent: Antigravity is admin-only and disabled in commercial and no commercial release carried it; selfhost owner-only.",
+      "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
       "commit": "c349d7f4bc78dd11b1520fc2b968fe9443eb3602",
       "reason": "OCV5-445: backport of commercial 6588fe7c2. The Antigravity relay now waits for drain or close, so a CLI that disconnects under backpressure no longer parks the handler; usage is still recorded and the reservation released. Latent: no user report, Antigravity is owner-only on selfhost. Regression test red without the fix.",
       "approvedBy": "user 2026-10-16 管家派单 OCV5-445：把商业 #723 同步里 Codex 发现的两个问题回挂个人版，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
@@ -327,16 +351,40 @@
       "expiresAt": "2026-11-20"
     },
     {
-      "commit": "a05e6277a3bf1f89a8a63bbcdd9ce797cd0f10c7",
-      "reason": "OCV5-619: remove GPT Image 2 hard daily >=10 enforce in reserveImageUsage; credits + in-flight lock remain. Cherry-picked from aurora 2896189a6 onto selfhost without image2Run/ImageStudio (paths absent). Not an incident fix.",
-      "approvedBy": "user/steward t1006u-t1007u 2026-10-26 media reverse-sync + full two-tree sync Batch0; standing personal green→merge OK after Grok OD",
-      "expiresAt": "2026-11-26"
+      "commit": "42f4b65a807ededc8c8bc0c0e30ac2ccd4591b65",
+      "reason": "Aurora sync of selfhost OCV5-577 PR-B openCodeGoAuthHeaders x-opencode-session (e4108c3e7). Production TEXT_HTTP on community blog AI moderation was Go 400 MissingSessionID with no DeepSeek fallback on 400. Fix is protocol header only; platformFlashFallback.test.ts asserts UUID session header and keeps Go-400-no-fallback. No new incident: proofPending baseline is full (19/19); raising it would weaken the gate.",
+      "approvedBy": "butler executor t977u 2026-10-25; user authorized fix AI moderation TEXT_HTTP; Incident: none because unit-covered selfhost port and proofPending baseline saturated",
+      "expiresAt": "2026-11-25"
+    },
+    {
+      "commit": "d97caaa43472913a1aaa5254fe3e65a79acdccaa",
+      "reason": "OCV5-593 FE-4: Brief「全自动开始」was intentionally FE-disabled while director POST /start|/approve was already live (media-e2e draft→planning). Wire the button and approve path; not an incident fix. StudioApp unit covers enablement; raising proofPending baseline forbidden.",
+      "approvedBy": "user widget t983s6206 「商业发」2026-10-25; butler executor fixing missing Incident trailer before merge (Codex r2 + Grok OD already APPROVED on content)",
+      "expiresAt": "2026-11-25"
+    },
+    {
+      "commit": "2896189a60ccd5d283792f0afc63dadd6162bf59",
+      "reason": "OCV5-619: remove GPT Image 2 hard daily >=10 enforce in reserveImageUsage; credits + in-flight lock remain. Studio already dual gpt-image/muse-image; label-only clarify. Not an incident fix. image2Run integ admits 11th; ImageStudio unit. Raising proofPending baseline forbidden.",
+      "approvedBy": "user/steward t990u-t991u 2026-10-25 no GPT image daily limit + Muse/GPT optional; butler executor fixing missing Incident trailer on draft PR #1110 (no merge/ship)",
+      "expiresAt": "2026-11-25"
     },
     {
       "commit": "122f0f0297e33eeb6c438fd0cc566b8216da5085",
       "reason": "OCV5-652: durable retry for a confirmed terminal delegate's failed no-usage abandon POST. Latent recovery gap, reproduced by unit tests; the OCV5-651 live example completed naturally. No parent-dispatch bypass, waiver-age change, or live-state cleanup. Unproven child death remains protected and tracked; draft pending real Grok OD and steward.",
       "approvedBy": "user t1154u/t1155u, 2026-10-28 START OCV5-652: authorize smallest correct selfhost repair with regression tests and draft PR only; no reproduced live incident; DO NOT MERGE — 待真 Grok OD / 管家",
       "expiresAt": "2026-11-27"
+    },
+    {
+      "commit": "a1aef01c532d921fe83697bff8620d51c3e6d7d5",
+      "reason": "Muse jobs were failed when the VM bridge process restarted on its half-hour schedule. The fix requeues the same job id with a new nonce and still charges only on success. Locked by museBridge unit tests and the bridge stop test. proofPending is already at its ceiling, so this does not open a new incident id.",
+      "approvedBy": "user t1519u, 2026-11-01 grok-muse-bridge: fix jobs that fail across the Muse bridge reconnect; do not touch the VM; commercial release still needs a separate steward confirm",
+      "expiresAt": "2026-12-01"
+    },
+    {
+      "commit": "a05e6277a3bf1f89a8a63bbcdd9ce797cd0f10c7",
+      "reason": "OCV5-619: remove GPT Image 2 hard daily >=10 enforce in reserveImageUsage; credits + in-flight lock remain. Cherry-picked from aurora 2896189a6 onto selfhost without image2Run/ImageStudio (paths absent). Not an incident fix.",
+      "approvedBy": "user/steward t1006u-t1007u 2026-10-26 media reverse-sync + full two-tree sync Batch0; standing personal green→merge OK after Grok OD",
+      "expiresAt": "2026-11-26"
     },
     {
       "commit": "e76500624fa00f8133744421e28b7b62777ab8dd",
@@ -385,6 +433,12 @@
       "reason": "OCV5-721 远程模型池提交 ae3b77946（remote_pool 目录投影、多目录 profile、SSH 密码引导）以 fix(v5) 前缀推送但漏写 Incident trailer；已推送到共享 feat/v5-selfhost，不可改写。属于远程模型池功能开发，不对应会话展示/错误卡事故。仅豁免该完整 SHA。",
       "approvedBy": "user 2026-11-06 webmw49pf18atbm96 选择「给这一个提交加例外后发布」",
       "expiresAt": "2026-12-06"
+    },
+    {
+      "commit": "de3ca8e4c1a801499aa771172924af06f09d0c8d",
+      "reason": "OCV5-746 Codex 远端容器侧提交 de3ca8e4c（同一准入只认领一次原生线程边界）以 fix(v5) 前缀推送但漏写 Incident trailer；已推送到共享 feat/v5-selfhost，不可改写。修的是开发中自测发现、从未上线的问题，不对应任何线上事故。仅豁免该完整 SHA。",
+      "approvedBy": "user 2026-11-08 webmw4oodqfrsmx3n 选择「登记单提交例外」",
+      "expiresAt": "2026-12-08"
     }
   ]
 }

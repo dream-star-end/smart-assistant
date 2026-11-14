@@ -8,16 +8,18 @@ import { dispatchLiteratureSetup } from './literatureSetup.js'
 
 import { PluginAccountLeaseError } from '../plugins/accountLease.js'
 import { PluginAccountError } from '../plugins/accounts.js'
+import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
+import { BiliAccountSetupError } from '../plugins/biliAccountSetup.js'
+import type { DouyinSetupManager } from '../plugins/douyinSetup.js'
+import { DouyinSetupError } from '../plugins/douyinSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import { KnowledgePlanetAutomationError } from '../plugins/knowledgePlanetAutomation.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
-import { localPluginsForUser } from '../plugins/localPlugins.js'
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
-import type { PluginRuntimeFacade } from '../plugins/runtime.js'
-import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
-import { BiliAccountSetupError } from '../plugins/biliAccountSetup.js'
-import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
+import { localPluginsForUser } from '../plugins/localPlugins.js'
 import { resolvePluginErrorGuidance } from '../plugins/pluginErrorGuidance.js'
+import type { PluginRuntimeFacade } from '../plugins/runtime.js'
+import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
 import { WeiboSetupError } from '../plugins/weiboSetup.js'
 import type { ZhihuSetupManager } from '../plugins/zhihuSetup.js'
@@ -34,6 +36,7 @@ export interface PluginHttpDeps {
   weiboSetup?: WeiboSetupManager
   zhihuSetup?: ZhihuSetupManager
   biliAccountSetup?: BiliAccountSetupManager
+  douyinSetup?: DouyinSetupManager
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
 }
 
@@ -47,7 +50,13 @@ function userIdFrom(value: string): number {
 // One list of QR-setup providers (OCV5-462): the type, both route patterns and the
 // manager table come from it, and setupManager's table is exhaustive, so a new
 // provider cannot silently fall through to another provider's manager.
-export const MANAGED_SETUP_PROVIDERS = ['knowledge-planet', 'weibo', 'zhihu', 'bili-account'] as const
+export const MANAGED_SETUP_PROVIDERS = [
+  'knowledge-planet',
+  'weibo',
+  'zhihu',
+  'bili-account',
+  'douyin',
+] as const
 type ManagedSetupProvider = (typeof MANAGED_SETUP_PROVIDERS)[number]
 const SETUP_PROVIDER_ALT = MANAGED_SETUP_PROVIDERS.join('|')
 const SETUP_SESSION_RE = new RegExp(
@@ -59,6 +68,7 @@ type ManagedSetupManager =
   | WeiboSetupManager
   | ZhihuSetupManager
   | BiliAccountSetupManager
+  | DouyinSetupManager
 
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
@@ -78,6 +88,10 @@ function setupManager(
 ): BiliAccountSetupManager
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: 'douyin',
+): DouyinSetupManager
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
   provider: ManagedSetupProvider,
 ): ManagedSetupManager
 function setupManager(
@@ -89,9 +103,11 @@ function setupManager(
     weibo: deps.weiboSetup,
     zhihu: deps.zhihuSetup,
     'bili-account': deps.biliAccountSetup,
+    douyin: deps.douyinSetup,
   }
   const manager = managers[provider]
-  if (!manager) throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+  if (!manager)
+    throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   return manager
 }
 
@@ -107,14 +123,14 @@ function automation(deps: CommercialHttpDeps & PluginHttpDeps): KnowledgePlanetA
   return deps.knowledgePlanetAutomation
 }
 
-
 function pluginHttpError(
   status: number,
   code: string,
   message: string,
   logMessage?: string,
+  provider?: string,
 ): HttpError {
-  const g = resolvePluginErrorGuidance({ code })
+  const g = resolvePluginErrorGuidance({ code, provider })
   return new HttpError(status, code, message, {
     ...(logMessage ? { logMessage } : {}),
     retrySafe: g.retrySafe,
@@ -150,12 +166,24 @@ function mapSetupError(error: unknown): never {
     !(error instanceof KnowledgePlanetSetupError) &&
     !(error instanceof WeiboSetupError) &&
     !(error instanceof ZhihuSetupError) &&
-    !(error instanceof BiliAccountSetupError)
+    !(error instanceof BiliAccountSetupError) &&
+    !(error instanceof DouyinSetupError)
   )
     throw error
+  // 通用码文案按插件生成(微博保持原文;OCV5-553)。
+  const provider =
+    error instanceof WeiboSetupError
+      ? 'weibo'
+      : error instanceof ZhihuSetupError
+        ? 'zhihu'
+        : error instanceof BiliAccountSetupError
+          ? 'bili-account'
+          : error instanceof DouyinSetupError
+            ? 'douyin'
+            : 'knowledge-planet'
   switch (error.code) {
     case 'NOT_INSTALLED':
-      throw pluginHttpError(403, error.code, 'Plugin is not installed')
+      throw pluginHttpError(403, error.code, 'Plugin is not installed', undefined, provider)
     case 'SETUP_ACTIVE':
     case 'ACCOUNT_ALREADY_EXISTS':
       throw pluginHttpError(409, error.code, 'Plugin account setup conflicts')
@@ -163,9 +191,9 @@ function mapSetupError(error: unknown): never {
     case 'QR_NOT_READY':
       throw pluginHttpError(404, error.code, 'Plugin setup not found')
     case 'TERMS_REQUIRED':
-      throw pluginHttpError(400, error.code, 'terms acceptance is required')
+      throw pluginHttpError(400, error.code, 'terms acceptance is required', undefined, provider)
     case 'CAPACITY_EXCEEDED':
-      throw pluginHttpError(429, error.code, 'Plugin setup capacity is full')
+      throw pluginHttpError(429, error.code, 'Plugin setup capacity is full', undefined, provider)
     case 'CLOSING':
     case 'UNAVAILABLE':
       throw pluginHttpError(
@@ -179,26 +207,51 @@ function mapSetupError(error: unknown): never {
   }
 }
 
-function mapRuntimeError(error: unknown): never {
+/** Provider of the account an error is about, so guidance names the right plugin; looked up only on error. */
+async function accountProvider(
+  deps: CommercialHttpDeps & PluginHttpDeps,
+  userId: number,
+  targetId: string,
+): Promise<string | undefined> {
+  try {
+    return (await deps.pluginRuntime?.targetProvider?.(userId, targetId)) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+function mapRuntimeError(error: unknown, provider?: string): never {
   if (error instanceof ConnectorError)
-    throw pluginHttpError(error.httpStatus, error.code, resolvePluginErrorGuidance({ code: error.code }).message)
+    throw pluginHttpError(error.httpStatus, error.code, resolvePluginErrorGuidance({ code: error.code, provider }).message)
   if (error instanceof PluginRuntimeFacadeError) {
     switch (error.code) {
       case 'BAD_REQUEST':
-        throw pluginHttpError(400, error.code, 'invalid Plugin request')
+        throw pluginHttpError(400, error.code, 'invalid Plugin request', undefined, provider)
       case 'TARGET_NOT_FOUND':
-        throw pluginHttpError(404, error.code, 'Plugin account not found')
+        throw pluginHttpError(404, error.code, 'Plugin account not found', undefined, provider)
       case 'TARGET_STALE':
-        throw pluginHttpError(409, error.code, 'Plugin account changed; retry')
+        throw pluginHttpError(409, error.code, 'Plugin account changed; retry', undefined, provider)
       case 'WRITE_DISABLED':
       case 'WRITE_REQUIRES_CONFIRMATION':
-        throw pluginHttpError(409, error.code, 'Plugin writes are not enabled')
+        throw pluginHttpError(409, error.code, 'Plugin writes are not enabled', undefined, provider)
       case 'RUNTIME_BUSY':
-        throw pluginHttpError(429, error.code, 'Plugin runtime is busy')
+        throw pluginHttpError(429, error.code, 'Plugin runtime is busy', undefined, provider)
       case 'RELINK_REQUIRED':
-        throw pluginHttpError(401, error.code, 'Plugin account must be authorized again')
+        throw pluginHttpError(
+          401,
+          error.code,
+          'Plugin account must be authorized again',
+          undefined,
+          provider,
+        )
       default:
-        throw pluginHttpError(503, error.code, 'Plugin runtime unavailable', error.message)
+        throw pluginHttpError(
+          503,
+          error.code,
+          'Plugin runtime unavailable',
+          error.message,
+          provider,
+        )
     }
   }
   if (error instanceof PluginAccountLeaseError) {
@@ -211,7 +264,13 @@ function mapRuntimeError(error: unknown): never {
       throw new HttpError(404, 'TARGET_NOT_FOUND', 'Plugin account not found')
     if (error.code === 'ACCOUNT_STALE')
       throw new HttpError(409, 'TARGET_STALE', 'Plugin account changed; retry')
-    throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+    throw pluginHttpError(
+      503,
+      'PLUGIN_RUNTIME_UNAVAILABLE',
+      'Plugin runtime unavailable',
+      undefined,
+      provider,
+    )
   }
   throw error
 }
@@ -219,10 +278,7 @@ function mapRuntimeError(error: unknown): never {
 function setupMatch(
   path: string,
 ): { provider: ManagedSetupProvider; sessionId: string; qr: boolean } | null {
-  const match =
-    SETUP_SESSION_RE.exec(
-      path,
-    )
+  const match = SETUP_SESSION_RE.exec(path)
   return match
     ? {
         provider: match[1] as ManagedSetupProvider,
@@ -319,8 +375,7 @@ export async function dispatchPluginsRoute(
       throw new HttpError(400, 'BAD_REQUEST', 'Plugin setup body is invalid')
     const body = raw as Record<string, unknown>
     const provider = setupRoot[1] as ManagedSetupProvider
-    const allowed =
-      provider === 'knowledge-planet' ? ['acceptTerms'] : ['acceptTerms', 'accountId']
+    const allowed = provider === 'knowledge-planet' ? ['acceptTerms'] : ['acceptTerms', 'accountId']
     if (
       !exactBodyKeys(body, allowed) ||
       (body.accountId !== undefined &&
@@ -347,7 +402,13 @@ export async function dispatchPluginsRoute(
                   body.acceptTerms === true,
                   body.accountId as string | undefined,
                 )
-              : await setupManager(deps, provider).start(userId, body.acceptTerms === true)
+              : provider === 'douyin'
+                ? await setupManager(deps, provider).start(
+                    userId,
+                    body.acceptTerms === true,
+                    body.accountId as string | undefined,
+                  )
+                : await setupManager(deps, provider).start(userId, body.acceptTerms === true)
       sendJson(res, 201, setup)
       return
     } catch (error) {
@@ -364,7 +425,7 @@ export async function dispatchPluginsRoute(
       })
       return
     } catch (error) {
-      mapRuntimeError(error)
+      mapRuntimeError(error, await accountProvider(deps, userId, account[1]!))
     }
   }
 
@@ -399,7 +460,7 @@ export async function dispatchPluginsRoute(
       sendJson(res, 200, { writeControl })
       return
     } catch (error) {
-      mapRuntimeError(error)
+      mapRuntimeError(error, await accountProvider(deps, userId, writeAccess[1]!))
     }
   }
 
@@ -434,7 +495,7 @@ export async function dispatchPluginsRoute(
       sendJson(res, 200, { writeControl })
       return
     } catch (error) {
-      mapRuntimeError(error)
+      mapRuntimeError(error, await accountProvider(deps, userId, writePreapproval[1]!))
     }
   }
 

@@ -809,6 +809,8 @@ export interface ResolvedGrokRouteContext {
   modelId: string;
   accountId: bigint;
   slotId: string;
+  /** 'delegate' rows are container-minted; the relay only serves them under an admitted bill. */
+  kind?: "bridge" | "delegate";
 }
 
 export async function resolveGrokRouteContext(args: {
@@ -822,7 +824,7 @@ export async function resolveGrokRouteContext(args: {
   // (terminal billing frames expire them explicitly); delegate rows only ever
   // extend their short heartbeat lease, so a crashed gateway can never park a
   // route in the account cap for a week.
-  const res = await query<{ model_id: string; account_id: string; slot_id: string }>(
+  const res = await query<{ model_id: string; account_id: string; slot_id: string; kind: string }>(
     `UPDATE grok_route_contexts c
         SET last_used_at = NOW(),
             expires_at = GREATEST(
@@ -840,7 +842,7 @@ export async function resolveGrokRouteContext(args: {
         AND a.provider = 'grok'
         AND a.runtime_channel = $4
         AND a.status = 'active'
-      RETURNING c.model_id, c.account_id::text AS account_id, c.slot_id`,
+      RETURNING c.model_id, c.account_id::text AS account_id, c.slot_id, c.kind`,
     [
       tokenHash,
       String(args.containerId),
@@ -852,7 +854,36 @@ export async function resolveGrokRouteContext(args: {
     args.runner,
   );
   const row = res.rows[0];
-  return row ? { modelId: row.model_id, accountId: BigInt(row.account_id), slotId: row.slot_id } : null;
+  return row
+    ? {
+        modelId: row.model_id,
+        accountId: BigInt(row.account_id),
+        slotId: row.slot_id,
+        kind: row.kind === "delegate" ? "delegate" : "bridge",
+      }
+    : null;
+}
+
+/**
+ * A delegate route is only usable while a delegate billing admission for it is in flight
+ * (delegateEngineBillingRuntime admit binds routeTokenHash into the journal ctx). Without
+ * this a container could mint a route and skip admission, running Grok unbilled.
+ */
+export async function hasInflightDelegateGrokBilling(args: {
+  token: string;
+  containerId: number;
+  userId: bigint;
+  runner?: QueryRunner;
+}): Promise<boolean> {
+  const res = await query(
+    `SELECT 1 FROM request_finalize_journal
+      WHERE user_id = $2 AND container_id = $3 AND state = 'inflight'
+        AND ctx->'grokExecutionDescriptor'->>'routeTokenHash' = $1
+      LIMIT 1`,
+    [hashRouteToken(args.token), String(args.userId), String(args.containerId)],
+    args.runner,
+  );
+  return (res.rowCount ?? 0) > 0;
 }
 
 export async function expireGrokRouteContext(token: string): Promise<boolean> {

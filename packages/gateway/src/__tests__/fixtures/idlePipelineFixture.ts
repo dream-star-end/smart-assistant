@@ -1,3 +1,4 @@
+import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../../scripts/lib/testDatabaseIdentity.mjs";
 /**
  * OCV5-296 idle chain. Real SessionManager.submit, real CcbAdapter,
  * real SubprocessRunner, and this checkout's claude-code-best entry.
@@ -20,6 +21,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { IDLE_COMPACT_PROMPT, writeIdleCandidate, writeIdleNative } from "../../boxIdleCompact.js";
 import { _setModelCatalogClientForTests } from "../../modelCatalogClient.js";
+import { mintIdleUserAuthority, type IdleAuthorityRecord } from "./idleAuthorityFixture.js";
 import { installIdleFaultFixture, armIdleFault, saveIdleCheckpoint, restoreIdleCheckpoint,
    captureIdleTranscript, readRecoveredConversation, assertRecoveredContent, type IdleCheckpoint } from "./idleCrashFixture.js";
 
@@ -79,6 +81,7 @@ const MAX_HTTP = 80;
 const GROW_CHARS = 180_000;
 const GROW_TARGET = 8_860_467;
 let summaryRequested = false;
+let defaultHighFirstBusiness = false;
 let growthActive = false;
 let growthRound = 0;
 let growthStopRound = 60;
@@ -93,6 +96,7 @@ const pendingById = new Map<string, string>();
 let mcpSerial = 0;
 const growthBodies: string[] = [];
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+assertTestDatabaseUrl(TEST_DB);
 const SCHEMA = `ocv5_296_idle_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/12";
 
@@ -169,7 +173,31 @@ function restoreEnv(name: string, previous: string | undefined): void {
   else process.env[name] = previous;
 }
 
-export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localAuth" | "seam" | "barriers"): Promise<void> {
+type IdleCase = "defaultLow" | "defaultHigh" | "short" | "fresh" | "live2" | "grow2" | "localAuth" | "seam" | "barriers";
+
+/** These legacy cases exercise the idle protocol even when their synthetic
+ * leaf reports only 20 tokens. They are explicitly forced, not a default
+ * policy acceptance test. Restore on success, failure and cleanup failure. */
+export async function runIdleCase(mode: IdleCase): Promise<void> {
+  const previousAlways = process.env.OC_BOX_IDLE_COMPACT_ALWAYS;
+  const previousHigh = defaultHighFirstBusiness;
+  const previousGrowth = growthActive;
+  const previousSummary = summaryRequested;
+  const defaultPolicy = mode === "defaultLow" || mode === "defaultHigh";
+  process.env.OC_BOX_IDLE_COMPACT_ALWAYS = defaultPolicy ? "0" : "1";
+  defaultHighFirstBusiness = mode === "defaultHigh";
+  growthActive = false;
+  summaryRequested = false;
+  try { await runIdleProtocolCase(mode); }
+  finally {
+    restoreEnv("OC_BOX_IDLE_COMPACT_ALWAYS", previousAlways);
+    defaultHighFirstBusiness = previousHigh;
+    growthActive = previousGrowth;
+    summaryRequested = previousSummary;
+  }
+}
+
+async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
@@ -191,7 +219,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
   let poolEnd: (() => Promise<void>) | undefined;
   let redisQuit: (() => Promise<void>) | undefined;
   let restoreLocalAuth: (() => void) | undefined;
-  const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT };
+  const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT, forcedIdleProtocol: process.env.OC_BOX_IDLE_COMPACT_ALWAYS === "1" };
   let holdNextSettlement = false;
   let holdSummaryCommit = false;
   let holdSourceCommit = false;
@@ -330,9 +358,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       }
       await redis.quit();
     };
-    const ident = await admin.query("SELECT current_database() AS db, inet_server_port() AS port");
-    assert.equal(ident.rows[0].db, "openclaude_test");
-    assert.equal(Number(ident.rows[0].port), 55432);
+    await assertConnectedTestDatabase(admin);
     const publicUsers = await admin.query("SELECT to_regclass('public.users') AS reg");
     assert.equal(publicUsers.rows[0].reg, null);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
@@ -414,12 +440,6 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
     candidateDb.setPoolOverride(pool);
     process.env.OC_BOX_MODEL_API = "1";
     process.env.OC_BOX_TOOL_BRIDGE = "1";
-    // OCV5-297 dispatches an idle turn only when the leaf reports compactRequired;
-    // these short synthetic chains never need it. This fixture proves the idle
-    // pipeline itself (barriers, apply, next user), so it uses the documented
-    // switch that restores dispatch after every terminal Box turn. The gate
-    // decision is covered by boxIdleOcv5297.test.ts.
-    process.env.OC_BOX_IDLE_COMPACT_ALWAYS = "1";
     const billingRedis = candidatePre.wrapIoredisForPreCheck(redis);
     const supervisor = readFileSync(join(CHECKOUT, "scripts/ocv5-289/box_supervisor.py"));
     const keeper = readFileSync(join(CHECKOUT, "scripts/ocv5-289/box_keeper.py"));
@@ -698,7 +718,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
     const { SessionManager } = await import("../../sessionManager.js");
     const { CcbAdapter } = await import("../../engine/ccbAdapter.js");
     const { setV3MasterSinkSingleton } = await import("../../v3MasterSink.js");
-    const protocol = await import("@openclaude/protocol");
+
     setV3MasterSinkSingleton({
       persistOrQueue: async () => ({ ok: true }),
       attemptOnce: async () => { throw new Error("unused"); },
@@ -738,22 +758,15 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       defaults: { permissionMode: "bypassPermissions", model: MODEL },
     } as never);
     const onEvent = (event: { kind?: string }) => { events.push(event.kind ?? "unknown"); };
-    // Each user turn carries its own freshly signed authority + lease, as the
-    // master issues them in production. One case-wide lease (30 min) expired
-    // mid-case once grow2 alone ran past 30 minutes on a loaded host.
-    const turnAuthority = () => {
-      const authority = signAuthority(protocol, privateKey, keyId);
-      return {
-        authorityEnvelope: authority.authority,
-        leaseEnvelope: authority.lease,
-        executionDescriptor: {
-          canonicalModel: MODEL, contextWindow: 200_000, capabilityZero: true,
-          supportsThinking: false, supportsVision: false, supportedEfforts: [],
-          contextOwner: "box-native-v1" as const,
-        },
-      };
+    const authorityRecords: Array<IdleAuthorityRecord & { source: string }> = [];
+    report.userAuthorities = authorityRecords;
+    // One signature pair per new inbound; CCB's internal live continuation retains it.
+    const newModelAuthority = (source: string) => {
+      const minted = mintIdleUserAuthority(privateKey, keyId, MODEL);
+      authorityRecords.push({ source, ...minted.record });
+      return minted.modelAuthority;
     };
-    if (mode === "short") {
+    if (mode === "short" || mode === "defaultLow" || mode === "defaultHigh") {
     const adapter = new CcbAdapter({
       sessionKey: "agent:main:webchat:dm:idle-peer",
       agentId: "main",
@@ -787,9 +800,14 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       executionTarget: { kind: "local" },
       providerTag: "ccb",
     } as never;
+    // scheduleIdleDrain only operates on sessions owned by this manager.
+    // Default-policy cases exercise that real lifecycle, not a detached runner.
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      (sm as unknown as { sessions: Map<string, unknown> }).sessions.set("agent:main:webchat:dm:idle-peer", session);
+    }
     let firstError: string | undefined;
     try {
-      await sm.submit(session, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+      await sm.submit(session, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-input") });
     } catch (error) {
       firstError = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
     }
@@ -822,11 +840,23 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       if (committed >= 1) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    // OCV5-755 deliberately defers default high-usage compaction to cache expiry.
+    // Observe the real scheduling result, then prove the next user supersedes it.
+    const idleSession = session as unknown as { _idlePreExpiryTimer?: ReturnType<typeof setTimeout>; _idlePreExpirySource?: { turnKey: string } };
+    if (mode === "defaultHigh") {
+      for (let attempt = 0; attempt < 50 && !idleSession._idlePreExpiryTimer; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.ok(idleSession._idlePreExpiryTimer, "high usage arms pre-expiry idle rather than immediate compaction");
+      assert.equal(idleSession._idlePreExpirySource?.turnKey, modelHit.cred?.ocTurnKey);
+      assert.deepEqual(listJson(join(HOME, "idle-native")), []);
+      assert.deepEqual(listJson(join(HOME, "idle-ops")), []);
+    }
     const beforeSecond = hits.length;
     let secondSubmitError: unknown;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        await sm.submit(session, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+        await sm.submit(session, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary next") });
         secondSubmitError = undefined;
         break;
       } catch (error) {
@@ -839,11 +869,31 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
     if (secondSubmitError) throw secondSubmitError;
     const short = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ applied?: boolean; summaryText?: string }>;
     report.nativeFiles = short;
-    assert.equal(short.some((file) => file.applied && !file.summaryText), true, JSON.stringify(short));
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      assert.deepEqual(short, [], "default policy must not compact immediately after a turn");
+      assert.deepEqual(listJson(join(HOME, "idle-ops")), [], "default policy creates no immediate idle op");
+      assert.equal(idleSession._idlePreExpiryTimer, undefined, "next low-usage user supersedes the old pre-expiry timer");
+    } else {
+      assert.equal(short.some((file) => file.applied && !file.summaryText), true, JSON.stringify(short));
+    }
     const added = hits.slice(beforeSecond);
     report.secondHits = added;
-    assert.equal(added.some((hit) => hit.summary), false);
+    assert.equal(added.some((hit) => hit.summary || hit.kind === "idle-summary"), false);
+    if (mode === "defaultHigh") {
+      const stock = added.filter((hit) => hit.url === "/v1/messages" && hit.kind === "stock-auto-summary");
+      report.stockSummaryHttp = stock.length;
+      assert.ok(stock.length <= 1, "a single next user must not trigger repeated stock compaction");
+      const nextBusiness = added.filter((hit) => hit.url === "/v1/messages" && hit.kind === "business" && hit.status === 200);
+      assert.equal(nextBusiness.length, 1, "next ordinary business reaches the real model once");
+    }
     assert.equal(added.some((hit) => hit.url === "/v1/messages" && hit.status === 200), true);
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      // SSE/gateway completion precedes the egress transaction's COMMIT.
+      for (const hit of hits.filter((item) => item.url === "/v1/messages" && item.status === 200)) {
+        assert.ok(hit.requestId);
+        await waitForCommitted(admin, SCHEMA, hit.requestId);
+      }
+    }
     const ledgers = await pool.query(
       `SELECT u.request_id, u.status AS usage_status, u.cost_credits::text, u.turn_key,
               l.id::text AS ledger_id, l.delta::text, l.ref_id
@@ -851,12 +901,42 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
          JOIN credit_ledger l ON l.id = u.ledger_id
         ORDER BY u.id`);
     report.ledgers = ledgers.rows;
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      const sourceProofs = hits.filter((hit) => hit.url === "/internal/box/idle-proof" && hit.status === 200)
+        .map((hit) => JSON.parse(hit.body ?? "{}") as { status?: string; turnKey?: string; compactRequired?: boolean; requestId?: string });
+      const sourceProof = sourceProofs.find((proof) => proof.status === "terminal" && proof.requestId === modelHit.requestId);
+      assert.ok(sourceProof, "real committed source proof is required");
+      assert.equal(sourceProof.compactRequired, mode === "defaultHigh");
+      report.defaultSourceProof = sourceProof;
+      const sourceUsage = await pool.query<{ input_tokens: string; cache_read_tokens: string; output_tokens: string }>(
+        "SELECT input_tokens::text,cache_read_tokens::text,output_tokens::text FROM usage_records WHERE request_id=$1", [modelHit.requestId]);
+      assert.equal(sourceUsage.rows.length, 1);
+      assert.equal(sourceUsage.rows[0]!.input_tokens, mode === "defaultHigh" ? "160000" : "20");
+      assert.equal(sourceUsage.rows[0]!.cache_read_tokens, mode === "defaultHigh" ? "7000" : "0");
+      assert.equal(sourceUsage.rows[0]!.output_tokens, "4");
+      report.defaultSourceUsage = sourceUsage.rows[0];
+      assert.equal(ledgers.rows.filter((row: { request_id: string }) => row.request_id === modelHit.requestId).length, 1);
+      const nextBusiness = added.filter((hit) => hit.url === "/v1/messages" && hit.status === 200 && hit.kind === "business");
+      assert.equal(nextBusiness.length, 1);
+      assert.equal(ledgers.rows.filter((row: { request_id: string }) => row.request_id === nextBusiness[0]!.requestId).length, 1);
+      assert.notEqual(modelHit.cred?.ocTurnKey, nextBusiness[0]!.cred?.ocTurnKey);
+      const stock = added.filter((hit) => hit.url === "/v1/messages" && hit.kind === "stock-auto-summary" && hit.status === 200);
+      assert.deepEqual(ledgers.rows.map((row: { request_id: string }) => row.request_id).sort(),
+        [modelHit.requestId, nextBusiness[0]!.requestId, ...stock.map((hit) => hit.requestId)].sort(),
+        "only source, next business and an observed stock summary may be charged");
+      const nextBook = ledgers.rows.find((row: { request_id: string }) => row.request_id === nextBusiness[0]!.requestId)!;
+      for (const hit of stock) {
+        const stockBook = ledgers.rows.find((row: { request_id: string }) => row.request_id === hit.requestId)!;
+        assert.equal(stockBook.turn_key, nextBook.turn_key, "stock summary is a separate request on the next business turn");
+        assert.notEqual(stockBook.request_id, nextBook.request_id);
+      }
+    }
     const seenRequests = new Set<string>();
     const seenTurns = new Set<string>();
     for (const row of ledgers.rows as Array<{ request_id: string; turn_key: string; delta: string }>) {
       assert.equal(seenRequests.has(row.request_id), false, row.request_id);
       seenRequests.add(row.request_id);
-      assert.equal(seenTurns.has(row.turn_key), false, row.turn_key);
+      if (mode !== "defaultHigh") assert.equal(seenTurns.has(row.turn_key), false, row.turn_key);
       seenTurns.add(row.turn_key);
       assert.ok(BigInt(row.delta) < 0n);
     }
@@ -903,7 +983,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       const beforeFresh = hits.length;
       let freshError = "";
       try {
-        await sm.submit(freshSession, "ordinary leaf", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+        await sm.submit(freshSession, "ordinary leaf", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary leaf") });
       } catch (error) {
         freshError = error instanceof Error ? error.message : String(error);
       }
@@ -927,8 +1007,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       assert.equal(freshIds.includes(heldId), true, heldId);
       const candidateFile = join(HOME, "idle-candidates", `${encodeURIComponent(freshKey)}.json`);
       assert.equal(existsSync(candidateFile), true);
-      const freshCandidateTurn = (JSON.parse(readFileSync(candidateFile, "utf8")) as { turnKey?: string }).turnKey;
-      assert.ok(freshCandidateTurn, "fresh candidate has no turnKey");
+      const sourceCandidateTurnKey = (JSON.parse(readFileSync(candidateFile, "utf8")) as { turnKey: string }).turnKey;
       const usageHidden = await pool.query<{ request_id: string }>(
         "SELECT request_id FROM usage_records WHERE request_id = $1 OR request_id = $2",
         [freshIds[0], freshIds[1]]);
@@ -946,7 +1025,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       const blockedAt = hits.filter((hit) => hit.url === "/v1/messages").length;
       let blockedError = "";
       try {
-        await sm.submit(freshSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+        await sm.submit(freshSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("blocked-user") });
       } catch (error) {
         blockedError = error instanceof Error ? error.message : String(error);
       }
@@ -969,7 +1048,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       }
       assert.equal(settled, true, "held request ids did not become committed usage");
       const beforeNext = hits.length;
-      await sm.submit(freshSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+      await sm.submit(freshSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary next") });
       const nextHits = hits.slice(beforeNext);
       const nextModel = nextHits.filter((hit) => hit.url === "/v1/messages");
       report.nextHits = nextModel.map((hit) => ({
@@ -981,14 +1060,16 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       const nextBusiness = nextModel.filter((hit) => hit.status === 200 && hit.mentions?.next === true && hit.kind !== "idle-summary");
       assert.equal(nextBusiness.length, 1, JSON.stringify(report.nextHits));
       assert.equal(freshIds.includes(nextBusiness[0]!.requestId ?? ""), false);
-      // The next turn consumed the fresh source's candidate. Since OCV5-297 every
-      // terminal Box turn records its own candidate for the background drain, so a
-      // candidate may exist again here, but never the fresh source's.
-      const leftTurn = existsSync(candidateFile)
-        ? (JSON.parse(readFileSync(candidateFile, "utf8")) as { turnKey?: string }).turnKey
-        : undefined;
-      report.candidateAfterNext = leftTurn ?? null;
-      assert.notEqual(leftTurn, freshCandidateTurn, "next user turn left the fresh source candidate unconsumed");
+      const nextTurnKey = nextBusiness[0]!.cred?.ocTurnKey;
+      assert.equal(typeof nextTurnKey, "string");
+      assert.notEqual(nextTurnKey, sourceCandidateTurnKey);
+      if (existsSync(candidateFile)) {
+        const nextCandidate = JSON.parse(readFileSync(candidateFile, "utf8")) as { sessionKey: string; turnKey: string };
+        assert.equal(nextCandidate.sessionKey, freshKey);
+        assert.equal(nextCandidate.turnKey, nextTurnKey, "only the new business turn may remain a candidate");
+        assert.notEqual(nextCandidate.turnKey, sourceCandidateTurnKey, "settled source candidate must not occupy the next turn");
+        report.nextBusinessCandidate = nextCandidate;
+      }
       const nativeRows = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ applied?: boolean; summaryText?: string; sessionId?: string }>;
       const ops = listJson(join(HOME, "idle-ops")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ disposition?: string; summaryText?: string; sourceSessionId?: string }>;
       report.nativeFiles = nativeRows;
@@ -1007,13 +1088,8 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         assert.equal("requestId" in proof, false);
         assert.deepEqual([...(proof.requestIds as string[])].sort(), [...freshIds].sort());
       }
-      // The next turn's usage/ledger row settles asynchronously after submit()
-      // resolves; reading the books at once raced it on CI (nextBooks.length 0,
-      // PR #780 idle 2/3). Wait for it, bounded, like the fresh rows above.
-      await until(async () => (await pool.query(
-        `SELECT 1 FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
-          WHERE u.user_id = 3 AND u.request_id <> ALL($1::text[])`, [freshIds])).rows.length > 0,
-      30_000, "next turn usage/ledger row");
+      assert.ok(nextBusiness[0]!.requestId);
+      await waitForCommitted(admin, SCHEMA, nextBusiness[0]!.requestId);
       const books = await pool.query<{ request_id: string; turn_key: string; ledger_id: string; delta: string; balance_after: string }>(
         `SELECT u.request_id, u.turn_key, l.id::text AS ledger_id, l.delta::text, l.balance_after::text
            FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
@@ -1068,7 +1144,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         executionTarget: { kind: "local" }, providerTag: "ccb",
       } as never;
       adapterShutdown = () => sourceAdapter.shutdown();
-      await sm.submit(sourceSession, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+      await sm.submit(sourceSession, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-input") });
       const sourceHit = hits.find((hit) => hit.url === "/v1/messages");
       report.sourceCred = sourceHit?.cred ?? null;
       report.sourceStatus = sourceHit?.status ?? null;
@@ -1321,7 +1397,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       const before = hits.length;
       let liveError = "";
       let submitDone = false;
-      const submitPromise = sm.submit(liveSession, "grow", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() })
+      const submitPromise = sm.submit(liveSession, "grow", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("grow") })
         .then(() => { submitDone = true; }, (error) => {
           liveError = error instanceof Error ? error.message : String(error);
           submitDone = true;
@@ -1349,7 +1425,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         assert.equal(hits.filter((hit) => hit.summary).length, 0);
         const beforeSourceBlocked = hits.length;
         let sourceBlocked = "";
-        try { await sm.submit(liveSession, "source-pending-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() }); }
+        try { await sm.submit(liveSession, "source-pending-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-pending-user") }); }
         catch (error) { sourceBlocked = error instanceof Error ? error.message : String(error); }
         assert.match(sourceBlocked, /IDLE_RECOVERY_PENDING/);
         assert.equal(hits.slice(beforeSourceBlocked).filter((hit) => hit.url === "/v1/messages").length, 0);
@@ -1358,7 +1434,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         report.sourceCommitted = sourceRequestId;
         // Re-enter through the normal same-session consumer. No helper call to
         // finishIdleUnderLock and no hand-written op or summary.
-        const recovery = sm.submit(liveSession, "resume-after-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() })
+        const recovery = sm.submit(liveSession, "resume-after-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("resume-after-source") })
           .then(() => "ok", (error) => error instanceof Error ? error.message : String(error));
         await until(() => heldCommits.length > 0, 120_000, "summary COMMIT after source recovery");
         assert.equal(heldKinds.at(-1), "summary");
@@ -1381,7 +1457,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
           : { rows: [{ usage_n: "missing-request-id", state: null }] };
         const httpAtHold = hits.filter((hit) => hit.url === "/v1/messages").length;
         let blockedText = "";
-        const blockedPromise = sm.submit(liveSession, "barrier-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() })
+        const blockedPromise = sm.submit(liveSession, "barrier-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("barrier-user") })
           .then(() => "ok", (error) => {
             blockedText = error instanceof Error ? error.message : String(error);
             return blockedText;
@@ -1523,7 +1599,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
           const blockedAt = hits.filter((hit) => hit.url === "/v1/messages").length;
           let blocked = "";
           try {
-            await sm.submit(liveSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+            await sm.submit(liveSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("blocked-user") });
           } catch (error) {
             blocked = error instanceof Error ? error.message : String(error);
           }
@@ -1542,7 +1618,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         let nextError = "";
         for (let attempt = 0; attempt < 5; attempt += 1) {
           try {
-            await sm.submit(liveSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+            await sm.submit(liveSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary next") });
             nextError = "";
             break;
           } catch (error) {
@@ -1619,7 +1695,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         let secondError = "";
         for (let attempt = 0; attempt < 8; attempt += 1) {
           try {
-            await sm.submit(liveSession, "second-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+            await sm.submit(liveSession, "second-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("second-source") });
             secondError = "";
             break;
           } catch (error) {
@@ -1671,7 +1747,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
           await coldRunner();
           const startHits = hits.length;
           const usageBefore = Number((await pool.query("SELECT count(*)::int AS n FROM usage_records")).rows[0].n);
-          const interrupted = sm.submit(liveSession, `crash-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() })
+          const interrupted = sm.submit(liveSession, `crash-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority(`crash-${windowName}`) })
             .then(() => "unexpected-success", (error) => error instanceof Error ? error.message : String(error));
           await until(() => existsSync(join(faultControl, "reached.json")), 90_000, `real ${windowName} cut point`);
           const reached = JSON.parse(readFileSync(join(faultControl, "reached.json"), "utf8"));
@@ -1694,7 +1770,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
           restoreIdleCheckpoint(atFault);
           await coldRunner();
           try {
-            await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: turnAuthority() });
+            await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority(`recover-${windowName}`) });
           } finally {
             captureIdleTranscript(HOME, nativeId, join(rawDir, `ocv5-296-post-user-${windowName}-${SCHEMA.slice(-6)}`));
           }
@@ -2111,7 +2187,9 @@ function prepareModelSpool(raw: string): void {
     } catch { return ["mcp__ocbridge__t0"]; }
   })();
   if (!growthActive || classified.kind === "idle-summary") {
-    spoolBuf = textSpool(initTools);
+    const highSource = defaultHighFirstBusiness && classified.kind === "business";
+    if (highSource) defaultHighFirstBusiness = false;
+    spoolBuf = textSpool(initTools, highSource);
     if (!growthActive) pendingById.clear();
     return;
   }
@@ -2151,20 +2229,24 @@ function stripInit(buffer: Buffer): Buffer {
   return Buffer.from(text.slice(newline + 1));
 }
 
-function textSpool(tools: string[]): Buffer {
+function textSpool(tools: string[], highSource = false): Buffer {
   const model = "claude-opus-5-5";
+  // Only the first default-high business leaf reaches the real usage floor.
+  // Both stock and dedicated idle summaries retain the ordinary low usage.
+  const input = highSource ? 160_000 : 20;
+  const cacheRead = highSource ? 7_000 : 0;
   const text = summaryRequested ? "outer-history-summary" : "DONE-6K";
   const event = (value: unknown) => ({ type: "stream_event", event: value });
   const rows = [
     { type: "system", subtype: "init", tools, mcp_servers: [{}] },
-    event({ type: "message_start", message: { id: "msg_idle_6k", model, role: "assistant", content: [], usage: { input_tokens: 20, output_tokens: 0 } } }),
+    event({ type: "message_start", message: { id: "msg_idle_6k", model, role: "assistant", content: [], usage: { input_tokens: input, cache_read_input_tokens: cacheRead, output_tokens: 0 } } }),
     event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
     event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
     { type: "assistant", message: { id: "msg_idle_6k", model, role: "assistant", content: [{ type: "text", text }] } },
     event({ type: "content_block_stop", index: 0 }),
-    event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 20, output_tokens: 4 } }),
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: input, cache_read_input_tokens: cacheRead, output_tokens: 4 } }),
     event({ type: "message_stop" }),
-    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 20, output_tokens: 4 } },
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: input, cache_read_input_tokens: cacheRead, output_tokens: 4 } },
   ];
   return Buffer.from(rows.map((row) => JSON.stringify(row) + "\n").join(""));
 }
@@ -2371,37 +2453,4 @@ async function execStage(plan: {
     rmSync(plan.cwd, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
   }
-}
-
-type ProtocolModule = typeof import("@openclaude/protocol");
-
-function signAuthority(protocol: Pick<ProtocolModule,
-  "MODEL_AUTHORITY_VERSION" | "AUTHORITY_TTL_MS" | "authoritySigningInput" | "encodeAuthorityEnvelope" | "turnLeaseSigningInput" | "encodeTurnLeaseEnvelope"
->, privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"], keyId: string): { authority: string; lease: string } {
-  const now = Date.now();
-  const expiresAt = now + protocol.AUTHORITY_TTL_MS;
-  const payload: Parameters<ProtocolModule["authoritySigningInput"]>[0] = {
-    v: protocol.MODEL_AUTHORITY_VERSION, keyId, uid: 3, containerId: 7,
-    authorityTurnId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", connectionChallenge: "chal-idle",
-    canonicalModel: MODEL, engine: "ccb",
-    executionDescriptor: {
-      capabilityProfile: {
-        supportsVision: false,
-        reasoning: { supported: [], codexModelDefault: null },
-        ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" },
-      },
-      capabilitySchemaVersion: 1, contextWindow: 200_000, supportedEfforts: [], supportsVision: false,
-    },
-    executionRevision: "b".repeat(64), securityEpoch: 12,
-    issuedAt: expiresAt - protocol.AUTHORITY_TTL_MS, expiresAt,
-  };
-  const lease: Parameters<ProtocolModule["turnLeaseSigningInput"]>[0] = {
-    v: protocol.MODEL_AUTHORITY_VERSION, keyId, uid: 3, containerId: 7,
-    authorityTurnId: payload.authorityTurnId, canonicalModel: MODEL, securityEpoch: 12,
-    connectionChallenge: "chal-idle", issuedAt: now - 60_000, expiresAt: now + 30 * 60_000,
-  };
-  return {
-    authority: protocol.encodeAuthorityEnvelope(payload, cryptoSign(null, protocol.authoritySigningInput(payload), privateKey)),
-    lease: protocol.encodeTurnLeaseEnvelope(lease, cryptoSign(null, protocol.turnLeaseSigningInput(lease), privateKey)),
-  };
 }

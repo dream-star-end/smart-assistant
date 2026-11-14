@@ -91,6 +91,18 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Build same-candidate CCB tool host
+        env:
+          OC_BUN_BIN: ${{ steps.bun.outputs.bun-path }}
+        run: |
+          source scripts/v5-runtime-release-lib.sh
+          oc_hotcfg_build_ccb_dist "$PWD" ""
+
+      - name: Install real tool-host prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Install CCB from lockfile
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts
@@ -106,7 +118,22 @@ jobs:
         env:
           # setup-bun 装在 ~/.bun/bin;ccbRealCliHeaders 缺省找 /usr/bin/bun
           BUN_BIN: ${{ steps.bun.outputs.bun-path }}
-        run: .github/scripts/gateway-test-shard.sh ${{ matrix.kind }} ${{ matrix.shard }}
+        run: |
+          # Match the real container identity; never weaken the worker's UID guard.
+          runtime_tree=$(mktemp -d /tmp/oc-selfhost-gateway-ci-XXXXXX)
+          trap 'sudo rm -rf -- "$runtime_tree"' EXIT
+          cp -a --reflink=auto "$GITHUB_WORKSPACE/." "$runtime_tree/"
+          getent group 1000 >/dev/null || sudo groupadd --gid 1000 oc-gateway-runtime
+          getent passwd 1000 >/dev/null || sudo useradd --uid 1000 --gid 1000 --no-create-home --home-dir /home/agent oc-gateway-runtime
+          sudo install -d -o 1000 -g 1000 /home/agent/.openclaude/generated /home/agent/.openclaude/commissioning /home/box/.claude/projects
+          sudo chown -R 1000:1000 "$runtime_tree" /home/agent /home/box
+          node_bin=$(readlink -f "$(command -v node)")
+          if [[ "$node_bin" != /usr/local/bin/node ]]; then sudo ln -sfn "$node_bin" /usr/local/bin/node; fi
+          bun_bin=$(readlink -f "$BUN_BIN")
+          if [[ "$bun_bin" != /usr/local/bin/bun ]]; then sudo install -m 755 "$bun_bin" /usr/local/bin/bun; fi
+          sudo -u '#1000' -g '#1000' env HOME=/home/agent CI=true PATH="/usr/local/bin:$PATH" \
+            BUN_BIN=/usr/local/bin/bun TEST_DATABASE_URL="$TEST_DATABASE_URL" \
+            bash -c 'set -e; cd "$1"; test "$(id -u)" = 1000; .github/scripts/gateway-test-shard.sh ${{ matrix.kind }} ${{ matrix.shard }}' -- "$runtime_tree"
 
   v5-ops:
     name: selfhost-v5-ops

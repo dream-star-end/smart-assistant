@@ -337,13 +337,14 @@ export function useSessionModelAndCollab({
       // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
       // default-write path; first send persists against the minted session id.
       if (!activeId && !asDefault) return;
-      // Failed save: solo/team keep the pick, only advisor rolls back (keepCollabChoiceOnSaveFailure).
+      // Solo/team keep the user's pick on a failed save (see keepCollabChoiceOnSaveFailure);
+      // only advisor rolls back, so a failing save can never pin the session to advisor.
+      // Inline error only (cleared on the next save): an error toast never auto-dismisses.
       const failSave = (msg: string) => {
         if (!keepCollabChoiceOnSaveFailure(mode)) {
           setCollabUi(previous);
         }
         setCollabSaveError(msg);
-        toast(msg, "error");
       };
       if (activeId && sockRef.current) {
         if (modelId) sockRef.current.setSessionModel(activeId, modelId);

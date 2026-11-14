@@ -1,3 +1,4 @@
+import { readMigrationSource } from "../../__tests__/helpers/migrationSource.js";
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
@@ -21,12 +22,18 @@ import {
   computeAggregatedRemoteCatalogState,
   preheatRemotePoolSession,
   rankRemotePoolCandidates,
+  REMOTE_SSH_PROBE_TIMEOUT_MS,
   toRemotePoolModelId,
   verifyAndMaterializePinnedKnownHosts,
   type RemoteCandidateMember,
 } from '../remoteBrainPool.js'
 
 describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Projection', () => {
+  it('probe timeout covers a cold discovery pass but stays bounded', () => {
+    // Live node: first cold probe >15s (REMOTE_SSH_PROBE_TIMEOUT), warm ~8s.
+    assert.equal(REMOTE_SSH_PROBE_TIMEOUT_MS, 45_000)
+    assert.ok(REMOTE_SSH_PROBE_TIMEOUT_MS > 15_000 && REMOTE_SSH_PROBE_TIMEOUT_MS <= 60_000)
+  })
   it('formatRemoteModelDisplayName appends " 远端" exactly once for remote_pool models', () => {
     assert.equal(formatRemoteModelDisplayName('Opus 4.7 (1M)', 'local', 'claude-opus-4-7'), 'Opus 4.7 (1M)')
     assert.equal(
@@ -285,6 +292,11 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const claudeDir = join(fakeHome, '.claude')
       const codexDir = join(fakeHome, '.codex')
       execFileSync('mkdir', ['-p', claudeDir, codexDir])
+      const fakeBin = join(fakeHome, 'bin')
+      execFileSync('mkdir', ['-p', fakeBin])
+      writeFileSync(join(fakeBin, 'claude'), '#!/bin/sh\n# {id:"claude-opus-4-7",family:"opus",display_name:"Opus 4.7",advisor_rank:1},{id:"claude-sonnet-5",family:"sonnet",display_name:"Sonnet 5",advisor_rank:2},{id:"claude-haiku-4-5",family:"haiku",display_name:"Haiku",advisor_rank:3}\necho fixture-1\n', { mode: 0o755 })
+      writeFileSync(join(fakeBin, 'codex'), '#!/bin/sh\nif [ "$1" = "--version" ]; then echo fixture-1; else exit 1; fi\n', { mode: 0o755 })
+      const probeEnv = { ...process.env, HOME: fakeHome, PATH: `${fakeBin}:${process.env.PATH}` }
       const nowSec = Math.floor(Date.now() / 1000)
 
       for (const exp of [(nowSec - 3600) * 1000, nowSec - 3600, 0]) {
@@ -308,7 +320,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
         const expiredProbe = JSON.parse(
           execFileSync('python3', [scriptPath, '--probe'], {
             encoding: 'utf8',
-            env: { ...process.env, HOME: fakeHome },
+            env: probeEnv,
           }),
         ) as {
           profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
@@ -332,7 +344,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const validProbe = JSON.parse(
         execFileSync('python3', [scriptPath, '--probe'], {
           encoding: 'utf8',
-          env: { ...process.env, HOME: fakeHome },
+          env: probeEnv,
         }),
       ) as {
         profiles: Array<{ engine: string; logged_in: boolean; discovered_models: unknown[] }>
@@ -352,7 +364,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const defaultModelsProbe = JSON.parse(
         execFileSync('python3', [scriptPath, '--probe'], {
           encoding: 'utf8',
-          env: { ...process.env, HOME: fakeHome },
+          env: probeEnv,
         }),
       ) as {
         profiles: Array<{
@@ -416,7 +428,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
       const multiProbe = JSON.parse(
         execFileSync('python3', [scriptPath, '--probe'], {
           encoding: 'utf8',
-          env: { ...process.env, HOME: fakeHome },
+          env: probeEnv,
         }),
       ) as {
         profiles: Array<{
@@ -679,10 +691,7 @@ describe('OCV5-721 P1: Remote Brain Pool, CC Interactive Guard & Model Suffix Pr
     )
 
     // 7. Admin activate/disable stored procedures in 0333_remote_agent_pool.sql explicitly reset pool_auto_disabled = FALSE (W1)
-    const migSql = readFileSync(
-      resolve(import.meta.dirname, '../../db/migrations/0333_remote_agent_pool.sql'),
-      'utf8',
-    )
+    const migSql = readMigrationSource("0333_remote_agent_pool")
     assert.match(
       migSql,
       /CREATE OR REPLACE FUNCTION fn_model_activate_entry[\s\S]*?SET state = 'active',\s*pool_auto_disabled = FALSE/,

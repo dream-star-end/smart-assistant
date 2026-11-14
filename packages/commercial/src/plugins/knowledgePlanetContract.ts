@@ -10,7 +10,7 @@ import {
 } from './knowledgePlanetWorkerSource.js'
 
 export const KNOWLEDGE_PLANET_PLUGIN_SLUG = 'knowledge-planet'
-export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.5.0'
+export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.5.3'
 /**
  * The implementation digest is part of both registry IDs, so changing trusted
  * worker code necessarily changes the marketplace artifact hash. Reusing the
@@ -21,9 +21,9 @@ export const KNOWLEDGE_PLANET_WORKER_DIGEST = createHash('sha256')
   .update(KNOWLEDGE_PLANET_WORKER_SOURCE)
   .digest('hex')
 export const KNOWLEDGE_PLANET_DRIVER_ID = `kp-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 60)}`
-export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.5.0'
+export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.5.3'
 export const KNOWLEDGE_PLANET_LAUNCHER_ID = `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`
-export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.5.0'
+export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.5.3'
 
 const authorSchema = {
   type: 'object',
@@ -814,6 +814,21 @@ if (COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType !== 'managed-browser')
  * no other historical or user-published Knowledge Planet artifact is eligible.
  */
 export const KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
+  Object.freeze({
+    version: '1.5.2',
+    artifactHash: '77a0e77acd066eeee5d411d4f6cee43abb374037d632ba19b8c667bbc3b38c3e',
+    execContractHash: 'a2d7c186e81d936f3eb7e561f54b9385899c372341b633a799afac7874d845fe',
+  }),
+  Object.freeze({
+    version: '1.5.0',
+    artifactHash: 'f5b41bcbdeeb0709c4e77ee05f05e6b994aeb8e6d72d5661e06496cfc2a8a642',
+    execContractHash: 'e67a26206d419020abf21f4bd4a3dd8ae44eb1a249cd47a9e356a861a8d08364',
+  }),
+  Object.freeze({
+    version: '1.5.1',
+    artifactHash: '26e3ecda30105be3fa0d9cb79fa320d48e39d8d4deb51bb6aa0f64d236bd944a',
+    execContractHash: '56fce86457230fb53e16e0d2f8a0b7db5485c7e5f8e8068a09e01e8e31968b0a',
+  }),
   Object.freeze({
     version: '1.4.0',
     artifactHash: 'bc027e75eade8285c776f0ca6aa1f10bc32d8f6e4bc870b1be35a965946a04fb',

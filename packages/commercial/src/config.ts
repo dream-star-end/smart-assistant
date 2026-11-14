@@ -616,6 +616,15 @@ export const commercialConfigSchema = z
      */
     ZAI_CODING_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
+     * 超算互联网 Token Plan key(2026-09-17 接入 glm-5.3 / glm-5.3-flash)。
+     * - Anthropic Messages:https://api.scnet.cn/api/llm/anthropic/v1/messages
+     * - Authorization Bearer；上游字面量 GLM-5.3 / GLM-5.3-Flash
+     * - 只存在于 master/egress EnvironmentFile，绝不注入用户容器或写入 git
+     * - 未配置 → 503 SCNET_NOT_CONFIGURED + reject 'scnet_config'
+     * - 聊天里出现过的 key 上线前必须在控制台旋转
+     */
+    SCNET_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
      * OCV5-415 Antigravity CLI 的 Google OAuth client secret(官方 1.3.4 二进制内嵌的
      * installed-app secret,client id 见 antigravityOAuth.ts)。
      * - 只用于 master/egress 刷新 gemini_oauth_accounts 的令牌与签发受限令牌
@@ -655,12 +664,45 @@ export const commercialConfigSchema = z
     MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
      * OCV5-589 / D12 (2026-10-23): root-only (0600) file holding the media-only MiniMax key. Set → the
-     * media proxy reads only this file (never falling back to MINIMAX_TOKEN_PLAN_KEY, which stays with
-     * web search). Unset → MINIMAX_TOKEN_PLAN_KEY as before.
+     * media proxy and the media studio read only this file (never falling back to MINIMAX_TOKEN_PLAN_KEY,
+     * which stays with web search). Unset → MINIMAX_TOKEN_PLAN_KEY as before.
      */
     MINIMAX_MEDIA_KEY_FILE: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
     /** OCV5-589: global soft cap on successful MiniMax media calls per rolling 5 hours. Unset → no cap. */
     OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS: positiveInt(1_000_000),
+    /** OCV5-588 media studio: root for compose work dirs and studio blobs. */
+    OC_STUDIO_ROOT: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
+    /** OCV5-588: exact image ID of openclaude/studio-ffmpeg (build-image.sh). Unset → compose unavailable. */
+    OC_STUDIO_FFMPEG_IMAGE_ID: z.string().trim().regex(/^sha256:[0-9a-f]{64}$/, "must be sha256:<64 hex>").optional(),
+    /** OCV5-588: site-wide concurrent compose containers. Unset → 2. */
+    OC_STUDIO_COMPOSE_CONCURRENCY: positiveInt(8),
+    /** OCV5-591 A2-0: media provider instances (JSON array). Deliberately unconstrained here: the
+     * studio registry parses it and only warns, so a typo can never block master boot. */
+    OC_STUDIO_PROVIDERS: z.string().optional(),
+    /** OCV5-591 media studio. Off unless "1": /api/studio/* answers 404 and no worker runs. */
+    OC_STUDIO_ENABLED: z
+      .enum(["0", "1"])
+      .optional()
+      .transform((value) => value === "1"),
+    /** Decimal uids allowed into the studio besides admins (D13: only 247 at first). Unset or empty →
+     * admins only. uid 4 is always ignored in a list. The single token `all` opens it to every account. */
+    OC_STUDIO_ALLOWED_UIDS: z
+      .string()
+      .max(8192)
+      .optional()
+      .transform((value) =>
+        Object.freeze(
+          (value ?? "")
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean),
+        ),
+      )
+      .refine(
+        (values) =>
+          (values.length === 1 && values[0] === "all") || values.every((value) => /^\d+$/.test(value)),
+        "user ids must be decimal, or the single token all",
+      ),
     /** Loopback endpoint, or explicitly opted-in HTTPS endpoint, of the SCNet H3 worker. */
     MEDIA_GENERATION_WORKER_URL: urlStringWithProtocols(
       ["http:", "https:"],
@@ -693,7 +735,8 @@ export const commercialConfigSchema = z
       .enum(["0", "1"])
       .optional()
       .transform((value) => value === "1"),
-    /** Decimal uids allowed to use oc-muse. Unset → "3"; empty → nobody. uid 4 is always ignored. */
+    /** Decimal uids allowed to use oc-muse. Unset → "3"; empty → nobody. uid 4 is always ignored in a
+     * list. The single token `all` opens Muse to every account (commercial, OCV5-574). */
     OC_MUSE_ALLOWED_UIDS: z
       .string()
       .max(8192)
@@ -709,15 +752,88 @@ export const commercialConfigSchema = z
             ),
       )
       .refine(
-        (values) => values === undefined || values.every((value) => /^\d+$/.test(value)),
-        "user ids must be decimal",
+        (values) =>
+          values === undefined ||
+          (values.length === 1 && values[0] === "all") ||
+          values.every((value) => /^\d+$/.test(value)),
+        "user ids must be decimal, or the single token all",
       ),
     /** Muse result staging; default /var/lib/openclaude-v5-selfhost/muse-media. */
     OC_MUSE_STATE_ROOT: absolutePath("OC_MUSE_STATE_ROOT"),
+    /**
+     * OCV5-750 second Muse video backend. Unset / empty / "hatch" = today's hatch path.
+     * "box-exec" routes video (no --resume) through Box Exec → muse-exec-cli.
+     * "hatch-with-box-fallback" keeps hatch primary and moves a video the hatch bridge has
+     * not started (offline / never acked / queue wait) onto Box Exec.
+     */
+    OC_MUSE_VIDEO_BACKEND: z
+      .string()
+      .optional()
+      .transform((value) => {
+        const trimmed = (value ?? "").trim()
+        if (!trimmed || trimmed === "hatch") return "hatch" as const
+        if (trimmed === "box-exec") return "box-exec" as const
+        if (trimmed === "hatch-with-box-fallback") return "hatch-with-box-fallback" as const
+        throw new Error(
+          "OC_MUSE_VIDEO_BACKEND must be hatch, box-exec or hatch-with-box-fallback",
+        )
+      }),
+    /** When "1", a down box-exec relay may fall back onto hatch if the hatch bridge is online. */
+    OC_MUSE_BOX_EXEC_FALLBACK_HATCH: z
+      .enum(["0", "1", ""])
+      .optional()
+      .transform((value) => value === "1"),
+    /** Decimal uid used to resolve the Box Exec target (no Claude login is scheduled). */
+    OC_MUSE_BOX_EXEC_UID: z
+      .string()
+      .optional()
+      .transform((value) => {
+        const trimmed = (value ?? "").trim()
+        return trimmed === "" ? undefined : trimmed
+      })
+      .refine(
+        (value) => value === undefined || /^[1-9]\d{0,18}$/.test(value),
+        "OC_MUSE_BOX_EXEC_UID must be a positive decimal uid",
+      ),
+    /** Box account (cursor_accounts.id) that hosts the Muse web relay. Required for box-exec: the
+     * resolver otherwise picks any eligible Box, which may not run the relay. */
+    OC_MUSE_BOX_EXEC_ACCOUNT_ID: z
+      .string()
+      .optional()
+      .transform((value) => {
+        const trimmed = (value ?? "").trim()
+        return trimmed === "" ? undefined : trimmed
+      })
+      .refine(
+        (value) => value === undefined || /^[1-9]\d{0,18}$/.test(value),
+        "OC_MUSE_BOX_EXEC_ACCOUNT_ID must be a positive decimal account id",
+      ),
     OC_MUSE_IMAGE_PER_HOUR: positiveInt(10_000),
     OC_MUSE_IMAGE_PER_DAY: positiveInt(100_000),
     OC_MUSE_VIDEO_PER_HOUR: positiveInt(10_000),
     OC_MUSE_VIDEO_PER_DAY: positiveInt(100_000),
+    /** OCV5-574 commercial Muse. All optional; unset keeps the personal edition's single-slot hub. */
+    /** Jobs running at once across the site (bridge slots). Unset → 1. */
+    OC_MUSE_CONCURRENCY: positiveInt(32),
+    /** Cap per Muse bridge; unset inherits site concurrency. Worker may lower it locally. */
+    OC_MUSE_BRIDGE_CONCURRENCY: positiveInt(32),
+    /** Jobs waiting across the site. Unset → 3. */
+    OC_MUSE_QUEUE_MAX: positiveInt(1_000),
+    /** Longest wait in the queue, per kind. Unset → 240 s. */
+    OC_MUSE_QUEUE_WAIT_IMAGE_SEC: positiveInt(3_600),
+    OC_MUSE_QUEUE_WAIT_VIDEO_SEC: positiveInt(3_600),
+    /** Per account: queued + running jobs, and running jobs. Unset → no per-account cap. */
+    OC_MUSE_USER_INFLIGHT_MAX: positiveInt(100),
+    OC_MUSE_USER_RUNNING_MAX: positiveInt(32),
+    /** Whole-site jobs per day, per kind. Unset → no site cap. */
+    OC_MUSE_GLOBAL_IMAGE_PER_DAY: positiveInt(10_000_000),
+    OC_MUSE_GLOBAL_VIDEO_PER_DAY: positiveInt(10_000_000),
+    /** Credits (the 积分 shown in the UI = cost_credits) per successful job. Unset → not billed. */
+    OC_MUSE_PRICE_IMAGE_CREDITS: positiveInt(1_000_000),
+    OC_MUSE_PRICE_VIDEO_CREDITS: positiveInt(1_000_000),
+    /** Open rows another master process left behind are closed only once this old (A/B slots share
+     * the database). Unset → closed at start (one master, the personal edition). */
+    OC_MUSE_ORPHAN_GRACE_SEC: positiveInt(86_400),
     /**
      * Optional direct HTTPS port for the Muse bridge (muse/publicListener.ts): serves only
      * /api/muse-bridge/* with the cert/key below, bypassing the Cloudflare tunnel. Unset = off.

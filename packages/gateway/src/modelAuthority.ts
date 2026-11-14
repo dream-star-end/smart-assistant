@@ -1,4 +1,10 @@
-import { type RemoteExecutionBackend, isBoxApiModel, isCc5ExecutionBackend } from '@openclaude/protocol'
+import {
+  type RemoteExecutionBackend,
+  isBoxApiModel,
+  isCc5ExecutionBackend,
+  isRemoteDriverExecutionBackend,
+  grokExecutionUpstream,
+} from '@openclaude/protocol'
 /**
  * modelAuthority(容器侧)—— master 签发的**模型执行权威**的验签消费端。
  *
@@ -522,13 +528,24 @@ export class ModelAuthorityConsumer {
         throw new AuthorityRejected('bad_shape', 'CCB contextOwner is not box-native-v1')
       }
       // A remote-pool chat carries its signed lane; its native context lives on the pool node.
-      if (ccb.contextOwner === 'box-native-v1' && !isBoxApiModel(payload.canonicalModel) &&
-          !isCc5ExecutionBackend((payload as { executionBackend?: unknown }).executionBackend)) {
+      const backendScope = (payload as { executionBackend?: unknown }).executionBackend
+      if (
+        ccb.contextOwner === 'box-native-v1' &&
+        !isBoxApiModel(payload.canonicalModel) &&
+        !isCc5ExecutionBackend(backendScope) &&
+        !isRemoteDriverExecutionBackend(backendScope)
+      ) {
         throw new AuthorityRejected(
           'bad_shape',
           'box-native-v1 contextOwner requires the signed Box model or a remote lane',
         )
       }
+    }
+
+    if (payload.engine === 'grok') {
+      const grok = descriptorRaw.capabilityProfile.grok as { upstreamModelId?: unknown } | undefined
+      try { grokExecutionUpstream(payload.canonicalModel, grok?.upstreamModelId) }
+      catch { throw new AuthorityRejected('bad_shape', 'Grok signed descriptor missing or mismatched public upstream version') }
     }
 
     // 单次消费(cache 满 → AuthorityRejected('replay_cache_full') 已在 cache 内抛)。

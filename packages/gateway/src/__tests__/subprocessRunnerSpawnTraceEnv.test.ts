@@ -26,6 +26,7 @@ import './helpers/subprocessRunnerSpawnEnvIsolate.js'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
+import ts from 'typescript'
 import { SubprocessRunner, _buildCcbServiceTierEnv, _buildCcbSpawnTraceEnv } from '../subprocessRunner.js'
 import {
   assertCcbSpawnWiring,
@@ -153,28 +154,30 @@ test('oracle rejects duplicating the trace helper spread', () => {
   assert.match(result.reason, /_buildCcbSpawnTraceEnv\(this\.opts\.traceId\) exactly once/)
 })
 
-test('structural: SubprocessRunnerOpts type declares traceId field', () => {
-  // Pin the opts schema — a future cleanup that mistakenly drops the field
-  // would silently break re-spawn trace propagation since the setter would
-  // still be there but writing to a nonexistent opts key would be a
-  // TypeScript error rather than a runtime no-op. This source-level check
-  // adds belt to the tsc suspenders.
-  // SubprocessRunnerOpts lives in subprocessSpawnConfig.ts since OCV5-478 (re-exported by subprocessRunner.ts)
-  const path = new URL('../subprocessSpawnConfig.ts', import.meta.url).pathname
-  const optsSrc = readFileSync(path, 'utf-8')
+const optsSrc = readFileSync(new URL('../subprocessSpawnConfig.ts', import.meta.url), 'utf-8')
 
-  const optsIdx = optsSrc.indexOf('export interface SubprocessRunnerOpts')
-  assert.ok(optsIdx >= 0, 'SubprocessRunnerOpts interface declaration not found')
-  // Body up to the interface's own closing brace (a fixed-size window went
-  // stale once the interface grew past it).
-  const endIdx = optsSrc.indexOf('\n}\n', optsIdx)
-  assert.ok(endIdx > optsIdx, 'SubprocessRunnerOpts closing brace not found')
-  const span = optsSrc.slice(optsIdx, endIdx)
-  assert.match(
-    span,
-    /traceId\?:\s*string/,
-    'SubprocessRunnerOpts must declare an optional traceId field',
-  )
+function traceIdContract(source: string): boolean {
+  const file = ts.createSourceFile('subprocessRunner.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const declarations = file.statements.filter(ts.isInterfaceDeclaration).filter((node) => node.name.text === 'SubprocessRunnerOpts')
+  if (declarations.length !== 1) return false
+  const fields = declarations[0]!.members.filter(ts.isPropertySignature).filter((node) => ts.isIdentifier(node.name) && node.name.text === 'traceId')
+  return fields.length === 1 && fields[0]!.questionToken !== undefined && fields[0]!.type?.kind === ts.SyntaxKind.StringKeyword
+}
+
+test('structural: SubprocessRunnerOpts type declares traceId field', () => {
+  assert.equal(traceIdContract(optsSrc), true, 'exact SubprocessRunnerOpts must declare optional string traceId')
+})
+
+test('trace opts oracle rejects missing, misplaced, required or non-string traceId', () => {
+  const file = ts.createSourceFile('subprocessSpawnConfig.ts', optsSrc, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const declaration = file.statements.find((node): node is ts.InterfaceDeclaration => ts.isInterfaceDeclaration(node) && node.name.text === 'SubprocessRunnerOpts')!
+  const field = declaration.members.find((node): node is ts.PropertySignature => ts.isPropertySignature(node) && ts.isIdentifier(node.name) && node.name.text === 'traceId')!
+  const prefix = optsSrc.slice(0, field.getStart(file))
+  const suffix = optsSrc.slice(field.end)
+  for (const replacement of ['', 'traceId: string', 'traceId?: number']) {
+    assert.equal(traceIdContract(prefix + replacement + suffix), false, replacement || 'removed')
+  }
+  assert.equal(traceIdContract(`${prefix + suffix}\ninterface WrongOpts { traceId?: string }`), false, 'another interface cannot satisfy the contract')
 })
 
 test('real LocalBackend child receives provided traceId and not inherited wrong values', async () => {

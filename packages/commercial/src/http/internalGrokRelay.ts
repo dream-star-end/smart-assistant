@@ -11,7 +11,7 @@ import {
   verifyContainerIdentity,
   type ContainerIdentityRepo,
 } from '../auth/containerIdentity.js'
-import { resolveGrokRouteContext } from '../account-pool/groups.js'
+import { hasInflightDelegateGrokBilling, resolveGrokRouteContext } from '../account-pool/groups.js'
 import { getFreshGrokAccessToken } from '../account-pool/grokOAuth.js'
 import type { AccountHealthTracker } from '../account-pool/health.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
@@ -144,6 +144,8 @@ function grokRelayPublicMessage(code: string): string {
       return 'grok slot lease lost'
     case 'UNAUTHORIZED':
       return 'grok relay unauthorized'
+    case 'GROK_DELEGATE_NOT_BILLED':
+      return 'grok delegate route has no admitted billing'
     default:
       return `grok relay error (${code})`
   }
@@ -189,6 +191,7 @@ export function makeGrokRelayHandler(deps: {
   identityRepo: ContainerIdentityRepo
   logger?: Pick<Logger, 'info'>
   resolveContext?: typeof resolveGrokRouteContext
+  hasDelegateBilling?: typeof hasInflightDelegateGrokBilling
   freshToken?: typeof getFreshGrokAccessToken
   resolveDispatcher?: (accountId: bigint) => Promise<{ dispatcher: Dispatcher }>
   requestFn?: typeof request
@@ -219,6 +222,14 @@ export function makeGrokRelayHandler(deps: {
       userId: BigInt(identity.userId),
     })
     if (!context || !GROK_RELAY_MODEL_IDS.has(context.modelId)) { error(res, 404, 'GROK_ROUTE_EXPIRED', requestId); return }
+    if (context.kind === 'delegate') {
+      const billed = await (deps.hasDelegateBilling ?? hasInflightDelegateGrokBilling)({
+        token: match[1]!,
+        containerId: identity.containerId,
+        userId: BigInt(identity.userId),
+      })
+      if (!billed) { error(res, 403, 'GROK_DELEGATE_NOT_BILLED', requestId); return }
+    }
     if (!isModelAvailable(context.modelId)) { error(res, 503, 'GROK_MODEL_UNAVAILABLE', requestId); return }
     // method + suffix are the ALLOWED pair checked above (fixed strings): they split inference from
     // the CLI's models/settings/billing probes in the egress log. Never the route token or query.

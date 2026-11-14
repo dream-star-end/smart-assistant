@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional
 
@@ -633,7 +634,7 @@ def assert_cc_interactive_args(argv: List[str], env: Dict[str, str]) -> None:
             raise RuntimeError(f"REMOTE_CC_PRINT_MODE_FORBIDDEN: {flag}")
 
 
-def run_cmd_version(binary: str, args: List[str] = ["--version"]) -> Optional[str]:
+def run_cmd_version(binary: str, args: List[str] = ["--version"], isolated_home: bool = False) -> Optional[str]:
     exe = shutil.which(binary)
     if not exe:
         for prefix in ("/home/box/.local/bin", "/home/box/.npm-global/bin", "/usr/local/bin", "/usr/bin"):
@@ -643,12 +644,29 @@ def run_cmd_version(binary: str, args: List[str] = ["--version"]) -> Optional[st
                 break
     if not exe:
         return None
+    # A bare `codex --version` initializes `$HOME/.codex` (tmp/arg0-linux) with the process
+    # umask. That created a group-writable ~/.codex on the live node and tripped Gate G.
+    # Version probing must never touch the real credential namespace: give it a throwaway
+    # HOME/CODEX_HOME that is removed immediately afterwards.
+    env = None
+    scratch: Optional[str] = None
     try:
-        out = subprocess.check_output([exe, *args], stderr=subprocess.STDOUT, timeout=4.0, text=True)
+        if isolated_home:
+            scratch = tempfile.mkdtemp(prefix="oc-probe-ver-")
+            os.chmod(scratch, 0o700)
+            env = dict(os.environ)
+            env["HOME"] = scratch
+            env["CODEX_HOME"] = scratch
+            env.pop("XDG_CONFIG_HOME", None)
+            env.pop("XDG_CACHE_HOME", None)
+        out = subprocess.check_output([exe, *args], stderr=subprocess.STDOUT, timeout=4.0, text=True, env=env)
         first = out.strip().splitlines()[0] if out.strip() else None
         return first[:120] if first else None
     except Exception:
         return None
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def compute_oc_bridge_digest(home: pathlib.Path) -> Optional[str]:
@@ -839,7 +857,8 @@ def probe_cc_profiles(home: pathlib.Path) -> List[Dict[str, Any]]:
 
 def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files: List[pathlib.Path]) -> List[Dict[str, Any]]:
     exe_path = resolve_binary_path(binary)
-    cli_ver = run_cmd_version(binary)
+    # codex initializes its default credential home on any invocation; isolate the version probe.
+    cli_ver = run_cmd_version(binary, isolated_home=(engine == "codex"))
     if not cli_ver and engine == "antigravity":
         alt_bin = "antigravity" if binary == "agy" else "agy"
         exe_path = resolve_binary_path(alt_bin)

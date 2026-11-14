@@ -859,7 +859,10 @@ export async function autoResumeFromHello(
             kind: 'prewarm',
             defaultModel: this.deps.config.defaults.model,
           })
-          session = await this.sessions.getOrCreate({
+          // As sessionPreheat: a Codex pre-warm without its route would check the chat's
+          // thread against the local rollout store and drop a remote lane's thread id. The
+          // socket is still registered and its replay cursor still served below.
+          if (preExec?.engine !== 'codex') session = await this.sessions.getOrCreate({
             sessionKey,
             agent,
             ...localExecutionOverride(preExec),
@@ -1690,7 +1693,7 @@ export function _consumeFrameAuthority(
 
   if (!hasEnvelope) {
     if (this._modelAuthority.required) {
-      this._rejectAuthority(ws, 'missing', 'inbound frame carries no model authority')
+      this._rejectAuthority(ws, 'missing', 'inbound frame carries no model authority', frame)
       return false
     }
     return true
@@ -1708,7 +1711,7 @@ export function _consumeFrameAuthority(
       err instanceof AuthorityRejected
         ? err
         : new AuthorityRejected('bad_shape', (err as Error)?.message ?? String(err))
-    this._rejectAuthority(ws, rejection.code, rejection.message)
+    this._rejectAuthority(ws, rejection.code, rejection.message, frame)
     return false
   }
 }

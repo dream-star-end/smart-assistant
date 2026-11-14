@@ -41,12 +41,15 @@ function probeFailureTag(error: unknown): { reason: string; cause?: string } {
  * OCV5-313: the same holds for every unknown phase of a launched run, linked
  * or first round (#1a28c670: a continuation_unknown leaf ran on alone for an
  * hour). A rejected result echo is stopped at once: its request already failed
- * and whatever the CLI writes next can reach nobody. OCV5-328: so is a stream
- * the handoff decoder rejected (#27da48a8). */
+ * and whatever the CLI writes next can reach nobody. OCV5-328 / OCV5-377: so is
+ * a stream the handoff decoder rejected (e.g. a model safety stop). OCV5-762:
+ * and so is a round whose Exec calls Cursor refused (417) even after one
+ * refreshed retry, first round or continuation. */
 const STALE_UNKNOWN_STOP_AFTER_MS = 20 * 60_000;
 const STALE_UNKNOWN_FAST_STOP_AFTER_MS = 10_000;
 const STALE_UNKNOWN_FAST_PHASES: ReadonlySet<string> = new Set(
-  ["resume_publish_unsent", "continuation_echo_rejected", "continuation_stream_rejected"]);
+  ["resume_publish_unsent", "continuation_echo_rejected", "continuation_stream_rejected",
+    "continuation_exec_rejected", "first_round_exec_rejected"]);
 
 function staleResumeDue(candidate: BoxStoppedFailureProbeCandidate): BoxStaleResumePhase | null {
   const stale = candidate.staleResume;
@@ -62,7 +65,7 @@ type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
   "claimRemoteCleanup" | "markRemoteCleaned"> & Partial<Pick<BoxDurableJournal,
     "listStoppedFailureProbeCandidates" | "claimStoppedFailureProbe" |
     "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure" |
-    "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
+    "markFirstRoundRejectedStream" | "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
     "readRecoveryWinner" | "recordStaleResumeStop" | "markRunExpiredUnproven">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
   Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
@@ -181,6 +184,18 @@ export class BoxRemoteCleanupWorker {
             await journal.markToolChainStoppedFailure({ requestId: candidate.requestId,
               uid: candidate.uid, leaseEpoch: candidate.leaseEpoch, proof, rejectedStream: true });
             recovered++;
+          } else if (outcome.status === "undeliverable" && !candidate.linked
+            && /^BOX_(CLI|TOOL)_(?!ECHO_)[A-Z0-9_]{1,56}$/.test(outcome.reason)
+            && journal.markFirstRoundRejectedStream) {
+            // A first round whose finished CLI left a stream the decoder
+            // rejects (a synthetic user turn inside its message, an assistant
+            // snapshot without its stream) pinned the session as unknown for
+            // good. Same unbilled close as
+            // the live path; the journal refuses a row that already handed
+            // off. An intermediate handoff keeps the success-recovery contract.
+            await journal.markFirstRoundRejectedStream({ requestId: candidate.requestId,
+              uid: candidate.uid, leaseEpoch: candidate.leaseEpoch, proof });
+            recovered++;
           } else if (outcome.status !== "committed") {
             pending++;
             workerLog.warn("box_stop_probe_pending", { requestId: candidate.requestId,
@@ -225,18 +240,24 @@ export class BoxRemoteCleanupWorker {
   /** OCV5-488 (10-17 commercial account 79, three handoff leaves held for
    * 78 min with no CLI left): no proof, and the run is not stale or not
    * stoppable. Look at the Box. Nothing of the run on two looks, a minute
-   * apart or across a reboot, closes it the way an expired run is closed;
-   * alive, terminal or unreadable keeps it pending exactly as before. */
+   * apart or across a reboot, closes it the way an expired run is closed.
+   * A stat-only terminal.json and a bad stop.ready are not proof and do not
+   * skip the scan. A proof the reader would accept for this lease epoch is
+   * terminal and is not an absence. alive, an injected terminal line, or an
+   * unreadable probe keeps it pending exactly as before. */
   private async closeAbsent(candidate: BoxStoppedFailureProbeCandidate,
     target: BoxResolvedTarget): Promise<boolean> {
     const journal = this.deps.journal;
     const holds = this.deps.holds;
     if (!holds || !journal.markRunExpiredUnproven) return false;
+    const watched = { requestId: candidate.requestId,
+      accountId: candidate.accountId.toString() };
     let seen: BoxRunLiveness | null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const result = await Promise.race([
-        target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd),
+        target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd,
+          candidate.leaseEpoch),
           // OCV5-649: the transport refuses a cap below 1024 before sending;
           // 256 made every look fail locally, so no run was ever closed here.
           { timeoutMs: 10_000, maxResponseBytes: 1024 }),
@@ -246,21 +267,24 @@ export class BoxRemoteCleanupWorker {
       ]);
       seen = parseBoxRunLiveness(result.stdout);
     } catch (error) {
-      workerLog.warn("box_run_liveness_unreadable", { requestId: candidate.requestId,
-        accountId: candidate.accountId.toString(), ...probeFailureTag(error) });
+      workerLog.warn("box_run_liveness", { ...watched, outcome: "probe_failed",
+        ...probeFailureTag(error) });
+      return false;
+    } finally { if (timer) clearTimeout(timer); }
+    if (!seen || seen.state === "terminal") {
+      // A parsed terminal line still belongs to the proof reader. An unparsed
+      // line proves nothing. Neither one is an absence.
+      workerLog.warn("box_run_liveness", { ...watched,
+        outcome: seen?.state === "terminal" ? "terminal" : "probe_failed",
+        ...(seen ? {} : { reason: "unparsed" }) });
       return false;
     }
-    finally { if (timer) clearTimeout(timer); }
-    if (!seen) {
-      workerLog.warn("box_run_liveness_unreadable", { requestId: candidate.requestId,
-        accountId: candidate.accountId.toString(), reason: "BOX_RUN_LIVENESS_MALFORMED" });
-      return false;
-    }
-    if (seen.state === "terminal") return false;
     if (seen.state === "alive") {
+      workerLog.warn("box_run_liveness", { ...watched, outcome: "alive", boot: seen.boot });
       await holds.clearRunAbsence(candidate);
       return false;
     }
+    workerLog.warn("box_run_liveness", { ...watched, outcome: "absent", boot: seen.boot });
     const first = await holds.recordRunAbsence({ ...candidate, boot: seen.boot });
     if (!first) {
       workerLog.warn("box_run_absent_seen", { requestId: candidate.requestId,

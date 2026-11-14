@@ -1,3 +1,9 @@
+import {
+  BOX_GPT_WEB_ALLOWED_UIDS_ENV,
+  BOX_GPT_WEB_CONTAINER_ALLOWED_ENV,
+  isBoxGptWebAllowedUid,
+} from "@openclaude/protocol";
+
 /**
  * Cursor credential entitlement is deliberately separate from model grants.
  * A DB visibility grant alone must never cause the shared root-only key to be
@@ -45,15 +51,40 @@ export function isCursorCredentialMember(
   return policy.has(normalized);
 }
 
-/** Who may receive a Box exec endpoint from the master (POST /internal/box/exec-target). The same
- * entitlement as the credential mount, except that a wildcard policy (`all` / `*`) is refused outright:
- * the endpoint drives the shared Box itself, so it goes only to explicitly listed uids (OCV5-380). */
+/** Explicit allowlist for the Box exec endpoint (OCV5-575). When set it replaces the credential-mount
+ * rule below: commercial mounts Cursor for everyone (`all`) but hands the Box exec endpoint only to the
+ * uids listed here. A wildcard is refused; an empty or malformed list allows nobody. */
+export const BOX_EXEC_TARGET_UIDS_ENV = "OC_BOX_EXEC_TARGET_UIDS";
+
+/** Who may receive a Box exec endpoint from the master (POST /internal/box/exec-target). With
+ * OC_BOX_EXEC_TARGET_UIDS set, exactly the uids it lists. Otherwise the same entitlement as the
+ * credential mount, except that a wildcard policy (`all` / `*`) is refused outright: the endpoint drives
+ * the shared Box itself, so it goes only to explicitly listed uids (OCV5-380). */
 export function boxExecTargetEntitlement(
   uid: number | string | bigint,
   env: NodeJS.ProcessEnv = process.env,
 ): "entitled" | "not_entitled" | "wildcard_refused" {
-  const raw = env.OC_V5_CURSOR_CREDENTIAL_UIDS?.trim() ? env.OC_V5_CURSOR_CREDENTIAL_UIDS : env.OC_V5_CURSOR_OWNER_UID;
+  const explicit = env[BOX_EXEC_TARGET_UIDS_ENV];
+  const raw = explicit !== undefined
+    ? explicit
+    : env.OC_V5_CURSOR_CREDENTIAL_UIDS?.trim() ? env.OC_V5_CURSOR_CREDENTIAL_UIDS : env.OC_V5_CURSOR_OWNER_UID;
   if (parseCursorCredentialUids(raw) === "all") return "wildcard_refused";
   return isCursorCredentialMember(uid, raw) ? "entitled" : "not_entitled";
+}
+
+/** The uid may use `box-gpt-6-astra-pro` (OC_BOX_GPT_WEB_ALLOWED_UIDS; unset = personal owner 3). */
+export function isBoxGptWebAllowedUser(
+  uid: number | string | bigint | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return isBoxGptWebAllowedUid(uid, env[BOX_GPT_WEB_ALLOWED_UIDS_ENV]);
+}
+
+/** The per-container capability flag the container gateway checks before it launches the Box runner. */
+export function boxGptWebContainerEnv(
+  uid: number | string | bigint,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return `${BOX_GPT_WEB_CONTAINER_ALLOWED_ENV}=${isBoxGptWebAllowedUser(uid, env) ? "1" : "0"}`;
 }
 

@@ -6,11 +6,22 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { remoteCcTargetFromPool,remoteNodeExecKeyDir,type RemoteAgentNodeView,type RemoteAgentProfileView,type RemoteModelOfferView } from './remoteBrainPool.js'
 import { Cc5SshHost, CodexSshHost, type CodexLaneSpec, type RemoteCcTarget } from '@openclaude/gateway/cc5-container-runtime'
+import { RemotePoolSshHost, type RemotePoolLaneSpec } from '@openclaude/gateway/remote-pool'
+import { REMOTE_DRIVER_BACKEND, remoteCanonicalSha256 } from '@openclaude/protocol'
 const exec = promisify(execFile)
 const need = (ok: unknown): void => { if (!ok) throw new Error('REMOTE_LANE_RECOVERY_UNPROVEN') }
 interface RecoverySpec {
   version: 1; operationId: string; runId: string; generation: string; taskRoot: string
   target: RemoteCcTarget; controllerPath: string; codex?: CodexLaneSpec
+}
+interface DriverRecoverySpec {
+  version: 4; operationId: string; runId: string; generation: string
+  sshTarget: RemoteCcTarget; spec: RemotePoolLaneSpec
+}
+interface RecoveryProofFixtures {
+  proveLocal?: typeof proveRemoteLaneContainerStopped
+  proveRemote?: (spec: RecoverySpec) => Promise<void | { noHostEffect: boolean }>
+  proveRemoteV4?: (spec: DriverRecoverySpec) => Promise<{ remoteStopped: true; noHostEffect?: boolean }>
 }
 /** A responsive Docker daemon and complete immutable ID, not a name, establish local process absence. */
 export async function proveRemoteLaneContainerStopped(dockerId: string): Promise<void> {
@@ -25,11 +36,53 @@ export async function proveRemoteLaneContainerStopped(dockerId: string): Promise
     && rows[0].State.Pid === 0 && ['exited','dead','created'].includes(rows[0].State.Status))
 }
 export async function reconcileRemoteLane(pool: Pool, operationId: string, generation: string,
-  fixtures: { proveLocal?: typeof proveRemoteLaneContainerStopped; proveRemote?: (spec: RecoverySpec) => Promise<void | { noHostEffect: boolean }> } = {}): Promise<void> {
+  fixtures: RecoveryProofFixtures = {}): Promise<void> {
   need(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(operationId) && /^[1-9][0-9]{0,15}$/.test(generation))
   const row = (await pool.query(`SELECT * FROM remote_agent_bindings WHERE operation_id=$1 AND generation=$2`,[operationId,generation])).rows[0]
   need(row)
   if (row.state === 'released') return
+  // Detect any v4 marker before the legacy Codex no-start shortcut. Mixed/corrupt encodings
+  // must not fall back to legacy recovery or reconstruct a different root from today's profile.
+  if (row.remote_protocol_version === 4 || row.backend_kind === REMOTE_DRIVER_BACKEND || row.recovery_spec?.version === 4) {
+    const recovery = row.recovery_spec as DriverRecoverySpec
+    need(row.remote_protocol_version === 4 && row.backend_kind === REMOTE_DRIVER_BACKEND && recovery?.version === 4
+      && recovery.operationId === operationId && recovery.generation === generation && recovery.runId === row.run_id)
+    const spec = recovery.spec
+    const manifest = spec?.manifest
+    const target = recovery.sshTarget
+    need(manifest?.version === 4 && target && /^[a-f0-9]{64}$/.test(row.docker_id)
+      && manifest.operationId === operationId && manifest.runId === row.run_id && manifest.generation === generation
+      && manifest.driverId === row.driver_id && manifest.engineId === row.engine_id && manifest.authEpoch === row.auth_epoch
+      && manifest.driverDigest === row.driver_digest && manifest.coreDigest === row.core_digest
+      && remoteCanonicalSha256(manifest) === row.manifest_sha256)
+    // Same deterministic production root as placement. Use the frozen bundle/target, never
+    // the current registry or profile: upgrades and auth drift must not prevent an old stop.
+    need(/^[a-z0-9][a-z0-9_-]{0,31}$/.test(manifest.driverId)
+      && /^[a-z_][a-z0-9_-]{0,31}$/.test(target.user) && target.user !== 'root')
+    const prefix = `/home/${target.user}/oc-remotedrv-`
+    const root = `${prefix}${manifest.driverId.replaceAll('_', '-').slice(0, 12)}-${operationId.replaceAll('-', '').slice(0, 24)}-g${generation}`
+    need(target.taskRootPrefix === prefix && manifest.root === root && target.upstreamModel === manifest.model
+      && /^[a-f0-9]{64}$/.test(spec.controllerSha256) && target.controllerSha256 === spec.controllerSha256
+      && spec.controllerPath === `/opt/openclaude/remote-driver/${spec.controllerSha256}/core/controller.py`)
+    const frozenSpec = JSON.stringify(recovery)
+    // Deliberately require both proofs even when remote_start_attempted=false. No local
+    // live relay may outlast release, and this branch never provisions/launches/submits.
+    await (fixtures.proveLocal ?? proveRemoteLaneContainerStopped)(row.docker_id)
+    const proof = fixtures.proveRemoteV4
+      ? await fixtures.proveRemoteV4(recovery)
+      : await RemotePoolSshHost.forSshTarget(target, spec, undefined, true).stop()
+    need(proof?.remoteStopped === true)
+    const updated = await pool.query(`UPDATE remote_agent_bindings
+      SET state='released',no_host_effect_proven=$7,updated_at=NOW()
+      WHERE operation_id=$1 AND generation=$2 AND docker_id=$3 AND run_id=$4
+        AND manifest_sha256=$5 AND recovery_spec=$6::jsonb AND state<>'released'
+        AND remote_protocol_version=4 AND backend_kind=$8
+        AND driver_id=$9 AND engine_id=$10 AND driver_digest=$11 AND core_digest=$12 AND auth_epoch=$13`,
+    [operationId,generation,row.docker_id,row.run_id,row.manifest_sha256,frozenSpec,proof.noHostEffect === true,
+      REMOTE_DRIVER_BACKEND,row.driver_id,row.engine_id,row.driver_digest,row.core_digest,row.auth_epoch])
+    need(updated.rowCount === 1)
+    return // Capacity only. Native pending owner, journals, receipts and balances remain untouched.
+  }
   if (row.engine === 'codex' && row.remote_start_attempted === false) {
     // This CAS fences a live old relay too: its before-provision CAS must see state=running.
     const released = await pool.query(`UPDATE remote_agent_bindings SET state='released',updated_at=NOW()
@@ -77,9 +130,20 @@ export async function reconcileRemoteLane(pool: Pool, operationId: string, gener
   need(updated.rowCount === 1)
   // Capacity only: never clear native pending_request_id or fabricate a terminal/zero receipt.
 }
+/** A full pool first reclaims this user's lanes left by an earlier container, each by its own stop proof. */
+export async function reconcileStaleContainerLanes(pool: Pool, uid: number, liveDockerId: string, fixtures: RecoveryProofFixtures = {}): Promise<number> {
+  const rows = (await pool.query(`SELECT operation_id::text,generation::text FROM remote_agent_bindings
+    WHERE uid=$1 AND docker_id<>$2 AND state<>'released'`,[uid,liveDockerId])).rows
+  let released = 0
+  for (const row of rows) {
+    try { await reconcileRemoteLane(pool,row.operation_id,row.generation,fixtures); released++ }
+    catch { /* A container that may still run keeps its slot. */ }
+  }
+  return released
+}
 /** Used on a new-container/master placement miss; a live old container remains fenced. */
-export async function reconcileRemoteChat(pool: Pool, uid: number, sessionKey: string): Promise<void> {
+export async function reconcileRemoteChat(pool: Pool, uid: number, sessionKey: string, fixtures: RecoveryProofFixtures = {}): Promise<void> {
   const rows = (await pool.query(`SELECT operation_id::text,generation::text FROM remote_agent_bindings
     WHERE uid=$1 AND session_key=$2 AND state<>'released'`,[uid,sessionKey])).rows
-  for (const row of rows) await reconcileRemoteLane(pool,row.operation_id,row.generation)
+  for (const row of rows) await reconcileRemoteLane(pool,row.operation_id,row.generation,fixtures)
 }

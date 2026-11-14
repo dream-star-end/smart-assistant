@@ -31,6 +31,9 @@ import type { PromptPrivacyPolicy } from '@openclaude/protocol'
  *     这里收口保证 codex 路径永远命中 scrub,与 buildCodexEnv 的 env scrub 成对。
  */
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type {
   CallTokenUsageSnapshot,
   CodexExecutionBackend,
@@ -41,10 +44,11 @@ import type {
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
+import { buildCodexLaunchOverrides } from '../codexLaunchOverrides.js'
 import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import { createLogger } from '../logger.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
-import type { SdkMessage, UsageAttributionTag } from '../subprocessRunner.js'
+import { SubprocessRunner, type SdkMessage, type UsageAttributionTag } from '../subprocessRunner.js'
 import { asCcbSessionTotals } from './ccbAdapter.js'
 import { CodexRemoteLane, type CodexRemoteLaneOptions } from '../codexRemoteLane.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
@@ -65,7 +69,11 @@ import type {
   TurnSummary,
 } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
-import { type EngineCreateOpts, registerEngine } from './registry.js'
+import {
+  type EngineCreateOpts,
+  registerEngine,
+  registerEngineRemoteContext,
+} from './registry.js'
 import { buildCodexDelegateTerminalNotification } from '../engineNotifier.js'
 
 const log = createLogger({ module: 'codexAdapter' })
@@ -861,6 +869,14 @@ export class CodexRemoteAdapter extends CodexAdapter {
     return super.submitTurn(params)
   }
 
+  /**
+   * Effort/model/privacy changes only need a fresh kernel: the lane, its node binding and its
+   * admission channel must survive, or the very next beginTurn sees CODEX_LANE_CLOSED.
+   */
+  restartForConfigChange(): Promise<void> {
+    return super.shutdown()
+  }
+
   override async shutdown(): Promise<void> {
     try {
       await this.lane.stopLane()
@@ -876,3 +892,85 @@ registerEngine('codex', (opts) =>
     ? new CodexRemoteAdapter(opts)
     : new CodexAdapter(opts),
 )
+
+registerEngineRemoteContext('codex', async ({ opts, promptPolicy, promptOnly }) => {
+  let profile: {
+    cwd: string
+    mcpConfigPath: string | null
+    settingsPath: string | null
+    disallowedTools: string[]
+  }
+  let env: NodeJS.ProcessEnv
+  let cleanup: () => void
+  if (promptOnly) {
+    profile = {
+      cwd: opts.agentBaseDir,
+      mcpConfigPath: null,
+      settingsPath: null,
+      disallowedTools: [],
+    }
+    env = {}
+    cleanup = () => {}
+  } else {
+    const sub = new SubprocessRunner(opts)
+    if (promptPolicy !== undefined) {
+      sub.setPromptPrivacy(promptPolicy)
+    }
+    const prepared = await sub.prepareRemoteToolContext()
+    profile = prepared.profile
+    env = prepared.env
+    cleanup = prepared.cleanup
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'oc-codex-rv4-'))
+  try {
+    let repoSnap: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null = null
+    if (opts.sessionId && opts.getRepoSnapshot) {
+      try {
+        repoSnap = opts.getRepoSnapshot(opts.sessionId)
+      } catch {
+        repoSnap = null
+      }
+    }
+    const overrides = await buildCodexLaunchOverrides({
+      promptPolicy,
+      systemHelpContextFile: opts.systemHelpContextFile,
+      agentId: opts.agentId,
+      sessionKey: opts.sessionKey,
+      persona: opts.persona,
+      identityCompat: opts.identityCompat,
+      provider: 'codex-native',
+      model: opts.model,
+      effortLevel: opts.effortLevel,
+      sessionDir: dir,
+      claudeCodePath: opts.config?.auth?.claudeCodePath,
+      gatewayPort: opts.config?.gateway?.port,
+      gatewayToken: opts.config?.gateway?.accessToken,
+      delegationDepth: opts.delegationDepth,
+      repoSnapshot: repoSnap,
+      sessionId: opts.sessionId,
+      projectId: opts.projectId,
+      runContext: opts.runContext,
+      frozenProjectContext: opts.frozenProjectContext,
+      cwd: opts.agentBaseDir,
+      readOnly: false,
+    })
+    return {
+      profile,
+      env,
+      platformPrompt: overrides.instructionsContent,
+      promptCwd: opts.agentBaseDir,
+      promptPolicyFingerprint: overrides.promptPolicyFingerprint,
+      promptIntelligentUi: overrides.intelligentUiApplied,
+      cleanup,
+    }
+  } catch (err) {
+    cleanup()
+    throw err
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      /* swallow */
+    }
+  }
+})
