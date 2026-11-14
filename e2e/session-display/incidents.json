@@ -5426,17 +5426,17 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.62"
+          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.77"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.62"
+          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.77"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.62 before it may start"
+          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.77 before it may start"
         },
         {
           "layer": "deploy-gate",
@@ -10878,6 +10878,30 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-codex-late-stop-proof.sh",
           "assertion": "a node that refuses the thread unload fences the lane and closes the undispatched admission"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261114-LOCAL-CATALOG-OWNER",
+      "occurredAt": "2026-11-14",
+      "severity": "P1",
+      "symptom": "OCV5-763 同步后，个人版 active 的 remote_pool CC 模型声明了 ccb.context_owner=box-native-v1，internalModelCatalog 复用签名通道的 issueBoxNativeContextOwner 将其投射到 /internal/v3/model-catalog，触发容器 ModelCatalogClient 校验 provider_id=box_cli 失败（catalog row context_owner invalid），阻断本地路径（delegate/cron/synthetic）。修复：新增 issueLocalCatalogBoxContextOwner 仅对 box_cli + BOX_NATIVE_CONTEXT_MODELS 下发本地目录 context_owner，保留签名 WS 远端泳道能力。",
+      "rootFixCommit": "912454e6",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxNativeContextOwner.test.ts",
+          "assertion": "remote_pool issues signed lane contextOwner but never local-catalog contextOwner"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalModelCatalog.test.ts",
+          "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
         }
       ]
     }

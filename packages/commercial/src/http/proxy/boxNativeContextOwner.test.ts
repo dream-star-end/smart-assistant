@@ -3,7 +3,9 @@ import { describe, it } from "node:test";
 import { parseCapabilityProfile } from "../../billing/modelCatalog.js";
 import {
   BOX_NATIVE_CONTEXT_ROUTE_READY,
+  REMOTE_POOL_PROVIDER_ID,
   getBoxNativeContextOwner,
+  issueLocalCatalogBoxContextOwner,
   selectBoxNativeByteBudget,
   signedCcbCapability,
 } from "./boxNativeContextOwner.js";
@@ -158,5 +160,51 @@ describe("box native context owner", () => {
       { kind: "box" },
       true,
     ), null);
+  });
+
+  it("remote_pool issues signed lane contextOwner but never local-catalog contextOwner", () => {
+    assert.equal(
+      signedCcbCapability({
+        canonicalModel: "claude-opus-5-5-remote",
+        providerId: REMOTE_POOL_PROVIDER_ID,
+        capabilityZero: true,
+        supportsThinking: false,
+        declaredContextOwner: "box-native-v1",
+      }).contextOwner,
+      "box-native-v1",
+    );
+    assert.equal(
+      issueLocalCatalogBoxContextOwner({
+        canonicalModel: "claude-opus-5-5-remote",
+        providerId: REMOTE_POOL_PROVIDER_ID,
+        declared: "box-native-v1",
+        routeReady: true,
+      }),
+      undefined,
+    );
+    assert.equal(
+      issueLocalCatalogBoxContextOwner({
+        canonicalModel: "box-api-claude-opus-5-5",
+        providerId: "box_cli",
+        declared: "box-native-v1",
+        routeReady: true,
+      }),
+      "box-native-v1",
+    );
+    assert.equal(
+      selectBoxNativeByteBudget({
+        authorityKind: "local_catalog",
+        routeKind: "box",
+        canonicalModel: "claude-opus-5-5-remote",
+        providerId: REMOTE_POOL_PROVIDER_ID,
+        declaredContextOwner: "box-native-v1",
+        verifiedSignedContextOwner: null,
+        routeReady: true,
+        containerId: 7n,
+        externalApiKey: false,
+        transportConfigured: true,
+      }),
+      "legacy",
+    );
   });
 });

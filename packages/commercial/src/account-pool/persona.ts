@@ -107,7 +107,7 @@ const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
 const CCB_CLI_VERSION = "2.8.4";
 const CCB_SDK_VERSION = "0.81.0";
 /** 与 deploy/v5-selfhost/runtime-build.env OC_OFFICIAL_CLAUDE_VERSION 对齐。 */
-export const OFFICIAL_CC_CLI_VERSION = "2.1.302";
+export const OFFICIAL_CC_CLI_VERSION = "2.1.325";
 
 export function isOfficialClaudeCodeEnabled(): boolean {
   return process.env.OC_CCB_OFFICIAL_CC === "1";

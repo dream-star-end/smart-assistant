@@ -197,7 +197,8 @@
     "0329_media_studio_music",
     "0334_users_registration_ip",
     "0336_commercial_muse_durable",
-    "0340_commercial_sync_compat"
+    "0340_commercial_sync_compat",
+    "0341_commercial_antigravity_gemini_4_models"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

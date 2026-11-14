@@ -73,6 +73,22 @@ export function issueBoxNativeContextOwner(input: {
   return BOX_NATIVE_CONTEXT_OWNER;
 }
 
+/**
+ * Local-catalog (`GET /internal/v3/model-catalog`) persistence hint.
+ * Local turns (`delegate` / `cron` / `synthetic`) never carry a signed remote
+ * lane, and `modelCatalogClient` rejects `context_owner` on any row other than
+ * `provider_id === "box_cli"` serving `BOX_NATIVE_CONTEXT_MODELS`.
+ */
+export function issueLocalCatalogBoxContextOwner(input: {
+  canonicalModel: string;
+  providerId: string | null;
+  declared: string | undefined;
+  routeReady: boolean;
+}): BoxNativeContextOwner | undefined {
+  if (input.providerId !== "box_cli") return undefined;
+  return issueBoxNativeContextOwner(input);
+}
+
 /** Wire shape copied into the signed execution descriptor. */
 export function signedCcbCapability(input: {
   canonicalModel: string;
@@ -147,7 +163,7 @@ export function selectBoxNativeByteBudget(input: {
   if (input.containerId == null || input.externalApiKey === true) return "legacy";
   if (input.transportConfigured !== true) return "legacy";
   if (input.routeKind !== "box") return "legacy";
-  const declared = issueBoxNativeContextOwner({
+  const declared = issueLocalCatalogBoxContextOwner({
     canonicalModel: input.canonicalModel ?? "",
     providerId: input.providerId ?? null,
     declared: input.declaredContextOwner,

@@ -50,7 +50,7 @@ import {
   PLATFORM_HIDDEN_REVIEWER_MODEL,
 } from "../platformDefaults.js";
 import { DEFAULT_CODEX_ENGINE_MODEL, MODEL_CATALOG_PROJECTION_FORMAT } from "@openclaude/protocol";
-import { BOX_NATIVE_CONTEXT_ROUTE_READY, issueBoxNativeContextOwner } from "./proxy/boxNativeContextOwner.js";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, issueLocalCatalogBoxContextOwner } from "./proxy/boxNativeContextOwner.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import {
   REQUEST_ID_HEADER,
@@ -272,7 +272,7 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       models: snapshot.listForUser(scope).map((r) => {
         const p = snapshot.billingPricingFor(r.modelId);
         const declared = snapshot.resolve(r.modelId)?.capabilityProfile.ccb.contextOwner;
-        const contextOwner = r.engine === "ccb" ? issueBoxNativeContextOwner({
+        const contextOwner = r.engine === "ccb" ? issueLocalCatalogBoxContextOwner({
           canonicalModel: r.modelId, providerId: r.providerId, declared,
           routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
         }) : undefined;
