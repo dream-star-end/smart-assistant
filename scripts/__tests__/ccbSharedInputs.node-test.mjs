@@ -11,6 +11,10 @@ const exec = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const shared = [
   'packages/storage/src/sessionFileIo.ts',
+  'packages/storage/src/idleNativeLock.ts',
+  'packages/storage/src/authorityGenerationLock.ts',
+  'packages/storage/src/kernelFileLock.ts',
+  'packages/storage/src/idleRollback.ts',
   'packages/protocol/src/contextBytePressure.ts',
   'packages/gateway/src/engine/contextReference.ts',
 ]
@@ -24,6 +28,15 @@ test('isolated CCB budget bundle includes shared inputs and caches by all their 
     await mkdir(dirname(join(input, file)), { recursive: true })
     await copyFile(join(root, file), join(input, file))
   }
+  await writeFile(
+    join(input, 'claude-code-best/src/__ccbSharedEntry.ts'),
+    [
+      "export * from './services/api/requestBodyBudget.ts'",
+      "export * from '../../packages/storage/src/idleNativeLock.js'",
+      "export * from '../../packages/storage/src/idleRollback.js'",
+      '',
+    ].join('\n'),
+  )
   // Exercise the real release isolation/cache layout without npm install or a
   // full CCB build. This stand-in resolves runtime imports with a real bundler.
   const bun = join(work, 'bun.mjs')
@@ -36,7 +49,7 @@ if (command === '--version') console.log('isolated-fixture-v1')
 else if (command === 'run') {
   if (process.env.FAIL_BUILD === '1') throw new Error('cache unexpectedly missed')
   await appendFile(process.env.BUILD_LOG, 'build\\n')
-  await build({ entryPoints: ['src/services/api/requestBodyBudget.ts'], bundle: true, platform: 'node', format: 'esm', outfile: 'dist/cli.js' })
+  await build({ entryPoints: ['src/__ccbSharedEntry.ts'], bundle: true, platform: 'node', format: 'esm', outfile: 'dist/cli.js' })
 } else if (command !== 'install') throw new Error('unexpected command')
 `)
   await chmod(bun, 0o700)
@@ -53,6 +66,9 @@ else if (command === 'run') {
   const bundle = await readFile(join(first, 'claude-code-best/dist/cli.js'), 'utf8')
   assert.match(bundle, /request_too_large/)
   assert.match(bundle, /Context reference does not match/)
+  assert.match(bundle, /IDLE_HISTORY_PENDING/)
+  assert.match(bundle, /IDLE_RECOVERY_CORRUPT/)
+  assert.match(bundle, /Authority lock unavailable/)
   assert.doesNotMatch(bundle, /@sinclair\/typebox/)
   await writeFile(join(first, 'MANIFEST.json'), JSON.stringify({ ccbDistKey: key }))
   const same = join(work, 'same')
@@ -65,6 +81,6 @@ else if (command === 'run') {
     await appendFile(join(changed, shared[i]), '\n// changed shared input\n')
     assert.notEqual(await build(changed, first), key, shared[i])
   }
-  assert.equal((await readFile(buildLog, 'utf8')).trim().split('\n').length, 4)
+  assert.equal((await readFile(buildLog, 'utf8')).trim().split('\n').length, 1 + shared.length)
   assert.equal(await readFile(join(first, 'claude-code-best/dist/cli.js'), 'utf8'), bundle, 'prior release is immutable')
 })
