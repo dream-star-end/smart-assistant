@@ -142,6 +142,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/internalModelCatalog.test.ts',
     cases: ['OCV5-745 catalog response carries projection_algo_version matching epoch endpoint (INC-20261114-CATALOG-EPOCH-409)'],
   },
+  {
+    incident: 'INC-20261114-CC5-NULL-RECEIPT-DRAIN', slug: 'inc-20261114-cc5-null-receipt-drain', db: false,
+    file: 'packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts',
+    cases: ['cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)'],
+  },
 ]
 
 function fail(message: string): never {
