@@ -10821,6 +10821,45 @@
           "assertion": "cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)"
         }
       ]
+    },
+    {
+      "id": "INC-20261115-CONTAINER-SWAP-FRAMESEQ",
+      "occurredAt": "2026-11-15",
+      "severity": "P2",
+      "symptom": "跨容器重建后浏览器在空闲态重连发送 hello{lastFrameSeq:N} 时，ContainerLinkHello 按新容器 PG 水位重写容器侧游标为 0 导致不发 resume_failed，同时 buildSessionSnapshot 空闲分支未返回 cursor_reset 且前端忽略 0 帧快照与非 hello 覆盖会话的旧容器游标，致使系统回调（如发布列车上线通知 lsc-*）与后续新回合低序号实时帧被 acceptFrameSeq 全部当重复帧静默丢弃。",
+      "rootFixCommit": "c997af06",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/sessionSnapshot.test.ts",
+          "assertion": "idle session arbitrates cross-container cursor_reset only when containerId is supplied (INC-20261115-CONTAINER-SWAP-FRAMESEQ)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/sessionSnapshot.test.ts",
+          "assertion": "cursor_reset takes priority over containerLinkGap and sequence_gap on open dispatch (INC-20261115-CONTAINER-SWAP-FRAMESEQ)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/sessionSnapshot.test.ts",
+          "assertion": "cursor_reset defers byte_limit on first page with oversize frame and exposes byte_limit on follow-up page (INC-20261115-CONTAINER-SWAP-FRAMESEQ)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/sessionSnapshot.test.ts",
+          "assertion": "full online repro: idle cursor_reset unblocks cronOrigin lsc-* live frames and summarizes satisfied lease"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/sessionSnapshot.test.ts",
+          "assertion": "dual-agent legacy cache clears both main & explorer on 0-frame main cursor_reset, preserves newer post-ready explorer frame, and rebuilds mismatched lead"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "idle session arbitrates cross-container cursor_reset only when containerId is supplied (INC-20261115-CONTAINER-SWAP-FRAMESEQ)"
+        }
+      ]
     }
   ]
 }
