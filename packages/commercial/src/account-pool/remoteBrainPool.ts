@@ -36,6 +36,8 @@ import {
   type ProbeResult,
 } from './policy/registry.js'
 import { healthWeight, rankWRH } from './policy/select.js'
+import { DEFAULT_MAX_PROBE_AGE_MS, verifyProfileReadyForV4 } from './remotePool/driftCoordinator.js'
+import { loadRemoteDriverRegistry } from './remotePool/registry.js'
 
 const execFileAsync = promisify(execFile)
 /** The controller this deployment ships; its digest is what a pool guard was installed for. */
@@ -803,8 +805,11 @@ function remoteNodeKeyPath(keyId: string): string {
  * The node's execution key: its authorized_keys line forces the cc5 guard, unlike the probe key
  * (forced to oc-remote-hostd). Its directory also holds the pinned known_hosts for the node.
  */
-export function remoteNodeExecKeyDir(keyId: string): string {
-  const keyDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
+export function remoteNodeExecKeyDir(keyId: string, baseKeyDir?: string): string {
+  const keyDir =
+    baseKeyDir?.trim() ||
+    process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() ||
+    '/etc/openclaude/remote-pool-keys'
   return join(keyDir, `${keyId}-exec`)
 }
 
@@ -1433,6 +1438,22 @@ export async function applyRemoteNodeProbeResult(
       continue
     }
     seenEngineFp.add(fpKey)
+    // Never let legacy probe payloads overwrite or delete v4-managed profiles (driver_id IS NOT NULL).
+    const v4Protected = await query<{ id: string }>(
+      `SELECT id FROM remote_agent_profiles
+        WHERE driver_id IS NOT NULL
+          AND (
+            (node_id = $1 AND engine = $2 AND profile_name = $3)
+            OR (engine = $2 AND account_fingerprint = $4)
+          )
+        LIMIT 1`,
+      [nodeId, p.engine, p.profile_name, p.account_fingerprint],
+      runner,
+    )
+    if (v4Protected.rows.length > 0) {
+      continue
+    }
+
     const normalizedWindows = (p.quota_windows ?? []).map((w) => ({
       label: w.label,
       usedPct: typeof w.usedPct === 'number' && Number.isFinite(w.usedPct) ? w.usedPct : null,
@@ -1460,6 +1481,7 @@ export async function applyRemoteNodeProbeResult(
               probe_failures = 0,
               last_error = NULL,
               updated_at = NOW()
+        WHERE remote_agent_profiles.driver_id IS NULL
        RETURNING *`,
       [
         nodeId,
@@ -1476,6 +1498,9 @@ export async function applyRemoteNodeProbeResult(
       ],
       runner,
     )
+    if (res.rows.length === 0) {
+      continue
+    }
     if (p.engine === 'codex') {
       const facts = { probe_schema_version: p.probe_schema_version, source: p.source, freshness: p.freshness,
         auth_present: p.auth_present === true, account_observed: p.account_observed === true,
@@ -1486,11 +1511,11 @@ export async function applyRemoteNodeProbeResult(
         execution_ready=CASE WHEN probe_snapshot->>'snapshot_sha256'=$3
           AND probe_snapshot->'execution_snapshot'=$4::jsonb AND $5::boolean THEN execution_ready ELSE FALSE END,
         last_error=$6,status=CASE WHEN disabled_by='admin' THEN 'disabled' WHEN $5::boolean THEN 'active' ELSE 'degraded' END
-        WHERE id=$1 RETURNING *`,
+        WHERE id=$1 AND driver_id IS NULL RETURNING *`,
       [res.rows[0]!.id, JSON.stringify(facts), p.snapshot_sha256 ?? null, JSON.stringify(p.execution_snapshot ?? null),
         p.auth_present === true && p.account_observed === true && p.models_observed === true && !p.error_code,
         p.error_code ?? p.execution_snapshot_error ?? null], runner);
-      upserted.push(mapProfileRow(updated.rows[0]!));
+      if (updated.rows[0]) upserted.push(mapProfileRow(updated.rows[0]!));
     } else upserted.push(mapProfileRow(res.rows[0]!))
   }
 
@@ -1509,6 +1534,7 @@ export async function applyRemoteNodeProbeResult(
       `SELECT id FROM remote_agent_profiles
         WHERE node_id = $1
           AND engine = $2
+          AND driver_id IS NULL
           AND NOT (profile_name = ANY($3::text[]))`,
       [nodeId, engine, activeNames],
       runner,
@@ -1531,6 +1557,7 @@ export async function applyRemoteNodeProbeResult(
       await query(
         `DELETE FROM remote_agent_profiles p
           WHERE p.id = $1
+            AND p.driver_id IS NULL
             AND NOT EXISTS (
               SELECT 1 FROM remote_agent_bindings b WHERE b.profile_id = p.id
             )`,
@@ -1544,10 +1571,10 @@ export async function applyRemoteNodeProbeResult(
   // returned no Codex profiles at all, then aggregate after *all* readiness changes are visible.
   await query(`UPDATE remote_agent_profiles SET execution_ready=FALSE,
     status=CASE WHEN disabled_by='admin' THEN 'disabled' ELSE 'degraded' END
-    WHERE node_id=$1 AND engine='codex' AND NOT (profile_name=ANY($2::text[]))`,
+    WHERE node_id=$1 AND engine='codex' AND driver_id IS NULL AND NOT (profile_name=ANY($2::text[]))`,
   [nodeId, (upsertedByEngine.get('codex') ?? []).map(p => p.profile_name)], runner)
   const affected = await query(`SELECT DISTINCT o.canonical_model_id FROM remote_model_offers o
-    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex'`, [nodeId], runner)
+    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex' AND p.driver_id IS NULL`, [nodeId], runner)
   for (const offer of affected.rows) {
     if (await countEligibleEnabledRemoteOffers(offer.canonical_model_id,runner) !== 0) continue
     await query(`UPDATE model_catalog SET state='disabled',pool_auto_disabled=TRUE
@@ -1561,13 +1588,14 @@ export async function countEligibleEnabledRemoteOffers(
   canonicalModelId: string,
   runner?: QueryRunner,
 ): Promise<number> {
-  const res = await query<{ cnt: string }>(
+  const legacyRes = await query<{ cnt: string }>(
     `SELECT COUNT(*)::text AS cnt
        FROM remote_model_offers o
        JOIN remote_agent_profiles p ON p.id = o.profile_id
        JOIN remote_agent_nodes n ON n.id = p.node_id
       WHERE o.canonical_model_id = $1
         AND o.enabled = TRUE
+        AND p.driver_id IS NULL
         AND (p.engine <> 'codex' OR (p.execution_ready=TRUE AND p.runner_mode='app-server'
           AND p.execution_manifest->>'backendKind'='codex-app-server-v1'
           AND p.execution_manifest->>'authEpoch'=p.auth_epoch
@@ -1585,7 +1613,46 @@ export async function countEligibleEnabledRemoteOffers(
     [canonicalModelId],
     runner,
   )
-  return Number(res.rows[0]?.cnt ?? 0)
+  let total = Number(legacyRes.rows[0]?.cnt ?? 0)
+
+  const v4Rows = (
+    await query<Record<string, any>>(
+      `SELECT p.*, o.upstream_model_id
+         FROM remote_model_offers o
+         JOIN remote_agent_profiles p ON p.id = o.profile_id
+         JOIN remote_agent_nodes n ON n.id = p.node_id
+        WHERE o.canonical_model_id = $1
+          AND o.enabled = TRUE
+          AND p.driver_id IS NOT NULL
+          AND p.status IN ('active', 'degraded')
+          AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
+          AND n.status IN ('active', 'degraded')
+          AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')`,
+      [canonicalModelId],
+      runner,
+    )
+  ).rows
+  if (v4Rows.length > 0) {
+    const regMap = loadRemoteDriverRegistry()
+    const nowMs = Date.now()
+    for (const row of v4Rows) {
+      const reg = regMap.get(String(row.driver_id))
+      if (!reg) continue
+      if (row.engine_id && String(row.engine_id) !== reg.engineId) continue
+      const check = verifyProfileReadyForV4(
+        row,
+        reg.driverDigest,
+        reg.coreDigest,
+        nowMs,
+        DEFAULT_MAX_PROBE_AGE_MS,
+      )
+      if (!check.ready) continue
+      if (check.snapshot.models.some((m) => m.upstreamModelId === String(row.upstream_model_id))) {
+        total += 1
+      }
+    }
+  }
+  return total
 }
 
 /**

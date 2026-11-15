@@ -7,18 +7,18 @@
  * - Stop requires BOTH `fence-stop` and `prove-stopped` with matching `bootId`, empty cgroup (`populated === 0`),
  *   and verified `dev`/`inode` identity before returning `{ remoteStopped: true }`.
  */
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { lstatSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { validateRemoteProbeSnapshot } from '@openclaude/protocol'
 import type { RemoteCcTarget } from '../cc5SshHost.js'
-import { isRemoteResourceCode, type RemoteResourceCode } from '../remoteNodeMemory.js'
+import { type RemoteResourceCode, isRemoteResourceCode } from '../remoteNodeMemory.js'
 import {
-  remotePoolNeed,
   type RemotePoolHostPort,
   type RemotePoolLaneSpec,
   type RemotePoolPreflight,
   type RemotePoolProbeOutput,
+  remotePoolNeed,
 } from './types.js'
 
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024
@@ -34,7 +34,10 @@ export function readJsonLines(
   child.stdout.on('data', (chunk: Buffer) => {
     try {
       buffer += decoder.decode(chunk, { stream: true })
-      remotePoolNeed(Buffer.byteLength(buffer, 'utf8') <= MAX_BUFFER_BYTES, 'REMOTE_HOST_FRAME_OVERFLOW')
+      remotePoolNeed(
+        Buffer.byteLength(buffer, 'utf8') <= MAX_BUFFER_BYTES,
+        'REMOTE_HOST_FRAME_OVERFLOW',
+      )
       let split: number
       while ((split = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, split)
@@ -63,7 +66,9 @@ export function buildPinnedSshArgs(
   root: string,
 ): string[] {
   const quote = (val: string) => `'${val.replaceAll("'", "'\\''")}'`
-  const remoteCmd = ['/usr/bin/python3', '-I', '-B', controllerPath, role, root].map(quote).join(' ')
+  const remoteCmd = ['/usr/bin/python3', '-I', '-B', controllerPath, role, root]
+    .map(quote)
+    .join(' ')
   return [
     '-F',
     'none',
@@ -107,48 +112,28 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
 
   constructor(
     private readonly spec: RemotePoolLaneSpec,
-    private readonly spawnChannel: (role: string, taskRoot?: string) => ChildProcessWithoutNullStreams,
+    private readonly spawnChannel: (
+      role: string,
+      taskRoot?: string,
+    ) => ChildProcessWithoutNullStreams,
     private readonly restoreExisting = false,
   ) {}
 
   static forSshTarget(
     target: RemoteCcTarget,
     spec: RemotePoolLaneSpec,
-    spawnSsh: (args: string[]) => ChildProcessWithoutNullStreams = (args) =>
-      spawn('/usr/bin/ssh', args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' },
-      }),
+    spawnSsh: (args: string[]) => ChildProcessWithoutNullStreams = defaultSpawnSsh,
     restoreExisting = false,
   ): RemotePoolSshHost {
+    assertValidSshHostAndController(target, spec.controllerPath, spec.controllerSha256)
     remotePoolNeed(
-      /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(target.host) &&
-        /^[a-z_][a-z0-9_-]{0,31}$/.test(target.user) &&
-        target.user !== 'root' &&
-        Number.isInteger(target.port) &&
-        target.port > 0 &&
-        target.port <= 65535 &&
-        spec.manifest.root.startsWith(`/home/${target.user}/oc-remotedrv-`) &&
-        /^[a-z0-9-]{16,72}$/.test(spec.manifest.root.split('/').at(-1)!.replace('oc-remotedrv-', '')) &&
-        /^\/opt\/openclaude\/remote-driver\/[a-f0-9]{64}\/core\/controller\.py$/.test(spec.controllerPath) &&
-        spec.controllerPath.includes(spec.controllerSha256),
+      spec.manifest.root.startsWith(`/home/${target.user}/oc-remotedrv-`) &&
+        /^[a-z0-9-]{16,72}$/.test(
+          spec.manifest.root.split('/').at(-1)!.replace('oc-remotedrv-', ''),
+        ),
       'REMOTE_SSH_TARGET_OR_CONTROLLER_INVALID',
     )
-    for (const filePath of [target.keyPath, target.knownHostsPath]) {
-      const st = lstatSync(filePath)
-      remotePoolNeed(
-        isAbsolute(filePath) &&
-          st.isFile() &&
-          !st.isSymbolicLink() &&
-          st.uid === 0 &&
-          st.nlink === 1 &&
-          !(st.mode & 0o022),
-        'REMOTE_SSH_KEY_OR_KNOWN_HOSTS_UNSAFE',
-      )
-      if (filePath === target.keyPath) {
-        remotePoolNeed(!(st.mode & 0o077), 'REMOTE_SSH_KEY_PERMISSIONS_UNSAFE')
-      }
-    }
+    assertPinnedSshFiles(target)
     return new RemotePoolSshHost(
       spec,
       (role, taskRoot = spec.manifest.root) =>
@@ -173,15 +158,7 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
     return new RemotePoolSshHost(
       spec,
       (role, taskRoot = spec.manifest.root) =>
-        spawn('/usr/bin/python3', ['-I', '-B', spec.controllerPath, role, taskRoot], {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          env: {
-            HOME: process.env.HOME ?? '/tmp',
-            PATH: '/usr/bin:/bin',
-            LANG: 'C.UTF-8',
-            ...extraEnv,
-          },
-        }),
+        spawnLocalSandboxController(spec.controllerPath, role, taskRoot, extraEnv),
       restoreExisting,
     )
   }
@@ -191,48 +168,20 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
   }
 
   private control(role: string, packet?: unknown, taskRoot?: string): Promise<any> {
-    const child = this.spawnChannel(role, taskRoot)
-    const rows: any[] = []
-    return new Promise((resolve, reject) => {
-      let failed = false
-      const fail = (err: Error) => {
-        if (failed) return
-        failed = true
-        reject(err)
-        child.kill('SIGTERM')
-      }
-      const timer = setTimeout(() => fail(new Error('REMOTE_HOST_CONTROL_TIMEOUT')), 30_000)
-      timer.unref()
-      readJsonLines(
-        child,
-        (row) => {
-          if (rows.length > 0) fail(new Error('REMOTE_HOST_CONTROL_MULTI_ROW'))
-          else rows.push(row)
-        },
-        fail,
-      )
-      child.once('close', (code) => {
-        clearTimeout(timer)
-        if (failed) return
-        if (code !== 0 || rows.length !== 1) {
-          if (rows.length === 1 && rows[0]?.kind === 'error' && isRemoteResourceCode(rows[0].code)) {
-            const memErr = new Error(rows[0].code) as Error & { activeSessions?: number }
-            memErr.activeSessions = rows[0].activeSessions
-            reject(memErr)
-            return
-          }
-          reject(new Error('REMOTE_HOST_CONTROL_FAILED'))
-        } else {
-          resolve(rows[0])
-        }
-      })
-      child.stdin.end(packet === undefined ? undefined : `${JSON.stringify(packet)}\n`)
-    })
+    return invokeControllerControlFrame(this.spawnChannel(role, taskRoot), packet)
   }
 
   private checkIdentity(row: any): void {
     remotePoolNeed(row?.version === 4, 'REMOTE_HOST_PROTOCOL_MISMATCH')
-    for (const k of ['driverId', 'engineId', 'operationId', 'runId', 'generation', 'profileId', 'authEpoch'] as const) {
+    for (const k of [
+      'driverId',
+      'engineId',
+      'operationId',
+      'runId',
+      'generation',
+      'profileId',
+      'authEpoch',
+    ] as const) {
       remotePoolNeed(row[k] === this.spec.manifest[k], 'REMOTE_HOST_IDENTITY_MISMATCH')
     }
   }
@@ -240,7 +189,15 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
   private checkScopeProofList(row: any, maxScopes: number): void {
     const seenUnits = new Set<string>()
     for (const s of row.scopes) {
-      for (const k of ['driverId', 'engineId', 'operationId', 'runId', 'generation', 'profileId', 'authEpoch'] as const) {
+      for (const k of [
+        'driverId',
+        'engineId',
+        'operationId',
+        'runId',
+        'generation',
+        'profileId',
+        'authEpoch',
+      ] as const) {
         remotePoolNeed(s[k] === this.spec.manifest[k], 'REMOTE_STOP_SCOPE_IDENTITY_MISMATCH')
       }
       remotePoolNeed(
@@ -317,7 +274,10 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
     }
   }
 
-  async provision(tools: unknown, defaultsContext?: Readonly<Record<string, unknown>>): Promise<void> {
+  async provision(
+    tools: unknown,
+    defaultsContext?: Readonly<Record<string, unknown>>,
+  ): Promise<void> {
     remotePoolNeed(!this.opened.size && !this.revoked, 'REMOTE_PROVISION_ALREADY_OPENED')
     this.opened.add('provision')
     const mergedContext = defaultsContext
@@ -348,7 +308,10 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
     }
   }
 
-  async reprovisionApp(tools: unknown, defaultsContext?: Readonly<Record<string, unknown>>): Promise<void> {
+  async reprovisionApp(
+    tools: unknown,
+    defaultsContext?: Readonly<Record<string, unknown>>,
+  ): Promise<void> {
     remotePoolNeed(
       this.opened.has('provision') && !this.opened.has('launch') && !this.revoked,
       'REMOTE_REPROVISION_INVALID_STATE',
@@ -377,7 +340,10 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
     return this.spawnChannel(role)
   }
 
-  async probe(context: Record<string, unknown>, probeRoot?: string): Promise<RemotePoolProbeOutput> {
+  async probe(
+    context: Record<string, unknown>,
+    probeRoot?: string,
+  ): Promise<RemotePoolProbeOutput> {
     const row = await this.control(
       'probe',
       {
@@ -414,5 +380,192 @@ export class RemotePoolSshHost implements RemotePoolHostPort {
       this.stopping = undefined
       throw err
     }))
+  }
+}
+
+function defaultSpawnSsh(args: string[]): ChildProcessWithoutNullStreams {
+  return spawn('/usr/bin/ssh', args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' },
+  })
+}
+
+function spawnLocalSandboxController(
+  controllerPath: string,
+  role: string,
+  taskRoot: string,
+  extraEnv: Record<string, string> = {},
+): ChildProcessWithoutNullStreams {
+  return spawn('/usr/bin/python3', ['-I', '-B', controllerPath, role, taskRoot], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      HOME: process.env.HOME ?? '/tmp',
+      PATH: '/usr/bin:/bin',
+      LANG: 'C.UTF-8',
+      ...extraEnv,
+    },
+  })
+}
+
+function assertValidSshHostAndController(
+  target: RemoteCcTarget,
+  controllerPath: string,
+  controllerSha256: string,
+): void {
+  remotePoolNeed(
+    /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(target.host) &&
+      /^[a-z_][a-z0-9_-]{0,31}$/.test(target.user) &&
+      target.user !== 'root' &&
+      Number.isInteger(target.port) &&
+      target.port > 0 &&
+      target.port <= 65535 &&
+      /^\/opt\/openclaude\/remote-driver\/[a-f0-9]{64}\/core\/controller\.py$/.test(
+        controllerPath,
+      ) &&
+      controllerPath.includes(controllerSha256),
+    'REMOTE_SSH_TARGET_OR_CONTROLLER_INVALID',
+  )
+}
+
+function assertPinnedSshFiles(target: Pick<RemoteCcTarget, 'keyPath' | 'knownHostsPath'>): void {
+  for (const filePath of [target.keyPath, target.knownHostsPath]) {
+    const st = lstatSync(filePath)
+    remotePoolNeed(
+      isAbsolute(filePath) &&
+        st.isFile() &&
+        !st.isSymbolicLink() &&
+        st.uid === 0 &&
+        st.nlink === 1 &&
+        !(st.mode & 0o022),
+      'REMOTE_SSH_KEY_OR_KNOWN_HOSTS_UNSAFE',
+    )
+    if (filePath === target.keyPath) {
+      remotePoolNeed(!(st.mode & 0o077), 'REMOTE_SSH_KEY_PERMISSIONS_UNSAFE')
+    }
+  }
+}
+
+function invokeControllerControlFrame(
+  child: ChildProcessWithoutNullStreams,
+  packet?: unknown,
+): Promise<any> {
+  const rows: any[] = []
+  return new Promise((resolve, reject) => {
+    let failed = false
+    const fail = (err: Error) => {
+      if (failed) return
+      failed = true
+      reject(err)
+      child.kill('SIGTERM')
+    }
+    const timer = setTimeout(() => fail(new Error('REMOTE_HOST_CONTROL_TIMEOUT')), 30_000)
+    timer.unref()
+    readJsonLines(
+      child,
+      (row) => {
+        if (rows.length > 0) fail(new Error('REMOTE_HOST_CONTROL_MULTI_ROW'))
+        else rows.push(row)
+      },
+      fail,
+    )
+    child.once('close', (code) => {
+      clearTimeout(timer)
+      if (failed) return
+      if (code !== 0 || rows.length !== 1) {
+        if (rows.length === 1 && rows[0]?.kind === 'error' && isRemoteResourceCode(rows[0].code)) {
+          const memErr = new Error(rows[0].code) as Error & { activeSessions?: number }
+          memErr.activeSessions = rows[0].activeSessions
+          reject(memErr)
+          return
+        }
+        reject(new Error('REMOTE_HOST_CONTROL_FAILED'))
+      } else {
+        resolve(rows[0])
+      }
+    })
+    child.stdin.end(packet === undefined ? undefined : `${JSON.stringify(packet)}\n`)
+  })
+}
+
+export function validateProbeSpecForSshTarget(
+  target: Pick<RemoteCcTarget, 'user'>,
+  spec: Pick<RemotePoolProbeSpec, 'probeRoot'>,
+): void {
+  const expectedHome = `/home/${target.user}`
+  const probePrefix = `${expectedHome}/oc-remotedrv-probe-`
+  const suffix = spec.probeRoot.startsWith(probePrefix)
+    ? spec.probeRoot.slice(probePrefix.length)
+    : ''
+  remotePoolNeed(
+    spec.probeRoot.startsWith(probePrefix) && /^[a-z0-9-]{10,66}$/.test(suffix),
+    'REMOTE_PROBE_ROOT_INVALID',
+  )
+}
+
+export interface RemotePoolProbeSpec {
+  readonly controllerPath: string
+  readonly controllerSha256: string
+  readonly driverId: string
+  readonly profileId: string
+  readonly probeRoot: string
+  readonly registryPath?: string
+}
+
+/**
+ * Probe-only transport (`probe` controller role only). Does not accept `verifiedProbe` or
+ * `manifest`, and exposes no lane launch, tool-socket, or stop methods.
+ */
+export class RemotePoolProbeHost {
+  private constructor(
+    private readonly spec: RemotePoolProbeSpec,
+    private readonly spawnProbe: () => ChildProcessWithoutNullStreams,
+  ) {}
+
+  static forSshTarget(
+    target: RemoteCcTarget,
+    spec: RemotePoolProbeSpec,
+    spawnSsh: (args: string[]) => ChildProcessWithoutNullStreams = defaultSpawnSsh,
+  ): RemotePoolProbeHost {
+    assertValidSshHostAndController(target, spec.controllerPath, spec.controllerSha256)
+    remotePoolNeed(
+      /^[a-z0-9][a-z0-9_-]{0,31}$/.test(spec.driverId) &&
+        typeof spec.profileId === 'string' &&
+        spec.profileId.length > 0,
+      'REMOTE_PROBE_SPEC_INVALID',
+    )
+    validateProbeSpecForSshTarget(target, spec)
+    assertPinnedSshFiles(target)
+    return new RemotePoolProbeHost(spec, () =>
+      spawnSsh(buildPinnedSshArgs(target, spec.controllerPath, 'probe', spec.probeRoot)),
+    )
+  }
+
+  static forLocalSandbox(
+    spec: RemotePoolProbeSpec,
+    extraEnv: Record<string, string> = {},
+  ): RemotePoolProbeHost {
+    remotePoolNeed(
+      spec.probeRoot.startsWith('/tmp/oc-drvtest-'),
+      'REMOTE_LOCAL_SANDBOX_ROOT_FORBIDDEN',
+    )
+    return new RemotePoolProbeHost(spec, () =>
+      spawnLocalSandboxController(spec.controllerPath, 'probe', spec.probeRoot, extraEnv),
+    )
+  }
+
+  async probe(context: Record<string, unknown>): Promise<RemotePoolProbeOutput> {
+    const row = await invokeControllerControlFrame(this.spawnProbe(), {
+      driverId: this.spec.driverId,
+      profileId: this.spec.profileId,
+      context,
+      ...(this.spec.registryPath ? { registryPath: this.spec.registryPath } : {}),
+    })
+    remotePoolNeed(row?.version === 4 && row.kind === 'probe-result', 'REMOTE_PROBE_RESULT_INVALID')
+    return {
+      snapshot: validateRemoteProbeSnapshot(row.snapshot),
+      driverDigest: String(row.driverDigest),
+      coreDigest: String(row.coreDigest),
+      probeFingerprint: String(row.probeFingerprint),
+    }
   }
 }

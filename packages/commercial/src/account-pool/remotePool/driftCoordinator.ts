@@ -1,3 +1,10 @@
+import {
+  REMOTE_DRIVER_BACKEND,
+  REMOTE_DRIVER_PROTOCOL_VERSION,
+  type RemoteProbeSnapshot,
+  remoteCanonicalSha256,
+  validateRemoteProbeSnapshot,
+} from '@openclaude/protocol'
 /**
  * `remote-driver-v4` Fingerprint Drift & Auto-Verification Closed-Loop Coordinator (`AC-3`).
  *
@@ -21,20 +28,36 @@
  *    `(profile_id, target_fingerprint)`.
  */
 import type { Pool, PoolClient } from 'pg'
-import {
-  REMOTE_DRIVER_BACKEND,
-  REMOTE_DRIVER_PROTOCOL_VERSION,
-  remoteCanonicalSha256,
-  validateRemoteProbeSnapshot,
-  type RemoteProbeSnapshot,
-} from '@openclaude/protocol'
 import { EVENTS } from '../../admin/alertEvents.js'
-import { loadRemoteDriverRegistry } from './registry.js'
+import { legacyProfileEngineForAuthority, loadRemoteDriverRegistry } from './registry.js'
 
 const SHA256_RE = /^[a-f0-9]{64}$/
 const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
 
+export const DEFAULT_MAX_PROBE_AGE_MS = 10 * 60_000
 export const REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX = 'remote-driver-verify:'
+export const REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX = 'rdv-'
+export const REMOTE_DRIVER_VERIFICATION_CASE_LANES = [
+  'g1',
+  'g2',
+  'g3',
+  'g4pre',
+  'g4mid',
+  'g4disc',
+  'g4stop',
+  'g5',
+  'g6a',
+  'g6b',
+  'g7old',
+  'g7new',
+  's1',
+  's2',
+  's3',
+  's4',
+] as const
+export type RemoteDriverVerificationCaseLane =
+  (typeof REMOTE_DRIVER_VERIFICATION_CASE_LANES)[number]
+const CASE_LANE_SET = new Set<string>(REMOTE_DRIVER_VERIFICATION_CASE_LANES)
 
 function need(condition: unknown, code = 'REMOTE_DRIFT_COORDINATOR_INVALID'): asserts condition {
   if (!condition) throw new Error(code)
@@ -43,6 +66,97 @@ function need(condition: unknown, code = 'REMOTE_DRIFT_COORDINATOR_INVALID'): as
 export function verificationSessionKeyForRun(runId: string): string {
   need(UUID_RE.test(runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
   return `${REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX}${runId}`
+}
+
+export function verificationSessionKeyForCaseLane(runId: string, caseLane: string): string {
+  need(UUID_RE.test(runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
+  need(
+    typeof caseLane === 'string' && CASE_LANE_SET.has(caseLane),
+    'REMOTE_VERIFICATION_CASE_LANE_INVALID',
+  )
+  return `${REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX}${runId}:${caseLane}`
+}
+
+export function verificationTurnRequestId(
+  runId: string,
+  caseLane: string,
+  turnIndex: number | string,
+): string {
+  need(UUID_RE.test(runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
+  need(
+    typeof caseLane === 'string' && CASE_LANE_SET.has(caseLane),
+    'REMOTE_VERIFICATION_CASE_LANE_INVALID',
+  )
+  const turnStr = typeof turnIndex === 'number' ? String(turnIndex) : turnIndex
+  need(/^[1-9][0-9]{0,5}$/.test(turnStr), 'REMOTE_VERIFICATION_TURN_INDEX_INVALID')
+  return `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${runId}:${caseLane}:${turnStr}`
+}
+
+export function isReservedVerificationSessionKey(sessionKey: string): boolean {
+  return (
+    typeof sessionKey === 'string' &&
+    sessionKey.startsWith(REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX)
+  )
+}
+
+/**
+ * Shared fail-closed v4 readiness verification used by both lane placement and offer gating.
+ */
+export function verifyProfileReadyForV4(
+  row: Record<string, any>,
+  expectedDriverDigest: string,
+  expectedCoreDigest: string,
+  nowMs: number = Date.now(),
+  maxProbeAgeMs: number = DEFAULT_MAX_PROBE_AGE_MS,
+):
+  | { ready: true; snapshot: RemoteProbeSnapshot; fingerprint: string }
+  | { ready: false; reason: 'reverify' | 'stale' } {
+  if (row.execution_ready !== true || typeof row.verified_fingerprint !== 'string') {
+    return { ready: false, reason: 'reverify' }
+  }
+  if (!row.probe_snapshot || typeof row.probe_snapshot !== 'object') {
+    return { ready: false, reason: 'reverify' }
+  }
+  const manifest =
+    row.execution_manifest && typeof row.execution_manifest === 'object'
+      ? (row.execution_manifest as Record<string, unknown>)
+      : {}
+  const policySha256 = typeof manifest.policySha256 === 'string' ? manifest.policySha256 : ''
+  if (!SHA256_RE.test(policySha256)) {
+    return { ready: false, reason: 'reverify' }
+  }
+  let snapshot: RemoteProbeSnapshot
+  let computedFp: string
+  try {
+    snapshot = validateRemoteProbeSnapshot(row.probe_snapshot)
+    computedFp = computeProbeFingerprintTs(snapshot, {
+      driverDigest: expectedDriverDigest,
+      coreDigest: expectedCoreDigest,
+      policySha256,
+    })
+  } catch {
+    return { ready: false, reason: 'reverify' }
+  }
+  if (
+    snapshot.authPresent !== true ||
+    snapshot.accountObserved !== true ||
+    snapshot.models.length === 0
+  ) {
+    return { ready: false, reason: 'reverify' }
+  }
+  if (computedFp !== row.verified_fingerprint) {
+    return { ready: false, reason: 'reverify' }
+  }
+  if (maxProbeAgeMs > 0) {
+    if (!row.last_probe_ok_at) {
+      return { ready: false, reason: 'stale' }
+    }
+    const probeAge = nowMs - new Date(row.last_probe_ok_at).getTime()
+    if (!Number.isFinite(probeAge) || probeAge > maxProbeAgeMs) {
+      return { ready: false, reason: 'stale' }
+    }
+  }
+  return { ready: true, snapshot, fingerprint: computedFp }
 }
 
 export function computeProbeFingerprintTs(
@@ -110,18 +224,42 @@ export interface RecordDriverProbeResult {
   readonly autoEligible: boolean
 }
 
+const CUTOVER_MANIFEST_PRESERVE_KEYS = [
+  'cutoverPreSnapshotUri',
+  'cutoverPreSnapshotSha256',
+  'cutoverFromGeneration',
+  'convertedGeneration',
+  'legacyCutoverBackup',
+] as const
+
+function pickCutoverManifestFields(manifest: Record<string, unknown>): Record<string, unknown> {
+  const preserved: Record<string, unknown> = {}
+  for (const key of CUTOVER_MANIFEST_PRESERVE_KEYS) {
+    if (manifest[key] !== undefined) {
+      preserved[key] = manifest[key]
+    }
+  }
+  return preserved
+}
+
 export async function recordDriverProbeSnapshot(
   pool: Pool,
   input: RecordDriverProbeInput,
+): Promise<RecordDriverProbeResult> {
+  return recordDriverProbeSnapshotInternal(pool, input, {})
+}
+
+async function recordDriverProbeSnapshotInternal(
+  pool: Pool,
+  input: RecordDriverProbeInput,
+  options: { readonly requireExistingCutover?: boolean },
 ): Promise<RecordDriverProbeResult> {
   need(UUID_RE.test(input.profileId), 'REMOTE_PROFILE_ID_INVALID')
   const snapshot = validateRemoteProbeSnapshot(input.snapshot)
   const regMap = loadRemoteDriverRegistry(input.registryPath)
   const reg = regMap.get(snapshot.driverId)
   need(
-    reg &&
-      reg.engineId === snapshot.engineId &&
-      reg.driverVersion === snapshot.driverVersion,
+    reg && reg.engineId === snapshot.engineId && reg.driverVersion === snapshot.driverVersion,
     'REMOTE_DRIVER_NOT_REGISTERED',
   )
   const driverDigest = input.driverDigest ?? reg.driverDigest
@@ -136,9 +274,7 @@ export async function recordDriverProbeSnapshot(
   }
 
   const healthyProbe =
-    snapshot.authPresent === true &&
-    snapshot.accountObserved === true &&
-    snapshot.models.length > 0
+    snapshot.authPresent === true && snapshot.accountObserved === true && snapshot.models.length > 0
 
   const client = await pool.connect()
   try {
@@ -149,6 +285,14 @@ export async function recordDriverProbeSnapshot(
     )
     need(profRes.rows.length === 1, 'REMOTE_PROFILE_NOT_FOUND')
     const row = profRes.rows[0]!
+    if (options.requireExistingCutover) {
+      need(row.driver_id !== null, 'REMOTE_INITIAL_CONVERSION_REQUIRES_CUTOVER')
+      need(String(row.driver_id) === reg.driverId, 'REMOTE_PROFILE_DRIVER_MISMATCH')
+      need(
+        String(row.engine) === legacyProfileEngineForAuthority(reg.authorityEngine),
+        'REMOTE_PROFILE_ENGINE_DRIVER_MISMATCH',
+      )
+    }
     const prevAuthEpoch: string | null = row.auth_epoch ?? null
     const effectiveAuthEpoch: string | null =
       input.authEpoch !== undefined ? input.authEpoch : prevAuthEpoch
@@ -166,6 +310,7 @@ export async function recordDriverProbeSnapshot(
 
     const nextManifest = {
       ...prevManifest,
+      ...pickCutoverManifestFields(prevManifest),
       version: REMOTE_DRIVER_PROTOCOL_VERSION,
       backendKind: REMOTE_DRIVER_BACKEND,
       driverId: snapshot.driverId,
@@ -617,17 +762,106 @@ async function emitDeduplicatedVerificationFailureAlert(
   }
 }
 
+export interface VerificationEvidenceMetadata {
+  readonly runId?: string
+  readonly profileId?: string
+  readonly nodeId?: string
+  readonly driverId?: string
+  readonly engineId?: string
+  readonly targetFingerprint?: string
+  readonly readyGeneration?: string | bigint | number
+  readonly suiteDigest?: string
+  readonly uid?: number | string
+  readonly caseLanes?: readonly string[]
+  readonly turnRequestIds?: readonly string[]
+}
+
 export interface CompleteDriverVerificationInput {
   readonly runId: string
   readonly leaseOwner: string
   readonly outcome: 'passed' | 'failed'
   readonly evidenceDigest?: string
   readonly evidenceUri?: string
+  readonly evidenceMetadata?: VerificationEvidenceMetadata
   readonly errorCode?: string
   readonly errorDetail?: string
   readonly currentDriverDigest?: string
   readonly currentCoreDigest?: string
   readonly registryPath?: string
+}
+
+export type RecordProductionDriverProbeInput = Omit<
+  RecordDriverProbeInput,
+  'driverDigest' | 'coreDigest' | 'registryPath'
+>
+
+export type CompleteProductionDriverVerificationInput = Omit<
+  CompleteDriverVerificationInput,
+  'currentDriverDigest' | 'currentCoreDigest' | 'registryPath'
+>
+
+/**
+ * Production entrypoint for recording probe snapshots without permitting digest or registry overrides.
+ */
+export async function recordProductionDriverProbeSnapshot(
+  pool: Pool,
+  input: RecordProductionDriverProbeInput,
+): Promise<RecordDriverProbeResult> {
+  const raw = input as Record<string, unknown>
+  need(
+    raw.driverDigest === undefined &&
+      raw.coreDigest === undefined &&
+      raw.registryPath === undefined,
+    'REMOTE_PRODUCTION_DIGEST_OVERRIDE_FORBIDDEN',
+  )
+  need(
+    typeof input.suiteDigest === 'string' && SHA256_RE.test(input.suiteDigest),
+    'REMOTE_SUITE_DIGEST_REQUIRED',
+  )
+  return recordDriverProbeSnapshotInternal(
+    pool,
+    {
+      ...input,
+      driverDigest: undefined,
+      coreDigest: undefined,
+      registryPath: undefined,
+    },
+    { requireExistingCutover: true },
+  )
+}
+
+/**
+ * Production entrypoint for completing verification runs without permitting digest or registry overrides.
+ */
+export async function completeProductionDriverVerificationRun(
+  pool: Pool,
+  input: CompleteProductionDriverVerificationInput,
+): Promise<CompleteDriverVerificationResult> {
+  const raw = input as Record<string, unknown>
+  need(
+    raw.currentDriverDigest === undefined &&
+      raw.currentCoreDigest === undefined &&
+      raw.registryPath === undefined,
+    'REMOTE_PRODUCTION_DIGEST_OVERRIDE_FORBIDDEN',
+  )
+  if (input.outcome === 'passed') {
+    const meta = input.evidenceMetadata
+    need(
+      meta !== undefined &&
+        typeof meta.runId === 'string' &&
+        typeof meta.targetFingerprint === 'string' &&
+        meta.readyGeneration !== undefined &&
+        typeof meta.suiteDigest === 'string' &&
+        SHA256_RE.test(meta.suiteDigest),
+      'REMOTE_EVIDENCE_METADATA_REQUIRED',
+    )
+  }
+  return completeDriverVerificationRun(pool, {
+    ...input,
+    currentDriverDigest: undefined,
+    currentCoreDigest: undefined,
+    registryPath: undefined,
+  })
 }
 
 export interface CompleteDriverVerificationResult {
@@ -646,7 +880,10 @@ export async function completeDriverVerificationRun(
   try {
     await client.query('BEGIN')
     const runRes = await client.query(
-      'SELECT * FROM remote_driver_verification_runs WHERE id = $1 FOR UPDATE',
+      `SELECT *, (lease_until IS NOT NULL AND lease_until > NOW()) AS lease_valid
+         FROM remote_driver_verification_runs
+        WHERE id = $1
+        FOR UPDATE`,
       [input.runId],
     )
     need(runRes.rows.length === 1, 'REMOTE_VERIFICATION_RUN_NOT_FOUND')
@@ -661,10 +898,7 @@ export async function completeDriverVerificationRun(
       }
     }
     need(
-      run.state === 'running' &&
-        run.lease_owner === input.leaseOwner &&
-        run.lease_until &&
-        new Date(run.lease_until).getTime() > Date.now(),
+      run.state === 'running' && run.lease_owner === input.leaseOwner && run.lease_valid === true,
       'REMOTE_VERIFICATION_LEASE_LOST',
     )
 
@@ -759,7 +993,12 @@ export async function completeDriverVerificationRun(
     const policySha256 = typeof manifest.policySha256 === 'string' ? manifest.policySha256 : ''
     let recomputedFp: string | null = null
     let snapshotHealthy = false
-    if (profile.probe_snapshot && SHA256_RE.test(policySha256) && currentDriverDigest && currentCoreDigest) {
+    if (
+      profile.probe_snapshot &&
+      SHA256_RE.test(policySha256) &&
+      currentDriverDigest &&
+      currentCoreDigest
+    ) {
       try {
         const parsedSnap = validateRemoteProbeSnapshot(profile.probe_snapshot)
         snapshotHealthy =
@@ -777,17 +1016,50 @@ export async function completeDriverVerificationRun(
       }
     }
 
-    const unreleasedTestBindings = Number(
-      (
-        await client.query<{ cnt: string }>(
-          `SELECT COUNT(*)::text AS cnt
-             FROM remote_agent_bindings
-            WHERE profile_id = $1
-              AND session_key = $2
-              AND state <> 'released'`,
-          [run.profile_id, verificationSessionKeyForRun(String(run.id))],
-        )
-      ).rows[0]?.cnt ?? '0',
+    const baseSessionKey = verificationSessionKeyForRun(String(run.id))
+    const bindingRows = (
+      await client.query<{
+        operation_id: string
+        state: string
+        uid: string
+        case_lane: string | null
+      }>(
+        `SELECT operation_id::text AS operation_id,
+                state,
+                uid::text AS uid,
+                recovery_spec->>'verificationCaseLane' AS case_lane
+           FROM remote_agent_bindings
+          WHERE session_key = $1
+             OR left(session_key, length($1) + 1) = $2
+             OR recovery_spec->>'verificationRunId' = $3`,
+        [baseSessionKey, `${baseSessionKey}:`, String(run.id)],
+      )
+    ).rows
+    const unreleasedTestBindings = bindingRows.filter((b) => b.state !== 'released').length
+    const verificationOpIds = bindingRows.map((b) => b.operation_id)
+    const turnReqIds = [...(input.evidenceMetadata?.turnRequestIds ?? [])]
+    const reqColonPrefix = `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${String(run.id)}:`
+    const reqHyphenPrefix = `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${String(run.id)}-`
+    const pendingFinanceRes = await client.query(
+      `SELECT 1
+         FROM request_finalize_journal j
+        WHERE j.state NOT IN ('committed', 'aborted')
+          AND (
+            left(j.request_id, length($1)) = $1
+            OR left(j.request_id, length($4)) = $4
+            OR j.request_id = ANY($2::text[])
+            OR j.ctx#>>'{remoteDriverV4,scope,operationId}' = ANY($3::text[])
+            OR j.ctx#>>'{remoteNative,scope,operationId}' = ANY($3::text[])
+          )
+        LIMIT 1`,
+      [reqColonPrefix, turnReqIds, verificationOpIds, reqHyphenPrefix],
+    )
+    const hasPendingFinance = pendingFinanceRes.rows.length > 0
+    const metadataValid = await validateEvidenceMetadata(
+      client,
+      run,
+      bindingRows,
+      input.evidenceMetadata,
     )
 
     let abortReason: string | null = null
@@ -818,6 +1090,10 @@ export async function completeDriverVerificationRun(
       targetRunState = 'superseded'
     } else if (unreleasedTestBindings > 0) {
       abortReason = 'VERIFICATION_TEST_BINDING_NOT_RELEASED'
+    } else if (hasPendingFinance) {
+      abortReason = 'VERIFICATION_FINANCE_NOT_SETTLED'
+    } else if (!metadataValid) {
+      abortReason = 'VERIFICATION_EVIDENCE_METADATA_MISMATCH'
     }
 
     if (abortReason !== null) {
@@ -830,13 +1106,7 @@ export async function completeDriverVerificationRun(
                 completed_at = NOW(),
                 updated_at = NOW()
           WHERE id = $1`,
-        [
-          input.runId,
-          targetRunState,
-          abortReason,
-          input.evidenceDigest,
-          input.evidenceUri ?? null,
-        ],
+        [input.runId, targetRunState, abortReason, input.evidenceDigest, input.evidenceUri ?? null],
       )
       await client.query('COMMIT')
       return {
@@ -849,6 +1119,7 @@ export async function completeDriverVerificationRun(
 
     const updatedManifest = {
       ...manifest,
+      ...pickCutoverManifestFields(manifest),
       unverifiedAuthChangeWhileUnhealthy: false,
       verifiedAt: new Date().toISOString(),
       verifiedFingerprint: String(run.target_fingerprint),
@@ -896,6 +1167,211 @@ export async function completeDriverVerificationRun(
       executionReadyRestored: true,
       alertEmitted: false,
     }
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+async function validateEvidenceMetadata(
+  client: PoolClient,
+  run: Record<string, any>,
+  bindingRows: ReadonlyArray<{
+    operation_id: string
+    state: string
+    uid: string
+    case_lane: string | null
+  }>,
+  metadata: VerificationEvidenceMetadata | undefined,
+): Promise<boolean> {
+  if (!metadata) return true
+  if (metadata.runId !== undefined && metadata.runId !== String(run.id)) return false
+  if (metadata.profileId !== undefined && metadata.profileId !== String(run.profile_id))
+    return false
+  if (metadata.nodeId !== undefined && metadata.nodeId !== String(run.node_id)) return false
+  if (metadata.driverId !== undefined && metadata.driverId !== String(run.driver_id)) return false
+  if (metadata.engineId !== undefined && metadata.engineId !== String(run.engine_id)) return false
+  if (
+    metadata.targetFingerprint !== undefined &&
+    metadata.targetFingerprint !== String(run.target_fingerprint)
+  ) {
+    return false
+  }
+  if (metadata.readyGeneration !== undefined) {
+    try {
+      if (BigInt(metadata.readyGeneration) !== BigInt(run.ready_generation)) return false
+    } catch {
+      return false
+    }
+  }
+  if (metadata.suiteDigest !== undefined) {
+    if (
+      !SHA256_RE.test(String(run.suite_digest ?? '')) ||
+      metadata.suiteDigest !== String(run.suite_digest)
+    ) {
+      return false
+    }
+  }
+  if (metadata.caseLanes !== undefined) {
+    for (const lane of metadata.caseLanes) {
+      if (!CASE_LANE_SET.has(lane)) return false
+    }
+    const allowed = new Set(metadata.caseLanes)
+    for (const b of bindingRows) {
+      if (b.case_lane && !allowed.has(b.case_lane)) return false
+    }
+  }
+  const reqColonPrefix = `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${String(run.id)}:`
+  const reqHyphenPrefix = `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${String(run.id)}-`
+  if (metadata.turnRequestIds !== undefined) {
+    for (const reqId of metadata.turnRequestIds) {
+      if (
+        typeof reqId !== 'string' ||
+        (!reqId.startsWith(reqColonPrefix) && !reqId.startsWith(reqHyphenPrefix))
+      ) {
+        return false
+      }
+    }
+  }
+  if (metadata.uid !== undefined) {
+    const uidStr = String(metadata.uid)
+    for (const b of bindingRows) {
+      if (b.uid !== uidStr) return false
+    }
+    if (metadata.turnRequestIds && metadata.turnRequestIds.length > 0) {
+      const badUserJournal = await client.query(
+        `SELECT 1 FROM request_finalize_journal
+          WHERE request_id = ANY($1::text[])
+            AND user_id::text <> $2
+          LIMIT 1`,
+        [[...metadata.turnRequestIds], uidStr],
+      )
+      if (badUserJournal.rows.length > 0) return false
+    }
+  }
+  return true
+}
+
+/**
+ * Renews a running verification lease only if owned by `leaseOwner`, not yet expired
+ * under DB `NOW()`, and still within the hard `maxTotalDurationMs` ceiling since `created_at`.
+ */
+export async function renewDriverVerificationLease(
+  pool: Pool,
+  input: {
+    readonly runId: string
+    readonly leaseOwner: string
+    readonly leaseMs?: number
+    readonly maxTotalDurationMs?: number
+  },
+): Promise<{ renewed: boolean; leaseUntil: string | null }> {
+  need(UUID_RE.test(input.runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
+  need(
+    typeof input.leaseOwner === 'string' && input.leaseOwner.trim().length > 0,
+    'REMOTE_VERIFICATION_OWNER_INVALID',
+  )
+  const rawMaxTotal = input.maxTotalDurationMs ?? 45 * 60_000
+  need(
+    typeof rawMaxTotal === 'number' &&
+      Number.isSafeInteger(rawMaxTotal) &&
+      rawMaxTotal > 0 &&
+      rawMaxTotal <= 4 * 3600_000,
+    'REMOTE_VERIFICATION_MAX_DURATION_INVALID',
+  )
+  const leaseMs = Math.min(15 * 60_000, Math.max(5_000, Math.floor(input.leaseMs ?? 5 * 60_000)))
+  const res = await pool.query<{ lease_until: string }>(
+    `UPDATE remote_driver_verification_runs
+        SET lease_until = NOW() + ($3::bigint * INTERVAL '1 millisecond'),
+            updated_at = NOW()
+      WHERE id = $1
+        AND state = 'running'
+        AND lease_owner = $2
+        AND lease_until IS NOT NULL
+        AND lease_until > NOW()
+        AND created_at + ($4::bigint * INTERVAL '1 millisecond') > NOW()
+      RETURNING lease_until::text AS lease_until`,
+    [input.runId, input.leaseOwner.trim(), leaseMs, rawMaxTotal],
+  )
+  if (res.rows.length === 0) {
+    return { renewed: false, leaseUntil: null }
+  }
+  return { renewed: true, leaseUntil: res.rows[0]!.lease_until }
+}
+
+/**
+ * Reaps expired `running` verification runs (`lease_until <= NOW()`).
+ * An expired running verification represents an unknown side-effect boundary, so it NEVER
+ * requeues to `pending`: every expired run transitions directly to `failed` with
+ * `VERIFICATION_LEASE_EXPIRED_UNKNOWN`, keeps `execution_ready = FALSE`, leaves unreleased
+ * verification bindings untouched, and emits a deduplicated alert once per
+ * `(profile_id, target_fingerprint)`.
+ */
+export async function reapExpiredDriverVerificationRuns(pool: Pool): Promise<{
+  readonly failedIds: string[]
+}> {
+  const failedIds: string[] = []
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const expired = await client.query(
+      `SELECT *
+         FROM remote_driver_verification_runs
+        WHERE state = 'running'
+          AND lease_until IS NOT NULL
+          AND lease_until <= NOW()
+        ORDER BY created_at ASC
+        FOR UPDATE SKIP LOCKED`,
+    )
+    for (const run of expired.rows) {
+      const priorAlert = await client.query(
+        `SELECT 1 FROM remote_driver_verification_runs
+          WHERE profile_id = $1
+            AND target_fingerprint = $2
+            AND alert_emitted = TRUE
+          LIMIT 1`,
+        [run.profile_id, run.target_fingerprint],
+      )
+      const shouldAlert = priorAlert.rows.length === 0 && run.alert_emitted !== true
+      const errorCode = 'VERIFICATION_LEASE_EXPIRED_UNKNOWN'
+      await client.query(
+        `UPDATE remote_driver_verification_runs
+            SET state = 'failed',
+                lease_owner = NULL,
+                lease_until = NULL,
+                alert_emitted = ($2 OR alert_emitted),
+                error_code = $3,
+                completed_at = COALESCE(completed_at, NOW()),
+                updated_at = NOW()
+          WHERE id = $1`,
+        [run.id, shouldAlert, errorCode],
+      )
+      await client.query(
+        `UPDATE remote_agent_profiles
+            SET execution_ready = FALSE,
+                last_error = $2,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [run.profile_id, errorCode],
+      )
+      if (shouldAlert) {
+        await emitDeduplicatedVerificationFailureAlert(client, {
+          runId: String(run.id),
+          profileId: String(run.profile_id),
+          nodeId: String(run.node_id),
+          driverId: String(run.driver_id),
+          engineId: String(run.engine_id),
+          targetFingerprint: String(run.target_fingerprint),
+          errorCode,
+          errorDetail:
+            'Verification lease expired before completion (unknown side-effect boundary)',
+        })
+      }
+      failedIds.push(String(run.id))
+    }
+    await client.query('COMMIT')
+    return { failedIds }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
     throw err
