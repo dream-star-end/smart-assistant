@@ -9,6 +9,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -33,6 +34,7 @@ import {
 } from '@openclaude/protocol'
 import { Pool } from 'pg'
 import { countEligibleEnabledRemoteOffers } from '../account-pool/remoteBrainPool.js'
+import { resolveLegacyCcControllerPath } from '../account-pool/remoteLaneRecovery.js'
 import {
   RemoteDriverV4CommissioningService,
   type VerificationWorkerController,
@@ -613,10 +615,13 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
           },
           hostFactory: (_t, spec) => {
             const base = RemotePoolSshHost.forLocalSandbox(spec)
+            const isLowMem =
+              typeof spec.manifest.maxSliceMemoryBytes === 'number' &&
+              spec.manifest.maxSliceMemoryBytes <= 64 * 1024 * 1024
             const stopObj = {
               remoteStopped: true,
-              proof: { scopes: ['s1', 's2'], populated: 0 },
-              fence: { scopes: ['s1', 's2'] },
+              proof: { scopes: isLowMem ? [] : ['s1', 's2'], populated: 0 },
+              fence: { scopes: isLowMem ? [] : ['s1', 's2'] },
             }
             Object.defineProperties(base, {
               verifiedStopEvidence: { get: () => stopObj, configurable: true },
@@ -945,11 +950,20 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
     )
   ).rows[0]!.c
   assert.equal(unreleased, 0)
+
+  const ccStatus = await okRun.svc.getProfileStatus(profId)
+  const ccProfile = ccStatus.profile as Record<string, unknown>
+  assert.equal(ccProfile.verified_fingerprint, g5ProbeFp)
+  assert.equal(ccProfile.target_fingerprint, g5ProbeFp)
+  assert.ok(ccProfile.last_probe_ok_at)
+  assert.ok(((ccStatus.eligibleOfferCounts as Record<string, number>)['claude-haiku-5-5-remote'] ?? 0) >= 1)
+  assert.equal((ccStatus.latestVerificationRun as { state?: string } | null)?.state, 'passed')
 })
 
 test('Group 6: startRemoteDriverDriftScheduler runOnce & stop operate single-flight cleanly', async () => {
   const sandbox = makeTmp('/tmp/oc-drvtest-r12g6-')
-  const probe = makeCcProbe(writeFakeCcCli(sandbox), [
+  const cliPath = writeFakeCcCli(sandbox)
+  const probe = makeCcProbe(cliPath, [
     {
       upstreamModelId: 'haiku',
       displayName: 'Haiku',
@@ -961,34 +975,98 @@ test('Group 6: startRemoteDriverDriftScheduler runOnce & stop operate single-fli
   ])
   const fx = await seedUserNode('g6')
   const reg = loadRemoteDriverRegistry().get('cc')!
-  const fp = createHash('sha256').update(JSON.stringify(probe)).digest('hex')
+  const g6PolicySha = remoteCanonicalSha256({
+    driverId: reg.driverId,
+    driverVersion: reg.driverVersion,
+    toolsFlag: '',
+    strictMcp: true,
+    settingSources: '',
+    disableSlashCommands: true,
+  })
+  const fp = computeProbeFingerprintTs(probe, {
+    driverDigest: reg.driverDigest,
+    coreDigest: reg.coreDigest,
+    policySha256: g6PolicySha,
+  })
   const manifest = {
     driverId: 'cc',
     engineId: reg.engineId,
     driverVersion: reg.driverVersion,
     driverDigest: reg.driverDigest,
     coreDigest: reg.coreDigest,
-    policySha256: '1'.repeat(64),
+    policySha256: g6PolicySha,
+    latestFingerprint: fp,
+    driverContext: { cliPath },
   }
-  await pool.query(
-    `INSERT INTO remote_agent_profiles (node_id, engine, driver_id, engine_id, profile_name, account_fingerprint, status, execution_ready, ready_generation, verified_fingerprint, execution_manifest, probe_snapshot)
-     VALUES ($1, 'cc', 'cc', $2, 'sched-prof', 'acct-s', 'active', TRUE, 1, $3, $4::jsonb, $5::jsonb)`,
-    [fx.nodeId, reg.engineId, fp, JSON.stringify(manifest), JSON.stringify(probe)],
-  )
-  const sched = startRemoteDriverDriftScheduler({
-    pool,
-    skipCatalogSync: true,
-    probeHostFactory: () => ({
-      probe: async () => ({
-        snapshot: probe,
-        driverDigest: reg.driverDigest,
-        coreDigest: reg.coreDigest,
-        probeFingerprint: fp,
+  const schedProfId = (
+    await pool.query<{ id: string }>(
+      `INSERT INTO remote_agent_profiles (node_id, engine, driver_id, engine_id, profile_name, account_fingerprint, status, execution_ready, ready_generation, verified_fingerprint, execution_manifest, probe_snapshot)
+       VALUES ($1, 'cc', 'cc', $2, 'sched-prof', 'acct-s', 'active', TRUE, 1, $3, $4::jsonb, $5::jsonb)
+       RETURNING id::text AS id`,
+      [fx.nodeId, reg.engineId, fp, JSON.stringify(manifest), JSON.stringify(probe)],
+    )
+  ).rows[0]!.id
+  const beforeSched = (
+    await pool.query<{ last_probe_ok_at: Date | null }>(
+      'SELECT last_probe_ok_at FROM remote_agent_profiles WHERE id = $1',
+      [schedProfId],
+    )
+  ).rows[0]!
+  assert.equal(beforeSched.last_probe_ok_at, null)
+
+  const schedulerLogErrors: string[] = []
+  const baseLog = createLogger({ level: 'error', out: () => {} })
+  const schedLog = {
+    ...baseLog,
+    warn(msg: string, meta?: Record<string, unknown>) {
+      schedulerLogErrors.push(`warn:${msg}:${JSON.stringify(meta ?? {})}`)
+    },
+    error(msg: string, meta?: Record<string, unknown>) {
+      schedulerLogErrors.push(`error:${msg}:${JSON.stringify(meta ?? {})}`)
+    },
+  }
+  const paused = (
+    await pool.query<{ id: string }>(
+      `UPDATE remote_agent_profiles
+          SET disabled_by = 'admin'
+        WHERE id <> $1 AND driver_id IS NOT NULL AND disabled_by IS DISTINCT FROM 'admin'
+       RETURNING id::text AS id`,
+      [schedProfId],
+    )
+  ).rows.map((r) => r.id)
+  try {
+    const sched = startRemoteDriverDriftScheduler({
+      pool,
+      initialDelayMs: 600_000,
+      skipCatalogSync: true,
+      log: schedLog as never,
+      probeHostFactory: () => ({
+        probe: async () => ({
+          snapshot: probe,
+          driverDigest: reg.driverDigest,
+          coreDigest: reg.coreDigest,
+          probeFingerprint: fp,
+        }),
       }),
-    }),
-  })
-  await sched.runOnce()
-  await sched.stop()
+    })
+    await sched.runOnce()
+    await sched.stop()
+  } finally {
+    if (paused.length > 0) {
+      await pool.query(
+        'UPDATE remote_agent_profiles SET disabled_by = NULL WHERE id = ANY($1::uuid[])',
+        [paused],
+      )
+    }
+  }
+  assert.deepEqual(schedulerLogErrors, [])
+  const afterSched = (
+    await pool.query<{ last_probe_ok_at: Date | null }>(
+      'SELECT last_probe_ok_at FROM remote_agent_profiles WHERE id = $1',
+      [schedProfId],
+    )
+  ).rows[0]!
+  assert.ok(afterSched.last_probe_ok_at instanceof Date)
 
   const pyOut = execFileSync(
     '/usr/bin/python3',
@@ -996,4 +1074,124 @@ test('Group 6: startRemoteDriverDriftScheduler runOnce & stop operate single-fli
     { encoding: 'utf8' },
   )
   assert.deepEqual(JSON.parse(pyOut), { ok: true, checked: 0 })
+})
+
+
+test('Group 7: getProfileStatus returns live codex columns and resolveLegacyCcControllerPath heals pruned release paths', async () => {
+  const sandbox = makeTmp('/tmp/oc-drvtest-r12g7-')
+  const fx = await seedUserNode('g7')
+  const codexReg = loadRemoteDriverRegistry().get('codex')!
+  const cliPath = writeFakeCcCli(sandbox)
+  const { bridgeSha256: _dropBridge, ...codexBaseProbe } = makeCcProbe(cliPath, [
+    {
+      upstreamModelId: 'gpt-6-luna',
+      displayName: 'GPT 6 Luna',
+      supportedEfforts: ['low', 'medium', 'high'],
+      defaultEffort: 'medium',
+      supportsAdaptiveThinking: true,
+      supportsVision: true,
+    },
+  ])
+  const codexProbe: RemoteProbeSnapshot = {
+    ...codexBaseProbe,
+    driverId: 'codex',
+    engineId: codexReg.engineId,
+    driverVersion: codexReg.driverVersion,
+    nativeSha256: 'b'.repeat(64),
+  }
+  const policySha256 = '2'.repeat(64)
+  const codexFp = computeProbeFingerprintTs(codexProbe, {
+    driverDigest: codexReg.driverDigest,
+    coreDigest: codexReg.coreDigest,
+    policySha256,
+  })
+  const codexManifest = {
+    driverId: 'codex',
+    engineId: codexReg.engineId,
+    driverVersion: codexReg.driverVersion,
+    driverDigest: codexReg.driverDigest,
+    coreDigest: codexReg.coreDigest,
+    policySha256,
+    latestFingerprint: codexFp,
+  }
+  const codexProfileId = (
+    await pool.query<{ id: string }>(
+      `INSERT INTO remote_agent_profiles
+         (node_id, engine, driver_id, engine_id, profile_name, account_fingerprint, status,
+          execution_ready, ready_generation, auth_epoch, verified_fingerprint,
+          execution_manifest, probe_snapshot, last_probe_ok_at)
+       VALUES ($1, 'codex', 'codex', $2, 'codex-r12-status', 'acct-codex-g7', 'active',
+               TRUE, 1, 'ae-codex-g7', $3, $4::jsonb, $5::jsonb, NOW())
+       RETURNING id::text AS id`,
+      [
+        fx.nodeId,
+        codexReg.engineId,
+        codexFp,
+        JSON.stringify(codexManifest),
+        JSON.stringify(codexProbe),
+      ],
+    )
+  ).rows[0]!.id
+  await pool.query(
+    `INSERT INTO remote_model_offers (profile_id, canonical_model_id, upstream_model_id, base_display_name, enabled)
+     VALUES ($1, 'gpt-6-luna-remote', 'gpt-6-luna', 'GPT 6 Luna Remote', TRUE)`,
+    [codexProfileId],
+  )
+  await pool.query(
+    `INSERT INTO remote_driver_verification_runs
+       (id, profile_id, node_id, driver_id, engine_id, target_fingerprint, driver_digest, core_digest,
+        suite_digest, ready_generation, auth_epoch, state, attempt_count, completed_at)
+     VALUES ($1, $2, $3, 'codex', $4, $5, $6, $7, $8, 1, 'ae-codex-g7', 'passed', 1, NOW())`,
+    [
+      randomUUID(),
+      codexProfileId,
+      fx.nodeId,
+      codexReg.engineId,
+      codexFp,
+      codexReg.driverDigest,
+      codexReg.coreDigest,
+      computeProductionConformanceSuiteDigest(),
+    ],
+  )
+
+  const signer = AuthoritySigner.createEphemeral()
+  const service = new RemoteDriverV4CommissioningService({
+    executorDeps: {
+      pool,
+      preCheckRedis: new InMemoryPreCheckRedis(),
+      catalog: {
+        assertFresh: async () =>
+          new ModelCatalogSnapshot({
+            securityEpoch: 1n,
+            entries: [],
+            aliases: new Map(),
+            pricing: new Map(),
+          }),
+      },
+      keyring: () => signer.publicKeyring(),
+      signer,
+      loadUserModelAuthz: async () => ({
+        role: 'admin',
+        grantedModelIds: new Set(['gpt-6-luna-remote']),
+      }),
+      log: createLogger({ level: 'error', out: () => {} }),
+      containerSource: async () => null,
+    },
+  })
+
+  const status = await service.getProfileStatus(codexProfileId)
+  const profile = status.profile as Record<string, unknown>
+  assert.equal(profile.verified_fingerprint, codexFp)
+  assert.equal(profile.target_fingerprint, codexFp)
+  assert.ok(profile.last_probe_ok_at)
+  assert.ok(((status.eligibleOfferCounts as Record<string, number>)['gpt-6-luna-remote'] ?? 0) >= 1)
+  assert.equal((status.latestVerificationRun as { state?: string } | null)?.state, 'passed')
+
+  const prunedPath =
+    '/opt/openclaude/openclaude-v5-selfhost-releases/rel-pruned-123/scripts/agent-remote/cc5-host-controller.py'
+  const resolvedPath = resolveLegacyCcControllerPath(prunedPath)
+  assert.notEqual(resolvedPath, prunedPath)
+  assert.ok(resolvedPath.endsWith('/scripts/agent-remote/cc5-host-controller.py'))
+  assert.equal(existsSync(resolvedPath), true)
+  assert.equal(resolveLegacyCcControllerPath('/tmp/nonexistent-other.py'), '/tmp/nonexistent-other.py')
 })

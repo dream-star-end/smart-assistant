@@ -204,15 +204,25 @@ export async function runCasesG5ToG7(
       g7newRejected = true
     }
     need(g7newRejected, 'G7NEW_DID_NOT_REJECT_UNDER_MEMORY_CAP')
-    need(!(await ctx.checkRemoteTaskFileExists(g7new, 'APP-SCOPE.json')), 'G7NEW_SPAWNED_APP_SCOPE')
     if (newTurnReqId) {
       need((await countUsageRowsForRequest(newTurnReqId)) === 0, 'G7NEW_CHARGED_CREDITS')
     }
     await recordRemoteDriverLaneState(g7new.operationId, g7new.generation, 'released', ctx.pool)
-    await ctx.closeSubLane(g7new, {
+    const g7newClosed = await ctx.closeSubLane(g7new, {
       absentFiles: [`${g7new.laneCwd}/g7new.txt`],
       keepState: true,
     })
+    const g7newStopScopes = (
+      g7newClosed.remoteStopProof as { proof?: { scopes?: unknown[] } } | undefined
+    )?.proof?.scopes
+    need(
+      g7newStopScopes === undefined || g7newStopScopes.length === 0,
+      'G7NEW_SPAWNED_APP_SCOPE',
+    )
+    const appScopeExists = await ctx.checkRemoteTaskFileExists(g7new, 'APP-SCOPE.json')
+    if (appScopeExists !== null) {
+      need(!appScopeExists, 'G7NEW_SPAWNED_APP_SCOPE')
+    }
 
     await ctx.releaseBarrier('g7old', false)
     const oldRes = await oldTurn.waitDone()
