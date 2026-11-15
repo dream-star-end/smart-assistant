@@ -118,6 +118,8 @@ export function createDriverVerificationCatalog(
       )
 
       const baseSlug = deriveBaseSlug(input.canonicalModel)
+      const allowAutoDisabledBootstrap =
+        catRow.state === 'disabled' && catRow.pool_auto_disabled === true
       const priceRes = await input.pool.query<Record<string, any>>(
         `SELECT p.model_id, p.display_name,
                 p.input_per_mtok::text       AS input_per_mtok,
@@ -133,9 +135,10 @@ export function createDriverVerificationCatalog(
            FROM model_pricing p
            LEFT JOIN subscription_plans sp ON sp.code = p.min_plan_code
           WHERE p.model_id IN ($1, $2)
+            AND ($3::boolean OR p.enabled = TRUE)
           ORDER BY CASE WHEN p.model_id = $1 THEN 0 ELSE 1 END
           LIMIT 1`,
-        [input.canonicalModel, baseSlug],
+        [input.canonicalModel, baseSlug, allowAutoDisabledBootstrap],
       )
       need(priceRes.rows.length === 1, 'REMOTE_VERIFICATION_PRICING_MISSING')
       const priceRow = priceRes.rows[0]!

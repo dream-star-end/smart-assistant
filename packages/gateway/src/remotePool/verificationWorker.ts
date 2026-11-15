@@ -44,7 +44,6 @@ export async function runVerificationWorkerMain(): Promise<void> {
   let httpSeq = 0
   const pendingHttp = new Map<number, PendingHttpCall>()
   const lanes = new Map<string, WorkerLaneState>()
-  let commandQueue: Promise<void> = Promise.resolve()
 
   async function closeLaneInternal(laneId: string) {
     const lane = lanes.get(laneId)
@@ -154,7 +153,8 @@ export async function runVerificationWorkerMain(): Promise<void> {
           agentId: 'main',
           agentBaseDir: laneDir,
           model: binding.canonicalModel,
-          effortLevel: typeof msg.effort === 'string' ? msg.effort : 'low',
+          effortLevel:
+            typeof msg.effort === 'string' && msg.effort.length > 0 ? msg.effort : undefined,
           config: {
             version: 1,
             gateway: { bind: '127.0.0.1', port: 9, accessToken: 'verification-worker' },
@@ -277,7 +277,7 @@ export async function runVerificationWorkerMain(): Promise<void> {
       if (msg.kind === 'cmd') {
         const cmdId = String(msg.cmdId ?? '')
         const op = String(msg.op ?? '')
-        const task = handleCommand(msg).then(
+        void handleCommand(msg).then(
           (result) => {
             emit({ kind: 'cmd_ok', cmdId, ...result })
             if (op === 'shutdown_worker') {
@@ -292,10 +292,6 @@ export async function runVerificationWorkerMain(): Promise<void> {
               error: err instanceof Error ? err.message : String(err),
             })
           },
-        )
-        commandQueue = commandQueue.then(
-          () => task,
-          () => task,
         )
       }
     },

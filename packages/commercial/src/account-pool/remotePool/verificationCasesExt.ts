@@ -183,6 +183,7 @@ export async function runCasesG5ToG7(
       skipPreflight: true,
     })
     let g7newRejected = false
+    let newTurnReqId: string | null = null
     try {
       const pre = await g7new.host.preflight()
       if (!pre.memoryOk) {
@@ -193,6 +194,7 @@ export async function runCasesG5ToG7(
           1,
           buildWritePrompt(`${g7new.laneCwd}/g7new.txt`, 'SHOULD_FAIL', 'g7new'),
         )
+        newTurnReqId = resNew.requestId
         trackReq(resNew.requestId)
         if (resNew.summary?.isError || resNew.calls.length === 0) {
           g7newRejected = true
@@ -202,6 +204,10 @@ export async function runCasesG5ToG7(
       g7newRejected = true
     }
     need(g7newRejected, 'G7NEW_DID_NOT_REJECT_UNDER_MEMORY_CAP')
+    need(!(await ctx.checkRemoteTaskFileExists(g7new, 'APP-SCOPE.json')), 'G7NEW_SPAWNED_APP_SCOPE')
+    if (newTurnReqId) {
+      need((await countUsageRowsForRequest(newTurnReqId)) === 0, 'G7NEW_CHARGED_CREDITS')
+    }
     await recordRemoteDriverLaneState(g7new.operationId, g7new.generation, 'released', ctx.pool)
     await ctx.closeSubLane(g7new, {
       absentFiles: [`${g7new.laneCwd}/g7new.txt`],

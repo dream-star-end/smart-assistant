@@ -7,7 +7,11 @@ import type { RemoteCcTarget } from '@openclaude/gateway/cc5-container-runtime'
 import type { RemotePoolProbeOutput, RemotePoolProbeSpec } from '@openclaude/gateway/remote-pool'
 import type { Pool } from 'pg'
 import { countEligibleEnabledRemoteOffers } from '../remoteBrainPool.js'
-import { reconcileRemoteLane, reconcileStaleContainerLanes } from '../remoteLaneRecovery.js'
+import {
+  proveRemoteLaneContainerStopped,
+  reconcileRemoteLane,
+  reconcileStaleContainerLanes,
+} from '../remoteLaneRecovery.js'
 import {
   claimDriverVerificationRun,
   recordProductionDriverProbeSnapshot,
@@ -29,6 +33,7 @@ import {
   type DriverVerificationExecutorDeps,
   executeDriverVerificationRun,
 } from './verificationExecutor.js'
+import { proveVerificationRunLocalStopped } from './verificationRuntimeProof.js'
 
 const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
 const DEFAULT_CUTOVER_DEADLINE_MS = 12 * 60_000
@@ -70,10 +75,13 @@ async function releaseVerificationBindingsForProfile(
   profileId: string,
   verificationRunId?: string,
   fixtures?: Parameters<typeof reconcileRemoteLane>[3],
+  liveDockerId?: string,
 ): Promise<void> {
   const rows = (
-    await pool.query<{ operation_id: string; generation: string }>(
-      `SELECT operation_id::text AS operation_id, generation::text AS generation
+    await pool.query<{ operation_id: string; generation: string; run_id: string | null }>(
+      `SELECT operation_id::text AS operation_id,
+              generation::text AS generation,
+              recovery_spec->>'verificationRunId' AS run_id
          FROM remote_agent_bindings
         WHERE profile_id = $1
           AND state <> 'released'
@@ -82,7 +90,17 @@ async function releaseVerificationBindingsForProfile(
     )
   ).rows
   for (const r of rows) {
-    await reconcileRemoteLane(pool, r.operation_id, r.generation, fixtures)
+    const rowRunId = verificationRunId ?? r.run_id ?? undefined
+    const rowFixtures = fixtures?.proveLocal
+      ? fixtures
+      : {
+          ...fixtures,
+          proveLocal: async (dId: string) =>
+            liveDockerId && dId === liveDockerId && rowRunId
+              ? await proveVerificationRunLocalStopped(dId, rowRunId)
+              : await proveRemoteLaneContainerStopped(dId),
+        }
+    await reconcileRemoteLane(pool, r.operation_id, r.generation, rowFixtures)
   }
 }
 
@@ -191,11 +209,13 @@ export class RemoteDriverV4CommissioningService {
   async revertToLegacy(profileId: string): Promise<Record<string, unknown>> {
     need(UUID_RE.test(profileId), 'REMOTE_PROFILE_ID_INVALID')
     const pool = this.deps.executorDeps.pool
+    const liveContainer = await this.deps.executorDeps.containerSource().catch(() => null)
     await releaseVerificationBindingsForProfile(
       pool,
       profileId,
       undefined,
       this.deps.recoveryFixtures,
+      liveContainer?.dockerId,
     )
     const profRes = await pool.query<{ ready_generation: string; driver_id: string | null }>(
       'SELECT ready_generation::text AS ready_generation, driver_id FROM remote_agent_profiles WHERE id = $1',
@@ -269,10 +289,12 @@ export class RemoteDriverV4CommissioningService {
     let convertedFromLegacy = false
     let cutoverReadyGeneration: string | undefined
     let claimedRunId: string | undefined
+    let liveDockerId: string | undefined
 
     try {
       const container = await this.deps.executorDeps.containerSource()
       need(container !== null, 'REMOTE_VERIFICATION_CONTAINER_NOT_RUNNING')
+      liveDockerId = container.dockerId
       await reconcileStaleContainerLanes(pool, 3, container.dockerId, this.deps.recoveryFixtures)
 
       const probed = await executeLiveRemoteDriverProbe(
@@ -359,9 +381,11 @@ export class RemoteDriverV4CommissioningService {
       job.verificationRunId = claimed.id
 
       const deadlineMs = input.deadlineMs ?? DEFAULT_CUTOVER_DEADLINE_MS
+      const abortController = new AbortController()
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-      const result = await Promise.race([
-        executeDriverVerificationRun(this.deps.executorDeps, {
+      const runPromise = executeDriverVerificationRun(
+        this.deps.executorDeps,
+        {
           id: claimed.id,
           nodeId: claimed.nodeId,
           profileId: claimed.profileId,
@@ -373,16 +397,27 @@ export class RemoteDriverV4CommissioningService {
           suiteDigest: claimed.suiteDigest ?? suiteDigest,
           readyGeneration: claimed.readyGeneration,
           leaseOwner: claimed.leaseOwner ?? leaseOwner,
-        }),
+        },
+        { signal: abortController.signal },
+      )
+      const result = await Promise.race([
+        runPromise,
         new Promise<never>((_, reject) => {
           timeoutHandle = setTimeout(() => {
+            abortController.abort()
             reject(new Error('REMOTE_CUTOVER_DEADLINE_EXCEEDED'))
           }, deadlineMs)
           timeoutHandle.unref()
         }),
-      ]).finally(() => {
-        if (timeoutHandle) clearTimeout(timeoutHandle)
-      })
+      ])
+        .catch(async (runErr) => {
+          abortController.abort()
+          await runPromise.catch(() => {})
+          throw runErr
+        })
+        .finally(() => {
+          if (timeoutHandle) clearTimeout(timeoutHandle)
+        })
 
       if (!this.deps.executorDeps.fixtures?.skipCatalogSync) {
         await syncProfileOffersCatalogState(pool, input.profileId)
@@ -402,6 +437,7 @@ export class RemoteDriverV4CommissioningService {
             input.profileId,
             claimedRunId,
             this.deps.recoveryFixtures,
+            liveDockerId,
           )
           await revertDriverV4ProfileToLegacy(pool, {
             profileId: input.profileId,

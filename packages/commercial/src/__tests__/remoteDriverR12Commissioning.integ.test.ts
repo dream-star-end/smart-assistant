@@ -188,8 +188,8 @@ before(async () => {
     [
       JSON.stringify({
         supports_vision: false,
-        reasoning: { supported: ['low', 'medium'], codex_model_default: null },
-        ccb: { capability_zero: false, supports_thinking: true },
+        reasoning: { supported: [], codex_model_default: null },
+        ccb: { context_owner: 'box-native-v1', capability_zero: true, supports_thinking: false },
       }),
     ],
   )
@@ -430,7 +430,6 @@ test('Group 3: verificationCatalog activates pool_auto_disabled models privately
   )
   const stubLive = new ModelCatalogSnapshot({
     securityEpoch: 1n,
-    defaultModelId: 'claude-haiku-5-5-remote',
     entries: [],
     aliases: new Map(),
     pricing: new Map(),
@@ -507,9 +506,9 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
     {
       upstreamModelId: 'haiku',
       displayName: 'Haiku',
-      supportedEfforts: ['low', 'medium'],
-      defaultEffort: 'low',
-      supportsAdaptiveThinking: true,
+      supportedEfforts: [],
+      defaultEffort: null,
+      supportsAdaptiveThinking: false,
       supportsVision: false,
     },
   ])
@@ -556,12 +555,11 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
   const signer = AuthoritySigner.createEphemeral()
   const stubLive = new ModelCatalogSnapshot({
     securityEpoch: 1n,
-    defaultModelId: 'claude-haiku-5-5-remote',
     entries: [],
     aliases: new Map(),
     pricing: new Map(),
   })
-  const makeSvc = (failRuntime = false) => {
+  const makeSvc = (failMidCase = false) => {
     let settled!: (j: Record<string, unknown>) => void
     const done = new Promise<Record<string, unknown>>((r) => {
       settled = r
@@ -577,7 +575,7 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
           role: 'admin',
           grantedModelIds: new Set(['claude-haiku-5-5-remote']),
         }),
-        log: createLogger('r12-test'),
+        log: createLogger({ level: 'error', out: () => {} }),
         containerSource: async () => ({
           containerDbId: fx.containerDbId,
           dockerId: fx.dockerId,
@@ -587,16 +585,13 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
         fixtures: {
           localSandboxDir: sandbox,
           skipCatalogSync: true,
-          proveRuntime: async (dockerId) => {
-            if (failRuntime) throw new Error('INJECTED_RUNTIME_PROOF_FAIL')
-            return {
-              dockerId,
-              workerHash: 'w'.repeat(64),
-              bridgeHash: 'b'.repeat(64),
-              coreHash: reg.coreDigest,
-              driverHashes: { cc: reg.driverDigest },
-            }
-          },
+          proveRuntime: async (dockerId) => ({
+            dockerId,
+            imageId: 'sha256:r12-test-image',
+            manifestSha256: 'm'.repeat(64),
+            verifiedFiles: { cc: reg.driverDigest },
+          }),
+          proveLocalStopped: async () => {},
           proveContainer: async (_d, a) => {
             for (const f of a.expectedFiles ?? [])
               assert.equal(
@@ -665,6 +660,7 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
             >()
             return {
               async openLane(opts) {
+                assert.equal(opts.effort, undefined)
                 const laneCwd = join(sandbox, 'c-lanes', opts.laneId)
                 mkdirSync(laneCwd, { recursive: true })
                 const sockPath = join(sandbox, `r-${opts.laneId}-${randomUUID().slice(0, 6)}.sock`)
@@ -799,6 +795,9 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
                 return { laneCwd }
               },
               startTurn(opts) {
+                if (failMidCase && opts.laneId === 'g1') {
+                  throw new Error('INJECTED_MID_CASE_FAIL')
+                }
                 const l = lanes.get(opts.laneId)!
                 if (opts.barrierMode) {
                   l.barrierMode = opts.barrierMode
@@ -894,6 +893,21 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
   const failJob = await failRun.done
   assert.equal(failJob.status, 'reverted', String(failJob.error ?? ''))
   assert.equal(failJob.reverted, true)
+  assert.ok(failJob.verificationRunId)
+  const failRunRow = (
+    await pool.query('SELECT state FROM remote_driver_verification_runs WHERE id = $1', [
+      failJob.verificationRunId,
+    ])
+  ).rows[0]!
+  assert.equal(failRunRow.state, 'failed')
+  const failBindings = (
+    await pool.query<{ total: number; unreleased: number }>(
+      `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE state <> 'released')::int AS unreleased FROM remote_agent_bindings WHERE recovery_spec->>'verificationRunId' = $1`,
+      [failJob.verificationRunId],
+    )
+  ).rows[0]!
+  assert.ok(failBindings.total >= 1)
+  assert.equal(failBindings.unreleased, 0)
   const afterFail = (
     await pool.query('SELECT driver_id, execution_ready FROM remote_agent_profiles WHERE id = $1', [
       profId,

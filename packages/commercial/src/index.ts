@@ -6974,7 +6974,13 @@ export async function registerCommercial(
     });
   }
 
-  if (runtimeChannel === "v5" && process.env.OC_REMOTE_DRIVER_DRIFT_DISABLED !== "1") {
+  if (
+    runtimeChannel === "v5" &&
+    flavorIdentity.status === "ok" &&
+    flavorIdentity.flavor === "selfhost" &&
+    v4ExecutorDeps &&
+    process.env.OC_REMOTE_DRIVER_DRIFT_DISABLED !== "1"
+  ) {
     leaderBundle.add({
       name: "remoteDriverDrift",
       domain: "v5-owned",

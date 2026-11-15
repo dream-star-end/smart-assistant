@@ -30,9 +30,10 @@ import type {
   VerificationTurnResult,
 } from './verificationCases.js'
 import type { VerificationCatalogHandle } from './verificationCatalog.js'
-import type {
-  VerificationContainerAuditInput,
-  VerificationContainerProofResult,
+import {
+  type VerificationContainerAuditInput,
+  type VerificationContainerProofResult,
+  proveVerificationRunLocalStopped,
 } from './verificationRuntimeProof.js'
 import type {
   DriverVerificationExecutorDeps,
@@ -86,6 +87,12 @@ export function createSubLaneOperations(ctx: {
     ctx.openLanes.delete(lane)
     const workerClosed = await ctx.workerCtrl.closeLane(lane.caseLane)
     await lane.relay.stop().catch(() => {})
+    const hostStop = (lane.host as { verifiedStopEvidence?: { remoteStopped?: boolean } })
+      .verifiedStopEvidence
+    if (!hostStop) {
+      const stopRes = await lane.host.stop()
+      need(stopRes?.remoteStopped === true, 'REMOTE_VERIFICATION_STOP_NOT_PROVEN')
+    }
     if (!audit?.keepState) {
       await recordRemoteDriverLaneState(
         lane.operationId,
@@ -118,6 +125,14 @@ export function createSubLaneOperations(ctx: {
     },
   ): Promise<VerificationSubLaneHandle> => {
     ctx.checkCancelled()
+    const snap = await ctx.verifyCatalog.assertFresh()
+    const modelEntry = snap.resolve(ctx.canonicalModel)
+    need(modelEntry !== null && modelEntry !== undefined, 'REMOTE_VERIFICATION_MODEL_MISSING')
+    const effectiveEffort = modelEntry.capabilityProfile.reasoning.supported.includes(
+      ctx.effort as never,
+    )
+      ? ctx.effort
+      : undefined
     const placed = await placeRemoteDriverLane(
       {
         uid: 3,
@@ -214,12 +229,31 @@ export function createSubLaneOperations(ctx: {
     })
     ctx.relays.set(caseLane, relay)
 
-    const workerOpened = await ctx.workerCtrl.openLane({
-      laneId: caseLane,
-      binding: placed.binding as unknown as Record<string, unknown>,
-      barrierMode: opts?.barrierMode,
-      effort: ctx.effort,
-    })
+    let workerOpened: { readonly laneCwd: string }
+    try {
+      workerOpened = await ctx.workerCtrl.openLane({
+        laneId: caseLane,
+        binding: placed.binding as unknown as Record<string, unknown>,
+        barrierMode: opts?.barrierMode,
+        ...(effectiveEffort !== undefined ? { effort: effectiveEffort } : {}),
+      })
+    } catch (err) {
+      await relay.stop().catch(() => {})
+      const stopRes = await host.stop().catch(() => null)
+      if (stopRes?.remoteStopped === true) {
+        const proveLocalStopped =
+          ctx.deps.fixtures?.proveLocalStopped ?? proveVerificationRunLocalStopped
+        await proveLocalStopped(ctx.container.dockerId, ctx.run.id).catch(() => {})
+        await recordRemoteDriverLaneState(
+          placed.binding.operationId,
+          placed.binding.generation,
+          'released',
+          ctx.deps.pool,
+        ).catch(() => {})
+      }
+      ctx.relays.delete(caseLane)
+      throw err
+    }
 
     const handle: VerificationSubLaneHandle = {
       caseLane,

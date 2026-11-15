@@ -6,17 +6,23 @@
  */
 import { execFile } from 'node:child_process'
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import type { RemoteCcTarget } from '@openclaude/gateway/cc5-container-runtime'
 import { evidenceHash } from '../codexCommissioningEvidence.js'
 
 const exec = promisify(execFile)
 const CODE_ROOT = fileURLToPath(new URL('../../../../../', import.meta.url))
+const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
 
 export const V4_VERIFICATION_WORKER_DIST = 'packages/gateway/dist/remotePool/verificationWorker.js'
 const PINNED_V4_RUNTIME_FILES = [
   V4_VERIFICATION_WORKER_DIST,
+  'packages/gateway/dist/remotePool/verificationWorkerHost.js',
+  'packages/gateway/dist/remotePool/relay.js',
+  'packages/gateway/dist/remotePool/sshTransport.js',
+  'packages/gateway/dist/remotePool/driverWorkerClient.js',
   'packages/gateway/dist/remotePool/remoteEngineAdapter.js',
   'packages/gateway/dist/remotePool/containerLane.js',
   'packages/gateway/dist/remotePool/observationGate.js',
@@ -200,4 +206,112 @@ export async function proveVerificationContainer(
     checkedSupervisors: parsed.pids ?? [],
     checkedSentinels: parsed.checkedFiles ?? [],
   }
+}
+
+export async function sshCheckRemoteTaskFileExists(
+  target: RemoteCcTarget,
+  taskRoot: string,
+  relPath: string,
+): Promise<boolean> {
+  need(taskRoot.length > 0 && isAbsolute(taskRoot), 'REMOTE_VERIFICATION_TASK_ROOT_INVALID')
+  need(relPath.length > 0 && !isAbsolute(relPath), 'REMOTE_VERIFICATION_RELPATH_INVALID')
+  const quote = (val: string) => `'${val.replaceAll("'", "'\\''")}'`
+  const py =
+    'import pathlib,sys; r=pathlib.Path(sys.argv[1]).resolve(); p=(r/sys.argv[2]).resolve(); ' +
+    'assert str(p).startswith(str(r)+"/"); print("1" if p.exists() else "0")'
+  const remoteCmd = ['/usr/bin/python3', '-I', '-B', '-c', py, taskRoot, relPath]
+    .map(quote)
+    .join(' ')
+  const sshArgs = [
+    '-F',
+    'none',
+    '-T',
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'StrictHostKeyChecking=yes',
+    '-o',
+    `UserKnownHostsFile=${target.knownHostsPath}`,
+    '-o',
+    'GlobalKnownHostsFile=/dev/null',
+    '-o',
+    'ControlMaster=no',
+    '-o',
+    'ControlPath=none',
+    '-o',
+    'IdentitiesOnly=yes',
+    '-o',
+    'IdentityAgent=none',
+    '-o',
+    'ForwardAgent=no',
+    '-o',
+    'ClearAllForwardings=yes',
+    '-o',
+    'ConnectTimeout=10',
+    '-i',
+    target.keyPath,
+    '-p',
+    String(target.port),
+    `${target.user}@${target.host}`,
+    remoteCmd,
+  ]
+  const out = (
+    await exec('/usr/bin/ssh', sshArgs, { timeout: 15_000, maxBuffer: 64 * 1024 })
+  ).stdout.trim()
+  need(out === '1' || out === '0', 'REMOTE_VERIFICATION_SSH_CHECK_INVALID')
+  return out === '1'
+}
+
+export async function proveVerificationRunLocalStopped(
+  dockerId: string,
+  runId: string,
+): Promise<void> {
+  need(UUID_RE.test(runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
+  const py = [
+    'import json, os, pathlib, stat, sys',
+    'rid = sys.argv[1]',
+    'target = "/home/agent/.openclaude/commissioning/" + rid',
+    'root = pathlib.Path(target)',
+    'checked = 0',
+    'if root.exists():',
+    '    for sf in root.rglob("stopped.json"):',
+    '        st = sf.lstat()',
+    '        assert stat.S_ISREG(st.st_mode) and st.st_uid == 1000 and (st.st_mode & 0o077) == 0',
+    '        data = json.loads(sf.read_text("utf-8"))',
+    '        assert data.get("version") == 1 and data.get("localStopped") is True',
+    '        pid = int(data["supervisorPid"])',
+    '        assert not pathlib.Path(f"/proc/{pid}").exists(), f"supervisor alive: {pid}"',
+    '        checked += 1',
+    'for entry in os.listdir("/proc"):',
+    '    if not entry.isdigit() or int(entry) == os.getpid():',
+    '        continue',
+    '    pdir = pathlib.Path("/proc") / entry',
+    '    try:',
+    '        if pdir.stat().st_uid != 1000:',
+    '            continue',
+    '        try:',
+    '            assert target not in os.readlink(str(pdir / "cwd"))',
+    '        except FileNotFoundError:',
+    '            pass',
+    '        try:',
+    '            assert target not in (pdir / "cmdline").read_bytes().decode("utf-8", "replace")',
+    '        except FileNotFoundError:',
+    '            pass',
+    '    except (FileNotFoundError, ProcessLookupError, PermissionError):',
+    '        continue',
+    'print(json.dumps({"ok": True, "checked": checked}))',
+  ].join('\\n')
+  const raw = await runDocker([
+    'exec',
+    '--user',
+    '1000',
+    dockerId,
+    '/usr/bin/python3',
+    '-I',
+    '-B',
+    '-c',
+    py,
+    runId,
+  ])
+  need(JSON.parse(raw).ok === true, 'REMOTE_VERIFICATION_RUN_LOCAL_STOP_UNPROVEN')
 }

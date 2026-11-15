@@ -28,7 +28,7 @@ export interface VerificationWorkerController {
     readonly laneId: string
     readonly binding: Record<string, unknown>
     readonly barrierMode?: 'none' | 'hold_until_release'
-    readonly effort: string
+    readonly effort?: string
   }): Promise<{ readonly laneCwd: string }>
   startTurn(input: {
     readonly laneId: string
@@ -58,6 +58,7 @@ export interface DriverVerificationTestFixtures {
     dockerId: string,
     input: VerificationContainerAuditInput,
   ) => Promise<VerificationContainerProofResult>
+  readonly proveLocalStopped?: (dockerId: string, runId: string) => Promise<void>
   readonly spawnWorker?: (input: {
     readonly dockerId: string
     readonly runId: string

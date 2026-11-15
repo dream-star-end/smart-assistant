@@ -18,6 +18,7 @@ import {
   completeProductionDriverVerificationRun,
   renewDriverVerificationLease,
 } from './driftCoordinator.js'
+import { recordRemoteDriverLaneState } from './placement.js'
 import { loadRemoteDriverRegistry } from './registry.js'
 import { verifySandboxRedProofForDriver } from './sandboxRedProof.js'
 import { assertVerificationRunAuthorized } from './verificationBudget.js'
@@ -25,7 +26,12 @@ import { type VerificationSubLaneHandle, runAllVerificationCases } from './verif
 import { createDriverVerificationCatalog } from './verificationCatalog.js'
 import { DEFAULT_EVIDENCE_ROOT, writeArtifactSafely } from './verificationEvidence.js'
 import { createSubLaneOperations } from './verificationLaneHost.js'
-import { proveVerificationContainer, proveVerificationRuntime } from './verificationRuntimeProof.js'
+import {
+  proveVerificationContainer,
+  proveVerificationRunLocalStopped,
+  proveVerificationRuntime,
+  sshCheckRemoteTaskFileExists,
+} from './verificationRuntimeProof.js'
 import type {
   DriverVerificationExecutorDeps,
   DriverVerificationTestFixtures,
@@ -52,7 +58,28 @@ function need(condition: unknown, code = 'REMOTE_VERIFICATION_EXECUTOR_FAILED'):
 export async function executeDriverVerificationRun(
   deps: DriverVerificationExecutorDeps,
   run: VerificationRunInput,
-  options: { readonly allowManualUnbound?: boolean } = {},
+  options: { readonly allowManualUnbound?: boolean; readonly signal?: AbortSignal } = {},
+): Promise<VerificationRunExecutionResult> {
+  try {
+    return await executeDriverVerificationRunInner(deps, run, options)
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    const codeMatch = /^[A-Z0-9_]{3,64}/.exec(detail)
+    await completeProductionDriverVerificationRun(deps.pool, {
+      runId: run.id,
+      outcome: 'failed',
+      leaseOwner: run.leaseOwner,
+      errorCode: codeMatch ? codeMatch[0] : 'REMOTE_VERIFICATION_FAILED',
+      errorDetail: detail.slice(0, 500),
+    }).catch(() => {})
+    throw err
+  }
+}
+
+async function executeDriverVerificationRunInner(
+  deps: DriverVerificationExecutorDeps,
+  run: VerificationRunInput,
+  options: { readonly allowManualUnbound?: boolean; readonly signal?: AbortSignal },
 ): Promise<VerificationRunExecutionResult> {
   const { policy, canonicalModel } = await assertVerificationRunAuthorized(deps.pool, run.id, {
     allowManualUnbound: options.allowManualUnbound,
@@ -93,7 +120,11 @@ export async function executeDriverVerificationRun(
   const proveContainer = deps.fixtures?.proveContainer ?? proveVerificationContainer
   const runtimeProof = await proveRuntime(container.dockerId)
 
-  let cancelledError: Error | null = null
+  if (options.signal?.aborted) throw new Error('REMOTE_CUTOVER_DEADLINE_EXCEEDED')
+
+  let cancelledError: Error | null = options.signal?.aborted
+    ? new Error('REMOTE_CUTOVER_DEADLINE_EXCEEDED')
+    : null
   let leaseStopped = false
   const leaseTimer = setInterval(() => {
     void renewDriverVerificationLease(deps.pool, {
@@ -133,6 +164,13 @@ export async function executeDriverVerificationRun(
         keyring: keyringEncoded,
         relays,
       })
+
+  const onAbort = () => {
+    cancelledError = new Error('REMOTE_CUTOVER_DEADLINE_EXCEEDED')
+    void workerCtrl.shutdown().catch(() => {})
+  }
+  if (options.signal?.aborted) onAbort()
+  else options.signal?.addEventListener('abort', onAbort, { once: true })
 
   const checkCancelled = () => {
     if (leaseStopped || cancelledError) {
@@ -202,7 +240,7 @@ export async function executeDriverVerificationRun(
         }
         return lane.taskRoot.startsWith('/tmp/oc-drvtest-')
           ? existsSync(join(lane.taskRoot, relPath))
-          : false
+          : await sshCheckRemoteTaskFileExists(lane.sshTarget, lane.taskRoot, relPath)
       },
       recordCaseLane: (l) => {
         if (!allCaseLanes.includes(l)) allCaseLanes.push(l)
@@ -288,8 +326,29 @@ export async function executeDriverVerificationRun(
     clearInterval(leaseTimer)
     for (const hb of activeHeartbeats) clearInterval(hb)
     activeHeartbeats.clear()
+    options.signal?.removeEventListener('abort', onAbort)
+    const proveLocalStopped = deps.fixtures?.proveLocalStopped ?? proveVerificationRunLocalStopped
     for (const lane of [...openLanes]) {
-      await laneOps.closeSubLane(lane, { keepState: true }).catch(() => {})
+      try {
+        await laneOps.closeSubLane(lane)
+      } catch {
+        await workerCtrl.shutdown().catch(() => {})
+        await lane.relay.stop().catch(() => {})
+        try {
+          const stopRes = await lane.host.stop()
+          if (stopRes?.remoteStopped === true) {
+            await proveLocalStopped(container.dockerId, run.id)
+            await recordRemoteDriverLaneState(
+              lane.operationId,
+              lane.generation,
+              'released',
+              deps.pool,
+            )
+          }
+        } catch {
+          // Leave binding unreleased for commissioningService / recovery reconciliation.
+        }
+      }
     }
     await workerCtrl.shutdown().catch(() => {})
     await sharedWorker.close().catch(() => {})

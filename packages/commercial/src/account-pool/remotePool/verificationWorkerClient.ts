@@ -114,9 +114,14 @@ export async function createDockerWorkerController(input: {
       else waiter.reject(new Error(String(msg.error ?? 'WORKER_CMD_FAILED')))
     }
   })
+  let resolveClosed!: () => void
+  const procClosed = new Promise<void>((res) => {
+    resolveClosed = res
+  })
   proc.once('error', failAll)
   proc.once('close', (code) => {
     if (!workerExited) failAll(new Error(`VERIFICATION_WORKER_EXITED_${String(code ?? 'null')}`))
+    resolveClosed()
   })
 
   const sendCmd = (
@@ -182,12 +187,26 @@ export async function createDockerWorkerController(input: {
       }
     },
     async shutdown() {
-      if (workerExited) return
-      await sendCmd('shutdown_worker', {}).catch(() => {})
-      workerExited = true
+      if (!workerExited) {
+        await sendCmd('shutdown_worker', {}).catch(() => {})
+        workerExited = true
+      }
       rl.close()
       proc.stdin.destroy()
-      proc.kill('SIGTERM')
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill('SIGTERM')
+        const killTimer = setTimeout(() => {
+          if (proc.exitCode === null && proc.signalCode === null) {
+            proc.kill('SIGKILL')
+          }
+        }, 3000)
+        killTimer.unref()
+        try {
+          await procClosed
+        } finally {
+          clearTimeout(killTimer)
+        }
+      }
     },
   }
 }
