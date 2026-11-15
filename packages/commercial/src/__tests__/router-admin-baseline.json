@@ -547,6 +547,18 @@
   },
   {
     "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/driver-v4",
+    "handler": "handleAdminRemoteDriverV4"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/remote-pool/driver-v4",
+    "handler": "handleAdminRemoteDriverV4"
+  },
+  {
+    "method": "GET",
     "pathKind": "path",
     "pathValue": "/api/admin/remote-pool",
     "handler": "handleAdminRemotePoolGet"

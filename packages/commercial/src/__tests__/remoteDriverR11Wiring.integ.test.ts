@@ -37,6 +37,7 @@ import {
 } from '../account-pool/remoteBrainPool.js'
 import {
   REMOTE_DRIVER_VERIFICATION_CASE_LANES,
+  REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX,
   REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX,
   claimDriverVerificationRun,
   completeDriverVerificationRun,
@@ -452,7 +453,7 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
   // Sub-lane key & prefix helpers
   assert.ok(REMOTE_DRIVER_VERIFICATION_CASE_LANES.includes('g1'))
   const laneKey = verificationSessionKeyForCaseLane(claimed.id, 'g1')
-  assert.equal(laneKey, `remote-driver-verify:${claimed.id}:g1`)
+  assert.equal(laneKey, `${REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX}${claimed.id.toLowerCase().replaceAll('-', '')}_g1`)
   assert.equal(isReservedVerificationSessionKey(laneKey), true)
   assert.equal(isReservedVerificationSessionKey('user-chat-1'), false)
   assert.throws(
@@ -460,7 +461,7 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
     /REMOTE_VERIFICATION_CASE_LANE_INVALID/,
   )
   const turnReq1 = verificationTurnRequestId(claimed.id, 'g1', 1)
-  assert.equal(turnReq1, `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${claimed.id}:g1:1`)
+  assert.equal(turnReq1, `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${claimed.id}-g1-1`)
 
   // Regular placement & cc5Runtime reject reserved prefix
   await assert.rejects(

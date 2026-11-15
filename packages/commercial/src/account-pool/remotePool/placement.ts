@@ -54,6 +54,7 @@ import {
   verificationSessionKeyForRun,
   verifyProfileReadyForV4,
 } from './driftCoordinator.js'
+import { buildDefaultDriverContextForNode, resolveProbedUpstreamModel } from './modelResolution.js'
 import {
   legacyBindingEngineForAuthority,
   legacyProfileEngineForAuthority,
@@ -548,7 +549,13 @@ export async function placeRemoteDriverLane(
       const authEpoch = String(
         selectedRow.auth_epoch ?? selectedRow.account_fingerprint ?? 'epoch-1',
       )
-      const upstreamModel = String(selectedRow.upstream_model_id)
+      const resolvedUpstreamModel = resolveProbedUpstreamModel(
+        reg.driverId,
+        String(selectedRow.upstream_model_id),
+        verifiedProbe,
+      )
+      need(resolvedUpstreamModel !== null, 'REMOTE_MODEL_NOT_IN_PROBE_SNAPSHOT')
+      const upstreamModel = resolvedUpstreamModel
       const effectiveCap = Math.min(Number(selectedRow.max_concurrent_lanes), reg.profileMaxLanes)
 
       const manifest: RemotePoolNodeManifest = Object.freeze({
@@ -624,14 +631,30 @@ export async function placeRemoteDriverLane(
         !Array.isArray(execManifestObj.driverContext)
           ? (execManifestObj.driverContext as Record<string, unknown>)
           : {}
-      const defaultMcpClientPath =
-        options.localSandboxDir !== undefined
-          ? join(dirname(controllerPath), 'mcp_client.py')
-          : `/opt/openclaude/remote-driver/${reg.controllerSha256}/core/mcp_client.py`
-      const mergedDriverContext: Record<string, unknown> = {
-        mcpClientPath: defaultMcpClientPath,
-        ...manifestDriverCtx,
-        ...(input.driverContext ?? {}),
+      let mergedDriverContext: Record<string, unknown>
+      if (options.localSandboxDir !== undefined) {
+        mergedDriverContext = {
+          mcpClientPath: join(dirname(controllerPath), 'mcp_client.py'),
+          ...manifestDriverCtx,
+          ...(input.driverContext ?? {}),
+        }
+      } else {
+        const defaultNodeCtx = buildDefaultDriverContextForNode({
+          driverId: reg.driverId,
+          sshUser: String(selectedRow.ssh_user),
+          profileName,
+          controllerSha256: reg.controllerSha256,
+          cliVersion: verifiedProbe.cliVersion,
+          includeBridgeFiles: true,
+        })
+        mergedDriverContext = {
+          ...defaultNodeCtx,
+          ...manifestDriverCtx,
+          ...(input.driverContext ?? {}),
+        }
+        if (reg.driverId === 'cc' && !mergedDriverContext.bridgeFiles) {
+          mergedDriverContext.bridgeFiles = defaultNodeCtx.bridgeFiles
+        }
       }
 
       const spec: RemotePoolLaneSpec = Object.freeze({

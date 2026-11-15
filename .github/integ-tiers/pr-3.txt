@@ -53,6 +53,7 @@ packages/commercial/src/__tests__/migration0331RefreshReissueClientIp.integ.test
 packages/commercial/src/__tests__/codexRemoteMaster.integ.test.ts
 packages/commercial/src/__tests__/remoteDriverCoreV4.integ.test.ts
 packages/commercial/src/__tests__/remoteDriverR11Wiring.integ.test.ts
+packages/commercial/src/__tests__/remoteDriverR12Commissioning.integ.test.ts
 packages/commercial/src/__tests__/remoteNativeNullReceiptRecovery.integ.test.ts
 packages/commercial/src/__tests__/migrationSyncCompat.integ.test.ts
 
