@@ -35,7 +35,7 @@ const SHA256_RE = /^[a-f0-9]{64}$/
 const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
 
 export const DEFAULT_MAX_PROBE_AGE_MS = 10 * 60_000
-export const REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX = 'remote-driver-verify:'
+export const REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX = 'agent:v4verify:webchat:dm:rv_'
 export const REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX = 'rdv-'
 export const REMOTE_DRIVER_VERIFICATION_CASE_LANES = [
   'g1',
@@ -65,7 +65,7 @@ function need(condition: unknown, code = 'REMOTE_DRIFT_COORDINATOR_INVALID'): as
 
 export function verificationSessionKeyForRun(runId: string): string {
   need(UUID_RE.test(runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
-  return `${REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX}${runId}`
+  return `${REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX}${runId.toLowerCase().replaceAll('-', '')}`
 }
 
 export function verificationSessionKeyForCaseLane(runId: string, caseLane: string): string {
@@ -74,7 +74,7 @@ export function verificationSessionKeyForCaseLane(runId: string, caseLane: strin
     typeof caseLane === 'string' && CASE_LANE_SET.has(caseLane),
     'REMOTE_VERIFICATION_CASE_LANE_INVALID',
   )
-  return `${REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX}${runId}:${caseLane}`
+  return `${REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX}${runId.toLowerCase().replaceAll('-', '')}_${caseLane}`
 }
 
 export function verificationTurnRequestId(
@@ -89,13 +89,14 @@ export function verificationTurnRequestId(
   )
   const turnStr = typeof turnIndex === 'number' ? String(turnIndex) : turnIndex
   need(/^[1-9][0-9]{0,5}$/.test(turnStr), 'REMOTE_VERIFICATION_TURN_INDEX_INVALID')
-  return `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${runId}:${caseLane}:${turnStr}`
+  return `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${runId}-${caseLane}-${turnStr}`
 }
 
 export function isReservedVerificationSessionKey(sessionKey: string): boolean {
   return (
     typeof sessionKey === 'string' &&
-    sessionKey.startsWith(REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX)
+    (sessionKey.startsWith(REMOTE_DRIVER_VERIFICATION_SESSION_PREFIX) ||
+      sessionKey.startsWith('remote-driver-verify:'))
   )
 }
 
@@ -1032,7 +1033,7 @@ export async function completeDriverVerificationRun(
           WHERE session_key = $1
              OR left(session_key, length($1) + 1) = $2
              OR recovery_spec->>'verificationRunId' = $3`,
-        [baseSessionKey, `${baseSessionKey}:`, String(run.id)],
+        [baseSessionKey, `${baseSessionKey}_`, String(run.id)],
       )
     ).rows
     const unreleasedTestBindings = bindingRows.filter((b) => b.state !== 'released').length

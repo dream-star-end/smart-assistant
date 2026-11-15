@@ -37,6 +37,7 @@ import {
 } from './policy/registry.js'
 import { healthWeight, rankWRH } from './policy/select.js'
 import { DEFAULT_MAX_PROBE_AGE_MS, verifyProfileReadyForV4 } from './remotePool/driftCoordinator.js'
+import { resolveProbedUpstreamModel } from './remotePool/modelResolution.js'
 import { loadRemoteDriverRegistry } from './remotePool/registry.js'
 
 const execFileAsync = promisify(execFile)
@@ -1647,7 +1648,7 @@ export async function countEligibleEnabledRemoteOffers(
         DEFAULT_MAX_PROBE_AGE_MS,
       )
       if (!check.ready) continue
-      if (check.snapshot.models.some((m) => m.upstreamModelId === String(row.upstream_model_id))) {
+      if (resolveProbedUpstreamModel(String(row.driver_id), String(row.upstream_model_id), check.snapshot) !== null) {
         total += 1
       }
     }

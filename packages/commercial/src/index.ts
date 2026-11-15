@@ -90,6 +90,7 @@ import { loadConfig, type CommercialConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { CodexCommissioning } from "./account-pool/codexCommissioning.js";
+import { RemoteDriverV4CommissioningService, startRemoteDriverDriftScheduler } from "./account-pool/remotePool/index.js";
 import { makeAdminCommissionContainerSource } from "./account-pool/codexCommissioningContainer.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { deriveMediaSignKey } from "./http/mediaSign.js";
@@ -4396,8 +4397,18 @@ export async function registerCommercial(
     ? new CodexCommissioning({pool:getPool(),preCheckRedis,catalog:modelCatalogCache,keyring:()=>modelAuthoritySigner!.publicKeyring(),
       signer:modelAuthoritySigner,loadUserModelAuthz,log:rootLogger.child({subsys:"codexCommissioning"}),
       containerSource:makeAdminCommissionContainerSource(v3Deps)}) : undefined;
+  const v4ExecutorDeps = runtimeChannel === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost"
+    && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache && v3Deps
+    ? { pool: getPool(), preCheckRedis, catalog: modelCatalogCache, keyring: () => modelAuthoritySigner!.publicKeyring(),
+        signer: modelAuthoritySigner, loadUserModelAuthz, log: rootLogger.child({ subsys: "remoteDriverV4" }),
+        containerSource: makeAdminCommissionContainerSource(v3Deps) }
+    : undefined;
+  const remoteDriverV4 = v4ExecutorDeps
+    ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps })
+    : undefined;
   const handler = createCommercialHandler({
     codexCommissioning,
+    remoteDriverV4,
     modelSwitchCost,
     jwtSecret,
     ...systemActions?.http,
@@ -6958,6 +6969,17 @@ export async function registerCommercial(
       domain: "v5-owned",
       start: () => {
         const h = trackScheduler("githubWorkspaceSweeper", "v5-owned", startGithubWorkspaceSweeper(getPool()));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  if (runtimeChannel === "v5" && process.env.OC_REMOTE_DRIVER_DRIFT_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "remoteDriverDrift",
+      domain: "v5-owned",
+      start: () => {
+        const h = trackScheduler("remoteDriverDrift", "v5-owned", startRemoteDriverDriftScheduler({ pool: getPool(), executorDeps: v4ExecutorDeps, log: rootLogger.child({ subsys: "remoteDriverDrift" }) }));
         return { stop: () => h.stop() };
       },
     });

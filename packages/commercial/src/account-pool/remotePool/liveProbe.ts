@@ -1,15 +1,14 @@
 /**
- * Read-only live probe helper for `remote-driver-v4` profiles (`OCV5-749`, R11).
+ * Live probe helper for `remote-driver-v4` profiles (`OCV5-749`, R11 & R12).
  *
- * Strictly `dryRun = true` in R11: resolves node SSH keys via `resolveRemoteDriverV4ExecKeyPath`,
- * runs the probe-only `RemotePoolProbeHost` (`probe` controller role only), computes `policySha256`
- * locally via `DriverWorkerClient.launchSpec`, and performs ZERO database mutations.
+ * `probeRemoteDriverProfileLive` remains strictly `dryRun = true` in CLI (`R11`), while
+ * `executeLiveRemoteDriverProbe` exposes the full probe output + `nonBlobDriverContext`
+ * for `commissioningService.ts` and `driftScheduler.ts` (`R12`).
  */
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { loadBoxBridgeMod } from '@openclaude/gateway'
 import type { RemoteCcTarget } from '@openclaude/gateway/cc5-container-runtime'
 import {
   DriverWorkerClient,
@@ -21,6 +20,10 @@ import type { RemoteProbeSnapshot } from '@openclaude/protocol'
 import type { Pool } from 'pg'
 import { remoteNodeExecKeyDir } from '../remoteBrainPool.js'
 import { computeProbeFingerprintTs } from './driftCoordinator.js'
+import {
+  buildBridgeFilesForDriver,
+  buildDefaultDriverContextForNode,
+} from './modelResolution.js'
 import { resolveRemoteDriverV4ExecKeyPath } from './placement.js'
 import { loadRemoteDriverRegistry } from './registry.js'
 
@@ -60,30 +63,26 @@ export interface ProbeRemoteDriverProfileLiveResult {
   readonly matchedVerifiedFingerprint: boolean
 }
 
-function buildBridgeFilesForDriver(driverId: string): Record<string, string> | undefined {
-  if (driverId !== 'cc') return undefined
-  const mod = loadBoxBridgeMod()
-  const bridgeFiles: Record<string, string> = {
-    'host.py': Buffer.from(mod.hostPy, 'utf8').toString('base64'),
-  }
-  for (const [rel, b64] of Object.entries(mod.files)) {
-    bridgeFiles[`mod/oc-bridge/${rel}`] = b64
-  }
-  return bridgeFiles
+export interface ExecuteLiveRemoteDriverProbeResult {
+  readonly profileRow: Record<string, any>
+  readonly profileId: string
+  readonly nodeId: string
+  readonly driverId: string
+  readonly engineId: string
+  readonly probeFingerprint: string
+  readonly driverDigest: string
+  readonly coreDigest: string
+  readonly policySha256: string
+  readonly snapshot: RemoteProbeSnapshot
+  readonly matchedVerifiedFingerprint: boolean
+  readonly nonBlobDriverContext: Record<string, unknown>
 }
 
-/**
- * Executes a read-only probe for a DB profile without persisting any probe snapshot or cutover state.
- * In R11, `dryRun: false` is explicitly disabled fail-closed (`REMOTE_LIVE_PROBE_WRITE_DISABLED_IN_R11`).
- */
-export async function probeRemoteDriverProfileLive(
+export async function executeLiveRemoteDriverProbe(
   pool: Pool,
-  input: ProbeRemoteDriverProfileLiveInput,
+  input: Omit<ProbeRemoteDriverProfileLiveInput, 'dryRun'>,
   options: ProbeRemoteDriverProfileLiveOptions = {},
-): Promise<ProbeRemoteDriverProfileLiveResult> {
-  if (input.dryRun === false) {
-    throw new Error('REMOTE_LIVE_PROBE_WRITE_DISABLED_IN_R11')
-  }
+): Promise<ExecuteLiveRemoteDriverProbeResult> {
   need(UUID_RE.test(input.profileId), 'REMOTE_PROFILE_ID_INVALID')
 
   const res = await pool.query<Record<string, any>>(
@@ -153,27 +152,16 @@ export async function probeRemoteDriverProfileLive(
       ? (execManifest.driverContext as Record<string, unknown>)
       : {}
   const profileName = String(row.profile_name)
-  const boxBridgeSha256 = reg.driverId === 'cc' ? loadBoxBridgeMod().sha256 : undefined
-  const defaultDriverProbeCtx: Record<string, unknown> =
-    reg.driverId === 'cc'
-      ? {
-          cliPath: `${home}/.oc-remote-cc/claude-2.1.316`,
-          accountHome: home,
-          profileName,
-          bridgeSha256: boxBridgeSha256,
-        }
-      : reg.driverId === 'codex'
-        ? {
-            cliPath: '/usr/bin/codex',
-            nativePath:
-              '/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex',
-            codexHome: `${home}/.oc-remote-codex/profiles/${profileName}/codex-home`,
-          }
-        : {}
+  const defaultDriverProbeCtx = buildDefaultDriverContextForNode({
+    driverId: reg.driverId,
+    sshUser,
+    profileName,
+    controllerSha256: reg.controllerSha256,
+    includeBridgeFiles: false,
+  })
   const bridgeFiles = buildBridgeFilesForDriver(reg.driverId)
   const mergedWithoutBridgeFiles: Record<string, unknown> = {
     ...defaultDriverProbeCtx,
-    mcpClientPath: `/opt/openclaude/remote-driver/${reg.controllerSha256}/core/mcp_client.py`,
     ...manifestDriverCtx,
     ...(input.driverContext ?? {}),
   }
@@ -188,7 +176,20 @@ export async function probeRemoteDriverProfileLive(
   need(probed.coreDigest === reg.coreDigest, 'REMOTE_PROBE_CORE_DIGEST_MISMATCH')
   need(probed.snapshot.models.length > 0, 'REMOTE_PROBE_NO_MODELS_OBSERVED')
 
-  // Compute deterministic `policySha256` locally via worker `launchSpec` in a hermetic temp dir.
+  const defaultCtxAfterProbe = buildDefaultDriverContextForNode({
+    driverId: reg.driverId,
+    sshUser,
+    profileName,
+    controllerSha256: reg.controllerSha256,
+    cliVersion: probed.snapshot.cliVersion,
+    includeBridgeFiles: false,
+  })
+  const { bridgeFiles: _stripped2, ...nonBlobDriverContext } = {
+    ...defaultCtxAfterProbe,
+    ...manifestDriverCtx,
+    ...(input.driverContext ?? {}),
+  }
+
   const policyTempDir = mkdtempSync(join(tmpdir(), 'oc-r11-probe-policy-'))
   const worker = new DriverWorkerClient(
     input.registryPath ? { registryPath: input.registryPath } : {},
@@ -204,11 +205,11 @@ export async function probeRemoteDriverProfileLive(
 
     const sampleModel = probed.snapshot.models[0]!.upstreamModelId
     const policySampleCtx: Record<string, unknown> = {
-      ...probeContext,
+      ...nonBlobDriverContext,
       ...(bridgeFiles ? { bridgeFiles } : {}),
       cliPath:
-        typeof probeContext.cliPath === 'string'
-          ? probeContext.cliPath
+        typeof nonBlobDriverContext.cliPath === 'string'
+          ? nonBlobDriverContext.cliPath
           : reg.driverId === 'codex'
             ? '/usr/bin/codex'
             : '/usr/bin/claude',
@@ -236,7 +237,7 @@ export async function probeRemoteDriverProfileLive(
     need(probeFingerprint === probed.probeFingerprint, 'REMOTE_PROBE_FINGERPRINT_MISMATCH')
 
     return {
-      dryRun: true,
+      profileRow: row,
       profileId: String(row.id),
       nodeId: String(row.node_id),
       driverId: reg.driverId,
@@ -247,9 +248,38 @@ export async function probeRemoteDriverProfileLive(
       policySha256,
       snapshot: probed.snapshot,
       matchedVerifiedFingerprint: row.verified_fingerprint === probeFingerprint,
+      nonBlobDriverContext,
     }
   } finally {
     await worker.close().catch(() => {})
     rmSync(policyTempDir, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Executes a read-only probe for a DB profile without persisting any probe snapshot or cutover state.
+ * In R11, `dryRun: false` is explicitly disabled fail-closed (`REMOTE_LIVE_PROBE_WRITE_DISABLED_IN_R11`).
+ */
+export async function probeRemoteDriverProfileLive(
+  pool: Pool,
+  input: ProbeRemoteDriverProfileLiveInput,
+  options: ProbeRemoteDriverProfileLiveOptions = {},
+): Promise<ProbeRemoteDriverProfileLiveResult> {
+  if (input.dryRun === false) {
+    throw new Error('REMOTE_LIVE_PROBE_WRITE_DISABLED_IN_R11')
+  }
+  const result = await executeLiveRemoteDriverProbe(pool, input, options)
+  return {
+    dryRun: true,
+    profileId: result.profileId,
+    nodeId: result.nodeId,
+    driverId: result.driverId,
+    engineId: result.engineId,
+    probeFingerprint: result.probeFingerprint,
+    driverDigest: result.driverDigest,
+    coreDigest: result.coreDigest,
+    policySha256: result.policySha256,
+    snapshot: result.snapshot,
+    matchedVerifiedFingerprint: result.matchedVerifiedFingerprint,
   }
 }

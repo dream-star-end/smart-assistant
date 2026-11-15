@@ -129,6 +129,7 @@ export const ADMIN_AUDIT_ACTIONS = {
   "remote_pool.offers.publish": { kind: "write", mode: "best-effort" },
   "remote_pool.profile.patch": { kind: "write", mode: "best-effort" },
   "remote_pool.codex_commissioning": { kind: "write", mode: "best-effort" },
+  "remote_pool.driver_v4_commissioning": { kind: "write", mode: "best-effort" },
   "remote_pool.binding.revoke": { kind: "write", mode: "best-effort" },
 
   // ── 容器/compute host 运维──────────────────────────────────────────
