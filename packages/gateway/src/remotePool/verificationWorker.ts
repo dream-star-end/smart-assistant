@@ -81,6 +81,10 @@ export async function runVerificationWorkerMain(): Promise<void> {
       remotePoolNeed(initializedRunId === null, 'VERIFICATION_WORKER_ALREADY_INITIALIZED')
       const runId = String(msg.runId ?? '')
       remotePoolNeed(UUID_RE.test(runId), 'VERIFICATION_RUN_ID_INVALID')
+      remotePoolNeed(
+        !process.argv[2] || process.argv[2] === runId,
+        'VERIFICATION_RUN_ID_ARG_MISMATCH',
+      )
       remotePoolNeed(Array.isArray(msg.keyring), 'VERIFICATION_KEYRING_INVALID')
       keyring = new Map<string, Uint8Array>(
         (msg.keyring as Array<[string, string]>).map(([id, b64]) => [

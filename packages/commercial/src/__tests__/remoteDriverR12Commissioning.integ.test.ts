@@ -4,6 +4,7 @@
  * `sandboxRedProof`, full 8-item `RemoteDriverV4CommissioningService` cutover + rollback, and `driftScheduler`).
  */
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import {
@@ -51,6 +52,7 @@ import {
   verifySandboxRedProofForDriver,
 } from '../account-pool/remotePool/index.js'
 import { computeProductionConformanceSuiteDigest } from '../account-pool/remotePool/profileCutover.js'
+import { buildProveRunLocalStoppedPy } from '../account-pool/remotePool/verificationRuntimeProof.js'
 import { ModelCatalogSnapshot } from '../billing/modelCatalog.js'
 import { InMemoryPreCheckRedis } from '../billing/preCheck.js'
 import { closePool, setPoolOverride } from '../db/index.js'
@@ -987,4 +989,11 @@ test('Group 6: startRemoteDriverDriftScheduler runOnce & stop operate single-fli
   })
   await sched.runOnce()
   await sched.stop()
+
+  const pyOut = execFileSync(
+    '/usr/bin/python3',
+    ['-I', '-B', '-c', buildProveRunLocalStoppedPy(), randomUUID()],
+    { encoding: 'utf8' },
+  )
+  assert.deepEqual(JSON.parse(pyOut), { ok: true, checked: 0 })
 })

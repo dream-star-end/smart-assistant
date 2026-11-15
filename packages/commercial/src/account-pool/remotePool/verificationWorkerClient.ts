@@ -25,6 +25,7 @@ export async function createDockerWorkerController(input: {
       '/usr/local/bin/node',
       '--conditions=openclaude-precompiled',
       `/opt/openclaude/${V4_VERIFICATION_WORKER_DIST}`,
+      input.runId,
     ],
     { stdio: ['pipe', 'pipe', 'pipe'] },
   )

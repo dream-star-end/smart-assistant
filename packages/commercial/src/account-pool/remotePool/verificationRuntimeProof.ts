@@ -262,12 +262,8 @@ export async function sshCheckRemoteTaskFileExists(
   return out === '1'
 }
 
-export async function proveVerificationRunLocalStopped(
-  dockerId: string,
-  runId: string,
-): Promise<void> {
-  need(UUID_RE.test(runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
-  const py = [
+export function buildProveRunLocalStoppedPy(): string {
+  return [
     'import json, os, pathlib, stat, sys',
     'rid = sys.argv[1]',
     'target = "/home/agent/.openclaude/commissioning/" + rid',
@@ -294,13 +290,23 @@ export async function proveVerificationRunLocalStopped(
     '        except FileNotFoundError:',
     '            pass',
     '        try:',
-    '            assert target not in (pdir / "cmdline").read_bytes().decode("utf-8", "replace")',
+    '            cmdline = (pdir / "cmdline").read_bytes().replace(b"\\x00", b" ").decode("utf-8", "replace")',
+    '            assert target not in cmdline',
+    '            assert not ("verificationWorker.js" in cmdline and rid in cmdline)',
     '        except FileNotFoundError:',
     '            pass',
     '    except (FileNotFoundError, ProcessLookupError, PermissionError):',
     '        continue',
     'print(json.dumps({"ok": True, "checked": checked}))',
-  ].join('\\n')
+  ].join(String.fromCharCode(10))
+}
+
+export async function proveVerificationRunLocalStopped(
+  dockerId: string,
+  runId: string,
+): Promise<void> {
+  need(UUID_RE.test(runId), 'REMOTE_VERIFICATION_RUN_ID_INVALID')
+  const py = buildProveRunLocalStoppedPy()
   const raw = await runDocker([
     'exec',
     '--user',
