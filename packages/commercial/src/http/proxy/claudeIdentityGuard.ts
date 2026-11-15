@@ -49,7 +49,6 @@ type GuardRuntime = {
   probeExit: (dispatcher: unknown) => Promise<IpObservation>;
   pinnedIp: string | null;
   pinnedCountry: string | null;
-  processTz: string | null;
   enabled: boolean;
 };
 
@@ -73,10 +72,6 @@ function runtime(): GuardRuntime {
     probeExit: testRuntime?.probeExit ?? defaultProbeExit,
     pinnedIp: testRuntime?.pinnedIp ?? envOn("OC_CLAUDE_EGRESS_PINNED_IP"),
     pinnedCountry: testRuntime?.pinnedCountry ?? envOn("OC_CLAUDE_EGRESS_PINNED_COUNTRY"),
-    processTz:
-      testRuntime?.processTz ??
-      envOn("OC_CLAUDE_CODE_TZ") ??
-      envOn("OPENCLAUDE_CCB_TZ"),
     enabled: testRuntime?.enabled ?? enabled,
   };
 }
@@ -205,12 +200,6 @@ function assertTzAndIp(
   const tz = input.personaTimezone;
   if (!tz) {
     throw new ClaudeIdentityGuardError("tz_mismatch", "persona.timezone missing");
-  }
-  if (rt.processTz && rt.processTz !== tz) {
-    throw new ClaudeIdentityGuardError(
-      "tz_mismatch",
-      `process TZ ${rt.processTz} != persona ${tz}`,
-    );
   }
   if (obs.timezone && obs.timezone !== tz) {
     throw new ClaudeIdentityGuardError(

@@ -32,22 +32,23 @@ describe('buildCcbSpawnProcessEnv', () => {
     assert.equal(got.no_proxy, got.NO_PROXY)
     assert.equal(got.HTTP_PROXY, undefined)
     assert.equal(got.ALL_PROXY, undefined)
-    assert.equal(got.TZ, 'Asia/Tokyo')
+    assert.equal(got.TZ, undefined)
+    assert.equal('OPENCLAUDE_CCB_TZ' in got, false)
   })
 
-  // OCV5-166:用户面时区 OC_USER_TZ 与出口对齐的 OPENCLAUDE_CCB_TZ 正交 —— 子进程 TZ 只认后者。
-  // 新增用例(不改上面的 Tokyo 锁),防以后有人把 `*TZ` 一锅端进 env.TZ。
-  it('keeps the egress TZ even when the user-facing OC_USER_TZ is present', () => {
+  // OCV5-754: 不再注入 Asia/Tokyo 到子进程 TZ;OC_USER_TZ 原样透传、OPENCLAUDE_CCB_TZ 被剥离。
+  it('strips OPENCLAUDE_CCB_TZ without mutating TZ and preserves OC_USER_TZ', () => {
     const got = buildCcbSpawnProcessEnv({
       ANTHROPIC_BASE_URL: 'http://172.31.0.1:18892',
       OPENCLAUDE_CCB_TZ: 'Asia/Tokyo',
       OC_USER_TZ: 'America/New_York',
     })
-    assert.equal(got.TZ, 'Asia/Tokyo')
-    assert.equal(got.OC_USER_TZ, 'America/New_York') // 原样透传,不翻译成 TZ
+    assert.equal(got.TZ, undefined)
+    assert.equal('OPENCLAUDE_CCB_TZ' in got, false)
+    assert.equal(got.OC_USER_TZ, 'America/New_York')
   })
 
-  it('fails closed if proxy credentials, internal bypass, or timezone are invalid', () => {
+  it('fails closed if proxy credentials or internal bypass are invalid', () => {
     const base = {
       ANTHROPIC_BASE_URL: 'http://172.31.0.1:18892',
       OPENCLAUDE_CCB_NO_PROXY: 'localhost,127.0.0.1',
@@ -67,10 +68,6 @@ describe('buildCcbSpawnProcessEnv', () => {
           OPENCLAUDE_CCB_HTTPS_PROXY: 'http://172.31.0.1:18991',
         }),
       /must include the ANTHROPIC_BASE_URL host/,
-    )
-    assert.throws(
-      () => buildCcbSpawnProcessEnv({ OPENCLAUDE_CCB_TZ: 'not/a-zone' }),
-      /IANA timezone/,
     )
   })
 })

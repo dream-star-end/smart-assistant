@@ -193,7 +193,6 @@ export interface V5LocalCcbTransportEnvInput {
   useRemote: boolean;
   hostGatewayIp: string;
   proxyUrl?: string;
-  timezone?: string;
   noProxy?: string;
 }
 
@@ -211,7 +210,6 @@ export function resolveV5LocalCcbTransportEnv(
   if (input.runtimeChannel !== "v5" || input.useRemote) return [];
 
   const proxy = input.proxyUrl?.trim();
-  const timezone = input.timezone?.trim();
   const result: string[] = [];
 
   if (proxy) {
@@ -254,22 +252,12 @@ export function resolveV5LocalCcbTransportEnv(
     );
   }
 
-  if (timezone) {
-    try {
-      new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
-    } catch {
-      throw new SupervisorError("InvalidArgument", "OC_CLAUDE_CODE_TZ must be a valid IANA timezone");
-    }
-    result.push(`OPENCLAUDE_CCB_TZ=${timezone}`);
-  }
-
   return result;
 }
 
 /**
- * 用户面时区透传(OCV5-166)。合法 IANA 名 → `["OC_USER_TZ=<tz>"]`;缺省/空白/非法 → `[]`
- * (不抛:这是 UX 提示,不是安全边界;容器侧 envProbe 会回落 Asia/Shanghai)。
- * 与 resolveV5LocalCcbTransportEnv 的 OPENCLAUDE_CCB_TZ 刻意分开:那个绑出口,这个绑用户。
+ * 用户面时区透传(OCV5-166 / OCV5-754)。合法 IANA 名 → `["OC_USER_TZ=<tz>"]`;缺省/空白/非法 → `[]`
+ * (不抛:这是 UX 提示,不是安全边界;容器侧 envProbe 会回落 Asia/Shanghai)。所有引擎统一走 OC_USER_TZ。
  */
 export function resolveUserTimeZoneEnv(raw: string | undefined): string[] {
   const tz = raw?.trim() ?? "";
@@ -2862,11 +2850,10 @@ export async function provisionV3Container(
         useRemote,
         hostGatewayIp,
         proxyUrl: process.env.OC_CLAUDE_CODE_HTTPS_PROXY,
-        timezone: process.env.OC_CLAUDE_CODE_TZ,
         noProxy: process.env.NO_PROXY,
       }),
     );
-    // OCV5-166:用户面时区,与上面出口对齐的 OPENCLAUDE_CCB_TZ **正交**。容器 gateway 的
+    // OCV5-166 / OCV5-754:用户面时区（所有引擎统一走 OC_USER_TZ）。容器 gateway 的
     // envProbe 把它渲染进 ENV prompt slot(user_tz=…),让模型不再把子进程 `date` 当用户
     // 时间。只透传合法 IANA 名;缺省/非法不注入,容器侧自行回落 Asia/Shanghai。
     env.push(...resolveUserTimeZoneEnv(process.env.OC_USER_TZ));

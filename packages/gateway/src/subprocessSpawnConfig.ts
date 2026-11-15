@@ -359,15 +359,6 @@ export function buildCcbSpawnProcessEnv(
     env.no_proxy = noProxyRaw
   }
 
-  const timezone = source.OPENCLAUDE_CCB_TZ?.trim()
-  if (timezone) {
-    try {
-      new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
-    } catch {
-      throw new Error('OPENCLAUDE_CCB_TZ must be a valid IANA timezone')
-    }
-    env.TZ = timezone
-  }
   return env
 }
 
@@ -758,7 +749,8 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
     )
     return { env: providerEnv, routing: 'host-static', providerId: hostStatic.providerId }
   }
-  if (input.effectiveProvider === 'claude-subscription') {
+  const selfhostLocalCcDisabled = (input.env ?? process.env).OC_SELFHOST_ENGINE_LOCAL_TURNS === '1'
+  if (input.effectiveProvider === 'claude-subscription' && !selfhostLocalCcDisabled) {
     // Claude subscription: 让 host 掌握 provider 路由(CCB 从 settings.json strip provider vars)。
     providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
     if (input.claudeOAuthAccessToken) {

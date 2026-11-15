@@ -1529,14 +1529,30 @@ export function makeAnthropicProxyHandler(
           listEnabledAccountGroupsForModel: deps.listEnabledAccountGroupsForModel,
         };
       stageTiming("upstream_prepare_started");
-      const pickRes = await pickUpstream(
-        pickDeps,
-        body,
-        route,
-        userLog,
-        uid,
-        forceRepin,
-      );
+      let pickRes: Awaited<ReturnType<typeof pickUpstream>>;
+      try {
+        pickRes = await pickUpstream(
+          pickDeps,
+          body,
+          route,
+          userLog,
+          uid,
+          forceRepin,
+        );
+      } catch (err) {
+        if (err instanceof HttpError) {
+          await settlement.abort();
+          userLog.warn("proxy_upstream_rejected", {
+            code: err.code,
+            status: err.status,
+            msg: err.message,
+          });
+          incrAnthropicProxyReject("unauthorized_model");
+          sendJsonError(res, err.status, err.code, err.message, requestId);
+          return;
+        }
+        throw err;
+      }
       stageTiming("upstream_prepare_complete");
       if (!pickRes.ok) {
         // 释放失败仅告警不阻断(TTL 300s 自愈兜底);但 Redis 故障时预留泄漏必须可观测。

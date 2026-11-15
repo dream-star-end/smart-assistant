@@ -54,7 +54,12 @@ describe('v5 selfhost CCB HTTPS proxy deployment contract', () => {
     // OCV5-535: the env writers live in scripts/lib/v5-selfhost-env.sh, sourced by the deploy script.
     const deploy = read('scripts/deploy-v5-selfhost.sh') + read('scripts/lib/v5-selfhost-env.sh')
     assert.match(deploy, /OC_CLAUDE_CODE_HTTPS_PROXY "http:\/\/172\.31\.0\.1:18991"/)
-    assert.match(deploy, /OC_CLAUDE_CODE_TZ "Asia\/Tokyo"/)
+    assert.match(deploy, /OC_USER_TZ "Asia\/Taipei"/)
+    assert.match(deploy, /delete_env_kv "\$V5_ENV" OC_CLAUDE_CODE_TZ/)
+    assert.match(deploy, /delete_env_kv "\$V5_ENV" OC_CLAUDE_EGRESS_IDENTITY_GUARD/)
+    assert.match(deploy, /delete_env_kv "\$V5_ENV" OC_CLAUDE_EGRESS_PINNED_COUNTRY/)
+    assert.match(deploy, /delete_env_kv "\$V5_ENV" OC_CLAUDE_EGRESS_PINNED_IP/)
+    assert.match(deploy, /UPDATE client_sessions cs[\s\S]*UPDATE model_pricing mp[\s\S]*visibility = 'hidden'/)
     assert.match(deploy, /install_unit "\$UNIT_DIR\/\$V5_CCB_PROXY_UNIT"/)
     assert.match(deploy, /install_unit "\$UNIT_DIR\/\$V5_CURSOR_PROXY_UNIT"/)
     // OCV5-306: restarting hostnet bounces both proxies (Requires=) mid-turn.
@@ -71,7 +76,7 @@ describe('v5 selfhost CCB HTTPS proxy deployment contract', () => {
       deploy,
       /iptables -C V5_EGRESS_IN[\s\S]*--dport 18992[\s\S]*--comment "v5 Cursor -> dedicated HTTPS proxy" -j RETURN/,
     )
-    assert.match(deploy, /install_aux_units\n  refresh_ccb_proxy_path\n  ensure_model_authority/)
+    assert.match(deploy, /install_aux_units\n\s+refresh_ccb_proxy_path\n\s+ensure_model_authority/)
   })
 
   it('syncs flavor helper next to breakglass hostnet when the source has it', () => {

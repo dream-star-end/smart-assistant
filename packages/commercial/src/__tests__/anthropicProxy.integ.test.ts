@@ -2829,7 +2829,7 @@ describe("invariant 4 — DeepSeek (pick=null) noop set + 反向 claude 锚定",
     try {
       // Keep identity enforcement enabled, but never probe the public internet.
       setClaudeIdentityGuardRuntimeForTest({ enabled: true, pinnedIp: "127.0.0.1",
-        pinnedCountry: "", processTz: FIXED_PERSONA.timezone,
+        pinnedCountry: "",
         probeExit: async () => ({ ip: "127.0.0.1", country: null, timezone: FIXED_PERSONA.timezone }) });
       endpoint = await listen(upstream);
       h.deps.upstreamEndpoint = endpoint;

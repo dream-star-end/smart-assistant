@@ -12,6 +12,9 @@ import { test } from "node:test";
 import type { FlavorIdentity } from "../flavor/assertFlavor.js";
 import { configureModelAvailability, isModelAvailable, modelAvailableForIdentity } from "../billing/modelAvailability.js";
 import { ModelCatalogSnapshot, type ModelCatalogEntry, type ModelCatalogPricing } from "../billing/modelCatalog.js";
+import { pickUpstream } from "../http/proxy/upstream.js";
+import { HttpError } from "../http/util.js";
+import { rootLogger } from "../logging/logger.js";
 import { PricingCache, type ModelPricing } from "../billing/pricing.js";
 import { canUseModel } from "../billing/authzModels.js";
 
@@ -172,4 +175,125 @@ test("OCV5-713: a valid pre-existing relay route cannot read credentials or call
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test("OCV5-754: selfhost retires local CC models while keeping box/remote/go/cc5 and commercial", () => {
+  const retiredLocal = ["claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-haiku-4-5"];
+  const keptClaude = [
+    "box-claude-opus-5-5",
+    "box-claude-sonnet-5",
+    "box-claude-haiku-4-5",
+    "claude-opus-4-7-remote",
+    "claude-sonnet-4-6-go",
+    "antigravity-claude-sonnet-4-6",
+    "cc5-remote-opus",
+  ];
+  for (const id of retiredLocal) {
+    assert.equal(modelAvailableForIdentity(identity("selfhost"), true, id), false, id);
+    assert.equal(modelAvailableForIdentity(identity("selfhost"), false, id), false, id);
+    assert.equal(modelAvailableForIdentity(identity("commercial"), false, id), true, id);
+  }
+  for (const id of keptClaude) {
+    assert.equal(modelAvailableForIdentity(identity("selfhost"), false, id), true, id);
+  }
+
+  configure(true);
+  const ccEntries: ModelCatalogEntry[] = [
+    {
+      entryId: 101,
+      modelId: "claude-opus-4-6",
+      engine: "ccb",
+      providerId: "anthropic",
+      upstreamModelId: null,
+      contextWindow: 200_000,
+      state: "active",
+      lockVersion: 0,
+      capabilitySchemaVersion: 1,
+      capabilityProfile: { supportsVision: true, reasoning: { supported: [], codexModelDefault: null }, ccb: { capabilityZero: false, supportsThinking: true } },
+    },
+    {
+      entryId: 102,
+      modelId: "box-claude-opus-5-5",
+      engine: "cursor",
+      providerId: "box_cli",
+      upstreamModelId: "claude-opus-5-5",
+      contextWindow: 200_000,
+      state: "active",
+      lockVersion: 0,
+      capabilitySchemaVersion: 1,
+      capabilityProfile: { supportsVision: true, reasoning: { supported: [], codexModelDefault: null }, ccb: { capabilityZero: false, supportsThinking: true } },
+    },
+    {
+      entryId: 103,
+      modelId: "claude-opus-4-7-remote",
+      engine: "ccb",
+      providerId: "anthropic",
+      placement: "remote_pool",
+      upstreamModelId: "claude-opus-4-7",
+      contextWindow: 200_000,
+      state: "active",
+      lockVersion: 0,
+      capabilitySchemaVersion: 1,
+      capabilityProfile: { supportsVision: true, reasoning: { supported: [], codexModelDefault: null }, ccb: { capabilityZero: false, supportsThinking: true } },
+    },
+    {
+      entryId: 104,
+      modelId: "claude-sonnet-4-6-go",
+      engine: "ccb",
+      providerId: "opencodego",
+      upstreamModelId: "claude-sonnet-4-6",
+      contextWindow: 200_000,
+      state: "active",
+      lockVersion: 0,
+      capabilitySchemaVersion: 1,
+      capabilityProfile: { supportsVision: false, reasoning: { supported: [], codexModelDefault: null }, ccb: { capabilityZero: false, supportsThinking: true } },
+    },
+  ];
+  const ccPrices: ModelCatalogPricing[] = ccEntries.map((e) => ({
+    modelId: e.modelId,
+    displayName: e.modelId,
+    inputPerMtok: 100n,
+    outputPerMtok: 100n,
+    cacheReadPerMtok: 10n,
+    cacheWritePerMtok: 0n,
+    multiplier: "1.000",
+    visibility: "public",
+    sortOrder: 1,
+    defaultEffort: null,
+  }));
+  const ccSnap = new ModelCatalogSnapshot({
+    entries: ccEntries,
+    aliases: new Map(),
+    pricing: new Map(ccPrices.map((p) => [p.modelId, p])),
+    securityEpoch: 2n,
+  });
+  assert.equal(ccSnap.resolve("claude-opus-4-6"), null);
+  assert.equal(ccSnap.canUseModel(scope, "claude-opus-4-6"), false);
+  assert.ok(ccSnap.resolve("box-claude-opus-5-5"));
+  assert.ok(ccSnap.resolve("claude-opus-4-7-remote"));
+  assert.ok(ccSnap.resolve("claude-sonnet-4-6-go"));
+});
+
+test("OCV5-754: pickUpstream fails closed on selfhost OAuth route before scheduler.pick", async () => {
+  configure(false);
+  let schedulerCalled = false;
+  await assert.rejects(
+    () =>
+      pickUpstream(
+        {
+          scheduler: {
+            async pick() {
+              schedulerCalled = true;
+              throw new Error("must not pick OAuth account on selfhost");
+            },
+            async release() {},
+          },
+        },
+        { model: "claude-opus-4-6", messages: [{ role: "user", content: "hi" }] } as never,
+        { kind: "oauth" },
+        rootLogger,
+      ),
+    (err: unknown) => err instanceof HttpError && err.status === 503 && err.code === "MODEL_NOT_AVAILABLE",
+  );
+  assert.equal(schedulerCalled, false);
 });

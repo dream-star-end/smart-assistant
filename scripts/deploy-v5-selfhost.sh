@@ -954,6 +954,43 @@ ensure_model_authority() {
   ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY 1
   ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY_PROVISION_REQUIRED 1
   log "  ✓ OC_MODEL_AUTHORITY=1 / PROVISION_REQUIRED=1 / MODEL_CATALOG_ADMIN_DATABASE_URL"
+
+  # OCV5-754: 下线个人版 local Claude Code 模型（claude-*-remote / box-claude-* / cc5-remote-* / claude-*-go 保留）。
+  # 先将仍绑定到已退休 local claude-* 的未删除会话迁到 active 的 box-claude 替代，再在 model_pricing 隐藏。
+  local migrated_counts
+  migrated_counts="$(
+    psql_as_postgres -d "$PG_DB" -tAc "
+      WITH retired(old_id, box_id) AS (
+        VALUES
+          ('claude-opus-4-6', 'box-claude-opus-5-5'),
+          ('claude-opus-4-5', 'box-claude-opus-5-5'),
+          ('claude-sonnet-4-6', 'box-claude-sonnet-5'),
+          ('claude-sonnet-4-5', 'box-claude-sonnet-5'),
+          ('claude-haiku-4-5', 'box-claude-haiku-4-5')
+      ),
+      updated_sessions AS (
+        UPDATE client_sessions cs
+        SET model_id = r.box_id
+        FROM retired r
+        JOIN model_catalog mc
+          ON mc.model_id = r.box_id
+         AND mc.state = 'active'
+        WHERE cs.deleted_at IS NULL
+          AND cs.model_id = r.old_id
+        RETURNING 1
+      ),
+      hidden_pricing AS (
+        UPDATE model_pricing mp
+        SET enabled = FALSE, visibility = 'hidden'
+        FROM retired r
+        WHERE mp.model_id = r.old_id
+          AND (mp.enabled IS TRUE OR mp.visibility <> 'hidden')
+        RETURNING 1
+      )
+      SELECT (SELECT count(*) FROM updated_sessions)::text || ':' || (SELECT count(*) FROM hidden_pricing)::text;
+    " | tr -d '[:space:]'
+  )" || die "下线 local Claude Code 模型失败。补救: 检查 client_sessions / model_pricing / model_catalog 状态。"
+  log "  ✓ local CC 下线收敛(sessions=${migrated_counts%%:*}, pricing_hidden=${migrated_counts##*:})"
 }
 
 # ── env / HOME ───────────────────────────────────────────────────────────
