@@ -136,8 +136,10 @@ export class RemoteDriverV4CommissioningService {
     const profRes = await pool.query<Record<string, any>>(
       `SELECT p.id, p.node_id, p.profile_name, p.engine, p.driver_id, p.engine_id,
               p.status, p.disabled_by, p.execution_ready, p.ready_generation::text AS ready_generation,
-              p.verified_fingerprint, p.target_fingerprint, p.auth_epoch, p.max_concurrent_lanes,
-              p.probed_at, p.verified_at
+              p.verified_fingerprint,
+              COALESCE(p.probe_snapshot->>'probeFingerprint', p.execution_manifest->>'latestFingerprint') AS target_fingerprint,
+              p.auth_epoch, p.max_concurrent_lanes,
+              p.last_probe_ok_at, p.updated_at
          FROM remote_agent_profiles p
         WHERE p.id = $1`,
       [profileId],

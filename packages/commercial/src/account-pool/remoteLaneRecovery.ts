@@ -1,5 +1,6 @@
 /** Privileged, proof-only lane recovery. No provision/launch/input port is reachable here. */
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { promisify } from 'node:util'
 import type { Pool } from 'pg'
 import { fileURLToPath } from 'node:url'
@@ -10,6 +11,14 @@ import { RemotePoolSshHost, type RemotePoolLaneSpec } from '@openclaude/gateway/
 import { REMOTE_DRIVER_BACKEND, remoteCanonicalSha256 } from '@openclaude/protocol'
 const exec = promisify(execFile)
 const need = (ok: unknown): void => { if (!ok) throw new Error('REMOTE_LANE_RECOVERY_UNPROVEN') }
+const LEGACY_CC_CONTROLLER_SUFFIX = '/scripts/agent-remote/cc5-host-controller.py'
+export function resolveLegacyCcControllerPath(
+  frozenPath: string,
+  fallbackPath = fileURLToPath(new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url)),
+): string {
+  if (existsSync(frozenPath)) return frozenPath
+  return frozenPath.endsWith(LEGACY_CC_CONTROLLER_SUFFIX) ? fallbackPath : frozenPath
+}
 interface RecoverySpec {
   version: 1; operationId: string; runId: string; generation: string; taskRoot: string
   target: RemoteCcTarget; controllerPath: string; codex?: CodexLaneSpec
@@ -122,7 +131,7 @@ export async function reconcileRemoteLane(pool: Pool, operationId: string, gener
   } else {
     need(row.engine === 'cc' && !spec.codex)
     await new Cc5SshHost({ target:spec.target,taskRoot:spec.taskRoot,operationId,runId:spec.runId,
-      controllerPath:spec.controllerPath,toolSocketPath:'/run/oc-remote-recovery-unused.sock' }).stop()
+      controllerPath:resolveLegacyCcControllerPath(spec.controllerPath),toolSocketPath:'/run/oc-remote-recovery-unused.sock' }).stop()
   }
   const updated = await pool.query(`UPDATE remote_agent_bindings SET state='released',no_host_effect_proven=$5,updated_at=NOW()
     WHERE operation_id=$1 AND generation=$2 AND docker_id=$3 AND recovery_spec=$4::jsonb AND state<>'released'`,

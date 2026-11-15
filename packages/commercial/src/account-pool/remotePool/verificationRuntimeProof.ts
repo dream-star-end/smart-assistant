@@ -6,10 +6,9 @@
  */
 import { execFile } from 'node:child_process'
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import type { RemoteCcTarget } from '@openclaude/gateway/cc5-container-runtime'
 import { evidenceHash } from '../codexCommissioningEvidence.js'
 
 const exec = promisify(execFile)
@@ -206,60 +205,6 @@ export async function proveVerificationContainer(
     checkedSupervisors: parsed.pids ?? [],
     checkedSentinels: parsed.checkedFiles ?? [],
   }
-}
-
-export async function sshCheckRemoteTaskFileExists(
-  target: RemoteCcTarget,
-  taskRoot: string,
-  relPath: string,
-): Promise<boolean> {
-  need(taskRoot.length > 0 && isAbsolute(taskRoot), 'REMOTE_VERIFICATION_TASK_ROOT_INVALID')
-  need(relPath.length > 0 && !isAbsolute(relPath), 'REMOTE_VERIFICATION_RELPATH_INVALID')
-  const quote = (val: string) => `'${val.replaceAll("'", "'\\''")}'`
-  const py =
-    'import pathlib,sys; r=pathlib.Path(sys.argv[1]).resolve(); p=(r/sys.argv[2]).resolve(); ' +
-    'assert str(p).startswith(str(r)+"/"); print("1" if p.exists() else "0")'
-  const remoteCmd = ['/usr/bin/python3', '-I', '-B', '-c', py, taskRoot, relPath]
-    .map(quote)
-    .join(' ')
-  const sshArgs = [
-    '-F',
-    'none',
-    '-T',
-    '-o',
-    'BatchMode=yes',
-    '-o',
-    'StrictHostKeyChecking=yes',
-    '-o',
-    `UserKnownHostsFile=${target.knownHostsPath}`,
-    '-o',
-    'GlobalKnownHostsFile=/dev/null',
-    '-o',
-    'ControlMaster=no',
-    '-o',
-    'ControlPath=none',
-    '-o',
-    'IdentitiesOnly=yes',
-    '-o',
-    'IdentityAgent=none',
-    '-o',
-    'ForwardAgent=no',
-    '-o',
-    'ClearAllForwardings=yes',
-    '-o',
-    'ConnectTimeout=10',
-    '-i',
-    target.keyPath,
-    '-p',
-    String(target.port),
-    `${target.user}@${target.host}`,
-    remoteCmd,
-  ]
-  const out = (
-    await exec('/usr/bin/ssh', sshArgs, { timeout: 15_000, maxBuffer: 64 * 1024 })
-  ).stdout.trim()
-  need(out === '1' || out === '0', 'REMOTE_VERIFICATION_SSH_CHECK_INVALID')
-  return out === '1'
 }
 
 export function buildProveRunLocalStoppedPy(): string {

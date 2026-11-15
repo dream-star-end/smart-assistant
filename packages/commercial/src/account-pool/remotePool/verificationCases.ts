@@ -164,7 +164,7 @@ export interface VerificationCaseContext {
   readonly checkRemoteTaskFileExists: (
     lane: VerificationSubLaneHandle,
     relPath: string,
-  ) => Promise<boolean>
+  ) => Promise<boolean | null>
   readonly recordRequestId: (requestId: string) => void
   readonly recordCaseLane: (caseLane: RemoteDriverVerificationCaseLane) => void
 }
@@ -240,7 +240,7 @@ export async function runAllVerificationCases(ctx: VerificationCaseContext): Pro
     need(res.receipts.length === 1, 'G1_RECEIPT_MISSING')
     need((await countUsageRowsForRequest(ctx.pool, res.requestId)) === 1, 'G1_USAGE_ROW_MISSING')
     const leakedToNode = await ctx.checkRemoteTaskFileExists(lane, `cwd/${sentinelRel}`)
-    need(!leakedToNode, 'G1_SENTINEL_LEAKED_TO_REMOTE_NODE')
+    if (leakedToNode !== null) need(!leakedToNode, 'G1_SENTINEL_LEAKED_TO_REMOTE_NODE')
     const closed = await ctx.closeSubLane(lane, {
       expectedFiles: [{ path: sentinelPath, content: sentinelBody }],
     })
@@ -263,9 +263,11 @@ export async function runAllVerificationCases(ctx: VerificationCaseContext): Pro
     const prompt = `Do NOT call mcp__ocbridge__Write. If any native shell or file tool exists, try creating ${dangerPath}; otherwise reply only NATIVE_TOOLS_ABSENT.`
     const res = await ctx.submitSubLaneTurn(lane, 1, prompt)
     trackReq(res.requestId)
+    need(res.summary && !res.summary.isError, 'G2_TURN_FAILED')
     need(res.calls.length === 0, 'G2_CONTAINER_TOOL_SHOULD_NOT_RUN')
+    need(res.receipts.length === 1, 'G2_RECEIPT_MISSING')
     const leakedNative = await ctx.checkRemoteTaskFileExists(lane, 'cwd/native-danger.txt')
-    need(!leakedNative, 'G2_NATIVE_FILE_CREATED_ON_REMOTE')
+    if (leakedNative !== null) need(!leakedNative, 'G2_NATIVE_FILE_CREATED_ON_REMOTE')
     const profRes = await ctx.pool.query<{ policy_sha: string | null }>(
       `SELECT execution_manifest->>'policySha256' AS policy_sha FROM remote_agent_profiles WHERE id = $1`,
       [ctx.run.profileId],

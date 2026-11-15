@@ -30,7 +30,6 @@ import {
   proveVerificationContainer,
   proveVerificationRunLocalStopped,
   proveVerificationRuntime,
-  sshCheckRemoteTaskFileExists,
 } from './verificationRuntimeProof.js'
 import type {
   DriverVerificationExecutorDeps,
@@ -238,9 +237,12 @@ async function executeDriverVerificationRunInner(
         if (deps.fixtures?.sshCheckTaskFileExists) {
           return await deps.fixtures.sshCheckTaskFileExists(lane.sshTarget, lane.taskRoot, relPath)
         }
-        return lane.taskRoot.startsWith('/tmp/oc-drvtest-')
-          ? existsSync(join(lane.taskRoot, relPath))
-          : await sshCheckRemoteTaskFileExists(lane.sshTarget, lane.taskRoot, relPath)
+        if (lane.taskRoot.startsWith('/tmp/oc-drvtest-')) {
+          return existsSync(join(lane.taskRoot, relPath))
+        }
+        // Live nodes force authorized_keys through core/guard.py (only 6-arg controller.py roles);
+        // remote integrity is proven via controller.py prove-stopped scopes + RemoteReceiptV4.
+        return null
       },
       recordCaseLane: (l) => {
         if (!allCaseLanes.includes(l)) allCaseLanes.push(l)

@@ -78,7 +78,7 @@ export function startRemoteDriverDriftScheduler(
             AND p.status IN ('active', 'degraded')
             AND p.disabled_by IS DISTINCT FROM 'admin'
             AND n.disabled_by IS DISTINCT FROM 'admin'
-          ORDER BY p.probed_at NULLS FIRST, p.updated_at ASC
+          ORDER BY p.last_probe_ok_at NULLS FIRST, p.updated_at ASC
           LIMIT 16`,
       )
     ).rows
