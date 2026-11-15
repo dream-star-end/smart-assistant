@@ -206,7 +206,8 @@
     "0339_remote_driver_core_v4",
     "0341_selfhost_sync_compat",
     "0342_antigravity_gemini_4_hydrogen",
-    "0343_antigravity_orchestrator_carbon"
+    "0343_antigravity_orchestrator_carbon",
+    "0344_drop_delegate_antigravity_budget_trigger"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
