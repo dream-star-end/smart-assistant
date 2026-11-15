@@ -178,13 +178,26 @@ test("OCV5-713: a valid pre-existing relay route cannot read credentials or call
 });
 
 test("OCV5-754: selfhost retires local CC models while keeping box/remote/go/cc5 and commercial", () => {
-  const retiredLocal = ["claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-haiku-4-5"];
+  const retiredLocal = [
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-opus-4-7",
+    "claude-fable-5",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+  ];
   const keptClaude = [
     "box-claude-opus-5-5",
     "box-claude-sonnet-5",
+    "box-claude-haiku-5-5",
     "box-claude-haiku-4-5",
+    "claude-opus-5-5-remote",
     "claude-opus-4-7-remote",
     "claude-sonnet-4-6-go",
+    "claude-haiku-5-5-go",
     "antigravity-claude-sonnet-4-6",
     "cc5-remote-opus",
   ];
