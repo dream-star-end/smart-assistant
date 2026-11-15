@@ -166,12 +166,30 @@ export type ProblemCardReport = {
 
 // ═══════════════ frameSeq 去重（per-sessionKey 游标，§3）═══════════════
 
+let frameSeqAcceptOrder = 0;
+
+export function currentFrameSeqAcceptOrder(): number {
+  return frameSeqAcceptOrder;
+}
+
 function setFrameSeqCursor(sess: ChatSession, key: string, seq: number): void {
   if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== "object") {
     sess._lastFrameSeqByKey = {};
   }
   sess._lastFrameSeqByKey[key] = seq;
   sess._lastFrameSeq = Math.max(sess._lastFrameSeq || 0, seq);
+  if (seq > 0) {
+    if (!sess._lastAcceptedFrameSeqOrderByKey || typeof sess._lastAcceptedFrameSeqOrderByKey !== "object") {
+      sess._lastAcceptedFrameSeqOrderByKey = {};
+    }
+    sess._lastAcceptedFrameSeqOrderByKey[key] = ++frameSeqAcceptOrder;
+    sess._lastAcceptedFrameSeqAt = Date.now();
+  } else {
+    if (sess._lastAcceptedFrameSeqOrderByKey) delete sess._lastAcceptedFrameSeqOrderByKey[key];
+    if (!sess._lastAcceptedFrameSeqOrderByKey || Object.keys(sess._lastAcceptedFrameSeqOrderByKey).length === 0) {
+      sess._lastAcceptedFrameSeqAt = undefined;
+    }
+  }
 }
 
 /** 无 frameSeq>0 直接接受；<=游标 drop；否则严格前进推进游标（乱序不回退）。*/
@@ -229,13 +247,30 @@ export function resetFrameSeqCursor(sess: ChatSession, frame: { sessionKey?: str
  * 新容器 outboundRing 从零计数,不归零则与上面同一类帧黑洞。删除键即可:getFrameSeqCursor
  * 对 agent-scoped 缺省键恒返回 0(严禁回退 legacy 单游标,pure.ts)。
  */
-export function resetAgentFrameSeqCursorsForSession(sess: ChatSession): void {
+export function resetAgentFrameSeqCursorsForSession(
+  sess: ChatSession,
+  opts?: { keepAcceptedAfterOrder?: number; excludeKey?: string; onResetKey?: (key: string) => void },
+): void {
   const byKey = sess._lastFrameSeqByKey;
-  if (!byKey || typeof byKey !== "object") return;
-  const safeId = String(sess.id).replace(/[^a-zA-Z0-9_-]/g, "_");
-  const suffix = `:webchat:dm:${safeId}`;
-  for (const key of Object.keys(byKey)) {
-    if (key.startsWith("agent:") && key.endsWith(suffix)) delete byKey[key];
+  if (byKey && typeof byKey === "object") {
+    const safeId = String(sess.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const suffix = `:webchat:dm:${safeId}`;
+    for (const key of Object.keys(byKey)) {
+      if (!key.startsWith("agent:") || !key.endsWith(suffix)) continue;
+      if (key === opts?.excludeKey) continue;
+      if (
+        typeof opts?.keepAcceptedAfterOrder === "number" &&
+        (sess._lastAcceptedFrameSeqOrderByKey?.[key] ?? 0) > opts.keepAcceptedAfterOrder
+      ) {
+        continue;
+      }
+      opts?.onResetKey?.(key);
+      delete byKey[key];
+      if (sess._lastAcceptedFrameSeqOrderByKey) delete sess._lastAcceptedFrameSeqOrderByKey[key];
+    }
+  }
+  if (!sess._lastAcceptedFrameSeqOrderByKey || Object.keys(sess._lastAcceptedFrameSeqOrderByKey).length === 0) {
+    sess._lastAcceptedFrameSeqAt = undefined;
   }
 }
 

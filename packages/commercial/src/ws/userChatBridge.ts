@@ -5611,7 +5611,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
             // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
             if (deps.pgPool) {
-              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog, connId);
+              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog, connId, containerId);
             }
             if (liveCatchupSessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;
@@ -9478,10 +9478,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // sys.* 命名;前端 default case 忽略未知 type,加 case 是 additive。
       if (userWs.readyState === WebSocket.OPEN) {
         try {
-          userWs.send(JSON.stringify({
-            type: "sys.relay_ready",
-            automaticRecoveryOwner: "master-v1",
-          }));
+          userWs.send(JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId }));
         } catch { /* swallow */ }
       }
       void drainDurableControlsForUser(uid);

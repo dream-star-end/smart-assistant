@@ -646,6 +646,7 @@ export type ChatSession = {
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  _frameSeqContainerId?: number;
   /** Settled frames that arrived before their permission_request. Applied
    *  when the matching card is created; keyed by requestId. */
   _pendingPermissionSettlements?: Record<string, {
@@ -706,6 +707,8 @@ export type ChatSession = {
   _agentSwitchedAt?: number | null;
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
+  _lastAcceptedFrameSeqAt?: number;
+  _lastAcceptedFrameSeqOrderByKey?: Record<string, number>;
   _turnStatus?: TurnStatusState | null;
   /** OCV5-704: when the current `compacting` phase began (local clock). The
    * 「正在压缩上下文 (Ns)」 seconds count from here, not from turn start. */

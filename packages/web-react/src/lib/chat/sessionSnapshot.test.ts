@@ -6,8 +6,9 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { SessionSnapshot } from "./sessionSnapshot";
-import { snapshotQuery, SNAPSHOT_ACK_TIMEOUT_MS } from "./sessionSnapshot";
+import { snapshotNeedsRebuild, snapshotQuery, SNAPSHOT_ACK_TIMEOUT_MS } from "./sessionSnapshot";
 import { isTurnDetached, type ChatMessage } from "./model";
+import { summarizeSystemCallbackUserTurn } from "./pure";
 import { ChatSocket, RECOVERY_ADOPTION_GRACE_MS, RECOVERY_DECISION_GRACE_MS, type ChatSocketDeps } from "./socket";
 
 class FakeWS {
@@ -895,5 +896,545 @@ describe("没有本地猜测：在飞回合只由快照裁定", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(syncSession).toHaveBeenCalledTimes(2);
     sock.stop();
+  });
+});
+
+describe("INC-20261115-CONTAINER-SWAP-FRAMESEQ: 跨容器游标归零与租约回调", () => {
+  test("full online repro: idle cursor_reset unblocks cronOrigin lsc-* live frames and summarizes satisfied lease", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.loadStored({
+      id: "s1", agentId: "main", title: "old", createdAt: 1, lastAt: 1,
+      messages: [],
+      _lastFrameSeqByKey: { [SK]: 500 },
+      _lastFrameSeq: 500,
+    });
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 1;
+    ws.onopen?.();
+    ws.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" });
+    const s = sock.sessions.get("s1")!;
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(500);
+
+    // Idle cross-container cursor_reset snapshot resets stale 500 -> 0.
+    pushSnapshot(ws, snapshot({ gap: { reason: "cursor_reset" }, frames: [] }));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBeUndefined();
+
+    // Server-injected lease callback turn arrives with fresh container frameSeq=1,2.
+    const lscId = "lsc-lease-773";
+    const lscText = "[系统通知 · 自进化租约列车结果]\n- 租约: tr-1\n- 结果: 已满足（survivor committed）\n- 代码已在线，无需重复处理。";
+    ws.push({
+      type: "outbound.ack", admitted: true, accepted: true, peer, clientMessageId: lscId,
+      cronOrigin: { text: lscText, ts: Date.now(), agentId: "main" },
+    });
+    ws.push({
+      type: "outbound.message", sessionKey: SK, channel: "webchat", peer, clientMessageId: lscId,
+      blocks: [{ kind: "tool_use", blockId: "blk-1", name: "Bash", input: { command: "echo ok" } }],
+      isFinal: false, frameSeq: 1, ts: Date.now(),
+    });
+    ws.push({
+      type: "outbound.turn_status", sessionKey: SK, channel: "webchat", peer, clientMessageId: lscId,
+      status: "working", frameSeq: 2, ts: Date.now(),
+    });
+    ws.push({
+      type: "outbound.message", sessionKey: SK, channel: "webchat", peer, clientMessageId: lscId,
+      blocks: [{ kind: "text", text: "已核验在线" }], isFinal: true, frameSeq: 3, ts: Date.now(),
+    });
+    await flush();
+
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(3);
+    expect(s.messages.some((m) => m.role === "tool" && m.blockId === "blk-1")).toBe(true);
+    expect(assistantText(s.messages, lscId)).toBe("已核验在线");
+    const userRow = s.messages.find((m) => m.role === "user" && m.id === lscId)!;
+    expect(summarizeSystemCallbackUserTurn(userRow)).toBe("系统回调 · 发布列车已上线");
+    sock.stop();
+  });
+
+  test("0-frame open dispatch cursor_reset resets cursor so live frameSeq=1 is accepted", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.loadStored({
+      id: "s1", agentId: "main", title: "old", createdAt: 1, lastAt: 1,
+      messages: [],
+      _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    pushSnapshot(ws, openSnapshot({ frames: [], lastFrameSeq: null, nextAfterSeq: 0, gap: { reason: "cursor_reset" } }));
+    await flush();
+
+    const s = sock.sessions.get("s1")!;
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(0);
+    ws.push(textFrame(1, "first live frame"));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(assistantText(s.messages)).toBe("first live frame");
+    sock.stop();
+  });
+
+  test("late idle cursor_reset snapshot does not roll back cursor advanced by live frames after requestedAt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    // helloSentAt for s1 was recorded at t=10_000.
+    vi.setSystemTime(10_500);
+    ws.push(textFrame(1, "already live on new container"));
+    const s = sock.sessions.get("s1")!;
+    expect(s._lastFrameAt).toBe(10_500);
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+
+    // Late idle cursor_reset snapshot arrives at 10_600 for the hello sent at 10_000.
+    vi.setSystemTime(10_600);
+    pushSnapshot(ws, snapshot({ gap: { reason: "cursor_reset" }, frames: [] }));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+
+    // Duplicate frameSeq=1 is still deduplicated; frameSeq=2 is accepted.
+    ws.push(textFrame(1, "dup"));
+    ws.push(textFrame(2, " + next"));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(2);
+    expect(assistantText(s.messages)).toBe("already live on new container + next");
+    sock.stop();
+  });
+
+  test("cursor_reset with oversize first frame recovers via follow-up byte_limit page and readLiveFramePayload", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const readLiveFramePayload = vi.fn(async () => ({ payload: textFrame(1, "oversize first") }));
+    const readSessionSnapshot = vi.fn(async (_sessId: string, q: { afterSeq: number }) => {
+      if (q.afterSeq === 0) {
+        return openSnapshot({
+          frames: [], nextAfterSeq: 0, hasMore: true,
+          gap: { reason: "byte_limit", recordId: "rec-1", sha256: "sha-1", frameSeq: 1 },
+        });
+      }
+      return openSnapshot({ frames: [record(2, " tail")], nextAfterSeq: 2, hasMore: false, gap: null });
+    });
+    const sock = makeSocket({ readLiveFramePayload, readSessionSnapshot });
+    sock.loadStored({
+      id: "s1", agentId: "main", title: "old", createdAt: 1, lastAt: 1,
+      messages: [],
+      _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    pushSnapshot(ws, openSnapshot({
+      frames: [], nextAfterSeq: 0, hasMore: true, gap: { reason: "cursor_reset" },
+    }));
+    await flush();
+
+    expect(readLiveFramePayload).toHaveBeenCalledWith("s1", { recordId: "rec-1", sha256: "sha-1" });
+    expect(readSessionSnapshot).toHaveBeenNthCalledWith(1, "s1", { afterSeq: 0, streamKey: STREAM, limit: 500, dispatch: CMID });
+    expect(readSessionSnapshot).toHaveBeenNthCalledWith(2, "s1", { afterSeq: 1, streamKey: STREAM, limit: 500, dispatch: CMID });
+    const s = sock.sessions.get("s1")!;
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(2);
+    expect(assistantText(s.messages)).toBe("oversize first tail");
+    sock.stop();
+  });
+
+  test("sys.relay_ready container switch resets all sessions including 9th+ and late-loaded sessions; same container preserves cursors", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    for (let i = 1; i <= 10; i++) {
+      const id = `s${i}`;
+      sock.loadStored({
+        id, agentId: "main", title: id, createdAt: 1, lastAt: 1, messages: [],
+        _lastFrameSeqByKey: { [`agent:main:webchat:dm:${id}`]: 500 },
+        _frameSeqContainerId: 7246,
+      });
+    }
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 1;
+    ws.onopen?.();
+    persistSession.mockClear();
+
+    ws.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    for (let i = 1; i <= 10; i++) {
+      const id = `s${i}`;
+      const sess = sock.sessions.get(id)!;
+      expect(sess._frameSeqContainerId).toBe(7247);
+      expect(sess._lastFrameSeqByKey?.[`agent:main:webchat:dm:${id}`]).toBeUndefined();
+      expect(persistSession).toHaveBeenCalledWith(id);
+      expect(sock.toStored(id)?._frameSeqContainerId).toBe(7247);
+    }
+
+    // Late IndexedDB load after sys.relay_ready also reconciles immediately.
+    persistSession.mockClear();
+    sock.loadStored({
+      id: "s11", agentId: "main", title: "s11", createdAt: 1, lastAt: 1, messages: [],
+      _lastFrameSeqByKey: { "agent:main:webchat:dm:s11": 500 },
+      _frameSeqContainerId: 7246,
+    });
+    const s11 = sock.sessions.get("s11")!;
+    expect(s11._frameSeqContainerId).toBe(7247);
+    expect(s11._lastFrameSeqByKey?.["agent:main:webchat:dm:s11"]).toBeUndefined();
+    expect(persistSession).toHaveBeenCalledWith("s11");
+
+    // Reconnect on the same container 7247 preserves cursors.
+    sock.sessions.get("s1")!._lastFrameSeqByKey!["agent:main:webchat:dm:s1"] = 12;
+    persistSession.mockClear();
+    ws.close(1006, "");
+    await vi.advanceTimersByTimeAsync(60_000);
+    const next = FakeWS.instances.at(-1)!;
+    next.readyState = 1;
+    next.onopen?.();
+    next.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    expect(sock.sessions.get("s1")!._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(12);
+    expect(persistSession).not.toHaveBeenCalledWith("s1");
+    sock.stop();
+  });
+
+  test("legacy cache without _frameSeqContainerId: resets 10 idle sessions on sys.relay_ready without hello snapshots", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    for (let i = 1; i <= 10; i++) {
+      const id = `s${i}`;
+      sock.loadStored({
+        id, agentId: "main", title: id, createdAt: 1, lastAt: 1, messages: [],
+        _lastFrameSeqByKey: { [`agent:main:webchat:dm:${id}`]: 500 },
+      });
+    }
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 1;
+    ws.onopen?.();
+    ws.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+
+    for (let i = 1; i <= 10; i++) {
+      const id = `s${i}`;
+      const sess = sock.sessions.get(id)!;
+      expect(sess._frameSeqContainerId).toBe(7247);
+      expect(sess._lastFrameSeqByKey?.[`agent:main:webchat:dm:${id}`]).toBeUndefined();
+    }
+
+    const lscId = "lsc-10";
+    ws.push({
+      type: "outbound.ack", admitted: true, accepted: true, peer: { id: "s10", kind: "dm" }, clientMessageId: lscId,
+      cronOrigin: { text: "[系统通知]\n- 结果: 已满足（survivor committed）", ts: Date.now(), agentId: "main" },
+    });
+    ws.push({
+      type: "outbound.message", sessionKey: "agent:main:webchat:dm:s10", channel: "webchat",
+      peer: { id: "s10", kind: "dm" }, clientMessageId: lscId,
+      blocks: [{ kind: "text", text: "10th session healed" }], isFinal: true, frameSeq: 1, ts: Date.now(),
+    });
+    await flush();
+    expect(sock.sessions.get("s10")!._lastFrameSeqByKey?.["agent:main:webchat:dm:s10"]).toBe(1);
+    expect(assistantText(sock.sessions.get("s10")!.messages, lscId)).toBe("10th session healed");
+    sock.stop();
+  });
+
+  test("legacy cache without _frameSeqContainerId: defers _frameSeqContainerId on in-flight session until snapshot settlement", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.loadStored({
+      id: "s1", agentId: "main", title: "inflight-legacy", createdAt: 1, lastAt: 1,
+      messages: [{ id: CMID, role: "user", text: "q", ts: 1, status: "sent" }],
+      _sendingInFlight: true, _activeClientMessageId: CMID,
+      _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 1;
+    ws.onopen?.();
+    ws.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+
+    const s = sock.sessions.get("s1")!;
+    expect(s._frameSeqContainerId).toBeUndefined();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(500);
+
+    pushSnapshot(ws, openSnapshot({ frames: [record(1, "rebuilt")], lastFrameSeq: 1, gap: { reason: "cursor_reset" } }));
+    await flush();
+    expect(s._frameSeqContainerId).toBe(7247);
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(assistantText(s.messages)).toBe("rebuilt");
+    sock.stop();
+
+    // Same-container legacy in-flight session without hello snapshot reconciles via 8s HTTP watchdog and keeps 500 -> 501.
+    const readSessionSnapshot = vi.fn(async () => openSnapshot({
+      streamKey: STREAM, frames: [record(501, "cont")], lastFrameSeq: 501, nextAfterSeq: 500, gap: null,
+    }));
+    const sock2 = makeSocket({ readSessionSnapshot });
+    sock2.loadStored({
+      id: "s1", agentId: "main", title: "same-container", createdAt: 1, lastAt: 1,
+      messages: [{ id: CMID, role: "user", text: "q", ts: 1, status: "sent" }],
+      _sendingInFlight: true, _activeClientMessageId: CMID,
+      _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    sock2.setActiveSession("s1");
+    sock2.setGateReady(true);
+    const ws2 = FakeWS.instances.at(-1)!;
+    ws2.readyState = 1;
+    ws2.onopen?.();
+    ws2.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    expect(sock2.sessions.get("s1")!._frameSeqContainerId).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
+    expect(readSessionSnapshot).toHaveBeenCalledWith("s1", { afterSeq: 500, dispatch: CMID });
+    expect(sock2.sessions.get("s1")!._frameSeqContainerId).toBe(7247);
+    expect(sock2.sessions.get("s1")!._lastFrameSeqByKey?.[SK]).toBe(501);
+    sock2.stop();
+
+    // Terminal tape snapshot settles legacy in-flight turn to idle -> resets stale 500 cursor and binds 7247.
+    const sock3 = makeSocket({ syncSession: vi.fn(async () => true) });
+    sock3.loadStored({
+      id: "s1", agentId: "main", title: "terminal-tape-legacy", createdAt: 1, lastAt: 1,
+      messages: [{ id: CMID, role: "user", text: "q", ts: 1, status: "sent" }],
+      _sendingInFlight: true, _activeClientMessageId: CMID,
+      _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    sock3.setActiveSession("s1");
+    sock3.setGateReady(true);
+    const ws3 = FakeWS.instances.at(-1)!;
+    ws3.readyState = 1;
+    ws3.onopen?.();
+    ws3.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    const s3 = sock3.sessions.get("s1")!;
+    expect(s3._frameSeqContainerId).toBeUndefined();
+    expect(s3._lastFrameSeqByKey?.[SK]).toBe(500);
+
+    pushSnapshot(ws3, openSnapshot({
+      dispatch: dispatchRow({ status: "terminal", outcome: "completed" }),
+      lastFrameSeq: null,
+      reconcile: "turn_completed",
+      gap: { reason: "tape" },
+      turnStatus: null,
+    }));
+    await flush();
+    expect(s3._sendingInFlight).toBe(false);
+    expect(s3._lastFrameSeqByKey?.[SK]).toBeUndefined();
+    expect(s3._frameSeqContainerId).toBe(7247);
+
+    ws3.push(textFrame(1, "next turn on new container", "m-run-2"));
+    await flush();
+    expect(s3._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(assistantText(s3.messages, "m-run-2")).toBe("next turn on new container");
+    sock3.stop();
+  });
+
+  test("unsequenced outbound.turn_status before 0-frame cursor_reset snapshot does not block cursor reset", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.loadStored({
+      id: "s1", agentId: "main", title: "old", createdAt: 1, lastAt: 1,
+      messages: [], _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const s = sock.sessions.get("s1")!;
+
+    vi.setSystemTime(10_100);
+    ws.push(detachedStatus("working"));
+    expect(s._lastFrameAt).toBe(10_100);
+    expect(s._lastAcceptedFrameSeqAt).toBeUndefined();
+
+    pushSnapshot(ws, openSnapshot({ frames: [], lastFrameSeq: null, nextAfterSeq: 0, gap: { reason: "cursor_reset" } }));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(0);
+
+    ws.push(textFrame(1, "accepted after unsequenced turn_status"));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(assistantText(s.messages)).toBe("accepted after unsequenced turn_status");
+    sock.stop();
+  });
+
+  test("Stop fence (isSnapshotFenced) preserves visible thinking/tool rows, cursor, and _frameSeqContainerId on cursor_reset snapshot", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const initialMessages: ChatMessage[] = [
+      { id: CMID, role: "user", text: "q", ts: 1, status: "sent" },
+      { id: "think-1", role: "thinking", text: "reasoning...", ts: 2, _clientMessageId: CMID, _turnOwnerId: CMID },
+      { id: "tool-1", role: "tool", text: "", toolName: "Bash", inputJson: { command: "ls" }, blockId: "blk-1", ts: 3, _clientMessageId: CMID, _turnOwnerId: CMID },
+    ];
+    sock.loadStored({
+      id: "s1", agentId: "main", title: "fenced", createdAt: 1, lastAt: 1,
+      messages: initialMessages,
+      _sendingInFlight: true, _activeClientMessageId: CMID,
+      _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    const s = sock.sessions.get("s1")!;
+    s._stopSettlement = { clientMessageId: CMID, controlId: "ctrl-stop-1", phase: "awaiting_receipt" };
+    sock.setActiveSession("s1");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.readyState = 1;
+    ws.onopen?.();
+    ws.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+
+    pushSnapshot(ws, openSnapshot({ frames: [record(1, "x")], lastFrameSeq: 1, gap: { reason: "cursor_reset" } }));
+    await flush();
+
+    expect(s.messages.map((m) => [m.id, m.role])).toEqual([
+      [CMID, "user"], ["think-1", "thinking"], ["tool-1", "tool"],
+    ]);
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(500);
+    expect(s._frameSeqContainerId).toBeUndefined();
+    sock.stop();
+  });
+
+  test("dual-agent legacy cache clears both main & explorer on 0-frame main cursor_reset, preserves newer post-ready explorer frame, and rebuilds mismatched lead", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const explorerKey = "agent:explorer:webchat:dm:s1";
+
+    // (a) main=500, explorer=500, legacy _frameSeqContainerId=undefined, main in-flight 0-frame cursor_reset -> resets both, binds 7247, live explorer=1 renders
+    const sock1 = makeSocket();
+    sock1.loadStored({
+      id: "s1", agentId: "main", _activeAgentId: "main", title: "dual", createdAt: 1, lastAt: 1,
+      messages: [], _sendingInFlight: true, _activeClientMessageId: CMID,
+      _lastFrameSeqByKey: { [SK]: 500, [explorerKey]: 500 },
+    });
+    sock1.setActiveSession("s1");
+    sock1.setGateReady(true);
+    const ws1 = FakeWS.instances.at(-1)!;
+    ws1.readyState = 1; ws1.onopen?.();
+    ws1.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    await vi.waitFor(() => expect(sock1.sessions.get("s1")?._lastFrameSeqByKey).toBeDefined());
+    const s1 = sock1.sessions.get("s1")!;
+    pushSnapshot(ws1, openSnapshot({ frames: [], lastFrameSeq: null, nextAfterSeq: 0, gap: { reason: "cursor_reset" } }));
+    await flush();
+    expect(s1._lastFrameSeqByKey?.[SK]).toBe(0);
+    expect(s1._lastFrameSeqByKey?.[explorerKey]).toBeUndefined();
+    expect(s1._frameSeqContainerId).toBe(7247);
+    ws1.push({ ...textFrame(1, "main done"), isFinal: true });
+    await flush();
+    expect(assistantText(s1.messages)).toBe("main done");
+    ws1.push({ type: "outbound.message", sessionKey: explorerKey, channel: "webchat", peer, clientMessageId: "m-exp-1", blocks: [{ kind: "text", text: "explorer live 1" }], isFinal: false, frameSeq: 1, ts: 10_002 });
+    await flush();
+    expect(s1._lastFrameSeqByKey?.[explorerKey]).toBe(1);
+    expect(assistantText(s1.messages, "m-exp-1")).toBe("explorer live 1");
+    sock1.stop();
+
+    // (b) causal order: live explorer=2 accepted AFTER sys.relay_ready(7247) before main cursor_reset snapshot -> explorer=2 preserved!
+    const sock2 = makeSocket();
+    sock2.loadStored({
+      id: "s1", agentId: "main", _activeAgentId: "main", title: "causal", createdAt: 1, lastAt: 1,
+      messages: [], _sendingInFlight: true, _activeClientMessageId: CMID,
+      _lastFrameSeqByKey: { [SK]: 500, [explorerKey]: 500 },
+    });
+    sock2.setActiveSession("s1");
+    sock2.setGateReady(true);
+    const ws2 = FakeWS.instances.at(-1)!;
+    ws2.readyState = 1; ws2.onopen?.();
+    ws2.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    const s2 = sock2.sessions.get("s1")!;
+    // Simulate new-container explorer frame=2 accepted after relay_ready (with lower seq than stale 500 -> reset explorer cursor first, then accept 2? wait: use 501 or pre-reset 1 -> 2)
+    ws2.push({ type: "outbound.message", sessionKey: explorerKey, channel: "webchat", peer, clientMessageId: "m-exp-2", blocks: [{ kind: "text", text: "explorer live 501" }], isFinal: false, frameSeq: 501, ts: 10_501 });
+    await flush();
+    pushSnapshot(ws2, openSnapshot({ frames: [], lastFrameSeq: null, nextAfterSeq: 0, gap: { reason: "cursor_reset" } }));
+    await flush();
+    expect(s2._lastFrameSeqByKey?.[SK]).toBe(0);
+    expect(s2._lastFrameSeqByKey?.[explorerKey]).toBe(501);
+    expect(s2._frameSeqContainerId).toBe(7247);
+    sock2.stop();
+
+    // (c) mismatched lead on legacy cache: sess.agentId=explorer (explorer=0), main=500, server running main frame 1 gap:null -> rebuilds & binds 7247
+    const sock3 = makeSocket();
+    sock3.loadStored({
+      id: "s1", agentId: "explorer", title: "mismatch", createdAt: 1, lastAt: 1,
+      messages: [{ id: CMID, role: "user", text: "q", ts: 1, status: "sent" }],
+      _sendingInFlight: true, _activeClientMessageId: CMID,
+      _lastFrameSeqByKey: { [SK]: 500 },
+    });
+    sock3.setActiveSession("s1");
+    sock3.setGateReady(true);
+    const ws3 = FakeWS.instances.at(-1)!;
+    ws3.readyState = 1; ws3.onopen?.();
+    ws3.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    const s3 = sock3.sessions.get("s1")!;
+    expect(s3._lastFrameSeqByKey?.[SK]).toBe(500);
+    pushSnapshot(ws3, openSnapshot({ frames: [record(1, "main-after-restart")], lastFrameSeq: 1, gap: null }));
+    await flush();
+    expect(s3._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(s3._frameSeqContainerId).toBe(7247);
+    expect(assistantText(s3.messages)).toBe("main-after-restart");
+    sock3.stop();
+
+    // (d) persisted same streamKey on legacy cache: _snapshotStream === STREAM, main=500, explorer=500, gap: cursor_reset with frame 1 -> rebuilds & accepts live frame 2
+    const sock4 = makeSocket();
+    sock4.loadStored({
+      id: "s1", agentId: "main", title: "same-stream", createdAt: 1, lastAt: 1,
+      messages: [{ id: CMID, role: "user", text: "q", ts: 1, status: "sent" }],
+      _sendingInFlight: true, _activeClientMessageId: CMID,
+      _snapshotStream: { streamKey: STREAM, agentId: "main" },
+      _lastFrameSeqByKey: { [SK]: 500, [explorerKey]: 500 },
+    });
+    sock4.setActiveSession("s1");
+    sock4.setGateReady(true);
+    const ws4 = FakeWS.instances.at(-1)!;
+    ws4.readyState = 1; ws4.onopen?.();
+    ws4.push({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1", containerId: 7247 });
+    const s4 = sock4.sessions.get("s1")!;
+    expect(s4._lastFrameSeqByKey?.[SK]).toBe(500);
+    const sameStreamResetSnap = openSnapshot({ streamKey: STREAM, frames: [record(1, "same-stream-reset")], lastFrameSeq: 1, gap: { reason: "cursor_reset" } });
+    expect(snapshotNeedsRebuild(s4, sameStreamResetSnap)).toBe(true);
+    pushSnapshot(ws4, sameStreamResetSnap);
+    await flush();
+    expect(s4._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(s4._lastFrameSeqByKey?.[explorerKey]).toBeUndefined();
+    expect(s4._frameSeqContainerId).toBe(7247);
+    expect(assistantText(s4.messages)).toBe("same-stream-reset");
+    ws4.push(textFrame(2, " + live2"));
+    await flush();
+    expect(s4._lastFrameSeqByKey?.[SK]).toBe(2);
+    expect(assistantText(s4.messages)).toBe("same-stream-reset + live2");
+    sock4.stop();
+  });
+
+  test("late 0-frame open cursor_reset snapshot preserves live frameSeq=1 cursor and rendered body accepted after hello", async () => {
+    const { sock, ws, s } = boot();
+    ws.push(textFrame(1, "live after hello"));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(assistantText(s.messages)).toBe("live after hello");
+
+    pushSnapshot(ws, openSnapshot({ frames: [], lastFrameSeq: null, nextAfterSeq: 0, gap: { reason: "cursor_reset" } }));
+    await flush();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+    expect(assistantText(s.messages)).toBe("live after hello");
+    sock.stop();
+
+    const { sock: sock2, ws: ws2, s: s2 } = boot();
+    s2._snapshotStream = { streamKey: STREAM, agentId: "main" };
+    ws2.push(textFrame(1, "a"));
+    ws2.push(textFrame(2, " + b"));
+    await flush();
+    expect(s2._lastFrameSeqByKey?.[SK]).toBe(2);
+    expect(assistantText(s2.messages)).toBe("a + b");
+    pushSnapshot(ws2, openSnapshot({ frames: [record(1, "a")], lastFrameSeq: 1, nextAfterSeq: 1, gap: { reason: "cursor_reset" } }));
+    await flush();
+    expect(s2._lastFrameSeqByKey?.[SK]).toBe(2);
+    expect(assistantText(s2.messages)).toBe("a + b");
+    sock2.stop();
   });
 });

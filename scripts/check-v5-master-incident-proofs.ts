@@ -147,6 +147,15 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts',
     cases: ['cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)'],
   },
+  {
+    incident: 'INC-20261115-CONTAINER-SWAP-FRAMESEQ', slug: 'inc-20261115-container-swap-frameseq', db: true,
+    file: 'packages/commercial/src/__tests__/sessionSnapshot.test.ts',
+    cases: [
+      'idle session arbitrates cross-container cursor_reset only when containerId is supplied (INC-20261115-CONTAINER-SWAP-FRAMESEQ)',
+      'cursor_reset takes priority over containerLinkGap and sequence_gap on open dispatch (INC-20261115-CONTAINER-SWAP-FRAMESEQ)',
+      'cursor_reset defers byte_limit on first page with oversize frame and exposes byte_limit on follow-up page (INC-20261115-CONTAINER-SWAP-FRAMESEQ)',
+    ],
+  },
 ]
 
 function fail(message: string): never {

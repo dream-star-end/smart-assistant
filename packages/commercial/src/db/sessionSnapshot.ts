@@ -7,10 +7,13 @@ import { openDispatchTurnStatusSnapshotFrame, terminalDispatchReconcile } from '
 
 export interface SessionSnapshotOptions {
   afterSeq?: number
+  afterSeqByAgent?: Record<string, number>
   limit?: number
   clientMessageId?: string
   /** Echo the previous snapshot's stream identity whenever afterSeq is nonzero. */
   streamKey?: string
+  streamKeyAgentId?: string
+  containerId?: number
 }
 export const SESSION_SNAPSHOT_MAX_BYTES = 1024 * 1024
 
@@ -95,7 +98,26 @@ export async function buildSessionSnapshot(
   } catch {
     snapshot.pendingPermissions.completeness = 'unavailable'
   }
-  if (!row) return snapshot
+  const requestedAfterBase = Number.isSafeInteger(options.afterSeq) && options.afterSeq! > 0 ? options.afterSeq! : 0
+  const anyAgentAfterPositive = !!options.afterSeqByAgent && Object.values(options.afterSeqByAgent).some(
+    v => typeof v === 'number' && Number.isSafeInteger(v) && v > 0,
+  )
+  if (!row) {
+    if ((requestedAfterBase > 0 || anyAgentAfterPositive) && typeof options.containerId === 'number' &&
+        Number.isSafeInteger(options.containerId) && options.containerId > 0) {
+      const lastDispatch = (await q.query<{ agent_container_id: string | number | null }>(
+        `/* session-snapshot-container-cursor */
+         SELECT agent_container_id FROM turn_dispatches
+          WHERE user_id=$1::bigint AND session_id=$2 AND agent_container_id IS NOT NULL
+          ORDER BY admitted_at DESC, dispatch_id DESC LIMIT 1`,
+        [uid, sessionId],
+      )).rows[0]
+      if (!lastDispatch || Number(lastDispatch.agent_container_id) !== options.containerId) {
+        snapshot.gap = { reason: 'cursor_reset' }
+      }
+    }
+    return snapshot
+  }
   snapshot.dispatch = {
     id: row.dispatch_id, clientMessageId: row.client_message_id, agentId,
     status: row.status, outcome: row.outcome, attempt: row.attempt_no,
@@ -128,7 +150,7 @@ export async function buildSessionSnapshot(
       WHERE s.stream_key=$1 AND s.user_id=$2 AND s.session_id=$3`,
     [streamKey, `c:${uid}`, sessionId],
   )).rows[0]
-  snapshot.gap = stream?.provenance?.containerLinkGap ?? null
+  const containerLinkGap = stream?.provenance?.containerLinkGap ?? null
   snapshot.lastFrameSeq = stream?.frame_seq == null ? null : Number(stream.frame_seq)
   snapshot.lastFrameAt = stream?.created_at?.getTime() ?? null
 
@@ -173,8 +195,13 @@ export async function buildSessionSnapshot(
       }
     }
   }
-  const requestedAfter = Number.isSafeInteger(options.afterSeq) && options.afterSeq! > 0 ? options.afterSeq! : 0
-  const reset = requestedAfter > 0 && (options.streamKey !== streamKey || requestedAfter > (snapshot.lastFrameSeq ?? 0))
+  const agentAfter = options.afterSeqByAgent && Object.prototype.hasOwnProperty.call(options.afterSeqByAgent, agentId)
+    ? options.afterSeqByAgent[agentId] : undefined
+  const requestedAfter = typeof agentAfter === 'number' && Number.isSafeInteger(agentAfter) && agentAfter >= 0
+    ? agentAfter : requestedAfterBase
+  const sameRequestedStream = options.streamKey === streamKey &&
+    (!options.streamKeyAgentId || options.streamKeyAgentId === agentId)
+  const reset = requestedAfter > 0 && (!sameRequestedStream || requestedAfter > (snapshot.lastFrameSeq ?? 0))
   const after = reset ? 0 : requestedAfter
   snapshot.nextAfterSeq = after
   const limit = Number.isSafeInteger(options.limit) ? Math.max(1, Math.min(500, options.limit!)) : 200
@@ -198,24 +225,27 @@ export async function buildSessionSnapshot(
          ON f.record_id=p.record_id AND p.total_bytes<=$4
       ORDER BY p.frame_seq,p.record_id`, [streamKey, after, limit + 1, SESSION_SNAPSHOT_MAX_BYTES],
   )
+  let sequenceGap: SessionSnapshot['gap'] = null
   for (const frame of page.rows.slice(0, limit)) {
     if (frame.payload === null) {
-      // Fetch exact bytes through the existing payload endpoint, then advance
-      // to frameSeq. Do not silently skip a frame or loop at the same cursor.
-      snapshot.gap = { reason: 'byte_limit', recordId: frame.record_id, sha256: frame.payload_sha256, frameSeq: Number(frame.frame_seq) }
+      if (!reset) {
+        // Fetch exact bytes through the existing payload endpoint, then advance
+        // to frameSeq. Do not silently skip a frame or loop at the same cursor.
+        snapshot.gap = { reason: 'byte_limit', recordId: frame.record_id, sha256: frame.payload_sha256, frameSeq: Number(frame.frame_seq) }
+      }
       snapshot.hasMore = true
       break
     }
     if (snapshot.nextAfterSeq > 0 && Number(frame.frame_seq) > snapshot.nextAfterSeq + 1) {
       // A session-scoped sequence can include non-journalled sidebands. Report
       // the observed discontinuity, without claiming those bytes are recoverable.
-      snapshot.gap ??= { reason: 'sequence_gap', afterSeq: snapshot.nextAfterSeq, beforeSeq: Number(frame.frame_seq) }
+      sequenceGap ??= { reason: 'sequence_gap', afterSeq: snapshot.nextAfterSeq, beforeSeq: Number(frame.frame_seq) }
     }
     snapshot.frames.push({ recordId: frame.record_id, frameSeq: Number(frame.frame_seq), payload: JSON.parse(frame.payload.toString('utf8')) })
     snapshot.nextAfterSeq = Number(frame.frame_seq)
   }
   snapshot.hasMore ||= page.rows.length > limit
-  snapshot.gap ??= reset ? { reason: 'cursor_reset' } : snapshot.hasMore ? { reason: 'page_limit' } : null
+  snapshot.gap ??= reset ? { reason: 'cursor_reset' } : containerLinkGap ?? sequenceGap ?? (snapshot.hasMore ? { reason: 'page_limit' } : null)
   return snapshot
 }
 

@@ -10,6 +10,7 @@ import { isClientMessageId, type SessionSnapshot } from "@openclaude/protocol/br
 import type { DurableLiveFrame } from "../types";
 import type { ChatSession } from "./model";
 import { getFrameSeqCursor, safeSessionKeyForAgent } from "./pure";
+import { resetAgentFrameSeqCursorsForSession } from "./reducer";
 
 export type { SessionSnapshot };
 
@@ -61,23 +62,24 @@ export function isOpenSnapshotDispatch(d: SessionSnapshot["dispatch"]): d is Sna
 
 /** 快照流所属 agent：游标、hello 首个 peer 都按它取，保证 afterSeq 与 streamKey 是同一个 sessionKey。 */
 export function snapshotLeadAgent(
-  sess: Pick<ChatSession, "agentId" | "_snapshotStream">,
+  sess: Pick<ChatSession, "agentId" | "_sendingInFlight" | "_activeAgentId" | "_snapshotStream">,
   defaultAgentId?: string,
 ): string {
-  return sess._snapshotStream?.agentId || sess.agentId || defaultAgentId || "main";
+  return (sess._sendingInFlight && sess._activeAgentId) || sess._snapshotStream?.agentId || sess.agentId || defaultAgentId || "main";
 }
 
 /** 与 hello 同口径的请求游标。没有记过流时仍报本地游标，服务端据此判 cursor_reset 并从头给。 */
 export function snapshotQuery(
-  sess: Pick<ChatSession, "id" | "agentId" | "_snapshotStream" | "_lastFrameSeqByKey" | "_lastFrameSeq" |
+  sess: Pick<ChatSession, "id" | "agentId" | "_activeAgentId" | "_snapshotStream" | "_lastFrameSeqByKey" | "_lastFrameSeq" |
     "_sendingInFlight" | "_activeClientMessageId">,
   defaultAgentId?: string,
 ): SnapshotQuery {
-  const key = safeSessionKeyForAgent(sess.id, snapshotLeadAgent(sess, defaultAgentId));
+  const lead = snapshotLeadAgent(sess, defaultAgentId);
+  const key = safeSessionKeyForAgent(sess.id, lead);
   const afterSeq = getFrameSeqCursor(sess._lastFrameSeqByKey, sess._lastFrameSeq, key);
   return {
     afterSeq: Number.isSafeInteger(afterSeq) && afterSeq > 0 ? afterSeq : 0,
-    ...(sess._snapshotStream ? { streamKey: sess._snapshotStream.streamKey } : {}),
+    ...(sess._snapshotStream?.agentId === lead ? { streamKey: sess._snapshotStream.streamKey } : {}),
     ...(sess._sendingInFlight && isClientMessageId(sess._activeClientMessageId)
       ? { dispatch: sess._activeClientMessageId }
       : {}),
@@ -109,9 +111,18 @@ export function snapshotIsStale(
 
 /** A reset may replace an old stream cursor, but cannot erase newer live evidence on the same stream. */
 export function snapshotNeedsRebuild(
-  sess: Pick<ChatSession, "id" | "_snapshotStream" | "_lastFrameSeqByKey" | "_lastFrameSeq">,
+  sess: Pick<ChatSession, "id" | "_frameSeqContainerId" | "_snapshotStream" | "_lastFrameSeqByKey" | "_lastFrameSeq" |
+    "_lastAcceptedFrameSeqOrderByKey">,
   snap: SessionSnapshot,
+  requestedOrder?: number,
 ): boolean {
+  if (sess._frameSeqContainerId === undefined && isOpenSnapshotDispatch(snap.dispatch)) {
+    const key = safeSessionKeyForAgent(sess.id, snap.dispatch.agentId || "main");
+    if (getFrameSeqCursor(sess._lastFrameSeqByKey, sess._lastFrameSeq, key) > (snap.lastFrameSeq ?? 0) &&
+      (sess._lastAcceptedFrameSeqOrderByKey?.[key] ?? 0) <= (requestedOrder ?? 0)) {
+      return true;
+    }
+  }
   return snap.gap?.reason === "cursor_reset" &&
     (sess._snapshotStream?.streamKey !== snap.streamKey || !snapshotIsStale(sess, snap));
 }
@@ -132,6 +143,72 @@ export function mayClaimSnapshotDispatch(
   if (sess._sendingInFlight || sess._stopSettlement || isSnapshotFenced(sess, d)) return false;
   const user = sess.messages.find((message) => message.role === "user" && message.id === d.clientMessageId);
   return user?.status !== "replied" && user?.status !== "error";
+}
+
+/** Return true when this session has any positive agent-scoped frameSeq cursor. */
+export function hasPositiveAgentFrameSeqCursor(
+  sess: Pick<ChatSession, "id" | "_lastFrameSeqByKey">,
+): boolean {
+  const byKey = sess._lastFrameSeqByKey;
+  if (!byKey || typeof byKey !== "object") return false;
+  const safeId = String(sess.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const suffix = `:webchat:dm:${safeId}`;
+  for (const [key, val] of Object.entries(byKey)) {
+    if (key.startsWith("agent:") && key.endsWith(suffix) && typeof val === "number" && Number.isSafeInteger(val) && val > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export type RelayContainerResetOpts = {
+  keepAcceptedAfterOrder?: number;
+  onResetKey?: (key: string) => void;
+};
+
+/** Reconcile a session's container-scoped frameSeq cursors against the live relay container generation. */
+export function reconcileSessionRelayContainer(
+  sess: ChatSession,
+  containerId: unknown,
+  opts?: RelayContainerResetOpts,
+): { changed: boolean; reset: boolean } {
+  if (typeof containerId !== "number" || !Number.isSafeInteger(containerId) || containerId <= 0) {
+    return { changed: false, reset: false };
+  }
+  const prev = sess._frameSeqContainerId;
+  if (prev === containerId) return { changed: false, reset: false };
+  if (typeof prev === "number" && Number.isSafeInteger(prev) && prev > 0) {
+    sess._frameSeqContainerId = containerId;
+    resetAgentFrameSeqCursorsForSession(sess, opts);
+    return { changed: true, reset: true };
+  }
+  if (!hasPositiveAgentFrameSeqCursor(sess)) {
+    sess._frameSeqContainerId = containerId;
+    return { changed: true, reset: false };
+  }
+  // Idle legacy cache without _frameSeqContainerId: resetting positive cursors immediately rescues 9th+ sessions safely.
+  if (!sess._sendingInFlight) {
+    sess._frameSeqContainerId = containerId;
+    resetAgentFrameSeqCursorsForSession(sess, opts);
+    return { changed: true, reset: true };
+  }
+  // In-flight legacy cache: keep existing positive cursors until authoritative snapshot settlement writes _frameSeqContainerId.
+  return { changed: false, reset: false };
+}
+
+/** Finalize container binding for a legacy in-flight session once an active open snapshot settles it. */
+export function reconcileOpenSnapshotRelayContainer(
+  sess: ChatSession,
+  containerId: unknown,
+  activeAgentId: string,
+  opts?: RelayContainerResetOpts,
+): boolean {
+  if (typeof containerId !== "number" || !Number.isSafeInteger(containerId) || containerId <= 0) return false;
+  if (sess._frameSeqContainerId !== undefined) return false;
+  const activeKey = safeSessionKeyForAgent(sess.id, activeAgentId || "main");
+  resetAgentFrameSeqCursorsForSession(sess, { ...opts, excludeKey: activeKey });
+  sess._frameSeqContainerId = containerId;
+  return true;
 }
 
 /** B3 §2.2：到点检查当前选中的会话和所有在飞会话。 */

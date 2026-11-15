@@ -40,7 +40,8 @@ before(async () => {
   await db.query(`
     CREATE TABLE client_sessions(id text PRIMARY KEY,user_id text,deleted_at timestamptz);
     CREATE TABLE turn_dispatches(dispatch_id uuid PRIMARY KEY,user_id bigint,session_id text,client_message_id text,
-      agent_id text,status text,outcome text,attempt_no int,admitted_at timestamptz,accepted_at timestamptz,terminal_at timestamptz);
+      agent_id text,status text,outcome text,attempt_no int,admitted_at timestamptz,accepted_at timestamptz,terminal_at timestamptz,
+      agent_container_id bigint DEFAULT NULL);
     CREATE TABLE client_session_live_streams(stream_key text PRIMARY KEY,session_id text,user_id text,
       client_message_id text,projection_source text,provenance jsonb DEFAULT '{}',created_at timestamptz DEFAULT now());
     CREATE TABLE client_session_live_frames(record_id bigserial PRIMARY KEY,stream_key text,frame_seq bigint,
@@ -65,7 +66,7 @@ beforeEach(async () => {
   await db.query(`TRUNCATE client_sessions,turn_dispatches,client_session_live_streams,client_session_live_frames,
     usage_records,client_session_turn_tapes,turn_tape_cost_components,pending_usage_patches,turn_permission_requests,turn_control_requests,turn_recovery_jobs RESTART IDENTITY`)
   await db.query("INSERT INTO client_sessions VALUES ($1,'c:3',NULL)", [sessionId])
-  await db.query(`INSERT INTO turn_dispatches VALUES ($1,3,$2,$3,'main','accepted',NULL,1,now()-interval '1 hour',now(),NULL)`, [id, sessionId, cmid])
+  await db.query(`INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,status,outcome,attempt_no,admitted_at,accepted_at,terminal_at) VALUES ($1,3,$2,$3,'main','accepted',NULL,1,now()-interval '1 hour',now(),NULL)`, [id, sessionId, cmid])
   await db.query("INSERT INTO client_session_live_streams(stream_key,session_id,user_id,client_message_id,projection_source) VALUES ($1,$2,'c:3',$3,'live')", [streamKey, sessionId, cmid])
 })
 async function frame(seq: number, payload: Record<string, unknown>) {
@@ -291,4 +292,117 @@ test('persisted container replay gap remains visible with zero frames in both HT
   const response = await http()
   assert.deepEqual(response.body.snapshot.gap, gap)
   assert.equal(response.body.snapshot.lastFrameSeq, null)
+})
+
+describe('INC-20261115-CONTAINER-SWAP-FRAMESEQ', () => {
+  test('idle session arbitrates cross-container cursor_reset only when containerId is supplied (INC-20261115-CONTAINER-SWAP-FRAMESEQ)', async () => {
+    await db.query('DELETE FROM turn_dispatches')
+    const queries: string[] = []
+    const spyPool = {
+      async connect() {
+        const client = await pool.connect()
+        return {
+          query(sql: string, values?: unknown[]) {
+            queries.push(sql)
+            return client.query(sql, values)
+          },
+          release: () => client.release(),
+        }
+      },
+    } as unknown as Pool
+    const withoutCid = await readSessionSnapshot(spyPool, '3', sessionId, { afterSeq: 500 })
+    assert.equal(withoutCid?.gap, null)
+    assert.equal(queries.some(q => q.includes('session-snapshot-container-cursor')), false)
+
+    const noHistory = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: 500, containerId: 7247 })
+    assert.deepEqual(noHistory?.gap, { reason: 'cursor_reset' })
+
+    await db.query(
+      `INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,status,outcome,attempt_no,admitted_at,accepted_at,terminal_at,agent_container_id)
+       VALUES ('00000000-0000-4000-8000-000000000010',3,$1,'cm-old','main','terminal','completed',1,now()-interval '2 minutes',now()-interval '2 minutes',now()-interval '1 minute',7246)`,
+      [sessionId],
+    )
+    const oldContainer = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: 500, containerId: 7247 })
+    assert.deepEqual(oldContainer?.gap, { reason: 'cursor_reset' })
+
+    const helloSent: Array<Record<string, unknown>> = []
+    await sendHelloSessionSnapshots(
+      pool,
+      { readyState: WebSocket.OPEN, bufferedAmount: 0, send: data => { helloSent.push(JSON.parse(String(data))) } },
+      '3',
+      [{ peerId: sessionId, lastFrameSeq: 500 }],
+      null,
+      'conn-swap',
+      7247,
+    )
+    const helloSnap = helloSent.find(f => f.type === 'outbound.session_snapshot')?.snapshot as SessionSnapshot
+    assert.deepEqual(helloSnap.gap, { reason: 'cursor_reset' })
+
+    await db.query(
+      `INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,status,outcome,attempt_no,admitted_at,accepted_at,terminal_at,agent_container_id)
+       VALUES ('00000000-0000-4000-8000-000000000011',3,$1,'cm-same','main','terminal','completed',1,now()-interval '30 seconds',now()-interval '30 seconds',now()-interval '10 seconds',7247)`,
+      [sessionId],
+    )
+    const sameContainer = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: 500, containerId: 7247 })
+    assert.equal(sameContainer?.gap, null)
+  })
+
+  test('cursor_reset takes priority over containerLinkGap and sequence_gap on open dispatch (INC-20261115-CONTAINER-SWAP-FRAMESEQ)', async () => {
+    const linkGap = { reason: 'sequence_gap', afterSeq: 0, beforeSeq: 90 }
+    await db.query("UPDATE client_session_live_streams SET provenance=jsonb_build_object('containerLinkGap',$1::jsonb)", [JSON.stringify(linkGap)])
+    await frame(10, { type: 'outbound.message', blocks: [{ kind: 'text', text: 'a' }] })
+    await frame(20, { type: 'outbound.message', blocks: [{ kind: 'text', text: 'b' }] })
+
+    const resetSnap = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: 500, streamKey })
+    assert.deepEqual(resetSnap?.gap, { reason: 'cursor_reset' })
+
+    const linkGapSnap = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: 0, streamKey })
+    assert.deepEqual(linkGapSnap?.gap, linkGap)
+
+    await db.query("UPDATE client_session_live_streams SET provenance='{}'::jsonb")
+    const seqGapSnap = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: 0, streamKey })
+    assert.deepEqual(seqGapSnap?.gap, { reason: 'sequence_gap', afterSeq: 10, beforeSeq: 20 })
+  })
+
+  test('cursor_reset defers byte_limit on first page with oversize frame and exposes byte_limit on follow-up page (INC-20261115-CONTAINER-SWAP-FRAMESEQ)', async () => {
+    await frame(1, { type: 'outbound.message', text: 'x'.repeat(SESSION_SNAPSHOT_MAX_BYTES + 1) })
+    await frame(2, { type: 'outbound.message', blocks: [{ kind: 'text', text: 'tail' }] })
+
+    const page1 = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: 500, streamKey })
+    assert.equal(page1?.frames.length, 0)
+    assert.equal(page1?.nextAfterSeq, 0)
+    assert.equal(page1?.hasMore, true)
+    assert.deepEqual(page1?.gap, { reason: 'cursor_reset' })
+
+    const page2 = await readSessionSnapshot(pool, '3', sessionId, { afterSeq: page1!.nextAfterSeq, streamKey })
+    assert.equal(page2?.frames.length, 0)
+    assert.equal(page2?.hasMore, true)
+    assert.equal(page2?.gap?.reason, 'byte_limit')
+    assert.equal(page2?.gap?.frameSeq, 1)
+  })
+
+  test('afterSeqByAgent resolves open dispatch by active agentId and detects idle container swap when any agent cursor > 0', async () => {
+    await frame(1, { type: 'outbound.message', blocks: [{ kind: 'text', text: 'main-fresh' }] })
+    const mainSnap = await readSessionSnapshot(pool, '3', sessionId, {
+      afterSeq: 0, afterSeqByAgent: { explorer: 0, main: 500 },
+    })
+    assert.deepEqual(mainSnap?.gap, { reason: 'cursor_reset' })
+
+    const expId = '00000000-0000-4000-8000-000000000022'
+    const expStream = `dispatch:${expId}:1`
+    await db.query("UPDATE turn_dispatches SET status='terminal',outcome='completed',terminal_at=now(),agent_container_id=7246 WHERE dispatch_id=$1", [id])
+    const idleSwap = await readSessionSnapshot(pool, '3', sessionId, {
+      afterSeq: 0, afterSeqByAgent: { explorer: 0, main: 500 }, containerId: 7247,
+    })
+    assert.deepEqual(idleSwap?.gap, { reason: 'cursor_reset' })
+
+    await db.query(`INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,status,outcome,attempt_no,admitted_at,accepted_at,terminal_at) VALUES ($1,3,$2,'cm-exp','explorer','accepted',NULL,1,now()-interval '1 minute',now(),NULL)`, [expId, sessionId])
+    await db.query("INSERT INTO client_session_live_streams(stream_key,session_id,user_id,client_message_id,projection_source) VALUES ($1,$2,'c:3','cm-exp','live')", [expStream, sessionId])
+    await db.query('INSERT INTO client_session_live_frames(stream_key,frame_seq,payload) VALUES ($1,1,$2)', [expStream, Buffer.from(JSON.stringify({ type: 'outbound.message', frameSeq: 1, blocks: [{ kind: 'text', text: 'exp-1' }] }))])
+    const expSnap = await readSessionSnapshot(pool, '3', sessionId, {
+      afterSeq: 500, afterSeqByAgent: { explorer: 0, main: 500 },
+    })
+    assert.equal(expSnap?.gap, null)
+    assert.equal(expSnap?.frames.length, 1)
+  })
 })
