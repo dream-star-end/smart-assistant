@@ -1,4 +1,6 @@
 export * from './registry.js'
 export * from './driftCoordinator.js'
-export * from './drainGate.js'
 export * from './placement.js'
+export * from './drainGate.js'
+export * from './liveProbe.js'
+export * from './profileCutover.js'
