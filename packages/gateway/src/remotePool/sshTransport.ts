@@ -487,6 +487,21 @@ function invokeControllerControlFrame(
   })
 }
 
+export function validateProbeSpecForSshTarget(
+  target: Pick<RemoteCcTarget, 'user'>,
+  spec: Pick<RemotePoolProbeSpec, 'probeRoot'>,
+): void {
+  const expectedHome = `/home/${target.user}`
+  const probePrefix = `${expectedHome}/oc-remotedrv-probe-`
+  const suffix = spec.probeRoot.startsWith(probePrefix)
+    ? spec.probeRoot.slice(probePrefix.length)
+    : ''
+  remotePoolNeed(
+    spec.probeRoot.startsWith(probePrefix) && /^[a-z0-9-]{10,66}$/.test(suffix),
+    'REMOTE_PROBE_ROOT_INVALID',
+  )
+}
+
 export interface RemotePoolProbeSpec {
   readonly controllerPath: string
   readonly controllerSha256: string
@@ -518,14 +533,7 @@ export class RemotePoolProbeHost {
         spec.profileId.length > 0,
       'REMOTE_PROBE_SPEC_INVALID',
     )
-    const probePrefix = `/home/${target.user}/oc-remoteprobe-`
-    const suffix = spec.probeRoot.startsWith(probePrefix)
-      ? spec.probeRoot.slice(probePrefix.length)
-      : ''
-    remotePoolNeed(
-      spec.probeRoot.startsWith(probePrefix) && /^[a-z0-9-]{6,72}$/.test(suffix),
-      'REMOTE_PROBE_ROOT_INVALID',
-    )
+    validateProbeSpecForSshTarget(target, spec)
     assertPinnedSshFiles(target)
     return new RemotePoolProbeHost(spec, () =>
       spawnSsh(buildPinnedSshArgs(target, spec.controllerPath, 'probe', spec.probeRoot)),

@@ -1557,6 +1557,7 @@ export async function applyRemoteNodeProbeResult(
       await query(
         `DELETE FROM remote_agent_profiles p
           WHERE p.id = $1
+            AND p.driver_id IS NULL
             AND NOT EXISTS (
               SELECT 1 FROM remote_agent_bindings b WHERE b.profile_id = p.id
             )`,
@@ -1573,7 +1574,7 @@ export async function applyRemoteNodeProbeResult(
     WHERE node_id=$1 AND engine='codex' AND driver_id IS NULL AND NOT (profile_name=ANY($2::text[]))`,
   [nodeId, (upsertedByEngine.get('codex') ?? []).map(p => p.profile_name)], runner)
   const affected = await query(`SELECT DISTINCT o.canonical_model_id FROM remote_model_offers o
-    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex'`, [nodeId], runner)
+    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex' AND p.driver_id IS NULL`, [nodeId], runner)
   for (const offer of affected.rows) {
     if (await countEligibleEnabledRemoteOffers(offer.canonical_model_id,runner) !== 0) continue
     await query(`UPDATE model_catalog SET state='disabled',pool_auto_disabled=TRUE

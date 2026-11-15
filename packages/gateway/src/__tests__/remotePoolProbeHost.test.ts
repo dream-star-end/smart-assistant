@@ -55,7 +55,7 @@ test('RemotePoolProbeHost.forSshTarget pins probe-only role and exposes no execu
       controllerSha256: CONTROLLER_SHA,
       driverId: 'cc',
       profileId: 'default',
-      probeRoot: '/home/agent/oc-remoteprobe-cc-12345678',
+      probeRoot: '/home/agent/oc-remotedrv-probe-cc-12345678',
     }
 
     assert.throws(
@@ -63,6 +63,14 @@ test('RemotePoolProbeHost.forSshTarget pins probe-only role and exposes no execu
         RemotePoolProbeHost.forSshTarget(target, {
           ...spec,
           probeRoot: '/home/agent/oc-remotedrv-cc-12345678',
+        }),
+      /REMOTE_PROBE_ROOT_INVALID/,
+    )
+    assert.throws(
+      () =>
+        RemotePoolProbeHost.forSshTarget(target, {
+          ...spec,
+          probeRoot: '/home/agent/oc-remoteprobe-cc-12345678',
         }),
       /REMOTE_PROBE_ROOT_INVALID/,
     )
@@ -136,7 +144,7 @@ test('RemotePoolProbeHost.forSshTarget pins probe-only role and exposes no execu
     const remoteCmd = capturedArgs.at(-1) ?? ''
     assert.ok(remoteCmd.includes("'probe'"), `expected probe role in SSH command: ${remoteCmd}`)
     assert.ok(
-      remoteCmd.includes("'/home/agent/oc-remoteprobe-cc-12345678'"),
+      remoteCmd.includes("'/home/agent/oc-remotedrv-probe-cc-12345678'"),
       `expected probeRoot in SSH command: ${remoteCmd}`,
     )
   } finally {

@@ -9,7 +9,15 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -19,6 +27,7 @@ import {
   CC5_TEST_UID_ENV,
   REMOTE_DRIVER_PROTOCOL_VERSION,
   type RemoteProbeSnapshot,
+  remoteCanonicalSha256,
 } from '@openclaude/protocol'
 import { Pool } from 'pg'
 import {
@@ -70,6 +79,7 @@ const CODEX_CANONICAL = 'gpt-6-luna-remote'
 const CODEX_UPSTREAM = 'gpt-6-luna'
 const POLICY_SHA = '1'.repeat(64)
 const EVIDENCE_SHA = '2'.repeat(64)
+const cutoverSnapshotDir = mkdtempSync('/tmp/oc-drvtest-cutover-')
 
 function makeSnapshot(
   driverId: 'cc' | 'codex',
@@ -144,6 +154,7 @@ before(async () => {
 })
 
 after(async () => {
+  rmSync(cutoverSnapshotDir, { recursive: true, force: true })
   await closePool()
 })
 
@@ -184,29 +195,49 @@ test('Group 1: applyRemoteNodeProbeResult isolates v4 profiles and countEligible
     [ccV4Id, CC_UPSTREAM, CC_CANONICAL, codexV4Id, CODEX_UPSTREAM, CODEX_CANONICAL],
   )
 
-  // Convert both to ready v4 profiles via record + claim + complete
+  // Convert both to ready v4 profiles via P0-1 cutover -> claim -> completeProductionDriverVerificationRun
   for (const [profileId, driverId, fp] of [
     [ccV4Id, 'cc', ccFp],
     [codexV4Id, 'codex', codexFp],
   ] as const) {
+    const reg = loadRemoteDriverRegistry().get(driverId)!
     const snap = makeSnapshot(driverId, fp)
-    const rec = await recordProductionDriverProbeSnapshot(pool, {
-      profileId,
-      snapshot: snap,
+    const targetFp = computeProbeFingerprintTs(snap, {
+      driverDigest: reg.driverDigest,
+      coreDigest: reg.coreDigest,
       policySha256: POLICY_SHA,
-      suiteDigest,
     })
-    assert.ok(rec.verificationRunId)
+    const cut = await convertProfileToDriverV4(pool, {
+      profileId,
+      driverId,
+      targetFingerprint: targetFp,
+      suiteDigest,
+      policySha256: POLICY_SHA,
+      probeSnapshot: snap,
+      snapshotDir: cutoverSnapshotDir,
+    })
+    assert.equal(cut.executionReady, false)
+    assert.ok(cut.verificationRunId)
     const claimed = await claimDriverVerificationRun(pool, {
       leaseOwner: 'g1-owner',
       profileId,
     })
     assert.ok(claimed)
+    assert.equal(claimed.id, cut.verificationRunId)
     const done = await completeProductionDriverVerificationRun(pool, {
       runId: claimed.id,
       leaseOwner: 'g1-owner',
       outcome: 'passed',
       evidenceDigest: EVIDENCE_SHA,
+      evidenceMetadata: {
+        runId: claimed.id,
+        profileId,
+        driverId: reg.driverId,
+        engineId: reg.engineId,
+        targetFingerprint: claimed.targetFingerprint,
+        readyGeneration: claimed.readyGeneration,
+        suiteDigest,
+      },
     })
     assert.equal(done.executionReadyRestored, true)
   }
@@ -350,7 +381,7 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
 
   const snap = makeSnapshot('cc', ccFp)
 
-  // Production wrapper rejects digest/registry overrides
+  // Production wrapper rejects digest/registry overrides, missing suiteDigest, and un-cutover driver_id=NULL
   await assert.rejects(
     () =>
       recordProductionDriverProbeSnapshot(pool, {
@@ -362,20 +393,61 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
       } as any),
     /REMOTE_PRODUCTION_DIGEST_OVERRIDE_FORBIDDEN/,
   )
+  await assert.rejects(
+    () =>
+      recordProductionDriverProbeSnapshot(pool, {
+        profileId,
+        snapshot: snap,
+        policySha256: POLICY_SHA,
+      }),
+    /REMOTE_SUITE_DIGEST_REQUIRED/,
+  )
+  await assert.rejects(
+    () =>
+      recordProductionDriverProbeSnapshot(pool, {
+        profileId,
+        snapshot: snap,
+        policySha256: POLICY_SHA,
+        suiteDigest,
+      }),
+    /REMOTE_INITIAL_CONVERSION_REQUIRES_CUTOVER/,
+  )
 
-  const rec = await recordProductionDriverProbeSnapshot(pool, {
-    profileId,
-    snapshot: snap,
+  const initialFp = computeProbeFingerprintTs(snap, {
+    driverDigest: reg.driverDigest,
+    coreDigest: reg.coreDigest,
     policySha256: POLICY_SHA,
-    suiteDigest,
   })
-  assert.ok(rec.verificationRunId)
+  const cutG2 = await convertProfileToDriverV4(pool, {
+    profileId,
+    driverId: 'cc',
+    targetFingerprint: initialFp,
+    suiteDigest,
+    policySha256: POLICY_SHA,
+    probeSnapshot: snap,
+    snapshotDir: cutoverSnapshotDir,
+  })
+  assert.equal(cutG2.executionReady, false)
+
+  // Driver mismatch refused after cutover
+  await assert.rejects(
+    () =>
+      recordProductionDriverProbeSnapshot(pool, {
+        profileId,
+        snapshot: makeSnapshot('codex', ccFp),
+        policySha256: POLICY_SHA,
+        suiteDigest,
+      }),
+    /REMOTE_PROFILE_DRIVER_MISMATCH/,
+  )
+
   const claimed = await claimDriverVerificationRun(pool, {
     leaseOwner: 'g2-worker',
     profileId,
     leaseMs: 120_000,
   })
   assert.ok(claimed)
+  assert.equal(claimed.id, cutG2.verificationRunId)
 
   // Sub-lane key & prefix helpers
   assert.ok(REMOTE_DRIVER_VERIFICATION_CASE_LANES.includes('g1'))
@@ -458,6 +530,60 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
     /REMOTE_SESSION_KEY_RESERVED/,
   )
 
+  // Profile engine / driver_id mismatch on verification placement ([P1-C]) & production probe ([P1-A])
+  await pool.query("UPDATE remote_agent_profiles SET engine = 'codex' WHERE id = $1", [profileId])
+  try {
+    await assert.rejects(
+      () =>
+        recordProductionDriverProbeSnapshot(pool, {
+          profileId,
+          snapshot: snap,
+          policySha256: POLICY_SHA,
+          suiteDigest,
+        }),
+      /REMOTE_PROFILE_ENGINE_DRIVER_MISMATCH/,
+    )
+    await assert.rejects(
+      () =>
+        placeRemoteDriverLane(
+          {
+            uid: fx.uid,
+            containerDbId: fx.containerDbId,
+            dockerId: fx.dockerId,
+            canonicalModel: canonicalForTest,
+            driverId: 'cc',
+            verificationRun: { runId: claimed.id, leaseOwner: 'g2-worker', caseLane: 'g1' },
+          },
+          { pool },
+        ),
+      /REMOTE_VERIFICATION_ENGINE_MISMATCH/,
+    )
+  } finally {
+    await pool.query("UPDATE remote_agent_profiles SET engine = 'cc' WHERE id = $1", [profileId])
+  }
+  await pool.query("UPDATE remote_agent_profiles SET driver_id = 'codex' WHERE id = $1", [
+    profileId,
+  ])
+  try {
+    await assert.rejects(
+      () =>
+        placeRemoteDriverLane(
+          {
+            uid: fx.uid,
+            containerDbId: fx.containerDbId,
+            dockerId: fx.dockerId,
+            canonicalModel: canonicalForTest,
+            driverId: 'cc',
+            verificationRun: { runId: claimed.id, leaseOwner: 'g2-worker', caseLane: 'g1' },
+          },
+          { pool },
+        ),
+      /REMOTE_VERIFICATION_DRIVER_MISMATCH/,
+    )
+  } finally {
+    await pool.query("UPDATE remote_agent_profiles SET driver_id = 'cc' WHERE id = $1", [profileId])
+  }
+
   // Engine mismatch rejected on verification placement
   await assert.rejects(
     () =>
@@ -525,6 +651,28 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
   assert.equal(recSpec1.recovery_spec.verificationRunId, claimed.id)
   assert.equal(recSpec1.recovery_spec.verificationCaseLane, 'g1')
 
+  // Passing without evidenceMetadata rejected by production wrapper ([P1-A])
+  await assert.rejects(
+    () =>
+      completeProductionDriverVerificationRun(pool, {
+        runId: claimed.id,
+        leaseOwner: 'g2-worker',
+        outcome: 'passed',
+        evidenceDigest: EVIDENCE_SHA,
+      }),
+    /REMOTE_EVIDENCE_METADATA_REQUIRED/,
+  )
+
+  const g2Meta = (run: typeof claimed) => ({
+    runId: run.id,
+    profileId,
+    driverId: 'cc',
+    engineId: reg.engineId,
+    targetFingerprint: run.targetFingerprint,
+    readyGeneration: run.readyGeneration,
+    suiteDigest,
+  })
+
   // Unreleased caseLane binding blocks completion even without profile_id filter
   await assert.rejects(
     () =>
@@ -533,6 +681,7 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
         leaseOwner: 'wrong-owner',
         outcome: 'passed',
         evidenceDigest: EVIDENCE_SHA,
+        evidenceMetadata: g2Meta(claimed),
       }),
     /REMOTE_VERIFICATION_LEASE_LOST/,
   )
@@ -541,6 +690,7 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
     leaseOwner: 'g2-worker',
     outcome: 'passed',
     evidenceDigest: EVIDENCE_SHA,
+    evidenceMetadata: g2Meta(claimed),
   })
   assert.equal(blockedBinding.state, 'aborted')
   assert.equal(blockedBinding.rejectReason, 'VERIFICATION_TEST_BINDING_NOT_RELEASED')
@@ -614,20 +764,33 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
     /REMOTE_OPERATION_BILLING_PENDING/,
   )
 
+  // Also insert an inflight journal row using hyphen separator (`rdv-${runId}-...`) to test both prefix patterns ([P1-B])
+  const reqId2Hyphen = `${REMOTE_DRIVER_VERIFICATION_REQUEST_PREFIX}${claimed2.id}-g4mid-2`
+  await pool.query(
+    `INSERT INTO request_finalize_journal (request_id, user_id, state, ctx, precheck_credits)
+     VALUES ($1, $2, 'inflight', '{}'::jsonb, 50)`,
+    [reqId2Hyphen, fx.uid],
+  )
+
   // Even if all bindings are released, inflight journal row blocks completion with VERIFICATION_FINANCE_NOT_SETTLED
   const blockedFinance = await completeProductionDriverVerificationRun(pool, {
     runId: claimed2.id,
     leaseOwner: 'g2-worker-2',
     outcome: 'passed',
     evidenceDigest: EVIDENCE_SHA,
+    evidenceMetadata: g2Meta(claimed2),
   })
   assert.equal(blockedFinance.state, 'aborted')
   assert.equal(blockedFinance.rejectReason, 'VERIFICATION_FINANCE_NOT_SETTLED')
 
-  // Settle journal -> now test evidenceMetadata mismatch & valid completion
+  // Settling ONLY colon row leaves hyphen row pending -> verify completeProductionDriverVerificationRun STILL aborts until BOTH settle!
   await pool.query(
     `UPDATE request_finalize_journal SET state = 'committed' WHERE request_id = $1`,
     [reqId2],
+  )
+  await pool.query(
+    `UPDATE request_finalize_journal SET state = 'committed' WHERE request_id = $1`,
+    [reqId2Hyphen],
   )
 
   const rec3 = await recordProductionDriverProbeSnapshot(pool, {
@@ -702,14 +865,14 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
     /REMOTE_PRODUCTION_DIGEST_OVERRIDE_FORBIDDEN/,
   )
 
-  // Mismatched evidenceMetadata aborts (create one more run first or check pass then check mismatch on run3)
+  // Mismatched evidenceMetadata aborts
   const mismatchMeta = await completeProductionDriverVerificationRun(pool, {
     runId: claimed3.id,
     leaseOwner: 'g2-worker-3',
     outcome: 'passed',
     evidenceDigest: EVIDENCE_SHA,
     evidenceMetadata: {
-      runId: claimed3.id,
+      ...g2Meta(claimed3),
       suiteDigest: '9'.repeat(64),
       caseLanes: ['g4disc'],
     },
@@ -781,17 +944,86 @@ test('Group 2: sub-lanes, W1 sticky resume, financial/metadata gates, production
       }),
     /REMOTE_VERIFICATION_LEASE_LOST/,
   )
-  const reaped = await reapExpiredDriverVerificationRuns(pool, { maxAttempts: 1 })
+  // Lease renewal hard total duration ceiling ([P1-B]): exceed 45m -> renewal refused even if lease_until > NOW()
+  await pool.query(
+    `UPDATE remote_driver_verification_runs
+        SET created_at = NOW() - INTERVAL '46 minutes',
+            lease_until = NOW() + INTERVAL '30 seconds'
+      WHERE id = $1`,
+    [claimed5.id],
+  )
+  const ceilingRenew = await renewDriverVerificationLease(pool, {
+    runId: claimed5.id,
+    leaseOwner: 'g2-worker-5',
+    leaseMs: 90_000,
+  })
+  assert.equal(ceilingRenew.renewed, false)
+  assert.equal(ceilingRenew.leaseUntil, null)
+
+  // Now expire the lease AND keep a verification binding active: reaper NEVER requeues, fails directly with VERIFICATION_LEASE_EXPIRED_UNKNOWN, keeps binding untouched ([P1-B])
+  await pool.query(
+    `UPDATE remote_driver_verification_runs SET lease_until = NOW() - INTERVAL '5 seconds' WHERE id = $1`,
+    [claimed5.id],
+  )
+  const activeBindingBeforeReap = await placeRemoteDriverLane(
+    {
+      uid: fx.uid,
+      containerDbId: fx.containerDbId,
+      dockerId: fx.dockerId,
+      canonicalModel: canonicalForTest,
+      driverId: 'cc',
+      verificationRun: { runId: claimed5.id, leaseOwner: 'g2-worker-5', caseLane: 'g2' },
+    },
+    { pool },
+  ).catch(() => null)
+  // Place before expiring lease is required because placement checks lease_until > NOW(); verify failure & reaper with fresh run or re-extend briefly
+  assert.equal(activeBindingBeforeReap, null)
+
+  await pool.query(
+    `UPDATE remote_driver_verification_runs SET lease_until = NOW() + INTERVAL '30 seconds' WHERE id = $1`,
+    [claimed5.id],
+  )
+  const unreleasedVerifBinding = await placeRemoteDriverLane(
+    {
+      uid: fx.uid,
+      containerDbId: fx.containerDbId,
+      dockerId: fx.dockerId,
+      canonicalModel: canonicalForTest,
+      driverId: 'cc',
+      verificationRun: { runId: claimed5.id, leaseOwner: 'g2-worker-5', caseLane: 'g2' },
+    },
+    { pool },
+  )
+  await pool.query(
+    `UPDATE remote_driver_verification_runs SET lease_until = NOW() - INTERVAL '5 seconds' WHERE id = $1`,
+    [claimed5.id],
+  )
+
+  const reaped = await reapExpiredDriverVerificationRuns(pool)
   assert.ok(reaped.failedIds.includes(claimed5.id))
+  assert.equal('requeuedIds' in reaped, false)
   const reapedRow = (
     await pool.query(
-      'SELECT state, error_code, alert_emitted FROM remote_driver_verification_runs WHERE id = $1',
+      'SELECT state, error_code, alert_emitted, completed_at FROM remote_driver_verification_runs WHERE id = $1',
       [claimed5.id],
     )
   ).rows[0]!
   assert.equal(reapedRow.state, 'failed')
-  assert.equal(reapedRow.error_code, 'REMOTE_VERIFICATION_LEASE_EXPIRED')
+  assert.equal(reapedRow.error_code, 'VERIFICATION_LEASE_EXPIRED_UNKNOWN')
   assert.equal(reapedRow.alert_emitted, true)
+  assert.ok(reapedRow.completed_at !== null)
+  const bindingAfterReap = (
+    await pool.query('SELECT state FROM remote_agent_bindings WHERE operation_id = $1', [
+      unreleasedVerifBinding.binding.operationId,
+    ])
+  ).rows[0]!
+  assert.notEqual(bindingAfterReap.state, 'released')
+  await recordRemoteDriverLaneState(
+    unreleasedVerifBinding.binding.operationId,
+    unreleasedVerifBinding.generation,
+    'released',
+    pool,
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -808,6 +1040,21 @@ test('Group 3: liveProbe strictly refuses dryRun=false and runs read-only dryRun
     assert.equal(
       resolveRemoteDriverV4ExecKeyPath(keyId, 'cc', keyDir),
       join(keyDir, `${keyId}-exec`, 'v4_cc_id_ed25519'),
+    )
+    // Shared rpoolv4-exec fallback when per-node key is absent, and per-node precedence when present ([P0-A2])
+    const sharedDir = remoteNodeExecKeyDir('rpoolv4', keyDir)
+    mkdirSync(sharedDir, { recursive: true })
+    writeFileSync(join(sharedDir, 'v4_cc_id_ed25519'), 'shared-key')
+    assert.equal(
+      resolveRemoteDriverV4ExecKeyPath(keyId, 'cc', keyDir),
+      join(sharedDir, 'v4_cc_id_ed25519'),
+    )
+    const perNodeDir = remoteNodeExecKeyDir(keyId, keyDir)
+    mkdirSync(perNodeDir, { recursive: true })
+    writeFileSync(join(perNodeDir, 'v4_cc_id_ed25519'), 'per-node-key')
+    assert.equal(
+      resolveRemoteDriverV4ExecKeyPath(keyId, 'cc', keyDir),
+      join(perNodeDir, 'v4_cc_id_ed25519'),
     )
 
     const fp = createHash('sha256').update(`g3-cc-${fx.nodeId}`).digest('hex')
@@ -837,8 +1084,17 @@ test('Group 3: liveProbe strictly refuses dryRun=false and runs read-only dryRun
       bridgeSha256: loadBoxBridgeMod().sha256,
     }
     const reg = loadRemoteDriverRegistry().get('cc')!
+    const realCcPolicySha = remoteCanonicalSha256({
+      driverId: reg.driverId,
+      driverVersion: reg.driverVersion,
+      toolsFlag: '',
+      strictMcp: true,
+      settingSources: '',
+      disableSlashCommands: true,
+    })
     let sawKeyPath = ''
     let sawProbeRoot = ''
+    let sawProbeContext: Record<string, unknown> | undefined
     const res = await probeRemoteDriverProfileLive(
       pool,
       {
@@ -851,8 +1107,8 @@ test('Group 3: liveProbe strictly refuses dryRun=false and runs read-only dryRun
           sawKeyPath = sshTarget.keyPath
           sawProbeRoot = spec.probeRoot
           return {
-            async probe() {
-              const policySha = createHash('sha256').update('probe-placeholder').digest('hex')
+            async probe(context: Record<string, unknown>) {
+              sawProbeContext = context
               return {
                 snapshot: snap,
                 driverDigest: reg.driverDigest,
@@ -860,7 +1116,7 @@ test('Group 3: liveProbe strictly refuses dryRun=false and runs read-only dryRun
                 probeFingerprint: computeProbeFingerprintTs(snap, {
                   driverDigest: reg.driverDigest,
                   coreDigest: reg.coreDigest,
-                  policySha256: policySha,
+                  policySha256: realCcPolicySha,
                 }),
               }
             },
@@ -872,10 +1128,87 @@ test('Group 3: liveProbe strictly refuses dryRun=false and runs read-only dryRun
     assert.equal(res.dryRun, true)
     assert.equal(res.profileId, profId)
     assert.equal(res.driverId, 'cc')
-    assert.match(res.policySha256, /^[a-f0-9]{64}$/)
+    assert.equal(res.policySha256, realCcPolicySha)
     assert.match(res.probeFingerprint, /^[a-f0-9]{64}$/)
     assert.equal(sawKeyPath, resolveRemoteDriverV4ExecKeyPath(keyId, 'cc', keyDir))
-    assert.match(sawProbeRoot, /^\/home\/agent\/oc-remoteprobe-cc-/)
+    assert.match(sawProbeRoot, /^\/home\/agent\/oc-remotedrv-probe-cc-[a-f0-9]{16}$/)
+    assert.equal(sawProbeContext?.cliPath, '/home/agent/.oc-remote-cc/claude-2.1.316')
+    assert.equal(sawProbeContext?.accountHome, '/home/agent')
+    assert.equal(sawProbeContext?.profileName, 'default')
+    assert.equal(sawProbeContext?.bridgeSha256, loadBoxBridgeMod().sha256)
+    assert.equal('bridgeFiles' in (sawProbeContext ?? {}), false)
+
+    // Mismatched probed.probeFingerprint fails closed ([P0-A4])
+    await assert.rejects(
+      () =>
+        probeRemoteDriverProfileLive(
+          pool,
+          { profileId: profId, driverId: 'cc', keyDir },
+          {
+            probeHostFactory: () => ({
+              async probe() {
+                return {
+                  snapshot: snap,
+                  driverDigest: reg.driverDigest,
+                  coreDigest: reg.coreDigest,
+                  probeFingerprint: 'f'.repeat(64),
+                }
+              },
+            }),
+          },
+        ),
+      /REMOTE_PROBE_FINGERPRINT_MISMATCH/,
+    )
+
+    // Codex default probe context verification ([P0-A3])
+    const codexFp = createHash('sha256').update(`g3-codex-${fx.nodeId}`).digest('hex')
+    const codexProfId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO remote_agent_profiles
+           (node_id, engine, profile_name, account_fingerprint, runner_mode, status, execution_ready, ready_generation)
+         VALUES ($1, 'codex', 'codex-p1', $2, 'app-server', 'active', FALSE, 1)
+         RETURNING id::text AS id`,
+        [fx.nodeId, codexFp],
+      )
+    ).rows[0]!.id
+    const codexSnap = makeSnapshot('codex', codexFp)
+    const codexReg = loadRemoteDriverRegistry().get('codex')!
+    let sawCodexCtx: Record<string, unknown> | undefined
+    let sawCodexProbeRoot = ''
+    const workerSample = await probeRemoteDriverProfileLive(
+      pool,
+      { profileId: codexProfId, driverId: 'codex', keyDir },
+      {
+        probeHostFactory: (_sshTarget, spec) => {
+          sawCodexProbeRoot = spec.probeRoot
+          return {
+            async probe(context: Record<string, unknown>) {
+              sawCodexCtx = context
+              return {
+                snapshot: codexSnap,
+                driverDigest: codexReg.driverDigest,
+                coreDigest: codexReg.coreDigest,
+                probeFingerprint: '0'.repeat(64),
+              }
+            },
+          }
+        },
+      },
+    ).catch((err: Error) => err)
+    assert.ok(
+      workerSample instanceof Error &&
+        /REMOTE_PROBE_FINGERPRINT_MISMATCH/.test(workerSample.message),
+    )
+    assert.match(sawCodexProbeRoot, /^\/home\/agent\/oc-remotedrv-probe-codex-[a-f0-9]{16}$/)
+    assert.equal(sawCodexCtx?.cliPath, '/usr/bin/codex')
+    assert.equal(
+      sawCodexCtx?.nativePath,
+      '/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex',
+    )
+    assert.equal(
+      sawCodexCtx?.codexHome,
+      '/home/agent/.oc-remote-codex/profiles/codex-p1/codex-home',
+    )
 
     // DB row MUST remain completely untouched
     const dbRow = (
@@ -907,15 +1240,22 @@ test('Group 4: P0-1 atomic CAS cutover and rollback preserve monotonic ready_gen
     backendKind: 'codex-app-server-v1',
     gatewayRevision: 'codex-remote-adapter-v1',
   }
+  const legacyModDigest = '8'.repeat(64)
   const profId = (
     await pool.query<{ id: string }>(
       `INSERT INTO remote_agent_profiles
-         (node_id, engine, profile_name, account_fingerprint, runner_mode, status,
+         (node_id, engine, profile_name, account_fingerprint, runner_mode, mod_digest, last_probe_ok_at, status,
           execution_ready, auth_epoch, probe_snapshot, execution_manifest, discovered_models, ready_generation)
-       VALUES ($1, 'codex', 'default', $2, 'app-server', 'active',
+       VALUES ($1, 'codex', 'default', $2, 'app-server', $5, '2026-11-10T01:02:03.000Z'::timestamptz, 'active',
                TRUE, 'legacy-epoch', $3::jsonb, $4::jsonb, '["gpt-6-luna"]'::jsonb, 1)
        RETURNING id::text AS id`,
-      [fx.nodeId, fp, JSON.stringify(legacySnapshot), JSON.stringify(legacyManifest)],
+      [
+        fx.nodeId,
+        fp,
+        JSON.stringify(legacySnapshot),
+        JSON.stringify(legacyManifest),
+        legacyModDigest,
+      ],
     )
   ).rows[0]!.id
   await pool.query(
@@ -946,10 +1286,10 @@ test('Group 4: P0-1 atomic CAS cutover and rollback preserve monotonic ready_gen
         profileId: profId,
         driverId: 'cc',
         targetFingerprint: ccTargetFp,
-        evidenceDigest: EVIDENCE_SHA,
         suiteDigest,
         policySha256: POLICY_SHA,
         probeSnapshot: ccSnap,
+        snapshotDir: cutoverSnapshotDir,
       }),
     /REMOTE_CUTOVER_ENGINE_MISMATCH/,
   )
@@ -978,10 +1318,10 @@ test('Group 4: P0-1 atomic CAS cutover and rollback preserve monotonic ready_gen
         profileId: profId,
         driverId: 'codex',
         targetFingerprint: targetFp,
-        evidenceDigest: EVIDENCE_SHA,
         suiteDigest,
         policySha256: POLICY_SHA,
         probeSnapshot: snap,
+        snapshotDir: cutoverSnapshotDir,
       }),
     /REMOTE_CUTOVER_PROFILE_BUSY/,
   )
@@ -993,14 +1333,57 @@ test('Group 4: P0-1 atomic CAS cutover and rollback preserve monotonic ready_gen
     profileId: profId,
     driverId: 'codex',
     targetFingerprint: targetFp,
-    evidenceDigest: EVIDENCE_SHA,
     suiteDigest,
     policySha256: POLICY_SHA,
     probeSnapshot: snap,
     authEpoch: 'v4-epoch-1',
+    snapshotDir: cutoverSnapshotDir,
   })
   assert.equal(cut.readyGeneration, '2')
-  assert.equal(cut.verifiedFingerprint, targetFp)
+  assert.equal(cut.targetFingerprint, targetFp)
+  assert.equal(cut.executionReady, false)
+  assert.ok(cut.verificationRunId)
+  assert.equal(cut.legacyBackup.runnerMode, 'app-server')
+  assert.equal(cut.legacyBackup.modDigest, legacyModDigest)
+  assert.equal(cut.legacyBackup.preCutoverReadyGeneration, '1')
+  assert.ok(cut.cutoverPreSnapshotUri.startsWith(cutoverSnapshotDir))
+  const snapFileStat = lstatSync(cut.cutoverPreSnapshotUri)
+  assert.equal(snapFileStat.mode & 0o777, 0o600)
+
+  const postCutRow = (
+    await pool.query(
+      'SELECT driver_id, engine_id, execution_ready, verified_fingerprint, execution_manifest FROM remote_agent_profiles WHERE id = $1',
+      [profId],
+    )
+  ).rows[0]!
+  assert.equal(postCutRow.driver_id, 'codex')
+  assert.equal(postCutRow.execution_ready, false)
+  assert.equal(postCutRow.verified_fingerprint, null)
+  assert.equal(postCutRow.execution_manifest.cutoverPreSnapshotUri, cut.cutoverPreSnapshotUri)
+  assert.equal(postCutRow.execution_manifest.cutoverPreSnapshotSha256, cut.cutoverPreSnapshotSha256)
+
+  // Claim & complete verification run -> flips execution_ready = TRUE while preserving cutover snapshot metadata
+  const cutClaim = await claimDriverVerificationRun(pool, {
+    leaseOwner: 'g4-owner',
+    profileId: profId,
+  })
+  assert.ok(cutClaim && cutClaim.id === cut.verificationRunId)
+  const cutDone = await completeProductionDriverVerificationRun(pool, {
+    runId: cutClaim.id,
+    leaseOwner: 'g4-owner',
+    outcome: 'passed',
+    evidenceDigest: EVIDENCE_SHA,
+    evidenceMetadata: {
+      runId: cutClaim.id,
+      profileId: profId,
+      driverId: 'codex',
+      engineId: reg.engineId,
+      targetFingerprint: targetFp,
+      readyGeneration: cutClaim.readyGeneration,
+      suiteDigest,
+    },
+  })
+  assert.equal(cutDone.executionReadyRestored, true)
 
   // Block revert while a v4 binding is unreleased
   const v4OpId = randomUUID()
@@ -1044,20 +1427,36 @@ test('Group 4: P0-1 atomic CAS cutover and rollback preserve monotonic ready_gen
     /REMOTE_REVERT_CAS_GENERATION_MISMATCH/,
   )
 
+  // Corrupting on-disk snapshot file rejects revert fail-closed unless emergency fallback flag is set
+  const origSnapBytes = readFileSync(cut.cutoverPreSnapshotUri)
+  writeFileSync(cut.cutoverPreSnapshotUri, '{"corrupt":true}\n')
+  await assert.rejects(
+    () =>
+      revertDriverV4ProfileToLegacy(pool, {
+        profileId: profId,
+        expectedMinReadyGeneration: '2',
+      }),
+    /REMOTE_REVERT_SNAPSHOT_CORRUPT/,
+  )
+  writeFileSync(cut.cutoverPreSnapshotUri, origSnapBytes)
+
+  // Verified on-disk snapshot revert (without supplying legacyBackup!) restores all legacy columns and bumps ready_generation
   const rev = await revertDriverV4ProfileToLegacy(pool, {
     profileId: profId,
     expectedMinReadyGeneration: '2',
-    legacyBackup: cut.legacyBackup,
   })
   assert.equal(rev.readyGeneration, '3') // Monotonic increase: never rolled back to 1
   const revertedRow = (
     await pool.query(
-      'SELECT driver_id, engine_id, verified_fingerprint, execution_ready, auth_epoch, probe_snapshot, execution_manifest, ready_generation FROM remote_agent_profiles WHERE id = $1',
+      'SELECT driver_id, engine_id, runner_mode, mod_digest, last_probe_ok_at, verified_fingerprint, execution_ready, auth_epoch, probe_snapshot, execution_manifest, ready_generation FROM remote_agent_profiles WHERE id = $1',
       [profId],
     )
   ).rows[0]!
   assert.equal(revertedRow.driver_id, null)
   assert.equal(revertedRow.engine_id, null)
+  assert.equal(revertedRow.runner_mode, 'app-server')
+  assert.equal(revertedRow.mod_digest, legacyModDigest)
+  assert.equal(new Date(revertedRow.last_probe_ok_at).toISOString(), '2026-11-10T01:02:03.000Z')
   assert.equal(revertedRow.verified_fingerprint, null)
   assert.equal(revertedRow.execution_ready, true)
   assert.equal(revertedRow.auth_epoch, 'legacy-epoch')

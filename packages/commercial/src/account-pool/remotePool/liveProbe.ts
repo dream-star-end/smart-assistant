@@ -112,7 +112,7 @@ export async function probeRemoteDriverProfileLive(
   const sshUser = String(row.ssh_user)
   const safeDriverSlug = reg.driverId.replaceAll('_', '-')
   const home = sshUser === 'root' ? '/root' : `/home/${sshUser}`
-  const probeRoot = `${home}/oc-remoteprobe-${safeDriverSlug.slice(0, 12)}-${randomUUID().replace(/-/g, '').slice(0, 16)}`
+  const probeRoot = `${home}/oc-remotedrv-probe-${safeDriverSlug.slice(0, 12)}-${randomUUID().replace(/-/g, '').slice(0, 16)}`
   const controllerPath = `/opt/openclaude/remote-driver/${reg.controllerSha256}/core/controller.py`
 
   const firstOfferModel = (
@@ -152,13 +152,32 @@ export async function probeRemoteDriverProfileLive(
     execManifest.driverContext && typeof execManifest.driverContext === 'object'
       ? (execManifest.driverContext as Record<string, unknown>)
       : {}
+  const profileName = String(row.profile_name)
+  const boxBridgeSha256 = reg.driverId === 'cc' ? loadBoxBridgeMod().sha256 : undefined
+  const defaultDriverProbeCtx: Record<string, unknown> =
+    reg.driverId === 'cc'
+      ? {
+          cliPath: `${home}/.oc-remote-cc/claude-2.1.316`,
+          accountHome: home,
+          profileName,
+          bridgeSha256: boxBridgeSha256,
+        }
+      : reg.driverId === 'codex'
+        ? {
+            cliPath: '/usr/bin/codex',
+            nativePath:
+              '/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex',
+            codexHome: `${home}/.oc-remote-codex/profiles/${profileName}/codex-home`,
+          }
+        : {}
   const bridgeFiles = buildBridgeFilesForDriver(reg.driverId)
-  const probeContext: Record<string, unknown> = {
+  const mergedWithoutBridgeFiles: Record<string, unknown> = {
+    ...defaultDriverProbeCtx,
     mcpClientPath: `/opt/openclaude/remote-driver/${reg.controllerSha256}/core/mcp_client.py`,
-    ...(bridgeFiles ? { bridgeFiles } : {}),
     ...manifestDriverCtx,
     ...(input.driverContext ?? {}),
   }
+  const { bridgeFiles: _strippedBridgeFiles, ...probeContext } = mergedWithoutBridgeFiles
 
   const probeHost = options.probeHostFactory
     ? options.probeHostFactory(sshTarget, probeSpec)
@@ -186,6 +205,7 @@ export async function probeRemoteDriverProfileLive(
     const sampleModel = probed.snapshot.models[0]!.upstreamModelId
     const policySampleCtx: Record<string, unknown> = {
       ...probeContext,
+      ...(bridgeFiles ? { bridgeFiles } : {}),
       cliPath:
         typeof probeContext.cliPath === 'string'
           ? probeContext.cliPath
@@ -213,6 +233,7 @@ export async function probeRemoteDriverProfileLive(
       coreDigest: reg.coreDigest,
       policySha256,
     })
+    need(probeFingerprint === probed.probeFingerprint, 'REMOTE_PROBE_FINGERPRINT_MISMATCH')
 
     return {
       dryRun: true,

@@ -14,6 +14,7 @@
  *   cutover (`AC-5`) and seamlessly upgrades sticky v1/v3 bindings to v4 on the next generation.
  */
 import { randomBytes, randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { RemoteCcTarget } from '@openclaude/gateway/cc5-container-runtime'
 import type {
@@ -73,7 +74,13 @@ export function resolveRemoteDriverV4ExecKeyPath(
 ): string {
   need(typeof keyId === 'string' && keyId.trim().length > 0, 'REMOTE_KEY_ID_INVALID')
   need(/^[a-z0-9][a-z0-9_-]{0,31}$/.test(driverId), 'REMOTE_DRIVER_ID_INVALID')
-  return join(remoteNodeExecKeyDir(keyId, baseKeyDir), `v4_${driverId}_id_ed25519`)
+  const fileName = `v4_${driverId}_id_ed25519`
+  const perNodePath = join(remoteNodeExecKeyDir(keyId, baseKeyDir), fileName)
+  const sharedV4Path = join(remoteNodeExecKeyDir('rpoolv4', baseKeyDir), fileName)
+  if (!existsSync(perNodePath) && existsSync(sharedV4Path)) {
+    return sharedV4Path
+  }
+  return perNodePath
 }
 
 export interface PlaceRemoteDriverLaneInput {
@@ -272,6 +279,11 @@ export async function placeRemoteDriverLane(
           )
         ).rows[0]
         need(cand !== undefined, 'REMOTE_VERIFICATION_PROFILE_UNAVAILABLE')
+        need(String(cand.engine) === legacyProfileEngine, 'REMOTE_VERIFICATION_ENGINE_MISMATCH')
+        need(
+          cand.driver_id === null || String(cand.driver_id) === reg.driverId,
+          'REMOTE_VERIFICATION_DRIVER_MISMATCH',
+        )
 
         const used = Number(
           (
