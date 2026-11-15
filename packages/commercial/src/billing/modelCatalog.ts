@@ -28,7 +28,19 @@
  */
 
 import { createHash } from "node:crypto";
-import { isModelAvailable } from "./modelAvailability.js";
+import { isModelAvailable, isSelfhostLocalCcDisabled } from "./modelAvailability.js";
+
+function isSelfhostRetiredLocalCcEntry(entry: ModelCatalogEntry): boolean {
+  return (
+    isSelfhostLocalCcDisabled() &&
+    entry.providerId === "anthropic" &&
+    entry.placement !== "remote_pool" &&
+    !entry.modelId.startsWith("box-") &&
+    !entry.modelId.startsWith("cc5-") &&
+    !entry.modelId.endsWith("-remote") &&
+    !entry.modelId.endsWith("-go")
+  );
+}
 import { Client } from "pg";
 import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
@@ -436,7 +448,9 @@ export class ModelCatalogSnapshot {
     const byId = new Map<number, ModelCatalogEntry>();
     for (const e of args.entries) {
       byId.set(e.entryId, e);
-      if (e.state === "active" && isModelAvailable(e.modelId)) active.set(e.modelId, e);
+      if (e.state === "active" && isModelAvailable(e.modelId) && !isSelfhostRetiredLocalCcEntry(e)) {
+        active.set(e.modelId, e);
+      }
     }
     this.activeByModel = active;
     this.byEntryId = byId;

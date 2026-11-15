@@ -2,14 +2,29 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { FlavorIdentity } from "../flavor/assertFlavor.js";
 
-/** OCV5-713: one versioned policy restores both user availability and C3. */
+/**
+ * Local Anthropic Claude Code models retired on selfhost (OCV5-754).
+ * Remote / Go / Box Claude (`box-claude-*`, `*-remote`, `*-go`, `antigravity-claude-*`,
+ * `cc5-remote-*`) stay enabled.
+ */
+export function isLocalAnthropicClaudeModelId(modelId: string): boolean {
+  return modelId.startsWith("claude-") && !modelId.endsWith("-remote") && !modelId.endsWith("-go");
+}
+
+/** True when the current commercial process is pinned to selfhost and local CC is disabled. */
+export function isSelfhostLocalCcDisabled(): boolean {
+  return deploymentIdentity?.status === "ok" && deploymentIdentity.flavor === "selfhost";
+}
+
+/** OCV5-713 / OCV5-754: one versioned policy governs user availability and catalog visibility. */
 export function modelAvailableForIdentity(
   identity: FlavorIdentity | undefined,
   grokEnabled: boolean,
   modelId: string,
 ): boolean {
-  return identity?.status !== "ok" || identity.flavor !== "selfhost" || grokEnabled ||
-    !(modelId === "grok-build" || modelId.startsWith("grok-build-"));
+  if (identity?.status !== "ok" || identity.flavor !== "selfhost") return true;
+  if (isLocalAnthropicClaudeModelId(modelId)) return false;
+  return grokEnabled || !(modelId === "grok-build" || modelId.startsWith("grok-build-"));
 }
 
 let deploymentIdentity: FlavorIdentity | undefined;

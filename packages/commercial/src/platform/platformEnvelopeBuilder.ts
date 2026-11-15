@@ -216,15 +216,10 @@ function detectCcbSystemReminderMessage(msg: unknown): boolean {
 }
 
 /**
- * 用户面时区(OCV5-166)—— **与引擎子进程 TZ 正交,不可互相替代**。
+ * 用户面时区(OCV5-166 / OCV5-754)—— 所有引擎统一读取 `OC_USER_TZ`。
  *
- * 背景:selfhost 的引擎子进程 `TZ=Asia/Tokyo` 是与固定日本出口 IP 对齐的风控一致性
- * 控制(deploy 脚本 `OC_CLAUDE_CODE_TZ` → `OPENCLAUDE_CCB_TZ` → spawn env.TZ,见
- * skill `claude-code-egress-region-consistency`),**刻意**不等于用户真实所在地。
- * 后果是模型 `date` 只能拿到出口时区,要自己 -1h 换算成用户本地时间。
- *
- * 这里给出一个**只读、与出口解耦**的用户面时区:只影响 system-reminder 文本,
- * 不参与任何 spawn env / 代理选路,因此不动上述风控控制。
+ * 这里给出一个**只读、与代理选路解耦**的用户面时区:只影响 system-reminder 文本,
+ * 不参与任何 spawn env / 代理选路。
  */
 const DEFAULT_USER_TZ = "Asia/Shanghai";
 
