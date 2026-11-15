@@ -52,7 +52,6 @@ import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
-import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
