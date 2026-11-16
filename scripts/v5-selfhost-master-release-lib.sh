@@ -1274,19 +1274,26 @@ build_master_release() {
     await_runtime_release_bg
     tsum_note runtimeWaitBeforeBoxSec "$(( $(date +%s) - t0 ))" 2>/dev/null || :
   fi
-  if master_local_gate_any_miss "$full_sha" box-success-recovery box-continuation box-incident-proofs box-longtask master-incident-proofs codex-chatgpt-ws platform-tool-proofs terminal-unproven; then
+  local box_idle_checked=0 gate_db_created=0
+  master_ensure_box_host_idle() {
+    if [[ "$box_idle_checked" == 1 ]]; then return 0; fi
     if ! master_gate_wait_host_idle box-gates; then
       cleanup_master_staging
       die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
     fi
-    if master_local_gate_any_miss "$full_sha" box-success-recovery box-incident-proofs box-longtask master-incident-proofs; then
-      if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
-        cleanup_master_staging
-        die "建本班列车独立测试库失败(live 未改)"
-      fi
+    box_idle_checked=1
+  }
+  master_ensure_gate_db() {
+    if [[ "$gate_db_created" == 1 ]]; then return 0; fi
+    if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
+      cleanup_master_staging
+      die "建本班列车独立测试库失败(live 未改)"
     fi
-  fi
+    gate_db_created=1
+  }
   if ! master_local_gate_has box-success-recovery "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
     mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
     if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
       cleanup_master_staging
@@ -1308,6 +1315,7 @@ build_master_release() {
   fi
   tsum_mark C.box-continuation 2>/dev/null || :
   if ! master_local_gate_has box-continuation "$full_sha"; then
+    master_ensure_box_host_idle
     mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
     if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
       cleanup_master_staging
@@ -1322,6 +1330,8 @@ build_master_release() {
   fi
   tsum_mark C.box-incident-proofs 2>/dev/null || :
   if ! master_local_gate_has box-incident-proofs "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
     mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
     if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
       cleanup_master_staging
@@ -1341,6 +1351,8 @@ build_master_release() {
   fi
   tsum_mark C.box-longtask 2>/dev/null || :
   if ! master_local_gate_has box-longtask "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
     tsum_note gateEvidence.box-longtask local 2>/dev/null || :
     mlog "  Box long-task generations gate @ pinned staging"
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
@@ -1354,6 +1366,8 @@ build_master_release() {
   # OCV5-763: reverse-imported commercial incidents need actual selfhost runners.
   # Existing train-isolated test DB only; no production credentials or model invocation.
   if ! master_local_gate_has master-incident-proofs "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
         REQUIRE_TEST_DB=1 TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
         npx --no-install tsx scripts/check-v5-master-incident-proofs.ts ); then
@@ -1363,6 +1377,7 @@ build_master_release() {
     master_local_gate_record master-incident-proofs "$full_sha"
   fi
   if ! master_local_gate_has codex-chatgpt-ws "$full_sha"; then
+    master_ensure_box_host_idle
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
         npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
       cleanup_master_staging
@@ -1371,6 +1386,7 @@ build_master_release() {
     master_local_gate_record codex-chatgpt-ws "$full_sha"
   fi
   if ! master_local_gate_has platform-tool-proofs "$full_sha"; then
+    master_ensure_box_host_idle
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
         npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
       cleanup_master_staging
@@ -1379,6 +1395,7 @@ build_master_release() {
     master_local_gate_record platform-tool-proofs "$full_sha"
   fi
   if ! master_local_gate_has terminal-unproven "$full_sha"; then
+    master_ensure_box_host_idle
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
         npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
       cleanup_master_staging

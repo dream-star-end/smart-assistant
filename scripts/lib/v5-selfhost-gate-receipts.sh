@@ -48,7 +48,7 @@ master_local_gate_id_for_job() { # <C.* job id> -> manifest gate id
 }
 
 master_local_gate_prepare() { # <pinned staging> <exact sha>
-  local _staging="$1" sha="$2" helper cache_dir plan_file node_ver py_ver stats
+  local _staging="$1" sha="$2" helper cache_dir plan_file node_ver py_ver bun_bin="" bun_ver="" bun_id="" stats
   MASTER_LOCAL_GATE_CACHE_READY=0
   MASTER_LOCAL_GATE_PLAN_FILE=""
   MASTER_LOCAL_GATE_SHA=""
@@ -64,11 +64,17 @@ master_local_gate_prepare() { # <pinned staging> <exact sha>
   git -C "$REPO_ROOT" cat-file -e "${sha}^{commit}" 2>/dev/null || return 0
   node_ver="$(node --version 2>/dev/null)" || return 0
   py_ver="$(python3 --version 2>/dev/null)" || return 0
+  # Match scripts/check-v5-codex-late-stop-proof.sh exact Bun selector: PATH first, then $HOME/.bun/bin/bun.
+  bun_bin="$(command -v bun 2>/dev/null || true)"
+  if [[ -z "$bun_bin" && -n "${HOME:-}" ]]; then bun_bin="$HOME/.bun/bin/bun"; fi
+  if [[ -n "$bun_bin" && -x "$bun_bin" ]] && bun_ver="$("$bun_bin" --version 2>/dev/null)" && [[ -n "$bun_ver" ]]; then
+    bun_id="$(readlink -f -- "$bun_bin" 2>/dev/null || printf '%s' "$bun_bin"):$bun_ver"
+  fi
   cache_dir="${OC_V5_LOCAL_GATE_CACHE_DIR:-/var/lib/openclaude-v5-selfhost/gate-receipts}"
   plan_file="$MASTER_GATE_TMPDIR/local-gate-plan.json"
   if stats="$(PYTHONDONTWRITEBYTECODE=1 python3 "$helper" plan \
       "$cache_dir" "$REPO_ROOT" "$sha" "$plan_file" "$node_ver" "$py_ver" \
-      "${RUNTIME_IMAGE:-}" "${OC_V5_FORCE_LOCAL_GATES:-0}")"; then
+      "${RUNTIME_IMAGE:-}" "$bun_id" "${OC_V5_FORCE_LOCAL_GATES:-0}")"; then
     MASTER_LOCAL_GATE_CACHE_READY=1
     MASTER_LOCAL_GATE_PLAN_FILE="$plan_file"
     MASTER_LOCAL_GATE_SHA="$sha"
@@ -112,23 +118,6 @@ master_gate_receipt_has() { # <gate id> <this build sha>
     return 0
   fi
   tsum_note "gateEvidence.$1" local 2>/dev/null || :
-  return 1
-}
-
-master_local_gate_peek() { # <gate id> <this build sha>; side-effect-free check
-  local gate_id="$1" sha="$2" helper
-  [[ "${MASTER_LOCAL_GATE_CACHE_READY:-0}" == 1 && "${MASTER_LOCAL_GATE_SHA:-}" == "$sha" \
-    && -n "${MASTER_LOCAL_GATE_PLAN_FILE:-}" ]] || return 1
-  helper="$(master_local_gate_helper_path)" || return 1
-  PYTHONDONTWRITEBYTECODE=1 python3 "$helper" peek "$MASTER_LOCAL_GATE_PLAN_FILE" "$sha" "$gate_id" >/dev/null 2>&1
-}
-
-master_local_gate_any_miss() { # <sha> <gate id...>; rc 0 if ANY gate must run locally
-  local sha="$1" gate_id
-  shift
-  for gate_id in "$@"; do
-    master_local_gate_peek "$gate_id" "$sha" || return 0
-  done
   return 1
 }
 

@@ -61,6 +61,7 @@ GATE_SCOPES = {
 }
 
 TOP_DOC_EXCLUDES = frozenset({"docs", "evals", "e2e"})
+BUN_REQUIRED_GATES = frozenset({"codex-late-stop-closure"})
 GATEWAY_ALLOWED_WORKSPACE_DEPS = frozenset({
     "@openclaude/kernel",
     "@openclaude/plugin-sdk",
@@ -74,6 +75,7 @@ GATEWAY_ALLOWED_WORKSPACE_DEPS = frozenset({
 })
 STORAGE_ALLOWED_WORKSPACE_DEPS = frozenset({
     "@openclaude/protocol",
+    "@openclaude/storage",
 })
 
 
@@ -159,6 +161,25 @@ def parse_ls_tree(raw: bytes) -> dict[str, tuple[str, str]]:
     return entries
 
 
+def read_blobs_batch(repo: str, oids: list[str]) -> dict[str, bytes]:
+    if not oids:
+        return {}
+    raw = git_run(repo, "cat-file", "--batch", stdin_bytes=("\n".join(oids) + "\n").encode("utf-8"))
+    out: dict[str, bytes] = {}
+    pos = 0
+    for expected_oid in oids:
+        nl = raw.index(b"\n", pos)
+        header = raw[pos:nl].decode("utf-8").split(" ")
+        if len(header) < 3 or header[0] != expected_oid or header[1] != "blob":
+            raise ValueError(f"unexpected batch blob header for {expected_oid}")
+        size = int(header[2])
+        body_start = nl + 1
+        body_end = body_start + size
+        out[expected_oid] = raw[body_start:body_end]
+        pos = body_end + 1
+    return out
+
+
 def workspace_deps(pkg_json_bytes: bytes) -> set[str]:
     doc = json.loads(pkg_json_bytes.decode("utf-8"))
     deps: set[str] = set()
@@ -203,7 +224,9 @@ def validate_arch_report(raw: object) -> dict[str, object]:
     }
 
 
-def compute_scope_digests(repo: str, sha: str, node_ver: str, py_ver: str, runtime_img: str) -> dict[str, str]:
+def compute_scope_digests(
+    repo: str, sha: str, node_ver: str, py_ver: str, runtime_img: str, bun_id: str
+) -> dict[str, str]:
     if not SHA_RE.fullmatch(sha):
         raise ValueError("invalid commit sha")
     if git_run(repo, "cat-file", "-t", sha).decode("utf-8").strip() != "commit":
@@ -229,12 +252,33 @@ def compute_scope_digests(repo: str, sha: str, node_ver: str, py_ver: str, runti
         raise ValueError("missing top-level packages tree")
     pkg_entries = parse_ls_tree(git_run(repo, "ls-tree", f"{sha}:packages"))
 
-    batch_specs = [
-        f"{sha}:packages/commercial/agent-sandbox",
-        f"{sha}:packages/commercial/package.json",
-        f"{sha}:packages/gateway/package.json",
-        f"{sha}:packages/storage/package.json",
+    root_pkg = json.loads(git_run(repo, "cat-file", "blob", f"{sha}:package.json").decode("utf-8"))
+    raw_ws = root_pkg.get("workspaces") if isinstance(root_pkg, dict) else None
+    ws_list = raw_ws if isinstance(raw_ws, list) else []
+    has_glob_ws = any(isinstance(w, str) and "*" in w for w in ws_list)
+    ws_dirs = [
+        w.strip("/")
+        for w in ws_list
+        if isinstance(w, str) and w.strip("/") and w.strip("/") != "packages/web-react" and "*" not in w
     ]
+    candidate_dirs = list(
+        dict.fromkeys([
+            *ws_dirs,
+            *(f"packages/{name}" for name in sorted(pkg_entries) if name != "web-react"),
+        ])
+    )
+    pkg_rel_to_key = {
+        f"{d}/package.json": (d.removeprefix("packages/") if d.startswith("packages/") else d)
+        for d in candidate_dirs
+    }
+    batch_rels = list(
+        dict.fromkeys([
+            "packages/commercial/agent-sandbox",
+            "packages/commercial/package.json",
+            *pkg_rel_to_key.keys(),
+        ])
+    )
+    batch_specs = [f"{sha}:{rel}" for rel in batch_rels]
     batch_out = git_run(
         repo,
         "cat-file",
@@ -245,8 +289,9 @@ def compute_scope_digests(repo: str, sha: str, node_ver: str, py_ver: str, runti
         raise ValueError("unexpected git batch-check line count")
 
     resolved_extra: dict[str, str] = {}
-    for spec, line in zip(batch_specs, batch_out):
-        rel = spec.split(":", 1)[1]
+    blob_oids: list[str] = []
+    pkg_blob_oid: dict[str, str] = {}
+    for rel, line in zip(batch_rels, batch_out):
         if line.endswith(" missing"):
             resolved_extra[rel] = "missing"
         else:
@@ -254,29 +299,48 @@ def compute_scope_digests(repo: str, sha: str, node_ver: str, py_ver: str, runti
             if len(parts) < 2 or not SHA_RE.fullmatch(parts[0]):
                 raise ValueError(f"invalid batch-check line for {rel}")
             resolved_extra[rel] = f"{parts[1]}:{parts[0]}"
+            if parts[1] == "blob" and rel in pkg_rel_to_key:
+                pkg_blob_oid[pkg_rel_to_key[rel]] = parts[0]
+                if parts[0] not in blob_oids:
+                    blob_oids.append(parts[0])
 
-    # Soundness guard: if gateway or storage ever acquire new workspace dependencies,
-    # promote their scope rather than risking a stale narrower closure.
-    gateway_scope_ok = False
-    storage_scope_ok = False
-    if resolved_extra["packages/gateway/package.json"] != "missing":
-        gw_deps = workspace_deps(git_run(repo, "cat-file", "blob", f"{sha}:packages/gateway/package.json"))
-        gateway_scope_ok = gw_deps.issubset(GATEWAY_ALLOWED_WORKSPACE_DEPS)
-    if resolved_extra["packages/storage/package.json"] != "missing":
-        st_deps = workspace_deps(git_run(repo, "cat-file", "blob", f"{sha}:packages/storage/package.json"))
-        storage_scope_ok = st_deps.issubset(STORAGE_ALLOWED_WORKSPACE_DEPS)
+    blobs = read_blobs_batch(repo, blob_oids)
+    pkg_deps = {name: workspace_deps(blobs[oid]) for name, oid in pkg_blob_oid.items()}
 
+    # Soundness guard: transitively promote narrower scopes whenever any included
+    # package declares a workspace dependency outside that scope's closed set.
+    backend_scope_ok = not has_glob_ws and all("@openclaude/web-react" not in deps for deps in pkg_deps.values())
+    storage_scope_ok = (
+        backend_scope_ok
+        and "protocol" in pkg_deps
+        and "storage" in pkg_deps
+        and (pkg_deps["protocol"] | pkg_deps["storage"]).issubset(STORAGE_ALLOWED_WORKSPACE_DEPS)
+    )
+    gateway_scope_ok = (
+        storage_scope_ok
+        and "gateway" in pkg_deps
+        and all(
+            deps.issubset(GATEWAY_ALLOWED_WORKSPACE_DEPS)
+            for name, deps in pkg_deps.items()
+            if name not in ("commercial", "cli")
+        )
+    )
+
+    full_items = [f"root_tree={root_tree}"]
     base_items: list[str] = []
     for name, (otype, oid) in sorted(top_entries.items()):
         if name == "packages" or name in TOP_DOC_EXCLUDES:
             continue
         base_items.append(f"top:{name}={otype}:{oid}")
 
-    backend_items = list(base_items)
-    for name, (otype, oid) in sorted(pkg_entries.items()):
-        if name == "web-react":
-            continue
-        backend_items.append(f"pkg:{name}={otype}:{oid}")
+    if backend_scope_ok:
+        backend_items = list(base_items)
+        for name, (otype, oid) in sorted(pkg_entries.items()):
+            if name == "web-react":
+                continue
+            backend_items.append(f"pkg:{name}={otype}:{oid}")
+    else:
+        backend_items = full_items
 
     if gateway_scope_ok:
         gateway_items = list(base_items)
@@ -299,8 +363,6 @@ def compute_scope_digests(repo: str, sha: str, node_ver: str, py_ver: str, runti
     else:
         storage_items = backend_items
 
-    full_items = [f"root_tree={root_tree}"]
-
     scope_lists = {
         "storage": storage_items,
         "gateway": gateway_items,
@@ -308,8 +370,10 @@ def compute_scope_digests(repo: str, sha: str, node_ver: str, py_ver: str, runti
         "full": full_items,
     }
 
+    clean_bun = bun_id.strip()
     gate_digests: dict[str, str] = {}
     for gate_id, scope_name in sorted(GATE_SCOPES.items()):
+        bun_token = f"bun={clean_bun}" if gate_id in BUN_REQUIRED_GATES else "bun=not-used"
         h = hashlib.sha256()
         for token in (
             SCHEMA,
@@ -318,6 +382,7 @@ def compute_scope_digests(repo: str, sha: str, node_ver: str, py_ver: str, runti
             f"node={node_ver.strip()}",
             f"python={py_ver.strip()}",
             f"runtime_image={runtime_img.strip()}",
+            bun_token,
             *scope_lists[scope_name],
         ):
             h.update(token.encode("utf-8") + b"\0")
@@ -370,7 +435,8 @@ def read_verified_receipt(cache_dir: Path, gate_id: str, expected_digest: str) -
         return None
 
 
-def gc_receipts(cache_dir: Path) -> None:
+def gc_receipts(cache_dir: Path, protected_names: set[str] | None = None) -> None:
+    protected = protected_names or set()
     entries: list[tuple[int, str, Path]] = []
     euid = os.geteuid()
     for entry in cache_dir.iterdir():
@@ -384,29 +450,39 @@ def gc_receipts(cache_dir: Path) -> None:
     if len(entries) <= MAX_RECEIPTS:
         return
     entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    for _mtime, _name, victim in entries[MAX_RECEIPTS:]:
+    kept = 0
+    for _mtime, name, path in entries:
+        if name in protected or kept < MAX_RECEIPTS:
+            if name not in protected:
+                kept += 1
+            continue
         try:
-            victim.unlink()
+            path.unlink()
         except OSError:
             pass
 
 
 def cmd_plan(args: list[str]) -> int:
-    if len(args) != 8:
-        raise ValueError("usage: plan <cache_dir> <repo_root> <sha> <plan_file> <node_ver> <py_ver> <runtime_img> <force>")
-    cache_raw, repo_root, sha, plan_raw, node_ver, py_ver, runtime_img, force = args
+    if len(args) != 9:
+        raise ValueError(
+            "usage: plan <cache_dir> <repo_root> <sha> <plan_file> <node_ver> <py_ver> <runtime_img> <bun_id> <force>"
+        )
+    cache_raw, repo_root, sha, plan_raw, node_ver, py_ver, runtime_img, bun_id, force = args
     cache_dir = ensure_trusted_cache_dir(cache_raw, create=True)
     plan_path = Path(plan_raw)
     if not plan_path.is_absolute() or ".." in plan_path.parts or plan_path.parent.is_symlink():
         raise ValueError("untrusted plan output path")
-    digests = compute_scope_digests(repo_root, sha, node_ver, py_ver, runtime_img)
+    digests = compute_scope_digests(repo_root, sha, node_ver, py_ver, runtime_img, bun_id)
+    has_bun = bool(bun_id.strip())
     gates_plan: dict[str, object] = {}
     hits = 0
     for gate_id, digest in sorted(digests.items()):
-        rec = None if force == "1" else read_verified_receipt(cache_dir, gate_id, digest)
+        cacheable = has_bun or (gate_id not in BUN_REQUIRED_GATES)
+        rec = None if (force == "1" or not cacheable) else read_verified_receipt(cache_dir, gate_id, digest)
         entry: dict[str, object] = {
             "scope": GATE_SCOPES[gate_id],
             "inputDigest": digest,
+            "cacheable": cacheable,
             "hit": rec is not None,
         }
         if rec is not None:
@@ -428,7 +504,7 @@ def cmd_plan(args: list[str]) -> int:
     return 0
 
 
-def load_plan_gate(plan_raw: str, sha: str, gate_id: str) -> tuple[Path, dict[str, object]]:
+def load_plan_gate(plan_raw: str, sha: str, gate_id: str) -> tuple[Path, dict[str, object], set[str]]:
     if not SHA_RE.fullmatch(sha) or not GATE_ID_RE.fullmatch(gate_id):
         raise ValueError("invalid sha or gate id")
     plan_path = Path(plan_raw)
@@ -447,18 +523,13 @@ def load_plan_gate(plan_raw: str, sha: str, gate_id: str) -> tuple[Path, dict[st
     digest = entry.get("inputDigest")
     if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
         raise ValueError("invalid inputDigest in plan")
+    protected = {
+        f"{gid}--{g['inputDigest']}.json"
+        for gid, g in gates.items()
+        if isinstance(g, dict) and isinstance(g.get("inputDigest"), str) and DIGEST_RE.fullmatch(g["inputDigest"])
+    }
     cache_dir = ensure_trusted_cache_dir(str(plan.get("cacheDir", "")), create=False)
-    return cache_dir, entry
-
-
-def cmd_peek(args: list[str]) -> int:
-    if len(args) != 3:
-        raise ValueError("usage: peek <plan_file> <sha> <gate_id>")
-    plan_raw, sha, gate_id = args
-    cache_dir, entry = load_plan_gate(plan_raw, sha, gate_id)
-    if not entry.get("hit"):
-        return 1
-    return 0 if read_verified_receipt(cache_dir, gate_id, str(entry["inputDigest"])) is not None else 1
+    return cache_dir, entry, protected
 
 
 def cmd_has(args: list[str]) -> int:
@@ -466,8 +537,8 @@ def cmd_has(args: list[str]) -> int:
         raise ValueError("usage: has <plan_file> <sha> <gate_id> [arch_restore_path]")
     plan_raw, sha, gate_id = args[:3]
     arch_out = args[3] if len(args) == 4 else ""
-    cache_dir, entry = load_plan_gate(plan_raw, sha, gate_id)
-    if not entry.get("hit"):
+    cache_dir, entry, _protected = load_plan_gate(plan_raw, sha, gate_id)
+    if not entry.get("cacheable", True) or not entry.get("hit"):
         return 1
     # Re-verify receipt on disk at point of use so tampered/deleted files never pass.
     rec = read_verified_receipt(cache_dir, gate_id, str(entry["inputDigest"]))
@@ -491,7 +562,9 @@ def cmd_record(args: list[str]) -> int:
         raise ValueError("usage: record <plan_file> <sha> <gate_id> [arch_report_path]")
     plan_raw, sha, gate_id = args[:3]
     arch_in = args[3] if len(args) == 4 else ""
-    cache_dir, entry = load_plan_gate(plan_raw, sha, gate_id)
+    cache_dir, entry, protected = load_plan_gate(plan_raw, sha, gate_id)
+    if not entry.get("cacheable", True):
+        return 0
     digest = str(entry["inputDigest"])
     receipt: dict[str, object] = {
         "schema": SCHEMA,
@@ -511,7 +584,7 @@ def cmd_record(args: list[str]) -> int:
         receipt["archReport"] = validate_arch_report(json.loads(in_path.read_text(encoding="utf-8")))
     filename = f"{gate_id}--{digest}.json"
     atomic_write_json(cache_dir, filename, receipt, 0o644)
-    gc_receipts(cache_dir)
+    gc_receipts(cache_dir, protected)
     return 0
 
 
@@ -522,8 +595,6 @@ def main() -> int:
     rest = sys.argv[2:]
     if sub == "plan":
         return cmd_plan(rest)
-    if sub == "peek":
-        return cmd_peek(rest)
     if sub == "has":
         return cmd_has(rest)
     if sub == "record":

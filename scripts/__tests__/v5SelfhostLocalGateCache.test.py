@@ -127,18 +127,33 @@ class LocalGateCacheTest(unittest.TestCase):
         }
         self.assertEqual(set(cache_mod.GATE_SCOPES.keys()), c_gates)
 
-        d1 = cache_mod.compute_scope_digests(str(self.repo), self.sha1, "v20.20.2", "Python 3.11", "img:1")
+        d1 = cache_mod.compute_scope_digests(
+            str(self.repo), self.sha1, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
+
+        # R1-P1-2: Host Bun identity changes ONLY codex-late-stop-closure digest.
+        d1_bun2 = cache_mod.compute_scope_digests(
+            str(self.repo), self.sha1, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.1"
+        )
+        self.assertNotEqual(d1["codex-late-stop-closure"], d1_bun2["codex-late-stop-closure"])
+        for gid in cache_mod.GATE_SCOPES:
+            if gid != "codex-late-stop-closure":
+                self.assertEqual(d1[gid], d1_bun2[gid], gid)
 
         # Dirty working tree file without commit must NOT alter immutable commit digests.
         self.write_repo("packages/commercial/src/ws/bridge.ts", "MUTATED UNCOMMITTED\n")
-        d1_dirty = cache_mod.compute_scope_digests(str(self.repo), self.sha1, "v20.20.2", "Python 3.11", "img:1")
+        d1_dirty = cache_mod.compute_scope_digests(
+            str(self.repo), self.sha1, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         self.assertEqual(d1, d1_dirty)
         self.git("checkout", "--", ".")
 
         # Pure docs change: storage, gateway, backend keep identical digests; only full changes.
         self.write_repo("docs/notes.md", "doc v2\n")
         sha_docs = self.commit_all("docs")
-        d_docs = cache_mod.compute_scope_digests(str(self.repo), sha_docs, "v20.20.2", "Python 3.11", "img:1")
+        d_docs = cache_mod.compute_scope_digests(
+            str(self.repo), sha_docs, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         self.assertEqual(d1["box-longtask"], d_docs["box-longtask"])
         self.assertEqual(d1["upload-retention-http"], d_docs["upload-retention-http"])
         self.assertEqual(d1["system-approval-fencing"], d_docs["system-approval-fencing"])
@@ -147,7 +162,9 @@ class LocalGateCacheTest(unittest.TestCase):
         # Pure web-react change: all 19 storage/gateway/backend gates stay identical; 5 full gates change.
         self.write_repo("packages/web-react/src/App.tsx", "export const W = 2;\n")
         sha_web = self.commit_all("web")
-        d_web = cache_mod.compute_scope_digests(str(self.repo), sha_web, "v20.20.2", "Python 3.11", "img:1")
+        d_web = cache_mod.compute_scope_digests(
+            str(self.repo), sha_web, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         for gid, scope in cache_mod.GATE_SCOPES.items():
             if scope in ("storage", "gateway", "backend"):
                 self.assertEqual(d_docs[gid], d_web[gid], gid)
@@ -157,7 +174,9 @@ class LocalGateCacheTest(unittest.TestCase):
         # commercial/src change: storage & gateway scopes stay identical; backend & full change.
         self.write_repo("packages/commercial/src/ws/bridge.ts", "export const C = 2;\n")
         sha_comm = self.commit_all("commercial-src")
-        d_comm = cache_mod.compute_scope_digests(str(self.repo), sha_comm, "v20.20.2", "Python 3.11", "img:1")
+        d_comm = cache_mod.compute_scope_digests(
+            str(self.repo), sha_comm, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         self.assertEqual(d_web["system-approval-fencing"], d_comm["system-approval-fencing"])
         self.assertEqual(d_web["upload-retention-http"], d_comm["upload-retention-http"])
         self.assertNotEqual(d_web["box-longtask"], d_comm["box-longtask"])
@@ -166,16 +185,46 @@ class LocalGateCacheTest(unittest.TestCase):
         # commercial/agent-sandbox prompt change MUST invalidate gateway scope too!
         self.write_repo("packages/commercial/agent-sandbox/platform-runtime/prompts/p.md", "prompt v2\n")
         sha_prompt = self.commit_all("sandbox-prompt")
-        d_prompt = cache_mod.compute_scope_digests(str(self.repo), sha_prompt, "v20.20.2", "Python 3.11", "img:1")
+        d_prompt = cache_mod.compute_scope_digests(
+            str(self.repo), sha_prompt, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         self.assertEqual(d_comm["system-approval-fencing"], d_prompt["system-approval-fencing"])
         self.assertNotEqual(d_comm["upload-retention-http"], d_prompt["upload-retention-http"])
 
         # Brand-new unknown backend package packages/new-svc is automatically included in backend & gateway!
         self.write_repo("packages/new-svc/index.ts", "export const N = 1;\n")
         sha_newpkg = self.commit_all("new-pkg")
-        d_newpkg = cache_mod.compute_scope_digests(str(self.repo), sha_newpkg, "v20.20.2", "Python 3.11", "img:1")
+        d_newpkg = cache_mod.compute_scope_digests(
+            str(self.repo), sha_newpkg, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         self.assertNotEqual(d_prompt["box-longtask"], d_newpkg["box-longtask"])
         self.assertNotEqual(d_prompt["upload-retention-http"], d_newpkg["upload-retention-http"])
+
+        # R1-Warn-3: If storage/package.json adds @openclaude/commercial, BOTH storage AND gateway
+        # scopes transitively promote so commercial/src invalidates both!
+        self.write_repo(
+            "packages/storage/package.json",
+            json.dumps({
+                "name": "@openclaude/storage",
+                "dependencies": {"@openclaude/commercial": "*", "@openclaude/protocol": "*"},
+            }) + "\n",
+        )
+        sha_st_dep1 = self.commit_all("storage-dep-commercial")
+        d_st1 = cache_mod.compute_scope_digests(
+            str(self.repo), sha_st_dep1, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
+        self.write_repo("packages/commercial/src/ws/bridge.ts", "export const C = 25;\n")
+        sha_st_dep2 = self.commit_all("commercial-after-storage-dep")
+        d_st2 = cache_mod.compute_scope_digests(
+            str(self.repo), sha_st_dep2, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
+        self.assertNotEqual(d_st1["system-approval-fencing"], d_st2["system-approval-fencing"])
+        self.assertNotEqual(d_st1["upload-retention-http"], d_st2["upload-retention-http"])
+        # Restore storage/package.json so we also verify direct gateway/package.json promotion independently.
+        self.write_repo(
+            "packages/storage/package.json",
+            json.dumps({"name": "@openclaude/storage", "dependencies": {"@openclaude/protocol": "*"}}) + "\n",
+        )
 
         # If gateway/package.json adds @openclaude/commercial, gateway scope auto-promotes so commercial/src invalidates it!
         self.write_repo(
@@ -186,17 +235,37 @@ class LocalGateCacheTest(unittest.TestCase):
             }) + "\n",
         )
         sha_dep = self.commit_all("gw-dep-commercial")
-        d_dep1 = cache_mod.compute_scope_digests(str(self.repo), sha_dep, "v20.20.2", "Python 3.11", "img:1")
+        d_dep1 = cache_mod.compute_scope_digests(
+            str(self.repo), sha_dep, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         self.write_repo("packages/commercial/src/ws/bridge.ts", "export const C = 3;\n")
         sha_dep2 = self.commit_all("commercial-after-gw-dep")
-        d_dep2 = cache_mod.compute_scope_digests(str(self.repo), sha_dep2, "v20.20.2", "Python 3.11", "img:1")
+        d_dep2 = cache_mod.compute_scope_digests(
+            str(self.repo), sha_dep2, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
         self.assertNotEqual(d_dep1["upload-retention-http"], d_dep2["upload-retention-http"])
+        # Meanwhile storage stayed narrow when only gateway added commercial:
+        self.assertEqual(d_dep1["system-approval-fencing"], d_dep2["system-approval-fencing"])
 
-    def test_architecture_replay_tamper_rejection_force_and_bounded_gc(self) -> None:
+    def test_architecture_replay_tamper_rejection_force_bun_and_bounded_gc(self) -> None:
         plan_file = self.plan_dir / "plan.json"
-        r = self.run_cli("plan", str(self.cache_dir), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "0")
+        r = self.run_cli(
+            "plan", str(self.cache_dir), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "bun:1.2", "0"
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "0/24")
+
+        # R1-P1-2: Empty bun_id disables caching ONLY for codex-late-stop-closure (cacheable=False, record is no-op).
+        plan_no_bun = self.plan_dir / "plan-no-bun.json"
+        r_nb = self.run_cli(
+            "plan", str(self.cache_dir), str(self.repo), self.sha1, str(plan_no_bun), "v20", "py3", "", "", "0"
+        )
+        self.assertEqual(r_nb.returncode, 0, r_nb.stderr)
+        nb_doc = json.loads(plan_no_bun.read_text(encoding="utf-8"))
+        self.assertFalse(nb_doc["gates"]["codex-late-stop-closure"]["cacheable"])
+        self.assertTrue(nb_doc["gates"]["upload-retention-http"]["cacheable"])
+        self.assertEqual(self.run_cli("record", str(plan_no_bun), self.sha1, "codex-late-stop-closure").returncode, 0)
+        self.assertEqual(list(self.cache_dir.glob("codex-late-stop-closure--*.json")), [])
 
         # Architecture record without report file fails closed.
         bad_arch = self.run_cli("record", str(plan_file), self.sha1, "architecture")
@@ -216,7 +285,9 @@ class LocalGateCacheTest(unittest.TestCase):
 
         # Re-plan hits both receipts; force=1 ignores hits.
         plan2 = self.plan_dir / "plan2.json"
-        r2 = self.run_cli("plan", str(self.cache_dir), str(self.repo), self.sha1, str(plan2), "v20", "py3", "", "0")
+        r2 = self.run_cli(
+            "plan", str(self.cache_dir), str(self.repo), self.sha1, str(plan2), "v20", "py3", "", "bun:1.2", "0"
+        )
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(r2.stdout.strip(), "2/24")
         restored = self.plan_dir / "restored/architecture.json"
@@ -226,7 +297,9 @@ class LocalGateCacheTest(unittest.TestCase):
         self.assertEqual(doc["identities"], 1400)
 
         plan_forced = self.plan_dir / "plan-force.json"
-        rf = self.run_cli("plan", str(self.cache_dir), str(self.repo), self.sha1, str(plan_forced), "v20", "py3", "", "1")
+        rf = self.run_cli(
+            "plan", str(self.cache_dir), str(self.repo), self.sha1, str(plan_forced), "v20", "py3", "", "bun:1.2", "1"
+        )
         self.assertEqual(rf.stdout.strip(), "0/24")
         self.assertNotEqual(self.run_cli("has", str(plan_forced), self.sha1, "box-longtask").returncode, 0)
 
@@ -238,13 +311,19 @@ class LocalGateCacheTest(unittest.TestCase):
         os.chmod(rec_files[0], 0o644)
         self.assertEqual(self.run_cli("has", str(plan2), self.sha1, "box-longtask").returncode, 0)
 
-        # Bounded GC caps receipt count at MAX_RECEIPTS (512).
+        # R1-P1-1 (GC protection): Even if an active plan receipt is the oldest file in a full cache,
+        # recording another gate in the same plan MUST NOT evict any receipt referenced by that plan!
+        os.utime(rec_files[0], ns=(1_000_000_000, 1_000_000_000))
         now_ns = time.time_ns()
         for idx in range(530):
             dummy = self.cache_dir / f"watch-gate--{idx:064x}.json"
             dummy.write_text('{"schema":"x"}\n', encoding="utf-8")
             os.chmod(dummy, 0o644)
             os.utime(dummy, ns=(now_ns - idx * 1_000_000, now_ns - idx * 1_000_000))
+        self.assertEqual(self.run_cli("record", str(plan2), self.sha1, "box-continuation").returncode, 0)
+        self.assertEqual(self.run_cli("has", str(plan2), self.sha1, "box-longtask").returncode, 0)
+
+        # Unprotected bounded GC caps receipt count at MAX_RECEIPTS (512).
         cache_mod.gc_receipts(self.cache_dir)
         remaining = [p for p in self.cache_dir.iterdir() if p.is_file()]
         self.assertLessEqual(len(remaining), cache_mod.MAX_RECEIPTS)
@@ -263,6 +342,9 @@ class LocalGateCacheTest(unittest.TestCase):
         bin_dir.mkdir(mode=0o700)
         real_node = shutil.which("node")
         assert real_node
+        bun_stub = bin_dir / "bun"
+        bun_stub.write_text('#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo "1.2.0"; exit 0; fi\nexit 0\n', encoding="utf-8")
+        os.chmod(bun_stub, 0o755)
         # Stub runner for gate invocations; delegates `node -e` (used by master_note_architecture)
         # and `--version` to real node. Also provides a fast `ps` stub if slim container lacks procps.
         runner = f"""#!/bin/bash
@@ -283,6 +365,17 @@ case "$*" in
   *check-v5-ccb-mcp-availability.ts*) id=C.ccb-mcp ;;
   *check-v5-codex-late-stop-proof.sh*) id=C.codex-late-stop ;;
 esac
+case "$id" in
+  C.box-success-recovery|C.box-incident-proofs|C.box-longtask|C.master-incident-proofs)
+    if [[ "${{TEST_DATABASE_URL:-}}" != "created-gate-db" ]]; then
+      echo "[gate-failure] missing TEST_DATABASE_URL (${{TEST_DATABASE_URL:-empty}})"
+      exit 23
+    fi
+    ;;
+esac
+if [[ "$id" == "C.box-continuation" && "${{EVICT_INCIDENT_ON_CONT:-0}}" == "1" ]]; then
+  rm -f -- "$CACHE_DIR_FOR_RUNNER"/box-incident-proofs--*.json
+fi
 printf 'RUN %s\\n' "$id" >>"$EVENTS"
 if [[ "$id" == "${{FAIL_AT:-never}}" ]]; then
   echo '[gate-failure] injected failure'
@@ -323,7 +416,9 @@ esac
             )
             os.chmod(ps_stub, 0o755)
 
-        def execute_train(sha: str, train_id: str, fail_at: str = "") -> tuple[int, list[str], dict[str, str]]:
+        def execute_train(
+            sha: str, train_id: str, fail_at: str = "", evict_incident_on_cont: bool = False
+        ) -> tuple[int, list[str], dict[str, str], str]:
             run_root = self.base / train_id
             for sub in ("tmp", "logs", "staging/scripts/lib", "staging/packages/web-react"):
                 (run_root / sub).mkdir(parents=True, exist_ok=True)
@@ -348,6 +443,10 @@ REPO_ROOT={str(self.repo)!r}
 SCRIPT_DIR={str(ROOT / "scripts")!r}
 OC_V5_LOCAL_GATE_CACHE=1
 OC_V5_LOCAL_GATE_CACHE_DIR={str(self.cache_dir)!r}
+CACHE_DIR_FOR_RUNNER={str(self.cache_dir)!r}
+export CACHE_DIR_FOR_RUNNER
+EVICT_INCIDENT_ON_CONT={'1' if evict_incident_on_cont else '0'}
+export EVICT_INCIDENT_ON_CONT
 MASTER_GATE_TMPDIR={str(run_root / "tmp")!r}
 MASTER_GATE_LOADAVG={str(load_file)!r}
 MASTER_GATE_ATTEMPT_DIR={str(run_root / "logs")!r}
@@ -357,7 +456,7 @@ LEASE_TARGET_SHA={sha!r}
 MASTER_BOX_GATE_LOAD_MAX=8
 MASTER_GATE_IDLE_TIMEOUT_S=20
 MASTER_GATE_LOAD_SCALE=1
-MASTER_GATE_DB_URL='fixture-db'
+MASTER_GATE_DB_URL=''
 WEB_DIST_REUSE_RECORD=.web-dist-reuse.json
 FAIL_AT={fail_at!r}
 export FAIL_AT
@@ -369,8 +468,8 @@ master_web_dist_key() {{ :; }}
 write_web_dist_reuse_record() {{ :; }}
 await_runtime_release_bg() {{ printf 'EVENT runtime-awaited\\n' >>"$EVENTS"; }}
 master_gate_wait_host_idle() {{ printf 'EVENT idle-%s\\n' "$1" >>"$EVENTS"; }}
-master_gate_db_create() {{ printf 'EVENT db-create\\n' >>"$EVENTS"; }}
-master_gate_db_drop() {{ printf 'EVENT db-drop\\n' >>"$EVENTS"; }}
+master_gate_db_create() {{ MASTER_GATE_DB_URL='created-gate-db'; printf 'EVENT db-create\\n' >>"$EVENTS"; }}
+master_gate_db_drop() {{ MASTER_GATE_DB_URL=''; printf 'EVENT db-drop\\n' >>"$EVENTS"; }}
 master_gate_retryable() {{ shift; "$@"; }}
 cleanup_master_gate_tmpdir() {{ printf 'EVENT tmp-cleanup\\n' >>"$EVENTS"; }}
 cleanup_master_staging() {{ reap_master_build_jobs; printf 'EVENT staging-cleanup\\n' >>"$EVENTS"; }}
@@ -446,6 +545,26 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
         # master-incident-proofs needed the test DB, so db-create DID run on Run 3!
         self.assertIn("EVENT db-create", ev3)
 
+        # Run 4 (R1-P1-1 end-to-end proof): All 4 DB gates hit at plan time while box-continuation misses,
+        # AND box-incident-proofs receipt vanishes on disk during box-continuation!
+        # master_ensure_gate_db MUST lazily create the test DB right before box-incident-proofs runs.
+        for p in self.cache_dir.glob("box-continuation--*.json"):
+            p.unlink()
+        rc4, ev4, notes4, err4 = execute_train(sha_web_fix, "tr-run4", evict_incident_on_cont=True)
+        self.assertEqual(rc4, 0, err4)
+        self.assertEqual(notes4["localGateCache.hits"], "23/24")
+        self.assertLess(ev4.index("RUN C.box-continuation"), ev4.index("EVENT db-create"))
+        self.assertLess(ev4.index("EVENT db-create"), ev4.index("RUN C.box-incident-proofs"))
+
+        # Run 5 (R1-P1-2 end-to-end proof): Upgrading host Bun invalidates ONLY codex-late-stop-closure!
+        bun_stub.write_text('#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo "1.2.1"; exit 0; fi\nexit 0\n', encoding="utf-8")
+        os.chmod(bun_stub, 0o755)
+        rc5, ev5, notes5, err5 = execute_train(sha_web_fix, "tr-run5")
+        self.assertEqual(rc5, 0, err5)
+        self.assertEqual(notes5["localGateCache.hits"], "23/24")
+        ran5 = [l.split(" ", 1)[1] for l in ev5 if l.startswith("RUN ")]
+        self.assertEqual(ran5, ["D", "C.codex-late-stop"])
+
     def test_root_and_unprivileged_trust_boundaries(self) -> None:
         # Symlink cache directory is always rejected.
         real_dir = self.base / "real-cache"
@@ -453,21 +572,27 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
         sym_dir = self.base / "sym-cache"
         sym_dir.symlink_to(real_dir)
         plan_file = self.plan_dir / "sym-plan.json"
-        r_sym = self.run_cli("plan", str(sym_dir), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "0")
+        r_sym = self.run_cli(
+            "plan", str(sym_dir), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "bun:1", "0"
+        )
         self.assertNotEqual(r_sym.returncode, 0)
 
         # Group-writable cache directory is always rejected.
         gw_dir = self.base / "gw-cache"
         gw_dir.mkdir(mode=0o700)
         os.chmod(gw_dir, 0o770)
-        r_gw = self.run_cli("plan", str(gw_dir), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "0")
+        r_gw = self.run_cli(
+            "plan", str(gw_dir), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "bun:1", "0"
+        )
         self.assertNotEqual(r_gw.returncode, 0)
 
         if os.geteuid() == 0:
             # Under root, a cache directory beneath world-writable /tmp MUST be rejected!
             with tempfile.TemporaryDirectory(prefix="oc-untrusted-root-", dir="/tmp") as bad_tmp:
                 bad_cache = Path(bad_tmp) / "gate-receipts"
-                r_bad = self.run_cli("plan", str(bad_cache), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "0")
+                r_bad = self.run_cli(
+                    "plan", str(bad_cache), str(self.repo), self.sha1, str(plan_file), "v20", "py3", "", "bun:1", "0"
+                )
                 self.assertNotEqual(r_bad.returncode, 0)
         else:
             # Unprivileged callers cannot target production /var/lib/openclaude-v5-selfhost paths.
@@ -480,6 +605,7 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
                 "v20",
                 "py3",
                 "",
+                "bun:1",
                 "0",
             )
             self.assertNotEqual(r_prod.returncode, 0)
