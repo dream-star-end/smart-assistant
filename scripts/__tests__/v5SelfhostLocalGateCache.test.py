@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Red/green unit + production-shell integration proofs for OCV5-774:
-local input-digest gate receipt cache & per-gate checkpoint resume.
+"""Red/green unit + production-shell integration proofs for OCV5-774 / OCV5-775:
+local input-digest gate receipt cache, narrowed frontend gate scopes, & per-gate checkpoint resume.
 """
 import importlib.util
 import json
@@ -159,17 +159,31 @@ class LocalGateCacheTest(unittest.TestCase):
         self.assertEqual(d1["system-approval-fencing"], d_docs["system-approval-fencing"])
         self.assertNotEqual(d1["architecture"], d_docs["architecture"])
 
-        # Pure web-react change: all 19 storage/gateway/backend gates stay identical; 5 full gates change.
+        # Pure web-react App.tsx change (OCV5-775): 21 gates (storage/gateway/backend/backend_ccb)
+        # stay identical; the 3 full-scope gates (session-unavailable-rootfix, platform-tool-proofs, architecture) change!
         self.write_repo("packages/web-react/src/App.tsx", "export const W = 2;\n")
         sha_web = self.commit_all("web")
         d_web = cache_mod.compute_scope_digests(
             str(self.repo), sha_web, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
         )
         for gid, scope in cache_mod.GATE_SCOPES.items():
-            if scope in ("storage", "gateway", "backend"):
+            if scope in ("storage", "gateway", "backend", "backend_ccb"):
                 self.assertEqual(d_docs[gid], d_web[gid], gid)
             else:
                 self.assertNotEqual(d_docs[gid], d_web[gid], gid)
+
+        # OCV5-775: editing CCB_WEB_EXTRA_PATHS invalidates ccb-mcp-availability + full, while backend stays unchanged.
+        self.write_repo("packages/web-react/src/components/tool/format.ts", "export const F = 1;\n")
+        sha_ccb_web = self.commit_all("web-ccb-format")
+        d_ccb_web = cache_mod.compute_scope_digests(
+            str(self.repo), sha_ccb_web, "v20.20.2", "Python 3.11", "img:1", "/usr/bin/bun:1.2.0"
+        )
+        self.assertNotEqual(d_web["ccb-mcp-availability"], d_ccb_web["ccb-mcp-availability"])
+        self.assertNotEqual(d_web["session-unavailable-rootfix"], d_ccb_web["session-unavailable-rootfix"])
+        self.assertEqual(d_web["box-longtask"], d_ccb_web["box-longtask"])
+        self.assertEqual(d_web["master-incident-proofs"], d_ccb_web["master-incident-proofs"])
+        sha_web = sha_ccb_web
+        d_web = d_ccb_web
 
         # commercial/src change: storage & gateway scopes stay identical; backend & full change.
         self.write_repo("packages/commercial/src/ws/bridge.ts", "export const C = 2;\n")
@@ -322,6 +336,9 @@ class LocalGateCacheTest(unittest.TestCase):
             os.utime(dummy, ns=(now_ns - idx * 1_000_000, now_ns - idx * 1_000_000))
         self.assertEqual(self.run_cli("record", str(plan2), self.sha1, "box-continuation").returncode, 0)
         self.assertEqual(self.run_cli("has", str(plan2), self.sha1, "box-longtask").returncode, 0)
+        # Even with protected plan receipts, total receipt count on disk stays bounded at <= MAX_RECEIPTS (512).
+        remaining_protected = [p for p in self.cache_dir.iterdir() if p.is_file()]
+        self.assertLessEqual(len(remaining_protected), cache_mod.MAX_RECEIPTS)
 
         # Unprotected bounded GC caps receipt count at MAX_RECEIPTS (512).
         cache_mod.gc_receipts(self.cache_dir)
@@ -335,7 +352,8 @@ class LocalGateCacheTest(unittest.TestCase):
         helpers = "\n".join(
             extract_fn(master_src, name)
             for name in ("master_gate_load1", "master_gate_attempt_log", "master_gate_first_failure",
-                         "master_seed_frontend_buildinfo", "master_note_architecture")
+                         "master_seed_frontend_buildinfo", "master_save_frontend_buildinfo",
+                         "master_note_architecture")
         )
 
         bin_dir = self.base / "bin"
@@ -385,6 +403,7 @@ case "$id" in
   D)
     mkdir -p packages/web-react/dist
     echo '<meta name="oc-build" content="0123456789abcdef">' >packages/web-react/dist/index.html
+    echo 'buildinfo-from-D' >packages/web-react/tsconfig.tsbuildinfo
     printf '0.250\\n' >"$OC_V5_SELFHOST_TSC_TIMER_FILE"
     ;;
   C.architecture)
@@ -436,6 +455,7 @@ esac
 
             shell_script = f"""
 set -Eeuo pipefail
+umask 022
 source {str(BUILD_JOBS_SH)!r}
 source {str(SUMMARY_SH)!r}
 source {str(RECEIPTS_SH)!r}
@@ -443,6 +463,7 @@ REPO_ROOT={str(self.repo)!r}
 SCRIPT_DIR={str(ROOT / "scripts")!r}
 OC_V5_LOCAL_GATE_CACHE=1
 OC_V5_LOCAL_GATE_CACHE_DIR={str(self.cache_dir)!r}
+OC_V5_TSC_CACHE_DIR={str(self.base / "tsc-cache")!r}
 CACHE_DIR_FOR_RUNNER={str(self.cache_dir)!r}
 export CACHE_DIR_FOR_RUNNER
 EVICT_INCIDENT_ON_CONT={'1' if evict_incident_on_cont else '0'}
@@ -523,8 +544,9 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
         self.assertEqual(notes2["arch.grown"], "1")
         self.assertEqual(notes2["arch.unmapped"], "2")
 
-        # Run 3 (cross-commit pure web-react fixup, like OCV5-773 e0c1f1ee1!):
-        # 19 storage/gateway/backend gates STILL hit receipts; ONLY D + 5 full-scope gates run!
+        # Run 3 (cross-commit pure web-react fixup, like OCV5-773 e0c1f1ee1! OCV5-775 narrowed scopes):
+        # 21/24 gates STILL hit receipts; ONLY D + the 3 full-scope gates (session-rootfix, architecture, platform-tool-proofs) run!
+        # db-create does NOT run because master-incident-proofs is now in backend scope!
         self.write_repo("packages/web-react/src/App.tsx", "export const W = 99;\n")
         sha_web_fix = self.commit_all("fix(v5): lazy split web-react bundle")
         rc3, ev3, notes3, err3 = execute_train(sha_web_fix, "tr-run3", fail_at="")
@@ -536,14 +558,13 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
                 "D",
                 "C.session-rootfix",
                 "C.architecture",
-                "C.master-incident-proofs",
                 "C.platform-tool-proofs",
-                "C.ccb-mcp",
             ]),
         )
-        self.assertEqual(notes3["localGateCache.hits"], "19/24")
-        # master-incident-proofs needed the test DB, so db-create DID run on Run 3!
-        self.assertIn("EVENT db-create", ev3)
+        self.assertEqual(notes3["localGateCache.hits"], "21/24")
+        self.assertIn("EVENT idle-box-gates", ev3)
+        self.assertNotIn("EVENT db-create", ev3)
+        self.assertEqual((self.base / "tsc-cache/web-react.tsbuildinfo").read_text(encoding="utf-8"), "buildinfo-from-D\n")
 
         # Run 4 (R1-P1-1 end-to-end proof): All 4 DB gates hit at plan time while box-continuation misses,
         # AND box-incident-proofs receipt vanishes on disk during box-continuation!
@@ -609,6 +630,133 @@ printf 'EVENT sealed\\n' >>"$EVENTS"
                 "0",
             )
             self.assertNotEqual(r_prod.returncode, 0)
+
+    def test_r1_audit_esm_syntax_and_git_symlink_regressions(self) -> None:
+        real_node = shutil.which("node")
+        assert real_node
+
+        # 1) R1-P1-1: Real Node ESM execution + actual plan -> record -> plan for quoted export,
+        # quoted import, and executable template-literal dynamic import `${(await import(name)).H}`.
+        syntax_cases = (
+            ("quoted-export", 'export { H as "P" } from "./helper.mjs";\n', 'ns["P"]'),
+            ("quoted-import", 'import { "H" as H } from "./helper.mjs";\nexport const P = H;\n', "ns.P"),
+            (
+                "template-dynamic-import",
+                'const name = "./helper.mjs";\nexport const P = Number(`${(await import(name)).H}`);\n',
+                "ns.P",
+            ),
+        )
+        for idx, (label, persist_src, expr) in enumerate(syntax_cases):
+            self.write_repo("packages/web-react/src/lib/helper.mjs", "export const H = 1;\n")
+            self.write_repo("packages/web-react/src/lib/persist.mjs", persist_src)
+            sha_a = self.commit_all(f"syntax-a-{label}")
+            node_check = (
+                f'const ns = await import({json.dumps(str(self.repo / "packages/web-react/src/lib/persist.mjs"))});'
+                f"if ({expr} !== 1) process.exit(9);"
+            )
+            self.assertEqual(subprocess.run([real_node, "--input-type=module", "-e", node_check]).returncode, 0, label)
+
+            plan_a = self.plan_dir / f"syntax-{idx}-a.json"
+            self.assertEqual(
+                self.run_cli("plan", str(self.cache_dir), str(self.repo), sha_a, str(plan_a), "v20", "py3", "", "bun:1", "0").returncode,
+                0,
+            )
+            self.assertEqual(self.run_cli("record", str(plan_a), sha_a, "session-unavailable-rootfix").returncode, 0)
+            plan_a_hit = self.plan_dir / f"syntax-{idx}-a-hit.json"
+            self.assertEqual(
+                self.run_cli("plan", str(self.cache_dir), str(self.repo), sha_a, str(plan_a_hit), "v20", "py3", "", "bun:1", "0").returncode,
+                0,
+            )
+            self.assertEqual(self.run_cli("has", str(plan_a_hit), sha_a, "session-unavailable-rootfix").returncode, 0)
+
+            self.write_repo("packages/web-react/src/lib/helper.mjs", "export const H = 2;\n")
+            sha_b = self.commit_all(f"syntax-b-{label}")
+            self.assertEqual(subprocess.run([real_node, "--input-type=module", "-e", node_check]).returncode, 9, label)
+
+            plan_b = self.plan_dir / f"syntax-{idx}-b.json"
+            self.assertEqual(
+                self.run_cli("plan", str(self.cache_dir), str(self.repo), sha_b, str(plan_b), "v20", "py3", "", "bun:1", "0").returncode,
+                0,
+            )
+            doc_b = json.loads(plan_b.read_text(encoding="utf-8"))
+            self.assertFalse(doc_b["gates"]["session-unavailable-rootfix"]["hit"], label)
+            self.assertNotEqual(self.run_cli("has", str(plan_b), sha_b, "session-unavailable-rootfix").returncode, 0, label)
+
+        # 2) R1-P1-2: Git symlink target mutation + regular<->symlink mode transition + ancestor symlink + backend symlink!
+        ccb_ok_src = (
+            "export function unwrapExecuteExtraToolInput() {}\n"
+            "export function parseExecuteExtraToolResult() {}\n"
+            "export function parseSearchExtraToolsResult() {}\n"
+        )
+        self.write_repo("packages/web-react/src/lib/chat/actual.ts", ccb_ok_src)
+        extra_link = self.repo / "packages/web-react/src/lib/chat/extraTool.ts"
+        if extra_link.exists() or extra_link.is_symlink():
+            extra_link.unlink()
+        extra_link.symlink_to("./actual.ts")
+        sha_sym_a = self.commit_all("ccb-symlink-a")
+
+        def check_ccb_markers() -> bool:
+            txt = (self.repo / "packages/web-react/src/lib/chat/extraTool.ts").read_text(encoding="utf-8")
+            return all(
+                fn in txt
+                for fn in ("unwrapExecuteExtraToolInput", "parseExecuteExtraToolResult", "parseSearchExtraToolsResult")
+            )
+
+        self.assertTrue(check_ccb_markers())
+        plan_sa = self.plan_dir / "sym-a.json"
+        self.assertEqual(
+            self.run_cli("plan", str(self.cache_dir), str(self.repo), sha_sym_a, str(plan_sa), "v20", "py3", "", "bun:1", "0").returncode,
+            0,
+        )
+        self.assertEqual(self.run_cli("record", str(plan_sa), sha_sym_a, "ccb-mcp-availability").returncode, 0)
+        plan_sa_hit = self.plan_dir / "sym-a-hit.json"
+        self.assertEqual(
+            self.run_cli("plan", str(self.cache_dir), str(self.repo), sha_sym_a, str(plan_sa_hit), "v20", "py3", "", "bun:1", "0").returncode,
+            0,
+        )
+        self.assertEqual(self.run_cli("has", str(plan_sa_hit), sha_sym_a, "ccb-mcp-availability").returncode, 0)
+
+        # Mutate ONLY actual.ts (symlink blob OID stays identical!); ccb-mcp-availability MUST miss!
+        self.write_repo("packages/web-react/src/lib/chat/actual.ts", "export const broken = 1;\n")
+        sha_sym_b = self.commit_all("ccb-symlink-b")
+        self.assertFalse(check_ccb_markers())
+        plan_sb = self.plan_dir / "sym-b.json"
+        self.assertEqual(
+            self.run_cli("plan", str(self.cache_dir), str(self.repo), sha_sym_b, str(plan_sb), "v20", "py3", "", "bun:1", "0").returncode,
+            0,
+        )
+        doc_sb = json.loads(plan_sb.read_text(encoding="utf-8"))
+        self.assertFalse(doc_sb["gates"]["ccb-mcp-availability"]["hit"])
+        self.assertNotEqual(self.run_cli("has", str(plan_sb), sha_sym_b, "ccb-mcp-availability").returncode, 0)
+
+        # Regular file <-> symlink mode transition with IDENTICAL blob bytes ("./actual.ts"):
+        extra_link.unlink()
+        extra_link.write_bytes(b"./actual.ts")
+        sha_reg_mode = self.commit_all("ccb-regular-same-bytes")
+        d_sym_b = cache_mod.compute_scope_digests(str(self.repo), sha_sym_b, "v20", "py3", "", "bun:1")
+        d_reg_mode = cache_mod.compute_scope_digests(str(self.repo), sha_reg_mode, "v20", "py3", "", "bun:1")
+        self.assertNotEqual(d_sym_b["ccb-mcp-availability"], d_reg_mode["ccb-mcp-availability"])
+
+        # Ancestor directory symlink (`src/lib/chat -> ../other_chat`) promotes ccb-mcp-availability to full_items:
+        shutil.rmtree(self.repo / "packages/web-react/src/lib/chat")
+        self.write_repo("packages/web-react/src/lib/other_chat/extraTool.ts", ccb_ok_src)
+        (self.repo / "packages/web-react/src/lib/chat").symlink_to("other_chat")
+        sha_anc1 = self.commit_all("ccb-ancestor-symlink-1")
+        self.write_repo("packages/web-react/src/lib/other_chat/extraTool.ts", "export const broken = 2;\n")
+        sha_anc2 = self.commit_all("ccb-ancestor-symlink-2")
+        d_anc1 = cache_mod.compute_scope_digests(str(self.repo), sha_anc1, "v20", "py3", "", "bun:1")
+        d_anc2 = cache_mod.compute_scope_digests(str(self.repo), sha_anc2, "v20", "py3", "", "bun:1")
+        self.assertNotEqual(d_anc1["ccb-mcp-availability"], d_anc2["ccb-mcp-availability"])
+
+        # Backend symlink inside packages/commercial/agent-sandbox promotes gateway & storage scopes too:
+        (self.repo / "packages/commercial/agent-sandbox/sym-bridge.ts").symlink_to("../src/ws/bridge.ts")
+        sha_bsym1 = self.commit_all("backend-symlink-1")
+        self.write_repo("packages/commercial/src/ws/bridge.ts", "export const C = 999;\n")
+        sha_bsym2 = self.commit_all("backend-symlink-2")
+        d_bsym1 = cache_mod.compute_scope_digests(str(self.repo), sha_bsym1, "v20", "py3", "", "bun:1")
+        d_bsym2 = cache_mod.compute_scope_digests(str(self.repo), sha_bsym2, "v20", "py3", "", "bun:1")
+        self.assertNotEqual(d_bsym1["upload-retention-http"], d_bsym2["upload-retention-http"])
+        self.assertNotEqual(d_bsym1["system-approval-fencing"], d_bsym2["system-approval-fencing"])
 
 
 if __name__ == "__main__":

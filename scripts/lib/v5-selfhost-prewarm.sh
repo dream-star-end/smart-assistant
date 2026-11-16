@@ -370,6 +370,9 @@ cmd_prewarm_artifacts() {
   else
     ( cd "$staging" && npm ci --no-audit --no-fund ) || die "prewarm npm ci failed"
   fi
+  if declare -F master_seed_frontend_buildinfo >/dev/null; then
+    master_seed_frontend_buildinfo "${donor:-}" "$staging" 1 || true
+  fi
   # Keep the exact official command visible to the existing train/CI gate-parity scanner.
   # Both this recipe and the train recipe are included in master_web_dist_key.
   ( cd "$staging" && NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ) \
@@ -379,6 +382,10 @@ cmd_prewarm_artifacts() {
   bucket="$PREWARM_WORK/web-bucket"
   mkdir -p "$bucket/packages/web-react"
   mv "$staging/packages/web-react/dist" "$bucket/packages/web-react/dist"
+  if [[ -f "$staging/packages/web-react/tsconfig.tsbuildinfo" && ! -L "$staging/packages/web-react/tsconfig.tsbuildinfo" ]]; then
+    cp --remove-destination -- "$staging/packages/web-react/tsconfig.tsbuildinfo" "$bucket/packages/web-react/tsconfig.tsbuildinfo" \
+      || die "prewarm web tsbuildinfo copy failed"
+  fi
   write_web_dist_reuse_record "$bucket" "$key" built "$sha" || die "prewarm web record failed"
   prewarm_recipe_matches "$sha" || die "prewarm driver changed during build; discard result"
   harden_unique_release_tree "$bucket" || die "prewarm web hardening failed"

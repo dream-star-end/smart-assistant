@@ -217,6 +217,7 @@ test("actual warm entry builds archived web A outside deploy lock, defers Docker
       [[ "$*" == 'run build --workspace packages/web-react' && "$NODE_OPTIONS" == --max-old-space-size=4096 ]] || return 1
       mkdir -p packages/web-react/dist
       echo '<meta name="oc-build" content="abcdef123456">' > packages/web-react/dist/index.html
+      echo warm-buildinfo > packages/web-react/tsconfig.tsbuildinfo
       cp packages/web-react/src/marker packages/web-react/dist/pin.txt
     }
     rc=0; cmd_prewarm_artifacts || rc=$?
@@ -226,6 +227,7 @@ test("actual warm entry builds archived web A outside deploy lock, defers Docker
     test -e "$T/finalizer-called"; test ! -e "$T/docker-run"; test ! -e "$T/official"; test ! -e "$T/master"
     key="$(master_web_dist_key "$SHA")"; bucket="$(find_web_dist_donor "$key")"
     test "$(cat "$bucket/packages/web-react/dist/pin.txt")" = pinned-A
+    test "$(cat "$bucket/packages/web-react/tsconfig.tsbuildinfo")" = warm-buildinfo
     test ! -e "$bucket/node_modules"; test ! -e "$bucket/VERSION.json"
     # Still not a deployable candidate even if a caller points E1 at this cache bucket.
     if ( assert_master_release_static_gate "$bucket" "$SHA" ); then exit 1; fi

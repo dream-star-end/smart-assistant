@@ -52,16 +52,23 @@ GATE_SCOPES = {
     "host-log-policy": "backend",
     "model-policy-recovery": "backend",
     "watch-gate": "backend",
-    # Touches web-react or e2e in addition to backend
-    "ccb-mcp-availability": "full",
+    "master-incident-proofs": "backend",
+    # Backend + static source-contract reads of two web-react regular files (no symlink/closure surface)
+    "ccb-mcp-availability": "backend_ccb",
+    # Full repo tree (imports web-react runtime modules, runs web-react vitest, or full-repo architecture graph)
     "session-unavailable-rootfix": "full",
-    "master-incident-proofs": "full",
     "platform-tool-proofs": "full",
     "architecture": "full",
 }
 
 TOP_DOC_EXCLUDES = frozenset({"docs", "evals", "e2e"})
+REGULAR_MODES = frozenset({"100644", "100755"})
+ALLOWED_TREE_OR_REG_MODES = frozenset({"040000", "100644", "100755"})
 BUN_REQUIRED_GATES = frozenset({"codex-late-stop-closure"})
+CCB_WEB_EXTRA_PATHS = (
+    "packages/web-react/src/lib/chat/extraTool.ts",
+    "packages/web-react/src/components/tool/format.ts",
+)
 GATEWAY_ALLOWED_WORKSPACE_DEPS = frozenset({
     "@openclaude/kernel",
     "@openclaude/plugin-sdk",
@@ -148,17 +155,23 @@ def git_run(repo: str, *args: str, stdin_bytes: bytes | None = None) -> bytes:
     return proc.stdout
 
 
-def parse_ls_tree(raw: bytes) -> dict[str, tuple[str, str]]:
-    entries: dict[str, tuple[str, str]] = {}
-    for line in raw.decode("utf-8").splitlines():
-        if not line:
+def parse_ls_tree_z(raw: bytes) -> tuple[dict[str, tuple[str, str, str]], bool]:
+    entries: dict[str, tuple[str, str, str]] = {}
+    all_utf8_ok = True
+    for rec in raw.split(b"\0"):
+        if not rec:
             continue
-        meta, name = line.split("\t", 1)
-        _mode, obj_type, oid = meta.split(" ")
+        meta_b, path_b = rec.split(b"\t", 1)
+        mode, obj_type, oid = meta_b.decode("ascii").split(" ")
         if not SHA_RE.fullmatch(oid):
-            raise ValueError(f"invalid tree oid for {name}")
-        entries[name] = (obj_type, oid)
-    return entries
+            raise ValueError("invalid tree oid")
+        try:
+            name = path_b.decode("utf-8")
+        except UnicodeDecodeError:
+            all_utf8_ok = False
+            continue
+        entries[name] = (mode, obj_type, oid)
+    return entries, all_utf8_ok
 
 
 def read_blobs_batch(repo: str, oids: list[str]) -> dict[str, bytes]:
@@ -247,12 +260,42 @@ def compute_scope_digests(
         if gid not in manifest_ids:
             raise ValueError(f"cached gate {gid} missing from manifest")
 
-    top_entries = parse_ls_tree(git_run(repo, "ls-tree", sha))
-    if "packages" not in top_entries or top_entries["packages"][0] != "tree":
+    all_entries, all_utf8_ok = parse_ls_tree_z(git_run(repo, "ls-tree", "-r", "-t", "-z", sha))
+    top_entries = {
+        path: val for path, val in all_entries.items() if "/" not in path
+    }
+    if "packages" not in top_entries or top_entries["packages"][:2] != ("040000", "tree"):
         raise ValueError("missing top-level packages tree")
-    pkg_entries = parse_ls_tree(git_run(repo, "ls-tree", f"{sha}:packages"))
+    pkg_entries = {
+        path.removeprefix("packages/"): val
+        for path, val in all_entries.items()
+        if path.startswith("packages/") and "/" not in path.removeprefix("packages/")
+    }
 
-    root_pkg = json.loads(git_run(repo, "cat-file", "blob", f"{sha}:package.json").decode("utf-8"))
+    # Any git symlink (120000) or gitlink/submodule (160000) outside excluded doc trees or
+    # packages/web-react/* could cross a narrowed scope boundary; fail closed to full_items!
+    has_backend_nonregular = not all_utf8_ok
+    if not has_backend_nonregular:
+        for path, (mode, _otype, _oid) in all_entries.items():
+            top_seg = path.split("/", 1)[0]
+            if top_seg in TOP_DOC_EXCLUDES or path.startswith("packages/web-react/"):
+                continue
+            if mode not in ALLOWED_TREE_OR_REG_MODES:
+                has_backend_nonregular = True
+                break
+
+    manifest_entry = all_entries.get("deploy/v5/selfhost-release-gates.json")
+    if manifest_entry is None or manifest_entry[0] not in REGULAR_MODES or manifest_entry[1] != "blob":
+        raise ValueError("missing regular release-gates manifest blob")
+
+    root_pkg_entry = top_entries.get("package.json")
+    if root_pkg_entry is None or root_pkg_entry[1] != "blob":
+        raise ValueError("missing root package.json blob")
+    if root_pkg_entry[0] in REGULAR_MODES:
+        root_pkg = json.loads(git_run(repo, "cat-file", "blob", root_pkg_entry[2]).decode("utf-8"))
+    else:
+        has_backend_nonregular = True
+        root_pkg = {}
     raw_ws = root_pkg.get("workspaces") if isinstance(root_pkg, dict) else None
     ws_list = raw_ws if isinstance(raw_ws, list) else []
     has_glob_ws = any(isinstance(w, str) and "*" in w for w in ws_list)
@@ -271,45 +314,32 @@ def compute_scope_digests(
         f"{d}/package.json": (d.removeprefix("packages/") if d.startswith("packages/") else d)
         for d in candidate_dirs
     }
-    batch_rels = list(
-        dict.fromkeys([
-            "packages/commercial/agent-sandbox",
-            "packages/commercial/package.json",
-            *pkg_rel_to_key.keys(),
-        ])
-    )
-    batch_specs = [f"{sha}:{rel}" for rel in batch_rels]
-    batch_out = git_run(
-        repo,
-        "cat-file",
-        "--batch-check",
-        stdin_bytes=("\n".join(batch_specs) + "\n").encode("utf-8"),
-    ).decode("utf-8").splitlines()
-    if len(batch_out) != len(batch_specs):
-        raise ValueError("unexpected git batch-check line count")
 
-    resolved_extra: dict[str, str] = {}
     blob_oids: list[str] = []
     pkg_blob_oid: dict[str, str] = {}
-    for rel, line in zip(batch_rels, batch_out):
-        if line.endswith(" missing"):
-            resolved_extra[rel] = "missing"
+    for rel, key in pkg_rel_to_key.items():
+        entry = all_entries.get(rel)
+        if entry is None:
+            continue
+        emode, eotype, eoid = entry
+        if emode in REGULAR_MODES and eotype == "blob":
+            pkg_blob_oid[key] = eoid
+            if eoid not in blob_oids:
+                blob_oids.append(eoid)
         else:
-            parts = line.split(" ")
-            if len(parts) < 2 or not SHA_RE.fullmatch(parts[0]):
-                raise ValueError(f"invalid batch-check line for {rel}")
-            resolved_extra[rel] = f"{parts[1]}:{parts[0]}"
-            if parts[1] == "blob" and rel in pkg_rel_to_key:
-                pkg_blob_oid[pkg_rel_to_key[rel]] = parts[0]
-                if parts[0] not in blob_oids:
-                    blob_oids.append(parts[0])
+            has_backend_nonregular = True
 
     blobs = read_blobs_batch(repo, blob_oids)
     pkg_deps = {name: workspace_deps(blobs[oid]) for name, oid in pkg_blob_oid.items()}
 
     # Soundness guard: transitively promote narrower scopes whenever any included
-    # package declares a workspace dependency outside that scope's closed set.
-    backend_scope_ok = not has_glob_ws and all("@openclaude/web-react" not in deps for deps in pkg_deps.values())
+    # package declares a workspace dependency outside that scope's closed set, or
+    # whenever any symlink/submodule exists in the narrowed tree.
+    backend_scope_ok = (
+        not has_backend_nonregular
+        and not has_glob_ws
+        and all("@openclaude/web-react" not in deps for deps in pkg_deps.values())
+    )
     storage_scope_ok = (
         backend_scope_ok
         and "protocol" in pkg_deps
@@ -328,28 +358,55 @@ def compute_scope_digests(
 
     full_items = [f"root_tree={root_tree}"]
     base_items: list[str] = []
-    for name, (otype, oid) in sorted(top_entries.items()):
+    for name, (mode, otype, oid) in sorted(top_entries.items()):
         if name == "packages" or name in TOP_DOC_EXCLUDES:
             continue
-        base_items.append(f"top:{name}={otype}:{oid}")
+        base_items.append(f"top:{name}={mode}:{otype}:{oid}")
+
+    def format_entry(rel_path: str) -> str:
+        ent = all_entries.get(rel_path)
+        if ent is None:
+            return "missing"
+        return f"{ent[0]}:{ent[1]}:{ent[2]}"
 
     if backend_scope_ok:
         backend_items = list(base_items)
-        for name, (otype, oid) in sorted(pkg_entries.items()):
+        for name, (mode, otype, oid) in sorted(pkg_entries.items()):
             if name == "web-react":
                 continue
-            backend_items.append(f"pkg:{name}={otype}:{oid}")
+            backend_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
+        ccb_extras_ok = True
+        ccb_extra_tokens: list[str] = []
+        for extra_path in CCB_WEB_EXTRA_PATHS:
+            parts_p = extra_path.split("/")
+            for idx in range(1, len(parts_p)):
+                anc = "/".join(parts_p[:idx])
+                if anc in all_entries and all_entries[anc][:2] != ("040000", "tree"):
+                    ccb_extras_ok = False
+                    break
+            if not ccb_extras_ok:
+                break
+            if extra_path not in all_entries:
+                ccb_extra_tokens.append(f"extra:{extra_path}=missing")
+            else:
+                emode, eotype, eoid = all_entries[extra_path]
+                if emode not in REGULAR_MODES or eotype != "blob":
+                    ccb_extras_ok = False
+                    break
+                ccb_extra_tokens.append(f"extra:{extra_path}={emode}:{eotype}:{eoid}")
+        backend_ccb_items = [*backend_items, *ccb_extra_tokens] if ccb_extras_ok else full_items
     else:
         backend_items = full_items
+        backend_ccb_items = full_items
 
     if gateway_scope_ok:
         gateway_items = list(base_items)
-        for name, (otype, oid) in sorted(pkg_entries.items()):
+        for name, (mode, otype, oid) in sorted(pkg_entries.items()):
             if name in ("web-react", "commercial", "cli"):
                 continue
-            gateway_items.append(f"pkg:{name}={otype}:{oid}")
-        gateway_items.append(f"extra:packages/commercial/agent-sandbox={resolved_extra['packages/commercial/agent-sandbox']}")
-        gateway_items.append(f"extra:packages/commercial/package.json={resolved_extra['packages/commercial/package.json']}")
+            gateway_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
+        gateway_items.append(f"extra:packages/commercial/agent-sandbox={format_entry('packages/commercial/agent-sandbox')}")
+        gateway_items.append(f"extra:packages/commercial/package.json={format_entry('packages/commercial/package.json')}")
     else:
         gateway_items = backend_items
 
@@ -358,8 +415,8 @@ def compute_scope_digests(
         for name in ("protocol", "storage"):
             if name not in pkg_entries:
                 raise ValueError(f"missing required package {name}")
-            otype, oid = pkg_entries[name]
-            storage_items.append(f"pkg:{name}={otype}:{oid}")
+            mode, otype, oid = pkg_entries[name]
+            storage_items.append(f"pkg:{name}={mode}:{otype}:{oid}")
     else:
         storage_items = backend_items
 
@@ -367,6 +424,7 @@ def compute_scope_digests(
         "storage": storage_items,
         "gateway": gateway_items,
         "backend": backend_items,
+        "backend_ccb": backend_ccb_items,
         "full": full_items,
     }
 
@@ -450,11 +508,12 @@ def gc_receipts(cache_dir: Path, protected_names: set[str] | None = None) -> Non
     if len(entries) <= MAX_RECEIPTS:
         return
     entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    kept = 0
+    kept = sum(1 for _mtime, name, _path in entries if name in protected)
     for _mtime, name, path in entries:
-        if name in protected or kept < MAX_RECEIPTS:
-            if name not in protected:
-                kept += 1
+        if name in protected:
+            continue
+        if kept < MAX_RECEIPTS:
+            kept += 1
             continue
         try:
             path.unlink()

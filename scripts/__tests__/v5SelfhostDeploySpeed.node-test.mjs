@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {execFileSync,spawnSync} from 'node:child_process';
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,chmodSync,existsSync,statSync} from 'node:fs';
+import {createHash} from 'node:crypto';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,chmodSync,existsSync,statSync,lstatSync,linkSync,readlinkSync,utimesSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -15,7 +16,7 @@ const hostPolicy=readFileSync(join(root,'scripts/lib/v5-selfhost-host-log-policy
 const hostPolicyFiles=['scripts/v5-selfhost-host-log-policy.py','deploy/v5-selfhost/host-log-policy.json','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost-egress-watch'];
 const modelPolicyFiles=['deploy/v5-selfhost/model-availability.json','scripts/lib/selfhost-model-policy.mjs','packages/commercial/src/billing/modelAvailability.ts'];
 const q=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
-const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',`source ${q(join(root,'scripts/lib/v5-selfhost-model-policy.sh'))}`,block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'master_seed_frontend_buildinfo'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
+const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',`source ${q(join(root,'scripts/lib/v5-selfhost-model-policy.sh'))}`,block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'master_seed_frontend_buildinfo'),fn(m,'master_save_frontend_buildinfo'),fn(m,'harden_unique_release_tree'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
 const asRoot=typeof process.getuid==='function'&&process.getuid()===0;
 function fixture(t){
  const dir=mkdtempSync(join(tmpdir(),'oc-deploy-speed-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const repo=join(dir,'repo');
@@ -229,4 +230,189 @@ test('P2: bg build starts after admission; non-Box gates overlap it; Box gates a
   for(const x of b.matchAll(new RegExp(g.replaceAll('.','\\.'),'g')))assert.ok(x.index>idle,g);
  for(const x of b.matchAll(/TEST_DATABASE_URL="\$MASTER_GATE_DB_URL"/g))assert.ok(x.index>db&&x.index<drop);
  assert.ok(at('  tsum_mark C.ccb-mcp ')>drop&&at('  tsum_mark C.ccb-mcp ')<at('\n  cleanup_master_gate_tmpdir\n'));
+});
+
+test('OCV5-775: persistent .tsc-cache survives interrupted train and feeds master_seed_frontend_buildinfo when donor lacks tsbuildinfo',t=>{
+ const parent=(asRoot&&existsSync('/root'))?'/root':tmpdir();
+ const safeDir=mkdtempSync(join(parent,'oc-tsc-cache-'));
+ chmodSync(safeDir,0o700);
+ t.after(()=>rmSync(safeDir,{recursive:true,force:true}));
+ const f=fixture(t);
+ const cacheDir=join(safeDir,'releases/.tsc-cache');
+
+ // 1) Save fresh buildinfo from a staging build (simulating D completing before a later gate fails).
+ const st1=join(safeDir,'staging1/packages/web-react');mkdirSync(st1,{recursive:true});
+ writeFileSync(join(st1,'tsconfig.tsbuildinfo'),'fresh-cache-buildinfo\n');
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_save_frontend_buildinfo ${q(join(safeDir,'staging1'))}`));
+ const cachedFile=join(cacheDir,'web-react.tsbuildinfo');
+ assert.equal(readFileSync(cachedFile,'utf8'),'fresh-cache-buildinfo\n');
+
+ // 2) Reused mode (prefer_freshest=0): when web_donor lacks tsconfig.tsbuildinfo (legacy prewarm bucket),
+ // master_seed_frontend_buildinfo falls back to .tsc-cache, sets mtime=0, mode=0644, and never shares the inode!
+ const bareDonor=join(safeDir,'bare-web-donor/packages/web-react/dist');mkdirSync(bareDonor,{recursive:true});
+ const st2=join(safeDir,'staging2/packages/web-react');mkdirSync(st2,{recursive:true});
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_seed_frontend_buildinfo ${q(join(safeDir,'bare-web-donor'))} ${q(join(safeDir,'staging2'))}`));
+ const seeded2=join(st2,'tsconfig.tsbuildinfo');
+ assert.equal(readFileSync(seeded2,'utf8'),'fresh-cache-buildinfo\n');
+ const seeded2St=statSync(seeded2);
+ assert.notEqual(seeded2St.ino,statSync(cachedFile).ino,'seeded tsbuildinfo must not share the cache inode');
+ assert.equal(Math.floor(seeded2St.mtimeMs),0,'mtime must be reset to @0 so tsc -b re-hashes all sources');
+ assert.equal(seeded2St.mode&0o777,0o644);
+
+ // 3) Built mode (prefer_freshest=1): fresher .tsc-cache wins over an older donor's tsconfig.tsbuildinfo!
+ const oldDonor=join(safeDir,'old-donor/packages/web-react');mkdirSync(oldDonor,{recursive:true});
+ const oldInfo=join(oldDonor,'tsconfig.tsbuildinfo');
+ writeFileSync(oldInfo,'stale-donor-buildinfo\n');
+ utimesSync(oldInfo,100,100);
+ utimesSync(cachedFile,200,200);
+ const st3=join(safeDir,'staging3/packages/web-react');mkdirSync(st3,{recursive:true});
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_seed_frontend_buildinfo ${q(join(safeDir,'old-donor'))} ${q(join(safeDir,'staging3'))} 1`));
+ assert.equal(readFileSync(join(st3,'tsconfig.tsbuildinfo'),'utf8'),'fresh-cache-buildinfo\n');
+
+ // 4) Trust boundaries: root rejects world-writable /tmp ancestor; non-root rejects production paths;
+ // BOTH root and non-root reject symlinked ancestors (`private/link/parent/cache`) and group-writable (0777/0664) donors!
+ const realTarget=join(safeDir,'real-target');mkdirSync(join(realTarget,'parent'),{recursive:true});chmodSync(realTarget,0o700);chmodSync(join(realTarget,'parent'),0o700);
+ const symHolder=join(safeDir,'private');mkdirSync(symHolder,{recursive:true});chmodSync(symHolder,0o700);
+ symlinkSync(realTarget,join(symHolder,'link'));
+ const symCache=join(symHolder,'link/parent/cache');
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(symCache)}; master_save_frontend_buildinfo ${q(join(safeDir,'staging1'))}`));
+ assert.equal(existsSync(join(realTarget,'parent/cache/web-react.tsbuildinfo')),false,'must refuse saving through ancestor symlink');
+ mkdirSync(join(realTarget,'parent/cache'),{recursive:true});chmodSync(join(realTarget,'parent/cache'),0o700);
+ writeFileSync(join(realTarget,'parent/cache/web-react.tsbuildinfo'),'evil-symlink-cache\n');chmodSync(join(realTarget,'parent/cache/web-react.tsbuildinfo'),0o600);
+ const stSym=join(safeDir,'staging-sym/packages/web-react');mkdirSync(stSym,{recursive:true});
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(symCache)}; master_seed_frontend_buildinfo "" ${q(join(safeDir,'staging-sym'))}`));
+ assert.equal(existsSync(join(stSym,'tsconfig.tsbuildinfo')),false,'must refuse seeding through ancestor symlink');
+
+ const gwDonor=join(safeDir,'gw-donor/packages/web-react');mkdirSync(gwDonor,{recursive:true});
+ writeFileSync(join(gwDonor,'tsconfig.tsbuildinfo'),'group-writable-donor\n');
+ chmodSync(join(gwDonor,'tsconfig.tsbuildinfo'),0o664);
+ const stGw1=join(safeDir,'staging-gw1/packages/web-react');mkdirSync(stGw1,{recursive:true});
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(join(safeDir,'empty-cache'))}; master_seed_frontend_buildinfo ${q(join(safeDir,'gw-donor'))} ${q(join(safeDir,'staging-gw1'))}`));
+ assert.equal(existsSync(join(stGw1,'tsconfig.tsbuildinfo')),false,'must refuse 0664 group-writable donor buildinfo');
+ chmodSync(join(gwDonor,'tsconfig.tsbuildinfo'),0o644);
+ chmodSync(gwDonor,0o777);
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(join(safeDir,'empty-cache'))}; master_seed_frontend_buildinfo ${q(join(safeDir,'gw-donor'))} ${q(join(safeDir,'staging-gw1'))}`));
+ assert.equal(existsSync(join(stGw1,'tsconfig.tsbuildinfo')),false,'must refuse 0777 writable donor directory');
+
+ if(asRoot){
+  const badCache=join(f.dir,'untrusted-tmp-cache');
+  ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(badCache)}; master_save_frontend_buildinfo ${q(join(safeDir,'staging1'))}`));
+  assert.equal(existsSync(join(badCache,'web-react.tsbuildinfo')),false,'root must refuse /tmp tsc cache');
+ }else{
+  const prodCache='/opt/openclaude/openclaude-v5-selfhost-releases/.tsc-cache';
+  const r=bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(prodCache)}; master_save_frontend_buildinfo ${q(join(safeDir,'staging1'))}`);
+  assert.equal(r.status,0);assert.match(r.stderr,/cache save skipped/);
+ }
+});
+
+const tscBin=[
+ process.env.OC_TEST_TSC_BIN,
+ join(root,'node_modules/typescript/bin/tsc'),
+ '/opt/openclaude/openclaude-v5-selfhost/node_modules/typescript/bin/tsc',
+ '/home/agent/.openclaude/workspace/ocv5-t1667-muse-api/node_modules/typescript/bin/tsc',
+].find(p=>p&&existsSync(p));
+
+test('OCV5-775: real tsc -b compiler catches type errors across distinct staging paths despite @0 seeded or corrupted tsbuildinfo',{skip:!tscBin&&'typescript compiler binary unavailable'},t=>{
+ const parent=(asRoot&&existsSync('/root'))?'/root':tmpdir();
+ const safeDir=mkdtempSync(join(parent,'oc-real-tsc-'));
+ chmodSync(safeDir,0o700);
+ t.after(()=>rmSync(safeDir,{recursive:true,force:true}));
+ const f=fixture(t);
+ const cacheDir=join(safeDir,'releases/.tsc-cache');
+ const tsconfig=JSON.stringify({
+  compilerOptions:{target:'ES2022',module:'ESNext',moduleResolution:'Bundler',strict:true,noEmit:true,incremental:true,tsBuildInfoFile:'tsconfig.tsbuildinfo',skipLibCheck:true},
+  include:['src'],
+ })+'\n';
+ const mkStage=(name,appSrc)=>{
+  const pkg=join(safeDir,name,'packages/web-react');
+  mkdirSync(join(pkg,'src'),{recursive:true});
+  writeFileSync(join(pkg,'tsconfig.json'),tsconfig);
+  writeFileSync(join(pkg,'src/App.ts'),appSrc);
+  return join(safeDir,name);
+ };
+ const runTsc=stage=>spawnSync(process.execPath,[tscBin,'-b'],{cwd:join(stage,'packages/web-react'),env:f.env,encoding:'utf8',timeout:30000});
+
+ // 1) Clean build in staging-a emits real compiler tsconfig.tsbuildinfo -> saved to .tsc-cache.
+ const stA=mkStage('staging-a','export const value: number = 100;\n');
+ const rA=runTsc(stA);
+ assert.equal(rA.status,0,rA.stdout+rA.stderr);
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_save_frontend_buildinfo ${q(stA)}`));
+ assert.ok(statSync(join(cacheDir,'web-react.tsbuildinfo')).size>50);
+
+ // 2) New staging path staging-b introduces a same-byte-length type error ("bad" vs 100), seeds @0 buildinfo -> MUST FAIL TS2322!
+ const stB=mkStage('staging-b','export const value: number = "x";\n');
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_seed_frontend_buildinfo "" ${q(stB)} 1`));
+ assert.equal(Math.floor(statSync(join(stB,'packages/web-react/tsconfig.tsbuildinfo')).mtimeMs),0);
+ const rB=runTsc(stB);
+ assert.notEqual(rB.status,0,'seeded @0 tsbuildinfo must never suppress a real type error');
+ assert.match(rB.stdout+rB.stderr,/TS2322/);
+
+ // 3) Corrupted/garbage tsbuildinfo in .tsc-cache still fails broken code and recovers cleanly on valid code!
+ writeFileSync(join(cacheDir,'web-react.tsbuildinfo'),'{corrupt-not-json\n');
+ chmodSync(join(cacheDir,'web-react.tsbuildinfo'),asRoot?0o644:0o600);
+ const stC=mkStage('staging-c','export const value: number = "y";\n');
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_seed_frontend_buildinfo "" ${q(stC)} 1`));
+ const rC=runTsc(stC);
+ assert.notEqual(rC.status,0);assert.match(rC.stdout+rC.stderr,/TS2322/);
+
+ const stD=mkStage('staging-d','export const value: number = 200;\n');
+ ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_seed_frontend_buildinfo "" ${q(stD)} 1`));
+ const rD=runTsc(stD);
+ assert.equal(rD.status,0,rD.stdout+rD.stderr);
+});
+
+test('OCV5-775: pipelined release_artifact_digest matches v2 reference byte-for-byte across multi-chunk/symlink trees, and single-pass harden_unique_release_tree preserves shared donor inodes',t=>{
+ const f=fixture(t);
+ const rel=join(f.dir,'digest-tree');
+ mkdirSync(join(rel,'sub/nested'),{recursive:true});
+ writeFileSync(join(rel,'empty.txt'),'');chmodSync(join(rel,'empty.txt'),0o644);
+ writeFileSync(join(rel,'bin.sh'),'#!/bin/sh\necho hi\n');chmodSync(join(rel,'bin.sh'),0o755);
+ // 2.6 MiB file spans multiple 1 MiB os.read chunks and >2 MiB BATCH_BYTES queue flushes.
+ const big=Buffer.alloc(2_726_297);
+ for(let i=0;i<big.length;i++)big[i]=(i*31+7)&0xff;
+ writeFileSync(join(rel,'sub/nested/big.bin'),big);chmodSync(join(rel,'sub/nested/big.bin'),0o644);
+ symlinkSync('../empty.txt',join(rel,'sub/link-empty'));
+ // Shared hardlinked donor file (nlink == 2) outside rel.
+ const donorFile=join(f.dir,'donor-shared.js');
+ writeFileSync(donorFile,'shared\n');chmodSync(donorFile,0o644);
+ linkSync(donorFile,join(rel,'sub/shared.js'));
+ writeFileSync(join(rel,'.complete'),'{"ignored":true}\n');
+
+ // Compute independent reference openclaude-release-artifact-v2\0 SHA-256 in Node.
+ const h=createHash('sha256');h.update(Buffer.from('openclaude-release-artifact-v2\0','utf8'));
+ const field=v=>{const b=Buffer.isBuffer(v)?v:Buffer.from(String(v),'utf8');const len=Buffer.alloc(8);len.writeBigUInt64BE(BigInt(b.length));h.update(len);h.update(b);};
+ const rst=lstatSync(rel);
+ field('D');field('');field(String(rst.mode&0o7777));field(String(rst.uid));field(String(rst.gid));
+ const rows=[];
+ const collect=(dir,prefix)=>{
+  for(const name of execFileSync('ls',['-A1',dir],{encoding:'utf8'}).split('\n').filter(Boolean)){
+   if(!prefix&&name==='.complete')continue;
+   const r=prefix?`${prefix}/${name}`:name,abs=join(dir,name);
+   rows.push([Buffer.from(r,'utf8'),abs]);
+   const st=lstatSync(abs);
+   if(st.isDirectory())collect(abs,r);
+  }
+ };
+ collect(rel,'');
+ rows.sort((a,b)=>Buffer.compare(a[0],b[0]));
+ for(const[rBuf,abs]of rows){
+  const st=lstatSync(abs),m=String(st.mode&0o7777),u=String(st.uid),g=String(st.gid);
+  if(st.isFile()){field('F');field(rBuf);field(m);field(u);field(g);field(String(st.size));h.update(readFileSync(abs));}
+  else if(st.isDirectory()){field('D');field(rBuf);field(m);field(u);field(g);}
+  else if(st.isSymbolicLink()){field('L');field(rBuf);field(m);field(u);field(g);field(Buffer.from(readlinkSync(abs),'utf8'));}
+ }
+ const expected=h.digest('hex');
+ const actual=ok(bash(f,webLib,`release_artifact_digest ${q(rel)}`));
+ assert.equal(actual,expected,'pipelined release_artifact_digest must match v2 reference byte-for-byte');
+
+ if(asRoot){
+  ok(bash(f,webLib,`harden_unique_release_tree ${q(rel)}`));
+  assert.equal(lstatSync(join(rel,'empty.txt')).mode&0o777,0o444);
+  assert.equal(lstatSync(join(rel,'bin.sh')).mode&0o777,0o555);
+  assert.equal(lstatSync(join(rel,'sub/nested')).mode&0o777,0o555);
+  assert.equal(lstatSync(join(rel,'sub')).mode&0o777,0o555);
+  assert.equal(lstatSync(donorFile).mode&0o777,0o644,'shared donor inode (nlink>1) must stay untouched');
+  const expectedAfterHarden=ok(bash(f,webLib,`release_artifact_digest ${q(rel)}`));
+  assert.match(expectedAfterHarden,/^[0-9a-f]{64}$/);
+ }
 });
