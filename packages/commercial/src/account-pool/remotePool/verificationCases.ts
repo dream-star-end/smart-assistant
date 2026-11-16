@@ -26,7 +26,7 @@ import {
 import type { Pool } from 'pg'
 import type { RemoteDriverVerificationCaseLane } from './driftCoordinator.js'
 import type { RemoteDriverRegistryEntry } from './registry.js'
-import { runCasesG5ToG7 } from './verificationCasesExt.js'
+import { assertRemoteStopProof, runCasesG5ToG7 } from './verificationCasesExt.js'
 import type { VerificationContainerProofResult } from './verificationRuntimeProof.js'
 
 function need(condition: unknown, code = 'REMOTE_VERIFICATION_CASE_FAILED'): asserts condition {
@@ -184,25 +184,7 @@ async function countUsageRowsForRequest(pool: Pool, requestId: string): Promise<
   return Number(r.rows[0]?.cnt ?? 0)
 }
 
-function assertRemoteStopProof(proof: unknown): { scopes: unknown[]; populated: number } {
-  need(proof && typeof proof === 'object', 'REMOTE_STOP_PROOF_MISSING')
-  const p = proof as {
-    remoteStopped?: boolean
-    proof?: { scopes?: unknown[]; populated?: number }
-    fence?: { scopes?: unknown[] }
-  }
-  const remoteStopped = p.remoteStopped === true || Boolean(p.proof || p.fence)
-  need(remoteStopped, 'REMOTE_STOP_PROOF_INVALID')
-  const scopes = Array.isArray(p.proof?.scopes)
-    ? p.proof!.scopes
-    : Array.isArray(p.fence?.scopes)
-      ? p.fence!.scopes
-      : []
-  need(scopes.length === 2, 'REMOTE_STOP_PROOF_SCOPES_INVALID')
-  const populated = typeof p.proof?.populated === 'number' ? p.proof.populated : 0
-  need(populated === 0, 'REMOTE_STOP_PROOF_POPULATED_NONZERO')
-  return { scopes, populated }
-}
+export { assertRemoteStopProof }
 
 export async function runAllVerificationCases(ctx: VerificationCaseContext): Promise<{
   readonly items: Record<string, unknown>
@@ -380,7 +362,7 @@ export async function runAllVerificationCases(ctx: VerificationCaseContext): Pro
       'G4PRE_UNEXPECTED_USAGE',
     )
     const preClosed = await ctx.closeSubLane(g4pre, { absentFiles: [`${g4pre.laneCwd}/pre.txt`] })
-    assertRemoteStopProof(preClosed.remoteStopProof)
+    assertRemoteStopProof(preClosed.remoteStopProof, { allowPreStartNoEffect: true })
 
     trackLane('g4mid')
     const g4mid = await ctx.openSubLane('g4mid', { barrierMode: 'hold_until_release' })
@@ -453,7 +435,6 @@ export async function runAllVerificationCases(ctx: VerificationCaseContext): Pro
   await runCasesG5ToG7(ctx, {
     buildWritePrompt,
     countUsageRowsForRequest: (requestId) => countUsageRowsForRequest(ctx.pool, requestId),
-    assertRemoteStopProof,
     trackLane,
     trackReq,
     items,
