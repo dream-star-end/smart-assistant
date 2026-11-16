@@ -66,6 +66,7 @@ export function createSubLaneOperations(ctx: {
   readonly checkCancelled: () => void
 }) {
   const laneReceipts = new Map<string, RemoteReceiptV4[]>()
+  const laneStopProofs = new Map<string, unknown>()
 
   const closeSubLane = async (
     lane: VerificationSubLaneHandle,
@@ -75,12 +76,15 @@ export function createSubLaneOperations(ctx: {
       readonly keepState?: boolean
     },
   ): Promise<VerificationLaneCloseResult> => {
+    const laneKey = `${lane.operationId}:${lane.generation}`
     if (lane.closed) {
       return {
         calls: [],
         nativeSessionId: null,
         proofs: [],
-        remoteStopProof: (lane.host as { verifiedStopEvidence?: unknown }).verifiedStopEvidence,
+        remoteStopProof:
+          (lane.host as { verifiedStopEvidence?: unknown }).verifiedStopEvidence ??
+          laneStopProofs.get(laneKey),
       }
     }
     lane.closed = true
@@ -89,8 +93,9 @@ export function createSubLaneOperations(ctx: {
     await lane.relay.stop().catch(() => {})
     const hostStop = (lane.host as { verifiedStopEvidence?: { remoteStopped?: boolean } })
       .verifiedStopEvidence
+    let stopRes: { remoteStopped: true; noHostEffect?: boolean } | undefined
     if (!hostStop) {
-      const stopRes = await lane.host.stop()
+      stopRes = await lane.host.stop()
       need(stopRes?.remoteStopped === true, 'REMOTE_VERIFICATION_STOP_NOT_PROVEN')
     }
     if (!audit?.keepState) {
@@ -109,9 +114,12 @@ export function createSubLaneOperations(ctx: {
       expectedFiles: audit?.expectedFiles,
       absentFiles: audit?.absentFiles,
     })
+    const effectiveStopProof =
+      (lane.host as { verifiedStopEvidence?: unknown }).verifiedStopEvidence ?? stopRes
+    laneStopProofs.set(laneKey, effectiveStopProof)
     return {
       ...workerClosed,
-      remoteStopProof: (lane.host as { verifiedStopEvidence?: unknown }).verifiedStopEvidence,
+      remoteStopProof: effectiveStopProof,
       containerProof,
     }
   }

@@ -5,11 +5,58 @@
 import { isDeepStrictEqual } from 'node:util'
 import { computeCostFen, normalizeUsageWithPolicy, validateUsagePolicy } from '@openclaude/protocol'
 import type { RemoteDriverVerificationCaseLane } from './driftCoordinator.js'
-import { recordRemoteDriverLaneState } from './placement.js'
 import type { VerificationCaseContext } from './verificationCases.js'
 
 function need(condition: unknown, code = 'REMOTE_VERIFICATION_CASE_FAILED'): asserts condition {
   if (!condition) throw new Error(code)
+}
+
+export function assertRemoteStopProof(
+  proof: unknown,
+  options?: { readonly allowPreStartNoEffect?: boolean },
+): { scopes: unknown[]; populated: number } {
+  need(proof && typeof proof === 'object', 'REMOTE_STOP_PROOF_MISSING')
+  const p = proof as {
+    remoteStopped?: boolean
+    noHostEffect?: boolean
+    proof?: { remoteStopped?: boolean; scopes?: unknown[]; populated?: number }
+    fence?: { scopes?: unknown[] }
+  }
+  const remoteStopped =
+    p.remoteStopped === true || p.proof?.remoteStopped === true || Boolean(p.proof || p.fence)
+  need(remoteStopped, 'REMOTE_STOP_PROOF_INVALID')
+  if (
+    options?.allowPreStartNoEffect === true &&
+    p.noHostEffect === true &&
+    p.remoteStopped === true &&
+    !p.proof &&
+    !p.fence
+  ) {
+    return { scopes: [], populated: 0 }
+  }
+  const proofScopes = p.proof?.scopes
+  const fenceScopes = p.fence?.scopes
+  const scopes = Array.isArray(proofScopes)
+    ? proofScopes
+    : Array.isArray(fenceScopes)
+      ? fenceScopes
+      : []
+  if (options?.allowPreStartNoEffect === true) {
+    need(scopes.length <= 2, 'REMOTE_STOP_PROOF_SCOPES_INVALID')
+  } else {
+    need(scopes.length === 2, 'REMOTE_STOP_PROOF_SCOPES_INVALID')
+  }
+  const populated = typeof p.proof?.populated === 'number' ? p.proof.populated : 0
+  need(populated === 0, 'REMOTE_STOP_PROOF_POPULATED_NONZERO')
+  for (const scope of scopes) {
+    if (scope && typeof scope === 'object') {
+      const sp = (scope as { populated?: unknown }).populated
+      if (typeof sp === 'number') {
+        need(sp === 0, 'REMOTE_STOP_PROOF_POPULATED_NONZERO')
+      }
+    }
+  }
+  return { scopes, populated }
 }
 
 export async function runCasesG5ToG7(
@@ -17,20 +64,12 @@ export async function runCasesG5ToG7(
   helpers: {
     readonly buildWritePrompt: (filePath: string, content: string, tag: string) => string
     readonly countUsageRowsForRequest: (requestId: string) => Promise<number>
-    readonly assertRemoteStopProof: (proof: unknown) => { scopes: unknown[]; populated: number }
     readonly trackLane: (l: RemoteDriverVerificationCaseLane) => void
     readonly trackReq: (id: string) => void
     readonly items: Record<string, unknown>
   },
 ): Promise<void> {
-  const {
-    buildWritePrompt,
-    countUsageRowsForRequest,
-    assertRemoteStopProof,
-    trackLane,
-    trackReq,
-    items,
-  } = helpers
+  const { buildWritePrompt, countUsageRowsForRequest, trackLane, trackReq, items } = helpers
 
   // Item 5 (G5): 2-turn warm accounting parity against model_pricing, usage_records, journal & remote_native_turns
   {
@@ -189,13 +228,14 @@ export async function runCasesG5ToG7(
       if (!pre.memoryOk) {
         g7newRejected = true
       } else {
-        const resNew = await ctx.submitSubLaneTurn(
+        const newTurn = await ctx.startSubLaneTurn(
           g7new,
           1,
           buildWritePrompt(`${g7new.laneCwd}/g7new.txt`, 'SHOULD_FAIL', 'g7new'),
         )
-        newTurnReqId = resNew.requestId
-        trackReq(resNew.requestId)
+        newTurnReqId = newTurn.requestId
+        trackReq(newTurn.requestId)
+        const resNew = await newTurn.waitDone()
         if (resNew.summary?.isError || resNew.calls.length === 0) {
           g7newRejected = true
         }
@@ -207,11 +247,13 @@ export async function runCasesG5ToG7(
     if (newTurnReqId) {
       need((await countUsageRowsForRequest(newTurnReqId)) === 0, 'G7NEW_CHARGED_CREDITS')
     }
-    await recordRemoteDriverLaneState(g7new.operationId, g7new.generation, 'released', ctx.pool)
     const g7newClosed = await ctx.closeSubLane(g7new, {
       absentFiles: [`${g7new.laneCwd}/g7new.txt`],
-      keepState: true,
     })
+    need(
+      g7newClosed.remoteStopProof !== undefined && g7newClosed.remoteStopProof !== null,
+      'G7NEW_STOP_PROOF_MISSING',
+    )
     const g7newStopScopes = (
       g7newClosed.remoteStopProof as { proof?: { scopes?: unknown[] } } | undefined
     )?.proof?.scopes

@@ -54,6 +54,7 @@ import {
   verifySandboxRedProofForDriver,
 } from '../account-pool/remotePool/index.js'
 import { computeProductionConformanceSuiteDigest } from '../account-pool/remotePool/profileCutover.js'
+import { assertRemoteStopProof } from '../account-pool/remotePool/verificationCasesExt.js'
 import { buildProveRunLocalStoppedPy } from '../account-pool/remotePool/verificationRuntimeProof.js'
 import { ModelCatalogSnapshot } from '../billing/modelCatalog.js'
 import { InMemoryPreCheckRedis } from '../billing/preCheck.js'
@@ -618,13 +619,25 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
             const isLowMem =
               typeof spec.manifest.maxSliceMemoryBytes === 'number' &&
               spec.manifest.maxSliceMemoryBytes <= 64 * 1024 * 1024
-            const stopObj = {
-              remoteStopped: true,
-              proof: { scopes: isLowMem ? [] : ['s1', 's2'], populated: 0 },
-              fence: { scopes: isLowMem ? [] : ['s1', 's2'] },
-            }
+            let provisioned = false
+            let stopped = false
+            let stopObj: unknown
+            const origProvision = base.provision.bind(base)
             Object.defineProperties(base, {
-              verifiedStopEvidence: { get: () => stopObj, configurable: true },
+              verifiedStopEvidence: {
+                get: () => (stopped && provisioned && !isLowMem ? stopObj : undefined),
+                configurable: true,
+              },
+              provision: {
+                value: async (
+                  tools: unknown,
+                  defaultsContext?: Readonly<Record<string, unknown>>,
+                ) => {
+                  provisioned = true
+                  return origProvision(tools, defaultsContext)
+                },
+                configurable: true,
+              },
               preflight: {
                 value: async () =>
                   typeof spec.manifest.maxSliceMemoryBytes === 'number' &&
@@ -640,7 +653,26 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
               stop: {
                 value: async () => {
                   await RemotePoolSshHost.prototype.stop.call(base).catch(() => {})
-                  return stopObj
+                  stopped = true
+                  if (!provisioned) {
+                    return { remoteStopped: true as const, noHostEffect: true }
+                  }
+                  if (isLowMem) {
+                    stopObj = {
+                      fence: { scopes: [] },
+                      proof: { remoteStopped: true, scopes: [], populated: 0 },
+                    }
+                    return { remoteStopped: true as const, noHostEffect: true }
+                  }
+                  stopObj = {
+                    fence: { scopes: [{ populated: 0 }, { populated: 0 }] },
+                    proof: {
+                      remoteStopped: true,
+                      scopes: [{ populated: 0 }, { populated: 0 }],
+                      populated: 0,
+                    },
+                  }
+                  return { remoteStopped: true as const, noHostEffect: false }
                 },
                 configurable: true,
               },
@@ -1194,4 +1226,26 @@ test('Group 7: getProfileStatus returns live codex columns and resolveLegacyCcCo
   assert.ok(resolvedPath.endsWith('/scripts/agent-remote/cc5-host-controller.py'))
   assert.equal(existsSync(resolvedPath), true)
   assert.equal(resolveLegacyCcControllerPath('/tmp/nonexistent-other.py'), '/tmp/nonexistent-other.py')
+})
+
+test('assertRemoteStopProof enforces strict dual-scope proofs by default and allows pre-start noHostEffect only with opt-in', () => {
+  assert.throws(() => assertRemoteStopProof(undefined), /REMOTE_STOP_PROOF_MISSING/)
+  assert.throws(
+    () => assertRemoteStopProof({ remoteStopped: true, noHostEffect: true }),
+    /REMOTE_STOP_PROOF_SCOPES_INVALID/,
+  )
+  assert.deepEqual(
+    assertRemoteStopProof(
+      { remoteStopped: true, noHostEffect: true },
+      { allowPreStartNoEffect: true },
+    ),
+    { scopes: [], populated: 0 },
+  )
+  assert.throws(
+    () =>
+      assertRemoteStopProof({
+        proof: { remoteStopped: true, scopes: [{ populated: 0 }, { populated: 1 }], populated: 0 },
+      }),
+    /REMOTE_STOP_PROOF_POPULATED_NONZERO/,
+  )
 })
