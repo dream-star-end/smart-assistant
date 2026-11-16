@@ -10860,6 +10860,40 @@
           "assertion": "idle session arbitrates cross-container cursor_reset only when containerId is supplied (INC-20261115-CONTAINER-SWAP-FRAMESEQ)"
         }
       ]
+    },
+    {
+      "id": "INC-20261116-REMOTE-V4-FENCE-ORPHAN",
+      "occurredAt": "2026-11-16",
+      "severity": "P1",
+      "symptom": "个人版 V5 selfhost 会话 webmwjab4u1r7hcnb（claude-opus-5-5-remote，dispatch_id=0b7ee01d-0fa2-4b38-9d8a-85ef5891951c）：remote-driver-v4 回合在本地工具宿主触发 CC5_TOOLHOST_EXECUTION_UNKNOWN 熔断后，RemoteEngineAdapter.submitTurn 同步调用 finalizeWith(null) 置 turn.finalized=true，使 sessionTurnRunner 的 handleError 200ms 延迟落盘被短路、finalizeTurn(null) 与升级版 runner.shutdown() 后 targetTurn.finalized 分支均静默跳过 persistTerminalSnapshot，导致未落终态 tape、未发终态帧；宿主机 ContainerLink 持续续租 turn_dispatches.lease_until 与容器 turn_dispatch_inbox 的 dispatchLeaseActive 守卫互锁，前端永久显示处理中且点击停止因 TURN_NOT_ACTIVE 仍恢复运行态。",
+      "rootFixCommit": "3b60eab8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/remotePoolTerminalSettlement.test.ts",
+          "assertion": "mid-turn CC5_TOOLHOST_EXECUTION_UNKNOWN after completed tool persists crashed tape and terminal inbox once (INC-20261116-REMOTE-V4-FENCE-ORPHAN)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/remotePoolTerminalSettlement.test.ts",
+          "assertion": "escalated user Stop during hung tool persists USER_CANCELLED tape instead of dropping on finalized null summary (INC-20261116-REMOTE-V4-FENCE-ORPHAN)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/remotePoolTerminalSettlement.test.ts",
+          "assertion": "planned gateway beginPlannedShutdown mid-turn persists SERVICE_RESTART with no_response waiver instead of RUNNER_CRASHED (INC-20261116-REMOTE-V4-FENCE-ORPHAN)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/remotePoolTerminalSettlement.test.ts",
+          "assertion": "pre-dispatch explicit user Stop waits for master ACK before surfacing error while pre-dispatch fence persists crashed tape (INC-20261116-REMOTE-V4-FENCE-ORPHAN)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "mid-turn CC5_TOOLHOST_EXECUTION_UNKNOWN after completed tool persists crashed tape and terminal inbox once (INC-20261116-REMOTE-V4-FENCE-ORPHAN)"
+        }
+      ]
     }
   ]
 }
