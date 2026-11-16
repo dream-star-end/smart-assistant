@@ -240,10 +240,27 @@ test('OCV5-775: persistent .tsc-cache survives interrupted train and feeds maste
  const f=fixture(t);
  const cacheDir=join(safeDir,'releases/.tsc-cache');
 
- // 1) Save fresh buildinfo from a staging build (simulating D completing before a later gate fails).
- const st1=join(safeDir,'staging1/packages/web-react');mkdirSync(st1,{recursive:true});
- writeFileSync(join(st1,'tsconfig.tsbuildinfo'),'fresh-cache-buildinfo\n');
- ok(bash(f,webLib,`OC_V5_TSC_CACHE_DIR=${q(cacheDir)}; master_save_frontend_buildinfo ${q(join(safeDir,'staging1'))}`));
+ // 1) Extract staging via the ACTUAL production build_master_release git archive | tar pipeline
+ // even under a permissive caller umask (0002) and under root (where bare `tar -x` preserves git archive's 0775 dirs!),
+ // proving both master_seed_frontend_buildinfo and master_save_frontend_buildinfo accept the extracted staging tree!
+ const bmr=fn(m,'build_master_release');
+ const archiveSection=block(bmr,/^  mkdir -p -- "\$staging"/m,/^  \[\[ -f "\$staging\/package-lock\.json" \]\]/m);
+ const st1Root=join(safeDir,'staging1');
+ const st1=join(st1Root,'packages/web-react');
+ const initDonor=join(safeDir,'init-donor/packages/web-react');mkdirSync(initDonor,{recursive:true});
+ writeFileSync(join(initDonor,'tsconfig.tsbuildinfo'),'initial-donor-buildinfo\n');
+ ok(bash(f,webLib,[
+  'umask 0002',
+  'cleanup_master_staging() { :; }',
+  `staging=${q(st1Root)}; full_sha=${q(f.base)}`,
+  archiveSection,
+  `OC_V5_TSC_CACHE_DIR=${q(cacheDir)}`,
+  `master_seed_frontend_buildinfo ${q(join(safeDir,'init-donor'))} "$staging" 1`,
+  'test "$(cat "$staging/packages/web-react/tsconfig.tsbuildinfo")" = initial-donor-buildinfo',
+  '( umask 022 && printf "fresh-cache-buildinfo\\n" >"$staging/packages/web-react/tsconfig.tsbuildinfo" )',
+  'master_save_frontend_buildinfo "$staging"',
+ ].join('\n')));
+ assert.equal(statSync(st1).mode&0o022,0,'git archive | tar must strip 0775 group-write bits even as root');
  const cachedFile=join(cacheDir,'web-react.tsbuildinfo');
  assert.equal(readFileSync(cachedFile,'utf8'),'fresh-cache-buildinfo\n');
 

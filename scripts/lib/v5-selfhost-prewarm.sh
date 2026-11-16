@@ -361,8 +361,10 @@ cmd_prewarm_artifacts() {
     return "$PREWARM_RUNTIME_RC"
   fi
   staging="$PREWARM_WORK/web-source"
-  mkdir -p "$staging"
-  git -C "$REPO_ROOT" archive "$sha" | tar -x -C "$staging" || die "prewarm web archive failed"
+  mkdir -m 0700 -p "$staging"
+  git -C "$REPO_ROOT" archive "$sha" \
+    | ( umask 022 && tar --no-same-permissions --no-same-owner -x -C "$staging" ) \
+    || die "prewarm web archive failed"
   donor="$(find_master_release_donor "$staging/package-lock.json" || true)"
   if [[ -n "$donor" ]]; then
     cp -al "$donor/node_modules" "$staging/node_modules" || die "prewarm deps copy failed"
@@ -375,12 +377,12 @@ cmd_prewarm_artifacts() {
   fi
   # Keep the exact official command visible to the existing train/CI gate-parity scanner.
   # Both this recipe and the train recipe are included in master_web_dist_key.
-  ( cd "$staging" && NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ) \
+  ( umask 022; cd "$staging" && NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ) \
     || die "prewarm web build failed"
   grep -q 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$staging/packages/web-react/dist/index.html" \
     || die "prewarm web build missing oc-build"
   bucket="$PREWARM_WORK/web-bucket"
-  mkdir -p "$bucket/packages/web-react"
+  ( umask 022 && mkdir -p "$bucket/packages/web-react" )
   mv "$staging/packages/web-react/dist" "$bucket/packages/web-react/dist"
   if [[ -f "$staging/packages/web-react/tsconfig.tsbuildinfo" && ! -L "$staging/packages/web-react/tsconfig.tsbuildinfo" ]]; then
     cp --remove-destination -- "$staging/packages/web-react/tsconfig.tsbuildinfo" "$bucket/packages/web-react/tsconfig.tsbuildinfo" \

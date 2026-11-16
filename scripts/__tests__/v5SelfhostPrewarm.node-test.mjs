@@ -209,12 +209,16 @@ test("actual warm entry builds archived web A outside deploy lock, defers Docker
     write_flavor_manifest() { [[ "$2" == selfhost && "$3" == "$SHA" ]]; echo '{}' >"$1/flavor.manifest.json"; }
     oc_hotcfg_finalize_release() { touch "$T/finalizer-called"; oc_hotcfg_install_deps_in_image "$1" "$2"; }
     oc_hotcfg_install_deps_in_image() { echo BAD >"$T/docker-run"; }
-    find_master_release_donor() { return 1; }
+    mkdir -p "$T/seed-donor/packages/web-react" "$T/seed-donor/node_modules"
+    chmod 0755 "$T/seed-donor" "$T/seed-donor/packages" "$T/seed-donor/packages/web-react" "$T/seed-donor/node_modules"
+    echo donor-seed-info > "$T/seed-donor/packages/web-react/tsconfig.tsbuildinfo"
+    chmod 0644 "$T/seed-donor/packages/web-react/tsconfig.tsbuildinfo"
+    find_master_release_donor() { echo "$T/seed-donor"; }
     npm() {
       ( exec 7<>"$SELFHOST_DEPLOY_LOCK"; flock -n 7 ) || return 1
       if flock -n "$SELFHOST_PREPARE_LOCK" true; then return 1; fi
-      if [[ "$1" == ci ]]; then mkdir node_modules; return 0; fi
       [[ "$*" == 'run build --workspace packages/web-react' && "$NODE_OPTIONS" == --max-old-space-size=4096 ]] || return 1
+      test "$(cat packages/web-react/tsconfig.tsbuildinfo)" = donor-seed-info || return 1
       mkdir -p packages/web-react/dist
       echo '<meta name="oc-build" content="abcdef123456">' > packages/web-react/dist/index.html
       echo warm-buildinfo > packages/web-react/tsconfig.tsbuildinfo

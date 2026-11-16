@@ -1382,12 +1382,14 @@ build_master_release() {
     || die "MASTER_RELEASES_ROOT 必须是普通目录: $MASTER_RELEASES_ROOT"
 
   mkdir -p -- "$staging" || die "无法创建 staging $staging"
+  chmod 0755 -- "$staging" || die "无法收敛 staging 权限 $staging"
   MASTER_STAGING="$(readlink -f -- "$staging")"
   [[ -n "$MASTER_STAGING" && -d "$MASTER_STAGING" ]] || die "staging 规范化失败: $staging"
   MASTER_STAGING_DEV="$(stat -c '%d' -- "$MASTER_STAGING")"
   MASTER_STAGING_INO="$(stat -c '%i' -- "$MASTER_STAGING")"
   staging="$MASTER_STAGING"
-  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$staging"; then
+  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" \
+      | ( umask 022 && tar --no-same-permissions --no-same-owner -x -C "$staging" ); then
     cleanup_master_staging
     die "git archive/解包失败"
   fi
@@ -1570,7 +1572,7 @@ build_master_release() {
       [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
       master_seed_frontend_buildinfo "${donor:-}" "$staging" 1 || return 1
       mlog "  web-react official build @ staging(不碰工作树 dist)"
-      if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+      if ! ( umask 022 && cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
           OC_V5_SELFHOST_TSC_TIMER_FILE="$MASTER_GATE_TMPDIR/frontend-tsc-sec" \
           NODE_OPTIONS="--max-old-space-size=4096 --require=\"$SCRIPT_DIR/lib/v5-selfhost-tsc-timer.cjs\"" \
           npm run build --workspace packages/web-react ); then
