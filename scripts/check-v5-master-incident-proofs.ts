@@ -166,6 +166,21 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
       'pre-dispatch explicit user Stop waits for master ACK before surfacing error while pre-dispatch fence persists crashed tape (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
     ],
   },
+  {
+    incident: 'INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT', slug: 'inc-20261117-cc5-bash-timeout-ps-enoent', db: false,
+    file: 'packages/gateway/src/__tests__/cc5ToolHost.test.ts',
+    cases: [
+      'Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)',
+    ],
+  },
+  {
+    incident: 'INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT', slug: 'inc-20261117-remote-v4-null-receipt-drain', db: true,
+    file: 'packages/commercial/src/__tests__/remoteDriverTurnBillingNullReceipt.test.ts',
+    cases: [
+      'offline contract: recoverRemoteDriverTurnBilling rotates live turns, aborts proven-dead null-receipt turns, and clears per_turn thread claim only (OCV5-777)',
+      'isolated PG: recoverRemoteDriverTurnBilling executes CTE SQL end-to-end against real PostgreSQL tables (OCV5-777)',
+    ],
+  },
 ]
 
 function fail(message: string): never {

@@ -503,7 +503,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       // A stale cached catalog replaces the remote without re-running task provisioning.
       replaceHost: () => createHost(hostConfig),
     })
-    const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation ?? '1'}`, relay)
+    const unregisterDrain = this.bindRelayDrainAndAutoStop(
+      request.sessionKey,
+      `${placement.operationId}:${placement.generation ?? '1'}`,
+      relay,
+      () => lane,
+    )
     lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
       operationId: placement.operationId, profileId: placement.profileId, generation: placement.generation ?? '1', dir, view, binding, relay,
       unregisterDrain, lastUsedAt: Date.now() }
@@ -553,7 +558,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     const relay = new CodexRemoteRelay(binding,container.keyring,host,spec,join(dir,'journal'),finance,
       id => this.hooks.onNativeThread!(placement.operationId,placement.generation!,id),
       () => this.hooks.onRemoteStart!(placement.operationId,placement.generation!))
-    const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation}`, relay)
+    const unregisterDrain = this.bindRelayDrainAndAutoStop(
+      request.sessionKey,
+      `${placement.operationId}:${placement.generation}`,
+      relay,
+      () => lane,
+    )
     lane = { container,sessionKey:request.sessionKey,canonicalModel:request.canonicalModel,operationId:placement.operationId,
       profileId:placement.profileId,generation:placement.generation,dir,view,binding,relay,unregisterDrain,lastUsedAt:Date.now() }
     writePrivate(join(view,'binding.json'),binding,true)
@@ -605,7 +615,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         onNativeSession: (id) => this.hooks.onNativeThread!(placement.operationId, placement.generation!, id, true),
         onRemoteStart: () => this.hooks.onRemoteStart!(placement.operationId, placement.generation!, true),
       })
-      const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation}`, relay)
+      const unregisterDrain = this.bindRelayDrainAndAutoStop(
+        request.sessionKey,
+        `${placement.operationId}:${placement.generation}`,
+        relay,
+        () => lane,
+      )
       lane = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
         operationId: placement.operationId, profileId: placement.profileId, generation: placement.generation,
         dir, view, binding: v4.binding, relay, isV4: true, unregisterDrain, lastUsedAt: Date.now() }
@@ -621,6 +636,103 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         try { await this.hooks.onState?.(placement.operationId, 'released', placement.generation, true) } catch { /* durable no-effect CAS permits recovery */ }
       }
       throw error
+    }
+  }
+
+  /**
+   * Ensures a lane stopped directly by the container over `relay.sock` (`/stop` + `/tool/stopped`)
+   * immediately stops blocking `RemoteReleaseDrainCoordinator`, and schedules serialized `stopLane`
+   * cleanup after any in-flight `/stop` HTTP response flushes so `unregisterDrain` + PG `'released'`
+   * happen without waiting for a future turn on the same chat.
+   */
+  private bindRelayDrainAndAutoStop(
+    sessionKey: string,
+    drainId: string,
+    relay: Lane['relay'],
+    getLane: () => Lane | undefined,
+  ): (() => void) | undefined {
+    let stopProven = false
+    let activeStopHttp = 0
+    let stopRequestedByClient = false
+    let cleanupScheduled = false
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+    const clearGraceTimer = (): void => {
+      if (!graceTimer) return
+      clearTimeout(graceTimer)
+      graceTimer = undefined
+    }
+    const scheduleCleanup = (): void => {
+      if (cleanupScheduled || activeStopHttp > 0) return
+      cleanupScheduled = true
+      clearGraceTimer()
+      setImmediate(() => {
+        if (activeStopHttp > 0) {
+          cleanupScheduled = false
+          return
+        }
+        const owner = this.chats.get(sessionKey)
+        const target = getLane()
+        if (!owner || !target) {
+          cleanupScheduled = false
+          return
+        }
+        void this.serial(owner, async () => {
+          if (activeStopHttp > 0) {
+            cleanupScheduled = false
+            return
+          }
+          if (owner.lane !== target || target.stopping) return
+          try {
+            await this.stopLane(target)
+            if (owner.lane === target) owner.lane = undefined
+          } catch {
+            cleanupScheduled = false
+            // Retain unproved lane on owner for subsequent retry/release.
+          }
+        })
+      })
+    }
+    relay.controlServer.on('request', (req, res) => {
+      if (req.url !== '/stop') return
+      stopRequestedByClient = true
+      clearGraceTimer()
+      activeStopHttp += 1
+      let doneCalled = false
+      const done = (): void => {
+        if (doneCalled) return
+        doneCalled = true
+        activeStopHttp = Math.max(0, activeStopHttp - 1)
+        if (stopProven && activeStopHttp === 0) {
+          scheduleCleanup()
+        }
+      }
+      res.once('finish', done)
+      res.once('close', done)
+    })
+    const rawStop = relay.stop.bind(relay)
+    ;(relay as { stop: Lane['relay']['stop'] }).stop = () =>
+      rawStop().then((res) => {
+        if (res.remoteStopped === true) {
+          stopProven = true
+          if (activeStopHttp === 0) {
+            if (stopRequestedByClient) {
+              scheduleCleanup()
+            } else if (!cleanupScheduled && !graceTimer) {
+              graceTimer = setTimeout(scheduleCleanup, 250)
+              graceTimer.unref()
+            }
+          }
+        }
+        return res
+      })
+    const rawUnregister = this.hooks.registerDrainRelay?.(drainId, {
+      get idle(): boolean {
+        return relay.idle || stopProven
+      },
+    })
+    return () => {
+      clearGraceTimer()
+      rawUnregister?.()
     }
   }
 
@@ -642,8 +754,14 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       requireLane(proven)
       for (const server of [lane.relay.controlServer, 'toolServer' in lane.relay ? lane.relay.toolServer : undefined]) {
         if (!server?.listening) continue
-        server.closeAllConnections()
-        await new Promise<void>((resolve) => server.close(() => resolve()))
+        server.closeIdleConnections()
+        const forceTimer = setTimeout(() => server.closeAllConnections(), 200)
+        forceTimer.unref()
+        try {
+          await new Promise<void>((resolve) => server.close(() => resolve()))
+        } finally {
+          clearTimeout(forceTimer)
+        }
       }
       rmSync(lane.view, { recursive: true, force: true })
       // An unproved stop retains its control endpoint for late local proof.

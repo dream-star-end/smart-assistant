@@ -52,6 +52,7 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
   const places: Array<Record<string, unknown>> = []
   const placements = new Map<string, RemoteLanePlacement>()
   const persisted = new Map<string, string>()
+  const drainRelays = new Map<string, { readonly idle: boolean }>()
   const hooks: RemoteLaneHooks = {
     async place(request) {
       if (options.enforcePlacementState && persisted.get(request.sessionKey) !== undefined && persisted.get(request.sessionKey) !== 'released') throw new Error('REMOTE_LANE_STOP_UNPROVEN')
@@ -78,6 +79,12 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
       return { ...placement, target: { ...placement.target, upstreamModel: request.canonicalModel.replace(/-remote$/, '') } }
     },
     onState(operationId, state) { states.push([operationId, state]); for (const [key, value] of placements) if (value.operationId === operationId) persisted.set(key, state) },
+    registerDrainRelay(id, relay) {
+      drainRelays.set(id, relay)
+      return () => {
+        if (drainRelays.get(id) === relay) drainRelays.delete(id)
+      }
+    },
   }
   const runtime = createRemoteLaneRuntime({
     selfhost: true, env, financeFactory, hooks,
@@ -116,7 +123,7 @@ function fixture(options: { failStop?: boolean; failPrepare?: boolean; baseRoot?
   }
   const lane = (sessionKey = SESSION, canonicalModel = MODEL, containerDbId = '91') =>
     runtime.ensureLane({ uid: 912, containerDbId, sessionKey, canonicalModel })
-  return { dir, baseRoot, runtime, key, publicKeyring, events, states, hosts, places, container, lane,
+  return { dir, baseRoot, runtime, key, publicKeyring, events, states, hosts, places, drainRelays, container, lane,
     async cleanup() {
       await runtime.release('91').catch(() => {})
       if (dir) rmSync(dir, { recursive: true, force: true })
@@ -546,5 +553,39 @@ test('R1 prepare failure closes persistent placement; unproved stop occupies unt
       assert.equal(f.states.at(-1)?.[1], 'running')
       assert.equal(f.places.length, 2)
     } finally { await f.cleanup() }
+  }
+})
+
+test('a lane stopped by the container over relay.sock unregisters drain and releases binding without waiting for another turn (OCV5-777)', { skip: !root }, async () => {
+  const f = fixture({ enforcePlacementState: true })
+  try {
+    const handle = await f.container()
+    const first = await f.lane()
+    const drainKey = `${first.operationId}:1`
+    assert.equal(f.drainRelays.has(drainKey), true)
+    assert.equal(f.drainRelays.get(drainKey)?.idle, true)
+
+    const socket = join(handle.mountSource, first.operationId, 'relay.sock')
+    const b = JSON.parse(readFileSync(join(handle.mountSource, first.operationId, 'binding.json'), 'utf8')) as Cc5BridgeBinding
+    await cc5ControlRequest('/admit', admission(f.key, b), socket)
+    assert.equal(f.drainRelays.get(drainKey)?.idle, false, 'busy mid-turn before /stop')
+
+    const stopPayload = admission(f.key, b)
+    const [stopReply1, stopReply2] = await Promise.all([
+      cc5ControlRequest('/stop', stopPayload, socket),
+      cc5ControlRequest('/stop', stopPayload, socket),
+    ])
+    assert.equal(stopReply1.remoteStopped, true)
+    assert.equal(stopReply2.remoteStopped, true)
+
+    const deadline = Date.now() + 2_000
+    while (f.drainRelays.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(f.drainRelays.size, 0, 'stopped relay must unregister from drain coordinator immediately')
+    assert.equal(f.states.at(-1)?.[1], 'released', 'persistent binding must transition to released without waiting for Turn 2')
+    assert.equal(existsSync(join(handle.mountSource, first.operationId)), false)
+  } finally {
+    await f.cleanup()
   }
 })

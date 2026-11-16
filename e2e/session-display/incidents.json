@@ -10894,6 +10894,35 @@
           "assertion": "mid-turn CC5_TOOLHOST_EXECUTION_UNKNOWN after completed tool persists crashed tape and terminal inbox once (INC-20261116-REMOTE-V4-FENCE-ORPHAN)"
         }
       ]
+    },
+    {
+      "id": "INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT",
+      "occurredAt": "2026-11-17",
+      "severity": "P1",
+      "symptom": "个人版 V5 selfhost 会话 webmwjab4u1r7hcnb（claude-opus-5-5-remote）：远端 Cc5ToolHost 在用户容器（无 /bin/ps）内执行超 2 分钟默认超时的 Bash 命令时，claude-code-best/src/utils/ShellCommand.ts 调用 tree-kill 直接 spawn('ps', ['-o', 'pid', '--no-headers', '--ppid', pid]) 且未挂 error 监听，触发未捕获 Error: spawn ps ENOENT 导致 cc5ToolHost 子进程退出（code 1）并引发 CC5_TOOLHOST_EXECUTION_UNKNOWN 整轮熔断；同时文件模式下超时说明仅写入 result.stderr 未进合并后的 result.stdout，禁后台任务的工具宿主默认超时未对齐 10 分钟上限；且熔断 /stop 后 cc5ContainerRuntime 未即时注销 drain 句柄与释放绑定、recoverRemoteDriverTurnBilling 未收敛已停无回执 inflight 账本行，导致列车切流触发 REMOTE_RELEASE_DRAIN_TIMEOUT。",
+      "rootFixCommit": "6b1cbe6b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cc5ToolHost.test.ts",
+          "assertion": "Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cc5ContainerRuntime.test.ts",
+          "assertion": "a lane stopped by the container over relay.sock unregisters drain and releases binding without waiting for another turn (OCV5-777)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/remoteDriverTurnBillingNullReceipt.test.ts",
+          "assertion": "offline contract: recoverRemoteDriverTurnBilling rotates live turns, aborts proven-dead null-receipt turns, and clears per_turn thread claim only (OCV5-777)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)"
+        }
+      ]
     }
   ]
 }

@@ -14,8 +14,17 @@ function childEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   for (const [key, value] of Object.entries(source)) {
     if (value !== undefined && key !== 'NODE_OPTIONS') env[key] = value
   }
-  return { ...env, CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' }
+  const explicitBashDefault = env.BASH_DEFAULT_TIMEOUT_MS?.trim()
+  return {
+    ...env,
+    // Tool-only hosts disable background tasks (`run_in_background`), so align default
+    // foreground Bash budget with BashTool's 10m ceiling (inside 11m host / 12m MCP bounds).
+    BASH_DEFAULT_TIMEOUT_MS:
+      explicitBashDefault && explicitBashDefault.length > 0 ? explicitBashDefault : '600000',
+    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+  }
 }
 
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/
