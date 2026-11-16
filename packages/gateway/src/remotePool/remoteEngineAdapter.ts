@@ -85,11 +85,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
   private _effortLevel: string | undefined
   private _toolsets: string[] | undefined
   private _executionTarget: ExecutionTarget = { kind: 'local' }
+  private _shuttingDown = false
   private _activeRun?: {
     readonly getPartialSnapshot: () => PartialSnapshot
     readonly getPendingTools: () => number
+    readonly markInterrupted: (reason?: 'user' | 'system') => void
     readonly finalizeNull: () => void
-    readonly drainPromise: Promise<void>
+    drainPromise: Promise<void>
   }
 
   lastActivityAt = Date.now()
@@ -180,6 +182,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     let pendingToolCalls = 0
     let finalized = false
     let userCancelled = false
+    let interruptReason: 'user' | 'system' | null = null
     const startedAtMs = Date.now()
     let localOrdinal = 0
     const nextOrdinal = () => (params.nextDurableEventOrdinal ? params.nextDurableEventOrdinal() : ++localOrdinal)
@@ -500,6 +503,22 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       })
     }
 
+    const activeHandle: NonNullable<RemoteEngineAdapter['_activeRun']> = {
+      getPartialSnapshot,
+      getPendingTools: () => pendingToolCalls,
+      markInterrupted: (reason?: 'user' | 'system') => {
+        interruptReason = reason ?? 'system'
+        if (reason === 'user') userCancelled = true
+      },
+      finalizeNull: () => {
+        interruptReason = 'user'
+        userCancelled = true
+        finalizeWith(null)
+      },
+      drainPromise: Promise.resolve(),
+    }
+    this._activeRun = activeHandle
+
     const drainPromise = (async () => {
       try {
         const outcome = await this.lane.executeTurn(
@@ -539,44 +558,62 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
             },
           },
         )
-        resolveSubmitted()
         if (outcome.kind === 'abandoned') {
-          userCancelled = true
+          if (this._shuttingDown) {
+            if (!finalized) {
+              this.emit('exit', { code: 0, signal: 'SIGTERM', crashed: false })
+            }
+            resolveSubmitted()
+            finalizeWith(null)
+            return
+          }
+          if (userCancelled || interruptReason !== null) {
+            resolveSubmitted()
+            if (!finalized) {
+              params.onEvent({
+                kind: 'error',
+                error: userCancelled ? 'Turn cancelled by user' : 'Turn cancelled before dispatch',
+                ...(userCancelled ? { errorCode: 'user_cancelled' as const } : {}),
+              })
+            }
+            finalizeWith(null)
+            return
+          }
+          const fenceErr = this.lane.fenceError ?? new Error('REMOTE_TURN_ABORTED')
+          rejectSubmitted(fenceErr)
           if (!finalized) {
-            params.onEvent({
-              kind: 'error',
-              error: 'Turn cancelled before dispatch',
-              errorCode: 'user_cancelled',
-            })
+            this.emit('error', fenceErr)
           }
           finalizeWith(null)
           return
         }
+        resolveSubmitted()
         settleWithReceipt(outcome.receipt, Math.max(0, Date.now() - startedAtMs))
       } catch (err) {
         const error = err instanceof Error ? err : new Error('REMOTE_TURN_FAILED')
+        if (this._shuttingDown) {
+          if (!finalized) {
+            this.emit('exit', { code: 0, signal: 'SIGTERM', crashed: false })
+          }
+          rejectSubmitted(error)
+          finalizeWith(null)
+          return
+        }
         rejectSubmitted(error)
-        this.emit('error', error)
+        if (!finalized) {
+          this.emit('error', error)
+        }
         finalizeWith(null)
       }
     })()
-
-    const activeHandle = {
-      getPartialSnapshot,
-      getPendingTools: () => pendingToolCalls,
-      finalizeNull: () => {
-        userCancelled = true
-        finalizeWith(null)
-      },
-      drainPromise,
-    }
-    this._activeRun = activeHandle
+    activeHandle.drainPromise = drainPromise
 
     return {
       submitted,
       summary,
       end: () => {
         if (!finalized) {
+          interruptReason ??= 'system'
           this.lane.interrupt()
           finalizeWith(null)
         }
@@ -592,15 +629,18 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     }
   }
 
-  interrupt(_reason?: 'user' | 'system'): boolean {
+  interrupt(reason?: 'user' | 'system'): boolean {
+    this._activeRun?.markInterrupted(reason)
     return this.lane.interrupt()
   }
 
   beginPlannedShutdown(): void {
+    this._shuttingDown = true
     void this.lane.stopLane().catch(() => {})
   }
 
   async shutdown(): Promise<void> {
+    this._shuttingDown = true
     await this.lane.stopLane()
   }
 

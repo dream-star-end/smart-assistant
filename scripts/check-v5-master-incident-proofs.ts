@@ -156,6 +156,16 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
       'cursor_reset defers byte_limit on first page with oversize frame and exposes byte_limit on follow-up page (INC-20261115-CONTAINER-SWAP-FRAMESEQ)',
     ],
   },
+  {
+    incident: 'INC-20261116-REMOTE-V4-FENCE-ORPHAN', slug: 'inc-20261116-remote-v4-fence-orphan', db: false,
+    file: 'packages/gateway/src/__tests__/remotePoolTerminalSettlement.test.ts',
+    cases: [
+      'mid-turn CC5_TOOLHOST_EXECUTION_UNKNOWN after completed tool persists crashed tape and terminal inbox once (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+      'escalated user Stop during hung tool persists USER_CANCELLED tape instead of dropping on finalized null summary (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+      'planned gateway beginPlannedShutdown mid-turn persists SERVICE_RESTART with no_response waiver instead of RUNNER_CRASHED (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+      'pre-dispatch explicit user Stop waits for master ACK before surfacing error while pre-dispatch fence persists crashed tape (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+    ],
+  },
 ]
 
 function fail(message: string): never {
