@@ -10904,6 +10904,11 @@
       "regressions": [
         {
           "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cc5BashTimeoutProof.test.ts",
+          "assertion": "candidate Cc5ToolHost + ShellCommand Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)"
+        },
+        {
+          "layer": "unit",
           "path": "packages/gateway/src/__tests__/cc5ToolHost.test.ts",
           "assertion": "Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)"
         },
@@ -10920,7 +10925,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-master-incident-proofs.ts",
-          "assertion": "Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)"
+          "assertion": "candidate Cc5ToolHost + ShellCommand Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)"
         }
       ]
     }

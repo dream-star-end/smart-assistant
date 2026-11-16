@@ -9,7 +9,7 @@ import type { Cc5HostProfile, Cc5HostTool } from './cc5ToolCatalog.js'
 
 /** The bridge already holds a local chat's tool environment without model credentials (runner
  * laneEnv); tools see it as they would locally. NODE_OPTIONS could rewrite the child runtime. */
-function childEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function cc5ToolHostChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' }
   for (const [key, value] of Object.entries(source)) {
     if (value !== undefined && key !== 'NODE_OPTIONS') env[key] = value
@@ -87,7 +87,7 @@ export class Cc5ToolHost {
         profilePath,
       ],
       {
-        env: childEnv(environment),
+        env: cc5ToolHostChildEnv(environment),
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe'],
       },

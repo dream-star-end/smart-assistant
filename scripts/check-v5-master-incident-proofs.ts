@@ -168,9 +168,9 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
   },
   {
     incident: 'INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT', slug: 'inc-20261117-cc5-bash-timeout-ps-enoent', db: false,
-    file: 'packages/gateway/src/__tests__/cc5ToolHost.test.ts',
+    file: 'packages/gateway/src/__tests__/cc5BashTimeoutProof.test.ts',
     cases: [
-      'Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)',
+      'candidate Cc5ToolHost + ShellCommand Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)',
     ],
   },
   {
