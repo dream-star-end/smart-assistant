@@ -946,6 +946,9 @@ build_master_release() {
   local full_sha short_sha ts staging reldir donor t0 t1 build_id web_key web_donor
   MASTER_GATE_RECEIPT_IDS=""
   MASTER_GATE_RECEIPT_SHA=""
+  MASTER_LOCAL_GATE_CACHE_READY=0
+  MASTER_LOCAL_GATE_PLAN_FILE=""
+  MASTER_LOCAL_GATE_SHA=""
   BUILT_MASTER_RELEASE=""
   MASTER_DEPS_MODE=""
   MASTER_DEPS_ELAPSED_S=""
@@ -1243,6 +1246,7 @@ build_master_release() {
       die "pinned C/D 并行任务失败(收据不能绕过已失败任务)"
     fi
     if [[ -n "$gate_id" ]] && master_gate_receipt_has "$gate_id" "$full_sha"; then continue; fi
+    if master_local_gate_has_job "$job_id" "$full_sha"; then continue; fi
     if ! master_build_job_start "$job_id" "$job_fn"; then
       cleanup_master_staging
       die "pinned C/D 并行任务失败或负载预算超时"
@@ -1270,111 +1274,148 @@ build_master_release() {
     await_runtime_release_bg
     tsum_note runtimeWaitBeforeBoxSec "$(( $(date +%s) - t0 ))" 2>/dev/null || :
   fi
-  if ! master_gate_wait_host_idle box-gates; then
-    cleanup_master_staging
-    die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
+  if master_local_gate_any_miss "$full_sha" box-success-recovery box-continuation box-incident-proofs box-longtask master-incident-proofs codex-chatgpt-ws platform-tool-proofs terminal-unproven; then
+    if ! master_gate_wait_host_idle box-gates; then
+      cleanup_master_staging
+      die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
+    fi
+    if master_local_gate_any_miss "$full_sha" box-success-recovery box-incident-proofs box-longtask master-incident-proofs; then
+      if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
+        cleanup_master_staging
+        die "建本班列车独立测试库失败(live 未改)"
+      fi
+    fi
   fi
-  if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
-    cleanup_master_staging
-    die "建本班列车独立测试库失败(live 未改)"
-  fi
-  mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-success-recovery.ts"
-  fi
-  # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
-  # 两道 DB 门的命令写在这里(check-v5-incident-regressions 只认 build_master_release 里的调用),
-  # 显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于 TEST_DATABASE_URL,留着就连回共享库。
-  master_gate_box_success_recovery() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-        npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
-  }
-  if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery; then
-    cleanup_master_staging
-    die "pinned Box success recovery behavioral gate 失败"
+  if ! master_local_gate_has box-success-recovery "$full_sha"; then
+    mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+    if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
+      cleanup_master_staging
+      die "新候选缺 scripts/check-v5-box-success-recovery.ts"
+    fi
+    # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
+    # 两道 DB 门的命令写在这里(check-v5-incident-regressions 只认 build_master_release 里的调用),
+    # 显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于 TEST_DATABASE_URL,留着就连回共享库。
+    master_gate_box_success_recovery() {
+      ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+          OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+          npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
+    }
+    if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery; then
+      cleanup_master_staging
+      die "pinned Box success recovery behavioral gate 失败"
+    fi
+    master_local_gate_record box-success-recovery "$full_sha"
   fi
   tsum_mark C.box-continuation 2>/dev/null || :
-  mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-continuation.ts"
-  fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
-    cleanup_master_staging
-    die "pinned Box multitool continuation gate 失败"
+  if ! master_local_gate_has box-continuation "$full_sha"; then
+    mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+    if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
+      cleanup_master_staging
+      die "新候选缺 scripts/check-v5-box-continuation.ts"
+    fi
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
+      cleanup_master_staging
+      die "pinned Box multitool continuation gate 失败"
+    fi
+    master_local_gate_record box-continuation "$full_sha"
   fi
   tsum_mark C.box-incident-proofs 2>/dev/null || :
-  mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
-  fi
-  # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
-  master_gate_box_incident_proofs() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-        npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
-  }
-  if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs; then
-    cleanup_master_staging
-    die "pinned Box incident proofs gate (OCV5-488) 失败"
+  if ! master_local_gate_has box-incident-proofs "$full_sha"; then
+    mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+    if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
+      cleanup_master_staging
+      die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
+    fi
+    # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
+    master_gate_box_incident_proofs() {
+      ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+          OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+          npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
+    }
+    if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs; then
+      cleanup_master_staging
+      die "pinned Box incident proofs gate (OCV5-488) 失败"
+    fi
+    master_local_gate_record box-incident-proofs "$full_sha"
   fi
   tsum_mark C.box-longtask 2>/dev/null || :
-  tsum_note gateEvidence.box-longtask local 2>/dev/null || :
-  mlog "  Box long-task generations gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
-      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha" ); then
-    cleanup_master_staging
-    die "pinned Box long-task generations gate 失败"
+  if ! master_local_gate_has box-longtask "$full_sha"; then
+    tsum_note gateEvidence.box-longtask local 2>/dev/null || :
+    mlog "  Box long-task generations gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha" ); then
+      cleanup_master_staging
+      die "pinned Box long-task generations gate 失败"
+    fi
+    master_local_gate_record box-longtask "$full_sha"
   fi
   # OCV5-763: reverse-imported commercial incidents need actual selfhost runners.
   # Existing train-isolated test DB only; no production credentials or model invocation.
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      REQUIRE_TEST_DB=1 TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-      npx --no-install tsx scripts/check-v5-master-incident-proofs.ts ); then
-    cleanup_master_staging
-    die "pinned imported master incident proofs failed"
+  if ! master_local_gate_has master-incident-proofs "$full_sha"; then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        REQUIRE_TEST_DB=1 TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-master-incident-proofs.ts ); then
+      cleanup_master_staging
+      die "pinned imported master incident proofs failed"
+    fi
+    master_local_gate_record master-incident-proofs "$full_sha"
   fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
-    cleanup_master_staging
-    die "pinned imported codex-chatgpt-ws proof failed"
+  if ! master_local_gate_has codex-chatgpt-ws "$full_sha"; then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
+      cleanup_master_staging
+      die "pinned imported codex-chatgpt-ws proof failed"
+    fi
+    master_local_gate_record codex-chatgpt-ws "$full_sha"
   fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
-    cleanup_master_staging
-    die "pinned imported ocv5-376-platform-tool-proofs proof failed"
+  if ! master_local_gate_has platform-tool-proofs "$full_sha"; then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+      cleanup_master_staging
+      die "pinned imported ocv5-376-platform-tool-proofs proof failed"
+    fi
+    master_local_gate_record platform-tool-proofs "$full_sha"
   fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
-    cleanup_master_staging
-    die "pinned imported box-terminal-unproven-probe proof failed"
+  if ! master_local_gate_has terminal-unproven "$full_sha"; then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
+      cleanup_master_staging
+      die "pinned imported box-terminal-unproven-probe proof failed"
+    fi
+    master_local_gate_record terminal-unproven "$full_sha"
   fi
   master_gate_db_drop
-  mlog "  upload retention HTTP responsiveness proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
-    cleanup_master_staging
-    die "pinned upload retention HTTP responsiveness proof failed"
+  if ! master_local_gate_has upload-retention-http "$full_sha"; then
+    mlog "  upload retention HTTP responsiveness proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
+      cleanup_master_staging
+      die "pinned upload retention HTTP responsiveness proof failed"
+    fi
+    master_local_gate_record upload-retention-http "$full_sha"
   fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
-  mlog "  CCB MCP availability contract gate @ pinned staging"
-  master_gate_ccb_mcp() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
-        npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
-  }
-  if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
-    cleanup_master_staging
-    die "pinned CCB MCP availability contract gate 失败"
+  if ! master_local_gate_has ccb-mcp-availability "$full_sha"; then
+    mlog "  CCB MCP availability contract gate @ pinned staging"
+    master_gate_ccb_mcp() {
+      ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
+          npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
+    }
+    if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
+      cleanup_master_staging
+      die "pinned CCB MCP availability contract gate 失败"
+    fi
+    master_local_gate_record ccb-mcp-availability "$full_sha"
   fi
   # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
-    cleanup_master_staging
-    die "pinned Codex late-stop closure proof failed"
+  if ! master_local_gate_has codex-late-stop-closure "$full_sha"; then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
+      cleanup_master_staging
+      die "pinned Codex late-stop closure proof failed"
+    fi
+    master_local_gate_record codex-late-stop-closure "$full_sha"
   fi
   cleanup_master_gate_tmpdir
 

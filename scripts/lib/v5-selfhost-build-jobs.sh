@@ -13,8 +13,8 @@ MASTER_BUILD_JOB_FAILED=0
 master_build_job_limit() { # <load sample>, also used verbatim in admission evidence
   local load="$1"
   if [[ -z "$load" ]]; then printf 0; return; fi
-  awk -v l="$load" -v max="$MASTER_BOX_GATE_LOAD_MAX" \
-    'BEGIN { print l >= max ? 0 : (l >= max / 2 ? 2 : 3) }'
+  awk -v l="$load" -v m="$MASTER_BOX_GATE_LOAD_MAX" \
+    'BEGIN { print (l >= m ? 0 : (l >= m / 2 ? 2 : 3)) }'
 }
 
 # Each job has its own process group. A dead shell can leave a live foreground
@@ -52,6 +52,8 @@ master_build_job_collect() { # <array index>, called only after the child has ex
   if [[ "$rc" != 0 ]]; then
     MASTER_BUILD_JOB_FAILED=1
     tsum_note "gateFailure.$id" "$(master_gate_first_failure "${MASTER_BUILD_JOB_LOGS[i]}" "$rc")" 2>/dev/null || :
+  elif declare -F master_local_gate_record_job >/dev/null; then
+    master_local_gate_record_job "$id" "${full_sha:-}"
   fi
   unset 'MASTER_BUILD_JOB_PIDS[i]' 'MASTER_BUILD_JOB_IDS[i]' 'MASTER_BUILD_JOB_LOGS[i]' 'MASTER_BUILD_JOB_STARTS[i]'
   return 0
