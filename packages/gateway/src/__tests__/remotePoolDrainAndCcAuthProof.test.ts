@@ -1115,7 +1115,7 @@ for raw in sys.stdin:
     )
 
     const worker = new DriverWorkerClient()
-    let relay: RemotePoolRelay | undefined
+    let relay: InstanceType<typeof RemotePoolRelay> | undefined
     try {
       const workerInfo = await worker.info('cc')
       const operationId = randomUUID()

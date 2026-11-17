@@ -1902,7 +1902,7 @@ process.stdin.on('end', () => process.exit(Number(process.env.FAKE_AGY_EXIT_CODE
   }
 
   test('elides repeated platform context across adapter restarts, preserves goal, and self-heals after CLI 253k compaction', async () => {
-    const personaFile = 'PERSONA_UNIQUE_SENTINEL_' + 'X'.repeat(4096)
+    const personaFile = `PERSONA_UNIQUE_SENTINEL_${'X'.repeat(4096)}`
     const h = await harness()
     try {
       const personaPath = path.join(h.dir, 'persona.md')
