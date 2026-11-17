@@ -10931,6 +10931,25 @@
           "assertion": "candidate Cc5ToolHost + ShellCommand Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)"
         }
       ]
+    },
+    {
+      "id": "INC-20261117-DROPDOWN-SHORT-VIEWPORT-CLIP",
+      "occurredAt": "2026-11-17",
+      "severity": "P2",
+      "symptom": "横屏手机等矮视口下打开侧栏项目行「⋯」下拉菜单时，ui/DropdownMenu.tsx 的 DropdownMenuContent/DropdownMenuSubContent 仅设 overflow-hidden 无最大高度与纵向滚动，菜单高于触发点上下可用高度并向上翻转后顶出视口上沿，首项「新建会话」及分隔线被裁掉不可见（OCV5-778）。",
+      "rootFixCommit": "b4ec4cc7",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ui/DropdownMenu.test.tsx",
+          "assertion": "caps DropdownMenuContent and DropdownMenuSubContent to Radix available height with vertical scroll (INC-20261117-DROPDOWN-SHORT-VIEWPORT-CLIP)"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/dropdown-short-viewport.node-test.mjs",
+          "assertion": "OCV5-778: short landscape touch viewport keeps ProjectRow「新建会话」visible and scrollable inside viewport (INC-20261117-DROPDOWN-SHORT-VIEWPORT-CLIP)"
+        }
+      ]
     }
   ]
 }
