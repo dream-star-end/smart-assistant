@@ -57,12 +57,15 @@ if "--version" in args:
 if "models" in args:
     print("gemini-4-carbon  Gemini 4 Carbon\ngemini-4-hydrogen  Gemini 4 Hydrogen\ngemini-pro-orchestrator  Orchestrator Carbon\nclaude-opus-5-5  Claude Opus 5.5\n")
     sys.exit(0)
+if "--effort" in args:
+    sys.stderr.write("forbidden --effort flag passed\n")
+    sys.exit(2)
 
 conv_id = str(uuid.uuid4())
 step_seq = 0
 if "--conversation" in args:
     conv_id = args[args.index("--conversation") + 1]
-eff = args[args.index("--effort") + 1] if "--effort" in args and args.index("--effort") + 1 < len(args) else ""
+selected_model = args[args.index("--model") + 1] if "--model" in args and args.index("--model") + 1 < len(args) else "gemini-4-carbon-medium"
 
 def on_sigint(signum, frame):
     sys.stdout.write(json.dumps({
@@ -73,7 +76,7 @@ def on_sigint(signum, frame):
     sys.exit(1)
 
 signal.signal(signal.SIGINT, on_sigint)
-sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv_id, "init": {"model": "gemini-4-carbon-medium", "tools": []}}) + "\n")
+sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv_id, "init": {"model": selected_model, "tools": []}}) + "\n")
 sys.stdout.flush()
 
 for line in sys.stdin:
@@ -112,7 +115,7 @@ for line in sys.stdin:
             "step_index": step_seq,
             "step_type": "agent_response",
             "state": "ACTIVE",
-            "text_delta": f"effort={eff}:",
+            "text_delta": f"model={selected_model}:",
         },
     }) + "\n")
     sys.stdout.write(json.dumps({
@@ -223,6 +226,7 @@ class AntigravityDriverTests(unittest.TestCase):
             )
             self.assertEqual(spec_a["policySha256"], snap_res["policySha256"])
             self.assertEqual(spec_a["policySha256"], spec_b["policySha256"])
+            self.assertIn("excludeDefaultComponents: true", spec_a["files"]["home/.gemini/antigravity-cli/agents/ocremote.md"]["content"])
             self.assertIn("PERSONA_ALPHA", spec_a["files"]["home/.gemini/antigravity-cli/agents/ocremote.md"]["content"])
             self.assertIn("PERSONA_BETA", spec_b["files"]["home/.gemini/antigravity-cli/agents/ocremote.md"]["content"])
             self.assertNotEqual(
@@ -241,6 +245,7 @@ class AntigravityDriverTests(unittest.TestCase):
                 },
                 snap,
             )
+            self.assertNotIn("excludeDefaultComponents: true", spec_red["files"]["home/.gemini/antigravity-cli/agents/ocremote.md"]["content"])
             self.assertNotEqual(spec_red["policySha256"], spec_a["policySha256"])
 
     def test_03_decode_real_recorded_cli_fixtures_and_recycle_safety(self) -> None:
@@ -331,9 +336,15 @@ class AntigravityDriverTests(unittest.TestCase):
         cmd_init = {"kind": "initialize", "commandId": "cmd_init_1", "model": "gemini-4-carbon-medium", "instructions": "SYS_1"}
         enc_init = validate_encode_batch(mod.encode(cmd_init, state), cmd_init)
         state = enc_init["nextNativeState"]
-        dec_init = dec("native", {"ev": "cli", "turnSeq": 0, "raw": {"event": "init", "conversation_id": conv_id, "init": {"model": "gemini-4-carbon-medium"}}}, state)
+        dec_init = dec("native", {"ev": "cli", "turnSeq": 0, "raw": {"event": "init", "conversation_id": conv_id, "init": {"model": "gemini-4-carbon-low"}}}, state)
         state = dec_init["nextNativeState"]
         self.assertEqual(dec_init["controlReplies"][0]["nativeSessionId"], conv_id)
+        with self.assertRaisesRegex(ValueError, "AGY_MODEL_MISMATCH"):
+            mod.decode(
+                "native",
+                json.dumps({"ev": "cli", "turnSeq": 0, "raw": {"event": "init", "conversation_id": str(uuid.uuid4()), "init": {"model": "gemini-3.8-flash-low"}}}).encode(),
+                validate_encode_batch(mod.encode({"kind": "initialize", "commandId": "cmd_init_bad", "model": "gemini-4-carbon-medium"}, {}), {"kind": "initialize", "commandId": "cmd_init_bad", "model": "gemini-4-carbon-medium"})["nextNativeState"],
+            )
 
         cmd_turn1 = {"kind": "newTurn", "commandId": "cmd_turn_1", "prompt": "do work", "instructions": "SYS_1"}
         enc_turn = validate_encode_batch(mod.encode(cmd_turn1, state), cmd_turn1)
@@ -409,7 +420,7 @@ class AntigravityDriverTests(unittest.TestCase):
                 "params": {
                     "name": "Write",
                     "arguments": tool_args,
-                    "_meta": {"antigravity.google/conversation_id": conv_id, "progressToken": f"{conv_id}:7"},
+                    "_meta": {"antigravity.google/conversation_id": conv_id, "progressToken": f"{uuid.uuid4()}:7"},
                 },
             },
             state,
@@ -473,7 +484,11 @@ class AntigravityDriverTests(unittest.TestCase):
                 "accountObserved": True,
                 "cliVersion": "1.5.5",
                 "cliSha256": file_sha256(cli),
-                "models": [{"upstreamModelId": "gemini-4-carbon-medium", "supportedEfforts": ["low", "medium", "high"], "defaultEffort": "medium", "supportsAdaptiveThinking": True, "supportsVision": False}],
+                "models": [
+                    {"upstreamModelId": "gemini-4-carbon-low", "supportedEfforts": ["low", "medium", "high"], "defaultEffort": "low", "supportsAdaptiveThinking": True, "supportsVision": False},
+                    {"upstreamModelId": "gemini-4-carbon-medium", "supportedEfforts": ["low", "medium", "high"], "defaultEffort": "medium", "supportsAdaptiveThinking": True, "supportsVision": False},
+                    {"upstreamModelId": "gemini-4-carbon-high", "supportedEfforts": ["low", "medium", "high"], "defaultEffort": "high", "supportsAdaptiveThinking": True, "supportsVision": False},
+                ],
                 "rawResponseSha256": "b" * 64,
                 "observedAt": "2026-11-18T00:00:00Z",
             }
@@ -522,7 +537,7 @@ class AntigravityDriverTests(unittest.TestCase):
                     for ev in res["securityEvents"]:
                         if ev["kind"] == "textDelta":
                             deltas.append(ev["delta"])
-                self.assertEqual("".join(deltas), "effort=high:hello world")
+                self.assertEqual("".join(deltas), "model=gemini-4-carbon-high:hello world")
 
                 e3 = mod.encode({"kind": "newTurn", "commandId": "cmd_t2", "prompt": "SLEEP_INTERRUPT", "effort": "low"}, state)
                 state = e3["nextNativeState"]

@@ -28,17 +28,31 @@ VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     "gemini-4-carbon": {"display": "Gemini 4 Carbon", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "gemini-4-carbon-low": {"display": "Gemini 4 Carbon Low", "efforts": ["low", "medium", "high"], "default": "low"},
     "gemini-4-carbon-medium": {"display": "Gemini 4 Carbon Medium", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "gemini-4-carbon-high": {"display": "Gemini 4 Carbon High", "efforts": ["low", "medium", "high"], "default": "high"},
     "gemini-4-hydrogen": {"display": "Gemini 4 Hydrogen", "efforts": ["low", "medium", "high", "xhigh"], "default": "high"},
+    "gemini-4-hydrogen-low": {"display": "Gemini 4 Hydrogen Low", "efforts": ["low", "medium", "high", "xhigh"], "default": "low"},
+    "gemini-4-hydrogen-medium": {"display": "Gemini 4 Hydrogen Medium", "efforts": ["low", "medium", "high", "xhigh"], "default": "medium"},
     "gemini-4-hydrogen-high": {"display": "Gemini 4 Hydrogen High", "efforts": ["low", "medium", "high", "xhigh"], "default": "high"},
+    "gemini-4-hydrogen-xhigh": {"display": "Gemini 4 Hydrogen XHigh", "efforts": ["low", "medium", "high", "xhigh"], "default": "xhigh"},
     "gemini-pro-orchestrator": {"display": "Orchestrator Carbon", "efforts": ["low", "medium", "high"], "default": "medium"},
     "gemini-4-argon": {"display": "Gemini 4 Argon", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "gemini-4-argon-low": {"display": "Gemini 4 Argon Low", "efforts": ["low", "medium", "high"], "default": "low"},
     "gemini-4-argon-medium": {"display": "Gemini 4 Argon Medium", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "gemini-4-argon-high": {"display": "Gemini 4 Argon High", "efforts": ["low", "medium", "high"], "default": "high"},
     "gemini-3.8-flash": {"display": "Gemini 3.8 Flash", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "gemini-3.8-flash-low": {"display": "Gemini 3.8 Flash Low", "efforts": ["low", "medium", "high"], "default": "low"},
+    "gemini-3.8-flash-medium": {"display": "Gemini 3.8 Flash Medium", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "gemini-3.8-flash-high": {"display": "Gemini 3.8 Flash High", "efforts": ["low", "medium", "high"], "default": "high"},
     "claude-opus-5-5": {"display": "Claude Opus 5.5", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "claude-opus-5-5-low": {"display": "Claude Opus 5.5 Low", "efforts": ["low", "medium", "high"], "default": "low"},
     "claude-opus-5-5-medium": {"display": "Claude Opus 5.5 Medium", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "claude-opus-5-5-high": {"display": "Claude Opus 5.5 High", "efforts": ["low", "medium", "high"], "default": "high"},
     "claude-sonnet-5-5": {"display": "Claude Sonnet 5.5", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "claude-sonnet-5-5-low": {"display": "Claude Sonnet 5.5 Low", "efforts": ["low", "medium", "high"], "default": "low"},
     "claude-sonnet-5-5-medium": {"display": "Claude Sonnet 5.5 Medium", "efforts": ["low", "medium", "high"], "default": "medium"},
+    "claude-sonnet-5-5-high": {"display": "Claude Sonnet 5.5 High", "efforts": ["low", "medium", "high"], "default": "high"},
     "gpt-oss-120b": {"display": "GPT-OSS 120B", "efforts": ["low", "medium", "high"], "default": "medium"},
     "gpt-oss-120b-medium": {"display": "GPT-OSS 120B Medium", "efforts": ["low", "medium", "high"], "default": "medium"},
     "gemini-3.1-pro": {"display": "Gemini 3.1 Pro", "efforts": ["low", "medium", "high"], "default": "medium"},
@@ -46,13 +60,13 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
 }
 
 BASE_TO_VARIANTS: Dict[str, List[str]] = {
-    "gemini-4-carbon": ["gemini-4-carbon", "gemini-4-carbon-medium"],
-    "gemini-4-hydrogen": ["gemini-4-hydrogen", "gemini-4-hydrogen-high"],
+    "gemini-4-carbon": ["gemini-4-carbon", "gemini-4-carbon-low", "gemini-4-carbon-medium", "gemini-4-carbon-high"],
+    "gemini-4-hydrogen": ["gemini-4-hydrogen", "gemini-4-hydrogen-low", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-high", "gemini-4-hydrogen-xhigh"],
     "gemini-pro-orchestrator": ["gemini-pro-orchestrator"],
-    "gemini-4-argon": ["gemini-4-argon", "gemini-4-argon-medium"],
-    "gemini-3.8-flash": ["gemini-3.8-flash"],
-    "claude-opus-5-5": ["claude-opus-5-5", "claude-opus-5-5-medium"],
-    "claude-sonnet-5-5": ["claude-sonnet-5-5", "claude-sonnet-5-5-medium"],
+    "gemini-4-argon": ["gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"],
+    "gemini-3.8-flash": ["gemini-3.8-flash", "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high"],
+    "claude-opus-5-5": ["claude-opus-5-5", "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high"],
+    "claude-sonnet-5-5": ["claude-sonnet-5-5", "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high"],
     "gpt-oss-120b": ["gpt-oss-120b", "gpt-oss-120b-medium"],
     "gemini-3.1-pro": ["gemini-3.1-pro"],
     "gemini-3.1-flash": ["gemini-3.1-flash"],
@@ -75,7 +89,7 @@ sys.stdout.flush()
 """
 
 _AGY_HOST_PY = r"""#!/usr/bin/env python3
-import collections, json, os, pathlib, queue, shutil, signal, sqlite3, subprocess, sys, threading
+import collections, json, os, pathlib, queue, re, shutil, signal, sqlite3, subprocess, sys, threading
 
 cfg = json.loads((pathlib.Path(__file__).resolve().parent / "host_config.json").read_text(encoding="utf-8"))
 home_dir = pathlib.Path(os.environ["HOME"])
@@ -149,7 +163,8 @@ def resolve_cli_prefix():
 
 conv_id = str(cfg.get("initialSessionId") or "").strip()
 child = None
-current_child_effort = ""
+current_child_model = ""
+probed_models_set = set(str(x) for x in (cfg.get("probedModels") or []))
 active_turn_seq = 0
 seen_max_step_idx = -1
 turn_in_flight = False
@@ -157,6 +172,17 @@ interrupted_flag = False
 pending_interrupt_cmd = None
 applied_launch_system_prompt = False
 stderr_tail = collections.deque(maxlen=40)
+
+def resolve_cli_model(base_model, effort_val=""):
+    eff = str(effort_val or "").strip().lower()
+    if not eff:
+        return base_model
+    m = re.match(r"^(.+)-(low|medium|high|xhigh|max)$", base_model)
+    family = m.group(1) if m else base_model
+    cand = f"{family}-{eff}"
+    if cand in probed_models_set:
+        return cand
+    return base_model
 
 def compute_db_baseline(resume_id):
     if not resume_id:
@@ -202,21 +228,19 @@ def stop_child_gracefully():
             child = None
 
 def spawn_cli(resume_id, effort_val=""):
-    global child, current_child_effort
+    global child, current_child_model
     launch_baseline = max(seen_max_step_idx, compute_db_baseline(resume_id)) if resume_id else -1
     is_resumed = bool(resume_id)
-    eff = str(effort_val or "").strip()
+    target_model = resolve_cli_model(cfg["model"], effort_val)
     cmd = resolve_cli_prefix() + [
         "--input-format", "stream-json",
         "--output-format", "stream-json",
-        "--model", cfg["model"],
+        "--model", target_model,
         "--dangerously-skip-permissions",
         "--disable-slash-commands",
     ]
     if not cfg.get("nativeToolsFlag"):
         cmd.extend(["--agent", "ocremote"])
-    if eff:
-        cmd.extend(["--effort", eff])
     if resume_id:
         cmd.extend(["--conversation", resume_id])
     ev = threading.Event()
@@ -232,7 +256,7 @@ def spawn_cli(resume_id, effort_val=""):
             env=os.environ.copy(),
         )
         child = proc
-        current_child_effort = eff
+        current_child_model = target_model
 
     def read_err():
         try:
@@ -345,7 +369,7 @@ while True:
     if op == "init":
         init_eff = str(cmd.get("effort") or cfg.get("effort") or "").strip()
         if conv_id:
-            emit({"ev": "host_ready", "sessionId": conv_id, "model": cfg["model"]})
+            emit({"ev": "host_ready", "sessionId": conv_id, "model": resolve_cli_model(cfg["model"], init_eff)})
         elif child is None:
             spawn_cli("", init_eff)
     elif op == "resume":
@@ -353,7 +377,7 @@ while True:
         res_eff = str(cmd.get("effort") or cfg.get("effort") or "").strip()
         if sid and sid != "new":
             conv_id = sid
-            emit({"ev": "host_ready", "sessionId": conv_id, "model": cfg["model"]})
+            emit({"ev": "host_ready", "sessionId": conv_id, "model": resolve_cli_model(cfg["model"], res_eff)})
         elif child is None:
             spawn_cli("", res_eff)
     elif op == "turn":
@@ -365,10 +389,11 @@ while True:
             applied_launch_system_prompt = True
         tseq = int(cmd.get("turnSeq") or 1)
         desired_eff = str(cmd.get("effort") or cfg.get("effort") or "").strip()
+        desired_model = resolve_cli_model(cfg["model"], desired_eff)
         with state_lock:
             proc = child
-            same_eff = (proc is not None and proc.poll() is None and current_child_effort == desired_eff)
-        if proc is not None and proc.poll() is None and not same_eff:
+            same_model = (proc is not None and proc.poll() is None and current_child_model == desired_model)
+        if proc is not None and proc.poll() is None and not same_model:
             stop_child_gracefully()
             proc = None
         with state_lock:
@@ -530,6 +555,7 @@ def _policy_hash(native_tools_flag: str = "") -> str:
             "agentName": "ocremote",
             "nativeTools": native_tools_flag,
             "ocbridgeOnly": native_tools_flag == "",
+            "excludeDefaultComponents": native_tools_flag == "",
             "hostSha256": remote_canonical_sha256(_AGY_HOST_PY),
             "denyHookSha256": remote_canonical_sha256(_DENY_NATIVE_PY),
         }
@@ -610,6 +636,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
     }
 
     agent_tools_yaml = json.dumps(list(fault_tokens)) if native_tools_flag else "[]"
+    exclude_line = "excludeDefaultComponents: true\n" if not native_tools_flag else ""
     agent_body = (
         f"{system_prompt.strip()}\n\n" if system_prompt.strip() else ""
     ) + "Use only the configured ocbridge MCP tools (`mcp_ocbridge_*`). Native host tools are forbidden.\n"
@@ -617,6 +644,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         "---\n"
         "name: ocremote\n"
         "description: OpenClaude remote brain\n"
+        f"{exclude_line}"
         f"tools: {agent_tools_yaml}\n"
         "---\n"
         f"{agent_body}"
@@ -644,6 +672,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         "qemuPath": qemu_path,
         "accountHome": account_home,
         "model": model,
+        "probedModels": sorted(probed_models.keys()),
         "effort": effort,
         "systemPrompt": system_prompt,
         "initialSessionId": initial_session_id,
@@ -828,12 +857,21 @@ def _extract_mcp_call_id(meta: Any, sess_id: str, rpc_id: Any) -> str:
     conv_id = meta.get("antigravity.google/conversation_id")
     prog = meta.get("progressToken")
     need(isinstance(conv_id, str) and conv_id == sess_id, "AGY_MCP_CONVERSATION_MISMATCH")
-    need(isinstance(prog, str) and prog.startswith(f"{conv_id}:"), "AGY_MCP_PROGRESS_INVALID")
-    step_suffix = prog[len(conv_id) + 1 :]
-    need(step_suffix.isdigit(), "AGY_MCP_STEP_INVALID")
+    need(isinstance(prog, str) and ":" in prog, "AGY_MCP_PROGRESS_INVALID")
+    prog_prefix, step_suffix = prog.rsplit(":", 1)
+    need(IDENT_RE.fullmatch(prog_prefix) and step_suffix.isdigit(), "AGY_MCP_STEP_INVALID")
     call_id = f"agy_{sess_id.replace('-', '')[:12]}_{step_suffix}"
     need(IDENT_RE.fullmatch(call_id) and call_id != rpc_id, "AGY_MCP_CALL_ID_INVALID")
     return call_id
+
+
+def _strip_effort_suffix(model_id: str) -> str:
+    m = re.match(r"^(.+)-(low|medium|high|xhigh|max)$", model_id.strip().lower())
+    return m.group(1) if m else model_id.strip().lower()
+
+
+def _models_compatible(observed: str, expected: str) -> bool:
+    return _strip_effort_suffix(observed) == _strip_effort_suffix(expected)
 
 
 def _bind_session_id(state: Dict[str, Any], cid: str) -> None:
@@ -918,7 +956,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
     ev = frame.get("ev")
     if ev == "host_ready":
         _bind_session_id(state, str(frame.get("sessionId") or ""))
-        if isinstance(frame.get("model"), str):
+        if isinstance(frame.get("model"), str) and frame["model"]:
+            if state.get("expectedModel"):
+                need(_models_compatible(frame["model"], str(state["expectedModel"])), "AGY_MODEL_MISMATCH")
             state["observedModel"] = frame["model"]
         state["initialized"] = True
         _flush_init_replies(state, control_replies)
@@ -968,7 +1008,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         model = init_obj.get("model") or raw.get("model")
         if isinstance(model, str) and model:
             if state.get("expectedModel"):
-                need(model == state["expectedModel"], "AGY_MODEL_MISMATCH")
+                need(_models_compatible(model, str(state["expectedModel"])), "AGY_MODEL_MISMATCH")
             state["observedModel"] = model
         state["initialized"] = True
         _flush_init_replies(state, control_replies)
