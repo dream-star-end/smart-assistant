@@ -3,7 +3,9 @@ import { randomBytes } from 'node:crypto'
 import { describe, test } from 'node:test'
 import { extractRawQueryParam } from '../handlers.js'
 import {
+  DEFAULT_SIGN_TTL_MS,
   MEDIA_SIGN_BATCH_MAX,
+  STREAM_MEDIA_SIGN_TTL_MS,
   buildOpaqueInboxAssetUrl,
   buildOpaqueMediaFileUrl,
   buildOpaqueSignedUrl,
@@ -13,7 +15,9 @@ import {
   extractApiMediaFilename,
   isContainerPathAllowed,
   isMediaFilenameAllowed,
+  isStreamableMediaPath,
   normalizeSignBatchInput,
+  signTtlMsForPath,
   verifySignedUrl,
 } from '../mediaSign.js'
 
@@ -669,5 +673,44 @@ describe('isContainerPathAllowed', () => {
     assert.equal(isContainerPathAllowed('foo.png'), false)
     assert.equal(isContainerPathAllowed('./home/agent/x.png'), false)
     assert.equal(isContainerPathAllowed('home/agent/x.png'), false)
+  })
+})
+
+describe('streamable media sign TTL (OCV5-764)', () => {
+  const key = deriveMediaSignKey(VALID_BRIDGE_SECRET)
+
+  test('音视频走 2h TTL，图片与文档仍保持 5min 默认 TTL', () => {
+    assert.equal(STREAM_MEDIA_SIGN_TTL_MS, 2 * 60 * 60 * 1000)
+    assert.equal(isStreamableMediaPath('/home/agent/.openclaude/generated/film.mp4'), true)
+    assert.equal(isStreamableMediaPath('clip.WEBM?foo=1#bar'), true)
+    assert.equal(isStreamableMediaPath('voice.m4a'), true)
+    assert.equal(isStreamableMediaPath('/home/agent/.openclaude/uploads/photo.png'), false)
+    assert.equal(isStreamableMediaPath('/home/agent/.openclaude/generated/report.pdf'), false)
+
+    assert.equal(signTtlMsForPath('/home/agent/.openclaude/generated/film.mp4'), STREAM_MEDIA_SIGN_TTL_MS)
+    assert.equal(signTtlMsForPath('/home/agent/.openclaude/uploads/photo.png'), DEFAULT_SIGN_TTL_MS)
+  })
+
+  test('播满 6 分钟继续拉取 Range 时，视频 token 仍有效、图片 token 已 410 gone', () => {
+    const startMs = 1_700_000_000_000
+    const video = buildOpaqueSignedUrl(
+      key,
+      '/home/agent/.openclaude/generated/film.mp4',
+      'c:4',
+      signTtlMsForPath('/home/agent/.openclaude/generated/film.mp4'),
+    )
+    const image = buildOpaqueSignedUrl(
+      key,
+      '/home/agent/.openclaude/uploads/photo.png',
+      'c:4',
+      signTtlMsForPath('/home/agent/.openclaude/uploads/photo.png'),
+    )
+    const videoToken = new URLSearchParams(video.url.slice(video.url.indexOf('?') + 1)).get('t')
+    const imageToken = new URLSearchParams(image.url.slice(image.url.indexOf('?') + 1)).get('t')
+
+    const sixMinAfterIssue = Math.min(video.expMs, image.expMs) + 60_000
+    assert.equal(verifySignedUrl(key, { t: videoToken, nowMs: sixMinAfterIssue }).kind, 'ok')
+    assert.equal(verifySignedUrl(key, { t: imageToken, nowMs: sixMinAfterIssue }).kind, 'gone')
+    assert.equal(verifySignedUrl(key, { t: videoToken, nowMs: video.expMs }).kind, 'gone')
   })
 })
