@@ -208,7 +208,14 @@ function TutorialArtifactView({ artifact }: { artifact: TutorialArtifact }) {
             浏览器不支持音频播放
           </audio>
         ) : kind === "video" && safeEmbed ? (
-          <video controls src={artifact.embedUrl!} className="max-h-96 w-full rounded-xl">
+          <video
+            controls
+            preload="none"
+            src={artifact.embedUrl!}
+            className="max-h-96 w-full rounded-xl"
+            playsInline
+            {...({ "webkit-playsinline": "true", "x5-playsinline": "true" } as Record<string, string>)}
+          >
             浏览器不支持视频播放
           </video>
         ) : kind === "pdf" && safeEmbed ? (

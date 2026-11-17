@@ -78,6 +78,7 @@ import {
   extractApiMediaFilename,
   isContainerPathAllowed,
   normalizeSignBatchInput,
+  signTtlMsForPath,
 } from "../mediaSign.js";
 
 // session id 在 client_sessions 表是 TEXT PRIMARY KEY,
@@ -724,13 +725,19 @@ export async function handleAdminSignSessionMedia(
   if (!norm.ok) throw new HttpError(400, "VALIDATION", norm.message);
 
   const urls: Record<string, string> = {};
-  let expMs = Date.now() + DEFAULT_SIGN_TTL_MS;
+  const fallbackExpMs = Date.now() + DEFAULT_SIGN_TTL_MS;
+  let minExpMs = Number.POSITIVE_INFINITY;
   for (const path of norm.paths) {
     const mediaFile = extractApiMediaFilename(path);
     if (mediaFile) {
-      const signed = buildOpaqueMediaFileUrl(deps.mediaSignKey, mediaFile, session.userId);
+      const signed = buildOpaqueMediaFileUrl(
+        deps.mediaSignKey,
+        mediaFile,
+        session.userId,
+        signTtlMsForPath(mediaFile),
+      );
       urls[path] = signed.url;
-      expMs = Math.min(expMs, signed.expMs);
+      minExpMs = Math.min(minExpMs, signed.expMs);
       continue;
     }
     let resolved: string;
@@ -740,10 +747,16 @@ export async function handleAdminSignSessionMedia(
       continue;
     }
     if (!isContainerPathAllowed(resolved)) continue;
-    const signed = buildOpaqueSignedUrl(deps.mediaSignKey, path, session.userId);
+    const signed = buildOpaqueSignedUrl(
+      deps.mediaSignKey,
+      path,
+      session.userId,
+      signTtlMsForPath(resolved),
+    );
     urls[path] = signed.url;
-    expMs = Math.min(expMs, signed.expMs);
+    minExpMs = Math.min(minExpMs, signed.expMs);
   }
+  const expMs = Number.isFinite(minExpMs) ? minExpMs : fallbackExpMs;
 
   await writeAdminAudit(getPool(), {
     adminId: admin.id,

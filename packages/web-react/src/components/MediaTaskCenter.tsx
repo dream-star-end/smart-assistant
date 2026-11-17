@@ -14,6 +14,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } fro
 import { assertAuthResponseCurrent, bearerHeaders, callWithRefresh } from '../lib/api'
 import type { AuthSession } from '../lib/types'
 import { Button, IconButton, Progress as ProgressBar, Sheet, useConfirm } from './ui'
+import { claimInlineVideoSlot, releaseInlineVideoSlot, teardownVideoElement } from './chat/inlineVideoSlot'
 
 type JobsPage = { jobs: MediaGenerationJob[]; nextCursor: string | null }
 type ProjectsPage = { projects: VideoProject[]; nextCursor: string | null }
@@ -255,10 +256,38 @@ function JobResult({ job, auth }: { job: MediaGenerationJob; auth: AuthSession |
   const [resultUrl, setResultUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const slotIdRef = useRef<symbol>(Symbol('media-task-video'))
+  const videoElRef = useRef<HTMLVideoElement | null>(null)
+  const mountedRef = useRef(true)
+  const requestEpochRef = useRef(0)
+
+  const setVideoRef = useCallback((node: HTMLVideoElement | null) => {
+    if (!node && videoElRef.current) teardownVideoElement(videoElRef.current)
+    videoElRef.current = node
+  }, [])
+
+  const collapseResult = useCallback(() => {
+    requestEpochRef.current += 1
+    teardownVideoElement(videoElRef.current)
+    releaseInlineVideoSlot(slotIdRef.current)
+    setResultUrl(null)
+  }, [])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      requestEpochRef.current += 1
+      teardownVideoElement(videoElRef.current)
+      releaseInlineVideoSlot(slotIdRef.current)
+    }
+  }, [])
+
   if (job.status !== 'completed') return null
 
   const loadResult = async () => {
     if (!auth || loading) return
+    const myEpoch = ++requestEpochRef.current
     setLoading(true)
     setError(null)
     try {
@@ -267,31 +296,42 @@ function JobResult({ job, auth }: { job: MediaGenerationJob; auth: AuthSession |
         `/api/media-generation/jobs/${job.id}/result-ticket`,
         { method: 'POST' },
       )
+      if (!mountedRef.current || requestEpochRef.current !== myEpoch) return
+      claimInlineVideoSlot(slotIdRef.current, collapseResult)
       setResultUrl(value.url)
     } catch (cause) {
+      if (!mountedRef.current || requestEpochRef.current !== myEpoch) return
       setError(cause instanceof Error ? cause.message : '视频地址获取失败')
     } finally {
-      setLoading(false)
+      if (mountedRef.current) setLoading(false)
     }
   }
   return (
     <div className="mt-3 space-y-2">
       {resultUrl ? (
         <>
-          {/* biome-ignore lint/a11y/useMediaCaption: generated H3 clips do not include a transcript or caption artifact */}
           <video
+            ref={setVideoRef}
             className="max-h-64 w-full rounded-xl bg-black"
             controls
+            playsInline
+            {...({ 'webkit-playsinline': 'true', 'x5-playsinline': 'true' } as Record<string, string>)}
             preload="metadata"
             src={resultUrl}
+            onEnded={collapseResult}
           />
-          <a
-            className="inline-flex items-center gap-1 text-meta font-medium text-accent hover:underline"
-            href={resultUrl}
-            download
-          >
-            <Download size={13} /> 下载 MP4
-          </a>
+          <div className="flex items-center gap-3">
+            <a
+              className="inline-flex items-center gap-1 text-meta font-medium text-accent hover:underline"
+              href={resultUrl}
+              download
+            >
+              <Download size={13} /> 下载 MP4
+            </a>
+            <Button size="sm" variant="ghost" onClick={collapseResult}>
+              收起预览
+            </Button>
+          </div>
         </>
       ) : (
         <Button size="sm" variant="secondary" disabled={loading} onClick={() => void loadResult()}>

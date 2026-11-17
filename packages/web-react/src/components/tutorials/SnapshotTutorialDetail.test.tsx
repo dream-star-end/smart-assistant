@@ -124,4 +124,31 @@ describe('SnapshotTutorialDetail', () => {
     fireEvent.click(screen.getByRole('button', { name: '重试' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
   })
+
+  it('视频产物带 playsinline 与 preload="none" 页内播放属性（OCV5-765）', () => {
+    render(
+      <SnapshotTutorialDetail
+        item={{
+          ...item,
+          artifacts: [
+            {
+              sha256: 'vid1',
+              name: 'demo.mp4',
+              mime: 'video/mp4',
+              bytes: 1024,
+              embedUrl: '/api/tutorial-embeds/vid1',
+              downloadUrl: '/api/tutorial-blobs/vid1',
+            },
+          ],
+        }}
+        onBack={() => {}}
+      />,
+    )
+    const video = document.querySelector('video')
+    expect(video).not.toBeNull()
+    expect(video?.hasAttribute('playsinline')).toBe(true)
+    expect(video?.getAttribute('webkit-playsinline')).toBe('true')
+    expect(video?.getAttribute('x5-playsinline')).toBe('true')
+    expect(video?.getAttribute('preload')).toBe('none')
+  })
 })

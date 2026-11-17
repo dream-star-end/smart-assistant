@@ -8,7 +8,12 @@ import type { Pool } from 'pg'
 import { signAccess } from '../../auth/jwt.js'
 import { setPoolOverride } from '../../db/index.js'
 import type { CommercialHttpDeps, RequestContext } from '../handlers.js'
-import { deriveMediaSignKey, verifySignedUrl } from '../mediaSign.js'
+import {
+  DEFAULT_SIGN_TTL_MS,
+  STREAM_MEDIA_SIGN_TTL_MS,
+  deriveMediaSignKey,
+  verifySignedUrl,
+} from '../mediaSign.js'
 import { HttpError } from '../util.js'
 import {
   handleAdminGetSession,
@@ -541,5 +546,39 @@ describe('admin session chat/archive/media handlers', () => {
     assert.equal(audit.signed_paths, 2)
     assert.ok(!JSON.stringify(audit).includes('photo.png'))
     assert.ok(!JSON.stringify(audit).includes('/home/agent'))
+  })
+
+  test('media-sign 对视频签出 2h token、图片保持 5min，纯视频批返 2h expMs', async () => {
+    const out = makeRes()
+    const videoPath = '/home/agent/.openclaude/generated/demo.mp4'
+    const imagePath = '/api/media/photo.png'
+    const beforeMs = Date.now()
+    await handleAdminSignSessionMedia(
+      makeReq('POST', '/api/admin/sessions/web-1/media-sign', {
+        paths: [videoPath, imagePath],
+      }),
+      out.res,
+      ctx,
+      deps,
+    )
+    const result = out.read()
+    assert.equal(result.status, 200)
+    assert.ok(result.body.expMs <= Date.now() + DEFAULT_SIGN_TTL_MS + 1000)
+
+    const videoToken = new URL(result.body.urls[videoPath], 'https://x').searchParams.get('t')
+    const imageToken = new URL(result.body.urls[imagePath], 'https://x').searchParams.get('t')
+    const sixMinLater = beforeMs + 6 * 60 * 1000
+    assert.equal(verifySignedUrl(MEDIA_SIGN_KEY, { t: videoToken, nowMs: sixMinLater }).kind, 'ok')
+    assert.equal(verifySignedUrl(MEDIA_SIGN_KEY, { t: imageToken, nowMs: sixMinLater }).kind, 'gone')
+
+    const outVideo = makeRes()
+    await handleAdminSignSessionMedia(
+      makeReq('POST', '/api/admin/sessions/web-1/media-sign', { paths: [videoPath] }),
+      outVideo.res,
+      ctx,
+      deps,
+    )
+    const videoResult = outVideo.read()
+    assert.ok(videoResult.body.expMs >= beforeMs + STREAM_MEDIA_SIGN_TTL_MS - 1000)
   })
 })

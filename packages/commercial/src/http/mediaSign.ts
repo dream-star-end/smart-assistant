@@ -67,6 +67,23 @@ export const MEDIA_SIGN_BATCH_MAX = 32
 export const DEFAULT_SIGN_TTL_MS = 5 * 60 * 1000
 
 /**
+ * 流式音视频 signed URL TTL(ms):移动端原生播放器(如鸿蒙 ArkWeb)按 2MB Range 分段
+ * 边播边拉且暂停/拖动后继续复用原 URL,5min 会中途 410 且不触发 DOM onError。
+ */
+export const STREAM_MEDIA_SIGN_TTL_MS = 2 * 60 * 60 * 1000
+
+const STREAM_MEDIA_EXT_RE = /\.(?:mp4|webm|mov|mkv|m4v|ogv|mp3|wav|ogg|m4a|flac|aac)(?:[?#].*)?$/i
+
+export function isStreamableMediaPath(pathOrFilename: string): boolean {
+  if (typeof pathOrFilename !== 'string' || pathOrFilename.length === 0) return false
+  return STREAM_MEDIA_EXT_RE.test(pathOrFilename)
+}
+
+export function signTtlMsForPath(pathOrFilename: string): number {
+  return isStreamableMediaPath(pathOrFilename) ? STREAM_MEDIA_SIGN_TTL_MS : DEFAULT_SIGN_TTL_MS
+}
+
+/**
  * v3 commercial 容器 HOME 前缀。signed URL 接受的 path 必须以此开头。
  *
  * 所有 v3 commercial 容器都按 `agent` user 启动,HOME=`/home/agent`。codex CLI 写

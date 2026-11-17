@@ -35,6 +35,18 @@ import { useTimelineEagerMedia } from "./timelineEager";
 // 时间线首屏同步渲染的一部分,不动。空闲期由 App.prefetchLazyCentersOnIdle 预取同一 chunk。
 const ImageViewer = lazy(() => import("../ImageViewer").then((m) => ({ default: m.ImageViewer })));
 
+// 首屏瘦身(OCV5-765):活跃 <video> 播放层及其 ArkWeb 防遮挡 observer 只在点击播放时挂载，
+// 懒加载移出入口静态闭包；若动态 import 失败则重建 lazy 包装，避免重试点击命中已失败缓存。
+function createLazyInlineVideoActive() {
+  return lazy(() =>
+    import("./InlineVideoActive").catch((err) => {
+      InlineVideoActive = createLazyInlineVideoActive();
+      throw err;
+    }),
+  );
+}
+let InlineVideoActive = createLazyInlineVideoActive();
+
 /** 气泡缩略默认按 dpr 选档:标屏 640,retina 1280(与服务端白名单一致)。 */
 function defaultThumbWidth(): 640 | 1280 {
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
@@ -460,23 +472,80 @@ export function SignedImg(
   );
 }
 
-/**
- * markdown 行内 <video>：容器路径签名后渲染（rehypeEmbedMedia 把媒体路径行内码转成 video 节点用）。
- * 聊天视频一律页内播放、只在用户点播放时开始(P0 鸿蒙原生浏览器):没有 playsInline 时移动端浏览器
- * 一播放就交给系统全屏 / 浮窗播放器,退出后页面按钮点不动。playsInline 放在 rest 之后,调用方关不掉。
- */
-export function SignedVideo(props: React.VideoHTMLAttributes<HTMLVideoElement> & { src?: string }) {
-  const { src, autoPlay: _autoPlay, ...rest } = props;
-  const { url: resolved, onError } = useSignedSrc(typeof src === "string" ? src : null);
-  if (!resolved) {
+function InlineVideoPlayer(
+  props: React.VideoHTMLAttributes<HTMLVideoElement> & { src?: string; filename?: string },
+) {
+  const { src, filename, ...videoProps } = props;
+  const rawSrc = typeof src === "string" ? src.trim() : "";
+  const displayName = (filename || rawSrc.split("/").pop()?.split("?")[0] || "视频").trim();
+  const { authKey } = useContext(Ctx);
+  const { get } = useFreshSignedUrl(rawSrc || null);
+  const sourceKey = `${rawSrc}\0${String(authKey ?? "")}`;
+  const [engaged, setEngaged] = useState<{ key: string; action: "play" | "download" } | null>(null);
+  const activeAction = engaged?.key === sourceKey ? engaged.action : null;
+
+  if (!rawSrc) {
     return (
       <span className="inline-flex items-center gap-1 rounded-md bg-hover px-2 py-1 text-xs text-faint">
-        <FileText size={12} /> 视频加载中…
+        <FileText size={12} /> 视频地址无效
       </span>
     );
   }
-  // biome-ignore lint/a11y/useMediaCaption: 模型生成媒体无字幕轨
-  return <video src={resolved} controls onError={onError} className="my-2 max-h-72 max-w-full rounded-lg border border-border" {...rest} playsInline />;
+
+  const coverCard = (
+    <div className="my-2 flex w-full max-w-md items-center gap-2 rounded-lg border border-border bg-surface p-2">
+      <button
+        type="button"
+        onClick={() => setEngaged({ key: sourceKey, action: "play" })}
+        aria-label={`播放视频 ${displayName}`}
+        className="flex min-h-[44px] min-w-0 flex-1 items-center gap-3 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-hover"
+      >
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" className="size-4 translate-x-[1px]">
+            <path d="M4.5 3.2a.8.8 0 0 1 1.22-.68l7.2 4.8a.8.8 0 0 1 0 1.36l-7.2 4.8A.8.8 0 0 1 4.5 12.8V3.2Z" />
+          </svg>
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-medium text-fg">播放视频</span>
+          <span className="block truncate text-xs text-muted">{displayName} · 页内播放</span>
+        </span>
+      </button>
+      <button
+        type="button"
+        aria-label={`下载 ${displayName}`}
+        onClick={() => setEngaged({ key: sourceKey, action: "download" })}
+        className="inline-flex min-h-[36px] shrink-0 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-muted hover:bg-hover hover:text-fg"
+      >
+        <Download size={13} />
+        下载
+      </button>
+    </div>
+  );
+
+  if (activeAction) {
+    return (
+      <LazyBoundary fallback={coverCard}>
+        <InlineVideoActive
+          key={sourceKey}
+          rawSrc={rawSrc}
+          displayName={displayName}
+          initialAction={activeAction}
+          get={get}
+          videoProps={videoProps}
+        />
+      </LazyBoundary>
+    );
+  }
+
+  return coverCard;
+}
+
+/**
+ * markdown 行内 <video>：点击后才签名并挂载单个页内 <video>，避免鸿蒙 ArkWeb 空闲预加载/同层遮挡侧栏。
+ * playsInline 放在 rest 之后，并剥离 autoPlay，确保只在用户点击时页内起播。
+ */
+export function SignedVideo(props: React.VideoHTMLAttributes<HTMLVideoElement> & { src?: string }) {
+  return <InlineVideoPlayer {...props} />;
 }
 
 /** markdown 行内 <audio>：容器路径签名后渲染。 */
@@ -766,7 +835,7 @@ export function SignedFileCard({ src, filename, label }: { src?: string; filenam
 
 /** 单个已分类媒体的实际元素（image/video/audio/file）。 */
 function MediaItem({ item }: { item: ResolvedMedia }) {
-  const path = item.mode === "sign" ? item.path : null;
+  const path = item.mode === "sign" && item.kind !== "video" ? item.path : null;
   const direct = item.mode === "direct" ? item.src : null;
   const { url: signed, onError } = useSignedSrc(path);
   const url = direct ?? signed;
@@ -784,6 +853,10 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
     // 此前这里是一条冻结挂载时签名 URL 的裸 <a>,消息渲染 >5min 后点击即 410 死链。
     return <SignedFileCard src={item.path} filename={item.filename} />;
   }
+  if (item.kind === "video") {
+    const videoSrc = item.mode === "direct" ? item.src : item.path;
+    return <InlineVideoPlayer src={videoSrc} filename={item.filename} />;
+  }
   if (!url) {
     return (
       <div className="flex h-24 w-32 items-center justify-center rounded-lg border border-border bg-hover text-xs text-faint">
@@ -800,12 +873,6 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
         signPath={path}
         imgClassName="max-h-72 max-w-full rounded-lg border border-border object-contain"
       />
-    );
-  }
-  if (item.kind === "video") {
-    return (
-      // biome-ignore lint/a11y/useMediaCaption: 用户/模型上传媒体无字幕轨
-      <video src={url} controls playsInline onError={onError} className="max-h-72 max-w-full rounded-lg border border-border" />
     );
   }
   if (item.kind === "audio") {

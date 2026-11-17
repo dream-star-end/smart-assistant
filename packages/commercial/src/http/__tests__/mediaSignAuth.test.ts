@@ -34,7 +34,12 @@ import type { Pool } from "pg";
 import { signAccess } from "../../auth/jwt.js";
 import { handleMediaSign } from "../handlers.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
-import { deriveMediaSignKey } from "../mediaSign.js";
+import {
+  DEFAULT_SIGN_TTL_MS,
+  STREAM_MEDIA_SIGN_TTL_MS,
+  deriveMediaSignKey,
+  verifySignedUrl,
+} from "../mediaSign.js";
 
 // ─── fixtures ──────────────────────────────────────────────────────────
 
@@ -372,5 +377,40 @@ describe("handleMediaSign auth (v1.0.159 cookie-first dual-verify)", () => {
     assert.equal(out.statusCode, 200);
     // 同 sub,mismatch 分支条件 `br.claims.sub !== claims.sub` 不成立,无 warn
     assert.deepEqual(warns, []);
+  });
+
+  test("OCV5-764: 视频路径(/home/agent/*.mp4 与 /api/media/*.webm)签出 2h token，图片保持 5min", async () => {
+    const sub = "4";
+    const cookie = await makeJwt(sub);
+    const { deps } = makeDeps(new Set([sub]));
+    const videoFile = "/home/agent/.openclaude/generated/clip.mp4";
+    const mediaVideo = "/api/media/clip2.webm";
+    const imageFile = "/home/agent/.openclaude/uploads/photo.png";
+    const req = makeReq({ cookieToken: cookie, paths: [videoFile, mediaVideo, imageFile] });
+    const out = makeRes();
+    const { ctx } = makeCtx();
+    const beforeMs = Date.now();
+    await handleMediaSign(req, out.res, ctx, deps);
+    assert.equal(out.statusCode, 200);
+    const body = parseBody(out) as { urls: Record<string, string>; expMs: number };
+
+    // 混合批次的 response expMs 取最短有效期（图片 5min）。
+    assert.ok(body.expMs <= Date.now() + DEFAULT_SIGN_TTL_MS + 1000);
+
+    const tokenFor = (p: string) => new URL(body.urls[p]!, "https://x.invalid").searchParams.get("t");
+    const afterSixMin = beforeMs + 6 * 60 * 1000;
+    const afterTwoHours = Date.now() + STREAM_MEDIA_SIGN_TTL_MS + 1000;
+
+    assert.equal(verifySignedUrl(TEST_MEDIA_SIGN_KEY, { t: tokenFor(videoFile), nowMs: afterSixMin }).kind, "ok");
+    assert.equal(verifySignedUrl(TEST_MEDIA_SIGN_KEY, { t: tokenFor(mediaVideo), nowMs: afterSixMin }).kind, "ok");
+    assert.equal(verifySignedUrl(TEST_MEDIA_SIGN_KEY, { t: tokenFor(imageFile), nowMs: afterSixMin }).kind, "gone");
+    assert.equal(verifySignedUrl(TEST_MEDIA_SIGN_KEY, { t: tokenFor(videoFile), nowMs: afterTwoHours }).kind, "gone");
+
+    // 纯视频批次的 expMs 为 2h。
+    const reqVideoOnly = makeReq({ cookieToken: cookie, paths: [videoFile] });
+    const outVideoOnly = makeRes();
+    await handleMediaSign(reqVideoOnly, outVideoOnly.res, ctx, deps);
+    const bodyVideoOnly = parseBody(outVideoOnly) as { expMs: number };
+    assert.ok(bodyVideoOnly.expMs >= beforeMs + STREAM_MEDIA_SIGN_TTL_MS - 1000);
   });
 });
