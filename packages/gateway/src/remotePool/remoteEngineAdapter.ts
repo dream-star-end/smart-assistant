@@ -121,11 +121,22 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     this._toolsets = opts.agentToolsets
 
     const isCodexAuthority = backend.authorityEngine === 'codex'
+    const isAntigravityAuthority = backend.authorityEngine === 'antigravity'
+    const needsServerReqId =
+      isCodexAuthority ||
+      isAntigravityAuthority ||
+      backend.authorityEngine === 'grok' ||
+      backend.authorityEngine === 'cursor' ||
+      backend.authorityEngine === 'zcode'
     this.capabilities = {
       billingMode: isCodexAuthority ? 'engine-reported' : 'proxy',
       supportsEffort: true,
-      resumeKind: isCodexAuthority ? 'codex-thread' : 'ccb-session',
-      needsServerRequestId: isCodexAuthority,
+      resumeKind: isAntigravityAuthority
+        ? 'antigravity-session'
+        : isCodexAuthority
+          ? 'codex-thread'
+          : 'ccb-session',
+      needsServerRequestId: needsServerReqId,
       historyMode: 'native-resume',
       permissionModel: 'native',
       emitsCallUsage: false,

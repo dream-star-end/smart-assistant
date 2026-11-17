@@ -41,6 +41,22 @@ export function resolveProbedUpstreamModel(
       return 'opus'
     }
   }
+  if (driverId === 'antigravity') {
+    const slug = rawUpstreamModelId.trim().toLowerCase().replace(/-remote$/, '')
+    const candidates: string[] = []
+    if (slug === 'antigravity-orchestrator-carbon' || slug === 'gemini-pro-orchestrator') {
+      candidates.push('gemini-pro-orchestrator')
+    } else {
+      const bare = slug.replace(/^antigravity-/, '').replace(/5\.5$/, '5-5')
+      const base = bare.replace(/-(?:low|medium|high|xhigh|max)$/, '')
+      candidates.push(bare, `${bare}-medium`, `${bare}-high`, base, `${base}-medium`, `${base}-high`)
+    }
+    for (const cand of candidates) {
+      if (snapshot.models.some((m) => m.upstreamModelId === cand)) {
+        return cand
+      }
+    }
+  }
   return null
 }
 
@@ -83,6 +99,15 @@ export function buildDefaultDriverContextForNode(
       nativePath:
         '/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex',
       codexHome: `${home}/.oc-remote-codex/profiles/${input.profileName}/codex-home`,
+    }
+  }
+  if (input.driverId === 'antigravity') {
+    return {
+      mcpClientPath,
+      cliPath: `${home}/.local/bin/agy`,
+      qemuPath: `${home}/.local/lib/antigravity-compat/usr/bin/qemu-x86_64-static`,
+      accountHome: home,
+      profileName: input.profileName,
     }
   }
   return { mcpClientPath }

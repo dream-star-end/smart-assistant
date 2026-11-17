@@ -216,6 +216,21 @@ export function toRemotePoolModelId(upstreamOrBaseId: string): string {
   return clean.endsWith('-remote') ? clean : `${clean}-remote`
 }
 
+export function defaultRemoteCanonicalModelId(
+  engine: RemoteBrainEngine,
+  upstreamModelId: string,
+): string {
+  const raw = upstreamModelId.trim().toLowerCase()
+  if (engine === 'antigravity') {
+    if (raw === 'gemini-pro-orchestrator') return 'antigravity-orchestrator-carbon-remote'
+    const base = raw
+      .replace(/-(?:low|medium|high|xhigh|max)$/, '')
+      .replace(/5-5$/, '5.5')
+    return toRemotePoolModelId(base.startsWith('antigravity-') ? base : `antigravity-${base}`)
+  }
+  return toRemotePoolModelId(upstreamModelId)
+}
+
 function getRemoteHostdScriptPath(): string {
   return resolve(
     fileURLToPath(import.meta.url),
@@ -1597,7 +1612,7 @@ export async function countEligibleEnabledRemoteOffers(
       WHERE o.canonical_model_id = $1
         AND o.enabled = TRUE
         AND p.driver_id IS NULL
-        AND (p.engine <> 'codex' OR (p.execution_ready=TRUE AND p.runner_mode='app-server'
+        AND (p.engine NOT IN ('codex', 'antigravity') OR (p.engine = 'codex' AND p.execution_ready=TRUE AND p.runner_mode='app-server'
           AND p.execution_manifest->>'backendKind'='codex-app-server-v1'
           AND p.execution_manifest->>'authEpoch'=p.auth_epoch
           AND p.execution_manifest->>'snapshotSha256'=p.probe_snapshot->>'snapshot_sha256'
@@ -1759,14 +1774,16 @@ export async function publishRemoteModelOffers(
         : catalogEngine === 'codex'
           ? 'codex'
           : catalogEngine === 'antigravity'
-            ? 'gemini'
+            ? 'antigravity'
             : 'grok'
 
     const published: RemoteModelOfferView[] = []
     for (const item of input.offers) {
       const upstreamModelId = item.upstream_model_id.trim()
       const baseDisplayName = item.base_display_name.trim() || upstreamModelId
-      const canonicalModelId = toRemotePoolModelId(item.canonical_model_id ?? upstreamModelId)
+      const canonicalModelId = item.canonical_model_id
+        ? toRemotePoolModelId(item.canonical_model_id)
+        : defaultRemoteCanonicalModelId(engine, upstreamModelId)
       if (engine === 'codex' && canonicalModelId !== `${upstreamModelId}-remote`) throw new Error('CODEX_CANONICAL_MODEL_MISMATCH')
       const enabled = item.enabled !== false
       const remoteDisplayName = formatRemoteModelDisplayName(
@@ -1851,17 +1868,53 @@ export async function publishRemoteModelOffers(
         promo_label: null,
       }
 
+      const baseCatalog = await client.query<{
+        context_window: number | null
+        capability_profile: Record<string, any> | null
+      }>(
+        `SELECT context_window, capability_profile
+           FROM model_catalog
+          WHERE model_id IN ($1, $2)
+             OR (engine = $3 AND upstream_model_id = $4)
+          ORDER BY CASE WHEN model_id = $1 THEN 0 ELSE 1 END, entry_id DESC
+          LIMIT 1`,
+        [baseSlug, upstreamModelId, catalogEngine, upstreamModelId],
+      )
+      const baseCatRow = baseCatalog.rows[0]
+      const probedSnapshotModels = Array.isArray(profile.probe_snapshot?.models)
+        ? (profile.probe_snapshot.models as Array<Record<string, any>>)
+        : []
+      const probedModel = probedSnapshotModels.find(
+        (m) => String(m?.upstreamModelId ?? '') === upstreamModelId,
+      )
+      const contextWindow =
+        Number(baseCatRow?.context_window ?? 0) > 0
+          ? Number(baseCatRow!.context_window)
+          : engine === 'antigravity'
+            ? 1048576
+            : 200000
+      const baseSupportedEfforts = Array.isArray(baseCatRow?.capability_profile?.reasoning?.supported)
+        ? (baseCatRow!.capability_profile!.reasoning.supported as string[])
+        : Array.isArray(probedModel?.supportedEfforts)
+          ? (probedModel!.supportedEfforts as string[])
+          : null
+
       // A remote cc chat is a text-only interactive session on the node: no image input and no
       // effort control reach its CLI; its native context lives there (box-native-v1).
       const capabilityProfile = engine === 'codex' ? projectCodexRemoteCapabilities(profile, upstreamModelId) : {
-        supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb',
+        supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb' && catalogEngine !== 'antigravity',
         reasoning: {
-          supported: catalogEngine === 'codex' ? ['low', 'medium', 'high'] : [],
+          supported:
+            catalogEngine === 'codex'
+              ? ['low', 'medium', 'high']
+              : catalogEngine === 'antigravity'
+                ? (baseSupportedEfforts ?? ['low', 'medium', 'high'])
+                : [],
           codex_model_default: catalogEngine === 'codex' ? 'medium' : null,
         },
         ccb: {
           capability_zero: catalogEngine === 'ccb',
-          supports_thinking: catalogEngine !== 'ccb',
+          supports_thinking: catalogEngine !== 'ccb' && catalogEngine !== 'antigravity',
           ...(catalogEngine === 'ccb' ? { context_owner: 'box-native-v1' } : {}),
         },
       }
@@ -1919,9 +1972,10 @@ export async function publishRemoteModelOffers(
                     provider_id = $3,
                     upstream_model_id = $4,
                     capability_profile = $5::jsonb,
+                    context_window = $6,
                     placement = 'remote_pool'
               WHERE entry_id = $1`,
-            [entryId, catalogEngine, providerId, upstreamModelId, JSON.stringify(capabilityProfile)],
+            [entryId, catalogEngine, providerId, upstreamModelId, JSON.stringify(capabilityProfile), contextWindow],
           )
           if (aggregated.catalogState === 'active') {
             await client.query(
@@ -1951,7 +2005,7 @@ export async function publishRemoteModelOffers(
           `INSERT INTO model_catalog
              (model_id, engine, provider_id, upstream_model_id, context_window,
               capability_profile, capability_schema_version, state, placement, pool_auto_disabled)
-           VALUES ($1, $2, $3, $4, 200000, $5::jsonb, 1, 'staged', 'remote_pool', FALSE)
+           VALUES ($1, $2, $3, $4, $6, $5::jsonb, 1, 'staged', 'remote_pool', FALSE)
            RETURNING entry_id`,
           [
             canonicalModelId,
@@ -1959,6 +2013,7 @@ export async function publishRemoteModelOffers(
             providerId,
             upstreamModelId,
             JSON.stringify(capabilityProfile),
+            contextWindow,
           ],
         )
         const entryId = insCat.rows[0]!.entry_id
@@ -2106,7 +2161,7 @@ export async function preheatRemotePoolSession(
        JOIN remote_agent_nodes n ON n.id = p.node_id
       WHERE o.canonical_model_id = $1
         AND o.enabled = TRUE
-        AND (p.engine <> 'codex' OR (p.execution_ready=TRUE AND p.runner_mode='app-server'
+        AND (p.engine NOT IN ('codex', 'antigravity') OR (p.engine = 'codex' AND p.execution_ready=TRUE AND p.runner_mode='app-server'
           AND p.execution_manifest->>'backendKind'='codex-app-server-v1'
           AND p.execution_manifest->>'authEpoch'=p.auth_epoch
           AND p.execution_manifest->>'snapshotSha256'=p.probe_snapshot->>'snapshot_sha256'

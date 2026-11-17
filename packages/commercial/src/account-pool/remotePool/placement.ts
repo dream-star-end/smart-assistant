@@ -381,11 +381,17 @@ export async function placeRemoteDriverLane(
               AND session_key = $2
               AND (
                 driver_id = $3
-                OR (driver_id IS NULL AND engine = $4)
+                OR ($5::boolean AND driver_id IS NULL AND engine = $4)
               )
             ORDER BY updated_at DESC
             LIMIT 1`,
-            [uidStr, effectiveSessionKey, reg.driverId, legacyBindEngine],
+            [
+              uidStr,
+              effectiveSessionKey,
+              reg.driverId,
+              legacyBindEngine,
+              reg.driverId === 'cc' || reg.driverId === 'codex',
+            ],
           )
         ).rows[0]
 

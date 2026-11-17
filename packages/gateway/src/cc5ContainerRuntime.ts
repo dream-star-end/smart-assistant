@@ -139,7 +139,7 @@ export interface RemoteLanePlacement {
   readonly profileId?: string
 }
 export interface RemoteLaneRequest {
-  readonly engine?: 'ccb' | 'codex'
+  readonly engine?: 'ccb' | 'codex' | 'antigravity'
   readonly uid: number
   readonly containerDbId: string
   readonly sessionKey: string
@@ -346,8 +346,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       !lane.creationFailed && !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
       lane.binding.expiresAt > Date.now() &&
       (lane.binding.version === 4
-        ? lane.binding.authorityEngine === (request.engine === 'codex' ? 'codex' : 'ccb')
-        : (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1'))
+        ? lane.binding.authorityEngine === (request.engine ?? 'ccb')
+        : request.engine !== 'antigravity' && (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1'))
     // A resident lane answers without waiting; anything else is decided on the chat's tail.
     let lane = owner.lane
     if (!live(lane)) {
@@ -452,6 +452,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     placement: RemoteLanePlacement): Promise<Lane> {
     if (placement.v4) return this.startDriverV4Lane(container, request, placement)
     if (request.engine === 'codex') return this.startCodexLane(container, request, placement)
+    requireLane(request.engine !== 'antigravity')
     let lane: Lane | undefined
     try {
     requireLane(!placement.codex)

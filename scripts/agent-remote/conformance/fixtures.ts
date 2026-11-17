@@ -343,6 +343,293 @@ for raw in sys.stdin:
   )
 }
 
+export function makeAntigravityConformanceCli(dir: string): string {
+  return writeExecutable(
+    join(dir, 'agy-conformance-cli'),
+    `#!/usr/bin/env python3
+import hashlib, json, os, pathlib, signal, subprocess, sys, threading, time, uuid
+
+args = sys.argv[1:]
+if "--version" in args:
+    print("antigravity 1.5.5")
+    sys.exit(0)
+if "models" in args:
+    print("gemini-4-carbon\\ngemini-4-hydrogen\\ngemini-pro-orchestrator\\nclaude-opus-5-5\\nclaude-sonnet-5-5")
+    sys.exit(0)
+
+home = pathlib.Path(os.environ.get("HOME") or ".")
+agent_md = home / ".gemini" / "antigravity-cli" / "agents" / "ocremote.md"
+agent_text = agent_md.read_text(encoding="utf-8") if agent_md.is_file() else ""
+policy_relaxed = ("--agent" not in args) or ("tools: []" not in agent_text)
+
+model = args[args.index("--model") + 1] if "--model" in args and args.index("--model") + 1 < len(args) else "gemini-4-carbon-medium"
+conv_id = args[args.index("--conversation") + 1] if "--conversation" in args and args.index("--conversation") + 1 < len(args) else str(uuid.uuid4())
+
+mcp_cfg_path = home / ".gemini" / "config" / "mcp_config.json"
+mcp_cfg = json.loads(mcp_cfg_path.read_text(encoding="utf-8")) if mcp_cfg_path.is_file() else {}
+oc_srv = (mcp_cfg.get("mcpServers") or {}).get("ocbridge") or {}
+oc_tools = list((oc_srv.get("tools") or {}).keys())
+write_alias = "Write" if "Write" in oc_tools else (oc_tools[0] if oc_tools else "Write")
+oc_cmd = str(oc_srv.get("command") or "")
+oc_args = [str(x) for x in (oc_srv.get("args") or [])]
+
+def on_sigint(signum, frame):
+    sys.stdout.write(json.dumps({
+        "event": "result",
+        "result": {"conversation_id": conv_id, "status": "ERROR", "error": "interrupted"},
+    }, separators=(",", ":")) + "\\n")
+    sys.stdout.flush()
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, on_sigint)
+
+def call_mcp(reqs):
+    if not oc_cmd:
+        return []
+    payload = "".join(json.dumps(r, separators=(",", ":")) + "\\n" for r in reqs)
+    p = subprocess.Popen(
+        [oc_cmd, *oc_args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    out, _ = p.communicate(payload, timeout=15)
+    return [ln for ln in out.splitlines() if ln.strip()]
+
+sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv_id, "init": {"model": model, "tools": oc_tools}}, separators=(",", ":")) + "\\n")
+sys.stdout.flush()
+
+turn_seq = 0
+step_seq = 0
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    text = str(((msg.get("message") or {}).get("content")) or "")
+    if "</openclaude_platform_context>\\n\\n" in text:
+        text = text.split("</openclaude_platform_context>\\n\\n", 1)[1]
+    turn_seq += 1
+    step_seq += 1
+    sys.stdout.write(json.dumps({
+        "event": "step_update",
+        "step_update": {"conversation_id": conv_id, "step_index": step_seq, "step_type": "user_input", "state": "DONE"},
+    }, separators=(",", ":")) + "\\n")
+    sys.stdout.flush()
+
+    if text.startswith("NATIVE_DANGER_INDUCE:"):
+        danger_target = text.split(":", 1)[1]
+        if danger_target.startswith("/tmp/oc-drvtest-") and policy_relaxed:
+            pathlib.Path(danger_target).write_text("native-escaped", encoding="utf-8")
+        step_seq += 1
+        sys.stdout.write(json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": conv_id,
+                "step_index": step_seq,
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": "run_command",
+                "tool_info": {"name": "run_command", "parameters": {"CommandLine": "touch " + danger_target}},
+            },
+        }, separators=(",", ":")) + "\\n")
+        sys.stdout.flush()
+        continue
+
+    if text.startswith("UNOBSERVED_FORGED:"):
+        u_parts = text.split(":")
+        fpath = u_parts[1]
+        tok = u_parts[2]
+        bypass_node_obs = len(u_parts) > 3 and u_parts[3] == "TEST_BYPASS_NODE_OBS"
+        forged_args = {"file_path": fpath, "content": tok}
+        forged_step = 900 + turn_seq
+        forged_call_id = f"agy_{conv_id.replace('-', '')[:12]}_{forged_step}"
+        if bypass_node_obs and str(pathlib.Path.cwd()).startswith("/tmp/oc-drvtest-"):
+            task_root = pathlib.Path.cwd().parent
+            mf = json.loads((task_root / "MANIFEST.json").read_text(encoding="utf-8"))
+            args_canon = json.dumps({"content": tok, "file_path": fpath}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            obs_dir = task_root / "observations"
+            obs_dir.mkdir(mode=0o700, exist_ok=True)
+            call_key = hashlib.sha256(forged_call_id.encode("utf-8")).hexdigest()
+            obs_file = obs_dir / (call_key + ".json")
+            obs_file.write_text(json.dumps({
+                "operationId": mf["operationId"],
+                "runId": mf["runId"],
+                "generation": mf["generation"],
+                "nativeSessionId": conv_id,
+                "nativeTurnId": f"turn_{conv_id.replace('-', '')[:12]}_{turn_seq}",
+                "callId": forged_call_id,
+                "name": write_alias,
+                "argsHash": hashlib.sha256(args_canon).hexdigest(),
+            }, separators=(",", ":")), encoding="utf-8")
+            os.chmod(obs_file, 0o600)
+        call_mcp([{
+            "jsonrpc": "2.0",
+            "id": 900 + turn_seq,
+            "method": "tools/call",
+            "params": {
+                "name": write_alias,
+                "arguments": forged_args,
+                "_meta": {"antigravity.google/conversation_id": conv_id, "progressToken": f"{conv_id}:{forged_step}"},
+            },
+        }])
+        continue
+
+    if text.startswith("ARGS_HASH_MISMATCH:"):
+        _, fpath, tok = text.split(":", 2)
+        step_seq += 1
+        sys.stdout.write(json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": conv_id,
+                "step_index": step_seq,
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": f"mcp_ocbridge_{write_alias}",
+                "tool_info": {"name": f"mcp_ocbridge_{write_alias}", "parameters": {"file_path": fpath, "content": "BENIGN_OBSERVED"}},
+            },
+        }, separators=(",", ":")) + "\\n")
+        sys.stdout.flush()
+        call_mcp([{
+            "jsonrpc": "2.0",
+            "id": 910 + turn_seq,
+            "method": "tools/call",
+            "params": {
+                "name": write_alias,
+                "arguments": {"file_path": fpath, "content": tok},
+                "_meta": {"antigravity.google/conversation_id": conv_id, "progressToken": f"{conv_id}:{step_seq}"},
+            },
+        }])
+        continue
+
+    if text.startswith("PARTIAL_DELTA_ONLY:"):
+        _, fpath, tok = text.split(":", 2)
+        step_seq += 1
+        sys.stdout.write(json.dumps({
+            "event": "step_update",
+            "step_update": {"conversation_id": conv_id, "step_index": step_seq, "step_type": "agent_response", "state": "ACTIVE", "text_delta": "thinking..."},
+        }, separators=(",", ":")) + "\\n")
+        sys.stdout.flush()
+        call_mcp([{
+            "jsonrpc": "2.0",
+            "id": 920 + turn_seq,
+            "method": "tools/call",
+            "params": {
+                "name": write_alias,
+                "arguments": {"file_path": fpath, "content": tok},
+                "_meta": {"antigravity.google/conversation_id": conv_id, "progressToken": f"{conv_id}:{step_seq}"},
+            },
+        }])
+        continue
+
+    if text.startswith("MCP_BEFORE_OBSERVATION:"):
+        _, fpath, tok = text.split(":", 2)
+        step_seq += 1
+        call_mcp([{
+            "jsonrpc": "2.0",
+            "id": 925 + turn_seq,
+            "method": "tools/call",
+            "params": {
+                "name": write_alias,
+                "arguments": {"file_path": fpath, "content": tok},
+                "_meta": {"antigravity.google/conversation_id": conv_id, "progressToken": f"{conv_id}:{step_seq}"},
+            },
+        }])
+        continue
+
+    if text.startswith("NEGATIVE_OR_DROP_USAGE"):
+        step_seq += 1
+        sys.stdout.write(json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": conv_id,
+                "step_index": step_seq,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "text_delta": "bad-usage",
+                "usage": {"input_tokens": -1, "output_tokens": 10, "thinking_tokens": 0, "cache_read_tokens": 0},
+            },
+        }, separators=(",", ":")) + "\\n")
+        sys.stdout.write(json.dumps({"event": "result", "result": {"conversation_id": conv_id, "status": "SUCCESS"}}, separators=(",", ":")) + "\\n")
+        sys.stdout.flush()
+        continue
+
+    if text.startswith("MISSING_USAGE_TERMINAL"):
+        sys.stdout.write(json.dumps({"event": "result", "result": {"conversation_id": conv_id, "status": "SUCCESS"}}, separators=(",", ":")) + "\\n")
+        sys.stdout.flush()
+        continue
+
+    if text.startswith("BARRIER_WAIT:"):
+        _, arrive_f, release_f, fpath, tok = text.split(":", 4)
+        pathlib.Path(arrive_f).write_text("arrived", encoding="utf-8")
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and not pathlib.Path(release_f).exists():
+            time.sleep(0.02)
+        text = f"SENTINEL_WRITE:{fpath}:{tok}"
+
+    if text.startswith("SENTINEL_WRITE:"):
+        parts = text.split(":")
+        fpath = parts[1]
+        tok = parts[2]
+        dup = len(parts) > 3 and parts[3] == "DUP_CONCURRENT"
+        tool_args = {"file_path": fpath, "content": tok}
+        step_seq += 1
+        sys.stdout.write(json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": conv_id,
+                "step_index": step_seq,
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": f"mcp_ocbridge_{write_alias}",
+                "tool_info": {"name": f"mcp_ocbridge_{write_alias}", "parameters": tool_args},
+            },
+        }, separators=(",", ":")) + "\\n")
+        sys.stdout.flush()
+        mcp_req = {
+            "jsonrpc": "2.0",
+            "id": 100 + turn_seq,
+            "method": "tools/call",
+            "params": {
+                "name": write_alias,
+                "arguments": tool_args,
+                "_meta": {"antigravity.google/conversation_id": conv_id, "progressToken": f"{conv_id}:{step_seq}"},
+            },
+        }
+        if dup and oc_cmd:
+            raw_line = json.dumps(mcp_req, separators=(",", ":")) + "\\n"
+            t1 = threading.Thread(target=lambda: subprocess.Popen([oc_cmd, *oc_args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).communicate(raw_line, timeout=15))
+            t2 = threading.Thread(target=lambda: subprocess.Popen([oc_cmd, *oc_args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).communicate(raw_line, timeout=15))
+            t1.start(); t2.start()
+            t1.join(); t2.join()
+        else:
+            call_mcp([mcp_req])
+
+    step_seq += 1
+    sys.stdout.write(json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": conv_id,
+            "step_index": step_seq,
+            "step_type": "agent_response",
+            "state": "DONE",
+            "text_delta": f"antigravity-ok-{turn_seq}",
+            "usage": {"input_tokens": 1000000, "output_tokens": 250000, "thinking_tokens": 100000, "cache_read_tokens": 400000},
+        },
+    }, separators=(",", ":")) + "\\n")
+    ok_frame = {"event": "result", "result": {"conversation_id": conv_id, "status": "SUCCESS"}}
+    sys.stdout.write(json.dumps(ok_frame, separators=(",", ":")) + "\\n")
+    if text.startswith("DUPLICATE_TERMINAL:SAME"):
+        sys.stdout.write(json.dumps(ok_frame, separators=(",", ":")) + "\\n")
+    elif text.startswith("DUPLICATE_TERMINAL:CONFLICT"):
+        sys.stdout.write(json.dumps({"event": "result", "result": {"conversation_id": conv_id, "status": "ERROR", "error": "conflict"}}, separators=(",", ":")) + "\\n")
+    sys.stdout.flush()
+`,
+  )
+}
+
 export function makeCodexConformanceCli(dir: string): string {
   return writeExecutable(
     join(dir, 'codex-conformance-cli'),
@@ -731,6 +1018,31 @@ export function prepareDriverSandbox(
         nativePath: cliPath,
         codexHome,
         systemCodexRoot: join(sandbox, 'empty-etc-codex'),
+      },
+    }
+  }
+  if (driverId === 'antigravity') {
+    const cliPath = makeAntigravityConformanceCli(sandbox)
+    const acctHome = join(sandbox, 'agy-home-shared')
+    const cliDir = join(acctHome, '.gemini', 'antigravity-cli')
+    mkdirSync(cliDir, { recursive: true, mode: 0o700 })
+    if (!existsSync(join(cliDir, 'antigravity-oauth-token'))) {
+      writeFileSync(
+        join(cliDir, 'antigravity-oauth-token'),
+        '{"access_token":"ya29.conformance-only","email":"conf@example.com","tier":"g1-ultra-tier"}',
+        { mode: 0o600 },
+      )
+    }
+    return {
+      upstreamModel: 'gemini-4-carbon-medium',
+      canonicalModel: 'antigravity-gemini-4-carbon-remote',
+      probeContext: {
+        cliPath,
+        accountHome: acctHome,
+      },
+      driverContext: {
+        cliPath,
+        accountHome: acctHome,
       },
     }
   }

@@ -6350,7 +6350,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
         return;
       }
-      if (isAntigravityInboundFrame && containerId !== undefined) {
+      if (isAntigravityInboundFrame && !isRemoteNativeInboundFrame && containerId !== undefined) {
         // OCV5-415 P2: official Antigravity CLI. Same admission shape as ZCode
         // (authority + spendable gate + master-owned route), but billing is
         // relay-metered: settle reads antigravity_relay_usage, never the
@@ -7794,9 +7794,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // (egress 据此写 usage_records.dispatch_id/attempt_no),没有 dispatch 才铸新 id
             // (legacy 连接)。同值既签进 envelope,也在 spread 之后覆写 frame.requestId ——
             // 浏览器伪造值不能存活。
-            const codexFrameRequestId = authorityExec !== null && authorityExec.engine === "codex"
-              ? (dispatchRecordC?.billingRequestId ?? ensureRequestIdServerSide())
-              : undefined;
+            const codexFrameRequestId =
+              authorityExec !== null && (authorityExec.engine === "codex" || authorityExec.engine === "antigravity")
+                ? (dispatchRecordC?.billingRequestId ?? ensureRequestIdServerSide())
+                : undefined;
             const authorityBillingRequestId = codexFrameRequestId ?? dispatchRecordC?.billingRequestId;
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {

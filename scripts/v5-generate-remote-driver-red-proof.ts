@@ -110,8 +110,11 @@ function normalizeDriverEvidence(evidenceDir: string, driverId: string) {
   }
 }
 
+const ALL_DRIVERS = ['codex', 'cc', 'antigravity'] as const
+type ProofDriverId = (typeof ALL_DRIVERS)[number]
+
 function runSandboxForDriver(
-  driverId: 'codex' | 'cc',
+  driverId: ProofDriverId,
   suiteDigest: string,
   workDir: string,
   groups = '1,2,3,4,5,6,7',
@@ -142,7 +145,7 @@ function runSandboxForDriver(
 }
 
 function parseCli(argv: string[]) {
-  let driver: 'codex' | 'cc' | undefined
+  let driver: ProofDriverId | undefined
   let cacheDir: string | undefined
   let groups = '1,2,3,4,5,6,7'
   let assembleOnly = false
@@ -150,7 +153,7 @@ function parseCli(argv: string[]) {
     const a = argv[i]
     if (a === '--driver' && argv[i + 1]) {
       const d = argv[++i]!
-      if (d !== 'codex' && d !== 'cc') throw new Error(`Unsupported driver: ${d}`)
+      if (d !== 'codex' && d !== 'cc' && d !== 'antigravity') throw new Error(`Unsupported driver: ${d}`)
       driver = d
     } else if (a === '--cache-dir' && argv[i + 1]) {
       cacheDir = resolve(argv[++i]!)
@@ -171,23 +174,21 @@ function main() {
   mkdirSync(tempRoot, { recursive: true })
   try {
     if (!args.assembleOnly) {
-      if (!args.driver || args.driver === 'codex') {
-        runSandboxForDriver('codex', suiteDigest, tempRoot, args.groups)
-      }
-      if (!args.driver || args.driver === 'cc') {
-        runSandboxForDriver('cc', suiteDigest, tempRoot, args.groups)
+      for (const drv of ALL_DRIVERS) {
+        if (!args.driver || args.driver === drv) {
+          runSandboxForDriver(drv, suiteDigest, tempRoot, args.groups)
+        }
       }
     }
 
-    const readyAll = ['codex', 'cc'].every(
+    const readyAll = ALL_DRIVERS.every(
       (d) =>
         ALL_GROUPS.every((g) => existsSync(join(tempRoot, d, `group-${g}.json`))) &&
         existsSync(join(tempRoot, d, 'summary.json')),
     )
     if (!readyAll) {
       if (args.driver && !args.assembleOnly) {
-        process.stdout.write(`Completed ${args.driver} groups=${args.groups} into ${tempRoot}
-`)
+        process.stdout.write(`Completed ${args.driver} groups=${args.groups} into ${tempRoot}\n`)
         return
       }
       throw new Error(`Missing driver group/summary files in ${tempRoot}`)
@@ -195,8 +196,9 @@ function main() {
 
     const codex = normalizeDriverEvidence(join(tempRoot, 'codex'), 'codex')
     const cc = normalizeDriverEvidence(join(tempRoot, 'cc'), 'cc')
+    const antigravity = normalizeDriverEvidence(join(tempRoot, 'antigravity'), 'antigravity')
 
-    for (const entry of [codex, cc]) {
+    for (const entry of [codex, cc, antigravity]) {
       const reg = regMap.get(entry.driverId)
       if (!reg || reg.driverDigest !== entry.driverDigest || reg.coreDigest !== entry.coreDigest) {
         throw new Error(`Registry digest mismatch for ${entry.driverId}`)
@@ -209,6 +211,7 @@ function main() {
       drivers: {
         codex,
         cc,
+        antigravity,
       },
     }
     const proofSha256 = remoteCanonicalSha256(payloadWithoutSha)

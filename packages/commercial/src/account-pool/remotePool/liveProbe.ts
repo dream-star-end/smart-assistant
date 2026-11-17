@@ -101,7 +101,13 @@ export async function executeLiveRemoteDriverProbe(
   const driverId =
     (row.driver_id ? String(row.driver_id) : undefined) ??
     input.driverId ??
-    (row.engine === 'codex' ? 'codex' : row.engine === 'cc' ? 'cc' : '')
+    (row.engine === 'codex'
+      ? 'codex'
+      : row.engine === 'antigravity'
+        ? 'antigravity'
+        : row.engine === 'cc'
+          ? 'cc'
+          : '')
   const regMap = loadRemoteDriverRegistry(input.registryPath)
   const reg = regMap.get(driverId)
   need(reg !== undefined, 'REMOTE_DRIVER_NOT_REGISTERED')
@@ -131,7 +137,13 @@ export async function executeLiveRemoteDriverProbe(
     knownHostsPath: join(execDir, 'known_hosts'),
     controllerSha256: reg.controllerSha256,
     taskRootPrefix: `${home}/oc-remotedrv-`,
-    upstreamModel: firstOfferModel ?? (reg.driverId === 'codex' ? 'gpt-6-luna' : 'claude-sonnet-5'),
+    upstreamModel:
+      firstOfferModel ??
+      (reg.driverId === 'codex'
+        ? 'gpt-6-luna'
+        : reg.driverId === 'antigravity'
+          ? 'gemini-4-carbon'
+          : 'claude-sonnet-5'),
   })
 
   const probeSpec: RemotePoolProbeSpec = Object.freeze({
@@ -212,7 +224,9 @@ export async function executeLiveRemoteDriverProbe(
           ? nonBlobDriverContext.cliPath
           : reg.driverId === 'codex'
             ? '/usr/bin/codex'
-            : '/usr/bin/claude',
+            : reg.driverId === 'antigravity'
+              ? '/home/box/.local/bin/agy'
+              : '/usr/bin/claude',
       codexHome,
       systemCodexRoot,
       modelCatalog: {

@@ -44,7 +44,8 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
-import { type EngineCreateOpts, registerEngine } from './registry.js'
+import { SubprocessRunner } from '../subprocessRunner.js'
+import { type EngineCreateOpts, registerEngine, registerEngineRemoteContext } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
@@ -1481,3 +1482,41 @@ export const _internals = {
 }
 
 registerEngine('antigravity', (opts) => new AntigravityAdapter(opts))
+
+registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, promptPolicy, promptOnly }) => {
+  const runner = new SubprocessRunner({
+    ...opts,
+    harness: 'official-cc',
+    boxResidentCc: true,
+  })
+  if (promptPolicy !== undefined) {
+    runner.setPromptPrivacy(promptPolicy)
+  }
+  const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({
+    supportsVision,
+  })
+  const platformPrompt = learning.extraPromptFile
+    ? readFileSync(learning.extraPromptFile, 'utf8')
+    : ''
+  if (promptOnly) {
+    cleanup()
+    return {
+      profile,
+      env,
+      platformPrompt,
+      promptCwd: profile.cwd,
+      promptPolicyFingerprint: runner.promptPolicyFingerprint,
+      promptIntelligentUi: runner.promptIntelligentUi,
+      cleanup: () => {},
+    }
+  }
+  return {
+    profile,
+    env,
+    platformPrompt,
+    promptCwd: profile.cwd,
+    promptPolicyFingerprint: runner.promptPolicyFingerprint,
+    promptIntelligentUi: runner.promptIntelligentUi,
+    cleanup,
+  }
+})

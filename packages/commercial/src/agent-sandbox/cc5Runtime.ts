@@ -28,6 +28,7 @@ import {
   isReservedVerificationSessionKey,
   legacyBindingEngineForAuthority,
   legacyProfileEngineForAuthority,
+  loadRemoteDriverRegistry,
   placeRemoteDriverLane,
   recordRemoteDriverLaneState,
   recordRemoteDriverNativeSession,
@@ -56,12 +57,13 @@ const BASE_ROOT = '/run/oc-cc5-t1555u'
  */
 async function resolveDriverV4Selection(
   pool: ReturnType<typeof getPool>,
-  request: { uid: number; sessionKey: string; canonicalModel: string; engine?: 'ccb' | 'codex' },
+  request: { uid: number; sessionKey: string; canonicalModel: string; engine?: 'ccb' | 'codex' | 'antigravity' },
 ): Promise<string | null> {
-  const authEngine = request.engine === 'codex' ? 'codex' : 'ccb'
+  const authEngine = request.engine ?? 'ccb'
   const legacyBindEngine = legacyBindingEngineForAuthority(authEngine)
   const legacyProfEngine = legacyProfileEngineForAuthority(authEngine)
-  const sticky = (
+  const regMap = loadRemoteDriverRegistry()
+  const stickyRows = (
     await pool.query<{ driver_id: string | null }>(
       `SELECT driver_id
          FROM remote_agent_bindings
@@ -70,11 +72,16 @@ async function resolveDriverV4Selection(
           AND driver_id IS NOT NULL
           AND engine = $3
         ORDER BY updated_at DESC
-        LIMIT 1`,
+        LIMIT 8`,
       [String(request.uid), request.sessionKey, legacyBindEngine],
     )
-  ).rows[0]
-  if (sticky?.driver_id) return sticky.driver_id
+  ).rows
+  for (const sticky of stickyRows) {
+    const did = sticky?.driver_id ? String(sticky.driver_id) : ''
+    if (did && regMap.get(did)?.authorityEngine === authEngine) {
+      return did
+    }
+  }
 
   const offer = (
     await pool.query<{ driver_id: string }>(
@@ -158,7 +165,7 @@ export function createMasterCc5Runtime(
       })
     }
     const runPlaceOnce = async (request: {
-      engine?: 'ccb' | 'codex'
+      engine?: 'ccb' | 'codex' | 'antigravity'
       uid: number
       containerDbId: string
       dockerId: string
@@ -202,7 +209,16 @@ export function createMasterCc5Runtime(
           },
         }
       }
-      return placeRemoteLane(request, { controllerPath, pool })
+      if (request.engine === 'antigravity') {
+        throw new Error('REMOTE_LANE_UNAVAILABLE')
+      }
+      return placeRemoteLane(
+        {
+          ...request,
+          engine: request.engine,
+        },
+        { controllerPath, pool },
+      )
     }
 
     return (fixture.create ?? createRemoteLaneRuntime)({
@@ -277,7 +293,7 @@ export async function selectMasterCc5Backend(
   if (
     !selfhost ||
     !runtime ||
-    !['ccb', 'codex'].includes(input.engine) ||
+    !['ccb', 'codex', 'antigravity'].includes(input.engine) ||
     !canUseCc5TestModel(String(input.uid), env)
   ) {
     throw new Error('REMOTE_LANE_UNAVAILABLE')
@@ -287,7 +303,9 @@ export async function selectMasterCc5Backend(
     containerDbId: String(input.containerId),
     sessionKey: input.sessionKey,
     canonicalModel: input.canonicalModel,
-    ...(input.engine === 'codex' ? { engine: 'codex' as const } : {}),
+    ...(input.engine === 'codex' || input.engine === 'antigravity'
+      ? { engine: input.engine }
+      : {}),
   })
   if (
     !isRemoteBackendAuthority({

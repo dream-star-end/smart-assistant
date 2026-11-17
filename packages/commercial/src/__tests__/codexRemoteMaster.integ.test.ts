@@ -411,7 +411,10 @@ test('R1 PG prepare failure then same-chat retry frees exactly one slot; unknown
     const runtime=createRemoteLaneRuntime({selfhost:true,
       env:{OC_SELFHOST_CC5_T1555U_ENABLED:'1',OC_SELFHOST_CC5_T1555U_TEST_UID:uid},
       financeFactory:()=>({admit:async()=>{throw new Error('must not start model')}}),
-      hooks:{place:request=>placeRemoteLane(request,{pool,packet:async()=>Buffer.from('fixture')}),
+      hooks:{place:request=>{
+        if (request.engine === 'antigravity') throw new Error('REMOTE_LANE_UNAVAILABLE')
+        return placeRemoteLane({...request, engine: request.engine},{pool,packet:async()=>Buffer.from('fixture')})
+      },
         onState:(op,state,generation)=>recordRemoteLaneState(op,state,pool,generation)},
       configuration:()=>({baseRoot:join(root,'r'),controllerPath:'/unused',hostFactory:()=>({
         prepareTask:async()=>{if(failPrepare)throw new Error('transient preparation failure')},
