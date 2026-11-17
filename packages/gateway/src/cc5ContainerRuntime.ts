@@ -596,7 +596,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       const dir = join(this.options.evidenceRoot ?? join(this.options.baseRoot, 'evidence'), placement.operationId, placement.generation)
       requireLane(!existsSync(dir) && !existsSync(view))
       const host = v4.spec.manifest.root.startsWith('/tmp/oc-drvtest-')
-        ? RemotePoolSshHost.forLocalSandbox(v4.spec)
+        ? RemotePoolSshHost.forLocalSandbox(v4.spec, {
+            ...(process.env.OC_REMOTE_RESOURCE_ROOT ? { OC_REMOTE_RESOURCE_ROOT: process.env.OC_REMOTE_RESOURCE_ROOT } : {}),
+            ...(process.env.OC_REMOTE_TEST_FAKE_SYSTEMD_DIR ? { OC_REMOTE_TEST_FAKE_SYSTEMD_DIR: process.env.OC_REMOTE_TEST_FAKE_SYSTEMD_DIR } : {}),
+            ...(process.env.OC_REMOTE_NODE_MEMORY_BUDGET ? { OC_REMOTE_NODE_MEMORY_BUDGET: process.env.OC_REMOTE_NODE_MEMORY_BUDGET } : {}),
+            ...(process.env.OC_REMOTE_TEST_MEM_AVAILABLE_BYTES ? { OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: process.env.OC_REMOTE_TEST_MEM_AVAILABLE_BYTES } : {}),
+          })
         : RemotePoolSshHost.forSshTarget(v4.sshTarget, v4.spec)
       const preflight = await host.preflight()
       if (!preflight.memoryOk) throw nodeMemoryError(preflight.activeSessions, preflight.code)
@@ -693,8 +698,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       })
     }
     relay.controlServer.on('request', (req, res) => {
-      if (req.url !== '/stop') return
-      stopRequestedByClient = true
+      if (req.url !== '/stop' && req.url !== '/tool/stopped') return
+      if (req.url === '/stop') stopRequestedByClient = true
       clearGraceTimer()
       activeStopHttp += 1
       let doneCalled = false

@@ -181,6 +181,15 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
       'isolated PG: recoverRemoteDriverTurnBilling executes CTE SQL end-to-end against real PostgreSQL tables (OCV5-777)',
     ],
   },
+  {
+    incident: 'INC-20261117-REMOTE-V4-DRAIN-CC-AUTH', slug: 'inc-20261117-remote-v4-drain-cc-auth', db: false,
+    file: 'packages/gateway/src/__tests__/remotePoolDrainAndCcAuthProof.test.ts',
+    cases: [
+      'synthetic CC verification_required API error classifies as non-recoverable AUTH_ERROR and settled turn clears lease timer + localStopped for clean cutover drain (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)',
+      'undispatched /abandon resets localStopped for clean idle teardown and late /tool/stopped re-drives stop() closure (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)',
+      'cross-window 20-turn mixed replay preserves synthetic errorCode without conflict while tampered duplicate fences with REMOTE_TERMINAL_CONFLICT (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)',
+    ],
+  },
 ]
 
 function fail(message: string): never {

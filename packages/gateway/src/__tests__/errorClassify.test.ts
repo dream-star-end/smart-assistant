@@ -267,6 +267,29 @@ describe('classifyRunError', () => {
     )
   })
 
+  it('OCV5-780: Claude Code synthetic verification_required / account / login blocks classify as non-recoverable auth_error', () => {
+    for (const raw of [
+      "API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://portal.anthropic.com/verify?org=6d4224c6-68b1-48ee-964d-0268130d4f10",
+      'CC_ACCOUNT_VERIFICATION_REQUIRED',
+      'CC_AUTH_ERROR',
+      'verification_required',
+      'Login expired · Please run /login',
+      'API Error: {"type":"error","error":{"type":"authentication_failed","message":"token expired"}}',
+    ]) {
+      const cls = classifyRunError(raw)
+      assert.equal(cls.code, 'auth_error', raw)
+      assert.equal(supportsAutomaticTurnRecovery(cls.code), false, raw)
+      const frame = _buildEngineErrorFrame(
+        { sessionKey: 'sk', channel: 'webchat', peer: { id: 'u3', kind: 'dm' } },
+        { kind: 'error', error: raw },
+      )
+      assert.equal(frame.code, 'auth_error', raw)
+      assert.equal(_tapeErrorCodeForGenericFailure(raw), 'auth_error', raw)
+    }
+    // Non-auth synthetic command output or 511 must NOT become auth_error
+    assert.equal(classifyRunError('gateway said 511 Network Authentication Required').code, 'upstream_failed')
+  })
+
   it('model_not_available: grok route expired (bare + JSON wrap)', () => {
     const bare =
       'Internal error: {"message":"API error (status 404 Not Found): grok route expired","http_status":404}'

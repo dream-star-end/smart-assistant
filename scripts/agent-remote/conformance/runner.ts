@@ -905,6 +905,9 @@ async function runGroup4(h: ConformanceHarness): Promise<GroupResult> {
     }
   }
 
+  // Drain prior fault-injected dead null-receipt journals (aborted since OCV5-777) before 4a.4 spool test.
+  await h.recoverSpool()
+
   // 4a.4 Disconnect AFTER terminal BEFORE PG commit -> recovered via `0000000N-native-terminal.json` spool!
   const failOnce = { active: true }
   const spoolLane = await h.openLane({ failTurnInsertOnce: failOnce, writeOnlyTools: true })

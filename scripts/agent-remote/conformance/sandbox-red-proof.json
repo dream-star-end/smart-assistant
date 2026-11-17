@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "suiteDigest": "e86b8b63dbd84e7b07f1909f6447b714bd36e03fae32e99d68d235e4a6fcfe1e",
+  "suiteDigest": "b7f997b91c760aad1722cdf60abe4462dbc06fc23856e405126b33432131127b",
   "drivers": {
     "codex": {
       "driverId": "codex",
@@ -63,7 +63,7 @@
     "cc": {
       "driverId": "cc",
       "engineId": "cc",
-      "driverDigest": "70d1a4e211a5cf0398374cc9f772c5e3ccb08d981650c8e8171237862d5436b9",
+      "driverDigest": "4f9ad3c9f60af5fcd33ed42403744e02c00f2800698a38cf9ed529c9b9b78944",
       "coreDigest": "cc94b10f9e5047f9a54c06c365192ed3deb348c99056f44724c60dcc1dc2f507",
       "controllerSha256": "8f033bb62e37fd726cdd7e9a3abd89eb4c28841f1e237259086a31bd6b34e320",
       "policySha256": "8a160f9bc7294bee227e650bbab07463650c173b5fd373dae3677f7349f34416",
@@ -119,5 +119,5 @@
       ]
     }
   },
-  "proofSha256": "7c88b6d5d5a52ac932cbc685ad16cc6ae1345893984799165e3bd0da788b9110"
+  "proofSha256": "2779568fdd3e6d3d024e36e605a0a2bb0e95453281898a9b4ae0e5eeb9996550"
 }

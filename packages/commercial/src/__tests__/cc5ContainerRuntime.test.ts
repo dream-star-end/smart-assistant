@@ -589,3 +589,377 @@ test('a lane stopped by the container over relay.sock unregisters drain and rele
     await f.cleanup()
   }
 })
+
+test('v4 RemotePoolRelay settled turn clears lease timer so drainForCutover passes past TTL and idle fence auto-releases (OCV5-780)', { skip: !root }, async () => {
+  const { chmodSync } = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const {
+    REMOTE_DRIVER_BACKEND,
+    REMOTE_DRIVER_PROTOCOL_VERSION,
+    remoteCanonicalSha256,
+    verifyAuthority,
+  } = await import('@openclaude/protocol')
+  const {
+    DriverWorkerClient,
+    RemotePoolSshHost,
+    remotePoolBackendOf,
+    remotePoolControlRequest,
+  } = await import('@openclaude/gateway/remote-pool')
+  const { RemoteReleaseDrainCoordinator } = await import('../account-pool/remotePool/drainGate.js')
+
+  const sandbox = mkdtempSync('/tmp/oc-drvtest-rt780-')
+  const rtDir = mkdtempSync('/tmp/cl-')
+  const baseRoot = join(rtDir, 'r')
+  const resRoot = join(sandbox, 'resources')
+  const fakeSys = join(sandbox, 'fake-systemd')
+  const exitSignalFile = join(sandbox, 'idle-exit')
+  const sbxEnv = {
+    OC_REMOTE_RESOURCE_ROOT: resRoot,
+    OC_REMOTE_TEST_FAKE_SYSTEMD_DIR: fakeSys,
+    OC_REMOTE_NODE_MEMORY_BUDGET: String(4096 * 1024 * 1024),
+    OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: String(4096 * 1024 * 1024),
+  }
+  const prevEnv = {
+    OC_REMOTE_RESOURCE_ROOT: process.env.OC_REMOTE_RESOURCE_ROOT,
+    OC_REMOTE_TEST_FAKE_SYSTEMD_DIR: process.env.OC_REMOTE_TEST_FAKE_SYSTEMD_DIR,
+    OC_REMOTE_NODE_MEMORY_BUDGET: process.env.OC_REMOTE_NODE_MEMORY_BUDGET,
+    OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: process.env.OC_REMOTE_TEST_MEM_AVAILABLE_BYTES,
+  }
+  Object.assign(process.env, sbxEnv)
+
+  const cliPath = join(sandbox, 'fake-claude-rt780')
+  writeFileSync(
+    cliPath,
+    `#!/usr/bin/env python3
+import json, os, pathlib, re, sys, time
+args = sys.argv[1:]
+if "-p" in args:
+    for raw in sys.stdin:
+        msg = json.loads(raw)
+        if msg.get("type") == "control_request" and msg.get("request", {}).get("subtype") == "initialize":
+            out = {"type": "control_response", "response": {"subtype": "success", "request_id": msg["request_id"], "response": {
+                "claude_code_version": "2.1.316", "account": {"email": "a@b.c", "subscriptionType": "max"},
+                "models": [{"value": "claude-opus-4-6", "displayName": "Opus 4.6", "supportedEffortLevels": ["low", "medium", "high"], "supportsAdaptiveThinking": True}]
+            }}}
+            sys.stdout.write(json.dumps(out) + "\\n"); sys.stdout.flush(); sys.exit(0)
+    sys.exit(1)
+def arg_val(flag, default=""):
+    return args[args.index(flag) + 1] if flag in args else default
+model = arg_val("--model", "claude-opus-4-6")
+session_id = arg_val("--session-id") or arg_val("--resume")
+home_dir = pathlib.Path(os.environ.get("HOME", "/tmp"))
+sanitized_cwd = re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
+tp = home_dir / ".claude/projects" / sanitized_cwd / f"{session_id}.jsonl"
+if "--session-id" in args:
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text(json.dumps({"sessionId": session_id}) + "\\n")
+sys.stdout.write(json.dumps({"type": "system", "subtype": "init", "session_id": session_id, "model": model, "tools": ["mcp__ocbridge__NoopTool"]}) + "\\n")
+sys.stdout.flush()
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    msg = json.loads(raw)
+    if msg.get("type") != "user":
+        continue
+    sys.stdout.write(json.dumps({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}}}) + "\\n")
+    sys.stdout.write(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": session_id, "uuid": "res-780-1",
+        "usage": {"input_tokens": 5, "output_tokens": 2, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}) + "\\n")
+    sys.stdout.flush()
+    exit_marker = pathlib.Path(${JSON.stringify(exitSignalFile)})
+    while not exit_marker.exists():
+        time.sleep(0.02)
+    sys.exit(1)
+`,
+    { mode: 0o755 },
+  )
+  chmodSync(cliPath, 0o755)
+
+  const controllerPath = fileURLToPath(new URL('../../../../scripts/agent-remote/core/controller.py', import.meta.url))
+  const controllerSha256 = createHash('sha256').update(readFileSync(controllerPath)).digest('hex')
+  const worker = new DriverWorkerClient()
+  let runtime: ReturnType<typeof createRemoteLaneRuntime> | undefined
+
+  try {
+    const workerInfo = await worker.info('cc')
+    const key = generateKeyPairSync('ed25519')
+    const keyId = 'fixture-v4-key'
+    const pubBytes = new Uint8Array(Buffer.from((key.publicKey.export({ format: 'jwk' }) as { x: string }).x, 'base64url'))
+    const keyring = new Map([[keyId, pubBytes]])
+    const publicKeyring = `${keyId}:${(key.publicKey.export({ format: 'jwk' }) as { x: string }).x}`
+
+    const drainGate = new RemoteReleaseDrainCoordinator()
+    const zeroJournalPool = { query: async () => ({ rows: [{ cnt: '0' }] }) } as any
+    const states: Array<[string, string]> = []
+    const operationId = randomUUID()
+    const runId = randomUUID()
+    const laneRoot = join(sandbox, `run-lane-${operationId}`)
+    const probeRoot = join(sandbox, `run-probe-${operationId}`)
+    const upstreamModel = 'claude-opus-4-6'
+
+    const bootstrapSpec = {
+      controllerPath,
+      controllerSha256,
+      manifest: {
+        version: 4 as const,
+        root: laneRoot,
+        driverId: 'cc',
+        engineId: 'cc',
+        operationId,
+        runId,
+        generation: '1',
+        profileId: 'ebc80fa6-0348-49a3-b1c1-8a08017114d6',
+        authEpoch: 'epoch-1',
+        model: upstreamModel,
+        driverDigest: workerInfo.driverDigest,
+        coreDigest: workerInfo.coreDigest,
+      },
+      driverContext: {
+        cliPath,
+        accountHome: sandbox,
+        bridgeMode: 'stdio-fixture',
+        initialSessionUuid: randomUUID(),
+      },
+      verifiedProbe: {
+        schemaVersion: 4 as const,
+        engineId: 'cc',
+        driverId: 'cc',
+        driverVersion: workerInfo.driverVersion,
+        source: 'bootstrap:init',
+        freshness: 'cli-observed' as const,
+        authPresent: true,
+        accountObserved: true,
+        cliVersion: '2.1.316',
+        cliSha256: 'a'.repeat(64),
+        models: [{
+          upstreamModelId: upstreamModel,
+          displayName: 'Opus 4.6',
+          supportedEfforts: ['low', 'medium', 'high'],
+          defaultEffort: 'medium',
+          supportsAdaptiveThinking: true,
+          supportsVision: true,
+        }],
+        rawResponseSha256: 'b'.repeat(64),
+        observedAt: '2026-11-17T00:00:00Z',
+      },
+    }
+    const probed = await RemotePoolSshHost.forLocalSandbox(bootstrapSpec, sbxEnv).probe({ cliPath, accountHome: sandbox }, probeRoot)
+    const spec = { ...bootstrapSpec, verifiedProbe: probed.snapshot }
+    const v4Binding = {
+      version: REMOTE_DRIVER_PROTOCOL_VERSION,
+      backendKind: REMOTE_DRIVER_BACKEND,
+      operationId,
+      runId,
+      uid: '912',
+      containerDbId: '91',
+      dockerId: DOCKER,
+      sessionKey: SESSION,
+      canonicalModel: MODEL,
+      upstreamModel,
+      driverId: 'cc',
+      engineId: 'cc',
+      authorityEngine: 'ccb' as const,
+      driverVersion: workerInfo.driverVersion,
+      driverDigest: workerInfo.driverDigest,
+      coreDigest: workerInfo.coreDigest,
+      probeFingerprint: probed.probeFingerprint,
+      manifestSha256: remoteCanonicalSha256(spec.manifest),
+      generation: '1',
+      profileId: 'ebc80fa6-0348-49a3-b1c1-8a08017114d6',
+      authEpoch: 'epoch-1',
+      capability: 'c'.repeat(64),
+      expiresAt: Date.now() + 600_000,
+    }
+
+    const v4FinanceFactory: RemoteFinanceFactory = () => ({
+      async admit() { throw new Error('legacy admit unused') },
+      async admitV4(inp) {
+        const a = verifyAuthority(inp.authorityEnvelope, keyring, Date.now())
+        const requestId = a.billingRequestId ?? `req-${a.authorityTurnId}`
+        return {
+          requestId,
+          beforeHostStart: async () => {},
+          beforeDispatch: async () => {},
+          bindNativeThread: async () => null,
+          abandonUndispatched: async () => ({ state: 'proven', requestId, disposition: 'waived_zero' }),
+          terminal: async (rcpt) => ({ state: 'proven', requestId: rcpt.requestId, disposition: 'settled' }),
+          stop: async () => {},
+        }
+      },
+    })
+
+    runtime = createRemoteLaneRuntime({
+      selfhost: true,
+      env,
+      financeFactory: v4FinanceFactory,
+      configuration: () => ({ baseRoot, controllerPath }),
+      hooks: {
+        async place() {
+          return {
+            operationId,
+            runId,
+            generation: '1',
+            profileId: v4Binding.profileId,
+            taskRoot: laneRoot,
+            provisionPacket: Buffer.alloc(0),
+            target: {
+              host: '127.0.0.1',
+              port: 22,
+              user: 'box',
+              keyPath: '/unused',
+              knownHostsPath: '/unused',
+              controllerSha256,
+              upstreamModel,
+              taskRootPrefix: '/tmp/oc-drvtest-',
+            },
+            v4: {
+              binding: v4Binding,
+              spec,
+              sshTarget: {
+                host: '127.0.0.1',
+                port: 22,
+                user: 'box',
+                keyPath: '/unused',
+                knownHostsPath: '/unused',
+                driverId: 'cc',
+                engineId: 'cc',
+                taskRootPrefix: '/tmp/oc-drvtest-',
+              },
+            },
+          }
+        },
+        async onNativeThread() {},
+        async onRemoteStart() {},
+        async onState(op, st) {
+          states.push([op, st])
+        },
+        registerDrainRelay: (id, handle) => drainGate.registerRelay(id, handle),
+      },
+    })!
+
+    const handle = (await runtime.prepare({ uid: 912, containerDbId: '91', local: true, publicKeyring }))!
+    await runtime.bindCreated(handle, DOCKER)
+    await runtime.activate(handle, DOCKER)
+    await runtime.ensureLane({ uid: 912, containerDbId: '91', sessionKey: SESSION, canonicalModel: MODEL })
+    assert.equal(drainGate.registeredRelayCount, 1)
+    assert.equal(drainGate.activeRelayCount, 0)
+
+    const socket = join(handle.mountSource, operationId, 'relay.sock')
+    const scope = {
+      capability: v4Binding.capability,
+      operationId: v4Binding.operationId,
+      sessionKey: v4Binding.sessionKey,
+      uid: v4Binding.uid,
+      containerDbId: v4Binding.containerDbId,
+      dockerId: v4Binding.dockerId,
+      generation: v4Binding.generation,
+      driverId: v4Binding.driverId,
+      engineId: v4Binding.engineId,
+    }
+    const now = Date.now()
+    const authorityTurnId = createHash('md5').update('rt780-t1').digest('hex')
+    const turnKey = createHash('sha256').update('rt780-tk1').digest('hex')
+    const authPayload: ModelAuthorityPayload = {
+      v: MODEL_AUTHORITY_VERSION,
+      keyId,
+      uid: 912,
+      containerId: 91,
+      authorityTurnId,
+      connectionChallenge: 'rt780',
+      canonicalModel: MODEL,
+      engine: 'ccb',
+      executionBackend: remotePoolBackendOf(v4Binding),
+      securityEpoch: 1,
+      executionRevision: 'r1',
+      issuedAt: now,
+      expiresAt: now + 60_000,
+      executionDescriptor: {
+        capabilityProfile: { ccb: { capabilityZero: true, supportsThinking: true, contextOwner: 'box-native-v1' } },
+        capabilitySchemaVersion: 1,
+        contextWindow: 200_000,
+        supportsVision: true,
+        supportedEfforts: ['low', 'medium', 'high'],
+      },
+    }
+    const coldStartLeasePayload: TurnLease = {
+      v: MODEL_AUTHORITY_VERSION,
+      keyId,
+      uid: 912,
+      containerId: 91,
+      authorityTurnId,
+      connectionChallenge: 'rt780',
+      canonicalModel: MODEL,
+      securityEpoch: 1,
+      issuedAt: now,
+      expiresAt: now + 30_000,
+    }
+    const admitRes = await remotePoolControlRequest('/admit', {
+      ...scope,
+      authority: encodeAuthorityEnvelope(authPayload, sign(null, authoritySigningInput(authPayload), key.privateKey)),
+      lease: encodeTurnLeaseEnvelope(coldStartLeasePayload, sign(null, turnLeaseSigningInput(coldStartLeasePayload), key.privateKey)),
+      turnKey,
+      catalog: { tools: [{ name: 'NoopTool', description: 'noop', inputSchema: { type: 'object' } }] },
+    }, socket)
+    let afterSeq = Number(admitRes.seq)
+    const nativeSessionId = String(admitRes.nativeSessionId)
+    assert.equal(drainGate.activeRelayCount, 1, 'busy while turn is active')
+
+    // Re-arm active turn lease to a tight 900ms TTL now that cold-start process launch is warm
+    const renewIssuedAt = Date.now()
+    const leaseExpiresAt = renewIssuedAt + 900
+    const shortLeasePayload: TurnLease = {
+      ...coldStartLeasePayload,
+      issuedAt: renewIssuedAt,
+      expiresAt: leaseExpiresAt,
+    }
+    await remotePoolControlRequest('/renew', {
+      ...scope,
+      lease: encodeTurnLeaseEnvelope(shortLeasePayload, sign(null, turnLeaseSigningInput(shortLeasePayload), key.privateKey)),
+    }, socket)
+
+    await remotePoolControlRequest('/command', {
+      ...scope,
+      command: { kind: 'newTurn', commandId: 'cmd-rt780-1', model: upstreamModel, prompt: 'ping', nativeSessionId },
+    }, socket)
+
+    let settled = false
+    const settleDeadline = Date.now() + 1_800
+    while (!settled && Date.now() < settleDeadline) {
+      const polled = await remotePoolControlRequest('/poll', { ...scope, afterSeq }, socket)
+      const frames = (polled.frames as Array<{ seq: number; frame: { kind: string } }>) ?? []
+      for (const f of frames) {
+        afterSeq = f.seq
+        if (f.frame.kind === 'turn_settled') settled = true
+      }
+      if (!settled) await new Promise((r) => setTimeout(r, 20))
+    }
+    assert.equal(settled, true, 'turn must settle before short lease TTL expires')
+    assert.equal(drainGate.activeRelayCount, 0)
+
+    // Wait past the 2200ms turn lease TTL — must NOT self-fence or block cutover drain!
+    const waitMs = Math.max(250, leaseExpiresAt - Date.now() + 300)
+    await new Promise((r) => setTimeout(r, waitMs))
+    assert.equal(drainGate.activeRelayCount, 0, 'settled v4 lane must remain idle past turn lease TTL')
+    const drain1 = await drainGate.drainForCutover(zeroJournalPool, { timeoutMs: 200, keepClosedForRestart: false })
+    assert.equal(drain1.drained, true)
+
+    // Trigger unexpected idle remote exit — stopProven must unblock drain immediately and auto-cleanup must release binding!
+    writeFileSync(exitSignalFile, '1\n')
+    const releaseDeadline = Date.now() + 3_000
+    while (drainGate.registeredRelayCount > 0 && Date.now() < releaseDeadline) {
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    assert.equal(drainGate.registeredRelayCount, 0, 'idle-fenced v4 lane must auto-stop and unregister drain handle')
+    assert.equal(states.at(-1)?.[1], 'released', 'idle-fenced v4 lane must transition persistent binding to released')
+    const drain2 = await drainGate.drainForCutover(zeroJournalPool, { timeoutMs: 200, keepClosedForRestart: false })
+    assert.equal(drain2.drained, true)
+  } finally {
+    await runtime?.release('91').catch(() => {})
+    await worker.close()
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) Reflect.deleteProperty(process.env, k)
+      else process.env[k] = v
+    }
+    rmSync(rtDir, { recursive: true, force: true })
+    rmSync(sandbox, { recursive: true, force: true })
+  }
+})
