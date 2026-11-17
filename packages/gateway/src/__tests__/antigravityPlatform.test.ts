@@ -4,8 +4,8 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/antigravityPlatform.test.ts
  */
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -280,5 +280,262 @@ test('persistSummaryCache refuses partial/busy WAL checkpoints and preserves pri
     const rows = verify.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
     verify.close()
     assert.deepEqual(rows.map((r) => r.id), ['baseline-clean'])
+  })
+})
+
+test('sequential turns reuse deterministic session launchHome while concurrent/late cleanups stay isolated', async () => {
+  await withHome(async () => {
+    const p1 = projectAntigravityPlatform(input(null))
+    assert.match(path.basename(p1.launchHome), /^s-[0-9a-f]{16}$/)
+
+    // Concurrent turn of the same session spills to an isolated `r-*` launchHome.
+    const concurrentSame = projectAntigravityPlatform(input(null))
+    assert.match(path.basename(concurrentSame.launchHome), /^r-[0-9a-f]{16}$/)
+    assert.notEqual(concurrentSame.launchHome, p1.launchHome)
+
+    // Different session gets its own distinct deterministic `s-*` launchHome.
+    const otherSession = projectAntigravityPlatform({
+      ...input(null),
+      sessionKey: 'agent:main:webchat:dm:other-session',
+    })
+    assert.match(path.basename(otherSession.launchHome), /^s-[0-9a-f]{16}$/)
+    assert.notEqual(otherSession.launchHome, p1.launchHome)
+
+    cleanupAntigravityLaunch(concurrentSame)
+    cleanupAntigravityLaunch(otherSession)
+    cleanupAntigravityLaunch(p1)
+    assert.equal(existsSync(p1.launchHome), false)
+
+    // Next sequential turn of the original session gets the exact same launchHome path.
+    const p2 = projectAntigravityPlatform({
+      ...input(null),
+      credential: { accessToken: 'fresh-turn-2-token', accessTokenExpiresAt: '2026-10-20T00:00:00Z' },
+    })
+    try {
+      assert.equal(p2.launchHome, p1.launchHome, 'sequential turns preserve byte-identical $HOME for prompt cache')
+      const tokenRaw = readFileSync(path.join(p2.launchHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'utf8')
+      assert.equal(tokenRaw.includes('fresh-turn-2-token'), true)
+
+      // Late/duplicate cleanup of p1 must NOT delete or clobber p2's active launchHome!
+      cleanupAntigravityLaunch(p1)
+      assert.equal(existsSync(p2.launchHome), true, 'stale lease cleanup must not remove active re-acquired launchHome')
+      cleanupAntigravityLaunch({ root: p1.root, launchHome: p1.launchHome })
+      assert.equal(existsSync(p2.launchHome), true, 'unleased manual cleanup must not clobber active leased launchHome')
+    } finally {
+      cleanupAntigravityLaunch(p2)
+    }
+    assert.equal(existsSync(p2.launchHome), false)
+  })
+})
+
+test('sticky launchHome reclaims dead crash residue without following symlinks and yields to live cross-process owners', async () => {
+  await withHome(async (root) => {
+    const probe = projectAntigravityPlatform(input(null))
+    const stickyPath = probe.launchHome
+    cleanupAntigravityLaunch(probe)
+
+    // 1. Symlink residue at stickyPath must be unlinked without touching outside target.
+    const outsideDir = path.join(root, 'outside-keep')
+    mkdirSync(outsideDir, { recursive: true })
+    writeFileSync(path.join(outsideDir, 'keep.txt'), 'safe')
+    symlinkSync(outsideDir, stickyPath)
+
+    const afterSymlink = projectAntigravityPlatform(input(null))
+    try {
+      assert.equal(afterSymlink.launchHome, stickyPath)
+      assert.equal(lstatSync(stickyPath).isDirectory(), true)
+      assert.equal(readFileSync(path.join(outsideDir, 'keep.txt'), 'utf8'), 'safe')
+    } finally {
+      cleanupAntigravityLaunch(afterSymlink)
+    }
+
+    // 2. Dead PID residue in `.oc-launch-owner.json` is reclaimed cleanly.
+    mkdirSync(stickyPath, { recursive: true, mode: 0o700 })
+    writeFileSync(path.join(stickyPath, '.oc-launch-owner.json'), JSON.stringify({ pid: 2_147_483_640, startTicks: '999999999' }))
+    writeFileSync(path.join(stickyPath, 'stale-marker'), 'old')
+
+    const afterDeadPid = projectAntigravityPlatform(input(null))
+    try {
+      assert.equal(afterDeadPid.launchHome, stickyPath)
+      assert.equal(existsSync(path.join(stickyPath, 'stale-marker')), false)
+    } finally {
+      cleanupAntigravityLaunch(afterDeadPid)
+    }
+
+    // 3. Live cross-process owner on stickyPath is respected (spills to `r-*` without clobbering).
+    const sleeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' })
+    try {
+      assert.ok(sleeper.pid && sleeper.pid > 0)
+      mkdirSync(stickyPath, { recursive: true, mode: 0o700 })
+      writeFileSync(path.join(stickyPath, '.oc-launch-owner.json'), JSON.stringify({ pid: sleeper.pid, startTicks: null }))
+      writeFileSync(path.join(stickyPath, 'live-owner-marker'), 'intact')
+
+      const spilled = projectAntigravityPlatform(input(null))
+      try {
+        assert.match(path.basename(spilled.launchHome), /^r-[0-9a-f]{16}$/)
+        assert.equal(readFileSync(path.join(stickyPath, 'live-owner-marker'), 'utf8'), 'intact')
+      } finally {
+        cleanupAntigravityLaunch(spilled)
+      }
+    } finally {
+      sleeper.kill('SIGKILL')
+    }
+  })
+})
+
+test('sticky launchHome respects runtime-flags/antigravity-sticky-launch-home and env override', async () => {
+  await withHome(async (root) => {
+    const flagsDir = path.join(root, 'runtime-flags')
+    mkdirSync(flagsDir, { recursive: true })
+    const flagFile = path.join(flagsDir, 'antigravity-sticky-launch-home')
+    writeFileSync(flagFile, 'off\n')
+
+    const pOff = projectAntigravityPlatform(input(null))
+    try {
+      assert.match(path.basename(pOff.launchHome), /^r-[0-9a-f]{16}$/)
+    } finally {
+      cleanupAntigravityLaunch(pOff)
+    }
+
+    // Env override `on` wins over file `off`.
+    process.env.OC_ANTIGRAVITY_STICKY_LAUNCH_HOME = 'on'
+    try {
+      const pEnvOn = projectAntigravityPlatform(input(null))
+      try {
+        assert.match(path.basename(pEnvOn.launchHome), /^s-[0-9a-f]{16}$/)
+      } finally {
+        cleanupAntigravityLaunch(pEnvOn)
+      }
+    } finally {
+      Reflect.deleteProperty(process.env, 'OC_ANTIGRAVITY_STICKY_LAUNCH_HOME')
+    }
+
+    writeFileSync(flagFile, 'on\n')
+    const pOn = projectAntigravityPlatform(input(null))
+    try {
+      assert.match(path.basename(pOn.launchHome), /^s-[0-9a-f]{16}$/)
+    } finally {
+      cleanupAntigravityLaunch(pOn)
+    }
+  })
+})
+
+test('concurrent cross-process stale-reclaim race never double-assigns or deletes a peer active launchHome', async () => {
+  await withHome(async (root) => {
+    const initial = projectAntigravityPlatform(input(null))
+    const stickyPath = initial.launchHome
+    const slotName = path.basename(stickyPath)
+    cleanupAntigravityLaunch(initial)
+
+    // Seed dead crash residue on the sticky launchHome; also verify contended slot lock degrades safely without ABA lock-stealing.
+    mkdirSync(stickyPath, { recursive: true, mode: 0o700 })
+    writeFileSync(
+      path.join(stickyPath, '.oc-launch-owner.json'),
+      JSON.stringify({ pid: 2_147_483_641, startTicks: '888888888', leaseId: 'dead-lease' }),
+    )
+    const lockDir = path.join(root, 'antigravity-cli', 'launch-locks', `${slotName}.lock`)
+    mkdirSync(lockDir, { recursive: true, mode: 0o700 })
+    const whileLocked = projectAntigravityPlatform(input(null))
+    assert.match(path.basename(whileLocked.launchHome), /^r-[0-9a-f]{16}$/, 'held lock degrades to r-* without stealing')
+    assert.equal(existsSync(lockDir), true, 'held lock must never be stolen or renamed')
+    cleanupAntigravityLaunch(whileLocked)
+    await rm(lockDir, { recursive: true, force: true })
+
+    const coordDir = path.join(root, 'race-coord')
+    mkdirSync(coordDir, { recursive: true })
+    const startGate = path.join(coordDir, 'go')
+    const cleanupGate = path.join(coordDir, 'cleanup')
+    const moduleUrl = new URL('../engine/antigravityPlatform.ts', import.meta.url).href
+    const tsxBin = path.resolve(process.cwd(), 'node_modules', '.bin', 'tsx')
+
+    const workerScript = `
+      import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+      import path from 'node:path';
+      import { projectAntigravityPlatform, cleanupAntigravityLaunch } from ${JSON.stringify(moduleUrl)};
+      const id = process.env.WORKER_ID!;
+      const coord = ${JSON.stringify(coordDir)};
+      const goFile = ${JSON.stringify(startGate)};
+      const cleanupFile = ${JSON.stringify(cleanupGate)};
+      writeFileSync(path.join(coord, 'ready-' + id), '1');
+      const sleepBuf = new Int32Array(new SharedArrayBuffer(4));
+      while (!existsSync(goFile)) Atomics.wait(sleepBuf, 0, 0, 2);
+      const p = projectAntigravityPlatform({
+        credential: { accessToken: 'tok-' + id, accessTokenExpiresAt: '2026-12-01T00:00:00Z' },
+        agentId: 'main',
+        sessionKey: 'agent:main:webchat:dm:agy-platform-test',
+        gatewayPort: 18789,
+        gatewayToken: '',
+        delegationDepth: 0,
+        hostBin: null,
+      });
+      const markerPath = path.join(p.launchHome, 'worker-marker.txt');
+      writeFileSync(markerPath, 'worker-' + id);
+      writeFileSync(path.join(coord, 'acquired-' + id + '.json'), JSON.stringify({ id, launchHome: p.launchHome }));
+      while (!existsSync(cleanupFile + '-' + id)) Atomics.wait(sleepBuf, 0, 0, 5);
+      const markerOk = existsSync(markerPath) && readFileSync(markerPath, 'utf8') === 'worker-' + id;
+      const tokenPath = path.join(p.launchHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+      const tokenOk = existsSync(tokenPath) && readFileSync(tokenPath, 'utf8').includes('tok-' + id);
+      cleanupAntigravityLaunch(p);
+      writeFileSync(path.join(coord, 'done-' + id + '.json'), JSON.stringify({ id, launchHome: p.launchHome, markerOk, tokenOk }));
+    `
+
+    const workerIds = ['1', '2', '3', '4']
+    const procs = workerIds.map((id) =>
+      spawn(tsxBin, ['-e', workerScript], {
+        env: { ...process.env, OPENCLAUDE_HOME: root, WORKER_ID: id },
+        stdio: 'pipe',
+      }),
+    )
+
+    try {
+      const waitFiles = async (names: string[], timeoutMs = 15_000) => {
+        const deadline = Date.now() + timeoutMs
+        while (Date.now() < deadline) {
+          if (names.every((n) => existsSync(path.join(coordDir, n)))) return
+          await new Promise((r) => setTimeout(r, 15))
+        }
+        throw new Error(`Timed out waiting for ${names.join(', ')}`)
+      }
+
+      await waitFiles(workerIds.map((id) => `ready-${id}`))
+      writeFileSync(startGate, '1')
+      await waitFiles(workerIds.map((id) => `acquired-${id}.json`))
+
+      const acquired = workerIds.map((id) =>
+        JSON.parse(readFileSync(path.join(coordDir, `acquired-${id}.json`), 'utf8')) as { id: string; launchHome: string },
+      )
+      const uniqueHomes = new Set(acquired.map((a) => a.launchHome))
+      assert.equal(uniqueHomes.size, workerIds.length, `duplicate launchHome assigned: ${JSON.stringify(acquired)}`)
+      const stickyWinners = acquired.filter((a) => a.launchHome === stickyPath)
+      assert.ok(stickyWinners.length <= 1, `at most one process may claim sticky launchHome: ${JSON.stringify(acquired)}`)
+
+      // Stagger cleanups: clean up non-sticky (or earlier) workers first, then verify remaining workers stay intact!
+      const ordered = [...acquired].sort((a, b) => (a.launchHome === stickyPath ? 1 : 0) - (b.launchHome === stickyPath ? 1 : 0))
+      for (const item of ordered) {
+        writeFileSync(`${cleanupGate}-${item.id}`, '1')
+        await waitFiles([`done-${item.id}.json`])
+        const done = JSON.parse(readFileSync(path.join(coordDir, `done-${item.id}.json`), 'utf8')) as {
+          markerOk: boolean
+          tokenOk: boolean
+        }
+        assert.equal(done.markerOk, true, `worker ${item.id} marker was clobbered`)
+        assert.equal(done.tokenOk, true, `worker ${item.id} token was clobbered`)
+      }
+
+      await Promise.all(
+        procs.map(
+          (proc) =>
+            new Promise<void>((resolve, reject) => {
+              if (proc.exitCode !== null) return proc.exitCode === 0 ? resolve() : reject(new Error(`exit ${proc.exitCode}`))
+              proc.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))))
+            }),
+        ),
+      )
+      assert.deepEqual(readdirSync(path.join(root, 'antigravity-cli', 'launch')), [])
+    } finally {
+      for (const proc of procs) {
+        if (proc.exitCode === null) proc.kill('SIGKILL')
+      }
+    }
   })
 })

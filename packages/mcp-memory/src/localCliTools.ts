@@ -24,6 +24,8 @@ export const OC_BASH_MAX_TIMEOUT_MS = 600_000
 export const OC_BASH_MAX_OUTPUT_BYTES = 200 * 1024
 export const OC_GREP_DEFAULT_MAX_MATCHES = 80
 export const OC_GREP_MAX_MATCHES = 200
+/** Cap single-line matches (minified bundles / JSONL transcripts) so 1 hit cannot inject 200 KB. */
+export const OC_GREP_MAX_LINE_CHARS = 2_000
 export const OC_GLOB_DEFAULT_MAX_RESULTS = 200
 export const OC_GLOB_MAX_RESULTS = 500
 
@@ -342,10 +344,31 @@ async function rgBinOrError(
   return rg
 }
 
-function clipLines(text: string, maxLines: number): { text: string; clipped: boolean } {
-  const lines = text.replace(/\s+$/, '').split('\n').filter((line) => line.length > 0)
-  if (lines.length <= maxLines) return { text: lines.join('\n'), clipped: false }
-  return { text: lines.slice(0, maxLines).join('\n'), clipped: true }
+function clipSingleLine(line: string, maxChars: number): { line: string; clipped: boolean } {
+  if (line.length <= maxChars) return { line, clipped: false }
+  let cut = maxChars
+  const prev = line.charCodeAt(cut - 1)
+  if (prev >= 0xd800 && prev <= 0xdbff) cut -= 1
+  return { line: `${line.slice(0, cut)}…`, clipped: true }
+}
+
+function clipLines(
+  text: string,
+  maxLines: number,
+  maxLineChars?: number,
+): { text: string; clipped: boolean } {
+  const rawLines = text.replace(/\s+$/, '').split('\n').filter((line) => line.length > 0)
+  let clipped = rawLines.length > maxLines
+  const kept = clipped ? rawLines.slice(0, maxLines) : rawLines
+  if (!maxLineChars || maxLineChars <= 0) {
+    return { text: kept.join('\n'), clipped }
+  }
+  const bounded = kept.map((line) => {
+    const res = clipSingleLine(line, maxLineChars)
+    if (res.clipped) clipped = true
+    return res.line
+  })
+  return { text: bounded.join('\n'), clipped }
 }
 
 export async function handleOcGrep(
@@ -384,7 +407,7 @@ export async function handleOcGrep(
     const detail = (outcome.stderr || outcome.stdout || `exit=${outcome.exitCode ?? 'none'}`).trim()
     return textResult(`oc_grep: ${detail}`, true)
   }
-  const clipped = clipLines(outcome.stdout, maxMatches)
+  const clipped = clipLines(outcome.stdout, maxMatches, OC_GREP_MAX_LINE_CHARS)
   const truncated = outcome.truncated || clipped.clipped
   const body = clipped.text || 'no matches'
   return textResult(truncated ? `${body}\n[truncated]` : body)

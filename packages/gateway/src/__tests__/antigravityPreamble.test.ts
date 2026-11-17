@@ -26,6 +26,8 @@ describe('ANTIGRAVITY_PREAMBLE local CLI hints', () => {
     assert.match(text, /parallel/i)
     assert.match(text, /brain/)
     assert.match(text, /file:\/\//)
+    assert.match(text, /Prefer native `read_file`, `oc_grep`, and `oc_glob` over/)
+    assert.match(text, /filter large JSON or log command outputs at the source/)
     assert.equal(text.includes('force_all_tools_eager'), false)
     assert.equal(text.includes('forceAllToolsEager'), false)
   })

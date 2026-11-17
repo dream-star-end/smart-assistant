@@ -16,6 +16,7 @@ import {
   LOCAL_CLI_TOOL_NAMES,
   OC_BASH_MAX_TIMEOUT_MS,
   OC_BASH_MIN_TIMEOUT_MS,
+  OC_GREP_MAX_LINE_CHARS,
   ocGlobArgv,
   ocGrepArgv,
   runCaptured,
@@ -185,6 +186,28 @@ describe('oc_grep / oc_glob', () => {
     const globbed = await handleOcGlob({ pattern: '*.ts' }, { rgBin: null })
     assert.equal(globbed.isError, true)
     assert.match(globbed.content[0]!.text, /找不到 rg/)
+  })
+
+  it('bounds single-line minified oc_grep hits without splitting UTF-16 surrogate pairs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-cli-longline-'))
+    try {
+      // Place an emoji (surrogate pair) straddling the exact cut index so naive slice() would leave a lone high surrogate.
+      const prefixLen = OC_GREP_MAX_LINE_CHARS - 20
+      const linePrefix = 'a'.repeat(prefixLen)
+      // Note: rg prepends `<file>:1:` to the output line; pad across a range of offsets with emojis to guarantee surrogate safety.
+      const emojiRun = '🚀'.repeat(40)
+      writeFileSync(join(dir, 'minified.js'), `const bundle = "${linePrefix}${emojiRun}${'z'.repeat(5000)}";\n`)
+
+      const hit = await handleOcGrep({ pattern: 'bundle', path: dir })
+      assert.equal(hit.isError, undefined)
+      const text = hit.content[0]!.text
+      assert.match(text, /\[truncated\]$/)
+      const firstLine = text.split('\n')[0]!
+      assert.ok(firstLine.length <= OC_GREP_MAX_LINE_CHARS + 1)
+      assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text), false, 'must not emit lone UTF-16 surrogates')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

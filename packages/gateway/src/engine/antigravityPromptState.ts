@@ -40,6 +40,7 @@ import {
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import type { PromptSlotApplied } from '../promptSlots.js'
+import { ANTIGRAVITY_PREAMBLE } from './antigravityPlatform.js'
 
 export type AntigravityDedupMode = 'on' | 'off'
 
@@ -149,6 +150,7 @@ export function buildAntigravityPromptInputsKey(args: AntigravityPromptInputsKey
   return sha256Hex(
     JSON.stringify([
       'ocv5-781-v1',
+      sha256Hex(ANTIGRAVITY_PREAMBLE),
       args.agentId,
       args.projectId ?? null,
       args.sessionId ?? null,
