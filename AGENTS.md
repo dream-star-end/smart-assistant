@@ -49,6 +49,10 @@ git worktree add ../openclaude-<slug> -b <type>/<slug> origin/master
 cd /opt/openclaude/openclaude-v3
 git fetch origin
 git worktree add ../openclaude-v3-<slug> -b <type>/<slug> origin/v3
+
+# V5 Selfhost (feat/v5-selfhost, uid=3 container):
+# Use shared persistent volume /home/agent/.openclaude/workspace/wt-<ticket> + warm dist-types/.tsc-cache seed (never host-private /opt/openclaude/wt-* or ~/work/).
+# Ordinary fixes use bug(v5): / ui(v5): / perf(v5): / refactor(v5): (no INC-*); reserve fix(v5): + Incident: INC-* for real production incidents (run only the new proof test + check-v5-fix-trailers.sh locally, never full historical incident suites).
 ```
 
 Rules:
@@ -138,7 +142,7 @@ For any `claudeai.chat` / OpenClaude v3 commercial code or deploy task:
 1. **范围**:只审这次 diff,以及 diff 直接影响到的调用方 / 被调用方。不审 diff 之外早已存在的代码;顺带看到的老问题最多一行列入「非阻断」,不算本次 finding。
 2. **严重度**:只有 P0/P1 阻断合并 —— 正确性(会出错的结果、崩溃、挂死、数据丢失)、安全、计费/积分、数据完整性、发布门被削弱或可被绕过。命名、风格、注释、可读性、"更好的写法"、缺少锦上添花的测试都是 P2 及以下:列在「非阻断」里,永不挡合并。
 3. **轮次记忆**:第 2 轮起,调用方会给出上一轮 findings 与「已定设计决定」。只做两件事:核对上一轮每条 P0/P1 是否真修好;只在本轮新增的 diff 里找新的 P0/P1。不重审全部代码;不重提已定设计决定,除非能给出它导致 P0/P1 的具体复现。
-4. **轮次上限**:小改动(单文件或 < ~150 行有效 diff)1 轮;大改动最多 3 轮。到上限仍有分歧,由发起审查的一方(外机 cc3 / 主控)裁决并留痕,不再循环。调用方在提示里写明「第 N 轮 / 上限 M」。
+4. **轮次上限**:V5 个人版(`feat/v5-selfhost`)T0/T1 不上审,T2 硬上限 `1+1`(1 轮完整 diff 首审 + 最多 1 轮增量复核;重型 `*-red-proof`/`conformance` 定稿后只跑 1 次);商业版小改动(< ~150 行有效 diff)1 轮、大改动最多 3 轮。到上限仍有分歧,由发起审查的一方(主控/队长)裁决留痕或另记待办,不再循环。调用方在提示里写明「第 N 轮 / 上限 M」。
 5. **用例卫生**:diff 改了行为却没有在同一 PR 里更新或删除因此过期/无用的用例,或让 `npm run test:web-react`
    变红,按 P1(发布门被削弱)报,复现写出会失败的用例名。见上节「用例卫生」。
 6. **固定输出**:
