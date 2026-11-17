@@ -664,7 +664,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     } catch {
       if (!ctx.abandoned) this.finishError(ctx, 'ANTIGRAVITY_DELIVERY_FAILED: terminal delivery could not be verified')
     } finally {
-      this.cleanupLaunch(ctx)
+      const persistSummaryCache = code === 0 && !ctx.interrupted && !ctx.abandoned && ctx.errorDetail === null
+      this.cleanupLaunch(ctx, { persistSummaryCache })
       ctx.resolveDrain?.()
       ctx.resolveDrain = null
       this.emit('exit', { code, signal, crashed: !ctx.interrupted && code !== 0 })
@@ -1218,14 +1219,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.resolveSummary(null)
   }
 
-  private cleanupLaunch(ctx: TurnContext): void {
+  private cleanupLaunch(ctx: TurnContext, opts?: { persistSummaryCache?: boolean }): void {
     // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
     ctx.releaseRelayTrace?.()
     ctx.releaseRelayTrace = null
     const projection = ctx.projection
     if (!projection) return
     ctx.projection = null
-    cleanupAntigravityLaunch(projection)
+    cleanupAntigravityLaunch(projection, opts)
   }
 
   /** Per-turn timer: an earlier turn's late `close` must not stop the

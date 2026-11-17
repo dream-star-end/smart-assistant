@@ -660,6 +660,153 @@ describe('AntigravityAdapter', () => {
     }
   })
 
+  test('maps eager mcp_<server>_<tool> wire steps onto identical mcp__server__tool product cards and strips synthetic toolSummary', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const convId = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+      const file = path.join(h.dir, 'tool-mcp-eager.ndjson')
+      await writeFile(file, `${[
+        { event: 'init', conversation_id: convId },
+        { event: 'step_update', step_update: { step_type: 'user_input', state: 'DONE', step_index: 0 } },
+        {
+          event: 'step_update',
+          step_update: {
+            step_type: 'tool',
+            state: 'ACTIVE',
+            step_index: 1,
+            tool_info: {
+              name: 'mcp_openclaude-memory_oc_bash',
+              parameters: { command: 'echo eager-ok', timeout_ms: 300_000, toolSummary: 'Echo test' },
+            },
+          },
+        },
+        {
+          event: 'step_update',
+          step_update: {
+            step_type: 'tool',
+            state: 'DONE',
+            step_index: 1,
+            tool_info: {
+              name: 'mcp_openclaude-memory_oc_bash',
+              parameters: { command: 'echo eager-ok', timeout_ms: 300_000, toolSummary: 'Echo test' },
+              output: 'exit=0\neager-ok',
+            },
+          },
+        },
+        { event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', step_index: 2, text_delta: 'Done.' } },
+        { event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Done.' } },
+      ].map((line) => JSON.stringify(line)).join('\n')}\n`)
+      const { summary, events } = await runTurn(h, file)
+      assert.equal(summary?.isError, false)
+      assert.equal(summary?.tools.length, 1)
+      assert.equal(summary?.tools[0]?.toolName, 'mcp__openclaude-memory__oc_bash')
+      assert.deepEqual(summary?.tools[0]?.inputJson, { command: 'echo eager-ok', timeout_ms: 300_000 })
+      assert.equal(summary?.tools[0]?.output, 'exit=0\neager-ok')
+      const toolUseBlock = events.find((e) => e.kind === 'block' && e.block.kind === 'tool_use')
+      assert.ok(toolUseBlock && toolUseBlock.kind === 'block' && toolUseBlock.block.kind === 'tool_use')
+      assert.equal(toolUseBlock.block.toolName, 'mcp__openclaude-memory__oc_bash')
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('persists WAL-checkpointed summary cache only on clean turns and seeds isolated copies into subsequent turns', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const stableCliDir = path.join(h.dir, 'openclaude-home', 'antigravity-cli', 'home', '.gemini', 'antigravity-cli')
+      const summaryWriterCli = path.join(h.dir, 'summary-writer-cli.cjs')
+      const seededCheckFile = path.join(h.dir, 'seeded-check.json')
+      const sqliteModulePath = fileURLToPath(import.meta.resolve('better-sqlite3'))
+      await writeFile(summaryWriterCli, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const Database = require(${JSON.stringify(sqliteModulePath)})
+const cliDir = path.join(process.env.HOME, '.gemini', 'antigravity-cli')
+const dbPath = path.join(cliDir, 'conversation_summaries.db')
+const pbPath = path.join(cliDir, 'jetbox_summaries_proto.pb')
+const mode = process.env.SUMMARY_TEST_MODE
+let seededIds = []
+let seededIno = null
+if (fs.existsSync(dbPath)) {
+  seededIno = fs.statSync(dbPath).ino
+  const rdb = new Database(dbPath, { readonly: true })
+  seededIds = rdb.prepare('SELECT id FROM summaries ORDER BY id').all().map((r) => r.id)
+  rdb.close()
+}
+fs.writeFileSync(${JSON.stringify(seededCheckFile)}, JSON.stringify({
+  seededIds,
+  seededIno,
+  hasPb: fs.existsSync(pbPath),
+  pbText: fs.existsSync(pbPath) ? fs.readFileSync(pbPath, 'utf8') : null,
+}))
+const db = new Database(dbPath)
+db.pragma('journal_mode = WAL')
+db.exec('CREATE TABLE IF NOT EXISTS summaries (id TEXT PRIMARY KEY)')
+db.prepare('INSERT OR REPLACE INTO summaries (id) VALUES (?)').run(mode === 'fail' ? 'poisoned-turn' : 'clean-turn-1')
+// Intentionally leave WAL uncheckpointed on exit to prove cleanup checkpoints before persisting.
+fs.writeFileSync(pbPath, mode === 'fail' ? 'pb-poisoned' : 'pb-clean-1')
+process.stdin.setEncoding('utf8')
+let inputBuf = ''
+let sent = false
+process.stdin.on('data', (chunk) => {
+  inputBuf += chunk
+  if (sent || !inputBuf.includes('\\n')) return
+  sent = true
+  const convId = '88888888-9999-4aaa-8bbb-cccccccccccc'
+  if (mode === 'fail') {
+    process.stdout.write(JSON.stringify({ event: 'init', conversation_id: convId }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: convId, status: 'ERROR', error: 'boom' } }) + '\\n')
+  } else {
+    process.stdout.write(JSON.stringify({ event: 'init', conversation_id: convId }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'step_update', step_update: { step_type: 'user_input', state: 'DONE', step_index: 0 } }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', step_index: 1, text_delta: 'ok' } }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'ok' } }) + '\\n')
+  }
+})
+process.stdin.on('end', () => process.exit(mode === 'fail' ? 1 : 0))
+`)
+      await chmod(summaryWriterCli, 0o755)
+      process.env.OC_ANTIGRAVITY_CLI_BIN = summaryWriterCli
+
+      // Turn 1 (clean): creates WAL-mode summary DB; cleanup must checkpoint & persist standalone .db + .pb.
+      process.env.SUMMARY_TEST_MODE = 'clean'
+      const t1 = await runTurn(h, 'tool-mcp.ndjson')
+      assert.equal(t1.summary?.isError, false)
+      const stableDbPath = path.join(stableCliDir, 'conversation_summaries.db')
+      const stablePbPath = path.join(stableCliDir, 'jetbox_summaries_proto.pb')
+      assert.equal(existsSync(stableDbPath), true, 'clean turn persists conversation_summaries.db to stable dir')
+      assert.equal(existsSync(`${stableDbPath}-wal`), false, 'stable summary DB is self-contained without -wal sidecar')
+      assert.equal((await stat(stableDbPath)).mode & 0o777, 0o600)
+      assert.equal((await readFile(stablePbPath, 'utf8')), 'pb-clean-1')
+      const stableIno1 = (await stat(stableDbPath)).ino
+
+      // Turn 2 (clean): must receive seeded summary DB with clean-turn-1 on an isolated private inode.
+      const t2 = await runTurn(h, 'tool-mcp.ndjson')
+      assert.equal(t2.summary?.isError, false)
+      const check2 = JSON.parse(await readFile(seededCheckFile, 'utf8')) as {
+        seededIds: string[]; seededIno: number | null; hasPb: boolean; pbText: string | null
+      }
+      assert.deepEqual(check2.seededIds, ['clean-turn-1'])
+      assert.notEqual(check2.seededIno, stableIno1, 'launch HOME gets an isolated copy, never sharing SQLite file locks')
+      assert.equal(check2.pbText, 'pb-clean-1')
+
+      // Turn 3 (failed exit 1): must NOT overwrite stable summary cache with poisoned data.
+      process.env.SUMMARY_TEST_MODE = 'fail'
+      const t3 = await runTurn(h, 'tool-mcp.ndjson')
+      assert.equal(t3.summary?.isError, true)
+      const verifyDb = new Database(stableDbPath, { readonly: true })
+      const finalRows = verifyDb.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
+      verifyDb.close()
+      assert.deepEqual(finalRows.map((r) => r.id), ['clean-turn-1'])
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-1')
+    } finally {
+      Reflect.deleteProperty(process.env, 'SUMMARY_TEST_MODE')
+      await h.restore()
+    }
+  })
+
   test('large-history startup observation failure preserves native identity and never re-spawns', async () => {
     const prior = '4187c78c-e96d-4840-8c1c-3de86f92ddd9'
     const h = await harness({ resumeSessionId: prior })

@@ -23,8 +23,24 @@ import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
  * keeps unknown keys but the CLI rewrites the file on start.
  */
 import { randomBytes } from 'node:crypto'
-import { chmodSync, lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  copyFileSync,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { isAbsolute, join } from 'node:path'
+import Database from 'better-sqlite3'
 import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
 
 import { paths } from '@openclaude/storage'
@@ -33,6 +49,21 @@ import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 import { PLATFORM_MEMORY_MCP_TOOLS } from './platformMemoryMcpTools.js'
 
 export const ANTIGRAVITY_MCP_SERVER = 'openclaude-memory'
+/** MCP per-call timeout in seconds (`mcp_config.json` defaults to 180s without this). */
+export const ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC = 3600
+/** High-frequency tools pre-registered eagerly so >10 KB outputs return inline head/tail instead of 0-byte file stubs. */
+export const ANTIGRAVITY_EAGER_MCP_TOOLS = [
+  'oc_bash',
+  'oc_grep',
+  'oc_glob',
+  'delegate_task',
+  'skill_search',
+  'skill_view',
+] as const
+
+const SUMMARY_CACHE_FILES = ['conversation_summaries.db', 'jetbox_summaries_proto.pb'] as const
+const SUMMARY_CACHE_MAX_BYTES = 64 * 1024 * 1024
+const SQLITE_HEADER_MAGIC = 'SQLite format 3\0'
 
 export const ANTIGRAVITY_MEMORY_MCP_TOOLS = PLATFORM_MEMORY_MCP_TOOLS
 
@@ -46,23 +77,30 @@ higher-priority platform guidance while answering the current turn.
 Your actual Antigravity native tool list and MCP server list are authoritative.
 Descriptions in the platform context may mention tools from another backend;
 do not claim or call a tool unless it is present in your current tool list.
-OpenClaude platform tools are on the MCP server \`${ANTIGRAVITY_MCP_SERVER}\`; call
-them with \`call_mcp_tool\` (ServerName \`${ANTIGRAVITY_MCP_SERVER}\`).
+OpenClaude platform tools are on the MCP server \`${ANTIGRAVITY_MCP_SERVER}\`.
 
-Those tools are lazy. Call them directly with \`call_mcp_tool\` (ServerName
-\`${ANTIGRAVITY_MCP_SERVER}\`, ToolName, Arguments). Do not spend a turn reading
-\`mcp/<server>/<tool>.json\` when the signature below is enough.
+High-frequency tools below are pre-registered eagerly as native tools
+(\`mcp_${ANTIGRAVITY_MCP_SERVER}_<tool>\`, e.g. \`mcp_${ANTIGRAVITY_MCP_SERVER}_oc_bash\`);
+call those eager tools directly. Remaining \`${ANTIGRAVITY_MCP_SERVER}\` tools are lazy;
+call them directly with \`call_mcp_tool\` (ServerName \`${ANTIGRAVITY_MCP_SERVER}\`,
+ToolName, Arguments) without spending a turn reading \`mcp/<server>/<tool>.json\`
+when the signature is known.
 
 High-frequency tools (Arguments object):
 - \`oc_bash\`: \`{command, cwd?, timeout_ms?}\`. Default timeout 60000 ms, maximum
-  170000. Use this when a command may run longer than a few seconds. Do not use
-  native \`run_command\` \`WaitMsBeforeAsync\` for that: its foreground wait is
-  hard-capped at 10000 ms, then the command is backgrounded and the turn stops.
+  600000. Use \`oc_bash\` synchronously when a command may run longer than a few
+  seconds. Never use native \`run_command\` \`WaitMsBeforeAsync\` plus \`manage_task\`
+  polling loops for that: native \`run_command\` foreground wait is hard-capped at
+  10000 ms, then backgrounds the command.
 - \`oc_grep\`: \`{pattern, path?, glob?, max_matches?}\` searches file contents.
 - \`oc_glob\`: \`{pattern, path?, max_results?}\` finds files by name.
 - \`delegate_task\`: \`{goal, agentId?, model?, allowSelf?}\`. \`goal\` is the only
   required field.
 - \`skill_search\` then \`skill_view\`: search by query, then view one skill by name.
+
+Batch independent read-only calls (\`read_file\`, \`oc_grep\`, \`oc_glob\`, \`skill_view\`,
+and read-only checks) in parallel within the same turn instead of issuing one
+tool call per turn.
 
 Do not write CLI brain or artifact files unless the user asked for a file.
 Do not wrap ordinary code symbols in \`file://\` links.
@@ -208,6 +246,104 @@ function linkShared(target: string, link: string): void {
   }
 }
 
+function readBoundedRegularFile(src: string, opts: { requireSqliteHeader: boolean }): Buffer | null {
+  let fd: number | null = null
+  try {
+    const flags = fsConstants.O_RDONLY | (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
+    fd = openSync(src, flags)
+    const st = fstatSync(fd)
+    if (!st.isFile() || st.size <= 0 || st.size > SUMMARY_CACHE_MAX_BYTES) return null
+    if (opts.requireSqliteHeader && st.size < 16) return null
+    const buf = Buffer.allocUnsafe(st.size)
+    let offset = 0
+    while (offset < st.size) {
+      const n = readSync(fd, buf, offset, st.size - offset, offset)
+      if (n <= 0) break
+      offset += n
+    }
+    const data = offset === st.size ? buf : buf.subarray(0, offset)
+    if (data.length <= 0) return null
+    if (opts.requireSqliteHeader && (data.length < 16 || data.subarray(0, 16).toString('latin1') !== SQLITE_HEADER_MAGIC)) {
+      return null
+    }
+    return data
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+function writePrivateBytes(filePath: string, data: Buffer): void {
+  writeFileSync(filePath, data, { mode: 0o600 })
+  chmodSync(filePath, 0o600)
+}
+
+/**
+ * Copy-seed CLI summary caches from stable storage into the private launch HOME.
+ * Without this, every turn starts with an empty summary store (`trigger=empty_on_open`)
+ * and scans every shared `<uuid>.db` (~17-22s across ~190 conversations). Each
+ * launch gets an independent file copy so concurrent turns never contend on SQLite locks.
+ */
+function seedAntigravitySummaryCache(stableCliDir: string, launchCliDir: string): void {
+  for (const name of SUMMARY_CACHE_FILES) {
+    const data = readBoundedRegularFile(join(stableCliDir, name), {
+      requireSqliteHeader: name.endsWith('.db'),
+    })
+    if (!data) continue
+    try {
+      writePrivateBytes(join(launchCliDir, name), data)
+    } catch {
+      // Best-effort cache seed; CLI rebuilds summaries from conversations/ if absent.
+    }
+  }
+}
+
+function checkpointSqliteWalIfPresent(dbPath: string): boolean {
+  const walPath = `${dbPath}-wal`
+  try {
+    if (!existsSync(walPath)) return true
+    const walStat = lstatSync(walPath)
+    if (!walStat.isFile()) return false
+    if (walStat.size === 0) return true
+    const dbStat = lstatSync(dbPath)
+    if (!dbStat.isFile() || dbStat.size <= 0 || dbStat.size > SUMMARY_CACHE_MAX_BYTES) return false
+    const db = new Database(dbPath, { fileMustExist: true, timeout: 1000 })
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)')
+    } finally {
+      db.close()
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+function persistAntigravitySummaryCache(stableCliDir: string, launchCliDir: string): void {
+  try {
+    privateDir(stableCliDir)
+  } catch {
+    return
+  }
+  for (const name of SUMMARY_CACHE_FILES) {
+    const src = join(launchCliDir, name)
+    const isSqlite = name.endsWith('.db')
+    if (isSqlite && !checkpointSqliteWalIfPresent(src)) continue
+    const data = readBoundedRegularFile(src, { requireSqliteHeader: isSqlite })
+    if (!data) continue
+    const tmp = join(stableCliDir, `.${name}.tmp.${randomBytes(6).toString('hex')}`)
+    try {
+      writePrivateBytes(tmp, data)
+      renameSync(tmp, join(stableCliDir, name))
+    } catch {
+      try { rmSync(tmp, { force: true }) } catch { /* ignore */ }
+    }
+  }
+}
+
 export function projectAntigravityPlatform(
   input: AntigravityPlatformInput,
 ): AntigravityPlatformProjection {
@@ -221,6 +357,7 @@ export function projectAntigravityPlatform(
   const configDir = privateDir(join(launchHome, '.gemini', 'config'))
   linkShared(join(stable, 'conversations'), join(cliDir, 'conversations'))
   linkShared(join(stable, 'bin'), join(cliDir, 'bin'))
+  seedAntigravitySummaryCache(stable, cliDir)
 
   // Google-account mode: no modelProvider override. The CLI reads this token
   // file when no keyring is reachable; it only runs the userinfo eligibility
@@ -261,11 +398,17 @@ export function projectAntigravityPlatform(
         consultTurn: input.consultTurn,
       })}\n`,
     )
+    const eagerTools: Record<string, { eager: true }> = {}
+    for (const toolName of ANTIGRAVITY_EAGER_MCP_TOOLS) {
+      eagerTools[toolName] = { eager: true }
+    }
     servers[ANTIGRAVITY_MCP_SERVER] = {
       command: mcpLaunch.command,
       args: [...mcpLaunch.args],
+      timeoutSeconds: ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC,
+      tools: eagerTools,
       env: {
-        ...delegateMcpBudgetEnvironment(),
+        ...delegateMcpBudgetEnvironment(ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC * 1000),
         OPENCLAUDE_AGENT_ID: input.agentId,
         OC_AGENT_ID: input.agentId,
         ...identityCompatEnvironment(input.identityCompat),
@@ -314,9 +457,16 @@ export function projectAntigravityPlatform(
 /** Remove one launch HOME. Never follows the shared symlinks. */
 export function cleanupAntigravityLaunch(
   projection: Pick<AntigravityPlatformProjection, 'root' | 'launchHome'>,
+  opts?: { persistSummaryCache?: boolean },
 ): void {
   const launchRoot = join(projection.root, 'launch')
   if (!projection.launchHome.startsWith(`${launchRoot}/`)) return
+  if (opts?.persistSummaryCache) {
+    persistAntigravitySummaryCache(
+      antigravityStableCliDir(projection.root),
+      join(projection.launchHome, '.gemini', 'antigravity-cli'),
+    )
+  }
   try {
     rmSync(projection.launchHome, { recursive: true, force: true })
   } catch {

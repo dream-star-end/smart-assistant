@@ -5,16 +5,18 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
+import Database from 'better-sqlite3'
 
 import {
   ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS,
   type AntigravityPlatformInput,
   antigravityCliTokenFileExpiry,
+  antigravityStableCliDir,
   cleanupAntigravityLaunch,
   projectAntigravityPlatform,
 } from '../engine/antigravityPlatform.js'
@@ -121,17 +123,75 @@ test('projection reports the expiry it wrote and never the token', async () => {
   })
 })
 
-test('the Antigravity MCP shell inherits only the stable help context path and existing local gateway port', async () => {
+test('the Antigravity MCP shell configures 3600s timeout, matching delegate budget, and eager core tools', async () => {
   await withHome(async () => {
     const projection = projectAntigravityPlatform({ ...input(null), gatewayToken: 'synthetic-gateway-token', systemHelpContextFile: '/synthetic/system-help-context.json' })
     const raw = readFileSync(path.join(projection.launchHome, '.gemini', 'config', 'mcp_config.json'), 'utf8')
-    const config = JSON.parse(raw) as { mcpServers: Record<string, { env: Record<string, string> }> }
+    const config = JSON.parse(raw) as {
+      mcpServers: Record<string, {
+        env: Record<string, string>
+        timeoutSeconds?: number
+        tools?: Record<string, { eager?: boolean }>
+      }>
+    }
     const server = Object.values(config.mcpServers)[0]
     assert.ok(server)
     assert.equal(server.env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE, '/synthetic/system-help-context.json')
     assert.equal(server.env.OPENCLAUDE_GATEWAY_PORT, '18789')
-    assert.equal(server.env.OPENCLAUDE_DELEGATE_MCP_BUDGET_MS, '45000')
+    assert.equal(server.timeoutSeconds, 3600)
+    assert.equal(server.env.OPENCLAUDE_DELEGATE_MCP_BUDGET_MS, '3585000')
+    assert.deepEqual(server.tools, {
+      oc_bash: { eager: true },
+      oc_grep: { eager: true },
+      oc_glob: { eager: true },
+      delegate_task: { eager: true },
+      skill_search: { eager: true },
+      skill_view: { eager: true },
+    })
     assert.equal(raw.includes('synthetic-gateway-token'), false)
     cleanupAntigravityLaunch(projection)
+  })
+})
+
+test('summary cache seeding skips symlinks and corrupt SQLite headers while copying valid caches', async () => {
+  await withHome(async (root) => {
+    const stable = antigravityStableCliDir(path.join(root, 'antigravity-cli'))
+    await mkdir(stable, { recursive: true })
+    // 1. Corrupt non-SQLite file + symlinked .pb must both be rejected on seed.
+    const corruptDb = path.join(stable, 'conversation_summaries.db')
+    const outsideTarget = path.join(root, 'outside-secret.pb')
+    writeFileSync(corruptDb, 'NOT_A_VALID_SQLITE_HEADER_AT_ALL')
+    writeFileSync(outsideTarget, 'secret')
+    symlinkSync(outsideTarget, path.join(stable, 'jetbox_summaries_proto.pb'))
+
+    const p1 = projectAntigravityPlatform(input(null))
+    try {
+      const cliDir1 = path.join(p1.launchHome, '.gemini', 'antigravity-cli')
+      assert.equal(existsSync(path.join(cliDir1, 'conversation_summaries.db')), false, 'corrupt SQLite header skipped')
+      assert.equal(existsSync(path.join(cliDir1, 'jetbox_summaries_proto.pb')), false, 'symlinked cache file skipped')
+    } finally {
+      cleanupAntigravityLaunch(p1)
+    }
+
+    // 2. Valid SQLite DB + regular .pb file are copied as private 0600 files.
+    await rm(path.join(stable, 'jetbox_summaries_proto.pb'), { force: true })
+    await rm(corruptDb, { force: true })
+    const db = new Database(corruptDb)
+    db.exec('CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42);')
+    db.close()
+    writeFileSync(path.join(stable, 'jetbox_summaries_proto.pb'), 'valid-pb')
+
+    const p2 = projectAntigravityPlatform(input(null))
+    try {
+      const cliDir2 = path.join(p2.launchHome, '.gemini', 'antigravity-cli')
+      const seededDb = path.join(cliDir2, 'conversation_summaries.db')
+      const seededPb = path.join(cliDir2, 'jetbox_summaries_proto.pb')
+      assert.equal(lstatSync(seededDb).isFile(), true)
+      assert.equal(lstatSync(seededDb).mode & 0o777, 0o600)
+      assert.notEqual(lstatSync(seededDb).ino, lstatSync(corruptDb).ino)
+      assert.equal(readFileSync(seededPb, 'utf8'), 'valid-pb')
+    } finally {
+      cleanupAntigravityLaunch(p2)
+    }
   })
 })
