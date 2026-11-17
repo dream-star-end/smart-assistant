@@ -419,35 +419,112 @@ describe("用户气泡媒体缩略图:/api/media 收口签名管线(iOS/CF 下 4
   });
 });
 
-describe("聊天视频页内播放、不自动播放(P0 鸿蒙原生浏览器起播后按钮失效)", () => {
-  // 没有 playsinline 时移动端浏览器一播放就交给系统全屏 / 浮窗播放器,退出后页面按钮点不动。
-  const signedVideo = async (container: HTMLElement) => {
-    await waitFor(() => expect(container.querySelector("video")?.getAttribute("src")).toBe("/api/media-signed?t=v1"));
-    return container.querySelector("video") as HTMLVideoElement;
-  };
-
-  test("气泡附件视频(MediaItem)带 playsinline、无 autoplay", async () => {
-    const media: MediaRef[] = [{ kind: "video", url: "/api/media/clip.mp4" }];
+describe("聊天视频点击才挂载、单实例互斥与防 ArkWeb 遮挡(OCV5-765)", () => {
+  // 空闲态不挂 <video>（防止鸿蒙 ArkWeb 提前起系统原生层抢触摸与并发拉流）；
+  // 点击后才签名挂载唯一页内 <video>，收起 / 播完 / 抽屉打开时立即销毁原生层。
+  test("气泡附件视频(MediaItem)默认只渲封面、零签名请求；点击才挂带 playsinline 的 <video>", async () => {
+    const sign = makeSignMock();
+    const media: MediaRef[] = [{ kind: "video", url: "/api/media/clip.mp4", filename: "clip.mp4" }];
     const { container } = render(
-      <MediaSignProvider sign={makeSignMock()}>
+      <MediaSignProvider sign={sign}>
         <Media media={media} />
       </MediaSignProvider>,
     );
-    const video = await signedVideo(container);
+    expect(container.querySelector("video")).toBeNull();
+    expect(sign).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /播放视频 clip\.mp4/ }));
+    await waitFor(() => expect(container.querySelector("video")?.getAttribute("src")).toBe("/api/media-signed?t=v1"));
+    const video = container.querySelector("video") as HTMLVideoElement;
+    expect(sign).toHaveBeenCalledTimes(1);
     expect(video.hasAttribute("playsinline")).toBe(true);
+    expect(video.getAttribute("webkit-playsinline")).toBe("true");
+    expect(video.getAttribute("x5-playsinline")).toBe("true");
+    expect(video.getAttribute("preload")).toBe("metadata");
     expect(video.hasAttribute("autoplay")).toBe(false);
   });
 
-  test("markdown 内联成片(SignedVideo)丢弃透传的 autoPlay,playsInline 关不掉", async () => {
+  test("markdown 内联成片(SignedVideo)丢弃透传 autoPlay、playsInline 关不掉，且单实例互斥+可收起", async () => {
+    const sign = makeSignMock();
+    const path = "/home/agent/.openclaude/generated/film.mp4";
     const { container } = render(
-      <MediaSignProvider sign={makeSignMock()}>
-        <SignedVideo src="/home/agent/.openclaude/generated/film.mp4" autoPlay playsInline={false} />
+      <MediaSignProvider sign={sign}>
+        <SignedVideo src={path} autoPlay playsInline={false} />
+        <SignedVideo src={path} />
+        <SignedVideo src={path} />
       </MediaSignProvider>,
     );
-    const video = await signedVideo(container);
-    expect(video.hasAttribute("playsinline")).toBe(true);
-    expect(video.hasAttribute("autoplay")).toBe(false);
-    expect(video.autoplay).toBe(false);
+    expect(container.querySelectorAll("video")).toHaveLength(0);
+    expect(sign).not.toHaveBeenCalled();
+
+    const playButtons = screen.getAllByRole("button", { name: /播放视频 film\.mp4/ });
+    expect(playButtons).toHaveLength(3);
+
+    fireEvent.click(playButtons[0]!);
+    await waitFor(() => expect(container.querySelectorAll("video")).toHaveLength(1));
+    const first = container.querySelector("video") as HTMLVideoElement;
+    expect(first.hasAttribute("playsinline")).toBe(true);
+    expect(first.hasAttribute("autoplay")).toBe(false);
+    expect(first.autoplay).toBe(false);
+
+    // 点第二个同路径视频时，第一个立刻卸载，页面同时最多 1 个 <video>。
+    fireEvent.click(screen.getAllByRole("button", { name: /播放视频 film\.mp4/ })[0]!);
+    await waitFor(() => expect(container.querySelectorAll("video")).toHaveLength(1));
+
+    // 点收起视频立即卸载 <video>。
+    fireEvent.click(screen.getByRole("button", { name: "收起视频" }));
+    expect(container.querySelector("video")).toBeNull();
+  });
+
+  test("打开侧栏抽屉(aria-hidden)或播完(ended)时立即卸载 <video>，防止原生层挡住侧栏", async () => {
+    const { container } = render(
+      <div data-testid="app-root">
+        <MediaSignProvider sign={makeSignMock()}>
+          <SignedVideo src="/home/agent/.openclaude/generated/drawer.mp4" />
+        </MediaSignProvider>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /播放视频 drawer\.mp4/ }));
+    await waitFor(() => expect(container.querySelector("video")).not.toBeNull());
+
+    // 模拟 Radix Sheet/Dialog 打开侧栏抽屉时给背景树设置 aria-hidden="true"。
+    const appRoot = screen.getByTestId("app-root");
+    act(() => {
+      appRoot.setAttribute("aria-hidden", "true");
+    });
+    await waitFor(() => expect(container.querySelector("video")).toBeNull());
+
+    act(() => {
+      appRoot.removeAttribute("aria-hidden");
+    });
+    fireEvent.click(screen.getByRole("button", { name: /播放视频 drawer\.mp4/ }));
+    const video = await waitFor(() => {
+      const v = container.querySelector("video");
+      expect(v).not.toBeNull();
+      return v as HTMLVideoElement;
+    });
+    fireEvent.ended(video);
+    await waitFor(() => expect(container.querySelector("video")).toBeNull());
+    expect(screen.getByRole("button", { name: /重新播放视频 drawer\.mp4/ })).toBeInTheDocument();
+  });
+
+  test("video onError 强制重签一次，二次失败则收起成 HTML 错误卡不留坏原生层", async () => {
+    const sign = makeSignMock();
+    const { container } = render(
+      <MediaSignProvider sign={sign}>
+        <SignedVideo src="/home/agent/.openclaude/generated/retry.mp4" />
+      </MediaSignProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /播放视频 retry\.mp4/ }));
+    await waitFor(() => expect(container.querySelector("video")?.getAttribute("src")).toBe("/api/media-signed?t=v1"));
+
+    fireEvent.error(container.querySelector("video")!);
+    await waitFor(() => expect(container.querySelector("video")?.getAttribute("src")).toBe("/api/media-signed?t=v2"));
+    expect(sign).toHaveBeenCalledTimes(2);
+
+    fireEvent.error(container.querySelector("video")!);
+    await waitFor(() => expect(container.querySelector("video")).toBeNull());
+    expect(screen.getByRole("button", { name: /视频加载失败 retry\.mp4/ })).toBeInTheDocument();
   });
 });
 

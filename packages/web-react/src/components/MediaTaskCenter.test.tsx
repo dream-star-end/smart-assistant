@@ -467,6 +467,14 @@ describe('MediaTaskCenter', () => {
     const download = await screen.findByRole('link', { name: /下载 MP4/ })
     expect(download).toHaveAttribute('href', '/api/media-generation/jobs/done/result?ticket=signed')
     expect(screen.getByText('下载 MP4').closest('a')).toBe(download)
+    const video = document.querySelector('video') as HTMLVideoElement | null
+    expect(video).not.toBeNull()
+    expect(video?.hasAttribute('playsinline')).toBe(true)
+    expect(video?.getAttribute('webkit-playsinline')).toBe('true')
+    expect(video?.getAttribute('x5-playsinline')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: '收起预览' }))
+    expect(document.querySelector('video')).toBeNull()
+    expect(screen.getByRole('button', { name: '播放或下载结果' })).toBeInTheDocument()
     expect(fetch).toHaveBeenCalledWith(
       '/api/media-generation/jobs/done/result-ticket',
       expect.objectContaining({ method: 'POST' }),

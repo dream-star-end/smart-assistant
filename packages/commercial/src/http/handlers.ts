@@ -65,6 +65,7 @@ import {
   isMediaFilenameAllowed,
   extractApiMediaFilename,
   DEFAULT_SIGN_TTL_MS,
+  signTtlMsForPath,
 } from "./mediaSign.js";
 import { containerFileProxy } from "./containerFileProxy.js";
 import {
@@ -2727,19 +2728,21 @@ export async function handleMediaSign(
   // 由容器内 handleApiFile(realpathSync + agentCwds + blocklist + fd recheck)做。
   const userId = `c:${claims.sub}`;
 
-  const expMs = Date.now() + DEFAULT_SIGN_TTL_MS;
+  const fallbackExpMs = Date.now() + DEFAULT_SIGN_TTL_MS;
+  let minExpMs = Number.POSITIVE_INFINITY;
   const urls: Record<string, string> = {};
   for (const p of norm.paths) {
     const inboxAssetId = inboxAssetIdFromPath(p);
     if (inboxAssetId) {
       if (await canAccessInboxAsset(verified.id, verified.role, inboxAssetId)) {
-        const { url } = buildOpaqueInboxAssetUrl(
+        const { url, expMs: itemExp } = buildOpaqueInboxAssetUrl(
           deps.mediaSignKey,
           inboxAssetId,
           userId,
           DEFAULT_SIGN_TTL_MS,
         );
         urls[p] = url;
+        minExpMs = Math.min(minExpMs, itemExp);
       }
       continue;
     }
@@ -2747,8 +2750,15 @@ export async function handleMediaSign(
     // 存库历史消息里的裸 `/api/media/` URL 在渲染时经此归一为签名 URL,零数据迁移。
     const mediaFile = extractApiMediaFilename(p);
     if (mediaFile) {
-      const { url } = buildOpaqueMediaFileUrl(deps.mediaSignKey, mediaFile, userId, DEFAULT_SIGN_TTL_MS);
+      const ttlMs = signTtlMsForPath(mediaFile);
+      const { url, expMs: itemExp } = buildOpaqueMediaFileUrl(
+        deps.mediaSignKey,
+        mediaFile,
+        userId,
+        ttlMs,
+      );
       urls[p] = url;
+      minExpMs = Math.min(minExpMs, itemExp);
       continue;
     }
     let resolved: string;
@@ -2760,10 +2770,12 @@ export async function handleMediaSign(
     if (!isContainerPathAllowed(resolved)) continue;
     // sign 用 raw 输入 path(handler 端 decoded 后做 HMAC,verify 端
     // decodeURIComponent 后再算 HMAC,canonicalization 一致)
-    const { url } = buildOpaqueSignedUrl(deps.mediaSignKey, p, userId, DEFAULT_SIGN_TTL_MS);
+    const ttlMs = signTtlMsForPath(resolved);
+    const { url, expMs: itemExp } = buildOpaqueSignedUrl(deps.mediaSignKey, p, userId, ttlMs);
     urls[p] = url;
+    minExpMs = Math.min(minExpMs, itemExp);
   }
-  sendJson(res, 200, { urls, expMs });
+  sendJson(res, 200, { urls, expMs: Number.isFinite(minExpMs) ? minExpMs : fallbackExpMs });
 }
 
 /**
