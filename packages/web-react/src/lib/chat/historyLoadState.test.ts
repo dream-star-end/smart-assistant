@@ -2,7 +2,48 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
-import { sessionHistorySurface } from "./historyLoadState";
+import {
+  countSubstantiveHistoryMessages,
+  isSubstantiveHistoryMessage,
+  sessionHistorySurface,
+} from "./historyLoadState";
+
+describe("countSubstantiveHistoryMessages", () => {
+  test("settled permission cards and system/runtime-event orphans do not count as substantive history", () => {
+    expect(
+      countSubstantiveHistoryMessages([
+        { role: "permission", _resolved: true },
+        { role: "system" },
+        { role: "runtime-event" },
+      ]),
+    ).toBe(0);
+    expect(isSubstantiveHistoryMessage(null)).toBe(false);
+    expect(isSubstantiveHistoryMessage({})).toBe(false);
+  });
+
+  test("unresolved non-expired or controlPending permission cards still count as substantive", () => {
+    const now = 10_000;
+    expect(
+      isSubstantiveHistoryMessage({ role: "permission", _resolved: false, _askUserExpiresAt: now + 5_000 }, now),
+    ).toBe(true);
+    expect(
+      isSubstantiveHistoryMessage({ role: "permission", _resolved: true, _controlPending: true }, now),
+    ).toBe(true);
+    expect(
+      isSubstantiveHistoryMessage({ role: "permission", _resolved: false, _askUserExpiresAt: now - 1 }, now),
+    ).toBe(false);
+  });
+
+  test("real transcript rows mixed with settled permission cards count properly", () => {
+    expect(
+      countSubstantiveHistoryMessages([
+        { role: "user" },
+        { role: "permission", _resolved: true },
+        { role: "assistant" },
+      ]),
+    ).toBe(2);
+  });
+});
 
 describe("sessionHistorySurface", () => {
   test("GET 5xx + known non-empty session is error, never empty welcome", () => {

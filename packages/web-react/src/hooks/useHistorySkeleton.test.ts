@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
+  countSubstantiveHistoryMessages,
   HISTORY_SKELETON_CAP_MS,
   HISTORY_SKELETON_GRACE_MS,
   type HistorySkeletonInput,
@@ -125,5 +126,59 @@ describe("useHistorySkeleton", () => {
     const { result } = renderHook(() => useHistorySkeleton(base({ activeId: undefined })));
     expect(result.current).toEqual({ loadingHistory: false, historySurface: "empty" });
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("仅残余已完结历史 permission 孤儿卡：冷加载走整屏骨架，失败后走重试面，真消息到达切回 messages", () => {
+    vi.useFakeTimers();
+    const orphanCount = countSubstantiveHistoryMessages([
+      { role: "permission", _resolved: true },
+      { role: "system" },
+    ]);
+    expect(orphanCount).toBe(0);
+
+    const { result, rerender } = renderHook((p: HistorySkeletonInput) => useHistorySkeleton(p), {
+      initialProps: base({
+        serverListSettled: true,
+        sessions: [{ id: "sess-a", messageCount: 78 }],
+        wsMessageCount: orphanCount,
+        historyLoading: true,
+      }),
+    });
+    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton" });
+
+    // Even past CAP_MS while canonical GET is still in flight, keep skeleton rather than orphan card.
+    act(() => {
+      vi.advanceTimersByTime(HISTORY_SKELETON_CAP_MS);
+    });
+    expect(result.current).toEqual({ loadingHistory: true, historySurface: "skeleton" });
+
+    // When canonical GET settles with an error, expose retry error surface instead of hiding behind orphan card.
+    rerender(
+      base({
+        serverListSettled: true,
+        sessions: [{ id: "sess-a", messageCount: 78 }],
+        wsMessageCount: orphanCount,
+        historyLoading: false,
+        historyError: new Error("timeout"),
+      }),
+    );
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "error" });
+
+    // Once real transcript messages arrive, switch to messages immediately.
+    const mergedCount = countSubstantiveHistoryMessages([
+      { role: "user" },
+      { role: "permission", _resolved: true },
+      { role: "assistant" },
+    ]);
+    rerender(
+      base({
+        serverListSettled: true,
+        sessions: [{ id: "sess-a", messageCount: 78 }],
+        wsMessageCount: mergedCount,
+        historyLoading: false,
+        historyError: null,
+      }),
+    );
+    expect(result.current).toEqual({ loadingHistory: false, historySurface: "messages" });
   });
 });

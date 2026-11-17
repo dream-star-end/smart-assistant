@@ -103,7 +103,7 @@ import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { BootSplash } from "./components/BootSplash";
 import { useAgentGate } from "./hooks/useAgentGate";
-import { useHistorySkeleton } from "./hooks/useHistorySkeleton";
+import { countSubstantiveHistoryMessages, useHistorySkeleton } from "./hooks/useHistorySkeleton";
 import {
   type BoardViewParam,
   parseBoardView,
@@ -1426,7 +1426,7 @@ export function App() {
     activeId,
     sessions,
     gated,
-    wsMessageCount: wsMessages.length,
+    wsMessageCount: countSubstantiveHistoryMessages(wsMessages),
     wsSending,
     demoMessageCount: messages.length,
     demoBusy: busy,
