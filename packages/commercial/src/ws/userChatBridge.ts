@@ -7697,7 +7697,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnTraceIdCapture = turnTraceIdForFrame;
         const turnLogCapture = turnLogForFrame;
         const authorityModelCapture = authorityModelForFrame;
-        const classifiedCodexCapture = isCodexInboundFrame;
+        const classifiedCodexCapture = isCodexInboundFrame || isAntigravityInboundFrame;
         const ccbTurnIdentity = inboundTurnIdentityForFrame;
         trackPreparation(async () => {
           // M6:总括 try/catch —— CCB turn 无预扣/journal/槽(计费在 egress 逐请求结算),一切
