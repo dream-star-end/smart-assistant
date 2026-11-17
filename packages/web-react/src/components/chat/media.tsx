@@ -824,10 +824,7 @@ function InlineVideoPlayer(
   return (
     <div
       ref={wrapperRef}
-      className={cn(
-        "my-2 flex w-full max-w-md items-center gap-2 rounded-lg border bg-surface p-2",
-        phase === "error" ? "border-danger/40" : "border-border",
-      )}
+      className="my-2 flex w-full max-w-md items-center gap-2 rounded-lg border border-border bg-surface p-2"
     >
       <button
         type="button"
@@ -839,7 +836,7 @@ function InlineVideoPlayer(
         <span
           className={cn(
             "flex size-9 shrink-0 items-center justify-center rounded-full",
-            phase === "error" ? "bg-danger/10 text-danger" : "bg-accent-soft text-accent",
+            phase === "error" ? "bg-hover text-danger" : "bg-accent-soft text-accent",
           )}
         >
           {phase === "loading" ? (
@@ -851,7 +848,14 @@ function InlineVideoPlayer(
           )}
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-sm font-medium text-fg">{coverTitle}</span>
+          <span
+            className={cn(
+              "block truncate text-sm font-medium",
+              phase === "error" ? "text-danger" : "text-fg",
+            )}
+          >
+            {coverTitle}
+          </span>
           <span className="block truncate text-xs text-muted">{displayName} · 页内播放</span>
         </span>
       </button>
