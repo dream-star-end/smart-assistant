@@ -14,7 +14,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } fro
 import { assertAuthResponseCurrent, bearerHeaders, callWithRefresh } from '../lib/api'
 import type { AuthSession } from '../lib/types'
 import { Button, IconButton, Progress as ProgressBar, Sheet, useConfirm } from './ui'
-import { claimInlineVideoSlot, releaseInlineVideoSlot, teardownVideoElement } from './chat/media'
+import { claimInlineVideoSlot, releaseInlineVideoSlot, teardownVideoElement } from './chat/inlineVideoSlot'
 
 type JobsPage = { jobs: MediaGenerationJob[]; nextCursor: string | null }
 type ProjectsPage = { projects: VideoProject[]; nextCursor: string | null }

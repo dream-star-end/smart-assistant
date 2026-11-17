@@ -21,8 +21,9 @@ import { ImageEditActionsContext } from "./imageEditActions";
 import { Media, MediaSignProvider, SignedFileCard, SignedVideo, ZoomableImage } from "./media";
 import { loadBeforeAll } from "../../test/moduleLoad";
 
-// 点开图片后断言查看器内容:懒加载的 ImageViewer 先在用例窗口外取好(src/test/moduleLoad.ts)。
+// 点开图片/视频后断言查看器与活跃播放器内容:懒加载 chunk 先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(() => import("../ImageViewer"));
+loadBeforeAll(() => import("./InlineVideoActive"));
 
 afterEach(() => {
   cleanup();
