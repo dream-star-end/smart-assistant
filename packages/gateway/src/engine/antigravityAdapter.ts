@@ -1218,8 +1218,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private forceEnd(ctx: TurnContext): void {
     this.stopKeepalive(ctx)
-    ctx.deliveredSuccess = false
     if (ctx.terminal) return
+    ctx.deliveredSuccess = false
     ctx.terminal = true
     ctx.resolveSummary(null)
   }
@@ -1296,6 +1296,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         return
       }
     }
+    ctx.deliveredSuccess = false
     killProcessGroup(proc, 'SIGTERM')
     let closed = await waitForCloseWithin(barrier, grace)
     if (!closed) {

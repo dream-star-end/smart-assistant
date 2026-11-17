@@ -205,8 +205,11 @@ async function runTurn(
     sessionTotals: { totalCostUSD: 0, turns: 0 },
     toolUseIdToName: new Map(),
   })
+  // Mirror sessionTurnRunner: summary.then(finalizeTurn) calls detach() -> turn.end() in the first microtask.
+  const detached = run.summary.then(() => { run.end() })
   await run.submitted.catch(() => {})
   const summary = await run.summary
+  await detached
   await h.adapter.waitForOutputDrain()
   h.adapter.off('session_id', onSession)
   return { summary, events, sessionIds }
@@ -747,9 +750,10 @@ fs.writeFileSync(${JSON.stringify(seededCheckFile)}, JSON.stringify({
 const db = new Database(dbPath)
 db.pragma('journal_mode = WAL')
 db.exec('CREATE TABLE IF NOT EXISTS summaries (id TEXT PRIMARY KEY)')
-db.prepare('INSERT OR REPLACE INTO summaries (id) VALUES (?)').run(mode === 'fail' ? 'poisoned-turn' : 'clean-turn-1')
+const rowId = mode === 'fail' ? 'poisoned-turn' : mode === 'delayed-clean' ? 'clean-turn-2' : 'clean-turn-1'
+db.prepare('INSERT OR REPLACE INTO summaries (id) VALUES (?)').run(rowId)
 // Intentionally leave WAL uncheckpointed on exit to prove cleanup checkpoints before persisting.
-fs.writeFileSync(pbPath, mode === 'fail' ? 'pb-poisoned' : 'pb-clean-1')
+fs.writeFileSync(pbPath, mode === 'fail' ? 'pb-poisoned' : mode === 'delayed-clean' ? 'pb-clean-2' : 'pb-clean-1')
 process.stdin.setEncoding('utf8')
 let inputBuf = ''
 let sent = false
@@ -768,12 +772,15 @@ process.stdin.on('data', (chunk) => {
     process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'ok' } }) + '\\n')
   }
 })
-process.stdin.on('end', () => process.exit(mode === 'fail' ? 1 : 0))
+process.stdin.on('end', () => {
+  if (mode === 'delayed-clean') setTimeout(() => process.exit(0), 80)
+  else process.exit(mode === 'fail' ? 1 : 0)
+})
 `)
       await chmod(summaryWriterCli, 0o755)
       process.env.OC_ANTIGRAVITY_CLI_BIN = summaryWriterCli
 
-      // Turn 1 (clean): creates WAL-mode summary DB; cleanup must checkpoint & persist standalone .db + .pb.
+      // Turn 1 (clean, close-before-settle): creates WAL-mode summary DB; post-summary detach run.end() must keep deliveredSuccess.
       process.env.SUMMARY_TEST_MODE = 'clean'
       const t1 = await runTurn(h, 'tool-mcp.ndjson')
       assert.equal(t1.summary?.isError, false)
@@ -785,8 +792,11 @@ process.stdin.on('end', () => process.exit(mode === 'fail' ? 1 : 0))
       assert.equal((await readFile(stablePbPath, 'utf8')), 'pb-clean-1')
       const stableIno1 = (await stat(stableDbPath)).ino
 
-      // Turn 2 (clean): must receive seeded summary DB with clean-turn-1 on an isolated private inode.
+      // Turn 2 (clean, settle-timer-before-close + post-terminal run.end()): receives seeded DB on private inode and persists updated cache.
+      _internals.setTimingTestHooks({ resultSettleMs: 15 })
+      process.env.SUMMARY_TEST_MODE = 'delayed-clean'
       const t2 = await runTurn(h, 'tool-mcp.ndjson')
+      _internals.setTimingTestHooks(null)
       assert.equal(t2.summary?.isError, false)
       const check2 = JSON.parse(await readFile(seededCheckFile, 'utf8')) as {
         seededIds: string[]; seededIno: number | null; hasPb: boolean; pbText: string | null
@@ -794,6 +804,7 @@ process.stdin.on('end', () => process.exit(mode === 'fail' ? 1 : 0))
       assert.deepEqual(check2.seededIds, ['clean-turn-1'])
       assert.notEqual(check2.seededIno, stableIno1, 'launch HOME gets an isolated copy, never sharing SQLite file locks')
       assert.equal(check2.pbText, 'pb-clean-1')
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-2')
 
       // Turn 3 (failed exit 1): must NOT overwrite stable summary cache with poisoned data.
       process.env.SUMMARY_TEST_MODE = 'fail'
@@ -802,8 +813,8 @@ process.stdin.on('end', () => process.exit(mode === 'fail' ? 1 : 0))
       const verifyDb = new Database(stableDbPath, { readonly: true })
       const finalRows = verifyDb.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
       verifyDb.close()
-      assert.deepEqual(finalRows.map((r) => r.id), ['clean-turn-1'])
-      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-1')
+      assert.deepEqual(finalRows.map((r) => r.id), ['clean-turn-1', 'clean-turn-2'])
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-2')
 
       // Turn 4 (forceEnd via run.end() before exit 0): must NOT overwrite stable summary cache even when child exits 0.
       const forceEndCli = path.join(h.dir, 'force-end-cli.cjs')
@@ -842,9 +853,10 @@ setTimeout(() => process.exit(0), 120)
       const verifyAfterForceEnd = new Database(stableDbPath, { readonly: true })
       const rowsAfterForceEnd = verifyAfterForceEnd.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
       verifyAfterForceEnd.close()
-      assert.deepEqual(rowsAfterForceEnd.map((r) => r.id), ['clean-turn-1'])
-      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-1')
+      assert.deepEqual(rowsAfterForceEnd.map((r) => r.id), ['clean-turn-1', 'clean-turn-2'])
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-2')
     } finally {
+      _internals.setTimingTestHooks(null)
       Reflect.deleteProperty(process.env, 'SUMMARY_TEST_MODE')
       await h.restore()
     }
