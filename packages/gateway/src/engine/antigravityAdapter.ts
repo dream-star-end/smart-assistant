@@ -52,7 +52,7 @@ import { probeEnvFacts } from '../envProbe.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
-import { buildPromptContext } from '../promptSlots.js'
+import { buildPromptContext, memoryInstructionsFingerprint } from '../promptSlots.js'
 import { prepareBoundedPrompt } from './boundedPrompt.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import { bindRouteTrace } from '../relayTrace.js'
@@ -732,14 +732,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         ctx.nativeBinding?.baseline !== undefined &&
         ctx.projection
       ) {
-        writeAntigravityPromptState(ctx.projection.root, {
-          v: 1,
-          sessionKey: this.opts.sessionKey,
-          conversationId: ctx.conversationId,
-          inputsKey: ctx.promptInputsKey,
-          injectedAfterBaseline: ctx.nativeBinding.baseline,
-          updatedAt: Date.now(),
-        })
+        try {
+          writeAntigravityPromptState(ctx.projection.root, {
+            v: 1,
+            sessionKey: this.opts.sessionKey,
+            conversationId: ctx.conversationId,
+            inputsKey: ctx.promptInputsKey,
+            injectedAfterBaseline: ctx.nativeBinding.baseline,
+            updatedAt: Date.now(),
+          })
+        } catch {
+          // Best-effort cache state must never block launch cleanup or drain resolution.
+        }
       }
       this.cleanupLaunch(ctx, { persistSummaryCache })
       ctx.resolveDrain?.()
@@ -815,6 +819,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         promptPolicyFingerprint: platform.promptPolicyFingerprint,
         frozenProjectContext: platform.frozenProjectContext,
         applied: platform.applied,
+        memoryInstructionsFingerprint: memoryInstructionsFingerprint(this.opts.agentId),
       })
       log.info('prompt_context_built', {
         sessionKey: this.opts.sessionKey,

@@ -25,7 +25,12 @@ import {
   _internals,
   validateAntigravityRoute,
 } from '../engine/antigravityAdapter.js'
-import { ANTIGRAVITY_COMPACTION_STEP_TYPE, readAntigravityPromptState } from '../engine/antigravityPromptState.js'
+import {
+  ANTIGRAVITY_COMPACTION_STEP_TYPE,
+  buildAntigravityPromptInputsKey,
+  readAntigravityPromptState,
+  writeAntigravityPromptState,
+} from '../engine/antigravityPromptState.js'
 import { prepareAntigravityNativeTrajectory } from '../engine/antigravityNativeTrajectory.js'
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
 import { resetEnvFactsCache } from '../envProbe.js'
@@ -2072,8 +2077,62 @@ process.stdin.on('end', () => process.exit(Number(process.env.FAKE_AGY_EXIT_CODE
       assert.notEqual(readAntigravityPromptState(agyRoot, 'agent:main:webchat:dm:ocv5-781-gates'), null)
       adapter.clearSessionId()
       assert.equal(readAntigravityPromptState(agyRoot, 'agent:main:webchat:dm:ocv5-781-gates'), null)
+
+      // 6. State-dir write failure (e.g. prompt-state obstructed by regular file -> ENOTDIR on mkdirSync)
+      // must NEVER abort closeTurn cleanup, hang waitForOutputDrain, or retain active turn lock.
+      await rm(path.join(agyRoot, 'prompt-state'), { recursive: true, force: true })
+      await writeFile(path.join(agyRoot, 'prompt-state'), 'not-a-directory', 'utf8')
+      const obstructed = await submit('t7-obstructed-state-dir')
+      assert.equal(obstructed.summary?.isError, false)
+      assert.equal(adapter.isRunning, false, 'active turn lock must be released even when prompt-state write fails')
+      assert.deepEqual(await readdir(path.join(agyRoot, 'launch')), [], 'launch HOME must still be cleaned up')
+      const nextAfterObstructed = await submit('t8-still-runnable')
+      assert.equal(nextAfterObstructed.summary?.isError, false)
+      assert.match(nextAfterObstructed.content, /^# OpenClaude Platform Context \(Antigravity adapter\)/)
     } finally {
       await h.restore()
     }
+  })
+})
+
+describe('Antigravity prompt state hardening (OCV5-781 audit)', () => {
+  test('state persistence failure is swallowed so turn teardown can finish', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-agy-state-'))
+    try {
+      const blocker = path.join(dir, 'not-a-dir')
+      await writeFile(blocker, 'x', 'utf8')
+      assert.doesNotThrow(() => writeAntigravityPromptState(blocker, {
+        v: 1,
+        sessionKey: 'agent:main:webchat:dm:state-fail',
+        conversationId: '9c2f4187-e96d-4840-8c1c-3de86f92aa01',
+        inputsKey: 'a'.repeat(64),
+        injectedAfterBaseline: 1,
+        updatedAt: Date.now(),
+      }))
+      assert.equal(readAntigravityPromptState(blocker, 'agent:main:webchat:dm:state-fail'), null)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('inputsKey changes when memory rules change but not when only the memory index churns', () => {
+    const base = {
+      agentId: 'main',
+      cwd: '/w',
+      cwdSource: 'default',
+      availableMcpTools: ['a'],
+      applied: [
+        { name: 'MEMORY', bytes: 10, sha256: '1'.repeat(64) },
+        { name: 'TOOLS', bytes: 10, sha256: '2'.repeat(64) },
+      ],
+      memoryInstructionsFingerprint: 'rules-v1',
+    }
+    const k1 = buildAntigravityPromptInputsKey(base)
+    const indexChurn = buildAntigravityPromptInputsKey({
+      ...base,
+      applied: [{ name: 'MEMORY', bytes: 99, sha256: '9'.repeat(64) }, base.applied[1]],
+    })
+    assert.equal(indexChurn, k1)
+    assert.notEqual(buildAntigravityPromptInputsKey({ ...base, memoryInstructionsFingerprint: 'rules-v2' }), k1)
   })
 })

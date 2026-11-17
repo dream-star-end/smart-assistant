@@ -52,7 +52,8 @@ export const ANTIGRAVITY_COMPACTION_STEP_TYPE = 23
 const STATE_KEEP_MS = 7 * 24 * 60 * 60_000
 
 /** Slots whose change alters active instructions/capabilities and requires re-injection.
- *  Excludes `ENV` (container snap SHA), `MEMORY`, `PROJECT_MEMORY`, and `SKILLS` index churn. */
+ *  Excludes `ENV` (container snap SHA), `MEMORY` (rules fingerprinted separately; index churns),
+ *  `PROJECT_MEMORY`, and `SKILLS` index churn. */
 const INSTRUCTION_SLOT_NAMES = new Set([
   'SOUL',
   'USER',
@@ -83,6 +84,8 @@ export interface AntigravityPromptInputsKeyArgs {
   promptPolicyFingerprint?: string
   frozenProjectContext?: unknown
   applied: readonly PromptSlotApplied[]
+  /** Fingerprint of the MEMORY rules (index churn excluded). */
+  memoryInstructionsFingerprint?: string | null
 }
 
 export interface AntigravityInjectedContextState {
@@ -162,6 +165,7 @@ export function buildAntigravityPromptInputsKey(args: AntigravityPromptInputsKey
       args.promptPolicyFingerprint ?? null,
       args.frozenProjectContext ?? null,
       instructionSlots,
+      args.memoryInstructionsFingerprint ?? null,
     ]),
   )
 }
@@ -224,10 +228,10 @@ export function writeAntigravityPromptState(
   now = Date.now(),
 ): void {
   const dir = path.join(antigravityRootDir, STATE_DIR)
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
   const target = stateFilePath(antigravityRootDir, state.sessionKey)
   const tmp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
     writeFileSync(tmp, `${JSON.stringify(state)}\n`, { encoding: 'utf8', mode: 0o600 })
     chmodSync(tmp, 0o600)
     renameSync(tmp, target)

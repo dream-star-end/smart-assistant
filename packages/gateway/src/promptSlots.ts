@@ -928,6 +928,16 @@ function renderMemoryInstructions(args: { memoryDir: string; memoryMd: string; u
     .replaceAll('{{USER_MD}}', () => args.userMd)
 }
 
+/** sha256 of the rendered memory rules only (excludes the churning index). */
+export function memoryInstructionsFingerprint(agentId: string): string {
+  const text = renderMemoryInstructions({
+    memoryDir: paths.agentMemoryDir(agentId),
+    memoryMd: paths.agentMemoryMd(agentId),
+    userMd: paths.sharedUserMd,
+  })
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
 export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot> {
   const parts = await buildMemorySlotParts(ctx)
   return parts.index
