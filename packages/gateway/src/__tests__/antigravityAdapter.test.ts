@@ -78,6 +78,9 @@ function replay() {
     hostLink: fs.existsSync(process.env.HOME + '/.oc-host-bin/host') ? fs.readlinkSync(process.env.HOME + '/.oc-host-bin/host') : null,
     conversationsIsLink: fs.lstatSync(process.env.HOME + '/.gemini/antigravity-cli/conversations').isSymbolicLink(),
   }))
+  if (process.env.FAKE_AGY_WRITE_SUMMARY_PB) {
+    fs.writeFileSync(process.env.HOME + '/.gemini/antigravity-cli/jetbox_summaries_proto.pb', process.env.FAKE_AGY_WRITE_SUMMARY_PB)
+  }
   if (process.env.FAKE_AGY_STDERR) process.stderr.write(fs.readFileSync(process.env.FAKE_AGY_STDERR, 'utf8'))
   if (process.env.FAKE_AGY_HANG === '1') { setInterval(() => {}, 1000); return }
   if (process.env.FAKE_AGY_STREAM_FILE) {
@@ -800,6 +803,46 @@ process.stdin.on('end', () => process.exit(mode === 'fail' ? 1 : 0))
       const finalRows = verifyDb.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
       verifyDb.close()
       assert.deepEqual(finalRows.map((r) => r.id), ['clean-turn-1'])
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-1')
+
+      // Turn 4 (forceEnd via run.end() before exit 0): must NOT overwrite stable summary cache even when child exits 0.
+      const forceEndCli = path.join(h.dir, 'force-end-cli.cjs')
+      const readyMarker = path.join(h.dir, 'force-end-ready')
+      await writeFile(forceEndCli, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const Database = require(${JSON.stringify(sqliteModulePath)})
+const cliDir = path.join(process.env.HOME, '.gemini', 'antigravity-cli')
+const db = new Database(path.join(cliDir, 'conversation_summaries.db'))
+db.exec('CREATE TABLE IF NOT EXISTS summaries (id TEXT PRIMARY KEY)')
+db.prepare('INSERT OR REPLACE INTO summaries (id) VALUES (?)').run('force-ended-turn')
+db.close()
+fs.writeFileSync(path.join(cliDir, 'jetbox_summaries_proto.pb'), 'pb-force-ended')
+fs.writeFileSync(${JSON.stringify(readyMarker)}, '1')
+setTimeout(() => process.exit(0), 120)
+`)
+      await chmod(forceEndCli, 0o755)
+      process.env.OC_ANTIGRAVITY_CLI_BIN = forceEndCli
+      const run4 = h.adapter.submitTurn({
+        input: 'force end check',
+        requestId: 'd'.repeat(32),
+        assistantMessageId: 'asst-4',
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run4.submitted
+      for (let i = 0; i < 100 && !existsSync(readyMarker); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(existsSync(readyMarker), true)
+      run4.end()
+      assert.equal(await run4.summary, null)
+      await h.adapter.waitForOutputDrain()
+      const verifyAfterForceEnd = new Database(stableDbPath, { readonly: true })
+      const rowsAfterForceEnd = verifyAfterForceEnd.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
+      verifyAfterForceEnd.close()
+      assert.deepEqual(rowsAfterForceEnd.map((r) => r.id), ['clean-turn-1'])
       assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-1')
     } finally {
       Reflect.deleteProperty(process.env, 'SUMMARY_TEST_MODE')
@@ -1608,6 +1651,7 @@ describe('Antigravity verified recovery lifecycle', () => {
       } })
       try {
         h.adapter.setAntigravityRoute(ROUTE)
+        process.env.FAKE_AGY_WRITE_SUMMARY_PB = `retired-${retiredBy}`
         process.env.FAKE_AGY_FIXTURE = await writeResult(h)
         const events: EngineEvent[] = []
         const billing: any[] = []
@@ -1625,6 +1669,8 @@ describe('Antigravity verified recovery lifecycle', () => {
         await h.adapter.waitForOutputDrain()
         assert.equal(summary?.assistantText ?? '', '')
         assert.equal(events.filter(e => e.kind === 'block').length, 0)
+        const stablePb = path.join(h.dir, 'openclaude-home', 'antigravity-cli', 'home', '.gemini', 'antigravity-cli', 'jetbox_summaries_proto.pb')
+        assert.equal(existsSync(stablePb), false, `${retiredBy} during recovery must not persist summary cache`)
         if (retiredBy === 'cancel') {
           assert.equal(summary?.stopReason, 'interrupted')
           assert.equal(billing.length, 1)
@@ -1633,7 +1679,7 @@ describe('Antigravity verified recovery lifecycle', () => {
           assert.equal(summary, null)
           assert.equal(billing.length, 0)
         }
-      } finally { release(); await h.adapter.shutdown(); await h.restore() }
+      } finally { Reflect.deleteProperty(process.env, 'FAKE_AGY_WRITE_SUMMARY_PB'); release(); await h.adapter.shutdown(); await h.restore() }
     })
   }
 

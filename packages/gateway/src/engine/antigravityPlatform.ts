@@ -249,7 +249,10 @@ function linkShared(target: string, link: string): void {
 function readBoundedRegularFile(src: string, opts: { requireSqliteHeader: boolean }): Buffer | null {
   let fd: number | null = null
   try {
-    const flags = fsConstants.O_RDONLY | (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
+    const flags =
+      fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0) |
+      (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0)
     fd = openSync(src, flags)
     const st = fstatSync(fd)
     if (!st.isFile() || st.size <= 0 || st.size > SUMMARY_CACHE_MAX_BYTES) return null
@@ -311,10 +314,19 @@ function checkpointSqliteWalIfPresent(dbPath: string): boolean {
     const dbStat = lstatSync(dbPath)
     if (!dbStat.isFile() || dbStat.size <= 0 || dbStat.size > SUMMARY_CACHE_MAX_BYTES) return false
     const db = new Database(dbPath, { fileMustExist: true, timeout: 1000 })
+    let rows: Array<{ busy?: unknown; log?: unknown; checkpointed?: unknown }>
     try {
-      db.pragma('wal_checkpoint(TRUNCATE)')
+      rows = db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy?: unknown; log?: unknown; checkpointed?: unknown }>
     } finally {
       db.close()
+    }
+    const row = Array.isArray(rows) ? rows[0] : undefined
+    if (!row || row.busy !== 0) return false
+    if (typeof row.log !== 'number' || typeof row.checkpointed !== 'number') return false
+    if (row.log >= 0 && row.checkpointed !== row.log) return false
+    if (existsSync(walPath)) {
+      const afterWal = lstatSync(walPath)
+      if (!afterWal.isFile() || afterWal.size !== 0) return false
     }
     return true
   } catch {
