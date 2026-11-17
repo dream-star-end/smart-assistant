@@ -50,6 +50,7 @@ import {
   ANTIGRAVITY_ENGINE_MODEL_IDS,
   antigravityAllowedUpstreamModels,
   antigravityCliModelId,
+  antigravityDirectoryUpstreamModels,
   isAntigravityEngineModel,
 } from '../engineModels.js'
 
@@ -664,18 +665,23 @@ describe('Gemini 4 Hydrogen account-verified CLI model authority (OCV5-768)', ()
   })
 })
 
-describe('Orchestrator Carbon account-verified CLI model authority (OCV5-769)', () => {
-  test('fixed default maps to gemini-pro-orchestrator with empty efforts and cross-family isolation', () => {
+describe('Orchestrator Carbon account-verified CLI model authority (OCV5-769 / OCV5-783)', () => {
+  test('fixed default maps to gemini-pro-orchestrator, allows gemini-flash-worker-agy on relay only, and preserves cross-family isolation', () => {
     assert.equal(antigravityCliModelId('antigravity-orchestrator-carbon', undefined), 'gemini-pro-orchestrator')
     assert.equal(antigravityCliModelId('antigravity-orchestrator-carbon', 'high'), 'gemini-pro-orchestrator')
     assert.deepEqual(modelReasoningPolicy('antigravity-orchestrator-carbon').supported, [])
+    assert.deepEqual(antigravityDirectoryUpstreamModels('antigravity-orchestrator-carbon'), [
+      'gemini-pro-orchestrator',
+    ])
     assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-orchestrator-carbon'), [
       'gemini-pro-orchestrator',
+      'gemini-flash-worker-agy',
       'gemini-3.5-flash-lite',
     ])
-    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-carbon').some((m) => m.includes('orchestrator')), false)
-    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-hydrogen').some((m) => m.includes('orchestrator')), false)
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-carbon').some((m) => m.includes('orchestrator') || m.includes('worker-agy')), false)
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-hydrogen').some((m) => m.includes('orchestrator') || m.includes('worker-agy')), false)
     assert.equal(isAntigravityEngineModel('antigravity-orchestrator-carbon'), true)
     assert.equal(isAntigravityEngineModel('gemini-pro-orchestrator'), false)
+    assert.equal(isAntigravityEngineModel('gemini-flash-worker-agy'), false)
   })
 })

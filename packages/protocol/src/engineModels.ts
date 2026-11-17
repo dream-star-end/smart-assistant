@@ -327,6 +327,10 @@ export const ANTIGRAVITY_CLI_VERSION = '1.5.8'
  * conversation. It is NOT included in the CLI's own `result.usage`, so CLI
  * usage alone under-bills. */
 export const ANTIGRAVITY_AUX_UPSTREAM_MODELS = ['gemini-3.5-flash-lite'] as const
+/** Internal Hydrogen execution worker (`MODEL_PLACEHOLDER_M669`) dispatched by
+ * `--model gemini-pro-orchestrator` when offloading routine steps (OCV5-783 live probe).
+ * Allowed on the Orchestrator relay route, but not a standalone `fetchAvailableModels` entry. */
+export const ANTIGRAVITY_ORCHESTRATOR_WORKER_UPSTREAM_MODELS = ['gemini-flash-worker-agy'] as const
 export const ANTIGRAVITY_ENGINE_MODELS = [
   {
     id: 'antigravity-gemini-3.8-flash',
@@ -383,6 +387,7 @@ export const ANTIGRAVITY_ENGINE_MODELS = [
     efforts: [],
     defaultEffort: 'default',
     cliModels: { default: 'gemini-pro-orchestrator' },
+    workerModels: ANTIGRAVITY_ORCHESTRATOR_WORKER_UPSTREAM_MODELS,
     experimental: true,
   },
   {
@@ -436,11 +441,24 @@ export function antigravityCliModelId(
   return cliModels[level]
 }
 
+/** Directory-listed upstream model ids in `fetchAvailableModels` required for pool eligibility. */
+export function antigravityDirectoryUpstreamModels(modelId: string | undefined): readonly string[] {
+  const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
+  if (!entry) return []
+  return Object.values(entry.cliModels as Readonly<Record<string, string>>)
+}
+
 /** Upstream model names a relay may forward for this canonical id. */
 export function antigravityAllowedUpstreamModels(modelId: string | undefined): readonly string[] {
   const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
   if (!entry) return []
-  return [...Object.values(entry.cliModels as Readonly<Record<string, string>>), ...ANTIGRAVITY_AUX_UPSTREAM_MODELS]
+  const workerModels =
+    'workerModels' in entry ? (entry.workerModels as readonly string[]) : []
+  return [
+    ...Object.values(entry.cliModels as Readonly<Record<string, string>>),
+    ...workerModels,
+    ...ANTIGRAVITY_AUX_UPSTREAM_MODELS,
+  ]
 }
 
 /**

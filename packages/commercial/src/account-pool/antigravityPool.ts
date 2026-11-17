@@ -17,7 +17,7 @@
  * (antigravityModelCooldown.ts).
  */
 import type { Pool } from 'pg'
-import { ANTIGRAVITY_AUX_UPSTREAM_MODELS, antigravityAllowedUpstreamModels } from '@openclaude/protocol'
+import { antigravityDirectoryUpstreamModels } from '@openclaude/protocol'
 import type { AntigravityModelAvailability } from './antigravityQuota.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
@@ -84,7 +84,7 @@ export function antigravityAccountSupportsModel(models: AntigravityModelAvailabi
   // Preserve existing legacy accounts until their first background refresh.
   // Newly introduced Claude 5.5 must have affirmative directory evidence.
   if (!models) return modelId === 'antigravity-gemini-3.8-flash' || modelId === 'antigravity-gpt-oss-120b'
-  let ids = antigravityAllowedUpstreamModels(modelId).filter((id) => !(ANTIGRAVITY_AUX_UPSTREAM_MODELS as readonly string[]).includes(id))
+  let ids = [...antigravityDirectoryUpstreamModels(modelId)]
   if (modelId === 'antigravity-gemini-3.8-flash' && models['gemini-3.8-flash-tiered']) ids = ['gemini-3.8-flash-tiered']
   if (ids.length === 0) return false
   return ids.every((id) => {

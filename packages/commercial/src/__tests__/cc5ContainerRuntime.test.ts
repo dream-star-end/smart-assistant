@@ -822,6 +822,8 @@ for raw in sys.stdin:
                 knownHostsPath: '/unused',
                 driverId: 'cc',
                 engineId: 'cc',
+                controllerSha256,
+                upstreamModel,
                 taskRootPrefix: '/tmp/oc-drvtest-',
               },
             },
