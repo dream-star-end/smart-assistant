@@ -203,6 +203,7 @@ interface TurnContext {
   releaseRelayTrace: (() => void) | null
   sawOutput: boolean
   terminal: boolean
+  deliveredSuccess: boolean
   procClosed: boolean
   abandoned: boolean
   interrupted: boolean
@@ -403,6 +404,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       releaseRelayTrace: null,
       sawOutput: false,
       terminal: false,
+      deliveredSuccess: false,
       procClosed: false,
       abandoned: false,
       interrupted: false,
@@ -664,7 +666,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     } catch {
       if (!ctx.abandoned) this.finishError(ctx, 'ANTIGRAVITY_DELIVERY_FAILED: terminal delivery could not be verified')
     } finally {
-      const persistSummaryCache = code === 0 && !ctx.interrupted && !ctx.abandoned && ctx.errorDetail === null
+      const persistSummaryCache =
+        ctx.deliveredSuccess && code === 0 && !ctx.interrupted && !ctx.abandoned && ctx.errorDetail === null
       this.cleanupLaunch(ctx, { persistSummaryCache })
       ctx.resolveDrain?.()
       ctx.resolveDrain = null
@@ -1151,6 +1154,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       failed: ctx.errorDetail !== null,
     })
     const isError = ctx.errorDetail !== null
+    ctx.deliveredSuccess = !isError && !ctx.interrupted && !ctx.abandoned
     const stopReason = ctx.interrupted ? 'interrupted' : isError ? 'error' : 'end_turn'
     ctx.params.sessionTotals.turns += 1
     if (isError) ctx.params.onEvent({ kind: 'error', error: ctx.errorDetail! })
@@ -1214,6 +1218,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private forceEnd(ctx: TurnContext): void {
     this.stopKeepalive(ctx)
+    ctx.deliveredSuccess = false
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolveSummary(null)
@@ -1311,8 +1316,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     detail: string,
   ): void {
     this.stopKeepalive(ctx)
-    this.cleanupLaunch(ctx)
+    ctx.deliveredSuccess = false
     ctx.abandoned = true
+    this.cleanupLaunch(ctx)
     if (proc) detachChildStdio(proc)
     if (!ctx.terminal) this.finishError(ctx, detail)
     ctx.resolveDrain?.()

@@ -195,3 +195,90 @@ test('summary cache seeding skips symlinks and corrupt SQLite headers while copy
     }
   })
 })
+
+test('non-regular FIFO cache entries never block gateway event loop on seed or persist', async () => {
+  await withHome(async (root) => {
+    const stable = antigravityStableCliDir(path.join(root, 'antigravity-cli'))
+    await mkdir(stable, { recursive: true })
+    const fifoPath = path.join(stable, 'conversation_summaries.db')
+    const mk = spawnSync('mkfifo', [fifoPath], { encoding: 'utf8' })
+    assert.equal(mk.status, 0, mk.stderr)
+
+    const moduleUrl = new URL('../engine/antigravityPlatform.ts', import.meta.url).href
+    const tsxBin = path.resolve(process.cwd(), 'node_modules', '.bin', 'tsx')
+    const probe = spawnSync(
+      tsxBin,
+      [
+        '-e',
+        `import { spawnSync } from 'node:child_process';
+         import { existsSync, rmSync } from 'node:fs';
+         import path from 'node:path';
+         import { projectAntigravityPlatform, cleanupAntigravityLaunch } from ${JSON.stringify(moduleUrl)};
+         const t0 = Date.now();
+         const p = projectAntigravityPlatform({
+           credential: { accessToken: 'tok', accessTokenExpiresAt: '2026-12-01T00:00:00Z' },
+           agentId: 'main', sessionKey: 's', gatewayPort: 18789, gatewayToken: '', delegationDepth: 0, hostBin: null,
+         });
+         const cliDir = path.join(p.launchHome, '.gemini', 'antigravity-cli');
+         const seeded = existsSync(path.join(cliDir, 'conversation_summaries.db'));
+         rmSync(${JSON.stringify(fifoPath)}, { force: true });
+         spawnSync('mkfifo', [path.join(cliDir, 'conversation_summaries.db')]);
+         spawnSync('mkfifo', [path.join(cliDir, 'jetbox_summaries_proto.pb')]);
+         cleanupAntigravityLaunch(p, { persistSummaryCache: true });
+         const persistedFifo = existsSync(${JSON.stringify(fifoPath)});
+         const elapsedMs = Date.now() - t0;
+         if (seeded || persistedFifo || elapsedMs > 1000) {
+           console.error({ seeded, persistedFifo, elapsedMs });
+           process.exit(2);
+         }
+         console.log('FIFO_SKIPPED_OK elapsedMs=' + elapsedMs);`,
+      ],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, OPENCLAUDE_HOME: root },
+        timeout: 15_000,
+      },
+    )
+    assert.equal(probe.error, undefined, `FIFO seed/persist blocked and timed out: ${String(probe.error)}`)
+    assert.equal(probe.status, 0, probe.stderr)
+    assert.match(probe.stdout, /FIFO_SKIPPED_OK/)
+  })
+})
+
+test('persistSummaryCache refuses partial/busy WAL checkpoints and preserves prior stable cache', async () => {
+  await withHome(async (root) => {
+    const stable = antigravityStableCliDir(path.join(root, 'antigravity-cli'))
+    await mkdir(stable, { recursive: true })
+    const stableDbPath = path.join(stable, 'conversation_summaries.db')
+    const baseDb = new Database(stableDbPath)
+    baseDb.exec('CREATE TABLE summaries (id TEXT PRIMARY KEY); INSERT INTO summaries VALUES (\'baseline-clean\');')
+    baseDb.close()
+
+    const projection = projectAntigravityPlatform(input(null))
+    const launchDbPath = path.join(projection.launchHome, '.gemini', 'antigravity-cli', 'conversation_summaries.db')
+    // Frame 1 is visible to reader's snapshot; Frame 2 is written after reader's snapshot.
+    // PRAGMA wal_checkpoint(TRUNCATE) will checkpoint Frame 1 into the main DB file and return
+    // { busy: 1, log: 2, checkpointed: 1 } without truncating WAL. Persistence MUST reject this partial state.
+    const writer = new Database(launchDbPath)
+    writer.pragma('journal_mode = WAL')
+    writer.exec('CREATE TABLE extra_page (x TEXT PRIMARY KEY)')
+    writer.prepare('INSERT INTO summaries VALUES (?)').run('partial-frame-1')
+    const reader = new Database(launchDbPath, { readonly: true })
+    const iter = reader.prepare('SELECT id FROM summaries').iterate()
+    iter.next()
+    writer.prepare('INSERT INTO extra_page VALUES (?)').run('uncheckpointed-frame-2')
+    writer.close()
+
+    try {
+      cleanupAntigravityLaunch(projection, { persistSummaryCache: true })
+    } finally {
+      try { iter.return?.() } catch { /* ignore */ }
+      try { reader.close() } catch { /* launch dir removed */ }
+    }
+
+    const verify = new Database(stableDbPath, { readonly: true })
+    const rows = verify.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
+    verify.close()
+    assert.deepEqual(rows.map((r) => r.id), ['baseline-clean'])
+  })
+})
