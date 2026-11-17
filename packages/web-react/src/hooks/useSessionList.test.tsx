@@ -1209,4 +1209,28 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
     await act(async () => stale.resolve([meta("webkeepme001", "保留的会话")] as never));
     expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({ title: "office-1029pm", pinned: true });
   });
+
+  test("临时快问会话([快问] webqa_*)不进侧栏，转为正式对话后的 webqa_* 正常保留", async () => {
+    const { result } = await renderSessionList({ confirmResult: true, promptResult: null });
+    act(() => {
+      result.current.onHydrated([
+        { id: "webqa_temp0001", title: "[快问] 临时问题", agentId: "main", createdAt: 1000, lastAt: 2000, messages: [] },
+        { id: "webqa_prom0002", title: "已转为正式会话", agentId: "main", createdAt: 1000, lastAt: 2100, messages: [] },
+      ] as never);
+    });
+    expect(result.current.sessions.some((s) => s.id === "webqa_temp0001")).toBe(false);
+    expect(result.current.sessions.some((s) => s.id === "webqa_prom0002")).toBe(true);
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      meta("webkeepme001", "保留的会话"),
+      meta("webqa_temp0003", "[快问] 服务端未转正"),
+      meta("webqa_prom0004", "服务端已转正"),
+    ] as never);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webqa_prom0004")).toBe(true));
+    expect(result.current.sessions.some((s) => s.id === "webqa_temp0003")).toBe(false);
+  });
 });

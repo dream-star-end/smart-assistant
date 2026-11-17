@@ -45,6 +45,34 @@ export const ProjectHome = lazy(() =>
   import("./components/project/ProjectHome").then((m) => ({ default: m.ProjectHome })),
 );
 
+// 同屏伴随快问小窗:按需加载,失败时清缓存并重建 lazy 工厂以便重试恢复。
+type QuickAskModule = typeof import("./components/chat/QuickAskWindow");
+let loadedQuickAsk: QuickAskModule | null = null;
+let pendingQuickAsk: Promise<QuickAskModule> | null = null;
+function loadQuickAskModule(): Promise<QuickAskModule> {
+  if (!pendingQuickAsk) {
+    pendingQuickAsk = import("./components/chat/QuickAskWindow").then(
+      (mod) => {
+        loadedQuickAsk = mod;
+        return mod;
+      },
+      (err: unknown) => {
+        pendingQuickAsk = null;
+        QuickAskWindow = makeLazyQuickAskWindow();
+        throw err;
+      },
+    );
+  }
+  return pendingQuickAsk;
+}
+function makeLazyQuickAskWindow() {
+  return lazy(() => {
+    if (loadedQuickAsk) return Promise.resolve({ default: loadedQuickAsk.QuickAskWindow });
+    return loadQuickAskModule().then((mod) => ({ default: mod.QuickAskWindow }));
+  });
+}
+export let QuickAskWindow = makeLazyQuickAskWindow();
+
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
 // loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
 // 的动态 import 去重,预取后 React.lazy 解析即命中,首开零延迟;弱网下预取失败静默,

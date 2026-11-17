@@ -5,6 +5,7 @@ import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
+import { isHiddenQuickAskSession } from "../lib/quickAskSession";
 import type {
   AuthSession,
   Session,
@@ -100,10 +101,16 @@ function isAbortError(e: unknown): boolean {
  * 合并侧栏会话：union by id，按 updatedAt 倒序。`incomingWins` 决定重叠项谁覆盖元数据
  * （listSessions=server-wins=true；IndexedDB 注水=本地不覆盖既有=false）。
  */
-function upsertSessions(cur: Session[], incoming: Session[], incomingWins: boolean): Session[] {
+function upsertSessions(
+  cur: Session[],
+  incoming: Session[],
+  incomingWins: boolean,
+  keepId?: string,
+): Session[] {
   const map = new Map<string, Session>();
   for (const s of cur) map.set(s.id, s);
   for (const s of incoming) {
+    if (isHiddenQuickAskSession(s, keepId)) continue;
     const prev = map.get(s.id);
     map.set(s.id, prev ? (incomingWins ? { ...prev, ...s } : { ...s, ...prev }) : s);
   }
@@ -235,6 +242,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [activeId, setActiveId] = useState<string | undefined>(
     demo ? DEMO_SESSIONS[0].id : undefined,
   );
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   // 历史拉取守卫（S2）：语义从"整页生命周期只拉一次"改为"只防并发 + 短时重复"。
   //  - historyFetchingRef：正在拉取的会话（防并发重入）；
   //  - historyFetchedAtRef：上次拉取时刻，HISTORY_REFETCH_COOLDOWN_MS 内不重拉。
@@ -314,7 +323,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       const owner = user?.id;
       if (!owner || stored.length === 0) return;
       const local = stored.map((s) => storedToSession(s, owner));
-      setSessions((cur) => upsertSessions(cur, local, false));
+      setSessions((cur) => upsertSessions(cur, local, false, activeIdRef.current));
     },
     [user],
   );
@@ -574,7 +583,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           }
         }
         const server = mapListMetas(metas);
-        setSessions((cur) => upsertSessions(cur, server, true));
+        setSessions((cur) => upsertSessions(cur, server, true, activeIdRef.current));
         if (opts?.initial) {
           nextCursorRef.current = undefined;
           setHasMoreSessions(server.length > 0);
@@ -860,7 +869,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       });
       if (generation !== listGenerationRef.current) return;
       const incoming = mapListMetas(page.sessions);
-      setSessions((cur) => upsertSessions(cur, incoming, true));
+      setSessions((cur) => upsertSessions(cur, incoming, true, activeIdRef.current));
       nextCursorRef.current = page.nextCursor;
       setHasMoreSessions(page.nextCursor != null && incoming.length > 0);
       setLoadMoreError(false);
@@ -889,7 +898,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       });
       if (generation !== listGenerationRef.current) return;
       const incoming = mapListMetas(page.sessions);
-      setSessions((cur) => upsertSessions(cur, incoming, true));
+      setSessions((cur) => upsertSessions(cur, incoming, true, activeIdRef.current));
     } catch (e) {
       if (generation !== listGenerationRef.current) return;
       archivedFetchedRef.current = false;

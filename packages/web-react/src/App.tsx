@@ -244,7 +244,7 @@ type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 import {
   IdentityRecoveryNotice, AccountSwitchNotice, AuthGate, Landing, DesktopEnrollPage,
   TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, InspectorPanel,
-  InspectorPanelContent, ImageAnnotationEditor, ProjectHome,
+  InspectorPanelContent, ImageAnnotationEditor, ProjectHome, QuickAskWindow,
   prefetchLazyCentersOnIdle, SplashFallback, useMountedOnce,
 } from "./appLazyViews";
 export { prefetchLazyCentersOnIdle } from "./appLazyViews";
@@ -402,6 +402,18 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const quickAskSeedRef = useRef(0);
+  const [quickAsk, setQuickAsk] = useState<{
+    open: boolean;
+    mounted: boolean;
+    sending: boolean;
+    seed: { text: string; nonce: number } | null;
+  }>({ open: false, mounted: false, sending: false, seed: null });
+  const closeQuickAsk = useCallback(() => setQuickAsk((s) => (s.open ? { ...s, open: false } : s)), []);
+  const onQuickAskSending = useCallback(
+    (v: boolean) => setQuickAsk((s) => (s.sending === v ? s : { ...s, sending: v })),
+    [],
+  );
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [goalOpenNonce, setGoalOpenNonce] = useState(0);
   const [messageReplyTarget, setMessageReplyTarget] = useState<{
@@ -512,6 +524,7 @@ export function App() {
       sessionsResetRef.current(); // 清列表/选中/已拉历史标记,允许下次登录重新自动选中
       setMessages([]);
       setChatError(null);
+      setQuickAsk({ open: false, mounted: false, sending: false, seed: null });
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
       setMediaTasksOpen(false);
@@ -1268,10 +1281,15 @@ export function App() {
         e.preventDefault();
         paneToggleRef.current();
       }
+      if (action === "quickAsk") {
+        if (!inWorkspace || (!demo && !gate.access)) return;
+        e.preventDefault();
+        setQuickAsk((s) => ({ ...s, open: !s.open, mounted: true }));
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew, inWorkspace, demo, wsMessages.length, setBoardOpen]);
+  }, [handleNew, inWorkspace, demo, gate.access, wsMessages.length, setBoardOpen]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -2334,6 +2352,9 @@ export function App() {
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
           onShare={demo ? undefined : () => setShareOpen(true)}
+          onToggleQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: !s.open, mounted: true }))}
+          quickAskOpen={quickAsk.open}
+          quickAskSending={quickAsk.sending}
           onTogglePane={paneAvailable && !demo ? togglePane : undefined}
           paneOpen={paneShown}
           unreadCount={inbox.unreadCount}
@@ -2666,6 +2687,7 @@ export function App() {
             sendKey={composerPrefs.sendKey}
             fontSize={composerPrefs.fontSize}
             goalOpenRequest={goalOpenNonce}
+            onQuickAskCommand={gated ? undefined : (q) => setQuickAsk((s) => ({ ...s, open: true, mounted: true, seed: { text: q, nonce: ++quickAskSeedRef.current } }))}
             projectSlot={
               // 仍是未发首条的草稿时可改归属:包括被 GitHub/目标提前物化成空会话行的草稿。
               activeId && !sessions.some((x) => x.id === activeId && x.messageCount === 0 && !x.projectId) ? undefined : (
@@ -2889,54 +2911,21 @@ export function App() {
             signatureWorkId={tutorialWork}
             onSignatureWorkChange={setTutorialWork}
             stepIndex={tutorialStep}
-            onTopicChange={(id) => {
-              // 用户自己换篇：深链带来的目标步骤不再适用。
-              if (id !== tutorialTopic) setTutorialStep(null);
-              setTutorialTopic(id);
-              setTutorialCase(null);
-              setTutorialCommunity(null);
-            }}
-            onCaseChange={(id) => {
-              setTutorialCase(id);
-              setTutorialTopic(null);
-              setTutorialCommunity(null);
-              setTutorialStep(null);
-            }}
-            onShowCaseGallery={() => {
-              setTutorialCase(null);
-              setTutorialTopic(null);
-              setTutorialCommunity(null);
-              setTutorialStep(null);
-            }}
-            onCommunityChange={(id) => {
-              setTutorialCommunity(id);
-              if (id) {
-                setTutorialTopic(null);
-                setTutorialCase(null);
-                setTutorialStep(null);
-              }
-            }}
+            onTopicChange={(id) => { if (id !== tutorialTopic) setTutorialStep(null); setTutorialTopic(id); setTutorialCase(null); setTutorialCommunity(null); }}
+            onCaseChange={(id) => { setTutorialCase(id); setTutorialTopic(null); setTutorialCommunity(null); setTutorialStep(null); }}
+            onShowCaseGallery={() => { setTutorialCase(null); setTutorialTopic(null); setTutorialCommunity(null); setTutorialStep(null); }}
+            onCommunityChange={(id) => { setTutorialCommunity(id); if (id) { setTutorialTopic(null); setTutorialCase(null); setTutorialStep(null); } }}
             caseActionLabel="带着指令去对话"
             onRunCase={runTutorialCase}
             userId={user?.id ?? null}
             auth={auth}
-            onRequireLogin={() => {
-              setAuthMode("login");
-            }}
+            onRequireLogin={() => setAuthMode("login")}
             activeSessionId={activeId ?? null}
             sessionMessages={wsMessages}
             sending={sending}
-            sessionTitle={
-              activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? ""
-            }
+            sessionTitle={activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? ""}
             sessionProjectId={sessions.find((session) => session.id === activeId)?.projectId ?? null}
-            onClose={() => {
-              setTutorialOpen(false);
-              setTutorialCommunity(null);
-              setTutorialTab(null);
-              setTutorialWork(null);
-              setTutorialStep(null);
-            }}
+            onClose={() => { setTutorialOpen(false); setTutorialCommunity(null); setTutorialTab(null); setTutorialWork(null); setTutorialStep(null); }}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}
           />
@@ -2945,6 +2934,27 @@ export function App() {
       {confirmDialogEl}
       {stopShortcutDialog}
       {promptTextEl}
+      {quickAsk.mounted && inWorkspace && !gated && (
+        <LazyBoundary key={user?.id ?? "anon"} fallback={null}>
+          <QuickAskWindow
+            open={quickAsk.open} onClose={closeQuickAsk} onSendingChange={onQuickAskSending} seed={quickAsk.seed}
+            chat={chat} authRef={authRef} user={user} demo={demo} agent={agent} models={models} mainlineModelId={modelId}
+            authorizeSwitch={demo ? undefined : authorizeSwitch}
+            mainlineTitle={activeSess?.title ?? sessions.find((s) => s.id === activeId)?.title}
+            mainlineGoalObjective={activeSess?.goalState?.objective} mainlineMessages={wsMessages}
+            rightOffsetPx={paneInline ? paneWidth.width + 16 : 16} isMdViewport={isMdViewport}
+            onPromoteSession={(sess, demoMsgs) => {
+              if (demo && demoMsgs) {
+                const mapped: Message[] = demoMsgs.map((m) => ({ id: m.id, role: m.role === "user" ? "user" : "assistant", content: m.text, createdAt: new Date(m.ts).toISOString() }));
+                localStore.current.set(sess.id, mapped);
+                setMessages(mapped);
+              }
+              setSessions((cur) => [sess, ...cur.filter((x) => x.id !== sess.id)]);
+              setActiveId(sess.id); setBoardOpen(false); setProjectHome(null); closeQuickAsk();
+            }}
+          />
+        </LazyBoundary>
+      )}
       {/* 圈选编辑器是懒块:有 source 才挂载(编辑器自身在 !open 时即重置全部状态、无退场动画,
           条件挂载与原先常驻+open 显隐等价);关闭即卸载,下次打开走已缓存的模块。 */}
       {imageAnnotationSource && (
