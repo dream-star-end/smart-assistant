@@ -10950,6 +10950,40 @@
           "assertion": "OCV5-778: short landscape touch viewport keeps ProjectRow「新建会话」visible and scrollable inside viewport (INC-20261117-DROPDOWN-SHORT-VIEWPORT-CLIP)"
         }
       ]
+    },
+    {
+      "id": "INC-20261117-REMOTE-V4-DRAIN-CC-AUTH",
+      "occurredAt": "2026-11-17",
+      "severity": "P1",
+      "symptom": "个人版 V5 selfhost 会话 webmwk009zzlm101z（claude-opus-5-5-remote）：(1) 远端节点 cc5-att-us 上 Claude Code CLI 返回 <synthetic> is_api_error_message 账号验证拦截（Anthropic Verification Portal），cc.py 未提取合成错误正文且硬编码 CC_TURN_EXECUTION_ERROR，RemoteEngineAdapter 落盘为可自动恢复的 ENGINE_ERROR 导致盲目触发 10 次断点续跑直至 automatic_retry_exhausted；(2) RemotePoolRelay.settleTerminal() 与 abandon() 未清除单轮 turn lease 定时器且未重置 localStopped=true，导致任意正常结束的 v4 回合在约 60 秒后自发触发 REMOTE_LEASE_EXPIRED 并在 waitLocalStop() 超时卡住（stopProven=false、relay.idle=false），阻塞发布列车 tr-20261117T024116Z-147ec13eb16b 切流并报 REMOTE_RELEASE_DRAIN_TIMEOUT。",
+      "rootFixCommit": "71ec7c0a",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/remotePoolDrainAndCcAuthProof.test.ts",
+          "assertion": "synthetic CC verification_required API error classifies as non-recoverable AUTH_ERROR and settled turn clears lease timer + localStopped for clean cutover drain (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/remotePoolDrainAndCcAuthProof.test.ts",
+          "assertion": "undispatched /abandon resets localStopped for clean idle teardown and late /tool/stopped re-drives stop() closure (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/remotePoolDrainAndCcAuthProof.test.ts",
+          "assertion": "cross-window 20-turn mixed replay preserves synthetic errorCode without conflict while tampered duplicate fences with REMOTE_TERMINAL_CONFLICT (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cc5ContainerRuntime.test.ts",
+          "assertion": "v4 RemotePoolRelay settled turn clears lease timer so drainForCutover passes past TTL and idle fence auto-releases (OCV5-780)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "synthetic CC verification_required API error classifies as non-recoverable AUTH_ERROR and settled turn clears lease timer + localStopped for clean cutover drain (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)"
+        }
+      ]
     }
   ]
 }
