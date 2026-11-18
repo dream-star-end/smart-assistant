@@ -39,7 +39,6 @@ BEGIN
   END IF;
 END $$;
 
-DROP INDEX IF EXISTS idx_user_sites_custom_domain_unique;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sites_custom_domain_verified_unique
   ON user_sites (custom_domain)
   WHERE custom_domain IS NOT NULL AND custom_domain_verified = TRUE;
