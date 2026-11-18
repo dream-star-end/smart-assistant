@@ -26,7 +26,7 @@ import {
 } from '@openclaude/protocol'
 import { remotePoolNeed } from './types.js'
 
-const MAX_LINE_BYTES = 2 * 1024 * 1024
+const MAX_LINE_BYTES = 24 * 1024 * 1024
 const MAX_INFLIGHT = 64
 const DEFAULT_TIMEOUT_MS = 10_000
 

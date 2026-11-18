@@ -6,8 +6,8 @@
       "driverId": "codex",
       "engineId": "codex",
       "driverDigest": "9084f49f290f1373bca3411c361f6a9df7a3e73d20714ef9685f50d0e532eb02",
-      "coreDigest": "cc94b10f9e5047f9a54c06c365192ed3deb348c99056f44724c60dcc1dc2f507",
-      "controllerSha256": "8f033bb62e37fd726cdd7e9a3abd89eb4c28841f1e237259086a31bd6b34e320",
+      "coreDigest": "4991e0b78abe1516d4ddc1bca60e524e295f1e76cbfa5b3349b49f75139d8744",
+      "controllerSha256": "e6eb9f3e3ba0bb7bfe791ac2863a4efb793ba86a78a6e3fe8176c8765812bcb5",
       "policySha256": "c60d5a823a66d0dfc271fa601424dbb644a3bb80d69e6562768e67d33bb85aac",
       "requirements": [
         {
@@ -63,9 +63,9 @@
     "cc": {
       "driverId": "cc",
       "engineId": "cc",
-      "driverDigest": "4f9ad3c9f60af5fcd33ed42403744e02c00f2800698a38cf9ed529c9b9b78944",
-      "coreDigest": "cc94b10f9e5047f9a54c06c365192ed3deb348c99056f44724c60dcc1dc2f507",
-      "controllerSha256": "8f033bb62e37fd726cdd7e9a3abd89eb4c28841f1e237259086a31bd6b34e320",
+      "driverDigest": "9e7bd0479218633b430dddbd6ca0af259020b88c6b59534d03b49fb333d37680",
+      "coreDigest": "4991e0b78abe1516d4ddc1bca60e524e295f1e76cbfa5b3349b49f75139d8744",
+      "controllerSha256": "e6eb9f3e3ba0bb7bfe791ac2863a4efb793ba86a78a6e3fe8176c8765812bcb5",
       "policySha256": "8a160f9bc7294bee227e650bbab07463650c173b5fd373dae3677f7349f34416",
       "requirements": [
         {
@@ -121,10 +121,10 @@
     "antigravity": {
       "driverId": "antigravity",
       "engineId": "antigravity",
-      "driverDigest": "69365191eddd6e3499927f355aa5c158dcec95626dc455efd5cc02c5d1b65600",
-      "coreDigest": "cc94b10f9e5047f9a54c06c365192ed3deb348c99056f44724c60dcc1dc2f507",
-      "controllerSha256": "8f033bb62e37fd726cdd7e9a3abd89eb4c28841f1e237259086a31bd6b34e320",
-      "policySha256": "d8c8c11f316c6e96c5797685cf8ee5041c0cea3c35c738c3f01d668f01cdbeb5",
+      "driverDigest": "dba7e8e7d3eb7a919c7c0e02cb6a534d4265a4e48967ec49981a1bcd4707c235",
+      "coreDigest": "4991e0b78abe1516d4ddc1bca60e524e295f1e76cbfa5b3349b49f75139d8744",
+      "controllerSha256": "e6eb9f3e3ba0bb7bfe791ac2863a4efb793ba86a78a6e3fe8176c8765812bcb5",
+      "policySha256": "9df917e36e0bedf0f08ef705400cea11d20f3d1d4ce1473ee2cb9c02f31a3761",
       "requirements": [
         {
           "requirementId": "R1",
@@ -177,5 +177,5 @@
       ]
     }
   },
-  "proofSha256": "b854a9ffa60682e09b31fae12d4db543bd337ae98393c144017701ce1433c6a3"
+  "proofSha256": "e35c849bd325936b314903f2c65fa2f809e4397e78b296067f7f5b68de4f3361"
 }

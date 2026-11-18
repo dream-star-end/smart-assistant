@@ -568,6 +568,182 @@ class AntigravityDriverTests(unittest.TestCase):
                         pass
                 proc.wait(timeout=5)
 
+    def test_06_pretool_hydration_exit_plan_mode_and_vision(self) -> None:
+        mod, _, _ = load_driver("antigravity")
+
+        # 1) supportsVision reflects real model capability (True except gpt-oss).
+        probed = mod._normalize_probed_models(
+            [
+                {"id": "gemini-4-carbon"},
+                {"id": "claude-opus-5-5"},
+                {"id": "gpt-oss-120b"},
+            ]
+        )
+        by_id = {m["upstreamModelId"]: m for m in probed}
+        self.assertTrue(by_id["gemini-4-carbon-medium"]["supportsVision"])
+        self.assertTrue(by_id["claude-opus-5-5-high"]["supportsVision"])
+        self.assertFalse(by_id["gpt-oss-120b"]["supportsVision"])
+
+        # 2) decode("native") allows exit_plan_mode without disallowedItem, and still blocks native run_command.
+        cid = str(uuid.uuid4())
+        st: dict = {}
+        st = mod.encode({"kind": "initialize", "commandId": "cmd_i_plan"}, st)["nextNativeState"]
+        st = mod.encode({"kind": "newTurn", "commandId": "cmd_t_plan", "prompt": "plan"}, st)["nextNativeState"]
+        plan_step = json.dumps(
+            {
+                "ev": "cli",
+                "turnSeq": 1,
+                "raw": {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": cid,
+                        "step_index": 2,
+                        "step_type": "tool",
+                        "state": "DONE",
+                        "tool_info": {"name": "exit_plan_mode", "parameters": {"plan": "ok"}},
+                    },
+                },
+            }
+        ).encode()
+        res_plan = mod.decode("native", plan_step, st)
+        self.assertEqual([e for e in res_plan["securityEvents"] if e["kind"] == "disallowedItem"], [])
+
+        # 3) End-to-end >512-char truncation hydration via deny_native.py PreToolUse hook + agy_host.py.
+        long_cmd = "python3 -c '" + ("a" * 900) + "'"
+        full_args = {"file_path": "/tmp/long.txt", "content": long_cmd}
+        with tempfile.TemporaryDirectory(prefix="oc-drvtest-hydrate-") as td:
+            root = Path(td) / "lane"
+            root.mkdir()
+            (root / "cwd").mkdir()
+            fake_cli = Path(td) / "fake-agy-truncate"
+            fake_cli.write_text(
+                r"""#!/usr/bin/env python3
+import json, pathlib, subprocess, sys, uuid
+args = sys.argv[1:]
+if "--version" in args:
+    print("antigravity 1.5.5")
+    sys.exit(0)
+conv_id = str(uuid.uuid4())
+sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv_id, "init": {"model": "gemini-4-carbon-medium", "tools": []}}) + "\n")
+sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    full_cmd = "python3 -c '" + ("a" * 900) + "'"
+    # Simulate Antigravity CLI invoking PreToolUse hook with FULL args, then emitting truncated 512+"…" stream-json!
+    deny_py = pathlib.Path.cwd().parent / "deny_native.py"
+    hook_in = json.dumps({
+        "toolCall": {"name": "mcp_ocbridge_Write", "args": {"file_path": "/tmp/long.txt", "content": full_cmd}},
+        "stepIdx": 5,
+        "conversation_id": conv_id,
+    })
+    hook_res = subprocess.run(["/usr/bin/python3", "-I", "-B", str(deny_py)], input=hook_in, text=True, capture_output=True, check=True)
+    assert json.loads(hook_res.stdout)["decision"] == "allow"
+    plan_res = subprocess.run(["/usr/bin/python3", "-I", "-B", str(deny_py)], input=json.dumps({"toolCall": {"name": "exit_plan_mode", "args": {}}}), text=True, capture_output=True, check=True)
+    assert json.loads(plan_res.stdout)["decision"] == "allow"
+    sys.stdout.write(json.dumps({"event": "step_update", "step_update": {"conversation_id": conv_id, "step_index": 4, "step_type": "user_input", "state": "DONE"}}) + "\n")
+    sys.stdout.write(json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": conv_id,
+            "step_index": 5,
+            "step_type": "tool",
+            "state": "DONE",
+            "tool_info": {"name": "mcp_ocbridge_Write", "parameters": {"file_path": "/tmp/long.txt", "content": full_cmd[:512] + "\u2026"}},
+        },
+    }) + "\n")
+    sys.stdout.write(json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": conv_id,
+            "step_index": 6,
+            "step_type": "agent_response",
+            "state": "DONE",
+            "text_delta": "done",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "thinking_tokens": 0, "cache_read_tokens": 0},
+        },
+    }) + "\n")
+    sys.stdout.write(json.dumps({"event": "result", "result": {"conversation_id": conv_id, "status": "SUCCESS"}}) + "\n")
+    sys.stdout.flush()
+""",
+                encoding="utf-8",
+            )
+            fake_cli.chmod(0o755)
+            snap = {
+                "schemaVersion": 4,
+                "engineId": "antigravity",
+                "driverId": "antigravity",
+                "driverVersion": "1.0.0",
+                "source": "test",
+                "freshness": "cli-observed",
+                "authPresent": True,
+                "accountObserved": True,
+                "cliVersion": "1.5.5",
+                "cliSha256": file_sha256(fake_cli),
+                "models": [
+                    {"upstreamModelId": "gemini-4-carbon-medium", "supportedEfforts": ["low", "medium", "high"], "defaultEffort": "medium", "supportsAdaptiveThinking": True, "supportsVision": True},
+                ],
+                "rawResponseSha256": "d" * 64,
+                "observedAt": "2026-11-18T00:00:00Z",
+            }
+            spec = mod.launch_spec(
+                {
+                    "root": str(root),
+                    "model": "gemini-4-carbon-medium",
+                    "cliPath": str(fake_cli),
+                    "systemPrompt": "PLAT_HYDRATE",
+                    "mcpClientPath": str(SCRIPT_DIR / "core" / "mcp_client.py"),
+                    "tools": SAMPLE_TOOLS,
+                },
+                snap,
+            )
+            self.assertIn("run/pretool", spec["dirs"])
+            for rel, meta in spec["files"].items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(meta["content"], encoding="utf-8")
+                os.chmod(p, meta["mode"])
+            for d in spec["dirs"]:
+                (root / d).mkdir(parents=True, exist_ok=True)
+
+            proc = subprocess.Popen(spec["argv"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=spec["cwd"], env=spec["environment"])
+            try:
+                hst: dict = {}
+                e1 = mod.encode({"kind": "initialize", "commandId": "cmd_h1", "model": "gemini-4-carbon-medium"}, hst)
+                hst = e1["nextNativeState"]
+                for ln in e1["lines"]:
+                    proc.stdin.write(ln + "\n")
+                proc.stdin.flush()
+                hst = mod.decode("native", proc.stdout.readline().encode(), hst)["nextNativeState"]
+
+                e2 = mod.encode({"kind": "newTurn", "commandId": "cmd_h2", "prompt": "go"}, hst)
+                hst = e2["nextNativeState"]
+                for ln in e2["lines"]:
+                    proc.stdin.write(ln + "\n")
+                proc.stdin.flush()
+                obs_args = []
+                while hst.get("activeTurn"):
+                    ln = proc.stdout.readline()
+                    self.assertTrue(ln)
+                    dec_res = mod.decode("native", ln.encode(), hst)
+                    hst = dec_res["nextNativeState"]
+                    for sev in dec_res["securityEvents"]:
+                        if sev["kind"] == "toolCallObserved":
+                            obs_args.append(sev)
+                self.assertEqual(len(obs_args), 1)
+                self.assertEqual(obs_args[0]["arguments"], full_args)
+                self.assertEqual(obs_args[0]["argsHash"], remote_canonical_sha256(full_args))
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    try:
+                        if stream:
+                            stream.close()
+                    except Exception:
+                        pass
+                proc.wait(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

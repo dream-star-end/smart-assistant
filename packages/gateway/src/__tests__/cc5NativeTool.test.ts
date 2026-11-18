@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
-import { CC5_TOOL_RESULT_MAX_BYTES, boundCc5ToolResult, cc5ToolResultBytes, cc5ToolInputSha256,
+import { CC5_TOOL_RESULT_MAX_BYTES, REMOTE_V4_TOOL_INPUT_MAX_BYTES, REMOTE_V4_TOOL_RESULT_MAX_BYTES,
+  assertCc5ToolResult, boundCc5ToolResult, cc5ToolResultBytes, cc5ToolInputSha256,
   validateCc5NativeToolInput } from '../cc5NativeTool.js'
 
 test('Python and Node hash the exact nested Unicode tool input identically regardless of key order', () => {
@@ -27,14 +28,64 @@ test('any catalog alias with a bounded JSON object is admitted; the tool schema 
     ['mcp__ocbridge__Bash', { command: 'pwd', timeout: 600000, run_in_background: true }],
     ['mcp__ocbridge__t7', { nested: { list: [1, 2.5, 'x'] } }],
   ] as const) assert.doesNotThrow(() => validateCc5NativeToolInput(name, args))
+  assert.throws(() => validateCc5NativeToolInput('mcp__ocbridge__Write', { file_path: '/tmp/a', content: 'x'.repeat(98304) }), /CC5_NATIVE_TOOL_INPUT_INVALID/)
+  assert.doesNotThrow(() => validateCc5NativeToolInput('mcp__ocbridge__Write', { file_path: '/tmp/a', content: 'x'.repeat(200 * 1024) }, REMOTE_V4_TOOL_INPUT_MAX_BYTES))
   for (const [name, args] of [
     ['Write', { file_path: '/tmp/a' }],
     ['mcp__other__Write', { file_path: '/tmp/a' }],
     ['mcp__ocbridge__Bash', ['pwd']],
     ['mcp__ocbridge__Edit', { file_path: '/tmp/a', old_string: { deep: '\ud800' }, new_string: 'x' }],
     ['mcp__ocbridge__Read', { offset: 2 ** 53 }],
-    ['mcp__ocbridge__Write', { file_path: '/tmp/a', content: 'x'.repeat(98304) }],
-  ] as const) assert.throws(() => validateCc5NativeToolInput(name, args), /CC5_NATIVE_TOOL_INPUT_INVALID/)
+    ['mcp__ocbridge__Write', { file_path: '/tmp/a', content: 'x'.repeat(4 * 1024 * 1024) }],
+  ] as const) assert.throws(() => validateCc5NativeToolInput(name, args, REMOTE_V4_TOOL_INPUT_MAX_BYTES), /CC5_NATIVE_TOOL_INPUT_INVALID/)
+})
+
+test('legacy 128 KiB result bound stays compatible with immutable cc5-fixed-mcp.py while v4 preserves 200 KiB text/images', () => {
+  const bigText = { content: [{ type: 'text', text: '新行\n😀"\\'.repeat(24000) }], isError: false }
+  const legacyBounded = boundCc5ToolResult(bigText)
+  assert.ok(cc5ToolResultBytes(legacyBounded) <= CC5_TOOL_RESULT_MAX_BYTES)
+  assertCc5ToolResult(legacyBounded)
+  const reqArgs = { file_path: '/tmp/a' }
+  const inputHash = cc5ToolInputSha256(reqArgs)
+  const compatValue = {
+    version: 2,
+    ok: true,
+    runId: 'run-compat-1',
+    operationId: 'op-compat-1',
+    rpcId: 1,
+    toolUseId: 'toolu-compat-1',
+    name: 'mcp__ocbridge__Read',
+    inputSha256: inputHash,
+    result: legacyBounded,
+  }
+  const compatCheck = spawnSync(
+    'python3',
+    [
+      '-I',
+      '-B',
+      '-c',
+      'import sys,json,importlib.util\nspec=importlib.util.spec_from_file_location("m",sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\np=json.load(sys.stdin)\nprint(json.dumps(m.validate_response(p["value"],p["config"],p["ident"],p["tool_id"],p["name"],p["input_hash"])))',
+      new URL('../../../../scripts/agent-remote/cc5-fixed-mcp.py', import.meta.url).pathname,
+    ],
+    {
+      input: JSON.stringify({
+        value: compatValue,
+        config: { runId: compatValue.runId, operationId: compatValue.operationId },
+        ident: compatValue.rpcId,
+        tool_id: compatValue.toolUseId,
+        name: compatValue.name,
+        input_hash: inputHash,
+      }),
+      encoding: 'utf8',
+      timeout: 3000,
+    },
+  )
+  assert.equal(compatCheck.status, 0, compatCheck.stderr)
+  assert.deepEqual(boundCc5ToolResult(bigText, REMOTE_V4_TOOL_RESULT_MAX_BYTES), bigText)
+
+  const data = Buffer.alloc(200 * 1024, 7).toString('base64')
+  const bigImage = { content: [{ type: 'image', mimeType: 'image/png', data }], isError: false }
+  assert.deepEqual(boundCc5ToolResult(bigImage, REMOTE_V4_TOOL_RESULT_MAX_BYTES), bigImage)
 })
 
 test('the gateway result bound matches the Python canonical wire limit byte for byte', () => {
@@ -51,6 +102,11 @@ test('the gateway result bound matches the Python canonical wire limit byte for 
   const text = (bounded.content[0] as { type: string; text: string }).text
   assert.ok(text.startsWith('新行\n😀"\\'))
   assert.ok(text.endsWith(`[cc5 tool result truncated: original ${cc5ToolResultBytes(oversized)} bytes]`))
+
+  const v4Oversized = { content: [{ type: 'text', text: 'A'.repeat(5 * 1024 * 1024) }], isError: false }
+  const v4Bounded = boundCc5ToolResult(v4Oversized, REMOTE_V4_TOOL_RESULT_MAX_BYTES) as unknown as { content: Array<{ text: string }> }
+  assert.ok(cc5ToolResultBytes(v4Bounded) <= REMOTE_V4_TOOL_RESULT_MAX_BYTES)
+  assert.ok(v4Bounded.content[0].text.endsWith(`[cc5 tool result truncated: original ${cc5ToolResultBytes(v4Oversized)} bytes]`))
 })
 
 
@@ -62,6 +118,14 @@ test('an oversized image block becomes a placeholder instead of base64 text', ()
   assert.deepEqual(bounded.content.map((block) => block.type), ['text'])
   assert.ok(bounded.content[0].text!.includes('[image omitted: original 204800 bytes, too large to transfer'))
   assert.ok(!JSON.stringify(bounded).includes(data.slice(0, 64)), 'image bytes leaked as text')
+
+  const v4Data = Buffer.alloc(4 * 1024 * 1024, 7).toString('base64')
+  const v4Bounded = boundCc5ToolResult(
+    { content: [{ type: 'image', mimeType: 'image/png', data: v4Data }], isError: false },
+    REMOTE_V4_TOOL_RESULT_MAX_BYTES,
+  ) as unknown as { content: Array<{ type: string; text?: string }> }
+  assert.ok(cc5ToolResultBytes(v4Bounded) <= REMOTE_V4_TOOL_RESULT_MAX_BYTES)
+  assert.deepEqual(v4Bounded.content.map((b) => b.type), ['text'])
 })
 
 test('mixed text and an oversized image keep the text head and replace only the image', () => {

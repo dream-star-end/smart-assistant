@@ -4,7 +4,12 @@ import { constants, closeSync, fstatSync, openSync, readFileSync, writeFileSync 
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
-import { type Cc5ToolResult, assertCc5ToolResult, boundCc5ToolResult } from './cc5NativeTool.js'
+import {
+  type Cc5ToolResult,
+  CC5_TOOL_RESULT_MAX_BYTES,
+  assertCc5ToolResult,
+  boundCc5ToolResult,
+} from './cc5NativeTool.js'
 import type { Cc5HostProfile, Cc5HostTool } from './cc5ToolCatalog.js'
 
 /** The bridge already holds a local chat's tool environment without model credentials (runner
@@ -29,8 +34,8 @@ export function cc5ToolHostChildEnv(source: NodeJS.ProcessEnv = process.env): No
 
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/
 const INIT_TIMEOUT_MS = 90000
-/** tools/list is big (full builtin + MCP prompts), so the line bound must be too. */
-const MAX_LINE_BYTES = 2 * 1024 * 1024
+/** tools/list and large image/file tool results can exceed 2 MiB; match v4 line bound. */
+const MAX_LINE_BYTES = 24 * 1024 * 1024
 const CALL_TIMEOUT_MS = 11 * 60 * 1000
 
 export class Cc5ToolHost {
@@ -46,6 +51,7 @@ export class Cc5ToolHost {
   private closePromise?: Promise<void>
   private readonly ready: Promise<void>
   private toolList?: Cc5HostTool[]
+  private readonly maxResultBytes: number
   constructor(
     private readonly root: string,
     private readonly lifecycleId: string,
@@ -53,7 +59,21 @@ export class Cc5ToolHost {
     /** Answers the host's permission prompt (AskUserQuestion) the way a local chat's gateway does. */
     private readonly onPermission?: (request: Record<string, unknown>) => Promise<Record<string, unknown>>,
     environment?: NodeJS.ProcessEnv,
+    options?: { readonly maxInputBytes?: number; readonly maxResultBytes?: number },
   ) {
+    this.maxResultBytes = options?.maxResultBytes ?? CC5_TOOL_RESULT_MAX_BYTES
+    const childEnvSource =
+      options?.maxInputBytes !== undefined || options?.maxResultBytes !== undefined
+        ? {
+            ...(environment ?? process.env),
+            ...(options?.maxInputBytes !== undefined
+              ? { OC_CC5_TOOL_INPUT_MAX_BYTES: String(options.maxInputBytes) }
+              : {}),
+            ...(options?.maxResultBytes !== undefined
+              ? { OC_CC5_TOOL_RESULT_MAX_BYTES: String(options.maxResultBytes) }
+              : {}),
+          }
+        : environment
     const supervisor = fileURLToPath(
       new URL('../../../scripts/agent-remote/cc5-toolhost-supervisor.py', import.meta.url),
     )
@@ -87,7 +107,7 @@ export class Cc5ToolHost {
         profilePath,
       ],
       {
-        env: cc5ToolHostChildEnv(environment),
+        env: cc5ToolHostChildEnv(childEnvSource),
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe'],
       },
@@ -239,8 +259,8 @@ export class Cc5ToolHost {
       },
       CALL_TIMEOUT_MS,
     )
-    const result = boundCc5ToolResult({ content: value.content, isError: value.isError === true })
-    assertCc5ToolResult(result)
+    const result = boundCc5ToolResult({ content: value.content, isError: value.isError === true }, this.maxResultBytes)
+    assertCc5ToolResult(result, this.maxResultBytes)
     return structuredClone(result)
   }
   close(): Promise<void> {

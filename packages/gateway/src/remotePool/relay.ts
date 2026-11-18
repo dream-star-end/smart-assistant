@@ -38,7 +38,7 @@ import {
   type RemotePendingToolRequest,
   type RemoteReceiptV4,
 } from '@openclaude/protocol'
-import { assertCc5ToolResult, type Cc5ToolResult } from '../cc5NativeTool.js'
+import { REMOTE_V4_TOOL_RESULT_MAX_BYTES, assertCc5ToolResult, type Cc5ToolResult } from '../cc5NativeTool.js'
 import { isRemoteResourceCode, memoryRejection, nodeMemoryError } from '../remoteNodeMemory.js'
 import { DriverWorkerClient, type DriverWorkerInfo } from './driverWorkerClient.js'
 import { RemoteObservationGate } from './observationGate.js'
@@ -55,9 +55,9 @@ import {
   type RemoteRelayedFrame,
 } from './types.js'
 
-const MAX_BODY_BYTES = 2 * 1024 * 1024
-const MAX_OUTPUT_BYTES = 8 * 1024 * 1024
-const MAX_TOOL_BODY_BYTES = 196_608
+const MAX_BODY_BYTES = 16 * 1024 * 1024
+const MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+const MAX_TOOL_BODY_BYTES = 6 * 1024 * 1024
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   remotePoolNeed(req.method === 'POST' && !req.headers['transfer-encoding'], 'REMOTE_HTTP_INVALID')
@@ -989,7 +989,7 @@ export class RemotePoolRelay {
 
     const instructions = typeof v.instructions === 'string' ? v.instructions : undefined
     remotePoolNeed(
-      instructions === undefined || (!instructions.includes('\u0000') && Buffer.byteLength(instructions, 'utf8') <= 256 * 1024),
+      instructions === undefined || (!instructions.includes('\u0000') && Buffer.byteLength(instructions, 'utf8') <= 1024 * 1024),
       'REMOTE_INSTRUCTIONS_INVALID',
     )
 
@@ -1367,7 +1367,7 @@ export class RemotePoolRelay {
           ? [...this.tools.values()].find((t) => t.request.callId === callId && t.delivered && !t.result)
           : undefined)
       remotePoolNeed(tool?.delivered && !tool.result, 'REMOTE_TOOL_RESULT_UNEXPECTED')
-      assertCc5ToolResult(v.result)
+      assertCc5ToolResult(v.result, REMOTE_V4_TOOL_RESULT_MAX_BYTES)
       const cleanResult: Cc5ToolResult = {
         content: (v.result as Cc5ToolResult).content,
         isError: (v.result as Cc5ToolResult).isError,

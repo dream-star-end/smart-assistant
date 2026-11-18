@@ -238,7 +238,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         session_flag = "--session-id"
 
     prompt_text = str(context.get("systemPrompt") or "")
-    need("\x00" not in prompt_text and len(prompt_text.encode("utf-8")) <= 256 * 1024, "CC_SYSTEM_PROMPT_INVALID")
+    need("\x00" not in prompt_text and len(prompt_text.encode("utf-8")) <= 1024 * 1024, "CC_SYSTEM_PROMPT_INVALID")
 
     mcp_config = {
         "mcpServers": {

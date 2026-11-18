@@ -2336,6 +2336,139 @@ class RemoteDriverCoreTests(unittest.TestCase):
         serialized_len = len(remote_canonical_bytes(b_worst["nextNativeState"]))
         self.assertLess(serialized_len, MAX_NATIVE_STATE_BYTES)
 
+    def test_13_mcp_socket_4mib_mixed_unicode_rss_under_budget(self) -> None:
+        from core.canonical import remote_canonical_bytes
+
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="oc-drvtest-rss-") as tmp:
+            root = Path(tmp)
+            root.chmod(0o700)
+            tools_bytes = json.dumps(SAMPLE_TOOLS, separators=(",", ":")).encode("utf-8")
+            (root / "tools.json").write_bytes(tools_bytes)
+            (root / "tools.json").chmod(0o400)
+            _, _, codex_digest = load_driver("codex")
+            cfg = {
+                "version": 4,
+                "driverId": "codex",
+                "engineId": "codex",
+                "driverDigest": codex_digest,
+                "operationId": "op-rss-1",
+                "runId": "run-rss-1",
+                "generation": "1",
+                "profileId": "c240b4a0-4d0b-49e8-b5d4-77252377ad88",
+                "authEpoch": "epoch-rss-1",
+                "nativeSessionId": "thr_rss_1",
+                "catalogSha256": hashlib.sha256(tools_bytes).hexdigest(),
+                "requireNodeObservation": False,
+            }
+            (root / "client.json").write_text(json.dumps(cfg), encoding="utf-8")
+            (root / "client.json").chmod(0o400)
+            (root / "observations").mkdir(mode=0o700)
+            (root / "tool-attempts").mkdir(mode=0o700)
+
+            socket_script = SCRIPT_DIR / "core" / "mcp_socket.py"
+            proc = subprocess.Popen(
+                ["/usr/bin/python3", "-I", "-B", str(socket_script), str(root)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert proc.stdin is not None and proc.stdout is not None
+            try:
+                ready = strict_json(proc.stdout.readline())
+                self.assertEqual(ready["kind"], "socket-ready")
+
+                mixed_text = ("a" * (4 * 1024 * 1024 - 256)) + "😀"
+                small_args = {"token": "ok"}
+
+                def post_roundtrip(call_id: str, args: dict, reply_result: dict) -> dict:
+                    args_hash = remote_canonical_sha256(args)
+                    wire_req = {
+                        "version": 4,
+                        "driverId": "codex",
+                        "engineId": "codex",
+                        "operationId": "op-rss-1",
+                        "runId": "run-rss-1",
+                        "generation": "1",
+                        "profileId": "c240b4a0-4d0b-49e8-b5d4-77252377ad88",
+                        "authEpoch": "epoch-rss-1",
+                        "nativeSessionId": "thr_rss_1",
+                        "callId": call_id,
+                        "rpcId": 1,
+                        "server": "ocbridge",
+                        "name": "t0",
+                        "arguments": args,
+                        "argsHash": args_hash,
+                    }
+                    payload = remote_canonical_bytes(wire_req)
+                    del wire_req
+
+                    def master_side() -> None:
+                        frame = strict_json(proc.stdout.readline())
+                        req_body = strict_json(base64.b64decode(frame["body"]))
+                        wire_reply = {
+                            **{k: req_body[k] for k in req_body if k != "arguments"},
+                            "ok": True,
+                            "result": reply_result,
+                        }
+                        del req_body
+                        resp_frame = {
+                            "version": 4,
+                            "driverId": "codex",
+                            "engineId": "codex",
+                            "kind": "tool-response",
+                            "seq": frame["seq"],
+                            "status": 200,
+                            "body": base64.b64encode(remote_canonical_bytes(wire_reply)).decode("ascii"),
+                        }
+                        del wire_reply
+                        proc.stdin.write((json.dumps(resp_frame) + "\n").encode("utf-8"))
+                        proc.stdin.flush()
+
+                    th = threading.Thread(target=master_side, daemon=True)
+                    th.start()
+                    import http.client as hc
+                    import socket as sk
+                    conn = hc.HTTPConnection("localhost", timeout=30)
+                    conn.sock = sk.socket(sk.AF_UNIX, sk.SOCK_STREAM)
+                    conn.sock.settimeout(30)
+                    conn.sock.connect(str(root / "tool.sock"))
+                    conn.request("POST", "/roundtrip", body=payload, headers={"Content-Type": "application/json", "Connection": "close"})
+                    resp = conn.getresponse()
+                    raw = resp.read()
+                    conn.close()
+                    th.join(timeout=5)
+                    self.assertEqual(resp.status, 200)
+                    return strict_json(raw)
+
+                # 1) Small input -> near-4 MiB mixed ASCII + astral emoji result.
+                r1 = post_roundtrip("call_rss_big_result", small_args, {"content": [{"type": "text", "text": mixed_text}], "isError": False})
+                self.assertTrue(r1["ok"])
+                self.assertEqual(len(r1["result"]["content"][0]["text"]), len(mixed_text))
+                del r1
+
+                # 2) >200 KiB input -> small result.
+                big_args = {"content": "b" * (300 * 1024)}
+                r2 = post_roundtrip("call_rss_big_input", big_args, {"content": [{"type": "text", "text": "ok"}], "isError": False})
+                self.assertTrue(r2["ok"])
+            finally:
+                (root / "STOPPING.json").write_text("{}", encoding="utf-8")
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                _, status, rusage = os.wait4(proc.pid, 0)
+                try:
+                    proc.stdout.close()
+                    proc.stderr.close()
+                except Exception:
+                    pass
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+                self.assertLess(
+                    rusage.ru_maxrss,
+                    120 * 1024,
+                    f"mcp_socket.py peak RSS {rusage.ru_maxrss} KiB exceeded 120 MiB budget",
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

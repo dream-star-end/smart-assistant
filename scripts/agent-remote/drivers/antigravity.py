@@ -73,15 +73,60 @@ BASE_TO_VARIANTS: Dict[str, List[str]] = {
 }
 
 _DENY_NATIVE_PY = r"""#!/usr/bin/env python3
-import json, sys
+import json, os, pathlib, sys, time
 
 try:
     payload = json.loads(sys.stdin.read() or "{}")
 except Exception:
     payload = {}
-tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else (
+    payload.get("tool_call") if isinstance(payload.get("tool_call"), dict) else {}
+)
 name = str(tool_call.get("name") or payload.get("tool_name") or "")
 if name.startswith("mcp_ocbridge_"):
+    try:
+        args = tool_call.get("args")
+        if not isinstance(args, dict):
+            args = tool_call.get("arguments")
+        if not isinstance(args, dict):
+            args = tool_call.get("input")
+        if not isinstance(args, dict):
+            args = payload.get("tool_input")
+        if isinstance(args, dict):
+            pretool_dir = pathlib.Path(__file__).resolve().parent / "run" / "pretool"
+            pretool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            doc = {"name": name, "args": args}
+            sidx = payload.get("stepIdx")
+            if type(sidx) is not int:
+                sidx = payload.get("step_index")
+            if type(sidx) is int:
+                doc["stepIdx"] = sidx
+            cid = payload.get("conversation_id") or payload.get("conversationId")
+            if isinstance(cid, str) and cid:
+                doc["conversationId"] = cid
+            raw = json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+            def _atomic_write(dst: pathlib.Path) -> None:
+                tmp = dst.with_name(f".{dst.name}.{os.getpid()}.tmp")
+                fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    view = memoryview(raw)
+                    while view:
+                        written = os.write(fd, view)
+                        if written <= 0:
+                            raise OSError("short write")
+                        view = view[written:]
+                finally:
+                    os.close(fd)
+                os.replace(tmp, dst)
+
+            if type(sidx) is int:
+                _atomic_write(pretool_dir / f"step_{sidx}.json")
+            _atomic_write(pretool_dir / f"seq_{time.time_ns()}_{os.getpid()}.json")
+    except Exception:
+        pass
+    sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+elif name == "exit_plan_mode":
     sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
 else:
     sys.stdout.write(json.dumps({"decision": "deny", "reason": "native_tool_forbidden:" + name}) + "\n")
@@ -89,7 +134,7 @@ sys.stdout.flush()
 """
 
 _AGY_HOST_PY = r"""#!/usr/bin/env python3
-import collections, json, os, pathlib, queue, re, shutil, signal, sqlite3, subprocess, sys, threading
+import collections, json, os, pathlib, queue, re, shutil, signal, sqlite3, subprocess, sys, threading, time
 
 cfg = json.loads((pathlib.Path(__file__).resolve().parent / "host_config.json").read_text(encoding="utf-8"))
 home_dir = pathlib.Path(os.environ["HOME"])
@@ -265,6 +310,86 @@ def spawn_cli(resume_id, effort_val=""):
         except Exception:
             pass
 
+    pretool_dir = pathlib.Path(__file__).resolve().parent / "run" / "pretool"
+    hydrated_by_step = {}
+
+    def _has_truncated_string(val):
+        if isinstance(val, str):
+            return val.endswith("\u2026")
+        if isinstance(val, dict):
+            return any(_has_truncated_string(v) for v in val.values())
+        if isinstance(val, list):
+            return any(_has_truncated_string(x) for x in val)
+        return False
+
+    def _value_matches_truncated(cur, full):
+        if isinstance(cur, str) and cur.endswith("\u2026"):
+            return isinstance(full, str) and full.startswith(cur[:-1])
+        if isinstance(cur, dict):
+            return isinstance(full, dict) and all(k in full and _value_matches_truncated(v, full[k]) for k, v in cur.items())
+        if isinstance(cur, list):
+            return isinstance(full, list) and len(cur) == len(full) and all(_value_matches_truncated(a, b) for a, b in zip(cur, full))
+        if isinstance(cur, bool) or isinstance(full, bool):
+            return type(cur) is bool and type(full) is bool and cur == full
+        return cur == full
+
+    def _read_pretool_doc(path_obj):
+        try:
+            doc = json.loads(path_obj.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(doc, dict) or not isinstance(doc.get("args"), dict):
+            return None
+        return doc
+
+    def _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params):
+        if not pretool_dir.is_dir():
+            return None
+        if type(sidx) is int:
+            step_path = pretool_dir / f"step_{sidx}.json"
+            if step_path.is_file():
+                doc = _read_pretool_doc(step_path)
+                if doc and doc.get("name") == tname:
+                    dcid = str(doc.get("conversationId") or "")
+                    if (not dcid or not scid or dcid == scid) and _value_matches_truncated(cur_params, doc["args"]):
+                        hydrated_by_step[(scid, sidx)] = doc["args"]
+                        return doc["args"]
+        for cand in sorted(pretool_dir.glob("seq_*.json")):
+            doc = _read_pretool_doc(cand)
+            if not doc or doc.get("name") != tname:
+                continue
+            dcid = str(doc.get("conversationId") or "")
+            if dcid and scid and dcid != scid:
+                continue
+            dsidx = doc.get("stepIdx")
+            if type(dsidx) is int and type(sidx) is int and dsidx != sidx:
+                continue
+            if _value_matches_truncated(cur_params, doc["args"]):
+                try:
+                    cand.unlink()
+                except OSError:
+                    pass
+                if type(sidx) is int:
+                    hydrated_by_step[(scid, sidx)] = doc["args"]
+                return doc["args"]
+        return None
+
+    def hydrate_mcp_tool_params(scid, sidx, tname, cur_params):
+        if type(sidx) is int and (scid, sidx) in hydrated_by_step:
+            return hydrated_by_step[(scid, sidx)]
+        found = _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params)
+        if found is not None:
+            return found
+        if not _has_truncated_string(cur_params):
+            return cur_params
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            time.sleep(0.01)
+            found = _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params)
+            if found is not None:
+                return found
+        return cur_params
+
     def read_out():
         global conv_id, child, turn_in_flight, interrupted_flag, pending_interrupt_cmd, seen_max_step_idx
         try:
@@ -285,6 +410,17 @@ def spawn_cli(resume_id, effort_val=""):
                     step = parsed.get("step_update")
                     if isinstance(step, dict) and type(step.get("step_index")) is int:
                         seen_max_step_idx = max(seen_max_step_idx, int(step["step_index"]))
+                    if isinstance(step, dict) and step.get("step_type") == "tool":
+                        tinfo = step.get("tool_info")
+                        if isinstance(tinfo, dict):
+                            tname = str(tinfo.get("name") or step.get("tool_name") or "")
+                            if tname.startswith("mcp_ocbridge_"):
+                                sidx = step.get("step_index")
+                                scid = str(step.get("conversation_id") or conv_id or "")
+                                cur_params = tinfo.get("parameters") if isinstance(tinfo.get("parameters"), dict) else {}
+                                hydrated = hydrate_mcp_tool_params(scid, sidx, tname, cur_params)
+                                if isinstance(hydrated, dict):
+                                    tinfo["parameters"] = hydrated
                 with state_lock:
                     tseq = active_turn_seq
                     if isinstance(parsed, dict) and parsed.get("event") == "result":
@@ -705,6 +841,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         "files": files,
         "dirs": [
             "run",
+            "run/pretool",
             "cache",
             "tmp",
             "home/.gemini/config",
@@ -1068,7 +1205,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
             state["trailingError"] = None
             tinfo = step.get("tool_info") if isinstance(step.get("tool_info"), dict) else {}
             tname = str(tinfo.get("name") or step.get("tool_name") or "")
-            if not tname.startswith("mcp_ocbridge_"):
+            if tname == "exit_plan_mode":
+                pass
+            elif not tname.startswith("mcp_ocbridge_"):
                 security_events.append(
                     {"kind": "disallowedItem", "reason": "non_ocbridge_tool_call", "itemType": tname[:120] or "native_tool"}
                 )
@@ -1185,7 +1324,7 @@ def _normalize_probed_models(raw_models: Any) -> List[Dict[str, Any]]:
                     "supportedEfforts": efforts,
                     "defaultEffort": default_eff if default_eff in efforts else efforts[0],
                     "supportsAdaptiveThinking": True,
-                    "supportsVision": False,
+                    "supportsVision": not vid.startswith("gpt-oss"),
                 }
             )
     return models

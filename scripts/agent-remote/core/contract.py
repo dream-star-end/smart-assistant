@@ -24,9 +24,9 @@ from .canonical import (
 )
 
 PROTOCOL_VERSION = 4
-MAX_NATIVE_STATE_BYTES = 65536
+MAX_NATIVE_STATE_BYTES = 524288
 MAX_ENCODE_LINES = 16
-MAX_LINE_BYTES = 2 * 1024 * 1024
+MAX_LINE_BYTES = 24 * 1024 * 1024
 
 ENGINE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}\Z")
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")

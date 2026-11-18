@@ -6,7 +6,7 @@ come exclusively from the registered 5-duty driver, while this core owns:
 - generation immutability & atomic `MANIFEST.json` / `STOPPING.json` fencing,
 - `(node, engineId, profileId)` admission & memory gates (`core/resources.py`),
 - systemd scope isolation (`MemoryMax`, `TasksMax=128`, `KillMode=control-group`),
-- raw native stdout evidence journaling + master framing,
+- raw native stdout evidence journaling + 24 MiB master framing,
 - strict stop proof (`bootId`, cgroup `dev/inode`, empty `cgroup.procs` & `populated 0`,
   optional root-scoped tmux check, and `AF_UNIX` `tool.sock` non-listening check).
 """
