@@ -71,7 +71,7 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
     case "chart":
       return <ChartBlock spec={spec} {...p} />;
     case "calculator":
-      return <CalculatorBlock spec={spec} {...p} />;
+      return <CalculatorBlock spec={spec} {...p} readOnly={readOnly} />;
     case "stats":
       return <StatsBlock spec={spec} {...p} />;
     case "steps":

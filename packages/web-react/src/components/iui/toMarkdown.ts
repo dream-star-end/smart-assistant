@@ -87,6 +87,25 @@ export function tableToCsv(spec: TableSpec, rows: Cell[][] = spec.rows): string 
   return `﻿${[header.join(","), ...body].join("\r\n")}\r\n`;
 }
 
+function tsvCell(v: string): string {
+  const safe = /^[=+\-@\t\r]/.test(v) ? `'${v}` : v;
+  return safe.replace(/[\t\r\n]+/g, " ");
+}
+
+/** 表格 → TSV:可直接粘贴到 Excel / 飞书 / Google Sheets。 */
+export function tableToTsv(spec: TableSpec, rows: Cell[][] = spec.rows): string {
+  const header = spec.columns.map((c) => tsvCell(c.unit ? `${c.label}(${c.unit})` : c.label));
+  const body = rows.map((r) =>
+    spec.columns
+      .map((_, i) => {
+        const c = r[i] ?? null;
+        return c === null ? "" : typeof c === "number" ? String(c) : tsvCell(c);
+      })
+      .join("\t"),
+  );
+  return [header.join("\t"), ...body].join("\n");
+}
+
 function heading(title?: string, subtitle?: string): string[] {
   if (!title) return subtitle ? [subtitle, ""] : [];
   return subtitle ? [`**${title}**`, subtitle, ""] : [`**${title}**`, ""];

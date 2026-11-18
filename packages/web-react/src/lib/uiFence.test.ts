@@ -46,4 +46,18 @@ describe('normalizeInlineUiFences(OCV5-482)', () => {
     expect(nextPredictionOf(GATE_RAW)).toBe('2+2等于几?')
     expect(uiFencesToMarkdown(GATE_RAW).trim()).toBe('2')
   })
+
+  test('闭合围栏后紧贴正文/错误时拆行，避免整块失效', () => {
+    expect(normalizeInlineUiFences('```ui\n{"type":"next","text":"继续"}\n```API Error: 409 conflict')).toBe(
+      '```ui\n{"type":"next","text":"继续"}\n```\nAPI Error: 409 conflict',
+    )
+    expect(normalizeInlineUiFences('```ui\n{"type":"next","text":"继续"}```后续说明')).toBe(
+      '```ui\n{"type":"next","text":"继续"}\n```\n后续说明',
+    )
+    const embeddedCode = '```ui\n{"type":"draft","variants":[{"text":"用 ```{\\"ok\\":true}``` 表示 JSON 示例。"}]}\n```'
+    expect(normalizeInlineUiFences(embeddedCode)).toBe(embeddedCode)
+    expect(normalizeInlineUiFences('```ui\n{"type":"next","text":"半截\n```API Error: 409')).toBe(
+      '```ui\n{"type":"next","text":"半截\n```\nAPI Error: 409',
+    )
+  })
 })

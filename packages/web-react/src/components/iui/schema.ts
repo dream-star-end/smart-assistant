@@ -182,7 +182,7 @@ export type KvSpec = Sub & { type: "kv"; title?: string; items: { label: string;
 export type FormField = {
   id: string;
   label: string;
-  kind: "text" | "number" | "select" | "chips" | "date";
+  kind: "text" | "textarea" | "number" | "select" | "chips" | "date";
   options: string[];
   multi: boolean;
   placeholder?: string;
@@ -995,9 +995,9 @@ function form(raw: Record<string, unknown>, ctx: Ctx): FormSpec | null {
     }
     seen.add(id);
     const options = strList(o.options, 12, ctx, "选项", 60);
-    let kind = pickOne<FormField["kind"]>(o.kind ?? o.type, ["text", "number", "select", "chips", "date"], options.length ? "chips" : "text");
+    let kind = pickOne<FormField["kind"]>(o.kind ?? o.type, ["text", "textarea", "number", "select", "chips", "date"], options.length ? "chips" : "text");
     if ((kind === "select" || kind === "chips") && options.length === 0) kind = "text";
-    const value = str(o.value ?? o.default, 200);
+    const value = str(o.value ?? o.default, kind === "textarea" ? 1000 : 200);
     fields.push({
       id,
       label,

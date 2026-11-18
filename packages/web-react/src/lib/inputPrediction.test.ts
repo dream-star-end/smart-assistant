@@ -110,4 +110,19 @@ describe("next 块不进复制 / 导出 / 关闭组件时的文字版", () => {
   test("流式中写到一半的 next 块也不出现", () => {
     expect(uiFencesToMarkdown('结论。\n\n```ui\n{"type":"next","te', true)).not.toContain("next");
   });
+  test("线上变体(#20521593 简写、数组、input-prediction、多行 JSONL)统一识别提取并隐藏", () => {
+    const shorthand = '{"next": "班车到站后帮我在 Gemini 4 会话复测秒点停止与新建会话"}';
+    const arr = '{"next": ["追问一", "追问二"]}';
+    const alias = '{"type": "input-prediction", "items": ["追问三"]}';
+    const jsonl = '{"type":"next","text":"甲"}\n{"type":"next","text":"乙"}';
+    for (const c of [shorthand, arr, alias, jsonl]) {
+      expect(isNextBlockCode(c)).toBe(true);
+      expect(uiFencesToMarkdown(`正文\n\n${ui(c)}`).trim()).toBe("正文");
+    }
+    expect(nextPredictionOf(`正文\n\n${ui(shorthand)}`)).toBe("班车到站后帮我在 Gemini 4 会话复测秒点停止与新建会话");
+    expect(nextPredictionOf(`正文\n\n${ui(arr)}`)).toBe("追问一");
+    expect(nextPredictionOf(`正文\n\n${ui(alias)}`)).toBe("追问三");
+    expect(nextPredictionOf(`正文\n\n${ui(jsonl)}`)).toBe("乙");
+    expect(isNextBlockCode('{"type":"table","next":"x"}')).toBe(false);
+  });
 });

@@ -2,7 +2,7 @@
  * Intelligent UI 交互类组件:随份数换算的食谱、本地判分的小测验、填完作为一条用户消息发出的表单。
  * 都在本机运行,不经模型;表单发送走与「后续建议」相同的发送通道。
  */
-import { ArrowRight, Check, Minus, Plus, RotateCcw, Send, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, Minus, Plus, RotateCcw, Send, X } from "lucide-react";
 import { useId, useMemo, useState } from "react";
 import { cn } from "../../lib/utils";
 import { chatInteractionUnavailableText, useChatInteraction } from "../tool/context";
@@ -130,6 +130,35 @@ export function QuizBlock({ spec, notes, streaming, nested }: BlockProps<QuizSpe
               <span> / {total}</span>
             </div>
             <p>{score === total ? "全部答对。" : score >= total / 2 ? "答对了一多半,看看错的那几题。" : "再看一遍解析,然后重做一次。"}</p>
+            {total > 0 && (
+              <ul className="oc-iui-quiz-review" aria-label="逐题复盘">
+                {spec.questions.map((qq, i) => {
+                  const chosen = picks[i];
+                  const right = chosen === qq.answer;
+                  return (
+                    <li key={`${i}:${qq.question}`} className={cn("oc-iui-quiz-review-item", right ? "is-right" : "is-wrong")}>
+                      <div className="oc-iui-quiz-review-head">
+                        <span className="oc-iui-quiz-review-q">
+                          {i + 1}. <Inline text={qq.question} />
+                        </span>
+                        <span className={cn("oc-iui-quiz-review-badge", right ? "is-right" : "is-wrong")}>
+                          {right ? "答对" : "答错"}
+                        </span>
+                      </div>
+                      <p className="oc-iui-quiz-review-ans">
+                        你的答案:{chosen !== null && chosen !== undefined ? `${String.fromCharCode(65 + chosen)}. ${qq.options[chosen] ?? ""}` : "未答"}
+                        {!right && ` · 正确答案:${String.fromCharCode(65 + qq.answer)}. ${qq.options[qq.answer] ?? ""}`}
+                      </p>
+                      {qq.explain && (
+                        <p className="oc-iui-quiz-review-explain">
+                          <Inline text={qq.explain} />
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
             <button type="button" className="oc-iui-btn" onClick={restart}>
               <RotateCcw size={14} aria-hidden />
               再做一次
@@ -166,20 +195,34 @@ export function QuizBlock({ spec, notes, streaming, nested }: BlockProps<QuizSpe
                 );
               })}
             </div>
-            {answered && (
+            {(answered || idx > 0) && (
               <div className="oc-iui-quiz-explain" aria-live="polite">
-                <p className={cn("oc-iui-quiz-verdict", pick === q.answer ? "is-right" : "is-wrong")}>
-                  {pick === q.answer ? "答对了" : `正确答案是 ${String.fromCharCode(65 + q.answer)}`}
-                </p>
-                {q.explain && (
-                  <p>
-                    <Inline text={q.explain} />
-                  </p>
+                {answered && (
+                  <>
+                    <p className={cn("oc-iui-quiz-verdict", pick === q.answer ? "is-right" : "is-wrong")}>
+                      {pick === q.answer ? "答对了" : `正确答案是 ${String.fromCharCode(65 + q.answer)}`}
+                    </p>
+                    {q.explain && (
+                      <p>
+                        <Inline text={q.explain} />
+                      </p>
+                    )}
+                  </>
                 )}
-                <button type="button" className="oc-iui-btn is-primary" onClick={() => setIdx((v) => v + 1)}>
-                  {idx + 1 < total ? "下一题" : "看结果"}
-                  <ArrowRight size={14} aria-hidden />
-                </button>
+                <div className="oc-iui-quiz-nav">
+                  {idx > 0 && (
+                    <button type="button" className="oc-iui-btn" onClick={() => setIdx((v) => Math.max(0, v - 1))}>
+                      <ArrowLeft size={14} aria-hidden />
+                      上一题
+                    </button>
+                  )}
+                  {answered && (
+                    <button type="button" className="oc-iui-btn is-primary" onClick={() => setIdx((v) => v + 1)}>
+                      {idx + 1 < total ? "下一题" : "看结果"}
+                      <ArrowRight size={14} aria-hidden />
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </>
@@ -247,7 +290,7 @@ export function FormBlock({ spec, notes, streaming, readOnly, nested }: BlockPro
           if (f.kind === "chips") {
             const arr = Array.isArray(v) ? v : v ? [v] : [];
             return (
-              <fieldset key={f.id} className="oc-iui-field" disabled={locked}>
+              <fieldset key={f.id} className="oc-iui-field is-full" disabled={locked}>
                 <legend className="contents">{label}</legend>
                 <div className="oc-iui-chips">
                   {f.options.map((o) => {
@@ -272,8 +315,9 @@ export function FormBlock({ spec, notes, streaming, readOnly, nested }: BlockPro
               </fieldset>
             );
           }
+          const isFull = f.kind === "textarea" || f.kind === "text";
           return (
-            <div key={f.id} className="oc-iui-field">
+            <div key={f.id} className={cn("oc-iui-field", isFull && "is-full")}>
               <label htmlFor={fid}>{label}</label>
               {f.kind === "select" ? (
                 <select id={fid} className="oc-iui-select" value={v as string} disabled={locked} onChange={(e) => set(f.id, e.target.value)}>
@@ -283,6 +327,17 @@ export function FormBlock({ spec, notes, streaming, readOnly, nested }: BlockPro
                     </option>
                   ))}
                 </select>
+              ) : f.kind === "textarea" ? (
+                <textarea
+                  id={fid}
+                  className="oc-iui-textarea"
+                  rows={3}
+                  value={v as string}
+                  placeholder={f.placeholder}
+                  disabled={locked}
+                  required={f.required}
+                  onChange={(e) => set(f.id, e.target.value)}
+                />
               ) : (
                 <div className="oc-iui-input-wrap">
                   <input
@@ -304,10 +359,18 @@ export function FormBlock({ spec, notes, streaming, readOnly, nested }: BlockPro
         })}
         <div className="oc-iui-form-foot">
           {sent ? (
-            <span className="oc-iui-sent">
-              <Check size={14} aria-hidden />
-              已发送
-            </span>
+            <>
+              <span className="oc-iui-sent">
+                <Check size={14} aria-hidden />
+                已发送
+              </span>
+              {!readOnly && !streaming && !!sendUserText && (
+                <button type="button" className="oc-iui-text-btn" onClick={() => setSent(false)}>
+                  <RotateCcw size={13} aria-hidden />
+                  修改重填
+                </button>
+              )}
+            </>
           ) : (
             <button type="submit" className="oc-iui-btn is-primary" disabled={!canSend}>
               <Send size={14} aria-hidden />

@@ -162,6 +162,9 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   const blockKey = useId();
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [sentLocal, setSentLocal] = useState<string | null>(null);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [customNote, setCustomNote] = useState("");
+  const composingRef = useRef(false);
   const parsed = useMemo(() => parseOptionsBlock(code), [code]);
 
   // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
@@ -199,6 +202,8 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   // 点击时刻直接读 store:同一 commit 里兄弟块刚注册完、本块还没因快照变化重渲时,
   // 渲染期算出的 grouped 可能还是旧值(单块),读 store 才不会误走「点击即发」。
   const groupedNow = () => !!group && group.getSnapshot().grouped;
+  const trimmedNote = customNote.trim();
+  const formatPick = (base: string) => (trimmedNote ? `${base}（补充：${trimmedNote}）` : base);
 
   const choose = (i: number) => {
     if (!interactive || blockedByBusy) return;
@@ -217,23 +222,37 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
       setPicked(new Set([i]));
       report([label]);
     } else {
-      setSentLocal(label);
-      sendUserText?.(`我选择:${label}`);
+      const display = formatPick(label);
+      setSentLocal(display);
+      sendUserText?.(`我选择:${display}`);
     }
   };
   const confirmMulti = () => {
     if (!interactive || blockedByBusy || picked.size === 0 || groupedNow()) return;
-    const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label);
-    setSentLocal(labels.join("、"));
-    sendUserText?.(`我选择:${labels.join("、")}`);
+    const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label).join("、");
+    const display = formatPick(labels);
+    setSentLocal(display);
+    sendUserText?.(`我选择:${display}`);
+  };
+  const sendCustomNote = () => {
+    if (!interactive || blockedByBusy || !trimmedNote || groupedNow()) return;
+    setSentLocal(trimmedNote);
+    sendUserText?.(trimmedNote);
   };
   return (
     <>
-    <div className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-surface p-2.5 not-prose">
-      {parsed.question && <p className="px-1 text-body font-medium text-fg">{parsed.question}</p>}
+    <div className="my-2 flex flex-col gap-2 rounded-2xl border border-border bg-surface p-3 not-prose shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+      {(parsed.question || parsed.options.length > 0) && (
+        <div className="flex items-start justify-between gap-2 px-1">
+          {parsed.question ? <p className="text-body font-medium text-fg">{parsed.question}</p> : <span />}
+          <span className="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-[11px] font-medium text-muted border border-border">
+            {parsed.multi ? "可多选" : "单选"}
+          </span>
+        </div>
+      )}
       <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
         {parsed.options.map((o, i) => {
-          const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label;
+          const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label || (trimmedNote ? sentText === formatPick(o.label) : false);
           return (
             <button
               key={`${i}-${o.label}`}
@@ -241,7 +260,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
               disabled={!interactive || blockedByBusy}
               onClick={() => choose(i)}
               className={
-                "flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
+                "flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
                 (chosen
                   ? "border-accent bg-accent-soft"
                   : "border-border bg-elevated hover:border-accent/40 hover:bg-hover") +
@@ -250,7 +269,8 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
             >
               <span
                 className={
-                  "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-micro " +
+                  "mt-0.5 flex size-4 shrink-0 items-center justify-center border text-micro " +
+                  (parsed.multi ? "rounded-[5px] " : "rounded-full ") +
                   (chosen ? "border-accent bg-accent text-accent-fg" : "border-border text-transparent")
                 }
               >
@@ -264,15 +284,66 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
           );
         })}
       </div>
-      {parsed.multi && interactive && !grouped && (
-        <button
-          type="button"
-          disabled={picked.size === 0 || blockedByBusy}
-          onClick={confirmMulti}
-          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40"
-        >
-          确认选择{picked.size > 0 ? `(${picked.size})` : ""}
-        </button>
+      {interactive && !grouped && (
+        <div className="flex flex-col gap-1.5 px-1">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <button
+              type="button"
+              aria-expanded={noteOpen}
+              disabled={blockedByBusy}
+              onClick={() => setNoteOpen((v) => !v)}
+              className="text-caption font-medium text-muted hover:text-fg transition-colors disabled:opacity-40 [@media(hover:none)]:min-h-11"
+            >
+              {noteOpen ? "收起补充说明" : "补充说明后再发"}
+            </button>
+            {parsed.multi && (
+              <button
+                type="button"
+                disabled={picked.size === 0 || blockedByBusy}
+                onClick={confirmMulti}
+                className="ml-auto rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40 [@media(hover:none)]:min-h-11"
+              >
+                确认选择{picked.size > 0 ? `(${picked.size})` : ""}
+              </button>
+            )}
+          </div>
+          {noteOpen && (
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                aria-label="补充说明"
+                value={customNote}
+                disabled={blockedByBusy}
+                onChange={(e) => setCustomNote(e.target.value)}
+                onCompositionStart={() => {
+                  composingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  composingRef.current = false;
+                }}
+                onKeyDown={(e) => {
+                  if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return;
+                  if (e.key === "Enter" && !parsed.multi && picked.size === 0 && trimmedNote) {
+                    e.preventDefault();
+                    sendCustomNote();
+                  }
+                }}
+                placeholder="选填：输入补充要求，点上方选项将一并带出"
+                className="min-w-0 flex-1 rounded-lg border border-border bg-elevated px-2.5 py-1.5 text-meta text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              {trimmedNote && (
+                <button
+                  type="button"
+                  disabled={blockedByBusy}
+                  onClick={sendCustomNote}
+                  className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-caption font-medium text-fg hover:bg-hover disabled:opacity-40 [@media(hover:none)]:min-h-11"
+                >
+                  直接发送说明
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       )}
       {sent && sentText && <p className="px-1 text-caption text-faint">已选择:{sentText}</p>}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (

@@ -59,6 +59,16 @@ describe('normalizeInlineUiFences (server twin)', () => {
       normalizeInlineUiFences('2```ui{"type":"next","text":"那2+2呢?"}\n```'),
       '2\n```ui\n{"type":"next","text":"那2+2呢?"}\n```',
     )
+    assert.equal(
+      normalizeInlineUiFences('```ui\n{"type":"next","text":"继续"}\n```API Error: 409'),
+      '```ui\n{"type":"next","text":"继续"}\n```\nAPI Error: 409',
+    )
+    const embeddedCode = '```ui\n{"type":"draft","variants":[{"text":"用 ```{\\"ok\\":true}``` 表示 JSON 示例。"}]}\n```'
+    assert.equal(normalizeInlineUiFences(embeddedCode), embeddedCode)
+    assert.equal(
+      normalizeInlineUiFences('```ui\n{"type":"next","text":"半截\n```API Error: 409'),
+      '```ui\n{"type":"next","text":"半截\n```\nAPI Error: 409',
+    )
   })
 })
 
