@@ -11,31 +11,10 @@ import assert from "node:assert/strict";
 import { renderVerifyEmail } from "../auth/verifyEmailTemplate.js";
 
 const LEGACY_REGISTER_TEXT = (code: string): string =>
-  `你好,欢迎使用 OpenClaude。\n\n` +
-  `这是一封由 OpenClaude（claudeai.chat）发出的邮箱验证邮件。你的验证码是:\n\n` +
-  `    ${code}\n\n` +
-  `请在有效期内回到注册页输入此验证码完成验证。\n` +
-  `验证码 30 分钟内有效,一次性使用。若验证码过期,可在注册页点「重新发送」。\n\n` +
-  `请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n` +
-  `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
-  `   并把 OpenClaude 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n` +
-  `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n` +
-  `—— OpenClaude 团队\n` +
-  `claudeai.chat`;
+  `你好,欢迎使用 OpenClaude。\n\n这是一封由 OpenClaude（claudeai.chat）发出的邮箱验证邮件。你的验证码是:\n\n    ${code}\n\n请在有效期内回到注册页输入此验证码完成验证。\n验证码 30 分钟内有效,一次性使用。若验证码过期,可在注册页点「重新发送」。\n\n请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n   并把 OpenClaude 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n—— OpenClaude 团队\nclaudeai.chat`;
 
 const LEGACY_RESEND_TEXT = (code: string): string =>
-  `你好,这是一封由 OpenClaude（claudeai.chat）发出的邮件。\n\n` +
-  `你的新邮箱验证码是:\n\n` +
-  `    ${code}\n\n` +
-  `请在有效期内回到注册页输入此验证码完成验证。\n` +
-  `验证码 30 分钟内有效,一次性使用。此前发出的旧验证码已作废。\n` +
-  `若验证码过期,可在注册页点「重新发送」。\n\n` +
-  `请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n` +
-  `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
-  `   并把 OpenClaude 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n` +
-  `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n` +
-  `—— OpenClaude 团队\n` +
-  `claudeai.chat`;
+  `你好,这是一封由 OpenClaude（claudeai.chat）发出的邮件。\n\n你的新邮箱验证码是:\n\n    ${code}\n\n请在有效期内回到注册页输入此验证码完成验证。\n验证码 30 分钟内有效,一次性使用。此前发出的旧验证码已作废。\n若验证码过期,可在注册页点「重新发送」。\n\n请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n   并把 OpenClaude 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n—— OpenClaude 团队\nclaudeai.chat`;
 
 describe("auth.verifyEmailTemplate", () => {
   test("register: subject and text unchanged from the plain-text version", () => {

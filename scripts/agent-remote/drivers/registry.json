@@ -87,6 +87,35 @@
         "recycle-app",
         "reprovision-app"
       ]
+    },
+    "antigravity": {
+      "driverId": "antigravity",
+      "engineId": "antigravity",
+      "authorityEngine": "antigravity",
+      "driverVersion": "1.0.0",
+      "module": "drivers/antigravity.py",
+      "runnerMode": "stream-json-stdio",
+      "slice": "oc-antigravity.slice",
+      "sliceMemoryMiB": 4096,
+      "sliceTasksMax": 768,
+      "appMemoryMiB": 1024,
+      "socketMemoryMiB": 128,
+      "probeMemoryMiB": 768,
+      "headroomMiB": 768,
+      "profileMaxLanes": 5,
+      "requireNodeObservation": true,
+      "roles": [
+        "provision",
+        "preflight",
+        "launch",
+        "tool-socket",
+        "stop",
+        "fence-stop",
+        "prove-stopped",
+        "probe",
+        "recycle-app",
+        "reprovision-app"
+      ]
     }
   }
 }

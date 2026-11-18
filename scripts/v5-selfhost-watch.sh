@@ -57,6 +57,8 @@ WATCH_DISK_WARN_GIB="${WATCH_DISK_WARN_GIB:-15}"
 WATCH_DISK_CRIT_GIB="${WATCH_DISK_CRIT_GIB:-10}"
 WATCH_PG_BACKUP_STATUS="${WATCH_PG_BACKUP_STATUS:-/var/lib/openclaude-v5-selfhost/pg-backup-status.json}"
 WATCH_PG_BACKUP_MAX_AGE_SEC="${WATCH_PG_BACKUP_MAX_AGE_SEC:-129600}"
+WATCH_AUTOSAVE_STATUS="${WATCH_AUTOSAVE_STATUS:-/var/lib/openclaude-v5-selfhost/harness-autosave-status.json}"
+WATCH_AUTOSAVE_MAX_STALE_SEC="${WATCH_AUTOSAVE_MAX_STALE_SEC:-7200}"
 WATCH_STUB_DISK_AVAIL_BYTES="${WATCH_STUB_DISK_AVAIL_BYTES:-}"
 
 # Reliable absence only; installed recovery scripts do not import a helper.
@@ -1346,6 +1348,68 @@ host_backup_age() {
   fi
 }
 
+# OCV5-751: harness autosave 状态只读检查（warn-only，不影响健康判定或退出码）。
+host_autosave_check() {
+  local f="$WATCH_AUTOSAVE_STATUS"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  local now max_stale non_agent=0 dirty_count=0 dirty_since="" last_ok_at="" consec_fail=0 last_err=""
+  local last_ok_epoch="" dirty_since_epoch="" last_ok_stale=0 dirty_stale=0 level=ok
+  local reasons=() msg=""
+
+  now="$(watch_now)"
+  max_stale="$WATCH_AUTOSAVE_MAX_STALE_SEC"
+  [[ "$max_stale" =~ ^[0-9]+$ ]] || max_stale=7200
+
+  if jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+    non_agent="$(jq -r '(.nonAgentGitEntries // 0) | if type == "number" then floor else 0 end' "$f" 2>/dev/null || echo 0)"
+    dirty_count="$(jq -r '(.dirtyCount // 0) | if type == "number" then floor else 0 end' "$f" 2>/dev/null || echo 0)"
+    dirty_since="$(jq -r '.dirtySince // empty' "$f" 2>/dev/null || true)"
+    last_ok_at="$(jq -r '.lastOkAt // empty' "$f" 2>/dev/null || true)"
+    consec_fail="$(jq -r '(.consecutiveFailures // 0) | if type == "number" then floor else 0 end' "$f" 2>/dev/null || echo 0)"
+    last_err="$(jq -r '.lastError // empty' "$f" 2>/dev/null | tr '\r\n\t' '   ' | cut -c1-120 || true)"
+  else
+    reasons+=("状态文件不可解析")
+  fi
+  [[ "$non_agent" =~ ^[0-9]+$ ]] || non_agent=0
+  [[ "$dirty_count" =~ ^[0-9]+$ ]] || dirty_count=0
+  [[ "$consec_fail" =~ ^[0-9]+$ ]] || consec_fail=0
+
+  if [[ -n "$last_ok_at" ]]; then
+    last_ok_epoch="$(date -u -d "$last_ok_at" +%s 2>/dev/null || true)"
+  fi
+  if [[ ! "$last_ok_epoch" =~ ^[0-9]+$ ]] || (( now - last_ok_epoch > max_stale )); then
+    last_ok_stale=1
+  fi
+
+  if [[ -n "$dirty_since" ]]; then
+    dirty_since_epoch="$(date -u -d "$dirty_since" +%s 2>/dev/null || true)"
+  fi
+  if (( dirty_count > 0 )) && [[ "$dirty_since_epoch" =~ ^[0-9]+$ ]] && (( now - dirty_since_epoch > max_stale )); then
+    dirty_stale=1
+  fi
+
+  if (( non_agent > 0 )); then
+    level=unhealthy
+    reasons+=("nonAgentGitEntries=${non_agent}")
+  fi
+  if (( dirty_count > 0 && (dirty_stale || last_ok_stale) )); then
+    level=unhealthy
+    reasons+=("dirtyCount=${dirty_count}(dirtySince=${dirty_since:-unknown})")
+  fi
+  if (( last_ok_stale )); then
+    level=unhealthy
+    reasons+=("lastOkAt=${last_ok_at:-missing}(超过${max_stale}s)")
+  fi
+
+  if [[ "$level" == ok ]]; then
+    msg="harness autosave 状态正常（lastOkAt=${last_ok_at}，dirtyCount=${dirty_count}）。"
+  else
+    local reason_str="${reasons[*]}"
+    msg="harness autosave 异常：${reason_str}，consecutiveFailures=${consec_fail}${last_err:+，lastError=${last_err}}。下一步：scripts/v5-selfhost-harness-autosave.sh --status；journalctl -t oc-autosave-fail。"
+  fi
+  host_notify harness_autosave "$level" warning harness_autosave_unhealthy "$msg"
+}
+
 host_checks() {
   local gib=1073741824 avail level sev age desc
   avail="$(host_disk_avail_bytes || true)"
@@ -1373,6 +1437,7 @@ host_checks() {
     fi
     host_notify pg_backup "$level" warning pg_backup_stale "个人版 PG 备份 core 层最近成功：${desc}（上限 $(( WATCH_PG_BACKUP_MAX_AGE_SEC / 3600 )) 小时）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
   fi
+  host_autosave_check || true
   return 0
 }
 

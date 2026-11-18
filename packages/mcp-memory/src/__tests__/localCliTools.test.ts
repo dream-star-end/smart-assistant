@@ -16,19 +16,28 @@ import {
   LOCAL_CLI_TOOL_NAMES,
   OC_BASH_MAX_TIMEOUT_MS,
   OC_BASH_MIN_TIMEOUT_MS,
+  OC_GREP_MAX_LINE_CHARS,
   ocGlobArgv,
   ocGrepArgv,
   runCaptured,
 } from '../localCliTools.js'
+import { TOOLS } from '../toolDefs.js'
 
 describe('clampInt', () => {
-  it('falls back, floors, and clamps', () => {
+  it('falls back, floors, and clamps up to the 600s Antigravity ceiling in lockstep with toolDefs', () => {
     assert.equal(clampInt(undefined, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS), 60_000)
-    assert.equal(clampInt('nope', 60_000, 1_000, 170_000), 60_000)
-    assert.equal(clampInt(500, 60_000, 1_000, 170_000), 1_000)
-    assert.equal(clampInt(999_999, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS), 170_000)
-    assert.equal(OC_BASH_MAX_TIMEOUT_MS, 170_000)
-    assert.equal(clampInt(1500.9, 60_000, 1_000, 170_000), 1500)
+    assert.equal(clampInt('nope', 60_000, 1_000, 600_000), 60_000)
+    assert.equal(clampInt(500, 60_000, 1_000, 600_000), 1_000)
+    assert.equal(clampInt(300_000, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS), 300_000)
+    assert.equal(clampInt(999_999, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS), 600_000)
+    assert.equal(OC_BASH_MAX_TIMEOUT_MS, 600_000)
+    assert.equal(clampInt(1500.9, 60_000, 1_000, 600_000), 1500)
+    const ocBashDef = TOOLS.find((t) => t.name === 'oc_bash')
+    assert.ok(ocBashDef, 'oc_bash definition must exist in TOOLS')
+    const timeoutProp = (ocBashDef.inputSchema.properties as Record<string, { maximum?: number }>).timeout_ms
+    assert.equal(timeoutProp?.maximum, OC_BASH_MAX_TIMEOUT_MS)
+    assert.match(ocBashDef.description, /600000/)
+    assert.equal(ocBashDef.description.includes('170000'), false)
   })
 })
 
@@ -75,10 +84,10 @@ describe('oc_bash', () => {
     assert.match(result.content[0]!.text, /exit=7/)
   })
 
-  it('caps timeout_ms 999999 at 170000 and still returns a short command', async () => {
+  it('caps timeout_ms 999999 at 600000 and still returns a short command', async () => {
     assert.equal(
       clampInt(999_999, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS),
-      170_000,
+      600_000,
     )
     const started = Date.now()
     const result = await handleOcBash({ command: 'echo capped', timeout_ms: 999_999 })
@@ -177,6 +186,28 @@ describe('oc_grep / oc_glob', () => {
     const globbed = await handleOcGlob({ pattern: '*.ts' }, { rgBin: null })
     assert.equal(globbed.isError, true)
     assert.match(globbed.content[0]!.text, /找不到 rg/)
+  })
+
+  it('bounds single-line minified oc_grep hits without splitting UTF-16 surrogate pairs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-cli-longline-'))
+    try {
+      // Place an emoji (surrogate pair) straddling the exact cut index so naive slice() would leave a lone high surrogate.
+      const prefixLen = OC_GREP_MAX_LINE_CHARS - 20
+      const linePrefix = 'a'.repeat(prefixLen)
+      // Note: rg prepends `<file>:1:` to the output line; pad across a range of offsets with emojis to guarantee surrogate safety.
+      const emojiRun = '🚀'.repeat(40)
+      writeFileSync(join(dir, 'minified.js'), `const bundle = "${linePrefix}${emojiRun}${'z'.repeat(5000)}";\n`)
+
+      const hit = await handleOcGrep({ pattern: 'bundle', path: dir })
+      assert.equal(hit.isError, undefined)
+      const text = hit.content[0]!.text
+      assert.match(text, /\[truncated\]$/)
+      const firstLine = text.split('\n')[0]!
+      assert.ok(firstLine.length <= OC_GREP_MAX_LINE_CHARS + 1)
+      assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text), false, 'must not emit lone UTF-16 surrogates')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

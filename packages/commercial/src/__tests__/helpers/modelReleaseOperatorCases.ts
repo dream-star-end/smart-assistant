@@ -55,18 +55,18 @@ async function issueLease(): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     holder.stdout.on("data", (chunk) => { output += chunk.toString(); if(output.includes("READY\n")) resolve(); });
     holder.once("error", reject);
-    holder.once("exit", (code) => reject(new Error("holder exited before readiness:" + code)));
+    holder.once("exit", (code) => reject(new Error(`holder exited before readiness:${code}`)));
   });
   const pid = holder.pid!;
-  const kernel = await readFile("/proc/" + pid + "/stat", "utf8");
+  const kernel = await readFile(`/proc/${pid}/stat`, "utf8");
   const start = kernel.slice(kernel.lastIndexOf(") ") + 2).split(/\s+/)[19];
   const lock = await stat(context.leasePaths!.lock, { bigint: true });
   const primary = await withClient(primaryIdentity);
   const proof = { schema:1, nonce, holderPid:pid, holderStart:start,
-    lockDevIno: lock.dev + ":" + lock.ino, expiresAt: Math.floor(Date.now()/1000)+600, ...primary };
+    lockDevIno: `${lock.dev}:${lock.ino}`, expiresAt: Math.floor(Date.now()/1000)+600, ...primary };
   for (const [path, text] of [
-    [context.leasePaths!.commonNonce, nonce + "\n"], [context.leasePaths!.manualNonce, nonce + "\n"],
-    [context.leasePaths!.commonNonce + ".db", JSON.stringify(proof)],
+    [context.leasePaths!.commonNonce, `${nonce}\n`], [context.leasePaths!.manualNonce, `${nonce}\n`],
+    [`${context.leasePaths!.commonNonce}.db`, JSON.stringify(proof)],
   ]) { await writeFile(path, text, { mode:0o600 }); await chmod(path,0o600); }
 }
 async function stopHolder(): Promise<void> {
@@ -100,7 +100,7 @@ async function seedProductionFloor(): Promise<void> {
           "cache_read_per_mtok","cache_write_per_mtok","multiplier"].map((key)=>target.pricing[key])]);
       old=(await pool.query("SELECT * FROM model_catalog WHERE entry_id=$1",[staged.rows[0].id])).rows[0];
     }
-    assert.ok(old, "full migration chain must contain frozen existing " + target.catalog.model_id);
+    assert.ok(old, `full migration chain must contain frozen existing ${target.catalog.model_id}`);
     if (digest(Object.fromEntries(catalogKeys.map((key) => [key, old[key]]))) !==
       digest(Object.fromEntries(catalogKeys.map((key) => [key, target.catalog[key]])))) {
       const switched = await pool.query("SELECT fn_model_switch_version($1,$2,$3,$4,$5,$6::jsonb,$7,1,$8) AS id",
@@ -111,9 +111,7 @@ async function seedProductionFloor(): Promise<void> {
     }
     if (old.state === "disabled" || old.state === "staged") await pool.query("SELECT fn_model_activate_entry($1,$2,1)",
       [old.entry_id,old.lock_version]);
-    const updated = await pool.query("UPDATE model_pricing SET " +
-      priceKeys.map((key,i) => key+"=$"+(i+2)).join(",") +
-      ",lock_version=lock_version+1,updated_by=1,updated_at=now() WHERE model_id=$1 RETURNING model_id",
+    const updated = await pool.query(`UPDATE model_pricing SET ${priceKeys.map((key,i) => `${key}=$${i+2}`).join(",")},lock_version=lock_version+1,updated_by=1,updated_at=now() WHERE model_id=$1 RETURNING model_id`,
       [target.catalog.model_id,...priceKeys.map((key) => target.pricing[key])]);
     assert.equal(updated.rowCount,1);
     if (target.catalog.model_id === "oc-catalog-canary-glm52") {
@@ -125,7 +123,7 @@ async function seedProductionFloor(): Promise<void> {
   for (const [provider,donor] of [["claude","claude-opus-5"],["cursor","cursor-grok-4.6-high"],
     ["grok","grok-build"],["codex","gpt-5.6-sol"]]) {
     const group = await pool.query("INSERT INTO account_groups(label,provider,kind,enabled) " +
-      "VALUES($1,$2,'official_oauth',TRUE) RETURNING id",["Operator fixture "+provider,provider]);
+      "VALUES($1,$2,'official_oauth',TRUE) RETURNING id",[`Operator fixture ${provider}`,provider]);
     await pool.query("INSERT INTO account_group_models(group_id,model_id) VALUES($1,$2)",
       [group.rows[0].id,donor]);
     if(provider==="codex") await pool.query("INSERT INTO account_group_models(group_id,model_id) " +
@@ -137,7 +135,7 @@ function request(runId: string): WriteRequest {
   return { runId,nonce,observation,readiness:ready };
 }
 function registerFixedGroup(group: "A" | "B" | "C" | "D" | "E") {
-db = useDedicatedTestDatabase("commercial_model_release_operator_"+group.toLowerCase()+"_test");
+db = useDedicatedTestDatabase(`commercial_model_release_operator_${group.toLowerCase()}_test`);
 describe("actual PG model release operator", () => {
 before(async () => {
   assert.equal(db.available,true,"parent dedicated DB before hook must have completed");
@@ -145,8 +143,9 @@ before(async () => {
   root = await mkdtemp(join(tmpdir(),"ocv5-308-operator-"));
   const releasesRoot = join(root,"releases"); await mkdir(releasesRoot);
   const sourceCommit="2188af24d8e451abb0a36259700b769ddc8f3719";
-  const builtAt="20261003-120000", short=sourceCommit.slice(0,9);
-  const release=join(releasesRoot,"rel-"+short+"-"+builtAt);
+  const builtAt="20261003-120000";
+  const short=sourceCommit.slice(0,9);
+  const release=join(releasesRoot,`rel-${short}-${builtAt}`);
   fixtureRelease=release;
   await mkdir(join(release,"deploy/v5"),{recursive:true});
   const metadata=Buffer.from(JSON.stringify({requiredMigrations:["0293_commercial_new_models_prepare"]}));
@@ -179,22 +178,22 @@ test("explicit authorized DSN and all non-null catalog CAS inputs fail closed",(
 
 function scenario02() {
 test("read-only preflight refuses actual 0144 deploy role and performs no model writes",async()=>{
-  const role="ocv5308_deploy_"+process.pid;
+  const role=`ocv5308_deploy_${process.pid}`;
   const before=await withClient(readSnapshot);
   const client=await connect();
   try{
-    await client.query('CREATE ROLE "'+role+'"');
-    await client.query("GRANT USAGE ON SCHEMA public TO "+role);
+    await client.query(`CREATE ROLE "${role}"`);
+    await client.query(`GRANT USAGE ON SCHEMA public TO ${role}`);
     await client.query("SELECT fn_model_authority_grant_deploy_role($1)",[role]);
-    await client.query("SET ROLE "+role);
+    await client.query(`SET ROLE ${role}`);
     await assert.rejects(permissionPreflight(client),/OPERATOR_PRIVILEGES_INSUFFICIENT/);
     await assert.rejects(apply(client,context,request("denied_deploy_role")),/OPERATOR_PRIVILEGES_INSUFFICIENT/);
     await client.query("RESET ROLE");
     assert.deepEqual(await readSnapshot(client),before);
   }finally{
     await client.query("RESET ROLE").catch(()=>{});
-    await client.query("DROP OWNED BY "+role).catch(()=>{});
-    await client.query("DROP ROLE IF EXISTS "+role).catch(()=>{});
+    await client.query(`DROP OWNED BY ${role}`).catch(()=>{});
+    await client.query(`DROP ROLE IF EXISTS ${role}`).catch(()=>{});
     await client.end();
   }
 });
@@ -202,7 +201,7 @@ test("read-only preflight refuses actual 0144 deploy role and performs no model 
 
 function scenario03() {
 test("stale snapshot or expired/wrong-type/wrong-primary proof refuses all activation atomically",async()=>{
-  const proofPath=context.leasePaths!.commonNonce+".db";
+  const proofPath=`${context.leasePaths!.commonNonce}.db`;
   const original=await readFile(proofPath);
   const before=await withClient(readSnapshot);
   for(const change of [
@@ -210,7 +209,7 @@ test("stale snapshot or expired/wrong-type/wrong-primary proof refuses all activ
   ]){
     const proof={...JSON.parse(original.toString()),...change};
     await writeFile(proofPath,JSON.stringify(proof));
-    await assert.rejects(withClient((client)=>apply(client,context,request("invalid_proof_"+Object.keys(change)[0]))));
+    await assert.rejects(withClient((client)=>apply(client,context,request(`invalid_proof_${Object.keys(change)[0]}`))));
     assert.deepEqual(await withClient(readSnapshot),before);
   }
   await writeFile(proofPath,original);
@@ -284,7 +283,7 @@ test("absent receipt remains UNKNOWN and never initiates apply",async()=>{
 // Each CLI invocation gets a real private mount namespace. Fixed production
 // paths are backed only by this _test fixture; no live/donor path is touched.
 async function privateCli(args: string[], options: { limitOutput?: boolean; nonRoot?: boolean } = {}) {
-  const trace = join(root,"namespace-"+randomBytes(8).toString("hex"));
+  const trace = join(root,`namespace-${randomBytes(8).toString("hex")}`);
   const parent = await readFile("/proc/self/mountinfo","utf8");
   const script = [
     "set -euo pipefail; umask 077",
@@ -329,7 +328,8 @@ async function privateCli(args: string[], options: { limitOutput?: boolean; nonR
       CB_MODULES:await realpath(fileURLToPath(new URL("../../../../../node_modules",import.meta.url))),
       CB_NODE:process.execPath, CB_LIMIT_OUTPUT:options.limitOutput?"1":"0", CB_NONROOT:options.nonRoot?"1":"0",
     }, stdio:["ignore","pipe","pipe"] });
-  let stdout="",stderr="";
+  let stdout="";
+  let stderr="";
   child.stdout.on("data",(chunk)=>{stdout+=chunk.toString();});
   child.stderr.on("data",(chunk)=>{stderr+=chunk.toString();});
   let expired=false;
@@ -337,22 +337,22 @@ async function privateCli(args: string[], options: { limitOutput?: boolean; nonR
   const [code,signal]=await once(child,"exit"); clearTimeout(deadline);
   assert.equal(expired,false,"actual CLI must terminate without consuming the fixture lease TTL");
   assert.equal(signal,null,"namespace CLI must exit normally");
-  const childNamespace=(await readFile(trace+".ns","utf8")).trim();
+  const childNamespace=(await readFile(`${trace}.ns`,"utf8")).trim();
   const parentNamespace=await readlink("/proc/self/ns/mnt");
   assert.notEqual(childNamespace,parentNamespace);
-  const beforeMounts=await readFile(trace+".mountinfo.before","utf8");
+  const beforeMounts=await readFile(`${trace}.mountinfo.before`,"utf8");
   assert.equal(/ (?:shared|master):/.test(beforeMounts),false,"mount propagation must be private BEFORE mounting");
   assert.equal(await readFile("/proc/self/mountinfo","utf8"),parent,"host mount topology unchanged");
-  const afterMounts=await readFile(trace+".mountinfo.after","utf8").catch((cause: unknown) => {
+  const afterMounts=await readFile(`${trace}.mountinfo.after`,"utf8").catch((cause: unknown) => {
     throw new Error(`namespace CLI preparation did not complete (exit=${code}): ${stderr}`, {cause});
   });
-  console.log("OPERATOR_NAMESPACE_EVIDENCE "+JSON.stringify({
+  console.log(`OPERATOR_NAMESPACE_EVIDENCE ${JSON.stringify({
     childNamespace,parentNamespace,privatePropagation:true,hostUnchanged:true,
     beforeSha256:createHash("sha256").update(beforeMounts).digest("hex"),
     afterSha256:createHash("sha256").update(afterMounts).digest("hex"),
     hostSha256:createHash("sha256").update(parent).digest("hex"),
     nonRoot:!!options.nonRoot,limitOutput:!!options.limitOutput,code,
-  }));
+  })}`);
   return {code:code as number,stdout,stderr,trace};
 }
 async function resetFixture() {
@@ -367,16 +367,16 @@ async function resetFixture() {
 async function configureCliFixture() {
   await resetFixture();
   await getPool().query("UPDATE deploy_state SET active_release=$1,lock_version=lock_version+1 WHERE singleton",
-    ["/opt/openclaude/openclaude-v5-releases/"+fixtureRelease.split("/").at(-1)]);
+    [`/opt/openclaude/openclaude-v5-releases/${fixtureRelease.split("/").at(-1)}`]);
   const bundle=join(root,"model-release-operator.mjs");
   buildSync({ entryPoints:[fileURLToPath(new URL("../../../../../ops/ocv5-308/model-release-operator.ts",import.meta.url))],
     outfile:bundle,platform:"node",format:"esm",packages:"external",bundle:true });
   await chmod(bundle,0o644);
-  const output=join(root,"cli-observation-"+randomBytes(8).toString("hex")+".json");
+  const output=join(root,`cli-observation-${randomBytes(8).toString("hex")}.json`);
   const result=await privateCli(["observe","--out",output]);
   assert.equal(result.code,0,result.stderr);
   const observed=JSON.parse(await readFile(output,"utf8")) as Observation;
-  const readiness=join(root,"cli-readiness-"+randomBytes(8).toString("hex")+".json");
+  const readiness=join(root,`cli-readiness-${randomBytes(8).toString("hex")}.json`);
   await writeFile(readiness,JSON.stringify({...ready,manifestSha256:observed.manifestSha256,
     sourceCommit:observed.release.sourceCommit,metadataSha256:observed.release.metadataSha256}),{mode:0o600});
   return {output,readiness,observed};
@@ -395,7 +395,7 @@ test("actual fixed-path CLI refuses existing output and malformed authority file
 
   const fifo=join(root,"readiness-fifo");await new Promise<void>((resolve,reject)=>{
     const child=spawn("mkfifo",["-m","600",fifo]);child.once("error",reject);
-    child.once("exit",(code)=>code===0?resolve():reject(new Error("mkfifo:"+code)));
+    child.once("exit",(code)=>code===0?resolve():reject(new Error(`mkfifo:${code}`)));
   });
   const started=Date.now();
   const fifoResult=await privateCli(["apply","--observation",cli.output,"--readiness",fifo,
@@ -404,12 +404,12 @@ test("actual fixed-path CLI refuses existing output and malformed authority file
   assert.ok(Date.now()-started<5000,"FIFO rejected promptly with no writer, not via lease timeout");
   assert.deepEqual(await withClient(readSnapshot),before);
 
-  const proofPath=context.leasePaths!.commonNonce+".db";
+  const proofPath=`${context.leasePaths!.commonNonce}.db`;
   const original=await readFile(proofPath);
   for(const patch of [{holderStart:"1"},{expiresAt:1},{database:"wrong_primary_test"}]){
     await writeFile(proofPath,JSON.stringify({...JSON.parse(original.toString()),...patch}));
     const result=await privateCli(["apply","--observation",cli.output,"--readiness",cli.readiness,
-      "--run-id","cli_invalid_"+Object.keys(patch)[0],"--out",join(root,"invalid-"+Object.keys(patch)[0]+".json")]);
+      "--run-id",`cli_invalid_${Object.keys(patch)[0]}`,"--out",join(root,`invalid-${Object.keys(patch)[0]}.json`)]);
     assert.equal(result.code,1,result.stderr);
     assert.deepEqual(await withClient(readSnapshot),before);
   }
@@ -495,13 +495,13 @@ const driftCases: Array<[string,(client:Client)=>Promise<unknown>,RegExp]>=[
 ];
 function scenario11() {
 const [name,mutate,error] = driftCases[0]!;
-test("actual "+name+" admin drift is retained while stale activation refuses every operator effect",async()=>{
+test(`actual ${name} admin drift is retained while stale activation refuses every operator effect`,async()=>{
   await resetFixture();
   await withClient(mutate);
   const changed=await withClient(readSnapshot);
   if(name!=="release")assert.notEqual(digest(changed),observation.snapshotSha256);
   const audit=await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'");
-  await assert.rejects(withClient((client)=>apply(client,context,request("stale_real_"+name))),error);
+  await assert.rejects(withClient((client)=>apply(client,context,request(`stale_real_${name}`))),error);
   assert.deepEqual(await withClient(readSnapshot),changed,"must preserve the legitimate admin change");
   assert.deepEqual((await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'")).rows,audit.rows);
 });
@@ -509,13 +509,13 @@ test("actual "+name+" admin drift is retained while stale activation refuses eve
 
 function scenario12() {
 const [name,mutate,error] = driftCases[1]!;
-test("actual "+name+" admin drift is retained while stale activation refuses every operator effect",async()=>{
+test(`actual ${name} admin drift is retained while stale activation refuses every operator effect`,async()=>{
   await resetFixture();
   await withClient(mutate);
   const changed=await withClient(readSnapshot);
   if(name!=="release")assert.notEqual(digest(changed),observation.snapshotSha256);
   const audit=await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'");
-  await assert.rejects(withClient((client)=>apply(client,context,request("stale_real_"+name))),error);
+  await assert.rejects(withClient((client)=>apply(client,context,request(`stale_real_${name}`))),error);
   assert.deepEqual(await withClient(readSnapshot),changed,"must preserve the legitimate admin change");
   assert.deepEqual((await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'")).rows,audit.rows);
 });
@@ -523,13 +523,13 @@ test("actual "+name+" admin drift is retained while stale activation refuses eve
 
 function scenario13() {
 const [name,mutate,error] = driftCases[2]!;
-test("actual "+name+" admin drift is retained while stale activation refuses every operator effect",async()=>{
+test(`actual ${name} admin drift is retained while stale activation refuses every operator effect`,async()=>{
   await resetFixture();
   await withClient(mutate);
   const changed=await withClient(readSnapshot);
   if(name!=="release")assert.notEqual(digest(changed),observation.snapshotSha256);
   const audit=await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'");
-  await assert.rejects(withClient((client)=>apply(client,context,request("stale_real_"+name))),error);
+  await assert.rejects(withClient((client)=>apply(client,context,request(`stale_real_${name}`))),error);
   assert.deepEqual(await withClient(readSnapshot),changed,"must preserve the legitimate admin change");
   assert.deepEqual((await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'")).rows,audit.rows);
 });
@@ -537,13 +537,13 @@ test("actual "+name+" admin drift is retained while stale activation refuses eve
 
 function scenario14() {
 const [name,mutate,error] = driftCases[3]!;
-test("actual "+name+" admin drift is retained while stale activation refuses every operator effect",async()=>{
+test(`actual ${name} admin drift is retained while stale activation refuses every operator effect`,async()=>{
   await resetFixture();
   await withClient(mutate);
   const changed=await withClient(readSnapshot);
   if(name!=="release")assert.notEqual(digest(changed),observation.snapshotSha256);
   const audit=await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'");
-  await assert.rejects(withClient((client)=>apply(client,context,request("stale_real_"+name))),error);
+  await assert.rejects(withClient((client)=>apply(client,context,request(`stale_real_${name}`))),error);
   assert.deepEqual(await withClient(readSnapshot),changed,"must preserve the legitimate admin change");
   assert.deepEqual((await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'")).rows,audit.rows);
 });
@@ -551,13 +551,13 @@ test("actual "+name+" admin drift is retained while stale activation refuses eve
 
 function scenario15() {
 const [name,mutate,error] = driftCases[4]!;
-test("actual "+name+" admin drift is retained while stale activation refuses every operator effect",async()=>{
+test(`actual ${name} admin drift is retained while stale activation refuses every operator effect`,async()=>{
   await resetFixture();
   await withClient(mutate);
   const changed=await withClient(readSnapshot);
   if(name!=="release")assert.notEqual(digest(changed),observation.snapshotSha256);
   const audit=await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'");
-  await assert.rejects(withClient((client)=>apply(client,context,request("stale_real_"+name))),error);
+  await assert.rejects(withClient((client)=>apply(client,context,request(`stale_real_${name}`))),error);
   assert.deepEqual(await withClient(readSnapshot),changed,"must preserve the legitimate admin change");
   assert.deepEqual((await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'")).rows,audit.rows);
 });
@@ -565,13 +565,13 @@ test("actual "+name+" admin drift is retained while stale activation refuses eve
 
 function scenario16() {
 const [name,mutate,error] = driftCases[5]!;
-test("actual "+name+" admin drift is retained while stale activation refuses every operator effect",async()=>{
+test(`actual ${name} admin drift is retained while stale activation refuses every operator effect`,async()=>{
   await resetFixture();
   await withClient(mutate);
   const changed=await withClient(readSnapshot);
   if(name!=="release")assert.notEqual(digest(changed),observation.snapshotSha256);
   const audit=await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'");
-  await assert.rejects(withClient((client)=>apply(client,context,request("stale_real_"+name))),error);
+  await assert.rejects(withClient((client)=>apply(client,context,request(`stale_real_${name}`))),error);
   assert.deepEqual(await withClient(readSnapshot),changed,"must preserve the legitimate admin change");
   assert.deepEqual((await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'")).rows,audit.rows);
 });
@@ -579,13 +579,13 @@ test("actual "+name+" admin drift is retained while stale activation refuses eve
 
 function scenario17() {
 const [name,mutate,error] = driftCases[6]!;
-test("actual "+name+" admin drift is retained while stale activation refuses every operator effect",async()=>{
+test(`actual ${name} admin drift is retained while stale activation refuses every operator effect`,async()=>{
   await resetFixture();
   await withClient(mutate);
   const changed=await withClient(readSnapshot);
   if(name!=="release")assert.notEqual(digest(changed),observation.snapshotSha256);
   const audit=await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'");
-  await assert.rejects(withClient((client)=>apply(client,context,request("stale_real_"+name))),error);
+  await assert.rejects(withClient((client)=>apply(client,context,request(`stale_real_${name}`))),error);
   assert.deepEqual(await withClient(readSnapshot),changed,"must preserve the legitimate admin change");
   assert.deepEqual((await getPool().query("SELECT count(*)::int AS n FROM admin_audit WHERE action='ocv5-308.model-release'")).rows,audit.rows);
 });
@@ -601,14 +601,14 @@ test("fourth actual activation fault rolls back earlier three real activations, 
   const noticeListener=(notice: {message?:string})=>{if(notice.message?.startsWith("OCV5308_ACTIVATION_REACHED:"))reached.push(notice.message.slice("OCV5308_ACTIVATION_REACHED:".length));};
   client.on("notice",noticeListener);
   try{
-    await client.query("CREATE FUNCTION ocv5308_fixture_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state='active' AND OLD.state='staged' AND NEW.model_id='"+ids[3]+"' THEN RAISE EXCEPTION 'OCV5308_FOURTH_ACTIVATION_FAULT'; END IF; RETURN NEW; END $$; CREATE TRIGGER ocv5308_fixture_fault BEFORE UPDATE ON model_catalog FOR EACH ROW EXECUTE FUNCTION ocv5308_fixture_fault()");
-    await client.query("CREATE FUNCTION ocv5308_fixture_notice() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.state IS DISTINCT FROM 'active' AND NEW.state='active' AND NEW.model_id IN ('"+ids.slice(0,3).join("','")+"') THEN RAISE NOTICE 'OCV5308_ACTIVATION_REACHED:%',NEW.model_id; END IF; RETURN NEW; END $$; CREATE TRIGGER ocv5308_fixture_notice AFTER UPDATE ON model_catalog FOR EACH ROW EXECUTE FUNCTION ocv5308_fixture_notice()");
+    await client.query(`CREATE FUNCTION ocv5308_fixture_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state='active' AND OLD.state='staged' AND NEW.model_id='${ids[3]}' THEN RAISE EXCEPTION 'OCV5308_FOURTH_ACTIVATION_FAULT'; END IF; RETURN NEW; END $$; CREATE TRIGGER ocv5308_fixture_fault BEFORE UPDATE ON model_catalog FOR EACH ROW EXECUTE FUNCTION ocv5308_fixture_fault()`);
+    await client.query(`CREATE FUNCTION ocv5308_fixture_notice() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.state IS DISTINCT FROM 'active' AND NEW.state='active' AND NEW.model_id IN ('${ids.slice(0,3).join("','")}') THEN RAISE NOTICE 'OCV5308_ACTIVATION_REACHED:%',NEW.model_id; END IF; RETURN NEW; END $$; CREATE TRIGGER ocv5308_fixture_notice AFTER UPDATE ON model_catalog FOR EACH ROW EXECUTE FUNCTION ocv5308_fixture_notice()`);
     const before=await readSnapshot(client);
     await assert.rejects(apply(client,context,request("mid_activation_real_fault")),/OCV5308_FOURTH_ACTIVATION_FAULT/);
     assert.deepEqual(reached,ids.slice(0,3),"three real AFTER UPDATE notices prove earlier DML executed before rollback");
     assert.deepEqual(await readSnapshot(client),before);
     assert.equal((await client.query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release'")).rowCount,0);
-    console.log("OPERATOR_ROLLBACK_EVIDENCE "+JSON.stringify({reached,failedModel:ids[3],snapshotAndEpochRestored:true,receipts:0}));
+    console.log(`OPERATOR_ROLLBACK_EVIDENCE ${JSON.stringify({reached,failedModel:ids[3],snapshotAndEpochRestored:true,receipts:0})}`);
   }finally{
     await client.query("DROP TRIGGER IF EXISTS ocv5308_fixture_fault ON model_catalog; DROP TRIGGER IF EXISTS ocv5308_fixture_notice ON model_catalog; DROP FUNCTION IF EXISTS ocv5308_fixture_fault(); DROP FUNCTION IF EXISTS ocv5308_fixture_notice()");
     client.removeListener("notice",noticeListener);
@@ -626,7 +626,7 @@ test("actual CLI refuses directory, non-root owned readiness and symlink without
   const link=join(root,"readiness-symlink.json");await symlink(cli.readiness,link);
   for(const [name,path] of [["directory",directory],["owner",wrongOwner],["symlink",link]]){
     const result=await privateCli(["apply","--observation",cli.output,"--readiness",path,
-      "--run-id","cli_bad_file_"+name,"--out",join(root,"file-refused-"+name+".json")]);
+      "--run-id",`cli_bad_file_${name}`,"--out",join(root,`file-refused-${name}.json`)]);
     assert.equal(result.code,1,result.stderr);assert.match(result.stderr,/MODEL_RELEASE_OPERATOR_REFUSED/);
     assert.deepEqual(await withClient(readSnapshot),before);
     assert.equal((await getPool().query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release'")).rowCount,0);
@@ -668,7 +668,9 @@ async function wireCommitProxy(mode:"drop-ack"|"hold-commit"|"hold-begin") {
       socket.on("close",()=>sockets.delete(socket));
     }
     front.on("close",()=>back.destroy());back.on("close",()=>front.destroy());
-    let input:Buffer=Buffer.alloc(0),output:Buffer=Buffer.alloc(0),startup=true;
+    let input:Buffer=Buffer.alloc(0);
+    let output:Buffer=Buffer.alloc(0);
+    let startup=true;
     front.on("data",(chunk)=>{
       input=Buffer.concat([input,chunk]);
       while(input.length>=4){
@@ -684,10 +686,10 @@ async function wireCommitProxy(mode:"drop-ack"|"hold-commit"|"hold-begin") {
         const frame=input.subarray(0,length);input=input.subarray(length);
         const isCommit=frame[0]===81&&frame.subarray(5).toString()==="COMMIT\0";
         if(mode==="hold-begin"&&frame[0]===81&&frame.subarray(5).toString()==="BEGIN\0"){
-          beginHeld=true;console.log("OPERATOR_WIRE_PHASE "+JSON.stringify({mode,type:"Q",backendPid,phase:"begin-before-forward",at:Date.now()}));continue;
+          beginHeld=true;console.log(`OPERATOR_WIRE_PHASE ${JSON.stringify({mode,type:"Q",backendPid,phase:"begin-before-forward",at:Date.now()})}`);continue;
         }
         if(isCommit){
-          console.log("OPERATOR_WIRE_PHASE "+JSON.stringify({mode,type:"Q",backendPid,phase:"commit-before-forward",at:Date.now()}));
+          console.log(`OPERATOR_WIRE_PHASE ${JSON.stringify({mode,type:"Q",backendPid,phase:"commit-before-forward",at:Date.now()})}`);
           armed=true;
           if(mode==="hold-commit"){
             assert.equal(commitFrame,undefined,"only one actual commit frame may be held");
@@ -705,7 +707,7 @@ async function wireCommitProxy(mode:"drop-ack"|"hold-commit"|"hold-begin") {
         const frame=output.subarray(0,length);output=output.subarray(length);
         if(frame[0]===75){assert.equal(frame.length,13);backendPid=frame.readInt32BE(5);}
         if(armed&&frame[0]===67&&frame.subarray(5).toString()==="COMMIT\0"){
-          sawCommitAck=true;console.log("OPERATOR_WIRE_PHASE "+JSON.stringify({mode,type:"C",backendPid,phase:"actual-commit-ack",at:Date.now()}));
+          sawCommitAck=true;console.log(`OPERATOR_WIRE_PHASE ${JSON.stringify({mode,type:"C",backendPid,phase:"actual-commit-ack",at:Date.now()})}`);
           if(mode==="drop-ack"){
             commitResolve();front.destroy();back.destroy();return;
           }
@@ -721,7 +723,7 @@ async function wireCommitProxy(mode:"drop-ack"|"hold-commit"|"hold-begin") {
     evidence:()=>({mode,backendPid,sawCommitAck,commitHeld:!!commitFrame,beginHeld}),
     close:()=>{
       if(!closed){
-        console.log("OPERATOR_WIRE_PHASE "+JSON.stringify({mode,backendPid,phase:"proxy-closing",at:Date.now()}));
+        console.log(`OPERATOR_WIRE_PHASE ${JSON.stringify({mode,backendPid,phase:"proxy-closing",at:Date.now()})}`);
         for(const socket of sockets)socket.destroy();
         closed=new Promise<void>((resolve)=>server.close(()=>resolve()));
       }
@@ -731,7 +733,7 @@ async function wireCommitProxy(mode:"drop-ack"|"hold-commit"|"hold-begin") {
 async function boundedEvidence<T>(label:string,fn:()=>Promise<T|undefined>,budget=5000):Promise<T>{
   const deadline=Date.now()+budget;
   while(Date.now()<deadline){const value=await fn();if(value!==undefined)return value;await new Promise<void>((resolve)=>setTimeout(resolve,10));}
-  throw new Error("bounded evidence timeout: "+label);
+  throw new Error(`bounded evidence timeout: ${label}`);
 }
 function scenario21() {
 test("actual server COMMIT acknowledgment loss yields UNKNOWN then new connection reconciles one committed receipt without reapply",async()=>{
@@ -753,7 +755,7 @@ test("actual server COMMIT acknowledgment loss yields UNKNOWN then new connectio
     const result=await withClient((fresh)=>reconcile(fresh,unknown!.runId,unknown!.requestSha256,digest(manifest),context));
     assert.equal(result.kind,"committed");assert.deepEqual(await withClient(readSnapshot),actual);
     assert.equal((await getPool().query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release' AND target=$1",[unknown.runId])).rowCount,1);
-    console.log("OPERATOR_COMMIT_WIRE_EVIDENCE "+JSON.stringify({...proxy.evidence(),status:"unknown_then_committed",receipts:1,noReapply:true}));
+    console.log(`OPERATOR_COMMIT_WIRE_EVIDENCE ${JSON.stringify({...proxy.evidence(),status:"unknown_then_committed",receipts:1,noReapply:true})}`);
   }finally{await client.end().catch(()=>{});await proxy.close();}
 });
 }
@@ -778,10 +780,11 @@ test("qualified old transaction keeps actual common and six table locks until re
     assert.deepEqual(await withClient(readSnapshot),observation.snapshot,"no pre-COMMIT effect visible to independent client");
 
     await stopHolder();nonce=randomBytes(16).toString("hex");
-    const successorNonce=nonce,marker=join(root,"successor-effects-marker");
+    const successorNonce=nonce;
+    const marker=join(root,"successor-effects-marker");
     const envFile=join(root,"successor-test.env");
-    const shellQuote=(value:string)=>"'"+value.replace(/'/g,"'\\''")+"'";
-    await writeFile(envFile,["DATABASE_URL","MODEL_AUTHORITY_DEPLOY_DATABASE_URL","MODEL_CATALOG_ADMIN_DATABASE_URL"].map((key)=>key+"="+shellQuote(db.url)).join("\n")+"\nOC_EGRESS_SECRET=fixture-not-production\n",{mode:0o600});
+    const shellQuote=(value:string)=>`'${value.replace(/'/g,"'\\''")}'`;
+    await writeFile(envFile,`${["DATABASE_URL","MODEL_AUTHORITY_DEPLOY_DATABASE_URL","MODEL_CATALOG_ADMIN_DATABASE_URL"].map((key)=>`${key}=${shellQuote(db.url)}`).join("\n")}\nOC_EGRESS_SECRET=fixture-not-production\n`,{mode:0o600});
     const helper=fileURLToPath(new URL("../../../../../scripts/lib/v5-mutation-admission.sh",import.meta.url));
     holder=spawn("bash",["-c",'set -euo pipefail; umask 077; exec 9>"$1"; flock -x 9; source "$2"; v5_mutation_admission "$3" "$4" "$5" "$(date +%s)" 30 "$PPID"; printf "%s\\n" "$4" > "$6"; printf "ADMITTED\\n" > "$7"; printf "READY\\n"; read -r line',
       "actual-successor-helper",context.leasePaths!.lock,helper,context.leasePaths!.commonNonce,successorNonce,envFile,context.leasePaths!.manualNonce,marker],{stdio:["pipe","pipe","pipe"]});
@@ -831,7 +834,7 @@ test("qualified old transaction keeps actual common and six table locks until re
     assert.equal((await getPool().query("SELECT 1 FROM account_group_models WHERE group_id=$1 AND model_id=$2",[delBinding.group_id,delBinding.model_id])).rowCount,0);
     assert.equal((await getPool().query("SELECT 1 FROM model_visibility_grants WHERE user_id=1 AND model_id='grok-build'")).rowCount,1);
     assert.equal((await getPool().query("SELECT 1 FROM model_visibility_grants WHERE user_id=1 AND model_id='oc-catalog-canary-glm52'")).rowCount,0);
-    console.log("OPERATOR_QUALIFIED_COMMIT_EVIDENCE "+JSON.stringify({...proxy.evidence(),blockedHelper,blockers,successorAfterCommit:true,adminDmlExecuted:6,receipts:1}));
+    console.log(`OPERATOR_QUALIFIED_COMMIT_EVIDENCE ${JSON.stringify({...proxy.evidence(),blockedHelper,blockers,successorAfterCommit:true,adminDmlExecuted:6,receipts:1})}`);
   }finally{
     // On any exception, close transport BEFORE awaiting a possibly future held COMMIT.
     await proxy.close();await commit;
@@ -864,7 +867,9 @@ test("two actual clients with same observe and run id serialize on common lock a
   const first=new Client({connectionString:proxy.url,connectionTimeoutMillis:3000});first.on("error",()=>{});
   await first.connect();const second=await connect();
   const sameRequest=request("actual_concurrent_same_run");
-  let firstError:unknown,secondError:unknown,secondDone=false;
+  let firstError:unknown;
+  let secondError:unknown;
+  let secondDone=false;
   const firstResult=apply(first,context,sameRequest).catch((error)=>{firstError=error;return undefined;});
   let secondResult:Promise<Receipt|undefined>|undefined;
   try{
@@ -882,7 +887,7 @@ test("two actual clients with same observe and run id serialize on common lock a
     assert.equal(firstError,undefined);assert.equal(secondError,undefined);assert.ok(a);assert.ok(b);assert.deepEqual(a,b);
     assert.deepEqual(await withClient(readSnapshot),a.after,"same-id follower has no second model or epoch writes");
     assert.equal((await getPool().query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release' AND target=$1",[sameRequest.runId])).rowCount,1);
-    console.log("OPERATOR_CONCURRENT_IDEMPOTENCY_EVIDENCE "+JSON.stringify({firstPid,secondPid,blockers,receipts:1,oneEpochTransition:true}));
+    console.log(`OPERATOR_CONCURRENT_IDEMPOTENCY_EVIDENCE ${JSON.stringify({firstPid,secondPid,blockers,receipts:1,oneEpochTransition:true})}`);
   }finally{
     await proxy.close();await firstResult;if(secondResult)await secondResult;
     await first.end().catch(()=>{});await second.end().catch(()=>{});
@@ -892,7 +897,7 @@ test("two actual clients with same observe and run id serialize on common lock a
 
 function scenario25() {
 const register = (kind: "manifest" | "prepare") => {
-test("actual apply refuses "+kind+" hash drift before model DML",async()=>{
+test(`actual apply refuses ${kind} hash drift before model DML`,async()=>{
   await resetFixture();
   const altered={...context};
   if(kind==="manifest"){
@@ -904,7 +909,7 @@ test("actual apply refuses "+kind+" hash drift before model DML",async()=>{
     assert.notEqual(altered.prepareSqlSha256,observation.prepareSqlSha256);
   }
   const before=await withClient(readSnapshot);
-  await assert.rejects(withClient((client)=>apply(client,altered,request("actual_hash_"+kind))),kind==="manifest"?/MANIFEST_DRIFT/:/PREPARATION_SQL_DRIFT/);
+  await assert.rejects(withClient((client)=>apply(client,altered,request(`actual_hash_${kind}`))),kind==="manifest"?/MANIFEST_DRIFT/:/PREPARATION_SQL_DRIFT/);
   assert.deepEqual(await withClient(readSnapshot),before);
   assert.equal((await getPool().query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release'")).rowCount,0);
 });
@@ -914,7 +919,7 @@ register("manifest");
 
 function scenario26() {
 const register = (kind: "manifest" | "prepare") => {
-test("actual apply refuses "+kind+" hash drift before model DML",async()=>{
+test(`actual apply refuses ${kind} hash drift before model DML`,async()=>{
   await resetFixture();
   const altered={...context};
   if(kind==="manifest"){
@@ -926,7 +931,7 @@ test("actual apply refuses "+kind+" hash drift before model DML",async()=>{
     assert.notEqual(altered.prepareSqlSha256,observation.prepareSqlSha256);
   }
   const before=await withClient(readSnapshot);
-  await assert.rejects(withClient((client)=>apply(client,altered,request("actual_hash_"+kind))),kind==="manifest"?/MANIFEST_DRIFT/:/PREPARATION_SQL_DRIFT/);
+  await assert.rejects(withClient((client)=>apply(client,altered,request(`actual_hash_${kind}`))),kind==="manifest"?/MANIFEST_DRIFT/:/PREPARATION_SQL_DRIFT/);
   assert.deepEqual(await withClient(readSnapshot),before);
   assert.equal((await getPool().query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release'")).rowCount,0);
 });
@@ -951,11 +956,13 @@ test("same committed run id with different valid readiness payload refuses preci
 function scenario28() {
 test("actual pre-COMMIT premise timeout closes its proxy before awaiting apply and leaves no PG backend or OS holder",async()=>{
   await resetFixture();
-  const before=await withClient(readSnapshot),holderPid=holder.pid!;
+  const before=await withClient(readSnapshot);
+  const holderPid=holder.pid!;
   const proxy=await wireCommitProxy("hold-begin");
   const client=new Client({connectionString:proxy.url,connectionTimeoutMillis:3000});client.on("error",()=>{});
   await client.connect();
-  let failure:unknown,done=false;
+  let failure:unknown;
+  let done=false;
   const applied=apply(client,context,request("actual_cleanup_before_commit")).then(()=>{done=true;},(error)=>{done=true;failure=error;});
   try{
     await boundedEvidence("real BEGIN frame stopped before forwarding",async()=>proxy.evidence().beginHeld?true:undefined);
@@ -971,10 +978,10 @@ test("actual pre-COMMIT premise timeout closes its proxy before awaiting apply a
     await boundedEvidence("actual former backend is gone",async()=>{
       const result=await getPool().query("SELECT 1 FROM pg_stat_activity WHERE pid=$1",[pid]);return result.rowCount===0?true:undefined;
     });
-    await stopHolder();await assert.rejects(readFile("/proc/"+holderPid+"/stat"),{code:"ENOENT"});
+    await stopHolder();await assert.rejects(readFile(`/proc/${holderPid}/stat`),{code:"ENOENT"});
     assert.deepEqual(await withClient(readSnapshot),before);
     assert.equal((await getPool().query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release'")).rowCount,0);
-    console.log("OPERATOR_PRECOMMIT_CLEANUP_EVIDENCE "+JSON.stringify({...proxy.evidence(),budget:5000,backendGone:true,holderGone:true,snapshotAndEpochUnchanged:true}));
+    console.log(`OPERATOR_PRECOMMIT_CLEANUP_EVIDENCE ${JSON.stringify({...proxy.evidence(),budget:5000,backendGone:true,holderGone:true,snapshotAndEpochUnchanged:true})}`);
   }finally{
     await proxy.close();await applied;
     await stopHolder();await client.end().catch(()=>{});
@@ -984,9 +991,9 @@ test("actual pre-COMMIT premise timeout closes its proxy before awaiting apply a
 
 function scenario29() {
 const register = (kind: "binding" | "catalog") => {
-test("compensation preserves subsequent legitimate "+kind+" admin drift without overwriting or extra receipt",async()=>{
+test(`compensation preserves subsequent legitimate ${kind} admin drift without overwriting or extra receipt`,async()=>{
   await resetFixture();
-  const activated=await withClient((client)=>apply(client,context,request("comp_drift_activation_"+kind)));
+  const activated=await withClient((client)=>apply(client,context,request(`comp_drift_activation_${kind}`)));
   if(kind==="binding"){
     const binding=activated.after.tables.account_group_models.find((row)=>row.model_id==="grok-build")!;
     assert.ok(binding);
@@ -1000,7 +1007,7 @@ test("compensation preserves subsequent legitimate "+kind+" admin drift without 
   }
   const changed=await withClient(readSnapshot);
   assert.notEqual(digest(changed),activated.afterSha256,"the real administrator operation must change the stored poststate");
-  await assert.rejects(withClient((client)=>compensate(client,context,request("comp_actual_drift_"+kind),activated.runId)),/COMPENSATION_POSTSTATE_CAS_CONFLICT/);
+  await assert.rejects(withClient((client)=>compensate(client,context,request(`comp_actual_drift_${kind}`),activated.runId)),/COMPENSATION_POSTSTATE_CAS_CONFLICT/);
   assert.deepEqual(await withClient(readSnapshot),changed);
   const receipts=await getPool().query("SELECT after FROM admin_audit WHERE action='ocv5-308.model-release'");
   assert.equal(receipts.rowCount,1);assert.deepEqual(receipts.rows[0].after,activated);
@@ -1011,9 +1018,9 @@ register("binding");
 
 function scenario30() {
 const register = (kind: "binding" | "catalog") => {
-test("compensation preserves subsequent legitimate "+kind+" admin drift without overwriting or extra receipt",async()=>{
+test(`compensation preserves subsequent legitimate ${kind} admin drift without overwriting or extra receipt`,async()=>{
   await resetFixture();
-  const activated=await withClient((client)=>apply(client,context,request("comp_drift_activation_"+kind)));
+  const activated=await withClient((client)=>apply(client,context,request(`comp_drift_activation_${kind}`)));
   if(kind==="binding"){
     const binding=activated.after.tables.account_group_models.find((row)=>row.model_id==="grok-build")!;
     assert.ok(binding);
@@ -1027,7 +1034,7 @@ test("compensation preserves subsequent legitimate "+kind+" admin drift without 
   }
   const changed=await withClient(readSnapshot);
   assert.notEqual(digest(changed),activated.afterSha256,"the real administrator operation must change the stored poststate");
-  await assert.rejects(withClient((client)=>compensate(client,context,request("comp_actual_drift_"+kind),activated.runId)),/COMPENSATION_POSTSTATE_CAS_CONFLICT/);
+  await assert.rejects(withClient((client)=>compensate(client,context,request(`comp_actual_drift_${kind}`),activated.runId)),/COMPENSATION_POSTSTATE_CAS_CONFLICT/);
   assert.deepEqual(await withClient(readSnapshot),changed);
   const receipts=await getPool().query("SELECT after FROM admin_audit WHERE action='ocv5-308.model-release'");
   assert.equal(receipts.rowCount,1);assert.deepEqual(receipts.rows[0].after,activated);
@@ -1040,10 +1047,11 @@ function scenario31() {
 test("actual fixed-path CLI refuses proof directory, foreign owner, symlink and stale measured kernel start with zero effects",async()=>{
   const cli=await configureCliFixture();
   const before=await withClient(readSnapshot);
-  const proof=context.leasePaths!.commonNonce+".db",backup=proof+".fixture-backup";
+  const proof=`${context.leasePaths!.commonNonce}.db`;
+  const backup=`${proof}.fixture-backup`;
   const original=await readFile(proof);
   const parsed=JSON.parse(original.toString());
-  const kernel=await readFile("/proc/"+holder.pid+"/stat","utf8");
+  const kernel=await readFile(`/proc/${holder.pid}/stat`,"utf8");
   const measured=kernel.slice(kernel.lastIndexOf(") ")+2).split(/\s+/)[19];
   assert.equal(parsed.holderPid,holder.pid);assert.equal(parsed.holderStart,measured);
   for(const kind of ["directory","owner","symlink","old-start"]){
@@ -1055,7 +1063,7 @@ test("actual fixed-path CLI refuses proof directory, foreign owner, symlink and 
       }else if(kind==="owner")await chown(proof,65534,65534);
       else await writeFile(proof,JSON.stringify({...parsed,holderStart:(BigInt(measured)+1n).toString()}));
       const refused=await privateCli(["apply","--observation",cli.output,"--readiness",cli.readiness,
-        "--run-id","cli_actual_proof_"+kind,"--out",join(root,"proof-refused-"+kind+".json")]);
+        "--run-id",`cli_actual_proof_${kind}`,"--out",join(root,`proof-refused-${kind}.json`)]);
       assert.equal(refused.code,1,refused.stderr);assert.match(refused.stderr,/MODEL_RELEASE_OPERATOR_REFUSED/);
       assert.deepEqual(await withClient(readSnapshot),before);
       assert.equal((await getPool().query("SELECT 1 FROM admin_audit WHERE action='ocv5-308.model-release'")).rowCount,0);

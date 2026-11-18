@@ -432,7 +432,12 @@ export function summarizeSystemCallbackUserTurn(
   const id = typeof message?.id === "string" ? message.id : "";
   const text = typeof message?.text === "string" ? message.text.trim() : "";
   if (id.startsWith("lsc-") || text.includes("自进化租约列车结果")) {
-    if (/终态:\s*committed\b/.test(text) || text.includes("已上线")) {
+    if (
+      /终态:\s*committed\b/.test(text) ||
+      text.includes("已上线") ||
+      /\bsurvivor committed\b/.test(text) ||
+      (text.includes("已满足") && text.includes("已在线"))
+    ) {
       return "系统回调 · 发布列车已上线";
     }
     if (/终态:\s*failed\b/.test(text) || text.includes("未通过") || text.includes("失败")) {

@@ -19,11 +19,18 @@ import { fileURLToPath } from 'node:url'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import {
   ANTIGRAVITY_MAX_PROMPT_BYTES,
+  ANTIGRAVITY_RESUMED_PREAMBLE,
   AntigravityAdapter,
   type AntigravityDeliveryDependencies,
   _internals,
   validateAntigravityRoute,
 } from '../engine/antigravityAdapter.js'
+import {
+  ANTIGRAVITY_COMPACTION_STEP_TYPE,
+  buildAntigravityPromptInputsKey,
+  readAntigravityPromptState,
+  writeAntigravityPromptState,
+} from '../engine/antigravityPromptState.js'
 import { prepareAntigravityNativeTrajectory } from '../engine/antigravityNativeTrajectory.js'
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
 import { resetEnvFactsCache } from '../envProbe.js'
@@ -78,6 +85,9 @@ function replay() {
     hostLink: fs.existsSync(process.env.HOME + '/.oc-host-bin/host') ? fs.readlinkSync(process.env.HOME + '/.oc-host-bin/host') : null,
     conversationsIsLink: fs.lstatSync(process.env.HOME + '/.gemini/antigravity-cli/conversations').isSymbolicLink(),
   }))
+  if (process.env.FAKE_AGY_WRITE_SUMMARY_PB) {
+    fs.writeFileSync(process.env.HOME + '/.gemini/antigravity-cli/jetbox_summaries_proto.pb', process.env.FAKE_AGY_WRITE_SUMMARY_PB)
+  }
   if (process.env.FAKE_AGY_STDERR) process.stderr.write(fs.readFileSync(process.env.FAKE_AGY_STDERR, 'utf8'))
   if (process.env.FAKE_AGY_HANG === '1') { setInterval(() => {}, 1000); return }
   if (process.env.FAKE_AGY_STREAM_FILE) {
@@ -202,8 +212,11 @@ async function runTurn(
     sessionTotals: { totalCostUSD: 0, turns: 0 },
     toolUseIdToName: new Map(),
   })
+  // Mirror sessionTurnRunner: summary.then(finalizeTurn) calls detach() -> turn.end() in the first microtask.
+  const detached = run.summary.then(() => { run.end() })
   await run.submitted.catch(() => {})
   const summary = await run.summary
+  await detached
   await h.adapter.waitForOutputDrain()
   h.adapter.off('session_id', onSession)
   return { summary, events, sessionIds }
@@ -656,6 +669,202 @@ describe('AntigravityAdapter', () => {
       assert.deepEqual(summary?.tools[0]?.inputJson, { q: 'deploy' })
       assert.equal(summary?.tools[0]?.output, 'probe-result:{"q": "deploy"}')
     } finally {
+      await h.restore()
+    }
+  })
+
+  test('maps eager mcp_<server>_<tool> wire steps onto identical mcp__server__tool product cards and strips synthetic toolSummary', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const convId = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+      const file = path.join(h.dir, 'tool-mcp-eager.ndjson')
+      await writeFile(file, `${[
+        { event: 'init', conversation_id: convId },
+        { event: 'step_update', step_update: { step_type: 'user_input', state: 'DONE', step_index: 0 } },
+        {
+          event: 'step_update',
+          step_update: {
+            step_type: 'tool',
+            state: 'ACTIVE',
+            step_index: 1,
+            tool_info: {
+              name: 'mcp_openclaude-memory_oc_bash',
+              parameters: { command: 'echo eager-ok', timeout_ms: 300_000, toolSummary: 'Echo test' },
+            },
+          },
+        },
+        {
+          event: 'step_update',
+          step_update: {
+            step_type: 'tool',
+            state: 'DONE',
+            step_index: 1,
+            tool_info: {
+              name: 'mcp_openclaude-memory_oc_bash',
+              parameters: { command: 'echo eager-ok', timeout_ms: 300_000, toolSummary: 'Echo test' },
+              output: 'exit=0\neager-ok',
+            },
+          },
+        },
+        { event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', step_index: 2, text_delta: 'Done.' } },
+        { event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Done.' } },
+      ].map((line) => JSON.stringify(line)).join('\n')}\n`)
+      const { summary, events } = await runTurn(h, file)
+      assert.equal(summary?.isError, false)
+      assert.equal(summary?.tools.length, 1)
+      assert.equal(summary?.tools[0]?.toolName, 'mcp__openclaude-memory__oc_bash')
+      assert.deepEqual(summary?.tools[0]?.inputJson, { command: 'echo eager-ok', timeout_ms: 300_000 })
+      assert.equal(summary?.tools[0]?.output, 'exit=0\neager-ok')
+      const toolUseBlock = events.find((e) => e.kind === 'block' && e.block.kind === 'tool_use')
+      assert.ok(toolUseBlock && toolUseBlock.kind === 'block' && toolUseBlock.block.kind === 'tool_use')
+      assert.equal(toolUseBlock.block.toolName, 'mcp__openclaude-memory__oc_bash')
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('persists WAL-checkpointed summary cache only on clean turns and seeds isolated copies into subsequent turns', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const stableCliDir = path.join(h.dir, 'openclaude-home', 'antigravity-cli', 'home', '.gemini', 'antigravity-cli')
+      const summaryWriterCli = path.join(h.dir, 'summary-writer-cli.cjs')
+      const seededCheckFile = path.join(h.dir, 'seeded-check.json')
+      const sqliteModulePath = fileURLToPath(import.meta.resolve('better-sqlite3'))
+      await writeFile(summaryWriterCli, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const Database = require(${JSON.stringify(sqliteModulePath)})
+const cliDir = path.join(process.env.HOME, '.gemini', 'antigravity-cli')
+const dbPath = path.join(cliDir, 'conversation_summaries.db')
+const pbPath = path.join(cliDir, 'jetbox_summaries_proto.pb')
+const mode = process.env.SUMMARY_TEST_MODE
+let seededIds = []
+let seededIno = null
+if (fs.existsSync(dbPath)) {
+  seededIno = fs.statSync(dbPath).ino
+  const rdb = new Database(dbPath, { readonly: true })
+  seededIds = rdb.prepare('SELECT id FROM summaries ORDER BY id').all().map((r) => r.id)
+  rdb.close()
+}
+fs.writeFileSync(${JSON.stringify(seededCheckFile)}, JSON.stringify({
+  seededIds,
+  seededIno,
+  hasPb: fs.existsSync(pbPath),
+  pbText: fs.existsSync(pbPath) ? fs.readFileSync(pbPath, 'utf8') : null,
+}))
+const db = new Database(dbPath)
+db.pragma('journal_mode = WAL')
+db.exec('CREATE TABLE IF NOT EXISTS summaries (id TEXT PRIMARY KEY)')
+const rowId = mode === 'fail' ? 'poisoned-turn' : mode === 'delayed-clean' ? 'clean-turn-2' : 'clean-turn-1'
+db.prepare('INSERT OR REPLACE INTO summaries (id) VALUES (?)').run(rowId)
+// Intentionally leave WAL uncheckpointed on exit to prove cleanup checkpoints before persisting.
+fs.writeFileSync(pbPath, mode === 'fail' ? 'pb-poisoned' : mode === 'delayed-clean' ? 'pb-clean-2' : 'pb-clean-1')
+process.stdin.setEncoding('utf8')
+let inputBuf = ''
+let sent = false
+process.stdin.on('data', (chunk) => {
+  inputBuf += chunk
+  if (sent || !inputBuf.includes('\\n')) return
+  sent = true
+  const convId = '88888888-9999-4aaa-8bbb-cccccccccccc'
+  if (mode === 'fail') {
+    process.stdout.write(JSON.stringify({ event: 'init', conversation_id: convId }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: convId, status: 'ERROR', error: 'boom' } }) + '\\n')
+  } else {
+    process.stdout.write(JSON.stringify({ event: 'init', conversation_id: convId }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'step_update', step_update: { step_type: 'user_input', state: 'DONE', step_index: 0 } }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', step_index: 1, text_delta: 'ok' } }) + '\\n')
+    process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'ok' } }) + '\\n')
+  }
+})
+process.stdin.on('end', () => {
+  if (mode === 'delayed-clean') setTimeout(() => process.exit(0), 80)
+  else process.exit(mode === 'fail' ? 1 : 0)
+})
+`)
+      await chmod(summaryWriterCli, 0o755)
+      process.env.OC_ANTIGRAVITY_CLI_BIN = summaryWriterCli
+
+      // Turn 1 (clean, close-before-settle): creates WAL-mode summary DB; post-summary detach run.end() must keep deliveredSuccess.
+      process.env.SUMMARY_TEST_MODE = 'clean'
+      const t1 = await runTurn(h, 'tool-mcp.ndjson')
+      assert.equal(t1.summary?.isError, false)
+      const stableDbPath = path.join(stableCliDir, 'conversation_summaries.db')
+      const stablePbPath = path.join(stableCliDir, 'jetbox_summaries_proto.pb')
+      assert.equal(existsSync(stableDbPath), true, 'clean turn persists conversation_summaries.db to stable dir')
+      assert.equal(existsSync(`${stableDbPath}-wal`), false, 'stable summary DB is self-contained without -wal sidecar')
+      assert.equal((await stat(stableDbPath)).mode & 0o777, 0o600)
+      assert.equal((await readFile(stablePbPath, 'utf8')), 'pb-clean-1')
+      const stableIno1 = (await stat(stableDbPath)).ino
+
+      // Turn 2 (clean, settle-timer-before-close + post-terminal run.end()): receives seeded DB on private inode and persists updated cache.
+      _internals.setTimingTestHooks({ resultSettleMs: 15 })
+      process.env.SUMMARY_TEST_MODE = 'delayed-clean'
+      const t2 = await runTurn(h, 'tool-mcp.ndjson')
+      _internals.setTimingTestHooks(null)
+      assert.equal(t2.summary?.isError, false)
+      const check2 = JSON.parse(await readFile(seededCheckFile, 'utf8')) as {
+        seededIds: string[]; seededIno: number | null; hasPb: boolean; pbText: string | null
+      }
+      assert.deepEqual(check2.seededIds, ['clean-turn-1'])
+      assert.notEqual(check2.seededIno, stableIno1, 'launch HOME gets an isolated copy, never sharing SQLite file locks')
+      assert.equal(check2.pbText, 'pb-clean-1')
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-2')
+
+      // Turn 3 (failed exit 1): must NOT overwrite stable summary cache with poisoned data.
+      process.env.SUMMARY_TEST_MODE = 'fail'
+      const t3 = await runTurn(h, 'tool-mcp.ndjson')
+      assert.equal(t3.summary?.isError, true)
+      const verifyDb = new Database(stableDbPath, { readonly: true })
+      const finalRows = verifyDb.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
+      verifyDb.close()
+      assert.deepEqual(finalRows.map((r) => r.id), ['clean-turn-1', 'clean-turn-2'])
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-2')
+
+      // Turn 4 (forceEnd via run.end() before exit 0): must NOT overwrite stable summary cache even when child exits 0.
+      const forceEndCli = path.join(h.dir, 'force-end-cli.cjs')
+      const readyMarker = path.join(h.dir, 'force-end-ready')
+      await writeFile(forceEndCli, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const Database = require(${JSON.stringify(sqliteModulePath)})
+const cliDir = path.join(process.env.HOME, '.gemini', 'antigravity-cli')
+const db = new Database(path.join(cliDir, 'conversation_summaries.db'))
+db.exec('CREATE TABLE IF NOT EXISTS summaries (id TEXT PRIMARY KEY)')
+db.prepare('INSERT OR REPLACE INTO summaries (id) VALUES (?)').run('force-ended-turn')
+db.close()
+fs.writeFileSync(path.join(cliDir, 'jetbox_summaries_proto.pb'), 'pb-force-ended')
+fs.writeFileSync(${JSON.stringify(readyMarker)}, '1')
+setTimeout(() => process.exit(0), 120)
+`)
+      await chmod(forceEndCli, 0o755)
+      process.env.OC_ANTIGRAVITY_CLI_BIN = forceEndCli
+      const run4 = h.adapter.submitTurn({
+        input: 'force end check',
+        requestId: 'd'.repeat(32),
+        assistantMessageId: 'asst-4',
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run4.submitted
+      for (let i = 0; i < 100 && !existsSync(readyMarker); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.equal(existsSync(readyMarker), true)
+      run4.end()
+      assert.equal(await run4.summary, null)
+      await h.adapter.waitForOutputDrain()
+      const verifyAfterForceEnd = new Database(stableDbPath, { readonly: true })
+      const rowsAfterForceEnd = verifyAfterForceEnd.prepare('SELECT id FROM summaries ORDER BY id').all() as Array<{ id: string }>
+      verifyAfterForceEnd.close()
+      assert.deepEqual(rowsAfterForceEnd.map((r) => r.id), ['clean-turn-1', 'clean-turn-2'])
+      assert.equal(await readFile(stablePbPath, 'utf8'), 'pb-clean-2')
+    } finally {
+      _internals.setTimingTestHooks(null)
+      Reflect.deleteProperty(process.env, 'SUMMARY_TEST_MODE')
       await h.restore()
     }
   })
@@ -1461,6 +1670,7 @@ describe('Antigravity verified recovery lifecycle', () => {
       } })
       try {
         h.adapter.setAntigravityRoute(ROUTE)
+        process.env.FAKE_AGY_WRITE_SUMMARY_PB = `retired-${retiredBy}`
         process.env.FAKE_AGY_FIXTURE = await writeResult(h)
         const events: EngineEvent[] = []
         const billing: any[] = []
@@ -1478,6 +1688,8 @@ describe('Antigravity verified recovery lifecycle', () => {
         await h.adapter.waitForOutputDrain()
         assert.equal(summary?.assistantText ?? '', '')
         assert.equal(events.filter(e => e.kind === 'block').length, 0)
+        const stablePb = path.join(h.dir, 'openclaude-home', 'antigravity-cli', 'home', '.gemini', 'antigravity-cli', 'jetbox_summaries_proto.pb')
+        assert.equal(existsSync(stablePb), false, `${retiredBy} during recovery must not persist summary cache`)
         if (retiredBy === 'cancel') {
           assert.equal(summary?.stopReason, 'interrupted')
           assert.equal(billing.length, 1)
@@ -1486,7 +1698,7 @@ describe('Antigravity verified recovery lifecycle', () => {
           assert.equal(summary, null)
           assert.equal(billing.length, 0)
         }
-      } finally { release(); await h.adapter.shutdown(); await h.restore() }
+      } finally { Reflect.deleteProperty(process.env, 'FAKE_AGY_WRITE_SUMMARY_PB'); release(); await h.adapter.shutdown(); await h.restore() }
     })
   }
 
@@ -1585,4 +1797,342 @@ describe('Antigravity unindexed resumed errors', () => {
       } finally { await h.restore() }
     })
   }
+})
+
+
+describe('Antigravity route lifetime heartbeat', () => {
+  test('INC-20261112-AGY-ROUTE-LIFETIME: live silent tool renews exact route and Stop ends heartbeat', async () => {
+    const h = await harness()
+    let calls = 0
+    let active = 0
+    let maximum = 0
+    _internals.setTimingTestHooks({ keepaliveMs: 10, routeRenewMs: 15,
+      renewRoute: async (token) => {
+        assert.equal(token, TOKEN)
+        calls += 1; active += 1; maximum = Math.max(maximum, active)
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        active -= 1
+        throw new Error('temporary control-plane outage')
+      } })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const live = await controlledTurn(h, 'silent-route-lease')
+      await live.push(fileStep(30, 'ACTIVE', 'run_command'))
+      await new Promise((resolve) => setTimeout(resolve, 220))
+      assert.ok(calls >= 2, 'actual adapter heartbeat runs without generation output')
+      assert.equal(maximum, 1, 'no overlapping renewals')
+      assert.ok(h.adapter.lastActivityAt > 0, 'renewal outage keeps activity alive')
+      h.adapter.interrupt('user')
+      const stoppedAt = calls
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      assert.equal(calls, stoppedAt, 'Stop suppresses future renewals before process exit')
+      await h.adapter.shutdown()
+      await live.run.summary
+    } finally { await h.adapter.shutdown(); await h.restore(); _internals.setTimingTestHooks(null) }
+  })
+})
+
+describe('Antigravity resumed platform context deduplication (OCV5-781)', () => {
+  const convId = '9c2f4187-e96d-4840-8c1c-3de86f92aa01'
+  const sqliteModulePath = fileURLToPath(new URL('../../../../node_modules/better-sqlite3', import.meta.url))
+
+  async function installStatefulCli(h: Harness): Promise<string> {
+    const cli = path.join(h.dir, 'stateful-agy.cjs')
+    await writeFile(cli, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const Database = require(${JSON.stringify(sqliteModulePath)})
+const convId = ${JSON.stringify(convId)}
+let input = ''
+let handled = false
+function handle() {
+  if (handled) return
+  handled = true
+  fs.writeFileSync(process.env.FAKE_AGY_CAPTURE, JSON.stringify({
+    argv: process.argv.slice(2),
+    stdin: input,
+  }))
+  const code = Number(process.env.FAKE_AGY_EXIT_CODE || 0)
+  const convDir = path.join(process.env.HOME, '.gemini', 'antigravity-cli', 'conversations')
+  fs.mkdirSync(convDir, { recursive: true })
+  const dbPath = path.join(convDir, convId + '.db')
+  const db = new Database(dbPath)
+  db.exec('CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, step_payload BLOB, step_format INTEGER NOT NULL DEFAULT 0)')
+  const maxRow = db.prepare('SELECT MAX(idx) AS m FROM steps').get()
+  const base = typeof maxRow?.m === 'number' ? maxRow.m : -1
+  if (code !== 0) {
+    db.close()
+    process.stderr.write('error: simulated cli failure\\n')
+    process.exit(code)
+  }
+  db.prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, 14, 3, ?)').run(base + 1, Buffer.from(input, 'utf8'))
+  db.prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, 15, 3, ?)').run(base + 2, Buffer.from('ok', 'utf8'))
+  process.stdout.write(JSON.stringify({ event: 'init', conversation_id: convId }) + '\\n')
+  process.stdout.write(JSON.stringify({
+    event: 'step_update',
+    step_update: { conversation_id: convId, step_index: base + 1, step_type: 'user_input', state: 'DONE' },
+  }) + '\\n')
+  process.stdout.write(JSON.stringify({
+    event: 'step_update',
+    step_update: {
+      conversation_id: convId,
+      step_index: base + 2,
+      step_type: 'agent_response',
+      state: 'DONE',
+      text_delta: 'ack-' + (base + 2),
+      usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: base >= 0 ? 500 : 0 },
+    },
+  }) + '\\n')
+  process.stdout.write(JSON.stringify({
+    event: 'result',
+    result: { conversation_id: convId, status: 'SUCCESS', response: 'ack-' + (base + 2), num_turns: 1 },
+  }) + '\\n')
+  db.close()
+}
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (chunk) => {
+  input += chunk
+  if (input.includes('\\n')) handle()
+})
+process.stdin.on('end', () => process.exit(Number(process.env.FAKE_AGY_EXIT_CODE || 0)))
+`)
+    await chmod(cli, 0o755)
+    process.env.OC_ANTIGRAVITY_CLI_BIN = cli
+    return cli
+  }
+
+  test('elides repeated platform context across adapter restarts, preserves goal, and self-heals after CLI 253k compaction', async () => {
+    const personaFile = `PERSONA_UNIQUE_SENTINEL_${'X'.repeat(4096)}`
+    const h = await harness()
+    try {
+      const personaPath = path.join(h.dir, 'persona.md')
+      await writeFile(personaPath, personaFile, 'utf8')
+      await installStatefulCli(h)
+
+      const makeAdapter = (resumeSessionId?: string) => {
+        const a = new AntigravityAdapter({
+          sessionKey: 'agent:main:webchat:dm:ocv5-781-test',
+          agentId: 'main',
+          agentBaseDir: h.dir,
+          persona: personaPath,
+          config: config(),
+          model: 'antigravity-gemini-4-carbon',
+          effortLevel: 'medium',
+          ...(resumeSessionId ? { resumeSessionId } : {}),
+        } as EngineCreateOpts)
+        a.on('error', () => {})
+        a.setAntigravityRoute(ROUTE)
+        return a
+      }
+
+      const submit = async (adapter: AntigravityAdapter, text: string) => {
+        const run = adapter.submitTurn({
+          input: text,
+          requestId: 'f'.repeat(32),
+          onEvent: () => {},
+          sessionTotals: { totalCostUSD: 0, turns: 0 },
+          toolUseIdToName: new Map(),
+        })
+        const detached = run.summary.then(() => { run.end() })
+        await run.submitted.catch(() => {})
+        const summary = await run.summary
+        await detached
+        await adapter.waitForOutputDrain()
+        const cap = JSON.parse(await readFile(h.capture, 'utf8')) as { argv: string[]; stdin: string }
+        const content = JSON.parse(cap.stdin.trim()).message.content as string
+        return { summary, argv: cap.argv, content }
+      }
+
+      // Turn 1 (fresh conversation): full Platform Context + persona injected; durable state written on clean exit.
+      const adapter1 = makeAdapter()
+      const t1 = await submit(adapter1, 'first question')
+      assert.equal(t1.summary?.isError, false)
+      assert.equal(t1.argv.includes('--conversation'), false)
+      assert.match(t1.content, /^# OpenClaude Platform Context \(Antigravity adapter\)/)
+      assert.ok(t1.content.includes(personaFile), 'turn 1 must inject full persona/platform context')
+      assert.match(t1.content, /first question$/)
+
+      // Turn 2 (new adapter instance simulating runner/container restart + effort change Medium -> High + active goal):
+      // native history already holds turn 1, so full Platform Context is elided while goal and user input remain intact.
+      const adapter2 = makeAdapter(convId)
+      adapter2.setEffortLevel('high')
+      await adapter2.setGoalState({
+        status: 'active',
+        objective: 'keep cache hit above 95%',
+        tokenBudget: null,
+        tokensUsed: 0,
+        creditBudget: null,
+        creditsUsed: 0,
+        timeUsedSeconds: 0,
+      } as any)
+      const t2 = await submit(adapter2, 'second question')
+      assert.equal(t2.summary?.isError, false)
+      assert.deepEqual(t2.argv.slice(-2), ['--conversation', convId])
+      assert.ok(t2.content.startsWith(ANTIGRAVITY_RESUMED_PREAMBLE), 'resumed turn uses compact preamble')
+      assert.equal(t2.content.includes('# OpenClaude Platform Context (Antigravity adapter)'), false)
+      assert.equal(t2.content.includes(personaFile), false, 'resumed turn must not duplicate 4 KB+ persona/platform slots')
+      assert.ok(t2.content.includes('keep cache hit above 95%'), 'active goal prompt must still be rendered on resumed turn')
+      assert.match(t2.content, /second question$/)
+      assert.ok(
+        Buffer.byteLength(t2.content, 'utf8') < Buffer.byteLength(t1.content, 'utf8') - 4096,
+        `expected >4 KB savings, got t1=${Buffer.byteLength(t1.content)} vs t2=${Buffer.byteLength(t2.content)}`,
+      )
+
+      // Simulate CLI ~253k auto-compaction (`step_type = 23`) in native SQLite:
+      // Turn 3 must detect compaction since baseline -1, re-inject full context, and advance injectedAfterBaseline.
+      const convDbPath = path.join(
+        h.dir, 'openclaude-home', 'antigravity-cli', 'home', '.gemini', 'antigravity-cli', 'conversations', `${convId}.db`,
+      )
+      const db = new Database(convDbPath)
+      db.prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (4, ?, 3, ?)').run(
+        ANTIGRAVITY_COMPACTION_STEP_TYPE,
+        Buffer.from('summary', 'utf8'),
+      )
+      db.close()
+
+      const t3 = await submit(adapter2, 'after compaction')
+      assert.equal(t3.summary?.isError, false)
+      assert.match(t3.content, /^# OpenClaude Platform Context \(Antigravity adapter\)/)
+      assert.ok(t3.content.includes(personaFile), 'compacted history must trigger fresh full platform injection')
+
+      // Turn 4 (after compaction recovery succeeded): elides again because no new step_type=23 occurred after idx 4.
+      const t4 = await submit(adapter2, 'post-recovery follow-up')
+      assert.equal(t4.summary?.isError, false)
+      assert.ok(t4.content.startsWith(ANTIGRAVITY_RESUMED_PREAMBLE))
+      assert.equal(t4.content.includes(personaFile), false)
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('re-injects when explicit prompt inputs change, never commits state on a failed turn, and respects runtime flag + clearSessionId', async () => {
+    const h = await harness()
+    try {
+      const personaPath = path.join(h.dir, 'persona.md')
+      await writeFile(personaPath, 'PERSONA_V1', 'utf8')
+      await installStatefulCli(h)
+
+      const adapter = new AntigravityAdapter({
+        sessionKey: 'agent:main:webchat:dm:ocv5-781-gates',
+        agentId: 'main',
+        agentBaseDir: h.dir,
+        persona: personaPath,
+        config: config(),
+        model: 'antigravity-gemini-4-carbon',
+        effortLevel: 'high',
+      } as EngineCreateOpts)
+      adapter.on('error', () => {})
+      adapter.setAntigravityRoute(ROUTE)
+
+      const submit = async (text: string) => {
+        const run = adapter.submitTurn({
+          input: text,
+          requestId: 'a'.repeat(32),
+          onEvent: () => {},
+          sessionTotals: { totalCostUSD: 0, turns: 0 },
+          toolUseIdToName: new Map(),
+        })
+        const detached = run.summary.then(() => { run.end() })
+        await run.submitted.catch(() => {})
+        const summary = await run.summary
+        await detached
+        await adapter.waitForOutputDrain()
+        const cap = JSON.parse(await readFile(h.capture, 'utf8')) as { stdin: string }
+        return { summary, content: JSON.parse(cap.stdin.trim()).message.content as string }
+      }
+
+      // 1. Fresh turn commits V1 state; turn 2 elides.
+      assert.equal((await submit('t1')).summary?.isError, false)
+      const t2 = await submit('t2')
+      assert.equal(t2.summary?.isError, false)
+      assert.ok(t2.content.startsWith(ANTIGRAVITY_RESUMED_PREAMBLE))
+
+      // 2. Persona changes to V2, but the next turn fails (exit 1): V2 is sent, yet state must NOT commit V2.
+      await writeFile(personaPath, 'PERSONA_V2_UPDATED', 'utf8')
+      process.env.FAKE_AGY_EXIT_CODE = '1'
+      const failedV2 = await submit('t3-fail')
+      assert.equal(failedV2.summary?.isError, true)
+      assert.ok(failedV2.content.includes('PERSONA_V2_UPDATED'))
+      process.env.FAKE_AGY_EXIT_CODE = '0'
+
+      // 3. Retry with V2 still sees uncommitted V2 vs committed V1 -> sends full V2, then commits V2 so the next turn elides.
+      const retryV2 = await submit('t3-retry')
+      assert.equal(retryV2.summary?.isError, false)
+      assert.ok(retryV2.content.includes('PERSONA_V2_UPDATED'), 'failed turn must not mark V2 as already committed')
+      const afterV2 = await submit('t4-elide')
+      assert.ok(afterV2.content.startsWith(ANTIGRAVITY_RESUMED_PREAMBLE))
+
+      // 4. Runtime flag file `off` forces full injection immediately without restart; removing it restores elision.
+      const flagDir = path.join(h.dir, 'openclaude-home', 'runtime-flags')
+      await mkdir(flagDir, { recursive: true })
+      await writeFile(path.join(flagDir, 'antigravity-dedup-context'), 'off\n', 'utf8')
+      const flagOff = await submit('t5-flag-off')
+      assert.match(flagOff.content, /^# OpenClaude Platform Context \(Antigravity adapter\)/)
+      await writeFile(path.join(flagDir, 'antigravity-dedup-context'), 'on\n', 'utf8')
+      const flagOn = await submit('t6-flag-on')
+      assert.ok(flagOn.content.startsWith(ANTIGRAVITY_RESUMED_PREAMBLE))
+
+      // 5. clearSessionId wipes durable prompt state so a reset conversation starts fresh.
+      const agyRoot = path.join(h.dir, 'openclaude-home', 'antigravity-cli')
+      assert.notEqual(readAntigravityPromptState(agyRoot, 'agent:main:webchat:dm:ocv5-781-gates'), null)
+      adapter.clearSessionId()
+      assert.equal(readAntigravityPromptState(agyRoot, 'agent:main:webchat:dm:ocv5-781-gates'), null)
+
+      // 6. State-dir write failure (e.g. prompt-state obstructed by regular file -> ENOTDIR on mkdirSync)
+      // must NEVER abort closeTurn cleanup, hang waitForOutputDrain, or retain active turn lock.
+      await rm(path.join(agyRoot, 'prompt-state'), { recursive: true, force: true })
+      await writeFile(path.join(agyRoot, 'prompt-state'), 'not-a-directory', 'utf8')
+      const obstructed = await submit('t7-obstructed-state-dir')
+      assert.equal(obstructed.summary?.isError, false)
+      assert.equal(adapter.isRunning, false, 'active turn lock must be released even when prompt-state write fails')
+      assert.deepEqual(await readdir(path.join(agyRoot, 'launch')), [], 'launch HOME must still be cleaned up')
+      const nextAfterObstructed = await submit('t8-still-runnable')
+      assert.equal(nextAfterObstructed.summary?.isError, false)
+      assert.match(nextAfterObstructed.content, /^# OpenClaude Platform Context \(Antigravity adapter\)/)
+    } finally {
+      await h.restore()
+    }
+  })
+})
+
+describe('Antigravity prompt state hardening (OCV5-781 audit)', () => {
+  test('state persistence failure is swallowed so turn teardown can finish', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-agy-state-'))
+    try {
+      const blocker = path.join(dir, 'not-a-dir')
+      await writeFile(blocker, 'x', 'utf8')
+      assert.doesNotThrow(() => writeAntigravityPromptState(blocker, {
+        v: 1,
+        sessionKey: 'agent:main:webchat:dm:state-fail',
+        conversationId: '9c2f4187-e96d-4840-8c1c-3de86f92aa01',
+        inputsKey: 'a'.repeat(64),
+        injectedAfterBaseline: 1,
+        updatedAt: Date.now(),
+      }))
+      assert.equal(readAntigravityPromptState(blocker, 'agent:main:webchat:dm:state-fail'), null)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('inputsKey changes when memory rules change but not when only the memory index churns', () => {
+    const base = {
+      agentId: 'main',
+      cwd: '/w',
+      cwdSource: 'default',
+      availableMcpTools: ['a'],
+      applied: [
+        { name: 'MEMORY', bytes: 10, sha256: '1'.repeat(64) },
+        { name: 'TOOLS', bytes: 10, sha256: '2'.repeat(64) },
+      ],
+      memoryInstructionsFingerprint: 'rules-v1',
+    }
+    const k1 = buildAntigravityPromptInputsKey(base)
+    const indexChurn = buildAntigravityPromptInputsKey({
+      ...base,
+      applied: [{ name: 'MEMORY', bytes: 99, sha256: '9'.repeat(64) }, base.applied[1]],
+    })
+    assert.equal(indexChurn, k1)
+    assert.notEqual(buildAntigravityPromptInputsKey({ ...base, memoryInstructionsFingerprint: 'rules-v2' }), k1)
+  })
 })

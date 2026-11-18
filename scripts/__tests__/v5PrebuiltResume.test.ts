@@ -120,7 +120,7 @@ build_release() { echo UNEXPECTED_BUILD_MASTER >>"$FIX/calls"; return 97; }
 build_runtime_release() { echo UNEXPECTED_BUILD_RUNTIME >>"$FIX/calls"; return 98; }
 build_platform_bundle() { echo UNEXPECTED_BUILD_PLATFORM >>"$FIX/calls"; return 99; }
 `
-  const run = (command: string, env: Record<string, string> = {}) => spawnSync('bash', ['-c', prelude + '\n' + command], {
+  const run = (command: string, env: Record<string, string> = {}) => spawnSync('bash', ['-c', `${prelude}\n${command}`], {
     cwd: repo, encoding: 'utf8', timeout: 120_000, env: { ...process.env, ALLOW_ANY_BRANCH: '1', ...env },
   })
   const setup = run(`
@@ -297,7 +297,8 @@ deploy`, { LOSE_AFTER_ACTIVATION: lost })
 })
 test('actual controller gate accepts only protected clean ops descendants and independently checks controller CI', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'v5-resume-controller-'))
-  const tree = path.join(dir, 'repo'), origin = path.join(dir, 'origin.git')
+  const tree = path.join(dir, 'repo')
+  const origin = path.join(dir, 'origin.git')
   mkdirSync(tree)
   const git = (...args: string[]) => {
     const result = spawnSync('git', args, { cwd: tree, encoding: 'utf8' })
@@ -342,7 +343,8 @@ ${command}`], { cwd: repo, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BR
       runtimeRelease: path.join(dir, 'runtime', 'rel-aaaaaaaaaaaa'), imageId,
       platformBundle: 'bbbbbbbbbbbb', masterArtifactSha256: 'a'.repeat(64),
       runtimeManifestSha256: 'b'.repeat(64), bundleManifestSha256: 'c'.repeat(64) }
-    const recordFile = path.join(dir, 'record'), queue = path.join(dir, 'queue')
+    const recordFile = path.join(dir, 'record')
+    const queue = path.join(dir, 'queue')
     writeFileSync(recordFile, JSON.stringify(record)); chmodSync(recordFile, 0o600)
     writeFileSync(queue, `#!/bin/bash\nprintf '%s\\n' '${base}'\n`); chmodSync(queue, 0o755)
     const refused = invoke(`

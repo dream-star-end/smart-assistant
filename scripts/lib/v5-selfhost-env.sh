@@ -112,13 +112,11 @@ OC_P5_RECIPE_SCHEDULE=1
 # Claude Code external HTTPS transport:keep internal http://172.31.0.1:18892
 # on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
 OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
-OC_CLAUDE_CODE_TZ=Asia/Tokyo
-# 用户面时区(OCV5-166)—— 与上面的 OC_CLAUDE_CODE_TZ **正交**,不要混改。
-#   OC_CLAUDE_CODE_TZ : 引擎子进程 TZ,跟随日本出口 IP,是风控一致性控制;
-#   OC_USER_TZ        : 用户真实所在地。两处消费:① 外接 ApiKey 路径的 system-reminder
-#                       追加「用户本地日期+UTC 偏移」;② 注入容器 env(docker Create.Env),
-#                       容器 gateway envProbe 渲染成 ENV slot 的 user_tz= 行给网页/cron 会话。
-#                       不改子进程 TZ、不参与选路;非缺省值改后需重建容器才进 PID1。
+# 用户面时区(OCV5-166 / OCV5-754 统一于 OC_USER_TZ):
+#   OC_USER_TZ: 用户真实所在地。两处消费:① 外接 ApiKey 路径的 system-reminder
+#               追加「用户本地日期+UTC 偏移」;② 注入容器 env(docker Create.Env),
+#               容器 gateway envProbe 渲染成 ENV slot 的 user_tz= 行给所有引擎。
+#               非缺省值改后需重建容器才进 PID1。
 OC_USER_TZ=Asia/Taipei
 # 不要在本文件写入 OPENCLAUDE_V3_MASTER_BASE_URL / OPENCLAUDE_V3_CONTAINER_TOKEN。
 # 这两项由 v3supervisor 按用户容器注入;写进 host env 会让 cron 站内信全部落到同一个 uid。
@@ -162,6 +160,16 @@ ensure_env_kv() {
   chmod 600 "$file"
 }
 
+# 幂等删除已退役的 env 键。
+delete_env_kv() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  if grep -Eq "^[[:space:]]*${key}=" "$file"; then
+    sed -i "/^[[:space:]]*${key}=/d" "$file"
+    chmod 600 "$file"
+  fi
+}
+
 ensure_selfhost_env_keys() {
   log "── 确认制品根 + OC_SESSIONS_STORE=pg 写在 $V5_ENV ──"
   if [[ "$DRY" == 1 ]]; then
@@ -186,12 +194,15 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_P5_CHIPS 1
   ensure_env_kv "$V5_ENV" OC_P5_RECIPE_SCHEDULE 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
-  ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
+  delete_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ
+  delete_env_kv "$V5_ENV" OC_CLAUDE_EGRESS_IDENTITY_GUARD
+  delete_env_kv "$V5_ENV" OC_CLAUDE_EGRESS_PINNED_COUNTRY
+  delete_env_kv "$V5_ENV" OC_CLAUDE_EGRESS_PINNED_IP
   ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Taipei"
   ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
   ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
   ensure_env_kv "$V5_ENV" OC_V5_WEB_OVERLAY_ROOT "$WEB_OVERLAY_ROOT"
   # OCV5-633:master 在 spa 模式 /assets 未命中时回落的资产池根(网关只认绝对路径;master 重启生效)。
   ensure_env_kv "$V5_ENV" OC_V5_WEB_ASSETS_POOL "$WEB_ASSETS_POOL"
-  log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
+  log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB transport + OC_USER_TZ"
 }

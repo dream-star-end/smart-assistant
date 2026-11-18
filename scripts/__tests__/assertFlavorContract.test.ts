@@ -175,7 +175,10 @@ describe("assert-flavor.sh matches TS fixtures", () => {
   });
 
   test("B5: activate_release and activate_runtime_tuple call the commercial assertion", () => {
-    const src = readFileSync(path.join(root, "scripts/deploy-v5.sh"), "utf8");
+    const entry = readFileSync(path.join(root, "scripts/deploy-v5.sh"), "utf8");
+    const wire = 'source "$SCRIPT_DIR/lib/v5-release-artifacts.sh"';
+    assert.equal(entry.split(wire).length, 2, "artifact helpers must be sourced exactly once");
+    const src = entry.replace(wire, readFileSync(path.join(root, "scripts/lib/v5-release-artifacts.sh"), "utf8"));
     assert.match(src, /assert_commercial_flavor_on_target "\$reldir"/);
     assert.match(src, /assert_commercial_flavor_on_target "\$BUILT_RELEASE"/);
     assert.match(src, /flavorGuardGeneration:\$flavorGuardGeneration/);

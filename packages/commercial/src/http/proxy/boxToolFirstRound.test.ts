@@ -159,10 +159,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
         sequence.push("proof-read");
         const reason = options.terminalProof ?? "worker_complete";
-        return { stdout: JSON.stringify({ runNonce: currentNonce,
+        return { stdout: `${JSON.stringify({ runNonce: currentNonce,
           leaseEpoch: currentEpoch, keeperPid: 101, cliPid: 102,
           reason, ...(reason === "worker_failed" ? { revision: 2, workerExitCode: 1 }
-            : { revision: 1 }) }) + "\n",
+            : { revision: 1 }) })}\n`,
         stderrBytes: 0, exitCode: 0 as const };
       }
 
@@ -983,7 +983,7 @@ const syntheticTurnRaw = Buffer.from([records[0], records[1],
   { type: "user", isSynthetic: true, parent_tool_use_id: null,
     message: { role: "user", content: [{ type: "text",
       text: "Output token limit hit. Resume directly" }] } },
-  ...records.slice(2)].map((record) => JSON.stringify(record) + "\n").join(""));
+  ...records.slice(2)].map((record) => `${JSON.stringify(record)}\n`).join(""));
 
 test("INC-20261006 a synthetic CLI turn inside a message is stopped and settled, not left unknown", async () => {
   const f = fixture({ spoolBody: syntheticTurnRaw });
@@ -1104,7 +1104,7 @@ test("OCV5-756: a context miss after a written pointer logs which part changed, 
     assert.equal(result.kind, "final");
     const context = decisions.find((item) => item.reason === "context");
     assert.deepEqual(context?.detail, { basis: "known",
-      system: { prev: 1, next: 1, firstDiff: 0 }, changed: ["system"] });
+      systemParts: { prev: 1, next: 1, firstDiff: 0 }, changed: ["system"] });
     assert.doesNotMatch(JSON.stringify(decisions), /SECRET/);
     assert.equal(f.admittedNative, null, "a diagnosed miss is still a cold start");
   } finally {
@@ -1127,7 +1127,7 @@ test("OCV5-384: a re-staged conversation carries the session's native context re
       rendered: "Today's date is 2026-10-12." }];
     const run = async (options: Parameters<typeof fixture>[0]) => {
       const f = fixture({ directFinal: true, ...options });
-      const decisions: { reason: string }[] = [];
+      const decisions: { reason: string; detail?: unknown }[] = [];
       const result = await runBoxToolFirstRound({ ...f.input, canonicalBody: history,
         init: { ...f.input.init, body: JSON.stringify({ ...history, model: "claude-opus-5-5" }) } },
       { ...f.deps, onNativeDecision: (info) => { decisions.push(info); } });
@@ -1137,7 +1137,8 @@ test("OCV5-384: a re-staged conversation carries the session's native context re
     const carried = await run({ transcriptSources: [source], transcriptRecords: records });
     assert.equal(carried.result.kind, "final");
     assert.ok(carried.f.sequence.indexOf("transcript-read") < carried.f.sequence.indexOf("admit"));
-    assert.ok(carried.decisions.some((d) => d.reason === "restage_attachments"));
+    assert.deepEqual(carried.decisions.find((d) => d.reason === "restage_attachments")?.detail,
+      { priorReason: "no_candidate", attachmentCount: records.length });
     assert.ok(plain.result.kind === "final" && carried.result.kind === "final"
       && plain.result.plan.snapshotHash !== null && carried.result.plan.snapshotHash !== null
       && plain.result.plan.snapshotHash !== carried.result.plan.snapshotHash,
@@ -1146,6 +1147,64 @@ test("OCV5-384: a re-staged conversation carries the session's native context re
       transcriptRecords: records });
     assert.equal(otherBuild.f.sequence.includes("transcript-read"), false,
       "a transcript written by another CLI build is not read");
+  } finally {
+    if (previous === undefined) Reflect.deleteProperty(process.env, "OC_BOX_FAST_NATIVE");
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
+test("OCV5-756: restage_attachments records priorReason and attachmentCount across context miss and tool_resume", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const source = { cliCwd: `/tmp/ocv5-289-run-${"7".repeat(24)}`,
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc", cliVersion: "2.1.280" };
+    const records = [
+      { type: "attachment", attachment: { type: "date", date: "2026-10-12" },
+        rendered: "Today's date is 2026-10-12." },
+      { type: "attachment", attachment: { type: "environment", os: "linux" },
+        rendered: "Environment: linux" },
+    ];
+
+    // 1) History miss ("context") followed by restage_attachments
+    const priorBody = { ...canonicalBody, system: "SECRET system v1",
+      messages: [{ role: "user", content: "SECRET prior question" }] } as ProxyBody;
+    const first = fixture({ directFinal: true });
+    const written = await runBoxToolFirstRound({ ...first.input, canonicalBody: priorBody,
+      init: { ...first.input.init, body: JSON.stringify({ ...priorBody, model }) } }, first.deps);
+    assert.ok(written.kind === "final" && written.nativePointer);
+    const nextBody = { ...priorBody, system: "SECRET system v2", messages: [
+      ...priorBody.messages,
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "SECRET new question" }] } as ProxyBody;
+    const contextFixture = fixture({ directFinal: true,
+      nativeCandidate: { ownerRequestId: "native-owner", pointer: written.nativePointer },
+      transcriptSources: [source], transcriptRecords: records });
+    const contextDecisions: Array<{ reason: string; detail?: unknown }> = [];
+    const contextResult = await runBoxToolFirstRound({ ...contextFixture.input, canonicalBody: nextBody,
+      init: { ...contextFixture.input.init, body: JSON.stringify({ ...nextBody, model }) } },
+    { ...contextFixture.deps, onNativeDecision: (info) => { contextDecisions.push(info); } });
+    assert.equal(contextResult.kind, "final");
+    assert.deepEqual(contextDecisions.map((d) => d.reason), ["context", "restage_attachments"]);
+    assert.deepEqual(contextDecisions.find((d) => d.reason === "restage_attachments")?.detail,
+      { priorReason: "context", attachmentCount: 2 });
+
+    // 2) resumeToolResults ("tool_resume") followed by restage_attachments
+    const toolBody = { ...canonicalBody, messages: [
+      { role: "user", content: "call tool" },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_resumed", name: "local_echo", input: { value: "x" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_resumed", content: "tool output" }] },
+    ] } as ProxyBody;
+    const toolFixture = fixture({ directFinal: true, transcriptSources: [source], transcriptRecords: records });
+    const toolDecisions: Array<{ reason: string; detail?: unknown }> = [];
+    const toolResult = await runBoxToolFirstRound({ ...toolFixture.input, canonicalBody: toolBody,
+      resumeToolResults: true,
+      init: { ...toolFixture.input.init, body: JSON.stringify({ ...toolBody, model }) } },
+    { ...toolFixture.deps, onNativeDecision: (info) => { toolDecisions.push(info); } });
+    assert.equal(toolResult.kind, "final");
+    assert.deepEqual(toolDecisions.map((d) => d.reason), ["tool_resume", "restage_attachments"]);
+    assert.deepEqual(toolDecisions.find((d) => d.reason === "restage_attachments")?.detail,
+      { priorReason: "tool_resume", attachmentCount: 2 });
   } finally {
     if (previous === undefined) Reflect.deleteProperty(process.env, "OC_BOX_FAST_NATIVE");
     else process.env.OC_BOX_FAST_NATIVE = previous;
@@ -1279,7 +1338,8 @@ test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and 
     assert.equal(input.phase, "first_round");
     events.push("first-failure"); return null;
   };
-  let stops = 0, stopStartedAt = 0;
+  let stops = 0;
+  let stopStartedAt = 0;
   let release!: () => void;
   const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
   try {
@@ -1308,10 +1368,10 @@ test("tool validation first errors survive first-round cleanup and strict termin
   const malformedInput = Buffer.from([records[0], records[1], records[2],
     event({ type: "content_block_delta", index: 0,
       delta: { type: "input_json_delta", partial_json: '{"private-input":' } }),
-    records[5]].map((item) => JSON.stringify(item) + "\n").join(""));
+    records[5]].map((item) => `${JSON.stringify(item)}\n`).join(""));
   const outOfOrder = Buffer.from([records[0], event({ type: "content_block_delta", index: 0,
     delta: { type: "text_delta", text: "private-output" } })]
-    .map((item) => JSON.stringify(item) + "\n").join(""));
+    .map((item) => `${JSON.stringify(item)}\n`).join(""));
   for (const item of [
     { code: "BOX_TOOL_INPUT_INVALID", spoolBody: malformedInput },
     { code: "BOX_TOOL_ORDER_INVALID", spoolBody: outOfOrder },

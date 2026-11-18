@@ -21,6 +21,9 @@ concurrency:
   group: v5-selfhost-gates-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
 jobs:
   gates:
     name: selfhost-gates

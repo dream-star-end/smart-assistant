@@ -3,10 +3,11 @@ import { isDialogLayerOpen, resolveGlobalHotkey } from "./hotkeys";
 
 function key(
   over: Partial<KeyboardEvent> & Pick<KeyboardEvent, "key">,
-): Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target"> & { code?: string } {
+): Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target"> & { altKey?: boolean; code?: string } {
   return {
     key: over.key,
     code: over.code,
+    altKey: over.altKey ?? false,
     metaKey: over.metaKey ?? false,
     ctrlKey: over.ctrlKey ?? false,
     shiftKey: over.shiftKey ?? false,
@@ -84,5 +85,14 @@ describe("resolveGlobalHotkey", () => {
     expect(resolveGlobalHotkey(key({ key: "\\", ctrlKey: true, target: document.createElement("textarea") }))).toBe("pane");
     expect(resolveGlobalHotkey(key({ key: "|", code: "Backslash", metaKey: true, shiftKey: true }))).toBeNull();
     expect(resolveGlobalHotkey(key({ key: "\\" }))).toBeNull();
+  });
+
+  test("Alt/⌥+K 开合快问小窗:输入框内也生效;组合修饰键或输入法组合态不触发", () => {
+    expect(resolveGlobalHotkey(key({ key: "k", altKey: true }))).toBe("quickAsk");
+    expect(resolveGlobalHotkey(key({ key: "˚", code: "KeyK", altKey: true }))).toBe("quickAsk");
+    expect(resolveGlobalHotkey(key({ key: "k", altKey: true, target: document.createElement("textarea") }))).toBe("quickAsk");
+    expect(resolveGlobalHotkey(key({ key: "k", altKey: true, ctrlKey: true }))).toBeNull();
+    expect(resolveGlobalHotkey(key({ key: "k", altKey: true, shiftKey: true }))).toBeNull();
+    expect(resolveGlobalHotkey({ ...key({ key: "k", altKey: true }), isComposing: true })).toBeNull();
   });
 });

@@ -62,6 +62,7 @@ import {
   claimDriverVerificationRun,
   completeDriverVerificationRun,
   computeProbeFingerprintTs,
+  legacyProfileEngineForAuthority,
   loadRemoteDriverRegistry,
   placeRemoteDriverLane,
   recordDriverProbeSnapshot,
@@ -774,7 +775,7 @@ export async function createConformanceHarness(
     )
   ).rows[0].id
 
-  const legacyProfileEngine = reg.authorityEngine === 'codex' ? 'codex' : 'cc'
+  const legacyProfileEngine = legacyProfileEngineForAuthority(reg.authorityEngine)
   const profileId = (
     await pool.query(
       `INSERT INTO remote_agent_profiles
@@ -926,7 +927,7 @@ export async function createConformanceHarness(
     peerProbed.snapshot,
   )
   const peerPolicySha = String(peerSpecSample.policySha256 ?? peerProbed.snapshot.rawResponseSha256)
-  const peerLegacyEngine = peerReg.authorityEngine === 'codex' ? 'codex' : 'cc'
+  const peerLegacyEngine = legacyProfileEngineForAuthority(peerReg.authorityEngine)
   const peerProfileId = (
     await pool.query(
       `INSERT INTO remote_agent_profiles
@@ -996,12 +997,14 @@ export async function createConformanceHarness(
     reasoning: { supported: ['low', 'medium', 'high'] as const, codexModelDefault: 'medium' as const },
     ccb: { capabilityZero: false, supportsThinking: true },
   }
+  const providerFor = (ae: string) =>
+    ae === 'codex' ? 'codex' : ae === 'antigravity' ? 'antigravity' : 'anthropic'
   const catalogEntries: ModelCatalogEntry[] = [
     {
       entryId: 501,
       modelId: canonicalModel,
       engine: reg.authorityEngine as any,
-      providerId: reg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      providerId: providerFor(reg.authorityEngine),
       placement: 'remote_pool',
       upstreamModelId: upstreamModel,
       contextWindow: 200_000,
@@ -1014,7 +1017,7 @@ export async function createConformanceHarness(
       entryId: 502,
       modelId: peerPrep.canonicalModel,
       engine: peerReg.authorityEngine as any,
-      providerId: peerReg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      providerId: providerFor(peerReg.authorityEngine),
       placement: 'remote_pool',
       upstreamModelId: peerPrep.upstreamModel,
       contextWindow: 200_000,
@@ -1055,7 +1058,7 @@ export async function createConformanceHarness(
       entryId: 503,
       modelId: faultCanonicalModel,
       engine: reg.authorityEngine as any,
-      providerId: reg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      providerId: providerFor(reg.authorityEngine),
       placement: 'remote_pool',
       upstreamModelId: faultUpstreamModel,
       contextWindow: 200_000,
@@ -1077,7 +1080,7 @@ export async function createConformanceHarness(
       entryId: 504,
       modelId: faultPeerCanonicalModel,
       engine: peerReg.authorityEngine as any,
-      providerId: peerReg.authorityEngine === 'codex' ? 'codex' : 'anthropic',
+      providerId: providerFor(peerReg.authorityEngine),
       placement: 'remote_pool',
       upstreamModelId: peerPrep.upstreamModel,
       contextWindow: 200_000,

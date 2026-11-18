@@ -470,7 +470,15 @@ oc_hotcfg_install_deps_in_image() {
 # 临时目录取 staging 的兄弟目录(同文件系统,空间充足;避免 /tmp tmpfs 撑爆),函数退出前必删。
 oc_hotcfg_build_ccb_dist() {
   local staging="$1" prev="${2:-}" bun ver ccb_build ccb_work src_rows src_key shared_path shared_file shared_rows=""
-  local -a shared_inputs=(packages/storage/src/sessionFileIo.ts packages/protocol/src/contextBytePressure.ts packages/gateway/src/engine/contextReference.ts)
+  local -a shared_inputs=(
+    packages/storage/src/sessionFileIo.ts
+    packages/storage/src/idleNativeLock.ts
+    packages/storage/src/authorityGenerationLock.ts
+    packages/storage/src/kernelFileLock.ts
+    packages/storage/src/idleRollback.ts
+    packages/protocol/src/contextBytePressure.ts
+    packages/gateway/src/engine/contextReference.ts
+  )
   bun="$OC_BUN_BIN"
   [ -n "$bun" ] || { if [ -x "$HOME/.bun/bin/bun" ]; then bun="$HOME/.bun/bin/bun"; else bun="$(command -v bun || true)"; fi; }
   [ -n "$bun" ] && [ -x "$bun" ] || { oc_hotcfg__die "build_ccb_dist: 找不到 host bun(~/.bun/bin/bun 或 PATH)"; return 1; }

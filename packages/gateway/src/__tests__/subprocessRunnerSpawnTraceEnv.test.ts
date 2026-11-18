@@ -172,11 +172,12 @@ test('trace opts oracle rejects missing, misplaced, required or non-string trace
   const file = ts.createSourceFile('subprocessSpawnConfig.ts', optsSrc, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const declaration = file.statements.find((node): node is ts.InterfaceDeclaration => ts.isInterfaceDeclaration(node) && node.name.text === 'SubprocessRunnerOpts')!
   const field = declaration.members.find((node): node is ts.PropertySignature => ts.isPropertySignature(node) && ts.isIdentifier(node.name) && node.name.text === 'traceId')!
-  const prefix = optsSrc.slice(0, field.getStart(file)), suffix = optsSrc.slice(field.end)
+  const prefix = optsSrc.slice(0, field.getStart(file))
+  const suffix = optsSrc.slice(field.end)
   for (const replacement of ['', 'traceId: string', 'traceId?: number']) {
     assert.equal(traceIdContract(prefix + replacement + suffix), false, replacement || 'removed')
   }
-  assert.equal(traceIdContract(prefix + suffix + '\ninterface WrongOpts { traceId?: string }'), false, 'another interface cannot satisfy the contract')
+  assert.equal(traceIdContract(`${prefix + suffix}\ninterface WrongOpts { traceId?: string }`), false, 'another interface cannot satisfy the contract')
 })
 
 test('real LocalBackend child receives provided traceId and not inherited wrong values', async () => {

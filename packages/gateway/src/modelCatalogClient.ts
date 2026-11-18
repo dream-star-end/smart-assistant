@@ -69,6 +69,8 @@ const CATALOG_TTL_MS = 30_000
  * gateway 必须用同一窗口重拉全量;过期且刷新失败 → fail-closed,不许沿用陈旧 Map。
  */
 export const AGENT_COST_OVERRIDE_TTL_MS = 60_000
+/** 409 MODEL_CONFIG_CHANGED_RETRY_TURN 触发全量重拉的最小冷却间隔(防滚动发版期雪崩)。 */
+export const DEFAULT_CONFIG_CHANGED_COOLDOWN_MS = 3_000
 /** 单次请求超时:本地路径 turn 在等它,失败要早(拒 turn 好过挂住 cron)。 */
 const FETCH_TIMEOUT_MS = 5_000
 const MAX_BODY_BYTES = 512 * 1024
@@ -111,6 +113,8 @@ export interface LocalCatalogView {
   readonly models: readonly LocalCatalogModel[]
   /** Actual wire source; omitted on a legacy in-memory view. */
   readonly projectionFormat?: number
+  /** Master projection algorithm/schema digest; omitted on legacy views/masters. */
+  readonly projectionAlgoVersion?: string
   readonly projectionRevision: string
   readonly availabilityRevision: string
   readonly securityEpoch: string
@@ -207,6 +211,8 @@ export interface ModelCatalogClientDeps {
   lkgPath?: string
   ttlMs?: number
   timeoutMs?: number
+  /** 409 自愈重拉的最小冷却间隔(默认 3000ms;测试可注入)。 */
+  configChangedCooldownMs?: number
   log?: (event: string, fields: Record<string, unknown>) => void
 }
 
@@ -220,6 +226,15 @@ export class ModelCatalogClient {
   private routingInflight: Promise<LocalCatalogView> | null = null
   /** Every full catalog fetch, regardless of caller, shares this single flight. */
   private catalogFetchInflight: Promise<LocalCatalogView> | null = null
+  /** 409 config-changed invalidation shares this single flight. */
+  private forceRefreshInflight: Promise<LocalCatalogView> | null = null
+  /** True after 409 invalidation until a post-invalidation full fetch commits. */
+  private forceFullFetch = false
+  /** Monotonic generation preventing pre-invalidation full fetches from clearing `forceFullFetch`. */
+  private configInvalidationSeq = 0
+  private lastConfigChangedRefreshAt: number | null = null
+  /** Cooldown deadline queued when a 409 occurs during cooldown throttle. */
+  private deferredConfigChangedRefreshAt: number | null = null
   /** 最近一次**全量拉到** agent_cost_overrides 的时刻。epoch 验证通过不算。 */
   private agentOverridesVerifiedAt = 0
   private lkgLoaded = false
@@ -232,6 +247,7 @@ export class ModelCatalogClient {
   private readonly lkgPath: string
   private readonly ttlMs: number
   private readonly timeoutMs: number
+  private readonly configChangedCooldownMs: number
   private readonly log: (event: string, fields: Record<string, unknown>) => void
 
   constructor(deps: ModelCatalogClientDeps = {}) {
@@ -254,6 +270,10 @@ export class ModelCatalogClient {
     this.lkgPath = deps.lkgPath ?? defaultLkgPath(this.env)
     this.ttlMs = deps.ttlMs ?? CATALOG_TTL_MS
     this.timeoutMs = deps.timeoutMs ?? FETCH_TIMEOUT_MS
+    this.configChangedCooldownMs = Math.max(
+      0,
+      deps.configChangedCooldownMs ?? DEFAULT_CONFIG_CHANGED_COOLDOWN_MS,
+    )
     this.log = deps.log ?? ((event, fields) => catalogLog.warn(event, fields))
   }
 
@@ -270,9 +290,13 @@ export class ModelCatalogClient {
     if (!this.configured) {
       throw new ModelCatalogUnavailableError('master base url / container token not injected')
     }
+    this.promoteDeferredConfigChangedRefresh()
+    if (this.forceRefreshInflight) return this.forceRefreshInflight
     if (this.routingInflight) return this.routingInflight
     const snap = this.snapshot
-    if (snap && this.now() - snap.verifiedAt < this.ttlMs) return snap.view
+    if (!this.forceFullFetch && snap && this.now() - snap.verifiedAt < this.ttlMs) {
+      return snap.view
+    }
 
     if (this.inflight) return this.inflight
     this.inflight = this.ensureFresh().finally(() => {
@@ -290,6 +314,8 @@ export class ModelCatalogClient {
     if (!this.configured) {
       throw new ModelCatalogUnavailableError('master base url / container token not injected')
     }
+    this.promoteDeferredConfigChangedRefresh()
+    if (this.forceRefreshInflight) return this.forceRefreshInflight
     if (this.routingInflight) return this.routingInflight
     this.routingInflight = (async () => {
       if (this.inflight) await this.inflight
@@ -298,6 +324,73 @@ export class ModelCatalogClient {
       this.routingInflight = null
     })
     return this.routingInflight
+  }
+
+  private promoteDeferredConfigChangedRefresh(): void {
+    if (
+      this.deferredConfigChangedRefreshAt !== null &&
+      this.now() >= this.deferredConfigChangedRefreshAt
+    ) {
+      this.deferredConfigChangedRefreshAt = null
+      this.lastConfigChangedRefreshAt = this.now()
+      this.forceFullFetch = true
+      this.configInvalidationSeq += 1
+      this.log('config_changed_deferred_refresh_promoted', {
+        cachedEpoch: this.snapshot?.view.securityEpoch ?? null,
+        cachedProjectionRevision: this.snapshot?.view.projectionRevision ?? null,
+      })
+    }
+  }
+
+  /**
+   * React to egress 409 `MODEL_CONFIG_CHANGED_RETRY_TURN`: bypass cached TTL and
+   * epoch-match short-circuiting to fetch a fresh full catalog projection once,
+   * while preserving on-disk LKG if master is temporarily unreachable.
+   *
+   * Single-flight + cooldown (`configChangedCooldownMs`) prevents thundering-herd
+   * full refetches against master during rolling deploys.
+   */
+  async invalidateOnConfigChanged(
+    reason = '409_model_config_changed',
+  ): Promise<LocalCatalogView | null> {
+    if (!this.configured) return null
+    if (this.forceRefreshInflight) return this.forceRefreshInflight
+
+    const now = this.now()
+    if (
+      this.lastConfigChangedRefreshAt !== null &&
+      now - this.lastConfigChangedRefreshAt < this.configChangedCooldownMs
+    ) {
+      this.deferredConfigChangedRefreshAt =
+        this.lastConfigChangedRefreshAt + this.configChangedCooldownMs
+      this.log('config_changed_refresh_throttled', {
+        reason,
+        elapsedMs: now - this.lastConfigChangedRefreshAt,
+        cooldownMs: this.configChangedCooldownMs,
+      })
+      return this.snapshot?.view ?? null
+    }
+
+    this.deferredConfigChangedRefreshAt = null
+    this.lastConfigChangedRefreshAt = now
+    this.forceFullFetch = true
+    this.configInvalidationSeq += 1
+    this.log('config_changed_invalidate_refetch', {
+      reason,
+      cachedEpoch: this.snapshot?.view.securityEpoch ?? null,
+      cachedProjectionRevision: this.snapshot?.view.projectionRevision ?? null,
+    })
+
+    this.forceRefreshInflight = (async () => {
+      // Drain any pre-invalidation full fetch so we never adopt stale in-flight data.
+      if (this.catalogFetchInflight) {
+        await this.catalogFetchInflight.catch(() => {})
+      }
+      return await this.fetchCatalog()
+    })().finally(() => {
+      this.forceRefreshInflight = null
+    })
+    return this.forceRefreshInflight
   }
 
   /**
@@ -375,6 +468,11 @@ export class ModelCatalogClient {
     this.inflight = null
     this.routingInflight = null
     this.catalogFetchInflight = null
+    this.forceRefreshInflight = null
+    this.forceFullFetch = false
+    this.configInvalidationSeq = 0
+    this.lastConfigChangedRefreshAt = null
+    this.deferredConfigChangedRefreshAt = null
     this.agentOverridesVerifiedAt = 0
     this.lkgLoaded = false
     this.pricingUpgradeAttempted = false
@@ -389,9 +487,16 @@ export class ModelCatalogClient {
    * 但**任何一步验不出新鲜,一律拒** —— 不存在"验不了就先用着"的分支。
    */
   private async ensureFresh(checkAvailability = false): Promise<LocalCatalogView> {
+    if (this.forceRefreshInflight) return this.forceRefreshInflight
+    if (this.forceFullFetch) return this.fetchCatalog()
     const cached = this.snapshot ?? this.loadLkg()
     if (cached) {
-      let state: { epoch: string; availabilityRevision: string; projectionFormat: number }
+      let state: {
+        epoch: string
+        availabilityRevision: string
+        projectionFormat: number
+        projectionAlgoVersion: string
+      }
       try {
         state = await this.fetchCatalogState()
       } catch (err) {
@@ -400,9 +505,13 @@ export class ModelCatalogClient {
           `epoch verification failed: ${err instanceof Error ? err.message : String(err)}`,
         )
       }
+      if (this.forceRefreshInflight) return this.forceRefreshInflight
+      const cachedAlgo = cached.view.projectionAlgoVersion ?? 'legacy'
       if (
+        !this.forceFullFetch &&
         state.epoch === cached.view.securityEpoch &&
         state.projectionFormat === (cached.view.projectionFormat ?? 1) &&
+        state.projectionAlgoVersion === cachedAlgo &&
         (!checkAvailability ||
           state.availabilityRevision === cached.view.availabilityRevision)
       ) {
@@ -425,15 +534,26 @@ export class ModelCatalogClient {
         this.snapshot = { view: cached.view, verifiedAt: this.now() }
         return cached.view
       }
-      if (state.projectionFormat !== (cached.view.projectionFormat ?? 1)) {
+      if (
+        this.forceFullFetch ||
+        state.projectionFormat !== (cached.view.projectionFormat ?? 1) ||
+        state.projectionAlgoVersion !== cachedAlgo
+      ) {
         // A full read started before this state probe may still return the old
-        // wire format. Drain it before fetching the newly observed projection.
+        // wire format/projection. Drain it before fetching the newly observed projection.
         if (this.catalogFetchInflight) await this.catalogFetchInflight.catch(() => {})
         const current = this.snapshot
-        if (current && current.view !== cached.view &&
+        if (
+          !this.forceFullFetch &&
+          current &&
+          current.view !== cached.view &&
           (current.view.projectionFormat ?? 1) === state.projectionFormat &&
+          (current.view.projectionAlgoVersion ?? 'legacy') === state.projectionAlgoVersion &&
           current.view.securityEpoch === state.epoch &&
-          (!checkAvailability || current.view.availabilityRevision === state.availabilityRevision)) return current.view
+          (!checkAvailability || current.view.availabilityRevision === state.availabilityRevision)
+        ) {
+          return current.view
+        }
       }
       this.log('epoch_drift_force_refetch', {
         cached: cached.view.securityEpoch,
@@ -442,6 +562,9 @@ export class ModelCatalogClient {
         dbAvailability: state.availabilityRevision,
         cachedFormat: cached.view.projectionFormat ?? 1,
         dbFormat: state.projectionFormat,
+        cachedAlgo,
+        dbAlgo: state.projectionAlgoVersion,
+        forceFullFetch: this.forceFullFetch,
       })
       // 漂移 → 强拉。拉不到 → 拒(下面 fetchCatalog 抛)。
     }
@@ -451,11 +574,15 @@ export class ModelCatalogClient {
   private async fetchCatalog(): Promise<LocalCatalogView> {
     if (this.catalogFetchInflight) return this.catalogFetchInflight
     this.catalogFetchInflight = (async () => {
+      const startSeq = this.configInvalidationSeq
       const body = await this.getJson(MODEL_CATALOG_PATH)
       const view = parseCatalogResponse(body)
-      this.snapshot = { view, verifiedAt: this.now() }
-      this.agentOverridesVerifiedAt = this.now()
-      this.persistLkg(view)
+      if (startSeq === this.configInvalidationSeq) {
+        this.snapshot = { view, verifiedAt: this.now() }
+        this.agentOverridesVerifiedAt = this.now()
+        this.forceFullFetch = false
+        this.persistLkg(view)
+      }
       return view
     })().finally(() => {
       this.catalogFetchInflight = null
@@ -467,6 +594,7 @@ export class ModelCatalogClient {
     epoch: string
     availabilityRevision: string
     projectionFormat: number
+    projectionAlgoVersion: string
   }> {
     const body = await this.getJson(MODEL_CATALOG_EPOCH_PATH)
     const epoch = (body as { epoch?: unknown }).epoch
@@ -474,9 +602,11 @@ export class ModelCatalogClient {
       throw new Error('epoch endpoint returned malformed body')
     }
     const availability = (body as { availability_revision?: unknown }).availability_revision
+    const algo = (body as { projection_algo_version?: unknown }).projection_algo_version
     return {
       epoch,
       projectionFormat: parseProjectionFormat((body as { projection_format?: unknown }).projection_format),
+      projectionAlgoVersion: typeof algo === 'string' && algo !== '' ? algo : 'legacy',
       availabilityRevision:
         typeof availability === 'string' && availability !== '' ? availability : 'legacy',
     }
@@ -564,6 +694,31 @@ export function getLocalCatalogToken(): Promise<string> {
   return getModelCatalogClient().getToken()
 }
 
+/**
+ * Notify the singleton client that egress rejected a `local_catalog` request
+ * with 409 `MODEL_CONFIG_CHANGED_RETRY_TURN`. Forces a single-flight,
+ * cooldown-bounded full refetch while keeping on-disk LKG intact on failure.
+ */
+export function invalidateModelCatalogOnConfigChanged(
+  reason?: string,
+): Promise<LocalCatalogView | null> {
+  return getModelCatalogClient().invalidateOnConfigChanged(reason)
+}
+
+/**
+ * Fire-and-forget 409 self-healing hook for synchronous/error boundaries:
+ * synchronously initiates the single-flight full refetch (subject to cooldown)
+ * without delaying turn error reporting or risking unhandled rejections.
+ */
+export function triggerLocalCatalogRefreshOnConfigChanged(reason?: string): void {
+  void invalidateModelCatalogOnConfigChanged(reason).catch((err) => {
+    catalogLog.warn('config_changed_invalidate_refetch_failed', {
+      reason: reason ?? '409_model_config_changed',
+      err: err instanceof Error ? err.message : String(err),
+    })
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 解析 / 序列化
 // ---------------------------------------------------------------------------
@@ -590,6 +745,7 @@ interface WireRow {
 
 interface WireResponse {
   projection_format?: number
+  projection_algo_version?: string
   models: WireRow[]
   projection_revision: string
   availability_revision?: string
@@ -611,6 +767,9 @@ function toWire(view: LocalCatalogView): WireResponse {
   for (const [alias, canonical] of aliasEntries) aliases[alias] = canonical
   return {
     projection_format: view.projectionFormat ?? 1,
+    ...(view.projectionAlgoVersion
+      ? { projection_algo_version: view.projectionAlgoVersion }
+      : {}),
     models: view.models.map((m) => ({
       model_id: m.modelId,
       display_name: m.displayName,
@@ -731,6 +890,9 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
   return {
     models,
     projectionFormat: parseProjectionFormat(o.projection_format),
+    ...(typeof o.projection_algo_version === 'string' && o.projection_algo_version !== ''
+      ? { projectionAlgoVersion: o.projection_algo_version }
+      : {}),
     projectionRevision: o.projection_revision,
     availabilityRevision:
       typeof o.availability_revision === 'string' && o.availability_revision !== ''

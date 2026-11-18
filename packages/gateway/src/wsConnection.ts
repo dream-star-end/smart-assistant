@@ -1042,7 +1042,8 @@ export async function autoResumeFromHello(
     // 单 ws send(只给本次 hello 的 client 看,不是所有 peerKey),与下方
     // synthetic isFinal 同模式 —— 不走 deliver(),避免把同一帧再 ring + 广播。
     const resendPhase = session
-      ? _helloTurnStatusResendPhase(session.runner.isRunning, session.currentTurnStatus)
+      ? _helloTurnStatusResendPhase(session.runner.isRunning || Boolean(session._idleWaiters?.size),
+          session._idleWaiters?.size ? 'compacting' : session.currentTurnStatus)
       : undefined
     if (resendPhase !== undefined) {
       try {

@@ -1879,6 +1879,463 @@ class RemoteDriverCoreTests(unittest.TestCase):
         self._run_warm_recycle_lifecycle("cc")
         self._run_warm_recycle_lifecycle("codex")
 
+    def test_12_cc_synthetic_api_error_and_duplicate_result_idempotency(self) -> None:
+        import drivers.cc as cc_drv
+        from core.contract import validate_decode_batch
+
+        sess_id = "1e03c7fa-494b-575a-aee7-1bd63071ce59"
+        env_meta = {
+            "operationId": "op-780",
+            "generation": "1",
+            "profileId": "prof-cc",
+            "authEpoch": "epoch-1",
+            "authorityTurnId": "turn-780",
+            "nativeSessionId": sess_id,
+            "driverId": "cc",
+            "driverVersion": "1.0.0",
+        }
+        state: Dict[str, Any] = {"sessionId": sess_id, "expectedModel": "claude-opus-5-5"}
+
+        enc = cc_drv.encode(
+            {"kind": "newTurn", "commandId": "cmd-1", "model": "claude-opus-5-5", "prompt": "hello"},
+            state,
+        )
+        state = enc["nextNativeState"]
+
+        # 1) Synthetic non-API-error assistant frame (no is_api_error_message / error) must NOT emit presentation error
+        non_err_raw = json.dumps(
+            {
+                "type": "assistant",
+                "session_id": sess_id,
+                "message": {
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "local command stdout"}],
+                },
+            }
+        ).encode("utf-8")
+        b0 = validate_decode_batch(
+            cc_drv.decode("native", non_err_raw, state),
+            channel="native",
+            raw_frame_bytes=non_err_raw,
+            frame_seq=1,
+            envelope=env_meta,
+        )
+        self.assertEqual(b0["presentation"], [])
+        state = b0["nextNativeState"]
+
+        # 2) Verbatim cc5-att-us synthetic verification_required frame
+        portal_msg = (
+            "API Error: Your account can't receive replies from Claude right now. "
+            "You can find the next step in the Anthropic Verification Portal: "
+            "https://portal.anthropic.com/verify?org=6d4224c6-68b1-48ee-964d-0268130d4f10"
+        )
+        synth_raw = json.dumps(
+            {
+                "type": "assistant",
+                "session_id": sess_id,
+                "is_api_error_message": True,
+                "message": {
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": portal_msg}],
+                },
+            }
+        ).encode("utf-8")
+        b1 = validate_decode_batch(
+            cc_drv.decode("native", synth_raw, state),
+            channel="native",
+            raw_frame_bytes=synth_raw,
+            frame_seq=2,
+            envelope=env_meta,
+        )
+        self.assertEqual(
+            b1["presentation"],
+            [{"kind": "error", "code": "CC_ACCOUNT_VERIFICATION_REQUIRED", "text": portal_msg}],
+        )
+        state = b1["nextNativeState"]
+
+        # 3) Result frame + duplicate replay with same uuid must emit identical CC_ACCOUNT_VERIFICATION_REQUIRED
+        res_raw = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "",
+                "errors": ["turn ended on an API error"],
+                "session_id": sess_id,
+                "uuid": "ocb-1e03c7fa-mwk0k3pu-1786",
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }
+        ).encode("utf-8")
+        b2 = validate_decode_batch(
+            cc_drv.decode("native", res_raw, state),
+            channel="native",
+            raw_frame_bytes=res_raw,
+            frame_seq=3,
+            envelope=env_meta,
+        )
+        term1 = [e["payload"] for e in b2["securityEvents"] if e["payload"]["kind"] == "turnTerminal"][0]
+        self.assertEqual(term1["errorCode"], "CC_ACCOUNT_VERIFICATION_REQUIRED")
+        state = b2["nextNativeState"]
+        self.assertNotIn("turnErrorCode", state)
+        self.assertNotIn("turnErrorText", state)
+
+        # Duplicate replay of exact same result uuid (immediate)
+        b3 = validate_decode_batch(
+            cc_drv.decode("native", res_raw, state),
+            channel="native",
+            raw_frame_bytes=res_raw,
+            frame_seq=4,
+            envelope=env_meta,
+        )
+        term2 = [e["payload"] for e in b3["securityEvents"] if e["payload"]["kind"] == "turnTerminal"][0]
+        self.assertEqual(term2, term1)
+        self.assertEqual(b3["presentation"], [])
+
+        # 4) Execute 127 additional mixed turns (error + success + interrupted) with 128-char maximal IDENT_RE UUIDs
+        #    so total unique UUIDs = 128 (Turn 1 is still inside the 128-entry window at index 0!).
+        from core.canonical import remote_canonical_bytes
+        from core.contract import MAX_NATIVE_STATE_BYTES
+
+        seq_no = 4
+        for idx in range(2, 129):
+            enc_turn = cc_drv.encode(
+                {"kind": "newTurn", "commandId": f"cmd-{idx}", "model": "claude-opus-4-6", "prompt": f"p-{idx}"},
+                state,
+            )
+            state = enc_turn["nextNativeState"]
+            prefix = f"t{idx:03d}-"
+            max_uuid = prefix + ("x" * (128 - len(prefix)))
+            self.assertEqual(len(max_uuid), 128)
+            mode = idx % 3
+            if mode == 0:
+                # Synthetic API error turn (mix verification_required and auth)
+                seq_no += 1
+                err_txt = portal_msg if idx % 2 == 0 else "API Error: 401 authentication_failed — please run /login"
+                s_raw = json.dumps(
+                    {
+                        "type": "assistant",
+                        "session_id": sess_id,
+                        "is_api_error_message": True,
+                        "message": {"model": "<synthetic>", "content": [{"type": "text", "text": err_txt}]},
+                    }
+                ).encode("utf-8")
+                bs = validate_decode_batch(
+                    cc_drv.decode("native", s_raw, state),
+                    channel="native",
+                    raw_frame_bytes=s_raw,
+                    frame_seq=seq_no,
+                    envelope=env_meta,
+                )
+                state = bs["nextNativeState"]
+                r_obj = {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "result": "",
+                    "errors": ["turn ended on an API error"],
+                    "session_id": sess_id,
+                    "uuid": max_uuid,
+                    "usage": {
+                        "input_tokens": idx,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                }
+            elif mode == 1:
+                r_obj = {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "ok",
+                    "session_id": sess_id,
+                    "uuid": max_uuid,
+                    "usage": {
+                        "input_tokens": idx,
+                        "output_tokens": 2,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                }
+            else:
+                r_obj = {
+                    "type": "result",
+                    "subtype": "interrupted",
+                    "is_error": False,
+                    "terminal_reason": "aborted_streaming",
+                    "session_id": sess_id,
+                    "uuid": max_uuid,
+                    "usage": {
+                        "input_tokens": idx,
+                        "output_tokens": 1,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                }
+            seq_no += 1
+            r_raw = json.dumps(r_obj).encode("utf-8")
+            br = validate_decode_batch(
+                cc_drv.decode("native", r_raw, state),
+                channel="native",
+                raw_frame_bytes=r_raw,
+                frame_seq=seq_no,
+                envelope=env_meta,
+            )
+            state = br["nextNativeState"]
+
+            # Replay Turn 1 verbatim across former 16-entry and 64-entry eviction boundaries (at 18, 65, and 128)
+            if idx in (18, 65, 128):
+                seq_no += 1
+                b_rep = validate_decode_batch(
+                    cc_drv.decode("native", res_raw, state),
+                    channel="native",
+                    raw_frame_bytes=res_raw,
+                    frame_seq=seq_no,
+                    envelope=env_meta,
+                )
+                rep_term = [e["payload"] for e in b_rep["securityEvents"] if e["payload"]["kind"] == "turnTerminal"][0]
+                self.assertEqual(rep_term, term1, f"Turn 1 replay diverged at idx={idx}: {rep_term}")
+                self.assertEqual(b_rep["presentation"], [])
+                state = b_rep["nextNativeState"]
+
+        self.assertEqual(len(state["seenResultUuids"]), 128)
+        self.assertIn("ocb-1e03c7fa-mwk0k3pu-1786", state["seenResultUuids"])
+        self.assertIn("ocb-1e03c7fa-mwk0k3pu-1786", state["resultErrorCodes"])
+
+        # 5) Conflicting duplicate result with same uuid + same usage but altered error payload MUST emit CC_RESULT_CONFLICT
+        seq_no += 1
+        tampered_raw = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "API Error: 429 rate_limit exceeded",
+                "errors": ["turn ended on an API error"],
+                "session_id": sess_id,
+                "uuid": "ocb-1e03c7fa-mwk0k3pu-1786",
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }
+        ).encode("utf-8")
+        b_conf = validate_decode_batch(
+            cc_drv.decode("native", tampered_raw, state),
+            channel="native",
+            raw_frame_bytes=tampered_raw,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        conf_term = [e["payload"] for e in b_conf["securityEvents"] if e["payload"]["kind"] == "turnTerminal"][0]
+        self.assertEqual(conf_term["errorCode"], "CC_RESULT_CONFLICT")
+
+        # 5b) 17th-element errors[] classification change and >2048-byte tail mutation MUST also emit CC_RESULT_CONFLICT
+        enc_17 = cc_drv.encode(
+            {"kind": "newTurn", "commandId": "cmd-err17", "model": "claude-opus-4-6", "prompt": "p-err17"},
+            state,
+        )
+        state = enc_17["nextNativeState"]
+        seq_no += 1
+        long_prefix = "z" * 2400
+        err17_first = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "",
+                "errors": (["x"] * 16) + ["rate_limit"],
+                "session_id": sess_id,
+                "uuid": "err17-uuid-check",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }
+        ).encode("utf-8")
+        b_e17_1 = validate_decode_batch(
+            cc_drv.decode("native", err17_first, state),
+            channel="native",
+            raw_frame_bytes=err17_first,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        t_e17_1 = [e["payload"] for e in b_e17_1["securityEvents"] if e["payload"]["kind"] == "turnTerminal"][0]
+        self.assertEqual(t_e17_1["errorCode"], "CC_RATE_LIMITED")
+        state = b_e17_1["nextNativeState"]
+
+        seq_no += 1
+        err17_tampered = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "",
+                "errors": (["x"] * 16) + ["authentication_failed"],
+                "session_id": sess_id,
+                "uuid": "err17-uuid-check",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }
+        ).encode("utf-8")
+        b_e17_2 = validate_decode_batch(
+            cc_drv.decode("native", err17_tampered, state),
+            channel="native",
+            raw_frame_bytes=err17_tampered,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        t_e17_2 = [e["payload"] for e in b_e17_2["securityEvents"] if e["payload"]["kind"] == "turnTerminal"][0]
+        self.assertEqual(t_e17_2["errorCode"], "CC_RESULT_CONFLICT")
+
+        # Long result differing past 2048-byte display truncation boundary
+        enc_long = cc_drv.encode(
+            {"kind": "newTurn", "commandId": "cmd-longtail", "model": "claude-opus-4-6", "prompt": "p-longtail"},
+            state,
+        )
+        state = enc_long["nextNativeState"]
+        seq_no += 1
+        long_first = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": long_prefix + "-tail-A",
+                "errors": [],
+                "session_id": sess_id,
+                "uuid": "longtail-uuid-check",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }
+        ).encode("utf-8")
+        b_lt_1 = validate_decode_batch(
+            cc_drv.decode("native", long_first, state),
+            channel="native",
+            raw_frame_bytes=long_first,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        state = b_lt_1["nextNativeState"]
+
+        seq_no += 1
+        long_tampered = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": long_prefix + "-tail-B",
+                "errors": [],
+                "session_id": sess_id,
+                "uuid": "longtail-uuid-check",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }
+        ).encode("utf-8")
+        b_lt_2 = validate_decode_batch(
+            cc_drv.decode("native", long_tampered, state),
+            channel="native",
+            raw_frame_bytes=long_tampered,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        t_lt_2 = [e["payload"] for e in b_lt_2["securityEvents"] if e["payload"]["kind"] == "turnTerminal"][0]
+        self.assertEqual(t_lt_2["errorCode"], "CC_RESULT_CONFLICT")
+
+        # Note: err17-uuid-check and longtail-uuid-check shifted Turn 1 out of 128 window; re-seed Turn 1 check below on a fresh in-window UUID
+        in_window_res_raw = long_first
+
+        # 6) Late duplicate result arriving while a NEW turn is active must NOT clobber activeTurn or turnErrorCode
+        enc_active = cc_drv.encode(
+            {"kind": "newTurn", "commandId": "cmd-active-129", "model": "claude-opus-4-6", "prompt": "p-129"},
+            state,
+        )
+        active_state = enc_active["nextNativeState"]
+        seq_no += 1
+        rl_synth = json.dumps(
+            {
+                "type": "assistant",
+                "session_id": sess_id,
+                "error": "rate_limit",
+                "is_api_error_message": True,
+                "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "429 rate limited"}]},
+            }
+        ).encode("utf-8")
+        b_rl = validate_decode_batch(
+            cc_drv.decode("native", rl_synth, active_state),
+            channel="native",
+            raw_frame_bytes=rl_synth,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        active_state = b_rl["nextNativeState"]
+        self.assertEqual(active_state.get("activeTurn"), True)
+        self.assertEqual(active_state.get("turnErrorCode"), "CC_RATE_LIMITED")
+
+        seq_no += 1
+        b_late_dup = validate_decode_batch(
+            cc_drv.decode("native", in_window_res_raw, active_state),
+            channel="native",
+            raw_frame_bytes=in_window_res_raw,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        active_state = b_late_dup["nextNativeState"]
+        self.assertEqual(active_state.get("activeTurn"), True)
+        self.assertEqual(active_state.get("turnErrorCode"), "CC_RATE_LIMITED")
+
+        # 7) Worst-case canonical native_state byte measurement: all 128 slots = 128-char IDs + 32-hex sigs + actual CJK/emoji turnErrorText
+        worst_state = dict(active_state)
+        worst_state.pop("turnErrorCode", None)
+        worst_state.pop("turnErrorText", None)
+        worst_ids = [f"w{k:03d}-" + ("z" * 123) for k in range(128)]
+        worst_state["seenResultUuids"] = worst_ids
+        worst_state["resultErrorCodes"] = {
+            wid: ["f" * 32, "CC_ACCOUNT_VERIFICATION_REQUIRED"] for wid in worst_ids
+        }
+        cjk_emoji_raw = ("鉴权验证失败🚨请前往控制台确认" * 120)
+        seq_no += 1
+        cjk_synth = json.dumps(
+            {
+                "type": "assistant",
+                "session_id": sess_id,
+                "is_api_error_message": True,
+                "message": {"model": "<synthetic>", "content": [{"type": "text", "text": cjk_emoji_raw}]},
+            }
+        ).encode("utf-8")
+        b_worst = validate_decode_batch(
+            cc_drv.decode("native", cjk_synth, worst_state),
+            channel="native",
+            raw_frame_bytes=cjk_synth,
+            frame_seq=seq_no,
+            envelope=env_meta,
+        )
+        saved_err_txt = b_worst["nextNativeState"]["turnErrorText"]
+        saved_err_utf8_len = len(saved_err_txt.encode("utf-8"))
+        self.assertGreaterEqual(saved_err_utf8_len, 2040)
+        self.assertLessEqual(saved_err_utf8_len, 2048)
+        serialized_len = len(remote_canonical_bytes(b_worst["nextNativeState"]))
+        self.assertLess(serialized_len, MAX_NATIVE_STATE_BYTES)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,3 +1,4 @@
+export * from './idleRecoveryError.js'
 /**
  * @openclaude/protocol/browser: the protocol entry for the browser (web-react) and any other
  * non-Node consumer (phase 3 plan v3.6 §3.6, OCV5-558). Everything here is free of `node:*` in its
@@ -18,6 +19,8 @@ export * from './teamCards.js'
 export * from './engineModels.js'
 export * from './cc5TestModel.js'
 export * from './cc5Backend.js'
+export * from './remoteExecutionBackend.js'
+export * from './grokExecution.js'
 export * from './serviceTiers.js'
 export * from './boxApiModels.js'
 export * from './boxGptWebModels.js'

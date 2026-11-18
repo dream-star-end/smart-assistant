@@ -35,3 +35,70 @@ test('hello snapshot logging omits unsafe error names and codes', async () => {
     '3', [{ peerId: 'session' }], { info() {}, warn: (_message, fields) => warnings.push(fields) }, 'conn')
   assert.deepEqual(warnings, [{ uid: '3', sessionId: 'session', connId: 'conn', errorName: 'Error' }])
 })
+
+test('INC-20261115-CONTAINER-SWAP-FRAMESEQ: extends snapshot budget to 64 for positive-cursor sessions while keeping 8 for zero-cursor idle sessions', async () => {
+  const pool = {
+    async connect() {
+      return {
+        async query(sql: string) {
+          if (sql.includes('session-snapshot-owner')) return { rows: [{ as_of: '1000' }] }
+          if (sql.includes('session-snapshot-container-cursor')) return { rows: [{ agent_container_id: '7246' }] }
+          return { rows: [] }
+        },
+        release() {},
+      }
+    },
+  } as unknown as Pool
+  const sentPositive: Array<{ peer: { id: string }; snapshot: { gap?: { reason: string } | null } }> = []
+  const positivePeers = Array.from({ length: 10 }, (_, i) => ({
+    peerId: `s${i + 1}`, lastFrameSeq: 500, inFlight: false,
+  }))
+  await sendHelloSessionSnapshots(
+    pool,
+    { readyState: WebSocket.OPEN, bufferedAmount: 0, send: (raw) => { sentPositive.push(JSON.parse(String(raw))) } },
+    '3', positivePeers, null, 'conn-pos', 7247,
+  )
+  assert.equal(sentPositive.length, 10)
+  for (const frame of sentPositive) assert.deepEqual(frame.snapshot.gap, { reason: 'cursor_reset' })
+
+  const sentZero: Array<{ peer: { id: string } }> = []
+  const zeroPeers = Array.from({ length: 10 }, (_, i) => ({
+    peerId: `z${i + 1}`, lastFrameSeq: 0, inFlight: false,
+  }))
+  await sendHelloSessionSnapshots(
+    pool,
+    { readyState: WebSocket.OPEN, bufferedAmount: 0, send: (raw) => { sentZero.push(JSON.parse(String(raw))) } },
+    '3', zeroPeers, null, 'conn-zero', 7247,
+  )
+  assert.equal(sentZero.length, 8)
+
+  const sentMixed: Array<{ peer: { id: string } }> = []
+  const mixedPeers = [
+    ...Array.from({ length: 9 }, (_, i) => ({ peerId: `zero-${i + 1}`, lastFrameSeq: 0, inFlight: false })),
+    { peerId: 'pos-1', lastFrameSeq: 500, inFlight: false },
+    { peerId: 'inflight-1', lastFrameSeq: 0, inFlight: true, inFlightClientMessageId: 'm-run-1' },
+  ]
+  await sendHelloSessionSnapshots(
+    pool,
+    { readyState: WebSocket.OPEN, bufferedAmount: 0, send: (raw) => { sentMixed.push(JSON.parse(String(raw))) } },
+    '3', mixedPeers, null, 'conn-mix', 7247,
+  )
+  assert.deepEqual(sentMixed.map((f) => f.peer.id), [
+    'inflight-1', 'pos-1', 'zero-1', 'zero-2', 'zero-3', 'zero-4', 'zero-5', 'zero-6',
+  ])
+
+  const sentMulti: Array<{ peer: { id: string }; snapshot: { gap: unknown } }> = []
+  const multiPeers = [
+    ...Array.from({ length: 8 }, (_, i) => ({ peerId: `z-other-${i + 1}`, lastFrameSeq: 0, inFlight: false })),
+    { peerId: 'multi-1', agentId: 'explorer', lastFrameSeq: 0, inFlight: false },
+    { peerId: 'multi-1', agentId: 'main', lastFrameSeq: 500, inFlight: false },
+  ]
+  await sendHelloSessionSnapshots(
+    pool,
+    { readyState: WebSocket.OPEN, bufferedAmount: 0, send: (raw) => { sentMulti.push(JSON.parse(String(raw))) } },
+    '3', multiPeers, null, 'conn-multi', 7247,
+  )
+  const multiFrame = sentMulti.find((f) => f.peer.id === 'multi-1')
+  assert.ok(multiFrame)
+  assert.deepEqual(multiFrame.snapshot.gap, { reason: 'cursor_reset' })
+})

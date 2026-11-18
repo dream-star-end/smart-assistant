@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import { shouldShowHistorySkeleton } from "../components/chat/HistorySkeleton";
-import { type HistorySurface, sessionHistorySurface } from "../lib/chat/historyLoadState";
+import {
+  countSubstantiveHistoryMessages,
+  type HistorySurface,
+  isSubstantiveHistoryMessage,
+  sessionHistorySurface,
+} from "../lib/chat/historyLoadState";
+
+export { countSubstantiveHistoryMessages, isSubstantiveHistoryMessage };
 
 /**
  * 冷会话加载骨架（moved out of App.tsx, FINDINGS §7 step 3a, OCV5-466）。

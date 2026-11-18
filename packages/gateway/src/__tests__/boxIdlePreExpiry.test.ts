@@ -18,9 +18,9 @@ import { BOX_NATIVE_CONTEXT_MODEL, BOX_NATIVE_CONTEXT_OWNER } from '@openclaude/
 
 const HOME = mkdtempSync(join(tmpdir(), 'ocv5-755-idle-home-'))
 process.env.OPENCLAUDE_HOME = HOME
-delete process.env.OC_BOX_IDLE_PRE_EXPIRY_MS
-delete process.env.OC_BOX_IDLE_COMPACT_ALWAYS
-delete process.env.OC_BOX_AUTO_COMPACT_WINDOW
+Reflect.deleteProperty(process.env, 'OC_BOX_IDLE_PRE_EXPIRY_MS')
+Reflect.deleteProperty(process.env, 'OC_BOX_IDLE_COMPACT_ALWAYS')
+Reflect.deleteProperty(process.env, 'OC_BOX_AUTO_COMPACT_WINDOW')
 
 const budget = await import('../boxContextBudget.js')
 const idle = await import('../boxIdleCompact.js')
@@ -34,7 +34,7 @@ const finish = (SessionManager.prototype as unknown as {
     source: { sessionId: string; turnKey: string },
     recoveryDir?: string,
     mode?: 'after_turn' | 'pre_expiry',
-  ) => Promise<'deferred' | void>
+  ) => Promise<'deferred' | undefined>
 }).finishIdleUnderLock
 
 const revision = 'ab'.repeat(32)
@@ -73,7 +73,10 @@ before(async () => {
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'oc-v3.test-token'
   process.env.OC_BOX_IDLE_PROOF_WAIT_MS = '0'
 })
-after(() => server.close())
+after(() => {
+  server.closeAllConnections?.()
+  server.close()
+})
 
 let n = 0
 function boxSession(dir: string) {
@@ -126,7 +129,7 @@ test('pre-OCV5-755 timing (pre-expiry off): the idle turn runs right after the t
     assert.equal(seen.submits, 1)
     assert.equal(seen.minInputTokens, undefined, 'after-turn ops keep the near-limit fit')
   } finally {
-    delete process.env.OC_BOX_IDLE_PRE_EXPIRY_MS
+    Reflect.deleteProperty(process.env, 'OC_BOX_IDLE_PRE_EXPIRY_MS')
   }
 })
 
@@ -246,15 +249,99 @@ test('audit r1: a replaced native session skips the stale pre-expiry compaction'
   }
 })
 
-test('submit cancels the armed timer and shows compacting while one runs', async () => {
-  const { readFileSync } = await import('node:fs')
-  const src = readFileSync(new URL('../sessionSubmit.ts', import.meta.url), 'utf8')
-  const lockAt = src.indexOf('session.lock = new Promise<void>((r) => (release = r))')
-  const cancelAt = src.indexOf('cancelIdlePreExpiry(session)', lockAt)
-  const awaitAt = src.indexOf('\n    await prev\n', lockAt)
-  assert.ok(lockAt > 0 && cancelAt > lockAt && cancelAt < awaitAt)
-  assert.match(src.slice(cancelAt, awaitAt), /onEvent\(\{ kind: 'turn_status', status: 'compacting' \}\)/)
-  assert.match(src.slice(awaitAt, awaitAt + 200), /onEvent\(\{ kind: 'turn_status', status: null \}\)/)
+test('submit cancels the armed timer and holds compacting until pre-expiry handoff completes', async () => {
+  const key = `submit-wait-${++n}`
+  let releasePrev!: () => void
+  const prevLock = new Promise<void>((resolve) => { releasePrev = resolve })
+  const events: Array<string | null> = []
+  let statusAtFinishStart: unknown = 'unset'
+  let eventsBeforeHandoff = -1
+  const armedTimer = setTimeout(() => {}, 60_000)
+  const session: Record<string, unknown> = {
+    sessionKey: key,
+    agentId: 'main',
+    channel: 'webchat',
+    lock: prevLock,
+    currentTurnStatus: null,
+    _idlePreExpiryTimer: armedTimer,
+    _idlePreExpirySource: { sessionId, turnKey: sourceTurn },
+    _idlePreExpiryActive: true,
+    _idleInternalTurns: 1,
+    _identityCreationOpts: { hermeticNoTools: true, agent: { id: 'stop-after-handoff' } },
+    runner: {
+      capabilities: { needsServerRequestId: false },
+      executionBackend: undefined,
+      nativeSessionId: sessionId,
+      clearSessionId: () => {},
+    },
+  }
+  idle.writeIdleCandidate(HOME, { v: 1, sessionKey: key, sessionId, turnKey: sourceTurn })
+  let finishEntered!: () => void
+  let releaseFinish!: () => void
+  const finishStarted = new Promise<void>((resolve) => { finishEntered = resolve })
+  const finishGate = new Promise<void>((resolve) => { releaseFinish = resolve })
+  const host = Object.assign(Object.create(SessionManager.prototype), {
+    _promptQueueExecutions: new Set(),
+    _promptQueueExecutionKeys: new Set(),
+    _promptQueueDispatchFences: new Map(),
+    getOrCreate: async () => session,
+    isRuntimeRecycleDraining: () => false,
+    _ownsPromptQueueExecutionFence: () => false,
+    applyIdleResetIfRequested: async () => {},
+    finishIdleUnderLock: async () => {
+      statusAtFinishStart = session.currentTurnStatus
+      eventsBeforeHandoff = events.length
+      finishEntered()
+      await finishGate
+      idle.clearIdleCandidate(HOME, key)
+    },
+    scheduleIdleDrain: () => {},
+  })
+  const savedChannel = process.env.OC_RUNTIME_CHANNEL
+  const savedMasterUrl = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+  const savedContainerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  Reflect.deleteProperty(process.env, 'OC_RUNTIME_CHANNEL')
+  Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL')
+  Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN')
+  const submitPromise = (SessionManager.prototype.submit as (...args: unknown[]) => Promise<void>).call(
+    host,
+    session,
+    'hello during pre-expiry',
+    (ev: { kind: string; status?: string | null }) => {
+      if (ev.kind === 'turn_status') {
+        session.currentTurnStatus = ev.status ?? null
+        events.push(ev.status ?? null)
+      }
+    },
+  ).catch((err: unknown) => {
+    if (!(err instanceof Error) || !err.message.includes('COMPAT_CONFIG_CONFLICT')) throw err
+  })
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(session._idlePreExpiryTimer, undefined, 'armed timer cancelled at submit')
+    assert.equal(session._idlePreExpirySource, undefined)
+    assert.deepEqual(events, ['compacting'])
+    assert.equal(session.currentTurnStatus, 'compacting')
+    session._idlePreExpiryActive = false
+    session._idleInternalTurns = 0
+    releasePrev()
+    await finishStarted
+    assert.equal(statusAtFinishStart, 'compacting', 'compacting must not clear before finishIdleUnderLock settles')
+    assert.deepEqual(events.slice(0, eventsBeforeHandoff), ['compacting'])
+    releaseFinish()
+    await submitPromise
+    assert.deepEqual(events, ['compacting', null])
+    assert.equal(session.currentTurnStatus, null)
+  } finally {
+    if (savedChannel !== undefined) process.env.OC_RUNTIME_CHANNEL = savedChannel
+    if (savedMasterUrl !== undefined) process.env.OPENCLAUDE_V3_MASTER_BASE_URL = savedMasterUrl
+    if (savedContainerToken !== undefined) process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = savedContainerToken
+    clearTimeout(armedTimer)
+    idle.clearIdleCandidate(HOME, key)
+    releasePrev()
+    releaseFinish()
+    await submitPromise
+  }
 })
 
 // ── knobs ──

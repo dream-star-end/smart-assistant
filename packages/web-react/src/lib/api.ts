@@ -320,12 +320,20 @@ export function isNetworkError(err: unknown): boolean {
   );
 }
 
+/** Per-attempt timeout abort error from AbortController / fetch. */
+export function isTimeoutError(err: unknown): boolean {
+  return (
+    (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "TimeoutError") ||
+    (err instanceof Error && err.name === "TimeoutError")
+  );
+}
+
 /**
- * 读请求的瞬时失败(OCV5-421):断网 / 弱网下的 fetch 失败、5xx、408、429。这类失败自动重试几次,
+ * 读请求的瞬时失败(OCV5-421):断网 / 弱网下的 fetch 失败、请求超时、5xx、408、429。这类失败自动重试几次,
  * 用户看不到;4xx(权限、不存在、参数)立即如实报告。
  */
 export function isTransientReadError(err: unknown): boolean {
-  if (isNetworkError(err)) return true;
+  if (isNetworkError(err) || isTimeoutError(err)) return true;
   if (!(err instanceof ApiError)) return false;
   return err.status >= 500 || err.status === 408 || err.status === 429;
 }
@@ -374,6 +382,7 @@ export function isAuthRecoveryTransient(err: unknown): boolean {
  */
 export function apiErrorMessage(err: unknown, fallback: string): string {
   if (isNetworkError(err)) return "网络连接不可用，请检查网络后重试";
+  if (isTimeoutError(err)) return "请求超时，请检查网络后重试";
 
   if (err instanceof ApiError) {
     if (err.code && CROSS_DOMAIN_ERROR_MESSAGES[err.code]) {
@@ -612,6 +621,9 @@ export async function getExactDeferredPayload(
 
 /** Per live-frames HTTP request. Journal hydrate adds its own page/time cap. */
 export const LIVE_FRAMES_REQUEST_TIMEOUT_MS = 12_000;
+
+/** Per canonical session GET request so stalled connections trigger retry instead of pinning loading forever. */
+export const SESSION_REQUEST_TIMEOUT_MS = 20_000;
 
 /** /api/me/api-keys 线上形状（snake_case）；list / PATCH 共用。 */
 type ApiKeyWire = {
@@ -1529,6 +1541,7 @@ export const api = {
     sinceSeq = 0,
     sinceHistoryRevision?: number,
     permissionLookupIds?: string[],
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<SessionDetail> => {
     const params = new URLSearchParams();
     if (sinceSeq > 0) {
@@ -1542,15 +1555,64 @@ export const api = {
     }
     const query = params.toString();
     const suffix = query ? `?${query}` : "";
-    const request = (requestSuffix: string) =>
-      jsonOrThrow<SessionDetail>(
+    const request = (requestSuffix: string) => {
+      const timeoutMs = opts?.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS;
+      const controller = new AbortController();
+      const parent = opts?.signal;
+      const onParentAbort = () =>
+        controller.abort(parent?.reason ?? new DOMException("aborted", "AbortError"));
+      if (parent) {
+        if (parent.aborted) onParentAbort();
+        else parent.addEventListener("abort", onParentAbort, { once: true });
+      }
+      if (controller.signal.aborted) {
+        parent?.removeEventListener("abort", onParentAbort);
+        return Promise.reject(
+          controller.signal.reason ?? new DOMException("aborted", "AbortError"),
+        );
+      }
+      const timeout = setTimeout(
+        () => controller.abort(new DOMException("session request timeout", "TimeoutError")),
+        timeoutMs,
+      );
+      const run = jsonOrThrow<SessionDetail>(
         callWithRefresh(a, (t) =>
           fetch(`/api/sessions/${encodeURIComponent(id)}${requestSuffix}`, {
             credentials: "include",
             headers: bearerHeaders(t),
+            signal: controller.signal,
           }),
         ),
       );
+      const raced = new Promise<SessionDetail>((resolve, reject) => {
+        const onAbort = () => {
+          reject(
+            controller.signal.reason ??
+              new DOMException("session request timeout", "TimeoutError"),
+          );
+        };
+        if (controller.signal.aborted) {
+          onAbort();
+          return;
+        }
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        run.then(
+          (value) => {
+            controller.signal.removeEventListener("abort", onAbort);
+            resolve(value);
+          },
+          (err) => {
+            controller.signal.removeEventListener("abort", onAbort);
+            reject(err);
+          },
+        );
+      });
+      void run.catch(() => {});
+      return raced.finally(() => {
+        clearTimeout(timeout);
+        parent?.removeEventListener("abort", onParentAbort);
+      });
+    };
     return request(suffix).then(async (initial) => {
       let detail = initial;
       let historyRevisionUnsupported = false;

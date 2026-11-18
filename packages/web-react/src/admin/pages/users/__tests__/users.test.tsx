@@ -5,9 +5,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { prefetchMarkdownImpl } from '../../../../components/Markdown'
 import { loadBeforeAll } from '../../../../test/moduleLoad'
 import { preloadToolBody } from '../../../../components/tool/lazyToolBody'
+import { preloadTimelineCards } from '../../../../components/chat/lazyTimelineCards'
 
 // 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(preloadToolBody)
+loadBeforeAll(preloadTimelineCards)
 
 // 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(prefetchMarkdownImpl)

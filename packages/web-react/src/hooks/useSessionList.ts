@@ -5,6 +5,7 @@ import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
+import { isHiddenQuickAskSession } from "../lib/quickAskSession";
 import type {
   AuthSession,
   Session,
@@ -100,10 +101,16 @@ function isAbortError(e: unknown): boolean {
  * 合并侧栏会话：union by id，按 updatedAt 倒序。`incomingWins` 决定重叠项谁覆盖元数据
  * （listSessions=server-wins=true；IndexedDB 注水=本地不覆盖既有=false）。
  */
-function upsertSessions(cur: Session[], incoming: Session[], incomingWins: boolean): Session[] {
+function upsertSessions(
+  cur: Session[],
+  incoming: Session[],
+  incomingWins: boolean,
+  keepId?: string,
+): Session[] {
   const map = new Map<string, Session>();
   for (const s of cur) map.set(s.id, s);
   for (const s of incoming) {
+    if (isHiddenQuickAskSession(s, keepId)) continue;
     const prev = map.get(s.id);
     map.set(s.id, prev ? (incomingWins ? { ...prev, ...s } : { ...s, ...prev }) : s);
   }
@@ -235,12 +242,15 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [activeId, setActiveId] = useState<string | undefined>(
     demo ? DEMO_SESSIONS[0].id : undefined,
   );
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   // 历史拉取守卫（S2）：语义从"整页生命周期只拉一次"改为"只防并发 + 短时重复"。
   //  - historyFetchingRef：正在拉取的会话（防并发重入）；
   //  - historyFetchedAtRef：上次拉取时刻，HISTORY_REFETCH_COOLDOWN_MS 内不重拉。
   // 冷却过后允许重拉：sinceSeq 增量 + server-wins 合并幂等、重拉无副作用，这样切回前台/
   // 重连后重新选中会话能增量补齐（旧的永久守卫会让锁屏后再选中的会话拿不到新内容）。
   const historyFetchingRef = useRef<Map<string, number>>(new Map());
+  const historyAbortRef = useRef<Map<string, AbortController>>(new Map());
   const historyRequestTokenRef = useRef(0);
   const [historyLoadingTokens, setHistoryLoadingTokens] = useState<Map<string, number>>(
     () => new Map(),
@@ -314,7 +324,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       const owner = user?.id;
       if (!owner || stored.length === 0) return;
       const local = stored.map((s) => storedToSession(s, owner));
-      setSessions((cur) => upsertSessions(cur, local, false));
+      setSessions((cur) => upsertSessions(cur, local, false, activeIdRef.current));
     },
     [user],
   );
@@ -328,9 +338,17 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       if (!opts?.force && historyFetchingRef.current.has(id)) return; // 并发中：不重入
       const lastAt = historyFetchedAtRef.current.get(id) ?? 0;
       if (!opts?.force && Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
-      if (opts?.force && historyFetchingRef.current.has(id)) return;
+      if (opts?.force) {
+        const prev = historyAbortRef.current.get(id);
+        if (prev) {
+          historyAbortRef.current.delete(id);
+          prev.abort(new DOMException("superseded by forced history reload", "AbortError"));
+        }
+      }
       const requestToken = ++historyRequestTokenRef.current;
       historyFetchingRef.current.set(id, requestToken);
+      const controller = new AbortController();
+      historyAbortRef.current.set(id, controller);
       setHistoryLoadingTokens((current) => {
         const next = new Map(current);
         next.set(id, requestToken);
@@ -341,7 +359,15 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         const sinceHistoryRevision = cbRef.current.sockRef.current?.storedHistoryRevision(id);
         // 弱网 / 网关抖动:先静默重试,仍失败才显示「会话加载失败」(OCV5-421)。
         const detail = await retryTransientRead(
-          () => api.getSession(cbRef.current.authSession, id, sinceSeq, sinceHistoryRevision),
+          () =>
+            api.getSession(
+              cbRef.current.authSession,
+              id,
+              sinceSeq,
+              sinceHistoryRevision,
+              undefined,
+              { signal: controller.signal },
+            ),
           () => userIdRef.current === owner && historyFetchingRef.current.get(id) === requestToken,
         );
         // await 期间换号、reset 或删除会话 → 丢弃旧响应，绝不污染当前会话/IndexedDB。
@@ -472,6 +498,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         if (historyFetchingRef.current.get(id) === requestToken) {
           historyFetchingRef.current.delete(id);
         }
+        if (historyAbortRef.current.get(id) === controller) {
+          historyAbortRef.current.delete(id);
+        }
         setHistoryLoadingTokens((current) => {
           if (current.get(id) !== requestToken) return current;
           const next = new Map(current);
@@ -574,7 +603,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           }
         }
         const server = mapListMetas(metas);
-        setSessions((cur) => upsertSessions(cur, server, true));
+        setSessions((cur) => upsertSessions(cur, server, true, activeIdRef.current));
         if (opts?.initial) {
           nextCursorRef.current = undefined;
           setHasMoreSessions(server.length > 0);
@@ -764,6 +793,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const forgetSessionLocal = (id: string) => {
     historyFetchedAtRef.current.delete(id);
     historyFetchingRef.current.delete(id);
+    const pendingAbort = historyAbortRef.current.get(id);
+    if (pendingAbort) {
+      historyAbortRef.current.delete(id);
+      pendingAbort.abort(new DOMException("session deleted", "AbortError"));
+    }
     setHistoryLoadingTokens((current) => {
       if (!current.has(id)) return current;
       const next = new Map(current);
@@ -860,7 +894,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       });
       if (generation !== listGenerationRef.current) return;
       const incoming = mapListMetas(page.sessions);
-      setSessions((cur) => upsertSessions(cur, incoming, true));
+      setSessions((cur) => upsertSessions(cur, incoming, true, activeIdRef.current));
       nextCursorRef.current = page.nextCursor;
       setHasMoreSessions(page.nextCursor != null && incoming.length > 0);
       setLoadMoreError(false);
@@ -889,7 +923,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       });
       if (generation !== listGenerationRef.current) return;
       const incoming = mapListMetas(page.sessions);
-      setSessions((cur) => upsertSessions(cur, incoming, true));
+      setSessions((cur) => upsertSessions(cur, incoming, true, activeIdRef.current));
     } catch (e) {
       if (generation !== listGenerationRef.current) return;
       archivedFetchedRef.current = false;
@@ -981,6 +1015,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     pendingTitles.current.clear();
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
+    for (const controller of historyAbortRef.current.values()) {
+      controller.abort(new DOMException("session store reset", "AbortError"));
+    }
+    historyAbortRef.current.clear();
     setHistoryLoadingTokens(new Map());
     setHistoryErrorBySession(new Map());
     terminalFillRef.current.clear();

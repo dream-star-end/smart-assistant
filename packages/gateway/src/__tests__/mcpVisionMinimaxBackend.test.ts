@@ -319,4 +319,59 @@ describe('runMinimaxVision', () => {
     )
     assert.equal(auth, 'Bearer file-bearer')
   })
+
+  it('OCV5-745: 409 MODEL_CONFIG_CHANGED_RETRY_TURN invalidates singleton catalog client', async () => {
+    const p = join(uploads, '409.png')
+    writeFileSync(p, PNG)
+    const reasons: string[] = []
+    _setModelCatalogClientForTests({
+      configured: true,
+      getToken: async () => 'stale-cat-tok',
+      invalidateOnConfigChanged: async (reason?: string) => {
+        reasons.push(reason ?? '')
+        return null
+      },
+      getView: async () => {
+        throw new Error('view not used in vision tests')
+      },
+    } as unknown as ModelCatalogClient)
+    try {
+      await withEnv(
+        {
+          OPENCLAUDE_V3_MASTER_BASE_URL: 'http://172.30.0.1:18791',
+          OPENCLAUDE_V3_CONTAINER_TOKEN: 'oc-v3.bearer',
+        },
+        async () => {
+          const orig = globalThis.fetch
+          globalThis.fetch = (async () =>
+            new Response(
+              JSON.stringify({
+                error: {
+                  code: 'MODEL_CONFIG_CHANGED_RETRY_TURN',
+                  message: 'model configuration changed, please retry in a new turn',
+                },
+              }),
+              { status: 409, headers: { 'content-type': 'application/json' } },
+            )) as unknown as typeof fetch
+          try {
+            await assert.rejects(
+              () => vision.runMinimaxVisionForTest(vision.resolveVisionInput({ image_file: p })),
+              /minimax vision upstream 409/,
+            )
+          } finally {
+            globalThis.fetch = orig
+          }
+        },
+      )
+      assert.deepEqual(reasons, ['minimax_vision_http_409'])
+    } finally {
+      _setModelCatalogClientForTests({
+        configured: true,
+        getToken: async () => 'cat-tok',
+        getView: async () => {
+          throw new Error('view not used in vision tests')
+        },
+      } as unknown as ModelCatalogClient)
+    }
+  })
 })

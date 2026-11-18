@@ -489,6 +489,19 @@ describe("incident selfhost edition", () => {
     f.write("scripts/deploy-v5-selfhost.sh", called ? 'node "$SCRIPT_DIR/selfhost-proof-fixture.mjs"\n' : "# no proof call\n");
     f.manifest.incidents[0].regressions[1] = { layer: "deploy-gate", path: "scripts/selfhost-proof-fixture.mjs", assertion: "SELFHOST_PROOF_ASSERTION" };
   };
+  // Metadata reachability only: the actual proof is executed by release-gates CI.
+  const shellGateProof = (f: SeverityFixture, body: string, sourced: boolean, outside: boolean) => {
+    const gate = "scripts/ocv5-763-shell-fixture.sh";
+    f.write(gate, "#!/usr/bin/env bash\n# UNIQUE_SHELL_GATE_ASSERTION\n");
+    f.write("scripts/deploy-v5-selfhost.sh", sourced
+      ? 'MASTER_RELEASE_LIB="$SCRIPT_DIR/v5-selfhost-master-release-lib.sh"\nsource "$MASTER_RELEASE_LIB"\n'
+      : "# library deliberately not sourced\n");
+    f.write("scripts/v5-selfhost-master-release-lib.sh", outside
+      ? `outside_gate() {\n${body}\n}\nbuild_master_release() {\n  :\n}\n`
+      : `build_master_release() {\n${body}\n}\n`);
+    f.manifest.incidents[0].regressions[1] = { layer: "deploy-gate", path: gate, assertion: "UNIQUE_SHELL_GATE_ASSERTION" };
+    debt(f, {});
+  };
   const cases: Array<{ name: string; arrange: (f: SeverityFixture) => string[]; pass: boolean; reason: RegExp }> = [
     {
       name: "a listed unit-only incident passes",
@@ -605,6 +618,23 @@ describe("incident selfhost edition", () => {
       reason: /--edition 只能是 selfhost/,
     },
   ];
+  for (const c of [
+    { name: "OCV5-763 shell gate: real sourced build command", body: "  if ! ( cd \"$staging\" && TMPDIR=\"$MASTER_GATE_TMPDIR\" bash scripts/ocv5-763-shell-fixture.sh ); then\n    return 1\n  fi", sourced: true, outside: false, edition: "selfhost", pass: true },
+    { name: "OCV5-763 shell gate: comment is not a run", body: "# bash scripts/ocv5-763-shell-fixture.sh", sourced: true, outside: false, edition: "selfhost", pass: false },
+    { name: "OCV5-763 shell gate: quoted text is not a run", body: "printf '%s\\n' 'bash scripts/ocv5-763-shell-fixture.sh'", sourced: true, outside: false, edition: "selfhost", pass: false },
+    { name: "OCV5-763 shell gate: heredoc is not a run", body: "cat <<'DATA'\nbash scripts/ocv5-763-shell-fixture.sh\nDATA", sourced: true, outside: false, edition: "selfhost", pass: false },
+    { name: "OCV5-763 shell gate: unsourced library is rejected", body: "  if ! ( cd \"$staging\" && TMPDIR=\"$MASTER_GATE_TMPDIR\" bash scripts/ocv5-763-shell-fixture.sh ); then\n    return 1\n  fi", sourced: false, outside: false, edition: "selfhost", pass: false },
+    { name: "OCV5-763 shell gate: another function is not build_master_release", body: "  if ! ( cd \"$staging\" && TMPDIR=\"$MASTER_GATE_TMPDIR\" bash scripts/ocv5-763-shell-fixture.sh ); then\n    return 1\n  fi", sourced: true, outside: true, edition: "selfhost", pass: false },
+    { name: "OCV5-763 shell gate: commercial cannot borrow a selfhost gate", body: "  if ! ( cd \"$staging\" && TMPDIR=\"$MASTER_GATE_TMPDIR\" bash scripts/ocv5-763-shell-fixture.sh ); then\n    return 1\n  fi", sourced: true, outside: false, edition: "commercial", pass: false },
+  ]) cases.push({
+    name: c.name,
+    arrange: (f) => {
+      shellGateProof(f, c.body, c.sourced, c.outside);
+      return c.edition === "selfhost" ? ["--edition=selfhost"] : [];
+    },
+    pass: c.pass,
+    reason: c.pass ? /\[incident-regressions\] PASS:/ : /未调用 scripts\/ocv5-763-shell-fixture\.sh/,
+  });
   for (const c of cases) {
     test(c.name, () => {
       const f = makeSeverityFixture();

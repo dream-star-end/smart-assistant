@@ -10,7 +10,7 @@ test("Box first failure envelope rejects raw content and unbounded metadata", ()
   assert.deepEqual(parseBoxFirstFailure(evidence), evidence);
   for (const changed of [
     { ...evidence, text: "private output" }, { ...evidence, code: "private output" },
-    { ...evidence, phase: "private output" }, { ...evidence, observedAtMs: NaN },
+    { ...evidence, phase: "private output" }, { ...evidence, observedAtMs: Number.NaN },
     { ...evidence, diagnostic: { raw: "private output" } },
     { ...evidence, diagnostic: { upstreamTag: "private output" } },
     { ...evidence, diagnostic: { observedBytes: -1 } },
@@ -89,7 +89,7 @@ test("tool-order state metadata accepts only fixed events and the five decoder b
   }
   for (const diagnostic of [
     { branch: "tool_event_order", eventType: "private-tool-name" },
-    ...[-1, 32, 1.5, NaN, "1"].map((stateFlags) => ({ branch: "tool_event_order", stateFlags })),
+    ...[-1, 32, 1.5, Number.NaN, "1"].map((stateFlags) => ({ branch: "tool_event_order", stateFlags })),
     { branch: "tool_event_order", args: "private arguments" },
     { branch: "private branch", stateFlags: 1 },
   ]) assert.equal(parseBoxFirstFailure({ ...base, diagnostic }), null);

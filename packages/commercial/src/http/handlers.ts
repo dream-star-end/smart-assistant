@@ -134,6 +134,7 @@ import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js"
 
 export interface CommercialHttpDeps {
   codexCommissioning?: import('../account-pool/codexCommissioning.js').CodexCommissioning
+  remoteDriverV4?: import('../account-pool/remotePool/commissioningService.js').RemoteDriverV4CommissioningService
   sessionMetadataRead?: typeof readSessionMetadata
   modelSwitchCost?: import('../billing/modelSwitchCost.js').ModelSwitchCostService;
   /** Master-private system actions; absent until explicit composition has initialized the ledger. */

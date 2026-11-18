@@ -28,7 +28,7 @@ if str(AGENT_REMOTE_DIR) not in sys.path:
 from core.contract import compute_core_digest, file_sha256, load_registry  # noqa: E402
 
 KEY_COMMENT = "oc-rpool-v4"
-PRODUCTION_DRIVERS = ("cc", "codex")
+PRODUCTION_DRIVERS = ("cc", "codex", "antigravity")
 
 
 def build_bundle_payload(ssh_user: str, source_ips: List[str], ssh_port: int) -> Dict[str, Any]:
@@ -140,6 +140,7 @@ def ensure_host_exec_keydir(key_dir: Path, key_id: str) -> Dict[str, str]:
         "knownHostsPath": str(known_hosts),
         "ccKeyPath": str(exec_dir / "v4_cc_id_ed25519"),
         "codexKeyPath": str(exec_dir / "v4_codex_id_ed25519"),
+        "antigravityKeyPath": str(exec_dir / "v4_antigravity_id_ed25519"),
     }
 
 

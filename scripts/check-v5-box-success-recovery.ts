@@ -250,7 +250,7 @@ function digestLine(root: string): string {
     if (!existsSync(path)) throw new Error("BOX_SUCCESS_GATE_DIGEST");
   }
   const additional = ["boxMessagesMapper", "boxToolCatalog", "boxToolPlan", "boxTextPlan", "boxStageFiles", "boxDetachedToolPlan", "boxToolFirstRound", "boxUserStopCoordinator", "boxDurableJournal", "boxIdleChain", "boxCallFingerprint", "boxBillingContext", "boxKeeperStop", "boxTerminalProof", "boxPrelaunchControl", "boxCliToolHandoff", "boxToolCapacity", "boxCapacityWait", "boxFastPath", "boxStageBatch", "boxDetachedRunAccess", "boxSpoolPoller", "boxSpoolRead", "upstream"]
-    .map((name) => `${name}=${sha256(join(root, "packages/commercial/src/http/proxy", name + ".ts"))}`).join(" ");
+    .map((name) => `${name}=${sha256(join(root, "packages/commercial/src/http/proxy", `${name}.ts`))}`).join(" ");
   const assets = ["box_supervisor.py", "box_keeper.py", "box_virtual_mcp.py", "box_detached_runner.py"]
     .map((name) => `${name}=${sha256(join(root, "scripts/ocv5-289", name))}`).join(" ");
   return `box success recovery gate: digest worker=${sha256(files.worker)} schema=${sha256(files.schema)} pg=${sha256(files.pg)} tsx=${sha256(files.tsx)} ${additional} ${assets}`;
@@ -520,8 +520,11 @@ async function runToolNameBusiness(root: string, client: QueryClient,
     import("../packages/commercial/src/http/proxy/boxTerminalProof.ts"),
     import("../packages/commercial/src/http/proxy/upstream.ts"),
   ]);
-  const uid = 900_000_232n, accountId = 21n, containerId = 232n;
-  const sessionId = "gate-tool-name", turnKey = "e".repeat(64);
+  const uid = 900_000_232n;
+  const accountId = 21n;
+  const containerId = 232n;
+  const sessionId = "gate-tool-name";
+  const turnKey = "e".repeat(64);
   const model = "box-api-claude-opus-5-5";
   const prefix = "Follow the original instructions. Use Bash, Read and ExecuteExtraTool.";
   const names = ["Bash", "Read", "ExecuteExtraTool"];
@@ -551,7 +554,9 @@ async function runToolNameBusiness(root: string, client: QueryClient,
     query: client.query.bind(client) } as unknown as ConstructorParameters<typeof journalMod.BoxDurableJournal>[0];
   const journal = new journalMod.BoxDurableJournal(same);
   const catalog = catalogMod.compileBoxToolCatalog(body.tools, "natural");
-  const remoteHome = join(capsuleParent, "remote-home"), homeBox = join(remoteHome, "box"), remoteTmp = join(capsuleParent, "remote-tmp");
+  const remoteHome = join(capsuleParent, "remote-home");
+  const homeBox = join(remoteHome, "box");
+  const remoteTmp = join(capsuleParent, "remote-tmp");
   mkdirSync(remoteHome, { mode: 0o700 });
   mkdirSync(homeBox, { mode: 0o700 }); mkdirSync(remoteTmp, { mode: 0o1777 });
   chmodSync(remoteTmp, 0o1777);
@@ -562,7 +567,9 @@ async function runToolNameBusiness(root: string, client: QueryClient,
   const counts = { stage: 0, launch: 0, spool: 0, stop: 0, proof: 0,
     coordinator: 0, unknown: 0, retained: 0, disposed: 0, ack: 0 };
   const requests: Array<{ digest: string; namespace: string }> = [];
-  let nonce = "", epoch = "", stopped = false;
+  let nonce = "";
+  let epoch = "";
+  let stopped = false;
   const identityUnchanged = () => {
     const current = lstatSync("/home");
     assert.deepEqual([current.dev, current.ino, current.uid, current.mode],
@@ -570,7 +577,8 @@ async function runToolNameBusiness(root: string, client: QueryClient,
     assert.equal(readFileSync("/proc/self/mountinfo", "utf8"), hostNamespace, "BOX_TOOL_HOST_MOUNTS_CHANGED");
   };
   const executeStage = (req: ExecRequest) => {
-    const raw = JSON.stringify(req), digest = createHash("sha256").update(raw).digest("hex");
+    const raw = JSON.stringify(req);
+    const digest = createHash("sha256").update(raw).digest("hex");
     const ran = spawnSync("/usr/bin/unshare", ["--mount", "--propagation", "private", "--",
       "/usr/bin/python3", "-I", "-c", TOOL_NAMESPACE, remoteHome, remoteTmp,
       hostNs, digest, raw], { encoding: "utf8", env: req.environment,
@@ -615,7 +623,7 @@ async function runToolNameBusiness(root: string, client: QueryClient,
       && text.includes('Result of earlier "LegacyTool" call (error): complete-error-result'),
     "BOX_TOOL_HISTORY_LEGACY_BYTES");
     const system = readFileSync(join(remoteTmp, `ocv5-289-run-${nonce}`, "system.txt"), "utf8");
-    assert.ok(system.startsWith(prefix + "\n\n"), "BOX_TOOL_SYSTEM_PREFIX");
+    assert.ok(system.startsWith(`${prefix}\n\n`), "BOX_TOOL_SYSTEM_PREFIX");
     assert.ok(system.includes("<tool-naming>") && system.endsWith("</tool-naming>"), "BOX_TOOL_SYSTEM_NOTICE");
     for (const name of names) assert.ok(system.includes(`- ${name} → ${catalog.boxNameByClientName.get(name)}`),
       "BOX_TOOL_SYSTEM_ALIAS");
@@ -632,7 +640,7 @@ async function runToolNameBusiness(root: string, client: QueryClient,
         { type: "stream_event", event: { type: "content_block_start", index: 0,
           content_block: { type: "tool_use", id: "toolu_rejected", name: "Bash tool", input: {} } } },
       ];
-      const spool = Buffer.from(bad.map((line) => JSON.stringify(line) + "\n").join(""));
+      const spool = Buffer.from(bad.map((line) => `${JSON.stringify(line)}\n`).join(""));
       const offset = Number(args[7]); assert.equal(offset, 0, "BOX_TOOL_SPOOL_START");
       return { stdout: JSON.stringify({ data: spool.toString("base64"), offset: spool.length }), stderrBytes: 0, exitCode: 0 as const };
     }
@@ -651,8 +659,8 @@ async function runToolNameBusiness(root: string, client: QueryClient,
     }
     if (nonce && exact(req, terminalMod.makeBoxTerminalRead(`/tmp/ocv5-289-proof-${nonce}`))) {
       assert.ok(stopped, "BOX_TOOL_PROOF_BEFORE_STOP"); counts.proof++;
-      return { stdout: JSON.stringify({ runNonce: nonce, leaseEpoch: epoch,
-        keeperPid: 101, cliPid: 102, reason: "keeper_stopped", revision: 1 }) + "\n", stderrBytes: 0, exitCode: 0 as const };
+      return { stdout: `${JSON.stringify({ runNonce: nonce, leaseEpoch: epoch,
+        keeperPid: 101, cliPid: 102, reason: "keeper_stopped", revision: 1 })}\n`, stderrBytes: 0, exitCode: 0 as const };
     }
     if (args[2]?.includes("identity['identityHash']")) { nonce = args[3]!; epoch = args[4]!; }
     return executeStage(req);

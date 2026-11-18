@@ -95,9 +95,9 @@ REDIS_URL="redis://127.0.0.1:6379/3"
 # agy134 (OCV5-415) = patch of the v5-cli-cc2280-codex01592-grok1013-zcode381-slim image that adds the official
 # Antigravity CLI 1.3.4 (same RUN block as Dockerfile.openclaude-runtime, sha512-pinned);
 # the previous tag stays for rollback.
-# cc2302/codex01630/grok1062/zcode3153/agy140 (OCV5-470) = Claude Code 2.1.302, Codex 0.163.0,
-# Grok 1.0.62, ZCode 3.15.3 (CLI 0.16.9), Antigravity 1.4.0 and Cursor Agent 2026.10.16-e3cb207; the agy134 tag stays for rollback.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2302-codex01630-grok1062-zcode3153-agy150-slim"
+# cc2325/codex01690/grok1077/zcode3153/agy158 (OCV5-769) = Claude Code 2.1.325, Codex 0.169.0,
+# Grok 1.0.77, ZCode 3.15.3 (CLI 0.16.9), Antigravity 1.5.8 and Cursor Agent 2026.10.16-e3cb207; previous agy150 tag stays for rollback.
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01690-grok1077-zcode3153-agy158-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
@@ -907,7 +907,7 @@ enable_registration() {
 # 满足 quiet window;③ 最后才关总 flag,且仍按 egress→master 顺序切。
 
 ensure_model_authority() {
-  local pass admin_url cur got
+  local pass admin_url cur got migrated_counts
   log "── 启用 model authority(durable turn dispatch 的前置)──"
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] 建 role ${CATALOG_ADMIN_ROLE} + fn_model_authority_grant_admin_role();upsert MODEL_CATALOG_ADMIN_DATABASE_URL / OC_MODEL_AUTHORITY=1 / OC_MODEL_AUTHORITY_PROVISION_REQUIRED=1"
@@ -954,6 +954,7 @@ ensure_model_authority() {
   ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY 1
   ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY_PROVISION_REQUIRED 1
   log "  ✓ OC_MODEL_AUTHORITY=1 / PROVISION_REQUIRED=1 / MODEL_CATALOG_ADMIN_DATABASE_URL"
+  migrated_counts="$(psql_as_postgres -d "$PG_DB" -tAc "WITH session_targets AS (SELECT cs.id, CASE WHEN cs.model_id LIKE 'claude-sonnet-%' THEN 'box-claude-sonnet-5' WHEN cs.model_id LIKE 'claude-haiku-%' THEN 'box-claude-haiku-5-5' ELSE 'box-claude-opus-5-5' END AS target_box_id FROM client_sessions cs WHERE cs.deleted_at IS NULL AND cs.model_id LIKE 'claude-%' AND cs.model_id NOT LIKE '%-remote' AND cs.model_id NOT LIKE '%-go'), updated_sessions AS (UPDATE client_sessions cs SET model_id = st.target_box_id FROM session_targets st WHERE cs.id = st.id AND EXISTS (SELECT 1 FROM model_catalog mc WHERE mc.model_id = st.target_box_id AND mc.state = 'active') RETURNING cs.id), hidden_pricing AS (UPDATE model_pricing mp SET enabled = FALSE, visibility = 'hidden' WHERE mp.model_id LIKE 'claude-%' AND mp.model_id NOT LIKE '%-remote' AND mp.model_id NOT LIKE '%-go' AND (mp.enabled IS TRUE OR mp.visibility <> 'hidden') RETURNING mp.model_id) SELECT (SELECT count(*) FROM updated_sessions)::text || ':' || (SELECT count(*) FROM hidden_pricing)::text;" | tr -d '[:space:]')" || die "下线 local Claude Code 模型失败。"; log "  ✓ local CC 下线收敛(sessions=${migrated_counts%%:*}, pricing_hidden=${migrated_counts##*:})"
 }
 
 # ── env / HOME ───────────────────────────────────────────────────────────

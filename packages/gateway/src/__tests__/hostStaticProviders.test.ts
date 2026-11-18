@@ -282,6 +282,19 @@ describe('buildHostSpawnProviderEnv — 路由决策对称性(MAJOR/MINOR 2026-0
     assert.equal(r.env.ANTHROPIC_BASE_URL, '')
   })
 
+  it('OC_SELFHOST_ENGINE_LOCAL_TURNS=1 禁用 claude-subscription oauth-direct(个人版本地 CC 下线)', () => {
+    const r = buildHostSpawnProviderEnv({
+      model: 'claude-opus-4-6',
+      effectiveProvider: 'claude-subscription',
+      claudeOAuthAccessToken: 'oauth-tok',
+      hostStaticKeys: null,
+      env: { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' },
+    })
+    assert.equal(r.routing, 'settings-default')
+    assert.equal(r.env.CLAUDE_CODE_OAUTH_TOKEN, undefined)
+    assert.equal(r.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, undefined)
+  })
+
   it('host + 模型属静态 provider 但 key 缺失 → throw(fail-closed,冒泡到 start 清理)', () => {
     assert.throws(
       () =>

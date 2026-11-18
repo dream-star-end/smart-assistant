@@ -267,7 +267,7 @@ export const TOOLS = [
           type: 'array',
           items: { type: 'string' },
           description:
-            '可选:为子 agent 额外授予的平台工具集名(目前仅 "browser";网页提取/论文下载已是常驻 CLI——oc-web / scansci-pdf,无需工具集)。通常无需手动指定 —— 系统会按任务目标自动挂载;只能授予平台已配置的工具集,无法越权,填错或填不存在的名字会被忽略而非报错。',
+            '可选:为子 agent 额外授予的平台工具集名(目前仅 "browser";网页提取/论文下载已是常驻 CLI——oc-web / oc-lit,无需工具集)。通常无需手动指定 —— 系统会按任务目标自动挂载;只能授予平台已配置的工具集,无法越权,填错或填不存在的名字会被忽略而非报错。',
         },
         resumeSessionKey: {
           type: 'string',
@@ -705,7 +705,7 @@ export const TOOLS = [
     name: 'oc_bash',
     description: [
       '在 MCP 进程里同步执行一条 shell 命令,返回 stdout、stderr 和 exit。',
-      '默认等待 60000ms,最短 1000ms,最长 170000ms。超时才算工具错误;非零退出码写在文本里,不是协议错误。',
+      '默认等待 60000ms,最短 1000ms,最长 600000ms。超时才算工具错误;非零退出码写在文本里,不是协议错误。',
       'Antigravity 原生 run_command 前台最多等 10000ms 就会转后台。需要跑完再继续时用本工具,不要用 run_command 的 WaitMsBeforeAsync。',
     ].join('\n'),
     inputSchema: {
@@ -716,8 +716,8 @@ export const TOOLS = [
         timeout_ms: {
           type: 'number',
           minimum: 1000,
-          maximum: 170000,
-          description: '等待毫秒数,默认 60000,范围 1000–170000',
+          maximum: 600000,
+          description: '等待毫秒数,默认 60000,范围 1000–600000',
         },
       },
       required: ['command'],

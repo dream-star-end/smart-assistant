@@ -410,6 +410,8 @@ master_gate_retryable() { # <gate> <command...>
 }
 
 # 商业版 release_artifact_digest 的本地化抄本(无 SSH)。.complete 不计入。
+# OCV5-775: 保持 openclaude-release-artifact-v2\0 字节级输出与前后双快照/fstat 校验完全不变,
+# 用有界单读线程预取 + 2MiB 批量喂入 GIL-free SHA256_Update 重叠 VFS 读取与哈希计算。
 release_artifact_digest() { # <absolute-release-root>
   local root="$1"
   [[ -d "$root" && ! -L "$root" ]] || {
@@ -419,8 +421,10 @@ release_artifact_digest() { # <absolute-release-root>
   python3 - "$root" <<'PY'
 import hashlib
 import os
+import queue
 import stat
 import sys
+import threading
 
 root = os.fsencode(os.path.abspath(sys.argv[1]))
 if not os.path.isdir(root) or os.path.islink(root):
@@ -455,51 +459,125 @@ def snapshot_tree():
     rows.sort(key=lambda item: item[0])
     return identity(root_stat), rows
 
-root_before, entries = snapshot_tree()
-digest = hashlib.sha256(b"openclaude-release-artifact-v2\0")
-
-def field(value):
+def append_field(buf, value):
     if isinstance(value, str):
         value = value.encode("ascii")
-    digest.update(len(value).to_bytes(8, "big"))
-    digest.update(value)
+    buf += len(value).to_bytes(8, "big")
+    buf += value
+
+root_before, entries = snapshot_tree()
+digest = hashlib.sha256(b"openclaude-release-artifact-v2\0")
 
 root_stat = os.lstat(root)
 if identity(root_stat) != root_before:
     raise RuntimeError("release artifact root changed before digest")
-field(b"D")
-field(b"")
-field(str(stat.S_IMODE(root_stat.st_mode)))
-field(str(root_stat.st_uid))
-field(str(root_stat.st_gid))
+hdr = bytearray()
+append_field(hdr, b"D")
+append_field(hdr, b"")
+append_field(hdr, str(stat.S_IMODE(root_stat.st_mode)))
+append_field(hdr, str(root_stat.st_uid))
+append_field(hdr, str(root_stat.st_gid))
+digest.update(hdr)
 
-for rel, absolute, before in entries:
-    st = os.lstat(absolute)
-    if identity(st) != before:
-        raise RuntimeError(f"release entry changed during digest: {os.fsdecode(rel)!r}")
-    mode = st.st_mode
-    kind = b"F" if stat.S_ISREG(mode) else b"D" if stat.S_ISDIR(mode) else b"L"
-    field(kind)
-    field(rel)
-    field(str(stat.S_IMODE(mode)))
-    field(str(st.st_uid))
-    field(str(st.st_gid))
-    if kind == b"F":
-        field(str(st.st_size))
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(absolute, flags)
-        if identity(os.fstat(fd)) != before:
-            os.close(fd)
-            raise RuntimeError(f"release file changed before open: {os.fsdecode(rel)!r}")
-        with os.fdopen(fd, "rb", buffering=1024 * 1024) as fh:
-            while chunk := fh.read(1024 * 1024):
-                digest.update(chunk)
-            if identity(os.fstat(fh.fileno())) != before:
-                raise RuntimeError(f"release file changed while open: {os.fsdecode(rel)!r}")
-    elif kind == b"L":
-        field(os.readlink(absolute))
-    if identity(os.lstat(absolute)) != before:
-        raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+q = queue.Queue(maxsize=16)
+stop_ev = threading.Event()
+O_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+BATCH_BYTES = 2 * 1024 * 1024
+
+def put_q(item):
+    while not stop_ev.is_set():
+        try:
+            q.put(item, timeout=0.2)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+def reader():
+    try:
+        buf = bytearray()
+        for rel, absolute, before in entries:
+            if stop_ev.is_set():
+                return
+            st = os.lstat(absolute)
+            if identity(st) != before:
+                raise RuntimeError(f"release entry changed during digest: {os.fsdecode(rel)!r}")
+            mode = st.st_mode
+            mode_s = str(stat.S_IMODE(mode))
+            uid_s = str(st.st_uid)
+            gid_s = str(st.st_gid)
+            if stat.S_ISREG(mode):
+                append_field(buf, b"F")
+                append_field(buf, rel)
+                append_field(buf, mode_s)
+                append_field(buf, uid_s)
+                append_field(buf, gid_s)
+                append_field(buf, str(st.st_size))
+                fd = os.open(absolute, O_FLAGS)
+                closed = False
+                try:
+                    if identity(os.fstat(fd)) != before:
+                        raise RuntimeError(f"release file changed before open: {os.fsdecode(rel)!r}")
+                    while chunk := os.read(fd, 1048576):
+                        buf += chunk
+                        if len(buf) >= BATCH_BYTES:
+                            if not put_q(("DATA", buf)):
+                                return
+                            buf = bytearray()
+                    if identity(os.fstat(fd)) != before:
+                        raise RuntimeError(f"release file changed while open: {os.fsdecode(rel)!r}")
+                    os.close(fd)
+                    closed = True
+                    if identity(os.lstat(absolute)) != before:
+                        raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+                finally:
+                    if not closed:
+                        os.close(fd)
+            elif stat.S_ISDIR(mode):
+                append_field(buf, b"D")
+                append_field(buf, rel)
+                append_field(buf, mode_s)
+                append_field(buf, uid_s)
+                append_field(buf, gid_s)
+                if identity(os.lstat(absolute)) != before:
+                    raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+            elif stat.S_ISLNK(mode):
+                target = os.readlink(absolute)
+                if identity(os.lstat(absolute)) != before:
+                    raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+                append_field(buf, b"L")
+                append_field(buf, rel)
+                append_field(buf, mode_s)
+                append_field(buf, uid_s)
+                append_field(buf, gid_s)
+                append_field(buf, target)
+            else:
+                raise RuntimeError(f"non-regular release entry: {os.fsdecode(rel)!r}")
+            if len(buf) >= BATCH_BYTES:
+                if not put_q(("DATA", buf)):
+                    return
+                buf = bytearray()
+        if buf and not put_q(("DATA", buf)):
+            return
+        put_q(("DONE",))
+    except BaseException as exc:
+        put_q(("ERR", exc))
+
+worker = threading.Thread(target=reader, daemon=True)
+worker.start()
+try:
+    while True:
+        msg = q.get()
+        tag = msg[0]
+        if tag == "DATA":
+            digest.update(msg[1])
+        elif tag == "DONE":
+            break
+        elif tag == "ERR":
+            raise msg[1]
+finally:
+    stop_ev.set()
+    worker.join(timeout=5)
 
 root_after, entries_after = snapshot_tree()
 before_signature = [(rel, before) for rel, _absolute, before in entries]
@@ -519,10 +597,34 @@ harden_unique_release_tree() { # <staging-root>
   local root="$1"
   [[ -d "$root" && ! -L "$root" ]] || return 1
   chown 0:0 -- "$root" || return 1
-  # 根目录先保持可写,以便随后落 .complete;子目录去写位。
-  find "$root" -mindepth 1 -type d -print0 | xargs -0 -r chmod 0555
-  find "$root" -type f -links 1 -perm /111 -print0 | xargs -0 -r chmod 0555
-  find "$root" -type f -links 1 ! -perm /111 -print0 | xargs -0 -r chmod 0444
+  # 根目录先保持可写,以便随后落 .complete;子目录与独立 inode 单遍 scandir 收紧。
+  python3 - "$root" <<'PY'
+import os
+import stat
+import sys
+
+root = os.fsencode(os.path.abspath(sys.argv[1]))
+if not os.path.isdir(root) or os.path.islink(root):
+    raise SystemExit(1)
+
+def walk(directory):
+    with os.scandir(directory) as scan:
+        for entry in scan:
+            st = entry.stat(follow_symlinks=False)
+            mode = st.st_mode
+            if stat.S_ISLNK(mode):
+                continue
+            if stat.S_ISDIR(mode):
+                walk(entry.path)
+                if stat.S_IMODE(mode) != 0o555:
+                    os.chmod(entry.path, 0o555)
+            elif stat.S_ISREG(mode) and st.st_nlink == 1:
+                target = 0o555 if (mode & 0o111) else 0o444
+                if stat.S_IMODE(mode) != target:
+                    os.chmod(entry.path, target)
+
+walk(root)
+PY
 }
 
 # 从已 harden 的 donor 硬链过来后,tsc/vite 可能是 0444。不能 chmod 共享 inode。
@@ -911,14 +1013,298 @@ write_web_dist_reuse_record() { # <staging> <key-or-empty> <mode> <full-sha> [do
     > "$staging/$WEB_DIST_REUSE_RECORD"
 }
 
-master_seed_frontend_buildinfo() { # <donor-or-empty> <staging>; never share a writable donor inode
-  local donor="$1" staging="$2" src dest
-  src="$donor/packages/web-react/tsconfig.tsbuildinfo"
-  [[ -n "$donor" && -f "$src" ]] || return 0
-  dest="$staging/packages/web-react/tsconfig.tsbuildinfo"
-  cp --remove-destination -- "$src" "$dest" || return 1
-  # Force tsc -b to compare input hashes even when git archive gave changed sources older mtimes.
-  touch -d @0 -- "$dest"
+master_seed_frontend_buildinfo() { # <donor-or-empty> <staging> [prefer-freshest:0|1]; never share a writable donor inode
+  local donor="${1:-}" staging="$2" prefer_freshest="${3:-0}"
+  [[ -d "$staging" && ! -L "$staging" && -d "$staging/packages" && ! -L "$staging/packages" \
+    && -d "$staging/packages/web-react" && ! -L "$staging/packages/web-react" ]] || return 0
+  python3 - "$staging" "$donor" "$prefer_freshest" "${OC_V5_TSC_CACHE_DIR:-}" "${MASTER_RELEASES_ROOT:-}" "${MASTER_LIVE_LINK:-}" "${REPO_ROOT:-}" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+
+staging, donor, prefer_freshest, raw_cache, releases_root, live_link, repo_root = sys.argv[1:8]
+euid = os.geteuid()
+MAX_BYTES = 64 * 1024 * 1024
+O_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+O_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+PROD_PREFIXES = ("/var/lib/openclaude-v5-selfhost", "/opt/openclaude/openclaude-v5-selfhost-releases")
+
+def dir_stat_trusted(st: os.stat_result, allow_root_sticky: bool) -> bool:
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid == euid and (st.st_mode & 0o022) == 0:
+        return True
+    if allow_root_sticky and st.st_uid == 0:
+        return (st.st_mode & 0o022) == 0 or (st.st_mode & stat.S_ISVTX) != 0
+    return False
+
+def open_trusted_dir_fd(raw_path: str, is_cache_path: bool, tail_strict_depth: int = 1) -> int | None:
+    if not raw_path:
+        return None
+    p = Path(raw_path)
+    if not p.is_absolute() or ".." in p.parts or "." in p.parts:
+        return None
+    if is_cache_path and euid != 0 and any(str(p).startswith(px) for px in PROD_PREFIXES):
+        return None
+    parts = p.parts[1:]
+    strict_from = max(0, len(parts) - tail_strict_depth)
+    try:
+        fd = os.open("/", O_DIR_FLAGS)
+    except OSError:
+        return None
+    try:
+        allow_root_sticky_root = not (is_cache_path and euid == 0) and len(parts) > tail_strict_depth
+        if not dir_stat_trusted(os.fstat(fd), allow_root_sticky=allow_root_sticky_root):
+            os.close(fd)
+            return None
+        for idx, comp in enumerate(parts):
+            allow_sticky = (not (is_cache_path and euid == 0)) and (idx < strict_from)
+            nxt = os.open(comp, O_DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            if not dir_stat_trusted(os.fstat(fd), allow_root_sticky=allow_sticky):
+                os.close(fd)
+                return None
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+def is_poisoned(d: Path) -> bool:
+    return d.name.endswith(".poisoned") or (d / ".poisoned").exists() or Path(f"{d}.poisoned").exists()
+
+def valid_file_stat(st: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(st.st_mode)
+        and st.st_uid == euid
+        and (st.st_mode & 0o022) == 0
+        and 0 < st.st_size <= MAX_BYTES
+    )
+
+dest_fd = open_trusted_dir_fd(f"{staging}/packages/web-react", is_cache_path=False, tail_strict_depth=3)
+if dest_fd is None:
+    raise SystemExit(0)
+
+try:
+    candidates: list[tuple[int, int, int, int, str]] = []
+    open_fds: list[int] = []
+
+    def add_candidate_dir(dir_path: str, filename: str, tier: int, prio: int, is_cache: bool, strict_depth: int) -> None:
+        dfd = open_trusted_dir_fd(dir_path, is_cache_path=is_cache, tail_strict_depth=strict_depth)
+        if dfd is None:
+            return
+        try:
+            st = os.stat(filename, dir_fd=dfd, follow_symlinks=False)
+        except OSError:
+            os.close(dfd)
+            return
+        if not valid_file_stat(st):
+            os.close(dfd)
+            return
+        open_fds.append(dfd)
+        candidates.append((tier, st.st_mtime_ns, prio, dfd, filename))
+
+    try:
+        cache_raw = raw_cache or (f"{releases_root}/.tsc-cache" if releases_root else "")
+        if cache_raw:
+            add_candidate_dir(cache_raw, "web-react.tsbuildinfo", tier=0, prio=3, is_cache=True, strict_depth=1)
+
+        def add_release_dir(raw_dir: str, require_complete: bool, tier: int, prio: int) -> None:
+            if not raw_dir:
+                return
+            if repo_root and os.path.abspath(raw_dir) == os.path.abspath(repo_root):
+                return
+            d = Path(raw_dir)
+            if not d.is_absolute() or ".." in d.parts or is_poisoned(d):
+                return
+            if require_complete:
+                rfd_root = open_trusted_dir_fd(str(d), is_cache_path=False, tail_strict_depth=1)
+                if rfd_root is None:
+                    return
+                try:
+                    cst = os.stat(".complete", dir_fd=rfd_root, follow_symlinks=False)
+                except OSError:
+                    cst = None
+                finally:
+                    os.close(rfd_root)
+                if cst is None or not stat.S_ISREG(cst.st_mode):
+                    return
+            add_candidate_dir(f"{raw_dir}/packages/web-react", "tsconfig.tsbuildinfo", tier=tier, prio=prio, is_cache=False, strict_depth=3)
+
+        donor_tier = 0 if prefer_freshest == "1" else 1
+        add_release_dir(donor, require_complete=False, tier=donor_tier, prio=2)
+
+        if live_link:
+            lp = Path(live_link)
+            if lp.is_symlink():
+                try:
+                    add_release_dir(str(lp.resolve(strict=True)), require_complete=True, tier=0, prio=1)
+                except OSError:
+                    pass
+
+        if releases_root:
+            rr = Path(releases_root)
+            if not rr.is_symlink() and rr.is_dir():
+                rels: list[tuple[int, Path]] = []
+                try:
+                    for entry in rr.iterdir():
+                        if entry.name.startswith("rel-") and not entry.name.endswith(".poisoned") and not entry.is_symlink() and entry.is_dir():
+                            rels.append((entry.stat().st_mtime_ns, entry))
+                except OSError:
+                    rels = []
+                rels.sort(key=lambda x: x[0], reverse=True)
+                for _mt, rpath in rels[:8]:
+                    add_release_dir(str(rpath), require_complete=True, tier=0, prio=0)
+
+        for _tier, _mt, _prio, src_dfd, fname in sorted(candidates, key=lambda item: (item[0], item[1], item[2]), reverse=True):
+            try:
+                rfd = os.open(fname, O_FILE_FLAGS, dir_fd=src_dfd)
+            except OSError:
+                continue
+            try:
+                if not valid_file_stat(os.fstat(rfd)):
+                    continue
+                tmp_name = f".tsbuildinfo.seed-{os.urandom(8).hex()}"
+                wfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=dest_fd)
+                try:
+                    with os.fdopen(rfd, "rb") as fin, os.fdopen(wfd, "wb") as fout:
+                        rfd = -1
+                        wfd = -1
+                        shutil.copyfileobj(fin, fout, length=1024 * 1024)
+                        fout.flush()
+                        os.chmod(fout.fileno(), 0o644)
+                        os.utime(fout.fileno(), (0, 0))
+                    os.rename(tmp_name, "tsconfig.tsbuildinfo", src_dir_fd=dest_fd, dst_dir_fd=dest_fd)
+                    break
+                except BaseException:
+                    if wfd >= 0:
+                        os.close(wfd)
+                    try:
+                        os.unlink(tmp_name, dir_fd=dest_fd)
+                    except OSError:
+                        pass
+                    raise
+            finally:
+                if rfd >= 0:
+                    os.close(rfd)
+    finally:
+        for dfd in open_fds:
+            os.close(dfd)
+finally:
+    os.close(dest_fd)
+PY
+}
+
+master_save_frontend_buildinfo() { # <staging>; best-effort atomic persist of fresh tsc -b buildinfo
+  local staging="$1" cache_dir=""
+  [[ "${DRY:-0}" != 1 && "${OC_V5_ALLOW_WORKTREE_DONOR:-0}" != 1 ]] || return 0
+  cache_dir="${OC_V5_TSC_CACHE_DIR:-${MASTER_RELEASES_ROOT:+${MASTER_RELEASES_ROOT}/.tsc-cache}}"
+  [[ -n "$cache_dir" ]] || return 0
+  python3 - "$staging" "$cache_dir" <<'PY' || mlog "  ⚠ frontend tsbuildinfo cache save skipped"
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+
+staging, cache_raw = sys.argv[1:3]
+euid = os.geteuid()
+MAX_BYTES = 64 * 1024 * 1024
+O_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+O_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+PROD_PREFIXES = ("/var/lib/openclaude-v5-selfhost", "/opt/openclaude/openclaude-v5-selfhost-releases")
+
+def dir_stat_trusted(st: os.stat_result, allow_root_sticky: bool) -> bool:
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid == euid and (st.st_mode & 0o022) == 0:
+        return True
+    if allow_root_sticky and st.st_uid == 0:
+        return (st.st_mode & 0o022) == 0 or (st.st_mode & stat.S_ISVTX) != 0
+    return False
+
+def open_trusted_dir_fd(raw_path: str, create_missing_last_two: bool, is_cache_path: bool, tail_strict_depth: int = 1) -> int:
+    p = Path(raw_path)
+    if not p.is_absolute() or ".." in p.parts or "." in p.parts:
+        raise ValueError("non-canonical path")
+    if is_cache_path and euid != 0 and any(str(p).startswith(px) for px in PROD_PREFIXES):
+        raise ValueError("unprivileged caller cannot write production tsc cache")
+    parts = p.parts[1:]
+    strict_from = max(0, len(parts) - tail_strict_depth)
+    dir_mode = 0o755 if euid == 0 else 0o700
+    fd = os.open("/", O_DIR_FLAGS)
+    try:
+        allow_root_sticky_root = not (is_cache_path and euid == 0) and len(parts) > tail_strict_depth
+        if not dir_stat_trusted(os.fstat(fd), allow_root_sticky=allow_root_sticky_root):
+            raise ValueError("untrusted root")
+        for idx, comp in enumerate(parts):
+            allow_sticky = (not (is_cache_path and euid == 0)) and (idx < strict_from)
+            can_create = (
+                create_missing_last_two
+                and (euid == 0 or (idx >= max(0, len(parts) - 2) and os.fstat(fd).st_uid == euid))
+            )
+            if can_create:
+                try:
+                    os.mkdir(comp, dir_mode, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            nxt = os.open(comp, O_DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            if not dir_stat_trusted(os.fstat(fd), allow_root_sticky=allow_sticky):
+                raise ValueError(f"untrusted directory component: {comp}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+try:
+    src_dir_fd = open_trusted_dir_fd(f"{staging}/packages/web-react", create_missing_last_two=False, is_cache_path=False, tail_strict_depth=3)
+except (OSError, ValueError):
+    raise SystemExit(0)
+
+rfd = -1
+try:
+    try:
+        rfd = os.open("tsconfig.tsbuildinfo", O_FILE_FLAGS, dir_fd=src_dir_fd)
+    except OSError:
+        raise SystemExit(0)
+    src_st = os.fstat(rfd)
+    if not stat.S_ISREG(src_st.st_mode) or src_st.st_uid != euid or (src_st.st_mode & 0o022) != 0 or src_st.st_size <= 0 or src_st.st_size > MAX_BYTES:
+        raise SystemExit(0)
+
+    cdir_fd = open_trusted_dir_fd(cache_raw, create_missing_last_two=True, is_cache_path=True, tail_strict_depth=1)
+    try:
+        file_mode = 0o644 if euid == 0 else 0o600
+        tmp_name = f".web-react.tsbuildinfo.tmp-{os.urandom(8).hex()}"
+        wfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=cdir_fd)
+        try:
+            with os.fdopen(rfd, "rb") as fin, os.fdopen(wfd, "wb") as fout:
+                rfd = -1
+                wfd = -1
+                shutil.copyfileobj(fin, fout, length=1024 * 1024)
+                fout.flush()
+                os.fsync(fout.fileno())
+                os.chmod(fout.fileno(), file_mode)
+            os.rename(tmp_name, "web-react.tsbuildinfo", src_dir_fd=cdir_fd, dst_dir_fd=cdir_fd)
+        except BaseException:
+            if wfd >= 0:
+                os.close(wfd)
+            try:
+                os.unlink(tmp_name, dir_fd=cdir_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(cdir_fd)
+finally:
+    if rfd >= 0:
+        os.close(rfd)
+    os.close(src_dir_fd)
+PY
+  return 0
 }
 
 # OCV5-545:把 check-architecture.ts --json 的计数记进列车 summary.json(只记录,读不到就记 unreadable)。
@@ -946,6 +1332,9 @@ build_master_release() {
   local full_sha short_sha ts staging reldir donor t0 t1 build_id web_key web_donor
   MASTER_GATE_RECEIPT_IDS=""
   MASTER_GATE_RECEIPT_SHA=""
+  MASTER_LOCAL_GATE_CACHE_READY=0
+  MASTER_LOCAL_GATE_PLAN_FILE=""
+  MASTER_LOCAL_GATE_SHA=""
   BUILT_MASTER_RELEASE=""
   MASTER_DEPS_MODE=""
   MASTER_DEPS_ELAPSED_S=""
@@ -993,12 +1382,14 @@ build_master_release() {
     || die "MASTER_RELEASES_ROOT 必须是普通目录: $MASTER_RELEASES_ROOT"
 
   mkdir -p -- "$staging" || die "无法创建 staging $staging"
+  chmod 0755 -- "$staging" || die "无法收敛 staging 权限 $staging"
   MASTER_STAGING="$(readlink -f -- "$staging")"
   [[ -n "$MASTER_STAGING" && -d "$MASTER_STAGING" ]] || die "staging 规范化失败: $staging"
   MASTER_STAGING_DEV="$(stat -c '%d' -- "$MASTER_STAGING")"
   MASTER_STAGING_INO="$(stat -c '%i' -- "$MASTER_STAGING")"
   staging="$MASTER_STAGING"
-  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$staging"; then
+  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" \
+      | ( umask 022 && tar --no-same-permissions --no-same-owner -x -C "$staging" ); then
     cleanup_master_staging
     die "git archive/解包失败"
   fi
@@ -1179,14 +1570,17 @@ build_master_release() {
       MASTER_FRONTEND_MODE="reused"
     else
       [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
-      master_seed_frontend_buildinfo "${donor:-}" "$staging" || return 1
+      master_seed_frontend_buildinfo "${donor:-}" "$staging" 1 || return 1
       mlog "  web-react official build @ staging(不碰工作树 dist)"
-      if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+      if ! ( umask 022 && cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
           OC_V5_SELFHOST_TSC_TIMER_FILE="$MASTER_GATE_TMPDIR/frontend-tsc-sec" \
           NODE_OPTIONS="--max-old-space-size=4096 --require=\"$SCRIPT_DIR/lib/v5-selfhost-tsc-timer.cjs\"" \
           npm run build --workspace packages/web-react ); then
         mlog "staging web-react 构建失败"
         return 1
+      fi
+      if declare -F master_save_frontend_buildinfo >/dev/null; then
+        master_save_frontend_buildinfo "$staging"
       fi
       MASTER_FRONTEND_TSC_S=unknown
       if [[ -f "$MASTER_GATE_TMPDIR/frontend-tsc-sec" ]] \
@@ -1243,6 +1637,7 @@ build_master_release() {
       die "pinned C/D 并行任务失败(收据不能绕过已失败任务)"
     fi
     if [[ -n "$gate_id" ]] && master_gate_receipt_has "$gate_id" "$full_sha"; then continue; fi
+    if master_local_gate_has_job "$job_id" "$full_sha"; then continue; fi
     if ! master_build_job_start "$job_id" "$job_fn"; then
       cleanup_master_staging
       die "pinned C/D 并行任务失败或负载预算超时"
@@ -1270,111 +1665,165 @@ build_master_release() {
     await_runtime_release_bg
     tsum_note runtimeWaitBeforeBoxSec "$(( $(date +%s) - t0 ))" 2>/dev/null || :
   fi
-  if ! master_gate_wait_host_idle box-gates; then
-    cleanup_master_staging
-    die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
-  fi
-  if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
-    cleanup_master_staging
-    die "建本班列车独立测试库失败(live 未改)"
-  fi
-  mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-success-recovery.ts"
-  fi
-  # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
-  # 两道 DB 门的命令写在这里(check-v5-incident-regressions 只认 build_master_release 里的调用),
-  # 显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于 TEST_DATABASE_URL,留着就连回共享库。
-  master_gate_box_success_recovery() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-        npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
+  local box_idle_checked=0 gate_db_created=0
+  master_ensure_box_host_idle() {
+    if [[ "$box_idle_checked" == 1 ]]; then return 0; fi
+    if ! master_gate_wait_host_idle box-gates; then
+      cleanup_master_staging
+      die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
+    fi
+    box_idle_checked=1
   }
-  if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery; then
-    cleanup_master_staging
-    die "pinned Box success recovery behavioral gate 失败"
+  master_ensure_gate_db() {
+    if [[ "$gate_db_created" == 1 ]]; then return 0; fi
+    if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
+      cleanup_master_staging
+      die "建本班列车独立测试库失败(live 未改)"
+    fi
+    gate_db_created=1
+  }
+  if ! master_local_gate_has box-success-recovery "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
+    mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+    if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
+      cleanup_master_staging
+      die "新候选缺 scripts/check-v5-box-success-recovery.ts"
+    fi
+    # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
+    # 两道 DB 门的命令写在这里(check-v5-incident-regressions 只认 build_master_release 里的调用),
+    # 显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于 TEST_DATABASE_URL,留着就连回共享库。
+    master_gate_box_success_recovery() {
+      ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+          OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+          npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
+    }
+    if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery; then
+      cleanup_master_staging
+      die "pinned Box success recovery behavioral gate 失败"
+    fi
+    master_local_gate_record box-success-recovery "$full_sha"
   fi
   tsum_mark C.box-continuation 2>/dev/null || :
-  mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-continuation.ts"
-  fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
-    cleanup_master_staging
-    die "pinned Box multitool continuation gate 失败"
+  if ! master_local_gate_has box-continuation "$full_sha"; then
+    master_ensure_box_host_idle
+    mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+    if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
+      cleanup_master_staging
+      die "新候选缺 scripts/check-v5-box-continuation.ts"
+    fi
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
+      cleanup_master_staging
+      die "pinned Box multitool continuation gate 失败"
+    fi
+    master_local_gate_record box-continuation "$full_sha"
   fi
   tsum_mark C.box-incident-proofs 2>/dev/null || :
-  mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
-  fi
-  # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
-  master_gate_box_incident_proofs() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-        npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
-  }
-  if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs; then
-    cleanup_master_staging
-    die "pinned Box incident proofs gate (OCV5-488) 失败"
+  if ! master_local_gate_has box-incident-proofs "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
+    mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+    if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
+      cleanup_master_staging
+      die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
+    fi
+    # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
+    master_gate_box_incident_proofs() {
+      ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+          OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+          npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
+    }
+    if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs; then
+      cleanup_master_staging
+      die "pinned Box incident proofs gate (OCV5-488) 失败"
+    fi
+    master_local_gate_record box-incident-proofs "$full_sha"
   fi
   tsum_mark C.box-longtask 2>/dev/null || :
-  tsum_note gateEvidence.box-longtask local 2>/dev/null || :
-  mlog "  Box long-task generations gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
-      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha" ); then
-    cleanup_master_staging
-    die "pinned Box long-task generations gate 失败"
+  if ! master_local_gate_has box-longtask "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
+    tsum_note gateEvidence.box-longtask local 2>/dev/null || :
+    mlog "  Box long-task generations gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha" ); then
+      cleanup_master_staging
+      die "pinned Box long-task generations gate 失败"
+    fi
+    master_local_gate_record box-longtask "$full_sha"
   fi
   # OCV5-763: reverse-imported commercial incidents need actual selfhost runners.
   # Existing train-isolated test DB only; no production credentials or model invocation.
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      REQUIRE_TEST_DB=1 TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-      npx --no-install tsx scripts/check-v5-master-incident-proofs.ts ); then
-    cleanup_master_staging
-    die "pinned imported master incident proofs failed"
+  if ! master_local_gate_has master-incident-proofs "$full_sha"; then
+    master_ensure_box_host_idle
+    master_ensure_gate_db
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        REQUIRE_TEST_DB=1 TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-master-incident-proofs.ts ); then
+      cleanup_master_staging
+      die "pinned imported master incident proofs failed"
+    fi
+    master_local_gate_record master-incident-proofs "$full_sha"
   fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
-    cleanup_master_staging
-    die "pinned imported codex-chatgpt-ws proof failed"
+  if ! master_local_gate_has codex-chatgpt-ws "$full_sha"; then
+    master_ensure_box_host_idle
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts ); then
+      cleanup_master_staging
+      die "pinned imported codex-chatgpt-ws proof failed"
+    fi
+    master_local_gate_record codex-chatgpt-ws "$full_sha"
   fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
-    cleanup_master_staging
-    die "pinned imported ocv5-376-platform-tool-proofs proof failed"
+  if ! master_local_gate_has platform-tool-proofs "$full_sha"; then
+    master_ensure_box_host_idle
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-ocv5-376-platform-tool-proofs.ts ); then
+      cleanup_master_staging
+      die "pinned imported ocv5-376-platform-tool-proofs proof failed"
+    fi
+    master_local_gate_record platform-tool-proofs "$full_sha"
   fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
-    cleanup_master_staging
-    die "pinned imported box-terminal-unproven-probe proof failed"
+  if ! master_local_gate_has terminal-unproven "$full_sha"; then
+    master_ensure_box_host_idle
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts ); then
+      cleanup_master_staging
+      die "pinned imported box-terminal-unproven-probe proof failed"
+    fi
+    master_local_gate_record terminal-unproven "$full_sha"
   fi
   master_gate_db_drop
-  mlog "  upload retention HTTP responsiveness proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
-    cleanup_master_staging
-    die "pinned upload retention HTTP responsiveness proof failed"
+  if ! master_local_gate_has upload-retention-http "$full_sha"; then
+    mlog "  upload retention HTTP responsiveness proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+        npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
+      cleanup_master_staging
+      die "pinned upload retention HTTP responsiveness proof failed"
+    fi
+    master_local_gate_record upload-retention-http "$full_sha"
   fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
-  mlog "  CCB MCP availability contract gate @ pinned staging"
-  master_gate_ccb_mcp() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
-        npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
-  }
-  if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
-    cleanup_master_staging
-    die "pinned CCB MCP availability contract gate 失败"
+  if ! master_local_gate_has ccb-mcp-availability "$full_sha"; then
+    mlog "  CCB MCP availability contract gate @ pinned staging"
+    master_gate_ccb_mcp() {
+      ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
+          npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
+    }
+    if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
+      cleanup_master_staging
+      die "pinned CCB MCP availability contract gate 失败"
+    fi
+    master_local_gate_record ccb-mcp-availability "$full_sha"
   fi
   # Before sealing: fresh same-candidate CCB and real late stop proof; no production DB.
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
-    cleanup_master_staging
-    die "pinned Codex late-stop closure proof failed"
+  if ! master_local_gate_has codex-late-stop-closure "$full_sha"; then
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/check-v5-codex-late-stop-proof.sh ); then
+      cleanup_master_staging
+      die "pinned Codex late-stop closure proof failed"
+    fi
+    master_local_gate_record codex-late-stop-closure "$full_sha"
   fi
   cleanup_master_gate_tmpdir
 

@@ -216,7 +216,8 @@ async function load(): Promise<Api> {
         pricing: new Map([[model, { modelId: model, displayName: model, inputPerMtok: 100n, outputPerMtok: 500n,
           cacheReadPerMtok: 10n, cacheWritePerMtok: 100n, multiplier: "1.000", visibility: "public",
           sortOrder: 1, defaultEffort: "low" }]]), securityEpoch: 5n });
-      const secret = "a".repeat(64), token = `oc-v3.7.${secret}`;
+      const secret = "a".repeat(64);
+      const token = `oc-v3.7.${secret}`;
       const authz = { role: "admin" as const, grantedModelIds: new Set<string>() };
       const handler = catalogHttp.makeModelCatalogHandler({ identityRepo: {
         async findActiveByHostAndBoundIp() { return { id: 7, user_id: 3, bound_ip: "127.0.0.1",
@@ -224,7 +225,8 @@ async function load(): Promise<Api> {
       }, catalog: { async assertFresh() { return snapshot; } }, loadUserModelAuthz: async () => authz,
         readEpoch: async () => 5n, loadRoutingAvailability: async () => ({ unavailableProviderIds: new Set<string>(),
           revision: "fixture-availability" }), loadAgentCostOverrides: async () => ({}) });
-      let fullFetches = 0, wireOwner: unknown;
+      let fullFetches = 0;
+      let wireOwner: unknown;
       const env = { OC_MODEL_AUTHORITY: "1", OPENCLAUDE_V3_MASTER_BASE_URL: "http://fixture.invalid",
         OPENCLAUDE_V3_CONTAINER_TOKEN: token };
       const lkgPath = join(process.env.OPENCLAUDE_HOME!, "ocv5-518-legacy-lkg.json");

@@ -36,6 +36,9 @@ import {
   type ProbeResult,
 } from './policy/registry.js'
 import { healthWeight, rankWRH } from './policy/select.js'
+import { DEFAULT_MAX_PROBE_AGE_MS, verifyProfileReadyForV4 } from './remotePool/driftCoordinator.js'
+import { resolveProbedUpstreamModel } from './remotePool/modelResolution.js'
+import { loadRemoteDriverRegistry } from './remotePool/registry.js'
 
 const execFileAsync = promisify(execFile)
 /** The controller this deployment ships; its digest is what a pool guard was installed for. */
@@ -211,6 +214,21 @@ export function toRemotePoolModelId(upstreamOrBaseId: string): string {
     .replace(/^-+|-+$/g, '')
   if (!clean) throw new Error('REMOTE_MODEL_SLUG_INVALID')
   return clean.endsWith('-remote') ? clean : `${clean}-remote`
+}
+
+export function defaultRemoteCanonicalModelId(
+  engine: RemoteBrainEngine,
+  upstreamModelId: string,
+): string {
+  const raw = upstreamModelId.trim().toLowerCase()
+  if (engine === 'antigravity') {
+    if (raw === 'gemini-pro-orchestrator') return 'antigravity-orchestrator-carbon-remote'
+    const base = raw
+      .replace(/-(?:low|medium|high|xhigh|max)$/, '')
+      .replace(/5-5$/, '5.5')
+    return toRemotePoolModelId(base.startsWith('antigravity-') ? base : `antigravity-${base}`)
+  }
+  return toRemotePoolModelId(upstreamModelId)
 }
 
 function getRemoteHostdScriptPath(): string {
@@ -803,8 +821,11 @@ function remoteNodeKeyPath(keyId: string): string {
  * The node's execution key: its authorized_keys line forces the cc5 guard, unlike the probe key
  * (forced to oc-remote-hostd). Its directory also holds the pinned known_hosts for the node.
  */
-export function remoteNodeExecKeyDir(keyId: string): string {
-  const keyDir = process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() || '/etc/openclaude/remote-pool-keys'
+export function remoteNodeExecKeyDir(keyId: string, baseKeyDir?: string): string {
+  const keyDir =
+    baseKeyDir?.trim() ||
+    process.env.OC_REMOTE_POOL_SSH_KEY_DIR?.trim() ||
+    '/etc/openclaude/remote-pool-keys'
   return join(keyDir, `${keyId}-exec`)
 }
 
@@ -1433,6 +1454,22 @@ export async function applyRemoteNodeProbeResult(
       continue
     }
     seenEngineFp.add(fpKey)
+    // Never let legacy probe payloads overwrite or delete v4-managed profiles (driver_id IS NOT NULL).
+    const v4Protected = await query<{ id: string }>(
+      `SELECT id FROM remote_agent_profiles
+        WHERE driver_id IS NOT NULL
+          AND (
+            (node_id = $1 AND engine = $2 AND profile_name = $3)
+            OR (engine = $2 AND account_fingerprint = $4)
+          )
+        LIMIT 1`,
+      [nodeId, p.engine, p.profile_name, p.account_fingerprint],
+      runner,
+    )
+    if (v4Protected.rows.length > 0) {
+      continue
+    }
+
     const normalizedWindows = (p.quota_windows ?? []).map((w) => ({
       label: w.label,
       usedPct: typeof w.usedPct === 'number' && Number.isFinite(w.usedPct) ? w.usedPct : null,
@@ -1460,6 +1497,7 @@ export async function applyRemoteNodeProbeResult(
               probe_failures = 0,
               last_error = NULL,
               updated_at = NOW()
+        WHERE remote_agent_profiles.driver_id IS NULL
        RETURNING *`,
       [
         nodeId,
@@ -1476,6 +1514,9 @@ export async function applyRemoteNodeProbeResult(
       ],
       runner,
     )
+    if (res.rows.length === 0) {
+      continue
+    }
     if (p.engine === 'codex') {
       const facts = { probe_schema_version: p.probe_schema_version, source: p.source, freshness: p.freshness,
         auth_present: p.auth_present === true, account_observed: p.account_observed === true,
@@ -1486,11 +1527,11 @@ export async function applyRemoteNodeProbeResult(
         execution_ready=CASE WHEN probe_snapshot->>'snapshot_sha256'=$3
           AND probe_snapshot->'execution_snapshot'=$4::jsonb AND $5::boolean THEN execution_ready ELSE FALSE END,
         last_error=$6,status=CASE WHEN disabled_by='admin' THEN 'disabled' WHEN $5::boolean THEN 'active' ELSE 'degraded' END
-        WHERE id=$1 RETURNING *`,
+        WHERE id=$1 AND driver_id IS NULL RETURNING *`,
       [res.rows[0]!.id, JSON.stringify(facts), p.snapshot_sha256 ?? null, JSON.stringify(p.execution_snapshot ?? null),
         p.auth_present === true && p.account_observed === true && p.models_observed === true && !p.error_code,
         p.error_code ?? p.execution_snapshot_error ?? null], runner);
-      upserted.push(mapProfileRow(updated.rows[0]!));
+      if (updated.rows[0]) upserted.push(mapProfileRow(updated.rows[0]!));
     } else upserted.push(mapProfileRow(res.rows[0]!))
   }
 
@@ -1509,6 +1550,7 @@ export async function applyRemoteNodeProbeResult(
       `SELECT id FROM remote_agent_profiles
         WHERE node_id = $1
           AND engine = $2
+          AND driver_id IS NULL
           AND NOT (profile_name = ANY($3::text[]))`,
       [nodeId, engine, activeNames],
       runner,
@@ -1531,6 +1573,7 @@ export async function applyRemoteNodeProbeResult(
       await query(
         `DELETE FROM remote_agent_profiles p
           WHERE p.id = $1
+            AND p.driver_id IS NULL
             AND NOT EXISTS (
               SELECT 1 FROM remote_agent_bindings b WHERE b.profile_id = p.id
             )`,
@@ -1544,10 +1587,10 @@ export async function applyRemoteNodeProbeResult(
   // returned no Codex profiles at all, then aggregate after *all* readiness changes are visible.
   await query(`UPDATE remote_agent_profiles SET execution_ready=FALSE,
     status=CASE WHEN disabled_by='admin' THEN 'disabled' ELSE 'degraded' END
-    WHERE node_id=$1 AND engine='codex' AND NOT (profile_name=ANY($2::text[]))`,
+    WHERE node_id=$1 AND engine='codex' AND driver_id IS NULL AND NOT (profile_name=ANY($2::text[]))`,
   [nodeId, (upsertedByEngine.get('codex') ?? []).map(p => p.profile_name)], runner)
   const affected = await query(`SELECT DISTINCT o.canonical_model_id FROM remote_model_offers o
-    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex'`, [nodeId], runner)
+    JOIN remote_agent_profiles p ON p.id=o.profile_id WHERE p.node_id=$1 AND p.engine='codex' AND p.driver_id IS NULL`, [nodeId], runner)
   for (const offer of affected.rows) {
     if (await countEligibleEnabledRemoteOffers(offer.canonical_model_id,runner) !== 0) continue
     await query(`UPDATE model_catalog SET state='disabled',pool_auto_disabled=TRUE
@@ -1561,14 +1604,15 @@ export async function countEligibleEnabledRemoteOffers(
   canonicalModelId: string,
   runner?: QueryRunner,
 ): Promise<number> {
-  const res = await query<{ cnt: string }>(
+  const legacyRes = await query<{ cnt: string }>(
     `SELECT COUNT(*)::text AS cnt
        FROM remote_model_offers o
        JOIN remote_agent_profiles p ON p.id = o.profile_id
        JOIN remote_agent_nodes n ON n.id = p.node_id
       WHERE o.canonical_model_id = $1
         AND o.enabled = TRUE
-        AND (p.engine <> 'codex' OR (p.execution_ready=TRUE AND p.runner_mode='app-server'
+        AND p.driver_id IS NULL
+        AND (p.engine NOT IN ('codex', 'antigravity') OR (p.engine = 'codex' AND p.execution_ready=TRUE AND p.runner_mode='app-server'
           AND p.execution_manifest->>'backendKind'='codex-app-server-v1'
           AND p.execution_manifest->>'authEpoch'=p.auth_epoch
           AND p.execution_manifest->>'snapshotSha256'=p.probe_snapshot->>'snapshot_sha256'
@@ -1585,7 +1629,46 @@ export async function countEligibleEnabledRemoteOffers(
     [canonicalModelId],
     runner,
   )
-  return Number(res.rows[0]?.cnt ?? 0)
+  let total = Number(legacyRes.rows[0]?.cnt ?? 0)
+
+  const v4Rows = (
+    await query<Record<string, any>>(
+      `SELECT p.*, o.upstream_model_id
+         FROM remote_model_offers o
+         JOIN remote_agent_profiles p ON p.id = o.profile_id
+         JOIN remote_agent_nodes n ON n.id = p.node_id
+        WHERE o.canonical_model_id = $1
+          AND o.enabled = TRUE
+          AND p.driver_id IS NOT NULL
+          AND p.status IN ('active', 'degraded')
+          AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
+          AND n.status IN ('active', 'degraded')
+          AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')`,
+      [canonicalModelId],
+      runner,
+    )
+  ).rows
+  if (v4Rows.length > 0) {
+    const regMap = loadRemoteDriverRegistry()
+    const nowMs = Date.now()
+    for (const row of v4Rows) {
+      const reg = regMap.get(String(row.driver_id))
+      if (!reg) continue
+      if (row.engine_id && String(row.engine_id) !== reg.engineId) continue
+      const check = verifyProfileReadyForV4(
+        row,
+        reg.driverDigest,
+        reg.coreDigest,
+        nowMs,
+        DEFAULT_MAX_PROBE_AGE_MS,
+      )
+      if (!check.ready) continue
+      if (resolveProbedUpstreamModel(String(row.driver_id), String(row.upstream_model_id), check.snapshot) !== null) {
+        total += 1
+      }
+    }
+  }
+  return total
 }
 
 /**
@@ -1691,14 +1774,16 @@ export async function publishRemoteModelOffers(
         : catalogEngine === 'codex'
           ? 'codex'
           : catalogEngine === 'antigravity'
-            ? 'gemini'
+            ? 'antigravity'
             : 'grok'
 
     const published: RemoteModelOfferView[] = []
     for (const item of input.offers) {
       const upstreamModelId = item.upstream_model_id.trim()
       const baseDisplayName = item.base_display_name.trim() || upstreamModelId
-      const canonicalModelId = toRemotePoolModelId(item.canonical_model_id ?? upstreamModelId)
+      const canonicalModelId = item.canonical_model_id
+        ? toRemotePoolModelId(item.canonical_model_id)
+        : defaultRemoteCanonicalModelId(engine, upstreamModelId)
       if (engine === 'codex' && canonicalModelId !== `${upstreamModelId}-remote`) throw new Error('CODEX_CANONICAL_MODEL_MISMATCH')
       const enabled = item.enabled !== false
       const remoteDisplayName = formatRemoteModelDisplayName(
@@ -1783,17 +1868,53 @@ export async function publishRemoteModelOffers(
         promo_label: null,
       }
 
+      const baseCatalog = await client.query<{
+        context_window: number | null
+        capability_profile: Record<string, any> | null
+      }>(
+        `SELECT context_window, capability_profile
+           FROM model_catalog
+          WHERE model_id IN ($1, $2)
+             OR (engine = $3 AND upstream_model_id = $4)
+          ORDER BY CASE WHEN model_id = $1 THEN 0 ELSE 1 END, entry_id DESC
+          LIMIT 1`,
+        [baseSlug, upstreamModelId, catalogEngine, upstreamModelId],
+      )
+      const baseCatRow = baseCatalog.rows[0]
+      const probedSnapshotModels = Array.isArray(profile.probe_snapshot?.models)
+        ? (profile.probe_snapshot.models as Array<Record<string, any>>)
+        : []
+      const probedModel = probedSnapshotModels.find(
+        (m) => String(m?.upstreamModelId ?? '') === upstreamModelId,
+      )
+      const contextWindow =
+        Number(baseCatRow?.context_window ?? 0) > 0
+          ? Number(baseCatRow!.context_window)
+          : engine === 'antigravity'
+            ? 1048576
+            : 200000
+      const baseSupportedEfforts = Array.isArray(baseCatRow?.capability_profile?.reasoning?.supported)
+        ? (baseCatRow!.capability_profile!.reasoning.supported as string[])
+        : Array.isArray(probedModel?.supportedEfforts)
+          ? (probedModel!.supportedEfforts as string[])
+          : null
+
       // A remote cc chat is a text-only interactive session on the node: no image input and no
       // effort control reach its CLI; its native context lives there (box-native-v1).
       const capabilityProfile = engine === 'codex' ? projectCodexRemoteCapabilities(profile, upstreamModelId) : {
-        supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb',
+        supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb' && catalogEngine !== 'antigravity',
         reasoning: {
-          supported: catalogEngine === 'codex' ? ['low', 'medium', 'high'] : [],
+          supported:
+            catalogEngine === 'codex'
+              ? ['low', 'medium', 'high']
+              : catalogEngine === 'antigravity'
+                ? (baseSupportedEfforts ?? ['low', 'medium', 'high'])
+                : [],
           codex_model_default: catalogEngine === 'codex' ? 'medium' : null,
         },
         ccb: {
           capability_zero: catalogEngine === 'ccb',
-          supports_thinking: catalogEngine !== 'ccb',
+          supports_thinking: catalogEngine !== 'ccb' && catalogEngine !== 'antigravity',
           ...(catalogEngine === 'ccb' ? { context_owner: 'box-native-v1' } : {}),
         },
       }
@@ -1851,9 +1972,10 @@ export async function publishRemoteModelOffers(
                     provider_id = $3,
                     upstream_model_id = $4,
                     capability_profile = $5::jsonb,
+                    context_window = $6,
                     placement = 'remote_pool'
               WHERE entry_id = $1`,
-            [entryId, catalogEngine, providerId, upstreamModelId, JSON.stringify(capabilityProfile)],
+            [entryId, catalogEngine, providerId, upstreamModelId, JSON.stringify(capabilityProfile), contextWindow],
           )
           if (aggregated.catalogState === 'active') {
             await client.query(
@@ -1883,7 +2005,7 @@ export async function publishRemoteModelOffers(
           `INSERT INTO model_catalog
              (model_id, engine, provider_id, upstream_model_id, context_window,
               capability_profile, capability_schema_version, state, placement, pool_auto_disabled)
-           VALUES ($1, $2, $3, $4, 200000, $5::jsonb, 1, 'staged', 'remote_pool', FALSE)
+           VALUES ($1, $2, $3, $4, $6, $5::jsonb, 1, 'staged', 'remote_pool', FALSE)
            RETURNING entry_id`,
           [
             canonicalModelId,
@@ -1891,6 +2013,7 @@ export async function publishRemoteModelOffers(
             providerId,
             upstreamModelId,
             JSON.stringify(capabilityProfile),
+            contextWindow,
           ],
         )
         const entryId = insCat.rows[0]!.entry_id
@@ -2038,7 +2161,7 @@ export async function preheatRemotePoolSession(
        JOIN remote_agent_nodes n ON n.id = p.node_id
       WHERE o.canonical_model_id = $1
         AND o.enabled = TRUE
-        AND (p.engine <> 'codex' OR (p.execution_ready=TRUE AND p.runner_mode='app-server'
+        AND (p.engine NOT IN ('codex', 'antigravity') OR (p.engine = 'codex' AND p.execution_ready=TRUE AND p.runner_mode='app-server'
           AND p.execution_manifest->>'backendKind'='codex-app-server-v1'
           AND p.execution_manifest->>'authEpoch'=p.auth_epoch
           AND p.execution_manifest->>'snapshotSha256'=p.probe_snapshot->>'snapshot_sha256'

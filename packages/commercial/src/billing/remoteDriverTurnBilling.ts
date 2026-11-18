@@ -77,6 +77,8 @@ const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
 const HASH_RE = /^[a-f0-9]{64}$/
 const IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const STALE_SETTLEMENT_MS = 5 * 60_000
+const NULL_RECEIPT_TERMINAL_GRACE_MS = 60_000
+const NULL_RECEIPT_VANISHED_GRACE_MS = 5 * 60_000
 
 function need(condition: unknown, code = 'REMOTE_DRIVER_BILLING_REJECTED'): asserts condition {
   if (!condition) throw new Error(code)
@@ -1441,6 +1443,176 @@ async function importDriverV4Spool(
   }
 }
 
+function hasDriverV4StoppedJournal(c: RemoteDriverJournalContextV4, root: string): boolean {
+  if (!UUID_RE.test(c.scope.operationId) || !/^[1-9][0-9]{0,15}$/.test(c.scope.generation)) {
+    return false
+  }
+  const dir = join(root, c.scope.operationId, c.scope.generation, 'journal')
+  let files: string[]
+  try {
+    files = readdirSync(dir)
+      .filter((f) => /^[0-9]{8}-stopped\.json$/.test(f))
+      .sort()
+  } catch {
+    return false
+  }
+  for (const file of files) {
+    let fd: number | undefined
+    try {
+      fd = openSync(
+        join(dir, file),
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      )
+      const st = fstatSync(fd)
+      if (
+        !st.isFile() ||
+        st.nlink !== 1 ||
+        st.size > 65_536 ||
+        Boolean(st.mode & 0o022) ||
+        st.uid !== process.getuid?.()
+      ) {
+        continue
+      }
+      const raw = JSON.parse(readFileSync(fd, 'utf8')) as { remoteStopped?: unknown }
+      if (raw?.remoteStopped === true) return true
+    } catch {
+      // Ignore unreadable or malformed candidate stop files.
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd)
+        } catch {}
+      }
+    }
+  }
+  return false
+}
+
+async function abortDeadNullReceiptDriverV4Turn(
+  pool: Pool,
+  c: RemoteDriverJournalContextV4,
+  hasStoppedJournal: boolean,
+  graceMs: number,
+): Promise<boolean> {
+  if (c.receipt !== null) return false
+  const boundedGraceMs = Math.max(0, Math.floor(graceMs))
+  const staleVanishedMs = Math.max(boundedGraceMs, NULL_RECEIPT_VANISHED_GRACE_MS)
+  const clearPendingOwner =
+    c.native !== undefined && (c.usagePolicy.mode === 'per_turn' || c.input === null)
+  const expectedBaselineJson =
+    clearPendingOwner && c.usagePolicy.mode === 'cumulative'
+      ? JSON.stringify(c.native!.baseline)
+      : null
+  const res = await pool.query<{ aborted_count: number }>(
+    `/* remote-driver-v4:null-receipt-abort */
+     WITH ev AS (
+       SELECT
+         CASE
+           WHEN d.outcome = 'interrupted' OR d.failure_code = 'USER_CANCELLED' THEN 'USER_CANCELLED'
+           ELSE 'INTERNAL_ERROR'
+         END AS journal_failure_code,
+         CASE
+           WHEN NOT $5::boolean AND NOT $6::boolean
+             AND (d.dispatch_id IS NULL OR d.outcome IS DISTINCT FROM 'completed')
+             AND (
+               b.state = 'released' OR b.expires_at <= NOW()
+               OR ac.state = 'vanished'
+               OR (d.status = 'terminal' AND d.outcome = ANY('{crashed,not_accepted,executed_error,interrupted}'::text[]))
+               OR d.producer_fenced_at IS NOT NULL
+             ) THEN 'remote_driver_v4_prehost_stopped'
+           WHEN NOT $6::boolean
+             AND (d.dispatch_id IS NULL OR d.outcome IS DISTINCT FROM 'completed')
+             AND (b.state = 'released' OR b.expires_at <= NOW() OR b.operation_id IS NULL)
+             AND (
+               $7::boolean
+               OR ac.state = 'vanished'
+               OR (d.status = 'terminal' AND d.outcome = ANY('{crashed,not_accepted,executed_error,interrupted}'::text[]))
+               OR d.producer_fenced_at IS NOT NULL
+               OR COALESCE(b.updated_at, j0.created_at) <= NOW() - ($13::bigint * INTERVAL '1 millisecond')
+             ) THEN 'remote_driver_v4_pre_dispatch_stopped'
+           WHEN $6::boolean
+             AND (d.dispatch_id IS NULL OR d.outcome IS DISTINCT FROM 'completed')
+             AND (
+               b.state = 'released' OR b.expires_at <= NOW() OR b.operation_id IS NULL
+               OR ($7::boolean AND d.status = 'terminal' AND d.outcome = ANY('{crashed,not_accepted,executed_error,interrupted}'::text[]))
+             )
+             AND (
+               $7::boolean
+               OR (d.status = 'terminal' AND d.outcome = ANY('{crashed,not_accepted,executed_error,interrupted}'::text[]))
+               OR (d.producer_fenced_at IS NOT NULL AND d.producer_fenced_at <= NOW() - ($13::bigint * INTERVAL '1 millisecond'))
+               OR (ac.state = 'vanished' AND COALESCE(ac.updated_at, j0.created_at) <= NOW() - ($14::bigint * INTERVAL '1 millisecond'))
+             ) THEN 'remote_driver_v4_terminal_null_receipt'
+           ELSE NULL
+         END AS reason
+       FROM request_finalize_journal j0
+       LEFT JOIN turn_dispatches d
+         ON d.dispatch_id = $8::uuid AND d.user_id = $2::bigint AND d.attempt_no = $9::integer
+       LEFT JOIN agent_containers ac
+         ON ac.id = $10::bigint AND ac.user_id = $2::bigint
+       LEFT JOIN remote_agent_bindings b
+         ON b.operation_id = $11::uuid AND b.generation = $12::bigint AND b.remote_protocol_version = 4
+       WHERE j0.request_id = $1
+         AND j0.user_id = $2::bigint
+         AND (ac.id IS NULL OR (ac.state IN ('active', 'vanished') AND ac.runtime_kind IN ('docker', 'desktop')))
+     ),
+     aborted AS (
+       UPDATE request_finalize_journal j
+          SET state = 'aborted',
+              final_credits = 0,
+              failure_code = ev.journal_failure_code,
+              error_msg = ev.reason,
+              updated_at = NOW()
+         FROM ev
+        WHERE j.request_id = $1
+          AND j.user_id = $2::bigint
+          AND j.ctx->>'remoteNativeBillingRecovery' = $3
+          AND j.state = 'inflight'
+          AND j.ctx->'remoteDriverV4' = $4::jsonb
+          AND j.ctx#>'{remoteDriverV4,receipt}' = 'null'::jsonb
+          AND ev.reason IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM usage_records u
+             WHERE u.request_id = j.request_id AND u.user_id = j.user_id
+          )
+        RETURNING j.request_id
+     ),
+     cleared_thread AS (
+       UPDATE remote_native_threads t
+          SET pending_request_id = NULL,
+              updated_at = NOW()
+        WHERE $15::boolean
+          AND EXISTS (SELECT 1 FROM aborted)
+          AND t.uid = $2::bigint
+          AND t.operation_id = $11::uuid
+          AND t.native_thread_id = $16::text
+          AND t.pending_request_id = $1
+          AND ($17::jsonb IS NULL OR t.total = $17::jsonb)
+        RETURNING 1
+     )
+     SELECT (SELECT COUNT(*)::int FROM aborted) AS aborted_count`,
+    [
+      c.requestId,
+      c.scope.uid,
+      REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION,
+      JSON.stringify(c),
+      c.native !== undefined,
+      c.input !== null,
+      hasStoppedJournal,
+      c.dispatchId,
+      c.attemptNo,
+      c.scope.containerDbId,
+      c.scope.operationId,
+      c.scope.generation,
+      boundedGraceMs,
+      staleVanishedMs,
+      clearPendingOwner,
+      c.native?.sessionId ?? '',
+      expectedBaselineJson,
+    ],
+  )
+  return Number(res.rows[0]?.aborted_count ?? 0) === 1
+}
+
 /**
  * Durable-receipt-only crash recovery for `remote-driver-v4` journals.
  * Never opens an SSH/model port or re-executes a turn.
@@ -1451,10 +1623,13 @@ export async function recoverRemoteDriverTurnBilling(
     limit?: number
     settle?: typeof settleUsageAndLedger
     evidenceRoot?: string
+    nullReceiptGraceMs?: number
     preloadedRows?: Array<JournalRow & { request_id: string; user_id: string }>
   } = {},
 ): Promise<{ proven: number; pending: number }> {
   const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 25)))
+  const evidenceRoot = options.evidenceRoot ?? '/var/lib/openclaude/remote-native'
+  const nullReceiptGraceMs = options.nullReceiptGraceMs ?? NULL_RECEIPT_TERMINAL_GRACE_MS
   const rows =
     options.preloadedRows ??
     (
@@ -1485,37 +1660,19 @@ export async function recoverRemoteDriverTurnBilling(
     try {
       const c = parseContextV4(row.ctx.remoteDriverV4)
       need(c.requestId === row.request_id && c.scope.uid === row.user_id)
-      await importDriverV4Spool(
-        deps.pool,
-        c,
-        options.evidenceRoot ?? '/var/lib/openclaude/remote-native',
-      )
-      if (!c.receipt && !c.input && !c.native) {
-        const aborted = await deps.pool.query(
-          `UPDATE request_finalize_journal j
-              SET state = 'aborted',
-                  final_credits = 0,
-                  failure_code = 'INTERNAL_ERROR',
-                  error_msg = 'remote_driver_v4_prehost_stopped',
-                  updated_at = NOW()
-            WHERE request_id = $1
-              AND user_id = $2
-              AND state = 'inflight'
-              AND ctx->'remoteDriverV4' = $3::jsonb
-              AND EXISTS (
-                SELECT 1 FROM remote_agent_bindings b
-                 WHERE b.operation_id = $4
-                   AND b.generation = $5
-                   AND b.remote_protocol_version = 4
-                   AND b.state = 'released'
-              )`,
-          [c.requestId, c.scope.uid, JSON.stringify(c), c.scope.operationId, c.scope.generation],
-        )
-        if (aborted.rowCount === 1) {
-          await releaseSoftReservation(deps.preCheckRedis, c, deps.log)
-          proven++
-          continue
-        }
+      await importDriverV4Spool(deps.pool, c, evidenceRoot)
+      if (
+        !c.receipt &&
+        (await abortDeadNullReceiptDriverV4Turn(
+          deps.pool,
+          c,
+          hasDriverV4StoppedJournal(c, evidenceRoot),
+          nullReceiptGraceMs,
+        ))
+      ) {
+        await releaseSoftReservation(deps.preCheckRedis, c, deps.log)
+        proven++
+        continue
       }
       if (!c.receipt) {
         await deps.pool.query(

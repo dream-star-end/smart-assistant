@@ -1,3 +1,4 @@
+import * as routeContext from '../billing/antigravityRouteContext.js'
 /**
  * Antigravity relay (OCV5-415 P2): route binding, method/model allowlists,
  * token injection, per-call metering, budget stop, interim pool policy and
@@ -15,6 +16,7 @@ import { afterEach, describe, test } from 'node:test'
 
 import {
   type AntigravityPoolOutcome,
+  antigravityAccountSupportsModel,
   classifyAntigravityUpstream,
   parseRetryAfterMs,
   toPoolOutcome,
@@ -1383,4 +1385,91 @@ describe('P1 real HTTP transport (no Google traffic)', () => {
       }
     })
   }
+})
+
+
+test('INC-20261112-AGY-ROUTE-LIFETIME: authority outage is 503 and never invokes upstream', async () => {
+  const token = await mintRoute()
+  const res = await relay(`${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:loadCodeAssist`,
+    { body: '{}' }, { status: 200, body: ['{}'] },
+    { resolveRoute: async () => { throw new Error('PG unavailable') } })
+  assert.equal(res.status, 503)
+  assert.match(res.text, /ANTIGRAVITY_AUTHORITY_UNAVAILABLE/)
+  assert.equal(res.captured.calls, 0)
+})
+
+
+test('INC-20261112-AGY-ROUTE-LIFETIME: actual resolver keeps an authorized turn beyond the old ceiling', async () => {
+  _resetAntigravityRelayRoutesForTests()
+  // Optional only so this exact regression can execute on the unfixed parent.
+  // The HTTP+PG+Redis integration suite proves the real authorization source.
+  routeContext.configureAntigravityRelayAuthority?.(async () => 'active')
+  try {
+    const minted = await mintAntigravityRelayRoute({ containerId: 11, userId: 42,
+      requestId: REQUEST_ID, modelId: 'antigravity-gemini-3.8-flash', accountId: 7n,
+      budgetCredits: 1000n, relayPort: 18789, nowMs: 0 })
+    for (let minute = 31; minute <= 496; minute += 31) {
+      assert.ok(await resolveAntigravityRelayRoute({ token: minted.token, containerId: 11,
+        userId: 42, nowMs: minute * 60_000 }), `active route must survive ${minute} minutes`)
+    }
+  } finally { _resetAntigravityRelayRoutesForTests() }
+})
+
+describe('Orchestrator Carbon relay worker allowlist and directory eligibility (OCV5-783)', () => {
+  test('antigravity-orchestrator-carbon route forwards planner + gemini-flash-worker-agy + aux while isolating other routes', async () => {
+    const orchToken = await mintRoute('antigravity-orchestrator-carbon')
+    for (const upstreamModel of ['gemini-pro-orchestrator', 'gemini-flash-worker-agy', 'gemini-3.5-flash-lite']) {
+      const { status, captured } = await relay(
+        `${ANTIGRAVITY_RELAY_PREFIX}/route/${orchToken}/v1internal:streamGenerateContent?alt=sse`,
+        { body: generateBody(upstreamModel) },
+        { status: 200, body: SSE },
+      )
+      assert.equal(status, 200, `expected 200 for ${upstreamModel} on orchestrator route`)
+      assert.equal(captured.usage[0]?.upstreamModel, upstreamModel)
+      assert.equal(captured.usage[0]?.routeModelId, 'antigravity-orchestrator-carbon')
+    }
+
+    const forbiddenOnOrch = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${orchToken}/v1internal:streamGenerateContent?alt=sse`,
+      { body: generateBody('gemini-4-carbon-high') },
+      { status: 200, body: SSE },
+    )
+    assert.equal(forbiddenOnOrch.status, 403)
+    assert.match(forbiddenOnOrch.text, /ANTIGRAVITY_MODEL_NOT_ALLOWED/)
+
+    const carbonToken = await mintRoute('antigravity-gemini-4-carbon')
+    const workerOnCarbon = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${carbonToken}/v1internal:streamGenerateContent?alt=sse`,
+      { body: generateBody('gemini-flash-worker-agy') },
+      { status: 200, body: SSE },
+    )
+    assert.equal(workerOnCarbon.status, 403)
+    assert.match(workerOnCarbon.text, /ANTIGRAVITY_MODEL_NOT_ALLOWED/)
+  })
+
+  test('antigravityAccountSupportsModel checks directory gemini-pro-orchestrator without requiring internal worker alias', () => {
+    const now = Date.parse('2026-11-17T15:00:00Z')
+    const ultraDirectory = {
+      'gemini-pro-orchestrator': { remainingFraction: 0.87, resetTime: '2026-11-17T16:06:05Z' },
+    }
+    assert.equal(antigravityAccountSupportsModel(ultraDirectory, 'antigravity-orchestrator-carbon', now), true)
+    assert.equal(antigravityAccountSupportsModel({}, 'antigravity-orchestrator-carbon', now), false)
+    assert.equal(antigravityAccountSupportsModel(null, 'antigravity-orchestrator-carbon', now), false)
+    assert.equal(
+      antigravityAccountSupportsModel(
+        { 'gemini-pro-orchestrator': { remainingFraction: 0, resetTime: '2026-11-17T16:06:05Z' } },
+        'antigravity-orchestrator-carbon',
+        now,
+      ),
+      false,
+    )
+    assert.equal(
+      antigravityAccountSupportsModel(
+        { 'gemini-pro-orchestrator': { remainingFraction: 0, resetTime: '2026-11-17T14:00:00Z' } },
+        'antigravity-orchestrator-carbon',
+        now,
+      ),
+      true,
+    )
+  })
 })

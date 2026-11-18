@@ -96,12 +96,12 @@ test("OCV5-488 a child left in the CLI's session keeps the run alive in any cwd"
 test("a bad stop.ready handshake does not block the process scan", async () => {
   const NL = String.fromCharCode(10);
   const { nonce, proof, remove } = runDirs();
-  const keeper = spawn("/usr/bin/python3", ["-I", "-c", "import time" + NL + "while True:time.sleep(.1)",
+  const keeper = spawn("/usr/bin/python3", ["-I", "-c", `import time${NL}while True:time.sleep(.1)`,
     "--proof-dir", proof], { cwd: "/tmp", stdio: "ignore" });
   try {
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
     const bodies = [
-      "not json" + NL,
+      `not json${NL}`,
       JSON.stringify({ runNonce: "c".repeat(24), cliPid: 4242 }) + NL,
       JSON.stringify({ runNonce: nonce, cliPid: "4242" }) + NL,
     ];
@@ -113,7 +113,7 @@ test("a bad stop.ready handshake does not block the process scan", async () => {
     }
     keeper.kill("SIGKILL");
     await exited(keeper);
-    for (const body of ["not json" + NL, JSON.stringify({ runNonce: nonce, cliPid: "4242" }) + NL]) {
+    for (const body of [`not json${NL}`, JSON.stringify({ runNonce: nonce, cliPid: "4242" }) + NL]) {
       writeFileSync(`${proof}/stop.ready`, body, { mode: 0o600 });
       assert.deepEqual(probe(nonce).parsed, { state: "absent", boot: BOOT }, body);
     }
@@ -126,11 +126,11 @@ test("a bad stop.ready handshake does not block the process scan", async () => {
 test("a stat-only terminal.json plus a bad stop.ready does not skip the process scan", async () => {
   const NL = String.fromCharCode(10);
   const { nonce, proof, remove } = runDirs();
-  const keeper = spawn("/usr/bin/python3", ["-I", "-c", "import time" + NL + "while True:time.sleep(.1)",
+  const keeper = spawn("/usr/bin/python3", ["-I", "-c", `import time${NL}while True:time.sleep(.1)`,
     "--proof-dir", proof], { cwd: "/tmp", stdio: "ignore" });
   try {
-    writeFileSync(`${proof}/terminal.json`, "{}" + NL, { mode: 0o644 });
-    writeFileSync(`${proof}/stop.ready`, "not json" + NL, { mode: 0o600 });
+    writeFileSync(`${proof}/terminal.json`, `{}${NL}`, { mode: 0o644 });
+    writeFileSync(`${proof}/stop.ready`, `not json${NL}`, { mode: 0o600 });
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
     assert.deepEqual(probe(nonce).parsed, { state: "alive", boot: BOOT });
     keeper.kill("SIGKILL");
@@ -158,8 +158,8 @@ test("OCV5-488 identities are validated and only the exact line is evidence", ()
 const EPOCH = "b".repeat(32);
 
 function workerComplete(nonce: string, leaseEpoch: string, extra?: Record<string, unknown>) {
-  return JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch,
-    reason: "worker_complete", revision: 1, runNonce: nonce, ...extra }) + "\n";
+  return `${JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch,
+    reason: "worker_complete", revision: 1, runNonce: nonce, ...extra })}\n`;
 }
 
 function plantProof(proof: string, body: string, mode: number) {
@@ -175,14 +175,14 @@ test("a valid worker_complete proof is terminal after its process has exited", (
     const out = probe(nonce, undefined, EPOCH);
     assert.equal(out.status, 0, out.stdout);
     assert.deepEqual(out.parsed, { state: "terminal", boot: BOOT });
-    plantProof(proof, JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch: EPOCH,
-      reason: "keeper_stopped", revision: 1, runNonce: nonce }) + "\n", 0o600);
+    plantProof(proof, `${JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch: EPOCH,
+      reason: "keeper_stopped", revision: 1, runNonce: nonce })}\n`, 0o600);
     assert.equal(probe(nonce, undefined, EPOCH).parsed?.state, "terminal");
-    plantProof(proof, JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch: EPOCH,
-      reason: "worker_failed", revision: 2, runNonce: nonce, workerExitCode: 7 }) + "\n", 0o600);
+    plantProof(proof, `${JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch: EPOCH,
+      reason: "worker_failed", revision: 2, runNonce: nonce, workerExitCode: 7 })}\n`, 0o600);
     assert.equal(probe(nonce, undefined, EPOCH).parsed?.state, "terminal");
-    plantProof(proof, JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch: EPOCH,
-      reason: "worker_failed", revision: 2, runNonce: nonce, workerExitCode: 0 }) + "\n", 0o600);
+    plantProof(proof, `${JSON.stringify({ cliPid: 123, keeperPid: 456, leaseEpoch: EPOCH,
+      reason: "worker_failed", revision: 2, runNonce: nonce, workerExitCode: 0 })}\n`, 0o600);
     assert.deepEqual(probe(nonce, undefined, EPOCH).parsed, { state: "absent", boot: BOOT });
   } finally { remove(); }
 });

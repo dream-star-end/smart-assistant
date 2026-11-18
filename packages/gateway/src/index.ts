@@ -88,6 +88,7 @@ export * from './modelAuthority.js'
 // (两包不互相 import 生产代码),漂移由 commercial 的 parity 测试硬断言锁定。
 export {
   AUTHORITY_HEADER,
+  DEFAULT_CONFIG_CHANGED_COOLDOWN_MS,
   LOCAL_CATALOG_HEADER,
   LOCAL_CATALOG_KIND,
   MODEL_CATALOG_EPOCH_PATH,
@@ -99,7 +100,9 @@ export {
   getLocalCatalogToken,
   getLocalCatalogView,
   getModelCatalogClient,
+  invalidateModelCatalogOnConfigChanged,
   parseCatalogResponse,
+  triggerLocalCatalogRefreshOnConfigChanged,
   type LocalCatalogModel,
   type LocalCatalogView,
 } from './modelCatalogClient.js'

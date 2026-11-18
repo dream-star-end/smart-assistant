@@ -93,7 +93,7 @@ test('backend has the probe reply but the UI never settles -> hard fail after th
 })
 
 test('zero tolerance stays: failure signature, alert row and missing probe all fail', { timeout: 60_000 }, async () => {
-  const sig = await run(page([[0, userRow(MARKER) + '<div>发送失败</div>' + SEND]]))
+  const sig = await run(page([[0, `${userRow(MARKER)}<div>发送失败</div>${SEND}`]]))
   assert.match(sig.ok ? '' : sig.err.message, /发送失败签名出现/)
   const alert = await run(page([[0, userRow(MARKER) + asst(PROBE, '<div role="alert">x</div>') + SEND]]))
   assert.match(alert.ok ? '' : alert.err.message, /错误\/空轮\/截断/)

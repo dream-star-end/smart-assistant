@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -332,3 +332,129 @@ test('R1 real supervisor late proof permits close retry but never another tool e
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test(
+  'Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)',
+  { timeout: 180000 },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cc5-no-ps-timeout-'))
+    const cwd = join(root, 'cwd')
+    const home = join(root, 'home')
+    const noPsBin = join(root, 'bin')
+    mkdirSync(cwd)
+    mkdirSync(home)
+    mkdirSync(noPsBin)
+
+    // Populate PATH with essential shell utilities while strictly omitting `ps`,
+    // matching the production user container (`oc-v5-u*`) environment.
+    for (const cmd of ['bash', 'sh', 'sleep', 'python3', 'env']) {
+      for (const dir of ['/usr/local/bin', '/usr/bin', '/bin']) {
+        const candidate = join(dir, cmd)
+        if (existsSync(candidate)) {
+          symlinkSync(candidate, join(noPsBin, cmd))
+          break
+        }
+      }
+    }
+    assert.equal(existsSync(join(noPsBin, 'ps')), false, 'fixture PATH must not contain ps')
+
+    const lifecycleId = randomUUID()
+    const host = new Cc5ToolHost(
+      root,
+      lifecycleId,
+      { cwd, mcpConfigPath: null, settingsPath: null, disallowedTools: [] },
+      undefined,
+      {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: join(home, '.claude'),
+        PATH: noPsBin,
+        LANG: 'C.UTF-8',
+        CI: 'true',
+      },
+    )
+
+    let grandchildPid = 0
+    try {
+      const grandchildPidFile = join(cwd, 'escaped-grandchild.pid')
+      const pyScript = [
+        'import os, time',
+        'os.setsid()',
+        `open(${JSON.stringify(grandchildPidFile)}, 'w').write(str(os.getpid()))`,
+        'time.sleep(30)',
+      ].join('; ')
+
+      const timedOut = await within(
+        host.execute(
+          'Bash',
+          {
+            command: `echo BEFORE_TIMEOUT_OK; python3 -c ${JSON.stringify(pyScript)} & sleep 10`,
+            timeout: 1200,
+          },
+          identity('bash-timeout-no-ps-1'),
+        ),
+        25000,
+        'timed-out Bash call without ps',
+      )
+
+      assert.match(text(timedOut), /Command timed out/i, `expected timeout message, got: ${text(timedOut)}`)
+      assert.match(text(timedOut), /BEFORE_TIMEOUT_OK/, `partial stdout before timeout must be preserved: ${text(timedOut)}`)
+
+      const tools = await host.tools()
+      const bashTool = tools.find((tool) => tool.name === 'Bash')
+      assert.ok(bashTool, 'Bash tool must be listed')
+      assert.match(
+        bashTool.description,
+        /By default, your command will timeout after 600000ms \(10 minutes\)\./,
+        `Cc5ToolHost must default Bash timeout to 10 minutes (600000ms); got: ${bashTool.description.slice(0, 500)}`,
+      )
+
+      grandchildPid = Number.parseInt(readFileSync(grandchildPidFile, 'utf8').trim(), 10)
+      assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 1, `expected valid grandchild pid, got ${grandchildPid}`)
+
+      // Under cc5-toolhost-supervisor's PR_SET_CHILD_SUBREAPER, a killed grandchild becomes
+      // either ESRCH or a 'Z' zombie until host.close() reaps adopted children.
+      let grandchildDead = false
+      for (let i = 0; i < 25; i++) {
+        try {
+          process.kill(grandchildPid, 0)
+          const statText = readFileSync(`/proc/${grandchildPid}/stat`, 'utf8')
+          const state = statText.slice(statText.lastIndexOf(')') + 1).trimStart().split(/\s+/)[0]
+          if (state === 'Z' || state === 'X') {
+            grandchildDead = true
+            break
+          }
+          await new Promise((r) => setTimeout(r, 40))
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ESRCH' || (err as NodeJS.ErrnoException).code === 'ENOENT') {
+            grandchildDead = true
+            break
+          }
+        }
+      }
+      assert.equal(grandchildDead, true, `setsid grandchild pid ${grandchildPid} must be dead on timeout`)
+
+      // Most importantly: Cc5ToolHost must still be alive and serve follow-up tool calls in the same turn!
+      const followUp = await within(
+        host.execute(
+          'Bash',
+          { command: 'echo HOST_STILL_ALIVE_777' },
+          identity('bash-followup-2'),
+        ),
+        15000,
+        'follow-up Bash call on same Cc5ToolHost',
+      )
+      assert.equal(followUp.isError, false, text(followUp))
+      assert.match(text(followUp), /HOST_STILL_ALIVE_777/)
+
+      await host.close()
+      assert.throws(
+        () => process.kill(grandchildPid, 0),
+        { code: 'ESRCH' },
+        'supervisor close() must reap the killed zombie grandchild to ESRCH',
+      )
+    } finally {
+      await host.close().catch(() => {})
+      rmSync(root, { recursive: true, force: true })
+    }
+  },
+)

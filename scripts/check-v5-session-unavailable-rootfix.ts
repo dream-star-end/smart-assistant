@@ -856,13 +856,15 @@ await runTapProof({
     'rejects an attachment code that is not the parsed byte count',
     'rejects a historical return hidden after an unconditional return',
     'rejects a local function shadowing the protocol helper',
+    'rejects a local function shadowing parseIdleRecoveryPending',
+    'rejects an idle-recovery template literal that does not interpolate the parsed minutes',
     'rejects an enrichment fence that no longer stops a terminalized turn',
     'rejects malformed source instead of accepting a partial parse',
   ],
   label: 'turn-dispatch-receipt-coverage',
   timeoutMs: 120_000,
 })
-console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 20 exact cases')
+console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 22 exact cases')
 
 await runTapProof({
   fromRoot: candidateRoot,
@@ -1239,3 +1241,25 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[antigravity-durable-delivery] PASS — executed terminal/native fallback, one subprocess/side effect/settlement and durable SQLite reopen')
+
+// INC-20261112-AGY-ROUTE-LIFETIME: actual adapter/process keepalive and Stop.
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/antigravityAdapter.test.ts'],
+  expected: ['INC-20261112-AGY-ROUTE-LIFETIME: live silent tool renews exact route and Stop ends heartbeat'],
+  namePattern: 'INC-20261112-AGY-ROUTE-LIFETIME',
+  label: 'antigravity-route-heartbeat',
+  timeoutMs: 120_000,
+})
+console.log('[antigravity-route-heartbeat] PASS — executed live silent tool heartbeat and Stop; local process proof, not paid live inference')
+
+// INC-20260920-CC-BETA-FALLBACK-CREDIT: real loopback HTTP through the proxy.
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/commercial/src/__tests__/anthropicProxy.integ.test.ts'],
+  expected: ['INC-20260920-CC-BETA-FALLBACK-CREDIT: HTTP beta forwarding delivers SSE and rejects unknown beta'],
+  namePattern: 'INC-20260920-CC-BETA-FALLBACK-CREDIT',
+  label: 'cc-fallback-beta-http',
+  timeoutMs: 120_000,
+})
+console.log('[cc-fallback-beta-http] PASS — loopback HTTP delivers SSE with allowed beta and blocks unknown beta; repositories are fixtures, not production ledger proof')

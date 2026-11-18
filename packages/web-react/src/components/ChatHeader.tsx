@@ -3,7 +3,9 @@ import {
   Bell,
   ChevronDown,
   FolderOpen,
+  Loader2,
   Menu,
+  MessageCircleQuestion,
   MoreHorizontal,
   PanelLeft,
   PanelRight,
@@ -44,6 +46,12 @@ export function modKeyLabel(): string {
   return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌘" : "Ctrl+";
 }
 
+export function altKeyLabel(): string {
+  if (typeof navigator === "undefined") return "Alt+";
+  const platform = `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`;
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌥" : "Alt+";
+}
+
 export function ChatHeader({
   agent,
   onAgentClick,
@@ -78,6 +86,9 @@ export function ChatHeader({
   onOpenInbox,
   onOpenFind,
   onShare,
+  onToggleQuickAsk,
+  quickAskOpen = false,
+  quickAskSending = false,
   onTogglePane,
   paneOpen = false,
   unreadCount,
@@ -143,6 +154,10 @@ export function ChatHeader({
   onOpenFind?: () => void;
   /** 打开「分享会话」(长图 + 文字,OCV5-369;省略则不渲染,如 demo)。窄屏收进「更多操作」菜单。 */
   onShare?: () => void;
+  /** 开合同屏伴随「快问小窗」。省略则不渲染。 */
+  onToggleQuickAsk?: () => void;
+  quickAskOpen?: boolean;
+  quickAskSending?: boolean;
   /** 开合详情面板(右侧第三栏)。省略则不渲染(demo / 空会话 / 任务看板)。手机上入口在过程摘要行。 */
   onTogglePane?: () => void;
   paneOpen?: boolean;
@@ -478,6 +493,24 @@ export function ChatHeader({
             {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。 */}
             <span className="hidden sm:inline">{formatCredits(credits)}</span>
           </button>
+        )}
+        {onToggleQuickAsk && (
+          <IconButton
+            data-product-control="quick-ask"
+            data-testid="quick-ask-toggle"
+            onClick={onToggleQuickAsk}
+            aria-label="快问小窗"
+            aria-pressed={quickAskOpen}
+            title={`${quickAskOpen ? "收起" : "打开"}快问小窗：并行问答不打断主线 (${altKeyLabel()}K)`}
+            shape="square"
+            className={quickAskOpen ? "bg-hover text-fg" : undefined}
+          >
+            {quickAskSending && !quickAskOpen ? (
+              <Loader2 size={18} className="animate-spin text-accent" />
+            ) : (
+              <MessageCircleQuestion size={18} />
+            )}
+          </IconButton>
         )}
         {onTogglePane && (
           <IconButton

@@ -22,10 +22,10 @@ export function insist(condition: unknown, code: string): asserts condition {
 }
 export function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   const object = value as JsonObject;
-  return "{" + Object.keys(object).sort().map((key) =>
-    JSON.stringify(key) + ":" + canonical(object[key])).join(",") + "}";
+  return `{${Object.keys(object).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonical(object[key])}`).join(",")}}`;
 }
 export function digest(value: unknown): string {
   return createHash("sha256").update(canonical(value)).digest("hex");
@@ -97,7 +97,7 @@ export async function verifyLocalLease(
   const manual = (await trustedRootFile(paths.manualNonce)).toString().trim();
   insist(common === nonce && manual === nonce, "STALE_INVOCATION_NONCE");
   const proof: JsonObject = JSON.parse(
-    (await trustedRootFile(paths.commonNonce + ".db")).toString());
+    (await trustedRootFile(`${paths.commonNonce}.db`)).toString());
   insist(proof.schema === 1 && proof.nonce === nonce, "ADMISSION_PROOF_SCHEMA_NONCE");
   const pid = proof.holderPid;
   insist(typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1,
@@ -106,19 +106,19 @@ export async function verifyLocalLease(
     "HOLDER_START_REQUIRED");
   insist(typeof proof.expiresAt === "number" && Number.isSafeInteger(proof.expiresAt) &&
     Math.floor(Date.now() / 1000) < proof.expiresAt, "LEASE_EXPIRED");
-  const kernel = await readFile("/proc/" + pid + "/stat", "utf8");
+  const kernel = await readFile(`/proc/${pid}/stat`, "utf8");
   const close = kernel.lastIndexOf(") ");
-  insist(close > 0 && kernel.startsWith(String(pid) + " ("), "HOLDER_STAT_IDENTITY");
+  insist(close > 0 && kernel.startsWith(`${String(pid)} (`), "HOLDER_STAT_IDENTITY");
   const fields = kernel.slice(close + 2).trim().split(/\s+/);
   insist(!["Z", "X", "x", "T", "t"].includes(fields[0]) &&
     fields[19] === proof.holderStart, "HOLDER_DEAD_OR_REUSED");
   process.kill(pid, 0);
-  const fd9 = await stat("/proc/" + pid + "/fd/9", { bigint: true });
+  const fd9 = await stat(`/proc/${pid}/fd/9`, { bigint: true });
   const lock = await stat(paths.lock, { bigint: true });
   insist(fd9.isFile() && fd9.dev === lock.dev && fd9.ino === lock.ino &&
-    proof.lockDevIno === fd9.dev.toString() + ":" + fd9.ino.toString(),
+    proof.lockDevIno === `${fd9.dev.toString()}:${fd9.ino.toString()}`,
     "HOLDER_FD9_LOCK_IDENTITY");
-  const fdInfo = await readFile("/proc/" + pid + "/fdinfo/9", "utf8");
+  const fdInfo = await readFile(`/proc/${pid}/fdinfo/9`, "utf8");
   insist(/^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\s+/m.test(fdInfo),
     "HOLDER_FD9_ACTUAL_EXCLUSIVE_FLOCK_REQUIRED");
   const identity = await primaryIdentity(db);
@@ -143,7 +143,7 @@ export async function permissionPreflight(db: Database): Promise<JsonObject> {
   for (const [table, privilege] of tableNeeds) {
     const result = await db.query<{ ok: boolean }>(
       "SELECT has_table_privilege(current_user,$1,$2) AS ok", [table, privilege]);
-    if (result.rows[0]?.ok !== true) denied.push(table + ":" + privilege);
+    if (result.rows[0]?.ok !== true) denied.push(`${table}:${privilege}`);
   }
   for (const signature of [
     "pg_catalog.pg_control_system()",
@@ -160,7 +160,7 @@ export async function permissionPreflight(db: Database): Promise<JsonObject> {
   if (sequence.rows[0]?.ok !== true) denied.push("admin_audit_id_seq:USAGE");
   const identity = await db.query<{ current_user: string; session_user: string }>(
     "SELECT current_user,session_user");
-  insist(denied.length === 0, "OPERATOR_PRIVILEGES_INSUFFICIENT:" + denied.join(","));
+  insist(denied.length === 0, `OPERATOR_PRIVILEGES_INSUFFICIENT:${denied.join(",")}`);
   return identity.rows[0];
 }
 
@@ -171,11 +171,11 @@ export async function writeLocks(db: Database, runId: string): Promise<void> {
   validateRunId(runId);
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [COMMON_FENCE]);
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
-    ["openclaude:v5:ocv5-308:run:" + runId]);
+    [`openclaude:v5:ocv5-308:run:${runId}`]);
   const state = await db.query("SELECT singleton FROM deploy_state WHERE singleton FOR UPDATE");
   insist(state.rows.length === 1, "DEPLOY_STATE_SINGLETON_REQUIRED");
   for (const table of LOCK_TABLES) {
-    await db.query("LOCK TABLE " + table + " IN SHARE ROW EXCLUSIVE MODE");
+    await db.query(`LOCK TABLE ${table} IN SHARE ROW EXCLUSIVE MODE`);
   }
 }
 
@@ -185,7 +185,7 @@ export async function reconciliationLocks(db: Database, runId: string): Promise<
   await db.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [COMMON_FENCE]);
   try {
     await db.query("SELECT pg_advisory_lock(hashtextextended($1,0))",
-      ["openclaude:v5:ocv5-308:run:" + runId]);
+      [`openclaude:v5:ocv5-308:run:${runId}`]);
   } catch (error) {
     await db.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [COMMON_FENCE]);
     throw error;
@@ -194,7 +194,7 @@ export async function reconciliationLocks(db: Database, runId: string): Promise<
 export async function releaseReconciliationLocks(db: Database, runId: string): Promise<void> {
   try {
     await db.query("SELECT pg_advisory_unlock(hashtextextended($1,0))",
-      ["openclaude:v5:ocv5-308:run:" + runId]);
+      [`openclaude:v5:ocv5-308:run:${runId}`]);
   } finally {
     await db.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [COMMON_FENCE]);
   }
@@ -219,7 +219,7 @@ export async function releaseIdentity(
   insist(result.rows.length === 1 && result.rows[0].phase === "stable", "STABLE_RELEASE_REQUIRED");
   const state = result.rows[0];
   insist(typeof state.active_release === "string" &&
-    resolve(state.active_release).startsWith(resolve(releasesRoot) + "/") &&
+    resolve(state.active_release).startsWith(`${resolve(releasesRoot)}/`) &&
     await realpath(state.active_release) === resolve(state.active_release), "TRUSTED_RELEASE_PATH");
   const markerBytes = await trustedRootFile(join(state.active_release, ".complete"), false);
   const metadata = await trustedRootFile(join(state.active_release, "deploy/v5/release-metadata.json"), false);
@@ -332,11 +332,11 @@ function one(rows: Row[], predicate: (row: Row) => boolean, code: string): Row {
 }
 function active(snapshot: Snapshot, modelId: string): Row {
   return one(snapshot.tables.model_catalog, (row) => row.model_id === modelId &&
-    row.state === "active", "ONE_ACTIVE_ENTRY_REQUIRED:" + modelId);
+    row.state === "active", `ONE_ACTIVE_ENTRY_REQUIRED:${modelId}`);
 }
 function price(snapshot: Snapshot, modelId: string): Row {
   return one(snapshot.tables.model_pricing, (row) => row.model_id === modelId,
-    "ONE_PRICE_REQUIRED:" + modelId);
+    `ONE_PRICE_REQUIRED:${modelId}`);
 }
 export function validateManifest(manifest: ModelManifest): void {
   const ids = manifest.new_models.map((row) => row.model_id);
@@ -362,8 +362,7 @@ export async function readSnapshot(db: Database): Promise<Snapshot> {
   };
   for (const table of LOCK_TABLES) {
     const result = await db.query<{ rows: Row[] }>(
-      "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY " + order[table] +
-      "),'[]'::jsonb) AS rows FROM " + table + " t");
+      `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY ${order[table]}),'[]'::jsonb) AS rows FROM ${table} t`);
     tables[table] = result.rows[0].rows;
   }
   const epoch = await db.query<{ epoch: string }>(
@@ -379,18 +378,18 @@ export function assertPrepared(snapshot: Snapshot, manifest: ModelManifest): voi
   const ids = manifest.new_models.map((row) => row.model_id);
   for (const spec of manifest.new_models) {
     const row = one(snapshot.tables.model_catalog, (item) => item.model_id === spec.model_id,
-      "ONE_PREPARED_ENTRY_REQUIRED:" + spec.model_id);
-    insist(row.state === "staged", "NEW_MODEL_MUST_BE_STAGED:" + spec.model_id);
+      `ONE_PREPARED_ENTRY_REQUIRED:${spec.model_id}`);
+    insist(row.state === "staged", `NEW_MODEL_MUST_BE_STAGED:${spec.model_id}`);
     expectedVersion(row.lock_version);
     same(pick(row, CATALOG_BUSINESS_KEYS), pick(spec, CATALOG_BUSINESS_KEYS),
-      "PREPARED_DESCRIPTOR_DRIFT:" + spec.model_id);
+      `PREPARED_DESCRIPTOR_DRIFT:${spec.model_id}`);
     const pricing = price(snapshot, spec.model_id);
     expectedVersion(pricing.lock_version);
     same(pick(pricing, [...PRICE_BUSINESS_KEYS, "sort_order", "default_effort"]),
       pick(spec, [...PRICE_BUSINESS_KEYS, "sort_order", "default_effort"]),
-      "PREPARED_PRICE_DRIFT:" + spec.model_id);
+      `PREPARED_PRICE_DRIFT:${spec.model_id}`);
     insist(pricing.enabled === false && pricing.visibility === "public" &&
-      pricing.min_plan_code === null, "PREPARED_VISIBILITY_DRIFT:" + spec.model_id);
+      pricing.min_plan_code === null, `PREPARED_VISIBILITY_DRIFT:${spec.model_id}`);
     const donors = snapshot.tables.account_groups.filter((group) =>
       group.enabled === true && group.provider === spec.group_provider &&
       group.kind === "official_oauth" &&
@@ -399,7 +398,7 @@ export function assertPrepared(snapshot: Snapshot, manifest: ModelManifest): voi
     insist(donors.length > 0 && donors.some((group) =>
       snapshot.tables.account_group_models.some((binding) =>
         binding.group_id === group.id && binding.model_id === spec.group_key)),
-      "LIVE_COMMERCIAL_DONOR_BINDING_REQUIRED:" + spec.model_id);
+      `LIVE_COMMERCIAL_DONOR_BINDING_REQUIRED:${spec.model_id}`);
   }
   insist(snapshot.tables.model_visibility_grants.every((row) => !ids.includes(row.model_id)),
     "NEW_MODEL_UNEXPECTED_PERMISSION");
@@ -410,9 +409,9 @@ export function assertPrepared(snapshot: Snapshot, manifest: ModelManifest): voi
     oldIds, "FROZEN_OLD_AVAILABILITY_DRIFT");
   for (const old of manifest.existing_active_enabled) {
     same(pick(active(snapshot, old.catalog.model_id), CATALOG_BUSINESS_KEYS),
-      pick(old.catalog, CATALOG_BUSINESS_KEYS), "FROZEN_OLD_DESCRIPTOR_DRIFT:" + old.catalog.model_id);
+      pick(old.catalog, CATALOG_BUSINESS_KEYS), `FROZEN_OLD_DESCRIPTOR_DRIFT:${old.catalog.model_id}`);
     same(pick(price(snapshot, old.catalog.model_id), PRICING_BUSINESS_KEYS),
-      pick(old.pricing, PRICING_BUSINESS_KEYS), "FROZEN_OLD_PRICE_OR_PERMISSION_DRIFT:" + old.catalog.model_id);
+      pick(old.pricing, PRICING_BUSINESS_KEYS), `FROZEN_OLD_PRICE_OR_PERMISSION_DRIFT:${old.catalog.model_id}`);
   }
   insist(price(snapshot, "gpt-6-astra-1m").enabled === false &&
     snapshot.tables.model_catalog.every((row) =>
@@ -482,10 +481,7 @@ async function setGrokPrice(db: Database, target: Row, before: Row): Promise<voi
   const expected = expectedVersion(before.lock_version);
   const params = PRICE_BUSINESS_KEYS.map((key) => target[key]);
   const result = await db.query(
-    "UPDATE model_pricing SET " +
-    PRICE_BUSINESS_KEYS.map((key, i) => key + "=$" + (i + 1)).join(",") +
-    ",lock_version=lock_version+1,updated_by=1,updated_at=now() " +
-    "WHERE model_id='grok-build' AND lock_version=$7 RETURNING model_id",
+    `UPDATE model_pricing SET ${PRICE_BUSINESS_KEYS.map((key, i) => `${key}=$${i + 1}`).join(",")},lock_version=lock_version+1,updated_by=1,updated_at=now() WHERE model_id='grok-build' AND lock_version=$7 RETURNING model_id`,
     [...params, expected]);
   insist(result.rowCount === 1, "STANDARD_GROK_PRICING_CAS_CONFLICT");
 }
@@ -495,7 +491,7 @@ function assertTransition(
   const ids = manifest.new_models.map((row) => row.model_id);
   const changedIds = [...ids, "grok-build"];
   for (const table of ["account_groups", "account_group_models", "model_visibility_grants"]) {
-    same(before.tables[table], after.tables[table], "UNEXPECTED_PERMISSION_BINDING_CHANGE:" + table);
+    same(before.tables[table], after.tables[table], `UNEXPECTED_PERMISSION_BINDING_CHANGE:${table}`);
   }
   same(before.tables.model_catalog.filter((row) => !changedIds.includes(row.model_id)),
     after.tables.model_catalog.filter((row) => !changedIds.includes(row.model_id)),
@@ -512,12 +508,14 @@ function assertTransition(
       "NEW_DESCRIPTOR_MUTATED");
     insist(now.state === (activation ? "active" : "disabled") &&
       now.lock_version === old.lock_version + 1, "NEW_STATE_VERSION_POSTCONDITION");
-    const oldPrice = price(before, spec.model_id), newPrice = price(after, spec.model_id);
+    const oldPrice = price(before, spec.model_id);
+    const newPrice = price(after, spec.model_id);
     same(without(oldPrice, ["enabled", ...GENERATED_KEYS]),
       without(newPrice, ["enabled", ...GENERATED_KEYS]), "NEW_PRICE_MUTATED");
     insist(newPrice.enabled === activation, "NEW_ENABLED_POSTCONDITION");
   }
-  const oldGrok = active(before, "grok-build"), newGrok = active(after, "grok-build");
+  const oldGrok = active(before, "grok-build");
+  const newGrok = active(after, "grok-build");
   insist(newGrok.entry_id !== oldGrok.entry_id, "NEW_GROK_VERSION_REQUIRED");
   const retired = one(after.tables.model_catalog, (row) => row.entry_id === oldGrok.entry_id,
     "OLD_GROK_HISTORY_MISSING");
@@ -702,7 +700,7 @@ async function commandLine(): Promise<void> {
   };
   insist(Object.keys(options).every((key) => allowed[operation].includes(key)),
     "UNKNOWN_CLI_OPTION_REFUSED");
-  for (const key of allowed[operation]) insist(options[key], "REQUIRED_CLI_OPTION:" + key);
+  for (const key of allowed[operation]) insist(options[key], `REQUIRED_CLI_OPTION:${key}`);
   const { fileURLToPath } = await import("node:url");
   const base = fileURLToPath(new URL(".", import.meta.url));
   const manifest = JSON.parse((await trustedRootFile(join(base, "model-release-manifest.json"), false)).toString());
@@ -736,13 +734,13 @@ async function commandLine(): Promise<void> {
     const shaped = result as Receipt & { kind?: string; receipt?: Receipt };
     const committed = shaped.operation ? shaped : shaped.kind === "committed" ? shaped.receipt : undefined;
     try {
-      await output.writeFile(JSON.stringify(result,null,2) + "\n");
+      await output.writeFile(`${JSON.stringify(result,null,2)}\n`);
       await output.sync();
     } catch (error) {
       if (committed) throw new CommittedOutputFailure(committed);
       throw error;
     }
-    process.stdout.write(JSON.stringify({ operation, output: options.out }) + "\n");
+    process.stdout.write(`${JSON.stringify({ operation, output: options.out })}\n`);
   } finally {
     await output.close().catch(() => {});
     await client.end().catch(() => {});
@@ -753,13 +751,13 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   commandLine().catch((error) => {
     // Never log credentials, DSNs or upstream/PG error messages.
     if (error instanceof CommitUnknown) {
-      process.stderr.write(JSON.stringify({ status: "unknown", runId: error.runId,
-        requestSha256: error.requestSha256, next: "reconcile-only" }) + "\n");
+      process.stderr.write(`${JSON.stringify({ status: "unknown", runId: error.runId,
+        requestSha256: error.requestSha256, next: "reconcile-only" })}\n`);
       process.exitCode = 75;
     } else if (error instanceof CommittedOutputFailure) {
-      process.stderr.write(JSON.stringify({ status: "committed_local_output_failed",
+      process.stderr.write(`${JSON.stringify({ status: "committed_local_output_failed",
         runId: error.receipt.runId, requestSha256: error.receipt.requestSha256,
-        manifestSha256: error.receipt.manifestSha256, next: "reconcile-only" }) + "\n");
+        manifestSha256: error.receipt.manifestSha256, next: "reconcile-only" })}\n`);
       process.exitCode = 74;
     } else {
       process.stderr.write("MODEL_RELEASE_OPERATOR_REFUSED\n");

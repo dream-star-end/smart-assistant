@@ -3383,6 +3383,64 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     }
   });
 
+  test("sys.relay_ready 携带 containerId 且 hello 快照透传 containerId 触发跨容器 cursor_reset", async () => {
+    const uid = "815";
+    const peerId = "peerContainerSwap";
+    const trio = helloTerminalBillingTrio({ row: null });
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.p, containerId: 7247 }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    const containerOpen = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt(uid));
+    const fc = frameCollector(ws);
+    try {
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      await containerOpen;
+      let relayReady: Record<string, unknown> | null = null;
+      for (let i = 0; i < 10; i++) {
+        const raw = await Promise.race([
+          fc.next(),
+          new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timeout waiting relay_ready")), 2000)),
+        ]);
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (parsed.type === "sys.relay_ready") {
+          relayReady = parsed;
+          break;
+        }
+      }
+      assert.ok(relayReady, "sys.relay_ready must arrive");
+      assert.equal(relayReady.containerId, 7247);
+
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId, agentId: "main", lastFrameSeq: 500, inFlight: false }],
+      });
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      let snapFrame: Record<string, unknown> | null = null;
+      for (let i = 0; i < 10; i++) {
+        const raw = await Promise.race([
+          fc.next(),
+          new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timeout waiting snapshot")), 2000)),
+        ]);
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (parsed.type === "outbound.session_snapshot") {
+          snapFrame = parsed;
+          break;
+        }
+      }
+      assert.ok(snapFrame, "outbound.session_snapshot must arrive");
+      assert.deepEqual((snapFrame.snapshot as { gap?: unknown }).gap, { reason: "cursor_reset" });
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
   test("hello + 超长 clientMessageId(>200) → 当作缺省：不拿它查库、不伪造终态补帧", async () => {
     const lookups: unknown[][] = [];
     const uid = "809";
@@ -3654,7 +3712,7 @@ describe("Cursor external authority regression tripwire", () => {
 
   test("OCV5-415: Antigravity admission gates on authority and balance before minting; settle reads relay rows", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    const start = source.indexOf("if (isAntigravityInboundFrame && containerId !== undefined)");
+    const start = source.indexOf("if (isAntigravityInboundFrame && !isRemoteNativeInboundFrame && containerId !== undefined)");
     const end = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)", start);
     assert.notEqual(start, -1);
     assert.ok(end > start);

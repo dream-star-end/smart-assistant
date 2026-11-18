@@ -57,7 +57,8 @@ for (const mutation of modes[0] === "positive" ? [null] : mutations) {
   try {
     clone(dir);
     if (mutation) {
-      const p = join(dir, mutation.file), before = readFileSync(p, "utf8");
+      const p = join(dir, mutation.file);
+      const before = readFileSync(p, "utf8");
       assert.equal(before.split(mutation.from).length - 1, 1, "unique ablation needle");
       const after = before.replace(mutation.from, mutation.to); writeFileSync(p, after);
       assert.equal(after.replace(mutation.to, mutation.from), before, "single exact reverse");

@@ -42,6 +42,7 @@ import type {
 import { engineSessionId } from '../engine/engineSessionId.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
+import { classifyRunError } from '../errorClassify.js'
 import { RemoteContainerLane, type RemoteContainerLaneOptions } from './containerLane.js'
 import { parseRemoteV4ResumeId, remoteV4ResumeId } from './resumeId.js'
 import { remotePoolNeed } from './types.js'
@@ -85,11 +86,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
   private _effortLevel: string | undefined
   private _toolsets: string[] | undefined
   private _executionTarget: ExecutionTarget = { kind: 'local' }
+  private _shuttingDown = false
   private _activeRun?: {
     readonly getPartialSnapshot: () => PartialSnapshot
     readonly getPendingTools: () => number
+    readonly markInterrupted: (reason?: 'user' | 'system') => void
     readonly finalizeNull: () => void
-    readonly drainPromise: Promise<void>
+    drainPromise: Promise<void>
   }
 
   lastActivityAt = Date.now()
@@ -118,11 +121,22 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     this._toolsets = opts.agentToolsets
 
     const isCodexAuthority = backend.authorityEngine === 'codex'
+    const isAntigravityAuthority = backend.authorityEngine === 'antigravity'
+    const needsServerReqId =
+      isCodexAuthority ||
+      isAntigravityAuthority ||
+      backend.authorityEngine === 'grok' ||
+      backend.authorityEngine === 'cursor' ||
+      backend.authorityEngine === 'zcode'
     this.capabilities = {
       billingMode: isCodexAuthority ? 'engine-reported' : 'proxy',
       supportsEffort: true,
-      resumeKind: isCodexAuthority ? 'codex-thread' : 'ccb-session',
-      needsServerRequestId: isCodexAuthority,
+      resumeKind: isAntigravityAuthority
+        ? 'antigravity-session'
+        : isCodexAuthority
+          ? 'codex-thread'
+          : 'ccb-session',
+      needsServerRequestId: needsServerReqId,
       historyMode: 'native-resume',
       permissionModel: 'native',
       emitsCallUsage: false,
@@ -180,6 +194,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     let pendingToolCalls = 0
     let finalized = false
     let userCancelled = false
+    let interruptReason: 'user' | 'system' | null = null
     const startedAtMs = Date.now()
     let localOrdinal = 0
     const nextOrdinal = () => (params.nextDurableEventOrdinal ? params.nextDurableEventOrdinal() : ++localOrdinal)
@@ -292,12 +307,19 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       }
     }
 
+    let presentationErrorText: string | undefined
+    let presentationErrorCode: string | undefined
+    let terminalErrorCode: string | undefined
+
     const handleSecurityEvent = (ev: RemoteSecurityEvent): void => {
       this.lastActivityAt = Date.now()
       this.emit('activity')
       if (finalized) return
 
       const payload = ev.payload
+      if (payload.kind === 'turnTerminal' && typeof payload.errorCode === 'string' && payload.errorCode.length > 0) {
+        terminalErrorCode = payload.errorCode
+      }
       if (payload.kind === 'toolCallObserved' && payload.phase === 'started') {
         const callId = payload.callId
         const toolName = this.lane.resolveClientToolName(payload.name)
@@ -446,6 +468,23 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
       params.sessionTotals.turns += 1
 
+      const effectiveErrorCode = terminalErrorCode ?? presentationErrorCode
+      const rawErrorText =
+        presentationErrorText ??
+        (effectiveErrorCode
+          ? `Remote turn ended with status ${receipt.nativeStatus} (${effectiveErrorCode})`
+          : `Remote turn ended with status ${receipt.nativeStatus}`)
+      const classified =
+        isError && !isInterrupted
+          ? classifyRunError([effectiveErrorCode, presentationErrorText].filter(Boolean).join('\n') || rawErrorText)
+          : { code: 'unknown' as const, message: '' }
+      const isAuthError =
+        isError &&
+        !isInterrupted &&
+        (classified.code === 'auth_error' ||
+          effectiveErrorCode === 'CC_AUTH_ERROR' ||
+          effectiveErrorCode === 'CC_ACCOUNT_VERIFICATION_REQUIRED')
+
       if (isInterrupted) {
         params.onEvent({
           kind: 'error',
@@ -455,8 +494,12 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       } else if (isError) {
         params.onEvent({
           kind: 'error',
-          error: `Remote turn ended with status ${receipt.nativeStatus}`,
-          errorCode: 'engine_error',
+          error: rawErrorText,
+          ...(isAuthError
+            ? { errorCode: 'auth_error' as const, errorClass: 'auth_error' as const }
+            : classified.code !== 'unknown'
+              ? { errorClass: classified.code }
+              : { errorCode: 'engine_error' as const }),
         })
       } else {
         params.onEvent({
@@ -494,11 +537,33 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
         ...(isInterrupted ? { terminalReason: 'aborted_streaming' } : {}),
         numTurns: 1,
         isError,
-        ...(isError && !isInterrupted ? { errorKind: 'other' as const, errorDetail: receipt.nativeStatus } : {}),
+        ...(isError && !isInterrupted
+          ? {
+              errorKind: isAuthError ? ('auth' as const) : ('other' as const),
+              ...(classified.code !== 'unknown' ? { errorClass: classified.code } : {}),
+              errorDetail: rawErrorText,
+            }
+          : {}),
         staleResumeId: false,
         phantomSignals: { ...DEFAULT_PHANTOM_SIGNALS },
       })
     }
+
+    const activeHandle: NonNullable<RemoteEngineAdapter['_activeRun']> = {
+      getPartialSnapshot,
+      getPendingTools: () => pendingToolCalls,
+      markInterrupted: (reason?: 'user' | 'system') => {
+        interruptReason = reason ?? 'system'
+        if (reason === 'user') userCancelled = true
+      },
+      finalizeNull: () => {
+        interruptReason = 'user'
+        userCancelled = true
+        finalizeWith(null)
+      },
+      drainPromise: Promise.resolve(),
+    }
+    this._activeRun = activeHandle
 
     const drainPromise = (async () => {
       try {
@@ -530,6 +595,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
               if (finalized) return
               if (item.kind === 'status' && item.code === 'compacting') {
                 params.onEvent({ kind: 'turn_status', status: 'compacting' })
+              } else if (item.kind === 'error') {
+                if (!presentationErrorCode && typeof item.code === 'string' && item.code.length > 0) {
+                  presentationErrorCode = item.code
+                }
+                if (!presentationErrorText && typeof item.text === 'string' && item.text.trim().length > 0) {
+                  presentationErrorText = item.text.trim().slice(0, 2_000)
+                }
               }
             },
             onToolExecuted: ({ callId, clientToolName, result }) => {
@@ -539,44 +611,62 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
             },
           },
         )
-        resolveSubmitted()
         if (outcome.kind === 'abandoned') {
-          userCancelled = true
+          if (this._shuttingDown) {
+            if (!finalized) {
+              this.emit('exit', { code: 0, signal: 'SIGTERM', crashed: false })
+            }
+            resolveSubmitted()
+            finalizeWith(null)
+            return
+          }
+          if (userCancelled || interruptReason !== null) {
+            resolveSubmitted()
+            if (!finalized) {
+              params.onEvent({
+                kind: 'error',
+                error: userCancelled ? 'Turn cancelled by user' : 'Turn cancelled before dispatch',
+                ...(userCancelled ? { errorCode: 'user_cancelled' as const } : {}),
+              })
+            }
+            finalizeWith(null)
+            return
+          }
+          const fenceErr = this.lane.fenceError ?? new Error('REMOTE_TURN_ABORTED')
+          rejectSubmitted(fenceErr)
           if (!finalized) {
-            params.onEvent({
-              kind: 'error',
-              error: 'Turn cancelled before dispatch',
-              errorCode: 'user_cancelled',
-            })
+            this.emit('error', fenceErr)
           }
           finalizeWith(null)
           return
         }
+        resolveSubmitted()
         settleWithReceipt(outcome.receipt, Math.max(0, Date.now() - startedAtMs))
       } catch (err) {
         const error = err instanceof Error ? err : new Error('REMOTE_TURN_FAILED')
+        if (this._shuttingDown) {
+          if (!finalized) {
+            this.emit('exit', { code: 0, signal: 'SIGTERM', crashed: false })
+          }
+          rejectSubmitted(error)
+          finalizeWith(null)
+          return
+        }
         rejectSubmitted(error)
-        this.emit('error', error)
+        if (!finalized) {
+          this.emit('error', error)
+        }
         finalizeWith(null)
       }
     })()
-
-    const activeHandle = {
-      getPartialSnapshot,
-      getPendingTools: () => pendingToolCalls,
-      finalizeNull: () => {
-        userCancelled = true
-        finalizeWith(null)
-      },
-      drainPromise,
-    }
-    this._activeRun = activeHandle
+    activeHandle.drainPromise = drainPromise
 
     return {
       submitted,
       summary,
       end: () => {
         if (!finalized) {
+          interruptReason ??= 'system'
           this.lane.interrupt()
           finalizeWith(null)
         }
@@ -592,15 +682,18 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     }
   }
 
-  interrupt(_reason?: 'user' | 'system'): boolean {
+  interrupt(reason?: 'user' | 'system'): boolean {
+    this._activeRun?.markInterrupted(reason)
     return this.lane.interrupt()
   }
 
   beginPlannedShutdown(): void {
+    this._shuttingDown = true
     void this.lane.stopLane().catch(() => {})
   }
 
   async shutdown(): Promise<void> {
+    this._shuttingDown = true
     await this.lane.stopLane()
   }
 

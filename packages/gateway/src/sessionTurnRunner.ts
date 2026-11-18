@@ -66,6 +66,7 @@ import {
   type OutboundContentBlock,
 } from '@openclaude/protocol'
 import { classifyRunError } from './errorClassify.js'
+import { triggerLocalCatalogRefreshOnConfigChanged } from './modelCatalogClient.js'
 import type {
   GatewayEngineErrorEvent,
   GatewayTerminalErrorCode,
@@ -875,11 +876,17 @@ export async function _runOneTurn(
     }
 
     const retainedTerminalErrors = new Set<string>()
+    let lastRetainedTerminalError: {
+      status: 'interrupted' | 'crashed'
+      reason: string
+      errorCode: string
+    } | null = null
     const retainTerminalError = (
       status: 'interrupted' | 'crashed',
       reason: string,
       errorCode: string,
     ): void => {
+      lastRetainedTerminalError = { status, reason, errorCode }
       const identity = `${status}\0${errorCode}\0${reason}`
       if (retainedTerminalErrors.has(identity)) return
       retainedTerminalErrors.add(identity)
@@ -907,6 +914,10 @@ export async function _runOneTurn(
         let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
         let persistenceQueuedToOutbox = false
         detach()
+        if (modelSwitchTransition && session._modelSwitchTransition === modelSwitchTransition) {
+          modelSwitchTransition.state = 'prepared'
+          modelSwitchTransition.summaryInjected = false
+        }
         if (
           status === 'interrupted' &&
           errorCode === 'USER_CANCELLED' &&
@@ -1074,6 +1085,7 @@ export async function _runOneTurn(
           if (settleAfter) settle(() => resolve())
         }
       })()
+      this._trackPersistence(partialPersistencePromise)
       return partialPersistencePromise
     }
 
@@ -1154,6 +1166,9 @@ export async function _runOneTurn(
         if (targetTurn.finalized) {
           await finalizationDone
           await partialPersistencePromise
+          if (terminalPersistenceClaim === 'none') {
+            await persistTerminalSnapshot?.(status, reason, errorCode, true, waiveReason)
+          }
           return
         }
         await persistTerminalSnapshot?.(status, reason, errorCode, true, waiveReason)
@@ -1185,6 +1200,53 @@ export async function _runOneTurn(
         if (turn) throw new Error('rejected retry already submitted an engine turn')
         // The parser normally advances this counter when it receives a result.
         session.turns = Math.max(session.turns, prevTurns + 1)
+      }
+      if (!result && !rejectedBeforeSubmit) {
+        // Yield one microtask so an adapter that resolves `summary(null)` right
+        // before rejecting `submitted` lets `submitted.catch` claim `terminalRequestPromise`.
+        await Promise.resolve()
+        if (terminalPersistenceClaim !== 'none' || terminalRequestPromise !== null) {
+          return
+        }
+        const planned = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+        const fallback: {
+          status: 'interrupted' | 'crashed'
+          reason: string
+          errorCode: string
+          waiveReason?: TurnWaiveReason
+        } = requestedTerminal
+          ? requestedTerminal
+          : planned
+            ? {
+                status: 'interrupted',
+                reason:
+                  lastRetainedTerminalError?.reason ??
+                  pendingAttemptError?.error ??
+                  '服务重启中断了当前回合',
+                errorCode: 'SERVICE_RESTART',
+                waiveReason: 'no_response',
+              }
+            : lastRetainedTerminalError
+              ? lastRetainedTerminalError
+              : pendingAttemptError?.errorCode === 'user_cancelled'
+                ? {
+                    status: 'interrupted',
+                    reason: pendingAttemptError.error,
+                    errorCode: 'USER_CANCELLED',
+                  }
+                : {
+                    status: 'crashed',
+                    reason: pendingAttemptError?.error ?? 'Engine turn ended without summary',
+                    errorCode: 'RUNNER_CRASHED',
+                  }
+        await (persistTerminalSnapshot?.(
+          fallback.status,
+          fallback.reason,
+          fallback.errorCode,
+          true,
+          fallback.waiveReason,
+        ) ?? Promise.resolve())
+        return
       }
       detach()
       if (result?.nativeCompactionSummary) {
@@ -1263,6 +1325,12 @@ export async function _runOneTurn(
 
       const terminalResultErrorClass =
         result?.errorClass ?? classifyRunError(result?.errorDetail).code
+      if (
+        terminalResultErrorClass === 'model_config_changed_retry_turn' ||
+        (result && classifyRunError(result.assistantText).code === 'model_config_changed_retry_turn')
+      ) {
+        triggerLocalCatalogRefreshOnConfigChanged('session_turn_result')
+      }
       if (
         terminalResultErrorClass === 'context_too_long' &&
         (session.providerTag === 'ccb' || session.providerTag === 'codex')
@@ -2245,8 +2313,15 @@ export async function _runOneTurn(
       // 对位旧 runner.submit(...).catch:spawn 失败 / crash-loop backoff 等。
       submittedTurn.submitted.catch((err) => {
         closeHelpAttempt?.()
+        const planned = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+        const reason = err instanceof Error ? err.message : String(err)
         const persistence =
-          requestTerminalPersistence?.('crashed', String(err), 'RUNNER_CRASHED') ?? Promise.resolve()
+          requestTerminalPersistence?.(
+            planned ? 'interrupted' : 'crashed',
+            reason,
+            planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+            planned ? 'no_response' : undefined,
+          ) ?? Promise.resolve()
         this._trackPersistence(persistence)
       })
 
@@ -2601,6 +2676,9 @@ export async function runOneTurnWithRetry(
       }
 
       const errorClass = classifyRunError(msg).code
+      if (errorClass === 'model_config_changed_retry_turn') {
+        triggerLocalCatalogRefreshOnConfigChanged('session_turn_throw')
+      }
       // A full Codex native thread is recoverable: immediately rebuild it
       // from a smaller exact master-history suffix. Surface progress to the
       // user and do not add transient backoff latency.

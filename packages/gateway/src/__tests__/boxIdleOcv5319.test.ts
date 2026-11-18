@@ -85,6 +85,7 @@ function fakeSession(sessionKey: string, counters: { submits: number; shutdowns:
   return {
     sessionKey, model: BOX_NATIVE_CONTEXT_MODEL, _boxContextOwner: BOX_NATIVE_CONTEXT_OWNER,
     runner: Object.assign(new EventEmitter(), {
+      isRunning: false,
       submitTurn: () => {
         counters.submits++
         return { submitted: Promise.resolve(), end: () => {}, summary: Promise.resolve({}) }

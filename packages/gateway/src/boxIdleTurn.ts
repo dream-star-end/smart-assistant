@@ -23,7 +23,7 @@ export interface IdleTurnLimits {
 
 const TIMEOUT = Symbol('timeout')
 
-function within<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
+export function withinIdleBudget<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
   let timer: ReturnType<typeof setTimeout> | undefined
   return Promise.race([
     promise,
@@ -70,14 +70,13 @@ export async function runBoxIdleTurn(runner: EngineAdapter, params: TurnParams,
     // A real result finalized synchronously wins over a following exit, but
     // our own end() never manufactures success: failure is claimed first.
     if (earlyFailure) fail(earlyFailure)
-    const first = await within(run.summary, timeoutMs)
+    const first = await withinIdleBudget(run.summary, timeoutMs)
     if (first === TIMEOUT) {
       runner.interrupt('system')
-      await within(run.summary, killGraceMs)
+      await withinIdleBudget(run.summary, killGraceMs)
       // A turn that stopped on interrupt is not proof the child stopped
       // sending: shut it down unconditionally before reporting.
-      let killed = true
-      await runner.shutdown().catch(() => { killed = false })
+      const killed = await shutdownIdleRunner(runner, killGraceMs)
       // An interrupted or late result is never treated as the compact result;
       // an exit caused by the shutdown is reported as this timeout.
       throw new IdleTurnTimeoutError(killed)
@@ -92,4 +91,17 @@ export async function runBoxIdleTurn(runner: EngineAdapter, params: TurnParams,
     runner.off('exit', onExit)
     run?.end()
   }
+}
+
+export async function shutdownIdleRunner(runner: EngineAdapter, ms = BOX_IDLE_TURN_KILL_GRACE_MS): Promise<boolean> {
+  if (typeof runner.shutdown !== 'function') return false
+  const stopped = Promise.resolve().then(() => runner.shutdown()).then(() => {
+    // SubprocessRunner.shutdown can return after its final drain deadline while
+    // retaining the child. Resolution alone is NOT a quiescence receipt.
+    if (runner.isRunning !== false) return false
+    const assertStopped = (runner as EngineAdapter & { assertPromptPrivacyStopped?: () => void }).assertPromptPrivacyStopped
+    assertStopped?.call(runner) // CCB checks retained proc ownership, not only isRunning.
+    return true
+  }).catch(() => false)
+  return await withinIdleBudget(stopped, Math.max(0, ms)) === true
 }

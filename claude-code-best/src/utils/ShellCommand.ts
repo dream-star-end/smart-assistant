@@ -1,9 +1,9 @@
 import type { ChildProcess } from 'child_process'
 import { stat } from 'fs/promises'
 import type { Readable } from 'stream'
-import treeKill from 'tree-kill'
 import { generateTaskId } from '../Task.js'
 import { formatDuration } from './format.js'
+import { killProcessTree } from './killProcessTree.js'
 import {
   MAX_TASK_OUTPUT_BYTES,
   MAX_TASK_OUTPUT_BYTES_DISPLAY,
@@ -316,15 +316,21 @@ class ShellCommandImpl implements ShellCommand {
     }
 
     if (this.#killedForSize) {
-      result.stderr = prependStderr(
-        `Background command killed: output file exceeded ${MAX_TASK_OUTPUT_BYTES_DISPLAY}`,
-        result.stderr,
-      )
+      const sizeMsg = `Background command killed: output file exceeded ${MAX_TASK_OUTPUT_BYTES_DISPLAY}`
+      result.stderr = prependStderr(sizeMsg, result.stderr)
+      if (this.taskOutput.stdoutToFile) {
+        result.stdout = result.stdout
+          ? `${result.stdout.trimEnd()}\n${sizeMsg}`
+          : sizeMsg
+      }
     } else if (code === SIGTERM) {
-      result.stderr = prependStderr(
-        `Command timed out after ${formatDuration(this.#timeout)}`,
-        result.stderr,
-      )
+      const timeoutMsg = `Command timed out after ${formatDuration(this.#timeout)}`
+      result.stderr = prependStderr(timeoutMsg, result.stderr)
+      if (this.taskOutput.stdoutToFile) {
+        result.stdout = result.stdout
+          ? `${result.stdout.trimEnd()}\n${timeoutMsg}`
+          : timeoutMsg
+      }
     }
 
     const resultResolver = this.#resultResolver
@@ -335,9 +341,16 @@ class ShellCommandImpl implements ShellCommand {
   }
 
   #doKill(code?: number): void {
+    if (this.#status === 'killed' || this.#status === 'completed') {
+      return
+    }
     this.#status = 'killed'
-    if (this.#childProcess.pid) {
-      treeKill(this.#childProcess.pid, 'SIGKILL')
+    if (
+      this.#childProcess?.pid &&
+      this.#childProcess.exitCode === null &&
+      this.#childProcess.signalCode === null
+    ) {
+      killProcessTree(this.#childProcess.pid, 'SIGKILL')
     }
     this.#resolveExitCode(code ?? SIGKILL)
   }

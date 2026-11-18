@@ -1,5 +1,15 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { ApiError, AuthEpochStaleError, api, apiErrorMessage, authErrorMessage, callWithRefresh } from './api'
+import {
+  ApiError,
+  AuthEpochStaleError,
+  api,
+  apiErrorMessage,
+  authErrorMessage,
+  callWithRefresh,
+  isTimeoutError,
+  isTransientReadError,
+  retryTransientRead,
+} from './api'
 import { createMemoryAuthSession } from './authSession'
 import type { AuthSession } from './types'
 
@@ -1483,4 +1493,46 @@ test('a non-JWT token still waits for 401 before refreshing', async () => {
   expect(res.status).toBe(200)
   expect(seen).toEqual(['account-a', 'tok-after-401'])
   expect(refreshCalls).toBe(1)
+})
+
+test('getSession aborts stalled requests with TimeoutError and exposes transient/中文提示', async () => {
+  vi.useFakeTimers()
+  let seenSignal: AbortSignal | null | undefined
+  const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+    seenSignal = init?.signal
+    return new Promise<Response>(() => {
+      // Simulate stalled socket/body that never resolves.
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-timeout')
+
+  const pending = api.getSession(session, 'web-session-timeout', 0, undefined, undefined, {
+    timeoutMs: 50,
+  })
+  const caught = pending.catch((err: unknown) => err)
+  await vi.advanceTimersByTimeAsync(50)
+  const err = await caught
+
+  expect(isTimeoutError(err)).toBe(true)
+  expect((err as DOMException).name).toBe('TimeoutError')
+  expect(seenSignal?.aborted).toBe(true)
+  expect(isTransientReadError(err)).toBe(true)
+  expect(isTransientReadError(new DOMException('aborted', 'AbortError'))).toBe(false)
+  expect(apiErrorMessage(err, '会话加载失败')).toBe('请求超时，请检查网络后重试')
+})
+
+test('retryTransientRead retries TimeoutError and recovers when next attempt succeeds', async () => {
+  let attempts = 0
+  const result = await retryTransientRead(
+    async () => {
+      attempts += 1
+      if (attempts === 1) throw new DOMException('session request timeout', 'TimeoutError')
+      return 'ok'
+    },
+    () => true,
+    [0, 0],
+  )
+  expect(result).toBe('ok')
+  expect(attempts).toBe(2)
 })

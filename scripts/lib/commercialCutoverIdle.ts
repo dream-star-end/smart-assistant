@@ -36,7 +36,8 @@ export async function readIdleSnapshot({ pool, journal, stats }: Deps) {
     assert.ok(Number.isSafeInteger(counts[0]![key]) && counts[0]![key] >= 0, `invalid ${key} count`);
   }
   const rows = (await pool.query<Row>(IDLE_JOURNAL_SQL, [ACTIVE_BOX_STATES])).rows;
-  let unresolved = 0, neverLaunched = 0;
+  let unresolved = 0;
+  let neverLaunched = 0;
   for (const row of rows) {
     const ctx = row.ctx;
     // A durable prestart stop is the only unsettled row that can be proved never launched.

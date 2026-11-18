@@ -116,7 +116,9 @@ async function completeTask(dispatchId: string, clientMessageId: string) {
 
 type Job = Awaited<ReturnType<typeof claimDueRecoveryJobs>>[number]
 async function admitJob(job: Job, ownerId = 'recovery-bridge') {
-  const r = job.request, content = r.content as Record<string, unknown>, cmid = String(r.clientMessageId)
+  const r = job.request
+  const content = r.content as Record<string, unknown>
+  const cmid = String(r.clientMessageId)
   const recovery = (r.content as { recovery: NonNullable<Parameters<PgSessionsBackend['admitUserTurn']>[0]['recovery']> }).recovery
   const result = await backend.admitUserTurn({ uid, sessionUserId: `c:${uid}`, sessionId,
     clientMessageId: cmid, agentId: 'main', model: 'gpt-6-sol', ownerId,
@@ -182,7 +184,7 @@ test('OCV5-511 optimistic user row receives the exact server snapshot before adm
 
 test('OCV5-511 oversized intent hydrates the existing byte sidecar without truncating hidden media or options', async t => {
   if (fixture.skipIfUnavailable(t)) return
-  const request = wire('x'.repeat(300_000) + '\u0000tail')
+  const request = wire(`${'x'.repeat(300_000)}\u0000tail`)
   const { d } = await seed({ request })
   const stored = (await getPool().query('SELECT messages FROM client_sessions WHERE id=$1', [sessionId])).rows[0]
   assert.equal(JSON.parse(stored.messages)[0]._userPayloadDeferred, true)
@@ -315,7 +317,7 @@ test('OCV5-511 any charged source remains held and cannot generate another billa
 
 test('OCV5-511 an existing large exact user sidecar gains admission metadata atomically', async t => {
   if (fixture.skipIfUnavailable(t)) return
-  const text = 'large'.repeat(60_000) + '\u0000end'
+  const text = `${'large'.repeat(60_000)}\u0000end`
   await backend.upsertClientSession({ id: sessionId, userId: `c:${uid}`, agentId: 'main', title: 'existing large',
     pinned: false, createdAt: Date.now(), lastAt: Date.now(), updatedAt: Date.now(), messages: [] })
   await backend.appendServerAuthoredMessage(sessionId, `c:${uid}`,
@@ -358,7 +360,8 @@ test('OCV5-511 deferred automatic replay preserves lineage across pre-receipt tr
   const [first] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'master-one', leaseMs: 60_000 })
   assert.ok(first)
   const admit = (job: typeof first, ownerId: string) => {
-    const r = job.request, cmid = String(r.clientMessageId)
+    const r = job.request
+    const cmid = String(r.clientMessageId)
     const recovery = (r.content as { recovery: NonNullable<Parameters<PgSessionsBackend['admitUserTurn']>[0]['recovery']> }).recovery
     return backend.admitUserTurn({ uid, sessionUserId: `c:${uid}`, sessionId,
       clientMessageId: cmid, agentId: 'main', model: 'gpt-6-sol', ownerId,

@@ -193,6 +193,7 @@ export type RelayReadyWire = {
   type: "sys.relay_ready";
   peer?: Peer;
   automaticRecoveryOwner?: "master-v1";
+  containerId?: number;
 };
 
 /** 前端版本握手：bridge 在 userWs accept 时下发（服务端权威=dist/index.html 的 oc-build meta）。

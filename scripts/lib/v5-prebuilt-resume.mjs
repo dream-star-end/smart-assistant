@@ -27,9 +27,10 @@ export function validateOriginBuildEvidence(input) {
   need(props.ActiveState === 'failed' && props.SubState === 'failed' && props.Result === 'exit-code' && String(props.ExecMainStatus) === '1', 'original unit is not a completed failed invocation')
   need(props.WorkingDirectory === canonical, 'original unit cwd mismatch')
   need(typeof props.ExecStart === 'string' && props.ExecStart.split('argv[]=').length === 2 && props.ExecStart.includes(`path=/usr/bin/bash ; argv[]=/usr/bin/bash ${canonical}/scripts/deploy-v5.sh --with-dist ; ignore_errors=no ;`), 'original unit was not exact ordinary --with-dist')
-  const start = Date.parse(props.ExecMainStartTimestamp), end = Date.parse(props.ExecMainExitTimestamp)
+  const start = Date.parse(props.ExecMainStartTimestamp)
+  const end = Date.parse(props.ExecMainExitTimestamp)
   const compact = /^([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})$/.exec(masterMarker.builtAt ?? '')
-  const built = compact ? Date.parse(`${compact[1]}-${compact[2]}-${compact[3]}T${compact[4]}:${compact[5]}:${compact[6]}Z`) : NaN
+  const built = compact ? Date.parse(`${compact[1]}-${compact[2]}-${compact[3]}T${compact[4]}:${compact[5]}:${compact[6]}Z`) : Number.NaN
   need(Number.isFinite(start) && Number.isFinite(end) && start < end && start <= built && built <= end, 'artifact outside original invocation')
   let rows = input.journal
   if (typeof rows === 'string') rows = rows.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))

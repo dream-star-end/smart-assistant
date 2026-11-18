@@ -958,7 +958,8 @@ export class BoxCliToolHandoffDecoder {
       if (next.size === 0) {
         // Select the longest matching attempted prefix only for diagnostics.
         // This does not participate in the acceptance/coverage predicate.
-        let position = 0, matched = -1;
+        let position = 0;
+        let matched = -1;
         for (const start of new Set([0, ...covered])) {
           let prefix = 0;
           while (prefix < content.length
