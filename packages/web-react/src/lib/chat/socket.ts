@@ -16,7 +16,7 @@ import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
-import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
+import { applyControlReceipt, settleTurnStopSettlement, type PendingControlItem } from "./controlReceipts";
 import { contextRebuiltRow } from "./contextRebuilt";
 import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
 import {
@@ -1618,25 +1618,8 @@ export class ChatSocket {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
         if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
-        const settlement = sess._stopSettlement;
-        if (
-          !isCronOrHeartbeat &&
-          settlement &&
-          (
-            !settlement.clientMessageId ||
-            (frame.clientMessageId ?? clientMessageId) === settlement.clientMessageId
-          )
-        ) {
-          if (settlement.controlId) {
-            this.settleControl(settlement.controlId, "terminal");
-          } else {
-            sess._stopSettlement = {
-              ...(settlement.clientMessageId
-                ? { clientMessageId: settlement.clientMessageId }
-                : {}),
-              phase: "sync",
-            };
-          }
+        if (!isCronOrHeartbeat) {
+          settleTurnStopSettlement(sess, frame.clientMessageId ?? clientMessageId, (id, s) => this.settleControl(id, s));
         }
         if (this.reconnectInFlightSet) {
           this.reconnectInFlightSet.delete(sess.id);
@@ -1688,6 +1671,12 @@ export class ChatSocket {
       },
       deferTerminalErrorForRecovery: (sessId, paint) => this.deferTerminalErrorForRecovery(sessId, paint),
       discardDeferredTerminalError: (sessId, clientMessageId) => this.discardDeferredTerminalError(sessId, clientMessageId),
+      settleCancelFencedStop: (sess, clientMessageId) => {
+        if (settleTurnStopSettlement(sess, clientMessageId, (id, s) => this.settleControl(id, s))) {
+          if (this.deps.syncSession) this.syncSessionAndSettleStop(sess.id, clientMessageId ? { clientMessageId } : undefined);
+          else sess._stopSettlement = undefined;
+        }
+      },
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),

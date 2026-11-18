@@ -2136,3 +2136,65 @@ describe('Antigravity prompt state hardening (OCV5-781 audit)', () => {
     assert.notEqual(buildAntigravityPromptInputsKey({ ...base, memoryInstructionsFingerprint: 'rules-v2' }), k1)
   })
 })
+
+describe('Antigravity pre-spawn interrupt (OCV5-788)', () => {
+  test('user interrupt before CLI spawn retires the turn as USER_CANCELLED without spawning or crashing', async () => {
+    let enteredPrepare!: () => void
+    let releasePrepare!: () => void
+    const prepareStarted = new Promise<void>((r) => { enteredPrepare = r })
+    const prepareGate = new Promise<void>((r) => { releasePrepare = r })
+    let gated = true
+    const h = await harness({}, {
+      nativeTrajectory: {
+        prepare: async (opts) => {
+          if (gated) {
+            enteredPrepare()
+            await prepareGate
+          }
+          return prepareAntigravityNativeTrajectory(opts)
+        },
+        recover: async () => ({ ok: false, reason: 'none' }),
+      },
+    })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      process.env.FAKE_AGY_FIXTURE = path.join(FIXTURES, 'stream-text.ndjson')
+      let spawns = 0
+      const events: EngineEvent[] = []
+      const billing: Array<{ status: string; terminalCode?: string }> = []
+      h.adapter.on('spawn', () => { spawns++ })
+      h.adapter.on('external_billing', (e) => billing.push(e))
+
+      const run = h.adapter.submitTurn({
+        input: 'hello then stop immediately',
+        requestId: 'f'.repeat(32),
+        onEvent: (e) => events.push(e),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await prepareStarted
+      assert.equal(h.adapter.interrupt('user'), true, 'pre-spawn interrupt must claim the preparing turn')
+      assert.equal(h.adapter.interrupt('user'), false, 'second interrupt after retirement is a no-op')
+      releasePrepare()
+      await run.submitted
+      const summary = await run.summary
+      await h.adapter.waitForOutputDrain()
+
+      assert.equal(spawns, 0, 'cancelled pre-spawn turn must never spawn paid antigravity CLI')
+      assert.equal(existsSync(h.capture), false)
+      assert.equal(summary?.stopReason, 'interrupted')
+      assert.equal(billing.length, 1)
+      assert.equal(billing[0]?.terminalCode, 'USER_CANCELLED')
+      assert.equal(events.filter((e) => e.kind === 'final').length, 1)
+
+      // Subsequent turn on the same adapter must proceed cleanly without mismatch or poison.
+      gated = false
+      const next = await runTurn(h, 'stream-text.ndjson')
+      assert.equal(next.summary?.isError, false)
+      assert.equal(spawns, 1)
+    } finally {
+      releasePrepare()
+      await h.restore()
+    }
+  })
+})

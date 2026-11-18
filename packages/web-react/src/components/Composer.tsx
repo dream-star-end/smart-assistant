@@ -272,7 +272,8 @@ export function Composer({
     items: draftKey ? (attachmentCache.get(draftKey) ?? []) : [],
   }));
   const attachEpochRef = useRef(attachEpoch);
-  if (attach.key !== draftKey || attachEpochRef.current !== attachEpoch) {
+  const draftOwnerSettled = attach.key === draftKey && attachEpochRef.current === attachEpoch;
+  if (!draftOwnerSettled) {
     const cacheWasReset = attachEpochRef.current !== attachEpoch;
     // Every mutation already updates the cache. Re-saving old React state here
     // would resurrect the old name after an explicit identity promotion.
@@ -511,53 +512,95 @@ export function Composer({
     [revoke],
   );
 
-  const submittingRef=useRef(false),[submitting,setSubmitting]=useState(false);
-  const latestSubmitRef=useRef({value,attachments,draftKey,replyTo,revision:0});
-  const previousSubmit=latestSubmitRef.current;
-  latestSubmitRef.current={value,attachments,draftKey,replyTo,revision:previousSubmit.revision+
-    (previousSubmit.value!==value||previousSubmit.attachments!==attachments||previousSubmit.draftKey!==draftKey||previousSubmit.replyTo!==replyTo?1:0)};
+  const submitOwnerKey = draftKey ?? "__default__";
+  const submittingKeysRef = useRef<Set<string>>(new Set());
+  const [submittingKeys, setSubmittingKeys] = useState<ReadonlySet<string>>(() => new Set());
+  const submitting = submittingKeys.has(submitOwnerKey);
+  const ownerRevisionsRef = useRef<
+    Map<string, { value: string; attachments: OwnedAttach[]; replyTo: MessageReplyQuote | null | undefined; revision: number }>
+  >(new Map());
+  const ownerRevisions = ownerRevisionsRef.current;
+  const prevOwner = ownerRevisions.get(submitOwnerKey);
+  let ownerRevision = prevOwner?.revision ?? 0;
+  if (draftOwnerSettled) {
+    const attachmentsChanged =
+      prevOwner !== undefined &&
+      prevOwner.attachments !== attachments &&
+      (prevOwner.attachments.length > 0 || attachments.length > 0);
+    ownerRevision = prevOwner
+      ? prevOwner.revision +
+        (prevOwner.value !== value || attachmentsChanged || prevOwner.replyTo !== replyTo ? 1 : 0)
+      : 0;
+    if (prevOwner) ownerRevisions.delete(submitOwnerKey);
+    ownerRevisions.set(submitOwnerKey, { value, attachments, replyTo, revision: ownerRevision });
+    while (ownerRevisions.size > 64) {
+      const oldest = ownerRevisions.keys().next().value;
+      if (oldest === undefined) break;
+      ownerRevisions.delete(oldest);
+    }
+  }
+  const latestSubmitRef = useRef({ value, attachments, draftKey, replyTo, ownerKey: submitOwnerKey, revision: ownerRevision });
+  latestSubmitRef.current = { value, attachments, draftKey, replyTo, ownerKey: submitOwnerKey, revision: ownerRevision };
   // Keep the draft until asynchronous fee confirmation has accepted this send.
   // onAccepted runs only once onSend accepted it (a declined confirm returns false).
   const submit = (sendPrediction = false, onAccepted?: () => void) => {
-    if (disabled || !canSend || submittingRef.current) return;
+    const ownerKey = submitOwnerKey;
+    if (disabled || !canSend || submittingKeysRef.current.has(ownerKey)) return;
     const typed = value.trim().length > 0 || doneMedia.length > 0;
     if (!typed && !sendPrediction) return;
     const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
     const qa = typed && onQuickAskCommand && doneMedia.length === 0 ? parseQuickAskSlashCommand(text) : null;
     if (qa?.matched) { setValue(""); if (draftKey) clearDraft(draftKey); onQuickAskCommand?.(qa.question); return; }
-    const snapshot=latestSubmitRef.current;
-    submittingRef.current=true;
-    const resetSubmit=()=>{submittingRef.current=false;setSubmitting(false);};
-    const finish=(sent:unknown)=>{
+    const snapshot = latestSubmitRef.current;
+    submittingKeysRef.current.add(ownerKey);
+    const resetSubmit = () => {
+      if (!submittingKeysRef.current.delete(ownerKey)) return;
+      setSubmittingKeys((prev) => {
+        if (!prev.has(ownerKey)) return prev;
+        const next = new Set(prev);
+        next.delete(ownerKey);
+        return next;
+      });
+    };
+    const finish = (sent: unknown) => {
       resetSubmit();
-      if(sent===false)return;
+      if (sent === false) return;
       onAccepted?.();
-      if(latestSubmitRef.current.draftKey!==snapshot.draftKey){
+      if (latestSubmitRef.current.draftKey !== snapshot.draftKey) {
         // A successful first send may promote the empty composer to its new
         // session. Clear only the submitted owner's unchanged stored draft.
-        const k=snapshot.draftKey;
-        if(k&&readDraft(k)===snapshot.value)clearDraft(k);
-        if(k&&attachmentCache.get(k)===snapshot.attachments){
-          attachmentCache.set(k,[]);
-          for(const a of snapshot.attachments)revoke(a.previewUrl);
+        const k = snapshot.draftKey;
+        if (k && readDraft(k) === snapshot.value) clearDraft(k);
+        if (k && attachmentCache.get(k) === snapshot.attachments) {
+          attachmentCache.set(k, []);
+          for (const a of snapshot.attachments) revoke(a.previewUrl);
         }
+        ownerRevisions.delete(ownerKey);
         return;
       }
-      if(latestSubmitRef.current.revision!==snapshot.revision)return;
+      if (latestSubmitRef.current.revision !== snapshot.revision) return;
       if (!typed && sendablePrediction) setDismissedPrediction(sendablePrediction);
       setValue("");
       if (draftKey) clearDraft(draftKey);
       for (const a of attachments) revoke(a.previewUrl);
       setAttachments([]);
+      ownerRevisions.delete(ownerKey);
       onCancelReply?.();
     };
-    try{
-      const sent=onSend(text,doneMedia.length?doneMedia:undefined,replyTo??undefined);
-      if(sent&&typeof (sent as Promise<unknown>).then==='function'){
-        setSubmitting(true);
-        void (sent as Promise<unknown>).then(finish,resetSubmit);
-      }else finish(sent);
-    }catch{ resetSubmit(); }
+    try {
+      const sent = onSend(text, doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
+      if (sent && typeof (sent as Promise<unknown>).then === "function") {
+        setSubmittingKeys((prev) => {
+          if (prev.has(ownerKey)) return prev;
+          const next = new Set(prev);
+          next.add(ownerKey);
+          return next;
+        });
+        void (sent as Promise<unknown>).then(finish, resetSubmit);
+      } else finish(sent);
+    } catch {
+      resetSubmit();
+    }
   };
 
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。

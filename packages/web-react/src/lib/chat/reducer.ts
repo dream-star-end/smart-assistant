@@ -109,6 +109,8 @@ export type FrameEffects = {
   deferTerminalErrorForRecovery?: (sessId: string, paint: DeferredTerminalErrorPaint) => boolean;
   /** 后到的静默终态（重启/点停）丢掉尚未画上的延后卡，不准补画。 */
   discardDeferredTerminalError?: (sessId: string, clientMessageId?: string) => void;
+  /** 点停围栏吞掉终态 outbound.error 时，同步收口对应的 `_stopSettlement` / controlQueue。 */
+  settleCancelFencedStop?: (sess: ChatSession, clientMessageId?: string) => void;
   /** 非 final 且 in-flight：socket 重置 thinking-safety（证明后端活着）。*/
   onLiveFrame?: (sess: ChatSession) => void;
   /** 空轮 end_turn → deferred(setTimeout 0) 自动续写。*/
@@ -2832,11 +2834,12 @@ function settleCancelFencedTerminalError(
   effects: FrameEffects,
 ): void {
   const cmid = paint.clientMessageId;
-  effects.discardDeferredTerminalError?.(sess.id, cmid);
-  if (cmid && sess._deferredTerminalErrorClientMessageId === cmid) {
+  const targetCmid = cmid ?? sess._activeClientMessageId;
+  effects.discardDeferredTerminalError?.(sess.id, targetCmid);
+  if (targetCmid && sess._deferredTerminalErrorClientMessageId === targetCmid) {
     sess._deferredTerminalErrorClientMessageId = undefined;
   }
-  if (cmid && sess._activeClientMessageId === cmid) {
+  if ((targetCmid && sess._activeClientMessageId === targetCmid) || (!targetCmid && sess._sendingInFlight)) {
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
@@ -2844,10 +2847,11 @@ function settleCancelFencedTerminalError(
     sess._localTeardownAt = sess._trackerResetAt;
     resolveGenPlaceholders(sess);
   }
-  const exactUser = cmid
-    ? sess.messages.find((message) => message?.role === "user" && message.id === cmid)
+  const exactUser = targetCmid
+    ? sess.messages.find((message) => message?.role === "user" && message.id === targetCmid)
     : undefined;
   if (exactUser && exactUser.status !== "replied") exactUser.status = "sent";
+  effects.settleCancelFencedStop?.(sess, targetCmid);
   effects.persistSession?.(sess.id);
 }
 

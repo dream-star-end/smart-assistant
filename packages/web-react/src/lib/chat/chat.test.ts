@@ -9567,6 +9567,64 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
+  test("post-Stop cancel-fenced outbound.error settles _stopSettlement without needing a trailing [error] message or terminal receipt (OCV5-788)", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const deletePendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ deletePendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "stop before CLI spawns" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+
+    sock.stopTurn("s1");
+    await vi.waitFor(() => expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.control.stop")).toBe(true));
+    const stop = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.control.stop");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "persisted",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+      attempt: 1,
+    }) });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "applied",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+    expect(session._stopSettlement?.phase).toBe("persisted");
+    expect(session._recoveryStatus?.kind).toBe("stopping");
+
+    // Server emits only outbound.error (no trailing [error] outbound.message and no terminal receipt).
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error",
+      peer: { id: "s1", kind: "dm" },
+      code: "upstream_failed",
+      message: "ANTIGRAVITY_CONVERSATION_MISMATCH",
+      clientMessageId,
+    }) });
+
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._stopSettlement).toBeUndefined();
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(deletePendingControl).toHaveBeenCalledWith("s1", stop.controlId);
+    expect(session.messages.some((m) => m._errorCode === "upstream_failed")).toBe(false);
+    sock.stop();
+  });
+
   test.each(["completed", "crashed"])("Master confirmed ended Stop syncs the exact turn and preserves its %s outcome", (outcome) => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const syncSession = vi.fn();

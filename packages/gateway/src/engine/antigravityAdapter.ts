@@ -461,12 +461,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     this.drain = new Promise<void>((resolve) => { ctx.resolveDrain = resolve })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       this.cleanupLaunch(ctx)
-      if (!ctx.abandoned) {
+      const alreadySettled = ctx.terminal || ctx.abandoned
+      if (!alreadySettled) {
         this.finishError(ctx, String((err as Error)?.message ?? err))
         if (this.active === ctx) this.active = null
       }
       ctx.resolveDrain?.()
       ctx.resolveDrain = null
+      if (alreadySettled) return
       throw err
     })
     return {
@@ -542,6 +544,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       cliTokenFileExpiry: projection.cliTokenFileExpiry,
     })
     const composed = await this.composePlatformContent(repoSnapshot, projection.advertisedMcpTools, cwdDecision)
+    if (ctx.terminal || ctx.abandoned) {
+      this.cleanupLaunch(ctx)
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
+      return
+    }
     ctx.requestedConversationId = this.nativeId
     ctx.promptInputsKey = composed.inputsKey
     const conversationsDir = join(projection.root, 'home', '.gemini', 'antigravity-cli', 'conversations')
@@ -1370,7 +1378,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   interrupt(reason: 'user' | 'system' = 'system'): boolean {
     const ctx = this.active
-    if (!ctx?.proc || ctx.terminal || ctx.abandoned || (ctx.proc.killed && !ctx.procClosed)) return false
+    if (!ctx || ctx.terminal || ctx.abandoned) return false
+    if (!ctx.proc) {
+      ctx.interruptReason ??= reason
+      ctx.interrupted = true
+      this.cleanupLaunch(ctx)
+      this.finish(ctx, 0)
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
+      if (this.active === ctx) this.active = null
+      return true
+    }
+    if (ctx.proc.killed && !ctx.procClosed) return false
     ctx.interruptReason ??= reason
     ctx.interrupted = true
     if (!ctx.procClosed) killProcessGroup(ctx.proc, 'SIGINT')

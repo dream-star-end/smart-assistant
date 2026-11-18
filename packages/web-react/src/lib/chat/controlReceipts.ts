@@ -56,3 +56,29 @@ export function applyControlReceipt(frame: OutboundControlReceiptWire, context: 
     void Promise.resolve(context.sync?.(item.sessId, { clientMessageId: item.clientMessageId! })).catch(() => {});
   }
 }
+
+/** Settle a session's active `_stopSettlement` when terminal turn evidence arrives
+ *  (either `isFinal` message or post-Stop cancel-fenced `outbound.error`). Returns
+ *  `true` when a `controlId`-less settlement transitioned to `phase: "sync"`. */
+export function settleTurnStopSettlement(
+  sess: ChatSession,
+  clientMessageId: string | undefined,
+  settle: (controlId: string, status: "applied" | "terminal") => void,
+): boolean {
+  const settlement = sess._stopSettlement;
+  if (!settlement) return false;
+  if (settlement.clientMessageId && clientMessageId !== settlement.clientMessageId) return false;
+  if (settlement.controlId) {
+    settle(settlement.controlId, "terminal");
+    if (sess._stopSettlement === settlement) {
+      sess._stopSettlement = undefined;
+      if (sess._recoveryStatus?.kind === "stopping") sess._recoveryStatus = { kind: "completed" };
+    }
+    return false;
+  }
+  sess._stopSettlement = {
+    ...(settlement.clientMessageId ? { clientMessageId: settlement.clientMessageId } : {}),
+    phase: "sync",
+  };
+  return true;
+}
