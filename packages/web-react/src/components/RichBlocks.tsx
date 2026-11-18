@@ -4,7 +4,7 @@
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
 import { chatInteractionUnavailableText, useChatInteraction } from "./tool/context";
-import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
+import { OptionsGroupFooter, OptionsGroupProvider, useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
 import { useMemo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 /** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
@@ -94,9 +94,20 @@ interface OptionItem {
   desc?: string;
 }
 
-function extractFirstJsonObject(source: string): { json: string; rest: string } | null {
+interface ParsedOptionsItem {
+  question?: string;
+  multi: boolean;
+  options: OptionItem[];
+}
+
+const MAX_QUESTIONS_PER_BLOCK = 8;
+
+function extractFirstJsonValue(source: string): { json: string; rest: string } | null {
   const start = source.search(/\S/);
-  if (start < 0 || source[start] !== "{") return null;
+  if (start < 0) return null;
+  const open = source[start];
+  if (open !== "{" && open !== "[") return null;
+  const close = open === "{" ? "}" : "]";
   let depth = 0;
   let inString = false;
   let escape = false;
@@ -118,8 +129,8 @@ function extractFirstJsonObject(source: string): { json: string; rest: string } 
       inString = true;
       continue;
     }
-    if (ch === "{") depth += 1;
-    else if (ch === "}") {
+    if (ch === open) depth += 1;
+    else if (ch === close) {
       depth -= 1;
       if (depth === 0) return { json: source.slice(start, i + 1), rest: source.slice(i + 1) };
     }
@@ -127,35 +138,111 @@ function extractFirstJsonObject(source: string): { json: string; rest: string } 
   return null;
 }
 
-function parseOptionsBlock(
-  code: string,
-): { question?: string; multi: boolean; options: OptionItem[]; trailing: string } | null {
-  try {
-    const extracted = extractFirstJsonObject(code);
-    if (!extracted) return null;
-    const raw = JSON.parse(extracted.json) as Record<string, unknown>;
-    if (!raw || typeof raw !== "object" || !Array.isArray(raw.options)) return null;
-    const options: OptionItem[] = [];
-    for (const o of raw.options as unknown[]) {
-      if (typeof o === "string") options.push({ label: o });
-      else if (o && typeof o === "object" && typeof (o as { label?: unknown }).label === "string") {
-        const oo = o as { label: string; desc?: unknown };
-        options.push({ label: oo.label, ...(typeof oo.desc === "string" ? { desc: oo.desc } : {}) });
-      }
+function parseStringOption(raw: string): OptionItem | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  // 兼容 `ask_question` 等原生风格里的 "标题 — 说明" 字符串写法。
+  const split = /^(.{1,120}?)\s+—\s+(.+)$/s.exec(trimmed);
+  if (split) {
+    const label = split[1]!.trim();
+    const desc = split[2]!.trim();
+    if (label && desc) return { label, desc };
+  }
+  return { label: trimmed };
+}
+
+function normalizeSingleOptionsItem(raw: unknown): ParsedOptionsItem | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  if (!Array.isArray(rec.options)) return null;
+  const options: OptionItem[] = [];
+  for (const o of rec.options) {
+    if (typeof o === "string") {
+      const parsed = parseStringOption(o);
+      if (parsed) options.push(parsed);
+    } else if (o && typeof o === "object") {
+      const oo = o as { label?: unknown; desc?: unknown; description?: unknown };
+      if (typeof oo.label !== "string" || !oo.label.trim()) continue;
+      const desc =
+        typeof oo.desc === "string" && oo.desc.trim()
+          ? oo.desc
+          : typeof oo.description === "string" && oo.description.trim()
+            ? oo.description
+            : undefined;
+      options.push(desc ? { label: oo.label, desc } : { label: oo.label });
     }
-    if (options.length === 0 || options.length > 12) return null;
+  }
+  if (options.length === 0 || options.length > 12) return null;
+  const question =
+    typeof rec.question === "string"
+      ? rec.question
+      : typeof rec.prompt === "string"
+        ? rec.prompt
+        : undefined;
+  return {
+    question,
+    multi: rec.multi === true || rec.multiSelect === true || rec.is_multi_select === true,
+    options,
+  };
+}
+
+function expandOptionsPayload(val: unknown): ParsedOptionsItem[] | null {
+  if (Array.isArray(val)) {
+    if (val.length === 0 || val.length > MAX_QUESTIONS_PER_BLOCK) return null;
+    const out: ParsedOptionsItem[] = [];
+    for (const item of val) {
+      const norm = normalizeSingleOptionsItem(item);
+      if (!norm) return null;
+      out.push(norm);
+    }
+    return out;
+  }
+  if (val && typeof val === "object") {
+    const rec = val as Record<string, unknown>;
+    if (Array.isArray(rec.questions)) {
+      if (rec.questions.length === 0 || rec.questions.length > MAX_QUESTIONS_PER_BLOCK) return null;
+      const out: ParsedOptionsItem[] = [];
+      for (const item of rec.questions) {
+        const norm = normalizeSingleOptionsItem(item);
+        if (!norm) return null;
+        out.push(norm);
+      }
+      return out;
+    }
+  }
+  const one = normalizeSingleOptionsItem(val);
+  return one ? [one] : null;
+}
+
+function parseOptionsBlocks(
+  code: string,
+): { items: ParsedOptionsItem[]; trailing: string } | null {
+  try {
+    const first = extractFirstJsonValue(code);
+    if (!first) return null;
+    const items = expandOptionsPayload(JSON.parse(first.json));
+    if (!items || items.length === 0) return null;
+    let rest = first.rest;
+    while (items.length < MAX_QUESTIONS_PER_BLOCK) {
+      const trimmed = rest.trimStart();
+      if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) break;
+      const next = extractFirstJsonValue(trimmed);
+      if (!next) break;
+      const more = expandOptionsPayload(JSON.parse(next.json));
+      if (!more || items.length + more.length > MAX_QUESTIONS_PER_BLOCK) break;
+      items.push(...more);
+      rest = next.rest;
+    }
     return {
-      question: typeof raw.question === "string" ? raw.question : undefined,
-      multi: raw.multi === true,
-      options,
-      trailing: extracted.rest.trim() ? extracted.rest.trim() : "",
+      items,
+      trailing: rest.trim() ? rest.trim() : "",
     };
   } catch {
     return null; // 流式半截 / 非法 JSON → 调用方回退源码
   }
 }
 
-export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: boolean }) {
+function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; readOnly?: boolean }) {
   const { sendUserText, busy, reason } = useChatInteraction();
   const group = useOptionsGroup();
   const groupSnap = useOptionsGroupSnapshot();
@@ -165,23 +252,16 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   const [noteOpen, setNoteOpen] = useState(false);
   const [customNote, setCustomNote] = useState("");
   const composingRef = useRef(false);
-  const parsed = useMemo(() => parseOptionsBlock(code), [code]);
 
   // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
   // 用 layout effect:passive effect 在 commit 之后才跑,中间那帧里块已可点、分组还没数到它,
   // 点选会误走「单块点击即发」(t-839 OG-01 实证:三题消息第一题被单独发出)。
   useLayoutEffect(() => {
-    if (readOnly || !group || !parsed) return;
+    if (readOnly || !group) return;
     group.register(blockKey, { question: parsed.question, multi: parsed.multi });
     return () => group.unregister(blockKey);
     // question/multi 变化(流式补全)时重登;blockKey 稳定。
   }, [group, blockKey, parsed, readOnly]);
-
-  if (!parsed) {
-    return (
-      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">{code}</pre>
-    );
-  }
 
   // 同消息多题 → 聚合模式:点选只记录,由 GroupFooter 统一发送。
   // 流式(live)期间即使目前只注册到 1 块也不走点击即发——长回合中途就会贴卡,
@@ -240,7 +320,6 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
     sendUserText?.(trimmedNote);
   };
   return (
-    <>
     <div className="my-2 flex flex-col gap-2 rounded-2xl border border-border bg-surface p-3 not-prose shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
       {(parsed.question || parsed.options.length > 0) && (
         <div className="flex items-start justify-between gap-2 px-1">
@@ -358,11 +437,40 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
         <output className="block px-1 text-caption text-faint">等待当前回合结束后可选择</output>
       )}
     </div>
-    {parsed.trailing ? (
-      <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
-    ) : null}
+  );
+}
+
+export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: boolean }) {
+  const outerGroup = useOptionsGroup();
+  const parsed = useMemo(() => parseOptionsBlocks(code), [code]);
+
+  if (!parsed) {
+    return (
+      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-meta text-fg">{code}</pre>
+    );
+  }
+
+  const content = (
+    <>
+      {parsed.items.map((item, idx) => (
+        <OptionsCardItem key={`${idx}-${item.question ?? ""}`} parsed={item} readOnly={readOnly} />
+      ))}
+      {parsed.trailing ? (
+        <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
+      ) : null}
     </>
   );
+
+  // 未包外层分组（单独挂载测试或无 Provider 上下文）且同块拆出 ≥2 题时，就地补组上下文避免误触即发。
+  if (!outerGroup && !readOnly && parsed.items.length >= 2) {
+    return (
+      <OptionsGroupProvider>
+        {content}
+        <OptionsGroupFooter />
+      </OptionsGroupProvider>
+    );
+  }
+  return content;
 }
 
 /** ```chart 代码块(Chart.js config JSON）→ canvas 图表;无效/半截回退源码(对齐 v3 markdown.js）。 */
