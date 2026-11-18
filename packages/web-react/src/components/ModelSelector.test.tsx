@@ -123,10 +123,10 @@ describe('ModelSelector 团队模式诚信显示', () => {
       ),
     ).toBe('GPT-7 Nova 旗舰')
     expect(teamEngineLabel([{ id: 'glm-5.2' }], 'gpt-8-server-only')).toBe('gpt-8-server-only')
-    expect(teamEngineLabel([{ id: 'gpt-6-astra', display_name: 'GPT-6-Astra 旗舰' }])).toBe(
-      'GPT-6-Astra 旗舰',
+    expect(teamEngineLabel([{ id: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra 旗舰' }])).toBe(
+      'GPT-6.2-Astra 旗舰',
     )
-    expect(teamEngineLabel([{ id: 'glm-5.2' }])).toBe('GPT-6-Astra')
+    expect(teamEngineLabel([{ id: 'glm-5.2' }])).toBe('GPT-6.2-Astra')
     expect(modelLabel({ id: 'x' })).toBe('x')
   })
 })
@@ -623,6 +623,29 @@ describe('ModelSelector GPT-6 家族(selfhost 无默认折叠组)', () => {
     )
     expect(families).toEqual(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna'])
     expect(screen.getByText('GPT-6-Luna')).toBeInTheDocument()
+    expect(document.querySelector('[data-collapsed-group]')).toBeNull()
+    expect(screen.queryByText('更多模型')).toBeNull()
+  })
+
+  it('GPT-6.2 Astra/Sol 家族按目录顺序直接可见,不渲染折叠头', async () => {
+    const models62: PublicModel[] = [
+      { id: 'glm-5.3', display_name: 'GLM-5.3' },
+      { id: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra' },
+      { id: 'gpt-6.2-astra-1m', display_name: 'GPT-6.2-Astra' },
+      { id: 'gpt-6.2-sol', display_name: 'GPT-6.2-Sol' },
+      { id: 'gpt-6.2-sol-1m', display_name: 'GPT-6.2-Sol' },
+      { id: 'gpt-6-luna', display_name: 'GPT-6-Luna' },
+      { id: 'gpt-6-luna-1m', display_name: 'GPT-6-Luna' },
+    ]
+    render(<ModelSelector models={models62} selectedId="gpt-6.2-astra" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const families = Array.from(document.querySelectorAll('[data-context-family]')).map((el) =>
+      el.getAttribute('data-context-family'),
+    )
+    expect(families).toEqual(['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6-luna'])
+    expect(screen.getAllByText('GPT-6.2-Astra').length).toBeGreaterThanOrEqual(2)
+    expect(screen.getByText('GPT-6.2-Sol')).toBeInTheDocument()
     expect(document.querySelector('[data-collapsed-group]')).toBeNull()
     expect(screen.queryByText('更多模型')).toBeNull()
   })

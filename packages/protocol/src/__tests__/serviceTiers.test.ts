@@ -14,7 +14,7 @@ import { OPENCODE_GO_RESPONSES_MODELS } from '../staticKeyProviders.js'
 describe('OCV5-434 service tiers', () => {
   it('routes the documented Fast models and nothing else', () => {
     // Codex: no Fast toggle (backend ignores priority from our client; hidden by user decision).
-    for (const id of ['gpt-6-astra', 'gpt-6.1-sol-1m', 'gpt-6-luna']) assert.equal(fastServiceTierRoute(id), null, id)
+    for (const id of ['gpt-6.2-astra', 'gpt-6.2-sol-1m', 'gpt-6-astra', 'gpt-6.1-sol-1m', 'gpt-6-luna']) assert.equal(fastServiceTierRoute(id), null, id)
     assert.equal(fastServiceTierRoute('opencode-gpt-6-luna'), 'opencode-responses')
     assert.equal(fastServiceTierRoute('opencode-gpt-5.6-luna'), 'opencode-responses')
     for (const id of [
@@ -42,6 +42,6 @@ describe('OCV5-434 service tiers', () => {
   })
   it('Codex GPT-6 models always send the explicit standard tier id', () => {
     assert.equal(CODEX_STANDARD_SERVICE_TIER, 'default')
-    for (const id of ['gpt-6-luna', 'gpt-6-luna-1m', 'gpt-6-astra', 'gpt-6.1-sol']) assert.ok(CODEX_EXPLICIT_STANDARD_MODELS.has(id), id)
+    for (const id of ['gpt-6.2-astra', 'gpt-6.2-astra-1m', 'gpt-6.2-sol', 'gpt-6.2-sol-1m', 'gpt-6-luna', 'gpt-6-luna-1m', 'gpt-6-astra', 'gpt-6.1-sol']) assert.ok(CODEX_EXPLICIT_STANDARD_MODELS.has(id), id)
   })
 })

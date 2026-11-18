@@ -199,6 +199,18 @@ describe("stale config loads", () => {
 });
 
 describe("recommendedAdvisorModel", () => {
+  it("prefers gpt-6.2-astra over gpt-6-astra when both are listed", () => {
+    expect(
+      recommendedAdvisorModel({
+        ...docToUiState(DOC),
+        advisorModels: [
+          { id: "gpt-6-astra", label: "GPT-6-Astra", engine: "codex" },
+          { id: "gpt-6.2-astra", label: "GPT-6.2-Astra", engine: "codex" },
+        ],
+      }),
+    ).toBe("gpt-6.2-astra");
+  });
+
   it("prefers gpt-6-astra when listed", () => {
     expect(recommendedAdvisorModel(docToUiState(DOC))).toBe("gpt-6-astra");
   });

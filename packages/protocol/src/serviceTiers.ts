@@ -24,6 +24,10 @@ export function isServiceTier(value: unknown): value is ServiceTier {
  * priority tier. They never get a Fast toggle; every turn sends an explicit standard tier.
  */
 export const CODEX_EXPLICIT_STANDARD_MODELS: ReadonlySet<string> = new Set([
+  'gpt-6.2-astra',
+  'gpt-6.2-astra-1m',
+  'gpt-6.2-sol',
+  'gpt-6.2-sol-1m',
   'gpt-6-astra',
   'gpt-6-astra-1m',
   'gpt-6.1-sol',

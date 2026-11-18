@@ -116,6 +116,19 @@ describe('pickReviewerModel', () => {
     assert.ok(r && modelFamily(r) !== 'openai')
   })
 
+  it('同时存在 gpt-6.2-astra 与 gpt-6-astra 时审议/审查优先选择 gpt-6.2-astra', () => {
+    const with62 = view([
+      row('glm-5.3-zai', 'ccb'),
+      row('gpt-6-astra', 'codex'),
+      row('gpt-6.2-astra', 'codex'),
+      row('grok-build', 'grok'),
+      row('deepseek-v4-pro', 'ccb'),
+    ])
+    const panel = pickDeliberationPanel(with62, { excludeModel: 'glm-5.3-zai' })
+    assert.equal(panel[0]?.modelId, 'gpt-6.2-astra')
+    assert.equal(pickReviewerModel(with62, { leaderModel: 'glm-5.3-zai' }), 'gpt-6.2-astra')
+  })
+
   it('家族全被占时退化为只避开精确型号;彻底选不出 → undefined', () => {
     const only = view([row('glm-5.3-zai', 'ccb'), row('glm-5.2', 'ccb')])
     // 只剩同家族两款:严格轮选不出,宽松轮选到另一款(不是队长本尊即可)
