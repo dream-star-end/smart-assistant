@@ -370,7 +370,7 @@ cmd_prewarm_artifacts() {
     cp -al "$donor/node_modules" "$staging/node_modules" || die "prewarm deps copy failed"
     break_hardlink_restore_exec "$staging" || die "prewarm deps executables failed"
   else
-    ( cd "$staging" && npm ci --no-audit --no-fund ) || die "prewarm npm ci failed"
+    ( cd "$staging" && ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --no-audit --no-fund ) || die "prewarm npm ci failed"
   fi
   if declare -F master_seed_frontend_buildinfo >/dev/null; then
     master_seed_frontend_buildinfo "${donor:-}" "$staging" 1 || true

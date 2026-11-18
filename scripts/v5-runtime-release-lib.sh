@@ -409,18 +409,31 @@ oc_hotcfg_flip_current() {
 # **自足** dist/cli.js(build.ts 无 externals、target=node,全量打包),其 bytes 已进
 # release 树 digest。故 release 只装 root 一套依赖,ccb 只有 host bun build(见下)。
 oc_hotcfg_deps_cache_key() {
-  local root="$1" image_id="$2" root_lock arch
+  local root="$1" image_id="$2" root_lock arch ort_cuda="${OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA:-}"
   [ -f "$root/package-lock.json" ] || { oc_hotcfg__die "deps_cache_key: 缺 root package-lock.json @ $root"; return 1; }
+  case "$ort_cuda" in
+    ''|skip) ;;
+    *) oc_hotcfg__die "deps_cache_key: invalid OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA='$ort_cuda'"; return 1 ;;
+  esac
   root_lock="$(sha256sum "$root/package-lock.json" | cut -d' ' -f1)"
   arch="$(uname -m)"
-  printf '%s\n' "$(printf '%s\0%s\0%s' "$root_lock" "$image_id" "$arch" | sha256sum | cut -c1-64)"
+  if [ "$ort_cuda" = skip ]; then
+    printf '%s\n' "$(printf '%s\0%s\0%s\0ort-cuda=skip' "$root_lock" "$image_id" "$arch" | sha256sum | cut -c1-64)"
+  else
+    printf '%s\n' "$(printf '%s\0%s\0%s' "$root_lock" "$image_id" "$arch" | sha256sum | cut -c1-64)"
+  fi
 }
 
 # 在目标 runtime 镜像的**一次性容器内**装 root 依赖(§3.1:与容器运行时同 ABI)。
 # npm ci 失败即整体失败(§3.1e 不降级 npm install;root lock 已实证 ci 通过)。
 # ccb 不装(见 deps_cache_key 头注:workspace:* npm 不支持,dist/cli.js 自足)。
 oc_hotcfg_install_deps_in_image() {
-  local staging="$1" image_id="$2"
+  local staging="$1" image_id="$2" ort_cuda="${OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA:-}" cuda_prefix=""
+  case "$ort_cuda" in
+    '') ;;
+    skip) cuda_prefix="ONNXRUNTIME_NODE_INSTALL_CUDA=skip " ;;
+    *) oc_hotcfg__die "install_deps_in_image: invalid OC_HOTCFG_ONNXRUNTIME_INSTALL_CUDA='$ort_cuda'"; return 1 ;;
+  esac
   oc_hotcfg__log "docker 一次性容器内 npm ci(root)@ image=$image_id"
   # --network=host:kl-mirror docker bridge 网络 DNS 不通(systemd-resolved stub 未被
   # daemon.json 兜底,与 build-image.sh 的 OC_BUILD_NETWORK_HOST 同一类坑,2026-07-12 实测
@@ -441,7 +454,7 @@ oc_hotcfg_install_deps_in_image() {
           echo "FATAL[hotcfg]: npm ci lock changed" >&2; exit 1;
         }
         rc=0
-        npm ci --include=dev --no-audit --no-fund >"$log" 2>&1 || rc=$?
+        '"$cuda_prefix"'npm ci --include=dev --no-audit --no-fund >"$log" 2>&1 || rc=$?
         cat "$log" >&2
         [ "$(sha256sum package-lock.json)" = "$lock" ] || {
           echo "FATAL[hotcfg]: npm ci lock changed" >&2; exit 1;

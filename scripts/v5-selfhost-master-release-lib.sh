@@ -1418,7 +1418,7 @@ build_master_release() {
     fi
   else
     mlog "  lock 变化/无 donor/--force-npm-ci → 在 staging 内 npm ci(绝不写 rel-*)"
-    if ! ( cd "$staging" && npm ci --no-audit --no-fund ); then
+    if ! ( cd "$staging" && ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --no-audit --no-fund ); then
       cleanup_master_staging
       die "staging npm ci 失败"
     fi

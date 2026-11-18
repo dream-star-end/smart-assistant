@@ -1124,7 +1124,7 @@ ensure_node_modules() {
     echo "  [dry-run] npm ci --no-audit --no-fund (worktree 无 node_modules,gateway/migrate 都需要)"
     return 0
   fi
-  npm ci --no-audit --no-fund || die "npm ci 失败。补救: 检查网络/npm registry 后重跑。"
+  ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --no-audit --no-fund || die "npm ci 失败。补救: 检查网络/npm registry 后重跑。"
   log "  ✓ npm ci 完成"
 }
 
