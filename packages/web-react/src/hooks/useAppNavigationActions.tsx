@@ -9,6 +9,7 @@ import { useCallback, useMemo } from "react";
 import type { ChatMessage } from "../lib/chat/model";
 import { lastRealUserTurn } from "../lib/chat/pure";
 import { exactUserReplayPayload } from "../lib/chat/socket";
+import type { ServiceTier } from "@openclaude/protocol/browser";
 import type { SettingsSection } from "../components/SettingsCenter";
 import type { LockedSelectInfo } from "../components/ModelSelector";
 import { lockedModelUnlockNotice } from "../lib/cursorModelPicker";
@@ -45,7 +46,7 @@ export type AppNavigationActionsInput = {
   modelId: string | undefined;
   refreshMe: () => Promise<void>;
   send: (text: string, media?: { url?: string | undefined; base64?: string | undefined; mimeType?: string | undefined; filename?: string | undefined; hidden?: boolean | undefined; localSrc?: string | undefined; kind: "image" | "audio" | "video" | "file"; }[] | undefined, imageEdit?: { mode?: "annotated" | "outpaint" | undefined; maskIndex?: number | undefined; targetAspect?: "16:9" | "4:3" | "9:16" | "3:4" | "1:1" | undefined; clientJobId: string; sourceIndex: number; guideIndex: number; width: number; height: number; } | undefined, displayText?: string | undefined, replyTo?: { text: string; messageId: string; role: "user" | "assistant"; } | undefined, target?: { sessionId: string; projectId?: string | null | undefined; } | undefined) => Promise<unknown>;
-  serviceTier: "fast" | null;
+  serviceTier: ServiceTier | null;
   sessionEffort: PreferenceEffort | null | undefined;
   setActiveId: React.Dispatch<React.SetStateAction<string | undefined>>;
   setAuthMode: React.Dispatch<React.SetStateAction<AuthMode>>;

@@ -14,7 +14,8 @@ import type { DurableCodexBilling } from "@openclaude/protocol";
 
 import type { Logger } from "../logging/logger.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
-import { getAgentCostMultiplier, composeMultiplier } from "./agentMultiplier.js";
+import { getAgentCostMultiplier } from "./agentMultiplier.js";
+import { composeCodexTurnPricing } from "./codexServiceTierPricing.js";
 import type { TokenUsage } from "./calculator.js";
 import {
   type CodexFinalizeResult,
@@ -302,10 +303,7 @@ export async function settleDurableCodexBilling(
     const current = deps.pricing.get(model);
     if (!current) return waive("durable_pricing_missing");
     const agentMultiplier = await getAgentCostMultiplier(deps.pgPool, agentId);
-    derivedPricing = {
-      ...current,
-      multiplier: composeMultiplier(current.multiplier, agentMultiplier),
-    };
+    derivedPricing = composeCodexTurnPricing(current, agentMultiplier, model, ctx.serviceTier).pricing;
   }
 
   if (frame.rateLimits && typeof ctx.codexAccountId === "string" && /^\d{1,19}$/.test(ctx.codexAccountId)) {

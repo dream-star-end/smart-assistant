@@ -1,4 +1,4 @@
-import { isCursorContextTier } from '@openclaude/protocol'
+import { isCursorContextTier, isServiceTier } from '@openclaude/protocol'
 import { ModelSwitchCostError, type ModelSwitchCostService } from '../billing/modelSwitchCost.js'
 
 /** The trusted image feature is a separate fixed-price request, not a chat switch. */
@@ -32,9 +32,11 @@ export async function checkModelSwitchFrame(
         targetModel: input.targetModel,
         agentId: typeof frame.agentId === 'string' ? frame.agentId : 'main',
         teamMode: frame.teamMode === true,
+        ...(typeof frame.collabMode === 'string' ? { collabMode: frame.collabMode } : {}),
+        ...(typeof frame.advisorModel === 'string' ? { advisorModel: frame.advisorModel } : {}),
         text: input.text,
         ...(isCursorContextTier(frame.contextTier) ? { contextTier: frame.contextTier } : {}),
-        ...(frame.serviceTier === 'fast' ? { serviceTier: 'fast' as const } : {}),
+        ...(isServiceTier(frame.serviceTier) ? { serviceTier: frame.serviceTier } : {}),
         mediaCount: Array.isArray(content.media) ? content.media.length : 0,
       },
       typeof frame.modelSwitchConsent === 'string' ? frame.modelSwitchConsent : undefined,

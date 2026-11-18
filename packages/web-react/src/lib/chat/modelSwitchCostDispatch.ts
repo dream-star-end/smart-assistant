@@ -32,6 +32,8 @@ export async function authorizeQueuedModelSwitch(
         text: formatMessageReplyPrompt(p.content.text ?? '', p.content.replyTo),
         mediaCount: p.content.media?.length ?? 0,
         teamMode: p.teamMode,
+        ...(p.collabMode ? { collabMode: p.collabMode } : {}),
+        ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
         ...(p.contextTier ? { contextTier: p.contextTier } : {}),
         ...(p.serviceTier ? { serviceTier: p.serviceTier } : {}),
       },

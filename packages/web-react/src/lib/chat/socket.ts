@@ -1,6 +1,7 @@
 import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch} from './modelSwitchCostDispatch';
 import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
-import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
+import {formatMessageReplyPrompt, normalizeServiceTierForModel} from '@openclaude/protocol/browser';
+import { readSessionServiceTier } from '../sessionServiceTier';
 /**
  * v5 WS 对话引擎 —— ChatSocket。**渲染树之外的单例 service**（ref-based manager）：
  * 持有 ws + 全部连接/重连/游标/离线队列/计费归因可变状态；帧到达频率极高
@@ -5302,7 +5303,7 @@ export class ChatSocket {
     if(!authorization&&this.deps.authorizeSwitch&&p.model&&!p.imageEdit){
       authorization=await this.deps.authorizeSwitch({sessionId:p.sessId,requestId:mintMsgId(),targetModel:p.model,agentId:p.agentId,
         text:formatMessageReplyPrompt(p.text,p.replyTo),mediaCount:p.media?.length??0,teamMode:p.teamMode,
-        ...(p.contextTier?{contextTier:p.contextTier}:{}),...(p.serviceTier?{serviceTier:p.serviceTier}:{}),
+        ...(p.collabMode?{collabMode:p.collabMode}:{}),...(p.advisorModel?{advisorModel:p.advisorModel}:{}),...(p.contextTier?{contextTier:p.contextTier}:{}),...(p.serviceTier?{serviceTier:p.serviceTier}:{}),
       },{useCachedRequestId:true,allowOfflineQueue:true})??undefined;
       if(!authorization)return false;
     }
@@ -5519,14 +5520,23 @@ export class ChatSocket {
     const preparedSwitch = selectedModel && sess._preparedModelSwitch?.targetModel === selectedModel
       ? sess._preparedModelSwitch
       : undefined;
+    const manualContinuationTier = !automatic
+      ? (normalizeServiceTierForModel(
+          selectedModel ?? baseRouting.model,
+          readSessionServiceTier(sess.id),
+        ) ?? undefined)
+      : baseRouting.serviceTier;
     const routing = selectedModel && selectedModel !== baseRouting.model
       ? {
           ...baseRouting,
           model: selectedModel,
           modelSwitchId: preparedSwitch?.id,
           modelSwitchConsent: undefined,
+          serviceTier: manualContinuationTier,
         }
-      : baseRouting;
+      : automatic
+        ? baseRouting
+        : { ...baseRouting, serviceTier: manualContinuationTier };
     const resolvedAgentId = sess.agentId || agentId;
     void this.ensureServerSessionOnce(sess, resolvedAgentId);
     const replay = target.mode === "replay"
@@ -5764,7 +5774,7 @@ export class ChatSocket {
     if(this.deps.authorizeSwitch&&routing?.model&&!replay.imageEdit){
       const permit=await this.deps.authorizeSwitch({sessionId:sess.id,requestId:nextId,targetModel:routing.model,agentId,
         text:formatMessageReplyPrompt(replay.text,replay.replyTo),mediaCount:replay.media?.length??0,teamMode:routing.teamMode,
-        ...(routing.contextTier?{contextTier:routing.contextTier}:{}),...(routing.serviceTier?{serviceTier:routing.serviceTier}:{}),
+        ...(routing.collabMode?{collabMode:routing.collabMode}:{}),...(routing.advisorModel?{advisorModel:routing.advisorModel}:{}),...(routing.contextTier?{contextTier:routing.contextTier}:{}),...(routing.serviceTier?{serviceTier:routing.serviceTier}:{}),
       },{consent:routing.modelSwitchConsent});
       if(!permit||this.sessions.get(sess.id)!==sess||userMsg.status!=='error')return;
       routing.modelSwitchConsent=permit.consent;

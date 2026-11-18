@@ -1,5 +1,5 @@
 import { withUserError } from '@openclaude/protocol'
-import { SYSTEM_HELP_CAPABILITY, takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { CODEX_SPEED_TIERS_CAPABILITY, SYSTEM_HELP_CAPABILITY, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import { captureSystemHelpFrame } from './systemHelpFrames.js'
 import { getSystemHelpRelay } from './systemHelpRelay.js'
 /**
@@ -204,6 +204,7 @@ export function handleWsConnection(
       // 验签能力 ∧ sink 装配 ∧ boot recovery 首跑成功,任一不满足 → 不申报(fail-closed)。
       attestFrame.capabilities = [
         ...attestFrame.capabilities,
+        CODEX_SPEED_TIERS_CAPABILITY,
         ...durableTurnDispatchCapabilities(
           this._dispatchAuthority.enabled,
           this._durableTurnDispatchReady,
@@ -781,6 +782,12 @@ export function handleWsConnection(
                 )
               }
             },
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { serviceTier: null },
           )
         } catch (err: any) {
           // E5 — 原文进日志,ws 控制面错误帧只发受控文案。

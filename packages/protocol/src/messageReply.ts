@@ -52,3 +52,20 @@ export function formatMessageReplyPrompt(
     currentText,
   ].join('\n')
 }
+
+const REPLY_ENVELOPE_HEADER_RE =
+  /^\[被引用的历史消息｜发送者：(?:用户|助手)｜消息ID：[A-Za-z0-9_.:-]{1,256}｜原文字符数：(\d+)\]\n/
+const REPLY_CURRENT_MARKER = '\n[用户当前消息]\n'
+
+/** Extracts the active current-turn user text from a reply envelope so quoted text cannot trigger turn-wide policies. */
+export function unwrapMessageReplyCurrentText(prompt: string): string {
+  const m = REPLY_ENVELOPE_HEADER_RE.exec(prompt)
+  if (!m) return prompt
+  const quoteLen = Number(m[1])
+  if (!Number.isSafeInteger(quoteLen) || quoteLen < 0) return prompt
+  const markerStart = m[0].length + quoteLen
+  if (prompt.slice(markerStart, markerStart + REPLY_CURRENT_MARKER.length) !== REPLY_CURRENT_MARKER) {
+    return prompt
+  }
+  return prompt.slice(markerStart + REPLY_CURRENT_MARKER.length)
+}

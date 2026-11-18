@@ -1,3 +1,5 @@
+import type { ServiceTier } from './serviceTiers.js'
+
 /** Values use the existing chat/ledger unit, displayed 1:1 as 积分. */
 export interface ModelSwitchCostRequest {
   sessionId: string
@@ -5,8 +7,10 @@ export interface ModelSwitchCostRequest {
   targetModel: string
   agentId: string
   teamMode?: boolean
+  collabMode?: string
+  advisorModel?: string
   contextTier?: '300k' | '1m'
-  serviceTier?: 'fast'
+  serviceTier?: ServiceTier
   text?: string
   mediaCount?: number
 }

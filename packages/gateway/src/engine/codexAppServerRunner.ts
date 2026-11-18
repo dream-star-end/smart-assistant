@@ -1,4 +1,14 @@
-import { readLatestCodexNativeHandoff, runnerShutdownTimeoutMs, waitForCloseWithin, killCodexProcessGroup } from './codexLifecycle.js'
+import {
+  readLatestCodexNativeHandoff,
+  runnerShutdownTimeoutMs,
+  waitForCloseWithin,
+  killCodexProcessGroup,
+  abortableDelay,
+  normalisePrompt,
+  isInlinePushProcLive,
+  writeCodexDelegateTerminalNotification,
+  handleCodexChatgptAuthTokensRefresh,
+} from './codexLifecycle.js'
 export { readLatestCodexNativeHandoff } from './codexLifecycle.js'
 import { CodexNativeContext } from './codexNativeContext.js'
 import { withFreshPromptPrivacy } from '../promptPrivacyRuntime.js'
@@ -27,10 +37,12 @@ import {
   AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
   type GoalStateSnapshot,
+  type ServiceTier,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
   codexTransportModelId,
   isToolExitCode,
+  normalizeServiceTierForModel,
   turnErrorSemantics,
 } from '@openclaude/protocol'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
@@ -157,18 +169,6 @@ export {
 export type { JsonRpcCallError, RuntimeRateLimits } from './codexAppServerProtocol.js'
 
 export const log = createLogger({ module: 'codexAppServerRunner' })
-
-const guardedStdin = new WeakSet<object>()
-function guardStdinErrors(stdin: {
-  on?: (event: 'error', fn: (err: Error) => void) => unknown
-}): void {
-  if (guardedStdin.has(stdin)) return
-  guardedStdin.add(stdin)
-  if (typeof stdin.on !== 'function') return
-  stdin.on('error', () => {
-    /* swallow async EPIPE so a settled write cannot become uncaughtException */
-  })
-}
 
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
@@ -314,6 +314,7 @@ interface QueuedTurn {
   traceId?: string
   automaticRetryState?: AutomaticRetryState
   readOnly?: boolean
+  serviceTier?: ServiceTier | null
 }
 
 export class PromptQueueRunnerInvariantError extends Error {
@@ -613,9 +614,20 @@ export class CodexAppServerRunner extends EventEmitter {
   get model(): string | undefined {
     return this.opts.model
   }
+  private _serviceTier: ServiceTier | null = null
+  get serviceTier(): ServiceTier | null {
+    return this._serviceTier
+  }
+  /** OCV5-798: serviceTier is sent per turn via turn/start `serviceTierForTurn`; never restarts proc. */
+  setServiceTier(tier: ServiceTier | null, model: string | undefined): 'unchanged' {
+    this._serviceTier = normalizeServiceTierForModel(model ?? this.opts.model, tier)
+    return 'unchanged'
+  }
+
   setModel(model: string | undefined): void {
     if (this.opts.model !== model) this.nativeContext.reset()
     this.opts.model = model
+    this._serviceTier = normalizeServiceTierForModel(model, this._serviceTier)
   }
 
   setCodexRoute(route: CodexProviderConfigOverride | null | undefined): void {
@@ -1179,6 +1191,7 @@ export class CodexAppServerRunner extends EventEmitter {
     automaticRetryState?: AutomaticRetryState,
     traceId?: string | null,
     readOnly = false,
+    serviceTier: ServiceTier | null = null,
   ): Promise<void> {
     const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     this.lastActivityAt = Date.now()
@@ -1188,6 +1201,7 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     const prompt = normalisePrompt(textOrBlocks)
     assertPromptQueueRunnerAdmission(queueTurn, this.processing, this.queue.length)
+    const turnTier = readOnly ? null : normalizeServiceTierForModel(this.opts.model, serviceTier)
     return new Promise((resolve, reject) => {
       this.queue.push({
         prompt,
@@ -1199,6 +1213,7 @@ export class CodexAppServerRunner extends EventEmitter {
         traceId: turnTraceId,
         automaticRetryState,
         readOnly,
+        serviceTier: turnTier,
       })
       void this.drain()
     })
@@ -1369,6 +1384,7 @@ export class CodexAppServerRunner extends EventEmitter {
         turn.automaticRetryState,
         turn.traceId ?? null,
         turn.readOnly === true,
+        turn.serviceTier ?? null,
       )
       turn.resolve()
     } catch (err) {
@@ -1941,121 +1957,17 @@ export class CodexAppServerRunner extends EventEmitter {
     return delta
   }
 
-  /**
-   * Forward codex's `account/chatgptAuthTokens/refresh` reverse-RPC to the
-   * v3 master HTTP endpoint.
-   *
-   * V3 commercial topology: each container's gateway has no DB / KMS /
-   * refresh_token. Refresh state lives on master. Container env carries:
-   *   - OPENCLAUDE_V3_MASTER_BASE_URL = e.g. http://172.30.0.1:18791 (self-host)
-   *     or https://commercial-v3.host:18443 (remote-host with mTLS — but in
-   *     v3 the container always reaches its own host, so plain http loopback)
-   *   - OPENCLAUDE_V3_CONTAINER_TOKEN = `oc-v3.<containerId>.<secret>` bearer
-   *
-   * Both env are required. Missing either → reply -32601 (matches the legacy
-   * "not implemented" semantics so codex's failure path is unchanged on
-   * non-v3 setups). Real failures (HTTP non-2xx, network) → -32603 internal
-   * error so codex / container log clearly distinguish "not wired" from
-   * "wired but broken".
-   *
-   * Response body shape from master matches codex's
-   * `ChatgptAuthTokensRefreshResponse` schema 1:1
-   * (`accessToken`, `chatgptAccountId`, `chatgptPlanType?`).
-   */
   private async _handleChatgptAuthTokensRefresh(
     id: string | number,
     params: unknown,
   ): Promise<void> {
-    const baseUrl = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
-    const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
-    if (!baseUrl || !token) {
-      // Not running under v3 commercial — preserve legacy "not implemented"
-      // semantics so personal-version codex paths fail the same way.
-      this.writeRaw(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id,
-          error: {
-            code: -32601,
-            message:
-              "method 'account/chatgptAuthTokens/refresh' not implemented by openclaude-gateway",
-          },
-        }),
-      )
-      return
-    }
-    const url = `${baseUrl.replace(/\/+$/, '')}/internal/v3/codex/token-refresh`
-    try {
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${token}`,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify(params ?? {}),
-      })
-      const text = await resp.text()
-      if (resp.status >= 200 && resp.status < 300) {
-        let parsed: unknown
-        try {
-          parsed = JSON.parse(text)
-        } catch (err) {
-          log.warn('codex token refresh: master 2xx but body not JSON', {
-            sessionKey: this.opts.sessionKey,
-            status: resp.status,
-            err: (err as Error).message,
-          })
-          this.writeRaw(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              id,
-              error: {
-                code: -32603,
-                message: 'codex token refresh: master returned non-JSON body',
-              },
-            }),
-          )
-          return
-        }
-        // Pass through — master already shaped to ChatgptAuthTokensRefreshResponse.
-        this.writeRaw(JSON.stringify({ jsonrpc: '2.0', id, result: parsed }))
-        return
-      }
-      // Non-2xx — surface master's error code/message for log diagnosis but
-      // collapse to JSON-RPC -32603. Codex will treat this as a hard refresh
-      // failure (turn fails); the container's next attempt will hit master
-      // anew (no caching here).
-      log.warn('codex token refresh: master returned non-2xx', {
-        sessionKey: this.opts.sessionKey,
-        status: resp.status,
-        body: text.slice(0, 512),
-      })
-      this.writeRaw(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id,
-          error: {
-            code: -32603,
-            message: `codex token refresh failed: master returned ${resp.status}`,
-          },
-        }),
-      )
-    } catch (err) {
-      log.warn('codex token refresh: master fetch threw', {
-        sessionKey: this.opts.sessionKey,
-        err: (err as Error).message,
-      })
-      this.writeRaw(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id,
-          error: {
-            code: -32603,
-            message: `codex token refresh failed: ${(err as Error).message}`,
-          },
-        }),
-      )
-    }
+    await handleCodexChatgptAuthTokensRefresh({
+      id,
+      params,
+      sessionKey: this.opts.sessionKey,
+      writeRaw: (line) => this.writeRaw(line),
+      warn: (msg, meta) => log.warn(msg, meta),
+    })
   }
 
   private writeRaw(line: string): boolean {
@@ -2064,8 +1976,6 @@ export class CodexAppServerRunner extends EventEmitter {
       this.proc!.stdin.write(`${line}\n`)
       return true
     } catch (err) {
-      // EPIPE if proc died between our check and write — fail pending so
-      // callers settle.
       log.warn('codex app-server stdin write failed', {
         err: (err as Error).message,
       })
@@ -2073,67 +1983,18 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  /**
-   * R3 档 A: JSON-RPC notification `delegate/terminal` over the existing
-   * app-server stdin. Official mechanism only — does not patch the Codex
-   * binary. Unknown notifications may be ignored by app-server (gap reported).
-   */
   async writeDelegateTerminalNotification(
     line: string,
   ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
-    const proc = this.proc
-    if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
-    const stdin = proc.stdin
-    if (!stdin || stdin.writable === false || stdin.destroyed) {
-      return { ok: false, processAlive: true }
-    }
-    guardStdinErrors(stdin)
-    try {
-      await new Promise<void>((resolve, reject) => {
-        let settled = false
-        const timer = setTimeout(() => finish(new Error('codex stdin write timeout')), 2_000)
-        timer.unref?.()
-        const finish = (err?: Error | null): void => {
-          if (settled) return
-          settled = true
-          clearTimeout(timer)
-          if (typeof stdin.off === 'function') stdin.off('error', onError)
-          if (typeof proc.off === 'function') proc.off('close', onClose)
-          if (err) reject(err)
-          else resolve()
-        }
-        const onError = (err: Error): void => finish(err)
-        const onClose = (): void => finish(new Error('codex process closed during inline push'))
-        if (typeof stdin.once === 'function') stdin.once('error', onError)
-        if (typeof proc.once === 'function') proc.once('close', onClose)
-        try {
-          // write()===false is backpressure: the chunk is already in the
-          // buffer and the caller must wait for drain/callback. It is not
-          // a failure (Node 22 Writable.write). Only the callback/error
-          // path settles this chunk.
-          stdin.write(`${line}\n`, (err) => finish(err))
-        } catch (err) {
-          finish(err as Error)
-        }
-      })
-      if (!this.isInlinePushProcLive(proc) || this.proc !== proc) {
-        return { ok: false, processAlive: false }
-      }
-      return { ok: true, processAlive: true }
-    } catch (err) {
-      const live = this.isInlinePushProcLive(this.proc)
-      const message = err instanceof Error ? err.message : ''
-      if (live && message.includes('stdin write timeout')) {
-        return { ok: false, processAlive: true, unknown: true }
-      }
-      return { ok: false, processAlive: live }
-    }
+    return writeCodexDelegateTerminalNotification(
+      this.proc,
+      (candidate) => this.isInlinePushProcLive(candidate),
+      line,
+    )
   }
 
   private isInlinePushProcLive(proc: ChildProcessWithoutNullStreams | null): boolean {
-    if (!proc || this.proc !== proc) return false
-    if (proc.killed || proc.exitCode != null || proc.signalCode != null) return false
-    return true
+    return isInlinePushProcLive(proc, this.proc)
   }
 
   /**
@@ -2141,7 +2002,7 @@ export class CodexAppServerRunner extends EventEmitter {
    * admission, not ingest: turn/start may still reject. The only ACK is a
    * turn id returned by turn/start (activeTurnId).
    */
-  get hasIngestedParentTurn(): boolean {
+    get hasIngestedParentTurn(): boolean {
     return this.activeTurnId != null
   }
 
@@ -2178,7 +2039,10 @@ export class CodexAppServerRunner extends EventEmitter {
     emitGoalBlockImpl.call(this as unknown as CodexNotificationHost, goal)
   }
 
-  private buildTurnStartParams(prompt: string): Record<string, unknown> {
+  private buildTurnStartParams(
+    prompt: string,
+    serviceTier: ServiceTier | null = this._serviceTier,
+  ): Record<string, unknown> {
     if (this.opts.remote) {
       // The relay's grammar is closed: model/sandbox/collaboration settings are the node's,
       // provisioned from the signed catalog; the container only names thread, text and effort.
@@ -2189,7 +2053,7 @@ export class CodexAppServerRunner extends EventEmitter {
       }
     }
     return buildCodexTurnPolicyParams(prompt, this.threadId, {
-      ...this.opts, effortLevel: this.effortLevel,
+      ...this.opts, effortLevel: this.effortLevel, serviceTier,
       mode: this.conversationMode, readOnly: this.advisorReadOnly,
     })
   }
@@ -2424,21 +2288,7 @@ export class CodexAppServerRunner extends EventEmitter {
 
   /** 可中断退避 sleep。resolve(true)=被 interrupt() abort;resolve(false)=正常睡满。 */
   private abortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
-      if (signal.aborted) {
-        resolve(true)
-        return
-      }
-      const onAbort = () => {
-        clearTimeout(timer)
-        resolve(true)
-      }
-      const timer = setTimeout(() => {
-        signal.removeEventListener('abort', onAbort)
-        resolve(false)
-      }, ms)
-      signal.addEventListener('abort', onAbort, { once: true })
-    })
+    return abortableDelay(ms, signal)
   }
 
   /** turn/start 窄路径自动重试门。**全部**满足才允许重试(fail-closed):
@@ -2482,6 +2332,7 @@ export class CodexAppServerRunner extends EventEmitter {
     automaticRetryState?: AutomaticRetryState,
     traceId?: string | null,
     readOnly = false,
+    turnServiceTier: ServiceTier | null = this._serviceTier,
   ): Promise<void> {
     const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     const startedAt = Date.now()
@@ -2732,7 +2583,7 @@ export class CodexAppServerRunner extends EventEmitter {
           log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
             stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
           tres = (await withCodexTurnTrace(this.threadId, turnTraceId, () =>
-            this.sendRequest('turn/start', this.buildTurnStartParams(prompt)))) as
+            this.sendRequest('turn/start', this.buildTurnStartParams(prompt, turnServiceTier)))) as
             | { turn?: { id?: string } }
             | undefined
         } catch (startErr) {
@@ -3113,14 +2964,6 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 }
 
-function normalisePrompt(input: string | Array<{ type: string; text?: string }>): string {
-  if (typeof input === 'string') return input
-  const parts: string[] = []
-  for (const b of input) {
-    if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
-  }
-  return parts.join('\n')
-}
 
 // Re-export internal helpers for the test harness — the test patches
 // `_classifyJsonRpcLine` to feed synthetic JSON-RPC frames.

@@ -60,6 +60,7 @@ import {
   type FrameEffects,
 } from "./reducer";
 import { CONTROL_PERSIST_TIMEOUT_MS } from "./controlReceipts";
+import { writeSessionServiceTier } from "../sessionServiceTier";
 import {
   ChatSocket,
   LIVE_JOURNAL_MAX_PAGES,
@@ -5554,6 +5555,110 @@ describe("ChatSocket interrupted continuation", () => {
     expect(payloads[0].content.media).toBeUndefined();
     expect(payloads[0].content.text).not.toContain("原始任务");
     sock.stop();
+  });
+
+  test("OCV5-798: 中断后切模并显式选回标准时，手动继续不回退到旧轮 Ultrafast；保持 Ultrafast 则保留 6x", async () => {
+    localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    try {
+      const sock = makeSocket();
+      sock.setGateReady(true);
+      const ws = FakeWS.instances.at(-1)!;
+      ws.open();
+      const session = sock.ensureSession("s-cont-tier", "main");
+      session.messages.push(
+        {
+          id: "u-ultra",
+          role: "user",
+          text: "task",
+          ts: 1,
+          status: "read",
+          _routing: { model: "gpt-6.2-sol", serviceTier: "ultrafast" },
+        },
+        {
+          id: "thinking-ultra",
+          role: "thinking",
+          text: "progress",
+          ts: 2,
+          _source: "server",
+          _turnTapeId: "tape-ultra",
+          _clientMessageId: "u-ultra",
+        },
+        {
+          id: "err-ultra",
+          role: "assistant",
+          text: "",
+          ts: 3,
+          _source: "server",
+          _turnTapeId: "tape-ultra",
+          _clientMessageId: "u-ultra",
+          _errorCode: "LIVENESS_TIMEOUT",
+        },
+      );
+      sock.setSessionModel("s-cont-tier", "gpt-6.2-sol-1m");
+      writeSessionServiceTier("s-cont-tier", null);
+      sock.continueInterruptedTurn({ sessId: "s-cont-tier", errorMessageId: "err-ultra", agentId: "main" });
+      await Promise.resolve();
+      await Promise.resolve();
+      const stdPayloads = ws.sent
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((p) => p.type === "inbound.message");
+      expect(stdPayloads).toHaveLength(1);
+      expect(stdPayloads[0]?.model).toBe("gpt-6.2-sol-1m");
+      expect("serviceTier" in stdPayloads[0]!).toBe(false);
+      sock.stop();
+
+      // Positive control: explicit ultrafast in current session IS preserved across manual continuation on Sol-1m.
+      FakeWS.instances = [];
+      const sock2 = makeSocket();
+      sock2.setGateReady(true);
+      const ws2 = FakeWS.instances.at(-1)!;
+      ws2.open();
+      const sess2 = sock2.ensureSession("s-cont-ultra", "main");
+      sess2.messages.push(
+        {
+          id: "u-ultra-2",
+          role: "user",
+          text: "task",
+          ts: 1,
+          status: "read",
+          _routing: { model: "gpt-6.2-sol", serviceTier: "ultrafast" },
+        },
+        {
+          id: "thinking-ultra-2",
+          role: "thinking",
+          text: "progress",
+          ts: 2,
+          _source: "server",
+          _turnTapeId: "tape-ultra-2",
+          _clientMessageId: "u-ultra-2",
+        },
+        {
+          id: "err-ultra-2",
+          role: "assistant",
+          text: "",
+          ts: 3,
+          _source: "server",
+          _turnTapeId: "tape-ultra-2",
+          _clientMessageId: "u-ultra-2",
+          _errorCode: "LIVENESS_TIMEOUT",
+        },
+      );
+      sock2.setSessionModel("s-cont-ultra", "gpt-6.2-sol-1m");
+      writeSessionServiceTier("s-cont-ultra", "ultrafast");
+      sock2.continueInterruptedTurn({ sessId: "s-cont-ultra", errorMessageId: "err-ultra-2", agentId: "main" });
+      await Promise.resolve();
+      await Promise.resolve();
+      const ultraPayloads = ws2.sent
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((p) => p.type === "inbound.message");
+      expect(ultraPayloads).toHaveLength(1);
+      expect(ultraPayloads[0]?.model).toBe("gpt-6.2-sol-1m");
+      expect(ultraPayloads[0]?.serviceTier).toBe("ultrafast");
+      sock2.stop();
+    } finally {
+      localStorage.clear();
+    }
   });
 
   test("两个独立 tab 对同一中断轮生成相同 durable identity", async () => {

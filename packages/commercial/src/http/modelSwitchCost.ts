@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { isClientMessageId, type ModelSwitchCostRequest } from '@openclaude/protocol'
+import { isClientMessageId, isServiceTier, type ModelSwitchCostRequest } from '@openclaude/protocol'
 import { requireAuth } from './auth.js'
 import { readJsonBody, sendJson, HttpError } from './util.js'
 import type { CommercialHttpDeps } from './handlers.js'
@@ -34,8 +34,10 @@ export async function handleModelSwitchCost(
     typeof b.agentId !== 'string' ||
     !/^[A-Za-z0-9_-]{1,128}$/.test(b.agentId) ||
     (b.teamMode !== undefined && typeof b.teamMode !== 'boolean') ||
+    (b.collabMode !== undefined && b.collabMode !== 'solo' && b.collabMode !== 'advisor' && b.collabMode !== 'team') ||
+    (b.advisorModel !== undefined && (typeof b.advisorModel !== 'string' || b.advisorModel.length > 128)) ||
     (b.contextTier !== undefined && b.contextTier !== '300k' && b.contextTier !== '1m') ||
-    (b.serviceTier !== undefined && b.serviceTier !== 'fast') ||
+    (b.serviceTier !== undefined && !isServiceTier(b.serviceTier)) ||
     (b.text !== undefined && typeof b.text !== 'string') ||
     (b.mediaCount !== undefined &&
       (typeof b.mediaCount !== 'number' ||
@@ -55,8 +57,10 @@ export async function handleModelSwitchCost(
     targetModel: b.targetModel,
     agentId: b.agentId,
     ...(b.teamMode === true ? { teamMode: true } : {}),
+    ...(typeof b.collabMode === 'string' ? { collabMode: b.collabMode } : {}),
+    ...(typeof b.advisorModel === 'string' ? { advisorModel: b.advisorModel } : {}),
     ...(b.contextTier ? { contextTier: b.contextTier as '300k' | '1m' } : {}),
-    ...(b.serviceTier === 'fast' ? { serviceTier: 'fast' as const } : {}),
+    ...(isServiceTier(b.serviceTier) ? { serviceTier: b.serviceTier } : {}),
     ...(typeof b.text === 'string' ? { text: b.text } : {}),
     ...(typeof b.mediaCount === 'number' ? { mediaCount: b.mediaCount } : {}),
   }

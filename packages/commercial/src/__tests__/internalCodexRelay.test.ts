@@ -614,6 +614,7 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
           session_id: 'legacy-session',
           conversation_id: 'legacy-conversation',
           'x-codex-turn-state': 'request-turn-state',
+          'x-codex-routing-hint': 'model=gpt-6.2-sol;tier=ultrafast',
           'x-openai-internal-codex-responses-lite': 'true',
           'x-codex-installation-id': 'must-not-leave-relay',
           'x-unknown-client-header': 'must-not-leave-relay',
@@ -634,6 +635,7 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
       assert.equal(captured.headers?.get('conversation_id'), 'legacy-conversation')
       assert.equal(captured.headers?.has('connection'), false)
       assert.equal(captured.headers?.get('x-codex-turn-state'), 'request-turn-state')
+      assert.equal(captured.headers?.get('x-codex-routing-hint'), 'model=gpt-6.2-sol;tier=ultrafast')
       assert.equal(captured.headers?.get('x-openai-internal-codex-responses-lite'), 'true')
       assert.equal(captured.headers?.has('x-codex-installation-id'), false)
       assert.equal(captured.headers?.has('x-unknown-client-header'), false)

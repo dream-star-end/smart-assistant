@@ -20,7 +20,7 @@ import { appUpdate } from "./lib/appUpdate";
 import {
   type CursorContextTier,
   cursorModelSupportsContextTier,
-  supportsFastServiceTier,
+  normalizeServiceTierForModel,
   isCodexEngineModel,
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
@@ -52,7 +52,6 @@ import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
-import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
 import { pushPaletteRecent } from "./lib/paletteRecents";
@@ -203,7 +202,6 @@ import {
 import { resolveTutorialAction } from "./lib/tutorialActions";
 import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage, ApiError } from "./lib/api";
-import { uploadFilesToProject } from "./lib/projectFileUpload";
 import { reportClientFriction } from "./lib/clientFriction";
 import { setTimelineLifecycleServerShadow } from "./lib/timeline/shadowLifecycle";
 import {
@@ -885,8 +883,12 @@ export function App() {
   }, [activeId, boardOpen, sitesOpen, projectHome]);
 
   const authorizeSwitch=useModelSwitchCost({authRef,confirmDialog,toast});
-  const switchOptionsRef=useRef<Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>>({});
+  const switchOptionsRef=useRef<Partial<Pick<ModelSwitchCostRequest,'teamMode'|'collabMode'|'advisorModel'|'contextTier'|'serviceTier'>>>({});
   const getSwitchOptions=useCallback(()=>switchOptionsRef.current,[]);
+
+  // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,提前以同步清理失效速度档)。
+  const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
+    useSessionEngineOptions(activeId);
 
   const {
     applyCollabDoc,
@@ -922,24 +924,22 @@ export function App() {
     resetSessionList,
     sessions,
     sessionsResetRef,
+    serviceTier,
+    setServiceTier,
     setModelId,
     setModelSwitchPreparing,
     setSessions,
     sockRef,
     toast,
   });
-
-  // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
-  const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
-    useSessionEngineOptions(activeId);
-  switchOptionsRef.current={teamMode:agent.id==='main'&&teamMode,contextTier,...(serviceTier==='fast'?{serviceTier}: {})};
+  switchOptionsRef.current={teamMode:agent.id==='main'&&teamMode,...(agent.id==='main'?{collabMode:collabUi.mode,...(collabUi.advisorModel?{advisorModel:collabUi.advisorModel}:{})}:{}),contextTier,...(serviceTier?{serviceTier}:{})};
 
   const { draftSessionId, stopPreparing } = useDraftPreparation({
     auth, userId: user?.id ?? null, activeId, agentId: agent.id, modelId,
     effortLevel: effortForModel(models, effectiveEffortModelId(modelId, false),
       sessionEffort !== undefined ? sessionEffort : preferenceEffort),
     enabled: !demo && laneReady && view === "app" && serverListSettled && !activeId &&
-      !draftProjectId && !projectHome && !boardOpen && !sitesOpen && collabMode === "solo" && serviceTier !== "fast" &&
+      !draftProjectId && !projectHome && !boardOpen && !sitesOpen && collabMode === "solo" && normalizeServiceTierForModel(modelId, serviceTier) === null &&
       !!modelId && isCodexEngineModel(modelId) && models.some(m => m.id === modelId),
   });
 
