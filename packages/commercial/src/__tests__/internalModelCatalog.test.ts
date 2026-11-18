@@ -550,4 +550,31 @@ describe("OCV5-518 local Box context ownership", () => {
     assert.equal(view.resolve("box-api-claude-haiku-5-5")?.contextOwner, "box-native-v1");
     assert.equal(view.resolve("claude-opus-5-5-remote")?.contextOwner, undefined);
   });
+
+  test("remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)", async () => {
+    const ownerProfile = {
+      supportsVision: false,
+      reasoning: { supported: ["low" as const], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" as const },
+    };
+    const models = [
+      entry({ entryId: 61, modelId: "box-api-claude-haiku-5-5", providerId: "box_cli", capabilityProfile: ownerProfile }),
+      entry({ entryId: 62, modelId: "claude-opus-5-5-remote", providerId: "remote_pool", capabilityProfile: ownerProfile }),
+    ];
+    const snap = new ModelCatalogSnapshot({
+      entries: models,
+      aliases: new Map(),
+      pricing: new Map(models.map((m) => [m.modelId, price(m.modelId)])),
+      securityEpoch: 6n,
+    });
+    const res = makeRes();
+    await handler({ snapshot: snap })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.models.find((m) => m.model_id === "box-api-claude-haiku-5-5")?.context_owner, "box-native-v1");
+    assert.equal(body.models.find((m) => m.model_id === "claude-opus-5-5-remote")?.context_owner, undefined);
+    const view = parseCatalogResponse(body);
+    assert.equal(view.resolve("box-api-claude-haiku-5-5")?.contextOwner, "box-native-v1");
+    assert.equal(view.resolve("claude-opus-5-5-remote")?.contextOwner, undefined);
+  });
 });

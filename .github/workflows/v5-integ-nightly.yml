@@ -32,6 +32,9 @@ concurrency:
   group: v5-integ-nightly-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
 jobs:
   nightly:
     name: integ ${{ matrix.shard }}

@@ -151,25 +151,47 @@ describe('0307 antigravity engine schema', () => {
         enabled: false,
         visibility: selfhost ? 'public' : 'admin',
       },
-      ...(selfhost ? [{
-        model_id: 'antigravity-gemini-4-carbon', state: 'staged',
-        enabled: false, visibility: 'public',
-      }, {
-        model_id: 'antigravity-gemini-4-hydrogen', state: 'staged',
-        enabled: false, visibility: 'admin',
-      }] : []),
+      ...(selfhost
+        ? [
+            {
+              model_id: 'antigravity-gemini-4-carbon',
+              state: 'staged',
+              enabled: false,
+              visibility: 'public',
+            },
+            {
+              model_id: 'antigravity-gemini-4-hydrogen',
+              state: 'staged',
+              enabled: false,
+              visibility: 'admin',
+            },
+          ]
+        : [
+            {
+              model_id: 'antigravity-gemini-4-carbon',
+              state: 'staged',
+              enabled: false,
+              visibility: 'admin',
+            },
+            {
+              model_id: 'antigravity-gemini-4-hydrogen',
+              state: 'staged',
+              enabled: false,
+              visibility: 'admin',
+            },
+          ]),
       {
         model_id: 'antigravity-gpt-oss-120b',
         state: 'staged',
         enabled: false,
         visibility: 'admin',
       },
-      ...(selfhost ? [{
+      {
         model_id: 'antigravity-orchestrator-carbon',
         state: 'staged',
         enabled: false,
         visibility: 'admin',
-      }] : []),
+      },
     ])
     // An automatic path can never leave an account disabled without admin provenance.
     await assert.rejects(
@@ -570,14 +592,15 @@ describe('Gemini 4 Argon staged pricing (OCV5-517)', () => {
 describe('Gemini 4 Carbon staged pricing (OCV5-757)', () => {
   test('new public family stays staged with explicit medium effort and the same introductory rates as Argon', async (t) => {
     if (db.skipIfUnavailable(t)) return
-    const r=await query(`SELECT c.state,c.upstream_model_id,c.context_window,p.enabled,p.visibility,p.default_effort,
+    const r = await query(`SELECT c.state,c.upstream_model_id,c.context_window,p.enabled,p.visibility,p.default_effort,
       p.input_per_mtok::text AS input,p.output_per_mtok::text AS output,p.cache_read_per_mtok::text AS cached,
       p.cache_write_per_mtok::text AS cache_write,p.multiplier::text AS multiplier
       FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-gemini-4-carbon'`)
-    // No catalog seed is imported into commercial by the compatibility migration.
-    assert.deepEqual(r.rows,selfhost ? [{ state:'staged',upstream_model_id:'gemini-4-carbon-medium',context_window:1048576,
-      enabled:false,visibility:'public',default_effort:'medium',input:'100',output:'500',cached:'5',
-      cache_write:'0',multiplier:'1.000' }] : [])
+    assert.deepEqual(r.rows, [{
+      state: 'staged', upstream_model_id: 'gemini-4-carbon-medium', context_window: 1048576,
+      enabled: false, visibility: selfhost ? 'public' : 'admin', default_effort: 'medium',
+      input: '100', output: '500', cached: '5', cache_write: '0', multiplier: '1.000',
+    }])
   })
 })
 
@@ -588,24 +611,19 @@ describe('Gemini 4 Hydrogen staged pricing (OCV5-768)', () => {
       p.input_per_mtok::text AS input,p.output_per_mtok::text AS output,p.cache_read_per_mtok::text AS cached,
       p.cache_write_per_mtok::text AS cache_write,p.multiplier::text AS multiplier
       FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-gemini-4-hydrogen'`)
-    assert.deepEqual(
-      r.rows,
-      selfhost
-        ? [{
-            state: 'staged',
-            upstream_model_id: 'gemini-4-hydrogen-high',
-            context_window: 1048576,
-            enabled: false,
-            visibility: 'admin',
-            default_effort: 'high',
-            input: '75',
-            output: '375',
-            cached: '4',
-            cache_write: '0',
-            multiplier: '1.000',
-          }]
-        : [],
-    )
+    assert.deepEqual(r.rows, [{
+      state: 'staged',
+      upstream_model_id: 'gemini-4-hydrogen-high',
+      context_window: 1048576,
+      enabled: false,
+      visibility: 'admin',
+      default_effort: 'high',
+      input: '75',
+      output: '375',
+      cached: '4',
+      cache_write: '0',
+      multiplier: '1.000',
+    }])
   })
 })
 
@@ -616,24 +634,19 @@ describe('Orchestrator Carbon staged pricing (OCV5-769)', () => {
       p.input_per_mtok::text AS input,p.output_per_mtok::text AS output,p.cache_read_per_mtok::text AS cached,
       p.cache_write_per_mtok::text AS cache_write,p.multiplier::text AS multiplier
       FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-orchestrator-carbon'`)
-    assert.deepEqual(
-      r.rows,
-      selfhost
-        ? [{
-            state: 'staged',
-            upstream_model_id: 'gemini-pro-orchestrator',
-            context_window: 1048576,
-            enabled: false,
-            visibility: 'admin',
-            default_effort: null,
-            input: '100',
-            output: '500',
-            cached: '5',
-            cache_write: '0',
-            multiplier: '1.000',
-          }]
-        : [],
-    )
+    assert.deepEqual(r.rows, [{
+      state: 'staged',
+      upstream_model_id: 'gemini-pro-orchestrator',
+      context_window: 1048576,
+      enabled: false,
+      visibility: 'admin',
+      default_effort: null,
+      input: '100',
+      output: '500',
+      cached: '5',
+      cache_write: '0',
+      multiplier: '1.000',
+    }])
   })
 })
 

@@ -241,7 +241,7 @@ export function grokVisionHeaders(accessToken: Buffer, canonicalModel: string): 
     "x-authenticateresponse": "authenticate-response",
     "x-grok-model-override": canonicalModel,
     "x-grok-client-mode": "headless",
-    "x-grok-client-version": "1.0.62",
+    "x-grok-client-version": "1.0.77",
     "x-grok-client-identifier": "openclaude-vision",
   };
 }

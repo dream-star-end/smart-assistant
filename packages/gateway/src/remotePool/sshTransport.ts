@@ -427,9 +427,12 @@ function assertValidSshHostAndController(
   )
 }
 
-function assertPinnedSshFiles(target: Pick<RemoteCcTarget, 'keyPath' | 'knownHostsPath'>): void {
+function assertPinnedSshFiles(
+  target: Pick<RemoteCcTarget, 'keyPath' | 'knownHostsPath'>,
+  lstat: typeof lstatSync = lstatSync,
+): void {
   for (const filePath of [target.keyPath, target.knownHostsPath]) {
-    const st = lstatSync(filePath)
+    const st = lstat(filePath)
     remotePoolNeed(
       isAbsolute(filePath) &&
         st.isFile() &&
@@ -525,6 +528,7 @@ export class RemotePoolProbeHost {
     target: RemoteCcTarget,
     spec: RemotePoolProbeSpec,
     spawnSsh: (args: string[]) => ChildProcessWithoutNullStreams = defaultSpawnSsh,
+    lstat: typeof lstatSync = lstatSync,
   ): RemotePoolProbeHost {
     assertValidSshHostAndController(target, spec.controllerPath, spec.controllerSha256)
     remotePoolNeed(
@@ -534,7 +538,7 @@ export class RemotePoolProbeHost {
       'REMOTE_PROBE_SPEC_INVALID',
     )
     validateProbeSpecForSshTarget(target, spec)
-    assertPinnedSshFiles(target)
+    assertPinnedSshFiles(target, lstat)
     return new RemotePoolProbeHost(spec, () =>
       spawnSsh(buildPinnedSshArgs(target, spec.controllerPath, 'probe', spec.probeRoot)),
     )

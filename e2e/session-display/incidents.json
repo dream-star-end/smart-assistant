@@ -10762,6 +10762,9 @@
           "path": "scripts/check-v5-master-incident-proofs.ts",
           "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
         }
+      ],
+      "coverageCommits": [
+        "912454e6"
       ]
     },
     {

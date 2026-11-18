@@ -290,7 +290,7 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # P1d / v5 ccb 单底座:OC_INCLUDE_CODEX=0 → 不装 codex CLI(镜像更小、冷启更快;v5 runner
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
-ARG OC_CODEX_VERSION=0.163.0
+ARG OC_CODEX_VERSION=0.169.0
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
       npm install -g "@openai/codex@${OC_CODEX_VERSION}" --no-audit --no-fund \
       && test "$(codex --version)" = "codex-cli ${OC_CODEX_VERSION}" \
@@ -358,7 +358,7 @@ COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/cod
 # native binary under $GROK_HOME; copy that verified binary to /usr/local/bin so
 # per-user persistent homes do not each receive a ~100 MB duplicate.
 ARG OC_INCLUDE_GROK=0
-ARG OC_GROK_VERSION=1.0.62
+ARG OC_GROK_VERSION=1.0.77
 RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
       npm install -g "@xai-official/grok@${OC_GROK_VERSION}" --no-audit --no-fund; \
       grok --version | grep -q "^grok ${OC_GROK_VERSION} "; \
@@ -805,9 +805,9 @@ RUN set -eux; \
 # 1.5.0 (docs/antigravity-large-history-resume.md). No Node dependency. Auto-update
 # is disabled at runtime by the adapter (AGY_CLI_DISABLE_AUTO_UPDATE=true).
 ARG OC_INCLUDE_ANTIGRAVITY=0
-ARG OC_ANTIGRAVITY_CLI_VERSION=1.5.0
-ARG OC_ANTIGRAVITY_CLI_BUILD=1.5.0-5269980577660928
-ARG OC_ANTIGRAVITY_CLI_SHA512=e6031f850929210705d8c2393a5665b82b8c3b19684a6d3c556cafa31f26f77acbf164dfee96ca84a5ae7670ac0cc238a974c981c517b269194bdccff271cbd5
+ARG OC_ANTIGRAVITY_CLI_VERSION=1.5.8
+ARG OC_ANTIGRAVITY_CLI_BUILD=1.5.8-4602374149505024
+ARG OC_ANTIGRAVITY_CLI_SHA512=f08faaee588327dba8722bdc60f26a14f6915a8f2d756ed7959cde0a706d4e62fd9f831ab1a077dace5f947caaa6e851457df5023180bb8d3f54386804a3787f
 RUN if [ "$OC_INCLUDE_ANTIGRAVITY" = "1" ]; then set -eux; \
       test "$(dpkg --print-architecture)" = amd64; \
       archive=/tmp/antigravity-cli-${OC_ANTIGRAVITY_CLI_VERSION}.tar.gz; \

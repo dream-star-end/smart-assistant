@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
@@ -79,9 +79,29 @@ test('RemotePoolProbeHost.forSshTarget pins probe-only role and exposes no execu
       /REMOTE_SSH_TARGET_OR_CONTROLLER_INVALID/,
     )
 
+    const rootStat: typeof lstatSync = ((
+      pathArg: Parameters<typeof lstatSync>[0],
+      opts?: Parameters<typeof lstatSync>[1],
+    ) => {
+      const st = lstatSync(pathArg, opts as never)
+      return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { uid: 0 })
+    }) as typeof lstatSync
+    const nonRootStat: typeof lstatSync = ((
+      pathArg: Parameters<typeof lstatSync>[0],
+      opts?: Parameters<typeof lstatSync>[1],
+    ) => {
+      const st = lstatSync(pathArg, opts as never)
+      return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { uid: 1000 })
+    }) as typeof lstatSync
+
+    assert.throws(
+      () => RemotePoolProbeHost.forSshTarget(target, spec, undefined, nonRootStat),
+      /REMOTE_SSH_KEY_OR_KNOWN_HOSTS_UNSAFE/,
+    )
+
     chmodSync(keyPath, 0o644)
     assert.throws(
-      () => RemotePoolProbeHost.forSshTarget(target, spec),
+      () => RemotePoolProbeHost.forSshTarget(target, spec, undefined, rootStat),
       /REMOTE_SSH_KEY_PERMISSIONS_UNSAFE/,
     )
     chmodSync(keyPath, 0o600)
@@ -89,12 +109,16 @@ test('RemotePoolProbeHost.forSshTarget pins probe-only role and exposes no execu
     const linkKey = join(dir, 'symlink_key')
     symlinkSync(keyPath, linkKey)
     assert.throws(
-      () => RemotePoolProbeHost.forSshTarget({ ...target, keyPath: linkKey }, spec),
+      () =>
+        RemotePoolProbeHost.forSshTarget({ ...target, keyPath: linkKey }, spec, undefined, rootStat),
       /REMOTE_SSH_KEY_OR_KNOWN_HOSTS_UNSAFE/,
     )
 
     let capturedArgs: string[] = []
-    const hostObj = RemotePoolProbeHost.forSshTarget(target, spec, (args) => {
+    const hostObj = RemotePoolProbeHost.forSshTarget(
+      target,
+      spec,
+      (args) => {
       capturedArgs = args
       const snapshot: RemoteProbeSnapshot = {
         schemaVersion: 4,
@@ -130,7 +154,9 @@ test('RemotePoolProbeHost.forSshTarget pins probe-only role and exposes no execu
         probeFingerprint: '1'.repeat(64),
       }
       return createMockChild(`${JSON.stringify(frame)}\n`)
-    })
+      },
+      rootStat,
+    )
 
     // Probe-only transport must not expose lane execution or stop methods
     assert.equal('open' in hostObj, false)

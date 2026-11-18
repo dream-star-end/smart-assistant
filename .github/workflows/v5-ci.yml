@@ -18,6 +18,9 @@ concurrency:
   group: v5-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
 jobs:
   # 调度闸(2026-08-22):required 6 个 check 与轻量非 required 仍立即入队。
   # typecheck 在 suite matrix 里,needs 不能指向单个 matrix 分片;新建秒级独立
