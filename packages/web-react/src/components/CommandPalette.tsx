@@ -63,6 +63,7 @@ export type CommandPaletteProps = {
   onCreateProject: (name?: string) => void;
   onMoveSession?: (session: Session, projectId: string | null) => void;
   onOpenBoard?: () => void;
+  onOpenSites?: () => void;
 };
 
 type RemoteResults = { q: string; hits: SessionSearchHit[]; assets: ProjectAsset[] };
@@ -165,6 +166,7 @@ export function CommandPalette(props: CommandPaletteProps) {
         canMoveSession: !!movable,
         canOpenHome: !props.onProjectHome,
         canOpenBoard: !!props.onOpenBoard,
+        canOpenSites: !!props.onOpenSites,
       }),
     });
   }, [
@@ -181,6 +183,7 @@ export function CommandPalette(props: CommandPaletteProps) {
     props.onNewSessionInProject,
     props.onProjectHome,
     props.onOpenBoard,
+    props.onOpenSites,
   ]);
   const flat = useMemo(() => flattenPalette(groups), [groups]);
 
@@ -231,6 +234,10 @@ export function CommandPalette(props: CommandPaletteProps) {
       case "open-board":
         close();
         props.onOpenBoard?.();
+        return;
+      case "open-sites":
+        close();
+        props.onOpenSites?.();
         return;
     }
   };

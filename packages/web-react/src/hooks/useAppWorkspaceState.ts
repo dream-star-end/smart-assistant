@@ -1,7 +1,19 @@
 import { useCallback, useState } from "react";
 import type { AuthMode } from "../components/AuthGate";
 import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
-import { readLocationRoute, parseSessionPath, parseProjectPath, parseBoardView, preferredBoardView, parseBoardTicket, parseBoardTicketType, type BoardViewParam, type ProjectRoute } from "./useAppRoute";
+import type { Session, UserSiteItem } from "../lib/types";
+import {
+  readLocationRoute,
+  parseSessionPath,
+  parseProjectPath,
+  parseSitesPath,
+  parseBoardView,
+  preferredBoardView,
+  parseBoardTicket,
+  parseBoardTicketType,
+  type BoardViewParam,
+  type ProjectRoute,
+} from "./useAppRoute";
 
 /** Route-derived workspace state; read location on every render, not just mount. */
 export function useAppWorkspaceState() {
@@ -18,16 +30,32 @@ export function useAppWorkspaceState() {
   const [boardOpen, setBoardOpenState] = useState(
     () => TASKBOARD_ENABLED && routingEnabled && location.pathname === "/board",
   );
+  // 站点工作区（/sites 或 /sites/<slug>）：并列工作区，取代原 ManageCenter 弹窗 Tab。
+  const [sitesOpen, setSitesOpenState] = useState(
+    () => routingEnabled && parseSitesPath(location.pathname) !== null,
+  );
+  const [activeSiteSlug, setActiveSiteSlug] = useState<string | null>(() =>
+    routingEnabled ? (parseSitesPath(location.pathname)?.slug ?? null) : null,
+  );
   // 项目主页(/p/<id>[/<tab>])：第三个并列工作区。null = 不在项目主页。
   const [projectHome, setProjectHome] = useState<ProjectRoute | null>(null);
   // 启动深链 /p/<id> 的未决目标：等项目列表到达再打开(useAppRoute),不存在则回 /。
   const [pendingRouteProject, setPendingRouteProject] = useState<ProjectRoute | null>(() =>
     routingEnabled ? parseProjectPath(location.pathname) : null,
   );
-  // 所有「去对话 / 去任务面板」的入口都经这里：切工作区即离开项目主页。
+  // 所有「去对话 / 去任务面板 / 去站点」的入口都经这里：切工作区即离开其余并列工作区。
   // 用户主动导航也作废未决的 /p/<id> 深链恢复(否则列表迟到后会把人拽回项目主页)。
   const setBoardOpen = useCallback((open: boolean) => {
     setBoardOpenState(open);
+    setSitesOpenState(false);
+    setActiveSiteSlug(null);
+    setProjectHome(null);
+    setPendingRouteProject(null);
+  }, []);
+  const openSites = useCallback((slug: string | null = null) => {
+    setSitesOpenState(true);
+    setActiveSiteSlug(slug);
+    setBoardOpenState(false);
     setProjectHome(null);
     setPendingRouteProject(null);
   }, []);
@@ -47,9 +75,27 @@ export function useAppWorkspaceState() {
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   return {
     urlRoute, params, demo, resetToken, desktopEnroll, studio, routingEnabled,
-    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, setBoardOpenState, projectHome,
-    setProjectHome, pendingRouteProject, setPendingRouteProject, boardView, setBoardView,
+    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, setBoardOpenState,
+    sitesOpen, setSitesOpenState, activeSiteSlug, setActiveSiteSlug, openSites,
+    projectHome, setProjectHome, pendingRouteProject, setPendingRouteProject, boardView, setBoardView,
     boardTicketId, setBoardTicketId, boardTicketType, setBoardTicketType, view,
     setView, authMode, setAuthMode,
+  };
+}
+
+export function resolveSiteEditTarget(
+  site: UserSiteItem,
+  sessions: readonly Session[],
+): { sessionId: string | null; prompt: string } {
+  const rawOrigin = site.originSessionId ?? "";
+  const peerId = rawOrigin.includes(":dm:") ? rawOrigin.split(":dm:").pop()! : rawOrigin;
+  const match = peerId
+    ? sessions.find((s) => s.id === peerId || s.id === rawOrigin)
+    : undefined;
+  return {
+    sessionId: match?.id ?? null,
+    prompt: match
+      ? `请继续修改已部署的站点「${site.title}」（${site.slug}）：`
+      : `请修改并重新发布已部署的站点「${site.title}」（slug: ${site.slug}）：`,
   };
 }

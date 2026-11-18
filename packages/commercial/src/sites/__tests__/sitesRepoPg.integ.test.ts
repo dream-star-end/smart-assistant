@@ -16,6 +16,7 @@ import { SitesError, encodeSiteBundle } from '../types.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const MIGRATION_0345 = resolve(HERE, '../../db/migrations/0345_user_sites.sql')
+const MIGRATION_0347 = resolve(HERE, '../../db/migrations/0347_user_sites_fullstack.sql')
 const EDGE_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
 const targetUrl = new URL(
@@ -49,8 +50,8 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
     await admin.query(`CREATE SCHEMA ${SCHEMA}`)
     await pool.query('CREATE TABLE users (id INTEGER PRIMARY KEY)')
     await pool.query('INSERT INTO users (id) VALUES (1), (2)')
-    const ddl = readFileSync(MIGRATION_0345, 'utf8')
-    await pool.query(ddl)
+    await pool.query(readFileSync(MIGRATION_0345, 'utf8'))
+    await pool.query(readFileSync(MIGRATION_0347, 'utf8'))
 
     workDir = mkdtempSync(join(tmpdir(), 'oc-sites-pg-integ-'))
     const edge = createSitesEdgeServer({
@@ -194,11 +195,12 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
       edge: {
         ...rawEdge,
         async pushBundle(args) {
-          await rawEdge.pushBundle(args)
+          const out = await rawEdge.pushBundle(args)
           if (failPushOnce) {
             failPushOnce = false
             throw new SitesError('EDGE_UNAVAILABLE', 'dropped ack', 502, true)
           }
+          return out
         },
         async updateMeta(args) {
           await rawEdge.updateMeta(args)
@@ -278,5 +280,132 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
 
     await svcDoubleFault.deleteSite(1, orphanSlug)
     assert.equal((await svcDoubleFault.listSummary(1)).sites.length, 0)
+  })
+
+  test('0347 migration: encrypted secrets at rest, unique verified custom_domain, and renameSite preserving env + crash recovery', async () => {
+    const repo = createPgSitesRepo(pool)
+    const txtRecords = new Map<string, string[][]>()
+    const resolveTxt = async (host: string) => txtRecords.get(host) ?? []
+    const svc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      edgeSecret: EDGE_SECRET,
+      repo,
+      edge: rawEdge,
+      resolveTxt,
+    })
+
+    const created = await svc.publishSite(1, {
+      slug: 'pg-fs-alpha',
+      title: 'Alpha Fullstack',
+      originSessionId: 'agent:main:webchat:dm:alpha',
+      gzippedBundle: buildBundle('<h1>ALPHA</h1>'),
+    })
+    assert.equal(created.originSessionId, 'agent:main:webchat:dm:alpha')
+
+    await svc.setEnvVar(1, 'pg-fs-alpha', {
+      key: 'DEEPSEEK_API_KEY',
+      value: 'sk-live-secret-999',
+      isSecret: true,
+    })
+    await svc.setEnvVar(1, 'pg-fs-alpha', {
+      key: 'PUBLIC_APP_NAME',
+      value: 'DemoApp',
+      isSecret: false,
+    })
+
+    const rawEnvRows = await pool.query<{
+      env_key: string
+      is_secret: boolean
+      plain_value: string | null
+      ciphertext: Buffer | null
+      nonce: Buffer | null
+    }>(
+      `SELECT env_key, is_secret, plain_value, ciphertext, nonce
+       FROM user_site_env_vars
+       WHERE site_id = $1
+       ORDER BY env_key ASC`,
+      [created.id],
+    )
+    assert.equal(rawEnvRows.rows.length, 2)
+    const secretRow = rawEnvRows.rows.find((r) => r.env_key === 'DEEPSEEK_API_KEY')!
+    assert.equal(secretRow.is_secret, true)
+    assert.equal(secretRow.plain_value, null)
+    assert.ok(secretRow.ciphertext && secretRow.ciphertext.length > 0)
+    assert.ok(secretRow.nonce && secretRow.nonce.length > 0)
+    assert.equal(secretRow.ciphertext.toString('utf8').includes('sk-live-secret-999'), false)
+
+    const maskedDtos = await svc.listEnvVars(1, 'pg-fs-alpha')
+    assert.equal(maskedDtos.find((v) => v.key === 'DEEPSEEK_API_KEY')?.value, null)
+    assert.equal(maskedDtos.find((v) => v.key === 'PUBLIC_APP_NAME')?.value, 'DemoApp')
+
+    await svc.publishSite(2, {
+      slug: 'pg-fs-beta',
+      gzippedBundle: buildBundle('<h1>BETA</h1>'),
+    })
+    const pendingAlpha = await svc.updateSite(1, 'pg-fs-alpha', { customDomain: 'portal.customer.com' })
+    assert.equal(pendingAlpha.customDomainStatus, 'pending')
+    txtRecords.set(pendingAlpha.customDomainTxtName!, [[pendingAlpha.customDomainTxtValue!]])
+    const verifiedAlpha = await svc.verifyCustomDomain(1, 'pg-fs-alpha')
+    assert.equal(verifiedAlpha.customDomainStatus, 'verified')
+
+    await assert.rejects(
+      () => svc.updateSite(2, 'pg-fs-beta', { customDomain: 'portal.customer.com' }),
+      (e: unknown) => e instanceof SitesError && e.code === 'DOMAIN_TAKEN',
+    )
+    await svc.updateSite(1, 'pg-fs-alpha', { customDomain: null })
+    const pendingBeta = await svc.updateSite(2, 'pg-fs-beta', { customDomain: 'portal.customer.com' })
+    txtRecords.set(pendingBeta.customDomainTxtName!, [[pendingBeta.customDomainTxtValue!]])
+    const boundBeta = await svc.verifyCustomDomain(2, 'pg-fs-beta')
+    assert.equal(boundBeta.customDomain, 'portal.customer.com')
+    assert.equal(boundBeta.customDomainStatus, 'verified')
+
+    const renamed = await svc.renameSite(1, 'pg-fs-alpha', 'pg-fs-renamed')
+    assert.equal(renamed.slug, 'pg-fs-renamed')
+    assert.equal(renamed.originSessionId, 'agent:main:webchat:dm:alpha')
+    const envAfterRename = await svc.listEnvVars(1, 'pg-fs-renamed')
+    assert.equal(envAfterRename.length, 2)
+
+    // P0 #2 + P1 #8: Crash after Edge rename BEFORE PG commit:
+    // Target slug claim blocks concurrent user 2, and reconcile completes rename preserving secrets!
+    const crashSvc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      edgeSecret: EDGE_SECRET,
+      repo,
+      resolveTxt,
+      edge: {
+        ...rawEdge,
+        async renameSite(args) {
+          await rawEdge.renameSite(args)
+          throw new SitesError('EDGE_UNAVAILABLE', 'simulated gateway crash after rename', 502, true)
+        },
+        async getSiteStatus() {
+          throw new SitesError('EDGE_UNAVAILABLE', 'simulated probe failure before crash', 502, true)
+        },
+      },
+    })
+    await assert.rejects(
+      () => crashSvc.renameSite(1, 'pg-fs-renamed', 'pg-fs-crash-dst'),
+      (e: unknown) => e instanceof SitesError && e.code === 'EDGE_UNAVAILABLE',
+    )
+
+    // Concurrent user 2 cannot steal the reserved rename target slug
+    await assert.rejects(
+      () => svc.publishSite(2, { slug: 'pg-fs-crash-dst', gzippedBundle: buildBundle() }),
+      (e: unknown) => e instanceof SitesError && e.code === 'SLUG_TAKEN',
+    )
+
+    // Next read on user 1 reconciles rename cleanly and preserves secret env vars!
+    const u1After = await svc.listSummary(1)
+    assert.equal(u1After.sites.length, 1)
+    assert.equal(u1After.sites[0]!.slug, 'pg-fs-crash-dst')
+    const envAfterCrash = await svc.listEnvVars(1, 'pg-fs-crash-dst')
+    assert.equal(envAfterCrash.length, 2)
+
+    await svc.deleteSite(1, 'pg-fs-crash-dst')
+    await svc.deleteSite(2, 'pg-fs-beta')
   })
 })

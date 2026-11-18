@@ -12,6 +12,7 @@ import { type ContainerIdentityRepo, hashSecret } from '../../auth/containerIden
 import { signAccess } from '../../auth/jwt.js'
 import type { RequestContext } from '../../http/handlers.js'
 import { createHttpSitesEdgeClient, type SitesEdgeClient } from '../edgeClient.js'
+import { runSiteApiWorker } from '../edgeApiRunner.js'
 import { createSitesEdgeServer } from '../edgeServer.js'
 import { dispatchSitesBrowserRoute } from '../browserHttp.js'
 import { makeSitesInternalHandler } from '../internalHttp.js'
@@ -22,12 +23,14 @@ import type {
   PublishReservation,
   PublishReservationInput,
   SitesRepo,
+  StoredSiteEnvVarRow,
 } from '../repo.js'
 import { SitesService } from '../service.js'
 import {
   SitesError,
   type SiteVisibility,
   type UserSiteRow,
+  customDomainTxtValueFor,
   decodeSiteBundle,
   encodeSiteBundle,
 } from '../types.js'
@@ -44,8 +47,10 @@ function createInMemorySitesRepo(): SitesRepo & {
   expireLease(slug: string): void
 } {
   const bySlug = new Map<string, UserSiteRow>()
+  const claims = new Map<string, { siteId: string; claimKind: 'active' | 'rename_target' }>()
   const leases = new Map<string, { leaseId: string; leaseUntil: number; expectedRev: number }>()
   const targetRevs = new Map<string, number>()
+  const envStore = new Map<string, Map<string, StoredSiteEnvVarRow>>()
   let revCounter = 0
   let idSeq = 0
   const LEASE_TTL_MS = 60_000
@@ -79,7 +84,7 @@ function createInMemorySitesRepo(): SitesRepo & {
           return (
             r.userId === userId &&
             (!lease || lease.leaseUntil <= now) &&
-            (r.edgeRevision === 0 || pendingRev > r.edgeRevision)
+            (r.edgeRevision === 0 || pendingRev > r.edgeRevision || Boolean(r.opKind))
           )
         })
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
@@ -89,7 +94,7 @@ function createInMemorySitesRepo(): SitesRepo & {
       if (!cur) return null
       if (isLeaseActive(cur.id)) return null
       const pendingRev = targetRevs.get(cur.id) ?? 0
-      if (cur.edgeRevision > 0 && pendingRev <= cur.edgeRevision) return null
+      if (cur.edgeRevision > 0 && pendingRev <= cur.edgeRevision && !cur.opKind) return null
       const leaseId = randomUUID()
       leases.set(cur.id, {
         leaseId,
@@ -102,7 +107,7 @@ function createInMemorySitesRepo(): SitesRepo & {
       const cur = [...bySlug.values()].find((r) => r.id === input.siteId && r.userId === input.userId)
       if (!cur) return null
       const lease = leases.get(cur.id)
-      if (lease?.leaseId !== input.leaseId || cur.edgeRevision >= input.edgeRevision) return null
+      if (lease?.leaseId !== input.leaseId || cur.edgeRevision > input.edgeRevision) return null
       const now = new Date()
       const updated: UserSiteRow = {
         ...cur,
@@ -111,10 +116,20 @@ function createInMemorySitesRepo(): SitesRepo & {
         passwordSalt: input.passwordSalt,
         passwordHash: input.passwordHash,
         spaMode: input.spaMode,
+        customDomain: input.customDomain !== undefined ? input.customDomain : cur.customDomain,
+        customDomainVerified:
+          input.customDomain !== undefined
+            ? Boolean(input.customDomain && input.customDomainVerified)
+            : cur.customDomainVerified,
+        hasServerApi: input.hasServerApi,
+        envDigest: input.envDigest ?? cur.envDigest,
+        opKind: null,
+        opRenameToSlug: null,
+        opEnvDigest: null,
         fileCount: input.fileCount,
         sizeBytes: input.sizeBytes,
         contentSha256: input.contentSha256,
-        edgeRevision: input.edgeRevision,
+        edgeRevision: Math.max(cur.edgeRevision, input.edgeRevision),
         updatedAt: now,
         lastPublishedAt: cur.edgeRevision === 0 ? now : cur.lastPublishedAt,
       }
@@ -124,6 +139,14 @@ function createInMemorySitesRepo(): SitesRepo & {
       return updated
     },
     async beginPublishReservation(input: PublishReservationInput): Promise<PublishReservation> {
+      const claim = claims.get(input.slug)
+      if (claim && claim.claimKind === 'rename_target') {
+        const owner = [...bySlug.values()].find((r) => r.id === claim.siteId)
+        if (owner && owner.userId !== input.userId) {
+          throw new SitesError('SLUG_TAKEN', `子域名 "${input.slug}" 已被占用`, 409)
+        }
+        throw new SitesError('SLUG_BUSY', `子域名 "${input.slug}" 正在迁移中`, 409, true)
+      }
       const existing = bySlug.get(input.slug)
       const leaseId = randomUUID()
       const leaseUntil = Date.now() + LEASE_TTL_MS
@@ -140,6 +163,8 @@ function createInMemorySitesRepo(): SitesRepo & {
           )
         }
         revCounter += 1
+        bySlug.set(input.slug, { ...existing, opKind: 'publish', opRenameToSlug: null, opEnvDigest: null })
+        claims.set(input.slug, { siteId: existing.id, claimKind: 'active' })
         leases.set(existing.id, { leaseId, leaseUntil, expectedRev: existing.edgeRevision })
         targetRevs.set(existing.id, revCounter)
         return {
@@ -167,6 +192,15 @@ function createInMemorySitesRepo(): SitesRepo & {
         passwordSalt: input.passwordSalt,
         passwordHash: input.passwordHash,
         spaMode: input.spaMode,
+        customDomain: null,
+        customDomainVerified: false,
+        customDomainToken: null,
+        originSessionId: input.originSessionId ?? null,
+        hasServerApi: input.hasServerApi,
+        envDigest: '',
+        opKind: 'publish',
+        opRenameToSlug: null,
+        opEnvDigest: null,
         fileCount: 0,
         sizeBytes: 0,
         contentSha256: '',
@@ -176,6 +210,7 @@ function createInMemorySitesRepo(): SitesRepo & {
         lastPublishedAt: now,
       }
       bySlug.set(input.slug, row)
+      claims.set(input.slug, { siteId: row.id, claimKind: 'active' })
       leases.set(row.id, { leaseId, leaseUntil, expectedRev: 0 })
       targetRevs.set(row.id, revCounter)
       return {
@@ -199,6 +234,12 @@ function createInMemorySitesRepo(): SitesRepo & {
           passwordSalt: input.passwordSalt,
           passwordHash: input.passwordHash,
           spaMode: input.spaMode,
+          originSessionId: input.originSessionId ?? cur.originSessionId,
+          hasServerApi: input.hasServerApi,
+          envDigest: input.envDigest ?? cur.envDigest,
+          opKind: input.markEnvPending ? 'env' : null,
+          opRenameToSlug: null,
+          opEnvDigest: input.markEnvPending ? (input.pendingEnvDigest ?? null) : null,
           fileCount: input.fileCount,
           sizeBytes: input.sizeBytes,
           contentSha256: input.contentSha256,
@@ -208,7 +249,8 @@ function createInMemorySitesRepo(): SitesRepo & {
         }
         bySlug.set(cur.slug, updated)
         if (leases.get(cur.id)?.leaseId === input.leaseId) leases.delete(cur.id)
-        if ((targetRevs.get(cur.id) ?? 0) <= input.edgeRevision) targetRevs.delete(cur.id)
+        if (input.markEnvPending) targetRevs.set(cur.id, input.edgeRevision)
+        else if ((targetRevs.get(cur.id) ?? 0) <= input.edgeRevision) targetRevs.delete(cur.id)
         return updated
       }
       if (cur.edgeRevision === input.edgeRevision) return cur
@@ -224,6 +266,7 @@ function createInMemorySitesRepo(): SitesRepo & {
           lease?.leaseId === leaseId
         ) {
           bySlug.delete(slug)
+          claims.delete(slug)
           leases.delete(r.id)
           targetRevs.delete(r.id)
         }
@@ -235,10 +278,19 @@ function createInMemorySitesRepo(): SitesRepo & {
       const lease = leases.get(r.id)
       if (lease?.leaseId === leaseId) {
         leases.delete(r.id)
-        if (clearTarget) targetRevs.delete(r.id)
+        if (clearTarget) {
+          targetRevs.delete(r.id)
+          bySlug.set(r.slug, { ...r, opKind: null, opRenameToSlug: null, opEnvDigest: null })
+        }
       }
     },
-    async prepareMetaUpdate(userId, slug): Promise<MetaUpdateReservation> {
+    async prepareMetaUpdate(
+      userId,
+      slug,
+      opKind = 'meta',
+      pendingEnvDigest = null,
+      checkDomain = null,
+    ): Promise<MetaUpdateReservation> {
       const row = bySlug.get(slug)
       if (!row || row.userId !== userId || row.edgeRevision <= 0) {
         throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
@@ -246,15 +298,35 @@ function createInMemorySitesRepo(): SitesRepo & {
       if (isLeaseActive(row.id)) {
         throw new SitesError('SLUG_BUSY', `站点 "${slug}" 正在处理另一项变更`, 409, true)
       }
+      if (checkDomain) {
+        for (const other of bySlug.values()) {
+          if (other.id !== row.id && other.customDomain === checkDomain && other.customDomainVerified) {
+            throw new SitesError('DOMAIN_TAKEN', '该自定义域名已被其他站点绑定', 409)
+          }
+        }
+      }
       revCounter += 1
       const leaseId = randomUUID()
+      const marked: UserSiteRow = { ...row, opKind, opRenameToSlug: null, opEnvDigest: pendingEnvDigest }
+      bySlug.set(slug, marked)
       leases.set(row.id, { leaseId, leaseUntil: Date.now() + LEASE_TTL_MS, expectedRev: row.edgeRevision })
       targetRevs.set(row.id, revCounter)
-      return { site: row, leaseId, nextRevision: revCounter }
+      return { site: marked, leaseId, nextRevision: revCounter }
     },
     async commitMetaUpdate(input): Promise<UserSiteRow> {
       const cur = [...bySlug.values()].find((r) => r.id === input.siteId && r.userId === input.userId)
       if (!cur) throw new SitesError('STALE_REVISION', '站点存在更新版本或已被删除', 409)
+      if (input.customDomain) {
+        for (const other of bySlug.values()) {
+          if (
+            other.id !== cur.id &&
+            other.customDomain === input.customDomain &&
+            other.customDomainVerified
+          ) {
+            throw new SitesError('DOMAIN_TAKEN', '该自定义域名已被其他站点绑定', 409)
+          }
+        }
+      }
       if (cur.edgeRevision < input.edgeRevision) {
         const updated: UserSiteRow = {
           ...cur,
@@ -263,6 +335,13 @@ function createInMemorySitesRepo(): SitesRepo & {
           passwordSalt: input.passwordSalt,
           passwordHash: input.passwordHash,
           spaMode: input.spaMode,
+          customDomain: input.customDomain,
+          customDomainVerified: input.customDomainVerified,
+          customDomainToken: input.customDomainToken,
+          envDigest: input.envDigest ?? cur.envDigest,
+          opKind: null,
+          opRenameToSlug: null,
+          opEnvDigest: null,
           edgeRevision: input.edgeRevision,
           updatedAt: new Date(),
         }
@@ -274,6 +353,71 @@ function createInMemorySitesRepo(): SitesRepo & {
       if (cur.edgeRevision === input.edgeRevision) return cur
       throw new SitesError('STALE_REVISION', '站点存在更新版本或已被删除', 409)
     },
+    async prepareRename(userId, oldSlug, newSlug): Promise<MetaUpdateReservation> {
+      const row = bySlug.get(oldSlug)
+      if (!row || row.userId !== userId || row.edgeRevision <= 0) {
+        throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${oldSlug}"`, 404)
+      }
+      if (isLeaseActive(row.id)) {
+        throw new SitesError('SLUG_BUSY', `站点 "${oldSlug}" 正在处理另一项变更`, 409, true)
+      }
+      if (bySlug.has(newSlug) || claims.has(newSlug)) {
+        throw new SitesError('SLUG_TAKEN', `子域名 "${newSlug}" 已被占用`, 409)
+      }
+      revCounter += 1
+      const leaseId = randomUUID()
+      claims.set(newSlug, { siteId: row.id, claimKind: 'rename_target' })
+      const marked: UserSiteRow = { ...row, opKind: 'rename', opRenameToSlug: newSlug, opEnvDigest: null }
+      bySlug.set(oldSlug, marked)
+      leases.set(row.id, { leaseId, leaseUntil: Date.now() + LEASE_TTL_MS, expectedRev: row.edgeRevision })
+      targetRevs.set(row.id, revCounter)
+      return { site: marked, leaseId, nextRevision: revCounter }
+    },
+    async commitRename(input): Promise<UserSiteRow> {
+      const cur = [...bySlug.values()].find((r) => r.id === input.siteId && r.userId === input.userId)
+      if (!cur) throw new SitesError('STALE_REVISION', '站点存在更新版本或已被删除', 409)
+      if (cur.slug !== input.newSlug && bySlug.has(input.newSlug)) {
+        throw new SitesError('SLUG_TAKEN', `子域名 "${input.newSlug}" 已被占用`, 409)
+      }
+      if (cur.edgeRevision < input.edgeRevision) {
+        bySlug.delete(cur.slug)
+        claims.delete(cur.slug)
+        const updated: UserSiteRow = {
+          ...cur,
+          slug: input.newSlug,
+          opKind: null,
+          opRenameToSlug: null,
+          opEnvDigest: null,
+          edgeRevision: input.edgeRevision,
+          updatedAt: new Date(),
+        }
+        bySlug.set(input.newSlug, updated)
+        claims.set(input.newSlug, { siteId: cur.id, claimKind: 'active' })
+        if (leases.get(cur.id)?.leaseId === input.leaseId) leases.delete(cur.id)
+        if ((targetRevs.get(cur.id) ?? 0) <= input.edgeRevision) targetRevs.delete(cur.id)
+        return updated
+      }
+      if (cur.edgeRevision === input.edgeRevision && cur.slug === input.newSlug) {
+        claims.set(input.newSlug, { siteId: cur.id, claimKind: 'active' })
+        return cur
+      }
+      throw new SitesError('STALE_REVISION', '站点存在更新版本或已被删除', 409)
+    },
+    async abortRenameReservation(siteId, userId, leaseId, newSlug, clearTarget = true) {
+      const c = claims.get(newSlug)
+      if (c && c.siteId === siteId && c.claimKind === 'rename_target') {
+        claims.delete(newSlug)
+      }
+      const r = [...bySlug.values()].find((row) => row.id === siteId && row.userId === userId)
+      if (!r) return
+      if (leases.get(r.id)?.leaseId === leaseId) {
+        leases.delete(r.id)
+        if (clearTarget) {
+          targetRevs.delete(r.id)
+          bySlug.set(r.slug, { ...r, opKind: null, opRenameToSlug: null, opEnvDigest: null })
+        }
+      }
+    },
     async prepareDelete(userId, slug): Promise<DeleteReservation> {
       const row = bySlug.get(slug)
       if (!row || row.userId !== userId || row.edgeRevision <= 0) {
@@ -284,18 +428,60 @@ function createInMemorySitesRepo(): SitesRepo & {
       }
       revCounter += 1
       const leaseId = randomUUID()
+      const marked: UserSiteRow = { ...row, opKind: 'delete', opRenameToSlug: null, opEnvDigest: null }
+      bySlug.set(slug, marked)
       leases.set(row.id, { leaseId, leaseUntil: Date.now() + LEASE_TTL_MS, expectedRev: row.edgeRevision })
       targetRevs.set(row.id, revCounter)
-      return { site: row, leaseId, deleteRevision: revCounter }
+      return { site: marked, leaseId, deleteRevision: revCounter }
     },
     async commitDelete(siteId, userId, _leaseId, deleteRevision) {
       for (const [slug, r] of bySlug) {
         if (r.id === siteId && r.userId === userId && r.edgeRevision < deleteRevision) {
           bySlug.delete(slug)
+          claims.delete(slug)
           leases.delete(r.id)
           targetRevs.delete(r.id)
+          envStore.delete(r.id)
         }
       }
+    },
+    async listSiteEnvRows(siteId, userId) {
+      const site = [...bySlug.values()].find((r) => r.id === siteId && r.userId === userId)
+      if (!site) return []
+      const map = envStore.get(siteId)
+      if (!map) return []
+      return [...map.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    },
+    async upsertSiteEnvRow(input) {
+      const site = [...bySlug.values()].find(
+        (r) => r.id === input.siteId && r.userId === input.userId && r.edgeRevision > 0,
+      )
+      if (!site) throw new SitesError('SITE_NOT_FOUND', '未找到对应站点', 404)
+      let map = envStore.get(input.siteId)
+      if (!map) {
+        map = new Map()
+        envStore.set(input.siteId, map)
+      }
+      const otherCount = [...map.keys()].filter((k) => k !== input.key).length
+      if (otherCount >= input.maxEnvVars) {
+        throw new SitesError('QUOTA_EXCEEDED', `每个站点最多配置 ${input.maxEnvVars} 个环境变量`, 429)
+      }
+      const saved: StoredSiteEnvVarRow = {
+        siteId: input.siteId,
+        key: input.key,
+        isSecret: input.isSecret,
+        plainValue: input.plainValue,
+        ciphertext: input.ciphertext,
+        nonce: input.nonce,
+        updatedAt: new Date(),
+      }
+      map.set(input.key, saved)
+      return saved
+    },
+    async deleteSiteEnvRow(siteId, userId, key) {
+      const site = [...bySlug.values()].find((r) => r.id === siteId && r.userId === userId)
+      if (!site) return false
+      return envStore.get(siteId)?.delete(key) ?? false
     },
   }
 }
@@ -403,6 +589,7 @@ describe('sites hosting end-to-end (edge + master + oc-site CLI)', () => {
       baseDomain: 'congjianai.com',
       maxPerUser: 2,
       maxSiteBytes: 1024 * 1024,
+      edgeSecret: EDGE_SECRET,
       repo,
       edge: edgeClient,
     })
@@ -973,7 +1160,7 @@ describe('sites concurrency, lease fencing, cache isolation, and rate limit (B1-
         expectedBaseRevision: initial.edgeRevision,
       },
     })
-    assert.equal(newer, undefined)
+    assert.ok(newer)
 
     finishEdgeDelete()
     await assert.rejects(
@@ -1008,11 +1195,12 @@ describe('sites concurrency, lease fencing, cache isolation, and rate limit (B1-
         if (failBeforeEdge) {
           throw new SitesError('EDGE_UNAVAILABLE', 'connect ECONNREFUSED', 502, true)
         }
-        await rawEdge.pushBundle(args)
+        const res = await rawEdge.pushBundle(args)
         if (dropResponseAfterCommit) {
           dropResponseAfterCommit = false
           throw new SitesError('EDGE_UNAVAILABLE', 'socket hang up after write', 502, true)
         }
+        return res
       },
       async updateMeta(args) {
         await rawEdge.updateMeta(args)
@@ -1344,5 +1532,872 @@ describe('sites concurrency, lease fencing, cache isolation, and rate limit (B1-
       assert.equal(r.headers['cache-control'], 'private, no-store')
       assert.equal(r.headers.vary, 'Cookie')
     }
+  })
+})
+
+describe('fullstack sites: /api/* worker, SQLite, encrypted env, analytics, rename, custom domain', () => {
+  let workDir = ''
+  let edgePort = 0
+  let masterPort = 0
+  let closeEdge: () => Promise<void>
+  let closeMaster: () => Promise<void>
+  let user1Jwt = ''
+  let user2Jwt = ''
+
+  const SECRET_1 = '3333333333333333333333333333333333333333333333333333333333333333'
+  const TOKEN_1 = `oc-v3.301.${SECRET_1}`
+
+  const txtRecords = new Map<string, string[][]>()
+  let edgeDataRoot = ''
+  let serviceRef: SitesService
+  let edgeClientRef: SitesEdgeClient
+
+  before(async () => {
+    workDir = mkdtempSync(join(tmpdir(), 'oc-sites-fullstack-'))
+    edgeDataRoot = join(workDir, 'edge-data')
+    const edge = createSitesEdgeServer({
+      bind: '127.0.0.1',
+      port: 0,
+      dataRoot: edgeDataRoot,
+      baseDomain: 'congjianai.com',
+      secret: EDGE_SECRET,
+      maxSiteBytes: 2 * 1024 * 1024,
+    })
+    const edgeAddr = await edge.listen()
+    edgePort = edgeAddr.port
+    closeEdge = edge.close
+
+    const edgeClient = createHttpSitesEdgeClient({
+      baseUrl: `http://127.0.0.1:${edgePort}`,
+      secret: EDGE_SECRET,
+    })
+    edgeClientRef = edgeClient
+    const repo = createInMemorySitesRepo()
+    const service = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      maxSiteBytes: 2 * 1024 * 1024,
+      edgeSecret: EDGE_SECRET,
+      repo,
+      edge: edgeClient,
+      resolveTxt: async (host) => txtRecords.get(host) ?? [],
+    })
+    serviceRef = service
+
+    const identityRepo: ContainerIdentityRepo = {
+      async findActiveByHostAndBoundIp(hostUuid: string, boundIp: string) {
+        if (boundIp === '10.0.0.1') {
+          return {
+            id: 301,
+            user_id: 1,
+            host_uuid: hostUuid,
+            bound_ip: boundIp,
+            secret_hash: hashSecret(SECRET_1),
+          }
+        }
+        return null
+      },
+    }
+    const internalHandler = makeSitesInternalHandler({ identityRepo, sites: service })
+
+    const masterServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+      void (async () => {
+        const pathname = (req.url ?? '/').split('?')[0]!
+        if (pathname.startsWith('/internal/v3/sites/')) {
+          await internalHandler(req, res, { hostUuid: 'test-host', boundIp: '10.0.0.1' })
+          return
+        }
+        if (pathname === '/api/sites' || pathname.startsWith('/api/sites/')) {
+          const ctx = {
+            requestId: 'req-fs-test',
+            clientIp: '127.0.0.1',
+            authBoundIp: '127.0.0.1',
+            userAgent: 'test',
+            log: { info() {}, warn() {}, error() {}, child() { return this } },
+          } as unknown as RequestContext
+          await dispatchSitesBrowserRoute(req, res, ctx, {
+            jwtSecret: JWT_SECRET,
+            sites: service,
+          })
+          return
+        }
+        res.statusCode = 404
+        res.end('not found')
+      })().catch((err) => {
+        if (res.headersSent) return
+        const e = err as { status?: number; code?: string; message?: string }
+        res.statusCode = e.status ?? 500
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ error: { code: e.code ?? 'ERR', message: e.message ?? 'err' } }))
+      })
+    })
+    await new Promise<void>((done) => {
+      masterServer.listen(0, '127.0.0.1', () => {
+        masterPort = (masterServer.address() as { port: number }).port
+        done()
+      })
+    })
+    closeMaster = () =>
+      new Promise<void>((done, fail) => masterServer.close((e) => (e ? fail(e) : done())))
+
+    user1Jwt = (await signAccess({ sub: '1', role: 'user' }, JWT_SECRET)).token
+    user2Jwt = (await signAccess({ sub: '2', role: 'user' }, JWT_SECRET)).token
+  })
+
+  after(async () => {
+    await closeMaster?.()
+    await closeEdge?.()
+    if (workDir) rmSync(workDir, { recursive: true, force: true })
+  })
+
+  test('publishes /api/* worker + auto-packs server/api.mjs, executes SQLite & encrypted env, blocks SSRF, tracks analytics, renames slug, binds custom domain', async () => {
+    const appDir = join(workDir, 'fullstack-dist')
+    mkdirSync(join(appDir, 'server'), { recursive: true })
+    writeFileSync(join(appDir, 'index.html'), '<!doctype html><html><body><h1>FS_APP</h1></body></html>')
+    writeFileSync(
+      join(appDir, 'server', 'api.mjs'),
+      `export default async function handler(req, ctx) {
+  ctx.db.run('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, mode TEXT NOT NULL)')
+  if (req.pathname === '/api/notes' && req.method === 'POST') {
+    const data = req.json() || {}
+    ctx.db.run('INSERT INTO notes (body, mode) VALUES (?, ?)', [String(data.body || ''), String(ctx.env.APP_MODE || '')])
+    const cnt = ctx.db.get('SELECT COUNT(*) AS cnt FROM notes')
+    return {
+      status: 201,
+      body: {
+        ok: true,
+        count: cnt.cnt,
+        hasSecret: Boolean(ctx.env.DEEPSEEK_API_KEY),
+        secretLen: (ctx.env.DEEPSEEK_API_KEY || '').length,
+        slug: ctx.site.slug,
+      },
+    }
+  }
+  if (req.pathname === '/api/notes' && req.method === 'GET') {
+    return {
+      status: 200,
+      body: {
+        rows: ctx.db.all('SELECT id, body, mode FROM notes ORDER BY id ASC'),
+        secretOk: ctx.env.DEEPSEEK_API_KEY === 'sk-top-secret-xyz',
+        slug: ctx.site.slug,
+      },
+    }
+  }
+  if (req.pathname === '/api/ssrf') {
+    try {
+      await fetch('http://127.0.0.1:9/blocked')
+      return { status: 200, body: { leaked: true } }
+    } catch (err) {
+      return { status: 403, body: { blocked: String(err.message || err) } }
+    }
+  }
+  return { status: 404, body: { error: 'not found' } }
+}
+`,
+    )
+
+    const cliEnv = {
+      OPENCLAUDE_V3_MASTER_BASE_URL: `http://127.0.0.1:${masterPort}`,
+      OPENCLAUDE_V3_CONTAINER_TOKEN: TOKEN_1,
+      OPENCLAUDE_SESSION_KEY: 'agent:main:webchat:dm:fullstack-origin',
+    }
+    const pub = await runPythonCli(['publish', appDir, '--slug', 'fs-blog', '--title', 'Fullstack Blog'], cliEnv)
+    assert.equal(pub.code, 0, pub.stderr)
+    const pubJson = JSON.parse(pub.stdout)
+    assert.equal(pubJson.site.hasServerApi, true)
+    assert.equal(pubJson.site.originSessionId, 'agent:main:webchat:dm:fullstack-origin')
+
+    // Raw server files must NEVER be served publicly
+    const rawServerFetch = await edgeHttpRequest({
+      port: edgePort,
+      path: '/__oc_server/api.mjs',
+      host: 'fs-blog.congjianai.com',
+    })
+    assert.equal(rawServerFetch.status, 404)
+    const autoPackedSourceFetch = await edgeHttpRequest({
+      port: edgePort,
+      path: '/server/api.mjs',
+      host: 'fs-blog.congjianai.com',
+    })
+    assert.doesNotMatch(autoPackedSourceFetch.text, /DEEPSEEK_API_KEY/)
+
+    // Set secret & non-secret env vars (CLI + browser API)
+    const setSecret = await runPythonCli(
+      ['env-set', 'fs-blog', 'DEEPSEEK_API_KEY', 'sk-top-secret-xyz', '--secret'],
+      cliEnv,
+    )
+    assert.equal(setSecret.code, 0, setSecret.stderr)
+    const setPlain = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog/env`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${user1Jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'APP_MODE', value: 'production', isSecret: false }),
+    })
+    assert.equal(setPlain.status, 200)
+
+    // GET /api/sites/:slug masks secret values
+    const detailRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog`, {
+      headers: { Authorization: `Bearer ${user1Jwt}` },
+    })
+    assert.equal(detailRes.status, 200)
+    const detail = (await detailRes.json()) as {
+      site: { slug: string; hasServerApi: boolean }
+      envVars: Array<{ key: string; value: string | null; isSecret: boolean }>
+    }
+    assert.equal(detail.envVars.find((v) => v.key === 'DEEPSEEK_API_KEY')?.value, null)
+    assert.equal(detail.envVars.find((v) => v.key === 'DEEPSEEK_API_KEY')?.isSecret, true)
+    assert.equal(detail.envVars.find((v) => v.key === 'APP_MODE')?.value, 'production')
+
+    // Execute /api/notes POST & GET -> proves decrypted ctx.env + persistent SQLite DB
+    const apiPost = await edgeHttpRequest({
+      port: edgePort,
+      method: 'POST',
+      path: '/api/notes',
+      host: 'fs-blog.congjianai.com',
+      headers: { 'Content-Type': 'application/json', 'X-Real-IP': '198.51.100.10' },
+      body: JSON.stringify({ body: 'hello-sqlite' }),
+    })
+    assert.equal(apiPost.status, 201, apiPost.text)
+    const apiPostJson = JSON.parse(apiPost.text)
+    assert.equal(apiPostJson.count, 1)
+    assert.equal(apiPostJson.hasSecret, true)
+    assert.equal(apiPostJson.secretLen, 'sk-top-secret-xyz'.length)
+
+    // SSRF inside worker fetch() must be blocked
+    const ssrfRes = await edgeHttpRequest({
+      port: edgePort,
+      path: '/api/ssrf',
+      host: 'fs-blog.congjianai.com',
+    })
+    assert.equal(ssrfRes.status, 403, ssrfRes.text)
+    assert.match(ssrfRes.text, /SSRF_BLOCKED/)
+
+    // Visit HTML page from two visitors to accumulate analytics
+    const visit1 = await edgeHttpRequest({
+      port: edgePort,
+      path: '/',
+      host: 'fs-blog.congjianai.com',
+      headers: { 'X-Real-IP': '198.51.100.11', 'User-Agent': 'BrowserA' },
+    })
+    assert.equal(visit1.status, 200)
+    const visit2 = await edgeHttpRequest({
+      port: edgePort,
+      path: '/',
+      host: 'fs-blog.congjianai.com',
+      headers: { 'X-Real-IP': '198.51.100.12', 'User-Agent': 'BrowserB' },
+    })
+    assert.equal(visit2.status, 200)
+
+    // SQLite DB inspector endpoint & CLI
+    const dbRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog/db?table=notes`, {
+      headers: { Authorization: `Bearer ${user1Jwt}` },
+    })
+    assert.equal(dbRes.status, 200)
+    const dbJson = (await dbRes.json()) as {
+      db: {
+        connected: boolean
+        tables: Array<{ name: string; rowCount: number }>
+        rows: Array<{ body: string; mode: string }>
+      }
+    }
+    assert.equal(dbJson.db.connected, true)
+    assert.deepEqual(dbJson.db.tables, [{ name: 'notes', rowCount: 1 }])
+    assert.equal(dbJson.db.rows[0]?.body, 'hello-sqlite')
+    assert.equal(dbJson.db.rows[0]?.mode, 'production')
+
+    const cliSql = await runPythonCli(
+      ['db-sql', 'fs-blog', 'SELECT body FROM notes WHERE id = ?', '--param', '1'],
+      cliEnv,
+    )
+    assert.equal(cliSql.code, 0, cliSql.stderr)
+    assert.match(cliSql.stdout, /hello-sqlite/)
+
+    // Traffic analytics endpoint & CLI
+    const anaRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog/analytics?days=7`, {
+      headers: { Authorization: `Bearer ${user1Jwt}` },
+    })
+    assert.equal(anaRes.status, 200)
+    const anaJson = (await anaRes.json()) as {
+      analytics: { totals: { uniqueVisitors: number; requests: number; pageViews: number }; series: unknown[] }
+    }
+    assert.ok(anaJson.analytics.totals.pageViews >= 2)
+    assert.ok(anaJson.analytics.totals.requests >= 4)
+    assert.ok(anaJson.analytics.totals.uniqueVisitors >= 3)
+    assert.equal(anaJson.analytics.series.length, 7)
+
+    // Cross-user browser access to analytics/db is forbidden (404)
+    const u2Ana = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog/analytics`, {
+      headers: { Authorization: `Bearer ${user2Jwt}` },
+    })
+    assert.equal(u2Ana.status, 404)
+
+    // Bind custom domain -> denied BEFORE TXT verification; allowed AFTER verify-domain; revoked on clear
+    const bindRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${user1Jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customDomain: 'app.mybrand.com' }),
+    })
+    const bindText = await bindRes.text()
+    assert.equal(bindRes.status, 200, bindText)
+    const pendingBind = JSON.parse(bindText) as {
+      site: {
+        customDomainStatus: string
+        customDomainTxtName: string
+        customDomainTxtValue: string
+      }
+    }
+    assert.equal(pendingBind.site.customDomainStatus, 'pending')
+    const preVerifyTls = await fetch(`http://127.0.0.1:${edgePort}/internal/tls-ask?domain=app.mybrand.com`)
+    assert.equal(preVerifyTls.status, 404)
+    const preVerifyHtml = await edgeHttpRequest({ port: edgePort, path: '/', host: 'app.mybrand.com' })
+    assert.equal(preVerifyHtml.status, 404)
+
+    txtRecords.set(pendingBind.site.customDomainTxtName, [[pendingBind.site.customDomainTxtValue]])
+    const verifyRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog/verify-domain`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${user1Jwt}` },
+    })
+    const verifyText = await verifyRes.text()
+    assert.equal(verifyRes.status, 200, verifyText)
+    const verifyJson = JSON.parse(verifyText) as { site: { customDomainStatus: string } }
+    assert.equal(verifyJson.site.customDomainStatus, 'verified')
+
+    const customTls = await fetch(`http://127.0.0.1:${edgePort}/internal/tls-ask?domain=app.mybrand.com`)
+    assert.equal(customTls.status, 200)
+    const customHtml = await edgeHttpRequest({ port: edgePort, path: '/', host: 'app.mybrand.com' })
+    assert.equal(customHtml.status, 200)
+    assert.match(customHtml.text, /FS_APP/)
+
+    // Second site cannot steal bound custom domain (409 DOMAIN_TAKEN)
+    await runPythonCli(['publish', join(appDir, 'index.html'), '--slug', 'other-site'], cliEnv)
+    const stealDom = await fetch(`http://127.0.0.1:${masterPort}/api/sites/other-site`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${user1Jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customDomain: 'app.mybrand.com' }),
+    })
+    assert.equal(stealDom.status, 409)
+
+    // Rename slug -> old slug returns 404, new slug keeps SQLite + re-sealed ctx.env + custom domain!
+    const renRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog/rename`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${user1Jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newSlug: 'fs-blog-v2' }),
+    })
+    const renText = await renRes.text()
+    assert.equal(renRes.status, 200, renText)
+    const renJson = JSON.parse(renText) as { site: { slug: string; customDomain: string | null } }
+    assert.equal(renJson.site.slug, 'fs-blog-v2')
+    assert.equal(renJson.site.customDomain, 'app.mybrand.com')
+
+    const oldLive = await edgeHttpRequest({ port: edgePort, path: '/', host: 'fs-blog.congjianai.com' })
+    assert.equal(oldLive.status, 404)
+
+    const newApi = await edgeHttpRequest({
+      port: edgePort,
+      path: '/api/notes',
+      host: 'fs-blog-v2.congjianai.com',
+    })
+    assert.equal(newApi.status, 200, newApi.text)
+    const newApiJson = JSON.parse(newApi.text)
+    assert.equal(newApiJson.secretOk, true)
+    assert.equal(newApiJson.slug, 'fs-blog-v2')
+    assert.equal(newApiJson.rows.length, 1)
+    assert.equal(newApiJson.rows[0].body, 'hello-sqlite')
+
+    // Password protection gates /api/* as well (401 JSON)
+    const lockRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog-v2`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${user1Jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ visibility: 'password', password: 'pw-9876' }),
+    })
+    assert.equal(lockRes.status, 200)
+    const lockedApi = await edgeHttpRequest({
+      port: edgePort,
+      path: '/api/notes',
+      host: 'fs-blog-v2.congjianai.com',
+    })
+    assert.equal(lockedApi.status, 401)
+    assert.match(lockedApi.text, /UNAUTHORIZED/)
+
+    // Unbinding custom domain immediately revokes routing & tls-ask
+    const clearDomRes = await fetch(`http://127.0.0.1:${masterPort}/api/sites/fs-blog-v2`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${user1Jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customDomain: null }),
+    })
+    assert.equal(clearDomRes.status, 200)
+    const revokedTls = await fetch(`http://127.0.0.1:${edgePort}/internal/tls-ask?domain=app.mybrand.com`)
+    assert.equal(revokedTls.status, 404)
+  })
+
+  test('T2 security audit hardening: bwrap OS sandbox, redirect auth strip/block, --api manifest exclusion, v1 fullstack reject, 16KiB secret & DB safety', async () => {
+    const cliEnv = {
+      OPENCLAUDE_V3_MASTER_BASE_URL: `http://127.0.0.1:${masterPort}`,
+      OPENCLAUDE_V3_CONTAINER_TOKEN: TOKEN_1,
+      OPENCLAUDE_SESSION_KEY: 'agent:main:webchat:dm:audit-hardening',
+    }
+
+    // Redirect target server to test cross-origin redirect block with credentials
+    const redirServer = createServer((req, res) => {
+      if (req.url === '/redir') {
+        res.statusCode = 302
+        res.setHeader('Location', `http://localhost:${(redirServer.address() as { port: number }).port}/target`)
+        res.end()
+        return
+      }
+      res.statusCode = 200
+      res.end(JSON.stringify({ auth: req.headers.authorization ?? null }))
+    })
+    await new Promise<void>((done) => redirServer.listen(0, '127.0.0.1', () => done()))
+    const redirPort = (redirServer.address() as { port: number }).port
+
+    try {
+      const hardDir = join(workDir, 'hardened-dist')
+      mkdirSync(hardDir, { recursive: true })
+      writeFileSync(join(hardDir, 'index.html'), '<h1>HARDENED</h1>')
+      // Explicit --api file placed INSIDE the publish directory (P1 #5)!
+      writeFileSync(
+        join(hardDir, 'handler.mjs'),
+        `import fs from 'node:fs'
+import net from 'node:net'
+export default async function handler(req, ctx) {
+  if (req.pathname === '/api/escape') {
+    let etcBlocked = false
+    try { fs.readFileSync('/etc/passwd', 'utf8'); } catch { etcBlocked = true }
+    const netBlocked = await new Promise((resolve) => {
+      const s = net.connect(80, '1.1.1.1');
+      s.on('error', (e) => resolve(e.code || 'ERR'));
+      s.on('connect', () => { s.destroy(); resolve('OPEN'); });
+    });
+    return { status: 200, body: { etcBlocked, netBlocked, bigSecretLen: (ctx.env.BIG_KEY || '').length } }
+  }
+  if (req.pathname === '/api/redir-auth') {
+    try {
+      await fetch('http://127.0.0.1:${redirPort}/redir', { headers: { Authorization: 'Bearer secret-tok' } })
+      return { status: 200, body: { leaked: true } }
+    } catch (e) {
+      return { status: 403, body: { blocked: String(e.message || e) } }
+    }
+  }
+  return { status: 200, body: { ok: true } }
+}
+`,
+      )
+
+      const pub = await runPythonCli(
+        ['publish', hardDir, '--api', join(hardDir, 'handler.mjs'), '--slug', 'hardened-app'],
+        cliEnv,
+      )
+      assert.equal(pub.code, 0, pub.stderr)
+
+      // P1 #5: explicit handler.mjs inside dist MUST NOT be downloadable as static file
+      const staticLeak = await edgeHttpRequest({
+        port: edgePort,
+        path: '/handler.mjs',
+        host: 'hardened-app.congjianai.com',
+      })
+      assert.notEqual(staticLeak.status, 200)
+      assert.doesNotMatch(staticLeak.text, /readFileSync/)
+
+      // P1 #6: OCSB2 / server API bundle MUST be rejected on /__oc_sites_edge/v1/
+      const v2Bundle = encodeSiteBundle([
+        { path: 'index.html', content: Buffer.from('<h1>V2</h1>') },
+        { path: '__oc_server/api.mjs', content: Buffer.from('export default () => ({ ok: true })') },
+      ]).gzipped
+      await assert.rejects(
+        () =>
+          edgeClientRef.pushBundle({
+            slug: 'hardened-app',
+            revision: 999999,
+            gzippedBundle: v2Bundle,
+            hasServerApi: false, // force v1 endpoint
+            meta: {
+              title: 'bad',
+              visibility: 'public',
+              passwordSalt: null,
+              passwordHash: null,
+              spaMode: true,
+            },
+          }),
+        (err: unknown) => err instanceof SitesError && err.status === 400,
+      )
+
+      // P1 #11: Valid 16 KiB secret env var works cleanly via body transport (no 16 KiB header overflow)
+      const bigVal = 'k'.repeat(16 * 1024)
+      const setBig = await fetch(`http://127.0.0.1:${masterPort}/api/sites/hardened-app/env`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${user1Jwt}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'BIG_KEY', value: bigVal, isSecret: true }),
+      })
+      assert.equal(setBig.status, 200, await setBig.text())
+
+      // P0 #1: bwrap OS sandbox blocks /etc/passwd and direct sockets while delivering 16 KiB secret
+      const escRes = await edgeHttpRequest({
+        port: edgePort,
+        path: '/api/escape',
+        host: 'hardened-app.congjianai.com',
+      })
+      assert.equal(escRes.status, 200, escRes.text)
+      const escJson = JSON.parse(escRes.text) as {
+        etcBlocked: boolean
+        netBlocked: string
+        bigSecretLen: number
+      }
+      assert.equal(escJson.etcBlocked, true)
+      assert.equal(escJson.netBlocked, 'ENETUNREACH')
+      assert.equal(escJson.bigSecretLen, 16 * 1024)
+
+      // P1 #4: cross-origin redirect with Authorization header blocked by trusted parent proxy
+      const redirEntryDir = join(workDir, 'redir-site-srv')
+      mkdirSync(redirEntryDir, { recursive: true })
+      const redirEntryPath = join(redirEntryDir, 'api.mjs')
+      writeFileSync(
+        redirEntryPath,
+        `export default async function handler() {
+  try {
+    await fetch('http://127.0.0.1:${redirPort}/redir', { headers: { Authorization: 'Bearer secret-tok' } });
+    return { status: 200, body: { leaked: true } };
+  } catch (e) {
+    return { status: 403, body: { blocked: String(e.message || e) } };
+  }
+}
+`,
+      )
+      const redirRes = await runSiteApiWorker({
+        slug: 'redir-unit',
+        siteDir: join(workDir, 'redir-site'),
+        entryFilePath: redirEntryPath,
+        revision: 1,
+        method: 'GET',
+        url: '/api/redir-auth',
+        pathname: '/api/redir-auth',
+        query: {},
+        headers: {},
+        body: Buffer.alloc(0),
+        env: {},
+        allowPrivateFetchForTest: true,
+      })
+      assert.equal(redirRes.status, 403, redirRes.body.toString('utf8'))
+      assert.match(redirRes.body.toString('utf8'), /CROSS_ORIGIN_REDIRECT_BLOCKED/)
+
+      // P1 #14 & P1 #15: VACUUM main INTO rejected; large cells > 32 KiB produce valid truncated JSON
+      await assert.rejects(
+        () =>
+          serviceRef.executeDbSql(1, 'hardened-app', {
+            sql: "VACUUM main INTO '/tmp/evil-copy.db'",
+          }),
+        (err: unknown) => err instanceof SitesError && err.status === 400,
+      )
+      await serviceRef.executeDbSql(1, 'hardened-app', {
+        sql: 'CREATE TABLE big_rows (id INTEGER PRIMARY KEY, body TEXT NOT NULL)',
+      })
+      for (let i = 0; i < 30; i += 1) {
+        await serviceRef.executeDbSql(1, 'hardened-app', {
+          sql: 'INSERT INTO big_rows (body) VALUES (?)',
+          params: [`row-${i}-` + 'x'.repeat(3000)],
+        })
+      }
+      const bigInspect = await serviceRef.inspectDb(1, 'hardened-app', { table: 'big_rows', limit: 100 })
+      assert.equal(bigInspect.tables[0]?.name, 'big_rows')
+      assert.equal(bigInspect.rows.length, 30)
+
+      // P1 #12: Stale/mismatched siteId on edge DB/analytics returns 409 STALE_REVISION
+      await assert.rejects(
+        () =>
+          edgeClientRef.inspectDb({
+            slug: 'hardened-app',
+            siteId: '00000000-0000-4000-8000-999999999999',
+            expectedRevision: 1,
+          }),
+        (err: unknown) => err instanceof SitesError && err.code === 'STALE_REVISION',
+      )
+
+      // P1 #9: Corrupt env.enc aborts rename BEFORE moving site directory!
+      writeFileSync(join(edgeDataRoot, 'sites', 'hardened-app', 'env.enc'), 'corrupted-ciphertext')
+      await assert.rejects(
+        () => serviceRef.renameSite(1, 'hardened-app', 'hardened-app-v2'),
+        (err: unknown) => err instanceof SitesError && err.status >= 400,
+      )
+      const stillAlive = await edgeHttpRequest({
+        port: edgePort,
+        path: '/',
+        host: 'hardened-app.congjianai.com',
+      })
+      assert.equal(stillAlive.status, 200)
+    } finally {
+      await new Promise<void>((done) => redirServer.close(() => done()))
+    }
+  })
+
+  test('Round-2 hardening: 4MiB IPC frame, custom-header cross-origin redirect block, env-unset reconciliation, verifyCustomDomain TOCTOU guard, and publish needsEnvSync fail-loud', async () => {
+    // 1. P1 #11/#12: Full 4 MiB response (> 5.5 MiB base64 IPC frame + looped writeSync) succeeds cleanly
+    const bigEntryDir = join(workDir, 'r2-big-srv')
+    const bigSiteDir = join(workDir, 'r2-big-site')
+    mkdirSync(bigEntryDir, { recursive: true })
+    mkdirSync(join(bigSiteDir, 'data'), { recursive: true })
+    const bigEntryPath = join(bigEntryDir, 'api.mjs')
+    writeFileSync(
+      bigEntryPath,
+      `export default async function handler() {
+  return {
+    status: 200,
+    headers: { 'content-type': 'application/octet-stream' },
+    body: Buffer.alloc(4 * 1024 * 1024, 0x61),
+  };
+}
+`,
+    )
+    const bigRes = await runSiteApiWorker({
+      slug: 'r2-big-unit',
+      siteDir: bigSiteDir,
+      entryFilePath: bigEntryPath,
+      revision: 1,
+      method: 'GET',
+      url: '/api/big',
+      pathname: '/api/big',
+      query: {},
+      headers: {},
+      body: Buffer.alloc(0),
+      env: {},
+    })
+    assert.equal(bigRes.status, 200, bigRes.body.toString('utf8').slice(0, 300))
+    assert.equal(bigRes.body.length, 4 * 1024 * 1024)
+
+    // 2. P1 #7: Cross-origin redirect with custom X-Service-Token header is blocked
+    const customHdrRedirServer = createServer((req, res) => {
+      if (req.url === '/redir') {
+        res.statusCode = 302
+        res.setHeader('Location', 'http://127.0.0.2:9/never')
+        res.end()
+        return
+      }
+      res.statusCode = 200
+      res.end('ok')
+    })
+    await new Promise<void>((done) => customHdrRedirServer.listen(0, '127.0.0.1', () => done()))
+    const customRedirPort = (customHdrRedirServer.address() as { port: number }).port
+    try {
+      const customRedirEntryDir = join(workDir, 'r2-redir-srv')
+      const customRedirSiteDir = join(workDir, 'r2-redir-site')
+      mkdirSync(customRedirEntryDir, { recursive: true })
+      mkdirSync(join(customRedirSiteDir, 'data'), { recursive: true })
+      const customRedirEntryPath = join(customRedirEntryDir, 'api.mjs')
+      writeFileSync(
+        customRedirEntryPath,
+        `export default async function handler() {
+  try {
+    await fetch('http://127.0.0.1:${customRedirPort}/redir', {
+      headers: { 'X-Service-Token': 'svc-secret' },
+    });
+    return { status: 200, body: { leaked: true } };
+  } catch (e) {
+    return { status: 403, body: { blocked: String(e.message || e) } };
+  }
+}
+`,
+      )
+      const customRedirRes = await runSiteApiWorker({
+        slug: 'r2-redir-unit',
+        siteDir: customRedirSiteDir,
+        entryFilePath: customRedirEntryPath,
+        revision: 1,
+        method: 'GET',
+        url: '/api/redir-custom',
+        pathname: '/api/redir-custom',
+        query: {},
+        headers: {},
+        body: Buffer.alloc(0),
+        env: {},
+        allowPrivateFetchForTest: true,
+      })
+      assert.equal(customRedirRes.status, 403, customRedirRes.body.toString('utf8'))
+      assert.match(customRedirRes.body.toString('utf8'), /CROSS_ORIGIN_REDIRECT_BLOCKED/)
+    } finally {
+      await new Promise<void>((done) => customHdrRedirServer.close(() => done()))
+    }
+
+    // 3. P1 #1: verifyCustomDomain rejects 409 STALE_REVISION if domain mutates after TXT check before lock
+    const toctouRepo = createInMemorySitesRepo()
+    let resolveTxtHook: (() => Promise<void>) | null = null
+    const toctouService = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      maxSiteBytes: 2 * 1024 * 1024,
+      edgeSecret: EDGE_SECRET,
+      repo: toctouRepo,
+      edge: edgeClientRef,
+      resolveTxt: async (host) => {
+        if (resolveTxtHook) await resolveTxtHook()
+        return txtRecords.get(host) ?? []
+      },
+    })
+    await toctouService.publishSite(1, {
+      slug: 'r2-domain-toctou',
+      title: 'Domain TOCTOU',
+      gzippedBundle: encodeSiteBundle([
+        { path: 'index.html', content: Buffer.from('<h1>TOCTOU</h1>') },
+      ]).gzipped,
+    })
+    await toctouService.updateSite(1, 'r2-domain-toctou', { customDomain: 'domain-a.example.com' })
+    const preToctou = await toctouRepo.getByUserAndSlug(1, 'r2-domain-toctou')
+    assert.ok(preToctou?.customDomainToken)
+    txtRecords.set('_oc-site-verify.domain-a.example.com', [
+      [customDomainTxtValueFor(preToctou.id, preToctou.customDomainToken)],
+    ])
+    resolveTxtHook = async () => {
+      resolveTxtHook = null
+      const prep = await toctouRepo.prepareMetaUpdate(1, 'r2-domain-toctou', 'meta')
+      await toctouRepo.commitMetaUpdate({
+        siteId: prep.site.id,
+        userId: 1,
+        leaseId: prep.leaseId,
+        title: prep.site.title,
+        visibility: prep.site.visibility,
+        passwordSalt: prep.site.passwordSalt,
+        passwordHash: prep.site.passwordHash,
+        spaMode: prep.site.spaMode,
+        customDomain: 'domain-b.example.com',
+        customDomainVerified: false,
+        customDomainToken: 'tok-b-changed',
+        edgeRevision: prep.nextRevision,
+      })
+    }
+    await assert.rejects(
+      () => toctouService.verifyCustomDomain(1, 'r2-domain-toctou'),
+      (err: unknown) => err instanceof SitesError && err.code === 'STALE_REVISION' && err.status === 409,
+    )
+    const afterToctou = await toctouRepo.getByUserAndSlug(1, 'r2-domain-toctou')
+    assert.equal(afterToctou?.customDomain, 'domain-b.example.com')
+    assert.equal(afterToctou?.customDomainVerified, false)
+    const tlsA = await fetch(`http://127.0.0.1:${edgePort}/internal/tls-ask?domain=domain-a.example.com`)
+    assert.equal(tlsA.status, 404)
+    const tlsB = await fetch(`http://127.0.0.1:${edgePort}/internal/tls-ask?domain=domain-b.example.com`)
+    assert.equal(tlsB.status, 404)
+
+    // 4 & 5. P1 #2 (deleteEnvVar EDGE_UNAVAILABLE + old rev probe keeps opKind='env') & P1 #9 (needsEnvSync fail loud)
+    let failNextUpdateMeta = false
+    let failNextSyncEnv = false
+    const faultEdge: SitesEdgeClient = {
+      pushBundle: (a) => edgeClientRef.pushBundle(a),
+      updateMeta: async (a) => {
+        if (failNextUpdateMeta) {
+          failNextUpdateMeta = false
+          throw new SitesError('EDGE_UNAVAILABLE', 'simulated patch drop', 502, true)
+        }
+        return edgeClientRef.updateMeta(a)
+      },
+      syncEnv: async (a) => {
+        if (failNextSyncEnv) {
+          failNextSyncEnv = false
+          throw new SitesError('EDGE_UNAVAILABLE', 'simulated syncEnv failure', 502, true)
+        }
+        return edgeClientRef.syncEnv!(a)
+      },
+      deleteSite: (a) => edgeClientRef.deleteSite(a),
+      renameSite: (a) => edgeClientRef.renameSite(a),
+      getAnalytics: (a) => edgeClientRef.getAnalytics(a),
+      inspectDb: (a) => edgeClientRef.inspectDb(a),
+      executeDbSql: (a) => edgeClientRef.executeDbSql(a),
+      getSiteStatus: (a) => edgeClientRef.getSiteStatus(a),
+    }
+    const r2Repo = createInMemorySitesRepo()
+    const r2Service = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      maxSiteBytes: 2 * 1024 * 1024,
+      edgeSecret: EDGE_SECRET,
+      repo: r2Repo,
+      edge: faultEdge,
+      resolveTxt: async () => [],
+    })
+    const checkBundle = encodeSiteBundle([
+      { path: 'index.html', content: Buffer.from('<h1>R2 Env Check</h1>') },
+      {
+        path: '__oc_server/api.mjs',
+        content: Buffer.from(
+          `export default async function handler(req, ctx) {
+  return {
+    status: 200,
+    body: {
+      hasRevoked: Boolean(ctx.env.REVOKED_KEY),
+      hasSync: Boolean(ctx.env.SYNC_KEY),
+    },
+  };
+}
+`,
+        ),
+      },
+    ]).gzipped
+
+    await r2Service.publishSite(1, {
+      slug: 'r2-env-revoke',
+      title: 'R2 Env Revoke',
+      gzippedBundle: checkBundle,
+    })
+    await r2Service.setEnvVar(1, 'r2-env-revoke', {
+      key: 'REVOKED_KEY',
+      value: 'secret-1',
+      isSecret: true,
+    })
+    const beforeRevoke = await edgeHttpRequest({
+      port: edgePort,
+      path: '/api/check',
+      host: 'r2-env-revoke.congjianai.com',
+    })
+    assert.equal(beforeRevoke.status, 200)
+    assert.deepEqual(JSON.parse(beforeRevoke.text), { hasRevoked: true, hasSync: false })
+
+    failNextUpdateMeta = true
+    await assert.rejects(
+      () => r2Service.deleteEnvVar(1, 'r2-env-revoke', 'REVOKED_KEY'),
+      (err: unknown) => err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE',
+    )
+    const pendingRow = await r2Repo.getByUserAndSlug(1, 'r2-env-revoke')
+    assert.equal(pendingRow?.opKind, 'env')
+
+    const listedEnv = await r2Service.listEnvVars(1, 'r2-env-revoke')
+    assert.equal(listedEnv.length, 0)
+    const healedRow = await r2Repo.getByUserAndSlug(1, 'r2-env-revoke')
+    assert.equal(healedRow?.opKind, null)
+    const afterRevoke = await edgeHttpRequest({
+      port: edgePort,
+      path: '/api/check',
+      host: 'r2-env-revoke.congjianai.com',
+    })
+    assert.equal(afterRevoke.status, 200)
+    assert.deepEqual(JSON.parse(afterRevoke.text), { hasRevoked: false, hasSync: false })
+
+    // P1 #9: publishSite fails loud with 502 EDGE_UNAVAILABLE if needsEnvSync fails, and auto-heals on read
+    await r2Service.setEnvVar(1, 'r2-env-revoke', {
+      key: 'SYNC_KEY',
+      value: 'sync-v1',
+      isSecret: true,
+    })
+    rmSync(join(edgeDataRoot, 'sites', 'r2-env-revoke', 'env.enc'), { force: true })
+    failNextSyncEnv = true
+    await assert.rejects(
+      () =>
+        r2Service.publishSite(1, {
+          slug: 'r2-env-revoke',
+          title: 'R2 Env Sync Fail Loud',
+          gzippedBundle: checkBundle,
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE' && err.status === 502,
+    )
+    const pendingSyncRow = await r2Repo.getByUserAndSlug(1, 'r2-env-revoke')
+    assert.equal(pendingSyncRow?.opKind, 'env')
+
+    await r2Service.listSummary(1)
+    const syncedRow = await r2Repo.getByUserAndSlug(1, 'r2-env-revoke')
+    assert.equal(syncedRow?.opKind, null)
+    const afterSync = await edgeHttpRequest({
+      port: edgePort,
+      path: '/api/check',
+      host: 'r2-env-revoke.congjianai.com',
+    })
+    assert.equal(afterSync.status, 200)
+    assert.deepEqual(JSON.parse(afterSync.text), { hasRevoked: false, hasSync: true })
   })
 })

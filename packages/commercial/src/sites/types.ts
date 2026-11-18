@@ -2,13 +2,19 @@ import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from
 import { gunzipSync, gzipSync } from 'node:zlib'
 
 export const SITE_EDGE_PREFIX = '/__oc_sites_edge/v1'
+export const SITE_EDGE_V2_PREFIX = '/__oc_sites_edge/v2'
 export const SITE_BUNDLE_MAGIC = Buffer.from('OCSB1\n', 'ascii')
+export const SITE_BUNDLE_MAGIC_V2 = Buffer.from('OCSB2\n', 'ascii')
 export const SITE_MAX_FILES = 500
 export const SITE_MAX_SINGLE_FILE_BYTES = 10 * 1024 * 1024
 export const DEFAULT_SITE_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 export const DEFAULT_SITE_MAX_PER_USER = 20
 export const SITE_AUTH_COOKIE_NAME = 'oc_site_auth'
 export const SITE_EDGE_SIGNATURE_WINDOW_SEC = 300
+export const SITE_SERVER_API_PATH = '__oc_server/api.mjs'
+export const SITE_MAX_ENV_VARS = 64
+export const SITE_MAX_ENV_VALUE_BYTES = 16 * 1024
+export const SITE_MAX_ENV_TOTAL_BYTES = 256 * 1024
 
 export type SiteVisibility = 'public' | 'password' | 'disabled'
 
@@ -25,6 +31,9 @@ export type SitesErrorCode =
   | 'EDGE_UNAVAILABLE'
   | 'STALE_REVISION'
   | 'SLUG_BUSY'
+  | 'DOMAIN_TAKEN'
+  | 'API_TIMEOUT'
+  | 'INTERNAL'
 
 export class SitesError extends Error {
   constructor(
@@ -78,6 +87,75 @@ export function generateRandomSiteSlug(): string {
   return `site-${randomBytes(4).toString('hex')}`
 }
 
+const CUSTOM_DOMAIN_RE =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/
+const IPV4_LITERAL_RE = /^\d+(?:\.\d+){3}$/
+const DISALLOWED_CUSTOM_DOMAIN_TLDS = new Set(['local', 'localhost', 'internal', 'arpa', 'invalid', 'test'])
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/
+const BLOCKED_ENV_KEYS = new Set([
+  'PATH',
+  'HOME',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'UV_THREADPOOL_SIZE',
+  'OC_SITES_EDGE_SECRET',
+  'DATABASE_URL',
+])
+
+export function validateCustomDomain(raw: string, baseDomain: string): string {
+  if (typeof raw !== 'string') {
+    throw new SitesError('INVALID_INPUT', '自定义域名必须是字符串', 400)
+  }
+  const normalized = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/\.+$/, '')
+
+  if (!normalized || normalized.length > 253 || !CUSTOM_DOMAIN_RE.test(normalized)) {
+    throw new SitesError('INVALID_INPUT', '请输入合法的自定义域名，例如 app.example.com', 400)
+  }
+  if (IPV4_LITERAL_RE.test(normalized)) {
+    throw new SitesError('INVALID_INPUT', '自定义域名不能是 IP 地址', 400)
+  }
+  const parts = normalized.split('.')
+  const tld = parts[parts.length - 1] ?? ''
+  if (DISALLOWED_CUSTOM_DOMAIN_TLDS.has(tld)) {
+    throw new SitesError('INVALID_INPUT', `不支持使用 .${tld} 内网域名`, 400)
+  }
+  const base = baseDomain.trim().toLowerCase()
+  if (normalized === base || normalized.endsWith(`.${base}`)) {
+    throw new SitesError(
+      'INVALID_INPUT',
+      `请使用站外自定义域名，不要填写 *.${base} 平台子域名（改子域名请用「URL 更改」）`,
+      400,
+    )
+  }
+  return normalized
+}
+
+export function validateEnvVarKey(raw: string): string {
+  if (typeof raw !== 'string') {
+    throw new SitesError('INVALID_INPUT', '环境变量名必须是字符串', 400)
+  }
+  const key = raw.trim()
+  if (!ENV_KEY_RE.test(key)) {
+    throw new SitesError(
+      'INVALID_INPUT',
+      '环境变量名只能包含字母、数字和下划线，且不能以数字开头',
+      400,
+    )
+  }
+  if (BLOCKED_ENV_KEYS.has(key.toUpperCase())) {
+    throw new SitesError('INVALID_INPUT', `环境变量名 ${key} 为系统保留键`, 400)
+  }
+  return key
+}
+
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/
 const IGNORED_SEGMENT_NAMES = new Set(['.git', 'node_modules', '__pycache__', '.DS_Store'])
 
@@ -127,6 +205,7 @@ export interface DecodedSiteBundle {
   fileCount: number
   sizeBytes: number
   contentSha256: string
+  hasServerApi: boolean
 }
 
 export function encodeSiteBundle(
@@ -178,9 +257,11 @@ export function encodeSiteBundle(
   const manifestBuf = Buffer.from(JSON.stringify(manifest), 'utf8')
   const contentSha256 = createHash('sha256').update(manifestBuf).digest('hex')
 
-  const header = Buffer.allocUnsafe(SITE_BUNDLE_MAGIC.length + 4)
-  SITE_BUNDLE_MAGIC.copy(header, 0)
-  header.writeUInt32BE(manifestBuf.length, SITE_BUNDLE_MAGIC.length)
+  const hasServerApi = seen.has(SITE_SERVER_API_PATH)
+  const magic = hasServerApi ? SITE_BUNDLE_MAGIC_V2 : SITE_BUNDLE_MAGIC
+  const header = Buffer.allocUnsafe(magic.length + 4)
+  magic.copy(header, 0)
+  header.writeUInt32BE(manifestBuf.length, magic.length)
 
   const rawBundle = Buffer.concat([header, manifestBuf, ...normalized.map((f) => f.content)])
   return {
@@ -206,12 +287,16 @@ export function decodeSiteBundle(
     throw new SitesError('INVALID_BUNDLE', '站点包解压失败或超出大小上限', 400)
   }
 
-  const minHeaderLen = SITE_BUNDLE_MAGIC.length + 4
-  if (raw.length < minHeaderLen || !raw.subarray(0, SITE_BUNDLE_MAGIC.length).equals(SITE_BUNDLE_MAGIC)) {
+  const magicLen = SITE_BUNDLE_MAGIC.length
+  const minHeaderLen = magicLen + 4
+  const headMagic = raw.subarray(0, magicLen)
+  const isV1 = raw.length >= minHeaderLen && headMagic.equals(SITE_BUNDLE_MAGIC)
+  const isV2 = raw.length >= minHeaderLen && headMagic.equals(SITE_BUNDLE_MAGIC_V2)
+  if (!isV1 && !isV2) {
     throw new SitesError('INVALID_BUNDLE', '无效的站点包格式标识', 400)
   }
 
-  const manifestLen = raw.readUInt32BE(SITE_BUNDLE_MAGIC.length)
+  const manifestLen = raw.readUInt32BE(magicLen)
   if (manifestLen === 0 || manifestLen > 4 * 1024 * 1024 || minHeaderLen + manifestLen > raw.length) {
     throw new SitesError('INVALID_BUNDLE', '站点包清单长度异常', 400)
   }
@@ -290,11 +375,17 @@ export function decodeSiteBundle(
   )
   const contentSha256 = createHash('sha256').update(canonicalManifestBuf).digest('hex')
 
+  const hasServerApi = seen.has(SITE_SERVER_API_PATH)
+  if (isV1 && hasServerApi) {
+    throw new SitesError('INVALID_BUNDLE', '包含服务端 API 的站点包必须使用 OCSB2 格式', 400)
+  }
+
   return {
     files,
     fileCount: files.length,
     sizeBytes: totalBytes,
     contentSha256,
+    hasServerApi,
   }
 }
 
@@ -332,11 +423,15 @@ export function parseSiteVisibility(raw: unknown, fallback: SiteVisibility = 'pu
 }
 
 export interface EdgeMetaEnvelope {
+  siteId?: string
   title: string
   visibility: SiteVisibility
   passwordSalt: string | null
   passwordHash: string | null
   spaMode: boolean
+  customDomain?: string | null
+  hasServerApi?: boolean
+  envDigest?: string
   contentSha256?: string
   expectedBaseRevision?: number
 }
@@ -427,11 +522,19 @@ export function verifyEdgeHeaders(args: {
       const parsed = JSON.parse(Buffer.from(metaB64, 'base64url').toString('utf8')) as Record<string, unknown>
       const visibility = parseSiteVisibility(parsed.visibility, 'public')
       meta = {
+        ...(typeof parsed.siteId === 'string' && parsed.siteId ? { siteId: parsed.siteId } : {}),
         title: typeof parsed.title === 'string' ? parsed.title : '',
         visibility,
         passwordSalt: typeof parsed.passwordSalt === 'string' ? parsed.passwordSalt : null,
         passwordHash: typeof parsed.passwordHash === 'string' ? parsed.passwordHash : null,
         spaMode: parsed.spaMode !== false,
+        ...(parsed.customDomain === null
+          ? { customDomain: null }
+          : typeof parsed.customDomain === 'string'
+            ? { customDomain: parsed.customDomain }
+            : {}),
+        ...(typeof parsed.hasServerApi === 'boolean' ? { hasServerApi: parsed.hasServerApi } : {}),
+        ...(typeof parsed.envDigest === 'string' ? { envDigest: parsed.envDigest } : {}),
         ...(typeof parsed.contentSha256 === 'string' ? { contentSha256: parsed.contentSha256 } : {}),
         ...(typeof parsed.expectedBaseRevision === 'number' &&
         Number.isSafeInteger(parsed.expectedBaseRevision) &&
@@ -449,6 +552,9 @@ export function verifyEdgeHeaders(args: {
   return { revision, nonce, bodySha256: actualSha, meta }
 }
 
+export type CustomDomainStatus = 'none' | 'pending' | 'verified'
+export type SiteOpKind = 'publish' | 'meta' | 'env' | 'rename' | 'delete'
+
 export interface UserSiteRow {
   id: string
   slug: string
@@ -458,6 +564,15 @@ export interface UserSiteRow {
   passwordSalt: string | null
   passwordHash: string | null
   spaMode: boolean
+  customDomain: string | null
+  customDomainVerified: boolean
+  customDomainToken: string | null
+  originSessionId: string | null
+  hasServerApi: boolean
+  envDigest: string
+  opKind?: SiteOpKind | null
+  opRenameToSlug?: string | null
+  opEnvDigest?: string | null
   fileCount: number
   sizeBytes: number
   contentSha256: string
@@ -471,6 +586,12 @@ export interface UserSiteDto {
   id: string
   slug: string
   url: string
+  customDomain: string | null
+  customDomainStatus: CustomDomainStatus
+  customDomainTxtName: string | null
+  customDomainTxtValue: string | null
+  originSessionId: string | null
+  hasServerApi: boolean
   title: string
   visibility: SiteVisibility
   spaMode: boolean
@@ -483,11 +604,87 @@ export interface UserSiteDto {
   lastPublishedAt: string
 }
 
+export interface SiteEnvVarDto {
+  key: string
+  value: string | null
+  isSecret: boolean
+  hasValue: boolean
+  updatedAt: string
+}
+
+export interface SiteAnalyticsPoint {
+  date: string
+  uniqueVisitors: number
+  requests: number
+  pageViews: number
+}
+
+export interface SiteAnalyticsResponse {
+  days: number
+  totals: {
+    uniqueVisitors: number
+    requests: number
+    pageViews: number
+  }
+  series: SiteAnalyticsPoint[]
+}
+
+export interface SiteDbTableSummary {
+  name: string
+  rowCount: number
+}
+
+export interface SiteDbColumnInfo {
+  name: string
+  type: string
+  pk: boolean
+  notnull: boolean
+}
+
+export interface SiteDbInspectResponse {
+  connected: boolean
+  hasDatabaseFile: boolean
+  sizeBytes: number
+  tables: SiteDbTableSummary[]
+  selectedTable: string | null
+  columns: SiteDbColumnInfo[]
+  rows: Array<Record<string, unknown>>
+  truncated?: boolean
+}
+
+export interface SiteDbQueryResponse {
+  columns: string[]
+  rows: Array<Record<string, unknown>>
+  changes: number
+  lastInsertRowid: number | string | null
+  truncated?: boolean
+}
+
+export function customDomainTxtValueFor(siteId: string, token: string): string {
+  return `oc-site-verify=${siteId}.${token}`
+}
+
 export function toUserSiteDto(row: UserSiteRow, baseDomain: string): UserSiteDto {
+  const customDomainStatus: CustomDomainStatus = !row.customDomain
+    ? 'none'
+    : row.customDomainVerified
+      ? 'verified'
+      : 'pending'
+  const txtName = row.customDomain ? `_oc-site-verify.${row.customDomain}` : null
+  const txtVal =
+    row.customDomain && row.customDomainToken
+      ? customDomainTxtValueFor(row.id, row.customDomainToken)
+      : null
   return {
     id: row.id,
     slug: row.slug,
     url: `https://${row.slug}.${baseDomain}`,
+    customDomain: row.customDomain,
+    customDomainStatus,
+    customDomainTxtName: txtName,
+    customDomainTxtValue: txtVal,
+    originSessionId: row.originSessionId,
+    hasServerApi: row.hasServerApi,
     title: row.title,
     visibility: row.visibility,
     spaMode: row.spaMode,

@@ -7,7 +7,6 @@ import type { AuthSession } from '../lib/types'
 import { CronPanel } from './manage/CronPanel'
 import { MemoryPanel } from './manage/MemoryPanel'
 import { SkillsPanel } from './manage/SkillsPanel'
-import { SitesPanel } from './manage/SitesPanel'
 import { ConnectorsTab } from './settings/ConnectorsTab'
 import {
   Button,
@@ -161,7 +160,7 @@ export function ManageCenter({
                   value={current.id}
                   onValueChange={(v) => onTabChange(v as ManageTab)}
                   items={navItems.map((it) => ({ value: it.id, label: it.label, featureId: it.featureId }))}
-                  className="grid-cols-5 [&_[role=tab]]:px-1.5"
+                  className="grid-cols-4 [&_[role=tab]]:px-1.5"
                 />
               </div>
             )}
@@ -257,11 +256,6 @@ export function ManageCenter({
                             onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
                             onAskInChat={onAskInChat}
                           />
-                        </div>
-                      )}
-                      {tab === 'sites' && (
-                        <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.containerPreview.id}>
-                          <SitesPanel auth={auth} onAskInChat={onAskInChat} />
                         </div>
                       )}
                     </>

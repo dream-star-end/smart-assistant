@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import {
   createReadStream,
   existsSync,
@@ -21,7 +21,9 @@ import {
   type EdgeMetaEnvelope,
   SITE_AUTH_COOKIE_NAME,
   SITE_EDGE_PREFIX,
+  SITE_EDGE_V2_PREFIX,
   SITE_EDGE_SIGNATURE_WINDOW_SEC,
+  SITE_SERVER_API_PATH,
   type SiteVisibility,
   SitesError,
   decodeSiteBundle,
@@ -29,6 +31,11 @@ import {
   verifyEdgeHeaders,
   verifySitePassword,
 } from './types.js'
+import { EdgeAnalyticsStore } from './edgeAnalytics.js'
+import { runSiteApiWorker } from './edgeApiRunner.js'
+import { sharedSandboxAdmission } from './edgeSandbox.js'
+import { executeSiteSql, inspectSiteDatabase } from './edgeSqlite.js'
+import { computeEnvMapDigest, sealEdgeEnvMap, unsealEdgeEnvMap } from './envCrypto.js'
 
 export interface SitesEdgeServerOptions {
   bind?: string
@@ -39,9 +46,11 @@ export interface SitesEdgeServerOptions {
   maxSiteBytes?: number
   trustLoopbackOnlyForTlsAsk?: boolean
   unlockCookieTtlSec?: number
+  allowPrivateFetchForTest?: boolean
 }
 
 interface StoredSiteMeta {
+  siteId?: string | null
   slug: string
   revision: number
   title: string
@@ -49,6 +58,9 @@ interface StoredSiteMeta {
   passwordSalt: string | null
   passwordHash: string | null
   spaMode: boolean
+  customDomain?: string | null
+  hasServerApi?: boolean
+  envDigest?: string
   fileCount: number
   sizeBytes: number
   contentSha256: string
@@ -58,6 +70,9 @@ interface StoredSiteMeta {
 interface TombstoneMeta {
   revision: number
   deletedAt: string
+  siteId?: string | null
+  op?: 'delete' | 'rename'
+  renamedTo?: string | null
 }
 
 const MAX_NONCE_CACHE = 10_000
@@ -65,7 +80,7 @@ const MAX_UNLOCK_FAIL_CACHE = 10_000
 const UNLOCK_WINDOW_MS = 5 * 60_000
 const UNLOCK_MAX_FAILS = 10
 const DEFAULT_UNLOCK_COOKIE_TTL_SEC = 7 * 24 * 3600
-const MAX_CONTROL_JSON_BYTES = 128 * 1024
+const MAX_CONTROL_JSON_BYTES = 1024 * 1024
 const MAX_UNLOCK_BODY_BYTES = 8 * 1024
 
 const MIME_TYPES: Readonly<Record<string, string>> = {
@@ -302,7 +317,6 @@ function serveStaticFile(
     res.setHeader('Content-Disposition', 'attachment')
   }
   if (visibility !== 'public') {
-    // Never allow shared/browser caching or conditional 304 revalidation for protected content (B4).
     res.setHeader('Cache-Control', 'private, no-store')
     res.setHeader('Pragma', 'no-cache')
     res.setHeader('Vary', 'Cookie')
@@ -354,6 +368,62 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
   const slugLocks = new Map<string, Promise<void>>()
   const usedNonces = new Map<string, number>()
   const unlockFailures = new Map<string, { count: number; inflight: number; resetAt: number }>()
+  const customDomainMap = new Map<string, string>()
+  const analytics = new EdgeAnalyticsStore(sitesDir, opts.secret)
+
+  function rebuildCustomDomainMap(): void {
+    customDomainMap.clear()
+    try {
+      for (const entry of readdirSync(sitesDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        const slug = entry.name
+        const meta = readJsonIfExists<StoredSiteMeta>(join(sitesDir, slug, 'meta.json'))
+        const tomb = readJsonIfExists<TombstoneMeta>(join(sitesDir, slug, 'tombstone.json'))
+        if (!meta || (tomb && tomb.revision >= meta.revision)) continue
+        const domain = typeof meta.customDomain === 'string' ? meta.customDomain.trim().toLowerCase() : ''
+        if (domain) customDomainMap.set(domain, slug)
+      }
+    } catch {
+      /* ignore scan error on empty root */
+    }
+  }
+  rebuildCustomDomainMap()
+
+  function updateCustomDomainMapping(slug: string, nextDomain: string | null): void {
+    for (const [dom, owner] of customDomainMap) {
+      if (owner === slug) customDomainMap.delete(dom)
+    }
+    if (nextDomain) {
+      customDomainMap.set(nextDomain.toLowerCase(), slug)
+    }
+    const obj: Record<string, string> = {}
+    for (const [dom, owner] of customDomainMap) obj[dom] = owner
+    writeFileAtomic(join(dataRoot, 'custom-domains.json'), JSON.stringify(obj))
+  }
+
+  function resolveSlugByHost(hostOrDomain: string): string | null {
+    const sub = extractSubdomainSlug(hostOrDomain, baseDomain)
+    if (sub) return sub
+    const clean = hostOrDomain.trim().toLowerCase().replace(/:\d+$/, '').replace(/\.+$/, '')
+    if (!clean) return null
+    return customDomainMap.get(clean) ?? null
+  }
+
+  function readDecryptedSiteEnvStrict(slug: string): Record<string, string> {
+    const envPath = join(siteDirOf(slug), 'env.enc')
+    if (!existsSync(envPath)) return {}
+    const sealed = readFileSync(envPath, 'utf8').trim()
+    return unsealEdgeEnvMap(opts.secret, slug, sealed)
+  }
+
+  async function withMultiSlugLock<T>(slugs: string[], fn: () => Promise<T>): Promise<T> {
+    const sorted = [...new Set(slugs)].sort()
+    const runAt = (idx: number): Promise<T> => {
+      if (idx >= sorted.length) return fn()
+      return withSlugLock(sorted[idx]!, () => runAt(idx + 1))
+    }
+    return runAt(0)
+  }
 
   const sweepTimer = setInterval(() => {
     const nowMs = Date.now()
@@ -444,7 +514,22 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     }
   }
 
-  function isSiteServable(slug: string): { meta: StoredSiteMeta; currentReal: string } | null {
+  function assertIdentityMatches(
+    curMeta: StoredSiteMeta,
+    reqSiteId: string | undefined,
+    expectedRev?: number,
+  ): void {
+    if (curMeta.siteId && reqSiteId !== curMeta.siteId) {
+      throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
+    }
+    if (expectedRev !== undefined && curMeta.revision !== expectedRev) {
+      throw new SitesError('STALE_REVISION', 'edge revision mismatch', 409)
+    }
+  }
+
+  function isSiteServable(
+    slug: string,
+  ): { meta: StoredSiteMeta; currentReal: string; serverEntryReal: string | null } | null {
     const { meta, tombstone, currentLink } = readMetaAndTombstone(slug)
     if (!meta || meta.visibility === 'disabled') return null
     if (tombstone && tombstone.revision >= meta.revision) return null
@@ -453,7 +538,15 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       const currentReal = realpathSync(currentLink)
       const siteRoot = realpathSync(siteDirOf(slug))
       if (!currentReal.startsWith(siteRoot + sep)) return null
-      return { meta, currentReal }
+      let serverEntryReal: string | null = null
+      const serverEntry = join(siteDirOf(slug), 'current-server', 'api.mjs')
+      if (meta.hasServerApi && existsSync(serverEntry)) {
+        const candidate = realpathSync(serverEntry)
+        if (candidate.startsWith(siteRoot + sep)) {
+          serverEntryReal = candidate
+        }
+      }
+      return { meta, currentReal, serverEntryReal }
     } catch {
       return null
     }
@@ -462,19 +555,44 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
   async function handleControlApi(
     req: IncomingMessage,
     res: ServerResponse,
-    pathname: string,
+    url: URL,
   ): Promise<void> {
+    const pathname = url.pathname
     const method = req.method ?? 'GET'
-    if (method === 'GET' && pathname === `${SITE_EDGE_PREFIX}/healthz`) {
+    if (
+      method === 'GET' &&
+      (pathname === `${SITE_EDGE_PREFIX}/healthz` || pathname === `${SITE_EDGE_V2_PREFIX}/healthz`)
+    ) {
       sendJsonResponse(res, 200, { ok: true, baseDomain })
       return
     }
 
-    const putOrDeleteMatch = new RegExp(`^${SITE_EDGE_PREFIX}/sites/([^/]+)$`).exec(pathname)
-    const patchMatch = new RegExp(`^${SITE_EDGE_PREFIX}/sites/([^/]+)/meta$`).exec(pathname)
+    let activePrefix = SITE_EDGE_PREFIX
+    let apiVersion: 1 | 2 = 1
+    if (pathname.startsWith(`${SITE_EDGE_V2_PREFIX}/`)) {
+      activePrefix = SITE_EDGE_V2_PREFIX
+      apiVersion = 2
+    }
+
+    const putOrDeleteMatch = new RegExp(`^${activePrefix}/sites/([^/]+)$`).exec(pathname)
+    const patchMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/meta$`).exec(pathname)
+    const envPutMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/env$`).exec(pathname)
+    const renameMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/rename$`).exec(pathname)
+    const analyticsMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/analytics$`).exec(pathname)
+    const dbInspectMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/db$`).exec(pathname)
+    const dbSqlMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/db/sql$`).exec(pathname)
     let rawSlug = ''
     try {
-      rawSlug = decodeURIComponent(putOrDeleteMatch?.[1] ?? patchMatch?.[1] ?? '')
+      rawSlug = decodeURIComponent(
+        putOrDeleteMatch?.[1] ??
+          patchMatch?.[1] ??
+          envPutMatch?.[1] ??
+          renameMatch?.[1] ??
+          analyticsMatch?.[1] ??
+          dbInspectMatch?.[1] ??
+          dbSqlMatch?.[1] ??
+          '',
+      )
     } catch {
       throw new SitesError('INVALID_SLUG', 'invalid slug encoding', 400)
     }
@@ -485,9 +603,10 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     }
 
     const slug = validateSiteSlug(rawSlug)
+    const isBundlePut = Boolean(method === 'PUT' && putOrDeleteMatch)
     const body = await readBodyLimited(
       req,
-      method === 'PUT' ? maxSiteBytes + 4 * 1024 * 1024 : MAX_CONTROL_JSON_BYTES,
+      isBundlePut ? maxSiteBytes + 4 * 1024 * 1024 : MAX_CONTROL_JSON_BYTES,
     )
     const verified = verifyEdgeHeaders({
       secret: opts.secret,
@@ -507,14 +626,28 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           exists: liveRevision > 0,
           revision: liveRevision,
           tombstoneRevision: tombstone?.revision ?? 0,
+          ...(tombstone
+            ? {
+                tombstone: {
+                  revision: tombstone.revision,
+                  siteId: tombstone.siteId ?? null,
+                  op: tombstone.op ?? 'delete',
+                  renamedTo: tombstone.renamedTo ?? null,
+                },
+              }
+            : {}),
           ...(liveRevision > 0 && curMeta
             ? {
                 meta: {
+                  siteId: curMeta.siteId ?? null,
                   title: curMeta.title,
                   visibility: curMeta.visibility,
                   passwordSalt: curMeta.passwordSalt,
                   passwordHash: curMeta.passwordHash,
                   spaMode: curMeta.spaMode,
+                  customDomain: curMeta.customDomain ?? null,
+                  hasServerApi: Boolean(curMeta.hasServerApi),
+                  envDigest: curMeta.envDigest ?? '',
                   fileCount: curMeta.fileCount,
                   sizeBytes: curMeta.sizeBytes,
                   contentSha256: curMeta.contentSha256,
@@ -526,8 +659,276 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       return
     }
 
+    if (method === 'GET' && analyticsMatch) {
+      await withSlugLock(slug, async () => {
+        const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
+        if (!curMeta || (tombstone && tombstone.revision >= curMeta.revision)) {
+          throw new SitesError('SITE_NOT_FOUND', 'site missing on edge', 404)
+        }
+        assertIdentityMatches(curMeta, verified.meta?.siteId, verified.meta?.expectedBaseRevision)
+        const days = Number.parseInt(url.searchParams.get('days') ?? '30', 10)
+        sendJsonResponse(res, 200, analytics.getSummary(slug, Number.isFinite(days) ? days : 30))
+      })
+      return
+    }
+
+    if (method === 'GET' && dbInspectMatch) {
+      const table = url.searchParams.get('table') ?? undefined
+      const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10)
+      const siteData = await withSlugLock(slug, async () => {
+        const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
+        if (!curMeta || (tombstone && tombstone.revision >= curMeta.revision)) {
+          throw new SitesError('SITE_NOT_FOUND', 'site missing on edge', 404)
+        }
+        assertIdentityMatches(curMeta, verified.meta?.siteId, verified.meta?.expectedBaseRevision)
+        return inspectSiteDatabase(siteDirOf(slug), table, Number.isFinite(limit) ? limit : 100, slug)
+      })
+      sendJsonResponse(res, 200, siteData)
+      return
+    }
+
+    if (method === 'POST' && dbSqlMatch) {
+      let payload: { siteId?: unknown; expectedRevision?: unknown; sql?: unknown; params?: unknown }
+      try {
+        payload = JSON.parse(body.toString('utf8')) as {
+          siteId?: unknown
+          expectedRevision?: unknown
+          sql?: unknown
+          params?: unknown
+        }
+      } catch {
+        throw new SitesError('INVALID_INPUT', 'invalid sql json', 400)
+      }
+      if (typeof payload.sql !== 'string') {
+        throw new SitesError('INVALID_INPUT', 'sql must be string', 400)
+      }
+      const reqSiteId =
+        verified.meta?.siteId ?? (typeof payload.siteId === 'string' ? payload.siteId : undefined)
+      const reqExpRev =
+        verified.meta?.expectedBaseRevision ??
+        (typeof payload.expectedRevision === 'number' ? payload.expectedRevision : undefined)
+      const params = Array.isArray(payload.params) ? payload.params : []
+      const result = await withSlugLock(slug, async () => {
+        const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
+        if (!curMeta || (tombstone && tombstone.revision >= curMeta.revision)) {
+          throw new SitesError('SITE_NOT_FOUND', 'site missing on edge', 404)
+        }
+        assertIdentityMatches(curMeta, reqSiteId, reqExpRev)
+        return executeSiteSql(siteDirOf(slug), payload.sql as string, params, slug)
+      })
+      sendJsonResponse(res, 200, result)
+      return
+    }
+
+    if (method === 'PUT' && envPutMatch) {
+      let payload: {
+        siteId?: unknown
+        expectedBaseRevision?: unknown
+        envDigest?: unknown
+        encryptedEnvB64?: unknown
+      }
+      try {
+        payload = JSON.parse(body.toString('utf8')) as typeof payload
+      } catch {
+        throw new SitesError('INVALID_INPUT', 'invalid env json', 400)
+      }
+      const reqSiteId =
+        verified.meta?.siteId ?? (typeof payload.siteId === 'string' ? payload.siteId : undefined)
+      const reqBaseRev =
+        typeof payload.expectedBaseRevision === 'number'
+          ? payload.expectedBaseRevision
+          : verified.meta?.expectedBaseRevision
+      const envDigest = typeof payload.envDigest === 'string' ? payload.envDigest : ''
+      const encryptedEnvB64 = typeof payload.encryptedEnvB64 === 'string' ? payload.encryptedEnvB64 : ''
+      if (encryptedEnvB64) {
+        unsealEdgeEnvMap(opts.secret, slug, encryptedEnvB64)
+      }
+
+      await withSlugLock(slug, async () => {
+        const dir = siteDirOf(slug)
+        const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
+        if (!curMeta || (tombstone && tombstone.revision >= curMeta.revision)) {
+          throw new SitesError('SITE_NOT_FOUND', 'site missing on edge', 404)
+        }
+        if (curMeta.siteId && reqSiteId !== curMeta.siteId) {
+          throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
+        }
+        if (reqBaseRev !== undefined && curMeta.revision !== reqBaseRev) {
+          throw new SitesError('STALE_REVISION', 'edge base revision mismatch', 409)
+        }
+        if (verified.revision < curMeta.revision) {
+          if (curMeta.envDigest === envDigest) {
+            sendJsonResponse(res, 200, { ok: true, idempotent: true, revision: curMeta.revision })
+            return
+          }
+          throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
+        }
+        if (encryptedEnvB64) {
+          writeFileAtomic(join(dir, 'env.enc'), encryptedEnvB64)
+        } else {
+          rmSync(join(dir, 'env.enc'), { force: true })
+        }
+        const nextMeta: StoredSiteMeta = {
+          ...curMeta,
+          siteId: curMeta.siteId ?? reqSiteId ?? null,
+          revision: verified.revision,
+          envDigest,
+          updatedAt: new Date().toISOString(),
+        }
+        writeFileAtomic(join(dir, 'meta.json'), JSON.stringify(nextMeta))
+        sendJsonResponse(res, 200, { ok: true, revision: verified.revision })
+      })
+      return
+    }
+
+    if (method === 'POST' && renameMatch) {
+      let payload: { siteId?: unknown; newSlug?: unknown; expectedBaseRevision?: unknown }
+      try {
+        payload = JSON.parse(body.toString('utf8')) as {
+          siteId?: unknown
+          newSlug?: unknown
+          expectedBaseRevision?: unknown
+        }
+      } catch {
+        throw new SitesError('INVALID_INPUT', 'invalid rename json', 400)
+      }
+      const newSlug = validateSiteSlug(String(payload.newSlug ?? ''))
+      const expectedBaseRevision =
+        typeof payload.expectedBaseRevision === 'number'
+          ? payload.expectedBaseRevision
+          : verified.meta?.expectedBaseRevision
+      const reqSiteId =
+        verified.meta?.siteId ?? (typeof payload.siteId === 'string' ? payload.siteId : undefined)
+
+      if (newSlug === slug) {
+        sendJsonResponse(res, 200, { ok: true, slug })
+        return
+      }
+      await withMultiSlugLock([slug, newSlug], async () => {
+        const { meta: oldMeta, tombstone: oldTomb } = readMetaAndTombstone(slug)
+        const { meta: dstMeta, tombstone: dstTomb } = readMetaAndTombstone(newSlug)
+
+        if (
+          oldTomb?.op === 'rename' &&
+          oldTomb.revision === verified.revision &&
+          oldTomb.renamedTo === newSlug &&
+          dstMeta?.revision === verified.revision &&
+          (!dstMeta.siteId || !reqSiteId || dstMeta.siteId === reqSiteId)
+        ) {
+          sendJsonResponse(res, 200, { ok: true, idempotent: true, slug: newSlug, revision: verified.revision })
+          return
+        }
+
+        const oldLiveRev =
+          oldMeta && (!oldTomb || oldTomb.revision < oldMeta.revision) ? oldMeta.revision : 0
+        if (!oldMeta || oldLiveRev <= 0) {
+          throw new SitesError('SITE_NOT_FOUND', 'source site missing on edge', 404)
+        }
+        if (oldMeta.siteId && reqSiteId !== oldMeta.siteId) {
+          throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
+        }
+        if (expectedBaseRevision !== undefined && oldLiveRev !== expectedBaseRevision) {
+          throw new SitesError('STALE_REVISION', 'edge base revision mismatch', 409)
+        }
+        const dstLive = Boolean(dstMeta && (!dstTomb || dstTomb.revision < dstMeta.revision))
+        if (dstLive) {
+          throw new SitesError('SLUG_TAKEN', `子域名 "${newSlug}" 已被占用`, 409)
+        }
+        const maxSeen = Math.max(
+          oldMeta.revision,
+          oldTomb?.revision ?? 0,
+          dstMeta?.revision ?? 0,
+          dstTomb?.revision ?? 0,
+        )
+        if (verified.revision <= maxSeen) {
+          throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
+        }
+
+        // Unseal & validate env BEFORE moving any files on disk (P1 #9).
+        const oldDir = siteDirOf(slug)
+        const newDir = siteDirOf(newSlug)
+        const oldEnvPath = join(oldDir, 'env.enc')
+        const oldEnvRaw = existsSync(oldEnvPath) ? readFileSync(oldEnvPath) : null
+        const oldMetaRaw = readFileSync(join(oldDir, 'meta.json'))
+        const effectiveSiteId = oldMeta.siteId ?? reqSiteId ?? null
+        const oldEnv = readDecryptedSiteEnvStrict(slug)
+        const resealedEnv =
+          Object.keys(oldEnv).length > 0 ? sealEdgeEnvMap(opts.secret, newSlug, oldEnv) : null
+        const resolvedEnvDigest =
+          oldMeta.envDigest ??
+          computeEnvMapDigest(oldEnv, effectiveSiteId ?? slug, opts.secret)
+
+        rmSync(newDir, { recursive: true, force: true })
+        renameSync(oldDir, newDir)
+
+        try {
+          const movedMeta: StoredSiteMeta = {
+            ...oldMeta,
+            siteId: effectiveSiteId,
+            slug: newSlug,
+            revision: verified.revision,
+            envDigest: resolvedEnvDigest,
+            updatedAt: new Date().toISOString(),
+          }
+          writeFileAtomic(join(newDir, 'meta.json'), JSON.stringify(movedMeta))
+
+          if (resealedEnv !== null) {
+            writeFileAtomic(join(newDir, 'env.enc'), resealedEnv)
+          } else {
+            rmSync(join(newDir, 'env.enc'), { force: true })
+          }
+
+          analytics.renameSlug(slug, newSlug)
+          updateCustomDomainMapping(slug, null)
+          if (movedMeta.customDomain) {
+            updateCustomDomainMapping(newSlug, movedMeta.customDomain)
+          }
+        } catch (err) {
+          // Restore directory, original meta/ciphertext, domain mapping, and analytics on post-move error.
+          try {
+            if (!existsSync(oldDir) && existsSync(newDir)) {
+              renameSync(newDir, oldDir)
+            }
+            if (existsSync(oldDir)) {
+              writeFileSync(join(oldDir, 'meta.json'), oldMetaRaw)
+              if (oldEnvRaw !== null) {
+                writeFileSync(join(oldDir, 'env.enc'), oldEnvRaw)
+              } else {
+                rmSync(join(oldDir, 'env.enc'), { force: true })
+              }
+            }
+            analytics.renameSlug(newSlug, slug)
+            updateCustomDomainMapping(newSlug, null)
+            if (oldMeta.customDomain) {
+              updateCustomDomainMapping(slug, oldMeta.customDomain)
+            }
+          } catch {
+            /* best effort rollback */
+          }
+          throw err
+        }
+
+        mkdirSync(oldDir, { recursive: true })
+        writeFileAtomic(
+          join(oldDir, 'tombstone.json'),
+          JSON.stringify({
+            revision: verified.revision,
+            deletedAt: new Date().toISOString(),
+            siteId: oldMeta.siteId ?? reqSiteId ?? null,
+            op: 'rename',
+            renamedTo: newSlug,
+          }),
+        )
+        sendJsonResponse(res, 200, { ok: true, slug: newSlug, revision: verified.revision })
+      })
+      return
+    }
+
     if (method === 'PUT' && putOrDeleteMatch) {
       const decoded = decodeSiteBundle(body, maxSiteBytes)
+      if (apiVersion === 1 && decoded.hasServerApi) {
+        throw new SitesError('INVALID_BUNDLE', '包含服务端 API 的包必须通过 /v2 端点上传', 400)
+      }
       const envelope: EdgeMetaEnvelope = verified.meta ?? {
         title: slug,
         visibility: 'public',
@@ -542,6 +943,13 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         const currentMax = Math.max(curMeta?.revision ?? 0, tombstone?.revision ?? 0)
         const liveRev =
           curMeta && (!tombstone || tombstone.revision < curMeta.revision) ? curMeta.revision : 0
+
+        if (curMeta && (!tombstone || tombstone.revision < curMeta.revision)) {
+          if (curMeta.siteId && envelope.siteId && curMeta.siteId !== envelope.siteId) {
+            throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
+          }
+        }
+
         if (verified.revision <= currentMax) {
           if (
             curMeta &&
@@ -549,7 +957,19 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             curMeta.contentSha256 === decoded.contentSha256 &&
             (!tombstone || tombstone.revision < curMeta.revision)
           ) {
-            sendJsonResponse(res, 200, { ok: true, idempotent: true, revision: curMeta.revision })
+            const effectiveId = curMeta.siteId ?? envelope.siteId ?? slug
+            const diskDigest =
+              curMeta.envDigest ??
+              computeEnvMapDigest(readDecryptedSiteEnvStrict(slug), effectiveId, opts.secret)
+            const needsEnvSync =
+              envelope.envDigest !== undefined && envelope.envDigest !== diskDigest
+            sendJsonResponse(res, 200, {
+              ok: true,
+              idempotent: true,
+              revision: curMeta.revision,
+              envDigest: diskDigest,
+              ...(needsEnvSync ? { needsEnvSync: true } : {}),
+            })
             return
           }
           throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
@@ -560,13 +980,43 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         ) {
           throw new SitesError('STALE_REVISION', 'edge base revision mismatch', 409)
         }
+        const nextDomain =
+          envelope.customDomain !== undefined ? envelope.customDomain : (curMeta?.customDomain ?? null)
+        if (nextDomain) {
+          const holder = customDomainMap.get(nextDomain.toLowerCase())
+          if (holder && holder !== slug) {
+            throw new SitesError('DOMAIN_TAKEN', `自定义域名 "${nextDomain}" 已被占用`, 409)
+          }
+        }
+
+        const diskEnvPath = join(dir, 'env.enc')
+        const effectiveSiteId = envelope.siteId ?? curMeta?.siteId ?? slug
+        let existingEnvDigest = ''
+        if (existsSync(diskEnvPath)) {
+          existingEnvDigest =
+            curMeta?.envDigest !== undefined
+              ? curMeta.envDigest
+              : computeEnvMapDigest(readDecryptedSiteEnvStrict(slug), effectiveSiteId, opts.secret)
+        }
 
         const revName = `rev-${verified.revision}`
+        const serverRevName = `${revName}-server`
         const tmpRelease = join(dir, 'releases', `.tmp-${revName}-${randomBytes(6).toString('hex')}`)
         const finalRelease = join(dir, 'releases', revName)
+        const tmpServerDir = join(
+          dir,
+          'releases',
+          `.tmp-${serverRevName}-${randomBytes(6).toString('hex')}`,
+        )
+        const finalServerDir = join(dir, 'releases', serverRevName)
+        let serverFile: Buffer | null = null
         mkdirSync(tmpRelease, { recursive: true })
         try {
           for (const f of decoded.files) {
+            if (f.path === SITE_SERVER_API_PATH) {
+              serverFile = f.content
+              continue
+            }
             const targetFile = join(tmpRelease, f.path)
             mkdirSync(join(targetFile, '..'), { recursive: true })
             writeFileSync(targetFile, f.content)
@@ -574,7 +1024,25 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           rmSync(finalRelease, { recursive: true, force: true })
           renameSync(tmpRelease, finalRelease)
 
+          if (serverFile) {
+            mkdirSync(tmpServerDir, { recursive: true })
+            writeFileSync(join(tmpServerDir, 'api.mjs'), serverFile)
+            rmSync(finalServerDir, { recursive: true, force: true })
+            renameSync(tmpServerDir, finalServerDir)
+            const tmpSrvLink = join(dir, `.tmp-current-server-${randomBytes(6).toString('hex')}`)
+            symlinkSync(join('releases', serverRevName), tmpSrvLink)
+            renameSync(tmpSrvLink, join(dir, 'current-server'))
+          } else {
+            rmSync(join(dir, 'current-server'), { force: true })
+          }
+
+          if (envelope.envDigest === '' && existsSync(diskEnvPath)) {
+            rmSync(diskEnvPath, { force: true })
+            existingEnvDigest = ''
+          }
+
           const nextMeta: StoredSiteMeta = {
+            siteId: envelope.siteId ?? curMeta?.siteId ?? null,
             slug,
             revision: verified.revision,
             title: envelope.title || slug,
@@ -582,12 +1050,16 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             passwordSalt: envelope.passwordSalt,
             passwordHash: envelope.passwordHash,
             spaMode: envelope.spaMode,
+            customDomain: nextDomain,
+            hasServerApi: Boolean(serverFile),
+            envDigest: existingEnvDigest,
             fileCount: decoded.fileCount,
             sizeBytes: decoded.sizeBytes,
             contentSha256: decoded.contentSha256,
             updatedAt: new Date().toISOString(),
           }
           writeFileAtomic(join(dir, 'meta.json'), JSON.stringify(nextMeta))
+          updateCustomDomainMapping(slug, nextDomain)
 
           const tmpLink = join(dir, `.tmp-current-${randomBytes(6).toString('hex')}`)
           symlinkSync(join('releases', revName), tmpLink)
@@ -595,28 +1067,46 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           rmSync(join(dir, 'tombstone.json'), { force: true })
 
           for (const entry of readdirSync(join(dir, 'releases'))) {
-            if (entry !== revName) {
+            if (entry !== revName && entry !== serverRevName) {
               rmSync(join(dir, 'releases', entry), { recursive: true, force: true })
             }
           }
         } catch (err) {
           rmSync(tmpRelease, { recursive: true, force: true })
+          rmSync(tmpServerDir, { recursive: true, force: true })
           throw err
         }
-        sendJsonResponse(res, 200, { ok: true, revision: verified.revision })
+        const needsEnvSync =
+          envelope.envDigest !== undefined && envelope.envDigest !== existingEnvDigest
+        sendJsonResponse(res, 200, {
+          ok: true,
+          revision: verified.revision,
+          envDigest: existingEnvDigest,
+          ...(needsEnvSync ? { needsEnvSync: true } : {}),
+        })
       })
       return
     }
 
     if (method === 'PATCH' && patchMatch) {
-      let envelope = verified.meta
-      if (!envelope) {
+      let bodyPayload: (EdgeMetaEnvelope & { encryptedEnvB64?: unknown }) | null = null
+      if (body.length > 0) {
         try {
-          envelope = JSON.parse(body.toString('utf8')) as EdgeMetaEnvelope
+          bodyPayload = JSON.parse(body.toString('utf8')) as EdgeMetaEnvelope & { encryptedEnvB64?: unknown }
         } catch {
           throw new SitesError('INVALID_INPUT', 'invalid meta json', 400)
         }
       }
+      const envelope = verified.meta ?? bodyPayload
+      if (!envelope) {
+        throw new SitesError('INVALID_INPUT', 'missing meta envelope', 400)
+      }
+      const bodyEncryptedEnvB64 =
+        typeof bodyPayload?.encryptedEnvB64 === 'string' ? bodyPayload.encryptedEnvB64 : undefined
+      if (bodyEncryptedEnvB64) {
+        unsealEdgeEnvMap(opts.secret, slug, bodyEncryptedEnvB64)
+      }
+
       await withSlugLock(slug, async () => {
         const dir = siteDirOf(slug)
         const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
@@ -627,13 +1117,20 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           }
           throw new SitesError('SITE_NOT_FOUND', 'site missing on edge', 404)
         }
+        if (curMeta.siteId && envelope.siteId && curMeta.siteId !== envelope.siteId) {
+          throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
+        }
         if (verified.revision <= currentMax) {
           if (
             verified.revision === curMeta.revision &&
-            curMeta.title === envelope!.title &&
-            curMeta.visibility === envelope!.visibility &&
-            curMeta.passwordHash === envelope!.passwordHash &&
-            curMeta.spaMode === envelope!.spaMode
+            curMeta.title === envelope.title &&
+            curMeta.visibility === envelope.visibility &&
+            curMeta.passwordHash === envelope.passwordHash &&
+            curMeta.spaMode === envelope.spaMode &&
+            (envelope.customDomain === undefined ||
+              (curMeta.customDomain ?? null) === envelope.customDomain) &&
+            (envelope.envDigest === undefined ||
+              (curMeta.envDigest ?? '') === envelope.envDigest)
           ) {
             sendJsonResponse(res, 200, { ok: true, idempotent: true, revision: curMeta.revision })
             return
@@ -641,22 +1138,50 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
         }
         if (
-          envelope!.expectedBaseRevision !== undefined &&
-          curMeta.revision !== envelope!.expectedBaseRevision
+          envelope.expectedBaseRevision !== undefined &&
+          curMeta.revision !== envelope.expectedBaseRevision
         ) {
           throw new SitesError('STALE_REVISION', 'edge base revision mismatch', 409)
         }
+        const nextDomain =
+          envelope.customDomain !== undefined
+            ? envelope.customDomain
+            : (curMeta.customDomain ?? null)
+        if (nextDomain) {
+          const holder = customDomainMap.get(nextDomain.toLowerCase())
+          if (holder && holder !== slug) {
+            throw new SitesError('DOMAIN_TAKEN', `自定义域名 "${nextDomain}" 已被占用`, 409)
+          }
+        }
+        if (bodyEncryptedEnvB64 !== undefined) {
+          if (bodyEncryptedEnvB64 === '') {
+            rmSync(join(dir, 'env.enc'), { force: true })
+          } else {
+            writeFileAtomic(join(dir, 'env.enc'), bodyEncryptedEnvB64)
+          }
+        }
         const nextMeta: StoredSiteMeta = {
           ...curMeta,
+          siteId: curMeta.siteId ?? envelope.siteId ?? null,
           revision: verified.revision,
-          title: envelope!.title || curMeta.slug,
-          visibility: envelope!.visibility,
-          passwordSalt: envelope!.passwordSalt,
-          passwordHash: envelope!.passwordHash,
-          spaMode: envelope!.spaMode,
+          title: envelope.title || curMeta.slug,
+          visibility: envelope.visibility,
+          passwordSalt: envelope.passwordSalt,
+          passwordHash: envelope.passwordHash,
+          spaMode: envelope.spaMode,
+          customDomain: nextDomain,
+          hasServerApi:
+            envelope.hasServerApi !== undefined
+              ? envelope.hasServerApi
+              : Boolean(curMeta.hasServerApi),
+          envDigest:
+            envelope.envDigest !== undefined
+              ? envelope.envDigest
+              : (curMeta.envDigest ?? ''),
           updatedAt: new Date().toISOString(),
         }
         writeFileAtomic(join(dir, 'meta.json'), JSON.stringify(nextMeta))
+        updateCustomDomainMapping(slug, nextDomain)
         sendJsonResponse(res, 200, { ok: true, revision: verified.revision })
       })
       return
@@ -667,6 +1192,12 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         const dir = siteDirOf(slug)
         mkdirSync(dir, { recursive: true })
         const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
+        const reqSiteId = verified.meta?.siteId
+        if (curMeta && (!tombstone || tombstone.revision < curMeta.revision)) {
+          if (curMeta.siteId && reqSiteId && curMeta.siteId !== reqSiteId) {
+            throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
+          }
+        }
         const currentMax = Math.max(curMeta?.revision ?? 0, tombstone?.revision ?? 0)
         if (verified.revision <= currentMax) {
           if (tombstone && verified.revision <= tombstone.revision) {
@@ -675,11 +1206,22 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           }
           throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
         }
+        updateCustomDomainMapping(slug, null)
+        analytics.deleteSlug(slug)
         writeFileAtomic(
           join(dir, 'tombstone.json'),
-          JSON.stringify({ revision: verified.revision, deletedAt: new Date().toISOString() }),
+          JSON.stringify({
+            revision: verified.revision,
+            deletedAt: new Date().toISOString(),
+            siteId: curMeta?.siteId ?? reqSiteId ?? null,
+            op: 'delete',
+          }),
         )
         rmSync(join(dir, 'current'), { force: true })
+        rmSync(join(dir, 'current-server'), { force: true })
+        rmSync(join(dir, 'env.enc'), { force: true })
+        rmSync(join(dir, 'analytics.json'), { force: true })
+        rmSync(join(dir, 'data'), { recursive: true, force: true })
         rmSync(join(dir, 'meta.json'), { force: true })
         rmSync(join(dir, 'releases'), { recursive: true, force: true })
         sendJsonResponse(res, 200, { ok: true, revision: verified.revision })
@@ -690,13 +1232,22 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     sendJsonResponse(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'method not allowed' } })
   }
 
+  function resolveClientIp(req: IncomingMessage): string {
+    const remoteIp = req.socket.remoteAddress
+    const forwardedRealIp =
+      isLoopbackIp(remoteIp) && typeof req.headers['x-real-ip'] === 'string'
+        ? req.headers['x-real-ip'].trim()
+        : ''
+    return forwardedRealIp || remoteIp || 'unknown'
+  }
+
   async function handlePublicSite(
     req: IncomingMessage,
     res: ServerResponse,
     url: URL,
   ): Promise<void> {
     const hostHeader = typeof req.headers.host === 'string' ? req.headers.host : ''
-    const slug = extractSubdomainSlug(hostHeader, baseDomain)
+    const slug = resolveSlugByHost(hostHeader)
     if (!slug) {
       sendSiteHtml(res, 404, renderStatusHtml('站点不存在', '未找到对应的托管站点域名。'))
       return
@@ -707,7 +1258,10 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       sendSiteHtml(res, 404, renderStatusHtml('站点暂不可访问', '该站点尚未发布、已下线或已被删除。'))
       return
     }
-    const { meta, currentReal } = active
+    const { meta, currentReal, serverEntryReal } = active
+    const visitorIp = resolveClientIp(req)
+    const userAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : ''
+    const isApiRequest = url.pathname === '/api' || url.pathname.startsWith('/api/')
     const method = req.method ?? 'GET'
     const isHttps =
       req.headers['x-forwarded-proto'] === 'https' ||
@@ -716,12 +1270,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     const isProtected = meta.visibility !== 'public'
     if (meta.visibility === 'password') {
       if (method === 'POST' && url.pathname === '/__oc_site_unlock') {
-        const remoteIp = req.socket.remoteAddress
-        const forwardedRealIp =
-          isLoopbackIp(remoteIp) && typeof req.headers['x-real-ip'] === 'string'
-            ? req.headers['x-real-ip'].trim()
-            : ''
-        const clientIp = forwardedRealIp || remoteIp || 'unknown'
+        const clientIp = resolveClientIp(req)
         const limitKey = `${clientIp}:${slug}`
         const nowMs = Date.now()
         let rec = unlockFailures.get(limitKey)
@@ -754,7 +1303,6 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           return
         }
 
-        // Reserve failure slot synchronously before awaiting request body to prevent concurrent burst bypass (B6).
         rec.inflight += 1
         let unlockedOk = false
         let redirectPath = '/'
@@ -814,6 +1362,15 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         meta.passwordHash !== null &&
         verifySiteCookie(slug, meta.passwordHash, cookies[SITE_AUTH_COOKIE_NAME])
       if (!authed) {
+        if (isApiRequest) {
+          res.statusCode = 401
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.setHeader('Cache-Control', 'private, no-store')
+          res.setHeader('Vary', 'Cookie')
+          setPublicSiteSecurityHeaders(res)
+          res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: '该站点受口令保护' } }))
+          return
+        }
         sendSiteHtml(
           res,
           401,
@@ -825,6 +1382,111 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         )
         return
       }
+    }
+
+    if (isApiRequest && serverEntryReal) {
+      let decryptedEnv: Record<string, string>
+      try {
+        decryptedEnv = readDecryptedSiteEnvStrict(slug)
+      } catch {
+        sendJsonResponse(res, 500, { error: { code: 'INTERNAL', message: 'site env decryption failed' } })
+        return
+      }
+
+      const abortController = new AbortController()
+      const onClose = () => {
+        if (!res.writableEnded) abortController.abort()
+      }
+      res.once('close', onClose)
+
+      let releaseAdmission!: () => void
+      try {
+        releaseAdmission = await sharedSandboxAdmission.acquire(slug, abortController.signal)
+      } catch (err) {
+        res.removeListener('close', onClose)
+        if (err instanceof SitesError) {
+          sendJsonResponse(res, err.status, {
+            error: { code: err.code, message: err.message, retryable: err.retryable },
+          })
+          return
+        }
+        sendJsonResponse(res, 429, { error: { code: 'SLUG_BUSY', message: 'too many requests' } })
+        return
+      }
+
+      let out
+      try {
+        const uploadTimer = setTimeout(() => {
+          abortController.abort()
+          req.destroy(new Error('REQUEST_BODY_TIMEOUT'))
+        }, 10_000)
+        let apiBody: Buffer
+        try {
+          apiBody = await readBodyLimited(req, 2 * 1024 * 1024)
+        } finally {
+          clearTimeout(uploadTimer)
+        }
+        const forwardHeaders: Record<string, string> = {}
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (k === 'cookie' || k === 'authorization') {
+            if (v !== undefined) forwardHeaders[k] = Array.isArray(v) ? v.join('; ') : v
+          } else if (typeof v === 'string' && k !== 'x-oc-sites-signature') {
+            forwardHeaders[k] = v
+          }
+        }
+        const queryObj: Record<string, string> = {}
+        for (const [k, v] of url.searchParams.entries()) queryObj[k] = v
+
+        out = await runSiteApiWorker({
+          slug,
+          siteDir: siteDirOf(slug),
+          entryFilePath: serverEntryReal,
+          revision: meta.revision,
+          method,
+          url: req.url ?? url.pathname,
+          pathname: url.pathname,
+          query: queryObj,
+          headers: forwardHeaders,
+          body: apiBody,
+          env: decryptedEnv,
+          allowPrivateFetchForTest: Boolean(opts.allowPrivateFetchForTest),
+          signal: abortController.signal,
+          preAdmitted: true,
+        })
+      } finally {
+        res.removeListener('close', onClose)
+        releaseAdmission()
+      }
+
+      if (res.writableEnded || res.destroyed) return
+      analytics.recordHit({ slug, clientIp: visitorIp, userAgent, isPageView: false })
+
+      const blockedOutHeaders = new Set([
+        'set-cookie',
+        'content-length',
+        'transfer-encoding',
+        'connection',
+        'strict-transport-security',
+        'cache-control',
+        'x-content-type-options',
+        'cross-origin-opener-policy',
+      ])
+      for (const [k, v] of Object.entries(out.headers)) {
+        const lower = k.toLowerCase()
+        if (!blockedOutHeaders.has(lower) && typeof v === 'string') {
+          res.setHeader(lower, v)
+        }
+      }
+      setPublicSiteSecurityHeaders(res)
+      res.setHeader('Cache-Control', isProtected ? 'private, no-store' : 'no-store')
+      if (isProtected) res.setHeader('Vary', 'Cookie')
+      if (!res.hasHeader('content-type')) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+      }
+      res.statusCode = out.status
+      res.setHeader('Content-Length', String(out.body.length))
+      res.end(method === 'HEAD' ? undefined : out.body)
+      return
     }
 
     if (method !== 'GET' && method !== 'HEAD') {
@@ -847,6 +1509,10 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       return
     }
     const cleanRel = decodedPath.replace(/^\/+/, '').replace(/\/+$/, '')
+    if (cleanRel === '__oc_server' || cleanRel.startsWith('__oc_server/')) {
+      sendSiteHtml(res, 404, renderStatusHtml('页面不存在', '未找到请求的资源。'), isProtected)
+      return
+    }
     const segs = cleanRel ? cleanRel.split('/') : []
     if (segs.some((s) => !s || s === '.' || s === '..')) {
       sendSiteHtml(res, 400, renderStatusHtml('请求路径无效', '不允许包含相对跳转路径。'), isProtected)
@@ -855,6 +1521,13 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
 
     const hit = resolveCandidateFile(currentReal, cleanRel)
     if (hit) {
+      const ext = extname(hit).toLowerCase()
+      analytics.recordHit({
+        slug,
+        clientIp: visitorIp,
+        userAgent,
+        isPageView: method === 'GET' && (ext === '.html' || ext === '.htm'),
+      })
       serveStaticFile(req, res, hit, cleanRel, 200, meta.visibility)
       return
     }
@@ -864,11 +1537,18 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     if (meta.spaMode && looksLikeRoute) {
       const spaIndex = resolveCandidateFile(currentReal, '')
       if (spaIndex) {
+        analytics.recordHit({
+          slug,
+          clientIp: visitorIp,
+          userAgent,
+          isPageView: method === 'GET',
+        })
         serveStaticFile(req, res, spaIndex, 'index.html', 200, meta.visibility)
         return
       }
     }
 
+    analytics.recordHit({ slug, clientIp: visitorIp, userAgent, isPageView: false })
     const custom404 = resolveCandidateFile(currentReal, '404.html')
     if (custom404) {
       serveStaticFile(req, res, custom404, '404.html', 404, meta.visibility)
@@ -887,8 +1567,13 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       const url = new URL(req.url ?? '/', 'http://localhost')
       const pathname = url.pathname
 
-      if (pathname === `${SITE_EDGE_PREFIX}/healthz` || pathname.startsWith(`${SITE_EDGE_PREFIX}/`)) {
-        await handleControlApi(req, res, pathname)
+      if (
+        pathname === `${SITE_EDGE_PREFIX}/healthz` ||
+        pathname.startsWith(`${SITE_EDGE_PREFIX}/`) ||
+        pathname === `${SITE_EDGE_V2_PREFIX}/healthz` ||
+        pathname.startsWith(`${SITE_EDGE_V2_PREFIX}/`)
+      ) {
+        await handleControlApi(req, res, url)
         return
       }
 
@@ -899,7 +1584,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           return
         }
         const domain = url.searchParams.get('domain') ?? ''
-        const slug = extractSubdomainSlug(domain, baseDomain)
+        const slug = resolveSlugByHost(domain)
         if (!slug || !isSiteServable(slug)) {
           res.statusCode = 404
           res.end('denied')
@@ -912,7 +1597,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
 
       await handlePublicSite(req, res, url)
     })().catch((err) => {
-      if (res.headersSent) {
+      if (res.headersSent || res.writableEnded) {
         res.destroy()
         return
       }
@@ -946,6 +1631,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     },
     async close() {
       clearInterval(sweepTimer)
+      analytics.close()
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()))
       })

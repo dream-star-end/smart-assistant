@@ -2235,10 +2235,18 @@ export type OrgPayResult = {
 
 export type UserSiteVisibility = "public" | "password" | "disabled";
 
+export type UserSiteCustomDomainStatus = "none" | "pending" | "verified";
+
 export type UserSiteItem = {
   id: string;
   slug: string;
   url: string;
+  customDomain: string | null;
+  customDomainStatus?: UserSiteCustomDomainStatus;
+  customDomainTxtName?: string | null;
+  customDomainTxtValue?: string | null;
+  originSessionId: string | null;
+  hasServerApi: boolean;
   title: string;
   visibility: UserSiteVisibility;
   spaMode: boolean;

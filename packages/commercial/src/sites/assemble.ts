@@ -11,6 +11,7 @@ export function createSitesFromConfig(cfg: CommercialConfig, pool: Pool): SitesS
     baseDomain: cfg.OC_SITES_BASE_DOMAIN,
     maxPerUser: cfg.OC_SITES_MAX_PER_USER,
     maxSiteBytes: cfg.OC_SITES_MAX_SITE_BYTES,
+    edgeSecret: cfg.OC_SITES_EDGE_SECRET ?? undefined,
     repo: enabled ? createPgSitesRepo(pool) : undefined,
     edge:
       enabled && cfg.OC_SITES_EDGE_PUSH_URL && cfg.OC_SITES_EDGE_SECRET

@@ -9,6 +9,7 @@ import {
   parseBoardView,
   parsePanelParam,
   parseProjectPath,
+  parseSitesPath,
   parseTutorialCase,
   parseTutorialCommunity,
   parseTutorialStep,
@@ -19,6 +20,7 @@ import {
   projectPath,
   readLocationRoute,
   replaceSearchParams,
+  sitesPath,
   tutorialHref,
   type UseAppRouteOptions,
   useAppRoute,
@@ -557,5 +559,72 @@ describe('replaceSearchParams', () => {
       '/s/abcdefgh#frag',
     )
     window.history.replaceState({}, '', '/')
+  })
+})
+
+describe('站点工作区 URL /sites[/<slug>]（OCV5-797）', () => {
+  afterEach(() => {
+    cleanup()
+    window.history.replaceState({}, '', '/')
+  })
+
+  it('parseSitesPath 只接受 /sites 与合法 slug 的 /sites/<slug>', () => {
+    expect(parseSitesPath('/sites')).toEqual({ slug: null })
+    expect(parseSitesPath('/sites/hello-1')).toEqual({ slug: 'hello-1' })
+    expect(sitesPath(null)).toBe('/sites')
+    expect(sitesPath('hello-1')).toBe('/sites/hello-1')
+    expect(parseSitesPath('/sites/')).toBeNull()
+    expect(parseSitesPath('/sites/hello/settings')).toBeNull()
+    expect(parseSitesPath('/sites/AB')).toBeNull()
+    expect(workspaceWantPath('sites', 's1', false, null, null)).toBe('/sites')
+    expect(workspaceWantPath('sites', 's1', false, null, 'hello-1')).toBe('/sites/hello-1')
+  })
+
+  it('在 sites 工作区内点开站点 pushState；popstate 回 /sites 与 /sites/<slug> 正确反灌', () => {
+    window.history.replaceState({}, '', '/')
+    const push = vi.spyOn(window.history, 'pushState')
+    const onPopWorkspace = vi.fn()
+    const onOpenSites = vi.fn()
+    const makeOpts = (workspace: 'chat' | 'sites', siteSlug: string | null): UseAppRouteOptions => ({
+      enabled: true,
+      inWorkspace: true,
+      activeId: undefined,
+      sessions: [],
+      serverListSettled: true,
+      pendingSessionId: null,
+      clearPendingSession: () => {},
+      selectSession: () => {},
+      onPopToRoot: () => {},
+      activePanel: null,
+      workspace,
+      siteSlug,
+      onPopWorkspace,
+      onOpenSites,
+    })
+
+    const { rerender } = renderHook((o: UseAppRouteOptions) => useAppRoute(o), {
+      initialProps: makeOpts('chat', null),
+    })
+    rerender(makeOpts('sites', null))
+    expect(window.location.pathname).toBe('/sites')
+    expect(push).toHaveBeenCalledTimes(1)
+
+    rerender(makeOpts('sites', 'demo-app'))
+    expect(window.location.pathname).toBe('/sites/demo-app')
+    expect(push).toHaveBeenCalledTimes(2)
+
+    act(() => {
+      window.history.pushState({}, '', '/sites')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(onPopWorkspace).toHaveBeenLastCalledWith('sites')
+    expect(onOpenSites).toHaveBeenLastCalledWith(null)
+
+    act(() => {
+      window.history.pushState({}, '', '/sites/demo-app')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(onOpenSites).toHaveBeenLastCalledWith('demo-app')
+    push.mockRestore()
   })
 })

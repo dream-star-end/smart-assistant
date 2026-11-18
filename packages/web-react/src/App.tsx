@@ -1,4 +1,4 @@
-import { useAppWorkspaceState } from "./hooks/useAppWorkspaceState";
+import { resolveSiteEditTarget, useAppWorkspaceState } from "./hooks/useAppWorkspaceState";
 import { catalogOwnerIsCurrent } from './hooks/useIdentityModelCatalog'
 import type { ResolvedIdentity } from './lib/resolvedIdentity'
 import {useModelSwitchCost} from './hooks/useModelSwitchCost';
@@ -243,7 +243,7 @@ import { AppDialogs } from "./components/AppDialogs";
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 import {
   IdentityRecoveryNotice, AccountSwitchNotice, AuthGate, Landing, DesktopEnrollPage,
-  TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, InspectorPanel,
+  TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, SitesWorkspaceView, InspectorPanel,
   InspectorPanelContent, ImageAnnotationEditor, ProjectHome, QuickAskWindow,
   prefetchLazyCentersOnIdle, SplashFallback, useMountedOnce,
 } from "./appLazyViews";
@@ -259,8 +259,9 @@ const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
 export function App() {
   const {
     urlRoute, params, demo, resetToken, desktopEnroll, studio, routingEnabled,
-    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, setBoardOpenState, projectHome,
-    setProjectHome, pendingRouteProject, setPendingRouteProject, boardView, setBoardView,
+    pendingRouteSession, setPendingRouteSession, boardOpen, setBoardOpen, setBoardOpenState,
+    sitesOpen, setSitesOpenState, activeSiteSlug, setActiveSiteSlug, openSites,
+    projectHome, setProjectHome, pendingRouteProject, setPendingRouteProject, boardView, setBoardView,
     boardTicketId, setBoardTicketId, boardTicketType, setBoardTicketType, view,
     setView, authMode, setAuthMode,
   } = useAppWorkspaceState();
@@ -833,7 +834,7 @@ export function App() {
   // Ctrl/⌘K recents: whatever the user actually lands on (project home or a chat).
   const paletteUserId = user?.id ?? (demo ? "demo" : null);
   const homeProjectId = homeProject?.id ?? null;
-  const chatViewActiveId = !boardOpen && !projectHome ? activeId : undefined;
+  const chatViewActiveId = !boardOpen && !sitesOpen && !projectHome ? activeId : undefined;
   useEffect(() => {
     if (homeProjectId) pushPaletteRecent(paletteUserId, { kind: "project", id: homeProjectId });
   }, [paletteUserId, homeProjectId]);
@@ -876,12 +877,12 @@ export function App() {
 
   // 切会话/进出任务看板时清掉面板里的定位:消息对象引用属于旧会话上下文,跨会话保留只会
   // 展示与当前消息流无关的陈旧内容。宽屏面板的开合是用户偏好,保留;窄屏抽屉收起。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId / boardOpen / projectHome 是「换了上下文」的触发信号
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId / boardOpen / sitesOpen / projectHome 是「换了上下文」的触发信号
   useEffect(() => {
     setPaneRequest(null);
     setPaneActive(null);
     setPaneSheetOpen(false);
-  }, [activeId, boardOpen, projectHome]);
+  }, [activeId, boardOpen, sitesOpen, projectHome]);
 
   const authorizeSwitch=useModelSwitchCost({authRef,confirmDialog,toast});
   const switchOptionsRef=useRef<Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>>({});
@@ -938,7 +939,7 @@ export function App() {
     effortLevel: effortForModel(models, effectiveEffortModelId(modelId, false),
       sessionEffort !== undefined ? sessionEffort : preferenceEffort),
     enabled: !demo && laneReady && view === "app" && serverListSettled && !activeId &&
-      !draftProjectId && !projectHome && !boardOpen && collabMode === "solo" && serviceTier !== "fast" &&
+      !draftProjectId && !projectHome && !boardOpen && !sitesOpen && collabMode === "solo" && serviceTier !== "fast" &&
       !!modelId && isCodexEngineModel(modelId) && models.some(m => m.id === modelId),
   });
 
@@ -959,7 +960,7 @@ export function App() {
     applyCollabDoc,
     auth,
     authRef,
-    boardOpen,
+    boardOpen: boardOpen || sitesOpen,
     collabAsDefault,
     collabEpochRef,
     collabUi,
@@ -1181,7 +1182,7 @@ export function App() {
   activeIdRef.current = activeId ?? null;
   // 详情面板可用 = 对话视图(非任务看板 / 项目主页)里有会话内容;demo 只在点了某张工具卡时出现。
   const paneAvailable =
-    !boardOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
+    !boardOpen && !sitesOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
   const paneRequestHere = paneRequestForSession(paneRequest, activeId);
   const paneInline = paneAvailable && isWideViewport && paneOpen;
   const paneShown = paneInline || (paneAvailable && !isWideViewport && paneSheetOpen);
@@ -1746,7 +1747,7 @@ export function App() {
         setTutorialStep(null);
       }
     },
-    workspace: TASKBOARD_ENABLED && boardOpen ? "board" : projectHome ? "project" : "chat",
+    workspace: TASKBOARD_ENABLED && boardOpen ? "board" : sitesOpen ? "sites" : projectHome ? "project" : "chat",
     boardView,
     boardTicket: boardTicketId,
     boardTicketType,
@@ -1757,10 +1758,18 @@ export function App() {
     projectListSettled: projectsLoaded,
     onOpenProject: (route) => {
       setBoardOpenState(false);
+      setSitesOpenState(false);
+      setActiveSiteSlug(null);
       setProjectHome(route);
     },
+    siteSlug: activeSiteSlug,
+    onOpenSites: (slug) => openSites(slug),
     onPopWorkspace: (ws) => {
       setBoardOpenState(TASKBOARD_ENABLED && ws === "board");
+      if (ws !== "sites") {
+        setSitesOpenState(false);
+        setActiveSiteSlug(null);
+      }
       if (ws !== "project") setProjectHome(null);
     },
     onPopBoardParams: (nextView, ticket, ticketType) => {
@@ -1988,18 +1997,50 @@ export function App() {
 
   // 侧栏公共 props：桌面内联与移动抽屉两处复用。余额（balanceCents）本期不展示（P3.5 计费中心）。
   // rename/delete 的数据收口（三持有方）在 useSessionList。
+  const closeMobileThen = (fn?: () => void) =>
+    fn
+      ? () => {
+          setMobileNavOpen(false);
+          fn();
+        }
+      : undefined;
   const sidebarProps = {
     sessions,
-    // 项目主页时侧栏高亮项目行，而不是背后仍选中的会话。
-    activeId: homeProject ? undefined : activeId,
+    // 项目主页 / 站点工作区时侧栏不高亮会话行。
+    activeId: homeProject || sitesOpen ? undefined : activeId,
     activeProjectId: homeProject ? homeProject.id : null,
-    onOpenProject: openProject,
+    onOpenProject: (projectId: string) => {
+      openProject(projectId);
+      setMobileNavOpen(false);
+    },
+    onSelect: (id: string) => {
+      setDraftProject(null);
+      setBoardOpen(false);
+      selectSession(id);
+      setMobileNavOpen(false);
+    },
     user,
     credits: user?.credits ?? null,
-    onOpenAccount: demo ? undefined : () => openSettings(),
-    onOpenFeedback: demo ? undefined : () => openSettings("feedback"),
-    onNew: handleNew,
-    onNewWithAgent: demo ? undefined : () => { handleNew(); setPickerOpen(true); },
+    onOpenAccount: demo ? undefined : closeMobileThen(() => openSettings()),
+    onOpenFeedback: demo ? undefined : closeMobileThen(() => openSettings("feedback")),
+    onNew: () => {
+      setBoardOpen(false);
+      handleNew();
+      setMobileNavOpen(false);
+    },
+    onNewWithAgent: demo
+      ? undefined
+      : () => {
+          setBoardOpen(false);
+          handleNew();
+          setPickerOpen(true);
+          setMobileNavOpen(false);
+        },
+    onNewInProject: (projectId: string) => {
+      setBoardOpen(false);
+      newSessionInProject(projectId);
+      setMobileNavOpen(false);
+    },
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onTogglePin: togglePinSession,
@@ -2018,36 +2059,33 @@ export function App() {
     liveTerminal,
     sessionNeedsYou,
     socketVersion: chat.version,
-    onLogout: demo ? undefined : logout,
-    onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
-    onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
-    onOpenTutorial: demo ? undefined : () => openTutorial(),
-    // 经验分享入口跟随 feature_community_blog（商业版默认关；配置未到时也不显示）。
+    onLogout: demo ? undefined : closeMobileThen(logout),
+    onOpenManage: demo ? undefined : closeMobileThen(() => openManage(DEFAULT_MANAGE_TAB)),
+    onOpenMarketplace: demo ? undefined : closeMobileThen(() => openMarketplace("browse")),
+    onOpenTutorial: demo ? undefined : closeMobileThen(() => openTutorial()),
     onOpenBlog:
       demo || !communityBlogEnabled
       ? undefined
-      : () => {
+      : closeMobileThen(() => {
           openTutorial();
           setTutorialTab("blog");
-        },
+        }),
     onOpenMediaTasks:
-      demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
-    onOpenStudio: !demo && studioAvailable ? () => window.location.assign("/studio") : undefined,
-    onOpenChatGptProxy: !demo && chatGptProxyEnabled ? () => setChatGptProxyOpen(true) : undefined,
-    // 「API 接入」:admin-only rollout(与后端 requireAdmin / strategy Layer 2 同门)。
-    onOpenApiAccess: !demo && user?.role === "admin" ? () => openSettings("api-access") : undefined,
+      demo || mediaTasksAvailable === false ? undefined : closeMobileThen(() => setMediaTasksOpen(true)),
+    onOpenStudio: !demo && studioAvailable ? closeMobileThen(() => window.location.assign("/studio")) : undefined,
+    onOpenChatGptProxy: !demo && chatGptProxyEnabled ? closeMobileThen(() => setChatGptProxyOpen(true)) : undefined,
+    onOpenApiAccess: !demo && user?.role === "admin" ? closeMobileThen(() => openSettings("api-access")) : undefined,
     theme,
     onCycleTheme: cycle,
-    // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台
-    // (web-react 第二 Vite 入口 /admin.html)。非 admin / demo 一律不渲染。
     showAdmin: !demo && user?.role === "admin",
-    // 组织入口:仅 org owner/admin 可见(成员无管理面,只在设置·账户页只读展示归属)。
     onOpenOrg:
       demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
         ? undefined
-        : () => openOrg(),
-    onOpenBoard: demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true),
+        : closeMobileThen(() => openOrg()),
+    onOpenBoard: demo || !TASKBOARD_ENABLED ? undefined : closeMobileThen(() => setBoardOpen(true)),
     boardActive: TASKBOARD_ENABLED && boardOpen,
+    onOpenSites: demo ? undefined : closeMobileThen(() => openSites(null)),
+    sitesActive: sitesOpen,
     unreadIds: unreadSessions.unreadIds,
     onMarkRead: unreadSessions.markRead,
     onOpenProjectSettings: (p: ChatProject) => {
@@ -2068,22 +2106,13 @@ export function App() {
     onLoadMore: loadMoreSessions,
     hasMore: hasMoreSessions,
     loadingMore: loadingMoreSessions,
-    // sidebar-B S-08：加载更早会话失败时侧栏底部给「点击重试」。
     loadMoreError,
-    // sidebar-B S-05：拖宽把手可 Tab 聚焦并用键盘调宽。
     onResizeKeyDown: sidebarWidth.onResizeKeyDown,
     onLoadArchived: loadArchivedSessions,
     loadingArchived,
     onSearchMessages: searchSessionMessages,
-    onOpenPalette: () => setPaletteOpen(true),
+    onOpenPalette: closeMobileThen(() => setPaletteOpen(true)),
   };
-  const closeMobileThen = (fn?: () => void) =>
-    fn
-      ? () => {
-          setMobileNavOpen(false);
-          fn();
-        }
-      : undefined;
   return (
     <MediaSignProvider
       sign={demo ? null : signMedia}
@@ -2108,28 +2137,6 @@ export function App() {
         <div className="hidden md:contents">
           <Sidebar
             {...sidebarProps}
-            onSelect={(id) => {
-              setDraftProject(null);
-              setBoardOpen(false);
-              selectSession(id);
-            }}
-            onNew={() => {
-              setBoardOpen(false);
-              handleNew();
-            }}
-            onNewWithAgent={
-              demo
-                ? undefined
-                : () => {
-                    setBoardOpen(false);
-                    handleNew();
-                    setPickerOpen(true);
-                  }
-            }
-            onNewInProject={(projectId) => {
-              setBoardOpen(false);
-              newSessionInProject(projectId);
-            }}
             onCollapse={() => setCollapsed(true)}
           />
         </div>
@@ -2146,60 +2153,8 @@ export function App() {
       >
         <Sidebar
           {...sidebarProps}
-          onSelect={(id) => {
-            setDraftProject(null);
-            setBoardOpen(false);
-            selectSession(id);
-            setMobileNavOpen(false);
-          }}
-          onNew={() => {
-            setBoardOpen(false);
-            handleNew();
-            setMobileNavOpen(false);
-          }}
-          onNewWithAgent={
-            demo
-              ? undefined
-              : () => {
-                  setBoardOpen(false);
-                  handleNew();
-                  setPickerOpen(true);
-                  setMobileNavOpen(false);
-                }
-          }
-          onNewInProject={(projectId) => {
-            setBoardOpen(false);
-            newSessionInProject(projectId);
-            setMobileNavOpen(false);
-          }}
-          onOpenProject={(projectId) => {
-            openProject(projectId);
-            setMobileNavOpen(false);
-          }}
           onCollapse={() => setMobileNavOpen(false)}
-          // sidebar-B S-06：抽屉里同一按钮语义是「关闭导航」，读屏名与桌面「折叠侧栏」区分。
           collapseLabel="关闭导航"
-          onOpenBoard={
-            demo || !TASKBOARD_ENABLED
-              ? undefined
-              : () => {
-                  setBoardOpen(true);
-                  setMobileNavOpen(false);
-                }
-          }
-          onOpenAccount={closeMobileThen(sidebarProps.onOpenAccount)}
-          onOpenFeedback={closeMobileThen(sidebarProps.onOpenFeedback)}
-          onOpenManage={closeMobileThen(sidebarProps.onOpenManage)}
-          onOpenMarketplace={closeMobileThen(sidebarProps.onOpenMarketplace)}
-          onOpenTutorial={closeMobileThen(sidebarProps.onOpenTutorial)}
-          onOpenBlog={closeMobileThen(sidebarProps.onOpenBlog)}
-          onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
-          onOpenPalette={closeMobileThen(sidebarProps.onOpenPalette)}
-          onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
-          onOpenStudio={closeMobileThen(sidebarProps.onOpenStudio)}
-          onOpenChatGptProxy={closeMobileThen(sidebarProps.onOpenChatGptProxy)}
-          onOpenApiAccess={closeMobileThen(sidebarProps.onOpenApiAccess)}
-          onLogout={closeMobileThen(sidebarProps.onLogout)}
           width={undefined}
           onResizeStart={undefined}
           resizing={false}
@@ -2233,6 +2188,29 @@ export function App() {
                 setUngroupedAssetsOpen(false);
                 setProjectSettings(p);
               }}
+            />
+          </LazyBoundary>
+        ) : sitesOpen && !demo && auth ? (
+          <LazyBoundary fallback={<SplashFallback />}>
+            <SitesWorkspaceView
+              auth={auth}
+              activeSlug={activeSiteSlug}
+              onSelectSlug={(slug) => setActiveSiteSlug(slug)}
+              onCreateInChat={(prompt) => {
+                setBoardOpen(false);
+                handleNew();
+                setComposerPrefill({ text: prompt, nonce: Date.now() });
+              }}
+              onEditSite={(site) => {
+                const { sessionId, prompt } = resolveSiteEditTarget(site, sessions);
+                setBoardOpen(false);
+                if (sessionId) selectSession(sessionId);
+                else handleNew();
+                setComposerPrefill({ text: prompt, nonce: Date.now() });
+              }}
+              onOpenMobileNav={() => setMobileNavOpen(true)}
+              sidebarCollapsed={collapsed}
+              onExpandSidebar={() => setCollapsed(false)}
             />
           </LazyBoundary>
         ) : homeProject && projectHome ? (
@@ -2821,6 +2799,7 @@ export function App() {
         openManage={openManage}
         openMarketplace={openMarketplace}
         openRepo={openRepo}
+        openSites={demo ? undefined : () => openSites(null)}
         openTutorial={openTutorial}
         orgOpen={orgOpen}
         orgSection={orgSection}
@@ -2889,6 +2868,7 @@ export function App() {
         settingsOpen={settingsOpen}
         settingsSection={settingsSection}
         shareOpen={shareOpen}
+        sitesOpen={sitesOpen}
         subscribeOpenSignal={subscribeOpenSignal}
         teamMode={teamMode}
         theme={theme}

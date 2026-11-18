@@ -152,6 +152,7 @@ export type AppDialogsProps = {
   openManage: (tab: ManageTab) => void;
   openMarketplace: (tab: MarketplaceTab, kind?: MarketplaceKind) => void;
   openRepo: () => void;
+  openSites?: () => void;
   openTutorial: (id?: "preferences" | "connectors" | "chat-basics" | "inbox" | "taskboard" | "session-goal" | "sessions-history" | "models-reasoning" | "files-media" | "voice-input" | "web-research" | "artifacts-download" | "container-web-preview" | "image-create-edit" | "github-repository" | "agents" | "team-mode" | "advisor-mode" | "memory-auto-dream" | "schedules-reminders" | "skills-training" | "marketplace-discovery" | "marketplace-publishing" | "billing-usage" | "organization" | "feedback-support" | undefined) => void;
   orgOpen: boolean;
   orgSection: OrgSection;
@@ -220,6 +221,7 @@ export type AppDialogsProps = {
   settingsOpen: boolean;
   settingsSection: SettingsDestinationSection;
   shareOpen: boolean;
+  sitesOpen?: boolean;
   subscribeOpenSignal: number;
   teamMode: boolean;
   theme: Theme;
@@ -278,6 +280,7 @@ export function AppDialogs({
   openManage,
   openMarketplace,
   openRepo,
+  openSites,
   openTutorial,
   orgOpen,
   orgSection,
@@ -346,6 +349,7 @@ export function AppDialogs({
   settingsOpen,
   settingsSection,
   shareOpen,
+  sitesOpen = false,
   subscribeOpenSignal,
   preferencesRevision,
   inboxRevision,
@@ -496,7 +500,7 @@ export function AppDialogs({
             sessions={sessions}
             currentProjectId={
               homeProject?.id ??
-              (boardOpen
+              (boardOpen || sitesOpen
                 ? null
                 : ((chatViewActiveId ? sessions.find((x) => x.id === chatViewActiveId)?.projectId : null) ??
                   draftProjectId))
@@ -508,7 +512,7 @@ export function AppDialogs({
             onOpenProject={(projectId, tab) => {
               if (!projects.some((x) => x.id === projectId)) return;
               setPendingRouteProject(null);
-              setBoardOpenState(false);
+              setBoardOpen(false);
               setProjectHome({ projectId, tab: tab ?? "overview" });
             }}
             onOpenSession={(id) => {
@@ -531,6 +535,7 @@ export function AppDialogs({
             onCreateProject={(name) => setCreateProjectFrom(name ? { title: name } : {})}
             onMoveSession={(sess, projectId) => void moveSessionToProject(sess, projectId)}
             onOpenBoard={demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true)}
+            onOpenSites={demo || !openSites ? undefined : () => openSites()}
           />
         </LazyBoundary>
       )}

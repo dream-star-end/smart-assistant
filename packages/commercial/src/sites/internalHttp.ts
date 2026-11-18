@@ -59,6 +59,20 @@ function parseMetaHeader(headerVal: string | string[] | undefined): Record<strin
   }
 }
 
+async function readJsonObject(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const buf = await readBoundedBuffer(req, JSON_MAX_BYTES)
+  let raw: unknown
+  try {
+    raw = JSON.parse(buf.toString('utf8'))
+  } catch {
+    throw new SitesError('INVALID_INPUT', '请求体必须是合法 JSON', 400)
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new SitesError('INVALID_INPUT', '请求体必须是 JSON 对象', 400)
+  }
+  return raw as Record<string, unknown>
+}
+
 export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternalHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: 'sitesInternal' })
   const prefixNoSlash = SITES_AGENT_INTERNAL_PREFIX.replace(/\/$/, '')
@@ -120,6 +134,10 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
             : url.searchParams.has('spa')
               ? url.searchParams.get('spa') !== '0'
               : undefined
+        const originSessionId =
+          typeof meta.originSessionId === 'string' && meta.originSessionId.trim()
+            ? meta.originSessionId.trim().slice(0, 200)
+            : null
 
         const site = await deps.sites.publishSite(userId, {
           slug,
@@ -127,6 +145,7 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
           visibility: visibilityRaw as SiteVisibility | undefined,
           password,
           spaMode,
+          originSessionId,
           gzippedBundle: body,
         })
         sendJson(res, 200, { site })
@@ -135,19 +154,16 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
 
       if (method === 'PATCH' && sub === '/item') {
         const slug = url.searchParams.get('slug') ?? ''
-        const buf = await readBoundedBuffer(req, JSON_MAX_BYTES)
-        let raw: unknown
-        try {
-          raw = JSON.parse(buf.toString('utf8'))
-        } catch {
-          throw new SitesError('INVALID_INPUT', '请求体必须是合法 JSON', 400)
-        }
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-          throw new SitesError('INVALID_INPUT', '请求体必须是 JSON 对象', 400)
-        }
-        const patch = raw as Record<string, unknown>
+        const patch = await readJsonObject(req)
         if (patch.spaMode !== undefined && typeof patch.spaMode !== 'boolean') {
           throw new SitesError('INVALID_INPUT', 'spaMode 必须是布尔值', 400)
+        }
+        if (
+          patch.customDomain !== undefined &&
+          patch.customDomain !== null &&
+          typeof patch.customDomain !== 'string'
+        ) {
+          throw new SitesError('INVALID_INPUT', 'customDomain 必须是字符串或 null', 400)
         }
         const site = await deps.sites.updateSite(userId, slug, {
           ...(patch.title !== undefined ? { title: String(patch.title) } : {}),
@@ -156,8 +172,96 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
             : {}),
           ...(patch.password !== undefined ? { password: String(patch.password) } : {}),
           ...(patch.spaMode !== undefined ? { spaMode: patch.spaMode as boolean } : {}),
+          ...(patch.customDomain !== undefined
+            ? { customDomain: patch.customDomain as string | null }
+            : {}),
         })
         sendJson(res, 200, { site })
+        return
+      }
+
+      if (method === 'POST' && sub === '/rename') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const body = await readJsonObject(req)
+        const site = await deps.sites.renameSite(
+          userId,
+          slug,
+          typeof body.newSlug === 'string' ? body.newSlug : '',
+        )
+        sendJson(res, 200, { site })
+        return
+      }
+
+      if (method === 'POST' && sub === '/verify-domain') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const site = await deps.sites.verifyCustomDomain(userId, slug)
+        sendJson(res, 200, { site })
+        return
+      }
+
+      if (method === 'GET' && sub === '/env/list') {
+        const slug = url.searchParams.get('slug') ?? ''
+        sendJson(res, 200, { envVars: await deps.sites.listEnvVars(userId, slug) })
+        return
+      }
+
+      if (method === 'PUT' && sub === '/env/set') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const body = await readJsonObject(req)
+        if (typeof body.key !== 'string' || typeof body.value !== 'string') {
+          throw new SitesError('INVALID_INPUT', 'key 和 value 必须是字符串', 400)
+        }
+        const result = await deps.sites.setEnvVar(userId, slug, {
+          key: body.key,
+          value: body.value,
+          isSecret: body.isSecret === true,
+        })
+        sendJson(res, 200, result)
+        return
+      }
+
+      if (method === 'DELETE' && sub === '/env/unset') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const key = url.searchParams.get('key') ?? ''
+        const envVars = await deps.sites.deleteEnvVar(userId, slug, key)
+        sendJson(res, 200, { ok: true, envVars })
+        return
+      }
+
+      if (method === 'GET' && sub === '/analytics') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const days = Number.parseInt(url.searchParams.get('days') ?? '30', 10)
+        sendJson(res, 200, {
+          analytics: await deps.sites.getAnalytics(userId, slug, Number.isFinite(days) ? days : 30),
+        })
+        return
+      }
+
+      if (method === 'GET' && sub === '/db/inspect') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const table = url.searchParams.get('table') ?? undefined
+        const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10)
+        sendJson(res, 200, {
+          db: await deps.sites.inspectDb(userId, slug, {
+            table,
+            limit: Number.isFinite(limit) ? limit : 100,
+          }),
+        })
+        return
+      }
+
+      if (method === 'POST' && sub === '/db/sql') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const body = await readJsonObject(req)
+        if (typeof body.sql !== 'string') {
+          throw new SitesError('INVALID_INPUT', 'sql 必须是字符串', 400)
+        }
+        const params = Array.isArray(body.params) ? body.params : []
+        const result = await deps.sites.executeDbSql(userId, slug, {
+          sql: body.sql,
+          params,
+        })
+        sendJson(res, 200, { result })
         return
       }
 

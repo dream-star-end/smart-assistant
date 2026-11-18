@@ -70,7 +70,7 @@ test('中心壳走 Modal 原语：与设置同高 + 桌面放宽容纳导航栏 
   expect(dialog).not.toHaveClass('oc-quiet')
 })
 
-test('首位 Tab 即默认落地页，且顺序/文案为已定案的五个分区（文献/优化已下线）', () => {
+test('首位 Tab 即默认落地页，且顺序/文案为已定案的四个分区（文献/优化已下线）', () => {
   // 契约：DEFAULT_MANAGE_TAB 由注册表首位派生。改造前 TABS[0]='optimization' 而 App
   // 默认 'memory'，首屏永远是"选中的不是第一个"。
   expect(DEFAULT_MANAGE_TAB).toBe(MANAGE_TABS[0].id)
@@ -79,24 +79,23 @@ test('首位 Tab 即默认落地页，且顺序/文案为已定案的五个分�
     'skills',
     'cron',
     'connectors',
-    'sites',
   ])
   renderShell()
   const tabs = screen.getAllByRole('tab')
   // 名字只是分区名；一句话说明是当前面板的 aria-describedby，不拼进名字（OCV5-344）。
-  expect(MANAGE_TABS.map((t) => t.label)).toEqual(['记忆', '技能', '定时', '插件', '站点'])
+  expect(MANAGE_TABS.map((t) => t.label)).toEqual(['记忆', '技能', '定时', '插件'])
   for (const [i, def] of MANAGE_TABS.entries()) expect(tabs[i]).toHaveAccessibleName(def.label)
   expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
   expect(screen.getByRole('tabpanel')).toHaveAccessibleDescription(MANAGE_TABS[0].blurb)
 })
 
-test('主导航与设置中心同款：窄屏五列宫格药丸页签，桌面 168px 纯文字竖导航', () => {
+test('主导航与设置中心同款：窄屏四列宫格药丸页签，桌面 168px 纯文字竖导航', () => {
   stubMd(false)
   const { rerender } = renderShell()
   const mobile = screen.getByRole('tablist', { name: '管理分区' })
   expect(mobile).not.toHaveAttribute('aria-orientation', 'vertical')
-  expect(mobile).toHaveClass('grid', 'grid-cols-5')
-  expect(screen.getAllByRole('tab')).toHaveLength(5)
+  expect(mobile).toHaveClass('grid', 'grid-cols-4')
+  expect(screen.getAllByRole('tab')).toHaveLength(4)
   for (const tab of screen.getAllByRole('tab')) expect(tab).toHaveClass('rounded-full')
 
   stubMd(true)
@@ -123,7 +122,7 @@ test('方向键 / Home / End 在分区间移动并切换（roving tabindex）', 
   fireEvent.keyDown(skills, { key: 'ArrowUp' })
   expect(onTabChange).toHaveBeenLastCalledWith('memory')
   fireEvent.keyDown(skills, { key: 'End' })
-  expect(onTabChange).toHaveBeenLastCalledWith('sites')
+  expect(onTabChange).toHaveBeenLastCalledWith('connectors')
   fireEvent.keyDown(skills, { key: 'Home' })
   expect(onTabChange).toHaveBeenLastCalledWith('memory')
 })
