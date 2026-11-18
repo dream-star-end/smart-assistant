@@ -24,6 +24,7 @@ import { resolveRequestTrace } from './requestTrace.js'
 import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { handleCodexCommissioning } from './admin/codexCommissioning.js'
+import { handleAdminRemoteDriverV4 } from './admin/remoteDriverV4.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
 import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
@@ -1280,6 +1281,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     // OCV5-721 远端底座服务池(节点、Profile 自动探测、勾选模型上架、Binding 撤销 + 预热)。
     { method: 'GET', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
+    { method: 'GET', pathPrefix: '/api/admin/remote-pool/driver-v4', handler: handleAdminRemoteDriverV4 },
+    { method: 'POST', pathPrefix: '/api/admin/remote-pool/driver-v4', handler: handleAdminRemoteDriverV4 },
     { method: 'GET', path: '/api/admin/remote-pool', handler: handleAdminRemotePoolGet },
     { method: 'POST', path: '/api/admin/remote-pool/nodes', handler: handleAdminRemotePoolNodeCreate },
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/nodes/', handler: handleAdminRemotePoolNodeAction },

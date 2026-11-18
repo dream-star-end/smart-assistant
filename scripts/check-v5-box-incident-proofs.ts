@@ -1151,28 +1151,28 @@ async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigi
  * dispatched, ends normally with no summary. */
 function gatewaySession(api: Api, sessionKey: string, counters: { submits: number; shutdowns: number },
   shutdown: () => Promise<void> = async () => {}) {
+  const runner = Object.assign(new EventEmitter(), { model: api.boxNative.model, engineId: "ccb", capabilities: {}, isRunning: false,
+    submitTurn: () => { counters.submits++; runner.isRunning = true; return { submitted: Promise.resolve(), end: () => {}, summary: Promise.resolve({}) }; },
+    shutdown: async () => { counters.shutdowns++; await shutdown(); runner.isRunning = false; } });
   return { sessionKey, agentId: "main", channel: "webchat", peerId: sessionKey, title: "proof", startedAt: Date.now(),
     model: api.boxNative.model, _boxContextOwner: api.boxNative.owner, lock: Promise.resolve(), lastUsedAt: 0,
     totalCostUSD: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
-    turns: 0, _lastCcbCumulativeCost: 0, toolUseIdToName: new Map(), executionTarget: { kind: "local" }, providerTag: "ccb",
-    runner: Object.assign(new EventEmitter(), { model: api.boxNative.model, engineId: "ccb", capabilities: {},
-      submitTurn: () => { counters.submits++; return { submitted: Promise.resolve(), end: () => {}, summary: Promise.resolve({}) }; },
-      shutdown: () => { counters.shutdowns++; return shutdown(); } }) };
+    turns: 0, _lastCcbCumulativeCost: 0, toolUseIdToName: new Map(), executionTarget: { kind: "local" }, providerTag: "ccb", runner };
 }
 const PAST_IDLE_GATE = "PROOF_PAST_IDLE_GATE";
-/** A message arrives for the session: the product's SessionManager.submit().
- * submit() drives the session's durable idle work and refuses the message
- * with IDLE_HISTORY_PENDING ("消息未开始处理") while its history is pending.
- * The first thing it does with an admitted message is read the turn's model
- * authority descriptor; this call ends there, before any runner is touched. */
-async function submitMessage(api: Api, session: unknown): Promise<"admitted" | "IDLE_HISTORY_PENDING"> {
-  const executionDescriptor = Object.defineProperty({}, "contextOwner",
-    { get: () => { throw new Error(PAST_IDLE_GATE); } });
-  const outcome = await codeOf(() => api.sessionManager.submit(session, "next message", () => {}, undefined,
-    api.boxNative.model, undefined, undefined, undefined, { modelAuthority: { executionDescriptor } }));
-  if (outcome === PAST_IDLE_GATE) return "admitted";
-  if (outcome.includes("IDLE_HISTORY_PENDING")) return "IDLE_HISTORY_PENDING";
-  return fail(`SUBMIT_ENDED_${outcome}`);
+/** SessionManager.submit() refuses with IDLE_RECOVERY_PENDING while recovery is pending; admitted stops at contextOwner. */
+async function submitMessage(api: Api, session: unknown): Promise<"admitted" | "IDLE_RECOVERY_PENDING"> {
+  const executionDescriptor = Object.defineProperty({}, "contextOwner", { get: () => { throw new Error(PAST_IDLE_GATE); } });
+  try {
+    await api.sessionManager.submit(session, "next message", () => {}, undefined, api.boxNative.model, undefined, undefined, undefined, { modelAuthority: { executionDescriptor } });
+    return fail("SUBMIT_ENDED_RETURNED");
+  } catch (error) {
+    const code = (error as { code?: unknown } | null | undefined)?.code;
+    const message = error instanceof Error ? error.message : String((error as { message?: unknown } | null | undefined)?.message ?? error);
+    if (message === PAST_IDLE_GATE) return "admitted";
+    if (code === "IDLE_RECOVERY_PENDING" && /^IDLE_RECOVERY_PENDING:([1-9]|1[0-5])$/.test(message)) return "IDLE_RECOVERY_PENDING";
+    return fail(`SUBMIT_ENDED_${String(code)}_${message}`);
+  }
 }
 
 // INC-20261003-BOX-REJECT-BLOCKS-NEXT-MESSAGE, live #72191544: egress refused a
@@ -1214,7 +1214,7 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
   try {
     if ((await api.fetchIdleProof({ sessionId: who.sessionId, turnKey })).status !== "pending") fail("REJECT_NOT_PARKED");
     // while the Box turn is parked, a message to this session is refused: the incident
-    if (await submitMessage(api, session) !== "IDLE_HISTORY_PENDING") fail("REJECT_PARKED_TURN_DID_NOT_BLOCK");
+    if (await submitMessage(api, session) !== "IDLE_RECOVERY_PENDING") fail("REJECT_PARKED_TURN_DID_NOT_BLOCK");
     const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
       setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
     const adapter = api.ccbAdapter(runner);
@@ -1286,7 +1286,7 @@ async function proveConfigChangedBlocksNextMessage(api: Api, db: Db): Promise<st
   api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: who.sessionId, turnKey });
   try {
     if ((await api.fetchIdleProof({ sessionId: who.sessionId, turnKey })).status !== "pending") fail("CONFIG_NOT_PARKED");
-    if (await submitMessage(api, session) !== "IDLE_HISTORY_PENDING") fail("CONFIG_PARKED_TURN_DID_NOT_BLOCK");
+    if (await submitMessage(api, session) !== "IDLE_RECOVERY_PENDING") fail("CONFIG_PARKED_TURN_DID_NOT_BLOCK");
     const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
       setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
     const adapter = api.ccbAdapter(runner);
@@ -1366,7 +1366,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: key, sessionId: who.sessionId, turnKey: sourceTurn });
     const before = Date.now();
     // the idle turn is dispatched and ends without a summary; inside the grace window the session waits
-    if (await submit(key) !== "IDLE_HISTORY_PENDING") fail("IDLE_ADMITTED_INSIDE_GRACE");
+    if (await submit(key) !== "IDLE_RECOVERY_PENDING") fail("IDLE_ADMITTED_INSIDE_GRACE");
     const recorded = api.idle.readIdleOp(dir, key, revision);
     if (counters.submits !== 1) fail(`IDLE_TURN_DISPATCHES_${counters.submits}`);
     if (counters.shutdowns !== 1 || !((recorded?.runnerKilledAt ?? 0) >= before)) fail("IDLE_NO_SHUTDOWN_EVIDENCE");
@@ -1381,7 +1381,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     // a shutdown that fails is no evidence: nothing is recorded and nothing settles on the clock alone
     api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: "idle-stuck", sessionId: who.sessionId, turnKey: sourceTurn });
     const stuck = await submit("idle-stuck", async () => { throw new Error("busy"); });
-    if (stuck !== "IDLE_HISTORY_PENDING" || api.idle.readIdleOp(dir, "idle-stuck", revision)?.runnerKilledAt !== undefined
+    if (stuck !== "IDLE_RECOVERY_PENDING" || api.idle.readIdleOp(dir, "idle-stuck", revision)?.runnerKilledAt !== undefined
       || !api.idle.readPendingIdle(dir, "idle-stuck")) fail("IDLE_SETTLED_WITHOUT_EVIDENCE");
     // an op stranded by older code in a container that no longer exists: written before this
     // runtime started, so that start is its shutdown evidence and the next submit settles it.

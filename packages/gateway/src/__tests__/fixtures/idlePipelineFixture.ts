@@ -862,7 +862,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       } catch (error) {
         secondSubmitError = error;
         const message = error instanceof Error ? error.message : String(error);
-        if (!message.includes("IDLE_HISTORY_PENDING")) throw error;
+        if (!message.includes("IDLE_RECOVERY_PENDING")) throw error;
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
     }
@@ -1030,7 +1030,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         blockedError = error instanceof Error ? error.message : String(error);
       }
       report.blockedError = blockedError;
-      assert.equal(blockedError.includes("IDLE_HISTORY_PENDING"), true, blockedError);
+      assert.equal(blockedError.includes("IDLE_RECOVERY_PENDING"), true, blockedError);
       assert.equal(hits.filter((hit) => hit.url === "/v1/messages").length, blockedAt);
       assert.equal(existsSync(candidateFile), true);
       releaseHeldCommits();
@@ -1427,7 +1427,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         let sourceBlocked = "";
         try { await sm.submit(liveSession, "source-pending-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-pending-user") }); }
         catch (error) { sourceBlocked = error instanceof Error ? error.message : String(error); }
-        assert.match(sourceBlocked, /IDLE_HISTORY_PENDING/);
+        assert.match(sourceBlocked, /IDLE_RECOVERY_PENDING/);
         assert.equal(hits.slice(beforeSourceBlocked).filter((hit) => hit.url === "/v1/messages").length, 0);
         releaseHeldCommits();
         await waitForCommitted(admin, SCHEMA, sourceRequestId);
@@ -1440,7 +1440,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         assert.equal(heldKinds.at(-1), "summary");
         const recoveryResult = await withDeadline(recovery, 30_000, "prepared recovery return");
         report.preparedRecoveryResult = recoveryResult;
-        assert.match(recoveryResult, /IDLE_HISTORY_PENDING/);
+        assert.match(recoveryResult, /IDLE_RECOVERY_PENDING/);
       }
       if (growing && heldCommits.length > 0) {
         const summaryHit = [...hits].reverse().find((hit) => hit.kind === "idle-summary");
@@ -1487,7 +1487,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         assert.equal(existsSync(candidateFile), true, "candidate missing while summary commit is held");
         assert.equal(nativeHeld.some((file) => file.applied === true), false, "history applied before summary COMMIT");
         assert.equal(httpDelta, 0, "new user reached the model while summary commit is held");
-        assert.equal(blockedNow === "still-waiting" || blockedNow.includes("IDLE_HISTORY_PENDING"), true, blockedNow);
+        assert.equal(blockedNow === "still-waiting" || blockedNow.includes("IDLE_RECOVERY_PENDING"), true, blockedNow);
         if (mode === "seam" || mode === "grow2") {
           const prepared = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8")))
             .find((file) => file.summaryText === "outer-history-summary");
@@ -1604,7 +1604,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
             blocked = error instanceof Error ? error.message : String(error);
           }
           report.blockedError = blocked;
-          assert.equal(blocked.includes("IDLE_HISTORY_PENDING"), true, blocked);
+          assert.equal(blocked.includes("IDLE_RECOVERY_PENDING"), true, blocked);
           assert.equal(hits.filter((hit) => hit.url === "/v1/messages").length, blockedAt);
           const idleId = hits.find((hit) => hit.kind === "idle-summary")?.requestId ?? "";
           releaseHeldCommits();
@@ -1623,7 +1623,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
             break;
           } catch (error) {
             nextError = error instanceof Error ? error.message : String(error);
-            if (!nextError.includes("IDLE_HISTORY_PENDING")) break;
+            if (!nextError.includes("IDLE_RECOVERY_PENDING")) break;
             await new Promise((resolve) => setTimeout(resolve, 300));
           }
         }
@@ -1700,7 +1700,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
             break;
           } catch (error) {
             secondError = error instanceof Error ? error.message : String(error);
-            if (!secondError.includes("IDLE_HISTORY_PENDING")) break;
+            if (!secondError.includes("IDLE_RECOVERY_PENDING")) break;
             await sleep(300);
           }
         }

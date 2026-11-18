@@ -170,6 +170,7 @@ export type StoredSession = {
   updatedAt?: number;
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  _frameSeqContainerId?: number;
   _sendingInFlight?: boolean;
   _activeClientMessageId?: string;
   _activeAgentId?: string;

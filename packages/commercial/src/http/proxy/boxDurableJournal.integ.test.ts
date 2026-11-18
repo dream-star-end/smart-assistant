@@ -1114,7 +1114,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       uid: 3n, canonicalModel: basis.model, canonicalBody: failedResumeBody });
     // A proved-complete run with no valid final message is already known
     // stopped. Its linked leaf must close without first inventing unknown.
-    const knownRoot = `known-root-${suffix}`, knownLeaf = `known-leaf-${suffix}`;
+    const knownRoot = `known-root-${suffix}`;
+    const knownLeaf = `known-leaf-${suffix}`;
     const knownSource = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
       "SELECT request_id,ctx FROM request_finalize_journal WHERE request_id=ANY($1::text[])",
       [[failedChainRoot.requestId, `box-h-${suffix}`]]);
@@ -1127,7 +1128,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       knownLeaf, JSON.stringify({ ...knownLeafCtx, boxOwnerRequestId: knownRoot })]);
     const knownProof = { ...failedProof, reason: "worker_complete" as const, revision: 1 as const,
       runNonce: failedChainRoot.runNonce, leaseEpoch: failedChainRoot.leaseEpoch };
-    delete (knownProof as { workerExitCode?: number }).workerExitCode;
+    assert.equal(Reflect.deleteProperty(knownProof, "workerExitCode"), true);
     await client.query(`UPDATE request_finalize_journal
       SET ctx=ctx || '{"boxResumeRequestId":"unexpected-child"}'::jsonb WHERE request_id=$1`, [knownLeaf]);
     await assert.rejects(() => journal.markToolChainStoppedFailure({ requestId: knownLeaf,

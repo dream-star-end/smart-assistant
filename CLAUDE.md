@@ -17,20 +17,16 @@
 
 ## Mandatory Code Review Workflow (BLOCKING)
 
-**Every code modification MUST follow this workflow, except the narrowly scoped dx-declared V5 P0
-emergency lane below.**
+**Code review scales by change risk tier (updated 2026-11-17):**
 
-1. **Plan** — Write out the modification plan: what to change, how, impact scope
-2. **Codex Review Plan** — Send plan to Codex for review. Wait for approval before writing any code
-3. **Implement** — Execute the approved plan
-4. **Codex Review Code** — Send the full diff to Codex for review: correctness, edge cases, side effects
-5. **Iterate** — If Codex finds issues, fix and re-submit until clean
-
-**If you skip this workflow outside the explicit exceptions below and write code directly,
-you are violating a direct instruction from boss.**
+- **T0 (docs, comments, copy/text, pure config)** and **V5 Selfhost (`feat/v5-selfhost`) T1** (single-package UI/UX, styling, local non-core bugfixes/wrappers): **no external Codex/auditor loop required** — author self-reviews and runs targeted unit tests plus lightweight package build/typecheck gates.
+- **T2 (`packages/{gateway,protocol,storage,commercial}` core paths, auth/security, billing/ledger, schema migrations, deploy/release scripts)** (and V5 Commercial `feat/v5-aurora-rewrite` code changes per `docs/V5_DEV_PLAYBOOK.md`):
+  1. **Pre-flight 4-Quadrant Self-Check** — Verify before coding/initial review: (a) legacy rows/caches missing new fields, (b) multi-stream & shard/cap overflow, (c) out-of-order/late async idempotency, (d) cancel/switch/unmount lock release. (Schema migration or cross-window deploy ordering changes run a 1-page Stage-0 design check before writing SQL/code.)
+  2. **Implement & Fast Local Verification** — Run fast targeted tests + incremental `tsc` during iteration. Defer heavy proof generators (`*-red-proof`, `conformance`) until code and audit are finalized, then run **once**.
+  3. **Bounded Independent Review (`1+1` hard cap on V5 Selfhost)** — **1 full-diff review + at most 1 same-session incremental re-review** closing real P0/P1 blockers (main-path correctness, security, billing, or data integrity). Out-of-scope items, speculative over-defensive edge cases, and P2/style nits are adjudicated and logged by the lead agent — **never enter round 3–4+ review ping-pong**.
 
 Exceptions:
-- single-line typo fixes;
+- single-line typo fixes, T0 docs/config, and V5 Selfhost T1 changes above;
 - the dx-declared V5 P0 emergency lane below.
 
 ### Dx-declared V5 P0 emergency lane (BLOCKING)
@@ -98,7 +94,17 @@ git worktree add ../openclaude-<slug> -b <type>/<slug> origin/master
 cd /opt/openclaude/openclaude-v3
 git fetch origin
 git worktree add ../openclaude-v3-<slug> -b <type>/<slug> origin/v3
+
+# V5 Selfhost (feat/v5-selfhost) from inside uid=3 user container:
+# MUST place clones/worktrees on the shared persistent volume
+# /home/agent/.openclaude/workspace/wt-<ticket> (host: /var/lib/openclaude/v5-selfhost/users/3/state/.openclaude/workspace/wt-<ticket>)
+# so container Read/Edit, subagents, and host commands share one tree; seed warm packages/*/dist-types + .tsc-cache from /opt/openclaude/openclaude-v5-selfhost.
+# Never put selfhost dev trees in host-private /opt/openclaude/wt-* or ephemeral ~/work/.
 ```
+
+V5 Selfhost (`feat/v5-selfhost`) commit prefix & pre-merge gate fast-path (2026-11-17):
+- **Commit prefixes**: Reserve `fix(v5):` + `Incident: INC-YYYYMMDD-SLUG` strictly for real production incident postmortems (locally run only the newly added proof test + `bash scripts/check-v5-fix-trailers.sh`; never re-run full historical `check-v5-master-incident-proofs.ts` or `check-v5-incident-regressions.ts` locally). Use `bug(v5):` / `ui(v5):` / `perf(v5):` / `refactor(v5):` for ordinary defects, UI fixes, perf, and refactors (no `INC-*`).
+- **Pre-merge local gates & release train**: Run targeted unit tests + warm incremental `tsc` + touched-surface lightweight gates (`packages/web-react` production `vite build` for first-screen gzip budget, `check-file-size-ratchet.ts` for large files, `build-container-gateway.mjs` for `gateway/protocol/storage/cli`). Full cross-package gates run once in the release-train `gate-receipts` pool; after ff-merge & push to `feat/v5-selfhost`, register via `scripts/oc-lease.sh register --resource deploy:selfhost --mode ride --sha <40hex> --ticket OCV5-xxx`.
 
 Rules:
 - branch names must be task-scoped (`fix/...`, `feat/...`, `chore/...`)

@@ -342,37 +342,32 @@ describe('envProbe', () => {
     assert.doesNotMatch(slot.content, /Tokyo/)
   })
 
-  it('CCB extra-prompt user_tz follows OPENCLAUDE_CCB_TZ and omits Asia/Shanghai', () => {
+  it('all engines (ccb / claude-subscription / grok) unify user_tz on OC_USER_TZ and ignore OPENCLAUDE_CCB_TZ', () => {
     const env = {
       ...selfhostEnv,
-      OC_USER_TZ: 'Asia/Shanghai',
+      OC_USER_TZ: 'Asia/Taipei',
       TZ: 'Asia/Tokyo',
       OPENCLAUDE_CCB_TZ: 'Asia/Tokyo',
     }
-    const ccb = buildEnvSlot(
-      { agentId: 'main', provider: 'ccb' },
-      fakeDeps({ env, files: selfhostFiles }),
-    )
-    assert.ok(ccb)
-    assert.match(ccb.content, /^user_tz=Asia\/Tokyo UTC\+09:00 /m)
-    assert.doesNotMatch(ccb.content, /Shanghai/)
-    const grok = buildEnvSlot(
-      { agentId: 'main', provider: 'grok' },
-      fakeDeps({ env, files: selfhostFiles }),
-    )
-    assert.ok(grok)
-    assert.match(grok.content, /^user_tz=Asia\/Shanghai UTC\+08:00 /m)
-    assert.doesNotMatch(grok.content, /Tokyo/)
+    for (const provider of ['ccb', 'claude-subscription', 'grok']) {
+      const slot = buildEnvSlot(
+        { agentId: 'main', provider },
+        fakeDeps({ env, files: selfhostFiles }),
+      )
+      assert.ok(slot, provider)
+      assert.match(slot.content, /^user_tz=Asia\/Taipei UTC\+08:00 /m, provider)
+      assert.doesNotMatch(slot.content, /Tokyo/, provider)
+    }
   })
 
-  it('CCB extra-prompt defaults to Asia/Tokyo when OPENCLAUDE_CCB_TZ is absent', () => {
+  it('CCB provider defaults to Asia/Shanghai when OC_USER_TZ is absent even if OPENCLAUDE_CCB_TZ is set', () => {
     const slot = buildEnvSlot(
       { agentId: 'main', provider: 'ccb' },
-      fakeDeps({ env: { ...selfhostEnv, OC_USER_TZ: 'Asia/Shanghai' }, files: selfhostFiles }),
+      fakeDeps({ env: { ...selfhostEnv, OPENCLAUDE_CCB_TZ: 'Asia/Tokyo' }, files: selfhostFiles }),
     )
     assert.ok(slot)
-    assert.match(slot.content, /^user_tz=Asia\/Tokyo UTC\+09:00 /m)
-    assert.doesNotMatch(slot.content, /Shanghai/)
+    assert.match(slot.content, /^user_tz=Asia\/Shanghai UTC\+08:00 /m)
+    assert.doesNotMatch(slot.content, /Tokyo/)
   })
 
   it('user_tz is backfilled from init environ when the engine scrubbed process env', () => {

@@ -37,6 +37,7 @@ import {
 } from "../auth/containerIdentity.js";
 import {
   CatalogUnknownError,
+  MODEL_PROJECTION_ALGO_VERSION,
   readSecurityEpoch,
   type ModelCatalogCache,
   type ModelCatalogSnapshot,
@@ -148,6 +149,7 @@ export interface WireModelRow {
 
 export interface WireCatalogResponse {
   projection_format?: number;
+  projection_algo_version?: string;
   models: WireModelRow[];
   projection_revision: string;
   availability_revision?: string;
@@ -211,7 +213,8 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
         res,
         200,
         { epoch: epoch.toString(), availability_revision: availability.revision,
-          projection_format: MODEL_CATALOG_PROJECTION_FORMAT },
+          projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+          projection_algo_version: MODEL_PROJECTION_ALGO_VERSION },
         { [REQUEST_ID_HEADER]: requestId, [SECURITY_EPOCH_HEADER]: epoch.toString() },
       );
       return;
@@ -269,6 +272,7 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
     }
     const body: WireCatalogResponse = {
       projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
+      projection_algo_version: MODEL_PROJECTION_ALGO_VERSION,
       models: snapshot.listForUser(scope).map((r) => {
         const p = snapshot.billingPricingFor(r.modelId);
         const declared = snapshot.resolve(r.modelId)?.capabilityProfile.ccb.contextOwner;

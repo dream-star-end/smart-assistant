@@ -88,6 +88,8 @@ import {
   stripMalformedThinkingBlocks,
   type ProxyBody,
 } from "./shared.js";
+import { isSelfhostLocalCcDisabled } from "../../billing/modelAvailability.js";
+import { HttpError } from "../util.js";
 import { ClaudeIdentityGuardError } from "./claudeIdentityGuard.js";
 
 // ─── 路由决策 + 早拒绝 ────────────────────────────────────────────────────────
@@ -1066,6 +1068,14 @@ export async function pickUpstream(
         pooled ? { service: pooled.service, memberId: pooled.memberId } : null,
       ),
     };
+  }
+
+  if (isSelfhostLocalCcDisabled()) {
+    throw new HttpError(
+      503,
+      "MODEL_NOT_AVAILABLE",
+      "本地 Claude Code 通道已下线，请切换至 Box Claude 或远端 Claude 模型",
+    );
   }
 
   const oauth = await pickOAuthUpstream(deps, body, route, log, userId, forceRepin);

@@ -161,6 +161,24 @@ describe("ChatHeader 会话未读角标", () => {
   });
 });
 
+describe("ChatHeader 快问小窗按钮", () => {
+  it("无 onToggleQuickAsk 时不渲染；有回调时展示按钮、按下态与后台旋转图标", () => {
+    renderHeader();
+    expect(screen.queryByTestId("quick-ask-toggle")).toBeNull();
+    cleanup();
+    const onToggleQuickAsk = vi.fn();
+    renderHeader({ onToggleQuickAsk, quickAskOpen: false, quickAskSending: true });
+    const btn = screen.getByTestId("quick-ask-toggle");
+    expect(btn).toHaveAttribute("aria-pressed", "false");
+    expect(btn.querySelector(".animate-spin")).not.toBeNull();
+    fireEvent.click(btn);
+    expect(onToggleQuickAsk).toHaveBeenCalledTimes(1);
+    cleanup();
+    renderHeader({ onToggleQuickAsk, quickAskOpen: true, quickAskSending: true });
+    expect(screen.getByTestId("quick-ask-toggle")).toHaveAttribute("aria-pressed", "true");
+  });
+});
+
 describe("ChatHeader 会话内查找", () => {
   it("无 onOpenFind 时不渲染查找按钮", () => {
     renderHeader();

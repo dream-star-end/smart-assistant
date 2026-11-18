@@ -7,7 +7,10 @@
  * Run: npx tsx --test packages/commercial/src/__tests__/internalDelegateAntigravityRoute.test.ts
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { AddressInfo } from 'node:net'
 import { describe, test } from 'node:test'
 
@@ -303,6 +306,86 @@ describe('internalDelegateAntigravityRoute', () => {
     assert.deepEqual(budgets, [5000n, 64n])
   })
 
+  test('mint falls back to ctx.antigravityBudgetCredits when readBalance throws, and caps at precheck_credits when readBalance returns 0n', async () => {
+    const admissionBudget = 2278962n
+    let thrownBudget: bigint | undefined
+    {
+      const { pool } = makePool({
+        row: journalRow({
+          precheck_credits: '64',
+          ctx: {
+            source: 'delegate_antigravity',
+            model: 'antigravity-claude-sonnet-5.5',
+            antigravityBudgetCredits: String(admissionBudget),
+          },
+        }),
+      })
+      const handler = makeHandler({
+        pool,
+        readBalance: async () => {
+          throw new Error('pg lookup timeout')
+        },
+        admit: async (args: any) => {
+          thrownBudget = args.budgetCredits
+          return mintedRoute()
+        },
+      })
+      await withServer(handler, async (port) => {
+        const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+          requestId: REQUEST_ID,
+        })
+        assert.equal(res.status, 200)
+      })
+    }
+    assert.equal(thrownBudget, admissionBudget)
+
+    let zeroBudget: bigint | undefined
+    {
+      const { pool } = makePool({
+        row: journalRow({
+          precheck_credits: '64',
+          ctx: {
+            source: 'delegate_antigravity',
+            model: 'antigravity-claude-sonnet-5.5',
+            antigravityBudgetCredits: String(admissionBudget),
+          },
+        }),
+      })
+      const handler = makeHandler({
+        pool,
+        readBalance: async () => 0n,
+        admit: async (args: any) => {
+          zeroBudget = args.budgetCredits
+          return mintedRoute()
+        },
+      })
+      await withServer(handler, async (port) => {
+        const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+          requestId: REQUEST_ID,
+        })
+        assert.equal(res.status, 200)
+      })
+    }
+    assert.equal(zeroBudget, 64n)
+    assert.notEqual(zeroBudget, admissionBudget)
+  })
+
+  test('migration 0344 idempotently drops legacy manual delegate_antigravity budget trigger and function (OCV5-752)', () => {
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
+    const migrationSql = readFileSync(
+      resolve(repoRoot, 'packages/commercial/src/db/migrations/0344_drop_delegate_antigravity_budget_trigger.sql'),
+      'utf8',
+    )
+    assert.match(
+      migrationSql,
+      /DROP\s+TRIGGER\s+IF\s+EXISTS\s+trg_rfj_delegate_antigravity_budget\s+ON\s+public\.request_finalize_journal\s*;/i,
+    )
+    assert.match(
+      migrationSql,
+      /DROP\s+FUNCTION\s+IF\s+EXISTS\s+public\.trg_rfj_delegate_antigravity_budget\(\)\s*;/i,
+    )
+  })
+
   test('mint rejects an admission owned by another user or container', async () => {
     for (const row of [
       journalRow({ user_id: '43' }),
@@ -450,8 +533,8 @@ describe('internalDelegateAntigravityRoute', () => {
     })
     assert.deepEqual(expired, [ROUTE_TOKEN], 'unknown/already-expired release is a no-op')
     assert.deepEqual(resolved, [
-      { token: ROUTE_TOKEN, containerId: 11, userId: 42n },
-      { token: ROUTE_TOKEN, containerId: 11, userId: 42n },
+      { token: ROUTE_TOKEN, containerId: 11, userId: 42n, ownershipOnly: true },
+      { token: ROUTE_TOKEN, containerId: 11, userId: 42n, ownershipOnly: true },
     ])
   })
 

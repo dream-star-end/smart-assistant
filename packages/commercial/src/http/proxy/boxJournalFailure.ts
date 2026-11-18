@@ -48,7 +48,8 @@ export async function recordBoxFirstFailure(pool: Pick<Pool, "connect">,
       `SELECT state,failure_code,ctx,FLOOR(EXTRACT(EPOCH FROM clock_timestamp())*1000)::bigint AS observed_ms
          FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
       [input.requestId, input.uid.toString()]);
-    const row = found.rows[0], ctx = row?.ctx;
+    const row = found.rows[0];
+    const ctx = row?.ctx;
     if (found.rowCount !== 1 || !row || !ctx || ctx.boxInvocationRecovery !== "v1"
       || typeof ctx.model !== "string" || !isBoxApiModel(ctx.model)
       || ctx.boxAccountId !== input.accountId.toString()
@@ -170,7 +171,7 @@ export function requireBoxFirstFailure(raw: unknown, ErrorType: JournalErrorCons
 export function assertBoxFailureTerminal(ctx: Record<string, unknown>,
   expected: { runNonce: string; leaseEpoch: string }, ErrorType: JournalErrorConstructor): void {
   try {
-    const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n", expected);
+    const proof = parseBoxTerminalProof(`${JSON.stringify(ctx.boxTerminalProof)}\n`, expected);
     if ((proof.reason === "worker_complete") !== (ctx.boxStopOutcome === "rejected_stream")) {
       throw new Error("unbound failure proof");
     }

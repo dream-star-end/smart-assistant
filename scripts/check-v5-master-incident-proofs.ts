@@ -137,6 +137,59 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/internalModelCatalog.test.ts',
     cases: ['remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)'],
   },
+  {
+    incident: 'INC-20261114-CATALOG-EPOCH-409', slug: 'inc-20261114-catalog-epoch-409', db: false,
+    file: 'packages/commercial/src/__tests__/internalModelCatalog.test.ts',
+    cases: ['OCV5-745 catalog response carries projection_algo_version matching epoch endpoint (INC-20261114-CATALOG-EPOCH-409)'],
+  },
+  {
+    incident: 'INC-20261114-CC5-NULL-RECEIPT-DRAIN', slug: 'inc-20261114-cc5-null-receipt-drain', db: true,
+    file: 'packages/commercial/src/__tests__/remoteNativeTurnBilling.test.ts',
+    cases: ['cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)'],
+  },
+  {
+    incident: 'INC-20261115-CONTAINER-SWAP-FRAMESEQ', slug: 'inc-20261115-container-swap-frameseq', db: true,
+    file: 'packages/commercial/src/__tests__/sessionSnapshot.test.ts',
+    cases: [
+      'idle session arbitrates cross-container cursor_reset only when containerId is supplied (INC-20261115-CONTAINER-SWAP-FRAMESEQ)',
+      'cursor_reset takes priority over containerLinkGap and sequence_gap on open dispatch (INC-20261115-CONTAINER-SWAP-FRAMESEQ)',
+      'cursor_reset defers byte_limit on first page with oversize frame and exposes byte_limit on follow-up page (INC-20261115-CONTAINER-SWAP-FRAMESEQ)',
+    ],
+  },
+  {
+    incident: 'INC-20261116-REMOTE-V4-FENCE-ORPHAN', slug: 'inc-20261116-remote-v4-fence-orphan', db: false,
+    file: 'packages/gateway/src/__tests__/remotePoolTerminalSettlement.test.ts',
+    cases: [
+      'mid-turn CC5_TOOLHOST_EXECUTION_UNKNOWN after completed tool persists crashed tape and terminal inbox once (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+      'escalated user Stop during hung tool persists USER_CANCELLED tape instead of dropping on finalized null summary (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+      'planned gateway beginPlannedShutdown mid-turn persists SERVICE_RESTART with no_response waiver instead of RUNNER_CRASHED (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+      'pre-dispatch explicit user Stop waits for master ACK before surfacing error while pre-dispatch fence persists crashed tape (INC-20261116-REMOTE-V4-FENCE-ORPHAN)',
+    ],
+  },
+  {
+    incident: 'INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT', slug: 'inc-20261117-cc5-bash-timeout-ps-enoent', db: false,
+    file: 'packages/gateway/src/__tests__/cc5BashTimeoutProof.test.ts',
+    cases: [
+      'candidate Cc5ToolHost + ShellCommand Bash timeout without ps in PATH returns timed-out tool result, reaps setsid descendants, keeps host alive, and defaults to 600000ms (INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT)',
+    ],
+  },
+  {
+    incident: 'INC-20261117-CC5-BASH-TIMEOUT-PS-ENOENT', slug: 'inc-20261117-remote-v4-null-receipt-drain', db: true,
+    file: 'packages/commercial/src/__tests__/remoteDriverTurnBillingNullReceipt.test.ts',
+    cases: [
+      'offline contract: recoverRemoteDriverTurnBilling rotates live turns, aborts proven-dead null-receipt turns, and clears per_turn thread claim only (OCV5-777)',
+      'isolated PG: recoverRemoteDriverTurnBilling executes CTE SQL end-to-end against real PostgreSQL tables (OCV5-777)',
+    ],
+  },
+  {
+    incident: 'INC-20261117-REMOTE-V4-DRAIN-CC-AUTH', slug: 'inc-20261117-remote-v4-drain-cc-auth', db: false,
+    file: 'packages/gateway/src/__tests__/remotePoolDrainAndCcAuthProof.test.ts',
+    cases: [
+      'synthetic CC verification_required API error classifies as non-recoverable AUTH_ERROR and settled turn clears lease timer + localStopped for clean cutover drain (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)',
+      'undispatched /abandon resets localStopped for clean idle teardown and late /tool/stopped re-drives stop() closure (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)',
+      'cross-window 20-turn mixed replay preserves synthetic errorCode without conflict while tampered duplicate fences with REMOTE_TERMINAL_CONFLICT (INC-20261117-REMOTE-V4-DRAIN-CC-AUTH)',
+    ],
+  },
 ]
 
 function fail(message: string): never {

@@ -1,3 +1,4 @@
+import { parseIdleRecoveryPending, idleRecoveryPendingMessage } from '@openclaude/protocol/browser';
 /**
  * P5 渲染层**纯逻辑核心** —— 与 React 无关、可独立单测。
  *
@@ -900,6 +901,11 @@ export function errorPresentation(
   // durable live-frame journal 保留此前所有已展示过程。
   // 均非平台内部错误,不甩堆栈。dispatch_not_accepted 是 reconciler 对「容器 rejected tombstone」
   // 铸的精确码(MIN2),与 dispatch_lost 同免单文案。
+  const idleMinutes = parseIdleRecoveryPending(code);
+  if (idleMinutes) {
+    return { code: "idle_recovery_pending", fixedMessage: true, title: "正在整理长对话",
+      message: idleRecoveryPendingMessage(idleMinutes), waived: true };
+  }
   const attachmentTotal = parseAttachmentTotalExceeded(code);
   if (attachmentTotal) {
     return {

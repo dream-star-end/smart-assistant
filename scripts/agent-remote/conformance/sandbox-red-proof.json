@@ -1,0 +1,181 @@
+{
+  "schemaVersion": 1,
+  "suiteDigest": "562d0d84909c5fd1a6c4f17a48403652122cf687039caf852ee43a8eba36137f",
+  "drivers": {
+    "codex": {
+      "driverId": "codex",
+      "engineId": "codex",
+      "driverDigest": "9084f49f290f1373bca3411c361f6a9df7a3e73d20714ef9685f50d0e532eb02",
+      "coreDigest": "cc94b10f9e5047f9a54c06c365192ed3deb348c99056f44724c60dcc1dc2f507",
+      "controllerSha256": "8f033bb62e37fd726cdd7e9a3abd89eb4c28841f1e237259086a31bd6b34e320",
+      "policySha256": "c60d5a823a66d0dfc271fa601424dbb644a3bb80d69e6562768e67d33bb85aac",
+      "requirements": [
+        {
+          "requirementId": "R1",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "wrong_container_noop_toolhost"
+        },
+        {
+          "requirementId": "R2",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultAllowNativeTools_or_testFaultEnableFeatures_in_tmp"
+        },
+        {
+          "requirementId": "R3",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultBypassObservation_in_tmp"
+        },
+        {
+          "requirementId": "R4a",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultDisableAttemptWal_and_testFaultAllowDuplicateClaim"
+        },
+        {
+          "requirementId": "R4b",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "forged_boot_cgroup_stop_proof"
+        },
+        {
+          "requirementId": "R5",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "pg_thread_baseline_reset_on_turn2_plus_conflicting_terminal_receipt"
+        },
+        {
+          "requirementId": "R6",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "codex_R6_fault"
+        },
+        {
+          "requirementId": "R7",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultBypassAdmit_under_64MiB_budget_spawns_app_scope"
+        }
+      ]
+    },
+    "cc": {
+      "driverId": "cc",
+      "engineId": "cc",
+      "driverDigest": "4f9ad3c9f60af5fcd33ed42403744e02c00f2800698a38cf9ed529c9b9b78944",
+      "coreDigest": "cc94b10f9e5047f9a54c06c365192ed3deb348c99056f44724c60dcc1dc2f507",
+      "controllerSha256": "8f033bb62e37fd726cdd7e9a3abd89eb4c28841f1e237259086a31bd6b34e320",
+      "policySha256": "8a160f9bc7294bee227e650bbab07463650c173b5fd373dae3677f7349f34416",
+      "requirements": [
+        {
+          "requirementId": "R1",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "wrong_container_noop_toolhost"
+        },
+        {
+          "requirementId": "R2",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultAllowNativeTools_or_testFaultEnableFeatures_in_tmp"
+        },
+        {
+          "requirementId": "R3",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultBypassObservation_in_tmp"
+        },
+        {
+          "requirementId": "R4a",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultDisableAttemptWal_and_testFaultAllowDuplicateClaim"
+        },
+        {
+          "requirementId": "R4b",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "forged_boot_cgroup_stop_proof"
+        },
+        {
+          "requirementId": "R5",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "inflated_unsubtracted_counters_on_turn2_plus_conflicting_terminal_receipt"
+        },
+        {
+          "requirementId": "R6",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "cc_R6_fault"
+        },
+        {
+          "requirementId": "R7",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultBypassAdmit_under_64MiB_budget_spawns_app_scope"
+        }
+      ]
+    },
+    "antigravity": {
+      "driverId": "antigravity",
+      "engineId": "antigravity",
+      "driverDigest": "69365191eddd6e3499927f355aa5c158dcec95626dc455efd5cc02c5d1b65600",
+      "coreDigest": "cc94b10f9e5047f9a54c06c365192ed3deb348c99056f44724c60dcc1dc2f507",
+      "controllerSha256": "8f033bb62e37fd726cdd7e9a3abd89eb4c28841f1e237259086a31bd6b34e320",
+      "policySha256": "d8c8c11f316c6e96c5797685cf8ee5041c0cea3c35c738c3f01d668f01cdbeb5",
+      "requirements": [
+        {
+          "requirementId": "R1",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "wrong_container_noop_toolhost"
+        },
+        {
+          "requirementId": "R2",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultAllowNativeTools_or_testFaultEnableFeatures_in_tmp"
+        },
+        {
+          "requirementId": "R3",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultBypassObservation_in_tmp"
+        },
+        {
+          "requirementId": "R4a",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultDisableAttemptWal_and_testFaultAllowDuplicateClaim"
+        },
+        {
+          "requirementId": "R4b",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "forged_boot_cgroup_stop_proof"
+        },
+        {
+          "requirementId": "R5",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "inflated_unsubtracted_counters_on_turn2_plus_conflicting_terminal_receipt"
+        },
+        {
+          "requirementId": "R6",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "antigravity_R6_fault"
+        },
+        {
+          "requirementId": "R7",
+          "redEnvironment": "local-sandbox-fault-injection",
+          "redControlCaught": true,
+          "injectedFault": "testFaultBypassAdmit_under_64MiB_budget_spawns_app_scope"
+        }
+      ]
+    }
+  },
+  "proofSha256": "b854a9ffa60682e09b31fae12d4db543bd337ae98393c144017701ce1433c6a3"
+}

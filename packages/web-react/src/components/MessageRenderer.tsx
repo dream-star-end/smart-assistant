@@ -78,15 +78,18 @@ import {
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TimelineEagerMediaContext } from "./chat/timelineEager";
-import { GeneratingPlaceholderCard, TeamPanel } from "./chat/lazyTimelineCards";
 import {
+  GeneratingPlaceholderCard,
   PermissionCard,
   PermissionPromptHost,
+  TeamPanel,
+} from "./chat/lazyTimelineCards";
+import {
   type PermissionRespond,
   isAwaitingPermissionPrompt,
-} from "./chat/PermissionCard";
+} from "./chat/permissionPromptState";
 import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
-import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
+import { reopenPermissionUi, yieldActiveModal } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, projectVisibleAssistantRows, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
 import {
@@ -2941,6 +2944,24 @@ export function MessageList({
     () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
     [pendingSig, readOnly, messages],
   );
+  const dockReopenedRef = useRef<{ sessionId: string | undefined; requestId: string } | null>(null);
+  useEffect(() => {
+    const active = dockReopenedRef.current;
+    if (!active) return;
+    if (
+      active.sessionId !== sessionId ||
+      !pendingPrompts.some((message) => message.requestId === active.requestId)
+    ) {
+      yieldActiveModal(active.requestId);
+      dockReopenedRef.current = null;
+    }
+  }, [sessionId, pendingPrompts]);
+  useEffect(() => () => {
+    if (dockReopenedRef.current) {
+      yieldActiveModal(dockReopenedRef.current.requestId);
+      dockReopenedRef.current = null;
+    }
+  }, []);
   // OCV5-421: pendingPrompts 依赖每次渲染新过滤出的 messages,本身不缓存;以前 Context value 也跟着
   // 每个流式 notify 换新,所有已挂载的工具卡一起重渲。value 只按映射内容换新。
   const reopenKey = pendingPrompts
@@ -3030,7 +3051,9 @@ export function MessageList({
     <ReadOnlySystemActionsBoundary readOnly={readOnly}>
     <PermissionToolReopenContext.Provider value={permissionReopen}>
     <>
-    <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
+    {!readOnly && pendingSig.length > 0 ? (
+      <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
+    ) : null}
     {pendingPrompts.length > 0 ? (
       <div
         data-testid="pending-permission-dock"
@@ -3043,7 +3066,10 @@ export function MessageList({
             type="button"
             className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             onClick={() => {
-              if (message.requestId) reopenPermissionUi(message.requestId);
+              if (message.requestId) {
+                dockReopenedRef.current = { sessionId, requestId: message.requestId };
+                reopenPermissionUi(message.requestId);
+              }
             }}
           >
             {message.toolName === "AskUserQuestion"

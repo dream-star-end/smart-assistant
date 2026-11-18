@@ -86,12 +86,12 @@ export function describeBoxNativeContextMiss(normalizedPrefix: ProxyBody,
   const systemAt = firstDiff(prev.system, next.system);
   if (systemAt >= 0) {
     changed.push("system");
-    out.system = { prev: prev.system.length, next: next.system.length, firstDiff: systemAt };
+    out.systemParts = { prev: prev.system.length, next: next.system.length, firstDiff: systemAt };
   }
   const toolsAt = firstDiff(prev.tools, next.tools);
   if (toolsAt >= 0) {
     changed.push("tools");
-    out.tools = { prev: prev.tools.length, next: next.tools.length, firstDiff: toolsAt };
+    out.toolParts = { prev: prev.tools.length, next: next.tools.length, firstDiff: toolsAt };
   }
   const keys = [...new Set([...Object.keys(prev.params), ...Object.keys(next.params)])].sort();
   const params = keys.filter((key) => prev.params[key] !== next.params[key]);
@@ -105,7 +105,7 @@ export function describeBoxNativeContextMiss(normalizedPrefix: ProxyBody,
       if (prev.messages[i - 1] !== undefined && prev.messages[i - 1] === next.messages[i]) shiftedNext++;
       if (next.messages[i - 1] !== undefined && prev.messages[i] === next.messages[i - 1]) shiftedPrev++;
     }
-    out.messages = { prev: prev.messages.length, next: next.messages.length, firstDiff: at,
+    out.messageParts = { prev: prev.messages.length, next: next.messages.length, firstDiff: at,
       prevKind: prev.kinds[at] ?? null, nextKind: next.kinds[at] ?? null,
       alignedAfter: aligned, insertedShift: shiftedNext, removedShift: shiftedPrev };
   }

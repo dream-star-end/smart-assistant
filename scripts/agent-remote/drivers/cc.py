@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 import re
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.canonical import remote_canonical_sha256, strict_json
 from core.contract import IDENT_RE, TOOL_ALIAS_RE, need
@@ -44,6 +44,84 @@ PLUGIN_REL_FILES = (
 BENIGN_SYSTEM_SUBTYPES = frozenset(
     {"informational", "api_retry", "status", "turn_duration", "local_command"}
 )
+MAX_ERROR_TEXT_CHARS = 1024
+MAX_ERROR_TEXT_BYTES = 2048
+MAX_SEEN_RESULTS = 128
+
+
+def _bound_error_text(raw: str) -> str:
+    clipped = raw.strip()[:MAX_ERROR_TEXT_CHARS]
+    encoded = clipped.encode("utf-8", errors="strict")
+    if len(encoded) <= MAX_ERROR_TEXT_BYTES:
+        return clipped
+    return encoded[:MAX_ERROR_TEXT_BYTES].decode("utf-8", errors="ignore").rstrip()
+
+
+def _result_error_signature(frame: Dict[str, Any]) -> str:
+    sig_doc = {
+        "subtype": frame.get("subtype"),
+        "is_error": frame.get("is_error"),
+        "terminal_reason": frame.get("terminal_reason"),
+        "stop_reason": frame.get("stop_reason"),
+        "error": frame.get("error"),
+        "result": frame.get("result"),
+        "errors": frame.get("errors"),
+    }
+    return remote_canonical_sha256(sig_doc)[:32]
+_VERIFICATION_BLOCK_RE = re.compile(
+    r"anthropic verification portal|can(?:'|’)?t receive replies from claude|cannot receive replies from claude|\bverification_required\b",
+    re.IGNORECASE,
+)
+_AUTH_ERROR_RE = re.compile(
+    r"\b401\b|unauthori[sz]ed|authentication[_ ]?(?:error|failed)|invalid (?:x-)?api[_ -]?key|login expired|please run /login|oauth token has expired|token has been revoked|organization has been disabled",
+    re.IGNORECASE,
+)
+_NET_AUTH_511_RE = re.compile(r"\b511\b[\s\S]{0,60}network authentication required", re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(r"\b429\b|rate[_ ]?limit(?:ed)?|\bRATE_LIMITED\b", re.IGNORECASE)
+_CONTEXT_LIMIT_RE = re.compile(
+    r"PROMPT_TOO_LONG|\bprompt is too long\b|context window (?:was )?(?:exceeded|too long)",
+    re.IGNORECASE,
+)
+
+
+def _classify_cc_error_code(error_tag: Any, error_text: str, default_code: str = "CC_TURN_EXECUTION_ERROR") -> str:
+    tag = error_tag.strip().lower() if isinstance(error_tag, str) else ""
+    text = error_text or ""
+    if tag == "verification_required" or _VERIFICATION_BLOCK_RE.search(text):
+        return "CC_ACCOUNT_VERIFICATION_REQUIRED"
+    if tag == "authentication_failed" or (not _NET_AUTH_511_RE.search(text) and _AUTH_ERROR_RE.search(text)):
+        return "CC_AUTH_ERROR"
+    if tag == "rate_limit" or _RATE_LIMIT_RE.search(text):
+        return "CC_RATE_LIMITED"
+    if _CONTEXT_LIMIT_RE.search(text):
+        return "CC_CONTEXT_TOO_LONG"
+    return default_code
+
+
+def _extract_assistant_api_error(frame: Dict[str, Any], msg: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    if msg.get("model") != "<synthetic>":
+        return None
+    is_api_err = (
+        frame.get("is_api_error_message") is True
+        or frame.get("isApiErrorMessage") is True
+        or (isinstance(frame.get("error"), str) and len(frame["error"].strip()) > 0)
+    )
+    if not is_api_err:
+        return None
+    content = msg.get("content")
+    parts: List[str] = []
+    if isinstance(content, str):
+        if content.strip():
+            parts.append(content.strip())
+    elif isinstance(content, list):
+        for blk in content:
+            if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                txt = blk["text"].strip()
+                if txt:
+                    parts.append(txt)
+    joined = _bound_error_text("\n".join(parts))
+    code = _classify_cc_error_code(frame.get("error"), joined, default_code="CC_API_ERROR")
+    return code, joined
 
 
 def _mod_digest(files: Dict[str, bytes]) -> str:
@@ -335,6 +413,8 @@ def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, A
             raise ValueError("CC_TURN_ALREADY_ACTIVE")
         state["activeTurn"] = True
         state["activeTurnCommandId"] = cmd_id
+        state.pop("turnErrorCode", None)
+        state.pop("turnErrorText", None)
         msg = {
             "type": "user",
             "message": {
@@ -499,6 +579,17 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         need(isinstance(msg, dict) and isinstance(msg.get("content"), (list, str)), "CC_ASSISTANT_MESSAGE_INVALID")
         msg_model = msg.get("model")
         _check_and_pin_model(state, msg_model)
+        api_err = _extract_assistant_api_error(frame, msg)
+        if api_err is not None:
+            err_code, err_text = api_err
+            if not state.get("turnErrorCode"):
+                state["turnErrorCode"] = err_code
+                if err_text:
+                    state["turnErrorText"] = err_text
+            pres_err: Dict[str, Any] = {"kind": "error", "code": err_code}
+            if err_text:
+                pres_err["text"] = err_text
+            presentation.append(pres_err)
         if frame.get("parent_tool_use_id") is not None:
             security_events.append(
                 {
@@ -573,10 +664,7 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
         term_id = frame.get("uuid")
         need(isinstance(term_id, str) and IDENT_RE.fullmatch(term_id), "CC_RESULT_UUID_INVALID")
         seen_uuids = list(state.get("seenResultUuids") or [])
-        if term_id not in seen_uuids:
-            seen_uuids.append(term_id)
-            state["seenResultUuids"] = seen_uuids[-64:]
-        state["activeTurn"] = False
+        is_duplicate_result = term_id in seen_uuids
 
         usage = frame.get("usage")
         need(isinstance(usage, dict), "CC_RESULT_USAGE_MISSING")
@@ -596,6 +684,20 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
             need(subtype == "success", "CC_RESULT_SUBTYPE_INVALID")
             status = "success"
 
+        if not is_duplicate_result:
+            seen_uuids.append(term_id)
+            seen_uuids = seen_uuids[-MAX_SEEN_RESULTS:]
+            state["seenResultUuids"] = seen_uuids
+            state["activeTurn"] = False
+            keep_ids = set(seen_uuids)
+            existing_codes = state.get("resultErrorCodes")
+            if isinstance(existing_codes, dict):
+                pruned = {k: v for k, v in existing_codes.items() if k in keep_ids}
+                if pruned:
+                    state["resultErrorCodes"] = pruned
+                else:
+                    state.pop("resultErrorCodes", None)
+
         security_events.append(
             {
                 "kind": "usage",
@@ -605,13 +707,47 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
                 "rawCounters": counters,
             }
         )
+        prior_code = state.pop("turnErrorCode", None) if not is_duplicate_result else None
+        prior_text = state.pop("turnErrorText", None) if not is_duplicate_result else None
         term_ev: Dict[str, Any] = {
             "kind": "turnTerminal",
             "terminalId": term_id,
             "status": status,
         }
         if status == "error":
-            term_ev["errorCode"] = "CC_TURN_EXECUTION_ERROR"
+            res_sig = _result_error_signature(frame)
+            result_err_codes = dict(state.get("resultErrorCodes") or {})
+            cached_entry = result_err_codes.get(term_id)
+            if is_duplicate_result:
+                if isinstance(cached_entry, list) and len(cached_entry) == 2 and cached_entry[0] == res_sig:
+                    err_code = str(cached_entry[1])
+                else:
+                    err_code = "CC_RESULT_CONFLICT"
+            else:
+                res_str = frame.get("result")
+                fallback_text = res_str.strip() if isinstance(res_str, str) and res_str.strip() else ""
+                if not fallback_text and isinstance(frame.get("errors"), list):
+                    err_items = [e.strip() for e in frame["errors"] if isinstance(e, str) and e.strip()]
+                    fallback_text = "; ".join(err_items)
+                fallback_text = _bound_error_text(fallback_text)
+                if isinstance(prior_code, str) and prior_code:
+                    err_code = (
+                        _classify_cc_error_code(frame.get("error"), fallback_text, default_code="CC_API_ERROR")
+                        if prior_code == "CC_API_ERROR" and fallback_text
+                        else prior_code
+                    )
+                    if not (isinstance(prior_text, str) and prior_text) and fallback_text:
+                        presentation.append({"kind": "error", "code": err_code, "text": fallback_text})
+                else:
+                    err_code = _classify_cc_error_code(
+                        frame.get("error"), fallback_text, default_code="CC_TURN_EXECUTION_ERROR"
+                    )
+                    if fallback_text:
+                        presentation.append({"kind": "error", "code": err_code, "text": fallback_text})
+                result_err_codes[term_id] = [res_sig, err_code]
+                keep_ids = set(seen_uuids)
+                state["resultErrorCodes"] = {k: v for k, v in result_err_codes.items() if k in keep_ids}
+            term_ev["errorCode"] = err_code
         security_events.append(term_ev)
 
     elif ftype in ("user", "rate_limit_event"):

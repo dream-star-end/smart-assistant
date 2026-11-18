@@ -355,9 +355,9 @@ esac
     OC_V5_RELEASE_QUEUE_REPO_ROOT: root,
     OC_V5_RELEASE_QUEUE_RUN_DIR: path.join(dir, 'run'),
   }
-  delete env.OC_V5_RELEASE_QUEUE_ID
-  delete env.OC_V5_PROOF_TEST_DATABASE_URL
-  delete env.OC_V5_DETACHED_SKIP_PREFLIGHT
+  assert.equal(Reflect.deleteProperty(env, "OC_V5_RELEASE_QUEUE_ID"), true)
+  assert.equal(Reflect.deleteProperty(env, "OC_V5_PROOF_TEST_DATABASE_URL"), true)
+  assert.equal(Reflect.deleteProperty(env, "OC_V5_DETACHED_SKIP_PREFLIGHT"), true)
   const queue = (args: string[]) =>
     spawnSync(path.join(root, 'scripts/v5-release-queue.sh'), args, { cwd: root, encoding: 'utf8', env })
   return { env, queue, serving, previous, bin, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
@@ -593,9 +593,9 @@ test('start runs the preflight and never creates a unit when it fails', () => {
   chmodSync(path.join(fake.bin, 'ssh'), 0o755)
   try {
     const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${fake.bin}:${process.env.PATH}`, FAKE_LOG: log }
-    delete env.OC_V5_RELEASE_QUEUE_ID
-    delete env.OC_V5_PROOF_TEST_DATABASE_URL
-    delete env.OC_V5_DETACHED_SKIP_PREFLIGHT
+    assert.equal(Reflect.deleteProperty(env, "OC_V5_RELEASE_QUEUE_ID"), true)
+    assert.equal(Reflect.deleteProperty(env, "OC_V5_PROOF_TEST_DATABASE_URL"), true)
+    assert.equal(Reflect.deleteProperty(env, "OC_V5_DETACHED_SKIP_PREFLIGHT"), true)
     const result = spawnSync(runner, ['start', '--', '--with-dist'], { cwd: root, encoding: 'utf8', env })
     assert.equal(result.status, 2, result.stderr)
     assert.match(result.stderr, /发车预检未通过/)

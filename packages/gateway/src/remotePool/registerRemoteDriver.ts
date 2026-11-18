@@ -3,6 +3,7 @@
  */
 import '../engine/ccbFactory.js'
 import '../engine/codexAdapter.js'
+import '../engine/antigravityAdapter.js'
 import { registerRemoteDriverAdapter } from '../engine/registry.js'
 import { RemoteEngineAdapter } from './remoteEngineAdapter.js'
 

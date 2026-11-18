@@ -15,20 +15,18 @@ describe("resolveV5LocalCcbTransportEnv", () => {
     );
   });
 
-  test("injects a credential-free HTTPS proxy, internal bypass, and IANA timezone", () => {
+  test("injects a credential-free HTTPS proxy and internal bypass without OPENCLAUDE_CCB_TZ", () => {
     assert.deepEqual(
       resolveV5LocalCcbTransportEnv({
         runtimeChannel: "v5",
         useRemote: false,
         hostGatewayIp: "172.31.0.1",
         proxyUrl: "http://172.31.0.1:18991/",
-        timezone: "Asia/Tokyo",
         noProxy: "localhost,10.0.0.0/8",
       }),
       [
         "OPENCLAUDE_CCB_HTTPS_PROXY=http://172.31.0.1:18991",
         "OPENCLAUDE_CCB_NO_PROXY=localhost,10.0.0.0/8,127.0.0.1,::1,172.31.0.1",
-        "OPENCLAUDE_CCB_TZ=Asia/Tokyo",
       ],
     );
   });
@@ -43,14 +41,13 @@ describe("resolveV5LocalCcbTransportEnv", () => {
           ...input,
           hostGatewayIp: "172.31.0.1",
           proxyUrl: "not-a-url",
-          timezone: "not/a-zone",
         }),
         [],
       );
     }
   });
 
-  test("fails closed on credentials or malformed timezones", () => {
+  test("fails closed on proxy credentials", () => {
     assert.throws(
       () =>
         resolveV5LocalCcbTransportEnv({
@@ -61,20 +58,10 @@ describe("resolveV5LocalCcbTransportEnv", () => {
         }),
       /credential-free/,
     );
-    assert.throws(
-      () =>
-        resolveV5LocalCcbTransportEnv({
-          runtimeChannel: "v5",
-          useRemote: false,
-          hostGatewayIp: "172.31.0.1",
-          timezone: "not\/a-zone",
-        }),
-      /IANA timezone/,
-    );
   });
 });
 
-describe("resolveUserTimeZoneEnv (OCV5-166, orthogonal to OPENCLAUDE_CCB_TZ)", () => {
+describe("resolveUserTimeZoneEnv (OCV5-166 / OCV5-754 unified OC_USER_TZ)", () => {
   test("passes a valid IANA zone through as OC_USER_TZ", () => {
     assert.deepEqual(resolveUserTimeZoneEnv("Asia/Shanghai"), ["OC_USER_TZ=Asia/Shanghai"]);
     assert.deepEqual(resolveUserTimeZoneEnv(" America/New_York "), ["OC_USER_TZ=America/New_York"]);
@@ -86,14 +73,14 @@ describe("resolveUserTimeZoneEnv (OCV5-166, orthogonal to OPENCLAUDE_CCB_TZ)", (
     }
   });
 
-  test("does not touch the egress-aligned OPENCLAUDE_CCB_TZ contract", () => {
+  test("transport env emits neither OPENCLAUDE_CCB_TZ nor OC_USER_TZ", () => {
     const egress = resolveV5LocalCcbTransportEnv({
       runtimeChannel: "v5",
       useRemote: false,
       hostGatewayIp: "172.31.0.1",
-      timezone: "Asia/Tokyo",
+      proxyUrl: "http://172.31.0.1:18991",
     });
-    assert.ok(egress.includes("OPENCLAUDE_CCB_TZ=Asia/Tokyo"));
+    assert.ok(!egress.some((kv) => kv.startsWith("OPENCLAUDE_CCB_TZ=")));
     assert.ok(!egress.some((kv) => kv.startsWith("OC_USER_TZ=")));
   });
 });

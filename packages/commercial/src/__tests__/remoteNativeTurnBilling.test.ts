@@ -126,6 +126,9 @@ class FinancialStore {
   attribution: string | null | undefined
   attributionCost: string | undefined
   attributionLedger: string | null | undefined
+  nullReceiptDead = false
+  rotatedNullCount = 0
+  lastNullAbortSql: string | undefined
   constructor(readonly identity = FIRST_TURN) {
     this.dispatchTurn = identity.turnKey
     this.authorityTurn = identity.turnKey
@@ -156,8 +159,23 @@ class FinancialStore {
       return this.result([], 1)
     }
     const j = this.journal
-    if (tag === 'recovery-scan') return this.result(j && j.state !== 'committed' && j.ctx.remoteNative.receipt
+    if (tag === 'recovery-scan') return this.result(j && (['inflight', 'finalizing'].includes(j.state) && (j.ctx.remoteNative.receipt || j.state === 'inflight'))
       ? [{ request_id: this.identity.requestId, user_id: '42', state: j.state, ctx: structuredClone(j.ctx), updated_at: new Date(NOW) }] : [])
+    if (tag === 'null-receipt-abort') {
+      this.lastNullAbortSql = sql
+      if (!j || j.state !== 'inflight' || j.ctx.remoteNative.receipt !== null || this.settled || !this.nullReceiptDead) return this.result()
+      assert.equal(values[0], j.ctx.remoteNative.requestId)
+      assert.equal(values[1], j.ctx.remoteNative.scope.uid)
+      assert.equal(values[2], REMOTE_NATIVE_BILLING_RECOVERY_VERSION)
+      assert.equal(values[3], JSON.stringify(j.ctx.remoteNative))
+      j.state = 'aborted'
+      return this.result([], 1)
+    }
+    if (tag === 'rotate-null') {
+      if (!j || j.state !== 'inflight' || j.ctx.remoteNative.receipt !== null) return this.result()
+      this.rotatedNullCount++
+      return this.result([], 1)
+    }
     if (tag === 'readback') {
       if (!j || !this.settled) return this.result()
       const s = this.settled
@@ -744,3 +762,26 @@ test('isolated PG: concurrent first-turn binding locks both rows and admits exac
       finally { await real.end() }
     }
   })
+
+test('cc5-native-v1 null-receipt recovery aborts dead crash, rotates still-live turns, and guards completed outcome (INC-20261114-CC5-NULL-RECEIPT-DRAIN)', async () => {
+  const { f } = await started()
+  assert.equal(f.store.journal?.state, 'inflight')
+  assert.equal(f.store.journal?.ctx.remoteNative.receipt, null)
+
+  // Still-live turn stays inflight and rotates updated_at without releasing reservation.
+  assert.deepEqual(await recoverRemoteNativeTurnBilling({ pool: f.pool, preCheckRedis: f.redis, log: logger }),
+    { proven: 0, pending: 1 })
+  assert.equal(f.store.journal?.state, 'inflight')
+  assert.equal(f.store.rotatedNullCount, 1)
+  assert.equal(f.counts().release, 0)
+  assert.ok(f.store.lastNullAbortSql?.includes("d.outcome=ANY('{crashed,not_accepted,executed_error,interrupted}'::text[])"))
+  assert.ok(f.store.lastNullAbortSql?.includes("d.outcome IS DISTINCT FROM 'completed'"))
+
+  // Dead crashed turn aborts cleanly with zero debit and releases Redis soft reservation.
+  f.store.nullReceiptDead = true
+  assert.deepEqual(await recoverRemoteNativeTurnBilling({ pool: f.pool, preCheckRedis: f.redis, log: logger }),
+    { proven: 1, pending: 0 })
+  assert.equal(f.store.journal?.state, 'aborted')
+  assert.equal(f.counts().release, 1)
+  assert.equal(f.counts().settle, 0)
+})

@@ -641,6 +641,105 @@ describe("useSessionList history loading fence", () => {
     await waitFor(() => expect(result.current.historyLoading).toBe(false));
     expect(result.current.historyError).toBeNull();
   });
+
+  test("getSession 超时一次后静默重试成功并清除 historyLoading/historyError", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      { id: "webhistoryto01", title: "超时恢复", agentId: "main", updatedAt: 2_000, lastAt: 2_000, messageCount: 4 },
+    ] as never);
+    const getSession = vi.spyOn(api, "getSession")
+      .mockRejectedValueOnce(new DOMException("session request timeout", "TimeoutError"))
+      .mockResolvedValueOnce(detail("webhistoryto01"));
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+    await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webhistoryto01")).toBe(true));
+    act(() => result.current.selectSession("webhistoryto01"));
+    await waitFor(() => expect(getSession).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.historyLoading).toBe(false));
+    expect(result.current.historyError).toBeNull();
+    expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
+  });
+
+  test("retryHistory(force) 在旧请求挂住时立即中止旧信号并发起新请求", async () => {
+    let rejectFirst!: (err: unknown) => void;
+    const firstPromise = new Promise<SessionDetail>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const second = deferred<SessionDetail>();
+    const signals: Array<AbortSignal | undefined> = [];
+    vi.spyOn(api, "listSessions").mockResolvedValue([]);
+    const getSession = vi.spyOn(api, "getSession")
+      .mockImplementationOnce(async (_a, _id, _s, _r, _p, opts) => {
+        signals.push(opts?.signal);
+        return firstPromise;
+      })
+      .mockImplementationOnce(async (_a, _id, _s, _r, _p, opts) => {
+        signals.push(opts?.signal);
+        return second.promise;
+      });
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+
+    act(() => result.current.selectSession("webhistoryhang1"));
+    await waitFor(() => expect(getSession).toHaveBeenCalledTimes(1));
+    expect(result.current.historyLoading).toBe(true);
+    expect(signals[0]?.aborted).toBe(false);
+
+    act(() => result.current.retryHistory("webhistoryhang1"));
+    await waitFor(() => expect(getSession).toHaveBeenCalledTimes(2));
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+    expect(result.current.historyLoading).toBe(true);
+
+    await act(async () => {
+      second.resolve(detail("webhistoryhang1"));
+      await second.promise;
+    });
+    await waitFor(() => expect(result.current.historyLoading).toBe(false));
+    expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
+
+    // Late error from superseded hung request must not set historyError or re-clear anything.
+    await act(async () => {
+      rejectFirst(new DOMException("superseded", "AbortError"));
+      await firstPromise.catch(() => {});
+    });
+    expect(result.current.historyError).toBeNull();
+  });
 });
 
 describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
@@ -1208,5 +1307,29 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
     });
     await act(async () => stale.resolve([meta("webkeepme001", "保留的会话")] as never));
     expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({ title: "office-1029pm", pinned: true });
+  });
+
+  test("临时快问会话([快问] webqa_*)不进侧栏，转为正式对话后的 webqa_* 正常保留", async () => {
+    const { result } = await renderSessionList({ confirmResult: true, promptResult: null });
+    act(() => {
+      result.current.onHydrated([
+        { id: "webqa_temp0001", title: "[快问] 临时问题", agentId: "main", createdAt: 1000, lastAt: 2000, messages: [] },
+        { id: "webqa_prom0002", title: "已转为正式会话", agentId: "main", createdAt: 1000, lastAt: 2100, messages: [] },
+      ] as never);
+    });
+    expect(result.current.sessions.some((s) => s.id === "webqa_temp0001")).toBe(false);
+    expect(result.current.sessions.some((s) => s.id === "webqa_prom0002")).toBe(true);
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      meta("webkeepme001", "保留的会话"),
+      meta("webqa_temp0003", "[快问] 服务端未转正"),
+      meta("webqa_prom0004", "服务端已转正"),
+    ] as never);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webqa_prom0004")).toBe(true));
+    expect(result.current.sessions.some((s) => s.id === "webqa_temp0003")).toBe(false);
   });
 });

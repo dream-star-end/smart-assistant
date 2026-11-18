@@ -3086,10 +3086,10 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     );
     await confirmDialog.getByRole("button", { name: "取消任务" }).click();
     const response = await canceled;
-    if (!response.ok()) throw new Error("取消响应失败: " + response.status());
+    if (!response.ok()) throw new Error(`取消响应失败: ${response.status()}`);
     const receipt = await response.json();
     if (receipt.job?.id !== "33333333-3333-4333-8333-333333333333" || receipt.job?.status !== "canceled") {
-      throw new Error("取消响应未确认目标任务终态: " + JSON.stringify(receipt));
+      throw new Error(`取消响应未确认目标任务终态: ${JSON.stringify(receipt)}`);
     }
     const request = response.request();
     if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);

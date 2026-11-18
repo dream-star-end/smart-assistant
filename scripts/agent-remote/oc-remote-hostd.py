@@ -536,14 +536,71 @@ def discover_grok_models_from_cli(home: pathlib.Path, exe_path: Optional[str]) -
     return []
 
 
+def _resolve_antigravity_runner(exe_path: str) -> List[str]:
+    p = pathlib.Path(exe_path)
+    if p.name == "agy-compat":
+        return [str(p)]
+    try:
+        cpuinfo = pathlib.Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        cpuinfo = ""
+    if "pclmulqdq" not in cpuinfo:
+        qemu = p.parent.parent / "lib" / "antigravity-compat" / "usr" / "bin" / "qemu-x86_64-static"
+        if qemu.is_file():
+            return [str(qemu), "-cpu", "max", str(p)]
+        compat = p.parent / "agy-compat"
+        if compat.is_file():
+            return [str(compat)]
+    return [str(p)]
+
+
 def discover_antigravity_models_from_cli(exe_path: Optional[str]) -> List[Dict[str, str]]:
     if not exe_path:
         return []
+    known_display = {
+        "gemini-4-carbon": "Gemini 4 Carbon",
+        "gemini-4-carbon-medium": "Gemini 4 Carbon Medium",
+        "gemini-4-hydrogen": "Gemini 4 Hydrogen",
+        "gemini-4-hydrogen-high": "Gemini 4 Hydrogen High",
+        "gemini-pro-orchestrator": "Orchestrator Carbon",
+        "gemini-4-argon": "Gemini 4 Argon",
+        "gemini-4-argon-medium": "Gemini 4 Argon Medium",
+        "gemini-3.8-flash": "Gemini 3.8 Flash",
+        "claude-opus-5-5": "Claude Opus 5.5 (Antigravity)",
+        "claude-opus-5-5-medium": "Claude Opus 5.5 Medium (Antigravity)",
+        "claude-sonnet-5-5": "Claude Sonnet 5.5 (Antigravity)",
+        "claude-sonnet-5-5-medium": "Claude Sonnet 5.5 Medium (Antigravity)",
+        "gpt-oss-120b": "GPT-OSS 120B",
+        "gpt-oss-120b-medium": "GPT-OSS 120B Medium",
+        "gemini-3.1-pro": "Gemini 3.1 Pro",
+        "gemini-3.1-flash": "Gemini 3.1 Flash",
+    }
+    try:
+        if not is_synthetic_stub_binary(exe_path):
+            cmd = [*_resolve_antigravity_runner(exe_path), "models"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+            out_text = (res.stdout or "") + "\n" + (res.stderr or "")
+            if res.returncode == 0 and out_text.strip():
+                found: List[Dict[str, str]] = []
+                seen_ids: set[str] = set()
+                for m in re.finditer(r"\b((?:gemini|claude|gpt|kimi|minimax|glm|qwen)-[a-z0-9][a-z0-9._-]{1,62})\b", out_text.lower()):
+                    mid = m.group(1)
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    found.append({"upstream_model_id": mid, "display_name": known_display.get(mid, mid)})
+                if found:
+                    return found
+    except Exception:
+        pass
     try:
         p = pathlib.Path(exe_path).resolve()
         if p.is_file() and p.stat().st_size >= 65536:
             raw_bytes = p.read_bytes()
             candidates = [
+                ("gemini-4-carbon", "Gemini 4 Carbon"),
+                ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+                ("gemini-pro-orchestrator", "Orchestrator Carbon"),
                 ("gemini-4-argon", "Gemini 4 Argon"),
                 ("gemini-3.8-flash", "Gemini 3.8 Flash"),
                 ("claude-opus-5-5", "Claude Opus 5.5 (Antigravity)"),
@@ -860,9 +917,24 @@ def probe_other_engine(home: pathlib.Path, engine: str, binary: str, auth_files:
     # codex initializes its default credential home on any invocation; isolate the version probe.
     cli_ver = run_cmd_version(binary, isolated_home=(engine == "codex"))
     if not cli_ver and engine == "antigravity":
-        alt_bin = "antigravity" if binary == "agy" else "agy"
-        exe_path = resolve_binary_path(alt_bin)
-        cli_ver = run_cmd_version(alt_bin)
+        for alt_bin in (("antigravity", "agy-compat") if binary == "agy" else ("agy", "agy-compat")):
+            cand_exe = resolve_binary_path(alt_bin)
+            if not cand_exe:
+                continue
+            cand_ver = run_cmd_version(alt_bin)
+            if cand_ver:
+                exe_path = cand_exe
+                cli_ver = cand_ver
+                break
+        if not cli_ver and exe_path:
+            try:
+                cmd = [*_resolve_antigravity_runner(exe_path), "--version"]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+                out = (res.stdout or res.stderr or "").strip()
+                if res.returncode == 0 and out:
+                    cli_ver = out.splitlines()[0][:120]
+            except Exception:
+                pass
     if engine == "codex":
         return probe_codex_profiles(home, exe_path, cli_ver)
     if not cli_ver:

@@ -1,3 +1,4 @@
+import { antigravityOwnerProtectedSql } from './antigravityRouteAuthority.js'
 /**
  * Antigravity turn settlement (OCV5-415 P2).
  *
@@ -262,7 +263,7 @@ export async function refreshWaivedAntigravityUsage(args: {
 // frame claims it by (request_id, user_id). Turns nobody reported are settled
 // from relay usage on the user's next admission (no timer).
 
-/** Route TTL (1h) plus margin: a pending turn older than this cannot still be running. */
+/** Minimum orphan age; live execution owners are excluded separately. */
 export const ANTIGRAVITY_STALE_TURN_MS = 2 * 60 * 60 * 1000
 
 export interface AntigravityTurnRecord {
@@ -318,7 +319,7 @@ export async function settleAntigravityTurnRecord(args: {
   staleBefore?: Date
 }): Promise<SettledTurn | null> {
   // The turn is over: free its in-flight slot on the account (OCV5-424 per-account cap).
-  releaseInflight(args.requestId)
+  if (!args.staleBefore) releaseInflight(args.requestId)
   // A reconcile pass ('unknown') never overwrites a terminal status a bridge
   // already persisted: an error turn whose first settle attempt failed must
   // stay free (Codex r2 P1).
@@ -333,11 +334,14 @@ export async function settleAntigravityTurnRecord(args: {
             updated_at = NOW()
       WHERE request_id = $1 AND user_id = $2
         AND (status = 'pending' OR ($4::timestamptz IS NOT NULL AND status = 'settling' AND updated_at < $4))
+        AND ($4::timestamptz IS NULL OR (updated_at < $4
+          AND NOT ${antigravityOwnerProtectedSql('antigravity_turns')}))
       RETURNING model_id, session_id, trace_id, engine_status`,
     [args.requestId, args.userId.toString(), args.engineStatus, args.staleBefore ?? null],
   )
   const row = claim.rows[0]
   if (!row) return null
+  if (args.staleBefore) releaseInflight(args.requestId)
   const engineStatus = row.engine_status as AntigravityEngineStatus | 'unknown'
   const reconciled = args.engineStatus === 'unknown'
   const turn: AntigravityTurnRecord = {
@@ -385,6 +389,7 @@ export async function reconcileStaleAntigravityTurns(args: {
   const due = await args.pool.query<{ request_id: string }>(
     `SELECT request_id FROM antigravity_turns
       WHERE user_id = $1 AND status IN ('pending','settling') AND updated_at < $2
+        AND NOT ${antigravityOwnerProtectedSql('antigravity_turns')}
       ORDER BY created_at LIMIT $3`,
     [args.userId.toString(), staleBefore, args.limit ?? 5],
   )

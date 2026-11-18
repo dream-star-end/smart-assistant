@@ -1,3 +1,5 @@
+export * from './idleRollback.js'
+export { withIdleNativeLock } from './idleNativeLock.js'
 export * from './paths.js'
 export * from './config.js'
 export * from './identityCompatAssets.js'

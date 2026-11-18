@@ -551,8 +551,7 @@ async function createDriverHarness(
   }
 
   const worker = new DriverWorkerClient()
-  let cleanupRelay: RemotePoolRelay | undefined
-  let cleanupAdapter: RemoteEngineAdapter | undefined
+  const cleanupResources: { relay?: RemotePoolRelay; adapter?: RemoteEngineAdapter } = {}
   let cleanupPromise: Promise<void> | undefined
   const cleanup = (): Promise<void> => (cleanupPromise ??= (async () => {
     const errors: unknown[] = []
@@ -560,8 +559,8 @@ async function createDriverHarness(
       try { await fn() } catch (error) { errors.push(error) }
     }
     // One owner, registered before setup can fail: stop writers before removing their journal.
-    const adapter = cleanupAdapter
-    const relay = cleanupRelay
+    const adapter = cleanupResources.adapter
+    const relay = cleanupResources.relay
     if (adapter) await release(() => adapter.shutdown())
     if (relay) {
       await release(async () => assert.deepEqual(await relay.stop(), { remoteStopped: true }))
@@ -712,7 +711,7 @@ async function createDriverHarness(
     observationOptions: { authorizeTimeoutMs: opts.toolAuthorizeTimeoutMs ?? 400 },
   })
 
-  cleanupRelay = relay
+  cleanupResources.relay = relay
   const socketPath = join(sandbox, 'relay.sock')
   relay.controlServer.listen(socketPath)
   await once(relay.controlServer, 'listening')
@@ -784,7 +783,7 @@ async function createDriverHarness(
     },
   )
 
-  cleanupAdapter = adapter
+  cleanupResources.adapter = adapter
   const billingEvents: EngineBillingEvent[] = []
   adapter.on('billing', (ev: EngineBillingEvent) => {
     billingEvents.push(ev)

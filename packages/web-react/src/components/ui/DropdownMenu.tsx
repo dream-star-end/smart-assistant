@@ -10,13 +10,16 @@ export const DropdownMenuGroup = RD.Group;
 export const DropdownMenuContent = forwardRef<
   ComponentRef<typeof RD.Content>,
   ComponentPropsWithoutRef<typeof RD.Content>
->(({ className, sideOffset = 6, ...props }, ref) => (
+>(({ className, sideOffset = 6, collisionPadding = 8, ...props }, ref) => (
   <RD.Portal>
     <RD.Content
       ref={ref}
       sideOffset={sideOffset}
+      collisionPadding={collisionPadding}
       className={cn(
-        "z-50 min-w-[11rem] overflow-hidden rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
+        // 矮视口（如手机横屏）下菜单高于触发点上下可用空间时，原先仅设 overflow-hidden 会导致翻转后顶出视口、
+        // 首项（如侧栏项目行「新建会话」）被裁掉看不到；按 Radix 可用高度封顶并开启纵向滚动（OCV5-778）。
+        "z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
         "data-[state=open]:animate-fade",
         className,
       )}
@@ -74,12 +77,13 @@ DropdownMenuSubTrigger.displayName = "DropdownMenuSubTrigger";
 export const DropdownMenuSubContent = forwardRef<
   ComponentRef<typeof RD.SubContent>,
   ComponentPropsWithoutRef<typeof RD.SubContent>
->(({ className, sideOffset = 4, ...props }, ref) => (
+>(({ className, sideOffset = 4, collisionPadding = 8, ...props }, ref) => (
   <RD.SubContent
     ref={ref}
     sideOffset={sideOffset}
+    collisionPadding={collisionPadding}
     className={cn(
-      "z-50 min-w-[11rem] overflow-hidden rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
+      "z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[11rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-elevated p-1 text-fg shadow-pop",
       "data-[state=open]:animate-fade",
       className,
     )}

@@ -51,13 +51,14 @@ describe("OCV5-575 box-gpt-6-astra-pro is never billed", () => {
     assert.match(source, /if \(!isBoxGptWebModel\(modelCapture\)\) \{\n\s+await deps\.pgPool\.query\(\n\s+`INSERT INTO cursor_external_usage_audit/);
   });
 
-  test("0318 stages a hidden, free row granted to uid 1 and uid 4 only", async () => {
-    const sql = await readFile(new URL("../db/migrations/0318_commercial_box_gpt_6_astra_pro.sql", import.meta.url), "utf8");
-    assert.match(sql, /^-- order-dependency: 0317_commercial_muse_media\n/);
-    assert.match(sql, /SELECT 'box-gpt-6-astra-pro', 'GPT-6-Astra-Pro', 0, 0, 0, 0, multiplier, FALSE, 19, 'hidden',/);
-    assert.match(sql, /AND user_id NOT IN \(1, 4\);/);
-    assert.match(sql, /WHERE u\.id IN \(1, 4\)/);
+  test("0314 preserves the selfhost hidden, disabled seed granted only to owner 3", async () => {
+    const sql = await readFile(new URL("../db/migrations/0314_selfhost_box_gpt_6_astra_pro.sql", import.meta.url), "utf8");
+    assert.match(sql, /^-- order-dependency: 0313_selfhost_go_beam_minimax31\n/);
+    assert.match(sql, /SELECT 'box-gpt-6-astra-pro', 'GPT-6-Astra-Pro', input_per_mtok, output_per_mtok,/);
+    assert.match(sql, /cache_read_per_mtok, cache_write_per_mtok, multiplier, FALSE, 19, 'hidden',/);
+    assert.match(sql, /AND user_id <> 3;/);
+    assert.match(sql, /SELECT 3, 'box-gpt-6-astra-pro', 3/);
     assert.match(sql, /'staged'/);
-    assert.doesNotMatch(sql, /user_id\s*(=|<>)\s*3\b|\bIN \([^)]*\b3\b[^)]*\)/, "commercial uid 3 is never granted or singled out");
+    assert.doesNotMatch(sql, /\bIN \(1, 4\)/, "selfhost never imports the commercial owner grants");
   });
 });

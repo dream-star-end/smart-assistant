@@ -217,7 +217,7 @@ wsetup() {
   export WATCH_STUB_UNIT_MASTER=active WATCH_STUB_UNIT_EGRESS=active WATCH_STUB_MASTER=ok WATCH_STUB_EGRESS=ok
   export WATCH_STUB_MASTER_BODY='{"ok":true,"deps":{"pg":"ok"}}' WATCH_STUB_PG=ok WATCH_STUB_REDIS=ok WATCH_STUB_DOCKER=ok
   # OCV5-444 host_checks: stub the disk and point at a missing backup status, like every other host probe here.
-  export WATCH_STUB_DISK_AVAIL_BYTES=$((100 * 1024 * 1024 * 1024)) WATCH_PG_BACKUP_STATUS="$C/no-pg-backup-status.json"
+  export WATCH_STUB_DISK_AVAIL_BYTES=$((100 * 1024 * 1024 * 1024)) WATCH_PG_BACKUP_STATUS="$C/no-pg-backup-status.json" WATCH_AUTOSAVE_STATUS="$C/no-harness-autosave-status.json"
   unset WATCH_STUB_FAIL_LOUD || true
   mkdir -p "$C/run" "$C/inst" "$C/rel"
   cp -- "$WATCH_SOURCE" "$WATCH_INSTALLED_BIN"
@@ -280,6 +280,59 @@ else bad "A19 e1=$e1 e2=$e2 dt=${dt}s calls=${ends}/${starts} disarm=$([[ -e "$W
 unset WATCH_ALERT_BIN
 unset WATCH_ALERT_DB_TIMEOUT_SEC WATCH_ALERT_FLUSH_BUDGET_SEC; export PSQL_SLEEP=0 WATCH_STUB_MASTER=ok
 
+# A20 未配置 harness autosave 状态文件: 不触发告警也不写 host 状态文件。
+wsetup a20; tick
+if [[ "$TEC" == 0 && "$(nfiles "$C/state/alert-dry")" == 0 && ! -e "$C/run/watch-host-harness_autosave" ]]; then
+  ok "A20 absent harness autosave status emits nothing"
+else bad "A20 ec=$TEC dry=$(nfiles "$C/state/alert-dry")"; fi
+
+# A21 harness autosave >2h dirty/stale -> harness_autosave_unhealthy; 恢复 -> harness_autosave_unhealthy_recovered。
+wsetup a21
+export WATCH_AUTOSAVE_STATUS="$C/harness-autosave-status.json"
+export WATCH_NOW_OVERRIDE=1800000000
+stale_iso="$(/usr/bin/date -u -d @$((WATCH_NOW_OVERRIDE - 7300)) +%Y-%m-%dT%H:%M:%SZ)"
+fresh_iso="$(/usr/bin/date -u -d @$((WATCH_NOW_OVERRIDE - 60)) +%Y-%m-%dT%H:%M:%SZ)"
+jq -n --arg stale "$stale_iso" '{
+  schema: 1, checkedAt: $stale, lastOkAt: $stale, lastCommitAt: $stale, lastCommitSha: "abc123",
+  dirtyCount: 2, dirtySince: $stale, nonAgentGitEntries: 0,
+  lastHealedAt: null, lastHealedCount: 0, lastFailAt: $stale, lastError: "git push failed", consecutiveFailures: 3
+}' >"$WATCH_AUTOSAVE_STATUS"
+tick; e21a=$TEC; ev21a="$(events)"
+jq -n --arg fresh "$fresh_iso" '{
+  schema: 1, checkedAt: $fresh, lastOkAt: $fresh, lastCommitAt: $fresh, lastCommitSha: "def456",
+  dirtyCount: 0, dirtySince: null, nonAgentGitEntries: 0,
+  lastHealedAt: null, lastHealedCount: 0, lastFailAt: null, lastError: null, consecutiveFailures: 0
+}' >"$WATCH_AUTOSAVE_STATUS"
+tick; e21b=$TEC; ev21b="$(events)"
+if [[ "$e21a" == 0 && "$e21b" == 0 && "$ev21a" == "harness_autosave_unhealthy " && "$ev21b" == "harness_autosave_unhealthy harness_autosave_unhealthy_recovered " ]] \
+  && grep -q '^health=green' "$WATCH_STATUS"; then
+  ok "A21 stale/dirty harness autosave alerts and recovers without changing watch health"
+else bad "A21 e21a=$e21a e21b=$e21b ev21a=[$ev21a] ev21b=[$ev21b]"; fi
+unset WATCH_NOW_OVERRIDE WATCH_AUTOSAVE_STATUS
+
+# A22 nonAgentGitEntries > 0 -> harness_autosave_unhealthy; 恢复 -> harness_autosave_unhealthy_recovered。
+wsetup a22
+export WATCH_AUTOSAVE_STATUS="$C/harness-autosave-status.json"
+export WATCH_NOW_OVERRIDE=1800000000
+fresh_iso="$(/usr/bin/date -u -d @$((WATCH_NOW_OVERRIDE - 30)) +%Y-%m-%dT%H:%M:%SZ)"
+jq -n --arg fresh "$fresh_iso" '{
+  schema: 1, checkedAt: $fresh, lastOkAt: $fresh, lastCommitAt: $fresh, lastCommitSha: "abc123",
+  dirtyCount: 0, dirtySince: null, nonAgentGitEntries: 3,
+  lastHealedAt: null, lastHealedCount: 0, lastFailAt: $fresh, lastError: "ownership heal incomplete", consecutiveFailures: 1
+}' >"$WATCH_AUTOSAVE_STATUS"
+tick; e22a=$TEC; ev22a="$(events)"
+jq -n --arg fresh "$fresh_iso" '{
+  schema: 1, checkedAt: $fresh, lastOkAt: $fresh, lastCommitAt: $fresh, lastCommitSha: "abc123",
+  dirtyCount: 0, dirtySince: null, nonAgentGitEntries: 0,
+  lastHealedAt: $fresh, lastHealedCount: 3, lastFailAt: $fresh, lastError: null, consecutiveFailures: 0
+}' >"$WATCH_AUTOSAVE_STATUS"
+tick; e22b=$TEC; ev22b="$(events)"
+if [[ "$e22a" == 0 && "$e22b" == 0 && "$ev22a" == "harness_autosave_unhealthy " && "$ev22b" == "harness_autosave_unhealthy harness_autosave_unhealthy_recovered " ]]; then
+  ok "A22 nonAgentGitEntries > 0 emits harness_autosave_unhealthy and recovers"
+else bad "A22 e22a=$e22a e22b=$e22b ev22a=[$ev22a] ev22b=[$ev22b]"; fi
+unset WATCH_NOW_OVERRIDE WATCH_AUTOSAVE_STATUS
+
 echo "ALERT_CASES pass=$pass fail=$fail"
 (( fail == 0 )) && echo ALERT_TEST_ALL_PASS
 (( fail == 0 ))
+

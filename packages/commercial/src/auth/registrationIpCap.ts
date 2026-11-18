@@ -26,7 +26,7 @@ export async function claimRegistrationIpSlot(
     [ip],
   );
   const res = await client.query<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM users WHERE registration_ip = $1::inet`,
+    'SELECT COUNT(*)::int AS n FROM users WHERE registration_ip = $1::inet',
     [ip],
   );
   return res.rows[0].n < MAX_ACCOUNTS_PER_REGISTRATION_IP;

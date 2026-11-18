@@ -193,7 +193,6 @@ export interface V5LocalCcbTransportEnvInput {
   useRemote: boolean;
   hostGatewayIp: string;
   proxyUrl?: string;
-  timezone?: string;
   noProxy?: string;
 }
 
@@ -211,7 +210,6 @@ export function resolveV5LocalCcbTransportEnv(
   if (input.runtimeChannel !== "v5" || input.useRemote) return [];
 
   const proxy = input.proxyUrl?.trim();
-  const timezone = input.timezone?.trim();
   const result: string[] = [];
 
   if (proxy) {
@@ -254,22 +252,12 @@ export function resolveV5LocalCcbTransportEnv(
     );
   }
 
-  if (timezone) {
-    try {
-      new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
-    } catch {
-      throw new SupervisorError("InvalidArgument", "OC_CLAUDE_CODE_TZ must be a valid IANA timezone");
-    }
-    result.push(`OPENCLAUDE_CCB_TZ=${timezone}`);
-  }
-
   return result;
 }
 
 /**
- * 用户面时区透传(OCV5-166)。合法 IANA 名 → `["OC_USER_TZ=<tz>"]`;缺省/空白/非法 → `[]`
- * (不抛:这是 UX 提示,不是安全边界;容器侧 envProbe 会回落 Asia/Shanghai)。
- * 与 resolveV5LocalCcbTransportEnv 的 OPENCLAUDE_CCB_TZ 刻意分开:那个绑出口,这个绑用户。
+ * 用户面时区透传(OCV5-166 / OCV5-754)。合法 IANA 名 → `["OC_USER_TZ=<tz>"]`;缺省/空白/非法 → `[]`
+ * (不抛:这是 UX 提示,不是安全边界;容器侧 envProbe 会回落 Asia/Shanghai)。所有引擎统一走 OC_USER_TZ。
  */
 export function resolveUserTimeZoneEnv(raw: string | undefined): string[] {
   const tz = raw?.trim() ?? "";
@@ -1122,48 +1110,8 @@ export async function acquireHostCapLock(
     [HOST_CAP_LOCK_NS, hostIdToLockKey(hostUuid)],
   );
 }
-
-// ───────────────────────────────────────────────────────────────────────
-// 公共类型
-// ───────────────────────────────────────────────────────────────────────
-
-/**
- * v5 runtime tuple(热生效改造,plan §1)。仅 v5 channel + 显式配置时真正生效。
- *
- * 分工:
- *   - provision:挂平台稳定根(→ /run/oc/platform:ro)+ release(→ /opt/openclaude:ro)、
- *     打 4 个 runtime label、注入 3 个平台 env。**昂贵的全量 bundle 校验(逐文件 sha256)
- *     不在这里做**,而在 index.ts 启动期一次性 resolvePlatformBundleMount / resolveRuntimeReleaseMount
- *     完成后把结果(bundleRev/bootHash/resolved 路径)灌进本结构;provision 每次只做便宜的
- *     `assertCurrentMatches`(current symlink realpath 对照,防激活中间态)。
- *   - ensureRunning:desired 三元组(imageId / release / bootHash)做 runtimeStale 判定。
- *
- * 字段全 optional:未配置(v3 常态)→ 整套逻辑跳过,provision/ensureRunning 行为逐字节同旧。
- */
-export interface V3RuntimeTuple {
-  /**
-   * OC_RUNTIME_IMAGE_ID —— 部署时验证过的 immutable image ID(sha256:...)。
-   * label image_id 值 + runtimeStale 的 desired imageId。缺省 → runtimeStale 回落 tag 比较
-   * (过渡兼容;**部署后必填**,否则同 tag 重指新镜像漏判,见 plan §1.1 R2-M4)。
-   */
-  imageId?: string;
-  /** OC_PLATFORM_BUNDLE —— bundles/<bundleRev12>(内容 digest 命名)。assertCurrentMatches 对照目标。 */
-  bundlePath?: string;
-  /** 启动期解析:bundle realpath(== platform current 目标)。 */
-  bundleResolvedPath?: string;
-  /** 启动期解析:bundleRev(= digest12 = bundle 目录名)。label bundle_rev。 */
-  bundleRev?: string;
-  /** 启动期解析:bootHash(entrypoint/+seed/ 子集)。label boot_hash + runtimeStale desired。 */
-  bootHash?: string;
-  /** OC_RUNTIME_RELEASE —— releases/rel-<digest12>。 */
-  releasePath?: string;
-  /** 启动期解析:release realpath(bind /opt/openclaude:ro 的源;绝不挂 symlink)。 */
-  releaseResolvedPath?: string;
-  /** 平台稳定根(默认 DEFAULT_PLATFORM_ROOT);挂 /run/oc/platform:ro + assertCurrentMatches。 */
-  platformRoot?: string;
-  /** releases 根(默认 DEFAULT_RUNTIME_RELEASES_ROOT);release realpath 必在其下。 */
-  releasesRoot?: string;
-}
+import type { V3RuntimeTuple } from "./v3RuntimeTupleTypes.js";
+export type { V3RuntimeTuple } from "./v3RuntimeTupleTypes.js";
 
 /**
  * 读 env `OC_PLATFORM_BUNDLE_OPTIONAL`:**只认 "1"**(fail-closed)。
@@ -2902,11 +2850,10 @@ export async function provisionV3Container(
         useRemote,
         hostGatewayIp,
         proxyUrl: process.env.OC_CLAUDE_CODE_HTTPS_PROXY,
-        timezone: process.env.OC_CLAUDE_CODE_TZ,
         noProxy: process.env.NO_PROXY,
       }),
     );
-    // OCV5-166:用户面时区,与上面出口对齐的 OPENCLAUDE_CCB_TZ **正交**。容器 gateway 的
+    // OCV5-166 / OCV5-754:用户面时区（所有引擎统一走 OC_USER_TZ）。容器 gateway 的
     // envProbe 把它渲染进 ENV prompt slot(user_tz=…),让模型不再把子进程 `date` 当用户
     // 时间。只透传合法 IANA 名;缺省/非法不注入,容器侧自行回落 Asia/Shanghai。
     env.push(...resolveUserTimeZoneEnv(process.env.OC_USER_TZ));

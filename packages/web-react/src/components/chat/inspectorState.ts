@@ -69,4 +69,3 @@ export function writeDetailPaneOpen(open: boolean): void {
     /* private mode / quota */
   }
 }
-

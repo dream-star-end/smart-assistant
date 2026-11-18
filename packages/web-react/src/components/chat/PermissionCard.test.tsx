@@ -31,6 +31,13 @@ import {
   permissionHasExpired,
   resetPermissionAutoOpenMemory,
 } from "./PermissionCard";
+import {
+  PermissionCard as LazyPermissionCard,
+  PermissionPromptHost as LazyPermissionPromptHost,
+  _setPermissionCardLoaderForTest,
+  preloadTimelineCards,
+} from "./lazyTimelineCards";
+import { MessageList } from "../MessageRenderer";
 import { prefetchMarkdownImpl } from "../Markdown";
 import { loadBeforeAll } from "../../test/moduleLoad";
 
@@ -39,6 +46,7 @@ loadBeforeAll(prefetchMarkdownImpl);
 
 afterEach(() => {
   cleanup();
+  _setPermissionCardLoaderForTest(null);
   resetPermissionAutoOpenMemory();
   setPermissionFullInputFetcher(null);
   Object.defineProperty(document, "visibilityState", {
@@ -1225,5 +1233,188 @@ describe("问答卡继续", () => {
     const encoded = JSON.stringify(payload);
     expect(encoded).not.toContain("购买");
     expect(encoded).not.toContain("简约");
+  });
+});
+
+describe("lazyTimelineCards PermissionCard 预热同步就绪", () => {
+  test("preloadTimelineCards() 预热后渲染 PermissionCard 与 PermissionPromptHost 同步就绪无回退占位", async () => {
+    await preloadTimelineCards();
+
+    render(
+      <LazyPermissionCard
+        msg={bashPermMsg({ requestId: "req-lazy-sync-card" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.queryByText("加载中…")).toBeNull();
+    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+
+    cleanup();
+
+    render(
+      <>
+        <div id="pending-approval-bar-slot" />
+        <LazyPermissionPromptHost
+          messages={[askMsg({ requestId: "req-lazy-sync-host" })]}
+          onRespond={vi.fn()}
+          sending
+          sessionId="lazy-sync-session"
+        />
+      </>,
+    );
+    expect(screen.queryByText("加载中…")).toBeNull();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("冷加载失败 → 网络恢复点击重试 → 实际权限弹窗正常打开且允许可触发 onRespond", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let shouldFail = true;
+      _setPermissionCardLoaderForTest(() =>
+        shouldFail
+          ? Promise.reject(new Error("ChunkLoadError: network offline"))
+          : import("./PermissionCard"),
+      );
+      const onRespond = vi.fn();
+
+      render(
+        <>
+          <div id="pending-approval-bar-slot" />
+          <LazyPermissionPromptHost
+            messages={[bashPermMsg({ requestId: "req-retry-modal" })]}
+            onRespond={onRespond}
+            sending
+            sessionId="sess-retry"
+          />
+        </>,
+      );
+
+      expect(await screen.findByTestId("permission-lazy-error")).toBeInTheDocument();
+
+      shouldFail = false;
+      fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+      expect(await screen.findByRole("dialog", { name: "工具权限请求" })).toBeInTheDocument();
+      expect(screen.queryByTestId("permission-lazy-error")).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "允许" }));
+      expect(onRespond).toHaveBeenCalledTimes(1);
+      expect(onRespond).toHaveBeenCalledWith({
+        requestId: "req-retry-modal",
+        behavior: "allow",
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  test("冷加载失败后切会话自动重置错误态并正常弹窗提交", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let shouldFail = true;
+      _setPermissionCardLoaderForTest(() =>
+        shouldFail
+          ? Promise.reject(new Error("ChunkLoadError: network offline"))
+          : import("./PermissionCard"),
+      );
+      const onRespond = vi.fn();
+
+      const { rerender } = render(
+        <>
+          <div id="pending-approval-bar-slot" />
+          <LazyPermissionPromptHost
+            messages={[askMsg({ requestId: "req-fail-s1" })]}
+            onRespond={onRespond}
+            sending
+            sessionId="sess-fail-1"
+          />
+        </>,
+      );
+
+      expect(await screen.findByTestId("permission-lazy-error")).toBeInTheDocument();
+
+      shouldFail = false;
+      rerender(
+        <>
+          <div id="pending-approval-bar-slot" />
+          <LazyPermissionPromptHost
+            messages={[askMsg({ requestId: "req-ok-s2" })]}
+            onRespond={onRespond}
+            sending
+            sessionId="sess-ok-2"
+          />
+        </>,
+      );
+
+      expect(await screen.findByRole("dialog")).toBeInTheDocument();
+      expect(screen.queryByTestId("permission-lazy-error")).toBeNull();
+
+      fireEvent.click(screen.getByRole("radio", { name: "组队合作割草" }));
+      fireEvent.click(screen.getByRole("button", { name: "提交" }));
+      expect(onRespond).toHaveBeenCalledTimes(1);
+      expect(onRespond.mock.calls[0][0].requestId).toBe("req-ok-s2");
+      expect(onRespond.mock.calls[0][0].behavior).toBe("allow");
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  test("懒块挂起期间点击 pending-permission-dock 后切换 sessionId，旧请求占用被释放，新会话活提问自动弹窗不受阻塞", async () => {
+    let resolveLoader!: (mod: typeof import("./PermissionCard")) => void;
+    _setPermissionCardLoaderForTest(
+      () =>
+        new Promise((resolve) => {
+          resolveLoader = resolve;
+        }),
+    );
+    const onRespond = vi.fn();
+
+    const { rerender } = render(
+      <>
+        <div id="pending-approval-bar-slot" />
+        <MessageList
+          messages={[bashPermMsg({ requestId: "req-dock-a" })]}
+          sending
+          sessionId="sess-dock-a"
+          cb={{}}
+          onRespondPermission={onRespond}
+        />
+      </>,
+    );
+
+    const dockBtn = screen.getByRole("button", { name: "打开审批" });
+    fireEvent.click(dockBtn);
+    expect(activeModalRequest()).toBe("req-dock-a");
+
+    rerender(
+      <>
+        <div id="pending-approval-bar-slot" />
+        <MessageList
+          messages={[bashPermMsg({ requestId: "req-live-b" })]}
+          sending
+          sessionId="sess-live-b"
+          cb={{}}
+          onRespondPermission={onRespond}
+        />
+      </>,
+    );
+
+    await waitFor(() => {
+      expect(activeModalRequest()).toBeNull();
+    });
+
+    const realModule = await import("./PermissionCard");
+    await act(async () => {
+      resolveLoader(realModule);
+    });
+
+    expect(await screen.findByRole("dialog", { name: "工具权限请求" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "允许" }));
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: "req-live-b",
+      behavior: "allow",
+    });
   });
 });

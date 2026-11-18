@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 import {
   ANTIGRAVITY_QUOTA_TTL_MS,
+  ANTIGRAVITY_QUOTA_USER_AGENT,
   _resetAntigravityQuotaCacheForTest,
   antigravityAccountQuota,
   parseQuotaSummary,
@@ -117,5 +118,11 @@ describe("paidTier and model metadata refresh (OCV5-516)", () => {
     assert.equal(next.paidTier, tier);
     assert.equal(saved[1][1], tier);
     assert.equal(saved[1][2], null, 'SQL COALESCE preserves last valid directory');
+  });
+
+  it("uses CLI 1.5.8 cl=1020628950 user-agent so fetchAvailableModels exposes gemini-pro-orchestrator (OCV5-783)", () => {
+    assert.match(ANTIGRAVITY_QUOTA_USER_AGENT, /^antigravity\/cli\/1\.5\.8 /);
+    assert.match(ANTIGRAVITY_QUOTA_USER_AGENT, /cl=1020628950;/);
+    assert.equal(ANTIGRAVITY_QUOTA_USER_AGENT.includes("cl=1000494485"), false);
   });
 });

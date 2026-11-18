@@ -29,7 +29,12 @@ const baseline = JSON.parse(readFileSync(new URL(`./fixtures/${selfhost ? 'selfh
 const expectedSuffix = [
   ...Object.keys(baseline.migrations).filter(v => v >= '0334'),
   ...(selfhost
-    ? ['0341_selfhost_sync_compat', '0342_antigravity_gemini_4_hydrogen', '0343_antigravity_orchestrator_carbon']
+    ? [
+        '0341_selfhost_sync_compat',
+        '0342_antigravity_gemini_4_hydrogen',
+        '0343_antigravity_orchestrator_carbon',
+        '0344_drop_delegate_antigravity_budget_trigger',
+      ]
     : ['0340_commercial_sync_compat', '0341_commercial_antigravity_gemini_4_models']),
 ].sort()
 const url = process.env.TEST_DATABASE_URL
@@ -413,7 +418,10 @@ test('R1 PG prepare failure then same-chat retry frees exactly one slot; unknown
     const runtime=createRemoteLaneRuntime({selfhost:true,
       env:{OC_SELFHOST_CC5_T1555U_ENABLED:'1',OC_SELFHOST_CC5_T1555U_TEST_UID:uid},
       financeFactory:()=>({admit:async()=>{throw new Error('must not start model')}}),
-      hooks:{place:request=>placeRemoteLane(request,{pool,packet:async()=>Buffer.from('fixture')}),
+      hooks:{place:request=>{
+        if (request.engine === 'antigravity') throw new Error('REMOTE_LANE_UNAVAILABLE')
+        return placeRemoteLane({...request, engine: request.engine},{pool,packet:async()=>Buffer.from('fixture')})
+      },
         onState:(op,state,generation)=>recordRemoteLaneState(op,state,pool,generation)},
       configuration:()=>({baseRoot:join(root,'r'),controllerPath:'/unused',hostFactory:()=>({
         prepareTask:async()=>{if(failPrepare)throw new Error('transient preparation failure')},

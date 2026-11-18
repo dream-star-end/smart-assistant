@@ -42,6 +42,8 @@ const INPUT_KEYS: Record<string, Record<string, string>> = {
 
 const SERVER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 const TOOL_RE = /^[A-Za-z0-9_-]+$/
+/** Antigravity 1.5+ eager MCP declaration name: `mcp_<server>_<tool>` (server has no `_`). */
+const EAGER_MCP_RE = /^mcp_([A-Za-z0-9][A-Za-z0-9.-]*)_([A-Za-z0-9_-]+)$/
 
 function recordOf(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -58,12 +60,20 @@ function mcpTarget(input: unknown): { server: string; tool: string; args: unknow
   return { server, tool, args: obj.Arguments ?? {} }
 }
 
+function eagerMcpTarget(nativeName: string): { server: string; tool: string } | null {
+  const match = EAGER_MCP_RE.exec(nativeName)
+  if (!match) return null
+  return { server: match[1]!, tool: match[2]! }
+}
+
 export function antigravityProductToolName(nativeName: string, input?: unknown): string {
   const name = nativeName.trim()
   if (name === 'call_mcp_tool') {
     const target = mcpTarget(input)
     if (target) return `mcp__${target.server}__${target.tool}`
   }
+  const eager = eagerMcpTarget(name)
+  if (eager) return `mcp__${eager.server}__${eager.tool}`
   return PRODUCT_NAMES[name] ?? (name || 'AntigravityTool')
 }
 
@@ -72,6 +82,16 @@ export function antigravityProductToolInput(nativeName: string, input: unknown):
   if (name === 'call_mcp_tool') {
     const target = mcpTarget(input)
     if (target) return target.args
+  }
+  const eager = eagerMcpTarget(name)
+  if (eager) {
+    const obj = recordOf(input)
+    if (!obj) return input ?? {}
+    if (eager.server === 'openclaude-memory' && 'toolSummary' in obj) {
+      const { toolSummary: _ignored, ...rest } = obj
+      return rest
+    }
+    return { ...obj }
   }
   const obj = recordOf(input)
   const keys = INPUT_KEYS[name]

@@ -36,7 +36,6 @@ describe("assertClaudeOAuthIdentity", () => {
   test("JP 出口 + 活体 UA + pin 一致 → 放行", async () => {
     setClaudeIdentityGuardRuntimeForTest({
       enabled: true,
-      processTz: "Asia/Tokyo",
       pinnedIp: JP.ip,
       pinnedCountry: "JP",
       probeExit: async () => JP,
@@ -47,7 +46,6 @@ describe("assertClaudeOAuthIdentity", () => {
   test("UA 与活体 CLI 不一致 → device_mismatch", async () => {
     setClaudeIdentityGuardRuntimeForTest({
       enabled: true,
-      processTz: "Asia/Tokyo",
       probeExit: async () => JP,
     });
     await assert.rejects(
@@ -61,7 +59,6 @@ describe("assertClaudeOAuthIdentity", () => {
   test("device_id 未钉到账号 pin → device_mismatch", async () => {
     setClaudeIdentityGuardRuntimeForTest({
       enabled: true,
-      processTz: "Asia/Tokyo",
       probeExit: async () => JP,
     });
     await assert.rejects(
@@ -79,7 +76,6 @@ describe("assertClaudeOAuthIdentity", () => {
   test("persona 时区与出口时区不一致 → tz_mismatch", async () => {
     setClaudeIdentityGuardRuntimeForTest({
       enabled: true,
-      processTz: "Asia/Tokyo",
       probeExit: async () => JP,
     });
     await assert.rejects(
@@ -93,7 +89,6 @@ describe("assertClaudeOAuthIdentity", () => {
   test("出口 IP 相对 env 钉漂移 → ip_drift", async () => {
     setClaudeIdentityGuardRuntimeForTest({
       enabled: true,
-      processTz: "Asia/Tokyo",
       pinnedIp: JP.ip,
       probeExit: async () => ({ ...JP, ip: "1.2.3.4" }),
     });
@@ -109,7 +104,6 @@ describe("assertClaudeOAuthIdentity", () => {
     let now = 0;
     setClaudeIdentityGuardRuntimeForTest({
       enabled: true,
-      processTz: "Asia/Tokyo",
       nowMs: () => now,
       probeExit: async () => {
         n += 1;
@@ -128,7 +122,6 @@ describe("assertClaudeOAuthIdentity", () => {
   test("probe 失败且无缓存 → probe_failed，不放行", async () => {
     setClaudeIdentityGuardRuntimeForTest({
       enabled: true,
-      processTz: "Asia/Tokyo",
       probeExit: async () => {
         throw new Error("network down");
       },

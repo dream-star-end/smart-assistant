@@ -15,3 +15,8 @@ describe("attachment total failure code", () => {
     assert.equal(rejectedDispatchFailureCode(over), "ATTACHMENT_TOTAL_EXCEEDED:345649213");
   });
 });
+
+it("idle rejection keeps its bounded remaining interval through the master allowlist", () => {
+  assert.equal(rejectedDispatchFailureCode({ kind: "ok", userFailureCode: "IDLE_RECOVERY_PENDING:7" }), "IDLE_RECOVERY_PENDING:7");
+  assert.equal(rejectedDispatchFailureCode({ kind: "ok", userFailureCode: "IDLE_RECOVERY_PENDING:999" }), "DISPATCH_NOT_ACCEPTED");
+});

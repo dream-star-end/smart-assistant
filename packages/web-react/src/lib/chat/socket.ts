@@ -35,6 +35,7 @@ import {
   AUTO_CONTINUE_PROMPT,
   expireGenPlaceholdersAgainstServerRows,
   normalizeDelegateCards,
+  currentFrameSeqAcceptOrder,
   normalizeGoalCards,
   paintDeferredTerminalError,
   rememberSettledPermissionRequestId,
@@ -67,11 +68,14 @@ import {
 } from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
+  hasPositiveAgentFrameSeqCursor,
   isOpenSnapshotDispatch,
   isSessionSnapshot,
   isSnapshotFenced,
   isTerminalSnapshotDispatch,
   mayClaimSnapshotDispatch,
+  reconcileOpenSnapshotRelayContainer,
+  reconcileSessionRelayContainer,
   rememberTerminalSnapshotDispatch,
   SNAPSHOT_ACK_TIMEOUT_MS,
   SNAPSHOT_MAX_PAGES,
@@ -447,49 +451,8 @@ export type InterruptedContinuationTarget = {
   attempt?: number;
   max?: number;
 };
-
-/** Human feedback for a server-authoritative recovery rejection. Keep the
- * optimistic child disposable, but never make the user's click look inert. */
-export function recoverySkippedNotice(reason?: string): string {
-  switch (reason) {
-    case "source_not_latest":
-      return "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。";
-    case "source_not_recoverable":
-    case "source_tape_completed":
-      return "未从断点继续：服务端没有确认到可恢复的中断断点，原任务仍已保留。";
-    case "completed_replay_forbidden":
-    case "automatic_replay_not_proven":
-    case "source_not_safely_replayable":
-      return "没有重放原请求：服务端无法证明它尚未执行。原任务仍已保留，可从已保存的断点继续。";
-    case "source_tape_malformed":
-      return "没法从保存的进度继续。任务内容还在，请刷新后再试。";
-    case "recovery_mode_mismatch":
-      return "没法从断点继续。这句没有发出去，点重试再发一次。";
-    case "automatic_checkpoint_unsafe":
-      return "自动续跑已跳过。这句没有发出去，请手动从进度继续，或点重试再发一次。";
-    case "automatic_retry_exhausted":
-      return "自动恢复已达到次数上限，原任务仍已保留。请在错误卡上手动重试。";
-    case "capability_unavailable":
-      return "暂时无法从断点继续：当前服务版本不支持这次恢复。原任务仍已保留，请刷新后再试。";
-    case "invalid_lineage":
-    case "identity_mismatch":
-    case "identity_reused":
-    case "automatic_lineage_mismatch":
-    case "automatic_attempt_mismatch":
-      return "未从断点继续：这次恢复请求已经过期或与当前会话不一致。原任务仍已保留，请刷新后再试。";
-    case "INSUFFICIENT_CREDITS":
-    case "ERR_INSUFFICIENT_CREDITS":
-    case "insufficient_credits":
-      return "自动恢复已暂停：账户可用积分不足，原任务仍已保留。请充值后在错误卡上继续。";
-    case "UNAUTHORIZED_MODEL":
-    case "MODEL_NOT_AVAILABLE":
-    case "ERR_MODEL_UNAUTHORIZED":
-    case "antigravity_authority_rejected":
-      return "自动恢复已暂停：当前模型不可用或无权限，原任务仍已保留。请切换模型后继续。";
-    default:
-      return "未从断点继续：服务端安全校验未通过。原任务仍已保留，请刷新后再试。";
-  }
-}
+import { recoverySkippedNotice } from "./recoveryNotices.js";
+export { recoverySkippedNotice } from "./recoveryNotices.js";
 
 function baseTurnRecoveryTarget(
   messages: ChatMessage[],
@@ -953,6 +916,9 @@ export class ChatSocket {
   private readonly wsSnapshotAt = new Map<string, number>();
   /** In-flight cmid the last hello named per session: its snapshot answers for exactly that turn. */
   private readonly helloAskedCmid = new Map<string, string>();
+  private readonly helloSentAt = new Map<string, { at: number; order: number }>();
+  private relayContainerId: number | undefined;
+  private relayContainerBoundOrder = 0;
   private readonly snapshotHttpInFlight = new Set<string>();
   private snapshotWatchTimer: ReturnType<typeof setTimeout> | null = null;
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
@@ -1760,7 +1726,7 @@ export class ChatSocket {
     this.setStatus("连接中…", "connecting");
     this.relayReady = false; // 新连接:relay 未确认,待 sys.relay_ready
     this.masterOwnsAutomaticRecovery = false;
-    this.subscribedSessions.clear();
+    this.subscribedSessions.clear(); this.helloSentAt.clear();
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     const url = `${proto}${location.host}${WS_PATH}`;
     // 鉴权 = Sec-WebSocket-Protocol 子协议 ['bearer', token]（非 ?token= 非 header）。
@@ -1928,7 +1894,7 @@ export class ChatSocket {
       // the prepared generation or send cancel — reconnect + ring replay
       // (or live fanout onto the new socket) delivers outbound.model_switch.prepared.
       this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
-      this.masterOwnsAutomaticRecovery = false;
+      this.masterOwnsAutomaticRecovery = false; this.helloSentAt.clear();
       this.resetControlsForReplay();
       if (this.reconnectInFlightTimer) {
         clearTimeout(this.reconnectInFlightTimer);
@@ -2168,9 +2134,9 @@ export class ChatSocket {
       case "outbound.session_snapshot": {
         const frame = f as OutboundSessionSnapshotWire;
         if (typeof frame.peer?.id === "string" && isSessionSnapshot(frame.snapshot)) {
-          const asked = this.helloAskedCmid.get(frame.peer.id);
-          this.helloAskedCmid.delete(frame.peer.id);
-          void this.applySessionSnapshot(frame.peer.id, frame.snapshot, { via: "ws", requestedAt: Date.now(), asked });
+          const asked = this.helloAskedCmid.get(frame.peer.id); this.helloAskedCmid.delete(frame.peer.id);
+          const sent = this.helloSentAt.get(frame.peer.id); this.helloSentAt.delete(frame.peer.id);
+          void this.applySessionSnapshot(frame.peer.id, frame.snapshot, { via: "ws", requestedAt: sent?.at ?? Date.now(), requestedOrder: sent?.order, asked });
         }
         return;
       }
@@ -2221,8 +2187,7 @@ export class ChatSocket {
           // frameSeq 游标立即归零,否则新生代帧 seq=1..旧游标 被 acceptFrameSeq 当重复帧
           // 黑洞(与 resume_failed no_buffer 同根因;此处覆盖「连接不断、容器中途回收」
           // 没有 hello 仲裁的场景,生产实证见 reducer.resetFrameSeqCursor 注释)。
-          this.noteAuthoritativeAgentFrameSeqResets(sess);
-          resetAgentFrameSeqCursorsForSession(sess);
+          resetAgentFrameSeqCursorsForSession(sess, { onResetKey: (sessionKey) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) });
           this.deps.persistSession?.(sess.id); // 游标变更立即落地(断点续传语义)
         }
         return;
@@ -2288,6 +2253,11 @@ export class ChatSocket {
         // 队列等待;此处一收到就立即排空 → relay 一就绪即投递,不靠 4503 reconnect 反弹的运气/时延。
         const relay = f as RelayReadyWire;
         this.masterOwnsAutomaticRecovery = relay.automaticRecoveryOwner === "master-v1";
+        if (typeof relay.containerId === "number" && Number.isSafeInteger(relay.containerId) && relay.containerId > 0) {
+          this.relayContainerId = relay.containerId;
+          this.relayContainerBoundOrder = currentFrameSeqAcceptOrder();
+          for (const sess of this.sessions.values()) this.reconcileContainerForSession(sess);
+        }
         this.relayReady = true;
         this.kickDispatchPump();
         this.kickControlPump();
@@ -2391,16 +2361,10 @@ export class ChatSocket {
     );
   }
 
-  private noteAuthoritativeAgentFrameSeqResets(sess: ChatSession): void {
-    const byKey = sess._lastFrameSeqByKey;
-    if (!byKey || typeof byKey !== "object") return;
-    const safeId = String(sess.id).replace(/[^a-zA-Z0-9_-]/g, "_");
-    const suffix = `:webchat:dm:${safeId}`;
-    for (const key of Object.keys(byKey)) {
-      if (key.startsWith("agent:") && key.endsWith(suffix)) {
-        this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: key });
-      }
-    }
+  private reconcileContainerForSession(sess: ChatSession): void {
+    const opts = { keepAcceptedAfterOrder: this.relayContainerBoundOrder, onResetKey: (sessionKey: string) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) };
+    if (reconcileSessionRelayContainer(sess, this.relayContainerId, opts).changed) this.deps.persistSession?.(sess.id);
+    else if (this.relayContainerId && sess._frameSeqContainerId === undefined && hasPositiveAgentFrameSeqCursor(sess)) this.armSnapshotWatchdog();
   }
 
   /** Reconcile a server-confirmed duplicate without touching another queued
@@ -3217,8 +3181,10 @@ export class ChatSocket {
     const hello = this.composeHelloFrame(includeInFlight, onlySessionId);
     const sent = this.safeWsSend(hello.data);
     if (!sent) return false;
+    const sentAt = Date.now();
+    const sentOrder = currentFrameSeqAcceptOrder();
     for (const id of hello.sessionIds) {
-      this.subscribedSessions.add(id);
+      this.subscribedSessions.add(id); this.helloSentAt.set(id, { at: sentAt, order: sentOrder });
       const cmid = hello.asked.get(id);
       if (cmid) this.helloAskedCmid.set(id, cmid);
       else this.helloAskedCmid.delete(id);
@@ -3243,7 +3209,7 @@ export class ChatSocket {
   private applySessionSnapshot(
     sessId: string,
     snap: SessionSnapshot,
-    ctx: { via: "ws" | "http"; requestedAt: number; asked?: string },
+    ctx: { via: "ws" | "http"; requestedAt: number; requestedOrder?: number; asked?: string },
   ): Promise<void> {
     const sess = this.sessions.get(sessId);
     if (!sess || snap.sessionId !== sessId) return Promise.resolve();
@@ -3263,7 +3229,7 @@ export class ChatSocket {
         this.scheduleNotify();
         return;
       }
-      const rebuild = snap.gap?.reason === "cursor_reset";
+      const rebuild = snapshotNeedsRebuild(sess, snap, ctx.requestedOrder);
       if (fresh && isOpenSnapshotDispatch(d) && mayClaimSnapshotDispatch(sess, d) && (rebuild || !snapshotIsStale(sess, snap))) {
         if (!this.confirmDispatchAdmission(sessId, d.clientMessageId, d.acceptedAt != null)) {
           this.beginTurn(sess, d.clientMessageId, d.agentId);
@@ -3271,13 +3237,25 @@ export class ChatSocket {
         }
         sess._turnStartedAt = d.since;
       }
-      const pages = isSnapshotFenced(sess, d)
+      const fenced = isSnapshotFenced(sess, d);
+      const pages = fenced
         ? { last: snap, records: [], degraded: false }
         : await this.readSnapshotPages(sess, snap);
       if (!current()) return;
       const running = sess._sendingInFlight ? sess._activeClientMessageId : undefined;
+      const activeKey = d ? safeSessionKeyForAgent(sess.id, d.agentId || "main") : undefined;
+      const cutoff = ctx.requestedOrder ?? 0;
+      const rebuildActive = rebuild && !!d && !!activeKey && (sess._snapshotStream?.streamKey !== pages.last.streamKey || (sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff || !snapshotIsStale(sess, pages.last));
       if (pages.records.length > 0) {
-        this.applyDurableLiveFrames(sessId, pages.records, snapshotNeedsRebuild(sess, snap) && d ? [d.clientMessageId] : []);
+        if (rebuildActive && activeKey) { this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey }); }
+        this.applyDurableLiveFrames(sessId, pages.records, rebuildActive && d ? [d.clientMessageId] : []);
+      } else if (!fenced && rebuild) {
+        if (d && activeKey) {
+          if ((sess._lastAcceptedFrameSeqOrderByKey?.[activeKey] ?? 0) <= cutoff) {
+            this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: activeKey }); resetFrameSeqCursor(sess, { sessionKey: activeKey });
+            this.resetOwnerLocalRows(sess, [d.clientMessageId], new Set());
+          }
+        } else resetAgentFrameSeqCursorsForSession(sess, { keepAcceptedAfterOrder: cutoff, onResetKey: (sessionKey) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) });
       }
       // A final among the frames settles the turn like a live final: one history read for its tape.
       const settled = running && !(sess._sendingInFlight && sess._activeClientMessageId === running) ? running : undefined;
@@ -3288,6 +3266,13 @@ export class ChatSocket {
       if (pages.degraded) sess._liveJournalDegraded = true;
       if (!this.applySnapshotHead(sess, last, fresh, true, ctx.asked) && settled) {
         this.syncHistory(sessId, { clientMessageId: settled });
+      }
+      if (!fenced && this.relayContainerId && this.relayContainerId > 0) {
+        const opts = { keepAcceptedAfterOrder: this.relayContainerBoundOrder, onResetKey: (sessionKey: string) => this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }) };
+        this.reconcileContainerForSession(sess);
+        if (fresh && isOpenSnapshotDispatch(last.dispatch) && !pages.degraded) {
+          reconcileOpenSnapshotRelayContainer(sess, this.relayContainerId, last.dispatch.agentId || "main", opts);
+        }
       }
       this.deps.persistSession?.(sessId);
       this.scheduleNotify();
@@ -3424,6 +3409,7 @@ export class ChatSocket {
     if (!read || !sess || this.snapshotHttpInFlight.has(sessId)) return Promise.resolve(undefined);
     this.snapshotHttpInFlight.add(sessId);
     const requestedAt = Date.now();
+    const requestedOrder = currentFrameSeqAcceptOrder();
     const lifecycle = this.lifecycleEpoch;
     const query: SnapshotQuery = opts.verifyOnly ? { afterSeq: 0, limit: 1 } : snapshotQuery(sess, this.deps.defaultAgentId);
     return Promise.resolve()
@@ -3432,7 +3418,7 @@ export class ChatSocket {
         this.snapshotHttpInFlight.delete(sessId);
         if (lifecycle !== this.lifecycleEpoch) return undefined;
         if (!isSessionSnapshot(snap)) return null;
-        if (!opts.verifyOnly) void this.applySessionSnapshot(sessId, snap, { via: "http", requestedAt, asked: query.dispatch });
+        if (!opts.verifyOnly) void this.applySessionSnapshot(sessId, snap, { via: "http", requestedAt, requestedOrder, asked: query.dispatch });
         return snap;
       }, () => {
         this.snapshotHttpInFlight.delete(sessId);
@@ -3608,7 +3594,7 @@ export class ChatSocket {
     let s = this.sessions.get(sessId);
     if (!s) {
       s = createSession({ id: sessId, agentId, title });
-      this.sessions.set(sessId, s);
+      this.sessions.set(sessId, s); this.reconcileContainerForSession(s);
       this.scheduleNotify();
     }
     return s;
@@ -3766,7 +3752,7 @@ export class ChatSocket {
     this.pendingRecoveryErrors.clear();
     this.reportedProblemCards.clear();
     this.problemCardSourceCodes.clear();
-    this.subscribedSessions.clear();
+    this.subscribedSessions.clear(); this.helloSentAt.clear();
     this.snapshotAckAt.clear();
     this.wsSnapshotAt.clear();
     this.helloAskedCmid.clear();
@@ -3854,6 +3840,7 @@ export class ChatSocket {
       updatedAt: s.updatedAt,
       _lastFrameSeqByKey: s._lastFrameSeqByKey ? { ...s._lastFrameSeqByKey } : undefined,
       _lastFrameSeq: s._lastFrameSeq,
+      ...(typeof s._frameSeqContainerId === "number" && Number.isSafeInteger(s._frameSeqContainerId) && s._frameSeqContainerId > 0 ? { _frameSeqContainerId: s._frameSeqContainerId } : {}),
       ...(s._snapshotStream ? { _snapshotStream: { ...s._snapshotStream } } : {}),
       ...(s._sendingInFlight ? { _sendingInFlight: true } : {}),
       ...(s._sendingInFlight && isClientMessageId(s._activeClientMessageId)
@@ -3955,6 +3942,7 @@ export class ChatSocket {
     s.updatedAt = stored.updatedAt;
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
     s._lastFrameSeq = stored._lastFrameSeq;
+    if (typeof stored._frameSeqContainerId === "number" && Number.isSafeInteger(stored._frameSeqContainerId) && stored._frameSeqContainerId > 0) s._frameSeqContainerId = stored._frameSeqContainerId;
     if (typeof stored._snapshotStream?.streamKey === "string" && typeof stored._snapshotStream.agentId === "string") {
       s._snapshotStream = { ...stored._snapshotStream };
     }
@@ -4040,7 +4028,7 @@ export class ChatSocket {
       repairedStoredOrder = repairedStoredMessages !== s.messages;
       if (repairedStoredOrder) s.messages = repairedStoredMessages;
     }
-    this.sessions.set(stored.id, s);
+    this.sessions.set(stored.id, s); this.reconcileContainerForSession(s);
     this.restoreDeferredTerminalError(s, stored);
     const storedControls = Array.isArray(stored._pendingControls)
       ? stored._pendingControls.filter((item) =>
@@ -4949,7 +4937,7 @@ export class ChatSocket {
         if (typeof sessionKey === "string") resetSessionKeys.add(sessionKey);
       }
       for (const sessionKey of resetSessionKeys) {
-        resetFrameSeqCursor(sess, { sessionKey });
+        this.noteAuthoritativeFrameSeqReset(sess, { sessionKey }); resetFrameSeqCursor(sess, { sessionKey });
       }
       this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromFrames(frames));
     }

@@ -60,7 +60,7 @@ for (const [name, changes] of [
   ['non-split first install', { OC_EGRESS_SPLIT: '0' }],
   ['production dangerous flag despite dev shell', { NODE_ENV: 'development', TURNSTILE_TEST_BYPASS: '1' }],
 ] as Array<[string, Record<string, string | undefined>]>) {
-  test('official bootstrap rejects ' + name, () => {
+  test(`official bootstrap rejects ${name}`, () => {
     const out = run(changes)
     assert.equal(out.status, 79, out.stderr)
     assert.match(out.stderr, /incomplete or invalid/)

@@ -27,6 +27,14 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const artifactHelpers = path.join(root, 'scripts/lib/v5-release-artifacts.sh')
+async function readDeployWithArtifactHelpers(): Promise<string> {
+  const entry = await readFile(deploy, 'utf8')
+  const wire = 'source "$SCRIPT_DIR/lib/v5-release-artifacts.sh"'
+  assert.equal(entry.split(wire).length, 2, 'entry must source the real artifact helper exactly once')
+  return entry.replace(wire, await readFile(artifactHelpers, 'utf8'))
+}
+
 const commercialPolicy = path.join(root, 'scripts/lib/v5-commercial-release-policy.sh')
 const selfhostDeploy = path.join(root, 'scripts/deploy-v5-selfhost.sh')
 const branchPolicy = path.join(root, 'scripts/v5-branch-policy.sh')
@@ -92,7 +100,7 @@ describe('core health polling', () => {
     try {
       await writeFile(path.join(dir, 'clock'), '0')
       await writeFile(path.join(dir, 'calls'), '0')
-      for (const [i, body] of bodies.entries()) await writeFile(path.join(dir, 'body-' + (i + 1)), body)
+      for (const [i, body] of bodies.entries()) await writeFile(path.join(dir, `body-${i + 1}`), body)
       return spawnSync('bash', ['-c', `
 set -eu
 source "$CORE_DEPLOY_SCRIPT"
@@ -1325,7 +1333,7 @@ async function manualOsPgTransport(dir: string, bin: string, deployDelaySeconds 
   const config = path.join(dir, 'os-pg-transport-config.json')
   await writeFile(config, JSON.stringify({ dsns, identitySql, deploySql, receipt, deployDelaySeconds }), { mode: 0o600 })
   await writeFile(receipt, JSON.stringify({ events: [] }), { mode: 0o600 })
-  await writeFile(transport, '#!/usr/bin/python3\n' + String.raw`
+  await writeFile(transport, `#!/usr/bin/python3\n${String.raw`
 import fcntl, json, os, sys, time
 from pathlib import Path
 cfg = json.loads(Path(${JSON.stringify(config)}).read_text())
@@ -1372,7 +1380,7 @@ def complete(state):
     sys.stdout.flush()
     record(state, 'completed')
 transact(complete)
-`, { mode: 0o755 })
+`}`, { mode: 0o755 })
   return { dsns, identitySql, deploySql, receipt, transport }
 }
 
@@ -1447,12 +1455,12 @@ async function manualLeaseFixture(options?: ManualPgTransportOptions) {
   const envFile = path.join(dir, 'v5.env')
   const fixtureUrl = 'postgresql://test:test@127.0.0.1:55432/openclaude_test'
   const pgTransport = options ? await manualOsPgTransport(dir, bin, options.deployDelaySeconds) : undefined
-  await writeFile(envFile, [
+  await writeFile(envFile, `${[
     `DATABASE_URL=${JSON.stringify(pgTransport?.dsns.gateway ?? fixtureUrl)}`,
     `MODEL_AUTHORITY_DEPLOY_DATABASE_URL=${JSON.stringify(pgTransport?.dsns.deploy ?? fixtureUrl)}`,
     `MODEL_CATALOG_ADMIN_DATABASE_URL=${JSON.stringify(pgTransport?.dsns.admin ?? fixtureUrl)}`,
     `OC_EGRESS_SECRET=${JSON.stringify('e'.repeat(32))}`,
-  ].join('\n') + '\n', { mode: 0o600 })
+  ].join('\n')}\n`, { mode: 0o600 })
   const envNeedle = 'V5_ENV="/etc/openclaude/commercial-v5.env"'
   assert.equal(source.split(envNeedle).length - 1, 1, 'manual wrapper env path replacement drifted')
   const helperBytes = await readFile(path.join(root, 'scripts/lib/v5-mutation-admission.sh'))
@@ -3417,7 +3425,7 @@ describe('v5 release safety lanes', () => {
   })
 
   test('strong release markers detect tampering and legacy trust is exact-invocation predecessor only', async () => {
-    const deploySource = await readFile(deploy, 'utf8')
+    const deploySource = await readDeployWithArtifactHelpers()
     assert.match(
       deploySource,
       /write_strong_release_marker_local\(\)[\s\S]*schemaVersion:\$schemaVersion[\s\S]*sourceCommit:\$sourceCommit[\s\S]*metadataSha256:\$metadataSha256[\s\S]*artifactSha256:\$artifactSha256/,
@@ -10685,7 +10693,7 @@ describe('v5 release speedup (B1-B5, C4)', () => {
   })
 
   test('B4: strong marker probe accepts distReuse without reindexing the string context', async () => {
-    const source = await readFile(deploy, 'utf8')
+    const source = await readDeployWithArtifactHelpers()
     const probe = source.slice(
       source.indexOf('\nrelease_marker_probe() {'),
       source.indexOf('\nassert_release_metadata_matches_commit() {'),
@@ -11570,4 +11578,22 @@ describe('v5 versioned baseline manifest', () => {
     assert.match(verify, /release_source_predates_manifest_cutoff/)
     assert.match(verify, /OC_V5_LEGACY_BASELINE_FALLBACK/)
   })
+})
+
+
+test('artifact helper definitions are loaded by the real deploy source-only entry', () => {
+  const ran = spawnSync('bash', ['-c', [
+    'set -euo pipefail',
+    'entry="$1"; set --',
+    'export V5_DEPLOY_SOURCE_ONLY=1',
+    'source "$entry"',
+    'shopt -s extdebug',
+    'declare -F release_artifact_digest release_marker_probe assert_release_marker write_strong_release_marker_local publish_strong_release',
+  ].join('\n'), '--', deploy], {
+    cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+  })
+  assert.equal(ran.status, 0, ran.stderr)
+  const rows = ran.stdout.trim().split('\n')
+  assert.equal(rows.length, 5)
+  for (const row of rows) assert.equal(row.split(' ').slice(2).join(' '), artifactHelpers, row)
 })

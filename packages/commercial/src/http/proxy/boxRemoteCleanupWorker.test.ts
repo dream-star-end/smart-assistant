@@ -761,8 +761,8 @@ function realRunDirs(terminal: boolean) {
   const proof = `/tmp/ocv5-289-proof-${nonce}`;
   mkdirSync(run, { mode: 0o700 });
   mkdirSync(proof, { mode: 0o700 });
-  writeFileSync(`${proof}/stop.ready`, "not json" + NL, { mode: 0o600 });
-  if (terminal) writeFileSync(`${proof}/terminal.json`, "{}" + NL, { mode: 0o644 });
+  writeFileSync(`${proof}/stop.ready`, `not json${NL}`, { mode: 0o600 });
+  if (terminal) writeFileSync(`${proof}/terminal.json`, `{}${NL}`, { mode: 0o644 });
   return { nonce, proof, remove: () => {
     rmSync(run, { recursive: true, force: true });
     rmSync(proof, { recursive: true, force: true });
@@ -875,7 +875,7 @@ test("a stop.ready exit 125 does not block two real absences, and one absence st
 
 test("a live process stays pending when terminal.json only stats and stop.ready is not a handshake", async () => {
   const dirs = realRunDirs(true);
-  const keeper = spawn("/usr/bin/python3", ["-I", "-c", "import time" + NL + "while True:time.sleep(.1)",
+  const keeper = spawn("/usr/bin/python3", ["-I", "-c", `import time${NL}while True:time.sleep(.1)`,
     "--proof-dir", dirs.proof], { cwd: "/tmp", stdio: "ignore" });
   const store: { seen: AbsenceMark } = { seen: { v: 1, atMs: 1,
     boot: "0f2c5d1e-1111-4222-8333-444455556666" } };
@@ -909,7 +909,7 @@ test("a restarted worker closes immediately when the persisted absence boot chan
   const worker = new BoxRemoteCleanupWorker({
     holds: {
       recordRunAbsence: async (args: { boot: string }) => {
-        sequence.push("record:" + args.boot);
+        sequence.push(`record:${args.boot}`);
         const prior = store.seen;
         if (!store.seen) store.seen = { v: 1, atMs: 1, boot: args.boot };
         return prior;
@@ -938,7 +938,7 @@ test("a restarted worker closes immediately when the persisted absence boot chan
         throw Object.assign(new Error("BOX_EXEC_REMOTE_EXIT"), { code: "BOX_EXEC_REMOTE_EXIT" });
       }
       look++;
-      return { stdout: "absent " + other + NL, stderrBytes: 0, exitCode: 0 as const };
+      return { stdout: `absent ${other}${NL}`, stderrBytes: 0, exitCode: 0 as const };
     } }, dispose: async () => { sequence.push("dispose"); } }) as never } as never,
   });
   assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
@@ -947,7 +947,7 @@ test("a restarted worker closes immediately when the persisted absence boot chan
   assert.equal((closes[0] as { absence: { boot: string } }).absence.boot, other);
   assert.deepEqual(released, [{ requestId: "box-parked", accountId: 79n,
     shape: "unbilled_leaf", rebooted: true }]);
-  assert.equal(sequence[0], "record:" + other);
+  assert.equal(sequence[0], `record:${other}`);
 });
 
 function provedRunDirs() {
@@ -1084,10 +1084,10 @@ test("an unreadable liveness probe stays pending and is logged apart from alive 
     assert.deepEqual(await failed.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
     assert.deepEqual(failed.closes, []);
     assert.deepEqual(logs.lines().map((line) => line.outcome), ["probe_failed"]);
-    const alive = absentWorker({ prior: { v: 1, atMs: 1, boot: BOOT }, looks: ["alive " + BOOT + NL] });
+    const alive = absentWorker({ prior: { v: 1, atMs: 1, boot: BOOT }, looks: [`alive ${BOOT}${NL}`] });
     assert.deepEqual(await alive.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
     assert.equal(logs.lines().at(-1)?.outcome, "alive");
-    const once = absentWorker({ looks: ["absent " + BOOT + NL] });
+    const once = absentWorker({ looks: [`absent ${BOOT}${NL}`] });
     assert.deepEqual(await once.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
     assert.deepEqual(once.closes, []);
     assert.equal(logs.lines().at(-1)?.outcome, "absent");

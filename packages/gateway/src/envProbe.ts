@@ -10,10 +10,9 @@
  *   - 不读 HOME、不读 CLAUDE.md(自用实例的基线文件也会自称商业版容器)
  *   - Cursor 引擎会掏空 OC_USER_ID;gateway 进程 env 是权威,缺项才从
  *     /proc/1/environ 回填白名单键
- *   - 用户面时区(OCV5-166):`OC_USER_TZ` 与出口对齐的 `OPENCLAUDE_CCB_TZ`/`TZ`
- *     **正交**。引擎子进程的 `date` 报的是出口时区(风控一致性控制,刻意≠用户所在地),
- *     这里只到日期粒度给出用户时区 + 偏移,让模型不必每轮跑 `date` 再手工换算。
- *     只写时区名与偏移、不写时刻:ENV slot 落在 system prompt 缓存前缀里。
+ *   - 用户面时区(OCV5-166 / OCV5-754):所有引擎统一读取 `OC_USER_TZ`(不按 provider
+ *     覆盖成出口时区)。这里只到日期粒度给出用户时区 + 偏移,让模型不必每轮跑 `date`
+ *     再手工换算。只写时区名与偏移、不写时刻:ENV slot 落在 system prompt 缓存前缀里。
  */
 import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, readSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -49,14 +48,7 @@ const INIT_ENV_KEYS = [
 /** 用户面时区缺省。与 deploy 模板 `OC_USER_TZ` 及 commercial platformEnvelopeBuilder 的缺省一致。 */
 export const DEFAULT_USER_TZ = 'Asia/Shanghai'
 
-/** CCB extra-prompt 跟 18991 出口对齐；与 OC_USER_TZ 正交。 */
-export const DEFAULT_CCB_EGRESS_TZ = 'Asia/Tokyo'
-
-const CCB_PROMPT_PROVIDERS = new Set(['ccb', 'claude-subscription'])
-
-export function isCcbPromptProvider(provider?: string): boolean {
-  return provider != null && CCB_PROMPT_PROVIDERS.has(provider)
-}
+// OCV5-754: all engines unify on OC_USER_TZ (facts.userTz); no CCB-specific timezone override.
 
 export type EnvInstance = 'v5-selfhost' | 'v5-commercial' | 'personal-legacy'
 
@@ -358,17 +350,13 @@ export function renderEnvSlot(
   facts: EnvFacts,
   agentId: string,
   now: Date = new Date(),
-  opts?: { provider?: string; env?: NodeJS.ProcessEnv },
+  _opts?: { provider?: string; env?: NodeJS.ProcessEnv },
 ): EnvPromptSlot | null {
   if (factsAreEmpty(facts) && !sanitizeAgentId(agentId)) return null
   if (factsAreEmpty(facts)) return null
-  // CCB extra-prompt 走出口时区,避免 Anthropic 看到 OC_USER_TZ=Asia/Shanghai。
-  // Grok/Cursor 仍用 facts.userTz(OC_USER_TZ)。facts 缓存不按 provider 分叉。
-  const slotTz = isCcbPromptProvider(opts?.provider)
-    ? (sanitizeTimeZone(opts?.env?.OPENCLAUDE_CCB_TZ) ?? DEFAULT_CCB_EGRESS_TZ)
-    : facts.userTz
+  const slotTz = facts.userTz
   // 偏移现算:facts 是进程级缓存,DST 时区的偏移不能跟着 uid/路径一起被冻住。
-  const userTzOffset = formatUtcOffset(slotTz, now) ?? (slotTz === facts.userTz ? facts.userTzOffset : null)
+  const userTzOffset = formatUtcOffset(slotTz, now) ?? facts.userTzOffset
 
   const lines: string[] = ['# Env · 勿重探']
   const ids: string[] = []
@@ -421,10 +409,8 @@ export function buildEnvSlot(
 ): EnvPromptSlot | null {
   try {
     const facts = deps ? computeEnvFacts(deps) : probeEnvFacts()
-    const env = deps?.env ?? process.env
     return renderEnvSlot(facts, ctx.agentId, deps?.now ?? new Date(), {
       provider: ctx.provider,
-      env,
     })
   } catch {
     return null

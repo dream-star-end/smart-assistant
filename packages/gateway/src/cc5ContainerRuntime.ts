@@ -139,7 +139,7 @@ export interface RemoteLanePlacement {
   readonly profileId?: string
 }
 export interface RemoteLaneRequest {
-  readonly engine?: 'ccb' | 'codex'
+  readonly engine?: 'ccb' | 'codex' | 'antigravity'
   readonly uid: number
   readonly containerDbId: string
   readonly sessionKey: string
@@ -346,8 +346,8 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       !lane.creationFailed && !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
       lane.binding.expiresAt > Date.now() &&
       (lane.binding.version === 4
-        ? lane.binding.authorityEngine === (request.engine === 'codex' ? 'codex' : 'ccb')
-        : (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1'))
+        ? lane.binding.authorityEngine === (request.engine ?? 'ccb')
+        : request.engine !== 'antigravity' && (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1'))
     // A resident lane answers without waiting; anything else is decided on the chat's tail.
     let lane = owner.lane
     if (!live(lane)) {
@@ -452,6 +452,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     placement: RemoteLanePlacement): Promise<Lane> {
     if (placement.v4) return this.startDriverV4Lane(container, request, placement)
     if (request.engine === 'codex') return this.startCodexLane(container, request, placement)
+    requireLane(request.engine !== 'antigravity')
     let lane: Lane | undefined
     try {
     requireLane(!placement.codex)
@@ -503,7 +504,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       // A stale cached catalog replaces the remote without re-running task provisioning.
       replaceHost: () => createHost(hostConfig),
     })
-    const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation ?? '1'}`, relay)
+    const unregisterDrain = this.bindRelayDrainAndAutoStop(
+      request.sessionKey,
+      `${placement.operationId}:${placement.generation ?? '1'}`,
+      relay,
+      () => lane,
+    )
     lane = current = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
       operationId: placement.operationId, profileId: placement.profileId, generation: placement.generation ?? '1', dir, view, binding, relay,
       unregisterDrain, lastUsedAt: Date.now() }
@@ -553,7 +559,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     const relay = new CodexRemoteRelay(binding,container.keyring,host,spec,join(dir,'journal'),finance,
       id => this.hooks.onNativeThread!(placement.operationId,placement.generation!,id),
       () => this.hooks.onRemoteStart!(placement.operationId,placement.generation!))
-    const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation}`, relay)
+    const unregisterDrain = this.bindRelayDrainAndAutoStop(
+      request.sessionKey,
+      `${placement.operationId}:${placement.generation}`,
+      relay,
+      () => lane,
+    )
     lane = { container,sessionKey:request.sessionKey,canonicalModel:request.canonicalModel,operationId:placement.operationId,
       profileId:placement.profileId,generation:placement.generation,dir,view,binding,relay,unregisterDrain,lastUsedAt:Date.now() }
     writePrivate(join(view,'binding.json'),binding,true)
@@ -586,7 +597,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       const dir = join(this.options.evidenceRoot ?? join(this.options.baseRoot, 'evidence'), placement.operationId, placement.generation)
       requireLane(!existsSync(dir) && !existsSync(view))
       const host = v4.spec.manifest.root.startsWith('/tmp/oc-drvtest-')
-        ? RemotePoolSshHost.forLocalSandbox(v4.spec)
+        ? RemotePoolSshHost.forLocalSandbox(v4.spec, {
+            ...(process.env.OC_REMOTE_RESOURCE_ROOT ? { OC_REMOTE_RESOURCE_ROOT: process.env.OC_REMOTE_RESOURCE_ROOT } : {}),
+            ...(process.env.OC_REMOTE_TEST_FAKE_SYSTEMD_DIR ? { OC_REMOTE_TEST_FAKE_SYSTEMD_DIR: process.env.OC_REMOTE_TEST_FAKE_SYSTEMD_DIR } : {}),
+            ...(process.env.OC_REMOTE_NODE_MEMORY_BUDGET ? { OC_REMOTE_NODE_MEMORY_BUDGET: process.env.OC_REMOTE_NODE_MEMORY_BUDGET } : {}),
+            ...(process.env.OC_REMOTE_TEST_MEM_AVAILABLE_BYTES ? { OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: process.env.OC_REMOTE_TEST_MEM_AVAILABLE_BYTES } : {}),
+          })
         : RemotePoolSshHost.forSshTarget(v4.sshTarget, v4.spec)
       const preflight = await host.preflight()
       if (!preflight.memoryOk) throw nodeMemoryError(preflight.activeSessions, preflight.code)
@@ -605,7 +621,12 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         onNativeSession: (id) => this.hooks.onNativeThread!(placement.operationId, placement.generation!, id, true),
         onRemoteStart: () => this.hooks.onRemoteStart!(placement.operationId, placement.generation!, true),
       })
-      const unregisterDrain = this.hooks.registerDrainRelay?.(`${placement.operationId}:${placement.generation}`, relay)
+      const unregisterDrain = this.bindRelayDrainAndAutoStop(
+        request.sessionKey,
+        `${placement.operationId}:${placement.generation}`,
+        relay,
+        () => lane,
+      )
       lane = { container, sessionKey: request.sessionKey, canonicalModel: request.canonicalModel,
         operationId: placement.operationId, profileId: placement.profileId, generation: placement.generation,
         dir, view, binding: v4.binding, relay, isV4: true, unregisterDrain, lastUsedAt: Date.now() }
@@ -621,6 +642,103 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
         try { await this.hooks.onState?.(placement.operationId, 'released', placement.generation, true) } catch { /* durable no-effect CAS permits recovery */ }
       }
       throw error
+    }
+  }
+
+  /**
+   * Ensures a lane stopped directly by the container over `relay.sock` (`/stop` + `/tool/stopped`)
+   * immediately stops blocking `RemoteReleaseDrainCoordinator`, and schedules serialized `stopLane`
+   * cleanup after any in-flight `/stop` HTTP response flushes so `unregisterDrain` + PG `'released'`
+   * happen without waiting for a future turn on the same chat.
+   */
+  private bindRelayDrainAndAutoStop(
+    sessionKey: string,
+    drainId: string,
+    relay: Lane['relay'],
+    getLane: () => Lane | undefined,
+  ): (() => void) | undefined {
+    let stopProven = false
+    let activeStopHttp = 0
+    let stopRequestedByClient = false
+    let cleanupScheduled = false
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+    const clearGraceTimer = (): void => {
+      if (!graceTimer) return
+      clearTimeout(graceTimer)
+      graceTimer = undefined
+    }
+    const scheduleCleanup = (): void => {
+      if (cleanupScheduled || activeStopHttp > 0) return
+      cleanupScheduled = true
+      clearGraceTimer()
+      setImmediate(() => {
+        if (activeStopHttp > 0) {
+          cleanupScheduled = false
+          return
+        }
+        const owner = this.chats.get(sessionKey)
+        const target = getLane()
+        if (!owner || !target) {
+          cleanupScheduled = false
+          return
+        }
+        void this.serial(owner, async () => {
+          if (activeStopHttp > 0) {
+            cleanupScheduled = false
+            return
+          }
+          if (owner.lane !== target || target.stopping) return
+          try {
+            await this.stopLane(target)
+            if (owner.lane === target) owner.lane = undefined
+          } catch {
+            cleanupScheduled = false
+            // Retain unproved lane on owner for subsequent retry/release.
+          }
+        })
+      })
+    }
+    relay.controlServer.on('request', (req, res) => {
+      if (req.url !== '/stop' && req.url !== '/tool/stopped') return
+      if (req.url === '/stop') stopRequestedByClient = true
+      clearGraceTimer()
+      activeStopHttp += 1
+      let doneCalled = false
+      const done = (): void => {
+        if (doneCalled) return
+        doneCalled = true
+        activeStopHttp = Math.max(0, activeStopHttp - 1)
+        if (stopProven && activeStopHttp === 0) {
+          scheduleCleanup()
+        }
+      }
+      res.once('finish', done)
+      res.once('close', done)
+    })
+    const rawStop = relay.stop.bind(relay)
+    ;(relay as { stop: Lane['relay']['stop'] }).stop = () =>
+      rawStop().then((res) => {
+        if (res.remoteStopped === true) {
+          stopProven = true
+          if (activeStopHttp === 0) {
+            if (stopRequestedByClient) {
+              scheduleCleanup()
+            } else if (!cleanupScheduled && !graceTimer) {
+              graceTimer = setTimeout(scheduleCleanup, 250)
+              graceTimer.unref()
+            }
+          }
+        }
+        return res
+      })
+    const rawUnregister = this.hooks.registerDrainRelay?.(drainId, {
+      get idle(): boolean {
+        return relay.idle || stopProven
+      },
+    })
+    return () => {
+      clearGraceTimer()
+      rawUnregister?.()
     }
   }
 
@@ -642,8 +760,14 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
       requireLane(proven)
       for (const server of [lane.relay.controlServer, 'toolServer' in lane.relay ? lane.relay.toolServer : undefined]) {
         if (!server?.listening) continue
-        server.closeAllConnections()
-        await new Promise<void>((resolve) => server.close(() => resolve()))
+        server.closeIdleConnections()
+        const forceTimer = setTimeout(() => server.closeAllConnections(), 200)
+        forceTimer.unref()
+        try {
+          await new Promise<void>((resolve) => server.close(() => resolve()))
+        } finally {
+          clearTimeout(forceTimer)
+        }
       }
       rmSync(lane.view, { recursive: true, force: true })
       // An unproved stop retains its control endpoint for late local proof.

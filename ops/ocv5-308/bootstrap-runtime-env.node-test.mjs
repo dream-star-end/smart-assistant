@@ -25,7 +25,7 @@ function run(change = {}, mode = 0o600, corruptDigest = false) {
   try {
     const bin = path.join(dir, "bin"); mkdirSync(bin);
     const fakeSsh = path.join(bin, "ssh");
-    writeFileSync(fakeSsh, [
+    writeFileSync(fakeSsh, `${[
       "#!/bin/bash", "set -e",
       'while [[ "$1" == -o ]]; do shift 2; done',
       '[[ "$1" == offline-bootstrap ]] || exit 99',
@@ -38,25 +38,25 @@ function run(change = {}, mode = 0o600, corruptDigest = false) {
       '  exec "$@"',
       "fi",
       'exec bash -c "$1" 2> >(tee -a "$OC_BOOTSTRAP_PHASE_LOG" >&2)',
-    ].join("\n") + "\n"); chmodSync(fakeSsh, 0o755);
+    ].join("\n")}\n`); chmodSync(fakeSsh, 0o755);
     const values = { ...base, ...change };
     const envFile = path.join(dir, "v5.env");
-    writeFileSync(envFile, Object.entries(values).filter(([,v]) => v !== undefined)
-      .map(([k,v]) => k + "=" + JSON.stringify(v)).join("\n") + "\n", { mode });
+    writeFileSync(envFile, `${Object.entries(values).filter(([,v]) => v !== undefined)
+      .map(([k,v]) => `${k}=${JSON.stringify(v)}`).join("\n")}\n`, { mode });
     const effect = path.join(dir, "installed");
     const observed = path.join(dir, "proof-observed.json");
     const lock = path.join(dir, "mutation.lock");
     const script = [
       "V5_DEPLOY_SOURCE_ONLY=1 source scripts/deploy-v5.sh",
       "set -e",
-      "V5_ENV=" + JSON.stringify(envFile),
+      `V5_ENV=${JSON.stringify(envFile)}`,
       "MODE=bootstrap",
       "trap 'release_production_mutation_lease >/dev/null 2>&1 || true' EXIT",
       "acquire_production_mutation_lease 3",
       "install_v5_slot_units() {",
-      "  flock -n " + JSON.stringify(lock) + " true && exit 98",
-      "  cp " + JSON.stringify(lock + ".admission-nonce.db") + " " + JSON.stringify(observed),
-      "  : >" + JSON.stringify(effect),
+      `  flock -n ${JSON.stringify(lock)} true && exit 98`,
+      `  cp ${JSON.stringify(`${lock}.admission-nonce.db`)} ${JSON.stringify(observed)}`,
+      `  : >${JSON.stringify(effect)}`,
       "  exit 0",
       "}",
       "bootstrap",
@@ -64,7 +64,7 @@ function run(change = {}, mode = 0o600, corruptDigest = false) {
     const out = spawnSync("bash", ["-c", script], {
       cwd: root, encoding: "utf8", timeout: 35_000,
       env: {
-        PATH: bin + ":" + process.env.PATH, HOME: process.env.HOME,
+        PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME,
         KL_HOST: "offline-bootstrap", ALLOW_ANY_BRANCH: "1",
         OC_V5_PRODUCTION_MUTATION_LOCK: lock,
         OC_V5_MUTATION_LEASE_TTL_SECONDS: "60",
@@ -82,7 +82,7 @@ function run(change = {}, mode = 0o600, corruptDigest = false) {
 }
 test("official bootstrap reaches first effect after real root holder + PG admission + complete config", () => {
   const out = run();
-  assert.equal(out.status, 0, out.stderr + "\n" + out.stdout);
+  assert.equal(out.status, 0, `${out.stderr}\n${out.stdout}`);
   assert.equal(out.effects, true);
   assert.equal(out.proof.schema, 1);
   assert.match(out.proof.nonce, /^[0-9a-f]{32}$/);
@@ -96,7 +96,7 @@ for (const [name, changes] of [
   ["missing split control", { INTERNAL_CONTROL_PORT: undefined }],
   ["dangerous flag under dev shell", { NODE_ENV: "development", TURNSTILE_TEST_BYPASS: "1" }],
 ]) {
-  test("official bootstrap rejects " + name + " before first install/rsync effect", () => {
+  test(`official bootstrap rejects ${name} before first install/rsync effect`, () => {
     const out = run(changes);
     assert.notEqual(out.status, 0, out.stdout);
     assert.equal(out.effects, false);

@@ -12,19 +12,37 @@ import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
  *   home/.gemini/antigravity-cli/bin            helpers the CLI extracts on
  *       first run (a 16 MB webm_encoder); shared so each launch does not.
  *   cache/                                     XDG_CACHE_HOME (fontconfig/mesa).
- *   launch/<random>/                           per-launch HOME. settings.json,
- *       config/mcp_config.json and the limited OAuth token file live here, so
- *       a concurrent turn of another session cannot retarget this process's
- *       MCP env or credential before it spawns.
+ *   launch/s-<sessionHash>/                per-session deterministic HOME (or
+ *       launch/r-<random>/ when concurrently occupied or sticky mode is off).
+ *       settings.json, config/mcp_config.json and the limited OAuth token file
+ *       live here and are removed on turn cleanup, keeping `$HOME` paths in the
+ *       CLI's `systemInstruction` byte-identical across sequential turns while
+ *       isolating concurrent turns.
  *
  * Behaviour pinned from the 1.3.4 binary (docs/ocv5-415-antigravity-cli.md):
  * MCP is read only from `$HOME/.gemini/config/mcp_config.json` (no CLI flag);
  * MCP tools are lazy and reached through native `call_mcp_tool`; settings.json
  * keeps unknown keys but the CLI rewrites the file on start.
  */
-import { randomBytes } from 'node:crypto'
-import { chmodSync, lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { isAbsolute, join } from 'node:path'
+import Database from 'better-sqlite3'
 import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
 
 import { paths } from '@openclaude/storage'
@@ -33,6 +51,21 @@ import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 import { PLATFORM_MEMORY_MCP_TOOLS } from './platformMemoryMcpTools.js'
 
 export const ANTIGRAVITY_MCP_SERVER = 'openclaude-memory'
+/** MCP per-call timeout in seconds (`mcp_config.json` defaults to 180s without this). */
+export const ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC = 3600
+/** High-frequency tools pre-registered eagerly so >10 KB outputs return inline head/tail instead of 0-byte file stubs. */
+export const ANTIGRAVITY_EAGER_MCP_TOOLS = [
+  'oc_bash',
+  'oc_grep',
+  'oc_glob',
+  'delegate_task',
+  'skill_search',
+  'skill_view',
+] as const
+
+const SUMMARY_CACHE_FILES = ['conversation_summaries.db', 'jetbox_summaries_proto.pb'] as const
+const SUMMARY_CACHE_MAX_BYTES = 64 * 1024 * 1024
+const SQLITE_HEADER_MAGIC = 'SQLite format 3\0'
 
 export const ANTIGRAVITY_MEMORY_MCP_TOOLS = PLATFORM_MEMORY_MCP_TOOLS
 
@@ -46,23 +79,33 @@ higher-priority platform guidance while answering the current turn.
 Your actual Antigravity native tool list and MCP server list are authoritative.
 Descriptions in the platform context may mention tools from another backend;
 do not claim or call a tool unless it is present in your current tool list.
-OpenClaude platform tools are on the MCP server \`${ANTIGRAVITY_MCP_SERVER}\`; call
-them with \`call_mcp_tool\` (ServerName \`${ANTIGRAVITY_MCP_SERVER}\`).
+OpenClaude platform tools are on the MCP server \`${ANTIGRAVITY_MCP_SERVER}\`.
 
-Those tools are lazy. Call them directly with \`call_mcp_tool\` (ServerName
-\`${ANTIGRAVITY_MCP_SERVER}\`, ToolName, Arguments). Do not spend a turn reading
-\`mcp/<server>/<tool>.json\` when the signature below is enough.
+High-frequency tools below are pre-registered eagerly as native tools
+(\`mcp_${ANTIGRAVITY_MCP_SERVER}_<tool>\`, e.g. \`mcp_${ANTIGRAVITY_MCP_SERVER}_oc_bash\`);
+call those eager tools directly. Remaining \`${ANTIGRAVITY_MCP_SERVER}\` tools are lazy;
+call them directly with \`call_mcp_tool\` (ServerName \`${ANTIGRAVITY_MCP_SERVER}\`,
+ToolName, Arguments) without spending a turn reading \`mcp/<server>/<tool>.json\`
+when the signature is known.
 
 High-frequency tools (Arguments object):
 - \`oc_bash\`: \`{command, cwd?, timeout_ms?}\`. Default timeout 60000 ms, maximum
-  170000. Use this when a command may run longer than a few seconds. Do not use
-  native \`run_command\` \`WaitMsBeforeAsync\` for that: its foreground wait is
-  hard-capped at 10000 ms, then the command is backgrounded and the turn stops.
+  600000. Use \`oc_bash\` synchronously when a command may run longer than a few
+  seconds. Never use native \`run_command\` \`WaitMsBeforeAsync\` plus \`manage_task\`
+  polling loops for that: native \`run_command\` foreground wait is hard-capped at
+  10000 ms, then backgrounds the command.
 - \`oc_grep\`: \`{pattern, path?, glob?, max_matches?}\` searches file contents.
 - \`oc_glob\`: \`{pattern, path?, max_results?}\` finds files by name.
 - \`delegate_task\`: \`{goal, agentId?, model?, allowSelf?}\`. \`goal\` is the only
   required field.
 - \`skill_search\` then \`skill_view\`: search by query, then view one skill by name.
+
+Batch independent read-only calls (\`read_file\`, \`oc_grep\`, \`oc_glob\`, \`skill_view\`,
+and read-only checks) in parallel within the same turn instead of issuing one
+tool call per turn. Prefer native \`read_file\`, \`oc_grep\`, and \`oc_glob\` over
+\`oc_bash\` (\`cat\`/\`sed\`/\`head\`/\`grep\`/\`find\`) for container-readable files, and
+filter large JSON or log command outputs at the source (\`jq\`, \`head\`, \`tail\`,
+\`--stat\`) to avoid context bloat.
 
 Do not write CLI brain or artifact files unless the user asked for a file.
 Do not wrap ordinary code symbols in \`file://\` links.
@@ -208,118 +251,528 @@ function linkShared(target: string, link: string): void {
   }
 }
 
-export function projectAntigravityPlatform(
-  input: AntigravityPlatformInput,
-): AntigravityPlatformProjection {
-  const root = antigravityRoot()
-  const stable = antigravityStableCliDir(root)
-  const cacheDir = privateDir(join(root, 'cache'))
-  const launchHome = privateDir(join(root, 'launch', randomBytes(8).toString('hex')))
-  // Commercial turns pass no hostBin and keep the sandboxed PATH.
-  const hostPathDir = projectHostPathDir(launchHome, input.hostBin)
-  const cliDir = privateDir(join(launchHome, '.gemini', 'antigravity-cli'))
-  const configDir = privateDir(join(launchHome, '.gemini', 'config'))
-  linkShared(join(stable, 'conversations'), join(cliDir, 'conversations'))
-  linkShared(join(stable, 'bin'), join(cliDir, 'bin'))
-
-  // Google-account mode: no modelProvider override. The CLI reads this token
-  // file when no keyring is reachable; it only runs the userinfo eligibility
-  // check with it. Every Cloud Code call goes to CLOUD_CODE_URL (the relay),
-  // which swaps in the account's real token. refresh_token stays empty, so the
-  // file claims a lifetime longer than any turn (see ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS).
-  const cliTokenFileExpiry = antigravityCliTokenFileExpiry(input.credential.accessTokenExpiresAt)
-  writePrivate(join(cliDir, 'settings.json'), `${JSON.stringify({}, null, 2)}\n`)
-  writePrivate(
-    join(cliDir, 'antigravity-oauth-token'),
-    `${JSON.stringify({
-      token: {
-        access_token: input.credential.accessToken,
-        token_type: 'Bearer',
-        refresh_token: '',
-        expiry: cliTokenFileExpiry,
-      },
-      auth_method: 'consumer',
-      ...(input.credential.idToken ? { id_token: input.credential.idToken } : {}),
-    })}\n`,
-  )
-
-  const advertisedMcpTools: string[] = []
-  let delegateContextFile: string | null = null
-  const servers: Record<string, unknown> = {}
-  const mcpLaunch = resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
-  if (mcpLaunch && input.gatewayToken) {
-    const tokenFile = join(launchHome, 'gateway-token')
-    delegateContextFile = join(launchHome, 'delegate-context')
-    writePrivate(tokenFile, input.gatewayToken)
-    writePrivate(
-      delegateContextFile,
-      `${issueParentCallerToken({
-        agentId: input.agentId,
-        sessionKey: input.sessionKey,
-        traceId: input.traceId,
-        depth: input.delegationDepth,
-        consultTurn: input.consultTurn,
-      })}\n`,
-    )
-    servers[ANTIGRAVITY_MCP_SERVER] = {
-      command: mcpLaunch.command,
-      args: [...mcpLaunch.args],
-      env: {
-        ...delegateMcpBudgetEnvironment(),
-        OPENCLAUDE_AGENT_ID: input.agentId,
-        OC_AGENT_ID: input.agentId,
-        ...identityCompatEnvironment(input.identityCompat),
-        ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
-        OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME?.trim() || paths.home,
-        OPENCLAUDE_SESSION_KEY: input.sessionKey,
-        ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
-      OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
-        OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
-        OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
-        OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
-        OPENCLAUDE_ENGINE: 'antigravity',
-        ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
-          ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
-          : {}),
-        ...(input.skillEvalMode ? { OPENCLAUDE_SKILL_EVAL_MODE: '1' } : {}),
-        ...(input.skillEvalExclude
-          ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: input.skillEvalExclude }
-          : {}),
-        ...(input.skillEvalDraft
-          ? {
-              OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: input.skillEvalDraft.name,
-              OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: input.skillEvalDraft.dir,
-            }
-          : {}),
-        ...(input.skillTrainRunId ? { OPENCLAUDE_SKILL_TRAIN_RUN_ID: input.skillTrainRunId } : {}),
-      },
+function readBoundedRegularFile(
+  src: string,
+  opts: { requireSqliteHeader: boolean; maxBytes?: number },
+): Buffer | null {
+  let fd: number | null = null
+  const cap = opts.maxBytes ?? SUMMARY_CACHE_MAX_BYTES
+  try {
+    const flags =
+      fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0) |
+      (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0)
+    fd = openSync(src, flags)
+    const st = fstatSync(fd)
+    if (!st.isFile() || st.size <= 0 || st.size > cap) return null
+    if (opts.requireSqliteHeader && st.size < 16) return null
+    const buf = Buffer.allocUnsafe(st.size)
+    let offset = 0
+    while (offset < st.size) {
+      const n = readSync(fd, buf, offset, st.size - offset, offset)
+      if (n <= 0) break
+      offset += n
     }
-    advertisedMcpTools.push(...ANTIGRAVITY_MEMORY_MCP_TOOLS)
-  }
-  writePrivate(
-    join(configDir, 'mcp_config.json'),
-    `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
-  )
-  return {
-    root,
-    launchHome,
-    hostPathDir,
-    cacheDir,
-    advertisedMcpTools,
-    delegateContextFile,
-    cliTokenFileExpiry,
+    const data = offset === st.size ? buf : buf.subarray(0, offset)
+    if (data.length <= 0) return null
+    if (opts.requireSqliteHeader && (data.length < 16 || data.subarray(0, 16).toString('latin1') !== SQLITE_HEADER_MAGIC)) {
+      return null
+    }
+    return data
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
   }
 }
 
-/** Remove one launch HOME. Never follows the shared symlinks. */
+function writePrivateBytes(filePath: string, data: Buffer): void {
+  writeFileSync(filePath, data, { mode: 0o600 })
+  chmodSync(filePath, 0o600)
+}
+
+/**
+ * Copy-seed CLI summary caches from stable storage into the private launch HOME.
+ * Without this, every turn starts with an empty summary store (`trigger=empty_on_open`)
+ * and scans every shared `<uuid>.db` (~17-22s across ~190 conversations). Each
+ * launch gets an independent file copy so concurrent turns never contend on SQLite locks.
+ */
+function seedAntigravitySummaryCache(stableCliDir: string, launchCliDir: string): void {
+  for (const name of SUMMARY_CACHE_FILES) {
+    const data = readBoundedRegularFile(join(stableCliDir, name), {
+      requireSqliteHeader: name.endsWith('.db'),
+    })
+    if (!data) continue
+    try {
+      writePrivateBytes(join(launchCliDir, name), data)
+    } catch {
+      // Best-effort cache seed; CLI rebuilds summaries from conversations/ if absent.
+    }
+  }
+}
+
+function checkpointSqliteWalIfPresent(dbPath: string): boolean {
+  const walPath = `${dbPath}-wal`
+  try {
+    if (!existsSync(walPath)) return true
+    const walStat = lstatSync(walPath)
+    if (!walStat.isFile()) return false
+    if (walStat.size === 0) return true
+    const dbStat = lstatSync(dbPath)
+    if (!dbStat.isFile() || dbStat.size <= 0 || dbStat.size > SUMMARY_CACHE_MAX_BYTES) return false
+    const db = new Database(dbPath, { fileMustExist: true, timeout: 1000 })
+    let rows: Array<{ busy?: unknown; log?: unknown; checkpointed?: unknown }>
+    try {
+      rows = db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy?: unknown; log?: unknown; checkpointed?: unknown }>
+    } finally {
+      db.close()
+    }
+    const row = Array.isArray(rows) ? rows[0] : undefined
+    if (!row || row.busy !== 0) return false
+    if (typeof row.log !== 'number' || typeof row.checkpointed !== 'number') return false
+    if (row.log >= 0 && row.checkpointed !== row.log) return false
+    if (existsSync(walPath)) {
+      const afterWal = lstatSync(walPath)
+      if (!afterWal.isFile() || afterWal.size !== 0) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+function persistAntigravitySummaryCache(stableCliDir: string, launchCliDir: string): void {
+  try {
+    privateDir(stableCliDir)
+  } catch {
+    return
+  }
+  for (const name of SUMMARY_CACHE_FILES) {
+    const src = join(launchCliDir, name)
+    const isSqlite = name.endsWith('.db')
+    if (isSqlite && !checkpointSqliteWalIfPresent(src)) continue
+    const data = readBoundedRegularFile(src, { requireSqliteHeader: isSqlite })
+    if (!data) continue
+    const tmp = join(stableCliDir, `.${name}.tmp.${randomBytes(6).toString('hex')}`)
+    try {
+      writePrivateBytes(tmp, data)
+      renameSync(tmp, join(stableCliDir, name))
+    } catch {
+      try { rmSync(tmp, { force: true }) } catch { /* ignore */ }
+    }
+  }
+}
+
+export type AntigravityStickyLaunchMode = 'on' | 'off'
+
+const STICKY_LAUNCH_FLAG_REL_PATH = ['runtime-flags', 'antigravity-sticky-launch-home'] as const
+const LAUNCH_OWNER_FILE = '.oc-launch-owner.json'
+const STALE_UNOWNED_LAUNCH_MS = 10_000
+const SLOT_LOCK_RETRY_ATTEMPTS = 50
+const SLOT_LOCK_RETRY_SLEEP_MS = 2
+const LAUNCH_LEASE: unique symbol = Symbol('antigravityLaunchLease')
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4))
+
+/** In-process active launchHome -> leaseId. Prevents same-session concurrent clobber and late duplicate cleanup. */
+const activeLaunchOwners = new Map<string, string>()
+
+interface LaunchOwnerRecord {
+  pid: number
+  startTicks: string | null
+  leaseId: string
+}
+
+/** `OC_ANTIGRAVITY_STICKY_LAUNCH_HOME` wins; else `<openClaudeHome>/runtime-flags/antigravity-sticky-launch-home`; default `on`. */
+export function resolveAntigravityStickyLaunchMode(
+  openClaudeHome: string,
+  env: NodeJS.ProcessEnv = process.env,
+): AntigravityStickyLaunchMode {
+  let raw = env.OC_ANTIGRAVITY_STICKY_LAUNCH_HOME
+  if (raw === undefined || raw.trim() === '') {
+    const buf = readBoundedRegularFile(join(openClaudeHome, ...STICKY_LAUNCH_FLAG_REL_PATH), {
+      requireSqliteHeader: false,
+      maxBytes: 1024,
+    })
+    raw = buf ? buf.toString('utf8') : undefined
+  }
+  const normalized = raw?.trim().toLowerCase()
+  if (normalized === 'off' || normalized === '0' || normalized === 'false') return 'off'
+  return 'on'
+}
+
+function sleepSyncMs(ms: number): void {
+  try {
+    Atomics.wait(SLEEP_BUF, 0, 0, ms)
+  } catch {
+    // Ignore on runtimes where Atomics.wait is restricted on main thread.
+  }
+}
+
+function readProcStartTicks(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const closeParen = stat.lastIndexOf(')')
+    if (closeParen < 0) return null
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/)
+    // Field 22 in proc(5) is index 19 after `(comm) `.
+    return fields[19] ?? null
+  } catch {
+    return null
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM'
+  }
+}
+
+function isLiveCrossProcessOwner(owner: LaunchOwnerRecord): boolean {
+  if (!Number.isInteger(owner.pid) || owner.pid <= 0) return false
+  // Same-process ownership is tracked authoritatively in `activeLaunchOwners`.
+  if (owner.pid === process.pid) return false
+  if (!isPidAlive(owner.pid)) return false
+  if (owner.startTicks) {
+    const currentTicks = readProcStartTicks(owner.pid)
+    if (currentTicks !== null && currentTicks !== owner.startTicks) return false
+  }
+  return true
+}
+
+function readLaunchOwnerRecord(dirPath: string): LaunchOwnerRecord | null {
+  const buf = readBoundedRegularFile(join(dirPath, LAUNCH_OWNER_FILE), {
+    requireSqliteHeader: false,
+    maxBytes: 4096,
+  })
+  if (!buf) return null
+  try {
+    const parsed = JSON.parse(buf.toString('utf8')) as Partial<LaunchOwnerRecord>
+    if (typeof parsed.pid !== 'number' || !Number.isInteger(parsed.pid) || parsed.pid <= 0) return null
+    return {
+      pid: parsed.pid,
+      startTicks: typeof parsed.startTicks === 'string' && parsed.startTicks.length > 0 ? parsed.startTicks : null,
+      leaseId: typeof parsed.leaseId === 'string' ? parsed.leaseId : '',
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeLaunchOwnerRecord(dirPath: string, leaseId: string): void {
+  const record: LaunchOwnerRecord = {
+    pid: process.pid,
+    startTicks: readProcStartTicks(process.pid),
+    leaseId,
+  }
+  writePrivate(join(dirPath, LAUNCH_OWNER_FILE), `${JSON.stringify(record)}\n`)
+}
+
+function tryCreateExclusiveLaunchDir(dirPath: string): boolean {
+  try {
+    mkdirSync(dirPath, { mode: 0o700 })
+    chmodSync(dirPath, 0o700)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Pure creator-owned atomic directory mutex (`mkdir` on acquire, `rmSync` only
+ * by the creator in `finally`). Never steals or renames an existing lock path,
+ * avoiding any ABA double-holder race; an existing lock simply degrades the
+ * caller to an isolated `r-<random>` launchHome.
+ */
+function tryAcquireSlotLockOnce(root: string, slotName: string): { lockDir: string } | null {
+  let locksRoot: string
+  try {
+    locksRoot = privateDir(join(root, 'launch-locks'))
+  } catch {
+    return null
+  }
+  const lockDir = join(locksRoot, `${slotName}.lock`)
+  return tryCreateExclusiveLaunchDir(lockDir) ? { lockDir } : null
+}
+
+function releaseSlotLock(held: { lockDir: string } | null): void {
+  if (!held) return
+  try {
+    rmSync(held.lockDir, { recursive: true, force: true })
+  } catch {
+    // Best effort lock cleanup.
+  }
+}
+
+function acquireSlotLockWithRetry(root: string, slotName: string): { lockDir: string } | null {
+  for (let i = 0; i < SLOT_LOCK_RETRY_ATTEMPTS; i++) {
+    const held = tryAcquireSlotLockOnce(root, slotName)
+    if (held) return held
+    sleepSyncMs(SLOT_LOCK_RETRY_SLEEP_MS)
+  }
+  return null
+}
+
+function tryAcquirePreferredLaunchHome(root: string, slotName: string, preferred: string, leaseId: string): boolean {
+  if (activeLaunchOwners.has(preferred)) return false
+  const heldLock = tryAcquireSlotLockOnce(root, slotName)
+  if (!heldLock) return false
+  try {
+    if (activeLaunchOwners.has(preferred)) return false
+    if (!tryCreateExclusiveLaunchDir(preferred)) {
+      const st = lstatSync(preferred)
+      if (!st.isDirectory()) {
+        rmSync(preferred, { force: true })
+      } else {
+        const owner = readLaunchOwnerRecord(preferred)
+        if (owner !== null) {
+          if (isLiveCrossProcessOwner(owner)) return false
+        } else if (Date.now() - st.mtimeMs <= STALE_UNOWNED_LAUNCH_MS) {
+          return false
+        }
+        rmSync(preferred, { recursive: true, force: true })
+      }
+      if (!tryCreateExclusiveLaunchDir(preferred)) return false
+    }
+    writeLaunchOwnerRecord(preferred, leaseId)
+    activeLaunchOwners.set(preferred, leaseId)
+    return true
+  } catch {
+    activeLaunchOwners.delete(preferred)
+    try { rmSync(preferred, { recursive: true, force: true }) } catch { /* ignore */ }
+    return false
+  } finally {
+    releaseSlotLock(heldLock)
+  }
+}
+
+function allocateRandomLaunchHome(launchRoot: string, leaseId: string): string {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = join(launchRoot, `r-${randomBytes(8).toString('hex')}`)
+    if (!activeLaunchOwners.has(candidate) && tryCreateExclusiveLaunchDir(candidate)) {
+      activeLaunchOwners.set(candidate, leaseId)
+      try {
+        writeLaunchOwnerRecord(candidate, leaseId)
+      } catch {
+        // Random dir is unique to this attempt; non-fatal if disk is constrained.
+      }
+      return candidate
+    }
+  }
+  const fallback = privateDir(join(launchRoot, `r-${randomBytes(12).toString('hex')}`))
+  activeLaunchOwners.set(fallback, leaseId)
+  try {
+    writeLaunchOwnerRecord(fallback, leaseId)
+  } catch {
+    // Non-fatal on unique fallback path.
+  }
+  return fallback
+}
+
+function acquireAntigravityLaunchHome(
+  root: string,
+  openClaudeHome: string,
+  sessionKey: string,
+): { launchHome: string; leaseId: string } {
+  const launchRoot = privateDir(join(root, 'launch'))
+  const leaseId = randomBytes(12).toString('hex')
+  const trimmedSession = sessionKey.trim()
+  if (trimmedSession.length > 0 && resolveAntigravityStickyLaunchMode(openClaudeHome) === 'on') {
+    const slotName = `s-${createHash('sha256').update(trimmedSession, 'utf8').digest('hex').slice(0, 16)}`
+    const preferred = join(launchRoot, slotName)
+    if (tryAcquirePreferredLaunchHome(root, slotName, preferred, leaseId)) {
+      return { launchHome: preferred, leaseId }
+    }
+  }
+  return { launchHome: allocateRandomLaunchHome(launchRoot, leaseId), leaseId }
+}
+
+function removeOwnedLaunchDir(
+  root: string,
+  rel: string,
+  launchHome: string,
+  expectedLeaseId: string | undefined,
+  persistSummaryCache: boolean,
+): void {
+  const isStickySlot = rel.startsWith('s-')
+  const heldLock = isStickySlot ? acquireSlotLockWithRetry(root, rel) : null
+  // Fail closed if a sticky slot lock is currently contended by another process: never rmSync unlocked!
+  if (isStickySlot && !heldLock) return
+  try {
+    if (expectedLeaseId !== undefined) {
+      const diskOwner = readLaunchOwnerRecord(launchHome)
+      if (diskOwner === null || diskOwner.leaseId !== expectedLeaseId) return
+    } else {
+      const diskOwner = readLaunchOwnerRecord(launchHome)
+      if (diskOwner !== null && isLiveCrossProcessOwner(diskOwner)) return
+    }
+    if (persistSummaryCache) {
+      persistAntigravitySummaryCache(
+        antigravityStableCliDir(root),
+        join(launchHome, '.gemini', 'antigravity-cli'),
+      )
+    }
+    rmSync(launchHome, { recursive: true, force: true })
+  } catch {
+    // Best effort; mode 0700 and the container recycle removes residue.
+  } finally {
+    releaseSlotLock(heldLock)
+  }
+}
+
+function releaseLaunchLeaseOnSetupFailure(root: string, launchHome: string, leaseId: string): void {
+  if (activeLaunchOwners.get(launchHome) !== leaseId) return
+  activeLaunchOwners.delete(launchHome)
+  const launchRoot = join(root, 'launch')
+  if (!launchHome.startsWith(`${launchRoot}/`)) return
+  const rel = launchHome.slice(launchRoot.length + 1)
+  removeOwnedLaunchDir(root, rel, launchHome, leaseId, false)
+}
+
+export function projectAntigravityPlatform(
+  input: AntigravityPlatformInput,
+): AntigravityPlatformProjection {
+  const openClaudeHome = process.env.OPENCLAUDE_HOME?.trim() || paths.home
+  const root = antigravityRoot()
+  const stable = antigravityStableCliDir(root)
+  const cacheDir = privateDir(join(root, 'cache'))
+  const { launchHome, leaseId } = acquireAntigravityLaunchHome(root, openClaudeHome, input.sessionKey)
+  try {
+    // Commercial turns pass no hostBin and keep the sandboxed PATH.
+    const hostPathDir = projectHostPathDir(launchHome, input.hostBin)
+    const cliDir = privateDir(join(launchHome, '.gemini', 'antigravity-cli'))
+    const configDir = privateDir(join(launchHome, '.gemini', 'config'))
+    linkShared(join(stable, 'conversations'), join(cliDir, 'conversations'))
+    linkShared(join(stable, 'bin'), join(cliDir, 'bin'))
+    seedAntigravitySummaryCache(stable, cliDir)
+
+    // Google-account mode: no modelProvider override. The CLI reads this token
+    // file when no keyring is reachable; it only runs the userinfo eligibility
+    // check with it. Every Cloud Code call goes to CLOUD_CODE_URL (the relay),
+    // which swaps in the account's real token. refresh_token stays empty, so the
+    // file claims a lifetime longer than any turn (see ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS).
+    const cliTokenFileExpiry = antigravityCliTokenFileExpiry(input.credential.accessTokenExpiresAt)
+    writePrivate(join(cliDir, 'settings.json'), `${JSON.stringify({}, null, 2)}\n`)
+    writePrivate(
+      join(cliDir, 'antigravity-oauth-token'),
+      `${JSON.stringify({
+        token: {
+          access_token: input.credential.accessToken,
+          token_type: 'Bearer',
+          refresh_token: '',
+          expiry: cliTokenFileExpiry,
+        },
+        auth_method: 'consumer',
+        ...(input.credential.idToken ? { id_token: input.credential.idToken } : {}),
+      })}\n`,
+    )
+
+    const advertisedMcpTools: string[] = []
+    let delegateContextFile: string | null = null
+    const servers: Record<string, unknown> = {}
+    const mcpLaunch = resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
+    if (mcpLaunch && input.gatewayToken) {
+      const tokenFile = join(launchHome, 'gateway-token')
+      delegateContextFile = join(launchHome, 'delegate-context')
+      writePrivate(tokenFile, input.gatewayToken)
+      writePrivate(
+        delegateContextFile,
+        `${issueParentCallerToken({
+          agentId: input.agentId,
+          sessionKey: input.sessionKey,
+          traceId: input.traceId,
+          depth: input.delegationDepth,
+          consultTurn: input.consultTurn,
+        })}\n`,
+      )
+      const eagerTools: Record<string, { eager: true }> = {}
+      for (const toolName of ANTIGRAVITY_EAGER_MCP_TOOLS) {
+        eagerTools[toolName] = { eager: true }
+      }
+      servers[ANTIGRAVITY_MCP_SERVER] = {
+        command: mcpLaunch.command,
+        args: [...mcpLaunch.args],
+        timeoutSeconds: ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC,
+        tools: eagerTools,
+        env: {
+          ...delegateMcpBudgetEnvironment(ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC * 1000),
+          OPENCLAUDE_AGENT_ID: input.agentId,
+          OC_AGENT_ID: input.agentId,
+          ...identityCompatEnvironment(input.identityCompat),
+          ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
+          OPENCLAUDE_HOME: openClaudeHome,
+          OPENCLAUDE_SESSION_KEY: input.sessionKey,
+          ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
+          OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
+          OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
+          OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
+          OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
+          OPENCLAUDE_ENGINE: 'antigravity',
+          ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+            ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
+            : {}),
+          ...(input.skillEvalMode ? { OPENCLAUDE_SKILL_EVAL_MODE: '1' } : {}),
+          ...(input.skillEvalExclude
+            ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: input.skillEvalExclude }
+            : {}),
+          ...(input.skillEvalDraft
+            ? {
+                OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: input.skillEvalDraft.name,
+                OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: input.skillEvalDraft.dir,
+              }
+            : {}),
+          ...(input.skillTrainRunId ? { OPENCLAUDE_SKILL_TRAIN_RUN_ID: input.skillTrainRunId } : {}),
+        },
+      }
+      advertisedMcpTools.push(...ANTIGRAVITY_MEMORY_MCP_TOOLS)
+    }
+    writePrivate(
+      join(configDir, 'mcp_config.json'),
+      `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
+    )
+    const projection: AntigravityPlatformProjection = {
+      root,
+      launchHome,
+      hostPathDir,
+      cacheDir,
+      advertisedMcpTools,
+      delegateContextFile,
+      cliTokenFileExpiry,
+    }
+    Object.defineProperty(projection, LAUNCH_LEASE, {
+      value: leaseId,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    })
+    return projection
+  } catch (err) {
+    releaseLaunchLeaseOnSetupFailure(root, launchHome, leaseId)
+    throw err
+  }
+}
+
+/** Remove one launch HOME. Never follows the shared symlinks or clobbers a newer turn's lease. */
 export function cleanupAntigravityLaunch(
   projection: Pick<AntigravityPlatformProjection, 'root' | 'launchHome'>,
+  opts?: { persistSummaryCache?: boolean },
 ): void {
   const launchRoot = join(projection.root, 'launch')
   if (!projection.launchHome.startsWith(`${launchRoot}/`)) return
-  try {
-    rmSync(projection.launchHome, { recursive: true, force: true })
-  } catch {
-    // Best effort; mode 0700 and the container recycle removes residue.
+  const rel = projection.launchHome.slice(launchRoot.length + 1)
+  if (!rel || rel === '.' || rel === '..' || rel.includes('/') || rel.includes('\\')) return
+  const leaseId = (projection as { [LAUNCH_LEASE]?: string })[LAUNCH_LEASE]
+  if (leaseId !== undefined) {
+    if (activeLaunchOwners.get(projection.launchHome) !== leaseId) return
+    activeLaunchOwners.delete(projection.launchHome)
+  } else if (activeLaunchOwners.has(projection.launchHome)) {
+    return
   }
+  removeOwnedLaunchDir(projection.root, rel, projection.launchHome, leaseId, Boolean(opts?.persistSummaryCache))
 }

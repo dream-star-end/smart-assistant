@@ -115,7 +115,7 @@ const PATTERNS: Array<{
   // 同现串被 upstream 正则吞掉。注意词族刻意窄:"Network Authentication Required"
   // (511)不含 "authentication error" 措辞,仍归 upstream_failed(见 511 回归测试)。
   {
-    re: /(?:\b401\b|unauthori[sz]ed|invalid (?:x-)?api[_ -]?key|authentication[_ ]?error|AUTH_ERROR)/i,
+    re: /(?:\b401\b|unauthori[sz]ed|invalid (?:x-)?api[_ -]?key|authentication[_ ]?(?:error|failed)|\bAUTH_ERROR\b|\bCC_AUTH_ERROR\b|\bCC_ACCOUNT_VERIFICATION_REQUIRED\b|\bverification_required\b|Anthropic Verification Portal|can(?:'|’)t receive replies from Claude|cannot receive replies from Claude|\blogin expired\b|please run \/login)/i,
     code: 'auth_error',
     message: '模型服务认证失败，请重新登录或检查凭据后重试',
   },

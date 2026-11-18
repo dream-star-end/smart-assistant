@@ -31,6 +31,7 @@ import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
 import { clearDraft, readDraft, draftExceedsStorage } from "../lib/composerDraft";
+import { parseQuickAskSlashCommand } from "../lib/quickAskSession";
 import { completionFor, type InputPrediction } from "../lib/inputCompletion";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
@@ -201,7 +202,7 @@ export function Composer({
   draftKey,
   goalOpenRequest,
   projectSlot,
-  prediction,
+  prediction, onQuickAskCommand,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => unknown;
@@ -249,8 +250,9 @@ export function Composer({
   /** 项目标识(ComposerProjectPill)。sm+ 在工具行,窄屏在底栏(与仓库入口同排)。 */
   projectSlot?: ReactNode;
   /** 输入预测(lib/inputCompletion):空输入框显示 next(直接点发送就发出),输入中按 candidates 补全;Tab / → 填入。
-   *  省略或 null = 关闭(设置里关掉、demo)。 */
+   *  省略或 null = 关闭(设置里关掉、demo)。onQuickAskCommand 拦截 `/btw`、`/ask` 到同屏快问小窗。 */
   prediction?: InputPrediction | null;
+  onQuickAskCommand?: (question: string) => void;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -521,6 +523,8 @@ export function Composer({
     const typed = value.trim().length > 0 || doneMedia.length > 0;
     if (!typed && !sendPrediction) return;
     const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
+    const qa = typed && onQuickAskCommand && doneMedia.length === 0 ? parseQuickAskSlashCommand(text) : null;
+    if (qa?.matched) { setValue(""); if (draftKey) clearDraft(draftKey); onQuickAskCommand?.(qa.question); return; }
     const snapshot=latestSubmitRef.current;
     submittingRef.current=true;
     const resetSubmit=()=>{submittingRef.current=false;setSubmitting(false);};

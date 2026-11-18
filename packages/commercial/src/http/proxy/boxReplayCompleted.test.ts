@@ -73,7 +73,8 @@ test("missing and pending rows never start Box or invent a successful response",
 test("a unique durable failure survives restart without reading a message or launching Box", async () => {
   const failure = { version: 1 as const, code: "BOX_TOOL_SNAPSHOT_MISMATCH" as const,
     phase: "continuation" as const, observedAtMs: 1_000, requestId: "original-failed" };
-  let failureReads = 0, messageReads = 0;
+  let failureReads = 0;
+  let messageReads = 0;
   const deps = { journal: {
     findReplayIdentity: async () => null,
     findReadOnlyFallback: async () => { failureReads++; return { kind: "failure" as const, failure }; },
@@ -115,7 +116,9 @@ for (const completed of [false, true]) {
         runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32), roundNo: 1,
         sha256: "a".repeat(64), bytes: 1,
       } } : {}) };
-    let ordinaryLookups = 0, atomicLookups = 0, messageReads = 0;
+    let ordinaryLookups = 0;
+    let atomicLookups = 0;
+    let messageReads = 0;
     const result = await findCompletedBoxReplay({ uid: 3n, canonicalModel: body.model,
       canonicalBody: { ...body, stream: false } as ProxyBody, upstreamModel: message.model }, {
       journal: {

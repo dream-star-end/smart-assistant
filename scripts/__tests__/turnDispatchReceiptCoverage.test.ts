@@ -100,7 +100,7 @@ describe('extracted turn dispatch receipt source guard', () => {
   })
   it('rejects a historical return hidden after an unconditional return', () => {
     const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
-    const before = `export function rejectedDispatchFailureCode(res: { kind: string; userFailureCode?: unknown }): string {\n`
+    const before = 'export function rejectedDispatchFailureCode(res: { kind: string; userFailureCode?: unknown }): string {\n'
     const after = `${before}  return attachmentTotalExceededFailureCode(parsed.totalBytes)\n`
     assert.throws(() => assertRejectedDispatchFailureHelper(mutate(helper, before, after)), pattern)
   })
@@ -108,6 +108,18 @@ describe('extracted turn dispatch receipt source guard', () => {
     const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
     assert.throws(() => assertRejectedDispatchFailureHelper(
       `${helper}\nfunction attachmentTotalExceededFailureCode(value: unknown): string { return String(value) }\n`), pattern)
+  })
+  it('rejects a local function shadowing parseIdleRecoveryPending', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      `${helper}\nfunction parseIdleRecoveryPending(value: unknown): number { return Number(value) }\n`), pattern)
+  })
+  it('rejects an idle-recovery template literal that does not interpolate the parsed minutes', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      mutate(helper, '`IDLE_RECOVERY_PENDING:${minutes}`', '`IDLE_RECOVERY_PENDING:${0}`')), pattern)
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      mutate(helper, '`IDLE_RECOVERY_PENDING:${minutes}`', '`OTHER:${minutes}`')), pattern)
   })
   it('rejects an enrichment fence that no longer stops a terminalized turn', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,

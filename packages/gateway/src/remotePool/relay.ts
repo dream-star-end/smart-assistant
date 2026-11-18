@@ -930,6 +930,9 @@ export class RemotePoolRelay {
       if (oldest !== undefined) this.settledTerminals.delete(oldest)
     }
 
+    clearTimeout(this.expiry)
+    this.expiry = undefined
+    this.localStopped = true
     this.observation!.endTurn()
     this.active = false
     this.dispatching = false
@@ -1039,7 +1042,7 @@ export class RemotePoolRelay {
     )
     this.observation.beginTurn()
     this.armLeaseTimer(v.lease)
-
+    try {
     if (!this.launched) {
       const pre = await this.host.preflight()
       if (!pre.memoryOk) {
@@ -1162,6 +1165,11 @@ export class RemotePoolRelay {
     this.active = true
     this.localStopped = false
     return { ready: true, seq: this.outputSeq, nativeSessionId: this.nativeSessionId }
+    } catch (err) {
+      clearTimeout(this.expiry)
+      this.expiry = undefined
+      throw err
+    }
   }
 
   private waitForNewTurnAckOrSettle(timeoutMs = 2_000): Promise<void> {
@@ -1285,6 +1293,8 @@ export class RemotePoolRelay {
     )
     remotePoolNeed(v.turnKey === this.admitted.turnKey, 'REMOTE_ABANDON_SCOPE_MISMATCH')
     clearTimeout(this.expiry)
+    this.expiry = undefined
+    this.localStopped = true
     this.active = false
     this.observation?.endTurn()
     const outcome = await this.financeTurn.abandonUndispatched()
@@ -1408,11 +1418,17 @@ export class RemotePoolRelay {
         turnKey: v.turnKey ?? null,
       })
       this.localStops.emit('stopped')
+      // Join an in-flight stop() or re-drive idempotent stop closure if a prior
+      // bounded waitLocalStop() timed out before the container finished aborting tools.
+      await this.stop()
       return { ok: true }
     }
     if (path === '/renew') {
       remotePoolNeed(this.admitted !== undefined && typeof v.lease === 'string', 'REMOTE_RENEW_INVALID')
       this.verifyAuthorityAndLease(this.admitted.authority, v.lease, true)
+      if (!this.active && !this.starting) {
+        return { ok: true, alreadySettled: true }
+      }
       this.admitted.lease = v.lease
       this.armLeaseTimer(v.lease)
       return { ok: true }

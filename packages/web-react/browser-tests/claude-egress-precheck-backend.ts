@@ -53,7 +53,7 @@ export async function startFixture(root: string, js: string, css: string) {
   const { token } = await signAccess({ sub: String(admin), role: "admin" }, secret);
   const handler = createCommercialHandler({ jwtSecret: secret, mailer: { async send() {} }, redis: wrapIoredis(redis), turnstileBypass: true,
     verifyEmailUrlBase: "https://fixture.invalid", resetPasswordUrlBase: "https://fixture.invalid",
-    rateLimits: { register: { scope: namespace + "register", windowSeconds: 60, max: 100 }, login: { scope: namespace + "login", windowSeconds: 60, max: 100 }, requestReset: { scope: namespace + "reset", windowSeconds: 60, max: 100 } } });
+    rateLimits: { register: { scope: `${namespace}register`, windowSeconds: 60, max: 100 }, login: { scope: `${namespace}login`, windowSeconds: 60, max: 100 }, requestReset: { scope: `${namespace}reset`, windowSeconds: 60, max: 100 } } });
   server = createServer(async (req, res) => {
     try {
       if (req.url === "/fixture") {
@@ -92,7 +92,7 @@ export async function stopFixture() {
       // SCAN returns raw keys; pipeline with prefixed connection would double-prefix.
       let cursor = "0";
       const keys: string[] = [];
-      do { const result = await redis.scan(cursor, "MATCH", namespace + "*", "COUNT", 100); cursor = result[0]; keys.push(...result[1]); } while (cursor !== "0");
+      do { const result = await redis.scan(cursor, "MATCH", `${namespace}*`, "COUNT", 100); cursor = result[0]; keys.push(...result[1]); } while (cursor !== "0");
       for (const key of keys) await redis.del(key.slice(namespace.length));
     } catch (e) { failures.push(e); }
     try { await redis.quit(); } catch (e) { redis.disconnect(); failures.push(e); }

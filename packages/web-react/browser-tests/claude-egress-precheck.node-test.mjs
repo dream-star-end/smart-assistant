@@ -22,7 +22,7 @@ if (process.env.OC_EGRESS_BROWSER_MUTEX_CHILD !== "1") {
   test("Claude egress precheck browser proof under commercial mutex", { timeout: 360000 }, () => {
     const env = { ...process.env };
     // Node nested runners inherit its internal child context, which suppresses discovery.
-    delete env.NODE_TEST_CONTEXT;
+    assert.equal(Reflect.deleteProperty(env, "NODE_TEST_CONTEXT"), true);
     const child = spawnSync("bash", [join(root, "scripts/test-mutex.sh"), "commercial",
       `env OC_EGRESS_BROWSER_MUTEX_CHILD=1 node --import tsx --test ${JSON.stringify(fileURLToPath(import.meta.url))}`],
       { cwd: root, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
@@ -113,12 +113,12 @@ if (process.env.OC_EGRESS_BROWSER_MUTEX_CHILD !== "1") {
             const page = await context.newPage();
             const errors = [];
             page.on("pageerror", (e) => errors.push(e.message));
-            await page.goto(base + "/fixture");
+            await page.goto(`${base}/fixture`);
             const modal = page.getByRole("dialog");
             await modal.getByLabel("label(账号标签,必填)", { exact: true }).fill(`new-${kind}`);
             await modal.getByPlaceholder("粘贴 OAuth access token").fill("synthetic-ui-never-outbound");
             await modal.getByLabel(/egress 代理池条目/).selectOption(proxyId);
-            const responsePromise = page.waitForResponse((r) => r.url() === base + "/api/admin/accounts" && r.request().method() === "POST");
+            const responsePromise = page.waitForResponse((r) => r.url() === `${base}/api/admin/accounts` && r.request().method() === "POST");
             await modal.getByRole("button", { name: "创建", exact: true }).click();
             const response = await responsePromise;
             const body = await response.json();

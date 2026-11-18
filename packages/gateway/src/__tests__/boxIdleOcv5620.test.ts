@@ -178,7 +178,7 @@ async function pendingProofServer() {
 }
 
 describe('OCV5-620 finishIdleUnderLock with a source proof that stays pending', () => {
-  test('a pending op still settles once apply-stuck after the candidate already aged out (Codex r1 P1)', async () => {
+  test('OCV5-747: age alone cannot release a prepared op while shutdown and idle proof are unknown', async () => {
     const dir = await tempDir()
     const close = await pendingProofServer()
     try {
@@ -199,9 +199,8 @@ describe('OCV5-620 finishIdleUnderLock with a source proof that stays pending', 
       age(IDLE_APPLY_STUCK_MS + 60_000)
       await finish.call({}, session, source, dir)
       const settled = readIdleOp(dir, sessionKey, revision)!
-      assert.equal(settled.disposition, 'abandoned')
-      assert.equal(settled.abandonReason, 'idle_apply_stuck')
-      assert.equal(readPendingIdle(dir, sessionKey), undefined)
+      assert.equal(settled.disposition, undefined, 'age is not proof that late apply cannot land')
+      assert.ok(readPendingIdle(dir, sessionKey), 'unknown runner/proof remains fenced')
     } finally {
       await close()
     }

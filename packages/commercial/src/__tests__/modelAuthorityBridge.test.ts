@@ -163,8 +163,11 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       ccb: { capabilityZero: true, supportsThinking: false, contextOwner: 'box-native-v1' } } }));
   entries.push(entry({entryId:63,modelId:'gpt-6-luna-remote',engine:'codex',providerId:'codex',upstreamModelId:'gpt-6-luna',placement:'remote_pool',
     capabilityProfile:{supportsVision:false,reasoning:{supported:['low'],codexModelDefault:'low'},ccb:{capabilityZero:false,supportsThinking:false}}}));
+  entries.push(entry({entryId:64,modelId:'antigravity-gemini-4-carbon-remote',engine:'antigravity',providerId:'antigravity',upstreamModelId:'gemini-4-carbon-medium',placement:'remote_pool',
+    capabilityProfile:{supportsVision:false,reasoning:{supported:['low','medium','high'],codexModelDefault:'medium'},ccb:{capabilityZero:false,supportsThinking:true}}}));
   const pricing = new Map([
     ['gpt-6-luna-remote',price('gpt-6-luna-remote')],
+    ['antigravity-gemini-4-carbon-remote',price('antigravity-gemini-4-carbon-remote')],
     ['box-claude-sonnet-5', price('box-claude-sonnet-5')],
     ['claude-opus-5-5-remote', price('claude-opus-5-5-remote')],
     ["glm-5.2", price("glm-5.2")],
@@ -3087,6 +3090,62 @@ describe('OCV5-746 chat turn model authority', () => {
         () => rig.containerConsumer!.consume(frame, rig.containerConn!),
         '真实 gateway consume 不得以 billing_request_mismatch 拒掉首轮',
       );
+      ws.close();
+    } finally { await stopRig(rig); }
+  });
+
+  test('antigravity -remote (remote-driver-v4) first frame is consumable by the real gateway without MODEL_CONFIG_CHANGED_RETRY_TURN', async () => {
+    let selectedInput: Record<string, unknown> | null = null;
+    const rig = await startRig({
+      attest: 'yes',
+      durableDispatch: true,
+      cc5BackendSelector: async (input) => {
+        selectedInput = input as unknown as Record<string, unknown>;
+        return {
+          kind: 'remote-driver-v4' as const,
+          version: 4 as const,
+          sessionKey: input.sessionKey,
+          operationId: '11111111-1111-4111-8111-111111111111',
+          driverId: 'antigravity',
+          engineId: 'antigravity',
+          authorityEngine: 'antigravity' as const,
+          driverVersion: '1.0.0',
+          generation: '1',
+          profileId: '22222222-2222-4222-8222-222222222222',
+          authEpoch: 'epoch-agy-1',
+        };
+      },
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const browserErrors: Array<Record<string, unknown>> = [];
+      ws.on('message', (data) => {
+        try {
+          const f = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (f.type === 'error') browserErrors.push(f);
+        } catch { /* ignore */ }
+      });
+      ws.send(inboundFrame({
+        model: 'antigravity-gemini-4-carbon-remote',
+        peer: { id: 'agy-remote-785', kind: 'dm' },
+        clientMessageId: 'cm-785-agy',
+        idempotencyKey: 'web:cm-785-agy:0',
+      }));
+      await waitFor(() => rig.containerSeen.some((s) => s.includes(MODEL_AUTHORITY_FIELD)));
+      assert.equal(browserErrors.length, 0, `unexpected error frame: ${JSON.stringify(browserErrors)}`);
+      const seenSelection = selectedInput as Record<string, unknown> | null;
+      assert.equal(seenSelection?.engine, 'antigravity');
+      assert.equal(seenSelection?.placement, 'remote_pool');
+      const frame = firstInbound(rig.containerSeen);
+      const bundle = frame[MODEL_AUTHORITY_FIELD] as { authority: string; lease: string };
+      const payload = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
+      assert.equal(payload.engine, 'antigravity');
+      assert.equal(payload.executionBackend?.kind, 'remote-driver-v4');
+      assert.match(String(frame.requestId), /^[0-9a-f]{32}$/);
+      assert.equal(frame.requestId, payload.billingRequestId);
+      assert.ok(rig.containerConsumer && rig.containerConn);
+      assert.doesNotThrow(() => rig.containerConsumer!.consume(frame, rig.containerConn!));
       ws.close();
     } finally { await stopRig(rig); }
   });
