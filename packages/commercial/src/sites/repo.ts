@@ -58,13 +58,16 @@ export interface DeleteReservation {
 export interface SitesRepo {
   listByUser(userId: number): Promise<UserSiteRow[]>
   getByUserAndSlug(userId: number, slug: string): Promise<UserSiteRow | null>
-  listUnleasedPlaceholdersByUser(userId: number): Promise<UserSiteRow[]>
-  promoteUnleasedPlaceholder(input: Omit<CommitPublishInput, 'leaseId'>): Promise<UserSiteRow | null>
-  deleteUnleasedPlaceholder(siteId: string, userId: number): Promise<void>
+  listUnleasedPendingByUser(userId: number): Promise<UserSiteRow[]>
+  tryClaimReconcileLease(
+    siteId: string,
+    userId: number,
+  ): Promise<{ row: UserSiteRow; leaseId: string } | null>
+  reconcileFromEdge(input: CommitPublishInput): Promise<UserSiteRow | null>
   beginPublishReservation(input: PublishReservationInput): Promise<PublishReservation>
   commitPublish(input: CommitPublishInput): Promise<UserSiteRow>
   abortPublishPlaceholder(siteId: string, userId: number, leaseId: string): Promise<void>
-  releaseLease(siteId: string, userId: number, leaseId: string): Promise<void>
+  releaseLease(siteId: string, userId: number, leaseId: string, clearTarget?: boolean): Promise<void>
   prepareMetaUpdate(userId: number, slug: string): Promise<MetaUpdateReservation>
   commitMetaUpdate(input: {
     siteId: string
@@ -97,6 +100,7 @@ interface RawUserSiteRow {
   op_lease_id: string | null
   op_lease_until: Date | null
   op_expected_rev: string | number
+  op_target_rev: string | number
   created_at: Date
   updated_at: Date
   last_published_at: Date
@@ -180,44 +184,62 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
       return res.rows[0] ? mapRow(res.rows[0]) : null
     },
 
-    async listUnleasedPlaceholdersByUser(userId) {
+    async listUnleasedPendingByUser(userId) {
       const res = await pool.query<RawUserSiteRow>(
         `SELECT * FROM user_sites
          WHERE user_id = $1
-           AND edge_revision = 0
            AND (op_lease_until IS NULL OR op_lease_until <= NOW())
+           AND (edge_revision = 0 OR op_target_rev > edge_revision)
          ORDER BY created_at ASC`,
         [userId],
       )
       return res.rows.map(mapRow)
     },
 
-    async promoteUnleasedPlaceholder(input) {
+    async tryClaimReconcileLease(siteId, userId) {
+      const leaseId = randomUUID()
+      const leaseUntil = new Date(Date.now() + OP_LEASE_TTL_MS)
       const res = await pool.query<RawUserSiteRow>(
         `UPDATE user_sites
-         SET title = $3,
-             visibility = $4,
-             password_salt = $5,
-             password_hash = $6,
-             spa_mode = $7,
-             file_count = $8,
-             size_bytes = $9,
-             content_sha256 = $10,
-             edge_revision = $11,
+         SET op_lease_id = $3,
+             op_lease_until = $4
+         WHERE id = $1
+           AND user_id = $2
+           AND (op_lease_until IS NULL OR op_lease_until <= NOW())
+           AND (edge_revision = 0 OR op_target_rev > edge_revision)
+         RETURNING *`,
+        [siteId, userId, leaseId, leaseUntil],
+      )
+      return res.rows[0] ? { row: mapRow(res.rows[0]), leaseId } : null
+    },
+
+    async reconcileFromEdge(input) {
+      const res = await pool.query<RawUserSiteRow>(
+        `UPDATE user_sites
+         SET title = $4,
+             visibility = $5,
+             password_salt = $6,
+             password_hash = $7,
+             spa_mode = $8,
+             file_count = $9,
+             size_bytes = $10,
+             content_sha256 = $11,
+             edge_revision = $12,
              op_lease_id = NULL,
              op_lease_until = NULL,
              op_expected_rev = 0,
+             op_target_rev = 0,
              updated_at = NOW(),
-             last_published_at = NOW()
+             last_published_at = CASE WHEN edge_revision = 0 THEN NOW() ELSE last_published_at END
          WHERE id = $1
            AND user_id = $2
-           AND edge_revision = 0
-           AND edge_revision < $11
-           AND (op_lease_until IS NULL OR op_lease_until <= NOW())
+           AND op_lease_id = $3
+           AND edge_revision < $12
          RETURNING *`,
         [
           input.siteId,
           input.userId,
+          input.leaseId,
           input.title,
           input.visibility,
           input.passwordSalt,
@@ -230,17 +252,6 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
         ],
       )
       return res.rows[0] ? mapRow(res.rows[0]) : null
-    },
-
-    async deleteUnleasedPlaceholder(siteId, userId) {
-      await pool.query(
-        `DELETE FROM user_sites
-         WHERE id = $1
-           AND user_id = $2
-           AND edge_revision = 0
-           AND (op_lease_until IS NULL OR op_lease_until <= NOW())`,
-        [siteId, userId],
-      )
     },
 
     async beginPublishReservation(input) {
@@ -276,9 +287,10 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
              SET op_lease_id = $2,
                  op_lease_until = $3,
                  op_expected_rev = edge_revision,
+                 op_target_rev = $4,
                  updated_at = NOW()
              WHERE id = $1`,
-            [existing.id, leaseId, leaseUntil],
+            [existing.id, leaseId, leaseUntil, edgeRevision],
           )
           return {
             siteId: existing.id,
@@ -309,8 +321,8 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
           const ins = await client.query<{ id: string }>(
             `INSERT INTO user_sites (
                slug, user_id, title, visibility, password_salt, password_hash, spa_mode,
-               edge_revision, op_lease_id, op_lease_until, op_expected_rev
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, 0)
+               edge_revision, op_lease_id, op_lease_until, op_expected_rev, op_target_rev
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, 0, $10)
              RETURNING id`,
             [
               input.slug,
@@ -322,6 +334,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
               input.spaMode,
               leaseId,
               leaseUntil,
+              edgeRevision,
             ],
           )
           return {
@@ -356,6 +369,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
              op_lease_id = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_id END,
              op_lease_until = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_until END,
              op_expected_rev = CASE WHEN op_lease_id = $3 THEN 0 ELSE op_expected_rev END,
+             op_target_rev = CASE WHEN op_lease_id = $3 OR op_target_rev <= $12 THEN 0 ELSE op_target_rev END,
              updated_at = NOW(),
              last_published_at = NOW()
          WHERE id = $1 AND user_id = $2 AND edge_revision < $12
@@ -395,10 +409,19 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
       )
     },
 
-    async releaseLease(siteId, userId, leaseId) {
+    async releaseLease(siteId, userId, leaseId, clearTarget = true) {
+      if (clearTarget) {
+        await pool.query(
+          `UPDATE user_sites
+           SET op_lease_id = NULL, op_lease_until = NULL, op_expected_rev = 0, op_target_rev = 0
+           WHERE id = $1 AND user_id = $2 AND op_lease_id = $3`,
+          [siteId, userId, leaseId],
+        )
+        return
+      }
       await pool.query(
         `UPDATE user_sites
-         SET op_lease_id = NULL, op_lease_until = NULL, op_expected_rev = 0
+         SET op_lease_id = NULL, op_lease_until = NULL
          WHERE id = $1 AND user_id = $2 AND op_lease_id = $3`,
         [siteId, userId, leaseId],
       )
@@ -427,9 +450,10 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
           `UPDATE user_sites
            SET op_lease_id = $2,
                op_lease_until = $3,
-               op_expected_rev = edge_revision
+               op_expected_rev = edge_revision,
+               op_target_rev = $4
            WHERE id = $1`,
-          [site.id, leaseId, leaseUntil],
+          [site.id, leaseId, leaseUntil, nextRevision],
         )
         return { site, leaseId, nextRevision }
       })
@@ -447,6 +471,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
              op_lease_id = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_id END,
              op_lease_until = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_until END,
              op_expected_rev = CASE WHEN op_lease_id = $3 THEN 0 ELSE op_expected_rev END,
+             op_target_rev = CASE WHEN op_lease_id = $3 OR op_target_rev <= $9 THEN 0 ELSE op_target_rev END,
              updated_at = NOW()
          WHERE id = $1 AND user_id = $2 AND edge_revision < $9
          RETURNING *`,
@@ -497,9 +522,10 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
           `UPDATE user_sites
            SET op_lease_id = $2,
                op_lease_until = $3,
-               op_expected_rev = edge_revision
+               op_expected_rev = edge_revision,
+               op_target_rev = $4
            WHERE id = $1`,
-          [site.id, leaseId, leaseUntil],
+          [site.id, leaseId, leaseUntil, deleteRevision],
         )
         return { site, leaseId, deleteRevision }
       })

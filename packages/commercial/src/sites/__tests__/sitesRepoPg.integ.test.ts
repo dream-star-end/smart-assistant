@@ -182,8 +182,9 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
     await svcB.deleteSite(1, 'pg-race')
     assert.equal(await repo.getByUserAndSlug(1, 'pg-race'), null)
 
-    // B3: Random-slug double-fault (push succeeds on Edge + throws EDGE_UNAVAILABLE, immediate status probe throws once)
+    // B3: Double-fault reconciliation for BOTH random-slug placeholder AND existing-site overwrite/PATCH
     let failPushOnce = true
+    let failPatchOnce = false
     let failProbeOnce = true
     const svcDoubleFault = new SitesService({
       enabled: true,
@@ -197,6 +198,13 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
           if (failPushOnce) {
             failPushOnce = false
             throw new SitesError('EDGE_UNAVAILABLE', 'dropped ack', 502, true)
+          }
+        },
+        async updateMeta(args) {
+          await rawEdge.updateMeta(args)
+          if (failPatchOnce) {
+            failPatchOnce = false
+            throw new SitesError('EDGE_UNAVAILABLE', 'dropped patch ack', 502, true)
           }
         },
         async getSiteStatus(args) {
@@ -227,6 +235,46 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
     assert.equal(summary.sites.length, 1)
     assert.equal(summary.sites[0]!.slug, orphanSlug)
     assert.equal(summary.sites[0]!.title, 'random-df')
+
+    // Existing-site overwrite publishSite double fault -> DB stays behind until next updateSite reconciles and succeeds
+    failPushOnce = true
+    failProbeOnce = true
+    await assert.rejects(
+      () =>
+        svcDoubleFault.publishSite(1, {
+          slug: orphanSlug,
+          title: 'pg-overwrite-df',
+          gzippedBundle: buildBundle('<h1>V2</h1>'),
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE',
+    )
+    const afterOverwritePw = await svcDoubleFault.updateSite(1, orphanSlug, {
+      visibility: 'password',
+      password: 'pg-recovered-99',
+    })
+    assert.equal(afterOverwritePw.title, 'pg-overwrite-df')
+    assert.equal(afterOverwritePw.visibility, 'password')
+
+    // Existing-site updateSite PATCH double fault -> next publishSite reconciles Edge revision and avoids 409 CAS wedge
+    failPatchOnce = true
+    failProbeOnce = true
+    await assert.rejects(
+      () =>
+        svcDoubleFault.updateSite(1, orphanSlug, {
+          title: 'pg-patch-df',
+          visibility: 'disabled',
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE',
+    )
+    const afterPatchRepub = await svcDoubleFault.publishSite(1, {
+      slug: orphanSlug,
+      visibility: 'public',
+      gzippedBundle: buildBundle('<h1>V3</h1>'),
+    })
+    assert.equal(afterPatchRepub.title, 'pg-patch-df')
+    assert.equal(afterPatchRepub.visibility, 'public')
+    const edgeFinal = await rawEdge.getSiteStatus({ slug: orphanSlug })
+    assert.equal(edgeFinal.revision, afterPatchRepub.edgeRevision)
 
     await svcDoubleFault.deleteSite(1, orphanSlug)
     assert.equal((await svcDoubleFault.listSummary(1)).sites.length, 0)

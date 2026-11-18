@@ -101,31 +101,45 @@ export class SitesService {
   private async reconcilePendingByUser(userId: number): Promise<void> {
     if (!this.enabled || !this.repo || !this.edge) return
     const { repo, edge } = { repo: this.repo, edge: this.edge }
-    const pending = await repo.listUnleasedPlaceholdersByUser(userId)
+    const pending = await repo.listUnleasedPendingByUser(userId)
     if (pending.length === 0) return
-    for (const row of pending) {
-      await this.withSlugLock(row.slug, async () => {
+    for (const cand of pending) {
+      await this.withSlugLock(cand.slug, async () => {
+        const claimed = await repo.tryClaimReconcileLease(cand.id, userId)
+        if (!claimed) return
         try {
-          const status = await edge.getSiteStatus({ slug: row.slug })
+          const status = await edge.getSiteStatus({ slug: claimed.row.slug })
           if (status.exists && status.revision > 0 && status.meta) {
-            await repo.promoteUnleasedPlaceholder({
-              siteId: row.id,
-              userId,
-              title: status.meta.title,
-              visibility: status.meta.visibility,
-              passwordSalt: status.meta.passwordSalt,
-              passwordHash: status.meta.passwordHash,
-              spaMode: status.meta.spaMode,
-              fileCount: status.meta.fileCount,
-              sizeBytes: status.meta.sizeBytes,
-              contentSha256: status.meta.contentSha256,
-              edgeRevision: status.revision,
-            })
-          } else if (!status.exists) {
-            await repo.deleteUnleasedPlaceholder(row.id, userId)
+            if (status.revision > claimed.row.edgeRevision) {
+              await repo.reconcileFromEdge({
+                siteId: claimed.row.id,
+                userId,
+                leaseId: claimed.leaseId,
+                title: status.meta.title,
+                visibility: status.meta.visibility,
+                passwordSalt: status.meta.passwordSalt,
+                passwordHash: status.meta.passwordHash,
+                spaMode: status.meta.spaMode,
+                fileCount: status.meta.fileCount,
+                sizeBytes: status.meta.sizeBytes,
+                contentSha256: status.meta.contentSha256,
+                edgeRevision: status.revision,
+              })
+            } else {
+              await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, true)
+            }
+          } else {
+            if (claimed.row.edgeRevision === 0) {
+              await repo.abortPublishPlaceholder(claimed.row.id, userId, claimed.leaseId)
+            } else if (status.tombstoneRevision > claimed.row.edgeRevision) {
+              await repo.commitDelete(claimed.row.id, userId, claimed.leaseId, status.tombstoneRevision)
+            } else {
+              await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, true)
+            }
           }
         } catch {
-          // Edge still unreachable: retain unleased placeholder so quota and ownership remain reserved until next check.
+          // Edge still unreachable: release lease lock while keeping op_target_rev > edge_revision so retry reconciles.
+          await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, false).catch(() => {})
         }
       })
     }
@@ -271,35 +285,43 @@ export class SitesService {
           committedOnEdge = true
         } catch (err) {
           if (err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE') {
-            // Transport drop/timeout has ambiguous outcome: probe Edge status before touching placeholder.
+            // Transport drop/timeout has ambiguous outcome: probe Edge status before releasing lease.
             try {
               const status = await edge.getSiteStatus({ slug })
               if (status.exists && status.revision === reservation.edgeRevision) {
                 committedOnEdge = true
-              } else if (status.revision < reservation.edgeRevision) {
-                if (reservation.isNewPlaceholder) {
-                  await repo
-                    .abortPublishPlaceholder(reservation.siteId, userId, reservation.leaseId)
-                    .catch(() => {})
-                } else {
-                  await repo.releaseLease(reservation.siteId, userId, reservation.leaseId).catch(() => {})
-                }
+              } else if (!status.exists && reservation.isNewPlaceholder) {
+                await repo
+                  .abortPublishPlaceholder(reservation.siteId, userId, reservation.leaseId)
+                  .catch(() => {})
+              } else if (status.exists && status.revision === reservation.baseRevision) {
+                await repo
+                  .releaseLease(reservation.siteId, userId, reservation.leaseId, true)
+                  .catch(() => {})
               } else {
-                await repo.releaseLease(reservation.siteId, userId, reservation.leaseId).catch(() => {})
+                await repo
+                  .releaseLease(reservation.siteId, userId, reservation.leaseId, false)
+                  .catch(() => {})
               }
             } catch {
-              // Edge unreachable even for probe: clear lease on existing site or keep unleased placeholder
-              // owned by userId so another tenant cannot grab a potentially-live Edge slug (B3).
-              await repo.releaseLease(reservation.siteId, userId, reservation.leaseId).catch(() => {})
-            }
-          } else {
-            if (reservation.isNewPlaceholder && !(err instanceof SitesError && err.code === 'STALE_REVISION')) {
+              // Edge unreachable even for probe: release lock lease while preserving op_target_rev
+              // so subsequent reads/writes reconcile before using base CAS (B3).
               await repo
-                .abortPublishPlaceholder(reservation.siteId, userId, reservation.leaseId)
+                .releaseLease(reservation.siteId, userId, reservation.leaseId, false)
                 .catch(() => {})
-            } else {
-              await repo.releaseLease(reservation.siteId, userId, reservation.leaseId).catch(() => {})
             }
+          } else if (err instanceof SitesError && err.code === 'STALE_REVISION') {
+            await repo
+              .releaseLease(reservation.siteId, userId, reservation.leaseId, false)
+              .catch(() => {})
+          } else if (reservation.isNewPlaceholder) {
+            await repo
+              .abortPublishPlaceholder(reservation.siteId, userId, reservation.leaseId)
+              .catch(() => {})
+          } else {
+            await repo
+              .releaseLease(reservation.siteId, userId, reservation.leaseId, true)
+              .catch(() => {})
           }
           if (!committedOnEdge) throw err
         }
@@ -405,15 +427,20 @@ export class SitesService {
             const status = await edge.getSiteStatus({ slug })
             if (status.exists && status.revision === nextRevision) {
               committedOnEdge = true
+            } else if (status.exists && status.revision === site.edgeRevision) {
+              await repo.releaseLease(site.id, userId, leaseId, true).catch(() => {})
+            } else {
+              await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})
             }
           } catch {
-            /* keep committedOnEdge=false and release lease */
+            await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})
           }
+        } else if (err instanceof SitesError && err.code === 'STALE_REVISION') {
+          await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})
+        } else {
+          await repo.releaseLease(site.id, userId, leaseId, true).catch(() => {})
         }
-        if (!committedOnEdge) {
-          await repo.releaseLease(site.id, userId, leaseId).catch(() => {})
-          throw err
-        }
+        if (!committedOnEdge) throw err
       }
 
       return repo.commitMetaUpdate({
@@ -447,15 +474,20 @@ export class SitesService {
             const status = await edge.getSiteStatus({ slug })
             if (!status.exists && status.tombstoneRevision >= deleteRevision) {
               deletedOnEdge = true
+            } else if (status.exists && status.revision === site.edgeRevision) {
+              await repo.releaseLease(site.id, userId, leaseId, true).catch(() => {})
+            } else {
+              await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})
             }
           } catch {
-            /* keep deletedOnEdge=false and release lease */
+            await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})
           }
+        } else if (err instanceof SitesError && err.code === 'STALE_REVISION') {
+          await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})
+        } else {
+          await repo.releaseLease(site.id, userId, leaseId, true).catch(() => {})
         }
-        if (!deletedOnEdge) {
-          await repo.releaseLease(site.id, userId, leaseId).catch(() => {})
-          throw err
-        }
+        if (!deletedOnEdge) throw err
       }
       await repo.commitDelete(site.id, userId, leaseId, deleteRevision)
     })

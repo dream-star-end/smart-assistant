@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS user_sites (
   op_lease_id UUID,
   op_lease_until TIMESTAMPTZ,
   op_expected_rev BIGINT NOT NULL DEFAULT 0 CHECK (op_expected_rev >= 0),
+  op_target_rev BIGINT NOT NULL DEFAULT 0 CHECK (op_target_rev >= 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -39,3 +40,7 @@ CREATE TABLE IF NOT EXISTS user_sites (
 
 CREATE INDEX IF NOT EXISTS idx_user_sites_user_updated
   ON user_sites (user_id, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_user_sites_user_pending
+  ON user_sites (user_id)
+  WHERE edge_revision = 0 OR op_target_rev > edge_revision;

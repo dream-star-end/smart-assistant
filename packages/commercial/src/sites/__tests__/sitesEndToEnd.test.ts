@@ -45,6 +45,7 @@ function createInMemorySitesRepo(): SitesRepo & {
 } {
   const bySlug = new Map<string, UserSiteRow>()
   const leases = new Map<string, { leaseId: string; leaseUntil: number; expectedRev: number }>()
+  const targetRevs = new Map<string, number>()
   let revCounter = 0
   let idSeq = 0
   const LEASE_TTL_MS = 60_000
@@ -69,21 +70,39 @@ function createInMemorySitesRepo(): SitesRepo & {
       if (!row || row.userId !== userId || row.edgeRevision <= 0) return null
       return row
     },
-    async listUnleasedPlaceholdersByUser(userId) {
+    async listUnleasedPendingByUser(userId) {
       const now = Date.now()
       return [...bySlug.values()]
         .filter((r) => {
           const lease = leases.get(r.id)
-          return r.userId === userId && r.edgeRevision === 0 && (!lease || lease.leaseUntil <= now)
+          const pendingRev = targetRevs.get(r.id) ?? 0
+          return (
+            r.userId === userId &&
+            (!lease || lease.leaseUntil <= now) &&
+            (r.edgeRevision === 0 || pendingRev > r.edgeRevision)
+          )
         })
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
     },
-    async promoteUnleasedPlaceholder(input) {
+    async tryClaimReconcileLease(siteId, userId) {
+      const cur = [...bySlug.values()].find((r) => r.id === siteId && r.userId === userId)
+      if (!cur) return null
+      if (isLeaseActive(cur.id)) return null
+      const pendingRev = targetRevs.get(cur.id) ?? 0
+      if (cur.edgeRevision > 0 && pendingRev <= cur.edgeRevision) return null
+      const leaseId = randomUUID()
+      leases.set(cur.id, {
+        leaseId,
+        leaseUntil: Date.now() + LEASE_TTL_MS,
+        expectedRev: cur.edgeRevision,
+      })
+      return { row: cur, leaseId }
+    },
+    async reconcileFromEdge(input) {
       const cur = [...bySlug.values()].find((r) => r.id === input.siteId && r.userId === input.userId)
-      if (!cur || cur.edgeRevision !== 0) return null
+      if (!cur) return null
       const lease = leases.get(cur.id)
-      if (lease && lease.leaseUntil > Date.now()) return null
-      if (cur.edgeRevision >= input.edgeRevision) return null
+      if (lease?.leaseId !== input.leaseId || cur.edgeRevision >= input.edgeRevision) return null
       const now = new Date()
       const updated: UserSiteRow = {
         ...cur,
@@ -97,25 +116,12 @@ function createInMemorySitesRepo(): SitesRepo & {
         contentSha256: input.contentSha256,
         edgeRevision: input.edgeRevision,
         updatedAt: now,
-        lastPublishedAt: now,
+        lastPublishedAt: cur.edgeRevision === 0 ? now : cur.lastPublishedAt,
       }
       bySlug.set(cur.slug, updated)
       leases.delete(cur.id)
+      targetRevs.delete(cur.id)
       return updated
-    },
-    async deleteUnleasedPlaceholder(siteId, userId) {
-      for (const [slug, r] of bySlug) {
-        const lease = leases.get(r.id)
-        if (
-          r.id === siteId &&
-          r.userId === userId &&
-          r.edgeRevision === 0 &&
-          (!lease || lease.leaseUntil <= Date.now())
-        ) {
-          bySlug.delete(slug)
-          leases.delete(r.id)
-        }
-      }
     },
     async beginPublishReservation(input: PublishReservationInput): Promise<PublishReservation> {
       const existing = bySlug.get(input.slug)
@@ -135,6 +141,7 @@ function createInMemorySitesRepo(): SitesRepo & {
         }
         revCounter += 1
         leases.set(existing.id, { leaseId, leaseUntil, expectedRev: existing.edgeRevision })
+        targetRevs.set(existing.id, revCounter)
         return {
           siteId: existing.id,
           leaseId,
@@ -170,6 +177,7 @@ function createInMemorySitesRepo(): SitesRepo & {
       }
       bySlug.set(input.slug, row)
       leases.set(row.id, { leaseId, leaseUntil, expectedRev: 0 })
+      targetRevs.set(row.id, revCounter)
       return {
         siteId: row.id,
         leaseId,
@@ -200,6 +208,7 @@ function createInMemorySitesRepo(): SitesRepo & {
         }
         bySlug.set(cur.slug, updated)
         if (leases.get(cur.id)?.leaseId === input.leaseId) leases.delete(cur.id)
+        if ((targetRevs.get(cur.id) ?? 0) <= input.edgeRevision) targetRevs.delete(cur.id)
         return updated
       }
       if (cur.edgeRevision === input.edgeRevision) return cur
@@ -216,14 +225,18 @@ function createInMemorySitesRepo(): SitesRepo & {
         ) {
           bySlug.delete(slug)
           leases.delete(r.id)
+          targetRevs.delete(r.id)
         }
       }
     },
-    async releaseLease(siteId, userId, leaseId) {
+    async releaseLease(siteId, userId, leaseId, clearTarget = true) {
       const r = [...bySlug.values()].find((row) => row.id === siteId && row.userId === userId)
       if (!r) return
       const lease = leases.get(r.id)
-      if (lease?.leaseId === leaseId) leases.delete(r.id)
+      if (lease?.leaseId === leaseId) {
+        leases.delete(r.id)
+        if (clearTarget) targetRevs.delete(r.id)
+      }
     },
     async prepareMetaUpdate(userId, slug): Promise<MetaUpdateReservation> {
       const row = bySlug.get(slug)
@@ -236,6 +249,7 @@ function createInMemorySitesRepo(): SitesRepo & {
       revCounter += 1
       const leaseId = randomUUID()
       leases.set(row.id, { leaseId, leaseUntil: Date.now() + LEASE_TTL_MS, expectedRev: row.edgeRevision })
+      targetRevs.set(row.id, revCounter)
       return { site: row, leaseId, nextRevision: revCounter }
     },
     async commitMetaUpdate(input): Promise<UserSiteRow> {
@@ -254,6 +268,7 @@ function createInMemorySitesRepo(): SitesRepo & {
         }
         bySlug.set(cur.slug, updated)
         if (leases.get(cur.id)?.leaseId === input.leaseId) leases.delete(cur.id)
+        if ((targetRevs.get(cur.id) ?? 0) <= input.edgeRevision) targetRevs.delete(cur.id)
         return updated
       }
       if (cur.edgeRevision === input.edgeRevision) return cur
@@ -270,6 +285,7 @@ function createInMemorySitesRepo(): SitesRepo & {
       revCounter += 1
       const leaseId = randomUUID()
       leases.set(row.id, { leaseId, leaseUntil: Date.now() + LEASE_TTL_MS, expectedRev: row.edgeRevision })
+      targetRevs.set(row.id, revCounter)
       return { site: row, leaseId, deleteRevision: revCounter }
     },
     async commitDelete(siteId, userId, _leaseId, deleteRevision) {
@@ -277,6 +293,7 @@ function createInMemorySitesRepo(): SitesRepo & {
         if (r.id === siteId && r.userId === userId && r.edgeRevision < deleteRevision) {
           bySlug.delete(slug)
           leases.delete(r.id)
+          targetRevs.delete(r.id)
         }
       }
     },
@@ -981,6 +998,7 @@ describe('sites concurrency, lease fencing, cache isolation, and rate limit (B1-
   test('B3: concurrent first-time publishes lock slug and ambiguous EDGE_UNAVAILABLE reconciles via getSiteStatus', async () => {
     const repo = createInMemorySitesRepo()
     let dropResponseAfterCommit = true
+    let dropPatchAfterCommit = false
     let failBeforeEdge = false
     let failStatusOnce = false
 
@@ -994,6 +1012,13 @@ describe('sites concurrency, lease fencing, cache isolation, and rate limit (B1-
         if (dropResponseAfterCommit) {
           dropResponseAfterCommit = false
           throw new SitesError('EDGE_UNAVAILABLE', 'socket hang up after write', 502, true)
+        }
+      },
+      async updateMeta(args) {
+        await rawEdge.updateMeta(args)
+        if (dropPatchAfterCommit) {
+          dropPatchAfterCommit = false
+          throw new SitesError('EDGE_UNAVAILABLE', 'patch ack lost', 502, true)
         }
       },
       async getSiteStatus(args) {
@@ -1043,6 +1068,46 @@ describe('sites concurrency, lease fencing, cache isolation, and rate limit (B1-
       gzippedBundle: buildStaticBundle(),
     })
     assert.equal(retriedExplicit.title, 'double-fault-updated')
+
+    // Existing-site overwrite publishSite double fault -> recovers cleanly and allows subsequent password PATCH
+    dropResponseAfterCommit = true
+    failStatusOnce = true
+    await assert.rejects(
+      () =>
+        svc.publishSite(1, {
+          slug: 'race-b3-double-fault',
+          title: 'existing-overwrite-fault',
+          gzippedBundle: buildStaticBundle(),
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE',
+    )
+    const afterExistingPw = await svc.updateSite(1, 'race-b3-double-fault', {
+      visibility: 'password',
+      password: 'after-overwrite-99',
+    })
+    assert.equal(afterExistingPw.title, 'existing-overwrite-fault')
+    assert.equal(afterExistingPw.visibility, 'password')
+
+    // Existing-site updateSite PATCH double fault -> recovers cleanly and allows subsequent overwrite publishSite
+    dropPatchAfterCommit = true
+    failStatusOnce = true
+    await assert.rejects(
+      () =>
+        svc.updateSite(1, 'race-b3-double-fault', {
+          title: 'patched-under-fault',
+          visibility: 'disabled',
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE',
+    )
+    const afterPatchRecoverPub = await svc.publishSite(1, {
+      slug: 'race-b3-double-fault',
+      visibility: 'public',
+      gzippedBundle: buildStaticBundle(),
+    })
+    assert.equal(afterPatchRecoverPub.title, 'patched-under-fault')
+    assert.equal(afterPatchRecoverPub.visibility, 'public')
+    const edgeStatusFinal = await rawEdge.getSiteStatus({ slug: 'race-b3-double-fault' })
+    assert.equal(edgeStatusFinal.revision, afterPatchRecoverPub.edgeRevision)
 
     // Failure BEFORE Edge wrote anything -> getSiteStatus sees !exists -> aborts placeholder so retry succeeds cleanly
     failBeforeEdge = true
