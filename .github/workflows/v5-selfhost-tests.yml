@@ -24,6 +24,9 @@ concurrency:
   group: v5-selfhost-tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
 jobs:
   gateway:
     name: selfhost-gateway (${{ matrix.kind }} ${{ matrix.shard }})

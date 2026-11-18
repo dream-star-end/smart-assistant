@@ -19,6 +19,9 @@ concurrency:
   group: v5-selfhost-web-react-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
 jobs:
   web-react:
     name: selfhost-web-react
