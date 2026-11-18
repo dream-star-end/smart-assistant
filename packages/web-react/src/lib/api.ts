@@ -61,6 +61,9 @@ import type {
   OrgPlan,
   OrgSubscriptionInfo,
   OrgPayResult,
+  SitesSummaryResponse,
+  UserSiteItem,
+  UserSiteVisibility,
 } from "./types";
 import { captureIdentityAttempt, resolveIdentity, type ResolvedIdentity } from './resolvedIdentity';
 import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
@@ -2461,6 +2464,43 @@ export const api = {
     jsonOrThrow<{ available?: boolean }>(
       callWithRefresh(a, (t) =>
         fetch("/api/media-generation/capabilities", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  listSites: (a: AuthSession): Promise<SitesSummaryResponse> =>
+    jsonOrThrow<SitesSummaryResponse>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/sites", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  updateSite: (
+    a: AuthSession,
+    slug: string,
+    patch: { title?: string; visibility?: UserSiteVisibility; password?: string; spaMode?: boolean },
+  ): Promise<{ site: UserSiteItem }> =>
+    jsonOrThrow<{ site: UserSiteItem }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sites/${encodeURIComponent(slug)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(patch),
+        }),
+      ),
+    ),
+
+  deleteSite: (a: AuthSession, slug: string): Promise<{ ok: boolean; slug: string }> =>
+    jsonOrThrow<{ ok: boolean; slug: string }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sites/${encodeURIComponent(slug)}`, {
+          method: "DELETE",
           credentials: "include",
           headers: bearerHeaders(t),
         }),

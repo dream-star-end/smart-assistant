@@ -8,7 +8,7 @@ import { PRODUCT_CAPABILITIES, type ProductFeatureId } from "./productCapabiliti
  * 已下线的分区 id（'library' 文献、'optimization' 优化，OCV5-360）不再属于本联合类型；
  * 任何仍带着它们的旧入口都经 normalizeManageTab 回落到默认分区，而不是渲染空白。
  */
-export type ManageTab = "memory" | "skills" | "cron" | "connectors";
+export type ManageTab = "memory" | "skills" | "cron" | "connectors" | "sites";
 
 export type ManageTabDef = {
   id: ManageTab;
@@ -33,6 +33,7 @@ export const MANAGE_TABS: readonly ManageTabDef[] = [
   { id: "skills", label: "技能", blurb: "沉淀下来、可以反复用的做法", featureId: PRODUCT_CAPABILITIES.skills.id },
   { id: "cron", label: "定时", blurb: "到点自动去做的任务", featureId: PRODUCT_CAPABILITIES.schedules.id },
   { id: "connectors", label: "插件", blurb: "已连接的应用和账号", featureId: PRODUCT_CAPABILITIES.connectors.id },
+  { id: "sites", label: "站点", blurb: "发布在公网域名下持久在线的网站", featureId: PRODUCT_CAPABILITIES.containerPreview.id },
 ];
 
 /** 作用范围（个人 / 工作项目）只对这几个分区生效；其余分区不显示范围选择。 */

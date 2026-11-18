@@ -127,6 +127,7 @@ import type { DouyinSetupManager } from '../plugins/douyinSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
+import type { SitesService } from '../sites/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 import type { StudioHttpDeps } from '../media-studio/http.js'
 import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
@@ -145,6 +146,8 @@ export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
   /** Durable local H3 jobs and long-form storyboard projects. */
   mediaGeneration?: MediaGenerationService;
+  /** OCV5-791 persistent static user sites (*.congjianai.com). */
+  sites?: SitesService;
   /** OCV5-561 Muse bridge endpoints; undefined (→ 404) unless OC_MUSE_BRIDGE_ENABLED=1. */
   museBridgeHttp?: MuseBridgeHttpHandler;
   /** OCV5-591 media studio; undefined or disabled (→ 404) unless OC_STUDIO_ENABLED=1. */

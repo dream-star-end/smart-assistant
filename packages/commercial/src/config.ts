@@ -898,8 +898,48 @@ export const commercialConfigSchema = z
     GITHUB_OAUTH_CLIENT_ID: z.string().min(1).optional(),
     GITHUB_OAUTH_CLIENT_SECRET: z.string().min(1).optional(),
     GITHUB_OAUTH_REDIRECT_URI: z.string().url().optional(),
+    /** OCV5-791: Persistent user static sites hosting (*.congjianai.com). */
+    OC_SITES_ENABLED: z
+      .enum(["0", "1", "true", "false"])
+      .optional()
+      .transform((v) => v === "1" || v === "true"),
+    OC_SITES_BASE_DOMAIN: z
+      .string()
+      .trim()
+      .toLowerCase()
+      .regex(
+        /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/,
+        "OC_SITES_BASE_DOMAIN must be a valid domain name",
+      )
+      .default("congjianai.com"),
+    OC_SITES_EDGE_PUSH_URL: urlStringWithProtocols(["http:", "https:"], "OC_SITES_EDGE_PUSH_URL")
+      .optional(),
+    OC_SITES_EDGE_SECRET: z
+      .string()
+      .trim()
+      .min(32, "OC_SITES_EDGE_SECRET must be at least 32 chars")
+      .max(256)
+      .optional(),
+    OC_SITES_MAX_PER_USER: positiveInt(10_000),
+    OC_SITES_MAX_SITE_BYTES: positiveInt(256 * 1024 * 1024),
   })
   .superRefine((cfg, ctx) => {
+    if (cfg.OC_SITES_ENABLED) {
+      if (!cfg.OC_SITES_EDGE_PUSH_URL) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["OC_SITES_EDGE_PUSH_URL"],
+          message: "OC_SITES_EDGE_PUSH_URL is required when OC_SITES_ENABLED is enabled",
+        });
+      }
+      if (!cfg.OC_SITES_EDGE_SECRET) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["OC_SITES_EDGE_SECRET"],
+          message: "OC_SITES_EDGE_SECRET is required when OC_SITES_ENABLED is enabled",
+        });
+      }
+    }
     // "给了一个就都得给":APP_ID / APP_SECRET / CALLBACK_URL 三件套要么全空要么全有。
     // 避免 "半配置" 导致运维以为开了支付但实际不通。
     const hupiTriplet: ReadonlyArray<[string, unknown]> = [

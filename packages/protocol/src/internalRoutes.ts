@@ -125,6 +125,8 @@ export const QQ_OUTBOUND_PATH = '/internal/v3/qq-outbound'
 export const QQ_PROACTIVE_PATH = '/internal/v3/qq-proactive'
 /** master 挂载的市场 agent API 前缀(注意带尾斜杠,startsWith 匹配)。 */
 export const MARKETPLACE_AGENT_PREFIX = '/internal/v3/marketplace/agent/'
+/** master 挂载的持久化静态站点发布前缀(oc-site CLI,startsWith 匹配)。 */
+export const SITES_AGENT_INTERNAL_PREFIX = '/internal/v3/sites/'
 
 // ── v3 master→容器 面(容器 gateway 18789 上服务;不经 egress forwarder)────
 export const WECHAT_INBOUND_CONTAINER_PATH = '/internal/v3/wechat-inbound'
@@ -552,6 +554,15 @@ export const INTERNAL_ROUTES = [
     match: 'prefix',
     plane: 'v3',
     sources: ['gateway/src/v3MarketplaceRelay.ts', 'commercial/src/http/internalMarketplaceAgent.ts'],
+  },
+  {
+    path: SITES_AGENT_INTERNAL_PREFIX,
+    match: 'prefix',
+    plane: 'v3',
+    sources: [
+      'commercial/src/sites/internalHttp.ts',
+      'commercial/agent-sandbox/platform-runtime/bin/oc-site.py',
+    ],
   },
   // ── v3:master→容器(容器 gateway 18789 服务;两侧成对复制)────────────────
   {

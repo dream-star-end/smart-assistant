@@ -312,6 +312,13 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     video: scriptProbe('oc-muse.py', ['video', '--help'], { code: 0, stdout: /--resume/ }),
     fetch: scriptProbe('oc-muse.py', ['fetch', '--help'], { code: 0, stdout: /job_id/ }),
   },
+  'oc-site': {
+    publish: scriptProbe('oc-site.py', ['publish', '--help'], { code: 0, stdout: /--slug/ }),
+    list: scriptProbe('oc-site.py', ['list', '--help'], { code: 0, stdout: /usage: oc-site list/ }),
+    info: scriptProbe('oc-site.py', ['info', '--help'], { code: 0, stdout: /slug/ }),
+    update: scriptProbe('oc-site.py', ['update', '--help'], { code: 0, stdout: /--visibility/ }),
+    delete: scriptProbe('oc-site.py', ['delete', '--help'], { code: 0, stdout: /slug/ }),
+  },
   'oc-h3': {
     generate: scriptProbe('oc-h3.py', ['generate', '--help'], {
       code: 0,
@@ -939,6 +946,9 @@ function productionSurfaces(): Record<string, Set<string>> {
     ),
     'oc-muse': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-muse.py',
+    ),
+    'oc-site': pythonArgparseCommands(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-site.py',
     ),
     'oc-docxcheck': singlePurpose(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docxcheck.sh',
