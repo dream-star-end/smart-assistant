@@ -674,6 +674,11 @@ import { startStudioOrchestrator } from "./media-studio/orchestrator/assemble.js
 import { makeMuseInternalHandler } from "./muse/internalHttp.js";
 import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
+  TAVILY_WEB_SEARCH_PATH,
+  makeTavilyWebSearchHandler,
+  type TavilyWebSearchHandler,
+} from "./tavily/webSearchProxy.js";
+import {
   MINIMAX_WEB_SEARCH_PATH,
   makeMiniMaxWebSearchHandler,
   type MiniMaxWebSearchHandler,
@@ -2299,6 +2304,10 @@ export async function registerCommercial(
       // /internal/v3/muse-media — oc-muse (OCV5-561). 403 MUSE_NOT_ENABLED when off or not allowlisted.
       const museInternalHandler = makeMuseInternalHandler({ identityRepo, hub: museHub });
       const sitesInternalHandler = makeSitesInternalHandler({ identityRepo, sites: sitesService });
+      const tavilyWebSearchHandler: TavilyWebSearchHandler = makeTavilyWebSearchHandler({
+        identityRepo,
+        apiKey: cfg.TAVILY_API_KEY,
+      });
       // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
       // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
       // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
@@ -2890,6 +2899,9 @@ export async function registerCommercial(
         }
         if (path.startsWith(SITES_AGENT_INTERNAL_PREFIX)) {
           return sitesInternalHandler(req, res, ctx);
+        }
+        if (path === TAVILY_WEB_SEARCH_PATH) {
+          return tavilyWebSearchHandler(req, res, ctx);
         }
         if (path === MINIMAX_WEB_SEARCH_PATH) {
           return minimaxWebSearchHandler(req, res, ctx);

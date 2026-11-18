@@ -662,6 +662,8 @@ export const commercialConfigSchema = z
      *   上线前必须在 MiniMax 控制台旋转后再写入生产 env。
     */
     MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /** Tavily Search API key (only on master; containers call /internal/v3/tavily-search). */
+    TAVILY_API_KEY: z.string().trim().min(1).max(512).optional(),
     /**
      * OCV5-589 / D12 (2026-10-23): root-only (0600) file holding the media-only MiniMax key. Set → the
      * media proxy and the media studio read only this file (never falling back to MINIMAX_TOKEN_PLAN_KEY,
