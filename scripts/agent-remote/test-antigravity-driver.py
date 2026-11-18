@@ -632,18 +632,32 @@ for line in sys.stdin:
         continue
     msg = json.loads(line)
     full_cmd = "python3 -c '" + ("a" * 900) + "'"
-    # Simulate Antigravity CLI invoking PreToolUse hook with FULL args, then emitting truncated 512+"…" stream-json!
+    # Mirror real Antigravity CLI 1.5.x (observed live): the PreToolUse payload uses camelCase
+    # `conversationId`/`stepIdx` and its args carry the CLI-injected `toolSummary`, which the CLI
+    # strips before the MCP `tools/call` and never shows in stream-json parameters.
     deny_py = pathlib.Path.cwd().parent / "deny_native.py"
+    sys.stdout.write(json.dumps({"event": "step_update", "step_update": {"conversation_id": conv_id, "step_index": 4, "step_type": "user_input", "state": "DONE"}}) + "\n")
+    sys.stdout.write(json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": conv_id,
+            "step_index": 5,
+            "step_type": "tool",
+            "state": "ACTIVE",
+            "tool_info": {"name": "mcp_ocbridge_Write", "parameters": {"file_path": "/tmp/long.txt", "content": full_cmd[:512] + "\u2026"}},
+        },
+    }) + "\n")
+    sys.stdout.flush()
     hook_in = json.dumps({
-        "toolCall": {"name": "mcp_ocbridge_Write", "args": {"file_path": "/tmp/long.txt", "content": full_cmd}},
+        "toolCall": {"id": "toolu_5", "name": "mcp_ocbridge_Write", "args": {"file_path": "/tmp/long.txt", "content": full_cmd, "toolSummary": "Write long file"}},
         "stepIdx": 5,
-        "conversation_id": conv_id,
+        "conversationId": conv_id,
+        "hookEventName": "PreToolUse",
     })
     hook_res = subprocess.run(["/usr/bin/python3", "-I", "-B", str(deny_py)], input=hook_in, text=True, capture_output=True, check=True)
     assert json.loads(hook_res.stdout)["decision"] == "allow"
     plan_res = subprocess.run(["/usr/bin/python3", "-I", "-B", str(deny_py)], input=json.dumps({"toolCall": {"name": "exit_plan_mode", "args": {}}}), text=True, capture_output=True, check=True)
     assert json.loads(plan_res.stdout)["decision"] == "allow"
-    sys.stdout.write(json.dumps({"event": "step_update", "step_update": {"conversation_id": conv_id, "step_index": 4, "step_type": "user_input", "state": "DONE"}}) + "\n")
     sys.stdout.write(json.dumps({
         "event": "step_update",
         "step_update": {
@@ -654,11 +668,30 @@ for line in sys.stdin:
             "tool_info": {"name": "mcp_ocbridge_Write", "parameters": {"file_path": "/tmp/long.txt", "content": full_cmd[:512] + "\u2026"}},
         },
     }) + "\n")
+    sys.stdout.flush()
+    # Short-arg call whose hook lands BEFORE the stream frame is read: must still observe stream params.
+    short_hook = json.dumps({
+        "toolCall": {"id": "toolu_6", "name": "mcp_ocbridge_Bash", "args": {"command": "ls", "toolSummary": "List"}},
+        "stepIdx": 6,
+        "conversationId": conv_id,
+        "hookEventName": "PreToolUse",
+    })
+    subprocess.run(["/usr/bin/python3", "-I", "-B", str(deny_py)], input=short_hook, text=True, capture_output=True, check=True)
     sys.stdout.write(json.dumps({
         "event": "step_update",
         "step_update": {
             "conversation_id": conv_id,
             "step_index": 6,
+            "step_type": "tool",
+            "state": "ACTIVE",
+            "tool_info": {"name": "mcp_ocbridge_Bash", "parameters": {"command": "ls"}},
+        },
+    }) + "\n")
+    sys.stdout.write(json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": conv_id,
+            "step_index": 7,
             "step_type": "agent_response",
             "state": "DONE",
             "text_delta": "done",
@@ -724,17 +757,31 @@ for line in sys.stdin:
                     proc.stdin.write(ln + "\n")
                 proc.stdin.flush()
                 obs_args = []
+                presented_params = []
                 while hst.get("activeTurn"):
                     ln = proc.stdout.readline()
                     self.assertTrue(ln)
+                    frame = json.loads(ln)
+                    su = (frame.get("raw") or {}).get("step_update") or {}
+                    if su.get("step_type") == "tool":
+                        presented_params.append((su.get("step_index"), su.get("state"), su["tool_info"]["parameters"]))
                     dec_res = mod.decode("native", ln.encode(), hst)
                     hst = dec_res["nextNativeState"]
                     for sev in dec_res["securityEvents"]:
                         if sev["kind"] == "toolCallObserved":
                             obs_args.append(sev)
-                self.assertEqual(len(obs_args), 1)
+                self.assertEqual(len(obs_args), 2)
+                # Observed args must equal what ocbridge `tools/call` receives (no CLI-only `toolSummary`).
                 self.assertEqual(obs_args[0]["arguments"], full_args)
                 self.assertEqual(obs_args[0]["argsHash"], remote_canonical_sha256(full_args))
+                self.assertEqual(obs_args[1]["arguments"], {"command": "ls"})
+                self.assertEqual(obs_args[1]["argsHash"], remote_canonical_sha256({"command": "ls"}))
+                # Every stream frame for the same step carries identical hydrated params.
+                self.assertEqual(
+                    [(i, s, p) for i, s, p in presented_params if i == 5],
+                    [(5, "ACTIVE", full_args), (5, "DONE", full_args)],
+                )
+                self.assertTrue(all("toolSummary" not in p for _, _, p in presented_params))
             finally:
                 for stream in (proc.stdin, proc.stdout, proc.stderr):
                     try:

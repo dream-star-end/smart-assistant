@@ -333,6 +333,18 @@ def spawn_cli(resume_id, effort_val=""):
             return type(cur) is bool and type(full) is bool and cur == full
         return cur == full
 
+    def _restore_truncated(cur, full):
+        # Project the hook's full args onto the stream-visible shape. Only `512 chars + …` strings are
+        # replaced; keys that the CLI injects for itself (e.g. `toolSummary`) and never forwards to the
+        # MCP `tools/call` are dropped, so the observation hashes exactly what ocbridge will receive.
+        if isinstance(cur, str) and cur.endswith("\u2026"):
+            return full
+        if isinstance(cur, dict):
+            return {k: _restore_truncated(v, full[k]) for k, v in cur.items()}
+        if isinstance(cur, list):
+            return [_restore_truncated(a, b) for a, b in zip(cur, full)]
+        return cur
+
     def _read_pretool_doc(path_obj):
         try:
             doc = json.loads(path_obj.read_text(encoding="utf-8"))
@@ -352,8 +364,9 @@ def spawn_cli(resume_id, effort_val=""):
                 if doc and doc.get("name") == tname:
                     dcid = str(doc.get("conversationId") or "")
                     if (not dcid or not scid or dcid == scid) and _value_matches_truncated(cur_params, doc["args"]):
-                        hydrated_by_step[(scid, sidx)] = doc["args"]
-                        return doc["args"]
+                        restored = _restore_truncated(cur_params, doc["args"])
+                        hydrated_by_step[(scid, sidx)] = restored
+                        return restored
         for cand in sorted(pretool_dir.glob("seq_*.json")):
             doc = _read_pretool_doc(cand)
             if not doc or doc.get("name") != tname:
@@ -369,19 +382,21 @@ def spawn_cli(resume_id, effort_val=""):
                     cand.unlink()
                 except OSError:
                     pass
+                restored = _restore_truncated(cur_params, doc["args"])
                 if type(sidx) is int:
-                    hydrated_by_step[(scid, sidx)] = doc["args"]
-                return doc["args"]
+                    hydrated_by_step[(scid, sidx)] = restored
+                return restored
         return None
 
     def hydrate_mcp_tool_params(scid, sidx, tname, cur_params):
+        # Untruncated params already equal the MCP `tools/call` arguments; never swap in hook args.
+        if not _has_truncated_string(cur_params):
+            return cur_params
         if type(sidx) is int and (scid, sidx) in hydrated_by_step:
             return hydrated_by_step[(scid, sidx)]
         found = _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params)
         if found is not None:
             return found
-        if not _has_truncated_string(cur_params):
-            return cur_params
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline:
             time.sleep(0.01)
