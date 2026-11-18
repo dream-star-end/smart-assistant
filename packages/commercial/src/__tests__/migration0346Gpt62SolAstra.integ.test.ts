@@ -60,7 +60,8 @@ async function fetchModels(ids: string[]): Promise<Map<string, ModelRow>> {
             p.default_effort, p.extra_system_prompt, p.min_plan_code
        FROM model_catalog c
        JOIN model_pricing p USING (model_id)
-      WHERE c.model_id = ANY($1::text[])`,
+      WHERE c.model_id = ANY($1::text[])
+        AND c.state <> 'retired'`,
     [ids],
   )
   return new Map(res.rows.map((r) => [r.model_id, r]))
@@ -91,7 +92,7 @@ async function seedRemoteModel(profileId: string, canonical: string, upstream: s
     [profileId, upstream, canonical, canonical],
   )
   const cap = JSON.stringify({ supports_vision: true, reasoning: { supported: ['low', 'medium', 'high', 'xhigh', 'max'], codex_model_default: 'medium' } })
-  const ins = await query<{ entry_id: string; lock_version: number }>(
+  const hist = await query<{ entry_id: string; lock_version: number }>(
     `INSERT INTO model_catalog(model_id, engine, provider_id, placement, upstream_model_id, context_window, capability_profile, capability_schema_version, state)
      VALUES ($1, 'codex', 'codex', 'remote_pool', $2, NULL, $3::jsonb, 1, 'staged')
      RETURNING entry_id::text AS entry_id, lock_version`,
@@ -102,13 +103,25 @@ async function seedRemoteModel(profileId: string, canonical: string, upstream: s
      VALUES ($1, $2, 100, 500, 5, 125, 1, FALSE, 110, 'hidden', 'medium', 0)`,
     [canonical, `${canonical} 远端`],
   )
+  await query('SELECT fn_model_activate_entry($1::bigint, $2::int, NULL)', [hist.rows[0]!.entry_id, hist.rows[0]!.lock_version])
+  const histActive = await query<{ lock_version: number }>('SELECT lock_version FROM model_catalog WHERE entry_id = $1::bigint', [hist.rows[0]!.entry_id])
+  await query('SELECT fn_model_disable_entry($1::bigint, $2::int, NULL)', [hist.rows[0]!.entry_id, histActive.rows[0]!.lock_version])
+  await query('UPDATE model_catalog SET pool_auto_disabled = TRUE WHERE entry_id = $1::bigint', [hist.rows[0]!.entry_id])
+  await query(`UPDATE model_catalog SET state = 'retired' WHERE entry_id = $1::bigint`, [hist.rows[0]!.entry_id])
+
+  const ins = await query<{ entry_id: string; lock_version: number }>(
+    `INSERT INTO model_catalog(model_id, engine, provider_id, placement, upstream_model_id, context_window, capability_profile, capability_schema_version, state)
+     VALUES ($1, 'codex', 'codex', 'remote_pool', $2, NULL, $3::jsonb, 1, 'staged')
+     RETURNING entry_id::text AS entry_id, lock_version`,
+    [canonical, upstream, cap],
+  )
   await query('SELECT fn_model_activate_entry($1::bigint, $2::int, NULL)', [ins.rows[0]!.entry_id, ins.rows[0]!.lock_version])
   if (active) {
     await query(`UPDATE model_pricing SET enabled = TRUE, visibility = 'public', lock_version = lock_version + 1 WHERE model_id = $1`, [canonical])
   } else {
-    const cur = await query<{ entry_id: string; lock_version: number }>('SELECT entry_id::text AS entry_id, lock_version FROM model_catalog WHERE model_id = $1', [canonical])
+    const cur = await query<{ entry_id: string; lock_version: number }>('SELECT entry_id::text AS entry_id, lock_version FROM model_catalog WHERE entry_id = $1::bigint', [ins.rows[0]!.entry_id])
     await query('SELECT fn_model_disable_entry($1::bigint, $2::int, NULL)', [cur.rows[0]!.entry_id, cur.rows[0]!.lock_version])
-    await query('UPDATE model_catalog SET pool_auto_disabled = TRUE WHERE model_id = $1', [canonical])
+    await query('UPDATE model_catalog SET pool_auto_disabled = TRUE WHERE entry_id = $1::bigint', [ins.rows[0]!.entry_id])
   }
 }
 
@@ -261,6 +274,38 @@ describe('0346_selfhost_gpt62_sol_astra_retire_legacy', () => {
     assert.equal(replayAfter.get('gpt-6.2-astra')!.state, 'active')
     assert.equal(replayAfter.get('gpt-6.2-sol')!.state, 'active')
     assert.equal(replayAfter.get('gpt-6-astra')!.state, 'disabled')
+
+    const retiredHistory = await query<{ model_id: string; state: string; pool_auto_disabled: boolean }>(
+      `SELECT model_id, state, pool_auto_disabled FROM model_catalog
+        WHERE model_id IN ('gpt-6-astra-remote', 'gpt-6.1-sol-remote') AND state = 'retired'
+        ORDER BY model_id`,
+    )
+    assert.deepEqual(retiredHistory.rows, [
+      { model_id: 'gpt-6-astra-remote', state: 'retired', pool_auto_disabled: true },
+      { model_id: 'gpt-6.1-sol-remote', state: 'retired', pool_auto_disabled: true },
+    ])
+  })
+
+  test('refuses drifted pre-existing GPT-6.2 row and rolls back atomically', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await resetAndMigrateBefore('0346')
+    const cap = JSON.stringify({ supports_vision: true, reasoning: { supported: ['low', 'medium', 'high', 'xhigh', 'max'], codex_model_default: 'xhigh' } })
+    const ins = await query<{ entry_id: string; lock_version: number }>(
+      `INSERT INTO model_catalog(model_id, engine, provider_id, upstream_model_id, context_window, capability_profile, capability_schema_version, state)
+       VALUES ('gpt-6.2-astra', 'codex', 'codex', NULL, NULL, $1::jsonb, 1, 'staged')
+       RETURNING entry_id::text AS entry_id, lock_version`,
+      [cap],
+    )
+    await query(
+      `INSERT INTO model_pricing(model_id, display_name, input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok, multiplier, enabled, sort_order, visibility, default_effort, lock_version)
+       VALUES ('gpt-6.2-astra', 'GPT-6.2-Astra', 999, 3598, 60, 0, 1, FALSE, 109, 'public', 'xhigh', 0)`,
+    )
+    await query('SELECT fn_model_activate_entry($1::bigint, $2::int, NULL)', [ins.rows[0]!.entry_id, ins.rows[0]!.lock_version])
+
+    await assert.rejects(async () => runMigrations(), /0346 refuses drifted gpt-6\.2-astra row/)
+    const legacy = await fetchModels(['gpt-6-astra', 'gpt-6.1-sol'])
+    assert.equal(legacy.get('gpt-6-astra')!.state, 'active')
+    assert.equal(legacy.get('gpt-6.1-sol')!.state, 'active')
   })
 
   test('is registered in release metadata after 0345_user_sites', async () => {

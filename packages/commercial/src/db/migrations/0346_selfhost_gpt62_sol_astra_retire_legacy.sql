@@ -230,7 +230,7 @@ BEGIN
 
   UPDATE model_catalog
      SET pool_auto_disabled = FALSE
-   WHERE state = 'disabled'
+   WHERE state <> 'retired'
      AND pool_auto_disabled IS TRUE
      AND model_id IN ('gpt-6-astra-remote', 'gpt-6.1-sol-remote');
 
@@ -349,6 +349,7 @@ BEGIN
      OR EXISTS (
        SELECT 1 FROM model_catalog
         WHERE model_id IN ('gpt-6-astra-remote', 'gpt-6.1-sol-remote')
+          AND state <> 'retired'
           AND pool_auto_disabled IS TRUE
      )
      OR (
