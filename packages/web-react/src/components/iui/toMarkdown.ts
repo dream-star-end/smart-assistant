@@ -15,6 +15,7 @@ import { parseUiBlock } from "./parse";
 import { pluginToMarkdown } from "./pluginMarkdown";
 import type { CalcFormat, CalculatorSpec, Cell, IuiSpec, OutlineNode, TableSpec } from "./schema";
 import { validateSpec } from "./schema";
+import { v2ToMarkdown } from "./v2Markdown";
 
 const CURRENCY_PREFIX = new Set(["¥", "￥", "$", "€", "£", "HK$", "US$"]);
 
@@ -365,6 +366,13 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "blog_status":
     case "blog_published":
       return blogToMarkdown(spec);
+    case "deliverables":
+    case "citations":
+    case "runbook":
+    case "prompt_template":
+    case "storyboard":
+    case "flashcards":
+      return v2ToMarkdown(spec);
   }
 }
 

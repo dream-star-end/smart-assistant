@@ -12,9 +12,11 @@ import { MARKET_ALIASES, MARKET_VALIDATORS, type MarketSpec } from "./marketSche
 import { BILI_ALIASES, BILI_VALIDATORS, type BiliSpec } from "./biliSchema";
 import { BLOG_ALIASES, BLOG_VALIDATORS, type BlogSpec } from "./blogSchema";
 import { PLUGIN_ALIASES, PLUGIN_VALIDATORS, type PluginSpec } from "./pluginSchema";
+import { V2_ALIASES, V2_VALIDATORS, type V2Spec } from "./v2Schema";
 
 export type { IntradaySpec, KlineSpec, MarketSpec, QuoteSpec, StockListSpec } from "./marketSchema";
 export type { FeishuDocSpec, FeishuEventsSpec, PluginSpec, WeiboHotSpec, WeiboPostsSpec, ZhihuAnswersSpec, ZhihuHotSpec } from "./pluginSchema";
+export type { CitationsSpec, DeliverablesSpec, FlashcardsSpec, PromptTemplateSpec, RunbookSpec, StoryboardSpec, V2Spec } from "./v2Schema";
 
 export type Cell = string | number | null;
 
@@ -247,7 +249,8 @@ export type IuiSpec =
   | MarketSpec
   | PluginSpec
   | BiliSpec
-  | BlogSpec;
+  | BlogSpec
+  | V2Spec;
 
 export type IuiType = IuiSpec["type"];
 
@@ -276,6 +279,12 @@ export const IUI_TYPES: readonly IuiType[] = [
   "sources",
   "outline",
   "draft",
+  "deliverables",
+  "citations",
+  "runbook",
+  "prompt_template",
+  "storyboard",
+  "flashcards",
   "quote",
   "kline",
   "intraday",
@@ -1209,6 +1218,7 @@ const VALIDATORS: Record<IuiType, (raw: Record<string, unknown>, ctx: Ctx) => Iu
   ...PLUGIN_VALIDATORS,
   ...BILI_VALIDATORS,
   ...BLOG_VALIDATORS,
+  ...V2_VALIDATORS,
 };
 
 /** 常见别名(模型偶尔写成其它名字)。 */
@@ -1244,7 +1254,6 @@ const TYPE_ALIASES: Record<string, IuiType> = {
   followups: "suggestions",
   follow_up: "suggestions",
   references: "sources",
-  citations: "sources",
   refs: "sources",
   links: "sources",
   tree: "outline",
@@ -1256,6 +1265,7 @@ const TYPE_ALIASES: Record<string, IuiType> = {
   ...PLUGIN_ALIASES,
   ...BILI_ALIASES,
   ...BLOG_ALIASES,
+  ...V2_ALIASES,
 };
 
 export function resolveType(raw: unknown): IuiType | null {

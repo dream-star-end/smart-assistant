@@ -38,6 +38,12 @@
 - choice:{"type":"choice","question"?,"multi"?,"options":["选项" 或 {"label","desc"?}]} —— 点选后作为用户消息发出
 - form:{"type":"form","fields":[{"id","label","kind"?:"text"|"textarea"|"number"|"select"|"chips"|"date","options"?,"multi"?,"unit"?,"placeholder"?,"required"?}],"submit"?} —— 填完作为一条用户消息发出
 - suggestions:{"type":"suggestions","items":["用户可能想接着问的一句话"]} —— 放在回答末尾,点一下直接发送
+- deliverables:{"type":"deliverables","items":[{"name":"文件名","path"?:工作区路径或https链接,"ext"?,"size"?,"meta"?,"desc"?,"preview"?}]} —— 多文件交付物工作台(支持页内速览与打包下载)
+- citations:{"type":"citations","items":[{"id":"1","title","meta"?,"url"?,"tags"?:[],"conclusion"?,"abstract"?,"gbt"?,"bibtex"?}]} —— 科研/检索文献精读卡(摘要折叠、国标/BibTeX 一键复制,链接须来自真实工具返回;普通末尾来源仍用普通 Markdown)
+- runbook:{"type":"runbook","vars":[{"id","label","value","placeholder"?}],"steps":[{"title","command","detail"?,"danger"?:true}]} —— 参数化运维命令流(改变量实时替换命令中的 `{{id}}`)
+- prompt_template:{"type":"prompt_template","template":"含{{slot}}的模板","slots":[{"id","label","value"?,"options"?:[],"placeholder"?}],"submit"?} —— 可点选填空的提示词/公文模板卡
+- storyboard:{"type":"storyboard","cps"?:4.5,"shots":[{"no"?,"shotType"?,"line","prompt"?,"image"?,"duration"?}]} —— 视频分镜脚本卡(按语速重算时长、可编辑台词)
+- flashcards:{"type":"flashcards","cards":[{"front","back","tag"?,"hint"?}]} —— 双面记忆闪卡(正反翻面与掌握进度)
 
 ## 示例
 ```ui
