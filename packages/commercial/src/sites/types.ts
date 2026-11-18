@@ -24,6 +24,7 @@ export type SitesErrorCode =
   | 'INVALID_INPUT'
   | 'EDGE_UNAVAILABLE'
   | 'STALE_REVISION'
+  | 'SLUG_BUSY'
 
 export class SitesError extends Error {
   constructor(
@@ -337,6 +338,7 @@ export interface EdgeMetaEnvelope {
   passwordHash: string | null
   spaMode: boolean
   contentSha256?: string
+  expectedBaseRevision?: number
 }
 
 export interface SignedEdgeHeaders {
@@ -431,6 +433,11 @@ export function verifyEdgeHeaders(args: {
         passwordHash: typeof parsed.passwordHash === 'string' ? parsed.passwordHash : null,
         spaMode: parsed.spaMode !== false,
         ...(typeof parsed.contentSha256 === 'string' ? { contentSha256: parsed.contentSha256 } : {}),
+        ...(typeof parsed.expectedBaseRevision === 'number' &&
+        Number.isSafeInteger(parsed.expectedBaseRevision) &&
+        parsed.expectedBaseRevision >= 0
+          ? { expectedBaseRevision: parsed.expectedBaseRevision }
+          : {}),
       }
       if (meta.visibility === 'password' && (!meta.passwordSalt || !meta.passwordHash)) {
         throw new Error('missing password hash')

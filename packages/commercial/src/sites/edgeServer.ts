@@ -113,10 +113,14 @@ function sendJsonResponse(res: ServerResponse, status: number, payload: unknown)
   res.end(body)
 }
 
-function sendSiteHtml(res: ServerResponse, status: number, html: string): void {
+function sendSiteHtml(res: ServerResponse, status: number, html: string, isPrivate = false): void {
   res.statusCode = status
   res.setHeader('Content-Type', 'text/html; charset=utf-8')
-  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('Cache-Control', isPrivate ? 'private, no-store' : 'no-store')
+  if (isPrivate) {
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Vary', 'Cookie')
+  }
   setPublicSiteSecurityHeaders(res)
   res.end(html)
 }
@@ -284,6 +288,7 @@ function serveStaticFile(
   filePath: string,
   relHint: string,
   status = 200,
+  visibility: SiteVisibility = 'public',
 ): void {
   const st = statSync(filePath)
   const etag = `"${st.size.toString(16)}-${Math.trunc(st.mtimeMs).toString(16)}"`
@@ -296,19 +301,26 @@ function serveStaticFile(
   if (!mime) {
     res.setHeader('Content-Disposition', 'attachment')
   }
-  if (ext === '.html' || ext === '.htm' || status >= 400) {
-    res.setHeader('Cache-Control', 'no-cache')
-  } else if (hasImmutableAssetHint(relHint)) {
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  if (visibility !== 'public') {
+    // Never allow shared/browser caching or conditional 304 revalidation for protected content (B4).
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Vary', 'Cookie')
   } else {
-    res.setHeader('Cache-Control', 'public, max-age=300')
-  }
-  res.setHeader('ETag', etag)
+    if (ext === '.html' || ext === '.htm' || status >= 400) {
+      res.setHeader('Cache-Control', 'no-cache')
+    } else if (hasImmutableAssetHint(relHint)) {
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+    } else {
+      res.setHeader('Cache-Control', 'public, max-age=300')
+    }
+    res.setHeader('ETag', etag)
 
-  if (status === 200 && req.headers['if-none-match'] === etag) {
-    res.statusCode = 304
-    res.end()
-    return
+    if (status === 200 && req.headers['if-none-match'] === etag) {
+      res.statusCode = 304
+      res.end()
+      return
+    }
   }
 
   res.statusCode = status
@@ -341,7 +353,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
 
   const slugLocks = new Map<string, Promise<void>>()
   const usedNonces = new Map<string, number>()
-  const unlockFailures = new Map<string, { count: number; resetAt: number }>()
+  const unlockFailures = new Map<string, { count: number; inflight: number; resetAt: number }>()
 
   const sweepTimer = setInterval(() => {
     const nowMs = Date.now()
@@ -349,7 +361,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       if (exp <= nowMs) usedNonces.delete(k)
     }
     for (const [k, v] of unlockFailures) {
-      if (v.resetAt <= nowMs) unlockFailures.delete(k)
+      if (v.resetAt <= nowMs && v.inflight <= 0) unlockFailures.delete(k)
     }
   }, 60_000)
   sweepTimer.unref()
@@ -486,6 +498,34 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     })
     recordNonce(verified.nonce)
 
+    if (method === 'GET' && putOrDeleteMatch) {
+      await withSlugLock(slug, async () => {
+        const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
+        const liveRevision =
+          curMeta && (!tombstone || tombstone.revision < curMeta.revision) ? curMeta.revision : 0
+        sendJsonResponse(res, 200, {
+          exists: liveRevision > 0,
+          revision: liveRevision,
+          tombstoneRevision: tombstone?.revision ?? 0,
+          ...(liveRevision > 0 && curMeta
+            ? {
+                meta: {
+                  title: curMeta.title,
+                  visibility: curMeta.visibility,
+                  passwordSalt: curMeta.passwordSalt,
+                  passwordHash: curMeta.passwordHash,
+                  spaMode: curMeta.spaMode,
+                  fileCount: curMeta.fileCount,
+                  sizeBytes: curMeta.sizeBytes,
+                  contentSha256: curMeta.contentSha256,
+                },
+              }
+            : {}),
+        })
+      })
+      return
+    }
+
     if (method === 'PUT' && putOrDeleteMatch) {
       const decoded = decodeSiteBundle(body, maxSiteBytes)
       const envelope: EdgeMetaEnvelope = verified.meta ?? {
@@ -500,6 +540,8 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         mkdirSync(join(dir, 'releases'), { recursive: true })
         const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
         const currentMax = Math.max(curMeta?.revision ?? 0, tombstone?.revision ?? 0)
+        const liveRev =
+          curMeta && (!tombstone || tombstone.revision < curMeta.revision) ? curMeta.revision : 0
         if (verified.revision <= currentMax) {
           if (
             curMeta &&
@@ -511,6 +553,12 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             return
           }
           throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
+        }
+        if (
+          envelope.expectedBaseRevision !== undefined &&
+          liveRev !== envelope.expectedBaseRevision
+        ) {
+          throw new SitesError('STALE_REVISION', 'edge base revision mismatch', 409)
         }
 
         const revName = `rev-${verified.revision}`
@@ -592,6 +640,12 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           }
           throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
         }
+        if (
+          envelope!.expectedBaseRevision !== undefined &&
+          curMeta.revision !== envelope!.expectedBaseRevision
+        ) {
+          throw new SitesError('STALE_REVISION', 'edge base revision mismatch', 409)
+        }
         const nextMeta: StoredSiteMeta = {
           ...curMeta,
           revision: verified.revision,
@@ -659,16 +713,34 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       req.headers['x-forwarded-proto'] === 'https' ||
       (req.socket as { encrypted?: boolean }).encrypted === true
 
+    const isProtected = meta.visibility !== 'public'
     if (meta.visibility === 'password') {
       if (method === 'POST' && url.pathname === '/__oc_site_unlock') {
-        const clientIp =
-          (typeof req.headers['x-real-ip'] === 'string' && req.headers['x-real-ip'].trim()) ||
-          req.socket.remoteAddress ||
-          'unknown'
+        const remoteIp = req.socket.remoteAddress
+        const forwardedRealIp =
+          isLoopbackIp(remoteIp) && typeof req.headers['x-real-ip'] === 'string'
+            ? req.headers['x-real-ip'].trim()
+            : ''
+        const clientIp = forwardedRealIp || remoteIp || 'unknown'
         const limitKey = `${clientIp}:${slug}`
         const nowMs = Date.now()
-        const rec = unlockFailures.get(limitKey)
-        if (rec && rec.resetAt > nowMs && rec.count >= UNLOCK_MAX_FAILS) {
+        let rec = unlockFailures.get(limitKey)
+        if (!rec || rec.resetAt <= nowMs) {
+          rec = { count: 0, inflight: 0, resetAt: nowMs + UNLOCK_WINDOW_MS }
+          if (unlockFailures.size >= MAX_UNLOCK_FAIL_CACHE) {
+            for (const [k, v] of unlockFailures) {
+              if (
+                (v.resetAt <= nowMs && v.inflight <= 0) ||
+                (v.inflight <= 0 && unlockFailures.size >= MAX_UNLOCK_FAIL_CACHE)
+              ) {
+                unlockFailures.delete(k)
+              }
+              if (unlockFailures.size < MAX_UNLOCK_FAIL_CACHE * 0.8) break
+            }
+          }
+          unlockFailures.set(limitKey, rec)
+        }
+        if (rec.count + rec.inflight >= UNLOCK_MAX_FAILS) {
           sendSiteHtml(
             res,
             429,
@@ -677,52 +749,53 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
               redirectPath: '/',
               errorMsg: '尝试次数过多，请 5 分钟后再试',
             }),
+            true,
           )
           return
         }
 
-        const rawForm = (await readBodyLimited(req, MAX_UNLOCK_BODY_BYTES)).toString('utf8')
-        const form = new URLSearchParams(rawForm)
-        const password = form.get('password') ?? ''
-        const redirectPath = sanitizeRedirectTarget(form.get('redirect'))
+        // Reserve failure slot synchronously before awaiting request body to prevent concurrent burst bypass (B6).
+        rec.inflight += 1
+        let unlockedOk = false
+        let redirectPath = '/'
+        try {
+          const rawForm = (await readBodyLimited(req, MAX_UNLOCK_BODY_BYTES)).toString('utf8')
+          const form = new URLSearchParams(rawForm)
+          const password = form.get('password') ?? ''
+          redirectPath = sanitizeRedirectTarget(form.get('redirect'))
 
-        if (
-          meta.passwordSalt &&
-          meta.passwordHash &&
-          verifySitePassword(password, meta.passwordSalt, meta.passwordHash)
-        ) {
-          unlockFailures.delete(limitKey)
-          const expSec = Math.floor(Date.now() / 1000) + cookieTtlSec
-          const token = signSiteCookie(slug, meta.passwordHash, expSec)
-          const cookieParts = [
-            `${SITE_AUTH_COOKIE_NAME}=${token}`,
-            'Path=/',
-            'HttpOnly',
-            'SameSite=Lax',
-            `Max-Age=${cookieTtlSec}`,
-          ]
-          if (isHttps) cookieParts.push('Secure')
-          res.statusCode = 303
-          res.setHeader('Set-Cookie', cookieParts.join('; '))
-          res.setHeader('Location', redirectPath)
-          res.setHeader('Cache-Control', 'no-store')
-          res.end()
-          return
-        }
-
-        if (unlockFailures.size >= MAX_UNLOCK_FAIL_CACHE) {
-          for (const [k, v] of unlockFailures) {
-            if (v.resetAt <= nowMs || unlockFailures.size >= MAX_UNLOCK_FAIL_CACHE) {
-              unlockFailures.delete(k)
-            }
-            if (unlockFailures.size < MAX_UNLOCK_FAIL_CACHE * 0.8) break
+          if (
+            meta.passwordSalt &&
+            meta.passwordHash &&
+            verifySitePassword(password, meta.passwordSalt, meta.passwordHash)
+          ) {
+            unlockedOk = true
+            unlockFailures.delete(limitKey)
+            const expSec = Math.floor(Date.now() / 1000) + cookieTtlSec
+            const token = signSiteCookie(slug, meta.passwordHash, expSec)
+            const cookieParts = [
+              `${SITE_AUTH_COOKIE_NAME}=${token}`,
+              'Path=/',
+              'HttpOnly',
+              'SameSite=Lax',
+              `Max-Age=${cookieTtlSec}`,
+            ]
+            if (isHttps) cookieParts.push('Secure')
+            res.statusCode = 303
+            res.setHeader('Set-Cookie', cookieParts.join('; '))
+            res.setHeader('Location', redirectPath)
+            res.setHeader('Cache-Control', 'no-store')
+            res.setHeader('Vary', 'Cookie')
+            res.end()
+            return
+          }
+        } finally {
+          rec.inflight = Math.max(0, rec.inflight - 1)
+          if (!unlockedOk && unlockFailures.has(limitKey)) {
+            rec.count += 1
           }
         }
-        const nextCount = rec && rec.resetAt > nowMs ? rec.count + 1 : 1
-        unlockFailures.set(limitKey, {
-          count: nextCount,
-          resetAt: rec && rec.resetAt > nowMs ? rec.resetAt : nowMs + UNLOCK_WINDOW_MS,
-        })
+
         sendSiteHtml(
           res,
           401,
@@ -731,6 +804,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             redirectPath,
             errorMsg: '口令不正确，请重试',
           }),
+          true,
         )
         return
       }
@@ -747,6 +821,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             title: meta.title,
             redirectPath: sanitizeRedirectTarget(url.pathname + url.search),
           }),
+          true,
         )
         return
       }
@@ -764,23 +839,23 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     try {
       decodedPath = decodeURIComponent(url.pathname)
     } catch {
-      sendSiteHtml(res, 400, renderStatusHtml('请求路径无效', 'URL 编码不合法。'))
+      sendSiteHtml(res, 400, renderStatusHtml('请求路径无效', 'URL 编码不合法。'), isProtected)
       return
     }
     if (decodedPath.includes('\0') || decodedPath.includes('\\')) {
-      sendSiteHtml(res, 400, renderStatusHtml('请求路径无效', '包含非法路径字符。'))
+      sendSiteHtml(res, 400, renderStatusHtml('请求路径无效', '包含非法路径字符。'), isProtected)
       return
     }
     const cleanRel = decodedPath.replace(/^\/+/, '').replace(/\/+$/, '')
     const segs = cleanRel ? cleanRel.split('/') : []
     if (segs.some((s) => !s || s === '.' || s === '..')) {
-      sendSiteHtml(res, 400, renderStatusHtml('请求路径无效', '不允许包含相对跳转路径。'))
+      sendSiteHtml(res, 400, renderStatusHtml('请求路径无效', '不允许包含相对跳转路径。'), isProtected)
       return
     }
 
     const hit = resolveCandidateFile(currentReal, cleanRel)
     if (hit) {
-      serveStaticFile(req, res, hit, cleanRel, 200)
+      serveStaticFile(req, res, hit, cleanRel, 200, meta.visibility)
       return
     }
 
@@ -789,17 +864,22 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     if (meta.spaMode && looksLikeRoute) {
       const spaIndex = resolveCandidateFile(currentReal, '')
       if (spaIndex) {
-        serveStaticFile(req, res, spaIndex, 'index.html', 200)
+        serveStaticFile(req, res, spaIndex, 'index.html', 200, meta.visibility)
         return
       }
     }
 
     const custom404 = resolveCandidateFile(currentReal, '404.html')
     if (custom404) {
-      serveStaticFile(req, res, custom404, '404.html', 404)
+      serveStaticFile(req, res, custom404, '404.html', 404, meta.visibility)
       return
     }
-    sendSiteHtml(res, 404, renderStatusHtml('页面不存在 (404)', '当前站点中没有找到请求的页面或文件。'))
+    sendSiteHtml(
+      res,
+      404,
+      renderStatusHtml('页面不存在 (404)', '当前站点中没有找到请求的页面或文件。'),
+      isProtected,
+    )
   }
 
   const server: Server = createServer((req, res) => {
@@ -873,9 +953,14 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
   }
 }
 
-const isEntrypoint =
-  typeof process.argv[1] === 'string' &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
+let isEntrypoint = false
+if (typeof process.argv[1] === 'string') {
+  try {
+    isEntrypoint = import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+  } catch {
+    isEntrypoint = import.meta.url === pathToFileURL(process.argv[1]).href
+  }
+}
 
 if (isEntrypoint) {
   const secret = (process.env.OC_SITES_EDGE_SECRET ?? '').trim()

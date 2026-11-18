@@ -3,9 +3,28 @@ import { request as httpsRequest } from 'node:https'
 import {
   type EdgeMetaEnvelope,
   SITE_EDGE_PREFIX,
+  type SiteVisibility,
   SitesError,
   signEdgeHeaders,
 } from './types.js'
+
+export interface EdgeSiteStatusMeta {
+  title: string
+  visibility: SiteVisibility
+  passwordSalt: string | null
+  passwordHash: string | null
+  spaMode: boolean
+  fileCount: number
+  sizeBytes: number
+  contentSha256: string
+}
+
+export interface EdgeSiteStatus {
+  exists: boolean
+  revision: number
+  tombstoneRevision: number
+  meta?: EdgeSiteStatusMeta
+}
 
 export interface SitesEdgeClient {
   pushBundle(args: {
@@ -23,10 +42,11 @@ export interface SitesEdgeClient {
     slug: string
     revision: number
   }): Promise<void>
+  getSiteStatus(args: { slug: string }): Promise<EdgeSiteStatus>
 }
 
 const EDGE_REQUEST_TIMEOUT_MS = 30_000
-const MAX_ERROR_BODY_BYTES = 16 * 1024
+const MAX_RESPONSE_BODY_BYTES = 32 * 1024
 
 export function createHttpSitesEdgeClient(opts: {
   baseUrl: string
@@ -38,13 +58,13 @@ export function createHttpSitesEdgeClient(opts: {
   const timeoutMs = opts.timeoutMs ?? EDGE_REQUEST_TIMEOUT_MS
 
   async function sendSigned(args: {
-    method: 'PUT' | 'PATCH' | 'DELETE'
+    method: 'GET' | 'PUT' | 'PATCH' | 'DELETE'
     subPath: string
     revision: number
     body: Buffer
     contentType?: string
     meta?: EdgeMetaEnvelope
-  }): Promise<void> {
+  }): Promise<string> {
     const pathname = `${basePath}${SITE_EDGE_PREFIX}${args.subPath}`
     const target = new URL(pathname, baseUrl)
     const signedHeaders = signEdgeHeaders({
@@ -81,8 +101,8 @@ export function createHttpSitesEdgeClient(opts: {
             const chunks: Buffer[] = []
             let total = 0
             res.on('data', (chunk: Buffer) => {
-              if (total < MAX_ERROR_BODY_BYTES) {
-                const slice = chunk.subarray(0, MAX_ERROR_BODY_BYTES - total)
+              if (total < MAX_RESPONSE_BODY_BYTES) {
+                const slice = chunk.subarray(0, MAX_RESPONSE_BODY_BYTES - total)
                 chunks.push(slice)
                 total += slice.length
               }
@@ -114,7 +134,7 @@ export function createHttpSitesEdgeClient(opts: {
       )
     })
 
-    if (status >= 200 && status < 300) return
+    if (status >= 200 && status < 300) return rawBody
 
     let parsedCode = ''
     let parsedMsg = ''
@@ -150,8 +170,8 @@ export function createHttpSitesEdgeClient(opts: {
   }
 
   return {
-    pushBundle({ slug, revision, gzippedBundle, meta }) {
-      return sendSigned({
+    async pushBundle({ slug, revision, gzippedBundle, meta }) {
+      await sendSigned({
         method: 'PUT',
         subPath: `/sites/${encodeURIComponent(slug)}`,
         revision,
@@ -160,9 +180,9 @@ export function createHttpSitesEdgeClient(opts: {
         meta,
       })
     },
-    updateMeta({ slug, revision, meta }) {
+    async updateMeta({ slug, revision, meta }) {
       const body = Buffer.from(JSON.stringify(meta), 'utf8')
-      return sendSigned({
+      await sendSigned({
         method: 'PATCH',
         subPath: `/sites/${encodeURIComponent(slug)}/meta`,
         revision,
@@ -171,13 +191,28 @@ export function createHttpSitesEdgeClient(opts: {
         meta,
       })
     },
-    deleteSite({ slug, revision }) {
-      return sendSigned({
+    async deleteSite({ slug, revision }) {
+      await sendSigned({
         method: 'DELETE',
         subPath: `/sites/${encodeURIComponent(slug)}`,
         revision,
         body: Buffer.alloc(0),
       })
+    },
+    async getSiteStatus({ slug }) {
+      const raw = await sendSigned({
+        method: 'GET',
+        subPath: `/sites/${encodeURIComponent(slug)}`,
+        revision: 1,
+        body: Buffer.alloc(0),
+      })
+      const parsed = JSON.parse(raw) as EdgeSiteStatus
+      return {
+        exists: Boolean(parsed.exists),
+        revision: Number(parsed.revision || 0),
+        tombstoneRevision: Number(parsed.tombstoneRevision || 0),
+        ...(parsed.meta && typeof parsed.meta === 'object' ? { meta: parsed.meta } : {}),
+      }
     },
   }
 }

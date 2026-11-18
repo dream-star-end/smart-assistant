@@ -1,9 +1,12 @@
+import { randomUUID } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
 import {
   SitesError,
   type SiteVisibility,
   type UserSiteRow,
 } from './types.js'
+
+const OP_LEASE_TTL_MS = 60_000
 
 export interface PublishReservationInput {
   userId: number
@@ -18,14 +21,17 @@ export interface PublishReservationInput {
 
 export interface PublishReservation {
   siteId: string
+  leaseId: string
   isNewPlaceholder: boolean
   edgeRevision: number
+  baseRevision: number
   existing: UserSiteRow | null
 }
 
 export interface CommitPublishInput {
   siteId: string
   userId: number
+  leaseId: string
   title: string
   visibility: SiteVisibility
   passwordSalt: string | null
@@ -39,24 +45,31 @@ export interface CommitPublishInput {
 
 export interface MetaUpdateReservation {
   site: UserSiteRow
+  leaseId: string
   nextRevision: number
 }
 
 export interface DeleteReservation {
   site: UserSiteRow
+  leaseId: string
   deleteRevision: number
 }
 
 export interface SitesRepo {
   listByUser(userId: number): Promise<UserSiteRow[]>
   getByUserAndSlug(userId: number, slug: string): Promise<UserSiteRow | null>
+  listUnleasedPlaceholdersByUser(userId: number): Promise<UserSiteRow[]>
+  promoteUnleasedPlaceholder(input: Omit<CommitPublishInput, 'leaseId'>): Promise<UserSiteRow | null>
+  deleteUnleasedPlaceholder(siteId: string, userId: number): Promise<void>
   beginPublishReservation(input: PublishReservationInput): Promise<PublishReservation>
   commitPublish(input: CommitPublishInput): Promise<UserSiteRow>
-  abortPublishPlaceholder(siteId: string, userId: number): Promise<void>
+  abortPublishPlaceholder(siteId: string, userId: number, leaseId: string): Promise<void>
+  releaseLease(siteId: string, userId: number, leaseId: string): Promise<void>
   prepareMetaUpdate(userId: number, slug: string): Promise<MetaUpdateReservation>
   commitMetaUpdate(input: {
     siteId: string
     userId: number
+    leaseId: string
     title: string
     visibility: SiteVisibility
     passwordSalt: string | null
@@ -65,7 +78,7 @@ export interface SitesRepo {
     edgeRevision: number
   }): Promise<UserSiteRow>
   prepareDelete(userId: number, slug: string): Promise<DeleteReservation>
-  commitDelete(siteId: string, userId: number): Promise<void>
+  commitDelete(siteId: string, userId: number, leaseId: string, deleteRevision: number): Promise<void>
 }
 
 interface RawUserSiteRow {
@@ -81,6 +94,9 @@ interface RawUserSiteRow {
   size_bytes: string | number
   content_sha256: string
   edge_revision: string | number
+  op_lease_id: string | null
+  op_lease_until: Date | null
+  op_expected_rev: string | number
   created_at: Date
   updated_at: Date
   last_published_at: Date
@@ -105,6 +121,13 @@ function mapRow(r: RawUserSiteRow): UserSiteRow {
     lastPublishedAt:
       r.last_published_at instanceof Date ? r.last_published_at : new Date(r.last_published_at),
   }
+}
+
+function hasActiveLease(row: { op_lease_id: string | null; op_lease_until: Date | null }): boolean {
+  if (!row.op_lease_id || !row.op_lease_until) return false
+  const until =
+    row.op_lease_until instanceof Date ? row.op_lease_until.getTime() : new Date(row.op_lease_until).getTime()
+  return until > Date.now()
 }
 
 async function allocateNextEdgeRevision(client: PoolClient): Promise<number> {
@@ -157,82 +180,19 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
       return res.rows[0] ? mapRow(res.rows[0]) : null
     },
 
-    async beginPublishReservation(input) {
-      return withTx(pool, async (client) => {
-        // Lock user row to serialize per-user quota checks across concurrent publishes.
-        const userLock = await client.query<{ id: number }>(
-          'SELECT id FROM users WHERE id = $1 FOR UPDATE',
-          [input.userId],
-        )
-        if (userLock.rows.length === 0) {
-          throw new SitesError('SITE_NOT_FOUND', '用户不存在', 404)
-        }
-
-        const existingRes = await client.query<RawUserSiteRow>(
-          'SELECT * FROM user_sites WHERE slug = $1 FOR UPDATE',
-          [input.slug],
-        )
-        const existing = existingRes.rows[0] ? mapRow(existingRes.rows[0]) : null
-
-        if (existing) {
-          if (existing.userId !== input.userId) {
-            throw new SitesError('SLUG_TAKEN', `子域名 "${input.slug}" 已被占用，请更换名称`, 409)
-          }
-          const edgeRevision = await allocateNextEdgeRevision(client)
-          return {
-            siteId: existing.id,
-            isNewPlaceholder: existing.edgeRevision === 0,
-            edgeRevision,
-            existing: existing.edgeRevision > 0 ? existing : null,
-          }
-        }
-
-        const countRes = await client.query<{ cnt: number }>(
-          'SELECT COUNT(*)::int AS cnt FROM user_sites WHERE user_id = $1 AND edge_revision > 0',
-          [input.userId],
-        )
-        const count = countRes.rows[0]?.cnt ?? 0
-        if (count >= input.maxPerUser) {
-          throw new SitesError(
-            'QUOTA_EXCEEDED',
-            `已达到站点数量上限（最多 ${input.maxPerUser} 个），请先删除旧站点或覆盖更新`,
-            429,
-          )
-        }
-
-        const edgeRevision = await allocateNextEdgeRevision(client)
-        try {
-          const ins = await client.query<{ id: string }>(
-            `INSERT INTO user_sites (
-               slug, user_id, title, visibility, password_salt, password_hash, spa_mode, edge_revision
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
-             RETURNING id`,
-            [
-              input.slug,
-              input.userId,
-              input.title,
-              input.visibility,
-              input.passwordSalt,
-              input.passwordHash,
-              input.spaMode,
-            ],
-          )
-          return {
-            siteId: ins.rows[0]!.id,
-            isNewPlaceholder: true,
-            edgeRevision,
-            existing: null,
-          }
-        } catch (err) {
-          if ((err as { code?: string })?.code === '23505') {
-            throw new SitesError('SLUG_TAKEN', `子域名 "${input.slug}" 已被占用，请更换名称`, 409)
-          }
-          throw err
-        }
-      })
+    async listUnleasedPlaceholdersByUser(userId) {
+      const res = await pool.query<RawUserSiteRow>(
+        `SELECT * FROM user_sites
+         WHERE user_id = $1
+           AND edge_revision = 0
+           AND (op_lease_until IS NULL OR op_lease_until <= NOW())
+         ORDER BY created_at ASC`,
+        [userId],
+      )
+      return res.rows.map(mapRow)
     },
 
-    async commitPublish(input) {
+    async promoteUnleasedPlaceholder(input) {
       const res = await pool.query<RawUserSiteRow>(
         `UPDATE user_sites
          SET title = $3,
@@ -244,9 +204,16 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
              size_bytes = $9,
              content_sha256 = $10,
              edge_revision = $11,
+             op_lease_id = NULL,
+             op_lease_until = NULL,
+             op_expected_rev = 0,
              updated_at = NOW(),
              last_published_at = NOW()
-         WHERE id = $1 AND user_id = $2 AND edge_revision < $11
+         WHERE id = $1
+           AND user_id = $2
+           AND edge_revision = 0
+           AND edge_revision < $11
+           AND (op_lease_until IS NULL OR op_lease_until <= NOW())
          RETURNING *`,
         [
           input.siteId,
@@ -262,21 +229,178 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
           input.edgeRevision,
         ],
       )
-      if (res.rows[0]) return mapRow(res.rows[0])
-
-      // Out-of-order slower write lost to a newer publish or concurrent delete: read current state.
-      const currentRes = await pool.query<RawUserSiteRow>(
-        'SELECT * FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision > 0',
-        [input.siteId, input.userId],
-      )
-      if (currentRes.rows[0]) return mapRow(currentRes.rows[0])
-      throw new SitesError('SITE_NOT_FOUND', '站点已被删除', 404)
+      return res.rows[0] ? mapRow(res.rows[0]) : null
     },
 
-    async abortPublishPlaceholder(siteId, userId) {
+    async deleteUnleasedPlaceholder(siteId, userId) {
       await pool.query(
-        'DELETE FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision = 0',
+        `DELETE FROM user_sites
+         WHERE id = $1
+           AND user_id = $2
+           AND edge_revision = 0
+           AND (op_lease_until IS NULL OR op_lease_until <= NOW())`,
         [siteId, userId],
+      )
+    },
+
+    async beginPublishReservation(input) {
+      return withTx(pool, async (client) => {
+        // Lock user row to serialize per-user quota checks across concurrent publishes.
+        const userLock = await client.query<{ id: number }>(
+          'SELECT id FROM users WHERE id = $1 FOR UPDATE',
+          [input.userId],
+        )
+        if (userLock.rows.length === 0) {
+          throw new SitesError('SITE_NOT_FOUND', '用户不存在', 404)
+        }
+
+        const existingRes = await client.query<RawUserSiteRow>(
+          'SELECT * FROM user_sites WHERE slug = $1 FOR UPDATE',
+          [input.slug],
+        )
+        const existingRaw = existingRes.rows[0] ?? null
+        const leaseId = randomUUID()
+        const leaseUntil = new Date(Date.now() + OP_LEASE_TTL_MS)
+
+        if (existingRaw) {
+          if (Number(existingRaw.user_id) !== input.userId) {
+            throw new SitesError('SLUG_TAKEN', `子域名 "${input.slug}" 已被占用，请更换名称`, 409)
+          }
+          if (hasActiveLease(existingRaw)) {
+            throw new SitesError('SLUG_BUSY', `站点 "${input.slug}" 正在进行另一项发布或变更，请稍后重试`, 409, true)
+          }
+          const existing = mapRow(existingRaw)
+          const edgeRevision = await allocateNextEdgeRevision(client)
+          await client.query(
+            `UPDATE user_sites
+             SET op_lease_id = $2,
+                 op_lease_until = $3,
+                 op_expected_rev = edge_revision,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [existing.id, leaseId, leaseUntil],
+          )
+          return {
+            siteId: existing.id,
+            leaseId,
+            isNewPlaceholder: existing.edgeRevision === 0,
+            edgeRevision,
+            baseRevision: existing.edgeRevision,
+            existing: existing.edgeRevision > 0 ? existing : null,
+          }
+        }
+
+        // Count all existing rows (published, in-flight, and unresolved indeterminate placeholders) to enforce strict quota (B5/B3).
+        const countRes = await client.query<{ cnt: number }>(
+          `SELECT COUNT(*)::int AS cnt FROM user_sites WHERE user_id = $1`,
+          [input.userId],
+        )
+        const count = countRes.rows[0]?.cnt ?? 0
+        if (count >= input.maxPerUser) {
+          throw new SitesError(
+            'QUOTA_EXCEEDED',
+            `已达到站点数量上限（最多 ${input.maxPerUser} 个），请先删除旧站点或覆盖更新`,
+            429,
+          )
+        }
+
+        const edgeRevision = await allocateNextEdgeRevision(client)
+        try {
+          const ins = await client.query<{ id: string }>(
+            `INSERT INTO user_sites (
+               slug, user_id, title, visibility, password_salt, password_hash, spa_mode,
+               edge_revision, op_lease_id, op_lease_until, op_expected_rev
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, 0)
+             RETURNING id`,
+            [
+              input.slug,
+              input.userId,
+              input.title,
+              input.visibility,
+              input.passwordSalt,
+              input.passwordHash,
+              input.spaMode,
+              leaseId,
+              leaseUntil,
+            ],
+          )
+          return {
+            siteId: ins.rows[0]!.id,
+            leaseId,
+            isNewPlaceholder: true,
+            edgeRevision,
+            baseRevision: 0,
+            existing: null,
+          }
+        } catch (err) {
+          if ((err as { code?: string })?.code === '23505') {
+            throw new SitesError('SLUG_TAKEN', `子域名 "${input.slug}" 已被占用，请更换名称`, 409)
+          }
+          throw err
+        }
+      })
+    },
+
+    async commitPublish(input) {
+      const res = await pool.query<RawUserSiteRow>(
+        `UPDATE user_sites
+         SET title = $4,
+             visibility = $5,
+             password_salt = $6,
+             password_hash = $7,
+             spa_mode = $8,
+             file_count = $9,
+             size_bytes = $10,
+             content_sha256 = $11,
+             edge_revision = $12,
+             op_lease_id = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_id END,
+             op_lease_until = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_until END,
+             op_expected_rev = CASE WHEN op_lease_id = $3 THEN 0 ELSE op_expected_rev END,
+             updated_at = NOW(),
+             last_published_at = NOW()
+         WHERE id = $1 AND user_id = $2 AND edge_revision < $12
+         RETURNING *`,
+        [
+          input.siteId,
+          input.userId,
+          input.leaseId,
+          input.title,
+          input.visibility,
+          input.passwordSalt,
+          input.passwordHash,
+          input.spaMode,
+          input.fileCount,
+          input.sizeBytes,
+          input.contentSha256,
+          input.edgeRevision,
+        ],
+      )
+      if (res.rows[0]) return mapRow(res.rows[0])
+
+      const currentRes = await pool.query<RawUserSiteRow>(
+        'SELECT * FROM user_sites WHERE id = $1 AND user_id = $2',
+        [input.siteId, input.userId],
+      )
+      const cur = currentRes.rows[0]
+      if (cur && Number(cur.edge_revision) === input.edgeRevision) {
+        return mapRow(cur)
+      }
+      throw new SitesError('STALE_REVISION', '站点存在更新版本或已被删除', 409)
+    },
+
+    async abortPublishPlaceholder(siteId, userId, leaseId) {
+      await pool.query(
+        'DELETE FROM user_sites WHERE id = $1 AND user_id = $2 AND op_lease_id = $3 AND edge_revision = 0',
+        [siteId, userId, leaseId],
+      )
+    },
+
+    async releaseLease(siteId, userId, leaseId) {
+      await pool.query(
+        `UPDATE user_sites
+         SET op_lease_id = NULL, op_lease_until = NULL, op_expected_rev = 0
+         WHERE id = $1 AND user_id = $2 AND op_lease_id = $3`,
+        [siteId, userId, leaseId],
       )
     },
 
@@ -288,29 +412,48 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
            FOR UPDATE`,
           [userId, slug],
         )
-        if (!res.rows[0]) {
+        const raw = res.rows[0]
+        if (!raw) {
           throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
         }
+        if (hasActiveLease(raw)) {
+          throw new SitesError('SLUG_BUSY', `站点 "${slug}" 正在处理另一项变更，请稍后重试`, 409, true)
+        }
+        const site = mapRow(raw)
         const nextRevision = await allocateNextEdgeRevision(client)
-        return { site: mapRow(res.rows[0]), nextRevision }
+        const leaseId = randomUUID()
+        const leaseUntil = new Date(Date.now() + OP_LEASE_TTL_MS)
+        await client.query(
+          `UPDATE user_sites
+           SET op_lease_id = $2,
+               op_lease_until = $3,
+               op_expected_rev = edge_revision
+           WHERE id = $1`,
+          [site.id, leaseId, leaseUntil],
+        )
+        return { site, leaseId, nextRevision }
       })
     },
 
     async commitMetaUpdate(input) {
       const res = await pool.query<RawUserSiteRow>(
         `UPDATE user_sites
-         SET title = $3,
-             visibility = $4,
-             password_salt = $5,
-             password_hash = $6,
-             spa_mode = $7,
-             edge_revision = $8,
+         SET title = $4,
+             visibility = $5,
+             password_salt = $6,
+             password_hash = $7,
+             spa_mode = $8,
+             edge_revision = $9,
+             op_lease_id = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_id END,
+             op_lease_until = CASE WHEN op_lease_id = $3 THEN NULL ELSE op_lease_until END,
+             op_expected_rev = CASE WHEN op_lease_id = $3 THEN 0 ELSE op_expected_rev END,
              updated_at = NOW()
-         WHERE id = $1 AND user_id = $2 AND edge_revision < $8
+         WHERE id = $1 AND user_id = $2 AND edge_revision < $9
          RETURNING *`,
         [
           input.siteId,
           input.userId,
+          input.leaseId,
           input.title,
           input.visibility,
           input.passwordSalt,
@@ -321,11 +464,14 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
       )
       if (res.rows[0]) return mapRow(res.rows[0])
       const currentRes = await pool.query<RawUserSiteRow>(
-        'SELECT * FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision > 0',
+        'SELECT * FROM user_sites WHERE id = $1 AND user_id = $2',
         [input.siteId, input.userId],
       )
-      if (currentRes.rows[0]) return mapRow(currentRes.rows[0])
-      throw new SitesError('SITE_NOT_FOUND', '站点不存在或已被删除', 404)
+      const cur = currentRes.rows[0]
+      if (cur && Number(cur.edge_revision) === input.edgeRevision) {
+        return mapRow(cur)
+      }
+      throw new SitesError('STALE_REVISION', '站点存在更新版本或已被删除', 409)
     },
 
     async prepareDelete(userId, slug) {
@@ -336,16 +482,35 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
            FOR UPDATE`,
           [userId, slug],
         )
-        if (!res.rows[0]) {
+        const raw = res.rows[0]
+        if (!raw) {
           throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
         }
+        if (hasActiveLease(raw)) {
+          throw new SitesError('SLUG_BUSY', `站点 "${slug}" 正在处理另一项变更，请稍后重试`, 409, true)
+        }
+        const site = mapRow(raw)
         const deleteRevision = await allocateNextEdgeRevision(client)
-        return { site: mapRow(res.rows[0]), deleteRevision }
+        const leaseId = randomUUID()
+        const leaseUntil = new Date(Date.now() + OP_LEASE_TTL_MS)
+        await client.query(
+          `UPDATE user_sites
+           SET op_lease_id = $2,
+               op_lease_until = $3,
+               op_expected_rev = edge_revision
+           WHERE id = $1`,
+          [site.id, leaseId, leaseUntil],
+        )
+        return { site, leaseId, deleteRevision }
       })
     },
 
-    async commitDelete(siteId, userId) {
-      await pool.query('DELETE FROM user_sites WHERE id = $1 AND user_id = $2', [siteId, userId])
+    async commitDelete(siteId, userId, _leaseId, deleteRevision) {
+      // Fencing revision check prevents an out-of-order late delete from deleting a newer published site (B2).
+      await pool.query(
+        'DELETE FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision < $3',
+        [siteId, userId, deleteRevision],
+      )
     },
   }
 }
