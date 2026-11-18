@@ -7,7 +7,7 @@
  * Run: npx tsx --test packages/commercial/src/__tests__/internalDelegateAntigravityRoute.test.ts
  */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -372,18 +372,44 @@ describe('internalDelegateAntigravityRoute', () => {
 
   test('migration 0344 idempotently drops legacy manual delegate_antigravity budget trigger and function (OCV5-752)', () => {
     const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
-    const migrationSql = readFileSync(
-      resolve(repoRoot, 'packages/commercial/src/db/migrations/0344_drop_delegate_antigravity_budget_trigger.sql'),
-      'utf8',
+    const migrationsDir = resolve(repoRoot, 'packages/commercial/src/db/migrations')
+    const isCommercial = existsSync(resolve(migrationsDir, '0340_commercial_sync_compat.sql'))
+    const isSelfhost = existsSync(resolve(migrationsDir, '0341_selfhost_sync_compat.sql'))
+    assert.notEqual(
+      isCommercial,
+      isSelfhost,
+      'exactly one edition compatibility marker migration must exist',
     )
-    assert.match(
-      migrationSql,
-      /DROP\s+TRIGGER\s+IF\s+EXISTS\s+trg_rfj_delegate_antigravity_budget\s+ON\s+public\.request_finalize_journal\s*;/i,
+    const migration0344Path = resolve(
+      migrationsDir,
+      '0344_drop_delegate_antigravity_budget_trigger.sql',
     )
-    assert.match(
-      migrationSql,
-      /DROP\s+FUNCTION\s+IF\s+EXISTS\s+public\.trg_rfj_delegate_antigravity_budget\(\)\s*;/i,
+    if (isSelfhost) {
+      const migrationSql = readFileSync(migration0344Path, 'utf8')
+      assert.match(
+        migrationSql,
+        /DROP\s+TRIGGER\s+IF\s+EXISTS\s+trg_rfj_delegate_antigravity_budget\s+ON\s+public\.request_finalize_journal\s*;/i,
+      )
+      assert.match(
+        migrationSql,
+        /DROP\s+FUNCTION\s+IF\s+EXISTS\s+public\.trg_rfj_delegate_antigravity_budget\(\)\s*;/i,
+      )
+      return
+    }
+    assert.equal(
+      existsSync(migration0344Path),
+      false,
+      'commercial edition must not include selfhost-only migration 0344',
     )
+    const sqlFiles = readdirSync(migrationsDir).filter((file) => file.endsWith('.sql'))
+    for (const file of sqlFiles) {
+      const sql = readFileSync(resolve(migrationsDir, file), 'utf8')
+      assert.doesNotMatch(
+        sql,
+        /CREATE\s+TRIGGER\s+trg_rfj_delegate_antigravity_budget/i,
+        `${file} must not create legacy manual delegate_antigravity budget trigger`,
+      )
+    }
   })
 
   test('mint rejects an admission owned by another user or container', async () => {

@@ -3712,7 +3712,7 @@ describe("Cursor external authority regression tripwire", () => {
 
   test("OCV5-415: Antigravity admission gates on authority and balance before minting; settle reads relay rows", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    const start = source.indexOf("if (isAntigravityInboundFrame && containerId !== undefined)");
+    const start = source.indexOf("if (isAntigravityInboundFrame && !isRemoteNativeInboundFrame && containerId !== undefined)");
     const end = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)", start);
     assert.notEqual(start, -1);
     assert.ok(end > start);

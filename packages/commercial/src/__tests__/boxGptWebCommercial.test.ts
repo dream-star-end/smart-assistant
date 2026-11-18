@@ -2,6 +2,7 @@
 // never billed, sharing the personal edition's single Chrome profile. The Box exec endpoint side of this
 // (OC_BOX_EXEC_TARGET_UIDS) is covered in http/proxy/boxInteractiveMasterGate.test.ts.
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { describe, test } from "node:test";
 
@@ -51,7 +52,20 @@ describe("OCV5-575 box-gpt-6-astra-pro is never billed", () => {
     assert.match(source, /if \(!isBoxGptWebModel\(modelCapture\)\) \{\n\s+await deps\.pgPool\.query\(\n\s+`INSERT INTO cursor_external_usage_audit/);
   });
 
-  test("0314 preserves the selfhost hidden, disabled seed granted only to owner 3", async () => {
+  test("edition migration stages a hidden disabled seed with exact commercial vs selfhost owner grant", async () => {
+    const isCommercial = existsSync(new URL("../db/migrations/0340_commercial_sync_compat.sql", import.meta.url));
+    const isSelfhost = existsSync(new URL("../db/migrations/0341_selfhost_sync_compat.sql", import.meta.url));
+    assert.notEqual(isCommercial, isSelfhost, "exactly one edition compatibility marker migration must exist");
+    if (isCommercial) {
+      const sql = await readFile(new URL("../db/migrations/0318_commercial_box_gpt_6_astra_pro.sql", import.meta.url), "utf8");
+      assert.match(sql, /^-- order-dependency: 0317_commercial_muse_media\n/);
+      assert.match(sql, /SELECT 'box-gpt-6-astra-pro', 'GPT-6-Astra-Pro', 0, 0, 0, 0, multiplier, FALSE, 19, 'hidden',/);
+      assert.match(sql, /AND user_id NOT IN \(1, 4\);/);
+      assert.match(sql, /WHERE u\.id IN \(1, 4\)/);
+      assert.match(sql, /'staged'/);
+      assert.doesNotMatch(sql, /user_id\s*(=|<>)\s*3\b|\bIN \([^)]*\b3\b[^)]*\)/, "commercial uid 3 is never granted or singled out");
+      return;
+    }
     const sql = await readFile(new URL("../db/migrations/0314_selfhost_box_gpt_6_astra_pro.sql", import.meta.url), "utf8");
     assert.match(sql, /^-- order-dependency: 0313_selfhost_go_beam_minimax31\n/);
     assert.match(sql, /SELECT 'box-gpt-6-astra-pro', 'GPT-6-Astra-Pro', input_per_mtok, output_per_mtok,/);

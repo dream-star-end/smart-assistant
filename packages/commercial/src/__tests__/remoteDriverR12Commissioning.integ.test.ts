@@ -505,6 +505,16 @@ test('Group 4: sandboxRedProof validates real committed proof for codex & cc and
 
 test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pass and auto-reverts on failure', async () => {
   const sandbox = makeTmp('/tmp/oc-drvtest-r12e2e-')
+  const resRoot = join(sandbox, 'resources')
+  const fakeSys = join(sandbox, 'fake-systemd')
+  mkdirSync(resRoot, { recursive: true, mode: 0o700 })
+  mkdirSync(fakeSys, { recursive: true, mode: 0o700 })
+  const sbxEnv = {
+    OC_REMOTE_RESOURCE_ROOT: resRoot,
+    OC_REMOTE_TEST_FAKE_SYSTEMD_DIR: fakeSys,
+    OC_REMOTE_NODE_MEMORY_BUDGET: String(4096 * 1024 * 1024),
+    OC_REMOTE_TEST_MEM_AVAILABLE_BYTES: String(4096 * 1024 * 1024),
+  }
   const evidenceRoot = makeTmp('/tmp/oc-drvtest-r12ev-')
   const cliPath = writeFakeCcCli(sandbox)
   const ccProbe = makeCcProbe(cliPath, [
@@ -570,6 +580,7 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
       settled = r
     })
     const svc = new RemoteDriverV4CommissioningService({
+      snapshotDir: join(sandbox, 'cutover-snapshots'),
       executorDeps: {
         pool,
         preCheckRedis: new InMemoryPreCheckRedis(),
@@ -615,7 +626,7 @@ test('Group 5: RemoteDriverV4CommissioningService drives full 8-item cutover pas
             }
           },
           hostFactory: (_t, spec) => {
-            const base = RemotePoolSshHost.forLocalSandbox(spec)
+            const base = RemotePoolSshHost.forLocalSandbox(spec, sbxEnv)
             const isLowMem =
               typeof spec.manifest.maxSliceMemoryBytes === 'number' &&
               spec.manifest.maxSliceMemoryBytes <= 64 * 1024 * 1024
