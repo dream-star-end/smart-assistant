@@ -89,11 +89,16 @@ ToolName, Arguments) without spending a turn reading \`mcp/<server>/<tool>.json\
 when the signature is known.
 
 High-frequency tools (Arguments object):
-- \`oc_bash\`: \`{command, cwd?, timeout_ms?}\`. Default timeout 60000 ms, maximum
-  600000. Use \`oc_bash\` synchronously when a command may run longer than a few
-  seconds. Never use native \`run_command\` \`WaitMsBeforeAsync\` plus \`manage_task\`
-  polling loops for that: native \`run_command\` foreground wait is hard-capped at
-  10000 ms, then backgrounds the command.
+- \`oc_bash\`: \`{command?, cwd?, timeout_ms?, job_id?, action?, kill_on_timeout?}\`. Default
+  wait 60000 ms, maximum 600000 ms per call. Use \`oc_bash\` when a command may run longer
+  than a few seconds (never use native \`run_command\` \`WaitMsBeforeAsync\` plus
+  \`manage_task\` polling loops: native \`run_command\` is hard-capped at 10000 ms).
+  If still running at \`timeout_ms\`, \`oc_bash\` keeps the process alive by default and
+  returns \`status=running job_id=<id>\` — continue with \`oc_bash({job_id, timeout_ms: 600000})\`
+  or stop a hung command with \`oc_bash({job_id, action: "kill"})\`; never re-run an active
+  command from scratch. Do not chain multiple heavy test suites, full gates, or \`git push\`
+  into one \`&&\` command: run heavy checks (>2–3 min) as separate \`oc_bash\` steps
+  (\`timeout_ms: 600000\`), then run \`git commit\` / \`git push\` separately.
 - \`oc_grep\`: \`{pattern, path?, glob?, max_matches?}\` searches file contents.
 - \`oc_glob\`: \`{pattern, path?, max_results?}\` finds files by name.
 - \`delegate_task\`: \`{goal, agentId?, model?, allowSelf?}\`. \`goal\` is the only

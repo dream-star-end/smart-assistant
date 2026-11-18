@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  ANTIGRAVITY_DEFAULT_OC_BASH_BUDGET_MS,
   delegateWaitExitCode,
   isTransientDelegateWaitError,
   resolveDelegateCliForegroundBudgetMs,
@@ -193,13 +194,20 @@ describe('runDelegateWaitLoop', () => {
     assert.doesNotMatch(r.stdout, /delegate-wait dlgjob-done/)
   })
 
-  it('foreground budget env is clamped below Cursor 60-minute handoff', () => {
+  it('foreground budget env is clamped below Cursor 60-minute handoff and inside Antigravity oc_bash windows', () => {
     assert.equal(resolveDelegateCliForegroundBudgetMs({}), 50 * 60_000)
     assert.equal(
       resolveDelegateCliForegroundBudgetMs({
         OPENCLAUDE_DELEGATE_CLI_FOREGROUND_BUDGET_MS: '999999999',
       }),
       55 * 60_000,
+    )
+    assert.equal(resolveDelegateCliForegroundBudgetMs({ OC_BASH_TIMEOUT_MS: '60000' }), 55_000)
+    assert.equal(resolveDelegateCliForegroundBudgetMs({ OC_BASH_TIMEOUT_MS: '600000' }), 595_000)
+    assert.equal(resolveDelegateCliForegroundBudgetMs({ OC_BASH_TIMEOUT_MS: '2000' }), 1_600)
+    assert.equal(
+      resolveDelegateCliForegroundBudgetMs({ OPENCLAUDE_ENGINE: 'antigravity' }),
+      ANTIGRAVITY_DEFAULT_OC_BASH_BUDGET_MS,
     )
   })
 
