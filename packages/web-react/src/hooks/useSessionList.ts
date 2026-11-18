@@ -108,11 +108,17 @@ function upsertSessions(
   keepId?: string,
 ): Session[] {
   const map = new Map<string, Session>();
-  for (const s of cur) map.set(s.id, s);
+  for (const s of cur) {
+    if (!isHiddenQuickAskSession(s, keepId)) map.set(s.id, s);
+  }
   for (const s of incoming) {
-    if (isHiddenQuickAskSession(s, keepId)) continue;
     const prev = map.get(s.id);
-    map.set(s.id, prev ? (incomingWins ? { ...prev, ...s } : { ...s, ...prev }) : s);
+    const merged = prev ? (incomingWins ? { ...prev, ...s } : { ...s, ...prev }) : s;
+    if (isHiddenQuickAskSession(merged, keepId)) {
+      map.delete(s.id);
+      continue;
+    }
+    map.set(s.id, merged);
   }
   return [...map.values()].sort((a, b) =>
     a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
@@ -948,7 +954,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         signal,
         ...(projectId !== undefined ? { projectId } : {}),
       });
-      return res.results;
+      return res.results.filter(
+        (hit) => !isHiddenQuickAskSession({ id: hit.sessionId, title: hit.title }, activeIdRef.current),
+      );
     } catch (e) {
       if (isAbortError(e) || signal.aborted) return [];
       throw e;

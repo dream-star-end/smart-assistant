@@ -2940,7 +2940,7 @@ export function App() {
             open={quickAsk.open} onClose={closeQuickAsk} onSendingChange={onQuickAskSending} seed={quickAsk.seed}
             chat={chat} authRef={authRef} user={user} demo={demo} agent={agent} models={models} mainlineModelId={modelId}
             authorizeSwitch={demo ? undefined : authorizeSwitch}
-            mainlineTitle={activeSess?.title ?? sessions.find((s) => s.id === activeId)?.title}
+            mainlineSessionId={activeId} mainlineTitle={activeSess?.title ?? sessions.find((s) => s.id === activeId)?.title}
             mainlineGoalObjective={activeSess?.goalState?.objective} mainlineMessages={wsMessages}
             rightOffsetPx={paneInline ? paneWidth.width + 16 : 16} isMdViewport={isMdViewport}
             onPromoteSession={(sess, demoMsgs) => {

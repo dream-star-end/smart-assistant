@@ -3,6 +3,7 @@ import {
   ArrowUpRight,
   Check,
   ChevronDown,
+  Link2,
   Loader2,
   MessageCircleQuestion,
   Minimize2,
@@ -16,6 +17,8 @@ import type { AuthorizeSwitch } from "../../hooks/useModelSwitchCost";
 import type { Agent } from "../../lib/agents";
 import { api } from "../../lib/api";
 import { mintMsgId, type ChatMessage } from "../../lib/chat/model";
+import { CONTINUE_PROMPT } from "../../lib/chat/render";
+import { preciseRetryEligible } from "../../lib/chat/socket";
 import { demoReply } from "../../lib/demo";
 import { isDialogLayerOpen } from "../../lib/hotkeys";
 import {
@@ -25,22 +28,25 @@ import {
 } from "../../lib/quickAskSession";
 import type { AuthSession, PublicModel, Session, User } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Markdown } from "../Markdown";
+import { MessageList } from "../MessageRenderer";
 import { modelLabel } from "../ModelSelector";
+import { ChatInteractionContext, type ChatInteraction } from "../tool/context";
 import {
-  Alert,
-  Button,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
   IconButton,
-  Switch,
 } from "../ui";
+import type { CardCallbacks } from "./cards";
+import type { PermissionRespond } from "./permissionPromptState";
 
 const QUICK_ASK_MODEL_STORAGE_KEY = "oc.quickAsk.model";
+const QUICK_ASK_LANES_STORAGE_PREFIX = "oc.quickAsk.lanes.";
+const MAX_STORED_LANES = 32;
 const MAX_CONTEXT_PREFIX_CHARS = 1200;
+const DEFAULT_LANE_KEY = "__draft__";
 
 export const FAST_MODEL_PRIORITY = [
   "deepseek-v4-flash",
@@ -77,6 +83,11 @@ function clipText(raw: string | undefined, max: number): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, Math.max(1, max - 1))}…`;
 }
 
+function isDefaultSessionTitle(title: string | undefined): boolean {
+  const t = (title ?? "").trim();
+  return !t || t === "新对话" || t === "新会话";
+}
+
 function extractErrorSummary(m: ChatMessage): string | null {
   if (m._errorCardSnapshot?.disposition === "card") {
     return m._errorCardSnapshot.message || m._errorCardSnapshot.title || null;
@@ -93,7 +104,7 @@ export function buildMainlineContextPrefix(p: {
 }): string {
   const parts: string[] = [];
   const title = clipText(p.title, 80);
-  if (title && title !== "新对话") parts.push(`会话标题：${title}`);
+  if (title && !isDefaultSessionTitle(title)) parts.push(`会话标题：${title}`);
   const goal = clipText(p.goalObjective, 160);
   if (goal) parts.push(`当前目标：${goal}`);
 
@@ -127,7 +138,7 @@ export function buildMainlineContextPrefix(p: {
 
   if (parts.length === 0) return "";
   const header =
-    "[以下为主线会话只读背景摘要，仅供回答本次支线技术问题参考，请简洁直接回答下方问题]\n";
+    "[以下为当前主线会话的只读背景摘要，仅供回答本次支线快问参考；请勿改动主线状态，优先简洁直接作答]\n";
   const footer = "\n---\n问题：";
   const budget = Math.max(80, MAX_CONTEXT_PREFIX_CHARS - header.length - footer.length);
   const rawBody = parts.join("\n");
@@ -153,6 +164,71 @@ function writeSavedQuickAskModel(modelId: string): void {
   }
 }
 
+type LaneState = {
+  qaSessId: string;
+  draft: string;
+  lastInjectedContext: string;
+  lastSentModel?: string;
+  demoMessages: ChatMessage[];
+};
+
+function createLaneState(qaSessId?: string): LaneState {
+  return {
+    qaSessId: qaSessId ?? genQuickAskSessionId(),
+    draft: "",
+    lastInjectedContext: "",
+    lastSentModel: undefined,
+    demoMessages: [],
+  };
+}
+
+function lanesStorageKey(userId: string | null | undefined): string {
+  return `${QUICK_ASK_LANES_STORAGE_PREFIX}${userId ?? "anon"}`;
+}
+
+function loadStoredLaneIds(userId: string | null | undefined): Record<string, string> {
+  try {
+    if (typeof sessionStorage === "undefined") return {};
+    const raw = sessionStorage.getItem(lanesStorageKey(userId));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof k === "string" && typeof v === "string" && v.startsWith("webqa_")) {
+        out[k] = v;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveStoredLaneIds(userId: string | null | undefined, lanes: Record<string, LaneState>): void {
+  try {
+    if (typeof sessionStorage === "undefined") return;
+    const entries = Object.entries(lanes)
+      .slice(-MAX_STORED_LANES)
+      .map(([k, v]) => [k, v.qaSessId] as const);
+    sessionStorage.setItem(lanesStorageKey(userId), JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    /* ignore storage unavailable */
+  }
+}
+
+function initLanesForUser(userId: string | null | undefined, activeLaneKey: string): Record<string, LaneState> {
+  const stored = loadStoredLaneIds(userId);
+  const out: Record<string, LaneState> = {};
+  for (const [k, id] of Object.entries(stored)) {
+    out[k] = createLaneState(id);
+  }
+  if (!out[activeLaneKey]) {
+    out[activeLaneKey] = createLaneState();
+  }
+  return out;
+}
+
 export type QuickAskWindowProps = {
   open: boolean;
   onClose: () => void;
@@ -164,6 +240,7 @@ export type QuickAskWindowProps = {
   demo: boolean;
   agent: Agent;
   models: PublicModel[];
+  mainlineSessionId?: string;
   mainlineModelId?: string;
   authorizeSwitch?: AuthorizeSwitch;
   mainlineTitle?: string;
@@ -184,6 +261,7 @@ export function QuickAskWindow({
   user,
   demo,
   models,
+  mainlineSessionId,
   mainlineModelId,
   authorizeSwitch,
   mainlineTitle,
@@ -193,28 +271,38 @@ export function QuickAskWindow({
   isMdViewport = true,
   onPromoteSession,
 }: QuickAskWindowProps) {
-  const [qaSessId, setQaSessId] = useState(() => genQuickAskSessionId());
-  const [selectedModel, setSelectedModel] = useState<string | null>(() => readSavedQuickAskModel());
-  const [includeContext, setIncludeContext] = useState(false);
-  const [input, setInput] = useState("");
-  const [authorizing, setAuthorizing] = useState(false);
-  const [demoMessages, setDemoMessages] = useState<ChatMessage[]>([]);
-  const [demoBusy, setDemoBusy] = useState(false);
+  const laneKey = mainlineSessionId?.trim() || DEFAULT_LANE_KEY;
+  const userId = user?.id ?? null;
 
-  const demoAbortRef = useRef(false);
-  const demoTimerRef = useRef<number | null>(null);
-  const lastSentModelRef = useRef<string | undefined>(undefined);
+  const [lanes, setLanes] = useState<Record<string, LaneState>>(() =>
+    initLanesForUser(userId, laneKey),
+  );
+  const [selectedModel, setSelectedModel] = useState<string | null>(() => readSavedQuickAskModel());
+  const [authorizing, setAuthorizing] = useState(false);
+  const [demoBusyLanes, setDemoBusyLanes] = useState<Record<string, boolean>>({});
+
+  const demoAbortRef = useRef<Record<string, boolean>>({});
+  const demoTimersRef = useRef<Record<string, number>>({});
+  const pendingDeleteIdsRef = useRef<Set<string>>(new Set());
   const lastHandledSeedRef = useRef(0);
-  const prevUserIdRef = useRef<string | null>(user?.id ?? null);
+  const prevUserIdRef = useRef<string | null>(userId);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
   const pinnedToBottomRef = useRef(true);
 
-  const clearDemoTimer = useCallback(() => {
-    if (demoTimerRef.current !== null) {
-      window.clearInterval(demoTimerRef.current);
-      demoTimerRef.current = null;
+  const clearDemoTimer = useCallback((targetLaneKey?: string) => {
+    if (targetLaneKey !== undefined) {
+      const id = demoTimersRef.current[targetLaneKey];
+      if (id !== undefined) {
+        window.clearInterval(id);
+        delete demoTimersRef.current[targetLaneKey];
+      }
+      return;
+    }
+    for (const [k, id] of Object.entries(demoTimersRef.current)) {
+      window.clearInterval(id);
+      delete demoTimersRef.current[k];
     }
   }, []);
 
@@ -222,19 +310,61 @@ export function QuickAskWindow({
 
   // Reset isolated quick-ask state when signed-in account changes.
   useEffect(() => {
-    const uid = user?.id ?? null;
-    if (prevUserIdRef.current !== uid) {
-      prevUserIdRef.current = uid;
+    if (prevUserIdRef.current !== userId) {
+      prevUserIdRef.current = userId;
       clearDemoTimer();
-      demoAbortRef.current = true;
-      setDemoMessages([]);
-      setDemoBusy(false);
-      setInput("");
-      lastSentModelRef.current = undefined;
-      setQaSessId(genQuickAskSessionId());
+      for (const k of Object.keys(demoAbortRef.current)) {
+        demoAbortRef.current[k] = true;
+      }
+      pendingDeleteIdsRef.current.clear();
+      setDemoBusyLanes({});
+      setLanes(initLanesForUser(userId, laneKey));
       onClose();
     }
-  }, [user?.id, clearDemoTimer, onClose]);
+  }, [userId, laneKey, clearDemoTimer, onClose]);
+
+  // Ensure the active main-session lane exists and persist tab lane pointers.
+  useEffect(() => {
+    setLanes((prev) => {
+      if (prev[laneKey]) return prev;
+      return { ...prev, [laneKey]: createLaneState() };
+    });
+  }, [laneKey]);
+
+  useEffect(() => {
+    saveStoredLaneIds(userId, lanes);
+  }, [userId, lanes]);
+
+  const activeLane = lanes[laneKey] ?? createLaneState();
+  const qaSessId = activeLane.qaSessId;
+  const input = activeLane.draft;
+
+  const setInput = useCallback(
+    (next: string | ((cur: string) => string)) => {
+      setLanes((prev) => {
+        const cur = prev[laneKey] ?? createLaneState();
+        const nextDraft = typeof next === "function" ? next(cur.draft) : next;
+        if (nextDraft === cur.draft && prev[laneKey]) return prev;
+        return { ...prev, [laneKey]: { ...cur, draft: nextDraft } };
+      });
+    },
+    [laneKey],
+  );
+
+  // Settle delayed deletes once an in-flight cleared lane receives its stop terminal state.
+  useEffect(() => {
+    if (demo || pendingDeleteIdsRef.current.size === 0) return;
+    for (const id of [...pendingDeleteIdsRef.current]) {
+      if (!chat.isSending(id)) {
+        pendingDeleteIdsRef.current.delete(id);
+        chat.removeSession(id);
+        chat.removePersisted(id);
+        if (authRef.current) {
+          void api.deleteSession(authRef.current, id).catch(() => {});
+        }
+      }
+    }
+  }, [demo, chat, chat.version, authRef]);
 
   const activeModelId = useMemo(
     () => pickDefaultQuickAskModel(models, mainlineModelId, selectedModel),
@@ -246,22 +376,40 @@ export function QuickAskWindow({
   );
   const activeModelLabel = activeModelObj ? modelLabel(activeModelObj) : (activeModelId ?? "快问模型");
 
-  const messages = demo ? demoMessages : chat.getMessages(qaSessId);
-  const sending = demo ? demoBusy : chat.isSending(qaSessId);
+  const messages = demo ? activeLane.demoMessages : chat.getMessages(qaSessId);
+  const sending = demo ? Boolean(demoBusyLanes[laneKey]) : chat.isSending(qaSessId);
+  const anyDemoBusy = useMemo(() => Object.values(demoBusyLanes).some(Boolean), [demoBusyLanes]);
+  const anyLaneSending = useMemo(
+    () =>
+      demo
+        ? anyDemoBusy
+        : Object.values(lanes).some((l) => chat.isSending(l.qaSessId)),
+    [demo, anyDemoBusy, lanes, chat, chat.version],
+  );
 
   useEffect(() => {
-    onSendingChange?.(sending);
-  }, [sending, onSendingChange]);
+    onSendingChange?.(anyLaneSending);
+  }, [anyLaneSending, onSendingChange]);
+
+  const contextPrefix = useMemo(
+    () =>
+      buildMainlineContextPrefix({
+        title: mainlineTitle,
+        goalObjective: mainlineGoalObjective,
+        messages: mainlineMessages,
+      }),
+    [mainlineTitle, mainlineGoalObjective, mainlineMessages],
+  );
 
   const handleStop = useCallback(() => {
     if (demo) {
-      demoAbortRef.current = true;
-      clearDemoTimer();
-      setDemoBusy(false);
+      demoAbortRef.current[laneKey] = true;
+      clearDemoTimer(laneKey);
+      setDemoBusyLanes((prev) => ({ ...prev, [laneKey]: false }));
       return;
     }
     chat.stop(qaSessId);
-  }, [demo, clearDemoTimer, chat, qaSessId]);
+  }, [demo, laneKey, clearDemoTimer, chat, qaSessId]);
 
   useEffect(() => {
     const el = sectionRef.current;
@@ -282,19 +430,16 @@ export function QuickAskWindow({
     async (rawText: string): Promise<boolean> => {
       const rawQuestion = rawText.trim();
       if (!rawQuestion || sending || authorizing) return false;
+      const targetLaneKey = laneKey;
+      const targetSessId = qaSessId;
       const model = activeModelId;
-      const contextPrefix = includeContext
-        ? buildMainlineContextPrefix({
-            title: mainlineTitle,
-            goalObjective: mainlineGoalObjective,
-            messages: mainlineMessages,
-          })
-        : "";
-      const finalPrompt = contextPrefix ? `${contextPrefix}${rawQuestion}` : rawQuestion;
+      const shouldInjectContext =
+        contextPrefix.length > 0 && contextPrefix !== activeLane.lastInjectedContext;
+      const finalPrompt = shouldInjectContext ? `${contextPrefix}${rawQuestion}` : rawQuestion;
 
       if (demo) {
-        clearDemoTimer();
-        demoAbortRef.current = false;
+        clearDemoTimer(targetLaneKey);
+        demoAbortRef.current[targetLaneKey] = false;
         const now = Date.now();
         const userMsg: ChatMessage = {
           id: mintMsgId(),
@@ -304,42 +449,61 @@ export function QuickAskWindow({
         };
         const assistantId = mintMsgId();
         const full = demoReply(rawQuestion, activeModelLabel);
-        setDemoMessages((prev) => [
-          ...prev,
-          userMsg,
-          { id: assistantId, role: "assistant", text: "", ts: now + 1, _completed: false },
-        ]);
-        setDemoBusy(true);
+        setLanes((prev) => {
+          const cur = prev[targetLaneKey] ?? createLaneState(targetSessId);
+          return {
+            ...prev,
+            [targetLaneKey]: {
+              ...cur,
+              lastInjectedContext: shouldInjectContext ? contextPrefix : cur.lastInjectedContext,
+              demoMessages: [
+                ...cur.demoMessages,
+                userMsg,
+                { id: assistantId, role: "assistant", text: "", ts: now + 1, _completed: false },
+              ],
+            },
+          };
+        });
+        setDemoBusyLanes((prev) => ({ ...prev, [targetLaneKey]: true }));
         let cursor = 0;
-        demoTimerRef.current = window.setInterval(() => {
-          if (demoAbortRef.current) {
-            clearDemoTimer();
-            setDemoBusy(false);
+        demoTimersRef.current[targetLaneKey] = window.setInterval(() => {
+          if (demoAbortRef.current[targetLaneKey]) {
+            clearDemoTimer(targetLaneKey);
+            setDemoBusyLanes((prev) => ({ ...prev, [targetLaneKey]: false }));
             return;
           }
           cursor = Math.min(full.length, cursor + 4);
           const done = cursor >= full.length;
-          setDemoMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId ? { ...m, text: full.slice(0, cursor), _completed: done } : m,
-            ),
-          );
+          setLanes((prev) => {
+            const cur = prev[targetLaneKey];
+            if (!cur) return prev;
+            return {
+              ...prev,
+              [targetLaneKey]: {
+                ...cur,
+                demoMessages: cur.demoMessages.map((m) =>
+                  m.id === assistantId ? { ...m, text: full.slice(0, cursor), _completed: done } : m,
+                ),
+              },
+            };
+          });
           if (done) {
-            clearDemoTimer();
-            setDemoBusy(false);
+            clearDemoTimer(targetLaneKey);
+            setDemoBusyLanes((prev) => ({ ...prev, [targetLaneKey]: false }));
           }
         }, 12);
         return true;
       }
 
-      const prevModel = lastSentModelRef.current ?? chat.getSession(qaSessId)?._lastRouting?.model;
+      const prevModel =
+        activeLane.lastSentModel ?? chat.getSession(targetSessId)?._lastRouting?.model;
       let switchAuthorization: Awaited<ReturnType<AuthorizeSwitch>> | undefined;
       if (messages.length > 0 && prevModel && model && prevModel !== model && authorizeSwitch) {
         setAuthorizing(true);
         try {
           const authz = await authorizeSwitch(
             {
-              sessionId: qaSessId,
+              sessionId: targetSessId,
               requestId: mintMsgId(),
               targetModel: model,
               agentId: "main",
@@ -357,18 +521,18 @@ export function QuickAskWindow({
 
       const initialTitle = `${QUICK_ASK_TITLE_PREFIX}${rawQuestion.replace(/\s+/g, " ").slice(0, 32)}`;
       if (messages.length === 0) {
-        chat.ensureSession(qaSessId, "main", initialTitle);
-        const existingSess = chat.getSession(qaSessId);
-        if (existingSess && (!existingSess.title || existingSess.title === "新对话")) {
-          chat.renameSession(qaSessId, initialTitle);
+        chat.ensureSession(targetSessId, "main", initialTitle);
+        const existingSess = chat.getSession(targetSessId);
+        if (existingSess && isDefaultSessionTitle(existingSess.title)) {
+          chat.renameSession(targetSessId, initialTitle);
         }
       } else {
-        chat.ensureSession(qaSessId, "main");
+        chat.ensureSession(targetSessId, "main");
       }
-      if (model) chat.setSessionModel(qaSessId, model);
+      if (model) chat.setSessionModel(targetSessId, model);
 
       const sent = await chat.send({
-        sessId: qaSessId,
+        sessId: targetSessId,
         agentId: "main",
         text: finalPrompt,
         ...(finalPrompt !== rawQuestion ? { displayText: rawQuestion } : {}),
@@ -376,7 +540,18 @@ export function QuickAskWindow({
         ...(switchAuthorization ? { switchAuthorization } : {}),
       });
       if (sent !== false) {
-        lastSentModelRef.current = model;
+        setLanes((prev) => {
+          const cur = prev[targetLaneKey];
+          if (!cur || cur.qaSessId !== targetSessId) return prev;
+          return {
+            ...prev,
+            [targetLaneKey]: {
+              ...cur,
+              lastSentModel: model,
+              lastInjectedContext: shouldInjectContext ? contextPrefix : cur.lastInjectedContext,
+            },
+          };
+        });
         return true;
       }
       return false;
@@ -384,27 +559,27 @@ export function QuickAskWindow({
     [
       sending,
       authorizing,
+      laneKey,
+      qaSessId,
       activeModelId,
-      includeContext,
-      mainlineTitle,
-      mainlineGoalObjective,
-      mainlineMessages,
+      contextPrefix,
+      activeLane.lastInjectedContext,
+      activeLane.lastSentModel,
       demo,
       clearDemoTimer,
       activeModelLabel,
       chat,
-      qaSessId,
       messages.length,
       authorizeSwitch,
     ],
   );
 
-  // Focus textarea when opened or re-seeded; auto-send non-empty slash seeds if idle.
+  // Focus textarea when opened or switched; auto-send non-empty slash seeds if idle.
   useEffect(() => {
     if (!open) return;
     const raf = window.requestAnimationFrame(() => textareaRef.current?.focus());
     return () => window.cancelAnimationFrame(raf);
-  }, [open]);
+  }, [open, laneKey]);
 
   useEffect(() => {
     if (!seed || seed.nonce === lastHandledSeedRef.current) return;
@@ -416,11 +591,11 @@ export function QuickAskWindow({
     } else {
       setInput((cur) => cur || text);
     }
-  }, [seed, sending, authorizing, sendQuestion]);
+  }, [seed, sending, authorizing, sendQuestion, setInput]);
 
   // Auto-scroll isolated quick-ask feed when user is pinned to bottom.
   const lastMsg = messages[messages.length - 1];
-  const scrollSignal = `${messages.length}:${lastMsg?.text?.length ?? 0}:${sending ? 1 : 0}`;
+  const scrollSignal = `${laneKey}:${qaSessId}:${messages.length}:${lastMsg?.text?.length ?? 0}:${sending ? 1 : 0}`;
   useEffect(() => {
     void scrollSignal;
     const el = scrollRef.current;
@@ -441,30 +616,33 @@ export function QuickAskWindow({
     if (!text) return;
     const ok = await sendQuestion(text);
     if (ok) setInput("");
-  }, [input, sendQuestion]);
+  }, [input, sendQuestion, setInput]);
 
   const handleClear = useCallback(() => {
-    if (sending) handleStop();
+    const prevId = qaSessId;
     if (demo) {
-      clearDemoTimer();
-      demoAbortRef.current = true;
-      setDemoMessages([]);
-      setDemoBusy(false);
+      clearDemoTimer(laneKey);
+      demoAbortRef.current[laneKey] = true;
+      setDemoBusyLanes((prev) => ({ ...prev, [laneKey]: false }));
+    } else if (chat.isSending(prevId)) {
+      pendingDeleteIdsRef.current.add(prevId);
+      chat.stop(prevId);
     } else {
-      const prevId = qaSessId;
       chat.removeSession(prevId);
       chat.removePersisted(prevId);
       if (authRef.current) {
         void api.deleteSession(authRef.current, prevId).catch(() => {});
       }
     }
-    lastSentModelRef.current = undefined;
     pinnedToBottomRef.current = true;
-    setQaSessId(genQuickAskSessionId());
-  }, [sending, handleStop, demo, clearDemoTimer, qaSessId, chat, authRef]);
+    setLanes((prev) => ({
+      ...prev,
+      [laneKey]: createLaneState(),
+    }));
+  }, [qaSessId, demo, laneKey, clearDemoTimer, chat, authRef]);
 
   const handlePromote = useCallback(() => {
-    if (messages.length === 0) return;
+    if (messages.length === 0 || sending) return;
     const firstUser = messages.find((m) => m.role === "user");
     const sess = demo ? undefined : chat.getSession(qaSessId);
     const title = cleanQuickAskTitle(sess?.title, firstUser?.text);
@@ -479,10 +657,9 @@ export function QuickAskWindow({
         .then((ok) => (ok ? api.patchSessionTitle(authSession, qaSessId, title) : undefined))
         .catch(() => {});
     } else {
-      clearDemoTimer();
-      demoAbortRef.current = true;
-      setDemoMessages([]);
-      setDemoBusy(false);
+      clearDemoTimer(laneKey);
+      demoAbortRef.current[laneKey] = true;
+      setDemoBusyLanes((prev) => ({ ...prev, [laneKey]: false }));
     }
 
     const promoted: Session = {
@@ -497,16 +674,20 @@ export function QuickAskWindow({
       ...(activeModelId ? { modelId: activeModelId } : {}),
     };
 
-    lastSentModelRef.current = undefined;
-    setQaSessId(genQuickAskSessionId());
+    setLanes((prev) => ({
+      ...prev,
+      [laneKey]: createLaneState(),
+    }));
     onPromoteSession(promoted, snapshotDemo);
   }, [
     messages,
+    sending,
     demo,
     chat,
     qaSessId,
     authRef,
     clearDemoTimer,
+    laneKey,
     user?.id,
     activeModelId,
     onPromoteSession,
@@ -514,23 +695,71 @@ export function QuickAskWindow({
 
   const healthyModels = useMemo(() => models.filter((m) => !m.degraded), [models]);
 
-  const lastAssistantId = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (messages[i]?.role === "assistant") return messages[i].id;
-    }
-    return undefined;
-  }, [messages]);
+  const qaChatInteraction = useMemo<ChatInteraction>(
+    () =>
+      demo
+        ? { reason: "demo" }
+        : {
+            sendUserText: (t: string) => {
+              void sendQuestion(t);
+            },
+            busy: sending,
+          },
+    [demo, sendQuestion, sending],
+  );
 
-  const waitingForFirstChunk =
-    sending &&
-    messages.length > 0 &&
-    messages[messages.length - 1]?.role === "user";
+  const onRespondPermission = useCallback<PermissionRespond>(
+    (p) => {
+      if (demo) return;
+      chat.respondPermission({ sessId: qaSessId, ...p });
+    },
+    [demo, chat, qaSessId],
+  );
+
+  const qaCardCallbacks = useMemo<CardCallbacks>(
+    () => ({
+      onContinue: demo ? undefined : () => { void sendQuestion(CONTINUE_PROMPT); },
+      onRetrySend: demo
+        ? undefined
+        : (msg) => {
+            chat.retryMessage({ sessId: qaSessId, msgId: msg.id, agentId: "main" });
+          },
+      resolveRetryTarget: demo
+        ? undefined
+        : (cmid) => {
+            const m = chat
+              .getMessages(qaSessId)
+              .find((x) => x.role === "user" && x.id === cmid && x.status === "error");
+            return m && preciseRetryEligible(m) ? m : undefined;
+          },
+      onFetchTapeRecordPayload: demo
+        ? undefined
+        : (tapeId, ord, exp, sig) => chat.fetchTapeRecordPayload(qaSessId, tapeId, ord, exp, sig),
+      onPeekTapeRecordPayload: demo
+        ? undefined
+        : (tapeId, ord, exp) => chat.peekTapeRecordPayload(qaSessId, tapeId, ord, exp),
+      onFetchUserMessagePayload: demo
+        ? undefined
+        : (mid, exp, sig) => chat.fetchUserMessagePayload(qaSessId, mid, exp, sig),
+      onPeekUserMessagePayload: demo
+        ? undefined
+        : (mid, exp) => chat.peekUserMessagePayload(qaSessId, mid, exp),
+    }),
+    [demo, chat, qaSessId, sendQuestion],
+  );
+
+  const qaSess = demo ? undefined : chat.getSession(qaSessId);
+  const contextLabel = contextPrefix
+    ? `已关联主线：${clipText(!isDefaultSessionTitle(mainlineTitle) ? mainlineTitle : "当前会话", 20)}`
+    : "独立支线快问";
 
   return (
     <section
       ref={sectionRef}
       aria-label="快问小窗"
       data-testid="quick-ask-window"
+      data-quick-ask-lane={laneKey}
+      data-quick-ask-session={qaSessId}
       style={isMdViewport ? { right: rightOffsetPx } : undefined}
       className={cn(
         "fixed bottom-3 inset-x-3 z-40 flex h-[68dvh] max-h-[560px] flex-col overflow-hidden rounded-xl border border-border-control bg-surface shadow-float",
@@ -587,7 +816,7 @@ export function QuickAskWindow({
             shape="square"
             aria-label="转为正式对话"
             title="转为正式对话并显示在左侧列表"
-            disabled={messages.length === 0}
+            disabled={messages.length === 0 || sending}
             onClick={handlePromote}
           >
             <ArrowUpRight size={15} />
@@ -613,152 +842,53 @@ export function QuickAskWindow({
         </div>
       </header>
 
-      {/* Message stream */}
+      {/* Message stream: only mount MessageList while open so PermissionPromptHost never portals modals/bars while collapsed */}
       <div
         ref={scrollRef}
         onScroll={(e) => {
           const el = e.currentTarget;
           pinnedToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 36;
         }}
-        className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3"
+        className="min-h-0 flex-1 overflow-y-auto [&_[data-testid=timeline-short-list]]:space-y-3 [&_[data-testid=timeline-short-list]]:px-3 [&_[data-testid=timeline-short-list]]:py-3 [&_[data-testid=timeline-footer]]:pb-2 [&_[data-testid=timeline-footer]]:pt-2 [&_[data-testid=pending-permission-dock]]:px-3"
       >
-        {messages.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
-            <MessageCircleQuestion size={24} className="text-accent" />
-            <p className="text-body font-medium text-fg">并行快问，不打断主线任务</p>
-            <p className="text-meta text-muted">
-              独立会话车道与轻模型快答；也可在主输入框直接发送 <span className="font-mono text-fg">/btw 问题</span>
-            </p>
-          </div>
-        ) : (
-          messages.map((msg, idx) => {
-            if (msg.role === "user") {
-              return (
-                <div key={msg.id} className="flex justify-end">
-                  <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-xl rounded-br-sm bg-bubble px-3 py-2 text-body text-fg">
-                    {msg.text}
-                  </div>
-                </div>
-              );
-            }
-
-            if (msg.role === "tool") {
-              return (
-                <div
-                  key={msg.id}
-                  className="flex items-center gap-1.5 text-caption text-muted"
-                >
-                  {msg._completed ? (
-                    <Check size={12} className="shrink-0 text-success" />
-                  ) : (
-                    <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
-                  )}
-                  <span className="truncate">{msg.toolName || msg.text || "执行步骤"}</span>
-                </div>
-              );
-            }
-
-            if (msg.role === "assistant") {
-              if (msg._errorCardSnapshot?.disposition === "silent") return null;
-              const isError =
-                msg._errorCardSnapshot?.disposition === "card" || Boolean(msg._errorCode);
-              if (isError) {
-                const errTitle =
-                  msg._errorCardSnapshot?.disposition === "card"
-                    ? msg._errorCardSnapshot.title
-                    : "回答失败";
-                const errBody =
-                  msg._errorCardSnapshot?.disposition === "card"
-                    ? msg._errorCardSnapshot.message
-                    : msg._userError?.message || msg._errorCode || "请求失败，请重试";
-                let ownerUserId = msg._clientMessageId;
-                if (!ownerUserId) {
-                  for (let j = idx - 1; j >= 0; j -= 1) {
-                    if (messages[j]?.role === "user") {
-                      ownerUserId = messages[j].id;
-                      break;
-                    }
-                  }
-                }
-                return (
-                  <div key={msg.id} className="space-y-2">
-                    {msg.text && (
-                      <div className="text-body text-fg">
-                        <Markdown signMedia={!demo}>{msg.text}</Markdown>
-                      </div>
-                    )}
-                    <Alert
-                      tone="danger"
-                      density="compact"
-                      title={errTitle}
-                      action={
-                        !demo && ownerUserId && !sending ? (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            onClick={() =>
-                              chat.retryMessage({
-                                sessId: qaSessId,
-                                msgId: ownerUserId,
-                                agentId: "main",
-                              })
-                            }
-                          >
-                            重试
-                          </Button>
-                        ) : undefined
-                      }
-                    >
-                      {errBody}
-                    </Alert>
-                  </div>
-                );
-              }
-              if (!msg.text) return null;
-              return (
-                <div key={msg.id} className="text-body text-fg">
-                  <Markdown
-                    live={!msg._completed}
-                    caret={sending && msg.id === lastAssistantId}
-                    signMedia={!demo}
-                  >
-                    {msg.text}
-                  </Markdown>
-                </div>
-              );
-            }
-
-            if (msg.role === "system" && msg._turnStatusRecord) {
-              return (
-                <Alert key={msg.id} tone="danger" density="compact">
-                  {msg._userError?.message || msg.text || "请求未完成"}
-                </Alert>
-              );
-            }
-            return null;
-          })
-        )}
-
-        {waitingForFirstChunk && (
-          <div className="flex items-center gap-2 text-meta text-muted" role="status">
-            <Loader2 size={14} className="animate-spin text-accent" />
-            <span>{activeModelLabel} 正在思考…</span>
-          </div>
-        )}
+        {open &&
+          (messages.length === 0 && !sending ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
+              <MessageCircleQuestion size={24} className="text-accent" />
+              <p className="text-body font-medium text-fg">并行快问，不打断主线任务</p>
+              <p className="text-meta text-muted">
+                按当前主会话隔离车道与轻模型快答；也可在主输入框直接发送{" "}
+                <span className="font-mono text-fg">/btw 问题</span>
+              </p>
+            </div>
+          ) : (
+            <ChatInteractionContext.Provider value={qaChatInteraction}>
+              <MessageList
+                processDisclosure
+                key={qaSessId}
+                messages={messages}
+                sending={sending}
+                liveTurnUsage={qaSess?._liveTurnUsage}
+                transientNotice={demo ? null : chat.getTransientNotice(qaSessId)}
+                cb={qaCardCallbacks}
+                onRespondPermission={onRespondPermission}
+                sessionId={qaSessId}
+              />
+            </ChatInteractionContext.Provider>
+          ))}
       </div>
 
       {/* Footer composer */}
       <footer className="shrink-0 border-t border-border bg-bg/60 px-3 py-2.5">
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <label className="flex cursor-pointer items-center gap-2 text-meta text-muted">
-            <Switch
-              checked={includeContext}
-              onCheckedChange={setIncludeContext}
-              aria-label="附带主线摘要"
-            />
-            <span>附带主线只读摘要</span>
-          </label>
-          <span className="text-caption text-faint">不进主历史</span>
+        <div className="mb-2 flex items-center justify-between gap-2 text-caption text-faint">
+          <span
+            data-testid="quick-ask-context-hint"
+            className="flex min-w-0 items-center gap-1 truncate text-muted"
+          >
+            <Link2 size={12} className="shrink-0 text-accent" />
+            <span className="truncate">{contextLabel}</span>
+          </span>
+          <span className="shrink-0">不进主历史</span>
         </div>
 
         <div className="flex items-end gap-2 rounded-lg border border-border-control bg-surface px-2.5 py-1.5 focus-within:border-border-strong">

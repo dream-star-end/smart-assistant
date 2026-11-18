@@ -1309,16 +1309,35 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
     expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({ title: "office-1029pm", pinned: true });
   });
 
-  test("临时快问会话([快问] webqa_*)不进侧栏，转为正式对话后的 webqa_* 正常保留", async () => {
+  test("临时快问会话([快问]/新会话 webqa_*)不进侧栏与搜索，转为正式对话后的 webqa_* 正常保留", async () => {
     const { result } = await renderSessionList({ confirmResult: true, promptResult: null });
     act(() => {
       result.current.onHydrated([
         { id: "webqa_temp0001", title: "[快问] 临时问题", agentId: "main", createdAt: 1000, lastAt: 2000, messages: [] },
+        { id: "webqa_temp_new", title: "新会话", agentId: "main", createdAt: 1000, lastAt: 2050, messages: [] },
         { id: "webqa_prom0002", title: "已转为正式会话", agentId: "main", createdAt: 1000, lastAt: 2100, messages: [] },
       ] as never);
     });
     expect(result.current.sessions.some((s) => s.id === "webqa_temp0001")).toBe(false);
+    expect(result.current.sessions.some((s) => s.id === "webqa_temp_new")).toBe(false);
     expect(result.current.sessions.some((s) => s.id === "webqa_prom0002")).toBe(true);
+
+    // 若之前 cur 里已有被写坏前缀的项，合并时也会被清理掉
+    act(() => {
+      result.current.setSessions((cur) => [
+        ...cur,
+        {
+          id: "webqa_stale_leak",
+          title: "[快问] 历史残留",
+          ownerUserId: "u1",
+          createdAt: 1000,
+          lastAt: 2080,
+          updatedAt: new Date(2080).toISOString(),
+          messageCount: 1,
+          agentId: "main",
+        },
+      ]);
+    });
 
     vi.mocked(api.listSessions).mockResolvedValueOnce([
       meta("webkeepme001", "保留的会话"),
@@ -1331,5 +1350,15 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
     });
     await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webqa_prom0004")).toBe(true));
     expect(result.current.sessions.some((s) => s.id === "webqa_temp0003")).toBe(false);
+    expect(result.current.sessions.some((s) => s.id === "webqa_stale_leak")).toBe(false);
+
+    vi.spyOn(api, "searchSessions").mockResolvedValueOnce({
+      results: [
+        { sessionId: "webqa_temp0001", title: "[快问] 临时问题", snippet: "命中", matchedAt: 1, kind: "message" },
+        { sessionId: "webqa_prom0002", title: "已转为正式会话", snippet: "命中", matchedAt: 2, kind: "title" },
+      ],
+    });
+    const hits = await result.current.searchSessionMessages("命中", new AbortController().signal);
+    expect(hits.map((h) => h.sessionId)).toEqual(["webqa_prom0002"]);
   });
 });

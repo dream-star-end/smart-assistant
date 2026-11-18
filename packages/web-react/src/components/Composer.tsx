@@ -549,8 +549,8 @@ export function Composer({
     const typed = value.trim().length > 0 || doneMedia.length > 0;
     if (!typed && !sendPrediction) return;
     const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
-    const qa = typed && onQuickAskCommand && doneMedia.length === 0 ? parseQuickAskSlashCommand(text) : null;
-    if (qa?.matched) { setValue(""); if (draftKey) clearDraft(draftKey); onQuickAskCommand?.(qa.question); return; }
+    const qa = typed && onQuickAskCommand ? parseQuickAskSlashCommand(text) : null;
+    if (qa?.matched) { if (attachments.length > 0) { toast("快问小窗暂不支持携带附件，请先移除附件", "info"); return; } setValue(""); if (draftKey) clearDraft(draftKey); onQuickAskCommand?.(qa.question); return; }
     const snapshot = latestSubmitRef.current;
     submittingKeysRef.current.add(ownerKey);
     const resetSubmit = () => {
