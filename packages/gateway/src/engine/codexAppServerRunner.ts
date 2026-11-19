@@ -67,7 +67,7 @@ import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import { writeCodexDelegateContext } from './codexDelegateContext.js'
 import {
   buildAdvisorReadOnlyArgs, buildCodexThreadPolicyParams,
-  buildCodexTurnPolicyParams, readAdvisorReadOnlyConfig,
+  buildCodexTurnPolicyParams, ensureCodexTurnServiceTierSupported, readAdvisorReadOnlyConfig,
 } from './codexAdvisorReadOnly.js'
 import {
   buildHermeticDenial,
@@ -354,6 +354,8 @@ export class CodexAppServerRunner extends EventEmitter {
   private shuttingDown = false
   private spawnEmitted = false
   private initialized = false
+  private initializedPayload: unknown = undefined
+  private resetInitializedState(): void { this.initialized = false; this.initializedPayload = undefined }
   /** Captured from this queue entry; never inferred from a rewritten prompt. */
   private advisorReadOnly = false
   /** Tool/MCP schemas are process-scoped, so both policy transitions recycle. */
@@ -981,7 +983,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // 之间的窗口),用户 stop 也要能立即中断退避,否则要等满退避才收尾。
     this.staleProcGeneration = true
     if (this.pendingRetryAbort) {
-      this.pendingRetryAbort.abort()
+      this.pendingRetryAbort.abort('user-stop')
       return true
     }
     const hadPendingUserInput = this.pendingUserInputs.size > 0
@@ -1015,7 +1017,7 @@ export class CodexAppServerRunner extends EventEmitter {
   private wakeRetryBackoffOnProcGone(): void {
     if (this.pendingRetryAbort) {
       this.retryBackoffProcGone = true
-      this.pendingRetryAbort.abort()
+      this.pendingRetryAbort.abort('proc-gone')
     }
   }
 
@@ -1237,17 +1239,16 @@ export class CodexAppServerRunner extends EventEmitter {
     // reject pending JSON-RPC before waiting for the process so waiters fail
     // closed instead of inheriting a never-settling handshake.
     this._spawnPromise = null
+    // Abort backoff sleep or Ultrafast capability check before failing pending RPCs so waiters
+    // observe shutdown rather than misclassifying it as a user interrupt.
+    if (this.pendingRetryAbort) {
+      this.pendingRetryAbort.abort('shutdown')
+      this.pendingRetryAbort = null
+    }
     for (const [, p] of this.pending) {
       p.reject(new Error('CodexAppServerRunner shutdown'))
     }
     this.pending.clear()
-    // turn-retry 批:若正卡在 turn/start 重试退避,唤醒它(abortableDelay 立即返回)。
-    // runTurn 的退避后 proc-gone 门会据 shuttingDown 转终态,不把 turn/start 发进
-    // 即将被 kill 的管道(否则 sendRequest 无人 settle → 挂死)。
-    if (this.pendingRetryAbort) {
-      this.pendingRetryAbort.abort()
-      this.pendingRetryAbort = null
-    }
     if (!opts?.keepQueuedTurns) {
       const pendingQueue = this.queue
       this.queue = []
@@ -1329,7 +1330,7 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     this.activeTurnId = null
     this.currentCollabAgentPolicy = undefined
-    this.initialized = false
+    this.resetInitializedState()
     this.attached = false
     this.syncedPlatformGoalSignature = null
     this.syncedPlatformGoal = null
@@ -1767,7 +1768,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.wakeRetryBackoffOnProcGone()
       this.proc = null
       this.spawnedProviderSignature = null
-      this.initialized = false
+      this.resetInitializedState()
       this.attached = false
       this.syncedPlatformGoalSignature = null
       this.syncedPlatformGoal = null
@@ -1800,6 +1801,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const initializeStartedAt = performance.now()
     try {
       const initialized = await this.sendRequest('initialize', this.buildInitializeParams())
+      this.initializedPayload = initialized
       this.advisorReadOnlyConfig = await readAdvisorReadOnlyConfig(this.advisorReadOnly, initialized,
         () => this.sendRequest('config/read', { cwd: effectiveCwd, includeLayers: false }),
         this.cachedOverrides?.tokenFile != null)
@@ -1884,7 +1886,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.wakeRetryBackoffOnProcGone()
       this.proc = null
       this.spawnedProviderSignature = null
-      this.initialized = false
+      this.resetInitializedState()
       this.attached = false
       this.activeTurnId = null
       this.stdoutBuf = ''
@@ -1896,7 +1898,7 @@ export class CodexAppServerRunner extends EventEmitter {
       if (wasShutdown) this.shuttingDown = false
     })
     try {
-      await this.sendRequest('initialize', this.buildInitializeParams())
+      this.initializedPayload = await this.sendRequest('initialize', this.buildInitializeParams())
     } catch (err) {
       try {
         await this.shutdown()
@@ -2006,10 +2008,18 @@ export class CodexAppServerRunner extends EventEmitter {
     return this.activeTurnId != null
   }
 
-  private sendRequest(method: string, params: unknown): Promise<unknown> {
+  private sendRequest(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) return Promise.reject(new Error(`codex request ${method} aborted`))
     const id = ++this.nextRequestId
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method })
+      const onAbort = signal ? () => { this.pending.delete(id); reject(new Error(`codex request ${method} aborted`)) } : null
+      const unlisten = () => { if (onAbort) signal?.removeEventListener('abort', onAbort) }
+      if (onAbort) signal?.addEventListener('abort', onAbort, { once: true })
+      this.pending.set(id, {
+        resolve: (v) => { unlisten(); resolve(v) },
+        reject: (e) => { unlisten(); reject(e) },
+        method,
+      })
       this.writeRaw(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
     })
   }
@@ -2290,6 +2300,23 @@ export class CodexAppServerRunner extends EventEmitter {
   private abortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
     return abortableDelay(ms, signal)
   }
+  private async verifyTurnServiceTier(readOnly: boolean, serviceTier: ServiceTier | null): Promise<void> {
+    const controller = new AbortController()
+    this.pendingRetryAbort = controller
+    this.retryBackoffProcGone = false
+    try {
+      await ensureCodexTurnServiceTierSupported({
+        model: this.opts.model, readOnly, serviceTier, remote: Boolean(this.opts.remote),
+        initialized: this.initializedPayload, signal: controller.signal,
+        listModels: (cursor, sig) => this.sendRequest('model/list', cursor ? { cursor } : {}, sig),
+      })
+    } catch (err) {
+      if (controller.signal.aborted && controller.signal.reason === 'user-stop' && !this.retryBackoffProcGone) {
+        this.pendingStartInterrupt = true; return
+      }
+      throw err
+    } finally { if (this.pendingRetryAbort === controller) this.pendingRetryAbort = null }
+  }
 
   /** turn/start 窄路径自动重试门。**全部**满足才允许重试(fail-closed):
    *   1. 共享自动重试额度尚未用尽;
@@ -2533,6 +2560,7 @@ export class CodexAppServerRunner extends EventEmitter {
       for (;;) {
         // 每个 attempt 起点集中复位 per-attempt 态(见 resetAttemptState)。
         this.resetAttemptState()
+        if (!this.pendingStartInterrupt) await this.verifyTurnServiceTier(readOnly, turnServiceTier)
         // Native compaction is a local RPC outside the relay grammar; the node manages its
         // own context window for a remote thread.
         if (!this.pendingStartInterrupt && !this.opts.remote) {

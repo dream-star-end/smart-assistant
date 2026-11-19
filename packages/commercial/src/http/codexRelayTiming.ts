@@ -6,6 +6,11 @@ export type TimingFields = Record<string, number | string | null>
 export type TimingObserver = (fields: TimingFields) => void
 const REQUEST_LIMIT = 2 * 1024 * 1024
 const EVENT_LIMIT = 256 * 1024
+const OBSERVED_SERVICE_TIERS = new Set(['priority', 'ultrafast', 'default', 'flex', 'auto'])
+
+function observedServiceTier(value: unknown): string | null {
+  return typeof value === 'string' && OBSERVED_SERVICE_TIERS.has(value) ? value : null
+}
 
 function obj(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -53,6 +58,7 @@ export function codexRequestTiming(
             toolsTokensEstimate: tokens(request.tools),
             toolCount: Array.isArray(request.tools) ? request.tools.length : 0,
             inputItemCount: input.length,
+            requestedServiceTier: observedServiceTier(request.service_tier),
           }
           for (const role of ['system', 'developer', 'user', 'assistant', 'tool', 'other']) {
             fields[`${role}TokensEstimate`] = 0
@@ -114,6 +120,7 @@ export function codexResponseTiming(
           reasoningTokens: count(output.reasoning_tokens),
           instructionsTokens: count(obj(fields.instructions).input_tokens),
           toolsTokens: count(obj(fields.tools).input_tokens),
+          responseServiceTier: observedServiceTier(response.service_tier),
         })
       }
     } catch { /* malformed/oversize events do not affect the original stream */ }

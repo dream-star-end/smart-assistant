@@ -12,7 +12,7 @@
 
 import { classifyHttpOutcome } from '../account-pool/policy/outcome.js'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -66,6 +66,12 @@ import { IMAGE_MODEL_RE, parseImageModelPolicy, type ImageModelPolicy } from '..
 import { InsufficientCreditsError as LedgerInsufficientCreditsError } from '../billing/ledger.js'
 
 import { codexRequestTiming, codexResponseTiming, codexBodyTiming } from './codexRelayTiming.js'
+import {
+  CodexModelsFallbackCache,
+  MAX_CODEX_MODELS_CACHE_BYTES,
+  buildCodexModelsCacheKey,
+  createModelsCacheTap,
+} from './codexModelsFallbackCache.js'
 import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
 import { buildUpstreamHeaders, CODEX_UPSTREAM_AUTH_HEADER, HOP_BY_HOP_HEADERS } from './codexUpstreamHeaders.js'
 
@@ -754,6 +760,10 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
   const image2Enabled = deps.image2Enabled ?? process.env.OC_IMAGE2_ENABLED === 'true'
   const imageModelPolicy = deps.imageModelPolicy ?? parseImageModelPolicy(process.env, (msg) => log.warn(msg))
   const imageAttempts = new Map<string, number[]>()
+  const modelsFallbackCache = new CodexModelsFallbackCache()
+  const modelsCacheHmacKey = randomBytes(32)
+  const officialUpstreamUrl = new URL(CODEX_OFFICIAL_UPSTREAM_BASE_URL)
+  const officialModelsPath = `${officialUpstreamUrl.pathname.replace(/\/+$/, '')}/models`
   let activeImageHeavyWork = 0
 
   return async function handle(req, res, ctx) {
@@ -1364,7 +1374,82 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         if (observeRequest) observeTiming({ stage: 'upstream_dispatch', atEpochMs: fetchInvokedAtMs, elapsedMs: upstreamStartedAt - relayReceivedAt })
         return pending
       }
-      let upstream = await fetchUpstream()
+      const mappedSearch = (() => {
+        try { return new URL(mappedUrl.url).search } catch { return '' }
+      })()
+      const isOfficialCodexModels =
+        observeModels &&
+        !routeContext &&
+        egress !== null &&
+        mappedUrl.upstreamHost === officialUpstreamUrl.host &&
+        mappedUrl.upstreamPath === officialModelsPath
+      const modelsCacheKey = isOfficialCodexModels
+        ? buildCodexModelsCacheKey({
+            hmacKey: modelsCacheHmacKey,
+            authHeader: outgoingHeaders.get('authorization'),
+            workspaceId: outgoingHeaders.get('chatgpt-account-id'),
+            accountId: egress!.accountId,
+            usedFallbackToken: !hadContainerUpstreamAuth,
+            search: mappedSearch,
+          })
+        : null
+      const isTransientModelsStatus = (status: number): boolean => status >= 500 || status === 429
+
+      let upstream: Response
+      if (isOfficialCodexModels) {
+        let firstRes: Response | null = null
+        let modelsErr: unknown = null
+        try {
+          firstRes = await fetchUpstream()
+        } catch (err) {
+          modelsErr = err
+        }
+        if (
+          (modelsErr !== null && !controller.signal.aborted) ||
+          (firstRes !== null && isTransientModelsStatus(firstRes.status))
+        ) {
+          if (firstRes) {
+            await firstRes.body?.cancel().catch(() => {})
+            firstRes = null
+          }
+          if (controller.signal.aborted) {
+            throw modelsErr ?? new DOMException('request aborted', 'AbortError')
+          }
+          await waitForImageRetry(200, controller.signal)
+          modelsErr = null
+          try {
+            firstRes = await fetchUpstream()
+          } catch (err) {
+            modelsErr = err
+          }
+        }
+        if (modelsErr !== null || (firstRes !== null && isTransientModelsStatus(firstRes.status))) {
+          const cachedModels = !controller.signal.aborted
+            ? modelsFallbackCache.get(modelsCacheKey)
+            : null
+          if (cachedModels) {
+            if (firstRes) await firstRes.body?.cancel().catch(() => {})
+            observeTiming({
+              stage: 'fallback_cache_hit',
+              elapsedMs: performance.now() - upstreamStartedAt,
+              bodyBytes: cachedModels.byteLength,
+            })
+            relayLog.warn('relay_models_fallback_cache_hit', {
+              status: firstRes ? firstRes.status : null,
+              bodyBytes: cachedModels.byteLength,
+            })
+            res.statusCode = 200
+            res.setHeader('x-openclaude-relay-request-id', requestId)
+            res.setHeader('Content-Type', 'application/json; charset=utf-8')
+            res.end(cachedModels)
+            return
+          }
+          if (modelsErr !== null) throw modelsErr
+        }
+        upstream = firstRes as Response
+      } else {
+        upstream = await fetchUpstream()
+      }
       if (isImageRequest && upstream.status === 429) {
         imageUpstreamFailureCode = 'IMAGE_UPSTREAM_RATE_LIMITED'
         if (activeImageAttemptId && imageRequestId && deps.pgPool) {
@@ -1552,7 +1637,17 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         } else if (observeModels) {
           const tap = codexBodyTiming(observeTiming, () => performance.now(), upstreamStartedAt)
           tap.on('error', reject)
-          body.pipe(tap).pipe(res)
+          if (upstream.status === 200 && modelsCacheKey) {
+            const cacheTap = createModelsCacheTap(MAX_CODEX_MODELS_CACHE_BYTES, (buf) => {
+              if (!controller.signal.aborted) {
+                modelsFallbackCache.putIfValid(modelsCacheKey, buf)
+              }
+            })
+            cacheTap.on('error', reject)
+            body.pipe(tap).pipe(cacheTap).pipe(res)
+          } else {
+            body.pipe(tap).pipe(res)
+          }
         } else body.pipe(res)
       })
     } catch (err) {
