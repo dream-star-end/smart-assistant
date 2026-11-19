@@ -47,6 +47,7 @@ import {
   readdir,
   readFile,
   rename,
+  stat,
   unlink,
 } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -94,6 +95,45 @@ export function retryBackoffMs(attempts: number): number {
   return Math.min(RETRY_BACKOFF_BASE_MS * 2 ** exp, RETRY_BACKOFF_MAX_MS)
 }
 
+/**
+ * 长尾冷退避档位(仅降频,严守 lossless 绝不按年龄删除有效付费数据):
+ * 长期无法收敛的条目(如历史 session_missing / 永久 incomplete 503 大文件)若一直停在 5min,
+ * 会每 5 分钟全量重写+fsync 几十 MB 并持续打 503。达到长尾阈值后分两档降频:
+ *   - Tier 1: attempts >= 30 且距 firstSeenAt >= 24h → 1h
+ *   - Tier 2: attempts >= 100 且距 firstSeenAt >= 72h → 6h
+ * 账务/免单待结算(TURN_TAPE_BILLING_PENDING / TURN_WAIVER_PENDING)豁免冷退避,
+ * 维持常规 5min 封顶以保障账务收敛速度。
+ */
+export const COLD_BACKOFF_TIER1_ATTEMPTS = 30
+export const COLD_BACKOFF_TIER1_AGE_MS = 24 * 60 * 60 * 1000
+export const COLD_BACKOFF_TIER1_MS = 60 * 60_000
+export const COLD_BACKOFF_TIER2_ATTEMPTS = 100
+export const COLD_BACKOFF_TIER2_AGE_MS = 72 * 60 * 60 * 1000
+export const COLD_BACKOFF_TIER2_MS = 6 * 60 * 60_000
+
+export function entryRetryBackoffMs(
+  entry: Pick<V3MasterRetryEntry, 'attempts' | 'firstSeenAt' | 'lastErrorMessage'>,
+  refNowMs: number,
+): number {
+  if (entry.attempts <= 0) return 0
+  const base = retryBackoffMs(entry.attempts)
+  if (entry.lastErrorMessage && BILLING_OR_WAIVER_PENDING_RE.test(entry.lastErrorMessage)) {
+    return base
+  }
+  const ageMs = Math.max(0, refNowMs - entry.firstSeenAt)
+  if (entry.attempts >= COLD_BACKOFF_TIER2_ATTEMPTS && ageMs >= COLD_BACKOFF_TIER2_AGE_MS) {
+    return Math.max(base, COLD_BACKOFF_TIER2_MS)
+  }
+  if (entry.attempts >= COLD_BACKOFF_TIER1_ATTEMPTS && ageMs >= COLD_BACKOFF_TIER1_AGE_MS) {
+    return Math.max(base, COLD_BACKOFF_TIER1_MS)
+  }
+  return base
+}
+
+/** 崩溃遗留 .tmp-<pid>-<hex> 孤儿文件回收阈值(1h,严格按 OS wall clock 判定,绝不删活跃写入). */
+export const STALE_TMP_TTL_MS = 60 * 60 * 1000
+const STALE_TMP_NAME_RE = /\.json\.tmp-\d+-[0-9a-f]+$/
+
 /** 重 kick 最小间隔。pendingKick 时不再 `setImmediate` 背靠背(配合退避后每轮多为
  *  "读文件+跳过",仍会 file-read 自旋占满 event loop → 已知 v3 wedge 类隐患)。
  *  改为延迟重 kick,把 drain 轮次封顶到 ~1/s;新 entry 最多等此值。 */
@@ -136,6 +176,10 @@ export interface DrainStats {
   errors: number
   /** Entry remained queued (transient/session_missing, attempts bumped). */
   pending: number
+  /** Entries skipped in backoff window via in-memory (ino, mtimeMs, size) index without readFile/JSON.parse. */
+  backoffCacheHits?: number
+  /** Crash-orphaned *.json.tmp-<pid>-<hex> files older than STALE_TMP_TTL_MS unlinked in this pass. */
+  staleTmpCleaned?: number
 }
 
 export interface V3MasterRetryQueue {
@@ -182,6 +226,22 @@ export interface MakeV3MasterRetryQueueDeps {
     attemptNo: number,
     status: 'completed' | 'interrupted' | 'crashed',
   ) => boolean | Promise<boolean>
+  /** Override only for tests / instrumentation. Defaults to fs.readFile(path, 'utf8'). */
+  readEntryFile?: (filepath: string) => Promise<string>
+}
+
+interface FileFingerprint {
+  ino: number
+  mtimeMs: number
+  size: number
+}
+
+interface BackoffCacheEntry extends FileFingerprint {
+  nextRetryAt: number
+}
+
+function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
+  return a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size
 }
 
 export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3MasterRetryQueue {
@@ -192,6 +252,84 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
   let draining = false
   let pendingKick = false
   let periodicTimer: ReturnType<typeof setInterval> | null = null
+  const backoffCache = new Map<string, BackoffCacheEntry>()
+
+  function setBackoffCache(name: string, fp: FileFingerprint | null, nextRetryAt: number): void {
+    if (!fp) {
+      backoffCache.delete(name)
+      return
+    }
+    backoffCache.set(name, {
+      ino: fp.ino,
+      mtimeMs: fp.mtimeMs,
+      size: fp.size,
+      nextRetryAt,
+    })
+  }
+
+  /**
+   * Read an entry file together with a TOCTOU-free fingerprint bound strictly to the
+   * bytes read. If the file changes mid-read (or cannot be verified as unchanged),
+   * returns `fingerprint: null` so the caller never caches a mismatched fingerprint.
+   */
+  async function readEntryWithFingerprint(
+    filepath: string,
+  ): Promise<{ raw: string; fingerprint: FileFingerprint | null }> {
+    if (deps.readEntryFile) {
+      let pre: FileFingerprint | null = null
+      try {
+        const s = await stat(filepath)
+        pre = { ino: s.ino, mtimeMs: s.mtimeMs, size: s.size }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw err
+      }
+      const raw = await deps.readEntryFile(filepath)
+      if (!pre) return { raw, fingerprint: null }
+      try {
+        const s = await stat(filepath)
+        const post: FileFingerprint = { ino: s.ino, mtimeMs: s.mtimeMs, size: s.size }
+        return { raw, fingerprint: sameFingerprint(pre, post) ? post : null }
+      } catch {
+        return { raw, fingerprint: null }
+      }
+    }
+    const fh = await open(filepath, 'r')
+    try {
+      const s1 = await fh.stat()
+      const raw = await fh.readFile('utf8')
+      const s2 = await fh.stat()
+      const fp1: FileFingerprint = { ino: s1.ino, mtimeMs: s1.mtimeMs, size: s1.size }
+      const fp2: FileFingerprint = { ino: s2.ino, mtimeMs: s2.mtimeMs, size: s2.size }
+      return { raw, fingerprint: sameFingerprint(fp1, fp2) ? fp2 : null }
+    } finally {
+      await fh.close()
+    }
+  }
+
+  async function cleanStaleTmpFiles(names: string[]): Promise<number> {
+    let cleaned = 0
+    const wallNow = Date.now()
+    for (const name of names) {
+      if (!STALE_TMP_NAME_RE.test(name)) continue
+      const filepath = join(dir, name)
+      try {
+        const st = await stat(filepath)
+        if (wallNow - st.mtimeMs >= STALE_TMP_TTL_MS) {
+          await unlinkIgnoreEnoent(filepath)
+          cleaned++
+          log.warn('v3MasterRetryQueue: cleaned stale orphan tmp file', {
+            name,
+            ageMs: Math.round(wallNow - st.mtimeMs),
+            size: st.size,
+          })
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue
+        // Best-effort cleanup; never fail a drain pass on tmp stat errors.
+      }
+    }
+    return cleaned
+  }
 
   async function ensureDir(): Promise<void> {
     await mkdir(dir, { recursive: true })
@@ -203,22 +341,27 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     return `${now()}-${randomBytes(8).toString('hex')}.json`
   }
 
-  async function atomicWriteJson(filepath: string, data: unknown): Promise<void> {
+  async function atomicWriteJson(filepath: string, data: unknown): Promise<FileFingerprint> {
     const tmp = `${filepath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
     const json = JSON.stringify(data)
     // Use open+writeFile+close so we can fsync before rename — without
     // fsync the rename can land before the file content reaches disk on
-    // a power loss. Cheap belt-and-braces on a path that runs once per
-    // turn-end retry.
+    // a power loss. Capture fstat on the open fd before rename so the
+    // fingerprint is atomically bound to the exact bytes written (rename
+    // preserves ino, size, and mtimeMs).
     const fh = await open(tmp, 'w')
+    let fp: FileFingerprint
     try {
       await fh.writeFile(json, 'utf8')
       await fh.sync()
+      const st = await fh.stat()
+      fp = { ino: st.ino, mtimeMs: st.mtimeMs, size: st.size }
     } finally {
       await fh.close()
     }
     await rename(tmp, filepath)
     await fsyncDir()
+    return fp
   }
 
   async function fsyncDir(): Promise<void> {
@@ -242,6 +385,7 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     if (!/^[0-9]+-[0-9a-f]+\.json$/.test(receipt)) {
       throw new Error('invalid v3 master retry receipt')
     }
+    backoffCache.delete(receipt)
     await unlinkIgnoreEnoent(join(dir, receipt))
     await fsyncDir().catch((err) => {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
@@ -304,6 +448,8 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
       fatalDropped: 0,
       errors: 0,
       pending: 0,
+      backoffCacheHits: 0,
+      staleTmpCleaned: 0,
     }
     let names: string[]
     try {
@@ -311,12 +457,20 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         // Dir hasn't been created yet (no enqueues yet) — nothing to do.
+        backoffCache.clear()
         return stats
       }
       throw err
     }
+    // Reclaim crash-orphaned *.json.tmp-<pid>-<hex> files older than 1h (OS wall clock).
+    stats.staleTmpCleaned = await cleanStaleTmpFiles(names)
     // Only entries — skip stale .tmp-* and anything that isn't *.json.
     const entries = names.filter((n) => n.endsWith('.json') && !n.includes('.tmp-'))
+    // Prune backoff cache keys whose files are no longer on disk (prevent unbounded growth).
+    const activeNames = new Set(entries)
+    for (const cachedName of backoffCache.keys()) {
+      if (!activeNames.has(cachedName)) backoffCache.delete(cachedName)
+    }
     // Lex sort ≈ time order (filename starts with ms ts) — drain oldest
     // first so a long-pending entry gets a fresh attempt sooner.
     entries.sort()
@@ -324,12 +478,39 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     for (const name of entries) {
       stats.considered++
       const filepath = join(dir, name)
+      // Fast-path: 若文件在内存退避索引内且磁盘 (ino, mtimeMs, size) 未变化,
+      // 直接跳过 readFile + JSON.parse(消除 30s 周期全量读几十 MB 大文件风暴)。
+      const cached = backoffCache.get(name)
+      if (cached) {
+        if (now() < cached.nextRetryAt) {
+          try {
+            const st = await stat(filepath)
+            if (st.ino === cached.ino && st.mtimeMs === cached.mtimeMs && st.size === cached.size) {
+              stats.pending++
+              stats.backoffCacheHits = (stats.backoffCacheHits ?? 0) + 1
+              continue
+            }
+            backoffCache.delete(name)
+          } catch (err) {
+            backoffCache.delete(name)
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+              continue
+            }
+          }
+        } else {
+          backoffCache.delete(name)
+        }
+      }
       let raw: string
+      let readFp: FileFingerprint | null
       try {
-        raw = await readFile(filepath, 'utf8')
+        const readRes = await readEntryWithFingerprint(filepath)
+        raw = readRes.raw
+        readFp = readRes.fingerprint
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
           // Vanished under us — fine.
+          backoffCache.delete(name)
           continue
         }
         stats.errors++
@@ -345,16 +526,19 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
         entry = parsed
       } catch (err) {
         stats.fatalDropped++
+        backoffCache.delete(name)
         log.warn('v3MasterRetryQueue: malformed entry, quarantining', { name }, err)
         await quarantine(filepath, 'malformed')
         await fsyncDir()
         continue
       }
-      // Per-entry 指数退避:刚失败过(attempts>0)且未到下次重试时刻 → 跳过本轮 attemptSend
-      // (不调 master),计为 pending。这是消除"频繁 kick → 无间隔背靠背重发"风暴的关键;
-      // 退避不丢数据且没有 TTL。新 entry(attempts=0)或退避已过 → 正常重试。
+      // Per-entry 指数退避 + 长尾冷退避:刚失败过(attempts>0)且未到下次重试时刻 → 跳过本轮
+      // attemptSend(不调 master),仅在确认读盘指纹未漂移时写入内存索引并计为 pending。
+      // 使用 entry.lastErrorAt 作为冷退避年龄参考点,保证重启前后 nextRetryAt 确定性一致。
       if (entry.attempts > 0 && typeof entry.lastErrorAt === 'number') {
-        if (now() < entry.lastErrorAt + retryBackoffMs(entry.attempts)) {
+        const nextRetryAt = entry.lastErrorAt + entryRetryBackoffMs(entry, entry.lastErrorAt)
+        if (now() < nextRetryAt) {
+          setBackoffCache(name, readFp, nextRetryAt)
           stats.pending++
           continue
         }
@@ -417,6 +601,7 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
             turnIndex: entry.payload.turnIndex,
           })
           await quarantine(filepath, 'immutable_conflict')
+          backoffCache.delete(name)
           await fsyncDir()
           continue
         }
@@ -435,6 +620,7 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
             attempts: entry.attempts + 1,
           })
           await quarantine(filepath, 'retry_cap_after_settlement_handoff')
+          backoffCache.delete(name)
           await fsyncDir()
           continue
         }
@@ -488,16 +674,20 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     name: string,
     stats: DrainStats,
   ): Promise<void> {
+    const failedAt = now()
     const updated: V3MasterRetryEntry = {
       ...entry,
       attempts: entry.attempts + 1,
       lastErrorClass,
-      lastErrorAt: now(),
+      lastErrorAt: failedAt,
       lastErrorMessage,
     }
     try {
-      await atomicWriteJson(filepath, updated)
+      const writtenFp = await atomicWriteJson(filepath, updated)
+      const nextRetryAt = failedAt + entryRetryBackoffMs(updated, failedAt)
+      setBackoffCache(name, writtenFp, nextRetryAt)
     } catch (writeErr) {
+      backoffCache.delete(name)
       if ((writeErr as NodeJS.ErrnoException).code === 'ENOENT') {
         // Dir vanished mid-pass. Re-create on next enqueue.
         log.warn('v3MasterRetryQueue: dir vanished during retry rewrite', { name })
