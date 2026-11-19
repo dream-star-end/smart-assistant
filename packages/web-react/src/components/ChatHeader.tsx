@@ -96,6 +96,8 @@ export function ChatHeader({
   projectBreadcrumb,
   projectSuggestion,
   onOpenProjectScope,
+  sessionTitle,
+  running = false,
   updateAvailable = false,
   onReloadForUpdate,
 }: {
@@ -169,12 +171,20 @@ export function ChatHeader({
   /** 未分类会话的项目建议（P5，开关控制）。只提示，移入由用户点。 */
   projectSuggestion?: { name: string; onAccept: () => void; onDismiss: () => void } | null;
   onOpenProjectScope?: () => void;
+  /** 可选当前会话标题（桌面宽屏在智能体名旁以安静层次展示，省略则不占空间）。 */
+  sessionTitle?: string | null;
+  /** 可选运行态标记：true 时在强模型选择器旁展示精简运行态徽章。 */
+  running?: boolean;
   /** 服务端已是新前端(appUpdate.getPillVisible)。true 且给了 onReloadForUpdate 时模型行右端出「新版本」pill。 */
   updateAvailable?: boolean;
   onReloadForUpdate?: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   const showUpdatePill = updateAvailable && !!onReloadForUpdate;
+  const trimmedSessionTitle = typeof sessionTitle === "string" ? sessionTitle.trim() : "";
+  const showSessionTitle = Boolean(trimmedSessionTitle && trimmedSessionTitle !== "新对话");
+  const hasSecondaryActions = Boolean(onOpenFind || onShare || onOpenInbox || credits != null);
+  const hasWorkspaceToggles = Boolean(onToggleQuickAsk || onTogglePane);
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
   // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
@@ -186,7 +196,7 @@ export function ChatHeader({
   return (
     <header
       ref={headerRef}
-      className="flex min-h-14 shrink-0 flex-wrap items-center gap-1 px-2 pb-2 header-safe-t sm:flex-nowrap sm:px-3 sm:pb-2.5"
+      className="flex min-h-14 shrink-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 border-b border-border/60 bg-bg/90 px-2.5 pb-2 backdrop-blur-sm header-safe-t sm:flex-nowrap sm:gap-1.5 sm:px-4 sm:pb-2.5"
       data-product-entry-scope="chat-header"
     >
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
@@ -254,6 +264,16 @@ export function ChatHeader({
         </span>
         <ChevronDown size={15} className="hidden shrink-0 text-faint sm:block" />
       </button>
+      {showSessionTitle && (
+        <span
+          data-testid="chat-session-title"
+          title={trimmedSessionTitle}
+          className="hidden min-w-0 max-w-[13rem] shrink items-center gap-1.5 text-meta font-medium text-muted lg:inline-flex"
+        >
+          <span aria-hidden className="text-border-strong">/</span>
+          <span className="truncate">{trimmedSessionTitle}</span>
+        </span>
+      )}
       {projectBreadcrumb?.chatName ? (
         // 所在项目:窄屏也显示(截断),点开项目本身,而不是管理中心。
         <button
@@ -262,10 +282,10 @@ export function ChatHeader({
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
           aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
-          className="inline-flex min-h-11 min-w-0 max-w-[7rem] shrink items-center gap-1 rounded-lg px-1.5 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[14rem] sm:px-2 sm:py-1"
+          className="inline-flex min-h-11 min-w-0 max-w-[7rem] shrink items-center gap-1 rounded-full px-2 text-caption text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[13rem] sm:py-1"
           title={`所在项目：${projectBreadcrumb.chatName}`}
         >
-          <FolderOpen size={13} aria-hidden className="shrink-0" />
+          <FolderOpen size={12.5} aria-hidden className="shrink-0" />
           <span className="truncate">{projectBreadcrumb.chatName}</span>
         </button>
       ) : projectSuggestion ? (
@@ -295,8 +315,12 @@ export function ChatHeader({
           </button>
         </span>
       ) : null}
-      {(teamModeActive || advisorModeActive || (models && onSelectModel) || showUpdatePill) && (
-        <div className="order-last flex min-w-0 basis-full items-center gap-1 sm:order-none sm:flex-1 sm:basis-auto" data-testid="chat-model-row">
+      {(teamModeActive || advisorModeActive || (models && onSelectModel) || running || showUpdatePill) && (
+        <div
+          className="order-last flex min-w-0 basis-full items-center gap-1.5 border-t border-border/50 pt-1 sm:order-none sm:flex-1 sm:basis-auto sm:border-t-0 sm:pt-0"
+          data-testid="chat-model-row"
+        >
+          <span aria-hidden className="hidden h-4 w-px shrink-0 bg-border sm:block" />
           {/* OCV5-295:窄屏模型行不再铺整宽灰底(像主 CTA);触发器自带 44px 命中与截断,模型名/倍率直接可读。 */}
           {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
               点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
@@ -405,6 +429,17 @@ export function ChatHeader({
               onCancelSwitch={onCancelModelSwitch}
             />
           )}
+          {running && (
+            <span
+              role="status"
+              data-testid="header-running-badge"
+              aria-label="当前会话正在运行"
+              className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium leading-none text-accent"
+            >
+              <Loader2 size={11} aria-hidden className="animate-spin shrink-0" />
+              <span>运行中</span>
+            </span>
+          )}
           {/* OCV5-626:版本不一致即亮,不等安全点 / 5 分钟横幅。放模型行右端:窄屏这一行整宽且右侧
               本就空着,不挤顶栏图标;桌面紧跟模型选择器。点一下走 governor.reloadNow()。 */}
           {showUpdatePill && (
@@ -426,105 +461,123 @@ export function ChatHeader({
           )}
         </div>
       )}
-      <div className="ml-auto flex shrink-0 items-center gap-0 sm:gap-1.5">
-        {onOpenFind && (
-          <IconButton
-            data-product-control
-            onClick={onOpenFind}
-            aria-label="会话内查找"
-            title={`会话内查找 (${modKeyLabel()}F)`}
-            shape="square"
-          >
-            <Search size={18} />
-          </IconButton>
-        )}
-        {onShare && (
-          <IconButton
-            data-product-control
-            onClick={onShare}
-            aria-label="分享会话"
-            title="分享会话"
-            shape="square"
-            className="hidden sm:flex"
-          >
-            <Share2 size={18} />
-          </IconButton>
-        )}
-        {/* 窄屏没有位置放独立分享键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
-        {onShare && (
-          <div className="sm:hidden">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <IconButton data-product-control aria-label="更多操作" title="更多操作" shape="square">
-                  <MoreHorizontal size={18} />
-                </IconButton>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem data-product-control onSelect={onShare}>
-                  <Share2 size={16} className="shrink-0 text-muted" />
-                  <span className="flex-1">分享</span>
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        )}
-        {onOpenInbox && (
-          <div className="relative">
-            <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
-              <Bell size={18} />
-            </IconButton>
-            <HeaderCountBadge count={unreadCount} tone="danger" />
-          </div>
-        )}
-        {credits != null && (
-          <button
-            type="button"
-            data-product-feature={PRODUCT_CAPABILITIES.billing.id}
-            onClick={onOpenBilling}
-            disabled={!onOpenBilling}
-            aria-label="账户与计费"
-            className={`flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
-              low
-                ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
-                : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg"
-            } disabled:cursor-default`}
-          >
-            <Wallet size={13} className="shrink-0" />
-            {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。 */}
-            <span className="hidden sm:inline">{formatCredits(credits)}</span>
-          </button>
-        )}
-        {onToggleQuickAsk && (
-          <IconButton
-            data-product-control="quick-ask"
-            data-testid="quick-ask-toggle"
-            onClick={onToggleQuickAsk}
-            aria-label="快问小窗"
-            aria-pressed={quickAskOpen}
-            title={`${quickAskOpen ? "收起" : "打开"}快问小窗：并行问答不打断主线 (${altKeyLabel()}K)`}
-            shape="square"
-            className={quickAskOpen ? "bg-hover text-fg" : undefined}
-          >
-            {quickAskSending && !quickAskOpen ? (
-              <Loader2 size={18} className="animate-spin text-accent" />
-            ) : (
-              <MessageCircleQuestion size={18} />
+      <div className="ml-auto flex shrink-0 items-center gap-0.5 sm:gap-1">
+        {hasSecondaryActions && (
+          <div className="flex items-center gap-0 sm:gap-0.5" data-testid="header-secondary-actions">
+            {onOpenFind && (
+              <IconButton
+                data-product-control
+                onClick={onOpenFind}
+                aria-label="会话内查找"
+                title={`会话内查找 (${modKeyLabel()}F)`}
+                shape="square"
+                className="text-faint hover:text-fg"
+              >
+                <Search size={17} />
+              </IconButton>
             )}
-          </IconButton>
+            {onShare && (
+              <IconButton
+                data-product-control
+                onClick={onShare}
+                aria-label="分享会话"
+                title="分享会话"
+                shape="square"
+                className="hidden text-faint hover:text-fg sm:flex"
+              >
+                <Share2 size={17} />
+              </IconButton>
+            )}
+            {/* 窄屏没有位置放独立分享键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
+            {onShare && (
+              <div className="sm:hidden">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <IconButton
+                      data-product-control
+                      aria-label="更多操作"
+                      title="更多操作"
+                      shape="square"
+                      className="text-faint hover:text-fg"
+                    >
+                      <MoreHorizontal size={18} />
+                    </IconButton>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem data-product-control onSelect={onShare}>
+                      <Share2 size={16} className="shrink-0 text-muted" />
+                      <span className="flex-1">分享</span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            )}
+            {onOpenInbox && (
+              <div className="relative">
+                <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
+                  <Bell size={18} />
+                </IconButton>
+                <HeaderCountBadge count={unreadCount} tone="danger" />
+              </div>
+            )}
+            {credits != null && (
+              <button
+                type="button"
+                data-product-feature={PRODUCT_CAPABILITIES.billing.id}
+                onClick={onOpenBilling}
+                disabled={!onOpenBilling}
+                aria-label="账户与计费"
+                className={`flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
+                  low
+                    ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
+                    : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg"
+                } disabled:cursor-default`}
+              >
+                <Wallet size={13} className="shrink-0" />
+                {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。 */}
+                <span className="hidden sm:inline">{formatCredits(credits)}</span>
+              </button>
+            )}
+          </div>
         )}
-        {onTogglePane && (
-          <IconButton
-            data-product-control
-            data-testid="detail-pane-toggle"
-            onClick={onTogglePane}
-            aria-label="详情面板"
-            aria-pressed={paneOpen}
-            title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
-            shape="square"
-            className="hidden sm:flex"
-          >
-            {paneOpen ? <PanelRightClose size={18} /> : <PanelRight size={18} />}
-          </IconButton>
+        {hasSecondaryActions && hasWorkspaceToggles && (
+          <span aria-hidden className="mx-0.5 hidden h-4 w-px shrink-0 bg-border sm:block" />
+        )}
+        {hasWorkspaceToggles && (
+          <div className="flex items-center gap-0.5 sm:gap-1" data-testid="header-workspace-toggles">
+            {onToggleQuickAsk && (
+              <IconButton
+                data-product-control="quick-ask"
+                data-testid="quick-ask-toggle"
+                onClick={onToggleQuickAsk}
+                aria-label="快问小窗"
+                aria-pressed={quickAskOpen}
+                title={`${quickAskOpen ? "收起" : "打开"}快问小窗：并行问答不打断主线 (${altKeyLabel()}K)`}
+                shape="square"
+                className={quickAskOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg"}
+              >
+                {quickAskSending && !quickAskOpen ? (
+                  <Loader2 size={18} className="animate-spin text-accent" />
+                ) : (
+                  <MessageCircleQuestion size={18} />
+                )}
+              </IconButton>
+            )}
+            {onTogglePane && (
+              <IconButton
+                data-product-control
+                data-testid="detail-pane-toggle"
+                onClick={onTogglePane}
+                aria-label="详情面板"
+                aria-pressed={paneOpen}
+                title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
+                shape="square"
+                className={cn("hidden sm:flex", paneOpen ? "bg-accent-soft text-accent" : "text-muted hover:text-fg")}
+              >
+                {paneOpen ? <PanelRightClose size={18} /> : <PanelRight size={18} />}
+              </IconButton>
+            )}
+          </div>
         )}
       </div>
     </header>

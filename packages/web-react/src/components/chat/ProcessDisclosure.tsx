@@ -5,7 +5,7 @@ import { agentTerminalStatus, isErrorCardHeldWithAnswer } from "../../lib/chat/r
 import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
 import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
-import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
+import { detectShellFileWrites, normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli, humanStepTitle, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
 import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
@@ -14,14 +14,15 @@ import { ProcessStepContext } from "./processStep";
 import { StepMetaBadge, StepTimingContext } from "./stepDuration";
 import type { DisplayTokenUsage } from "./tokenUsage";
 import type { TurnActivityInfo } from "./TurnActivity";
-import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
+import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature, type StepTiming } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
 import { cn, groupDigits } from "../../lib/utils";
 import { toolChangedFileCount } from "./workPane";
 import { ProcessStages } from "./lazyProcessStages";
+import type { PhaseKind } from "./phaseTimeline";
 
-// 展开时间轴只从外壳拿这些符号。懒块若直接 import cards / meta / status,
+// 展开时间轴与阶段时间线懒块只从外壳拿这些符号。懒块若直接 import cards / meta / status,
 // rolldown 会把它们和 api+protocol 重新并进首屏 styles 块。
 export {
   FirstTextPaintCommitProbe,
@@ -31,13 +32,69 @@ export {
   StepMetaBadge,
   StepTimingContext,
   combineStepTimings,
+  detectOcCli,
+  detectShellFileWrites,
   formatStepDuration,
   humanStepTitle,
   normalizeToolForDisplay,
+  parseCodexTypeName,
   resolveToolMeta,
   resolveToolStatus,
+  stripShellWrapperForDisplay,
   timelineMessageKey,
+  toolChangedFileCount,
+  type PhaseKind,
+  type StepTiming,
+  type ToolInput,
 };
+
+type PhaseSummaryModule = typeof import("./PhaseTimelineSummary");
+let loadedPhaseSummary: PhaseSummaryModule | null = null;
+let pendingPhaseSummary: Promise<PhaseSummaryModule> | null = null;
+
+/** 按需预取阶段时间线懒块（不进首屏 modulepreload 闭包，测试可用 loadBeforeAll 同步就绪）。 */
+export function preloadPhaseTimelineSummary(): Promise<PhaseSummaryModule> {
+  if (loadedPhaseSummary) return Promise.resolve(loadedPhaseSummary);
+  if (!pendingPhaseSummary) {
+    pendingPhaseSummary = import("./PhaseTimelineSummary").then(
+      (module) => {
+        loadedPhaseSummary = module;
+        return module;
+      },
+      (error: unknown) => {
+        pendingPhaseSummary = null;
+        throw error;
+      },
+    );
+  }
+  return pendingPhaseSummary;
+}
+
+function LazyPhaseTimelineStrip(props: {
+  messages: readonly ChatMessage[];
+  stepTimings: ReadonlyMap<string, StepTiming>;
+  active: boolean;
+  selectedPhase: PhaseKind | null;
+  onSelectPhase: (kind: PhaseKind) => void;
+}) {
+  const [Comp, setComp] = useState<PhaseSummaryModule["PhaseTimelineStripFromMessages"] | null>(
+    () => loadedPhaseSummary?.PhaseTimelineStripFromMessages ?? null,
+  );
+  useEffect(() => {
+    if (Comp) return;
+    let alive = true;
+    preloadPhaseTimelineSummary()
+      .then((module) => {
+        if (alive) setComp(() => module.PhaseTimelineStripFromMessages);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [Comp]);
+  if (!Comp) return null;
+  return <Comp {...props} />;
+}
 /**
  * View-only fold for the main chat. Message ids, tape bytes, and scroll
  * ownership stay where they were; this only decides which rows share a
@@ -1210,7 +1267,8 @@ export function ProcessDisclosure<T>({
   const lastSection = sections.at(-1);
   const lastItem = lastSection?.items.at(-1);
   const lastItemKey = lastItem === undefined ? "" : keyOf(lastItem);
-
+  const [phaseFilter, setPhaseFilter] = useState<PhaseKind | null>(null);
+  const maybeMultiStep = messages.length >= 2;
 
   return (
     <StepTimingContext.Provider value={stepTimings}>
@@ -1225,7 +1283,10 @@ export function ProcessDisclosure<T>({
         className={cn(shellToggleClass, "mx-0 w-auto min-w-0 flex-1")}
         aria-expanded={open}
         data-testid="process-toggle"
-        onClick={() => setOpen(!open)}
+        onClick={() => {
+          if (open) setPhaseFilter(null);
+          setOpen(!open);
+        }}
       >
         <ShellGlyph active={active} outcome={outcome} />
         <span className="flex min-w-0 flex-1 items-baseline gap-2">
@@ -1288,6 +1349,18 @@ export function ProcessDisclosure<T>({
         </button>
       ) : null}
       </div>
+      {!open && maybeMultiStep ? (
+        <LazyPhaseTimelineStrip
+          messages={messages}
+          stepTimings={stepTimings}
+          active={active}
+          selectedPhase={phaseFilter}
+          onSelectPhase={(kind) => {
+            setPhaseFilter(kind);
+            setOpen(true);
+          }}
+        />
+      ) : null}
       {/* 收起时不挂任何隐藏水合节点:>1 MiB 定位桩的正文只在展开(本层或阶段详情)后按原规则
           取——尾部直接取,其余进视口 600px 再取。此前收起态也会把首屏尾部的定位桩塞进 1px
           隐藏容器立即下载并整段渲染,看不见却付全部流量与解析成本。 */}
@@ -1316,6 +1389,8 @@ export function ProcessDisclosure<T>({
                 messagesOf={messagesOf}
                 onFirstTextPaint={onFirstTextPaint}
                 tokenUsageOf={tokenUsageOf}
+                phaseFilter={phaseFilter}
+                onPhaseFilterChange={setPhaseFilter}
               />
             ) : null}
           </div>

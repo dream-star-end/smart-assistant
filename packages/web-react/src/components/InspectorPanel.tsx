@@ -586,6 +586,7 @@ export function InspectorPanelContent({
   deferredLoader,
   onClose,
   onActiveChange,
+  onAnnotateToComposer,
   titleId,
 }: {
   messages: readonly ChatMessage[];
@@ -599,6 +600,8 @@ export function InspectorPanelContent({
   onClose: () => void;
   /** 当前在详情里查看的那一步 → 源卡片选中态(T-18)。 */
   onActiveChange?: (message: ToolLike | null) => void;
+  /** 可选：右侧交付物批注精修时，将结构化修改指令直接回填至左侧 Composer 输入框。 */
+  onAnnotateToComposer?: (draft: string) => void;
   titleId?: string;
 }) {
   // 浏览器卡点进来:那一步不在顶层轮里(团队子任务等)就退回步骤详情,不落到一个没有它的「浏览器」页。
@@ -887,6 +890,7 @@ export function InspectorPanelContent({
               setFollow(false);
             }}
             onOpenStep={openStep}
+            onAnnotateToComposer={onAnnotateToComposer}
           />
           </Suspense>
         ) : (

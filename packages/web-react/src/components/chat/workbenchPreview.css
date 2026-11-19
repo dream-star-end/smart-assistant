@@ -1,0 +1,387 @@
+/* 右侧统一 Workbench 交付物富预览样式（OCV5-811）。
+ * 仅使用 styles.css 已定义的设计 token（--*），确保明/暗双态高质感并通过 designTokens.test.ts。 */
+
+.wb-preview-shell {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  color: var(--fg);
+}
+
+/* ── 顶部统一交付物操作条 ────────────────────────────────────────────── */
+.wb-action-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--hover) 65%, var(--surface));
+}
+
+.wb-action-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  flex: 1 1 10rem;
+}
+
+.wb-action-path {
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-action-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+/* ── 批注回填抽屉 ───────────────────────────────────────────────────── */
+.wb-annotate-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface));
+}
+
+.wb-annotate-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.wb-anchor-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--text-caption);
+  font-weight: 500;
+  max-width: 100%;
+}
+
+.wb-annotate-input {
+  width: 100%;
+  min-height: 3.75rem;
+  resize: vertical;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-control);
+  background: var(--surface);
+  color: var(--fg);
+  padding: 0.5rem 0.625rem;
+  line-height: 1.45;
+  outline: none;
+  transition: border-color 140ms var(--ease-standard), box-shadow 140ms var(--ease-standard);
+}
+
+.wb-annotate-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 25%, transparent);
+}
+
+/* ── 表格预览器（CSV / TSV） ────────────────────────────────────────── */
+.wb-table-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.625rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.wb-table-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  padding: 0.5rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--hover) 45%, var(--surface));
+}
+
+.wb-stat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.1875rem 0.5rem;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: var(--text-caption);
+  color: var(--muted);
+}
+
+.wb-table-scroll {
+  overflow: auto;
+  max-height: 52vh;
+  background: var(--surface);
+}
+
+.wb-data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--text-meta);
+}
+
+.wb-data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--elevated);
+  border-bottom: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border);
+  padding: 0;
+  text-align: left;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+.wb-data-table thead th:last-child {
+  border-right: none;
+}
+
+.wb-th-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  width: 100%;
+  min-height: 2.25rem;
+  padding: 0.375rem 0.625rem;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.wb-th-btn:hover {
+  background: var(--hover);
+}
+
+.wb-th-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.wb-data-table tbody td {
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  padding: 0.4375rem 0.625rem;
+  color: var(--fg);
+  vertical-align: top;
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-data-table tbody td:last-child {
+  border-right: none;
+}
+
+.wb-data-table tbody tr:hover td {
+  background: var(--hover);
+}
+
+.wb-row-gutter {
+  width: 3rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+  background: color-mix(in srgb, var(--hover) 45%, var(--surface));
+}
+
+.wb-row-action-cell {
+  width: 2.5rem;
+  text-align: center;
+  padding: 0.25rem 0.375rem;
+}
+
+/* ── 幻灯片逐页预览器（16:9 画布 + 缩略条） ─────────────────────────── */
+.wb-slides-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.875rem;
+  background: color-mix(in srgb, var(--bg) 70%, var(--surface));
+}
+
+.wb-slide-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--elevated);
+  box-shadow: var(--shadow-soft);
+  overflow: auto;
+  padding: 1.5rem 1.75rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.wb-slide-page-badge {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0.625rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: var(--radius-full);
+  background: var(--hover);
+  color: var(--faint);
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.wb-slide-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.wb-slide-strip {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding: 0.125rem 0.125rem 0.375rem;
+}
+
+.wb-slide-thumb {
+  flex: 0 0 auto;
+  min-width: 7.5rem;
+  max-width: 10.5rem;
+  min-height: 2.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.125rem;
+  padding: 0.4375rem 0.625rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 140ms var(--ease-standard), background-color 140ms var(--ease-standard);
+}
+
+.wb-slide-thumb:hover {
+  border-color: var(--border-strong);
+  background: var(--hover);
+}
+
+.wb-slide-thumb[aria-current="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+.wb-slide-thumb:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.wb-slide-notes {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 0.625rem 0.75rem;
+  font-size: var(--text-meta);
+  color: var(--muted);
+}
+
+/* ── 长文档阅读器（大纲目录 + 统计栏） ──────────────────────────────── */
+.wb-doc-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.875rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.wb-doc-outline {
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--hover) 45%, var(--surface));
+  padding: 0.5rem 0.875rem;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+.wb-outline-item {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  border-radius: var(--radius-xs);
+  padding: 0.25rem 0.375rem;
+}
+
+.wb-outline-item:hover {
+  background: var(--hover);
+}
+
+/* ── 二进制 Office 交付物优雅呈现卡（PPTX / XLSX / DOCX） ───────────── */
+.wb-office-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.75rem;
+  padding: 1.75rem 1.25rem;
+  background: color-mix(in srgb, var(--bg) 55%, var(--surface));
+}
+
+.wb-office-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--accent);
+  box-shadow: var(--shadow-soft);
+}
+
+.wb-office-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+/* ── PDF 预览容器 ───────────────────────────────────────────────────── */
+.wb-pdf-frame {
+  display: block;
+  width: 100%;
+  height: min(62vh, 580px);
+  border: 0;
+  background: var(--bg);
+}
+
+@media (hover: none) {
+  .wb-th-btn {
+    min-height: 2.75rem;
+  }
+}

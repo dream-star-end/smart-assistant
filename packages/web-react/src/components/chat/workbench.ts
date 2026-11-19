@@ -16,8 +16,28 @@ import { parseWebSearchSources } from "../tool/webSearchHits";
 import { resolveToolStatus } from "../tool/status";
 import { type FileChange, collectFileChanges } from "./workPane";
 import type { WorkTurn } from "./workTurns";
+import {
+  DELIVERABLE_CATEGORY_LABEL,
+  DELIVERABLE_CATEGORY_ORDER,
+  type CategoryCount,
+  type DeliverableCategory,
+  type DeliverableFormat,
+  type DeliverableMeta,
+  classifyDeliverable,
+  summarizeDeliverableCategories,
+} from "./deliverablePreview";
 
 export { type WorkTurn, collectWorkTurns, turnIndexOf } from "./workTurns";
+export {
+  DELIVERABLE_CATEGORY_LABEL,
+  DELIVERABLE_CATEGORY_ORDER,
+  classifyDeliverable,
+  summarizeDeliverableCategories,
+  type CategoryCount,
+  type DeliverableCategory,
+  type DeliverableFormat,
+  type DeliverableMeta,
+};
 
 // ── 产出 ────────────────────────────────────────────────────────────────
 
@@ -378,4 +398,29 @@ export function formatDuration(ms: number): string {
   const m = Math.floor(s / 60);
   if (m < 60) return `${m} 分 ${s % 60} 秒`;
   return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+}
+
+export type OutputFileGroup = {
+  category: DeliverableCategory;
+  label: string;
+  files: OutputFile[];
+};
+
+/** 将本轮产出文件按交付物类型（幻灯片 / 表格 / 文档 / PDF / 网页 / 代码 / 文件）归组。 */
+export function groupOutputFiles(files: readonly OutputFile[]): OutputFileGroup[] {
+  const map = new Map<DeliverableCategory, OutputFile[]>();
+  for (const f of files) {
+    const cat = classifyDeliverable(f.path).category;
+    const list = map.get(cat);
+    if (list) list.push(f);
+    else map.set(cat, [f]);
+  }
+  const out: OutputFileGroup[] = [];
+  for (const category of DELIVERABLE_CATEGORY_ORDER) {
+    const list = map.get(category);
+    if (list && list.length > 0) {
+      out.push({ category, label: DELIVERABLE_CATEGORY_LABEL[category], files: list });
+    }
+  }
+  return out;
 }

@@ -85,6 +85,10 @@ import {
 
 /** 多选批量条只在进入多选后出现，懒加载，不进首屏（UI-1 用它抵掉本片首屏增量）。 */
 const BatchBar = lazy(() => import("./sidebar/BatchBar").then((m) => ({ default: m.BatchBar })));
+/** 活态指挥条只在存在待拍板/运行中/未读完成会话时按需懒加载，不进首屏静态闭包。 */
+const SidebarLiveActivityStrip = lazy(() =>
+  import("./sidebar/LiveActivityStrip").then((m) => ({ default: m.SidebarLiveActivityStrip })),
+);
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
@@ -225,6 +229,10 @@ export type SidebarProps = {
   virtualizeThreshold?: number;
   /** Ctrl/⌘K palette (projects, chats, files, actions). Omit to hide the hint button. */
   onOpenPalette?: () => void;
+  /** 可选：多代理/蜂群协作运行中的会话 id 集合（供顶部活态指挥区识别协作态）。 */
+  swarmSessionIds?: ReadonlySet<string>;
+  /** 可选：是否展示侧栏顶部活态指挥区；默认 true（无活态项时自动零占位折叠）。 */
+  showLiveActivityStrip?: boolean;
 };
 
 export function Sidebar({
@@ -298,6 +306,8 @@ export function Sidebar({
   searchProjectId,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
   onOpenPalette,
+  swarmSessionIds,
+  showLiveActivityStrip = true,
 }: SidebarProps) {
   const [q, setQ] = useState("");
   const [now, setNow] = useState(() => Date.now());
@@ -487,6 +497,27 @@ export function Sidebar({
       ),
     [orderedProjects, projectSessions, runningIds],
   );
+
+  const hasLiveCandidate = useMemo(() => {
+    void socketVersion;
+    if (!showLiveActivityStrip || searching || multiSelect) return false;
+    if (runningIds.size > 0 || (swarmSessionIds?.size ?? 0) > 0) return true;
+    for (const s of activeSessions) {
+      if (sessionNeedsYou?.(s.id)) return true;
+      if (unreadIds ? unreadIds.has(s.id) : Boolean(s.unread)) return true;
+    }
+    return false;
+  }, [
+    showLiveActivityStrip,
+    searching,
+    multiSelect,
+    runningIds,
+    swarmSessionIds,
+    activeSessions,
+    sessionNeedsYou,
+    unreadIds,
+    socketVersion,
+  ]);
 
   const flatItems = useMemo(
     () =>
@@ -1209,6 +1240,24 @@ export function Sidebar({
           </button>
         )}
       </div>
+
+      {hasLiveCandidate && (
+        <Suspense fallback={null}>
+          <SidebarLiveActivityStrip
+            sessions={activeSessions}
+            projects={orderedProjects}
+            isSending={isSending}
+            liveTerminal={liveTerminal}
+            sessionNeedsYou={sessionNeedsYou}
+            unreadIds={unreadIds}
+            swarmSessionIds={swarmSessionIds}
+            socketVersion={socketVersion}
+            activeId={activeId}
+            onSelect={rowActions.select}
+            onMarkRead={onMarkRead ? rowActions.markRead : undefined}
+          />
+        </Suspense>
+      )}
 
       {multiSelect && onBatch && (
         <Suspense fallback={null}>

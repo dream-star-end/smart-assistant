@@ -52,8 +52,11 @@ import {
   toolStillRunning,
   workKind,
   workSummary,
+  type PhaseKind,
   type ProcessSection,
 } from "./ProcessDisclosure";
+import { buildPhaseTimeline, classifyMessagePhase } from "./phaseTimeline";
+import { PhaseGroupHeader, PhaseTimelineFilterBar } from "./PhaseTimelineSummary";
 
 /** 一段步骤的摘要行:有事说事;只有思考 / 准备工作时直说。 */
 function groupSummary(messages: readonly ChatMessage[]): string {
@@ -268,6 +271,8 @@ export type ProcessStageListProps<T> = {
   messagesOf: (item: T) => ChatMessage[];
   onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
   tokenUsageOf?: (item: T) => DisplayTokenUsage | undefined;
+  phaseFilter?: PhaseKind | null;
+  onPhaseFilterChange?: (phase: PhaseKind | null) => void;
 };
 
 export function ProcessStageList<T>({
@@ -288,6 +293,8 @@ export function ProcessStageList<T>({
   messagesOf,
   onFirstTextPaint,
   tokenUsageOf,
+  phaseFilter = null,
+  onPhaseFilterChange,
 }: ProcessStageListProps<T>) {
   const narrativeBody = (section: ProcessSection<T>, isLive: boolean) => (
     <div className="space-y-1">
@@ -408,9 +415,38 @@ export function ProcessStageList<T>({
     );
   };
 
+  const allMessages = sections.flatMap((section) => section.messages);
+  const phaseTimeline = buildPhaseTimeline(allMessages, { stepTimings: stepTimings ?? undefined, active });
+  const activePhaseFilter =
+    phaseFilter !== null && phaseTimeline.phases.some((phase) => phase.kind === phaseFilter) ? phaseFilter : null;
+  const filteredPhaseSegment =
+    activePhaseFilter !== null ? phaseTimeline.phases.find((phase) => phase.kind === activePhaseFilter) : undefined;
+  const filteredItems =
+    activePhaseFilter !== null
+      ? sections.flatMap((section) => {
+          if (section.narrative || section.goal) return [];
+          return section.items.filter((item) =>
+            messagesOf(item).some((message) => classifyMessagePhase(message) === activePhaseFilter),
+          );
+        })
+      : null;
+
   return (
     <>
-            {sections.map((section, index) => {
+            {phaseTimeline.showFilterBar && onPhaseFilterChange ? (
+              <PhaseTimelineFilterBar
+                timeline={phaseTimeline}
+                selectedPhase={activePhaseFilter}
+                onSelectPhase={onPhaseFilterChange}
+              />
+            ) : null}
+            {filteredItems !== null ? (
+              <div className="space-y-0.5" data-testid="process-phase-filtered" data-phase-filter={activePhaseFilter}>
+                {filteredPhaseSegment ? <PhaseGroupHeader phase={filteredPhaseSegment} /> : null}
+                {filteredItems.map((item, idx) => stepRow(item, idx === filteredItems.length - 1))}
+              </div>
+            ) : (
+            sections.map((section, index) => {
               const isLastSection = index === sections.length - 1;
               if (section.card) {
                 // 过程里常显的整卡步骤:已回答的问答/审批(用户的选择是这轮的关键事实)、
@@ -523,7 +559,8 @@ export function ProcessStageList<T>({
                   ) : null}
                 </div>
               );
-            })}
+            })
+            )}
             {waiting && live ? (
               // 可见进展之后在等模型(叙述写完或工具都已返回):在最新进展处挂一行活的「等待模型响应」+ 等待时长,
               // 不把已经完成的工具标为仍在执行。下一步一冒出来这行就消失,流光随之落到那一段的摘要行上。

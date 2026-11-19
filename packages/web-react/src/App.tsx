@@ -2725,6 +2725,7 @@ export function App() {
             widthMax={DETAIL_PANE_WIDTH.max}
             onResizeStart={paneWidth.onResizeStart}
             onResizeKeyDown={paneWidth.onResizeKeyDown}
+            onAnnotateToComposer={(text) => setComposerPrefill({ text, nonce: Date.now() })}
           />
         </LazyBoundary>
       )}
@@ -2756,6 +2757,7 @@ export function App() {
                 deferredLoader={paneDeferredLoader}
                 onClose={() => setPaneSheetOpen(false)}
                 onActiveChange={setPaneActive}
+                onAnnotateToComposer={(text) => { setComposerPrefill({ text, nonce: Date.now() }); setPaneSheetOpen(false); }}
               />
             </LazyBoundary>
           </div>
@@ -2812,7 +2814,7 @@ export function App() {
         openManage={openManage}
         openMarketplace={openMarketplace}
         openRepo={openRepo}
-        openSites={demo ? undefined : () => openSites(null)}
+        openSites={demo ? undefined : (slug) => openSites(slug ?? null)}
         openTutorial={openTutorial}
         orgOpen={orgOpen}
         orgSection={orgSection}
@@ -2890,6 +2892,9 @@ export function App() {
         updateProject={updateProject}
         user={user}
         wsMessages={wsMessages}
+        selectModel={selectModel} liveTerminal={liveTerminal} sessionNeedsYou={sessionNeedsYou}
+        unreadIds={unreadSessions.unreadIds} onMarkRead={unreadSessions.markRead}
+        onOpenQuickAsk={gated ? undefined : () => setQuickAsk((s) => ({ ...s, open: true, mounted: true }))}
       />{tutorialOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <TutorialCenter

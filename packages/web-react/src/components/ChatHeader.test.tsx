@@ -312,3 +312,35 @@ describe("ChatHeader 未分类会话的项目建议", () => {
     expect(screen.getByTestId("chat-project-breadcrumb")).toHaveTextContent("别的项目");
   });
 });
+
+describe("ChatHeader 视觉层次与运行态焦点（OCV5-811）", () => {
+  it("展示可选会话标题与运行态徽章，同时显式保留强模型选择器", () => {
+    renderHeader({
+      sessionTitle: "性能回归排查",
+      running: true,
+      onOpenFind: vi.fn(),
+      onToggleQuickAsk: vi.fn(),
+      onTogglePane: vi.fn(),
+      paneOpen: true,
+    });
+    expect(screen.getByTestId("chat-session-title")).toHaveTextContent("性能回归排查");
+    const runningBadge = screen.getByTestId("header-running-badge");
+    expect(runningBadge).toHaveTextContent("运行中");
+    expect(screen.getByTestId("chat-model-row")).toContainElement(runningBadge);
+    expect(screen.getByTestId("chat-model-row")).toContainElement(
+      screen.getByRole("button", { name: "选择对话模型" }),
+    );
+    expect(screen.getByTestId("header-secondary-actions")).toContainElement(
+      screen.getByRole("button", { name: "会话内查找" }),
+    );
+    expect(screen.getByTestId("header-workspace-toggles")).toContainElement(
+      screen.getByTestId("detail-pane-toggle"),
+    );
+  });
+
+  it("默认标题「新对话」与 running=false 时不额外渲染噪声徽章", () => {
+    renderHeader({ sessionTitle: "新对话", running: false });
+    expect(screen.queryByTestId("chat-session-title")).toBeNull();
+    expect(screen.queryByTestId("header-running-badge")).toBeNull();
+  });
+});

@@ -17,6 +17,7 @@ import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import type { Agent } from "../lib/agents";
 import type { PrefsView } from "../lib/modelPreferences";
 import type { AuthSession, ChatProject, DeletedChatProject, ProjectAsset, PublicModel, RepoSelection, Session, SessionSearchHit, User } from "../lib/types";
+import type { SessionNeedsYouKind } from "../lib/sessionStatus";
 import type { UseChatSocket } from "../hooks/useChatSocket";
 import type { CollabMode, CollabUiState } from "../lib/collaborationConfig";
 import type { CreateProjectInput } from "../hooks/useChatProjects";
@@ -150,7 +151,7 @@ export type AppDialogsProps = {
   openManage: (tab: ManageTab) => void;
   openMarketplace: (tab: MarketplaceTab, kind?: MarketplaceKind) => void;
   openRepo: () => void;
-  openSites?: () => void;
+  openSites?: (slug?: string | null) => void;
   openTutorial: (id?: "preferences" | "connectors" | "chat-basics" | "inbox" | "taskboard" | "session-goal" | "sessions-history" | "models-reasoning" | "files-media" | "voice-input" | "web-research" | "artifacts-download" | "container-web-preview" | "image-create-edit" | "github-repository" | "agents" | "team-mode" | "advisor-mode" | "memory-auto-dream" | "schedules-reminders" | "skills-training" | "marketplace-discovery" | "marketplace-publishing" | "billing-usage" | "organization" | "feedback-support" | undefined) => void;
   orgOpen: boolean;
   orgSection: OrgSection;
@@ -228,6 +229,12 @@ export type AppDialogsProps = {
   updateProject: (id: string, patch: { name?: string | undefined; color?: string | null | undefined; instructions?: string | null | undefined; }) => Promise<void>;
   user: User | null;
   wsMessages: ChatMessage[];
+  selectModel?: (modelId: string) => void;
+  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  sessionNeedsYou?: (id: string) => SessionNeedsYouKind | null | undefined;
+  unreadIds?: ReadonlySet<string>;
+  onMarkRead?: (id: string) => void;
+  onOpenQuickAsk?: () => void;
 };
 
 export function AppDialogs({
@@ -358,6 +365,12 @@ export function AppDialogs({
   updateProject,
   user,
   wsMessages,
+  selectModel,
+  liveTerminal,
+  sessionNeedsYou,
+  unreadIds,
+  onMarkRead,
+  onOpenQuickAsk,
 }: AppDialogsProps) {
   const mediaAuthEpoch = auth?.snapshot().epoch;
   return (
@@ -533,7 +546,18 @@ export function AppDialogs({
             onCreateProject={(name) => setCreateProjectFrom(name ? { title: name } : {})}
             onMoveSession={(sess, projectId) => void moveSessionToProject(sess, projectId)}
             onOpenBoard={demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true)}
-            onOpenSites={demo || !openSites ? undefined : () => openSites()}
+            onOpenSites={demo || !openSites ? undefined : () => openSites(null)}
+            isSending={(id) => !demo && chat.isSending(id)}
+            liveTerminal={liveTerminal}
+            sessionNeedsYou={sessionNeedsYou}
+            unreadIds={unreadIds}
+            onMarkRead={onMarkRead}
+            onOpenSite={demo || !openSites ? undefined : (slug) => openSites(slug)}
+            models={models}
+            activeModelId={modelId}
+            onSelectModel={selectModel}
+            onOpenManage={demo ? undefined : (tab) => openManage(tab)}
+            onOpenQuickAsk={onOpenQuickAsk}
           />
         </LazyBoundary>
       )}
