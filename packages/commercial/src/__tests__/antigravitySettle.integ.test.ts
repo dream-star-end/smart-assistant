@@ -22,7 +22,7 @@ import {
  *   'npx tsx --test --test-force-exit packages/commercial/src/__tests__/antigravitySettle.integ.test.ts'
  */
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 const selfhost = existsSync(new URL('../db/migrations/0341_selfhost_sync_compat.sql', import.meta.url))
 assert.notEqual(selfhost, existsSync(new URL('../db/migrations/0340_commercial_sync_compat.sql', import.meta.url)))
 import { describe, test } from 'node:test'
@@ -185,6 +185,12 @@ describe('0307 antigravity engine schema', () => {
               enabled: false,
               visibility: 'admin',
             },
+            {
+              model_id: 'antigravity-gemini-4-neon',
+              state: 'staged',
+              enabled: false,
+              visibility: 'admin',
+            },
           ]),
       {
         model_id: 'antigravity-gpt-oss-120b',
@@ -198,16 +204,12 @@ describe('0307 antigravity engine schema', () => {
         enabled: false,
         visibility: 'admin',
       },
-      ...(selfhost
-        ? [
-            {
-              model_id: 'antigravity-orchestrator-neon',
-              state: 'staged',
-              enabled: false,
-              visibility: 'admin',
-            },
-          ]
-        : []),
+      {
+        model_id: 'antigravity-orchestrator-neon',
+        state: 'staged',
+        enabled: false,
+        visibility: 'admin',
+      },
     ])
     // An automatic path can never leave an account disabled without admin provenance.
     await assert.rejects(
@@ -675,21 +677,19 @@ describe('Gemini 4 Neon & Orchestrator Neon staged pricing (OCV5-803)', () => {
       FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-gemini-4-neon'`)
     assert.deepEqual(
       r.rows,
-      selfhost
-        ? [{
-            state: 'staged',
-            upstream_model_id: 'gemini-4-neon-high',
-            context_window: 1048576,
-            enabled: false,
-            visibility: 'admin',
-            default_effort: 'high',
-            input: '600',
-            output: '3000',
-            cached: '15',
-            cache_write: '0',
-            multiplier: '1.000',
-          }]
-        : [],
+      [{
+        state: 'staged',
+        upstream_model_id: 'gemini-4-neon-high',
+        context_window: 1048576,
+        enabled: false,
+        visibility: 'admin',
+        default_effort: 'high',
+        input: '600',
+        output: '3000',
+        cached: '15',
+        cache_write: '0',
+        multiplier: '1.000',
+      }],
     )
   })
 
@@ -701,22 +701,114 @@ describe('Gemini 4 Neon & Orchestrator Neon staged pricing (OCV5-803)', () => {
       FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-orchestrator-neon'`)
     assert.deepEqual(
       r.rows,
-      selfhost
-        ? [{
-            state: 'staged',
-            upstream_model_id: 'gemini-pro-orchestrator-neon',
-            context_window: 1048576,
-            enabled: false,
-            visibility: 'admin',
-            default_effort: null,
-            input: '600',
-            output: '3000',
-            cached: '15',
-            cache_write: '0',
-            multiplier: '1.000',
-          }]
-        : [],
+      [{
+        state: 'staged',
+        upstream_model_id: 'gemini-pro-orchestrator-neon',
+        context_window: 1048576,
+        enabled: false,
+        visibility: 'admin',
+        default_effort: null,
+        input: '600',
+        output: '3000',
+        cached: '15',
+        cache_write: '0',
+        multiplier: '1.000',
+      }],
     )
+  })
+})
+
+describe('0344 commercial Neon migration replay & guard proofs (OCV5-807)', () => {
+  test('0344 replays idempotently, preserves active rows without INSERT trigger downgrade, and rejects drift/half-pair', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    if (selfhost) {
+      t.skip('commercial 0344 migration only runs on commercial schema')
+      return
+    }
+    const sql0344 = readFileSync(
+      new URL('../db/migrations/0344_commercial_antigravity_gemini_4_neon.sql', import.meta.url),
+      'utf8',
+    )
+    const migRow = await query<{ version: string }>(
+      `SELECT version FROM schema_migrations WHERE version = '0344_commercial_antigravity_gemini_4_neon'`,
+    )
+    assert.equal(migRow.rows.length, 1, '0344 must be registered in commercial schema_migrations')
+
+    const epochBefore = Number(
+      (await query<{ epoch: string }>('SELECT epoch::text FROM model_security_epoch WHERE id')).rows[0]!.epoch,
+    )
+    const client = await getPool().connect()
+    try {
+      await client.query('BEGIN')
+      // 1. Clean replay on staged/disabled/admin baseline: idempotent & epoch unchanged
+      await client.query(sql0344)
+      const epochAfterReplay = Number(
+        (await client.query<{ epoch: string }>('SELECT epoch::text FROM model_security_epoch WHERE id')).rows[0]!.epoch,
+      )
+      assert.equal(epochAfterReplay, epochBefore)
+
+      // 1b. Pre-seeded staged/disabled/public row must refuse 0344 fail-closed without mutating rows
+      await client.query('SAVEPOINT sp_staged_public')
+      await client.query(
+        `UPDATE model_pricing SET visibility = 'public' WHERE model_id = 'antigravity-gemini-4-neon'`,
+      )
+      await client.query('SAVEPOINT sp_staged_public_exec')
+      await assert.rejects(() => client.query(sql0344), /refuses drifted or inconsistent/)
+      await client.query('ROLLBACK TO SAVEPOINT sp_staged_public_exec')
+      const stagedPublicUnchanged = await client.query<{ state: string; enabled: boolean; visibility: string }>(
+        `SELECT c.state, p.enabled, p.visibility
+           FROM model_catalog c JOIN model_pricing p USING (model_id)
+          WHERE c.model_id = 'antigravity-gemini-4-neon'`,
+      )
+      assert.deepEqual(stagedPublicUnchanged.rows, [{ state: 'staged', enabled: false, visibility: 'public' }])
+      await client.query('ROLLBACK TO SAVEPOINT sp_staged_public')
+      const stagedAfterReject = await client.query<{ state: string; enabled: boolean; visibility: string }>(
+        `SELECT c.state, p.enabled, p.visibility
+           FROM model_catalog c JOIN model_pricing p USING (model_id)
+          WHERE c.model_id = 'antigravity-gemini-4-neon'`,
+      )
+      assert.deepEqual(stagedAfterReject.rows, [{ state: 'staged', enabled: false, visibility: 'admin' }])
+
+      // 2. Active/public row must stay active/enabled=true/public without BEFORE INSERT downgrade or epoch bump
+      await client.query(
+        `UPDATE model_catalog SET state = 'active' WHERE model_id = 'antigravity-gemini-4-neon'`,
+      )
+      await client.query(
+        `UPDATE model_pricing SET enabled = TRUE, visibility = 'public' WHERE model_id = 'antigravity-gemini-4-neon'`,
+      )
+      const epochActiveBefore = Number(
+        (await client.query<{ epoch: string }>('SELECT epoch::text FROM model_security_epoch WHERE id')).rows[0]!.epoch,
+      )
+      await client.query(sql0344)
+      const activeAfter = await client.query<{ state: string; enabled: boolean; visibility: string }>(
+        `SELECT c.state, p.enabled, p.visibility
+           FROM model_catalog c JOIN model_pricing p USING (model_id)
+          WHERE c.model_id = 'antigravity-gemini-4-neon'`,
+      )
+      assert.deepEqual(activeAfter.rows, [{ state: 'active', enabled: true, visibility: 'public' }])
+      const epochActiveAfter = Number(
+        (await client.query<{ epoch: string }>('SELECT epoch::text FROM model_security_epoch WHERE id')).rows[0]!.epoch,
+      )
+      assert.equal(epochActiveAfter, epochActiveBefore)
+
+      // 3. Drifted pricing refuses 0344 fail-closed
+      await client.query('SAVEPOINT sp_drift')
+      await client.query(
+        `UPDATE model_pricing SET input_per_mtok = 999 WHERE model_id = 'antigravity-gemini-4-neon'`,
+      )
+      await assert.rejects(() => client.query(sql0344), /refuses drifted or inconsistent/)
+      await client.query('ROLLBACK TO SAVEPOINT sp_drift')
+
+      // 4. Half-pair (pricing missing while catalog exists) refuses 0344 fail-closed
+      await client.query('SAVEPOINT sp_half')
+      await client.query(`SET LOCAL openclaude.catalog_sync = '1'`)
+      await client.query(`DELETE FROM model_pricing WHERE model_id = 'antigravity-orchestrator-neon'`)
+      await assert.rejects(() => client.query(sql0344), /refuses incomplete/)
+      await client.query('ROLLBACK TO SAVEPOINT sp_half')
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+    }
   })
 })
 

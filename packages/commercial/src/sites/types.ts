@@ -169,6 +169,10 @@ export function validateEnvVarKey(raw: string): string {
 // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional ASCII control-char path sanitization
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/
 const IGNORED_SEGMENT_NAMES = new Set(['.git', 'node_modules', '__pycache__', '.DS_Store', '.oc-site-state.json'])
+export const RESERVED_SERVER_API_ALIAS_PATHS: ReadonlySet<string> = new Set([
+  'server/api.mjs',
+  'api/index.mjs',
+])
 
 export function normalizeRelativeAssetPath(relPath: string): string {
   if (typeof relPath !== 'string' || relPath.length === 0 || relPath.length > 512) {
@@ -196,7 +200,19 @@ export function normalizeRelativeAssetPath(relPath: string): string {
       throw new SitesError('INVALID_BUNDLE', `安全拦截：禁止上传环境变量文件 ${relPath}`, 400)
     }
   }
-  return segments.join('/')
+  const normalized = segments.join('/')
+  const lower = normalized.toLowerCase()
+  if ((lower === '__oc_server' || lower.startsWith('__oc_server/')) && normalized !== SITE_SERVER_API_PATH) {
+    throw new SitesError('INVALID_BUNDLE', `保留服务端目录路径不合法: ${relPath}`, 400)
+  }
+  if (RESERVED_SERVER_API_ALIAS_PATHS.has(lower)) {
+    throw new SitesError(
+      'INVALID_BUNDLE',
+      `保留服务端入口路径禁止作为静态文件上传 (${relPath})；服务端代码请打包为 ${SITE_SERVER_API_PATH}`,
+      400,
+    )
+  }
+  return normalized
 }
 
 export interface SiteBundleManifestEntry {

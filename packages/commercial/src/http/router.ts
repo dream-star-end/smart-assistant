@@ -1744,6 +1744,16 @@ export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
   { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
 ]
 
+export function sanitizeCommercialLogPath(pathname: string): string {
+  if (/^\/api\/site-invites\/[^/]+\/accept\/?$/.test(pathname)) {
+    return '/api/site-invites/:token/accept'
+  }
+  if (pathname === '/api/site-invites' || pathname.startsWith('/api/site-invites/')) {
+    return '/api/site-invites/:token'
+  }
+  return pathname
+}
+
 export function createCommercialHandler(
   deps: CommercialHttpDeps,
   options: {
@@ -1758,6 +1768,7 @@ export function createCommercialHandler(
   return async function commercialHandler(req, res): Promise<boolean> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
     const path = url.pathname
+    const safeLogPath = sanitizeCommercialLogPath(path)
     const method = req.method ?? 'GET'
 
     // ── V3 Phase 4H+ maintenance 闸门 ────────────────────────────────────
@@ -1798,7 +1809,7 @@ export function createCommercialHandler(
         const requestId = ensureRequestId(req)
         res.setHeader(REQUEST_ID_HEADER, requestId)
         httpLogger
-          .child({ requestId, route: '__maintenance__', method, path })
+          .child({ requestId, route: '__maintenance__', method, path: safeLogPath })
           .warn('maintenance_block')
         sendError(res, 503, 'MAINTENANCE', '服务正在维护中,请稍后再试', requestId, undefined, {
           'Retry-After': 60,
@@ -1856,7 +1867,7 @@ export function createCommercialHandler(
         requestId,
         route: externalReadOnly.route,
         method,
-        path,
+        path: safeLogPath,
         clientIp: clientIpOf(req),
       })
       if (!externalReadOnly.handler) {
@@ -1892,7 +1903,7 @@ export function createCommercialHandler(
         requestId,
         route: '__cc_external__',
         method,
-        path,
+        path: safeLogPath,
         clientIp: clientIpOf(req),
       })
       if (!deps.externalApiKeyProxy) {
@@ -2062,7 +2073,7 @@ export function createCommercialHandler(
         route: '__file_proxy__',
         rule: proxyRule.label,
         method,
-        path,
+        path: safeLogPath,
         clientIp: clientIpOf(req),
       })
       const token = extractTokenFromReq(req)
@@ -2184,7 +2195,7 @@ export function createCommercialHandler(
         route: '__blocked_for_user__',
         rule: blockedRule.label,
         method,
-        path,
+        path: safeLogPath,
         clientIp: clientIpOf(req),
       })
       const token = extractTokenFromReq(req)
@@ -2205,7 +2216,7 @@ export function createCommercialHandler(
               type: 'route_bypass',
               actorUserId: admin.id,
               target: `${method} ${blockedRule.label}`,
-              detail: { path },
+              detail: { path: safeLogPath },
               ip: clientIpOf(req),
               userAgent: userAgentOf(req),
             })
@@ -2225,7 +2236,7 @@ export function createCommercialHandler(
           type: 'route_blocked',
           actorUserId: claims.sub,
           target: `${method} ${blockedRule.label}`,
-          detail: { path },
+          detail: { path: safeLogPath },
           ip: clientIpOf(req),
           userAgent: userAgentOf(req),
         })

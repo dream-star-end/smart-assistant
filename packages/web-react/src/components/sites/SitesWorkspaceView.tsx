@@ -135,6 +135,7 @@ export function SitesWorkspaceView({
     void loadSites();
   }, [loadSites, authIdentityKey]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-preview trigger on authIdentityKey change
   useEffect(() => {
     if (!inviteToken) {
       setInvitePreview(null);

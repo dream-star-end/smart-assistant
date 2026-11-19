@@ -199,6 +199,14 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
           }
           expectedBaseContentSha256 = meta.expectedBaseContentSha256
         }
+        if (
+          meta.forceOverwrite !== undefined &&
+          meta.forceOverwrite !== null &&
+          typeof meta.forceOverwrite !== 'boolean'
+        ) {
+          throw new SitesError('INVALID_INPUT', 'forceOverwrite 必须是布尔值', 400)
+        }
+        const forceOverwrite = meta.forceOverwrite === true
 
         const site = await deps.sites.publishSite(userId, {
           slug,
@@ -210,6 +218,7 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
           ...(expectedSiteId !== undefined ? { expectedSiteId } : {}),
           ...(expectedBaseRevision !== undefined ? { expectedBaseRevision } : {}),
           ...(expectedBaseContentSha256 !== undefined ? { expectedBaseContentSha256 } : {}),
+          ...(forceOverwrite ? { forceOverwrite: true } : {}),
           gzippedBundle: body,
         })
         sendJson(res, 200, { site })

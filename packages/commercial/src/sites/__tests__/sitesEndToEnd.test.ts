@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { gzipSync } from 'node:zlib'
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -49,6 +50,10 @@ const JWT_SECRET = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba987654
 
 function createInMemorySitesRepo(repoOpts?: { idPrefix?: string; initialRev?: number }): SitesRepo & {
   expireLease(slug: string): void
+  simulateLegacyMasterPublish(
+    slug: string,
+    patch: { hasServerApi: boolean; contentSha256?: string },
+  ): UserSiteRow
 } {
   const bySlug = new Map<string, UserSiteRow>()
   const claims = new Map<string, { siteId: string; claimKind: 'active' | 'rename_target' }>()
@@ -94,6 +99,23 @@ function createInMemorySitesRepo(repoOpts?: { idPrefix?: string; initialRev?: nu
     expireLease(slug: string) {
       const row = bySlug.get(slug)
       if (row) leases.delete(row.id)
+    },
+    simulateLegacyMasterPublish(
+      slug: string,
+      patch: { hasServerApi: boolean; contentSha256?: string },
+    ): UserSiteRow {
+      const row = bySlug.get(slug)
+      if (!row) throw new Error(`missing site ${slug}`)
+      revCounter += 1
+      const updated: UserSiteRow = {
+        ...row,
+        edgeRevision: Math.max(row.edgeRevision + 1, revCounter),
+        hasServerApi: patch.hasServerApi,
+        contentSha256: patch.contentSha256 ?? row.contentSha256,
+        updatedAt: new Date(),
+      }
+      bySlug.set(slug, updated)
+      return updated
     },
     async listByUser(userId) {
       return [...bySlug.values()]
@@ -233,10 +255,19 @@ function createInMemorySitesRepo(repoOpts?: { idPrefix?: string; initialRev?: nu
         if (input.expectedSiteId && existing.id !== input.expectedSiteId) {
           throw new SitesError('STALE_REVISION', '子域名已指向其他站点，拒绝覆盖', 409)
         }
-        if (accessRole === 'editor' && (input.hasServerApi || existing.hasServerApi)) {
+        if (accessRole !== 'owner' && input.forceOverwrite) {
+          throw new SitesError('FORBIDDEN', '仅站点所有者可执行强制覆盖发布', 403)
+        }
+        if (
+          accessRole === 'editor' &&
+          (input.hasServerApi || existing.hasServerApi || Boolean(existing.serverApiSha256))
+        ) {
           const approvedSha = existing.serverApiSha256 ?? ''
           const incomingSha = input.hasServerApi ? (input.serverApiSha256 ?? '') : ''
-          if (!existing.hasServerApi || !approvedSha || incomingSha !== approvedSha) {
+          const matchesApproved = existing.hasServerApi
+            ? input.hasServerApi && Boolean(approvedSha) && incomingSha === approvedSha
+            : !input.hasServerApi && approvedSha === '' && incomingSha === ''
+          if (!matchesApproved) {
             throw new SitesError(
               'FORBIDDEN',
               '仅站点所有者可新增、修改或移除服务端 /api/* 代码',
@@ -245,8 +276,12 @@ function createInMemorySitesRepo(repoOpts?: { idPrefix?: string; initialRev?: nu
           }
         }
         if (existing.edgeRevision > 0) {
+          const hasCollaborators = (collabStore.get(existing.id)?.size ?? 0) > 0
+          const requiresBaseline =
+            accessRole === 'editor' ||
+            (accessRole === 'owner' && hasCollaborators && !input.forceOverwrite)
           if (
-            accessRole === 'editor' &&
+            requiresBaseline &&
             input.expectedBaseRevision === undefined &&
             !input.expectedBaseContentSha256
           ) {
@@ -3044,7 +3079,7 @@ export default async function handler(req, ctx) {
       const origApiMjs = readFileSync(join(pullDir, 'server', 'api.mjs'), 'utf8')
       writeFileSync(
         join(pullDir, 'server', 'api.mjs'),
-        `export default async function handler(ctx) { return ctx.json({ leaked: ctx.env.OWNER_SECRET }) }\n`,
+        'export default async function handler(ctx) { return ctx.json({ leaked: ctx.env.OWNER_SECRET }) }\n',
       )
       const pubExfil = await runCli(tok2, ['publish', pullDir, '--slug', 'team-portal'])
       assert.equal(pubExfil.code, 1)
@@ -3627,5 +3662,352 @@ export default async function handler(req, ctx) {
     )
     await svcA.deleteSite(1, 'shared-rename-dst2')
     await svcB.deleteSite(2, 'shared-lost-delete')
+  })
+
+  test('audit B3/B4/B6 hardening: handler alias isolation, owner stale-baseline protection, and legacy-writer rollback guard', async () => {
+    const workDir = mkdtempSync(join(tmpdir(), 'oc-sites-audit-hardening-'))
+    const edgeDataDir = join(workDir, 'edge-data')
+    const edgeSrv = createSitesEdgeServer({
+      bind: '127.0.0.1',
+      port: 0,
+      dataRoot: edgeDataDir,
+      baseDomain: 'congjianai.com',
+      secret: EDGE_SECRET,
+      maxSiteBytes: 2 * 1024 * 1024,
+    })
+    const { port: edgePort } = await edgeSrv.listen()
+    const edgeClient = createHttpSitesEdgeClient({
+      baseUrl: `http://127.0.0.1:${edgePort}`,
+      secret: EDGE_SECRET,
+    })
+    const repo = createInMemorySitesRepo()
+    const svc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 10,
+      maxSiteBytes: 2 * 1024 * 1024,
+      edgeSecret: EDGE_SECRET,
+      repo,
+      edge: edgeClient,
+      resolveTxt: async () => [],
+    })
+
+    const sec1 = 'd1'.repeat(32)
+    const sec2 = 'e2'.repeat(32)
+    const tok1 = `oc-v3.401.${sec1}`
+    const tok2 = `oc-v3.402.${sec2}`
+    const h1 = hashSecret(sec1)
+    const h2 = hashSecret(sec2)
+    const idRepo: ContainerIdentityRepo = {
+      async findActiveByHostAndBoundIp(hostUuid: string, boundIp: string) {
+        if (boundIp === '10.0.1.1') {
+          return { id: 401, user_id: 1, host_uuid: hostUuid, bound_ip: boundIp, secret_hash: h1 }
+        }
+        if (boundIp === '10.0.1.2') {
+          return { id: 402, user_id: 2, host_uuid: hostUuid, bound_ip: boundIp, secret_hash: h2 }
+        }
+        return null
+      },
+    }
+    const internalHandler = makeSitesInternalHandler({ identityRepo: idRepo, sites: svc })
+    const masterSrv = createServer((req: IncomingMessage, res: ServerResponse) => {
+      void (async () => {
+        const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+        if (pathname.startsWith('/internal/v3/sites/')) {
+          const auth = req.headers.authorization ?? ''
+          const boundIp = auth.includes(tok1) ? '10.0.1.1' : '10.0.1.2'
+          await internalHandler(req, res, { hostUuid: 'h-audit', boundIp })
+          return
+        }
+        res.statusCode = 404
+        res.end('not found')
+      })().catch((err: unknown) => {
+        const e = err as { status?: number; code?: string; message?: string }
+        res.statusCode = e.status ?? 500
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ error: { code: e.code ?? 'INTERNAL', message: e.message ?? 'err' } }))
+      })
+    })
+    await new Promise<void>((r) => masterSrv.listen(0, '127.0.0.1', () => r()))
+    const mPort = (masterSrv.address() as { port: number }).port
+
+    const runCli = (token: string, args: string[]) =>
+      new Promise<{ code: number; stdout: string; stderr: string }>((resolvePromise) => {
+        const child = spawn('python3', [OC_SITE_PY, ...args], {
+          env: {
+            ...process.env,
+            OPENCLAUDE_V3_MASTER_BASE_URL: `http://127.0.0.1:${mPort}`,
+            OPENCLAUDE_V3_CONTAINER_TOKEN: token,
+          },
+        })
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => (stdout += String(d)))
+        child.stderr.on('data', (d) => (stderr += String(d)))
+        child.on('close', (code) => resolvePromise({ code: code ?? 1, stdout, stderr }))
+      })
+
+    try {
+      // B3: Raw static server/api.mjs and api/index.mjs are rejected at encoder & decoder boundaries
+      assert.throws(
+        () =>
+          encodeSiteBundle([
+            { path: 'index.html', content: Buffer.from('<h1>Hi</h1>') },
+            { path: 'server/api.mjs', content: Buffer.from('export default () => ({ ok: 1 })') },
+          ]),
+        (e: unknown) => e instanceof SitesError && e.code === 'INVALID_BUNDLE',
+      )
+      const spoofRawBody = Buffer.concat([
+        Buffer.from('OCSB1\n', 'ascii'),
+        (() => {
+          const fakeCode = Buffer.from('export default () => ({ ok: 1 })')
+          const html = Buffer.from('<h1>Hi</h1>')
+          const manifest = Buffer.from(
+            JSON.stringify([
+              {
+                path: 'api/index.mjs',
+                size: fakeCode.length,
+                sha256: createHash('sha256').update(fakeCode).digest('hex'),
+              },
+              {
+                path: 'index.html',
+                size: html.length,
+                sha256: createHash('sha256').update(html).digest('hex'),
+              },
+            ]),
+          )
+          const len = Buffer.allocUnsafe(4)
+          len.writeUInt32BE(manifest.length, 0)
+          return Buffer.concat([len, manifest, fakeCode, html])
+        })(),
+      ])
+      const gzippedSpoof = gzipSync(spoofRawBody)
+      assert.throws(
+        () => decodeSiteBundle(gzippedSpoof),
+        (e: unknown) => e instanceof SitesError && e.code === 'INVALID_BUNDLE',
+      )
+
+      // B3 CLI: conflicting multiple handler aliases fail closed instead of silently picking one
+      const conflictDir = join(workDir, 'conflict-handlers')
+      mkdirSync(join(conflictDir, 'server'), { recursive: true })
+      mkdirSync(join(conflictDir, 'api'), { recursive: true })
+      writeFileSync(join(conflictDir, 'index.html'), '<h1>Conflict</h1>')
+      writeFileSync(join(conflictDir, 'server', 'api.mjs'), 'export default () => ({ s: 1 })')
+      writeFileSync(join(conflictDir, 'api', 'index.mjs'), 'export default () => ({ s: 2 })')
+      const pubConflict = await runCli(tok1, ['publish', conflictDir, '--slug', 'conflict-api-site'])
+      assert.equal(pubConflict.code, 1)
+      assert.match(pubConflict.stderr, /conflicting server api handler sources/)
+
+      // B3 R2: case-approximate single-source file (e.g. Server/api.mjs in a legacy static dir) must fail closed and NEVER elevate into a backend handler
+      const legacyStaticDir = join(workDir, 'legacy-static')
+      mkdirSync(legacyStaticDir, { recursive: true })
+      writeFileSync(join(legacyStaticDir, 'index.html'), '<h1>LEGACY_STATIC_V1</h1>')
+      const pubLegacyV1 = await runCli(tok1, [
+        'publish',
+        legacyStaticDir,
+        '--slug',
+        'legacy-static-site',
+        '--no-spa',
+      ])
+      assert.equal(pubLegacyV1.code, 0, pubLegacyV1.stderr)
+      assert.equal(JSON.parse(pubLegacyV1.stdout).site.hasServerApi, false)
+      mkdirSync(join(legacyStaticDir, 'Server'), { recursive: true })
+      writeFileSync(
+        join(legacyStaticDir, 'Server', 'api.mjs'),
+        'export default async function(ctx) { return ctx.json({ leaked: true }) }',
+      )
+      const pubLegacyCaseApprox = await runCli(tok1, ['publish', legacyStaticDir, '--slug', 'legacy-static-site', '--no-spa'])
+      assert.equal(pubLegacyCaseApprox.code, 1)
+      assert.match(pubLegacyCaseApprox.stderr, /casing is ambiguous/)
+      const legacyLiveRoot = await edgeHttpRequest({
+        port: edgePort,
+        path: '/',
+        host: 'legacy-static-site.congjianai.com',
+      })
+      assert.equal(legacyLiveRoot.status, 200)
+      assert.match(legacyLiveRoot.text, /LEGACY_STATIC_V1/)
+      const legacyLiveApi = await edgeHttpRequest({
+        port: edgePort,
+        path: '/api/ping',
+        host: 'legacy-static-site.congjianai.com',
+      })
+      assert.equal(legacyLiveApi.status, 404)
+      assert.equal(legacyLiveApi.text.includes('leaked'), false)
+      assert.equal((await svc.getSite(1, 'legacy-static-site')).hasServerApi, false)
+
+      // B4 + B3 roundtrip: owner first publish saves .oc-site-state.json; editor edits; owner stale directory is blocked!
+      const ownerOrigDir = join(workDir, 'owner-orig')
+      mkdirSync(join(ownerOrigDir, 'server'), { recursive: true })
+      writeFileSync(join(ownerOrigDir, 'index.html'), '<h1>OWNER_V1</h1>')
+      writeFileSync(
+        join(ownerOrigDir, 'server', 'api.mjs'),
+        'export default async function handler() { return { status: 200, body: { h: "OWNER_A" } } }\n',
+      )
+      const pubOwner1 = await runCli(tok1, ['publish', ownerOrigDir, '--slug', 'audit-collab-site'])
+      assert.equal(pubOwner1.code, 0, pubOwner1.stderr)
+      const stateAfterPub1 = JSON.parse(readFileSync(join(ownerOrigDir, '.oc-site-state.json'), 'utf8')) as {
+        slug: string
+        edgeRevision: number
+      }
+      assert.equal(stateAfterPub1.slug, 'audit-collab-site')
+      assert.ok(stateAfterPub1.edgeRevision >= 1)
+
+      await svc.addCollaboratorByEmail(1, 'audit-collab-site', { email: 'editor@example.com', role: 'editor' })
+      const editorDir = join(workDir, 'editor-work')
+      const pullEd = await runCli(tok2, ['pull', 'audit-collab-site', editorDir])
+      assert.equal(pullEd.code, 0, pullEd.stderr)
+      writeFileSync(join(editorDir, 'index.html'), '<h1>EDITOR_LIVE_B</h1>')
+      const pubEd = await runCli(tok2, ['publish', editorDir, '--slug', 'audit-collab-site'])
+      assert.equal(pubEd.code, 0, pubEd.stderr)
+
+      // Owner publishing again from stale original dir fails 409 STALE_REVISION -> editor content B preserved!
+      writeFileSync(join(ownerOrigDir, 'index.html'), '<h1>OWNER_STALE_OVERWRITE</h1>')
+      const pubOwnerStale = await runCli(tok1, ['publish', ownerOrigDir, '--slug', 'audit-collab-site'])
+      assert.equal(pubOwnerStale.code, 1)
+      assert.ok(pubOwnerStale.stderr.includes('STALE_REVISION'), pubOwnerStale.stderr)
+
+      // Owner removing .oc-site-state.json without --force STILL fails 409 on collaborated site
+      rmSync(join(ownerOrigDir, '.oc-site-state.json'))
+      const pubOwnerNoState = await runCli(tok1, ['publish', ownerOrigDir, '--slug', 'audit-collab-site'])
+      assert.equal(pubOwnerNoState.code, 1)
+      assert.ok(pubOwnerNoState.stderr.includes('STALE_REVISION'), pubOwnerNoState.stderr)
+
+      // Editor passing --force is rejected 403 FORBIDDEN; live site STILL shows EDITOR_LIVE_B!
+      const pubEdForce = await runCli(tok2, ['publish', editorDir, '--slug', 'audit-collab-site', '--force'])
+      assert.equal(pubEdForce.code, 1)
+      assert.ok(pubEdForce.stderr.includes('FORBIDDEN'), pubEdForce.stderr)
+
+      const liveBeforeForce = await edgeHttpRequest({
+        port: edgePort,
+        path: '/',
+        host: 'audit-collab-site.congjianai.com',
+      })
+      assert.equal(liveBeforeForce.status, 200)
+      assert.match(liveBeforeForce.text, /EDITOR_LIVE_B/)
+
+      // Owner pulls latest, updates only frontend, republishes -> handler remains OWNER_A with identical SHA
+      const ownerPulledDir = join(workDir, 'owner-pulled')
+      const pullOw = await runCli(tok1, ['pull', 'audit-collab-site', ownerPulledDir])
+      assert.equal(pullOw.code, 0, pullOw.stderr)
+      writeFileSync(join(ownerPulledDir, 'index.html'), '<h1>OWNER_MERGED_V3</h1>')
+      const pubOwMerged = await runCli(tok1, ['publish', ownerPulledDir, '--slug', 'audit-collab-site'])
+      assert.equal(pubOwMerged.code, 0, pubOwMerged.stderr)
+      const apiAfterOw = await edgeHttpRequest({
+        port: edgePort,
+        path: '/api/ping',
+        host: 'audit-collab-site.congjianai.com',
+      })
+      assert.equal(apiAfterOw.status, 200)
+      assert.deepEqual(JSON.parse(apiAfterOw.text), { h: 'OWNER_A' })
+
+      // Owner --force intentionally overwrites from un-baselined dir when explicitly requested
+      writeFileSync(join(ownerOrigDir, 'index.html'), '<h1>OWNER_FORCE_FINAL</h1>')
+      const pubOwForce = await runCli(tok1, ['publish', ownerOrigDir, '--slug', 'audit-collab-site', '--force'])
+      assert.equal(pubOwForce.code, 0, pubOwForce.stderr)
+      const liveAfterForce = await edgeHttpRequest({
+        port: edgePort,
+        path: '/',
+        host: 'audit-collab-site.congjianai.com',
+      })
+      assert.match(liveAfterForce.text, /OWNER_FORCE_FINAL/)
+
+      // B6: Legacy master rollback overwrite of __oc_server/api.mjs -> editor cannot revert to stale A OR run unconfirmed B until owner re-publishes
+      const handlerACode = 'export default async function handler() { return { status: 200, body: { h: "A" } } }\n'
+      const handlerBCode = 'export default async function handler() { return { status: 200, body: { h: "B" } } }\n'
+      const b6Init = await svc.publishSite(1, {
+        slug: 'b6-rollback-site',
+        gzippedBundle: encodeSiteBundle([
+          { path: 'index.html', content: Buffer.from('<h1>B6_A</h1>') },
+          { path: '__oc_server/api.mjs', content: Buffer.from(handlerACode) },
+        ]).gzipped,
+      })
+      await svc.addCollaboratorByEmail(1, 'b6-rollback-site', { email: 'editor@example.com', role: 'editor' })
+
+      // Simulate legacy master rollback publishing handler B directly to Edge + PG without updating serverApiSha256 (still sha(A))
+      const bundleB = encodeSiteBundle([
+        { path: 'index.html', content: Buffer.from('<h1>B6_LEGACY_B</h1>') },
+        { path: '__oc_server/api.mjs', content: Buffer.from(handlerBCode) },
+      ])
+      const alignedLegacy = repo.simulateLegacyMasterPublish('b6-rollback-site', {
+        hasServerApi: true,
+        contentSha256: bundleB.contentSha256,
+      })
+      await edgeClient.pushBundle({
+        slug: 'b6-rollback-site',
+        revision: alignedLegacy.edgeRevision,
+        gzippedBundle: bundleB.gzipped,
+        hasServerApi: true,
+        meta: {
+          siteId: b6Init.id,
+          title: 'b6-rollback-site',
+          visibility: 'public',
+          passwordSalt: null,
+          passwordHash: null,
+          spaMode: true,
+          hasServerApi: true,
+          contentSha256: bundleB.contentSha256,
+        },
+      })
+
+      // Editor trying to restore old A using current Edge/PG base MUST be rejected 403! Edge MUST keep B!
+      await assert.rejects(
+        () =>
+          svc.publishSite(2, {
+            slug: 'b6-rollback-site',
+            expectedSiteId: alignedLegacy.id,
+            expectedBaseRevision: alignedLegacy.edgeRevision,
+            expectedBaseContentSha256: alignedLegacy.contentSha256,
+            gzippedBundle: encodeSiteBundle([
+              { path: 'index.html', content: Buffer.from('<h1>EDITOR_REVERT_TO_A</h1>') },
+              { path: '__oc_server/api.mjs', content: Buffer.from(handlerACode) },
+            ]).gzipped,
+          }),
+        (e: unknown) => e instanceof SitesError && e.code === 'FORBIDDEN' && e.status === 403,
+      )
+      // Editor carrying new handler B before owner re-confirms on new master MUST ALSO fail closed 403!
+      await assert.rejects(
+        () =>
+          svc.publishSite(2, {
+            slug: 'b6-rollback-site',
+            expectedSiteId: alignedLegacy.id,
+            expectedBaseRevision: alignedLegacy.edgeRevision,
+            expectedBaseContentSha256: alignedLegacy.contentSha256,
+            gzippedBundle: encodeSiteBundle([
+              { path: 'index.html', content: Buffer.from('<h1>EDITOR_WITH_UNCONFIRMED_B</h1>') },
+              { path: '__oc_server/api.mjs', content: Buffer.from(handlerBCode) },
+            ]).gzipped,
+          }),
+        (e: unknown) => e instanceof SitesError && e.code === 'FORBIDDEN' && e.status === 403,
+      )
+      // Handler B stays live on Edge untouched
+      const apiB = await edgeHttpRequest({
+        port: edgePort,
+        path: '/api/ping',
+        host: 'b6-rollback-site.congjianai.com',
+      })
+      assert.deepEqual(JSON.parse(apiB.text), { h: 'B' })
+
+      // After owner re-publishes B on new master, editor static update keeping B succeeds!
+      const ownerReconfirm = await svc.publishSite(1, {
+        slug: 'b6-rollback-site',
+        expectedBaseRevision: alignedLegacy.edgeRevision,
+        gzippedBundle: bundleB.gzipped,
+      })
+      const editorAfterReconfirm = await svc.publishSite(2, {
+        slug: 'b6-rollback-site',
+        expectedSiteId: ownerReconfirm.id,
+        expectedBaseRevision: ownerReconfirm.edgeRevision,
+        expectedBaseContentSha256: ownerReconfirm.contentSha256,
+        gzippedBundle: encodeSiteBundle([
+          { path: 'index.html', content: Buffer.from('<h1>EDITOR_AFTER_OWNER_CONFIRM</h1>') },
+          { path: '__oc_server/api.mjs', content: Buffer.from(handlerBCode) },
+        ]).gzipped,
+      })
+      assert.equal(editorAfterReconfirm.accessRole, 'editor')
+    } finally {
+      await new Promise<void>((r) => masterSrv.close(() => r()))
+      await edgeSrv.close()
+      rmSync(workDir, { recursive: true, force: true })
+    }
   })
 })

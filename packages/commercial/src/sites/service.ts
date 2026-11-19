@@ -77,6 +77,7 @@ export interface PublishSiteInput {
   expectedSiteId?: string
   expectedBaseRevision?: number
   expectedBaseContentSha256?: string
+  forceOverwrite?: boolean
   gzippedBundle: Buffer
 }
 
@@ -648,6 +649,7 @@ export class SitesService {
           ...(input.expectedBaseContentSha256 !== undefined
             ? { expectedBaseContentSha256: input.expectedBaseContentSha256 }
             : {}),
+          ...(input.forceOverwrite ? { forceOverwrite: true } : {}),
           maxPerUser: this.maxPerUser,
         })
 
@@ -658,6 +660,52 @@ export class SitesService {
         if (accessRole !== 'owner' && (input.visibility !== undefined || input.password !== undefined)) {
           await repo.releaseLease(reservation.siteId, ownerId, reservation.leaseId, true).catch(() => {})
           throw new SitesError('FORBIDDEN', '协作者不能修改站点访问可见性或访问口令', 403)
+        }
+
+        // B6 rollback safety: verify the live __oc_server/api.mjs bytes on Edge still match the
+        // owner-approved PG serverApiSha256 so an out-of-band/pre-0345 write can never leave stale approvals active.
+        if (
+          accessRole === 'editor' &&
+          (decoded.hasServerApi || lockedExisting?.hasServerApi || Boolean(lockedExisting?.serverApiSha256))
+        ) {
+          const releaseOnVerifyFail = async () => {
+            if (reservation.isNewPlaceholder) {
+              await repo.abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId).catch(() => {})
+            } else {
+              await repo.releaseLease(reservation.siteId, ownerId, reservation.leaseId, true).catch(() => {})
+            }
+          }
+          if (!edge.pullBundle) {
+            await releaseOnVerifyFail()
+            throw new SitesError('EDGE_UNAVAILABLE', '当前边缘节点不支持校验线上服务端代码摘要', 502, true)
+          }
+          let liveDecoded: ReturnType<typeof decodeSiteBundle>
+          try {
+            const liveBuf = await edge.pullBundle({
+              slug,
+              siteId: reservation.siteId,
+              expectedRevision: reservation.baseRevision,
+            })
+            liveDecoded = decodeSiteBundle(liveBuf, this.maxSiteBytes)
+          } catch (err) {
+            await releaseOnVerifyFail()
+            throw err
+          }
+          const pgHasApi = Boolean(lockedExisting?.hasServerApi)
+          const pgApprovedSha = lockedExisting?.serverApiSha256 ?? ''
+          if (
+            liveDecoded.hasServerApi !== pgHasApi ||
+            liveDecoded.serverApiSha256 !== pgApprovedSha ||
+            liveDecoded.hasServerApi !== decoded.hasServerApi ||
+            liveDecoded.serverApiSha256 !== decoded.serverApiSha256
+          ) {
+            await releaseOnVerifyFail()
+            throw new SitesError(
+              'FORBIDDEN',
+              '站点当前线上服务端 /api/* 代码与所有者已批准摘要不一致，请先由站点所有者重新确认发布后再允许协作者更新',
+              403,
+            )
+          }
         }
 
         const finalVisibility: SiteVisibility =

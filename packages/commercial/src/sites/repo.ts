@@ -25,6 +25,7 @@ export interface PublishReservationInput {
   expectedSiteId?: string
   expectedBaseRevision?: number
   expectedBaseContentSha256?: string
+  forceOverwrite?: boolean
   maxPerUser: number
 }
 
@@ -686,11 +687,21 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
             )
           }
 
+          if (accessRole !== 'owner' && input.forceOverwrite) {
+            throw new SitesError('FORBIDDEN', '仅站点所有者可执行强制覆盖发布', 403)
+          }
+
           // P0 #1: Editor may never introduce, alter, or remove __oc_server/api.mjs (which receives owner ctx.env).
-          if (accessRole === 'editor' && (input.hasServerApi || existing.hasServerApi)) {
+          if (
+            accessRole === 'editor' &&
+            (input.hasServerApi || existing.hasServerApi || Boolean(existing.serverApiSha256))
+          ) {
             const approvedSha = existing.serverApiSha256 ?? ''
             const incomingSha = input.hasServerApi ? (input.serverApiSha256 ?? '') : ''
-            if (!existing.hasServerApi || !approvedSha || incomingSha !== approvedSha) {
+            const matchesApproved = existing.hasServerApi
+              ? input.hasServerApi && Boolean(approvedSha) && incomingSha === approvedSha
+              : !input.hasServerApi && approvedSha === '' && incomingSha === ''
+            if (!matchesApproved) {
               throw new SitesError(
                 'FORBIDDEN',
                 '仅站点所有者可新增、修改或移除服务端 /api/* 代码（以保护站点密钥与后端路由）；协作者可自由修改并发布前端静态文件',
@@ -699,16 +710,28 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
             }
           }
 
-          // P1 #7: Optimistic concurrency guard preventing stale full-bundle overwrites.
+          // P1 #7: Optimistic concurrency guard preventing stale full-bundle overwrites across collaborators.
           if (existing.edgeRevision > 0) {
+            const collabExistsRes = await client.query<{ has_collab: boolean }>(
+              `SELECT EXISTS (
+                 SELECT 1 FROM user_site_collaborators WHERE site_id = $1
+               ) AS has_collab`,
+              [existing.id],
+            )
+            const hasCollaborators = Boolean(collabExistsRes.rows[0]?.has_collab)
+            const requiresBaseline =
+              accessRole === 'editor' ||
+              (accessRole === 'owner' && hasCollaborators && !input.forceOverwrite)
             if (
-              accessRole === 'editor' &&
+              requiresBaseline &&
               input.expectedBaseRevision === undefined &&
               !input.expectedBaseContentSha256
             ) {
               throw new SitesError(
                 'STALE_REVISION',
-                `协同发布必须提供拉取基线版本，请先运行 oc-site pull ${input.slug} 后再发布`,
+                accessRole === 'editor'
+                  ? `协同发布必须提供拉取基线版本，请先运行 oc-site pull ${input.slug} 后再发布`
+                  : `站点 "${input.slug}" 已开启多人协作，请先运行 oc-site pull ${input.slug} 同步协作者最新版本后再发布（如需强制覆盖请传 --force）`,
                 409,
               )
             }
@@ -1475,7 +1498,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
     async updateCollaboratorRole(input) {
       return withTx(pool, async (client) => {
         const siteRes = await client.query<{ id: string }>(
-          `SELECT id FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision > 0 FOR UPDATE`,
+          'SELECT id FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision > 0 FOR UPDATE',
           [input.siteId, input.ownerUserId],
         )
         if (siteRes.rows.length === 0) {
@@ -1518,7 +1541,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
     async removeCollaborator(input) {
       return withTx(pool, async (client) => {
         const siteRes = await client.query<{ id: string }>(
-          `SELECT id FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision > 0 FOR UPDATE`,
+          'SELECT id FROM user_sites WHERE id = $1 AND user_id = $2 AND edge_revision > 0 FOR UPDATE',
           [input.siteId, input.ownerUserId],
         )
         if (siteRes.rows.length === 0) {
@@ -1546,7 +1569,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
     async leaveSiteCollaborator(siteId, actorUserId) {
       return withTx(pool, async (client) => {
         const siteRes = await client.query<{ id: string }>(
-          `SELECT id FROM user_sites WHERE id = $1 AND edge_revision > 0 FOR UPDATE`,
+          'SELECT id FROM user_sites WHERE id = $1 AND edge_revision > 0 FOR UPDATE',
           [siteId],
         )
         if (siteRes.rows.length === 0) {
@@ -1753,7 +1776,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
 
         if (!existingRole) {
           const cntRes = await client.query<{ cnt: number }>(
-            `SELECT COUNT(*)::int AS cnt FROM user_site_collaborators WHERE site_id = $1`,
+            'SELECT COUNT(*)::int AS cnt FROM user_site_collaborators WHERE site_id = $1',
             [siteRaw.id],
           )
           if ((cntRes.rows[0]?.cnt ?? 0) >= maxCollaborators) {
@@ -1774,7 +1797,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
           [siteRaw.id, actorUserId, inv.role, ownerUserId],
         )
         await client.query(
-          `UPDATE user_site_invites SET use_count = use_count + 1 WHERE id = $1`,
+          'UPDATE user_site_invites SET use_count = use_count + 1 WHERE id = $1',
           [inv.id],
         )
         const nextCount = Number(siteRaw.collaborator_count ?? 0) + (existingRole ? 0 : 1)

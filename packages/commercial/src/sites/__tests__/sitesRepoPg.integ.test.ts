@@ -18,6 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const MIGRATIONS_DIR = resolve(HERE, '../../db/migrations')
 const SITES_MIGRATIONS = [
   resolve(MIGRATIONS_DIR, '0342_commercial_user_sites.sql'),
+  resolve(MIGRATIONS_DIR, '0345_commercial_user_site_collaborators.sql'),
   resolve(MIGRATIONS_DIR, '0345_user_sites.sql'),
   resolve(MIGRATIONS_DIR, '0347_user_sites_fullstack.sql'),
   resolve(MIGRATIONS_DIR, '0349_user_site_collaborators.sql'),
@@ -586,10 +587,12 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
         },
       },
     })
+    const ownerBeforePublishB = await svc.getSite(1, 'pg-collab-site')
     await assert.rejects(
       () =>
         crashPublishSvc.publishSite(1, {
           slug: 'pg-collab-site',
+          expectedBaseRevision: ownerBeforePublishB.edgeRevision,
           gzippedBundle: encodeSiteBundle([
             { path: 'index.html', content: Buffer.from('<h1>OWNER_B</h1>', 'utf8') },
             { path: '__oc_server/api.mjs', content: Buffer.from(ownerApiCodeB, 'utf8') },
@@ -674,13 +677,17 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
     assert.equal(await repo.getByUserAndSlug(2, 'pg-collab-site'), null)
   })
 
-  test('0342 migration is idempotent per table across multiple schemas in one database', async (t) => {
+  test('0342 and 0345 migrations are idempotent across multiple schemas in one database', async (t) => {
     const commercial0342 = SITES_MIGRATIONS.find((p) => p.endsWith('0342_commercial_user_sites.sql'))
+    const commercial0345 = SITES_MIGRATIONS.find((p) =>
+      p.endsWith('0345_commercial_user_site_collaborators.sql'),
+    )
     if (!commercial0342) {
       t.skip('commercial 0342 migration not present on selfhost')
       return
     }
-    const sql = readFileSync(commercial0342, 'utf8')
+    const sql0342 = readFileSync(commercial0342, 'utf8')
+    const sql0345 = commercial0345 ? readFileSync(commercial0345, 'utf8') : null
     const schemaA = `oc_sites_0342_a_${randomUUID().replaceAll('-', '')}`
     const schemaB = `oc_sites_0342_b_${randomUUID().replaceAll('-', '')}`
     const client = await admin.connect()
@@ -692,15 +699,41 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
           SET LOCAL search_path = ${s};
           CREATE TABLE users (id INTEGER PRIMARY KEY);
         `)
-        await client.query(sql)
-        await client.query(sql)
+        await client.query(sql0342)
+        await client.query(sql0342)
+        if (sql0345) {
+          await client.query(sql0345)
+          await client.query(sql0345)
+        }
+        const expectedCheckNames = [
+          'user_sites_custom_domain_format_chk',
+          'user_sites_op_kind_chk',
+          ...(sql0345
+            ? ['user_sites_preview_acl_version_chk', 'user_sites_preview_acl_target_version_chk']
+            : []),
+        ]
         const chks = await client.query<{ cnt: number }>(
           `SELECT count(*)::int AS cnt
              FROM pg_constraint
             WHERE conrelid = 'user_sites'::regclass
-              AND conname IN ('user_sites_custom_domain_format_chk', 'user_sites_op_kind_chk')`,
+              AND conname = ANY($1::text[])`,
+          [expectedCheckNames],
         )
-        assert.equal(chks.rows[0]!.cnt, 2, `expected 2 check constraints on ${s}.user_sites`)
+        assert.equal(
+          chks.rows[0]!.cnt,
+          expectedCheckNames.length,
+          `expected ${expectedCheckNames.length} check constraints on ${s}.user_sites`,
+        )
+        if (sql0345) {
+          const tbls = await client.query<{ cnt: number }>(
+            `SELECT count(*)::int AS cnt
+               FROM information_schema.tables
+              WHERE table_schema = $1
+                AND table_name IN ('user_site_collaborators', 'user_site_invites')`,
+            [s],
+          )
+          assert.equal(tbls.rows[0]!.cnt, 2, `expected collaborator tables in ${s}`)
+        }
         await client.query('COMMIT')
       }
     } finally {

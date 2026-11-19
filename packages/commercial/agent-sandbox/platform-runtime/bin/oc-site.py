@@ -223,7 +223,9 @@ def collect_bundle(target_raw: str, api_raw: str | None = None) -> tuple[bytes, 
     if api_raw:
         explicit_api_data, explicit_api_real = read_api_file(api_raw)
     server_rel = "__oc_server/api.mjs"
-    detected_api_data: bytes | None = None
+    api_sources: list[tuple[str, bytes]] = []
+    if explicit_api_data is not None:
+        api_sources.append(("--api", explicit_api_data))
 
     if target.is_file():
         if explicit_api_real is not None and target.resolve() == explicit_api_real:
@@ -252,6 +254,7 @@ def collect_bundle(target_raw: str, api_raw: str | None = None) -> tuple[bytes, 
             for fn in sorted(filenames):
                 full_f = Path(dirpath) / fn
                 rel = full_f.relative_to(root).as_posix()
+                rel_lower = rel.lower()
                 if fn in SKIP_FILES:
                     continue
                 if fn == ".env" or fn.startswith(".env."):
@@ -264,13 +267,19 @@ def collect_bundle(target_raw: str, api_raw: str | None = None) -> tuple[bytes, 
                     continue
                 if explicit_api_real is not None and full_f.resolve() == explicit_api_real:
                     continue
+                if (rel_lower == "__oc_server" or rel_lower.startswith("__oc_server/")) and rel != server_rel:
+                    raise SiteCliError("INVALID_BUNDLE", f"reserved server path is invalid: {rel}")
                 if rel in (server_rel, "server/api.mjs", "api/index.mjs"):
-                    if explicit_api_data is None and detected_api_data is None:
-                        data = full_f.read_bytes()
-                        if len(data) > MAX_SINGLE_FILE_BYTES:
-                            raise SiteCliError("INVALID_BUNDLE", f"api handler exceeds 10 MiB: {rel}")
-                        detected_api_data = data
+                    data = full_f.read_bytes()
+                    if len(data) > MAX_SINGLE_FILE_BYTES:
+                        raise SiteCliError("INVALID_BUNDLE", f"api handler exceeds 10 MiB: {rel}")
+                    api_sources.append((rel, data))
                     continue
+                if rel_lower in (server_rel, "server/api.mjs", "api/index.mjs"):
+                    raise SiteCliError(
+                        "INVALID_BUNDLE",
+                        f"reserved server handler path casing is ambiguous ({rel}); rename to exact {rel_lower} or a non-reserved static path",
+                    )
                 data = full_f.read_bytes()
                 if len(data) > MAX_SINGLE_FILE_BYTES:
                     raise SiteCliError("INVALID_BUNDLE", f"file exceeds 10 MiB: {rel}")
@@ -283,7 +292,11 @@ def collect_bundle(target_raw: str, api_raw: str | None = None) -> tuple[bytes, 
     else:
         raise SiteCliError("INVALID_INPUT", f"unsupported path type: {target}")
 
-    server_data = explicit_api_data if explicit_api_data is not None else detected_api_data
+    if len(api_sources) > 1:
+        labels = ", ".join(lbl for lbl, _ in api_sources)
+        raise SiteCliError("INVALID_BUNDLE", f"conflicting server api handler sources: {labels}")
+
+    server_data = api_sources[0][1] if api_sources else None
     if server_data is not None:
         total_bytes += len(server_data)
         if total_bytes > MAX_TOTAL_BYTES:
@@ -373,6 +386,8 @@ def cmd_publish(ns: argparse.Namespace) -> int:
     has_explicit_base = (
         ns.base_site_id is not None or ns.base_rev is not None or ns.base_sha is not None
     )
+    if ns.force:
+        meta["forceOverwrite"] = True
     if ns.base_site_id is not None:
         meta["expectedSiteId"] = ns.base_site_id
     if ns.base_rev is not None:
@@ -387,10 +402,11 @@ def cmd_publish(ns: argparse.Namespace) -> int:
     ):
         if isinstance(existing_state.get("siteId"), str) and existing_state["siteId"].strip():
             meta["expectedSiteId"] = existing_state["siteId"].strip()
-        if isinstance(existing_state.get("edgeRevision"), int) and existing_state["edgeRevision"] >= 1:
-            meta["expectedBaseRevision"] = existing_state["edgeRevision"]
-        if isinstance(existing_state.get("contentSha256"), str) and len(existing_state["contentSha256"]) == 64:
-            meta["expectedBaseContentSha256"] = existing_state["contentSha256"]
+        if not ns.force:
+            if isinstance(existing_state.get("edgeRevision"), int) and existing_state["edgeRevision"] >= 1:
+                meta["expectedBaseRevision"] = existing_state["edgeRevision"]
+            if isinstance(existing_state.get("contentSha256"), str) and len(existing_state["contentSha256"]) == 64:
+                meta["expectedBaseContentSha256"] = existing_state["contentSha256"]
     origin_session = (
         os.environ.get("OPENCLAUDE_SESSION_KEY") or os.environ.get("OC_SESSION_KEY") or ""
     ).strip()
@@ -410,11 +426,7 @@ def cmd_publish(ns: argparse.Namespace) -> int:
         timeout=90,
     )
     site_obj = res.get("site") if isinstance(res, dict) else None
-    if (
-        isinstance(site_obj, dict)
-        and target_path.is_dir()
-        and (existing_state is not None or has_explicit_base)
-    ):
+    if isinstance(site_obj, dict) and target_path.is_dir():
         write_site_state(
             target_path.resolve(),
             {
@@ -459,13 +471,26 @@ def cmd_pull(ns: argparse.Namespace) -> int:
     dest_real = dest.resolve()
     has_api = False
     written = 0
+    seen_outputs: set[str] = set()
+    planned: list[tuple[Path, bytes]] = []
     for rel, content in files:
+        rel_lower = rel.lower()
+        if rel_lower in ("server/api.mjs", "api/index.mjs") or (
+            rel_lower.startswith("__oc_server/") and rel != "__oc_server/api.mjs"
+        ):
+            raise SiteCliError("INVALID_BUNDLE", f"unexpected reserved server asset in bundle: {rel}")
         out_rel = "server/api.mjs" if rel == "__oc_server/api.mjs" else rel
+        if out_rel in seen_outputs:
+            raise SiteCliError("INVALID_BUNDLE", f"duplicate mapped path in bundle: {out_rel}")
+        seen_outputs.add(out_rel)
         if rel == "__oc_server/api.mjs":
             has_api = True
         target = (dest_real / out_rel).resolve()
         if dest_real not in target.parents:
             raise SiteCliError("INVALID_BUNDLE", f"refusing to write outside target dir: {out_rel}")
+        planned.append((target, content))
+
+    for target, content in planned:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         written += 1
@@ -628,6 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pub.add_argument("--base-site-id", dest="base_site_id", help="Optimistic concurrency expected siteId (update-only)")
     p_pub.add_argument("--base-rev", dest="base_rev", type=int, help="Optimistic concurrency expected base edgeRevision")
     p_pub.add_argument("--base-sha", dest="base_sha", help="Optimistic concurrency expected base contentSha256")
+    p_pub.add_argument("--force", action="store_true", help="Owner-only: bypass base revision check and force overwrite remote site")
     spa_g = p_pub.add_mutually_exclusive_group()
     spa_g.add_argument("--spa", dest="spa", action="store_const", const=True, help="Enable SPA fallback to index.html")
     spa_g.add_argument("--no-spa", dest="spa", action="store_const", const=False, help="Disable SPA fallback")

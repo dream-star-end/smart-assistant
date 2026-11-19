@@ -280,6 +280,7 @@ export function SiteLiveEditModal({
     }
   }, [sendToIframe]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional reconnect trigger on reconnectKey bump
   useEffect(() => {
     if (!open) return;
     let alive = true;
@@ -931,7 +932,6 @@ export function SiteLiveEditModal({
 
             {mode === "comment" && ready && (
               <div
-                tabIndex={0}
                 role="application"
                 aria-label="网页画面，点按选择要修改的元素"
                 className="absolute inset-0 z-[5] touch-none cursor-crosshair outline-none"

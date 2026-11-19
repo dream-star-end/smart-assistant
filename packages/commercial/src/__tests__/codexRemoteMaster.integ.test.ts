@@ -51,6 +51,12 @@ const expectedSuffix = [
         '0341_commercial_antigravity_gemini_4_models',
         '0342_commercial_user_sites',
         '0343_commercial_gpt62_sol_astra_models',
+        ...(existsSync(new URL('../db/migrations/0344_commercial_antigravity_gemini_4_neon.sql', import.meta.url))
+          ? ['0344_commercial_antigravity_gemini_4_neon']
+          : []),
+        ...(existsSync(new URL('../db/migrations/0345_commercial_user_site_collaborators.sql', import.meta.url))
+          ? ['0345_commercial_user_site_collaborators']
+          : []),
       ]),
 ].sort()
 const url = process.env.TEST_DATABASE_URL
