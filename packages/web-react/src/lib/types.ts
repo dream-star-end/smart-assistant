@@ -338,7 +338,9 @@ export type PublicModel = {
   /** protocol modelReasoningPolicy 的 API 投影；空数组 = 不支持思考深度。 */
   supported_efforts?: Array<"low" | "medium" | "high" | "xhigh" | "max">;
   /** Catalog execution metadata used to decide whether a populated session needs native compaction before switching. */
-  engine?: "ccb" | "codex" | "grok" | "cursor" | "zcode";
+  engine?: "ccb" | "codex" | "grok" | "cursor" | "zcode" | "antigravity";
+  /** Execution placement projected by GET /api/public/models ('local' default or 'remote_pool'). */
+  placement?: "local" | "remote_pool";
   context_window?: number | null;
   supports_vision?: boolean;
   /** Blended cost vs DeepSeek V4 Pro (one decimal), from GET /api/public/models. */

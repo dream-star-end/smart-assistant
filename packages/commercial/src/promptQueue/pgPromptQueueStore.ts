@@ -1154,6 +1154,7 @@ async function readSnapshot(
         modelSwitchConsent?:string
         effortLevel?: string | null
         teamMode?: boolean
+        swarmMode?: boolean
         contextTier?: CursorContextTier
         serviceTier?: ServiceTier | null
       },
@@ -1394,6 +1395,9 @@ function validateRequestedExecution(value: Record<string, unknown>): void {
   }
   if (value.teamMode !== undefined && typeof value.teamMode !== 'boolean') {
     throw new PromptQueueStoreError('INVALID_REQUEST', 'requestedExecution.teamMode is invalid')
+  }
+  if (value.swarmMode !== undefined && typeof value.swarmMode !== 'boolean') {
+    throw new PromptQueueStoreError('INVALID_REQUEST', 'requestedExecution.swarmMode is invalid')
   }
   if (value.contextTier !== undefined && !isCursorContextTier(value.contextTier)) {
     throw new PromptQueueStoreError('INVALID_REQUEST', 'requestedExecution.contextTier is invalid')

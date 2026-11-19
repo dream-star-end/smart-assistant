@@ -5292,6 +5292,7 @@ export class ChatSocket {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    swarmMode?: boolean;
     collabMode?: "solo" | "advisor" | "team";
     advisorModel?: string;
     collabConfigVersion?: string;
@@ -5333,6 +5334,7 @@ export class ChatSocket {
       ...(authorization?.consent?{modelSwitchConsent:authorization.consent}:{}),
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       teamMode: !!p.teamMode,
+      ...(p.swarmMode ? { swarmMode: true } : {}),
       ...(p.collabMode ? { collabMode: p.collabMode } : {}),
       ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
       ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
@@ -5374,6 +5376,7 @@ export class ChatSocket {
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
+      ...(p.swarmMode ? { swarmMode: true } : {}),
       ...(p.collabMode ? { collabMode: p.collabMode } : {}),
       ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
       ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
@@ -5584,6 +5587,7 @@ export class ChatSocket {
       ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing.modelSwitchConsent ? { modelSwitchConsent:routing.modelSwitchConsent } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
+      ...(routing.swarmMode ? { swarmMode: true } : {}),
       ...(routing.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
@@ -5808,6 +5812,7 @@ export class ChatSocket {
       ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing?.modelSwitchConsent ? { modelSwitchConsent:routing.modelSwitchConsent } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.swarmMode ? { swarmMode: true } : {}),
       ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
@@ -6429,6 +6434,7 @@ export class ChatSocket {
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.swarmMode ? { swarmMode: true } : {}),
       ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),

@@ -237,9 +237,12 @@ function validateMutation(value: unknown, owner: PromptQueueOwner): void {
       if (!isRecord(value.requestedExecution)) {
         throw new InvalidPromptQueueBodyError('requestedExecution object required')
       }
-      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'])
+      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode', 'swarmMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'])
       assertOptionalString('model', value.requestedExecution.model, 256)
       assertOptionalString('effortLevel', value.requestedExecution.effortLevel, 64, true)
+      if (value.requestedExecution.swarmMode !== undefined && typeof value.requestedExecution.swarmMode !== 'boolean') {
+        throw new InvalidPromptQueueBodyError('swarmMode invalid')
+      }
       if (
         value.requestedExecution.contextTier !== undefined &&
         !isCursorContextTier(value.requestedExecution.contextTier)

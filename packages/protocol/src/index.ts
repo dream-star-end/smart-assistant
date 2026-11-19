@@ -1,5 +1,6 @@
 export * from './idleRecoveryError.js'
 export * from './frames.js'
+export * from './swarm.js'
 export * from './uploadLimits.js'
 export * from './uploadChunkSizing.js'
 export * from './contextPressure.js'

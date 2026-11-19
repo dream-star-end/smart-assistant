@@ -48,7 +48,7 @@
       "mediaKey": "chat-basics",
       "mediaVersion": 5,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "2158c0bac9cf4cd42865d6fb9fe448dfa517238b119ecbc54a5b3bbbf8f3acde"
+      "sourceHash": "c8c8fc9800f933c58b13eff0f8241557812df8788d38c9084c35183ef3586040"
     },
     "connectors": {
       "contentHash": "60d53be82da147122f4fef4ea5028d7e02e59148ab15b9454ee7aa933f45a874",
@@ -88,7 +88,7 @@
       "mediaKey": "files-media",
       "mediaVersion": 3,
       "registryHash": "a4788dc8e858a3a4a7fea3d3871867574bc6482b8dd239b053d234321febc305",
-      "sourceHash": "94972760f8d215dba2aaf987bfddd8c0588b9c918f8b56a23593577dfd94ab52"
+      "sourceHash": "35f4ad1a366b36417d8d2e2f3c078b8af4f149de7a4e3a2829cf11873541efea"
     },
     "github-repository": {
       "contentHash": "0d7c180f622f932b7b689b2f76dd60ca6de4db38ba392ac38248c9b57590c127",

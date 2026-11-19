@@ -1,5 +1,6 @@
-import { lazy, useState } from "react";
+import { type ComponentProps, lazy, useState } from "react";
 import { BootSplash } from "./components/BootSplash";
+import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
@@ -11,6 +12,37 @@ import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 export const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 export const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 export const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
+export const AgentGate = lazy(() => import("./components/AgentGate").then((m) => ({ default: m.AgentGate })));
+const RepoStatusBannerLazy = lazy(() =>
+  import("./components/github/RepoStatusBanner").then((m) => ({ default: m.RepoStatusBanner })),
+);
+const ErrorBannerLazy = lazy(() =>
+  import("./components/ErrorBanner").then((m) => ({ default: m.ErrorBanner })),
+);
+const UpdateBannerLazy = lazy(() =>
+  import("./components/UpdateBanner").then((m) => ({ default: m.UpdateBanner })),
+);
+const BackgroundTurnBannerLazy = lazy(() =>
+  import("./components/chat/BackgroundTurnBanner").then((m) => ({ default: m.BackgroundTurnBanner })),
+);
+const TurnCostReminderLazy = lazy(() =>
+  import("./components/chat/TurnCostReminder").then((m) => ({ default: m.TurnCostReminder })),
+);
+export function RepoStatusBanner(props: ComponentProps<typeof RepoStatusBannerLazy>) {
+  return <LazyBoundary fallback={null}><RepoStatusBannerLazy {...props} /></LazyBoundary>;
+}
+export function ErrorBanner(props: ComponentProps<typeof ErrorBannerLazy>) {
+  return <LazyBoundary fallback={null}><ErrorBannerLazy {...props} /></LazyBoundary>;
+}
+export function UpdateBanner() {
+  return <LazyBoundary fallback={null}><UpdateBannerLazy /></LazyBoundary>;
+}
+export function BackgroundTurnBanner(props: ComponentProps<typeof BackgroundTurnBannerLazy>) {
+  return <LazyBoundary fallback={null}><BackgroundTurnBannerLazy {...props} /></LazyBoundary>;
+}
+export function TurnCostReminder(props: ComponentProps<typeof TurnCostReminderLazy>) {
+  return <LazyBoundary fallback={null}><TurnCostReminderLazy {...props} /></LazyBoundary>;
+}
 export const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 export const DesktopEnrollPage = lazy(() =>
   import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })),

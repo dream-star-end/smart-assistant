@@ -91,6 +91,16 @@ const TOOL_META: Record<string, ToolMeta> = {
   delegate_task: { icon: Bot, label: "委托子任务", tone: "accent" },
   delegate_tasks: { icon: Users, label: "并行委派", tone: "accent" },
   delegate_wait: { icon: Clock, label: "等待委派", tone: "accent" },
+  // Antigravity 1.5.8 native swarm tools (OCV5-809).
+  SwarmBoard: { icon: Users, label: "蜂群协作看板", tone: "accent" },
+  SwarmManage: { icon: Users, label: "蜂群调度", tone: "accent" },
+  SwarmPost: { icon: Send, label: "蜂群广播", tone: "info" },
+  SwarmReadBoard: { icon: Eye, label: "读取讨论板", tone: "neutral" },
+  SwarmWait: { icon: Clock, label: "等待蜂群回复", tone: "neutral" },
+  swarm: { icon: Users, label: "蜂群调度", tone: "accent" },
+  post_message: { icon: Send, label: "蜂群广播", tone: "info" },
+  read_board: { icon: Eye, label: "读取讨论板", tone: "neutral" },
+  swarm_wait: { icon: Clock, label: "等待蜂群回复", tone: "neutral" },
 };
 
 const CODEX_TYPE_META: Record<string, ToolMeta> = {
@@ -683,6 +693,36 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
       return delegateTasksSummary(input);
     case "delegate_wait":
       return asStr(input.jobId);
+    case "SwarmBoard":
+      return asStr(input.title) || "蜂群协作";
+    case "SwarmManage":
+    case "swarm": {
+      const action = asStr(input.action);
+      const memberName = asStr(input.name);
+      const title = asStr(input.title);
+      if (action === "title" && title) return `命名「${title}」`;
+      if (action === "add" && memberName) return `招募 @${memberName}`;
+      if (action === "kill" && memberName) return `回收 @${memberName}`;
+      if (action === "model" && memberName) return `切换 @${memberName} 模型`;
+      if (action === "status") return "查看蜂群成员状态";
+      if (action === "models") return "查询可用模型";
+      if (action === "channel") return `频道 ${asStr(input.channel) || asStr(input.op)}`;
+      return title || memberName || action;
+    }
+    case "SwarmPost":
+    case "post_message": {
+      const ch = asStr(input.channel);
+      const text = asStr(input.text).replace(/\s+/g, " ").trim().slice(0, 60);
+      return ch && ch !== "main" ? `#${ch} ${text}` : text;
+    }
+    case "SwarmReadBoard":
+    case "read_board": {
+      const ch = asStr(input.channel);
+      return ch ? `频道 #${ch}` : "同步最新讨论";
+    }
+    case "SwarmWait":
+    case "swarm_wait":
+      return "等待成员汇报";
   }
   const codexType = parseCodexTypeName(name);
   if (codexType) return codexSummary(codexType, input).slice(0, 80);

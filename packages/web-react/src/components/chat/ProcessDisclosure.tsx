@@ -56,7 +56,7 @@ const WORK_ROLES = new Set<ChatMessage["role"]>([
 ]);
 
 const INTERACTIVE_TOOL_RE =
-  /ask_user|request_user_input|present_options|present_task_approval|exit_plan_mode|exitplanmode/i;
+  /ask_user|request_user_input|present_options|present_task_approval|exit_plan_mode|exitplanmode|^swarmboard$/i;
 
 export function isFoldableWorkRole(message: ChatMessage): boolean {
   return WORK_ROLES.has(message.role);

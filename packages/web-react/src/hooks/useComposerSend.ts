@@ -9,7 +9,8 @@ import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
  */
 import { useCallback, useState, useRef, useEffect, useMemo } from "react";
 import type { MediaRef, InboundMessage } from "../lib/chat/frames";
-import { type MessageReplyQuote, type ServiceTier, cursorModelSupportsContextTier, normalizeServiceTierForModel, isCodexEngineModel } from "@openclaude/protocol/browser";
+import { type MessageReplyQuote, type ServiceTier, cursorModelSupportsContextTier, normalizeServiceTierForModel, isCodexEngineModel, parseSwarmSlashCommand } from "@openclaude/protocol/browser";
+import { isAntigravityModelForUi } from "../components/chat/swarmDetect";
 import { sessionTitleFromText } from "../lib/sessionTitle";
 import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";
@@ -78,6 +79,7 @@ export type ComposerSendInput = {
   sockRef: React.RefObject<UseChatSocket | null>;
   stopPreparing: () => void;
   stopRef: React.RefObject<boolean>;
+  swarmMode?: boolean;
   toast: ToastFn;
   user: User | null;
 };
@@ -126,6 +128,7 @@ export function useComposerSend({
   sockRef,
   stopPreparing,
   stopRef,
+  swarmMode = false,
   toast,
   user,
 }: ComposerSendInput) {
@@ -337,6 +340,13 @@ export function useComposerSend({
         sendScrollRef?.current?.();
       }
       const teamLeaderTurn = sendCollab.teamMode;
+      const slashSwarm = parseSwarmSlashCommand(text);
+      const modelIsAntigravity = isAntigravityModelForUi(modelId, models);
+      if (slashSwarm?.matched && !modelIsAntigravity) {
+        toast("蜂群模式仅支持 Antigravity 模型，请先在顶栏切换至 Gemini 4 / Antigravity 模型", "info");
+        return false;
+      }
+      const effectiveSwarmMode = modelIsAntigravity && (swarmMode || Boolean(slashSwarm?.matched));
       const sent=await sockRef.current?.send({
         ...(authorization?{switchAuthorization:authorization}:{}),
         sessId: sessionId,
@@ -353,6 +363,7 @@ export function useComposerSend({
         imageEdit,
         replyTo,
         teamMode: teamLeaderTurn,
+        ...(effectiveSwarmMode ? { swarmMode: true } : {}),
         collabMode: sendCollab.collabMode,
         ...(sendCollab.collabMode === "advisor"
           ? {
@@ -428,6 +439,7 @@ export function useComposerSend({
       user,
       agent,
       modelId,
+      swarmMode,
       models,
       preferenceEffort,
       sessionEffort,

@@ -69,6 +69,7 @@ export type ChatCardActionsInput = {
   openBlog: (target: BlogOpenTarget) => void;
   openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined) => void;
   openSettings: (section?: SettingsDestinationSection) => void;
+  onOpenSwarmBoard?: ToolCardActions["onOpenSwarmBoard"];
   regenerate: () => Promise<void>;
   send: (text: string, media?: { url?: string | undefined; base64?: string | undefined; mimeType?: string | undefined; filename?: string | undefined; hidden?: boolean | undefined; localSrc?: string | undefined; kind: "image" | "audio" | "video" | "file"; }[] | undefined, imageEdit?: { mode?: "annotated" | "outpaint" | undefined; maskIndex?: number | undefined; targetAspect?: "16:9" | "4:3" | "9:16" | "3:4" | "1:1" | undefined; clientJobId: string; sourceIndex: number; guideIndex: number; width: number; height: number; } | undefined, displayText?: string | undefined, replyTo?: { text: string; messageId: string; role: "user" | "assistant"; } | undefined, target?: { sessionId: string; projectId?: string | null | undefined; } | undefined) => Promise<unknown>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
@@ -108,6 +109,7 @@ export function useChatCardActions({
   openBlog,
   openPane,
   openSettings,
+  onOpenSwarmBoard,
   regenerate,
   send,
   sendImplicitRatingRef,
@@ -213,6 +215,7 @@ export function useChatCardActions({
       onOpenMemory: () => openManage("memory"),
       onOpenSkills: () => openManage("skills"),
       onOpenTasks: () => openManage("cron"),
+      onOpenSwarmBoard,
       downloadLiteratureArtifact: (id: string) => api.downloadLiteratureArtifact(authRef.current, id),
       literatureArtifactMeta: (id: string) => api.literatureArtifactMeta(authRef.current, id),
       ...(verified ? {
@@ -247,7 +250,7 @@ export function useChatCardActions({
         },
       } : {}),
     };
-  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, communityBlogEnabled, openBlog]);
+  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, communityBlogEnabled, openBlog, onOpenSwarmBoard]);
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
   // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。

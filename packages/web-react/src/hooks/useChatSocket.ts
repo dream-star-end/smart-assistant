@@ -99,6 +99,7 @@ export type UseChatSocket = {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    swarmMode?: boolean;
     collabMode?: "solo" | "advisor" | "team";
     advisorModel?: string;
     collabConfigVersion?: string;

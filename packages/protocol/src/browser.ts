@@ -10,6 +10,7 @@ export * from './idleRecoveryError.js'
  * generation), modelAuthority / dispatchAuthority (signature verification) and losslessTurnTape.
  */
 export * from './frames.js'
+export * from './swarm.js'
 export * from './contextPressure.js'
 export * from './liveUnits.js'
 export * from './timelineLifecycle.js'

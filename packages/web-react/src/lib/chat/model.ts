@@ -14,6 +14,7 @@ import type {
   CursorContextTier,
   MessageReplyQuote,
   ServiceTier,
+  SwarmSnapshot,
   UserError,
 } from "@openclaude/protocol/browser";
 import type {
@@ -75,6 +76,7 @@ export type ChatRoutingSnapshot = {
   modelSwitchId?: string;
   modelSwitchConsent?: string;
   teamMode?: boolean;
+  swarmMode?: boolean;
   collabMode?: "solo" | "advisor" | "team";
   advisorModel?: string;
   collabConfigVersion?: string;
@@ -536,6 +538,8 @@ export type ChatMessage = {
   /** 本轮被停止 / 中断时还没拿到结果的工具:中性「已取消」,不是「完成」也不再转圈(OCV5-421)。 */
   cancelled?: boolean;
   bashTail?: BashTail;
+  /** Antigravity native swarm live/durable snapshot (OCV5-809). */
+  _swarmSnapshot?: SwarmSnapshot;
 
   // ── agent-group ──
   startTime?: number;

@@ -65,6 +65,8 @@ export type ToolCardActions = {
   };
   /** 打开任务面板(可选定位到 identifier)。 */
   onOpenTaskboard?: (identifier?: string) => void;
+  /** 打开 Antigravity 原生蜂群看板抽屉（OCV5-809）。 */
+  onOpenSwarmBoard?: (req: import("../chat/swarmDetect").SwarmOpenRequest) => void;
   /**
    * 对话写博客（经验分享草稿卡，OCV5-577 跟进）：全部走用户浏览器登录态，与「写一篇经验」同一套接口；
    * Agent 没有任何投稿能力。经验分享开关关闭、demo、未登录时不注入，草稿卡降级为只读预览。

@@ -37,6 +37,7 @@ import {
 } from '../billing/antigravitySettle.js'
 import type { ModelPricing } from '../billing/pricing.js'
 import {
+  ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE,
   ANTIGRAVITY_RELAY_PREFIX,
   ANTIGRAVITY_UPSTREAM_BASE_URL,
   type AntigravityRelayDeps,
@@ -711,13 +712,14 @@ describe('Antigravity relay concurrent budget (Codex r1 P1)', () => {
   })
 
   test('calls that fit the budget run concurrently up to the per-route cap', async () => {
+    const cap = ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE
     const { statuses, calls } = await concurrent({
       budget: 1_000_000n,
-      n: 7,
+      n: cap + 3,
       extra: { estimateCost: () => 1n },
     })
-    assert.equal(calls, 4)
-    assert.equal(statuses.filter((code) => code === 200).length, 4)
+    assert.equal(calls, cap)
+    assert.equal(statuses.filter((code) => code === 200).length, cap)
     assert.equal(statuses.filter((code) => code === 429).length, 3)
   })
 

@@ -42,6 +42,9 @@ import {
   AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
   isCursorEngineModel,
+  isAntigravityEngineModel,
+  isRemoteDriverExecutionBackend,
+  parseSwarmSlashCommand,
   isClientMessageId,
   formatMessageReplyPrompt,
   normalizeMessageReplyQuote,
@@ -562,6 +565,7 @@ export async function dispatchInbound(
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
+    const swarmMode = (frame as any).swarmMode === true
     const inboundCollabMode = normalizeCollabMode({
       collabMode: (frame as { collabMode?: unknown }).collabMode,
       teamMode,
@@ -1716,6 +1720,69 @@ export async function dispatchInbound(
         })
         finalText = teamPreamble + finalText
       }
+      // Antigravity native swarm mode (OCV5-809): activated either by explicit
+      // `swarmMode: true` toggle on a LOCAL Antigravity route or by leading `/swarm`.
+      // Remote-pool Antigravity routes (`remote-driver-v4`) do not run local CLI
+      // swarm watchers and forbid native swarm tools, so reject fail-closed early.
+      const effectiveModelForSwarm =
+        safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
+      const isAntigravityTurn =
+        turnAuthority?.engine === 'antigravity' ||
+        (typeof effectiveModelForSwarm === 'string' && isAntigravityEngineModel(effectiveModelForSwarm))
+      const isRemoteAntigravity =
+        isAntigravityTurn &&
+        (isRemoteDriverExecutionBackend(turnAuthority?.executionBackend) ||
+          (typeof effectiveModelForSwarm === 'string' && effectiveModelForSwarm.endsWith('-remote')))
+      const slashSwarm = parseSwarmSlashCommand(rawUserText)
+      const swarmRequested = swarmMode || Boolean(slashSwarm?.matched)
+      if (swarmRequested && isRemoteAntigravity) {
+        const _errUserId: string =
+          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+        this.log.warn('antigravity_swarm_rejected_remote_route', {
+          sessionKey,
+          model: effectiveModelForSwarm,
+          viaSlash: Boolean(slashSwarm?.matched),
+          viaToggle: swarmMode,
+        })
+        const rejectFrames = _earlyRejectErrorFrames({
+          sessionKey,
+          channel: frame.channel,
+          peer: frame.peer,
+          userId: _errUserId,
+          traceId: turnTraceId,
+          code: 'upstream_failed',
+          message: '远端 Antigravity 路由暂不支持原生蜂群（Swarm）模式，请切换至本地 Antigravity 模型后重试。',
+          legacyErrorText: '[error] native swarm mode is not supported on remote Antigravity routes',
+          ...(safeClientMessageId ? { clientMessageId: safeClientMessageId } : {}),
+        })
+        for (const f of rejectFrames) this.deliver(f, adapter)
+        return
+      }
+      if (isAntigravityTurn && !isRemoteAntigravity && swarmRequested) {
+        if (slashSwarm?.matched && rawUserText && finalText.endsWith(rawUserText)) {
+          const prefixPart = finalText.slice(0, finalText.length - rawUserText.length)
+          const taskBody =
+            slashSwarm.task ||
+            '请先了解当前工作区与上下文，并告知我可以如何拆分为并行蜂群任务。'
+          finalText = `${prefixPart}${taskBody}`
+        }
+        const swarmDirective = [
+          '[OpenClaude Antigravity 蜂群模式已激活]',
+          '用户已显式开启 Antigravity 原生蜂群（Swarm）模式。请按以下规则作为 Coordinator 编排蜂群：',
+          '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），请立即读取内置 `swarm` skill，先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者，若有 `swarm_monitor` 技能可配 `monitor`）。',
+          '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保 relay 计费与权限一致）。',
+          '3. OpenClaude 网页端会实时原生渲染蜂群看板（成员矩阵、实时活动、频道与讨论流），**切勿**在回复中输出本地 `open_board` 链接或终端 `/swarm board` 命令。',
+          '4. 所有成员收口后，先在讨论板发一行 `[done] <总结>` 让监控停止，再向用户交付清晰、完整的最终汇总。',
+          '',
+        ].join('\n')
+        finalText = `${swarmDirective}\n${finalText}`
+        this.log.info('antigravity_swarm_mode_turn', {
+          sessionKey,
+          model: effectiveModelForSwarm,
+          viaSlash: Boolean(slashSwarm?.matched),
+          viaToggle: swarmMode,
+        })
+      }
       // Pass as plain text. No image content blocks — safer for non-multimodal providers.
       const payload: string = finalText
       const taskType = sessionKey.includes(':cron:')
@@ -1848,8 +1915,8 @@ export async function dispatchInbound(
                 typeof b.parentToolUseId === 'string' ? b.parentToolUseId : undefined,
             })
           }
-          const isTail = b?.kind === 'tool_output_tail'
-          if (isTail) {
+          const isSnapshotSideband = b?.kind === 'tool_output_tail' || b?.kind === 'swarm_snapshot'
+          if (isSnapshotSideband) {
             if (liveWechatAdapter) {
               this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
               return

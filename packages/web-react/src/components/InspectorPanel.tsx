@@ -63,7 +63,7 @@ export {
 import type { ChatMessage } from "../lib/chat/model";
 import { computeStepTimings, formatStepDuration } from "../lib/chat/stepTiming";
 import { cn } from "../lib/utils";
-import { extractLatestTodos, type TodoItem } from "./chat/PinnedTaskTracker";
+import { extractLatestTodos, type TodoItem } from "./chat/todoExtract";
 import { CopyIconButton, FullToolBody } from "./chat/paneParts";
 import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
 import { isBrowserStepMessage } from "./tool/browserDetect";

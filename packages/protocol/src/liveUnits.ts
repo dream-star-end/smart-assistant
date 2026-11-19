@@ -9,7 +9,7 @@
 
 import { mintLiveProcessKey } from './timelineLifecycle.js'
 
-export const LIVE_UNITS_REDUCER_EPOCH = '2'
+export const LIVE_UNITS_REDUCER_EPOCH = '3'
 export const LIVE_UNITS_DEFAULT_N = 20
 export const LIVE_UNITS_MAX_N = 80
 export const LIVE_UNITS_DEFAULT_K = 20
@@ -651,6 +651,13 @@ function reduceLiveFramesOnto(
     if (meta.type === 'outbound.permission_request' || meta.type === 'outbound.permission_settled')
       return { ok: false, degraded: 'fallback' }
     if (meta.type !== 'outbound.message') continue
+    // Swarm snapshots carry live multi-agent board state that the compact
+    // live-unit schema does not fold. Advancing a resume cursor past one would
+    // make a refreshed or second tab miss the latest board while it is quiet.
+    // Fail closed to the raw-frame journal so hydration replays through the
+    // ordinary reducer (same contract as permission frames above).
+    if (meta.blocks.some((b) => str(b.kind) === 'swarm_snapshot'))
+      return { ok: false, degraded: 'fallback' }
     const block = meta.blocks[0]
     if (!block) continue
     const kind = str(block.kind)

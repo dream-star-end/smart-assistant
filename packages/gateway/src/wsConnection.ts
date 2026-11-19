@@ -1567,7 +1567,7 @@ export function deliver(
         Array.isArray(blocks) &&
         blocks.length > 0 &&
         !(wire as { isFinal?: boolean }).isFinal &&
-        blocks.every((b) => b?.kind === 'delegate_progress'))
+        blocks.every((b) => b?.kind === 'delegate_progress' || b?.kind === 'swarm_snapshot'))
     const evicted = this._outboundRing.store(
       sessionKey,
       frameSeq,

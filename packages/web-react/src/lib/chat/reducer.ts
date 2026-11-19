@@ -10,6 +10,7 @@
  *
  * 漏掉本文件任一守卫 = 重现一类历史已修 bug（每条都标了 §）。
  */
+import { applySwarmSnapshotBlock, finalizeSwarmMessageOnTurnEnd } from "./swarmReducer";
 import {
   AUTO_CONTINUE_PROMPT,
   applyPartialJsonDelta,
@@ -1841,7 +1842,9 @@ export function applyOutboundMessage(
   // 计时器触发时按 _lastFrameAt(markFrameReceived 推进)做 liveness 复检,长 bash 只发 tail 也不误超时。
   const nonFinalBlocks = !frame.isFinal && hasBlocks ? (frame.blocks as Array<{ kind?: string }>) : null;
   const tailOnlyFrame = !!nonFinalBlocks?.every((b) => b?.kind === "tool_output_tail");
-  const progressOnlyFrame = !!nonFinalBlocks?.every((b) => b?.kind === "delegate_progress");
+  const progressOnlyFrame = !!nonFinalBlocks?.every(
+    (b) => b?.kind === "delegate_progress" || b?.kind === "swarm_snapshot",
+  );
   const leftoverProgressSideband =
     progressOnlyFrame && (!sess._sendingInFlight || (!!sess._activeClientMessageId && !frame.clientMessageId));
   if (leftoverProgressSideband) frameTurnOwnerId = undefined;
@@ -2335,6 +2338,14 @@ export function applyOutboundMessage(
       const prev = existing.bashTail?.totalBytes ?? 0;
       if (totalBytes < prev) continue;
       existing.bashTail = { tail, totalBytes, truncatedHead };
+    } else if (b.kind === "swarm_snapshot") {
+      applySwarmSnapshotBlock(
+        sess,
+        b as { blockId?: string; snapshot?: unknown },
+        planTurnStart(sess.messages, sess.messages.length),
+        frameTurnOwnerId,
+        isFrozenLiveTarget,
+      );
     }
   }
 
@@ -2444,6 +2455,7 @@ export function applyOutboundMessage(
         // OCV5-421: 停止 / 中断收尾时这一步没拿到任何结果,它没跑完 —— 显示「已取消」而不是绿勾「完成」。
         if (interrupted && !m.output && !m.bashTail) m.cancelled = true;
       }
+      finalizeSwarmMessageOnTurnEnd(m, Boolean(interrupted), isFrozenLiveTarget);
       // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
       // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
       // send_to_agent 是真后台：父回合结束后子任务仍在跑，组卡必须保持运行中直到

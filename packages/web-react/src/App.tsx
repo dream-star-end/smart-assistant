@@ -25,7 +25,6 @@ import {
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
 } from "@openclaude/protocol/browser";
-import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import type { AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
@@ -41,17 +40,15 @@ import {
   ImageEditActionsContext,
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
-import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
-import { QueuedSendList } from "./components/chat/QueuedSendList";
-import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
-import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
+import { extractLatestTodos } from "./components/chat/todoExtract";
+import { PinnedDelegateTrackerLazy, PinnedGoalBarLazy, PinnedSwarmDock, PinnedTaskTrackerLazy, QueuedSendListLazy, SwarmBoardDrawer } from "./components/chat/lazyTimelineCards";
+import { useSwarmBoard, useSwarmMode } from "./hooks/useSwarmUi";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
-import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
+import type { ChatError } from "./components/ErrorBanner";
 import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
-import { UpdateBanner } from "./components/UpdateBanner";
-import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
+import { AssistantMessage, UserMessage } from "./components/Message";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
 import { pushPaletteRecent } from "./lib/paletteRecents";
@@ -62,11 +59,8 @@ import { DEFAULT_MANAGE_TAB, type ManageTab, normalizeManageTab } from "./lib/ma
 import type { SettingsSection } from "./components/SettingsCenter";
 import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
-import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton } from "./components/chat/HistorySkeleton";
-import { TurnCostReminder } from "./components/chat/TurnCostReminder";
-import { BackgroundTurnBanner } from "./components/chat/BackgroundTurnBanner";
 import { useBackgroundTurn } from "./hooks/useBackgroundTurn";
 import {
   captureVisibleVirtualRowAnchor,
@@ -240,7 +234,9 @@ import { AppDialogs } from "./components/AppDialogs";
 
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 import {
-  IdentityRecoveryNotice, AccountSwitchNotice, AuthGate, Landing, DesktopEnrollPage,
+  IdentityRecoveryNotice, AccountSwitchNotice, AgentGate, AuthGate,
+  RepoStatusBanner, ErrorBanner, UpdateBanner, BackgroundTurnBanner, TurnCostReminder,
+  Landing, DesktopEnrollPage,
   TutorialCenter, ContainerWebPreview, StudioApp, TaskboardView, SitesWorkspaceView, InspectorPanel,
   InspectorPanelContent, ImageAnnotationEditor, ProjectHome, QuickAskWindow,
   prefetchLazyCentersOnIdle, SplashFallback, useMountedOnce,
@@ -946,6 +942,8 @@ export function App() {
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
   selectedSessionIdRef.current = activeId;
+  const { swarmSupported, swarmMode, toggleSwarmMode } = useSwarmMode({ demo, sessionKey: activeId ?? draftSessionId, modelId, models });
+
   const {
     image2Available,
     imageEditActions,
@@ -996,6 +994,7 @@ export function App() {
     sockRef,
     stopPreparing,
     stopRef,
+    swarmMode,
     toast,
     user,
   });
@@ -1171,6 +1170,7 @@ export function App() {
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
+  const swarmUi = useSwarmBoard({ sessionKey: activeId ?? draftSessionId, wsMessages, messagesVersion: chat.version });
   // 分享对话框只针对打开时的会话;切会话(返回键/深链)就关掉,不拿旧快照配新标题。
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是触发条件
   useEffect(() => {
@@ -1502,6 +1502,7 @@ export function App() {
     openManage,
     openPane,
     openSettings,
+    onOpenSwarmBoard: swarmUi.openBoard,
     regenerate,
     send,
     sendImplicitRatingRef,
@@ -2384,15 +2385,17 @@ export function App() {
           data-font-size={composerPrefs.fontSize}
         >
           {gated ? (
-            <AgentGate
-              phase={gate.phase}
-              onOpen={gate.open}
-              onRetry={gate.check}
-              onTopUp={() => {
-                openSettings("account");
-                setSubscribeOpenSignal((n) => n + 1);
-              }}
-            />
+            <LazyBoundary fallback={<div className="flex flex-1 items-center justify-center p-8 text-meta text-faint">加载中…</div>}>
+              <AgentGate
+                phase={gate.phase}
+                onOpen={gate.open}
+                onRetry={gate.check}
+                onTopUp={() => {
+                  openSettings("account");
+                  setSubscribeOpenSignal((n) => n + 1);
+                }}
+              />
+            </LazyBoundary>
           ) : loadingHistory || historySurface === "skeleton" ? (
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
             <MessageListSkeleton />
@@ -2514,29 +2517,31 @@ export function App() {
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务或本轮已收口时组件自渲染
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
-            <PinnedGoalBar messages={timelineMessages} />
-          )}
-          {!demo && !gated && (
-            <PinnedTaskTracker
-              todos={extractLatestTodos(timelineMessages)}
-              active={wsSending}
-              settled={currentTurnSettled(timelineMessages)}
-              tokenUsage={activeSess?._liveTurnUsage?.usage}
-            />
-          )}
-          {!demo && !gated && (
-            <PinnedDelegateTracker
-              items={inflightDelegates.items}
-              onDismiss={inflightDelegates.dismiss}
-              // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
-              onStop={wsSending ? stopTurn : undefined}
-            />
-          )}
-          {!demo && !gated && (
-            <div
-              id="pending-approval-bar-slot"
-              className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden"
-            />
+            <>
+              <PinnedGoalBarLazy messages={timelineMessages} />
+              <PinnedTaskTrackerLazy
+                todos={extractLatestTodos(timelineMessages)}
+                active={wsSending}
+                settled={currentTurnSettled(timelineMessages)}
+                tokenUsage={activeSess?._liveTurnUsage?.usage}
+              />
+              <PinnedDelegateTrackerLazy
+                items={inflightDelegates.items}
+                onDismiss={inflightDelegates.dismiss}
+                onStop={wsSending ? stopTurn : undefined}
+              />
+              {swarmUi.latestSwarm && (
+                <PinnedSwarmDock
+                  snapshot={swarmUi.latestSwarm}
+                  cardId={swarmUi.latestCard?.messageId}
+                  blockId={swarmUi.latestCard?.blockId}
+                  dismissed={swarmUi.dismissedSwarmKey === swarmUi.latestSwarmKey}
+                  onOpenBoard={swarmUi.openBoard}
+                  onDismiss={() => swarmUi.latestSwarmKey && swarmUi.dismissSwarm(swarmUi.latestSwarmKey)}
+                />
+              )}
+              <div id="pending-approval-bar-slot" className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden" />
+            </>
           )}
           {/* 以下六条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
               发送失败 > 连接状态 > 本轮运行 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
@@ -2586,9 +2591,7 @@ export function App() {
           {showBanner("update") && <UpdateBanner />}
           {showBanner("cost") && activeSess?._turnCostReminderCredits && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <TurnCostReminder
-                credits={activeSess._turnCostReminderCredits}
-              />
+              <TurnCostReminder credits={activeSess._turnCostReminderCredits} />
             </div>
           )}
           {(bannerStack.hidden.length > 0 || bannerStack.canCollapse) && (
@@ -2615,7 +2618,7 @@ export function App() {
             </div>
           )}
           {!demo && !gated && queuedOutgoing.length > 0 && (
-            <QueuedSendList
+            <QueuedSendListLazy
               messages={queuedOutgoing}
               onEdit={(message) => cardCallbacks.onEditQueued?.(message)}
               onDelete={(message) => cardCallbacks.onDeleteQueued?.(message)}
@@ -2655,7 +2658,10 @@ export function App() {
                 <BackgroundTurnBanner notice={backgroundTurn.notice} />
               ) : undefined
             }
-            placeholder={`和「${agent.name}」对话…`}
+            placeholder={swarmMode ? "描述需要蜂群并行协作的任务，或直接输入 /swarm …" : `和「${agent.name}」对话…`}
+            swarmSupported={swarmSupported}
+            swarmMode={swarmMode}
+            onToggleSwarmMode={toggleSwarmMode}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
@@ -2953,6 +2959,9 @@ export function App() {
             onSubmit={submitImageEdit}
           />
         </LazyBoundary>
+      )}
+      {swarmUi.boardOpen && swarmUi.activeDrawerSwarm && (
+        <SwarmBoardDrawer open={swarmUi.boardOpen} onOpenChange={swarmUi.setBoardOpen} snapshot={swarmUi.activeDrawerSwarm} initialFocusMember={swarmUi.boardFocus.member} initialFocusChannel={swarmUi.boardFocus.channel} />
       )}
       {containerPreviewUrl && (
         <LazyBoundary fallback={<DialogFallback />}>

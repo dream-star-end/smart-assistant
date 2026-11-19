@@ -416,6 +416,9 @@ export function messageSignature(
         m._inputRevision ?? 0,
         m.inputPreview ? m.inputPreview.length : 0,
         bashTailSig(m.bashTail),
+        m._swarmSnapshot
+          ? `${m._swarmSnapshot.swarmId}:${m._swarmSnapshot.revision}:${m._swarmSnapshot.phase}:${m._swarmSnapshot.totalPosts}`
+          : "",
       ].join("|");
     case "plan":
       return [

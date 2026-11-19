@@ -82,8 +82,10 @@ const METADATA_METHODS = new Set([
   'writeTrajectoryAcls',
 ])
 const MAX_GENERATE_BODY = 32 * 1024 * 1024
-/** Title + agent call run together; subagents may add a couple more. */
-export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 4
+/** Title + agent call run together; Antigravity native swarm workers can run
+ * multiple parallel turns on the same route (each still strictly reserved
+ * against route.budgetCredits atomically below). */
+export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 12
 /** Output tokens assumed for an in-flight reservation (input comes from the body size). */
 const RESERVED_OUTPUT_TOKENS = 2048
 const MAX_METADATA_BODY = 1024 * 1024

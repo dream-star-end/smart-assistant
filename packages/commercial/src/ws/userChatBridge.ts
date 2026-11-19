@@ -420,13 +420,14 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "modelSwitchConsent", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "modelSwitchConsent", "effortLevel", "teamMode", "swarmMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
   if (execution.modelSwitchConsent !== undefined && (typeof execution.modelSwitchConsent !== 'string' || execution.modelSwitchConsent.length>4096)) return null;
   if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
   if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
+  if (execution.swarmMode !== undefined && typeof execution.swarmMode !== "boolean") return null;
   if (
     execution.collabMode !== undefined &&
     execution.collabMode !== "solo" &&
@@ -8558,6 +8559,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
             ...(execution.serviceTier !== undefined ? { serviceTier: execution.serviceTier } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
+            ...(execution.swarmMode !== undefined ? { swarmMode: execution.swarmMode } : {}),
             ...(execution.collabMode !== undefined ? { collabMode: execution.collabMode } : {}),
             ...(execution.advisorModel !== undefined ? { advisorModel: execution.advisorModel } : {}),
             ...(execution.collabConfigVersion !== undefined

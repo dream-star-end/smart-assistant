@@ -13,9 +13,12 @@
 import { createContext, useContext } from "react";
 import type { ChatMessage, ChildBlock } from "../../lib/chat/model";
 import { ToolCard } from "../ToolCard";
+import { useToolCardActions } from "../tool/context";
 import type { DisplayTokenUsage } from "./tokenUsage";
 import { reopenPermissionUi } from "../../lib/chat/permissionPopupCoordinator";
 import { Button } from "../ui";
+import { SwarmInlineCard } from "./lazyTimelineCards";
+import { extractSwarmSnapshotFromMessage } from "./swarmDetect";
 
 export const PermissionToolReopenContext = createContext<{
   requestIdByToolUseId: Map<string, string>;
@@ -29,6 +32,18 @@ export type ToolCardProps = {
 
 export function ToolCardSlot({ message, tokenUsage }: ToolCardProps) {
   const reopen = useContext(PermissionToolReopenContext);
+  const toolActions = useToolCardActions();
+  const swarmSnap = extractSwarmSnapshotFromMessage(message as ChatMessage);
+  if (swarmSnap) {
+    return (
+      <SwarmInlineCard
+        snapshot={swarmSnap}
+        cardId={(message as ChatMessage).id}
+        blockId={(message as ChatMessage).blockId}
+        onOpenBoard={toolActions.onOpenSwarmBoard}
+      />
+    );
+  }
   const toolUseId =
     (message as ChatMessage).toolUseId ??
     (message as ChatMessage).blockId ??

@@ -4,6 +4,7 @@ import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import {
   ArrowUp,
+  Hexagon,
   ListPlus,
   Loader2,
   Mic,
@@ -203,6 +204,9 @@ export function Composer({
   goalOpenRequest,
   projectSlot,
   prediction, onQuickAskCommand,
+  swarmSupported = false,
+  swarmMode = false,
+  onToggleSwarmMode,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => unknown;
@@ -253,6 +257,10 @@ export function Composer({
    *  省略或 null = 关闭(设置里关掉、demo)。onQuickAskCommand 拦截 `/btw`、`/ask` 到同屏快问小窗。 */
   prediction?: InputPrediction | null;
   onQuickAskCommand?: (question: string) => void;
+  /** Antigravity native swarm mode pill (only visible when an Antigravity model is selected). */
+  swarmSupported?: boolean;
+  swarmMode?: boolean;
+  onToggleSwarmMode?: () => void;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -1069,6 +1077,41 @@ export function Composer({
               <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
                 <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
               </span>
+            )}
+            {swarmSupported && onToggleSwarmMode && (
+              <button
+                type="button"
+                data-testid="composer-swarm-toggle"
+                data-product-control
+                aria-pressed={swarmMode}
+                disabled={disabled}
+                onClick={onToggleSwarmMode}
+                title={
+                  swarmMode
+                    ? "已开启 Antigravity 蜂群模式：多智能体并行协作与实时讨论板（各成员请求按当前模型路由实际用量计费）。点击关闭"
+                    : "开启 Antigravity 蜂群模式：多智能体并行拆解与互审（也可直接输入 /swarm）"
+                }
+                className={cn(
+                  "inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition-all duration-150",
+                  "outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
+                  swarmMode
+                    ? "border-accent/40 bg-accent-soft text-accent shadow-soft hover:bg-accent/15"
+                    : "border-border bg-surface/80 text-muted hover:border-border-strong hover:bg-hover hover:text-fg",
+                )}
+              >
+                <Hexagon
+                  size={13}
+                  strokeWidth={2.2}
+                  className={cn("shrink-0", swarmMode && "text-accent")}
+                />
+                <span>蜂群</span>
+                {swarmMode && (
+                  <span
+                    aria-hidden
+                    className="size-1.5 rounded-full bg-accent animate-pulse"
+                  />
+                )}
+              </button>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
               {/* 「正在停止…」占位符已由 App 传入 placeholder 承载,角落再写一遍是冗余(C-17);
