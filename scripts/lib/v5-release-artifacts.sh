@@ -15,11 +15,16 @@ release_artifact_digest() { # <absolute-release-root>
   # byte fields cover arbitrary path/symlink bytes without TSV ambiguity; file,
   # directory and symlink type/mode/uid/gid are all bound. Root .complete alone
   # is excluded to avoid self-reference.
+  # OCV5-808 (aligned with selfhost OCV5-775): keep openclaude-release-artifact-v2\0
+  # byte-for-byte output and before/after snapshot+fstat checks identical, while
+  # overlapping VFS reads with GIL-free 2MiB batched SHA256_Update via a bounded queue.
   python3 - "$root" <<'PY'
 import hashlib
 import os
+import queue
 import stat
 import sys
+import threading
 
 root = os.fsencode(os.path.abspath(sys.argv[1]))
 if not os.path.isdir(root) or os.path.islink(root):
@@ -54,51 +59,125 @@ def snapshot_tree():
     rows.sort(key=lambda item: item[0])
     return identity(root_stat), rows
 
-root_before, entries = snapshot_tree()
-digest = hashlib.sha256(b"openclaude-release-artifact-v2\0")
-
-def field(value):
+def append_field(buf, value):
     if isinstance(value, str):
         value = value.encode("ascii")
-    digest.update(len(value).to_bytes(8, "big"))
-    digest.update(value)
+    buf += len(value).to_bytes(8, "big")
+    buf += value
+
+root_before, entries = snapshot_tree()
+digest = hashlib.sha256(b"openclaude-release-artifact-v2\0")
 
 root_stat = os.lstat(root)
 if identity(root_stat) != root_before:
     raise RuntimeError("release artifact root changed before digest")
-field(b"D")
-field(b"")
-field(str(stat.S_IMODE(root_stat.st_mode)))
-field(str(root_stat.st_uid))
-field(str(root_stat.st_gid))
+hdr = bytearray()
+append_field(hdr, b"D")
+append_field(hdr, b"")
+append_field(hdr, str(stat.S_IMODE(root_stat.st_mode)))
+append_field(hdr, str(root_stat.st_uid))
+append_field(hdr, str(root_stat.st_gid))
+digest.update(hdr)
 
-for rel, absolute, before in entries:
-    st = os.lstat(absolute)
-    if identity(st) != before:
-        raise RuntimeError(f"release entry changed during digest: {os.fsdecode(rel)!r}")
-    mode = st.st_mode
-    kind = b"F" if stat.S_ISREG(mode) else b"D" if stat.S_ISDIR(mode) else b"L"
-    field(kind)
-    field(rel)
-    field(str(stat.S_IMODE(mode)))
-    field(str(st.st_uid))
-    field(str(st.st_gid))
-    if kind == b"F":
-        field(str(st.st_size))
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(absolute, flags)
-        if identity(os.fstat(fd)) != before:
-            os.close(fd)
-            raise RuntimeError(f"release file changed before open: {os.fsdecode(rel)!r}")
-        with os.fdopen(fd, "rb", buffering=1024 * 1024) as fh:
-            while chunk := fh.read(1024 * 1024):
-                digest.update(chunk)
-            if identity(os.fstat(fh.fileno())) != before:
-                raise RuntimeError(f"release file changed while open: {os.fsdecode(rel)!r}")
-    elif kind == b"L":
-        field(os.readlink(absolute))
-    if identity(os.lstat(absolute)) != before:
-        raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+q = queue.Queue(maxsize=16)
+stop_ev = threading.Event()
+O_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+BATCH_BYTES = 2 * 1024 * 1024
+
+def put_q(item):
+    while not stop_ev.is_set():
+        try:
+            q.put(item, timeout=0.2)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+def reader():
+    try:
+        buf = bytearray()
+        for rel, absolute, before in entries:
+            if stop_ev.is_set():
+                return
+            st = os.lstat(absolute)
+            if identity(st) != before:
+                raise RuntimeError(f"release entry changed during digest: {os.fsdecode(rel)!r}")
+            mode = st.st_mode
+            mode_s = str(stat.S_IMODE(mode))
+            uid_s = str(st.st_uid)
+            gid_s = str(st.st_gid)
+            if stat.S_ISREG(mode):
+                append_field(buf, b"F")
+                append_field(buf, rel)
+                append_field(buf, mode_s)
+                append_field(buf, uid_s)
+                append_field(buf, gid_s)
+                append_field(buf, str(st.st_size))
+                fd = os.open(absolute, O_FLAGS)
+                closed = False
+                try:
+                    if identity(os.fstat(fd)) != before:
+                        raise RuntimeError(f"release file changed before open: {os.fsdecode(rel)!r}")
+                    while chunk := os.read(fd, 1048576):
+                        buf += chunk
+                        if len(buf) >= BATCH_BYTES:
+                            if not put_q(("DATA", buf)):
+                                return
+                            buf = bytearray()
+                    if identity(os.fstat(fd)) != before:
+                        raise RuntimeError(f"release file changed while open: {os.fsdecode(rel)!r}")
+                    os.close(fd)
+                    closed = True
+                    if identity(os.lstat(absolute)) != before:
+                        raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+                finally:
+                    if not closed:
+                        os.close(fd)
+            elif stat.S_ISDIR(mode):
+                append_field(buf, b"D")
+                append_field(buf, rel)
+                append_field(buf, mode_s)
+                append_field(buf, uid_s)
+                append_field(buf, gid_s)
+                if identity(os.lstat(absolute)) != before:
+                    raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+            elif stat.S_ISLNK(mode):
+                target = os.readlink(absolute)
+                if identity(os.lstat(absolute)) != before:
+                    raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+                append_field(buf, b"L")
+                append_field(buf, rel)
+                append_field(buf, mode_s)
+                append_field(buf, uid_s)
+                append_field(buf, gid_s)
+                append_field(buf, target)
+            else:
+                raise RuntimeError(f"non-regular release entry: {os.fsdecode(rel)!r}")
+            if len(buf) >= BATCH_BYTES:
+                if not put_q(("DATA", buf)):
+                    return
+                buf = bytearray()
+        if buf and not put_q(("DATA", buf)):
+            return
+        put_q(("DONE",))
+    except BaseException as exc:
+        put_q(("ERR", exc))
+
+worker = threading.Thread(target=reader, daemon=True)
+worker.start()
+try:
+    while True:
+        msg = q.get()
+        tag = msg[0]
+        if tag == "DATA":
+            digest.update(msg[1])
+        elif tag == "DONE":
+            break
+        elif tag == "ERR":
+            raise msg[1]
+finally:
+    stop_ev.set()
+    worker.join(timeout=5)
 
 # A per-entry check alone misses a new/deleted path after the directory was
 # scanned or after that directory's own hash step. Re-snapshot the entire tree

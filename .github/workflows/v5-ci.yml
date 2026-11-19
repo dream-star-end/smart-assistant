@@ -95,7 +95,11 @@ jobs:
     timeout-minutes: 2
     steps:
       - name: First-wave scheduling gate
-        run: echo 'first-wave jobs may claim runners'
+        # Give container-backed first-wave required jobs (commercial-unit, v5-ops) a short
+        # head start to claim runner slots before second-wave commercial-integ shards fan out.
+        run: |
+          echo 'first-wave jobs claiming runners'
+          sleep 15
 
   suite:
     name: ${{ matrix.name }}
