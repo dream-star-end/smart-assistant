@@ -10,7 +10,7 @@ async function through(chunks: Buffer[], stream: ReturnType<typeof codexRequestT
 }
 
 test('request context observation preserves bytes and logs only fixed numeric summaries', async () => {
-  const source = Buffer.from(JSON.stringify({ instructions: 'PRIVATE_SYSTEM', tools: [{ name: 'PRIVATE_TOOL' }],
+  const source = Buffer.from(JSON.stringify({ instructions: 'PRIVATE_SYSTEM', service_tier: 'ultrafast', tools: [{ name: 'PRIVATE_TOOL' }],
     input: [{ role: 'developer', content: 'PRIVATE_SKILL' }, { role: 'user', content: 'PRIVATE_USER' }] }))
   const events: TimingFields[] = []
   const result = await through([source.subarray(0, 7), source.subarray(7)], codexRequestTiming(e => events.push(e)))
@@ -18,6 +18,7 @@ test('request context observation preserves bytes and logs only fixed numeric su
   assert.equal(events.length, 1)
   assert.equal(events[0].stage, 'request_context')
   assert.equal(events[0].toolCount, 1)
+  assert.equal(events[0].requestedServiceTier, 'ultrafast')
   assert.ok(Number(events[0].developerTokensEstimate) > 0)
   assert.ok(Number(events[0].userTokensEstimate) > 0)
   assert.doesNotMatch(JSON.stringify(events), /PRIVATE_/)
@@ -35,7 +36,7 @@ test('oversize request and malformed JSON never truncate transport or expose con
 
 test('SSE split at every byte preserves UTF8/CRLF and separates body, reasoning, text, usage', async () => {
   const event = (data: unknown) => `data: ${JSON.stringify(data)}\r\n\r\n`
-  const source = Buffer.from(`: keepalive\r\n\r\n${event({type:'response.created'})}${event({type:'response.output_text.delta',delta:'  '})}${event({type:'response.reasoning_summary_text.delta',delta:'PRIVATE_THINKING'})}${event({type:'response.output_text.delta',delta:'你好PRIVATE_TEXT'})}${event({type:'response.output_text.delta',delta:'more'})}${event({type:'response.completed',response:{usage:{input_tokens:17000,output_tokens:22,
+  const source = Buffer.from(`: keepalive\r\n\r\n${event({type:'response.created'})}${event({type:'response.output_text.delta',delta:'  '})}${event({type:'response.reasoning_summary_text.delta',delta:'PRIVATE_THINKING'})}${event({type:'response.output_text.delta',delta:'你好PRIVATE_TEXT'})}${event({type:'response.output_text.delta',delta:'more'})}${event({type:'response.completed',response:{service_tier:'ultrafast',usage:{input_tokens:17000,output_tokens:22,
       input_tokens_details:{cached_tokens:15000}, output_tokens_details:{reasoning_tokens:12},
       secret:'PRIVATE_USAGE',attribution:{request_fields:{instructions:{input_tokens:9000}}}}}})}`)
   const events: TimingFields[] = []
@@ -49,6 +50,7 @@ test('SSE split at every byte preserves UTF8/CRLF and separates body, reasoning,
   assert.equal(events[3].inputTokens, 17000)
   assert.equal(events[3].cachedInputTokens, 15000)
   assert.equal(events[3].instructionsTokens, 9000)
+  assert.equal(events[3].responseServiceTier, 'ultrafast')
   assert.doesNotMatch(JSON.stringify(events), /PRIVATE/)
 })
 
@@ -64,4 +66,19 @@ test('oversize SSE event skips observation, resumes next event, and leaves strea
 test('observer failure cannot fail a successful model stream', async () => {
   const source = Buffer.from('data: {"type":"response.output_text.delta","delta":"ok"}\n\n')
   assert.deepEqual(await through([source], codexResponseTiming(() => { throw new Error('logger unavailable') })), source)
+})
+
+test('allowlisted service_tier observation strips non-allowlisted strings without altering bytes', async () => {
+  const source = Buffer.from(JSON.stringify({ service_tier: 'PRIVATE_TIER_LEAK', input: [] }))
+  const events: TimingFields[] = []
+  assert.deepEqual(await through([source], codexRequestTiming(e => events.push(e))), source)
+  assert.equal(events[0].requestedServiceTier, null)
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE/)
+
+  const sse = Buffer.from('data: {"type":"response.completed","response":{"service_tier":"PRIVATE_RESP","usage":{"input_tokens":1,"output_tokens":1}}}\n\n')
+  const respEvents: TimingFields[] = []
+  assert.deepEqual(await through([sse], codexResponseTiming(e => respEvents.push(e))), sse)
+  const usageEv = respEvents.find(e => e.stage === 'usage')
+  assert.equal(usageEv?.responseServiceTier, null)
+  assert.doesNotMatch(JSON.stringify(respEvents), /PRIVATE/)
 })

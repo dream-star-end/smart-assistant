@@ -1,4 +1,13 @@
-import { ArrowLeft, ExternalLink, Globe, Lock, PauseCircle, Pencil } from "lucide-react";
+import {
+  ArrowLeft,
+  ExternalLink,
+  Globe,
+  Lock,
+  Monitor,
+  PauseCircle,
+  Pencil,
+  Users,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { apiErrorMessage } from "../../lib/api";
 import { type SiteEnvVarItem, sitesApi } from "../../lib/sitesApi";
@@ -7,10 +16,12 @@ import { cn } from "../../lib/utils";
 import { Alert, Button, Skeleton } from "../ui";
 import { SiteAnalyticsTab } from "./SiteAnalyticsTab";
 import { SiteDatabaseTab } from "./SiteDatabaseTab";
+import { SiteLiveEditModal } from "./SiteLiveEditModal";
 import { SitePreviewThumb } from "./SitePreviewThumb";
 import { SiteSettingsTab } from "./SiteSettingsTab";
+import { SiteShareTab, roleLabel } from "./SiteShareTab";
 
-export type SiteDetailTab = "settings" | "analytics" | "database";
+export type SiteDetailTab = "settings" | "share" | "analytics" | "database";
 
 export function SiteDetailView({
   auth,
@@ -19,9 +30,11 @@ export function SiteDetailView({
   baseDomain,
   onBack,
   onEditSite,
+  onApplyLiveEdit,
   onSiteUpdated,
   onSiteRenamed,
   onSiteDeleted,
+  onLeftSite,
 }: {
   auth: AuthSession;
   slug: string;
@@ -29,17 +42,21 @@ export function SiteDetailView({
   baseDomain: string;
   onBack: () => void;
   onEditSite: (site: UserSiteItem) => void;
+  onApplyLiveEdit?: (site: UserSiteItem, prompt: string) => void;
   onSiteUpdated: (site: UserSiteItem) => void;
   onSiteRenamed: (oldSlug: string, updated: UserSiteItem) => void;
   onSiteDeleted: (slug: string) => void;
+  onLeftSite?: (slug: string) => void;
 }) {
   const [tab, setTab] = useState<SiteDetailTab>("settings");
   const [site, setSite] = useState<UserSiteItem | null>(initialSite);
   const [envVars, setEnvVars] = useState<SiteEnvVarItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [liveEditOpen, setLiveEditOpen] = useState(false);
 
   useEffect(() => {
+    setLiveEditOpen(false);
     if (initialSite && initialSite.slug === slug) {
       setSite((cur) => cur ?? initialSite);
     } else {
@@ -79,6 +96,8 @@ export function SiteDetailView({
     : (site?.url ?? `https://${slug}.${baseDomain}`);
   const detailReady = Boolean(site && site.slug === slug);
   const mutationsDisabled = !detailReady || loading;
+  const accessRole = site?.accessRole ?? "owner";
+  const canEdit = accessRole === "owner" || accessRole === "editor";
 
   return (
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-8 sm:py-8">
@@ -94,7 +113,7 @@ export function SiteDetailView({
         </Button>
 
         {site && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <a
               href={visitHref}
               target="_blank"
@@ -104,15 +123,29 @@ export function SiteDetailView({
               <ExternalLink size={14} aria-hidden="true" />
               访问
             </a>
-            <Button
-              variant="secondary"
-              size="sm"
-              className="rounded-full"
-              onClick={() => onEditSite(site)}
-            >
-              <Pencil size={14} aria-hidden="true" />
-              编辑
-            </Button>
+            {canEdit && (
+              <>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="rounded-full"
+                  disabled={!detailReady}
+                  onClick={() => setLiveEditOpen(true)}
+                >
+                  <Monitor size={14} aria-hidden="true" />
+                  实时编辑
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="rounded-full"
+                  onClick={() => onEditSite(site)}
+                >
+                  <Pencil size={14} aria-hidden="true" />
+                  编辑
+                </Button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -147,8 +180,14 @@ export function SiteDetailView({
                     全栈 API
                   </span>
                 )}
+                {accessRole !== "owner" && (
+                  <span className="inline-flex items-center gap-1 rounded-full border border-info/30 bg-info-soft px-2.5 py-0.5 text-caption font-medium text-info">
+                    <Users size={12} aria-hidden="true" />
+                    共享 · {roleLabel(accessRole)}
+                  </span>
+                )}
               </div>
-              <p className="flex items-center gap-1.5 truncate text-body text-muted">
+              <p className="flex flex-wrap items-center gap-1.5 truncate text-body text-muted">
                 {site.visibility === "public" ? (
                   <Globe size={14} aria-hidden="true" />
                 ) : site.visibility === "password" ? (
@@ -157,14 +196,18 @@ export function SiteDetailView({
                   <PauseCircle size={14} aria-hidden="true" />
                 )}
                 <span className="truncate">{activeHost}</span>
+                {accessRole !== "owner" && site.ownerEmail && (
+                  <span className="text-caption text-faint">· 所有者 {site.ownerEmail}</span>
+                )}
               </p>
             </div>
           </div>
 
-          <div role="tablist" aria-label="站点详情标签页" className="flex items-center gap-2">
+          <div role="tablist" aria-label="站点详情标签页" className="flex flex-wrap items-center gap-2">
             {(
               [
                 { id: "settings", label: "设置" },
+                { id: "share", label: "共享" },
                 { id: "analytics", label: "分析" },
                 { id: "database", label: "数据库" },
               ] as const
@@ -211,8 +254,41 @@ export function SiteDetailView({
               onSiteDeleted={onSiteDeleted}
             />
           )}
+          {tab === "share" && (
+            <SiteShareTab
+              auth={auth}
+              site={site}
+              readOnly={mutationsDisabled}
+              onCollaboratorCountChange={(count) => {
+                if (!site || site.collaboratorCount === count) return;
+                const next = { ...site, collaboratorCount: count };
+                setSite(next);
+                onSiteUpdated(next);
+              }}
+              onLeftSite={(leftSlug) => {
+                onLeftSite?.(leftSlug);
+              }}
+            />
+          )}
           {tab === "analytics" && <SiteAnalyticsTab auth={auth} slug={site.slug} />}
           {tab === "database" && <SiteDatabaseTab auth={auth} slug={site.slug} />}
+
+          {liveEditOpen && canEdit && (
+            <SiteLiveEditModal
+              open
+              site={site}
+              auth={auth}
+              onClose={() => setLiveEditOpen(false)}
+              onApplyPrompt={(prompt) => {
+                setLiveEditOpen(false);
+                if (onApplyLiveEdit) {
+                  onApplyLiveEdit(site, prompt);
+                } else {
+                  onEditSite(site);
+                }
+              }}
+            />
+          )}
         </>
       ) : null}
     </div>

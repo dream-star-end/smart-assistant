@@ -1008,6 +1008,119 @@ describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTie
     }
   })
 
+  it('顶栏触发按钮与速度菜单联动展示 Fast/Ultrafast 标签及叠加倍率，切到不支持模型或团队模式立即回落', async () => {
+    const pricedModels: PublicModel[] = [
+      { id: 'gpt-6.2-sol', display_name: 'GPT-6.2 Sol', cost_x: 0.5 },
+      { id: 'gpt-6.2-sol-1m', display_name: 'GPT-6.2 Sol 1M', cost_x: 0.8 },
+      { id: 'gpt-6.2-astra', display_name: 'GPT-6.2 Astra', cost_x: 4.1 },
+      { id: 'opencode-gpt-6-luna', display_name: 'GPT-6 Luna (OpenCode)' },
+    ]
+    const view = render(
+      <ModelSelector
+        models={pricedModels}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+        serviceTier="ultrafast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    let trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(screen.getByTestId('model-trigger-tier').textContent).toContain('高 · Ultrafast')
+    expect(trigger.textContent).toContain('x3.0')
+
+    openMenu(trigger)
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-gpt-fast="false"]')?.textContent).toContain('x0.5')
+    expect(document.querySelector('[data-gpt-fast="true"]')?.textContent).toContain('x1.0')
+    expect(document.querySelector('[data-gpt-ultrafast="true"]')?.textContent).toContain('x3.0')
+
+    view.rerender(
+      <ModelSelector
+        models={pricedModels}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+        serviceTier="fast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-tier').textContent).toContain('高 · Fast')
+    expect(trigger.textContent).toContain('x1.0')
+
+    view.rerender(
+      <ModelSelector
+        models={pricedModels}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high']}
+        effortActive="high"
+        onSelectEffort={() => {}}
+        serviceTier={null}
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-tier').textContent).toContain('高')
+    expect(screen.getByTestId('model-trigger-tier').textContent).not.toContain('Fast')
+    expect(trigger.textContent).toContain('x0.5')
+
+    view.rerender(
+      <ModelSelector
+        models={pricedModels}
+        selectedId="gpt-6.2-sol-1m"
+        onSelect={() => {}}
+        serviceTier="ultrafast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-tier').textContent).toContain('Ultrafast')
+    expect(trigger.textContent).toContain('x4.8')
+
+    view.rerender(
+      <ModelSelector
+        models={pricedModels}
+        selectedId="gpt-6.2-astra"
+        onSelect={() => {}}
+        serviceTier="ultrafast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('model-trigger-tier')).toBeNull()
+    expect(trigger.textContent).toContain('x4.1')
+
+    view.rerender(
+      <ModelSelector
+        models={pricedModels}
+        selectedId="gpt-6.2-sol"
+        onSelect={() => {}}
+        teamEngineActive={true}
+        teamLeaderModelId="gpt-6.2-astra"
+        serviceTier="ultrafast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(screen.queryByTestId('model-trigger-tier')).toBeNull()
+    expect(trigger.textContent).toContain('x4.1')
+    expect(trigger.textContent).not.toContain('Ultrafast')
+
+    view.rerender(
+      <ModelSelector
+        models={pricedModels}
+        selectedId="opencode-gpt-6-luna"
+        onSelect={() => {}}
+        serviceTier="fast"
+        onSelectServiceTier={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-tier').textContent).toContain('Fast')
+    expect(trigger.textContent).not.toMatch(/x\d/)
+  })
+
   it('Remote Codex 与非加速模型不渲染速度段', async () => {
     for (const id of ['gpt-6-luna-remote', 'opencode-grok-4.7', 'glm-5.2']) {
       cleanup()

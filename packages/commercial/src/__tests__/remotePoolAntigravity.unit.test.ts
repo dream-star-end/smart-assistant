@@ -49,7 +49,9 @@ test('resolveProbedUpstreamModel maps antigravity slugs, efforts, and orchestrat
     'gemini-4-carbon',
     'gemini-4-carbon-medium',
     'gemini-4-hydrogen-high',
+    'gemini-4-neon-high',
     'gemini-pro-orchestrator',
+    'gemini-pro-orchestrator-neon',
     'claude-opus-5-5',
     'claude-sonnet-5-5-medium',
   ])
@@ -63,8 +65,16 @@ test('resolveProbedUpstreamModel maps antigravity slugs, efforts, and orchestrat
     'gemini-4-hydrogen-high',
   )
   assert.equal(
+    resolveProbedUpstreamModel('antigravity', 'antigravity-gemini-4-neon-remote', snap),
+    'gemini-4-neon-high',
+  )
+  assert.equal(
     resolveProbedUpstreamModel('antigravity', 'antigravity-orchestrator-carbon-remote', snap),
     'gemini-pro-orchestrator',
+  )
+  assert.equal(
+    resolveProbedUpstreamModel('antigravity', 'antigravity-orchestrator-neon-remote', snap),
+    'gemini-pro-orchestrator-neon',
   )
   assert.equal(
     resolveProbedUpstreamModel('antigravity', 'antigravity-claude-opus-5.5-remote', snap),
@@ -83,8 +93,16 @@ test('defaultRemoteCanonicalModelId normalizes antigravity remote slugs consiste
     'antigravity-gemini-4-carbon-remote',
   )
   assert.equal(
+    defaultRemoteCanonicalModelId('antigravity', 'gemini-4-neon-high'),
+    'antigravity-gemini-4-neon-remote',
+  )
+  assert.equal(
     defaultRemoteCanonicalModelId('antigravity', 'gemini-pro-orchestrator'),
     'antigravity-orchestrator-carbon-remote',
+  )
+  assert.equal(
+    defaultRemoteCanonicalModelId('antigravity', 'gemini-pro-orchestrator-neon'),
+    'antigravity-orchestrator-neon-remote',
   )
   assert.equal(
     defaultRemoteCanonicalModelId('antigravity', 'claude-opus-5-5'),

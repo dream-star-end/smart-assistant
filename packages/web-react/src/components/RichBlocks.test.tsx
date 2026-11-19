@@ -481,6 +481,64 @@ describe("OptionsBlock in a multi-question message (group mode)", () => {
     expect(sendUserText.mock.calls[0][0]).toContain("1. 选择区域:美区");
     expect(sendUserText.mock.calls[0][0]).toContain("2. 是否同步重启:立即重启");
   });
+
+  it("renders bare top-level option arrays (#a16e52ae object list & string list) as single-question cards", () => {
+    const sendUserText = vi.fn();
+    const bareObjArray = JSON.stringify([
+      { label: "不用改了，直接验收", description: "Ultrafast 已确认生效，维持当前线上版本" },
+      { label: "顺手优化顶栏显示与兜底", description: "补齐顶栏标签与动态倍率展示" },
+    ]);
+
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsGroupProvider>
+          <OptionsBlock code={bareObjArray} />
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>,
+    );
+
+    expect(document.querySelector("pre")).toBeNull();
+    expect(screen.getByText("Ultrafast 已确认生效，维持当前线上版本")).toBeTruthy();
+    expect(screen.queryByText("发送选择")).toBeNull();
+    fireEvent.click(screen.getByText("不用改了，直接验收"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:不用改了，直接验收");
+  });
+
+  it("supports bare string array, choices/title/detail/allowMultiple aliases, and falls back to <pre> on unrelated arrays", () => {
+    const sendUserText = vi.fn();
+    const bareStrings = JSON.stringify(["(推荐) 方案 A — 风险最低", "方案 B — 改动较大"]);
+    const aliasedObj = JSON.stringify({
+      header: "选部署策略",
+      allowMultiple: true,
+      choices: [
+        { title: "灰度", detail: "先验证 10%" },
+        { text: "全量", sublabel: "直接切换" },
+      ],
+    });
+    const unrelated = JSON.stringify([{ foo: 1 }, { bar: 2 }]);
+
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={bareStrings} />
+        <OptionsBlock code={aliasedObj} />
+        <OptionsBlock code={unrelated} />
+      </ChatInteractionContext.Provider>,
+    );
+
+    expect(screen.getByText("风险最低")).toBeTruthy();
+    expect(screen.getByText("选部署策略")).toBeTruthy();
+    expect(screen.getByText("先验证 10%")).toBeTruthy();
+    expect(screen.getByText("直接切换")).toBeTruthy();
+    expect(document.querySelector("pre")?.textContent).toContain('"foo":1');
+
+    fireEvent.click(screen.getByText("(推荐) 方案 A"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:(推荐) 方案 A");
+    fireEvent.click(screen.getByText("灰度"));
+    fireEvent.click(screen.getByText("全量"));
+    fireEvent.click(screen.getByText(/确认选择/));
+    expect(sendUserText).toHaveBeenLastCalledWith("我选择:灰度、全量");
+  });
 });
 
 describe("HtmlPreview 导出", () => {

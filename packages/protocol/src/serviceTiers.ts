@@ -139,6 +139,17 @@ export const OPENCODE_GO_FAST_BILLING_MULTIPLIER = '2.000'
 export const CODEX_FAST_BILLING_MULTIPLIER = '2.000'
 export const CODEX_ULTRAFAST_BILLING_MULTIPLIER = '6.000'
 
+/** Numeric billing multiplier for a model's active speed tier (1 = Standard, 2 = Fast, 6 = Ultrafast). */
+export function serviceTierBillingMultiplierNumber(
+  modelId: string | null | undefined,
+  tier: unknown,
+): number {
+  const normalized = normalizeServiceTierForModel(modelId, tier)
+  if (normalized === 'ultrafast') return 6
+  if (normalized === 'fast') return 2
+  return 1
+}
+
 /** Returns the speed-tier billing multiplier for a Codex turn, or null for Standard / non-Codex. */
 export function codexServiceTierBillingMultiplier(
   modelId: string | null | undefined,

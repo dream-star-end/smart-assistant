@@ -316,6 +316,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     publish: scriptProbe('oc-site.py', ['publish', '--help'], { code: 0, stdout: /--api/ }),
     list: scriptProbe('oc-site.py', ['list', '--help'], { code: 0, stdout: /usage: oc-site list/ }),
     info: scriptProbe('oc-site.py', ['info', '--help'], { code: 0, stdout: /slug/ }),
+    pull: scriptProbe('oc-site.py', ['pull', '--help'], { code: 0, stdout: /--force/ }),
     update: scriptProbe('oc-site.py', ['update', '--help'], { code: 0, stdout: /--custom-domain/ }),
     rename: scriptProbe('oc-site.py', ['rename', '--help'], { code: 0, stdout: /new_slug/ }),
     'verify-domain': scriptProbe('oc-site.py', ['verify-domain', '--help'], { code: 0, stdout: /slug/ }),

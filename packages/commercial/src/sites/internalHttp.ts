@@ -116,6 +116,30 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
         return
       }
 
+      if (method === 'GET' && sub === '/pull') {
+        const slug = url.searchParams.get('slug') ?? ''
+        const { site, gzippedBundle } = await deps.sites.pullSiteBundle(userId, slug)
+        const metaB64 = Buffer.from(
+          JSON.stringify({
+            siteId: site.id,
+            slug: site.slug,
+            title: site.title,
+            edgeRevision: site.edgeRevision,
+            contentSha256: site.contentSha256,
+            hasServerApi: site.hasServerApi,
+            accessRole: site.accessRole,
+          }),
+          'utf8',
+        ).toString('base64url')
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/x-oc-site-bundle')
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('x-oc-site-meta', metaB64)
+        res.setHeader('Content-Length', String(gzippedBundle.length))
+        res.end(gzippedBundle)
+        return
+      }
+
       if (method === 'POST' && sub === '/publish') {
         const meta = parseMetaHeader(req.headers['x-oc-site-meta'])
         const body = await readBoundedBuffer(req, deps.sites.maxSiteBytes + 4 * 1024 * 1024)
@@ -139,6 +163,51 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
             ? meta.originSessionId.trim().slice(0, 200)
             : null
 
+        let expectedSiteId: string | undefined
+        if (meta.expectedSiteId !== undefined && meta.expectedSiteId !== null) {
+          if (
+            typeof meta.expectedSiteId !== 'string' ||
+            meta.expectedSiteId.trim().length < 8 ||
+            meta.expectedSiteId.trim().length > 64
+          ) {
+            throw new SitesError('INVALID_INPUT', 'expectedSiteId 格式不合法', 400)
+          }
+          expectedSiteId = meta.expectedSiteId.trim()
+        }
+        let expectedBaseRevision: number | undefined
+        if (meta.expectedBaseRevision !== undefined && meta.expectedBaseRevision !== null) {
+          const parsedRev = Number(meta.expectedBaseRevision)
+          if (!Number.isSafeInteger(parsedRev) || parsedRev < 1) {
+            throw new SitesError('INVALID_INPUT', 'expectedBaseRevision 必须是正整数', 400)
+          }
+          expectedBaseRevision = parsedRev
+        }
+        let expectedBaseContentSha256: string | undefined
+        if (
+          meta.expectedBaseContentSha256 !== undefined &&
+          meta.expectedBaseContentSha256 !== null
+        ) {
+          if (
+            typeof meta.expectedBaseContentSha256 !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(meta.expectedBaseContentSha256)
+          ) {
+            throw new SitesError(
+              'INVALID_INPUT',
+              'expectedBaseContentSha256 必须是 64 位小写十六进制 SHA-256',
+              400,
+            )
+          }
+          expectedBaseContentSha256 = meta.expectedBaseContentSha256
+        }
+        if (
+          meta.forceOverwrite !== undefined &&
+          meta.forceOverwrite !== null &&
+          typeof meta.forceOverwrite !== 'boolean'
+        ) {
+          throw new SitesError('INVALID_INPUT', 'forceOverwrite 必须是布尔值', 400)
+        }
+        const forceOverwrite = meta.forceOverwrite === true
+
         const site = await deps.sites.publishSite(userId, {
           slug,
           title,
@@ -146,6 +215,10 @@ export function makeSitesInternalHandler(deps: SitesInternalDeps): SitesInternal
           password,
           spaMode,
           originSessionId,
+          ...(expectedSiteId !== undefined ? { expectedSiteId } : {}),
+          ...(expectedBaseRevision !== undefined ? { expectedBaseRevision } : {}),
+          ...(expectedBaseContentSha256 !== undefined ? { expectedBaseContentSha256 } : {}),
+          ...(forceOverwrite ? { forceOverwrite: true } : {}),
           gzippedBundle: body,
         })
         sendJson(res, 200, { site })

@@ -11,6 +11,7 @@ import {
   contextFamilyByModelId,
   cursorFamilySupportsContextTier,
   normalizeServiceTierForModel,
+  serviceTierBillingMultiplierNumber,
   supportedServiceTiers,
   cursorFamilySupportsFast,
 } from '@openclaude/protocol/browser'
@@ -179,8 +180,8 @@ export function modelLabel(m: PublicModel): string {
   return typeof dn === 'string' && dn.trim() ? dn : m.id
 }
 
-function CostMark({ model }: { model?: { cost_x?: number } }) {
-  const label = modelCostLabel(model)
+function CostMark({ model, multiplier = 1 }: { model?: { cost_x?: number }; multiplier?: number }) {
+  const label = modelCostLabel(model, multiplier)
   if (!label) return null
   return <span className="text-caption font-normal text-faint">{label}</span>
 }
@@ -315,8 +316,7 @@ export function ModelSelector({
   contextTier?: CursorContextTier | null
   onSelectContextTier?: (tier: CursorContextTier) => void
   /**
-   * OCV5-434 GPT Fast(OpenAI priority),会话级、默认关。只对 OpenCode Go Luna 显示(按 2× 计费);
-   * Codex 路线上游对本客户端不生效,按用户决定隐藏。
+   * OCV5-434 / OCV5-798 速度档位（Fast 2× / Ultrafast 6×），默认标准。
    */
   serviceTier?: ServiceTier | null
   onSelectServiceTier?: (tier: ServiceTier | null) => void
@@ -332,10 +332,16 @@ export function ModelSelector({
   const hasAlternatives = models.some((m) => !isDegraded(m) && m.id !== selectedId)
   const leaderModel = resolveTeamLeaderModel(models, teamLeaderModelId, lockedModels)
   const engineLabel = teamEngineLabel(models, teamLeaderModelId, lockedModels)
+  const availableServiceTiers = supportedServiceTiers(selectedId)
+  const showServiceTiers = availableServiceTiers.length > 0 && onSelectServiceTier != null
+  const effectiveServiceTier = normalizeServiceTierForModel(selectedId, serviceTier)
+  const triggerCostMultiplier = teamEngineActive
+    ? 1
+    : serviceTierBillingMultiplierNumber(selectedId, effectiveServiceTier)
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
-  // 思考档位是计费相关状态(同家族 medium/high 单价不同),此前只有点开菜单才知道(C-07):
-  // trigger 在 sm+ 追加「· 高」「· Fast」。Cursor 家族读 canonical id 上的档位,其它模型读会话偏好。
+  // 思考/速度档位是计费相关状态(同家族 medium/high 或 Fast/Ultrafast 倍率不同),此前只有点开菜单才知道(C-07):
+  // trigger 在 sm+ 追加「· 高」「· Fast」「· Ultrafast」。Cursor 家族读 canonical id 上的档位,其它模型读会话偏好。
   const tierLabel = (() => {
     if (teamEngineActive) return null
     const parts: string[] = []
@@ -349,6 +355,8 @@ export function ModelSelector({
         if (effort) parts.push(effort)
       }
       if (grokBuildFastSelected(selectedId)) parts.push('Fast')
+      else if (effectiveServiceTier === 'ultrafast') parts.push('Ultrafast')
+      else if (effectiveServiceTier === 'fast') parts.push('Fast')
     }
     return parts.length > 0 ? parts.join(' · ') : null
   })()
@@ -453,9 +461,6 @@ export function ModelSelector({
     cursorFamilySupportsContextTier(selectedCursor.family) &&
     onSelectContextTier != null
   const activeCursorContextTier: CursorContextTier = contextTier ?? DEFAULT_CURSOR_CONTEXT_TIER
-  const availableServiceTiers = supportedServiceTiers(selectedId)
-  const showServiceTiers = availableServiceTiers.length > 0 && onSelectServiceTier != null
-  const effectiveServiceTier = normalizeServiceTierForModel(selectedId, serviceTier)
   const showPlatformEffort =
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
@@ -852,7 +857,10 @@ export function ModelSelector({
               onSelect={() => onSelectServiceTier(null)}
               className="justify-between"
             >
-              <span>标准</span>
+              <span className="flex items-center gap-2">
+                <span>标准</span>
+                <CostMark model={selected} multiplier={1} />
+              </span>
               {effectiveServiceTier === null && <Check size={14} className="shrink-0 text-accent" />}
             </PickerItem>
             <PickerItem
@@ -862,7 +870,10 @@ export function ModelSelector({
               onSelect={() => onSelectServiceTier('fast')}
               className="justify-between"
             >
-              <span>Fast（更快，按 2× 计费）</span>
+              <span className="flex items-center gap-2">
+                <span>Fast（更快，按 2× 计费）</span>
+                <CostMark model={selected} multiplier={2} />
+              </span>
               {effectiveServiceTier === 'fast' && <Check size={14} className="shrink-0 text-accent" />}
             </PickerItem>
             {availableServiceTiers.includes('ultrafast') && (
@@ -873,7 +884,10 @@ export function ModelSelector({
                 onSelect={() => onSelectServiceTier('ultrafast')}
                 className="justify-between"
               >
-                <span>Ultrafast（超快，按 6× 计费）</span>
+                <span className="flex items-center gap-2">
+                  <span>Ultrafast（超快，按 6× 计费）</span>
+                  <CostMark model={selected} multiplier={6} />
+                </span>
                 {effectiveServiceTier === 'ultrafast' && (
                   <Check size={14} className="shrink-0 text-accent" />
                 )}
@@ -1080,7 +1094,7 @@ export function ModelSelector({
           </span>
         )
       )}
-      <CostMark model={teamEngineActive ? leaderModel : selected} />
+      <CostMark model={teamEngineActive ? leaderModel : selected} multiplier={triggerCostMultiplier} />
       {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
       {!teamEngineActive && <ChevronDown size={14} className="shrink-0 text-faint" />}
     </button>

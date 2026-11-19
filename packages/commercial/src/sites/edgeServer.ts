@@ -23,13 +23,21 @@ import {
   SITE_EDGE_PREFIX,
   SITE_EDGE_V2_PREFIX,
   SITE_EDGE_SIGNATURE_WINDOW_SEC,
+  SITE_MAX_FILES,
+  SITE_MAX_SINGLE_FILE_BYTES,
+  SITE_PREVIEW_COOKIE_NAME,
+  SITE_PREVIEW_TTL_SEC,
   SITE_SERVER_API_PATH,
+  type SitePreviewTokenPayload,
   type SiteVisibility,
   SitesError,
   decodeSiteBundle,
+  encodeSiteBundle,
+  signSitePreviewToken,
   validateSiteSlug,
   verifyEdgeHeaders,
   verifySitePassword,
+  verifySitePreviewToken,
 } from './types.js'
 import { EdgeAnalyticsStore } from './edgeAnalytics.js'
 import { runSiteApiWorker } from './edgeApiRunner.js'
@@ -61,6 +69,7 @@ interface StoredSiteMeta {
   customDomain?: string | null
   hasServerApi?: boolean
   envDigest?: string
+  previewAclVersion?: number
   fileCount: number
   sizeBytes: number
   contentSha256: string
@@ -310,6 +319,100 @@ function resolveCandidateFile(currentReal: string, relPath: string): string | nu
   return null
 }
 
+function stripPlatformCookies(rawCookieHeader: string): string {
+  const kept: string[] = []
+  for (const part of rawCookieHeader.split(';')) {
+    const eq = part.indexOf('=')
+    const name = (eq >= 0 ? part.slice(0, eq) : part).trim()
+    if (!name || name === SITE_AUTH_COOKIE_NAME || name === SITE_PREVIEW_COOKIE_NAME) {
+      continue
+    }
+    kept.push(part.trim())
+  }
+  return kept.join('; ')
+}
+
+function sitePreviewBridgeScript(parentOrigin: string): string {
+  return `(()=>{'use strict';const P=${JSON.stringify(parentOrigin)},S='oc-site-preview-v1';let rev=0;
+const post=(m)=>{try{parent.postMessage({source:S,...m},P)}catch{}};
+const text=(e)=>String((e&&((e.getAttribute&&e.getAttribute('aria-label'))||e.innerText||e.textContent))||'').trim().replace(/\\s+/g,' ').slice(0,160);
+const esc=(v)=>globalThis.CSS&&CSS.escape?CSS.escape(v):String(v).replace(/[^a-zA-Z0-9_-]/g,c=>'\\\\'+c);
+const selector=(e)=>{if(e.id)return '#'+esc(e.id);const a=['data-testid','data-test','name','aria-label'];for(const k of a){const v=e.getAttribute&&e.getAttribute(k);if(v)return e.tagName.toLowerCase()+'['+k+'="'+String(v).replace(/["\\\\]/g,'\\\\$&')+'"]'}let n=e,p=[];for(let d=0;n&&n.nodeType===1&&d<6;d++,n=n.parentElement){let q=n.tagName.toLowerCase();const par=n.parentElement;if(par){const same=[...par.children].filter(x=>x.tagName===n.tagName);if(same.length>1)q+=':nth-of-type('+(same.indexOf(n)+1)+')'}p.unshift(q)}return p.join(' > ')};
+const describe=(e)=>{if(!e||e===document.documentElement||e===document.body)return null;const r=e.getBoundingClientRect();return{selector:selector(e),tag:e.tagName.toLowerCase(),...(e.getAttribute('role')?{role:e.getAttribute('role')}:{}),...(e.getAttribute('aria-label')?{ariaLabel:e.getAttribute('aria-label')}:{}),...(text(e)?{text:text(e)}:{}),bounds:{x:r.x,y:r.y,width:r.width,height:r.height}}};
+const navigation=()=>post({type:'preview.navigation',url:location.href,title:document.title,pageRevision:++rev});
+for(const k of ['pushState','replaceState']){const f=history[k];history[k]=function(...a){const r=f.apply(this,a);queueMicrotask(navigation);return r}}
+addEventListener('popstate',navigation);addEventListener('hashchange',navigation);
+let rafScroll=0;const notifyScroll=()=>{if(rafScroll)return;rafScroll=requestAnimationFrame(()=>{rafScroll=0;post({type:'preview.scroll'})})};
+addEventListener('scroll',notifyScroll,{passive:true,capture:true});addEventListener('resize',notifyScroll,{passive:true});
+addEventListener('message',(e)=>{if(e.origin!==P||e.source!==parent)return;const w=e.data;if(!w||w.source!==S||!w.message||typeof w.message.type!=='string')return;const m=w.message;try{switch(m.type){case'preview.navigate':if(m.action==='back')history.back();else if(m.action==='forward')history.forward();else if(m.action==='reload')location.reload();break;case'preview.select':if(Number.isFinite(m.x)&&Number.isFinite(m.y))post({type:'preview.selection',target:describe(document.elementFromPoint(m.x,m.y))});break;case'preview.hover':if(Number.isFinite(m.x)&&Number.isFinite(m.y))post({type:'preview.hover',target:describe(document.elementFromPoint(m.x,m.y))});else post({type:'preview.hover',target:null});break;case'preview.resolve':if(typeof m.selector==='string'&&m.selector.length<=512){let el=null;try{el=document.querySelector(m.selector)}catch{}post({type:'preview.resolved',selector:m.selector,target:describe(el)})}break;case'preview.wheel':if(Number.isFinite(m.deltaX)&&Number.isFinite(m.deltaY))scrollBy({left:m.deltaX,top:m.deltaY,behavior:'auto'});break;case'preview.text':if(typeof m.text==='string'&&m.text.length<=2000){const el=document.activeElement;if(el&&('value'in el)){const v=String(el.value||''),s=Number.isInteger(el.selectionStart)?el.selectionStart:v.length,t=Number.isInteger(el.selectionEnd)?el.selectionEnd:s;el.value=v.slice(0,s)+m.text+v.slice(t);el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:m.text}))}else if(el&&el.isContentEditable){document.execCommand('insertText',false,m.text)}}break;}}catch{}});
+const ready=()=>post({type:'preview.ready',protocolVersion:1,url:location.href,title:document.title,viewport:{width:innerWidth,height:innerHeight,deviceScaleFactor:devicePixelRatio,isMobile:innerWidth<600}});
+if(document.readyState==='loading')addEventListener('DOMContentLoaded',ready,{once:true});else queueMicrotask(ready);
+})();`
+}
+
+function injectPreviewBridgeIntoHtml(html: string, bridgeSrc: string): string {
+  const tag = `<script src="${escapeHtml(bridgeSrc)}" defer></script>`
+  const bodyIdx = html.search(/<\/body\s*>/i)
+  if (bodyIdx >= 0) {
+    return html.slice(0, bodyIdx) + tag + html.slice(bodyIdx)
+  }
+  const headIdx = html.search(/<\/head\s*>/i)
+  if (headIdx >= 0) {
+    return html.slice(0, headIdx) + tag + html.slice(headIdx)
+  }
+  return `${html}\n${tag}`
+}
+
+function collectBundleFromRelease(
+  currentReal: string,
+  serverEntryReal: string | null,
+  maxTotalBytes: number,
+): Buffer {
+  const items: Array<{ path: string; content: Buffer }> = []
+  let totalBytes = 0
+
+  function walk(dir: string, relPrefix: string): void {
+    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+      a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+    )
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue
+      const full = join(dir, entry.name)
+      const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name
+      if (rel === '__oc_server' || rel.startsWith('__oc_server/')) continue
+      if (entry.isDirectory()) {
+        walk(full, rel)
+      } else if (entry.isFile()) {
+        const resolved = realpathSync(full)
+        if (resolved !== currentReal && !resolved.startsWith(currentReal + sep)) continue
+        const data = readFileSync(resolved)
+        if (data.length > SITE_MAX_SINGLE_FILE_BYTES) {
+          throw new SitesError('INVALID_BUNDLE', `单文件超过上限: ${rel}`, 413)
+        }
+        totalBytes += data.length
+        if (totalBytes > maxTotalBytes) {
+          throw new SitesError('INVALID_BUNDLE', '站点总大小超过上限', 413)
+        }
+        items.push({ path: rel, content: data })
+        if (items.length > SITE_MAX_FILES) {
+          throw new SitesError('INVALID_BUNDLE', '站点文件数量超过上限', 400)
+        }
+      }
+    }
+  }
+
+  walk(currentReal, '')
+  if (serverEntryReal && existsSync(serverEntryReal)) {
+    const serverBytes = readFileSync(serverEntryReal)
+    totalBytes += serverBytes.length
+    if (totalBytes > maxTotalBytes) {
+      throw new SitesError('INVALID_BUNDLE', '站点总大小超过上限', 413)
+    }
+    items.push({ path: SITE_SERVER_API_PATH, content: serverBytes })
+  }
+  return encodeSiteBundle(items, maxTotalBytes).gzipped
+}
+
 function serveStaticFile(
   req: IncomingMessage,
   res: ServerResponse,
@@ -317,6 +420,7 @@ function serveStaticFile(
   relHint: string,
   status = 200,
   visibility: SiteVisibility = 'public',
+  preview?: { parentOrigin: string } | null,
 ): void {
   const st = statSync(filePath)
   const etag = `"${st.size.toString(16)}-${Math.trunc(st.mtimeMs).toString(16)}"`
@@ -329,7 +433,22 @@ function serveStaticFile(
   if (!mime) {
     res.setHeader('Content-Disposition', 'attachment')
   }
-  if (visibility !== 'public') {
+  if (preview) {
+    res.setHeader('Content-Security-Policy', `frame-ancestors ${preview.parentOrigin}`)
+    res.setHeader('Referrer-Policy', 'no-referrer')
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Vary', 'Cookie')
+    if (ext === '.html' || ext === '.htm') {
+      const rawHtml = readFileSync(filePath, 'utf8')
+      const injected = injectPreviewBridgeIntoHtml(rawHtml, '/__oc_site_preview_bridge.js')
+      const buf = Buffer.from(injected, 'utf8')
+      res.statusCode = status
+      res.setHeader('Content-Length', String(buf.length))
+      res.end(req.method === 'HEAD' ? undefined : buf)
+      return
+    }
+  } else if (visibility !== 'public') {
     res.setHeader('Cache-Control', 'private, no-store')
     res.setHeader('Pragma', 'no-cache')
     res.setHeader('Vary', 'Cookie')
@@ -380,6 +499,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
 
   const slugLocks = new Map<string, Promise<void>>()
   const usedNonces = new Map<string, number>()
+  const usedPreviewNonces = new Map<string, number>()
   const unlockFailures = new Map<string, { count: number; inflight: number; resetAt: number }>()
   const customDomainMap = new Map<string, string>()
   const analytics = new EdgeAnalyticsStore(sitesDir, opts.secret)
@@ -442,6 +562,9 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     const nowMs = Date.now()
     for (const [k, exp] of usedNonces) {
       if (exp <= nowMs) usedNonces.delete(k)
+    }
+    for (const [k, exp] of usedPreviewNonces) {
+      if (exp <= nowMs) usedPreviewNonces.delete(k)
     }
     for (const [k, v] of unlockFailures) {
       if (v.resetAt <= nowMs && v.inflight <= 0) unlockFailures.delete(k)
@@ -648,11 +771,12 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     }
   }
 
-  function isSiteServable(
+  function resolveSiteFiles(
     slug: string,
+    allowDisabled: boolean,
   ): { meta: StoredSiteMeta; currentReal: string; serverEntryReal: string | null } | null {
     const { meta, tombstone, currentLink } = readMetaAndTombstone(slug)
-    if (!meta || meta.visibility === 'disabled') return null
+    if (!meta || (!allowDisabled && meta.visibility === 'disabled')) return null
     if (tombstone && tombstone.revision >= meta.revision) return null
     if (!existsSync(currentLink)) return null
     try {
@@ -671,6 +795,47 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     } catch {
       return null
     }
+  }
+
+  function isSiteServable(
+    slug: string,
+  ): { meta: StoredSiteMeta; currentReal: string; serverEntryReal: string | null } | null {
+    return resolveSiteFiles(slug, false)
+  }
+
+  function consumePreviewBootNonce(nonce: string, expSec: number): boolean {
+    const nowMs = Date.now()
+    const existing = usedPreviewNonces.get(nonce)
+    if (existing && existing > nowMs) return false
+    if (usedPreviewNonces.size >= MAX_NONCE_CACHE) {
+      for (const [k, exp] of usedPreviewNonces) {
+        if (exp <= nowMs || usedPreviewNonces.size >= MAX_NONCE_CACHE) usedPreviewNonces.delete(k)
+        if (usedPreviewNonces.size < MAX_NONCE_CACHE * 0.8) break
+      }
+    }
+    usedPreviewNonces.set(nonce, Math.max(nowMs + 120_000, (expSec + 60) * 1000))
+    return true
+  }
+
+  function resolvePreviewSession(
+    req: IncomingMessage,
+    slug: string,
+    meta: StoredSiteMeta,
+  ): SitePreviewTokenPayload | null {
+    const cookies = parseCookies(req.headers.cookie)
+    const token = cookies[SITE_PREVIEW_COOKIE_NAME]
+    if (!token) return null
+    const payload = verifySitePreviewToken({
+      secret: opts.secret,
+      token,
+      expectedSlug: slug,
+      expectedKind: 'sess',
+    })
+    if (!payload) return null
+    if (meta.siteId && payload.siteId !== meta.siteId) return null
+    const minAcl = meta.previewAclVersion ?? 1
+    if (payload.aclVersion < minAcl) return null
+    return payload
   }
 
   async function handleControlApi(
@@ -696,6 +861,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     }
 
     const putOrDeleteMatch = new RegExp(`^${activePrefix}/sites/([^/]+)$`).exec(pathname)
+    const bundleMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/bundle$`).exec(pathname)
     const patchMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/meta$`).exec(pathname)
     const envPutMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/env$`).exec(pathname)
     const renameMatch = new RegExp(`^${activePrefix}/sites/([^/]+)/rename$`).exec(pathname)
@@ -706,6 +872,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     try {
       rawSlug = decodeURIComponent(
         putOrDeleteMatch?.[1] ??
+          bundleMatch?.[1] ??
           patchMatch?.[1] ??
           envPutMatch?.[1] ??
           renameMatch?.[1] ??
@@ -781,6 +948,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
                   customDomain: curMeta.customDomain ?? null,
                   hasServerApi: Boolean(curMeta.hasServerApi),
                   envDigest: curMeta.envDigest ?? '',
+                  previewAclVersion: curMeta.previewAclVersion ?? 1,
                   fileCount: curMeta.fileCount,
                   sizeBytes: curMeta.sizeBytes,
                   contentSha256: curMeta.contentSha256,
@@ -789,6 +957,27 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             : {}),
         })
       })
+      return
+    }
+
+    if (method === 'GET' && bundleMatch) {
+      const gzipped = await withSlugLock(slug, async () => {
+        const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
+        if (!curMeta || (tombstone && tombstone.revision >= curMeta.revision)) {
+          throw new SitesError('SITE_NOT_FOUND', 'site missing on edge', 404)
+        }
+        assertIdentityMatches(curMeta, verified.meta?.siteId, verified.meta?.expectedBaseRevision)
+        const files = resolveSiteFiles(slug, true)
+        if (!files) {
+          throw new SitesError('SITE_NOT_FOUND', 'site release files missing on edge', 404)
+        }
+        return collectBundleFromRelease(files.currentReal, files.serverEntryReal, maxSiteBytes)
+      })
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'application/x-oc-site-bundle')
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader('Content-Length', String(gzipped.length))
+      res.end(gzipped)
       return
     }
 
@@ -1215,6 +1404,10 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             customDomain: nextDomain,
             hasServerApi: Boolean(serverFile),
             envDigest: existingEnvDigest,
+            previewAclVersion: Math.max(
+              curMeta?.previewAclVersion ?? 1,
+              envelope.previewAclVersion ?? 1,
+            ),
             fileCount: decoded.fileCount,
             sizeBytes: decoded.sizeBytes,
             contentSha256: decoded.contentSha256,
@@ -1293,7 +1486,9 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             (envelope.customDomain === undefined ||
               (curMeta.customDomain ?? null) === envelope.customDomain) &&
             (envelope.envDigest === undefined ||
-              (curMeta.envDigest ?? '') === envelope.envDigest)
+              (curMeta.envDigest ?? '') === envelope.envDigest) &&
+            (envelope.previewAclVersion === undefined ||
+              (curMeta.previewAclVersion ?? 1) >= envelope.previewAclVersion)
           ) {
             sendJsonResponse(res, 200, { ok: true, idempotent: true, revision: curMeta.revision })
             return
@@ -1341,6 +1536,10 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
             envelope.envDigest !== undefined
               ? envelope.envDigest
               : (curMeta.envDigest ?? ''),
+          previewAclVersion: Math.max(
+            curMeta.previewAclVersion ?? 1,
+            envelope.previewAclVersion ?? 1,
+          ),
           updatedAt: new Date().toISOString(),
         }
         writeFileAtomic(join(dir, 'meta.json'), JSON.stringify(nextMeta))
@@ -1429,7 +1628,92 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       return
     }
 
-    const active = isSiteServable(slug)
+    const method = req.method ?? 'GET'
+    const isHttps =
+      req.headers['x-forwarded-proto'] === 'https' ||
+      (req.socket as { encrypted?: boolean }).encrypted === true
+
+    if (method === 'GET' && url.pathname === '/__oc_site_preview_bootstrap') {
+      const rawCode = url.searchParams.get('code') ?? undefined
+      const previewFiles = resolveSiteFiles(slug, true)
+      const payload = previewFiles
+        ? verifySitePreviewToken({
+            secret: opts.secret,
+            token: rawCode,
+            expectedSlug: slug,
+            expectedKind: 'boot',
+          })
+        : null
+      const minAcl = previewFiles?.meta.previewAclVersion ?? 1
+      if (
+        !previewFiles ||
+        !payload ||
+        !payload.nonce ||
+        (previewFiles.meta.siteId && payload.siteId !== previewFiles.meta.siteId) ||
+        payload.aclVersion < minAcl ||
+        !consumePreviewBootNonce(payload.nonce, payload.expSec)
+      ) {
+        sendSiteHtml(res, 401, renderStatusHtml('预览授权无效', '预览令牌已失效或已使用，请回到站点页面重新打开实时编辑。'), true)
+        return
+      }
+      const sessExpSec = Math.floor(Date.now() / 1000) + SITE_PREVIEW_TTL_SEC
+      const sessionCookieToken = signSitePreviewToken({
+        secret: opts.secret,
+        kind: 'sess',
+        siteId: payload.siteId,
+        slug,
+        parentOrigin: payload.parentOrigin,
+        aclVersion: payload.aclVersion,
+        expSec: sessExpSec,
+      })
+      const cookieParts = [
+        `${SITE_PREVIEW_COOKIE_NAME}=${sessionCookieToken}`,
+        'Path=/',
+        'HttpOnly',
+        `Max-Age=${SITE_PREVIEW_TTL_SEC}`,
+      ]
+      if (isHttps) {
+        cookieParts.push('Secure', 'SameSite=None', 'Partitioned')
+      } else {
+        cookieParts.push('SameSite=Lax')
+      }
+      const targetPath = sanitizeRedirectTarget(url.searchParams.get('path'))
+      res.statusCode = 302
+      res.setHeader('Set-Cookie', cookieParts.join('; '))
+      res.setHeader('Location', targetPath)
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader('Referrer-Policy', 'no-referrer')
+      res.setHeader('Content-Security-Policy', `frame-ancestors ${payload.parentOrigin}`)
+      res.end()
+      return
+    }
+
+    if (method === 'GET' && url.pathname === '/__oc_site_preview_bridge.js') {
+      const previewFiles = resolveSiteFiles(slug, true)
+      const session = previewFiles ? resolvePreviewSession(req, slug, previewFiles.meta) : null
+      if (!session) {
+        res.statusCode = 404
+        res.setHeader('Cache-Control', 'no-store')
+        res.end('not found')
+        return
+      }
+      const script = Buffer.from(sitePreviewBridgeScript(session.parentOrigin), 'utf8')
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-store')
+      res.setHeader('Referrer-Policy', 'no-referrer')
+      res.setHeader('X-Content-Type-Options', 'nosniff')
+      res.setHeader('Content-Security-Policy', `frame-ancestors ${session.parentOrigin}`)
+      res.setHeader('Content-Length', String(script.length))
+      res.end(script)
+      return
+    }
+
+    const previewCandidate = resolveSiteFiles(slug, true)
+    const previewSession = previewCandidate
+      ? resolvePreviewSession(req, slug, previewCandidate.meta)
+      : null
+    const active = previewSession ? previewCandidate : isSiteServable(slug)
     if (!active) {
       sendSiteHtml(res, 404, renderStatusHtml('站点暂不可访问', '该站点尚未发布、已下线或已被删除。'))
       return
@@ -1438,13 +1722,9 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     const visitorIp = resolveClientIp(req)
     const userAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : ''
     const isApiRequest = url.pathname === '/api' || url.pathname.startsWith('/api/')
-    const method = req.method ?? 'GET'
-    const isHttps =
-      req.headers['x-forwarded-proto'] === 'https' ||
-      (req.socket as { encrypted?: boolean }).encrypted === true
 
-    const isProtected = meta.visibility !== 'public'
-    if (meta.visibility === 'password') {
+    const isProtected = meta.visibility !== 'public' || Boolean(previewSession)
+    if (meta.visibility === 'password' && !previewSession) {
       if (method === 'POST' && url.pathname === '/__oc_site_unlock') {
         const clientIp = resolveClientIp(req)
         const limitKey = `${clientIp}:${slug}`
@@ -1604,7 +1884,12 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         }
         const forwardHeaders: Record<string, string> = {}
         for (const [k, v] of Object.entries(req.headers)) {
-          if (k === 'cookie' || k === 'authorization') {
+          if (k === 'cookie') {
+            if (v !== undefined) {
+              const sanitized = stripPlatformCookies(Array.isArray(v) ? v.join('; ') : v)
+              if (sanitized) forwardHeaders[k] = sanitized
+            }
+          } else if (k === 'authorization') {
             if (v !== undefined) forwardHeaders[k] = Array.isArray(v) ? v.join('; ') : v
           } else if (typeof v === 'string' && k !== 'x-oc-sites-signature') {
             forwardHeaders[k] = v
@@ -1635,7 +1920,9 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       }
 
       if (res.writableEnded || res.destroyed) return
-      analytics.recordHit({ slug, clientIp: visitorIp, userAgent, isPageView: false })
+      if (!previewSession) {
+        analytics.recordHit({ slug, clientIp: visitorIp, userAgent, isPageView: false })
+      }
 
       const blockedOutHeaders = new Set([
         'set-cookie',
@@ -1695,16 +1982,20 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       return
     }
 
+    const previewCtx = previewSession ? { parentOrigin: previewSession.parentOrigin } : null
+
     const hit = resolveCandidateFile(currentReal, cleanRel)
     if (hit) {
       const ext = extname(hit).toLowerCase()
-      analytics.recordHit({
-        slug,
-        clientIp: visitorIp,
-        userAgent,
-        isPageView: method === 'GET' && (ext === '.html' || ext === '.htm'),
-      })
-      serveStaticFile(req, res, hit, cleanRel, 200, meta.visibility)
+      if (!previewSession) {
+        analytics.recordHit({
+          slug,
+          clientIp: visitorIp,
+          userAgent,
+          isPageView: method === 'GET' && (ext === '.html' || ext === '.htm'),
+        })
+      }
+      serveStaticFile(req, res, hit, cleanRel, 200, meta.visibility, previewCtx)
       return
     }
 
@@ -1713,21 +2004,25 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     if (meta.spaMode && looksLikeRoute) {
       const spaIndex = resolveCandidateFile(currentReal, '')
       if (spaIndex) {
-        analytics.recordHit({
-          slug,
-          clientIp: visitorIp,
-          userAgent,
-          isPageView: method === 'GET',
-        })
-        serveStaticFile(req, res, spaIndex, 'index.html', 200, meta.visibility)
+        if (!previewSession) {
+          analytics.recordHit({
+            slug,
+            clientIp: visitorIp,
+            userAgent,
+            isPageView: method === 'GET',
+          })
+        }
+        serveStaticFile(req, res, spaIndex, 'index.html', 200, meta.visibility, previewCtx)
         return
       }
     }
 
-    analytics.recordHit({ slug, clientIp: visitorIp, userAgent, isPageView: false })
+    if (!previewSession) {
+      analytics.recordHit({ slug, clientIp: visitorIp, userAgent, isPageView: false })
+    }
     const custom404 = resolveCandidateFile(currentReal, '404.html')
     if (custom404) {
-      serveStaticFile(req, res, custom404, '404.html', 404, meta.visibility)
+      serveStaticFile(req, res, custom404, '404.html', 404, meta.visibility, previewCtx)
       return
     }
     sendSiteHtml(

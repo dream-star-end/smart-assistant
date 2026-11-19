@@ -606,7 +606,9 @@ describe('Antigravity CLI engine model authority (OCV5-415)', () => {
       'antigravity-gemini-4-argon',
       'antigravity-gemini-4-carbon',
       'antigravity-gemini-4-hydrogen',
+      'antigravity-gemini-4-neon',
       'antigravity-orchestrator-carbon',
+      'antigravity-orchestrator-neon',
       'antigravity-claude-sonnet-5.5',
       'antigravity-claude-opus-5.5',
       'antigravity-gpt-oss-120b',
@@ -719,5 +721,55 @@ describe('Orchestrator Carbon account-verified CLI model authority (OCV5-769 / O
     assert.equal(isAntigravityEngineModel('antigravity-orchestrator-carbon'), true)
     assert.equal(isAntigravityEngineModel('gemini-pro-orchestrator'), false)
     assert.equal(isAntigravityEngineModel('gemini-flash-worker-agy'), false)
+  })
+})
+
+describe('Gemini 4 Neon account-verified CLI model authority (OCV5-803)', () => {
+  test('all four choices map to the exact CLI id with explicit high default and cross-family isolation', () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh']) {
+      assert.equal(antigravityCliModelId('antigravity-gemini-4-neon', effort), `gemini-4-neon-${effort}`)
+    }
+    assert.equal(antigravityCliModelId('antigravity-gemini-4-neon', undefined), 'gemini-4-neon-high')
+    assert.equal(antigravityCliModelId('antigravity-gemini-4-neon', 'max'), 'gemini-4-neon-high')
+    assert.deepEqual(modelReasoningPolicy('antigravity-gemini-4-neon').supported, ['low', 'medium', 'high', 'xhigh'])
+    assert.deepEqual(antigravityDirectoryUpstreamModels('antigravity-gemini-4-neon'), [
+      'gemini-4-neon-low',
+      'gemini-4-neon-medium',
+      'gemini-4-neon-high',
+      'gemini-4-neon-xhigh',
+    ])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-4-neon'), [
+      'gemini-4-neon-low',
+      'gemini-4-neon-medium',
+      'gemini-4-neon-high',
+      'gemini-4-neon-xhigh',
+      'gemini-3.5-flash-lite',
+    ])
+    const neonAllow = antigravityAllowedUpstreamModels('antigravity-gemini-4-neon')
+    assert.equal(neonAllow.some((m) => m.includes('orchestrator') || m.includes('worker-agy') || m.includes('carbon') || m.includes('hydrogen')), false)
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-carbon').some((m) => m.includes('neon')), false)
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-gemini-4-hydrogen').some((m) => m.includes('neon')), false)
+    assert.equal(isAntigravityEngineModel('antigravity-gemini-4-neon'), true)
+    assert.equal(isAntigravityEngineModel('gemini-4-neon-high'), false)
+  })
+})
+
+describe('Orchestrator Neon account-verified CLI model authority (OCV5-803)', () => {
+  test('fixed default maps to gemini-pro-orchestrator-neon, allows gemini-flash-worker-agy on relay only, and isolates Carbon orchestrator', () => {
+    assert.equal(antigravityCliModelId('antigravity-orchestrator-neon', undefined), 'gemini-pro-orchestrator-neon')
+    assert.equal(antigravityCliModelId('antigravity-orchestrator-neon', 'high'), 'gemini-pro-orchestrator-neon')
+    assert.deepEqual(modelReasoningPolicy('antigravity-orchestrator-neon').supported, [])
+    assert.deepEqual(antigravityDirectoryUpstreamModels('antigravity-orchestrator-neon'), [
+      'gemini-pro-orchestrator-neon',
+    ])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-orchestrator-neon'), [
+      'gemini-pro-orchestrator-neon',
+      'gemini-flash-worker-agy',
+      'gemini-3.5-flash-lite',
+    ])
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-orchestrator-neon').includes('gemini-pro-orchestrator'), false)
+    assert.equal(antigravityAllowedUpstreamModels('antigravity-orchestrator-carbon').includes('gemini-pro-orchestrator-neon'), false)
+    assert.equal(isAntigravityEngineModel('antigravity-orchestrator-neon'), true)
+    assert.equal(isAntigravityEngineModel('gemini-pro-orchestrator-neon'), false)
   })
 })

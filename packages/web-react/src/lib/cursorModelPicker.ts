@@ -84,9 +84,17 @@ export function cursorPickerDef(
   return cursorModelById(model.id)
 }
 
-export function modelCostLabel(model: { cost_x?: number } | undefined): string | undefined {
+export function modelCostLabel(
+  model: { cost_x?: number } | undefined,
+  multiplier = 1,
+): string | undefined {
   const raw = model?.cost_x
-  return formatCostX(typeof raw === 'number' ? raw : undefined)
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined
+  const scale =
+    typeof multiplier === 'number' && Number.isFinite(multiplier) && multiplier > 0
+      ? multiplier
+      : 1
+  return formatCostX(raw * scale)
 }
 
 /**

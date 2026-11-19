@@ -336,4 +336,254 @@ describe("SitesWorkspaceView", () => {
     fireEvent.click(screen.getByRole("button", { name: "验证域名" }));
     expect(await screen.findByText("已验证")).toBeInTheDocument();
   });
+
+  test("supports shared-with-me filter, Share tab (email + invite links), and Live Edit modal annotations", async () => {
+    const sharedSite: UserSiteItem = {
+      ...SITE_PUBLIC,
+      id: "site-3",
+      slug: "shared-portal",
+      url: "https://shared-portal.congjianai.com",
+      title: "团队协作站",
+      accessRole: "editor",
+      ownerEmail: "boss@example.com",
+      ownerDisplayName: "Boss",
+      collaboratorCount: 1,
+    };
+    const collaborators = [
+      {
+        userId: 2,
+        email: "dev@example.com",
+        displayName: "Dev",
+        role: "editor" as const,
+        createdAt: "2026-11-01T00:00:00.000Z",
+        updatedAt: "2026-11-01T00:00:00.000Z",
+      },
+    ];
+    let invites: Array<{
+      id: string;
+      role: "editor" | "viewer";
+      maxUses: number | null;
+      useCount: number;
+      expiresAt: string | null;
+      createdAt: string;
+    }> = [];
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/sites" && method === "GET") {
+        return okJson({ ...SUMMARY, sites: [SITE_PUBLIC, sharedSite] });
+      }
+      if (url === "/api/sites/demo-app" && method === "GET") {
+        return okJson({ site: SITE_PUBLIC, envVars: [] });
+      }
+      if (url === "/api/sites/demo-app/sharing" && method === "GET") {
+        return okJson({ site: SITE_PUBLIC, collaborators, invites });
+      }
+      if (url === "/api/sites/demo-app/collaborators" && method === "POST") {
+        const added = {
+          userId: 3,
+          email: "newbie@example.com",
+          displayName: "Newbie",
+          role: "editor" as const,
+          createdAt: "2026-11-19T00:00:00.000Z",
+          updatedAt: "2026-11-19T00:00:00.000Z",
+        };
+        collaborators.push(added);
+        return okJson({ collaborator: added, collaborators: [...collaborators] });
+      }
+      if (url === "/api/sites/demo-app/invites" && method === "POST") {
+        const created = {
+          id: "inv-1",
+          role: "editor" as const,
+          maxUses: null,
+          useCount: 0,
+          expiresAt: "2026-11-26T00:00:00.000Z",
+          createdAt: "2026-11-19T00:00:00.000Z",
+        };
+        invites = [created];
+        return okJson({ invite: created, token: "invite-token-xyz-123456", invites });
+      }
+      if (url === "/api/sites/demo-app/invites/inv-1" && method === "DELETE") {
+        invites = [];
+        return okJson({ ok: true, invites });
+      }
+      if (url === "/api/sites/demo-app/preview-session" && method === "POST") {
+        return okJson({
+          preview: {
+            bootstrapUrl: "https://demo-app.congjianai.com/__oc_site_preview_bootstrap?code=abc",
+            siteOrigin: "https://demo-app.congjianai.com",
+            siteUrl: "https://demo-app.congjianai.com",
+            expiresAt: "2026-11-19T13:30:00.000Z",
+          },
+        });
+      }
+      return okJson({ error: { message: "not found" } }, 404);
+    });
+
+    const onApplyLiveEdit = vi.fn();
+    function Host() {
+      const [slug, setSlug] = useState<string | null>(null);
+      return (
+        <ToastProvider>
+          <SitesWorkspaceView
+            auth={AUTH}
+            activeSlug={slug}
+            onSelectSlug={setSlug}
+            onCreateInChat={vi.fn()}
+            onEditSite={vi.fn()}
+            onApplyLiveEdit={onApplyLiveEdit}
+          />
+        </ToastProvider>
+      );
+    }
+    render(<Host />);
+
+    // Shared-with-me filter shows only shared sites
+    expect(await screen.findByText("团队协作站")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /共享给我/ }));
+    expect(screen.getByText("团队协作站")).toBeInTheDocument();
+    expect(screen.queryByText("知行实验室")).not.toBeInTheDocument();
+
+    // Open owned site -> Share tab -> add collaborator + create/revoke invite link
+    fireEvent.click(screen.getByRole("button", { name: "全部" }));
+    fireEvent.click(screen.getByText("知行实验室"));
+    expect(await screen.findByRole("heading", { name: "知行实验室" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "共享" }));
+    expect(await screen.findByText("dev@example.com")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("协作者邮箱"), {
+      target: { value: "newbie@example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加协作者" }));
+    expect(await screen.findByText("newbie@example.com")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "生成邀请链接" }));
+    const linkInput = (await screen.findByLabelText("生成的邀请链接")) as HTMLInputElement;
+    expect(linkInput.value).toContain("siteInvite=invite-token-xyz-123456");
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/sites/demo-app/invites/inv-1",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+
+    // Open Live Edit modal -> simulate iframe ready & element selection -> add comment -> apply to chat!
+    fireEvent.click(screen.getByRole("button", { name: "实时编辑" }));
+    const iframe = (await screen.findByTitle("站点实时编辑预览：知行实验室")) as HTMLIFrameElement;
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "https://demo-app.congjianai.com",
+        source: iframe.contentWindow,
+        data: {
+          source: "oc-site-preview-v1",
+          type: "preview.ready",
+          url: "https://demo-app.congjianai.com/",
+          title: "知行实验室首页",
+        },
+      }),
+    );
+
+    const commentBtn = await screen.findByRole("button", { name: "评论" });
+    await waitFor(() => expect(commentBtn).not.toBeDisabled());
+    fireEvent.click(commentBtn);
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "https://demo-app.congjianai.com",
+        source: iframe.contentWindow,
+        data: {
+          source: "oc-site-preview-v1",
+          type: "preview.selection",
+          target: {
+            selector: "#hero-title",
+            tag: "h1",
+            text: "欢迎来到知行实验室",
+            bounds: { x: 40, y: 80, width: 320, height: 48 },
+          },
+        },
+      }),
+    );
+
+    fireEvent.change(await screen.findByLabelText("描述网页修改"), {
+      target: { value: "把标题改成更醒目的渐变色" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加评论" }));
+    fireEvent.click(screen.getByRole("button", { name: /加入输入框/ }));
+
+    expect(onApplyLiveEdit).toHaveBeenCalledWith(
+      expect.objectContaining({ slug: "demo-app" }),
+      expect.stringContaining("#hero-title"),
+    );
+    expect(onApplyLiveEdit.mock.calls[0]?.[1]).toContain("把标题改成更醒目的渐变色");
+  });
+
+  test("allows editor collaborator to toggle SPA mode independently while hiding owner-only settings", async () => {
+    const editorSite: UserSiteItem = {
+      ...SITE_PUBLIC,
+      id: "site-editor-1",
+      slug: "team-app",
+      url: "https://team-app.congjianai.com",
+      title: "协作站点",
+      spaMode: true,
+      accessRole: "editor",
+      ownerEmail: "owner@example.com",
+      ownerDisplayName: "Owner",
+      collaboratorCount: 1,
+    };
+    let currentSite = editorSite;
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/sites" && method === "GET") {
+        return okJson({ ...SUMMARY, sites: [currentSite] });
+      }
+      if (url === "/api/sites/team-app" && method === "GET") {
+        return okJson({ site: currentSite, envVars: [] });
+      }
+      if (url === "/api/sites/team-app" && method === "PATCH") {
+        const patch = JSON.parse(String(init?.body ?? "{}")) as Partial<UserSiteItem>;
+        currentSite = { ...currentSite, ...patch };
+        return okJson({ site: currentSite });
+      }
+      return okJson({ error: { message: "not found" } }, 404);
+    });
+
+    render(
+      <ToastProvider>
+        <SitesWorkspaceView
+          auth={AUTH}
+          activeSlug="team-app"
+          onSelectSlug={vi.fn()}
+          onCreateInChat={vi.fn()}
+          onEditSite={vi.fn()}
+        />
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "协作站点" })).toBeInTheDocument();
+    // Owner-only controls must be hidden for editor
+    expect(screen.queryByRole("button", { name: "删除站点" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "添加变量" })).not.toBeInTheDocument();
+
+    // Editor can toggle SPA mode directly in general settings
+    const spaSwitch = screen.getByRole("switch", { name: "SPA 单页应用路由开关" });
+    expect(spaSwitch).not.toBeDisabled();
+    fireEvent.click(spaSwitch);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/sites/team-app",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({ spaMode: false }),
+        }),
+      );
+    });
+  });
 });

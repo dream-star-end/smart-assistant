@@ -30,9 +30,10 @@ export function useAppWorkspaceState() {
   const [boardOpen, setBoardOpenState] = useState(
     () => TASKBOARD_ENABLED && routingEnabled && location.pathname === "/board",
   );
+  const hasSiteInvite = Boolean(params.get("siteInvite")?.trim());
   // 站点工作区（/sites 或 /sites/<slug>）：并列工作区，取代原 ManageCenter 弹窗 Tab。
   const [sitesOpen, setSitesOpenState] = useState(
-    () => routingEnabled && parseSitesPath(location.pathname) !== null,
+    () => routingEnabled && (parseSitesPath(location.pathname) !== null || hasSiteInvite),
   );
   const [activeSiteSlug, setActiveSiteSlug] = useState<string | null>(() =>
     routingEnabled ? (parseSitesPath(location.pathname)?.slug ?? null) : null,
@@ -70,7 +71,9 @@ export function useAppWorkspaceState() {
   );
   // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
   // 直接置 app,失败停在 home。
-  const [view, setView] = useState<"home" | "app">(resetToken || desktopEnroll ? "app" : "home");
+  const [view, setView] = useState<"home" | "app">(
+    resetToken || desktopEnroll || hasSiteInvite ? "app" : "home",
+  );
   // AuthGate 初始模式：「免费开始」=register，顶栏「登录」=login，重置链接=reset。
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   return {
@@ -86,16 +89,30 @@ export function useAppWorkspaceState() {
 export function resolveSiteEditTarget(
   site: UserSiteItem,
   sessions: readonly Session[],
+  customPrompt?: string,
 ): { sessionId: string | null; prompt: string } {
-  const rawOrigin = site.originSessionId ?? "";
+  const isOwner = (site.accessRole ?? "owner") === "owner";
+  const rawOrigin = isOwner ? (site.originSessionId ?? "") : "";
   const peerId = rawOrigin.includes(":dm:") ? rawOrigin.split(":dm:").pop()! : rawOrigin;
   const match = peerId
     ? sessions.find((s) => s.id === peerId || s.id === rawOrigin)
     : undefined;
+  if (customPrompt) {
+    return {
+      sessionId: match?.id ?? null,
+      prompt: customPrompt,
+    };
+  }
+  if (!isOwner) {
+    return {
+      sessionId: null,
+      prompt: `请协同开发站点「${site.title}」（slug: ${site.slug}）。如当前工作区尚未拉取该站点文件，请先运行 \`oc-site pull ${site.slug} ./${site.slug}\` 获取最新线上代码，完成修改后运行 \`oc-site publish ./${site.slug} --slug ${site.slug}\` 重新发布：`,
+    };
+  }
   return {
     sessionId: match?.id ?? null,
     prompt: match
       ? `请继续修改已部署的站点「${site.title}」（${site.slug}）：`
-      : `请修改并重新发布已部署的站点「${site.title}」（slug: ${site.slug}）：`,
+      : `请修改并重新发布已部署的站点「${site.title}」（slug: ${site.slug}，如需先拉取线上文件可运行 \`oc-site pull ${site.slug} ./${site.slug}\`）：`,
   };
 }

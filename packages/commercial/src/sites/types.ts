@@ -10,13 +10,20 @@ export const SITE_MAX_SINGLE_FILE_BYTES = 10 * 1024 * 1024
 export const DEFAULT_SITE_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 export const DEFAULT_SITE_MAX_PER_USER = 20
 export const SITE_AUTH_COOKIE_NAME = 'oc_site_auth'
+export const SITE_PREVIEW_COOKIE_NAME = '__oc_site_preview'
+export const SITE_PREVIEW_BOOT_TTL_SEC = 60
+export const SITE_PREVIEW_TTL_SEC = 30 * 60
 export const SITE_EDGE_SIGNATURE_WINDOW_SEC = 300
 export const SITE_SERVER_API_PATH = '__oc_server/api.mjs'
 export const SITE_MAX_ENV_VARS = 64
 export const SITE_MAX_ENV_VALUE_BYTES = 16 * 1024
 export const SITE_MAX_ENV_TOTAL_BYTES = 256 * 1024
+export const SITE_MAX_COLLABORATORS = 50
+export const SITE_MAX_ACTIVE_INVITES = 20
 
 export type SiteVisibility = 'public' | 'password' | 'disabled'
+export type SiteAccessRole = 'owner' | 'editor' | 'viewer'
+export type SiteCollaboratorRole = 'editor' | 'viewer'
 
 export type SitesErrorCode =
   | 'SITES_DISABLED'
@@ -24,6 +31,9 @@ export type SitesErrorCode =
   | 'RESERVED_SLUG'
   | 'SLUG_TAKEN'
   | 'SITE_NOT_FOUND'
+  | 'FORBIDDEN'
+  | 'INVITE_INVALID'
+  | 'USER_NOT_FOUND'
   | 'QUOTA_EXCEEDED'
   | 'INVALID_BUNDLE'
   | 'PASSWORD_REQUIRED'
@@ -158,7 +168,11 @@ export function validateEnvVarKey(raw: string): string {
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional ASCII control-char path sanitization
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/
-const IGNORED_SEGMENT_NAMES = new Set(['.git', 'node_modules', '__pycache__', '.DS_Store'])
+const IGNORED_SEGMENT_NAMES = new Set(['.git', 'node_modules', '__pycache__', '.DS_Store', '.oc-site-state.json'])
+export const RESERVED_SERVER_API_ALIAS_PATHS: ReadonlySet<string> = new Set([
+  'server/api.mjs',
+  'api/index.mjs',
+])
 
 export function normalizeRelativeAssetPath(relPath: string): string {
   if (typeof relPath !== 'string' || relPath.length === 0 || relPath.length > 512) {
@@ -186,7 +200,19 @@ export function normalizeRelativeAssetPath(relPath: string): string {
       throw new SitesError('INVALID_BUNDLE', `安全拦截：禁止上传环境变量文件 ${relPath}`, 400)
     }
   }
-  return segments.join('/')
+  const normalized = segments.join('/')
+  const lower = normalized.toLowerCase()
+  if ((lower === '__oc_server' || lower.startsWith('__oc_server/')) && normalized !== SITE_SERVER_API_PATH) {
+    throw new SitesError('INVALID_BUNDLE', `保留服务端目录路径不合法: ${relPath}`, 400)
+  }
+  if (RESERVED_SERVER_API_ALIAS_PATHS.has(lower)) {
+    throw new SitesError(
+      'INVALID_BUNDLE',
+      `保留服务端入口路径禁止作为静态文件上传 (${relPath})；服务端代码请打包为 ${SITE_SERVER_API_PATH}`,
+      400,
+    )
+  }
+  return normalized
 }
 
 export interface SiteBundleManifestEntry {
@@ -207,6 +233,7 @@ export interface DecodedSiteBundle {
   sizeBytes: number
   contentSha256: string
   hasServerApi: boolean
+  serverApiSha256: string
 }
 
 export function encodeSiteBundle(
@@ -376,7 +403,8 @@ export function decodeSiteBundle(
   )
   const contentSha256 = createHash('sha256').update(canonicalManifestBuf).digest('hex')
 
-  const hasServerApi = seen.has(SITE_SERVER_API_PATH)
+  const serverApiFile = files.find((f) => f.path === SITE_SERVER_API_PATH)
+  const hasServerApi = Boolean(serverApiFile)
   if (isV1 && hasServerApi) {
     throw new SitesError('INVALID_BUNDLE', '包含服务端 API 的站点包必须使用 OCSB2 格式', 400)
   }
@@ -387,6 +415,7 @@ export function decodeSiteBundle(
     sizeBytes: totalBytes,
     contentSha256,
     hasServerApi,
+    serverApiSha256: serverApiFile?.sha256 ?? '',
   }
 }
 
@@ -423,6 +452,146 @@ export function parseSiteVisibility(raw: unknown, fallback: SiteVisibility = 'pu
   throw new SitesError('INVALID_INPUT', 'visibility 仅支持 public / password / disabled', 400)
 }
 
+export function parseSiteCollaboratorRole(
+  raw: unknown,
+  fallback: SiteCollaboratorRole = 'editor',
+): SiteCollaboratorRole {
+  if (raw === undefined || raw === null) return fallback
+  if (raw === 'editor' || raw === 'viewer') return raw
+  throw new SitesError('INVALID_INPUT', '协作者角色仅支持 editor / viewer', 400)
+}
+
+export function normalizePreviewParentOrigin(raw: string): string {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new SitesError('INVALID_INPUT', '无效的预览父页面来源', 400)
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(raw.trim())
+  } catch {
+    throw new SitesError('INVALID_INPUT', '无效的预览父页面来源', 400)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new SitesError('INVALID_INPUT', '预览父页面来源必须是 http 或 https', 400)
+  }
+  return parsed.origin
+}
+
+export type SitePreviewTokenKind = 'boot' | 'sess'
+
+export interface SitePreviewTokenPayload {
+  v: 2
+  kind: SitePreviewTokenKind
+  siteId: string
+  slug: string
+  parentOrigin: string
+  aclVersion: number
+  nonce?: string
+  expSec: number
+}
+
+function derivePreviewTokenKey(secret: string): Buffer {
+  return createHmac('sha256', secret).update('oc-site-preview-token-v2').digest()
+}
+
+export function signSitePreviewToken(args: {
+  secret: string
+  kind: SitePreviewTokenKind
+  siteId: string
+  slug: string
+  parentOrigin: string
+  aclVersion: number
+  nonce?: string
+  expSec: number
+}): string {
+  const aclVersion = Math.max(1, Math.trunc(args.aclVersion))
+  const payload: SitePreviewTokenPayload = {
+    v: 2,
+    kind: args.kind,
+    siteId: args.siteId,
+    slug: validateSiteSlug(args.slug),
+    parentOrigin: normalizePreviewParentOrigin(args.parentOrigin),
+    aclVersion,
+    ...(args.nonce ? { nonce: args.nonce } : {}),
+    expSec: Math.trunc(args.expSec),
+  }
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+  const sig = createHmac('sha256', derivePreviewTokenKey(args.secret))
+    .update(payloadB64)
+    .digest('hex')
+  return `${payloadB64}.${sig}`
+}
+
+export function verifySitePreviewToken(args: {
+  secret: string
+  token: string | undefined
+  expectedSlug: string
+  expectedKind: SitePreviewTokenKind
+  nowSec?: number
+}): SitePreviewTokenPayload | null {
+  if (!args.token || typeof args.token !== 'string') return null
+  const dot = args.token.indexOf('.')
+  if (dot <= 0 || dot !== args.token.lastIndexOf('.')) return null
+  const payloadB64 = args.token.slice(0, dot)
+  const sig = args.token.slice(dot + 1)
+  if (!/^[A-Za-z0-9_-]{16,1024}$/.test(payloadB64) || !/^[a-f0-9]{64}$/.test(sig)) {
+    return null
+  }
+  const expectedSig = createHmac('sha256', derivePreviewTokenKey(args.secret))
+    .update(payloadB64)
+    .digest('hex')
+  const a = Buffer.from(sig, 'hex')
+  const b = Buffer.from(expectedSig, 'hex')
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >
+    if (
+      !parsed ||
+      parsed.v !== 2 ||
+      parsed.kind !== args.expectedKind ||
+      typeof parsed.siteId !== 'string' ||
+      !parsed.siteId ||
+      typeof parsed.slug !== 'string' ||
+      parsed.slug !== args.expectedSlug ||
+      typeof parsed.parentOrigin !== 'string' ||
+      typeof parsed.aclVersion !== 'number' ||
+      !Number.isSafeInteger(parsed.aclVersion) ||
+      parsed.aclVersion < 1 ||
+      typeof parsed.expSec !== 'number' ||
+      !Number.isSafeInteger(parsed.expSec)
+    ) {
+      return null
+    }
+    if (args.expectedKind === 'boot') {
+      if (typeof parsed.nonce !== 'string' || !/^[a-f0-9]{16,64}$/.test(parsed.nonce)) {
+        return null
+      }
+    }
+    const nowSec = args.nowSec ?? Math.floor(Date.now() / 1000)
+    if (parsed.expSec <= nowSec) return null
+    const parentOrigin = normalizePreviewParentOrigin(parsed.parentOrigin)
+    return {
+      v: 2,
+      kind: args.expectedKind,
+      siteId: parsed.siteId,
+      slug: parsed.slug,
+      parentOrigin,
+      aclVersion: parsed.aclVersion,
+      ...(typeof parsed.nonce === 'string' ? { nonce: parsed.nonce } : {}),
+      expSec: parsed.expSec,
+    }
+  } catch {
+    return null
+  }
+}
+
+export function hashSiteInviteToken(token: string): string {
+  return createHash('sha256').update(`oc-site-invite-v1:${token}`, 'utf8').digest('hex')
+}
+
 export interface EdgeMetaEnvelope {
   siteId?: string
   title: string
@@ -434,6 +603,7 @@ export interface EdgeMetaEnvelope {
   hasServerApi?: boolean
   envDigest?: string
   contentSha256?: string
+  previewAclVersion?: number
   expectedBaseRevision?: number
 }
 
@@ -537,6 +707,11 @@ export function verifyEdgeHeaders(args: {
         ...(typeof parsed.hasServerApi === 'boolean' ? { hasServerApi: parsed.hasServerApi } : {}),
         ...(typeof parsed.envDigest === 'string' ? { envDigest: parsed.envDigest } : {}),
         ...(typeof parsed.contentSha256 === 'string' ? { contentSha256: parsed.contentSha256 } : {}),
+        ...(typeof parsed.previewAclVersion === 'number' &&
+        Number.isSafeInteger(parsed.previewAclVersion) &&
+        parsed.previewAclVersion >= 1
+          ? { previewAclVersion: parsed.previewAclVersion }
+          : {}),
         ...(typeof parsed.expectedBaseRevision === 'number' &&
         Number.isSafeInteger(parsed.expectedBaseRevision) &&
         parsed.expectedBaseRevision >= 0
@@ -560,6 +735,10 @@ export interface UserSiteRow {
   id: string
   slug: string
   userId: number
+  accessRole?: SiteAccessRole
+  ownerEmail?: string | null
+  ownerDisplayName?: string | null
+  collaboratorCount?: number
   title: string
   visibility: SiteVisibility
   passwordSalt: string | null
@@ -570,6 +749,10 @@ export interface UserSiteRow {
   customDomainToken: string | null
   originSessionId: string | null
   hasServerApi: boolean
+  serverApiSha256?: string
+  opServerApiSha256?: string | null
+  previewAclVersion?: number
+  previewAclTargetVersion?: number
   envDigest: string
   opKind?: SiteOpKind | null
   opRenameToSlug?: string | null
@@ -587,6 +770,10 @@ export interface UserSiteDto {
   id: string
   slug: string
   url: string
+  accessRole: SiteAccessRole
+  ownerEmail: string | null
+  ownerDisplayName: string | null
+  collaboratorCount: number
   customDomain: string | null
   customDomainStatus: CustomDomainStatus
   customDomainTxtName: string | null
@@ -603,6 +790,46 @@ export interface UserSiteDto {
   createdAt: string
   updatedAt: string
   lastPublishedAt: string
+}
+
+export interface SiteCollaboratorDto {
+  userId: number
+  email: string
+  displayName: string | null
+  role: SiteCollaboratorRole
+  createdAt: string
+  updatedAt: string
+}
+
+export interface SiteInviteDto {
+  id: string
+  role: SiteCollaboratorRole
+  maxUses: number | null
+  useCount: number
+  expiresAt: string | null
+  createdAt: string
+}
+
+export interface SiteInvitePreviewDto {
+  valid: boolean
+  site: {
+    id: string
+    slug: string
+    title: string
+    url: string
+  }
+  role: SiteCollaboratorRole
+  ownerEmail: string | null
+  ownerDisplayName: string | null
+  expiresAt: string | null
+  alreadyRole: SiteAccessRole | null
+}
+
+export interface SitePreviewSessionDto {
+  bootstrapUrl: string
+  siteOrigin: string
+  siteUrl: string
+  expiresAt: string
 }
 
 export interface SiteEnvVarDto {
@@ -666,25 +893,31 @@ export function customDomainTxtValueFor(siteId: string, token: string): string {
 }
 
 export function toUserSiteDto(row: UserSiteRow, baseDomain: string): UserSiteDto {
+  const accessRole: SiteAccessRole = row.accessRole ?? 'owner'
+  const isOwner = accessRole === 'owner'
   const customDomainStatus: CustomDomainStatus = !row.customDomain
     ? 'none'
     : row.customDomainVerified
       ? 'verified'
       : 'pending'
-  const txtName = row.customDomain ? `_oc-site-verify.${row.customDomain}` : null
+  const txtName = isOwner && row.customDomain ? `_oc-site-verify.${row.customDomain}` : null
   const txtVal =
-    row.customDomain && row.customDomainToken
+    isOwner && row.customDomain && row.customDomainToken
       ? customDomainTxtValueFor(row.id, row.customDomainToken)
       : null
   return {
     id: row.id,
     slug: row.slug,
     url: `https://${row.slug}.${baseDomain}`,
+    accessRole,
+    ownerEmail: row.ownerEmail ?? null,
+    ownerDisplayName: row.ownerDisplayName ?? null,
+    collaboratorCount: row.collaboratorCount ?? 0,
     customDomain: row.customDomain,
     customDomainStatus,
     customDomainTxtName: txtName,
     customDomainTxtValue: txtVal,
-    originSessionId: row.originSessionId,
+    originSessionId: isOwner ? row.originSessionId : null,
     hasServerApi: row.hasServerApi,
     title: row.title,
     visibility: row.visibility,

@@ -5,10 +5,12 @@
  * construction so even a legacy launch without platform context is restricted. */
 import {
   ADVISOR_READ_ONLY_MCP_TOOLS,
+  CODEX_ULTRAFAST_SERVICE_TIER,
   type ServiceTier,
   codexTransportModelId,
   codexTurnServiceTierValue,
 } from '@openclaude/protocol'
+import { abortableDelay } from './codexLifecycle.js'
 import { normalizeCodexReasoningEffort } from './codexShared.js'
 
 const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
@@ -148,4 +150,151 @@ export function advisorReadOnlyThreadConfig(configuration: unknown, trustedPlatf
     agents: { enabled: false },
     features: Object.fromEntries(DISABLED_FEATURES.map(feature => [feature, false])),
   }
+}
+
+export const CODEX_ULTRAFAST_CHECK_TIMEOUT_MS = 10_000
+export const CODEX_ULTRAFAST_UNAVAILABLE_CODE = 'CODEX_ULTRAFAST_UNAVAILABLE'
+const CODEX_ULTRAFAST_RETRY_DELAY_MS = 250
+const MAX_MODEL_LIST_PAGES = 10
+
+let ultrafastCheckTimeoutOverrideMs: number | null = null
+
+/** Test hook to override the Ultrafast `model/list` capability timeout without slowing CI. */
+export function _setUltrafastCheckTimeoutForTests(ms: number | null): void {
+  ultrafastCheckTimeoutOverrideMs = ms
+}
+
+function modelListAdvertisesTierOnPage(
+  modelListRes: unknown,
+  transportModel: string,
+  wireTier: string,
+): { foundModel: boolean; supported: boolean; nextCursor: string | null } {
+  const obj = modelListRes && typeof modelListRes === 'object'
+    ? (modelListRes as { data?: unknown; nextCursor?: unknown })
+    : undefined
+  const data = obj?.data
+  const nextCursor = typeof obj?.nextCursor === 'string' && obj.nextCursor ? obj.nextCursor : null
+  if (!Array.isArray(data)) return { foundModel: false, supported: false, nextCursor }
+  const entry = data.find((item) => {
+    if (!item || typeof item !== 'object') return false
+    const rec = item as { id?: unknown; model?: unknown }
+    return rec.id === transportModel || rec.model === transportModel
+  }) as { serviceTiers?: unknown; additionalSpeedTiers?: unknown } | undefined
+  if (!entry) return { foundModel: false, supported: false, nextCursor }
+  const hasTierObj = Array.isArray(entry.serviceTiers) && entry.serviceTiers.some((t) =>
+    typeof t === 'string'
+      ? t === wireTier
+      : Boolean(t && typeof t === 'object' && (t as { id?: unknown }).id === wireTier),
+  )
+  const hasAdditional = Array.isArray(entry.additionalSpeedTiers)
+    && entry.additionalSpeedTiers.includes(wireTier)
+  return { foundModel: true, supported: hasTierObj || hasAdditional, nextCursor }
+}
+
+/** Checks whether a Codex `model/list` response advertises `wireTier` for `transportModel`. */
+export function modelListAdvertisesServiceTier(
+  modelListRes: unknown,
+  transportModel: string,
+  wireTier: string,
+): boolean {
+  return modelListAdvertisesTierOnPage(modelListRes, transportModel, wireTier).supported
+}
+
+function toAbortError(reason: unknown): Error {
+  return reason instanceof Error
+    ? reason
+    : new Error(`Codex Ultrafast check aborted${reason ? ` (${String(reason)})` : ''}`)
+}
+
+/**
+ * Prevents silent 6x Ultrafast overbilling when Codex 0.170.0 cannot refresh `/models`
+ * (or the bound account lacks entitlement / switches mid-session) by confirming via live
+ * local `model/list` before native compaction and `turn/start`.
+ */
+export async function ensureCodexTurnServiceTierSupported(opts: {
+  model?: string
+  readOnly: boolean
+  serviceTier?: ServiceTier | null
+  remote?: boolean
+  initialized: unknown
+  signal?: AbortSignal
+  timeoutMs?: number
+  listModels: (cursor?: string, signal?: AbortSignal) => Promise<unknown>
+  waitRetryMs?: (ms: number, signal?: AbortSignal) => Promise<void>
+}): Promise<void> {
+  const wireTier = codexTurnServiceTierValue(opts.model, opts.readOnly ? null : opts.serviceTier)
+  const transportModel = codexTransportModelId(opts.model)
+  if (opts.remote || wireTier !== CODEX_ULTRAFAST_SERVICE_TIER || !transportModel) return
+  const userAgent = opts.initialized && typeof opts.initialized === 'object'
+    ? (opts.initialized as { userAgent?: unknown }).userAgent
+    : undefined
+  // FakeCodexProc unit harnesses return `{}` without userAgent and do not implement `model/list`.
+  if (typeof userAgent !== 'string' || !userAgent.trim()) return
+  if (opts.signal?.aborted) throw toAbortError(opts.signal.reason)
+
+  const checkController = new AbortController()
+  let timedOut = false
+  const onParentAbort = () => {
+    checkController.abort(opts.signal?.reason)
+  }
+  opts.signal?.addEventListener('abort', onParentAbort, { once: true })
+
+  const rawTimeout = opts.timeoutMs ?? ultrafastCheckTimeoutOverrideMs ?? CODEX_ULTRAFAST_CHECK_TIMEOUT_MS
+  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0
+    ? rawTimeout
+    : CODEX_ULTRAFAST_CHECK_TIMEOUT_MS
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true
+    checkController.abort('timeout')
+  }, timeoutMs)
+
+  const assertNotAborted = (): void => {
+    if (opts.signal?.aborted) throw toAbortError(opts.signal.reason)
+    if (timedOut) {
+      throw new Error(
+        `${CODEX_ULTRAFAST_UNAVAILABLE_CODE}: Codex model/list capability check timed out after ${timeoutMs}ms`,
+      )
+    }
+    if (checkController.signal.aborted) throw toAbortError(checkController.signal.reason)
+  }
+
+  const checkOnce = async (): Promise<boolean> => {
+    let cursor: string | undefined
+    for (let page = 0; page < MAX_MODEL_LIST_PAGES; page++) {
+      assertNotAborted()
+      const res = await opts.listModels(cursor, checkController.signal)
+      assertNotAborted()
+      const parsed = modelListAdvertisesTierOnPage(res, transportModel, CODEX_ULTRAFAST_SERVICE_TIER)
+      if (parsed.foundModel) return parsed.supported
+      if (!parsed.nextCursor) return false
+      cursor = parsed.nextCursor
+    }
+    return false
+  }
+
+  try {
+    if (await checkOnce()) return
+    assertNotAborted()
+    if (opts.waitRetryMs) {
+      await opts.waitRetryMs(CODEX_ULTRAFAST_RETRY_DELAY_MS, checkController.signal)
+    } else {
+      await abortableDelay(CODEX_ULTRAFAST_RETRY_DELAY_MS, checkController.signal)
+    }
+    assertNotAborted()
+    if (await checkOnce()) return
+  } catch (err) {
+    if (opts.signal?.aborted) throw toAbortError(opts.signal.reason)
+    if (timedOut) {
+      throw new Error(
+        `${CODEX_ULTRAFAST_UNAVAILABLE_CODE}: Codex model/list capability check timed out after ${timeoutMs}ms`,
+      )
+    }
+    throw err
+  } finally {
+    clearTimeout(timeoutTimer)
+    opts.signal?.removeEventListener('abort', onParentAbort)
+  }
+  throw new Error(
+    `${CODEX_ULTRAFAST_UNAVAILABLE_CODE}: Ultrafast speed tier is unavailable in Codex model catalog (/models unreachable or account lacks Ultrafast entitlement); refusing turn before execution to prevent 6x overbilling`,
+  )
 }
