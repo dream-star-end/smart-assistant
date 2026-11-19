@@ -17,6 +17,8 @@ describe('ANTIGRAVITY_PREAMBLE local CLI hints', () => {
     assert.match(text, /oc_bash/)
     assert.match(text, /mcp_openclaude-memory_oc_bash/)
     assert.match(text, /600000/)
+    assert.match(text, /job_id/)
+    assert.match(text, /status=running/)
     assert.equal(text.includes('170000'), false)
     assert.equal(text.includes('180000'), false)
     assert.match(text, /oc_grep/)

@@ -35,6 +35,7 @@ loadBeforeAll(() =>
     import('./components/TutorialCenter'),
     import('./components/MediaTaskCenter'),
     import('./components/ImageViewer'),
+    import('./components/sites/SitesWorkspaceView'),
     import('./components/taskboard/TaskboardView'),
   ]),
 )

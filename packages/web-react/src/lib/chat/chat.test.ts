@@ -59,6 +59,8 @@ import {
   SETTLED_PERMISSION_REQUEST_IDS_MAX,
   type FrameEffects,
 } from "./reducer";
+import { CONTROL_PERSIST_TIMEOUT_MS } from "./controlReceipts";
+import { writeSessionServiceTier } from "../sessionServiceTier";
 import {
   ChatSocket,
   LIVE_JOURNAL_MAX_PAGES,
@@ -5555,6 +5557,110 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("OCV5-798: 中断后切模并显式选回标准时，手动继续不回退到旧轮 Ultrafast；保持 Ultrafast 则保留 6x", async () => {
+    localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    try {
+      const sock = makeSocket();
+      sock.setGateReady(true);
+      const ws = FakeWS.instances.at(-1)!;
+      ws.open();
+      const session = sock.ensureSession("s-cont-tier", "main");
+      session.messages.push(
+        {
+          id: "u-ultra",
+          role: "user",
+          text: "task",
+          ts: 1,
+          status: "read",
+          _routing: { model: "gpt-6.2-sol", serviceTier: "ultrafast" },
+        },
+        {
+          id: "thinking-ultra",
+          role: "thinking",
+          text: "progress",
+          ts: 2,
+          _source: "server",
+          _turnTapeId: "tape-ultra",
+          _clientMessageId: "u-ultra",
+        },
+        {
+          id: "err-ultra",
+          role: "assistant",
+          text: "",
+          ts: 3,
+          _source: "server",
+          _turnTapeId: "tape-ultra",
+          _clientMessageId: "u-ultra",
+          _errorCode: "LIVENESS_TIMEOUT",
+        },
+      );
+      sock.setSessionModel("s-cont-tier", "gpt-6.2-sol-1m");
+      writeSessionServiceTier("s-cont-tier", null);
+      sock.continueInterruptedTurn({ sessId: "s-cont-tier", errorMessageId: "err-ultra", agentId: "main" });
+      await Promise.resolve();
+      await Promise.resolve();
+      const stdPayloads = ws.sent
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((p) => p.type === "inbound.message");
+      expect(stdPayloads).toHaveLength(1);
+      expect(stdPayloads[0]?.model).toBe("gpt-6.2-sol-1m");
+      expect("serviceTier" in stdPayloads[0]!).toBe(false);
+      sock.stop();
+
+      // Positive control: explicit ultrafast in current session IS preserved across manual continuation on Sol-1m.
+      FakeWS.instances = [];
+      const sock2 = makeSocket();
+      sock2.setGateReady(true);
+      const ws2 = FakeWS.instances.at(-1)!;
+      ws2.open();
+      const sess2 = sock2.ensureSession("s-cont-ultra", "main");
+      sess2.messages.push(
+        {
+          id: "u-ultra-2",
+          role: "user",
+          text: "task",
+          ts: 1,
+          status: "read",
+          _routing: { model: "gpt-6.2-sol", serviceTier: "ultrafast" },
+        },
+        {
+          id: "thinking-ultra-2",
+          role: "thinking",
+          text: "progress",
+          ts: 2,
+          _source: "server",
+          _turnTapeId: "tape-ultra-2",
+          _clientMessageId: "u-ultra-2",
+        },
+        {
+          id: "err-ultra-2",
+          role: "assistant",
+          text: "",
+          ts: 3,
+          _source: "server",
+          _turnTapeId: "tape-ultra-2",
+          _clientMessageId: "u-ultra-2",
+          _errorCode: "LIVENESS_TIMEOUT",
+        },
+      );
+      sock2.setSessionModel("s-cont-ultra", "gpt-6.2-sol-1m");
+      writeSessionServiceTier("s-cont-ultra", "ultrafast");
+      sock2.continueInterruptedTurn({ sessId: "s-cont-ultra", errorMessageId: "err-ultra-2", agentId: "main" });
+      await Promise.resolve();
+      await Promise.resolve();
+      const ultraPayloads = ws2.sent
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((p) => p.type === "inbound.message");
+      expect(ultraPayloads).toHaveLength(1);
+      expect(ultraPayloads[0]?.model).toBe("gpt-6.2-sol-1m");
+      expect(ultraPayloads[0]?.serviceTier).toBe("ultrafast");
+      sock2.stop();
+    } finally {
+      localStorage.clear();
+    }
+  });
+
   test("两个独立 tab 对同一中断轮生成相同 durable identity", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sockets = [makeSocket(), makeSocket()];
@@ -8741,12 +8847,12 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       .find((payload) => payload.clientMessageId === userMessage.id && typeof payload.idempotencyKey === "string" && payload.idempotencyKey.endsWith(":1"));
     expect(retry.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMessage.id, 1));
     expect(retry).toMatchObject({
-      model: "gpt-6-astra",
+      model: "gpt-6.2-astra",
       effortLevel: "high",
       teamMode: true,
     });
-    expect(session._lastRouting?.model).toBe("gpt-6-astra");
-    expect((userMessage as ChatMessage)._routing?.model).toBe("gpt-6-astra");
+    expect(session._lastRouting?.model).toBe("gpt-6.2-astra");
+    expect((userMessage as ChatMessage)._routing?.model).toBe("gpt-6.2-astra");
   });
 
   test("retry preserves explicit null effort so a warm runner returns to the model default", () => {
@@ -9567,6 +9673,64 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
+  test("post-Stop cancel-fenced outbound.error settles _stopSettlement without needing a trailing [error] message or terminal receipt (OCV5-788)", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const deletePendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ deletePendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "stop before CLI spawns" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+
+    sock.stopTurn("s1");
+    await vi.waitFor(() => expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.control.stop")).toBe(true));
+    const stop = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.control.stop");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "persisted",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+      attempt: 1,
+    }) });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "applied",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+    expect(session._stopSettlement?.phase).toBe("persisted");
+    expect(session._recoveryStatus?.kind).toBe("stopping");
+
+    // Server emits only outbound.error (no trailing [error] outbound.message and no terminal receipt).
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error",
+      peer: { id: "s1", kind: "dm" },
+      code: "upstream_failed",
+      message: "ANTIGRAVITY_CONVERSATION_MISMATCH",
+      clientMessageId,
+    }) });
+
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._stopSettlement).toBeUndefined();
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(deletePendingControl).toHaveBeenCalledWith("s1", stop.controlId);
+    expect(session.messages.some((m) => m._errorCode === "upstream_failed")).toBe(false);
+    sock.stop();
+  });
+
   test.each(["completed", "crashed"])("Master confirmed ended Stop syncs the exact turn and preserves its %s outcome", (outcome) => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const syncSession = vi.fn();
@@ -9670,6 +9834,214 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(session._recoveryStatus?.kind).toBe("resumed");
     expect(deletePendingControl).toHaveBeenCalledWith("s1", decision.controlId);
     sock.stop();
+  });
+
+  test("persistent IDB journal rejection falls back to live delivery without reordering", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistPendingControl = vi.fn(async (item: { controlKind: string }) => {
+      if (item.controlKind === "stop") throw new Error("idb unavailable");
+    });
+    const sock = makeSocket({ persistPendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+
+    sock.stopTurn("s1");
+    await Promise.resolve();
+    const permission = addMessage(session, "permission", "AskUserQuestion", {
+      requestId: "req-persist-fail",
+      _resolved: false,
+    });
+    sock.respondPermission({ sessId: "s1", requestId: "req-persist-fail", behavior: "allow" });
+    await Promise.resolve();
+    const controlFrames = () => ws.sent
+      .map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.control.stop" || frame.type === "inbound.permission_response");
+    expect(controlFrames()).toHaveLength(0);
+    expect(permission._controlPending).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(controlFrames().map((frame) => frame.type)).toEqual([
+      "inbound.control.stop",
+      "inbound.permission_response",
+    ]);
+    const decision = controlFrames()[1];
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: decision.controlId,
+      controlKind: "permission",
+      status: "applied",
+      peer: { id: "s1", kind: "dm" },
+      requestId: "req-persist-fail",
+    }) });
+    expect(permission._resolved).toBe(true);
+    expect(permission._controlPending).toBe(false);
+    sock.stop();
+  });
+
+  test("hung IDB control journal times out and falls back to live delivery", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistPendingControl = vi.fn(() => new Promise<void>(() => {}));
+    const deletePendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ persistPendingControl, deletePendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const session = sock.ensureSession("s1", "main");
+    const permission = addMessage(session, "permission", "AskUserQuestion", {
+      requestId: "req-hang",
+      _resolved: false,
+    });
+
+    sock.respondPermission({ sessId: "s1", requestId: "req-hang", behavior: "allow" });
+    expect(permission._controlPending).toBe(true);
+    await vi.advanceTimersByTimeAsync(CONTROL_PERSIST_TIMEOUT_MS - 1);
+    expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.permission_response")).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const decision = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.permission_response");
+    expect(decision?.requestId).toBe("req-hang");
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: decision.controlId,
+      controlKind: "permission",
+      status: "applied",
+      peer: { id: "s1", kind: "dm" },
+      requestId: "req-hang",
+    }) });
+    expect(permission._resolved).toBe(true);
+    expect(permission._controlPending).toBe(false);
+    expect(deletePendingControl).toHaveBeenCalledWith("s1", decision.controlId);
+    sock.stop();
+  });
+
+  test("toStored strips _controlPending, existing loadStored hydrates _pendingControls, and server pending replay clears orphan _controlPending", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const session = sock.ensureSession("s1", "main");
+    addMessage(session, "permission", "AskUserQuestion", {
+      requestId: "req-strip",
+      _resolved: false,
+    });
+    sock.respondPermission({ sessId: "s1", requestId: "req-strip", behavior: "allow" });
+    const stored = sock.toStored("s1")!;
+    expect(stored.messages.find((m) => m.requestId === "req-strip")?._controlPending).toBeUndefined();
+    sock.stop();
+
+    // REST history lands before IndexedDB hydration: loadStored existing branch must still replay _pendingControls.
+    const restFirst = makeSocket();
+    restFirst.applyServerMessages("s1", "main", [
+      { id: "u1", role: "user", text: "hi", ts: 1, _source: "server", _seq: 1, _orderSeq: 1 },
+      {
+        id: "perm-1",
+        role: "permission",
+        toolName: "AskUserQuestion",
+        text: "AskUserQuestion",
+        requestId: "req-rest-first",
+        _resolved: false,
+        ts: 2,
+      },
+    ], true, 1);
+    restFirst.loadStored({
+      ...stored,
+      _pendingControls: [{
+        kind: "control",
+        sessId: "s1",
+        controlId: "control:permission:req-rest-first:allow",
+        controlKind: "permission",
+        requestId: "req-rest-first",
+        behavior: "allow",
+        agentId: "main",
+        payload: {
+          type: "inbound.permission_response",
+          controlId: "control:permission:req-rest-first:allow",
+          channel: "webchat",
+          peer: { id: "s1", kind: "dm" },
+          agentId: "main",
+          requestId: "req-rest-first",
+          behavior: "allow",
+        },
+        enqueuedAt: 10,
+        attempt: 0,
+        status: "queued",
+      }],
+    });
+    expect(restFirst.sessions.get("s1")!.messages.find((m) => m.requestId === "req-rest-first")?._controlPending).toBe(true);
+    restFirst.setGateReady(true);
+    const wsRest = FakeWS.instances.at(-1)!;
+    wsRest.open();
+    expect(wsRest.sent.map((raw) => JSON.parse(raw)).some((f) => f.type === "inbound.permission_response" && f.requestId === "req-rest-first")).toBe(true);
+    restFirst.stop();
+
+    // Legacy polluted cache without _pendingControls strips _controlPending, and server replay self-heals in-memory orphans.
+    const orphan = makeSocket();
+    orphan.loadStored({
+      ...stored,
+      id: "s-orphan",
+      messages: [{
+        id: "p-orphan",
+        role: "permission",
+        toolName: "AskUserQuestion",
+        text: "AskUserQuestion",
+        requestId: "req-orphan",
+        _resolved: false,
+        _controlPending: true,
+        ts: 3,
+      }],
+    });
+    const loadedOrphan = orphan.sessions.get("s-orphan")!.messages[0]!;
+    expect(loadedOrphan._controlPending).toBeUndefined();
+
+    loadedOrphan._controlPending = true;
+    orphan.setGateReady(true);
+    const wsOrphan = FakeWS.instances.at(-1)!;
+    wsOrphan.open();
+    wsOrphan.onmessage?.({ data: JSON.stringify({
+      type: "outbound.permission_request",
+      sessionKey: "agent:main:webchat:dm:s-orphan",
+      channel: "webchat",
+      peer: { id: "s-orphan", kind: "dm" },
+      requestId: "req-orphan",
+      toolName: "AskUserQuestion",
+      inputPreview: "{}",
+      inputJson: { questions: [{ question: "q" }] },
+      ts: 4,
+    }) });
+    expect(loadedOrphan._controlPending).toBe(false);
+
+    loadedOrphan._controlPending = true;
+    orphan.applyPermissionPromptSnapshot("s-orphan", {
+      items: [{
+        requestId: "req-orphan",
+        clientMessageId: "u1",
+        toolUseId: "toolu_1",
+        toolName: "AskUserQuestion",
+        inputJson: { questions: [{ question: "q" }] },
+        status: "pending",
+        behavior: null,
+        reason: null,
+        answers: null,
+        expiresAt: Date.now() + 60_000,
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000,
+      }],
+      completeness: "complete",
+      source: "pg",
+    });
+    expect(loadedOrphan._controlPending).toBe(false);
+    orphan.stop();
   });
 
   test("deduplicated auto-continue ack clears and persists pending turn state", () => {

@@ -29,7 +29,7 @@ const MAX_PREDICTION_CHARS = 80;
 const MAX_HISTORY = 50;
 
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)/;
-const NEXT_TYPES = new Set(["next", "prediction"]);
+const NEXT_TYPES = new Set(["next", "prediction", "input-prediction", "input_prediction", "next-input", "next_input"]);
 const SUGGESTION_TYPES = new Set(["suggestions", "followups", "follow_up"]);
 
 /** 一个 ui 块 → 对象;解析不了 → null。容忍模型常见的尾逗号。 */
@@ -45,6 +45,21 @@ function parseBlock(code: string): Record<string, unknown> | null {
     }
   }
   return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+}
+
+/** 容忍模型在同一个 ui 块里按行吐多个 JSON 对象(JSONL)。 */
+function parseBlocks(code: string): Record<string, unknown>[] {
+  const single = parseBlock(code);
+  if (single) return [single];
+  if (!code.includes("\n")) return [];
+  const out: Record<string, unknown>[] = [];
+  for (const line of code.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    const item = parseBlock(trimmed);
+    if (item) out.push(item);
+  }
+  return out;
 }
 
 function textOf(v: unknown): string {
@@ -68,8 +83,7 @@ function uiBlocksOf(text: string): Record<string, unknown>[] {
     let j = i + 1;
     while (j < lines.length && !closeRe.test(lines[j]!)) j += 1;
     if (m[2]!.toLowerCase() === "ui" && j < lines.length) {
-      const block = parseBlock(lines.slice(i + 1, j).join("\n"));
-      if (block) blocks.push(block);
+      blocks.push(...parseBlocks(lines.slice(i + 1, j).join("\n")));
     }
     i = j + 1;
   }
@@ -80,11 +94,38 @@ function typeOf(block: Record<string, unknown>): string {
   return typeof block.type === "string" ? block.type.trim().toLowerCase() : "";
 }
 
+function isPredictionBlock(block: Record<string, unknown>): boolean {
+  const t = typeOf(block);
+  return NEXT_TYPES.has(t) || (!t && "next" in block);
+}
+
+function entryText(v: unknown): string {
+  const s = textOf(v);
+  if (s) return s;
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const o = v as Record<string, unknown>;
+    return textOf(o.text ?? o.label ?? o.prediction);
+  }
+  return "";
+}
+
+function predictionTextOf(block: Record<string, unknown>): string {
+  const direct = textOf(block.text ?? block.prediction);
+  if (direct) return direct;
+  if ("next" in block) {
+    if (Array.isArray(block.next)) return block.next.map(entryText).find(Boolean) ?? "";
+    const n = entryText(block.next);
+    if (n) return n;
+  }
+  if (Array.isArray(block.items)) return block.items.map(entryText).find(Boolean) ?? "";
+  return "";
+}
+
 /** 助手写的输入预测(最后一个 next 块的 text);没有 → null。 */
 export function nextPredictionOf(text: string): string | null {
-  const blocks = uiBlocksOf(text).filter((b) => NEXT_TYPES.has(typeOf(b)));
+  const blocks = uiBlocksOf(text).filter(isPredictionBlock);
   const last = blocks[blocks.length - 1];
-  return last ? textOf(last.text) || null : null;
+  return last ? predictionTextOf(last) || null : null;
 }
 
 /** 回答里所有 suggestions 块的条目(最后一块在前)。 */

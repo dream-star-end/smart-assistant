@@ -16,12 +16,31 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
 import { access } from 'node:fs/promises'
 import { delimiter } from 'node:path'
+import {
+  KILL_GRACE_MS,
+  OC_BASH_MAX_OUTPUT_BYTES,
+  OcBashJobManager,
+  killChildProcessGroup,
+  type OcBashAction,
+  type OcBashCallOutcome,
+} from './ocBashJobManager.js'
+
+export {
+  OC_BASH_HEAD_BYTES,
+  OC_BASH_IDLE_JOB_TTL_MS,
+  OC_BASH_MAX_ACTIVE_JOBS,
+  OC_BASH_MAX_JOB_LIFETIME_MS,
+  OC_BASH_MAX_OUTPUT_BYTES,
+  OC_BASH_TAIL_BYTES,
+  OcBashJobManager,
+  type OcBashAction,
+  type OcBashCallOutcome,
+} from './ocBashJobManager.js'
 
 export const OC_BASH_DEFAULT_TIMEOUT_MS = 60_000
 export const OC_BASH_MIN_TIMEOUT_MS = 1_000
 /** Antigravity mcp_config.json sets timeoutSeconds=3600 (OCV5-779). Cap single oc_bash calls at 10m (aligned with OCV5-777 remote default) while keeping 60s default. */
 export const OC_BASH_MAX_TIMEOUT_MS = 600_000
-export const OC_BASH_MAX_OUTPUT_BYTES = 200 * 1024
 export const OC_GREP_DEFAULT_MAX_MATCHES = 80
 export const OC_GREP_MAX_MATCHES = 200
 /** Cap single-line matches (minified bundles / JSONL transcripts) so 1 hit cannot inject 200 KB. */
@@ -46,7 +65,6 @@ export function isLocalCliToolEnabled(engineId: string): boolean {
 }
 
 const RG_CANDIDATES = ['/usr/bin/rg', '/usr/local/bin/rg', '/run/oc/platform/current/bin/rg']
-const KILL_GRACE_MS = 400
 
 export interface ToolTextResult {
   content: Array<{ type: 'text'; text: string }>
@@ -165,16 +183,6 @@ function takeBytes(buf: Buffer, acc: Buffer[], count: number, maxBytes: number):
   return { count: maxBytes, truncated: true }
 }
 
-function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  const pid = child.pid
-  if (!pid || pid <= 0) return
-  try {
-    process.kill(-pid, signal)
-  } catch {
-    try { child.kill(signal) } catch { /* already gone */ }
-  }
-}
-
 /** Group leaders of detached oc_* children. The MCP timer dies with this process. */
 const activeProcessGroups = new Set<number>()
 let processGroupCleanupInstalled = false
@@ -266,8 +274,8 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
     let killTimer: NodeJS.Timeout | null = null
     const timer = setTimeout(() => {
       timedOut = true
-      killGroup(child, 'SIGTERM')
-      killTimer = setTimeout(() => killGroup(child, 'SIGKILL'), KILL_GRACE_MS)
+      killChildProcessGroup(child, 'SIGTERM')
+      killTimer = setTimeout(() => killChildProcessGroup(child, 'SIGKILL'), KILL_GRACE_MS)
     }, spec.timeoutMs)
 
     const snapshot = (extra: Partial<RunCapturedResult>): RunCapturedResult => ({
@@ -290,7 +298,7 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
     child.on('close', (code, signal) => {
       // The shell can close while a TERM-ignoring descendant has redirected its pipes.
       // Finish timeout escalation before dropping this process group.
-      if (timedOut) killGroup(child, 'SIGKILL')
+      if (timedOut) killChildProcessGroup(child, 'SIGKILL')
       clearTimeout(timer)
       if (killTimer) clearTimeout(killTimer)
       forget()
@@ -304,36 +312,174 @@ function optionalCwd(value: unknown): string | undefined {
   return cwd || undefined
 }
 
-export async function handleOcBash(args: unknown): Promise<ToolTextResult> {
+const defaultOcBashManager = new OcBashJobManager({
+  trackProcessGroup,
+  untrackProcessGroup,
+})
+
+/** Reap all active oc_bash / oc_* child process groups on MCP shutdown or stdin disconnect. */
+export function shutdownLocalCliTools(): void {
+  defaultOcBashManager.shutdown()
+  killTrackedProcessGroups('SIGKILL')
+  activeProcessGroups.clear()
+}
+
+function appendStreamSections(
+  header: string,
+  stdoutRaw: string,
+  stderrRaw: string,
+  footer?: string,
+): string {
+  const stdout = stdoutRaw.replace(/\s+$/, '')
+  const stderr = stderrRaw.replace(/\s+$/, '')
+  let text = header
+  if (stdout) text += `\n${stdout}`
+  if (stderr) text += `\n--- stderr ---\n${stderr}`
+  if (footer) text += `\n---\n${footer}`
+  return text
+}
+
+function formatOcBashOutcome(outcome: OcBashCallOutcome): ToolTextResult {
+  switch (outcome.kind) {
+    case 'spawn_error':
+      return textResult(`oc_bash: 启动失败: ${outcome.error}`, true)
+    case 'too_many_jobs': {
+      const list = outcome.active.length > 0 ? `\n${outcome.active.join('\n')}` : ''
+      return textResult(
+        `oc_bash: 当前已有 ${outcome.maxActiveJobs} 个在途后台命令（已达并发上限），请先用 job_id 续等或 kill 清理后再启动新命令:${list}`,
+        true,
+      )
+    }
+    case 'not_found':
+      return textResult(
+        `oc_bash: 未找到任务 job_id=${outcome.jobId}（可能已过期清理，或不属于本回合 MCP 进程）`,
+        true,
+      )
+    case 'busy':
+      return textResult(`oc_bash: 任务 job_id=${outcome.jobId} 正在等待中，请勿并发重复 wait`, true)
+    case 'tombstone': {
+      const t = outcome.tombstone
+      const bits = [`exit=${t.exitCode ?? 'none'}`]
+      if (t.signal) bits.push(`signal=${t.signal}`)
+      if (t.reason === 'idle_timeout') {
+        return textResult(
+          `status=terminated_idle job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 任务因无人续等超过空闲租约已被自动终止（${t.commandPreview}）。`,
+          true,
+        )
+      }
+      if (t.reason === 'max_lifetime') {
+        return textResult(
+          `status=terminated_max_lifetime job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 任务超过总运行上限已被自动终止（${t.commandPreview}）。`,
+          true,
+        )
+      }
+      const statusLabel = t.reason === 'killed' ? 'already_killed' : 'already_collected'
+      return textResult(
+        `status=${statusLabel} job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 该任务结果此前已回收。`,
+      )
+    }
+    case 'finished': {
+      const bits = [`exit=${outcome.exitCode ?? 'none'}`]
+      if (outcome.signal) bits.push(`signal=${outcome.signal}`)
+      if (outcome.truncated) bits.push('truncated')
+      return textResult(
+        appendStreamSections(bits.join(' '), outcome.stdout, outcome.stderr),
+        false,
+      )
+    }
+    case 'hard_timeout': {
+      const bits = [`exit=${outcome.exitCode ?? 'none'}`]
+      if (outcome.signal) bits.push(`signal=${outcome.signal}`)
+      bits.push(`timed out after ${outcome.timeoutMs}ms`)
+      if (outcome.truncated) bits.push('truncated')
+      return textResult(
+        appendStreamSections(bits.join(' '), outcome.stdout, outcome.stderr),
+        true,
+      )
+    }
+    case 'terminated': {
+      const bits = [`exit=${outcome.exitCode ?? 'none'}`]
+      if (outcome.signal) bits.push(`signal=${outcome.signal}`)
+      bits.push(
+        outcome.reason === 'idle_timeout'
+          ? `terminated after idle timeout (${outcome.elapsedMs}ms)`
+          : `terminated after max lifetime (${outcome.elapsedMs}ms)`,
+      )
+      if (outcome.truncated) bits.push('truncated')
+      return textResult(
+        appendStreamSections(bits.join(' '), outcome.stdout, outcome.stderr),
+        true,
+      )
+    }
+    case 'killed': {
+      const bits = ['status=killed', `job_id=${outcome.jobId}`, `exit=${outcome.exitCode ?? 'none'}`]
+      if (outcome.signal) bits.push(`signal=${outcome.signal}`)
+      bits.push(`elapsed_ms=${outcome.elapsedMs}`)
+      if (outcome.truncated) bits.push('truncated')
+      return textResult(appendStreamSections(bits.join(' '), outcome.stdout, outcome.stderr), false)
+    }
+    case 'running': {
+      const bits = ['status=running', `job_id=${outcome.jobId}`, `elapsed_ms=${outcome.elapsedMs}`]
+      if (outcome.truncated) bits.push('truncated')
+      const footer = [
+        '[oc_bash] 命令仍在运行（进度已保留，未强杀）。',
+        `继续等待: oc_bash({"job_id":"${outcome.jobId}","timeout_ms":600000})`,
+        `查看状态: oc_bash({"job_id":"${outcome.jobId}","action":"status"})`,
+        `终止进程: oc_bash({"job_id":"${outcome.jobId}","action":"kill"})`,
+      ].join('\n')
+      return textResult(
+        appendStreamSections(bits.join(' '), outcome.stdout, outcome.stderr, footer),
+        false,
+      )
+    }
+  }
+}
+
+export async function handleOcBash(
+  args: unknown,
+  deps?: { jobManager?: OcBashJobManager },
+): Promise<ToolTextResult> {
   const input = asRecord(args)
   const command = asText(input.command).trim()
-  if (!command) return textResult('oc_bash: command 不能为空', true)
+  const jobId = asText(input.job_id).trim()
+  const rawAction = input.action === undefined ? 'wait' : asText(input.action).trim()
+  const killOnTimeout = input.kill_on_timeout === true
+
+  if (!command && !jobId) {
+    return textResult('oc_bash: command 不能为空（或传入 job_id 操作在途任务）', true)
+  }
+  if (command && jobId) {
+    return textResult('oc_bash: command 与 job_id 不能同时传入；续等请只传 job_id', true)
+  }
+  if (rawAction !== 'wait' && rawAction !== 'status' && rawAction !== 'kill') {
+    return textResult(`oc_bash: 无效的 action "${rawAction}"（仅支持 wait / status / kill）`, true)
+  }
+  if (command && rawAction !== 'wait') {
+    return textResult('oc_bash: 启动新 command 时不能指定 action="status" 或 "kill"', true)
+  }
+
+  const action: OcBashAction = rawAction
   const timeoutMs = clampInt(
     input.timeout_ms,
     OC_BASH_DEFAULT_TIMEOUT_MS,
     OC_BASH_MIN_TIMEOUT_MS,
     OC_BASH_MAX_TIMEOUT_MS,
   )
-  const outcome = await runCaptured({
-    bin: '/bin/bash',
-    args: ['-lc', command],
-    cwd: optionalCwd(input.cwd),
-    timeoutMs,
-    maxBytes: OC_BASH_MAX_OUTPUT_BYTES,
-  })
-  if (outcome.spawnError && !outcome.timedOut) {
-    return textResult(`oc_bash: 启动失败: ${outcome.spawnError}`, true)
-  }
-  const bits = [`exit=${outcome.exitCode ?? 'none'}`]
-  if (outcome.signal) bits.push(`signal=${outcome.signal}`)
-  if (outcome.timedOut) bits.push(`timed out after ${timeoutMs}ms`)
-  if (outcome.truncated) bits.push('truncated')
-  const stdout = outcome.stdout.replace(/\s+$/, '')
-  const stderr = outcome.stderr.replace(/\s+$/, '')
-  let text = bits.join(' ')
-  if (stdout) text += `\n${stdout}`
-  if (stderr) text += `\n--- stderr ---\n${stderr}`
-  return textResult(text, outcome.timedOut || Boolean(outcome.spawnError))
+  const manager = deps?.jobManager ?? defaultOcBashManager
+  const outcome = command
+    ? await manager.startAndWait({
+        command,
+        cwd: optionalCwd(input.cwd),
+        timeoutMs,
+        killOnTimeout,
+      })
+    : await manager.continueJob({
+        jobId,
+        action,
+        timeoutMs,
+        killOnTimeout,
+      })
+  return formatOcBashOutcome(outcome)
 }
 
 async function rgBinOrError(

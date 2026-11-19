@@ -2,12 +2,13 @@
  * Intelligent UI 其余组件:指标、步骤/清单、对比卡、提示框、分段标签、时间线、后续建议、选择。
  */
 import {
-  ArrowUpRight,
   Check,
   CircleAlert,
   CircleCheck,
+  CornerDownLeft,
   Info,
   Lightbulb,
+  ListChecks,
   Minus,
   OctagonAlert,
   Plus,
@@ -132,6 +133,8 @@ function useCheckedState(key: string, initial: boolean[]) {
 export function StepsBlock({ spec, notes, streaming, nested }: BlockProps<StepsSpec>) {
   const key = useMemo(() => hashText(spec.items.map((i) => i.title).join("\n")), [spec.items]);
   const [checked, setChecked] = useCheckedState(key, spec.items.map((i) => i.done));
+  const [checklistMode, setChecklistMode] = useState(false);
+  const checkable = spec.checkable || checklistMode;
   const done = spec.items.filter((_, i) => checked[i] ?? spec.items[i]!.done).length;
   const total = spec.items.length;
   return (
@@ -142,25 +145,38 @@ export function StepsBlock({ spec, notes, streaming, nested }: BlockProps<StepsS
       nested={nested}
       notes={notes}
       streaming={streaming}
-      copyText={() => specToMarkdown({ ...spec, items: spec.items.map((it, i) => ({ ...it, done: checked[i] ?? it.done })) })}
+      copyText={() => specToMarkdown({ ...spec, checkable, items: spec.items.map((it, i) => ({ ...it, done: checked[i] ?? it.done })) })}
       actions={
-        spec.checkable && total > 0 ? (
-          <span className="oc-iui-progress-text" aria-live="polite">
-            <ProgressRing value={done / total} />
-            <span>
-              <span className="sr-only">已完成 </span>
-              {done} / {total}
+        <>
+          {checkable && total > 0 && (
+            <span className="oc-iui-progress-text" aria-live="polite">
+              <ProgressRing value={done / total} />
+              <span>
+                <span className="sr-only">已完成 </span>
+                {done} / {total}
+              </span>
             </span>
-          </span>
-        ) : undefined
+          )}
+          {!spec.checkable && !streaming && total >= 2 && (
+            <button
+              type="button"
+              className="oc-iui-text-btn"
+              aria-pressed={checklistMode}
+              onClick={() => setChecklistMode((v) => !v)}
+            >
+              <ListChecks size={14} aria-hidden />
+              {checklistMode ? "恢复步骤" : "转为核对清单"}
+            </button>
+          )}
+        </>
       }
     >
-      <ol className={cn("oc-iui-steps", spec.checkable && "is-checkable")}>
+      <ol className={cn("oc-iui-steps", checkable && "is-checkable")}>
         {spec.items.map((it, i) => {
-          const isDone = checked[i] ?? it.done;
+          const isDone = checkable && (checked[i] ?? it.done);
           return (
             <li key={`${i}:${it.title}`} className={cn(isDone && "is-done")}>
-              {spec.checkable ? (
+              {checkable ? (
                 <label className="oc-iui-check">
                   <input
                     type="checkbox"
@@ -383,12 +399,12 @@ export function SuggestionsBlock({ spec, streaming, readOnly }: BlockProps<Sugge
   return (
     <Frame kind="suggestions" streaming={streaming} bare className="oc-iui-suggestions-frame">
       {/* biome-ignore lint/a11y/useSemanticElements: 一组发送按钮,不是表单字段组 */}
-      <div className="oc-iui-suggestions" role="group" aria-label="接着问">
+      <div className={cn("oc-iui-suggestions", sent !== null && "has-sent")} role="group" aria-label="接着问">
         {spec.items.map((s) => (
           <button
             key={s}
             type="button"
-            className={cn("oc-iui-suggestion", sent === s && "is-sent")}
+            className={cn("oc-iui-suggestion", sent === s && "is-sent", sent !== null && sent !== s && "is-dimmed")}
             disabled={!canSend || !!busy || sent !== null}
             onClick={() => {
               if (!sendUserText) return;
@@ -397,7 +413,7 @@ export function SuggestionsBlock({ spec, streaming, readOnly }: BlockProps<Sugge
             }}
           >
             <span>{s}</span>
-            <ArrowUpRight size={14} aria-hidden />
+            <CornerDownLeft size={13} aria-hidden />
           </button>
         ))}
       </div>

@@ -1,4 +1,4 @@
-import type { GrokExecutionDescriptor } from '@openclaude/protocol'
+import type { GrokExecutionDescriptor, ServiceTier } from '@openclaude/protocol'
 /**
  * engineAdapter — EngineAdapter 契约(形式化原 SubprocessRunner 的 de-facto
  * EventEmitter 契约,底座差异全部收口在 adapter 内)。
@@ -107,6 +107,8 @@ export interface AutomaticRetryState {
 export interface TurnParams {
   /** Frozen user no-write restriction for this advisor turn, including retries. */
   readOnly?: boolean
+  /** Explicit per-turn speed tier ('fast' | 'ultrafast' | null). Omission means Standard. */
+  serviceTier?: ServiceTier | null
   input: string | Array<{ type: string; [k: string]: unknown }>
   /** PG coordinator-originated turn. Adapters may use this to enforce that
    * no hidden runner-local queue forms behind the platform claim. */

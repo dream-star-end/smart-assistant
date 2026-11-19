@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path'
 import {
   TURN_LEASE_RENEW_AFTER_MS,
   assertLeaseMatchesAuthority,
+  isAdvisorReadOnlyMcpTool,
   parseRemoteDriverExecutionBackend,
   remoteCanonicalSha256,
   sameRemoteExecutionBackend,
@@ -31,8 +32,14 @@ import {
 import { CC5_MOUNT, readCc5AuthorityKeyring } from '../cc5BridgePort.js'
 import type { Cc5FinanceTerminalOutcome } from '../cc5Finance.js'
 import { privateDir, syncDir } from '../cc5FixedTool.js'
-import { validateCc5NativeToolInput, type Cc5ToolResult } from '../cc5NativeTool.js'
 import {
+  REMOTE_V4_TOOL_INPUT_MAX_BYTES,
+  REMOTE_V4_TOOL_RESULT_MAX_BYTES,
+  validateCc5NativeToolInput,
+  type Cc5ToolResult,
+} from '../cc5NativeTool.js'
+import {
+  REMOTE_V4_PROMPT_MAX_BYTES,
   cc5RemotePrompt,
   compileCc5ToolCatalog,
   type Cc5HostProfile,
@@ -41,6 +48,7 @@ import {
 import { Cc5ToolHost } from '../cc5ToolHost.js'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { TurnParams } from '../engine/engineAdapter.js'
+import type { PermissionRequest } from '../engine/engineEvents.js'
 import {
   resolveEngineRemoteContextBuilder,
   type EngineCreateOpts,
@@ -66,7 +74,32 @@ import {
 
 const log = createLogger({ module: 'remoteContainerLane' })
 const LANE_UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
-const MAX_FRAME_BYTES = 8 * 1024 * 1024
+const MAX_FRAME_BYTES = 32 * 1024 * 1024
+const READ_ONLY_BUILTIN_TOOLS = new Set([
+  'Read',
+  'Glob',
+  'Grep',
+  'AskUserQuestion',
+  'SearchExtraTools',
+])
+
+function isAllowedInReadOnlyTurn(
+  clientToolName: string,
+  args: Readonly<Record<string, unknown>>,
+): boolean {
+  if (READ_ONLY_BUILTIN_TOOLS.has(clientToolName)) return true
+  if (clientToolName.startsWith('mcp__openclaude-memory__')) {
+    return isAdvisorReadOnlyMcpTool(clientToolName.slice('mcp__openclaude-memory__'.length))
+  }
+  if (clientToolName === 'ExecuteExtraTool') {
+    const target = typeof args.tool_name === 'string' ? args.tool_name : ''
+    return (
+      target.startsWith('mcp__openclaude-memory__') &&
+      isAdvisorReadOnlyMcpTool(target.slice('mcp__openclaude-memory__'.length))
+    )
+  }
+  return false
+}
 const POLL_IDLE_MS = 15
 const TOOL_IDLE_MS = 20
 const DEFAULT_EXECUTION_ROOT = '/home/agent/.openclaude/.cc5-native-tools'
@@ -464,6 +497,7 @@ export interface RemoteContainerLaneOptions {
     lifecycleId: string,
     profile: Cc5HostProfile,
     env: NodeJS.ProcessEnv,
+    onPermission?: (request: Record<string, unknown>) => Promise<Record<string, unknown>>,
   ) => LaneToolHost
   readonly toolContextFactory?: (input?: {
     readonly promptPolicy?: PromptPrivacyPolicy
@@ -497,6 +531,7 @@ export interface RemoteTurnHandlers {
   readonly onSubmitted: () => void
   readonly onSecurityEvent: (event: RemoteSecurityEvent) => void
   readonly onPresentationItem: (item: RemotePresentationItem) => void
+  readonly onPermissionRequest?: (request: PermissionRequest) => Promise<Record<string, unknown>>
   readonly onControlReply?: (reply: RemoteControlReply) => void
   readonly onToolExecuting?: (info: {
     readonly callId: string
@@ -530,6 +565,8 @@ interface ActiveLaneTurn {
   readonly authorityTurnId: string
   readonly payload: ModelAuthorityPayload
   readonly lease: { leaseEnvelope: string }
+  readonly readOnly: boolean
+  readonly onPermission?: (request: PermissionRequest) => Promise<Record<string, unknown>>
   nativeSessionId?: string
   dispatched: boolean
   cancelRequested: boolean
@@ -573,6 +610,7 @@ export class RemoteContainerLane {
 
   private admitted?: RemoteAdmittedIdentity
   private activeTurn?: ActiveLaneTurn
+  private readonly pendingTurns = new Set<ActiveLaneTurn>()
   private turnMutex: Promise<void> = Promise.resolve()
   private failure?: Error
   private stopRun?: Promise<void>
@@ -814,16 +852,19 @@ export class RemoteContainerLane {
       this.lastBuiltIntelligentUi = context.promptIntelligentUi
       this.promptInitialized = true
       try {
+        const onPermission = (raw: Record<string, unknown>) => this.handleHostPermission(raw)
         const host =
-          this.laneOptions.hostFactory?.(root, lifecycleId, context.profile, context.env) ??
+          this.laneOptions.hostFactory?.(root, lifecycleId, context.profile, context.env, onPermission) ??
           new Cc5ToolHost(
             root,
             lifecycleId,
             context.profile,
-            async () => {
-              throw new Error('REMOTE_PERMISSION_PROMPT_UNSUPPORTED')
-            },
+            onPermission,
             context.env,
+            {
+              maxInputBytes: REMOTE_V4_TOOL_INPUT_MAX_BYTES,
+              maxResultBytes: REMOTE_V4_TOOL_RESULT_MAX_BYTES,
+            },
           )
         this.host = host
         const compiled = compileCc5ToolCatalog(await host.tools())
@@ -846,15 +887,68 @@ export class RemoteContainerLane {
     }))
   }
 
+  private async handleHostPermission(raw: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const turn = this.activeTurn
+    if (!turn || turn.cancelRequested || turn.abort.signal.aborted || this.stopRun !== undefined || !turn.onPermission) {
+      throw new Error('REMOTE_PERMISSION_PROMPT_UNSUPPORTED')
+    }
+    const toolName = typeof raw.tool_name === 'string' && raw.tool_name.length > 0 ? raw.tool_name : 'AskUserQuestion'
+    const toolUseId = typeof raw.tool_use_id === 'string' && raw.tool_use_id.length > 0 ? raw.tool_use_id : undefined
+    const input =
+      raw.input && typeof raw.input === 'object' && !Array.isArray(raw.input)
+        ? (raw.input as Record<string, unknown>)
+        : {}
+    const permissionSuggestions = Array.isArray(raw.permission_suggestions) ? raw.permission_suggestions : undefined
+    const request: PermissionRequest = {
+      requestId: `perm-${randomUUID()}`,
+      toolName,
+      ...(toolUseId ? { toolUseId } : {}),
+      input,
+      ...(permissionSuggestions ? { permissionSuggestions } : {}),
+    }
+
+    const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      if (turn.abort.signal.aborted || this.stopRun !== undefined) {
+        reject(new Error('REMOTE_PERMISSION_ABORTED'))
+        return
+      }
+      let settled = false
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        turn.abort.signal.removeEventListener('abort', onAbort)
+        reject(new Error('REMOTE_PERMISSION_ABORTED'))
+      }
+      turn.abort.signal.addEventListener('abort', onAbort, { once: true })
+      turn.onPermission!(request).then(
+        (res) => {
+          if (settled) return
+          settled = true
+          turn.abort.signal.removeEventListener('abort', onAbort)
+          resolve(res)
+        },
+        (err) => {
+          if (settled) return
+          settled = true
+          turn.abort.signal.removeEventListener('abort', onAbort)
+          reject(err instanceof Error ? err : new Error('REMOTE_PERMISSION_REJECTED'))
+        },
+      )
+    })
+
+    return toolUseId && reply.toolUseID === undefined ? { ...reply, toolUseID: toolUseId } : reply
+  }
+
   validateTurnSubmission(params: TurnParams): {
     readonly authority: string
     readonly lease: string
     readonly turnKey: string
     readonly payload: ModelAuthorityPayload
     readonly prompt: string
+    readonly readOnly: boolean
   } {
     remotePoolNeed(
-      !params.readOnly && !params.consultTurn && !this.opts.hermeticNoTools,
+      !params.consultTurn && !this.opts.hermeticNoTools,
       'REMOTE_READ_ONLY_OR_CONSULT_UNSUPPORTED',
     )
     remotePoolNeed(!this.failure, this.failure?.message ?? 'REMOTE_LANE_FENCED')
@@ -893,7 +987,7 @@ export class RemoteContainerLane {
       'REMOTE_TURN_AUTHORITY_REPLAYED',
     )
     this.seenAuthorityTurnIds.add(payload.authorityTurnId)
-    return { authority, lease, turnKey, payload, prompt }
+    return { authority, lease, turnKey, payload, prompt, readOnly: params.readOnly === true }
   }
 
   async executeTurn(
@@ -904,30 +998,38 @@ export class RemoteContainerLane {
       readonly payload: ModelAuthorityPayload
       readonly prompt: string
       readonly effort?: string
+      readonly readOnly?: boolean
     },
     handlers: RemoteTurnHandlers,
   ): Promise<RemoteContainerTurnOutcome> {
-    let releaseMutex!: () => void
-    const prev = this.turnMutex
-    this.turnMutex = new Promise<void>((res) => {
-      releaseMutex = res
-    })
-    await prev
-
     const turn: ActiveLaneTurn = {
       turnKey: validated.turnKey,
       authority: validated.authority,
       authorityTurnId: validated.payload.authorityTurnId,
       payload: validated.payload,
       lease: { leaseEnvelope: validated.lease },
+      readOnly: Boolean(validated.readOnly),
+      onPermission: handlers.onPermissionRequest,
       dispatched: false,
       cancelRequested: false,
       interruptSent: false,
       abort: new AbortController(),
     }
-    this.activeTurn = turn
+    this.pendingTurns.add(turn)
+
+    let releaseMutex!: () => void
+    const prev = this.turnMutex
+    this.turnMutex = new Promise<void>((res) => {
+      releaseMutex = res
+    })
 
     try {
+      await prev
+      this.pendingTurns.delete(turn)
+      if (turn.cancelRequested || turn.abort.signal.aborted) {
+        return { kind: 'abandoned', nativeSessionId: this.boundNativeSessionId ?? 'unassigned' }
+      }
+      this.activeTurn = turn
       remotePoolNeed(!this.failure && this.stopRun === undefined, this.failure?.message ?? 'REMOTE_LANE_CLOSED')
       const frozenPolicy = this.stagedPromptPrivacy ? structuredClone(this.stagedPromptPrivacy) : undefined
       const epochAtStart = this.configEpoch
@@ -952,10 +1054,10 @@ export class RemoteContainerLane {
         await this.refreshPlatformPrompt(supportsVision, frozenPolicy)
       }
 
-      remotePoolNeed(
-        this.configEpoch === epochAtStart && !turn.cancelRequested && !turn.abort.signal.aborted,
-        'PROMPT_PRIVACY_TURN_SUPERSEDED',
-      )
+      if (turn.cancelRequested || turn.abort.signal.aborted) {
+        return { kind: 'abandoned', nativeSessionId: this.boundNativeSessionId ?? 'unassigned' }
+      }
+      remotePoolNeed(this.configEpoch === epochAtStart, 'PROMPT_PRIVACY_TURN_SUPERSEDED')
       if ((policyChanged || this.promptRefreshRequired) && this.remoteAdmissionAttempted) {
         remotePoolNeed(this.remoteAppStoppedProven, 'REMOTE_APP_STOP_UNPROVEN')
       }
@@ -973,6 +1075,7 @@ export class RemoteContainerLane {
         basePrompt,
         catalog,
         this.resolvedPromptCwd ?? this.opts.agentBaseDir,
+        REMOTE_V4_PROMPT_MAX_BYTES,
       )
 
       this.admitted = {
@@ -1029,6 +1132,7 @@ export class RemoteContainerLane {
 
       return await this.runActiveTurnLoops(turn, admittedReply.seq, handlers)
     } finally {
+      this.pendingTurns.delete(turn)
       turn.stopLease?.()
       if (this.activeTurn === turn) {
         this.activeTurn = undefined
@@ -1171,7 +1275,7 @@ export class RemoteContainerLane {
         req.argsHash === remoteCanonicalSha256(req.arguments),
       'REMOTE_TOOL_REQUEST_INVALID',
     )
-    validateCc5NativeToolInput(`mcp__ocbridge__${req.name}`, req.arguments)
+    validateCc5NativeToolInput(`mcp__ocbridge__${req.name}`, req.arguments, REMOTE_V4_TOOL_INPUT_MAX_BYTES)
     const clientToolName = this.clientNameByRemoteName[`mcp__ocbridge__${req.name}`]
     remotePoolNeed(typeof clientToolName === 'string', 'REMOTE_TOOL_NOT_IN_CATALOG')
 
@@ -1182,6 +1286,28 @@ export class RemoteContainerLane {
 
     const host = this.host
     remotePoolNeed(host !== undefined && this.stopRun === undefined, 'REMOTE_TOOLHOST_CLOSED')
+
+    if (turn.readOnly && !isAllowedInReadOnlyTurn(clientToolName, req.arguments)) {
+      const result: Cc5ToolResult = {
+        content: [{ type: 'text', text: `Tool ${clientToolName} is disabled in read-only mode.` }],
+        isError: true,
+      }
+      handlers.onToolExecuting?.({
+        callId: req.callId,
+        clientToolName,
+        remoteAlias: req.name,
+        arguments: req.arguments,
+      })
+      handlers.onToolExecuted?.({
+        callId: req.callId,
+        clientToolName,
+        remoteAlias: req.name,
+        result,
+      })
+      await this.client.toolResult(req.callId, result)
+      await this.client.toolAck(req.callId)
+      return
+    }
 
     handlers.onToolExecuting?.({
       callId: req.callId,
@@ -1283,23 +1409,35 @@ export class RemoteContainerLane {
   }
 
   interrupt(): boolean {
+    let hit = false
+    for (const pending of this.pendingTurns) {
+      if (!pending.cancelRequested) {
+        pending.cancelRequested = true
+        pending.abort.abort(new Error('USER_CANCELLED'))
+      }
+      hit = true
+    }
     const turn = this.activeTurn
-    if (!turn) return false
-    turn.cancelRequested = true
-    if (!turn.dispatched) {
-      turn.abort.abort(new Error('USER_CANCELLED'))
-      return true
+    if (turn) {
+      hit = true
+      turn.cancelRequested = true
+      if (!turn.dispatched) {
+        turn.abort.abort(new Error('USER_CANCELLED'))
+      } else if (!turn.interruptSent) {
+        turn.interruptSent = true
+        void this.sendInterrupt(turn).catch((err) => {
+          this.fence(err instanceof Error ? err.message : 'REMOTE_INTERRUPT_FAILED')
+        })
+      }
     }
-    if (!turn.interruptSent) {
-      turn.interruptSent = true
-      void this.sendInterrupt(turn).catch((err) => {
-        this.fence(err instanceof Error ? err.message : 'REMOTE_INTERRUPT_FAILED')
-      })
-    }
-    return true
+    return hit
   }
 
   stopLane(): Promise<void> {
+    for (const pending of this.pendingTurns) {
+      pending.cancelRequested = true
+      pending.abort.abort(new Error('REMOTE_LANE_STOPPING'))
+    }
     this.activeTurn?.abort.abort(new Error('REMOTE_LANE_STOPPING'))
     this.activeTurn?.stopLease?.()
     return (this.stopRun ??= (async () => {

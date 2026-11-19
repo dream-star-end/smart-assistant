@@ -33,6 +33,7 @@ import { getHostById as computePoolGetHostById } from '../compute-pool/queries.j
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { dispatchSystemActionsBrowserRoute } from '../system-assistant/browserHttp.js'
 import { dispatchMediaGenerationRoute } from '../media-generation/http.js'
+import { dispatchSitesBrowserRoute } from '../sites/browserHttp.js'
 import { dispatchMuseBridgeRoute } from '../muse/bridgeHttp.js'
 import { dispatchStudioRoute } from '../media-studio/http.js'
 import { MUSE_BRIDGE_PREFIX } from '../muse/protocol.js'
@@ -765,6 +766,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', pathPrefix: '/api/me/sessions/', handler: (req,res) => handleModelSwitchCost(req,res,deps) },
     { method: ANY_METHOD, path: '/api/media-generation', handler: dispatchMediaGenerationRoute },
     { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
+    { method: ANY_METHOD, path: '/api/sites', handler: dispatchSitesBrowserRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/sites/', handler: dispatchSitesBrowserRoute },
     // OCV5-561 Muse bridge (Muse VM dials out; bridge-token auth in the handler).
     { method: ANY_METHOD, pathPrefix: MUSE_BRIDGE_PREFIX, handler: dispatchMuseBridgeRoute },
     // OCV5-591 media studio (404 unless OC_STUDIO_ENABLED=1 and the user is allowed).
@@ -1659,6 +1662,7 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/connectors',
     '/api/plugins',
     '/api/media-generation',
+    '/api/sites',
     // OCV5-561 Muse bridge; 404 unless OC_MUSE_BRIDGE_ENABLED=1.
     MUSE_BRIDGE_PREFIX,
     // OCV5-591 media studio browser API.

@@ -186,3 +186,21 @@ test('Codex launch allows safe platform reads and consult while installing the M
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('OCV5-798: readOnly turn forces Standard default even when serviceTier is fast/ultrafast', async () => {
+  const { buildCodexTurnPolicyParams } = await import('../engine/codexAdvisorReadOnly.js')
+  const roSol = buildCodexTurnPolicyParams('check', 'th1', {
+    model: 'gpt-6.2-sol',
+    serviceTier: 'ultrafast',
+    mode: 'default',
+    readOnly: true,
+  })
+  assert.equal(roSol.serviceTierForTurn, 'default')
+  const normSol = buildCodexTurnPolicyParams('check', 'th1', {
+    model: 'gpt-6.2-sol',
+    serviceTier: 'ultrafast',
+    mode: 'default',
+    readOnly: false,
+  })
+  assert.equal(normSol.serviceTierForTurn, 'ultrafast')
+})

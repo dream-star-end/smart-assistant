@@ -8,6 +8,7 @@ import type { IdentityCompatRuntimeContext } from '@openclaude/storage'
 import type { EngineAdapter } from './engine/engineAdapter.js'
 import type { DurableRuntimeEvent, EngineBillingEvent } from './engine/engineEvents.js'
 import type {
+  ServiceTier,
   TurnWaiveReason,
   DurableGoalUsageRecord,
   GoalStateSnapshot,
@@ -129,6 +130,8 @@ export interface AgentSession {
   _turnCreditBudgetFen?: bigint
   /** Set and cleared only while owning session.lock. */
   _turnReadOnly?: boolean
+  /** Set and cleared only while owning session.lock. */
+  _turnServiceTier?: ServiceTier | null
   /** Active turn's fail-safe tape finalizer. The outer liveness watchdog uses
    * this instead of emitting an unpersisted error and abandoning the parser. */
   _persistActiveTurn?: (

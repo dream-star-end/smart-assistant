@@ -380,13 +380,23 @@ describe("OCV5-434 submit() serviceTier", () => {
     assert.equal(runner.submitTurnCalls.length, 1);
   });
 
-  test("Codex applies per turn without a restart; null is explicit standard", async () => {
-    const runner = new TierRunner("codex", CCB_CAPS, "gpt-6-luna");
+  test("Codex applies fast/ultrafast/null per turn without a restart", async () => {
+    const runner = new TierRunner("codex", CCB_CAPS, "gpt-6.2-sol");
     const session = makeSession(runner as unknown as FakeEngineAdapter);
+    await makeSm().submit(session, "hello", () => {}, undefined, undefined, undefined, undefined, undefined, {
+      serviceTier: "fast",
+    });
+    await makeSm().submit(session, "hello", () => {}, undefined, undefined, undefined, undefined, undefined, {
+      serviceTier: "ultrafast",
+    });
     await makeSm().submit(session, "hello", () => {}, undefined, undefined, undefined, undefined, undefined, {
       serviceTier: null,
     });
-    assert.deepEqual(runner.tierCalls, [[null, "gpt-6-luna"]]);
+    assert.deepEqual(runner.tierCalls, [
+      ["fast", "gpt-6.2-sol"],
+      ["ultrafast", "gpt-6.2-sol"],
+      [null, "gpt-6.2-sol"],
+    ]);
     assert.equal(runner.shutdowns, 0);
   });
 

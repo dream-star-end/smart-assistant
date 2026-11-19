@@ -21,7 +21,7 @@ import {
   remotePoolNeed,
 } from './types.js'
 
-const MAX_BUFFER_BYTES = 8 * 1024 * 1024
+const MAX_BUFFER_BYTES = 32 * 1024 * 1024
 
 export function readJsonLines(
   child: ChildProcessWithoutNullStreams,

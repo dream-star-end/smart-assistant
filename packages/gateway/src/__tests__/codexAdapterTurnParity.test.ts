@@ -1814,3 +1814,80 @@ for (const outcome of ['overflow', 'stop', 'shutdown']) {
     assert.equal(h.events.filter((e) => e.kind === 'context_compacted').length, 0);
   });
 }
+
+describe("OCV5-798 — Codex speed tiers & credit budget", () => {
+  test("warm Sol runner sends ultrafast on paid turn and resets omitted /compact turn to default", async () => {
+    const h = makeHarness({ model: "gpt-6.2-sol" });
+    try {
+      h.adapter.setServiceTier("ultrafast", "gpt-6.2-sol");
+      const t1 = beginTurn(h, { requestId: "req-warm-uf", serviceTier: "ultrafast" });
+      const req1 = await waitForRequest(h, "turn/start");
+      assert.equal((req1.params as { serviceTierForTurn?: unknown })?.serviceTierForTurn, "ultrafast");
+      const p = h.proc() as FakeCodexProc & { kill: () => void };
+      const origKill = p.kill.bind(p);
+      p.kill = () => {
+        origKill();
+        setImmediate(() => p.emit("close", 0, "SIGTERM"));
+      };
+      p.notify("turn/completed", { turn: { id: "turn-1", status: "completed", durationMs: 5 } });
+      await t1.submitted;
+      await t1.summary;
+
+      p.written.length = 0;
+      const t2 = beginTurn(h, { requestId: "req-compact", input: "/compact" });
+      const req2 = await waitForRequest(h, "turn/start");
+      assert.equal((req2.params as { serviceTierForTurn?: unknown })?.serviceTierForTurn, "default");
+      assert.equal(h.spawnCalls.length, 1, "warm runner reused for /compact");
+      p.notify("turn/completed", { turn: { id: "turn-1", status: "completed", durationMs: 5 } });
+      await t2.submitted;
+      await t2.summary;
+    } finally {
+      await h.adapter.shutdown().catch(() => {});
+    }
+  });
+
+  test("gpt-6.2-sol Ultrafast 6x triggers creditBudgetFen interrupt", async () => {
+    _setPlatformPricingLookupForTests(async () => ({
+      inputPerMtok: "100",
+      outputPerMtok: "1000",
+      cacheReadPerMtok: "10",
+      cacheWritePerMtok: "0",
+      multiplier: "1.000",
+    }));
+    _setModelCatalogClientForTests({
+      get configured() { return true; },
+      async lookupAgentCostMultiplier() { return "1.000"; },
+    } as never);
+    const h = makeHarness({ model: "gpt-6.2-sol" });
+    try {
+      h.adapter.setServiceTier("ultrafast", "gpt-6.2-sol");
+      const turn = beginTurn(h, { requestId: "req-uf-budget", creditBudgetFen: 600n, serviceTier: "ultrafast" });
+      const turnStartReq = await waitForRequest(h, "turn/start");
+      assert.equal((turnStartReq.params as { serviceTierForTurn?: unknown })?.serviceTierForTurn, "ultrafast");
+      const p = h.proc() as FakeCodexProc & { kill: () => void };
+      const origKill = p.kill.bind(p);
+      p.kill = () => {
+        origKill();
+        setImmediate(() => p.emit("close", 0, "SIGTERM"));
+      };
+      const tid = { threadId: "thr-new-1", turnId: "turn-1" };
+      // 1M input = 100 fen base × 6 (ultrafast) = 600 fen >= 600 budget -> turn/interrupt
+      p.notify("thread/tokenUsage/updated", {
+        ...tid,
+        tokenUsage: {
+          last: { cachedInputTokens: 0, inputTokens: 1_000_000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1_000_000 },
+          total: { cachedInputTokens: 0, inputTokens: 1_000_000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1_000_000 },
+        },
+      });
+      await waitForRequest(h, "turn/interrupt");
+      p.notify("turn/completed", { turn: { id: "turn-1", status: "interrupted", durationMs: 7 } });
+      await turn.submitted;
+      const s1 = await turn.summary;
+      assert.equal(s1?.errorClass, "insufficient_credits");
+    } finally {
+      await h.adapter.shutdown().catch(() => {});
+      _setPlatformPricingLookupForTests(null);
+      _setModelCatalogClientForTests(null);
+    }
+  });
+});

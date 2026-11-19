@@ -309,6 +309,11 @@ export const DURABLE_TABLES: readonly string[] = [
   "remote_agent_profiles",
   "remote_model_offers",
   "remote_agent_bindings",
+  // OCV5-791 / OCV5-797 / OCV5-802: user fullstack static sites metadata, slug claims, env secrets, and rev counter.
+  "user_sites_rev_counter",
+  "user_sites",
+  "user_site_slug_claims",
+  "user_site_env_vars",
 ] as const;
 
 /**

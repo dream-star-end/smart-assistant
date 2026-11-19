@@ -13,12 +13,12 @@ import {
   HARD_WEB_CONTEXT_MAX_DECODED_BYTES,
   HARD_WEB_CONTEXT_MAX_ENCODED_BYTES,
   type WebContextKind,
+  type WebContextSsrfProxyOptions,
   detectBlockedContent,
   fetchWebContextUrl,
-  normalizeHttpUrl,
   parseBoundedInt,
-  resolvePublicIp,
 } from './webContextSafety.js'
+import { checkWebContextBrowserHealth, renderWebContextUrlWithBrowser } from './webContextBrowser.js'
 
 export const OPENCLAUDE_WEB_CONTEXT_MCP_ID = 'web-context'
 export const WEB_CONTEXT_EXTRACT_URL_TOOL = 'web_context_extract_url'
@@ -67,6 +67,8 @@ export type WebContextExtractUrlArgs = {
   timeout_ms?: unknown
   max_encoded_bytes?: unknown
   max_decoded_bytes?: unknown
+  _browserProxyOptions?: WebContextSsrfProxyOptions
+  _onBrowserPid?: (pid: number) => void
 }
 
 export type WebContextParseFileArgs = {
@@ -247,10 +249,163 @@ async function withConcurrency<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+const SPA_JS_HINT_RE =
+  /enable javascript|requires javascript|javascript is disabled|turn on javascript|please enable js/i
+const SPA_EMPTY_MOUNT_RE = /<div\s+id=["'](?:app|root|__next|__nuxt)["']\s*>\s*<\/div>/i
+
+async function runExtractorOnBody(params: {
+  url: string
+  finalUrl: string
+  status: number
+  contentType: string
+  kind: WebContextKind
+  body: Buffer
+  encodedBytes: number
+  decodedBytes: number
+  redirects: string[]
+  maxChars: number
+  timeoutMs: number
+}): Promise<Record<string, unknown>> {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-web-context-'))
+  try {
+    const ext =
+      params.kind === 'html' ? '.html' : params.kind === 'text' ? '.txt' : `.${params.kind}`
+    const file = join(dir, `body${ext}`)
+    writeFileSync(file, params.body)
+    const child = await runChild(
+      {
+        op: parserOpForKind(params.kind),
+        file_path: file,
+        source_url: params.finalUrl,
+        content_type: params.contentType,
+        kind: params.kind,
+        max_chars: params.maxChars,
+      },
+      params.timeoutMs,
+    )
+    const out = truncateText(child.markdown ?? child.text, params.maxChars)
+    const markerMiss = out.text.trim().length < 120 && params.kind === 'html'
+    return {
+      ...child,
+      ok: child.ok !== false && !markerMiss,
+      url: params.url,
+      final_url: params.finalUrl,
+      http_status: params.status,
+      content_type: params.contentType,
+      kind: params.kind,
+      encoded_bytes: params.encodedBytes,
+      decoded_bytes: params.decodedBytes,
+      redirects: params.redirects,
+      markdown: out.text,
+      truncated: out.truncated || child.truncated === true,
+      ...(markerMiss ? { error: 'extracted output is too small to be useful' } : {}),
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function shouldFallbackToBrowser(
+  staticResult: Record<string, unknown>,
+  rawHtml: Buffer,
+): string | null {
+  if (staticResult.kind !== 'html' || staticResult.blocked === true) return null
+  const status = typeof staticResult.http_status === 'number' ? staticResult.http_status : 0
+  if (status < 200 || status >= 300) return null
+  const md = typeof staticResult.markdown === 'string' ? staticResult.markdown.trim() : ''
+  if (staticResult.ok === false || md.length < 120) return 'static_output_too_small'
+  if (md.length < 400) {
+    const htmlSample = rawHtml.subarray(0, 32 * 1024).toString('utf8')
+    if (SPA_JS_HINT_RE.test(md) || SPA_EMPTY_MOUNT_RE.test(htmlSample)) {
+      return 'spa_shell_detected'
+    }
+  }
+  return null
+}
+
+function isSsrfRejectionError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /non-public ip|localhost|not allowed|ssrf|resolve to a public ip/i.test(msg)
+}
+
+async function extractViaBrowser(params: {
+  url: string
+  mode: 'auto' | 'browser'
+  maxChars: number
+  deadlineMs: number
+  maxEncodedBytes: number
+  maxDecodedBytes: number
+  proxyOptions?: WebContextSsrfProxyOptions
+  onBrowserPid?: (pid: number) => void
+  fallbackReason?: string
+}): Promise<Record<string, unknown>> {
+  const rendered = await renderWebContextUrlWithBrowser(params.url, {
+    timeoutMs: Math.max(1_000, params.deadlineMs - Date.now()),
+    deadlineMs: params.deadlineMs,
+    maxEncodedBytes: params.maxEncodedBytes,
+    maxDecodedBytes: params.maxDecodedBytes,
+    proxyOptions: params.proxyOptions,
+    onBrowserPid: params.onBrowserPid,
+  })
+  const blockedReason = detectBlockedContent(rendered.status, rendered.body)
+  if (blockedReason) {
+    return {
+      ok: false,
+      blocked: true,
+      blocked_reason: blockedReason,
+      url: params.url,
+      final_url: rendered.finalUrl,
+      http_status: rendered.status,
+      content_type: rendered.contentType,
+      mode: params.mode,
+      rendered_via: 'browser',
+      ...(params.fallbackReason ? { fallback_reason: params.fallbackReason } : {}),
+    }
+  }
+  if (rendered.status < 200 || rendered.status >= 300) {
+    return {
+      ok: false,
+      error: `HTTP ${rendered.status}`,
+      url: params.url,
+      final_url: rendered.finalUrl,
+      http_status: rendered.status,
+      mode: params.mode,
+      rendered_via: 'browser',
+      ...(params.fallbackReason ? { fallback_reason: params.fallbackReason } : {}),
+    }
+  }
+  const remainingChildMs = params.deadlineMs - Date.now()
+  if (remainingChildMs <= 0) {
+    throw new Error('web-context extraction timed out before parser stage')
+  }
+  const extracted = await runExtractorOnBody({
+    url: params.url,
+    finalUrl: rendered.finalUrl,
+    status: rendered.status,
+    contentType: rendered.contentType,
+    kind: 'html',
+    body: rendered.body,
+    encodedBytes: rendered.body.length,
+    decodedBytes: rendered.body.length,
+    redirects: rendered.redirects,
+    maxChars: params.maxChars,
+    timeoutMs: remainingChildMs,
+  })
+  return {
+    ...extracted,
+    mode: params.mode,
+    rendered_via: 'browser',
+    ...(params.fallbackReason ? { fallback_reason: params.fallbackReason } : {}),
+  }
+}
+
 export async function extractUrl(args: WebContextExtractUrlArgs): Promise<Record<string, unknown>> {
   const url = optionalString(args.url)
   if (!url) throw new Error('url is required')
   const mode = optionalString(args.mode) ?? 'auto'
+  if (mode !== 'auto' && mode !== 'static' && mode !== 'browser') {
+    throw new Error('invalid mode: expected auto, static, or browser')
+  }
   const maxChars = boundedNumber(args.max_chars, DEFAULT_MAX_OUTPUT_CHARS, 1_000, MAX_OUTPUT_CHARS)
   const timeoutMs = boundedNumber(
     args.timeout_ms,
@@ -258,33 +413,42 @@ export async function extractUrl(args: WebContextExtractUrlArgs): Promise<Record
     MIN_TIMEOUT_MS,
     MAX_TIMEOUT_MS,
   )
+  const deadlineMs = Date.now() + timeoutMs
+  const maxEncodedBytes = boundedNumber(
+    args.max_encoded_bytes,
+    DEFAULT_WEB_CONTEXT_MAX_ENCODED_BYTES,
+    1,
+    HARD_WEB_CONTEXT_MAX_ENCODED_BYTES,
+  )
+  const maxDecodedBytes = boundedNumber(
+    args.max_decoded_bytes,
+    DEFAULT_WEB_CONTEXT_MAX_DECODED_BYTES,
+    1,
+    HARD_WEB_CONTEXT_MAX_DECODED_BYTES,
+  )
+
   if (mode === 'browser') {
-    const normalizedUrl = normalizeHttpUrl(url)
-    await resolvePublicIp(normalizedUrl.hostname)
-    return {
-      ok: false,
-      blocked: false,
-      error:
-        'browser rendering is unavailable in web-context: static extraction keeps redirects and DNS behind the SSRF guard',
+    return await extractViaBrowser({
+      url,
       mode: 'browser',
-      final_url: normalizedUrl.toString(),
-    }
+      maxChars,
+      deadlineMs,
+      maxEncodedBytes,
+      maxDecodedBytes,
+      proxyOptions: args._browserProxyOptions,
+      onBrowserPid: args._onBrowserPid,
+    })
   }
 
   const fetched = await fetchWebContextUrl(url, {
-    timeoutMs: Math.min(timeoutMs, DEFAULT_WEB_CONTEXT_TIMEOUT_MS),
-    maxEncodedBytes: boundedNumber(
-      args.max_encoded_bytes,
-      DEFAULT_WEB_CONTEXT_MAX_ENCODED_BYTES,
-      1,
-      HARD_WEB_CONTEXT_MAX_ENCODED_BYTES,
-    ),
-    maxDecodedBytes: boundedNumber(
-      args.max_decoded_bytes,
-      DEFAULT_WEB_CONTEXT_MAX_DECODED_BYTES,
-      1,
-      HARD_WEB_CONTEXT_MAX_DECODED_BYTES,
-    ),
+    timeoutMs: Math.max(1_000, Math.min(deadlineMs - Date.now(), DEFAULT_WEB_CONTEXT_TIMEOUT_MS)),
+    deadlineMs,
+    maxEncodedBytes,
+    maxDecodedBytes,
+    ...(args._browserProxyOptions?.lookup ? { lookup: args._browserProxyOptions.lookup } : {}),
+    ...(args._browserProxyOptions?.connectSocket
+      ? { connectSocket: args._browserProxyOptions.connectSocket }
+      : {}),
   })
   const blockedReason = detectBlockedContent(fetched.status, fetched.body)
   if (blockedReason) {
@@ -296,6 +460,8 @@ export async function extractUrl(args: WebContextExtractUrlArgs): Promise<Record
       final_url: fetched.finalUrl,
       http_status: fetched.status,
       content_type: fetched.contentType,
+      mode,
+      rendered_via: 'static',
     }
   }
   if (fetched.status < 200 || fetched.status >= 300) {
@@ -305,45 +471,78 @@ export async function extractUrl(args: WebContextExtractUrlArgs): Promise<Record
       url,
       final_url: fetched.finalUrl,
       http_status: fetched.status,
+      mode,
+      rendered_via: 'static',
     }
   }
 
-  const dir = mkdtempSync(join(tmpdir(), 'oc-web-context-'))
+  const staticChildTimeout = deadlineMs - Date.now()
+  if (staticChildTimeout <= 0) {
+    throw new Error('web-context extraction timed out before parser stage')
+  }
+  const staticResult = await runExtractorOnBody({
+    url,
+    finalUrl: fetched.finalUrl,
+    status: fetched.status,
+    contentType: fetched.contentType,
+    kind: fetched.kind,
+    body: fetched.body,
+    encodedBytes: fetched.encodedBytes,
+    decodedBytes: fetched.decodedBytes,
+    redirects: fetched.redirects,
+    maxChars,
+    timeoutMs: staticChildTimeout,
+  })
+  if (mode === 'static') {
+    return { ...staticResult, mode: 'static', rendered_via: 'static' }
+  }
+
+  const fallbackReason = shouldFallbackToBrowser(staticResult, fetched.body)
+  if (!fallbackReason) {
+    return { ...staticResult, mode: 'auto', rendered_via: 'static' }
+  }
+
+  const remainingMs = deadlineMs - Date.now()
+  if (remainingMs < 500) {
+    return { ...staticResult, mode: 'auto', rendered_via: 'static' }
+  }
+
   try {
-    const ext =
-      fetched.kind === 'html' ? '.html' : fetched.kind === 'text' ? '.txt' : `.${fetched.kind}`
-    const file = join(dir, `body${ext}`)
-    writeFileSync(file, fetched.body)
-    const child = await runChild(
-      {
-        op: parserOpForKind(fetched.kind),
-        file_path: file,
-        source_url: fetched.finalUrl,
-        content_type: fetched.contentType,
-        kind: fetched.kind,
-        max_chars: maxChars,
-      },
-      timeoutMs,
-    )
-    const out = truncateText(child.markdown ?? child.text, maxChars)
-    const markerMiss = out.text.length < 120 && fetched.kind === 'html'
-    return {
-      ...child,
-      ok: child.ok !== false && !markerMiss,
+    const browserResult = await extractViaBrowser({
       url,
-      final_url: fetched.finalUrl,
-      http_status: fetched.status,
-      content_type: fetched.contentType,
-      kind: fetched.kind,
-      encoded_bytes: fetched.encodedBytes,
-      decoded_bytes: fetched.decodedBytes,
-      redirects: fetched.redirects,
-      markdown: out.text,
-      truncated: out.truncated || child.truncated === true,
-      ...(markerMiss ? { error: 'extracted output is too small to be useful' } : {}),
+      mode: 'auto',
+      maxChars,
+      deadlineMs,
+      maxEncodedBytes,
+      maxDecodedBytes,
+      proxyOptions: args._browserProxyOptions,
+      onBrowserPid: args._onBrowserPid,
+      fallbackReason,
+    })
+    const staticLen = typeof staticResult.markdown === 'string' ? staticResult.markdown.trim().length : 0
+    const browserLen = typeof browserResult.markdown === 'string' ? browserResult.markdown.trim().length : 0
+    if (browserResult.ok === true || browserResult.blocked === true || browserLen > staticLen) {
+      return browserResult
     }
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
+    return {
+      ...staticResult,
+      mode: 'auto',
+      rendered_via: 'static',
+      fallback_reason: fallbackReason,
+    }
+  } catch (err) {
+    if (isSsrfRejectionError(err)) throw err
+    const msg = err instanceof Error ? err.message : String(err)
+    if (staticResult.ok === true || /Chromium executable not found/i.test(msg)) {
+      return {
+        ...staticResult,
+        mode: 'auto',
+        rendered_via: 'static',
+        fallback_reason: fallbackReason,
+        browser_fallback_error: msg,
+      }
+    }
+    throw err
   }
 }
 
@@ -369,7 +568,15 @@ export async function parseFile(args: WebContextParseFileArgs): Promise<Record<s
 
 export async function healthCheck(): Promise<Record<string, unknown>> {
   const timeoutMs = boundedNumber(undefined, 20_000, 1_000, 60_000)
-  return await runChild({ op: 'health_check' }, timeoutMs)
+  const child = await runChild({ op: 'health_check' }, timeoutMs)
+  const hasExplicitBrowserEnv = Boolean(process.env.OPENCLAUDE_WEB_CONTEXT_BROWSER?.trim())
+  if (Object.prototype.hasOwnProperty.call(child, 'browser') && !hasExplicitBrowserEnv) {
+    return child
+  }
+  return {
+    ...child,
+    browser: await checkWebContextBrowserHealth(),
+  }
 }
 
 const TOOLS = [
@@ -379,7 +586,7 @@ const TOOLS = [
       'Extract public web/document context into clean Markdown for AI use.',
       'Use for public URLs, official pages, articles, filings, PDFs and documents.',
       'Does not bypass anti-bot/CAPTCHA/Cloudflare; blocked pages return blocked=true.',
-      'mode="auto" is the safe default. mode="browser" is unavailable until a guarded rendering proxy exists.',
+      'mode="auto" tries fast static extraction first and falls back to SSRF-guarded headless Chromium when SPA HTML yields insufficient text; mode="browser" renders via guarded Chromium directly.',
     ].join('\n'),
     inputSchema: {
       type: 'object',

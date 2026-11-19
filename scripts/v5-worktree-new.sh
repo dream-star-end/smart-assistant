@@ -323,7 +323,7 @@ create_worktree() {
   if [[ "$fresh" == 1 ]]; then
     need_tool npm
     echo "── --fresh: npm ci(不复用)──"
-    (cd "$path" && npm ci)
+    (cd "$path" && ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci)
     assert_workspace_self_point "$path" "" || die "工作区自指自检失败,拒绝交付这棵树"
   else
     echo "── 复用第三方依赖($method)并自指工作区包──"

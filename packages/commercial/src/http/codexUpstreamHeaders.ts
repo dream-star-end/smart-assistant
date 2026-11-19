@@ -37,6 +37,7 @@ const SAFE_UPSTREAM_REQUEST_HEADERS = new Set([
   // Responses Lite request path. They contain routing state/capability only;
   // broader client-correlation headers intentionally remain blocked.
   'x-codex-turn-state',
+  'x-codex-routing-hint',
   'x-openai-internal-codex-responses-lite',
 ])
 

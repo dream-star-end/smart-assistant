@@ -15,7 +15,7 @@ import {
   type RemotePendingToolRequest,
   type RemoteSecurityEvent,
 } from '@openclaude/protocol'
-import { validateCc5NativeToolInput } from '../cc5NativeTool.js'
+import { REMOTE_V4_TOOL_INPUT_MAX_BYTES, validateCc5NativeToolInput } from '../cc5NativeTool.js'
 import { remotePoolNeed } from './types.js'
 
 export interface ObservedRemoteToolCall {
@@ -143,7 +143,7 @@ export class RemoteObservationGate {
           'REMOTE_TOOL_OBSERVED_WITHOUT_SESSION',
         )
         remotePoolNeed(this.allowedToolAliases.has(payload.name), 'REMOTE_TOOL_ALIAS_NOT_ALLOWED')
-        validateCc5NativeToolInput(`mcp__ocbridge__${payload.name}`, payload.arguments)
+        validateCc5NativeToolInput(`mcp__ocbridge__${payload.name}`, payload.arguments, REMOTE_V4_TOOL_INPUT_MAX_BYTES)
         const recomputedHash = remoteCanonicalSha256(payload.arguments)
         remotePoolNeed(recomputedHash === payload.argsHash, 'REMOTE_TOOL_ARGS_HASH_MISMATCH')
 
@@ -236,7 +236,7 @@ export class RemoteObservationGate {
 
     try {
       remotePoolNeed(this.allowedToolAliases.has(req.name), 'REMOTE_TOOL_ALIAS_NOT_ALLOWED')
-      validateCc5NativeToolInput(`mcp__ocbridge__${req.name}`, req.arguments)
+      validateCc5NativeToolInput(`mcp__ocbridge__${req.name}`, req.arguments, REMOTE_V4_TOOL_INPUT_MAX_BYTES)
       const actualHash = remoteCanonicalSha256(req.arguments)
       remotePoolNeed(actualHash === req.argsHash, 'REMOTE_TOOL_ARGS_HASH_MISMATCH')
 

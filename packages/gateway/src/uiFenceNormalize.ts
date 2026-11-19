@@ -16,46 +16,54 @@ const INDENTED_CODE = /^(?: {4}|\t)/
 export function normalizeInlineUiFences(text: string): string {
   if (!text.includes('```ui') && !text.includes('~~~ui')) return text
   const out: string[] = []
-  let open: { char: string; len: number; ui: boolean } | null = null
+  type OpenState = { char: string; len: number; ui: boolean; depth: number }
+  const state: { open: OpenState | null } = { open: null }
 
+  const fenceChar = (o: { char: string }) => (o.char === '`' ? '`' : '~')
   const closeRe = (o: { char: string; len: number }) =>
-    new RegExp(`^ {0,3}${o.char === '`' ? '`' : '~'}{${o.len},}[ \\t]*$`)
-  const pushUiBody = (line: string) => {
-    // `{…}```` :收围栏贴在 JSON 后面。
-    const o = open!
-    const glued = new RegExp(
-      `^(.*\\})[ \\t]*(${o.char === '`' ? '`' : '~'}{${o.len},})[ \\t]*$`,
-    ).exec(line)
-    if (glued) {
-      out.push(glued[1]!, glued[2]!)
-      open = null
-    } else out.push(line)
-  }
-  const openUi = (indent: string, fence: string, rest: string) => {
-    out.push(`${indent}${fence}ui`)
-    open = { char: fence[0]!, len: fence.length, ui: true }
-    if (rest.trim()) pushUiBody(rest.trim())
-  }
-
-  for (const line of text.split('\n')) {
-    if (open) {
-      if (closeRe(open).test(line)) {
-        out.push(line)
-        open = null
-      } else if (open.ui) pushUiBody(line)
-      else out.push(line)
-      continue
+    new RegExp(`^ {0,3}${fenceChar(o)}{${o.len},}[ \\t]*$`)
+  const closeTrailingRe = (o: { char: string; len: number }) =>
+    new RegExp(`^( {0,3}${fenceChar(o)}{${o.len},})[ \\t]*(\\S.*)$`)
+  const findUiCloseSplit = (
+    line: string,
+    o: OpenState,
+  ): { before: string; fence: string; after: string } | null => {
+    const ch = fenceChar(o)
+    const trailingClose = closeTrailingRe(o).exec(line)
+    if (trailingClose) return { before: '', fence: trailingClose[1]!, after: trailingClose[2]! }
+    let inString = false
+    let esc = false
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i]!
+      if (inString) {
+        if (esc) esc = false
+        else if (c === '\\') esc = true
+        else if (c === '"') inString = false
+        continue
+      }
+      if (c === '"') inString = true
+      else if (c === '{') o.depth += 1
+      else if (c === '}') {
+        if (o.depth > 0) o.depth -= 1
+        if (o.depth === 0) {
+          const tail = new RegExp(`^[ \\t]*(${ch}{${o.len},})(?:[ \\t]*(\\S.*))?$`).exec(line.slice(i + 1))
+          if (tail) return { before: line.slice(0, i + 1), fence: tail[1]!, after: tail[2] ?? '' }
+        }
+      }
     }
+    return null
+  }
+  const pushOutside = (line: string) => {
     const withBody = LINE_UI_WITH_BODY.exec(line)
     if (withBody) {
       openUi(withBody[1]!, withBody[2]!, withBody[3]!)
-      continue
+      return
     }
     const m = LINE_FENCE.exec(line)
     if (m) {
       out.push(line)
-      open = { char: m[1]![0]!, len: m[1]!.length, ui: m[2]!.toLowerCase() === 'ui' }
-      continue
+      state.open = { char: m[1]![0]!, len: m[1]!.length, ui: m[2]!.toLowerCase() === 'ui', depth: 0 }
+      return
     }
     // 只处理正文后面贴着的开围栏:前面得有文字,且这一行不是缩进代码块(4 空格/Tab 起头)。
     const g = INDENTED_CODE.test(line) ? null : GLUED_UI.exec(line)
@@ -63,9 +71,40 @@ export function normalizeInlineUiFences(text: string): string {
     if (g && before.trim()) {
       out.push(before)
       openUi('', g[1]!, line.slice(g.index + g[0].length))
-      continue
+      return
     }
     out.push(line)
+  }
+  const pushUiBody = (line: string) => {
+    // 仅在 JSON 字符串外且根对象闭合后（或行首闭合围栏）拆分收围栏与后续正文，避免破坏正文字符串里的 ```{...}```。
+    const o = state.open!
+    const split = findUiCloseSplit(line, o)
+    if (split) {
+      if (split.before) out.push(split.before)
+      out.push(split.fence)
+      state.open = null
+      if (split.after) pushOutside(split.after)
+      return
+    }
+    out.push(line)
+  }
+  const openUi = (indent: string, fence: string, rest: string) => {
+    out.push(`${indent}${fence}ui`)
+    state.open = { char: fence[0]!, len: fence.length, ui: true, depth: 0 }
+    if (rest.trim()) pushUiBody(rest.trim())
+  }
+
+  for (const line of text.split('\n')) {
+    const o = state.open
+    if (o) {
+      if (closeRe(o).test(line)) {
+        out.push(line)
+        state.open = null
+      } else if (o.ui) pushUiBody(line)
+      else out.push(line)
+      continue
+    }
+    pushOutside(line)
   }
   return out.join('\n')
 }

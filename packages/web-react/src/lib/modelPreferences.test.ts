@@ -55,7 +55,7 @@ describe("model preferences", () => {
   });
 
   test("team leader effort is resolved against the actual Astra execution model", () => {
-    expect(effectiveEffortModelId("MiniMax-M3", true)).toBe("gpt-6-astra");
+    expect(effectiveEffortModelId("MiniMax-M3", true)).toBe("gpt-6.2-astra");
     expect(effectiveEffortModelId("gpt-5.6-terra", false)).toBe("gpt-5.6-terra");
   });
 

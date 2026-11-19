@@ -26,7 +26,8 @@ export type PaletteActionId =
   | "new-project"
   | "move-session"
   | "open-home"
-  | "open-board";
+  | "open-board"
+  | "open-sites";
 
 export type PaletteAction = { id: PaletteActionId; label: string; keywords?: string };
 
@@ -246,6 +247,7 @@ export function paletteActions(opts: {
   canMoveSession: boolean;
   canOpenHome: boolean;
   canOpenBoard: boolean;
+  canOpenSites?: boolean;
 }): PaletteAction[] {
   const q = opts.query.trim();
   const out: PaletteAction[] = [];
@@ -263,6 +265,7 @@ export function paletteActions(opts: {
     out.push({ id: "open-home", label: "打开项目主页", keywords: `home ${opts.currentProject.name}` });
   }
   if (opts.canOpenBoard) out.push({ id: "open-board", label: "打开看板", keywords: "board kanban 任务" });
+  if (opts.canOpenSites) out.push({ id: "open-sites", label: "打开站点", keywords: "sites website 站点 网站 部署" });
   out.push({ id: "new-project", label: q ? `新建项目「${q}」` : "新建项目…", keywords: "new project" });
   return out;
 }

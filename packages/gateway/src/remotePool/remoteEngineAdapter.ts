@@ -34,6 +34,7 @@ import type {
 import type {
   DurableRuntimeEvent,
   PartialSnapshot,
+  PermissionRequest,
   PhantomSignals,
   SegmentRecord,
   TurnSummary,
@@ -90,6 +91,8 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
   private _activeRun?: {
     readonly getPartialSnapshot: () => PartialSnapshot
     readonly getPendingTools: () => number
+    readonly hasPendingPermissions: () => boolean
+    readonly resolvePermission: (requestId: string, response: Record<string, unknown>) => boolean
     readonly markInterrupted: (reason?: 'user' | 'system') => void
     readonly finalizeNull: () => void
     drainPromise: Promise<void>
@@ -105,7 +108,6 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       backend.sessionKey === opts.sessionKey &&
         !opts.hermeticNoTools &&
         !opts.advisorExecutionLock &&
-        !opts.delegationDepth &&
         opts.executionTarget?.kind !== 'remote' &&
         (!opts.resumeSessionId || parsedResume?.bindingId === backend.operationId),
       'REMOTE_ADAPTER_PROFILE_UNSUPPORTED',
@@ -192,6 +194,16 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     const emittedToolResultIds = new Set<string>()
     const runtimeEvents: DurableRuntimeEvent[] = []
     let pendingToolCalls = 0
+    const pendingPermissions = new Map<
+      string,
+      { resolve: (response: Record<string, unknown>) => void; reject: (err: Error) => void }
+    >()
+    const rejectPendingPermissions = (reason: string): void => {
+      for (const waiter of pendingPermissions.values()) {
+        waiter.reject(new Error(reason))
+      }
+      pendingPermissions.clear()
+    }
     let finalized = false
     let userCancelled = false
     let interruptReason: 'user' | 'system' | null = null
@@ -234,6 +246,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     const finalizeWith = (value: TurnSummary | null): void => {
       if (finalized) return
       finalized = true
+      rejectPendingPermissions('TURN_FINALIZED')
       if (this._activeRun === activeHandle) {
         this._activeRun = undefined
       }
@@ -552,9 +565,18 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     const activeHandle: NonNullable<RemoteEngineAdapter['_activeRun']> = {
       getPartialSnapshot,
       getPendingTools: () => pendingToolCalls,
+      hasPendingPermissions: () => pendingPermissions.size > 0,
+      resolvePermission: (requestId: string, response: Record<string, unknown>) => {
+        const waiter = pendingPermissions.get(requestId)
+        if (!waiter || finalized) return false
+        pendingPermissions.delete(requestId)
+        waiter.resolve(response)
+        return true
+      },
       markInterrupted: (reason?: 'user' | 'system') => {
         interruptReason = reason ?? 'system'
         if (reason === 'user') userCancelled = true
+        rejectPendingPermissions('TURN_INTERRUPTED')
       },
       finalizeNull: () => {
         interruptReason = 'user'
@@ -589,6 +611,17 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
               resolveSubmitted()
             },
             onSecurityEvent: handleSecurityEvent,
+            onPermissionRequest: (request: PermissionRequest) => {
+              this.lastActivityAt = Date.now()
+              this.emit('activity')
+              if (finalized || userCancelled || interruptReason !== null) {
+                return Promise.reject(new Error('TURN_NOT_ACTIVE'))
+              }
+              return new Promise<Record<string, unknown>>((resolve, reject) => {
+                pendingPermissions.set(request.requestId, { resolve, reject })
+                params.onEvent({ kind: 'permission_request', request })
+              })
+            },
             onPresentationItem: (item) => {
               this.lastActivityAt = Date.now()
               this.emit('activity')
@@ -803,8 +836,24 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     return this._executionTarget
   }
 
-  sendPermissionResponse(_requestId: string, _response: unknown): boolean {
-    return false
+  get waitingForUserInput(): boolean {
+    return this._activeRun?.hasPendingPermissions() ?? false
+  }
+
+  sendPermissionResponse(requestId: string, response: unknown): boolean {
+    if (!this._activeRun || !response || typeof response !== 'object' || Array.isArray(response)) {
+      return false
+    }
+    const behavior = (response as { behavior?: unknown }).behavior
+    if (behavior !== 'allow' && behavior !== 'deny') {
+      return false
+    }
+    const sent = this._activeRun.resolvePermission(requestId, response as Record<string, unknown>)
+    if (sent) {
+      this.lastActivityAt = Date.now()
+      this.emit('activity')
+    }
+    return sent
   }
 
   getPartialSnapshot(): PartialSnapshot {

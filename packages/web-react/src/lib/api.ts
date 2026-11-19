@@ -650,11 +650,31 @@ function apiKeyFromWire(k: ApiKeyWire): ApiKeySummary {
   };
 }
 
+const MODEL_SWITCH_ESTIMATE_TIMEOUT_MS = 5_000;
+
 export const api = {
   async modelSwitchCost(auth:AuthSession,input:ModelSwitchCostRequest,proof?:{consent?:string;quoteToken?:string}):Promise<ModelSwitchCostQuote>{
-    return jsonOrThrow<ModelSwitchCostQuote>(await callWithRefresh(auth,token=>fetch(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`,{
-      method:'POST',credentials:'include',headers:{...bearerHeaders(token),'content-type':'application/json'},body:JSON.stringify({...input,...proof}),
+    const ac=new AbortController();
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    const timeout=new Promise<never>((_,reject)=>{
+      timer=setTimeout(()=>{
+        ac.abort();
+        reject(new ApiError({status:503,code:'MODEL_SWITCH_UNAVAILABLE',message:'费用确认暂不可用，请重试'}));
+      },MODEL_SWITCH_ESTIMATE_TIMEOUT_MS);
+    });
+    const work=jsonOrThrow<ModelSwitchCostQuote>(callWithRefresh(auth,token=>fetch(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`,{
+      method:'POST',credentials:'include',signal:ac.signal,
+      headers:{...bearerHeaders(token),'content-type':'application/json'},body:JSON.stringify({...input,...proof}),
     })));
+    void work.catch(()=>{});
+    try{
+      return await Promise.race([work,timeout]);
+    }catch(err){
+      if(ac.signal.aborted)throw new ApiError({status:503,code:'MODEL_SWITCH_UNAVAILABLE',message:'费用确认暂不可用，请重试'});
+      throw err;
+    }finally{
+      if(timer!==undefined)clearTimeout(timer);
+    }
   },
   // ── 鉴权 ───────────────────────────────────────────────────────────
 

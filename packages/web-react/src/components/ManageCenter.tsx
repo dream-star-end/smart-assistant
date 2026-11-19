@@ -160,7 +160,7 @@ export function ManageCenter({
                   value={current.id}
                   onValueChange={(v) => onTabChange(v as ManageTab)}
                   items={navItems.map((it) => ({ value: it.id, label: it.label, featureId: it.featureId }))}
-                  className="grid-cols-4 [&_[role=tab]]:px-2"
+                  className="grid-cols-4 [&_[role=tab]]:px-1.5"
                 />
               </div>
             )}

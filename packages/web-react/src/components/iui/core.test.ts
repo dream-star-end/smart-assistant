@@ -6,7 +6,7 @@ import { computeOutputs, evaluate, FormulaError, parseFormula, substitute } from
 import { completePartialJson, escapeStrayQuotes, IUI_MAX_BLOCK_BYTES, parseUiBlock, sliceFirstObject } from "./parse";
 import { LIMITS, resolveType, validateSpec } from "./schema";
 import { niceTicks } from "./ChartBlock";
-import { formatNumber, specToMarkdown, uiCodeToMarkdown, uiFencesToMarkdown, withUnit } from "./toMarkdown";
+import { formatNumber, specToMarkdown, tableToTsv, uiCodeToMarkdown, uiFencesToMarkdown, withUnit } from "./toMarkdown";
 
 describe("parseUiBlock", () => {
   it("parses a complete object and ignores trailing prose after it", () => {
@@ -60,6 +60,22 @@ describe("parseUiBlock", () => {
     });
     // 流式中途不做这项修复(半截补全照旧),写完后才修。
     expect(parseUiBlock('{"type":"callout","body":"对"社会', true)).toMatchObject({ ok: true, complete: false });
+  });
+
+  it("repairs steps items missing the explicit detail key after title", () => {
+    const raw = '{"type":"steps","items":[{"title":"第一步","打开配置页"},{"title":"第二步","点击保存"}]}';
+    const parsed = parseUiBlock(raw, false);
+    expect(parsed).toEqual({
+      ok: true,
+      value: {
+        type: "steps",
+        items: [
+          { title: "第一步", detail: "打开配置页" },
+          { title: "第二步", detail: "点击保存" },
+        ],
+      },
+      complete: true,
+    });
   });
 
   it("returns partial objects while streaming", () => {
@@ -337,5 +353,15 @@ describe("toMarkdown", () => {
       expect(v.ok).toBe(true);
       if (v.ok) expect(specToMarkdown(v.spec).length).toBeGreaterThan(0);
     }
+  });
+
+  it("exports tableToTsv safely and validates textarea form fields", () => {
+    const tbl = validateSpec({ type: "table", columns: ["项目", "分数"], rows: [["=CMD()", 98], ["第二行\n换行", null]] }, false);
+    expect(tbl.ok && tbl.spec.type === "table").toBe(true);
+    if (tbl.ok && tbl.spec.type === "table") {
+      expect(tableToTsv(tbl.spec)).toBe("项目\t分数\n'=CMD()\t98\n第二行 换行\t");
+    }
+    const form = validateSpec({ type: "form", fields: [{ id: "bio", label: "说明", kind: "textarea", placeholder: "请填写" }] }, false);
+    expect(form.ok && form.spec.type === "form" && form.spec.fields[0]?.kind).toBe("textarea");
   });
 });

@@ -101,7 +101,9 @@ export function isStaleCollabEpoch(started: number, current: number): boolean {
 export function recommendedAdvisorModel(state: CollabUiState): string | null {
   const listed = state.advisorModels;
   if (listed.length === 0) return null;
-  const astra = listed.find((row) => row.id === "gpt-6-astra");
+  const astra =
+    listed.find((row) => row.id === "gpt-6.2-astra") ??
+    listed.find((row) => row.id === "gpt-6-astra");
   return (astra ?? listed[0]).id;
 }
 

@@ -4,15 +4,15 @@ import type { Cc5ToolRequest } from './cc5FixedTool.js'
 
 /** Every remote tool is an alias in the lane's catalog (cc5ToolCatalog.ts); membership is the relay's check. */
 export const CC5_NATIVE_TOOL_NAME = /^mcp__ocbridge__(?:t[0-9]{1,3}|[A-Za-z0-9_-]{1,48})$/
-/** Same bound as the node MCP (cc5-fixed-mcp.py) applies to canonical argument bytes. */
+/** Same bound as the legacy node MCP (cc5-fixed-mcp.py) applies to canonical argument bytes. */
 export const CC5_TOOL_INPUT_MAX_BYTES = 98304
-/** Single tool-result bound for both wire ends. Must equal the execution-side
- * MCP host (`claude-code-best/src/entrypoints/cc5ToolHost.ts` MAX_RESULT_BYTES)
- * and the container client (`scripts/agent-remote/cc5-fixed-mcp.py` MAX_RESULT).
- * A result one end admits must never be rejected by the other. */
+/** Single tool-result bound for legacy v1/v2 wire ends. Must equal cc5-fixed-mcp.py MAX_RESULT. */
 export const CC5_TOOL_RESULT_MAX_BYTES = 128 * 1024
-/** A journaled receipt carries one result plus bounded request identifiers. */
+/** A journaled legacy receipt carries one result plus bounded request identifiers. */
 export const CC5_TOOL_RECEIPT_MAX_BYTES = CC5_TOOL_RESULT_MAX_BYTES * 2
+/** Expanded tool bounds for `remote-driver-v4` (`core/mcp_client.py` MAX_ARGUMENTS / MAX_RESULT). */
+export const REMOTE_V4_TOOL_INPUT_MAX_BYTES = 4 * 1024 * 1024
+export const REMOTE_V4_TOOL_RESULT_MAX_BYTES = 4 * 1024 * 1024
 export interface Cc5ToolResult {
   content: Array<Record<string, unknown> & { type: string }>
   isError: boolean
@@ -51,9 +51,13 @@ function wellFormed(value: unknown): boolean {
   return typeof value !== 'number' || Number.isFinite(value) && (!Number.isInteger(value) || Number.isSafeInteger(value))
 }
 /** Shape only: the tool's own schema is enforced where it executes (CCB runTools). */
-export function validateCc5NativeToolInput(name: string, args: unknown): void {
+export function validateCc5NativeToolInput(
+  name: string,
+  args: unknown,
+  maxBytes = CC5_TOOL_INPUT_MAX_BYTES,
+): void {
   requireInput(CC5_NATIVE_TOOL_NAME.test(name) && args && typeof args === 'object' && !Array.isArray(args) &&
-    wellFormed(args) && Buffer.byteLength(cc5CanonicalJson(args)) <= CC5_TOOL_INPUT_MAX_BYTES)
+    wellFormed(args) && Buffer.byteLength(cc5CanonicalJson(args)) <= maxBytes)
 }
 /** sha256 of Python's canonical(): recursively sorted keys, compact, raw UTF-8. */
 export function cc5ToolInputSha256(args: unknown): string {
@@ -111,14 +115,14 @@ function cc5Utf8Boundary(bytes: Buffer, length: number): number {
  * character boundary, and an oversized image block becomes a placeholder
  * instead of being serialized into the text stream as base64. Malformed shapes
  * are returned untouched so the strict assertion below still rejects them. */
-export function boundCc5ToolResult(result: Cc5ToolResult): Cc5ToolResult
-export function boundCc5ToolResult(result: unknown): unknown
-export function boundCc5ToolResult(result: unknown): unknown {
+export function boundCc5ToolResult(result: Cc5ToolResult, maxBytes?: number): Cc5ToolResult
+export function boundCc5ToolResult(result: unknown, maxBytes?: number): unknown
+export function boundCc5ToolResult(result: unknown, maxBytes = CC5_TOOL_RESULT_MAX_BYTES): unknown {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result
   const value = result as Partial<Cc5ToolResult>
   if (!Array.isArray(value.content)) return result
   const originalBytes = cc5ToolResultBytes(result)
-  if (originalBytes <= CC5_TOOL_RESULT_MAX_BYTES) return result
+  if (originalBytes <= maxBytes) return result
   const isError = value.isError as boolean
   const note = `\n\n[cc5 tool result truncated: original ${originalBytes} bytes]`
   const content = value.content as Array<Record<string, unknown>>
@@ -135,7 +139,7 @@ export function boundCc5ToolResult(result: unknown): unknown {
   }
   if (lastText >= 0) withNote[lastText] = { ...withNote[lastText], text: `${withNote[lastText].text as string}${note}` }
   else withNote.push({ type: 'text', text: note.trimStart() })
-  if (cc5ToolResultBytes({ content: withNote, isError }) <= CC5_TOOL_RESULT_MAX_BYTES)
+  if (cc5ToolResultBytes({ content: withNote, isError }) <= maxBytes)
     return { content: withNote, isError }
   // The text itself is over budget: keep its head plus the note, as before.
   const head = bounded.map((block) => typeof block.text === 'string' ? block.text : JSON.stringify(block)).join('\n\n')
@@ -148,14 +152,14 @@ export function boundCc5ToolResult(result: unknown): unknown {
   let high = bytes.length
   while (low < high) {
     const middle = Math.ceil((low + high) / 2)
-    if (cc5ToolResultBytes(truncate(middle)) <= CC5_TOOL_RESULT_MAX_BYTES) low = middle
+    if (cc5ToolResultBytes(truncate(middle)) <= maxBytes) low = middle
     else high = middle - 1
   }
   return truncate(low)
 }
-export function assertCc5ToolResult(value: unknown): asserts value is Cc5ToolResult {
+export function assertCc5ToolResult(value: unknown, maxBytes = CC5_TOOL_RESULT_MAX_BYTES): asserts value is Cc5ToolResult {
   const result = value as Cc5ToolResult | undefined
   requireInput(result && typeof result === 'object' && typeof result.isError === 'boolean' && Array.isArray(result.content) &&
     result.content.every((block) => block && typeof block === 'object' && !Array.isArray(block) && typeof block.type === 'string') &&
-    cc5ToolResultBytes(result) <= CC5_TOOL_RESULT_MAX_BYTES)
+    cc5ToolResultBytes(result) <= maxBytes)
 }

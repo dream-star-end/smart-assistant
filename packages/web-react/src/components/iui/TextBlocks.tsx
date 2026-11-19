@@ -1,11 +1,12 @@
 /**
  * Intelligent UI 文字类组件(OCV5-361 第三轮):来源(普通 Markdown,不画卡片)、大纲 / 思维导图、成稿。
  */
-import { Check, ChevronRight, Copy, Icon } from "lucide-react";
+import { Check, ChevronRight, Copy, Eye, Icon, Pencil, RotateCcw } from "lucide-react";
 import { useMemo, useState } from "react";
 import { cn } from "../../lib/utils";
 import { countWords, diffText } from "./diff";
 import { uiIcon } from "./icons";
+import { OutlineMindMap } from "./OutlineMindMap";
 import type { DraftSpec, OutlineNode, OutlineSpec, SourcesSpec } from "./schema";
 import { BodyMarkdown, Frame, Inline, Segmented, useCopiedFlag } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
@@ -110,46 +111,6 @@ function TreeList({
   );
 }
 
-function MindMap({ spec }: { spec: OutlineSpec }) {
-  return (
-    <div className="oc-iui-mind">
-      <div className="oc-iui-mind-root">
-        <span>{spec.title ?? "主题"}</span>
-      </div>
-      <div className="oc-iui-mind-branches" data-count={spec.items.length}>
-        {spec.items.map((b, i) => (
-          <section key={`${i}:${b.title}`} className={cn("oc-iui-mind-branch", `is-tone-${i % 6}`)} aria-label={b.title}>
-            <h5 className="oc-iui-mind-head">
-              <Inline text={b.title} />
-            </h5>
-            {b.detail && (
-              <p className="oc-iui-mind-detail">
-                <Inline text={b.detail} />
-              </p>
-            )}
-            {b.children.length > 0 && (
-              <ul className="oc-iui-mind-list">
-                {b.children.map((c, j) => (
-                  <li key={`${j}:${c.title}`}>
-                    <span className="oc-iui-mind-item">
-                      <Inline text={c.title} />
-                    </span>
-                    {c.children.length > 0 && (
-                      <span className="oc-iui-mind-sub">
-                        {c.children.map((g) => g.title).join(" · ")}
-                      </span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 const VIEWS = ["tree", "map"] as const;
 
 export function OutlineBlock({ spec, notes, streaming, nested }: BlockProps<OutlineSpec>) {
@@ -164,7 +125,7 @@ export function OutlineBlock({ spec, notes, streaming, nested }: BlockProps<Outl
       return next;
     });
   const anyOpen = paths.some((p) => !collapsed.has(p));
-  // 导图只画两层半(第三层并成一行);只有一层时没有可导图的结构,不给切换。
+  // 只有一层时没有可导图的结构,不给切换。
   const canMap = spec.items.length >= 2 && spec.items.some((n) => n.children.length > 0);
   const shownView = canMap ? view : "tree";
   return (
@@ -199,7 +160,7 @@ export function OutlineBlock({ spec, notes, streaming, nested }: BlockProps<Outl
       }
     >
       {shownView === "map" ? (
-        <MindMap spec={spec} />
+        <OutlineMindMap spec={spec} />
       ) : (
         <div className="oc-iui-tree-wrap">
           <TreeList nodes={spec.items} path="" depth={0} collapsed={streaming ? new Set() : collapsed} toggle={toggle} />
@@ -275,9 +236,19 @@ function DiffView({ before, after }: { before: string; after: string }) {
 export function DraftBlock({ spec, notes, streaming, nested }: BlockProps<DraftSpec>) {
   const [active, setActive] = useState(0);
   const [showDiff, setShowDiff] = useState(false);
-  const cur = spec.variants[Math.min(active, Math.max(0, spec.variants.length - 1))];
-  const words = cur ? countWords(cur.text) : 0;
+  const [editing, setEditing] = useState(false);
+  const [previewMd, setPreviewMd] = useState(false);
+  const [edits, setEdits] = useState<Record<number, string>>({});
+  const curIdx = Math.min(active, Math.max(0, spec.variants.length - 1));
+  const cur = spec.variants[curIdx];
+  const currentText = edits[curIdx] ?? cur?.text ?? "";
+  const isEdited = cur !== undefined && edits[curIdx] !== undefined && edits[curIdx] !== cur.text;
+  const words = cur ? countWords(currentText) : 0;
   const diffing = showDiff && !!spec.original && !streaming && !!cur;
+  const hasMarkdown = useMemo(
+    () => /(?:^|\n)(?:#{1,6}\s|[-*]\s|\d+\.\s|> )|\*\*[^*\n]+\*\*|`[^`\n]+`/.test(currentText),
+    [currentText],
+  );
   return (
     <Frame
       kind="draft"
@@ -291,7 +262,7 @@ export function DraftBlock({ spec, notes, streaming, nested }: BlockProps<DraftS
     >
       {spec.variants.length > 1 && (
         <div className="oc-iui-tabbar">
-          <Segmented items={spec.variants.map((v) => v.label)} value={active} onChange={setActive} label="版本" role="radiogroup" />
+          <Segmented items={spec.variants.map((v) => v.label)} value={curIdx} onChange={setActive} label="版本" role="radiogroup" />
         </div>
       )}
       {cur && (
@@ -303,21 +274,93 @@ export function DraftBlock({ spec, notes, streaming, nested }: BlockProps<DraftS
               {!streaming && <CopyTextButton getText={() => cur.subject ?? ""} label="复制主题" />}
             </div>
           )}
-          {diffing ? <DiffView before={spec.original!} after={cur.text} /> : <div className="oc-iui-draft-text">{cur.text}</div>}
+          {diffing ? (
+            <DiffView before={spec.original!} after={currentText} />
+          ) : editing && !streaming ? (
+            <textarea
+              className="oc-iui-draft-editor"
+              aria-label="编辑成稿正文"
+              value={currentText}
+              rows={Math.min(18, Math.max(5, currentText.split("\n").length + 1))}
+              onChange={(e) => setEdits((s) => ({ ...s, [curIdx]: e.target.value }))}
+            />
+          ) : previewMd && hasMarkdown && !streaming ? (
+            <div className="oc-iui-draft-text is-markdown">
+              <BodyMarkdown text={currentText} />
+            </div>
+          ) : (
+            <div className="oc-iui-draft-text">{currentText}</div>
+          )}
         </div>
       )}
       <div className="oc-iui-draft-bar">
         <span className="oc-iui-draft-count" aria-live="polite">
-          约 {words} 字
+          约 {words} 字{isEdited ? " · 已微调" : ""}
         </span>
         <span className="oc-iui-draft-actions">
+          {isEdited && !streaming && (
+            <button
+              type="button"
+              className="oc-iui-text-btn"
+              onClick={() =>
+                setEdits((s) => {
+                  const next = { ...s };
+                  delete next[curIdx];
+                  return next;
+                })
+              }
+            >
+              <RotateCcw size={13} aria-hidden />
+              恢复初稿
+            </button>
+          )}
+          {hasMarkdown && !streaming && (
+            <button
+              type="button"
+              className="oc-iui-text-btn"
+              aria-pressed={previewMd}
+              onClick={() => {
+                setPreviewMd((v) => !v);
+                setEditing(false);
+                setShowDiff(false);
+              }}
+            >
+              <Eye size={14} aria-hidden />
+              排版预览
+            </button>
+          )}
+          {!streaming && cur && (
+            <button
+              type="button"
+              className="oc-iui-text-btn"
+              aria-pressed={editing}
+              onClick={() => {
+                setEditing((v) => !v);
+                setShowDiff(false);
+                setPreviewMd(false);
+              }}
+            >
+              <Pencil size={13} aria-hidden />
+              编辑微调
+            </button>
+          )}
           {spec.original && (
-            <button type="button" className="oc-iui-text-btn" aria-pressed={showDiff} disabled={streaming} onClick={() => setShowDiff((v) => !v)}>
+            <button
+              type="button"
+              className="oc-iui-text-btn"
+              aria-pressed={showDiff}
+              disabled={streaming}
+              onClick={() => {
+                setShowDiff((v) => !v);
+                setEditing(false);
+                setPreviewMd(false);
+              }}
+            >
               <Icon iconNode={uiIcon("diff")} size={14} aria-hidden />
               对比原文
             </button>
           )}
-          <CopyTextButton getText={() => cur?.text ?? ""} label="复制全文" disabled={streaming || !cur} primary />
+          <CopyTextButton getText={() => (cur ? currentText : "")} label="复制全文" disabled={streaming || !cur} primary />
         </span>
       </div>
     </Frame>

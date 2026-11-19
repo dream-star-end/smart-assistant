@@ -1,8 +1,9 @@
 import {
   DEFAULT_CODEX_ENGINE_MODEL,
   cursorModelSupportsContextTier,
-  supportsFastServiceTier,
+  resolveEffectiveTurnServiceTier,
 } from '@openclaude/protocol/browser'
+export { resolveEffectiveTurnServiceTier }
 import type { ModelSwitchCostQuote } from '@openclaude/protocol/browser'
 import type { ConfirmChoice } from '../components/ui/ConfirmDialog'
 import { api, apiErrorMessage, ApiError } from './api'
@@ -128,7 +129,15 @@ export function createModelSwitchCostAuthorizer({
     original = {
       ...original,
       contextTier: cursorModelSupportsContextTier(effective) ? original.contextTier : undefined,
-      serviceTier: supportsFastServiceTier(effective) ? original.serviceTier : undefined,
+      serviceTier:
+        resolveEffectiveTurnServiceTier({
+          model: effective,
+          serviceTier: original.serviceTier,
+          agentId: original.agentId,
+          collabMode: original.collabMode,
+          advisorModel: original.advisorModel,
+          text: original.text,
+        }) ?? undefined,
     }
     const auth = authRef.current
     const epoch = auth.snapshot().epoch
@@ -137,6 +146,8 @@ export function createModelSwitchCostAuthorizer({
       original.targetModel,
       original.agentId,
       original.teamMode === true,
+      original.collabMode ?? null,
+      original.advisorModel ?? null,
       original.contextTier ?? null,
       original.serviceTier ?? null,
     ])

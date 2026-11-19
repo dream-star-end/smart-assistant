@@ -52,14 +52,16 @@ export const AGENT_MODEL_AUTO = 'auto'
 /**
  * Codex engine 模型号 + 模型自身默认思考深度的单一权威。
  * 第一项仍是历史 Sol id,避免把数组下标当默认值。队长默认是
- * `DEFAULT_CODEX_ENGINE_MODEL`(gpt-6-astra),不靠本表顺序。
+ * `DEFAULT_CODEX_ENGINE_MODEL`(gpt-6.2-astra),不靠本表顺序。
  *
  * GPT-6 Sol / Luna(2026-09-22,Codex CLI 0.155.1 `debug models` 可见,
  * slug `gpt-6-sol` / `gpt-6-luna`)。GPT-6.1 Sol(2026-09-30,Codex CLI 0.159.2
- * `debug models` 可见,slug `gpt-6.1-sol`,supported_in_api)。官方 API 默认
- * 思考深度是 medium;CLI 报 low,平台仍显式送 medium。1M 孪生沿用 0238 的
- * 1.5× 长上下文契约,cliModel 指标准 id。GPT-5.6 与 GPT-6 Sol 仍留在本表里
- * 供在途会话解析,选择器家族已摘掉(0288 / 0292 下线 catalog)。
+ * `debug models` 可见,slug `gpt-6.1-sol`,supported_in_api)。GPT-6.2 Sol /
+ * Astra(2026-11-18,Codex CLI 0.170.0 `debug models` 及远端 `model/list` 可见,
+ * slug `gpt-6.2-sol` / `gpt-6.2-astra`,supported_in_api)。官方 API 默认
+ * 思考深度 Sol 为 medium、Astra 为 xhigh;CLI 报 low,平台仍显式送各自默认。
+ * 1M 孪生沿用 0238 的 1.5× 长上下文契约,cliModel 指标准 id。GPT-5.6、GPT-6 Sol、
+ * GPT-6.1 Sol 与 GPT-6 Astra 仍留在本表里供在途/历史会话解析(0288 / 0292 / 0346 下线 catalog)。
  */
 export const CODEX_ENGINE_MODELS = [
   { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'xhigh', longContext: false },
@@ -118,6 +120,22 @@ export const CODEX_ENGINE_MODELS = [
     cliModel: 'gpt-6-luna',
     longContext: true,
   },
+  { id: 'gpt-6.2-astra', displayName: 'GPT-6.2-Astra', defaultReasoningEffort: 'xhigh', longContext: false },
+  {
+    id: 'gpt-6.2-astra-1m',
+    displayName: 'GPT-6.2-Astra',
+    defaultReasoningEffort: 'xhigh',
+    cliModel: 'gpt-6.2-astra',
+    longContext: true,
+  },
+  { id: 'gpt-6.2-sol', displayName: 'GPT-6.2-Sol', defaultReasoningEffort: 'medium', longContext: false },
+  {
+    id: 'gpt-6.2-sol-1m',
+    displayName: 'GPT-6.2-Sol',
+    defaultReasoningEffort: 'medium',
+    cliModel: 'gpt-6.2-sol',
+    longContext: true,
+  },
 ] as const satisfies readonly {
   id: string
   displayName: string
@@ -135,11 +153,25 @@ export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
 /**
  * 标准/1M 上下文成对家族。`collapsedByDefault` 是选择器的展示语义:为 true 的家族默认
  * 收进「更多 GPT 模型」折叠组。个人版目录下线的 GPT-5.6 不据此删除商业兼容映射;GPT-6 Sol 不进该家族表;
- * GPT-6 Astra / GPT-6.1 Sol / Luna 都直接展示,不进「更多」。切流冒烟 C2 选可见模型,
- * 不再依赖折叠组。商业仍启用的 GPT-5.6 家族保留原上下文与折叠合同，目录决定可见性。
+ * GPT-6.2 Astra / GPT-6.2 Sol / GPT-6 Astra / GPT-6.1 Sol / Luna 都直接展示,不进「更多」。切流冒烟 C2 选可见模型,
+ * 不再依赖折叠组。商业仍启用的 GPT-5.6/6.0/6.1 家族保留原上下文与折叠合同，目录决定可见性。
  * 当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
  */
 export const CONTEXT_TIER_FAMILIES = [
+  {
+    family: 'gpt-6.2-astra',
+    familyLabel: 'GPT-6.2-Astra',
+    standardId: 'gpt-6.2-astra',
+    longId: 'gpt-6.2-astra-1m',
+    collapsedByDefault: false,
+  },
+  {
+    family: 'gpt-6.2-sol',
+    familyLabel: 'GPT-6.2-Sol',
+    standardId: 'gpt-6.2-sol',
+    longId: 'gpt-6.2-sol-1m',
+    collapsedByDefault: false,
+  },
   {
     family: 'gpt-6-astra',
     familyLabel: 'GPT-6-Astra',
@@ -1667,7 +1699,7 @@ export function projectContextWindowForCursorTier(
 }
 
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
-export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = 'gpt-6-astra'
+export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = 'gpt-6.2-astra'
 export const DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME: string =
   CODEX_ENGINE_MODELS.find((model) => model.id === DEFAULT_CODEX_ENGINE_MODEL)!.displayName
 

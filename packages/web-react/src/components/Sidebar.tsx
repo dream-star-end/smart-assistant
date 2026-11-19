@@ -176,6 +176,7 @@ export type SidebarProps = {
   onOpenBlog?: () => void;
   onOpenOrg?: () => void;
   onOpenBoard?: () => void;
+  onOpenSites?: () => void;
   onOpenMediaTasks?: () => void;
   /** OCV5-593: shown only when /api/studio/providers answers 200 for this account. */
   onOpenStudio?: () => void;
@@ -184,6 +185,7 @@ export type SidebarProps = {
   /** 「API 接入」入口:管理员由 App 传入(admin-only rollout),直达设置 api-access 分区。 */
   onOpenApiAccess?: () => void;
   boardActive?: boolean;
+  sitesActive?: boolean;
   showAdmin?: boolean;
   theme?: Theme;
   onCycleTheme?: () => void;
@@ -263,11 +265,13 @@ export function Sidebar({
   onOpenBlog,
   onOpenOrg,
   onOpenBoard,
+  onOpenSites,
   onOpenMediaTasks,
   onOpenStudio,
   onOpenChatGptProxy,
   onOpenApiAccess,
   boardActive,
+  sitesActive,
   showAdmin,
   theme,
   onCycleTheme,
@@ -1168,6 +1172,28 @@ export function Sidebar({
               className={boardActive ? "text-fg" : "text-faint"}
             />
             任务
+          </button>
+        )}
+        {onOpenSites && (
+          <button
+            type="button"
+            data-product-control
+            data-testid="sites-nav"
+            onClick={onOpenSites}
+            aria-current={sitesActive ? "true" : undefined}
+            className={cn(
+              "mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              sitesActive
+                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active"
+                : "text-muted hover:bg-hover hover:text-fg",
+            )}
+          >
+            <Globe
+              size={15}
+              aria-hidden
+              className={sitesActive ? "text-fg" : "text-faint"}
+            />
+            站点
           </button>
         )}
         {onOpenBlog && (

@@ -26,6 +26,9 @@ export const StudioApp = lazy(() => import("./components/studio/StudioApp").then
 export const TaskboardView = lazy(() =>
   import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
 );
+export const SitesWorkspaceView = lazy(() =>
+  import("./components/sites/SitesWorkspaceView").then((m) => ({ default: m.SitesWorkspaceView })),
+);
 // 2026-09-17 首屏体量门(first-screen-budget)超限修复:下列对话框/编辑器都是「点开才需要」的
 // 覆盖层,此前静态 import 把它们(连同 ImageViewer 三模式、ProjectAssetsPanel 等)钉在入口静态
 // 闭包里。改 React.lazy 后由渲染点的挂载闸(useMountedOnce / 条件挂载)控制首次下载;打开过
@@ -91,6 +94,7 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/MediaTaskCenter").catch(() => {});
     // 全屏图片查看器(含圈选编辑/评论/调整大小)也是懒块:时间线里点图即开,预热后首开零延迟。
     void import("./components/ImageViewer").catch(() => {});
+    void import("./components/sites/SitesWorkspaceView").catch(() => {});
     if (TASKBOARD_ENABLED) {
       void import("./components/taskboard/TaskboardView").catch(() => {});
     }

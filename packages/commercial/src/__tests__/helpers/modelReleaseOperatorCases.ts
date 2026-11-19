@@ -12,7 +12,7 @@ import { once } from "node:events";
 import { createServer as createTcpServer, createConnection as createTcpConnection, type Socket } from "node:net";
 import { getPool } from "../../db/index.js";
 import { runMigrations } from "../../db/migrate.js";
-import { useDedicatedTestDatabase, resetAndMigrateBefore } from "./db.js";
+import { useDedicatedTestDatabase, resetAndMigrateBefore, migrationsDirBefore } from "./db.js";
 import {
   observe, apply, compensate, reconcile, readSnapshot, digest, primaryIdentity,
   expectedVersion, explicitOperatorDsn, CommitUnknown, permissionPreflight,
@@ -129,7 +129,7 @@ async function seedProductionFloor(): Promise<void> {
     if(provider==="codex") await pool.query("INSERT INTO account_group_models(group_id,model_id) " +
       "VALUES($1,'gpt-5.6-luna')",[group.rows[0].id]);
   }
-  await runMigrations();
+  await runMigrations({ dir: await migrationsDirBefore("0294") });
 }
 function request(runId: string): WriteRequest {
   return { runId,nonce,observation,readiness:ready };

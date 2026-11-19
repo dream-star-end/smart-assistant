@@ -129,4 +129,48 @@ describe("FQ-03 Composer attachments follow draft owner", () => {
     expect(sends[0]?.session).toBe("B");
     expect(sends[0]?.media).toBeUndefined();
   });
+
+  test("in-flight async onSend in session A never spins or blocks New Session / session B, and clears A even after A→B→A round-trip (OCV5-788)", async () => {
+    let resolveA!: (sent: boolean) => void;
+    const sends: Array<{ owner: string; text: string }> = [];
+    const onSendA = vi.fn(
+      (text: string) =>
+        new Promise<boolean>((resolve) => {
+          sends.push({ owner: "A", text });
+          resolveA = resolve;
+        }),
+    );
+    const onSendNew = vi.fn((text: string) => {
+      sends.push({ owner: "new", text });
+      return true;
+    });
+
+    const view = render(wrap(<Composer draftKey="3:session-A" onSend={onSendA} />));
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "stuck in A" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(onSendA).toHaveBeenCalledTimes(1);
+    expect(view.container.querySelector(".animate-spin")).not.toBeNull();
+    // Duplicate submit in A while A's onSend is pending must still be blocked.
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(onSendA).toHaveBeenCalledTimes(1);
+
+    // Switch to New Session ("3:__new__"): must NOT spin and must allow immediate send.
+    view.rerender(wrap(<Composer draftKey="3:__new__" onSend={onSendNew} />));
+    expect(view.container.querySelector(".animate-spin")).toBeNull();
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "hello from new session" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(onSendNew).toHaveBeenCalledWith("hello from new session", undefined, undefined);
+    expect((screen.getByLabelText("消息输入框") as HTMLTextAreaElement).value).toBe("");
+
+    // Switch back to session A while A's onSend is still pending: spinner stays on A, then clears draft on settle.
+    view.rerender(wrap(<Composer draftKey="3:session-A" onSend={onSendA} />));
+    expect(view.container.querySelector(".animate-spin")).not.toBeNull();
+    expect((screen.getByLabelText("消息输入框") as HTMLTextAreaElement).value).toBe("stuck in A");
+
+    await act(async () => {
+      resolveA(true);
+    });
+    expect(view.container.querySelector(".animate-spin")).toBeNull();
+    expect((screen.getByLabelText("消息输入框") as HTMLTextAreaElement).value).toBe("");
+  });
 });

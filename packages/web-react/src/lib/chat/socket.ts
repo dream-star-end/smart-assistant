@@ -1,6 +1,7 @@
 import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch} from './modelSwitchCostDispatch';
 import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
-import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
+import {formatMessageReplyPrompt, normalizeServiceTierForModel} from '@openclaude/protocol/browser';
+import { readSessionServiceTier } from '../sessionServiceTier';
 /**
  * v5 WS 对话引擎 —— ChatSocket。**渲染树之外的单例 service**（ref-based manager）：
  * 持有 ws + 全部连接/重连/游标/离线队列/计费归因可变状态；帧到达频率极高
@@ -16,7 +17,15 @@ import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
-import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
+import {
+  applyControlReceipt,
+  hydrateStoredControls,
+  persistControlWithFallback,
+  reconcileOrphanControlPending,
+  settleTurnStopSettlement,
+  stripTransientControlFlags,
+  type PendingControlItem,
+} from "./controlReceipts";
 import { contextRebuiltRow } from "./contextRebuilt";
 import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
 import {
@@ -34,6 +43,7 @@ import {
   applyTurnUsage,
   AUTO_CONTINUE_PROMPT,
   expireGenPlaceholdersAgainstServerRows,
+  isSettledPermissionRequestId,
   normalizeDelegateCards,
   currentFrameSeqAcceptOrder,
   normalizeGoalCards,
@@ -1618,25 +1628,8 @@ export class ChatSocket {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
         if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
-        const settlement = sess._stopSettlement;
-        if (
-          !isCronOrHeartbeat &&
-          settlement &&
-          (
-            !settlement.clientMessageId ||
-            (frame.clientMessageId ?? clientMessageId) === settlement.clientMessageId
-          )
-        ) {
-          if (settlement.controlId) {
-            this.settleControl(settlement.controlId, "terminal");
-          } else {
-            sess._stopSettlement = {
-              ...(settlement.clientMessageId
-                ? { clientMessageId: settlement.clientMessageId }
-                : {}),
-              phase: "sync",
-            };
-          }
+        if (!isCronOrHeartbeat) {
+          settleTurnStopSettlement(sess, frame.clientMessageId ?? clientMessageId, (id, s) => this.settleControl(id, s));
         }
         if (this.reconnectInFlightSet) {
           this.reconnectInFlightSet.delete(sess.id);
@@ -1688,6 +1681,12 @@ export class ChatSocket {
       },
       deferTerminalErrorForRecovery: (sessId, paint) => this.deferTerminalErrorForRecovery(sessId, paint),
       discardDeferredTerminalError: (sessId, clientMessageId) => this.discardDeferredTerminalError(sessId, clientMessageId),
+      settleCancelFencedStop: (sess, clientMessageId) => {
+        if (settleTurnStopSettlement(sess, clientMessageId, (id, s) => this.settleControl(id, s))) {
+          if (this.deps.syncSession) this.syncSessionAndSettleStop(sess.id, clientMessageId ? { clientMessageId } : undefined);
+          else sess._stopSettlement = undefined;
+        }
+      },
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
@@ -2112,6 +2111,7 @@ export class ChatSocket {
         const sess = this.sessions.get(frame.peer?.id);
         if (sess) {
           applyPermissionRequest(sess, frame);
+          reconcileOrphanControlPending(sess, this.controlQueue);
           sess._recoveryStatus = { kind: "needs-confirmation" };
           this.deps.persistSession?.(sess.id);
         }
@@ -3822,6 +3822,7 @@ export class ChatSocket {
         return clean;
       });
     }
+    messages = stripTransientControlFlags(messages);
     const pendingDeferred = this.pendingRecoveryErrors.get(s.id);
     const pendingDeferredId = pendingDeferred?.clientMessageId;
     const deferredTerminalErrorId = isClientMessageId(s._deferredTerminalErrorClientMessageId)
@@ -3914,6 +3915,9 @@ export class ChatSocket {
           changed = true;
         }
       }
+      if (hydrateStoredControls(existing, stored._pendingControls, isSettledPermissionRequestId, (item) => this.enqueueControl(item, true))) {
+        changed = true;
+      }
       if (changed) { this.deps.persistSession?.(stored.id); this.scheduleNotify(); }
       return;
     }
@@ -3923,21 +3927,23 @@ export class ChatSocket {
       title: stored.title,
       createdAt: stored.createdAt,
     });
-    s.messages = Array.isArray(stored.messages)
-      ? stored.messages
-        .filter((message) =>
-          !(typeof message.id === "string" && message.id.startsWith("projection-")) &&
-          !(typeof message.id === "string" && message.id.startsWith("oc-dispatch-err:")) &&
-          message._timelineRecord !== true &&
-          message._turnTapeProcess !== true &&
-          typeof message._historyPageLoadedFrom !== "string" &&
-          !(message as ChatMessage & { _historyProjection?: unknown })._historyProjection,
-        )
-        .map((message) => {
-          const routing = normalizeRetiredRouting(message._routing);
-          return routing !== message._routing ? { ...message, _routing: routing } : message;
-        })
-      : [];
+    s.messages = stripTransientControlFlags(
+      Array.isArray(stored.messages)
+        ? stored.messages
+          .filter((message) =>
+            !(typeof message.id === "string" && message.id.startsWith("projection-")) &&
+            !(typeof message.id === "string" && message.id.startsWith("oc-dispatch-err:")) &&
+            message._timelineRecord !== true &&
+            message._turnTapeProcess !== true &&
+            typeof message._historyPageLoadedFrom !== "string" &&
+            !(message as ChatMessage & { _historyProjection?: unknown })._historyProjection,
+          )
+          .map((message) => {
+            const routing = normalizeRetiredRouting(message._routing);
+            return routing !== message._routing ? { ...message, _routing: routing } : message;
+          })
+        : [],
+    );
     s.lastAt = typeof stored.lastAt === "number" ? stored.lastAt : s.lastAt;
     s.updatedAt = stored.updatedAt;
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
@@ -4030,33 +4036,9 @@ export class ChatSocket {
     }
     this.sessions.set(stored.id, s); this.reconcileContainerForSession(s);
     this.restoreDeferredTerminalError(s, stored);
-    const storedControls = Array.isArray(stored._pendingControls)
-      ? stored._pendingControls.filter((item) =>
-          item?.kind === "control" &&
-          item.sessId === stored.id &&
-          typeof item.controlId === "string" &&
-          item.payload?.controlId === item.controlId)
-      : [];
-    for (const control of storedControls) {
-      const item: PendingControlItem = { ...control, status: "queued" };
-      if (control.controlKind === "stop" && control.fenceOnly === true) {
-        // 围栏 stop 只需重放到 master;不代表在飞 turn,不进入停止态。
-      } else if (control.controlKind === "stop") {
-        s._sendingInFlight = true;
-        s._activeClientMessageId = control.clientMessageId;
-        s._stopSettlement = {
-          ...(control.clientMessageId ? { clientMessageId: control.clientMessageId } : {}),
-          controlId: control.controlId,
-          phase: "awaiting_receipt",
-        };
-        s._recoveryStatus = { kind: "stopping" };
-      } else if (control.controlKind === "permission" && control.requestId) {
-        const permission = s.messages.find((message) => message.requestId === control.requestId);
-        if (permission) permission._controlPending = true;
-        s._recoveryStatus = { kind: "needs-confirmation" };
-      }
-      this.enqueueControl(item, true);
-    }
+    hydrateStoredControls(s, stored._pendingControls, isSettledPermissionRequestId, (item) =>
+      this.enqueueControl(item, true),
+    );
     // The persistence callback resolves the snapshot through this.sessions,
     // so register the repaired session first.  A clean second load remains a
     // zero-write fast path because the repair is idempotent.
@@ -4341,6 +4323,7 @@ export class ChatSocket {
       const lookupIds = applyPermissionSnapshot(s, archive.permissionPrompts);
       if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(s.id, lookupIds);
     }
+    reconcileOrphanControlPending(s, this.controlQueue);
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
     this.reconcileUnpublishedTapeRetry(sessId);
@@ -4383,6 +4366,7 @@ export class ChatSocket {
     const sess = this.sessions.get(sessId);
     if (!sess || !snapshot) return [];
     const lookupIds = applyPermissionSnapshot(sess, snapshot);
+    reconcileOrphanControlPending(sess, this.controlQueue);
     this.deps.persistSession?.(sess.id);
     this.scheduleNotify();
     if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(sess.id, lookupIds);
@@ -5319,7 +5303,7 @@ export class ChatSocket {
     if(!authorization&&this.deps.authorizeSwitch&&p.model&&!p.imageEdit){
       authorization=await this.deps.authorizeSwitch({sessionId:p.sessId,requestId:mintMsgId(),targetModel:p.model,agentId:p.agentId,
         text:formatMessageReplyPrompt(p.text,p.replyTo),mediaCount:p.media?.length??0,teamMode:p.teamMode,
-        ...(p.contextTier?{contextTier:p.contextTier}:{}),...(p.serviceTier?{serviceTier:p.serviceTier}:{}),
+        ...(p.collabMode?{collabMode:p.collabMode}:{}),...(p.advisorModel?{advisorModel:p.advisorModel}:{}),...(p.contextTier?{contextTier:p.contextTier}:{}),...(p.serviceTier?{serviceTier:p.serviceTier}:{}),
       },{useCachedRequestId:true,allowOfflineQueue:true})??undefined;
       if(!authorization)return false;
     }
@@ -5536,14 +5520,23 @@ export class ChatSocket {
     const preparedSwitch = selectedModel && sess._preparedModelSwitch?.targetModel === selectedModel
       ? sess._preparedModelSwitch
       : undefined;
+    const manualContinuationTier = !automatic
+      ? (normalizeServiceTierForModel(
+          selectedModel ?? baseRouting.model,
+          readSessionServiceTier(sess.id),
+        ) ?? undefined)
+      : baseRouting.serviceTier;
     const routing = selectedModel && selectedModel !== baseRouting.model
       ? {
           ...baseRouting,
           model: selectedModel,
           modelSwitchId: preparedSwitch?.id,
           modelSwitchConsent: undefined,
+          serviceTier: manualContinuationTier,
         }
-      : baseRouting;
+      : automatic
+        ? baseRouting
+        : { ...baseRouting, serviceTier: manualContinuationTier };
     const resolvedAgentId = sess.agentId || agentId;
     void this.ensureServerSessionOnce(sess, resolvedAgentId);
     const replay = target.mode === "replay"
@@ -5781,7 +5774,7 @@ export class ChatSocket {
     if(this.deps.authorizeSwitch&&routing?.model&&!replay.imageEdit){
       const permit=await this.deps.authorizeSwitch({sessionId:sess.id,requestId:nextId,targetModel:routing.model,agentId,
         text:formatMessageReplyPrompt(replay.text,replay.replyTo),mediaCount:replay.media?.length??0,teamMode:routing.teamMode,
-        ...(routing.contextTier?{contextTier:routing.contextTier}:{}),...(routing.serviceTier?{serviceTier:routing.serviceTier}:{}),
+        ...(routing.collabMode?{collabMode:routing.collabMode}:{}),...(routing.advisorModel?{advisorModel:routing.advisorModel}:{}),...(routing.contextTier?{contextTier:routing.contextTier}:{}),...(routing.serviceTier?{serviceTier:routing.serviceTier}:{}),
       },{consent:routing.modelSwitchConsent});
       if(!permit||this.sessions.get(sess.id)!==sess||userMsg.status!=='error')return;
       routing.modelSwitchConsent=permit.consent;
@@ -5893,44 +5886,15 @@ export class ChatSocket {
   }
 
   private persistControl(item: PendingControlItem): void {
-    if (!this.controlQueue.includes(item) || item.status === "persisting") return;
-    item.status = "persisting";
-    const persist = this.deps.persistPendingControl;
-    if (!persist) {
-      // Test/SSR adapters without storage still use the rolling-compatible
-      // in-memory path. Production always wires SessionStore.
-      item.status = "queued";
-      this.kickControlPump();
-      return;
-    }
-    const durable: StoredPendingControl = { ...item, status: "queued" };
-    void Promise.resolve(persist(durable)).then(
-      () => {
-        if (!this.controlQueue.includes(item)) return;
-        item.status = "queued";
-        this.kickControlPump();
-      },
-      () => {
-        if (!this.controlQueue.includes(item)) return;
-        item.status = "waiting_persist";
-        item.attempt += 1;
-        const sess = this.sessions.get(item.sessId);
-        if (sess) {
-          sess._recoveryStatus = {
-            kind: "waiting-service",
-            attempt: item.attempt,
-            errorCode: "control_journal_unavailable",
-          };
-          this.scheduleNotify();
-        }
-        const delay = Math.min(30_000, 1000 * (2 ** Math.min(item.attempt - 1, 5)));
-        const timer = setTimeout(() => {
-          this.controlPersistRetryTimers.delete(item.controlId);
-          this.persistControl(item);
-        }, delay);
-        this.controlPersistRetryTimers.set(item.controlId, timer);
-      },
-    );
+    persistControlWithFallback(item, {
+      queue: this.controlQueue,
+      sessions: this.sessions,
+      timers: this.controlPersistRetryTimers,
+      persist: this.deps.persistPendingControl,
+      pump: () => this.kickControlPump(),
+      retry: (next) => this.persistControl(next),
+      notify: () => this.scheduleNotify(),
+    });
   }
 
   private resetControlsForReplay(): void {

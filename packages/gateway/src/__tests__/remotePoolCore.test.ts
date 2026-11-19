@@ -1183,3 +1183,16 @@ test('driver fixture tears down a real listening relay when setup fails before a
     assert.equal(existsSync(sandbox), false)
   })
 })
+
+test('remote-driver-v4 real relay and node round-trips >200 KiB tool arguments and >200 KiB tool results end-to-end', async (t) => {
+  const h = await createDriverHarness(t, 'cc')
+  const largeToken = 'K'.repeat(200 * 1024)
+  const turn = h.submitPrompt(largeToken)
+  const summary = await turn.run.summary
+  assert.ok(summary)
+  assert.equal(summary.isError, false)
+  assert.equal(h.executedCalls.length, 1)
+  assert.equal(String(h.executedCalls[0]!.args.token).length, largeToken.length + 3)
+  assert.ok(summary.assistantText.includes(`SENTINEL_OK(${largeToken}:t1)`))
+  assert.equal(h.settledReceipts.length, 1)
+})

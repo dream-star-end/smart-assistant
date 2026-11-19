@@ -10,7 +10,8 @@ import {
   type PlatformReasoningEffort,
   contextFamilyByModelId,
   cursorFamilySupportsContextTier,
-  fastServiceTierRoute,
+  normalizeServiceTierForModel,
+  supportedServiceTiers,
   cursorFamilySupportsFast,
 } from '@openclaude/protocol/browser'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
@@ -452,9 +453,9 @@ export function ModelSelector({
     cursorFamilySupportsContextTier(selectedCursor.family) &&
     onSelectContextTier != null
   const activeCursorContextTier: CursorContextTier = contextTier ?? DEFAULT_CURSOR_CONTEXT_TIER
-  const gptFastRoute = fastServiceTierRoute(selectedId)
-  const showGptFast = gptFastRoute !== null && onSelectServiceTier != null
-  const gptFastOn = serviceTier === 'fast'
+  const availableServiceTiers = supportedServiceTiers(selectedId)
+  const showServiceTiers = availableServiceTiers.length > 0 && onSelectServiceTier != null
+  const effectiveServiceTier = normalizeServiceTierForModel(selectedId, serviceTier)
   const showPlatformEffort =
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
@@ -831,33 +832,53 @@ export function ModelSelector({
             </PickerItem>
           </div>
         )}
-        {showGptFast && onSelectServiceTier && (
+        {showServiceTiers && onSelectServiceTier && (
           <div className={mode === 'menu' ? 'shrink-0' : undefined}>
             <PickerSeparator mode={mode} />
             <PickerLabel mode={mode} className="flex items-center justify-between">
               速度
-              <PickerSectionSummary mode={mode}>{gptFastOn ? 'Fast' : '标准'}</PickerSectionSummary>
+              <PickerSectionSummary mode={mode}>
+                {effectiveServiceTier === 'ultrafast'
+                  ? 'Ultrafast'
+                  : effectiveServiceTier === 'fast'
+                    ? 'Fast'
+                    : '标准'}
+              </PickerSectionSummary>
             </PickerLabel>
             <PickerItem
               mode={mode}
               data-gpt-fast="false"
+              data-service-tier="standard"
               onSelect={() => onSelectServiceTier(null)}
               className="justify-between"
             >
               <span>标准</span>
-              {!gptFastOn && <Check size={14} className="shrink-0 text-accent" />}
+              {effectiveServiceTier === null && <Check size={14} className="shrink-0 text-accent" />}
             </PickerItem>
             <PickerItem
               mode={mode}
               data-gpt-fast="true"
+              data-service-tier="fast"
               onSelect={() => onSelectServiceTier('fast')}
               className="justify-between"
             >
-              <span>
-                Fast（更快，按 2× 计费）
-              </span>
-              {gptFastOn && <Check size={14} className="shrink-0 text-accent" />}
+              <span>Fast（更快，按 2× 计费）</span>
+              {effectiveServiceTier === 'fast' && <Check size={14} className="shrink-0 text-accent" />}
             </PickerItem>
+            {availableServiceTiers.includes('ultrafast') && (
+              <PickerItem
+                mode={mode}
+                data-gpt-ultrafast="true"
+                data-service-tier="ultrafast"
+                onSelect={() => onSelectServiceTier('ultrafast')}
+                className="justify-between"
+              >
+                <span>Ultrafast（超快，按 6× 计费）</span>
+                {effectiveServiceTier === 'ultrafast' && (
+                  <Check size={14} className="shrink-0 text-accent" />
+                )}
+              </PickerItem>
+            )}
           </div>
         )}
         {showCursorContextTier && onSelectContextTier && (

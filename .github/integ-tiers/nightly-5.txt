@@ -21,3 +21,4 @@ packages/commercial/src/__tests__/db.integ.test.ts
 packages/commercial/src/__tests__/turnTapeJobs.integ.test.ts
 
 packages/commercial/src/__tests__/codexCommissioning.integ.test.ts
+packages/commercial/src/sites/__tests__/sitesRepoPg.integ.test.ts

@@ -4,6 +4,7 @@ import {
   type GrokExecutionDescriptor,
   type RemoteExecutionBackend,
   isCc5ExecutionBackend,
+  isServiceTier,
   sameRemoteExecutionBackend,
 } from '@openclaude/protocol'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
@@ -640,6 +641,7 @@ export async function submit(
     )) closeIdleWait = beginIdleWait(session, onEvent)
     await prev
     session._turnReadOnly = opts?.readOnly === true
+    session._turnServiceTier = session._turnReadOnly ? null : (isServiceTier(opts?.serviceTier) ? opts.serviceTier : null)
     if (!sameRemoteExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
       throw new Error('CC5_BACKEND_SCOPE_CHANGED')
     }
@@ -863,7 +865,7 @@ export async function submit(
       typeof maybeSetServiceTier === 'function' &&
       maybeSetServiceTier.call(
         session.runner,
-        opts?.serviceTier === 'fast' ? 'fast' : null,
+        isServiceTier(opts?.serviceTier) ? opts.serviceTier : null,
         modelChanged ? desiredModel : session.runner.model,
       ) === 'restart'
     if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
@@ -1541,6 +1543,7 @@ export async function submit(
         session._currentDispatch = undefined
         session._turnCreditBudgetFen = undefined
         session._turnReadOnly = undefined
+        session._turnServiceTier = undefined
         if (queueTurn) {
           this._promptQueueExecutions.delete(session)
           this._promptQueueExecutionKeys.delete(session.sessionKey)

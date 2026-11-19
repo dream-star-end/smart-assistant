@@ -1179,7 +1179,13 @@ export function ProcessDisclosure<T>({
   const narrativeSettled = liveClock && !!currentSection?.narrative && quietMs >= QUIET_TAIL_MS;
   const toolWaitMs = completedSince === null ? 0 : now - completedSince;
   const toolsSettled = active && completedSince !== null && toolWaitMs >= QUIET_TAIL_MS && toolWaitMs <= 24 * 3600_000;
-  const waiting = narrativeSettled || toolsSettled;
+  const blockedOnPrompt = active && (bounds?.following ?? []).some(
+    (message) =>
+      message.role === "permission" &&
+      !isAnsweredPrompt(message) &&
+      !(typeof message._askUserExpiresAt === "number" && message._askUserExpiresAt > 0 && message._askUserExpiresAt <= now),
+  );
+  const waiting = !blockedOnPrompt && (narrativeSettled || toolsSettled);
   const waitingMs = toolsSettled ? toolWaitMs : quietMs;
   const runningSince =
     liveClock && currentSection && !currentSection.narrative ? earliestRunningSince(currentSection.messages, startedAt) : null;
@@ -1187,7 +1193,7 @@ export function ProcessDisclosure<T>({
   const runningFor = runningSince !== null && runningMs >= RUNNING_META_MS && runningMs <= 24 * 3600_000 ? formatElapsed(runningMs) : "";
   // 同一时刻只有一行运行状态:阶段归 TurnActivity 时外壳不说「正在…」;展开时那一行落在时间轴里
   // 在干活的段(或「等待模型响应」尾行),外壳只留标题和计时(OCV5-308)。
-  const live = active && !keepDistinctActivity(activity) ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
+  const live = active && !blockedOnPrompt && !keepDistinctActivity(activity) ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
   const liveInRail = !!live && open && (waiting || (!!currentSection && !currentSection.narrative));
   const title = active ? "处理过程" : "工作过程";
   const outcome = turnOutcome(bounds?.following);

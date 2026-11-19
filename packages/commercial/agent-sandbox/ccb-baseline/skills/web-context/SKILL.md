@@ -12,10 +12,10 @@ priority: 8
 ## 用法
 
 ```bash
-oc-web search "<关键词>"       # 搜索并返回带来源 URL 的结果；首路失败时内部自动换路
-oc-web extract <url>          # 抓公开 URL → 干净 Markdown（静态提取，保留重定向/DNS 在 SSRF 防护内）
+oc-web search "<关键词>"       # 搜索并返回带来源 URL 的结果；优先高阶搜索并在失败时自动换路
+oc-web extract <url>          # 抓公开 URL → 干净 Markdown（默认 auto 先静态后受 SSRF 守卫的浏览器渲染）
 oc-web parse <绝对路径>        # 解析本地文件 → Markdown
-oc-web health                 # 检查解析器依赖是否可用
+oc-web health                 # 检查解析器与受守卫浏览器渲染依赖是否可用
 ```
 
 `search` 直接接收查询词，返回带标题、URL、摘要的结果；下列 flag 用于 `extract` / `parse`。
@@ -24,7 +24,7 @@ oc-web health                 # 检查解析器依赖是否可用
 - `--json`：输出完整结构化 JSON（含 ok/blocked/error/final_url/http_status 等），便于你程序化判断；默认直接打印 Markdown 正文。
 - `--max-chars <n>`：限制输出字符数。
 - `--timeout-ms <n>`：单次超时。
-- `--mode auto|static|browser`：默认 `auto`（=静态提取）；`browser` 渲染暂不可用。
+- `--mode auto|static|browser`：默认 `auto`（先跑静态快路径，遇到 JS 渲染 SPA 正文不足时自动回退到受 SSRF 代理守卫的无头 Chromium 渲染）；`static` 仅静态抓取；`browser` 直接走受守卫浏览器渲染。
 - `--max-file-bytes <n>`：`parse` 的输入文件大小上限。
 
 退出码：`0` 成功；`1` 提取失败/被拦（blocked）/运行错误；`2` 用法错误。

@@ -1,5 +1,5 @@
 import { useCallback, type Dispatch, type RefObject, type SetStateAction } from 'react'
-import type { CursorContextTier, ServiceTier } from '@openclaude/protocol/browser'
+import { normalizeServiceTierForModel, type CursorContextTier, type ServiceTier } from '@openclaude/protocol/browser'
 import type { Session } from '../lib/types'
 import type { UseChatSocket } from './useChatSocket'
 import type { PreferenceEffort } from '../lib/modelPreferences'
@@ -37,7 +37,7 @@ export function useDraftSessionMaterialization(args: {
     promoteDraftCollab?.(id)
     if (sessionEffort !== undefined) writeSessionEffort(id, sessionEffort)
     writeContextTier(id, contextTier)
-    writeSessionServiceTier(id, serviceTier)
+    writeSessionServiceTier(id, normalizeServiceTierForModel(modelId, serviceTier))
     sockRef.current?.ensureSession(id, agentId, '新对话')
     if (modelId) sockRef.current?.setSessionModel(id, modelId)
     setSessions(current => [session, ...current])

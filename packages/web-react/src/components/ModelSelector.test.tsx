@@ -123,10 +123,10 @@ describe('ModelSelector 团队模式诚信显示', () => {
       ),
     ).toBe('GPT-7 Nova 旗舰')
     expect(teamEngineLabel([{ id: 'glm-5.2' }], 'gpt-8-server-only')).toBe('gpt-8-server-only')
-    expect(teamEngineLabel([{ id: 'gpt-6-astra', display_name: 'GPT-6-Astra 旗舰' }])).toBe(
-      'GPT-6-Astra 旗舰',
+    expect(teamEngineLabel([{ id: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra 旗舰' }])).toBe(
+      'GPT-6.2-Astra 旗舰',
     )
-    expect(teamEngineLabel([{ id: 'glm-5.2' }])).toBe('GPT-6-Astra')
+    expect(teamEngineLabel([{ id: 'glm-5.2' }])).toBe('GPT-6.2-Astra')
     expect(modelLabel({ id: 'x' })).toBe('x')
   })
 })
@@ -626,6 +626,29 @@ describe('ModelSelector GPT-6 家族(selfhost 无默认折叠组)', () => {
     expect(document.querySelector('[data-collapsed-group]')).toBeNull()
     expect(screen.queryByText('更多模型')).toBeNull()
   })
+
+  it('GPT-6.2 Astra/Sol 家族按目录顺序直接可见,不渲染折叠头', async () => {
+    const models62: PublicModel[] = [
+      { id: 'glm-5.3', display_name: 'GLM-5.3' },
+      { id: 'gpt-6.2-astra', display_name: 'GPT-6.2-Astra' },
+      { id: 'gpt-6.2-astra-1m', display_name: 'GPT-6.2-Astra' },
+      { id: 'gpt-6.2-sol', display_name: 'GPT-6.2-Sol' },
+      { id: 'gpt-6.2-sol-1m', display_name: 'GPT-6.2-Sol' },
+      { id: 'gpt-6-luna', display_name: 'GPT-6-Luna' },
+      { id: 'gpt-6-luna-1m', display_name: 'GPT-6-Luna' },
+    ]
+    render(<ModelSelector models={models62} selectedId="gpt-6.2-astra" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const families = Array.from(document.querySelectorAll('[data-context-family]')).map((el) =>
+      el.getAttribute('data-context-family'),
+    )
+    expect(families).toEqual(['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6-luna'])
+    expect(screen.getAllByText('GPT-6.2-Astra').length).toBeGreaterThanOrEqual(2)
+    expect(screen.getByText('GPT-6.2-Sol')).toBeInTheDocument()
+    expect(document.querySelector('[data-collapsed-group]')).toBeNull()
+    expect(screen.queryByText('更多模型')).toBeNull()
+  })
 })
 
 // OCV5-425: OpenCode Go models sit in the collapsed「更多模型」group; the main list stays as is.
@@ -924,20 +947,23 @@ describe('ModelSelector Box Claude 走平台思考档位(OCV5-378)', () => {
   })
 })
 
-describe('ModelSelector OCV5-434 GPT Fast(turn 级 serviceTier,默认关)', () => {
+describe('ModelSelector OCV5-434 / OCV5-798 GPT 速度档位(turn 级 serviceTier,默认关)', () => {
   const GPT_MODELS: PublicModel[] = [
+    { id: 'gpt-6.2-sol', display_name: 'GPT-6.2 Sol' },
+    { id: 'gpt-6.2-astra', display_name: 'GPT-6.2 Astra' },
     { id: 'gpt-6-luna', display_name: 'GPT-6 Luna' },
+    { id: 'gpt-6-luna-remote', display_name: 'GPT-6 Luna (Remote)' },
     { id: 'opencode-gpt-6-luna', display_name: 'GPT-6 Luna (OpenCode)' },
     { id: 'opencode-grok-4.7', display_name: 'Grok 4.7' },
     { id: 'glm-5.2', display_name: 'GLM-5.2' },
   ]
 
-  it('OpenCode Go Luna: Fast 标注按 2× 计费;serviceTier=fast 时 Fast 打勾,点标准上抛 null', async () => {
+  it('gpt-6.2-sol 显示标准 / Fast(2×) / Ultrafast(6×) 并正确上抛档位', async () => {
     const onSelectServiceTier = vi.fn()
     render(
       <ModelSelector
         models={GPT_MODELS}
-        selectedId="opencode-gpt-6-luna"
+        selectedId="gpt-6.2-sol"
         onSelect={() => {}}
         serviceTier="fast"
         onSelectServiceTier={onSelectServiceTier}
@@ -945,22 +971,51 @@ describe('ModelSelector OCV5-434 GPT Fast(turn 级 serviceTier,默认关)', () =
     )
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
-    const std = document.querySelector('[data-gpt-fast="false"]')
     const fast = document.querySelector('[data-gpt-fast="true"]')
+    const ultra = document.querySelector('[data-gpt-ultrafast="true"]')
     expect(fast?.textContent).toContain('按 2× 计费')
     expect(fast?.querySelector('svg')).toBeTruthy()
-    if (std) fireEvent.click(std)
+    expect(ultra?.textContent).toContain('按 6× 计费')
+    expect(ultra).toBeTruthy()
+    fireEvent.click(ultra!)
+    expect(onSelectServiceTier).toHaveBeenCalledWith('ultrafast')
+
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    fireEvent.click(document.querySelector('[data-gpt-fast="false"]')!)
     expect(onSelectServiceTier).toHaveBeenCalledWith(null)
   })
 
-  it('Codex GPT-6 与不支持 Fast 的模型不渲染速度段', async () => {
-    // Codex GPT-6 Luna 也不显示(OCV5-434:上游不生效,按用户决定隐藏)。
-    for (const id of ['gpt-6-luna', 'opencode-grok-4.7', 'glm-5.2']) {
+  it('gpt-6.2-astra 与 OpenCode Go Luna 仅显示 Fast(2×),且切到不支持 ultrafast 的模型时回落标准勾选', async () => {
+    for (const id of ['gpt-6.2-astra', 'gpt-6-luna', 'opencode-gpt-6-luna']) {
+      cleanup()
+      render(
+        <ModelSelector
+          models={GPT_MODELS}
+          selectedId={id}
+          onSelect={() => {}}
+          serviceTier="ultrafast"
+          onSelectServiceTier={() => {}}
+        />,
+      )
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findAllByRole('menuitem')
+      const std = document.querySelector('[data-gpt-fast="false"]')
+      const fast = document.querySelector('[data-gpt-fast="true"]')
+      expect(fast?.textContent).toContain('按 2× 计费')
+      expect(std?.querySelector('svg')).toBeTruthy()
+      expect(document.querySelector('[data-gpt-ultrafast]')).toBeNull()
+    }
+  })
+
+  it('Remote Codex 与非加速模型不渲染速度段', async () => {
+    for (const id of ['gpt-6-luna-remote', 'opencode-grok-4.7', 'glm-5.2']) {
       cleanup()
       render(<ModelSelector models={GPT_MODELS} selectedId={id} onSelect={() => {}} onSelectServiceTier={() => {}} />)
       openMenu(screen.getByRole('button', { name: '选择对话模型' }))
       await screen.findAllByRole('menuitem')
       expect(document.querySelector('[data-gpt-fast]')).toBeNull()
+      expect(document.querySelector('[data-gpt-ultrafast]')).toBeNull()
     }
   })
 })

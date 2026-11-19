@@ -391,6 +391,96 @@ describe("OptionsBlock in a multi-question message (group mode)", () => {
     fireEvent.click(screen.getByText("全量发布"));
     expect(sendUserText).toHaveBeenCalledTimes(1);
   });
+
+  it("expands top-level JSON array (#e3082ac8 case), splits em-dash descriptions, and aggregates cleanly", () => {
+    const sendUserText = vi.fn();
+    const arrayCode = JSON.stringify([
+      {
+        question: "本次功能上线范围怎么定？",
+        options: [
+          "(推荐) Codex 升到 0.170.0 + 同时开放 Fast 与 6.2-sol Ultrafast — 一次发车完成 CLI 升级",
+          "仅把 Codex CLI 升到 0.170.0 — 只更新镜像与本地 CLI 版本",
+        ],
+      },
+      {
+        question: "如果开放加速档，平台侧对用户的积分计费倍率按多少结算？",
+        options: [
+          "(推荐) Fast 按 2×、Ultrafast 按 6× — 与 OpenAI 官方订阅额度消耗倍率一致",
+          "暂不开放加速档（无需调整倍率）",
+        ],
+      },
+      {
+        question: "远端美区节点 cc5-us 是否一并升级？",
+        options: [
+          "(推荐) 一并升级主站镜像与 cc5-us — 全链路版本对齐",
+          "仅升级主站容器镜像",
+        ],
+      },
+    ]);
+
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsGroupProvider>
+          <OptionsBlock code={arrayCode} />
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>,
+    );
+
+    expect(document.querySelector("pre")).toBeNull();
+    expect(screen.getByText("一次发车完成 CLI 升级")).toBeTruthy();
+    expect(screen.getByText("全链路版本对齐")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("(推荐) Codex 升到 0.170.0 + 同时开放 Fast 与 6.2-sol Ultrafast"));
+    expect(sendUserText).not.toHaveBeenCalled();
+    expect(screen.getByRole("status").textContent).toContain("已作答 1 / 3 题");
+
+    fireEvent.click(screen.getByText("(推荐) Fast 按 2×、Ultrafast 按 6×"));
+    fireEvent.click(screen.getByText("(推荐) 一并升级主站镜像与 cc5-us"));
+    fireEvent.click(screen.getByText("发送选择"));
+
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sent = sendUserText.mock.calls[0][0] as string;
+    expect(sent).toContain("1. 本次功能上线范围怎么定？:(推荐) Codex 升到 0.170.0 + 同时开放 Fast 与 6.2-sol Ultrafast");
+    expect(sent).toContain("2. 如果开放加速档，平台侧对用户的积分计费倍率按多少结算？:(推荐) Fast 按 2×、Ultrafast 按 6×");
+    expect(sent).toContain("3. 远端美区节点 cc5-us 是否一并升级？:(推荐) 一并升级主站镜像与 cc5-us");
+  });
+
+  it("self-provides group footer for standalone array OptionsBlock and supports questions wrapper + multi-JSONL aliases", () => {
+    const sendUserText = vi.fn();
+    const wrapperAndJsonl = [
+      JSON.stringify({
+        questions: [
+          {
+            prompt: "选择区域",
+            is_multi_select: true,
+            options: [{ label: "美区", description: "cc5-us" }, { label: "亚太" }],
+          },
+        ],
+      }),
+      JSON.stringify({
+        question: "是否同步重启",
+        options: [{ label: "立即重启" }, { label: "稍后" }],
+      }),
+    ].join("\n");
+
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={wrapperAndJsonl} />
+      </ChatInteractionContext.Provider>,
+    );
+
+    expect(document.querySelector("pre")).toBeNull();
+    expect(screen.getByText("可多选")).toBeTruthy();
+    expect(screen.getByText("cc5-us")).toBeTruthy();
+    fireEvent.click(screen.getByText("美区"));
+    fireEvent.click(screen.getByText("立即重启"));
+    expect(sendUserText).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("发送选择"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(sendUserText.mock.calls[0][0]).toContain("1. 选择区域:美区");
+    expect(sendUserText.mock.calls[0][0]).toContain("2. 是否同步重启:立即重启");
+  });
 });
 
 describe("HtmlPreview 导出", () => {

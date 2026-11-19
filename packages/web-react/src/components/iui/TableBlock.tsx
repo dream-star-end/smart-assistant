@@ -1,8 +1,9 @@
-import { ArrowDown, ArrowUp, ArrowUpDown, Check, Download, Search, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Check, Copy, Download, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
+import { cn } from "../../lib/utils";
 import type { Cell, TableSpec } from "./schema";
-import { Frame, Inline } from "./shell";
-import { formatNumber, specToMarkdown, tableToCsv } from "./toMarkdown";
+import { Frame, Inline, useCopiedFlag } from "./shell";
+import { formatNumber, specToMarkdown, tableToCsv, tableToTsv } from "./toMarkdown";
 
 /** 单元格的排序键:数字直接比;「1,200」「35%」「¥80」这类数字字符串按数值比;其余按文字。 */
 export function sortKey(c: Cell): { n: number | null; s: string } {
@@ -81,9 +82,15 @@ export function compareCells(a: Cell, b: Cell): number {
 export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec; notes: string[]; streaming: boolean; nested?: boolean }) {
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
   const [query, setQuery] = useState("");
+  const [mediumSearchOpen, setMediumSearchOpen] = useState(false);
+  const [scrolledX, setScrolledX] = useState(false);
+  const [copiedTsv, flashTsv] = useCopiedFlag();
   const width = spec.columns.length;
   const long = spec.rows.length > LONG_TABLE_ROWS;
-  const filtering = long && !streaming && query.trim() !== "";
+  const canMediumSearch = !long && spec.rows.length >= 5;
+  const searchVisible = !streaming && (long || (canMediumSearch && mediumSearchOpen));
+  const filtering = searchVisible && query.trim() !== "";
+  const showTools = !streaming && (spec.title || spec.rows.length >= 5);
   const rows = useMemo(() => {
     const all = spec.rows.map((r, i) => ({ r: Array.from({ length: width }, (_, j) => r[j] ?? null), i }));
     const padded = filtering ? all.filter((x) => rowMatches(x.r, query)) : all;
@@ -122,20 +129,55 @@ export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec
       streaming={streaming}
       copyText={() => specToMarkdown(spec)}
       actions={
-        !streaming && (spec.title || spec.rows.length >= 5) ? (
-          <button
-            type="button"
-            className="oc-iui-icon-btn"
-            aria-label={filtering ? `下载筛选后的 ${rows.length} 行为 CSV` : "下载为 CSV"}
-            title={filtering ? `下载筛选后的 ${rows.length} 行(CSV)` : "下载 CSV"}
-            onClick={() => downloadCsv(spec, rows.map((x) => x.r))}
-          >
-            <Download size={14} aria-hidden />
-          </button>
+        showTools ? (
+          <>
+            {canMediumSearch && (
+              <button
+                type="button"
+                className="oc-iui-icon-btn"
+                aria-label={mediumSearchOpen ? "收起筛选" : "展开筛选"}
+                aria-expanded={mediumSearchOpen}
+                title={mediumSearchOpen ? "收起筛选" : "筛选表格行"}
+                onClick={() => {
+                  setMediumSearchOpen((v) => {
+                    if (v) setQuery("");
+                    return !v;
+                  });
+                }}
+              >
+                <Search size={14} aria-hidden />
+              </button>
+            )}
+            <button
+              type="button"
+              className="oc-iui-icon-btn"
+              aria-label={copiedTsv ? "已复制表格" : "复制表格(TSV)"}
+              title={copiedTsv ? "已复制表格" : "复制表格(TSV，可直接粘贴到 Excel)"}
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(tableToTsv(spec, rows.map((x) => x.r)));
+                  flashTsv();
+                } catch {
+                  /* 剪贴板不可用 */
+                }
+              }}
+            >
+              {copiedTsv ? <Check size={14} aria-hidden /> : <Copy size={14} aria-hidden />}
+            </button>
+            <button
+              type="button"
+              className="oc-iui-icon-btn"
+              aria-label={filtering ? `下载筛选后的 ${rows.length} 行为 CSV` : "下载为 CSV"}
+              title={filtering ? `下载筛选后的 ${rows.length} 行(CSV)` : "下载 CSV"}
+              onClick={() => downloadCsv(spec, rows.map((x) => x.r))}
+            >
+              <Download size={14} aria-hidden />
+            </button>
+          </>
         ) : undefined
       }
     >
-      {long && !streaming && (
+      {searchVisible && (
         <div className="oc-iui-table-tools">
           <label className="oc-iui-search">
             <Search size={14} aria-hidden />
@@ -156,8 +198,9 @@ export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec
         </div>
       )}
       <section
-        className={long ? "oc-iui-table-region is-long" : "oc-iui-table-region"}
+        className={cn("oc-iui-table-region", long && "is-long", scrolledX && "is-scrolled-x")}
         aria-label={spec.title ? `${spec.title}(可横向滚动)` : "表格(可横向滚动)"}
+        onScroll={(e) => setScrolledX(e.currentTarget.scrollLeft > 2)}
         // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
         tabIndex={0}
       >

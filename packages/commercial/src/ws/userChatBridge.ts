@@ -20,7 +20,7 @@ import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/model
 import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
-import { applyTeamLeaderForwarding } from './teamModeForwarding.js'
+import { applyTeamLeaderForwarding, resolveBridgeTeamLeaderModel } from "./teamModeForwarding.js";
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -96,10 +96,8 @@ import {
   parseBillingPricing,
   serializeBillingPricing,
 } from "../billing/persistedBillingPricing.js";
-import {
-  getAgentCostMultiplier,
-  composeMultiplier,
-} from "../billing/agentMultiplier.js";
+import { getAgentCostMultiplier } from "../billing/agentMultiplier.js";
+import { applyAdmittedServiceTierToFrame, composeCodexTurnPricing, extractInboundPromptText, resolveTakenOverCodexBilling } from "../billing/codexServiceTierPricing.js";
 import {
   startInflightJournal,
   abortInflightJournal,
@@ -157,7 +155,9 @@ import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   DEFAULT_CODEX_ENGINE_MODEL,
+  CODEX_SPEED_TIERS_CAPABILITY,
   MODEL_AUTHORITY_CAPABILITY,
+  resolveEffectiveTurnServiceTier,
   MODEL_AUTHORITY_FIELD,
   DURABLE_TURN_DISPATCH_CAPABILITY,
   DISPATCH_AUTHORITY_FIELD,
@@ -2874,6 +2874,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     /** 容器 attest 是否携带 durable-turn-dispatch-v1:true 才走 dispatch 受理,否则 legacy。 */
     let containerHasDurableDispatch = false;
     let containerHasSystemHelp = false;
+    let containerHasCodexSpeedTiers = false;
+    let speedTierAttestSeen = false;
     let recoveryExecutor: ((job: ClaimedRecoveryJob) => void) | null = null;
     let cronOriginExecutor: CronOriginExecutor | null = null;
     let unregisterExecutors: (() => void) | null = null;
@@ -2924,9 +2926,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     /** 容器 attest 帧到达(bridge 拦截消费,**绝不**透传给浏览器)。 */
     const onContainerAttest = (frame: Record<string, unknown>): void => {
-      if (!authorityOn || attestState !== "pending") return;
-      const capsRaw = frame.capabilities;
-      const caps = Array.isArray(capsRaw) ? capsRaw : [];
+      const caps = Array.isArray(frame.capabilities) ? frame.capabilities : [];
+      if (!authorityOn) {
+        if (!speedTierAttestSeen) { speedTierAttestSeen = true; containerHasCodexSpeedTiers = caps.includes(CODEX_SPEED_TIERS_CAPABILITY); }
+        return;
+      }
+      if (attestState !== "pending") return;
       const challenge =
         typeof frame.connectionChallenge === "string" ? frame.connectionChallenge : "";
       if (!caps.includes(MODEL_AUTHORITY_CAPABILITY) || challenge === "") {
@@ -2957,6 +2962,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // capability 门:容器广播 durable-turn-dispatch-v1 才走 dispatch 受理(RFC §2.2)。
       containerHasDurableDispatch = caps.includes(DURABLE_TURN_DISPATCH_CAPABILITY);
       containerHasSystemHelp = caps.includes(SYSTEM_HELP_CAPABILITY);
+      containerHasCodexSpeedTiers = caps.includes(CODEX_SPEED_TIERS_CAPABILITY);
       attestState = "ok";
       if (containerHasDurableDispatch && deps.pgPool && recoveryExecutor === null) {
         recoveryExecutor = (job) => {
@@ -5855,6 +5861,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 这里必须在 auth/codex 分类前覆盖 effectiveModel,并在下方 rewrite
               // forwarded frame.model,确保 master 计费链路与容器执行模型一致。
               effectiveModel = DEFAULT_CODEX_ENGINE_MODEL;
+              effectiveModel = resolveBridgeTeamLeaderModel(deps.pricing, modelCheckerHandle);
               source = "teamMode.main";
             } else if (frameModelId !== null) {
               effectiveModel = frameModelId;
@@ -6062,7 +6069,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 sanitizedParsed = withoutWorkspaceMode;
               }
               if (teamModeMain) {
-                applyTeamLeaderForwarding(sanitizedParsed);
+                applyTeamLeaderForwarding(sanitizedParsed, effectiveModelForFrame ?? DEFAULT_CODEX_ENGINE_MODEL);
               }
             }
             // Browser paper hints run before admission freezes the content hash.
@@ -6972,7 +6979,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const decision = await createCodexRoute({
                 containerId: cid,
                 userId: uid,
-                modelId: effectiveModelCapture,
+                modelId: authorityExec?.canonicalModel ?? effectiveModelCapture,
                 ...(inboundPeerIdForFrame ? { sessionId: inboundPeerIdForFrame } : {}),
               });
               if (!isCurrentCodexTurnState(codexTurnState)) {
@@ -7099,7 +7106,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 releaseAcquiredSlotForFailure();
                 return;
               }
-              const effectiveModel = effectiveModelCapture;
+              const effectiveModel = authorityExec !== null ? authorityExec.canonicalModel : effectiveModelCapture;
 
               // authority turn 的执行、授权、基础价格必须来自同一个 fenced snapshot；
               // PricingCache 只服务 flag 关闭的 legacy 路径。
@@ -7142,11 +7149,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 return;
               }
 
-              const composedMultiplier = composeMultiplier(modelPricing.multiplier, agentMul);
-              const derivedPricing: ModelPricing = {
-                ...modelPricing,
-                multiplier: composedMultiplier,
-              };
+              let { pricing: derivedPricing, serviceTier: turnServiceTier } = composeCodexTurnPricing(
+                modelPricing, agentMul, effectiveModel, (preparedInbound as Record<string, unknown>).serviceTier,
+                { agentId: inboundAgentIdCapture ?? "main", collabMode: preparedInbound.collabMode, advisorModel: preparedInbound.advisorModel, text: extractInboundPromptText(preparedInbound), gatewaySupportsSpeedTiers: containerHasCodexSpeedTiers },
+              );
 
               // durable dispatch:复用受理铸的稳定 billingRequestId 作 server requestId
               // (接管跨 attempt 稳定;journal/票据/结算全绑同一值)。
@@ -7257,6 +7263,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     // 已复合 agent override 的最终价格。跨 bridge 恢复必须用这份
                     // server-owned 快照，不能在结算时回读已换代的 cache/override。
                     billingPricing: serializeBillingPricing(derivedPricing),
+                    ...(turnServiceTier ? { serviceTier: turnServiceTier } : {}),
                     ...(verificationSponsorship === null
                       ? {}
                       : { verificationSponsorship: serializeVerificationSponsorshipSnapshot(verificationSponsorship) }),
@@ -7294,27 +7301,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   let reuseAsTakenOver = false;
                   if (dispatchRecordB !== undefined) {
                     const existing = await readJournalForTakeover(pgPool, requestId).catch(() => null);
-                    if (
-                      existing !== null &&
-                      existing.state === "inflight" &&
-                      existing.userId === uid.toString() &&
-                      existing.dispatchId === dispatchRecordB.dispatchId &&
-                      existing.attemptNo === dispatchRecordB.attemptNo &&
-                      existing.model === effectiveModel
-                    ) {
+                    const takeover = resolveTakenOverCodexBilling(
+                      existing,
+                      { userId: uid.toString(), dispatchId: dispatchRecordB.dispatchId, attemptNo: dispatchRecordB.attemptNo, model: effectiveModel, gatewaySupportsSpeedTiers: containerHasCodexSpeedTiers },
+                      (tier) => composeCodexTurnPricing(modelPricing, agentMul, effectiveModel, tier, { gatewaySupportsSpeedTiers: containerHasCodexSpeedTiers }).pricing,
+                    );
+                    if (takeover.kind === "reuse") {
                       reuseAsTakenOver = true;
-                      turnLogCapture?.info("user-chat-bridge: journal takeover reuse", {
-                        requestId, dispatchId: dispatchRecordB.dispatchId,
-                      });
-                    } else if (existing !== null && existing.state === "aborted") {
-                      failDispatchPreForward(dispatchRecordB, "journal_aborted");
-                    } else {
-                      void casToManualReconcile(pgPool, {
-                        dispatchId: dispatchRecordB.dispatchId,
-                        conflictReason: "journal_takeover_mismatch",
-                      }).catch(() => {});
-                      dropAdmittedDispatch(dispatchRecordB.clientMessageId);
-                    }
+                      derivedPricing = takeover.pricing;
+                      turnServiceTier = takeover.serviceTier;
+                      turnLogCapture?.info("user-chat-bridge: journal takeover reuse", { requestId, dispatchId: dispatchRecordB.dispatchId });
+                    } else if (takeover.kind === "aborted") failDispatchPreForward(dispatchRecordB, "journal_aborted");
+                    else if (takeover.kind === "capability_mismatch") failDispatchPreForward(dispatchRecordB, "codex_speed_tier_capability_mismatch", { abortNeverExecutedJournal: true, fromStatuses: ["admitted"] });
+                    else { void casToManualReconcile(pgPool, { dispatchId: dispatchRecordB.dispatchId, conflictReason: "journal_takeover_mismatch" }).catch(() => {}); dropAdmittedDispatch(dispatchRecordB.clientMessageId); }
                   }
                   if (!reuseAsTakenOver) {
                     turnLogCapture?.error("user-chat-bridge: request journal conflict", {
@@ -7488,19 +7487,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 abandonReason = "bridge_disconnect_before_forward";
                 return;
               }
-              const rewrittenObj = {
+              const rewrittenObj = applyAdmittedServiceTierToFrame({
                 ...enrichedParsed,
                 requestId,
                 traceId: turnTraceIdCapture,
                 _creditBudget: preCheckResult.balance.toString(),
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
                 ...(grokRouteFrame !== null ? { __oc_grok_route: grokRouteFrame } : {}),
-                // 模型执行权威:签票绑定本 turn 的 server-owned requestId(billingRequestId),
-                // 并把 frame.model 归一为 canonical(容器断言 canonicalModel === frame.model)。
                 ...authorityFields,
-                // durable dispatch envelope(容器 durable inbox 准入 + at-most-once)。
                 ...dispatchAuthorityField(dispatchRecordB),
-              };
+              }, turnServiceTier);
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
               if (rewrittenLen > maxFrameBytes) {
@@ -7580,17 +7576,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 releaseAcquiredSlotForFailure();
                 return;
               }
-              const rewrittenObj = {
+              const legacyTier = containerHasCodexSpeedTiers
+                ? resolveEffectiveTurnServiceTier({
+                    model: authorityExec?.canonicalModel ?? effectiveModelCapture,
+                    serviceTier: (enrichedParsed as Record<string, unknown>).serviceTier,
+                    agentId: inboundAgentIdCapture ?? "main",
+                    collabMode: enrichedParsed.collabMode,
+                    advisorModel: enrichedParsed.advisorModel,
+                    text: extractInboundPromptText(enrichedParsed),
+                  })
+                : null;
+              const rewrittenObj = applyAdmittedServiceTierToFrame({
                 ...enrichedParsed,
                 traceId: turnTraceIdCapture,
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
                 ...(grokRouteFrame !== null ? { __oc_grok_route: grokRouteFrame } : {}),
-                // billing 未启用(legacy NULL 容器 / 测试):无 server requestId 可绑,
-                // 仍必须签票 —— 容器侧(flag 开)对无 envelope 的帧一律拒。
                 ...authorityFields,
-                // durable dispatch envelope(记录存在才注;此分支通常无 durable capability)。
                 ...dispatchAuthorityField(dispatchRecordB),
-              };
+              }, legacyTier);
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
               if (rewrittenLen > maxFrameBytes) {
@@ -10129,10 +10132,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               });
               return;
             }
-            derivedPricing = {
-              ...modelPricing,
-              multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
-            };
+            derivedPricing = composeCodexTurnPricing(modelPricing, agentMul, model, ctx.serviceTier).pricing;
           }
           // rateLimits piggyback(best-effort,与主路径同语义;accountId 权威取
           // journal ctx.codexAccountId —— null = legacy / api_relay 无关联账号)。

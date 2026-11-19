@@ -26,21 +26,34 @@ async function fixture(handler: (req: IncomingMessage, res: ServerResponse) => v
 }
 function ok(res: ServerResponse) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ organic })) }
 
-test('OCV5-510 oc-web search returns source URLs through the authenticated master proxy', async () => {
+test('OCV5-510 oc-web search returns source URLs through the authenticated master proxy (Tavily first)', async () => {
   await fixture((_req, res) => ok(res), async (env, requests) => {
     const result = await runOcWebCli(['search', '今日科技新闻', '--json'], env)
     assert.equal(result.exitCode, 0, result.stderr)
     assert.equal(JSON.parse(result.stdout).results[0].url, organic[0].url)
     assert.match(result.stdout, /今日科技新闻/)
-    assert.deepEqual(requests, [{ path: '/internal/v3/minimax-search', body: { q: '今日科技新闻' }, auth: `Bearer ${identity}` }])
+    assert.deepEqual(requests, [{ path: '/internal/v3/tavily-search', body: { q: '今日科技新闻' }, auth: `Bearer ${identity}` }])
     assert.ok(!result.stdout.includes(identity))
   })
 })
 
+test('oc-web search falls back cleanly from Tavily (503 unconfigured) to MiniMax', async () => {
+  await fixture((req, res) => {
+    if (req.url === '/internal/v3/tavily-search') { res.writeHead(503); res.end('{"error":"TAVILY_NOT_CONFIGURED"}'); return }
+    ok(res)
+  }, async (env, requests) => {
+    const result = await runOcWebCli(['search', '今日科技新闻', '--json'], env)
+    assert.equal(result.exitCode, 0, result.stderr)
+    assert.equal(JSON.parse(result.stdout).results[0].url, organic[0].url)
+    assert.deepEqual(requests.map((r) => r.path), ['/internal/v3/tavily-search', '/internal/v3/minimax-search'])
+  })
+})
+
 for (const scenario of ['http-error', 'empty', 'invalid-json', 'invalid-urls', 'timeout']) {
-  test(`search falls back to Grok after MiniMax ${scenario}`, async () => {
+  test(`search falls back to Grok after Tavily & MiniMax ${scenario}`, async () => {
     await fixture((req, res) => {
       if (req.url === '/internal/v3/grok-search') return ok(res)
+      if (req.url === '/internal/v3/tavily-search') { res.writeHead(503); res.end('{}'); return }
       if (scenario === 'http-error') { res.writeHead(503); res.end('private upstream error'); return }
       if (scenario === 'timeout') return // Hold this response open until the caller aborts it.
       res.end(scenario === 'empty' ? '{"organic":[]}' : scenario === 'invalid-urls' ? '{"organic":[{"title":"bad","url":"javascript:alert(1)"}]}' : 'not json')
@@ -48,7 +61,7 @@ for (const scenario of ['http-error', 'empty', 'invalid-json', 'invalid-urls', '
       const result = await runOcWebCli(['search', 'news', '--timeout-ms', scenario === 'timeout' ? '1000' : '2000'], env)
       assert.equal(result.exitCode, 0, result.stderr)
       assert.match(result.stdout, /https:\/\/example.test\/news/)
-      assert.deepEqual(requests.map((r) => r.path), ['/internal/v3/minimax-search', '/internal/v3/grok-search'])
+      assert.deepEqual(requests.map((r) => r.path), ['/internal/v3/tavily-search', '/internal/v3/minimax-search', '/internal/v3/grok-search'])
     })
   })
 }
@@ -59,7 +72,7 @@ test('search fails explicitly without disclosing response bodies or identity', a
     assert.equal(result.exitCode, 1)
     assert.equal(JSON.parse(result.stdout).ok, false)
     assert.ok(!result.stdout.includes(identity)); assert.ok(!result.stdout.includes('private upstream detail'))
-    assert.equal(requests.length, 2)
+    assert.equal(requests.length, 3)
   })
 })
 
@@ -117,7 +130,7 @@ for (const format of ['json', 'markdown']) {
       } else {
         assert.ok(result.stdout.includes(`1. ${sourceUrl}\n${sourceUrl}`))
       }
-      assert.deepEqual(requests.map((r) => r.path), ['/internal/v3/minimax-search', '/internal/v3/grok-search'])
+      assert.deepEqual(requests.map((r) => r.path), ['/internal/v3/tavily-search', '/internal/v3/minimax-search', '/internal/v3/grok-search'])
       assert.ok(!result.stdout.includes('javascript:'))
       assert.ok(!result.stdout.includes(identity))
       assert.ok(!result.stdout.includes('private upstream detail'))

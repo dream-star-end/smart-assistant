@@ -37,6 +37,8 @@ import {
   normalizeCollabMode,
   collabConfigVersionOf,
   MAX_ATTACHMENTS_PER_MESSAGE,
+  isServiceTier,
+  type ServiceTier,
   AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
   isCursorEngineModel,
@@ -503,7 +505,9 @@ export async function dispatchInbound(
     // OCV5-434 GPT Fast (turn-level). WS frames are JSON-cast: only 'fast' passes; anything
     // else — including an absent field — is explicit standard, so Fast is never implied or
     // carried over from an earlier turn. Runners act on it only for Fast-capable models.
-    const safeServiceTier: 'fast' | null = (frame as any).serviceTier === 'fast' ? 'fast' : null
+    const safeServiceTier: ServiceTier | null = isServiceTier((frame as any).serviceTier)
+      ? (frame as any).serviceTier
+      : null
     const _frameEffort = (frame as any).effortLevel
     const allowedEfforts: ReadonlySet<string> =
       turnAuthority !== undefined
@@ -2291,15 +2295,16 @@ export async function dispatchInbound(
                 max: AUTOMATIC_TURN_RETRY_MAX,
               }
             : undefined
+      const turnReadOnly = advisorTurnAllowed && detectAdvisorNoWrite(rawUserText)
       const leaderSubmitOpts = {
-        readOnly: advisorTurnAllowed && detectAdvisorNoWrite(rawUserText),
+        readOnly: turnReadOnly,
         systemHelpBootstrap: getSystemHelpBootstrap(frame as object),
         historicalMessages: masterHistoricalMessages,
         codexRoute: safeCodexRoute,
         grokRoute: safeGrokRoute,
         zcodeRoute: safeZcodeRoute,
         antigravityRoute: safeAntigravityRoute,
-        serviceTier: safeServiceTier,
+        serviceTier: turnReadOnly ? null : safeServiceTier,
         ...(automaticRetryState ? { automaticRetryState } : {}),
         ...(inboundRecovery?.automatic === true &&
         'resetNativeSession' in inboundRecovery &&
