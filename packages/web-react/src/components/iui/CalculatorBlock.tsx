@@ -94,6 +94,7 @@ function SliderField({ input, value, onChange, disabled }: { input: CalcInput; v
         onChange={(e) => onChange(Number(e.target.value))}
       />
       {presets.length >= 2 && (
+        // biome-ignore lint/a11y/useSemanticElements: div avoids fieldset default UA border and min-content layout
         <div className="oc-iui-calc-presets" role="group" aria-label={`${input.label}快捷挡位`}>
           {presets.map((p) => (
             <button

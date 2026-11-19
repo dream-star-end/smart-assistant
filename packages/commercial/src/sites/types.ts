@@ -166,6 +166,7 @@ export function validateEnvVarKey(raw: string): string {
   return key
 }
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional ASCII control-char path sanitization
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/
 const IGNORED_SEGMENT_NAMES = new Set(['.git', 'node_modules', '__pycache__', '.DS_Store', '.oc-site-state.json'])
 

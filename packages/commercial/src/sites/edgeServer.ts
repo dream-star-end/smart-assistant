@@ -84,6 +84,19 @@ interface TombstoneMeta {
   renamedTo?: string | null
 }
 
+interface RetiredSiteRecord {
+  revision: number
+  op: 'delete' | 'rename'
+  renamedTo: string | null
+  retiredAt: string
+}
+
+interface RetiredSitesMeta {
+  bySiteId: Record<string, RetiredSiteRecord | number>
+}
+
+const MAX_RETIRED_SITE_IDS_PER_SLUG = 64
+
 const MAX_NONCE_CACHE = 10_000
 const MAX_UNLOCK_FAIL_CACHE = 10_000
 const UNLOCK_WINDOW_MS = 5 * 60_000
@@ -624,6 +637,41 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     return join(sitesDir, slug)
   }
 
+  function retiredFileOf(slug: string): string {
+    return join(dataRoot, 'retired', `${slug}.json`)
+  }
+
+  function purgeSiteRuntimeArtifacts(dir: string): void {
+    rmSync(join(dir, 'current'), { force: true })
+    rmSync(join(dir, 'current-server'), { force: true })
+    rmSync(join(dir, 'env.enc'), { force: true })
+    rmSync(join(dir, 'analytics.json'), { force: true })
+    rmSync(join(dir, 'data'), { recursive: true, force: true })
+    rmSync(join(dir, 'releases'), { recursive: true, force: true })
+    rmSync(join(dir, 'meta.json'), { force: true })
+  }
+
+  function normalizeRetiredRecord(raw: RetiredSiteRecord | number): RetiredSiteRecord | null {
+    if (typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0) {
+      return { revision: raw, op: 'delete', renamedTo: null, retiredAt: '' }
+    }
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      typeof raw.revision === 'number' &&
+      Number.isSafeInteger(raw.revision) &&
+      raw.revision > 0
+    ) {
+      return {
+        revision: raw.revision,
+        op: raw.op === 'rename' ? 'rename' : 'delete',
+        renamedTo: typeof raw.renamedTo === 'string' ? raw.renamedTo : null,
+        retiredAt: typeof raw.retiredAt === 'string' ? raw.retiredAt : '',
+      }
+    }
+    return null
+  }
+
   function readMetaAndTombstone(slug: string): {
     meta: StoredSiteMeta | null
     tombstone: TombstoneMeta | null
@@ -635,6 +683,79 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       tombstone: readJsonIfExists<TombstoneMeta>(join(dir, 'tombstone.json')),
       currentLink: join(dir, 'current'),
     }
+  }
+
+  function readRetiredSiteRecords(slug: string): Record<string, RetiredSiteRecord> {
+    const out: Record<string, RetiredSiteRecord> = {}
+    for (const file of [join(siteDirOf(slug), 'retired.json'), retiredFileOf(slug)]) {
+      const parsed = readJsonIfExists<RetiredSitesMeta>(file)
+      if (!parsed || typeof parsed.bySiteId !== 'object' || parsed.bySiteId === null) continue
+      for (const [id, raw] of Object.entries(parsed.bySiteId)) {
+        const rec = normalizeRetiredRecord(raw)
+        if (!rec) continue
+        const prev = out[id]
+        if (!prev || rec.revision > prev.revision || (rec.revision === prev.revision && rec.retiredAt > prev.retiredAt)) {
+          out[id] = rec
+        }
+      }
+    }
+    return out
+  }
+
+  function recordRetiredSiteRevision(
+    slug: string,
+    siteId: string | null | undefined,
+    revision: number,
+    op: 'delete' | 'rename' = 'delete',
+    renamedTo: string | null = null,
+  ): void {
+    if (!siteId || !Number.isSafeInteger(revision) || revision <= 0) return
+    const retiredDir = join(dataRoot, 'retired')
+    mkdirSync(retiredDir, { recursive: true })
+    const prev = readRetiredSiteRecords(slug)
+    const cur = prev[siteId]
+    const retiredAt = new Date().toISOString()
+    const nextRec: RetiredSiteRecord =
+      cur && cur.revision > revision
+        ? cur
+        : {
+            revision: Math.max(cur?.revision ?? 0, revision),
+            op: cur && cur.revision === revision ? cur.op : op,
+            renamedTo: cur && cur.revision === revision ? cur.renamedTo : op === 'rename' ? renamedTo : null,
+            retiredAt:
+              cur?.retiredAt && cur.retiredAt > retiredAt ? cur.retiredAt : retiredAt,
+          }
+    const next: Record<string, RetiredSiteRecord> = {
+      ...prev,
+      [siteId]: nextRec,
+    }
+    const entries = Object.entries(next)
+    if (entries.length > MAX_RETIRED_SITE_IDS_PER_SLUG) {
+      entries.sort((a, b) => b[1].retiredAt.localeCompare(a[1].retiredAt) || b[1].revision - a[1].revision)
+      entries.length = MAX_RETIRED_SITE_IDS_PER_SLUG
+    }
+    writeFileAtomic(retiredFileOf(slug), JSON.stringify({ bySiteId: Object.fromEntries(entries) }))
+  }
+
+  /**
+   * High-water revision for a specific siteId UUID so independent writer instances
+   * sharing one edge storage cannot block a vacant slug via another instance's high tombstone.
+   */
+  function maxSeenRevisionForSite(
+    slug: string,
+    curMeta: StoredSiteMeta | null,
+    tombstone: TombstoneMeta | null,
+    reqSiteId: string | null | undefined,
+  ): number {
+    if (!reqSiteId) {
+      return Math.max(curMeta?.revision ?? 0, tombstone?.revision ?? 0)
+    }
+    const curLive = Boolean(curMeta && (!tombstone || tombstone.revision < curMeta.revision))
+    const curRev =
+      curMeta && curMeta.siteId === reqSiteId && (curLive || !tombstone) ? curMeta.revision : 0
+    const tombRev = tombstone && tombstone.siteId === reqSiteId ? tombstone.revision : 0
+    const retiredRev = readRetiredSiteRecords(slug)[reqSiteId]?.revision ?? 0
+    return Math.max(curRev, tombRev, retiredRev)
   }
 
   function assertIdentityMatches(
@@ -785,10 +906,12 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
     recordNonce(verified.nonce)
 
     if (method === 'GET' && putOrDeleteMatch) {
+      const requestedSiteId = verified.meta?.siteId || url.searchParams.get('siteId')?.trim() || ''
       await withSlugLock(slug, async () => {
         const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
         const liveRevision =
           curMeta && (!tombstone || tombstone.revision < curMeta.revision) ? curMeta.revision : 0
+        const retiredRec = requestedSiteId ? readRetiredSiteRecords(slug)[requestedSiteId] : undefined
         sendJsonResponse(res, 200, {
           exists: liveRevision > 0,
           revision: liveRevision,
@@ -800,6 +923,16 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
                   siteId: tombstone.siteId ?? null,
                   op: tombstone.op ?? 'delete',
                   renamedTo: tombstone.renamedTo ?? null,
+                },
+              }
+            : {}),
+          ...(retiredRec
+            ? {
+                retired: {
+                  siteId: requestedSiteId,
+                  revision: retiredRec.revision,
+                  op: retiredRec.op,
+                  renamedTo: retiredRec.renamedTo,
                 },
               }
             : {}),
@@ -1001,6 +1134,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
           oldTomb?.op === 'rename' &&
           oldTomb.revision === verified.revision &&
           oldTomb.renamedTo === newSlug &&
+          (!oldTomb.siteId || !reqSiteId || oldTomb.siteId === reqSiteId) &&
           dstMeta?.revision === verified.revision &&
           (!dstMeta.siteId || !reqSiteId || dstMeta.siteId === reqSiteId)
         ) {
@@ -1023,12 +1157,22 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         if (dstLive) {
           throw new SitesError('SLUG_TAKEN', `子域名 "${newSlug}" 已被占用`, 409)
         }
-        const maxSeen = Math.max(
-          oldMeta.revision,
-          oldTomb?.revision ?? 0,
-          dstMeta?.revision ?? 0,
-          dstTomb?.revision ?? 0,
-        )
+        const effectiveCheckId = reqSiteId ?? oldMeta.siteId ?? undefined
+        if (effectiveCheckId && verified.revision <= maxSeenRevisionForSite(newSlug, dstMeta, dstTomb, effectiveCheckId)) {
+          throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
+        }
+        const maxSeen = reqSiteId
+          ? Math.max(
+              oldMeta.revision,
+              maxSeenRevisionForSite(slug, oldMeta, oldTomb, reqSiteId),
+              maxSeenRevisionForSite(newSlug, dstMeta, dstTomb, reqSiteId),
+            )
+          : Math.max(
+              oldMeta.revision,
+              oldTomb?.revision ?? 0,
+              dstMeta?.revision ?? 0,
+              dstTomb?.revision ?? 0,
+            )
         if (verified.revision <= maxSeen) {
           throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
         }
@@ -1098,16 +1242,18 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         }
 
         mkdirSync(oldDir, { recursive: true })
+        const retiredRenameSiteId = oldMeta.siteId ?? reqSiteId ?? null
         writeFileAtomic(
           join(oldDir, 'tombstone.json'),
           JSON.stringify({
             revision: verified.revision,
             deletedAt: new Date().toISOString(),
-            siteId: oldMeta.siteId ?? reqSiteId ?? null,
+            siteId: retiredRenameSiteId,
             op: 'rename',
             renamedTo: newSlug,
           }),
         )
+        recordRetiredSiteRevision(slug, retiredRenameSiteId, verified.revision, 'rename', newSlug)
         sendJsonResponse(res, 200, { ok: true, slug: newSlug, revision: verified.revision })
       })
       return
@@ -1129,22 +1275,29 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         const dir = siteDirOf(slug)
         mkdirSync(join(dir, 'releases'), { recursive: true })
         const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
-        const currentMax = Math.max(curMeta?.revision ?? 0, tombstone?.revision ?? 0)
         const liveRev =
           curMeta && (!tombstone || tombstone.revision < curMeta.revision) ? curMeta.revision : 0
 
-        if (curMeta && (!tombstone || tombstone.revision < curMeta.revision)) {
-          if (curMeta.siteId && envelope.siteId && curMeta.siteId !== envelope.siteId) {
+        if (liveRev > 0 && curMeta) {
+          if (
+            (curMeta.siteId && envelope.siteId && curMeta.siteId !== envelope.siteId) ||
+            (envelope.expectedBaseRevision === 0 && Boolean(curMeta.siteId) !== Boolean(envelope.siteId))
+          ) {
+            if (envelope.expectedBaseRevision === 0) {
+              throw new SitesError('SLUG_TAKEN', `子域名 "${slug}" 已被占用`, 409)
+            }
             throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
           }
         }
 
-        if (verified.revision <= currentMax) {
+        const siteMax = maxSeenRevisionForSite(slug, curMeta, tombstone, envelope.siteId)
+        if (verified.revision <= siteMax) {
           if (
             curMeta &&
             verified.revision === curMeta.revision &&
             curMeta.contentSha256 === decoded.contentSha256 &&
-            (!tombstone || tombstone.revision < curMeta.revision)
+            (!tombstone || tombstone.revision < curMeta.revision) &&
+            (!curMeta.siteId || !envelope.siteId || curMeta.siteId === envelope.siteId)
           ) {
             const effectiveId = curMeta.siteId ?? envelope.siteId ?? slug
             const diskDigest =
@@ -1180,8 +1333,17 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
 
         const diskEnvPath = join(dir, 'env.enc')
         const effectiveSiteId = envelope.siteId ?? curMeta?.siteId ?? slug
+        const isSameLiveOwner = Boolean(
+          liveRev > 0 && curMeta && (!envelope.siteId || !curMeta.siteId || curMeta.siteId === envelope.siteId),
+        )
         let existingEnvDigest = ''
-        if (existsSync(diskEnvPath)) {
+        if (!isSameLiveOwner) {
+          // Switching ownership (or reusing a deleted/vacant slug) must never inherit stale DB, env, or analytics.
+          rmSync(join(dir, 'data'), { recursive: true, force: true })
+          rmSync(diskEnvPath, { force: true })
+          rmSync(join(dir, 'analytics.json'), { force: true })
+          analytics.deleteSlug(slug)
+        } else if (existsSync(diskEnvPath)) {
           existingEnvDigest =
             curMeta?.envDigest !== undefined
               ? curMeta.envDigest
@@ -1303,9 +1465,9 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
       await withSlugLock(slug, async () => {
         const dir = siteDirOf(slug)
         const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
-        const currentMax = Math.max(curMeta?.revision ?? 0, tombstone?.revision ?? 0)
+        const siteMax = maxSeenRevisionForSite(slug, curMeta, tombstone, envelope.siteId)
         if (!curMeta || (tombstone && tombstone.revision >= curMeta.revision)) {
-          if (verified.revision <= currentMax) {
+          if (verified.revision <= siteMax) {
             throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
           }
           throw new SitesError('SITE_NOT_FOUND', 'site missing on edge', 404)
@@ -1313,9 +1475,10 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         if (curMeta.siteId && envelope.siteId && curMeta.siteId !== envelope.siteId) {
           throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
         }
-        if (verified.revision <= currentMax) {
+        if (verified.revision <= siteMax) {
           if (
             verified.revision === curMeta.revision &&
+            (!curMeta.siteId || !envelope.siteId || curMeta.siteId === envelope.siteId) &&
             curMeta.title === envelope.title &&
             curMeta.visibility === envelope.visibility &&
             curMeta.passwordHash === envelope.passwordHash &&
@@ -1392,37 +1555,50 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         mkdirSync(dir, { recursive: true })
         const { meta: curMeta, tombstone } = readMetaAndTombstone(slug)
         const reqSiteId = verified.meta?.siteId
-        if (curMeta && (!tombstone || tombstone.revision < curMeta.revision)) {
+        const liveRev =
+          curMeta && (!tombstone || tombstone.revision < curMeta.revision) ? curMeta.revision : 0
+        if (liveRev > 0 && curMeta) {
           if (curMeta.siteId && reqSiteId && curMeta.siteId !== reqSiteId) {
             throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
           }
         }
-        const currentMax = Math.max(curMeta?.revision ?? 0, tombstone?.revision ?? 0)
-        if (verified.revision <= currentMax) {
-          if (tombstone && verified.revision <= tombstone.revision) {
-            sendJsonResponse(res, 200, { ok: true, idempotent: true, revision: tombstone.revision })
+        const siteMax = maxSeenRevisionForSite(slug, curMeta, tombstone, reqSiteId)
+        if (liveRev === 0 && tombstone) {
+          if (tombstone.siteId && reqSiteId && tombstone.siteId !== reqSiteId) {
+            throw new SitesError('STALE_REVISION', 'siteId mismatch on edge', 409)
+          }
+          if (verified.revision <= siteMax) {
+            updateCustomDomainMapping(slug, null)
+            analytics.deleteSlug(slug)
+            purgeSiteRuntimeArtifacts(dir)
+            recordRetiredSiteRevision(
+              slug,
+              tombstone.siteId ?? reqSiteId ?? null,
+              tombstone.revision,
+              tombstone.op ?? 'delete',
+              tombstone.renamedTo ?? null,
+            )
+            sendJsonResponse(res, 200, { ok: true, idempotent: true, revision: siteMax })
             return
           }
+        }
+        if (verified.revision <= siteMax) {
           throw new SitesError('STALE_REVISION', 'stale edge revision', 409)
         }
         updateCustomDomainMapping(slug, null)
         analytics.deleteSlug(slug)
+        const retiredDeleteSiteId = curMeta?.siteId ?? reqSiteId ?? null
+        purgeSiteRuntimeArtifacts(dir)
+        recordRetiredSiteRevision(slug, retiredDeleteSiteId, verified.revision, 'delete', null)
         writeFileAtomic(
           join(dir, 'tombstone.json'),
           JSON.stringify({
             revision: verified.revision,
             deletedAt: new Date().toISOString(),
-            siteId: curMeta?.siteId ?? reqSiteId ?? null,
+            siteId: retiredDeleteSiteId,
             op: 'delete',
           }),
         )
-        rmSync(join(dir, 'current'), { force: true })
-        rmSync(join(dir, 'current-server'), { force: true })
-        rmSync(join(dir, 'env.enc'), { force: true })
-        rmSync(join(dir, 'analytics.json'), { force: true })
-        rmSync(join(dir, 'data'), { recursive: true, force: true })
-        rmSync(join(dir, 'meta.json'), { force: true })
-        rmSync(join(dir, 'releases'), { recursive: true, force: true })
         sendJsonResponse(res, 200, { ok: true, revision: verified.revision })
       })
       return
@@ -1694,7 +1870,7 @@ export function createSitesEdgeServer(opts: SitesEdgeServerOptions): {
         return
       }
 
-      let out
+      let out: Awaited<ReturnType<typeof runSiteApiWorker>>
       try {
         const uploadTimer = setTimeout(() => {
           abortController.abort()

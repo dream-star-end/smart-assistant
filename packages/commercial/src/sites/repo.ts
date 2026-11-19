@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Pool, PoolClient } from 'pg'
+import type { Pool, PoolClient, QueryResult } from 'pg'
 import {
   SitesError,
   type SiteAccessRole,
@@ -779,7 +779,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
         }
 
         const countRes = await client.query<{ cnt: number }>(
-          `SELECT COUNT(*)::int AS cnt FROM user_sites WHERE user_id = $1`,
+          'SELECT COUNT(*)::int AS cnt FROM user_sites WHERE user_id = $1',
           [input.userId],
         )
         const count = countRes.rows[0]?.cnt ?? 0
@@ -1033,7 +1033,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
             throw new SitesError('DOMAIN_TAKEN', '该自定义域名已被其他站点绑定', 409)
           }
         }
-        let res
+        let res: QueryResult<RawUserSiteRow>
         try {
           res = await client.query<RawUserSiteRow>(
             `UPDATE user_sites
@@ -1115,11 +1115,11 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
           throw new SitesError('SLUG_BUSY', `站点 "${oldSlug}" 正在处理另一项变更，请稍后重试`, 409, true)
         }
         const dstClaim = await client.query<{ site_id: string }>(
-          `SELECT site_id FROM user_site_slug_claims WHERE slug = $1 FOR UPDATE`,
+          'SELECT site_id FROM user_site_slug_claims WHERE slug = $1 FOR UPDATE',
           [newSlug],
         )
         const dstRow = await client.query<{ id: string }>(
-          `SELECT id FROM user_sites WHERE slug = $1 FOR UPDATE`,
+          'SELECT id FROM user_sites WHERE slug = $1 FOR UPDATE',
           [newSlug],
         )
         if (dstClaim.rows.length > 0 || dstRow.rows.length > 0) {
@@ -1205,7 +1205,7 @@ export function createPgSitesRepo(pool: Pool): SitesRepo {
             throw new SitesError('STALE_REVISION', '站点存在更新版本或已被删除', 409)
           }
           await client.query(
-            `DELETE FROM user_site_slug_claims WHERE site_id = $1 AND slug <> $2`,
+            'DELETE FROM user_site_slug_claims WHERE site_id = $1 AND slug <> $2',
             [input.siteId, input.newSlug],
           )
           await client.query(

@@ -366,7 +366,7 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
       {(parsed.question || parsed.options.length > 0) && (
         <div className="flex items-start justify-between gap-2 px-1">
           {parsed.question ? <p className="text-body font-medium text-fg">{parsed.question}</p> : <span />}
-          <span className="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-[11px] font-medium text-muted border border-border">
+          <span className="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-micro font-medium text-muted border border-border">
             {parsed.multi ? "可多选" : "单选"}
           </span>
         </div>
@@ -391,7 +391,7 @@ function OptionsCardItem({ parsed, readOnly }: { parsed: ParsedOptionsItem; read
               <span
                 className={
                   "mt-0.5 flex size-4 shrink-0 items-center justify-center border text-micro " +
-                  (parsed.multi ? "rounded-[5px] " : "rounded-full ") +
+                  (parsed.multi ? "rounded " : "rounded-full ") +
                   (chosen ? "border-accent bg-accent text-accent-fg" : "border-border text-transparent")
                 }
               >
@@ -498,7 +498,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
         <OptionsCardItem key={`${idx}-${item.question ?? ""}`} parsed={item} readOnly={readOnly} />
       ))}
       {parsed.trailing ? (
-        <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
+        <p className="whitespace-pre-wrap text-body leading-relaxed text-fg">{parsed.trailing}</p>
       ) : null}
     </>
   );

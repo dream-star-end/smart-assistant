@@ -161,7 +161,7 @@ export function makeTavilyWebSearchHandler(
       return;
     }
 
-    let verified;
+    let verified: Awaited<ReturnType<typeof verifyContainerIdentity>>;
     try {
       verified = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization);
     } catch (err) {

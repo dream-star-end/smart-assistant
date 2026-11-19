@@ -220,7 +220,17 @@ test('parser rejects skip/todo/duplicate/missing/fail/empty TAP', () => {
 async function waitForMarker(path: string, ms: number): Promise<string> {
   const start = Date.now()
   while (Date.now() - start < ms) {
-    if (existsSync(path)) return readFileSync(path, 'utf8')
+    if (existsSync(path)) {
+      const content = readFileSync(path, 'utf8')
+      if (content.trim().length > 0) {
+        try {
+          JSON.parse(content)
+          return content
+        } catch {
+          /* hold.mjs writeFileSync may still be flushing JSON */
+        }
+      }
+    }
     await new Promise((r) => setTimeout(r, 25))
   }
   throw new Error(`hold marker not written within ${ms}ms: ${path}`)

@@ -322,18 +322,21 @@ export class SitesService {
           const claimed = await repo.tryClaimReconcileLease(cand.id, ownerId)
           if (!claimed) return
           try {
-            const newStatus = await edge.getSiteStatus({ slug: targetSlug })
-            const oldStatus = await edge.getSiteStatus({ slug: claimed.row.slug })
-            const newMatchesId =
-              !newStatus.meta?.siteId || newStatus.meta.siteId === claimed.row.id
+            const newStatus = await edge.getSiteStatus({ slug: targetSlug, siteId: claimed.row.id })
+            const oldStatus = await edge.getSiteStatus({ slug: claimed.row.slug, siteId: claimed.row.id })
+            const newMatchesId = newStatus.meta?.siteId === claimed.row.id
             const oldMatchesId =
               !oldStatus.meta?.siteId || oldStatus.meta.siteId === claimed.row.id
+            const oldRenamedAway =
+              !oldStatus.exists ||
+              oldStatus.tombstone?.op === 'rename' ||
+              (oldStatus.retired?.siteId === claimed.row.id && oldStatus.retired.op === 'rename')
 
             if (
               newStatus.exists &&
               newMatchesId &&
               newStatus.revision >= claimed.row.edgeRevision &&
-              (!oldStatus.exists || oldStatus.tombstone?.op === 'rename')
+              oldRenamedAway
             ) {
               let finalRev = newStatus.revision
               const envBundle = await this.buildEdgeEnvPayload(repo, ownerId, claimed.row.id, targetSlug)
@@ -405,14 +408,19 @@ export class SitesService {
         const claimed = await repo.tryClaimReconcileLease(cand.id, ownerId)
         if (!claimed) return
         try {
-          const status = await edge.getSiteStatus({ slug: claimed.row.slug })
+          const status = await edge.getSiteStatus({ slug: claimed.row.slug, siteId: claimed.row.id })
 
           if (claimed.row.opKind === 'delete') {
-            const tombMatchesId =
-              !status.tombstone?.siteId || status.tombstone.siteId === claimed.row.id
+            const tombMatchesId = status.tombstone?.siteId === claimed.row.id
+            const retiredDeleteMatches =
+              status.retired?.siteId === claimed.row.id &&
+              status.retired.op === 'delete' &&
+              status.retired.revision > claimed.row.edgeRevision
             if (!status.exists && status.tombstoneRevision > claimed.row.edgeRevision && tombMatchesId) {
               await repo.commitDelete(claimed.row.id, ownerId, claimed.leaseId, status.tombstoneRevision)
-            } else if (status.exists && (!status.meta?.siteId || status.meta.siteId === claimed.row.id)) {
+            } else if (retiredDeleteMatches && status.retired) {
+              await repo.commitDelete(claimed.row.id, ownerId, claimed.leaseId, status.retired.revision)
+            } else if (status.exists && status.meta?.siteId === claimed.row.id) {
               await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, true)
             } else {
               await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false)
@@ -421,7 +429,11 @@ export class SitesService {
           }
 
           if (status.exists && status.revision > 0 && status.meta) {
-            if (status.meta.siteId && status.meta.siteId !== claimed.row.id) {
+            if (
+              claimed.row.edgeRevision === 0
+                ? status.meta.siteId !== claimed.row.id
+                : Boolean(status.meta.siteId && status.meta.siteId !== claimed.row.id)
+            ) {
               if (claimed.row.edgeRevision === 0) {
                 await repo.abortPublishPlaceholder(claimed.row.id, ownerId, claimed.leaseId)
               } else {
@@ -713,6 +725,7 @@ export class SitesService {
 
         let committedOnEdge = false
         let pushResult: { needsEnvSync?: boolean; envDigest?: string } = {}
+        let overriddenErr: Error | null = null
         try {
           pushResult = await edge.pushBundle({
             slug,
@@ -725,14 +738,37 @@ export class SitesService {
         } catch (err) {
           if (err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE') {
             try {
-              const status = await edge.getSiteStatus({ slug })
-              if (status.exists && status.revision === reservation.edgeRevision) {
+              const status = await edge.getSiteStatus({ slug, siteId: reservation.siteId })
+              if (
+                status.exists &&
+                status.meta?.siteId === reservation.siteId &&
+                status.revision === reservation.edgeRevision &&
+                status.meta?.contentSha256 === decoded.contentSha256
+              ) {
                 committedOnEdge = true
+              } else if (
+                status.exists &&
+                status.meta?.siteId &&
+                status.meta.siteId !== reservation.siteId &&
+                reservation.isNewPlaceholder
+              ) {
+                await repo
+                  .abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId)
+                  .catch(() => {})
+                overriddenErr = new SitesError(
+                  'SLUG_TAKEN',
+                  `子域名 "${slug}" 已被占用，请更换名称`,
+                  409,
+                )
               } else if (!status.exists && reservation.isNewPlaceholder) {
                 await repo
                   .abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId)
                   .catch(() => {})
-              } else if (status.exists && status.revision === reservation.baseRevision) {
+              } else if (
+                status.exists &&
+                (!status.meta?.siteId || status.meta.siteId === reservation.siteId) &&
+                status.revision === reservation.baseRevision
+              ) {
                 await repo
                   .releaseLease(reservation.siteId, ownerId, reservation.leaseId, true)
                   .catch(() => {})
@@ -747,9 +783,15 @@ export class SitesService {
                 .catch(() => {})
             }
           } else if (err instanceof SitesError && err.code === 'STALE_REVISION') {
-            await repo
-              .releaseLease(reservation.siteId, ownerId, reservation.leaseId, false)
-              .catch(() => {})
+            if (reservation.isNewPlaceholder) {
+              await repo
+                .abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId)
+                .catch(() => {})
+            } else {
+              await repo
+                .releaseLease(reservation.siteId, ownerId, reservation.leaseId, false)
+                .catch(() => {})
+            }
           } else if (reservation.isNewPlaceholder) {
             await repo
               .abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId)
@@ -759,7 +801,7 @@ export class SitesService {
               .releaseLease(reservation.siteId, ownerId, reservation.leaseId, true)
               .catch(() => {})
           }
-          if (!committedOnEdge) throw err
+          if (!committedOnEdge) throw overriddenErr ?? err
         }
 
         let committedDigest = envPayload.digest
@@ -860,11 +902,19 @@ export class SitesService {
     } catch (err) {
       if (err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE') {
         try {
-          const status = await args.edge.getSiteStatus({ slug: args.site.slug })
-          if (status.exists && status.revision === args.nextRevision) {
+          const status = await args.edge.getSiteStatus({ slug: args.site.slug, siteId: args.site.id })
+          if (
+            status.exists &&
+            status.meta?.siteId === args.site.id &&
+            status.revision === args.nextRevision
+          ) {
             return 'committed'
           }
-          if (status.exists && status.revision === args.site.edgeRevision) {
+          if (
+            status.exists &&
+            (!status.meta?.siteId || status.meta.siteId === args.site.id) &&
+            status.revision === args.site.edgeRevision
+          ) {
             await args.repo
               .releaseLease(args.site.id, args.userId, args.leaseId, !args.preserveTargetOnAmbiguous)
               .catch(() => {})
@@ -1113,20 +1163,16 @@ export class SitesService {
         expectedBaseRevision: site.edgeRevision,
       }
 
-      try {
-        await this.pushMetaWithLeaseHandling({
-          repo,
-          edge,
-          site,
-          userId,
-          leaseId,
-          nextRevision,
-          meta,
-          encryptedEnvB64: envPayload.sealedB64,
-        })
-      } catch (err) {
-        throw err
-      }
+      await this.pushMetaWithLeaseHandling({
+        repo,
+        edge,
+        site,
+        userId,
+        leaseId,
+        nextRevision,
+        meta,
+        encryptedEnvB64: envPayload.sealedB64,
+      })
 
       try {
         return await repo.commitMetaUpdate({
@@ -1201,15 +1247,15 @@ export class SitesService {
       } catch (err) {
         if (err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE') {
           try {
-            const newStatus = await edge.getSiteStatus({ slug: newSlug })
+            const newStatus = await edge.getSiteStatus({ slug: newSlug, siteId: site.id })
             if (
               newStatus.exists &&
               newStatus.revision === nextRevision &&
-              (!newStatus.meta?.siteId || newStatus.meta.siteId === site.id)
+              newStatus.meta?.siteId === site.id
             ) {
               committedOnEdge = true
             } else {
-              const oldStatus = await edge.getSiteStatus({ slug: oldSlug })
+              const oldStatus = await edge.getSiteStatus({ slug: oldSlug, siteId: site.id })
               if (
                 oldStatus.exists &&
                 oldStatus.revision === site.edgeRevision &&
@@ -1950,14 +1996,21 @@ export class SitesService {
       } catch (err) {
         if (err instanceof SitesError && err.code === 'EDGE_UNAVAILABLE') {
           try {
-            const status = await edge.getSiteStatus({ slug })
+            const status = await edge.getSiteStatus({ slug, siteId: site.id })
             if (
-              !status.exists &&
-              status.tombstoneRevision >= deleteRevision &&
-              (!status.tombstone?.siteId || status.tombstone.siteId === site.id)
+              (!status.exists &&
+                status.tombstoneRevision >= deleteRevision &&
+                status.tombstone?.siteId === site.id) ||
+              (status.retired?.siteId === site.id &&
+                status.retired.op === 'delete' &&
+                status.retired.revision >= deleteRevision)
             ) {
               deletedOnEdge = true
-            } else if (status.exists && status.revision === site.edgeRevision) {
+            } else if (
+              status.exists &&
+              (!status.meta?.siteId || status.meta.siteId === site.id) &&
+              status.revision === site.edgeRevision
+            ) {
               await repo.releaseLease(site.id, userId, leaseId, true).catch(() => {})
             } else {
               await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})

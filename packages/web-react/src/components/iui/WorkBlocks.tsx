@@ -280,6 +280,7 @@ export function RunbookBlock({ spec, notes, streaming, nested }: BlockProps<Runb
       }
     >
       {spec.vars.length > 0 && (
+        // biome-ignore lint/a11y/useSemanticElements: div avoids fieldset default UA border and min-content layout
         <div className="oc-iui-runbook-vars" role="group" aria-label="参数变量">
           {spec.vars.map((v) => (
             <label key={v.id} className="oc-iui-runbook-var">

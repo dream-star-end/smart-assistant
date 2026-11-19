@@ -4,7 +4,7 @@ import { apiErrorMessage } from "../../lib/api";
 import { type SiteDbInspectData, sitesApi } from "../../lib/sitesApi";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Button, EmptyState, Skeleton } from "../ui";
+import { Alert, Button, EmptyState, Skeleton, StatusPill } from "../ui";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -33,6 +33,7 @@ export function SiteDatabaseTab({
   slugRef.current = slug;
   const reqIdRef = useRef(0);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset/focus trigger on prop or identity change
   useEffect(() => {
     setSelectedTable(undefined);
     setData(null);
@@ -98,17 +99,11 @@ export function SiteDatabaseTab({
 
       <div className="overflow-hidden rounded-xl border border-border bg-surface">
         <div className="flex items-center justify-between border-b border-border px-4 py-2.5 text-body">
-          <div className="flex items-center gap-2">
-            <span
-              className={cn(
-                "h-2 w-2 rounded-full",
-                data?.hasDatabaseFile ? "bg-emerald-500" : "bg-faint",
-              )}
-            />
-            <span className="font-medium text-fg">
-              {data?.hasDatabaseFile ? "已连接" : "就绪（首次写入时自动建库）"}
-            </span>
-          </div>
+          <StatusPill
+            tone={data?.hasDatabaseFile ? "done" : "idle"}
+            label={data?.hasDatabaseFile ? "已连接" : "就绪（首次写入时自动建库）"}
+            className="font-medium text-fg"
+          />
           {data && data.sizeBytes > 0 && (
             <span className="text-caption text-muted">{formatBytes(data.sizeBytes)}</span>
           )}
@@ -145,7 +140,7 @@ export function SiteDatabaseTab({
                           : "text-muted hover:bg-hover/60 hover:text-fg",
                       )}
                     >
-                      <span className="truncate font-mono text-[13px]">{tbl.name}</span>
+                      <span className="truncate font-mono text-body">{tbl.name}</span>
                       <span className="text-caption tabular-nums text-faint">
                         {tbl.rowCount}
                       </span>
@@ -178,7 +173,7 @@ export function SiteDatabaseTab({
                         >
                           {col.name}
                           {col.pk && (
-                            <span className="ml-1 text-[10px] text-accent">PK</span>
+                            <span className="ml-1 text-micro text-accent">PK</span>
                           )}
                         </th>
                       ))}
@@ -196,11 +191,12 @@ export function SiteDatabaseTab({
                       </tr>
                     ) : (
                       data.rows.map((row, rIdx) => (
+                        // biome-ignore lint/suspicious/noArrayIndexKey: arbitrary SQL result rows have no unique row key
                         <tr key={rIdx} className="align-top">
                           {data.columns.map((col) => (
                             <td
                               key={col.name}
-                              className="max-w-[260px] break-all py-2.5 pr-4 font-mono text-[12px] text-fg"
+                              className="max-w-[260px] break-all py-2.5 pr-4 font-mono text-caption text-fg"
                             >
                               {formatCell(row[col.name])}
                             </td>

@@ -91,8 +91,7 @@ export function stripTransientControlFlags(messages: ChatMessage[]): ChatMessage
   if (!messages.some((m) => m != null && m._controlPending !== undefined)) return messages;
   return messages.map((m) => {
     if (!m || m._controlPending === undefined) return m;
-    const clean = { ...m };
-    delete clean._controlPending;
+    const { _controlPending: _omitted, ...clean } = m;
     return clean;
   });
 }

@@ -47,7 +47,7 @@ const OC_SITE_PY = resolve(
 const EDGE_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 const JWT_SECRET = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
 
-function createInMemorySitesRepo(): SitesRepo & {
+function createInMemorySitesRepo(repoOpts?: { idPrefix?: string; initialRev?: number }): SitesRepo & {
   expireLease(slug: string): void
 } {
   const bySlug = new Map<string, UserSiteRow>()
@@ -66,8 +66,9 @@ function createInMemorySitesRepo(): SitesRepo & {
     [3, { id: 3, email: 'viewer@example.com', displayName: 'Viewer Three', emailVerified: true }],
     [4, { id: 4, email: 'unverified@example.com', displayName: 'Unverified Four', emailVerified: false }],
   ])
-  let revCounter = 0
+  let revCounter = repoOpts?.initialRev ?? 0
   let idSeq = 0
+  const idPrefix = repoOpts?.idPrefix ?? '00000000'
   const LEASE_TTL_MS = 60_000
 
   function isLeaseActive(siteId: string): boolean {
@@ -298,7 +299,7 @@ function createInMemorySitesRepo(): SitesRepo & {
       idSeq += 1
       const now = new Date()
       const row: UserSiteRow = {
-        id: `00000000-0000-4000-8000-${String(idSeq).padStart(12, '0')}`,
+        id: `${idPrefix}-0000-4000-8000-${String(idSeq).padStart(12, '0')}`,
         slug: input.slug,
         userId: input.userId,
         title: input.title,
@@ -2428,7 +2429,7 @@ export default async function handler(req, ctx) {
       for (let i = 0; i < 30; i += 1) {
         await serviceRef.executeDbSql(1, 'hardened-app', {
           sql: 'INSERT INTO big_rows (body) VALUES (?)',
-          params: [`row-${i}-` + 'x'.repeat(3000)],
+          params: [`row-${i}-${'x'.repeat(3000)}`],
         })
       }
       const bigInspect = await serviceRef.inspectDb(1, 'hardened-app', { table: 'big_rows', limit: 100 })
@@ -3341,5 +3342,290 @@ export default async function handler(req, ctx) {
       await edgeSrv.close()
       rmSync(collabDir, { recursive: true, force: true })
     }
+  })
+
+  test('shared edge enforces cross-instance siteId ownership, tombstone lineage, and lost-ACK UUID match', async () => {
+    const selfhostRepo = createInMemorySitesRepo({ idPrefix: 'aaaaaaaa', initialRev: 0 })
+    const commercialRepo = createInMemorySitesRepo({ idPrefix: 'bbbbbbbb', initialRev: 100_000 })
+    const selfhostSvc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 10,
+      edgeSecret: EDGE_SECRET,
+      repo: selfhostRepo,
+      edge: edgeClientRef,
+    })
+    const commercialSvc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 10,
+      edgeSecret: EDGE_SECRET,
+      repo: commercialRepo,
+      edge: edgeClientRef,
+    })
+
+    // 1. Live slug owned by Instance A cannot be overwritten by Instance B even with higher rev (100001 > 1)
+    const liveA = await selfhostSvc.publishSite(1, {
+      slug: 'shared-live-slug',
+      title: 'Instance A Live',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>INSTANCE_A</h1>') }]).gzipped,
+    })
+    assert.equal(liveA.edgeRevision, 1)
+    await assert.rejects(
+      () =>
+        commercialSvc.publishSite(2, {
+          slug: 'shared-live-slug',
+          title: 'Instance B Steal Attempt',
+          gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>HIJACK</h1>') }]).gzipped,
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'SLUG_TAKEN' && err.status === 409,
+    )
+    const servedA = await edgeHttpRequest({
+      port: edgePort,
+      path: '/',
+      host: 'shared-live-slug.congjianai.com',
+    })
+    assert.equal(servedA.status, 200)
+    assert.match(servedA.text, /INSTANCE_A/)
+
+    // 2. High tombstone (rev=100002) from Instance B does NOT block Instance A (rev=2) on a vacant slug,
+    //    while delayed replays for Instance B's retired siteId are still rejected even after A deletes too!
+    const createdB = await commercialSvc.publishSite(2, {
+      slug: 'shared-reused-slug',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>B1</h1>') }]).gzipped,
+    })
+    assert.equal(createdB.edgeRevision, 100_002)
+    await commercialSvc.deleteSite(2, 'shared-reused-slug')
+
+    const reusedByA = await selfhostSvc.publishSite(1, {
+      slug: 'shared-reused-slug',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>A_REUSED</h1>') }]).gzipped,
+    })
+    assert.equal(reusedByA.edgeRevision, 2)
+    const servedReusedA = await edgeHttpRequest({
+      port: edgePort,
+      path: '/',
+      host: 'shared-reused-slug.congjianai.com',
+    })
+    assert.equal(servedReusedA.status, 200)
+    assert.match(servedReusedA.text, /A_REUSED/)
+
+    await selfhostSvc.deleteSite(1, 'shared-reused-slug')
+    await assert.rejects(
+      () =>
+        edgeClientRef.pushBundle({
+          slug: 'shared-reused-slug',
+          revision: 100_001,
+          gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>STALE_B</h1>') }]).gzipped,
+          meta: {
+            siteId: createdB.id,
+            title: 'stale-b',
+            visibility: 'public',
+            passwordSalt: null,
+            passwordHash: null,
+            spaMode: true,
+          },
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'STALE_REVISION',
+    )
+
+    // 3. Lost-ACK probe: EDGE_UNAVAILABLE where edge has same numeric revision for a different siteId must NOT commit
+    const mismatchRepo = createInMemorySitesRepo({ idPrefix: 'cccccccc', initialRev: 0 })
+    const mismatchSvc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 10,
+      edgeSecret: EDGE_SECRET,
+      repo: mismatchRepo,
+      edge: {
+        ...edgeClientRef,
+        async pushBundle() {
+          throw new SitesError('EDGE_UNAVAILABLE', 'simulated network drop', 502, true)
+        },
+        async getSiteStatus() {
+          return {
+            exists: true,
+            revision: 1,
+            tombstoneRevision: 0,
+            meta: {
+              siteId: '99999999-0000-4000-8000-000000000001',
+              title: 'Foreign Site',
+              visibility: 'public',
+              passwordSalt: null,
+              passwordHash: null,
+              spaMode: true,
+              customDomain: null,
+              hasServerApi: false,
+              fileCount: 1,
+              sizeBytes: 16,
+              contentSha256: 'deadbeef'.repeat(8),
+            },
+          }
+        },
+      },
+    })
+    await assert.rejects(
+      () =>
+        mismatchSvc.publishSite(3, {
+          slug: 'shared-live-slug',
+          gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>FOREIGN</h1>') }]).gzipped,
+        }),
+      (err: unknown) => err instanceof SitesError && err.code === 'SLUG_TAKEN',
+    )
+    assert.equal(await mismatchRepo.getByUserAndSlug(3, 'shared-live-slug'), null)
+  })
+
+  test('shared edge: purges old tenant SQLite/env before reuse, reconciles lost-ACK delete after foreign reuse, and preserves retired history across rename', async () => {
+    const repoA = createInMemorySitesRepo({ idPrefix: '11111111', initialRev: 0 })
+    const repoB = createInMemorySitesRepo({ idPrefix: '22222222', initialRev: 50_000 })
+    const svcA = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 1,
+      edgeSecret: EDGE_SECRET,
+      repo: repoA,
+      edge: edgeClientRef,
+    })
+    const svcB = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 2,
+      edgeSecret: EDGE_SECRET,
+      repo: repoB,
+      edge: edgeClientRef,
+    })
+
+    // 1. Orphaned data/site.db + env.enc on edge (simulating interrupted delete before cleanup) MUST be purged for new UUID owner
+    const tenantOld = await svcA.publishSite(1, {
+      slug: 'shared-data-isolation',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>OLD_TENANT</h1>') }]).gzipped,
+    })
+    await svcA.executeDbSql(1, 'shared-data-isolation', {
+      sql: 'CREATE TABLE secret_notes (note TEXT)',
+    })
+    await svcA.executeDbSql(1, 'shared-data-isolation', {
+      sql: 'INSERT INTO secret_notes VALUES (?)',
+      params: ['tenant-a-confidential'],
+    })
+    const leakedDir = join(workDir, 'edge-data', 'sites', 'shared-data-isolation')
+    writeFileSync(
+      join(leakedDir, 'tombstone.json'),
+      JSON.stringify({
+        revision: tenantOld.edgeRevision + 1,
+        deletedAt: new Date().toISOString(),
+        siteId: tenantOld.id,
+        op: 'delete',
+      }),
+    )
+    // Stale delete still works cleanly via idempotent tombstone cleanup
+    await svcA.deleteSite(1, 'shared-data-isolation')
+    // Inject leftover SQLite/env right before new owner publishes on vacant slug (worst-case crash race)
+    mkdirSync(join(leakedDir, 'data'), { recursive: true })
+    writeFileSync(join(leakedDir, 'data', 'site.db'), Buffer.from('corrupt-leftover-sqlite-bytes'))
+    writeFileSync(join(leakedDir, 'env.enc'), 'leftover-cipher')
+
+    await svcB.publishSite(2, {
+      slug: 'shared-data-isolation',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>NEW_TENANT_B</h1>') }]).gzipped,
+    })
+    const dbNewOwner = await svcB.inspectDb(2, 'shared-data-isolation', { limit: 20 })
+    assert.deepEqual(dbNewOwner.tables, [], 'new UUID owner must start with an empty database')
+    await svcB.deleteSite(2, 'shared-data-isolation')
+
+    // 2. Lost-ACK delete on Instance A followed by Instance B reusing the same slug still frees A's row and quota=1
+    await svcA.publishSite(1, {
+      slug: 'shared-lost-delete',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>A_TO_DELETE</h1>') }]).gzipped,
+    })
+    const dropOnceSvcA = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 1,
+      edgeSecret: EDGE_SECRET,
+      repo: repoA,
+      edge: {
+        ...edgeClientRef,
+        async deleteSite(args) {
+          await edgeClientRef.deleteSite(args)
+          throw new SitesError('EDGE_UNAVAILABLE', 'drop delete ACK after edge committed', 502, true)
+        },
+        async getSiteStatus() {
+          throw new SitesError('EDGE_UNAVAILABLE', 'immediate probe also failed', 502, true)
+        },
+      },
+    })
+    await assert.rejects(
+      () => dropOnceSvcA.deleteSite(1, 'shared-lost-delete'),
+      (e: unknown) => e instanceof SitesError && e.code === 'EDGE_UNAVAILABLE',
+    )
+    // Instance B immediately claims the deleted slug BEFORE Instance A reconciles
+    await svcB.publishSite(2, {
+      slug: 'shared-lost-delete',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>B_CLAIMED</h1>') }]).gzipped,
+    })
+    repoA.expireLease('shared-lost-delete')
+    // Next read / publish on Instance A must reconcile A's pending delete via retired receipt & free maxPerUser=1 quota
+    const listAfterLostDelete = await svcA.listSummary(1)
+    assert.equal(listAfterLostDelete.sites.length, 0)
+    const freshAfterQuotaFreed = await svcA.publishSite(1, {
+      slug: 'shared-fresh-quota',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>FRESH</h1>') }]).gzipped,
+    })
+    assert.equal(freshAfterQuotaFreed.slug, 'shared-fresh-quota')
+    // Instance B's site stays intact
+    const bServed = await edgeHttpRequest({
+      port: edgePort,
+      path: '/',
+      host: 'shared-lost-delete.congjianai.com',
+    })
+    assert.equal(bServed.status, 200)
+    assert.match(bServed.text, /B_CLAIMED/)
+
+    // 3. Rename must preserve both destination's and source's slug-anchored retired records
+    const priorDst = await svcB.publishSite(2, {
+      slug: 'shared-rename-dst',
+      gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>PRIOR_DST</h1>') }]).gzipped,
+    })
+    await svcB.deleteSite(2, 'shared-rename-dst')
+    const movedSite = await svcA.renameSite(1, 'shared-fresh-quota', 'shared-rename-dst')
+    await svcA.renameSite(1, 'shared-rename-dst', 'shared-rename-dst2')
+    // Stale replay for priorDst at shared-rename-dst must STILL be rejected after rename!
+    await assert.rejects(
+      () =>
+        edgeClientRef.pushBundle({
+          slug: 'shared-rename-dst',
+          revision: priorDst.edgeRevision - 1,
+          gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>STALE_DST</h1>') }]).gzipped,
+          meta: {
+            siteId: priorDst.id,
+            title: 'stale-dst',
+            visibility: 'public',
+            passwordSalt: null,
+            passwordHash: null,
+            spaMode: true,
+          },
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'STALE_REVISION',
+    )
+    // And stale replay for movedSite at original slug shared-fresh-quota must STILL be rejected after dst -> dst2!
+    await assert.rejects(
+      () =>
+        edgeClientRef.pushBundle({
+          slug: 'shared-fresh-quota',
+          revision: movedSite.edgeRevision - 1,
+          gzippedBundle: encodeSiteBundle([{ path: 'index.html', content: Buffer.from('<h1>STALE_SRC</h1>') }]).gzipped,
+          meta: {
+            siteId: movedSite.id,
+            title: 'stale-src',
+            visibility: 'public',
+            passwordSalt: null,
+            passwordHash: null,
+            spaMode: true,
+          },
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'STALE_REVISION',
+    )
+    await svcA.deleteSite(1, 'shared-rename-dst2')
+    await svcB.deleteSite(2, 'shared-lost-delete')
   })
 })

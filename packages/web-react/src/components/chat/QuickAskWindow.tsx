@@ -575,6 +575,7 @@ export function QuickAskWindow({
   );
 
   // Focus textarea when opened or switched; auto-send non-empty slash seeds if idle.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset/focus trigger on prop or identity change
   useEffect(() => {
     if (!open) return;
     const raf = window.requestAnimationFrame(() => textareaRef.current?.focus());

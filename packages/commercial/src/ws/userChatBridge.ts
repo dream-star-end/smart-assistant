@@ -20,7 +20,7 @@ import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/model
 import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
-import { applyTeamLeaderForwarding } from './teamModeForwarding.js'
+import { applyTeamLeaderForwarding, resolveBridgeTeamLeaderModel } from "./teamModeForwarding.js";
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -5861,6 +5861,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 这里必须在 auth/codex 分类前覆盖 effectiveModel,并在下方 rewrite
               // forwarded frame.model,确保 master 计费链路与容器执行模型一致。
               effectiveModel = DEFAULT_CODEX_ENGINE_MODEL;
+              effectiveModel = resolveBridgeTeamLeaderModel(deps.pricing, modelCheckerHandle);
               source = "teamMode.main";
             } else if (frameModelId !== null) {
               effectiveModel = frameModelId;
@@ -6068,7 +6069,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 sanitizedParsed = withoutWorkspaceMode;
               }
               if (teamModeMain) {
-                applyTeamLeaderForwarding(sanitizedParsed);
+                applyTeamLeaderForwarding(sanitizedParsed, effectiveModelForFrame ?? DEFAULT_CODEX_ENGINE_MODEL);
               }
             }
             // Browser paper hints run before admission freezes the content hash.

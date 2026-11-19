@@ -180,7 +180,7 @@ jobs:
           cp -a --reflink=auto "$GITHUB_WORKSPACE/." "$runtime_tree/"
           getent group 1000 >/dev/null || sudo groupadd --gid 1000 oc-gateway-runtime
           getent passwd 1000 >/dev/null || sudo useradd --uid 1000 --gid 1000 --no-create-home --home-dir /home/agent oc-gateway-runtime
-          sudo install -d -o 1000 -g 1000 /home/agent/.openclaude
+          sudo install -d -o 1000 -g 1000 /home/agent /home/agent/.openclaude
           sudo chown -R 1000:1000 "$runtime_tree"
           node_bin=$(readlink -f "$(command -v node)")
           if [[ "$node_bin" != /usr/local/bin/node ]]; then sudo ln -sfn "$node_bin" /usr/local/bin/node; fi

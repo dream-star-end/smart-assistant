@@ -43,6 +43,7 @@ export interface ModelSwitchCostDeps {
     uid: string,
     model: string,
     contextTier?: '300k' | '1m',
+    opts?: { allowLegacyTeamLeaderFallback?: boolean },
   ) => Promise<SwitchCostTarget>
   sourceEngine?: (model: string) => string | null
   balance?: (uid: string) => Promise<bigint>
@@ -213,6 +214,7 @@ export class ModelSwitchCostService {
       uid,
       requested,
       cursorModelSupportsContextTier(requested) ? input.contextTier : undefined,
+      { allowLegacyTeamLeaderFallback: input.agentId === 'main' && Boolean(input.teamMode) },
     )
     const canonical = target.pricing.model_id
     input = {
@@ -366,7 +368,9 @@ export class ModelSwitchCostService {
     return { quote: { ...quote, quoteToken: this.sign(grant) }, grant }
   }
   async validateTarget(uid: string, input: ModelSwitchCostRequest): Promise<void> {
-    await this.deps.resolveTarget(uid, effectiveSwitchCostModel(input), input.contextTier)
+    await this.deps.resolveTarget(uid, effectiveSwitchCostModel(input), input.contextTier, {
+      allowLegacyTeamLeaderFallback: input.agentId === 'main' && Boolean(input.teamMode),
+    })
   }
   async quote(
     uid: string,

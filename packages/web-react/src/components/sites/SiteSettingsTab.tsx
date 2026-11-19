@@ -104,6 +104,7 @@ export function SiteSettingsTab({
     };
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset/focus trigger on prop or identity change
   useEffect(() => {
     siteGenRef.current += 1;
     setRenameOpen(false);
@@ -415,12 +416,12 @@ export function SiteSettingsTab({
                   <>
                     <span className="font-mono text-body text-fg">{site.customDomain}</span>
                     {site.customDomainStatus === "verified" ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-caption font-medium text-emerald-700 dark:text-emerald-300">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-success-soft px-2.5 py-0.5 text-caption font-medium text-success">
                         <CheckCircle2 size={12} aria-hidden="true" />
                         已验证
                       </span>
                     ) : (
-                      <span className="rounded-full bg-amber-500/15 px-2.5 py-0.5 text-caption font-medium text-amber-700 dark:text-amber-300">
+                      <span className="rounded-full bg-warning-soft px-2.5 py-0.5 text-caption font-medium text-warning">
                         待验证 DNS
                       </span>
                     )}
@@ -463,10 +464,10 @@ export function SiteSettingsTab({
                   <p className="font-medium text-fg">
                     验证所有权后才会启用路由与 TLS 证书。请添加以下 DNS 记录：
                   </p>
-                  <p className="mt-1 font-mono text-[12px]">
+                  <p className="mt-1 font-mono text-caption">
                     1) TXT 记录名：{site.customDomainTxtName} → 值：{site.customDomainTxtValue}
                   </p>
-                  <p className="font-mono text-[12px]">
+                  <p className="font-mono text-caption">
                     2) CNAME 记录：{site.customDomain} → {primaryHost}
                   </p>
                 </div>
@@ -574,7 +575,7 @@ export function SiteSettingsTab({
                     readOnly
                     disabled
                     aria-label={`环境变量名 ${envVar.key}`}
-                    className="font-mono text-[13px]"
+                    className="font-mono text-body"
                   />
 
                   <div className="flex items-center gap-2">
@@ -701,7 +702,7 @@ export function SiteSettingsTab({
                   value={newEnvKey}
                   placeholder="DEEPSEEK_API_KEY"
                   aria-label="新环境变量名"
-                  className="font-mono text-[13px]"
+                  className="font-mono text-body"
                   onChange={(e) => setNewEnvKey(e.target.value)}
                 />
                 <Input
@@ -764,11 +765,11 @@ export function SiteSettingsTab({
               <p className="text-caption text-muted">永久删除此站点</p>
             </div>
             <Button
-              variant="secondary"
+              variant="danger"
               size="sm"
               disabled={ownerMutationBlocked || deletingSite}
               onClick={() => void handleDeleteSite()}
-              className="rounded-full border-red-500/50 text-red-600 hover:bg-red-500/10 dark:text-red-400"
+              className="rounded-full"
             >
               删除站点
             </Button>
@@ -838,7 +839,7 @@ export function SiteSettingsTab({
                 variant="ghost"
                 disabled={savingDomain}
                 onClick={() => void saveCustomDomain(null)}
-                className="text-red-600 dark:text-red-400"
+                className="text-danger"
               >
                 移除绑定
               </Button>

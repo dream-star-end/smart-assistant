@@ -181,7 +181,7 @@ export function SiteDetailView({
                   </span>
                 )}
                 {accessRole !== "owner" && (
-                  <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-0.5 text-caption font-medium text-sky-700 dark:text-sky-300">
+                  <span className="inline-flex items-center gap-1 rounded-full border border-info/30 bg-info-soft px-2.5 py-0.5 text-caption font-medium text-info">
                     <Users size={12} aria-hidden="true" />
                     共享 · {roleLabel(accessRole)}
                   </span>

@@ -41,7 +41,7 @@ describe('selfhost: synced models preserve edition visibility history', () => {
   })
 
   const baseline = JSON.parse(readFileSync(new URL('./fixtures/selfhostSyncBaseline.json', import.meta.url), 'utf8')) as { migrations: Record<string, string> }
-  const publicHistory = new Set(['0307_antigravity_engine.sql', '0312_antigravity_gemini_4_argon.sql', '0338_antigravity_gemini_4_carbon.sql'])
+  const publicHistory = new Set(['0307_antigravity_engine.sql', '0312_antigravity_gemini_4_argon.sql', '0338_antigravity_gemini_4_carbon.sql', '0346_selfhost_gpt62_sol_astra_retire_legacy.sql'])
   for (const f of files) {
     test(`${f}: preserves applied SQL and only its original public write`, () => {
       const raw = readFileSync(path.join(MIGRATIONS_DIR, f))

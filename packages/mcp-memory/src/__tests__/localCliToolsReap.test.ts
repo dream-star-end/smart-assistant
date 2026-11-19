@@ -80,6 +80,7 @@ const timer = setInterval(() => {
 
 async function launch(mode: 'signal' | 'exit'): Promise<{
   child: ChildProcess
+  exited: Promise<number | null>
   sleepPid: number
   dir: string
   stderr: () => string
@@ -94,11 +95,19 @@ async function launch(mode: 'signal' | 'exit'): Promise<{
     stdio: ['ignore', 'ignore', 'pipe'],
     env: process.env,
   })
+  const exited = new Promise<number | null>((resolvePromise) => {
+    if (child.exitCode !== null) {
+      resolvePromise(child.exitCode)
+      return
+    }
+    child.once('exit', (status) => resolvePromise(status))
+  })
   child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
   try {
     const sleepPid = await readPidFile(pidFile, 6_000)
     return {
       child,
+      exited,
       sleepPid,
       dir,
       stderr: () => Buffer.concat(stderrChunks).toString('utf8'),
@@ -116,9 +125,7 @@ describe('oc_* process groups die with the MCP process', () => {
     try {
       assert.equal(pidAlive(launched.sleepPid), true)
       launched.child.kill('SIGTERM')
-      const code = await new Promise<number | null>((resolvePromise) => {
-        launched.child.once('exit', (status) => resolvePromise(status))
-      })
+      const code = await launched.exited
       const dead = await waitDead(launched.sleepPid, 2_000)
       assert.equal(dead, true, `sleep ${launched.sleepPid} still alive; node exit=${code}; ${launched.stderr()}`)
       assert.ok(Date.now() - started < 9_000)
@@ -137,9 +144,7 @@ describe('oc_* process groups die with the MCP process', () => {
     const started = Date.now()
     const launched = await launch('exit')
     try {
-      const code = await new Promise<number | null>((resolvePromise) => {
-        launched.child.once('exit', (status) => resolvePromise(status))
-      })
+      const code = await launched.exited
       assert.equal(code, 0, launched.stderr())
       const dead = await waitDead(launched.sleepPid, 2_000)
       assert.equal(dead, true, `sleep ${launched.sleepPid} still alive after process.exit; ${launched.stderr()}`)

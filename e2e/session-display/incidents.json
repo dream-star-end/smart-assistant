@@ -944,14 +944,14 @@
           "assertion": "retrying API error attempt stays non-terminal and the next successful attempt streams live"
         },
         {
-          "layer": "browser",
-          "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
-        },
-        {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "unified timeline hides only a recovered API Error attempt and preserves its immutable audit rows"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
         }
       ]
     },
@@ -1338,7 +1338,7 @@
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
-          "assertion": "historical pending waiver refunds only the exact 259-credit turn to original personal buckets and sends once"
+          "assertion": "refunds only the exact 259-credit turn to original personal buckets and sends once"
         },
         {
           "layer": "integration",
@@ -1353,7 +1353,7 @@
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
-          "assertion": "refunds only the exact 259-credit turn to original personal buckets and sends once"
+          "assertion": "historical pending waiver refunds only the exact 259-credit turn to original personal buckets and sends once"
         }
       ]
     },
@@ -1403,11 +1403,6 @@
           "assertion": "durable journal rebuilds once, then appends only records after the shared cursor"
         },
         {
-          "layer": "unit",
-          "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
-          "assertion": "OCV5-523: retrying → one model-busy retry hint, no counter or warning colour"
-        },
-        {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
@@ -1416,6 +1411,11 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
+          "assertion": "OCV5-523: retrying → one model-busy retry hint, no counter or warning colour"
         }
       ],
       "coverageCommits": []
@@ -4241,13 +4241,14 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/advisorMode.test.ts",
           "assertion": "assertAdvisorModelAllowed canonicalizes Codex 1M twins onto the standard id"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-advisor-1m-dup-picker.ts",
+          "assertion": "listProvenAdvisorModels skips Codex 1M twins and assertAdvisorModelAllowed canonicalizes via advisorCanonicalModelId"
         }
       ],
-      "coverageCommits": [],
-      "proofPending": {
-        "reason": "目前只有型号规范化单测，尚缺真实顾问下拉的浏览器或 live-e2e 证据；不将单测冒充界面验收。",
-        "since": "2026-09-25"
-      }
+      "coverageCommits": []
     },
     {
       "id": "INC-20260915-CODEX-CHATGPT-WS",
@@ -4388,7 +4389,11 @@
       ],
       "coverageCommits": [
         "6b22b40d"
-      ]
+      ],
+      "proofPending": {
+        "reason": "unit coverage on official CC anthropic-beta thinking-token-count allowlist; live proof after commercial runtime image rebuild",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-CLAUDE-QUOTA-RESET-STALE",
@@ -4415,7 +4420,11 @@
       ],
       "coverageCommits": [
         "d08669ae"
-      ]
+      ],
+      "proofPending": {
+        "reason": "unit coverage on Claude quota-window reset not kicking the account; live proof on commercial pool after a 5h window rollover",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-OFFICIAL-CC-OPUS48-GATE",
@@ -4442,7 +4451,11 @@
       ],
       "coverageCommits": [
         "a63fbe79"
-      ]
+      ],
+      "proofPending": {
+        "reason": "unit coverage rewriting in-flight claude-opus-4-8 to the turn canonical; live proof on official-cc harness",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-OFFICIAL-CC-FALSE-SERVICE-RESTART",
@@ -4465,7 +4478,11 @@
           "path": "packages/gateway/src/__tests__/ccbOfficialCcHarness.test.ts",
           "assertion": "official-cc preheat does not spawn or --resume without a master dispatch"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "unit coverage declining leftover SERVICE_RESTART auto-recovery after live progress; live proof on official-cc leftover frames",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-OFFICIAL-CC-EXPIRED-AUTHORITY-LEASE",
@@ -4671,6 +4688,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/api.test.ts",
           "assertion": "apiErrorMessage: Claude 出口已被启用号占用 → 中文，不回退成请求失败"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/claude-egress-precheck.node-test.mjs",
+          "assertion": "INC-20260921-CLAUDE-EGRESS-PRECHECK-ACTIVE: real modal POST, PG and audit"
         }
       ],
       "historicalRebasedLineage": [
@@ -4767,6 +4789,16 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/ccbLocalAgentCallback.test.ts",
           "assertion": "drops a second notice with the same status and summary"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/empty-turn-callback.node-test.mjs",
+          "assertion": "INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callback admission"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recovery-retry-loop.node-test.mjs",
+          "assertion": "INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence"
         }
       ]
     },
@@ -4791,6 +4823,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
           "assertion": "对话流不渲染还在排队的用户消息"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/queued-send-app.node-test.mjs",
+          "assertion": "INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before send-now"
         }
       ]
     },
@@ -4824,6 +4861,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
           "assertion": "既有更早对话又有本轮未加载步骤时，顶部按钮只翻对话"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T69 贴底补更早过程步骤时已渲染锚点不位移，离底保持锚点，上滑后不恢复跟随"
         }
       ]
     },
@@ -4848,6 +4890,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
           "assertion": "离底补更早过程步骤时按前插后的真实位置保持锚点"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T69 贴底补更早过程步骤时已渲染锚点不位移，离底保持锚点，上滑后不恢复跟随"
         }
       ]
     },
@@ -5025,6 +5072,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "HOOK_CURRENT_TEXT"
         }
       ]
     },
@@ -5356,6 +5408,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
           "assertion": "a locally rejected tool name is stopped and settled, not left unknown"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "staged history and system use current catalog aliases; rejected first round is proven failed with zero charge, idle failed, and next admission succeeds"
         }
       ]
     },
@@ -5369,6 +5426,26 @@
         "e93c03d6"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.77"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.77"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.77 before it may start"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-web-search-header] PASS — the master's Grok web search presents a client version xAI serves"
+        },
         {
           "layer": "unit",
           "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
@@ -5384,6 +5461,11 @@
       "rootFixCommit": "21bf1581",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-300-rejected-stream-wedge] PASS — a rejected stream whose CLI finished settles unbilled and the next message runs"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
@@ -5417,6 +5499,11 @@
         "18ac8043"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-301-cli-rejected-call] PASS — a call the CLI rejects is retried inside one visible turn"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.multimsg.test.ts",
@@ -5456,6 +5543,11 @@
         "2cea9e69"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-302-result-rewrite-echo] PASS — a phone screenshot is published fitted and its echo binds byte for byte"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolResultImages.test.ts",
@@ -5508,6 +5600,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-302-image-caption] PASS — a resized Read image continues when the caption is proven by the image"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxImageCaptionProof.test.ts",
           "assertion": "OCV5-302 the cached caption of the live repro image continues the turn"
@@ -5538,6 +5635,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-303-skill-continuation] PASS — a Skill launch with its injected body continues"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
           "assertion": "OCV5-303 the injected skill body joins its Skill result and the turn continues"
@@ -5561,6 +5663,11 @@
         "7c464fb7"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-304-recovered-tool-exchange] PASS — a recovery turn stops the orphaned run and continues its tool exchange once"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
@@ -5605,6 +5712,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-306-replay-pending-after-cut] PASS — a retry waits for the still-finishing Box call and replays its real result"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxReplayWait.test.ts",
           "assertion": "a still-resolving Box call is awaited until its replay is ready"
@@ -5635,6 +5747,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-306-spool-read-transient] PASS — a dropped spool read is read again at the same offset"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
           "assertion": "OCV5-306: a dropped exec exchange re-reads the same offset instead of failing the turn"
@@ -5654,6 +5771,11 @@
       "rootFixCommit": "0938b060",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/continue-card-retired.node-test.mjs",
+          "assertion": "running continuation: the committed failure card is retired"
+        },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
@@ -5792,6 +5914,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-314-parallel-skill-bodies] PASS — each parallel Skill body joins its own launch"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
           "assertion": "OCV5-314 parallel Skill bodies each join their own launch, in any layout"
@@ -5812,6 +5939,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message passes submit"
+        },
+        {
           "layer": "unit",
           "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
           "assertion": "OCV5-315 a Box continuation reject settles the parked Box turn once"
@@ -5831,6 +5963,11 @@
       "rootFixCommit": "15a6d2a5",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-317-skill-budget-tail] PASS — a Skill step followed by the CCB budget tail continues"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
@@ -5853,6 +5990,11 @@
         "78368a61"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation"
+        },
         {
           "layer": "unit",
           "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
@@ -5884,6 +6026,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released"
+        },
+        {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
           "assertion": "a normal turn end with no summary shuts the runner down and records it"
@@ -5913,6 +6060,11 @@
           "assertion": "closing stdin drains the launch reader after one GC"
         },
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-315-box-cli-follow-up-turn] PASS — a follow-up turn reaches the same box Claude and closing stdin ends it"
+        },
+        {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/subprocessRunnerBoxCcTurnReuse.test.ts",
           "assertion": "a second turn with a new lease goes to the same process"
@@ -5927,11 +6079,7 @@
           "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
           "assertion": "box scripts: stop ends the launched Claude, and a new launch retires the old one of the same session"
         }
-      ],
-      "proofPending": {
-        "reason": "个人版这里只有 unit 层（真实 runner 对假子进程、真实 Box 脚本对本机 fifo）。deploy-gate 证明和线上多轮对话证据在商业树（611cf330，scripts/check-v5-box-incident-proofs.ts 的 ocv5-315-box-cli-follow-up-turn；个人版没有这份发布门脚本）。个人版发布后的真实多轮 turn 是一次性核对，不是可重复执行的产物。",
-        "since": "2026-10-05"
-      }
+      ]
     },
     {
       "id": "INC-20261003-BOX-LEFTOVER-TOOL-FRAMES",
@@ -5943,6 +6091,11 @@
         "c1e3b8a4"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled"
+        },
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
@@ -5972,6 +6125,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-322-answered-exchange-prompt] PASS — a prompt merged behind an answered tool exchange runs as a new invocation over that exchange"
+        },
+        {
           "layer": "integration",
           "path": "packages/commercial/src/http/proxy/boxCapacityAdmission.integ.test.ts",
           "assertion": "runs past the supervisor deadline no longer hold their session, account or user"
@@ -5997,6 +6155,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-323-resume-unsent-parked] PASS — a run parked behind a publish that never left is stopped and its session continues"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
           "assertion": "unsent resume leaf: intent, keeper stop, proof, then the existing chain CAS"
@@ -6017,6 +6180,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-310-fresh-projects-dir] PASS — history stages on a Box whose Claude has no projects directory yet"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
           "assertion": "history stages on a never-used Box that has no projects directory yet"
@@ -6036,11 +6204,7 @@
           "path": "packages/commercial/src/http/proxy/boxStageFiles.test.ts",
           "assertion": "INIT refuses a symlinked projects directory instead of following it"
         }
-      ],
-      "proofPending": {
-        "reason": "已在账号 25 真实 Box 用零付费 boxPrelaunchLiveProbe（修复前失败、修复后通过）和一次合成历史回放（boxTextStreamProbe，OCV5_289_STREAM_HISTORY_ACK=1）验证。这两个探针需要真实 Box 账号凭据，接不进 CI 的 browser/live-e2e/deploy-gate runner。selfhost 上线后需用真实用户的带历史 Box 回合验收。",
-        "since": "2026-10-04"
-      }
+      ]
     },
     {
       "id": "INC-20261004-BOX-UNKNOWN-NEVER-CLOSED",
@@ -6054,6 +6218,11 @@
         "353fd2ac"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-313-unknown-never-closed] PASS — the 2.1.288 image echo continues and an abandoned unknown run is stopped or expired so its session continues"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolResultEcho.cli.test.ts",
@@ -6089,15 +6258,16 @@
       "rootFixCommit": "7721c063",
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-313-cli-version-read] PASS — the Box CLI version read leaves through the real exec transport and a supported Box is admitted"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
           "assertion": "the version read is a request the real Box exec transport sends"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层（真实 BoxExecTransport 的请求校验）；线上证据是一次性的运维只读探针（账号 25 读到 2.1.288 并放行），不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-04"
-      }
+      ]
     },
     {
       "id": "INC-20261005-SAND-INSTALL-RESEND",
@@ -6107,15 +6277,16 @@
       "rootFixCommit": "7f8e925e",
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-314-sand-install-resend] PASS — an installer the Box accepted is not sent again to the same Box host process"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
           "assertion": "an accepted install that leaves no capability is not sent again to the same host process"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层（真实协调器对假 Box 网关的发送计数）；线上证据是发布后状态日志里该 operation 进入 INSTALL_UNCONFIRMED 且不再有新的 submitted，属一次性只读核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-05"
-      }
+      ]
     },
     {
       "id": "INC-20261005-BOX-CC-LARGE-LINE",
@@ -6132,6 +6303,11 @@
         "571fa589"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-317-box-cli-large-line] PASS — a 900 KB stdin line reaches the box Claude whole and a failed write ends the turn at once"
+        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCcWriteCleanup.test.ts",
@@ -6177,11 +6353,7 @@
           "path": "packages/gateway/src/__tests__/cursorBoxCcWriteCleanup.test.ts",
           "assertion": "failed Box write preserves its original rejection when stop"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层，其中一条用真实的 launch / write / stop 脚本对本机 fifo 跑完整的一行 900KB 输入。个人版没有 Box 事故的 deploy-gate 脚本；发布后的真实大消息 turn 是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-05"
-      }
+      ]
     },
     {
       "id": "INC-20261006-BOX-SYNTHETIC-TURN-HELD",
@@ -6305,25 +6477,26 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "admittedUnlisted.cliVersion !== \"2.1.999\""
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
           "assertion": "a new launch is refused before anything is admitted only when the CLI version cannot be read"
         },
         {
           "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
-          "assertion": "boxCliNativeResumeVerified(\"2.1.999\"), true"
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "anyWritten.kind === \"final\" && anyWritten.nativePointer?.cliVersion, \"2.1.999\""
         },
         {
           "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
-          "assertion": "anyWritten.kind === \"final\" && anyWritten.nativePointer?.cliVersion, \"2.1.999\""
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "boxCliNativeResumeVerified(\"2.1.999\"), true"
         }
-      ],
-      "proofPending": {
-        "reason": "行为由商业包单测锁住（可读版本放行并记原生指针，不可读仍拒绝）。本回合只删校验，不补浏览器证明。",
-        "since": "2026-10-07"
-      }
+      ]
     },
     {
       "id": "INC-20261007-ENGINE-STARTING-THINKING",
@@ -6384,6 +6557,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
           "assertion": "OCV5-334 one caption among parallel image results continues the turn"
@@ -6398,11 +6576,7 @@
           "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
           "assertion": "a matching image followed by another image in the same result stays rejected"
         }
-      ],
-      "proofPending": {
-        "reason": "商业 OCV5-334 的发布门证明（scripts/check-v5-box-incident-proofs.ts，红绿各一次）在商业树；个人版没有这道 Box 证明门，这里由同一份代码的 unit 层锁住。商业 rel-8db5c2ee8 已用 canary 真实验证（停止原生续接的运行、STOP_CANARY_OK）。",
-        "since": "2026-10-08"
-      }
+      ]
     },
     {
       "id": "INC-20261008-BOX-NATIVE-RESUME-UNSTOPPABLE",
@@ -6415,15 +6589,16 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-334-native-resume-stop] PASS — a native-resumed run whose keeper runs in the transcript run directory is stopped"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxKeeperStop.test.ts",
           "assertion": "stop reaches a native-resumed keeper that runs in the transcript run directory"
         }
-      ],
-      "proofPending": {
-        "reason": "商业 OCV5-334 的发布门证明（scripts/check-v5-box-incident-proofs.ts，红绿各一次）在商业树；个人版没有这道 Box 证明门，这里由同一份代码的 unit 层锁住。商业 rel-8db5c2ee8 已用 canary 真实验证（停止原生续接的运行、STOP_CANARY_OK）。",
-        "since": "2026-10-08"
-      }
+      ]
     },
     {
       "id": "INC-20261008-BOX-FOREIGN-TOOL-HISTORY",
@@ -6435,6 +6610,11 @@
         "3d3a652b"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
@@ -6450,11 +6630,7 @@
           "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
           "assertion": "a foreign id whose renamed form is already used is refused"
         }
-      ],
-      "proofPending": {
-        "reason": "商业 OCV5-337 的发布门证明（[ocv5-337-foreign-tool-history]，红绿各一次）在商业树；个人版没有这道 Box 证明门，这里由同一份代码的 unit 层锁住。",
-        "since": "2026-10-08"
-      }
+      ]
     },
     {
       "id": "INC-20261009-PREFILL-DRAFT-FLASH",
@@ -6525,6 +6701,16 @@
         },
         {
           "layer": "unit",
+          "path": "packages/commercial/src/__tests__/proxyCore.unit.test.ts",
+          "assertion": "中途断流 → 收尾前补一帧 SSE error,客户端不会把半截消息当成完成"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261010-output-limit-resume] PASS — a message the CLI resumed after max_tokens reaches the client as one answer and both calls are journaled for billing"
+        },
+        {
+          "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.outputLimit.test.ts",
           "assertion": "a max_tokens cut resumed by the CLI settles as one answer"
         },
@@ -6542,17 +6728,8 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
           "assertion": "OCV5-368 a final cut at max_tokens and resumed by the CLI is delivered and billed once"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/__tests__/proxyCore.unit.test.ts",
-          "assertion": "中途断流 → 收尾前补一帧 SSE error,客户端不会把半截消息当成完成"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层：decoder 用 Box 上 Claude Code 2.1.296 真实写出的续写记录形态走完“max_tokens 截断→续写→回答”，续轮测试在 native 与非 native 下都走到 final 并按两次调用计费。个人版 canary 用不了仅管理员可见的 box-api-claude-opus-5-5，触发需要一次真实打满输出上限的回答，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-10"
-      }
+      ]
     },
     {
       "id": "INC-20261011-BOX-TOOL-409-STUCK-RECOVERY",
@@ -6578,6 +6755,11 @@
         "a4368f43"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261011-tool-409-superseded] PASS — tool results followed by text Claude Code added run fresh after the waiting handoff is stopped, never 409"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxAnsweredExchange.test.ts",
@@ -6615,6 +6797,11 @@
         },
         {
           "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "OCV5-328 a stream the decoder rejects stops the run like a rejected echo"
+        },
+        {
+          "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
           "assertion": "OCV5-377 a model safety stop in the finished spool is undeliverable"
         },
@@ -6627,17 +6814,8 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/boxIdleOcv5377.test.ts",
           "assertion": "a stuck op whose runner was killed stops the parked run and settles; the session is free"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
-          "assertion": "OCV5-328 a stream the decoder rejects stops the run like a rejected echo"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit/integration 层：分类器、fetch 认领停止、journal 查询、decoder refusal 与恢复任务收口都有真实 SQL 或真实代码路径的用例；个人版 canary 用不了仅管理员可见的 Box 模型，触发需要真实 Claude Code 注入文本或真实 refusal，不是可重复执行的 browser/live-e2e 产物。商业版以 deploy-gate proof 覆盖。",
-        "since": "2026-10-11"
-      }
+      ]
     },
     {
       "id": "INC-20261006-BOX-MIXED-CALL-TURN-CUT",
@@ -6681,12 +6859,13 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/proxyCore.unit.test.ts",
           "assertion": "中途断流 → 收尾前补一帧 SSE error,客户端不会把半截消息当成完成"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261006-mixed-call-turn-cut] PASS — a message that mixes an exposed call with hidden ones hands off the exposed call and the next round takes the CLI own answers to the hidden ones"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit / integration 层，其中一条用 Box 上 Claude Code 2.1.288 对同形态消息的真实输出（一次已暴露调用加两次未暴露调用）走完两轮解码。个人版 canary 用不了仅管理员可见的 box-api-claude-opus-5-5，个人版也没有 Box 事故的 deploy-gate 脚本；对真实 CCB 构建做的“干净截断 / 带 error 帧”对照是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-06"
-      }
+      ]
     },
     {
       "id": "INC-20261006-BOX-BIGCTX-QUOTA",
@@ -6725,12 +6904,13 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
           "assertion": "a CLI usage-limit refusal before any model message is a named code, not a snapshot violation"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once, its retries are not seen as still resolving, and the next message runs"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层，其中一条用 Box 上抓到的真实“额度耗尽”记录（__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl）走完首轮解码和未计费收尾。商业版在真实 Postgres 上有部署门禁证明（scripts/check-v5-box-incident-proofs.ts，红绿对照），个人版没有 Box 事故的 deploy-gate 脚本，canary 也用不了 box-claude-*，所以个人版暂无 browser/live-e2e/deploy-gate 层产物。",
-        "since": "2026-10-07"
-      }
+      ]
     },
     {
       "id": "INC-20261006-MODEL-CONFIG-CARD-BILLING-COPY",
@@ -6748,12 +6928,17 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
-          "assertion": "exactly one Continue button"
+          "assertion": "the card describes the available continuation"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "MODEL_CONFIG_CHANGED_RETRY_TURN 文案不声称整轮不计费,按钮名与卡片实际一致"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
+          "assertion": "exactly one Continue button"
         }
       ]
     },
@@ -6783,12 +6968,13 @@
           "layer": "unit",
           "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
           "assertion": "host path follows the expected PID's cwd among known Sand host directories"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261007-sand-installer-host-f95dbfb] PASS — the installer patches the f95dbfb host with its relay route before the proxy gate and only the gateway token reaches it"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层（真实 installer.py 对 f95dbfb 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌，含无自身鉴权的 relay 替身）；线上证据要账号 25 真实 Box：发布后 Sand host 换 PID、生命周期 ready、能力探针命中、账号池写入 ≥1，属一次性运维核对，接不进 browser/live-e2e/deploy-gate runner。",
-        "since": "2026-10-08"
-      }
+      ]
     },
     {
       "id": "INC-20261008-MARKET-SKILL-IMPORT-OVERFLOW",
@@ -6832,12 +7018,13 @@
           "layer": "unit",
           "path": "packages/storage/src/__tests__/projectContext.test.ts",
           "assertion": "a seed racing a human write cannot overwrite it (checked under the lock)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "a hand-edited PROJECT.md with a stale hash is preserved, not replaced by the seed"
         }
-      ],
-      "proofPending": {
-        "reason": "缺陷在存储层（项目卷上的 PROJECT.md 与 meta.json），回归在 unit 层，对旧实现红、新实现绿（五条）。个人版没有能覆盖容器卷文件的 browser/live-e2e/deploy-gate runner；发布后在 uid3 卷上只读核对 meta.json 的 instructionsState 与 PROJECT.md 未变，属一次性核对。",
-        "since": "2026-10-08"
-      }
+      ]
     },
     {
       "id": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP",
@@ -6910,12 +7097,13 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/projectAssetOutputsMaster.test.ts",
           "assertion": "a registration queued while a flush is sending is not lost"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "registers into the tenant from the container identity, never from the body"
         }
-      ],
-      "proofPending": {
-        "reason": "缺陷在容器↔主控的登记链路，回归在 unit 层：容器侧收集器对假主控（重试/待登记队列/冻结项目）六条、主控路由对假身份与假存储（租户只取容器身份、冻结项目、已删项目落未分类、外人会话不登记）六条；把收集器强制回本地登记时六条全红。个人版没有覆盖真实容器→主控链路的 browser/live-e2e/deploy-gate runner；发布后用 uid3 真实一轮产出文件、在 PG project_assets 只读核对新行与项目归属，属一次性核对。",
-        "since": "2026-10-08"
-      }
+      ]
     },
     {
       "id": "INC-20261009-UPLOAD-RETRY-ACCOUNT-SWITCH",
@@ -6929,12 +7117,13 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/api.test.ts",
           "assertion": "uploadFile never retries under another identity after a 503 backoff"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/upload-retry-account-switch.node-test.mjs",
+          "assertion": "INC-20261009-UPLOAD-RETRY-ACCOUNT-SWITCH: a cold-start retry after an account switch never sends the file under the new account"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层（真实 api.uploadFile + 内存 AuthSession，503 退避中切换身份后不再发出第二次请求；去掉修复即红）。换号时机需要在退避窗口内人工登出登录，个人版没有能编排这一时序的 browser/live-e2e/deploy-gate runner。",
-        "since": "2026-10-09"
-      }
+      ]
     },
     {
       "id": "INC-20261009-CC-SWITCH-LIGHT-SLOT-ORDER",
@@ -6983,6 +7172,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/admin/AdminShellBoundary.test.tsx",
           "assertion": "页面崩溃只影响当前 tab，切页后错误边界重置"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/admin-boundary-sticky.node-test.mjs",
+          "assertion": "INC-20261009-ADMIN-BOUNDARY-STICKY: one crashed admin page does not lock the other tabs"
         }
       ]
     },
@@ -7003,6 +7197,11 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts",
           "assertion": "uid=1 不是 admin(个人版)→ 发给最小的非系统种子 active admin"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "同 dedupe_key 重复兜底 → 只写 1 条,第二次 inbox_fallback=false"
         }
       ]
     },
@@ -7017,6 +7216,11 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalInboxPost.test.ts",
+          "assertion": "delivery key already delivered with other content → 200 duplicate, not 500 (OCV5-365)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
           "assertion": "delivery key already delivered with other content → 200 duplicate, not 500 (OCV5-365)"
         }
       ]
@@ -7033,6 +7237,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/admin/pages/selfheal/__tests__/selfheal.test.tsx",
           "assertion": "加载更多不超过后端上限 200(OCV5-365)"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/selfheal-load-more.node-test.mjs",
+          "assertion": "INC-20261009-SELFHEAL-LOAD-MORE-400: load more stops at the backend cap and the list stays up"
         }
       ]
     },
@@ -7057,12 +7266,13 @@
           "layer": "unit",
           "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
           "assertion": "a stuck unconfirmed install on the same host process gets one new attempt when the relay module changes (OCV5-378, host f1727e3)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261011-sand-installer-host-f1727e3] PASS — the installer patches the f1727e3 host, still refuses any other change to its auth gate, and only the gateway token reaches the relay"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层(真实 installer.py 对 f1727e3 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌;锚点反例;生命周期同一主程序遇新模块再试一次);线上证据要账号 25 的真实 Box:发布后生命周期 ready、能力探针命中新模块、账号池写入 ≥1、个人版 box-claude 回合跑通,属一次性运维核对,个人版发布不跑 deploy-gate/live-e2e,canary 也没有 Cursor slot。",
-        "since": "2026-10-11"
-      }
+      ]
     },
     {
       "id": "INC-20261012-BOX-SYSTEM-HEADER-DROP",
@@ -7417,13 +7627,12 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/openAiChatGoBridge.test.ts",
           "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-go-cache-contract.mjs",
-          "assertion": "G1 OpenCode Go prompt cache hits across turns"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "商业版暂无 proof 层证据:发版证据是 G1(scripts/v5-go-cache-contract.mjs),它只接在个人版发版 deploy-v5-selfhost.sh;商业版没有已上架的 OpenCode Go 模型和对应测试账号,deploy-v5.sh 跑不了 G1。本轮由 Go 桥单测锁住(openAiResponsesGoBridge/openAiChatGoBridge)。补证到期 2026-11-15:商业上架 Go 模型时接入商业发布门,或补等价商业证据。管家 2026-10-16 决定方案 a。",
+        "since": "2026-10-16"
+      }
     },
     {
       "id": "INC-20261015-PRESTART-STOP-LOST",
@@ -7474,11 +7683,6 @@
           "assertion": "Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR"
         },
         {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-stop-before-start-contract.mjs",
-          "assertion": "S1 Stop sent while the engine starts ends the turn before the model answers"
-        },
-        {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
           "assertion": "OCV5-522: same-stack Stop before engine start retains exactly one owned terminal billing"
@@ -7498,7 +7702,11 @@
           "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
           "assertion": "OCV5-522: a genuine success racing Stop retains its actual positive usage"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "商业版暂无 proof 层证据:发版证据是 S1(scripts/v5-stop-before-start-contract.mjs),它只接在个人版发版 deploy-v5-selfhost.sh,依赖个人版 canary 的 Codex 模型;商业版没有对应模型/测试账号,deploy-v5.sh 跑不了 S1。本轮由 sessionManagerEngineTurn/preStartStop/codexTurnRetry 单测锁住。补证到期 2026-11-15:补商业真网关浏览器证明或商业发布门。管家 2026-10-16 决定方案 a。",
+        "since": "2026-10-16"
+      }
     },
     {
       "id": "INC-20261016-GROK-PROMPT-OFFLOAD",
@@ -7524,8 +7732,8 @@
         },
         {
           "layer": "deploy-gate",
-          "path": "scripts/v5-user-contract-smoke.mjs",
-          "assertion": "C3 the model answers from the user's message in its context, never from an offloaded request file"
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "the user's words reach the model's context inline, not as a file to read"
         }
       ]
     },
@@ -7618,6 +7826,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
           "assertion": "OCV5-477: a delegate route with no admitted billing is refused before upstream traffic"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-477-advisor-error-clears-app.node-test.mjs",
+          "assertion": "no stale save error after a successful save"
         }
       ],
       "coverageCommits": [
@@ -7641,17 +7854,17 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/uiFence.test.ts",
-          "assertion": "缩进代码块里的 ```ui 示例不动,后续正文保留(Codex r1)"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/uiFence.test.ts",
           "assertion": "输入预测与 Markdown 转换都认得贴行的块"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/ocv5-482-inline-ui-fence.node-test.mjs",
           "assertion": "an inline ```ui next block never reaches the screen"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/uiFence.test.ts",
+          "assertion": "缩进代码块里的 ```ui 示例不动,后续正文保留(Codex r1)"
         },
         {
           "layer": "unit",
@@ -8093,8 +8306,8 @@
         },
         {
           "layer": "deploy-gate",
-          "path": "scripts/v5-go-cache-contract.mjs",
-          "assertion": "G1 OpenCode Go prompt cache hits across turns"
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-500-recovery-pool-identity] PASS — recovery probes authenticate with the eligible pool identity, send nothing without one, and heal only on a completed inference"
         }
       ]
     },
@@ -9071,6 +9284,11 @@
         },
         {
           "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "late proven Box stops release retained credit reservations without charging"
+        },
+        {
+          "layer": "deploy-gate",
           "path": "scripts/check-v5-box-success-recovery.ts",
           "assertion": "[box-stopped-precheck] PASS — late proven Box stops release retained credit reservations without charging"
         }
@@ -9100,6 +9318,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCcInteractive.test.ts",
           "assertion": "frames: chunk mapping, abort result and user text"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p"
         },
         {
           "layer": "deploy-gate",
@@ -9307,14 +9530,14 @@
           "assertion": "keeps file search/deletion inside the current conversation unless the user names another one"
         },
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "keeps file search/deletion inside the current conversation unless the user names another one"
+        },
+        {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionWorkspaceBoundary.test.ts",
           "assertion": "every engine prompt keeps file search and deletion inside the current conversation"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/check-v5-session-workspace-boundary.ts",
-          "assertion": "[session-workspace-boundary] PASS every engine prompt keeps file work inside the current conversation"
         }
       ]
     },
@@ -10640,6 +10863,57 @@
       ]
     },
     {
+      "id": "INC-20261113-CODEX-LATE-STOP-CLOSURE",
+      "occurredAt": "2026-11-13",
+      "severity": "P1",
+      "symptom": "线程卸载被拒后，真实本地停止证明晚于有界 stop，未执行 admission 未自动释放；迟到证明须完成身份限定清理且不重放模型、不重复计费。",
+      "rootFixCommit": "72cef4a7",
+      "coverageCommits": [
+        "3e73c155",
+        "54f4e526",
+        "cd2f0391"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexRemoteAdapterE2E.test.ts",
+          "assertion": "after a late local stop proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-codex-late-stop-proof.sh",
+          "assertion": "a node that refuses the thread unload fences the lane and closes the undispatched admission"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261114-LOCAL-CATALOG-OWNER",
+      "occurredAt": "2026-11-14",
+      "severity": "P1",
+      "symptom": "OCV5-763 同步后，个人版 active 的 remote_pool CC 模型声明了 ccb.context_owner=box-native-v1，internalModelCatalog 复用签名通道的 issueBoxNativeContextOwner 将其投射到 /internal/v3/model-catalog，触发容器 ModelCatalogClient 校验 provider_id=box_cli 失败（catalog row context_owner invalid），阻断本地路径（delegate/cron/synthetic）。修复：新增 issueLocalCatalogBoxContextOwner 仅对 box_cli + BOX_NATIVE_CONTEXT_MODELS 下发本地目录 context_owner，保留签名 WS 远端泳道能力。",
+      "rootFixCommit": "912454e6",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxNativeContextOwner.test.ts",
+          "assertion": "remote_pool issues signed lane contextOwner but never local-catalog contextOwner"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalModelCatalog.test.ts",
+          "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
+        }
+      ],
+      "coverageCommits": [
+        "c2237fe7"
+      ]
+    },
+    {
       "id": "INC-20261107-BOX-IDLE-CONTINUITY",
       "occurredAt": "2026-11-07",
       "severity": "P1",
@@ -10714,57 +10988,6 @@
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "antigravity-route-heartbeat"
         }
-      ]
-    },
-    {
-      "id": "INC-20261113-CODEX-LATE-STOP-CLOSURE",
-      "occurredAt": "2026-11-13",
-      "severity": "P1",
-      "symptom": "线程卸载被拒后，真实本地停止证明晚于有界 stop，未执行 admission 未自动释放；迟到证明须完成身份限定清理且不重放模型、不重复计费。",
-      "rootFixCommit": "72cef4a7",
-      "coverageCommits": [
-        "3e73c155",
-        "cd2f0391",
-        "54f4e526"
-      ],
-      "regressions": [
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/codexRemoteAdapterE2E.test.ts",
-          "assertion": "after a late local stop proof"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/check-v5-codex-late-stop-proof.sh",
-          "assertion": "a node that refuses the thread unload fences the lane and closes the undispatched admission"
-        }
-      ]
-    },
-    {
-      "id": "INC-20261114-LOCAL-CATALOG-OWNER",
-      "occurredAt": "2026-11-14",
-      "severity": "P1",
-      "symptom": "OCV5-763 同步后，个人版 active 的 remote_pool CC 模型声明了 ccb.context_owner=box-native-v1，internalModelCatalog 复用签名通道的 issueBoxNativeContextOwner 将其投射到 /internal/v3/model-catalog，触发容器 ModelCatalogClient 校验 provider_id=box_cli 失败（catalog row context_owner invalid），阻断本地路径（delegate/cron/synthetic）。修复：新增 issueLocalCatalogBoxContextOwner 仅对 box_cli + BOX_NATIVE_CONTEXT_MODELS 下发本地目录 context_owner，保留签名 WS 远端泳道能力。",
-      "rootFixCommit": "c2237fe7",
-      "regressions": [
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxNativeContextOwner.test.ts",
-          "assertion": "remote_pool issues signed lane contextOwner but never local-catalog contextOwner"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/__tests__/internalModelCatalog.test.ts",
-          "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/check-v5-master-incident-proofs.ts",
-          "assertion": "remote_pool CCB rows do not emit local-catalog context_owner while exact Box rows still do (INC-20261114-LOCAL-CATALOG-OWNER)"
-        }
-      ],
-      "coverageCommits": [
-        "912454e6"
       ]
     },
     {

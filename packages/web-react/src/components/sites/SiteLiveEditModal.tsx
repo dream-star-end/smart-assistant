@@ -737,7 +737,7 @@ export function SiteLiveEditModal({
       srTitle={`站点实时编辑：${site.title}`}
       hideClose
       mobile="none"
-      className="left-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-screen max-w-none translate-x-0 translate-y-0 rounded-none border-0 bg-[#0c0c11]"
+      className="left-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-screen max-w-none translate-x-0 translate-y-0 rounded-none border-0 bg-bg"
       bodyClassName="overflow-hidden p-0"
     >
       <div
@@ -898,7 +898,7 @@ export function SiteLiveEditModal({
             data-testid="site-live-edit-viewport"
             className={cn(
               "preview-viewport relative max-h-full max-w-full overflow-hidden",
-              !fillsClientViewport && (device === "mobile" ? "rounded-[28px]" : "rounded-xl"),
+              !fillsClientViewport && (device === "mobile" ? "rounded-3xl" : "rounded-xl"),
               fillsClientViewport && "size-full max-h-none max-w-none rounded-none border-0",
               mode === "comment" && ready && "preview-viewport-selecting",
               phase === "error" && "preview-viewport-error",
@@ -950,7 +950,7 @@ export function SiteLiveEditModal({
             {mode === "comment" && hoverTarget && (
               <div
                 style={targetOverlayStyle(hoverTarget, viewport)}
-                className="pointer-events-none absolute z-[8] rounded border border-dashed border-sky-400/90 bg-sky-400/10"
+                className="pointer-events-none absolute z-[8] rounded border border-dashed border-info bg-info-soft"
               />
             )}
 

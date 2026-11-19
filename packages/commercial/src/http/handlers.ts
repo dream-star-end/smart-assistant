@@ -1,7 +1,8 @@
 import type { readSessionMetadata } from '../db/sessionMetadataApproval.js'
 import { projectPublicModels, projectLockedModels } from '../billing/modelPublicProjection.js'
 export type { PublicModelProjection, LockedPublicModelProjection } from '../billing/modelPublicProjection.js'
-import { DEFAULT_CODEX_ENGINE_MODEL, DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
+import { DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
+import { resolveAuthorizedTeamLeaderModel } from "../ws/teamModeForwarding.js";
 import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
 import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
 /**
@@ -1482,10 +1483,15 @@ export async function handleListPublicModels(
     const effective = claims
       ? await loadPublicModelScope(deps, claims, snapshot.securityEpoch)
       : anonymousModelScope();
+    const teamLeaderModel = resolveAuthorizedTeamLeaderModel(
+      (m) =>
+        Boolean(snapshot.billingPricingFor(m)?.enabled) &&
+        snapshot.canUseModel(effective, snapshot.aliasToCanonical(m)),
+    );
     sendJson(res, 200, {
       models: projectPublicModels(snapshot, effective, degraded),
       locked_models: projectLockedModels(snapshot, effective),
-      team_leader_model: DEFAULT_CODEX_ENGINE_MODEL,
+      team_leader_model: teamLeaderModel,
     });
     return;
   }
@@ -1496,7 +1502,9 @@ export async function handleListPublicModels(
   const models = scope
     ? pricing.listForUser(scope)
     : pricing.listPublic();
-  sendJson(res, 200, { models: annotateDegraded(models, degraded), team_leader_model: DEFAULT_CODEX_ENGINE_MODEL });
+  const visibleIds = new Set(models.map((m) => m.id));
+  const teamLeaderModel = resolveAuthorizedTeamLeaderModel((m) => visibleIds.has(m));
+  sendJson(res, 200, { models: annotateDegraded(models, degraded), team_leader_model: teamLeaderModel });
 }
 
 function anonymousModelScope(): UserModelScope {

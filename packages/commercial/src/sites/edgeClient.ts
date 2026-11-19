@@ -35,11 +35,19 @@ export interface EdgeSiteTombstoneInfo {
   renamedTo: string | null
 }
 
+export interface EdgeSiteRetiredInfo {
+  siteId: string
+  revision: number
+  op: 'delete' | 'rename'
+  renamedTo: string | null
+}
+
 export interface EdgeSiteStatus {
   exists: boolean
   revision: number
   tombstoneRevision: number
   tombstone?: EdgeSiteTombstoneInfo
+  retired?: EdgeSiteRetiredInfo
   meta?: EdgeSiteStatusMeta
 }
 
@@ -102,7 +110,7 @@ export interface SitesEdgeClient {
     sql: string
     params?: unknown[]
   }): Promise<SiteDbQueryResponse>
-  getSiteStatus(args: { slug: string }): Promise<EdgeSiteStatus>
+  getSiteStatus(args: { slug: string; siteId?: string }): Promise<EdgeSiteStatus>
 }
 
 const EDGE_REQUEST_TIMEOUT_MS = 30_000
@@ -397,12 +405,14 @@ export function createHttpSitesEdgeClient(opts: {
       })
       return JSON.parse(raw) as SiteDbQueryResponse
     },
-    async getSiteStatus({ slug }) {
+    async getSiteStatus({ slug, siteId }) {
       const raw = await sendSigned({
         method: 'GET',
         subPath: `/sites/${encodeURIComponent(slug)}`,
+        ...(siteId ? { query: `siteId=${encodeURIComponent(siteId)}` } : {}),
         revision: 1,
         body: Buffer.alloc(0),
+        meta: makeIdentityMeta({ siteId }),
       })
       const parsed = JSON.parse(raw) as EdgeSiteStatus
       return {
@@ -412,6 +422,7 @@ export function createHttpSitesEdgeClient(opts: {
         ...(parsed.tombstone && typeof parsed.tombstone === 'object'
           ? { tombstone: parsed.tombstone }
           : {}),
+        ...(parsed.retired && typeof parsed.retired === 'object' ? { retired: parsed.retired } : {}),
         ...(parsed.meta && typeof parsed.meta === 'object' ? { meta: parsed.meta } : {}),
       }
     },

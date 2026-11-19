@@ -358,7 +358,7 @@ export function SiteShareTab({
             <Button
               variant="secondary"
               size="sm"
-              className="rounded-full text-red-600 hover:bg-red-500/10 dark:text-red-400"
+              className="rounded-full text-danger hover:bg-hover"
               disabled={leaving}
               onClick={() => void handleLeaveSite()}
             >
@@ -533,8 +533,8 @@ export function SiteShareTab({
           </div>
 
           {latestInviteUrl && (
-            <div className="space-y-2 rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-3.5">
-              <p className="text-caption font-medium text-emerald-700 dark:text-emerald-300">
+            <div className="space-y-2 rounded-xl border border-success/40 bg-success-soft p-3.5">
+              <p className="text-caption font-medium text-success">
                 新邀请链接已生成（出于安全考虑仅展示这一次，请及时复制）：
               </p>
               <div className="flex flex-wrap items-center gap-2">
@@ -542,7 +542,7 @@ export function SiteShareTab({
                   value={latestInviteUrl}
                   readOnly
                   aria-label="生成的邀请链接"
-                  className="min-w-0 flex-1 font-mono text-[12px]"
+                  className="min-w-0 flex-1 font-mono text-caption"
                 />
                 <Button
                   size="sm"
@@ -586,7 +586,7 @@ export function SiteShareTab({
                       variant="ghost"
                       size="sm"
                       disabled={readOnly || busy}
-                      className="rounded-full text-red-600 hover:bg-red-500/10 dark:text-red-400"
+                      className="rounded-full text-danger hover:bg-hover"
                       onClick={() => void handleRevokeInvite(inv.id)}
                     >
                       {busy ? "撤销中…" : "撤销"}
@@ -608,7 +608,7 @@ export function SiteShareTab({
           <p className="text-caption text-muted">
             协作者在自己的对话中点击右上角「实时编辑」或「编辑」即可直接协同修改；也可在容器终端运行以下命令拉取和更新站点：
           </p>
-          <div className="space-y-2 rounded-xl border border-border/70 bg-bg-subtle/60 p-3.5 font-mono text-[12px] text-fg">
+          <div className="space-y-2 rounded-xl border border-border/70 bg-bg-subtle/60 p-3.5 font-mono text-caption text-fg">
             <div className="flex items-center justify-between gap-2">
               <span className="truncate">{pullCmd}</span>
               <IconButton

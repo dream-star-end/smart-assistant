@@ -26,7 +26,7 @@ async function fixture(handler: (req: IncomingMessage, res: ServerResponse) => v
 }
 function ok(res: ServerResponse) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ organic })) }
 
-test('OCV5-510 oc-web search prefers Tavily first and returns source URLs without hitting fallback proxies', async () => {
+test('OCV5-510 oc-web search returns source URLs through the authenticated master proxy (Tavily first)', async () => {
   await fixture((_req, res) => ok(res), async (env, requests) => {
     const result = await runOcWebCli(['search', '今日科技新闻', '--json'], env)
     assert.equal(result.exitCode, 0, result.stderr)

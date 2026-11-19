@@ -11,7 +11,7 @@ afterEach(cleanup);
 const MODELS: PublicModel[] = [
   { id: "glm-5.2", display_name: "GLM-5.2" },
   { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
-  { id: "gpt-6-astra", display_name: "GPT-6-Astra" },
+  { id: "gpt-6.2-astra", display_name: "GPT-6.2-Astra" },
 ];
 
 function renderHeader(extra: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
@@ -53,7 +53,7 @@ describe("ChatHeader 团队模式指示 chip", () => {
     fireEvent.click(screen.getByRole("button", { name: "团队模式已开启" }));
 
     // 说明一句话:如实告知队长引擎与计费差异
-    const note = await screen.findByText(/队长引擎为 GPT-6-Astra/);
+    const note = await screen.findByText(/队长引擎为 GPT-6\.2-Astra/);
     expect(note.textContent).toContain("计费高于默认模型");
 
     fireEvent.click(screen.getByRole("button", { name: "关闭团队模式" }));
@@ -85,7 +85,7 @@ describe("ChatHeader 团队模式指示 chip", () => {
     renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
     // C-25:「顶栏所见 = 实际所发」—— 引擎名必须在 trigger 上;「团队模式」一词只由 chip 承担。
-    expect(trigger.textContent).toContain("队长引擎 · GPT-6-Astra");
+    expect(trigger.textContent).toContain("队长引擎 · GPT-6.2-Astra");
     expect(trigger.textContent).not.toContain("团队模式");
     expect(trigger.textContent).not.toContain("GLM-5.2");
     expect(screen.getByRole("button", { name: "团队模式已开启" })).toBeInTheDocument();

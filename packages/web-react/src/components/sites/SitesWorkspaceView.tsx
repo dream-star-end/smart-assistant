@@ -129,6 +129,7 @@ export function SitesWorkspaceView({
     }
   }, [auth]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset/focus trigger on prop or identity change
   useEffect(() => {
     setSummary(null);
     void loadSites();
@@ -310,7 +311,7 @@ export function SitesWorkspaceView({
         />
       ) : (
         <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-8 sm:py-8">
-          <h1 className="text-2xl font-semibold text-fg sm:text-[28px]">站点</h1>
+          <h1 className="text-2xl font-semibold text-fg sm:text-3xl">站点</h1>
 
           <div className="flex flex-wrap items-center gap-3">
             <label className="relative min-w-[200px] flex-1">
@@ -503,7 +504,7 @@ export function SitesWorkspaceView({
                       {site.customDomain || `${site.slug}.${baseDomain}`}
                     </p>
                     {(site.accessRole ?? "owner") !== "owner" && (
-                      <p className="truncate text-[11px] font-medium text-sky-700 dark:text-sky-300">
+                      <p className="truncate text-micro font-medium text-info">
                         共享 · {roleLabel(site.accessRole ?? "editor")}
                         {site.ownerEmail ? ` · ${site.ownerEmail}` : ""}
                       </p>
@@ -533,13 +534,13 @@ export function SitesWorkspaceView({
                       <div className="flex flex-wrap items-center gap-2">
                         <p className="truncate text-body font-medium text-fg">{site.title}</p>
                         {(site.accessRole ?? "owner") !== "owner" && (
-                          <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-300">
+                          <span className="inline-flex items-center gap-1 rounded-full bg-info-soft px-2 py-0.5 text-micro font-medium text-info">
                             <Users size={11} aria-hidden="true" />
                             共享 · {roleLabel(site.accessRole ?? "editor")}
                           </span>
                         )}
                         {site.customDomain && (
-                          <span className="hidden truncate rounded bg-bg-subtle px-1.5 py-0.5 font-mono text-[11px] text-muted sm:inline">
+                          <span className="hidden truncate rounded bg-bg-subtle px-1.5 py-0.5 font-mono text-micro text-muted sm:inline">
                             {site.customDomain}
                           </span>
                         )}
@@ -593,7 +594,7 @@ export function SitesWorkspaceView({
                 授予角色：<strong className="text-fg">{roleLabel(invitePreview.role)}</strong>
               </p>
               {invitePreview.alreadyRole && (
-                <p className="text-caption text-emerald-700 dark:text-emerald-300">
+                <p className="text-caption text-success">
                   你当前已是该站点的「{roleLabel(invitePreview.alreadyRole)}」。
                 </p>
               )}

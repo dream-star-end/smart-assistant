@@ -133,7 +133,7 @@ esac
         browser: false,
       })
     } finally {
-      if (previous === undefined) delete process.env.OPENCLAUDE_WEB_CONTEXT_BIN
+      if (previous === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_WEB_CONTEXT_BIN')
       else process.env.OPENCLAUDE_WEB_CONTEXT_BIN = previous
       await rm(dir, { recursive: true, force: true })
     }
@@ -166,9 +166,9 @@ printf '%s\\n' '{"ok":true,"checks":{"trafilatura":{"ok":true}}}'
       assert.equal(parsed.browser.executable, browserPath)
       assert.equal(parsed.browser.proxy, true)
     } finally {
-      if (prevBin === undefined) delete process.env.OPENCLAUDE_WEB_CONTEXT_BIN
+      if (prevBin === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_WEB_CONTEXT_BIN')
       else process.env.OPENCLAUDE_WEB_CONTEXT_BIN = prevBin
-      if (prevBrowser === undefined) delete process.env.OPENCLAUDE_WEB_CONTEXT_BROWSER
+      if (prevBrowser === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_WEB_CONTEXT_BROWSER')
       else process.env.OPENCLAUDE_WEB_CONTEXT_BROWSER = prevBrowser
       await rm(dir, { recursive: true, force: true })
     }

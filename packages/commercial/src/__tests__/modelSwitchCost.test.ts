@@ -2,7 +2,10 @@ import { switchPriceDominated } from '../billing/modelSwitchCost.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Pool } from 'pg'
-import { PricingCache, type ModelPricing } from '../billing/pricing.js'
+import type { ModelPricing } from '../billing/pricing.js'
+import { PricingCache } from '../billing/pricing.js'
+import { ModelCatalogSnapshot, type ModelCatalogCache } from '../billing/modelCatalog.js'
+import { makeModelSwitchCostTargetResolver } from '../billing/modelSwitchCostTarget.js'
 import {
   readSwitchCostPolicy,
   expensiveSwitch,
@@ -383,4 +386,103 @@ test('known insufficient funds block even a switch below the expensive-warning t
     f.service.assertAuthorized('765', f.request),
     (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
   )
+})
+
+test('teamMode falls back to gpt-6-astra during Phase A when gpt-6.2-astra is admin-only', async () => {
+  const snapshot = new ModelCatalogSnapshot({
+    entries: [
+      {
+        entryId: 1,
+        modelId: 'gpt-6-astra',
+        engine: 'codex',
+        providerId: 'codex',
+        upstreamModelId: null,
+        contextWindow: null,
+        capabilityProfile: {
+          supportsVision: true,
+          reasoning: { supported: ['low', 'medium', 'high', 'xhigh', 'max'], codexModelDefault: 'xhigh' },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: 1,
+        state: 'active',
+        lockVersion: 0,
+      },
+      {
+        entryId: 2,
+        modelId: 'gpt-6.2-astra',
+        engine: 'codex',
+        providerId: 'codex',
+        upstreamModelId: null,
+        contextWindow: null,
+        capabilityProfile: {
+          supportsVision: true,
+          reasoning: { supported: ['low', 'medium', 'high', 'xhigh', 'max'], codexModelDefault: 'xhigh' },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: 1,
+        state: 'active',
+        lockVersion: 0,
+      },
+    ],
+    aliases: new Map(),
+    pricing: new Map([
+      [
+        'gpt-6-astra',
+        {
+          modelId: 'gpt-6-astra',
+          displayName: 'GPT-6-Astra',
+          inputPerMtok: 598n,
+          outputPerMtok: 3598n,
+          cacheReadPerMtok: 60n,
+          cacheWritePerMtok: 0n,
+          multiplier: '1.000',
+          visibility: 'public',
+          sortOrder: 109,
+          defaultEffort: 'xhigh',
+        },
+      ],
+      [
+        'gpt-6.2-astra',
+        {
+          modelId: 'gpt-6.2-astra',
+          displayName: 'GPT-6.2-Astra',
+          inputPerMtok: 598n,
+          outputPerMtok: 3598n,
+          cacheReadPerMtok: 60n,
+          cacheWritePerMtok: 0n,
+          multiplier: '1.000',
+          visibility: 'admin',
+          sortOrder: 109,
+          defaultEffort: 'xhigh',
+        },
+      ],
+    ]),
+    securityEpoch: 7n,
+  })
+  const fakeCache = {
+    assertFresh: async () => snapshot,
+    current: () => snapshot,
+  } as unknown as ModelCatalogCache
+  const resolver = makeModelSwitchCostTargetResolver(
+    async (uid) => ({
+      role: uid === 1n ? 'admin' : 'user',
+      grantedModelIds: new Set<string>(),
+    }),
+    () => fakeCache,
+  )
+
+  const resolvedUser = await resolver('42', 'gpt-6.2-astra', undefined, {
+    allowLegacyTeamLeaderFallback: true,
+  })
+  assert.equal(resolvedUser.pricing.model_id, 'gpt-6-astra')
+
+  await assert.rejects(
+    resolver('42', 'gpt-6.2-astra', undefined, { allowLegacyTeamLeaderFallback: false }),
+    (e) => e instanceof ModelSwitchCostError && e.code === 'UNAUTHORIZED_MODEL',
+  )
+
+  const resolvedAdmin = await resolver('1', 'gpt-6.2-astra', undefined, {
+    allowLegacyTeamLeaderFallback: true,
+  })
+  assert.equal(resolvedAdmin.pricing.model_id, 'gpt-6.2-astra')
 })

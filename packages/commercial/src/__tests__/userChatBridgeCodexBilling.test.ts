@@ -3384,6 +3384,120 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     }
   });
 
+  test("Phase A rollout: ungranted user teamMode/main falls back to gpt-6-astra while admin uses 6.2 and ungranted-both rejects", async () => {
+    const LEGACY_ASTRA_PRICING: ModelPricing = {
+      ...PRICING,
+      model_id: "gpt-6-astra",
+      display_name: "GPT-6-Astra",
+      visibility: "public",
+    };
+    // 1. Ordinary ungranted user: gpt-6-astra public+enabled, gpt-6.2-astra admin+enabled -> falls back to gpt-6-astra
+    const rigUser = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-6-astra",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "deepseek-v4-flash" : agentId === "codex" ? DEFAULT_CODEX_ENGINE_MODEL : null,
+    });
+    rigUser.pricing._setForTests([PRICING, LEGACY_ASTRA_PRICING, { ...TEAM_LEADER_PRICING, visibility: "admin" }]);
+    try {
+      const containerOpenP = waitNextContainerSocket(rigUser);
+      const ws = openClient(rigUser.gatewayPort, await makeJwt("31"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "phase-a-user-team", kind: "dm" },
+        clientMessageId: "phase-a-user-msg",
+        agentId: "main",
+        model: "glm-5.2",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const frame = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frame.data) as Record<string, unknown>;
+      assert.equal(parsed.agentId, "main");
+      assert.equal(parsed.model, "gpt-6-astra");
+      assert.equal(parsed.effortLevel, "high");
+      const journal = rigUser.poolCtrl.journalRows.get(parsed.requestId as string);
+      assert.ok(journal, "fallback GPT leader must open inflight journal");
+      assert.equal(journal.ctx.model, "gpt-6-astra");
+      ws.close();
+    } finally {
+      await stopRig(rigUser);
+    }
+
+    // 2. Admin / Phase B user allowed for both -> prefers DEFAULT_CODEX_ENGINE_MODEL (gpt-6.2-astra)
+    const rigAdmin = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) =>
+        modelId === "gpt-6-astra" || modelId === DEFAULT_CODEX_ENGINE_MODEL,
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "deepseek-v4-flash" : agentId === "codex" ? DEFAULT_CODEX_ENGINE_MODEL : null,
+    });
+    rigAdmin.pricing._setForTests([PRICING, LEGACY_ASTRA_PRICING, { ...TEAM_LEADER_PRICING, visibility: "admin" }]);
+    try {
+      const containerOpenP = waitNextContainerSocket(rigAdmin);
+      const ws = openClient(rigAdmin.gatewayPort, await makeJwt("1"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "phase-a-admin-team", kind: "dm" },
+        clientMessageId: "phase-a-admin-msg",
+        agentId: "main",
+        model: "glm-5.2",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const frame = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frame.data) as Record<string, unknown>;
+      assert.equal(parsed.agentId, "main");
+      assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL);
+      const journal = rigAdmin.poolCtrl.journalRows.get(parsed.requestId as string);
+      assert.equal(journal?.ctx.model, DEFAULT_CODEX_ENGINE_MODEL);
+      ws.close();
+    } finally {
+      await stopRig(rigAdmin);
+    }
+
+    // 3. Denied both gpt-6.2-astra and gpt-6-astra -> fail-closed UNAUTHORIZED_MODEL
+    const rigDenied = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "glm-5.2",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2" : null,
+    });
+    rigDenied.pricing._setForTests([PRICING, LEGACY_ASTRA_PRICING, { ...TEAM_LEADER_PRICING, visibility: "admin" }]);
+    try {
+      const containerOpenP = waitNextContainerSocket(rigDenied);
+      const ws = openClient(rigDenied.gatewayPort, await makeJwt("32"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      let containerGotFrame = false;
+      containerWs.on("message", () => { containerGotFrame = true; });
+      const errP = waitJsonFrameOfType(ws, "error");
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "phase-a-denied-team", kind: "dm" },
+        clientMessageId: "phase-a-denied-msg",
+        agentId: "main",
+        teamMode: true,
+        content: "hi",
+      }));
+      const err = await errP;
+      assert.equal(err.code, "UNAUTHORIZED_MODEL");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(containerGotFrame, false);
+      ws.close();
+    } finally {
+      await stopRig(rigDenied);
+    }
+  });
+
   test("teamMode effort override leaves ordinary and registered non-main frames unchanged", async () => {
     const variants: Array<{
       name: string;

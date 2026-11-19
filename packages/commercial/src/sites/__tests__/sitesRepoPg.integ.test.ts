@@ -1,7 +1,7 @@
 /** Real PostgreSQL + SitesService concurrency, quota, fencing, and double-fault reconciliation tests (B1/B2/B3/B5). */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { after, before, describe, test } from 'node:test'
@@ -15,9 +15,13 @@ import { SitesService } from '../service.js'
 import { SitesError, encodeSiteBundle } from '../types.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const MIGRATION_0345 = resolve(HERE, '../../db/migrations/0345_user_sites.sql')
-const MIGRATION_0347 = resolve(HERE, '../../db/migrations/0347_user_sites_fullstack.sql')
-const MIGRATION_0349 = resolve(HERE, '../../db/migrations/0349_user_site_collaborators.sql')
+const MIGRATIONS_DIR = resolve(HERE, '../../db/migrations')
+const SITES_MIGRATIONS = [
+  resolve(MIGRATIONS_DIR, '0342_commercial_user_sites.sql'),
+  resolve(MIGRATIONS_DIR, '0345_user_sites.sql'),
+  resolve(MIGRATIONS_DIR, '0347_user_sites_fullstack.sql'),
+  resolve(MIGRATIONS_DIR, '0349_user_site_collaborators.sql'),
+].filter((p) => existsSync(p))
 const EDGE_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
 const targetUrl = new URL(
@@ -66,9 +70,10 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
          (3, 'u3@example.com', 'User Three', 'active', TRUE),
          (4, 'unverified@example.com', 'User Four', 'active', FALSE)`,
     )
-    await pool.query(readFileSync(MIGRATION_0345, 'utf8'))
-    await pool.query(readFileSync(MIGRATION_0347, 'utf8'))
-    await pool.query(readFileSync(MIGRATION_0349, 'utf8'))
+    assert.ok(SITES_MIGRATIONS.length > 0, 'at least one user_sites migration must exist')
+    for (const file of SITES_MIGRATIONS) {
+      await pool.query(readFileSync(file, 'utf8'))
+    }
 
     workDir = mkdtempSync(join(tmpdir(), 'oc-sites-pg-integ-'))
     const edge = createSitesEdgeServer({
@@ -667,5 +672,41 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
       (e: unknown) => e instanceof SitesError && e.code === 'STALE_REVISION' && e.status === 409,
     )
     assert.equal(await repo.getByUserAndSlug(2, 'pg-collab-site'), null)
+  })
+
+  test('0342 migration is idempotent per table across multiple schemas in one database', async (t) => {
+    const commercial0342 = SITES_MIGRATIONS.find((p) => p.endsWith('0342_commercial_user_sites.sql'))
+    if (!commercial0342) {
+      t.skip('commercial 0342 migration not present on selfhost')
+      return
+    }
+    const sql = readFileSync(commercial0342, 'utf8')
+    const schemaA = `oc_sites_0342_a_${randomUUID().replaceAll('-', '')}`
+    const schemaB = `oc_sites_0342_b_${randomUUID().replaceAll('-', '')}`
+    const client = await admin.connect()
+    try {
+      await client.query(`CREATE SCHEMA ${schemaA}; CREATE SCHEMA ${schemaB};`)
+      for (const s of [schemaA, schemaB]) {
+        await client.query(`
+          BEGIN;
+          SET LOCAL search_path = ${s};
+          CREATE TABLE users (id INTEGER PRIMARY KEY);
+        `)
+        await client.query(sql)
+        await client.query(sql)
+        const chks = await client.query<{ cnt: number }>(
+          `SELECT count(*)::int AS cnt
+             FROM pg_constraint
+            WHERE conrelid = 'user_sites'::regclass
+              AND conname IN ('user_sites_custom_domain_format_chk', 'user_sites_op_kind_chk')`,
+        )
+        assert.equal(chks.rows[0]!.cnt, 2, `expected 2 check constraints on ${s}.user_sites`)
+        await client.query('COMMIT')
+      }
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+      await admin.query(`DROP SCHEMA IF EXISTS ${schemaA}, ${schemaB} CASCADE`).catch(() => {})
+    }
   })
 })

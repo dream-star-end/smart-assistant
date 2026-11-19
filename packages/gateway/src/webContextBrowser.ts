@@ -3,8 +3,10 @@ import {
   existsSync,
   linkSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -586,6 +588,11 @@ export async function renderWebContextUrlWithBrowser(
       'web-context SSRF proxy startup timed out',
     )
 
+    const browserHomeDir = mkdtempSync(join(tmpdir(), 'oc-webctx-home-'))
+    mkdirSync(join(browserHomeDir, '.config'), { recursive: true })
+    mkdirSync(join(browserHomeDir, '.cache'), { recursive: true })
+    mkdirSync(join(browserHomeDir, '.local', 'share', 'applications'), { recursive: true })
+
     try {
       const chromium = loadPlaywrightChromium()
       let launchTimedOut = false
@@ -595,6 +602,13 @@ export async function renderWebContextUrlWithBrowser(
           headless: true,
           chromiumSandbox: false,
           timeout: remainingBudgetMs(deadlineMs, 1_000),
+          env: {
+            ...process.env,
+            HOME: browserHomeDir,
+            XDG_CONFIG_HOME: join(browserHomeDir, '.config'),
+            XDG_CACHE_HOME: join(browserHomeDir, '.cache'),
+            XDG_DATA_HOME: join(browserHomeDir, '.local', 'share'),
+          },
           args: [
             `--proxy-server=${proxy.serverUrl}`,
             '--proxy-bypass-list=<-loopback>',
@@ -695,14 +709,14 @@ export async function renderWebContextUrlWithBrowser(
           deadlineMs,
           'web-context browser CDP session timed out',
         )
-        let mainTargetId: string | undefined
+        const mainTarget: { id?: string } = {}
         browserCdp.on('Target.targetCreated', (ev) => {
           const info = ev.targetInfo as { targetId?: string; type?: string } | undefined
           if (
             info?.type === 'page' &&
             typeof info.targetId === 'string' &&
-            mainTargetId &&
-            info.targetId !== mainTargetId
+            mainTarget.id &&
+            info.targetId !== mainTarget.id
           ) {
             void browserCdp.send('Target.closeTarget', { targetId: info.targetId }).catch(() => {})
           }
@@ -736,7 +750,7 @@ export async function renderWebContextUrlWithBrowser(
           deadlineMs,
           'web-context Target.getTargetInfo timed out',
         )) as { targetInfo?: { targetId?: string } } | undefined
-        mainTargetId = targetInfoRes?.targetInfo?.targetId
+        mainTarget.id = targetInfoRes?.targetInfo?.targetId
 
         const gotoTimeout = remainingBudgetMs(deadlineMs, 200)
         let response: PlaywrightResponseLike | null
@@ -814,6 +828,11 @@ export async function renderWebContextUrlWithBrowser(
         await closeBrowserSafely(context, browser, browserServer)
       }
     } finally {
+      try {
+        rmSync(browserHomeDir, { recursive: true, force: true })
+      } catch {
+        /* ignore temp home cleanup failure */
+      }
       await proxy.close()
     }
   })

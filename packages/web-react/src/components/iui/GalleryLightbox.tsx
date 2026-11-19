@@ -36,11 +36,15 @@ export function GalleryLightbox({
   const content = (
     <div
       className="oc-iui-lightbox"
+      // biome-ignore lint/a11y/useSemanticElements: portal overlay styled as div without native dialog UA layout
       role="dialog"
       aria-modal="true"
       aria-label={title ? `${title} · 图片预览` : "图片预览"}
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
       }}
     >
       <div className="oc-iui-lightbox-bar">

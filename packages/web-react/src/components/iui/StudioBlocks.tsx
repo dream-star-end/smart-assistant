@@ -34,7 +34,12 @@ export function PromptTemplateBlock({ spec, notes, streaming, readOnly, nested }
       <div className="oc-iui-tpl-box">
         {parts.map((part, idx) => {
           const m = /^\{\{([A-Za-z0-9_\u4e00-\u9fff-]{1,40})\}\}$/.exec(part);
-          if (!m) return <Fragment key={`${idx}:t`}>{part}</Fragment>;
+          if (!m) {
+            return (
+              // biome-ignore lint/suspicious/noArrayIndexKey: static template segments have no unique row key
+              <Fragment key={`${idx}:t`}>{part}</Fragment>
+            );
+          }
           const id = m[1]!;
           const slot = spec.slots.find((s) => s.id === id);
           const shown = values[id]?.trim() || `[${slot?.label ?? id}]`;
