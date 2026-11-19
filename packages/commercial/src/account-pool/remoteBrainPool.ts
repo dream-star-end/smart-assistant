@@ -223,6 +223,7 @@ export function defaultRemoteCanonicalModelId(
   const raw = upstreamModelId.trim().toLowerCase()
   if (engine === 'antigravity') {
     if (raw === 'gemini-pro-orchestrator') return 'antigravity-orchestrator-carbon-remote'
+    if (raw === 'gemini-pro-orchestrator-neon') return 'antigravity-orchestrator-neon-remote'
     const base = raw
       .replace(/-(?:low|medium|high|xhigh|max)$/, '')
       .replace(/5-5$/, '5.5')

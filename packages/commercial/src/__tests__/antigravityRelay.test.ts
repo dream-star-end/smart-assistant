@@ -1473,3 +1473,86 @@ describe('Orchestrator Carbon relay worker allowlist and directory eligibility (
     )
   })
 })
+
+describe('Gemini 4 Neon & Orchestrator Neon relay allowlist and directory eligibility (OCV5-803)', () => {
+  test('antigravity-gemini-4-neon route forwards all four efforts + aux while rejecting worker and orchestrator ids', async () => {
+    const neonToken = await mintRoute('antigravity-gemini-4-neon')
+    for (const upstreamModel of [
+      'gemini-4-neon-low',
+      'gemini-4-neon-medium',
+      'gemini-4-neon-high',
+      'gemini-4-neon-xhigh',
+      'gemini-3.5-flash-lite',
+    ]) {
+      const { status, captured } = await relay(
+        `${ANTIGRAVITY_RELAY_PREFIX}/route/${neonToken}/v1internal:streamGenerateContent?alt=sse`,
+        { body: generateBody(upstreamModel) },
+        { status: 200, body: SSE },
+      )
+      assert.equal(status, 200, `expected 200 for ${upstreamModel} on gemini-4-neon route`)
+      assert.equal(captured.usage[0]?.upstreamModel, upstreamModel)
+      assert.equal(captured.usage[0]?.routeModelId, 'antigravity-gemini-4-neon')
+    }
+
+    for (const forbidden of ['gemini-flash-worker-agy', 'gemini-pro-orchestrator-neon', 'gemini-4-carbon-high']) {
+      const res = await relay(
+        `${ANTIGRAVITY_RELAY_PREFIX}/route/${neonToken}/v1internal:streamGenerateContent?alt=sse`,
+        { body: generateBody(forbidden) },
+        { status: 200, body: SSE },
+      )
+      assert.equal(res.status, 403, `expected 403 for ${forbidden} on gemini-4-neon route`)
+      assert.match(res.text, /ANTIGRAVITY_MODEL_NOT_ALLOWED/)
+    }
+  })
+
+  test('antigravity-orchestrator-neon route forwards planner + gemini-flash-worker-agy + aux while isolating carbon and raw neon', async () => {
+    const orchNeonToken = await mintRoute('antigravity-orchestrator-neon')
+    for (const upstreamModel of ['gemini-pro-orchestrator-neon', 'gemini-flash-worker-agy', 'gemini-3.5-flash-lite']) {
+      const { status, captured } = await relay(
+        `${ANTIGRAVITY_RELAY_PREFIX}/route/${orchNeonToken}/v1internal:streamGenerateContent?alt=sse`,
+        { body: generateBody(upstreamModel) },
+        { status: 200, body: SSE },
+      )
+      assert.equal(status, 200, `expected 200 for ${upstreamModel} on orchestrator-neon route`)
+      assert.equal(captured.usage[0]?.upstreamModel, upstreamModel)
+      assert.equal(captured.usage[0]?.routeModelId, 'antigravity-orchestrator-neon')
+    }
+
+    for (const forbidden of ['gemini-pro-orchestrator', 'gemini-4-neon-high']) {
+      const res = await relay(
+        `${ANTIGRAVITY_RELAY_PREFIX}/route/${orchNeonToken}/v1internal:streamGenerateContent?alt=sse`,
+        { body: generateBody(forbidden) },
+        { status: 200, body: SSE },
+      )
+      assert.equal(res.status, 403, `expected 403 for ${forbidden} on orchestrator-neon route`)
+      assert.match(res.text, /ANTIGRAVITY_MODEL_NOT_ALLOWED/)
+    }
+  })
+
+  test('antigravityAccountSupportsModel checks directory gemini-pro-orchestrator-neon without requiring internal worker alias', () => {
+    const now = Date.parse('2026-11-19T02:00:00Z')
+    const ultraDirectory = {
+      'gemini-pro-orchestrator-neon': { remainingFraction: 0.89, resetTime: '2026-11-19T05:28:33Z' },
+    }
+    assert.equal(antigravityAccountSupportsModel(ultraDirectory, 'antigravity-orchestrator-neon', now), true)
+    assert.equal(antigravityAccountSupportsModel(ultraDirectory, 'antigravity-orchestrator-carbon', now), false)
+    assert.equal(antigravityAccountSupportsModel({}, 'antigravity-orchestrator-neon', now), false)
+    assert.equal(antigravityAccountSupportsModel(null, 'antigravity-orchestrator-neon', now), false)
+    assert.equal(
+      antigravityAccountSupportsModel(
+        { 'gemini-pro-orchestrator-neon': { remainingFraction: 0, resetTime: '2026-11-19T05:28:33Z' } },
+        'antigravity-orchestrator-neon',
+        now,
+      ),
+      false,
+    )
+    assert.equal(
+      antigravityAccountSupportsModel(
+        { 'gemini-pro-orchestrator-neon': { remainingFraction: 0, resetTime: '2026-11-19T01:00:00Z' } },
+        'antigravity-orchestrator-neon',
+        now,
+      ),
+      true,
+    )
+  })
+})

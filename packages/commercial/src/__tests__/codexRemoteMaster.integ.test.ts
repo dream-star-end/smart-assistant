@@ -36,6 +36,8 @@ const expectedSuffix = [
         '0344_drop_delegate_antigravity_budget_trigger',
         '0345_user_sites',
         '0346_selfhost_gpt62_sol_astra_retire_legacy',
+        '0347_user_sites_fullstack',
+        '0348_antigravity_gemini_4_neon',
       ]
     : ['0340_commercial_sync_compat', '0341_commercial_antigravity_gemini_4_models']),
 ].sort()

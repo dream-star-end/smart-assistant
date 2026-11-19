@@ -165,6 +165,12 @@ describe('0307 antigravity engine schema', () => {
               enabled: false,
               visibility: 'admin',
             },
+            {
+              model_id: 'antigravity-gemini-4-neon',
+              state: 'staged',
+              enabled: false,
+              visibility: 'admin',
+            },
           ]
         : [
             {
@@ -192,6 +198,16 @@ describe('0307 antigravity engine schema', () => {
         enabled: false,
         visibility: 'admin',
       },
+      ...(selfhost
+        ? [
+            {
+              model_id: 'antigravity-orchestrator-neon',
+              state: 'staged',
+              enabled: false,
+              visibility: 'admin',
+            },
+          ]
+        : []),
     ])
     // An automatic path can never leave an account disabled without admin provenance.
     await assert.rejects(
@@ -647,6 +663,60 @@ describe('Orchestrator Carbon staged pricing (OCV5-769)', () => {
       cache_write: '0',
       multiplier: '1.000',
     }])
+  })
+})
+
+describe('Gemini 4 Neon & Orchestrator Neon staged pricing (OCV5-803)', () => {
+  test('Gemini 4 Neon seeds staged with explicit high effort, admin visibility, and commercial 600/3000/15/0 rates', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const r = await query(`SELECT c.state,c.upstream_model_id,c.context_window,p.enabled,p.visibility,p.default_effort,
+      p.input_per_mtok::text AS input,p.output_per_mtok::text AS output,p.cache_read_per_mtok::text AS cached,
+      p.cache_write_per_mtok::text AS cache_write,p.multiplier::text AS multiplier
+      FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-gemini-4-neon'`)
+    assert.deepEqual(
+      r.rows,
+      selfhost
+        ? [{
+            state: 'staged',
+            upstream_model_id: 'gemini-4-neon-high',
+            context_window: 1048576,
+            enabled: false,
+            visibility: 'admin',
+            default_effort: 'high',
+            input: '600',
+            output: '3000',
+            cached: '15',
+            cache_write: '0',
+            multiplier: '1.000',
+          }]
+        : [],
+    )
+  })
+
+  test('Orchestrator Neon seeds staged with fixed default, admin visibility, and commercial 600/3000/15/0 rates', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const r = await query(`SELECT c.state,c.upstream_model_id,c.context_window,p.enabled,p.visibility,p.default_effort,
+      p.input_per_mtok::text AS input,p.output_per_mtok::text AS output,p.cache_read_per_mtok::text AS cached,
+      p.cache_write_per_mtok::text AS cache_write,p.multiplier::text AS multiplier
+      FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-orchestrator-neon'`)
+    assert.deepEqual(
+      r.rows,
+      selfhost
+        ? [{
+            state: 'staged',
+            upstream_model_id: 'gemini-pro-orchestrator-neon',
+            context_window: 1048576,
+            enabled: false,
+            visibility: 'admin',
+            default_effort: null,
+            input: '600',
+            output: '3000',
+            cached: '15',
+            cache_write: '0',
+            multiplier: '1.000',
+          }]
+        : [],
+    )
   })
 })
 
