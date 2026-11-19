@@ -1,7 +1,9 @@
 import { randomBytes } from 'node:crypto'
 import {
   accessSync,
+  chmodSync,
   constants,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -11,6 +13,7 @@ import {
   rmSync,
   rmdirSync,
   realpathSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { request as httpRequest } from 'node:http'
@@ -19,6 +22,7 @@ import { spawn } from 'node:child_process'
 import dns from 'node:dns'
 import net from 'node:net'
 import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { SitesError, type SiteDbInspectResponse, type SiteDbQueryResponse } from './types.js'
 
@@ -255,30 +259,103 @@ function findPackageRoot(entryFile: string): string {
   return dirname(realpathSync(entryFile))
 }
 
+let cachedSqliteMounts: Array<{ hostDir: string; containerDir: string }> | undefined
+
+function isWorldTraversablePath(targetPath: string): boolean {
+  let cur: string
+  try {
+    cur = realpathSync(targetPath)
+    const leafSt = statSync(cur)
+    const leafNeed = leafSt.isDirectory() ? 0o005 : 0o004
+    if ((leafSt.mode & leafNeed) !== leafNeed) return false
+  } catch {
+    return false
+  }
+  while (true) {
+    const parent = dirname(cur)
+    if (parent === cur) break
+    cur = parent
+    try {
+      const st = statSync(cur)
+      if ((st.mode & 0o005) !== 0o005) return false
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+function makeTreeWorldReadable(rootDir: string): void {
+  chmodSync(rootDir, 0o755)
+  for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
+    const full = join(rootDir, entry.name)
+    if (entry.isSymbolicLink()) continue
+    if (entry.isDirectory()) {
+      makeTreeWorldReadable(full)
+    } else {
+      const st = statSync(full)
+      const isExec = (st.mode & 0o111) !== 0 || full.endsWith('.node')
+      chmodSync(full, isExec ? 0o755 : 0o644)
+    }
+  }
+}
+
 function resolveSqliteSandboxMounts(): Array<{ hostDir: string; containerDir: string }> {
+  if (cachedSqliteMounts) return cachedSqliteMounts
   const sqliteEntry = resolveBetterSqliteModulePath()
-  if (!sqliteEntry) return []
+  if (!sqliteEntry) {
+    cachedSqliteMounts = []
+    return cachedSqliteMounts
+  }
   const reqSqlite = createRequire(sqliteEntry)
   const sqliteRoot = findPackageRoot(sqliteEntry)
-  const mounts: Array<{ hostDir: string; containerDir: string }> = [
-    { hostDir: sqliteRoot, containerDir: '/sandbox/node_modules/better-sqlite3' },
+  const rawMounts: Array<{ pkgName: string; hostDir: string; containerDir: string }> = [
+    { pkgName: 'better-sqlite3', hostDir: sqliteRoot, containerDir: '/sandbox/node_modules/better-sqlite3' },
   ]
   try {
     const bindingsEntry = reqSqlite.resolve('bindings')
-    mounts.push({
+    rawMounts.push({
+      pkgName: 'bindings',
       hostDir: findPackageRoot(bindingsEntry),
       containerDir: '/sandbox/node_modules/bindings',
     })
     const reqBindings = createRequire(bindingsEntry)
     const fileUriEntry = reqBindings.resolve('file-uri-to-path')
-    mounts.push({
+    rawMounts.push({
+      pkgName: 'file-uri-to-path',
       hostDir: findPackageRoot(fileUriEntry),
       containerDir: '/sandbox/node_modules/file-uri-to-path',
     })
   } catch {
     /* ignore if optional helper resolution differs */
   }
-  return mounts
+
+  if (rawMounts.every((m) => isWorldTraversablePath(m.hostDir))) {
+    cachedSqliteMounts = rawMounts.map(({ hostDir, containerDir }) => ({ hostDir, containerDir }))
+    return cachedSqliteMounts
+  }
+
+  // When running under an un-traversable parent dir (e.g. CI runner /home/runner 0750 under sudo -> nobody 65534),
+  // stage a world-readable copy in tmpdir so bwrap --uid 65534 can bind-mount better-sqlite3 cleanly.
+  const stageRoot = join(tmpdir(), `oc-sites-sqlite-rt-${process.pid}-${randomBytes(4).toString('hex')}`)
+  mkdirSync(stageRoot, { recursive: true, mode: 0o755 })
+  chmodSync(stageRoot, 0o755)
+  const staged: Array<{ hostDir: string; containerDir: string }> = []
+  for (const m of rawMounts) {
+    const dst = join(stageRoot, m.pkgName)
+    cpSync(realpathSync(m.hostDir), dst, { recursive: true })
+    makeTreeWorldReadable(dst)
+    staged.push({ hostDir: dst, containerDir: m.containerDir })
+  }
+  process.once('exit', () => {
+    try {
+      rmSync(stageRoot, { recursive: true, force: true })
+    } catch {
+      /* ignore exit cleanup errors */
+    }
+  })
+  cachedSqliteMounts = staged
+  return cachedSqliteMounts
 }
 
 export function cleanupSiteDataExtras(siteDataDir: string): void {

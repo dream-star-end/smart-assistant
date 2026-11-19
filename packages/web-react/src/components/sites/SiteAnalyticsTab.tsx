@@ -162,15 +162,21 @@ export function SiteAnalyticsTab({
           </div>
           <div className="flex flex-wrap items-center gap-4 text-caption text-muted">
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-[#3b82f6]" />
+              <svg width="8" height="8" aria-hidden="true" className="shrink-0">
+                <circle cx="4" cy="4" r="4" fill="var(--info)" />
+              </svg>
               独立访客{activePoint ? ` ${activePoint.uniqueVisitors}` : ""}
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-[#8b5cf6]" />
+              <svg width="8" height="8" aria-hidden="true" className="shrink-0">
+                <circle cx="4" cy="4" r="4" fill="var(--accent)" />
+              </svg>
               请求数{activePoint ? ` ${activePoint.requests}` : ""}
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-[#f97316]" />
+              <svg width="8" height="8" aria-hidden="true" className="shrink-0">
+                <circle cx="4" cy="4" r="4" fill="var(--warning)" />
+              </svg>
               页面浏览量{activePoint ? ` ${activePoint.pageViews}` : ""}
             </span>
             {activePoint && (
@@ -220,7 +226,7 @@ export function SiteAnalyticsTab({
                 <path
                   d={chart.requestsPath}
                   fill="none"
-                  stroke="#8b5cf6"
+                  stroke="var(--accent)"
                   strokeWidth={2}
                   strokeLinejoin="round"
                   strokeLinecap="round"
@@ -228,7 +234,7 @@ export function SiteAnalyticsTab({
                 <path
                   d={chart.pageViewsPath}
                   fill="none"
-                  stroke="#f97316"
+                  stroke="var(--warning)"
                   strokeWidth={2}
                   strokeLinejoin="round"
                   strokeLinecap="round"
@@ -236,7 +242,7 @@ export function SiteAnalyticsTab({
                 <path
                   d={chart.visitorsPath}
                   fill="none"
-                  stroke="#3b82f6"
+                  stroke="var(--info)"
                   strokeWidth={2}
                   strokeLinejoin="round"
                   strokeLinecap="round"

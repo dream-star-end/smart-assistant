@@ -210,7 +210,7 @@ export function SitesWorkspaceView({
         />
       ) : (
         <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-8 sm:py-8">
-          <h1 className="text-2xl font-semibold text-fg sm:text-[28px]">站点</h1>
+          <h1 className="text-2xl font-semibold text-fg sm:text-3xl">站点</h1>
 
           <div className="flex flex-wrap items-center gap-3">
             <label className="relative min-w-[200px] flex-1">
@@ -415,7 +415,7 @@ export function SitesWorkspaceView({
                       <div className="flex items-center gap-2">
                         <p className="truncate text-body font-medium text-fg">{site.title}</p>
                         {site.customDomain && (
-                          <span className="hidden truncate rounded bg-bg-subtle px-1.5 py-0.5 font-mono text-[11px] text-muted sm:inline">
+                          <span className="hidden truncate rounded bg-bg-subtle px-1.5 py-0.5 font-mono text-micro text-muted sm:inline">
                             {site.customDomain}
                           </span>
                         )}

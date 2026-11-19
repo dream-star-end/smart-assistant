@@ -228,7 +228,7 @@ describe('oc_bash', () => {
       'const chunk = "🚀中文".repeat(2000);',
       'for (let i = 0; i < 20; i++) process.stdout.write(chunk);',
       'process.stdout.write("\\nFINAL_FAILURE_SUMMARY_MARKER\\n");',
-      'process.exit(1);',
+      'process.exitCode = 1;',
     ].join('')
     const result = await handleOcBash({
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,

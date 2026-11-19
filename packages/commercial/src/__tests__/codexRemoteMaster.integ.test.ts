@@ -36,8 +36,19 @@ const expectedSuffix = [
         '0344_drop_delegate_antigravity_budget_trigger',
         '0345_user_sites',
         '0346_selfhost_gpt62_sol_astra_retire_legacy',
+        ...(existsSync(new URL('../db/migrations/0347_user_sites_fullstack.sql', import.meta.url))
+          ? ['0347_user_sites_fullstack']
+          : []),
+        ...(existsSync(new URL('../db/migrations/0348_antigravity_gemini_4_neon.sql', import.meta.url))
+          ? ['0348_antigravity_gemini_4_neon']
+          : []),
       ]
-    : ['0340_commercial_sync_compat', '0341_commercial_antigravity_gemini_4_models']),
+    : [
+        '0340_commercial_sync_compat',
+        '0341_commercial_antigravity_gemini_4_models',
+        '0342_commercial_user_sites',
+        '0343_commercial_gpt62_sol_astra_models',
+      ]),
 ].sort()
 const url = process.env.TEST_DATABASE_URL
 assert.ok(url && new URL(url).pathname.endsWith('_test'), 'explicit isolated TEST_DATABASE_URL required')
