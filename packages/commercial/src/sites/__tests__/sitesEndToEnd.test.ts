@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { after, before, describe, test } from 'node:test'
@@ -23,11 +23,15 @@ import type {
   PublishReservation,
   PublishReservationInput,
   SitesRepo,
+  StoredSiteCollaboratorRow,
   StoredSiteEnvVarRow,
+  StoredSiteInviteRow,
 } from '../repo.js'
 import { SitesService } from '../service.js'
 import {
   SitesError,
+  type SiteAccessRole,
+  type SiteCollaboratorRole,
   type SiteVisibility,
   type UserSiteRow,
   customDomainTxtValueFor,
@@ -51,6 +55,17 @@ function createInMemorySitesRepo(): SitesRepo & {
   const leases = new Map<string, { leaseId: string; leaseUntil: number; expectedRev: number }>()
   const targetRevs = new Map<string, number>()
   const envStore = new Map<string, Map<string, StoredSiteEnvVarRow>>()
+  const collabStore = new Map<string, Map<number, StoredSiteCollaboratorRow>>()
+  const inviteStore = new Map<string, { row: StoredSiteInviteRow; tokenHash: string }>()
+  const usersById = new Map<
+    number,
+    { id: number; email: string; displayName: string; emailVerified: boolean }
+  >([
+    [1, { id: 1, email: 'owner@example.com', displayName: 'Owner One', emailVerified: true }],
+    [2, { id: 2, email: 'editor@example.com', displayName: 'Editor Two', emailVerified: true }],
+    [3, { id: 3, email: 'viewer@example.com', displayName: 'Viewer Three', emailVerified: true }],
+    [4, { id: 4, email: 'unverified@example.com', displayName: 'Unverified Four', emailVerified: false }],
+  ])
   let revCounter = 0
   let idSeq = 0
   const LEASE_TTL_MS = 60_000
@@ -60,6 +75,20 @@ function createInMemorySitesRepo(): SitesRepo & {
     return Boolean(l && l.leaseUntil > Date.now())
   }
 
+  function decorateRow(row: UserSiteRow, actorUserId: number): UserSiteRow {
+    const owner = usersById.get(row.userId)
+    const collabs = collabStore.get(row.id)
+    const role: SiteAccessRole =
+      row.userId === actorUserId ? 'owner' : (collabs?.get(actorUserId)?.role ?? 'owner')
+    return {
+      ...row,
+      accessRole: role,
+      ownerEmail: owner?.email ?? null,
+      ownerDisplayName: owner?.displayName ?? null,
+      collaboratorCount: collabs?.size ?? 0,
+    }
+  }
+
   return {
     expireLease(slug: string) {
       const row = bySlug.get(slug)
@@ -67,13 +96,15 @@ function createInMemorySitesRepo(): SitesRepo & {
     },
     async listByUser(userId) {
       return [...bySlug.values()]
-        .filter((r) => r.userId === userId && r.edgeRevision > 0)
+        .filter((r) => r.edgeRevision > 0 && (r.userId === userId || Boolean(collabStore.get(r.id)?.has(userId))))
+        .map((r) => decorateRow(r, userId))
         .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
     },
     async getByUserAndSlug(userId, slug) {
       const row = bySlug.get(slug)
-      if (!row || row.userId !== userId || row.edgeRevision <= 0) return null
-      return row
+      if (!row || row.edgeRevision <= 0) return null
+      if (row.userId !== userId && !collabStore.get(row.id)?.has(userId)) return null
+      return decorateRow(row, userId)
     },
     async listUnleasedPendingByUser(userId) {
       const now = Date.now()
@@ -81,10 +112,14 @@ function createInMemorySitesRepo(): SitesRepo & {
         .filter((r) => {
           const lease = leases.get(r.id)
           const pendingRev = targetRevs.get(r.id) ?? 0
+          const hasAccess = r.userId === userId || Boolean(collabStore.get(r.id)?.has(userId))
           return (
-            r.userId === userId &&
+            hasAccess &&
             (!lease || lease.leaseUntil <= now) &&
-            (r.edgeRevision === 0 || pendingRev > r.edgeRevision || Boolean(r.opKind))
+            (r.edgeRevision === 0 ||
+              pendingRev > r.edgeRevision ||
+              Boolean(r.opKind) ||
+              (r.previewAclTargetVersion ?? 1) > (r.previewAclVersion ?? 1))
           )
         })
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
@@ -94,7 +129,14 @@ function createInMemorySitesRepo(): SitesRepo & {
       if (!cur) return null
       if (isLeaseActive(cur.id)) return null
       const pendingRev = targetRevs.get(cur.id) ?? 0
-      if (cur.edgeRevision > 0 && pendingRev <= cur.edgeRevision && !cur.opKind) return null
+      if (
+        cur.edgeRevision > 0 &&
+        pendingRev <= cur.edgeRevision &&
+        !cur.opKind &&
+        (cur.previewAclTargetVersion ?? 1) <= (cur.previewAclVersion ?? 1)
+      ) {
+        return null
+      }
       const leaseId = randomUUID()
       leases.set(cur.id, {
         leaseId,
@@ -122,6 +164,18 @@ function createInMemorySitesRepo(): SitesRepo & {
             ? Boolean(input.customDomain && input.customDomainVerified)
             : cur.customDomainVerified,
         hasServerApi: input.hasServerApi,
+        serverApiSha256: !input.hasServerApi
+          ? ''
+          : cur.opKind === 'publish' && cur.opServerApiSha256 != null
+            ? cur.opServerApiSha256
+            : (cur.serverApiSha256 ?? ''),
+        opServerApiSha256: null,
+        previewAclVersion: Math.max(cur.previewAclVersion ?? 1, input.previewAclVersion ?? 1),
+        previewAclTargetVersion: Math.max(
+          cur.previewAclTargetVersion ?? 1,
+          cur.previewAclVersion ?? 1,
+          input.previewAclVersion ?? 1,
+        ),
         envDigest: input.envDigest ?? cur.envDigest,
         opKind: null,
         opRenameToSlug: null,
@@ -150,9 +204,22 @@ function createInMemorySitesRepo(): SitesRepo & {
       const existing = bySlug.get(input.slug)
       const leaseId = randomUUID()
       const leaseUntil = Date.now() + LEASE_TTL_MS
+      const hasExpectedBase = Boolean(
+        input.expectedSiteId ||
+          input.expectedBaseRevision !== undefined ||
+          input.expectedBaseContentSha256,
+      )
       if (existing) {
+        let accessRole: SiteAccessRole = 'owner'
         if (existing.userId !== input.userId) {
-          throw new SitesError('SLUG_TAKEN', `子域名 "${input.slug}" 已被占用`, 409)
+          const collab = collabStore.get(existing.id)?.get(input.userId)
+          if (!collab || existing.edgeRevision <= 0) {
+            throw new SitesError('SLUG_TAKEN', `子域名 "${input.slug}" 已被占用`, 409)
+          }
+          if (collab.role !== 'editor') {
+            throw new SitesError('FORBIDDEN', '你对该站点只有只读权限，无法发布更新', 403)
+          }
+          accessRole = 'editor'
         }
         if (isLeaseActive(existing.id)) {
           throw new SitesError(
@@ -162,19 +229,66 @@ function createInMemorySitesRepo(): SitesRepo & {
             true,
           )
         }
+        if (input.expectedSiteId && existing.id !== input.expectedSiteId) {
+          throw new SitesError('STALE_REVISION', '子域名已指向其他站点，拒绝覆盖', 409)
+        }
+        if (accessRole === 'editor' && (input.hasServerApi || existing.hasServerApi)) {
+          const approvedSha = existing.serverApiSha256 ?? ''
+          const incomingSha = input.hasServerApi ? (input.serverApiSha256 ?? '') : ''
+          if (!existing.hasServerApi || !approvedSha || incomingSha !== approvedSha) {
+            throw new SitesError(
+              'FORBIDDEN',
+              '仅站点所有者可新增、修改或移除服务端 /api/* 代码',
+              403,
+            )
+          }
+        }
+        if (existing.edgeRevision > 0) {
+          if (
+            accessRole === 'editor' &&
+            input.expectedBaseRevision === undefined &&
+            !input.expectedBaseContentSha256
+          ) {
+            throw new SitesError('STALE_REVISION', '协同发布必须提供拉取基线版本', 409)
+          }
+          if (
+            input.expectedBaseRevision !== undefined &&
+            existing.edgeRevision !== input.expectedBaseRevision
+          ) {
+            throw new SitesError('STALE_REVISION', '远端站点已更新，请先拉取合并后再发布', 409)
+          }
+          if (
+            input.expectedBaseContentSha256 &&
+            existing.contentSha256 !== input.expectedBaseContentSha256
+          ) {
+            throw new SitesError('STALE_REVISION', '远端站点内容已变化，请先拉取合并后再发布', 409)
+          }
+        }
         revCounter += 1
-        bySlug.set(input.slug, { ...existing, opKind: 'publish', opRenameToSlug: null, opEnvDigest: null })
+        bySlug.set(input.slug, {
+          ...existing,
+          opKind: 'publish',
+          opRenameToSlug: null,
+          opEnvDigest: null,
+          opServerApiSha256:
+            accessRole === 'owner' ? (input.hasServerApi ? (input.serverApiSha256 ?? '') : '') : null,
+        })
         claims.set(input.slug, { siteId: existing.id, claimKind: 'active' })
         leases.set(existing.id, { leaseId, leaseUntil, expectedRev: existing.edgeRevision })
         targetRevs.set(existing.id, revCounter)
         return {
           siteId: existing.id,
+          ownerUserId: existing.userId,
+          accessRole,
           leaseId,
           isNewPlaceholder: existing.edgeRevision === 0,
           edgeRevision: revCounter,
           baseRevision: existing.edgeRevision,
-          existing: existing.edgeRevision > 0 ? existing : null,
+          existing: existing.edgeRevision > 0 ? decorateRow(existing, input.userId) : null,
         }
+      }
+      if (hasExpectedBase) {
+        throw new SitesError('STALE_REVISION', '基线站点已不存在或已被重命名，拒绝自动新建站点', 409)
       }
       const count = [...bySlug.values()].filter((r) => r.userId === input.userId).length
       if (count >= input.maxPerUser) {
@@ -197,6 +311,10 @@ function createInMemorySitesRepo(): SitesRepo & {
         customDomainToken: null,
         originSessionId: input.originSessionId ?? null,
         hasServerApi: input.hasServerApi,
+        serverApiSha256: input.serverApiSha256 ?? '',
+        opServerApiSha256: input.hasServerApi ? (input.serverApiSha256 ?? '') : '',
+        previewAclVersion: 1,
+        previewAclTargetVersion: 1,
         envDigest: '',
         opKind: 'publish',
         opRenameToSlug: null,
@@ -215,6 +333,8 @@ function createInMemorySitesRepo(): SitesRepo & {
       targetRevs.set(row.id, revCounter)
       return {
         siteId: row.id,
+        ownerUserId: input.userId,
+        accessRole: 'owner',
         leaseId,
         isNewPlaceholder: true,
         edgeRevision: revCounter,
@@ -236,6 +356,15 @@ function createInMemorySitesRepo(): SitesRepo & {
           spaMode: input.spaMode,
           originSessionId: input.originSessionId ?? cur.originSessionId,
           hasServerApi: input.hasServerApi,
+          serverApiSha256:
+            input.serverApiSha256 !== undefined ? input.serverApiSha256 : (cur.serverApiSha256 ?? ''),
+          opServerApiSha256: null,
+          previewAclVersion: Math.max(cur.previewAclVersion ?? 1, input.previewAclVersion ?? 1),
+          previewAclTargetVersion: Math.max(
+            cur.previewAclTargetVersion ?? 1,
+            cur.previewAclVersion ?? 1,
+            input.previewAclVersion ?? 1,
+          ),
           envDigest: input.envDigest ?? cur.envDigest,
           opKind: input.markEnvPending ? 'env' : null,
           opRenameToSlug: null,
@@ -290,10 +419,20 @@ function createInMemorySitesRepo(): SitesRepo & {
       opKind = 'meta',
       pendingEnvDigest = null,
       checkDomain = null,
+      allowEditor = false,
     ): Promise<MetaUpdateReservation> {
       const row = bySlug.get(slug)
-      if (!row || row.userId !== userId || row.edgeRevision <= 0) {
+      if (!row || row.edgeRevision <= 0) {
         throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+      }
+      const collab = collabStore.get(row.id)?.get(userId)
+      const role: SiteAccessRole | null =
+        row.userId === userId ? 'owner' : (collab?.role ?? null)
+      if (!role) {
+        throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+      }
+      if (role !== 'owner' && !(allowEditor && role === 'editor')) {
+        throw new SitesError('FORBIDDEN', '仅站点所有者或具编辑权限的协作者可执行此操作', 403)
       }
       if (isLeaseActive(row.id)) {
         throw new SitesError('SLUG_BUSY', `站点 "${slug}" 正在处理另一项变更`, 409, true)
@@ -307,7 +446,12 @@ function createInMemorySitesRepo(): SitesRepo & {
       }
       revCounter += 1
       const leaseId = randomUUID()
-      const marked: UserSiteRow = { ...row, opKind, opRenameToSlug: null, opEnvDigest: pendingEnvDigest }
+      const marked: UserSiteRow = {
+        ...decorateRow(row, userId),
+        opKind,
+        opRenameToSlug: null,
+        opEnvDigest: pendingEnvDigest,
+      }
       bySlug.set(slug, marked)
       leases.set(row.id, { leaseId, leaseUntil: Date.now() + LEASE_TTL_MS, expectedRev: row.edgeRevision })
       targetRevs.set(row.id, revCounter)
@@ -339,6 +483,14 @@ function createInMemorySitesRepo(): SitesRepo & {
           customDomainVerified: input.customDomainVerified,
           customDomainToken: input.customDomainToken,
           envDigest: input.envDigest ?? cur.envDigest,
+          previewAclVersion:
+            input.previewAclVersion !== undefined
+              ? Math.max(cur.previewAclVersion ?? 1, input.previewAclVersion)
+              : (cur.previewAclVersion ?? 1),
+          previewAclTargetVersion:
+            input.previewAclVersion !== undefined
+              ? Math.max(cur.previewAclTargetVersion ?? 1, cur.previewAclVersion ?? 1, input.previewAclVersion)
+              : (cur.previewAclTargetVersion ?? 1),
           opKind: null,
           opRenameToSlug: null,
           opEnvDigest: null,
@@ -482,6 +634,188 @@ function createInMemorySitesRepo(): SitesRepo & {
       const site = [...bySlug.values()].find((r) => r.id === siteId && r.userId === userId)
       if (!site) return false
       return envStore.get(siteId)?.delete(key) ?? false
+    },
+    async listCollaborators(siteId) {
+      return [...(collabStore.get(siteId)?.values() ?? [])]
+    },
+    async upsertCollaboratorByEmail(input) {
+      const site = [...bySlug.values()].find(
+        (r) => r.id === input.siteId && r.userId === input.ownerUserId && r.edgeRevision > 0,
+      )
+      if (!site) throw new SitesError('SITE_NOT_FOUND', '未找到对应站点', 404)
+      const target = [...usersById.values()].find(
+        (u) => u.email.toLowerCase() === input.email.toLowerCase(),
+      )
+      if (!target) throw new SitesError('USER_NOT_FOUND', `未找到注册邮箱为 ${input.email} 的站内用户`, 404)
+      if (!target.emailVerified) {
+        throw new SitesError('INVALID_INPUT', '该账号尚未完成邮箱验证，无法按邮箱直接授权', 400)
+      }
+      if (target.id === input.ownerUserId) {
+        throw new SitesError('INVALID_INPUT', '不能将站点所有者自己添加为协作者', 400)
+      }
+      let map = collabStore.get(input.siteId)
+      if (!map) {
+        map = new Map()
+        collabStore.set(input.siteId, map)
+      }
+      if (!map.has(target.id) && map.size >= input.maxCollaborators) {
+        throw new SitesError('QUOTA_EXCEEDED', '协作者人数已达上限', 429)
+      }
+      const now = new Date()
+      const existing = map.get(target.id)
+      const saved: StoredSiteCollaboratorRow = {
+        siteId: input.siteId,
+        userId: target.id,
+        email: target.email,
+        displayName: target.displayName,
+        role: input.role,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      }
+      map.set(target.id, saved)
+      if (existing?.role === 'editor' && input.role === 'viewer') {
+        const nextTarget = Math.max(site.previewAclTargetVersion ?? 1, site.previewAclVersion ?? 1) + 1
+        bySlug.set(site.slug, { ...site, previewAclTargetVersion: nextTarget })
+      }
+      return saved
+    },
+    async updateCollaboratorRole(input) {
+      const site = [...bySlug.values()].find((r) => r.id === input.siteId && r.userId === input.ownerUserId)
+      const map = collabStore.get(input.siteId)
+      const cur = map?.get(input.targetUserId)
+      if (!cur) throw new SitesError('USER_NOT_FOUND', '未找到该协作者', 404)
+      const updated = { ...cur, role: input.role, updatedAt: new Date() }
+      map!.set(input.targetUserId, updated)
+      if (site && cur.role === 'editor' && input.role === 'viewer') {
+        const nextTarget = Math.max(site.previewAclTargetVersion ?? 1, site.previewAclVersion ?? 1) + 1
+        bySlug.set(site.slug, { ...site, previewAclTargetVersion: nextTarget })
+      }
+      return updated
+    },
+    async removeCollaborator(input) {
+      const removed = collabStore.get(input.siteId)?.delete(input.targetUserId) ?? false
+      if (removed) {
+        const site = [...bySlug.values()].find((r) => r.id === input.siteId && r.userId === input.ownerUserId)
+        if (site) {
+          const nextTarget = Math.max(site.previewAclTargetVersion ?? 1, site.previewAclVersion ?? 1) + 1
+          bySlug.set(site.slug, { ...site, previewAclTargetVersion: nextTarget })
+        }
+      }
+      return removed
+    },
+    async leaveSiteCollaborator(siteId, actorUserId) {
+      const left = collabStore.get(siteId)?.delete(actorUserId) ?? false
+      if (left) {
+        const site = [...bySlug.values()].find((r) => r.id === siteId)
+        if (site) {
+          const nextTarget = Math.max(site.previewAclTargetVersion ?? 1, site.previewAclVersion ?? 1) + 1
+          bySlug.set(site.slug, { ...site, previewAclTargetVersion: nextTarget })
+        }
+      }
+      return left
+    },
+    async listActiveInvites(siteId, ownerUserId) {
+      const site = [...bySlug.values()].find((r) => r.id === siteId && r.userId === ownerUserId)
+      if (!site) return []
+      const now = Date.now()
+      return [...inviteStore.values()]
+        .map((x) => x.row)
+        .filter(
+          (i) =>
+            i.siteId === siteId &&
+            !i.revokedAt &&
+            (!i.expiresAt || i.expiresAt.getTime() > now) &&
+            (i.maxUses === null || i.useCount < i.maxUses),
+        )
+    },
+    async createInvite(input) {
+      const row: StoredSiteInviteRow = {
+        id: randomUUID(),
+        siteId: input.siteId,
+        role: input.role,
+        maxUses: input.maxUses,
+        useCount: 0,
+        expiresAt: input.expiresAt,
+        revokedAt: null,
+        createdAt: new Date(),
+      }
+      inviteStore.set(row.id, { row, tokenHash: input.tokenHash })
+      return row
+    },
+    async revokeInvite(input) {
+      const entry = inviteStore.get(input.inviteId)
+      if (!entry || entry.row.siteId !== input.siteId || entry.row.revokedAt) return false
+      entry.row = { ...entry.row, revokedAt: new Date() }
+      return true
+    },
+    async lookupInviteByTokenHash(tokenHash, actorUserId) {
+      const entry = [...inviteStore.values()].find((x) => x.tokenHash === tokenHash)
+      if (!entry) return null
+      const inv = entry.row
+      if (inv.revokedAt) return null
+      if (inv.expiresAt && inv.expiresAt.getTime() <= Date.now()) return null
+      if (inv.maxUses !== null && inv.useCount >= inv.maxUses) return null
+      const site = [...bySlug.values()].find((r) => r.id === inv.siteId && r.edgeRevision > 0)
+      if (!site) return null
+      const owner = usersById.get(site.userId)
+      const alreadyRole: SiteAccessRole | null =
+        site.userId === actorUserId
+          ? 'owner'
+          : (collabStore.get(site.id)?.get(actorUserId)?.role ?? null)
+      return {
+        invite: inv,
+        site: decorateRow(site, actorUserId),
+        ownerEmail: owner?.email ?? null,
+        ownerDisplayName: owner?.displayName ?? null,
+        alreadyRole,
+      }
+    },
+    async acceptInviteByTokenHash(tokenHash, actorUserId, maxCollaborators) {
+      const entry = [...inviteStore.values()].find((x) => x.tokenHash === tokenHash)
+      if (!entry || entry.row.revokedAt) {
+        throw new SitesError('INVITE_INVALID', '邀请链接无效或已被撤销', 404)
+      }
+      const inv = entry.row
+      if (inv.expiresAt && inv.expiresAt.getTime() <= Date.now()) {
+        throw new SitesError('INVITE_INVALID', '邀请链接已过期', 410)
+      }
+      if (inv.maxUses !== null && inv.useCount >= inv.maxUses) {
+        throw new SitesError('INVITE_INVALID', '邀请链接使用次数已达上限', 410)
+      }
+      const site = [...bySlug.values()].find((r) => r.id === inv.siteId && r.edgeRevision > 0)
+      if (!site) throw new SitesError('SITE_NOT_FOUND', '对应站点已不存在', 404)
+      if (site.userId === actorUserId) {
+        return { site: decorateRow(site, actorUserId), role: 'owner' as SiteAccessRole, alreadyMember: true }
+      }
+      let map = collabStore.get(site.id)
+      if (!map) {
+        map = new Map()
+        collabStore.set(site.id, map)
+      }
+      const existing = map.get(actorUserId)
+      if (existing && (existing.role === 'editor' || (existing.role === 'viewer' && inv.role === 'viewer'))) {
+        return { site: decorateRow(site, actorUserId), role: existing.role, alreadyMember: true }
+      }
+      if (!existing && map.size >= maxCollaborators) {
+        throw new SitesError('QUOTA_EXCEEDED', '协作者人数已达上限', 429)
+      }
+      const u = usersById.get(actorUserId) ?? {
+        id: actorUserId,
+        email: `u${actorUserId}@example.com`,
+        displayName: `User ${actorUserId}`,
+      }
+      const now = new Date()
+      map.set(actorUserId, {
+        siteId: site.id,
+        userId: actorUserId,
+        email: u.email,
+        displayName: u.displayName,
+        role: inv.role as SiteCollaboratorRole,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      })
+      entry.row = { ...inv, useCount: inv.useCount + 1 }
+      return { site: decorateRow(site, actorUserId), role: inv.role, alreadyMember: false }
     },
   }
 }
@@ -2399,5 +2733,613 @@ export default async function handler(req, ctx) {
     })
     assert.equal(afterSync.status, 200)
     assert.deepEqual(JSON.parse(afterSync.text), { hasRevoked: false, hasSync: true })
+  })
+
+  test('collaborative sharing (email + invite links + permissions + oc-site pull/publish) & live-edit preview bridge', async () => {
+    const collabDir = mkdtempSync(join(tmpdir(), 'oc-sites-collab-e2e-'))
+    const edgeDataDir = join(collabDir, 'edge-data')
+    const edgeSrv = createSitesEdgeServer({
+      bind: '127.0.0.1',
+      port: 0,
+      dataRoot: edgeDataDir,
+      baseDomain: 'congjianai.com',
+      secret: EDGE_SECRET,
+      maxSiteBytes: 2 * 1024 * 1024,
+      allowPrivateFetchForTest: true,
+    })
+    const { port: cEdgePort } = await edgeSrv.listen()
+    const cEdgeClient = createHttpSitesEdgeClient({
+      baseUrl: `http://127.0.0.1:${cEdgePort}`,
+      secret: EDGE_SECRET,
+    })
+    const cRepo = createInMemorySitesRepo()
+    const cService = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      maxSiteBytes: 2 * 1024 * 1024,
+      edgeSecret: EDGE_SECRET,
+      repo: cRepo,
+      edge: cEdgeClient,
+      resolveTxt: async () => [],
+    })
+
+    const sec1 = 'a1'.repeat(32)
+    const sec2 = 'b2'.repeat(32)
+    const sec3 = 'c3'.repeat(32)
+    const tok1 = `oc-v3.101.${sec1}`
+    const tok2 = `oc-v3.202.${sec2}`
+    const tok3 = `oc-v3.303.${sec3}`
+    const h1 = hashSecret(sec1)
+    const h2 = hashSecret(sec2)
+    const h3 = hashSecret(sec3)
+    const idRepo: ContainerIdentityRepo = {
+      async findActiveByHostAndBoundIp(hostUuid: string, boundIp: string) {
+        if (boundIp === '10.0.0.1') {
+          return { id: 101, user_id: 1, host_uuid: hostUuid, bound_ip: boundIp, secret_hash: h1 }
+        }
+        if (boundIp === '10.0.0.2') {
+          return { id: 202, user_id: 2, host_uuid: hostUuid, bound_ip: boundIp, secret_hash: h2 }
+        }
+        if (boundIp === '10.0.0.3') {
+          return { id: 303, user_id: 3, host_uuid: hostUuid, bound_ip: boundIp, secret_hash: h3 }
+        }
+        return null
+      },
+    }
+    const internalHandler = makeSitesInternalHandler({ identityRepo: idRepo, sites: cService })
+    const masterSrv = createServer((req: IncomingMessage, res: ServerResponse) => {
+      void (async () => {
+        const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+        if (pathname.startsWith('/internal/v3/sites/')) {
+          const auth = req.headers.authorization ?? ''
+          const hostUuid = auth.includes(tok1) ? 'h1' : auth.includes(tok2) ? 'h2' : 'h3'
+          const boundIp = hostUuid === 'h1' ? '10.0.0.1' : hostUuid === 'h2' ? '10.0.0.2' : '10.0.0.3'
+          await internalHandler(req, res, { hostUuid, boundIp })
+          return
+        }
+        if (
+          pathname === '/api/sites' ||
+          pathname.startsWith('/api/sites/') ||
+          pathname.startsWith('/api/site-invites/')
+        ) {
+          await dispatchSitesBrowserRoute(
+            req,
+            res,
+            { requestId: 'req-collab', ip: '127.0.0.1' } as unknown as RequestContext,
+            {
+              jwtSecret: JWT_SECRET,
+              sites: cService,
+              verifyEmailUrlBase: 'https://app.congjianai.com',
+            },
+          )
+          return
+        }
+        res.statusCode = 404
+        res.end('not found')
+      })().catch((err: unknown) => {
+        const e = err as { status?: number; code?: string; message?: string }
+        res.statusCode = e.status ?? 500
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ error: { code: e.code ?? 'INTERNAL', message: e.message ?? 'err' } }))
+      })
+    })
+    await new Promise<void>((r) => masterSrv.listen(0, '127.0.0.1', () => r()))
+    const mPort = (masterSrv.address() as { port: number }).port
+
+    const runCli = (token: string, args: string[], extraEnv?: Record<string, string>) =>
+      new Promise<{ code: number; stdout: string; stderr: string }>((resolvePromise) => {
+        const child = spawn('python3', [OC_SITE_PY, ...args], {
+          env: {
+            ...process.env,
+            OPENCLAUDE_V3_MASTER_BASE_URL: `http://127.0.0.1:${mPort}`,
+            OPENCLAUDE_V3_CONTAINER_TOKEN: token,
+            ...(extraEnv ?? {}),
+          },
+        })
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => (stdout += String(d)))
+        child.stderr.on('data', (d) => (stderr += String(d)))
+        child.on('close', (code) => resolvePromise({ code: code ?? 1, stdout, stderr }))
+      })
+
+    try {
+      const jwt1 = (await signAccess({ sub: '1', role: 'user' }, JWT_SECRET)).token
+      const jwt2 = (await signAccess({ sub: '2', role: 'user' }, JWT_SECRET)).token
+      const jwt3 = (await signAccess({ sub: '3', role: 'user' }, JWT_SECRET)).token
+
+      // 1) Owner (uid 1) publishes a fullstack password-protected site + secret env var + pending custom domain
+      const srcDir = join(collabDir, 'src-v1')
+      mkdirSync(join(srcDir, 'server'), { recursive: true })
+      writeFileSync(join(srcDir, 'index.html'), '<!doctype html><html><body><h1 id="hero">Hello v1</h1></body></html>')
+      writeFileSync(
+        join(srcDir, 'server', 'api.mjs'),
+        `export default async function handler(ctx) {
+  return ctx.json({
+    ver: 'v1',
+    hasKey: Boolean(ctx.env.OWNER_SECRET),
+    cookieHeader: ctx.req.headers.cookie || '',
+  })
+}
+`,
+      )
+      const pub1 = await runCli(
+        tok1,
+        ['publish', srcDir, '--slug', 'team-portal', '--title', 'Team Portal', '--visibility', 'password', '--password', 'pass1234'],
+        { OPENCLAUDE_SESSION_KEY: 'agent:main:webchat:dm:owner-sess' },
+      )
+      assert.equal(pub1.code, 0, pub1.stderr)
+
+      // P1 #8: Existing slug "invites" must still be publishable and accessible without colliding with /api/site-invites/*
+      const invSlugDir = join(collabDir, 'slug-invites')
+      mkdirSync(invSlugDir, { recursive: true })
+      writeFileSync(join(invSlugDir, 'index.html'), '<h1>Legacy invites slug</h1>')
+      const pubInvSlug = await runCli(tok1, ['publish', invSlugDir, '--slug', 'invites', '--title', 'Invites Site'])
+      assert.equal(pubInvSlug.code, 0, pubInvSlug.stderr)
+      const invSlugDetail = await fetch(`http://127.0.0.1:${mPort}/api/sites/invites`, {
+        headers: { Authorization: `Bearer ${jwt1}` },
+      })
+      assert.equal(invSlugDetail.status, 200)
+
+      await cService.updateSite(1, 'team-portal', { customDomain: 'portal.custom.example' })
+
+      const envSetRes = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/env`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'OWNER_SECRET', value: 'top-secret-value', isSecret: true }),
+      })
+      assert.equal(envSetRes.status, 200)
+
+      // P1 #6: Email direct add rejects unverified user accounts
+      const addUnverifiedRes = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'unverified@example.com', role: 'editor' }),
+      })
+      assert.equal(addUnverifiedRes.status, 400)
+
+      // 2) Owner invites User 2 as editor by verified email
+      const addEditorRes = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'editor@example.com', role: 'editor' }),
+      })
+      assert.equal(addEditorRes.status, 200)
+      const addEditorBody = (await addEditorRes.json()) as { collaborators: Array<{ email: string; role: string }> }
+      assert.equal(addEditorBody.collaborators.length, 1)
+      assert.equal(addEditorBody.collaborators[0]?.role, 'editor')
+
+      // 3) Owner creates single-use viewer invite link; User 3 previews & accepts it at /api/site-invites/*; second accept fails
+      const createInvRes = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/invites`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'viewer', expiresInHours: 24, maxUses: 1 }),
+      })
+      assert.equal(createInvRes.status, 200)
+      const createdInv = (await createInvRes.json()) as { token: string; invite: { id: string } }
+      assert.ok(createdInv.token.length >= 20)
+
+      const previewInvRes = await fetch(
+        `http://127.0.0.1:${mPort}/api/site-invites/${encodeURIComponent(createdInv.token)}`,
+        { headers: { Authorization: `Bearer ${jwt3}` } },
+      )
+      assert.equal(previewInvRes.status, 200)
+      const previewInvBody = (await previewInvRes.json()) as { invite: { site: { slug: string }; role: string } }
+      assert.equal(previewInvBody.invite.site.slug, 'team-portal')
+      assert.equal(previewInvBody.invite.role, 'viewer')
+
+      const acceptRes = await fetch(
+        `http://127.0.0.1:${mPort}/api/site-invites/${encodeURIComponent(createdInv.token)}/accept`,
+        { method: 'POST', headers: { Authorization: `Bearer ${jwt3}`, 'Content-Type': 'application/json' }, body: '{}' },
+      )
+      assert.equal(acceptRes.status, 200)
+      const acceptBody = (await acceptRes.json()) as { site: { slug: string; accessRole: string }; alreadyMember: boolean }
+      assert.equal(acceptBody.site.accessRole, 'viewer')
+      assert.equal(acceptBody.alreadyMember, false)
+
+      // Single-use invite is now exhausted for new users
+      const previewExhausted = await fetch(
+        `http://127.0.0.1:${mPort}/api/site-invites/${encodeURIComponent(createdInv.token)}`,
+        { headers: { Authorization: `Bearer ${jwt2}` } },
+      )
+      assert.equal(previewExhausted.status, 404)
+
+      // 4) Permission boundaries + P1 #5 DTO sanitization:
+      // Owner sees originSessionId + customDomainTxtValue; Editor & Viewer receive null!
+      const ownerDetail = await cService.getSite(1, 'team-portal')
+      assert.equal(ownerDetail.originSessionId, 'agent:main:webchat:dm:owner-sess')
+      assert.ok(ownerDetail.customDomainTxtValue)
+
+      const u2Detail = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal`, {
+        headers: { Authorization: `Bearer ${jwt2}` },
+      })
+      assert.equal(u2Detail.status, 200)
+      const u2DetailJson = (await u2Detail.json()) as {
+        site: {
+          accessRole: string
+          originSessionId: string | null
+          customDomainTxtName: string | null
+          customDomainTxtValue: string | null
+        }
+        envVars: unknown[]
+      }
+      assert.equal(u2DetailJson.site.accessRole, 'editor')
+      assert.equal(u2DetailJson.site.originSessionId, null)
+      assert.equal(u2DetailJson.site.customDomainTxtName, null)
+      assert.equal(u2DetailJson.site.customDomainTxtValue, null)
+      assert.deepEqual(u2DetailJson.envVars, [])
+
+      const u2TitlePatch = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Team Portal Edited', spaMode: false }),
+      })
+      assert.equal(u2TitlePatch.status, 200)
+
+      for (const forbiddenReq of [
+        fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ visibility: 'public' }),
+        }),
+        fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/rename`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ newSlug: 'hijacked-slug' }),
+        }),
+        fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/env`, {
+          method: 'PUT',
+          headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: 'X', value: '1', isSecret: false }),
+        }),
+        fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${jwt2}` },
+        }),
+        fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'viewer@example.com', role: 'editor' }),
+        }),
+      ]) {
+        assert.equal((await forbiddenReq).status, 403)
+      }
+
+      // Viewer (uid 3) can view analytics/detail (sanitized), CANNOT update title, pull, publish, or start live-edit preview
+      const u3Ana = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/analytics?days=7`, {
+        headers: { Authorization: `Bearer ${jwt3}` },
+      })
+      assert.equal(u3Ana.status, 200)
+      const u3Preview = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/preview-session`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt3}`, 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      assert.equal(u3Preview.status, 403)
+      const u3Pull = await runCli(tok3, ['pull', 'team-portal', join(collabDir, 'u3-pull')])
+      assert.equal(u3Pull.code, 1)
+
+      // 5) P0 #1 + P1 #7: Collaborative oc-site pull -> optimistic concurrency & server/api.mjs secret protection
+      const pullDir = join(collabDir, 'u2-pull-a')
+      const pullDirStale = join(collabDir, 'u2-pull-b')
+      const pullRes = await runCli(tok2, ['pull', 'team-portal', pullDir])
+      assert.equal(pullRes.code, 0, pullRes.stderr)
+      const pullResB = await runCli(tok2, ['pull', 'team-portal', pullDirStale])
+      assert.equal(pullResB.code, 0, pullResB.stderr)
+      const pullJson = JSON.parse(pullRes.stdout) as {
+        ok: boolean
+        hasServerApi: boolean
+        fileCount: number
+        contentSha256: string
+      }
+      assert.equal(pullJson.ok, true)
+      assert.equal(pullJson.hasServerApi, true)
+      assert.match(pullJson.contentSha256, /^[a-f0-9]{64}$/)
+      assert.ok(readFileSync(join(pullDir, 'index.html'), 'utf8').includes('Hello v1'))
+      assert.ok(readFileSync(join(pullDir, 'server', 'api.mjs'), 'utf8').includes('OWNER_SECRET'))
+
+      // P0 #1: Editor attempting to modify server/api.mjs (e.g. to exfiltrate ctx.env.OWNER_SECRET) MUST be rejected 403!
+      const origApiMjs = readFileSync(join(pullDir, 'server', 'api.mjs'), 'utf8')
+      writeFileSync(
+        join(pullDir, 'server', 'api.mjs'),
+        `export default async function handler(ctx) { return ctx.json({ leaked: ctx.env.OWNER_SECRET }) }\n`,
+      )
+      const pubExfil = await runCli(tok2, ['publish', pullDir, '--slug', 'team-portal'])
+      assert.equal(pubExfil.code, 1)
+      assert.ok(pubExfil.stderr.includes('FORBIDDEN'), pubExfil.stderr)
+
+      // Restore owner-approved server/api.mjs and modify ONLY index.html -> editor publish SUCCEEDS!
+      writeFileSync(join(pullDir, 'server', 'api.mjs'), origApiMjs)
+      writeFileSync(join(pullDir, 'index.html'), '<!doctype html><html><body><h1 id="hero">Hello v2 by editor</h1></body></html>')
+      const pub2 = await runCli(tok2, ['publish', pullDir, '--slug', 'team-portal'], {
+        OPENCLAUDE_SESSION_KEY: 'agent:main:webchat:dm:editor-sess',
+      })
+      assert.equal(pub2.code, 0, pub2.stderr)
+
+      // P1 #7: Stale workspace (pulled before pub2) MUST fail with 409 STALE_REVISION rather than silently clobbering!
+      writeFileSync(join(pullDirStale, 'index.html'), '<!doctype html><html><body><h1>Stale overwrite attempt</h1></body></html>')
+      const pubStale = await runCli(tok2, ['publish', pullDirStale, '--slug', 'team-portal'])
+      assert.equal(pubStale.code, 1)
+      assert.ok(pubStale.stderr.includes('STALE_REVISION'), pubStale.stderr)
+
+      // Owner's originSessionId is preserved (not clobbered by editor's session)
+      const ownerAfter = await cService.getSite(1, 'team-portal')
+      assert.equal(ownerAfter.originSessionId, 'agent:main:webchat:dm:owner-sess')
+
+      // 6) Live-Edit Preview Session (P1 #4 one-time boot code + clean URL + cookie stripping + no analytics pollution)
+      const publicBlocked = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+      })
+      assert.equal(publicBlocked.status, 401)
+      assert.equal(publicBlocked.text.includes('__oc_site_preview_bridge.js'), false)
+
+      const previewRes = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/preview-session`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      assert.equal(previewRes.status, 200)
+      const { preview } = (await previewRes.json()) as {
+        preview: { bootstrapUrl: string; siteOrigin: string }
+      }
+      assert.equal(preview.siteOrigin, 'https://team-portal.congjianai.com')
+      const bootUrl = new URL(preview.bootstrapUrl)
+      assert.ok(bootUrl.searchParams.get('code'), 'bootstrap URL must use one-time ?code=')
+      assert.equal(bootUrl.searchParams.get('token'), null)
+
+      const bootResp = await edgeHttpRequest({
+        port: cEdgePort,
+        path: `${bootUrl.pathname}${bootUrl.search}`,
+        host: 'team-portal.congjianai.com',
+      })
+      assert.equal(bootResp.status, 302)
+      assert.equal(bootResp.headers.location, '/')
+      assert.equal(bootResp.headers['content-security-policy'], 'frame-ancestors https://app.congjianai.com')
+      const setCookie = Array.isArray(bootResp.headers['set-cookie'])
+        ? bootResp.headers['set-cookie'][0]!
+        : String(bootResp.headers['set-cookie'] ?? '')
+      assert.ok(setCookie.includes('__oc_site_preview='))
+      assert.ok(setCookie.includes('HttpOnly'))
+      const previewCookie = setCookie.split(';')[0]!
+
+      // P1 #4: One-time boot code cannot be replayed!
+      const bootReplay = await edgeHttpRequest({
+        port: cEdgePort,
+        path: `${bootUrl.pathname}${bootUrl.search}`,
+        host: 'team-portal.congjianai.com',
+      })
+      assert.equal(bootReplay.status, 401)
+
+      // Fetch HTML with preview cookie -> unlocked, shows v2 content, injects clean /__oc_site_preview_bridge.js (no ?t=)!
+      const previewHtml = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie },
+      })
+      assert.equal(previewHtml.status, 200)
+      assert.ok(previewHtml.text.includes('Hello v2 by editor'))
+      assert.ok(previewHtml.text.includes('src="/__oc_site_preview_bridge.js"'))
+      assert.equal(previewHtml.text.includes('__oc_site_preview_bridge.js?'), false)
+      assert.equal(previewHtml.headers['content-security-policy'], 'frame-ancestors https://app.congjianai.com')
+
+      // P1 #4: /api/status receives user app cookies but NEVER platform preview/auth cookies!
+      const previewApi = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/api/status',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: `${previewCookie}; oc_site_auth=secret-site-auth; app_session=keepme` },
+      })
+      assert.equal(previewApi.status, 200)
+      const apiJson = JSON.parse(previewApi.text) as {
+        ver: string
+        hasKey: boolean
+        cookieHeader: string
+      }
+      assert.equal(apiJson.ver, 'v1')
+      assert.equal(apiJson.hasKey, true)
+      assert.equal(apiJson.cookieHeader.includes('__oc_site_preview'), false)
+      assert.equal(apiJson.cookieHeader.includes('oc_site_auth'), false)
+      assert.ok(apiJson.cookieHeader.includes('app_session=keepme'))
+
+      // Fetch bridge script with preview cookie -> served with strict parentOrigin
+      const bridgeRes = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/__oc_site_preview_bridge.js',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie },
+      })
+      assert.equal(bridgeRes.status, 200)
+      assert.ok(bridgeRes.text.includes('oc-site-preview-v1'))
+      assert.ok(bridgeRes.text.includes('https://app.congjianai.com'))
+
+      // Bridge script without preview cookie -> 404 (invisible to public)
+      const bridgeUnauth = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/__oc_site_preview_bridge.js',
+        host: 'team-portal.congjianai.com',
+      })
+      assert.equal(bridgeUnauth.status, 404)
+
+      // Preview traffic must NOT pollute analytics
+      const anaAfterPreview = await cService.getAnalytics(1, 'team-portal', 7)
+      assert.equal(anaAfterPreview.totals.requests, 0)
+
+      // Disabled site is still previewable by owner/editor with preview cookie, while public gets 404
+      await cService.updateSite(1, 'team-portal', { visibility: 'disabled' })
+      const disabledPublic = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+      })
+      assert.equal(disabledPublic.status, 404)
+      const disabledPreview = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie },
+      })
+      assert.equal(disabledPreview.status, 200)
+      assert.ok(disabledPreview.text.includes('Hello v2 by editor'))
+
+      // 7) P1 #3: Downgrading editor -> viewer OR removing editor immediately revokes ALREADY-ISSUED Edge preview cookie!
+      const downgradeRes = await fetch(
+        `http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators/2`,
+        {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'viewer' }),
+        },
+      )
+      assert.equal(downgradeRes.status, 200)
+      const revokedPageAfterDowngrade = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie },
+      })
+      assert.equal(revokedPageAfterDowngrade.status, 404)
+      const revokedBridgeAfterDowngrade = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/__oc_site_preview_bridge.js',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie },
+      })
+      assert.equal(revokedBridgeAfterDowngrade.status, 404)
+
+      // Re-promote editor, mint a fresh preview cookie, then remove editor -> immediately revoked again!
+      const rePromote = await fetch(
+        `http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators/2`,
+        {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'editor' }),
+        },
+      )
+      assert.equal(rePromote.status, 200)
+      const previewRes2 = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/preview-session`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      assert.equal(previewRes2.status, 200)
+      const bootUrl2 = new URL(((await previewRes2.json()) as { preview: { bootstrapUrl: string } }).preview.bootstrapUrl)
+      const bootResp2 = await edgeHttpRequest({
+        port: cEdgePort,
+        path: `${bootUrl2.pathname}${bootUrl2.search}`,
+        host: 'team-portal.congjianai.com',
+      })
+      assert.equal(bootResp2.status, 302)
+      const setCookie2 = Array.isArray(bootResp2.headers['set-cookie'])
+        ? bootResp2.headers['set-cookie'][0]!
+        : String(bootResp2.headers['set-cookie'] ?? '')
+      const previewCookie2 = setCookie2.split(';')[0]!
+      const previewOk2 = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie2 },
+      })
+      assert.equal(previewOk2.status, 200)
+
+      // Collaborator leaves & owner removes editor -> access & preview cookie revoked immediately
+      const leaveRes = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/leave`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt3}`, 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      assert.equal(leaveRes.status, 200)
+      const u3AfterLeave = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal`, {
+        headers: { Authorization: `Bearer ${jwt3}` },
+      })
+      assert.equal(u3AfterLeave.status, 404)
+
+      const removeEditorRes = await fetch(
+        `http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators/2`,
+        { method: 'DELETE', headers: { Authorization: `Bearer ${jwt1}` } },
+      )
+      assert.equal(removeEditorRes.status, 200)
+      const u2AfterRemove = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal`, {
+        headers: { Authorization: `Bearer ${jwt2}` },
+      })
+      assert.equal(u2AfterRemove.status, 404)
+      const revokedPageAfterRemove = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie2 },
+      })
+      assert.equal(revokedPageAfterRemove.status, 404)
+
+      // 8) Round-2 P1 #3: Email upsert downgrading editor -> viewer ALSO immediately revokes Edge preview cookie!
+      const reAddEditor = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'editor@example.com', role: 'editor' }),
+      })
+      assert.equal(reAddEditor.status, 200)
+      const previewRes3 = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/preview-session`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt2}`, 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      assert.equal(previewRes3.status, 200)
+      const bootUrl3 = new URL(((await previewRes3.json()) as { preview: { bootstrapUrl: string } }).preview.bootstrapUrl)
+      const bootResp3 = await edgeHttpRequest({
+        port: cEdgePort,
+        path: `${bootUrl3.pathname}${bootUrl3.search}`,
+        host: 'team-portal.congjianai.com',
+      })
+      assert.equal(bootResp3.status, 302)
+      const setCookie3 = Array.isArray(bootResp3.headers['set-cookie'])
+        ? bootResp3.headers['set-cookie'][0]!
+        : String(bootResp3.headers['set-cookie'] ?? '')
+      const previewCookie3 = setCookie3.split(';')[0]!
+      const previewOk3 = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie3 },
+      })
+      assert.equal(previewOk3.status, 200)
+
+      const emailDowngradeRes = await fetch(`http://127.0.0.1:${mPort}/api/sites/team-portal/collaborators`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt1}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'editor@example.com', role: 'viewer' }),
+      })
+      assert.equal(emailDowngradeRes.status, 200)
+      const revokedAfterEmailDowngrade = await edgeHttpRequest({
+        port: cEdgePort,
+        path: '/',
+        host: 'team-portal.congjianai.com',
+        headers: { Cookie: previewCookie3 },
+      })
+      assert.equal(revokedAfterEmailDowngrade.status, 404)
+
+      // 9) Round-2 P1 #7: Symlink .oc-site-state.json refuses overwrite on pull --force, AND baseline publish after delete fails 409 (never recreates public site!)
+      const symTarget = join(collabDir, 'victim.txt')
+      writeFileSync(symTarget, 'ORIGINAL_VICTIM')
+      const symPullDir = join(collabDir, 'sym-pull')
+      mkdirSync(symPullDir, { recursive: true })
+      symlinkSync(symTarget, join(symPullDir, '.oc-site-state.json'))
+      const symPull = await runCli(tok1, ['pull', 'team-portal', symPullDir, '--force'])
+      assert.equal(symPull.code, 1)
+      assert.equal(readFileSync(symTarget, 'utf8'), 'ORIGINAL_VICTIM')
+
+      // Owner deletes team-portal; editor (or owner) attempting publish from pulled dir with baseline MUST fail 409 STALE_REVISION!
+      await cService.deleteSite(1, 'team-portal')
+      const pubAfterDelete = await runCli(tok2, ['publish', pullDir, '--slug', 'team-portal'])
+      assert.equal(pubAfterDelete.code, 1)
+      assert.ok(pubAfterDelete.stderr.includes('STALE_REVISION'), pubAfterDelete.stderr)
+      assert.equal(await cRepo.getByUserAndSlug(2, 'team-portal'), null)
+    } finally {
+      await new Promise<void>((r) => masterSrv.close(() => r()))
+      await edgeSrv.close()
+      rmSync(collabDir, { recursive: true, force: true })
+    }
   })
 })

@@ -22,6 +22,7 @@ export interface EdgeSiteStatusMeta {
   customDomain: string | null
   hasServerApi: boolean
   envDigest?: string
+  previewAclVersion?: number
   fileCount: number
   sizeBytes: number
   contentSha256: string
@@ -50,6 +51,11 @@ export interface SitesEdgeClient {
     meta: EdgeMetaEnvelope
     hasServerApi?: boolean
   }): Promise<{ needsEnvSync?: boolean; envDigest?: string }>
+  pullBundle?(args: {
+    slug: string
+    siteId?: string
+    expectedRevision?: number
+  }): Promise<Buffer>
   updateMeta(args: {
     slug: string
     revision: number
@@ -101,6 +107,7 @@ export interface SitesEdgeClient {
 
 const EDGE_REQUEST_TIMEOUT_MS = 30_000
 const MAX_RESPONSE_BODY_BYTES = 1024 * 1024
+const MAX_BUNDLE_RESPONSE_BYTES = 32 * 1024 * 1024
 
 function makeIdentityMeta(args: { siteId?: string; expectedRevision?: number; envDigest?: string }): EdgeMetaEnvelope | undefined {
   if (!args.siteId && args.expectedRevision === undefined && args.envDigest === undefined) {
@@ -127,7 +134,7 @@ export function createHttpSitesEdgeClient(opts: {
   const basePath = baseUrl.pathname.replace(/\/+$/, '')
   const timeoutMs = opts.timeoutMs ?? EDGE_REQUEST_TIMEOUT_MS
 
-  async function sendSigned(args: {
+  async function sendSignedBuffer(args: {
     prefix?: string
     method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
     subPath: string
@@ -136,7 +143,8 @@ export function createHttpSitesEdgeClient(opts: {
     body: Buffer
     contentType?: string
     meta?: EdgeMetaEnvelope
-  }): Promise<string> {
+    maxResponseBytes?: number
+  }): Promise<Buffer> {
     const prefix = args.prefix ?? SITE_EDGE_PREFIX
     const pathname = `${basePath}${prefix}${args.subPath}`
     const target = new URL(`${pathname}${args.query ? `?${args.query}` : ''}`, baseUrl)
@@ -158,8 +166,9 @@ export function createHttpSitesEdgeClient(opts: {
     }
 
     const doReq = target.protocol === 'https:' ? httpsRequest : httpRequest
+    const maxResBytes = args.maxResponseBytes ?? MAX_RESPONSE_BODY_BYTES
 
-    const { status, rawBody } = await new Promise<{ status: number; rawBody: string }>(
+    const { status, rawBuf } = await new Promise<{ status: number; rawBuf: Buffer }>(
       (resolve, reject) => {
         const req = doReq(
           {
@@ -175,7 +184,7 @@ export function createHttpSitesEdgeClient(opts: {
             let total = 0
             res.on('data', (chunk: Buffer) => {
               total += chunk.length
-              if (total > MAX_RESPONSE_BODY_BYTES) {
+              if (total > maxResBytes) {
                 req.destroy(new Error('edge response exceeded size limit'))
                 return
               }
@@ -184,7 +193,7 @@ export function createHttpSitesEdgeClient(opts: {
             res.on('end', () => {
               resolve({
                 status: res.statusCode ?? 502,
-                rawBody: Buffer.concat(chunks).toString('utf8'),
+                rawBuf: Buffer.concat(chunks),
               })
             })
             res.on('error', (err) => reject(err))
@@ -208,8 +217,9 @@ export function createHttpSitesEdgeClient(opts: {
       )
     })
 
-    if (status >= 200 && status < 300) return rawBody
+    if (status >= 200 && status < 300) return rawBuf
 
+    const rawBody = rawBuf.toString('utf8')
     let parsedCode = ''
     let parsedMsg = ''
     try {
@@ -255,6 +265,19 @@ export function createHttpSitesEdgeClient(opts: {
     )
   }
 
+  async function sendSigned(args: {
+    prefix?: string
+    method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+    subPath: string
+    query?: string
+    revision: number
+    body: Buffer
+    contentType?: string
+    meta?: EdgeMetaEnvelope
+  }): Promise<string> {
+    return (await sendSignedBuffer(args)).toString('utf8')
+  }
+
   return {
     async pushBundle({ slug, revision, gzippedBundle, meta, hasServerApi }) {
       const useV2 = Boolean(hasServerApi ?? meta.hasServerApi)
@@ -276,6 +299,16 @@ export function createHttpSitesEdgeClient(opts: {
       } catch {
         return {}
       }
+    },
+    async pullBundle({ slug, siteId, expectedRevision }) {
+      return sendSignedBuffer({
+        method: 'GET',
+        subPath: `/sites/${encodeURIComponent(slug)}/bundle`,
+        revision: 1,
+        body: Buffer.alloc(0),
+        meta: makeIdentityMeta({ siteId, expectedRevision }),
+        maxResponseBytes: MAX_BUNDLE_RESPONSE_BYTES,
+      })
     },
     async updateMeta({ slug, revision, meta, encryptedEnvB64 }) {
       const bodyPayload =

@@ -2208,6 +2208,13 @@ export function App() {
                 else handleNew();
                 setComposerPrefill({ text: prompt, nonce: Date.now() });
               }}
+              onApplyLiveEdit={(site, livePrompt) => {
+                const { sessionId, prompt } = resolveSiteEditTarget(site, sessions, livePrompt);
+                setBoardOpen(false);
+                if (sessionId) selectSession(sessionId);
+                else handleNew();
+                setComposerPrefill({ text: prompt, nonce: Date.now() });
+              }}
               onOpenMobileNav={() => setMobileNavOpen(true)}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}

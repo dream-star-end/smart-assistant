@@ -8,18 +8,33 @@ import {
   encryptSiteSecretForDb,
   sealEdgeEnvMap,
 } from './envCrypto.js'
-import type { SitesRepo, StoredSiteEnvVarRow } from './repo.js'
+import type {
+  SitesRepo,
+  StoredSiteCollaboratorRow,
+  StoredSiteEnvVarRow,
+  StoredSiteInviteRow,
+} from './repo.js'
 import {
   DEFAULT_SITE_MAX_PER_USER,
   DEFAULT_SITE_MAX_TOTAL_BYTES,
   type EdgeMetaEnvelope,
+  SITE_MAX_ACTIVE_INVITES,
+  SITE_MAX_COLLABORATORS,
   SITE_MAX_ENV_TOTAL_BYTES,
   SITE_MAX_ENV_VALUE_BYTES,
   SITE_MAX_ENV_VARS,
+  SITE_PREVIEW_BOOT_TTL_SEC,
+  SITE_PREVIEW_TTL_SEC,
+  type SiteAccessRole,
   type SiteAnalyticsResponse,
+  type SiteCollaboratorDto,
+  type SiteCollaboratorRole,
   type SiteDbInspectResponse,
   type SiteDbQueryResponse,
   type SiteEnvVarDto,
+  type SiteInviteDto,
+  type SiteInvitePreviewDto,
+  type SitePreviewSessionDto,
   type SiteVisibility,
   SitesError,
   type UserSiteDto,
@@ -27,9 +42,13 @@ import {
   customDomainTxtValueFor,
   decodeSiteBundle,
   generateRandomSiteSlug,
+  hashSiteInviteToken,
   hashSitePassword,
+  normalizePreviewParentOrigin,
   normalizeSiteTitle,
+  parseSiteCollaboratorRole,
   parseSiteVisibility,
+  signSitePreviewToken,
   toUserSiteDto,
   validateCustomDomain,
   validateEnvVarKey,
@@ -55,6 +74,9 @@ export interface PublishSiteInput {
   password?: string
   spaMode?: boolean
   originSessionId?: string | null
+  expectedSiteId?: string
+  expectedBaseRevision?: number
+  expectedBaseContentSha256?: string
   gzippedBundle: Buffer
 }
 
@@ -172,6 +194,41 @@ export class SitesService {
     }))
   }
 
+  private toCollaboratorDtos(rows: StoredSiteCollaboratorRow[]): SiteCollaboratorDto[] {
+    return rows.map((r) => ({
+      userId: r.userId,
+      email: r.email,
+      displayName: r.displayName,
+      role: r.role,
+      createdAt: r.createdAt.toISOString(),
+      updatedAt: r.updatedAt.toISOString(),
+    }))
+  }
+
+  private toInviteDtos(rows: StoredSiteInviteRow[]): SiteInviteDto[] {
+    return rows.map((r) => ({
+      id: r.id,
+      role: r.role,
+      maxUses: r.maxUses,
+      useCount: r.useCount,
+      expiresAt: r.expiresAt ? r.expiresAt.toISOString() : null,
+      createdAt: r.createdAt.toISOString(),
+    }))
+  }
+
+  private assertOwner(row: UserSiteRow, actionLabel: string): void {
+    if ((row.accessRole ?? 'owner') !== 'owner') {
+      throw new SitesError('FORBIDDEN', `仅站点所有者可${actionLabel}`, 403)
+    }
+  }
+
+  private assertCanEdit(row: UserSiteRow, actionLabel: string): void {
+    const role = row.accessRole ?? 'owner'
+    if (role !== 'owner' && role !== 'editor') {
+      throw new SitesError('FORBIDDEN', `仅站点所有者或协作者可${actionLabel}`, 403)
+    }
+  }
+
   private buildEdgeEnvPayloadFromRows(
     userId: number,
     siteId: string,
@@ -258,10 +315,11 @@ export class SitesService {
     const pending = await repo.listUnleasedPendingByUser(userId)
     if (pending.length === 0) return
     for (const cand of pending) {
+      const ownerId = cand.userId
       if (cand.opKind === 'rename' && cand.opRenameToSlug) {
         const targetSlug = cand.opRenameToSlug
         await this.withTwoSlugLocks(cand.slug, targetSlug, async () => {
-          const claimed = await repo.tryClaimReconcileLease(cand.id, userId)
+          const claimed = await repo.tryClaimReconcileLease(cand.id, ownerId)
           if (!claimed) return
           try {
             const newStatus = await edge.getSiteStatus({ slug: targetSlug })
@@ -278,12 +336,19 @@ export class SitesService {
               (!oldStatus.exists || oldStatus.tombstone?.op === 'rename')
             ) {
               let finalRev = newStatus.revision
-              const envBundle = await this.buildEdgeEnvPayload(repo, userId, claimed.row.id, targetSlug)
+              const envBundle = await this.buildEdgeEnvPayload(repo, ownerId, claimed.row.id, targetSlug)
               if (
                 newStatus.revision === claimed.row.edgeRevision ||
-                (newStatus.meta?.envDigest ?? '') !== envBundle.digest
+                (newStatus.meta?.envDigest ?? '') !== envBundle.digest ||
+                (newStatus.meta?.previewAclVersion ?? 1) <
+                  Math.max(claimed.row.previewAclVersion ?? 1, claimed.row.previewAclTargetVersion ?? 1)
               ) {
                 if (newStatus.meta) {
+                  const targetAcl = Math.max(
+                    claimed.row.previewAclVersion ?? 1,
+                    claimed.row.previewAclTargetVersion ?? 1,
+                    newStatus.meta.previewAclVersion ?? 1,
+                  )
                   await edge.updateMeta({
                     slug: targetSlug,
                     revision: claimed.row.edgeRevision + 1,
@@ -298,6 +363,7 @@ export class SitesService {
                       hasServerApi: Boolean(newStatus.meta.hasServerApi),
                       envDigest: envBundle.digest,
                       contentSha256: newStatus.meta.contentSha256,
+                      previewAclVersion: targetAcl,
                       expectedBaseRevision: newStatus.revision,
                     },
                     encryptedEnvB64: envBundle.sealedB64,
@@ -307,7 +373,7 @@ export class SitesService {
               }
               await repo.commitRename({
                 siteId: claimed.row.id,
-                userId,
+                userId: ownerId,
                 leaseId: claimed.leaseId,
                 newSlug: targetSlug,
                 edgeRevision: finalRev,
@@ -320,23 +386,23 @@ export class SitesService {
             ) {
               await repo.abortRenameReservation(
                 claimed.row.id,
-                userId,
+                ownerId,
                 claimed.leaseId,
                 targetSlug,
                 true,
               )
             } else {
-              await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, false)
+              await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false)
             }
           } catch {
-            await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, false).catch(() => {})
+            await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false).catch(() => {})
           }
         })
         continue
       }
 
       await this.withSlugLock(cand.slug, async () => {
-        const claimed = await repo.tryClaimReconcileLease(cand.id, userId)
+        const claimed = await repo.tryClaimReconcileLease(cand.id, ownerId)
         if (!claimed) return
         try {
           const status = await edge.getSiteStatus({ slug: claimed.row.slug })
@@ -345,11 +411,11 @@ export class SitesService {
             const tombMatchesId =
               !status.tombstone?.siteId || status.tombstone.siteId === claimed.row.id
             if (!status.exists && status.tombstoneRevision > claimed.row.edgeRevision && tombMatchesId) {
-              await repo.commitDelete(claimed.row.id, userId, claimed.leaseId, status.tombstoneRevision)
+              await repo.commitDelete(claimed.row.id, ownerId, claimed.leaseId, status.tombstoneRevision)
             } else if (status.exists && (!status.meta?.siteId || status.meta.siteId === claimed.row.id)) {
-              await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, true)
+              await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, true)
             } else {
-              await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, false)
+              await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false)
             }
             return
           }
@@ -357,16 +423,16 @@ export class SitesService {
           if (status.exists && status.revision > 0 && status.meta) {
             if (status.meta.siteId && status.meta.siteId !== claimed.row.id) {
               if (claimed.row.edgeRevision === 0) {
-                await repo.abortPublishPlaceholder(claimed.row.id, userId, claimed.leaseId)
+                await repo.abortPublishPlaceholder(claimed.row.id, ownerId, claimed.leaseId)
               } else {
-                await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, false)
+                await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false)
               }
               return
             }
 
             const envBundle = await this.buildEdgeEnvPayload(
               repo,
-              userId,
+              ownerId,
               claimed.row.id,
               claimed.row.slug,
             )
@@ -384,7 +450,43 @@ export class SitesService {
               effectiveDigest = envBundle.digest
             }
 
-            if (status.revision > claimed.row.edgeRevision || effectiveDigest !== claimed.row.envDigest || claimed.row.opKind) {
+            const desiredAcl = Math.max(
+              1,
+              claimed.row.previewAclVersion ?? 1,
+              claimed.row.previewAclTargetVersion ?? 1,
+              status.meta.previewAclVersion ?? 1,
+            )
+            let effectiveRev = status.revision
+            if ((status.meta.previewAclVersion ?? 1) < desiredAcl) {
+              const bumpedRev = status.revision + 1
+              await edge.updateMeta({
+                slug: claimed.row.slug,
+                revision: bumpedRev,
+                meta: {
+                  siteId: claimed.row.id,
+                  title: status.meta.title,
+                  visibility: status.meta.visibility,
+                  passwordSalt: status.meta.passwordSalt,
+                  passwordHash: status.meta.passwordHash,
+                  spaMode: status.meta.spaMode,
+                  customDomain: status.meta.customDomain ?? null,
+                  hasServerApi: Boolean(status.meta.hasServerApi),
+                  envDigest: effectiveDigest,
+                  contentSha256: status.meta.contentSha256,
+                  previewAclVersion: desiredAcl,
+                  expectedBaseRevision: status.revision,
+                },
+                encryptedEnvB64: envBundle.sealedB64,
+              })
+              effectiveRev = bumpedRev
+            }
+
+            if (
+              effectiveRev > claimed.row.edgeRevision ||
+              effectiveDigest !== claimed.row.envDigest ||
+              claimed.row.opKind ||
+              desiredAcl > (claimed.row.previewAclVersion ?? 1)
+            ) {
               const shouldSyncDomain =
                 status.meta.customDomain !== null || claimed.row.customDomainVerified
               const verifiedMatch =
@@ -393,7 +495,7 @@ export class SitesService {
                 claimed.row.customDomain === status.meta.customDomain
               await repo.reconcileFromEdge({
                 siteId: claimed.row.id,
-                userId,
+                userId: ownerId,
                 leaseId: claimed.leaseId,
                 title: status.meta.title,
                 visibility: status.meta.visibility,
@@ -408,23 +510,24 @@ export class SitesService {
                   : {}),
                 originSessionId: null,
                 hasServerApi: Boolean(status.meta.hasServerApi),
+                previewAclVersion: desiredAcl,
                 envDigest: effectiveDigest,
                 fileCount: status.meta.fileCount,
                 sizeBytes: status.meta.sizeBytes,
                 contentSha256: status.meta.contentSha256,
-                edgeRevision: status.revision,
+                edgeRevision: effectiveRev,
               })
             } else {
-              await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, true)
+              await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, true)
             }
           } else if (claimed.row.edgeRevision === 0) {
-            await repo.abortPublishPlaceholder(claimed.row.id, userId, claimed.leaseId)
+            await repo.abortPublishPlaceholder(claimed.row.id, ownerId, claimed.leaseId)
           } else {
             // Never delete a PG row on non-delete ops (e.g. an intermediate crash or rename tombstone).
-            await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, true)
+            await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, true)
           }
         } catch {
-          await repo.releaseLease(claimed.row.id, userId, claimed.leaseId, false).catch(() => {})
+          await repo.releaseLease(claimed.row.id, ownerId, claimed.leaseId, false).catch(() => {})
         }
       })
     }
@@ -480,6 +583,14 @@ export class SitesService {
     const attemptPublish = (slug: string): Promise<UserSiteRow> =>
       this.withSlugLock(slug, async () => {
         const preHint = await repo.getByUserAndSlug(userId, slug)
+        if (preHint) {
+          this.assertCanEdit(preHint, '发布更新')
+          if ((preHint.accessRole ?? 'owner') !== 'owner') {
+            if (input.visibility !== undefined || input.password !== undefined) {
+              throw new SitesError('FORBIDDEN', '协作者不能修改站点访问可见性或访问口令', 403)
+            }
+          }
+        }
         const hintVisibility: SiteVisibility = requestedVisibility ?? preHint?.visibility ?? 'public'
         const hintTitle =
           input.title !== undefined
@@ -517,23 +628,41 @@ export class SitesService {
           spaMode: hintSpaMode,
           originSessionId: input.originSessionId ?? null,
           hasServerApi: decoded.hasServerApi,
+          serverApiSha256: decoded.serverApiSha256,
+          ...(input.expectedSiteId !== undefined ? { expectedSiteId: input.expectedSiteId } : {}),
+          ...(input.expectedBaseRevision !== undefined
+            ? { expectedBaseRevision: input.expectedBaseRevision }
+            : {}),
+          ...(input.expectedBaseContentSha256 !== undefined
+            ? { expectedBaseContentSha256: input.expectedBaseContentSha256 }
+            : {}),
           maxPerUser: this.maxPerUser,
         })
 
+        const ownerId = reservation.ownerUserId ?? userId
+        const accessRole: SiteAccessRole = reservation.accessRole ?? 'owner'
         const lockedExisting = reservation.existing
+
+        if (accessRole !== 'owner' && (input.visibility !== undefined || input.password !== undefined)) {
+          await repo.releaseLease(reservation.siteId, ownerId, reservation.leaseId, true).catch(() => {})
+          throw new SitesError('FORBIDDEN', '协作者不能修改站点访问可见性或访问口令', 403)
+        }
+
         const finalVisibility: SiteVisibility =
-          requestedVisibility ?? lockedExisting?.visibility ?? 'public'
+          accessRole === 'owner'
+            ? (requestedVisibility ?? lockedExisting?.visibility ?? 'public')
+            : (lockedExisting?.visibility ?? 'public')
         let finalSalt = preSalt
         let finalHash = preHash
-        if (finalVisibility === 'password' && input.password === undefined) {
+        if (finalVisibility === 'password' && (input.password === undefined || accessRole !== 'owner')) {
           if (lockedExisting?.passwordSalt && lockedExisting.passwordHash) {
             finalSalt = lockedExisting.passwordSalt
             finalHash = lockedExisting.passwordHash
           } else if (!finalSalt || !finalHash) {
             if (reservation.isNewPlaceholder) {
-              await repo.abortPublishPlaceholder(reservation.siteId, userId, reservation.leaseId)
+              await repo.abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId)
             } else {
-              await repo.releaseLease(reservation.siteId, userId, reservation.leaseId)
+              await repo.releaseLease(reservation.siteId, ownerId, reservation.leaseId)
             }
             throw new SitesError('PASSWORD_REQUIRED', '口令保护模式需要设置 4–128 位访问口令', 400)
           }
@@ -553,7 +682,7 @@ export class SitesService {
 
         const envPayload = await this.buildEdgeEnvPayload(
           repo,
-          userId,
+          ownerId,
           reservation.siteId,
           slug,
         )
@@ -562,6 +691,11 @@ export class SitesService {
             ? lockedExisting.customDomain
             : null
 
+        const effectiveAclVersion = Math.max(
+          1,
+          lockedExisting?.previewAclVersion ?? 1,
+          lockedExisting?.previewAclTargetVersion ?? 1,
+        )
         const meta: EdgeMetaEnvelope = {
           siteId: reservation.siteId,
           title: finalTitle,
@@ -573,6 +707,7 @@ export class SitesService {
           hasServerApi: decoded.hasServerApi,
           envDigest: envPayload.digest,
           contentSha256: decoded.contentSha256,
+          previewAclVersion: effectiveAclVersion,
           expectedBaseRevision: reservation.baseRevision,
         }
 
@@ -595,33 +730,33 @@ export class SitesService {
                 committedOnEdge = true
               } else if (!status.exists && reservation.isNewPlaceholder) {
                 await repo
-                  .abortPublishPlaceholder(reservation.siteId, userId, reservation.leaseId)
+                  .abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId)
                   .catch(() => {})
               } else if (status.exists && status.revision === reservation.baseRevision) {
                 await repo
-                  .releaseLease(reservation.siteId, userId, reservation.leaseId, true)
+                  .releaseLease(reservation.siteId, ownerId, reservation.leaseId, true)
                   .catch(() => {})
               } else {
                 await repo
-                  .releaseLease(reservation.siteId, userId, reservation.leaseId, false)
+                  .releaseLease(reservation.siteId, ownerId, reservation.leaseId, false)
                   .catch(() => {})
               }
             } catch {
               await repo
-                .releaseLease(reservation.siteId, userId, reservation.leaseId, false)
+                .releaseLease(reservation.siteId, ownerId, reservation.leaseId, false)
                 .catch(() => {})
             }
           } else if (err instanceof SitesError && err.code === 'STALE_REVISION') {
             await repo
-              .releaseLease(reservation.siteId, userId, reservation.leaseId, false)
+              .releaseLease(reservation.siteId, ownerId, reservation.leaseId, false)
               .catch(() => {})
           } else if (reservation.isNewPlaceholder) {
             await repo
-              .abortPublishPlaceholder(reservation.siteId, userId, reservation.leaseId)
+              .abortPublishPlaceholder(reservation.siteId, ownerId, reservation.leaseId)
               .catch(() => {})
           } else {
             await repo
-              .releaseLease(reservation.siteId, userId, reservation.leaseId, true)
+              .releaseLease(reservation.siteId, ownerId, reservation.leaseId, true)
               .catch(() => {})
           }
           if (!committedOnEdge) throw err
@@ -649,15 +784,17 @@ export class SitesService {
 
         const committed = await repo.commitPublish({
           siteId: reservation.siteId,
-          userId,
+          userId: ownerId,
           leaseId: reservation.leaseId,
           title: finalTitle,
           visibility: finalVisibility,
           passwordSalt: finalSalt,
           passwordHash: finalHash,
           spaMode: finalSpa,
-          originSessionId: input.originSessionId ?? null,
+          originSessionId: accessRole === 'owner' ? (input.originSessionId ?? null) : null,
           hasServerApi: decoded.hasServerApi,
+          ...(accessRole === 'owner' ? { serverApiSha256: decoded.serverApiSha256 } : {}),
+          previewAclVersion: effectiveAclVersion,
           envDigest: committedDigest,
           markEnvPending,
           pendingEnvDigest: markEnvPending ? envPayload.digest : null,
@@ -674,7 +811,13 @@ export class SitesService {
             true,
           )
         }
-        return committed
+        return {
+          ...committed,
+          accessRole,
+          ownerEmail: preHint?.ownerEmail ?? committed.ownerEmail ?? null,
+          ownerDisplayName: preHint?.ownerDisplayName ?? committed.ownerDisplayName ?? null,
+          collaboratorCount: preHint?.collaboratorCount ?? committed.collaboratorCount ?? 0,
+        }
       })
 
     if (explicitSlug) {
@@ -780,6 +923,11 @@ export class SitesService {
 
     await this.reconcilePendingByUser(userId)
 
+    const touchesOwnerOnly =
+      patch.visibility !== undefined ||
+      patch.password !== undefined ||
+      patch.customDomain !== undefined
+
     const row = await this.withSlugLock(slug, async () => {
       const { site, leaseId, nextRevision } = await repo.prepareMetaUpdate(
         userId,
@@ -787,7 +935,14 @@ export class SitesService {
         'meta',
         null,
         normalizedDomain ?? null,
+        !touchesOwnerOnly,
       )
+      const ownerId = site.userId
+      const accessRole: SiteAccessRole = site.accessRole ?? 'owner'
+      if (touchesOwnerOnly && accessRole !== 'owner') {
+        await repo.releaseLease(site.id, ownerId, leaseId, true).catch(() => {})
+        throw new SitesError('FORBIDDEN', '仅站点所有者可修改访问权限或自定义域名', 403)
+      }
 
       const nextVisibility: SiteVisibility = requestedVisibility ?? site.visibility
       const nextTitle =
@@ -822,7 +977,7 @@ export class SitesService {
           nextSalt = site.passwordSalt
           nextHash = site.passwordHash
         } else {
-          await repo.releaseLease(site.id, userId, leaseId).catch(() => {})
+          await repo.releaseLease(site.id, ownerId, leaseId).catch(() => {})
           throw new SitesError(
             'PASSWORD_REQUIRED',
             '切换到口令保护模式需要设置 4–128 位访问口令',
@@ -831,7 +986,7 @@ export class SitesService {
         }
       }
 
-      const envPayload = await this.buildEdgeEnvPayload(repo, userId, site.id, slug)
+      const envPayload = await this.buildEdgeEnvPayload(repo, ownerId, site.id, slug)
       const meta: EdgeMetaEnvelope = {
         siteId: site.id,
         title: nextTitle,
@@ -843,6 +998,7 @@ export class SitesService {
         hasServerApi: site.hasServerApi,
         envDigest: envPayload.digest,
         contentSha256: site.contentSha256,
+        previewAclVersion: Math.max(1, site.previewAclVersion ?? 1, site.previewAclTargetVersion ?? 1),
         expectedBaseRevision: site.edgeRevision,
       }
 
@@ -850,7 +1006,7 @@ export class SitesService {
         repo,
         edge,
         site,
-        userId,
+        userId: ownerId,
         leaseId,
         nextRevision,
         meta,
@@ -858,9 +1014,9 @@ export class SitesService {
       })
 
       try {
-        return await repo.commitMetaUpdate({
+        const committed = await repo.commitMetaUpdate({
           siteId: site.id,
-          userId,
+          userId: ownerId,
           leaseId,
           title: nextTitle,
           visibility: nextVisibility,
@@ -871,10 +1027,18 @@ export class SitesService {
           customDomainVerified: nextDomainVerified,
           customDomainToken: nextDomainToken,
           envDigest: envPayload.digest,
+          previewAclVersion: Math.max(1, site.previewAclVersion ?? 1, site.previewAclTargetVersion ?? 1),
           edgeRevision: nextRevision,
         })
+        return {
+          ...committed,
+          accessRole,
+          ownerEmail: site.ownerEmail ?? committed.ownerEmail ?? null,
+          ownerDisplayName: site.ownerDisplayName ?? committed.ownerDisplayName ?? null,
+          collaboratorCount: site.collaboratorCount ?? committed.collaboratorCount ?? 0,
+        }
       } catch (err) {
-        await repo.releaseLease(site.id, userId, leaseId, false).catch(() => {})
+        await repo.releaseLease(site.id, ownerId, leaseId, false).catch(() => {})
         throw err
       }
     })
@@ -891,6 +1055,7 @@ export class SitesService {
       if (!current) {
         throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
       }
+      this.assertOwner(current, '验证自定义域名')
       if (!current.customDomain) {
         throw new SitesError('INVALID_INPUT', '请先添加并保存自定义域名后再验证', 400)
       }
@@ -944,6 +1109,7 @@ export class SitesService {
         hasServerApi: site.hasServerApi,
         envDigest: envPayload.digest,
         contentSha256: site.contentSha256,
+        previewAclVersion: Math.max(1, site.previewAclVersion ?? 1, site.previewAclTargetVersion ?? 1),
         expectedBaseRevision: site.edgeRevision,
       }
 
@@ -1016,6 +1182,11 @@ export class SitesService {
     await this.reconcilePendingByUser(userId)
 
     const row = await this.withTwoSlugLocks(oldSlug, newSlug, async () => {
+      const existing = await repo.getByUserAndSlug(userId, oldSlug)
+      if (!existing) {
+        throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${oldSlug}"`, 404)
+      }
+      this.assertOwner(existing, '更改站点子域名')
       const { site, leaseId, nextRevision } = await repo.prepareRename(userId, oldSlug, newSlug)
       let committedOnEdge = false
       try {
@@ -1083,6 +1254,7 @@ export class SitesService {
     if (!row) {
       throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
     }
+    this.assertOwner(row, '查看或管理环境变量')
     const envRows = await repo.listSiteEnvRows(row.id, userId)
     return this.toEnvDtos(envRows)
   }
@@ -1168,6 +1340,7 @@ export class SitesService {
         hasServerApi: site.hasServerApi,
         envDigest: envPayload.digest,
         contentSha256: site.contentSha256,
+        previewAclVersion: Math.max(1, site.previewAclVersion ?? 1, site.previewAclTargetVersion ?? 1),
         expectedBaseRevision: site.edgeRevision,
       }
 
@@ -1228,6 +1401,7 @@ export class SitesService {
       if (!existing) {
         throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
       }
+      this.assertOwner(existing, '管理环境变量')
       const initialRows = await repo.listSiteEnvRows(existing.id, userId)
       if (!initialRows.some((r) => r.key === key)) {
         return this.toEnvDtos(initialRows)
@@ -1255,6 +1429,7 @@ export class SitesService {
         hasServerApi: site.hasServerApi,
         envDigest: envPayload.digest,
         contentSha256: site.contentSha256,
+        previewAclVersion: Math.max(1, site.previewAclVersion ?? 1, site.previewAclTargetVersion ?? 1),
         expectedBaseRevision: site.edgeRevision,
       }
 
@@ -1350,6 +1525,7 @@ export class SitesService {
     if (!row) {
       throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
     }
+    this.assertCanEdit(row, '执行数据库 SQL')
     return edge.executeDbSql({
       slug: row.slug,
       siteId: row.id,
@@ -1359,11 +1535,413 @@ export class SitesService {
     })
   }
 
+  async pullSiteBundle(
+    userId: number,
+    rawSlug: string,
+  ): Promise<{ site: UserSiteDto; gzippedBundle: Buffer }> {
+    const { repo, edge } = this.requireReady()
+    if (!edge.pullBundle) {
+      throw new SitesError('EDGE_UNAVAILABLE', '当前边缘节点不支持拉取站点包', 501)
+    }
+    const slug = validateSiteSlug(rawSlug)
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    this.assertCanEdit(row, '拉取站点代码')
+    const gzippedBundle = await edge.pullBundle({
+      slug: row.slug,
+      siteId: row.id,
+      expectedRevision: row.edgeRevision,
+    })
+    decodeSiteBundle(gzippedBundle, this.maxSiteBytes)
+    return { site: toUserSiteDto(row, this.baseDomain), gzippedBundle }
+  }
+
+  private async syncPreviewAclToEdge(ownerUserId: number, slug: string): Promise<void> {
+    const { repo, edge } = this.requireReady()
+    await this.withSlugLock(slug, async () => {
+      const { site, leaseId, nextRevision } = await repo.prepareMetaUpdate(ownerUserId, slug, 'meta')
+      const currentAcl = Math.max(1, site.previewAclVersion ?? 1)
+      const targetAcl = Math.max(currentAcl, site.previewAclTargetVersion ?? 1)
+      if (currentAcl >= targetAcl) {
+        await repo.releaseLease(site.id, ownerUserId, leaseId, true).catch(() => {})
+        return
+      }
+      const envPayload = await this.buildEdgeEnvPayload(repo, ownerUserId, site.id, slug)
+      const meta: EdgeMetaEnvelope = {
+        siteId: site.id,
+        title: site.title,
+        visibility: site.visibility,
+        passwordSalt: site.passwordSalt,
+        passwordHash: site.passwordHash,
+        spaMode: site.spaMode,
+        customDomain: site.customDomainVerified ? site.customDomain : null,
+        hasServerApi: site.hasServerApi,
+        envDigest: envPayload.digest,
+        contentSha256: site.contentSha256,
+        previewAclVersion: targetAcl,
+        expectedBaseRevision: site.edgeRevision,
+      }
+      await this.pushMetaWithLeaseHandling({
+        repo,
+        edge,
+        site,
+        userId: ownerUserId,
+        leaseId,
+        nextRevision,
+        meta,
+        encryptedEnvB64: envPayload.sealedB64,
+      })
+      try {
+        await repo.commitMetaUpdate({
+          siteId: site.id,
+          userId: ownerUserId,
+          leaseId,
+          title: site.title,
+          visibility: site.visibility,
+          passwordSalt: site.passwordSalt,
+          passwordHash: site.passwordHash,
+          spaMode: site.spaMode,
+          customDomain: site.customDomain,
+          customDomainVerified: site.customDomainVerified,
+          customDomainToken: site.customDomainToken,
+          envDigest: envPayload.digest,
+          previewAclVersion: targetAcl,
+          edgeRevision: nextRevision,
+        })
+      } catch (err) {
+        await repo.releaseLease(site.id, ownerUserId, leaseId, false).catch(() => {})
+        throw err
+      }
+    })
+  }
+
+  async createPreviewSession(
+    userId: number,
+    rawSlug: string,
+    parentOriginRaw: string,
+  ): Promise<SitePreviewSessionDto> {
+    const { repo } = this.requireReady()
+    const { edgeSecret } = this.requireEnvSecrets()
+    const slug = validateSiteSlug(rawSlug)
+    const parentOrigin = normalizePreviewParentOrigin(parentOriginRaw)
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    this.assertCanEdit(row, '使用实时预览编辑')
+    const nowSec = Math.floor(Date.now() / 1000)
+    const bootExpSec = nowSec + SITE_PREVIEW_BOOT_TTL_SEC
+    const sessionExpSec = nowSec + SITE_PREVIEW_TTL_SEC
+    const bootCode = signSitePreviewToken({
+      secret: edgeSecret,
+      kind: 'boot',
+      siteId: row.id,
+      slug: row.slug,
+      parentOrigin,
+      aclVersion: Math.max(1, row.previewAclVersion ?? 1, row.previewAclTargetVersion ?? 1),
+      nonce: randomBytes(16).toString('hex'),
+      expSec: bootExpSec,
+    })
+    const siteOrigin = `https://${row.slug}.${this.baseDomain}`
+    return {
+      bootstrapUrl: `${siteOrigin}/__oc_site_preview_bootstrap?code=${encodeURIComponent(bootCode)}`,
+      siteOrigin,
+      siteUrl: siteOrigin,
+      expiresAt: new Date(sessionExpSec * 1000).toISOString(),
+    }
+  }
+
+  async getSharingState(
+    userId: number,
+    rawSlug: string,
+  ): Promise<{
+    site: UserSiteDto
+    collaborators: SiteCollaboratorDto[]
+    invites: SiteInviteDto[]
+  }> {
+    const { repo } = this.requireReady()
+    const slug = validateSiteSlug(rawSlug)
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    const collaborators = repo.listCollaborators
+      ? this.toCollaboratorDtos(await repo.listCollaborators(row.id))
+      : []
+    const invites =
+      (row.accessRole ?? 'owner') === 'owner' && repo.listActiveInvites
+        ? this.toInviteDtos(await repo.listActiveInvites(row.id, userId))
+        : []
+    return {
+      site: toUserSiteDto(row, this.baseDomain),
+      collaborators,
+      invites,
+    }
+  }
+
+  async addCollaboratorByEmail(
+    userId: number,
+    rawSlug: string,
+    input: { email: string; role?: SiteCollaboratorRole },
+  ): Promise<{ collaborator: SiteCollaboratorDto; collaborators: SiteCollaboratorDto[] }> {
+    const { repo } = this.requireReady()
+    if (!repo.upsertCollaboratorByEmail || !repo.listCollaborators) {
+      throw new SitesError('INTERNAL', '当前存储层未启用协作管理', 501)
+    }
+    const slug = validateSiteSlug(rawSlug)
+    const email = typeof input.email === 'string' ? input.email.trim().toLowerCase() : ''
+    if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new SitesError('INVALID_INPUT', '请输入合法的邮箱地址', 400)
+    }
+    const role = parseSiteCollaboratorRole(input.role, 'editor')
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    this.assertOwner(row, '添加协作者')
+    const saved = await repo.upsertCollaboratorByEmail({
+      siteId: row.id,
+      ownerUserId: userId,
+      email,
+      role,
+      maxCollaborators: SITE_MAX_COLLABORATORS,
+    })
+    await this.syncPreviewAclToEdge(userId, slug)
+    const all = await repo.listCollaborators(row.id)
+    return {
+      collaborator: this.toCollaboratorDtos([saved])[0]!,
+      collaborators: this.toCollaboratorDtos(all),
+    }
+  }
+
+  async updateCollaboratorRole(
+    userId: number,
+    rawSlug: string,
+    targetUserId: number,
+    rawRole: SiteCollaboratorRole,
+  ): Promise<{ collaborator: SiteCollaboratorDto; collaborators: SiteCollaboratorDto[] }> {
+    const { repo } = this.requireReady()
+    if (!repo.updateCollaboratorRole || !repo.listCollaborators) {
+      throw new SitesError('INTERNAL', '当前存储层未启用协作管理', 501)
+    }
+    if (!Number.isSafeInteger(targetUserId) || targetUserId <= 0) {
+      throw new SitesError('INVALID_INPUT', '无效的用户 ID', 400)
+    }
+    const slug = validateSiteSlug(rawSlug)
+    const role = parseSiteCollaboratorRole(rawRole)
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    this.assertOwner(row, '修改协作者角色')
+    const saved = await repo.updateCollaboratorRole({
+      siteId: row.id,
+      ownerUserId: userId,
+      targetUserId,
+      role,
+    })
+    await this.syncPreviewAclToEdge(userId, slug)
+    const all = await repo.listCollaborators(row.id)
+    return {
+      collaborator: this.toCollaboratorDtos([saved])[0]!,
+      collaborators: this.toCollaboratorDtos(all),
+    }
+  }
+
+  async removeCollaborator(
+    userId: number,
+    rawSlug: string,
+    targetUserId: number,
+  ): Promise<{ ok: true; collaborators: SiteCollaboratorDto[] }> {
+    const { repo } = this.requireReady()
+    if (!repo.removeCollaborator || !repo.listCollaborators) {
+      throw new SitesError('INTERNAL', '当前存储层未启用协作管理', 501)
+    }
+    if (!Number.isSafeInteger(targetUserId) || targetUserId <= 0) {
+      throw new SitesError('INVALID_INPUT', '无效的用户 ID', 400)
+    }
+    const slug = validateSiteSlug(rawSlug)
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    this.assertOwner(row, '移除协作者')
+    await repo.removeCollaborator({ siteId: row.id, ownerUserId: userId, targetUserId })
+    await this.syncPreviewAclToEdge(userId, slug)
+    const all = await repo.listCollaborators(row.id)
+    return { ok: true, collaborators: this.toCollaboratorDtos(all) }
+  }
+
+  async leaveSite(userId: number, rawSlug: string): Promise<{ ok: true; slug: string }> {
+    const { repo } = this.requireReady()
+    if (!repo.leaveSiteCollaborator) {
+      throw new SitesError('INTERNAL', '当前存储层未启用协作管理', 501)
+    }
+    const slug = validateSiteSlug(rawSlug)
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    if ((row.accessRole ?? 'owner') === 'owner') {
+      throw new SitesError('INVALID_INPUT', '站点所有者不能退出自己的站点', 400)
+    }
+    await repo.leaveSiteCollaborator(row.id, userId)
+    await this.syncPreviewAclToEdge(row.userId, slug)
+    return { ok: true, slug }
+  }
+
+  async createInvite(
+    userId: number,
+    rawSlug: string,
+    input: {
+      role?: SiteCollaboratorRole
+      expiresInHours?: number | null
+      maxUses?: number | null
+    },
+  ): Promise<{ invite: SiteInviteDto; token: string; invites: SiteInviteDto[] }> {
+    const { repo } = this.requireReady()
+    if (!repo.createInvite || !repo.listActiveInvites) {
+      throw new SitesError('INTERNAL', '当前存储层未启用邀请链接', 501)
+    }
+    const slug = validateSiteSlug(rawSlug)
+    const role = parseSiteCollaboratorRole(input.role, 'editor')
+    let expiresAt: Date | null = null
+    if (input.expiresInHours !== null) {
+      const hours = input.expiresInHours === undefined ? 24 * 7 : Number(input.expiresInHours)
+      if (!Number.isFinite(hours) || hours < 1 || hours > 24 * 365) {
+        throw new SitesError('INVALID_INPUT', '邀请链接有效期需在 1 小时至 365 天之间', 400)
+      }
+      expiresAt = new Date(Date.now() + Math.trunc(hours * 3600 * 1000))
+    }
+    let maxUses: number | null = null
+    if (input.maxUses !== undefined && input.maxUses !== null) {
+      const parsedMax = Math.trunc(Number(input.maxUses))
+      if (!Number.isSafeInteger(parsedMax) || parsedMax < 1 || parsedMax > 1000) {
+        throw new SitesError('INVALID_INPUT', '最大使用次数需为 1–1000 的正整数', 400)
+      }
+      maxUses = parsedMax
+    }
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    this.assertOwner(row, '创建协作邀请链接')
+    const token = randomBytes(24).toString('base64url')
+    const tokenHash = hashSiteInviteToken(token)
+    const created = await repo.createInvite({
+      siteId: row.id,
+      ownerUserId: userId,
+      tokenHash,
+      role,
+      maxUses,
+      expiresAt,
+      maxActiveInvites: SITE_MAX_ACTIVE_INVITES,
+    })
+    const active = await repo.listActiveInvites(row.id, userId)
+    return {
+      invite: this.toInviteDtos([created])[0]!,
+      token,
+      invites: this.toInviteDtos(active),
+    }
+  }
+
+  async revokeInvite(
+    userId: number,
+    rawSlug: string,
+    inviteId: string,
+  ): Promise<{ ok: true; invites: SiteInviteDto[] }> {
+    const { repo } = this.requireReady()
+    if (!repo.revokeInvite || !repo.listActiveInvites) {
+      throw new SitesError('INTERNAL', '当前存储层未启用邀请链接', 501)
+    }
+    const slug = validateSiteSlug(rawSlug)
+    if (!inviteId || typeof inviteId !== 'string' || inviteId.length > 64) {
+      throw new SitesError('INVALID_INPUT', '无效的邀请 ID', 400)
+    }
+    await this.reconcilePendingByUser(userId)
+    const row = await repo.getByUserAndSlug(userId, slug)
+    if (!row) {
+      throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+    }
+    this.assertOwner(row, '撤销协作邀请链接')
+    await repo.revokeInvite({ siteId: row.id, ownerUserId: userId, inviteId })
+    const active = await repo.listActiveInvites(row.id, userId)
+    return { ok: true, invites: this.toInviteDtos(active) }
+  }
+
+  async previewInvite(userId: number, rawToken: string): Promise<SiteInvitePreviewDto> {
+    const { repo } = this.requireReady()
+    if (!repo.lookupInviteByTokenHash) {
+      throw new SitesError('INTERNAL', '当前存储层未启用邀请链接', 501)
+    }
+    const token = typeof rawToken === 'string' ? rawToken.trim() : ''
+    if (!token || token.length < 16 || token.length > 128) {
+      throw new SitesError('INVITE_INVALID', '邀请链接无效或已过期', 404)
+    }
+    const lookup = await repo.lookupInviteByTokenHash(hashSiteInviteToken(token), userId)
+    if (!lookup) {
+      throw new SitesError('INVITE_INVALID', '邀请链接无效、已过期或已被撤销', 404)
+    }
+    return {
+      valid: true,
+      site: {
+        id: lookup.site.id,
+        slug: lookup.site.slug,
+        title: lookup.site.title,
+        url: `https://${lookup.site.slug}.${this.baseDomain}`,
+      },
+      role: lookup.invite.role,
+      ownerEmail: lookup.ownerEmail,
+      ownerDisplayName: lookup.ownerDisplayName,
+      expiresAt: lookup.invite.expiresAt ? lookup.invite.expiresAt.toISOString() : null,
+      alreadyRole: lookup.alreadyRole,
+    }
+  }
+
+  async acceptInvite(
+    userId: number,
+    rawToken: string,
+  ): Promise<{ site: UserSiteDto; role: SiteAccessRole; alreadyMember: boolean }> {
+    const { repo } = this.requireReady()
+    if (!repo.acceptInviteByTokenHash) {
+      throw new SitesError('INTERNAL', '当前存储层未启用邀请链接', 501)
+    }
+    const token = typeof rawToken === 'string' ? rawToken.trim() : ''
+    if (!token || token.length < 16 || token.length > 128) {
+      throw new SitesError('INVITE_INVALID', '邀请链接无效或已过期', 404)
+    }
+    const result = await repo.acceptInviteByTokenHash(
+      hashSiteInviteToken(token),
+      userId,
+      SITE_MAX_COLLABORATORS,
+    )
+    return {
+      site: toUserSiteDto(result.site, this.baseDomain),
+      role: result.role,
+      alreadyMember: result.alreadyMember,
+    }
+  }
+
   async deleteSite(userId: number, rawSlug: string): Promise<{ ok: true; slug: string }> {
     const { repo, edge } = this.requireReady()
     const slug = validateSiteSlug(rawSlug)
     await this.reconcilePendingByUser(userId)
     await this.withSlugLock(slug, async () => {
+      const existing = await repo.getByUserAndSlug(userId, slug)
+      if (!existing) {
+        throw new SitesError('SITE_NOT_FOUND', `未找到站点 "${slug}"`, 404)
+      }
+      this.assertOwner(existing, '删除站点')
       const { site, leaseId, deleteRevision } = await repo.prepareDelete(userId, slug)
       let deletedOnEdge = false
       try {

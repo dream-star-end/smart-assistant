@@ -17,6 +17,7 @@ import { SitesError, encodeSiteBundle } from '../types.js'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const MIGRATION_0345 = resolve(HERE, '../../db/migrations/0345_user_sites.sql')
 const MIGRATION_0347 = resolve(HERE, '../../db/migrations/0347_user_sites_fullstack.sql')
+const MIGRATION_0349 = resolve(HERE, '../../db/migrations/0349_user_site_collaborators.sql')
 const EDGE_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
 const targetUrl = new URL(
@@ -48,10 +49,26 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
 
   before(async () => {
     await admin.query(`CREATE SCHEMA ${SCHEMA}`)
-    await pool.query('CREATE TABLE users (id INTEGER PRIMARY KEY)')
-    await pool.query('INSERT INTO users (id) VALUES (1), (2)')
+    await pool.query(
+      `CREATE TABLE users (
+         id INTEGER PRIMARY KEY,
+         email TEXT NOT NULL UNIQUE,
+         display_name TEXT,
+         status TEXT NOT NULL DEFAULT 'active',
+         email_verified BOOLEAN NOT NULL DEFAULT TRUE
+       )`,
+    )
+    await pool.query(
+      `INSERT INTO users (id, email, display_name, status, email_verified)
+       VALUES
+         (1, 'u1@example.com', 'User One', 'active', TRUE),
+         (2, 'u2@example.com', 'User Two', 'active', TRUE),
+         (3, 'u3@example.com', 'User Three', 'active', TRUE),
+         (4, 'unverified@example.com', 'User Four', 'active', FALSE)`,
+    )
     await pool.query(readFileSync(MIGRATION_0345, 'utf8'))
     await pool.query(readFileSync(MIGRATION_0347, 'utf8'))
+    await pool.query(readFileSync(MIGRATION_0349, 'utf8'))
 
     workDir = mkdtempSync(join(tmpdir(), 'oc-sites-pg-integ-'))
     const edge = createSitesEdgeServer({
@@ -407,5 +424,248 @@ describe('createPgSitesRepo + SitesService real PostgreSQL concurrency proofs', 
 
     await svc.deleteSite(1, 'pg-fs-crash-dst')
     await svc.deleteSite(2, 'pg-fs-beta')
+  })
+
+  test('PG collaborators & single-use invite concurrency + owner secret env AAD integrity on editor publish', async () => {
+    const repo = createPgSitesRepo(pool)
+    const svc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      edgeSecret: EDGE_SECRET,
+      repo,
+      edge: rawEdge,
+      resolveTxt: async () => [],
+    })
+
+    const ownerApiCode = 'export default async function handler(ctx) { return ctx.json({ ok: true }) }\n'
+    const v1Site = await svc.publishSite(1, {
+      slug: 'pg-collab-site',
+      title: 'PG Collab',
+      originSessionId: 'agent:main:webchat:dm:owner-pg',
+      gzippedBundle: encodeSiteBundle([
+        { path: 'index.html', content: Buffer.from('<h1>PG_COLLAB_V1</h1>', 'utf8') },
+        { path: '__oc_server/api.mjs', content: Buffer.from(ownerApiCode, 'utf8') },
+      ]).gzipped,
+    })
+    await svc.setEnvVar(1, 'pg-collab-site', {
+      key: 'PG_SECRET',
+      value: 'owner-aad-secret',
+      isSecret: true,
+    })
+
+    // P1 #6 real PG: unverified user email cannot be added directly
+    await assert.rejects(
+      () =>
+        svc.addCollaboratorByEmail(1, 'pg-collab-site', {
+          email: 'unverified@example.com',
+          role: 'editor',
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'INVALID_INPUT' && e.status === 400,
+    )
+
+    // Single-use invite raced by user 2 and user 3 simultaneously -> exactly 1 wins!
+    const created = await svc.createInvite(1, 'pg-collab-site', {
+      role: 'editor',
+      expiresInHours: 24,
+      maxUses: 1,
+    })
+    const race = await Promise.allSettled([
+      svc.acceptInvite(2, created.token),
+      svc.acceptInvite(3, created.token),
+    ])
+    const winners = race.filter((r) => r.status === 'fulfilled')
+    const losers = race.filter((r) => r.status === 'rejected')
+    assert.equal(winners.length, 1)
+    assert.equal(losers.length, 1)
+    assert.ok(losers[0]?.reason instanceof SitesError && losers[0].reason.code === 'INVITE_INVALID')
+
+    const winnerUid = race[0]?.status === 'fulfilled' ? 2 : 3
+    const pulled = await svc.pullSiteBundle(winnerUid, 'pg-collab-site')
+    assert.equal(pulled.site.slug, 'pg-collab-site')
+    assert.equal(pulled.site.originSessionId, null)
+    assert.ok(pulled.gzippedBundle.length > 0)
+
+    // P0 #1 real PG: editor modifying __oc_server/api.mjs is rejected with 403 FORBIDDEN!
+    await assert.rejects(
+      () =>
+        svc.publishSite(winnerUid, {
+          slug: 'pg-collab-site',
+          expectedBaseRevision: pulled.site.edgeRevision,
+          gzippedBundle: encodeSiteBundle([
+            { path: 'index.html', content: Buffer.from('<h1>PG_COLLAB_V2</h1>', 'utf8') },
+            {
+              path: '__oc_server/api.mjs',
+              content: Buffer.from('export default async function(ctx){return ctx.json(ctx.env)}', 'utf8'),
+            },
+          ]).gzipped,
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'FORBIDDEN' && e.status === 403,
+    )
+
+    // P1 #7 real PG: editor publishing without expectedBaseRevision or with stale revision is rejected 409 STALE_REVISION
+    await assert.rejects(
+      () =>
+        svc.publishSite(winnerUid, {
+          slug: 'pg-collab-site',
+          expectedBaseRevision: v1Site.edgeRevision,
+          gzippedBundle: encodeSiteBundle([
+            { path: 'index.html', content: Buffer.from('<h1>STALE</h1>', 'utf8') },
+            { path: '__oc_server/api.mjs', content: Buffer.from(ownerApiCode, 'utf8') },
+          ]).gzipped,
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'STALE_REVISION' && e.status === 409,
+    )
+
+    // Winner (editor) keeps owner-approved api.mjs intact and supplies matching base revision -> succeeds!
+    const edited = await svc.publishSite(winnerUid, {
+      slug: 'pg-collab-site',
+      title: 'PG Collab V2',
+      originSessionId: 'agent:main:webchat:dm:editor-should-not-clobber',
+      expectedBaseRevision: pulled.site.edgeRevision,
+      expectedBaseContentSha256: pulled.site.contentSha256,
+      gzippedBundle: encodeSiteBundle([
+        { path: 'index.html', content: Buffer.from('<h1>PG_COLLAB_V2</h1>', 'utf8') },
+        { path: '__oc_server/api.mjs', content: Buffer.from(ownerApiCode, 'utf8') },
+      ]).gzipped,
+    })
+    assert.equal(edited.accessRole, 'editor')
+    const ownerView = await svc.getSite(1, 'pg-collab-site')
+    assert.equal(ownerView.originSessionId, 'agent:main:webchat:dm:owner-pg')
+    const envVars = await svc.listEnvVars(1, 'pg-collab-site')
+    assert.equal(envVars.length, 1)
+    assert.equal(envVars[0]?.key, 'PG_SECRET')
+
+    // P1 #3 real PG: removing collaborator bumps preview_acl_version in PG and Edge!
+    await svc.removeCollaborator(1, 'pg-collab-site', winnerUid)
+    const aclRow = await pool.query<{ preview_acl_version: string | number }>(
+      'SELECT preview_acl_version FROM user_sites WHERE slug = $1',
+      ['pg-collab-site'],
+    )
+    assert.ok(Number(aclRow.rows[0]?.preview_acl_version) >= 2)
+    const edgeStatus = await rawEdge.getSiteStatus({ slug: 'pg-collab-site' })
+    assert.ok((edgeStatus.meta?.previewAclVersion ?? 0) >= 2)
+
+    // Round-2 P1 #1 real PG: owner updates api.mjs A -> B with simulated Edge-commit / PG-crash -> reconcile promotes sha(B)!
+    // Editor keeping B succeeds; editor trying to roll back to old A is rejected 403 FORBIDDEN!
+    await svc.addCollaboratorByEmail(1, 'pg-collab-site', {
+      email: 'u2@example.com',
+      role: 'editor',
+    })
+    const ownerApiCodeB = 'export default async function handler(ctx) { return ctx.json({ ver: "B" }) }\n'
+    let failPushOnce = true
+    let failProbeOnce = true
+    const crashPublishSvc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      edgeSecret: EDGE_SECRET,
+      repo,
+      resolveTxt: async () => [],
+      edge: {
+        ...rawEdge,
+        async pushBundle(args) {
+          const out = await rawEdge.pushBundle(args)
+          if (failPushOnce) {
+            failPushOnce = false
+            throw new SitesError('EDGE_UNAVAILABLE', 'simulated ack drop after Edge commit B', 502, true)
+          }
+          return out
+        },
+        async getSiteStatus(args) {
+          if (failProbeOnce) {
+            failProbeOnce = false
+            throw new SitesError('EDGE_UNAVAILABLE', 'simulated probe fail before crash', 502, true)
+          }
+          return rawEdge.getSiteStatus(args)
+        },
+      },
+    })
+    await assert.rejects(
+      () =>
+        crashPublishSvc.publishSite(1, {
+          slug: 'pg-collab-site',
+          gzippedBundle: encodeSiteBundle([
+            { path: 'index.html', content: Buffer.from('<h1>OWNER_B</h1>', 'utf8') },
+            { path: '__oc_server/api.mjs', content: Buffer.from(ownerApiCodeB, 'utf8') },
+          ]).gzipped,
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'EDGE_UNAVAILABLE',
+    )
+    // Next read reconciles from Edge and promotes owner's approved sha(B)
+    const pulledB = await svc.pullSiteBundle(2, 'pg-collab-site')
+    // Editor trying to roll back to old ownerApiCode (A) MUST be rejected 403!
+    await assert.rejects(
+      () =>
+        svc.publishSite(2, {
+          slug: 'pg-collab-site',
+          expectedSiteId: pulledB.site.id,
+          expectedBaseRevision: pulledB.site.edgeRevision,
+          expectedBaseContentSha256: pulledB.site.contentSha256,
+          gzippedBundle: encodeSiteBundle([
+            { path: 'index.html', content: Buffer.from('<h1>ROLLBACK_A</h1>', 'utf8') },
+            { path: '__oc_server/api.mjs', content: Buffer.from(ownerApiCode, 'utf8') },
+          ]).gzipped,
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'FORBIDDEN' && e.status === 403,
+    )
+    // Editor keeping B intact and updating frontend SUCCEEDS!
+    const editedB = await svc.publishSite(2, {
+      slug: 'pg-collab-site',
+      expectedSiteId: pulledB.site.id,
+      expectedBaseRevision: pulledB.site.edgeRevision,
+      expectedBaseContentSha256: pulledB.site.contentSha256,
+      gzippedBundle: encodeSiteBundle([
+        { path: 'index.html', content: Buffer.from('<h1>EDITOR_WITH_B</h1>', 'utf8') },
+        { path: '__oc_server/api.mjs', content: Buffer.from(ownerApiCodeB, 'utf8') },
+      ]).gzipped,
+    })
+    assert.equal(editedB.accessRole, 'editor')
+
+    // Round-2 P1 #3 real PG: retry removeCollaborator after Edge failure STILL syncs durable preview_acl_target_version!
+    const preRetryEdge = await rawEdge.getSiteStatus({ slug: 'pg-collab-site' })
+    const preRetryAcl = preRetryEdge.meta?.previewAclVersion ?? 1
+    let failAclMetaOnce = true
+    const flakyAclSvc = new SitesService({
+      enabled: true,
+      baseDomain: 'congjianai.com',
+      maxPerUser: 5,
+      edgeSecret: EDGE_SECRET,
+      repo,
+      resolveTxt: async () => [],
+      edge: {
+        ...rawEdge,
+        async updateMeta(args) {
+          if (failAclMetaOnce) {
+            failAclMetaOnce = false
+            throw new SitesError('EDGE_UNAVAILABLE', 'simulated edge failure during removeCollaborator', 502, true)
+          }
+          return rawEdge.updateMeta(args)
+        },
+      },
+    })
+    await assert.rejects(
+      () => flakyAclSvc.removeCollaborator(1, 'pg-collab-site', 2),
+      (e: unknown) => e instanceof SitesError && e.code === 'EDGE_UNAVAILABLE',
+    )
+    // Retry removeCollaborator (DB row already gone -> rowCount=0), MUST still push target ACL version to Edge!
+    await flakyAclSvc.removeCollaborator(1, 'pg-collab-site', 2)
+    const postRetryEdge = await rawEdge.getSiteStatus({ slug: 'pg-collab-site' })
+    assert.ok((postRetryEdge.meta?.previewAclVersion ?? 0) > preRetryAcl)
+
+    // Round-2 P1 #7 real PG: baseline publish after owner deletes site MUST fail 409 STALE_REVISION (never recreate public site!)
+    await svc.deleteSite(1, 'pg-collab-site')
+    await assert.rejects(
+      () =>
+        svc.publishSite(2, {
+          slug: 'pg-collab-site',
+          expectedSiteId: editedB.id,
+          expectedBaseRevision: editedB.edgeRevision,
+          expectedBaseContentSha256: editedB.contentSha256,
+          gzippedBundle: buildBundle('<h1>SHOULD_NOT_RECREATE</h1>'),
+        }),
+      (e: unknown) => e instanceof SitesError && e.code === 'STALE_REVISION' && e.status === 409,
+    )
+    assert.equal(await repo.getByUserAndSlug(2, 'pg-collab-site'), null)
   })
 })

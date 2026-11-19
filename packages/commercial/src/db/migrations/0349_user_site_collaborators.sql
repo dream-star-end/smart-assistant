@@ -1,0 +1,38 @@
+-- order-dependency: 0347_user_sites_fullstack
+-- compat: purely additive columns on user_sites and new tables user_site_collaborators / user_site_invites; pre-0349 binaries ignore them and rollback leaves them inert.
+
+ALTER TABLE user_sites
+  ADD COLUMN IF NOT EXISTS server_api_sha256 TEXT NOT NULL DEFAULT '',
+  ADD COLUMN IF NOT EXISTS op_server_api_sha256 TEXT,
+  ADD COLUMN IF NOT EXISTS preview_acl_version BIGINT NOT NULL DEFAULT 1 CHECK (preview_acl_version >= 1),
+  ADD COLUMN IF NOT EXISTS preview_acl_target_version BIGINT NOT NULL DEFAULT 1 CHECK (preview_acl_target_version >= 1);
+
+CREATE TABLE IF NOT EXISTS user_site_collaborators (
+  site_id UUID NOT NULL REFERENCES user_sites(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('editor', 'viewer')),
+  invited_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (site_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_site_collaborators_user_id
+  ON user_site_collaborators (user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_site_invites (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_id UUID NOT NULL REFERENCES user_sites(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL CHECK (role IN ('editor', 'viewer')),
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  max_uses INTEGER CHECK (max_uses IS NULL OR max_uses > 0),
+  use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+  expires_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_site_invites_site_active
+  ON user_site_invites (site_id, created_at DESC)
+  WHERE revoked_at IS NULL;

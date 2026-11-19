@@ -27,9 +27,10 @@ oc-site publish ./index.html --slug demo-card --title "交互名片"
 oc-site publish ./dist --slug team-notes --visibility password --password "secret-pass"
 oc-site publish ./out --slug docs-site --no-spa
 
-# Manage slug, custom domain, env secrets, SQLite, and analytics
+# Manage slug, custom domain, env secrets, SQLite, analytics, and collaborative pull
 oc-site list
 oc-site info my-app
+oc-site pull my-app ./my-app                      # pull published files (+ server/api.mjs if fullstack) to edit locally
 oc-site rename my-app my-app-v2
 oc-site update my-app --visibility disabled      # pause offline
 oc-site update my-app --visibility public        # resume online
@@ -48,7 +49,9 @@ oc-site delete my-app
 
 Rules:
 - Root `index.html` is mandatory. Single publish limit is 25 MiB / 500 files (10 MiB max per file).
-- `oc-site publish` skips `.env`, `.env.*`, `.git`, `node_modules`, and symlinks, and never serves `__oc_server/*` publicly.
+- `oc-site publish` skips `.env`, `.env.*`, `.oc-site-state.json`, `.git`, `node_modules`, and symlinks, and never serves `__oc_server/*` publicly.
+- `oc-site pull` saves `.oc-site-state.json` (base revision & content SHA-256) so subsequent collaborative `oc-site publish` automatically enforces optimistic concurrency (`409 STALE_REVISION` if another collaborator published newer changes; re-pull and merge before re-publishing).
+- Collaborators (`editor`) can update frontend assets and keep an existing owner-approved `server/api.mjs` unchanged, but cannot introduce or modify `server/api.mjs` (owner-only, since it reads owner secrets).
 - Omit `--slug` on first publish to auto-assign `site-xxxxxxxx`. Pass the same `--slug` on updates, or use `oc-site rename` to migrate while preserving SQLite and env vars.
 
 ## 2. Built-in Fullstack Mode (`/api/*` + SQLite + Secret Env)

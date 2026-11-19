@@ -768,6 +768,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
     { method: ANY_METHOD, path: '/api/sites', handler: dispatchSitesBrowserRoute },
     { method: ANY_METHOD, pathPrefix: '/api/sites/', handler: dispatchSitesBrowserRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/site-invites/', handler: dispatchSitesBrowserRoute },
     // OCV5-561 Muse bridge (Muse VM dials out; bridge-token auth in the handler).
     { method: ANY_METHOD, pathPrefix: MUSE_BRIDGE_PREFIX, handler: dispatchMuseBridgeRoute },
     // OCV5-591 media studio (404 unless OC_STUDIO_ENABLED=1 and the user is allowed).
@@ -1663,6 +1664,7 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/plugins',
     '/api/media-generation',
     '/api/sites',
+    '/api/site-invites/',
     // OCV5-561 Muse bridge; 404 unless OC_MUSE_BRIDGE_ENABLED=1.
     MUSE_BRIDGE_PREFIX,
     // OCV5-591 media studio browser API.

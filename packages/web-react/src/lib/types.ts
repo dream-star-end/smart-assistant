@@ -2237,10 +2237,17 @@ export type UserSiteVisibility = "public" | "password" | "disabled";
 
 export type UserSiteCustomDomainStatus = "none" | "pending" | "verified";
 
+export type UserSiteAccessRole = "owner" | "editor" | "viewer";
+export type UserSiteCollaboratorRole = "editor" | "viewer";
+
 export type UserSiteItem = {
   id: string;
   slug: string;
   url: string;
+  accessRole?: UserSiteAccessRole;
+  ownerEmail?: string | null;
+  ownerDisplayName?: string | null;
+  collaboratorCount?: number;
   customDomain: string | null;
   customDomainStatus?: UserSiteCustomDomainStatus;
   customDomainTxtName?: string | null;
